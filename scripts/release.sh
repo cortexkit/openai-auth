@@ -64,6 +64,9 @@ echo ""
 echo "→ Running pre-release checks..."
 echo ""
 
+echo "  bun format:check..."
+bun run format:check 2>&1 || { echo "Error: Format check failed"; exit 1; }
+
 echo "  bun lint..."
 bun run lint 2>&1 || { echo "Error: Lint failed"; exit 1; }
 

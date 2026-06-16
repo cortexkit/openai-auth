@@ -41,6 +41,28 @@ class PiRawCodexWebSocket extends RawWebSocket {
   }
 }
 
+let rawWebSocketInstallCount = 0
+let originalWebSocket: unknown
+
+function installRawCodexWebSocket() {
+  const global = globalThis as unknown as GlobalWebSocketSlot
+  if (rawWebSocketInstallCount === 0) {
+    originalWebSocket = global.WebSocket
+    global.WebSocket = PiRawCodexWebSocket
+  }
+  rawWebSocketInstallCount++
+
+  return () => {
+    rawWebSocketInstallCount = Math.max(0, rawWebSocketInstallCount - 1)
+    if (rawWebSocketInstallCount === 0) {
+      if (global.WebSocket === PiRawCodexWebSocket) {
+        global.WebSocket = originalWebSocket
+      }
+      originalWebSocket = undefined
+    }
+  }
+}
+
 const OPENAI_CODEX_MODELS: CodexModel[] = [
   {
     id: 'gpt-5.5',
@@ -120,9 +142,7 @@ function streamOpenAI(
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
   const outer = createAssistantMessageEventStream()
-  const global = globalThis as unknown as GlobalWebSocketSlot
-  const originalWebSocket = global.WebSocket
-  global.WebSocket = PiRawCodexWebSocket
+  const restoreWebSocket = installRawCodexWebSocket()
   const inner = streamSimpleOpenAICodexResponses(
     model as CodexModel,
     context,
@@ -166,9 +186,7 @@ function streamOpenAI(
       })
       outer.end()
     } finally {
-      if (global.WebSocket === PiRawCodexWebSocket) {
-        global.WebSocket = originalWebSocket
-      }
+      restoreWebSocket()
     }
   })()
 
