@@ -1,6 +1,5 @@
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
 import os from "node:os"
-import { appendFileSync } from "node:fs"
 import { setTimeout as sleep } from "node:timers/promises"
 import { createServer } from "http"
 import { OpenAIWebSocketPool } from "./ws-pool"
@@ -14,46 +13,10 @@ const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000
 const ALLOWED_MODELS = new Set(["gpt-5.5", "gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini"])
 const OAUTH_DUMMY_KEY = "opencode-oauth-dummy-key"
 const USER_AGENT = `cortexkit-opencode-openai-auth/${PackageVersion}`
-const DEFAULT_MIN_CODEX_HTTP_RESPONSE_GAP_MS = 0
 const CODEX_BETA_FEATURES = "terminal_resize_reflow"
 const CODEX_VERSION = "0.139.0"
 const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
 const CODEX_SANDBOX = "seccomp"
-// CORTEXKIT_OPENAI_AUTH_RETEST8_SHAPE=1: reproduce retest8's exact HTTP request shape (pre-WS-work)
-// to test whether codex-identity changes we added during WS testing regressed the HTTP cache path.
-const RETEST8_SHAPE = !!process.env.CORTEXKIT_OPENAI_AUTH_RETEST8_SHAPE
-function cryptoRandomUUID(): string {
-  return (globalThis.crypto as Crypto).randomUUID()
-}
-// Optional request self-log (CORTEXKIT_OPENAI_AUTH_REQ_LOG=path): one JSON line per outbound
-// codex/responses request with its on-wire headers + body-shape, so a run can self-verify the
-// request shape without a MITM proxy.
-function logCodexRequest(headers: Headers, body: Record<string, unknown> | undefined) {
-  const p = process.env.CORTEXKIT_OPENAI_AUTH_REQ_LOG
-  if (!p || !body) return
-  try {
-    const tools = Array.isArray(body.tools) ? (body.tools as Record<string, unknown>[]) : []
-    const hdr: Record<string, string> = {}
-    headers.forEach((v, k) => {
-      if (k.toLowerCase() === "authorization") return
-      hdr[k] = v
-    })
-    appendFileSync(
-      p,
-      JSON.stringify({
-        t: Date.now(),
-        headers: hdr,
-        bodyKeys: Object.keys(body),
-        store: body.store,
-        nInput: Array.isArray(body.input) ? body.input.length : undefined,
-        tool0Keys: tools[0] ? Object.keys(tools[0]) : [],
-        tool0HasSchema: tools[0] ? "$schema" in ((tools[0].parameters as Record<string, unknown>) || {}) : undefined,
-        tool0Strict: tools[0]?.strict,
-        toolTypes: [...new Set(tools.map((t) => t.type))],
-      }) + "\n",
-    )
-  } catch {}
-}
 
 interface PkceCodes {
   verifier: string
@@ -149,12 +112,6 @@ interface CodexSessionMetadata {
   turnID: string
   windowID: string
   turnStartedAt?: number
-  lastResponseCompletedAt?: number
-  /** True once the codex_thread_initialized ping has been sent for this session. */
-  threadInitialized?: boolean
-  /** Cloudflare affinity cookies (`__cflb`/`__cf_bm`/`_cfuvid`) captured from the
-   *  thread-init response, replayed on subsequent requests to pin the edge/origin. */
-  affinityCookie?: string
 }
 
 interface PreparedCodexRequest {
@@ -227,34 +184,16 @@ function prepareCodexRequest(input: {
   // OpenCode's untrimmed body always still contains the user message.
   // Codex turn-metadata schema (exact field set + order; no request_id/originator):
   // { session_id, thread_id, thread_source, turn_id, sandbox, turn_started_at_unix_ms, request_kind, window_id }
-  // RETEST8_SHAPE: reproduce the EXACT request shape from the retest8 HTTP run (which measured
-  // 0 cliffs without web_search), to test whether a change we made during WS testing regressed
-  // the HTTP cache path. Differences from current: SDK default User-Agent (no codex UA / no
-  // `version` header), fresh-per-request x-client-request-id (= request_id), the older
-  // turn-metadata schema {session_id, request_id, request_kind, thread_id, thread_source,
-  // turn_id, window_id, originator}, and NO tool normalization ($schema kept, no strict).
-  const perRequestId = RETEST8_SHAPE ? cryptoRandomUUID() : undefined
-  const turnMetadata = RETEST8_SHAPE
-    ? JSON.stringify({
-        session_id: input.metadata.threadID,
-        request_id: perRequestId,
-        request_kind: "turn",
-        thread_id: input.metadata.threadID,
-        thread_source: "user",
-        turn_id: input.metadata.turnID,
-        window_id: input.metadata.windowID,
-        originator: "codex_exec",
-      })
-    : JSON.stringify({
-        session_id: input.metadata.threadID,
-        thread_id: input.metadata.threadID,
-        thread_source: "user",
-        turn_id: input.metadata.turnID,
-        sandbox: CODEX_SANDBOX,
-        turn_started_at_unix_ms: input.metadata.turnStartedAt,
-        request_kind: "turn",
-        window_id: input.metadata.windowID,
-      })
+  const turnMetadata = JSON.stringify({
+    session_id: input.metadata.threadID,
+    thread_id: input.metadata.threadID,
+    thread_source: "user",
+    turn_id: input.metadata.turnID,
+    sandbox: CODEX_SANDBOX,
+    turn_started_at_unix_ms: input.metadata.turnStartedAt,
+    request_kind: "turn",
+    window_id: input.metadata.windowID,
+  })
   input.headers.set("originator", "codex_exec")
   if (input.websocket) {
     // Codex's WebSocket upgrade carries neither Accept nor Content-Type.
@@ -268,25 +207,18 @@ function prepareCodexRequest(input: {
   input.headers.delete("x-session-affinity")
   input.headers.set("thread-id", input.metadata.threadID)
   input.headers.set("x-codex-window-id", input.metadata.windowID)
+  // Codex uses the session/thread UUID as x-client-request-id (not a fresh per-request id).
+  input.headers.set("x-client-request-id", input.metadata.threadID)
   input.headers.set("x-codex-beta-features", CODEX_BETA_FEATURES)
   input.headers.set("x-codex-turn-metadata", turnMetadata)
-  if (RETEST8_SHAPE) {
-    // retest8: fresh per-request id (matches request_id), SDK default UA, no `version` header.
-    input.headers.set("x-client-request-id", perRequestId!)
-    input.headers.delete("version")
-  } else {
-    // Codex uses the session/thread UUID as x-client-request-id (not a fresh per-request id).
-    input.headers.set("x-client-request-id", input.metadata.threadID)
-    input.headers.set("user-agent", CODEX_USER_AGENT)
-    input.headers.set("version", CODEX_VERSION)
-  }
+  input.headers.set("user-agent", CODEX_USER_AGENT)
+  input.headers.set("version", CODEX_VERSION)
 
   const parsed = body
   if (!parsed) return { init: input.init }
   parsed.prompt_cache_key = input.metadata.threadID
   parsed.parallel_tool_calls ??= true
-  // retest8 sent tools UNNORMALIZED ($schema present, no `strict`). Skip normalization in that mode.
-  if (Array.isArray(parsed.tools) && !RETEST8_SHAPE) parsed.tools = parsed.tools.map(normalizeCodexTool)
+  if (Array.isArray(parsed.tools)) parsed.tools = parsed.tools.map(normalizeCodexTool)
   maybeInjectCacheStabilizerTool(parsed)
   maybeInjectImageGenerationTool(parsed)
   const clientMetadata: Record<string, unknown> = {
@@ -301,7 +233,6 @@ function prepareCodexRequest(input: {
   parsed.client_metadata = clientMetadata
   input.headers.delete("content-length")
   input.headers.delete("Content-Length")
-  logCodexRequest(input.headers, parsed)
   return { init: { ...input.init, body: JSON.stringify(parsed) } }
 }
 
@@ -361,48 +292,6 @@ function normalizeCodexTool(tool: unknown) {
   // Codex function-tool key order: type, name, description, strict, parameters (+ any extras).
   const { type, name, description, strict, parameters: _p, ...extra } = tool
   return { type, name, description, strict: strict ?? false, parameters, ...extra }
-}
-
-async function waitForCodexHttpTurn(metadata: CodexSessionMetadata | undefined) {
-  if (!metadata?.lastResponseCompletedAt) return
-  const wait = minCodexHttpResponseGapMs() - (Date.now() - metadata.lastResponseCompletedAt)
-  if (wait > 0) await sleep(wait)
-}
-
-function minCodexHttpResponseGapMs() {
-  const value = Number(process.env.MIN_CODEX_HTTP_RESPONSE_GAP_MS)
-  if (Number.isFinite(value) && value >= 0) return value
-  return DEFAULT_MIN_CODEX_HTTP_RESPONSE_GAP_MS
-}
-
-function trackCodexHttpCompletion(
-  response: Response,
-  metadata: CodexSessionMetadata | undefined,
-) {
-  if (!metadata || !response.body) return response
-  const reader = response.body.getReader()
-  return new Response(
-    new ReadableStream({
-      async pull(controller) {
-        const next = await reader.read()
-        if (next.done) {
-          metadata.lastResponseCompletedAt = Date.now()
-          controller.close()
-          return
-        }
-        controller.enqueue(next.value)
-      },
-      async cancel(reason) {
-        metadata.lastResponseCompletedAt = Date.now()
-        await reader.cancel(reason)
-      },
-    }),
-    {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers,
-    },
-  )
 }
 
 async function exchangeCodeForTokens(code: string, redirectUri: string, pkce: PkceCodes): Promise<TokenResponse> {
@@ -648,80 +537,6 @@ function waitForOAuthCallback(pkce: PkceCodes, state: string): Promise<TokenResp
   })
 }
 
-// Experiment (CORTEXKIT_OPENAI_AUTH_THREAD_INIT=1): real Codex POSTs a
-// `codex_thread_initialized` analytics event to chatgpt.com over the
-// cookie-bearing HTTP lane before opening the responses WebSocket, registering
-// the thread/cache-key id with the backend and establishing Cloudflare edge
-// state. OpenCode's first contact with the cache key is the WS request itself.
-// This probe replicates that ping and replays the captured CF affinity cookies
-// (`__cflb`/`__cf_bm`/`_cfuvid`) on the WS upgrade to pin our single socket.
-function threadInitEnabled(): boolean {
-  return Boolean(process.env.CORTEXKIT_OPENAI_AUTH_THREAD_INIT)
-}
-
-function affinityCookiesFromResponse(res: Response): string | undefined {
-  const headers = res.headers as Headers & { getSetCookie?: () => string[] }
-  const raw = typeof headers.getSetCookie === "function" ? headers.getSetCookie() : []
-  const jar: string[] = []
-  for (const cookie of raw) {
-    const m = cookie.match(/^(__cflb|__cf_bm|_cfuvid)=([^;]+)/)
-    if (m) jar.push(`${m[1]}=${m[2]}`)
-  }
-  return jar.length ? jar.join("; ") : undefined
-}
-
-async function sendCodexThreadInit(input: {
-  access: string
-  accountId: string | undefined
-  metadata: CodexSessionMetadata
-  analyticsEndpoint: string
-}): Promise<void> {
-  const headers: Record<string, string> = {
-    authorization: `Bearer ${input.access}`,
-    "content-type": "application/json",
-    accept: "*/*",
-    originator: "codex_exec",
-    "user-agent": CODEX_USER_AGENT,
-  }
-  if (input.accountId) headers["chatgpt-account-id"] = input.accountId
-  const body = JSON.stringify({
-    events: [
-      {
-        event_type: "codex_thread_initialized",
-        event_params: {
-          thread_id: input.metadata.threadID,
-          session_id: input.metadata.threadID,
-          app_server_client: {
-            product_client_id: "codex_exec",
-            client_name: "codex_exec",
-            client_version: CODEX_VERSION,
-            rpc_transport: "in_process",
-            experimental_api_enabled: true,
-          },
-          runtime: {
-            codex_rs_version: CODEX_VERSION,
-            runtime_os: os.platform(),
-            runtime_os_version: os.release(),
-            runtime_arch: os.arch(),
-          },
-          model: "gpt-5.5",
-          ephemeral: true,
-          thread_source: "user",
-          initialization_mode: "new",
-          subagent_source: null,
-          parent_thread_id: null,
-          forked_from_thread_id: null,
-          created_at: Math.floor(Date.now() / 1000),
-        },
-      },
-    ],
-  })
-  const res = await fetch(input.analyticsEndpoint, { method: "POST", headers, body })
-  const cookie = affinityCookiesFromResponse(res)
-  if (cookie) input.metadata.affinityCookie = cookie
-  await res.arrayBuffer().catch(() => {})
-}
-
 export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPluginOptions = {}): Promise<Hooks> {
   const issuer = options.issuer ?? ISSUER
   const codexApiEndpoint = options.codexApiEndpoint ?? CODEX_API_ENDPOINT
@@ -873,25 +688,6 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
                 ? new URL(codexApiEndpoint)
                 : parsed
 
-            // Thread-init probe: before the first responses request for this session,
-            // register the thread/cache-key over the cookie-bearing HTTP lane (as real
-            // Codex does), capturing CF affinity cookies to replay on the WS upgrade.
-            if (
-              threadInitEnabled() &&
-              codexMetadata &&
-              !codexMetadata.threadInitialized &&
-              parsed.pathname.endsWith("/responses")
-            ) {
-              codexMetadata.threadInitialized = true
-              await sendCodexThreadInit({
-                access: currentAuth.access,
-                accountId: authWithAccount.accountId,
-                metadata: codexMetadata,
-                analyticsEndpoint: codexApiEndpoint.replace(/\/responses$/, "/analytics-events/events"),
-              }).catch(() => {})
-            }
-            if (codexMetadata?.affinityCookie) headers.set("cookie", codexMetadata.affinityCookie)
-
             const prepared = prepareCodexRequest({
               init: {
                 ...init,
@@ -904,13 +700,6 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
             })
             const requestInit = prepared.init
             if (websocketFetch && parsed.pathname.endsWith("/responses")) return websocketFetch(url, requestInit)
-            if (parsed.pathname.endsWith("/responses")) {
-              await waitForCodexHttpTurn(codexMetadata)
-              return trackCodexHttpCompletion(
-                await fetch(url, OpenAIWebSocketPool.withoutInternalHeaders(requestInit)),
-                codexMetadata,
-              )
-            }
             return fetch(url, OpenAIWebSocketPool.withoutInternalHeaders(requestInit))
           },
         }

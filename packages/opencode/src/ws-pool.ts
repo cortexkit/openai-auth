@@ -16,7 +16,6 @@ export interface CreateWebSocketFetchOptions {
 interface PoolEntry {
   socket?: WebSocket
   connectedAt?: number
-  lastResponseCompletedAt?: number
   lastUsedAt: number
   busy: boolean
   fallback: boolean
@@ -38,12 +37,6 @@ interface ContinuationState {
 const DEFAULT_CONNECT_TIMEOUT = 15_000
 const DEFAULT_IDLE_TIMEOUT = 5 * 60 * 1000
 const DEFAULT_MAX_CONNECTION_AGE = 55 * 60 * 1000
-// Codex paces real turns ~0.75s after the previous response completes. Tunable for A/B
-// (CORTEXKIT_OPENAI_AUTH_WS_RESPONSE_GAP_MS); 0 disables the floor (Codex has no hard floor).
-function wsResponseGapMs() {
-  const value = Number(process.env.CORTEXKIT_OPENAI_AUTH_WS_RESPONSE_GAP_MS)
-  return Number.isFinite(value) && value >= 0 ? value : 0
-}
 const CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached"
 export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const httpFetch = options?.httpFetch ?? globalThis.fetch
@@ -113,18 +106,13 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       if (!entry.continuation) {
         await prewarm(entry, sourceBody, idleTimeout, init?.signal ?? undefined)
       }
-      const gap = wsResponseGapMs()
-      if (gap > 0 && entry.lastResponseCompletedAt) {
-        const wait = gap - (Date.now() - entry.lastResponseCompletedAt)
-        if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait))
-      }
       let resolveFirstEvent: (event: boolean | OpenAIWebSocket.WrappedError) => void = () => {}
       let rejectFirstEvent: (error: Error) => void = () => {}
       const firstEvent = new Promise<boolean | OpenAIWebSocket.WrappedError>((resolve, reject) => {
         resolveFirstEvent = resolve
         rejectFirstEvent = reject
       })
-      const requestBody = orderCodexBody(maybeDisableParallel(padInstructions(applyTurnId(entry, withContinuation(entry, sourceBody)))))
+      const requestBody = orderCodexBody(applyTurnId(entry, withContinuation(entry, sourceBody)))
       const response = OpenAIWebSocket.streamResponsesWebSocket({
         socket: entry.socket,
         body: requestBody,
@@ -372,38 +360,6 @@ function prewarmHeaders(input: Record<string, string>) {
   }
 }
 
-// Experiment (CORTEXKIT_OPENAI_AUTH_PAD_INSTRUCTIONS_CHARS): prepend a large, byte-stable
-// block to `instructions` to test whether a Codex-sized (~21k char) stable cacheable prefix
-// eliminates mid-turn prompt-cache cliffs. The block is deterministic and identical on every
-// request (built once, cached) so it forms a stable cache anchor at the front of the prompt.
-let _padCache: { len: number; text: string } | undefined
-function instructionsPad(len: number): string {
-  if (_padCache && _padCache.len === len) return _padCache.text
-  // Plausible-looking, fully deterministic filler. Repeated stable lines.
-  const line =
-    "# Stable cache anchor block. This text is identical on every request so it forms a cacheable prefix.\n"
-  let text = ""
-  while (text.length < len) text += line
-  text = text.slice(0, len)
-  _padCache = { len, text }
-  return text
-}
-
-function padInstructions(body: Record<string, unknown>): Record<string, unknown> {
-  const current = typeof body.instructions === "string" ? body.instructions : ""
-  // Double mode: repeat the real instructions N times (stable, realistic content) to push
-  // the instructions prefix over OpenAI's 1024-token cache floor. CORTEXKIT_OPENAI_AUTH_DOUBLE_INSTRUCTIONS
-  // = repeat count (1 => doubled, 2 => tripled). Tested independently of the char-pad knob below.
-  const repeat = Number(process.env.CORTEXKIT_OPENAI_AUTH_DOUBLE_INSTRUCTIONS || 0)
-  if (Number.isFinite(repeat) && repeat > 0 && current) {
-    return { ...body, instructions: (current + "\n").repeat(repeat) + current }
-  }
-  const len = Number(process.env.CORTEXKIT_OPENAI_AUTH_PAD_INSTRUCTIONS_CHARS || 0)
-  if (!Number.isFinite(len) || len <= 0) return body
-  // Prepend the stable block; keep the real instructions after it.
-  return { ...body, instructions: instructionsPad(len) + "\n" + current }
-}
-
 // Codex serializes the response.create body in this exact key order.
 const CODEX_BODY_KEY_ORDER = [
   "type",
@@ -423,16 +379,6 @@ const CODEX_BODY_KEY_ORDER = [
   "generate",
   "client_metadata",
 ]
-
-// Experiment (CORTEXKIT_OPENAI_AUTH_DISABLE_PARALLEL=1): force parallel_tool_calls=false so
-// the model emits one tool call per turn. This removes multi-output continuations
-// (input carrying >=2 function_call_output items), which the cliff-vs-hit analysis showed
-// are heavily over-represented among prompt-cache cliffs. If cliffs vanish, OpenCode's
-// handling of parallel tool outputs is the trigger; if not, parallelism is exonerated.
-function maybeDisableParallel(body: Record<string, unknown>): Record<string, unknown> {
-  if (!process.env.CORTEXKIT_OPENAI_AUTH_DISABLE_PARALLEL) return body
-  return { ...body, parallel_tool_calls: false }
-}
 
 function normalizeResponseBody(body: Record<string, unknown>) {
   const next: Record<string, unknown> = { ...body }
@@ -466,7 +412,6 @@ function normalizeResponseInputItem(item: unknown) {
 }
 
 function updateContinuation(entry: PoolEntry, fullBody: Record<string, unknown>, event: Record<string, unknown>) {
-  if (fullBody.generate !== false) entry.lastResponseCompletedAt = Date.now()
   const response = event.response
   const responseID = isRecord(response) && typeof response.id === "string" ? response.id : undefined
   if (!responseID || !Array.isArray(fullBody.input)) {

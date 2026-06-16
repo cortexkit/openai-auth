@@ -1,21 +1,17 @@
 // Hand-rolled WebSocket client over Bun.connect (raw TLS socket).
 //
 // Purpose: Bun's built-in WebSocket fixes the HTTP upgrade header ORDER and owns
-// the RFC 6455 frame codec, so we cannot make it speak the wire the way Codex's
-// Rust tokio-tungstenite client does. This client writes the upgrade bytes and
-// frames by hand, giving full control of header order + framing, to test whether
-// matching Codex's transport (not just its request payload) changes the server's
-// streaming / prompt-cache behavior. Direct connection (no proxy) so our actual
-// framing reaches the server (an HTTP-CONNECT proxy/mitmproxy would re-frame).
+// the RFC 6455 frame codec, so it cannot speak the wire the way Codex's Rust
+// tokio-tungstenite client does. This client writes the upgrade bytes and frames
+// by hand, giving full control of header order + framing, which surfaces Codex-style
+// incremental streaming that Bun's native WebSocket suppresses.
 //
-// Gated by CORTEXKIT_OPENAI_AUTH_RAW_WS=1. permessage-deflate is intentionally NOT
-// negotiated (retest29 exonerated it); plain text frames keep the codec simple.
+// Opt-in via CORTEXKIT_OPENAI_AUTH_RAW_WS=1. permessage-deflate is intentionally NOT
+// negotiated; plain text frames keep the codec simple.
 //
 // Implements only the subset of the WebSocket interface the plugin consumes:
 // addEventListener/removeEventListener for "open"|"message"|"error"|"close",
 // send(string), close(), and a `url` field. Text frames only on receive.
-
-import { appendFileSync } from "node:fs"
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -39,16 +35,6 @@ const CODEX_APP_HEADER_ORDER = [
 ]
 
 type Listener = (event: any) => void
-
-function logLine(obj: Record<string, unknown>): void {
-  const path = process.env.CORTEXKIT_OPENAI_AUTH_RAW_WS_LOG
-  if (!path) return
-  try {
-    appendFileSync(path, `${JSON.stringify({ t: Date.now(), ...obj })}\n`)
-  } catch {
-    // best-effort instrumentation
-  }
-}
 
 export class RawWebSocket {
   url: string
@@ -119,26 +105,12 @@ export class RawWebSocket {
       }
     }
     const request = lines.join("\r\n") + "\r\n\r\n"
-    // Optional connect-target override (CORTEXKIT_OPENAI_AUTH_RAW_WS_CONNECT=host:port):
-    // connect the raw TCP/TLS to a different endpoint (e.g. a mitmproxy in reverse mode)
-    // while keeping SNI/servername and the Host header = chatgpt.com. This routes our
-    // hand-rolled, Codex-header-ordered upgrade THROUGH mitm so the server-facing TLS is
-    // mitmproxy's (TLS-fingerprint isolation test on the good transport).
-    const override = process.env.CORTEXKIT_OPENAI_AUTH_RAW_WS_CONNECT
-    let connectHost = host
-    let connectPort = port
-    if (override && override.includes(":")) {
-      const [oh, op] = override.split(":")
-      connectHost = oh!
-      connectPort = Number(op)
-    }
-    logLine({ ev: "raw_ws_connect", host, port, path, connectHost, connectPort })
 
     try {
       const connectFn = Bun.connect as unknown as (opts: unknown) => Promise<unknown>
       this.socket = (await connectFn({
-        hostname: connectHost,
-        port: connectPort,
+        hostname: host,
+        port,
         tls: { serverName: host, rejectUnauthorized: false },
         socket: {
           open: (s: { write(d: Uint8Array | string): number }) => s.write(request),
@@ -252,35 +224,12 @@ export class RawWebSocket {
     this.fragChunks = []
     if (this.fragOpcode === 0x1) {
       const text = Buffer.from(full).toString("utf-8")
-      let type: string | undefined
-      let cached: number | undefined
-      try {
-        const obj = JSON.parse(text)
-        type = obj?.type
-        cached = obj?.response?.usage?.input_tokens_details?.cached_tokens
-      } catch {
-        /* not json */
-      }
-      if (type) logLine({ ev: "rx", type, ...(cached !== undefined ? { cached } : {}) })
       this.emit("message", { data: text })
     }
   }
 
   send(data: string): void {
     if (this.readyState !== 1) return
-    try {
-      const obj = JSON.parse(data)
-      const input = Array.isArray(obj?.input) ? obj.input : []
-      logLine({
-        ev: "tx",
-        type: obj?.type,
-        input_len: input.length,
-        has_prev: Boolean(obj?.previous_response_id),
-        generate: obj?.generate,
-      })
-    } catch {
-      logLine({ ev: "tx", type: "?" })
-    }
     this.writeFrame(0x1, new TextEncoder().encode(data))
   }
 

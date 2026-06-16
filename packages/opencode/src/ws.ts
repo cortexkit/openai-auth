@@ -31,8 +31,10 @@ const CODEX_WS_HEADER_ORDER = [
   "x-codex-window-id",
 ]
 
+// Order the WS upgrade headers to match Codex's request (lowercase app headers first, in
+// Codex's order). Note: Bun's native WebSocket ignores headers-object insertion order on the
+// wire; the hand-rolled RawWebSocket honors it. Kept for parity on both paths.
 function orderCodexWsHeaders(headers: Record<string, string>): Record<string, string> {
-  if (!process.env.CORTEXKIT_OPENAI_AUTH_WS_HEADER_ORDER) return headers
   const lowerToKey = new Map<string, string>()
   for (const key of Object.keys(headers)) lowerToKey.set(key.toLowerCase(), key)
   const out: Record<string, string> = {}
@@ -133,14 +135,10 @@ export function connectResponsesWebSocket(options: ConnectResponsesWebSocketOpti
         ? undefined
         : ProxyEnv.getProxyForUrl(options.url.replace(/^wss:/, "https:").replace(/^ws:/, "http:"))
     // Codex negotiates `permessage-deflate; client_max_window_bits`; match it for wire parity.
-    // Quick discriminator (CORTEXKIT_OPENAI_AUTH_WS_NO_DEFLATE=1): drop permessage-deflate
-    // to test whether the deflate extension / compressed framing is what makes Bun's WS
-    // behave differently from Codex's tokio-tungstenite client on the cache lane.
-    const perMessageDeflate = !process.env.CORTEXKIT_OPENAI_AUTH_WS_NO_DEFLATE
-    // Hand-rolled raw client (CORTEXKIT_OPENAI_AUTH_RAW_WS=1): full control of the
-    // upgrade header order + RFC 6455 framing via Bun.connect. Connects DIRECT
-    // (no proxy) so our actual frames reach the server — an HTTP-CONNECT proxy
-    // would re-frame and hide the transport we're testing.
+    const perMessageDeflate = true
+    // Hand-rolled raw client (CORTEXKIT_OPENAI_AUTH_RAW_WS=1): full control of the upgrade
+    // header order + RFC 6455 framing via Bun.connect, which surfaces Codex-style incremental
+    // streaming that Bun's native WebSocket suppresses. Default native Bun WS otherwise.
     const socket = process.env.CORTEXKIT_OPENAI_AUTH_RAW_WS
       ? (new RawWebSocket(options.url, headers) as unknown as WebSocket)
       : new (globalThis.WebSocket as unknown as BunWebSocketConstructor)(options.url, {
