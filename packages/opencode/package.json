@@ -1,0 +1,42 @@
+{
+  "name": "@cortexkit/opencode-openai-auth",
+  "version": "0.1.0",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cortexkit/openai-auth.git",
+    "directory": "packages/opencode"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "oc-plugin": [
+    "server"
+  ],
+  "engines": {
+    "bun": "1.3.14"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "build:dev": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc",
+    "types": "tsc",
+    "prepublishOnly": "bun run build"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "dependencies": {
+    "ai": "^5.0.88"
+  }
+}
