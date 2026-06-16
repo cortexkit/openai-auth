@@ -1,5 +1,6 @@
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
 import os from "node:os"
+import { appendFileSync } from "node:fs"
 import { setTimeout as sleep } from "node:timers/promises"
 import { createServer } from "http"
 import { OpenAIWebSocketPool } from "./ws-pool"
@@ -18,6 +19,41 @@ const CODEX_BETA_FEATURES = "terminal_resize_reflow"
 const CODEX_VERSION = "0.139.0"
 const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
 const CODEX_SANDBOX = "seccomp"
+// CORTEXKIT_OPENAI_AUTH_RETEST8_SHAPE=1: reproduce retest8's exact HTTP request shape (pre-WS-work)
+// to test whether codex-identity changes we added during WS testing regressed the HTTP cache path.
+const RETEST8_SHAPE = !!process.env.CORTEXKIT_OPENAI_AUTH_RETEST8_SHAPE
+function cryptoRandomUUID(): string {
+  return (globalThis.crypto as Crypto).randomUUID()
+}
+// Optional request self-log (CORTEXKIT_OPENAI_AUTH_REQ_LOG=path): one JSON line per outbound
+// codex/responses request with its on-wire headers + body-shape, so a run can self-verify the
+// request shape without a MITM proxy.
+function logCodexRequest(headers: Headers, body: Record<string, unknown> | undefined) {
+  const p = process.env.CORTEXKIT_OPENAI_AUTH_REQ_LOG
+  if (!p || !body) return
+  try {
+    const tools = Array.isArray(body.tools) ? (body.tools as Record<string, unknown>[]) : []
+    const hdr: Record<string, string> = {}
+    headers.forEach((v, k) => {
+      if (k.toLowerCase() === "authorization") return
+      hdr[k] = v
+    })
+    appendFileSync(
+      p,
+      JSON.stringify({
+        t: Date.now(),
+        headers: hdr,
+        bodyKeys: Object.keys(body),
+        store: body.store,
+        nInput: Array.isArray(body.input) ? body.input.length : undefined,
+        tool0Keys: tools[0] ? Object.keys(tools[0]) : [],
+        tool0HasSchema: tools[0] ? "$schema" in ((tools[0].parameters as Record<string, unknown>) || {}) : undefined,
+        tool0Strict: tools[0]?.strict,
+        toolTypes: [...new Set(tools.map((t) => t.type))],
+      }) + "\n",
+    )
+  } catch {}
+}
 
 interface PkceCodes {
   verifier: string
@@ -191,16 +227,34 @@ function prepareCodexRequest(input: {
   // OpenCode's untrimmed body always still contains the user message.
   // Codex turn-metadata schema (exact field set + order; no request_id/originator):
   // { session_id, thread_id, thread_source, turn_id, sandbox, turn_started_at_unix_ms, request_kind, window_id }
-  const turnMetadata = JSON.stringify({
-    session_id: input.metadata.threadID,
-    thread_id: input.metadata.threadID,
-    thread_source: "user",
-    turn_id: input.metadata.turnID,
-    sandbox: CODEX_SANDBOX,
-    turn_started_at_unix_ms: input.metadata.turnStartedAt,
-    request_kind: "turn",
-    window_id: input.metadata.windowID,
-  })
+  // RETEST8_SHAPE: reproduce the EXACT request shape from the retest8 HTTP run (which measured
+  // 0 cliffs without web_search), to test whether a change we made during WS testing regressed
+  // the HTTP cache path. Differences from current: SDK default User-Agent (no codex UA / no
+  // `version` header), fresh-per-request x-client-request-id (= request_id), the older
+  // turn-metadata schema {session_id, request_id, request_kind, thread_id, thread_source,
+  // turn_id, window_id, originator}, and NO tool normalization ($schema kept, no strict).
+  const perRequestId = RETEST8_SHAPE ? cryptoRandomUUID() : undefined
+  const turnMetadata = RETEST8_SHAPE
+    ? JSON.stringify({
+        session_id: input.metadata.threadID,
+        request_id: perRequestId,
+        request_kind: "turn",
+        thread_id: input.metadata.threadID,
+        thread_source: "user",
+        turn_id: input.metadata.turnID,
+        window_id: input.metadata.windowID,
+        originator: "codex_exec",
+      })
+    : JSON.stringify({
+        session_id: input.metadata.threadID,
+        thread_id: input.metadata.threadID,
+        thread_source: "user",
+        turn_id: input.metadata.turnID,
+        sandbox: CODEX_SANDBOX,
+        turn_started_at_unix_ms: input.metadata.turnStartedAt,
+        request_kind: "turn",
+        window_id: input.metadata.windowID,
+      })
   input.headers.set("originator", "codex_exec")
   if (input.websocket) {
     // Codex's WebSocket upgrade carries neither Accept nor Content-Type.
@@ -214,18 +268,25 @@ function prepareCodexRequest(input: {
   input.headers.delete("x-session-affinity")
   input.headers.set("thread-id", input.metadata.threadID)
   input.headers.set("x-codex-window-id", input.metadata.windowID)
-  // Codex uses the session/thread UUID as x-client-request-id (not a fresh per-request id).
-  input.headers.set("x-client-request-id", input.metadata.threadID)
   input.headers.set("x-codex-beta-features", CODEX_BETA_FEATURES)
   input.headers.set("x-codex-turn-metadata", turnMetadata)
-  input.headers.set("user-agent", CODEX_USER_AGENT)
-  input.headers.set("version", CODEX_VERSION)
+  if (RETEST8_SHAPE) {
+    // retest8: fresh per-request id (matches request_id), SDK default UA, no `version` header.
+    input.headers.set("x-client-request-id", perRequestId!)
+    input.headers.delete("version")
+  } else {
+    // Codex uses the session/thread UUID as x-client-request-id (not a fresh per-request id).
+    input.headers.set("x-client-request-id", input.metadata.threadID)
+    input.headers.set("user-agent", CODEX_USER_AGENT)
+    input.headers.set("version", CODEX_VERSION)
+  }
 
   const parsed = body
   if (!parsed) return { init: input.init }
   parsed.prompt_cache_key = input.metadata.threadID
   parsed.parallel_tool_calls ??= true
-  if (Array.isArray(parsed.tools)) parsed.tools = parsed.tools.map(normalizeCodexTool)
+  // retest8 sent tools UNNORMALIZED ($schema present, no `strict`). Skip normalization in that mode.
+  if (Array.isArray(parsed.tools) && !RETEST8_SHAPE) parsed.tools = parsed.tools.map(normalizeCodexTool)
   maybeInjectCacheStabilizerTool(parsed)
   maybeInjectImageGenerationTool(parsed)
   const clientMetadata: Record<string, unknown> = {
@@ -240,6 +301,7 @@ function prepareCodexRequest(input: {
   parsed.client_metadata = clientMetadata
   input.headers.delete("content-length")
   input.headers.delete("Content-Length")
+  logCodexRequest(input.headers, parsed)
   return { init: { ...input.init, body: JSON.stringify(parsed) } }
 }
 
