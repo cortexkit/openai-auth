@@ -143,11 +143,17 @@ function streamOpenAI(
 ): AssistantMessageEventStream {
   const outer = createAssistantMessageEventStream()
   const restoreWebSocket = installRawCodexWebSocket()
-  const inner = streamSimpleOpenAICodexResponses(
-    model as CodexModel,
-    context,
-    options,
-  )
+  let inner: AssistantMessageEventStream
+  try {
+    inner = streamSimpleOpenAICodexResponses(
+      model as CodexModel,
+      context,
+      options,
+    )
+  } catch (error) {
+    restoreWebSocket()
+    throw error
+  }
 
   void (async () => {
     try {
