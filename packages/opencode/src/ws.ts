@@ -52,6 +52,8 @@ export interface ConnectResponsesWebSocketOptions {
   url: string
   headers: Record<string, string>
   timeout?: number
+  /** Use the hand-rolled Bun.connect WebSocket client instead of Bun's native WebSocket. */
+  rawWebSocket?: boolean
   signal?: AbortSignal
 }
 
@@ -136,10 +138,10 @@ export function connectResponsesWebSocket(options: ConnectResponsesWebSocketOpti
         : ProxyEnv.getProxyForUrl(options.url.replace(/^wss:/, "https:").replace(/^ws:/, "http:"))
     // Codex negotiates `permessage-deflate; client_max_window_bits`; match it for wire parity.
     const perMessageDeflate = true
-    // Hand-rolled raw client (CORTEXKIT_OPENAI_AUTH_RAW_WS=1): full control of the upgrade
-    // header order + RFC 6455 framing via Bun.connect, which surfaces Codex-style incremental
-    // streaming that Bun's native WebSocket suppresses. Default native Bun WS otherwise.
-    const socket = process.env.CORTEXKIT_OPENAI_AUTH_RAW_WS
+    // Hand-rolled raw client (opt-in): full control of the upgrade header order + RFC 6455
+    // framing via Bun.connect, which surfaces Codex-style incremental streaming that Bun's
+    // native WebSocket suppresses. Default native Bun WS otherwise.
+    const socket = options.rawWebSocket
       ? (new RawWebSocket(options.url, headers) as unknown as WebSocket)
       : new (globalThis.WebSocket as unknown as BunWebSocketConstructor)(options.url, {
           headers,

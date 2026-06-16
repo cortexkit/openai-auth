@@ -2,6 +2,7 @@ import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
 import os from "node:os"
 import { setTimeout as sleep } from "node:timers/promises"
 import { createServer } from "http"
+import { getSettings } from "./config"
 import { OpenAIWebSocketPool } from "./ws-pool"
 import { PackageVersion } from "./version"
 
@@ -236,7 +237,8 @@ function prepareCodexRequest(input: {
   return { init: { ...input.init, body: JSON.stringify(parsed) } }
 }
 
-// Prompt-cache stabilizer (ON by default; opt out with CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH=1).
+// Prompt-cache stabilizer (ON by default; opt out via config `webSearch: false` or
+// CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH=1 — env wins over config).
 //
 // The Codex `responses` backend only puts a request on the STABLE prompt-cache path when its
 // `tools` array carries an OpenAI-native tool type. OpenCode declares only custom `function`
@@ -255,13 +257,14 @@ function prepareCodexRequest(input: {
 // Only injected when the request already carries tools (agentic turns); empty/tool-less requests
 // have no continuation cliff to fix and are left untouched.
 function maybeInjectCacheStabilizerTool(parsed: Record<string, unknown>) {
-  if (process.env.CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH) return
+  if (!getSettings().webSearch) return
   if (!Array.isArray(parsed.tools) || parsed.tools.length === 0) return
   if (parsed.tools.some((t) => isRecord(t) && t.type === "web_search")) return
   parsed.tools = [...parsed.tools, { type: "web_search", external_web_access: true, search_content_types: ["text", "image"] }]
 }
 
-// Optional native image generation (opt-in: CORTEXKIT_OPENAI_AUTH_IMAGE_GENERATION=1).
+// Optional native image generation (opt-in via config `imageGeneration: true` or
+// CORTEXKIT_OPENAI_AUTH_IMAGE_GENERATION=1 — env wins over config).
 //
 // Declares Codex's native `image_generation` tool so the model can produce images. This is a
 // FEATURE knob, not the cache fix — image_generation does NOT stabilize the prompt cache (mimic:
@@ -271,7 +274,7 @@ function maybeInjectCacheStabilizerTool(parsed: Record<string, unknown>) {
 // saving the resulting PNG is a separate, still-unverified piece — keep this opt-in until the
 // end-to-end image round-trip through OpenCode is confirmed.
 function maybeInjectImageGenerationTool(parsed: Record<string, unknown>) {
-  if (!process.env.CORTEXKIT_OPENAI_AUTH_IMAGE_GENERATION) return
+  if (!getSettings().imageGeneration) return
   if (!Array.isArray(parsed.tools) || parsed.tools.length === 0) return
   if (parsed.tools.some((t) => isRecord(t) && t.type === "image_generation")) return
   parsed.tools = [...parsed.tools, { type: "image_generation", output_format: "png" }]
@@ -592,7 +595,7 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
       async loader(getAuth) {
         const auth = await getAuth()
         const websocketFetch = options.experimentalWebSockets
-          ? OpenAIWebSocketPool.createWebSocketFetch({ httpFetch: fetch })
+          ? OpenAIWebSocketPool.createWebSocketFetch({ httpFetch: fetch, rawWebSocket: getSettings().rawWebSocket })
           : undefined
         if (websocketFetch) {
           websocketFetches.push(websocketFetch)
@@ -842,7 +845,8 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
   }
 }
 
-export const OpenAIAuthPlugin: Plugin = async (input) => CodexAuthPlugin(input, { experimentalWebSockets: true })
+export const OpenAIAuthPlugin: Plugin = async (input) =>
+  CodexAuthPlugin(input, { experimentalWebSockets: getSettings().webSockets })
 
 export default {
   id: "cortexkit-openai-auth",

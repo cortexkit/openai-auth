@@ -11,6 +11,8 @@ export interface CreateWebSocketFetchOptions {
   idleTimeout?: number
   maxConnectionAge?: number
   streamRetries?: number
+  /** Use the hand-rolled Bun.connect WebSocket client instead of Bun's native WebSocket. */
+  rawWebSocket?: boolean
 }
 
 interface PoolEntry {
@@ -45,6 +47,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const idleTimeout = options?.idleTimeout ?? DEFAULT_IDLE_TIMEOUT
   const maxConnectionAge = options?.maxConnectionAge ?? DEFAULT_MAX_CONNECTION_AGE
   const streamRetries = options?.streamRetries ?? 5
+  const rawWebSocket = options?.rawWebSocket ?? false
   const pruneTimer = setInterval(() => prune(), Math.min(idleTimeout, 60_000))
   if (typeof pruneTimer === "object" && "unref" in pruneTimer && typeof pruneTimer.unref === "function") {
     pruneTimer.unref()
@@ -101,6 +104,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         socketHeaders,
         connectTimeout,
         maxConnectionAge,
+        rawWebSocket,
         init?.signal,
       )
       if (!entry.continuation) {
@@ -242,6 +246,7 @@ async function socket(
   headers: Record<string, string>,
   connectTimeout: number,
   maxConnectionAge: number,
+  rawWebSocket: boolean,
   signal?: AbortSignal | null,
 ) {
   if (
@@ -257,6 +262,7 @@ async function socket(
     url: OpenAIWebSocket.toWebSocketUrl(url),
     headers,
     timeout: connectTimeout,
+    rawWebSocket,
     signal: signal ?? undefined,
   })
   entry.connectedAt = Date.now()
