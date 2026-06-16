@@ -15,7 +15,11 @@ import { fileURLToPath } from 'node:url'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[\w.]+)?(?:\+[\w.]+)?$/
-const packageJsonPaths = [join(root, 'packages', 'opencode', 'package.json')]
+const packageJsonPaths = [
+  join(root, 'packages', 'opencode', 'package.json'),
+  join(root, 'packages', 'pi', 'package.json'),
+]
+const versionTsPath = join(root, 'packages', 'opencode', 'src', 'version.ts')
 
 function parseArgs(argv) {
   const args = argv.slice(2)
@@ -87,6 +91,21 @@ for (const pkgPath of packageJsonPaths) {
   if (!dryRun) {
     writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf-8')
   }
+}
+
+if (!existsSync(versionTsPath)) {
+  console.error(`Version source file not found: ${versionTsPath}`)
+  process.exit(1)
+}
+
+const versionTsRelativePath = versionTsPath.slice(root.length + 1)
+const nextVersionTs = `export const PackageVersion = '${version}'\n`
+const currentVersionTs = readFileSync(versionTsPath, 'utf-8')
+if (currentVersionTs === nextVersionTs) {
+  console.log(`${versionTsRelativePath}: version already at target`)
+} else {
+  console.log(`${versionTsRelativePath}: syncing PackageVersion → ${version}`)
+  if (!dryRun) writeFileSync(versionTsPath, nextVersionTs, 'utf-8')
 }
 
 console.log(`\n${dryRun ? '[DRY RUN] ' : ''}Done.`)

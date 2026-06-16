@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { DUMP_SESSION_HEADER } from '../dump'
 import { applyTurnId, createWebSocketFetch } from '../ws-pool'
 
 function entry() {
@@ -250,6 +251,234 @@ describe('createWebSocketFetch', () => {
             { type: 'function_call_output', call_id: 'call_1' },
           ],
         })
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('prewarms again for a fresh user turn instead of continuing from the prior turn response', async () => {
+    const sent: Array<Record<string, unknown>> = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send(data) {
+          const parsed = JSON.parse(data) as Record<string, unknown>
+          sent.push(parsed)
+          const id =
+            parsed.generate === false
+              ? `resp_prewarm_${sent.length}`
+              : `resp_main_${sent.length}`
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+
+        await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({
+            input: [
+              { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+            ],
+          }),
+        )
+        await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({
+            input: [
+              { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+              { type: 'function_call', call_id: 'call_1', name: 'bash' },
+              { type: 'function_call_output', call_id: 'call_1', output: 'ok' },
+            ],
+          }),
+        )
+        await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({
+            input: [
+              { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+              { type: 'function_call', call_id: 'call_1', name: 'bash' },
+              { type: 'function_call_output', call_id: 'call_1', output: 'ok' },
+              {
+                role: 'assistant',
+                content: [{ type: 'output_text', text: 'done' }],
+              },
+              { role: 'user', content: [{ type: 'input_text', text: 'two' }] },
+            ],
+          }),
+        )
+
+        expect(sent).toHaveLength(5)
+        expect(sent[0]).toMatchObject({ generate: false, input: [] })
+        expect(sent[1]?.previous_response_id).toBe('resp_prewarm_1')
+        expect(sent[2]).toMatchObject({
+          previous_response_id: 'resp_main_2',
+          input: [{ type: 'function_call_output', call_id: 'call_1' }],
+        })
+        expect(sent[3]).toMatchObject({ generate: false, input: [] })
+        expect(sent[4]?.previous_response_id).toBe('resp_prewarm_4')
+        expect(sent[4]?.input).toHaveLength(5)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('removes websocket pool entries by original OpenCode session id', async () => {
+    let sockets = 0
+    const sent: Array<Record<string, unknown>> = []
+    await withFakeWebSocket(
+      ({ message }) => {
+        sockets++
+        return {
+          send(data) {
+            const parsed = JSON.parse(data) as Record<string, unknown>
+            sent.push(parsed)
+            message(
+              JSON.stringify({
+                type: 'response.completed',
+                response: {
+                  id:
+                    parsed.generate === false
+                      ? `resp_prewarm_${sockets}`
+                      : `resp_main_${sockets}`,
+                },
+              }),
+            )
+          },
+        }
+      },
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const request = streamRequest({
+          input: [
+            { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+          ],
+        })
+        request.headers = {
+          'session-id': 'codex-thread-id',
+          [DUMP_SESSION_HEADER]: 'ses_original',
+        }
+
+        await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          request,
+        )
+        websocketFetch.remove('ses_original')
+        await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          request,
+        )
+
+        expect(sockets).toBe(2)
+        expect(sent.filter((body) => body.generate === false)).toHaveLength(2)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('idle-prunes websocket fallback entries so a later turn can retry websocket', async () => {
+    let sockets = 0
+    let httpRequests = 0
+    await withFakeWebSocket(
+      ({ message }) => {
+        sockets++
+        const socketNumber = sockets
+        return {
+          send() {
+            if (socketNumber === 1) {
+              message(
+                JSON.stringify({
+                  type: 'error',
+                  status: 400,
+                  error: {
+                    code: 'websocket_connection_limit_reached',
+                    message: 'Responses websocket connection limit reached',
+                  },
+                }),
+              )
+              return
+            }
+            message(
+              JSON.stringify({
+                type: 'response.completed',
+                response: { id: `resp_${socketNumber}` },
+              }),
+            )
+          },
+        }
+      },
+      async () => {
+        const httpFetch: typeof globalThis.fetch = Object.assign(
+          async () => {
+            httpRequests++
+            return new Response('http')
+          },
+          { preconnect: () => {} },
+        )
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          httpFetch,
+          idleTimeout: 1,
+        })
+
+        const first = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+        expect(await first.text()).toBe('http')
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        const second = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+
+        expect(await second.text()).toContain('[DONE]')
+        expect(httpRequests).toBe(1)
+        expect(sockets).toBe(2)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('returns response headers without waiting for first websocket event', async () => {
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          // Delay the first provider event. The fetch wrapper must still
+          // resolve response headers before this arrives.
+          setTimeout(() => {
+            message(
+              JSON.stringify({
+                type: 'response.completed',
+                response: { id: 'resp_delayed' },
+              }),
+            )
+          }, 20)
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          firstEventGraceMs: 0,
+        })
+        const started = Date.now()
+
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+
+        expect(Date.now() - started).toBeLessThan(100)
+        expect(response.status).toBe(200)
+        expect(await response.text()).toContain('[DONE]')
         websocketFetch.close()
       },
     )

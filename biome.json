@@ -23,7 +23,9 @@
       "scripts/**",
       "*.json",
       "*.yml",
-      ".github/**/*.yml"
+      "*.yaml",
+      ".github/**/*.yml",
+      ".github/**/*.yaml"
     ]
   },
   "overrides": [
@@ -39,6 +41,16 @@
           },
           "correctness": {
             "noUnusedFunctionParameters": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["packages/*/src/raw-ws-*.ts"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noNonNullAssertion": "off"
           }
         }
       }

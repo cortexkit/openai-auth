@@ -71,7 +71,7 @@ Config file: `~/.config/opencode/openai-auth.json` (the directory follows `OPENC
 | --- | --- | --- | --- | --- |
 | Prompt-cache fix | `webSearch` | `CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH` (set to disable) | `true` | Appends a native `web_search` tool to the wire request so Codex keeps tool-continuation requests on the stable prompt cache. See [Why `web_search`](#why-web_search). |
 | WebSocket transport | `webSockets` | `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS` | `false` | Use the Codex Responses WebSocket transport instead of plain HTTP. See [Transports](#transports). |
-| Hand-rolled WS client | `rawWebSocket` | `CORTEXKIT_OPENAI_AUTH_RAW_WS` | `false` | When WebSockets are enabled, use a hand-rolled `Bun.connect` client that surfaces Codex-style incremental streaming. |
+| Hand-rolled WS client | `rawWebSocket` | `CORTEXKIT_OPENAI_AUTH_RAW_WS` | `false` | When WebSockets are enabled, use the hand-rolled raw TCP/TLS client that surfaces Codex-style incremental streaming. Bun uses `Bun.connect`; Node/OpenCode Desktop uses `node:net`/`node:tls`. |
 | Image generation | `imageGeneration` | `CORTEXKIT_OPENAI_AUTH_IMAGE_GENERATION` | `false` | Declare Codex's native `image_generation` tool. End-to-end rendering in OpenCode is not yet verified — leave off unless you are testing it. |
 | Request dumps | `dump` | `CORTEXKIT_OPENAI_AUTH_DUMP` | `false` | Write final Codex request bodies and redacted request metadata for cache debugging. Bodies may contain prompt/session content. |
 | Dump directory | `dumpDir` | `OPENCODE_OPENAI_AUTH_DUMP_DIR` | OS temp dir: `opencode-openai-auth-dumps` | Destination for `.body.json`, `.meta.json`, and `.request.json` dump files. |
@@ -108,8 +108,8 @@ The plugin can reach the Codex backend over plain HTTP or over the OpenAI Respon
 | Transport | Enable with | Streaming | Notes |
 | --- | --- | --- | --- |
 | HTTP (default) | — | Server-sent events | Simplest and the default. One request/response per turn step. |
-| Native WebSocket | `webSockets: true` | Coarse | Uses Bun's built-in WebSocket with a session-keyed connection pool and `previous_response_id` continuation chaining. Bun's native client batches frames, so streaming is coarser than Codex's. |
-| Hand-rolled WebSocket | `webSockets: true` + `rawWebSocket: true` | Codex-style incremental | A hand-rolled RFC 6455 client over `Bun.connect`. Exists only to surface Codex-style incremental streaming (token-by-token rather than batched); it is not required for the cache fix. |
+| Native WebSocket | `webSockets: true` | Coarse | Uses the runtime's native WebSocket with a session-keyed connection pool and `previous_response_id` continuation chaining. Native clients can batch frames, so streaming is coarser than Codex's raw client. |
+| Hand-rolled WebSocket | `webSockets: true` + `rawWebSocket: true` | Codex-style incremental | A hand-rolled RFC 6455 client. Bun uses `Bun.connect`; Node/OpenCode Desktop uses `node:net`/`node:tls`. Exists only to surface Codex-style incremental streaming (token-by-token rather than batched); it is not required for the cache fix. |
 
 WebSocket continuation chaining relies on `previous_response_id`, which only resolves on the connection that produced it. A dropped or reconnected socket discards its continuation and starts a fresh chain.
 

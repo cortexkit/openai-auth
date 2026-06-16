@@ -2,6 +2,7 @@
 // fallback, and continuation state intentionally live above this file.
 
 import { APICallError } from 'ai'
+import { DUMP_SESSION_HEADER } from './dump'
 import { RawWebSocket } from './raw-ws'
 import { ResponseStreamError } from './response-stream-error'
 import { errorMessage } from './util/error'
@@ -15,7 +16,6 @@ export const PROTOCOL_HEADER = 'responses_websockets=2026-02-06'
 // could change edge fingerprinting/routing. We can only control the order of our own
 // application headers — Bun owns the order of the WS control headers (host/connection/
 // upgrade/sec-websocket-*). This normalizes the application headers to Codex's order.
-// Gated by CORTEXKIT_OPENAI_AUTH_WS_HEADER_ORDER=1.
 const CODEX_WS_HEADER_ORDER = [
   'chatgpt-account-id',
   'authorization',
@@ -31,6 +31,8 @@ const CODEX_WS_HEADER_ORDER = [
   'x-codex-window-id',
 ]
 
+const INTERNAL_WS_HEADERS = new Set([DUMP_SESSION_HEADER, 'x-opencode-title'])
+
 // Order the WS upgrade headers to match Codex's request (lowercase app headers first, in
 // Codex's order). Note: Bun's native WebSocket ignores headers-object insertion order on the
 // wire; the hand-rolled RawWebSocket honors it. Kept for parity on both paths.
@@ -42,10 +44,22 @@ function orderCodexWsHeaders(
   const out: Record<string, string> = {}
   for (const want of CODEX_WS_HEADER_ORDER) {
     const actual = lowerToKey.get(want)
-    if (actual !== undefined) out[actual] = headers[actual]!
+    const value = actual === undefined ? undefined : headers[actual]
+    if (actual !== undefined && value !== undefined) out[actual] = value
   }
   for (const [key, value] of Object.entries(headers)) {
     if (!CODEX_WS_HEADER_ORDER.includes(key.toLowerCase())) out[key] = value
+  }
+  return out
+}
+
+function stripInternalWsHeaders(
+  headers: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(headers)) {
+    if (INTERNAL_WS_HEADERS.has(key.toLowerCase())) continue
+    out[key] = value
   }
   return out
 }
@@ -54,7 +68,7 @@ export interface ConnectResponsesWebSocketOptions {
   url: string
   headers: Record<string, string>
   timeout?: number
-  /** Use the hand-rolled Bun.connect WebSocket client instead of Bun's native WebSocket. */
+  /** Use the hand-rolled raw TCP/TLS WebSocket client instead of native WebSocket. */
   rawWebSocket?: boolean
   signal?: AbortSignal
 }
@@ -136,8 +150,10 @@ export function connectResponsesWebSocket(
       ...options.headers,
       'openai-beta': options.headers['openai-beta'] ?? PROTOCOL_HEADER,
     }
+    const diagnosticSessionID =
+      headers[DUMP_SESSION_HEADER] ?? headers['session-id']
     delete headers['content-length']
-    headers = orderCodexWsHeaders(headers)
+    headers = orderCodexWsHeaders(stripInternalWsHeaders(headers))
 
     // Bun does not apply HTTP(S)_PROXY to WebSockets unless the proxy is supplied explicitly.
     const proxy =
@@ -149,10 +165,11 @@ export function connectResponsesWebSocket(
     // Codex negotiates `permessage-deflate; client_max_window_bits`; match it for wire parity.
     const perMessageDeflate = true
     // Hand-rolled raw client (opt-in): full control of the upgrade header order + RFC 6455
-    // framing via Bun.connect, which surfaces Codex-style incremental streaming that Bun's
-    // native WebSocket suppresses. Default native Bun WS otherwise.
+    // framing. Bun uses Bun.connect; Node/OpenCode Desktop uses node:net/tls.
     const socket = options.rawWebSocket
-      ? (new RawWebSocket(options.url, headers) as unknown as WebSocket)
+      ? (new RawWebSocket(options.url, headers, {
+          sessionID: diagnosticSessionID,
+        }) as unknown as WebSocket)
       : new (globalThis.WebSocket as unknown as BunWebSocketConstructor)(
           options.url,
           {

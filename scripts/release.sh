@@ -57,6 +57,10 @@ if [[ "$DRY" == "--dry" ]]; then
   exit 0
 fi
 
+echo "→ Syncing version to $VERSION..."
+bun scripts/version-sync.mjs "$VERSION"
+echo ""
+
 echo "→ Running pre-release checks..."
 echo ""
 
@@ -73,10 +77,6 @@ echo "  bun build..."
 bun run build 2>&1 || { echo "Error: Build failed"; exit 1; }
 
 echo "  ✓ All checks passed"
-echo ""
-
-echo "→ Syncing version to $VERSION..."
-bun scripts/version-sync.mjs "$VERSION"
 echo ""
 
 echo "→ Committing version bump..."

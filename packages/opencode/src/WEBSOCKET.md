@@ -9,7 +9,9 @@ Enabled by the CortexKit OpenAI Auth plugin.
 3. Title requests use HTTP.
 4. If that session's socket is busy or already in fallback mode, use HTTP.
 5. Otherwise, reuse its open socket or open a new one.
-6. Send `response.create` and return WebSocket events as SSE.
+6. Prewarm fresh user turns with `generate: false`.
+7. Send `response.create` with `previous_response_id` when a valid same-socket continuation exists.
+8. Return WebSocket events as SSE.
 
 ## Lifetime
 
@@ -21,11 +23,10 @@ Enabled by the CortexKit OpenAI Auth plugin.
 ## Retries
 
 - Retry WebSocket stream/setup failures up to 5 times, then use HTTP for that session until the pool entry is idle-pruned.
-- `websocket_connection_limit_reached` consumes the same retry budget and HTTP fallback.
+- `websocket_connection_limit_reached` switches that session to HTTP fallback immediately.
 - If a WebSocket fails after its first event, fail it as retryable rather than replaying partial output in transport.
 - Abort or cancel closes the socket.
 
 ## Next Steps
 
-- `previous_response_id` continuation.
 - Optional second WebSocket for concurrent requests in one session. Currently these use HTTP.

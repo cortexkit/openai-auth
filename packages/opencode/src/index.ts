@@ -1,10 +1,15 @@
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import os from 'node:os'
+import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import type { Hooks, Plugin, PluginInput } from '@opencode-ai/plugin'
 
-import { getSettings } from './config'
+import { getConfigDir, getSettings } from './config'
 import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
+import { isRecord } from './util/record'
+import { stableStringify } from './util/stable-json'
+import { uuidV7 } from './util/uuid-v7'
 import { PackageVersion } from './version'
 import { OpenAIWebSocketPool } from './ws-pool'
 
@@ -61,8 +66,10 @@ export interface IdTokenClaims {
 export function parseJwtClaims(token: string): IdTokenClaims | undefined {
   const parts = token.split('.')
   if (parts.length !== 3) return undefined
+  const payload = parts[1]
+  if (!payload) return undefined
   try {
-    return JSON.parse(Buffer.from(parts[1]!, 'base64url').toString())
+    return JSON.parse(Buffer.from(payload, 'base64url').toString())
   } catch {
     return undefined
   }
@@ -129,6 +136,12 @@ interface CodexSessionMetadata {
   turnID: string
   windowID: string
   turnStartedAt?: number
+  input?: unknown[]
+}
+
+interface PersistedCodexSessions {
+  version?: number
+  sessions?: Record<string, { threadID?: unknown }>
 }
 
 interface PreparedCodexRequest {
@@ -139,16 +152,14 @@ function parseJsonObject(input: unknown) {
   if (typeof input !== 'string') return undefined
   try {
     const parsed = JSON.parse(input)
-    return typeof parsed === 'object' && parsed !== null
+    return typeof parsed === 'object' &&
+      parsed !== null &&
+      !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>)
       : undefined
   } catch {
     return undefined
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null
 }
 
 // Real Codex mints the session/thread id (which becomes prompt_cache_key,
@@ -157,38 +168,109 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 // only produces UUIDv4 (uniform random). OpenAI's prompt_cache_key is a routing
 // hint; matching Codex's v7 shape exactly removes the only remaining wire-level
 // difference from the Codex client when probing prompt-cache routing behavior.
-function uuidV7(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(16))
-  const ms = Date.now()
-  // 48-bit big-endian millisecond timestamp
-  bytes[0] = (ms / 2 ** 40) & 0xff
-  bytes[1] = (ms / 2 ** 32) & 0xff
-  bytes[2] = (ms / 2 ** 24) & 0xff
-  bytes[3] = (ms / 2 ** 16) & 0xff
-  bytes[4] = (ms / 2 ** 8) & 0xff
-  bytes[5] = ms & 0xff
-  // version 7 in the high nibble of byte 6
-  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x70
-  // RFC 4122 variant (10xx) in the high bits of byte 8
-  bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80
-  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
-}
-
 function getCodexSessionMetadata(
   sessions: Map<string, CodexSessionMetadata>,
   sessionID: string,
+  persist?: () => void,
 ): CodexSessionMetadata {
   const existing = sessions.get(sessionID)
   if (existing) return existing
   const threadID = uuidV7()
   const next: CodexSessionMetadata = {
     threadID,
-    turnID: crypto.randomUUID(),
+    turnID: uuidV7(),
     windowID: `${threadID}:0`,
   }
   sessions.set(sessionID, next)
+  persist?.()
   return next
+}
+
+function codexSessionStatePath() {
+  return join(getConfigDir(), 'openai-auth-sessions.json')
+}
+
+function loadCodexSessions(): Map<string, CodexSessionMetadata> {
+  const sessions = new Map<string, CodexSessionMetadata>()
+  try {
+    const parsed = JSON.parse(
+      readFileSync(codexSessionStatePath(), 'utf8'),
+    ) as PersistedCodexSessions
+    if (!isRecord(parsed.sessions)) return sessions
+    for (const [sessionID, state] of Object.entries(parsed.sessions)) {
+      if (!isRecord(state) || typeof state.threadID !== 'string') continue
+      sessions.set(sessionID, {
+        threadID: state.threadID,
+        turnID: uuidV7(),
+        windowID: `${state.threadID}:0`,
+      })
+    }
+  } catch {
+    // Missing or malformed state should not break auth.
+  }
+  return sessions
+}
+
+function saveCodexSessions(sessions: Map<string, CodexSessionMetadata>): void {
+  const path = codexSessionStatePath()
+  const tmp = `${path}.tmp-${process.pid}`
+  try {
+    mkdirSync(getConfigDir(), { recursive: true })
+    const payload: PersistedCodexSessions = {
+      version: 1,
+      sessions: Object.fromEntries(
+        [...sessions.entries()].map(([sessionID, state]) => [
+          sessionID,
+          { threadID: state.threadID },
+        ]),
+      ),
+    }
+    writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
+    renameSync(tmp, path)
+  } catch {
+    // State persistence only improves cache continuity; never fail a request.
+  }
+}
+
+function isMessageWithRole(item: unknown, role: string) {
+  return (
+    isRecord(item) &&
+    (item.type === 'message' || 'role' in item) &&
+    item.role === role
+  )
+}
+
+function hasInputPrefix(prefix: unknown[], input: unknown[]) {
+  if (prefix.length > input.length) return false
+  for (let index = 0; index < prefix.length; index++) {
+    if (stableStringify(prefix[index]) !== stableStringify(input[index]))
+      return false
+  }
+  return true
+}
+
+function startsHttpUserTurn(metadata: CodexSessionMetadata, input: unknown[]) {
+  if (!metadata.input) return input.length > 0
+  if (!hasInputPrefix(metadata.input, input)) return true
+  const suffix = input.slice(metadata.input.length)
+  return suffix.some(
+    (item) =>
+      isMessageWithRole(item, 'user') || isMessageWithRole(item, 'developer'),
+  )
+}
+
+function updateHttpTurnMetadata(
+  metadata: CodexSessionMetadata,
+  body: Record<string, unknown> | undefined,
+) {
+  const input = Array.isArray(body?.input) ? body.input : undefined
+  if (input && (startsHttpUserTurn(metadata, input) || !metadata.turnID)) {
+    metadata.turnID = uuidV7()
+    metadata.turnStartedAt = Date.now()
+  } else if (!metadata.turnStartedAt) {
+    metadata.turnStartedAt = Date.now()
+  }
+  if (input) metadata.input = input
 }
 
 function prepareCodexRequest(input: {
@@ -201,11 +283,13 @@ function prepareCodexRequest(input: {
 }): PreparedCodexRequest {
   if (!input.metadata) return { init: input.init }
   const body = parseJsonObject(input.init?.body)
+  if (!input.websocket) updateHttpTurnMetadata(input.metadata, body)
+  else if (!input.metadata.turnStartedAt)
+    input.metadata.turnStartedAt = Date.now()
   if (!input.metadata.turnStartedAt) input.metadata.turnStartedAt = Date.now()
-  // Base turn-metadata. NOTE: for the WebSocket path, ws-pool.ts overrides turn_id/turn_started_at
-  // per *actual* turn (it alone sees the post-continuation-trim input). Codex keeps ONE turn_id +
-  // turn_started_at across a user turn's whole tool-loop; deciding that here is impossible because
-  // OpenCode's untrimmed body always still contains the user message.
+  // Base turn-metadata. HTTP sends full replay bodies, so we detect fresh user turns from append-only
+  // input growth above. The WebSocket path still overrides turn_id/turn_started_at in ws-pool.ts
+  // after continuation trimming/prewarm selection.
   // Codex turn-metadata schema (exact field set + order; no request_id/originator):
   // { session_id, thread_id, thread_source, turn_id, sandbox, turn_started_at_unix_ms, request_kind, window_id }
   const turnMetadata = JSON.stringify({
@@ -278,7 +362,7 @@ function prepareCodexRequest(input: {
 // Evidence: standalone Bun mimic (size-controlled 24000c prefix) — +web_search 10.6%->0% cliffs;
 // image_generation (8.3%) and tool_search (4.5%) do NOT fully fix it, so it is web_search-specific.
 // End-to-end in real OpenCode (no-AFT, same-session A/B): control 20% cliffs (10/50) -> 0% (0/42),
-// and 0% on native Bun WS too (0/49) — the fix is transport-independent. The stabilizer also
+// and 0% on native WS too (0/49) — the fix is transport-independent. The stabilizer also
 // ~doubles the steady cached prefix (~3-5.6k -> ~8-10k tokens), so it is a net cost win.
 //
 // web_search executes server-side, so a model invocation would run a real OpenAI web search, but
@@ -430,6 +514,15 @@ const HTML_SUCCESS = `<!doctype html>
   </body>
 </html>`
 
+function escapeHtml(value: string) {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;')
+}
+
 const HTML_ERROR = (error: string) => `<!doctype html>
 <html>
   <head>
@@ -473,7 +566,7 @@ const HTML_ERROR = (error: string) => `<!doctype html>
     <div class="container">
       <h1>Authorization Failed</h1>
       <p>An error occurred during authorization.</p>
-      <div class="error">${error}</div>
+      <div class="error">${escapeHtml(error)}</div>
     </div>
   </body>
 </html>`
@@ -499,7 +592,7 @@ async function startOAuthServer(): Promise<{
     }
   }
 
-  oauthServer = createServer((req, res) => {
+  const server = createServer((req, res) => {
     const url = new URL(req.url || '/', `http://localhost:${OAUTH_PORT}`)
 
     if (url.pathname === '/auth/callback') {
@@ -563,11 +656,13 @@ async function startOAuthServer(): Promise<{
     res.end('Not found')
   })
 
+  oauthServer = server
+
   await new Promise<void>((resolve, reject) => {
-    oauthServer!.listen(OAUTH_PORT, () => {
+    server.listen(OAUTH_PORT, () => {
       resolve()
     })
-    oauthServer!.on('error', reject)
+    server.on('error', reject)
   })
 
   return {
@@ -622,7 +717,8 @@ export async function CodexAuthPlugin(
   const issuer = options.issuer ?? ISSUER
   const codexApiEndpoint = options.codexApiEndpoint ?? CODEX_API_ENDPOINT
   const installationID = crypto.randomUUID()
-  const codexSessions = new Map<string, CodexSessionMetadata>()
+  const codexSessions = loadCodexSessions()
+  const persistCodexSessions = () => saveCodexSessions(codexSessions)
   let websocketFetchInstalled = false
   const websocketFetches: Array<
     ReturnType<typeof OpenAIWebSocketPool.createWebSocketFetch>
@@ -635,6 +731,8 @@ export async function CodexAuthPlugin(
     },
     async event(input) {
       if (input.event.type !== 'session.deleted') return
+      if (codexSessions.delete(input.event.properties.info.id))
+        persistCodexSessions()
       for (const websocketFetch of websocketFetches)
         websocketFetch.remove(input.event.properties.info.id)
     },
@@ -648,7 +746,8 @@ export async function CodexAuthPlugin(
             .filter(([, model]) => {
               if (ALLOWED_MODELS.has(model.api.id)) return true
               const match = model.api.id.match(/^gpt-(\d+\.\d+)/)
-              return match ? parseFloat(match[1]!) > 5.4 : false
+              const version = match?.[1]
+              return version ? parseFloat(version) > 5.4 : false
             })
             .map(([modelID, model]) => [
               modelID,
@@ -675,6 +774,8 @@ export async function CodexAuthPlugin(
       provider: 'openai',
       async loader(getAuth) {
         const auth = await getAuth()
+        if (auth.type !== 'oauth') return {}
+
         const websocketFetch = options.experimentalWebSockets
           ? OpenAIWebSocketPool.createWebSocketFetch({
               httpFetch: fetch,
@@ -685,8 +786,6 @@ export async function CodexAuthPlugin(
           websocketFetches.push(websocketFetch)
           websocketFetchInstalled = true
         }
-        if (auth.type !== 'oauth')
-          return websocketFetch ? { fetch: websocketFetch } : {}
 
         let refreshPromise:
           | Promise<{
@@ -698,6 +797,9 @@ export async function CodexAuthPlugin(
         return {
           apiKey: OAUTH_DUMMY_KEY,
           async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
+            const currentAuth = await getAuth()
+            if (currentAuth.type !== 'oauth') return fetch(requestInput, init)
+
             if (init?.headers) {
               if (init.headers instanceof Headers) {
                 init.headers.delete('authorization')
@@ -707,16 +809,10 @@ export async function CodexAuthPlugin(
                   ([key]) => String(key).toLowerCase() !== 'authorization',
                 )
               } else {
-                delete init.headers['authorization']
-                delete init.headers['Authorization']
+                delete init.headers.authorization
+                delete init.headers.Authorization
               }
             }
-
-            const currentAuth = await getAuth()
-            if (currentAuth.type !== 'oauth')
-              return websocketFetch
-                ? websocketFetch(requestInput, init)
-                : fetch(requestInput, init)
 
             const authWithAccount = currentAuth as typeof currentAuth & {
               accountId?: string
@@ -780,7 +876,11 @@ export async function CodexAuthPlugin(
               headers.get('session-id') ??
               undefined
             const codexMetadata = sessionID
-              ? getCodexSessionMetadata(codexSessions, sessionID)
+              ? getCodexSessionMetadata(
+                  codexSessions,
+                  sessionID,
+                  persistCodexSessions,
+                )
               : undefined
 
             const parsed =
@@ -905,7 +1005,7 @@ export async function CodexAuthPlugin(
               interval: string
             }
             const interval =
-              Math.max(parseInt(deviceData.interval) || 5, 1) * 1000
+              Math.max(parseInt(deviceData.interval, 10) || 5, 1) * 1000
 
             return {
               url: `${ISSUER}/codex/device`,

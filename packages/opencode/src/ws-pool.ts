@@ -1,6 +1,8 @@
 import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
 import { ResponseStreamError } from './response-stream-error'
 import { isRecord } from './util/record'
+import { stableStringify } from './util/stable-json'
+import { uuidV7 } from './util/uuid-v7'
 import { OpenAIWebSocket } from './ws'
 
 export const TITLE_HEADER = 'x-opencode-title'
@@ -13,7 +15,9 @@ export interface CreateWebSocketFetchOptions {
   idleTimeout?: number
   maxConnectionAge?: number
   streamRetries?: number
-  /** Use the hand-rolled Bun.connect WebSocket client instead of Bun's native WebSocket. */
+  /** Milliseconds to wait for an immediate provider-side WS error before returning response headers. */
+  firstEventGraceMs?: number
+  /** Use the hand-rolled raw TCP/TLS WebSocket client instead of native WebSocket. */
   rawWebSocket?: boolean
 }
 
@@ -50,6 +54,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const maxConnectionAge =
     options?.maxConnectionAge ?? DEFAULT_MAX_CONNECTION_AGE
   const streamRetries = options?.streamRetries ?? 5
+  const firstEventGraceMs = options?.firstEventGraceMs ?? 250
   const rawWebSocket = options?.rawWebSocket ?? false
   const pruneTimer = setInterval(() => prune(), Math.min(idleTimeout, 60_000))
   if (
@@ -97,8 +102,10 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     }
 
     const sessionID =
-      internalHeaders['x-session-affinity'] ?? internalHeaders['session-id']
-    const dumpSessionID = internalHeaders[DUMP_SESSION_HEADER] ?? sessionID
+      internalHeaders[DUMP_SESSION_HEADER] ??
+      internalHeaders['x-session-affinity'] ??
+      internalHeaders['session-id']
+    const dumpSessionID = sessionID
     if (!sessionID) {
       return httpFetch(input, httpInit)
     }
@@ -137,7 +144,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         rawWebSocket,
         init?.signal,
       )
-      if (!entry.continuation) {
+      if (shouldPrewarm(entry, sourceBody)) {
         await prewarm(entry, sourceBody, idleTimeout, {
           signal: init?.signal ?? undefined,
           sessionID: dumpSessionID,
@@ -209,7 +216,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           throw error
         },
       })
-      const first = await firstEvent
+      const first = await withGrace(firstEvent, firstEventGraceMs)
       if (first !== false) {
         if (first === true || first.status < 200 || first.status > 599)
           return response
@@ -255,7 +262,6 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     const now = Date.now()
     for (const [key, entry] of pool) {
       if (entry.busy) continue
-      if (entry.fallback) continue
       if (now - entry.lastUsedAt < idleTimeout) continue
       invalidate(entry)
       pool.delete(key)
@@ -291,6 +297,23 @@ function connectionLimitError(event: Record<string, unknown>) {
       ? event.error.message
       : CONNECTION_LIMIT_REACHED_CODE,
   )
+}
+
+async function withGrace<T>(promise: Promise<T>, graceMs: number) {
+  if (graceMs <= 0) return false as const
+  return new Promise<T | false>((resolve, reject) => {
+    const timer = setTimeout(() => resolve(false), graceMs)
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error: unknown) => {
+        clearTimeout(timer)
+        reject(error)
+      },
+    )
+  })
 }
 
 function failedResponse(error: ResponseStreamError) {
@@ -538,7 +561,7 @@ export function applyTurnId(entry: PoolEntry, body: Record<string, unknown>) {
         ),
     )
   if (isNewTurn || !entry.turnID) {
-    entry.turnID = crypto.randomUUID()
+    entry.turnID = uuidV7()
     entry.turnStartedAt = Date.now()
   }
   const cm = body.client_metadata
@@ -594,6 +617,21 @@ function withContinuation(entry: PoolEntry, body: Record<string, unknown>) {
   }
 }
 
+function shouldPrewarm(entry: PoolEntry, body: Record<string, unknown>) {
+  const input = Array.isArray(body.input) ? body.input : undefined
+  if (!entry.continuation) return true
+  if (!input) return false
+  if (!hasInputPrefix(entry.continuation.input, input)) return true
+  const suffix = input.slice(entry.continuation.input.length)
+  return suffix.some(isUserTurnMessage)
+}
+
+function isUserTurnMessage(item: unknown) {
+  if (!isRecord(item)) return false
+  if (!(item.type === 'message' || 'role' in item)) return false
+  return item.role === 'user' || item.role === 'developer'
+}
+
 function continuationInput(input: unknown[]) {
   return input.filter((item) => {
     if (!isRecord(item)) return true
@@ -646,20 +684,6 @@ function hasInputPrefix(prefix: unknown[], input: unknown[]) {
       return false
   }
   return true
-}
-
-function stableStringify(value: unknown): string {
-  return JSON.stringify(stable(value)) ?? 'undefined'
-}
-
-function stable(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stable)
-  if (!isRecord(value)) return value
-  return Object.fromEntries(
-    Object.keys(value)
-      .sort()
-      .map((key) => [key, stable(value[key])]),
-  )
 }
 
 export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(

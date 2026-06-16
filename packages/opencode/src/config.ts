@@ -20,7 +20,7 @@ export interface OpenAIAuthConfig {
   webSearch?: boolean
   /** Use the WebSocket transport for /responses instead of plain HTTP. Default false. */
   webSockets?: boolean
-  /** Use the hand-rolled Bun.connect WebSocket client (incremental streaming). Default false. */
+  /** Use the hand-rolled raw TCP/TLS WebSocket client (incremental streaming). Default false. */
   rawWebSocket?: boolean
   /** Declare the native image_generation tool. Default false. */
   imageGeneration?: boolean
@@ -53,9 +53,9 @@ const ENV = {
   configDir: 'OPENCODE_CONFIG_DIR',
 } as const
 
-function getConfigDir(): string {
-  if (process.env[ENV.configDir]?.trim())
-    return process.env[ENV.configDir]!.trim()
+export function getConfigDir(): string {
+  const configured = process.env[ENV.configDir]?.trim()
+  if (configured) return configured
   return join(
     process.env.XDG_CONFIG_HOME || join(homedir(), '.config'),
     'opencode',

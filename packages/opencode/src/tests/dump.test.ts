@@ -9,6 +9,197 @@ import { resetDumpStateForTest } from '../dump'
 import { CodexAuthPlugin } from '../index'
 
 describe('request dumps', () => {
+  test('does not install the Codex/WebSocket fetch for manual API-key auth', async () => {
+    const hooks = await CodexAuthPlugin(pluginInput(), {
+      experimentalWebSockets: true,
+    })
+    const auth = hooks.auth
+    if (!auth?.loader) throw new Error('missing auth loader')
+
+    const loaded = await auth.loader(
+      async () => ({ type: 'api', key: 'sk-test' }) as any,
+      {} as Parameters<NonNullable<typeof auth.loader>>[1],
+    )
+
+    expect(loaded.fetch).toBeUndefined()
+  })
+
+  test('drops cached Codex session metadata when OpenCode deletes a session', async () => {
+    await withDumpEnv(async () => {
+      const originalFetch = globalThis.fetch
+      const promptCacheKeys: string[] = []
+      globalThis.fetch = Object.assign(
+        async (_url: RequestInfo | URL, init?: RequestInit) => {
+          const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          promptCacheKeys.push(String(body.prompt_cache_key))
+          return new Response('ok', { status: 200 })
+        },
+        { preconnect: () => {} },
+      )
+      try {
+        const hooks = await CodexAuthPlugin(pluginInput(), {
+          experimentalWebSockets: false,
+        })
+        const fetch = await pluginFetch(hooks)
+
+        await fetch('https://api.openai.com/v1/responses', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-session-affinity': 'ses_deleted',
+          },
+          body: JSON.stringify(toolRequestBody()),
+        })
+        await hooks.event?.({
+          event: {
+            type: 'session.deleted',
+            properties: { info: { id: 'ses_deleted' } },
+          },
+        } as Parameters<NonNullable<typeof hooks.event>>[0])
+        await fetch('https://api.openai.com/v1/responses', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-session-affinity': 'ses_deleted',
+          },
+          body: JSON.stringify(toolRequestBody()),
+        })
+
+        expect(promptCacheKeys).toHaveLength(2)
+        expect(promptCacheKeys[1]).not.toBe(promptCacheKeys[0])
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+  })
+
+  test('persists Codex prompt_cache_key mapping across plugin restarts', async () => {
+    await withDumpEnv(async () => {
+      const originalFetch = globalThis.fetch
+      const promptCacheKeys: string[] = []
+      globalThis.fetch = Object.assign(
+        async (_url: RequestInfo | URL, init?: RequestInit) => {
+          const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          promptCacheKeys.push(String(body.prompt_cache_key))
+          return new Response('ok', { status: 200 })
+        },
+        { preconnect: () => {} },
+      )
+      try {
+        const firstHooks = await CodexAuthPlugin(pluginInput(), {
+          experimentalWebSockets: false,
+        })
+        const firstFetch = await pluginFetch(firstHooks)
+        await firstFetch('https://api.openai.com/v1/responses', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-session-affinity': 'ses_persisted',
+          },
+          body: JSON.stringify(toolRequestBody()),
+        })
+        await firstHooks.dispose?.()
+
+        const secondHooks = await CodexAuthPlugin(pluginInput(), {
+          experimentalWebSockets: false,
+        })
+        const secondFetch = await pluginFetch(secondHooks)
+        await secondFetch('https://api.openai.com/v1/responses', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-session-affinity': 'ses_persisted',
+          },
+          body: JSON.stringify(toolRequestBody()),
+        })
+
+        expect(promptCacheKeys).toHaveLength(2)
+        expect(promptCacheKeys[1]).toBe(promptCacheKeys[0])
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+  })
+
+  test('rotates HTTP turn metadata for a new user turn and keeps it during tool continuations', async () => {
+    await withDumpEnv(async () => {
+      const originalFetch = globalThis.fetch
+      const turnIDs: string[] = []
+      globalThis.fetch = Object.assign(
+        async (_url: RequestInfo | URL, init?: RequestInit) => {
+          const headers = new Headers(init?.headers)
+          turnIDs.push(
+            JSON.parse(headers.get('x-codex-turn-metadata') ?? '{}').turn_id,
+          )
+          return new Response('ok', { status: 200 })
+        },
+        { preconnect: () => {} },
+      )
+      try {
+        const hooks = await CodexAuthPlugin(pluginInput(), {
+          experimentalWebSockets: false,
+        })
+        const fetch = await pluginFetch(hooks)
+
+        await fetch('https://api.openai.com/v1/responses', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-session-affinity': 'ses_turn_http',
+          },
+          body: JSON.stringify({
+            ...toolRequestBody(),
+            input: [
+              { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+            ],
+          }),
+        })
+        await fetch('https://api.openai.com/v1/responses', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-session-affinity': 'ses_turn_http',
+          },
+          body: JSON.stringify({
+            ...toolRequestBody(),
+            input: [
+              { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+              { type: 'function_call', call_id: 'call_1', name: 'bash' },
+              { type: 'function_call_output', call_id: 'call_1', output: 'ok' },
+            ],
+          }),
+        })
+        await fetch('https://api.openai.com/v1/responses', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-session-affinity': 'ses_turn_http',
+          },
+          body: JSON.stringify({
+            ...toolRequestBody(),
+            input: [
+              { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+              { type: 'function_call', call_id: 'call_1', name: 'bash' },
+              { type: 'function_call_output', call_id: 'call_1', output: 'ok' },
+              {
+                role: 'assistant',
+                content: [{ type: 'output_text', text: 'done' }],
+              },
+              { role: 'user', content: [{ type: 'input_text', text: 'two' }] },
+            ],
+          }),
+        })
+
+        expect(turnIDs).toHaveLength(3)
+        expect(turnIDs[1]).toBe(turnIDs[0])
+        expect(turnIDs[2]).not.toBe(turnIDs[0])
+        expect(turnIDs.every((id) => id[14] === '7')).toBe(true)
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+  })
+
   test('dumps final HTTP body and redacted request metadata when enabled', async () => {
     await withDumpEnv(async (dumpDir) => {
       const originalFetch = globalThis.fetch
@@ -163,9 +354,11 @@ async function withDumpEnv(run: (dumpDir: string) => Promise<void>) {
   const originalDump = process.env.CORTEXKIT_OPENAI_AUTH_DUMP
   const originalDumpDir = process.env.OPENCODE_OPENAI_AUTH_DUMP_DIR
   const originalConfigFile = process.env.OPENCODE_OPENAI_AUTH_FILE
+  const originalConfigDir = process.env.OPENCODE_CONFIG_DIR
   process.env.CORTEXKIT_OPENAI_AUTH_DUMP = '1'
   process.env.OPENCODE_OPENAI_AUTH_DUMP_DIR = dumpDir
   process.env.OPENCODE_OPENAI_AUTH_FILE = join(dumpDir, 'missing.json')
+  process.env.OPENCODE_CONFIG_DIR = dumpDir
   resetSettingsForTest()
   resetDumpStateForTest()
   try {
@@ -174,6 +367,7 @@ async function withDumpEnv(run: (dumpDir: string) => Promise<void>) {
     restoreEnv('CORTEXKIT_OPENAI_AUTH_DUMP', originalDump)
     restoreEnv('OPENCODE_OPENAI_AUTH_DUMP_DIR', originalDumpDir)
     restoreEnv('OPENCODE_OPENAI_AUTH_FILE', originalConfigFile)
+    restoreEnv('OPENCODE_CONFIG_DIR', originalConfigDir)
     resetSettingsForTest()
     resetDumpStateForTest()
     await rm(dumpDir, { recursive: true, force: true })

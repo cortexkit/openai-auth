@@ -69,6 +69,8 @@ jobs:
         include:
           - package: "@cortexkit/opencode-openai-auth"
             workspace: "@cortexkit/opencode-openai-auth"
+          - package: "@cortexkit/pi-openai-auth"
+            workspace: "@cortexkit/pi-openai-auth"
     steps:
       - uses: actions/checkout@v6
         with:
