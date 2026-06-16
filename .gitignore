@@ -8,6 +8,7 @@ packages/*/dist/
 # Local agent/dev state
 .opencode/
 .claude/
+HANDOVER.md
 
 # Editor and OS metadata
 .DS_Store
