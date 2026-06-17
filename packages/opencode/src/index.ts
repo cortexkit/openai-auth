@@ -339,7 +339,6 @@ function prepareCodexRequest(input: {
   removeExaWebSearchFunctionTool(parsed)
   rewriteHostedWebSearchReplay(parsed)
   maybeInjectCacheStabilizerTool(parsed)
-  maybeInjectImageGenerationTool(parsed)
   const clientMetadata: Record<string, unknown> = {
     ...(typeof parsed.client_metadata === 'object' &&
     parsed.client_metadata !== null
@@ -413,27 +412,6 @@ function removeExaWebSearchFunctionTool(parsed: Record<string, unknown>) {
         item.name === 'websearch_web_search_exa'
       ),
   )
-}
-
-// Optional native image generation (opt-in via config `imageGeneration: true` or
-// CORTEXKIT_OPENAI_AUTH_IMAGE_GENERATION=1 — env wins over config).
-//
-// Declares Codex's native `image_generation` tool so the model can produce images. This is a
-// FEATURE knob, not the cache fix — image_generation does NOT stabilize the prompt cache (mimic:
-// +image_generation = 8.3% cliffs, no help; web_search is the cache lever). It is server-executed:
-// when invoked, OpenAI generates the image and returns `image_generation_call` items + partial_image
-// events on the wire, which the plugin currently forwards verbatim to OpenCode's parser. Rendering/
-// saving the resulting PNG is a separate, still-unverified piece — keep this opt-in until the
-// end-to-end image round-trip through OpenCode is confirmed.
-function maybeInjectImageGenerationTool(parsed: Record<string, unknown>) {
-  if (!getSettings().imageGeneration) return
-  if (!Array.isArray(parsed.tools) || parsed.tools.length === 0) return
-  if (parsed.tools.some((t) => isRecord(t) && t.type === 'image_generation'))
-    return
-  parsed.tools = [
-    ...parsed.tools,
-    { type: 'image_generation', output_format: 'png' },
-  ]
 }
 
 // Match Codex's function-tool shape: drop the JSON-Schema `$schema` dialect marker

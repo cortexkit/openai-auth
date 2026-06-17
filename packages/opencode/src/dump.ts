@@ -177,7 +177,6 @@ function bodySummary(bodyText: string) {
     toolTypes,
     toolsHash: hashJson(tools),
     hasWebSearch: toolTypes.includes('web_search'),
-    hasImageGeneration: toolTypes.includes('image_generation'),
     clientMetadataKeys: clientMetadata
       ? Object.keys(clientMetadata).sort()
       : [],

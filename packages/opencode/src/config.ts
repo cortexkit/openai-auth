@@ -22,8 +22,6 @@ export interface OpenAIAuthConfig {
   webSockets?: boolean
   /** Use the hand-rolled raw TCP/TLS WebSocket client (incremental streaming). Default false. */
   rawWebSocket?: boolean
-  /** Declare the native image_generation tool. Default false. */
-  imageGeneration?: boolean
   /** Dump final Codex request bodies for cache debugging. Default false. */
   dump?: boolean
   /** Directory for request dumps. Defaults to the OS temp directory. */
@@ -34,7 +32,6 @@ export interface ResolvedSettings {
   webSearch: boolean
   webSockets: boolean
   rawWebSocket: boolean
-  imageGeneration: boolean
   dump: boolean
   dumpDir: string
 }
@@ -46,7 +43,6 @@ const ENV = {
   noWebSearch: 'CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH',
   webSockets: 'CORTEXKIT_OPENAI_AUTH_WEBSOCKETS',
   rawWebSocket: 'CORTEXKIT_OPENAI_AUTH_RAW_WS',
-  imageGeneration: 'CORTEXKIT_OPENAI_AUTH_IMAGE_GENERATION',
   dump: 'CORTEXKIT_OPENAI_AUTH_DUMP',
   dumpDir: 'OPENCODE_OPENAI_AUTH_DUMP_DIR',
   configFile: 'OPENCODE_OPENAI_AUTH_FILE',
@@ -120,11 +116,6 @@ function resolve(): ResolvedSettings {
     webSearch,
     webSockets: resolveBool(ENV.webSockets, config.webSockets, false),
     rawWebSocket: resolveBool(ENV.rawWebSocket, config.rawWebSocket, false),
-    imageGeneration: resolveBool(
-      ENV.imageGeneration,
-      config.imageGeneration,
-      false,
-    ),
     dump: resolveBool(ENV.dump, config.dump, false),
     dumpDir:
       process.env[ENV.dumpDir]?.trim() ||
