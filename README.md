@@ -99,6 +99,18 @@ CORTEXKIT_OPENAI_AUTH_DUMP=1 opencode
 
 Turn dumps off after debugging; `.body.json` files contain the full rewritten prompt/request body.
 
+Analyze cache cliffs for a dumped OpenCode session:
+
+```sh
+bun run analyze:cache -- --session ses_... --no-timeline
+```
+
+For raw consecutive request-body comparisons, include wire context:
+
+```sh
+bun run analyze:cache -- --session ses_... --no-timeline --wire-context 180
+```
+
 ## Transports
 
 The plugin can reach the Codex backend over plain HTTP or over the OpenAI Responses WebSocket. The transport choice does **not** affect prompt-cache behavior (the cache fix applies to all three); it only affects connection style and streaming.
