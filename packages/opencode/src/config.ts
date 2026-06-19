@@ -53,6 +53,7 @@ const ENV = {
   dumpDir: 'OPENCODE_OPENAI_AUTH_DUMP_DIR',
   codexApiEndpoint: 'CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT',
   configFile: 'OPENCODE_OPENAI_AUTH_FILE',
+  stateFile: 'OPENCODE_OPENAI_AUTH_STATE_FILE',
   configDir: 'OPENCODE_CONFIG_DIR',
 } as const
 

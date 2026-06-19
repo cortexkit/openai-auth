@@ -4,13 +4,15 @@ ChatGPT Plus/Pro OAuth support for [OpenCode](https://opencode.ai), maintained b
 
 This plugin lets OpenCode talk to the OpenAI **Codex** backend (`https://chatgpt.com/backend-api/codex/responses`) using a ChatGPT Plus/Pro subscription instead of a pay-as-you-go API key. It rewrites OpenCode's outbound OpenAI requests into Codex's request shape, filters the model list to OAuth-eligible models, zeroes provider costs for those models, and adds a prompt-cache stabilizer that keeps tool-continuation requests on the backend's cached path.
 
+On top of single-account auth it adds a full account-management layer: multiple ChatGPT accounts with automatic fallback when one is rate-limited, live quota visibility, a per-account killswitch, an idle prompt-cache keep-warm, and interactive in-TUI control surfaces for all of it.
+
 The plugin intentionally registers the built-in `openai` provider id. OpenCode loads external server plugins after its internal ones, so this package supersedes OpenCode's internal OpenAI auth hook without any change to your model configuration.
 
 ## Package
 
 | Package | Agent | Purpose |
 | --- | --- | --- |
-| `@cortexkit/opencode-openai-auth` | OpenCode | ChatGPT Plus/Pro OAuth, Codex request rewriting, model filtering, prompt-cache stabilizer, and an optional OpenAI Responses WebSocket transport. |
+| `@cortexkit/opencode-openai-auth` | OpenCode | ChatGPT Plus/Pro OAuth, Codex request rewriting, model filtering, prompt-cache stabilizer, multi-account fallback, quota tracking, cache keep-warm, and an optional OpenAI Responses WebSocket transport. |
 
 ## Install
 
@@ -49,7 +51,89 @@ Three methods are offered:
 - **ChatGPT Pro/Plus (headless)** — device-code flow for remote or headless machines: you're shown a code to enter at the OpenAI device page from any browser.
 - **Manually enter API Key** — falls back to a standard pay-as-you-go OpenAI API key (no OAuth, normal billing).
 
-OAuth tokens are stored and refreshed by OpenCode's own auth store.
+The account you log in with via `/login openai` is your **main** account, stored and refreshed by OpenCode's own auth store. Additional **fallback** accounts are managed separately (see [Multiple accounts](#multiple-accounts)).
+
+## Multiple accounts
+
+The plugin supports more than one ChatGPT account: a single **main** account (the one from `/login openai`, held in OpenCode's auth store) plus any number of **fallback** accounts (held in the plugin's own account store). When the main account hits a rate limit, traffic automatically rolls over to a healthy fallback for the rest of the limit window, then returns.
+
+- **Add a fallback** in the TUI with `/openai-account add [label]` (runs the same browser/headless OAuth flow as login), or from a shell with the `openai-auth` CLI (see [CLI](#cli)).
+- **Switch** which account serves traffic with `/openai-account switch <id>`. Switching is non-destructive — it re-routes by account id and never overwrites the main login, so you can switch back at any time.
+- Each account is identified by its stable ChatGPT account id, so the same account is never added twice.
+
+Fallback is **reactive**: a request that comes back `401`/`403`/`429` is transparently retried on the next usable account (the original request body is buffered so the retry is safe). Selection respects your [routing](#routing) preference and skips accounts the [killswitch](#killswitch) has gated out.
+
+### Routing
+
+`/openai-routing` controls account preference order:
+
+| Mode | Behavior |
+| --- | --- |
+| `main-first` (default) | Use the main account until it is exhausted, then fall back. |
+| `fallback-first` | Prefer fallback accounts and preserve the main account's quota. |
+
+### Killswitch
+
+`/openai-killswitch` hard-blocks requests for an account once its quota drops below a threshold, instead of letting the request through and burning the last of a window:
+
+- `/openai-killswitch on` / `off` — enable or disable hard-blocking.
+- `/openai-killswitch set <acct>:<5h>,<1w> ...` — set per-account 5-hour and weekly cutoff percentages (e.g. `main:5,10 work-alt:5,10`).
+
+## Quota
+
+Codex reports usage on **two rolling windows** — a 5-hour primary window and a weekly secondary window. The plugin reads quota **passively, per turn**, from whichever transport is in use, so there is no extra polling during normal work:
+
+- **HTTP/SSE** — `x-codex-*` response headers on every reply.
+- **WebSocket** — the in-band `codex.rate_limits` frame.
+
+`/openai-quota` shows the current 5h and weekly used-percent for every account. When you run it, it additionally polls the explicit usage endpoint for the main account **and every fallback** so even never-routed accounts show fresh numbers. Quota for the active account is also rendered in the OpenCode sidebar (used %, reset countdown, and a pacing estimate).
+
+## Cache keep-warm
+
+`/openai-cachekeep` keeps the Codex prompt cache warm while a session is idle, so the next real turn after a gap hits the cache instead of paying a cold-start. Codex evicts a session's prompt cache after roughly five minutes of inactivity; keep-warm replays the latest real request as a tiny shadow request (it generates no stored turn — `store: false`) just before the cache would expire.
+
+- `/openai-cachekeep on` / `off` — enable or disable. The setting is **persisted**, so it stays on across restarts and applies to every session until you turn it off.
+- `/openai-cachekeep subagents on` / `off` — also keep subagent sessions warm (off by default). Useful when the same subagent is reused repeatedly. Subagent sessions warm only while recently active (a 30-minute idle cap, versus one hour for the main session).
+- `/openai-cachekeep` — show status: enabled state, subagent mode, tracked sessions, and last-warm cost.
+
+Keep-warm only ever runs for **main-agent** sessions unless subagent mode is on, and an idle session stops warming once it passes its idle cap (then resumes if it becomes active again). Each warm reuses the session's own cached prefix, so its marginal cost is small (typically a near-100% cache hit plus a few dozen output tokens).
+
+## Logging
+
+The plugin writes a leveled, secret-redacting, size-rotating log:
+
+| Setting | Where | Default | Purpose |
+| --- | --- | --- | --- |
+| Log level | `/openai-logging` (TUI) or `OPENCODE_OPENAI_AUTH_LOG_LEVEL` | `info` | One of `error`, `warn`, `info`, `debug`, `trace`. `/openai-logging` changes it immediately without a restart and persists it. |
+| Log file | `OPENCODE_OPENAI_AUTH_LOG_FILE` | OS temp dir: `opencode-openai-auth.log` | Destination file. Rotates at 5 MB, keeping three older generations. |
+
+Token values and authorization/cookie headers are redacted from the log. Conversation/request bodies are never written to it (transport request dumps are a separate, explicit opt-in — see [`dump`](#configuration)).
+
+## Slash commands
+
+All commands open an interactive control surface in the TUI (a selectable dialog), and also accept the explicit argument forms below.
+
+| Command | Arguments | Purpose |
+| --- | --- | --- |
+| `/openai-quota` | — | Show 5h + weekly quota for all accounts (polls the usage endpoint). |
+| `/openai-account` | `add [label]` · `switch <id>` · `remove <id>` · `order <a> <b>` | List and manage accounts; add runs OAuth, switch is non-destructive, order swaps fallback positions. |
+| `/openai-routing` | `main-first` · `fallback-first` | Set account preference order. |
+| `/openai-killswitch` | `on` · `off` · `set <acct>:<5h>,<1w> ...` | Hard-block accounts below per-window quota thresholds. |
+| `/openai-cachekeep` | `on` · `off` · `subagents on` · `subagents off` | Idle prompt-cache keep-warm; optional subagent mode. |
+| `/openai-logging` | `<level>` | Set log level (`error`/`warn`/`info`/`debug`/`trace`) live. |
+| `/openai-dump` | `on` · `off` | Toggle transport request dumps for cache debugging. |
+
+## CLI
+
+The package installs an `openai-auth` binary for managing fallback accounts from a shell (useful on headless machines or in scripts):
+
+```text
+openai-auth login [--label <name>] [--headless]   # add a fallback account via OAuth
+openai-auth list                                   # list fallback accounts
+openai-auth remove <id>                            # remove a fallback account
+```
+
+`login` uses the browser flow by default; `--headless` uses the device-code flow. These manage **fallback** accounts only — the main account comes from `/login openai`.
 
 ## Configuration
 
@@ -77,6 +161,8 @@ Config file: `~/.config/opencode/openai-auth.json` (the directory follows `OPENC
 | Codex endpoint | `codexApiEndpoint` | `CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT` | `https://chatgpt.com/backend-api/codex/responses` | Send rewritten Codex requests to a compatible proxy/relay instead of ChatGPT's backend endpoint. |
 
 Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty. The `webSearch` negative env var (`CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH`), when set to a truthy value, disables the cache fix and always wins over the config file.
+
+The same `openai-auth.json` file also holds the managed **account store** (accounts, routing, killswitch thresholds, quota cache, log level, and cache-keep state). Those keys are written by the slash commands and the CLI — edit them through the commands rather than by hand. The plugin distinguishes the two: a settings-only file is never overwritten with account data, and account operations preserve your transport settings.
 
 Example — opt into the WebSocket transport via the config file:
 
@@ -121,7 +207,7 @@ bun run analyze:cache -- --session ses_... --no-timeline --wire-context 180
 
 ## Transports
 
-The plugin can reach the Codex backend over plain HTTP or over the OpenAI Responses WebSocket. The transport choice does **not** affect prompt-cache behavior (the cache fix applies to all three); it only affects connection style and streaming.
+The plugin can reach the Codex backend over plain HTTP or over the OpenAI Responses WebSocket. The transport choice does **not** affect prompt-cache behavior (the cache fix applies to all three) or quota tracking (both transports report quota per turn); it only affects connection style and streaming.
 
 | Transport | Enable with | Streaming | Notes |
 | --- | --- | --- | --- |

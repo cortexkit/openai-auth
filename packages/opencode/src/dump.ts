@@ -2,7 +2,9 @@ import { createHash } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { getSettings } from './config'
-import { log } from './logger'
+import { createLogger } from './logger'
+
+const log = createLogger('dump')
 
 export const DUMP_SESSION_HEADER = 'x-cortexkit-openai-auth-dump-session'
 
@@ -246,7 +248,7 @@ export async function dumpCodexRequest(input: {
         'utf8',
       ),
     ])
-    log('dumped request', {
+    log.debug('dumped request', {
       id,
       session: shortSession(sessionID),
       body: files.body,
@@ -256,7 +258,7 @@ export async function dumpCodexRequest(input: {
   } catch (error) {
     // Dumping is diagnostic-only. Never write failures to stderr: OpenCode surfaces plugin stderr
     // directly in the TUI, which would make an optional debug feature noisy for users.
-    log('request dump failed', {
+    log.warn('request dump failed', {
       session: shortSession(sessionID),
       error: error instanceof Error ? error.message : String(error),
     })
@@ -266,7 +268,7 @@ export async function dumpCodexRequest(input: {
 export async function dumpDiagnostic(event: Record<string, unknown>) {
   const settings = getSettings()
   if (!settings.dump) return
-  log('diagnostic', event)
+  log.debug('diagnostic', event)
 }
 
 export function resetDumpStateForTest() {

@@ -26,7 +26,34 @@ Restart OpenCode after changing plugin config, then authenticate:
 - Codex request rewriting for OAuth requests, with Codex identity parity.
 - OAuth model filtering and zero-cost display.
 - Prompt-cache stabilizer (`web_search`) that keeps tool-continuation requests on the backend's cached path (on by default).
+- Multiple ChatGPT accounts with automatic reactive fallback on rate limits, configurable routing, and a per-account quota killswitch.
+- Per-turn quota tracking (5-hour + weekly windows) on both transports, with a sidebar readout and an explicit all-accounts refresh.
+- Idle prompt-cache keep-warm, with an optional subagent mode.
+- Leveled, secret-redacting, rotating log file.
+- Interactive in-TUI control surfaces for every command, plus an `openai-auth` CLI for managing fallback accounts headlessly.
 - Optional OpenAI Responses WebSocket transport (HTTP is the default).
+
+## Commands
+
+Each opens an interactive dialog in the TUI and also accepts explicit arguments:
+
+| Command | Arguments | Purpose |
+| --- | --- | --- |
+| `/openai-quota` | — | Show 5h + weekly quota for all accounts. |
+| `/openai-account` | `add [label]` · `switch <id>` · `remove <id>` · `order <a> <b>` | Manage main + fallback accounts (non-destructive switch). |
+| `/openai-routing` | `main-first` · `fallback-first` | Account preference order. |
+| `/openai-killswitch` | `on` · `off` · `set <acct>:<5h>,<1w> ...` | Hard-block accounts below quota thresholds. |
+| `/openai-cachekeep` | `on` · `off` · `subagents on` · `subagents off` | Idle prompt-cache keep-warm. |
+| `/openai-logging` | `<level>` | Set log level live. |
+| `/openai-dump` | `on` · `off` | Toggle transport request dumps. |
+
+CLI (fallback accounts only; the main account comes from `/login openai`):
+
+```text
+openai-auth login [--label <name>] [--headless]
+openai-auth list
+openai-auth remove <id>
+```
 
 ## Configuration
 

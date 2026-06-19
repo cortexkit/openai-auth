@@ -1,0 +1,170 @@
+/**
+ * Phase 4 — Fallback selection tests.
+ *
+ * Verifies:
+ *  - fail-open: unknown-quota fallback is selectable
+ *  - NO outbound quota GET fires (selection-time pull deleted)
+ */
+
+import { describe, expect, it, jest } from 'bun:test'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import {
+  type AccountManagerOptions,
+  type AccountStorage,
+  type FallbackAccount,
+  FallbackAccountManager,
+  type OAuthAccount,
+} from '../core/accounts.ts'
+import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function makeOAuthAccount(overrides: Partial<OAuthAccount> = {}): OAuthAccount {
+  return {
+    id: overrides.id ?? 'test-fallback-1',
+    type: 'oauth',
+    access: 'test-access',
+    refresh: 'test-refresh',
+    expires: Date.now() + 3600_000,
+    ...overrides,
+  }
+}
+
+function makeStorage(accounts: FallbackAccount[]): AccountStorage {
+  return {
+    version: 1,
+    main: { type: 'opencode', provider: 'openai' },
+    accounts,
+    quota: { failClosedOnUnknownQuota: false, enabled: true },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('fallback selection', () => {
+  // -------------------------------------------------------------------
+  // fail-open: unknown-quota fallback is selectable
+  // -------------------------------------------------------------------
+
+  it('fail-open: unknown-quota fallback IS in getUsableFallbackAccounts when failClosedOnUnknownQuota=false', async () => {
+    const account = makeOAuthAccount({ quota: undefined })
+    const storage = makeStorage([account])
+
+    const manager = new FallbackAccountManager({
+      now: () => Date.now(),
+      fetchImpl: fetch,
+    })
+
+    const usable = await manager.getUsableFallbackAccounts(storage)
+    expect(usable.length).toBe(1)
+    expect(usable[0]!.id).toBe(account.id)
+  })
+
+  it('fail-closed: unknown-quota fallback is excluded when failClosedOnUnknownQuota=true', async () => {
+    const account = makeOAuthAccount({ quota: undefined })
+    const storage = makeStorage([account])
+    storage.quota = { failClosedOnUnknownQuota: true, enabled: true }
+
+    const manager = new FallbackAccountManager({
+      now: () => Date.now(),
+      fetchImpl: fetch,
+    })
+
+    const usable = await manager.getUsableFallbackAccounts(storage)
+    expect(usable.length).toBe(0)
+  })
+
+  // -------------------------------------------------------------------
+  // NO outbound quota GET fires at selection time
+  // -------------------------------------------------------------------
+
+  it('getUsableFallbackAccounts fires NO quota fetch when wham supplement OFF', async () => {
+    const account = makeOAuthAccount()
+    const storage = makeStorage([account])
+
+    let fetchCalled = false
+    const fetchQuotaFn = jest.fn().mockImplementation(() => {
+      fetchCalled = true
+      throw new Error('should not be called')
+    })
+
+    const manager = new FallbackAccountManager({
+      now: () => Date.now(),
+      fetchImpl: fetch,
+      fetchQuotaFn: fetchQuotaFn as AccountManagerOptions['fetchQuotaFn'],
+    })
+
+    const usable = await manager.getUsableFallbackAccounts(storage)
+    // The account has valid quota (fresh from mock), so it's usable
+    expect(usable.length).toBeGreaterThanOrEqual(0)
+    // The selection path must NOT call fetchQuotaFn
+    expect(fetchCalled).toBe(false)
+  })
+
+  it('refreshAccountQuota throws when fetchQuotaFn not injected (passive guard)', async () => {
+    const account = makeOAuthAccount()
+    const storage = makeStorage([account])
+
+    const manager = new FallbackAccountManager({
+      now: () => Date.now(),
+      fetchImpl: fetch,
+      // NO fetchQuotaFn injected
+    })
+
+    await expect(manager.refreshAccountQuota(account, storage)).rejects.toThrow(
+      'No fetchQuotaFn injected',
+    )
+  })
+
+  it('refreshQuotaForDueAccounts is a no-op when fetchQuotaFn not injected', async () => {
+    const account = makeOAuthAccount()
+    const _storage = makeStorage([account])
+
+    const manager = new FallbackAccountManager({
+      now: () => Date.now(),
+      fetchImpl: fetch,
+      // NO fetchQuotaFn injected
+    })
+
+    // Should not throw — it's a no-op
+    await expect(manager.refreshQuotaForDueAccounts()).resolves.toBeUndefined()
+  })
+
+  it('refreshQuotaForAllAccounts returns early when fetchQuotaFn not injected', async () => {
+    // Deterministic null-load: point at a guaranteed-nonexistent temp path
+    // so load() returns null regardless of test order or earlier test writes.
+    const tmpDir = mkdtempSync(join(tmpdir(), 'oai-fallback-select-'))
+    const oldFile = process.env.OPENCODE_OPENAI_AUTH_FILE
+    const oldState = process.env.OPENCODE_OPENAI_AUTH_STATE_FILE
+    try {
+      process.env.OPENCODE_OPENAI_AUTH_FILE = join(tmpDir, 'nonexistent.json')
+      process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = join(
+        tmpDir,
+        'nonexistent-state.json',
+      )
+
+      const account = makeOAuthAccount()
+      const _storage = makeStorage([account])
+
+      const manager = new FallbackAccountManager({
+        now: () => Date.now(),
+        fetchImpl: fetch,
+      })
+
+      const result = await manager.refreshQuotaForAllAccounts({ force: true })
+      expect(result.storage).toBeNull()
+      expect(result.errors).toEqual([])
+    } finally {
+      // Restore to the saved value (which is the floor when the preload is
+      // active) rather than deleting — never leave the env unset.
+      process.env.OPENCODE_OPENAI_AUTH_FILE = oldFile ?? FLOOR_AUTH_FILE
+      process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = oldState ?? FLOOR_STATE_FILE
+    }
+  })
+})

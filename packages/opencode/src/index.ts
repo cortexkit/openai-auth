@@ -1,27 +1,91 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { createServer } from 'node:http'
+import {
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
-import { setTimeout as sleep } from 'node:timers/promises'
 import type { Hooks, Plugin, PluginInput } from '@opencode-ai/plugin'
-
-import { getConfigDir, getSettings } from './config'
+import {
+  buildDialogPayload,
+  type CommandContext,
+  MODAL_COMMANDS,
+  OPENAI_ACCOUNT_COMMAND_NAME,
+  OPENAI_CACHEKEEP_COMMAND_NAME,
+  OPENAI_DUMP_COMMAND_NAME,
+  OPENAI_KILLSWITCH_COMMAND_NAME,
+  OPENAI_LOGGING_COMMAND_NAME,
+  OPENAI_QUOTA_COMMAND_NAME,
+  OPENAI_ROUTING_COMMAND_NAME,
+} from './commands'
+import { getConfigDir, getConfigPath, getSettings } from './config'
+import {
+  type AccountStorage,
+  type FallbackAccount,
+  FallbackAccountManager,
+  isCostZeroingEnabled,
+  isOAuthAccount,
+  loadAccounts,
+  migrateIfNeeded,
+  type OAuthAccount,
+  saveAccounts,
+  shouldFallbackStatus,
+} from './core/accounts'
+import {
+  buildRefreshOperationError,
+  formatRefreshBackoffMessage,
+  hashRefreshToken,
+  refreshBackoffActive,
+} from './core/backoff'
+import { buildKeepwarmCapture, CacheKeepManager } from './core/cachekeep'
+import {
+  base64UrlEncode,
+  beginDeviceAuth,
+  buildAuthorizeUrl,
+  completeDeviceAuth,
+  extractAccountId,
+  flowCleanup,
+  generatePKCE,
+  startOAuthServer,
+  USER_AGENT,
+  waitForOAuthCallback,
+} from './core/oauth'
+import { codexRefreshFn, whamUsageFn } from './core/provider'
+import { QuotaManager } from './core/quota-manager'
+import { refreshAllQuota } from './core/refresh-all-quota'
+import { acquireRefreshFileLock } from './core/refresh-file-lock'
 import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
 import {
   HostedWebSearchTool,
   rewriteHostedWebSearchReplay,
   translateHostedWebSearchResponse,
 } from './hosted-web-search'
+import { createLogger, setLogLevel } from './logger'
+import { normalizeQuotaHeaders } from './quota-normalize'
+import {
+  drainNotifications,
+  isTuiConnected,
+  pushNotification,
+} from './rpc/notifications'
+import type {
+  ApplyRequest,
+  ApplyResult,
+  CommandModalName,
+} from './rpc/protocol'
+import { getRpcDir } from './rpc/rpc-dir'
+import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server'
+import {
+  getSidebarStateFile,
+  type SidebarState,
+  setSidebarState,
+} from './sidebar-state'
 import { isRecord } from './util/record'
 import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
-import { PackageVersion } from './version'
 import { OpenAIWebSocketPool } from './ws-pool'
 
-const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
-const ISSUER = 'https://auth.openai.com'
-const OAUTH_PORT = 1455
-const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000
 const ALLOWED_MODELS = new Set([
   'gpt-5.5',
   'gpt-5.3-codex-spark',
@@ -29,105 +93,33 @@ const ALLOWED_MODELS = new Set([
   'gpt-5.4-mini',
 ])
 const OAUTH_DUMMY_KEY = 'opencode-oauth-dummy-key'
-const USER_AGENT = `cortexkit-opencode-openai-auth/${PackageVersion}`
 const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
 const CODEX_VERSION = '0.139.0'
 const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
 const CODEX_SANDBOX = 'seccomp'
+const MAIN_REFRESH_LOCK_NAME = 'main-refresh'
+const MAIN_REFRESH_LOCK_TTL_MS = 2 * 60_000
+const MAIN_REFRESH_LEASE_TTL_MS = 600_000
+const CONCURRENT_MAIN_REFRESH_WAIT_MS = 4_000
+const CONCURRENT_MAIN_REFRESH_POLL_BASE_MS = 50
 
-interface PkceCodes {
-  verifier: string
-  challenge: string
+const HANDLED_SENTINEL = '__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__'
+
+let bootQuotaSeedStarted = false
+
+function cleanAbort(): never {
+  throw new Error(HANDLED_SENTINEL)
 }
 
-async function generatePKCE(): Promise<PkceCodes> {
-  const chars =
-    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'
-  const verifier = Array.from(crypto.getRandomValues(new Uint8Array(43)))
-    .map((b) => chars[b % chars.length])
-    .join('')
-  const challenge = base64UrlEncode(
-    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)),
-  )
-  return { verifier, challenge }
+function jitterMs(baseMs: number) {
+  return Math.floor(Math.random() * baseMs)
 }
 
-function base64UrlEncode(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer)
-  const binary = String.fromCharCode(...bytes)
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-}
-
-export interface IdTokenClaims {
-  chatgpt_account_id?: string
-  organizations?: Array<{ id: string }>
-  email?: string
-  'https://api.openai.com/auth'?: {
-    chatgpt_account_id?: string
-  }
-}
-
-export function parseJwtClaims(token: string): IdTokenClaims | undefined {
-  const parts = token.split('.')
-  if (parts.length !== 3) return undefined
-  const payload = parts[1]
-  if (!payload) return undefined
-  try {
-    return JSON.parse(Buffer.from(payload, 'base64url').toString())
-  } catch {
-    return undefined
-  }
-}
-
-export function extractAccountIdFromClaims(
-  claims: IdTokenClaims,
-): string | undefined {
-  return (
-    claims.chatgpt_account_id ||
-    claims['https://api.openai.com/auth']?.chatgpt_account_id ||
-    claims.organizations?.[0]?.id
-  )
-}
-
-export function extractAccountId(tokens: TokenResponse): string | undefined {
-  if (tokens.id_token) {
-    const claims = parseJwtClaims(tokens.id_token)
-    const accountId = claims && extractAccountIdFromClaims(claims)
-    if (accountId) return accountId
-  }
-  if (tokens.access_token) {
-    const claims = parseJwtClaims(tokens.access_token)
-    return claims ? extractAccountIdFromClaims(claims) : undefined
-  }
-  return undefined
-}
-
-function buildAuthorizeUrl(
-  redirectUri: string,
-  pkce: PkceCodes,
-  state: string,
-): string {
-  const params = new URLSearchParams({
-    response_type: 'code',
-    client_id: CLIENT_ID,
-    redirect_uri: redirectUri,
-    scope: 'openid profile email offline_access',
-    code_challenge: pkce.challenge,
-    code_challenge_method: 'S256',
-    id_token_add_organizations: 'true',
-    codex_cli_simplified_flow: 'true',
-    state,
-    originator: 'opencode',
-  })
-  return `${ISSUER}/oauth/authorize?${params.toString()}`
-}
-
-interface TokenResponse {
-  id_token: string
-  access_token: string
-  refresh_token: string
-  expires_in?: number
-}
+export {
+  extractAccountIdFromClaims,
+  type IdTokenClaims,
+  parseJwtClaims,
+} from './core/oauth'
 
 interface CodexAuthPluginOptions {
   issuer?: string
@@ -356,25 +348,30 @@ function prepareCodexRequest(input: {
   return { init: { ...input.init, body: JSON.stringify(parsed) } }
 }
 
+export function findCachekeepFallbackAccount(
+  accounts: FallbackAccount[],
+  accountId: string,
+): OAuthAccount | undefined {
+  return accounts.find(
+    (a): a is OAuthAccount =>
+      a.enabled !== false &&
+      isOAuthAccount(a) &&
+      (a.id === accountId || a.accountId === accountId),
+  )
+}
+
 // Prompt-cache stabilizer (ON by default; opt out via config `webSearch: false` or
 // CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH=1 — env wins over config).
 //
 // The Codex `responses` backend only puts a request on the STABLE prompt-cache path when its
-// `tools` array carries an OpenAI-native tool type. OpenCode declares only custom `function`
-// tools, so its tool-continuation requests land on a flaky best-effort cache and intermittently
-// drop cached_tokens to 0 ("cliffs"). We append a single native `web_search` tool to flip every
-// tool-bearing request onto the stable cache path.
-//
-// Evidence: standalone Bun mimic (size-controlled 24000c prefix) — +web_search 10.6%->0% cliffs;
-// image_generation (8.3%) and tool_search (4.5%) do NOT fully fix it, so it is web_search-specific.
-// End-to-end in real OpenCode (no-AFT, same-session A/B): control 20% cliffs (10/50) -> 0% (0/42),
-// and 0% on native WS too (0/49) — the fix is transport-independent. The stabilizer also
-// ~doubles the steady cached prefix (~3-5.6k -> ~8-10k tokens), so it is a net cost win.
-//
-// web_search executes server-side, so a model invocation would run a real OpenAI web search, but
-// across the end-to-end runs the model never once invoked it on a coding task (websearch_calls=0).
-// Only injected when the request already carries tools (agentic turns); empty/tool-less requests
-// have no continuation cliff to fix and are left untouched.
+// OpenAI's prompt-cache path for tool-continuation requests is hashed against
+// the tool type set. Requests carrying only custom `function` tools can
+// intermittently fail to hit the cache, dropping cached_tokens to 0.
+// Appending a native `web_search` tool — which executes server-side and is
+// never actually invoked by the model on coding tasks — redirects every
+// tool-bearing request onto the stable cache path. Only injected when the
+// request already carries tools (agentic turns); tool-less requests have no
+// cache-continuation risk and are left untouched.
 function maybeInjectCacheStabilizerTool(parsed: Record<string, unknown>) {
   if (!getSettings().webSearch) return
   if (!Array.isArray(parsed.tools) || parsed.tools.length === 0) return
@@ -440,292 +437,12 @@ function normalizeCodexTool(tool: unknown) {
   }
 }
 
-async function exchangeCodeForTokens(
-  code: string,
-  redirectUri: string,
-  pkce: PkceCodes,
-): Promise<TokenResponse> {
-  const response = await fetch(`${ISSUER}/oauth/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'authorization_code',
-      code,
-      redirect_uri: redirectUri,
-      client_id: CLIENT_ID,
-      code_verifier: pkce.verifier,
-    }).toString(),
-  })
-  if (!response.ok) {
-    throw new Error(`Token exchange failed: ${response.status}`)
-  }
-  return (await response.json()) as TokenResponse
-}
-
-async function refreshAccessToken(
-  refreshToken: string,
-  issuer = ISSUER,
-): Promise<TokenResponse> {
-  const response = await fetch(`${issuer}/oauth/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'refresh_token',
-      refresh_token: refreshToken,
-      client_id: CLIENT_ID,
-    }).toString(),
-  })
-  if (!response.ok) {
-    throw new Error(`Token refresh failed: ${response.status}`)
-  }
-  return (await response.json()) as TokenResponse
-}
-
-const HTML_SUCCESS = `<!doctype html>
-<html>
-  <head>
-    <title>CortexKit OpenAI Auth - Authorization Successful</title>
-    <style>
-      body {
-        font-family:
-          system-ui,
-          -apple-system,
-          sans-serif;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        height: 100vh;
-        margin: 0;
-        background: #131010;
-        color: #f1ecec;
-      }
-      .container {
-        text-align: center;
-        padding: 2rem;
-      }
-      h1 {
-        color: #f1ecec;
-        margin-bottom: 1rem;
-      }
-      p {
-        color: #b7b1b1;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="container">
-      <h1>Authorization Successful</h1>
-      <p>You can close this window and return to OpenCode.</p>
-    </div>
-    <script>
-      setTimeout(() => window.close(), 2000)
-    </script>
-  </body>
-</html>`
-
-function escapeHtml(value: string) {
-  return value
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;')
-}
-
-const HTML_ERROR = (error: string) => `<!doctype html>
-<html>
-  <head>
-    <title>CortexKit OpenAI Auth - Authorization Failed</title>
-    <style>
-      body {
-        font-family:
-          system-ui,
-          -apple-system,
-          sans-serif;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        height: 100vh;
-        margin: 0;
-        background: #131010;
-        color: #f1ecec;
-      }
-      .container {
-        text-align: center;
-        padding: 2rem;
-      }
-      h1 {
-        color: #fc533a;
-        margin-bottom: 1rem;
-      }
-      p {
-        color: #b7b1b1;
-      }
-      .error {
-        color: #ff917b;
-        font-family: monospace;
-        margin-top: 1rem;
-        padding: 1rem;
-        background: #3c140d;
-        border-radius: 0.5rem;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="container">
-      <h1>Authorization Failed</h1>
-      <p>An error occurred during authorization.</p>
-      <div class="error">${escapeHtml(error)}</div>
-    </div>
-  </body>
-</html>`
-
-interface PendingOAuth {
-  pkce: PkceCodes
-  state: string
-  resolve: (tokens: TokenResponse) => void
-  reject: (error: Error) => void
-}
-
-let oauthServer: ReturnType<typeof createServer> | undefined
-let pendingOAuth: PendingOAuth | undefined
-
-async function startOAuthServer(): Promise<{
-  port: number
-  redirectUri: string
-}> {
-  if (oauthServer) {
-    return {
-      port: OAUTH_PORT,
-      redirectUri: `http://localhost:${OAUTH_PORT}/auth/callback`,
-    }
-  }
-
-  const server = createServer((req, res) => {
-    const url = new URL(req.url || '/', `http://localhost:${OAUTH_PORT}`)
-
-    if (url.pathname === '/auth/callback') {
-      const code = url.searchParams.get('code')
-      const state = url.searchParams.get('state')
-      const error = url.searchParams.get('error')
-      const errorDescription = url.searchParams.get('error_description')
-
-      if (error) {
-        const errorMsg = errorDescription || error
-        pendingOAuth?.reject(new Error(errorMsg))
-        pendingOAuth = undefined
-        res.writeHead(200, { 'Content-Type': 'text/html' })
-        res.end(HTML_ERROR(errorMsg))
-        return
-      }
-
-      if (!code) {
-        const errorMsg = 'Missing authorization code'
-        pendingOAuth?.reject(new Error(errorMsg))
-        pendingOAuth = undefined
-        res.writeHead(400, { 'Content-Type': 'text/html' })
-        res.end(HTML_ERROR(errorMsg))
-        return
-      }
-
-      if (!pendingOAuth || state !== pendingOAuth.state) {
-        const errorMsg = 'Invalid state - potential CSRF attack'
-        pendingOAuth?.reject(new Error(errorMsg))
-        pendingOAuth = undefined
-        res.writeHead(400, { 'Content-Type': 'text/html' })
-        res.end(HTML_ERROR(errorMsg))
-        return
-      }
-
-      const current = pendingOAuth
-      pendingOAuth = undefined
-
-      exchangeCodeForTokens(
-        code,
-        `http://localhost:${OAUTH_PORT}/auth/callback`,
-        current.pkce,
-      )
-        .then((tokens) => current.resolve(tokens))
-        .catch((err) => current.reject(err))
-
-      res.writeHead(200, { 'Content-Type': 'text/html' })
-      res.end(HTML_SUCCESS)
-      return
-    }
-
-    if (url.pathname === '/cancel') {
-      pendingOAuth?.reject(new Error('Login cancelled'))
-      pendingOAuth = undefined
-      res.writeHead(200)
-      res.end('Login cancelled')
-      return
-    }
-
-    res.writeHead(404)
-    res.end('Not found')
-  })
-
-  oauthServer = server
-
-  await new Promise<void>((resolve, reject) => {
-    server.listen(OAUTH_PORT, () => {
-      resolve()
-    })
-    server.on('error', reject)
-  })
-
-  return {
-    port: OAUTH_PORT,
-    redirectUri: `http://localhost:${OAUTH_PORT}/auth/callback`,
-  }
-}
-
-function stopOAuthServer() {
-  if (oauthServer) {
-    oauthServer.close(() => {})
-    oauthServer = undefined
-  }
-}
-
-function waitForOAuthCallback(
-  pkce: PkceCodes,
-  state: string,
-): Promise<TokenResponse> {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(
-      () => {
-        if (pendingOAuth) {
-          pendingOAuth = undefined
-          reject(
-            new Error('OAuth callback timeout - authorization took too long'),
-          )
-        }
-      },
-      5 * 60 * 1000,
-    ) // 5 minute timeout
-
-    pendingOAuth = {
-      pkce,
-      state,
-      resolve: (tokens) => {
-        clearTimeout(timeout)
-        resolve(tokens)
-      },
-      reject: (error) => {
-        clearTimeout(timeout)
-        reject(error)
-      },
-    }
-  })
-}
-
 export async function CodexAuthPlugin(
   input: PluginInput,
   options: CodexAuthPluginOptions = {},
 ): Promise<Hooks> {
-  const settings = getSettings()
-  const issuer = options.issuer ?? ISSUER
-  const codexApiEndpoint = options.codexApiEndpoint ?? settings.codexApiEndpoint
+  const codexApiEndpoint =
+    options.codexApiEndpoint ?? getSettings().codexApiEndpoint
   const installationID = crypto.randomUUID()
   const codexSessions = loadCodexSessions()
   const persistCodexSessions = () => saveCodexSessions(codexSessions)
@@ -733,6 +450,28 @@ export async function CodexAuthPlugin(
   const websocketFetches: Array<
     ReturnType<typeof OpenAIWebSocketPool.createWebSocketFetch>
   > = []
+
+  // Command context holder — filled by the auth loader on first run.
+  // command.execute.before reads this; if null (auth not loaded yet),
+  // the command is rejected with a message.
+  let cmdCtx: CommandContext | null = null
+
+  async function sendIgnoredMessage(sessionId: string, text: string) {
+    const session = input.client.session as
+      | { promptAsync?: (req: unknown) => Promise<unknown> }
+      | undefined
+    if (typeof session?.promptAsync === 'function') {
+      await session.promptAsync({
+        path: { id: sessionId },
+        body: {
+          noReply: true,
+          parts: [{ type: 'text', text, ignored: true }],
+        },
+      })
+      return
+    }
+    // Fallback: log it. The user won't see the dialog if TUI is not running.
+  }
 
   return {
     async dispose() {
@@ -751,6 +490,9 @@ export async function CodexAuthPlugin(
       async models(provider, ctx) {
         if (ctx.auth?.type !== 'oauth') return provider.models
 
+        const storage = await loadAccounts(getConfigPath())
+        const zeroCosts = !storage || isCostZeroingEnabled(storage)
+
         return Object.fromEntries(
           Object.entries(provider.models)
             .filter(([, model]) => {
@@ -763,11 +505,9 @@ export async function CodexAuthPlugin(
               modelID,
               {
                 ...model,
-                cost: {
-                  input: 0,
-                  output: 0,
-                  cache: { read: 0, write: 0 },
-                },
+                cost: zeroCosts
+                  ? { input: 0, output: 0, cache: { read: 0, write: 0 } }
+                  : model.cost,
                 limit: model.id.includes('gpt-5.5')
                   ? {
                       context: 400_000,
@@ -789,10 +529,381 @@ export async function CodexAuthPlugin(
         const auth = await getAuth()
         if (auth.type !== 'oauth') return {}
 
+        // Migration: seed the multi-account store from the existing token (idempotent)
+        await migrateIfNeeded(
+          {
+            type: 'oauth',
+            access: auth.access ?? '',
+            refresh: auth.refresh ?? '',
+            expires: auth.expires ?? 0,
+          },
+          getConfigPath(),
+        )
+
+        // Construct managers for push-only quota updates from response headers.
+        // Wrap the first boot-time read so a corrupt store surfaces a clear,
+        // actionable message instead of a raw JSON.parse SyntaxError.
+        const storage = await loadAccounts(getConfigPath()).catch((err) => {
+          const path = getConfigPath()
+          throw new Error(
+            `OpenAI auth store at ${path} is corrupt or unreadable: ${err instanceof Error ? err.message : String(err)}. Fix or remove it to continue.`,
+            { cause: err },
+          )
+        })
+
+        let requestStorageCache:
+          | {
+              path: string
+              mtimeMs: number
+              size: number
+              storage: Awaited<ReturnType<typeof loadAccounts>>
+            }
+          | undefined
+
+        async function loadRequestAccounts() {
+          const path = getConfigPath()
+          try {
+            const stat = statSync(path)
+            if (
+              requestStorageCache?.path === path &&
+              requestStorageCache.mtimeMs === stat.mtimeMs &&
+              requestStorageCache.size === stat.size
+            ) {
+              return requestStorageCache.storage
+            }
+            const next = await loadAccounts(path)
+            requestStorageCache = {
+              path,
+              mtimeMs: stat.mtimeMs,
+              size: stat.size,
+              storage: next,
+            }
+            return next
+          } catch {
+            requestStorageCache = undefined
+            return loadAccounts(path)
+          }
+        }
+
+        function invalidateRequestStorageCache() {
+          requestStorageCache = undefined
+        }
+
+        // Derive the main account's stable ChatGPT identity from the live
+        // token on every invocation so storage.mainAccountId stays current
+        // (migrateIfNeeded only sets it once on first run). The CLI add path
+        // rejects against the persisted value — acceptable because the plugin
+        // refreshes it here each time the auth loader runs.
+        if (storage && auth.access) {
+          const liveAccountId = extractAccountId({
+            id_token: '',
+            access_token: auth.access,
+            refresh_token: auth.refresh ?? '',
+          })
+          if (liveAccountId && liveAccountId !== storage.mainAccountId) {
+            storage.mainAccountId = liveAccountId
+            await saveAccounts(storage, getConfigPath())
+            invalidateRequestStorageCache()
+          }
+        }
+
+        // Restore persisted log level from stored config.
+        const storedLevel = storage?.logging?.level
+        if (storedLevel && typeof storedLevel === 'string') {
+          setLogLevel(storedLevel as Parameters<typeof setLogLevel>[0])
+        }
+
+        // Transport logging follows the persisted runtime log level.
+        const logT = createLogger('transport')
+        const logQ = createLogger('quota')
+        const logR = createLogger('refresh')
+        const logA = createLogger('accounts')
+
+        const quotaManager = new QuotaManager({
+          storage,
+          fetchQuotaFn: undefined, // push-only: quota comes from HTTP headers / WS frames
+        })
+        const fallbackManager = new FallbackAccountManager({
+          refreshFn: (opts) =>
+            codexRefreshFn({
+              refreshToken: opts.refreshToken,
+              fetchImpl: opts.fetchImpl,
+              now: opts.now,
+            }),
+          quotaManager,
+          onFallbackStorageChanged: invalidateRequestStorageCache,
+        })
+        // Start background refresh only when fallback accounts are configured;
+        // single-account paths must not create extra token refresh traffic.
+        if (storage && storage.accounts.length > 0) {
+          fallbackManager.startBackgroundRefresh()
+        }
+
+        // -------------------------------------------------------------------
+        // CacheKeepManager — prompt-cache warmer for idle main-agent sessions
+        // -------------------------------------------------------------------
+        const cacheKeepLogger = createLogger('cachekeep')
+        let cacheKeepEnabled = storage?.cachekeep?.enabled === true
+        let cacheKeepSubagents = storage?.cachekeep?.subagents === true
+        let mainRefreshPromise:
+          | Promise<{ access: string; refresh: string; expires: number }>
+          | undefined
+
+        async function updateMainRefreshState(
+          update: (storage: AccountStorage) => void,
+        ) {
+          const nextStorage = (await loadAccounts(getConfigPath())) ?? {
+            version: 1 as const,
+            main: { type: 'opencode' as const, provider: 'openai' as const },
+            accounts: [],
+          }
+          nextStorage.refresh = nextStorage.refresh ?? {}
+          update(nextStorage)
+          await saveAccounts(nextStorage, getConfigPath())
+          invalidateRequestStorageCache()
+        }
+
+        async function waitForConcurrentMainRefresh(previous: {
+          access?: string
+          refresh?: string
+          expires?: number
+        }) {
+          const deadline = Date.now() + CONCURRENT_MAIN_REFRESH_WAIT_MS
+          while (Date.now() < deadline) {
+            await new Promise((resolve) =>
+              setTimeout(
+                resolve,
+                CONCURRENT_MAIN_REFRESH_POLL_BASE_MS +
+                  jitterMs(CONCURRENT_MAIN_REFRESH_POLL_BASE_MS),
+              ),
+            )
+            const latest = await getAuth()
+            if (latest.type !== 'oauth' || !latest.access) continue
+            const changed =
+              latest.access !== previous.access ||
+              latest.refresh !== previous.refresh ||
+              (latest.expires ?? 0) > (previous.expires ?? 0) + 60_000
+            if (changed && (!latest.expires || latest.expires > Date.now())) {
+              logR.debug('joined concurrent main refresh', {
+                pid: process.pid,
+                expiresInMs: latest.expires
+                  ? latest.expires - Date.now()
+                  : undefined,
+              })
+              return {
+                access: latest.access,
+                refresh: latest.refresh ?? previous.refresh ?? '',
+                expires: latest.expires ?? 0,
+              }
+            }
+          }
+          return null
+        }
+
+        async function refreshMainWithLease() {
+          if (!mainRefreshPromise) {
+            mainRefreshPromise = (async () => {
+              const freshAuth = await getAuth()
+              if (freshAuth.type !== 'oauth') throw new Error('not oauth')
+              if (!freshAuth.refresh) {
+                throw new Error('Token refresh failed: missing refresh token')
+              }
+
+              const refreshTokenHash = hashRefreshToken(freshAuth.refresh)
+              const latestStorage = await loadAccounts(getConfigPath())
+              const mainError = latestStorage?.refresh?.mainLastRefreshError
+              if (
+                mainError &&
+                refreshBackoffActive(mainError, freshAuth.refresh, Date.now())
+              ) {
+                throw new Error(
+                  formatRefreshBackoffMessage(mainError, Date.now()),
+                )
+              }
+
+              if (
+                latestStorage?.refresh?.mainRefreshLeaseUntil &&
+                latestStorage.refresh.mainRefreshLeaseUntil > Date.now() &&
+                latestStorage.refresh.mainRefreshLeaseTokenHash ===
+                  refreshTokenHash
+              ) {
+                const concurrent = await waitForConcurrentMainRefresh(freshAuth)
+                if (concurrent) return concurrent
+                throw new Error('Codex OAuth refresh is already in progress')
+              }
+
+              const fileLock = await acquireRefreshFileLock({
+                name: MAIN_REFRESH_LOCK_NAME,
+                ttlMs: MAIN_REFRESH_LOCK_TTL_MS,
+                path: getConfigPath(),
+                renew: true,
+              })
+              if (!fileLock) {
+                const concurrent = await waitForConcurrentMainRefresh(freshAuth)
+                if (concurrent) return concurrent
+                throw new Error('Codex OAuth refresh is already in progress')
+              }
+
+              const leaseId = crypto.randomUUID()
+              let leaseTokenHash: string | undefined = refreshTokenHash
+              try {
+                await updateMainRefreshState((nextStorage) => {
+                  nextStorage.refresh = nextStorage.refresh ?? {}
+                  nextStorage.refresh.mainRefreshLeaseId = leaseId
+                  nextStorage.refresh.mainRefreshLeaseUntil =
+                    Date.now() + MAIN_REFRESH_LEASE_TTL_MS
+                  nextStorage.refresh.mainRefreshLeaseTokenHash =
+                    refreshTokenHash
+                })
+
+                const latestLease = await loadAccounts(getConfigPath())
+                if (
+                  latestLease?.refresh?.mainRefreshLeaseId !== leaseId ||
+                  latestLease.refresh.mainRefreshLeaseTokenHash !==
+                    refreshTokenHash
+                ) {
+                  throw new Error('Codex OAuth refresh is already in progress')
+                }
+
+                const tokens = await codexRefreshFn({
+                  refreshToken: freshAuth.refresh,
+                  fetchImpl: fetch,
+                  now: Date.now,
+                })
+                await input.client.auth.set({
+                  path: { id: 'openai' },
+                  body: {
+                    type: 'oauth',
+                    refresh: tokens.refresh,
+                    access: tokens.access,
+                    expires: tokens.expires,
+                  },
+                })
+                await updateMainRefreshState((nextStorage) => {
+                  nextStorage.refresh = nextStorage.refresh ?? {}
+                  nextStorage.refresh.mainLastRefreshError = undefined
+                  if (nextStorage.refresh.mainRefreshLeaseId === leaseId) {
+                    nextStorage.refresh.mainRefreshLeaseId = undefined
+                    nextStorage.refresh.mainRefreshLeaseUntil = undefined
+                    nextStorage.refresh.mainRefreshLeaseTokenHash = undefined
+                  }
+                }).catch(() => {})
+                leaseTokenHash = undefined
+                return tokens
+              } catch (error) {
+                if (freshAuth.refresh) {
+                  await updateMainRefreshState((nextStorage) => {
+                    nextStorage.refresh = nextStorage.refresh ?? {}
+                    nextStorage.refresh.mainLastRefreshError =
+                      buildRefreshOperationError({
+                        error,
+                        now: Date.now(),
+                        refreshToken: freshAuth.refresh ?? '',
+                        previous: nextStorage.refresh.mainLastRefreshError,
+                      })
+                  }).catch(() => {})
+                }
+                throw error
+              } finally {
+                if (leaseTokenHash) {
+                  await updateMainRefreshState((nextStorage) => {
+                    if (
+                      nextStorage.refresh?.mainRefreshLeaseId === leaseId &&
+                      nextStorage.refresh.mainRefreshLeaseTokenHash ===
+                        leaseTokenHash
+                    ) {
+                      nextStorage.refresh.mainRefreshLeaseId = undefined
+                      nextStorage.refresh.mainRefreshLeaseUntil = undefined
+                      nextStorage.refresh.mainRefreshLeaseTokenHash = undefined
+                    }
+                  }).catch(() => {})
+                }
+                await fileLock.release().catch(() => {})
+              }
+            })().finally(() => {
+              mainRefreshPromise = undefined
+            })
+          }
+          return mainRefreshPromise
+        }
+        const cacheKeepGlobal = globalThis as {
+          __openaiAuthCacheKeepManager?: CacheKeepManager
+        }
+        cacheKeepGlobal.__openaiAuthCacheKeepManager?.stop()
+        const cacheKeepManager = new CacheKeepManager({
+          fetchImpl: fetch,
+          getMainToken: async () => {
+            const auth = await getAuth()
+            if (auth.type !== 'oauth') throw new Error('not oauth')
+            if (!auth.access || (auth.expires ?? 0) < Date.now()) {
+              try {
+                return (await refreshMainWithLease()).access
+              } catch {
+                if (auth.access) return auth.access
+                throw new Error('main token refresh failed')
+              }
+            }
+            return auth.access
+          },
+          refreshFallback: async (accountId: string) => {
+            const fbStorage = await loadRequestAccounts()
+            const account = fbStorage
+              ? findCachekeepFallbackAccount(fbStorage.accounts, accountId)
+              : undefined
+            if (!account)
+              throw new Error(`fallback account ${accountId} not found`)
+            const refreshed = await fallbackManager.refreshAccount(
+              account,
+              fbStorage ?? { version: 1 as const, accounts: [account] },
+            )
+            if (!refreshed.access)
+              throw new Error(`no access token for ${accountId}`)
+            return refreshed.access
+          },
+          codexResponsesUrl: codexApiEndpoint,
+          logger: cacheKeepLogger,
+          now: Date.now,
+        })
+        cacheKeepGlobal.__openaiAuthCacheKeepManager = cacheKeepManager
+
+        async function pushQuota(
+          snapshot: Record<string, unknown>,
+          accessToken: string,
+          accountId?: string,
+        ) {
+          if (Object.keys(snapshot).length === 0) return
+          const now = Date.now()
+          const entry = {
+            quota: snapshot as Parameters<
+              typeof quotaManager.setMain
+            >[1]['quota'],
+            refreshAfter: now + 5 * 60 * 1000,
+            checkedAt: now,
+          }
+          if (accountId && accountId !== 'main') {
+            quotaManager.setFallback(accountId, entry, accessToken)
+          } else {
+            quotaManager.setMain(accessToken, entry)
+          }
+          logQ.debug('quota pushed', {
+            pid: process.pid,
+            accountId: accountId ?? 'main',
+            snapshot,
+          })
+          const latestStorage = await loadRequestAccounts()
+          await writeSidebarState(quotaManager, latestStorage)
+        }
+
         const websocketFetch = options.experimentalWebSockets
           ? OpenAIWebSocketPool.createWebSocketFetch({
               httpFetch: fetch,
-              rawWebSocket: settings.rawWebSocket,
+              rawWebSocket: getSettings().rawWebSocket,
+              // Per-request account identity is captured at send time by the
+              // pool and threaded here so the frame is attributed to the
+              // connection's own account, not the shared mutable globals.
+              onQuota: (s, accessToken, accountId) => {
+                void pushQuota(s, accessToken, accountId)
+              },
             })
           : undefined
         if (websocketFetch) {
@@ -800,19 +911,512 @@ export async function CodexAuthPlugin(
           websocketFetchInstalled = true
         }
 
-        let refreshPromise:
-          | Promise<{
-              access: string
-              accountId: string | undefined
-            }>
-          | undefined
+        // -------------------------------------------------------------------
+        // writeSidebarState — snapshot the QuotaManager's view into the
+        // sidebar-state.json file for the TUI to read. Best-effort.
+        //
+        // The sidebar path is resolved ONCE here (at loader-run time) and
+        // captured in boundSidebarFile. All writes from this loader instance
+        // — including fire-and-forget boot-seed and background timer callbacks
+        // — pass the bound path explicitly so they cannot re-resolve
+        // getSidebarStateFile() if the env changes underneath them (e.g.
+        // during tests where afterEach restores the env floor).
+        // -------------------------------------------------------------------
+        const boundSidebarFile = getSidebarStateFile()
+        async function writeSidebarState(
+          qm: QuotaManager,
+          store: Awaited<ReturnType<typeof loadAccounts>>,
+        ) {
+          if (!store) return
+          const mainQuota = qm.getMain()?.quota
+          const sidebar: SidebarState = {
+            main: {
+              quota: mainQuota ?? null,
+              killed: false,
+            },
+            fallbacks: store.accounts
+              .filter((a) => a.enabled)
+              .map((a) => {
+                const fbQuota = qm.getFallback(a.id)?.quota ?? null
+                return {
+                  id: a.id,
+                  label: (a as { label?: string }).label,
+                  quota: fbQuota,
+                  killed: false,
+                  enabled: true,
+                }
+              }),
+            activeId: store.routing?.activeId ?? 'main',
+            route: store.routing?.mode ?? 'main-first',
+            lastUpdated: Date.now(),
+          }
+          // Pass the bound path so this instance's writes always go to the
+          // file that was configured when the loader ran.
+          await setSidebarState(sidebar, boundSidebarFile)
+        }
 
+        // -------------------------------------------------------------------
+        // Start the loopback RPC server so the TUI can drain notifications and
+        // dispatch apply commands.
+        // -------------------------------------------------------------------
+        cmdCtx = {
+          accountStoragePath: getConfigPath(),
+          quotaManager,
+          loadAccounts,
+          client: input.client as CommandContext['client'],
+          cacheKeepManager,
+          setCacheKeepEnabled: (enabled) => {
+            cacheKeepEnabled = enabled
+          },
+          setCacheKeepSubagents: (enabled) => {
+            cacheKeepSubagents = enabled
+          },
+          refreshSidebar: async () => {
+            const store = await loadAccounts(getConfigPath())
+            await writeSidebarState(quotaManager, store)
+          },
+          refreshAllQuota: async () =>
+            refreshAllQuota({
+              getAuth,
+              codexRefreshFn,
+              fallbackManager,
+              quotaManager,
+              loadAccounts,
+              writeSidebarState,
+              client: input.client as CommandContext['client'],
+              fetchImpl: fetch,
+              now: Date.now,
+              configPath: getConfigPath(),
+              storageMainAccountId: storage?.mainAccountId,
+              isOAuthAccountFn: isOAuthAccount,
+              whamFn: whamUsageFn,
+            }),
+        }
+
+        let rpcServer: RpcServerHandle | null = null
+        if (input.directory) {
+          const rpcGlobal = globalThis as {
+            __openaiAuthRpcServer?: RpcServerHandle
+          }
+          if (rpcGlobal.__openaiAuthRpcServer) {
+            await rpcGlobal.__openaiAuthRpcServer.stop().catch(() => {})
+            rpcGlobal.__openaiAuthRpcServer = undefined
+          }
+          try {
+            rpcServer = await startRpcServer({
+              dir: getRpcDir(input.directory),
+              drain: drainNotifications,
+              apply: async (request: ApplyRequest): Promise<ApplyResult> => {
+                const payload = await buildDialogPayload(
+                  request.command,
+                  request.arguments,
+                  // biome-ignore lint/style/noNonNullAssertion: cmdCtx is set in the loader before RPC server starts, and command.execute.before has a null guard
+                  cmdCtx!,
+                )
+                return { text: payload.text, knobs: payload.knobs }
+              },
+            })
+            rpcGlobal.__openaiAuthRpcServer = rpcServer
+          } catch {
+            // RPC is best-effort; the plugin must not fail if the port file
+            // can't be written (e.g. missing directory in test environments).
+          }
+        }
+
+        // -------------------------------------------------------------------
+        // sendWithAccessToken — the one primitive that both main and fallback
+        // sends call.  Wraps the existing Codex transform + send.
+        // -------------------------------------------------------------------
+        async function sendWithAccessToken(
+          requestInput: RequestInfo | URL,
+          init: RequestInit | undefined,
+          accessToken: string,
+          accountId?: string,
+          keepwarmAccountKey: string = 'main',
+        ): Promise<Response> {
+          const headers = new Headers()
+          if (init?.headers) {
+            if (init.headers instanceof Headers) {
+              init.headers.forEach((value, key) => {
+                headers.set(key, value)
+              })
+            } else if (Array.isArray(init.headers)) {
+              for (const [key, value] of init.headers) {
+                if (value !== undefined) headers.set(key, String(value))
+              }
+            } else {
+              for (const [key, value] of Object.entries(init.headers)) {
+                if (value !== undefined) headers.set(key, String(value))
+              }
+            }
+          }
+          headers.set('authorization', `Bearer ${accessToken}`)
+          if (accountId) {
+            headers.set('ChatGPT-Account-Id', accountId)
+          }
+
+          const sessionID =
+            headers.get('x-session-affinity') ??
+            headers.get('x-session-id') ??
+            headers.get('session-id') ??
+            undefined
+
+          const codexMetadata = sessionID
+            ? getCodexSessionMetadata(
+                codexSessions,
+                sessionID,
+                persistCodexSessions,
+              )
+            : undefined
+
+          const parsed =
+            requestInput instanceof URL
+              ? requestInput
+              : new URL(
+                  typeof requestInput === 'string'
+                    ? requestInput
+                    : requestInput.url,
+                )
+          const url =
+            parsed.pathname.includes('/v1/responses') ||
+            parsed.pathname.includes('/chat/completions')
+              ? new URL(codexApiEndpoint)
+              : parsed
+
+          const prepared = prepareCodexRequest({
+            init: {
+              ...init,
+              headers,
+            },
+            headers,
+            metadata: codexMetadata,
+            installationID,
+            websocket: Boolean(
+              websocketFetch && parsed.pathname.endsWith('/responses'),
+            ),
+            dumpSessionID: sessionID,
+          })
+          const requestInit = prepared.init
+          const keepwarmEnabled = cacheKeepEnabled
+          const keepwarmHeaders = new Headers(requestInit?.headers)
+          const keepwarmCapture = buildKeepwarmCapture({
+            enabled: keepwarmEnabled,
+            includeSubagents: cacheKeepSubagents,
+            headers: keepwarmHeaders,
+            body: requestInit?.body,
+          })
+          if (keepwarmEnabled) {
+            cacheKeepLogger.trace('cachekeep headers', {
+              pid: process.pid,
+              hasParent: keepwarmHeaders.has('x-parent-session-id'),
+              sessionKey: keepwarmCapture?.sessionKey,
+              captured: Boolean(keepwarmCapture),
+              affinity: keepwarmHeaders.get('x-session-affinity'),
+              opencodeSession: keepwarmHeaders.get('x-opencode-session'),
+              sessionId: keepwarmHeaders.get('session-id'),
+            })
+          }
+          if (websocketFetch && parsed.pathname.endsWith('/responses')) {
+            logT.debug('WS transport', {
+              pid: process.pid,
+              pathname: parsed.pathname,
+            })
+            if (keepwarmCapture) {
+              cacheKeepManager.track(
+                keepwarmCapture.sessionKey,
+                keepwarmCapture.bodyText,
+                keepwarmAccountKey,
+                accountId,
+                keepwarmCapture.replayHeaders,
+                keepwarmCapture.isSubagent,
+              )
+            }
+            return websocketFetch(url, requestInit)
+          }
+          const finalInit =
+            OpenAIWebSocketPool.withoutInternalHeaders(requestInit)
+          if (typeof finalInit?.body !== 'string') return fetch(url, finalInit)
+
+          // Keepwarm capture: track every request body for idle
+          // prompt-cache warming. Cheap — stores the already-serialized string.
+          if (keepwarmCapture) {
+            cacheKeepManager.track(
+              keepwarmCapture.sessionKey,
+              keepwarmCapture.bodyText,
+              keepwarmAccountKey,
+              accountId,
+              keepwarmCapture.replayHeaders,
+              keepwarmCapture.isSubagent,
+            )
+          }
+
+          logT.debug('HTTP transport', {
+            pid: process.pid,
+            pathname: parsed.pathname,
+          })
+          try {
+            const response = await fetch(url, finalInit)
+            await dumpCodexRequest({
+              sessionID,
+              transport: 'http',
+              phase: 'http',
+              bodyText: finalInit.body,
+              url: url.toString(),
+              method: finalInit.method,
+              headers: finalInit.headers,
+              status: response.status,
+            })
+            return translateHostedWebSearchResponse(response)
+          } catch (error) {
+            await dumpCodexRequest({
+              sessionID,
+              transport: 'http',
+              phase: 'http',
+              bodyText: finalInit.body,
+              url: url.toString(),
+              method: finalInit.method,
+              headers: finalInit.headers,
+              error: error instanceof Error ? error.message : String(error),
+            })
+            throw error
+          }
+        }
+
+        // -------------------------------------------------------------------
+        // Replayability guard: a non-string body (stream, consumed)
+        // cannot be retried — skip fallback and return mainResponse uncancelled.
+        // -------------------------------------------------------------------
+        function isReplayableRequest(init: RequestInit | undefined) {
+          return !init?.body || typeof init.body === 'string'
+        }
+
+        // -------------------------------------------------------------------
+        // tryFallbackAccounts — reactive: iterate getUsableFallbackAccounts
+        // and retry with each candidate's access token.
+        // -------------------------------------------------------------------
+        async function tryFallbackAccounts(
+          requestInput: RequestInfo | URL,
+          init: RequestInit | undefined,
+          primaryResponse: Response,
+          primaryFallbackId?: string,
+        ) {
+          if (!isReplayableRequest(init)) return { response: primaryResponse }
+
+          const fallbackStorage = await loadRequestAccounts()
+          const usableFallbacks =
+            await fallbackManager.getUsableFallbackAccounts(fallbackStorage)
+
+          type Candidate = {
+            access: string
+            accountId?: string
+            keepwarmAccountKey: string
+            quotaAccountId?: string
+            fallback?: FallbackAccount
+            isMain?: true
+          }
+          const candidates: Candidate[] = []
+
+          // Fallback candidates: exclude the primary when it was a fallback
+          for (const fb of usableFallbacks) {
+            if (fb.id !== primaryFallbackId && fb.access) {
+              candidates.push({
+                access: fb.access,
+                accountId: fb.accountId,
+                keepwarmAccountKey: fb.id,
+                quotaAccountId: fb.id,
+                fallback: fb,
+              })
+            }
+          }
+
+          // When primary is a fallback, include main as a candidate
+          let mainCandidate: Candidate | undefined
+          if (primaryFallbackId) {
+            const mainAuth = await getAuth()
+            if (
+              mainAuth.type === 'oauth' &&
+              (mainAuth.access || mainAuth.refresh)
+            ) {
+              let mainAccess = mainAuth.access ?? ''
+              if (!mainAuth.access || (mainAuth.expires ?? 0) < Date.now()) {
+                try {
+                  mainAccess = (await refreshMainWithLease()).access
+                } catch {
+                  // Use stale token on refresh failure
+                }
+              }
+              if (mainAccess) {
+                const mainAuthWithAccount = mainAuth as typeof mainAuth & {
+                  accountId?: string
+                }
+                mainCandidate = {
+                  access: mainAccess,
+                  accountId: mainAuthWithAccount.accountId,
+                  keepwarmAccountKey: 'main',
+                  isMain: true,
+                }
+              }
+            }
+          }
+
+          // Honor routing.mode ordering: main-first puts main at the front,
+          // fallback-first puts main last.
+          if (mainCandidate) {
+            if (fallbackStorage?.routing?.mode === 'fallback-first') {
+              candidates.push(mainCandidate)
+            } else {
+              candidates.unshift(mainCandidate)
+            }
+          }
+
+          if (!candidates.length) return { response: primaryResponse }
+
+          // Keep the returned response body live; only cancel a response after a
+          // later retry has produced a replacement.
+          let lastResponse: Response = primaryResponse
+          let lastQuotaTarget:
+            | { accessToken: string; accountId?: string }
+            | undefined
+
+          for (const candidate of candidates) {
+            const response = await sendWithAccessToken(
+              requestInput,
+              init,
+              candidate.access,
+              candidate.accountId,
+              candidate.keepwarmAccountKey,
+            )
+
+            // Cancel the PREVIOUS response body now that we have a new one.
+            // Only the LAST (returned) response keeps its body intact.
+            lastResponse.body?.cancel().catch(() => {})
+            lastResponse = response
+            lastQuotaTarget = {
+              accessToken: candidate.access,
+              accountId: candidate.quotaAccountId,
+            }
+
+            if (!shouldFallbackStatus(response.status, fallbackStorage)) {
+              if (candidate.fallback) {
+                await fallbackManager.markUsed(candidate.fallback)
+              }
+              return { response, ...lastQuotaTarget }
+            }
+          }
+
+          // All fallbacks exhausted (or none had .access). Return the last
+          // response — its body is always intact (never cancelled here).
+          return { response: lastResponse, ...lastQuotaTarget }
+        }
+
+        // -------------------------------------------------------------------
+        // Boot-time quota seed: fire refreshAllQuota once per process so the
+        // sidebar shows real numbers shortly after start instead of "checking…".
+        // Non-blocking, best-effort — a failure must never crash the loader.
+        // -------------------------------------------------------------------
+        if (!bootQuotaSeedStarted) {
+          bootQuotaSeedStarted = true
+
+          // Seed fallback quota from persisted account.quota so the immediate
+          // writeSidebarState shows last-known fallback numbers, not null.
+          if (storage) {
+            const oauthAccts: OAuthAccount[] = []
+            for (const a of storage.accounts) {
+              if (isOAuthAccount(a)) oauthAccts.push(a)
+            }
+            quotaManager.seedFallbacksFromAccounts(oauthAccts)
+          }
+
+          // Immediate: show persisted quota so the sidebar isn't blank
+          void writeSidebarState(quotaManager, storage).catch(() => {})
+
+          // Background: refresh from the API, then the sidebar shows fresh numbers
+          void refreshAllQuota({
+            getAuth,
+            codexRefreshFn,
+            fallbackManager,
+            quotaManager,
+            loadAccounts,
+            writeSidebarState,
+            client: input.client as Parameters<
+              typeof refreshAllQuota
+            >[0]['client'],
+            fetchImpl: fetch,
+            now: Date.now,
+            configPath: getConfigPath(),
+            storageMainAccountId: storage?.mainAccountId,
+            isOAuthAccountFn: isOAuthAccount,
+            whamFn: whamUsageFn,
+            respectBackoff: true,
+          }).catch(() => {})
+        }
+
+        // -------------------------------------------------------------------
+        // Fetch override that selects the active account, refreshes if
+        // needed, sends the transformed Codex request, and records quota.
+        // -------------------------------------------------------------------
         return {
           apiKey: OAUTH_DUMMY_KEY,
           async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
-            const currentAuth = await getAuth()
-            if (currentAuth.type !== 'oauth') return fetch(requestInput, init)
+            // Select the active primary account for this request.
+            const reqStorage = await loadRequestAccounts()
+            const activeId = reqStorage?.routing?.activeId ?? 'main'
 
+            let activeFallback =
+              activeId !== 'main'
+                ? reqStorage?.accounts.find(
+                    (a): a is OAuthAccount =>
+                      a.enabled !== false &&
+                      a.id === activeId &&
+                      isOAuthAccount(a),
+                  )
+                : undefined
+
+            let currentAuth: {
+              type: string
+              access?: string
+              refresh?: string
+              expires?: number
+            }
+            let primaryAccess: string
+
+            if (activeFallback && reqStorage) {
+              // Refresh fallback primaries through fallback storage only; the
+              // single auth slot remains the main account.
+              let resolvedFallback = activeFallback
+              try {
+                resolvedFallback = await fallbackManager.refreshAccount(
+                  activeFallback,
+                  reqStorage,
+                )
+              } catch {
+                // Keep a stale fallback token when one exists; otherwise demote.
+              }
+
+              if (resolvedFallback.access) {
+                activeFallback = resolvedFallback
+                currentAuth = {
+                  type: 'oauth',
+                  access: resolvedFallback.access,
+                  refresh: resolvedFallback.refresh,
+                  expires: resolvedFallback.expires,
+                }
+                primaryAccess = resolvedFallback.access
+              } else {
+                activeFallback = undefined
+                currentAuth = await getAuth()
+                if (currentAuth.type !== 'oauth')
+                  return fetch(requestInput, init)
+                primaryAccess = currentAuth.access ?? ''
+              }
+            } else {
+              // Main primary uses opencode's auth slot.
+              currentAuth = await getAuth()
+              if (currentAuth.type !== 'oauth') return fetch(requestInput, init)
+              primaryAccess = currentAuth.access ?? ''
+            }
+
+            // Strip any existing auth headers — we set them
             if (init?.headers) {
               if (init.headers instanceof Headers) {
                 init.headers.delete('authorization')
@@ -827,135 +1431,97 @@ export async function CodexAuthPlugin(
               }
             }
 
+            // Refresh expired main tokens and mirror them into opencode's slot.
+            if (!activeFallback) {
+              if (
+                !currentAuth.access ||
+                (currentAuth.expires ?? 0) < Date.now()
+              ) {
+                logR.debug('token refresh triggered', {
+                  pid: process.pid,
+                  hasAccess: Boolean(currentAuth.access),
+                  expiresInMs: currentAuth.expires
+                    ? currentAuth.expires - Date.now()
+                    : undefined,
+                })
+                try {
+                  const refreshed = await refreshMainWithLease()
+                  currentAuth.access = refreshed.access
+                  currentAuth.refresh = refreshed.refresh
+                  currentAuth.expires = refreshed.expires
+                } catch {
+                  // Use stale token on refresh failure
+                }
+              }
+              primaryAccess = currentAuth.access ?? ''
+            }
+
             const authWithAccount = currentAuth as typeof currentAuth & {
               accountId?: string
             }
 
-            if (!currentAuth.access || currentAuth.expires < Date.now()) {
-              if (!refreshPromise) {
-                refreshPromise = refreshAccessToken(currentAuth.refresh, issuer)
-                  .then(async (tokens) => {
-                    const accountId =
-                      extractAccountId(tokens) || authWithAccount.accountId
-                    await input.client.auth.set({
-                      path: { id: 'openai' },
-                      body: {
-                        type: 'oauth',
-                        refresh: tokens.refresh_token,
-                        access: tokens.access_token,
-                        expires:
-                          Date.now() + (tokens.expires_in ?? 3600) * 1000,
-                        ...(accountId && { accountId }),
-                      },
-                    })
-                    return {
-                      access: tokens.access_token,
-                      accountId,
-                    }
-                  })
-                  .finally(() => {
-                    refreshPromise = undefined
-                  })
-              }
+            // Killswitch acts on last-seen cached quota. Full enforcement waits
+            // until sidebar controls can configure the policy safely.
 
-              const refreshed = await refreshPromise
-              currentAuth.access = refreshed.access
-              authWithAccount.accountId = refreshed.accountId
-            }
+            // Send through the resolved primary account.
+            const response = await sendWithAccessToken(
+              requestInput,
+              init,
+              primaryAccess,
+              activeFallback?.accountId ?? authWithAccount.accountId,
+              activeFallback?.id ?? 'main',
+            )
 
-            const headers = new Headers()
-            if (init?.headers) {
-              if (init.headers instanceof Headers) {
-                init.headers.forEach((value, key) => {
-                  headers.set(key, value)
-                })
-              } else if (Array.isArray(init.headers)) {
-                for (const [key, value] of init.headers) {
-                  if (value !== undefined) headers.set(key, String(value))
-                }
-              } else {
-                for (const [key, value] of Object.entries(init.headers)) {
-                  if (value !== undefined) headers.set(key, String(value))
-                }
-              }
-            }
-            headers.set('authorization', `Bearer ${currentAuth.access}`)
-            if (authWithAccount.accountId) {
-              headers.set('ChatGPT-Account-Id', authWithAccount.accountId)
-            }
-            const sessionID =
-              headers.get('x-session-affinity') ??
-              headers.get('x-session-id') ??
-              headers.get('session-id') ??
-              undefined
-            const codexMetadata = sessionID
-              ? getCodexSessionMetadata(
-                  codexSessions,
-                  sessionID,
-                  persistCodexSessions,
-                )
-              : undefined
-
-            const parsed =
-              requestInput instanceof URL
-                ? requestInput
-                : new URL(
-                    typeof requestInput === 'string'
-                      ? requestInput
-                      : requestInput.url,
-                  )
-            const url =
-              parsed.pathname.includes('/v1/responses') ||
-              parsed.pathname.includes('/chat/completions')
-                ? new URL(codexApiEndpoint)
-                : parsed
-
-            const prepared = prepareCodexRequest({
-              init: {
-                ...init,
-                headers,
-              },
-              headers,
-              metadata: codexMetadata,
-              installationID,
-              websocket: Boolean(
-                websocketFetch && parsed.pathname.endsWith('/responses'),
-              ),
-              dumpSessionID: sessionID,
-            })
-            const requestInit = prepared.init
-            if (websocketFetch && parsed.pathname.endsWith('/responses'))
-              return websocketFetch(url, requestInit)
-            const finalInit =
-              OpenAIWebSocketPool.withoutInternalHeaders(requestInit)
-            if (typeof finalInit?.body !== 'string')
-              return fetch(url, finalInit)
-            try {
-              const response = await fetch(url, finalInit)
-              await dumpCodexRequest({
-                sessionID,
-                transport: 'http',
-                phase: 'http',
-                bodyText: finalInit.body,
-                url: url.toString(),
-                method: finalInit.method,
-                headers: finalInit.headers,
+            let fallbackServed = false
+            let finalResponse = response
+            let fallbackQuotaAccess = primaryAccess
+            let fallbackQuotaAccountId: string | undefined
+            if (shouldFallbackStatus(response.status, reqStorage)) {
+              logA.debug('reactive fallback triggered', {
+                pid: process.pid,
                 status: response.status,
               })
-              return translateHostedWebSearchResponse(response)
-            } catch (error) {
-              await dumpCodexRequest({
-                sessionID,
-                transport: 'http',
-                phase: 'http',
-                bodyText: finalInit.body,
-                url: url.toString(),
-                method: finalInit.method,
-                headers: finalInit.headers,
-                error: error instanceof Error ? error.message : String(error),
-              })
-              throw error
+              const fallbackResult = await tryFallbackAccounts(
+                requestInput,
+                init,
+                response,
+                activeFallback ? activeId : undefined,
+              )
+              const fallbackResponse = fallbackResult.response
+              if (fallbackResponse !== response) {
+                fallbackServed = true
+                finalResponse = fallbackResponse
+                fallbackQuotaAccess =
+                  fallbackResult.accessToken ?? primaryAccess
+                fallbackQuotaAccountId = fallbackResult.accountId
+              }
             }
+
+            try {
+              const snapshot = normalizeQuotaHeaders(finalResponse.headers)
+              if (fallbackServed) {
+                await pushQuota(
+                  snapshot,
+                  fallbackQuotaAccess,
+                  fallbackQuotaAccountId,
+                )
+              } else {
+                await pushQuota(snapshot, primaryAccess, activeFallback?.id)
+              }
+            } catch {
+              // Quota push is best-effort — never break the response
+            }
+
+            return finalResponse
+          },
+          dispose() {
+            cacheKeepManager.stop()
+            if (
+              cacheKeepGlobal.__openaiAuthCacheKeepManager === cacheKeepManager
+            ) {
+              cacheKeepGlobal.__openaiAuthCacheKeepManager = undefined
+            }
+            fallbackManager.stopBackgroundRefresh()
           },
         }
       },
@@ -979,15 +1545,18 @@ export async function CodexAuthPlugin(
                 'Complete authorization in your browser. This window will close automatically.',
               method: 'auto' as const,
               callback: async () => {
-                const tokens = await callbackPromise
-                stopOAuthServer()
-                const accountId = extractAccountId(tokens)
-                return {
-                  type: 'success' as const,
-                  refresh: tokens.refresh_token,
-                  access: tokens.access_token,
-                  expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-                  accountId,
+                try {
+                  const tokens = await callbackPromise
+                  const accountId = extractAccountId(tokens)
+                  return {
+                    type: 'success' as const,
+                    refresh: tokens.refresh_token,
+                    access: tokens.access_token,
+                    expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+                    accountId,
+                  }
+                } finally {
+                  flowCleanup(state)
                 }
               },
             }
@@ -997,92 +1566,24 @@ export async function CodexAuthPlugin(
           label: 'ChatGPT Pro/Plus (headless)',
           type: 'oauth',
           authorize: async () => {
-            const deviceResponse = await fetch(
-              `${ISSUER}/api/accounts/deviceauth/usercode`,
-              {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'User-Agent': USER_AGENT,
-                },
-                body: JSON.stringify({ client_id: CLIENT_ID }),
-              },
-            )
-
-            if (!deviceResponse.ok)
-              throw new Error('Failed to initiate device authorization')
-
-            const deviceData = (await deviceResponse.json()) as {
-              device_auth_id: string
-              user_code: string
-              interval: string
-            }
-            const interval =
-              Math.max(parseInt(deviceData.interval, 10) || 5, 1) * 1000
+            const { deviceData, url, instructions } = await beginDeviceAuth()
 
             return {
-              url: `${ISSUER}/codex/device`,
-              instructions: `Enter code: ${deviceData.user_code}`,
+              url,
+              instructions,
               method: 'auto' as const,
               async callback() {
-                while (true) {
-                  const response = await fetch(
-                    `${ISSUER}/api/accounts/deviceauth/token`,
-                    {
-                      method: 'POST',
-                      headers: {
-                        'Content-Type': 'application/json',
-                        'User-Agent': USER_AGENT,
-                      },
-                      body: JSON.stringify({
-                        device_auth_id: deviceData.device_auth_id,
-                        user_code: deviceData.user_code,
-                      }),
-                    },
-                  )
-
-                  if (response.ok) {
-                    const data = (await response.json()) as {
-                      authorization_code: string
-                      code_verifier: string
-                    }
-
-                    const tokenResponse = await fetch(`${ISSUER}/oauth/token`, {
-                      method: 'POST',
-                      headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                      },
-                      body: new URLSearchParams({
-                        grant_type: 'authorization_code',
-                        code: data.authorization_code,
-                        redirect_uri: `${ISSUER}/deviceauth/callback`,
-                        client_id: CLIENT_ID,
-                        code_verifier: data.code_verifier,
-                      }).toString(),
-                    })
-
-                    if (!tokenResponse.ok) {
-                      throw new Error(
-                        `Token exchange failed: ${tokenResponse.status}`,
-                      )
-                    }
-
-                    const tokens = (await tokenResponse.json()) as TokenResponse
-
-                    return {
-                      type: 'success' as const,
-                      refresh: tokens.refresh_token,
-                      access: tokens.access_token,
-                      expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-                      accountId: extractAccountId(tokens),
-                    }
+                try {
+                  const tokens = await completeDeviceAuth(deviceData)
+                  return {
+                    type: 'success' as const,
+                    refresh: tokens.refresh_token,
+                    access: tokens.access_token,
+                    expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+                    accountId: extractAccountId(tokens),
                   }
-
-                  if (response.status !== 403 && response.status !== 404) {
-                    return { type: 'failed' as const }
-                  }
-
-                  await sleep(interval + OAUTH_POLLING_SAFETY_MARGIN_MS)
+                } catch {
+                  return { type: 'failed' as const }
                 }
               },
             }
@@ -1110,6 +1611,76 @@ export async function CodexAuthPlugin(
       if (input.model.providerID !== 'openai') return
       // Match codex cli
       output.maxOutputTokens = undefined
+    },
+    config: async (config: { command?: Record<string, unknown> }) => {
+      config.command = {
+        ...(config.command ?? {}),
+        [OPENAI_QUOTA_COMMAND_NAME]: {
+          template: OPENAI_QUOTA_COMMAND_NAME,
+          description:
+            'Show current OpenAI Codex OAuth quota usage for all accounts.',
+        },
+        [OPENAI_ACCOUNT_COMMAND_NAME]: {
+          template: OPENAI_ACCOUNT_COMMAND_NAME,
+          description:
+            'Manage OpenAI accounts — add, switch, remove, or reorder.',
+        },
+        [OPENAI_ROUTING_COMMAND_NAME]: {
+          template: OPENAI_ROUTING_COMMAND_NAME,
+          description:
+            'Show or change OpenAI account routing between main-first and fallback-first.',
+        },
+        [OPENAI_KILLSWITCH_COMMAND_NAME]: {
+          template: OPENAI_KILLSWITCH_COMMAND_NAME,
+          description:
+            'Manage killswitch — hard-block requests when quota drops below per-account thresholds.',
+        },
+        [OPENAI_DUMP_COMMAND_NAME]: {
+          template: OPENAI_DUMP_COMMAND_NAME,
+          description:
+            'Show or toggle OpenAI Codex request dump capture for debugging.',
+        },
+        [OPENAI_LOGGING_COMMAND_NAME]: {
+          template: OPENAI_LOGGING_COMMAND_NAME,
+          description:
+            'Show or change the plugin log level (error, warn, info, debug, trace).',
+        },
+        [OPENAI_CACHEKEEP_COMMAND_NAME]: {
+          template: OPENAI_CACHEKEEP_COMMAND_NAME,
+          description:
+            'Keep Codex prompt cache alive during idle by shadow-replaying the last request.',
+        },
+      }
+    },
+    'command.execute.before': async (input: {
+      command: string
+      arguments: string
+      sessionID: string
+    }) => {
+      if (!MODAL_COMMANDS.includes(input.command as CommandModalName)) return
+      if (!cmdCtx) {
+        await sendIgnoredMessage(
+          input.sessionID,
+          'OpenAI auth plugin is still initializing. Send a request first, then try again.',
+        )
+        cleanAbort()
+      }
+      const command = input.command as CommandModalName
+      // Thread session-aware notification capability into the command context
+      // so the detached add-flow completion can deliver feedback to the user.
+      if (cmdCtx) {
+        cmdCtx.sessionId = input.sessionID
+        cmdCtx.notify = (payload) => {
+          pushNotification(payload, input.sessionID)
+        }
+      }
+      const payload = await buildDialogPayload(command, input.arguments, cmdCtx)
+      if (isTuiConnected(input.sessionID)) {
+        pushNotification(payload, input.sessionID)
+      } else {
+        await sendIgnoredMessage(input.sessionID, payload.text)
+      }
+      cleanAbort()
     },
   }
 }

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { DUMP_SESSION_HEADER, dumpCodexRequest, dumpDiagnostic } from './dump'
 import { ResponseStreamError } from './response-stream-error'
 import { isRecord } from './util/record'
@@ -19,6 +20,18 @@ export interface CreateWebSocketFetchOptions {
   firstEventGraceMs?: number
   /** Use the hand-rolled raw TCP/TLS WebSocket client instead of native WebSocket. */
   rawWebSocket?: boolean
+  /**
+   * Push per-turn quota from a codex.rate_limits in-band frame.
+   *
+   * Receives the snapshot plus the per-request account identity (access token
+   * and accountId) captured at send time so the frame is attributed to the
+   * connection's own account, not a shared mutable global.
+   */
+  onQuota?: (
+    s: Record<string, unknown>,
+    accessToken: string,
+    accountId: string | undefined,
+  ) => void
 }
 
 interface PoolEntry {
@@ -46,6 +59,35 @@ const DEFAULT_CONNECT_TIMEOUT = 15_000
 const DEFAULT_IDLE_TIMEOUT = 5 * 60 * 1000
 const DEFAULT_MAX_CONNECTION_AGE = 55 * 60 * 1000
 const CONNECTION_LIMIT_REACHED_CODE = 'websocket_connection_limit_reached'
+
+/**
+ * Derive a short, stable per-account discriminator from the request's
+ * authorization header (Bearer token) and optional chatgpt-account-id.
+ *
+ * Including the account identity in the pool key ensures that a socket is
+ * NEVER reused across accounts: an account switch mid-session produces a
+ * different key → fresh socket → no cross-account codex.rate_limits frame
+ * leakage, and continuation chaining (previous_response_id, per-socket)
+ * correctly restarts on switch.
+ *
+ * Same account + same session → same key → socket reuse preserved.
+ */
+function accountDiscriminator(headers: Record<string, string>): string {
+  const bearer =
+    typeof headers.authorization === 'string' &&
+    headers.authorization.startsWith('Bearer ')
+      ? headers.authorization.slice('Bearer '.length)
+      : ''
+  const accountId =
+    typeof headers['chatgpt-account-id'] === 'string'
+      ? headers['chatgpt-account-id']
+      : ''
+  // A short hash is sufficient — we only need stable equality, not secrecy.
+  return createHash('sha256')
+    .update(`${bearer}:${accountId}`)
+    .digest('hex')
+    .slice(0, 12)
+}
 export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const httpFetch = options?.httpFetch ?? globalThis.fetch
   const pool = new Map<string, PoolEntry>()
@@ -56,6 +98,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const streamRetries = options?.streamRetries ?? 5
   const firstEventGraceMs = options?.firstEventGraceMs ?? 250
   const rawWebSocket = options?.rawWebSocket ?? false
+  const onQuota = options?.onQuota
   const pruneTimer = setInterval(() => prune(), Math.min(idleTimeout, 60_000))
   if (
     typeof pruneTimer === 'object' &&
@@ -109,7 +152,16 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     if (!sessionID) {
       return httpFetch(input, httpInit)
     }
-    const key = `${sessionID}:conversation`
+    // Include the account identity in the pool key so a socket is NEVER reused
+    // across accounts. An account switch mid-session produces a different
+    // accountDiscriminator → different key → fresh socket → no cross-account
+    // codex.rate_limits frame leakage. Same account + same session → same key
+    // → socket reuse preserved.
+    const sourceHeadersForKey = OpenAIWebSocket.normalizeHeaders(
+      httpInit?.headers,
+    )
+    const acctDisc = accountDiscriminator(sourceHeadersForKey)
+    const key = `${sessionID}:${acctDisc}:conversation`
 
     const entry = pool.get(key) ?? {
       lastUsedAt: Date.now(),
@@ -131,6 +183,25 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     try {
       const sourceBody = normalizeResponseBody(body)
       const sourceHeaders = OpenAIWebSocket.normalizeHeaders(httpInit?.headers)
+
+      // Capture the per-request account identity at send time so that any
+      // codex.rate_limits frame arriving asynchronously is attributed to THIS
+      // connection's account, not a shared mutable global that may have been
+      // overwritten by a concurrent request.
+      const requestAccessToken =
+        typeof sourceHeaders.authorization === 'string' &&
+        sourceHeaders.authorization.startsWith('Bearer ')
+          ? sourceHeaders.authorization.slice('Bearer '.length)
+          : ''
+      const requestAccountId =
+        typeof sourceHeaders['chatgpt-account-id'] === 'string'
+          ? sourceHeaders['chatgpt-account-id']
+          : undefined
+      const requestOnQuota = onQuota
+        ? (s: Record<string, unknown>) =>
+            onQuota(s, requestAccessToken, requestAccountId)
+        : undefined
+
       const socketHeaders =
         !entry.socket && !entry.continuation
           ? prewarmHeaders(sourceHeaders)
@@ -180,14 +251,16 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         sessionID: dumpSessionID ?? undefined,
         idleTimeout,
         signal: init?.signal ?? undefined,
+        onQuota: requestOnQuota,
         onFirstEvent: (error) => resolveFirstEvent(error ?? true),
         onComplete: (event) => {
+          const usage = responseUsage(event)
           void dumpDiagnostic({
             component: 'ws-pool',
             event: 'main_completed',
             sessionID: dumpSessionID,
             responseID: responseID(event),
-            usage: responseUsage(event),
+            usage,
           })
           updateContinuation(entry, sourceBody, event)
         },
@@ -285,11 +358,16 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   }
 
   function remove(sessionID: string) {
-    const key = `${sessionID}:conversation`
-    const entry = pool.get(key)
-    if (!entry) return
-    invalidate(entry)
-    pool.delete(key)
+    // The pool key is now `${sessionID}:${acctDisc}:conversation` — there may
+    // be multiple entries for the same session (one per account used). Remove
+    // all entries whose key starts with `${sessionID}:` so cleanup is complete
+    // regardless of which account was active when the session ended.
+    const prefix = `${sessionID}:`
+    for (const [key, entry] of pool) {
+      if (!key.startsWith(prefix)) continue
+      invalidate(entry)
+      pool.delete(key)
+    }
   }
 
   return Object.assign(websocketFetch, { close, remove })

@@ -4,11 +4,15 @@
 import { APICallError } from 'ai'
 import { DUMP_SESSION_HEADER, dumpDiagnostic } from './dump'
 import { translateHostedWebSearchEvent } from './hosted-web-search'
+import { createLogger } from './logger'
+import { normalizeWsFrame } from './quota-normalize'
 import { RawWebSocket } from './raw-ws'
 import { ResponseStreamError } from './response-stream-error'
 import { errorMessage } from './util/error'
 import { ProxyEnv } from './util/proxy-env'
 import { isRecord } from './util/record'
+
+const logQ = createLogger('quota')
 
 export const PROTOCOL_HEADER = 'responses_websockets=2026-02-06'
 
@@ -88,6 +92,10 @@ export interface StreamResponsesWebSocketOptions {
   ) => Promise<WebSocket | undefined>
   onConnectionInvalid?: (error: ResponseStreamError) => void
   onAbort?: (error: Error) => void
+  /** Push per-turn quota from a codex.rate_limits in-band frame. */
+  onQuota?: (s: Record<string, unknown>) => void
+  /** Display+classify only: called when response.failed carries a rate_limit_reached_type. */
+  onRateLimitReached?: (window: string) => void
 }
 
 export interface WrappedError {
@@ -297,6 +305,17 @@ export function streamResponsesWebSocket(
       }
     })()
 
+    if (event?.type === 'codex.rate_limits') {
+      logQ.debug('codex.rate_limits frame received', { pid: process.pid })
+      // A received frame counts as activity — reset the idle timer so a
+      // stream that sends rate_limits frames but sparse data is not
+      // falsely disconnected.
+      resetIdleTimeout('idle timeout waiting for websocket')
+      // biome-ignore lint/suspicious/noExplicitAny: ws event parsed from JSON
+      options.onQuota?.(normalizeWsFrame(event as any))
+      return
+    }
+
     if (event?.type === 'error' && options.onRetryableTerminal) {
       cleanupSocket()
       if (idleTimer) clearTimeout(idleTimer)
@@ -388,6 +407,19 @@ export function streamResponsesWebSocket(
       translatedEvent.type === 'error'
     ) {
       completed = true
+      // Extract rate_limit_reached_type from response.failed events for
+      // display/classification only; do not trigger mid-stream fallback
+      // (that decision is locked).
+      if (translatedEvent.type === 'response.failed') {
+        const rateLimitType = isRecord(translatedEvent.response)
+          ? (translatedEvent.response as Record<string, unknown>)?.failed
+          : undefined
+        if (isRecord(rateLimitType)) {
+          const label = (rateLimitType as Record<string, unknown>)
+            .rate_limit_reached_type
+          if (typeof label === 'string') options.onRateLimitReached?.(label)
+        }
+      }
       options.onTerminal?.(translatedEvent)
       closeCompleted()
     }

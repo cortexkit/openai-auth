@@ -1,0 +1,7 @@
+[test]
+# Preload the test-process floor before any test file runs.
+# This sets safe temp paths for all openai-auth path envs so that
+# fire-and-forget writes (background timers, boot-seed) that outlive a
+# test's afterEach always resolve to a temp path — never to the operator's
+# live /tmp/opencode-openai-auth/ default.
+preload = ["./src/tests/setup-env.ts"]
