@@ -619,6 +619,18 @@ export async function CodexAuthPlugin(
         const logR = createLogger('refresh')
         const logA = createLogger('accounts')
 
+        // One-line resolved-config marker so the active endpoint/transport is
+        // observable in the file log without enabling request dumps.
+        logT.info('codex auth loader ready', {
+          codexApiEndpoint,
+          transport: getSettings().rawWebSocket
+            ? 'raw-websocket'
+            : getSettings().webSockets
+              ? 'websocket'
+              : 'http',
+          webSearch: getSettings().webSearch,
+        })
+
         const quotaManager = new QuotaManager({
           storage,
           fetchQuotaFn: undefined, // push-only: quota comes from HTTP headers / WS frames
