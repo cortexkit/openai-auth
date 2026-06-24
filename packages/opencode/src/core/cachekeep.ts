@@ -111,7 +111,6 @@ export function buildKeepwarmCapture(input: {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000 // 5 min
-const DEFAULT_LEAD_MS = 5 * 1000 // 5 s lead → ~4:55 effective cadence
 const DEFAULT_MAX_IDLE_WARM_MS = 60 * 60 * 1000 // 1 h
 const DEFAULT_MAX_SUBAGENT_IDLE_MS = 30 * 60 * 1000 // 30 min
 const DEFAULT_TICK_INTERVAL_MS = 60 * 1000 // 60 s
@@ -248,6 +247,8 @@ export class CacheKeepManager {
   private startedAt: number | null = null
   private totalBytes = 0
   private tickInFlight = false
+  private disposed = false
+  private abortController = new AbortController()
 
   private logPayload(
     fields: Record<string, unknown> = {},
@@ -263,7 +264,8 @@ export class CacheKeepManager {
     this.log = options.logger
     this.now = options.now
     this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS
-    this.leadMs = options.leadMs ?? DEFAULT_LEAD_MS
+    this.tickIntervalMs = options.tickIntervalMs ?? DEFAULT_TICK_INTERVAL_MS
+    this.leadMs = options.leadMs ?? this.tickIntervalMs + 15_000
     const maxIdleWarmMs = options.maxIdleWarmMs ?? options.maxDurationMs
     this.maxIdleWarmMs =
       typeof maxIdleWarmMs === 'number' &&
@@ -385,6 +387,7 @@ export class CacheKeepManager {
   }
 
   start(): void {
+    this.disposed = false
     if (this.timer) return
     this.startedAt = this.now()
     this.log.debug(
@@ -403,6 +406,9 @@ export class CacheKeepManager {
   }
 
   stop(): void {
+    this.disposed = true
+    this.abortController.abort()
+    this.abortController = new AbortController()
     if (this.timer) {
       clearInterval(this.timer)
       this.timer = null
@@ -411,6 +417,18 @@ export class CacheKeepManager {
     this.targets.clear()
     this.totalBytes = 0
     this.log.debug('cachekeep stopped', this.logPayload())
+  }
+
+  remove(sessionKey: string): void {
+    const old = this.targets.get(sessionKey)
+    if (old) {
+      this.totalBytes -= old.bodyText.length
+      this.targets.delete(sessionKey)
+      this.log.debug(
+        'cachekeep removed target',
+        this.logPayload({ sessionKey }),
+      )
+    }
   }
 
   status(): CacheKeepStatus {
@@ -487,16 +505,22 @@ export class CacheKeepManager {
       } else {
         accessToken = await this.getMainToken()
       }
-    } catch {
+    } catch (err) {
+      if (!this.disposed && this.targets.get(sessionKey) === target) {
+        target.backoffUntil = this.now() + BACKOFF_MS
+      }
       this.log.debug(
         'cachekeep skip (no token)',
         this.logPayload({
           sessionKey,
           accountId: target.accountId ?? 'main',
+          error: err instanceof Error ? err.message : String(err),
         }),
       )
       return
     }
+
+    if (this.disposed || this.targets.get(sessionKey) !== target) return
 
     const headers: Record<string, string> = {
       ...target.replayHeaders,
@@ -538,7 +562,10 @@ export class CacheKeepManager {
         method: 'POST',
         headers,
         body: warmBody,
-        signal: AbortSignal.timeout(30_000),
+        signal: AbortSignal.any([
+          AbortSignal.timeout(30_000),
+          this.abortController.signal,
+        ]),
       })
 
       // Read the response body for usage
@@ -548,6 +575,8 @@ export class CacheKeepManager {
       } catch {
         // body already consumed or error
       }
+
+      if (this.disposed || this.targets.get(sessionKey) !== target) return
 
       if (!response.ok) {
         target.backoffUntil = this.now() + BACKOFF_MS
@@ -603,6 +632,7 @@ export class CacheKeepManager {
       target.lastWarmedAt = this.now()
       target.backoffUntil = undefined
     } catch (err) {
+      if (this.disposed || this.targets.get(sessionKey) !== target) return
       target.backoffUntil = this.now() + BACKOFF_MS
       this.log.warn(
         'cachekeep failed',

@@ -56,6 +56,25 @@ export function rewriteHostedWebSearchReplay(body: Record<string, unknown>) {
   const hostedCalls = new Map<string, Record<string, unknown>>()
   const rewritten: unknown[] = []
 
+  const allCalls = new Map<string, Record<string, unknown>>()
+  const allOutputs = new Map<string, string>()
+  for (const item of body.input) {
+    if (
+      isRecord(item) &&
+      typeof item.call_id === 'string' &&
+      item.call_id.startsWith(HOSTED_WEB_SEARCH_ID_PREFIX)
+    ) {
+      if (item.type === 'function_call') {
+        allCalls.set(item.call_id, item)
+      } else if (
+        item.type === 'function_call_output' &&
+        typeof item.output === 'string'
+      ) {
+        allOutputs.set(item.call_id, item.output)
+      }
+    }
+  }
+
   for (const item of body.input) {
     if (isHostedWebSearchFunctionCall(item)) {
       hostedCalls.set(item.call_id, item)
@@ -77,8 +96,17 @@ export function rewriteHostedWebSearchReplay(body: Record<string, unknown>) {
 
     if (isHostedWebSearchItemReference(item)) {
       const hostedItem = hostedWebSearchItems.get(item.id)
-      if (hostedItem) rewritten.push(toCodexWebSearchCall(item.id, hostedItem))
-      else rewritten.push(item)
+      if (hostedItem) {
+        rewritten.push(toCodexWebSearchCall(item.id, hostedItem))
+      } else {
+        const call = allCalls.get(item.id)
+        const output = allOutputs.get(item.id)
+        if (call || output) {
+          rewritten.push(toCodexWebSearchCall(item.id, output, call))
+        } else {
+          rewritten.push(item)
+        }
+      }
       changed = true
       continue
     }

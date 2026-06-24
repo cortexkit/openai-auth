@@ -455,6 +455,7 @@ export async function CodexAuthPlugin(
   // command.execute.before reads this; if null (auth not loaded yet),
   // the command is rejected with a message.
   let cmdCtx: CommandContext | null = null
+  let activeRpcServer: RpcServerHandle | null = null
 
   async function sendIgnoredMessage(sessionId: string, text: string) {
     const session = input.client.session as
@@ -477,13 +478,27 @@ export async function CodexAuthPlugin(
     async dispose() {
       for (const websocketFetch of websocketFetches) websocketFetch.close()
       websocketFetches.length = 0
+      if (activeRpcServer) {
+        await activeRpcServer.stop().catch(() => {})
+        const rpcGlobal = globalThis as {
+          __openaiAuthRpcServer?: RpcServerHandle
+        }
+        if (rpcGlobal.__openaiAuthRpcServer === activeRpcServer) {
+          rpcGlobal.__openaiAuthRpcServer = undefined
+        }
+        activeRpcServer = null
+      }
     },
     async event(input) {
       if (input.event.type !== 'session.deleted') return
-      if (codexSessions.delete(input.event.properties.info.id))
-        persistCodexSessions()
+      const info = input.event.properties.info
+      const meta = codexSessions.get(info.id)
+      if (meta) {
+        cmdCtx?.cacheKeepManager?.remove(meta.threadID)
+      }
+      if (codexSessions.delete(info.id)) persistCodexSessions()
       for (const websocketFetch of websocketFetches)
-        websocketFetch.remove(input.event.properties.info.id)
+        websocketFetch.remove(info.id)
     },
     provider: {
       id: 'openai',
@@ -1029,6 +1044,7 @@ export async function CodexAuthPlugin(
               },
             })
             rpcGlobal.__openaiAuthRpcServer = rpcServer
+            activeRpcServer = rpcServer
           } catch {
             // RPC is best-effort; the plugin must not fail if the port file
             // can't be written (e.g. missing directory in test environments).
@@ -1052,16 +1068,30 @@ export async function CodexAuthPlugin(
               init.headers.forEach((value, key) => {
                 headers.set(key, value)
               })
+              init.headers.delete('x-api-key')
+              init.headers.delete('api-key')
             } else if (Array.isArray(init.headers)) {
               for (const [key, value] of init.headers) {
                 if (value !== undefined) headers.set(key, String(value))
               }
+              init.headers = init.headers.filter(([key]) => {
+                const lower = String(key).toLowerCase()
+                return lower !== 'x-api-key' && lower !== 'api-key'
+              })
             } else {
               for (const [key, value] of Object.entries(init.headers)) {
                 if (value !== undefined) headers.set(key, String(value))
               }
+              for (const key of Object.keys(init.headers)) {
+                const lower = key.toLowerCase()
+                if (lower === 'x-api-key' || lower === 'api-key') {
+                  delete init.headers[key]
+                }
+              }
             }
           }
+          headers.delete('x-api-key')
+          headers.delete('api-key')
           headers.set('authorization', `Bearer ${accessToken}`)
           if (accountId) {
             headers.set('ChatGPT-Account-Id', accountId)
@@ -1433,13 +1463,26 @@ export async function CodexAuthPlugin(
               if (init.headers instanceof Headers) {
                 init.headers.delete('authorization')
                 init.headers.delete('Authorization')
+                init.headers.delete('x-api-key')
+                init.headers.delete('api-key')
               } else if (Array.isArray(init.headers)) {
-                init.headers = init.headers.filter(
-                  ([key]) => String(key).toLowerCase() !== 'authorization',
-                )
+                init.headers = init.headers.filter(([key]) => {
+                  const lower = String(key).toLowerCase()
+                  return (
+                    lower !== 'authorization' &&
+                    lower !== 'x-api-key' &&
+                    lower !== 'api-key'
+                  )
+                })
               } else {
                 delete init.headers.authorization
                 delete init.headers.Authorization
+                for (const key of Object.keys(init.headers)) {
+                  const lower = key.toLowerCase()
+                  if (lower === 'x-api-key' || lower === 'api-key') {
+                    delete init.headers[key]
+                  }
+                }
               }
             }
 
@@ -1526,7 +1569,7 @@ export async function CodexAuthPlugin(
 
             return finalResponse
           },
-          dispose() {
+          async dispose() {
             cacheKeepManager.stop()
             if (
               cacheKeepGlobal.__openaiAuthCacheKeepManager === cacheKeepManager
@@ -1534,6 +1577,16 @@ export async function CodexAuthPlugin(
               cacheKeepGlobal.__openaiAuthCacheKeepManager = undefined
             }
             fallbackManager.stopBackgroundRefresh()
+            if (activeRpcServer) {
+              await activeRpcServer.stop().catch(() => {})
+              const rpcGlobal = globalThis as {
+                __openaiAuthRpcServer?: RpcServerHandle
+              }
+              if (rpcGlobal.__openaiAuthRpcServer === activeRpcServer) {
+                rpcGlobal.__openaiAuthRpcServer = undefined
+              }
+              activeRpcServer = null
+            }
           },
         }
       },

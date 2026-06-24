@@ -1,9 +1,13 @@
-import { beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   buildKeepwarmBody,
   buildKeepwarmCapture,
   CacheKeepManager,
 } from '../core/cachekeep'
+import { CodexAuthPlugin } from '../index'
 
 function fakeLogger() {
   return {
@@ -1806,7 +1810,7 @@ describe('CacheKeepManager token resolution', () => {
     )
   })
 
-  test('skips warm if no token resolves', async () => {
+  test('skips warm and sets backoff if no token resolves', async () => {
     getMainToken = mock(async () => {
       throw new Error('no token')
     })
@@ -1831,5 +1835,353 @@ describe('CacheKeepManager token resolution', () => {
 
     // fetchImpl should NOT have been called (no token to make the request)
     expect(fetchImpl).not.toHaveBeenCalled()
+    // backoffUntil should be set
+    expect(mgr.status().targets[0]!.backoffUntil).toBeDefined()
+  })
+
+  test('stop/dispose aborts in-flight warm and prevents mutating removed targets', async () => {
+    let resolveFetch!: (response: Response) => void
+    let fetchCalled!: () => void
+    const fetchCalledPromise = new Promise<void>((resolve) => {
+      fetchCalled = resolve
+    })
+    const slowFetch = mock(
+      () =>
+        new Promise<Response>((res) => {
+          resolveFetch = res
+          fetchCalled()
+        }),
+    ) as unknown as typeof fetch
+
+    const mgr = new CacheKeepManager({
+      fetchImpl: slowFetch,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: TTL_MS,
+      leadMs: LEAD_MS,
+    })
+    mgr.track(
+      'sess-1',
+      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
+      'main',
+    )
+
+    clock.advance(TTL_MS - LEAD_MS + 1000)
+    const tickPromise = mgr.tick()
+
+    // Wait for fetch to be called
+    await fetchCalledPromise
+
+    // Stop the manager while tick is in flight
+    mgr.stop()
+
+    // Resolve the fetch
+    resolveFetch(new Response('{}'))
+    await tickPromise
+
+    // The target was removed, so status targets should be empty
+    expect(mgr.status().tracked).toBe(0)
+  })
+
+  test('session.deleted event removes target by threadID and prevents further warm fires', async () => {
+    const originalFetch = globalThis.fetch
+    let lastFetchHeaders: Headers | undefined
+
+    globalThis.fetch = (async (url: any, init: any) => {
+      lastFetchHeaders = new Headers(init?.headers)
+      return new Response('{}')
+    }) as any
+
+    try {
+      const configFile = process.env.OPENCODE_OPENAI_AUTH_FILE
+      if (configFile) {
+        await writeFile(
+          configFile,
+          JSON.stringify({
+            version: 1,
+            main: { type: 'opencode', provider: 'openai' },
+            accounts: [],
+            cachekeep: {
+              enabled: true,
+            },
+          }),
+        )
+      }
+
+      const plugin = await CodexAuthPlugin({
+        client: {
+          auth: { set: async () => {} },
+          session: { promptAsync: async () => {} },
+        } as any,
+        project: { id: 'test' } as any,
+        directory: '',
+        worktree: '/some/worktree',
+        experimental_workspace: { register: () => {} },
+        serverUrl: new URL('http://localhost:0'),
+        $: {} as any,
+      })
+
+      const loaderResult = await plugin.auth?.loader?.(
+        async () => ({
+          type: 'oauth',
+          provider: 'openai',
+          access: 'access-token',
+          refresh: 'refresh-token',
+          expires: Date.now() + 3600_000,
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as any,
+      )
+
+      if (!loaderResult?.fetch) throw new Error('No fetch override')
+
+      const cacheKeepGlobal = globalThis as any
+      const mgr = cacheKeepGlobal.__openaiAuthCacheKeepManager
+      expect(mgr).toBeDefined()
+
+      const mockFetch = mock(async () => new Response('{}'))
+      mgr.fetchImpl = mockFetch
+
+      const opencodeSessionId = 'opencode-sess-123'
+      await loaderResult.fetch('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: {
+          'session-id': opencodeSessionId,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
+      })
+
+      expect(mgr.status().tracked).toBe(1)
+      const trackedTarget = mgr.status().targets[0]
+      expect(trackedTarget.sessionKey).not.toBe(opencodeSessionId)
+
+      await plugin.event?.({
+        event: {
+          type: 'session.deleted',
+          properties: {
+            info: {
+              id: opencodeSessionId,
+            },
+          },
+        },
+      } as any)
+
+      expect(mgr.status().tracked).toBe(0)
+
+      clock.advance(TTL_MS - LEAD_MS + 1000)
+      await mgr.tick()
+      expect(mockFetch).not.toHaveBeenCalled()
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+})
+
+describe('RPC server dispose', () => {
+  let tempDir: string
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'oa-rpc-dispose-'))
+  })
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true })
+  })
+
+  test('RPC server stops and unlinks port file on loader dispose', async () => {
+    const originalRpcDir = process.env.OPENCODE_OPENAI_AUTH_RPC_DIR
+    process.env.OPENCODE_OPENAI_AUTH_RPC_DIR = tempDir
+
+    try {
+      const plugin = await CodexAuthPlugin({
+        client: {
+          auth: { set: async () => {} },
+          session: { promptAsync: async () => {} },
+        } as any,
+        project: { id: 'test' } as any,
+        directory: '/some/project/dir',
+        worktree: '/some/worktree',
+        experimental_workspace: { register: () => {} },
+        serverUrl: new URL('http://localhost:0'),
+        $: {} as any,
+      })
+
+      const loaderResult = await plugin.auth?.loader?.(
+        async () => ({
+          type: 'oauth',
+          provider: 'openai',
+          access: 'access',
+          refresh: 'refresh',
+          expires: Date.now() + 3600_000,
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as any,
+      )
+
+      // Verify port file exists in tempDir
+      let files = await readdir(tempDir)
+      expect(
+        files.some((f) => f.startsWith('port-') && f.endsWith('.json')),
+      ).toBe(true)
+
+      // Dispose the loader
+      await loaderResult?.dispose?.()
+
+      // Verify port file is gone
+      files = await readdir(tempDir)
+      expect(
+        files.some((f) => f.startsWith('port-') && f.endsWith('.json')),
+      ).toBe(false)
+    } finally {
+      process.env.OPENCODE_OPENAI_AUTH_RPC_DIR = originalRpcDir
+    }
+  })
+
+  test('RPC server stops and unlinks port file on plugin dispose', async () => {
+    const originalRpcDir = process.env.OPENCODE_OPENAI_AUTH_RPC_DIR
+    process.env.OPENCODE_OPENAI_AUTH_RPC_DIR = tempDir
+
+    try {
+      const plugin = await CodexAuthPlugin({
+        client: {
+          auth: { set: async () => {} },
+          session: { promptAsync: async () => {} },
+        } as any,
+        project: { id: 'test' } as any,
+        directory: '/some/project/dir',
+        worktree: '/some/worktree',
+        experimental_workspace: { register: () => {} },
+        serverUrl: new URL('http://localhost:0'),
+        $: {} as any,
+      })
+
+      await plugin.auth?.loader?.(
+        async () => ({
+          type: 'oauth',
+          provider: 'openai',
+          access: 'access',
+          refresh: 'refresh',
+          expires: Date.now() + 3600_000,
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as any,
+      )
+
+      // Verify port file exists in tempDir
+      let files = await readdir(tempDir)
+      expect(
+        files.some((f) => f.startsWith('port-') && f.endsWith('.json')),
+      ).toBe(true)
+
+      // Dispose the plugin
+      await plugin.dispose?.()
+
+      // Verify port file is gone
+      files = await readdir(tempDir)
+      expect(
+        files.some((f) => f.startsWith('port-') && f.endsWith('.json')),
+      ).toBe(false)
+    } finally {
+      process.env.OPENCODE_OPENAI_AUTH_RPC_DIR = originalRpcDir
+    }
+  })
+})
+
+describe('Header stripping', () => {
+  test('strips x-api-key and api-key headers case-insensitively', async () => {
+    const originalFetch = globalThis.fetch
+    let lastFetchHeaders: Headers | undefined
+
+    globalThis.fetch = (async (url: any, init: any) => {
+      lastFetchHeaders = new Headers(init?.headers)
+      return new Response('{}')
+    }) as any
+
+    try {
+      const plugin = await CodexAuthPlugin({
+        client: {
+          auth: { set: async () => {} },
+          session: { promptAsync: async () => {} },
+        } as any,
+        project: { id: 'test' } as any,
+        directory: '',
+        worktree: '/some/worktree',
+        experimental_workspace: { register: () => {} },
+        serverUrl: new URL('http://localhost:0'),
+        $: {} as any,
+      })
+
+      const loaderResult = await plugin.auth?.loader?.(
+        async () => ({
+          type: 'oauth',
+          provider: 'openai',
+          access: 'access-token',
+          refresh: 'refresh-token',
+          expires: Date.now() + 3600_000,
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as any,
+      )
+
+      if (!loaderResult?.fetch) throw new Error('No fetch override')
+
+      // Test with Headers object
+      const headersObj = new Headers({
+        'X-API-Key': 'secret-x-key',
+        'api-key': 'secret-key',
+        Authorization: 'Bearer old-token',
+      })
+      await loaderResult.fetch('https://api.openai.com/v1/responses', {
+        headers: headersObj,
+      })
+
+      expect(lastFetchHeaders?.has('x-api-key')).toBe(false)
+      expect(lastFetchHeaders?.has('api-key')).toBe(false)
+      expect(lastFetchHeaders?.get('authorization')).toBe('Bearer access-token')
+
+      // Test with plain object
+      await loaderResult.fetch('https://api.openai.com/v1/responses', {
+        headers: {
+          'X-API-KEY': 'secret-x-key',
+          'API-KEY': 'secret-key',
+          Authorization: 'Bearer old-token',
+        } as any,
+      })
+
+      expect(lastFetchHeaders?.has('x-api-key')).toBe(false)
+      expect(lastFetchHeaders?.has('api-key')).toBe(false)
+      expect(lastFetchHeaders?.get('authorization')).toBe('Bearer access-token')
+
+      // Test with array of pairs
+      await loaderResult.fetch('https://api.openai.com/v1/responses', {
+        headers: [
+          ['X-Api-Key', 'secret-x-key'],
+          ['Api-Key', 'secret-key'],
+          ['Authorization', 'Bearer old-token'],
+        ] as any,
+      })
+
+      expect(lastFetchHeaders?.has('x-api-key')).toBe(false)
+      expect(lastFetchHeaders?.has('api-key')).toBe(false)
+      expect(lastFetchHeaders?.get('authorization')).toBe('Bearer access-token')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
   })
 })

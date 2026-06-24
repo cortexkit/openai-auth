@@ -142,4 +142,39 @@ describe('hosted web search replay', () => {
     expect(rewriteHostedWebSearchReplay(body)).toBe(false)
     expect((body.input as unknown[]).length).toBe(2)
   })
+
+  test('reconstructs web_search_call from replayed function_call/output when in-memory map is empty (restart)', () => {
+    const body: Record<string, unknown> = {
+      input: [
+        {
+          type: 'function_call',
+          call_id: 'ws_restart_123',
+          name: 'web_search',
+          arguments: '{"type":"search","query":"restart test"}',
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'ws_restart_123',
+          output:
+            '{"action":{"type":"search","query":"restart test"},"results":[]}',
+        },
+        { type: 'item_reference', id: 'ws_restart_123' },
+      ],
+    }
+
+    // Ensure the in-memory map does not contain the replay ID for this search call to simulate a restart
+    expect(rewriteHostedWebSearchReplay(body)).toBe(true)
+    expect(body.input).toEqual([
+      {
+        type: 'web_search_call',
+        status: 'completed',
+        action: { type: 'search', query: 'restart test' },
+      },
+      {
+        type: 'web_search_call',
+        status: 'completed',
+        action: { type: 'search', query: 'restart test' },
+      },
+    ])
+  })
 })
