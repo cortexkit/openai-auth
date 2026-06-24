@@ -649,6 +649,13 @@ export interface IngestAccount {
   enabled: boolean
   addedAt: number
   lastUsed: number
+  /**
+   * When the token was obtained. Stamped at login so a freshly added account
+   * carries a refresh marker — without it, the runtime-state merge cannot tell a
+   * rotated token from a stale one (both default to 0) and a concurrent stale
+   * save could roll the token back.
+   */
+  lastRefreshedAt?: number
   /** Stable ChatGPT account identifier from the OAuth token claims. */
   accountId?: string
 }
@@ -760,6 +767,7 @@ export async function beginAccountLogin(
         enabled: true,
         addedAt: now,
         lastUsed: now,
+        lastRefreshedAt: now,
         accountId: extractAccountId(tokens),
       }
     })()
@@ -792,6 +800,7 @@ export async function beginAccountLogin(
         enabled: true,
         addedAt: now,
         lastUsed: now,
+        lastRefreshedAt: now,
         accountId: extractAccountId(tokens),
       }
     } finally {

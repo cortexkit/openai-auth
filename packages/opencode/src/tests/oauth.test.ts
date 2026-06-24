@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { createServer } from 'node:http'
 import {
   base64UrlEncode,
+  beginAccountLogin,
   buildAuthorizeUrl,
   completeDeviceAuth,
   escapeHtml,
@@ -787,5 +788,63 @@ describe('Browser OAuth abort cleanup (Fix 4)', () => {
 
     await expect(promise).rejects.toThrow('Login cancelled')
     await expectOAuthPortClosed()
+  })
+})
+
+describe('login stamps lastRefreshedAt (token-rollback root fix)', () => {
+  let originalFetch: typeof globalThis.fetch
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  test('headless device login sets lastRefreshedAt on the ingested account', async () => {
+    globalThis.fetch = mock(async (url: unknown) => {
+      const u = String(url)
+      if (u.endsWith('/api/accounts/deviceauth/usercode')) {
+        return new Response(
+          JSON.stringify({
+            device_auth_id: 'dev-1',
+            user_code: 'CODE-1',
+            interval: '1',
+            expires_in: 600,
+          }),
+          { status: 200 },
+        )
+      }
+      if (u.endsWith('/api/accounts/deviceauth/token')) {
+        return new Response(
+          JSON.stringify({
+            authorization_code: 'auth-1',
+            code_verifier: 'verifier-1',
+          }),
+          { status: 200 },
+        )
+      }
+      if (u.endsWith('/oauth/token')) {
+        return new Response(
+          JSON.stringify({
+            access_token: 'access-1',
+            refresh_token: 'refresh-1',
+            expires_in: 3600,
+          }),
+          { status: 200 },
+        )
+      }
+      throw new Error(`unexpected fetch: ${u}`)
+    }) as unknown as typeof globalThis.fetch
+
+    const before = Date.now()
+    const { completion } = await beginAccountLogin({ headless: true })
+    const account = (await completion) as IngestAccount
+
+    expect(typeof account.lastRefreshedAt).toBe('number')
+    expect(account.lastRefreshedAt).toBeGreaterThanOrEqual(before)
+    expect(account.access).toBe('access-1')
+    expect(account.refresh).toBe('refresh-1')
   })
 })
