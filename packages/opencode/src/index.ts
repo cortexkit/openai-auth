@@ -29,8 +29,8 @@ import {
   isOAuthAccount,
   loadAccounts,
   migrateIfNeeded,
+  mutateAccounts,
   type OAuthAccount,
-  saveAccounts,
   shouldFallbackStatus,
 } from './core/accounts'
 import {
@@ -601,8 +601,9 @@ export async function CodexAuthPlugin(
             refresh_token: auth.refresh ?? '',
           })
           if (liveAccountId && liveAccountId !== storage.mainAccountId) {
-            storage.mainAccountId = liveAccountId
-            await saveAccounts(storage, getConfigPath())
+            await mutateAccounts((fresh) => {
+              fresh.mainAccountId = liveAccountId
+            }, getConfigPath())
             invalidateRequestStorageCache()
           }
         }
@@ -664,14 +665,10 @@ export async function CodexAuthPlugin(
         async function updateMainRefreshState(
           update: (storage: AccountStorage) => void,
         ) {
-          const nextStorage = (await loadAccounts(getConfigPath())) ?? {
-            version: 1 as const,
-            main: { type: 'opencode' as const, provider: 'openai' as const },
-            accounts: [],
-          }
-          nextStorage.refresh = nextStorage.refresh ?? {}
-          update(nextStorage)
-          await saveAccounts(nextStorage, getConfigPath())
+          await mutateAccounts((fresh) => {
+            fresh.refresh = fresh.refresh ?? {}
+            update(fresh)
+          }, getConfigPath())
           invalidateRequestStorageCache()
         }
 
@@ -975,6 +972,7 @@ export async function CodexAuthPlugin(
           accountStoragePath: getConfigPath(),
           quotaManager,
           loadAccounts,
+          mutateAccounts: (m, p) => mutateAccounts(m, p),
           client: input.client as CommandContext['client'],
           cacheKeepManager,
           setCacheKeepEnabled: (enabled) => {

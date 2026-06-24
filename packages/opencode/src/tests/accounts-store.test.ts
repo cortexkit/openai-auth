@@ -181,21 +181,27 @@ describe('accounts store', () => {
     expect(loadedAcct1.access).toBe('acc-1')
   })
 
-  it('saveAccounts waits for the file lock and merges with the latest on-disk accounts', async () => {
+  it('saveAccounts waits for the file lock, then the incoming account list is authoritative', async () => {
     const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
 
-    const staleAccount: OAuthAccount = {
-      id: 'stale-writer',
+    // The account list is written only by lock-serialized callers (user
+    // add/remove/switch/order and the loader's main-state writes). incoming is
+    // authoritative for the set, so a removal sticks; an account absent from
+    // incoming is not resurrected from the on-disk snapshot. (Per-account
+    // runtime state — quota / refresh-error from background timers — is written
+    // separately via saveAccountState and is covered by its own tests.)
+    const incomingAccount: OAuthAccount = {
+      id: 'incoming-writer',
       type: 'oauth',
-      access: 'acc-stale',
-      refresh: 'ref-stale',
+      access: 'acc-incoming',
+      refresh: 'ref-incoming',
       expires: Date.now() + 3600_000,
     }
-    const latestAccount: OAuthAccount = {
-      id: 'latest-writer',
+    const onDiskAccount: OAuthAccount = {
+      id: 'on-disk-writer',
       type: 'oauth',
-      access: 'acc-latest',
-      refresh: 'ref-latest',
+      access: 'acc-on-disk',
+      refresh: 'ref-on-disk',
       expires: Date.now() + 3600_000,
     }
 
@@ -206,9 +212,10 @@ describe('accounts store', () => {
     })
     expect(lock).not.toBeNull()
 
+    // saveAccounts must block until the lock is released (serialization).
     let settled = false
-    const staleSave = saveAccounts(
-      { version: 1, accounts: [staleAccount] },
+    const blockedSave = saveAccounts(
+      { version: 1, accounts: [incomingAccount] },
       cfgPath,
     ).finally(() => {
       settled = true
@@ -217,22 +224,32 @@ describe('accounts store', () => {
     await new Promise((resolve) => setTimeout(resolve, 50))
     expect(settled).toBe(false)
 
+    // A different account lands on disk while the save is blocked.
     await writeFile(
       cfgPath,
-      `${JSON.stringify({ version: 1, accounts: [{ id: latestAccount.id, type: 'oauth', enabled: true }] })}\n`,
+      `${JSON.stringify({ version: 1, accounts: [{ id: onDiskAccount.id, type: 'oauth', enabled: true }] })}\n`,
     )
     await writeFile(
       statePath,
-      `${JSON.stringify({ version: 1, accounts: { [latestAccount.id]: latestAccount } })}\n`,
+      `${JSON.stringify({ version: 1, accounts: { [onDiskAccount.id]: onDiskAccount } })}\n`,
     )
 
     await lock?.release()
-    await staleSave
+    await blockedSave
 
+    // The resumed save's incoming list wins — only incoming-writer remains.
     const loaded = await loadAccounts(cfgPath)
     expect(loaded?.accounts.map((account) => account.id).sort()).toEqual([
-      'latest-writer',
-      'stale-writer',
+      'incoming-writer',
     ])
+
+    // The state file is rebuilt from the authoritative account set, so the
+    // overwritten account's per-account secrets are pruned — no stale
+    // access/refresh tokens for a dropped account linger at rest.
+    const stateRaw = readFileSync(statePath, 'utf8')
+    const state = JSON.parse(stateRaw)
+    expect(Object.keys(state.accounts ?? {})).toEqual(['incoming-writer'])
+    expect(stateRaw).not.toContain('acc-on-disk')
+    expect(stateRaw).not.toContain('ref-on-disk')
   })
 })

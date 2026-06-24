@@ -77,6 +77,13 @@ export interface CommandContext {
   setCacheKeepEnabled?: (enabled: boolean) => void
   /** Updates the live loader's persisted-subagent cachekeep gate. */
   setCacheKeepSubagents?: (enabled: boolean) => void
+  /** Lock-held read-modify-write; preserves concurrent additions. */
+  mutateAccounts: (
+    mutator: (
+      storage: import('./core/accounts').AccountStorage,
+    ) => void | Promise<void>,
+    path: string,
+  ) => Promise<import('./core/accounts').AccountStorage>
 }
 
 const log = createLogger('commands')
@@ -196,20 +203,21 @@ async function executeAccountCommand(
   if (tokens[0] === 'switch' && tokens[1]) {
     const targetId = tokens[1]
 
-    if (targetId === 'main') {
-      storage.routing = { ...(storage.routing ?? {}), activeId: 'main' }
-      await defaultSaveAccounts(storage, ctx.accountStoragePath)
-      log.info('account switched', { activeId: 'main' })
-      void ctx.refreshSidebar?.().catch(() => {})
-      return {
-        command: 'openai-account',
-        text: '## Account Switched\n\nActive account is now main.',
-        knobs: { accounts, activeId: 'main' },
+    let notFoundSwitch = false
+    const fresh = await ctx.mutateAccounts((fresh) => {
+      if (targetId === 'main') {
+        fresh.routing = { ...(fresh.routing ?? {}), activeId: 'main' }
+        return
       }
-    }
+      const account = fresh.accounts.find((a) => a.id === targetId)
+      if (!account) {
+        notFoundSwitch = true
+        return
+      }
+      fresh.routing = { ...(fresh.routing ?? {}), activeId: targetId }
+    }, ctx.accountStoragePath)
 
-    const account = accounts.find((a) => a.id === targetId)
-    if (!account) {
+    if (notFoundSwitch) {
       return {
         command: 'openai-account',
         text: `## Account Not Found\n\nNo account with id \`${targetId}\` exists.`,
@@ -217,23 +225,43 @@ async function executeAccountCommand(
       }
     }
 
-    // Persist the active account id
-    storage.routing = { ...(storage.routing ?? {}), activeId: targetId }
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
     log.info('account switched', { activeId: targetId })
     void ctx.refreshSidebar?.().catch(() => {})
 
     return {
       command: 'openai-account',
-      text: `## Account Switched\n\nActive account is now \`${targetId}\`.`,
-      knobs: { accounts, activeId: targetId },
+      text:
+        targetId === 'main'
+          ? '## Account Switched\n\nActive account is now main.'
+          : `## Account Switched\n\nActive account is now \`${targetId}\`.`,
+      knobs: { accounts: fresh.accounts, activeId: targetId },
     }
   }
 
   if (tokens[0] === 'remove' && tokens[1]) {
     const targetId = tokens[1]
-    const idx = accounts.findIndex((a) => a.id === targetId)
-    if (idx === -1) {
+    let notFoundRemove = false
+
+    const fresh = await ctx.mutateAccounts((fresh) => {
+      const idx = fresh.accounts.findIndex((a) => a.id === targetId)
+      if (idx === -1) {
+        notFoundRemove = true
+        return
+      }
+
+      const wasActive = fresh.routing?.activeId === targetId
+      fresh.accounts.splice(idx, 1)
+
+      if (wasActive) {
+        const next = fresh.accounts.find(isOAuthAccount)
+        fresh.routing = {
+          ...(fresh.routing ?? {}),
+          activeId: next?.id ?? 'main',
+        }
+      }
+    }, ctx.accountStoragePath)
+
+    if (notFoundRemove) {
       return {
         command: 'openai-account',
         text: `## Account Not Found\n\nNo account with id \`${targetId}\` exists.`,
@@ -241,52 +269,48 @@ async function executeAccountCommand(
       }
     }
 
-    const wasActive = storage.routing?.activeId === targetId
-    accounts.splice(idx, 1)
-
-    // If removing the active account, repoint to the next OAuth fallback or main.
-    if (wasActive) {
-      const next = accounts.find(isOAuthAccount)
-      storage.routing = {
-        ...(storage.routing ?? {}),
-        activeId: next?.id ?? 'main',
-      }
-    }
-
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
     log.info('account removed', { id: targetId })
     void ctx.refreshSidebar?.().catch(() => {})
 
     return {
       command: 'openai-account',
       text: `## Account Removed\n\nRemoved account \`${targetId}\`.`,
-      knobs: { accounts },
+      knobs: { accounts: fresh.accounts },
     }
   }
 
   if (tokens[0] === 'order' && tokens.length >= 3) {
-    // Reorder: swap positions of two accounts
-    const a = accounts.findIndex((ac) => ac.id === tokens[1])
-    const b = accounts.findIndex((ac) => ac.id === tokens[2])
-    if (a === -1 || b === -1) {
+    let notFoundOrder = false
+
+    const fresh = await ctx.mutateAccounts((fresh) => {
+      const a = fresh.accounts.findIndex((ac) => ac.id === tokens[1])
+      const b = fresh.accounts.findIndex((ac) => ac.id === tokens[2])
+      if (a === -1 || b === -1) {
+        notFoundOrder = true
+        return
+      }
+      // biome-ignore lint/style/noNonNullAssertion: a,b validated in-bounds by findIndex above
+      const tmp = fresh.accounts[a]!
+      // biome-ignore lint/style/noNonNullAssertion: a,b validated in-bounds by findIndex above
+      fresh.accounts[a] = fresh.accounts[b]!
+      fresh.accounts[b] = tmp
+    }, ctx.accountStoragePath)
+
+    if (notFoundOrder) {
       return {
         command: 'openai-account',
         text: '## Invalid Order\n\nBoth account IDs must exist.',
         knobs: { accounts },
       }
     }
-    // biome-ignore lint/style/noNonNullAssertion: a,b validated in-bounds by findIndex above
-    const tmp = accounts[a]!
-    // biome-ignore lint/style/noNonNullAssertion: a,b validated in-bounds by findIndex above
-    accounts[a] = accounts[b]!
-    accounts[b] = tmp
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
+
     log.info('accounts reordered', { a: tokens[1], b: tokens[2] })
     void ctx.refreshSidebar?.().catch(() => {})
+
     return {
       command: 'openai-account',
       text: `## Accounts Reordered\n\nSwapped positions of \`${tokens[1]}\` and \`${tokens[2]}\`.`,
-      knobs: { accounts },
+      knobs: { accounts: fresh.accounts },
     }
   }
 
@@ -307,32 +331,36 @@ async function executeAccountCommand(
     // never reach the user.
     completion
       .then(async (account) => {
-        const store = (await ctx.loadAccounts(ctx.accountStoragePath)) ?? {
-          version: 1 as const,
-          accounts: [],
-        }
+        let rejected = false
+        let rejectedMsg = ''
 
-        if (
-          account.accountId &&
-          store.mainAccountId &&
-          account.accountId === store.mainAccountId
-        ) {
-          const msg =
-            'That account is already your main account — not added as a fallback.'
+        await ctx.mutateAccounts((fresh) => {
+          if (
+            account.accountId &&
+            fresh.mainAccountId &&
+            account.accountId === fresh.mainAccountId
+          ) {
+            rejected = true
+            rejectedMsg =
+              'That account is already your main account — not added as a fallback.'
+            return
+          }
+          upsertAccount(fresh.accounts, account as OAuthAccount)
+        }, ctx.accountStoragePath)
+
+        if (rejected) {
           log.warn('account add rejected (main identity)', {
             accountId: account.accountId,
             sessionId,
           })
           notify?.({
             command: 'openai-account',
-            text: `## Add Failed\n\n${msg}`,
+            text: `## Add Failed\n\n${rejectedMsg}`,
             knobs: {},
           })
           return
         }
 
-        upsertAccount(store.accounts, account as OAuthAccount)
-        await defaultSaveAccounts(store, ctx.accountStoragePath)
         log.info('account added', {
           id: account.id,
           label: account.label,

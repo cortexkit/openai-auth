@@ -3,8 +3,8 @@
 import {
   getAccountStoragePath,
   loadAccounts,
+  mutateAccounts,
   type OAuthAccount,
-  saveAccounts,
 } from './core/accounts'
 import { beginAccountLogin, upsertAccount } from './core/oauth'
 import { openUrl } from './util/open-url'
@@ -70,29 +70,30 @@ async function main() {
 
       const account = await completion
 
-      const storage = (await loadAccounts()) ?? {
-        version: 1 as const,
-        accounts: [],
-      }
+      let rejected = false
+      let rejectedMsg = ''
 
-      // Reject self-fallback: adding main's ChatGPT account as a fallback
-      // would let routing retry on the account that just returned 429.
-      if (
-        account.accountId &&
-        storage.mainAccountId &&
-        account.accountId === storage.mainAccountId
-      ) {
-        console.error(
-          '\nError: that account is already your main (same ChatGPT account).',
-        )
+      await mutateAccounts((fresh) => {
+        if (
+          account.accountId &&
+          fresh.mainAccountId &&
+          account.accountId === fresh.mainAccountId
+        ) {
+          rejected = true
+          rejectedMsg =
+            '\nError: that account is already your main (same ChatGPT account).'
+          return
+        }
+        upsertAccount(fresh.accounts, account as unknown as OAuthAccount)
+      })
+
+      if (rejected) {
+        console.error(rejectedMsg)
         console.error(
           'A self-fallback would retry on the account that just returned 429.',
         )
         process.exit(1)
       }
-
-      upsertAccount(storage.accounts, account as unknown as OAuthAccount)
-      await saveAccounts(storage)
 
       console.log(`\n✓ Added account ${account.id}`)
       if (account.label) console.log(`  Label: ${account.label}`)
@@ -123,20 +124,21 @@ async function main() {
         process.exit(1)
       }
 
-      const storage = await loadAccounts()
-      if (!storage) {
-        console.error('No account store found.')
-        process.exit(1)
-      }
+      let notFoundRemove = false
+      await mutateAccounts((fresh) => {
+        const idx = fresh.accounts.findIndex((a) => a.id === targetId)
+        if (idx === -1) {
+          notFoundRemove = true
+          return
+        }
+        fresh.accounts.splice(idx, 1)
+      })
 
-      const idx = storage.accounts.findIndex((a) => a.id === targetId)
-      if (idx === -1) {
+      if (notFoundRemove) {
         console.error(`No account with id "${targetId}".`)
         process.exit(1)
       }
 
-      storage.accounts.splice(idx, 1)
-      await saveAccounts(storage)
       console.log(`Removed account ${targetId}.`)
       break
     }

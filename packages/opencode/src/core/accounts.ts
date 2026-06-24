@@ -642,14 +642,21 @@ function mergeStorageForSave(
 ): AccountStorage {
   if (!latest) return incoming
 
-  const accounts = new Map<string, FallbackAccount>()
-  for (const account of latest.accounts) accounts.set(account.id, account)
-  for (const account of incoming.accounts) accounts.set(account.id, account)
-
+  // Incoming storage is authoritative for the account set and for every
+  // top-level field it carries.  Fields absent from incoming fall back to
+  // the latest on-disk snapshot.  Because the spread is { ...latest,
+  // ...incoming }, incoming can overwrite any field that was concurrently
+  // written to disk — callers that need to preserve concurrent writes must
+  // use mutateAccounts (which re-reads under the lock) instead of a
+  // load→mutate→saveAccounts sequence.
+  //
+  // Per-account runtime state (quota snapshots, refresh errors) is written
+  // by background timers through the scoped saveAccountState path and is
+  // unaffected by this merge.
   return {
     ...latest,
     ...incoming,
-    accounts: [...accounts.values()],
+    accounts: incoming.accounts,
   }
 }
 
@@ -745,6 +752,45 @@ export async function saveAccounts(
   }
 }
 
+export async function mutateAccounts(
+  mutator: (storage: AccountStorage) => void | Promise<void>,
+  path = getAccountStoragePath(),
+): Promise<AccountStorage> {
+  const statePath = getAccountStatePath(path)
+  const lock = await acquireSaveAccountsLock(path)
+  try {
+    const stateLock = await acquireSaveAccountsLock(statePath)
+    try {
+      const configJson = await readJsonIfPresent(path)
+      const stateJson = await readJsonIfPresent(statePath)
+      const fresh: AccountStorage = configJson.exists
+        ? (normalizeStorage(
+            mergeConfigAndState(configJson.value, stateJson.value),
+          ) ??
+          ({
+            version: 1,
+            main: { type: 'opencode', provider: 'openai' },
+            accounts: [],
+          } as AccountStorage))
+        : {
+            version: 1,
+            main: { type: 'opencode', provider: 'openai' },
+            accounts: [],
+          }
+      await mutator(fresh)
+      const existing = isRecord(configJson.value) ? configJson.value : {}
+      const nextConfig = { ...existing, ...configFromStorage(fresh) }
+      await writeJsonAtomic(path, nextConfig)
+      await writeJsonAtomic(statePath, stateFromStorage(fresh))
+      return fresh
+    } finally {
+      await stateLock.release()
+    }
+  } finally {
+    await lock.release()
+  }
+}
+
 function applyMainQuotaStatePatch(
   state: AccountRuntimeState,
   storage: AccountStorage,
@@ -820,6 +866,10 @@ export async function saveAccountState(
         )
       }
       if (ids) {
+        // Scoped save: only prune ids that are in the requested scope and
+        // absent from storage.accounts.  Do NOT touch ids outside the scope
+        // so that a partial save never prunes state for accounts it was not
+        // asked to manage.
         for (const id of ids) {
           if (!storage.accounts.some((account) => account.id === id)) {
             delete next.accounts[id]

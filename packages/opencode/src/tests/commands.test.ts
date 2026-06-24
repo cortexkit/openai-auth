@@ -14,7 +14,12 @@ import type { CommandContext } from '../commands'
 // Static import for tests that don't need mocking.
 import { buildDialogPayload } from '../commands'
 import type { AccountQuotaWindow, OAuthQuotaSnapshot } from '../core/accounts'
-import { loadAccounts, type OAuthAccount, saveAccounts } from '../core/accounts'
+import {
+  loadAccounts,
+  mutateAccounts,
+  type OAuthAccount,
+  saveAccounts,
+} from '../core/accounts'
 import { QuotaManager } from '../core/quota-manager'
 import { createLogger, flushForTest, setLogLevel } from '../logger'
 import { resetNotificationsForTest } from '../rpc/notifications'
@@ -84,6 +89,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
     }
 
@@ -101,6 +107,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
     }
 
@@ -131,6 +138,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
       cacheKeepManager: {
         status: () => ({
@@ -173,6 +181,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
       setCacheKeepEnabled,
       cacheKeepManager: {
@@ -220,6 +229,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
       setCacheKeepSubagents,
       cacheKeepManager: {
@@ -259,6 +269,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
       cacheKeepManager: {
         start,
@@ -303,6 +314,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client,
     }
 
@@ -347,6 +359,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client,
     }
 
@@ -390,6 +403,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client,
     }
 
@@ -422,6 +436,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client,
     }
 
@@ -457,6 +472,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
     }
     await saveAccounts(
@@ -483,6 +499,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
     }
     await saveAccounts(
@@ -516,6 +533,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client,
       refreshSidebar: async () => {
         refreshCalls.push(1)
@@ -545,6 +563,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client,
       refreshSidebar: async () => {
         refreshCalls.push(1)
@@ -574,6 +593,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client,
       refreshSidebar: async () => {
         refreshCalls.push(1)
@@ -603,6 +623,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client,
       refreshSidebar: async () => {
         refreshCalls.push(1)
@@ -639,6 +660,7 @@ describe('commands', () => {
         accountStoragePath: configPath,
         quotaManager: qm,
         loadAccounts,
+        mutateAccounts: (m, p) => mutateAccounts(m, p),
         client: makeClient(),
       }
 
@@ -695,6 +717,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
     }
 
@@ -720,6 +743,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
     }
 
@@ -740,6 +764,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
     }
 
@@ -770,6 +795,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
       refreshAllQuota: async () => {
         qm.setMain('access-main', {
@@ -820,6 +846,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
       refreshAllQuota: async () => {
         qm.setMain('access-main', {
@@ -867,6 +894,7 @@ describe('commands', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
       // refreshAllQuota intentionally omitted
     }
@@ -943,6 +971,7 @@ describe('commands (add)', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
     }
 
@@ -983,6 +1012,7 @@ describe('commands (add)', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client,
     }
 
@@ -1027,6 +1057,7 @@ describe('commands (add)', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
     }
 
@@ -1065,6 +1096,7 @@ describe('commands (add)', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
     }
 
@@ -1111,6 +1143,7 @@ describe('commands (add)', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
     }
 
@@ -1156,6 +1189,7 @@ describe('commands (add)', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
       notify: (payload) => {
         notifyCalls.push({ text: payload.text })
@@ -1192,6 +1226,7 @@ describe('commands (add)', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
       notify: (payload) => {
         notifyCalls.push({ text: payload.text })
@@ -1227,6 +1262,7 @@ describe('commands (add)', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
     }
 
@@ -1264,6 +1300,7 @@ describe('commands (add)', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
     }
 
@@ -1301,6 +1338,7 @@ describe('commands (add)', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
       refreshSidebar: async () => {
         refreshCalls.push(1)
@@ -1337,6 +1375,7 @@ describe('commands (add)', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
     }
 
@@ -1371,6 +1410,7 @@ describe('commands (add)', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
     }
 
@@ -1412,6 +1452,7 @@ describe('commands (add)', () => {
       accountStoragePath: configPath,
       quotaManager: qm,
       loadAccounts,
+      mutateAccounts: (m, p) => mutateAccounts(m, p),
       client: makeClient(),
       sessionId: 'session-one',
       notify: (payload) => {
