@@ -218,6 +218,63 @@ describe('createWebSocketFetch', () => {
     )
   })
 
+  test('sanitizes websocket-shaped requests before HTTP fallback', async () => {
+    let fallbackInit: RequestInit | undefined
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'error',
+              status: 400,
+              error: {
+                code: 'websocket_connection_limit_reached',
+                message: 'Responses websocket connection limit reached',
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const httpFetch: typeof globalThis.fetch = Object.assign(
+          async (_input: RequestInfo | URL, init?: RequestInit) => {
+            fallbackInit = init
+            return new Response('http')
+          },
+          { preconnect: () => {} },
+        )
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          httpFetch,
+          firstEventGraceMs: 1,
+        })
+
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({
+            input: [],
+            client_metadata: {
+              keep: 'stable',
+              'x-codex-ws-stream-request-start-ms': '12345',
+            },
+          }),
+        )
+
+        expect(await response.text()).toBe('http')
+        if (!fallbackInit) throw new Error('missing fallback init')
+        const headers = new Headers(fallbackInit.headers)
+        expect(headers.get('accept')).toBe('text/event-stream')
+        expect(headers.get('content-type')).toBe('application/json')
+        const fallbackBody = JSON.parse(String(fallbackInit.body)) as Record<
+          string,
+          unknown
+        >
+        expect(fallbackBody.client_metadata).toEqual({ keep: 'stable' })
+        websocketFetch.close()
+      },
+    )
+  })
+
   test('keeps the full first request after prewarm so historical tool outputs keep their tool calls', async () => {
     const sent: Array<Record<string, unknown>> = []
     await withFakeWebSocket(
@@ -361,6 +418,81 @@ describe('createWebSocketFetch', () => {
         expect(sent[3]).toMatchObject({ generate: false, input: [] })
         expect(sent[4]?.previous_response_id).toBe('resp_prewarm_4')
         expect(sent[4]?.input).toHaveLength(5)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('preserves turn_id across a reconnect in the same tool loop', async () => {
+    const sent: Array<Record<string, unknown>> = []
+    let sockets = 0
+    await withFakeWebSocket(
+      ({ message }) => {
+        sockets++
+        return {
+          send(data) {
+            const parsed = JSON.parse(data) as Record<string, unknown>
+            sent.push(parsed)
+            message(
+              JSON.stringify({
+                type: 'response.completed',
+                response: {
+                  id:
+                    parsed.generate === false
+                      ? `resp_prewarm_${sent.length}`
+                      : `resp_main_${sent.length}`,
+                },
+              }),
+            )
+          },
+        }
+      },
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          maxConnectionAge: 0,
+        })
+        const url = 'https://example.test/backend-api/codex/responses'
+        const user = {
+          role: 'user',
+          content: [{ type: 'input_text', text: 'go' }],
+        }
+        const call = { type: 'function_call', call_id: 'call_1', name: 'read' }
+        const output = {
+          type: 'function_call_output',
+          call_id: 'call_1',
+          output: 'ok',
+        }
+
+        await websocketFetch(
+          url,
+          streamRequest({
+            input: [user],
+            client_metadata: body([]).client_metadata,
+          }),
+        )
+        await websocketFetch(
+          url,
+          streamRequest({
+            input: [user, call, output],
+            client_metadata: body([]).client_metadata,
+          }),
+        )
+
+        const mainRequests = sent.filter(
+          (request) => request.generate !== false,
+        )
+        expect(sockets).toBe(2)
+        expect(mainRequests).toHaveLength(2)
+        const firstMain = mainRequests[0]
+        const secondMain = mainRequests[1]
+        if (!firstMain || !secondMain) throw new Error('missing main requests')
+        expect(secondMain.input).toEqual([
+          { ...user, type: 'message' },
+          call,
+          output,
+        ])
+        expect(turnID(secondMain)).toBe(turnID(firstMain))
         websocketFetch.close()
       },
     )
