@@ -121,6 +121,60 @@ describe('applyTurnId', () => {
 })
 
 describe('createWebSocketFetch', () => {
+  test('attributes quota by the internal account key, not the wire chatgpt-account-id', async () => {
+    const quotaCalls: Array<{ accessToken: string; accountId?: string }> = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'codex.rate_limits',
+              rate_limits: {
+                primary: { used_percent: 10, window_minutes: 300 },
+              },
+            }),
+          )
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: 'resp_1' },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          onQuota: (_s, accessToken, accountId) => {
+            quotaCalls.push({ accessToken, accountId })
+          },
+        })
+
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-q',
+              authorization: 'Bearer tok-main',
+              // Wire account id is the ChatGPT stable id — must NOT be used as the
+              // quota key. The internal QUOTA_ACCOUNT_HEADER is 'main' here.
+              'chatgpt-account-id': 'chatgpt-stable-xyz',
+              'x-openai-auth-quota-account': 'main',
+            },
+            body: JSON.stringify({ stream: true, input: [] }),
+          },
+        )
+        await response.text()
+
+        expect(quotaCalls).toHaveLength(1)
+        expect(quotaCalls[0]?.accountId).toBe('main')
+        expect(quotaCalls[0]?.accessToken).toBe('tok-main')
+        websocketFetch.close()
+      },
+    )
+  })
+
   test('preserves reasoning summaries on websocket requests and forwards reasoning deltas', async () => {
     const sent: Array<Record<string, unknown>> = []
     await withFakeWebSocket(

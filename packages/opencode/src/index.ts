@@ -1096,6 +1096,14 @@ export async function CodexAuthPlugin(
           if (accountId) {
             headers.set('ChatGPT-Account-Id', accountId)
           }
+          // Thread the internal quota STORAGE key ('main' or a fallback id) so the
+          // WS pool attributes codex.rate_limits frames to the right bucket instead
+          // of the wire chatgpt-account-id. Stripped before the wire as an internal
+          // header. The HTTP path attributes quota directly at pushQuota.
+          headers.set(
+            OpenAIWebSocketPool.QUOTA_ACCOUNT_HEADER,
+            keepwarmAccountKey,
+          )
 
           const sessionID =
             headers.get('x-session-affinity') ??

@@ -1,4 +1,5 @@
 import {
+  afterAll,
   afterEach,
   beforeEach,
   describe,
@@ -13,6 +14,16 @@ import { join } from 'node:path'
 import type { CommandContext } from '../commands'
 // Static import for tests that don't need mocking.
 import { buildDialogPayload } from '../commands'
+// Snapshot the REAL oauth module exports at load time (before any mock.module
+// runs). bun's mock.module leaks process-wide and mock.restore() does NOT undo
+// it, so without restoring here the beginAccountLogin stub below would poison
+// every later test file that imports ../core/oauth. We spread into a PLAIN object
+// so the snapshot holds the original function references even after the live
+// namespace is later replaced; afterAll re-installs it.
+import * as oauthLiveNamespace from '../core/oauth'
+
+const oauthRealExports = { ...oauthLiveNamespace }
+
 import type { AccountQuotaWindow, OAuthQuotaSnapshot } from '../core/accounts'
 import { loadAccounts, type OAuthAccount, saveAccounts } from '../core/accounts'
 import { QuotaManager } from '../core/quota-manager'
@@ -917,6 +928,12 @@ describe('commands (add)', () => {
     } catch {
       /* */
     }
+  })
+
+  // mock.module('../core/oauth', ...) below leaks process-wide; re-install the
+  // real module so later test files (e.g. oauth.test.ts) see the genuine exports.
+  afterAll(() => {
+    mock.module('../core/oauth', () => oauthRealExports)
   })
 
   test('/openai-account add returns dialog with auth URL', async () => {

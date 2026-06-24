@@ -7,7 +7,17 @@ import { uuidV7 } from './util/uuid-v7'
 import { OpenAIWebSocket } from './ws'
 
 export const TITLE_HEADER = 'x-opencode-title'
-const INTERNAL_HEADERS = new Set([TITLE_HEADER, DUMP_SESSION_HEADER])
+// Internal-only header carrying the quota STORAGE key ('main' or a fallback id)
+// for the account this request is sent on. Quota frames must be attributed by
+// this internal key, not the wire `chatgpt-account-id` (which can differ from the
+// plugin's fallback id, or be present for the main account — both misroute quota).
+// Stripped before the socket upgrade / HTTP fallback like every internal header.
+export const QUOTA_ACCOUNT_HEADER = 'x-openai-auth-quota-account'
+const INTERNAL_HEADERS = new Set([
+  TITLE_HEADER,
+  DUMP_SESSION_HEADER,
+  QUOTA_ACCOUNT_HEADER,
+])
 
 export interface CreateWebSocketFetchOptions {
   httpFetch?: typeof globalThis.fetch
@@ -203,9 +213,13 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         sourceHeaders.authorization.startsWith('Bearer ')
           ? sourceHeaders.authorization.slice('Bearer '.length)
           : ''
+      // Attribute quota by the internal storage key threaded from the loader
+      // (the account this request was actually sent on), NOT the wire
+      // chatgpt-account-id header. The internal key was read from the raw init
+      // before internal-header stripping.
       const requestAccountId =
-        typeof sourceHeaders['chatgpt-account-id'] === 'string'
-          ? sourceHeaders['chatgpt-account-id']
+        typeof internalHeaders[QUOTA_ACCOUNT_HEADER] === 'string'
+          ? internalHeaders[QUOTA_ACCOUNT_HEADER]
           : undefined
       const requestOnQuota = onQuota
         ? (s: Record<string, unknown>) =>
