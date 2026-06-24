@@ -47,6 +47,11 @@ interface PoolEntry {
   // continuation input is only known at send time.
   turnID?: string
   turnStartedAt?: number
+  // Last full replay input seen for this logical turn. Unlike continuation,
+  // this survives socket reconnects so a replay of prior user messages does
+  // not look like a fresh turn.
+  turnInput?: unknown[]
+  turnSignature?: string
 }
 
 interface ContinuationState {
@@ -123,7 +128,8 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           ? input
           : input.url
     const internalHeaders = OpenAIWebSocket.normalizeHeaders(init?.headers)
-    const httpInit = withoutInternalHeaders(init)
+    const wsInit = withoutInternalHeaders(init)
+    const httpInit = sanitizeHttpFallbackInit(wsInit)
 
     if (
       init?.method !== 'POST' ||
@@ -162,7 +168,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     // codex.rate_limits frame leakage. Same account + same session → same key
     // → socket reuse preserved.
     const sourceHeadersForKey = OpenAIWebSocket.normalizeHeaders(
-      httpInit?.headers,
+      wsInit?.headers,
     )
     const acctDisc = accountDiscriminator(sourceHeadersForKey)
     const key = `${sessionID}:${acctDisc}:conversation`
@@ -186,7 +192,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     entry.lastUsedAt = Date.now()
     try {
       const sourceBody = normalizeResponseBody(body)
-      const sourceHeaders = OpenAIWebSocket.normalizeHeaders(httpInit?.headers)
+      const sourceHeaders = OpenAIWebSocket.normalizeHeaders(wsInit?.headers)
 
       // Capture the per-request account identity at send time so that any
       // codex.rate_limits frame arriving asynchronously is attributed to THIS
@@ -224,7 +230,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           signal: init?.signal ?? undefined,
           sessionID: dumpSessionID,
           url: options?.url ?? url,
-          headers: httpInit?.headers,
+          headers: wsInit?.headers,
         })
       }
       let resolveFirstEvent: (
@@ -237,8 +243,9 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           rejectFirstEvent = reject
         },
       )
+      const continuedBody = withContinuation(entry, sourceBody)
       const requestBody = orderCodexBody(
-        applyTurnId(entry, withContinuation(entry, sourceBody)),
+        applyTurnId(entry, continuedBody, sourceBody),
       )
       // The request chained to the prior continuation iff it carries a
       // previous_response_id (withContinuation only sets it when it actually
@@ -251,8 +258,8 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         phase: 'main',
         bodyText: JSON.stringify(requestBody),
         url: options?.url ?? url,
-        method: httpInit?.method,
-        headers: httpInit?.headers,
+        method: wsInit?.method,
+        headers: wsInit?.headers,
       })
       const response = OpenAIWebSocket.streamResponsesWebSocket({
         socket: entry.socket,
@@ -691,18 +698,34 @@ function updateContinuation(
 }
 
 // Stabilize turn_id/turn_started_at across a turn's tool-loop, matching Codex. The *sent* input
-// is authoritative: a fresh user turn carries a user/developer message; a tool continuation carries
-// only tool *_output items (and possibly an inline, unfinalized function_call kept by the
-// continuation guard) and reuses the active turn_id. We key on a user/developer message — matching
-// the HTTP path's startsHttpUserTurn — rather than "any non-_output item", so a kept inline
-// function_call does not spuriously mint a new turn_id mid tool-loop (which would bust the cache).
-export function applyTurnId(entry: PoolEntry, body: Record<string, unknown>) {
+// is authoritative on the normal continuation path: a fresh user turn carries a user/developer
+// message; a tool continuation carries only tool *_output items (and possibly an inline,
+// unfinalized function_call kept by the continuation guard) and reuses the active turn_id. When a
+// reconnect forces a full replay, compare against the previous full input so historical user
+// messages do not look like a fresh turn. We key on a user/developer message — matching the HTTP
+// path's startsHttpUserTurn — rather than "any non-_output item", so a kept inline function_call
+// does not spuriously mint a new turn_id mid tool-loop (which would bust the cache).
+export function applyTurnId(
+  entry: PoolEntry,
+  body: Record<string, unknown>,
+  fullBody: Record<string, unknown> = body,
+) {
   const input = Array.isArray(body.input) ? body.input : []
-  const isNewTurn = input.length > 0 && input.some(isUserTurnMessage)
+  const fullInput = Array.isArray(fullBody.input) ? fullBody.input : input
+  const fullSignature = bodySignature(fullBody)
+  const prefixLength =
+    entry.turnInput && entry.turnSignature === fullSignature
+      ? matchingInputPrefixLength(entry.turnInput, fullInput)
+      : undefined
+  const turnInput =
+    prefixLength === undefined ? input : fullInput.slice(prefixLength)
+  const isNewTurn = turnInput.length > 0 && turnInput.some(isUserTurnMessage)
   if (isNewTurn || !entry.turnID) {
     entry.turnID = uuidV7()
     entry.turnStartedAt = Date.now()
   }
+  entry.turnInput = fullInput.slice()
+  entry.turnSignature = fullSignature
   const cm = body.client_metadata
   if (!isRecord(cm) || typeof cm['x-codex-turn-metadata'] !== 'string')
     return body
@@ -727,6 +750,15 @@ export function applyTurnId(entry: PoolEntry, body: Record<string, unknown>) {
     ...body,
     client_metadata: { ...cm, 'x-codex-turn-metadata': turnMetadata },
   }
+}
+
+function matchingInputPrefixLength(prefix: unknown[], input: unknown[]) {
+  if (prefix.length > input.length) return undefined
+  for (let index = 0; index < prefix.length; index++) {
+    if (stableStringify(prefix[index]) !== stableStringify(input[index]))
+      return undefined
+  }
+  return prefix.length
 }
 
 function withContinuation(entry: PoolEntry, body: Record<string, unknown>) {
@@ -841,6 +873,40 @@ function hasInputPrefix(prefix: unknown[], input: unknown[]) {
       return false
   }
   return true
+}
+
+function sanitizeHttpFallbackInit(init: RequestInit | undefined) {
+  if (init?.method?.toUpperCase() !== 'POST') return init
+  const headers = new Headers(init.headers)
+  headers.set('accept', 'text/event-stream')
+  headers.set('content-type', 'application/json')
+  return {
+    ...init,
+    headers,
+    body: sanitizeHttpFallbackBody(init.body),
+  }
+}
+
+function sanitizeHttpFallbackBody(body: BodyInit | null | undefined) {
+  if (typeof body !== 'string') return body
+  try {
+    const parsed = JSON.parse(body)
+    if (!isRecord(parsed) || !isRecord(parsed.client_metadata)) return body
+    if (
+      !(
+        'x-codex-turn-metadata' in parsed.client_metadata ||
+        'x-codex-ws-stream-request-start-ms' in parsed.client_metadata
+      )
+    ) {
+      return body
+    }
+    const clientMetadata = { ...parsed.client_metadata }
+    delete clientMetadata['x-codex-turn-metadata']
+    delete clientMetadata['x-codex-ws-stream-request-start-ms']
+    return JSON.stringify({ ...parsed, client_metadata: clientMetadata })
+  } catch {
+    return body
+  }
 }
 
 export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(
