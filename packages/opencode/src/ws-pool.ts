@@ -53,6 +53,10 @@ interface ContinuationState {
   responseID: string
   input: unknown[]
   signature: string
+  // call_ids the chained response actually finalized. Only these may be trimmed
+  // from a later continuation suffix; an unfinalized function_call (e.g. an
+  // aborted partial whose output is still replayed) must be kept inline.
+  finalizedCallIds: Set<string>
 }
 
 const DEFAULT_CONNECT_TIMEOUT = 15_000
@@ -253,7 +257,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         signal: init?.signal ?? undefined,
         onQuota: requestOnQuota,
         onFirstEvent: (error) => resolveFirstEvent(error ?? true),
-        onComplete: (event) => {
+        onComplete: (event, finalizedCallIds) => {
           const usage = responseUsage(event)
           void dumpDiagnostic({
             component: 'ws-pool',
@@ -262,7 +266,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
             responseID: responseID(event),
             usage,
           })
-          updateContinuation(entry, sourceBody, event)
+          updateContinuation(entry, sourceBody, event, finalizedCallIds)
         },
         onTerminal: (event) => {
           entry.busy = false
@@ -487,7 +491,7 @@ async function prewarm(
     sessionID: options.sessionID,
     idleTimeout,
     signal: options.signal,
-    onComplete: (event) => {
+    onComplete: (event, finalizedCallIds) => {
       void dumpDiagnostic({
         component: 'ws-pool',
         event: 'prewarm_completed',
@@ -495,7 +499,7 @@ async function prewarm(
         responseID: responseID(event),
         usage: responseUsage(event),
       })
-      updateContinuation(entry, request, event)
+      updateContinuation(entry, request, event, finalizedCallIds)
     },
     onTerminal: (event) => {
       if (event.type !== 'response.completed' && event.type !== 'response.done')
@@ -638,6 +642,7 @@ function updateContinuation(
   entry: PoolEntry,
   fullBody: Record<string, unknown>,
   event: Record<string, unknown>,
+  finalizedCallIds: Set<string>,
 ) {
   const response = event.response
   const responseID =
@@ -648,28 +653,35 @@ function updateContinuation(
     entry.continuation = undefined
     return
   }
+  // Accumulate finalized call ids across the whole previous_response_id chain, not
+  // just the latest response. A continuation suffix can carry the output of a call
+  // finalized several responses back (delayed/parallel tool output); that call is
+  // already in the chained context, so it must still be trimmed — re-sending its
+  // function_call inline would duplicate it. A prewarm (generate:false) starts a
+  // fresh chain (previous_response_id:null), so it resets the set rather than
+  // inheriting the prior turn's ids; this also bounds the set to one turn.
+  const isPrewarm = fullBody.generate === false
+  const chainFinalized = isPrewarm
+    ? new Set<string>()
+    : new Set(entry.continuation?.finalizedCallIds)
+  for (const id of finalizedCallIds) chainFinalized.add(id)
   entry.continuation = {
     responseID,
     input: fullBody.input,
     signature: bodySignature(fullBody),
+    finalizedCallIds: chainFinalized,
   }
 }
 
 // Stabilize turn_id/turn_started_at across a turn's tool-loop, matching Codex. The *sent* input
-// is authoritative: a fresh turn carries a non-*_output message; a tool continuation carries only
-// *_output items and reuses the active turn_id.
+// is authoritative: a fresh user turn carries a user/developer message; a tool continuation carries
+// only tool *_output items (and possibly an inline, unfinalized function_call kept by the
+// continuation guard) and reuses the active turn_id. We key on a user/developer message — matching
+// the HTTP path's startsHttpUserTurn — rather than "any non-_output item", so a kept inline
+// function_call does not spuriously mint a new turn_id mid tool-loop (which would bust the cache).
 export function applyTurnId(entry: PoolEntry, body: Record<string, unknown>) {
   const input = Array.isArray(body.input) ? body.input : []
-  const isNewTurn =
-    input.length > 0 &&
-    input.some(
-      (item) =>
-        !(
-          isRecord(item) &&
-          typeof item.type === 'string' &&
-          item.type.endsWith('_output')
-        ),
-    )
+  const isNewTurn = input.length > 0 && input.some(isUserTurnMessage)
   if (isNewTurn || !entry.turnID) {
     entry.turnID = uuidV7()
     entry.turnStartedAt = Date.now()
@@ -718,7 +730,10 @@ function withContinuation(entry: PoolEntry, body: Record<string, unknown>) {
     }
   }
   const suffix = input.slice(entry.continuation.input.length)
-  const nextInput = continuationInput(suffix)
+  const nextInput = continuationInput(
+    suffix,
+    entry.continuation.finalizedCallIds,
+  )
   if (nextInput.length === 0) return body
   return {
     ...body,
@@ -742,7 +757,7 @@ function isUserTurnMessage(item: unknown) {
   return item.role === 'user' || item.role === 'developer'
 }
 
-function continuationInput(input: unknown[]) {
+function continuationInput(input: unknown[], finalizedCallIds: Set<string>) {
   return input.filter((item) => {
     if (!isRecord(item)) return true
     if (typeof item.type === 'string' && item.type.endsWith('_output'))
@@ -752,6 +767,21 @@ function continuationInput(input: unknown[]) {
       item.type === 'custom_tool_call_output'
     )
       return true
+    // A function_call is normally dropped from the continuation because the
+    // chained response (previous_response_id) already holds it. That only holds
+    // when the response actually FINALIZED it. An unfinalized call (e.g. an
+    // aborted partial that OpenCode still replays as a function_call/output pair)
+    // is NOT in the chained response, so trimming it orphans its output → 400.
+    // Keep such a function_call inline so the backend can match it.
+    if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+      const callId =
+        typeof item.call_id === 'string'
+          ? item.call_id
+          : typeof item.id === 'string'
+            ? item.id
+            : undefined
+      return callId ? !finalizedCallIds.has(callId) : true
+    }
     if (item.type === 'message') return item.role !== 'assistant'
     if (typeof item.role === 'string') return item.role !== 'assistant'
     return false

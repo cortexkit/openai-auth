@@ -85,7 +85,18 @@ export interface StreamResponsesWebSocketOptions {
   idleTimeout?: number
   signal?: AbortSignal
   onFirstEvent?: (error?: WrappedError) => void
-  onComplete?: (event: Record<string, unknown>) => void
+  /**
+   * Fires on response.completed/response.done. `finalizedFunctionCallIds` is the
+   * set of function/custom tool call ids the response actually finalized (emitted
+   * a response.output_item.done for). The pool uses it to decide which suffix
+   * function_call items are safe to trim from a continuation: only those present
+   * in the chained response may be dropped — an unfinalized call (e.g. an aborted
+   * partial) must be kept inline or its function_call_output orphans → 400.
+   */
+  onComplete?: (
+    event: Record<string, unknown>,
+    finalizedFunctionCallIds: Set<string>,
+  ) => void
   onTerminal?: (event: Record<string, unknown>) => void
   onRetryableTerminal?: (
     event: Record<string, unknown>,
@@ -251,6 +262,10 @@ export function streamResponsesWebSocket(
   let completed = false
   let emitted = false
   let idleTimer: ReturnType<typeof setTimeout> | undefined
+  // Call ids the response finalizes (one response.output_item.done per item).
+  // Only these are guaranteed present in the response previous_response_id will
+  // chain to, so only these are safe to trim from a later continuation suffix.
+  const finalizedFunctionCallIds = new Set<string>()
 
   function cleanup() {
     if (idleTimer) clearTimeout(idleTimer)
@@ -364,6 +379,7 @@ export function streamResponsesWebSocket(
 
     if (event) {
       void logProviderNativeWebSearchEvent(event, options.sessionID)
+      recordFinalizedFunctionCall(event, finalizedFunctionCallIds)
     }
 
     const translatedEvent = event ? translateHostedWebSearchEvent(event) : event
@@ -395,7 +411,10 @@ export function streamResponsesWebSocket(
       translatedEvent.type === 'response.done'
     ) {
       completed = true
-      options.onComplete?.(translatedEvent)
+      // Belt-and-suspenders: the completed frame may carry the full output list;
+      // fold any finalized function_call ids it lists into the streamed set.
+      collectFinalizedFromResponse(translatedEvent, finalizedFunctionCallIds)
+      options.onComplete?.(translatedEvent, finalizedFunctionCallIds)
       options.onTerminal?.(translatedEvent)
       closeCompleted()
       return
@@ -541,6 +560,44 @@ function isProviderNativeWebSearchEvent(event: Record<string, unknown>) {
     )
   }
   return false
+}
+
+// A function/custom tool call is "finalized" once the response emits its
+// response.output_item.done. Its call_id is then guaranteed to live in the
+// stored response, so a later continuation chained via previous_response_id may
+// safely omit the matching function_call from its input.
+function recordFinalizedFunctionCall(
+  event: Record<string, unknown>,
+  into: Set<string>,
+) {
+  if (event.type !== 'response.output_item.done') return
+  if (!isRecord(event.item)) return
+  addFinalizedCallId(event.item, into)
+}
+
+// The response.completed/done frame may carry the full output[] list. Fold any
+// finalized function_call ids it lists into the set, in case an output_item.done
+// was missed (e.g. coalesced frames).
+function collectFinalizedFromResponse(
+  event: Record<string, unknown>,
+  into: Set<string>,
+) {
+  const response = event.response
+  if (!isRecord(response) || !Array.isArray(response.output)) return
+  for (const item of response.output) {
+    if (isRecord(item)) addFinalizedCallId(item, into)
+  }
+}
+
+function addFinalizedCallId(item: Record<string, unknown>, into: Set<string>) {
+  if (item.type !== 'function_call' && item.type !== 'custom_tool_call') return
+  const callId =
+    typeof item.call_id === 'string'
+      ? item.call_id
+      : typeof item.id === 'string'
+        ? item.id
+        : undefined
+  if (callId) into.add(callId)
 }
 
 function parseWrappedError(
