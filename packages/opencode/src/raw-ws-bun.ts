@@ -159,7 +159,10 @@ export class RawWebSocket {
         port,
         tls: u.protocol === 'https:' ? { serverName: host } : undefined,
         socket: {
-          open: (s: BunSocket) => s.write(request),
+          open: (s: BunSocket) => {
+            this.socket = s
+            this.enqueueWrite(new TextEncoder().encode(request))
+          },
           data: (_s: unknown, d: Uint8Array) => this.onData(d),
           drain: () => this.flushWrites(),
           error: (_s: unknown, e: unknown) => {

@@ -110,7 +110,7 @@ describe('logger redaction', () => {
     expect(txt).toContain('"apiKey":"***REDACTED***"')
   })
 
-  it('keeps non-secret camelCase keys (sessionKey, cacheKey, lastAccessAt, accountId)', async () => {
+  it('keeps non-secret camelCase keys (sessionKey, cacheKey, lastAccessAt)', async () => {
     process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = 'debug'
     const { createLogger, flushForTest } = await import('../logger.ts')
     const log = createLogger('transport')
@@ -118,7 +118,6 @@ describe('logger redaction', () => {
       sessionKey: 'sess-abc',
       cacheKey: 'cache-123',
       lastAccessAt: 1234567890,
-      accountId: 'acc-456',
       status: 'ok',
       mode: 'auto',
       level: 'info',
@@ -128,8 +127,29 @@ describe('logger redaction', () => {
     expect(txt).toContain('"sessionKey":"sess-abc"')
     expect(txt).toContain('"cacheKey":"cache-123"')
     expect(txt).toContain('"lastAccessAt"')
-    expect(txt).toContain('"accountId"')
     expect(txt).toContain('"status"')
+  })
+
+  it('redacts account identity keys (accountId, chatgptAccountId, chatgpt-account-id)', async () => {
+    process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = 'debug'
+    const { createLogger, flushForTest } = await import('../logger.ts')
+    const log = createLogger('transport')
+    log.info('account-keys', {
+      accountId: 'acc-123',
+      chatgptAccountId: 'chatgpt-acc-456',
+      'chatgpt-account-id': 'chatgpt-acc-789',
+      chatgpt_account_id: 'chatgpt-acc-000',
+    })
+    await flushForTest()
+    const txt = readFileSync(logFile, 'utf8')
+    expect(txt).not.toContain('acc-123')
+    expect(txt).not.toContain('chatgpt-acc-456')
+    expect(txt).not.toContain('chatgpt-acc-789')
+    expect(txt).not.toContain('chatgpt-acc-000')
+    expect(txt).toContain('"accountId":"***REDACTED***"')
+    expect(txt).toContain('"chatgptAccountId":"***REDACTED***"')
+    expect(txt).toContain('"chatgpt-account-id":"***REDACTED***"')
+    expect(txt).toContain('"chatgpt_account_id":"***REDACTED***"')
   })
 
   it('keeps token COUNT keys (input_tokens, cached_tokens, output_tokens) unredacted', async () => {

@@ -35,6 +35,7 @@ const SECRET_KEY_EXACT =
 function isSecretKey(key: string): boolean {
   if (SECRET_KEY_EXACT.test(key)) return true
   const k = key.toLowerCase().replace(/[-_]/g, '')
+  if (k === 'accountid' || k === 'chatgptaccountid') return true
   if (k.includes('apikey')) return true
   if (k.endsWith('secret') || k.endsWith('password')) return true
   if (k.endsWith('token') && !k.endsWith('tokens')) return true
