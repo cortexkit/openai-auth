@@ -568,6 +568,31 @@ function copyRuntimeField<K extends keyof AccountRuntimeEntry>(
   }
 }
 
+function tokenFieldsMatch(
+  existing: AccountRuntimeEntry,
+  incoming: AccountRuntimeEntry,
+) {
+  return (
+    existing.access === incoming.access &&
+    existing.refresh === incoming.refresh &&
+    existing.expires === incoming.expires &&
+    existing.lastRefreshedAt === incoming.lastRefreshedAt
+  )
+}
+
+function selectSameTokenState(
+  existing: AccountRuntimeEntry,
+  incoming: AccountRuntimeEntry,
+) {
+  if (!tokenFieldsMatch(existing, incoming)) return incoming
+  if (!('lastRefreshError' in incoming)) return existing
+  if (!('lastRefreshError' in existing)) return incoming
+  return (incoming.lastRefreshError?.checkedAt ?? 0) >
+    (existing.lastRefreshError?.checkedAt ?? 0)
+    ? incoming
+    : existing
+}
+
 function applyNewerTokenState(
   merged: AccountRuntimeEntry,
   existing: AccountRuntimeEntry,
@@ -575,10 +600,19 @@ function applyNewerTokenState(
 ) {
   const existingRefreshAt = existing.lastRefreshedAt ?? 0
   const incomingRefreshAt = incoming.lastRefreshedAt ?? 0
-  if (existingRefreshAt === incomingRefreshAt) return
-
+  const existingExpires = existing.expires ?? 0
+  const incomingExpires = incoming.expires ?? 0
   const tokenSource =
-    existingRefreshAt > incomingRefreshAt ? existing : incoming
+    incomingRefreshAt > existingRefreshAt
+      ? incoming
+      : existingRefreshAt > incomingRefreshAt
+        ? existing
+        : incomingExpires > existingExpires
+          ? incoming
+          : existingExpires > incomingExpires
+            ? existing
+            : selectSameTokenState(existing, incoming)
+
   copyRuntimeField(merged, tokenSource, 'access')
   copyRuntimeField(merged, tokenSource, 'refresh')
   copyRuntimeField(merged, tokenSource, 'expires')
@@ -1352,13 +1386,13 @@ export class FallbackAccountManager {
       if (account.enabled === false || !isOAuthAccount(account)) continue
       if (isMainAccountFallback(storage, account)) continue
       let refreshFailed = false
+      let candidate = account
       try {
-        let next = account
-        if (tokenNeedsRefresh(next, storage, this.now())) {
-          const refreshError = next.lastRefreshError
+        if (tokenNeedsRefresh(candidate, storage, this.now())) {
+          const refreshError = candidate.lastRefreshError
           if (
             refreshError &&
-            refreshBackoffActive(refreshError, next.refresh, this.now())
+            refreshBackoffActive(refreshError, candidate.refresh, this.now())
           ) {
             refreshFailed = true
             throw new Error(
@@ -1366,7 +1400,7 @@ export class FallbackAccountManager {
             )
           }
           try {
-            next = await this.refreshAccount(next, storage)
+            candidate = await this.refreshAccount(candidate, storage)
             changed = true
           } catch (error) {
             refreshFailed = true
@@ -1389,26 +1423,29 @@ export class FallbackAccountManager {
             throw error
           }
         }
-        this.seedFallbackQuota(next, storage)
+        this.seedFallbackQuota(candidate, storage)
         // Quota is pushed per-turn from transport headers/WS frames; selection
         // filters stale candidates without ever pulling quota from the network.
         if (
-          this.accountPassesQuotaPolicy(this.quotaPolicyAccount(next), storage)
+          this.accountPassesQuotaPolicy(
+            this.quotaPolicyAccount(candidate),
+            storage,
+          )
         )
-          usable.push(next)
+          usable.push(candidate)
       } catch (error) {
-        const hasUsableExistingToken = hasUnexpiredAccessToken(
-          account,
+        const hasUsableCandidateToken = hasUnexpiredAccessToken(
+          candidate,
           this.now(),
         )
         if (refreshFailed) {
-          if (!hasUsableExistingToken) continue
-        } else if (!hasUsableExistingToken) {
+          if (!hasUsableCandidateToken) continue
+        } else if (!hasUsableCandidateToken) {
           continue
         }
         if (
           canUseCachedQuotaAfterRefreshError(
-            account,
+            candidate,
             storage,
             error,
             this.now(),
@@ -1416,12 +1453,12 @@ export class FallbackAccountManager {
         ) {
           logR.debug('fallback quota using cached quota after refresh error', {
             pid: process.pid,
-            accountId: account.id,
+            accountId: candidate.id,
             error: formatErrorMessage(error),
           })
-          usable.push(account)
+          usable.push(candidate)
         } else if (!failClosedOnUnknownQuota(storage)) {
-          usable.push(account)
+          usable.push(candidate)
         }
       }
     }

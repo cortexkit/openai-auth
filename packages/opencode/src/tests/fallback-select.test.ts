@@ -181,6 +181,54 @@ describe('fallback selection', () => {
     expect(account.lastRefreshError?.message).toBe('previous refresh failure')
   })
 
+  it('uses the refreshed candidate when a post-refresh quota seed fails', async () => {
+    await withTempAuthEnv(async () => {
+      const now = 1_700_000_000_000
+      const account = makeOAuthAccount({
+        access: 'expired-access',
+        refresh: 'old-refresh',
+        expires: now - 1_000,
+        quota: {
+          primary: {
+            usedPercent: 10,
+            remainingPercent: 90,
+            checkedAt: now - 1_000,
+          },
+        },
+      })
+      const storage = makeStorage([account])
+      const refreshFn = jest.fn().mockResolvedValue({
+        access: 'fresh-access',
+        refresh: 'fresh-refresh',
+        expires: now + 6 * 3600_000,
+        expiresIn: 6 * 3600,
+      })
+      const getFallback = jest.fn(() => {
+        throw new Error('quota seed failed')
+      })
+      const setFallback = jest.fn()
+
+      const manager = new FallbackAccountManager({
+        now: () => now,
+        fetchImpl: fetch,
+        refreshFn: refreshFn as AccountManagerOptions['refreshFn'],
+        quotaManager: {
+          getFallback,
+          setFallback,
+        } as unknown as AccountManagerOptions['quotaManager'],
+      })
+
+      const usable = await manager.getUsableFallbackAccounts(storage)
+
+      expect(refreshFn).toHaveBeenCalledTimes(1)
+      expect(getFallback).toHaveBeenCalledWith(account.id, 'fresh-access')
+      expect(setFallback).not.toHaveBeenCalled()
+      expect(usable).toHaveLength(1)
+      expect(usable[0]?.access).toBe('fresh-access')
+      expect(usable[0]?.refresh).toBe('fresh-refresh')
+    })
+  })
+
   // -------------------------------------------------------------------
   // NO outbound quota GET fires at selection time
   // -------------------------------------------------------------------
