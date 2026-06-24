@@ -8,7 +8,12 @@ packages/*/dist/
 # Local agent/dev state
 .opencode/
 .claude/
+.alfonso/
+.cortexkit/
 HANDOVER.md
+
+# Paused local benchmark harness (owned out-of-tree)
+benchmarks/
 
 # Editor and OS metadata
 .DS_Store
