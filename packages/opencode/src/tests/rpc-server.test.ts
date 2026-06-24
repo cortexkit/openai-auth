@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
+import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -137,5 +138,47 @@ describe('rpc-server', () => {
       rejected = true
     }
     expect(rejected).toBe(true)
+  })
+
+  test('enforces request timeout', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'oa-rpcsrv-'))
+    const server = await startRpcServer({
+      dir,
+      drain: drainNotifications,
+      apply: async () => ({ text: 'ok', knobs: {} }),
+      timeoutMs: 100,
+    })
+    stop = server.stop
+
+    const reqPromise = new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: '127.0.0.1',
+          port: server.port,
+          path: '/rpc/apply',
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${server.token}`,
+          },
+        },
+        (res) => {
+          res.on('data', () => {})
+          res.on('end', () => {
+            reject(
+              new Error(
+                `should have timed out (end), status: ${res.statusCode}`,
+              ),
+            )
+          })
+        },
+      )
+      req.on('error', () => {
+        resolve()
+      })
+      req.write('{"command":')
+    })
+
+    await expect(reqPromise).resolves.toBeUndefined()
   })
 })

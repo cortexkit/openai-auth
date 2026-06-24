@@ -23,6 +23,7 @@ export interface RpcServerOptions {
   dir: string
   drain: typeof drainNotifications
   apply: (request: ApplyRequest) => Promise<ApplyResult>
+  timeoutMs?: number
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -54,9 +55,15 @@ export async function startRpcServer(
   options: RpcServerOptions,
 ): Promise<RpcServerHandle> {
   const token = randomBytes(32).toString('hex')
+  const timeoutMs = options.timeoutMs ?? 2000
   const server = createServer((req, res) => {
+    req.setTimeout(timeoutMs, () => {
+      req.socket.destroy()
+    })
     void dispatch(req, res)
   })
+  server.requestTimeout = timeoutMs
+  server.headersTimeout = timeoutMs
 
   async function dispatch(req: IncomingMessage, res: ServerResponse) {
     const json = (status: number, value: unknown) => {

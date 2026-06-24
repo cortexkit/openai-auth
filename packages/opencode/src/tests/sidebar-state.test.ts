@@ -511,3 +511,33 @@ describe('sidebar isolation: setSidebarState serializes concurrent writes', () =
     }
   })
 })
+
+describe('sidebar atomic write', () => {
+  test('writes state atomically and cleans up temp files', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-atomic-'))
+    const file = join(tempDir, 'sidebar-state.json')
+
+    const savedEnv = process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = file
+
+    try {
+      const state: SidebarState = {
+        ...DEFAULT_SIDEBAR_STATE,
+        lastUpdated: 999,
+      }
+      await setSidebarState(state)
+      await drainSidebarWrites()
+
+      const { readFileSync, readdirSync } = await import('node:fs')
+      const written = JSON.parse(readFileSync(file, 'utf8')) as SidebarState
+      expect(written.lastUpdated).toBe(999)
+
+      // Check that no temp files are left in the directory
+      const files = readdirSync(tempDir)
+      expect(files).toEqual(['sidebar-state.json'])
+    } finally {
+      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+        savedEnv ?? FLOOR_SIDEBAR_STATE_FILE
+    }
+  })
+})

@@ -34,7 +34,8 @@ export interface SidebarState {
   lastUpdated: number
 }
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createLogger } from './logger'
@@ -188,10 +189,13 @@ async function doWriteSidebarState(
   state: SidebarState,
   file: string,
 ): Promise<void> {
+  const tempPath = `${file}.${randomUUID()}.tmp`
   try {
     await mkdir(dirname(file), { recursive: true })
-    await writeFile(file, JSON.stringify(state), 'utf8')
+    await writeFile(tempPath, JSON.stringify(state), 'utf8')
+    await rename(tempPath, file)
   } catch (e) {
+    await rm(tempPath, { force: true }).catch(() => {})
     logSb.warn('sidebar write failed', {
       pid: process.pid,
       error: e instanceof Error ? e.message : String(e),
