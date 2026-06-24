@@ -3,6 +3,7 @@ import { createServer } from 'node:http'
 import {
   base64UrlEncode,
   buildAuthorizeUrl,
+  completeDeviceAuth,
   escapeHtml,
   extractAccountId,
   extractAccountIdFromClaims,
@@ -290,7 +291,7 @@ describe('extractAccountId', () => {
 describe('buildAuthorizeUrl', () => {
   test('builds a URL with required params', () => {
     const url = buildAuthorizeUrl(
-      'http://localhost:1455/auth/callback',
+      'http://127.0.0.1:1455/auth/callback',
       { verifier: 'v', challenge: 'c' },
       'state123',
     )
@@ -298,7 +299,7 @@ describe('buildAuthorizeUrl', () => {
     expect(url).toContain('code_challenge=c')
     expect(url).toContain('state=state123')
     expect(url).toContain(
-      'redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback',
+      'redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback',
     )
   })
 })
@@ -337,7 +338,7 @@ describe('OAuth server concurrency (C1/C2)', () => {
   let originalFetch: typeof globalThis.fetch
 
   beforeEach(async () => {
-    // Mock fetch for the token-exchange endpoint only; passthrough for localhost.
+    // Mock fetch for the token-exchange endpoint only; passthrough for 127.0.0.1.
     originalFetch = globalThis.fetch
     globalThis.fetch = mock(async (url: unknown, init?: unknown) => {
       const urlStr = typeof url === 'string' ? url : String(url)
@@ -384,12 +385,12 @@ describe('OAuth server concurrency (C1/C2)', () => {
 
     // Simulate callbacks arriving in reverse order
     const cb1 = await fetch(
-      `http://localhost:${OAUTH_PORT}/auth/callback?code=code1&state=${state1}`,
+      `http://127.0.0.1:${OAUTH_PORT}/auth/callback?code=code1&state=${state1}`,
     )
     expect(cb1.status).toBe(200)
 
     const cb2 = await fetch(
-      `http://localhost:${OAUTH_PORT}/auth/callback?code=code2&state=${state2}`,
+      `http://127.0.0.1:${OAUTH_PORT}/auth/callback?code=code2&state=${state2}`,
     )
     expect(cb2.status).toBe(200)
 
@@ -407,7 +408,7 @@ describe('OAuth server concurrency (C1/C2)', () => {
     expect(first.port).toBe(OAUTH_PORT)
     expect(second).toEqual(first)
 
-    const probe = await fetch(`http://localhost:${OAUTH_PORT}/`)
+    const probe = await fetch(`http://127.0.0.1:${OAUTH_PORT}/`)
     expect(probe.status).toBe(404)
   })
 
@@ -428,7 +429,7 @@ describe('OAuth server concurrency (C1/C2)', () => {
 
     await expect(startOAuthServer()).resolves.toEqual({
       port: OAUTH_PORT,
-      redirectUri: `http://localhost:${OAUTH_PORT}/auth/callback`,
+      redirectUri: `http://127.0.0.1:${OAUTH_PORT}/auth/callback`,
     })
   })
 
@@ -443,14 +444,14 @@ describe('OAuth server concurrency (C1/C2)', () => {
 
     // Send a callback with an unknown state
     const badCb = await fetch(
-      `http://localhost:${OAUTH_PORT}/auth/callback?code=bad&state=unknown`,
+      `http://127.0.0.1:${OAUTH_PORT}/auth/callback?code=bad&state=unknown`,
     )
     expect(badCb.status).toBe(400)
 
     // The known flow should still be pending (not rejected)
     // Send the real callback
     const goodCb = await fetch(
-      `http://localhost:${OAUTH_PORT}/auth/callback?code=real&state=known-state`,
+      `http://127.0.0.1:${OAUTH_PORT}/auth/callback?code=real&state=known-state`,
     )
     expect(goodCb.status).toBe(200)
 
@@ -460,7 +461,7 @@ describe('OAuth server concurrency (C1/C2)', () => {
   test('C1: missing state parameter returns 400', async () => {
     await startOAuthServer()
     const cb = await fetch(
-      `http://localhost:${OAUTH_PORT}/auth/callback?code=somecode`,
+      `http://127.0.0.1:${OAUTH_PORT}/auth/callback?code=somecode`,
     )
     expect(cb.status).toBe(400)
     const text = await cb.text()
@@ -481,14 +482,14 @@ describe('OAuth server concurrency (C1/C2)', () => {
 
     // Resolve first flow
     await fetch(
-      `http://localhost:${OAUTH_PORT}/auth/callback?code=c1&state=state-1`,
+      `http://127.0.0.1:${OAUTH_PORT}/auth/callback?code=c1&state=state-1`,
     )
     await p1
 
     // Second flow still pending — server should still be running
     // (can verify by sending another request)
     const probe = await fetch(
-      `http://localhost:${OAUTH_PORT}/auth/callback?code=c2&state=state-2`,
+      `http://127.0.0.1:${OAUTH_PORT}/auth/callback?code=c2&state=state-2`,
     )
     expect(probe.status).toBe(200)
     await p2
@@ -497,7 +498,7 @@ describe('OAuth server concurrency (C1/C2)', () => {
     // (flowCleanup called internally by callback handler)
     // Verify by trying to connect — should fail
     try {
-      await fetch(`http://localhost:${OAUTH_PORT}/`)
+      await fetch(`http://127.0.0.1:${OAUTH_PORT}/`)
     } catch {
       // Expected: server is closed
     }
@@ -516,7 +517,7 @@ describe('OAuth server concurrency (C1/C2)', () => {
     const cancelledError = cancelled.catch((error) => error)
 
     const cancelResponse = await fetch(
-      `http://localhost:${OAUTH_PORT}/cancel?state=cancel-me`,
+      `http://127.0.0.1:${OAUTH_PORT}/cancel?state=cancel-me`,
     )
     expect(cancelResponse.status).toBe(200)
     const cancelledResult = await cancelledError
@@ -524,7 +525,7 @@ describe('OAuth server concurrency (C1/C2)', () => {
     expect(cancelledResult.message).toBe('Login cancelled')
 
     const callback = await fetch(
-      `http://localhost:${OAUTH_PORT}/auth/callback?code=ok&state=keep-me`,
+      `http://127.0.0.1:${OAUTH_PORT}/auth/callback?code=ok&state=keep-me`,
     )
     expect(callback.status).toBe(200)
     await expect(remaining).resolves.toBeDefined()
@@ -538,7 +539,7 @@ describe('OAuth server concurrency (C1/C2)', () => {
     )
     const pendingError = pending.catch((error) => error)
 
-    const cancelResponse = await fetch(`http://localhost:${OAUTH_PORT}/cancel`)
+    const cancelResponse = await fetch(`http://127.0.0.1:${OAUTH_PORT}/cancel`)
     expect(cancelResponse.status).toBe(200)
     const pendingResult = await pendingError
     expect(pendingResult).toEqual(expect.any(Error))
@@ -551,7 +552,7 @@ describe('OAuth server concurrency (C1/C2)', () => {
     await startOAuthServer()
 
     const response = await fetch(
-      `http://localhost:${OAUTH_PORT}/auth/callback?code=bad&state=unknown`,
+      `http://127.0.0.1:${OAUTH_PORT}/auth/callback?code=bad&state=unknown`,
     )
     expect(response.status).toBe(400)
 
@@ -689,5 +690,102 @@ describe('upsertAccount U5 — label-tier guard', () => {
     upsertAccount(accounts, second)
 
     expect(accounts).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Regression tests for security/robustness hardening
+// ---------------------------------------------------------------------------
+
+describe('Loopback redirect-URI family mismatch (Fix 1)', () => {
+  test('redirectUri uses 127.0.0.1 instead of localhost', async () => {
+    const { redirectUri } = await startOAuthServer()
+    expect(redirectUri).toContain('http://127.0.0.1:')
+    expect(redirectUri).not.toContain('localhost')
+  })
+})
+
+describe('Device flow polling timeout and abort (Fix 2)', () => {
+  let originalFetch: typeof globalThis.fetch
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  test('completeDeviceAuth respects expires_in and times out', async () => {
+    globalThis.fetch = mock(async () => {
+      return new Response('Forbidden', { status: 403 })
+    }) as unknown as typeof globalThis.fetch
+
+    const deviceData = {
+      device_auth_id: 'test-id',
+      user_code: 'test-code',
+      interval: '1',
+      expires_in: 1, // 1 second expiry
+    }
+
+    const start = Date.now()
+    await expect(completeDeviceAuth(deviceData)).rejects.toThrow(
+      'Device authorization expired',
+    )
+    expect(Date.now() - start).toBeLessThan(3000) // should fail quickly
+  })
+
+  test('completeDeviceAuth respects AbortSignal', async () => {
+    globalThis.fetch = mock(async () => {
+      return new Response('Forbidden', { status: 403 })
+    }) as unknown as typeof globalThis.fetch
+
+    const deviceData = {
+      device_auth_id: 'test-id',
+      user_code: 'test-code',
+      interval: '1',
+    }
+
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 100)
+
+    await expect(
+      completeDeviceAuth(deviceData, controller.signal),
+    ).rejects.toThrow('Device authorization cancelled')
+  })
+})
+
+describe('JWT parsing size bound (Fix 3)', () => {
+  test('rejects tokens larger than 16KB', () => {
+    const hugeToken = 'a'.repeat(17000)
+    expect(parseJwtClaims(hugeToken)).toBeUndefined()
+  })
+
+  test('rejects payload segments larger than 8KB', () => {
+    const header = btoa(JSON.stringify({ alg: 'RS256' }))
+    const hugePayload = 'a'.repeat(9000)
+    const token = `${header}.${hugePayload}.sig`
+    expect(parseJwtClaims(token)).toBeUndefined()
+  })
+
+  test('accepts valid tokens within bounds', () => {
+    const header = btoa(JSON.stringify({ alg: 'RS256' }))
+    const payload = btoa(JSON.stringify({ chatgpt_account_id: 'acc-123' }))
+    const token = `${header}.${payload}.sig`
+    expect(parseJwtClaims(token)?.chatgpt_account_id).toBe('acc-123')
+  })
+})
+
+describe('Browser OAuth abort cleanup (Fix 4)', () => {
+  test('waitForOAuthCallback rejects and cleans up immediately on abort', async () => {
+    const pkce = { verifier: 'v', challenge: 'c' }
+    const state = 'abort-state'
+    const controller = new AbortController()
+
+    const promise = waitForOAuthCallback(pkce, state, 5000, controller.signal)
+    controller.abort()
+
+    await expect(promise).rejects.toThrow('Login cancelled')
+    await expectOAuthPortClosed()
   })
 })
