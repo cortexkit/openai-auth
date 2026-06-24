@@ -26,7 +26,7 @@ export interface OpenAIAuthConfig {
   /** Use the hand-rolled raw TCP/TLS WebSocket client (incremental streaming). Default false. */
   rawWebSocket?: boolean
   /** Dump final Codex request bodies for cache debugging. Default false. */
-  dump?: boolean
+  dump?: boolean | { enabled?: boolean }
   /** Directory for request dumps. Defaults to the OS temp directory. */
   dumpDir?: string
   /** Codex-compatible Responses endpoint. Defaults to ChatGPT's Codex backend. */
@@ -92,9 +92,13 @@ function envBool(name: string): boolean | undefined {
   const raw = process.env[name]
   if (raw === undefined) return undefined
   const v = raw.trim().toLowerCase()
-  if (v === '' || v === '0' || v === 'false' || v === 'no' || v === 'off')
+  if (v === '1' || v === 'true' || v === 'yes' || v === 'on') {
+    return true
+  }
+  if (v === '' || v === '0' || v === 'false' || v === 'no' || v === 'off') {
     return false
-  return true
+  }
+  return undefined
 }
 
 /** env (if explicitly set) overrides config (if set) overrides default. */
@@ -120,11 +124,21 @@ function resolve(): ResolvedSettings {
       : typeof config.webSearch === 'boolean'
         ? config.webSearch
         : true
+
+  let dumpConfig: boolean | undefined
+  if (config.dump !== undefined && config.dump !== null) {
+    if (typeof config.dump === 'object') {
+      dumpConfig = config.dump.enabled
+    } else if (typeof config.dump === 'boolean') {
+      dumpConfig = config.dump
+    }
+  }
+
   return {
     webSearch,
     webSockets: resolveBool(ENV.webSockets, config.webSockets, false),
     rawWebSocket: resolveBool(ENV.rawWebSocket, config.rawWebSocket, false),
-    dump: resolveBool(ENV.dump, config.dump, false),
+    dump: resolveBool(ENV.dump, dumpConfig, false),
     dumpDir:
       process.env[ENV.dumpDir]?.trim() ||
       (typeof config.dumpDir === 'string' && config.dumpDir.trim()
