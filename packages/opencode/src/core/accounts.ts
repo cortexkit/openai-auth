@@ -556,6 +556,36 @@ function quotaSnapshotCheckedAt(quota: OAuthQuotaSnapshot | undefined) {
   )
 }
 
+function copyRuntimeField<K extends keyof AccountRuntimeEntry>(
+  target: AccountRuntimeEntry,
+  source: AccountRuntimeEntry,
+  key: K,
+) {
+  if (key in source) {
+    target[key] = source[key]
+  } else {
+    delete target[key]
+  }
+}
+
+function applyNewerTokenState(
+  merged: AccountRuntimeEntry,
+  existing: AccountRuntimeEntry,
+  incoming: AccountRuntimeEntry,
+) {
+  const existingRefreshAt = existing.lastRefreshedAt ?? 0
+  const incomingRefreshAt = incoming.lastRefreshedAt ?? 0
+  if (existingRefreshAt === incomingRefreshAt) return
+
+  const tokenSource =
+    existingRefreshAt > incomingRefreshAt ? existing : incoming
+  copyRuntimeField(merged, tokenSource, 'access')
+  copyRuntimeField(merged, tokenSource, 'refresh')
+  copyRuntimeField(merged, tokenSource, 'expires')
+  copyRuntimeField(merged, tokenSource, 'lastRefreshedAt')
+  copyRuntimeField(merged, tokenSource, 'lastRefreshError')
+}
+
 function mergeAccountRuntimeState(
   existing: unknown,
   incoming: AccountRuntimeEntry,
@@ -564,39 +594,31 @@ function mergeAccountRuntimeState(
   const existingEntry = existing as AccountRuntimeEntry
   const existingQuotaCheckedAt = quotaSnapshotCheckedAt(existingEntry.quota)
   const incomingQuotaCheckedAt = quotaSnapshotCheckedAt(incoming.quota)
-  if (existingQuotaCheckedAt > incomingQuotaCheckedAt) {
-    const tokenChanged = Boolean(
-      existingEntry.access &&
-        incoming.access &&
-        existingEntry.access !== incoming.access,
-    )
-    const existingRefreshAt = existingEntry.lastRefreshedAt ?? 0
-    const incomingRefreshAt = incoming.lastRefreshedAt ?? 0
-    if (tokenChanged && incomingRefreshAt <= existingRefreshAt) {
-      const merged: AccountRuntimeEntry = { ...existingEntry }
-      if (
-        typeof incoming.lastUsed === 'number' &&
-        (!(typeof existingEntry.lastUsed === 'number') ||
-          incoming.lastUsed > existingEntry.lastUsed)
-      ) {
-        merged.lastUsed = incoming.lastUsed
+  const existingQuotaIsNewer = existingQuotaCheckedAt > incomingQuotaCheckedAt
+  const merged: AccountRuntimeEntry = existingQuotaIsNewer
+    ? {
+        ...existingEntry,
+        ...incoming,
+        quota: existingEntry.quota,
+        lastQuotaRefreshError: existingEntry.lastQuotaRefreshError,
       }
-      return merged
-    }
-    return {
-      ...existingEntry,
-      ...incoming,
-      quota: existingEntry.quota,
-      lastQuotaRefreshError: existingEntry.lastQuotaRefreshError,
-    }
-  }
-  const merged: AccountRuntimeEntry = { ...existingEntry, ...incoming }
-  if (!('lastQuotaRefreshError' in incoming)) {
+    : { ...existingEntry, ...incoming }
+
+  if (!existingQuotaIsNewer && !('lastQuotaRefreshError' in incoming)) {
     delete merged.lastQuotaRefreshError
   }
   if (!('lastRefreshError' in incoming)) {
     delete merged.lastRefreshError
   }
+  if (
+    typeof existingEntry.lastUsed === 'number' &&
+    (!(typeof incoming.lastUsed === 'number') ||
+      existingEntry.lastUsed > incoming.lastUsed)
+  ) {
+    merged.lastUsed = existingEntry.lastUsed
+  }
+
+  applyNewerTokenState(merged, existingEntry, incoming)
   return merged
 }
 
@@ -1072,6 +1094,22 @@ function tokenNeedsRefresh(
   )
 }
 
+function hasUnexpiredAccessToken(account: OAuthAccount, now: number) {
+  return Boolean(
+    account.access &&
+      typeof account.expires === 'number' &&
+      account.expires > now,
+  )
+}
+
+function isMainAccountFallback(storage: AccountStorage, account: OAuthAccount) {
+  return Boolean(
+    storage.mainAccountId &&
+      account.accountId &&
+      account.accountId === storage.mainAccountId,
+  )
+}
+
 function updateStoredAccount(storage: AccountStorage, account: OAuthAccount) {
   const idx = storage.accounts.findIndex(
     (candidate) => candidate.id === account.id,
@@ -1312,6 +1350,8 @@ export class FallbackAccountManager {
 
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (isMainAccountFallback(storage, account)) continue
+      let refreshFailed = false
       try {
         let next = account
         if (tokenNeedsRefresh(next, storage, this.now())) {
@@ -1320,12 +1360,34 @@ export class FallbackAccountManager {
             refreshError &&
             refreshBackoffActive(refreshError, next.refresh, this.now())
           ) {
+            refreshFailed = true
             throw new Error(
               formatRefreshBackoffMessage(refreshError, this.now()),
             )
           }
-          next = await this.refreshAccount(next, storage)
-          changed = true
+          try {
+            next = await this.refreshAccount(next, storage)
+            changed = true
+          } catch (error) {
+            refreshFailed = true
+            const stored = storage.accounts.find(
+              (candidate): candidate is OAuthAccount =>
+                candidate.id === account.id && isOAuthAccount(candidate),
+            )
+            if (
+              stored &&
+              !refreshBackoffActive(
+                stored.lastRefreshError,
+                stored.refresh,
+                this.now(),
+              )
+            ) {
+              recordRefreshError(stored, error, this.now())
+              updateStoredAccount(storage, stored)
+              changed = true
+            }
+            throw error
+          }
         }
         this.seedFallbackQuota(next, storage)
         // Quota is pushed per-turn from transport headers/WS frames; selection
@@ -1335,6 +1397,15 @@ export class FallbackAccountManager {
         )
           usable.push(next)
       } catch (error) {
+        const hasUsableExistingToken = hasUnexpiredAccessToken(
+          account,
+          this.now(),
+        )
+        if (refreshFailed) {
+          if (!hasUsableExistingToken) continue
+        } else if (!hasUsableExistingToken) {
+          continue
+        }
         if (
           canUseCachedQuotaAfterRefreshError(
             account,
