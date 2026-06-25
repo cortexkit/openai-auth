@@ -190,11 +190,17 @@ describe('command hook session isolation', () => {
       lastUsed: now,
       lastRefreshedAt: now,
     })
-    await tick()
-    await tick()
-
-    const notes = drainNotifications(0)
-    const added = notes.find((n) => n.payload.text.includes('Account Added'))
+    // The detached completion does lock-based RMW file I/O before it notifies,
+    // so poll for the notification rather than guessing a fixed number of ticks.
+    let added: ReturnType<typeof drainNotifications>[number] | undefined
+    const deadline = Date.now() + 2000
+    while (Date.now() < deadline) {
+      added = drainNotifications(0).find((n) =>
+        n.payload.text.includes('Account Added'),
+      )
+      if (added) break
+      await tick()
+    }
     expect(added).toBeDefined()
     expect(added?.sessionId).toBe('sess-A')
 

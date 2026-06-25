@@ -299,6 +299,256 @@ describe('integration: HTTP quota push', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Test 2b: Killswitch enforcement through the loader fetch override (end-to-end)
+// ---------------------------------------------------------------------------
+
+describe('integration: killswitch enforcement', () => {
+  let configDir: string
+  let configFile: string
+  let stateFile: string
+  let sidebarFile: string
+  let logFile: string
+  const accessToken = 'sk-ks-access'
+  const refreshToken = 'sk-ks-refresh'
+
+  beforeEach(() => {
+    configDir = tempDir('oai-int-ks-')
+    configFile = join(configDir, 'openai-auth.json')
+    stateFile = join(configDir, 'openai-auth-state.json')
+    sidebarFile = join(configDir, 'sidebar-state.json')
+    logFile = join(configDir, 'test.log')
+    process.env.OPENCODE_OPENAI_AUTH_FILE = configFile
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = stateFile
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = sidebarFile
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
+    process.env.NODE_ENV = 'test'
+    process.env.OPENCODE_CONFIG_DIR = configDir
+  })
+
+  afterEach(async () => {
+    await drainSidebarWrites()
+    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+      FLOOR_SIDEBAR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+    delete process.env.OPENCODE_CONFIG_DIR
+    delete process.env.NODE_ENV
+  })
+
+  // Mock fetch: a 200 whose x-codex-* headers report `usedPercent` for the
+  // primary window. Counts calls so we can prove a blocked request never spends.
+  function mockCodexFetch(usedPercent: number) {
+    let calls = 0
+    const fn = (async () => {
+      calls++
+      return new Response('{"choices":[{"delta":{"content":"hi"}}]}', {
+        status: 200,
+        headers: {
+          'content-type': 'text/event-stream',
+          'x-codex-primary-used-percent': String(usedPercent),
+          'x-codex-primary-window-minutes': '300',
+          'x-codex-primary-reset-at': '1781729038',
+          'x-codex-secondary-used-percent': String(usedPercent),
+          'x-codex-secondary-window-minutes': '10080',
+          'x-codex-secondary-reset-at': '1781766665',
+        },
+      })
+    }) as unknown as typeof globalThis.fetch
+    return { fn, calls: () => calls }
+  }
+
+  async function loaderFetch(hooks: Hooks) {
+    const authHook = hooks.auth
+    if (!authHook?.loader) throw new Error('No auth loader')
+    const loaderResult = await authHook.loader(
+      async () => ({
+        type: 'oauth' as const,
+        provider: 'openai',
+        access: accessToken,
+        refresh: refreshToken,
+        expires: Date.now() + 3600_000,
+      }),
+      {
+        id: 'openai',
+        label: 'OpenAI',
+        models: [],
+      } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+    )
+    const fetchOverride = (loaderResult as Record<string, unknown>).fetch as (
+      url: string,
+      init?: RequestInit,
+    ) => Promise<Response>
+    if (!fetchOverride) throw new Error('No fetch in loader result')
+    return fetchOverride
+  }
+
+  const REQ_INIT: RequestInit = {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'gpt-5.5',
+      messages: [{ role: 'user', content: 'hi' }],
+    }),
+  }
+
+  it('blocks the main account with a synthetic 429 + Retry-After once quota drops below the threshold, without spending', async () => {
+    // Killswitch ON, main threshold high so a near-exhausted account is killed.
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        killswitch: {
+          enabled: true,
+          main: { primary: 50, secondary: 50 },
+        },
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    const mock = mockCodexFetch(95) // 95% used → 5% remaining → below 50%
+    globalThis.fetch = mock.fn
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const fetchOverride = await loaderFetch(hooks)
+
+      // First request: quota is unknown, so it passes the gate, hits upstream,
+      // and the 95%-used headers push low quota into the manager.
+      const first = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(first.status).toBe(200)
+      await first.body?.cancel()
+      expect(mock.calls()).toBe(1)
+
+      // Second request: cached quota is now below threshold → hard block.
+      const second = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(second.status).toBe(429)
+      expect(second.headers.get('retry-after')).toBeTruthy()
+      const body = (await second.json()) as {
+        error?: { type?: string; message?: string }
+      }
+      expect(body.error?.type).toBe('rate_limit_exceeded')
+      expect(body.error?.message).toContain('Killswitch')
+
+      // The blocked request did NOT reach upstream — no extra spend.
+      expect(mock.calls()).toBe(1)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('does NOT block when the killswitch is disabled (opt-in)', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        // killswitch absent → disabled
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    const mock = mockCodexFetch(99) // basically exhausted
+    globalThis.fetch = mock.fn
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const fetchOverride = await loaderFetch(hooks)
+
+      const first = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(first.status).toBe(200)
+      await first.body?.cancel()
+
+      // Even with quota at 1% remaining, a disabled killswitch never blocks.
+      const second = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(second.status).toBe(200)
+      await second.body?.cancel()
+      expect(mock.calls()).toBe(2)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('reroutes to a healthy fallback when the killswitch kills main', async () => {
+    // Main killed (high threshold), one fallback whose quota is unknown — unknown
+    // fails OPEN by default, so it survives the killswitch filter and serves.
+    const fallback: OAuthAccount = {
+      id: 'fb-healthy',
+      type: 'oauth',
+      access: 'sk-fb-access',
+      refresh: 'sk-fb-refresh',
+      expires: Date.now() + 3600_000,
+      enabled: true,
+      addedAt: Date.now(),
+      lastUsed: Date.now(),
+    }
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [fallback],
+        killswitch: { enabled: true, main: { primary: 50, secondary: 50 } },
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    const mock = mockCodexFetch(95)
+    globalThis.fetch = mock.fn
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const fetchOverride = await loaderFetch(hooks)
+
+      // First request pushes low main quota.
+      const first = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(first.status).toBe(200)
+      await first.body?.cancel()
+
+      // Second request: main is killswitch-blocked, but the healthy fallback
+      // serves a 200 (not a 429).
+      const second = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(second.status).toBe(200)
+      await second.body?.cancel()
+      // Two upstream calls served by the fallback path (main never spent on req 2).
+      expect(mock.calls()).toBeGreaterThanOrEqual(2)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Test 3: WS quota push (frame consumed, not relayed)
 // ---------------------------------------------------------------------------
 

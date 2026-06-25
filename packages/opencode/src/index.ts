@@ -26,7 +26,10 @@ import {
   type FallbackAccount,
   FallbackAccountManager,
   isCostZeroingEnabled,
+  isKillswitchEnabled,
   isOAuthAccount,
+  killswitchPassesPolicy,
+  killswitchRetryAfterSeconds,
   loadAccounts,
   migrateIfNeeded,
   type OAuthAccount,
@@ -1241,6 +1244,60 @@ export async function CodexAuthPlugin(
         }
 
         // -------------------------------------------------------------------
+        // Killswitch helpers (opt-in hard circuit-breaker on cached quota).
+        // -------------------------------------------------------------------
+
+        // Last-seen pushed quota for the resolved primary (fallback or main).
+        // Push-only: no network fetch here.
+        function killswitchPrimaryQuota(
+          active: OAuthAccount | undefined,
+          access: string,
+        ) {
+          return active
+            ? quotaManager.getFallback(active.id, access)?.quota
+            : quotaManager.getMain(access)?.quota
+        }
+
+        // Synthetic provider-shaped 429 with a Retry-After derived from the
+        // earliest known quota reset across all accounts. Returned when the
+        // killswitch blocks the primary and no surviving account can serve.
+        function killswitchBlockedResponse(
+          storage: AccountStorage | null,
+        ): Response {
+          const now = Date.now()
+          const mainQuota = quotaManager.getMain()?.quota
+          const fallbackAccounts = (storage?.accounts ?? [])
+            .filter(
+              (a): a is OAuthAccount =>
+                a.enabled !== false && isOAuthAccount(a),
+            )
+            .map((a) => ({ quota: quotaManager.getFallback(a.id)?.quota }))
+          const retryAfter = killswitchRetryAfterSeconds(
+            mainQuota,
+            fallbackAccounts,
+            now,
+          )
+          const mins = Math.floor(retryAfter / 60)
+          const secs = retryAfter % 60
+          return new Response(
+            JSON.stringify({
+              error: {
+                message: `Killswitch: all OpenAI accounts are below their configured quota threshold. Retry in ${mins}m ${secs}s.`,
+                type: 'rate_limit_exceeded',
+                code: 'rate_limit_exceeded',
+              },
+            }),
+            {
+              status: 429,
+              headers: {
+                'content-type': 'application/json',
+                'retry-after': String(retryAfter),
+              },
+            },
+          )
+        }
+
+        // -------------------------------------------------------------------
         // tryFallbackAccounts — reactive: iterate getUsableFallbackAccounts
         // and retry with each candidate's access token.
         // -------------------------------------------------------------------
@@ -1319,7 +1376,25 @@ export async function CodexAuthPlugin(
             }
           }
 
-          if (!candidates.length) return { response: primaryResponse }
+          // Killswitch: drop any candidate whose last-seen quota is below its
+          // threshold so a reroute never spends on a killed account. Opt-in —
+          // a no-op when the killswitch is disabled.
+          let killswitchFiltered = candidates
+          if (isKillswitchEnabled(fallbackStorage)) {
+            killswitchFiltered = candidates.filter((c) => {
+              const quota = c.isMain
+                ? quotaManager.getMain(c.access)?.quota
+                : quotaManager.getFallback(c.quotaAccountId ?? '', c.access)
+                    ?.quota
+              return killswitchPassesPolicy(
+                quota,
+                fallbackStorage,
+                c.isMain ? undefined : c.quotaAccountId,
+              )
+            })
+          }
+
+          if (!killswitchFiltered.length) return { response: primaryResponse }
 
           // Keep the returned response body live; only cancel a response after a
           // later retry has produced a replacement.
@@ -1328,7 +1403,7 @@ export async function CodexAuthPlugin(
             | { accessToken: string; accountId?: string }
             | undefined
 
-          for (const candidate of candidates) {
+          for (const candidate of killswitchFiltered) {
             const response = await sendWithAccessToken(
               requestInput,
               init,
@@ -1523,17 +1598,39 @@ export async function CodexAuthPlugin(
               accountId?: string
             }
 
-            // Killswitch acts on last-seen cached quota. Full enforcement waits
-            // until sidebar controls can configure the policy safely.
-
-            // Send through the resolved primary account.
-            const response = await sendWithAccessToken(
-              requestInput,
-              init,
-              primaryAccess,
-              activeFallback?.accountId ?? authWithAccount.accountId,
-              activeFallback?.id ?? 'main',
-            )
+            // Killswitch (opt-in): act on last-seen cached quota, push-only — no
+            // network fetch on the hot path. If the resolved primary is below its
+            // threshold, do NOT spend on it: synthesize a 429 so the existing
+            // reactive-fallback path reroutes to a surviving account, and if none
+            // survive (or the body is non-replayable so a fallback is impossible)
+            // the 429 stands as the hard block (with a Retry-After). Blocking is
+            // independent of replayability — the killswitch's contract is "never
+            // spend below threshold", so a non-replayable request hard-fails
+            // rather than spending on the killed account.
+            let response: Response
+            const killswitchBlocksPrimary =
+              isKillswitchEnabled(reqStorage) &&
+              !killswitchPassesPolicy(
+                killswitchPrimaryQuota(activeFallback, primaryAccess),
+                reqStorage,
+                activeFallback?.id,
+              )
+            if (killswitchBlocksPrimary) {
+              logA.debug('killswitch blocked primary', {
+                pid: process.pid,
+                activeId: activeFallback?.id ?? 'main',
+              })
+              response = killswitchBlockedResponse(reqStorage)
+            } else {
+              // Send through the resolved primary account.
+              response = await sendWithAccessToken(
+                requestInput,
+                init,
+                primaryAccess,
+                activeFallback?.accountId ?? authWithAccount.accountId,
+                activeFallback?.id ?? 'main',
+              )
+            }
 
             let fallbackServed = false
             let finalResponse = response
