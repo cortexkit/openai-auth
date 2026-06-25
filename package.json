@@ -21,7 +21,7 @@
     "prepublishOnly": "bun run build"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.4.16",
+    "@biomejs/biome": "2.5.1",
     "@earendil-works/pi-ai": "0.79.5",
     "@earendil-works/pi-coding-agent": "0.79.5",
     "@earendil-works/pi-tui": "0.79.5",
