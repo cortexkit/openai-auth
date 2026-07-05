@@ -40,8 +40,8 @@ Each opens an interactive dialog in the TUI and also accepts explicit arguments:
 | Command | Arguments | Purpose |
 | --- | --- | --- |
 | `/openai-quota` | — | Show 5h + weekly quota for all accounts. |
-| `/openai-account` | `add [label]` · `switch <id>` · `remove <id>` · `order <a> <b>` | Manage main + fallback accounts (non-destructive switch). |
-| `/openai-routing` | `main-first` · `fallback-first` | Account preference order. |
+| `/openai-account` | `add [label]` · `remove <id>` · `order <a> <b>` | Manage main + fallback accounts. |
+| `/openai-routing` | `main-first` · `fallback-first` | Routing mode: which account is tried first. |
 | `/openai-killswitch` | `on` · `off` · `set <acct>:<5h>,<1w> ...` | Hard-block accounts below quota thresholds. |
 | `/openai-cachekeep` | `on` · `off` · `subagents on` · `subagents off` | Idle prompt-cache keep-warm. |
 | `/openai-logging` | `<level>` | Set log level live. |

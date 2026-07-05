@@ -58,19 +58,19 @@ The account you log in with via `/login openai` is your **main** account, stored
 The plugin supports more than one ChatGPT account: a single **main** account (the one from `/login openai`, held in OpenCode's auth store) plus any number of **fallback** accounts (held in the plugin's own account store). When the main account hits a rate limit, traffic automatically rolls over to a healthy fallback for the rest of the limit window, then returns.
 
 - **Add a fallback** in the TUI with `/openai-account add [label]` (runs the same browser/headless OAuth flow as login), or from a shell with the `openai-auth` CLI (see [CLI](#cli)).
-- **Switch** which account serves traffic with `/openai-account switch <id>`. Switching is non-destructive — it re-routes by account id and never overwrites the main login, so you can switch back at any time.
+- **Remove** a fallback with `/openai-account remove <id>`.
 - Each account is identified by its stable ChatGPT account id, so the same account is never added twice.
 
-Fallback is **reactive**: a request that comes back `401`/`403`/`429` is transparently retried on the next usable account (the original request body is buffered so the retry is safe). Selection respects your [routing](#routing) preference and skips accounts the [killswitch](#killswitch) has gated out.
+Which account serves is decided by [routing](#routing) mode — there is no manual "active account" to pin. A request that a fallback can serve is buffered so the retry is safe, and selection skips accounts the [killswitch](#killswitch) has gated out.
 
 ### Routing
 
-`/openai-routing` controls account preference order:
+`/openai-routing` controls how the main and fallback accounts are ordered:
 
 | Mode | Behavior |
 | --- | --- |
-| `main-first` (default) | Use the main account until it is exhausted, then fall back. |
-| `fallback-first` | Prefer fallback accounts and preserve the main account's quota. |
+| `main-first` (default) | Send on the main account; on a `401`/`403`/`429`, transparently retry on the next usable fallback. |
+| `fallback-first` | Try usable fallback accounts first (preserving the main account's quota), and fall through to the main account only if no fallback can serve. |
 
 ### Killswitch
 
@@ -116,7 +116,7 @@ All commands open an interactive control surface in the TUI (a selectable dialog
 | Command | Arguments | Purpose |
 | --- | --- | --- |
 | `/openai-quota` | — | Show 5h + weekly quota for all accounts (polls the usage endpoint). |
-| `/openai-account` | `add [label]` · `switch <id>` · `remove <id>` · `order <a> <b>` | List and manage accounts; add runs OAuth, switch is non-destructive, order swaps fallback positions. |
+| `/openai-account` | `add [label]` · `remove <id>` · `order <a> <b>` | List and manage accounts; add runs OAuth, order swaps fallback positions. |
 | `/openai-routing` | `main-first` · `fallback-first` | Set account preference order. |
 | `/openai-killswitch` | `on` · `off` · `set <acct>:<5h>,<1w> ...` | Hard-block accounts below per-window quota thresholds. |
 | `/openai-cachekeep` | `on` · `off` · `subagents on` · `subagents off` | Idle prompt-cache keep-warm; optional subagent mode. |

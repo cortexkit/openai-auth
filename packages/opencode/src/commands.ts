@@ -353,7 +353,7 @@ async function executeAccountCommand(
 
   return {
     command: 'openai-account',
-    text: '## Account Commands\n\n- `/openai-account` — show accounts\n- `/openai-account add [label]` — add a new account\n- `/openai-account switch <id>` — switch active\n- `/openai-account remove <id>` — remove\n- `/openai-account order <a> <b>` — swap positions',
+    text: '## Account Commands\n\n- `/openai-account` — show accounts\n- `/openai-account add [label]` — add a new account\n- `/openai-account remove <id>` — remove\n- `/openai-account order <a> <b>` — swap fallback positions\n\nRouting is set with `/openai-routing` (main-first / fallback-first).',
     knobs: { accounts },
   }
 }
