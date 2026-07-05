@@ -40,6 +40,8 @@
     "src/tui/command-dialogs.tsx",
     "src/sidebar-state.ts",
     "src/tui-preferences.ts",
+    "src/logger.ts",
+    "src/util",
     "src/rpc",
     "README.md",
     "LICENSE"
