@@ -128,6 +128,49 @@ describe('commands', () => {
     expect(storage?.routing?.mode).toBe('fallback-first')
   })
 
+  test('scalar command (routing) does not resurrect a removed account or its secrets', async () => {
+    // Seed a fallback account with real secrets, then remove it, then run a
+    // scalar command. The scalar path now goes through mutateAccounts (reads
+    // fresh under the lock, no union), so the removed account and its state-file
+    // secrets must stay gone.
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [
+          {
+            id: 'gone',
+            type: 'oauth',
+            access: 'acc-gone-secret',
+            refresh: 'ref-gone-secret',
+            expires: Date.now() + 3600_000,
+            addedAt: Date.now(),
+            lastUsed: Date.now(),
+          },
+        ],
+      },
+      configPath,
+    )
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+    }
+
+    await buildDialogPayload('openai-account', 'remove gone', ctx)
+    // A scalar command runs afterward.
+    await buildDialogPayload('openai-routing', 'fallback-first', ctx)
+
+    const storage = await loadAccounts(configPath)
+    expect(storage?.accounts.map((a) => a.id)).toEqual([])
+    expect(storage?.routing?.mode).toBe('fallback-first')
+    // Secrets must not linger in the state file.
+    const stateRaw = readFileSync(statePath, 'utf8')
+    expect(stateRaw).not.toContain('acc-gone-secret')
+    expect(stateRaw).not.toContain('ref-gone-secret')
+  })
+
   test('/openai-cachekeep status reflects persisted enabled and state-aware knobs', async () => {
     await saveAccounts(
       {

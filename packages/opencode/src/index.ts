@@ -32,9 +32,9 @@ import {
   killswitchRetryAfterSeconds,
   loadAccounts,
   migrateIfNeeded,
+  mutateAccounts,
   type OAuthAccount,
   type RoutingMode,
-  saveAccounts,
   shouldFallbackStatus,
 } from './core/accounts'
 import {
@@ -622,8 +622,14 @@ export async function CodexAuthPlugin(
             refresh_token: auth.refresh ?? '',
           })
           if (liveAccountId && liveAccountId !== storage.mainAccountId) {
+            // Authoritative RMW: a stale saveAccounts here would union this
+            // loader's snapshot back over disk and could resurrect a
+            // concurrently-removed account (and its secrets in the state file).
+            await mutateAccounts((current) => {
+              current.mainAccountId = liveAccountId
+              return current
+            }, getConfigPath())
             storage.mainAccountId = liveAccountId
-            await saveAccounts(storage, getConfigPath())
             invalidateRequestStorageCache()
           }
         }
@@ -685,14 +691,14 @@ export async function CodexAuthPlugin(
         async function updateMainRefreshState(
           update: (storage: AccountStorage) => void,
         ) {
-          const nextStorage = (await loadAccounts(getConfigPath())) ?? {
-            version: 1 as const,
-            main: { type: 'opencode' as const, provider: 'openai' as const },
-            accounts: [],
-          }
-          nextStorage.refresh = nextStorage.refresh ?? {}
-          update(nextStorage)
-          await saveAccounts(nextStorage, getConfigPath())
+          // Authoritative RMW under the store lock so persisting the main-refresh
+          // lease can never union a stale account list back over disk (which
+          // would resurrect a concurrently-removed account's secrets in state).
+          await mutateAccounts((current) => {
+            current.refresh = current.refresh ?? {}
+            update(current)
+            return current
+          }, getConfigPath())
           invalidateRequestStorageCache()
         }
 

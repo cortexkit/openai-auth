@@ -2,7 +2,6 @@ import { getSettings } from './config'
 import {
   DEFAULT_KILLSWITCH_THRESHOLDS,
   type loadAccounts as defaultLoadAccounts,
-  saveAccounts as defaultSaveAccounts,
   type KillswitchConfig,
   mutateAccounts,
   type OAuthAccount,
@@ -374,8 +373,14 @@ async function executeRoutingCommand(
     (tokens[0] === 'main-first' || tokens[0] === 'fallback-first')
   ) {
     const mode = tokens[0] as RoutingMode
-    storage.routing = { ...(storage.routing ?? {}), mode }
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
+    // Scalar-field write MUST go through mutateAccounts (read-fresh under lock,
+    // authoritative rewrite). A stale saveAccounts here would union its stale
+    // account list back over disk and resurrect a concurrently-removed account
+    // — re-writing that account's secrets into the state file (credential leak).
+    await mutateAccounts((current) => {
+      current.routing = { ...(current.routing ?? {}), mode }
+      return current
+    }, ctx.accountStoragePath)
     log.info('routing mode changed', { mode })
     return {
       command: 'openai-routing',
@@ -451,8 +456,10 @@ async function executeKillswitchCommand(
         secondary: DEFAULT_KILLSWITCH_THRESHOLDS.secondary,
       },
     }
-    storage.killswitch = updated
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
+    await mutateAccounts((current) => {
+      current.killswitch = updated
+      return current
+    }, ctx.accountStoragePath)
     log.info('killswitch enabled')
     return {
       command: 'openai-killswitch',
@@ -463,8 +470,10 @@ async function executeKillswitchCommand(
 
   if (tokens[0] === 'off') {
     const updated: KillswitchConfig = { ...config, enabled: false }
-    storage.killswitch = updated
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
+    await mutateAccounts((current) => {
+      current.killswitch = updated
+      return current
+    }, ctx.accountStoragePath)
     log.info('killswitch disabled')
     return {
       command: 'openai-killswitch',
@@ -501,8 +510,10 @@ async function executeKillswitchCommand(
         updated.accounts![acct] = thresholds
       }
     }
-    storage.killswitch = updated
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
+    await mutateAccounts((current) => {
+      current.killswitch = updated
+      return current
+    }, ctx.accountStoragePath)
     log.info('killswitch thresholds updated', { count: tokens.length - 1 })
     return {
       command: 'openai-killswitch',
@@ -535,13 +546,11 @@ async function executeDumpCommand(
   }
 
   if (tokens[0] === 'on') {
-    // Persist the dump toggle in account storage
-    const storage = (await ctx.loadAccounts(ctx.accountStoragePath)) ?? {
-      version: 1 as const,
-      accounts: [],
-    }
-    storage.dump = { ...(storage.dump ?? {}), enabled: true }
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
+    // Persist the dump toggle via mutateAccounts (authoritative, no stale union).
+    await mutateAccounts((current) => {
+      current.dump = { ...(current.dump ?? {}), enabled: true }
+      return current
+    }, ctx.accountStoragePath)
     log.info('request dump enabled')
     return {
       command: 'openai-dump',
@@ -551,12 +560,10 @@ async function executeDumpCommand(
   }
 
   if (tokens[0] === 'off') {
-    const storage = (await ctx.loadAccounts(ctx.accountStoragePath)) ?? {
-      version: 1 as const,
-      accounts: [],
-    }
-    storage.dump = { ...(storage.dump ?? {}), enabled: false }
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
+    await mutateAccounts((current) => {
+      current.dump = { ...(current.dump ?? {}), enabled: false }
+      return current
+    }, ctx.accountStoragePath)
     log.info('request dump disabled')
     return {
       command: 'openai-dump',
@@ -597,13 +604,11 @@ async function executeLoggingCommand(
     // Call setLogLevel so the log-level change takes effect immediately without a restart.
     setLogLevel(level as 'error' | 'warn' | 'info' | 'debug' | 'trace')
 
-    // Persist in account storage
-    const storage = (await ctx.loadAccounts(ctx.accountStoragePath)) ?? {
-      version: 1 as const,
-      accounts: [],
-    }
-    storage.logging = { ...(storage.logging ?? {}), level }
-    await defaultSaveAccounts(storage, ctx.accountStoragePath)
+    // Persist via mutateAccounts (authoritative, no stale union).
+    await mutateAccounts((current) => {
+      current.logging = { ...(current.logging ?? {}), level }
+      return current
+    }, ctx.accountStoragePath)
     log.info('log level changed', { level })
 
     return {
@@ -703,13 +708,10 @@ async function executeCachekeepCommand(
         knobs: {},
       }
     }
-    const nextStorage = storage ?? {
-      version: 1 as const,
-      main: { type: 'opencode' as const, provider: 'openai' as const },
-      accounts: [],
-    }
-    nextStorage.cachekeep = { ...(nextStorage.cachekeep ?? {}), enabled: true }
-    await defaultSaveAccounts(nextStorage, ctx.accountStoragePath)
+    await mutateAccounts((current) => {
+      current.cachekeep = { ...(current.cachekeep ?? {}), enabled: true }
+      return current
+    }, ctx.accountStoragePath)
     log.info('cachekeep enabled')
     ctx.setCacheKeepEnabled?.(true)
     mgr.start()
@@ -735,13 +737,10 @@ async function executeCachekeepCommand(
   }
 
   if (tokens[0] === 'off') {
-    const nextStorage = storage ?? {
-      version: 1 as const,
-      main: { type: 'opencode' as const, provider: 'openai' as const },
-      accounts: [],
-    }
-    nextStorage.cachekeep = { ...(nextStorage.cachekeep ?? {}), enabled: false }
-    await defaultSaveAccounts(nextStorage, ctx.accountStoragePath)
+    await mutateAccounts((current) => {
+      current.cachekeep = { ...(current.cachekeep ?? {}), enabled: false }
+      return current
+    }, ctx.accountStoragePath)
     log.info('cachekeep disabled')
     ctx.setCacheKeepEnabled?.(false)
     mgr?.stop()
@@ -761,17 +760,14 @@ async function executeCachekeepCommand(
         knobs: {},
       }
     }
-    const nextStorage = storage ?? {
-      version: 1 as const,
-      main: { type: 'opencode' as const, provider: 'openai' as const },
-      accounts: [],
-    }
     const value = subCmd === 'on'
-    nextStorage.cachekeep = {
-      ...(nextStorage.cachekeep ?? {}),
-      subagents: value,
-    }
-    await defaultSaveAccounts(nextStorage, ctx.accountStoragePath)
+    await mutateAccounts((current) => {
+      current.cachekeep = {
+        ...(current.cachekeep ?? {}),
+        subagents: value,
+      }
+      return current
+    }, ctx.accountStoragePath)
     log.info(
       value
         ? 'cachekeep subagent warming enabled'

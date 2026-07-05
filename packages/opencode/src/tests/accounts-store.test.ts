@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -283,7 +289,91 @@ describe('mutateAccounts (authoritative structural edits)', () => {
     const stateRaw = readFileSync(statePath, 'utf8')
     const state = JSON.parse(stateRaw)
     expect(Object.keys(state.accounts ?? {}).sort()).toEqual(['a', 'c'])
-    expect(stateRaw).not.toContain('acc-b')
+    expect(state.accounts?.b).toBeUndefined()
+    // Parsed exact-secret check (not just substring): no surviving entry may
+    // carry the removed account's tokens.
+    for (const entry of Object.values(
+      state.accounts as Record<string, { access?: string; refresh?: string }>,
+    )) {
+      expect(entry.access).not.toBe('acc-b')
+      expect(entry.refresh).not.toBe('ref-b')
+    }
+  })
+
+  it('saveAccountState with a stale snapshot does NOT re-add a removed account to state (incl. api-key)', async () => {
+    const { loadAccounts, saveAccounts, mutateAccounts, saveAccountState } =
+      await import('../core/accounts.ts')
+    const apiAccount = {
+      id: 'api-1',
+      type: 'api' as const,
+      apiKey: 'sk-secret-api-1',
+      baseURL: 'https://example.test',
+      enabled: true,
+      addedAt: Date.now(),
+      lastUsed: Date.now(),
+    }
+    const initial = {
+      version: 1 as const,
+      main: { type: 'opencode' as const, provider: 'openai' as const },
+      accounts: [oauth('a'), oauth('b'), apiAccount],
+    }
+    await saveAccounts(initial, cfgPath)
+
+    // Background worker holds a stale snapshot (still has b + api-1).
+    const stale = (await loadAccounts(cfgPath))!
+
+    // b and api-1 are removed authoritatively.
+    await mutateAccounts((current) => {
+      current.accounts = current.accounts.filter((acc) => acc.id === 'a')
+      return current
+    }, cfgPath)
+
+    // Stale worker writes state (default scope accounts:true). The roster gate
+    // must drop the removed ids instead of re-writing their secrets.
+    await saveAccountState(stale, cfgPath)
+
+    const stateRaw = readFileSync(statePath, 'utf8')
+    const state = JSON.parse(stateRaw)
+    expect(Object.keys(state.accounts ?? {}).sort()).toEqual(['a'])
+    expect(stateRaw).not.toContain('ref-b')
+    expect(stateRaw).not.toContain('sk-secret-api-1')
+  })
+
+  it('saveAccountState prunes a pre-existing orphan state entry absent from config', async () => {
+    const { saveAccounts, saveAccountState } = await import(
+      '../core/accounts.ts'
+    )
+    // Config roster = [a]; but the state file already has an orphan b at rest
+    // (e.g. left by an earlier crash between the config and state writes).
+    await saveAccounts(
+      {
+        version: 1 as const,
+        main: { type: 'opencode' as const, provider: 'openai' as const },
+        accounts: [oauth('a')],
+      },
+      cfgPath,
+    )
+    const orphanState = {
+      version: 1,
+      accounts: {
+        a: { access: 'acc-a', refresh: 'ref-a' },
+        b: { access: 'acc-b', refresh: 'ref-b' },
+      },
+    }
+    writeFileSync(statePath, `${JSON.stringify(orphanState)}\n`)
+
+    // Any state write (here scoped to main quota) must prune the orphan b.
+    await saveAccountState(
+      {
+        version: 1 as const,
+        main: { type: 'opencode' as const, provider: 'openai' as const },
+        accounts: [oauth('a')],
+      },
+      cfgPath,
+    )
+
+    const stateRaw = readFileSync(statePath, 'utf8')
+    expect(JSON.parse(stateRaw).accounts?.b).toBeUndefined()
     expect(stateRaw).not.toContain('ref-b')
   })
 

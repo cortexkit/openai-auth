@@ -456,6 +456,31 @@ function objectWithDefinedEntries(value: Record<string, unknown>) {
   )
 }
 
+/**
+ * The set of account ids present in the CONFIG file (the authoritative account
+ * roster). Returns null when the config is absent or unreadable/malformed, so
+ * callers can fall back to non-pruning behavior rather than risk wiping live
+ * state. The config never holds secrets (see accountConfig), so reading it here
+ * is safe. Reads are lock-free but the file is written atomically, so a
+ * concurrent write is seen as either the complete old or complete new file.
+ */
+async function readConfigRosterIds(path: string): Promise<Set<string> | null> {
+  let value: unknown
+  try {
+    value = (await readJsonIfPresent(path)).value
+  } catch {
+    return null
+  }
+  if (!isRecord(value) || !Array.isArray(value.accounts)) return null
+  const ids = new Set<string>()
+  for (const account of value.accounts) {
+    if (isRecord(account) && typeof account.id === 'string') {
+      ids.add(account.id)
+    }
+  }
+  return ids
+}
+
 function mergeConfigAndState(
   configValue: unknown,
   stateValue: unknown,
@@ -924,9 +949,21 @@ export async function saveAccountState(
 
     if (scope.accounts) {
       const ids = scope.accounts === true ? null : new Set(scope.accounts)
+      // Authoritative account roster from the CONFIG file (the account list of
+      // record). A caller's in-memory `storage` may be stale — e.g. a background
+      // refresh holding a snapshot from before a concurrent removal — so gating
+      // state writes on the roster prevents re-introducing a removed account's
+      // secrets (access/refresh/apiKey) into the state file. Read unlocked: the
+      // config is written atomically (temp+rename), so this sees a complete
+      // file, and the state lock we hold serializes the state write itself.
+      const roster = await readConfigRosterIds(path)
       next.accounts = { ...(isRecord(next.accounts) ? next.accounts : {}) }
       for (const account of storage.accounts) {
         if (ids && !ids.has(account.id)) continue
+        // Skip accounts no longer in the roster (removed out from under a stale
+        // snapshot). When the roster is unreadable (null) fall back to today's
+        // merge-only behavior rather than risk wiping live secrets.
+        if (roster && !roster.has(account.id)) continue
         next.accounts[account.id] = mergeAccountRuntimeState(
           next.accounts[account.id],
           accountRuntimeState(account),
@@ -937,6 +974,14 @@ export async function saveAccountState(
           if (!storage.accounts.some((account) => account.id === id)) {
             delete next.accounts[id]
           }
+        }
+      }
+      // Prune orphan state entries whose id is absent from the roster — clears
+      // secrets already at rest for a removed account (and closes the
+      // mutateAccounts config-then-state crash window on the next state write).
+      if (roster) {
+        for (const id of Object.keys(next.accounts)) {
+          if (!roster.has(id)) delete next.accounts[id]
         }
       }
     }
