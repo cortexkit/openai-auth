@@ -276,6 +276,15 @@ describe('mutateAccounts (authoritative structural edits)', () => {
     // proving the deletion was authoritative, not just an in-memory filter.
     const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
     expect(cfg.accounts.map((a: { id: string }) => a.id)).toEqual(['a', 'c'])
+
+    // The state file is rebuilt from the authoritative account set, so the
+    // removed account's per-account secrets must not linger at rest — a stale
+    // access/refresh token for a deleted account is a credential leak.
+    const stateRaw = readFileSync(statePath, 'utf8')
+    const state = JSON.parse(stateRaw)
+    expect(Object.keys(state.accounts ?? {}).sort()).toEqual(['a', 'c'])
+    expect(stateRaw).not.toContain('acc-b')
+    expect(stateRaw).not.toContain('ref-b')
   })
 
   it('reordering persists (union-merge would have ignored it)', async () => {
