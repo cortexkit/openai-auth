@@ -58,7 +58,7 @@
     "@opencode-ai/plugin": "*"
   },
   "dependencies": {
-    "@opentui/core": ">=0.4.0",
+    "@opentui/core": ">=0.4.3",
     "@opentui/solid": ">=0.4.0",
     "ai": "^5.0.88",
     "jsonc-parser": "^3.3.1",
