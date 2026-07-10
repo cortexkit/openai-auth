@@ -2,7 +2,12 @@ import { describe, expect, test } from 'bun:test'
 import { APICallError } from 'ai'
 import { DUMP_SESSION_HEADER } from '../dump'
 import { connectResponsesWebSocket } from '../ws'
-import { applyTurnId, createWebSocketFetch } from '../ws-pool'
+import {
+  applyTurnId,
+  CODEX_BODY_KEY_ORDER,
+  createWebSocketFetch,
+  orderCodexBody,
+} from '../ws-pool'
 
 function entry() {
   return {
@@ -120,9 +125,32 @@ describe('applyTurnId', () => {
   })
 })
 
+describe('orderCodexBody', () => {
+  test('orders known response body keys and leaves unknown keys trailing', () => {
+    const input = {
+      stream: true,
+      extra_key: 'kept-last',
+      client_metadata: {},
+      model: 'gpt-5.5',
+      input: [],
+      prompt_cache_key: 'session-1',
+    }
+
+    const ordered = orderCodexBody(input)
+    expect(Object.keys(ordered)).toEqual([
+      ...CODEX_BODY_KEY_ORDER.filter((key) => key in input),
+      'extra_key',
+    ])
+  })
+})
+
 describe('createWebSocketFetch', () => {
-  test('attributes quota by the internal account key, not the wire chatgpt-account-id', async () => {
-    const quotaCalls: Array<{ accessToken: string; accountId?: string }> = []
+  test('attributes quota by the internal account key and threads the served ChatGPT id', async () => {
+    const quotaCalls: Array<{
+      accessToken: string
+      accountId?: string
+      servedChatgptAccountId?: string
+    }> = []
     await withFakeWebSocket(
       ({ message }) => ({
         send() {
@@ -145,8 +173,12 @@ describe('createWebSocketFetch', () => {
       async () => {
         const websocketFetch = createWebSocketFetch({
           url: 'https://example.test/backend-api/codex/responses',
-          onQuota: (_s, accessToken, accountId) => {
-            quotaCalls.push({ accessToken, accountId })
+          onQuota: (_s, accessToken, accountId, servedChatgptAccountId) => {
+            quotaCalls.push({
+              accessToken,
+              accountId,
+              servedChatgptAccountId,
+            })
           },
         })
 
@@ -170,6 +202,7 @@ describe('createWebSocketFetch', () => {
         expect(quotaCalls).toHaveLength(1)
         expect(quotaCalls[0]?.accountId).toBe('main')
         expect(quotaCalls[0]?.accessToken).toBe('tok-main')
+        expect(quotaCalls[0]?.servedChatgptAccountId).toBe('chatgpt-stable-xyz')
         websocketFetch.close()
       },
     )

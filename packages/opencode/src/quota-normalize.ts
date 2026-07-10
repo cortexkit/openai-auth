@@ -30,7 +30,7 @@ function windowFromHeader(
   prefix: string,
 ): AccountQuotaWindow | undefined {
   const used = h.get(prefix)
-  if (used === null) return undefined
+  if (used === null || used.trim() === '') return undefined
   const usedPercent = Number(used)
   if (!Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100)
     return undefined

@@ -33,14 +33,16 @@ export interface CreateWebSocketFetchOptions {
   /**
    * Push per-turn quota from a codex.rate_limits in-band frame.
    *
-   * Receives the snapshot plus the per-request account identity (access token
-   * and accountId) captured at send time so the frame is attributed to the
-   * connection's own account, not a shared mutable global.
+   * Receives the snapshot plus the per-request account identity (access token,
+   * internal quota account key, and served ChatGPT account id) captured at send
+   * time so the frame is attributed to the connection's own account, not a
+   * shared mutable global.
    */
   onQuota?: (
     s: Record<string, unknown>,
     accessToken: string,
     accountId: string | undefined,
+    servedChatgptAccountId: string | undefined,
   ) => void
 }
 
@@ -221,9 +223,18 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         typeof internalHeaders[QUOTA_ACCOUNT_HEADER] === 'string'
           ? internalHeaders[QUOTA_ACCOUNT_HEADER]
           : undefined
+      const requestServedChatgptAccountId =
+        typeof sourceHeaders['chatgpt-account-id'] === 'string'
+          ? sourceHeaders['chatgpt-account-id']
+          : undefined
       const requestOnQuota = onQuota
         ? (s: Record<string, unknown>) =>
-            onQuota(s, requestAccessToken, requestAccountId)
+            onQuota(
+              s,
+              requestAccessToken,
+              requestAccountId,
+              requestServedChatgptAccountId,
+            )
         : undefined
 
       const socketHeaders =
@@ -626,7 +637,7 @@ function prewarmHeaders(input: Record<string, string>) {
 }
 
 // Codex serializes the response.create body in this exact key order.
-const CODEX_BODY_KEY_ORDER = [
+export const CODEX_BODY_KEY_ORDER = [
   'type',
   'model',
   'instructions',
@@ -654,7 +665,7 @@ function normalizeResponseBody(body: Record<string, unknown>) {
 
 // Reconstruct the body in Codex's exact key order; append any unexpected keys at the end.
 // Applied at the final send so continuation/prewarm fields land in the right position.
-function orderCodexBody(body: Record<string, unknown>) {
+export function orderCodexBody(body: Record<string, unknown>) {
   const next: Record<string, unknown> = {}
   for (const key of CODEX_BODY_KEY_ORDER) if (key in body) next[key] = body[key]
   for (const key of Object.keys(body)) if (!(key in next)) next[key] = body[key]

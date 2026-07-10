@@ -7,7 +7,13 @@ import type { Hooks, PluginInput } from '@opencode-ai/plugin'
 import type { OAuthAccount } from '../core/accounts.ts'
 import { migrateIfNeeded } from '../core/accounts.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
-import { CodexAuthPlugin, findCachekeepFallbackAccount } from '../index.ts'
+import {
+  AuthPersistError,
+  CodexAuthPlugin,
+  findCachekeepFallbackAccount,
+  MAIN_REFRESH_LEASE_TTL_MS,
+  MAIN_REFRESH_LOCK_TTL_MS,
+} from '../index.ts'
 import {
   drainSidebarWrites,
   getSidebarStateFile,
@@ -67,6 +73,112 @@ function createMockPluginInput(
     serverUrl: new URL('http://localhost:0'),
     $: {} as PluginInput['$'],
     ...overrides,
+  }
+}
+
+type FakeWebSocketContext = {
+  message(data: string): void
+  close(code?: number, reason?: string): void
+}
+
+type FakeWebSocketBehavior = {
+  autoOpen?: boolean
+  send?: (data: string) => void
+  close?: () => void
+}
+
+function headerValue(init: unknown, name: string) {
+  const headers = (init as { headers?: HeadersInit } | undefined)?.headers
+  if (!headers) return ''
+  const lowerName = name.toLowerCase()
+  if (headers instanceof Headers) return headers.get(name) ?? ''
+  if (Array.isArray(headers)) {
+    const found = headers.find(([key]) => key.toLowerCase() === lowerName)
+    return found ? String(found[1]) : ''
+  }
+  const record = headers as Record<string, string>
+  return String(record[name] ?? record[lowerName] ?? '')
+}
+
+async function withFakeWebSocket(
+  behavior: (context: FakeWebSocketContext) => FakeWebSocketBehavior,
+  run: () => Promise<void>,
+) {
+  const original = globalThis.WebSocket
+
+  class FakeWebSocket {
+    static OPEN = 1
+    static CLOSED = 3
+
+    url: string
+    readyState = 0
+    private readonly listeners = new Map<
+      string,
+      Set<{ fn: (event: unknown) => void; once: boolean }>
+    >()
+    private readonly behavior: FakeWebSocketBehavior
+
+    constructor(url: string) {
+      this.url = url
+      this.behavior = behavior({
+        message: (data) => this.emit('message', { data }),
+        close: (code = 1000, reason = '') => {
+          this.readyState = FakeWebSocket.CLOSED
+          this.emit('close', { code, reason })
+        },
+      })
+      if (this.behavior.autoOpen !== false) {
+        queueMicrotask(() => {
+          this.readyState = FakeWebSocket.OPEN
+          this.emit('open', {})
+        })
+      }
+    }
+
+    addEventListener(
+      type: string,
+      fn: (event: unknown) => void,
+      options?: { once?: boolean },
+    ) {
+      const listeners = this.listeners.get(type) ?? new Set()
+      listeners.add({ fn, once: options?.once === true })
+      this.listeners.set(type, listeners)
+    }
+
+    removeEventListener(type: string, fn: (event: unknown) => void) {
+      const listeners = this.listeners.get(type)
+      if (!listeners) return
+      for (const listener of listeners) {
+        if (listener.fn === fn) listeners.delete(listener)
+      }
+    }
+
+    send(data: string) {
+      this.behavior.send?.(data)
+    }
+
+    close() {
+      this.readyState = FakeWebSocket.CLOSED
+      this.behavior.close?.()
+    }
+
+    private emit(type: string, event: unknown) {
+      const listeners = this.listeners.get(type)
+      if (!listeners) return
+      for (const listener of [...listeners]) {
+        listener.fn(event)
+        if (listener.once) listeners.delete(listener)
+      }
+    }
+  }
+
+  ;(globalThis as unknown as { WebSocket: typeof WebSocket }).WebSocket =
+    FakeWebSocket as unknown as typeof WebSocket
+  try {
+    await run()
+  } finally {
+    ;(globalThis as unknown as { WebSocket: typeof WebSocket }).WebSocket =
+      original
   }
 }
 
@@ -695,6 +807,224 @@ describe('integration: killswitch enforcement', () => {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
+  })
+
+  it('drops late main quota pushed for a previous identity after a switch', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        killswitch: { enabled: true, main: { primary: 50, secondary: 50 } },
+      }),
+    )
+
+    const init = (): RequestInit => ({
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.5', input: [], stream: false }),
+    })
+    const quotaResponse = (used: number) =>
+      new Response('{}', {
+        status: 200,
+        headers: {
+          'x-codex-primary-used-percent': String(used),
+          'x-codex-secondary-used-percent': String(used),
+        },
+      })
+
+    const originalFetch = globalThis.fetch
+    let account: 'A' | 'B' = 'A'
+    let resolveA: ((response: Response) => void) | undefined
+    let sawA: (() => void) | undefined
+    const sawAPromise = new Promise<void>((resolve) => {
+      sawA = resolve
+    })
+    const seenAuth: string[] = []
+    globalThis.fetch = (async (_url: unknown, request?: unknown) => {
+      const auth = headerValue(request, 'authorization')
+      seenAuth.push(auth)
+      if (auth.includes('access-A')) {
+        sawA?.()
+        return new Promise<Response>((resolve) => {
+          resolveA = resolve
+        })
+      }
+      return quotaResponse(95)
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const authHook = hooks.auth
+      if (!authHook?.loader) throw new Error('No auth loader')
+      const loaderResult = await authHook.loader(
+        async () => ({
+          type: 'oauth' as const,
+          provider: 'openai',
+          access: account === 'A' ? 'access-A' : 'access-B',
+          refresh: refreshToken,
+          expires: Date.now() + 3600_000,
+          accountId: account === 'A' ? 'chatgpt-A' : 'chatgpt-B',
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+      )
+      const fetchOverride = (loaderResult as Record<string, unknown>).fetch as (
+        url: string,
+        init?: RequestInit,
+      ) => Promise<Response>
+
+      const firstPromise = fetchOverride(
+        'https://api.openai.com/v1/responses',
+        init(),
+      )
+      await sawAPromise
+
+      account = 'B'
+      const second = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        init(),
+      )
+      expect(second.status).toBe(200)
+      await second.body?.cancel()
+
+      resolveA?.(quotaResponse(10))
+      const first = await firstPromise
+      expect(first.status).toBe(200)
+      await first.body?.cancel()
+
+      const third = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        init(),
+      )
+      expect(third.status).toBe(429)
+      await third.body?.cancel()
+      expect(seenAuth).toEqual(['Bearer access-A', 'Bearer access-B'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('uses the served WebSocket ChatGPT account id for main killswitch policy after re-auth', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        killswitch: { enabled: true, main: { primary: 50, secondary: 50 } },
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', {
+        status: 200,
+        headers: {
+          'x-codex-primary-used-percent': '10',
+          'x-codex-secondary-used-percent': '10',
+        },
+      })) as unknown as typeof globalThis.fetch
+
+    let wsSends = 0
+    let hooks: Hooks | undefined
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          wsSends++
+          message(
+            JSON.stringify({
+              type: 'codex.rate_limits',
+              rate_limits: {
+                primary: { used_percent: 95, window_minutes: 300 },
+                secondary: { used_percent: 95, window_minutes: 10080 },
+              },
+            }),
+          )
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: `resp_${wsSends}` },
+            }),
+          )
+        },
+      }),
+      async () => {
+        let account: 'A' | 'B' = 'A'
+        try {
+          hooks = await CodexAuthPlugin(createMockPluginInput(), {
+            experimentalWebSockets: true,
+          })
+          const authHook = hooks.auth
+          if (!authHook?.loader) throw new Error('No auth loader')
+          const loaderResult = await authHook.loader(
+            async () => ({
+              type: 'oauth' as const,
+              provider: 'openai',
+              access: account === 'A' ? 'access-A' : 'access-B',
+              refresh: refreshToken,
+              expires: Date.now() + 3600_000,
+              accountId: account === 'A' ? 'chatgpt-A' : 'chatgpt-B',
+            }),
+            {
+              id: 'openai',
+              label: 'OpenAI',
+              models: [],
+            } as unknown as Parameters<
+              NonNullable<(typeof authHook)['loader']>
+            >[1],
+          )
+          const fetchOverride = (loaderResult as Record<string, unknown>)
+            .fetch as (url: string, init?: RequestInit) => Promise<Response>
+          const request = (stream: boolean): RequestInit => ({
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'session-id': 'ws-main-identity-session',
+            },
+            body: JSON.stringify({ model: 'gpt-5.5', input: [], stream }),
+          })
+
+          const seedA = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            request(false),
+          )
+          expect(seedA.status).toBe(200)
+          await seedA.body?.cancel()
+
+          account = 'B'
+          const pushedB = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            request(true),
+          )
+          expect(pushedB.status).toBe(200)
+          await pushedB.text()
+          await waitForSidebarState(
+            sidebarFile,
+            (s) => s.main.quota?.primary?.usedPercent === 95,
+          )
+
+          const blockedB = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            request(true),
+          )
+          expect(blockedB.status).toBe(429)
+          await blockedB.body?.cancel()
+          expect(wsSends).toBe(1)
+        } finally {
+          globalThis.fetch = originalFetch
+          await hooks?.dispose?.()
+        }
+      },
+    )
   })
 })
 
@@ -2058,6 +2388,547 @@ describe('integration: active fallback routing', () => {
         'Bearer main-stale-token',
         'Bearer fallback-primary-token',
       ])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('records quota from a failed fallback so the killswitch skips it next turn', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            label: 'Fallback',
+            enabled: true,
+            access: 'fallback-access-token',
+            refresh: 'fallback-refresh-token',
+            expires: Date.now() + 3600_000 * 24,
+            accountId: 'acc-fallback-1',
+          },
+        ],
+        routing: { mode: 'fallback-first' },
+        killswitch: {
+          enabled: true,
+          accounts: { 'fallback-1': { primary: 50, secondary: 50 } },
+        },
+      }),
+    )
+
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+      const auth = headerValue(init, 'authorization')
+      seenAuth.push(auth)
+      if (auth.includes('fallback-access-token')) {
+        return new Response('{}', {
+          status: 429,
+          headers: {
+            'x-codex-primary-used-percent': '95',
+            'x-codex-secondary-used-percent': '95',
+          },
+        })
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      const first = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(first.status).toBe(200)
+      await first.body?.cancel()
+
+      const second = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(second.status).toBe(200)
+      await second.body?.cancel()
+      expect(seenAuth).toEqual([
+        'Bearer fallback-access-token',
+        'Bearer main-stale-token',
+        'Bearer main-stale-token',
+      ])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('preserves a fresh fallback quota window when a partial failed snapshot arrives', async () => {
+    seedStorage({ access: 'fallback-access-token' })
+    const originalFetch = globalThis.fetch
+    let fallbackCalls = 0
+    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+      const auth = headerValue(init, 'authorization')
+      if (auth.includes('fallback-access-token')) {
+        fallbackCalls++
+        return new Response('{}', {
+          status: 429,
+          headers:
+            fallbackCalls === 1
+              ? {
+                  'x-codex-primary-used-percent': '10',
+                  'x-codex-secondary-used-percent': '95',
+                }
+              : { 'x-codex-primary-used-percent': '20' },
+        })
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      const first = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(first.status).toBe(200)
+      await first.body?.cancel()
+
+      const second = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(second.status).toBe(200)
+      await second.body?.cancel()
+
+      const sidebar = await waitForSidebarState(
+        sidebarFile,
+        (s) =>
+          s.fallbacks.find((a) => a.id === 'fallback-1')?.quota?.primary
+            ?.usedPercent === 20 &&
+          s.fallbacks.find((a) => a.id === 'fallback-1')?.quota?.secondary
+            ?.usedPercent === 95,
+      )
+      const quota = sidebar.fallbacks.find((a) => a.id === 'fallback-1')?.quota
+      expect(quota?.primary?.usedPercent).toBe(20)
+      expect(quota?.secondary?.usedPercent).toBe(95)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('does not replay non-responses POSTs or GET requests through fallbacks', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            enabled: true,
+            access: 'fallback-access-token',
+            refresh: 'fallback-refresh-token',
+            expires: Date.now() + 3600_000 * 24,
+            accountId: 'acc-fallback-1',
+          },
+        ],
+        routing: { mode: 'main-first' },
+      }),
+    )
+
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+      seenAuth.push(headerValue(init, 'authorization'))
+      return new Response('main limited', { status: 429 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      const chat = await loaded.fetchOverride(
+        'https://api.openai.com/v1/chat/completions',
+        requestInit(),
+      )
+      expect(chat.status).toBe(429)
+      expect(await chat.text()).toBe('main limited')
+
+      const get = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        { method: 'GET' },
+      )
+      expect(get.status).toBe(429)
+      expect(await get.text()).toBe('main limited')
+      expect(seenAuth).toEqual([
+        'Bearer main-stale-token',
+        'Bearer main-stale-token',
+      ])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('stops reactive fallback on an indeterminate transport throw and returns the primary response', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            enabled: true,
+            access: 'fallback-throw-token',
+            refresh: 'fallback-throw-refresh',
+            expires: Date.now() + 3600_000 * 24,
+          },
+          {
+            id: 'fallback-2',
+            type: 'oauth',
+            enabled: true,
+            access: 'fallback-never-token',
+            refresh: 'fallback-never-refresh',
+            expires: Date.now() + 3600_000 * 24,
+          },
+        ],
+        routing: { mode: 'main-first' },
+      }),
+    )
+
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+      const auth = headerValue(init, 'authorization')
+      seenAuth.push(auth)
+      if (auth.includes('fallback-throw-token')) throw new Error('ECONNRESET')
+      if (auth.includes('fallback-never-token')) {
+        return new Response('should not be called', { status: 200 })
+      }
+      return new Response('primary body stays readable', { status: 429 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(response.status).toBe(429)
+      expect(await response.text()).toBe('primary body stays readable')
+      expect(seenAuth).toEqual([
+        'Bearer main-stale-token',
+        'Bearer fallback-throw-token',
+      ])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('propagates caller aborts from reactive fallback attempts', async () => {
+    seedStorage({ access: 'fallback-access-token' }, { mode: 'main-first' })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+      const auth = headerValue(init, 'authorization')
+      if (auth.includes('fallback-access-token')) {
+        throw new DOMException('request aborted', 'AbortError')
+      }
+      return new Response('main limited', { status: 429 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      let caught: unknown
+      try {
+        await loaded.fetchOverride(
+          'https://api.openai.com/v1/responses',
+          requestInit(),
+        )
+      } catch (error) {
+        caught = error
+      }
+      expect(caught).toBeInstanceOf(DOMException)
+      expect((caught as DOMException).name).toBe('AbortError')
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('orders HTTP Codex bodies the same way as WebSocket bodies', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        routing: { mode: 'main-first' },
+      }),
+    )
+    const request = (): RequestInit => ({
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'session-id': 'body-order-session',
+      },
+      body: JSON.stringify({
+        stream: true,
+        client_metadata: { existing: 'yes' },
+        input: [{ role: 'user', content: 'hi' }],
+        previous_response_id: 'resp_prev',
+        model: 'gpt-5.5',
+        type: 'response.create',
+        reasoning: { effort: 'low' },
+        tools: [],
+        store: false,
+      }),
+    })
+    const expectedKeys = [
+      'type',
+      'model',
+      'previous_response_id',
+      'input',
+      'tools',
+      'parallel_tool_calls',
+      'reasoning',
+      'store',
+      'stream',
+      'prompt_cache_key',
+      'client_metadata',
+    ]
+
+    const originalFetch = globalThis.fetch
+    let httpBody = ''
+    let httpHooks: Hooks | undefined
+    try {
+      globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+        httpBody = String((init as { body?: unknown } | undefined)?.body ?? '')
+        return new Response('{}', { status: 200 })
+      }) as unknown as typeof globalThis.fetch
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+      )
+      httpHooks = loaded.hooks
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        request(),
+      )
+      expect(response.status).toBe(200)
+      await response.body?.cancel()
+    } finally {
+      globalThis.fetch = originalFetch
+      await httpHooks?.dispose?.()
+    }
+
+    let wsBody = ''
+    let wsHooks: Hooks | undefined
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send(data) {
+          wsBody = data
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: 'resp_order' },
+            }),
+          )
+        },
+      }),
+      async () => {
+        try {
+          globalThis.fetch = (async () =>
+            new Response('{}', {
+              status: 200,
+            })) as unknown as typeof globalThis.fetch
+          const loaded = await loadFetchOverride(
+            createMockPluginInput(),
+            Date.now() + 3600_000,
+            true,
+          )
+          wsHooks = loaded.hooks
+          const response = await loaded.fetchOverride(
+            'https://api.openai.com/v1/responses',
+            request(),
+          )
+          expect(response.status).toBe(200)
+          await response.text()
+        } finally {
+          globalThis.fetch = originalFetch
+          await wsHooks?.dispose?.()
+        }
+      },
+    )
+
+    expect(Object.keys(JSON.parse(httpBody))).toEqual(expectedKeys)
+    expect(Object.keys(JSON.parse(wsBody))).toEqual(expectedKeys)
+  })
+
+  it('keeps the main refresh advisory lease shorter than the file lock TTL', () => {
+    expect(MAIN_REFRESH_LEASE_TTL_MS).toBe(90_000)
+    expect(MAIN_REFRESH_LEASE_TTL_MS).toBeLessThan(MAIN_REFRESH_LOCK_TTL_MS)
+  })
+
+  it('retries persisting rotated main tokens without refreshing twice', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        refresh: { refreshBeforeExpiryMinutes: 5 },
+        routing: { mode: 'main-first' },
+      }),
+    )
+    const originalFetch = globalThis.fetch
+    const seenAuth: string[] = []
+    let oauthRefreshCalls = 0
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('/oauth/token')) {
+        oauthRefreshCalls++
+        return new Response(
+          JSON.stringify({
+            access_token: 'main-refreshed-token',
+            refresh_token: 'main-refresh-new',
+            expires_in: 3600,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      seenAuth.push(headerValue(init, 'authorization'))
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let authSetCalls = 0
+    let hooks: Hooks | undefined
+    try {
+      const input = createMockPluginInput({
+        client: {
+          auth: {
+            set: async () => {
+              authSetCalls++
+              if (authSetCalls < 3) throw new Error('temporary auth write')
+            },
+          },
+          session: { promptAsync: async () => {} },
+        } as unknown as PluginInput['client'],
+      })
+      const loaded = await loadFetchOverride(input, Date.now() - 60_000)
+      hooks = loaded.hooks
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(response.status).toBe(200)
+      await response.body?.cancel()
+      expect(oauthRefreshCalls).toBe(1)
+      expect(authSetCalls).toBe(3)
+      expect(seenAuth).toEqual(['Bearer main-refreshed-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('surfaces a distinct auth persistence error after rotated tokens cannot be saved', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        refresh: { refreshBeforeExpiryMinutes: 5 },
+        routing: { mode: 'main-first' },
+      }),
+    )
+    const originalFetch = globalThis.fetch
+    const seenAuth: string[] = []
+    let oauthRefreshCalls = 0
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('/oauth/token')) {
+        oauthRefreshCalls++
+        return new Response(
+          JSON.stringify({
+            access_token: 'main-refreshed-token',
+            refresh_token: 'main-refresh-new',
+            expires_in: 3600,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      seenAuth.push(headerValue(init, 'authorization'))
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let authSetCalls = 0
+    let hooks: Hooks | undefined
+    try {
+      const input = createMockPluginInput({
+        client: {
+          auth: {
+            set: async () => {
+              authSetCalls++
+              throw new Error('auth write failed')
+            },
+          },
+          session: { promptAsync: async () => {} },
+        } as unknown as PluginInput['client'],
+      })
+      const loaded = await loadFetchOverride(input, Date.now() - 60_000)
+      hooks = loaded.hooks
+
+      let caught: unknown
+      try {
+        await loaded.fetchOverride(
+          'https://api.openai.com/v1/responses',
+          requestInit(),
+        )
+      } catch (error) {
+        caught = error
+      }
+      expect(caught).toBeInstanceOf(AuthPersistError)
+      expect((caught as AuthPersistError).code).toBe(
+        'OPENAI_AUTH_PERSIST_FAILED',
+      )
+      expect(oauthRefreshCalls).toBe(1)
+      expect(authSetCalls).toBe(3)
+      expect(seenAuth).toEqual([])
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()

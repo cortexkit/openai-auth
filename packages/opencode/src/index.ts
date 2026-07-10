@@ -34,6 +34,7 @@ import {
   migrateIfNeeded,
   mutateAccounts,
   type OAuthAccount,
+  type OAuthQuotaSnapshot,
   type RoutingMode,
   shouldFallbackStatus,
 } from './core/accounts'
@@ -90,7 +91,7 @@ import {
 import { isRecord } from './util/record'
 import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
-import { OpenAIWebSocketPool } from './ws-pool'
+import { OpenAIWebSocketPool, orderCodexBody } from './ws-pool'
 
 const ALLOWED_MODELS = new Set([
   'gpt-5.5',
@@ -113,14 +114,32 @@ const CODEX_VERSION = '0.144.0'
 const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
 const CODEX_SANDBOX = 'seccomp'
 const MAIN_REFRESH_LOCK_NAME = 'main-refresh'
-const MAIN_REFRESH_LOCK_TTL_MS = 2 * 60_000
-const MAIN_REFRESH_LEASE_TTL_MS = 600_000
+export const MAIN_REFRESH_LOCK_TTL_MS = 2 * 60_000
+export const MAIN_REFRESH_LEASE_TTL_MS = 90_000
 const CONCURRENT_MAIN_REFRESH_WAIT_MS = 4_000
 const CONCURRENT_MAIN_REFRESH_POLL_BASE_MS = 50
+const AUTH_SET_MAX_ATTEMPTS = 3
+const AUTH_SET_RETRY_BASE_MS = 25
 
 const HANDLED_SENTINEL = '__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__'
 
 let bootQuotaSeedStarted = false
+
+export class AuthPersistError extends Error {
+  readonly code = 'OPENAI_AUTH_PERSIST_FAILED'
+
+  constructor(cause: unknown) {
+    super(
+      'OpenAI OAuth token refreshed but could not be persisted; re-login required',
+      { cause },
+    )
+    this.name = 'AuthPersistError'
+  }
+}
+
+function isAuthPersistError(error: unknown): error is AuthPersistError {
+  return error instanceof AuthPersistError
+}
 
 function cleanAbort(): never {
   throw new Error(HANDLED_SENTINEL)
@@ -360,7 +379,9 @@ function prepareCodexRequest(input: {
   parsed.client_metadata = clientMetadata
   input.headers.delete('content-length')
   input.headers.delete('Content-Length')
-  return { init: { ...input.init, body: JSON.stringify(parsed) } }
+  return {
+    init: { ...input.init, body: JSON.stringify(orderCodexBody(parsed)) },
+  }
 }
 
 export function findCachekeepFallbackAccount(
@@ -680,6 +701,7 @@ export async function CodexAuthPlugin(
           storage,
           fetchQuotaFn: undefined, // push-only: quota comes from HTTP headers / WS frames
         })
+        let currentMainIdentity: string | undefined
         const fallbackManager = new FallbackAccountManager({
           refreshFn: (opts) =>
             codexRefreshFn({
@@ -705,6 +727,38 @@ export async function CodexAuthPlugin(
         let mainRefreshPromise:
           | Promise<{ access: string; refresh: string; expires: number }>
           | undefined
+
+        async function sleep(ms: number) {
+          await new Promise((resolve) => setTimeout(resolve, ms))
+        }
+
+        async function persistMainAuthTokens(tokens: {
+          access: string
+          refresh: string
+          expires: number
+        }) {
+          let lastError: unknown
+          for (let attempt = 1; attempt <= AUTH_SET_MAX_ATTEMPTS; attempt++) {
+            try {
+              await input.client.auth.set({
+                path: { id: 'openai' },
+                body: {
+                  type: 'oauth',
+                  refresh: tokens.refresh,
+                  access: tokens.access,
+                  expires: tokens.expires,
+                },
+              })
+              return
+            } catch (error) {
+              lastError = error
+              if (attempt < AUTH_SET_MAX_ATTEMPTS) {
+                await sleep(AUTH_SET_RETRY_BASE_MS * attempt)
+              }
+            }
+          }
+          throw new AuthPersistError(lastError)
+        }
 
         async function updateMainRefreshState(
           update: (storage: AccountStorage) => void,
@@ -827,15 +881,7 @@ export async function CodexAuthPlugin(
                   fetchImpl: fetch,
                   now: Date.now,
                 })
-                await input.client.auth.set({
-                  path: { id: 'openai' },
-                  body: {
-                    type: 'oauth',
-                    refresh: tokens.refresh,
-                    access: tokens.access,
-                    expires: tokens.expires,
-                  },
-                })
+                await persistMainAuthTokens(tokens)
                 await updateMainRefreshState((nextStorage) => {
                   nextStorage.refresh = nextStorage.refresh ?? {}
                   nextStorage.refresh.mainLastRefreshError = undefined
@@ -848,7 +894,7 @@ export async function CodexAuthPlugin(
                 leaseTokenHash = undefined
                 return tokens
               } catch (error) {
-                if (freshAuth.refresh) {
+                if (freshAuth.refresh && !isAuthPersistError(error)) {
                   await updateMainRefreshState((nextStorage) => {
                     nextStorage.refresh = nextStorage.refresh ?? {}
                     nextStorage.refresh.mainLastRefreshError =
@@ -895,7 +941,8 @@ export async function CodexAuthPlugin(
             if (!auth.access || (auth.expires ?? 0) < Date.now()) {
               try {
                 return (await refreshMainWithLease()).access
-              } catch {
+              } catch (error) {
+                if (isAuthPersistError(error)) throw error
                 if (auth.access) return auth.access
                 throw new Error('main token refresh failed')
               }
@@ -933,17 +980,46 @@ export async function CodexAuthPlugin(
         ) {
           if (Object.keys(snapshot).length === 0) return
           const now = Date.now()
-          const entry = {
-            quota: snapshot as Parameters<
-              typeof quotaManager.setMain
-            >[1]['quota'],
+          const quota = snapshot as OAuthQuotaSnapshot
+          let entry: Parameters<typeof quotaManager.setMain>[1] = {
+            quota,
             refreshAfter: now + 5 * 60 * 1000,
             checkedAt: now,
           }
           if (accountId && accountId !== 'main') {
+            const previous = quotaManager.getFallback(accountId, accessToken)
+            if (previous && previous.refreshAfter > now) {
+              const mergedQuota: OAuthQuotaSnapshot = { ...quota }
+              if (!mergedQuota.primary && previous.quota.primary) {
+                mergedQuota.primary = previous.quota.primary
+              }
+              if (!mergedQuota.secondary && previous.quota.secondary) {
+                mergedQuota.secondary = previous.quota.secondary
+              }
+              entry = { ...entry, quota: mergedQuota }
+            }
             quotaManager.setFallback(accountId, entry, accessToken)
           } else {
-            quotaManager.setMain(accessToken, entry, mainAccountIdentity)
+            let resolvedMainIdentity = mainAccountIdentity
+            if (!resolvedMainIdentity && accessToken) {
+              const claims = parseJwtClaims(accessToken)
+              resolvedMainIdentity = claims
+                ? extractAccountIdFromClaims(claims)
+                : undefined
+            }
+            if (
+              resolvedMainIdentity &&
+              currentMainIdentity &&
+              resolvedMainIdentity !== currentMainIdentity
+            ) {
+              logQ.debug('stale main quota frame dropped', {
+                pid: process.pid,
+                frameAccountId: resolvedMainIdentity,
+                currentMainIdentity,
+              })
+              return
+            }
+            quotaManager.setMain(accessToken, entry, resolvedMainIdentity)
           }
           logQ.debug('quota pushed', {
             pid: process.pid,
@@ -961,8 +1037,14 @@ export async function CodexAuthPlugin(
               // Per-request account identity is captured at send time by the
               // pool and threaded here so the frame is attributed to the
               // connection's own account, not the shared mutable globals.
-              onQuota: (s, accessToken, accountId) => {
-                void pushQuota(s, accessToken, accountId)
+              onQuota: (s, accessToken, accountId, servedChatgptAccountId) => {
+                const isMainBucket = !accountId || accountId === 'main'
+                void pushQuota(
+                  s,
+                  accessToken,
+                  accountId,
+                  isMainBucket ? servedChatgptAccountId : undefined,
+                )
               },
             })
           : undefined
@@ -1270,11 +1352,29 @@ export async function CodexAuthPlugin(
         }
 
         // -------------------------------------------------------------------
-        // Replayability guard: a non-string body (stream, consumed)
-        // cannot be retried — skip fallback and return mainResponse uncancelled.
+        // Replayability guard: only Codex generation POSTs with a buffered body
+        // can be retried — skip fallback and return the primary response intact.
         // -------------------------------------------------------------------
-        function isReplayableRequest(init: RequestInit | undefined) {
-          return !init?.body || typeof init.body === 'string'
+        function isReplayableRequest(
+          requestInput: RequestInfo | URL,
+          init: RequestInit | undefined,
+        ) {
+          const method =
+            init?.method ??
+            (requestInput instanceof Request ? requestInput.method : 'GET')
+          if (method.toUpperCase() !== 'POST') return false
+          if (typeof init?.body !== 'string') return false
+          try {
+            const rawUrl =
+              requestInput instanceof URL
+                ? requestInput.toString()
+                : typeof requestInput === 'string'
+                  ? requestInput
+                  : requestInput.url
+            return new URL(rawUrl).pathname.endsWith('/responses')
+          } catch {
+            return false
+          }
         }
 
         // -------------------------------------------------------------------
@@ -1373,6 +1473,24 @@ export async function CodexAuthPlugin(
           )
         }
 
+        async function pushFailedFallbackQuota(
+          response: Response,
+          candidate: FallbackCandidate,
+        ) {
+          try {
+            const snapshot = normalizeQuotaHeaders(response.headers)
+            if (Object.keys(snapshot).length > 0) {
+              await pushQuota(
+                snapshot,
+                candidate.access,
+                candidate.quotaAccountId,
+              )
+            }
+          } catch {
+            // Quota headers from a failed candidate are advisory; routing must continue.
+          }
+        }
+
         // -------------------------------------------------------------------
         // tryFallbackFirst — proactive (fallback-first mode): try usable
         // fallbacks BEFORE main. Returns the first fallback that serves, or
@@ -1431,6 +1549,7 @@ export async function CodexAuthPlugin(
                 activeId: candidate.keepwarmAccountKey,
               }
             }
+            await pushFailedFallbackQuota(response, candidate)
             // This fallback failed — discard its body and try the next.
             response.body?.cancel().catch(() => {})
           }
@@ -1447,7 +1566,9 @@ export async function CodexAuthPlugin(
           primaryResponse: Response,
           _unused?: string,
         ) {
-          if (!isReplayableRequest(init)) return { response: primaryResponse }
+          if (!isReplayableRequest(requestInput, init)) {
+            return { response: primaryResponse }
+          }
 
           const fallbackStorage = await loadRequestAccounts()
           const candidates = await usableFallbackCandidates(fallbackStorage)
@@ -1461,13 +1582,31 @@ export async function CodexAuthPlugin(
             | undefined
 
           for (const candidate of candidates) {
-            const response = await sendWithAccessToken(
-              requestInput,
-              init,
-              candidate.access,
-              candidate.accountId,
-              candidate.keepwarmAccountKey,
-            )
+            let response: Response
+            try {
+              response = await sendWithAccessToken(
+                requestInput,
+                init,
+                candidate.access,
+                candidate.accountId,
+                candidate.keepwarmAccountKey,
+              )
+            } catch (error) {
+              if (
+                error instanceof DOMException &&
+                error.name === 'AbortError'
+              ) {
+                throw error
+              }
+              if ((init?.signal as AbortSignal | undefined | null)?.aborted) {
+                throw error
+              }
+              logA.debug('reactive fallback candidate threw; stopping', {
+                pid: process.pid,
+                accountId: candidate.quotaAccountId,
+              })
+              return { response: lastResponse, ...lastQuotaTarget }
+            }
 
             // Cancel the PREVIOUS response body now that we have a new one.
             // Only the LAST (returned) response keeps its body intact.
@@ -1482,6 +1621,7 @@ export async function CodexAuthPlugin(
               await fallbackManager.markUsed(candidate.fallback)
               return { response, ...lastQuotaTarget }
             }
+            await pushFailedFallbackQuota(response, candidate)
           }
 
           // All fallbacks exhausted. Return the last response — its body is
@@ -1598,7 +1738,8 @@ export async function CodexAuthPlugin(
                 currentAuth.access = refreshed.access
                 currentAuth.refresh = refreshed.refresh
                 currentAuth.expires = refreshed.expires
-              } catch {
+              } catch (error) {
+                if (isAuthPersistError(error)) throw error
                 // Use stale token on refresh failure
               }
             }
@@ -1619,6 +1760,7 @@ export async function CodexAuthPlugin(
                     parseJwtClaims(primaryAccess) ?? {},
                   )
                 : undefined)
+            currentMainIdentity = mainAccountIdentity
             const mode: RoutingMode = reqStorage?.routing?.mode ?? 'main-first'
 
             // fallback-first (proactive): try usable fallbacks BEFORE main. If one
@@ -1632,7 +1774,10 @@ export async function CodexAuthPlugin(
             // True when the proactive gate already tried every usable fallback,
             // so the reactive path below must not re-try (and re-spend on) them.
             let fallbacksAlreadyTried = false
-            if (mode === 'fallback-first' && isReplayableRequest(init)) {
+            if (
+              mode === 'fallback-first' &&
+              isReplayableRequest(requestInput, init)
+            ) {
               fallbacksAlreadyTried = true
               const pre = await tryFallbackFirst(requestInput, init, reqStorage)
               if (pre) {

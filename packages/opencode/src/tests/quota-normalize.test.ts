@@ -38,6 +38,15 @@ describe('quota normalize → QuotaSnapshot', () => {
     expect(s.secondary).toBeUndefined()
   })
 
+  it('HTTP headers: blank used-percent is treated as absent, not zero', () => {
+    const h = new Headers({
+      'x-codex-primary-used-percent': '   ',
+      'x-codex-primary-reset-at': '1781729038',
+    })
+    const s = normalizeQuotaHeaders(h)
+    expect(s.primary).toBeUndefined()
+  })
+
   it('WS codex.rate_limits frame (minutes)', () => {
     const s = normalizeWsFrame({
       type: 'codex.rate_limits',
