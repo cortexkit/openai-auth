@@ -98,9 +98,18 @@ const ALLOWED_MODELS = new Set([
   'gpt-5.4',
   'gpt-5.4-mini',
 ])
+// The suffix-less gpt-5.6 model is rejected by the Codex OAuth backend
+// ("not supported when using Codex with a ChatGPT account"); only the
+// -luna/-sol/-terra variants work. Its -fast/-pro synthetics inherit the same
+// api.id ("gpt-5.6"), so filtering on api.id drops them all at once while
+// keeping the working variants (api.id gpt-5.6-luna, etc.).
+const DISALLOWED_MODELS = new Set(['gpt-5.6'])
 const OAUTH_DUMMY_KEY = 'opencode-oauth-dummy-key'
 const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
-const CODEX_VERSION = '0.139.0'
+// gpt-5.6 requires Codex client >= 0.144.0 (older versions 400 with "requires a
+// newer version of Codex"). 0.144.0 also works for gpt-5.4/5.5, so the bump is
+// safe across the whole model range.
+const CODEX_VERSION = '0.144.0'
 const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
 const CODEX_SANDBOX = 'seccomp'
 const MAIN_REFRESH_LOCK_NAME = 'main-refresh'
@@ -518,6 +527,7 @@ export async function CodexAuthPlugin(
           Object.entries(provider.models)
             .filter(([, model]) => {
               if (ALLOWED_MODELS.has(model.api.id)) return true
+              if (DISALLOWED_MODELS.has(model.api.id)) return false
               const match = model.api.id.match(/^gpt-(\d+\.\d+)/)
               const version = match?.[1]
               return version ? parseFloat(version) > 5.4 : false
@@ -535,7 +545,15 @@ export async function CodexAuthPlugin(
                       input: 272_000,
                       output: 128_000,
                     }
-                  : model.limit,
+                  : // gpt-5.6 (luna/sol/terra) real context window is 372k on
+                    // the Codex backend, not the 1.05M models.dev reports.
+                    model.id.includes('gpt-5.6')
+                    ? {
+                        context: 372_000,
+                        input: 244_000,
+                        output: 128_000,
+                      }
+                    : model.limit,
               },
             ]),
         )

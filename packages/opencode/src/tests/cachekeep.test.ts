@@ -581,7 +581,7 @@ describe('buildKeepwarmCapture', () => {
       headers: new Headers({
         'session-id': 'main-session',
         'user-agent': 'codex-test',
-        version: '0.139.0',
+        version: '0.144.0',
         'x-codex-beta-features': 'terminal_resize_reflow',
         'x-codex-turn-metadata': '{"turn_id":"turn-1"}',
         'x-codex-window-id': 'window-1',
@@ -595,7 +595,7 @@ describe('buildKeepwarmCapture', () => {
       replayHeaders: {
         'session-id': 'main-session',
         'user-agent': 'codex-test',
-        version: '0.139.0',
+        version: '0.144.0',
         'x-codex-beta-features': 'terminal_resize_reflow',
         'x-codex-turn-metadata': '{"turn_id":"turn-1"}',
         'x-codex-window-id': 'window-1',
@@ -1348,7 +1348,7 @@ describe('CacheKeepManager tick/prewarm', () => {
       {
         'session-id': 'sess-1',
         'user-agent': 'codex-test',
-        version: '0.139.0',
+        version: '0.144.0',
         'x-codex-beta-features': 'terminal_resize_reflow',
         'x-codex-turn-metadata': '{"turn_id":"turn-1"}',
       },
@@ -1366,7 +1366,7 @@ describe('CacheKeepManager tick/prewarm', () => {
       'content-type': 'application/json',
       'session-id': 'sess-1',
       'user-agent': 'codex-test',
-      version: '0.139.0',
+      version: '0.144.0',
       'x-codex-beta-features': 'terminal_resize_reflow',
       'x-codex-turn-metadata': '{"turn_id":"turn-1"}',
     })
