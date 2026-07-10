@@ -65,7 +65,7 @@
 - Purpose: Generic, provider-agnostic core. Owns the multi-account store, file locks, retry/backoff math, quota cache/refresh orchestration, OAuth flow primitives, cache keep-warm, and atomic-write helpers. The Codex-specific bits (`codexRefreshFn`, `whamUsageFn`, JWT/account-id extraction) are injected via the `provider.ts` seam or live in `oauth.ts` so the layer can stay provider-agnostic.
 - Contains: `accounts.ts`, `atomic-write.ts`, `backoff.ts`, `cachekeep.ts`, `oauth.ts`, `provider.ts`, `quota-manager.ts`, `refresh-all-quota.ts`, `refresh-file-lock.ts`.
 - Key files:
-  - `packages/opencode/src/core/accounts.ts` — `loadAccounts`/`saveAccounts`, `mutateAccounts` (authoritative read-modify-write for structural mutations), `FallbackAccountManager`, account types
+  - `packages/opencode/src/core/accounts.ts` — `loadAccounts`/`mutateAccounts` (authoritative read-modify-write), `saveAccounts` (test seeding only), `saveAccountState` (updates state secrets, gated by config roster), `FallbackAccountManager`, account types
   - `packages/opencode/src/core/quota-manager.ts` — in-memory quota cache + backoff
   - `packages/opencode/src/core/cachekeep.ts` — `CacheKeepManager` (idle prompt-cache warmer)
   - `packages/opencode/src/core/oauth.ts` — PKCE, callback server, device-code flow, JWT parsing
@@ -107,13 +107,13 @@
 
 **Entry Points:**
 - `packages/opencode/src/index.ts` — OpenCode plugin (server hook). The plugin registers as `openai` provider.
-- `packages/opencode/src/cli.ts` — `openai-auth` binary (manages fallback accounts).
+- `packages/opencode/src/cli.ts` — `openai-auth` CLI (manages fallback accounts; executed via `npx @cortexkit/opencode-openai-auth`).
 - `packages/opencode/src/tui.tsx` — TUI sidebar (exported as `./tui`; loaded by OpenCode's TUI).
 - `packages/pi/src/index.ts` — Pi extension entry.
 
 **Configuration:**
 - `packages/opencode/src/config.ts` — settings resolution (env > file > default), `DEFAULT_CODEX_API_ENDPOINT`, env-var constants.
-- `packages/opencode/package.json` — `bin.openai-auth`, `oc-plugin` field declaring `["server", "tui"]`, exports map (`./tui`, `./tui-prefs`).
+- `packages/opencode/package.json` — `bin.openai-auth` entry point, `oc-plugin` field declaring `["server", "tui"]`, exports map (`./tui`, `./tui-prefs`).
 - `packages/opencode/src/tui-preferences.ts` — shared `tui-preferences.jsonc` reader/writer/watcher (used by the TUI sidebar slot config).
 - `biome.json` — formatter/linter config.
 - `lefthook.yml` — pre-commit biome check.
@@ -171,7 +171,7 @@ Example: `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS`, `CORTEXKIT_OPENAI_AUTH_RAW_WS`, `OP
 
 **New `/openai-*` slash command:** add the command name constant in `packages/opencode/src/commands.ts` (`OPENAI_*_COMMAND_NAME`), add it to `MODAL_COMMANDS`, implement `executeXxxCommand`, and wire it into `buildDialogPayload`. The TUI dialog content lives in `packages/opencode/src/tui/command-dialogs.tsx`.
 
-**New storage key (under the existing JSON file):** extend `AccountStorage` in `packages/opencode/src/core/accounts.ts`, bump `version`, write through `saveAccounts` (atomic via `writeJsonAtomic`). Account operations preserve existing transport settings. For structural modifications (removal, reordering), route edits through `mutateAccounts` instead of `saveAccounts` to avoid union-merge resurrection.
+**New storage key (under the existing JSON file):** extend `AccountStorage` in `packages/opencode/src/core/accounts.ts`, bump `version`, and update the config through `mutateAccounts` (atomic read-modify-write). Account operations preserve existing transport settings. Do not use `saveAccounts` (which union-merges the account list and can resurrect concurrently-removed accounts) except for test seeding. Gating of state writes on the config roster is handled automatically by `saveAccountState`.
 
 **New transport (gRPC, etc.):** create a new file under `packages/opencode/src/` mirroring `ws.ts` + `ws-pool.ts`; integrate in `packages/opencode/src/index.ts` `sendWithAccessToken` next to the HTTP/WS branch. Update `packages/opencode/src/raw-ws.ts` only if you need a new runtime-specific client.
 

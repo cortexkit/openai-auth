@@ -25,7 +25,7 @@
 **Accounts and fallback storage:**
 - Purpose: Atomic, multi-account JSON store with file locks, retry/backoff state, killswitch config, routing mode, persisted quota, log level, and dump/cachekeep toggles.
 - Location: `packages/opencode/src/core/accounts.ts`, `packages/opencode/src/core/atomic-write.ts`, `packages/opencode/src/core/refresh-file-lock.ts`
-- Contains: `loadAccounts`/`saveAccounts`/`migrateIfNeeded`, `mutateAccounts` (authoritative read-modify-write for structural modifications under the save lock to prevent concurrent union-merge resurrection), `FallbackAccountManager` (background refresh, `getUsableFallbackAccounts`, `markUsed`), `OAuthAccount`/`ApiKeyAccount` types, single-writer eviction-marker file lock, atomic JSON write (temp + rename, mode `0o600`).
+- Contains: `loadAccounts`/`migrateIfNeeded`, `mutateAccounts` (authoritative read-modify-write for structural mutations and scalar writes to prevent concurrent union-merge resurrection of deleted accounts/secrets), `saveAccounts` (test seeding only), `saveAccountState` (updates state secrets, gated by config roster to prevent resurrection of deleted account secrets), `FallbackAccountManager` (background refresh, `getUsableFallbackAccounts`, `markUsed`), `OAuthAccount`/`ApiKeyAccount` types, single-writer eviction-marker file lock, atomic JSON write (temp + rename, mode `0o600`).
 - Depends on: `core/oauth.ts` (`extractAccountId`), `core/provider.ts` (`ProviderQuotaFn`), `core/backoff.ts`.
 - Used by: Plugin loader, CLI (`cli.ts`), `/openai-account`/`/openai-routing`/`/openai-killswitch` commands, every quota push.
 
@@ -113,7 +113,7 @@
 - Location: `packages/opencode/src/cli.ts`
 - Contains: `login`/`list`/`remove` subcommands, browser or device-code (`--headless`) OAuth flow, self-fallback rejection (refuses to add the main account as a fallback).
 - Depends on: `core/accounts.ts`, `core/oauth.ts`, `util/open-url.ts`.
-- Used by: The published `openai-auth` binary.
+- Used by: The published `openai-auth` CLI (run via `npx @cortexkit/opencode-openai-auth`).
 
 **Pi extension (sibling package):**
 - Purpose: Same Codex OAuth capability for the Pi coding agent (separate OpenAI Codex Responses API surface).
@@ -135,12 +135,12 @@
 
 **Reactive fallback (per request):**
 
-1. Plugin loader `auth.fetch` selects the active primary (main or a fallback via `routing.activeId`) — `packages/opencode/src/index.ts`.
-2. Strips any existing `authorization` header, refreshes an expired main token via `refreshMainWithLease`, or refreshes a fallback via `fallbackManager.refreshAccount`.
-3. When the opt-in killswitch is enabled, verifies the primary account's cached quota against configured thresholds using the non-invalidating policy peeks. If the primary is below threshold, synthesizes a 429 response carrying a `Retry-After` header derived from the earliest known reset time across all accounts.
+1. Plugin loader `auth.fetch` determines the routing mode (purely mode-driven: `main-first` or `fallback-first`). If `fallback-first` mode is active and the request is replayable, it proactively tries usable fallback accounts before the main account.
+2. Strips any existing `authorization` header, refreshes an expired main token via `refreshMainWithLease`, or refreshes a fallback via `fallbackManager.refreshAccount`. Derives the main ChatGPT identity from the access token JWT to ensure correct quota/killswitch tracking after a main-account switch.
+3. If a proactive fallback serves, its response is used. If a proactive fallback request throws a transport error (except for a genuine caller-abort which propagates), the loader logs the failure and falls through to the next candidate (or the main account). Otherwise (or under `main-first` mode), checks if the primary account is blocked by the killswitch (verifying cached quota against configured thresholds). If blocked, it synthesizes a 429 response carrying a `Retry-After` header derived from the earliest known reset time across all accounts.
 4. If the request is not blocked by the killswitch, calls `sendWithAccessToken` which rewrites headers/body via `prepareCodexRequest`, picks HTTP or WS transport, and optionally tracks the body for cachekeep — `packages/opencode/src/index.ts`.
-5. If the primary response status is in the fallback set (`401`/`403`/`429`) or was blocked by the killswitch, AND the request is replayable, `tryFallbackAccounts` iterates `getUsableFallbackAccounts` (killswitch-aware, routing-mode-ordered, filtering out candidates below their killswitch thresholds) and retries each candidate — `packages/opencode/src/index.ts`.
-6. The final response's `x-codex-*` headers are normalized via `normalizeQuotaHeaders` and pushed into `QuotaManager` (main or per-account), then `setSidebarState` writes `sidebar-state.json` for the TUI.
+5. If the primary request fails with a fallback status (`401`/`403`/`429`) or was blocked by the killswitch, and the request is replayable, `tryFallbackAccounts` reactively iterates usable fallback accounts (filtering candidates below their killswitch thresholds) and retries each candidate — `packages/opencode/src/index.ts`. Reactive fallback is skipped if the proactive gate already tried all fallbacks in `fallback-first` mode.
+6. The final response's `x-codex-*` headers are normalized via `normalizeQuotaHeaders` and pushed into `QuotaManager` (main or per-account), then `setSidebarState` writes `sidebar-state.json` for the TUI using the active display ID (the account that actually served).
 
 **Quota push (no extra polling during normal traffic):**
 
@@ -155,7 +155,7 @@
 2. The plugin returns `cleanAbort()` (sentinel throw) so OpenCode does NOT execute any built-in command — `packages/opencode/src/index.ts`.
 3. The plugin pushes an `open-dialog` notification via `pushNotification` (`packages/opencode/src/rpc/notifications.ts`).
 4. TUI's `tui.tsx` polls the loader's loopback RPC (`/rpc/pending-notifications`), receives the dialog, and renders it via `command-dialogs.tsx`.
-5. User clicks Apply → TUI POSTs `/rpc/apply` → loader's `apply` calls `buildDialogPayload`, mutates storage via `saveAccounts`, and returns updated knobs for the TUI to re-render.
+5. User clicks Apply → TUI POSTs `/rpc/apply` → loader's `apply` calls `buildDialogPayload`, mutates storage via `mutateAccounts`, and returns updated knobs for the TUI to re-render.
 
 **Cache keep-warm (idle session):**
 
@@ -210,7 +210,7 @@
 
 **CLI entry:**
 - Location: `packages/opencode/src/cli.ts`
-- Triggers: The `openai-auth` binary (`packages/opencode/package.json` `bin`).
+- Triggers: The `openai-auth` CLI (run via `npx @cortexkit/opencode-openai-auth`).
 - Responsibilities: Manages fallback accounts (`login [--headless]`, `list`, `remove`); rejects adding the main account as a fallback.
 
 **TUI entry:**
@@ -244,10 +244,10 @@
 - **In-memory quota cache:** `QuotaManager` (per-account fingerprint; 5-min refresh-after default; `respectBackoff` gates active polling).
 - **Prompt cache keep-warm:** `CacheKeepManager` tracks per-session last request and replays as `store:false` before the Codex ~5-min eviction window.
 
-**Storage:** Single JSON file per process at `$OPENCODE_CONFIG_DIR/openai-auth.json` (default `~/.config/opencode/openai-auth.json`, overridable via `OPENCODE_OPENAI_AUTH_FILE`). Atomic writes via `writeJsonAtomic` (temp + `rename`, mode `0o600`). File-level locks at `<config>.lock` and `<config>.main-refresh.lock` coordinate cross-process refresh and quota seed. A separate `openai-auth-sessions.json` persists Codex UUIDv7 thread/turn ids for prompt-cache continuity. Sidebar state lives at `tmpdir/opencode-openai-auth/sidebar-state.json` (override `OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE`). Loopback RPC port files live in `$XDG_STATE_HOME/cortexkit/openai-auth/rpc/<sha256(projectDir)>/port-<pid>.json`.
+**Storage:** Config and state are stored in two separate files under `$OPENCODE_CONFIG_DIR`: config at `openai-auth.json` (default `~/.config/opencode/openai-auth.json`, overridable via `OPENCODE_OPENAI_AUTH_FILE`) containing settings and metadata without credentials, and state at `openai-auth-state.json` (overridable via `OPENCODE_OPENAI_AUTH_STATE_FILE`) containing access/refresh tokens and API keys. Atomic writes via `writeJsonAtomic` (temp + `rename`, mode `0o600`). File-level locks at `<config>.lock` and `<config>.main-refresh.lock` coordinate cross-process refresh and quota seed. A separate `openai-auth-sessions.json` persists Codex UUIDv7 thread/turn ids for prompt-cache continuity. Sidebar state lives at `tmpdir/opencode-openai-auth/sidebar-state.json` (override `OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE`). Loopback RPC port files live in `$XDG_STATE_HOME/cortexkit/openai-auth/rpc/<sha256(projectDir)>/port-<pid>.json`.
 
 **Configuration resolution (`config.ts`):** Env wins over config file wins over default. The `webSearch` cache fix is default-on and gated by a NEGATIVE env (`CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH`). Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty. Settings are memoized per process; tests call `resetSettingsForTest`.
 
-**Versioning & build:** `packages/opencode/src/version.ts` exposes `PackageVersion` (currently `0.2.0`); the TUI plugin header reads `package.json` at runtime via `import.meta.url` so the version badge tracks the package version without baking it into the dist. The release pipeline is tag-driven (`.github/workflows` + `scripts/release.sh`); see `README.md` for the exact command surface.
+**Versioning & build:** `packages/opencode/src/version.ts` exposes `PackageVersion` (currently `0.2.1`); the TUI plugin header reads `package.json` at runtime via `import.meta.url` so the version badge tracks the package version without baking it into the dist. The release pipeline is tag-driven (`.github/workflows` + `scripts/release.sh`); see `README.md` for the exact command surface.
 
 **Formatting/linting:** Biome 2.4.16 (single quotes, no semicolons, trailing commas, 2-space indent). Lefthook runs `biome check` on staged files. Tests run via `bun test src/tests`; typecheck via `tsc`.
