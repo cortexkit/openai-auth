@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setLogLevel } from '../logger'
@@ -33,6 +33,7 @@ describe('logger levels', () => {
     log.warn('shown-warn-line')
     await flushForTest()
     const txt = existsSync(logFile) ? readFileSync(logFile, 'utf8') : ''
+    expect(statSync(logFile).mode & 0o777).toBe(0o600)
     expect(txt).not.toContain('hidden-debug-line')
     expect(txt).toContain('shown-warn-line')
     expect(txt).toContain('[quota]')

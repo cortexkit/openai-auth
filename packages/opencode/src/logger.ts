@@ -1,4 +1,10 @@
-import { appendFileSync, existsSync, renameSync, statSync } from 'node:fs'
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  renameSync,
+  statSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -47,7 +53,7 @@ function isSecretKey(key: string): boolean {
   return false
 }
 const TOKEN_VALUE = /\b(Bearer\s+[\w.-]+|sk-[\w-]+|eyJ[\w.-]+)\b/g
-function redact(value: unknown): unknown {
+export function redact(value: unknown): unknown {
   return redactInner(value, new WeakSet<object>())
 }
 function redactInner(value: unknown, seen: WeakSet<object>): unknown {
@@ -75,14 +81,27 @@ function redactInner(value: unknown, seen: WeakSet<object>): unknown {
 let buffer: string[] = []
 let timer: ReturnType<typeof setTimeout> | undefined
 const ROTATE_KEEP = 3
+function chmodPrivate(path: string) {
+  try {
+    chmodSync(path, 0o600)
+  } catch {
+    /* never throw */
+  }
+}
 function rotateIfNeeded() {
   try {
     const f = logFile()
     if (!(existsSync(f) && statSync(f).size > MAX_BYTES)) return
     for (let i = ROTATE_KEEP - 1; i >= 1; i--) {
-      if (existsSync(`${f}.${i}`)) renameSync(`${f}.${i}`, `${f}.${i + 1}`)
+      if (existsSync(`${f}.${i}`)) {
+        const rotated = `${f}.${i + 1}`
+        renameSync(`${f}.${i}`, rotated)
+        chmodPrivate(rotated)
+      }
     }
-    renameSync(f, `${f}.1`)
+    const rotated = `${f}.1`
+    renameSync(f, rotated)
+    chmodPrivate(rotated)
   } catch {
     /* never throw */
   }
@@ -93,7 +112,9 @@ function flush() {
   buffer = []
   try {
     rotateIfNeeded()
-    appendFileSync(logFile(), text)
+    const file = logFile()
+    if (existsSync(file)) chmodPrivate(file)
+    appendFileSync(file, text, { encoding: 'utf8', mode: 0o600 })
   } catch {
     /* never throw */
   }

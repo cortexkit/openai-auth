@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { PluginInput } from '@opencode-ai/plugin'
@@ -9,7 +16,7 @@ import {
   getSettings,
   resetSettingsForTest,
 } from '../config'
-import { resetDumpStateForTest } from '../dump'
+import { dumpCodexRequest, resetDumpStateForTest } from '../dump'
 import { CodexAuthPlugin } from '../index'
 
 describe('request dumps', () => {
@@ -340,6 +347,10 @@ describe('request dumps', () => {
           await readFile(join(dumpDir, requestFile), 'utf8'),
         )
 
+        expect((await stat(dumpDir)).mode & 0o777).toBe(0o700)
+        for (const file of [bodyFile, metaFile, requestFile]) {
+          expect((await stat(join(dumpDir, file))).mode & 0o777).toBe(0o600)
+        }
         expect(body).toContain('"type":"web_search"')
         expect(meta).toMatchObject({
           transport: 'http',
@@ -355,6 +366,56 @@ describe('request dumps', () => {
       } finally {
         globalThis.fetch = originalFetch
       }
+    })
+  })
+
+  test('preserves non-secret JSON dump body bytes', async () => {
+    await withDumpEnv(async (dumpDir) => {
+      const bodyText = '{\n  "model": "gpt-5.5-fast",\n  "input": []\n}\n'
+      await dumpCodexRequest({
+        sessionID: 'ses_dump_fidelity',
+        transport: 'http',
+        phase: 'http',
+        bodyText,
+      })
+
+      const bodyFile = requireFile(await readdir(dumpDir), '.body.json')
+      expect(await readFile(join(dumpDir, bodyFile), 'utf8')).toBe(bodyText)
+    })
+  })
+
+  test('redacts credentials from JSON dump bodies', async () => {
+    await withDumpEnv(async (dumpDir) => {
+      const bearer = 'Bearer dump-body-token'
+      const accountID = 'chatgpt-account-secret'
+      const metadataToken = 'Bearer client-metadata-token'
+      const prompt = 'keep this prompt for cache debugging'
+      await dumpCodexRequest({
+        sessionID: 'ses_dump_redaction',
+        transport: 'http',
+        phase: 'http',
+        bodyText: JSON.stringify({
+          authorization: bearer,
+          chatgptAccountId: accountID,
+          'chatgpt-account-id': accountID,
+          client_metadata: { trace: metadataToken },
+          input: [
+            {
+              role: 'user',
+              content: [{ type: 'input_text', text: prompt }],
+            },
+          ],
+        }),
+      })
+
+      const bodyFile = requireFile(await readdir(dumpDir), '.body.json')
+      const body = await readFile(join(dumpDir, bodyFile), 'utf8')
+
+      expect(body).not.toContain(bearer)
+      expect(body).not.toContain(accountID)
+      expect(body).not.toContain(metadataToken)
+      expect(body).not.toContain('\n')
+      expect(body).toContain(prompt)
     })
   })
 
@@ -458,15 +519,16 @@ function toolRequestBody() {
 }
 
 async function withDumpEnv(run: (dumpDir: string) => Promise<void>) {
-  const dumpDir = await mkdtemp(join(tmpdir(), 'openai-auth-dump-test-'))
+  const rootDir = await mkdtemp(join(tmpdir(), 'openai-auth-dump-test-'))
+  const dumpDir = join(rootDir, 'dumps')
   const originalDump = process.env.CORTEXKIT_OPENAI_AUTH_DUMP
   const originalDumpDir = process.env.OPENCODE_OPENAI_AUTH_DUMP_DIR
   const originalConfigFile = process.env.OPENCODE_OPENAI_AUTH_FILE
   const originalConfigDir = process.env.OPENCODE_CONFIG_DIR
   process.env.CORTEXKIT_OPENAI_AUTH_DUMP = '1'
   process.env.OPENCODE_OPENAI_AUTH_DUMP_DIR = dumpDir
-  process.env.OPENCODE_OPENAI_AUTH_FILE = join(dumpDir, 'missing.json')
-  process.env.OPENCODE_CONFIG_DIR = dumpDir
+  process.env.OPENCODE_OPENAI_AUTH_FILE = join(rootDir, 'missing.json')
+  process.env.OPENCODE_CONFIG_DIR = rootDir
   resetSettingsForTest()
   resetDumpStateForTest()
   try {
@@ -478,7 +540,7 @@ async function withDumpEnv(run: (dumpDir: string) => Promise<void>) {
     restoreEnv('OPENCODE_CONFIG_DIR', originalConfigDir)
     resetSettingsForTest()
     resetDumpStateForTest()
-    await rm(dumpDir, { recursive: true, force: true })
+    await rm(rootDir, { recursive: true, force: true })
   }
 }
 

@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { getSettings } from './config'
-import { createLogger } from './logger'
+import { createLogger, redact } from './logger'
 
 const log = createLogger('dump')
 
@@ -134,6 +134,16 @@ function redactForDump(value: unknown): unknown {
   return redacted
 }
 
+function redactBodyForDump(bodyText: string) {
+  const parsed = parseBody(bodyText)
+  if (parsed === undefined) return bodyText
+
+  const redacted = redact(parsed)
+  const redactedText = JSON.stringify(redacted)
+  if (redactedText === undefined) return bodyText
+  return JSON.stringify(parsed) === redactedText ? bodyText : redactedText
+}
+
 function toolType(tool: unknown) {
   return tool != null &&
     typeof tool === 'object' &&
@@ -212,7 +222,9 @@ export async function dumpCodexRequest(input: {
   const previousBodyText = previousBodies.get(previousKey)
 
   try {
-    await mkdir(settings.dumpDir, { recursive: true })
+    await mkdir(settings.dumpDir, { recursive: true, mode: 0o700 })
+    await chmod(settings.dumpDir, 0o700).catch(() => {})
+    const bodyForDump = redactBodyForDump(input.bodyText)
     const metadata = {
       id,
       createdAt: new Date().toISOString(),
@@ -228,12 +240,11 @@ export async function dumpCodexRequest(input: {
       files,
     }
     await Promise.all([
-      writeFile(files.body, input.bodyText, 'utf8'),
-      writeFile(
-        files.metadata,
-        `${JSON.stringify(metadata, null, 2)}\n`,
-        'utf8',
-      ),
+      writeFile(files.body, bodyForDump, { encoding: 'utf8', mode: 0o600 }),
+      writeFile(files.metadata, `${JSON.stringify(metadata, null, 2)}\n`, {
+        encoding: 'utf8',
+        mode: 0o600,
+      }),
       writeFile(
         files.request,
         `${JSON.stringify(
@@ -245,7 +256,7 @@ export async function dumpCodexRequest(input: {
           null,
           2,
         )}\n`,
-        'utf8',
+        { encoding: 'utf8', mode: 0o600 },
       ),
     ])
     log.debug('dumped request', {
