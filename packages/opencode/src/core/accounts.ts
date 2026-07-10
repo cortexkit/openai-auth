@@ -19,6 +19,7 @@ import type {
   QuotaWindowName,
 } from './provider.ts'
 import { PRIMARY, SECONDARY } from './provider.ts'
+import { quotaWindowResetIsPast } from './quota-manager.ts'
 import { acquireRefreshFileLock } from './refresh-file-lock'
 
 const logR = createLogger('refresh')
@@ -1058,12 +1059,15 @@ function failClosedOnUnknownQuota(storage: AccountStorage | null) {
 export function quotaSnapshotPassesPolicy(
   quota: OAuthQuotaSnapshot | undefined,
   storage: AccountStorage | null,
+  now = Date.now(),
 ) {
   if (!quotaEnabled(storage)) return true
   const thresholds = normalizeThresholds(storage)
   for (const key of ['primary', 'secondary'] as const) {
     const window = quota?.[key]
-    if (!window) return !failClosedOnUnknownQuota(storage)
+    if (!window || quotaWindowResetIsPast(window, now)) {
+      return !failClosedOnUnknownQuota(storage)
+    }
     if (window.remainingPercent < thresholds[key]) return false
   }
   return true
@@ -1107,13 +1111,14 @@ export function killswitchPassesPolicy(
   quota: OAuthQuotaSnapshot | undefined,
   storage: AccountStorage | null,
   accountId?: string,
+  now = Date.now(),
 ) {
   if (!isKillswitchEnabled(storage)) return true
   const thresholds = getKillswitchThresholdsForAccount(storage, accountId)
   let sawUnknownWindow = false
   for (const key of ['primary', 'secondary'] as const) {
     const window = quota?.[key]
-    if (!window) {
+    if (!window || quotaWindowResetIsPast(window, now)) {
       sawUnknownWindow = true
       continue
     }
@@ -1381,7 +1386,7 @@ function canUseCachedQuotaAfterRefreshError(
 ) {
   return (
     isTransientQuotaError(error) &&
-    quotaSnapshotPassesPolicy(account.quota, storage) &&
+    quotaSnapshotPassesPolicy(account.quota, storage, now) &&
     cachedQuotaSnapshotStillRelevant(account.quota, now)
   )
 }
@@ -1606,7 +1611,7 @@ export class FallbackAccountManager {
     account: OAuthAccount,
     storage: AccountStorage | null,
   ) {
-    return quotaSnapshotPassesPolicy(account.quota, storage)
+    return quotaSnapshotPassesPolicy(account.quota, storage, this.now())
   }
 
   /**
@@ -1919,6 +1924,14 @@ export class FallbackAccountManager {
       sourceAccount.lastRefreshError = undefined
       updateStoredAccount(storage, sourceAccount)
       await this.save(storage)
+      const refreshedStorage = await this.load()
+      if (
+        !refreshedStorage?.accounts.some(
+          (candidate) => candidate.id === account.id,
+        )
+      ) {
+        throw new AccountRemovedDuringRefreshError(account.id)
+      }
       logR.debug('fallback oauth refresh succeeded', {
         pid: process.pid,
         accountId: sourceAccount.id,

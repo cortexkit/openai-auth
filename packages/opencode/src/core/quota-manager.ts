@@ -13,6 +13,7 @@ import { createHash } from 'node:crypto'
 
 import type {
   AccountOperationError,
+  AccountQuotaWindow,
   AccountStorage,
   OAuthAccount,
   OAuthQuotaSnapshot,
@@ -40,6 +41,15 @@ function getQuotaCheckIntervalMs(storage: AccountStorage | null) {
 
 function quotaEnabled(storage: AccountStorage | null) {
   return storage?.quota?.enabled !== false
+}
+
+export function quotaWindowResetIsPast(
+  window: AccountQuotaWindow | undefined,
+  now: number,
+): boolean {
+  if (!window?.resetsAt) return false
+  const resetTime = Date.parse(window.resetsAt)
+  return Number.isFinite(resetTime) && resetTime <= now
 }
 
 function normalizeThresholds(storage: AccountStorage | null) {

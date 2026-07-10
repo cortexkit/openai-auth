@@ -460,10 +460,14 @@ describe('integration: killswitch enforcement', () => {
           'content-type': 'text/event-stream',
           'x-codex-primary-used-percent': String(usedPercent),
           'x-codex-primary-window-minutes': '300',
-          'x-codex-primary-reset-at': '1781729038',
+          'x-codex-primary-reset-at': String(
+            Math.floor((Date.now() + 5 * 3600_000) / 1000),
+          ),
           'x-codex-secondary-used-percent': String(usedPercent),
           'x-codex-secondary-window-minutes': '10080',
-          'x-codex-secondary-reset-at': '1781766665',
+          'x-codex-secondary-reset-at': String(
+            Math.floor((Date.now() + 7 * 24 * 3600_000) / 1000),
+          ),
         },
       })
     }) as unknown as typeof globalThis.fetch
@@ -907,6 +911,119 @@ describe('integration: killswitch enforcement', () => {
       expect(third.status).toBe(429)
       await third.body?.cancel()
       expect(seenAuth).toEqual(['Bearer access-A', 'Bearer access-B'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('keeps the newest main identity published when an older refresh finishes late', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        killswitch: { enabled: true, main: { primary: 50, secondary: 50 } },
+      }),
+    )
+
+    const init = (): RequestInit => ({
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.5', input: [], stream: false }),
+    })
+    const quotaResponse = (used: number) =>
+      new Response('{}', {
+        status: 200,
+        headers: {
+          'x-codex-primary-used-percent': String(used),
+          'x-codex-secondary-used-percent': String(used),
+        },
+      })
+
+    const originalFetch = globalThis.fetch
+    let account: 'A' | 'B' = 'A'
+    let signalRefreshStarted: (() => void) | undefined
+    const refreshStarted = new Promise<void>((resolve) => {
+      signalRefreshStarted = resolve
+    })
+    let resolveRefresh: ((response: Response) => void) | undefined
+    const seenAuth: string[] = []
+    globalThis.fetch = (async (url: unknown, request?: unknown) => {
+      if (String(url).includes('/oauth/token')) {
+        signalRefreshStarted?.()
+        return new Promise<Response>((resolve) => {
+          resolveRefresh = resolve
+        })
+      }
+      const authorization = headerValue(request, 'authorization')
+      seenAuth.push(authorization)
+      return quotaResponse(authorization.includes('access-B') ? 95 : 10)
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const authHook = hooks.auth
+      if (!authHook?.loader) throw new Error('No auth loader')
+      const loaderResult = await authHook.loader(
+        async () => ({
+          type: 'oauth' as const,
+          provider: 'openai',
+          access: account === 'A' ? 'access-A' : 'access-B',
+          refresh: refreshToken,
+          expires: account === 'A' ? Date.now() - 1_000 : Date.now() + 3600_000,
+          accountId: account === 'A' ? 'chatgpt-A' : 'chatgpt-B',
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+      )
+      const fetchOverride = (loaderResult as Record<string, unknown>).fetch as (
+        url: string,
+        init?: RequestInit,
+      ) => Promise<Response>
+
+      const firstPromise = fetchOverride(
+        'https://api.openai.com/v1/responses',
+        init(),
+      )
+      await refreshStarted
+
+      account = 'B'
+      const second = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        init(),
+      )
+      expect(second.status).toBe(200)
+      await second.body?.cancel()
+
+      resolveRefresh?.(
+        new Response(
+          JSON.stringify({
+            access_token: 'refreshed-A',
+            refresh_token: 'refreshed-A-refresh',
+            expires_in: 3600,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      )
+      const first = await firstPromise
+      expect(first.status).toBe(200)
+      await first.body?.cancel()
+
+      const third = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        init(),
+      )
+      expect(third.status).toBe(429)
+      await third.body?.cancel()
+      expect(seenAuth).toEqual(['Bearer access-B', 'Bearer refreshed-A'])
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
@@ -2083,9 +2200,9 @@ describe('integration: active fallback routing', () => {
     }
   })
 
-  it('fallback-first falls through to main when a fallback send throws a non-abort error', async () => {
-    // A transport error (not an abort) on the fallback must not fail the whole
-    // request — main still gets a chance to serve.
+  it('fallback-first propagates a transport error without replaying on main', async () => {
+    // The fallback send may already have generated or billed before the
+    // transport error surfaced, so routing must stop instead of replaying.
     seedStorage({ access: 'fallback-access-token' })
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
@@ -2095,11 +2212,10 @@ describe('integration: active fallback routing', () => {
       }
       const auth = headerValue(init, 'authorization')
       seenAuth.push(auth)
-      // The fallback throws a network error; main succeeds.
       if (auth.includes('fallback-access-token')) {
         throw new Error('ECONNRESET')
       }
-      return new Response('{}', { status: 200 })
+      return new Response('main must not be called', { status: 200 })
     }) as unknown as typeof globalThis.fetch
 
     let hooks: Hooks | undefined
@@ -2110,17 +2226,54 @@ describe('integration: active fallback routing', () => {
       )
       hooks = loaded.hooks
 
-      const response = await loaded.fetchOverride(
-        'https://api.openai.com/v1/responses',
-        requestInit(),
+      let caught: unknown
+      try {
+        await loaded.fetchOverride(
+          'https://api.openai.com/v1/responses',
+          requestInit(),
+        )
+      } catch (error) {
+        caught = error
+      }
+      expect(caught).toBeInstanceOf(Error)
+      expect((caught as Error).message).toBe('ECONNRESET')
+      expect(seenAuth).toEqual(['Bearer fallback-access-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('fallback-first propagates caller aborts without trying main', async () => {
+    seedStorage({ access: 'fallback-access-token' })
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+      const auth = headerValue(init, 'authorization')
+      seenAuth.push(auth)
+      throw new DOMException('request aborted', 'AbortError')
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
       )
-      expect(response.status).toBe(200)
-      await response.body?.cancel()
-      // Fallback attempted (threw), then main served.
-      expect(seenAuth).toEqual([
-        'Bearer fallback-access-token',
-        'Bearer main-stale-token',
-      ])
+      hooks = loaded.hooks
+
+      let caught: unknown
+      try {
+        await loaded.fetchOverride(
+          'https://api.openai.com/v1/responses',
+          requestInit(),
+        )
+      } catch (error) {
+        caught = error
+      }
+      expect(caught).toBeInstanceOf(DOMException)
+      expect((caught as DOMException).name).toBe('AbortError')
+      expect(seenAuth).toEqual(['Bearer fallback-access-token'])
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
@@ -2524,6 +2677,69 @@ describe('integration: active fallback routing', () => {
       const quota = sidebar.fallbacks.find((a) => a.id === 'fallback-1')?.quota
       expect(quota?.primary?.usedPercent).toBe(20)
       expect(quota?.secondary?.usedPercent).toBe(95)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('does not preserve a fallback quota window after its reset passed', async () => {
+    seedStorage({ access: 'fallback-access-token' })
+    const originalFetch = globalThis.fetch
+    const pastReset = Math.floor((Date.now() - 60_000) / 1000)
+    let fallbackCalls = 0
+    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+      const auth = headerValue(init, 'authorization')
+      if (auth.includes('fallback-access-token')) {
+        fallbackCalls++
+        return new Response('{}', {
+          status: 429,
+          headers:
+            fallbackCalls === 1
+              ? {
+                  'x-codex-primary-used-percent': '10',
+                  'x-codex-secondary-used-percent': '95',
+                  'x-codex-secondary-reset-at': String(pastReset),
+                }
+              : { 'x-codex-primary-used-percent': '20' },
+        })
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      const first = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(first.status).toBe(200)
+      await first.body?.cancel()
+
+      const second = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(second.status).toBe(200)
+      await second.body?.cancel()
+
+      const sidebar = await waitForSidebarState(sidebarFile, (state) => {
+        const quota = state.fallbacks.find(
+          (account) => account.id === 'fallback-1',
+        )?.quota
+        return quota?.primary?.usedPercent === 20 && !quota.secondary
+      })
+      const quota = sidebar.fallbacks.find(
+        (account) => account.id === 'fallback-1',
+      )?.quota
+      expect(quota?.primary?.usedPercent).toBe(20)
+      expect(quota?.secondary).toBeUndefined()
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()

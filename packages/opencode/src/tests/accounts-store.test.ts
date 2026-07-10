@@ -456,6 +456,89 @@ describe('removed fallback refresh guard', () => {
     expect((await loadAccounts(cfgPath))?.accounts).toEqual([])
   })
 
+  it('rejects and skips an account removed while provider refresh is in flight', async () => {
+    const {
+      AccountRemovedDuringRefreshError,
+      FallbackAccountManager,
+      loadAccounts,
+      mutateAccounts,
+      saveAccounts,
+    } = await import('../core/accounts.ts')
+    const now = 1_700_000_000_000
+    const account = oauthAccount('removed-during-provider-refresh', {
+      access: 'expired-access',
+      refresh: 'refresh-in-flight',
+      expires: now - 1_000,
+    })
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [account],
+        quota: { failClosedOnUnknownQuota: false },
+      },
+      cfgPath,
+    )
+    const snapshot = (await loadAccounts(cfgPath))!
+    let signalRefreshStarted: (() => void) | undefined
+    const refreshStarted = new Promise<void>((resolve) => {
+      signalRefreshStarted = resolve
+    })
+    let resolveRefresh:
+      | ((tokens: {
+          access: string
+          refresh: string
+          expires: number
+          expiresIn: number
+        }) => void)
+      | undefined
+    const manager = new FallbackAccountManager({
+      configPath: cfgPath,
+      now: () => now,
+      refreshFn: async () => {
+        signalRefreshStarted?.()
+        return new Promise((resolve) => {
+          resolveRefresh = resolve
+        })
+      },
+    })
+
+    const selectionPromise = manager.getUsableFallbackAccounts(snapshot)
+    await refreshStarted
+    const directRefreshPromise = manager.refreshAccount(
+      snapshot.accounts[0] as OAuthAccount,
+      snapshot,
+    )
+    await mutateAccounts((current) => {
+      current.accounts = current.accounts.filter(
+        (candidate) => candidate.id !== account.id,
+      )
+      return current
+    }, cfgPath)
+    resolveRefresh?.({
+      access: 'fresh-access',
+      refresh: 'fresh-refresh',
+      expires: now + 3600_000,
+      expiresIn: 3600,
+    })
+
+    const [selectionResult, directRefreshResult] = await Promise.allSettled([
+      selectionPromise,
+      directRefreshPromise,
+    ])
+    expect(selectionResult.status).toBe('fulfilled')
+    expect(
+      selectionResult.status === 'fulfilled' ? selectionResult.value : null,
+    ).toEqual([])
+    expect(directRefreshResult.status).toBe('rejected')
+    expect(
+      directRefreshResult.status === 'rejected'
+        ? directRefreshResult.reason
+        : null,
+    ).toBeInstanceOf(AccountRemovedDuringRefreshError)
+    expect((await loadAccounts(cfgPath))?.accounts).toEqual([])
+  })
+
   it('skips a removed account instead of selecting it through fail-open', async () => {
     const {
       FallbackAccountManager,

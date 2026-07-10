@@ -15,7 +15,9 @@ import {
   type AccountStorage,
   type FallbackAccount,
   FallbackAccountManager,
+  killswitchPassesPolicy,
   type OAuthAccount,
+  quotaSnapshotPassesPolicy,
   saveAccounts,
 } from '../core/accounts.ts'
 import { hashRefreshToken } from '../core/backoff.ts'
@@ -98,6 +100,52 @@ describe('fallback selection', () => {
 
     const usable = await manager.getUsableFallbackAccounts(storage)
     expect(usable.length).toBe(0)
+  })
+
+  it('treats a past-reset low quota window as unknown under fail-open policy', () => {
+    const now = 1_700_000_000_000
+    const storage = makeStorage([])
+    const quota = {
+      primary: {
+        usedPercent: 99,
+        remainingPercent: 1,
+        checkedAt: now - 1_000,
+        resetsAt: new Date(now - 1).toISOString(),
+      },
+      secondary: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        checkedAt: now - 1_000,
+        resetsAt: new Date(now + 60_000).toISOString(),
+      },
+    }
+
+    expect(quotaSnapshotPassesPolicy(quota, storage, now)).toBe(true)
+  })
+
+  it('treats a past-reset low killswitch window as unknown under fail-open policy', () => {
+    const now = 1_700_000_000_000
+    const storage = makeStorage([])
+    storage.killswitch = {
+      enabled: true,
+      main: { primary: 50, secondary: 50 },
+    }
+    const quota = {
+      primary: {
+        usedPercent: 99,
+        remainingPercent: 1,
+        checkedAt: now - 1_000,
+        resetsAt: new Date(now - 1).toISOString(),
+      },
+      secondary: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        checkedAt: now - 1_000,
+        resetsAt: new Date(now + 60_000).toISOString(),
+      },
+    }
+
+    expect(killswitchPassesPolicy(quota, storage, undefined, now)).toBe(true)
   })
 
   it('excludes a fallback whose stable account id matches the main account', async () => {

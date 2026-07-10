@@ -60,7 +60,7 @@ import {
   waitForOAuthCallback,
 } from './core/oauth'
 import { codexRefreshFn, whamUsageFn } from './core/provider'
-import { QuotaManager } from './core/quota-manager'
+import { QuotaManager, quotaWindowResetIsPast } from './core/quota-manager'
 import { refreshAllQuota } from './core/refresh-all-quota'
 import { acquireRefreshFileLock } from './core/refresh-file-lock'
 import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
@@ -702,6 +702,7 @@ export async function CodexAuthPlugin(
           fetchQuotaFn: undefined, // push-only: quota comes from HTTP headers / WS frames
         })
         let currentMainIdentity: string | undefined
+        let mainIdentityGeneration = 0
         const fallbackManager = new FallbackAccountManager({
           refreshFn: (opts) =>
             codexRefreshFn({
@@ -990,10 +991,18 @@ export async function CodexAuthPlugin(
             const previous = quotaManager.getFallback(accountId, accessToken)
             if (previous && previous.refreshAfter > now) {
               const mergedQuota: OAuthQuotaSnapshot = { ...quota }
-              if (!mergedQuota.primary && previous.quota.primary) {
+              if (
+                !mergedQuota.primary &&
+                previous.quota.primary &&
+                !quotaWindowResetIsPast(previous.quota.primary, now)
+              ) {
                 mergedQuota.primary = previous.quota.primary
               }
-              if (!mergedQuota.secondary && previous.quota.secondary) {
+              if (
+                !mergedQuota.secondary &&
+                previous.quota.secondary &&
+                !quotaWindowResetIsPast(previous.quota.secondary, now)
+              ) {
                 mergedQuota.secondary = previous.quota.secondary
               }
               entry = { ...entry, quota: mergedQuota }
@@ -1469,6 +1478,7 @@ export async function CodexAuthPlugin(
               quotaManager.peekFallbackForPolicy(c.quotaAccountId)?.quota,
               fallbackStorage,
               c.quotaAccountId,
+              Date.now(),
             ),
           )
         }
@@ -1521,10 +1531,9 @@ export async function CodexAuthPlugin(
                 candidate.keepwarmAccountKey,
               )
             } catch (error) {
-              // A genuine caller-abort must propagate (the user cancelled the
-              // whole request — do not silently reroute to main). Any other
-              // transport error on a fallback is treated like a failed
-              // candidate: fall through so main still gets a chance to serve.
+              // A caller abort and an indeterminate transport failure both
+              // stop routing: the failed send may already have generated or
+              // billed, so trying another account could duplicate the request.
               if (
                 error instanceof DOMException &&
                 error.name === 'AbortError'
@@ -1534,11 +1543,14 @@ export async function CodexAuthPlugin(
               if ((init?.signal as AbortSignal | undefined | null)?.aborted) {
                 throw error
               }
-              logA.debug('fallback-first candidate threw; trying next/main', {
-                pid: process.pid,
-                accountId: candidate.quotaAccountId,
-              })
-              continue
+              logA.debug(
+                'fallback-first transport failed; request not replayed',
+                {
+                  pid: process.pid,
+                  accountId: candidate.quotaAccountId,
+                },
+              )
+              throw error
             }
             if (!shouldFallbackStatus(response.status, fallbackStorage)) {
               await fallbackManager.markUsed(candidate.fallback)
@@ -1690,6 +1702,7 @@ export async function CodexAuthPlugin(
               refresh?: string
               expires?: number
             } = await getAuth()
+            const myGeneration = ++mainIdentityGeneration
             if (currentAuth.type !== 'oauth') return fetch(requestInput, init)
             let primaryAccess: string = currentAuth.access ?? ''
 
@@ -1760,7 +1773,9 @@ export async function CodexAuthPlugin(
                     parseJwtClaims(primaryAccess) ?? {},
                   )
                 : undefined)
-            currentMainIdentity = mainAccountIdentity
+            if (myGeneration === mainIdentityGeneration) {
+              currentMainIdentity = mainAccountIdentity
+            }
             const mode: RoutingMode = reqStorage?.routing?.mode ?? 'main-first'
 
             // fallback-first (proactive): try usable fallbacks BEFORE main. If one
@@ -1805,6 +1820,7 @@ export async function CodexAuthPlugin(
                   killswitchMainQuota(mainAccountIdentity),
                   reqStorage,
                   undefined,
+                  Date.now(),
                 )
               if (killswitchBlocksMain) {
                 logA.debug('killswitch blocked primary', {
