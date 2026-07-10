@@ -10,7 +10,7 @@
     "dev": "bun scripts/dev.ts",
     "dev:clean": "bun scripts/dev-clean.ts",
     "analyze:cache": "bun scripts/analyze-cache-cliffs.mjs",
-    "test": "cd packages/opencode && bun run test",
+    "test": "cd packages/opencode && bun run test && cd ../pi && bun run test",
     "typecheck": "cd packages/opencode && bun run typecheck && cd ../pi && bun run typecheck",
     "types": "bun run typecheck",
     "format": "biome check --write --unsafe .",

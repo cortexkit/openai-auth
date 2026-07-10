@@ -44,7 +44,7 @@ class PiRawCodexWebSocket extends RawWebSocket {
 let rawWebSocketInstallCount = 0
 let originalWebSocket: unknown
 
-function installRawCodexWebSocket() {
+export function installRawCodexWebSocket() {
   const global = globalThis as unknown as GlobalWebSocketSlot
   if (rawWebSocketInstallCount === 0) {
     originalWebSocket = global.WebSocket
