@@ -580,6 +580,28 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
     expect(await countRefreshLockLeaks(lockPath, name)).toBe(0)
   })
 
+  it('classifies a renamed-away marker (ENOENT/EINVAL/ENOTDIR) as a lost race, not a fatal error', async () => {
+    // A contender that renames our fresh eviction-marker directory away between
+    // our mkdir and owner-file write makes the write fail with a platform-
+    // dependent errno: ENOENT on Linux, EINVAL/ENOTDIR on macOS/APFS. All three
+    // must be treated as a lost race so the acquire retries instead of throwing.
+    const { isLostMarkerRaceError } = await import(
+      '../core/refresh-file-lock.ts'
+    )
+
+    for (const code of ['ENOENT', 'EINVAL', 'ENOTDIR']) {
+      const err = Object.assign(new Error(code), { code })
+      expect(isLostMarkerRaceError(err), code).toBe(true)
+    }
+    // A genuine failure (e.g. permissions, disk full) must NOT be swallowed as a
+    // lost race — the acquire has to surface it.
+    for (const code of ['EACCES', 'EEXIST', 'ENOSPC', undefined]) {
+      const err = Object.assign(new Error(String(code)), code ? { code } : {})
+      expect(isLostMarkerRaceError(err), String(code)).toBe(false)
+    }
+    expect(isLostMarkerRaceError(null)).toBe(false)
+  })
+
   it('refresh file lock stale-marker steal has a single winner across high-volume contention', async () => {
     // 3000 rounds × 16 contenders on a seeded stale lock; every round must
     // elect exactly one winner with zero eviction-marker leaks.

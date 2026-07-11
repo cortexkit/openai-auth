@@ -19,6 +19,15 @@ function getConfigDir() {
   )
 }
 
+// A concurrent contender renaming the freshly-created eviction-marker directory
+// away surfaces the vanished parent differently per platform: ENOENT on Linux,
+// EINVAL or ENOTDIR on macOS/APFS. All three mean the marker is no longer ours
+// to hold — a lost race the caller should retry, not a fatal lock error.
+export function isLostMarkerRaceError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code
+  return code === 'ENOENT' || code === 'EINVAL' || code === 'ENOTDIR'
+}
+
 export function getAccountStoragePath() {
   return (
     process.env.OPENCODE_OPENAI_AUTH_FILE?.trim() ||
@@ -170,7 +179,12 @@ export async function acquireRefreshFileLock(options: {
           { encoding: 'utf8', mode: 0o600, flag: 'wx' },
         )
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+        // A competing contender can rename our just-created marker directory
+        // away between the mkdir above and this write (the stale-marker steal
+        // path below does exactly that). That is a lost race, not a failure, so
+        // report it as such and let the caller back off and retry rather than
+        // failing the whole lock acquisition.
+        if (isLostMarkerRaceError(error)) return false
         await releaseEvictionMarker()
         throw error
       }
