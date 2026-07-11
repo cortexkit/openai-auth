@@ -37,6 +37,8 @@
 │   │   └── bunfig.toml
 │   └── pi/                        # @cortexkit/pi-openai-auth (Pi coding-agent extension)
 │       ├── src/
+│       │   ├── tests/             # Extension tests
+│       │   │   └── index.test.ts
 │       │   ├── index.ts           # Pi extension entry (registers openai-codex provider)
 │       │   └── raw-ws-node.ts     # node:net/node:tls-backed hand-rolled WS client
 │       ├── package.json
@@ -163,7 +165,7 @@ Example: `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS`, `CORTEXKIT_OPENAI_AUTH_RAW_WS`, `OP
 
 **RPC methods:** lowercase, dash-separated (`pending-notifications`, `apply`). JSON-RPC-shaped bodies.
 
-**Model IDs:** GPT-style dotted identifiers that pass `gpt-X.Y`; the allow-list at `packages/opencode/src/index.ts` (`ALLOWED_MODELS`) and the regex `^gpt-(\d+\.\d+)` with `> 5.4` fallback define which models surface to the TUI.
+**Model IDs:** GPT-style dotted identifiers that pass `gpt-X.Y`; the allow-list at `packages/opencode/src/index.ts` (`ALLOWED_MODELS`) and the regex `^gpt-(\d+\.\d+)` with `> 5.4` fallback define which models surface to the TUI (explicitly disallowing the suffix-less `gpt-5.6` and its synthetic fast/pro variants while accepting `-luna`, `-sol`, and `-terra` variants).
 
 ## Where to Add New Code
 
@@ -171,7 +173,7 @@ Example: `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS`, `CORTEXKIT_OPENAI_AUTH_RAW_WS`, `OP
 
 **New `/openai-*` slash command:** add the command name constant in `packages/opencode/src/commands.ts` (`OPENAI_*_COMMAND_NAME`), add it to `MODAL_COMMANDS`, implement `executeXxxCommand`, and wire it into `buildDialogPayload`. The TUI dialog content lives in `packages/opencode/src/tui/command-dialogs.tsx`.
 
-**New storage key (under the existing JSON file):** extend `AccountStorage` in `packages/opencode/src/core/accounts.ts`, bump `version`, and update the config through `mutateAccounts` (atomic read-modify-write). Account operations preserve existing transport settings. Do not use `saveAccounts` (which union-merges the account list and can resurrect concurrently-removed accounts) except for test seeding. Gating of state writes on the config roster is handled automatically by `saveAccountState`.
+**New storage key (under the existing JSON file):** extend `AccountStorage` in `packages/opencode/src/core/accounts.ts`, bump `version`, and update the config through `mutateAccounts` (atomic read-modify-write). Account operations preserve existing transport settings. Do not use `saveAccounts` (which union-merges the account list and can resurrect concurrently-removed accounts) except for test seeding. Gating of state writes on the config roster is handled automatically by `saveAccountState`. Note that `"main"` is a reserved account ID (case-insensitive) and cannot be used as a label for fallback accounts.
 
 **New transport (gRPC, etc.):** create a new file under `packages/opencode/src/` mirroring `ws.ts` + `ws-pool.ts`; integrate in `packages/opencode/src/index.ts` `sendWithAccessToken` next to the HTTP/WS branch. Update `packages/opencode/src/raw-ws.ts` only if you need a new runtime-specific client.
 
