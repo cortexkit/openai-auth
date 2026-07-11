@@ -70,6 +70,7 @@ import {
   translateHostedWebSearchResponse,
 } from './hosted-web-search'
 import { createLogger, setLogLevel } from './logger'
+import { resolvePromptContext } from './prompt-context'
 import { normalizeQuotaHeaders } from './quota-normalize'
 import {
   drainNotifications,
@@ -303,6 +304,12 @@ function updateHttpTurnMetadata(
   if (input) metadata.input = input
 }
 
+// Internal signal header: the `chat.headers` hook sees the outer variant id
+// (e.g. gpt-5.6-sol-pro) and sets this so the fetch layer — which only sees the
+// base slug — knows to inject the reasoning effort onto the wire. Stripped before
+// the request leaves the process.
+const REASONING_EFFORT_HEADER = 'x-codex-reasoning-effort'
+
 function prepareCodexRequest(input: {
   init: RequestInit | undefined
   headers: Headers
@@ -311,6 +318,10 @@ function prepareCodexRequest(input: {
   websocket: boolean
   dumpSessionID?: string
 }): PreparedCodexRequest {
+  // Capture + strip the internal effort signal up front so it never leaks to the
+  // wire, even on the early-return paths below.
+  const effortSignal = input.headers.get(REASONING_EFFORT_HEADER)
+  input.headers.delete(REASONING_EFFORT_HEADER)
   if (!input.metadata) return { init: input.init }
   const body = parseJsonObject(input.init?.body)
   if (!input.websocket) updateHttpTurnMetadata(input.metadata, body)
@@ -358,6 +369,21 @@ function prepareCodexRequest(input: {
   if (!parsed) return { init: input.init }
   parsed.prompt_cache_key = input.metadata.threadID
   parsed.parallel_tool_calls ??= true
+  // OpenCode's `-pro` moniker means max reasoning effort, but the pinned
+  // @ai-sdk/openai validates reasoningEffort against ["none".."xhigh"] and drops
+  // "max", and its `reasoning.mode:"pro"` is never emitted. The Codex OAuth
+  // backend has no reasoning-mode field; its pro tier is reasoning.effort:"max"
+  // (what codex CLI and Pi send). chat.headers flags -pro via an internal header
+  // (captured + stripped up top); inject it onto the wire here.
+  if (effortSignal) {
+    const reasoning =
+      typeof parsed.reasoning === 'object' && parsed.reasoning !== null
+        ? (parsed.reasoning as Record<string, unknown>)
+        : {}
+    delete reasoning.mode
+    reasoning.effort = effortSignal
+    parsed.reasoning = reasoning
+  }
   if (Array.isArray(parsed.tools))
     parsed.tools = parsed.tools.map(normalizeCodexTool)
   removeHostedWebSearchFunctionTool(parsed)
@@ -498,13 +524,19 @@ export async function CodexAuthPlugin(
       | { promptAsync?: (req: unknown) => Promise<unknown> }
       | undefined
     if (typeof session?.promptAsync === 'function') {
-      await session.promptAsync({
-        path: { id: sessionId },
-        body: {
-          noReply: true,
-          parts: [{ type: 'text', text, ignored: true }],
-        },
-      })
+      // OpenCode records this hidden noReply message as a user message. Without
+      // the previous model/variant, its next real prompt inherits the synthetic
+      // default and silently switches the model (e.g. drops -pro). Thread the
+      // last assistant's model/agent/variant so the user's selection is kept.
+      const promptContext = await resolvePromptContext(input.client, sessionId)
+      const body: Record<string, unknown> = {
+        noReply: true,
+        parts: [{ type: 'text', text, ignored: true }],
+      }
+      if (promptContext?.agent) body.agent = promptContext.agent
+      if (promptContext?.model) body.model = promptContext.model
+      if (promptContext?.variant) body.variant = promptContext.variant
+      await session.promptAsync({ path: { id: sessionId }, body })
       return
     }
     // Fallback: log it. The user won't see the dialog if TUI is not running.
@@ -2009,6 +2041,12 @@ export async function CodexAuthPlugin(
       // context can be passed directly instead of smuggled through headers.
       if (websocketFetchInstalled && input.agent === 'title')
         output.headers[OpenAIWebSocketPool.TITLE_HEADER] = 'true'
+      // OpenCode's `-pro` moniker (e.g. gpt-5.6-sol-pro) is a separate model id
+      // whose outer id is only visible here, not at the fetch layer (which sees
+      // the base slug). Flag it so prepareCodexRequest injects reasoning.effort
+      // "max" onto the wire — the Codex OAuth pro tier.
+      if (input.model.id.endsWith('-pro'))
+        output.headers[REASONING_EFFORT_HEADER] = 'max'
     },
     'chat.params': async (input, output) => {
       if (input.model.providerID !== 'openai') return
