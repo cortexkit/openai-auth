@@ -259,9 +259,8 @@ describe('createWebSocketFetch', () => {
         expect((streamError as { isRetryable?: boolean }).isRetryable).toBe(
           true,
         )
-        // The message must contain "rate limit" so OpenCode's native-LLM
-        // runtime (which loses the isRetryable marker and falls back to a
-        // text heuristic in retry.ts) still re-issues the request.
+        // Human-readable rate-limit message (surfaced to the user on the
+        // native runtime, which does not auto-reroute).
         expect(
           (streamError as { message: string }).message.toLowerCase(),
         ).toContain('rate limit')
@@ -273,6 +272,64 @@ describe('createWebSocketFetch', () => {
         // The mark must be set BEFORE the body errors, so it's live when
         // OpenCode re-issues.
         expect(rateLimitCalls[0]?.accountId).toBe('fb-1')
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('does NOT force a retry when output already streamed before a rate-limit failure (no duplicate replay)', async () => {
+    // A rate_limit_reached_type arriving AFTER meaningful output has streamed
+    // must still MARK the account (steer the next turn away) but must NOT error
+    // the body — OpenCode has already persisted the emitted parts, so a retry
+    // would replay text / re-run tools / double-bill. The body must complete
+    // normally; only the mark is set.
+    const rateLimitCalls: Array<{ window: string; accountId?: string }> = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          // First emit real output, THEN fail with a rate limit mid-stream.
+          message(
+            JSON.stringify({
+              type: 'response.output_text.delta',
+              delta: 'partial answer',
+            }),
+          )
+          message(
+            JSON.stringify({
+              type: 'response.failed',
+              response: {
+                id: 'resp_rl_after_output',
+                failed: { rate_limit_reached_type: 'primary' },
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          onRateLimitReached: (window, accountId) => {
+            rateLimitCalls.push({ window, accountId })
+          },
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-rl-after-output',
+              authorization: 'Bearer tok-main',
+              'x-openai-auth-quota-account': 'main',
+            },
+            body: JSON.stringify({ stream: true, input: [] }),
+          },
+        )
+        // Body must NOT reject: reading it to completion resolves.
+        const text = await response.text()
+        expect(text).toContain('partial answer')
+        // The mark is still set so the NEXT turn reroutes off this account.
+        expect(rateLimitCalls).toHaveLength(1)
+        expect(rateLimitCalls[0]?.accountId).toBe('main')
         websocketFetch.close()
       },
     )

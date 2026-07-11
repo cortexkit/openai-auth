@@ -275,6 +275,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           sessionID: dumpSessionID,
           url: options?.url ?? url,
           headers: wsInit?.headers,
+          onRateLimitReached: requestOnRateLimitReached,
         })
       }
       let resolveFirstEvent: (
@@ -534,6 +535,7 @@ async function prewarm(
     sessionID?: string
     url?: string
     headers?: HeadersInit
+    onRateLimitReached?: (window: string) => void
   },
 ) {
   if (!entry.socket || !Array.isArray(body.input) || body.input.length === 0)
@@ -554,6 +556,10 @@ async function prewarm(
     sessionID: options.sessionID,
     idleTimeout,
     signal: options.signal,
+    // A rate-limit response.failed can arrive on the prewarm connection too;
+    // mark the account here so the retry (the prewarm failure surfaces as a
+    // retryable stream error) reroutes off it instead of hitting it again.
+    onRateLimitReached: options.onRateLimitReached,
     onComplete: (event, finalizedCallIds) => {
       void dumpDiagnostic({
         component: 'ws-pool',

@@ -248,7 +248,11 @@ describe('resolveMidStreamRateLimitResetAt', () => {
     ).toBe(now + 300_000)
   })
 
-  it('falls back to the earliest future reset when the named window is absent', async () => {
+  it('uses the bounded default (NOT the other window) when the named window is absent', async () => {
+    // The frame named `primary`, but only `secondary` has a cached reset. We
+    // must NOT borrow secondary's reset — an unrelated window can reset far in
+    // the future and would blackhole the account long past its real rate-limit.
+    // Fall back to the bounded, self-correcting default instead.
     const { resolveMidStreamRateLimitResetAt } = await import(
       '../core/quota-manager.ts'
     )
@@ -256,13 +260,13 @@ describe('resolveMidStreamRateLimitResetAt', () => {
       secondary: {
         usedPercent: 50,
         remainingPercent: 50,
-        resetsAt: new Date(now + 30_000).toISOString(),
+        resetsAt: new Date(now + 3_600_000).toISOString(),
         checkedAt: now,
       },
     }
     expect(
       resolveMidStreamRateLimitResetAt(quota, 'primary', now, defaultMs),
-    ).toBe(now + 30_000)
+    ).toBe(now + defaultMs)
   })
 
   it('falls back to the default when every window is past or absent', async () => {

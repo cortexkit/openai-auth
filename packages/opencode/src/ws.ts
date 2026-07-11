@@ -391,13 +391,16 @@ export function streamResponsesWebSocket(
     // synchronously, so the mark is set when OpenCode re-issues), then error
     // the body; do not enqueue the frame or [DONE].
     //
-    // Dual-runtime robustness: on the stock runtime ResponseStreamError (a
-    // retryable APICallError) is what triggers the re-issue. Under
-    // OPENCODE_EXPERIMENTAL_NATIVE_LLM=1 a response.failed becomes an LLM
-    // provider-error that processor.ts throws as a BARE Error, losing the
-    // isRetryable marker; OpenCode's retry.ts then only re-issues if the
-    // message text matches a rate-limit pattern. So the message intentionally
-    // contains "rate limit reached" to satisfy that heuristic too.
+    // Runtime scope: this drives a same-turn reroute on the STOCK @ai-sdk/openai
+    // runtime, where the errored body rejects fullStream with our retryable
+    // APICallError and OpenCode's outer retry re-issues. It does NOT reroute on
+    // the experimental native runtime (OPENCODE_EXPERIMENTAL_NATIVE_LLM=1): that
+    // transport wraps any body-stream error as a non-retryable
+    // InvalidProviderOutput (llm/route/transport/http.ts) and replaces the
+    // message, so neither the isRetryable marker nor the text below reaches the
+    // retry predicate. On native mode the mark still steers the NEXT turn off
+    // this account; same-turn reroute there needs an upstream fix. The message
+    // stays human-readable regardless.
     if (isRecord(event) && event.type === 'response.failed') {
       const failed = isRecord(event.response)
         ? (event.response as Record<string, unknown>).failed
@@ -406,16 +409,29 @@ export function streamResponsesWebSocket(
         ? (failed as Record<string, unknown>).rate_limit_reached_type
         : undefined
       if (typeof label === 'string') {
-        if (!emitted) options.onFirstEvent?.()
         completed = true
         cleanup()
+        // Always mark the account (route future turns away from it), attributed
+        // to THIS connection via the captured callback.
         options.onRateLimitReached?.(label)
         options.onTerminal?.(event)
-        controller?.error(
-          new ResponseStreamError(
-            `OpenAI account rate limit reached mid-stream (${label})`,
-          ),
-        )
+        if (!emitted) {
+          // Nothing was streamed yet (rate limit at admission, the common
+          // case): force a retryable stream error so OpenCode re-issues and the
+          // fetch override reroutes to a healthy account THIS turn.
+          options.onFirstEvent?.()
+          controller?.error(
+            new ResponseStreamError(
+              `OpenAI account rate limit reached mid-stream (${label})`,
+            ),
+          )
+        } else {
+          // Output/reasoning/tool parts already streamed and OpenCode persisted
+          // them. Retrying would replay the whole turn — duplicate text, re-run
+          // side-effecting tools, and double-bill — so end the turn WITHOUT a
+          // retry. The mark still steers the next turn off this account.
+          closeCompleted()
+        }
         return
       }
     }
