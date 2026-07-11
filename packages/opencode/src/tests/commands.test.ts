@@ -365,6 +365,196 @@ describe('commands', () => {
   })
 
   // -----------------------------------------------------------------------
+  // Clock-hour window: HH-HH / window clear
+  // -----------------------------------------------------------------------
+  test('/openai-cachekeep HH-HH persists window and updates the live gate', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      },
+      configPath,
+    )
+    const setCacheKeepWindow = mock(() => {})
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+      setCacheKeepWindow,
+      cacheKeepManager: {
+        status: () => ({
+          running: true,
+          tracked: 0,
+          generatedAt: 1700000000000,
+          startedAt: 1700000000000,
+          maxIdleWarmMs: 60 * 60 * 1000,
+          maxSubagentIdleMs: 30 * 60 * 1000,
+          ttlMs: 5 * 60 * 1000,
+          leadMs: 5000,
+          targets: [],
+        }),
+      } as unknown as CommandContext['cacheKeepManager'],
+    }
+
+    const payload = await buildDialogPayload('openai-cachekeep', '9-18', ctx)
+    expect(payload.knobs.window).toEqual({ startHour: 9, endHour: 18 })
+    expect(setCacheKeepWindow).toHaveBeenCalledWith({
+      startHour: 9,
+      endHour: 18,
+    })
+    const storage = await loadAccounts(configPath)
+    expect(storage?.cachekeep?.startHour).toBe(9)
+    expect(storage?.cachekeep?.endHour).toBe(18)
+  })
+
+  test('/openai-cachekeep window clear drops startHour/endHour and clears the live gate', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        cachekeep: {
+          enabled: true,
+          subagents: false,
+          startHour: 9,
+          endHour: 18,
+        },
+      },
+      configPath,
+    )
+    const setCacheKeepWindow = mock(() => {})
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+      setCacheKeepWindow,
+      cacheKeepManager: {
+        status: () => ({
+          running: true,
+          tracked: 0,
+          generatedAt: 1700000000000,
+          startedAt: 1700000000000,
+          maxIdleWarmMs: 60 * 60 * 1000,
+          maxSubagentIdleMs: 30 * 60 * 1000,
+          ttlMs: 5 * 60 * 1000,
+          leadMs: 5000,
+          targets: [],
+        }),
+      } as unknown as CommandContext['cacheKeepManager'],
+    }
+
+    const payload = await buildDialogPayload(
+      'openai-cachekeep',
+      'window clear',
+      ctx,
+    )
+    expect(payload.knobs.window).toBeUndefined()
+    expect(setCacheKeepWindow).toHaveBeenCalledWith(undefined)
+    const storage = await loadAccounts(configPath)
+    expect(storage?.cachekeep?.startHour).toBeUndefined()
+    expect(storage?.cachekeep?.endHour).toBeUndefined()
+    // enabled/subagents stay — only the window fields are dropped.
+    expect(storage?.cachekeep?.enabled).toBe(true)
+    expect(storage?.cachekeep?.subagents).toBe(false)
+  })
+
+  test('/openai-cachekeep HH-HH with equal hours reports invalid and persists nothing', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      },
+      configPath,
+    )
+    const setCacheKeepWindow = mock(() => {})
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+      setCacheKeepWindow,
+      cacheKeepManager: {
+        status: () => ({
+          running: true,
+          tracked: 0,
+          generatedAt: 1700000000000,
+          startedAt: 1700000000000,
+          maxIdleWarmMs: 60 * 60 * 1000,
+          maxSubagentIdleMs: 30 * 60 * 1000,
+          ttlMs: 5 * 60 * 1000,
+          leadMs: 5000,
+          targets: [],
+        }),
+      } as unknown as CommandContext['cacheKeepManager'],
+    }
+
+    const payload = await buildDialogPayload('openai-cachekeep', '9-9', ctx)
+    expect(payload.text.toLowerCase()).toContain('invalid')
+    expect(setCacheKeepWindow).not.toHaveBeenCalled()
+    const storage = await loadAccounts(configPath)
+    expect(storage?.cachekeep?.startHour).toBeUndefined()
+    expect(storage?.cachekeep?.endHour).toBeUndefined()
+  })
+
+  test('/openai-cachekeep status includes window knob and text label', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        cachekeep: { enabled: true, startHour: 9, endHour: 18 },
+      },
+      configPath,
+    )
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+      cacheKeepManager: {
+        status: () => ({
+          running: true,
+          tracked: 0,
+          generatedAt: 1700000000000,
+          startedAt: 1700000000000,
+          maxIdleWarmMs: 60 * 60 * 1000,
+          maxSubagentIdleMs: 30 * 60 * 1000,
+          ttlMs: 5 * 60 * 1000,
+          leadMs: 5000,
+          window: { startHour: 9, endHour: 18 },
+          targets: [],
+        }),
+      } as unknown as CommandContext['cacheKeepManager'],
+    }
+    const payload = await buildDialogPayload('openai-cachekeep', '', ctx)
+    expect(payload.knobs.window).toEqual({ startHour: 9, endHour: 18 })
+    expect(payload.text).toContain('Window: **09-18**')
+
+    const noWindow = await buildDialogPayload('openai-cachekeep', '', {
+      ...ctx,
+      cacheKeepManager: {
+        status: () => ({
+          running: false,
+          tracked: 0,
+          generatedAt: 1700000000000,
+          startedAt: null,
+          maxIdleWarmMs: 60 * 60 * 1000,
+          maxSubagentIdleMs: 30 * 60 * 1000,
+          ttlMs: 5 * 60 * 1000,
+          leadMs: 5000,
+          targets: [],
+        }),
+      } as unknown as CommandContext['cacheKeepManager'],
+    })
+    expect(noWindow.knobs.window).toBeUndefined()
+    expect(noWindow.text).toContain('Window: **always (no window)**')
+  })
+
+  // -----------------------------------------------------------------------
   // refreshSidebar is called after remove/order mutations
   // -----------------------------------------------------------------------
   test('refreshSidebar called after remove', async () => {

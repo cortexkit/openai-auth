@@ -1,5 +1,10 @@
-import { describe, expect, test } from 'bun:test'
-import { buildCachekeepDialogOptions } from '../tui/command-dialogs'
+import { describe, expect, mock, test } from 'bun:test'
+import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
+import type { OpenDialogPayload } from '../rpc/protocol.js'
+import {
+  buildCachekeepDialogOptions,
+  openCommandDialog,
+} from '../tui/command-dialogs'
 
 describe('command dialogs', () => {
   test('cachekeep modal shows Turn on when disabled', () => {
@@ -33,5 +38,111 @@ describe('command dialogs', () => {
     expect(options[0]!.title).toContain('last warm 5s ago')
     expect(options.map((option) => option.title)).toContain('Turn off')
     expect(options.map((option) => option.title)).toContain('Refresh status')
+  })
+
+  // The cachekeep dialog is implemented as JSX over the runtime-provided
+  // `TuiPluginApi`. To exercise its onSelect without spinning the real TUI,
+  // intercept the renderer's render fn and the runtime DialogSelect
+  // component factory — both are accessed via the api object at render time,
+  // so a minimal harness can capture the onSelect closure.
+  function makeCachekeepDialogHarness() {
+    let capturedRenderer: (() => unknown) | null = null
+    let capturedOnSelect: ((option: { value: string }) => void) | null = null
+    const clearCount = { value: 0 }
+    const replaceCount = { value: 0 }
+
+    const api = {
+      ui: {
+        dialog: {
+          setSize: () => {},
+          replace: (fn: () => unknown) => {
+            capturedRenderer = fn
+            replaceCount.value += 1
+          },
+          clear: () => {
+            clearCount.value += 1
+          },
+        },
+        toast: () => {},
+        DialogSelect: ((props: {
+          onSelect: (option: { value: string }) => void
+        }) => {
+          capturedOnSelect = props.onSelect
+          return null
+        }) as unknown as TuiPluginApi['ui']['DialogSelect'],
+      },
+    } as unknown as TuiPluginApi
+
+    return {
+      api,
+      renderDialog: () => {
+        capturedRenderer?.()
+      },
+      getOnSelect: () => capturedOnSelect,
+      clearCount,
+      replaceCount,
+    }
+  }
+
+  test('cachekeep dialog "clear_window" applies "window clear" (not the literal option value)', async () => {
+    const { api, renderDialog, getOnSelect } = makeCachekeepDialogHarness()
+    const apply = mock(async () => ({ text: 'window cleared', knobs: {} }))
+
+    const payload: OpenDialogPayload = {
+      command: 'openai-cachekeep',
+      text: '',
+      knobs: {
+        enabled: true,
+        running: true,
+        tracked: 0,
+        window: { startHour: 9, endHour: 18 },
+      },
+    }
+    openCommandDialog(api, payload, apply)
+
+    renderDialog()
+    const onSelect = getOnSelect()
+    expect(onSelect).not.toBeNull()
+
+    onSelect!({ value: 'clear_window' })
+    await Promise.resolve()
+
+    expect(apply).toHaveBeenCalledTimes(1)
+    expect(apply).toHaveBeenCalledWith('openai-cachekeep', 'window clear')
+  })
+
+  test('cachekeep dialog "set_window" does not call apply directly (opens the prompt dialog)', async () => {
+    const { api, renderDialog, getOnSelect, replaceCount } =
+      makeCachekeepDialogHarness()
+    const apply = mock(async () => ({ text: '', knobs: {} }))
+
+    openCommandDialog(
+      api,
+      {
+        command: 'openai-cachekeep',
+        text: '',
+        knobs: {
+          enabled: true,
+          running: true,
+          tracked: 0,
+          window: { startHour: 9, endHour: 18 },
+        },
+      },
+      apply,
+    )
+
+    renderDialog()
+    const onSelect = getOnSelect()
+    expect(onSelect).not.toBeNull()
+
+    const replacesBeforeSelect = replaceCount.value
+    onSelect!({ value: 'set_window' })
+    await Promise.resolve()
+
+    // set_window must NOT call apply directly — it shows a sub-prompt.
+    expect(apply).not.toHaveBeenCalled()
+    // Instead it installs the window-prompt dialog via dialog.replace, so a
+    // further replace must have fired beyond the initial dialog open.
+    expect(replaceCount.value).toBeGreaterThan(replacesBeforeSelect)
   })
 })

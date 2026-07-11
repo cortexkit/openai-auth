@@ -2,10 +2,14 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { AccountStorage } from '../core/accounts'
 import {
   buildKeepwarmBody,
   buildKeepwarmCapture,
   CacheKeepManager,
+  getCacheKeepWindow,
+  isWithinCacheKeepWindow,
+  ttlForModel,
 } from '../core/cachekeep'
 import { CodexAuthPlugin } from '../index'
 
@@ -126,6 +130,70 @@ describe('buildKeepwarmBody', () => {
 })
 
 // ---------------------------------------------------------------------------
+// ttlForModel
+// ---------------------------------------------------------------------------
+describe('ttlForModel', () => {
+  const defaultTtl = 5 * 60 * 1000
+  const longTtl = 30 * 60 * 1000
+
+  test('returns 30min for gpt-5.6-sol body', () => {
+    const body = JSON.stringify({ model: 'gpt-5.6-sol' })
+    expect(ttlForModel(body, defaultTtl)).toBe(longTtl)
+  })
+
+  test('returns 30min for gpt-5.6-luna body', () => {
+    const body = JSON.stringify({ model: 'gpt-5.6-luna' })
+    expect(ttlForModel(body, defaultTtl)).toBe(longTtl)
+  })
+
+  test('returns 30min for gpt-5.6-terra body', () => {
+    const body = JSON.stringify({ model: 'gpt-5.6-terra' })
+    expect(ttlForModel(body, defaultTtl)).toBe(longTtl)
+  })
+
+  test('returns 30min for bare gpt-5.6 id', () => {
+    const body = JSON.stringify({ model: 'gpt-5.6' })
+    expect(ttlForModel(body, defaultTtl)).toBe(longTtl)
+  })
+
+  test('returns default for gpt-5.60 body (substring match would false-positive)', () => {
+    // Hypothetical sibling id whose digits also contain "5.6" must not pick up
+    // the gpt-5.6 cache TTL.
+    const body = JSON.stringify({ model: 'gpt-5.60' })
+    expect(ttlForModel(body, defaultTtl)).toBe(defaultTtl)
+  })
+
+  test('returns default for gpt-5.6x body (substring match would false-positive)', () => {
+    const body = JSON.stringify({ model: 'gpt-5.6x' })
+    expect(ttlForModel(body, defaultTtl)).toBe(defaultTtl)
+  })
+
+  test('returns default for gpt-5.5 body', () => {
+    const body = JSON.stringify({ model: 'gpt-5.5' })
+    expect(ttlForModel(body, defaultTtl)).toBe(defaultTtl)
+  })
+
+  test('returns default for gpt-5.4-mini body', () => {
+    const body = JSON.stringify({ model: 'gpt-5.4-mini' })
+    expect(ttlForModel(body, defaultTtl)).toBe(defaultTtl)
+  })
+
+  test('returns default for malformed JSON', () => {
+    expect(ttlForModel('{not-json', defaultTtl)).toBe(defaultTtl)
+  })
+
+  test('returns default for body missing model field', () => {
+    const body = JSON.stringify({ input: [{ role: 'user', content: 'hi' }] })
+    expect(ttlForModel(body, defaultTtl)).toBe(defaultTtl)
+  })
+
+  test('returns default when model is not a string', () => {
+    const body = JSON.stringify({ model: 42 })
+    expect(ttlForModel(body, defaultTtl)).toBe(defaultTtl)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // CacheKeepManager — track()
 // ---------------------------------------------------------------------------
 describe('CacheKeepManager.track', () => {
@@ -177,6 +245,84 @@ describe('CacheKeepManager.track', () => {
     mgr.track('sess-1', JSON.stringify({ input: 'test' }), 'main')
     const status = mgr.status()
     expect(status.targets[0]!.cacheExpiresAt).toBe(clock.now() + TTL_MS)
+  })
+
+  test('gpt-5.6 body uses 30-min cacheExpiresAt; non-5.6 body keeps 5-min', () => {
+    const longTtl = 30 * 60 * 1000
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: TTL_MS,
+    })
+    mgr.track(
+      'sess-56',
+      JSON.stringify({ input: 'sol', model: 'gpt-5.6-sol' }),
+      'main',
+    )
+    mgr.track(
+      'sess-55',
+      JSON.stringify({ input: 'old', model: 'gpt-5.5' }),
+      'main',
+    )
+    const status = mgr.status()
+    const solTarget = status.targets.find((t) => t.sessionKey === 'sess-56')!
+    const oldTarget = status.targets.find((t) => t.sessionKey === 'sess-55')!
+    expect(solTarget.cacheExpiresAt).toBe(clock.now() + longTtl)
+    expect(oldTarget.cacheExpiresAt).toBe(clock.now() + TTL_MS)
+  })
+
+  test('is56 flag is captured at track(): true for 5.6 body, false for 5.5/5.4/5.60', () => {
+    // The Target exposes is56 for pruneStale's 5.6-subagent bound and the
+    // 2-warm cap. With ttlMs inference this flag would silently misclassify
+    // if the default TTL ever matched GPT_5_6_TTL_MS — the explicit field is
+    // the only contract both code paths trust.
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: TTL_MS,
+    })
+    mgr.track(
+      'sol',
+      JSON.stringify({ input: 'sol', model: 'gpt-5.6-sol' }),
+      'main',
+    )
+    mgr.track(
+      'luna',
+      JSON.stringify({ input: 'l', model: 'gpt-5.6-luna' }),
+      'main',
+    )
+    mgr.track('bare', JSON.stringify({ input: 'b', model: 'gpt-5.6' }), 'main')
+    mgr.track('v55', JSON.stringify({ input: '55', model: 'gpt-5.5' }), 'main')
+    mgr.track(
+      'v54',
+      JSON.stringify({ input: '54', model: 'gpt-5.4-mini' }),
+      'main',
+    )
+    mgr.track(
+      'v560',
+      JSON.stringify({ input: '560', model: 'gpt-5.60' }),
+      'main',
+    )
+    mgr.track('malformed', '{not-json', 'main')
+
+    const targets = (
+      mgr as unknown as { targets: Map<string, { is56: boolean }> }
+    ).targets
+    expect(targets.get('sol')!.is56).toBe(true)
+    expect(targets.get('luna')!.is56).toBe(true)
+    expect(targets.get('bare')!.is56).toBe(true)
+    expect(targets.get('v55')!.is56).toBe(false)
+    expect(targets.get('v54')!.is56).toBe(false)
+    expect(targets.get('v560')!.is56).toBe(false)
+    expect(targets.get('malformed')!.is56).toBe(false)
   })
 
   test('replace-on-retrack: freshest body wins', async () => {
@@ -1253,6 +1399,248 @@ describe('CacheKeepManager tick/prewarm', () => {
     expect(status.targets[0]!.lastWarmedAt).toBe(clock.now())
   })
 
+  test('gpt-5.6 session: post-warm reset uses per-target 30-min TTL (not 5-min)', async () => {
+    const longTtl = 30 * 60 * 1000
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: TTL_MS, // constructor default
+      leadMs: LEAD_MS,
+    })
+    mgr.track(
+      'sess-56',
+      JSON.stringify({ input: 'sol', model: 'gpt-5.6-sol' }),
+      'main',
+    )
+
+    // Sanity: initial expiry is now + 30 min, not now + 5 min
+    const initialExpiry = mgr.status().targets[0]!.cacheExpiresAt
+    expect(initialExpiry).toBe(clock.now() + longTtl)
+
+    // Advance into the 30-min LEAD window
+    clock.advance(longTtl - LEAD_MS + 1000)
+    await mgr.tick()
+
+    // Warm should have fired
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    // Post-warm reset uses the per-target 30-min TTL, not the 5-min constructor default
+    expect(mgr.status().targets[0]!.cacheExpiresAt).toBe(clock.now() + longTtl)
+  })
+
+  // ---- Piece B: gpt-5.6 subagent 2-warm cap -------------------------
+
+  test('gpt-5.6 subagent warms exactly twice then is dropped from the map', async () => {
+    const longTtl = 30 * 60 * 1000
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: longTtl,
+      leadMs: LEAD_MS,
+      maxSubagentIdleMs: 60 * 60 * 1000, // large so the idle prune doesn't fire first
+    })
+    mgr.track(
+      'sub-56',
+      JSON.stringify({ input: 'subagent-turn', model: 'gpt-5.6-sol' }),
+      'main',
+      undefined,
+      {},
+      true, // isSubagent
+    )
+
+    // Lead window 1 → warm #1
+    clock.advance(longTtl - LEAD_MS + 1000)
+    await mgr.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(mgr.status().tracked).toBe(1)
+
+    // Lead window 2 → warm #2 → drop
+    clock.advance(longTtl - LEAD_MS + 1000)
+    await mgr.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(mgr.status().tracked).toBe(0)
+
+    // Lead window 3 → target is gone, no further fire
+    clock.advance(longTtl - LEAD_MS + 1000)
+    await mgr.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+  })
+
+  test('gpt-5.6 subagent is NOT idle-pruned before its 2 warms (cap governs)', async () => {
+    const longTtl = 30 * 60 * 1000
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: longTtl,
+      leadMs: LEAD_MS,
+      maxSubagentIdleMs: 30 * 60 * 1000, // same as TTL — would prune pre-change
+    })
+    mgr.track(
+      'sub-56',
+      JSON.stringify({ input: 'subagent-turn', model: 'gpt-5.6-sol' }),
+      'main',
+      undefined,
+      {},
+      true,
+    )
+
+    // Advance past maxSubagentIdleMs (30 min) — pre-change the idle prune would
+    // kill the target here, before it can warm even once. Post-change the
+    // 2-warm cap governs instead, so the target survives and gets its first warm.
+    clock.advance(31 * 60 * 1000)
+    await mgr.tick()
+
+    expect(mgr.status().tracked).toBe(1)
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+
+  test('gpt-5.6 subagent stuck on persistently failing warms is reclaimed at the long idle bound (no leak)', async () => {
+    // With every warm returning non-2xx, warmCount never reaches the 2-warm cap
+    // so the cap can't reclaim this target. The pre-fix pruneStale had an
+    // unconditional skip for 5.6 subagents — the target would live forever
+    // and retry on a dead session every tick. Post-fix it is reclaimed at a
+    // longer idle bound (~75 min) that still allows both warms on the happy
+    // path (which completes at ~58 min) but eventually reclaims a stuck one.
+    const longTtl = 30 * 60 * 1000
+    fetchImpl = mock(
+      async () => new Response('fail', { status: 500 }),
+    ) as unknown as typeof fetch
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: longTtl,
+      leadMs: LEAD_MS,
+      maxSubagentIdleMs: 30 * 60 * 1000,
+    })
+    mgr.track(
+      'sub-56-stuck',
+      JSON.stringify({ input: 'subagent-turn', model: 'gpt-5.6-sol' }),
+      'main',
+      undefined,
+      {},
+      true,
+    )
+
+    // Advance past the long 5.6 subagent idle bound (2 * 30min TTL + 15min ≈ 75min).
+    clock.advance(76 * 60 * 1000)
+    // Track another session so pruneStale runs (called inside track()).
+    mgr.track('trigger', JSON.stringify({ input: 'trigger' }), 'main')
+
+    expect(mgr.status().tracked).toBe(1)
+    expect(mgr.status().targets[0]!.sessionKey).toBe('trigger')
+  })
+
+  test('non-5.6 subagent is still idle-pruned at maxSubagentIdleMs (unchanged)', async () => {
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: TTL_MS,
+      leadMs: LEAD_MS,
+      maxSubagentIdleMs: 30 * 60 * 1000,
+    })
+    mgr.track(
+      'sub-55',
+      JSON.stringify({ input: 'subagent-turn', model: 'gpt-5.5' }),
+      'main',
+      undefined,
+      {},
+      true,
+    )
+
+    clock.advance(31 * 60 * 1000) // past 30-min subagent cap
+    // Track another session so pruneStale runs (it's called inside track())
+    mgr.track('other', JSON.stringify({ input: 'other' }), 'main')
+
+    // Sub-55 should be pruned; only the 'other' target remains
+    expect(mgr.status().tracked).toBe(1)
+    expect(mgr.status().targets[0]!.sessionKey).toBe('other')
+  })
+
+  test('gpt-5.6 main target is unchanged (not dropped after 2 warms)', async () => {
+    const longTtl = 30 * 60 * 1000
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: longTtl,
+      leadMs: LEAD_MS,
+      maxIdleWarmMs: 60 * 60 * 1000,
+    })
+    mgr.track(
+      'main-56',
+      JSON.stringify({ input: 'main-turn', model: 'gpt-5.6-sol' }),
+      'main',
+    )
+
+    // 2 lead windows → 2 warms
+    clock.advance(longTtl - LEAD_MS + 1000)
+    await mgr.tick()
+    clock.advance(longTtl - LEAD_MS + 1000)
+    await mgr.tick()
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    // Main target survives the 2-warm cap (cap applies to subagents only)
+    expect(mgr.status().tracked).toBe(1)
+    expect(mgr.status().targets[0]!.sessionKey).toBe('main-56')
+  })
+
+  test('warmCount resets when track() re-captures the same subagent session', async () => {
+    const longTtl = 30 * 60 * 1000
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: longTtl,
+      leadMs: LEAD_MS,
+      maxSubagentIdleMs: 60 * 60 * 1000,
+    })
+    const body = JSON.stringify({
+      input: 'subagent-turn',
+      model: 'gpt-5.6-sol',
+    })
+    mgr.track('sub-56', body, 'main', undefined, {}, true)
+
+    // First warm
+    clock.advance(longTtl - LEAD_MS + 1000)
+    await mgr.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+
+    // Re-capture the same session — warmCount resets to 0, fresh lifecycle
+    mgr.track('sub-56', body, 'main', undefined, {}, true)
+
+    // Next warm
+    clock.advance(longTtl - LEAD_MS + 1000)
+    await mgr.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    // warmCount is now 1 (after reset, after 1 more warm) — NOT dropped
+    expect(mgr.status().tracked).toBe(1)
+  })
+
   test('logs cost from mock usage', async () => {
     const mgr = new CacheKeepManager({
       fetchImpl,
@@ -2181,5 +2569,301 @@ describe('Header stripping', () => {
     } finally {
       globalThis.fetch = originalFetch
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// CacheKeepWindow helpers
+// ---------------------------------------------------------------------------
+
+function windowStorage(cachekeep: AccountStorage['cachekeep']): AccountStorage {
+  // Only the cachekeep field is exercised by getCacheKeepWindow; everything
+  // else is filler so the type narrows correctly.
+  return {
+    version: 1,
+    main: { type: 'opencode', provider: 'openai' },
+    accounts: [],
+    cachekeep,
+  }
+}
+
+describe('getCacheKeepWindow', () => {
+  test('returns undefined for null storage', () => {
+    expect(getCacheKeepWindow(null)).toBeUndefined()
+  })
+
+  test('returns undefined when storage has no cachekeep block', () => {
+    expect(getCacheKeepWindow(windowStorage(undefined))).toBeUndefined()
+  })
+
+  test('returns the parsed window for a valid same-day pair', () => {
+    expect(
+      getCacheKeepWindow(windowStorage({ startHour: 9, endHour: 18 })),
+    ).toEqual({ startHour: 9, endHour: 18 })
+  })
+
+  test('returns the parsed window for a valid overnight wrap pair', () => {
+    expect(
+      getCacheKeepWindow(windowStorage({ startHour: 22, endHour: 6 })),
+    ).toEqual({ startHour: 22, endHour: 6 })
+  })
+
+  test('returns undefined when start and end are equal', () => {
+    expect(
+      getCacheKeepWindow(windowStorage({ startHour: 9, endHour: 9 })),
+    ).toBeUndefined()
+    expect(
+      getCacheKeepWindow(windowStorage({ startHour: 0, endHour: 0 })),
+    ).toBeUndefined()
+  })
+
+  test('returns undefined when hours are out of 0-23 range', () => {
+    expect(
+      getCacheKeepWindow(windowStorage({ startHour: -1, endHour: 9 })),
+    ).toBeUndefined()
+    expect(
+      getCacheKeepWindow(windowStorage({ startHour: 24, endHour: 9 })),
+    ).toBeUndefined()
+    expect(
+      getCacheKeepWindow(windowStorage({ startHour: 9, endHour: 24 })),
+    ).toBeUndefined()
+  })
+
+  test('returns undefined when hours are non-integer', () => {
+    // Number(9.5) = 9.5 — Number.isInteger rejects it.
+    expect(
+      getCacheKeepWindow(windowStorage({ startHour: 9.5, endHour: 18 })),
+    ).toBeUndefined()
+    // NaN propagates through Number() — Number.isInteger(NaN) is false.
+    expect(
+      getCacheKeepWindow(windowStorage({ startHour: NaN, endHour: 18 })),
+    ).toBeUndefined()
+  })
+
+  test('returns undefined when either hour is missing', () => {
+    expect(getCacheKeepWindow(windowStorage({ startHour: 9 }))).toBeUndefined()
+    expect(getCacheKeepWindow(windowStorage({ endHour: 18 }))).toBeUndefined()
+  })
+})
+
+describe('isWithinCacheKeepWindow', () => {
+  // Build a Date in local time so getHours() is stable across TZ tests.
+  const at = (h: number) => {
+    const d = new Date(2024, 5, 15, h, 0, 0, 0) // 2024-06-15 HH:00:00 local
+    return d
+  }
+
+  test('returns false for undefined window', () => {
+    expect(isWithinCacheKeepWindow(undefined, at(3))).toBe(false)
+  })
+
+  test('same-day window (9-18): inside hours', () => {
+    const win = { startHour: 9, endHour: 18 }
+    expect(isWithinCacheKeepWindow(win, at(9))).toBe(true)
+    expect(isWithinCacheKeepWindow(win, at(12))).toBe(true)
+    expect(isWithinCacheKeepWindow(win, at(17))).toBe(true)
+  })
+
+  test('same-day window (9-18): outside hours', () => {
+    const win = { startHour: 9, endHour: 18 }
+    expect(isWithinCacheKeepWindow(win, at(8))).toBe(false)
+    expect(isWithinCacheKeepWindow(win, at(18))).toBe(false)
+    expect(isWithinCacheKeepWindow(win, at(23))).toBe(false)
+  })
+
+  test('overnight wrap (22-6): inside hours', () => {
+    const win = { startHour: 22, endHour: 6 }
+    expect(isWithinCacheKeepWindow(win, at(23))).toBe(true)
+    expect(isWithinCacheKeepWindow(win, at(0))).toBe(true)
+    expect(isWithinCacheKeepWindow(win, at(5))).toBe(true)
+  })
+
+  test('overnight wrap (22-6): outside hours', () => {
+    const win = { startHour: 22, endHour: 6 }
+    expect(isWithinCacheKeepWindow(win, at(12))).toBe(false)
+    expect(isWithinCacheKeepWindow(win, at(9))).toBe(false)
+    expect(isWithinCacheKeepWindow(win, at(6))).toBe(false)
+    expect(isWithinCacheKeepWindow(win, at(21))).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// CacheKeepManager window gating
+// ---------------------------------------------------------------------------
+
+describe('CacheKeepManager window gating', () => {
+  let log: ReturnType<typeof fakeLogger>
+  let getMainToken: ReturnType<typeof mock>
+  let refreshFallback: ReturnType<typeof mock>
+  let fetchImpl: typeof fetch
+  let clock: ReturnType<typeof fakeNow>
+
+  beforeEach(() => {
+    log = fakeLogger()
+    getMainToken = mock(async () => 'main-token')
+    refreshFallback = mock(async () => 'fallback-token')
+    fetchImpl = mock(async () => new Response('{}')) as unknown as typeof fetch
+    clock = fakeNow()
+  })
+
+  // Pick a window that is guaranteed to exclude `now`'s local hour regardless
+  // of CI timezone — it sits 6 hours ahead of the current hour and never wraps
+  // back to include it.
+  const excludedWindowFor = (now: Date) => {
+    const currentHour = now.getHours()
+    const nextHour = (currentHour + 1) % 24
+    const endHour = (nextHour + 5) % 24
+    // (nextHour + 5) % 24 cannot equal nextHour (5 mod 24 != 0), so the
+    // validator accepts it; it covers exactly the 5 hours after `nextHour`.
+    return { startHour: nextHour, endHour }
+  }
+
+  // A single-hour window that always covers `now`'s local hour.
+  const includedWindowFor = (now: Date) => {
+    const currentHour = now.getHours()
+    const nextHour = (currentHour + 1) % 24
+    return { startHour: currentHour, endHour: nextHour }
+  }
+
+  // Use the manager's own injected `now()` so the window math agrees with what
+  // the Manager sees — fakeNow's timestamp may map to a different local hour
+  // than the real wall clock.
+  const managerNow = () => new Date(clock.now())
+
+  test('without getWindow: behavior is identical to the pre-window manager (unchanged legacy path)', async () => {
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: TTL_MS,
+      leadMs: LEAD_MS,
+      // no getWindow — must behave exactly like today.
+    })
+    mgr.track(
+      'legacy-sess',
+      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
+      'main',
+    )
+    expect(mgr.status().tracked).toBe(1)
+    expect(mgr.status().window).toBeUndefined()
+
+    clock.advance(TTL_MS - LEAD_MS + 1000)
+    await mgr.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+
+  test('with excluded getWindow: track() captures nothing and tick() does not fire', async () => {
+    const window = excludedWindowFor(managerNow())
+    expect(isWithinCacheKeepWindow(window, managerNow())).toBe(false)
+
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: TTL_MS,
+      leadMs: LEAD_MS,
+      getWindow: () => window,
+    })
+    mgr.track(
+      'sess-1',
+      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
+      'main',
+    )
+    expect(mgr.status().tracked).toBe(0)
+    expect(mgr.status().window).toEqual(window)
+
+    clock.advance(TTL_MS - LEAD_MS + 1000)
+    await mgr.tick()
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  test('with included getWindow: track() captures and tick() fires normally', async () => {
+    const window = includedWindowFor(managerNow())
+    expect(isWithinCacheKeepWindow(window, managerNow())).toBe(true)
+
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: TTL_MS,
+      leadMs: LEAD_MS,
+      getWindow: () => window,
+    })
+    mgr.track(
+      'sess-1',
+      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
+      'main',
+    )
+    expect(mgr.status().tracked).toBe(1)
+    expect(mgr.status().window).toEqual(window)
+
+    clock.advance(TTL_MS - LEAD_MS + 1000)
+    await mgr.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+
+  test('tick() before any capture with excluded window: no targets created, fetch not called', async () => {
+    const window = excludedWindowFor(managerNow())
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: TTL_MS,
+      leadMs: LEAD_MS,
+      getWindow: () => window,
+    })
+    await mgr.tick()
+    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(mgr.status().tracked).toBe(0)
+  })
+
+  test('changing getWindow at runtime affects only subsequent track/tick calls (existing targets survive outside-window)', async () => {
+    const included = includedWindowFor(managerNow())
+    const excluded = excludedWindowFor(managerNow())
+    let currentWindow = included
+
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: TTL_MS,
+      leadMs: LEAD_MS,
+      getWindow: () => currentWindow,
+    })
+    mgr.track(
+      'sess-1',
+      JSON.stringify({ input: 'in', model: 'gpt-5.5' }),
+      'main',
+    )
+    expect(mgr.status().tracked).toBe(1)
+
+    // Flip to excluded — existing target stays in the map, but tick() must
+    // skip the fire loop until we flip back.
+    currentWindow = excluded
+    clock.advance(TTL_MS - LEAD_MS + 1000)
+    await mgr.tick()
+    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(mgr.status().tracked).toBe(1)
+
+    // Flip back to included and tick again — prewarm fires.
+    currentWindow = included
+    clock.advance(1000)
+    await mgr.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
   })
 })

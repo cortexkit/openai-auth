@@ -20,6 +20,12 @@ export function buildCachekeepDialogOptions(payload: OpenDialogPayload) {
   const maxSubagentIdleMs = Number(
     payload.knobs.maxSubagentIdleMs ?? 30 * 60 * 1000,
   )
+  const windowKnob = payload.knobs.window as
+    | { startHour: number; endHour: number }
+    | undefined
+  const windowLabel = windowKnob
+    ? `${String(windowKnob.startHour).padStart(2, '0')}-${String(windowKnob.endHour).padStart(2, '0')}`
+    : 'always'
   const lastWarm = lastWarmAt
     ? `${Math.ceil((generatedAt - lastWarmAt) / 1000)}s ago`
     : 'none yet'
@@ -30,6 +36,7 @@ export function buildCachekeepDialogOptions(payload: OpenDialogPayload) {
     `timer ${running ? 'armed' : 'idle'}`,
     `${tracked} tracked`,
     `last warm ${lastWarm}`,
+    `window ${windowLabel}`,
     `${idleWindow}m idle cap`,
     `subagent idle ${subIdleWindow}m`,
   ].filter((part) => part.length > 0)
@@ -55,6 +62,20 @@ export function buildCachekeepDialogOptions(payload: OpenDialogPayload) {
         : `Skip subagent sessions. Enable to warm them too (${subIdleWindow}m idle cap).`,
     },
     {
+      title: windowKnob ? `Warm window: ${windowLabel}` : 'Set warm window…',
+      value: 'set_window',
+      description: windowKnob
+        ? `Currently only warming between ${windowLabel} local hours — pick to change`
+        : 'Restrict capture + warm to a clock-hour window, e.g. 9-18 or 22-6',
+    },
+    {
+      title: 'Clear warm window',
+      value: 'clear_window',
+      description: windowKnob
+        ? 'Remove the clock-hour restriction — return to always-warm (within idle caps)'
+        : 'No clock-hour window is currently set',
+    },
+    {
       title: 'Refresh status',
       value: 'refresh',
       description: 'Re-read cachekeep status',
@@ -73,6 +94,44 @@ function showText(api: TuiPluginApi, text: string) {
     <box flexDirection='column' padding={1} width='100%'>
       <text>{text}</text>
     </box>
+  ))
+}
+
+function showSetCachekeepWindowPrompt(
+  api: TuiPluginApi,
+  apply: ApplyFn,
+  state: OpenDialogPayload,
+  render: (state: OpenDialogPayload) => void,
+) {
+  const DialogPrompt = api.ui.DialogPrompt
+  const knobWindow = state.knobs.window as
+    | { startHour: number; endHour: number }
+    | undefined
+  const seed = knobWindow ? `${knobWindow.startHour}-${knobWindow.endHour}` : ''
+  api.ui.dialog.setSize('xlarge')
+  api.ui.dialog.replace(() => (
+    <DialogPrompt
+      title='Cachekeep warm window'
+      description={() => <text>{state.text}</text>}
+      placeholder='HH-HH (e.g. 9-18 or 22-6)'
+      value={seed}
+      onConfirm={(value: string) => {
+        const trimmed = value.trim()
+        if (!trimmed) {
+          render(state)
+          return
+        }
+        void apply('openai-cachekeep', trimmed).then((r) => {
+          api.ui.toast({ message: r.text })
+          render({
+            command: 'openai-cachekeep',
+            text: r.text,
+            knobs: r.knobs,
+          })
+        })
+      }}
+      onCancel={() => render(state)}
+    />
   ))
 }
 
@@ -248,6 +307,24 @@ export function openCommandDialog(
           onSelect={(option) => {
             if (option.value === 'close') {
               api.ui.dialog.clear()
+              return
+            }
+            if (option.value === 'set_window') {
+              showSetCachekeepWindowPrompt(api, apply, state, render)
+              return
+            }
+            if (option.value === 'clear_window') {
+              // The option label is `clear_window`, but executeCachekeepCommand
+              // matches on `window clear` — forward the canonical form or the
+              // command falls through to the usage-text branch and the window
+              // is never cleared.
+              void apply('openai-cachekeep', 'window clear').then((r) => {
+                render({
+                  command: 'openai-cachekeep',
+                  text: r.text,
+                  knobs: r.knobs,
+                })
+              })
               return
             }
             const args =
