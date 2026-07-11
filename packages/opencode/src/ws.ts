@@ -105,7 +105,7 @@ export interface StreamResponsesWebSocketOptions {
   onAbort?: (error: Error) => void
   /** Push per-turn quota from a codex.rate_limits in-band frame. */
   onQuota?: (s: Record<string, unknown>) => void
-  /** Display+classify only: called when response.failed carries a rate_limit_reached_type. */
+  /** Called when response.failed carries a rate_limit_reached_type — the only mid-stream quota-exhaustion signal on this transport. */
   onRateLimitReached?: (window: string) => void
 }
 
@@ -426,9 +426,10 @@ export function streamResponsesWebSocket(
       translatedEvent.type === 'error'
     ) {
       completed = true
-      // Extract rate_limit_reached_type from response.failed events for
-      // display/classification only; do not trigger mid-stream fallback
-      // (that decision is locked).
+      // Mid-stream quota exhaustion arrives in-band here (ws.ts already
+      // returned status:200 at socket upgrade, before generation ran), so
+      // this is the only signal the pool has for it. SSE/HTTP has no
+      // equivalent mid-stream hook — the body passes through untouched there.
       if (translatedEvent.type === 'response.failed') {
         const rateLimitType = isRecord(translatedEvent.response)
           ? (translatedEvent.response as Record<string, unknown>)?.failed

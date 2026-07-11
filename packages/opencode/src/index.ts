@@ -8,6 +8,7 @@ import {
 import os from 'node:os'
 import { join } from 'node:path'
 import type { Hooks, Plugin, PluginInput } from '@opencode-ai/plugin'
+
 import {
   buildDialogPayload,
   type CommandContext,
@@ -60,7 +61,11 @@ import {
   waitForOAuthCallback,
 } from './core/oauth'
 import { codexRefreshFn, whamUsageFn } from './core/provider'
-import { QuotaManager, quotaWindowResetIsPast } from './core/quota-manager'
+import {
+  QuotaManager,
+  quotaWindowResetIsPast,
+  resolveMidStreamRateLimitResetAt,
+} from './core/quota-manager'
 import { refreshAllQuota } from './core/refresh-all-quota'
 import { acquireRefreshFileLock } from './core/refresh-file-lock'
 import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
@@ -120,6 +125,10 @@ const CONCURRENT_MAIN_REFRESH_WAIT_MS = 4_000
 const CONCURRENT_MAIN_REFRESH_POLL_BASE_MS = 50
 const AUTH_SET_MAX_ATTEMPTS = 3
 const AUTH_SET_RETRY_BASE_MS = 25
+// Fallback reset window for a mid-stream rate-limit mark when no cached quota
+// snapshot resolves a real reset time. Conservative and short: if the account
+// is still exhausted next turn, the next response.failed frame re-marks it.
+const DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS = 60_000
 
 const HANDLED_SENTINEL = '__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__'
 
@@ -1039,6 +1048,26 @@ export async function CodexAuthPlugin(
           await writeSidebarState(quotaManager, latestStorage)
         }
 
+        // Resolve when a mid-stream-exhausted account's window actually resets,
+        // from its own last-known cached quota. The resolution logic itself
+        // lives in quota-manager.ts (single source of truth, unit-tested
+        // there) — this wrapper only supplies the account's cached snapshot.
+        function midStreamRateLimitResetAt(
+          accountKey: string,
+          window: string,
+        ): number {
+          const quota =
+            accountKey === 'main'
+              ? quotaManager.peekMainForPolicy()?.quota
+              : quotaManager.peekFallbackForPolicy(accountKey)?.quota
+          return resolveMidStreamRateLimitResetAt(
+            quota,
+            window,
+            Date.now(),
+            DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS,
+          )
+        }
+
         const websocketFetch = options.experimentalWebSockets
           ? OpenAIWebSocketPool.createWebSocketFetch({
               httpFetch: fetch,
@@ -1054,6 +1083,32 @@ export async function CodexAuthPlugin(
                   accountId,
                   isMainBucket ? servedChatgptAccountId : undefined,
                 )
+              },
+              // Mid-stream quota exhaustion (response.failed carrying
+              // rate_limit_reached_type) — the frame itself is the authority,
+              // so this marks the account rate-limited without any quota-API
+              // call. The fetch override then reroutes away from it: a
+              // rate-limited main is treated like a killswitch block, and a
+              // rate-limited fallback is dropped from candidate selection.
+              onRateLimitReached: (window, accountId) => {
+                if (!accountId) {
+                  // The loader always sets the internal quota-account header,
+                  // so this should never fire today — but a future call site
+                  // that bypasses it would otherwise misattribute the mark
+                  // onto main's bucket with zero signal.
+                  logQ.warn(
+                    'mid-stream rate-limit mark missing internal account id; defaulting to main',
+                    { pid: process.pid, window },
+                  )
+                }
+                const accountKey = accountId ?? 'main'
+                const resetAt = midStreamRateLimitResetAt(accountKey, window)
+                quotaManager.markRateLimited(accountKey, resetAt)
+                logQ.debug('mid-stream rate limit mark', {
+                  pid: process.pid,
+                  accountId: accountKey,
+                  window,
+                })
               },
             })
           : undefined
@@ -1401,9 +1456,23 @@ export async function CodexAuthPlugin(
 
         // Synthetic provider-shaped 429 with a Retry-After derived from the
         // earliest known quota reset across all accounts. Returned when the
-        // killswitch blocks the primary and no surviving account can serve.
+        // killswitch blocks the primary and no surviving account can serve —
+        // or when a mid-stream rate-limit mark blocks it instead (killswitch
+        // may be OFF in that case), hence the parametrized reason: the
+        // retry-after math is the same earliest-known-reset computation
+        // either way, only the human-readable message differs.
+        //
+        // markResetAtMs carries the mid-stream mark's OWN stored reset (~60s,
+        // DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS) when the block is a mark, not
+        // a killswitch decision. killswitchRetryAfterSeconds falls back to a
+        // 300s default when no account reset is known — without this, a bare
+        // mid-stream block (no cached quota yet) would tell the client to wait
+        // 4 extra minutes past the mark's actual expiry. The sooner of the two
+        // always wins — this only ever tightens the wait, never lengthens it.
         function killswitchBlockedResponse(
           storage: AccountStorage | null,
+          reason: 'killswitch' | 'mid-stream-rate-limit' = 'killswitch',
+          markResetAtMs?: number,
         ): Response {
           const now = Date.now()
           const mainQuota = quotaManager.getMain()?.quota
@@ -1413,17 +1482,31 @@ export async function CodexAuthPlugin(
                 a.enabled !== false && isOAuthAccount(a),
             )
             .map((a) => ({ quota: quotaManager.getFallback(a.id)?.quota }))
-          const retryAfter = killswitchRetryAfterSeconds(
+          let retryAfter = killswitchRetryAfterSeconds(
             mainQuota,
             fallbackAccounts,
             now,
           )
+          if (
+            reason === 'mid-stream-rate-limit' &&
+            markResetAtMs !== undefined
+          ) {
+            const markRetryAfter = Math.max(
+              1,
+              Math.ceil((markResetAtMs - now) / 1000),
+            )
+            retryAfter = Math.min(retryAfter, markRetryAfter)
+          }
           const mins = Math.floor(retryAfter / 60)
           const secs = retryAfter % 60
+          const message =
+            reason === 'mid-stream-rate-limit'
+              ? `OpenAI rate limit reached — retrying on another account. Retry in ${mins}m ${secs}s.`
+              : `Killswitch: all OpenAI accounts are below their configured quota threshold. Retry in ${mins}m ${secs}s.`
           return new Response(
             JSON.stringify({
               error: {
-                message: `Killswitch: all OpenAI accounts are below their configured quota threshold. Retry in ${mins}m ${secs}s.`,
+                message,
                 type: 'rate_limit_exceeded',
                 code: 'rate_limit_exceeded',
               },
@@ -1468,12 +1551,19 @@ export async function CodexAuthPlugin(
               })
             }
           }
+          // Mid-stream rate-limit mark: never re-try a fallback a prior request
+          // just exhausted mid-generation. Unlike the killswitch quota filter
+          // below, this applies unconditionally — the mark comes from the
+          // account's own response.failed frame, not an opt-in policy.
+          const notRateLimited = candidates.filter(
+            (c) => !quotaManager.isRateLimited(c.quotaAccountId),
+          )
           // Killswitch: drop any candidate whose last-seen quota is below its
           // threshold so routing never spends on a killed account. Opt-in — a
           // no-op when disabled. Non-invalidating peek so a token refresh does
           // not flip a killed account to "unknown".
-          if (!isKillswitchEnabled(fallbackStorage)) return candidates
-          return candidates.filter((c) =>
+          if (!isKillswitchEnabled(fallbackStorage)) return notRateLimited
+          return notRateLimited.filter((c) =>
             killswitchPassesPolicy(
               quotaManager.peekFallbackForPolicy(c.quotaAccountId)?.quota,
               fallbackStorage,
@@ -1813,6 +1903,12 @@ export async function CodexAuthPlugin(
             // hard block (with a Retry-After). Blocking is independent of
             // replayability — the killswitch's contract is "never spend below
             // threshold", so a non-replayable request hard-fails.
+            //
+            // Same treatment for a mid-stream rate-limit mark (a prior request on
+            // main hit response.failed/rate_limit_reached_type on the WS
+            // transport): main is exhausted right now even though the killswitch's
+            // cached quota may not yet reflect it, so block main here too until
+            // the mark's reset passes.
             if (!response) {
               const killswitchBlocksMain =
                 isKillswitchEnabled(reqStorage) &&
@@ -1822,12 +1918,24 @@ export async function CodexAuthPlugin(
                   undefined,
                   Date.now(),
                 )
-              if (killswitchBlocksMain) {
+              const mainRateLimited = quotaManager.isRateLimited('main')
+              if (killswitchBlocksMain || mainRateLimited) {
+                const blockReason =
+                  mainRateLimited && !killswitchBlocksMain
+                    ? 'mid-stream-rate-limit'
+                    : 'killswitch'
                 logA.debug('killswitch blocked primary', {
                   pid: process.pid,
                   activeId: 'main',
+                  reason: blockReason,
                 })
-                response = killswitchBlockedResponse(reqStorage)
+                response = killswitchBlockedResponse(
+                  reqStorage,
+                  blockReason,
+                  mainRateLimited
+                    ? quotaManager.rateLimitedUntil('main')
+                    : undefined,
+                )
               } else {
                 // Send through the main account.
                 response = await sendWithAccessToken(

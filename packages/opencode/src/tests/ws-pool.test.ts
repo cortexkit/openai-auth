@@ -208,6 +208,55 @@ describe('createWebSocketFetch', () => {
     )
   })
 
+  test('attributes a mid-stream response.failed rate_limit_reached_type to the connection that sent it', async () => {
+    const rateLimitCalls: Array<{ window: string; accountId?: string }> = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'response.failed',
+              response: {
+                id: 'resp_1',
+                failed: { rate_limit_reached_type: 'secondary' },
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          onRateLimitReached: (window, accountId) => {
+            rateLimitCalls.push({ window, accountId })
+          },
+        })
+
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-rl',
+              authorization: 'Bearer tok-fb',
+              'chatgpt-account-id': 'chatgpt-stable-fb',
+              'x-openai-auth-quota-account': 'fb-1',
+            },
+            body: JSON.stringify({ stream: true, input: [] }),
+          },
+        )
+        await response.text()
+
+        expect(rateLimitCalls).toHaveLength(1)
+        expect(rateLimitCalls[0]?.window).toBe('secondary')
+        // Attributed by the internal quota storage key captured at send time
+        // (mirrors onQuota's requestAccountId), not the wire chatgpt-account-id.
+        expect(rateLimitCalls[0]?.accountId).toBe('fb-1')
+        websocketFetch.close()
+      },
+    )
+  })
+
   test('preserves reasoning summaries on websocket requests and forwards reasoning deltas', async () => {
     const sent: Array<Record<string, unknown>> = []
     await withFakeWebSocket(

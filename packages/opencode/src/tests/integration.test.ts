@@ -79,6 +79,8 @@ function createMockPluginInput(
 type FakeWebSocketContext = {
   message(data: string): void
   close(code?: number, reason?: string): void
+  /** The `authorization` connect header for this socket, if present. */
+  authorization: string
 }
 
 type FakeWebSocketBehavior = {
@@ -118,7 +120,7 @@ async function withFakeWebSocket(
     >()
     private readonly behavior: FakeWebSocketBehavior
 
-    constructor(url: string) {
+    constructor(url: string, options?: { headers?: Record<string, string> }) {
       this.url = url
       this.behavior = behavior({
         message: (data) => this.emit('message', { data }),
@@ -126,6 +128,7 @@ async function withFakeWebSocket(
           this.readyState = FakeWebSocket.CLOSED
           this.emit('close', { code, reason })
         },
+        authorization: options?.headers?.authorization ?? '',
       })
       if (this.behavior.autoOpen !== false) {
         queueMicrotask(() => {
@@ -1136,6 +1139,491 @@ describe('integration: killswitch enforcement', () => {
           expect(blockedB.status).toBe(429)
           await blockedB.body?.cancel()
           expect(wsSends).toBe(1)
+        } finally {
+          globalThis.fetch = originalFetch
+          await hooks?.dispose?.()
+        }
+      },
+    )
+  })
+
+  it('reroutes to a healthy fallback after main signals mid-stream quota exhaustion over WebSocket', async () => {
+    // Killswitch OFF — this reroute must fire purely from the WS mid-stream
+    // response.failed rate_limit_reached_type signal, not the killswitch's
+    // cached-quota policy. Main's HTTP status is always the synthetic 200 the
+    // WS transport returns at upgrade, so a reactive HTTP-status fallback
+    // alone would never see this account is exhausted.
+    const fallback: OAuthAccount = {
+      id: 'fb-healthy',
+      type: 'oauth',
+      access: 'sk-fb-access-rl',
+      refresh: 'sk-fb-refresh-rl',
+      expires: Date.now() + 3600_000,
+      enabled: true,
+      addedAt: Date.now(),
+      lastUsed: Date.now(),
+    }
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [fallback],
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let mainSends = 0
+    let fallbackSends = 0
+    let hooks: Hooks | undefined
+    await withFakeWebSocket(
+      ({ message, authorization }) => ({
+        send() {
+          // Distinguish by the ACTUAL account credential on this connection's
+          // upgrade headers, not connection order — main reconnects with a
+          // fresh socket after invalidate(), so order alone would not prove
+          // the reroute reached a different account.
+          if (authorization === 'Bearer access-main-rl') {
+            // Main's connection: mid-stream quota exhaustion.
+            mainSends++
+            message(
+              JSON.stringify({
+                type: 'response.failed',
+                response: {
+                  id: 'resp_main_failed',
+                  failed: { rate_limit_reached_type: 'primary' },
+                },
+              }),
+            )
+            return
+          }
+          // The fallback's connection: succeeds normally.
+          fallbackSends++
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: `resp_fb_${fallbackSends}` },
+            }),
+          )
+        },
+      }),
+      async () => {
+        try {
+          hooks = await CodexAuthPlugin(createMockPluginInput(), {
+            experimentalWebSockets: true,
+          })
+          const authHook = hooks.auth
+          if (!authHook?.loader) throw new Error('No auth loader')
+          const loaderResult = await authHook.loader(
+            async () => ({
+              type: 'oauth' as const,
+              provider: 'openai',
+              access: 'access-main-rl',
+              refresh: refreshToken,
+              expires: Date.now() + 3600_000,
+              accountId: 'chatgpt-main-rl',
+            }),
+            {
+              id: 'openai',
+              label: 'OpenAI',
+              models: [],
+            } as unknown as Parameters<
+              NonNullable<(typeof authHook)['loader']>
+            >[1],
+          )
+          const fetchOverride = (loaderResult as Record<string, unknown>)
+            .fetch as (url: string, init?: RequestInit) => Promise<Response>
+          const wsRequest: RequestInit = {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'session-id': 'ws-rate-limit-reroute-session',
+            },
+            body: JSON.stringify({ model: 'gpt-5.5', input: [], stream: true }),
+          }
+
+          // Request 1: main's stream hits mid-stream rate_limit_reached_type.
+          // The synthetic WS status is still 200 — the reroute cannot come
+          // from a reactive HTTP-status check on THIS response.
+          const first = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            wsRequest,
+          )
+          expect(first.status).toBe(200)
+          await first.text()
+
+          // Request 2: main is now marked rate-limited from request 1's
+          // in-band signal, so the fetch override must reroute to the
+          // fallback WITHOUT ever re-sending to main.
+          const second = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            wsRequest,
+          )
+          expect(second.status).toBe(200)
+          await second.text()
+
+          expect(mainSends).toBe(1)
+          expect(fallbackSends).toBe(1)
+        } finally {
+          globalThis.fetch = originalFetch
+          await hooks?.dispose?.()
+        }
+      },
+    )
+  })
+
+  it('excludes a rate-limited fallback from candidate selection after a mid-stream mark', async () => {
+    // fallback-first: the single fallback is tried before main. Its own
+    // mid-stream rate_limit_reached_type mark must make usableFallbackCandidates
+    // exclude it on the NEXT request — this filter is always-on, independent
+    // of the killswitch (off here).
+    const fallback: OAuthAccount = {
+      id: 'fb-excluded',
+      type: 'oauth',
+      access: 'sk-fb-access-excl',
+      refresh: 'sk-fb-refresh-excl',
+      expires: Date.now() + 3600_000,
+      enabled: true,
+      addedAt: Date.now(),
+      lastUsed: Date.now(),
+    }
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [fallback],
+        routing: { mode: 'fallback-first' },
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let fallbackSends = 0
+    let mainSends = 0
+    let hooks: Hooks | undefined
+    await withFakeWebSocket(
+      ({ message, authorization }) => ({
+        send() {
+          // Distinguish by the ACTUAL account credential on this connection's
+          // upgrade headers, not connection order — the fallback pool entry
+          // can reconnect with a fresh socket after invalidate(), so order
+          // alone would not prove request 2 actually reached main.
+          if (authorization === 'Bearer sk-fb-access-excl') {
+            // The fallback's own connection: mid-stream exhaustion, but the
+            // WS transport still returns 200, so tryFallbackFirst treats
+            // this as a success and serves it.
+            fallbackSends++
+            message(
+              JSON.stringify({
+                type: 'response.failed',
+                response: {
+                  id: 'resp_fb_failed',
+                  failed: { rate_limit_reached_type: 'secondary' },
+                },
+              }),
+            )
+            return
+          }
+          // Main's connection — only reached on request 2, once the
+          // fallback is excluded from candidate selection.
+          mainSends++
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: `resp_main_${mainSends}` },
+            }),
+          )
+        },
+      }),
+      async () => {
+        try {
+          hooks = await CodexAuthPlugin(createMockPluginInput(), {
+            experimentalWebSockets: true,
+          })
+          const authHook = hooks.auth
+          if (!authHook?.loader) throw new Error('No auth loader')
+          const loaderResult = await authHook.loader(
+            async () => ({
+              type: 'oauth' as const,
+              provider: 'openai',
+              access: 'access-main-excl',
+              refresh: refreshToken,
+              expires: Date.now() + 3600_000,
+              accountId: 'chatgpt-main-excl',
+            }),
+            {
+              id: 'openai',
+              label: 'OpenAI',
+              models: [],
+            } as unknown as Parameters<
+              NonNullable<(typeof authHook)['loader']>
+            >[1],
+          )
+          const fetchOverride = (loaderResult as Record<string, unknown>)
+            .fetch as (url: string, init?: RequestInit) => Promise<Response>
+          const wsRequest: RequestInit = {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'session-id': 'ws-fallback-exclude-session',
+            },
+            body: JSON.stringify({ model: 'gpt-5.5', input: [], stream: true }),
+          }
+
+          // Request 1: fallback-first tries the fallback; its stream hits
+          // mid-stream rate_limit_reached_type but still returns 200, so
+          // tryFallbackFirst marks it used and serves this response.
+          const first = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            wsRequest,
+          )
+          expect(first.status).toBe(200)
+          await first.text()
+
+          // Request 2: the fallback is now marked rate-limited from request
+          // 1's in-band signal, so usableFallbackCandidates excludes it and
+          // routing falls through to main WITHOUT re-trying the fallback.
+          const second = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            wsRequest,
+          )
+          expect(second.status).toBe(200)
+          await second.text()
+
+          expect(fallbackSends).toBe(1)
+          expect(mainSends).toBe(1)
+        } finally {
+          globalThis.fetch = originalFetch
+          await hooks?.dispose?.()
+        }
+      },
+    )
+  })
+
+  it('reroutes on a mid-stream mark even with the killswitch ENABLED (OR precedence, not AND)', async () => {
+    // Killswitch ON, but main's cached quota is unknown (nothing has pushed
+    // it in this test), so killswitchPassesPolicy fails OPEN and
+    // killswitchBlocksMain is false on its own — only the mid-stream mark
+    // makes `killswitchBlocksMain || mainRateLimited` true. This documents
+    // the block condition is an OR, not an AND: a future re-ordering to
+    // `&&` would silently stop rerouting on a mid-stream mark whenever the
+    // killswitch happens to be enabled, and this test would catch it.
+    const fallback: OAuthAccount = {
+      id: 'fb-healthy-ks-on',
+      type: 'oauth',
+      access: 'sk-fb-access-ks-on',
+      refresh: 'sk-fb-refresh-ks-on',
+      expires: Date.now() + 3600_000,
+      enabled: true,
+      addedAt: Date.now(),
+      lastUsed: Date.now(),
+    }
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [fallback],
+        killswitch: { enabled: true, main: { primary: 50, secondary: 50 } },
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let mainSends = 0
+    let fallbackSends = 0
+    let hooks: Hooks | undefined
+    await withFakeWebSocket(
+      ({ message, authorization }) => ({
+        send() {
+          if (authorization === 'Bearer access-main-ks-on') {
+            mainSends++
+            message(
+              JSON.stringify({
+                type: 'response.failed',
+                response: {
+                  id: 'resp_main_failed_ks_on',
+                  failed: { rate_limit_reached_type: 'primary' },
+                },
+              }),
+            )
+            return
+          }
+          fallbackSends++
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: `resp_fb_ks_on_${fallbackSends}` },
+            }),
+          )
+        },
+      }),
+      async () => {
+        try {
+          hooks = await CodexAuthPlugin(createMockPluginInput(), {
+            experimentalWebSockets: true,
+          })
+          const authHook = hooks.auth
+          if (!authHook?.loader) throw new Error('No auth loader')
+          const loaderResult = await authHook.loader(
+            async () => ({
+              type: 'oauth' as const,
+              provider: 'openai',
+              access: 'access-main-ks-on',
+              refresh: refreshToken,
+              expires: Date.now() + 3600_000,
+              accountId: 'chatgpt-main-ks-on',
+            }),
+            {
+              id: 'openai',
+              label: 'OpenAI',
+              models: [],
+            } as unknown as Parameters<
+              NonNullable<(typeof authHook)['loader']>
+            >[1],
+          )
+          const fetchOverride = (loaderResult as Record<string, unknown>)
+            .fetch as (url: string, init?: RequestInit) => Promise<Response>
+          const wsRequest: RequestInit = {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'session-id': 'ws-rate-limit-reroute-ks-on-session',
+            },
+            body: JSON.stringify({ model: 'gpt-5.5', input: [], stream: true }),
+          }
+
+          // Request 1: main's stream hits mid-stream rate_limit_reached_type.
+          const first = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            wsRequest,
+          )
+          expect(first.status).toBe(200)
+          await first.text()
+
+          // Request 2: main is marked rate-limited from request 1's in-band
+          // signal. The killswitch itself is enabled but fails open on
+          // main's unknown quota — the reroute must still fire from the
+          // mid-stream mark alone, proving the OR (not AND) semantics.
+          const second = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            wsRequest,
+          )
+          expect(second.status).toBe(200)
+          await second.text()
+
+          expect(mainSends).toBe(1)
+          expect(fallbackSends).toBe(1)
+        } finally {
+          globalThis.fetch = originalFetch
+          await hooks?.dispose?.()
+        }
+      },
+    )
+  })
+
+  it('a mid-stream block with no cached quota gives a ~60s Retry-After (the mark), not the killswitch 300s default', async () => {
+    // Killswitch OFF, no fallback accounts — the hard-block path. With no
+    // cached quota anywhere, killswitchRetryAfterSeconds alone would fall
+    // back to its 300s default; the mark's own DEFAULT_MID_STREAM_RATE_LIMIT_
+    // RESET_MS (~60s) must win instead so the client isn't told to wait 4
+    // extra minutes past the mark's actual expiry.
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let mainSends = 0
+    let hooks: Hooks | undefined
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          mainSends++
+          message(
+            JSON.stringify({
+              type: 'response.failed',
+              response: {
+                id: 'resp_main_failed_no_quota',
+                failed: { rate_limit_reached_type: 'primary' },
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        try {
+          hooks = await CodexAuthPlugin(createMockPluginInput(), {
+            experimentalWebSockets: true,
+          })
+          const authHook = hooks.auth
+          if (!authHook?.loader) throw new Error('No auth loader')
+          const loaderResult = await authHook.loader(
+            async () => ({
+              type: 'oauth' as const,
+              provider: 'openai',
+              access: 'access-main-no-quota',
+              refresh: refreshToken,
+              expires: Date.now() + 3600_000,
+              accountId: 'chatgpt-main-no-quota',
+            }),
+            {
+              id: 'openai',
+              label: 'OpenAI',
+              models: [],
+            } as unknown as Parameters<
+              NonNullable<(typeof authHook)['loader']>
+            >[1],
+          )
+          const fetchOverride = (loaderResult as Record<string, unknown>)
+            .fetch as (url: string, init?: RequestInit) => Promise<Response>
+          const wsRequest: RequestInit = {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'session-id': 'ws-mid-stream-retry-after-session',
+            },
+            body: JSON.stringify({ model: 'gpt-5.5', input: [], stream: true }),
+          }
+
+          // Request 1: main hits mid-stream rate_limit_reached_type; no
+          // fallback exists to reroute to, so the mark is set for the next
+          // request.
+          const first = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            wsRequest,
+          )
+          expect(first.status).toBe(200)
+          await first.text()
+
+          // Request 2: main is marked rate-limited and there is no fallback
+          // to reroute to, so this hits the hard-block path.
+          const second = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            wsRequest,
+          )
+          expect(second.status).toBe(429)
+          const retryAfter = Number(second.headers.get('retry-after'))
+          expect(retryAfter).toBeGreaterThan(0)
+          expect(retryAfter).toBeLessThanOrEqual(60)
+          await second.body?.cancel()
+
+          expect(mainSends).toBe(1)
         } finally {
           globalThis.fetch = originalFetch
           await hooks?.dispose?.()

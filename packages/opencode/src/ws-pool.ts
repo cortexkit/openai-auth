@@ -44,6 +44,17 @@ export interface CreateWebSocketFetchOptions {
     accountId: string | undefined,
     servedChatgptAccountId: string | undefined,
   ) => void
+  /**
+   * Fires when a response.failed frame carries a rate_limit_reached_type —
+   * mid-stream quota exhaustion the reactive HTTP-status fallback cannot see
+   * on the WebSocket transport (ws.ts synthesizes status:200 at upgrade,
+   * before generation runs).
+   *
+   * Receives the window label plus the per-request internal quota account key
+   * captured at send time, same as onQuota, so the signal is attributed to
+   * the connection's own account rather than a shared mutable global.
+   */
+  onRateLimitReached?: (window: string, accountId: string | undefined) => void
 }
 
 interface PoolEntry {
@@ -120,6 +131,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   const firstEventGraceMs = options?.firstEventGraceMs ?? 250
   const rawWebSocket = options?.rawWebSocket ?? false
   const onQuota = options?.onQuota
+  const onRateLimitReached = options?.onRateLimitReached
   const pruneTimer = setInterval(() => prune(), Math.min(idleTimeout, 60_000))
   if (
     typeof pruneTimer === 'object' &&
@@ -236,6 +248,13 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
               requestServedChatgptAccountId,
             )
         : undefined
+      // Same capture-at-send-time discipline as requestOnQuota: the
+      // response.failed frame arrives asynchronously, so it must be
+      // attributed to THIS connection's account, never a shared mutable
+      // global a concurrent request could have overwritten.
+      const requestOnRateLimitReached = onRateLimitReached
+        ? (window: string) => onRateLimitReached(window, requestAccountId)
+        : undefined
 
       const socketHeaders =
         !entry.socket && !entry.continuation
@@ -293,6 +312,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         idleTimeout,
         signal: init?.signal ?? undefined,
         onQuota: requestOnQuota,
+        onRateLimitReached: requestOnRateLimitReached,
         onFirstEvent: (error) => resolveFirstEvent(error ?? true),
         onComplete: (event, finalizedCallIds) => {
           const usage = responseUsage(event)

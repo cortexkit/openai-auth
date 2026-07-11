@@ -19,7 +19,7 @@ import type {
   OAuthQuotaSnapshot,
 } from './accounts.ts'
 import { buildQuotaOperationError, quotaBackoffActive } from './backoff.ts'
-import type { ProviderQuotaFn } from './provider.ts'
+import { PRIMARY, type ProviderQuotaFn, SECONDARY } from './provider.ts'
 import { acquireRefreshFileLock } from './refresh-file-lock'
 
 export type { ProviderQuotaFn }
@@ -50,6 +50,37 @@ export function quotaWindowResetIsPast(
   if (!window?.resetsAt) return false
   const resetTime = Date.parse(window.resetsAt)
   return Number.isFinite(resetTime) && resetTime <= now
+}
+
+/**
+ * Resolve when a mid-stream-exhausted account's window actually resets, from
+ * its own last-known cached quota snapshot (a response.failed frame carries
+ * no reset time itself). Prefers the window the frame named; falls back to
+ * the earliest future reset across both windows, then a conservative default
+ * so the account is never permanently blackholed. Pure — single source of
+ * truth shared by the fetch-override reroute and its unit tests.
+ */
+export function resolveMidStreamRateLimitResetAt(
+  quota: OAuthQuotaSnapshot | undefined,
+  window: string,
+  now: number,
+  defaultMs: number,
+): number {
+  const named =
+    window === PRIMARY
+      ? quota?.primary
+      : window === SECONDARY
+        ? quota?.secondary
+        : undefined
+  const namedReset = named?.resetsAt ? Date.parse(named.resetsAt) : NaN
+  if (Number.isFinite(namedReset) && namedReset > now) return namedReset
+
+  const futureResets = [quota?.primary, quota?.secondary]
+    .map((w) => (w?.resetsAt ? Date.parse(w.resetsAt) : Number.NaN))
+    .filter((t) => Number.isFinite(t) && t > now)
+  if (futureResets.length) return Math.min(...futureResets)
+
+  return now + defaultMs
 }
 
 function normalizeThresholds(storage: AccountStorage | null) {
@@ -172,6 +203,12 @@ export class QuotaManager {
   private fallbackApiErrors = new Map<string, AccountOperationError>()
   private fallbackErrorTokenFps = new Map<string, string>()
 
+  // --- Mid-stream rate-limit marks (from a WS response.failed
+  // rate_limit_reached_type signal — never a quota-API call). Keyed by the
+  // internal storage id ('main' or a fallback id). Expires purely by
+  // read-time comparison in isRateLimited(); no timer is armed. ---
+  private rateLimitedUntilMap = new Map<string, number>()
+
   // --- Serial API gate (prevents concurrent quota API calls) ---
   private apiGate: Promise<unknown> = Promise.resolve()
   private lastApiCallAt = 0
@@ -256,8 +293,21 @@ export class QuotaManager {
     // an empty one (no window data).
     if (!hasAnyQuotaWindow(entry.quota)) return
     this.mainTokenFp = tokenFingerprint(accessToken)
+    // A genuine account SWITCH (same identity condition as peekMainForPolicy)
+    // invalidates the OLD account's mid-stream mark — otherwise the new
+    // account inherits a 429 reroute until the old account's reset time. A
+    // token refresh (same accountId, new token) must NOT hit this: it fires
+    // on every refresh and would erase a still-live mark for the same account.
+    if (
+      accountId &&
+      this.mainQuotaAccountId &&
+      this.mainQuotaAccountId !== accountId
+    ) {
+      this.clearRateLimited('main')
+    }
     if (accountId) this.mainQuotaAccountId = accountId
     this.main = entry
+    if (quotaLooksHealthy(entry.quota)) this.clearRateLimited('main')
   }
 
   /**
@@ -306,6 +356,49 @@ export class QuotaManager {
     } else {
       this.fallbackTokenFps.delete(accountId)
     }
+    if (quotaLooksHealthy(entry.quota)) this.clearRateLimited(accountId)
+  }
+
+  // =========================================================================
+  // Mid-stream rate-limit marks
+  //
+  // Sourced from a WS response.failed rate_limit_reached_type frame — the
+  // frame itself is the authority, so marking never triggers a network call.
+  // Expiry is read-time only (isRateLimited compares against injected now());
+  // no timer is armed, so a mark simply stops applying once its reset passes.
+  // =========================================================================
+
+  /**
+   * Mark accountId ('main' or a fallback id) rate-limited until resetAtMs.
+   * Keeps the LATER reset: skips only when an existing mark is strictly
+   * later than resetAtMs, so an equal-reset re-mark still applies (idempotent)
+   * instead of being silently dropped by a stale `>=` comparison.
+   */
+  markRateLimited(accountId: string, resetAtMs: number): void {
+    const existing = this.rateLimitedUntilMap.get(accountId)
+    if (existing !== undefined && existing > resetAtMs) return
+    this.rateLimitedUntilMap.set(accountId, resetAtMs)
+  }
+
+  /** True iff accountId has a mark whose reset has not yet passed. */
+  isRateLimited(accountId: string): boolean {
+    const until = this.rateLimitedUntilMap.get(accountId)
+    return until !== undefined && this.now() < until
+  }
+
+  /**
+   * Raw stored reset for accountId's mark, or undefined if none. Unlike
+   * isRateLimited, this does NOT apply read-time expiry — callers on the
+   * block path already know the mark is live (isRateLimited just returned
+   * true) and want its exact reset estimate for a Retry-After computation.
+   */
+  rateLimitedUntil(accountId: string): number | undefined {
+    return this.rateLimitedUntilMap.get(accountId)
+  }
+
+  /** Explicit early clear — read-time expiry in isRateLimited is primary. */
+  clearRateLimited(accountId: string): void {
+    this.rateLimitedUntilMap.delete(accountId)
   }
 
   // =========================================================================
@@ -472,7 +565,20 @@ export class QuotaManager {
 
     this.main = entry
     this.mainTokenFp = persisted.tokenFingerprint ?? null
-    if (storage?.mainAccountId) this.mainQuotaAccountId = storage.mainAccountId
+    if (storage?.mainAccountId) {
+      // Mirrors setMain's switch-clear: a fresh disk load asserting a
+      // different stable account identity is the same "switch" event, even
+      // though in practice no mark can exist yet at process boot (the only
+      // caller today). Kept for consistency should a future caller re-seed
+      // mid-process with a live mark present.
+      if (
+        this.mainQuotaAccountId &&
+        this.mainQuotaAccountId !== storage.mainAccountId
+      ) {
+        this.clearRateLimited('main')
+      }
+      this.mainQuotaAccountId = storage.mainAccountId
+    }
   }
 
   private seedMainBackoffFromStorage(storage: AccountStorage | null): void {
@@ -614,6 +720,11 @@ export class QuotaManager {
             refreshAfter: getQuotaNextRefreshAt(quota, this.storage, now),
             checkedAt: now,
           }
+          // This assignment bypasses setMain (no accountId is threaded through
+          // this path), so its healthy-clear must be mirrored here — otherwise
+          // a known-healthy active poll leaves a stale mid-stream mark forcing
+          // fallback until the mark's own (unrelated) reset estimate.
+          if (quotaLooksHealthy(quota)) this.clearRateLimited('main')
           this.mainLastApiError = undefined
           this.onMainQuotaFetched?.(
             quota,
@@ -760,4 +871,23 @@ export class QuotaManager {
 function hasAnyQuotaWindow(quota: OAuthQuotaSnapshot): boolean {
   for (const _key of Object.keys(quota)) return true
   return false
+}
+
+// ---------------------------------------------------------------------------
+// Mid-stream rate-limit mark: early-clear guard
+// ---------------------------------------------------------------------------
+
+/**
+ * True when a freshly pushed snapshot shows BOTH windows present and under
+ * 100% used — positive full evidence the account is no longer exhausted, so
+ * a stale mid-stream rate-limit mark can be cleared before its read-time
+ * expiry. A mark is per-account, not per-window, so a partial snapshot (only
+ * one window present — e.g. a malformed refreshAllQuota result) is not
+ * evidence: the OTHER window could be the one that's actually exhausted.
+ * Clears only on a snapshot where both windows are present and under 100%.
+ */
+function quotaLooksHealthy(quota: OAuthQuotaSnapshot): boolean {
+  const { primary, secondary } = quota
+  if (!primary || !secondary) return false
+  return primary.usedPercent < 100 && secondary.usedPercent < 100
 }
