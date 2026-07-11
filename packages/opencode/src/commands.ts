@@ -7,7 +7,7 @@ import {
   type OAuthAccount,
   type RoutingMode,
 } from './core/accounts'
-import type { CacheKeepManager } from './core/cachekeep'
+import type { CacheKeepManager, CacheKeepWindow } from './core/cachekeep'
 import { beginAccountLogin, upsertAccount } from './core/oauth'
 import type { QuotaManager } from './core/quota-manager'
 import type { RefreshAllQuotaResult } from './core/refresh-all-quota'
@@ -76,6 +76,8 @@ export interface CommandContext {
   setCacheKeepEnabled?: (enabled: boolean) => void
   /** Updates the live loader's persisted-subagent cachekeep gate. */
   setCacheKeepSubagents?: (enabled: boolean) => void
+  /** Updates the live loader's clock-hour warm window. undefined = no window. */
+  setCacheKeepWindow?: (window: CacheKeepWindow | undefined) => void
 }
 
 const log = createLogger('commands')
@@ -625,6 +627,34 @@ async function executeLoggingCommand(
   }
 }
 
+function parseCacheKeepWindowArg(
+  input: string,
+):
+  | { ok: true; startHour: number; endHour: number }
+  | { ok: false; reason: string } {
+  const match = /^(\d{1,2})-(\d{1,2})$/.exec(input.trim())
+  if (!match) {
+    return { ok: false, reason: 'expected HH-HH, e.g. 9-18 or 22-6' }
+  }
+  const startHour = Number(match[1])
+  const endHour = Number(match[2])
+  if (
+    !Number.isInteger(startHour) ||
+    !Number.isInteger(endHour) ||
+    startHour < 0 ||
+    startHour > 23 ||
+    endHour < 0 ||
+    endHour > 23 ||
+    startHour === endHour
+  ) {
+    return {
+      ok: false,
+      reason: 'hours must be integers 0-23 and start ≠ end',
+    }
+  }
+  return { ok: true, startHour, endHour }
+}
+
 async function executeCachekeepCommand(
   args: string,
   ctx: CommandContext,
@@ -643,12 +673,17 @@ async function executeCachekeepCommand(
       }
     }
     const status = mgr.status()
+    const liveWindow = status.window
+    const windowLabel = liveWindow
+      ? `${String(liveWindow.startHour).padStart(2, '0')}-${String(liveWindow.endHour).padStart(2, '0')}`
+      : 'always (no window)'
     const lines: string[] = [
       '## Cachekeep',
       '',
       `Status: **${enabled ? 'ON' : 'OFF'}**`,
       `Timer: **${status.running ? 'armed' : 'idle'}**`,
       `Subagent warming: **${storage?.cachekeep?.subagents === true ? 'ON' : 'OFF'}**`,
+      `Window: **${windowLabel}**`,
     ]
     lines.push(`Tracked sessions: **${status.tracked}**`)
     if (status.targets.length > 0) {
@@ -678,7 +713,7 @@ async function executeCachekeepCommand(
     )
     lines.push('')
     lines.push(
-      'Commands: `/openai-cachekeep on` | `/openai-cachekeep off` | `/openai-cachekeep subagents on` | `/openai-cachekeep subagents off` | `/openai-cachekeep`',
+      'Commands: `/openai-cachekeep on` | `/openai-cachekeep off` | `/openai-cachekeep HH-HH` | `/openai-cachekeep window clear` | `/openai-cachekeep subagents on` | `/openai-cachekeep subagents off` | `/openai-cachekeep`',
     )
     const lastWarmAt = Math.max(
       0,
@@ -690,6 +725,7 @@ async function executeCachekeepCommand(
       knobs: {
         enabled,
         subagents: storage?.cachekeep?.subagents === true,
+        window: liveWindow,
         running: status.running,
         tracked: status.tracked,
         lastWarmAt: lastWarmAt || undefined,
@@ -726,6 +762,7 @@ async function executeCachekeepCommand(
       knobs: {
         enabled: true,
         subagents: storage?.cachekeep?.subagents === true,
+        window: status.window,
         running: status.running,
         tracked: status.tracked,
         lastWarmAt: lastWarmAt || undefined,
@@ -781,6 +818,84 @@ async function executeCachekeepCommand(
       knobs: {
         enabled,
         subagents: value,
+        window: nextStatus?.window,
+        running: nextStatus?.running ?? false,
+        tracked: nextStatus?.tracked ?? 0,
+        generatedAt: nextStatus?.generatedAt ?? Date.now(),
+        maxIdleWarmMs: nextStatus?.maxIdleWarmMs ?? 60 * 60 * 1000,
+        maxSubagentIdleMs: nextStatus?.maxSubagentIdleMs ?? 30 * 60 * 1000,
+      },
+    }
+  }
+
+  // `/openai-cachekeep window clear` (or `window off`) drops any persisted
+  // window so cachekeep returns to the legacy "always warm" behavior.
+  if (tokens[0] === 'window') {
+    const sub = tokens[1]
+    if (sub === 'clear' || sub === 'off') {
+      await mutateAccounts((current) => {
+        if (current.cachekeep) {
+          delete current.cachekeep.startHour
+          delete current.cachekeep.endHour
+        }
+        return current
+      }, ctx.accountStoragePath)
+      ctx.setCacheKeepWindow?.(undefined)
+      log.info('cachekeep window cleared')
+      const nextStatus = mgr?.status()
+      return {
+        command: 'openai-cachekeep',
+        text: '## Cachekeep Window Cleared\n\nCachekeep will now warm on every tick (within idle caps).',
+        knobs: {
+          enabled,
+          subagents: storage?.cachekeep?.subagents === true,
+          window: undefined,
+          running: nextStatus?.running ?? false,
+          tracked: nextStatus?.tracked ?? 0,
+          generatedAt: nextStatus?.generatedAt ?? Date.now(),
+          maxIdleWarmMs: nextStatus?.maxIdleWarmMs ?? 60 * 60 * 1000,
+          maxSubagentIdleMs: nextStatus?.maxSubagentIdleMs ?? 30 * 60 * 1000,
+        },
+      }
+    }
+    return {
+      command: 'openai-cachekeep',
+      text: 'Usage: `/openai-cachekeep window clear`',
+      knobs: {},
+    }
+  }
+
+  // Top-level `HH-HH` parses as a window set (e.g. `/openai-cachekeep 9-18`).
+  const hhToken = tokens[0]
+  if (hhToken && /^\d{1,2}-\d{1,2}$/.test(hhToken)) {
+    const parsed = parseCacheKeepWindowArg(hhToken)
+    if (!parsed.ok) {
+      return {
+        command: 'openai-cachekeep',
+        text: `## Cachekeep Window Invalid\n\n${parsed.reason}`,
+        knobs: {},
+      }
+    }
+    const { startHour, endHour } = parsed
+    await mutateAccounts((current) => {
+      current.cachekeep = {
+        ...(current.cachekeep ?? {}),
+        startHour,
+        endHour,
+      }
+      return current
+    }, ctx.accountStoragePath)
+    ctx.setCacheKeepWindow?.({ startHour, endHour })
+    log.info('cachekeep window set', { startHour, endHour })
+    const nextStatus = mgr?.status()
+    const hhLabel = `${String(startHour).padStart(2, '0')}-${String(endHour).padStart(2, '0')}`
+    return {
+      command: 'openai-cachekeep',
+      text: `## Cachekeep Window Set\n\nWarming limited to **${hhLabel}** local hours.`,
+      knobs: {
+        enabled,
+        subagents: storage?.cachekeep?.subagents === true,
+        window: { startHour, endHour },
         running: nextStatus?.running ?? false,
         tracked: nextStatus?.tracked ?? 0,
         generatedAt: nextStatus?.generatedAt ?? Date.now(),
@@ -792,7 +907,7 @@ async function executeCachekeepCommand(
 
   return {
     command: 'openai-cachekeep',
-    text: 'Usage: `/openai-cachekeep`, `/openai-cachekeep on`, `/openai-cachekeep off`, `/openai-cachekeep subagents on`, `/openai-cachekeep subagents off`',
+    text: 'Usage: `/openai-cachekeep`, `/openai-cachekeep on`, `/openai-cachekeep off`, `/openai-cachekeep HH-HH`, `/openai-cachekeep window clear`, `/openai-cachekeep subagents on`, `/openai-cachekeep subagents off`',
     knobs: {},
   }
 }

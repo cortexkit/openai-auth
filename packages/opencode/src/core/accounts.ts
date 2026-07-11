@@ -217,6 +217,12 @@ export type AccountStorage = {
   cachekeep?: {
     enabled?: boolean
     subagents?: boolean
+    /** Clock-hour window start (0-23, inclusive) — keeps cachekeep idle warming
+     *  inside `[startHour, endHour)` local hours. Omit to warm unconditionally. */
+    startHour?: number
+    /** Clock-hour window end (0-23, exclusive) — must differ from startHour
+     *  to be honored; an unset or equal hour falls back to "always warm". */
+    endHour?: number
   }
   /** Stable ChatGPT account identifier of the main account (extracted from OAuth token). */
   mainAccountId?: string

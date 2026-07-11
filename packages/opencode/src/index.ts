@@ -44,7 +44,11 @@ import {
   hashRefreshToken,
   refreshBackoffActive,
 } from './core/backoff'
-import { buildKeepwarmCapture, CacheKeepManager } from './core/cachekeep'
+import {
+  buildKeepwarmCapture,
+  CacheKeepManager,
+  getCacheKeepWindow,
+} from './core/cachekeep'
 import {
   base64UrlEncode,
   beginDeviceAuth,
@@ -757,6 +761,7 @@ export async function CodexAuthPlugin(
         const cacheKeepLogger = createLogger('cachekeep')
         let cacheKeepEnabled = storage?.cachekeep?.enabled === true
         let cacheKeepSubagents = storage?.cachekeep?.subagents === true
+        let cacheKeepWindow = getCacheKeepWindow(storage)
         let mainRefreshPromise:
           | Promise<{ access: string; refresh: string; expires: number }>
           | undefined
@@ -1000,6 +1005,7 @@ export async function CodexAuthPlugin(
           codexResponsesUrl: codexApiEndpoint,
           logger: cacheKeepLogger,
           now: Date.now,
+          getWindow: () => cacheKeepWindow,
         })
         cacheKeepGlobal.__openaiAuthCacheKeepManager = cacheKeepManager
 
@@ -1157,6 +1163,9 @@ export async function CodexAuthPlugin(
           },
           setCacheKeepSubagents: (enabled) => {
             cacheKeepSubagents = enabled
+          },
+          setCacheKeepWindow: (window) => {
+            cacheKeepWindow = window
           },
           refreshSidebar: async () => {
             const store = await loadAccounts(getConfigPath())
