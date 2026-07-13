@@ -28,6 +28,7 @@
 │   │   │   ├── raw-ws-node.ts     # node:net/node:tls-backed hand-rolled client
 │   │   │   ├── hosted-web-search.ts # Provider-hosted web_search tool + replay/SSE translation
 │   │   │   ├── response-stream-error.ts # Stream error type for WS/HTTP
+│   │   │   ├── prompt-context.ts  # Assistant model/variant resolver for synthetic replies
 │   │   │   ├── dump.ts            # Optional transport request dumps for cache debugging
 │   │   │   └── version.ts         # Package version (mirrors package.json)
 │   │   ├── package.json
@@ -68,8 +69,8 @@
 - Contains: `accounts.ts`, `atomic-write.ts`, `backoff.ts`, `cachekeep.ts`, `oauth.ts`, `provider.ts`, `quota-manager.ts`, `refresh-all-quota.ts`, `refresh-file-lock.ts`.
 - Key files:
   - `packages/opencode/src/core/accounts.ts` — `loadAccounts`/`mutateAccounts` (authoritative read-modify-write), `saveAccounts` (test seeding only), `saveAccountState` (updates state secrets, gated by config roster), `FallbackAccountManager`, account types
-  - `packages/opencode/src/core/quota-manager.ts` — in-memory quota cache + backoff
-  - `packages/opencode/src/core/cachekeep.ts` — `CacheKeepManager` (idle prompt-cache warmer)
+  - `packages/opencode/src/core/quota-manager.ts` — in-memory quota cache, backoff, and mid-stream rate limit marking
+  - `packages/opencode/src/core/cachekeep.ts` — `CacheKeepManager` (idle prompt-cache warmer with model-aware TTLs, subagent 2-warm limits, clock windows, and idle pruning)
   - `packages/opencode/src/core/oauth.ts` — PKCE, callback server, device-code flow, JWT parsing
   - `packages/opencode/src/core/backoff.ts` — refresh/quota backoff math + `hashRefreshToken`
   - `packages/opencode/src/core/refresh-file-lock.ts` — single-writer eviction-marker lock
@@ -110,7 +111,8 @@
 **Entry Points:**
 - `packages/opencode/src/index.ts` — OpenCode plugin (server hook). The plugin registers as `openai` provider.
 - `packages/opencode/src/cli.ts` — `openai-auth` CLI (manages fallback accounts; executed via `npx @cortexkit/opencode-openai-auth`).
-- `packages/opencode/src/tui.tsx` — TUI sidebar (exported as `./tui`; loaded by OpenCode's TUI).
+- `packages/opencode/src/tui/entry.mjs` — TUI export shim; loads the precompiled TUI for packaged hosts and raw TSX for compatible local loaders.
+- `packages/opencode/src/tui.tsx` — TUI sidebar source; compiled into `src/tui-compiled/` during the package build.
 - `packages/pi/src/index.ts` — Pi extension entry.
 
 **Configuration:**
@@ -124,8 +126,9 @@
 **Core Logic:**
 - `packages/opencode/src/core/accounts.ts` — multi-account store, `FallbackAccountManager`.
 - `packages/opencode/src/core/oauth.ts` — PKCE, OAuth flow, JWT parsing.
-- `packages/opencode/src/core/quota-manager.ts` — quota cache + backoff.
-- `packages/opencode/src/core/cachekeep.ts` — prompt-cache warmer.
+- `packages/opencode/src/core/quota-manager.ts` — quota cache, backoff, and mid-stream rate limit marking.
+- `packages/opencode/src/core/cachekeep.ts` — prompt-cache warmer with model-aware TTL, clock window, and subagent warm caps.
+- `packages/opencode/src/prompt-context.ts` — assistant model/variant resolver for synthetic command replies.
 - `packages/opencode/src/core/provider.ts` — Codex injection seam (`codexRefreshFn`, `whamUsageFn`).
 - `packages/opencode/src/core/backoff.ts` — retry/backoff math.
 - `packages/opencode/src/core/refresh-file-lock.ts` — single-writer eviction-marker lock.

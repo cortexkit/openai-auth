@@ -10,5 +10,5 @@
     "rewriteRelativeImportExtensions": true
   },
   "include": ["src/**/*.ts", "src/**/*.tsx"],
-  "exclude": ["src/tests/**"]
+  "exclude": ["src/tests/**", "src/tui-compiled/**"]
 }

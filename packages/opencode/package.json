@@ -20,7 +20,7 @@
     },
     "./tui": {
       "types": "./dist/tui.d.ts",
-      "import": "./src/tui.tsx"
+      "import": "./src/tui/entry.mjs"
     },
     "./tui-prefs": {
       "types": "./dist/tui-preferences.d.ts",
@@ -37,7 +37,8 @@
   "files": [
     "dist",
     "src/tui.tsx",
-    "src/tui/command-dialogs.tsx",
+    "src/tui",
+    "src/tui-compiled",
     "src/sidebar-state.ts",
     "src/tui-preferences.ts",
     "src/logger.ts",
@@ -47,7 +48,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && tsc -p tsconfig.build.json --emitDeclarationOnly && bun run build:tui",
+    "build:tui": "bun scripts/build-tui.ts",
     "build:dev": "rm -rf dist && tsc -p tsconfig.build.json",
     "test": "bun test src/tests",
     "typecheck": "tsc",

@@ -50,21 +50,24 @@ const log = createLogger('rpc-tui')
 
 const ID = 'cortexkit.openai-auth'
 
-// Plugin version for the header (mirrors the Magic Context / AFT convention).
-// Read at runtime from package.json relative to this module — NOT a TS JSON
-// import, which would break the declaration build (package.json is outside
-// rootDir). tui.tsx ships as source (package.json exports["./tui"] →
-// "./src/tui.tsx") and is never compiled into a deeper dist tree, so `..` from
-// src/ is always the package root. Empty string on any failure → header shows
-// the badge with no version.
+// Read package metadata from either the raw src/ entry or its generated
+// src/tui-compiled/ counterpart. Avoid a JSON import because package.json sits
+// outside the declaration build's rootDir.
 const PLUGIN_VERSION: string = (() => {
-  try {
-    const here = dirname(fileURLToPath(import.meta.url))
-    const raw = readFileSync(join(here, '..', 'package.json'), 'utf8')
-    return (JSON.parse(raw) as { version?: string }).version ?? ''
-  } catch {
-    return ''
+  const here = dirname(fileURLToPath(import.meta.url))
+  for (const packageFile of [
+    join(here, '..', 'package.json'),
+    join(here, '..', '..', 'package.json'),
+  ]) {
+    try {
+      const raw = readFileSync(packageFile, 'utf8')
+      const version = (JSON.parse(raw) as { version?: string }).version
+      if (version) return version
+    } catch {
+      // Try the path for the other TUI entry layout.
+    }
   }
+  return ''
 })()
 
 // biome-ignore lint/suspicious/noExplicitAny: opentui border prop not typed in plugin tui surface
