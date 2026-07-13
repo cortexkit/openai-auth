@@ -19,6 +19,7 @@
     "ignoreUnknown": true,
     "includes": [
       "packages/*/src/**",
+      "!packages/opencode/src/tui-compiled",
       "packages/*/*.json",
       "scripts/**",
       "*.json",
