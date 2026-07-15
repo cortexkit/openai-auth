@@ -473,6 +473,7 @@ describe('createWebSocketFetch', () => {
               'x-codex-window-id': 'window-1',
               'x-codex-turn-metadata': '{"turn_id":"ws-only"}',
               'x-codex-ws-stream-request-start-ms': '12345',
+              ws_request_header_x_openai_internal_codex_responses_lite: 'true',
             },
           }),
         )
@@ -482,6 +483,9 @@ describe('createWebSocketFetch', () => {
         const headers = new Headers(fallbackInit.headers)
         expect(headers.get('accept')).toBe('text/event-stream')
         expect(headers.get('content-type')).toBe('application/json')
+        expect(headers.get('x-openai-internal-codex-responses-lite')).toBe(
+          'true',
+        )
         const fallbackBody = JSON.parse(String(fallbackInit.body)) as Record<
           string,
           unknown

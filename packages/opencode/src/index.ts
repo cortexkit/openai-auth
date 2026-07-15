@@ -115,6 +115,14 @@ const ALLOWED_MODELS = new Set([
 // api.id ("gpt-5.6"), so filtering on api.id drops them all at once while
 // keeping the working variants (api.id gpt-5.6-luna, etc.).
 const DISALLOWED_MODELS = new Set(['gpt-5.6'])
+// Wire models Codex's catalog marks use_responses_lite. The set is exact on
+// purpose: upstream resolves models against its catalog and defaults unknown
+// names to the normal Responses shape, so no prefix matching here.
+const RESPONSES_LITE_MODELS = new Set([
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+])
 const OAUTH_DUMMY_KEY = 'opencode-oauth-dummy-key'
 const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
 // gpt-5.6 requires Codex client >= 0.144.0 (older versions 400 with "requires a
@@ -173,6 +181,7 @@ interface CodexAuthPluginOptions {
   issuer?: string
   codexApiEndpoint?: string
   experimentalWebSockets?: boolean
+  responsesLite?: boolean
 }
 
 interface CodexSessionMetadata {
@@ -329,6 +338,7 @@ function prepareCodexRequest(input: {
   metadata: CodexSessionMetadata | undefined
   installationID: string
   websocket: boolean
+  responsesLite: boolean
   dumpSessionID?: string
 }): PreparedCodexRequest {
   // Capture + strip the internal effort signal up front so it never leaks to the
@@ -380,6 +390,13 @@ function prepareCodexRequest(input: {
 
   const parsed = body
   if (!parsed) return { init: input.init }
+  const useResponsesLite =
+    input.responsesLite &&
+    typeof parsed.model === 'string' &&
+    RESPONSES_LITE_MODELS.has(parsed.model)
+  if (useResponsesLite && !input.websocket) {
+    input.headers.set('x-openai-internal-codex-responses-lite', 'true')
+  }
   parsed.prompt_cache_key = input.metadata.threadID
   parsed.parallel_tool_calls ??= true
   // OpenCode's `-pro` moniker means max reasoning effort, but the pinned
@@ -403,6 +420,7 @@ function prepareCodexRequest(input: {
   removeExaWebSearchFunctionTool(parsed)
   rewriteHostedWebSearchReplay(parsed)
   maybeInjectCacheStabilizerTool(parsed)
+  if (useResponsesLite) rewriteResponsesLiteBody(parsed)
   const clientMetadata: Record<string, unknown> = {
     ...(typeof parsed.client_metadata === 'object' &&
     parsed.client_metadata !== null
@@ -414,6 +432,12 @@ function prepareCodexRequest(input: {
   if (input.websocket) {
     clientMetadata['x-codex-turn-metadata'] = turnMetadata
     clientMetadata['x-codex-ws-stream-request-start-ms'] = String(Date.now())
+    if (useResponsesLite) {
+      // The WS transport marks Lite per request via client_metadata; the
+      // upgrade itself carries no Lite header.
+      clientMetadata.ws_request_header_x_openai_internal_codex_responses_lite =
+        'true'
+    }
   }
   parsed.client_metadata = clientMetadata
   input.headers.delete('content-length')
@@ -459,6 +483,56 @@ function maybeInjectCacheStabilizerTool(parsed: Record<string, unknown>) {
       search_content_types: ['text', 'image'],
     },
   ]
+}
+
+// Codex strips `detail` from every input_image in a Lite request, including
+// images nested in function/custom-tool outputs — hence the recursion.
+function stripResponsesLiteImageDetails(value: unknown) {
+  if (Array.isArray(value)) {
+    for (const item of value) stripResponsesLiteImageDetails(item)
+    return
+  }
+  if (!isRecord(value)) return
+  if (value.type === 'input_image') delete value.detail
+  for (const nested of Object.values(value))
+    stripResponsesLiteImageDetails(nested)
+}
+
+// Codex's Responses Lite request shape (client_common.rs): reasoning over all
+// turns, no parallel tool calls, and tools/instructions moved into the input —
+// an always-present `additional_tools` developer item (client-executed tools
+// only; hosted tools like web_search are excluded, so the cache stabilizer is
+// dropped here) followed by a developer message for non-empty instructions
+// (Codex omits empty instructions from the wire).
+function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
+  const reasoning = isRecord(parsed.reasoning) ? { ...parsed.reasoning } : {}
+  reasoning.context = 'all_turns'
+  parsed.reasoning = reasoning
+  parsed.parallel_tool_calls = false
+
+  const input = Array.isArray(parsed.input) ? parsed.input : []
+  stripResponsesLiteImageDetails(input)
+  const tools = Array.isArray(parsed.tools)
+    ? parsed.tools.filter(
+        (tool) => !(isRecord(tool) && tool.type === 'web_search'),
+      )
+    : []
+  const prefix: unknown[] = [
+    { type: 'additional_tools', role: 'developer', tools },
+  ]
+  if (
+    typeof parsed.instructions === 'string' &&
+    parsed.instructions.length > 0
+  ) {
+    prefix.push({
+      type: 'message',
+      role: 'developer',
+      content: [{ type: 'input_text', text: parsed.instructions }],
+    })
+  }
+  parsed.input = [...prefix, ...input]
+  delete parsed.tools
+  delete parsed.instructions
 }
 
 function removeHostedWebSearchFunctionTool(parsed: Record<string, unknown>) {
@@ -1368,6 +1442,7 @@ export async function CodexAuthPlugin(
             websocket: Boolean(
               websocketFetch && parsed.pathname.endsWith('/responses'),
             ),
+            responsesLite: options.responsesLite ?? false,
             dumpSessionID: sessionID,
           })
           const requestInit = prepared.init
@@ -1396,12 +1471,26 @@ export async function CodexAuthPlugin(
               pathname: parsed.pathname,
             })
             if (keepwarmCapture) {
+              // Keepwarm replays over HTTP; convert the WS-shaped body like fallback does.
+              const replayBody = OpenAIWebSocketPool.sanitizeHttpFallbackBody(
+                keepwarmCapture.bodyText,
+              )
+              const replayHeaders = { ...keepwarmCapture.replayHeaders }
+              if (
+                OpenAIWebSocketPool.hasWebSocketResponsesLiteMetadata(
+                  keepwarmCapture.bodyText,
+                )
+              ) {
+                replayHeaders['x-openai-internal-codex-responses-lite'] = 'true'
+              }
               cacheKeepManager.track(
                 keepwarmCapture.sessionKey,
-                keepwarmCapture.bodyText,
+                typeof replayBody === 'string'
+                  ? replayBody
+                  : keepwarmCapture.bodyText,
                 keepwarmAccountKey,
                 accountId,
-                keepwarmCapture.replayHeaders,
+                replayHeaders,
                 keepwarmCapture.isSubagent,
               )
             }
@@ -2257,6 +2346,7 @@ export const OpenAIAuthPlugin: Plugin = async (input) => {
   return CodexAuthPlugin(input, {
     codexApiEndpoint: settings.codexApiEndpoint,
     experimentalWebSockets: settings.webSockets,
+    responsesLite: settings.responsesLite,
   })
 }
 

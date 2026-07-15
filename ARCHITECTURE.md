@@ -58,7 +58,7 @@
 - Used by: Plugin loader (per-instance wiring); `/openai-cachekeep` command.
 
 **Request transformation:**
-- Purpose: Convert OpenAI Responses calls into Codex-shaped wire requests (UUIDv7 thread/turn ids, Codex turn-metadata header, OAuth/ChatGPT account headers, client_metadata, tool normalization, cache-stabilizer injection, key-reordering via `orderCodexBody` to match Codex wire serialization). Maps the `-pro` moniker (e.g. `gpt-5.6-sol-pro`) to `reasoning.effort: "max"` and strips the header. Resolves and preserves model/variant context for synthetic command replies to prevent model regression.
+- Purpose: Convert OpenAI Responses calls into Codex-shaped wire requests (UUIDv7 thread/turn ids, Codex turn-metadata header, OAuth/ChatGPT account headers, client_metadata, tool normalization, cache-stabilizer injection, key-reordering via `orderCodexBody` to match Codex wire serialization), including Codex's Responses Lite request shape for eligible models. Maps the `-pro` moniker (e.g. `gpt-5.6-sol-pro`) to `reasoning.effort: "max"` and strips the header. Resolves and preserves model/variant context for synthetic command replies to prevent model regression.
 - Location: `packages/opencode/src/index.ts` (`prepareCodexRequest`, `maybeInjectCacheStabilizerTool`, `normalizeCodexTool`, `getCodexSessionMetadata`, `loadCodexSessions`/`saveCodexSessions`), `packages/opencode/src/hosted-web-search.ts` (provider-hosted web-search tool + replay rewrite + SSE translation), `packages/opencode/src/prompt-context.ts` (`resolvePromptContext`), `packages/opencode/src/response-stream-error.ts`.
 - Depends on: `util/uuid-v7.ts`, `util/stable-json.ts`, `util/record.ts`, `config.ts`.
 - Used by: Plugin loader `sendWithAccessToken`, `fetch` override.

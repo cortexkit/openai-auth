@@ -12,6 +12,7 @@ describe('config resolution', () => {
     'OPENCODE_OPENAI_AUTH_FILE',
     'CORTEXKIT_OPENAI_AUTH_DUMP',
     'CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH',
+    'CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE',
   ]
 
   beforeEach(async () => {
@@ -100,6 +101,31 @@ describe('config resolution', () => {
       process.env.CORTEXKIT_OPENAI_AUTH_DUMP = 'true'
       resetSettingsForTest()
       expect(getSettings().dump).toBe(true)
+    })
+  })
+
+  describe('Responses Lite setting resolution', () => {
+    test('defaults to false', () => {
+      resetSettingsForTest()
+      expect(getSettings().responsesLite).toBe(false)
+    })
+
+    test('reads the config value', async () => {
+      await writeFile(configPath, JSON.stringify({ responsesLite: true }))
+      resetSettingsForTest()
+      expect(getSettings().responsesLite).toBe(true)
+    })
+
+    test('env overrides config', async () => {
+      await writeFile(configPath, JSON.stringify({ responsesLite: true }))
+      process.env.CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE = 'false'
+      resetSettingsForTest()
+      expect(getSettings().responsesLite).toBe(false)
+
+      await writeFile(configPath, JSON.stringify({ responsesLite: false }))
+      process.env.CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE = 'true'
+      resetSettingsForTest()
+      expect(getSettings().responsesLite).toBe(true)
     })
   })
 

@@ -931,6 +931,9 @@ function sanitizeHttpFallbackInit(init: RequestInit | undefined) {
   const headers = new Headers(init.headers)
   headers.set('accept', 'text/event-stream')
   headers.set('content-type', 'application/json')
+  if (hasWebSocketResponsesLiteMetadata(init.body)) {
+    headers.set('x-openai-internal-codex-responses-lite', 'true')
+  }
   return {
     ...init,
     headers,
@@ -938,7 +941,28 @@ function sanitizeHttpFallbackInit(init: RequestInit | undefined) {
   }
 }
 
-function sanitizeHttpFallbackBody(body: BodyInit | null | undefined) {
+// Codex marks Responses Lite requests per transport: HTTP carries the
+// x-openai-internal-codex-responses-lite header, WebSocket carries the
+// equivalent request-scoped client_metadata key (the upgrade itself is
+// unmarked). The WS→HTTP fallback converts one to the other.
+export function hasWebSocketResponsesLiteMetadata(
+  body: BodyInit | null | undefined,
+) {
+  if (typeof body !== 'string') return false
+  try {
+    const parsed = JSON.parse(body)
+    return (
+      isRecord(parsed) &&
+      isRecord(parsed.client_metadata) &&
+      parsed.client_metadata
+        .ws_request_header_x_openai_internal_codex_responses_lite === 'true'
+    )
+  } catch {
+    return false
+  }
+}
+
+export function sanitizeHttpFallbackBody(body: BodyInit | null | undefined) {
   if (typeof body !== 'string') return body
   try {
     const parsed = JSON.parse(body)
@@ -946,7 +970,9 @@ function sanitizeHttpFallbackBody(body: BodyInit | null | undefined) {
     if (
       !(
         'x-codex-turn-metadata' in parsed.client_metadata ||
-        'x-codex-ws-stream-request-start-ms' in parsed.client_metadata
+        'x-codex-ws-stream-request-start-ms' in parsed.client_metadata ||
+        'ws_request_header_x_openai_internal_codex_responses_lite' in
+          parsed.client_metadata
       )
     ) {
       return body
@@ -954,6 +980,7 @@ function sanitizeHttpFallbackBody(body: BodyInit | null | undefined) {
     const clientMetadata = { ...parsed.client_metadata }
     delete clientMetadata['x-codex-turn-metadata']
     delete clientMetadata['x-codex-ws-stream-request-start-ms']
+    delete clientMetadata.ws_request_header_x_openai_internal_codex_responses_lite
     return JSON.stringify({ ...parsed, client_metadata: clientMetadata })
   } catch {
     return body

@@ -731,6 +731,7 @@ describe('buildKeepwarmCapture', () => {
         'x-codex-beta-features': 'terminal_resize_reflow',
         'x-codex-turn-metadata': '{"turn_id":"turn-1"}',
         'x-codex-window-id': 'window-1',
+        'x-openai-internal-codex-responses-lite': 'true',
       }),
       body,
     })
@@ -745,6 +746,7 @@ describe('buildKeepwarmCapture', () => {
         'x-codex-beta-features': 'terminal_resize_reflow',
         'x-codex-turn-metadata': '{"turn_id":"turn-1"}',
         'x-codex-window-id': 'window-1',
+        'x-openai-internal-codex-responses-lite': 'true',
       },
       isSubagent: false,
     })

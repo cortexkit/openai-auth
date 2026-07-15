@@ -82,6 +82,7 @@ type FakeWebSocketContext = {
   close(code?: number, reason?: string): void
   /** The `authorization` connect header for this socket, if present. */
   authorization: string
+  upgradeHeaders: Record<string, string>
 }
 
 type FakeWebSocketBehavior = {
@@ -130,6 +131,7 @@ async function withFakeWebSocket(
           this.emit('close', { code, reason })
         },
         authorization: options?.headers?.authorization ?? '',
+        upgradeHeaders: options?.headers ?? {},
       })
       if (this.behavior.autoOpen !== false) {
         queueMicrotask(() => {
@@ -1972,9 +1974,11 @@ describe('integration: active fallback routing', () => {
     input: PluginInput,
     mainExpires: number,
     experimentalWebSockets = false,
+    responsesLite = false,
   ) {
     const hooks = await CodexAuthPlugin(input, {
       experimentalWebSockets,
+      responsesLite,
     })
     const authHook = hooks.auth
     if (!authHook?.loader) throw new Error('No auth loader')
@@ -2044,6 +2048,107 @@ describe('integration: active fallback routing', () => {
         stream: false,
       }),
     }
+  }
+
+  function responsesLiteRequestInit(
+    model: string,
+    sessionID: string,
+    options: { stream?: boolean; hostedTool?: boolean } = {},
+  ): RequestInit {
+    return {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'session-id': sessionID },
+      body: JSON.stringify({
+        model,
+        instructions: 'Be concise',
+        input: [
+          {
+            role: 'user',
+            content: [
+              { type: 'input_text', text: 'hi' },
+              {
+                type: 'input_image',
+                image_url: 'data:image/png;base64,AA==',
+                detail: 'high',
+              },
+            ],
+          },
+          {
+            type: 'function_call_output',
+            call_id: 'call_1',
+            output: [
+              {
+                type: 'input_image',
+                image_url: 'https://example.test/function.png',
+                detail: 'low',
+              },
+            ],
+          },
+          {
+            type: 'custom_tool_call_output',
+            call_id: 'call_2',
+            output: [
+              {
+                type: 'input_image',
+                image_url: 'https://example.test/custom.png',
+                detail: 'auto',
+              },
+            ],
+          },
+        ],
+        tools: [
+          { type: 'function', name: 'read', parameters: {} },
+          ...(options.hostedTool ? [{ type: 'web_search' }] : []),
+        ],
+        reasoning: { effort: 'low' },
+        stream: options.stream ?? false,
+      }),
+    }
+  }
+
+  function seedEmptyAccountStorage() {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      }),
+    )
+  }
+
+  async function captureResponsesLiteHttpRequest(
+    model: string,
+    responsesLite: boolean,
+    sessionID: string,
+    options: { hostedTool?: boolean } = {},
+  ) {
+    seedEmptyAccountStorage()
+    const originalFetch = globalThis.fetch
+    let captured: RequestInit | undefined
+    let hooks: Hooks | undefined
+    try {
+      globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+        captured = init
+        return new Response('{}', { status: 200 })
+      }) as typeof globalThis.fetch
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        responsesLite,
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responsesLiteRequestInit(model, sessionID, options),
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+    if (!captured) throw new Error('missing captured request')
+    return captured
   }
 
   function headerValue(init: unknown, name: string) {
@@ -3517,6 +3622,218 @@ describe('integration: active fallback routing', () => {
 
     expect(Object.keys(JSON.parse(httpBody))).toEqual(expectedKeys)
     expect(Object.keys(JSON.parse(wsBody))).toEqual(expectedKeys)
+  })
+
+  it('gates Responses Lite by setting and exact HTTP model', async () => {
+    // Exact-set membership is covered by RESPONSES_LITE_MODELS itself; these
+    // cases prove the gate wiring (eligible, nearest ineligible, disabled).
+    const cases = [
+      { name: 'sol', model: 'gpt-5.6-sol', enabled: true, marked: true },
+      {
+        name: 'synthetic',
+        model: 'gpt-5.6-sol-pro',
+        enabled: true,
+        marked: false,
+      },
+      { name: 'disabled', model: 'gpt-5.6-sol', enabled: false, marked: false },
+    ]
+    for (const testCase of cases) {
+      const captured = await captureResponsesLiteHttpRequest(
+        testCase.model,
+        testCase.enabled,
+        `responses-lite-${testCase.name}`,
+      )
+      expect(
+        new Headers(captured.headers).get(
+          'x-openai-internal-codex-responses-lite',
+        ),
+      ).toBe(testCase.marked ? 'true' : null)
+    }
+  })
+
+  it('rewrites an eligible HTTP body for Responses Lite', async () => {
+    const captured = await captureResponsesLiteHttpRequest(
+      'gpt-5.6-sol',
+      true,
+      'responses-lite-body',
+      { hostedTool: true },
+    )
+    const body = JSON.parse(String(captured.body)) as Record<string, unknown>
+    expect(body.reasoning).toEqual({ effort: 'low', context: 'all_turns' })
+    expect(body.parallel_tool_calls).toBe(false)
+    expect('instructions' in body).toBe(false)
+    expect('tools' in body).toBe(false)
+
+    const input = body.input as Array<Record<string, unknown>>
+    expect(input[0]).toMatchObject({
+      type: 'additional_tools',
+      role: 'developer',
+    })
+    expect(input[0]?.tools).toContainEqual({
+      type: 'function',
+      name: 'read',
+      strict: false,
+      parameters: {},
+    })
+    expect(
+      (input[0]?.tools as Array<Record<string, unknown>>).some(
+        (tool) => tool.type === 'web_search',
+      ),
+    ).toBe(false)
+    expect(input[1]).toEqual({
+      type: 'message',
+      role: 'developer',
+      content: [{ type: 'input_text', text: 'Be concise' }],
+    })
+    const sourceInput = input.slice(2)
+    expect([
+      (sourceInput[0]?.content as Array<Record<string, unknown>>)[1]?.detail,
+      (sourceInput[1]?.output as Array<Record<string, unknown>>)[0]?.detail,
+      (sourceInput[2]?.output as Array<Record<string, unknown>>)[0]?.detail,
+    ]).toEqual([undefined, undefined, undefined])
+  })
+
+  it('preserves input_image detail outside Responses Lite', async () => {
+    const captured = await captureResponsesLiteHttpRequest(
+      'gpt-5.6-sol',
+      false,
+      'responses-lite-disabled',
+    )
+    const body = JSON.parse(String(captured.body)) as Record<string, unknown>
+    const input = body.input as Array<Record<string, unknown>>
+    expect([
+      (input[0]?.content as Array<Record<string, unknown>>)[1]?.detail,
+      (input[1]?.output as Array<Record<string, unknown>>)[0]?.detail,
+      (input[2]?.output as Array<Record<string, unknown>>)[0]?.detail,
+    ]).toEqual(['high', 'low', 'auto'])
+  })
+
+  it('marks Responses Lite in WS metadata and still prewarms', async () => {
+    seedEmptyAccountStorage()
+    const sent: Array<Record<string, unknown>> = []
+    let seenUpgradeHeaders: Record<string, string> = {}
+    let hooks: Hooks | undefined
+    await withFakeWebSocket(
+      ({ message, upgradeHeaders }) => ({
+        send(data) {
+          seenUpgradeHeaders = upgradeHeaders
+          const body = JSON.parse(data) as Record<string, unknown>
+          sent.push(body)
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: {
+                id: body.generate === false ? 'resp_prewarm' : 'resp_main',
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        try {
+          const loaded = await loadFetchOverride(
+            createMockPluginInput(),
+            Date.now() + 3600_000,
+            true,
+            true,
+          )
+          hooks = loaded.hooks
+          const response = await loaded.fetchOverride(
+            'https://api.openai.com/v1/responses',
+            responsesLiteRequestInit('gpt-5.6-sol', 'responses-lite-ws', {
+              stream: true,
+            }),
+          )
+          await response.text()
+        } finally {
+          await hooks?.dispose?.()
+        }
+      },
+    )
+
+    expect(sent).toHaveLength(2)
+    expect(sent[0]?.generate).toBe(false)
+    const main = sent[1]!
+    expect(
+      (main.client_metadata as Record<string, unknown>)
+        .ws_request_header_x_openai_internal_codex_responses_lite,
+    ).toBe('true')
+    expect(
+      seenUpgradeHeaders['x-openai-internal-codex-responses-lite'],
+    ).toBeUndefined()
+  })
+
+  it('replays a WS-captured Responses Lite keepwarm over HTTP', async () => {
+    seedEmptyAccountStorage()
+    const originalFetch = globalThis.fetch
+    const originalNow = Date.now
+    let now = originalNow()
+    const warmRequests: RequestInit[] = []
+    let hooks: Hooks | undefined
+    Date.now = () => now
+    try {
+      globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+        if (init) warmRequests.push(init)
+        return new Response('{}', { status: 200 })
+      }) as typeof globalThis.fetch
+      await withFakeWebSocket(
+        ({ message }) => ({
+          send(data) {
+            const body = JSON.parse(data) as Record<string, unknown>
+            message(
+              JSON.stringify({
+                type: 'response.completed',
+                response: {
+                  id: body.generate === false ? 'resp_prewarm' : 'resp_main',
+                },
+              }),
+            )
+          },
+        }),
+        async () => {
+          const loaded = await loadFetchOverride(
+            createMockPluginInput(),
+            now + 3600_000,
+            true,
+            true,
+          )
+          hooks = loaded.hooks
+          await runCommand(hooks, 'openai-cachekeep', 'on')
+          const response = await loaded.fetchOverride(
+            'https://api.openai.com/v1/responses',
+            responsesLiteRequestInit('gpt-5.6-sol', 'responses-lite-keepwarm', {
+              stream: true,
+            }),
+          )
+          await response.text()
+          now += 30 * 60_000
+          const manager = (
+            globalThis as typeof globalThis & {
+              __openaiAuthCacheKeepManager?: { tick(): Promise<void> }
+            }
+          ).__openaiAuthCacheKeepManager
+          if (!manager) throw new Error('missing cachekeep manager')
+          await manager.tick()
+        },
+      )
+    } finally {
+      Date.now = originalNow
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+
+    expect(warmRequests).toHaveLength(1)
+    const warm = warmRequests[0]!
+    expect(
+      new Headers(warm.headers).get('x-openai-internal-codex-responses-lite'),
+    ).toBe('true')
+    const body = JSON.parse(String(warm.body)) as Record<string, unknown>
+    const metadata = body.client_metadata as Record<string, unknown>
+    expect('x-codex-turn-metadata' in metadata).toBe(false)
+    expect('x-codex-ws-stream-request-start-ms' in metadata).toBe(false)
+    expect(
+      'ws_request_header_x_openai_internal_codex_responses_lite' in metadata,
+    ).toBe(false)
   })
 
   it('keeps the main refresh advisory lease shorter than the file lock TTL', () => {

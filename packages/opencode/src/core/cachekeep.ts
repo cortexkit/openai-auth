@@ -113,6 +113,7 @@ export function buildKeepwarmCapture(input: {
     'x-codex-window-id',
     'x-client-request-id',
     'thread-id',
+    'x-openai-internal-codex-responses-lite',
   ]) {
     const value = input.headers.get(name)
     if (value) replayHeaders[name] = value
