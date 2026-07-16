@@ -118,6 +118,9 @@ async function executeQuotaCommand(
         )
       }
     }
+    if (q.resetCreditsAvailable !== undefined) {
+      lines.push(`- resets: ${q.resetCreditsAvailable}`)
+    }
   } else {
     lines.push('No main quota snapshot available. Send a request first.')
   }
@@ -138,6 +141,9 @@ async function executeQuotaCommand(
             `  - ${key}: ${pct}% used (${Math.round(w.remainingPercent)}% remaining)`,
           )
         }
+      }
+      if (entry.quota.resetCreditsAvailable !== undefined) {
+        lines.push(`  - resets: ${entry.quota.resetCreditsAvailable}`)
       }
     }
   }
@@ -419,7 +425,7 @@ async function executeKillswitchCommand(
     const lines = ['## Killswitch', '', `Status: **${enabled ? 'ON' : 'OFF'}**`]
     if (enabled) {
       lines.push('')
-      lines.push('| Account | 5h threshold | 1w threshold |')
+      lines.push('| Account | primary threshold | secondary threshold |')
       lines.push('| ------- | ------------ | ------------ |')
       const mainT = config.main ?? {}
       const fh =

@@ -3,6 +3,7 @@ import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
 import {
   buildCachekeepDialogOptions,
+  formatQuotaWindows,
   openCommandDialog,
 } from '../tui/command-dialogs'
 
@@ -144,5 +145,41 @@ describe('command dialogs', () => {
     // Instead it installs the window-prompt dialog via dialog.replace, so a
     // further replace must have fired beyond the initial dialog open.
     expect(replaceCount.value).toBeGreaterThan(replacesBeforeSelect)
+  })
+
+  test('account quota descriptions derive labels from present window lengths', () => {
+    expect(
+      formatQuotaWindows({
+        primary: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          windowMinutes: 10_080,
+        },
+      }),
+    ).toBe('7d: 20%')
+
+    expect(
+      formatQuotaWindows({
+        primary: {
+          usedPercent: 3,
+          remainingPercent: 97,
+          windowMinutes: 300,
+        },
+        secondary: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          windowMinutes: 10_080,
+        },
+      }),
+    ).toBe('5h: 3% 7d: 20%')
+  })
+
+  test('account quota descriptions show reset credits without windows', () => {
+    expect(formatQuotaWindows({ resetCreditsAvailable: 3 })).toBe('resets: 3')
+  })
+
+  test('account quota descriptions reserve no-data text for empty snapshots', () => {
+    expect(formatQuotaWindows({})).toBe('no quota data')
+    expect(formatQuotaWindows(null)).toBe('no quota data')
   })
 })

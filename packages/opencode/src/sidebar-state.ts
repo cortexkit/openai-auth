@@ -2,11 +2,75 @@ export interface QuotaWindow {
   usedPercent: number
   remainingPercent: number
   resetsAt?: string
+  windowMinutes?: number
 }
 
 export interface AccountQuota {
   primary?: QuotaWindow
   secondary?: QuotaWindow
+  resetCreditsAvailable?: number
+}
+
+export type QuotaWindowKey = 'primary' | 'secondary'
+
+const QUOTA_WINDOW_KEYS: readonly QuotaWindowKey[] = ['primary', 'secondary']
+
+function compactUnit(value: number): string {
+  return Number.isInteger(value)
+    ? String(value)
+    : String(Math.round(value * 10) / 10)
+}
+
+// Derives a short human label ("5h", "1d", "7d") from a window length in
+// minutes. Old snapshots carry no length, so the stable slot name is the
+// fallback label rather than a guessed duration.
+export function formatWindowLabel(
+  windowMinutes: number | undefined,
+  fallbackKey: QuotaWindowKey,
+): string {
+  if (
+    windowMinutes === undefined ||
+    !Number.isFinite(windowMinutes) ||
+    windowMinutes <= 0
+  ) {
+    return fallbackKey
+  }
+  if (windowMinutes < 60) return `${compactUnit(windowMinutes)}m`
+  if (windowMinutes < 1_440) {
+    return `${compactUnit(windowMinutes / 60)}h`
+  }
+  return `${compactUnit(windowMinutes / 1_440)}d`
+}
+
+export interface PresentQuotaWindow {
+  key: QuotaWindowKey
+  label: string
+  window: QuotaWindow
+  windowMs: number | null
+}
+
+// Present windows only — an absent slot means "not applicable", not
+// "unknown", so it must never synthesize a placeholder row here.
+export function getPresentQuotaWindows(
+  quota: AccountQuota | null,
+): PresentQuotaWindow[] {
+  if (!quota) return []
+  const rows: PresentQuotaWindow[] = []
+  for (const key of QUOTA_WINDOW_KEYS) {
+    const window = quota[key]
+    if (!window) continue
+    const validMinutes =
+      Number.isFinite(window.windowMinutes) && (window.windowMinutes ?? 0) > 0
+        ? window.windowMinutes
+        : undefined
+    rows.push({
+      key,
+      label: formatWindowLabel(validMinutes, key),
+      window,
+      windowMs: validMinutes === undefined ? null : validMinutes * 60_000,
+    })
+  }
+  return rows
 }
 
 export interface SidebarAccountState {
@@ -15,6 +79,7 @@ export interface SidebarAccountState {
   quota: AccountQuota | null
   killed: boolean
   enabled: boolean
+  resetCredits?: number
 }
 
 export interface SidebarState {
@@ -25,6 +90,7 @@ export interface SidebarState {
     quotaBackoffUntil?: number
     refreshBackedOff?: boolean
     refreshBackoffUntil?: number
+    resetCredits?: number
   }
   fallbacks: SidebarAccountState[]
   activeId: string | undefined
@@ -45,6 +111,17 @@ const logSb = createLogger('sidebar')
 const STATE_FILE_ENV = 'OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE'
 const DEFAULT_STATE_DIR = join(tmpdir(), 'opencode-openai-auth')
 const DEFAULT_STATE_FILE = join(DEFAULT_STATE_DIR, 'sidebar-state.json')
+
+function normalizeResetCredits(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined
+}
+
+function resetCreditsField(value: unknown): { resetCredits?: number } {
+  const credits = normalizeResetCredits(value)
+  return credits !== undefined ? { resetCredits: credits } : {}
+}
 
 export function getSidebarStateFile(): string {
   return process.env[STATE_FILE_ENV] || DEFAULT_STATE_FILE
@@ -99,6 +176,7 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
       ...(typeof m.refreshBackoffUntil === 'number'
         ? { refreshBackoffUntil: m.refreshBackoffUntil }
         : {}),
+      ...resetCreditsField(m.resetCredits),
     }
   } else {
     main = { quota: null, killed: false }
@@ -123,6 +201,7 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
           quota: ('quota' in e ? e.quota : null) as AccountQuota | null,
           killed: typeof e.killed === 'boolean' ? e.killed : false,
           enabled: typeof e.enabled === 'boolean' ? e.enabled : true,
+          ...resetCreditsField(e.resetCredits),
         }))
     : []
 
@@ -139,7 +218,6 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
   // Optional top-level fields
   const planType = typeof r.planType === 'string' ? r.planType : undefined
   const credits = typeof r.credits === 'number' ? r.credits : undefined
-
   return {
     main,
     fallbacks,
@@ -250,19 +328,21 @@ export function getCollapsedQuotaSummary(quota: AccountQuota | null): {
 } {
   const primaryUsedPercent = quota?.primary?.usedPercent ?? null
   const secondaryUsedPercent = quota?.secondary?.usedPercent ?? null
-  if (primaryUsedPercent == null && secondaryUsedPercent == null) {
-    return { primaryUsedPercent, secondaryUsedPercent, text: null }
-  }
-
+  const rows = getPresentQuotaWindows(quota)
   return {
     primaryUsedPercent,
     secondaryUsedPercent,
-    text: `5h: ${primaryUsedPercent == null ? '\u2014' : `${Math.round(primaryUsedPercent)}%`} 7d: ${secondaryUsedPercent == null ? '\u2014' : `${Math.round(secondaryUsedPercent)}%`}`,
+    text:
+      rows.length === 0
+        ? null
+        : rows
+            .map(
+              ({ label, window }) =>
+                `${label}: ${Math.round(window.usedPercent)}%`,
+            )
+            .join(' '),
   }
 }
-
-export const FIVE_HOUR_MS = 5 * 60 * 60 * 1000
-export const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000
 
 const PACING_MIN_ELAPSED_MS = 5 * 60 * 1000
 const PACING_MIN_ELAPSED_FRACTION = 0.01

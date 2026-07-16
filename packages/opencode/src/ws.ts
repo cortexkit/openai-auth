@@ -327,7 +327,8 @@ export function streamResponsesWebSocket(
       // falsely disconnected.
       resetIdleTimeout('idle timeout waiting for websocket')
       // biome-ignore lint/suspicious/noExplicitAny: ws event parsed from JSON
-      options.onQuota?.(normalizeWsFrame(event as any))
+      const quotaFrame = normalizeWsFrame(event as any)
+      options.onQuota?.(quotaFrame as Record<string, unknown>)
       return
     }
 

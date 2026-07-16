@@ -23,12 +23,12 @@ import {
   type AccountQuota,
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
-  FIVE_HOUR_MS,
   getCollapsedQuotaSummary,
+  getPresentQuotaWindows,
   getSidebarState,
   type QuotaPacing,
+  type QuotaWindow,
   resolveActiveAccount,
-  SEVEN_DAY_MS,
   type SidebarState,
 } from './sidebar-state.js'
 import { openCommandDialog } from './tui/command-dialogs.js'
@@ -228,6 +228,55 @@ function CollapsedRow(props: {
   )
 }
 
+export interface QuotaDisplayRow {
+  key: 'primary' | 'secondary'
+  label: string
+  window: QuotaWindow
+  pacing: QuotaPacing | null
+}
+
+// Maps present quota windows onto display rows: pacing is computed here (per
+// window, against the wall clock at call time) and skipped entirely for a
+// window with no known length, since there is no ruler to pace against.
+export function buildQuotaRowsForDisplay(
+  quota: AccountQuota | null,
+  now: number,
+  pacingEnabled: boolean,
+): QuotaDisplayRow[] {
+  return getPresentQuotaWindows(quota).map((row) => ({
+    key: row.key,
+    label: row.label,
+    window: row.window,
+    pacing:
+      pacingEnabled && row.windowMs !== null
+        ? computeQuotaPacing(row.window, row.windowMs, now)
+        : null,
+  }))
+}
+
+export function isQuotaLoaded(quota: AccountQuota | null): boolean {
+  return quota !== null
+}
+
+export function getQuotaMetadataRows(
+  state: SidebarState,
+): Array<{ label: string; value: string }> {
+  const rows: Array<{ label: string; value: string }> = []
+  if (state.planType) rows.push({ label: 'Plan', value: state.planType })
+  if (state.credits !== undefined) {
+    rows.push({ label: 'Credits', value: String(state.credits) })
+  }
+  return rows
+}
+
+export function getAccountMetadataRows(
+  resetCredits: number | undefined,
+): Array<{ label: string; value: string }> {
+  return resetCredits === undefined
+    ? []
+    : [{ label: 'resets', value: String(resetCredits) }]
+}
+
 // Quota window row: muted label left, tone-colored bar + percentage right,
 // with an optional muted reset suffix. When pacing data is present, the bar
 // gains a pace segment and an off-pace window adds a muted subline with the
@@ -311,21 +360,15 @@ function AccountBlock(props: {
   killed: boolean
   active: boolean
   pacingEnabled: boolean
+  resetCredits?: number
   marginTop?: number
 }) {
   const statusWord = () =>
     props.killed ? 'blocked' : props.active ? 'active' : 'idle'
   const statusTone = (): Tone =>
     props.killed ? 'err' : props.active ? 'ok' : 'muted'
-  const pacingFor = (
-    window:
-      | { usedPercent: number; remainingPercent: number; resetsAt?: string }
-      | undefined,
-    windowMs: number,
-  ) =>
-    props.pacingEnabled && window
-      ? computeQuotaPacing(window, windowMs, Date.now())
-      : null
+  const rows = () =>
+    buildQuotaRowsForDisplay(props.quota, Date.now(), props.pacingEnabled)
   return (
     <box width='100%' flexDirection='column' marginTop={props.marginTop ?? 0}>
       <box width='100%' flexDirection='row' justifyContent='space-between'>
@@ -337,24 +380,36 @@ function AccountBlock(props: {
         </text>
       </box>
       <Show
-        when={props.quota}
+        when={isQuotaLoaded(props.quota)}
         fallback={<text fg={props.theme.textMuted}>{'checking\u2026'}</text>}
       >
-        <QuotaRow
-          theme={props.theme}
-          appearance={props.appearance}
-          label='5h'
-          window={props.quota?.primary}
-          pacing={pacingFor(props.quota?.primary, FIVE_HOUR_MS)}
-        />
-        <QuotaRow
-          theme={props.theme}
-          appearance={props.appearance}
-          label='7d'
-          window={props.quota?.secondary}
-          pacing={pacingFor(props.quota?.secondary, SEVEN_DAY_MS)}
-        />
+        <Show
+          when={rows().length > 0}
+          fallback={<text fg={props.theme.textMuted}>{'\u2014'}</text>}
+        >
+          <For each={rows()}>
+            {(row) => (
+              <QuotaRow
+                theme={props.theme}
+                appearance={props.appearance}
+                label={row.label}
+                window={row.window}
+                pacing={row.pacing}
+              />
+            )}
+          </For>
+        </Show>
       </Show>
+      <For each={getAccountMetadataRows(props.resetCredits)}>
+        {(row) => (
+          <StatRow
+            theme={props.theme}
+            label={row.label}
+            value={row.value}
+            tone='text'
+          />
+        )}
+      </For>
     </box>
   )
 }
@@ -401,6 +456,7 @@ function QuotaDialogContent(props: {
           killed={state().main?.killed ?? false}
           active={state().activeId === 'main'}
           pacingEnabled={prefs().sections.pacing}
+          resetCredits={state().main?.resetCredits}
         />
         <Show when={prefs().sections.fallbackAccounts}>
           <For each={enabledFallbacks()}>
@@ -413,6 +469,7 @@ function QuotaDialogContent(props: {
                 killed={fb.killed}
                 active={state().activeId === fb.id}
                 pacingEnabled={prefs().sections.pacing}
+                resetCredits={fb.resetCredits}
                 marginTop={1}
               />
             )}
@@ -552,17 +609,11 @@ function QuotaSidebar(props: {
     getCollapsedQuotaSummary(activeAccount().quota)
   const activePacingDeficit = () => {
     if (!prefs().sections.pacing) return false
-    const quota = activeAccount().quota
-    if (!quota) return false
-    const now = Date.now()
-    const windows: Array<[typeof quota.primary, number]> = [
-      [quota.primary, FIVE_HOUR_MS],
-      [quota.secondary, SEVEN_DAY_MS],
-    ]
-    return windows.some(
-      ([w, ms]) =>
-        w != null && computeQuotaPacing(w, ms, now)?.state === 'deficit',
-    )
+    return buildQuotaRowsForDisplay(
+      activeAccount().quota,
+      Date.now(),
+      true,
+    ).some((row) => row.pacing?.state === 'deficit')
   }
   const activeQuotaTone = (): Tone => {
     const summary = activeQuotaSummary()
@@ -640,7 +691,7 @@ function QuotaSidebar(props: {
         </Show>
       </box>
 
-      {/* Collapsed: active account 5h + 7d quota + dot (red ⊘ when killed) */}
+      {/* Collapsed: active account's present quota windows + dot (red ⊘ when killed) */}
       <Show when={collapsed() && hasData()}>
         <CollapsedRow theme={theme()} label={activeAccount().name}>
           <Show
@@ -686,6 +737,7 @@ function QuotaSidebar(props: {
               killed={state().main?.killed ?? false}
               active={state().activeId === 'main'}
               pacingEnabled={prefs().sections.pacing}
+              resetCredits={state().main?.resetCredits}
             />
             <Show when={prefs().sections.fallbackAccounts}>
               <For each={enabledFallbacks()}>
@@ -698,6 +750,7 @@ function QuotaSidebar(props: {
                     killed={fb.killed}
                     active={state().activeId === fb.id}
                     pacingEnabled={prefs().sections.pacing}
+                    resetCredits={fb.resetCredits}
                     marginTop={1}
                   />
                 )}
@@ -717,25 +770,17 @@ function QuotaSidebar(props: {
           />
         </Show>
 
-        {/* Plan + Credits */}
-        <Show when={state().planType || state().credits != null}>
-          <Show when={state().planType}>
+        {/* Plan and credits — whichever are present */}
+        <For each={getQuotaMetadataRows(state())}>
+          {(row) => (
             <StatRow
               theme={theme()}
-              label='Plan'
-              value={state().planType ?? '\u2014'}
+              label={row.label}
+              value={row.value}
               tone='text'
             />
-          </Show>
-          <Show when={state().credits != null}>
-            <StatRow
-              theme={theme()}
-              label='Credits'
-              value={String(state().credits)}
-              tone='text'
-            />
-          </Show>
-        </Show>
+          )}
+        </For>
 
         {/* Health — only when something is wrong */}
         <Show when={degraded() && prefs().sections.health}>

@@ -412,6 +412,192 @@ describe('integration: HTTP quota push', () => {
       await hooks?.dispose?.()
     }
   })
+
+  it('a complete header frame reporting every window retired clears cached windows', async () => {
+    const store = {
+      version: 1,
+      main: { type: 'opencode', provider: 'openai' },
+      accounts: [],
+    }
+    writeFileSync(configFile, JSON.stringify(store))
+
+    // First response carries a real primary window — seeds the cache.
+    let respondWithRealWindow = true
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => {
+      const headers = new Headers(
+        respondWithRealWindow
+          ? {
+              'content-type': 'text/event-stream',
+              'x-codex-primary-used-percent': '42',
+              'x-codex-primary-window-minutes': '10080',
+              'x-codex-primary-reset-at': '1781729038',
+            }
+          : {
+              'content-type': 'text/event-stream',
+              'x-codex-primary-used-percent': '0',
+              'x-codex-secondary-used-percent': '0',
+            },
+      )
+      return new Response('{"choices":[{"delta":{"content":"hello"}}]}', {
+        status: 200,
+        headers,
+      })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const input = createMockPluginInput()
+      hooks = await CodexAuthPlugin(input, { experimentalWebSockets: false })
+      const authHook = hooks.auth
+      if (!authHook?.loader) throw new Error('No auth loader')
+      const loaderResult = await authHook.loader(
+        async () => ({
+          type: 'oauth' as const,
+          provider: 'openai',
+          access: accessToken,
+          refresh: refreshToken,
+          expires: Date.now() + 3600_000,
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+      )
+      const fetchOverride = (loaderResult as Record<string, unknown>).fetch as
+        | ((url: string, init?: RequestInit) => Promise<Response>)
+        | undefined
+      if (!fetchOverride) throw new Error('No fetch in loader result')
+
+      const request = (): RequestInit => ({
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'gpt-5.5',
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      })
+
+      const seed = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        request(),
+      )
+      await seed.body?.cancel()
+      await waitForSidebarState(
+        sidebarFile,
+        (s) => s.main.quota?.primary?.usedPercent === 42,
+      )
+
+      respondWithRealWindow = false
+      const retired = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        request(),
+      )
+      await retired.body?.cancel()
+
+      const sidebar = await waitForSidebarState(
+        sidebarFile,
+        (s) => s.main.quota?.primary === undefined,
+      )
+      expect(sidebar.main.quota?.primary).toBeUndefined()
+      expect(sidebar.main.quota?.secondary).toBeUndefined()
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('a truly empty header set (no x-codex-* headers) does NOT clobber cached windows', async () => {
+    const store = {
+      version: 1,
+      main: { type: 'opencode', provider: 'openai' },
+      accounts: [],
+    }
+    writeFileSync(configFile, JSON.stringify(store))
+
+    let respondWithRealWindow = true
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => {
+      const headers = new Headers(
+        respondWithRealWindow
+          ? {
+              'content-type': 'text/event-stream',
+              'x-codex-primary-used-percent': '42',
+              'x-codex-primary-window-minutes': '10080',
+              'x-codex-primary-reset-at': '1781729038',
+            }
+          : { 'content-type': 'text/event-stream' },
+      )
+      return new Response('{"choices":[{"delta":{"content":"hello"}}]}', {
+        status: 200,
+        headers,
+      })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const input = createMockPluginInput()
+      hooks = await CodexAuthPlugin(input, { experimentalWebSockets: false })
+      const authHook = hooks.auth
+      if (!authHook?.loader) throw new Error('No auth loader')
+      const loaderResult = await authHook.loader(
+        async () => ({
+          type: 'oauth' as const,
+          provider: 'openai',
+          access: accessToken,
+          refresh: refreshToken,
+          expires: Date.now() + 3600_000,
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+      )
+      const fetchOverride = (loaderResult as Record<string, unknown>).fetch as
+        | ((url: string, init?: RequestInit) => Promise<Response>)
+        | undefined
+      if (!fetchOverride) throw new Error('No fetch in loader result')
+
+      const request = (): RequestInit => ({
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'gpt-5.5',
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      })
+
+      const seed = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        request(),
+      )
+      await seed.body?.cancel()
+      await waitForSidebarState(
+        sidebarFile,
+        (s) => s.main.quota?.primary?.usedPercent === 42,
+      )
+
+      respondWithRealWindow = false
+      const nonQuota = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        request(),
+      )
+      await nonQuota.body?.cancel()
+
+      // Give any (incorrect) clearing write a chance to land before asserting
+      // the cache survived.
+      await drainSidebarWrites()
+      const sidebar = JSON.parse(
+        readFileSync(sidebarFile, 'utf8'),
+      ) as SidebarState
+      expect(sidebar.main.quota?.primary?.usedPercent).toBe(42)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1684,6 +1870,172 @@ describe('integration: WS quota push', () => {
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
     delete process.env.OPENCODE_CONFIG_DIR
     delete process.env.NODE_ENV
+  })
+
+  it('attributes an early fallback WS quota push to the served fallback', async () => {
+    const now = Date.now()
+    const fallback = {
+      id: 'fallback-1',
+      type: 'oauth' as const,
+      label: 'Fallback 1',
+      enabled: true,
+      access: 'fallback-access',
+      refresh: 'fallback-refresh',
+      expires: now + 24 * 3600_000,
+      accountId: 'chatgpt-fallback-1',
+    }
+    const quota = (usedPercent: number, resetCreditsAvailable: number) => ({
+      primary: {
+        usedPercent,
+        remainingPercent: 100 - usedPercent,
+        checkedAt: now,
+        windowMinutes: 300,
+      },
+      resetCreditsAvailable,
+    })
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [{ ...fallback, quota: quota(30, 2) }],
+        routing: { mode: 'fallback-first' },
+        quota: {
+          mainQuota: quota(20, 4),
+          mainQuotaCheckedAt: now,
+        },
+      }),
+    )
+    writeFileSync(
+      sidebarFile,
+      JSON.stringify({
+        main: { quota: quota(20, 4), killed: false },
+        fallbacks: [
+          {
+            id: fallback.id,
+            label: fallback.label,
+            quota: quota(30, 2),
+            killed: false,
+            enabled: true,
+            resetCredits: 2,
+          },
+        ],
+        activeId: 'main',
+        route: 'fallback-first',
+        lastUpdated: 1,
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+    let hooks: Hooks | undefined
+    let releaseFirstEvent: (() => void) | undefined
+    let quotaFrameSent: (() => void) | undefined
+    const quotaFrameSentPromise = new Promise<void>((resolve) => {
+      quotaFrameSent = resolve
+    })
+
+    await withFakeWebSocket(
+      ({ message, authorization }) => ({
+        send() {
+          expect(authorization).toBe('Bearer fallback-access')
+          message(
+            JSON.stringify({
+              type: 'codex.rate_limits',
+              rate_limits: {
+                primary: { used_percent: 35, window_minutes: 300 },
+              },
+            }),
+          )
+          releaseFirstEvent = () => {
+            message(
+              JSON.stringify({
+                type: 'response.completed',
+                response: { id: 'resp_fallback_1' },
+              }),
+            )
+          }
+          quotaFrameSent?.()
+        },
+      }),
+      async () => {
+        try {
+          hooks = await CodexAuthPlugin(createMockPluginInput(), {
+            experimentalWebSockets: true,
+          })
+          const authHook = hooks.auth
+          if (!authHook?.loader) throw new Error('No auth loader')
+          const loaderResult = await authHook.loader(
+            async () => ({
+              type: 'oauth' as const,
+              provider: 'openai',
+              access: 'main-access',
+              refresh: 'main-refresh',
+              expires: now + 3600_000,
+            }),
+            {
+              id: 'openai',
+              label: 'OpenAI',
+              models: [],
+            } as unknown as Parameters<
+              NonNullable<(typeof authHook)['loader']>
+            >[1],
+          )
+          const fetchOverride = (loaderResult as Record<string, unknown>)
+            .fetch as (url: string, init?: RequestInit) => Promise<Response>
+          const responsePromise = fetchOverride(
+            'https://api.openai.com/v1/responses',
+            {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                'session-id': 'early-fallback-quota',
+              },
+              body: JSON.stringify({
+                model: 'gpt-5.5',
+                input: [],
+                stream: true,
+              }),
+            },
+          )
+
+          await quotaFrameSentPromise
+          let earlySidebar: SidebarState
+          while (true) {
+            earlySidebar = JSON.parse(
+              await readFile(sidebarFile, 'utf8'),
+            ) as SidebarState
+            if (
+              earlySidebar.fallbacks.find(
+                (account) => account.id === fallback.id,
+              )?.quota?.primary?.usedPercent === 35
+            )
+              break
+            await Promise.resolve()
+          }
+          expect(releaseFirstEvent).toBeDefined()
+          releaseFirstEvent?.()
+
+          const response = await responsePromise
+          expect(response.status).toBe(200)
+          await response.body?.cancel()
+          await drainSidebarWrites()
+
+          const sidebar = JSON.parse(
+            await readFile(sidebarFile, 'utf8'),
+          ) as SidebarState
+          expect(sidebar.activeId).toBe('fallback-1')
+          expect(
+            sidebar.fallbacks.find((account) => account.id === fallback.id)
+              ?.resetCredits,
+          ).toBe(2)
+        } finally {
+          globalThis.fetch = originalFetch
+          await hooks?.dispose?.()
+        }
+      },
+    )
   })
 
   it('onQuota fires for codex.rate_limits frame and the frame is NOT relayed as SSE output', async () => {
@@ -3126,7 +3478,10 @@ describe('integration: active fallback routing', () => {
     }
   })
 
-  it('preserves a fresh fallback quota window when a partial failed snapshot arrives', async () => {
+  it('a later single-primary snapshot fully replaces an earlier two-window snapshot, not merges with it', async () => {
+    // Header/WS pushes are always complete snapshots of every live window
+    // (never a partial subset), so a later push that omits a window means
+    // the wire genuinely dropped it — the cached value must not survive.
     seedStorage({ access: 'fallback-access-token' })
     const originalFetch = globalThis.fetch
     let fallbackCalls = 0
@@ -3174,74 +3529,9 @@ describe('integration: active fallback routing', () => {
         sidebarFile,
         (s) =>
           s.fallbacks.find((a) => a.id === 'fallback-1')?.quota?.primary
-            ?.usedPercent === 20 &&
-          s.fallbacks.find((a) => a.id === 'fallback-1')?.quota?.secondary
-            ?.usedPercent === 95,
+            ?.usedPercent === 20,
       )
       const quota = sidebar.fallbacks.find((a) => a.id === 'fallback-1')?.quota
-      expect(quota?.primary?.usedPercent).toBe(20)
-      expect(quota?.secondary?.usedPercent).toBe(95)
-    } finally {
-      globalThis.fetch = originalFetch
-      await hooks?.dispose?.()
-    }
-  })
-
-  it('does not preserve a fallback quota window after its reset passed', async () => {
-    seedStorage({ access: 'fallback-access-token' })
-    const originalFetch = globalThis.fetch
-    const pastReset = Math.floor((Date.now() - 60_000) / 1000)
-    let fallbackCalls = 0
-    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
-      const auth = headerValue(init, 'authorization')
-      if (auth.includes('fallback-access-token')) {
-        fallbackCalls++
-        return new Response('{}', {
-          status: 429,
-          headers:
-            fallbackCalls === 1
-              ? {
-                  'x-codex-primary-used-percent': '10',
-                  'x-codex-secondary-used-percent': '95',
-                  'x-codex-secondary-reset-at': String(pastReset),
-                }
-              : { 'x-codex-primary-used-percent': '20' },
-        })
-      }
-      return new Response('{}', { status: 200 })
-    }) as unknown as typeof globalThis.fetch
-
-    let hooks: Hooks | undefined
-    try {
-      const loaded = await loadFetchOverride(
-        createMockPluginInput(),
-        Date.now() + 3600_000,
-      )
-      hooks = loaded.hooks
-
-      const first = await loaded.fetchOverride(
-        'https://api.openai.com/v1/responses',
-        requestInit(),
-      )
-      expect(first.status).toBe(200)
-      await first.body?.cancel()
-
-      const second = await loaded.fetchOverride(
-        'https://api.openai.com/v1/responses',
-        requestInit(),
-      )
-      expect(second.status).toBe(200)
-      await second.body?.cancel()
-
-      const sidebar = await waitForSidebarState(sidebarFile, (state) => {
-        const quota = state.fallbacks.find(
-          (account) => account.id === 'fallback-1',
-        )?.quota
-        return quota?.primary?.usedPercent === 20 && !quota.secondary
-      })
-      const quota = sidebar.fallbacks.find(
-        (account) => account.id === 'fallback-1',
-      )?.quota
       expect(quota?.primary?.usedPercent).toBe(20)
       expect(quota?.secondary).toBeUndefined()
     } finally {
@@ -3649,6 +3939,85 @@ describe('integration: active fallback routing', () => {
       expect(oauthRefreshCalls).toBe(1)
       expect(authSetCalls).toBe(3)
       expect(seenAuth).toEqual([])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('a fallback that stops sending a secondary window does not keep resurrecting it from cache', async () => {
+    seedStorage({ access: 'fallback-access-token' })
+    const originalFetch = globalThis.fetch
+    const farFuture = Math.floor((Date.now() + 7 * 24 * 3600_000) / 1000)
+    let responseHeaders: Record<string, string> = {
+      'x-codex-primary-used-percent': '10',
+      'x-codex-primary-window-minutes': '300',
+      'x-codex-primary-reset-at': String(farFuture),
+      'x-codex-secondary-used-percent': '20',
+      'x-codex-secondary-window-minutes': '10080',
+      'x-codex-secondary-reset-at': String(farFuture),
+    }
+    globalThis.fetch = (async () => {
+      return new Response('{}', {
+        status: 200,
+        headers: { 'content-type': 'application/json', ...responseHeaders },
+      })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      // First push: real two-window frame — cache now holds both windows.
+      let response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(response.status).toBe(200)
+      await response.body?.cancel()
+
+      await waitForSidebarState(
+        sidebarFile,
+        (s) =>
+          s.fallbacks.find((a) => a.id === 'fallback-1')?.quota?.secondary
+            ?.usedPercent === 20,
+      )
+
+      // The backend stops sending a secondary window entirely (the current
+      // live wire shape) — every subsequent push is single-primary.
+      responseHeaders = {
+        'x-codex-primary-used-percent': '15',
+        'x-codex-primary-window-minutes': '300',
+        'x-codex-primary-reset-at': String(farFuture),
+      }
+      response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(response.status).toBe(200)
+      await response.body?.cancel()
+
+      response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+      expect(response.status).toBe(200)
+      await response.body?.cancel()
+
+      const sidebar = await waitForSidebarState(
+        sidebarFile,
+        (s) =>
+          s.fallbacks.find((a) => a.id === 'fallback-1')?.quota?.primary
+            ?.usedPercent === 15,
+      )
+      // The removed secondary must not be perpetuated from the stale cache.
+      expect(
+        sidebar.fallbacks.find((a) => a.id === 'fallback-1')?.quota?.secondary,
+      ).toBeUndefined()
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()

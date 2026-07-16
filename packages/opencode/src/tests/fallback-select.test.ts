@@ -148,6 +148,172 @@ describe('fallback selection', () => {
     expect(killswitchPassesPolicy(quota, storage, undefined, now)).toBe(true)
   })
 
+  it('killswitch: fail-closed skips an absent secondary window (healthy primary passes)', () => {
+    const now = 1_700_000_000_000
+    const storage = makeStorage([])
+    storage.quota = { enabled: true, failClosedOnUnknownQuota: true }
+    storage.killswitch = {
+      enabled: true,
+      main: { primary: 5, secondary: 10 },
+    }
+    const quota = {
+      primary: {
+        usedPercent: 20,
+        remainingPercent: 80,
+        windowMinutes: 10_080,
+        checkedAt: now,
+        resetsAt: new Date(now + 60_000).toISOString(),
+      },
+    }
+
+    expect(killswitchPassesPolicy(quota, storage, undefined, now)).toBe(true)
+  })
+
+  it('killswitch: fail-closed rejects a present stale window', () => {
+    const now = 1_700_000_000_000
+    const storage = makeStorage([])
+    storage.quota = { enabled: true, failClosedOnUnknownQuota: true }
+    storage.killswitch = {
+      enabled: true,
+      main: { primary: 5, secondary: 10 },
+    }
+    const quota = {
+      primary: {
+        usedPercent: 20,
+        remainingPercent: 80,
+        checkedAt: now - 1_000,
+        resetsAt: new Date(now - 1).toISOString(),
+      },
+    }
+
+    expect(killswitchPassesPolicy(quota, storage, undefined, now)).toBe(false)
+  })
+
+  it('fail-closed skips an absent secondary window', () => {
+    const now = 1_700_000_000_000
+    const storage = makeStorage([])
+    storage.quota = {
+      enabled: true,
+      failClosedOnUnknownQuota: true,
+      minimumRemaining: { primary: 5, secondary: 10 },
+    }
+    const quota = {
+      primary: {
+        usedPercent: 20,
+        remainingPercent: 80,
+        windowMinutes: 10_080,
+        checkedAt: now,
+        resetsAt: new Date(now + 60_000).toISOString(),
+      },
+    }
+
+    expect(quotaSnapshotPassesPolicy(quota, storage, now)).toBe(true)
+  })
+
+  it('fail-closed rejects a present stale window', () => {
+    const now = 1_700_000_000_000
+    const storage = makeStorage([])
+    storage.quota = { enabled: true, failClosedOnUnknownQuota: true }
+    const quota = {
+      primary: {
+        usedPercent: 20,
+        remainingPercent: 80,
+        checkedAt: now - 1_000,
+        resetsAt: new Date(now - 1).toISOString(),
+      },
+    }
+
+    expect(quotaSnapshotPassesPolicy(quota, storage, now)).toBe(false)
+  })
+
+  it('keeps thresholds keyed by slot when a 7-day window is primary', () => {
+    const now = 1_700_000_000_000
+    const storage = makeStorage([])
+    storage.quota = {
+      enabled: true,
+      failClosedOnUnknownQuota: false,
+      minimumRemaining: { primary: 25, secondary: 5 },
+    }
+    const quota = {
+      primary: {
+        usedPercent: 80,
+        remainingPercent: 20,
+        windowMinutes: 10_080,
+        checkedAt: now,
+        resetsAt: new Date(now + 60_000).toISOString(),
+      },
+    }
+
+    expect(quotaSnapshotPassesPolicy(quota, storage, now)).toBe(false)
+  })
+
+  it('fail-open still checks a healthy sibling after skipping a stale window', () => {
+    const now = 1_700_000_000_000
+    const storage = makeStorage([])
+    storage.quota = {
+      enabled: true,
+      failClosedOnUnknownQuota: false,
+      minimumRemaining: { primary: 5, secondary: 25 },
+    }
+    const quota = {
+      primary: {
+        usedPercent: 20,
+        remainingPercent: 80,
+        checkedAt: now - 1_000,
+        resetsAt: new Date(now - 1).toISOString(),
+      },
+      secondary: {
+        usedPercent: 80,
+        remainingPercent: 20,
+        checkedAt: now,
+        resetsAt: new Date(now + 60_000).toISOString(),
+      },
+    }
+
+    expect(quotaSnapshotPassesPolicy(quota, storage, now)).toBe(false)
+  })
+
+  it('a metadata-only quota object (no windows) has no applicable window and passes under both fail modes', () => {
+    const now = 1_700_000_000_000
+    const metadataOnly = { resetCreditsAvailable: 4 }
+
+    const failOpenStorage = makeStorage([])
+    failOpenStorage.quota = { enabled: true, failClosedOnUnknownQuota: false }
+    expect(quotaSnapshotPassesPolicy(metadataOnly, failOpenStorage, now)).toBe(
+      true,
+    )
+
+    const failClosedStorage = makeStorage([])
+    failClosedStorage.quota = { enabled: true, failClosedOnUnknownQuota: true }
+    expect(
+      quotaSnapshotPassesPolicy(metadataOnly, failClosedStorage, now),
+    ).toBe(true)
+  })
+
+  it('an explicit zero-window quota is a present, healthy window and passes both fail modes', () => {
+    const now = 1_700_000_000_000
+    const zeroWindow = {
+      primary: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        checkedAt: now,
+        resetsAt: new Date(now + 60_000).toISOString(),
+      },
+    }
+
+    const failOpenStorage = makeStorage([])
+    failOpenStorage.quota = { enabled: true, failClosedOnUnknownQuota: false }
+    expect(quotaSnapshotPassesPolicy(zeroWindow, failOpenStorage, now)).toBe(
+      true,
+    )
+
+    const failClosedStorage = makeStorage([])
+    failClosedStorage.quota = { enabled: true, failClosedOnUnknownQuota: true }
+    expect(quotaSnapshotPassesPolicy(zeroWindow, failClosedStorage, now)).toBe(
+      true,
+    )
+  })
+
   it('excludes a fallback whose stable account id matches the main account', async () => {
     const account = makeOAuthAccount({ accountId: 'chatgpt-main' })
     const storage = makeStorage([account])

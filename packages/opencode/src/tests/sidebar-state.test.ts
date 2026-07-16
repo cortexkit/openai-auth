@@ -7,18 +7,24 @@ import {
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
   drainSidebarWrites,
-  FIVE_HOUR_MS,
+  formatWindowLabel,
   getCollapsedQuotaSummary,
+  getPresentQuotaWindows,
   getSidebarState,
   getSidebarStateFile,
   normalizeSidebarState,
   resolveActiveAccount,
-  SEVEN_DAY_MS,
   type SidebarAccountState,
   type SidebarState,
   setSidebarState,
 } from '../sidebar-state'
 import { FLOOR_SIDEBAR_STATE_FILE } from './setup-env.ts'
+
+// computeQuotaPacing takes an explicit windowMs, independent of the slot
+// carrying it — these are test-local reference durations, not the
+// production label/pacing ruler (which derives from window length).
+const FIVE_HOUR_MS = 5 * 60 * 60 * 1000
+const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000
 
 const quota = (used: number): AccountQuota => ({
   primary: { usedPercent: used, remainingPercent: 100 - used },
@@ -110,7 +116,11 @@ describe('normalizeSidebarState', () => {
     const full: SidebarState = {
       main: {
         quota: {
-          primary: { usedPercent: 42, remainingPercent: 58 },
+          primary: {
+            usedPercent: 42,
+            remainingPercent: 58,
+            windowMinutes: 10_080,
+          },
           secondary: { usedPercent: 17, remainingPercent: 83 },
         },
         killed: true,
@@ -118,6 +128,7 @@ describe('normalizeSidebarState', () => {
         quotaBackoffUntil: 1234567890,
         refreshBackedOff: false,
         refreshBackoffUntil: 9876543210,
+        resetCredits: 4,
       },
       fallbacks: [
         {
@@ -126,6 +137,7 @@ describe('normalizeSidebarState', () => {
           quota: { primary: { usedPercent: 5, remainingPercent: 95 } },
           killed: false,
           enabled: true,
+          resetCredits: 2,
         },
       ],
       activeId: 'fb1',
@@ -136,21 +148,77 @@ describe('normalizeSidebarState', () => {
     }
     const result = normalizeSidebarState(full)
     expect(result.main.quota?.primary?.usedPercent).toBe(42)
+    expect(result.main.quota?.primary?.windowMinutes).toBe(10_080)
     expect(result.main.quota?.secondary?.usedPercent).toBe(17)
     expect(result.main.killed).toBe(true)
     expect(result.main.quotaBackedOff).toBe(true)
     expect(result.main.quotaBackoffUntil).toBe(1234567890)
     expect(result.main.refreshBackedOff).toBe(false)
     expect(result.main.refreshBackoffUntil).toBe(9876543210)
+    expect(result.main.resetCredits).toBe(4)
     expect(result.fallbacks).toHaveLength(1)
     const fb0 = result.fallbacks[0]!
     expect(fb0.id).toBe('fb1')
     expect(fb0.label).toBe('work')
+    expect(fb0.resetCredits).toBe(2)
     expect(result.activeId).toBe('fb1')
     expect(result.route).toBe('fallback')
     expect(result.planType).toBe('pro')
     expect(result.credits).toBe(100)
     expect(result.lastUpdated).toBe(1718000000000)
+  })
+
+  test('normalizes reset credits independently for main and fallback accounts', () => {
+    const valid = normalizeSidebarState({
+      ...DEFAULT_SIDEBAR_STATE,
+      main: {
+        quota: {
+          primary: {
+            usedPercent: 20,
+            remainingPercent: 80,
+            windowMinutes: 10_080,
+          },
+        },
+        killed: false,
+        resetCredits: 4,
+      },
+      fallbacks: [
+        {
+          id: 'fb1',
+          quota: null,
+          killed: false,
+          enabled: true,
+          resetCredits: 2,
+        },
+      ],
+    })
+    expect(valid.main.quota?.primary?.windowMinutes).toBe(10_080)
+    expect(valid.main.resetCredits).toBe(4)
+    expect(valid.fallbacks[0]?.resetCredits).toBe(2)
+
+    const malformed = normalizeSidebarState({
+      ...DEFAULT_SIDEBAR_STATE,
+      main: {
+        quota: null,
+        killed: false,
+        resetCredits: Number.POSITIVE_INFINITY,
+      },
+      fallbacks: [
+        {
+          id: 'fb1',
+          quota: null,
+          killed: false,
+          enabled: true,
+          resetCredits: -1,
+        },
+      ],
+      resetCredits: '4',
+    })
+    expect(malformed.main.resetCredits).toBeUndefined()
+    expect(malformed.fallbacks[0]?.resetCredits).toBeUndefined()
+    expect(
+      (malformed as SidebarState & { resetCredits?: number }).resetCredits,
+    ).toBeUndefined()
   })
 })
 
@@ -269,31 +337,67 @@ describe('resolveActiveAccount', () => {
   })
 })
 
+describe('formatWindowLabel', () => {
+  test.each([
+    [59, '59m'],
+    [60, '1h'],
+    [300, '5h'],
+    [1_440, '1d'],
+    [10_080, '7d'],
+  ])('%i minutes formats as %s', (minutes, expected) => {
+    expect(formatWindowLabel(minutes, 'primary')).toBe(expected)
+  })
+
+  test('uses the stable slot only as a fallback for old snapshots', () => {
+    expect(formatWindowLabel(undefined, 'primary')).toBe('primary')
+    expect(formatWindowLabel(undefined, 'secondary')).toBe('secondary')
+  })
+})
+
 describe('getCollapsedQuotaSummary', () => {
-  test('formats both active-account quota windows', () => {
-    expect(getCollapsedQuotaSummary(quota(13)).text).toBe('5h: 13% 7d: 13%')
+  test('renders one 7-day primary window without a phantom 5h label', () => {
+    const summary = getCollapsedQuotaSummary({
+      primary: {
+        usedPercent: 20,
+        remainingPercent: 80,
+        windowMinutes: 10_080,
+      },
+    })
+    expect(summary.text).toBe('7d: 20%')
   })
 
-  test('formats different 5h and 7d percentages', () => {
-    expect(
-      getCollapsedQuotaSummary({
-        primary: { usedPercent: 13.4, remainingPercent: 86.6 },
-        secondary: { usedPercent: 7.2, remainingPercent: 92.8 },
-      }).text,
-    ).toBe('5h: 13% 7d: 7%')
+  test('renders both present windows from their lengths', () => {
+    const summary = getCollapsedQuotaSummary({
+      primary: {
+        usedPercent: 3.4,
+        remainingPercent: 96.6,
+        windowMinutes: 300,
+      },
+      secondary: {
+        usedPercent: 20.2,
+        remainingPercent: 79.8,
+        windowMinutes: 10_080,
+      },
+    })
+    expect(summary.text).toBe('5h: 3% 7d: 20%')
   })
 
-  test('uses a dash for a missing collapsed quota window', () => {
-    expect(
-      getCollapsedQuotaSummary({
-        primary: { usedPercent: 13, remainingPercent: 87 },
-      }).text,
-    ).toBe('5h: 13% 7d: \u2014')
-  })
-
-  test('returns no collapsed quota text when no windows are available', () => {
+  test('returns no text and no rows when no windows are present', () => {
     expect(getCollapsedQuotaSummary(null).text).toBeNull()
     expect(getCollapsedQuotaSummary({}).text).toBeNull()
+    expect(getPresentQuotaWindows({})).toEqual([])
+  })
+
+  test('old snapshots use slot labels and do not invent pacing rulers', () => {
+    const rows = getPresentQuotaWindows({
+      primary: { usedPercent: 20, remainingPercent: 80 },
+    })
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({
+      key: 'primary',
+      label: 'primary',
+      windowMs: null,
+    })
   })
 })
 

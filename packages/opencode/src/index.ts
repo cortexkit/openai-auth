@@ -67,7 +67,6 @@ import {
 import { codexRefreshFn, whamUsageFn } from './core/provider'
 import {
   QuotaManager,
-  quotaWindowResetIsPast,
   resolveMidStreamRateLimitResetAt,
 } from './core/quota-manager'
 import { refreshAllQuota } from './core/refresh-all-quota'
@@ -80,7 +79,10 @@ import {
 } from './hosted-web-search'
 import { createLogger, setLogLevel } from './logger'
 import { resolvePromptContext } from './prompt-context'
-import { normalizeQuotaHeaders } from './quota-normalize'
+import {
+  isCompleteQuotaHeaderFrame,
+  normalizeQuotaHeaders,
+} from './quota-normalize'
 import {
   drainNotifications,
   isTuiConnected,
@@ -94,6 +96,7 @@ import type {
 import { getRpcDir } from './rpc/rpc-dir'
 import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server'
 import {
+  type AccountQuota,
   getSidebarStateFile,
   type SidebarState,
   setSidebarState,
@@ -433,6 +436,63 @@ export function findCachekeepFallbackAccount(
       isOAuthAccount(a) &&
       (a.id === accountId || a.accountId === accountId),
   )
+}
+
+// wham is the only source that reports reset-credit counts; header/WS pushes
+// never carry the field. An incoming push that omits it inherits the last
+// known count for the same account so the sidebar does not flicker it away
+// on every per-turn header/WS update — but an explicit incoming value
+// (including 0) always wins over a stale cached one.
+export function mergePushedQuotaMetadata(
+  incoming: OAuthQuotaSnapshot,
+  previous: OAuthQuotaSnapshot | undefined,
+): OAuthQuotaSnapshot {
+  if (
+    incoming.resetCreditsAvailable !== undefined ||
+    previous?.resetCreditsAvailable === undefined
+  ) {
+    return incoming
+  }
+  return {
+    ...incoming,
+    resetCreditsAvailable: previous.resetCreditsAvailable,
+  }
+}
+
+export function buildSidebarState(
+  qm: QuotaManager,
+  store: AccountStorage,
+  activeId: string,
+  now = Date.now(),
+): SidebarState {
+  const mainQuota = qm.getMain()?.quota
+  return {
+    main: {
+      quota: (mainQuota as AccountQuota | undefined) ?? null,
+      killed: false,
+      ...(mainQuota?.resetCreditsAvailable !== undefined
+        ? { resetCredits: mainQuota.resetCreditsAvailable }
+        : {}),
+    },
+    fallbacks: store.accounts
+      .filter((account) => account.enabled)
+      .map((account) => {
+        const fallbackQuota = qm.getFallback(account.id)?.quota
+        return {
+          id: account.id,
+          label: (account as { label?: string }).label,
+          quota: (fallbackQuota as AccountQuota | undefined) ?? null,
+          killed: false,
+          enabled: true,
+          ...(fallbackQuota?.resetCreditsAvailable !== undefined
+            ? { resetCredits: fallbackQuota.resetCreditsAvailable }
+            : {}),
+        }
+      }),
+    activeId,
+    route: store.routing?.mode ?? 'main-first',
+    lastUpdated: now,
+  }
 }
 
 // Prompt-cache stabilizer (ON by default; opt out via config `webSearch: false` or
@@ -1025,8 +1085,12 @@ export async function CodexAuthPlugin(
           // ChatGPT account identity for the MAIN account, so the killswitch's
           // policy read survives a token refresh but still drops on a switch.
           mainAccountIdentity?: string,
+          servedActiveId?: string,
+          completeSnapshot = false,
         ) {
-          if (Object.keys(snapshot).length === 0) return
+          if (servedActiveId) lastServedActiveId = servedActiveId
+          if (Object.keys(snapshot).length === 0 && !completeSnapshot) return
+          const sidebarActiveId = servedActiveId ?? lastServedActiveId
           const now = Date.now()
           const quota = snapshot as OAuthQuotaSnapshot
           let entry: Parameters<typeof quotaManager.setMain>[1] = {
@@ -1035,26 +1099,22 @@ export async function CodexAuthPlugin(
             checkedAt: now,
           }
           if (accountId && accountId !== 'main') {
-            const previous = quotaManager.getFallback(accountId, accessToken)
-            if (previous && previous.refreshAfter > now) {
-              const mergedQuota: OAuthQuotaSnapshot = { ...quota }
-              if (
-                !mergedQuota.primary &&
-                previous.quota.primary &&
-                !quotaWindowResetIsPast(previous.quota.primary, now)
-              ) {
-                mergedQuota.primary = previous.quota.primary
-              }
-              if (
-                !mergedQuota.secondary &&
-                previous.quota.secondary &&
-                !quotaWindowResetIsPast(previous.quota.secondary, now)
-              ) {
-                mergedQuota.secondary = previous.quota.secondary
-              }
-              entry = { ...entry, quota: mergedQuota }
-            }
-            quotaManager.setFallback(accountId, entry, accessToken)
+            // Quota-bearing transports report every live window rather than a
+            // partial subset, so an absent slot means the wire dropped it.
+            // Only the wham-only reset-credit metadata carries forward.
+            const previousForMetadata =
+              quotaManager.peekFallbackForPolicy(accountId)?.quota
+            const mergedQuota = mergePushedQuotaMetadata(
+              quota,
+              previousForMetadata,
+            )
+            entry = { ...entry, quota: mergedQuota }
+            quotaManager.setFallback(
+              accountId,
+              entry,
+              accessToken,
+              completeSnapshot,
+            )
           } else {
             let resolvedMainIdentity = mainAccountIdentity
             if (!resolvedMainIdentity && accessToken) {
@@ -1075,15 +1135,27 @@ export async function CodexAuthPlugin(
               })
               return
             }
-            quotaManager.setMain(accessToken, entry, resolvedMainIdentity)
+            const previousForMetadata =
+              quotaManager.peekMainForPolicy(resolvedMainIdentity)?.quota
+            const mergedQuota = mergePushedQuotaMetadata(
+              quota,
+              previousForMetadata,
+            )
+            entry = { ...entry, quota: mergedQuota }
+            quotaManager.setMain(
+              accessToken,
+              entry,
+              resolvedMainIdentity,
+              completeSnapshot,
+            )
           }
           logQ.debug('quota pushed', {
             pid: process.pid,
             accountId: accountId ?? 'main',
-            snapshot,
+            snapshot: entry.quota,
           })
           const latestStorage = await loadRequestAccounts()
-          await writeSidebarState(quotaManager, latestStorage)
+          await writeSidebarState(quotaManager, latestStorage, sidebarActiveId)
         }
 
         // Resolve when a mid-stream-exhausted account's window actually resets,
@@ -1120,6 +1192,8 @@ export async function CodexAuthPlugin(
                   accessToken,
                   accountId,
                   isMainBucket ? servedChatgptAccountId : undefined,
+                  isMainBucket ? 'main' : accountId,
+                  true,
                 )
               },
               // Mid-stream quota exhaustion (response.failed carrying
@@ -1174,30 +1248,10 @@ export async function CodexAuthPlugin(
         async function writeSidebarState(
           qm: QuotaManager,
           store: Awaited<ReturnType<typeof loadAccounts>>,
+          activeId: string = lastServedActiveId,
         ) {
           if (!store) return
-          const mainQuota = qm.getMain()?.quota
-          const sidebar: SidebarState = {
-            main: {
-              quota: mainQuota ?? null,
-              killed: false,
-            },
-            fallbacks: store.accounts
-              .filter((a) => a.enabled)
-              .map((a) => {
-                const fbQuota = qm.getFallback(a.id)?.quota ?? null
-                return {
-                  id: a.id,
-                  label: (a as { label?: string }).label,
-                  quota: fbQuota,
-                  killed: false,
-                  enabled: true,
-                }
-              }),
-            activeId: lastServedActiveId,
-            route: store.routing?.mode ?? 'main-first',
-            lastUpdated: Date.now(),
-          }
+          const sidebar = buildSidebarState(qm, store, activeId)
           // Pass the bound path so this instance's writes always go to the
           // file that was configured when the loader ran.
           await setSidebarState(sidebar, boundSidebarFile)
@@ -1620,13 +1674,14 @@ export async function CodexAuthPlugin(
         ) {
           try {
             const snapshot = normalizeQuotaHeaders(response.headers)
-            if (Object.keys(snapshot).length > 0) {
-              await pushQuota(
-                snapshot,
-                candidate.access,
-                candidate.quotaAccountId,
-              )
-            }
+            await pushQuota(
+              snapshot as Record<string, unknown>,
+              candidate.access,
+              candidate.quotaAccountId,
+              undefined,
+              undefined,
+              isCompleteQuotaHeaderFrame(response.headers),
+            )
           } catch {
             // Quota headers from a failed candidate are advisory; routing must continue.
           }
@@ -2038,16 +2093,21 @@ export async function CodexAuthPlugin(
               const snapshot = normalizeQuotaHeaders(finalResponse.headers)
               if (fallbackServed) {
                 await pushQuota(
-                  snapshot,
+                  snapshot as Record<string, unknown>,
                   fallbackQuotaAccess,
                   fallbackQuotaAccountId,
+                  undefined,
+                  servedActiveId,
+                  isCompleteQuotaHeaderFrame(finalResponse.headers),
                 )
               } else {
                 await pushQuota(
-                  snapshot,
+                  snapshot as Record<string, unknown>,
                   primaryAccess,
                   undefined,
                   mainAccountIdentity,
+                  servedActiveId,
+                  isCompleteQuotaHeaderFrame(finalResponse.headers),
                 )
               }
             } catch {

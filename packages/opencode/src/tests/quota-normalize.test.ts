@@ -27,6 +27,8 @@ describe('quota normalize → QuotaSnapshot', () => {
     expect(s.secondary?.resetsAt).toBe(
       new Date(1781766665 * 1000).toISOString(),
     )
+    expect(normalizeQuotaHeaders(h).primary?.windowMinutes).toBe(300)
+    expect(normalizeQuotaHeaders(h).secondary?.windowMinutes).toBe(10_080)
   })
 
   it('HTTP headers: missing optional fields → undefined in snapshot', () => {
@@ -61,6 +63,8 @@ describe('quota normalize → QuotaSnapshot', () => {
     expect(s.secondary?.usedPercent).toBe(5)
     expect(s.secondary?.remainingPercent).toBe(95)
     expect(s.primary?.checkedAt).toBeGreaterThan(0)
+    expect(s.primary?.windowMinutes).toBe(300)
+    expect(s.secondary?.windowMinutes).toBe(10_080)
   })
 
   // Regression: the real codex.rate_limits frame carries additional_rate_limits
@@ -146,6 +150,114 @@ describe('quota normalize → QuotaSnapshot', () => {
     expect(s.secondary?.usedPercent).toBe(91)
     expect(s.secondary?.remainingPercent).toBe(9)
     expect(s.primary?.checkedAt).toBeGreaterThan(0)
+    expect(s.primary?.windowMinutes).toBe(300)
+    expect(s.secondary?.windowMinutes).toBe(10_080)
+  })
+
+  it('wham carries a single 7-day primary window and reset credits', () => {
+    const snapshot = normalizeWham({
+      rate_limit: {
+        primary_window: {
+          used_percent: 20,
+          limit_window_seconds: 604_800,
+          reset_at: 1_784_809_904,
+        },
+        secondary_window: null,
+      },
+      rate_limit_reset_credits: { available_count: 4 },
+    } as Parameters<typeof normalizeWham>[0])
+
+    expect(snapshot.primary?.windowMinutes).toBe(10_080)
+    expect(snapshot.secondary).toBeUndefined()
+    expect(snapshot.resetCreditsAvailable).toBe(4)
+  })
+
+  it('omits invalid window lengths and reset-credit counts', () => {
+    const headers = normalizeQuotaHeaders(
+      new Headers({
+        'x-codex-primary-used-percent': '20',
+        'x-codex-primary-window-minutes': '0',
+      }),
+    )
+    expect(headers.primary?.windowMinutes).toBeUndefined()
+    expect(headers.resetCreditsAvailable).toBeUndefined()
+
+    const ws = normalizeWsFrame({
+      type: 'codex.rate_limits',
+      rate_limits: {
+        primary: { used_percent: 20, window_minutes: Number.POSITIVE_INFINITY },
+      },
+    })
+    expect(ws.primary?.windowMinutes).toBeUndefined()
+    expect(ws.resetCreditsAvailable).toBeUndefined()
+
+    const wham = normalizeWham({
+      rate_limit: {
+        primary_window: { used_percent: 20, limit_window_seconds: -60 },
+      },
+      rate_limit_reset_credits: { available_count: Number.NaN },
+    } as Parameters<typeof normalizeWham>[0])
+    expect(wham.primary?.windowMinutes).toBeUndefined()
+    expect(wham.resetCreditsAvailable).toBeUndefined()
+
+    const zeroCredits = normalizeWham({
+      rate_limit: {},
+      rate_limit_reset_credits: { available_count: 0 },
+    } as Parameters<typeof normalizeWham>[0])
+    expect(zeroCredits.resetCreditsAvailable).toBe(0)
+  })
+
+  it('does not coerce a null or empty-string reset-credit count into a fabricated zero', () => {
+    const nullCredits = normalizeWham({
+      rate_limit: {},
+      rate_limit_reset_credits: { available_count: null as unknown as number },
+    } as Parameters<typeof normalizeWham>[0])
+    expect(nullCredits.resetCreditsAvailable).toBeUndefined()
+
+    const emptyStringCredits = normalizeWham({
+      rate_limit: {},
+      rate_limit_reset_credits: { available_count: '' as unknown as number },
+    } as Parameters<typeof normalizeWham>[0])
+    expect(emptyStringCredits.resetCreditsAvailable).toBeUndefined()
+
+    const missingCredits = normalizeWham({
+      rate_limit: {},
+      rate_limit_reset_credits: null,
+    })
+    expect(missingCredits.resetCreditsAvailable).toBeUndefined()
+  })
+
+  it('header: a zero-placeholder secondary (gone window) normalizes as absent, not a 0% window', () => {
+    // Full captured live header set for a single-primary account: the gone
+    // secondary window is encoded as a zero used-percent sibling of the real
+    // primary fields, not by omitting the header entirely.
+    const h = new Headers({
+      'x-codex-active-limit': 'premium',
+      'x-codex-plan-type': 'team',
+      'x-codex-primary-used-percent': '0',
+      'x-codex-primary-window-minutes': '10080',
+      'x-codex-primary-reset-after-seconds': '604800',
+      'x-codex-primary-reset-at': '1784810110',
+      'x-codex-secondary-used-percent': '0',
+      'x-codex-secondary-window-minutes': '0',
+      'x-codex-secondary-reset-after-seconds': '0',
+      'x-codex-secondary-reset-at': '',
+    })
+    const s = normalizeQuotaHeaders(h)
+    expect(s.primary?.usedPercent).toBe(0)
+    expect(s.primary?.windowMinutes).toBe(10_080)
+    expect(s.secondary).toBeUndefined()
+  })
+
+  it('header: a real 0%-used window with a positive length and a reset stays present', () => {
+    const h = new Headers({
+      'x-codex-secondary-used-percent': '0',
+      'x-codex-secondary-window-minutes': '10080',
+      'x-codex-secondary-reset-at': '1784810110',
+    })
+    const s = normalizeQuotaHeaders(h)
+    expect(s.secondary?.usedPercent).toBe(0)
+    expect(s.secondary?.windowMinutes).toBe(10_080)
   })
 
   it('wham: object-shaped additional_rate_limits does not crash and is ignored', () => {
