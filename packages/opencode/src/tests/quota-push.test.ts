@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import type { AccountStorage, OAuthQuotaSnapshot } from '../core/accounts.ts'
 import type { QuotaManager } from '../core/quota-manager.ts'
-import { buildSidebarState, mergePushedQuotaMetadata } from '../index.ts'
+import {
+  buildSidebarMachineState,
+  buildSidebarState,
+  mergePushedQuotaMetadata,
+} from '../index.ts'
 import { normalizeQuotaHeaders } from '../quota-normalize.ts'
 import type { SidebarState } from '../sidebar-state.ts'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
@@ -384,13 +388,48 @@ describe('QuotaManager push', () => {
       ],
     }
 
-    for (const activeId of ['main', 'fallback-1', 'missing']) {
-      const sidebar = buildSidebarState(qm, store, activeId, 10)
-      expect(sidebar.main.resetCredits).toBe(4)
-      expect(sidebar.fallbacks[0]?.resetCredits).toBe(2)
-      expect(
-        (sidebar as SidebarState & { resetCredits?: number }).resetCredits,
-      ).toBeUndefined()
+    const machine = buildSidebarMachineState(qm, store, 10)
+    const expectedMachine = {
+      main: {
+        quota: {
+          primary: {
+            usedPercent: 20,
+            remainingPercent: 80,
+            checkedAt: 1,
+            windowMinutes: 10_080,
+          },
+          resetCreditsAvailable: 4,
+        },
+        killed: false,
+        resetCredits: 4,
+      },
+      fallbacks: [
+        {
+          id: 'fallback-1',
+          label: undefined,
+          quota: {
+            primary: {
+              usedPercent: 30,
+              remainingPercent: 70,
+              checkedAt: 1,
+              windowMinutes: 10_080,
+            },
+            resetCreditsAvailable: 2,
+          },
+          killed: false,
+          enabled: true,
+          resetCredits: 2,
+        },
+      ],
+      route: 'main-first',
+      lastUpdated: 10,
     }
+    expect(machine).toEqual(expectedMachine)
+
+    const legacy = buildSidebarState(qm, store, 'fallback-1', 10)
+    expect(legacy).toEqual({ ...machine, activeId: 'fallback-1' })
+    expect(
+      (legacy as SidebarState & { resetCredits?: number }).resetCredits,
+    ).toBeUndefined()
   })
 })

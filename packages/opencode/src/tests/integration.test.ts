@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, it, test } from 'bun:test'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -13,11 +13,13 @@ import {
   findCachekeepFallbackAccount,
   MAIN_REFRESH_LEASE_TTL_MS,
   MAIN_REFRESH_LOCK_TTL_MS,
+  resolveSidebarSessionId,
 } from '../index.ts'
 import { ResponseStreamError } from '../response-stream-error'
 import {
   drainSidebarWrites,
   getSidebarStateFile,
+  normalizeSidebarState,
   type SidebarState,
 } from '../sidebar-state.ts'
 import {
@@ -2038,6 +2040,9 @@ describe('integration: WS quota push', () => {
           ) as SidebarState
           expect(sidebar.activeId).toBe('fallback-1')
           expect(
+            sidebar.activeRouting?.['early-fallback-quota']?.activeId,
+          ).toBe('fallback-1')
+          expect(
             sidebar.fallbacks.find((account) => account.id === fallback.id)
               ?.resetCredits,
           ).toBe(2)
@@ -2444,6 +2449,72 @@ describe('integration: active fallback routing', () => {
       }),
     )
   }
+
+  test.each([
+    [
+      {
+        'x-session-affinity': 'affinity',
+        'x-opencode-session': 'opencode',
+        'x-session-id': 'x-session',
+        'session-id': 'session',
+      },
+      'affinity',
+    ],
+    [
+      { 'x-opencode-session': 'opencode', 'x-session-id': 'x-session' },
+      'opencode',
+    ],
+    [{ 'x-session-id': 'x-session', 'session-id': 'session' }, 'x-session'],
+    [{ 'session-id': 'session' }, 'session'],
+    [{}, undefined],
+  ])('resolves sidebar session headers by documented precedence', (raw, expected) => {
+    expect(resolveSidebarSessionId(new Headers(raw))).toBe(expected)
+  })
+
+  it('keeps different served accounts under different session keys', async () => {
+    seedStorage({ access: 'fallback-access-token' })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-opencode-session': 'sess-fallback' }),
+      )
+
+      seedStorage({ access: 'fallback-access-token' }, { mode: 'main-first' })
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-opencode-session': 'sess-main' }),
+      )
+      await drainSidebarWrites()
+
+      const sidebar = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      )
+      expect(sidebar.activeRouting?.['sess-fallback']).toMatchObject({
+        activeId: 'fallback-1',
+        route: 'fallback-first',
+      })
+      expect(sidebar.activeRouting?.['sess-main']).toMatchObject({
+        activeId: 'main',
+        route: 'main-first',
+      })
+      expect(sidebar.activeId).toBe('main')
+      expect(sidebar.route).toBe('main-first')
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
 
   it('uses the active fallback token without writing it to the auth slot', async () => {
     seedStorage({ access: 'fallback-access-token' })
@@ -2930,6 +3001,7 @@ describe('integration: active fallback routing', () => {
             ?.usedPercent === 63,
       )
       expect(sidebar.activeId).toBe('work-alt')
+      expect(sidebar.activeRouting).toBeUndefined()
       expect(sidebar.main.quota).toBeNull()
       expect(
         sidebar.fallbacks.find((a) => a.id === 'work-alt')?.quota?.primary

@@ -82,6 +82,14 @@ export interface SidebarAccountState {
   resetCredits?: number
 }
 
+export interface ActiveRoutingEntry {
+  activeId: string
+  route: string
+  updatedAt: number
+}
+
+export type ActiveRoutingMap = Record<string, ActiveRoutingEntry>
+
 export interface SidebarState {
   main: {
     quota: AccountQuota | null
@@ -93,8 +101,11 @@ export interface SidebarState {
     resetCredits?: number
   }
   fallbacks: SidebarAccountState[]
+  /** @deprecated Compatibility field for readers that do not consume activeRouting. */
   activeId: string | undefined
+  /** Machine-global routing mode and compatibility value for older readers. */
   route: string
+  activeRouting?: ActiveRoutingMap
   planType?: string
   credits?: number
   lastUpdated: number
@@ -121,6 +132,39 @@ function normalizeResetCredits(value: unknown): number | undefined {
 function resetCreditsField(value: unknown): { resetCredits?: number } {
   const credits = normalizeResetCredits(value)
   return credits !== undefined ? { resetCredits: credits } : {}
+}
+
+function normalizeActiveRouting(value: unknown): ActiveRoutingMap | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined
+  }
+
+  const normalized: ActiveRoutingMap = {}
+  for (const [sessionId, rawEntry] of Object.entries(value)) {
+    if (
+      rawEntry === null ||
+      typeof rawEntry !== 'object' ||
+      Array.isArray(rawEntry)
+    ) {
+      continue
+    }
+    const entry = rawEntry as Record<string, unknown>
+    if (
+      typeof entry.activeId !== 'string' ||
+      typeof entry.route !== 'string' ||
+      typeof entry.updatedAt !== 'number' ||
+      !Number.isFinite(entry.updatedAt)
+    ) {
+      continue
+    }
+    normalized[sessionId] = {
+      activeId: entry.activeId,
+      route: entry.route,
+      updatedAt: entry.updatedAt,
+    }
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined
 }
 
 export function getSidebarStateFile(): string {
@@ -218,12 +262,14 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
   // Optional top-level fields
   const planType = typeof r.planType === 'string' ? r.planType : undefined
   const credits = typeof r.credits === 'number' ? r.credits : undefined
+  const activeRouting = normalizeActiveRouting(r.activeRouting)
   return {
     main,
     fallbacks,
     activeId,
     route,
     lastUpdated,
+    ...(activeRouting !== undefined ? { activeRouting } : {}),
     ...(planType !== undefined ? { planType } : {}),
     ...(credits !== undefined ? { credits } : {}),
   }
@@ -238,9 +284,64 @@ export async function getSidebarState(): Promise<SidebarState> {
   }
 }
 
+export const ACTIVE_ROUTING_MAX_AGE_MS = 60 * 60 * 1000
+export const ACTIVE_ROUTING_MAX_ENTRIES = 128
+
+export type SidebarRoutingAccount = {
+  id: string
+  enabled?: boolean
+}
+
+export function isUsableRoutingEntry(
+  entry: ActiveRoutingEntry,
+  accounts: readonly SidebarRoutingAccount[],
+  now = Date.now(),
+): boolean {
+  const fresh =
+    entry.updatedAt >= now - ACTIVE_ROUTING_MAX_AGE_MS && entry.updatedAt <= now
+  if (!fresh) return false
+  return (
+    entry.activeId === 'main' ||
+    accounts.some(
+      (account) => account.enabled !== false && account.id === entry.activeId,
+    )
+  )
+}
+
+export function pruneActiveRouting(
+  activeRouting: ActiveRoutingMap | undefined,
+  accounts: readonly SidebarRoutingAccount[],
+  now = Date.now(),
+  removedSessionId?: string,
+): ActiveRoutingMap | undefined {
+  if (!activeRouting) return undefined
+  const kept = Object.entries(activeRouting).filter(
+    ([sessionId, entry]) =>
+      sessionId !== removedSessionId &&
+      isUsableRoutingEntry(entry, accounts, now),
+  )
+  const bounded =
+    kept.length <= ACTIVE_ROUTING_MAX_ENTRIES
+      ? kept
+      : kept
+          .sort((left, right) => right[1].updatedAt - left[1].updatedAt)
+          .slice(0, ACTIVE_ROUTING_MAX_ENTRIES)
+  return bounded.length > 0 ? Object.fromEntries(bounded) : undefined
+}
+
 // Serialization chain: concurrent calls are queued so a stale background
 // write cannot land after a newer one and corrupt the file.
 let sidebarWriteChain: Promise<void> = Promise.resolve()
+const MAX_MERGE_ATTEMPTS = 3
+
+interface SidebarMergeHooks {
+  beforeRecheck?: () => void | Promise<void>
+}
+
+function enqueueSidebarWrite(operation: () => Promise<void>): Promise<void> {
+  sidebarWriteChain = sidebarWriteChain.then(operation).catch(() => {})
+  return sidebarWriteChain
+}
 
 /**
  * Write sidebar state to disk, serialized through a promise chain so
@@ -257,10 +358,156 @@ export function setSidebarState(
   state: SidebarState,
   file = getSidebarStateFile(),
 ): Promise<void> {
-  sidebarWriteChain = sidebarWriteChain
-    .then(() => doWriteSidebarState(state, file))
-    .catch(() => {})
-  return sidebarWriteChain
+  return enqueueSidebarWrite(() => doWriteSidebarState(state, file))
+}
+
+async function readSidebarState(file: string): Promise<SidebarState> {
+  try {
+    return parseSidebarState(await readRawSidebar(file))
+  } catch {
+    return DEFAULT_SIDEBAR_STATE
+  }
+}
+
+async function readRawSidebar(file: string): Promise<string> {
+  try {
+    return await readFile(file, 'utf8')
+  } catch (error) {
+    if ((error as { code?: string }).code === 'ENOENT') return ''
+    throw error
+  }
+}
+
+function parseSidebarState(raw: string): SidebarState {
+  if (raw === '') return DEFAULT_SIDEBAR_STATE
+  try {
+    return normalizeSidebarState(JSON.parse(raw))
+  } catch {
+    return DEFAULT_SIDEBAR_STATE
+  }
+}
+
+async function writeMergedSidebarState(
+  file: string,
+  merge: (latest: SidebarState) => SidebarState,
+  hooks?: SidebarMergeHooks,
+): Promise<void> {
+  // Cross-process writers recheck before commit so concurrent foreign session
+  // entries are re-merged. The narrow post-check race self-heals on the next write.
+  for (let attempt = 0; attempt < MAX_MERGE_ATTEMPTS; attempt += 1) {
+    const rawBefore = await readRawSidebar(file)
+    const next = merge(parseSidebarState(rawBefore))
+    if (attempt === 0) await hooks?.beforeRecheck?.()
+    const rawRecheck = await readRawSidebar(file)
+    if (rawRecheck !== rawBefore) continue
+    await doWriteSidebarState(next, file)
+    return
+  }
+
+  const latest = await readSidebarState(file)
+  await doWriteSidebarState(merge(latest), file)
+}
+
+export type SidebarMachineState = Pick<
+  SidebarState,
+  'main' | 'fallbacks' | 'planType' | 'credits' | 'lastUpdated'
+> & { route: string }
+
+export function setSidebarMachineState(
+  machineState: SidebarMachineState,
+  file = getSidebarStateFile(),
+  hooks?: SidebarMergeHooks,
+): Promise<void> {
+  return enqueueSidebarWrite(async () => {
+    await writeMergedSidebarState(
+      file,
+      (latest) => ({
+        ...latest,
+        ...machineState,
+        activeId: latest.activeId,
+        activeRouting: latest.activeRouting,
+        lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
+      }),
+      hooks,
+    )
+  })
+}
+
+export function upsertSidebarActiveRouting(
+  input: { sessionId: string } & ActiveRoutingEntry,
+  accounts: readonly SidebarRoutingAccount[],
+  file = getSidebarStateFile(),
+  hooks?: SidebarMergeHooks,
+): Promise<void> {
+  return enqueueSidebarWrite(async () => {
+    await writeMergedSidebarState(
+      file,
+      (latest) => {
+        const activeRouting = pruneActiveRouting(
+          {
+            ...latest.activeRouting,
+            [input.sessionId]: {
+              activeId: input.activeId,
+              route: input.route,
+              updatedAt: input.updatedAt,
+            },
+          },
+          accounts,
+          Date.now(),
+        )
+        return {
+          ...latest,
+          activeId: input.activeId,
+          route: input.route,
+          activeRouting,
+          lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
+        }
+      },
+      hooks,
+    )
+  })
+}
+
+export function setSidebarLegacyRouting(
+  input: ActiveRoutingEntry,
+  file = getSidebarStateFile(),
+): Promise<void> {
+  return enqueueSidebarWrite(async () => {
+    await writeMergedSidebarState(file, (latest) => ({
+      ...latest,
+      activeId: input.activeId,
+      route: input.route,
+      lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
+    }))
+  })
+}
+
+export function removeSidebarActiveRouting(
+  sessionId: string,
+  accounts: readonly SidebarRoutingAccount[],
+  file = getSidebarStateFile(),
+  hooks?: SidebarMergeHooks,
+): Promise<void> {
+  return enqueueSidebarWrite(async () => {
+    await writeMergedSidebarState(
+      file,
+      (latest) => {
+        const now = Date.now()
+        const activeRouting = pruneActiveRouting(
+          latest.activeRouting,
+          accounts,
+          now,
+          sessionId,
+        )
+        return {
+          ...latest,
+          activeRouting,
+          lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
+        }
+      },
+      hooks,
+    )
+  })
 }
 
 async function doWriteSidebarState(

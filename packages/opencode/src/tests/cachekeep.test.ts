@@ -12,6 +12,7 @@ import {
   ttlForModel,
 } from '../core/cachekeep'
 import { CodexAuthPlugin } from '../index'
+import { drainSidebarWrites, getSidebarState } from '../sidebar-state'
 
 function fakeLogger() {
   return {
@@ -2339,10 +2340,16 @@ describe('CacheKeepManager token resolution', () => {
         method: 'POST',
         headers: {
           'session-id': opencodeSessionId,
+          'x-opencode-session': opencodeSessionId,
           'content-type': 'application/json',
         },
         body: JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
       })
+
+      await drainSidebarWrites()
+      expect(
+        (await getSidebarState()).activeRouting?.[opencodeSessionId],
+      ).toBeDefined()
 
       expect(mgr.status().tracked).toBe(1)
       const trackedTarget = mgr.status().targets[0]
@@ -2358,6 +2365,11 @@ describe('CacheKeepManager token resolution', () => {
           },
         },
       } as any)
+
+      await drainSidebarWrites()
+      expect(
+        (await getSidebarState()).activeRouting?.[opencodeSessionId],
+      ).toBeUndefined()
 
       expect(mgr.status().tracked).toBe(0)
 

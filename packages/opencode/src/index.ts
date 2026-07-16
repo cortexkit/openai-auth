@@ -98,8 +98,12 @@ import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server'
 import {
   type AccountQuota,
   getSidebarStateFile,
+  removeSidebarActiveRouting,
+  type SidebarMachineState,
   type SidebarState,
-  setSidebarState,
+  setSidebarLegacyRouting,
+  setSidebarMachineState,
+  upsertSidebarActiveRouting,
 } from './sidebar-state'
 import { isRecord } from './util/record'
 import { stableStringify } from './util/stable-json'
@@ -459,12 +463,11 @@ export function mergePushedQuotaMetadata(
   }
 }
 
-export function buildSidebarState(
+export function buildSidebarMachineState(
   qm: QuotaManager,
   store: AccountStorage,
-  activeId: string,
   now = Date.now(),
-): SidebarState {
+): SidebarMachineState {
   const mainQuota = qm.getMain()?.quota
   return {
     main: {
@@ -489,10 +492,28 @@ export function buildSidebarState(
             : {}),
         }
       }),
-    activeId,
     route: store.routing?.mode ?? 'main-first',
     lastUpdated: now,
   }
+}
+
+export function buildSidebarState(
+  qm: QuotaManager,
+  store: AccountStorage,
+  activeId: string,
+  now = Date.now(),
+): SidebarState {
+  return { ...buildSidebarMachineState(qm, store, now), activeId }
+}
+
+export function resolveSidebarSessionId(headers: Headers): string | undefined {
+  return (
+    headers.get('x-session-affinity') ??
+    headers.get('x-opencode-session') ??
+    headers.get('x-session-id') ??
+    headers.get('session-id') ??
+    undefined
+  )
 }
 
 // Prompt-cache stabilizer (ON by default; opt out via config `webSearch: false` or
@@ -591,6 +612,7 @@ export async function CodexAuthPlugin(
   // the command is rejected with a message.
   let cmdCtx: CommandContext | null = null
   let activeRpcServer: RpcServerHandle | null = null
+  let sidebarStateFileForEvents: string | undefined
 
   async function sendIgnoredMessage(sessionId: string, text: string) {
     const session = input.client.session as
@@ -638,6 +660,14 @@ export async function CodexAuthPlugin(
         cmdCtx?.cacheKeepManager?.remove(meta.threadID)
       }
       if (codexSessions.delete(info.id)) persistCodexSessions()
+      if (sidebarStateFileForEvents) {
+        const accounts = (await loadAccounts(getConfigPath()))?.accounts ?? []
+        await removeSidebarActiveRouting(
+          info.id,
+          accounts,
+          sidebarStateFileForEvents,
+        )
+      }
       for (const websocketFetch of websocketFetches)
         websocketFetch.remove(info.id)
     },
@@ -1085,12 +1115,9 @@ export async function CodexAuthPlugin(
           // ChatGPT account identity for the MAIN account, so the killswitch's
           // policy read survives a token refresh but still drops on a switch.
           mainAccountIdentity?: string,
-          servedActiveId?: string,
           completeSnapshot = false,
         ) {
-          if (servedActiveId) lastServedActiveId = servedActiveId
           if (Object.keys(snapshot).length === 0 && !completeSnapshot) return
-          const sidebarActiveId = servedActiveId ?? lastServedActiveId
           const now = Date.now()
           const quota = snapshot as OAuthQuotaSnapshot
           let entry: Parameters<typeof quotaManager.setMain>[1] = {
@@ -1155,7 +1182,7 @@ export async function CodexAuthPlugin(
             snapshot: entry.quota,
           })
           const latestStorage = await loadRequestAccounts()
-          await writeSidebarState(quotaManager, latestStorage, sidebarActiveId)
+          await writeMachineSidebarState(quotaManager, latestStorage)
         }
 
         // Resolve when a mid-stream-exhausted account's window actually resets,
@@ -1192,7 +1219,6 @@ export async function CodexAuthPlugin(
                   accessToken,
                   accountId,
                   isMainBucket ? servedChatgptAccountId : undefined,
-                  isMainBucket ? 'main' : accountId,
                   true,
                 )
               },
@@ -1230,8 +1256,8 @@ export async function CodexAuthPlugin(
         }
 
         // -------------------------------------------------------------------
-        // writeSidebarState — snapshot the QuotaManager's view into the
-        // sidebar-state.json file for the TUI to read. Best-effort.
+        // Machine snapshots refresh shared quota and routing configuration;
+        // request writers record only the account that served that request.
         //
         // The sidebar path is resolved ONCE here (at loader-run time) and
         // captured in boundSidebarFile. All writes from this loader instance
@@ -1241,20 +1267,35 @@ export async function CodexAuthPlugin(
         // during tests where afterEach restores the env floor).
         // -------------------------------------------------------------------
         const boundSidebarFile = getSidebarStateFile()
-        // Display-only: the account that actually served the most recent request
-        // (main or a fallback id). Routing has no persisted pin, so this is how
-        // the sidebar shows the true active account. Defaults to main.
-        let lastServedActiveId = 'main'
-        async function writeSidebarState(
+        sidebarStateFileForEvents = boundSidebarFile
+
+        async function writeMachineSidebarState(
           qm: QuotaManager,
           store: Awaited<ReturnType<typeof loadAccounts>>,
-          activeId: string = lastServedActiveId,
         ) {
           if (!store) return
-          const sidebar = buildSidebarState(qm, store, activeId)
-          // Pass the bound path so this instance's writes always go to the
-          // file that was configured when the loader ran.
-          await setSidebarState(sidebar, boundSidebarFile)
+          await setSidebarMachineState(
+            buildSidebarMachineState(qm, store),
+            boundSidebarFile,
+          )
+        }
+
+        async function writeRequestSidebarRouting(
+          sessionId: string | undefined,
+          activeId: string,
+          route: RoutingMode,
+          accounts: readonly { id: string; enabled?: boolean }[],
+        ) {
+          const input = { activeId, route, updatedAt: Date.now() }
+          if (sessionId) {
+            await upsertSidebarActiveRouting(
+              { sessionId, ...input },
+              accounts,
+              boundSidebarFile,
+            )
+            return
+          }
+          await setSidebarLegacyRouting(input, boundSidebarFile)
         }
 
         // -------------------------------------------------------------------
@@ -1278,7 +1319,7 @@ export async function CodexAuthPlugin(
           },
           refreshSidebar: async () => {
             const store = await loadAccounts(getConfigPath())
-            await writeSidebarState(quotaManager, store)
+            await writeMachineSidebarState(quotaManager, store)
           },
           refreshAllQuota: async () =>
             refreshAllQuota({
@@ -1287,7 +1328,7 @@ export async function CodexAuthPlugin(
               fallbackManager,
               quotaManager,
               loadAccounts,
-              writeSidebarState,
+              writeSidebarState: writeMachineSidebarState,
               client: input.client as CommandContext['client'],
               fetchImpl: fetch,
               now: Date.now,
@@ -1679,7 +1720,6 @@ export async function CodexAuthPlugin(
               candidate.access,
               candidate.quotaAccountId,
               undefined,
-              undefined,
               isCompleteQuotaHeaderFrame(response.headers),
             )
           } catch {
@@ -1836,7 +1876,7 @@ export async function CodexAuthPlugin(
           bootQuotaSeedStarted = true
 
           // Seed fallback quota from persisted account.quota so the immediate
-          // writeSidebarState shows last-known fallback numbers, not null.
+          // The immediate machine snapshot shows last-known fallback numbers.
           if (storage) {
             const oauthAccts: OAuthAccount[] = []
             for (const a of storage.accounts) {
@@ -1846,7 +1886,7 @@ export async function CodexAuthPlugin(
           }
 
           // Immediate: show persisted quota so the sidebar isn't blank
-          void writeSidebarState(quotaManager, storage).catch(() => {})
+          void writeMachineSidebarState(quotaManager, storage).catch(() => {})
 
           // Background: refresh from the API, then the sidebar shows fresh numbers
           void refreshAllQuota({
@@ -1855,7 +1895,7 @@ export async function CodexAuthPlugin(
             fallbackManager,
             quotaManager,
             loadAccounts,
-            writeSidebarState,
+            writeSidebarState: writeMachineSidebarState,
             client: input.client as Parameters<
               typeof refreshAllQuota
             >[0]['client'],
@@ -1876,6 +1916,9 @@ export async function CodexAuthPlugin(
         return {
           apiKey: OAUTH_DUMMY_KEY,
           async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
+            const sidebarSessionId = resolveSidebarSessionId(
+              new Headers(init?.headers),
+            )
             // Routing is purely mode-driven. The primary is ALWAYS the main
             // account; fallback-first is handled by a proactive gate below that
             // tries usable fallbacks before main. There is no per-account pin.
@@ -2085,10 +2128,6 @@ export async function CodexAuthPlugin(
               }
             }
 
-            // Record which account served so the sidebar shows the true active
-            // account (display only — not a persisted pin).
-            lastServedActiveId = servedActiveId
-
             try {
               const snapshot = normalizeQuotaHeaders(finalResponse.headers)
               if (fallbackServed) {
@@ -2097,7 +2136,6 @@ export async function CodexAuthPlugin(
                   fallbackQuotaAccess,
                   fallbackQuotaAccountId,
                   undefined,
-                  servedActiveId,
                   isCompleteQuotaHeaderFrame(finalResponse.headers),
                 )
               } else {
@@ -2106,7 +2144,6 @@ export async function CodexAuthPlugin(
                   primaryAccess,
                   undefined,
                   mainAccountIdentity,
-                  servedActiveId,
                   isCompleteQuotaHeaderFrame(finalResponse.headers),
                 )
               }
@@ -2114,6 +2151,12 @@ export async function CodexAuthPlugin(
               // Quota push is best-effort — never break the response
             }
 
+            await writeRequestSidebarRouting(
+              sidebarSessionId,
+              servedActiveId,
+              mode,
+              reqStorage?.accounts ?? [],
+            )
             return finalResponse
           },
           async dispose() {

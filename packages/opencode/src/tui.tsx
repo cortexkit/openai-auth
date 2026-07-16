@@ -26,6 +26,7 @@ import {
   getCollapsedQuotaSummary,
   getPresentQuotaWindows,
   getSidebarState,
+  isUsableRoutingEntry,
   type QuotaPacing,
   type QuotaWindow,
   resolveActiveAccount,
@@ -421,6 +422,7 @@ function AccountBlock(props: {
 function QuotaDialogContent(props: {
   api: TuiPluginApi
   controller: SidebarController
+  sessionId: string | undefined
 }) {
   const prefs = props.controller.prefs
   const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
@@ -440,6 +442,7 @@ function QuotaDialogContent(props: {
   const theme = () => props.api.theme.current
   const enabledFallbacks = () =>
     (state().fallbacks ?? []).filter((f) => f.enabled)
+  const activeId = () => resolveQuotaDialogActiveId(state(), props.sessionId)
   return (
     <box flexDirection='column' padding={2} width='100%' alignItems='center'>
       <box flexDirection='column' width={58}>
@@ -454,7 +457,7 @@ function QuotaDialogContent(props: {
           name='main'
           quota={state().main?.quota ?? null}
           killed={state().main?.killed ?? false}
-          active={state().activeId === 'main'}
+          active={activeId() === 'main'}
           pacingEnabled={prefs().sections.pacing}
           resetCredits={state().main?.resetCredits}
         />
@@ -467,7 +470,7 @@ function QuotaDialogContent(props: {
                 name={fb.label ?? fb.id}
                 quota={fb.quota}
                 killed={fb.killed}
-                active={state().activeId === fb.id}
+                active={activeId() === fb.id}
                 pacingEnabled={prefs().sections.pacing}
                 resetCredits={fb.resetCredits}
                 marginTop={1}
@@ -484,6 +487,35 @@ function QuotaDialogContent(props: {
 
 export async function readStateFromFile(): Promise<SidebarState> {
   return getSidebarState()
+}
+
+export function resolveSessionSidebarRouting(
+  state: SidebarState,
+  sessionId: string,
+  now = Date.now(),
+): { activeId: string; route: string } {
+  const own = state.activeRouting?.[sessionId]
+  // Validity follows the last-published sidebar roster and corrects on the next machine snapshot.
+  if (own && isUsableRoutingEntry(own, state.fallbacks, now)) {
+    return { activeId: own.activeId, route: own.route }
+  }
+
+  const fallback = state.fallbacks.find((account) => account.enabled)
+  return {
+    activeId:
+      state.route === 'fallback-first' && fallback ? fallback.id : 'main',
+    route: state.route,
+  }
+}
+
+export function resolveQuotaDialogActiveId(
+  state: SidebarState,
+  sessionId: string | undefined,
+  now = Date.now(),
+): string | undefined {
+  return sessionId
+    ? resolveSessionSidebarRouting(state, sessionId, now).activeId
+    : state.activeId
 }
 
 interface SidebarController {
@@ -553,6 +585,7 @@ function createSidebarController(
 function QuotaSidebar(props: {
   api: TuiPluginApi
   controller: SidebarController
+  sessionId: string
 }) {
   const prefs = props.controller.prefs
   const collapsed = props.controller.collapsed
@@ -604,7 +637,14 @@ function QuotaSidebar(props: {
     const name = prefs().header.label
     return !hasData() ? name : collapsed() ? `\u25b6 ${name}` : `\u25bc ${name}`
   }
-  const activeAccount = () => resolveActiveAccount(state())
+  const sessionRouting = () =>
+    resolveSessionSidebarRouting(state(), props.sessionId)
+  const sessionState = (): SidebarState => ({
+    ...state(),
+    activeId: sessionRouting().activeId,
+    route: sessionRouting().route,
+  })
+  const activeAccount = () => resolveActiveAccount(sessionState())
   const activeQuotaSummary = () =>
     getCollapsedQuotaSummary(activeAccount().quota)
   const activePacingDeficit = () => {
@@ -735,7 +775,7 @@ function QuotaSidebar(props: {
               name='main'
               quota={state().main?.quota ?? null}
               killed={state().main?.killed ?? false}
-              active={state().activeId === 'main'}
+              active={sessionRouting().activeId === 'main'}
               pacingEnabled={prefs().sections.pacing}
               resetCredits={state().main?.resetCredits}
             />
@@ -748,7 +788,7 @@ function QuotaSidebar(props: {
                     name={fb.label ?? fb.id}
                     quota={fb.quota}
                     killed={fb.killed}
-                    active={state().activeId === fb.id}
+                    active={sessionRouting().activeId === fb.id}
                     pacingEnabled={prefs().sections.pacing}
                     resetCredits={fb.resetCredits}
                     marginTop={1}
@@ -765,7 +805,7 @@ function QuotaSidebar(props: {
           <StatRow
             theme={theme()}
             label='Route'
-            value={state().route}
+            value={sessionRouting().route}
             tone='accent'
           />
         </Show>
@@ -821,8 +861,14 @@ const tui: TuiPlugin = async (api) => {
   api.slots.register({
     order: computeEffectiveOrder(root, PLUGIN_KEY, DEFAULT_SLOT_ORDER),
     slots: {
-      sidebar_content(_ctx: unknown, _props: { session_id: string }) {
-        return <QuotaSidebar api={api} controller={controller} />
+      sidebar_content(_ctx: unknown, props: { session_id: string }) {
+        return (
+          <QuotaSidebar
+            api={api}
+            controller={controller}
+            sessionId={props.session_id}
+          />
+        )
       },
     },
   })
@@ -860,7 +906,11 @@ const tui: TuiPlugin = async (api) => {
             if (message.payload.command === 'openai-quota') {
               api.ui.dialog.setSize('xlarge')
               api.ui.dialog.replace(() => (
-                <QuotaDialogContent api={api} controller={controller} />
+                <QuotaDialogContent
+                  api={api}
+                  controller={controller}
+                  sessionId={sessionId}
+                />
               ))
               continue
             }
