@@ -51,12 +51,13 @@ function windowFromHeader(
   const base = prefix.slice(0, -'-used-percent'.length)
   const windowMinutes = positiveFinite(h.get(`${base}-window-minutes`))
   const resetsAt = toResetIso(h.get(`${base}-reset-at`) ?? undefined)
-  // A retired window is encoded on this transport as a zero used-percent
-  // sibling of the real fields, not by omitting the header — the header
-  // set always carries all slots, live or not. With no positive length and
-  // no reset time, a zero used-percent is that placeholder, not a real
-  // 0%-used window (a real one still carries its length + reset).
-  if (usedPercent === 0 && windowMinutes === undefined && !resetsAt) {
+  // Retired slots use an explicit zero-length marker. Missing optional
+  // metadata alone cannot distinguish a retired slot from a live 0%-used window.
+  if (
+    usedPercent === 0 &&
+    h.get(`${base}-window-minutes`) === '0' &&
+    !resetsAt
+  ) {
     return undefined
   }
   return {

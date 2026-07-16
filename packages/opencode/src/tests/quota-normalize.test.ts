@@ -249,6 +249,16 @@ describe('quota normalize → QuotaSnapshot', () => {
     expect(s.secondary).toBeUndefined()
   })
 
+  it('header: a 0%-used window without optional metadata stays present', () => {
+    const h = new Headers({
+      'x-codex-secondary-used-percent': '0',
+    })
+    const s = normalizeQuotaHeaders(h)
+    expect(s.secondary?.usedPercent).toBe(0)
+    expect(s.secondary?.windowMinutes).toBeUndefined()
+    expect(s.secondary?.resetsAt).toBeUndefined()
+  })
+
   it('header: a real 0%-used window with a positive length and a reset stays present', () => {
     const h = new Headers({
       'x-codex-secondary-used-percent': '0',

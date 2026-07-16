@@ -436,7 +436,9 @@ describe('integration: HTTP quota push', () => {
           : {
               'content-type': 'text/event-stream',
               'x-codex-primary-used-percent': '0',
+              'x-codex-primary-window-minutes': '0',
               'x-codex-secondary-used-percent': '0',
+              'x-codex-secondary-window-minutes': '0',
             },
       )
       return new Response('{"choices":[{"delta":{"content":"hello"}}]}', {
@@ -2001,18 +2003,27 @@ describe('integration: WS quota push', () => {
           )
 
           await quotaFrameSentPromise
-          let earlySidebar: SidebarState
-          while (true) {
-            earlySidebar = JSON.parse(
+          const sidebarWaitMs = 2000
+          const sidebarDeadline = Date.now() + sidebarWaitMs
+          let sidebarWriteLanded = false
+          while (Date.now() < sidebarDeadline) {
+            const earlySidebar = JSON.parse(
               await readFile(sidebarFile, 'utf8'),
             ) as SidebarState
             if (
               earlySidebar.fallbacks.find(
                 (account) => account.id === fallback.id,
               )?.quota?.primary?.usedPercent === 35
-            )
+            ) {
+              sidebarWriteLanded = true
               break
+            }
             await Promise.resolve()
+          }
+          if (!sidebarWriteLanded) {
+            throw new Error(
+              `early fallback WS sidebar write did not land within ${sidebarWaitMs}ms`,
+            )
           }
           expect(releaseFirstEvent).toBeDefined()
           releaseFirstEvent?.()
