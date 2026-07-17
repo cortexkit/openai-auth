@@ -143,4 +143,38 @@ describe('tui packaging (compiled ./tui entry shim)', () => {
 
     expect(uncovered).toEqual([])
   })
+
+  // The compiled TUI bundle is produced from the static shippedSourceFiles
+  // list in scripts/build-tui.ts. A source file reachable from tui.tsx but
+  // missing from that list is absent from src/tui-compiled/, and the compiled
+  // bundle then fails at load time with "Cannot find module" — the host
+  // silently drops the sidebar. Walk the real import graph and require the
+  // build list to cover it exactly.
+  test('every src/ file reachable from tui.tsx is in build-tui shippedSourceFiles', () => {
+    const script = readFileSync(
+      join(PKG_DIR, 'scripts', 'build-tui.ts'),
+      'utf8',
+    )
+    const arrayMatch = script.match(
+      /const shippedSourceFiles = \[([\s\S]*?)\] as const/,
+    )
+    if (!arrayMatch) {
+      throw new Error(
+        'scripts/build-tui.ts no longer declares shippedSourceFiles — update this test to match the new build mechanism',
+      )
+    }
+    const shipped = new Set(
+      [...arrayMatch[1]!.matchAll(/'([^']+)'/g)].map((m) => m[1]!),
+    )
+
+    // tui-compiled is build output; the graph of interest is the raw source
+    // fallback starting at src/tui.tsx (the same graph build-tui compiles).
+    const reachable = [...collectReachableSrcFiles('src/tui.tsx')]
+      .filter((rel) => !rel.startsWith('src/tui-compiled/'))
+      .map((rel) => rel.replace(/^src\//, ''))
+      .sort()
+
+    const missing = reachable.filter((rel) => !shipped.has(rel))
+    expect(missing).toEqual([])
+  })
 })

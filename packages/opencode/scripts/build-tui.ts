@@ -10,6 +10,7 @@ const shippedSourceFiles = [
   'tui.tsx',
   'tui/command-dialogs.tsx',
   'sidebar-state.ts',
+  'core/refresh-file-lock.ts',
   'tui-preferences.ts',
   'logger.ts',
   'rpc/rpc-client.ts',
