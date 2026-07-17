@@ -14,6 +14,7 @@ import {
   MAIN_REFRESH_LEASE_TTL_MS,
   MAIN_REFRESH_LOCK_TTL_MS,
 } from '../index.ts'
+import { resetModelCostsForTest } from '../model-costs.ts'
 import { ResponseStreamError } from '../response-stream-error'
 import {
   drainSidebarWrites,
@@ -23,6 +24,7 @@ import {
 import {
   FLOOR_AUTH_FILE,
   FLOOR_LOG_FILE,
+  FLOOR_MODELS_CACHE,
   FLOOR_SIDEBAR_STATE_FILE,
   FLOOR_STATE_FILE,
 } from './setup-env.ts'
@@ -304,6 +306,7 @@ describe('integration: HTTP quota push', () => {
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
     process.env.NODE_ENV = 'test'
     process.env.OPENCODE_CONFIG_DIR = configDir
+    resetModelCostsForTest()
   })
 
   afterEach(async () => {
@@ -3725,6 +3728,7 @@ describe('integration: no real config read', () => {
 describe('integration: models cost-zeroing', () => {
   let configDir: string
   let configFile: string
+  let modelsCacheFile: string
   let stateFile: string
 
   function mockProvider() {
@@ -3790,19 +3794,24 @@ describe('integration: models cost-zeroing', () => {
   beforeEach(() => {
     configDir = tempDir('oai-int-models-')
     configFile = join(configDir, 'openai-auth.json')
+    modelsCacheFile = join(configDir, 'models.json')
     stateFile = join(configDir, 'openai-auth-state.json')
     process.env.OPENCODE_OPENAI_AUTH_FILE = configFile
+    process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE = modelsCacheFile
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = stateFile
     process.env.NODE_ENV = 'test'
     process.env.OPENCODE_CONFIG_DIR = configDir
+    resetModelCostsForTest()
   })
 
   afterEach(() => {
     // Restore path envs to floor (not delete) — keeps in-flight writes away from live defaults.
     process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+    process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE = FLOOR_MODELS_CACHE
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
     delete process.env.OPENCODE_CONFIG_DIR
     delete process.env.NODE_ENV
+    resetModelCostsForTest()
   })
 
   it('OAuth + no costZeroing key → costs ZEROED (default-on preserved)', async () => {
@@ -3820,13 +3829,45 @@ describe('integration: models cost-zeroing', () => {
     })
   })
 
-  it('OAuth + costZeroing.enabled === false → original cost PRESERVED', async () => {
+  it('OAuth + costZeroing.enabled === false → catalog cost RESTORED', async () => {
     writeFileSync(
       configFile,
       JSON.stringify({
         version: 1,
         accounts: [],
         costZeroing: { enabled: false },
+      }),
+    )
+    writeFileSync(
+      modelsCacheFile,
+      JSON.stringify({
+        openai: {
+          models: {
+            'gpt-5.5': {
+              cost: {
+                input: 5,
+                output: 30,
+                cache_read: 0.5,
+                cache_write: 6.25,
+                tiers: [
+                  {
+                    input: 10,
+                    output: 45,
+                    cache_read: 1,
+                    cache_write: 12.5,
+                    tier: { type: 'context', size: 272_000 },
+                  },
+                ],
+                context_over_200k: {
+                  input: 10,
+                  output: 45,
+                  cache_read: 1,
+                  cache_write: 12.5,
+                },
+              },
+            },
+          },
+        },
       }),
     )
     const input = createMockPluginInput()
@@ -3836,9 +3877,22 @@ describe('integration: models cost-zeroing', () => {
     const result = await modelsFn(mockProvider(), oauthCtx())
     const model = result['gpt-5.5']!
     expect(model.cost).toEqual({
-      input: 15,
-      output: 60,
-      cache: { read: 7.5, write: 15 },
+      input: 5,
+      output: 30,
+      cache: { read: 0.5, write: 6.25 },
+      tiers: [
+        {
+          input: 10,
+          output: 45,
+          cache: { read: 1, write: 12.5 },
+          tier: { type: 'context', size: 272_000 },
+        },
+      ],
+      experimentalOver200K: {
+        input: 10,
+        output: 45,
+        cache: { read: 1, write: 12.5 },
+      },
     })
   })
 
