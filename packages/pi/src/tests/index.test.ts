@@ -4,6 +4,7 @@ import cortexKitPiOpenAIAuth, { installRawCodexWebSocket } from '../index.ts'
 
 type RegisteredProvider = {
   models: Array<{ id: string }>
+  oauth?: unknown
 }
 
 describe('Pi OpenAI auth extension', () => {
@@ -21,6 +22,9 @@ describe('Pi OpenAI auth extension', () => {
 
     expect(registrations).toHaveLength(1)
     expect(registrations[0]?.id).toBe('openai-codex')
+    // Pi 0.80+ inherits canonical OAuth from its built-in provider when an
+    // extension overrides transport/models without supplying its own OAuth.
+    expect(registrations[0]?.provider.oauth).toBeUndefined()
     expect(registrations[0]?.provider.models.map((model) => model.id)).toEqual([
       'gpt-5.5',
       'gpt-5.4',
