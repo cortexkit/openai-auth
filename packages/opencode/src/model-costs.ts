@@ -4,7 +4,10 @@ import { join } from 'node:path'
 
 const MODELS_DEV_URL = 'https://models.dev/api.json'
 const MODELS_CACHE_ENV = 'OPENCODE_OPENAI_AUTH_MODELS_CACHE'
+const OPENCODE_MODELS_PATH_ENV = 'OPENCODE_MODELS_PATH'
+const OPENCODE_DISABLE_MODELS_FETCH_ENV = 'OPENCODE_DISABLE_MODELS_FETCH'
 const FETCH_TIMEOUT_MS = 10_000
+const CATALOG_CACHE_TTL_MS = 5 * 60_000
 
 type CacheCost = { read: number; write: number }
 
@@ -33,8 +36,11 @@ function record(value: unknown): Record<string, unknown> | null {
     : null
 }
 
-function finiteNumber(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+function optionalPrice(value: unknown): number | null {
+  if (value === undefined) return 0
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? value
+    : null
 }
 
 // Restoring a zero price for a direction the catalog actually charges for
@@ -45,14 +51,19 @@ function strictPrices(
   raw: Record<string, unknown>,
 ): { input: number; output: number; cache: CacheCost } | null {
   const { input, output } = raw
-  if (typeof input !== 'number' || !Number.isFinite(input)) return null
-  if (typeof output !== 'number' || !Number.isFinite(output)) return null
+  if (typeof input !== 'number' || !Number.isFinite(input) || input < 0)
+    return null
+  if (typeof output !== 'number' || !Number.isFinite(output) || output < 0)
+    return null
+  const cacheRead = optionalPrice(raw.cache_read)
+  const cacheWrite = optionalPrice(raw.cache_write)
+  if (cacheRead === null || cacheWrite === null) return null
   return {
     input,
     output,
     cache: {
-      read: finiteNumber(raw.cache_read),
-      write: finiteNumber(raw.cache_write),
+      read: cacheRead,
+      write: cacheWrite,
     },
   }
 }
@@ -76,6 +87,7 @@ export function toSdkCost(raw: unknown): ModelCost | null {
       if (!tier) continue
       const tierRule = record(tier.tier)
       const size = tierRule?.size
+      if (tierRule?.type !== 'context') continue
       if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0)
         continue
       const prices = strictPrices(tier)
@@ -107,14 +119,27 @@ function catalogCosts(raw: unknown): Record<string, ModelCost> | null {
     const cost = toSdkCost(model?.cost)
     if (cost) costs[modelID] = cost
   }
-  return costs
+  return Object.keys(costs).length > 0 ? costs : null
 }
 
 function modelsCachePath(): string {
-  return (
-    process.env[MODELS_CACHE_ENV]?.trim() ||
-    join(homedir(), '.cache', 'opencode', 'models.json')
-  )
+  const explicit = process.env[MODELS_CACHE_ENV]?.trim()
+  if (explicit) return explicit
+  const hostOverride = process.env[OPENCODE_MODELS_PATH_ENV]?.trim()
+  if (hostOverride) return hostOverride
+
+  const cacheRoot =
+    process.env.XDG_CACHE_HOME?.trim() ||
+    (process.platform === 'win32'
+      ? process.env.LOCALAPPDATA?.trim()
+      : undefined) ||
+    join(homedir(), '.cache')
+  return join(cacheRoot, 'opencode', 'models.json')
+}
+
+function hostModelsFetchDisabled(): boolean {
+  const value = process.env[OPENCODE_DISABLE_MODELS_FETCH_ENV]?.toLowerCase()
+  return value === 'true' || value === '1'
 }
 
 async function resolveModelsDevCosts(): Promise<Record<
@@ -128,6 +153,8 @@ async function resolveModelsDevCosts(): Promise<Record<
     if (cachedCatalog) return cachedCatalog
   } catch {}
 
+  if (hostModelsFetchDisabled()) return null
+
   try {
     const response = await fetch(MODELS_DEV_URL, {
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
@@ -139,14 +166,29 @@ async function resolveModelsDevCosts(): Promise<Record<
   }
 }
 
-let cachedCosts: Promise<Record<string, ModelCost> | null> | undefined
+let cachedCosts:
+  | {
+      expiresAt: number
+      promise: Promise<Record<string, ModelCost> | null>
+    }
+  | undefined
 
 export function loadModelsDevCosts(): Promise<Record<
   string,
   ModelCost
 > | null> {
-  cachedCosts ??= resolveModelsDevCosts()
-  return cachedCosts
+  const now = Date.now()
+  if (cachedCosts && cachedCosts.expiresAt > now) return cachedCosts.promise
+
+  const entry = {
+    expiresAt: now + CATALOG_CACHE_TTL_MS,
+    promise: resolveModelsDevCosts(),
+  }
+  cachedCosts = entry
+  void entry.promise.then((costs) => {
+    if (costs === null && cachedCosts === entry) cachedCosts = undefined
+  })
+  return entry.promise
 }
 
 /** Test-only: drop the memoized catalog so a later load re-reads its source. */

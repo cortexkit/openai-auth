@@ -763,7 +763,7 @@ export async function CodexAuthPlugin(
         if (!zeroCosts && !catalog && !warnedCostCatalogUnavailable) {
           warnedCostCatalogUnavailable = true
           logModels.warn(
-            'models.dev catalog unavailable; preserving incoming OAuth model costs',
+            'models.dev catalog unavailable; OAuth model costs could not be restored',
           )
         }
 
