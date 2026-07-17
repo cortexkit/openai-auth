@@ -94,9 +94,9 @@ describe('request dumps', () => {
       expect(seen[0]?.body.store).toBe(false)
       expect(typeof seen[0]?.body.prompt_cache_key).toBe('string')
       expect(
-        (seen[0]?.body.tools as Array<Record<string, unknown>>).some(
-          (tool) => tool.type === 'web_search',
-        ),
+        (
+          seen[0]?.body.tools as Array<Record<string, unknown>> | undefined
+        )?.some((tool) => tool.type === 'web_search') ?? false,
       ).toBe(true)
     } finally {
       globalThis.fetch = originalFetch

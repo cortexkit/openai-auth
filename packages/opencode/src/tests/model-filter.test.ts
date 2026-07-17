@@ -6,10 +6,10 @@ import type { PluginInput } from '@opencode-ai/plugin'
 import { CodexAuthPlugin } from '../index'
 
 // Exercises the provider.models hook: which OpenAI models surface to OAuth
-// users and what context limits they carry. The suffix-less gpt-5.6 (and its
-// -fast/-pro synthetics, which inherit api.id "gpt-5.6") must be dropped
-// because the Codex OAuth backend rejects that model name; the -luna/-sol/-terra
-// variants stay and get the real 372k context window.
+// users and what context limits they carry. The suffix-less gpt-5.6 and its
+// synthetics inherit api.id "gpt-5.6" and must be dropped because the Codex
+// OAuth backend rejects that model name. Legacy reasoning-mode `-pro` models
+// are also dropped; Luna/Sol/Terra use the native `max` reasoning variant.
 
 function createMockPluginInput(): PluginInput {
   return {
@@ -29,6 +29,7 @@ function createMockPluginInput(): PluginInput {
 type MockModel = {
   id: string
   api: { id: string }
+  options: { reasoningMode?: string }
   cost: {
     input: number
     output: number
@@ -37,10 +38,15 @@ type MockModel = {
   limit: { context: number; input: number; output: number }
 }
 
-function model(id: string, apiId: string): MockModel {
+function model(
+  id: string,
+  apiId: string,
+  options: MockModel['options'] = {},
+): MockModel {
   return {
     id,
     api: { id: apiId },
+    options,
     cost: { input: 5, output: 10, cache: { read: 1, write: 2 } },
     limit: { context: 1_050_000, input: 922_000, output: 128_000 },
   }
@@ -67,7 +73,13 @@ async function surfacedModels() {
       // real 5.6 variants (api.id carries the suffix): kept
       'gpt-5.6-luna': model('gpt-5.6-luna', 'gpt-5.6-luna'),
       'gpt-5.6-luna-fast': model('gpt-5.6-luna-fast', 'gpt-5.6-luna'),
+      'gpt-5.6-luna-pro': model('gpt-5.6-luna-pro', 'gpt-5.6-luna', {
+        reasoningMode: 'pro',
+      }),
       'gpt-5.6-sol': model('gpt-5.6-sol', 'gpt-5.6-sol'),
+      'gpt-5.6-sol-pro': model('gpt-5.6-sol-pro', 'gpt-5.6-sol', {
+        reasoningMode: 'pro',
+      }),
       'gpt-5.6-terra': model('gpt-5.6-terra', 'gpt-5.6-terra'),
     },
   }
@@ -111,12 +123,18 @@ describe('provider.models filter', () => {
     expect(models['gpt-5.6-pro']).toBeUndefined()
   })
 
-  it('keeps the -luna/-sol/-terra variants (including their -fast synthetics)', async () => {
+  it('keeps the -luna/-sol/-terra models and their native reasoning variants', async () => {
     const models = await surfacedModels()
     expect(models['gpt-5.6-luna']).toBeDefined()
     expect(models['gpt-5.6-luna-fast']).toBeDefined()
     expect(models['gpt-5.6-sol']).toBeDefined()
     expect(models['gpt-5.6-terra']).toBeDefined()
+  })
+
+  it('drops legacy reasoning-mode pro models for supported 5.6 slugs', async () => {
+    const models = await surfacedModels()
+    expect(models['gpt-5.6-luna-pro']).toBeUndefined()
+    expect(models['gpt-5.6-sol-pro']).toBeUndefined()
   })
 
   it('keeps allow-listed models and drops pre-5.4 models', async () => {

@@ -6,7 +6,7 @@
  * model/variant, OpenCode's next real prompt can inherit the synthetic message's
  * default model/variant and silently change the model, usage, or cache
  * attribution. Resolve the most recent assistant context and pass it through on
- * hidden command replies so the user's selected model (including -pro) is kept.
+ * hidden command replies so the user's selected model and reasoning variant are kept.
  */
 export interface ResolvedPromptContext {
   agent?: string

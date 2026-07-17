@@ -21,6 +21,20 @@ export function toResetIso(
   return Number.isNaN(d.getTime()) ? undefined : d.toISOString()
 }
 
+function positiveFinite(value: unknown): number | undefined {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+}
+
+// JSON-only (reset-credit count) — unlike positiveFinite, deliberately does
+// NOT coerce strings/null: Number(null) and Number('') are both 0, which
+// would turn an absent/null wham field into a fabricated real zero.
+function nonNegativeFinite(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined
+}
+
 // ---------------------------------------------------------------------------
 // HTTP x-codex-* response headers
 // ---------------------------------------------------------------------------
@@ -34,24 +48,67 @@ function windowFromHeader(
   const usedPercent = Number(used)
   if (!Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100)
     return undefined
+  const base = prefix.slice(0, -'-used-percent'.length)
+  const windowMinutes = positiveFinite(h.get(`${base}-window-minutes`))
+  const resetsAt = toResetIso(h.get(`${base}-reset-at`) ?? undefined)
+  // Retired slots use an explicit zero-length marker. Missing optional
+  // metadata alone cannot distinguish a retired slot from a live 0%-used window.
+  if (
+    usedPercent === 0 &&
+    h.get(`${base}-window-minutes`) === '0' &&
+    !resetsAt
+  ) {
+    return undefined
+  }
   return {
     usedPercent,
     remainingPercent: 100 - usedPercent,
-    resetsAt: toResetIso(
-      h.get(`${prefix.slice(0, -'-used-percent'.length)}-reset-at`) ??
-        undefined,
-    ),
+    resetsAt,
     checkedAt: Date.now(),
+    ...(windowMinutes !== undefined ? { windowMinutes } : {}),
   }
 }
 
+const QUOTA_USED_PERCENT_HEADERS = [
+  'x-codex-primary-used-percent',
+  'x-codex-secondary-used-percent',
+] as const
+
+function usedPercentHeaderState(h: Headers, name: string) {
+  const raw = h.get(name)
+  if (raw === null) return 'absent' as const
+  if (raw.trim() === '') return 'invalid' as const
+  const value = Number(raw)
+  return Number.isFinite(value) && value >= 0 && value <= 100
+    ? ('valid' as const)
+    : ('invalid' as const)
+}
+
 export function normalizeQuotaHeaders(h: Headers): OAuthQuotaSnapshot {
+  if (
+    QUOTA_USED_PERCENT_HEADERS.some(
+      (name) => usedPercentHeaderState(h, name) === 'invalid',
+    )
+  )
+    return {}
   const snapshot: OAuthQuotaSnapshot = {}
   const primary = windowFromHeader(h, 'x-codex-primary-used-percent')
   if (primary) snapshot.primary = primary
   const secondary = windowFromHeader(h, 'x-codex-secondary-used-percent')
   if (secondary) snapshot.secondary = secondary
   return snapshot
+}
+
+/**
+ * A complete frame has at least one syntactically valid used-percent header
+ * and no malformed used-percent headers. Explicit retired-slot markers count
+ * as valid even though normalization omits them from the snapshot.
+ */
+export function isCompleteQuotaHeaderFrame(h: Headers): boolean {
+  const states = QUOTA_USED_PERCENT_HEADERS.map((name) =>
+    usedPercentHeaderState(h, name),
+  )
+  return states.includes('valid') && !states.includes('invalid')
 }
 
 // ---------------------------------------------------------------------------
@@ -65,8 +122,8 @@ interface WsRateLimitWindow {
 }
 
 interface WsRateLimits {
-  primary?: WsRateLimitWindow
-  secondary?: WsRateLimitWindow
+  primary?: WsRateLimitWindow | null
+  secondary?: WsRateLimitWindow | null
 }
 
 // The live codex.rate_limits frame also carries `additional_rate_limits`, but on
@@ -82,7 +139,7 @@ interface WsRateLimitsFrame {
 }
 
 function windowFromWs(
-  w: WsRateLimitWindow | undefined,
+  w: WsRateLimitWindow | null | undefined,
 ): AccountQuotaWindow | undefined {
   if (!w) return undefined
   // A non-finite used_percent (NaN, Infinity) would produce a bogus
@@ -94,11 +151,21 @@ function windowFromWs(
     w.used_percent > 100
   )
     return undefined
+  const windowMinutes = positiveFinite(w.window_minutes)
+  const resetsAt = toResetIso(w.reset_at)
+  // Defensive mirror of the header-path placeholder guard: a gone window
+  // slot on this transport is normally an explicit null, but a zero-valued
+  // object with no length and no reset carries the same "not really here"
+  // shape and should not render as a present 0% window either.
+  if (w.used_percent === 0 && windowMinutes === undefined && !resetsAt) {
+    return undefined
+  }
   return {
     usedPercent: w.used_percent,
     remainingPercent: 100 - w.used_percent,
-    resetsAt: toResetIso(w.reset_at),
+    resetsAt,
     checkedAt: Date.now(),
+    ...(windowMinutes !== undefined ? { windowMinutes } : {}),
   }
 }
 
@@ -122,8 +189,8 @@ interface WhamRateLimitWindow {
 }
 
 interface WhamRateLimits {
-  primary_window?: WhamRateLimitWindow
-  secondary_window?: WhamRateLimitWindow
+  primary_window?: WhamRateLimitWindow | null
+  secondary_window?: WhamRateLimitWindow | null
 }
 
 // As with the WS frame, wham/usage may carry per-model windows alongside the
@@ -132,10 +199,13 @@ interface WhamRateLimits {
 interface WhamUsageResponse {
   plan_type?: string
   rate_limit: WhamRateLimits
+  rate_limit_reset_credits?: {
+    available_count?: number
+  } | null
 }
 
 function windowFromWham(
-  w: WhamRateLimitWindow | undefined,
+  w: WhamRateLimitWindow | null | undefined,
 ): AccountQuotaWindow | undefined {
   if (!w) return undefined
   // A non-finite used_percent (NaN, Infinity) would produce a bogus
@@ -147,11 +217,23 @@ function windowFromWham(
     w.used_percent > 100
   )
     return undefined
+  // wham's window length is in seconds; every other source is minutes.
+  const windowSeconds = positiveFinite(w.limit_window_seconds)
+  const resetsAt = toResetIso(w.reset_at)
+  // Defensive mirror of the header-path placeholder guard — wham sends an
+  // explicit null for a gone window, but a zero-valued object with no
+  // length and no reset carries the same "not really here" shape.
+  if (w.used_percent === 0 && windowSeconds === undefined && !resetsAt) {
+    return undefined
+  }
   return {
     usedPercent: w.used_percent,
     remainingPercent: 100 - w.used_percent,
-    resetsAt: toResetIso(w.reset_at),
+    resetsAt,
     checkedAt: Date.now(),
+    ...(windowSeconds !== undefined
+      ? { windowMinutes: windowSeconds / 60 }
+      : {}),
   }
 }
 
@@ -161,5 +243,11 @@ export function normalizeWham(json: WhamUsageResponse): OAuthQuotaSnapshot {
   if (primary) snapshot.primary = primary
   const secondary = windowFromWham(json.rate_limit?.secondary_window)
   if (secondary) snapshot.secondary = secondary
+  const resetCreditsAvailable = nonNegativeFinite(
+    json.rate_limit_reset_credits?.available_count,
+  )
+  if (resetCreditsAvailable !== undefined) {
+    snapshot.resetCreditsAvailable = resetCreditsAvailable
+  }
   return snapshot
 }

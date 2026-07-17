@@ -1,24 +1,39 @@
 import { describe, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+
+import { acquireRefreshFileLock } from '../core/refresh-file-lock'
 import {
+  ACTIVE_ROUTING_MAX_AGE_MS,
   type AccountQuota,
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
   drainSidebarWrites,
-  FIVE_HOUR_MS,
+  formatWindowLabel,
   getCollapsedQuotaSummary,
+  getPresentQuotaWindows,
   getSidebarState,
   getSidebarStateFile,
+  isUsableRoutingEntry,
   normalizeSidebarState,
+  pruneActiveRouting,
+  removeSidebarActiveRouting,
   resolveActiveAccount,
-  SEVEN_DAY_MS,
   type SidebarAccountState,
   type SidebarState,
+  setSidebarLegacyRouting,
+  setSidebarMachineState,
   setSidebarState,
+  upsertSidebarActiveRouting,
 } from '../sidebar-state'
 import { FLOOR_SIDEBAR_STATE_FILE } from './setup-env.ts'
+
+// computeQuotaPacing takes an explicit windowMs, independent of the slot
+// carrying it — these are test-local reference durations, not the
+// production label/pacing ruler (which derives from window length).
+const FIVE_HOUR_MS = 5 * 60 * 60 * 1000
+const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000
 
 const quota = (used: number): AccountQuota => ({
   primary: { usedPercent: used, remainingPercent: 100 - used },
@@ -110,7 +125,11 @@ describe('normalizeSidebarState', () => {
     const full: SidebarState = {
       main: {
         quota: {
-          primary: { usedPercent: 42, remainingPercent: 58 },
+          primary: {
+            usedPercent: 42,
+            remainingPercent: 58,
+            windowMinutes: 10_080,
+          },
           secondary: { usedPercent: 17, remainingPercent: 83 },
         },
         killed: true,
@@ -118,6 +137,7 @@ describe('normalizeSidebarState', () => {
         quotaBackoffUntil: 1234567890,
         refreshBackedOff: false,
         refreshBackoffUntil: 9876543210,
+        resetCredits: 4,
       },
       fallbacks: [
         {
@@ -126,31 +146,177 @@ describe('normalizeSidebarState', () => {
           quota: { primary: { usedPercent: 5, remainingPercent: 95 } },
           killed: false,
           enabled: true,
+          resetCredits: 2,
         },
       ],
       activeId: 'fb1',
       route: 'fallback',
+      activeRouting: {
+        'sess-fb1': {
+          activeId: 'fb1',
+          route: 'fallback',
+          updatedAt: 1718000000000,
+        },
+      },
       planType: 'pro',
       credits: 100,
       lastUpdated: 1718000000000,
     }
     const result = normalizeSidebarState(full)
     expect(result.main.quota?.primary?.usedPercent).toBe(42)
+    expect(result.main.quota?.primary?.windowMinutes).toBe(10_080)
     expect(result.main.quota?.secondary?.usedPercent).toBe(17)
     expect(result.main.killed).toBe(true)
     expect(result.main.quotaBackedOff).toBe(true)
     expect(result.main.quotaBackoffUntil).toBe(1234567890)
     expect(result.main.refreshBackedOff).toBe(false)
     expect(result.main.refreshBackoffUntil).toBe(9876543210)
+    expect(result.main.resetCredits).toBe(4)
     expect(result.fallbacks).toHaveLength(1)
     const fb0 = result.fallbacks[0]!
     expect(fb0.id).toBe('fb1')
     expect(fb0.label).toBe('work')
+    expect(fb0.resetCredits).toBe(2)
     expect(result.activeId).toBe('fb1')
     expect(result.route).toBe('fallback')
+    expect(result.activeRouting).toEqual({
+      'sess-fb1': {
+        activeId: 'fb1',
+        route: 'fallback',
+        updatedAt: 1718000000000,
+      },
+    })
     expect(result.planType).toBe('pro')
     expect(result.credits).toBe(100)
     expect(result.lastUpdated).toBe(1718000000000)
+  })
+
+  test('normalizes reset credits independently for main and fallback accounts', () => {
+    const valid = normalizeSidebarState({
+      ...DEFAULT_SIDEBAR_STATE,
+      main: {
+        quota: {
+          primary: {
+            usedPercent: 20,
+            remainingPercent: 80,
+            windowMinutes: 10_080,
+          },
+        },
+        killed: false,
+        resetCredits: 4,
+      },
+      fallbacks: [
+        {
+          id: 'fb1',
+          quota: null,
+          killed: false,
+          enabled: true,
+          resetCredits: 2,
+        },
+      ],
+    })
+    expect(valid.main.quota?.primary?.windowMinutes).toBe(10_080)
+    expect(valid.main.resetCredits).toBe(4)
+    expect(valid.fallbacks[0]?.resetCredits).toBe(2)
+
+    const malformed = normalizeSidebarState({
+      ...DEFAULT_SIDEBAR_STATE,
+      main: {
+        quota: null,
+        killed: false,
+        resetCredits: Number.POSITIVE_INFINITY,
+      },
+      fallbacks: [
+        {
+          id: 'fb1',
+          quota: null,
+          killed: false,
+          enabled: true,
+          resetCredits: -1,
+        },
+      ],
+      resetCredits: '4',
+    })
+    expect(malformed.main.resetCredits).toBeUndefined()
+    expect(malformed.fallbacks[0]?.resetCredits).toBeUndefined()
+    expect(
+      (malformed as SidebarState & { resetCredits?: number }).resetCredits,
+    ).toBeUndefined()
+  })
+
+  test('preserves valid active routing entries by session id', () => {
+    const result = normalizeSidebarState({
+      ...DEFAULT_SIDEBAR_STATE,
+      activeRouting: {
+        'sess-main': {
+          activeId: 'main',
+          route: 'main-first',
+          updatedAt: 100,
+        },
+        'sess-fallback': {
+          activeId: 'fallback-1',
+          route: 'fallback-first',
+          updatedAt: 200,
+        },
+      },
+    })
+
+    expect(result.activeRouting).toEqual({
+      'sess-main': {
+        activeId: 'main',
+        route: 'main-first',
+        updatedAt: 100,
+      },
+      'sess-fallback': {
+        activeId: 'fallback-1',
+        route: 'fallback-first',
+        updatedAt: 200,
+      },
+    })
+  })
+
+  test('drops malformed active routing entries without rejecting valid siblings', () => {
+    const result = normalizeSidebarState({
+      ...DEFAULT_SIDEBAR_STATE,
+      activeRouting: {
+        valid: { activeId: 'main', route: 'main-first', updatedAt: 100 },
+        missingActive: { route: 'main-first', updatedAt: 100 },
+        wrongRoute: { activeId: 'main', route: 7, updatedAt: 100 },
+        infiniteTime: {
+          activeId: 'main',
+          route: 'main-first',
+          updatedAt: Number.POSITIVE_INFINITY,
+        },
+        scalar: 'main',
+      },
+    })
+
+    expect(result.activeRouting).toEqual({
+      valid: { activeId: 'main', route: 'main-first', updatedAt: 100 },
+    })
+  })
+
+  test('omits active routing for old files and non-object values', () => {
+    expect(
+      normalizeSidebarState(DEFAULT_SIDEBAR_STATE).activeRouting,
+    ).toBeUndefined()
+    expect(
+      normalizeSidebarState({
+        ...DEFAULT_SIDEBAR_STATE,
+        activeRouting: ['sess-main'],
+      }).activeRouting,
+    ).toBeUndefined()
+  })
+
+  test('old files without active routing retain legacy active id and route', () => {
+    const result = normalizeSidebarState({
+      ...DEFAULT_SIDEBAR_STATE,
+      activeId: 'fallback-1',
+      route: 'fallback-first',
+    })
+    expect(result.activeRouting).toBeUndefined()
+    expect(result.activeId).toBe('fallback-1')
+    expect(result.route).toBe('fallback-first')
   })
 })
 
@@ -187,6 +353,30 @@ describe('getSidebarState — malformed file never throws', () => {
       expect(result.main.killed).toBe(false)
       expect(Array.isArray(result.fallbacks)).toBe(true)
     } finally {
+      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+        savedEnv ?? FLOOR_SIDEBAR_STATE_FILE
+    }
+  })
+})
+
+describe('sidebar write failures', () => {
+  test('rejects the failed operation but keeps the write queue usable', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-write-'))
+    const nonDirectory = join(tempDir, 'not-a-directory')
+    writeFileSync(nonDirectory, 'blocker', 'utf8')
+    const invalidFile = join(nonDirectory, 'sidebar-state.json')
+    const validFile = join(tempDir, 'sidebar-state.json')
+    const savedEnv = process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE
+
+    try {
+      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = invalidFile
+      await expect(setSidebarState(DEFAULT_SIDEBAR_STATE)).rejects.toThrow()
+
+      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = validFile
+      await setSidebarState(DEFAULT_SIDEBAR_STATE)
+      expect(existsSync(validFile)).toBe(true)
+    } finally {
+      await drainSidebarWrites()
       process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
         savedEnv ?? FLOOR_SIDEBAR_STATE_FILE
     }
@@ -269,31 +459,73 @@ describe('resolveActiveAccount', () => {
   })
 })
 
+describe('formatWindowLabel', () => {
+  test.each([
+    [59, '59m'],
+    [60, '1h'],
+    [300, '5h'],
+    [1_440, '1d'],
+    [10_080, '7d'],
+  ])('%i minutes formats as %s', (minutes, expected) => {
+    expect(formatWindowLabel(minutes, 'primary')).toBe(expected)
+  })
+
+  test('preserves historical labels for snapshots without window lengths', () => {
+    expect(formatWindowLabel(undefined, 'primary')).toBe('5h')
+    expect(formatWindowLabel(undefined, 'secondary')).toBe('7d')
+  })
+})
+
 describe('getCollapsedQuotaSummary', () => {
-  test('formats both active-account quota windows', () => {
-    expect(getCollapsedQuotaSummary(quota(13)).text).toBe('5h: 13% 7d: 13%')
+  test('renders one 7-day primary window without a phantom 5h label', () => {
+    const summary = getCollapsedQuotaSummary({
+      primary: {
+        usedPercent: 20,
+        remainingPercent: 80,
+        windowMinutes: 10_080,
+      },
+    })
+    expect(summary.text).toBe('7d: 20%')
   })
 
-  test('formats different 5h and 7d percentages', () => {
-    expect(
-      getCollapsedQuotaSummary({
-        primary: { usedPercent: 13.4, remainingPercent: 86.6 },
-        secondary: { usedPercent: 7.2, remainingPercent: 92.8 },
-      }).text,
-    ).toBe('5h: 13% 7d: 7%')
+  test('renders both present windows from their lengths', () => {
+    const summary = getCollapsedQuotaSummary({
+      primary: {
+        usedPercent: 3.4,
+        remainingPercent: 96.6,
+        windowMinutes: 300,
+      },
+      secondary: {
+        usedPercent: 20.2,
+        remainingPercent: 79.8,
+        windowMinutes: 10_080,
+      },
+    })
+    expect(summary.text).toBe('5h: 3% 7d: 20%')
   })
 
-  test('uses a dash for a missing collapsed quota window', () => {
-    expect(
-      getCollapsedQuotaSummary({
-        primary: { usedPercent: 13, remainingPercent: 87 },
-      }).text,
-    ).toBe('5h: 13% 7d: \u2014')
-  })
-
-  test('returns no collapsed quota text when no windows are available', () => {
+  test('returns no text and no rows when no windows are present', () => {
     expect(getCollapsedQuotaSummary(null).text).toBeNull()
     expect(getCollapsedQuotaSummary({}).text).toBeNull()
+    expect(getPresentQuotaWindows({})).toEqual([])
+  })
+
+  test('old snapshots retain their historical labels and pacing rulers', () => {
+    const rows = getPresentQuotaWindows({
+      primary: { usedPercent: 20, remainingPercent: 80 },
+      secondary: { usedPercent: 30, remainingPercent: 70 },
+    })
+    expect(rows).toHaveLength(2)
+    expect(rows[0]).toMatchObject({
+      key: 'primary',
+      label: '5h',
+      windowMs: FIVE_HOUR_MS,
+    })
+    expect(rows[1]).toMatchObject({
+      key: 'secondary',
+      label: '7d',
+      windowMs: SEVEN_DAY_MS,
+    })
   })
 })
 
@@ -540,4 +772,569 @@ describe('sidebar atomic write', () => {
         savedEnv ?? FLOOR_SIDEBAR_STATE_FILE
     }
   })
+})
+
+describe('active routing validity and pruning', () => {
+  const accounts = [{ id: 'fallback-1', enabled: true }]
+  const now = 2 * 60 * 60 * 1000
+
+  test('accepts fresh main and enabled-fallback entries only', () => {
+    expect(
+      isUsableRoutingEntry(
+        { activeId: 'main', route: 'main-first', updatedAt: now },
+        accounts,
+        now,
+      ),
+    ).toBe(true)
+    expect(
+      isUsableRoutingEntry(
+        {
+          activeId: 'fallback-1',
+          route: 'fallback-first',
+          updatedAt: now,
+        },
+        accounts,
+        now,
+      ),
+    ).toBe(true)
+    expect(
+      isUsableRoutingEntry(
+        {
+          activeId: 'fallback-default-enabled',
+          route: 'fallback-first',
+          updatedAt: now,
+        },
+        [{ id: 'fallback-default-enabled' }],
+        now,
+      ),
+    ).toBe(true)
+    expect(
+      isUsableRoutingEntry(
+        {
+          activeId: 'removed-fallback',
+          route: 'fallback-first',
+          updatedAt: now,
+        },
+        accounts,
+        now,
+      ),
+    ).toBe(false)
+    expect(
+      isUsableRoutingEntry(
+        {
+          activeId: 'main',
+          route: 'main-first',
+          updatedAt: now - ACTIVE_ROUTING_MAX_AGE_MS - 1,
+        },
+        accounts,
+        now,
+      ),
+    ).toBe(false)
+  })
+
+  test('drops invalid accounts and an explicitly deleted session', () => {
+    const result = pruneActiveRouting(
+      {
+        keep: { activeId: 'main', route: 'main-first', updatedAt: now },
+        removedAccount: {
+          activeId: 'removed-fallback',
+          route: 'fallback-first',
+          updatedAt: now,
+        },
+        deletedSession: {
+          activeId: 'fallback-1',
+          route: 'fallback-first',
+          updatedAt: now,
+        },
+      },
+      accounts,
+      now,
+      'deletedSession',
+    )
+
+    expect(result).toEqual({
+      keep: { activeId: 'main', route: 'main-first', updatedAt: now },
+    })
+  })
+
+  test('caps usable entries at the 128 newest', () => {
+    const entries = Object.fromEntries(
+      Array.from({ length: 130 }, (_, index) => [
+        `sess-${index}`,
+        {
+          activeId: 'main',
+          route: 'main-first',
+          updatedAt: now - index,
+        },
+      ]),
+    )
+    const result = pruneActiveRouting(entries, accounts, now)
+    expect(Object.keys(result ?? {})).toHaveLength(128)
+    expect(result?.['sess-0']).toBeDefined()
+    expect(result?.['sess-129']).toBeUndefined()
+  })
+})
+
+test('upserting session B preserves session A and refreshes legacy fields', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-routing-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  await setSidebarState(
+    make({
+      fallbacks: [fb({ id: 'fallback-1', enabled: true })],
+      activeRouting: {
+        'sess-a': { activeId: 'main', route: 'main-first', updatedAt: now - 1 },
+      },
+      lastUpdated: now - 1,
+    }),
+    file,
+  )
+
+  await upsertSidebarActiveRouting(
+    {
+      sessionId: 'sess-b',
+      activeId: 'fallback-1',
+      route: 'fallback-first',
+      updatedAt: now,
+    },
+    [{ id: 'fallback-1', enabled: true }],
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.activeRouting).toEqual({
+    'sess-a': { activeId: 'main', route: 'main-first', updatedAt: now - 1 },
+    'sess-b': {
+      activeId: 'fallback-1',
+      route: 'fallback-first',
+      updatedAt: now,
+    },
+  })
+  expect(written.activeId).toBe('fallback-1')
+  expect(written.route).toBe('fallback-first')
+})
+
+test('upsert waits for a foreign writer lock and merges its session entry', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-file-lock-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const accounts = [
+    { id: 'fallback-foreign', enabled: true },
+    { id: 'fallback-local', enabled: true },
+  ]
+  const fallbacks = [
+    fb({ id: 'fallback-foreign', enabled: true }),
+    fb({ id: 'fallback-local', enabled: true }),
+  ]
+  await setSidebarState(make({ fallbacks, lastUpdated: now }), file)
+  const foreignLock = await acquireRefreshFileLock({
+    name: 'sidebar-write',
+    path: file,
+    ttlMs: 10_000,
+  })
+  if (!foreignLock) throw new Error('failed to acquire foreign writer lock')
+
+  const localWrite = upsertSidebarActiveRouting(
+    {
+      sessionId: 'local',
+      activeId: 'fallback-local',
+      route: 'fallback-first',
+      updatedAt: now,
+    },
+    accounts,
+    file,
+  )
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  writeFileSync(
+    file,
+    JSON.stringify(
+      make({
+        fallbacks,
+        activeRouting: {
+          foreign: {
+            activeId: 'fallback-foreign',
+            route: 'fallback-first',
+            updatedAt: now,
+          },
+        },
+        lastUpdated: now + 1,
+      }),
+    ),
+    'utf8',
+  )
+  await foreignLock.release()
+  await localWrite
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.activeRouting).toEqual({
+    foreign: {
+      activeId: 'fallback-foreign',
+      route: 'fallback-first',
+      updatedAt: now,
+    },
+    local: {
+      activeId: 'fallback-local',
+      route: 'fallback-first',
+      updatedAt: now,
+    },
+  })
+})
+
+test('upsert re-merges when a foreign session write lands before commit', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-cross-process-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const accounts = [
+    { id: 'fallback-foreign', enabled: true },
+    { id: 'fallback-local', enabled: true },
+  ]
+  const fallbacks = [
+    fb({ id: 'fallback-foreign', enabled: true }),
+    fb({ id: 'fallback-local', enabled: true }),
+  ]
+  await setSidebarState(make({ fallbacks, lastUpdated: now }), file)
+  let injections = 0
+  const upsertWithHook = upsertSidebarActiveRouting as unknown as (
+    input: Parameters<typeof upsertSidebarActiveRouting>[0],
+    routingAccounts: Parameters<typeof upsertSidebarActiveRouting>[1],
+    stateFile: string,
+    hooks: { beforeRecheck: () => void },
+  ) => Promise<void>
+
+  await upsertWithHook(
+    {
+      sessionId: 'local',
+      activeId: 'fallback-local',
+      route: 'fallback-first',
+      updatedAt: now,
+    },
+    accounts,
+    file,
+    {
+      beforeRecheck: () => {
+        injections += 1
+        writeFileSync(
+          file,
+          JSON.stringify(
+            make({
+              fallbacks,
+              activeRouting: {
+                foreign: {
+                  activeId: 'fallback-foreign',
+                  route: 'fallback-first',
+                  updatedAt: now,
+                },
+              },
+              lastUpdated: now + 1,
+            }),
+          ),
+          'utf8',
+        )
+      },
+    },
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(injections).toBe(1)
+  expect(written.activeRouting).toEqual({
+    foreign: {
+      activeId: 'fallback-foreign',
+      route: 'fallback-first',
+      updatedAt: now,
+    },
+    local: {
+      activeId: 'fallback-local',
+      route: 'fallback-first',
+      updatedAt: now,
+    },
+  })
+})
+
+test('machine write re-merges a foreign session entry without creating its own', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-machine-cross-process-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const fallbacks = [fb({ id: 'fallback-foreign', enabled: true })]
+  const existingRouting = {
+    existing: { activeId: 'main', route: 'main-first', updatedAt: now },
+  }
+  await setSidebarState(
+    make({ fallbacks, activeRouting: existingRouting, lastUpdated: now }),
+    file,
+  )
+  let injections = 0
+  const setMachineWithHook = setSidebarMachineState as unknown as (
+    machineState: Parameters<typeof setSidebarMachineState>[0],
+    stateFile: string,
+    hooks: { beforeRecheck: () => void },
+  ) => Promise<void>
+
+  await setMachineWithHook(
+    {
+      main: { quota: quota(25), killed: false },
+      fallbacks,
+      route: 'fallback-first',
+      lastUpdated: now,
+    },
+    file,
+    {
+      beforeRecheck: () => {
+        injections += 1
+        writeFileSync(
+          file,
+          JSON.stringify(
+            make({
+              fallbacks,
+              activeRouting: {
+                ...existingRouting,
+                foreign: {
+                  activeId: 'fallback-foreign',
+                  route: 'fallback-first',
+                  updatedAt: now,
+                },
+              },
+              lastUpdated: now + 1,
+            }),
+          ),
+          'utf8',
+        )
+      },
+    },
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(injections).toBe(1)
+  expect(written.main.quota).toEqual(quota(25))
+  expect(written.route).toBe('fallback-first')
+  expect(written.activeRouting).toEqual({
+    ...existingRouting,
+    foreign: {
+      activeId: 'fallback-foreign',
+      route: 'fallback-first',
+      updatedAt: now,
+    },
+  })
+})
+
+test('every polled write path strictly advances the sidebar version at the same wall-clock time', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-version-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const fixedNow = 1_700_000_000_000
+  const realDateNow = Date.now
+  Date.now = () => fixedNow
+
+  try {
+    await setSidebarState(make({ lastUpdated: fixedNow }), file)
+    await setSidebarMachineState(
+      {
+        main: { quota: null, killed: false },
+        fallbacks: [],
+        route: 'main-first',
+        lastUpdated: fixedNow,
+      },
+      file,
+    )
+    const machineVersion = JSON.parse(readFileSync(file, 'utf8')).lastUpdated
+
+    await upsertSidebarActiveRouting(
+      {
+        sessionId: 'sess-a',
+        activeId: 'main',
+        route: 'main-first',
+        updatedAt: fixedNow,
+      },
+      [],
+      file,
+    )
+    const upsertVersion = JSON.parse(readFileSync(file, 'utf8')).lastUpdated
+
+    await setSidebarLegacyRouting(
+      { activeId: 'main', route: 'main-first', updatedAt: fixedNow },
+      file,
+    )
+    const legacyVersion = JSON.parse(readFileSync(file, 'utf8')).lastUpdated
+
+    await removeSidebarActiveRouting('sess-a', [], file)
+    const removalVersion = JSON.parse(readFileSync(file, 'utf8')).lastUpdated
+
+    expect([
+      machineVersion,
+      upsertVersion,
+      legacyVersion,
+      removalVersion,
+    ]).toEqual([fixedNow + 1, fixedNow + 2, fixedNow + 3, fixedNow + 4])
+  } finally {
+    Date.now = realDateNow
+    await drainSidebarWrites()
+  }
+})
+
+test('delayed upsert preserves a newer foreign session entry', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-stale-now-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const newerTime = Date.now() - 100
+  const delayedRequestTime = newerTime - 100
+  const accounts = [
+    { id: 'fallback-foreign', enabled: true },
+    { id: 'fallback-local', enabled: true },
+  ]
+  await setSidebarState(
+    make({
+      activeRouting: {
+        foreign: {
+          activeId: 'fallback-foreign',
+          route: 'fallback-first',
+          updatedAt: newerTime,
+        },
+      },
+    }),
+    file,
+  )
+
+  await upsertSidebarActiveRouting(
+    {
+      sessionId: 'local',
+      activeId: 'fallback-local',
+      route: 'fallback-first',
+      updatedAt: delayedRequestTime,
+    },
+    accounts,
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.activeRouting).toEqual({
+    foreign: {
+      activeId: 'fallback-foreign',
+      route: 'fallback-first',
+      updatedAt: newerTime,
+    },
+    local: {
+      activeId: 'fallback-local',
+      route: 'fallback-first',
+      updatedAt: delayedRequestTime,
+    },
+  })
+})
+
+test('every keyed upsert prunes stale and removed-account siblings', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-upsert-prune-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  await setSidebarState(
+    make({
+      activeRouting: {
+        stale: {
+          activeId: 'main',
+          route: 'main-first',
+          updatedAt: now - ACTIVE_ROUTING_MAX_AGE_MS - 1,
+        },
+        removedAccount: {
+          activeId: 'removed-fallback',
+          route: 'fallback-first',
+          updatedAt: now,
+        },
+      },
+    }),
+    file,
+  )
+
+  await upsertSidebarActiveRouting(
+    {
+      sessionId: 'live',
+      activeId: 'main',
+      route: 'main-first',
+      updatedAt: now,
+    },
+    [],
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.activeRouting).toEqual({
+    live: { activeId: 'main', route: 'main-first', updatedAt: now },
+  })
+})
+
+test('machine writes preserve routing while retaining reset-credit fields', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-machine-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  await setSidebarState(
+    make({
+      activeId: 'fallback-1',
+      route: 'fallback-first',
+      activeRouting: {
+        'sess-a': {
+          activeId: 'fallback-1',
+          route: 'fallback-first',
+          updatedAt: 100,
+        },
+      },
+    }),
+    file,
+  )
+
+  await setSidebarMachineState(
+    {
+      main: { ...main(quota(25)), resetCredits: 4 },
+      fallbacks: [fb({ id: 'fallback-1', resetCredits: 2 })],
+      route: 'fallback-first',
+      lastUpdated: 200,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.resetCredits).toBe(4)
+  expect(written.fallbacks[0]?.resetCredits).toBe(2)
+  expect(written.activeId).toBe('fallback-1')
+  expect(written.activeRouting?.['sess-a']?.activeId).toBe('fallback-1')
+})
+
+test('headerless request compatibility write does not create a session entry', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-legacy-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  await setSidebarState(DEFAULT_SIDEBAR_STATE, file)
+  await setSidebarLegacyRouting(
+    { activeId: 'fallback-1', route: 'fallback-first', updatedAt: 200 },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.activeId).toBe('fallback-1')
+  expect(written.route).toBe('fallback-first')
+  expect(written.activeRouting).toBeUndefined()
+})
+
+test('machine refresh cannot replace request-authored legacy active id', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-compat-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  await setSidebarState(DEFAULT_SIDEBAR_STATE, file)
+  await setSidebarLegacyRouting(
+    { activeId: 'fallback-1', route: 'fallback-first', updatedAt: 100 },
+    file,
+  )
+  await setSidebarMachineState(
+    {
+      main: { quota: null, killed: false, resetCredits: 4 },
+      fallbacks: [],
+      route: 'main-first',
+      lastUpdated: 200,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.activeId).toBe('fallback-1')
+  expect(written.route).toBe('main-first')
+  expect(written.main.resetCredits).toBe(4)
 })

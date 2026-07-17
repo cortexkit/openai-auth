@@ -98,11 +98,16 @@ export async function refreshAllQuota(
             now: deps.now,
             accountId: deps.storageMainAccountId,
           })
-          deps.quotaManager.setMain(auth.access, {
-            quota: snap,
-            refreshAfter: deps.now() + 5 * 60 * 1000,
-            checkedAt: deps.now(),
-          })
+          deps.quotaManager.setMain(
+            auth.access,
+            {
+              quota: snap,
+              refreshAfter: deps.now() + 5 * 60 * 1000,
+              checkedAt: deps.now(),
+            },
+            undefined,
+            true,
+          )
           results.push({ account: 'main', ok: true })
         }
       } else {
@@ -171,6 +176,7 @@ export async function refreshAllQuota(
             checkedAt: deps.now(),
           },
           refreshed.access,
+          true,
         )
         results.push({ account: acct.id, ok: true })
       } catch (e) {

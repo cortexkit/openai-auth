@@ -42,6 +42,7 @@
     "src/sidebar-state.ts",
     "src/tui-preferences.ts",
     "src/logger.ts",
+    "src/core/refresh-file-lock.ts",
     "src/util",
     "src/rpc",
     "README.md",

@@ -3,7 +3,7 @@ import { resolvePromptContext } from '../prompt-context'
 
 // Guards the model-switch fix: a hidden /openai-* command reply must carry the
 // last assistant's model/agent/variant so OpenCode's next real prompt does not
-// inherit a synthetic default and silently switch the model (e.g. drop -pro).
+// inherit a synthetic default and silently drop a reasoning variant.
 
 function clientWith(messages: unknown[]) {
   return {
@@ -27,16 +27,16 @@ describe('resolvePromptContext', () => {
       clientWith([
         assistant({
           providerID: 'openai',
-          modelID: 'gpt-5.6-sol-pro',
-          variant: 'xhigh',
+          modelID: 'gpt-5.6-sol',
+          variant: 'max',
         }),
       ]),
       'ses_1',
     )
     expect(ctx).toEqual({
       agent: 'build',
-      model: { providerID: 'openai', modelID: 'gpt-5.6-sol-pro' },
-      variant: 'xhigh',
+      model: { providerID: 'openai', modelID: 'gpt-5.6-sol' },
+      variant: 'max',
     })
   })
 
@@ -47,14 +47,14 @@ describe('resolvePromptContext', () => {
         { info: { role: 'user' } },
         assistant({
           providerID: 'openai',
-          modelID: 'gpt-5.6-luna-pro',
-          variant: 'high',
+          modelID: 'gpt-5.6-luna',
+          variant: 'max',
         }),
       ]),
       'ses_1',
     )
-    expect(ctx?.model?.modelID).toBe('gpt-5.6-luna-pro')
-    expect(ctx?.variant).toBe('high')
+    expect(ctx?.model?.modelID).toBe('gpt-5.6-luna')
+    expect(ctx?.variant).toBe('max')
   })
 
   it('returns null when there are no messages', async () => {

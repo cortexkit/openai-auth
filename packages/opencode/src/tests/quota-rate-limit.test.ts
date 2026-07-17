@@ -1,4 +1,62 @@
 import { describe, expect, it } from 'bun:test'
+import type { AccountStorage } from '../core/accounts.ts'
+
+describe('QuotaManager refresh scheduling', () => {
+  const storage: AccountStorage = {
+    version: 1,
+    accounts: [],
+    quota: {
+      checkIntervalMinutes: 5,
+      minimumRemaining: { primary: 15, secondary: 10 },
+    },
+  }
+
+  it('defers a blocked single-primary snapshot until its future reset', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const now = Date.UTC(2026, 6, 16, 12, 0, 0)
+    const resetAt = now + 60 * 60 * 1000
+    const token = 'blocked-single-primary'
+    const qm = new QuotaManager({
+      storage,
+      now: () => now,
+      fetchQuotaFn: async () => ({
+        primary: {
+          usedPercent: 90,
+          remainingPercent: 10,
+          resetsAt: new Date(resetAt).toISOString(),
+          checkedAt: now,
+          windowMinutes: 10_080,
+        },
+      }),
+    })
+
+    await qm.refreshMain(token)
+
+    expect(qm.getMain(token)?.refreshAfter).toBe(resetAt + 60_000)
+  })
+
+  it('polls a healthy single-primary snapshot at the normal interval', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const now = Date.UTC(2026, 6, 16, 13, 0, 0)
+    const token = 'healthy-single-primary'
+    const qm = new QuotaManager({
+      storage,
+      now: () => now,
+      fetchQuotaFn: async () => ({
+        primary: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          checkedAt: now,
+          windowMinutes: 10_080,
+        },
+      }),
+    })
+
+    await qm.refreshMain(token)
+
+    expect(qm.getMain(token)?.refreshAfter).toBe(now + 5 * 60_000)
+  })
+})
 
 /**
  * Unit tests for QuotaManager's mid-stream rate-limit marks: an in-memory,
@@ -99,7 +157,7 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
     expect(qm.isRateLimited('main')).toBe(false)
   })
 
-  it('setMain only clears a mark when BOTH windows are present and healthy, not on a partial snapshot', async () => {
+  it('setMain clears a mark when the only present window is healthy (single-primary wire)', async () => {
     const { QuotaManager } = await import('../core/quota-manager.ts')
     const now = 4_000_000
     const qm = new QuotaManager({
@@ -113,19 +171,65 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
     qm.markRateLimited('main', now + 60_000)
     expect(qm.isRateLimited('main')).toBe(true)
 
-    // A partial snapshot (only primary present, healthy) is not full
-    // evidence — secondary could still be the exhausted window — so the
-    // mark must survive.
+    // The current wire sends a single present primary window (secondary is
+    // absent, not unhealthy) — a healthy primary alone is positive evidence,
+    // since an absent window is not applicable, not uncertain.
+    qm.setMain('token-a', {
+      quota: {
+        primary: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          windowMinutes: 10_080,
+          checkedAt: now,
+        },
+      },
+      refreshAfter: now + 60_000,
+      checkedAt: now,
+    })
+    expect(qm.isRateLimited('main')).toBe(false)
+  })
+
+  it('setMain does not clear the mark when a present window is still exhausted', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const now = 4_050_000
+    const qm = new QuotaManager({
+      storage: null,
+      now: () => now,
+      fetchQuotaFn: () => {
+        throw new Error('must not be called')
+      },
+    })
+
+    qm.markRateLimited('main', now + 60_000)
+    expect(qm.isRateLimited('main')).toBe(true)
+
+    // A present-and-still-exhausted window is not evidence of health, even
+    // alongside a healthy sibling — every present window must be under 100%.
     qm.setMain('token-a', {
       quota: {
         primary: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
+        secondary: { usedPercent: 100, remainingPercent: 0, checkedAt: now },
       },
       refreshAfter: now + 60_000,
       checkedAt: now,
     })
     expect(qm.isRateLimited('main')).toBe(true)
+  })
 
-    // Both windows present and healthy — positive full evidence — clears it.
+  it('setMain clears the mark when both present windows are healthy', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const now = 4_080_000
+    const qm = new QuotaManager({
+      storage: null,
+      now: () => now,
+      fetchQuotaFn: () => {
+        throw new Error('must not be called')
+      },
+    })
+
+    qm.markRateLimited('main', now + 60_000)
+    expect(qm.isRateLimited('main')).toBe(true)
+
     qm.setMain('token-a', {
       quota: {
         primary: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
@@ -148,24 +252,24 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
       },
     })
 
-    // A partial (not both-windows-healthy) snapshot establishes the initial
-    // account identity without itself clearing anything.
-    const partialEntry = {
+    // A still-exhausted snapshot establishes the initial account identity
+    // without itself clearing anything (quotaLooksHealthy is false).
+    const exhaustedEntry = {
       quota: {
-        primary: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
+        primary: { usedPercent: 100, remainingPercent: 0, checkedAt: now },
       },
       refreshAfter: now + 60_000,
       checkedAt: now,
     }
-    qm.setMain('token-a', partialEntry, 'acct-A')
+    qm.setMain('token-a', exhaustedEntry, 'acct-A')
 
     qm.markRateLimited('main', now + 60_000)
     expect(qm.isRateLimited('main')).toBe(true)
 
     // A different accountId is a SWITCH — the old account's mark must not
     // carry over to the new account, even though this snapshot alone isn't
-    // full healthy evidence (only primary present).
-    qm.setMain('token-b', partialEntry, 'acct-B')
+    // healthy evidence.
+    qm.setMain('token-b', exhaustedEntry, 'acct-B')
     expect(qm.isRateLimited('main')).toBe(false)
   })
 
@@ -180,21 +284,23 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
       },
     })
 
-    const partialEntry = {
+    // Still-exhausted, so the clear-on-refresh assertion below isolates the
+    // same-account-refresh behavior from quotaLooksHealthy's own clear.
+    const exhaustedEntry = {
       quota: {
-        primary: { usedPercent: 10, remainingPercent: 90, checkedAt: now },
+        primary: { usedPercent: 100, remainingPercent: 0, checkedAt: now },
       },
       refreshAfter: now + 60_000,
       checkedAt: now,
     }
-    qm.setMain('token-a', partialEntry, 'acct-A')
+    qm.setMain('token-a', exhaustedEntry, 'acct-A')
 
     qm.markRateLimited('main', now + 60_000)
     expect(qm.isRateLimited('main')).toBe(true)
 
     // Same accountId, new access token — a routine refresh, NOT a switch.
     // The mark must survive.
-    qm.setMain('refreshed-token-a', partialEntry, 'acct-A')
+    qm.setMain('refreshed-token-a', exhaustedEntry, 'acct-A')
     expect(qm.isRateLimited('main')).toBe(true)
   })
 
@@ -303,6 +409,45 @@ describe('resolveMidStreamRateLimitResetAt', () => {
     }
     expect(
       resolveMidStreamRateLimitResetAt(quota, 'primary', now, defaultMs),
+    ).toBe(now + defaultMs)
+  })
+
+  it('uses primary from a single-primary snapshot', async () => {
+    const { resolveMidStreamRateLimitResetAt } = await import(
+      '../core/quota-manager.ts'
+    )
+    const primaryReset = new Date(now + 300_000).toISOString()
+    const quota = {
+      primary: {
+        usedPercent: 100,
+        remainingPercent: 0,
+        checkedAt: now,
+        resetsAt: primaryReset,
+        windowMinutes: 10_080,
+      },
+    }
+
+    expect(
+      resolveMidStreamRateLimitResetAt(quota, 'primary', now, defaultMs),
+    ).toBe(Date.parse(primaryReset))
+  })
+
+  it('does not borrow primary for a secondary-named frame', async () => {
+    const { resolveMidStreamRateLimitResetAt } = await import(
+      '../core/quota-manager.ts'
+    )
+    const quota = {
+      primary: {
+        usedPercent: 100,
+        remainingPercent: 0,
+        checkedAt: now,
+        resetsAt: new Date(now + 300_000).toISOString(),
+        windowMinutes: 10_080,
+      },
+    }
+
+    expect(
+      resolveMidStreamRateLimitResetAt(quota, 'secondary', now, defaultMs),
     ).toBe(now + defaultMs)
   })
 })

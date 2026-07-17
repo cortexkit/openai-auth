@@ -747,13 +747,19 @@ describe('commands', () => {
   // Quota command with refreshAllQuota wired → shows fresh per-account quota
   // -----------------------------------------------------------------------
 
-  function makeQuotaSnapshot(usedPercent: number): OAuthQuotaSnapshot {
+  function makeQuotaSnapshot(
+    usedPercent: number,
+    resetCreditsAvailable?: number,
+  ): OAuthQuotaSnapshot {
     const window: AccountQuotaWindow = {
       usedPercent,
       remainingPercent: 100 - usedPercent,
       checkedAt: Date.now(),
     }
-    return { primary: window }
+    return {
+      primary: window,
+      ...(resetCreditsAvailable !== undefined ? { resetCreditsAvailable } : {}),
+    }
   }
 
   test('refreshAllQuota populates main + 2 fallbacks → output shows quota', async () => {
@@ -804,6 +810,43 @@ describe('commands', () => {
     expect(payload.text).toContain('42% used')
     expect(payload.text).toContain('**fb-2**')
     expect(payload.text).toContain('78% used')
+  })
+
+  test('quota command shows reset credits under their own account only', async () => {
+    const qm = new QuotaManager({
+      storage: { version: 1 as const, accounts: [] },
+    })
+    qm.setMain('access-main', {
+      quota: makeQuotaSnapshot(15, 4),
+      refreshAfter: Date.now() + 5 * 60 * 1000,
+      checkedAt: Date.now(),
+    })
+    qm.setFallback('fb-1', {
+      quota: makeQuotaSnapshot(42, 2),
+      refreshAfter: Date.now() + 5 * 60 * 1000,
+      checkedAt: Date.now(),
+    })
+    qm.setFallback('fb-2', {
+      quota: makeQuotaSnapshot(78),
+      refreshAfter: Date.now() + 5 * 60 * 1000,
+      checkedAt: Date.now(),
+    })
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: qm,
+      loadAccounts,
+      client: makeClient(),
+    }
+
+    const payload = await buildDialogPayload('openai-quota', '', ctx)
+    const [mainSection, fallbackSection = ''] = payload.text.split(
+      '### Fallback accounts',
+    )
+    const [fb1Section, fb2Section = ''] = fallbackSection.split('**fb-2**')
+
+    expect(mainSection).toContain('- resets: 4')
+    expect(fb1Section).toContain('  - resets: 2')
+    expect(fb2Section).not.toContain('resets:')
   })
 
   test('refreshAllQuota with one failure → ⚠ line for failing account', async () => {

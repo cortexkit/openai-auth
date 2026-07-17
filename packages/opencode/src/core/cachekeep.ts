@@ -1,3 +1,4 @@
+import { sanitizeHttpFallbackInit } from '../codex-http'
 import { normalizeQuotaHeaders } from '../quota-normalize'
 import type { AccountStorage } from './accounts.ts'
 
@@ -103,7 +104,6 @@ export function buildKeepwarmCapture(input: {
   const replayHeaders: Record<string, string> = {}
   for (const name of [
     'session-id',
-    'x-opencode-session',
     'x-session-affinity',
     'x-parent-session-id',
     'user-agent',
@@ -113,6 +113,7 @@ export function buildKeepwarmCapture(input: {
     'x-codex-window-id',
     'x-client-request-id',
     'thread-id',
+    'x-openai-internal-codex-responses-lite',
   ]) {
     const value = input.headers.get(name)
     if (value) replayHeaders[name] = value
@@ -678,7 +679,7 @@ export class CacheKeepManager {
           hasChatGptAccountId: 'ChatGPT-Account-Id' in headers,
         }),
       )
-      const response = await this.fetchImpl(this.codexResponsesUrl, {
+      const requestInit = sanitizeHttpFallbackInit({
         method: 'POST',
         headers,
         body: warmBody,
@@ -687,6 +688,7 @@ export class CacheKeepManager {
           this.abortController.signal,
         ]),
       })
+      const response = await this.fetchImpl(this.codexResponsesUrl, requestInit)
 
       // Read the response body for usage
       let responseText = ''

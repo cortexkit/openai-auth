@@ -23,12 +23,13 @@ import {
   type AccountQuota,
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
-  FIVE_HOUR_MS,
   getCollapsedQuotaSummary,
+  getPresentQuotaWindows,
   getSidebarState,
   type QuotaPacing,
+  type QuotaWindow,
   resolveActiveAccount,
-  SEVEN_DAY_MS,
+  resolveSessionSidebarRouting,
   type SidebarState,
 } from './sidebar-state.js'
 import { openCommandDialog } from './tui/command-dialogs.js'
@@ -228,6 +229,54 @@ function CollapsedRow(props: {
   )
 }
 
+export interface QuotaDisplayRow {
+  key: 'primary' | 'secondary'
+  label: string
+  window: QuotaWindow
+  pacing: QuotaPacing | null
+}
+
+// Maps present quota windows onto display rows and computes pacing against each
+// dynamic duration or the historical 5h/7d duration for legacy snapshots.
+export function buildQuotaRowsForDisplay(
+  quota: AccountQuota | null,
+  now: number,
+  pacingEnabled: boolean,
+): QuotaDisplayRow[] {
+  return getPresentQuotaWindows(quota).map((row) => ({
+    key: row.key,
+    label: row.label,
+    window: row.window,
+    pacing:
+      pacingEnabled && row.windowMs !== null
+        ? computeQuotaPacing(row.window, row.windowMs, now)
+        : null,
+  }))
+}
+
+export function isQuotaLoaded(quota: AccountQuota | null): boolean {
+  return quota !== null
+}
+
+export function getQuotaMetadataRows(
+  state: SidebarState,
+): Array<{ label: string; value: string }> {
+  const rows: Array<{ label: string; value: string }> = []
+  if (state.planType) rows.push({ label: 'Plan', value: state.planType })
+  if (state.credits !== undefined) {
+    rows.push({ label: 'Credits', value: String(state.credits) })
+  }
+  return rows
+}
+
+export function getAccountMetadataRows(
+  resetCredits: number | undefined,
+): Array<{ label: string; value: string }> {
+  return resetCredits === undefined
+    ? []
+    : [{ label: 'resets', value: String(resetCredits) }]
+}
+
 // Quota window row: muted label left, tone-colored bar + percentage right,
 // with an optional muted reset suffix. When pacing data is present, the bar
 // gains a pace segment and an off-pace window adds a muted subline with the
@@ -311,21 +360,15 @@ function AccountBlock(props: {
   killed: boolean
   active: boolean
   pacingEnabled: boolean
+  resetCredits?: number
   marginTop?: number
 }) {
   const statusWord = () =>
     props.killed ? 'blocked' : props.active ? 'active' : 'idle'
   const statusTone = (): Tone =>
     props.killed ? 'err' : props.active ? 'ok' : 'muted'
-  const pacingFor = (
-    window:
-      | { usedPercent: number; remainingPercent: number; resetsAt?: string }
-      | undefined,
-    windowMs: number,
-  ) =>
-    props.pacingEnabled && window
-      ? computeQuotaPacing(window, windowMs, Date.now())
-      : null
+  const rows = () =>
+    buildQuotaRowsForDisplay(props.quota, Date.now(), props.pacingEnabled)
   return (
     <box width='100%' flexDirection='column' marginTop={props.marginTop ?? 0}>
       <box width='100%' flexDirection='row' justifyContent='space-between'>
@@ -337,24 +380,36 @@ function AccountBlock(props: {
         </text>
       </box>
       <Show
-        when={props.quota}
+        when={isQuotaLoaded(props.quota)}
         fallback={<text fg={props.theme.textMuted}>{'checking\u2026'}</text>}
       >
-        <QuotaRow
-          theme={props.theme}
-          appearance={props.appearance}
-          label='5h'
-          window={props.quota?.primary}
-          pacing={pacingFor(props.quota?.primary, FIVE_HOUR_MS)}
-        />
-        <QuotaRow
-          theme={props.theme}
-          appearance={props.appearance}
-          label='7d'
-          window={props.quota?.secondary}
-          pacing={pacingFor(props.quota?.secondary, SEVEN_DAY_MS)}
-        />
+        <Show
+          when={rows().length > 0}
+          fallback={<text fg={props.theme.textMuted}>{'\u2014'}</text>}
+        >
+          <For each={rows()}>
+            {(row) => (
+              <QuotaRow
+                theme={props.theme}
+                appearance={props.appearance}
+                label={row.label}
+                window={row.window}
+                pacing={row.pacing}
+              />
+            )}
+          </For>
+        </Show>
       </Show>
+      <For each={getAccountMetadataRows(props.resetCredits)}>
+        {(row) => (
+          <StatRow
+            theme={props.theme}
+            label={row.label}
+            value={row.value}
+            tone='text'
+          />
+        )}
+      </For>
     </box>
   )
 }
@@ -366,6 +421,7 @@ function AccountBlock(props: {
 function QuotaDialogContent(props: {
   api: TuiPluginApi
   controller: SidebarController
+  sessionId: string | undefined
 }) {
   const prefs = props.controller.prefs
   const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
@@ -385,6 +441,7 @@ function QuotaDialogContent(props: {
   const theme = () => props.api.theme.current
   const enabledFallbacks = () =>
     (state().fallbacks ?? []).filter((f) => f.enabled)
+  const activeId = () => resolveQuotaDialogActiveId(state(), props.sessionId)
   return (
     <box flexDirection='column' padding={2} width='100%' alignItems='center'>
       <box flexDirection='column' width={58}>
@@ -399,8 +456,9 @@ function QuotaDialogContent(props: {
           name='main'
           quota={state().main?.quota ?? null}
           killed={state().main?.killed ?? false}
-          active={state().activeId === 'main'}
+          active={activeId() === 'main'}
           pacingEnabled={prefs().sections.pacing}
+          resetCredits={state().main?.resetCredits}
         />
         <Show when={prefs().sections.fallbackAccounts}>
           <For each={enabledFallbacks()}>
@@ -411,8 +469,9 @@ function QuotaDialogContent(props: {
                 name={fb.label ?? fb.id}
                 quota={fb.quota}
                 killed={fb.killed}
-                active={state().activeId === fb.id}
+                active={activeId() === fb.id}
                 pacingEnabled={prefs().sections.pacing}
+                resetCredits={fb.resetCredits}
                 marginTop={1}
               />
             )}
@@ -427,6 +486,16 @@ function QuotaDialogContent(props: {
 
 export async function readStateFromFile(): Promise<SidebarState> {
   return getSidebarState()
+}
+
+export function resolveQuotaDialogActiveId(
+  state: SidebarState,
+  sessionId: string | undefined,
+  now = Date.now(),
+): string | undefined {
+  return sessionId
+    ? resolveSessionSidebarRouting(state, sessionId, now).activeId
+    : state.activeId
 }
 
 interface SidebarController {
@@ -496,6 +565,7 @@ function createSidebarController(
 function QuotaSidebar(props: {
   api: TuiPluginApi
   controller: SidebarController
+  sessionId: string
 }) {
   const prefs = props.controller.prefs
   const collapsed = props.controller.collapsed
@@ -547,22 +617,23 @@ function QuotaSidebar(props: {
     const name = prefs().header.label
     return !hasData() ? name : collapsed() ? `\u25b6 ${name}` : `\u25bc ${name}`
   }
-  const activeAccount = () => resolveActiveAccount(state())
+  const sessionRouting = () =>
+    resolveSessionSidebarRouting(state(), props.sessionId)
+  const sessionState = (): SidebarState => ({
+    ...state(),
+    activeId: sessionRouting().activeId,
+    route: sessionRouting().route,
+  })
+  const activeAccount = () => resolveActiveAccount(sessionState())
   const activeQuotaSummary = () =>
     getCollapsedQuotaSummary(activeAccount().quota)
   const activePacingDeficit = () => {
     if (!prefs().sections.pacing) return false
-    const quota = activeAccount().quota
-    if (!quota) return false
-    const now = Date.now()
-    const windows: Array<[typeof quota.primary, number]> = [
-      [quota.primary, FIVE_HOUR_MS],
-      [quota.secondary, SEVEN_DAY_MS],
-    ]
-    return windows.some(
-      ([w, ms]) =>
-        w != null && computeQuotaPacing(w, ms, now)?.state === 'deficit',
-    )
+    return buildQuotaRowsForDisplay(
+      activeAccount().quota,
+      Date.now(),
+      true,
+    ).some((row) => row.pacing?.state === 'deficit')
   }
   const activeQuotaTone = (): Tone => {
     const summary = activeQuotaSummary()
@@ -640,7 +711,7 @@ function QuotaSidebar(props: {
         </Show>
       </box>
 
-      {/* Collapsed: active account 5h + 7d quota + dot (red ⊘ when killed) */}
+      {/* Collapsed: active account's present quota windows + dot (red ⊘ when killed) */}
       <Show when={collapsed() && hasData()}>
         <CollapsedRow theme={theme()} label={activeAccount().name}>
           <Show
@@ -684,8 +755,9 @@ function QuotaSidebar(props: {
               name='main'
               quota={state().main?.quota ?? null}
               killed={state().main?.killed ?? false}
-              active={state().activeId === 'main'}
+              active={sessionRouting().activeId === 'main'}
               pacingEnabled={prefs().sections.pacing}
+              resetCredits={state().main?.resetCredits}
             />
             <Show when={prefs().sections.fallbackAccounts}>
               <For each={enabledFallbacks()}>
@@ -696,8 +768,9 @@ function QuotaSidebar(props: {
                     name={fb.label ?? fb.id}
                     quota={fb.quota}
                     killed={fb.killed}
-                    active={state().activeId === fb.id}
+                    active={sessionRouting().activeId === fb.id}
                     pacingEnabled={prefs().sections.pacing}
+                    resetCredits={fb.resetCredits}
                     marginTop={1}
                   />
                 )}
@@ -712,30 +785,22 @@ function QuotaSidebar(props: {
           <StatRow
             theme={theme()}
             label='Route'
-            value={state().route}
+            value={sessionRouting().route}
             tone='accent'
           />
         </Show>
 
-        {/* Plan + Credits */}
-        <Show when={state().planType || state().credits != null}>
-          <Show when={state().planType}>
+        {/* Plan and credits — whichever are present */}
+        <For each={getQuotaMetadataRows(state())}>
+          {(row) => (
             <StatRow
               theme={theme()}
-              label='Plan'
-              value={state().planType ?? '\u2014'}
+              label={row.label}
+              value={row.value}
               tone='text'
             />
-          </Show>
-          <Show when={state().credits != null}>
-            <StatRow
-              theme={theme()}
-              label='Credits'
-              value={String(state().credits)}
-              tone='text'
-            />
-          </Show>
-        </Show>
+          )}
+        </For>
 
         {/* Health — only when something is wrong */}
         <Show when={degraded() && prefs().sections.health}>
@@ -776,8 +841,14 @@ const tui: TuiPlugin = async (api) => {
   api.slots.register({
     order: computeEffectiveOrder(root, PLUGIN_KEY, DEFAULT_SLOT_ORDER),
     slots: {
-      sidebar_content(_ctx: unknown, _props: { session_id: string }) {
-        return <QuotaSidebar api={api} controller={controller} />
+      sidebar_content(_ctx: unknown, props: { session_id: string }) {
+        return (
+          <QuotaSidebar
+            api={api}
+            controller={controller}
+            sessionId={props.session_id}
+          />
+        )
       },
     },
   })
@@ -815,12 +886,19 @@ const tui: TuiPlugin = async (api) => {
             if (message.payload.command === 'openai-quota') {
               api.ui.dialog.setSize('xlarge')
               api.ui.dialog.replace(() => (
-                <QuotaDialogContent api={api} controller={controller} />
+                <QuotaDialogContent
+                  api={api}
+                  controller={controller}
+                  sessionId={sessionId}
+                />
               ))
               continue
             }
-            openCommandDialog(api, message.payload, (command, args) =>
-              rpcClient.apply({ command, arguments: args }),
+            openCommandDialog(
+              api,
+              message.payload,
+              (command, args) => rpcClient.apply({ command, arguments: args }),
+              sessionId,
             )
           }
         })

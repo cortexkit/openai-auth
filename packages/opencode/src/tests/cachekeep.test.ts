@@ -12,6 +12,7 @@ import {
   ttlForModel,
 } from '../core/cachekeep'
 import { CodexAuthPlugin } from '../index'
+import { drainSidebarWrites, getSidebarState } from '../sidebar-state'
 
 function fakeLogger() {
   return {
@@ -680,12 +681,12 @@ describe('buildKeepwarmCapture', () => {
       sessionKey: 'sub-session',
       bodyText: JSON.stringify({ input: 'subagent-turn' }),
       replayHeaders: {
-        'x-opencode-session': 'sub-session',
         'x-session-affinity': 'affinity-session',
         'x-parent-session-id': 'parent-session',
       },
       isSubagent: true,
     })
+    expect(capture?.replayHeaders['x-opencode-session']).toBeUndefined()
   })
 
   test('main request (no x-parent-session-id) is captured regardless of includeSubagents', () => {
@@ -731,6 +732,7 @@ describe('buildKeepwarmCapture', () => {
         'x-codex-beta-features': 'terminal_resize_reflow',
         'x-codex-turn-metadata': '{"turn_id":"turn-1"}',
         'x-codex-window-id': 'window-1',
+        'x-openai-internal-codex-responses-lite': 'true',
       }),
       body,
     })
@@ -745,6 +747,7 @@ describe('buildKeepwarmCapture', () => {
         'x-codex-beta-features': 'terminal_resize_reflow',
         'x-codex-turn-metadata': '{"turn_id":"turn-1"}',
         'x-codex-window-id': 'window-1',
+        'x-openai-internal-codex-responses-lite': 'true',
       },
       isSubagent: false,
     })
@@ -809,7 +812,7 @@ describe('CacheKeepManager tick/prewarm', () => {
     const fetchCall = (fetchImpl as unknown as ReturnType<typeof mock>).mock
       .calls[0] as unknown[]
     const init = fetchCall[1] as RequestInit
-    expect((init.headers as Record<string, string>)['ChatGPT-Account-Id']).toBe(
+    expect(new Headers(init.headers).get('ChatGPT-Account-Id')).toBe(
       '8c97f046-7e21-409b-9829-0488897e475b',
     )
   })
@@ -841,7 +844,7 @@ describe('CacheKeepManager tick/prewarm', () => {
     const fetchCall = (fetchImpl as unknown as ReturnType<typeof mock>).mock
       .calls[0] as unknown[]
     const init = fetchCall[1] as RequestInit
-    expect((init.headers as Record<string, string>)['ChatGPT-Account-Id']).toBe(
+    expect(new Headers(init.headers).get('ChatGPT-Account-Id')).toBe(
       'real-chatgpt-account-id',
     )
   })
@@ -868,7 +871,7 @@ describe('CacheKeepManager tick/prewarm', () => {
     let fetchCall = (fetchImpl as unknown as ReturnType<typeof mock>).mock
       .calls[0] as unknown[]
     let init = fetchCall[1] as RequestInit
-    expect((init.headers as Record<string, string>)['ChatGPT-Account-Id']).toBe(
+    expect(new Headers(init.headers).get('ChatGPT-Account-Id')).toBe(
       'main-chatgpt-id',
     )
 
@@ -897,9 +900,7 @@ describe('CacheKeepManager tick/prewarm', () => {
     fetchCall = (fetchImpl as unknown as ReturnType<typeof mock>).mock
       .calls[0] as unknown[]
     init = fetchCall[1] as RequestInit
-    expect(
-      (init.headers as Record<string, string>)['ChatGPT-Account-Id'],
-    ).toBeUndefined()
+    expect(new Headers(init.headers).get('ChatGPT-Account-Id')).toBeNull()
   })
 
   test('idle cap prunes targets even when active backoff would otherwise skip pruning', async () => {
@@ -1749,7 +1750,7 @@ describe('CacheKeepManager tick/prewarm', () => {
       .calls[0] as unknown[]
     const init = fetchCall[1] as RequestInit
     expect(init.signal).toBeInstanceOf(AbortSignal)
-    expect(init.headers).toMatchObject({
+    expect(Object.fromEntries(new Headers(init.headers))).toMatchObject({
       authorization: 'Bearer main-token',
       'content-type': 'application/json',
       'session-id': 'sess-1',
@@ -2165,7 +2166,7 @@ describe('CacheKeepManager token resolution', () => {
     const fetchCall = (fetchImpl as unknown as ReturnType<typeof mock>).mock
       .calls[0] as unknown[]
     const init = fetchCall[1] as RequestInit
-    const authHeader = (init.headers as Record<string, string>)?.authorization
+    const authHeader = new Headers(init.headers).get('authorization')
     expect(authHeader).toBe('Bearer resolved-main-token')
   })
 
@@ -2193,7 +2194,7 @@ describe('CacheKeepManager token resolution', () => {
     const fetchCall2 = (fetchImpl as unknown as ReturnType<typeof mock>).mock
       .calls[0] as unknown[]
     const init2 = fetchCall2[1] as RequestInit
-    expect((init2.headers as Record<string, string>)?.authorization).toBe(
+    expect(new Headers(init2.headers).get('authorization')).toBe(
       'Bearer resolved-acct-1',
     )
   })
@@ -2339,10 +2340,16 @@ describe('CacheKeepManager token resolution', () => {
         method: 'POST',
         headers: {
           'session-id': opencodeSessionId,
+          'x-opencode-session': opencodeSessionId,
           'content-type': 'application/json',
         },
         body: JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
       })
+
+      await drainSidebarWrites()
+      expect(
+        (await getSidebarState()).activeRouting?.[opencodeSessionId],
+      ).toBeDefined()
 
       expect(mgr.status().tracked).toBe(1)
       const trackedTarget = mgr.status().targets[0]
@@ -2358,6 +2365,11 @@ describe('CacheKeepManager token resolution', () => {
           },
         },
       } as any)
+
+      await drainSidebarWrites()
+      expect(
+        (await getSidebarState()).activeRouting?.[opencodeSessionId],
+      ).toBeUndefined()
 
       expect(mgr.status().tracked).toBe(0)
 

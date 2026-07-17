@@ -25,6 +25,8 @@ export interface OpenAIAuthConfig {
   webSockets?: boolean
   /** Use the hand-rolled raw TCP/TLS WebSocket client (incremental streaming). Default false. */
   rawWebSocket?: boolean
+  /** Use Codex's Responses Lite request shape. Default false. */
+  responsesLite?: boolean
   /** Dump final Codex request bodies for cache debugging. Default false. */
   dump?: boolean | { enabled?: boolean }
   /** Directory for request dumps. Defaults to the OS temp directory. */
@@ -37,6 +39,7 @@ export interface ResolvedSettings {
   webSearch: boolean
   webSockets: boolean
   rawWebSocket: boolean
+  responsesLite: boolean
   dump: boolean
   dumpDir: string
   codexApiEndpoint: string
@@ -49,6 +52,7 @@ const ENV = {
   noWebSearch: 'CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH',
   webSockets: 'CORTEXKIT_OPENAI_AUTH_WEBSOCKETS',
   rawWebSocket: 'CORTEXKIT_OPENAI_AUTH_RAW_WS',
+  responsesLite: 'CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE',
   dump: 'CORTEXKIT_OPENAI_AUTH_DUMP',
   dumpDir: 'OPENCODE_OPENAI_AUTH_DUMP_DIR',
   codexApiEndpoint: 'CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT',
@@ -138,6 +142,7 @@ function resolve(): ResolvedSettings {
     webSearch,
     webSockets: resolveBool(ENV.webSockets, config.webSockets, false),
     rawWebSocket: resolveBool(ENV.rawWebSocket, config.rawWebSocket, false),
+    responsesLite: resolveBool(ENV.responsesLite, config.responsesLite, false),
     dump: resolveBool(ENV.dump, dumpConfig, false),
     dumpDir:
       process.env[ENV.dumpDir]?.trim() ||

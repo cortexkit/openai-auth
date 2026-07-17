@@ -1,7 +1,13 @@
 /** @jsxImportSource @opentui/solid */
 import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
-import { getSidebarState } from '../sidebar-state.js'
+import {
+  type AccountQuota,
+  getCollapsedQuotaSummary,
+  getSidebarState,
+  resolveSessionSidebarRouting,
+  type SidebarState,
+} from '../sidebar-state.js'
 import { openUrl } from '../util/open-url'
 
 type ApplyFn = (
@@ -139,6 +145,7 @@ export function openCommandDialog(
   api: TuiPluginApi,
   payload: OpenDialogPayload,
   apply: ApplyFn,
+  sessionId?: string,
 ) {
   if (payload.command === 'openai-routing') {
     const current = (payload.knobs.mode as string) ?? 'main-first'
@@ -248,7 +255,7 @@ export function openCommandDialog(
           {
             title: 'Edit thresholds\u2026',
             value: 'edit',
-            description: 'Set per-account 5h,1w cutoffs',
+            description: 'Set per-account primary,secondary cutoffs',
           },
         ]}
         onSelect={(option) => {
@@ -345,7 +352,7 @@ export function openCommandDialog(
   }
 
   if (payload.command === 'openai-account') {
-    openAccountDialog(api, apply)
+    openAccountDialog(api, apply, sessionId)
     return
   }
 
@@ -355,18 +362,15 @@ export function openCommandDialog(
 
 // -- Accounts dialog ---------------------------------------------------------
 
-function formatQuota5h7d(
-  quota:
-    | { primary?: { usedPercent: number }; secondary?: { usedPercent: number } }
-    | null
-    | undefined,
+export function formatQuotaWindows(
+  quota: AccountQuota | null | undefined,
 ): string {
-  if (!quota) return 'no quota data'
-  const parts: string[] = []
-  if (quota.primary) parts.push(`5h: ${Math.round(quota.primary.usedPercent)}%`)
-  if (quota.secondary)
-    parts.push(`7d: ${Math.round(quota.secondary.usedPercent)}%`)
-  return parts.length > 0 ? parts.join(' ') : 'no quota data'
+  const windowSummary = getCollapsedQuotaSummary(quota ?? null).text
+  if (windowSummary) return windowSummary
+  if (quota?.resetCreditsAvailable !== undefined) {
+    return `resets: ${quota.resetCreditsAvailable}`
+  }
+  return 'no quota data'
 }
 
 function osc52Copy(api: TuiPluginApi, text: string): boolean {
@@ -386,7 +390,30 @@ function osc52Copy(api: TuiPluginApi, text: string): boolean {
   return false
 }
 
-function openAccountDialog(api: TuiPluginApi, apply: ApplyFn) {
+export function buildAccountDialogRows(
+  state: SidebarState,
+  sessionId?: string,
+) {
+  const activeId = resolveSessionSidebarRouting(state, sessionId).activeId
+  return [
+    {
+      title: `main${activeId === 'main' ? ' \u2022 active' : ''}`,
+      value: 'main',
+      description: formatQuotaWindows(state.main.quota),
+    },
+    ...state.fallbacks.map((fb) => ({
+      title: `${fb.label ?? fb.id}${activeId === fb.id ? ' \u2022 active' : ''}${!fb.enabled ? ' (disabled)' : ''}`,
+      value: fb.id,
+      description: formatQuotaWindows(fb.quota),
+    })),
+  ]
+}
+
+function openAccountDialog(
+  api: TuiPluginApi,
+  apply: ApplyFn,
+  sessionId?: string,
+) {
   const DialogConfirm = api.ui.DialogConfirm
 
   function showL1() {
@@ -397,16 +424,7 @@ function openAccountDialog(api: TuiPluginApi, apply: ApplyFn) {
         <DialogSelectInner
           title='OpenAI Accounts'
           options={[
-            {
-              title: `main${state.activeId === 'main' || !state.activeId ? ' \u2022 active' : ''}`,
-              value: 'main',
-              description: formatQuota5h7d(state.main.quota),
-            },
-            ...state.fallbacks.map((fb) => ({
-              title: `${fb.label ?? fb.id}${state.activeId === fb.id ? ' \u2022 active' : ''}${!fb.enabled ? ' (disabled)' : ''}`,
-              value: fb.id,
-              description: formatQuota5h7d(fb.quota),
-            })),
+            ...buildAccountDialogRows(state, sessionId),
             {
               title: 'Add account\u2026',
               value: '__add__',

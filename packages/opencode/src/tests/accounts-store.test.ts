@@ -243,6 +243,63 @@ describe('accounts store', () => {
     expect(loadedAcct1.access).toBe('acc-1')
   })
 
+  it('round-trips optional dynamic quota metadata through the runtime state file', async () => {
+    const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
+    const account = oauthAccount('quota-metadata', {
+      quota: {
+        primary: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          resetsAt: '2026-07-23T00:00:00.000Z',
+          checkedAt: 1_752_710_400_000,
+          windowMinutes: 10_080,
+        },
+        resetCreditsAvailable: 4,
+      },
+    })
+
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [account],
+      },
+      cfgPath,
+    )
+
+    const loaded = await loadAccounts(cfgPath)
+    const quota = (loaded?.accounts[0] as OAuthAccount | undefined)?.quota
+    expect(quota?.primary?.windowMinutes).toBe(10_080)
+    expect(quota?.resetCreditsAvailable).toBe(4)
+  })
+
+  it('loads an older quota snapshot without dynamic metadata', async () => {
+    const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
+    const account = oauthAccount('old-quota', {
+      quota: {
+        primary: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: 1_752_710_400_000,
+        },
+      },
+    })
+
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [account],
+      },
+      cfgPath,
+    )
+
+    const loaded = await loadAccounts(cfgPath)
+    const quota = (loaded?.accounts[0] as OAuthAccount | undefined)?.quota
+    expect(quota?.primary?.windowMinutes).toBeUndefined()
+    expect(quota?.resetCreditsAvailable).toBeUndefined()
+  })
+
   it('saveAccounts waits for the file lock and merges with the latest on-disk accounts', async () => {
     const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
 

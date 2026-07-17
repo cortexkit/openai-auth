@@ -30,7 +30,10 @@
 │   │   │   ├── response-stream-error.ts # Stream error type for WS/HTTP
 │   │   │   ├── prompt-context.ts  # Assistant model/variant resolver for synthetic replies
 │   │   │   ├── dump.ts            # Optional transport request dumps for cache debugging
-│   │   │   └── version.ts         # Package version (mirrors package.json)
+│   │   │   ├── version.ts         # Package version (mirrors package.json)
+│   │   │   └── WEBSOCKET.md       # Developer reference for WebSocket flow/lifetime/retries
+│   │   ├── scripts/               # Package-specific build scripts
+│   │   │   └── build-tui.ts       # Precompiles TUI Solid JSX into tui-compiled/
 │   │   ├── package.json
 │   │   ├── README.md
 │   │   ├── tsconfig.json
@@ -87,14 +90,19 @@
 - Key files: `packages/opencode/src/tests/integration.test.ts`, `packages/opencode/src/tests/oauth.test.ts`, `packages/opencode/src/tests/cachekeep.test.ts`, `packages/opencode/src/tests/rpc-server.test.ts`.
 
 **`packages/opencode/src/tui/`:**
-- Purpose: TUI sidebar Solid components (separated from `tui.tsx` to keep the top-level entry small).
-- Contains: `command-dialogs.tsx`.
-- Key files: `packages/opencode/src/tui/command-dialogs.tsx`.
+- Purpose: TUI sidebar Solid components and entry loader (separated from `tui.tsx` to keep the top-level entry small).
+- Contains: `command-dialogs.tsx`, `entry.mjs`.
+- Key files: `packages/opencode/src/tui/command-dialogs.tsx`, `packages/opencode/src/tui/entry.mjs`.
 
 **`packages/opencode/src/util/`:**
 - Purpose: Small, dependency-free helpers shared by every layer.
 - Contains: `error.ts`, `proxy-env.ts`, `record.ts`, `stable-json.ts`, `uuid-v7.ts`, `open-url.ts`.
 - Key files: `packages/opencode/src/util/uuid-v7.ts` (Codex session/turn id parity), `packages/opencode/src/util/stable-json.ts` (cache key parity).
+
+**`packages/opencode/scripts/`:**
+- Purpose: Package-specific build and helper scripts.
+- Contains: `build-tui.ts`.
+- Key files: `packages/opencode/scripts/build-tui.ts`.
 
 **`packages/pi/src/`:**
 - Purpose: Sibling package exposing the same Codex OAuth capability to the Pi coding agent.
@@ -134,6 +142,7 @@
 - `packages/opencode/src/core/refresh-file-lock.ts` — single-writer eviction-marker lock.
 - `packages/opencode/src/ws-pool.ts` — per-account WebSocket pool.
 - `packages/opencode/src/ws.ts` — low-level WS connect/stream.
+- `packages/opencode/src/WEBSOCKET.md` — developer reference for WebSocket flow, lifetime, and retry strategies.
 - `packages/opencode/src/raw-ws-bun.ts` / `packages/opencode/src/raw-ws-node.ts` — hand-rolled RFC 6455 clients.
 - `packages/opencode/src/hosted-web-search.ts` — provider-hosted `web_search` tool + replay/SSE translation.
 - `packages/opencode/src/quota-normalize.ts` — HTTP/WS/wham → `OAuthQuotaSnapshot`.

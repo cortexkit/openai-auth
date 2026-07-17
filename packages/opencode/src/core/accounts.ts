@@ -79,11 +79,14 @@ export type AccountQuotaWindow = {
   remainingPercent: number
   resetsAt?: string
   checkedAt: number
+  windowMinutes?: number
 }
 
-export type OAuthQuotaSnapshot = Partial<
-  Record<QuotaWindowName, AccountQuotaWindow>
->
+export interface OAuthQuotaSnapshot {
+  primary?: AccountQuotaWindow
+  secondary?: AccountQuotaWindow
+  resetCreditsAvailable?: number
+}
 
 // ---------------------------------------------------------------------------
 // Account types
@@ -115,7 +118,7 @@ export type OAuthAccount = AccountBase & {
   lastRefreshedAt?: number
   lastRefreshError?: AccountOperationError
   lastQuotaRefreshError?: AccountOperationError
-  quota?: Partial<Record<QuotaWindowName, AccountQuotaWindow>>
+  quota?: OAuthQuotaSnapshot
 }
 
 export type ApiKeyAccount = AccountBase & {
@@ -369,7 +372,7 @@ function normalizeOperationError(
 
 function normalizeQuota(value: unknown): OAuthAccount['quota'] {
   if (!isRecord(value)) return undefined
-  const quota: OAuthAccount['quota'] = {}
+  const quota: OAuthQuotaSnapshot = {}
   for (const key of ['primary', 'secondary'] as const) {
     const window = value[key]
     if (!isRecord(window)) continue
@@ -383,14 +386,30 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
     ) {
       continue
     }
+    const windowMinutes =
+      typeof window.windowMinutes === 'number'
+        ? window.windowMinutes
+        : Number.NaN
     quota[key] = {
       usedPercent,
       remainingPercent,
       checkedAt,
       resetsAt:
         typeof window.resetsAt === 'string' ? window.resetsAt : undefined,
+      ...(Number.isFinite(windowMinutes) && windowMinutes > 0
+        ? { windowMinutes }
+        : {}),
     }
   }
+
+  const resetCreditsAvailable =
+    typeof value.resetCreditsAvailable === 'number'
+      ? value.resetCreditsAvailable
+      : Number.NaN
+  if (Number.isFinite(resetCreditsAvailable) && resetCreditsAvailable >= 0) {
+    quota.resetCreditsAvailable = resetCreditsAvailable
+  }
+
   return Object.keys(quota).length ? quota : undefined
 }
 
@@ -1068,11 +1087,16 @@ export function quotaSnapshotPassesPolicy(
   now = Date.now(),
 ) {
   if (!quotaEnabled(storage)) return true
+  if (!quota) return !failClosedOnUnknownQuota(storage)
+
   const thresholds = normalizeThresholds(storage)
+  const failClosed = failClosedOnUnknownQuota(storage)
   for (const key of ['primary', 'secondary'] as const) {
-    const window = quota?.[key]
-    if (!window || quotaWindowResetIsPast(window, now)) {
-      return !failClosedOnUnknownQuota(storage)
+    const window = quota[key]
+    if (!window) continue
+    if (quotaWindowResetIsPast(window, now)) {
+      if (failClosed) return false
+      continue
     }
     if (window.remainingPercent < thresholds[key]) return false
   }
@@ -1120,39 +1144,57 @@ export function killswitchPassesPolicy(
   now = Date.now(),
 ) {
   if (!isKillswitchEnabled(storage)) return true
+  if (!quota) return !failClosedOnUnknownQuota(storage)
+
   const thresholds = getKillswitchThresholdsForAccount(storage, accountId)
-  let sawUnknownWindow = false
+  const failClosed = failClosedOnUnknownQuota(storage)
   for (const key of ['primary', 'secondary'] as const) {
-    const window = quota?.[key]
-    if (!window || quotaWindowResetIsPast(window, now)) {
-      sawUnknownWindow = true
+    const window = quota[key]
+    if (!window) continue
+    if (quotaWindowResetIsPast(window, now)) {
+      if (failClosed) return false
       continue
     }
     if (window.remainingPercent < thresholds[key]) return false
   }
-  if (sawUnknownWindow) return !failClosedOnUnknownQuota(storage)
   return true
 }
 
 export function killswitchRetryAfterSeconds(
   mainQuota: OAuthQuotaSnapshot | undefined,
-  fallbackAccounts: Array<{ quota?: OAuthQuotaSnapshot }>,
+  fallbackAccounts: Array<{ accountId: string; quota?: OAuthQuotaSnapshot }>,
   now: number,
+  storage: AccountStorage | null,
 ): number {
-  const resetTimes: number[] = []
-  const allQuotas = [mainQuota, ...fallbackAccounts.map((a) => a.quota)]
-  for (const quota of allQuotas) {
+  if (!isKillswitchEnabled(storage)) return 300
+
+  const accountResetTimes: number[] = []
+  const accounts = [
+    { accountId: undefined, quota: mainQuota },
+    ...fallbackAccounts,
+  ]
+  for (const { accountId, quota } of accounts) {
+    if (!quota) continue
+    const thresholds = getKillswitchThresholdsForAccount(storage, accountId)
+    const violatingResetTimes: number[] = []
+    let resetUnknown = false
     for (const key of ['primary', 'secondary'] as const) {
-      const resetStr = quota?.[key]?.resetsAt
-      if (!resetStr) continue
-      const resetTime = Date.parse(resetStr)
-      if (Number.isFinite(resetTime) && resetTime > now) {
-        resetTimes.push(resetTime)
+      const window = quota[key]
+      if (!window || quotaWindowResetIsPast(window, now)) continue
+      if (window.remainingPercent >= thresholds[key]) continue
+      const resetTime = window.resetsAt ? Date.parse(window.resetsAt) : NaN
+      if (!Number.isFinite(resetTime) || resetTime <= now) {
+        resetUnknown = true
+        break
       }
+      violatingResetTimes.push(resetTime)
     }
+    if (resetUnknown || violatingResetTimes.length === 0) continue
+    // Every violating window must reset before this account can pass policy.
+    accountResetTimes.push(Math.max(...violatingResetTimes))
   }
-  if (resetTimes.length === 0) return 300
-  const earliest = Math.min(...resetTimes)
+  if (accountResetTimes.length === 0) return 300
+  const earliest = Math.min(...accountResetTimes)
   return Math.max(1, Math.ceil((earliest - now) / 1000))
 }
 
@@ -1356,8 +1398,8 @@ function cachedQuotaSnapshotStillRelevant(
 ) {
   if (!quota) return false
   return (
-    cachedQuotaWindowStillRelevant(quota[PRIMARY], now) ||
-    cachedQuotaWindowStillRelevant(quota[SECONDARY], now)
+    cachedQuotaWindowStillRelevant(quota.primary, now) ||
+    cachedQuotaWindowStillRelevant(quota.secondary, now)
   )
 }
 
@@ -1370,8 +1412,8 @@ function quotaSnapshotIsFresh(
   const intervalMinutes = storage?.quota?.checkIntervalMinutes ?? 5
   const staleAfterMs = Math.max(1, intervalMinutes) * 60_000
   const checkedAt = Math.max(
-    quota[PRIMARY]?.checkedAt ?? 0,
-    quota[SECONDARY]?.checkedAt ?? 0,
+    quota.primary?.checkedAt ?? 0,
+    quota.secondary?.checkedAt ?? 0,
   )
   return now - checkedAt < staleAfterMs
 }
@@ -1458,8 +1500,8 @@ export class FallbackAccountManager {
     if (!this.quotaManager) return
     if (!account.quota) return
     const checkedAt = Math.max(
-      account.quota[PRIMARY]?.checkedAt ?? 0,
-      account.quota[SECONDARY]?.checkedAt ?? 0,
+      account.quota.primary?.checkedAt ?? 0,
+      account.quota.secondary?.checkedAt ?? 0,
     )
     if (checkedAt <= 0) return
     const existing = this.quotaManager.getFallback(account.id, account.access)

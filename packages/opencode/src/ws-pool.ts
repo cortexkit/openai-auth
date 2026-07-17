@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { sanitizeHttpFallbackInit } from './codex-http'
 import { DUMP_SESSION_HEADER, dumpCodexRequest, dumpDiagnostic } from './dump'
 import { ResponseStreamError } from './response-stream-error'
 import { isRecord } from './util/record'
@@ -17,6 +18,7 @@ const INTERNAL_HEADERS = new Set([
   TITLE_HEADER,
   DUMP_SESSION_HEADER,
   QUOTA_ACCOUNT_HEADER,
+  'x-opencode-session',
 ])
 
 export interface CreateWebSocketFetchOptions {
@@ -926,39 +928,10 @@ function hasInputPrefix(prefix: unknown[], input: unknown[]) {
   return true
 }
 
-function sanitizeHttpFallbackInit(init: RequestInit | undefined) {
-  if (init?.method?.toUpperCase() !== 'POST') return init
-  const headers = new Headers(init.headers)
-  headers.set('accept', 'text/event-stream')
-  headers.set('content-type', 'application/json')
-  return {
-    ...init,
-    headers,
-    body: sanitizeHttpFallbackBody(init.body),
-  }
-}
-
-function sanitizeHttpFallbackBody(body: BodyInit | null | undefined) {
-  if (typeof body !== 'string') return body
-  try {
-    const parsed = JSON.parse(body)
-    if (!isRecord(parsed) || !isRecord(parsed.client_metadata)) return body
-    if (
-      !(
-        'x-codex-turn-metadata' in parsed.client_metadata ||
-        'x-codex-ws-stream-request-start-ms' in parsed.client_metadata
-      )
-    ) {
-      return body
-    }
-    const clientMetadata = { ...parsed.client_metadata }
-    delete clientMetadata['x-codex-turn-metadata']
-    delete clientMetadata['x-codex-ws-stream-request-start-ms']
-    return JSON.stringify({ ...parsed, client_metadata: clientMetadata })
-  } catch {
-    return body
-  }
-}
+export {
+  hasWebSocketResponsesLiteMetadata,
+  sanitizeHttpFallbackBody,
+} from './codex-http'
 
 export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(
   init: T | undefined,

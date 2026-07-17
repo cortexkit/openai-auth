@@ -2,7 +2,9 @@ import { describe, expect, mock, test } from 'bun:test'
 import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
 import {
+  buildAccountDialogRows,
   buildCachekeepDialogOptions,
+  formatQuotaWindows,
   openCommandDialog,
 } from '../tui/command-dialogs'
 
@@ -144,5 +146,93 @@ describe('command dialogs', () => {
     // Instead it installs the window-prompt dialog via dialog.replace, so a
     // further replace must have fired beyond the initial dialog open.
     expect(replaceCount.value).toBeGreaterThan(replacesBeforeSelect)
+  })
+
+  test('account dialog marks the current session routing entry as active', () => {
+    const rows = buildAccountDialogRows(
+      {
+        main: { quota: null, killed: false },
+        fallbacks: [
+          {
+            id: 'fallback-1',
+            label: 'work',
+            quota: null,
+            killed: false,
+            enabled: true,
+          },
+        ],
+        activeId: 'main',
+        route: 'main-first',
+        activeRouting: {
+          'session-a': {
+            activeId: 'fallback-1',
+            route: 'fallback-first',
+            updatedAt: Date.now(),
+          },
+        },
+        lastUpdated: Date.now(),
+      },
+      'session-a',
+    )
+
+    expect(rows[0]?.title).toBe('main')
+    expect(rows[1]?.title).toBe('work • active')
+  })
+
+  test('account dialog without a session uses the legacy active account', () => {
+    const rows = buildAccountDialogRows({
+      main: { quota: null, killed: false },
+      fallbacks: [
+        {
+          id: 'killed',
+          label: 'killed',
+          quota: null,
+          killed: true,
+          enabled: true,
+        },
+      ],
+      activeId: 'main',
+      route: 'fallback-first',
+      lastUpdated: Date.now(),
+    })
+
+    expect(rows[0]?.title).toBe('main • active')
+    expect(rows[1]?.title).toBe('killed')
+  })
+
+  test('account quota descriptions derive labels from present window lengths', () => {
+    expect(
+      formatQuotaWindows({
+        primary: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          windowMinutes: 10_080,
+        },
+      }),
+    ).toBe('7d: 20%')
+
+    expect(
+      formatQuotaWindows({
+        primary: {
+          usedPercent: 3,
+          remainingPercent: 97,
+          windowMinutes: 300,
+        },
+        secondary: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          windowMinutes: 10_080,
+        },
+      }),
+    ).toBe('5h: 3% 7d: 20%')
+  })
+
+  test('account quota descriptions show reset credits without windows', () => {
+    expect(formatQuotaWindows({ resetCreditsAvailable: 3 })).toBe('resets: 3')
+  })
+
+  test('account quota descriptions reserve no-data text for empty snapshots', () => {
+    expect(formatQuotaWindows({})).toBe('no quota data')
+    expect(formatQuotaWindows(null)).toBe('no quota data')
   })
 })

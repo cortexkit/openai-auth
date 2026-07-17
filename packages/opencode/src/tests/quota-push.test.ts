@@ -1,7 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import type { OAuthQuotaSnapshot } from '../core/accounts.ts'
-import { normalizeQuotaHeaders } from '../quota-normalize.ts'
+import type { AccountStorage, OAuthQuotaSnapshot } from '../core/accounts.ts'
+import type { QuotaManager } from '../core/quota-manager.ts'
+import {
+  buildSidebarMachineState,
+  buildSidebarState,
+  mergePushedQuotaMetadata,
+} from '../index.ts'
+import {
+  isCompleteQuotaHeaderFrame,
+  normalizeQuotaHeaders,
+} from '../quota-normalize.ts'
+import type { SidebarState } from '../sidebar-state.ts'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
 
 let origAuthFile: string | undefined
@@ -180,6 +190,93 @@ describe('QuotaManager push', () => {
     expect(entry!.quota.primary?.usedPercent).toBe(10)
   })
 
+  it('malformed quota headers cannot erase a valid cached snapshot', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const token = `access-${randomUUID()}`
+    const qm = new QuotaManager({ storage: null })
+    qm.setMain(token, {
+      quota: goodSnapshot(),
+      refreshAfter: Date.now() + 60_000,
+      checkedAt: Date.now(),
+    })
+
+    const malformed = new Headers({
+      'x-codex-primary-used-percent': 'bad',
+    })
+    qm.setMain(
+      token,
+      {
+        quota: normalizeQuotaHeaders(malformed),
+        refreshAfter: Date.now() + 60_000,
+        checkedAt: Date.now(),
+      },
+      undefined,
+      isCompleteQuotaHeaderFrame(malformed),
+    )
+
+    expect(qm.getMain(token)?.quota.primary?.usedPercent).toBe(10)
+  })
+
+  it('conditional push: reset-credit metadata alone does NOT count as a window and must not overwrite a valid cached snapshot', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const token = `access-${randomUUID()}`
+    const snapshot = goodSnapshot()
+
+    const qm = new QuotaManager({
+      storage: null,
+      fetchQuotaFn: () => {
+        throw new Error('must not be called')
+      },
+    })
+
+    qm.setMain(token, {
+      quota: snapshot,
+      refreshAfter: Date.now() + 60_000,
+      checkedAt: Date.now(),
+    })
+
+    // A push carrying only metadata (no window data) must be treated the
+    // same as an empty snapshot — the conditional-push guard is about
+    // window presence, not key presence.
+    qm.setMain(token, {
+      quota: { resetCreditsAvailable: 4 },
+      refreshAfter: Date.now() + 60_000,
+      checkedAt: Date.now(),
+    })
+    const entry = qm.getMain(token)
+    expect(entry).not.toBeNull()
+    expect(entry!.quota.primary?.usedPercent).toBe(10)
+  })
+
+  it('conditional push: an explicit zero-window quota IS a real window and overwrites the cache', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const token = `access-${randomUUID()}`
+    const snapshot = goodSnapshot()
+
+    const qm = new QuotaManager({
+      storage: null,
+      fetchQuotaFn: () => {
+        throw new Error('must not be called')
+      },
+    })
+
+    qm.setMain(token, {
+      quota: snapshot,
+      refreshAfter: Date.now() + 60_000,
+      checkedAt: Date.now(),
+    })
+
+    qm.setMain(token, {
+      quota: {
+        primary: { usedPercent: 100, remainingPercent: 0, checkedAt: 1 },
+      },
+      refreshAfter: Date.now() + 60_000,
+      checkedAt: Date.now(),
+    })
+    const entry = qm.getMain(token)
+    expect(entry!.quota.primary?.usedPercent).toBe(100)
+  })
+
   it('setFallback push updates getFallback without any network', async () => {
     const { QuotaManager } = await import('../core/quota-manager.ts')
     const accountId = randomUUID()
@@ -241,5 +338,128 @@ describe('QuotaManager push', () => {
     const entry = qm.getFallback(accountId, token)
     expect(entry).not.toBeNull()
     expect(entry!.quota.primary?.usedPercent).toBe(10)
+  })
+
+  it('preserves last-known reset credits when a per-turn push omits them', () => {
+    const previous: OAuthQuotaSnapshot = {
+      primary: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        checkedAt: 1,
+        windowMinutes: 10_080,
+      },
+      resetCreditsAvailable: 4,
+    }
+    const incoming: OAuthQuotaSnapshot = {
+      primary: {
+        usedPercent: 20,
+        remainingPercent: 80,
+        checkedAt: 2,
+        windowMinutes: 10_080,
+      },
+    }
+
+    expect(
+      mergePushedQuotaMetadata(incoming, previous).resetCreditsAvailable,
+    ).toBe(4)
+    expect(
+      mergePushedQuotaMetadata(
+        { ...incoming, resetCreditsAvailable: 0 },
+        previous,
+      ).resetCreditsAvailable,
+    ).toBe(0)
+  })
+
+  it('publishes each account reset-credit count independently of the active account', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const qm: QuotaManager = new QuotaManager({ storage: null })
+    qm.setMain('main-token', {
+      quota: {
+        primary: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: 1,
+          windowMinutes: 10_080,
+        },
+        resetCreditsAvailable: 4,
+      },
+      refreshAfter: 2,
+      checkedAt: 1,
+    })
+    qm.setFallback(
+      'fallback-1',
+      {
+        quota: {
+          primary: {
+            usedPercent: 30,
+            remainingPercent: 70,
+            checkedAt: 1,
+            windowMinutes: 10_080,
+          },
+          resetCreditsAvailable: 2,
+        },
+        refreshAfter: 2,
+        checkedAt: 1,
+      },
+      'fallback-token',
+    )
+    const store: AccountStorage = {
+      version: 1,
+      main: { type: 'opencode', provider: 'openai' },
+      accounts: [
+        {
+          id: 'fallback-1',
+          type: 'oauth',
+          access: 'fallback-token',
+          refresh: 'fallback-refresh',
+          expires: 10,
+          enabled: true,
+        },
+      ],
+    }
+
+    const machine = buildSidebarMachineState(qm, store, 10)
+    const expectedMachine = {
+      main: {
+        quota: {
+          primary: {
+            usedPercent: 20,
+            remainingPercent: 80,
+            checkedAt: 1,
+            windowMinutes: 10_080,
+          },
+          resetCreditsAvailable: 4,
+        },
+        killed: false,
+        resetCredits: 4,
+      },
+      fallbacks: [
+        {
+          id: 'fallback-1',
+          label: undefined,
+          quota: {
+            primary: {
+              usedPercent: 30,
+              remainingPercent: 70,
+              checkedAt: 1,
+              windowMinutes: 10_080,
+            },
+            resetCreditsAvailable: 2,
+          },
+          killed: false,
+          enabled: true,
+          resetCredits: 2,
+        },
+      ],
+      route: 'main-first',
+      lastUpdated: 10,
+    }
+    expect(machine).toEqual(expectedMachine)
+
+    const legacy = buildSidebarState(qm, store, 'fallback-1', 10)
+    expect(legacy).toEqual({ ...machine, activeId: 'fallback-1' })
+    expect(
+      (legacy as SidebarState & { resetCredits?: number }).resetCredits,
+    ).toBeUndefined()
   })
 })
