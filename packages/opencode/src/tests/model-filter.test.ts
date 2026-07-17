@@ -1,9 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { PluginInput } from '@opencode-ai/plugin'
 import { CodexAuthPlugin } from '../index'
+import { type ModelCost, resetModelCostsForTest } from '../model-costs'
+import {
+  FLOOR_AUTH_FILE,
+  FLOOR_MODELS_CACHE,
+  FLOOR_STATE_FILE,
+} from './setup-env'
 
 // Exercises the provider.models hook: which OpenAI models surface to OAuth
 // users and what context limits they carry. The suffix-less gpt-5.6 and its
@@ -30,12 +36,21 @@ type MockModel = {
   id: string
   api: { id: string }
   options: { reasoningMode?: string }
-  cost: {
-    input: number
-    output: number
-    cache: { read: number; write: number }
-  }
+  cost: ModelCost
   limit: { context: number; input: number; output: number }
+}
+
+function failingFetch(message: string): typeof globalThis.fetch {
+  return Object.assign(
+    async () => {
+      throw new Error(message)
+    },
+    {
+      preconnect: (
+        ..._args: Parameters<typeof globalThis.fetch.preconnect>
+      ) => {},
+    },
+  )
 }
 
 function model(
@@ -93,27 +108,242 @@ async function surfacedModels() {
 }
 
 describe('provider.models filter', () => {
-  let restoreFile: string | undefined
-  let restoreState: string | undefined
+  let dir: string
+  let configPath: string
+  let modelsCachePath: string
+  let restoreFile: string
+  let restoreState: string
+  let restoreModelsCache: string
+  let restoreFetch: typeof globalThis.fetch
 
   beforeEach(() => {
-    restoreFile = process.env.OPENCODE_OPENAI_AUTH_FILE
-    restoreState = process.env.OPENCODE_OPENAI_AUTH_STATE_FILE
-    const dir = mkdtempSync(join(tmpdir(), 'oai-modelfilter-'))
+    restoreFile = process.env.OPENCODE_OPENAI_AUTH_FILE ?? FLOOR_AUTH_FILE
+    restoreState =
+      process.env.OPENCODE_OPENAI_AUTH_STATE_FILE ?? FLOOR_STATE_FILE
+    restoreModelsCache =
+      process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE ?? FLOOR_MODELS_CACHE
+    restoreFetch = globalThis.fetch
+    dir = mkdtempSync(join(tmpdir(), 'oai-modelfilter-'))
+    configPath = join(dir, 'openai-auth.json')
+    modelsCachePath = join(dir, 'models.json')
     // Point at nonexistent files so loadAccounts returns null (cost-zeroing on).
-    process.env.OPENCODE_OPENAI_AUTH_FILE = join(dir, 'openai-auth.json')
+    process.env.OPENCODE_OPENAI_AUTH_FILE = configPath
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = join(
       dir,
       'openai-auth-state.json',
     )
+    process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE = modelsCachePath
+    resetModelCostsForTest()
   })
 
   afterEach(() => {
-    if (restoreFile === undefined) delete process.env.OPENCODE_OPENAI_AUTH_FILE
-    else process.env.OPENCODE_OPENAI_AUTH_FILE = restoreFile
-    if (restoreState === undefined)
-      delete process.env.OPENCODE_OPENAI_AUTH_STATE_FILE
-    else process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = restoreState
+    process.env.OPENCODE_OPENAI_AUTH_FILE = restoreFile
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = restoreState
+    process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE = restoreModelsCache
+    globalThis.fetch = restoreFetch
+    resetModelCostsForTest()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('restores catalog prices when incoming OAuth costs were pre-zeroed', async () => {
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        version: 1,
+        costZeroing: { enabled: false },
+        accounts: [],
+      }),
+    )
+    writeFileSync(
+      modelsCachePath,
+      JSON.stringify({
+        openai: {
+          models: {
+            'gpt-5.6-sol': {
+              cost: {
+                input: 5,
+                output: 30,
+                cache_read: 0.5,
+                cache_write: 6.25,
+                tiers: [
+                  {
+                    input: 10,
+                    output: 45,
+                    cache_read: 1,
+                    cache_write: 12.5,
+                    tier: { type: 'context', size: 272_000 },
+                  },
+                ],
+                context_over_200k: {
+                  input: 10,
+                  output: 45,
+                  cache_read: 1,
+                  cache_write: 12.5,
+                },
+              },
+            },
+          },
+        },
+      }),
+    )
+
+    const hooks = await CodexAuthPlugin(createMockPluginInput(), {
+      experimentalWebSockets: false,
+    })
+    const modelsHook = hooks.provider?.models
+    if (!modelsHook) throw new Error('No provider.models hook')
+    const incoming = model('gpt-5.6-sol', 'gpt-5.6-sol')
+    incoming.cost = { input: 0, output: 0, cache: { read: 0, write: 0 } }
+
+    const result = (await modelsHook(
+      { models: { 'gpt-5.6-sol': incoming } } as never,
+      { auth: { type: 'oauth' } } as never,
+    )) as Record<string, MockModel>
+
+    expect(result['gpt-5.6-sol']?.cost).toEqual({
+      input: 5,
+      output: 30,
+      cache: { read: 0.5, write: 6.25 },
+      tiers: [
+        {
+          input: 10,
+          output: 45,
+          cache: { read: 1, write: 12.5 },
+          tier: { type: 'context', size: 272_000 },
+        },
+      ],
+      experimentalOver200K: {
+        input: 10,
+        output: 45,
+        cache: { read: 1, write: 12.5 },
+      },
+    })
+  })
+
+  it('keeps zeroing enabled even when catalog prices are available', async () => {
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        version: 1,
+        costZeroing: { enabled: true },
+        accounts: [],
+      }),
+    )
+    writeFileSync(
+      modelsCachePath,
+      JSON.stringify({
+        openai: {
+          models: {
+            'gpt-5.6-sol': {
+              cost: {
+                input: 5,
+                output: 30,
+                cache_read: 0.5,
+                cache_write: 6.25,
+              },
+            },
+          },
+        },
+      }),
+    )
+
+    const hooks = await CodexAuthPlugin(createMockPluginInput(), {
+      experimentalWebSockets: false,
+    })
+    const modelsHook = hooks.provider?.models
+    if (!modelsHook) throw new Error('No provider.models hook')
+    const result = (await modelsHook(
+      {
+        models: { 'gpt-5.6-sol': model('gpt-5.6-sol', 'gpt-5.6-sol') },
+      } as never,
+      { auth: { type: 'oauth' } } as never,
+    )) as Record<string, MockModel>
+
+    expect(result['gpt-5.6-sol']?.cost).toEqual({
+      input: 0,
+      output: 0,
+      cache: { read: 0, write: 0 },
+    })
+  })
+
+  it('preserves incoming costs when the catalog is unavailable', async () => {
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        version: 1,
+        costZeroing: { enabled: false },
+        accounts: [],
+      }),
+    )
+    globalThis.fetch = failingFetch('network unavailable')
+
+    const hooks = await CodexAuthPlugin(createMockPluginInput(), {
+      experimentalWebSockets: false,
+    })
+    const modelsHook = hooks.provider?.models
+    if (!modelsHook) throw new Error('No provider.models hook')
+    const incoming = model('gpt-5.6-sol', 'gpt-5.6-sol')
+
+    const result = (await modelsHook(
+      { models: { 'gpt-5.6-sol': incoming } } as never,
+      { auth: { type: 'oauth' } } as never,
+    )) as Record<string, MockModel>
+
+    expect(result['gpt-5.6-sol']?.cost).toEqual(incoming.cost)
+  })
+
+  it('looks up catalog costs by API id before falling back to model id', async () => {
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        version: 1,
+        costZeroing: { enabled: false },
+        accounts: [],
+      }),
+    )
+    writeFileSync(
+      modelsCachePath,
+      JSON.stringify({
+        openai: {
+          models: {
+            'gpt-5.6-sol': {
+              cost: {
+                input: 5,
+                output: 30,
+                cache_read: 0.5,
+                cache_write: 6.25,
+              },
+            },
+            'gpt-5.6-terra': {
+              cost: {
+                input: 7,
+                output: 31,
+                cache_read: 0.7,
+                cache_write: 7.25,
+              },
+            },
+          },
+        },
+      }),
+    )
+
+    const hooks = await CodexAuthPlugin(createMockPluginInput(), {
+      experimentalWebSockets: false,
+    })
+    const modelsHook = hooks.provider?.models
+    if (!modelsHook) throw new Error('No provider.models hook')
+    const result = (await modelsHook(
+      {
+        models: {
+          'gpt-5.6-sol-fast': model('gpt-5.6-sol-fast', 'gpt-5.6-sol'),
+          'gpt-5.6-terra': model('gpt-5.6-terra', 'gpt-5.6-terra-catalog-miss'),
+        },
+      } as never,
+      { auth: { type: 'oauth' } } as never,
+    )) as Record<string, MockModel>
+
+    expect(result['gpt-5.6-sol-fast']?.cost.input).toBe(5)
+    expect(result['gpt-5.6-terra']?.cost.input).toBe(7)
   })
 
   it('drops the suffix-less gpt-5.6 and its -fast/-pro synthetics', async () => {
