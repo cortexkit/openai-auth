@@ -79,6 +79,7 @@ import {
   translateHostedWebSearchResponse,
 } from './hosted-web-search'
 import { createLogger, setLogLevel } from './logger'
+import { loadModelsDevCosts } from './model-costs'
 import { resolvePromptContext } from './prompt-context'
 import { normalizeQuotaHeaders } from './quota-normalize'
 import {
@@ -138,6 +139,9 @@ const DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS = 60_000
 const HANDLED_SENTINEL = '__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__'
 
 let bootQuotaSeedStarted = false
+const logModels = createLogger('models')
+let loggedCostRestoration = false
+let warnedCostCatalogUnavailable = false
 
 export class AuthPersistError extends Error {
   readonly code = 'OPENAI_AUTH_PERSIST_FAILED'
@@ -588,6 +592,17 @@ export async function CodexAuthPlugin(
 
         const storage = await loadAccounts(getConfigPath())
         const zeroCosts = !storage || isCostZeroingEnabled(storage)
+        const catalog = zeroCosts ? null : await loadModelsDevCosts()
+        if (!zeroCosts && catalog && !loggedCostRestoration) {
+          loggedCostRestoration = true
+          logModels.debug('restoring OAuth model costs from models.dev catalog')
+        }
+        if (!zeroCosts && !catalog && !warnedCostCatalogUnavailable) {
+          warnedCostCatalogUnavailable = true
+          logModels.warn(
+            'models.dev catalog unavailable; preserving incoming OAuth model costs',
+          )
+        }
 
         return Object.fromEntries(
           Object.entries(provider.models)
@@ -604,7 +619,9 @@ export async function CodexAuthPlugin(
                 ...model,
                 cost: zeroCosts
                   ? { input: 0, output: 0, cache: { read: 0, write: 0 } }
-                  : model.cost,
+                  : (catalog?.[model.api.id] ??
+                    catalog?.[modelID] ??
+                    model.cost),
                 limit: model.id.includes('gpt-5.5')
                   ? {
                       context: 400_000,

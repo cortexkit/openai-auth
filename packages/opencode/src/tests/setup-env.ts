@@ -24,6 +24,7 @@ export const FLOOR_SIDEBAR_STATE_FILE = join(FLOOR_DIR, 'sidebar-state.json')
 export const FLOOR_AUTH_FILE = join(FLOOR_DIR, 'openai-auth.json')
 export const FLOOR_STATE_FILE = join(FLOOR_DIR, 'openai-auth-state.json')
 export const FLOOR_LOG_FILE = join(FLOOR_DIR, 'openai-auth.log')
+export const FLOOR_MODELS_CACHE = join(FLOOR_DIR, 'models.json')
 
 // Set the floor values only if the env is not already set (a parent process
 // or CI may have pre-configured them intentionally).
@@ -38,6 +39,9 @@ if (!process.env.OPENCODE_OPENAI_AUTH_STATE_FILE) {
 }
 if (!process.env.OPENCODE_OPENAI_AUTH_LOG_FILE) {
   process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+}
+if (!process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE) {
+  process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE = FLOOR_MODELS_CACHE
 }
 
 // Belt-and-suspenders: remove the floor temp dir when the test process exits
