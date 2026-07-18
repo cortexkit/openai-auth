@@ -95,6 +95,22 @@ export async function acquireRefreshFileLock(options: {
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
       if (code === 'EEXIST' || code === 'EISDIR') return false
+      if (code === 'ENOENT') {
+        // Reboots can clear runtime temp directories before the next lock acquisition.
+        await mkdir(dirname(lockPath), { recursive: true })
+        try {
+          await writeFile(
+            lockPath,
+            `${JSON.stringify({ ownerId, expiresAt: now() + options.ttlMs })}\n`,
+            { encoding: 'utf8', mode: 0o600, flag: 'wx' },
+          )
+          return true
+        } catch (retryError) {
+          const retryCode = (retryError as NodeJS.ErrnoException).code
+          if (retryCode === 'EEXIST' || retryCode === 'EISDIR') return false
+          throw retryError
+        }
+      }
       throw error
     }
   }
