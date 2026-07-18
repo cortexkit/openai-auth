@@ -6,8 +6,10 @@ export interface RpcClient {
     lastReceivedId: number,
     sessionId?: string,
   ) => Promise<RpcNotification[]>
-  apply: (request: ApplyRequest) => Promise<ApplyResult>
+  apply: (request: ApplyRequest, timeoutMs?: number) => Promise<ApplyResult>
 }
+
+export const DEFAULT_RPC_TIMEOUT_MS = 2_000
 
 async function call<T>(
   dir: string,
@@ -15,12 +17,13 @@ async function call<T>(
   onSelected: ((entry: PortFileEntry | null) => void) | undefined,
   method: string,
   params: Record<string, unknown>,
+  timeoutMs = DEFAULT_RPC_TIMEOUT_MS,
 ): Promise<T | null> {
   const entry = await discoverPortFile(dir, expectedPid)
   onSelected?.(entry)
   if (!entry) return null
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 2_000)
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const res = await fetch(`http://127.0.0.1:${entry.port}/rpc/${method}`, {
       method: 'POST',
@@ -62,7 +65,7 @@ export function createRpcClient(
       )
       return out?.messages ?? []
     },
-    async apply(request) {
+    async apply(request, timeoutMs) {
       const out = await call<ApplyResult>(
         dir,
         expectedPid,
@@ -71,6 +74,7 @@ export function createRpcClient(
         {
           ...request,
         },
+        timeoutMs,
       )
       return out ?? { text: 'apply failed', knobs: {} }
     },

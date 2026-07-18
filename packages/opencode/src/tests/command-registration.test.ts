@@ -68,6 +68,8 @@ describe('command-registration: config hook stays in sync with MODAL_COMMANDS', 
   })
 
   it('registered openai-* command keys exactly equal MODAL_COMMANDS (bidirectional)', async () => {
+    expect(MODAL_COMMANDS).toContain('openai-reset')
+
     const hooks = await CodexAuthPlugin(createMockPluginInput(), {
       experimentalWebSockets: false,
     })

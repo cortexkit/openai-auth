@@ -86,6 +86,7 @@ export interface OAuthQuotaSnapshot {
   primary?: AccountQuotaWindow
   secondary?: AccountQuotaWindow
   resetCreditsAvailable?: number
+  resetCreditsApplicable?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +174,29 @@ export type KillswitchConfig = {
   accounts?: Record<string, KillswitchThresholds>
 }
 
+export interface ResetInFlight {
+  redeemRequestId: string
+  creditId: string
+  startedAt: number
+}
+
+export interface ResetLastOutcome {
+  code: string
+  at: number
+  previousOutcome?: {
+    code: string
+    at: number
+  }
+}
+
+export interface ResetAccountState {
+  inFlight?: ResetInFlight | Record<string, unknown>
+  lastOutcome?: ResetLastOutcome
+  cooldownUntil?: number
+}
+
+export type ResetStateByAccount = Record<string, ResetAccountState>
+
 export type AccountStorage = {
   version: 1
   main?: {
@@ -207,6 +231,7 @@ export type AccountStorage = {
     mainQuotaToken?: string
     mainLastQuotaApiError?: AccountOperationError
   }
+  reset?: ResetStateByAccount
   dump?: {
     enabled?: boolean
   }
@@ -325,6 +350,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value)
 }
 
+const UNSAFE_RESET_ACCOUNT_KEYS = new Set([
+  '__proto__',
+  'constructor',
+  'prototype',
+])
+
+export function isSafeResetAccountKey(accountKey: string): boolean {
+  return accountKey.length > 0 && !UNSAFE_RESET_ACCOUNT_KEYS.has(accountKey)
+}
+
 function isAccountRemovedDuringRefreshError(
   error: unknown,
 ): error is AccountRemovedDuringRefreshError {
@@ -402,12 +437,14 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
     }
   }
 
-  const resetCreditsAvailable =
-    typeof value.resetCreditsAvailable === 'number'
-      ? value.resetCreditsAvailable
-      : Number.NaN
-  if (Number.isFinite(resetCreditsAvailable) && resetCreditsAvailable >= 0) {
-    quota.resetCreditsAvailable = resetCreditsAvailable
+  for (const key of [
+    'resetCreditsAvailable',
+    'resetCreditsApplicable',
+  ] as const) {
+    const credits = typeof value[key] === 'number' ? value[key] : Number.NaN
+    if (Number.isFinite(credits) && credits >= 0) {
+      quota[key] = credits
+    }
   }
 
   return Object.keys(quota).length ? quota : undefined
@@ -450,6 +487,54 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
   }
 }
 
+function normalizeResetState(value: unknown): ResetStateByAccount | undefined {
+  if (!isRecord(value)) return undefined
+
+  const normalized = Object.create(null) as ResetStateByAccount
+  for (const [accountId, candidate] of Object.entries(value)) {
+    if (!isSafeResetAccountKey(accountId) || !isRecord(candidate)) continue
+
+    const state: ResetAccountState = {}
+    if (isRecord(candidate.inFlight)) {
+      state.inFlight = { ...candidate.inFlight }
+    }
+    if (
+      isRecord(candidate.lastOutcome) &&
+      typeof candidate.lastOutcome.code === 'string' &&
+      candidate.lastOutcome.code.length > 0 &&
+      typeof candidate.lastOutcome.at === 'number' &&
+      Number.isFinite(candidate.lastOutcome.at)
+    ) {
+      state.lastOutcome = {
+        code: candidate.lastOutcome.code,
+        at: candidate.lastOutcome.at,
+        ...(isRecord(candidate.lastOutcome.previousOutcome) &&
+        typeof candidate.lastOutcome.previousOutcome.code === 'string' &&
+        candidate.lastOutcome.previousOutcome.code.length > 0 &&
+        typeof candidate.lastOutcome.previousOutcome.at === 'number' &&
+        Number.isFinite(candidate.lastOutcome.previousOutcome.at)
+          ? {
+              previousOutcome: {
+                code: candidate.lastOutcome.previousOutcome.code,
+                at: candidate.lastOutcome.previousOutcome.at,
+              },
+            }
+          : {}),
+      }
+    }
+    if (
+      typeof candidate.cooldownUntil === 'number' &&
+      Number.isFinite(candidate.cooldownUntil)
+    ) {
+      state.cooldownUntil = candidate.cooldownUntil
+    }
+
+    if (Object.keys(state).length > 0) normalized[accountId] = state
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined
+}
+
 function normalizeStorage(value: unknown): AccountStorage | null {
   if (!isRecord(value) || !Array.isArray(value.accounts)) return null
   return {
@@ -461,6 +546,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
       : undefined,
     refresh: isRecord(value.refresh) ? value.refresh : undefined,
     quota: isRecord(value.quota) ? value.quota : undefined,
+    reset: normalizeResetState(value.reset),
     dump: isRecord(value.dump) ? value.dump : undefined,
     costZeroing: isRecord(value.costZeroing) ? value.costZeroing : undefined,
     killswitch: isRecord(value.killswitch) ? value.killswitch : undefined,
@@ -755,6 +841,7 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     fallbackOn: storage.fallbackOn,
     refresh,
     quota,
+    reset: storage.reset,
     dump: storage.dump,
     costZeroing: storage.costZeroing,
     killswitch: storage.killswitch,

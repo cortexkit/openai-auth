@@ -255,6 +255,7 @@ describe('accounts store', () => {
           windowMinutes: 10_080,
         },
         resetCreditsAvailable: 4,
+        resetCreditsApplicable: 3,
       },
     })
 
@@ -271,6 +272,7 @@ describe('accounts store', () => {
     const quota = (loaded?.accounts[0] as OAuthAccount | undefined)?.quota
     expect(quota?.primary?.windowMinutes).toBe(10_080)
     expect(quota?.resetCreditsAvailable).toBe(4)
+    expect(quota?.resetCreditsApplicable).toBe(3)
   })
 
   it('loads an older quota snapshot without dynamic metadata', async () => {
@@ -298,6 +300,185 @@ describe('accounts store', () => {
     const quota = (loaded?.accounts[0] as OAuthAccount | undefined)?.quota
     expect(quota?.primary?.windowMinutes).toBeUndefined()
     expect(quota?.resetCreditsAvailable).toBeUndefined()
+  })
+
+  it('drops missing and malformed reset state while retaining storage version', async () => {
+    const { loadAccounts } = await import('../core/accounts.ts')
+
+    for (const reset of [undefined, null, [], 'invalid']) {
+      const config: Record<string, unknown> = { version: 1, accounts: [] }
+      if (reset !== undefined) config.reset = reset
+      writeFileSync(cfgPath, `${JSON.stringify(config)}\n`)
+
+      const loaded = await loadAccounts(cfgPath)
+      expect(loaded?.version).toBe(1)
+      expect(loaded?.reset).toBeUndefined()
+    }
+  })
+
+  it('normalizes reset state per account without discarding valid siblings', async () => {
+    const { loadAccounts } = await import('../core/accounts.ts')
+    writeFileSync(
+      cfgPath,
+      `${JSON.stringify({
+        version: 1,
+        accounts: [],
+        reset: {
+          main: {
+            inFlight: {
+              redeemRequestId: 'redeem-main',
+              creditId: 'credit-main',
+              startedAt: 100,
+            },
+            lastOutcome: { code: 'completed', at: 200 },
+            cooldownUntil: 300,
+          },
+          'fallback-a': {
+            inFlight: { redeemRequestId: 'partial', startedAt: 400 },
+            lastOutcome: { code: 'failed', at: 500 },
+            cooldownUntil: 'later',
+          },
+          'fallback-b': {
+            inFlight: { creditId: 'credit-b', startedAt: 600 },
+            cooldownUntil: 700,
+          },
+          'fallback-c': {
+            inFlight: {
+              redeemRequestId: 'redeem-c',
+              creditId: 'credit-c',
+              startedAt: 'now',
+            },
+            lastOutcome: { code: 'failed', at: 800 },
+          },
+          garbage: 'invalid',
+          empty: {
+            inFlight: {
+              redeemRequestId: '',
+              creditId: 'credit-empty',
+              startedAt: 600,
+            },
+            lastOutcome: { code: '', at: 700 },
+            cooldownUntil: Number.NaN,
+          },
+          '': {
+            lastOutcome: { code: 'completed', at: 800 },
+          },
+        },
+      })}\n`,
+    )
+
+    const loaded = await loadAccounts(cfgPath)
+    expect(loaded).toMatchObject({
+      version: 1,
+      reset: {
+        main: {
+          inFlight: {
+            redeemRequestId: 'redeem-main',
+            creditId: 'credit-main',
+            startedAt: 100,
+          },
+          lastOutcome: { code: 'completed', at: 200 },
+          cooldownUntil: 300,
+        },
+        'fallback-a': {
+          inFlight: { redeemRequestId: 'partial', startedAt: 400 },
+          lastOutcome: { code: 'failed', at: 500 },
+        },
+        'fallback-b': {
+          inFlight: { creditId: 'credit-b', startedAt: 600 },
+          cooldownUntil: 700,
+        },
+        'fallback-c': {
+          inFlight: {
+            redeemRequestId: 'redeem-c',
+            creditId: 'credit-c',
+            startedAt: 'now',
+          },
+          lastOutcome: { code: 'failed', at: 800 },
+        },
+        empty: {
+          inFlight: {
+            redeemRequestId: '',
+            creditId: 'credit-empty',
+            startedAt: 600,
+          },
+        },
+      },
+    })
+    expect(Object.keys(loaded?.reset ?? {}).sort()).toEqual([
+      'empty',
+      'fallback-a',
+      'fallback-b',
+      'fallback-c',
+      'main',
+    ])
+  })
+
+  it('drops prototype-sensitive reset account keys without polluting lookups', async () => {
+    const { loadAccounts } = await import('../core/accounts.ts')
+    writeFileSync(
+      cfgPath,
+      '{"version":1,"accounts":[],"reset":{"__proto__":{"cooldownUntil":999},"constructor":{"cooldownUntil":999},"prototype":{"cooldownUntil":999},"safe":{"cooldownUntil":123}}}\n',
+    )
+
+    const loaded = await loadAccounts(cfgPath)
+
+    expect(loaded?.reset).toEqual({ safe: { cooldownUntil: 123 } })
+    expect(
+      Object.getOwnPropertyDescriptor(loaded?.reset ?? {}, '__proto__'),
+    ).toBeUndefined()
+    expect(Object.getPrototypeOf(loaded?.reset ?? {})).toBeNull()
+    expect(loaded?.reset?.constructor).toBeUndefined()
+    expect(({} as Record<string, unknown>).cooldownUntil).toBeUndefined()
+  })
+
+  it('mutateAccounts persists independent reset states and unknown config keys', async () => {
+    const { loadAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    writeFileSync(
+      cfgPath,
+      `${JSON.stringify({
+        version: 1,
+        accounts: [],
+        futureConfig: { retained: true },
+      })}\n`,
+    )
+
+    await mutateAccounts((current) => {
+      current.reset = {
+        main: {
+          inFlight: {
+            redeemRequestId: 'redeem-main',
+            creditId: 'credit-main',
+            startedAt: 100,
+          },
+          cooldownUntil: 200,
+        },
+        'fallback-a': {
+          lastOutcome: { code: 'completed', at: 300 },
+          cooldownUntil: 400,
+        },
+      }
+      return current
+    }, cfgPath)
+
+    const loaded = await loadAccounts(cfgPath)
+    expect(loaded?.reset).toEqual({
+      main: {
+        inFlight: {
+          redeemRequestId: 'redeem-main',
+          creditId: 'credit-main',
+          startedAt: 100,
+        },
+        cooldownUntil: 200,
+      },
+      'fallback-a': {
+        lastOutcome: { code: 'completed', at: 300 },
+        cooldownUntil: 400,
+      },
+    })
+    expect(JSON.parse(readFileSync(cfgPath, 'utf8')).futureConfig).toEqual({
+      retained: true,
+    })
   })
 
   it('saveAccounts waits for the file lock and merges with the latest on-disk accounts', async () => {

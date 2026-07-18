@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CommandContext } from '../commands'
 // Static import for tests that don't need mocking.
-import { buildDialogPayload } from '../commands'
+import { buildDialogPayload, renderResetCoordinatorResult } from '../commands'
 // Snapshot the REAL oauth module exports at load time (before any mock.module
 // runs). bun's mock.module leaks process-wide and mock.restore() does NOT undo
 // it, so without restoring here the beginAccountLogin stub below would poison
@@ -24,9 +24,20 @@ import * as oauthLiveNamespace from '../core/oauth'
 
 const oauthRealExports = { ...oauthLiveNamespace }
 
-import type { AccountQuotaWindow, OAuthQuotaSnapshot } from '../core/accounts'
-import { loadAccounts, type OAuthAccount, saveAccounts } from '../core/accounts'
+import type {
+  AccountQuotaWindow,
+  AccountStorage,
+  OAuthQuotaSnapshot,
+} from '../core/accounts'
+import {
+  loadAccounts,
+  mutateAccounts,
+  type OAuthAccount,
+  saveAccounts,
+} from '../core/accounts'
 import { QuotaManager } from '../core/quota-manager'
+import { runResetCreditRedemption } from '../core/reset-credits'
+import { buildResetRedemptionDeps, createResetTargetResolver } from '../index'
 import { createLogger, flushForTest, setLogLevel } from '../logger'
 import { resetNotificationsForTest } from '../rpc/notifications'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
@@ -46,12 +57,222 @@ function makeAccount(
   } as OAuthAccount
 }
 
+// Unsigned JWT carrying a single claim — parseJwtClaims only base64url-decodes
+// the payload segment and never verifies the signature.
+function jwtWithAccountId(accountId: string): string {
+  const payload = Buffer.from(
+    JSON.stringify({ chatgpt_account_id: accountId }),
+  ).toString('base64url')
+  return `test-header.${payload}.test-signature`
+}
+
 function makeClient(): CommandContext['client'] {
   return {
     auth: {
       set: mock(async () => {}),
     },
   } as unknown as CommandContext['client']
+}
+
+function fetchStub(
+  implementation: (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ) => Promise<Response>,
+): typeof globalThis.fetch {
+  return Object.assign(implementation, {
+    preconnect: (
+      ..._args: Parameters<typeof globalThis.fetch.preconnect>
+    ) => {},
+  })
+}
+
+type ResetWireFixture = {
+  usedPercent: Record<string, number>
+  applicableCount: Record<string, number>
+  availableCount: Record<string, number>
+  outcome: 'reset' | 'already_redeemed' | 'nothing_to_reset' | 'no_credit'
+  postStatus?: number
+  throwOnPost?: boolean
+  freshAfterPost?: boolean
+  applicableAfterPost?: number
+  calls: Array<{ method: string; accountId: string; url: string }>
+  targetRefreshes: string[]
+  sidebarRefreshes: number
+}
+
+function resetFixture(
+  overrides: Partial<ResetWireFixture> = {},
+): ResetWireFixture {
+  return {
+    usedPercent: {
+      'chatgpt-main': 100,
+      'chatgpt-fallback-a': 100,
+    },
+    applicableCount: {
+      'chatgpt-main': 2,
+      'chatgpt-fallback-a': 2,
+    },
+    availableCount: {
+      'chatgpt-main': 2,
+      'chatgpt-fallback-a': 2,
+    },
+    outcome: 'reset',
+    calls: [],
+    targetRefreshes: [],
+    sidebarRefreshes: 0,
+    ...overrides,
+  }
+}
+
+function resetCreditResponse(
+  accountId: string,
+  fixture: ResetWireFixture,
+): Response {
+  const count = fixture.applicableCount[accountId] ?? 0
+  const credits = Array.from({ length: count }, (_, index) => ({
+    id: `credit-${accountId}-${index + 1}`,
+    status: 'available',
+    expires_at: `2026-08-${String(index + 1).padStart(2, '0')}T00:00:00.000Z`,
+    reset_type: 'codex_rate_limits',
+    is_supported_by_plan: true,
+  }))
+  return Response.json({
+    credits,
+    available_count: fixture.availableCount[accountId] ?? count,
+  })
+}
+
+function makeResetWire(fixture: ResetWireFixture): typeof globalThis.fetch {
+  return fetchStub(async (input, init) => {
+    const url = input.toString()
+    const method = init?.method ?? 'GET'
+    const headers = new Headers(init?.headers)
+    const accountId = headers.get('chatgpt-account-id') || 'chatgpt-main'
+    fixture.calls.push({ method, accountId, url })
+    if (method === 'POST') {
+      if (fixture.throwOnPost) throw new Error('connection lost')
+      if (fixture.postStatus) {
+        return Response.json(
+          { error: 'upstream failed' },
+          { status: fixture.postStatus },
+        )
+      }
+      if (fixture.freshAfterPost) fixture.usedPercent[accountId] = 0
+      if (fixture.applicableAfterPost !== undefined) {
+        fixture.applicableCount[accountId] = fixture.applicableAfterPost
+        fixture.availableCount[accountId] = fixture.applicableAfterPost
+      }
+      return Response.json({ code: fixture.outcome })
+    }
+    if (url.endsWith('/wham/usage')) {
+      return Response.json({
+        rate_limit: {
+          primary_window: {
+            used_percent: fixture.usedPercent[accountId] ?? 0,
+            limit_window_seconds: 18_000,
+            reset_at: '2026-07-18T00:00:00.000Z',
+          },
+        },
+        rate_limit_reset_credits: {
+          available_count: fixture.availableCount[accountId] ?? 0,
+          applicable_available_count: fixture.applicableCount[accountId] ?? 0,
+        },
+      })
+    }
+    return resetCreditResponse(accountId, fixture)
+  })
+}
+
+function resetQuotaSnapshot(
+  usedPercent: number,
+  availableCount: number,
+  applicableCount: number,
+): OAuthQuotaSnapshot {
+  return {
+    primary: {
+      usedPercent,
+      remainingPercent: 100 - usedPercent,
+      checkedAt: Date.parse('2026-07-17T12:00:00.000Z'),
+    },
+    resetCreditsAvailable: availableCount,
+    resetCreditsApplicable: applicableCount,
+  }
+}
+
+async function makeResetCommandHarness(
+  configPath: string,
+  now: number,
+  fixture: ResetWireFixture,
+) {
+  const quotaManager = new QuotaManager({
+    storage: (await loadAccounts(configPath)) ?? { version: 1, accounts: [] },
+    now: () => now,
+  })
+  const resolveResetTarget = createResetTargetResolver({
+    getAuth: async () => ({
+      type: 'oauth',
+      access: 'main-token',
+      refresh: 'main-refresh',
+      expires: now + 6 * 60 * 60_000,
+    }),
+    refreshMainWithLease: async () => ({
+      access: 'refreshed-main-token',
+      refresh: 'main-refresh',
+      expires: now + 6 * 60 * 60_000,
+    }),
+    refreshFallbackAccount: async (account) => account,
+    loadAccounts,
+    accountStoragePath: configPath,
+    now: () => now,
+  })
+  const ctx: CommandContext = {
+    accountStoragePath: configPath,
+    quotaManager,
+    loadAccounts,
+    client: makeClient(),
+    resolveResetTarget,
+    fetchImpl: makeResetWire(fixture),
+    now: () => now,
+    randomUUID: () => 'reset-request-id',
+    refreshResetTargetQuota: async (accountKey) => {
+      fixture.sidebarRefreshes += 1
+      fixture.targetRefreshes.push(accountKey)
+      const storage = await loadAccounts(configPath)
+      const fallback = storage?.accounts.find(
+        (account) => account.id === accountKey && account.type === 'oauth',
+      ) as OAuthAccount | undefined
+      const accountId =
+        accountKey === 'main' ? 'chatgpt-main' : fallback?.accountId
+      const quota = resetQuotaSnapshot(
+        fixture.usedPercent[accountId ?? ''] ?? 0,
+        fixture.availableCount[accountId ?? ''] ?? 0,
+        fixture.applicableCount[accountId ?? ''] ?? 0,
+      )
+      if (quota.primary) {
+        quota.primary = {
+          ...quota.primary,
+          resetsAt: '2026-07-18T00:00:00.000Z',
+        }
+      }
+      if (accountKey === 'main') {
+        quotaManager.setMain('main-token', {
+          quota,
+          checkedAt: now,
+          refreshAfter: now + 300_000,
+        })
+      } else {
+        quotaManager.setFallback(
+          accountKey,
+          { quota, checkedAt: now, refreshAfter: now + 300_000 },
+          fallback?.access,
+        )
+      }
+      return { account: accountKey, ok: true }
+    },
+    refreshSidebar: async () => {},
+  }
+  return { ctx, quotaManager }
 }
 
 describe('commands', () => {
@@ -915,6 +1136,1268 @@ describe('commands', () => {
 
     // No ⚠ lines (no refresh happened)
     expect(payload.text).not.toContain('⚠')
+  })
+
+  test('reset coordinator uses the freshly resolved identity for main and the selected fallback only', async () => {
+    const now = Date.parse('2026-07-17T12:00:00.000Z')
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        mainAccountId: 'chatgpt-main',
+        accounts: [
+          makeAccount('fallback-a', {
+            access: 'fresh-fallback-a-token',
+            accountId: 'chatgpt-fallback-a',
+            expires: now + 5 * 60 * 60_000,
+          }),
+          makeAccount('fallback-b', {
+            access: 'fresh-fallback-b-token',
+            accountId: 'chatgpt-fallback-b',
+            expires: now + 5 * 60 * 60_000,
+          }),
+        ],
+      },
+      configPath,
+    )
+
+    const refreshMainWithLease = mock(async () => ({
+      access: 'unexpected-refreshed-main-token',
+      refresh: 'fresh-main-refresh',
+      expires: now + 6 * 60 * 60_000,
+    }))
+    const refreshFallbackAccount = mock(
+      async (account: OAuthAccount) => account,
+    )
+    const resolveTarget = createResetTargetResolver({
+      getAuth: async () => ({
+        type: 'oauth',
+        access: 'fresh-main-token',
+        refresh: 'fresh-main-refresh',
+        expires: now + 5 * 60 * 60_000,
+      }),
+      refreshMainWithLease,
+      refreshFallbackAccount,
+      loadAccounts,
+      accountStoragePath: configPath,
+      now: () => now,
+    })
+
+    const requests: Array<{
+      method: string
+      headers: Record<string, string>
+    }> = []
+    const fetchImpl = fetchStub(async (_input, init) => {
+      const method = init?.method ?? 'GET'
+      requests.push({
+        method,
+        headers: Object.fromEntries(new Headers(init?.headers).entries()),
+      })
+      if (method === 'POST') return Response.json({ code: 'reset' })
+      return Response.json({
+        credits: [
+          {
+            id: 'credit-1',
+            status: 'available',
+            expires_at: '2026-08-01T00:00:00.000Z',
+            reset_type: 'codex_rate_limits',
+            is_supported_by_plan: true,
+          },
+        ],
+        available_count: 1,
+      })
+    })
+    const deps = {
+      configPath,
+      mutateAccountsFn: mutateAccounts,
+      loadAccountsFn: loadAccounts,
+      now: () => now,
+      randomUUID: () => 'reset-request-id',
+      fetchImpl,
+      resolveTarget,
+      fetchUsage: async () => ({
+        primary: {
+          usedPercent: 100,
+          remainingPercent: 0,
+          checkedAt: now,
+        },
+        resetCreditsApplicable: 1,
+      }),
+      hasActiveRateLimitMark: () => false,
+    }
+
+    await expect(
+      runResetCreditRedemption(deps, {
+        accountKey: 'main',
+        expectedChatgptAccountId: 'stale-chatgpt-main',
+        retry: false,
+      }),
+    ).rejects.toMatchObject({ kind: 'identity_mismatch' })
+    expect(requests).toHaveLength(0)
+
+    await runResetCreditRedemption(deps, {
+      accountKey: 'main',
+      expectedChatgptAccountId: 'chatgpt-main',
+      retry: false,
+    })
+    await runResetCreditRedemption(deps, {
+      accountKey: 'fallback-a',
+      expectedChatgptAccountId: 'chatgpt-fallback-a',
+      retry: false,
+    })
+
+    const consumeRequests = requests.filter(
+      (request) => request.method === 'POST',
+    )
+    expect(consumeRequests).toHaveLength(2)
+    const [mainConsume, fallbackConsume] = consumeRequests
+    expect(mainConsume?.headers.authorization).toBe('Bearer fresh-main-token')
+    expect(mainConsume?.headers['chatgpt-account-id']).toBeUndefined()
+    expect(fallbackConsume?.headers.authorization).toBe(
+      'Bearer fresh-fallback-a-token',
+    )
+    expect(fallbackConsume?.headers['chatgpt-account-id']).toBe(
+      'chatgpt-fallback-a',
+    )
+    expect(Object.values(fallbackConsume?.headers ?? {})).not.toContain(
+      'Bearer fresh-fallback-b-token',
+    )
+    expect(Object.values(fallbackConsume?.headers ?? {})).not.toContain(
+      'chatgpt-fallback-b',
+    )
+    expect(refreshMainWithLease).toHaveBeenCalledTimes(0)
+    expect(refreshFallbackAccount).toHaveBeenCalledTimes(0)
+  })
+
+  test('production reset redemption dependencies generate a UUID', () => {
+    const deps = buildResetRedemptionDeps()
+
+    expect(deps.randomUUID()).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    )
+  })
+
+  test('opening reset modal reuses all tokens outside the refresh horizon', async () => {
+    const now = Date.parse('2026-07-17T12:00:00.000Z')
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [
+          makeAccount('fallback-a', {
+            expires: now + 5 * 60 * 60_000,
+            accountId: 'chatgpt-fallback-a',
+          }),
+          makeAccount('fallback-b', {
+            expires: now + 6 * 60 * 60_000,
+            accountId: 'chatgpt-fallback-b',
+          }),
+        ],
+      },
+      configPath,
+    )
+    const refreshMainWithLease = mock(async () => ({
+      access: 'refreshed-main',
+      refresh: 'refresh-main',
+      expires: now + 6 * 60 * 60_000,
+    }))
+    const refreshFallbackAccount = mock(
+      async (account: OAuthAccount) => account,
+    )
+    const resolveResetTarget = createResetTargetResolver({
+      getAuth: async () => ({
+        type: 'oauth',
+        access: 'main-token',
+        refresh: 'main-refresh',
+        expires: now + 5 * 60 * 60_000,
+      }),
+      refreshMainWithLease,
+      refreshFallbackAccount,
+      loadAccounts,
+      accountStoragePath: configPath,
+      now: () => now,
+    })
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+      resolveResetTarget,
+      fetchImpl: fetchStub(async () => Response.json({})),
+      now: () => now,
+      randomUUID: () => 'uuid',
+      refreshResetTargetQuota: async (accountKey) => ({
+        account: accountKey,
+        ok: true,
+      }),
+    }
+
+    const payload = await buildDialogPayload('openai-reset', '', ctx)
+
+    expect(payload.command).toBe('openai-reset')
+    expect(payload.knobs.accounts).toHaveLength(3)
+    expect(refreshMainWithLease).toHaveBeenCalledTimes(0)
+    expect(refreshFallbackAccount).toHaveBeenCalledTimes(0)
+  })
+
+  test('reset command reports unavailable when runtime dependencies are not wired', async () => {
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+    }
+
+    const payload = await buildDialogPayload('openai-reset', '', ctx)
+
+    expect(payload.command).toBe('openai-reset')
+    expect(payload.text).toContain('Unavailable')
+    expect(payload.knobs).toEqual({})
+  })
+
+  test('reset identity resolver returns tagged displayable target errors', async () => {
+    const now = Date.parse('2026-07-17T12:00:00.000Z')
+    const resolver = () =>
+      createResetTargetResolver({
+        getAuth: async () => ({
+          type: 'oauth',
+          access: 'main-token',
+          refresh: 'main-refresh',
+          expires: now + 5 * 60 * 60_000,
+        }),
+        refreshMainWithLease: async () => ({
+          access: 'main-token',
+          refresh: 'main-refresh',
+          expires: now + 5 * 60 * 60_000,
+        }),
+        refreshFallbackAccount: async (account) => account,
+        loadAccounts,
+        accountStoragePath: configPath,
+        now: () => now,
+      })
+
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      },
+      configPath,
+    )
+    await expect(resolver()('missing')).rejects.toMatchObject({
+      code: 'unknown_account',
+      message: expect.stringContaining('not found'),
+    })
+
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [makeAccount('disabled', { enabled: false })],
+      },
+      configPath,
+    )
+    await expect(resolver()('disabled')).rejects.toMatchObject({
+      code: 'disabled_account',
+      message: expect.stringContaining('disabled'),
+    })
+
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [
+          {
+            id: 'api-account',
+            type: 'api',
+            baseURL: 'https://api.openai.com/v1',
+          },
+        ],
+      },
+      configPath,
+    )
+    await expect(resolver()('api-account')).rejects.toMatchObject({
+      code: 'non_oauth_account',
+      message: expect.stringContaining('not an OAuth account'),
+    })
+
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [makeAccount('tokenless', { access: '', expires: 0 })],
+      },
+      configPath,
+    )
+    await expect(resolver()('tokenless')).rejects.toMatchObject({
+      code: 'token_unavailable',
+      message: expect.stringContaining('no usable access token'),
+    })
+  })
+
+  test('reset identity resolver derives the main account id from the live access token JWT', async () => {
+    const now = Date.parse('2026-07-17T12:00:00.000Z')
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        mainAccountId: 'old-account',
+        accounts: [],
+      },
+      configPath,
+    )
+    const resolveTarget = createResetTargetResolver({
+      getAuth: async () => ({
+        type: 'oauth',
+        access: jwtWithAccountId('new-account'),
+        refresh: 'main-refresh',
+        expires: now + 5 * 60 * 60_000,
+      }),
+      refreshMainWithLease: async () => ({
+        access: 'unused-main-token',
+        refresh: 'unused-main-refresh',
+        expires: now + 6 * 60 * 60_000,
+      }),
+      refreshFallbackAccount: async (account) => account,
+      loadAccounts,
+      accountStoragePath: configPath,
+      now: () => now,
+    })
+
+    const target = await resolveTarget('main')
+    expect(target.chatgptAccountId).toBe('new-account')
+  })
+
+  test('reset identity resolver falls back to persisted main account id when the token carries no claims', async () => {
+    const now = Date.parse('2026-07-17T12:00:00.000Z')
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        mainAccountId: 'old-account',
+        accounts: [],
+      },
+      configPath,
+    )
+    const resolveTarget = createResetTargetResolver({
+      getAuth: async () => ({
+        type: 'oauth',
+        access: 'opaque-token-without-jwt-shape',
+        refresh: 'main-refresh',
+        expires: now + 5 * 60 * 60_000,
+      }),
+      refreshMainWithLease: async () => ({
+        access: 'unused-main-token',
+        refresh: 'unused-main-refresh',
+        expires: now + 6 * 60 * 60_000,
+      }),
+      refreshFallbackAccount: async (account) => account,
+      loadAccounts,
+      accountStoragePath: configPath,
+      now: () => now,
+    })
+
+    const target = await resolveTarget('main')
+    expect(target.chatgptAccountId).toBe('old-account')
+  })
+
+  for (const mutation of ['removed', 'disabled'] as const) {
+    test(`reset identity resolver rejects a fallback ${mutation} before its fresh snapshot`, async () => {
+      const now = Date.parse('2026-07-17T12:00:00.000Z')
+      const account = makeAccount('fallback-a', {
+        accountId: 'chatgpt-fallback-a',
+        expires: now + 60_000,
+      })
+      const initial: AccountStorage = { version: 1, accounts: [account] }
+      const fresh: AccountStorage = {
+        version: 1,
+        accounts:
+          mutation === 'removed' ? [] : [{ ...account, enabled: false }],
+      }
+      let loadCount = 0
+      const loadAccountsFn: typeof loadAccounts = async () => {
+        loadCount += 1
+        return loadCount === 1 ? initial : fresh
+      }
+      const refreshFallbackAccount = mock(async (candidate: OAuthAccount) => ({
+        ...candidate,
+        access: 'refreshed-fallback-token',
+        expires: now + 6 * 60 * 60_000,
+      }))
+      const resolveTarget = createResetTargetResolver({
+        getAuth: async () => ({ type: 'oauth' }),
+        refreshMainWithLease: async () => ({
+          access: 'unused-main-token',
+          refresh: 'unused-main-refresh',
+          expires: now + 6 * 60 * 60_000,
+        }),
+        refreshFallbackAccount,
+        loadAccounts: loadAccountsFn,
+        accountStoragePath: configPath,
+        now: () => now,
+      })
+
+      await expect(resolveTarget('fallback-a')).rejects.toMatchObject({
+        code: mutation === 'removed' ? 'unknown_account' : 'disabled_account',
+      })
+      expect(loadCount).toBe(2)
+      expect(refreshFallbackAccount).toHaveBeenCalledTimes(1)
+    })
+  }
+
+  for (const tokenCase of ['missing', 'expired', 'near-expiry'] as const) {
+    test(`reset identity resolver refreshes only its ${tokenCase} target exactly once`, async () => {
+      const now = Date.parse('2026-07-17T12:00:00.000Z')
+      const access = tokenCase === 'missing' ? '' : 'stale-token'
+      const expires =
+        tokenCase === 'expired'
+          ? now - 1
+          : tokenCase === 'near-expiry'
+            ? now + 60_000
+            : now + 5 * 60 * 60_000
+      await saveAccounts(
+        {
+          version: 1,
+          main: { type: 'opencode', provider: 'openai' },
+          accounts: [
+            makeAccount('fallback-a', {
+              access,
+              expires,
+              accountId: 'chatgpt-fallback-a',
+            }),
+          ],
+        },
+        configPath,
+      )
+      const refreshMainWithLease = mock(async () => ({
+        access: 'refreshed-main-token',
+        refresh: 'refreshed-main-refresh',
+        expires: now + 6 * 60 * 60_000,
+      }))
+      const refreshFallbackAccount = mock(async (account: OAuthAccount) => ({
+        ...account,
+        access: 'refreshed-fallback-token',
+        expires: now + 6 * 60 * 60_000,
+      }))
+      const resolveTarget = createResetTargetResolver({
+        getAuth: async () => ({
+          type: 'oauth',
+          access,
+          refresh: 'main-refresh',
+          expires,
+        }),
+        refreshMainWithLease,
+        refreshFallbackAccount,
+        loadAccounts,
+        accountStoragePath: configPath,
+        now: () => now,
+      })
+
+      await resolveTarget('main')
+      expect(refreshMainWithLease).toHaveBeenCalledTimes(1)
+      expect(refreshFallbackAccount).toHaveBeenCalledTimes(0)
+
+      await resolveTarget('fallback-a')
+      expect(refreshMainWithLease).toHaveBeenCalledTimes(1)
+      expect(refreshFallbackAccount).toHaveBeenCalledTimes(1)
+    })
+  }
+
+  describe('reset command safety flow', () => {
+    const now = Date.parse('2026-07-17T12:00:00.000Z')
+
+    async function saveResetAccounts(
+      accounts: OAuthAccount[] = [
+        makeAccount('fallback-a', {
+          accountId: 'chatgpt-fallback-a',
+          expires: now + 6 * 60 * 60_000,
+        }),
+      ],
+    ) {
+      await saveAccounts(
+        {
+          version: 1,
+          main: { type: 'opencode', provider: 'openai' },
+          mainAccountId: 'chatgpt-main',
+          accounts,
+        },
+        configPath,
+      )
+    }
+
+    test('empty args builds visible account rows with advisory quota and exact credit data', async () => {
+      await saveResetAccounts([
+        makeAccount('fallback-a', {
+          label: 'Fallback A',
+          accountId: 'chatgpt-fallback-a',
+          expires: now + 6 * 60 * 60_000,
+        }),
+        makeAccount('healthy', {
+          accountId: 'chatgpt-healthy',
+          expires: now + 6 * 60 * 60_000,
+        }),
+        makeAccount('no-credits', {
+          accountId: 'chatgpt-no-credits',
+          expires: now + 6 * 60 * 60_000,
+        }),
+        makeAccount('disabled', {
+          accountId: 'chatgpt-disabled',
+          enabled: false,
+        }),
+      ])
+      const fixture = resetFixture({
+        usedPercent: {
+          'chatgpt-main': 100,
+          'chatgpt-fallback-a': 100,
+          'chatgpt-healthy': 42,
+          'chatgpt-no-credits': 100,
+        },
+        applicableCount: {
+          'chatgpt-main': 2,
+          'chatgpt-fallback-a': 3,
+          'chatgpt-healthy': 1,
+          'chatgpt-no-credits': 0,
+        },
+        availableCount: {
+          'chatgpt-main': 4,
+          'chatgpt-fallback-a': 5,
+          'chatgpt-healthy': 1,
+          'chatgpt-no-credits': 2,
+        },
+      })
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+
+      const payload = await buildDialogPayload('openai-reset', '', ctx)
+      const rows = payload.knobs.accounts as Array<Record<string, unknown>>
+
+      expect(payload.knobs.stage).toBe('accounts')
+      expect(rows.map((row) => row.accountKey)).toEqual([
+        'main',
+        'fallback-a',
+        'healthy',
+        'no-credits',
+      ])
+      expect(rows[1]).toMatchObject({
+        accountKey: 'fallback-a',
+        label: 'Fallback A',
+        usedPercent: 100,
+        availableCount: 5,
+        applicableAvailableCount: 3,
+        eligible: true,
+        selectedCreditId: 'credit-chatgpt-fallback-a-1',
+        selectedCreditExpiresAt: '2026-08-01T00:00:00.000Z',
+      })
+      expect(rows.find((row) => row.accountKey === 'healthy')).toMatchObject({
+        eligible: false,
+        reason: 'not exhausted',
+      })
+      expect(rows.find((row) => row.accountKey === 'no-credits')).toMatchObject(
+        {
+          eligible: false,
+          reason: 'no applicable credits',
+        },
+      )
+      expect(payload.text).toContain('not exhausted')
+      expect(payload.text).toContain('no applicable credits')
+    })
+
+    test('exhausted main preview is eligible when usage reports three applicable credits', async () => {
+      await saveResetAccounts([])
+      const fixture = resetFixture({
+        usedPercent: { 'chatgpt-main': 100 },
+        applicableCount: { 'chatgpt-main': 3 },
+        availableCount: { 'chatgpt-main': 3 },
+      })
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+
+      const payload = await buildDialogPayload('openai-reset', '', ctx)
+      const rows = payload.knobs.accounts as Array<Record<string, unknown>>
+
+      expect(rows).toContainEqual(
+        expect.objectContaining({
+          accountKey: 'main',
+          availableCount: 3,
+          applicableAvailableCount: 3,
+          eligible: true,
+        }),
+      )
+    })
+
+    test('account preview keeps per-account failures visible and requires a stable identity for action', async () => {
+      await saveResetAccounts([
+        makeAccount('broken', {
+          accountId: 'chatgpt-broken',
+          expires: now + 6 * 60 * 60_000,
+        }),
+        makeAccount('missing-identity', {
+          accountId: undefined,
+          expires: now + 6 * 60 * 60_000,
+        }),
+      ])
+      const fixture = resetFixture()
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+      const resolveTarget = ctx.resolveResetTarget
+      if (!resolveTarget) throw new Error('reset target resolver is not wired')
+      ctx.resolveResetTarget = async (accountKey) => {
+        if (accountKey === 'broken')
+          throw new Error('quota endpoint unavailable')
+        return resolveTarget(accountKey)
+      }
+
+      const payload = await buildDialogPayload('openai-reset', '', ctx)
+      const rows = payload.knobs.accounts as Array<Record<string, unknown>>
+
+      expect(rows.find((row) => row.accountKey === 'broken')).toMatchObject({
+        eligible: false,
+        reason: 'quota endpoint unavailable',
+      })
+      expect(
+        rows.find((row) => row.accountKey === 'missing-identity'),
+      ).toMatchObject({
+        eligible: false,
+        reason: 'stable ChatGPT account identity unavailable',
+      })
+      expect(payload.text).toContain('quota endpoint unavailable')
+      expect(payload.text).toContain(
+        'stable ChatGPT account identity unavailable',
+      )
+    })
+
+    test('select decodes the account key and returns a fresh token-free confirmation preview', async () => {
+      const accountKey = 'fallback/a b'
+      const accountId = 'chatgpt/fallback a'
+      await saveResetAccounts([
+        makeAccount(accountKey, {
+          label: 'Encoded fallback',
+          accountId,
+          expires: now + 6 * 60 * 60_000,
+        }),
+      ])
+      const fixture = resetFixture({
+        usedPercent: { [accountId]: 100 },
+        applicableCount: { [accountId]: 2 },
+        availableCount: { [accountId]: 4 },
+      })
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+
+      const payload = await buildDialogPayload(
+        'openai-reset',
+        `select ${encodeURIComponent(accountKey)}`,
+        ctx,
+      )
+
+      expect(payload.knobs.stage).toBe('confirm')
+      expect(payload.knobs.preview).toMatchObject({
+        accountKey,
+        chatgptAccountId: accountId,
+      })
+      expect(payload.text).toContain('Encoded fallback')
+      expect(payload.text).toContain('100%')
+      expect(payload.text).toContain('Spend 1 of 2')
+      expect(payload.text).toContain('2026-08-01T00:00:00.000Z')
+      expect(payload.text).toContain('2026-07-18T00:00:00.000Z')
+      expect(JSON.stringify(payload.knobs)).not.toContain('fallback/a b-token')
+      expect(JSON.stringify(payload.knobs)).not.toContain('access')
+    })
+
+    test('select returns an informational result instead of confirmation for an ineligible account', async () => {
+      await saveResetAccounts()
+      const fixture = resetFixture({
+        usedPercent: { 'chatgpt-fallback-a': 42 },
+        applicableCount: { 'chatgpt-fallback-a': 3 },
+        availableCount: { 'chatgpt-fallback-a': 3 },
+      })
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+
+      const payload = await buildDialogPayload(
+        'openai-reset',
+        'select fallback-a',
+        ctx,
+      )
+
+      expect(payload.knobs).toMatchObject({
+        stage: 'result',
+        code: 'not_eligible',
+        accountKey: 'fallback-a',
+      })
+      expect(payload.knobs).not.toHaveProperty('preview')
+      expect(payload.text).toContain('Cannot reset:')
+      expect(payload.text).toContain('not exhausted')
+    })
+
+    test('select refuses prototype-sensitive decoded account keys before resolution', async () => {
+      await saveResetAccounts()
+      const fixture = resetFixture()
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+      const resolveResetTarget = mock(ctx.resolveResetTarget!)
+      ctx.resolveResetTarget = resolveResetTarget
+
+      const payload = await buildDialogPayload(
+        'openai-reset',
+        `select ${encodeURIComponent('__proto__')}`,
+        ctx,
+      )
+
+      expect(payload.knobs).toMatchObject({
+        stage: 'result',
+        code: 'invalid_command',
+      })
+      expect(payload.text).toContain('Usage:')
+      expect(resolveResetTarget).not.toHaveBeenCalled()
+    })
+
+    test('preview reset time prefers a still-live exhausted window over a stale exhausted window', async () => {
+      await saveResetAccounts()
+      const fixture = resetFixture()
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+      const liveReset = '2026-07-18T00:00:00.000Z'
+      ctx.fetchImpl = fetchStub(async (input) => {
+        if (input.toString().endsWith('/wham/usage')) {
+          return Response.json({
+            rate_limit: {
+              primary_window: {
+                used_percent: 100,
+                reset_at: '2026-07-17T11:00:00.000Z',
+              },
+              secondary_window: {
+                used_percent: 100,
+                reset_at: liveReset,
+              },
+            },
+            rate_limit_reset_credits: {
+              available_count: 2,
+              applicable_available_count: 2,
+            },
+          })
+        }
+        return resetCreditResponse('chatgpt-fallback-a', fixture)
+      })
+
+      const payload = await buildDialogPayload(
+        'openai-reset',
+        'select fallback-a',
+        ctx,
+      )
+
+      expect(payload.knobs.preview).toMatchObject({ resetTime: liveReset })
+    })
+
+    for (const mutation of [
+      'removed fallback',
+      'disabled fallback',
+      'changed fallback account id',
+      'changed main account id',
+    ] as const) {
+      test(`confirm refuses a ${mutation} before list or consume`, async () => {
+        await saveResetAccounts()
+        const fixture = resetFixture()
+        const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+        const accountKey =
+          mutation === 'changed main account id' ? 'main' : 'fallback-a'
+        const expectedId =
+          accountKey === 'main' ? 'chatgpt-main' : 'chatgpt-fallback-a'
+
+        await buildDialogPayload(
+          'openai-reset',
+          `select ${encodeURIComponent(accountKey)}`,
+          ctx,
+        )
+        const callsBeforeConfirm = fixture.calls.length
+        await mutateAccounts((storage) => {
+          if (mutation === 'removed fallback') storage.accounts = []
+          if (mutation === 'disabled fallback') {
+            const first = storage.accounts[0]
+            if (first) first.enabled = false
+          }
+          if (mutation === 'changed fallback account id') {
+            const first = storage.accounts[0]
+            if (first?.type === 'oauth') {
+              first.accountId = 'chatgpt-fallback-replacement'
+            }
+          }
+          if (mutation === 'changed main account id') {
+            storage.mainAccountId = 'chatgpt-main-replacement'
+          }
+          return storage
+        }, configPath)
+
+        const payload = await buildDialogPayload(
+          'openai-reset',
+          `confirm ${encodeURIComponent(accountKey)} ${encodeURIComponent(expectedId)}`,
+          ctx,
+        )
+
+        const expectedCode =
+          mutation === 'removed fallback'
+            ? 'unknown_account'
+            : mutation === 'disabled fallback'
+              ? 'disabled_account'
+              : 'identity_mismatch'
+        expect(payload.knobs).toMatchObject({
+          stage: 'result',
+          code: expectedCode,
+        })
+        expect(payload.text).toContain(
+          expectedCode === 'identity_mismatch'
+            ? 'account identity changed'
+            : 'Account unavailable',
+        )
+        expect(fixture.calls).toHaveLength(callsBeforeConfirm)
+      })
+    }
+
+    for (const { code, expected } of [
+      {
+        code: 'non_oauth_account',
+        expected: 'not authenticated with OAuth',
+      },
+      { code: 'token_unavailable', expected: 'token is unavailable' },
+    ] as const) {
+      test(`confirm renders truthful ${code} copy`, async () => {
+        await saveResetAccounts()
+        const fixture = resetFixture()
+        const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+        ctx.resolveResetTarget = async () => {
+          throw Object.assign(new Error('internal resolver detail'), { code })
+        }
+
+        const payload = await buildDialogPayload(
+          'openai-reset',
+          'confirm fallback-a chatgpt-fallback-a',
+          ctx,
+        )
+
+        expect(payload.knobs.code).toBe(code)
+        expect(payload.text).toContain(expected)
+        expect(payload.text).not.toContain('identity changed')
+      })
+    }
+
+    test('confirm rechecks a stale exhausted preview and refuses when the fresh quota is healthy', async () => {
+      await saveResetAccounts()
+      const fixture = resetFixture()
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+      await buildDialogPayload('openai-reset', 'select fallback-a', ctx)
+      expect(
+        (await loadAccounts(configPath))?.reset?.['fallback-a'],
+      ).toBeUndefined()
+      fixture.usedPercent['chatgpt-fallback-a'] = 20
+      const postsBefore = fixture.calls.filter(
+        (call) => call.method === 'POST',
+      ).length
+      const listsBefore = fixture.calls.filter((call) =>
+        call.url.endsWith('/rate_limit_reset_credits'),
+      ).length
+
+      const payload = await buildDialogPayload(
+        'openai-reset',
+        'confirm fallback-a chatgpt-fallback-a',
+        ctx,
+      )
+
+      expect(payload.knobs).toMatchObject({
+        stage: 'result',
+        code: 'not_exhausted',
+      })
+      expect(payload.text).toContain('not exhausted')
+      expect(
+        fixture.calls.filter((call) => call.method === 'POST'),
+      ).toHaveLength(postsBefore)
+      expect(
+        fixture.calls.filter((call) =>
+          call.url.endsWith('/rate_limit_reset_credits'),
+        ),
+      ).toHaveLength(listsBefore)
+      expect(
+        (await loadAccounts(configPath))?.reset?.['fallback-a'],
+      ).toBeUndefined()
+    })
+
+    test('confirm refuses a near-limit 99.9% snapshot', async () => {
+      await saveResetAccounts()
+      const fixture = resetFixture({
+        usedPercent: { 'chatgpt-fallback-a': 99.9 },
+      })
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+
+      const payload = await buildDialogPayload(
+        'openai-reset',
+        'confirm fallback-a chatgpt-fallback-a',
+        ctx,
+      )
+
+      expect(payload.knobs.code).toBe('not_exhausted')
+      expect(fixture.calls.some((call) => call.method === 'POST')).toBe(false)
+    })
+
+    test('confirm reports cooldown before POST and tells the user quota is being rechecked', async () => {
+      await saveResetAccounts()
+      await mutateAccounts((storage) => {
+        storage.reset = {
+          'fallback-a': { cooldownUntil: now + 30_000 },
+        }
+        return storage
+      }, configPath)
+      const fixture = resetFixture()
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+
+      const payload = await buildDialogPayload(
+        'openai-reset',
+        'confirm fallback-a chatgpt-fallback-a',
+        ctx,
+      )
+
+      expect(payload.knobs.code).toBe('cooldown_active')
+      expect(payload.text).toContain('just reset — re-checking quota')
+      expect(fixture.calls).toHaveLength(0)
+    })
+
+    test('confirm refuses an expired unreconciled attempt with bound retry guidance and no wire call', async () => {
+      await saveResetAccounts()
+      await mutateAccounts((storage) => {
+        storage.reset = {
+          'fallback-a': {
+            inFlight: {
+              redeemRequestId: 'expired-request',
+              creditId: 'expired-credit',
+              startedAt: now - 5 * 60_000 - 1,
+            },
+          },
+        }
+        return storage
+      }, configPath)
+      const fixture = resetFixture()
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+
+      const payload = await buildDialogPayload(
+        'openai-reset',
+        'confirm fallback-a chatgpt-fallback-a',
+        ctx,
+      )
+
+      expect(payload.knobs).toMatchObject({
+        stage: 'result',
+        code: 'expired_unreconciled',
+        accountKey: 'fallback-a',
+        chatgptAccountId: 'chatgpt-fallback-a',
+        retryGuidance: expect.any(String),
+      })
+      expect(payload.text).toContain('previous attempt outcome is unknown')
+      expect(payload.text).toContain('retry replays the same identifiers')
+      expect(fixture.calls).toHaveLength(0)
+    })
+
+    for (const outcome of ['reset', 'already_redeemed'] as const) {
+      test(`${outcome} runs targeted post-verification and reports a fresh window only from the refreshed snapshot`, async () => {
+        await saveResetAccounts()
+        const fixture = resetFixture({
+          outcome,
+          freshAfterPost: true,
+          applicableAfterPost: 0,
+        })
+        const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+
+        const payload = await buildDialogPayload(
+          'openai-reset',
+          'confirm fallback-a chatgpt-fallback-a',
+          ctx,
+        )
+
+        expect(payload.knobs).toMatchObject({
+          stage: 'result',
+          code: outcome,
+          verifiedFresh: true,
+          remainingCredits: 0,
+        })
+        expect(payload.knobs).not.toHaveProperty('chatgptAccountId')
+        expect(payload.text).toContain('window fresh')
+        expect(fixture.targetRefreshes).toEqual(['fallback-a'])
+        expect(fixture.sidebarRefreshes).toBe(1)
+      })
+    }
+
+    test('post-verification refresh failure is logged and surfaced without claiming a fresh window', async () => {
+      await saveResetAccounts()
+      const fixture = resetFixture({ outcome: 'reset' })
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+      ctx.refreshResetTargetQuota = async () => {
+        throw new Error('targeted refresh unavailable')
+      }
+      const logDir = mkdtempSync(join(tmpdir(), 'oai-reset-post-verify-'))
+      const logFile = join(logDir, 'test.log')
+      const savedLogFile = process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+      const savedLogLevel = process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL
+      try {
+        process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
+        setLogLevel('info')
+
+        const payload = await buildDialogPayload(
+          'openai-reset',
+          'confirm fallback-a chatgpt-fallback-a',
+          ctx,
+        )
+        await flushForTest()
+        const logged = readFileSync(logFile, 'utf8')
+
+        expect(payload.text).toContain('window not yet refreshed')
+        expect(payload.text).toContain('quota re-check failed — see log')
+        expect(logged).toContain('reset quota re-check failed')
+        expect(logged).toContain('fallback-a')
+        expect(logged).toContain('targeted refresh unavailable')
+      } finally {
+        process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = savedLogFile
+        if (savedLogLevel !== undefined) {
+          process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = savedLogLevel
+        }
+        setLogLevel(undefined)
+        rmSync(logDir, { recursive: true, force: true })
+      }
+    })
+
+    test('generic reset failures hide internal details from the dialog and log them', async () => {
+      await saveResetAccounts()
+      const fixture = resetFixture()
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+      ctx.resolveResetTarget = async () => {
+        throw new Error('/private/plugin/path: sensitive internal detail')
+      }
+      const logDir = mkdtempSync(join(tmpdir(), 'oai-reset-generic-error-'))
+      const logFile = join(logDir, 'test.log')
+      const savedLogFile = process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+      try {
+        process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
+        setLogLevel('info')
+
+        const payload = await buildDialogPayload(
+          'openai-reset',
+          'confirm fallback-a chatgpt-fallback-a',
+          ctx,
+        )
+        await flushForTest()
+        const logged = readFileSync(logFile, 'utf8')
+
+        expect(payload.text).toContain(
+          'internal command failure — see plugin log',
+        )
+        expect(payload.text).not.toContain('/private/plugin/path')
+        expect(logged).toContain('/private/plugin/path')
+      } finally {
+        process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = savedLogFile
+        setLogLevel(undefined)
+        rmSync(logDir, { recursive: true, force: true })
+      }
+    })
+
+    test('ambiguous local renderer preserves no-request guidance without success or retry guarantees', async () => {
+      const result = {
+        target: {
+          accountKey: 'fallback-a',
+          label: 'Fallback A',
+          accessToken: 'secret-token',
+          chatgptAccountId: 'chatgpt-fallback-a',
+        },
+        selectedCredit: undefined,
+        beforeState: undefined,
+        outcome: {
+          kind: 'ambiguous_local' as const,
+          raw: { reason: 'corrupt_in_flight' as const },
+        },
+        retrySafety:
+          'No request was sent because the saved redemption identity was incomplete.',
+      }
+
+      const payload = await renderResetCoordinatorResult(
+        result,
+        {} as Parameters<typeof renderResetCoordinatorResult>[1],
+      )
+
+      expect(payload.text).toContain('No request was sent')
+      expect(payload.text.toLowerCase()).not.toContain('success')
+      expect(payload.text).not.toContain('retry is free')
+      expect(payload.text).not.toContain('guaranteed')
+      expect(payload.text).not.toContain('secret-token')
+    })
+
+    test('retry-safe renderer carries the preview-bound identity instead of rebuilding it from the result target', async () => {
+      const result = {
+        target: {
+          accountKey: 'fallback/a b',
+          label: 'Fallback A',
+          accessToken: 'secret-token',
+          chatgptAccountId: 'resolved-target-id',
+        },
+        selectedCredit: { id: 'credit-1' },
+        beforeState: undefined,
+        outcome: {
+          kind: 'ambiguous' as const,
+          raw: new Error('connection lost'),
+        },
+        retrySafety:
+          'The outcome is uncertain. A retry reuses the same request and credit identifiers.',
+      }
+
+      const payload = await renderResetCoordinatorResult(
+        result,
+        {} as Parameters<typeof renderResetCoordinatorResult>[1],
+        'preview-bound/id',
+      )
+
+      expect(payload.knobs).toMatchObject({
+        accountKey: 'fallback/a b',
+        chatgptAccountId: 'preview-bound/id',
+      })
+      expect(payload.text).toContain(encodeURIComponent('preview-bound/id'))
+      expect(payload.text).not.toContain('resolved-target-id')
+      expect(payload.text).not.toContain('secret-token')
+    })
+
+    test('terminal result with a failed finalize write keeps the known outcome and offers identifier reuse', async () => {
+      const result = {
+        target: {
+          accountKey: 'fallback-a',
+          label: 'Fallback A',
+          accessToken: 'secret-token',
+          chatgptAccountId: 'chatgpt-fallback-a',
+        },
+        selectedCredit: { id: 'credit-1' },
+        beforeState: undefined,
+        outcome: { kind: 'reset' as const, raw: { code: 'reset' } },
+        retrySafety: 'same identifiers',
+        finalizeStateWriteFailed: true,
+      }
+
+      const payload = await renderResetCoordinatorResult(
+        result,
+        {} as Parameters<typeof renderResetCoordinatorResult>[1],
+        'chatgpt-fallback-a',
+      )
+
+      expect(payload.knobs).toMatchObject({
+        code: 'reset',
+        stateWriteFailed: true,
+        chatgptAccountId: 'chatgpt-fallback-a',
+      })
+      expect(payload.text).toContain('outcome recorded as `reset`')
+      expect(payload.text).toContain('state write failed')
+      expect(payload.text).toContain('same request and credit identifiers')
+    })
+
+    test('reset does not call an exhausted post-refresh snapshot fresh', async () => {
+      await saveResetAccounts()
+      const fixture = resetFixture({ outcome: 'reset' })
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+
+      const payload = await buildDialogPayload(
+        'openai-reset',
+        'confirm fallback-a chatgpt-fallback-a',
+        ctx,
+      )
+
+      expect(payload.knobs).toMatchObject({
+        code: 'reset',
+        verifiedFresh: false,
+      })
+      expect(payload.text).toContain('window not yet refreshed')
+      expect(payload.text).not.toContain('window fresh')
+    })
+
+    for (const outcome of ['nothing_to_reset', 'no_credit'] as const) {
+      test(`${outcome} preserves the exact no-op code without claiming success`, async () => {
+        await saveResetAccounts()
+        const fixture = resetFixture({ outcome })
+        const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+
+        const payload = await buildDialogPayload(
+          'openai-reset',
+          'confirm fallback-a chatgpt-fallback-a',
+          ctx,
+        )
+
+        expect(payload.knobs.code).toBe(outcome)
+        expect(payload.knobs).not.toHaveProperty('chatgptAccountId')
+        expect(payload.text).toContain(outcome)
+        expect(payload.text.toLowerCase()).not.toContain('success')
+        expect(payload.text).toContain(
+          'A new attempt starts fresh and must pass the current preconditions.',
+        )
+        expect(fixture.targetRefreshes).toHaveLength(0)
+      })
+    }
+
+    for (const outcome of ['ambiguous', 'http_error'] as const) {
+      test(`${outcome} reports an unknown outcome with bounded retry guidance and no post-verification`, async () => {
+        await saveResetAccounts()
+        const fixture = resetFixture(
+          outcome === 'ambiguous' ? { throwOnPost: true } : { postStatus: 503 },
+        )
+        const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+
+        const payload = await buildDialogPayload(
+          'openai-reset',
+          'confirm fallback-a chatgpt-fallback-a',
+          ctx,
+        )
+
+        expect(payload.knobs.code).toBe(outcome)
+        expect(payload.knobs).toMatchObject({
+          accountKey: 'fallback-a',
+          chatgptAccountId: 'chatgpt-fallback-a',
+        })
+        expect(payload.text).toContain('outcome is unknown')
+        expect(payload.text).toContain('same request and credit identifiers')
+        expect(payload.text).not.toContain('retry is free')
+        expect(payload.text).not.toContain('guaranteed')
+        expect(fixture.targetRefreshes).toHaveLength(0)
+      })
+    }
+
+    test('retry decodes the bound identity and reuses the persisted in-flight request', async () => {
+      await saveResetAccounts()
+      const firstFixture = resetFixture({ throwOnPost: true })
+      const harness = await makeResetCommandHarness(
+        configPath,
+        now,
+        firstFixture,
+      )
+      await buildDialogPayload(
+        'openai-reset',
+        'confirm fallback-a chatgpt-fallback-a',
+        harness.ctx,
+      )
+      const state = (await loadAccounts(configPath))?.reset?.['fallback-a']
+      expect(state?.inFlight?.redeemRequestId).toBe('reset-request-id')
+      firstFixture.throwOnPost = false
+      firstFixture.outcome = 'nothing_to_reset'
+
+      const payload = await buildDialogPayload(
+        'openai-reset',
+        `retry ${encodeURIComponent('fallback-a')} ${encodeURIComponent('chatgpt-fallback-a')}`,
+        harness.ctx,
+      )
+
+      expect(payload.knobs.code).toBe('nothing_to_reset')
+      const postBodies = firstFixture.calls.filter(
+        (call) => call.method === 'POST',
+      )
+      expect(postBodies).toHaveLength(2)
+    })
+
+    test('result text remains useful without a connected TUI', async () => {
+      await saveResetAccounts()
+      const fixture = resetFixture({ outcome: 'no_credit' })
+      const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
+      ctx.notify = undefined
+
+      const payload = await buildDialogPayload(
+        'openai-reset',
+        'confirm fallback-a chatgpt-fallback-a',
+        ctx,
+      )
+
+      expect(payload.text.length).toBeGreaterThan(60)
+      expect(payload.text).toContain('fallback-a')
+      expect(payload.text).toContain('no_credit')
+    })
   })
 })
 

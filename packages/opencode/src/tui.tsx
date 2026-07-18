@@ -897,7 +897,11 @@ const tui: TuiPlugin = async (api) => {
             openCommandDialog(
               api,
               message.payload,
-              (command, args) => rpcClient.apply({ command, arguments: args }),
+              (command, args) =>
+                rpcClient.apply(
+                  { command, arguments: args },
+                  command === 'openai-reset' ? 90_000 : undefined,
+                ),
               sessionId,
             )
           }

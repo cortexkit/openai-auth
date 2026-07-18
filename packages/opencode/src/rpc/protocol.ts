@@ -6,6 +6,7 @@ export type CommandModalName =
   | 'openai-dump'
   | 'openai-logging'
   | 'openai-cachekeep'
+  | 'openai-reset'
 
 export interface OpenDialogPayload {
   command: CommandModalName

@@ -35,7 +35,7 @@ Restart OpenCode after changing plugin config, then authenticate:
 
 ## Commands
 
-Each opens an interactive dialog in the TUI and also accepts explicit arguments:
+Each opens an interactive dialog in the TUI. Commands with listed arguments also accept those explicit arguments:
 
 | Command | Arguments | Purpose |
 | --- | --- | --- |
@@ -44,6 +44,7 @@ Each opens an interactive dialog in the TUI and also accepts explicit arguments:
 | `/openai-routing` | `main-first` · `fallback-first` | Routing mode: which account is tried first. |
 | `/openai-killswitch` | `on` · `off` · `set <acct>:<5h>,<1w> ...` | Hard-block accounts below quota thresholds. |
 | `/openai-cachekeep` | `on` · `off` · `subagents on` · `subagents off` | Idle prompt-cache keep-warm. |
+| `/openai-reset` | Modal only | Spend one applicable reset credit for an exhausted account after explicit confirmation. |
 | `/openai-logging` | `<level>` | Set log level live. |
 | `/openai-dump` | `on` · `off` | Toggle transport request dumps. |
 

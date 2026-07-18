@@ -181,4 +181,32 @@ describe('rpc-server', () => {
 
     await expect(reqPromise).resolves.toBeUndefined()
   })
+
+  test('default timeout lets a slow apply handler respond before the socket is destroyed', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'oa-rpcsrv-'))
+    // No explicit timeoutMs — the server default is the safety net. A reset
+    // apply takes a few seconds (network call to Codex); the default must not
+    // destroy the socket before the handler responds.
+    const server = await startRpcServer({
+      dir,
+      drain: drainNotifications,
+      apply: async () => {
+        await Bun.sleep(3_000)
+        return { text: 'slow-ok', knobs: {} }
+      },
+    })
+    stop = server.stop
+
+    const res = await fetch(`http://127.0.0.1:${server.port}/rpc/apply`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${server.token}`,
+      },
+      body: JSON.stringify({ command: 'openai-reset', arguments: '' }),
+      signal: AbortSignal.timeout(15_000),
+    })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ text: 'slow-ok', knobs: {} })
+  })
 })

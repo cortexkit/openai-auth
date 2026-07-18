@@ -370,6 +370,65 @@ describe('QuotaManager push', () => {
     ).toBe(0)
   })
 
+  it('preserves applicable reset credits when a per-turn push omits them', () => {
+    const previous: OAuthQuotaSnapshot = {
+      primary: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        checkedAt: 1,
+        windowMinutes: 10_080,
+      },
+      resetCreditsAvailable: 4,
+      resetCreditsApplicable: 3,
+    }
+    const incoming: OAuthQuotaSnapshot = {
+      primary: {
+        usedPercent: 20,
+        remainingPercent: 80,
+        checkedAt: 2,
+        windowMinutes: 10_080,
+      },
+    }
+
+    const merged = mergePushedQuotaMetadata(incoming, previous)
+    expect(merged.resetCreditsAvailable).toBe(4)
+    expect(merged.resetCreditsApplicable).toBe(3)
+
+    // An explicit incoming count (including 0) wins over the cached one.
+    const explicit = mergePushedQuotaMetadata(
+      { ...incoming, resetCreditsApplicable: 0 },
+      previous,
+    )
+    expect(explicit.resetCreditsApplicable).toBe(0)
+    expect(explicit.resetCreditsAvailable).toBe(4)
+  })
+
+  it('round-trips resetCreditsApplicable from wham normalization through the main quota cache', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { normalizeWham } = await import('../quota-normalize.ts')
+    const snapshot = normalizeWham({
+      rate_limit: {
+        primary_window: {
+          used_percent: 100,
+          limit_window_seconds: 18_000,
+          reset_at: 1_784_809_904,
+        },
+        secondary_window: null,
+      },
+      rate_limit_reset_credits: {
+        available_count: 4,
+        applicable_available_count: 3,
+      },
+    } as Parameters<typeof normalizeWham>[0])
+
+    const qm: QuotaManager = new QuotaManager({ storage: null })
+    qm.setMain('main-token', { quota: snapshot, refreshAfter: 2, checkedAt: 1 })
+
+    const cached = qm.peekMainForPolicy()?.quota
+    expect(cached?.resetCreditsApplicable).toBe(3)
+    expect(cached?.resetCreditsAvailable).toBe(4)
+  })
+
   it('publishes each account reset-credit count independently of the active account', async () => {
     const { QuotaManager } = await import('../core/quota-manager.ts')
     const qm: QuotaManager = new QuotaManager({ storage: null })

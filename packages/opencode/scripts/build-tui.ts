@@ -17,6 +17,7 @@ const shippedSourceFiles = [
   'rpc/rpc-dir.ts',
   'rpc/port-file.ts',
   'rpc/protocol.ts',
+  'util/error.ts',
   'util/open-url.ts',
 ] as const
 const runtimeSpecifiers = new Set([

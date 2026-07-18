@@ -58,6 +58,10 @@ export interface RefreshAllQuotaDeps {
   logger?: QuotaLogger
 }
 
+export interface RefreshAllQuotaOptions {
+  accountKey?: string
+}
+
 export interface RefreshAllQuotaResult {
   account: string
   ok: boolean
@@ -66,6 +70,7 @@ export interface RefreshAllQuotaResult {
 
 export async function refreshAllQuota(
   deps: RefreshAllQuotaDeps,
+  options: RefreshAllQuotaOptions = {},
 ): Promise<RefreshAllQuotaResult[]> {
   const whamFn = deps.whamFn
   if (!whamFn) throw new Error('whamFn is required for refreshAllQuota')
@@ -84,78 +89,96 @@ export async function refreshAllQuota(
     else logger.warn('quota refresh failed', payload)
   }
 
-  // --- MAIN ---
-  try {
-    let auth = await deps.getAuth()
-    if (auth.type === 'oauth') {
-      if (!auth.access || (auth.expires ?? 0) < deps.now()) {
-        const tokens = await deps.codexRefreshFn({
-          refreshToken: auth.refresh ?? '',
-          fetchImpl: deps.fetchImpl,
-          now: deps.now,
-        })
-        await deps.client.auth.set({
-          path: { id: 'openai' },
-          body: {
-            type: 'oauth',
-            access: tokens.access,
-            refresh: tokens.refresh,
-            expires: tokens.expires,
-          },
-        })
-        auth = { ...auth, access: tokens.access, expires: tokens.expires }
-      }
+  const storage = await deps.loadAccounts(deps.configPath)
 
-      if (auth.access) {
-        if (deps.respectBackoff && deps.quotaManager.isBackedOff()) {
-          recordOutcome({ account: 'main', ok: true })
-        } else {
-          const snap = await whamFn({
-            accessToken: auth.access,
+  if (!options.accountKey || options.accountKey === 'main') {
+    // --- MAIN ---
+    try {
+      let auth = await deps.getAuth()
+      if (auth.type === 'oauth') {
+        if (!auth.access || (auth.expires ?? 0) < deps.now()) {
+          const tokens = await deps.codexRefreshFn({
+            refreshToken: auth.refresh ?? '',
             fetchImpl: deps.fetchImpl,
             now: deps.now,
-            accountId: deps.storageMainAccountId,
-            accountKey: 'main',
           })
-          deps.quotaManager.setMain(
-            auth.access,
-            {
-              quota: snap,
-              refreshAfter: deps.now() + 5 * 60 * 1000,
-              checkedAt: deps.now(),
+          await deps.client.auth.set({
+            path: { id: 'openai' },
+            body: {
+              type: 'oauth',
+              access: tokens.access,
+              refresh: tokens.refresh,
+              expires: tokens.expires,
             },
-            undefined,
-            true,
-          )
-          recordOutcome({ account: 'main', ok: true })
+          })
+          auth = { ...auth, access: tokens.access, expires: tokens.expires }
+        }
+
+        if (auth.access) {
+          if (deps.respectBackoff && deps.quotaManager.isBackedOff()) {
+            recordOutcome({ account: 'main', ok: true })
+          } else {
+            const snap = await whamFn({
+              accessToken: auth.access,
+              fetchImpl: deps.fetchImpl,
+              now: deps.now,
+              accountId: storage?.mainAccountId,
+              accountKey: 'main',
+            })
+            deps.quotaManager.setMain(
+              auth.access,
+              {
+                quota: snap,
+                refreshAfter: deps.now() + 5 * 60 * 1000,
+                checkedAt: deps.now(),
+              },
+              undefined,
+              true,
+            )
+            recordOutcome({ account: 'main', ok: true })
+          }
+        } else {
+          recordOutcome({
+            account: 'main',
+            ok: false,
+            error: 'no access token',
+          })
         }
       } else {
         recordOutcome({
           account: 'main',
           ok: false,
-          error: 'no access token',
+          error: 'auth type is not oauth',
         })
       }
-    } else {
+    } catch (e) {
       recordOutcome({
         account: 'main',
         ok: false,
-        error: 'auth type is not oauth',
+        error: errorMessage(e),
       })
     }
-  } catch (e) {
-    recordOutcome({
-      account: 'main',
-      ok: false,
-      error: errorMessage(e),
-    })
   }
 
   // --- FALLBACKS ---
-  const storage = await deps.loadAccounts(deps.configPath)
   if (storage) {
     for (const acct of storage.accounts) {
-      if (acct.enabled === false || !deps.isOAuthAccountFn(acct)) continue
+      if (
+        options.accountKey &&
+        (options.accountKey === 'main' || acct.id !== options.accountKey)
+      ) {
+        continue
+      }
+      if (acct.enabled === false || !deps.isOAuthAccountFn(acct)) {
+        if (options.accountKey) {
+          recordOutcome({
+            account: acct.id,
+            ok: false,
+            error: 'account is not an enabled OAuth fallback',
+          })
+        }
+        continue
+      }
 
       try {
         if (
@@ -211,6 +234,18 @@ export async function refreshAllQuota(
         })
       }
     }
+  }
+
+  if (
+    options.accountKey &&
+    options.accountKey !== 'main' &&
+    !results.some((result) => result.account === options.accountKey)
+  ) {
+    results.push({
+      account: options.accountKey,
+      ok: false,
+      error: 'account not found',
+    })
   }
 
   // Refresh sidebar after all fetches
