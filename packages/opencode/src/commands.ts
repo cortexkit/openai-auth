@@ -153,9 +153,7 @@ async function executeQuotaCommand(
     if (failures.length > 0) {
       lines.push('')
       for (const f of failures) {
-        lines.push(
-          `⚠ ${f.account}: could not fetch (${f.error ?? 'unknown error'})`,
-        )
+        lines.push(`- ${f.account}: fetch failed — Refresh to retry`)
       }
     }
   }

@@ -849,7 +849,7 @@ describe('commands', () => {
     expect(fb2Section).not.toContain('resets:')
   })
 
-  test('refreshAllQuota with one failure → ⚠ line for failing account', async () => {
+  test('refreshAllQuota with one failure → short retry state for failing account', async () => {
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
     })
@@ -884,10 +884,8 @@ describe('commands', () => {
     expect(payload.text).toContain('10% used')
     expect(payload.text).toContain('50% used')
 
-    // Failure line
-    expect(payload.text).toContain(
-      '⚠ fb-2: could not fetch (wham usage check failed: 401)',
-    )
+    expect(payload.text).toContain('- fb-2: fetch failed — Refresh to retry')
+    expect(payload.text).not.toContain('wham usage check failed: 401')
   })
 
   test('refreshAllQuota undefined → falls back to cached display', async () => {

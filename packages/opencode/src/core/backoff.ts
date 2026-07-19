@@ -19,6 +19,8 @@ export function isTransientRefreshError(error: unknown) {
   }
   if (!(error instanceof Error)) return false
   return (
+    error.name === 'AbortError' ||
+    error.name === 'TimeoutError' ||
     error.message.includes('fetch failed') ||
     ('code' in error &&
       (error.code === 'ECONNRESET' ||
@@ -37,6 +39,8 @@ export function isTransientQuotaError(error: unknown) {
   if (!(error instanceof Error)) return false
   const code = (error as Error & { code?: unknown }).code
   return (
+    error.name === 'AbortError' ||
+    error.name === 'TimeoutError' ||
     message.includes('fetch failed') ||
     code === 'ECONNRESET' ||
     code === 'ECONNREFUSED' ||
