@@ -277,6 +277,393 @@ describe('createWebSocketFetch', () => {
     )
   })
 
+  test('marks an admission-time usage limit with the provider reset before rejecting the stream', async () => {
+    const resetAtSeconds = 1_784_958_366
+    const rateLimitCalls: Array<{
+      window: string
+      accountId?: string
+      resetAt?: number
+    }> = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'error',
+              error: {
+                type: 'usage_limit_reached',
+                message: 'The usage limit has been reached',
+                plan_type: 'team',
+                resets_at: resetAtSeconds,
+                eligible_promo: null,
+                resets_in_seconds: 514_504,
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          onRateLimitReached: ((
+            window: string,
+            accountId: string | undefined,
+            resetAt: number | undefined,
+          ) => {
+            rateLimitCalls.push({ window, accountId, resetAt })
+          }) as NonNullable<
+            Parameters<typeof createWebSocketFetch>[0]
+          >['onRateLimitReached'],
+        })
+
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-admission-rl',
+              authorization: 'Bearer tok-main',
+              'x-openai-auth-quota-account': 'main',
+            },
+            body: JSON.stringify({ stream: true, input: [] }),
+          },
+        )
+
+        await expect(response.text()).rejects.toMatchObject({
+          isRetryable: true,
+        })
+        expect(rateLimitCalls).toEqual([
+          {
+            window: 'usage_limit_reached',
+            accountId: 'main',
+            resetAt: resetAtSeconds * 1000,
+          },
+        ])
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('does not classify a 503 circuit-open admission error as a rate limit', async () => {
+    const rateLimitCalls: string[] = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              error: {
+                message: 'Service Unavailable',
+                type: null,
+                code: 'biscuit_baker_service_me_circuit_open',
+                param: null,
+              },
+              status: 503,
+              type: 'error',
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          onRateLimitReached: (window) => rateLimitCalls.push(window),
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+
+        expect(response.status).toBe(503)
+        expect(await response.json()).toMatchObject({ status: 503 })
+        expect(rateLimitCalls).toEqual([])
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('classifies status 429 with another error type but leaves reset undefined for the bounded default', async () => {
+    const rateLimitCalls: Array<{ window: string; resetAt?: number }> = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'error',
+              status: 429,
+              error: {
+                type: 'rate_limit_exceeded',
+                message: 'Rate limit exceeded',
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          onRateLimitReached: (window, _accountId, resetAt) =>
+            rateLimitCalls.push({ window, resetAt }),
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+
+        await expect(response.text()).rejects.toBeInstanceOf(
+          ResponseStreamError,
+        )
+        expect(rateLimitCalls).toEqual([
+          { window: 'rate_limit_exceeded', resetAt: undefined },
+        ])
+        const { resolveMidStreamRateLimitResetAt } = await import(
+          '../core/quota-manager'
+        )
+        expect(
+          resolveMidStreamRateLimitResetAt(
+            undefined,
+            rateLimitCalls[0]!.window,
+            1_000,
+            60_000,
+            rateLimitCalls[0]!.resetAt,
+          ),
+        ).toBe(61_000)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('keeps websocket connection-limit admission errors on HTTP fallback without a rate-limit mark', async () => {
+    const rateLimitCalls: string[] = []
+    let httpRequests = 0
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'error',
+              status: 400,
+              error: {
+                type: 'invalid_request_error',
+                code: 'websocket_connection_limit_reached',
+                message: 'Responses websocket connection limit reached',
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const httpFetch: typeof globalThis.fetch = Object.assign(
+          async () => {
+            httpRequests++
+            return new Response('http')
+          },
+          { preconnect: () => {} },
+        )
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          httpFetch,
+          onRateLimitReached: (window) => rateLimitCalls.push(window),
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+
+        expect(await response.text()).toBe('http')
+        expect(httpRequests).toBe(1)
+        expect(rateLimitCalls).toEqual([])
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('leaves an untyped statusless error on the benign terminal path without a rate-limit mark', async () => {
+    const rateLimitCalls: string[] = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'error',
+              error: { message: 'provider rejected request' },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          onRateLimitReached: (window) => rateLimitCalls.push(window),
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+        const text = await response.text()
+
+        expect(text).toContain('provider rejected request')
+        expect(text).toContain('data: [DONE]')
+        expect(rateLimitCalls).toEqual([])
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('keeps admission rate-limit reroute alive after a filtered control frame (no emitted output)', async () => {
+    // A hosted-web-search lifecycle frame is filtered from the SSE output
+    // (translateHostedWebSearchEvent returns undefined), so it must NOT mark the
+    // stream as having emitted. If it did, a following admission-time usage limit
+    // would skip the retryable reroute and silently enqueue the error frame.
+    const rateLimitCalls: Array<{ window: string; accountId?: string }> = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'response.web_search_call.searching',
+              item_id: 'ws_1',
+            }),
+          )
+          message(
+            JSON.stringify({
+              type: 'error',
+              error: {
+                type: 'usage_limit_reached',
+                message: 'The usage limit has been reached',
+                resets_at: 1_784_958_366,
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          onRateLimitReached: (window, accountId) => {
+            rateLimitCalls.push({ window, accountId })
+          },
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-control-frame-admission',
+              authorization: 'Bearer tok-main',
+              'x-openai-auth-quota-account': 'main',
+            },
+            body: JSON.stringify({ stream: true, input: [] }),
+          },
+        )
+        await expect(response.text()).rejects.toMatchObject({
+          isRetryable: true,
+        })
+        expect(rateLimitCalls).toEqual([
+          { window: 'usage_limit_reached', accountId: 'main' },
+        ])
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('falls back to HTTP when a native WebSocket upgrade fails before open', async () => {
+    // The standard (non-raw) WebSocket API exposes no HTTP status/body on a
+    // failed upgrade, so an admission 429 there is invisible to
+    // parseRateLimitSignal. Any upgrade failure on the native client must fall
+    // back to HTTP, which surfaces the real status for classification.
+    let httpRequests = 0
+    await withFakeWebSocket(
+      ({ close }) => {
+        queueMicrotask(() => close(1006, 'upgrade rejected'))
+        return { autoOpen: false }
+      },
+      async () => {
+        const httpFetch: typeof globalThis.fetch = Object.assign(
+          async () => {
+            httpRequests++
+            return new Response('http')
+          },
+          { preconnect: () => {} },
+        )
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          httpFetch,
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+        expect(await response.text()).toBe('http')
+        expect(httpRequests).toBe(1)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('marks and reroutes when the prewarm connection hits an admission rate limit', async () => {
+    // The first request on a fresh connection prewarms (generate:false) before
+    // the main turn. A usage limit on the PREWARM connection must mark the
+    // account and surface a retryable error too — not only on the main
+    // connection — so the re-issued turn reroutes off the exhausted account.
+    const rateLimitCalls: Array<{ window: string; accountId?: string }> = []
+    const sent: Array<Record<string, unknown>> = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send(data) {
+          const parsed = JSON.parse(data) as Record<string, unknown>
+          sent.push(parsed)
+          if (parsed.generate === false) {
+            message(
+              JSON.stringify({
+                type: 'error',
+                error: {
+                  type: 'usage_limit_reached',
+                  message: 'The usage limit has been reached',
+                  resets_at: 1_784_958_366,
+                },
+              }),
+            )
+          }
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          onRateLimitReached: (window, accountId) => {
+            rateLimitCalls.push({ window, accountId })
+          },
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-prewarm-admission',
+              authorization: 'Bearer tok-main',
+              'x-openai-auth-quota-account': 'main',
+            },
+            body: JSON.stringify({
+              stream: true,
+              input: [
+                { role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+              ],
+            }),
+          },
+        )
+        await expect(response.text()).rejects.toMatchObject({
+          isRetryable: true,
+        })
+        expect(rateLimitCalls).toEqual([
+          { window: 'usage_limit_reached', accountId: 'main' },
+        ])
+        // Only the prewarm went out on this account; the main turn never sent.
+        expect(sent).toHaveLength(1)
+        expect(sent[0]).toMatchObject({ generate: false })
+        websocketFetch.close()
+      },
+    )
+  })
+
   test('does NOT force a retry when output already streamed before a rate-limit failure (no duplicate replay)', async () => {
     // A rate_limit_reached_type arriving AFTER meaningful output has streamed
     // must still MARK the account (steer the next turn away) but must NOT error

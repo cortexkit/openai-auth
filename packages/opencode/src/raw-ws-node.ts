@@ -18,6 +18,7 @@ import { connect as netConnect } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
 
 import { dumpDiagnostic } from './dump'
+import { rejectedUpgradeEvent, rejectedUpgradeStatus } from './raw-ws-upgrade'
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 
@@ -61,6 +62,7 @@ export class RawWebSocket {
   }
   private rxBuffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0)
   private handshakeDone = false
+  private upgradeFailureEmitted = false
   private expectedAccept = ''
   // message reassembly across fragmented frames
   private fragOpcode = 0
@@ -159,12 +161,14 @@ export class RawWebSocket {
         )
       })
       socket.on('error', (e) => {
+        if (this.emitRejectedUpgrade(true)) return
         this.readyState = 3
         const message = e instanceof Error ? e.message : String(e)
         void this.log('socket_error', { message })
         this.emit('error', { message })
       })
       socket.on('close', (hadError) => {
+        if (this.emitRejectedUpgrade(true)) return
         this.readyState = 3
         void this.log('socket_close', { hadError })
         this.emit('close', { code: 1006, reason: 'socket closed' })
@@ -189,11 +193,17 @@ export class RawWebSocket {
       const headerText = text.slice(0, idx)
       const statusLine = headerText.split('\r\n')[0] ?? ''
       const acceptMatch = headerText.match(/sec-websocket-accept:\s*(\S+)/i)
-      if (!statusLine.includes(' 101')) {
-        this.readyState = 3
+      const status = rejectedUpgradeStatus(statusLine)
+      if (status !== 101) {
+        if (status === undefined) {
+          this.readyState = 3
+          this.socket?.destroy?.()
+          void this.log('upgrade_failed', { statusLine })
+          this.emit('error', { message: `WS upgrade failed: ${statusLine}` })
+          return
+        }
+        if (!this.emitRejectedUpgrade()) return
         this.socket?.destroy?.()
-        void this.log('upgrade_failed', { statusLine })
-        this.emit('error', { message: `WS upgrade failed: ${statusLine}` })
         return
       }
       if (!acceptMatch || acceptMatch[1] !== this.expectedAccept) {
@@ -212,6 +222,27 @@ export class RawWebSocket {
       this.emit('open', {})
     }
     this.drainFrames()
+  }
+
+  private emitRejectedUpgrade(finalizePartial = false): boolean {
+    if (this.upgradeFailureEmitted) return true
+    if (this.handshakeDone) return false
+    const headerEnd = Buffer.from(this.rxBuffer).indexOf('\r\n\r\n')
+    if (headerEnd === -1) return false
+    const errorEvent = rejectedUpgradeEvent(
+      this.rxBuffer,
+      headerEnd,
+      finalizePartial,
+    )
+    if (!errorEvent) return false
+    this.upgradeFailureEmitted = true
+    this.readyState = 3
+    void this.log('upgrade_failed', {
+      status: errorEvent.status,
+      partial: finalizePartial,
+    })
+    this.emit('error', errorEvent)
+    return true
   }
 
   private drainFrames(): void {
