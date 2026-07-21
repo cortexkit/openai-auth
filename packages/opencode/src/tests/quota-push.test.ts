@@ -160,6 +160,43 @@ describe('QuotaManager push', () => {
     expect(qm.getFallback('fb-1', newToken)).toBeNull()
   })
 
+  it('peekFallbackForPolicy survives a token refresh but drops on an account switch', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const token = `fb-${randomUUID()}`
+    const snapshot = goodSnapshot()
+
+    const qm = new QuotaManager({
+      storage: null,
+      fetchQuotaFn: () => {
+        throw new Error('must not be called')
+      },
+    })
+
+    // Quota pushed for the internal storage id "fb-1" under ChatGPT identity
+    // "acct-old".
+    qm.setFallback(
+      'fb-1',
+      {
+        quota: snapshot,
+        refreshAfter: Date.now() + 60_000,
+        checkedAt: Date.now(),
+      },
+      token,
+      false,
+      'acct-old',
+    )
+
+    // Same identity: the policy peek still sees the entry (a token refresh is a
+    // same-account event and must not drop it).
+    expect(qm.peekFallbackForPolicy('fb-1', 'acct-old')).not.toBeNull()
+    // No-identity peek returns the cached entry (best-effort, backward compat).
+    expect(qm.peekFallbackForPolicy('fb-1')).not.toBeNull()
+    // A genuine account SWITCH (a different ChatGPT id re-logged in under the
+    // same storage id) drops the policy view, so the killswitch never judges the
+    // new account by the old account's quota.
+    expect(qm.peekFallbackForPolicy('fb-1', 'acct-new')).toBeNull()
+  })
+
   it('conditional push: empty snapshot does NOT overwrite a valid cached one', async () => {
     const { QuotaManager } = await import('../core/quota-manager.ts')
     const token = `access-${randomUUID()}`
@@ -402,6 +439,8 @@ describe('QuotaManager push', () => {
         checkedAt: 1,
       },
       'fallback-token',
+      false,
+      'captured-account-id',
     )
     const store: AccountStorage = {
       version: 1,
@@ -414,6 +453,7 @@ describe('QuotaManager push', () => {
           refresh: 'fallback-refresh',
           expires: 10,
           enabled: true,
+          accountId: 'live-account-id',
         },
       ],
     }
@@ -422,6 +462,7 @@ describe('QuotaManager push', () => {
     const expectedMachine = {
       main: {
         quota: {
+          checkedAt: 1,
           primary: {
             usedPercent: 20,
             remainingPercent: 80,
@@ -437,7 +478,9 @@ describe('QuotaManager push', () => {
         {
           id: 'fallback-1',
           label: undefined,
+          accountId: 'captured-account-id',
           quota: {
+            checkedAt: 1,
             primary: {
               usedPercent: 30,
               remainingPercent: 70,

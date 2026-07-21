@@ -3,7 +3,9 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import type { AccountStorage } from '../core/accounts.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock'
+import { buildSidebarMachineState } from '../index.ts'
 import {
   ACTIVE_ROUTING_MAX_AGE_MS,
   type AccountQuota,
@@ -35,8 +37,12 @@ import { FLOOR_SIDEBAR_STATE_FILE } from './setup-env.ts'
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000
 const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000
 
-const quota = (used: number): AccountQuota => ({
-  primary: { usedPercent: used, remainingPercent: 100 - used },
+const quota = (used: number, checkedAt?: number): AccountQuota => ({
+  primary: {
+    usedPercent: used,
+    remainingPercent: 100 - used,
+    ...(checkedAt === undefined ? {} : { checkedAt }),
+  },
   secondary: { usedPercent: used, remainingPercent: 100 - used },
 })
 
@@ -132,6 +138,7 @@ describe('normalizeSidebarState', () => {
           },
           secondary: { usedPercent: 17, remainingPercent: 83 },
         },
+        mainAccountId: 'chatgpt-main',
         killed: true,
         quotaBackedOff: true,
         quotaBackoffUntil: 1234567890,
@@ -143,6 +150,7 @@ describe('normalizeSidebarState', () => {
         {
           id: 'fb1',
           label: 'work',
+          accountId: 'chatgpt-fb1',
           quota: { primary: { usedPercent: 5, remainingPercent: 95 } },
           killed: false,
           enabled: true,
@@ -172,10 +180,12 @@ describe('normalizeSidebarState', () => {
     expect(result.main.refreshBackedOff).toBe(false)
     expect(result.main.refreshBackoffUntil).toBe(9876543210)
     expect(result.main.resetCredits).toBe(4)
+    expect(result.main.mainAccountId).toBe('chatgpt-main')
     expect(result.fallbacks).toHaveLength(1)
     const fb0 = result.fallbacks[0]!
     expect(fb0.id).toBe('fb1')
     expect(fb0.label).toBe('work')
+    expect(fb0.accountId).toBe('chatgpt-fb1')
     expect(fb0.resetCredits).toBe(2)
     expect(result.activeId).toBe('fb1')
     expect(result.route).toBe('fallback')
@@ -1324,6 +1334,351 @@ test('machine writes preserve routing while retaining reset-credit fields', asyn
   expect(written.activeRouting?.['sess-a']?.activeId).toBe('fallback-1')
 })
 
+test('machine writes cannot clobber fresher main and fallback quota from disk', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-quota-fresh-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const stale = now - 10 * 60_000
+  await setSidebarState(
+    make({
+      main: main(quota(10, now)),
+      fallbacks: [fb({ id: 'fallback-1', quota: quota(20, now) })],
+      activeRouting: {
+        session: {
+          activeId: 'fallback-1',
+          route: 'fallback-first',
+          updatedAt: now,
+        },
+      },
+    }),
+    file,
+  )
+
+  await setSidebarMachineState(
+    {
+      main: main(quota(90, stale)),
+      fallbacks: [fb({ id: 'fallback-1', quota: quota(80, stale) })],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.quota?.primary).toMatchObject({
+    usedPercent: 10,
+    checkedAt: now,
+  })
+  expect(written.fallbacks[0]?.quota?.primary).toMatchObject({
+    usedPercent: 20,
+    checkedAt: now,
+  })
+  expect(written.route).toBe('main-first')
+  expect(written.activeRouting?.session?.activeId).toBe('fallback-1')
+})
+
+test('machine write keeps the existing identity when the existing quota wins the merge (re-login race)', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-identity-keep-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  // On disk: the OLD account's quota with a fresh checkedAt.
+  await setSidebarState(
+    make({
+      main: { ...main(quota(10, now)), mainAccountId: 'account-old' },
+      fallbacks: [
+        fb({ id: 'fallback-1', accountId: 'fb-old', quota: quota(20, now) }),
+      ],
+    }),
+    file,
+  )
+
+  // Incoming: the re-logged-in process has no quota yet (null) but a NEW
+  // identity. The existing quota is fresher so it wins the merge — the identity
+  // must follow it rather than be overwritten with the new account's id, or a
+  // reader would judge the new account by the old account's quota.
+  await setSidebarMachineState(
+    {
+      main: { ...main(null), mainAccountId: 'account-new' },
+      fallbacks: [fb({ id: 'fallback-1', accountId: 'fb-new', quota: null })],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.quota?.primary?.usedPercent).toBe(10)
+  expect(written.main.mainAccountId).toBe('account-old')
+  expect(written.fallbacks[0]?.quota?.primary?.usedPercent).toBe(20)
+  expect(written.fallbacks[0]?.accountId).toBe('fb-old')
+})
+
+test('machine write carries the incoming identity when the incoming quota wins the merge', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-identity-take-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const stale = now - 10 * 60_000
+  // On disk: stale quota under the OLD identity.
+  await setSidebarState(
+    make({
+      main: { ...main(quota(10, stale)), mainAccountId: 'account-old' },
+    }),
+    file,
+  )
+
+  // Incoming: a fresher snapshot under the NEW identity wins the merge, and the
+  // identity follows it.
+  await setSidebarMachineState(
+    {
+      main: { ...main(quota(50, now)), mainAccountId: 'account-new' },
+      fallbacks: [],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.quota?.primary?.usedPercent).toBe(50)
+  expect(written.main.mainAccountId).toBe('account-new')
+})
+
+test('machine write ranks a fresh secondary window above an older incoming primary', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-secondary-fresh-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const stale = now - 10 * 60_000
+  // On disk the primary window is retired (absent) but the secondary window is
+  // fresh; the incoming primary is older than that secondary. The merge must rank
+  // the disk's fresh secondary above the incoming primary and keep the disk quota,
+  // not discard it just because its primary slot is null.
+  await setSidebarState(
+    make({
+      main: {
+        ...main(null),
+        quota: {
+          secondary: { usedPercent: 25, remainingPercent: 75, checkedAt: now },
+        },
+      },
+    }),
+    file,
+  )
+
+  await setSidebarMachineState(
+    {
+      main: {
+        ...main(null),
+        quota: {
+          primary: { usedPercent: 80, remainingPercent: 20, checkedAt: stale },
+        },
+      },
+      fallbacks: [],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.quota?.secondary?.usedPercent).toBe(25)
+  expect(written.main.quota?.primary).toBeUndefined()
+})
+
+test('machine write merges each quota window independently when the account identity matches', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-window-merge-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const stale = now - 10 * 60_000
+  // On disk: a stale primary but a fresh secondary, under identity "acct-x".
+  await setSidebarState(
+    make({
+      main: {
+        ...main(null),
+        mainAccountId: 'acct-x',
+        quota: {
+          primary: { usedPercent: 11, remainingPercent: 89, checkedAt: stale },
+          secondary: { usedPercent: 22, remainingPercent: 78, checkedAt: now },
+        },
+      },
+      fallbacks: [
+        fb({
+          id: 'fallback-1',
+          accountId: 'fb-x',
+          quota: {
+            primary: {
+              usedPercent: 33,
+              remainingPercent: 67,
+              checkedAt: stale,
+            },
+            secondary: {
+              usedPercent: 44,
+              remainingPercent: 56,
+              checkedAt: now,
+            },
+          },
+        }),
+      ],
+    }),
+    file,
+  )
+
+  // Incoming: a fresh primary but a stale secondary, same identities. A
+  // whole-snapshot pick would drop one side's fresher window; the merge must
+  // keep the freshest primary AND the freshest secondary independently.
+  await setSidebarMachineState(
+    {
+      main: {
+        ...main(null),
+        mainAccountId: 'acct-x',
+        quota: {
+          primary: { usedPercent: 55, remainingPercent: 45, checkedAt: now },
+          secondary: {
+            usedPercent: 66,
+            remainingPercent: 34,
+            checkedAt: stale,
+          },
+        },
+      },
+      fallbacks: [
+        fb({
+          id: 'fallback-1',
+          accountId: 'fb-x',
+          quota: {
+            primary: { usedPercent: 77, remainingPercent: 23, checkedAt: now },
+            secondary: {
+              usedPercent: 88,
+              remainingPercent: 12,
+              checkedAt: stale,
+            },
+          },
+        }),
+      ],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  // Main: primary from the incoming side (fresh), secondary from disk (fresh).
+  expect(written.main.quota?.primary).toMatchObject({
+    usedPercent: 55,
+    checkedAt: now,
+  })
+  expect(written.main.quota?.secondary).toMatchObject({
+    usedPercent: 22,
+    checkedAt: now,
+  })
+  expect(written.main.mainAccountId).toBe('acct-x')
+  // Fallback: the same per-window merge applies.
+  const fb1 = written.fallbacks.find((row) => row.id === 'fallback-1')
+  expect(fb1?.quota?.primary).toMatchObject({ usedPercent: 77, checkedAt: now })
+  expect(fb1?.quota?.secondary).toMatchObject({
+    usedPercent: 44,
+    checkedAt: now,
+  })
+  expect(fb1?.accountId).toBe('fb-x')
+})
+
+test('machine writes select quota freshness independently per account', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-quota-mixed-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const stale = now - 10 * 60_000
+  await setSidebarState(
+    make({
+      fallbacks: [
+        fb({ id: 'fallback-a', quota: quota(10, stale) }),
+        fb({ id: 'fallback-b', quota: quota(20, now) }),
+      ],
+    }),
+    file,
+  )
+
+  await setSidebarMachineState(
+    {
+      main: main(null),
+      fallbacks: [
+        fb({ id: 'fallback-a', quota: quota(30, now) }),
+        fb({ id: 'fallback-b', quota: quota(40, stale) }),
+      ],
+      route: 'fallback-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(
+    written.fallbacks.find((row) => row.id === 'fallback-a')?.quota?.primary
+      ?.usedPercent,
+  ).toBe(30)
+  expect(
+    written.fallbacks.find((row) => row.id === 'fallback-b')?.quota?.primary
+      ?.usedPercent,
+  ).toBe(20)
+})
+
+test('valid checkedAt beats missing or invalid values while incoming wins ties without timestamps', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-quota-invalid-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const invalidQuota = {
+    primary: {
+      usedPercent: 90,
+      remainingPercent: 10,
+      checkedAt: 'not-a-number',
+    },
+  } as unknown as AccountQuota
+  await setSidebarState(
+    make({
+      main: main(quota(10, now)),
+      fallbacks: [
+        fb({ id: 'incoming-valid', quota: invalidQuota }),
+        fb({ id: 'disk-valid', quota: quota(20, now) }),
+        fb({ id: 'both-missing', quota: quota(30) }),
+      ],
+    }),
+    file,
+  )
+
+  await setSidebarMachineState(
+    {
+      main: main(null),
+      fallbacks: [
+        fb({ id: 'incoming-valid', quota: quota(40, now) }),
+        fb({ id: 'disk-valid', quota: invalidQuota }),
+        fb({ id: 'both-missing', quota: quota(50) }),
+      ],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.quota?.primary?.usedPercent).toBe(10)
+  expect(
+    written.fallbacks.find((row) => row.id === 'incoming-valid')?.quota?.primary
+      ?.usedPercent,
+  ).toBe(40)
+  expect(
+    written.fallbacks.find((row) => row.id === 'disk-valid')?.quota?.primary
+      ?.usedPercent,
+  ).toBe(20)
+  expect(
+    written.fallbacks.find((row) => row.id === 'both-missing')?.quota?.primary
+      ?.usedPercent,
+  ).toBe(50)
+})
+
 test('headerless request compatibility write does not create a session entry', async () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-legacy-'))
   const file = join(tempDir, 'sidebar-state.json')
@@ -1363,4 +1718,95 @@ test('machine refresh cannot replace request-authored legacy active id', async (
   expect(written.activeId).toBe('fallback-1')
   expect(written.route).toBe('main-first')
   expect(written.main.resetCredits).toBe(4)
+})
+
+test("machine write keeps A's newer secondary when a concurrent normal write carries crossed timestamps (per-window merge fires on identity match)", async () => {
+  // A writes a snapshot with BOTH windows via the NORMAL writer path
+  // (buildSidebarMachineState → setSidebarMachineState). A's snapshot
+  // checkedAt is T2 (newer) and A's windows carry no per-window stamps —
+  // mirroring files written by code that only stamped the snapshot-level
+  // checkedAt. B then writes a snapshot via the SAME normal writer path
+  // with BOTH windows stamped at T1 < T2, under the same account identity
+  // so per-window merge fires.
+  //
+  // Under OLD code the per-window comparison falls back to "incoming wins"
+  // when both stamps are undefined, so B's older windows clobber A's newer
+  // secondary. Under the fix the per-window freshness comparison falls back
+  // to each side's snapshot stamp (A: T2, B: T1), so A's secondary is kept.
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-crossed-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const { QuotaManager } = await import('../core/quota-manager.ts')
+  const T2 = 1_700_000_000_000 // newer — A's snapshot
+  const T1 = T2 - 5_000 // older — B's snapshot
+
+  const qmA = new QuotaManager({ storage: null })
+  // Cast to bypass the required-checkedAt type so A's windows reach the
+  // file without per-window stamps — the same shape an old writer would
+  // produce.
+  qmA.setMain(
+    'token-a',
+    {
+      quota: {
+        primary: { usedPercent: 50, remainingPercent: 50 } as never,
+        secondary: { usedPercent: 30, remainingPercent: 70 } as never,
+      },
+      refreshAfter: T2 + 60_000,
+      checkedAt: T2,
+    },
+    'acct-x',
+    true,
+  )
+
+  const storeA: AccountStorage = {
+    version: 1,
+    main: { type: 'opencode', provider: 'openai' },
+    accounts: [],
+    routing: { mode: 'main-first' },
+    mainAccountId: 'acct-x',
+  }
+  await setSidebarMachineState(buildSidebarMachineState(qmA, storeA, T2), file)
+  await drainSidebarWrites()
+
+  const qmB = new QuotaManager({ storage: null })
+  qmB.setMain(
+    'token-b',
+    {
+      quota: {
+        primary: {
+          usedPercent: 60,
+          remainingPercent: 40,
+          checkedAt: T1,
+        },
+        secondary: {
+          usedPercent: 70,
+          remainingPercent: 30,
+          checkedAt: T1,
+        },
+      },
+      refreshAfter: T1 + 60_000,
+      checkedAt: T1,
+    },
+    'acct-x',
+    true,
+  )
+
+  const storeB: AccountStorage = {
+    version: 1,
+    main: { type: 'opencode', provider: 'openai' },
+    accounts: [],
+    routing: { mode: 'main-first' },
+    mainAccountId: 'acct-x',
+  }
+  await setSidebarMachineState(buildSidebarMachineState(qmB, storeB, T1), file)
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  // A's primary: A's snapshot T2 > B's primary stamp T1 → A wins.
+  expect(written.main.quota?.primary?.usedPercent).toBe(50)
+  // A's secondary: A's snapshot T2 > B's secondary stamp T1 → A wins,
+  // even though A's window itself carried no stamp. The per-window merge
+  // must fall back to the enclosing snapshot's checkedAt for freshness,
+  // not blindly hand the slot to whoever happened to write last.
+  expect(written.main.quota?.secondary?.usedPercent).toBe(30)
+  expect(written.main.mainAccountId).toBe('acct-x')
 })
