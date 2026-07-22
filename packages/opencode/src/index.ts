@@ -106,6 +106,7 @@ import {
   setSidebarMachineState,
   upsertSidebarActiveRouting,
 } from './sidebar-state'
+import { errorMessage } from './util/error'
 import { isRecord } from './util/record'
 import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
@@ -1971,7 +1972,12 @@ export async function CodexAuthPlugin(
             isOAuthAccountFn: isOAuthAccount,
             whamFn: whamUsageFn,
             respectBackoff: true,
-          }).catch(() => {})
+          }).catch((error) =>
+            logQ.warn('boot quota seed failed', {
+              pid: process.pid,
+              error: errorMessage(error),
+            }),
+          )
         }
 
         // -------------------------------------------------------------------

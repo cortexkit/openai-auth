@@ -6,8 +6,13 @@
  * directly.
  */
 
+import { createLogger } from '../logger.ts'
+import { errorMessage } from '../util/error.ts'
 import type { OAuthQuotaSnapshot } from './accounts.ts'
 import { parseRetryAfter } from './backoff.ts'
+
+const log = createLogger('quota')
+type QuotaLogger = Pick<typeof log, 'debug' | 'warn'>
 
 // ---------------------------------------------------------------------------
 // Window names are widen-able strings (not an enum) so multi-family
@@ -92,6 +97,7 @@ export async function codexRefreshFn(input: {
 }> {
   const response = await input.fetchImpl(`${CODEX_ISSUER}/oauth/token`, {
     method: 'POST',
+    signal: AbortSignal.timeout(15_000),
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       grant_type: 'refresh_token',
@@ -140,23 +146,51 @@ export async function whamUsageFn(input: {
   fetchImpl: typeof fetch
   now: () => number
   accountId?: string
+  accountKey?: string
+  logger?: QuotaLogger
 }): Promise<OAuthQuotaSnapshot> {
-  const res = await input.fetchImpl(WHAM_USAGE_URL, {
-    headers: {
-      authorization: `Bearer ${input.accessToken}`,
-      'chatgpt-account-id': input.accountId ?? '',
-      'oai-client-platform': 'web',
-      'oai-client-version': '0',
-      'x-openai-target-path': '/backend-api/wham/usage',
-    },
-  })
-  if (!res.ok) {
-    const retryAfter = parseRetryAfter(res.headers.get('retry-after'))
-    throw Object.assign(new Error(`wham usage check failed: ${res.status}`), {
+  const logger = input.logger ?? log
+  const accountId = input.accountKey ?? 'unknown'
+  const startedAt = Date.now()
+  logger.debug('wham usage fetch started', { pid: process.pid, accountId })
+  try {
+    const res = await input.fetchImpl(WHAM_USAGE_URL, {
+      signal: AbortSignal.timeout(15_000),
+      headers: {
+        authorization: `Bearer ${input.accessToken}`,
+        'chatgpt-account-id': input.accountId ?? '',
+        'oai-client-platform': 'web',
+        'oai-client-version': '0',
+        'x-openai-target-path': '/backend-api/wham/usage',
+      },
+    })
+    if (!res.ok) {
+      const retryAfter = parseRetryAfter(res.headers.get('retry-after'))
+      throw Object.assign(new Error(`wham usage check failed: ${res.status}`), {
+        status: res.status,
+        retryAfter,
+      }) as ProviderHttpError
+    }
+    const { normalizeWham } = await import('../quota-normalize.ts')
+    const snapshot = normalizeWham(await res.json())
+    logger.debug('wham usage fetch succeeded', {
+      pid: process.pid,
+      accountId,
       status: res.status,
-      retryAfter,
-    }) as ProviderHttpError
+      elapsedMs: Date.now() - startedAt,
+    })
+    return snapshot
+  } catch (error) {
+    logger.warn('wham usage fetch failed', {
+      pid: process.pid,
+      accountId,
+      status:
+        typeof (error as { status?: unknown } | null)?.status === 'number'
+          ? (error as { status: number }).status
+          : 'error',
+      elapsedMs: Date.now() - startedAt,
+      error: errorMessage(error),
+    })
+    throw error
   }
-  const { normalizeWham } = await import('../quota-normalize.ts')
-  return normalizeWham(await res.json())
 }

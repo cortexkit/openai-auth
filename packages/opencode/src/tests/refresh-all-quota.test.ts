@@ -150,6 +150,40 @@ describe('refreshAllQuota', () => {
     expect(whamCalls).toEqual(['access-main', 'access-fb1', 'access-fb2'])
   })
 
+  test('logs each account outcome without exposing credentials', async () => {
+    const logger = {
+      debug: mock(() => {}),
+      warn: mock(() => {}),
+    }
+    const whamFn = mock(async (input: { accessToken: string }) => {
+      if (input.accessToken === 'access-fb2') {
+        throw new Error('upstream unavailable')
+      }
+      return makeQuotaSnapshot(10)
+    })
+    const deps = makeDeps({ whamFn, logger } as MakeDepsOptions)
+
+    await refreshAllQuota(deps)
+
+    expect(logger.debug).toHaveBeenCalledWith('quota refresh succeeded', {
+      pid: process.pid,
+      accountId: 'main',
+      status: 'ok',
+    })
+    expect(logger.warn).toHaveBeenCalledWith('quota refresh failed', {
+      pid: process.pid,
+      accountId: 'fb-2',
+      status: 'error',
+      error: 'upstream unavailable',
+    })
+    const serialized = JSON.stringify([
+      ...logger.debug.mock.calls,
+      ...logger.warn.mock.calls,
+    ])
+    expect(serialized).not.toContain('access-main')
+    expect(serialized).not.toContain('access-fb2')
+  })
+
   test('expired main token → codexRefreshFn called before wham', async () => {
     const deps = makeDeps({
       getAuth: mock(async () => ({

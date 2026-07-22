@@ -1,6 +1,31 @@
-import { describe, expect, it, mock } from 'bun:test'
-import { buildQuotaOperationError } from '../core/backoff.ts'
-import { codexRefreshFn, type ProviderHttpError } from '../core/provider.ts'
+import { describe, expect, it, jest, mock } from 'bun:test'
+import {
+  buildQuotaOperationError,
+  isTransientQuotaError,
+  isTransientRefreshError,
+} from '../core/backoff.ts'
+import {
+  codexRefreshFn,
+  type ProviderHttpError,
+  whamUsageFn,
+} from '../core/provider.ts'
+
+function fetchUntilAborted() {
+  const fetchMock = mock(
+    (_input: RequestInfo | URL, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal
+        if (!signal) {
+          reject(new Error('missing timeout signal'))
+          return
+        }
+        signal.addEventListener('abort', () => reject(signal.reason), {
+          once: true,
+        })
+      }),
+  )
+  return fetchMock as unknown as typeof fetch & typeof fetchMock
+}
 
 describe('buildQuotaOperationError retryAfter threading', () => {
   it('honors positive retryAfter on quota error', () => {
@@ -140,5 +165,82 @@ describe('codexRefreshFn token validation', () => {
     expect(thrown?.message).toContain('malformed response')
     expect(thrown?.status).toBe(200)
     expect(thrown?.isRefreshError).toBe(true)
+  })
+})
+
+describe('provider fetch timeouts', () => {
+  it('bounds a stalled quota fetch and classifies the timeout as transient', async () => {
+    jest.useFakeTimers()
+    try {
+      const fetchImpl = fetchUntilAborted()
+      const pending = whamUsageFn({
+        accessToken: 'access-token',
+        fetchImpl,
+        now: () => 1_000_000,
+        accountId: 'account-1',
+      })
+
+      expect(fetchImpl.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal)
+      jest.advanceTimersByTime(15_000)
+
+      const error = await pending.catch((caught) => caught)
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).name).toBe('TimeoutError')
+      expect(isTransientQuotaError(error)).toBe(true)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('bounds a stalled token refresh and classifies the timeout as transient', async () => {
+    jest.useFakeTimers()
+    try {
+      const fetchImpl = fetchUntilAborted()
+      const pending = codexRefreshFn({
+        refreshToken: 'refresh-token',
+        fetchImpl,
+        now: () => 1_000_000,
+      })
+
+      expect(fetchImpl.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal)
+      jest.advanceTimersByTime(15_000)
+
+      const error = await pending.catch((caught) => caught)
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).name).toBe('TimeoutError')
+      expect(isTransientRefreshError(error)).toBe(true)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+})
+
+describe('quota fetch logging', () => {
+  it('warns with account context when the usage fetch rejects', async () => {
+    const logger = {
+      debug: mock(() => {}),
+      warn: mock(() => {}),
+    }
+    const failure = new Error('upstream unavailable')
+    const input = {
+      accessToken: 'access-token',
+      fetchImpl: mock(async () => {
+        throw failure
+      }) as unknown as typeof fetch,
+      now: () => 1_000_000,
+      accountId: 'account-1',
+      accountKey: 'account-1',
+      logger,
+    }
+
+    const caught = await whamUsageFn(input).catch((error) => error)
+    expect(caught).toBe(failure)
+    expect(logger.warn).toHaveBeenCalledWith(
+      'wham usage fetch failed',
+      expect.objectContaining({
+        accountId: 'account-1',
+        error: 'upstream unavailable',
+      }),
+    )
   })
 })

@@ -1,3 +1,5 @@
+import { createLogger } from '../logger'
+import { errorMessage } from '../util/error'
 import type {
   FallbackAccountManager,
   isOAuthAccount,
@@ -6,6 +8,9 @@ import type {
 } from './accounts'
 import type { whamUsageFn } from './provider'
 import type { QuotaManager } from './quota-manager'
+
+const log = createLogger('quota')
+type QuotaLogger = Pick<typeof log, 'debug' | 'warn'>
 
 export interface RefreshAllQuotaDeps {
   getAuth: () => Promise<{
@@ -50,6 +55,7 @@ export interface RefreshAllQuotaDeps {
   isOAuthAccountFn: typeof isOAuthAccount
   whamFn?: typeof whamUsageFn
   respectBackoff?: boolean
+  logger?: QuotaLogger
 }
 
 export interface RefreshAllQuotaResult {
@@ -65,6 +71,18 @@ export async function refreshAllQuota(
   if (!whamFn) throw new Error('whamFn is required for refreshAllQuota')
 
   const results: RefreshAllQuotaResult[] = []
+  const logger = deps.logger ?? log
+  const recordOutcome = (result: RefreshAllQuotaResult) => {
+    results.push(result)
+    const payload = {
+      pid: process.pid,
+      accountId: result.account,
+      status: result.ok ? 'ok' : 'error',
+      ...(result.error ? { error: result.error } : {}),
+    }
+    if (result.ok) logger.debug('quota refresh succeeded', payload)
+    else logger.warn('quota refresh failed', payload)
+  }
 
   // --- MAIN ---
   try {
@@ -90,13 +108,14 @@ export async function refreshAllQuota(
 
       if (auth.access) {
         if (deps.respectBackoff && deps.quotaManager.isBackedOff()) {
-          results.push({ account: 'main', ok: true })
+          recordOutcome({ account: 'main', ok: true })
         } else {
           const snap = await whamFn({
             accessToken: auth.access,
             fetchImpl: deps.fetchImpl,
             now: deps.now,
             accountId: deps.storageMainAccountId,
+            accountKey: 'main',
           })
           deps.quotaManager.setMain(
             auth.access,
@@ -108,23 +127,27 @@ export async function refreshAllQuota(
             undefined,
             true,
           )
-          results.push({ account: 'main', ok: true })
+          recordOutcome({ account: 'main', ok: true })
         }
       } else {
-        results.push({ account: 'main', ok: false, error: 'no access token' })
+        recordOutcome({
+          account: 'main',
+          ok: false,
+          error: 'no access token',
+        })
       }
     } else {
-      results.push({
+      recordOutcome({
         account: 'main',
         ok: false,
         error: 'auth type is not oauth',
       })
     }
   } catch (e) {
-    results.push({
+    recordOutcome({
       account: 'main',
       ok: false,
-      error: (e as Error)?.message ?? String(e),
+      error: errorMessage(e),
     })
   }
 
@@ -142,7 +165,7 @@ export async function refreshAllQuota(
             (acct as OAuthAccount).access,
           )
         ) {
-          results.push({ account: acct.id, ok: true })
+          recordOutcome({ account: acct.id, ok: true })
           continue
         }
 
@@ -154,7 +177,7 @@ export async function refreshAllQuota(
         }
 
         if (!refreshed.access) {
-          results.push({
+          recordOutcome({
             account: acct.id,
             ok: false,
             error: 'no access token',
@@ -167,6 +190,7 @@ export async function refreshAllQuota(
           fetchImpl: deps.fetchImpl,
           now: deps.now,
           accountId: refreshed.accountId,
+          accountKey: acct.id,
         })
         deps.quotaManager.setFallback(
           acct.id,
@@ -178,12 +202,12 @@ export async function refreshAllQuota(
           refreshed.access,
           true,
         )
-        results.push({ account: acct.id, ok: true })
+        recordOutcome({ account: acct.id, ok: true })
       } catch (e) {
-        results.push({
+        recordOutcome({
           account: acct.id,
           ok: false,
-          error: (e as Error)?.message ?? String(e),
+          error: errorMessage(e),
         })
       }
     }
