@@ -875,6 +875,32 @@ describe('active routing validity and pruning', () => {
   })
 })
 
+test('upsert creates a missing sidebar state directory before locking', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-missing-dir-'))
+  const file = join(tempDir, 'missing', 'sidebar-state.json')
+  const now = Date.now()
+
+  expect(existsSync(file)).toBe(false)
+
+  await upsertSidebarActiveRouting(
+    {
+      sessionId: 'sess-a',
+      activeId: 'main',
+      route: 'main-first',
+      updatedAt: now,
+    },
+    [],
+    file,
+  )
+  await drainSidebarWrites()
+
+  expect(existsSync(file)).toBe(true)
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.activeRouting).toEqual({
+    'sess-a': { activeId: 'main', route: 'main-first', updatedAt: now },
+  })
+})
+
 test('upserting session B preserves session A and refreshes legacy fields', async () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-routing-'))
   const file = join(tempDir, 'sidebar-state.json')

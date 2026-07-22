@@ -419,6 +419,7 @@ function parseSidebarState(raw: string): SidebarState {
 }
 
 async function acquireSidebarWriteLock(file: string) {
+  await mkdir(dirname(file), { recursive: true })
   const deadline = Date.now() + SIDEBAR_WRITE_LOCK_WAIT_MS
   while (Date.now() <= deadline) {
     const lock = await acquireRefreshFileLock({
