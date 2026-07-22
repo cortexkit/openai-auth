@@ -1,11 +1,13 @@
 export interface QuotaWindow {
   usedPercent: number
   remainingPercent: number
+  checkedAt?: number
   resetsAt?: string
   windowMinutes?: number
 }
 
 export interface AccountQuota {
+  checkedAt?: number
   primary?: QuotaWindow
   secondary?: QuotaWindow
   resetCreditsAvailable?: number
@@ -80,6 +82,8 @@ export function getPresentQuotaWindows(
 export interface SidebarAccountState {
   id: string
   label: string | undefined
+  /** ChatGPT identity of the account this quota belongs to. */
+  accountId?: string
   quota: AccountQuota | null
   killed: boolean
   enabled: boolean
@@ -97,6 +101,8 @@ export type ActiveRoutingMap = Record<string, ActiveRoutingEntry>
 export interface SidebarState {
   main: {
     quota: AccountQuota | null
+    /** ChatGPT identity of the main account this quota belongs to. */
+    mainAccountId?: string
     killed: boolean
     quotaBackedOff?: boolean
     quotaBackoffUntil?: number
@@ -212,6 +218,9 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
     main = {
       quota: ('quota' in m ? m.quota : null) as AccountQuota | null,
       killed: typeof m.killed === 'boolean' ? m.killed : false,
+      ...(typeof m.mainAccountId === 'string'
+        ? { mainAccountId: m.mainAccountId }
+        : {}),
       // Preserve optional backoff fields if present
       ...(typeof m.quotaBackedOff === 'boolean'
         ? { quotaBackedOff: m.quotaBackedOff }
@@ -247,6 +256,9 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
         .map((e) => ({
           id: e.id as string,
           label: typeof e.label === 'string' ? e.label : undefined,
+          ...(typeof e.accountId === 'string'
+            ? { accountId: e.accountId }
+            : {}),
           quota: ('quota' in e ? e.quota : null) as AccountQuota | null,
           killed: typeof e.killed === 'boolean' ? e.killed : false,
           enabled: typeof e.enabled === 'boolean' ? e.enabled : true,
@@ -280,9 +292,11 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
   }
 }
 
-export async function getSidebarState(): Promise<SidebarState> {
+export async function getSidebarState(
+  stateFile = getSidebarStateFile(),
+): Promise<SidebarState> {
   try {
-    const raw = await readFile(getSidebarStateFile(), 'utf8')
+    const raw = await readFile(stateFile, 'utf8')
     return normalizeSidebarState(JSON.parse(raw))
   } catch {
     return DEFAULT_SIDEBAR_STATE
@@ -317,20 +331,40 @@ export function isUsableRoutingEntry(
   )
 }
 
+// Earliest future reset among the quota's exhausted windows, or undefined when
+// no present window is exhausted. Every present window is evaluated — matching
+// the admission policy, which rejects an account when ANY live window is below
+// its threshold — and each check fails open: a missing/malformed usage, a
+// missing/unparsable reset, or a reset already in the past never counts as
+// exhausted, so a stale or corrupt snapshot can never block routing.
+export function exhaustedQuotaResetAt(
+  quota: AccountQuota | null | undefined,
+  now = Date.now(),
+): { resetsAt: string; resetAtMs: number } | undefined {
+  let earliest: { resetsAt: string; resetAtMs: number } | undefined
+  for (const key of QUOTA_WINDOW_KEYS) {
+    const window = quota?.[key]
+    if (
+      typeof window?.resetsAt !== 'string' ||
+      !Number.isFinite(window.usedPercent) ||
+      window.usedPercent < 100
+    ) {
+      continue
+    }
+    const resetAtMs = Date.parse(window.resetsAt)
+    if (!Number.isFinite(resetAtMs) || resetAtMs <= now) continue
+    if (!earliest || resetAtMs < earliest.resetAtMs) {
+      earliest = { resetsAt: window.resetsAt, resetAtMs }
+    }
+  }
+  return earliest
+}
+
 export function isQuotaExhausted(
   quota: AccountQuota | null | undefined,
   now = Date.now(),
 ): boolean {
-  const primary = quota?.primary
-  if (
-    typeof primary?.resetsAt !== 'string' ||
-    !Number.isFinite(primary.usedPercent) ||
-    primary.usedPercent < 100
-  ) {
-    return false
-  }
-  const resetsAt = Date.parse(primary.resetsAt)
-  return Number.isFinite(resetsAt) && resetsAt > now
+  return exhaustedQuotaResetAt(quota, now) !== undefined
 }
 
 export function resolveSessionSidebarRouting(
@@ -496,6 +530,30 @@ export type SidebarMachineState = Pick<
   'main' | 'fallbacks' | 'planType' | 'credits' | 'lastUpdated'
 > & { route: string }
 
+function primaryQuotaCheckedAt(quota: AccountQuota | null): number | undefined {
+  for (const checkedAt of [quota?.primary?.checkedAt, quota?.checkedAt]) {
+    if (typeof checkedAt === 'number' && Number.isFinite(checkedAt)) {
+      return checkedAt
+    }
+  }
+  return undefined
+}
+
+function freshestQuota(
+  incoming: AccountQuota | null,
+  existing: AccountQuota | null,
+): AccountQuota | null {
+  const incomingCheckedAt = primaryQuotaCheckedAt(incoming)
+  const existingCheckedAt = primaryQuotaCheckedAt(existing)
+  if (
+    existingCheckedAt !== undefined &&
+    (incomingCheckedAt === undefined || existingCheckedAt > incomingCheckedAt)
+  ) {
+    return existing
+  }
+  return incoming
+}
+
 export function setSidebarMachineState(
   machineState: SidebarMachineState,
   file = getSidebarStateFile(),
@@ -504,13 +562,49 @@ export function setSidebarMachineState(
   return enqueueSidebarWrite(async () => {
     await writeMergedSidebarState(
       file,
-      (latest) => ({
-        ...latest,
-        ...machineState,
-        activeId: latest.activeId,
-        activeRouting: latest.activeRouting,
-        lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
-      }),
+      (latest) => {
+        const latestFallbacks = new Map(
+          latest.fallbacks.map((account) => [account.id, account]),
+        )
+        const mergedMainQuota = freshestQuota(
+          machineState.main.quota,
+          latest.main.quota,
+        )
+        return {
+          ...latest,
+          ...machineState,
+          main: {
+            ...machineState.main,
+            quota: mergedMainQuota,
+            // Identity follows the snapshot that wins the freshness merge, so a
+            // reader never pairs one account's id with another account's quota
+            // (a re-login race would otherwise resurrect the stale-account bug).
+            mainAccountId:
+              mergedMainQuota === latest.main.quota &&
+              mergedMainQuota !== machineState.main.quota
+                ? latest.main.mainAccountId
+                : machineState.main.mainAccountId,
+          },
+          fallbacks: machineState.fallbacks.map((account) => {
+            const existing = latestFallbacks.get(account.id)
+            const mergedQuota = freshestQuota(
+              account.quota,
+              existing?.quota ?? null,
+            )
+            return {
+              ...account,
+              quota: mergedQuota,
+              accountId:
+                mergedQuota === existing?.quota && mergedQuota !== account.quota
+                  ? existing?.accountId
+                  : account.accountId,
+            }
+          }),
+          activeId: latest.activeId,
+          activeRouting: latest.activeRouting,
+          lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
+        }
+      },
       hooks,
     )
   })

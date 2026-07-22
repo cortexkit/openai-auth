@@ -2570,6 +2570,7 @@ describe('integration: active fallback routing', () => {
     mainExpires: number,
     experimentalWebSockets = false,
     responsesLite = false,
+    mainAccountId?: string,
   ) {
     const hooks = await CodexAuthPlugin(input, {
       experimentalWebSockets,
@@ -2584,6 +2585,7 @@ describe('integration: active fallback routing', () => {
         access: 'main-stale-token',
         refresh: 'main-refresh-token',
         expires: mainExpires,
+        ...(mainAccountId ? { accountId: mainAccountId } : {}),
       }),
       {
         id: 'openai',
@@ -2780,6 +2782,89 @@ describe('integration: active fallback routing', () => {
         routing: { mode: 'fallback-first', ...routing },
       }),
     )
+  }
+
+  function seedAdmissionAccounts(
+    ids: string[],
+    mode: 'main-first' | 'fallback-first' = 'fallback-first',
+    quotas: Record<string, OAuthAccount['quota']> = {},
+  ) {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: ids.map((id) => ({
+          id,
+          type: 'oauth',
+          label: id,
+          enabled: true,
+          access: `${id}-token`,
+          refresh: `${id}-refresh`,
+          expires: Date.now() + 24 * 3600_000,
+          accountId: `chatgpt-${id}`,
+          ...(quotas[id] ? { quota: quotas[id] } : {}),
+        })),
+        refresh: { refreshBeforeExpiryMinutes: 5 },
+        routing: { mode },
+      }),
+    )
+  }
+
+  function admissionQuota(
+    usedPercent: number,
+    resetsAt: string,
+    checkedAt: number,
+  ): NonNullable<OAuthAccount['quota']> {
+    return {
+      primary: {
+        usedPercent,
+        remainingPercent: 100 - usedPercent,
+        resetsAt,
+        checkedAt,
+        windowMinutes: 10_080,
+      },
+    }
+  }
+
+  function writeAdmissionSidebarState(input: {
+    fallbackIds: string[]
+    fallbackQuotas?: Record<string, SidebarState['main']['quota'] | undefined>
+    fallbackAccountIds?: Record<string, string>
+    mainQuota?: SidebarState['main']['quota']
+    mainAccountId?: string
+    activeId?: string
+    route?: 'main-first' | 'fallback-first'
+  }) {
+    const state: SidebarState = {
+      main: { quota: input.mainQuota ?? null, killed: false },
+      fallbacks: input.fallbackIds.map((id) => ({
+        id,
+        label: id,
+        ...(input.fallbackAccountIds?.[id] !== undefined
+          ? { accountId: input.fallbackAccountIds[id] }
+          : {}),
+        quota: input.fallbackQuotas?.[id] ?? null,
+        killed: false,
+        enabled: true,
+      })),
+      activeId: input.activeId,
+      route: input.route ?? 'fallback-first',
+      lastUpdated: Date.now(),
+    }
+    if (input.mainAccountId !== undefined) {
+      state.main.mainAccountId = input.mainAccountId
+    }
+    writeFileSync(sidebarFile, JSON.stringify(state))
+  }
+
+  function mockAdmissionFetch(seenAuth: string[], status = 200) {
+    return (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('responses')) {
+        seenAuth.push(headerValue(init, 'authorization'))
+      }
+      return new Response('{}', { status })
+    }) as unknown as typeof globalThis.fetch
   }
 
   test.each([
@@ -3513,6 +3598,525 @@ describe('integration: active fallback routing', () => {
         sidebar.fallbacks.find((a) => a.id === 'work-alt')?.quota?.primary
           ?.usedPercent,
       ).toBe(63)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('admission quota skips an exhausted first fallback from the shared sidebar state', async () => {
+    const now = Date.now()
+    const reset = new Date(now + 7 * 24 * 3600_000).toISOString()
+    seedAdmissionAccounts(['work-alt', 'client-alt'])
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+      writeAdmissionSidebarState({
+        fallbackIds: ['work-alt', 'client-alt'],
+        fallbackQuotas: {
+          'work-alt': admissionQuota(100, reset, now),
+          'client-alt': admissionQuota(20, reset, now),
+        },
+        activeId: 'work-alt',
+      })
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(response.status).toBe(200)
+      expect(seenAuth).toEqual(['Bearer client-alt-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('admission quota skips a file-exhausted fallback with an empty process quota cache', async () => {
+    const now = Date.now()
+    const reset = new Date(now + 7 * 24 * 3600_000).toISOString()
+    seedAdmissionAccounts(['work-alt'])
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+      writeAdmissionSidebarState({
+        fallbackIds: ['work-alt'],
+        fallbackQuotas: {
+          'work-alt': admissionQuota(100, reset, now),
+        },
+      })
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(response.status).toBe(200)
+      expect(seenAuth).toEqual(['Bearer main-stale-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('admission quota uses fresher healthy memory instead of a stale exhausted file row', async () => {
+    const now = Date.now()
+    const reset = new Date(now + 7 * 24 * 3600_000).toISOString()
+    seedAdmissionAccounts(['work-alt'], 'fallback-first', {
+      'work-alt': admissionQuota(20, reset, now),
+    })
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+      writeAdmissionSidebarState({
+        fallbackIds: ['work-alt'],
+        fallbackQuotas: {
+          'work-alt': admissionQuota(100, reset, now - 60_000),
+        },
+      })
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(seenAuth).toEqual(['Bearer work-alt-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('admission quota uses a fresher exhausted file row instead of stale healthy memory', async () => {
+    const now = Date.now()
+    const reset = new Date(now + 7 * 24 * 3600_000).toISOString()
+    seedAdmissionAccounts(['work-alt', 'client-alt'], 'fallback-first', {
+      'work-alt': admissionQuota(20, reset, now - 60_000),
+    })
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+      writeAdmissionSidebarState({
+        fallbackIds: ['work-alt', 'client-alt'],
+        fallbackQuotas: {
+          'work-alt': admissionQuota(100, reset, now),
+          'client-alt': admissionQuota(20, reset, now),
+        },
+      })
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(seenAuth).toEqual(['Bearer client-alt-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('admission quota skips from fresher exhausted memory instead of a stale healthy file row', async () => {
+    const now = Date.now()
+    const reset = new Date(now + 7 * 24 * 3600_000).toISOString()
+    seedAdmissionAccounts(['work-alt', 'client-alt'], 'fallback-first', {
+      'work-alt': admissionQuota(100, reset, now),
+    })
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+      writeAdmissionSidebarState({
+        fallbackIds: ['work-alt', 'client-alt'],
+        fallbackQuotas: {
+          'work-alt': admissionQuota(20, reset, now - 60_000),
+          'client-alt': admissionQuota(20, reset, now),
+        },
+      })
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(seenAuth).toEqual(['Bearer client-alt-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  test.each([
+    ['missing quota', null],
+    ['missing reset', { primary: { usedPercent: 100, remainingPercent: 0 } }],
+    [
+      'malformed reset',
+      {
+        primary: {
+          usedPercent: 100,
+          remainingPercent: 0,
+          resetsAt: 'not-a-date',
+        },
+      },
+    ],
+    [
+      'malformed usage',
+      {
+        primary: {
+          usedPercent: '100',
+          remainingPercent: 0,
+          resetsAt: new Date(Date.now() + 3600_000).toISOString(),
+        },
+      },
+    ],
+  ])('admission quota retains a fallback with %s', async (_label, quota) => {
+    seedAdmissionAccounts(['work-alt'])
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+      writeAdmissionSidebarState({
+        fallbackIds: ['work-alt'],
+        fallbackQuotas: {
+          'work-alt': quota as SidebarState['main']['quota'],
+        },
+      })
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(seenAuth).toEqual(['Bearer work-alt-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('admission quota preserves probe order when every account is exhausted', async () => {
+    const now = Date.now()
+    const reset = new Date(now + 7 * 24 * 3600_000).toISOString()
+    seedAdmissionAccounts(['work-alt', 'client-alt'])
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth, 429)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+      writeAdmissionSidebarState({
+        fallbackIds: ['work-alt', 'client-alt'],
+        fallbackQuotas: {
+          'work-alt': admissionQuota(100, reset, now),
+          'client-alt': admissionQuota(100, reset, now),
+        },
+        mainQuota: admissionQuota(100, reset, now),
+      })
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(response.status).toBe(429)
+      expect(seenAuth).toEqual([
+        'Bearer work-alt-token',
+        'Bearer client-alt-token',
+        'Bearer main-stale-token',
+      ])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('admission quota reroutes a file-exhausted main without probing it', async () => {
+    const now = Date.now()
+    const reset = new Date(now + 7 * 24 * 3600_000).toISOString()
+    seedAdmissionAccounts(['client-alt'], 'main-first')
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+      await new Promise((resolve) => setTimeout(resolve, 2))
+      const checkedAt = Date.now()
+      writeAdmissionSidebarState({
+        fallbackIds: ['client-alt'],
+        fallbackQuotas: {
+          'client-alt': admissionQuota(20, reset, checkedAt),
+        },
+        mainQuota: admissionQuota(100, reset, checkedAt),
+        route: 'main-first',
+      })
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(response.status).toBe(200)
+      expect(seenAuth).toEqual(['Bearer client-alt-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('admission quota ignores an exhausted main row from a different account', async () => {
+    const now = Date.now()
+    const reset = new Date(now + 7 * 24 * 3600_000).toISOString()
+    seedAdmissionAccounts(['client-alt'], 'main-first')
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+        false,
+        false,
+        'new-account',
+      )
+      hooks = loaded.hooks
+      await new Promise((resolve) => setTimeout(resolve, 2))
+      const checkedAt = Date.now()
+      writeAdmissionSidebarState({
+        fallbackIds: ['client-alt'],
+        fallbackQuotas: {
+          'client-alt': admissionQuota(20, reset, checkedAt),
+        },
+        mainQuota: admissionQuota(100, reset, checkedAt),
+        mainAccountId: 'old-account',
+        route: 'main-first',
+      })
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(response.status).toBe(200)
+      expect(seenAuth).toEqual(['Bearer main-stale-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('admission quota ignores an exhausted fallback row stamped with a different account identity', async () => {
+    const now = Date.now()
+    const reset = new Date(now + 7 * 24 * 3600_000).toISOString()
+    // Live account identity is chatgpt-work-alt (see seedAdmissionAccounts).
+    seedAdmissionAccounts(['work-alt'])
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+      writeAdmissionSidebarState({
+        fallbackIds: ['work-alt'],
+        fallbackQuotas: {
+          'work-alt': admissionQuota(100, reset, now),
+        },
+        // The file row belongs to a previous login of this stable id; the live
+        // account is a different ChatGPT identity, so the exhausted row must be
+        // treated as absent (fail-open) rather than blocking the replacement.
+        fallbackAccountIds: { 'work-alt': 'chatgpt-stale' },
+      })
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(response.status).toBe(200)
+      expect(seenAuth).toEqual(['Bearer work-alt-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('admission quota honors an exhausted fallback row matching the live account identity', async () => {
+    const now = Date.now()
+    const reset = new Date(now + 7 * 24 * 3600_000).toISOString()
+    seedAdmissionAccounts(['work-alt'])
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+      writeAdmissionSidebarState({
+        fallbackIds: ['work-alt'],
+        fallbackQuotas: {
+          'work-alt': admissionQuota(100, reset, now),
+        },
+        // Identity matches the live account, so the exhausted row is honored
+        // and the fallback is skipped in favor of main.
+        fallbackAccountIds: { 'work-alt': 'chatgpt-work-alt' },
+      })
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(response.status).toBe(200)
+      expect(seenAuth).toEqual(['Bearer main-stale-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('admission quota skips a fallback exhausted only on its secondary window', async () => {
+    const now = Date.now()
+    const reset = new Date(now + 7 * 24 * 3600_000).toISOString()
+    seedAdmissionAccounts(['work-alt'])
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+      writeAdmissionSidebarState({
+        fallbackIds: ['work-alt'],
+        fallbackQuotas: {
+          // No primary window; the secondary window alone is exhausted.
+          'work-alt': {
+            secondary: {
+              usedPercent: 100,
+              remainingPercent: 0,
+              resetsAt: reset,
+              checkedAt: now,
+              windowMinutes: 10_080,
+            },
+          },
+        },
+      })
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(response.status).toBe(200)
+      expect(seenAuth).toEqual(['Bearer main-stale-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('admission quota retains an exhausted-looking fallback after its reset passes', async () => {
+    const now = Date.now()
+    seedAdmissionAccounts(['work-alt'])
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+      writeAdmissionSidebarState({
+        fallbackIds: ['work-alt'],
+        fallbackQuotas: {
+          'work-alt': admissionQuota(
+            100,
+            new Date(now - 60_000).toISOString(),
+            now,
+          ),
+        },
+      })
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(seenAuth).toEqual(['Bearer work-alt-token'])
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()

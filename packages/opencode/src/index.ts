@@ -66,6 +66,7 @@ import {
 } from './core/oauth'
 import { codexRefreshFn, whamUsageFn } from './core/provider'
 import {
+  type QuotaEntry,
   QuotaManager,
   resolveMidStreamRateLimitResetAt,
 } from './core/quota-manager'
@@ -98,7 +99,10 @@ import { getRpcDir } from './rpc/rpc-dir'
 import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server'
 import {
   type AccountQuota,
+  exhaustedQuotaResetAt,
+  getSidebarState,
   getSidebarStateFile,
+  isQuotaExhausted,
   removeSidebarActiveRouting,
   type SidebarMachineState,
   type SidebarState,
@@ -465,11 +469,18 @@ export function buildSidebarMachineState(
   qm: QuotaManager,
   store: AccountStorage,
   now = Date.now(),
+  mainAccountIdentity = store.mainAccountId,
 ): SidebarMachineState {
-  const mainQuota = qm.getMain()?.quota
+  const mainEntry = qm.getMain()
+  const mainQuota = mainEntry?.quota
   return {
     main: {
-      quota: (mainQuota as AccountQuota | undefined) ?? null,
+      quota: mainQuota
+        ? { ...(mainQuota as AccountQuota), checkedAt: mainEntry.checkedAt }
+        : null,
+      ...(typeof mainAccountIdentity === 'string'
+        ? { mainAccountId: mainAccountIdentity }
+        : {}),
       killed: false,
       ...(mainQuota?.resetCreditsAvailable !== undefined
         ? { resetCredits: mainQuota.resetCreditsAvailable }
@@ -478,11 +489,22 @@ export function buildSidebarMachineState(
     fallbacks: store.accounts
       .filter((account) => account.enabled)
       .map((account) => {
-        const fallbackQuota = qm.getFallback(account.id)?.quota
+        const fallbackEntry = qm.getFallback(account.id)
+        const fallbackQuota = fallbackEntry?.quota
         return {
           id: account.id,
           label: (account as { label?: string }).label,
-          quota: (fallbackQuota as AccountQuota | undefined) ?? null,
+          // Identity follows the cached snapshot (the identity that quota was
+          // captured under), falling back to the live account — so a re-login
+          // never pairs the previous identity's stale quota with the new one.
+          accountId:
+            fallbackEntry?.accountId ?? (account as OAuthAccount).accountId,
+          quota: fallbackQuota
+            ? {
+                ...(fallbackQuota as AccountQuota),
+                checkedAt: fallbackEntry.checkedAt,
+              }
+            : null,
           killed: false,
           enabled: true,
           ...(fallbackQuota?.resetCreditsAvailable !== undefined
@@ -1217,7 +1239,18 @@ export async function CodexAuthPlugin(
             refreshAfter: now + 5 * 60 * 1000,
             checkedAt: now,
           }
+          let resolvedMainIdentity: string | undefined
           if (accountId && accountId !== 'main') {
+            // Bind the pushed snapshot to the ChatGPT identity of the token
+            // that carried it (same derivation as main below), so a re-login on
+            // this stable id stays detectable and the sidebar never pairs a
+            // stale identity's quota with the new one.
+            const fallbackClaims = accessToken
+              ? parseJwtClaims(accessToken)
+              : null
+            const fallbackIdentity = fallbackClaims
+              ? extractAccountIdFromClaims(fallbackClaims)
+              : undefined
             // Quota-bearing transports report every live window rather than a
             // partial subset, so an absent slot means the wire dropped it.
             // Only the wham-only reset-credit metadata carries forward.
@@ -1233,9 +1266,10 @@ export async function CodexAuthPlugin(
               entry,
               accessToken,
               completeSnapshot,
+              fallbackIdentity,
             )
           } else {
-            let resolvedMainIdentity = mainAccountIdentity
+            resolvedMainIdentity = mainAccountIdentity
             if (!resolvedMainIdentity && accessToken) {
               const claims = parseJwtClaims(accessToken)
               resolvedMainIdentity = claims
@@ -1274,7 +1308,13 @@ export async function CodexAuthPlugin(
             snapshot: entry.quota,
           })
           const latestStorage = await loadRequestAccounts()
-          await writeMachineSidebarState(quotaManager, latestStorage)
+          await writeMachineSidebarState(
+            quotaManager,
+            latestStorage,
+            accountId && accountId !== 'main'
+              ? latestStorage?.mainAccountId
+              : resolvedMainIdentity,
+          )
         }
 
         // The pure resolver prefers an admission error's explicit reset and
@@ -1365,10 +1405,16 @@ export async function CodexAuthPlugin(
         async function writeMachineSidebarState(
           qm: QuotaManager,
           store: Awaited<ReturnType<typeof loadAccounts>>,
+          mainAccountIdentity = store?.mainAccountId,
         ) {
           if (!store) return
           await setSidebarMachineState(
-            buildSidebarMachineState(qm, store),
+            buildSidebarMachineState(
+              qm,
+              store,
+              Date.now(),
+              mainAccountIdentity,
+            ),
             boundSidebarFile,
           )
         }
@@ -1661,24 +1707,101 @@ export async function CodexAuthPlugin(
           return quotaManager.peekMainForPolicy(mainAccountIdentity)?.quota
         }
 
+        // -----------------------------------------------------------------
+        // Admission quota consultation: before probing an account, check the
+        // shared sidebar file (written by every plugin process on the machine)
+        // against the in-process cache, so a fresh process never spends a
+        // doomed request on an account already known to be at 100%.
+        // -----------------------------------------------------------------
+        type AdmissionQuotaDecision =
+          | { exhausted: false }
+          | {
+              exhausted: true
+              source: 'memory' | 'file'
+              resetsAt: string
+              resetAtMs: number
+            }
+
+        // Freshness key for a quota snapshot: the window's own checkedAt, then
+        // the snapshot-level checkedAt, then the cache entry's checkedAt.
+        function quotaCheckedAt(
+          quota: AccountQuota | null | undefined,
+          entryCheckedAt?: number,
+        ): number | undefined {
+          for (const checkedAt of [
+            quota?.primary?.checkedAt,
+            quota?.checkedAt,
+            entryCheckedAt,
+          ]) {
+            if (typeof checkedAt === 'number' && Number.isFinite(checkedAt)) {
+              return checkedAt
+            }
+          }
+          return undefined
+        }
+
+        // Selects the fresher quota source and judges it. The file wins only
+        // when strictly newer; memory wins ties; empty memory defers to a
+        // valid file. A file row stamped with a DIFFERENT account identity is
+        // treated as absent (fail-open) — a re-login must never be judged by
+        // the previous account's exhaustion.
+        function admissionQuotaDecision(
+          memoryEntry: QuotaEntry | null,
+          fileQuota: AccountQuota | null | undefined,
+          now: number,
+          fileAccountId?: string,
+          currentAccountId?: string,
+        ): AdmissionQuotaDecision {
+          const memoryQuota = memoryEntry?.quota as AccountQuota | undefined
+          const memoryCheckedAt = quotaCheckedAt(
+            memoryQuota,
+            memoryEntry?.checkedAt,
+          )
+          const fileCheckedAt = quotaCheckedAt(fileQuota)
+          const useFile =
+            (fileAccountId === undefined ||
+              fileAccountId === currentAccountId) &&
+            fileQuota != null &&
+            (memoryQuota === undefined ||
+              (fileCheckedAt !== undefined &&
+                (memoryCheckedAt === undefined ||
+                  fileCheckedAt > memoryCheckedAt)))
+          const source = useFile ? 'file' : 'memory'
+          const quota = useFile ? fileQuota : memoryQuota
+          if (!isQuotaExhausted(quota, now)) return { exhausted: false }
+
+          const reset = exhaustedQuotaResetAt(quota, now)
+          if (!reset) return { exhausted: false }
+          return { exhausted: true, source, ...reset }
+        }
+
+        function logAdmissionQuotaSkip(
+          accountId: string,
+          decision: Extract<AdmissionQuotaDecision, { exhausted: true }>,
+        ) {
+          logQ.debug('admission skip: exhausted account', {
+            accountId,
+            source: decision.source,
+            resetsAt: decision.resetsAt,
+          })
+        }
+
         // Synthetic provider-shaped 429 with a Retry-After derived from the
         // earliest known quota reset across all accounts. Returned when the
-        // killswitch blocks the primary and no surviving account can serve —
-        // or when a mid-stream rate-limit mark blocks it instead (killswitch
-        // may be OFF in that case), hence the parametrized reason: the
-        // retry-after math is the same earliest-known-reset computation
-        // either way, only the human-readable message differs.
+        // killswitch blocks the primary and no surviving account can serve, or
+        // when admission knows the primary is temporarily unavailable for one
+        // of the unconditional quota reasons.
         //
-        // markResetAtMs carries the mid-stream mark's OWN stored reset (~60s,
-        // DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS) when the block is a mark, not
-        // a killswitch decision. killswitchRetryAfterSeconds falls back to a
-        // 300s default when no account reset is known — without this, a bare
-        // mid-stream block (no cached quota yet) would tell the client to wait
-        // 4 extra minutes past the mark's actual expiry. The sooner of the two
-        // always wins — this only ever tightens the wait, never lengthens it.
+        // markResetAtMs carries the blocking account's own reset when the reason
+        // has one. A known-exhausted quota uses that reset exactly; a transient
+        // mid-stream mark takes the sooner of its bounded reset and any cached
+        // quota reset so a missing quota snapshot cannot overstate the wait.
         function killswitchBlockedResponse(
           storage: AccountStorage | null,
-          reason: 'killswitch' | 'mid-stream-rate-limit' = 'killswitch',
+          reason:
+            | 'killswitch'
+            | 'mid-stream-rate-limit'
+            | 'quota-exhausted' = 'killswitch',
           markResetAtMs?: number,
         ): Response {
           const now = Date.now()
@@ -1698,7 +1821,9 @@ export async function CodexAuthPlugin(
             now,
             storage,
           )
-          if (
+          if (reason === 'quota-exhausted' && markResetAtMs !== undefined) {
+            retryAfter = Math.max(1, Math.ceil((markResetAtMs - now) / 1000))
+          } else if (
             reason === 'mid-stream-rate-limit' &&
             markResetAtMs !== undefined
           ) {
@@ -1713,7 +1838,9 @@ export async function CodexAuthPlugin(
           const message =
             reason === 'mid-stream-rate-limit'
               ? `OpenAI rate limit reached — retrying on another account. Retry in ${mins}m ${secs}s.`
-              : `Killswitch: all OpenAI accounts are below their configured quota threshold. Retry in ${mins}m ${secs}s.`
+              : reason === 'quota-exhausted'
+                ? `OpenAI quota exhausted — retrying on another account. Retry in ${mins}m ${secs}s.`
+                : `Killswitch: all OpenAI accounts are below their configured quota threshold. Retry in ${mins}m ${secs}s.`
           return new Response(
             JSON.stringify({
               error: {
@@ -1745,9 +1872,19 @@ export async function CodexAuthPlugin(
           fallback: FallbackAccount
         }
 
+        type FallbackCandidateSelection = {
+          current: FallbackCandidate[]
+          retained: FallbackCandidate[]
+          skipped: Array<{
+            candidate: FallbackCandidate
+            decision: Extract<AdmissionQuotaDecision, { exhausted: true }>
+          }>
+        }
+
         async function usableFallbackCandidates(
           fallbackStorage: Awaited<ReturnType<typeof loadAccounts>>,
-        ): Promise<FallbackCandidate[]> {
+          sidebarState: SidebarState,
+        ): Promise<FallbackCandidateSelection> {
           const usableFallbacks =
             await fallbackManager.getUsableFallbackAccounts(fallbackStorage)
           const candidates: FallbackCandidate[] = []
@@ -1773,15 +1910,66 @@ export async function CodexAuthPlugin(
           // threshold so routing never spends on a killed account. Opt-in — a
           // no-op when disabled. Non-invalidating peek so a token refresh does
           // not flip a killed account to "unknown".
-          if (!isKillswitchEnabled(fallbackStorage)) return notRateLimited
-          return notRateLimited.filter((c) =>
-            killswitchPassesPolicy(
-              quotaManager.peekFallbackForPolicy(c.quotaAccountId)?.quota,
-              fallbackStorage,
-              c.quotaAccountId,
-              Date.now(),
-            ),
+          const current = isKillswitchEnabled(fallbackStorage)
+            ? notRateLimited.filter((c) =>
+                killswitchPassesPolicy(
+                  quotaManager.peekFallbackForPolicy(
+                    c.quotaAccountId,
+                    c.accountId,
+                  )?.quota,
+                  fallbackStorage,
+                  c.quotaAccountId,
+                  Date.now(),
+                ),
+              )
+            : notRateLimited
+          // Admission: drop candidates whose freshest known quota (memory or
+          // the shared sidebar file) is exhausted, so a doomed probe is never
+          // spent on them.
+          const fileQuotas = new Map(
+            sidebarState.fallbacks.map((account) => [
+              account.id,
+              { quota: account.quota, accountId: account.accountId },
+            ]),
           )
+          const retained: FallbackCandidate[] = []
+          const skipped: FallbackCandidateSelection['skipped'] = []
+          const now = Date.now()
+          for (const candidate of current) {
+            const fileEntry = fileQuotas.get(candidate.quotaAccountId)
+            const decision = admissionQuotaDecision(
+              quotaManager.peekFallbackForPolicy(
+                candidate.quotaAccountId,
+                candidate.accountId,
+              ),
+              fileEntry?.quota,
+              now,
+              fileEntry?.accountId,
+              candidate.accountId,
+            )
+            if (decision.exhausted) {
+              skipped.push({ candidate, decision })
+            } else {
+              retained.push(candidate)
+            }
+          }
+          return { current, retained, skipped }
+        }
+
+        function applyAdmissionQuotaSafety(
+          selection: FallbackCandidateSelection,
+          mainRemainsCandidate: boolean,
+        ): FallbackCandidate[] {
+          // The shared file is advisory. If filtering it would remove the last
+          // admission path, keep probing in the original wire-authority order —
+          // a stale or corrupt file can never brick routing.
+          if (selection.retained.length === 0 && !mainRemainsCandidate) {
+            return selection.current
+          }
+          for (const { candidate, decision } of selection.skipped) {
+            logAdmissionQuotaSkip(candidate.quotaAccountId, decision)
+          }
+          return selection.retained
         }
 
         async function pushFailedFallbackQuota(
@@ -1811,6 +1999,7 @@ export async function CodexAuthPlugin(
           requestInput: RequestInfo | URL,
           init: RequestInit | undefined,
           fallbackStorage: Awaited<ReturnType<typeof loadAccounts>>,
+          candidates: FallbackCandidate[],
         ): Promise<
           | {
               response: Response
@@ -1820,7 +2009,6 @@ export async function CodexAuthPlugin(
             }
           | undefined
         > {
-          const candidates = await usableFallbackCandidates(fallbackStorage)
           for (const candidate of candidates) {
             let response: Response
             try {
@@ -1877,14 +2065,13 @@ export async function CodexAuthPlugin(
           requestInput: RequestInfo | URL,
           init: RequestInit | undefined,
           primaryResponse: Response,
-          _unused?: string,
+          fallbackStorage: Awaited<ReturnType<typeof loadAccounts>>,
+          candidates: FallbackCandidate[],
         ) {
           if (!isReplayableRequest(requestInput, init)) {
             return { response: primaryResponse }
           }
 
-          const fallbackStorage = await loadRequestAccounts()
-          const candidates = await usableFallbackCandidates(fallbackStorage)
           if (!candidates.length) return { response: primaryResponse }
 
           // Keep the returned response body live; only cancel a response after a
@@ -2060,6 +2247,40 @@ export async function CodexAuthPlugin(
               currentMainIdentity = mainAccountIdentity
             }
             const mode: RoutingMode = reqStorage?.routing?.mode ?? 'main-first'
+            // One shared sidebar read per request: admission decisions for main
+            // and the fallbacks must all judge the same snapshot.
+            let requestSidebarStatePromise: Promise<SidebarState> | undefined
+            const requestSidebarState = () => {
+              requestSidebarStatePromise ??= getSidebarState(boundSidebarFile)
+              return requestSidebarStatePromise
+            }
+            const sidebarState = await requestSidebarState()
+            const mainQuotaDecision = admissionQuotaDecision(
+              quotaManager.peekMainForPolicy(mainAccountIdentity),
+              sidebarState.main.quota,
+              Date.now(),
+              sidebarState.main.mainAccountId,
+              mainAccountIdentity,
+            )
+            const killswitchBlocksMain =
+              isKillswitchEnabled(reqStorage) &&
+              !killswitchPassesPolicy(
+                killswitchMainQuota(mainAccountIdentity),
+                reqStorage,
+                undefined,
+                Date.now(),
+              )
+            const mainRateLimited = quotaManager.isRateLimited('main')
+            let fallbackSelectionPromise:
+              | Promise<FallbackCandidateSelection>
+              | undefined
+            const requestFallbackSelection = () => {
+              fallbackSelectionPromise ??= usableFallbackCandidates(
+                reqStorage,
+                sidebarState,
+              )
+              return fallbackSelectionPromise
+            }
 
             // fallback-first (proactive): try usable fallbacks BEFORE main. If one
             // serves, use it and skip main entirely; otherwise fall through to the
@@ -2072,12 +2293,25 @@ export async function CodexAuthPlugin(
             // True when the proactive gate already tried every usable fallback,
             // so the reactive path below must not re-try (and re-spend on) them.
             let fallbacksAlreadyTried = false
+            let fallbackCandidates: FallbackCandidate[] | undefined
             if (
               mode === 'fallback-first' &&
               isReplayableRequest(requestInput, init)
             ) {
               fallbacksAlreadyTried = true
-              const pre = await tryFallbackFirst(requestInput, init, reqStorage)
+              const selection = await requestFallbackSelection()
+              fallbackCandidates = applyAdmissionQuotaSafety(
+                selection,
+                !killswitchBlocksMain &&
+                  !mainRateLimited &&
+                  !mainQuotaDecision.exhausted,
+              )
+              const pre = await tryFallbackFirst(
+                requestInput,
+                init,
+                reqStorage,
+                fallbackCandidates,
+              )
               if (pre) {
                 response = pre.response
                 servedFallback = {
@@ -2103,21 +2337,25 @@ export async function CodexAuthPlugin(
             // cached quota may not yet reflect it, so block main here too until
             // the mark's reset passes.
             if (!response) {
-              const killswitchBlocksMain =
-                isKillswitchEnabled(reqStorage) &&
-                !killswitchPassesPolicy(
-                  killswitchMainQuota(mainAccountIdentity),
-                  reqStorage,
-                  undefined,
-                  Date.now(),
-                )
-              const mainRateLimited = quotaManager.isRateLimited('main')
-              if (killswitchBlocksMain || mainRateLimited) {
-                const blockReason =
-                  mainRateLimited && !killswitchBlocksMain
+              // Admission: a main the shared data already knows to be exhausted
+              // is blocked only when a non-exhausted fallback survives to serve
+              // — otherwise the probe stands (the wire is the final authority).
+              const quotaBlocksMain =
+                mainQuotaDecision.exhausted &&
+                (await requestFallbackSelection()).retained.length > 0
+              if (killswitchBlocksMain || mainRateLimited || quotaBlocksMain) {
+                const blockReason = killswitchBlocksMain
+                  ? 'killswitch'
+                  : mainRateLimited
                     ? 'mid-stream-rate-limit'
-                    : 'killswitch'
-                logA.debug('killswitch blocked primary', {
+                    : 'quota-exhausted'
+                if (
+                  blockReason === 'quota-exhausted' &&
+                  mainQuotaDecision.exhausted
+                ) {
+                  logAdmissionQuotaSkip('main', mainQuotaDecision)
+                }
+                logA.debug('admission blocked primary', {
                   pid: process.pid,
                   activeId: 'main',
                   reason: blockReason,
@@ -2125,9 +2363,12 @@ export async function CodexAuthPlugin(
                 response = killswitchBlockedResponse(
                   reqStorage,
                   blockReason,
-                  mainRateLimited
-                    ? quotaManager.rateLimitedUntil('main')
-                    : undefined,
+                  blockReason === 'quota-exhausted' &&
+                    mainQuotaDecision.exhausted
+                    ? mainQuotaDecision.resetAtMs
+                    : mainRateLimited
+                      ? quotaManager.rateLimitedUntil('main')
+                      : undefined,
                 )
               } else {
                 // Send through the main account.
@@ -2164,11 +2405,18 @@ export async function CodexAuthPlugin(
                 pid: process.pid,
                 status: response.status,
               })
+              // Main already failed, so it is no longer a surviving candidate
+              // for the admission safety valve.
+              fallbackCandidates ??= applyAdmissionQuotaSafety(
+                await requestFallbackSelection(),
+                false,
+              )
               const fallbackResult = await tryFallbackAccounts(
                 requestInput,
                 init,
                 response,
-                undefined,
+                reqStorage,
+                fallbackCandidates,
               )
               const fallbackResponse = fallbackResult.response
               if (fallbackResponse !== response) {

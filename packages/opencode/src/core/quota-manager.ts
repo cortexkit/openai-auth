@@ -156,6 +156,11 @@ export type QuotaEntry = {
   quota: OAuthQuotaSnapshot
   refreshAfter: number // Unix ms — earliest next refresh
   checkedAt: number // when snapshot was fetched
+  // ChatGPT identity of the account this snapshot was captured under. Lets a
+  // policy read detect a re-login (identity switch) on a stable internal id, so
+  // the previous identity's quota is never applied to its replacement. Absent
+  // when the identity was never recorded (fail-open, best-effort).
+  accountId?: string
 }
 
 export type QuotaManagerOptions = {
@@ -343,11 +348,24 @@ export class QuotaManager {
 
   /**
    * Non-invalidating read of a cached fallback quota for POLICY decisions
-   * (killswitch). Keyed by the stable internal account id, so a token refresh
-   * for the same account does not drop it (getFallback(id, token) would).
+   * (killswitch, admission). Keyed by the stable internal account id, so a
+   * token refresh for the same account does not drop it (getFallback(id, token)
+   * would).
+   *
+   * Pass the live ChatGPT identity to still drop on a genuine re-login: if the
+   * cached entry's identity is known and differs, return null so the previous
+   * identity's (possibly exhausted) quota is never judged against its
+   * replacement. Unknown on either side fails open, matching peekMainForPolicy.
    */
-  peekFallbackForPolicy(accountId: string): QuotaEntry | null {
-    return this.fallbacks.get(accountId) ?? null
+  peekFallbackForPolicy(
+    accountId: string,
+    identity?: string,
+  ): QuotaEntry | null {
+    const entry = this.fallbacks.get(accountId) ?? null
+    if (identity && entry?.accountId && entry.accountId !== identity) {
+      return null
+    }
+    return entry
   }
 
   setFallback(
@@ -355,11 +373,16 @@ export class QuotaManager {
     entry: QuotaEntry,
     accessToken?: string,
     completeSnapshot = false,
+    identity?: string,
   ): void {
     // Empty snapshots replace cache only when their transport guarantees a
     // complete frame; otherwise a non-quota response could erase good data.
     if (!completeSnapshot && !hasAnyQuotaWindow(entry.quota)) return
-    this.fallbacks.set(accountId, entry)
+    // Bind the snapshot to the identity it was captured under so a re-login on
+    // this stable id stays detectable. An unknown incoming identity preserves
+    // the prior binding (mirrors setMain) rather than erasing a known one.
+    const boundIdentity = identity ?? this.fallbacks.get(accountId)?.accountId
+    this.fallbacks.set(accountId, { ...entry, accountId: boundIdentity })
     if (accessToken) {
       this.fallbackTokenFps.set(accountId, tokenFingerprint(accessToken))
     } else {
@@ -623,6 +646,8 @@ export class QuotaManager {
           checkedAt,
         },
         account.access,
+        false,
+        account.accountId,
       )
     }
   }

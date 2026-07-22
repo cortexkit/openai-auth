@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import type { AccountStorage, OAuthQuotaSnapshot } from '../core/accounts.ts'
+import type {
+  AccountStorage,
+  OAuthAccount,
+  OAuthQuotaSnapshot,
+} from '../core/accounts.ts'
 import type { QuotaManager } from '../core/quota-manager.ts'
 import {
   buildSidebarMachineState,
@@ -158,6 +162,72 @@ describe('QuotaManager push', () => {
     expect(qm.peekFallbackForPolicy('fb-1')).not.toBeNull()
     // But the invalidating display read with the new token drops it.
     expect(qm.getFallback('fb-1', newToken)).toBeNull()
+  })
+
+  it('peekFallbackForPolicy drops a quota bound to a different identity (re-login on a stable id)', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const snapshot = goodSnapshot()
+
+    const qm = new QuotaManager({
+      storage: null,
+      fetchQuotaFn: () => {
+        throw new Error('must not be called')
+      },
+    })
+
+    // Cached under the OLD ChatGPT identity on stable id fb-1.
+    qm.setFallback(
+      'fb-1',
+      {
+        quota: snapshot,
+        refreshAfter: Date.now() + 60_000,
+        checkedAt: Date.now(),
+      },
+      `fb-old-${randomUUID()}`,
+      false,
+      'old',
+    )
+
+    // Same identity (or no identity supplied) still sees the cached quota.
+    expect(qm.peekFallbackForPolicy('fb-1', 'old')).not.toBeNull()
+    expect(qm.peekFallbackForPolicy('fb-1')).not.toBeNull()
+    // A re-login (different ChatGPT identity on the same stable id) drops the
+    // policy view, so the old identity's quota never blocks its replacement.
+    expect(qm.peekFallbackForPolicy('fb-1', 'new')).toBeNull()
+  })
+
+  it('seedFallbacksFromAccounts binds persisted quota to the account identity', async () => {
+    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const now = Date.now()
+
+    const qm = new QuotaManager({
+      storage: null,
+      fetchQuotaFn: () => {
+        throw new Error('must not be called')
+      },
+    })
+
+    const account: OAuthAccount = {
+      id: 'fb-1',
+      type: 'oauth',
+      access: `fb-seed-${randomUUID()}`,
+      refresh: 'fb-seed-refresh',
+      expires: now + 3600_000,
+      enabled: true,
+      accountId: 'old',
+      quota: {
+        primary: {
+          usedPercent: 100,
+          remainingPercent: 0,
+          checkedAt: now,
+          resetsAt: new Date(now + 60_000).toISOString(),
+        },
+      },
+    }
+    qm.seedFallbacksFromAccounts([account])
+
+    expect(qm.peekFallbackForPolicy('fb-1', 'old')).not.toBeNull()
+    expect(qm.peekFallbackForPolicy('fb-1', 'new')).toBeNull()
   })
 
   it('conditional push: empty snapshot does NOT overwrite a valid cached one', async () => {
@@ -406,6 +476,7 @@ describe('QuotaManager push', () => {
     const store: AccountStorage = {
       version: 1,
       main: { type: 'opencode', provider: 'openai' },
+      mainAccountId: 'chatgpt-main',
       accounts: [
         {
           id: 'fallback-1',
@@ -422,6 +493,7 @@ describe('QuotaManager push', () => {
     const expectedMachine = {
       main: {
         quota: {
+          checkedAt: 1,
           primary: {
             usedPercent: 20,
             remainingPercent: 80,
@@ -430,6 +502,7 @@ describe('QuotaManager push', () => {
           },
           resetCreditsAvailable: 4,
         },
+        mainAccountId: 'chatgpt-main',
         killed: false,
         resetCredits: 4,
       },
@@ -438,6 +511,7 @@ describe('QuotaManager push', () => {
           id: 'fallback-1',
           label: undefined,
           quota: {
+            checkedAt: 1,
             primary: {
               usedPercent: 30,
               remainingPercent: 70,
