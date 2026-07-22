@@ -58,7 +58,7 @@
 - Used by: Plugin loader (per-instance wiring); `/openai-cachekeep` command.
 
 **Request transformation:**
-- Purpose: Convert OpenAI Responses calls into Codex-shaped wire requests (UUIDv7 thread/turn ids, Codex turn-metadata header, OAuth/ChatGPT account headers, client_metadata, tool normalization, cache-stabilizer injection, key-reordering via `orderCodexBody` to match Codex wire serialization), with an opt-in Responses Lite shape for eligible GPT-5.6 models. Preserves OpenCode's native `max` reasoning variant on the wire and filters legacy experimental `-pro` model entries from the OAuth catalog. Resolves and preserves model/variant context for synthetic command replies to prevent model regression.
+- Purpose: Convert OpenAI Responses calls into Codex-shaped wire requests (UUIDv7 thread/turn ids, Codex turn-metadata header, OAuth/ChatGPT account headers, client_metadata, tool normalization, cache-stabilizer injection, key-reordering via `orderCodexBody` to match Codex wire serialization), with an opt-in Responses Lite shape for eligible GPT-5.6 models. Responses Lite trades capabilities for compact requests by disabling parallel tool calls, moving system instructions and tools into developer messages prefixing the input sequence, excluding hosted tools, and stripping details from images. Preserves OpenCode's native `max` reasoning variant on the wire and filters legacy experimental `-pro` model entries from the OAuth catalog. Resolves and preserves model/variant context for synthetic command replies to prevent model regression.
 - Location: `packages/opencode/src/index.ts` (`prepareCodexRequest`, `maybeInjectCacheStabilizerTool`, `normalizeCodexTool`, `getCodexSessionMetadata`, `loadCodexSessions`/`saveCodexSessions`), `packages/opencode/src/hosted-web-search.ts` (provider-hosted web-search tool + replay rewrite + SSE translation), `packages/opencode/src/prompt-context.ts` (`resolvePromptContext`), `packages/opencode/src/response-stream-error.ts`.
 - Depends on: `util/uuid-v7.ts`, `util/stable-json.ts`, `util/record.ts`, `config.ts`.
 - Used by: Plugin loader `sendWithAccessToken`, `fetch` override.
@@ -77,7 +77,7 @@
 - Used by: Plugin loader (server + notifications push), `tui.tsx` (RPC client polling + dialog delivery).
 
 **TUI sidebar:**
-- Purpose: Render an OpenCode sidebar slot showing main/fallback quota bars, routing/killswitch/health state, and the command dialog surfaces. The TUI does not own any auth state — it reads `sidebar-state.json` and pushes commands via RPC.
+- Purpose: Render an OpenCode sidebar slot showing main/fallback quota bars, routing/killswitch/health state, and the command dialog surfaces. The TUI does not own any auth state — it reads `sidebar-state.json`, resolves the session-safe active account via `resolveSessionSidebarRouting`, and pushes commands via RPC.
 - Location: `packages/opencode/src/tui.tsx`, `packages/opencode/src/tui/entry.mjs`, generated `packages/opencode/src/tui-compiled/`, `packages/opencode/src/tui/command-dialogs.tsx`, `packages/opencode/src/sidebar-state.ts`, `packages/opencode/src/tui-preferences.ts`.
 - Depends on: `@opentui/core`, `@opentui/solid`, `solid-js`, `jsonc-parser`.
 - Used by: OpenCode's TUI plugin loader (`./tui` export).
@@ -87,6 +87,13 @@
 - Location: `packages/opencode/src/quota-normalize.ts`
 - Contains: `normalizeQuotaHeaders`, `normalizeWsFrame`, `normalizeWham`, `toResetIso`.
 - Used by: Plugin loader (push), `refresh-all-quota.ts`, `cachekeep.ts`, `provider.ts` (dynamic import to avoid a cycle).
+
+**Model cost restoration:**
+- Purpose: Restore real model costs from a local cache or a remote catalog (`models.dev`) when cost zeroing is disabled.
+- Location: `packages/opencode/src/model-costs.ts`
+- Contains: `loadModelsDevCosts`, `resetModelCostsForTest`, `toSdkCost` with strict price validation, `modelsCachePath` checking `OPENCODE_OPENAI_AUTH_MODELS_CACHE`/`OPENCODE_MODELS_PATH` env vars and falling back to XDG cache, and catalog caching with a timeout-backed fetch.
+- Depends on: `node:fs/promises`, `node:os`, `node:path`.
+- Used by: `packages/opencode/src/index.ts` models provider hook.
 
 **Settings and logging:**
 - Purpose: Resolve plugin settings from env + config file, and provide a leveled, secret-redacting, size-rotating logger.
@@ -118,7 +125,7 @@
 **Pi extension (sibling package):**
 - Purpose: Same Codex OAuth capability for the Pi coding agent (separate OpenAI Codex Responses API surface).
 - Location: `packages/pi/src/index.ts`, `packages/pi/src/raw-ws-node.ts`
-- Contains: Provider registration (`openai-codex`), model list (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`), `loginOpenAICodex`/`refreshOpenAICodexToken`, custom streaming wrapper, hand-rolled WebSocket shim.
+- Contains: Provider registration (`openai-codex`), model list (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`), custom streaming wrapper, hand-rolled WebSocket shim.
 - Depends on: `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `node:net`/`node:tls`.
 - Used by: Pi extension loader.
 
@@ -135,18 +142,18 @@
 
 **Reactive fallback (per request):**
 
-1. Plugin loader `auth.fetch` determines the routing mode (purely mode-driven: `main-first` or `fallback-first`). If `fallback-first` mode is active and the request is replayable, it proactively tries usable fallback accounts before the main account.
+1. Plugin loader `auth.fetch` resolves the session affinity ID from the request's headers (`x-session-affinity`, `x-opencode-session`, `x-session-id`, `session-id`) and determines the routing mode (purely mode-driven: `main-first` or `fallback-first`). If `fallback-first` mode is active and the request is replayable, it proactively tries usable fallback accounts before the main account.
 2. Strips any existing `authorization` header, refreshes an expired main token via `refreshMainWithLease`, or refreshes a fallback via `fallbackManager.refreshAccount`. Derives the main ChatGPT identity from the access token JWT to ensure correct quota/killswitch tracking after a main-account switch.
 3. If a proactive fallback serves, its response is used. If a proactive fallback request throws a transport error (both caller-aborts and indeterminate transport failures), routing halts immediately and the error propagates to prevent request duplication and double-billing. Otherwise (or under `main-first` mode), checks if the primary account is blocked by the killswitch (verifying cached quota against configured thresholds) or by a mid-stream rate-limit mark. If blocked, it synthesizes a 429 response carrying a `Retry-After` header derived from the earliest known reset time across all accounts (or the mid-stream mark's own reset time, whichever is tighter).
 4. If the request is not blocked by the killswitch, calls `sendWithAccessToken` which rewrites headers/body via `prepareCodexRequest`, picks HTTP or WS transport, and optionally tracks the body for cachekeep — `packages/opencode/src/index.ts`.
 5. If the primary request fails with a fallback status (`401`/`403`/`429`), is blocked by the killswitch, or encounters mid-stream rate-limit exhaustion before streaming starts, and the request is replayable, `tryFallbackAccounts` reactively iterates usable fallback accounts (filtering candidates below their killswitch thresholds and unconditionally excluding those with active mid-stream rate-limit marks) and retries each candidate — `packages/opencode/src/index.ts`. Indeterminate transport failures on reactive fallbacks halt routing immediately to prevent duplication. If a fallback attempt fails, its advisory quota headers are pushed to the cache. Reactive fallback is skipped if the proactive gate already tried all fallbacks in `fallback-first` mode.
-6. The final response's `x-codex-*` headers are normalized via `normalizeQuotaHeaders` and pushed into `QuotaManager` (main or per-account), then `setSidebarState` writes `sidebar-state.json` for the TUI using the active display ID (the account that actually served).
+6. The final response's `x-codex-*` headers are normalized via `normalizeQuotaHeaders` and pushed into `QuotaManager` (main or per-account). The loader then calls `writeRequestSidebarRouting` to write the routing snapshot to `sidebar-state.json`. If a session ID is present, it registers the active account to that session in `activeRouting` (pruned to 128 entries and 1 hour age); otherwise, it falls back to legacy routing. The TUI sidebar resolves the active account for its session via `resolveSessionSidebarRouting`.
 
 **Quota push (no extra polling during normal traffic):**
 
 1. HTTP path — `normalizeQuotaHeaders(finalResponse.headers)` runs inside the `fetch` override.
 2. WS path — `codex.rate_limits` in-band frame fires `onQuota` in `ws.ts`, which calls back into `pushQuota` carrying the connection's per-request access token, internal quota account key, and the served ChatGPT account ID header to prevent cross-account leakage.
-3. `pushQuota` writes to `QuotaManager.setMain`/`setFallback` (discarding stale main frames and past-expired windows) and triggers `writeSidebarState` (snapshot to disk).
+3. `pushQuota` writes to `QuotaManager.setMain`/`setFallback` (discarding stale main frames and past-expired windows) and triggers `writeMachineSidebarState` (updates machine-global state in the sidebar snapshot using `setSidebarMachineState`).
 4. `/openai-quota` command additionally calls `refreshAllQuota` to actively fetch `wham/usage` for main + every fallback (respecting per-account backoff).
 
 **Slash command (TUI dialog):**
@@ -200,7 +207,7 @@
 **Sidebar snapshot:**
 - Purpose: Loader → TUI surface for quota/killswitch/routing without coupling the TUI to the auth storage schema.
 - Location: `packages/opencode/src/sidebar-state.ts`
-- Pattern: Promise-chained writes (no interleaved/stale writes); file path bound at loader-run time; `normalizeSidebarState` is the tolerant-read entry point so a malformed file never crashes the TUI.
+- Pattern: Promise-chained writes (no interleaved/stale writes); file path bound at loader-run time; `normalizeSidebarState` is the tolerant-read entry point so a malformed file never crashes the TUI. Writes machine-wide quota state via `setSidebarMachineState` and session-specific active routing records via `upsertSidebarActiveRouting`, preserving concurrency through a file-level write lock and a promise serialization chain.
 
 ## Entry Points
 

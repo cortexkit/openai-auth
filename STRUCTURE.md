@@ -17,6 +17,7 @@
 │   │   │   ├── commands.ts        # /openai-* dialog builders
 │   │   │   ├── config.ts          # Settings resolution (env > file > default)
 │   │   │   ├── logger.ts          # Leveled, redacting, rotating logger
+│   │   │   ├── model-costs.ts     # Dev catalog parser and cost restorer
 │   │   │   ├── quota-normalize.ts # HTTP/WS/wham → OAuthQuotaSnapshot
 │   │   │   ├── sidebar-state.ts   # Loader→TUI snapshot file
 │   │   │   ├── tui-preferences.ts # Shared tui-preferences.jsonc reader/writer/watcher
@@ -149,6 +150,7 @@
 - `packages/opencode/src/sidebar-state.ts` — loader→TUI snapshot file + tolerant reader.
 - `packages/opencode/src/dump.ts` — optional transport request dumps for cache debugging.
 - `packages/opencode/src/logger.ts` — leveled, secret-redacting, size-rotating logger.
+- `packages/opencode/src/model-costs.ts` — model cost resolution and restoration from `models.dev` catalog.
 
 **Tests:**
 - `packages/opencode/src/tests/` — co-located bun tests (`*.test.ts`).
@@ -157,7 +159,7 @@
 
 ## Naming Conventions
 
-**Files:** lowercase-kebab or lowercase-flat. Top-level files use bare lowercase names (`index.ts`, `cli.ts`, `commands.ts`, `config.ts`, `logger.ts`, `quota-normalize.ts`, `sidebar-state.ts`, `ws-pool.ts`, `hosted-web-search.ts`, `response-stream-error.ts`, `raw-ws-bun.ts`, `raw-ws-node.ts`, `version.ts`). Subdirectory files share the directory name as a prefix where it helps (`core/accounts.ts`, `core/oauth.ts`, `rpc/rpc-server.ts`, `rpc/port-file.ts`, `util/uuid-v7.ts`).
+**Files:** lowercase-kebab or lowercase-flat. Top-level files use bare lowercase names (`index.ts`, `cli.ts`, `commands.ts`, `config.ts`, `logger.ts`, `model-costs.ts`, `quota-normalize.ts`, `sidebar-state.ts`, `ws-pool.ts`, `hosted-web-search.ts`, `response-stream-error.ts`, `raw-ws-bun.ts`, `raw-ws-node.ts`, `version.ts`). Subdirectory files share the directory name as a prefix where it helps (`core/accounts.ts`, `core/oauth.ts`, `rpc/rpc-server.ts`, `rpc/port-file.ts`, `util/uuid-v7.ts`).
 Example: `packages/opencode/src/core/cachekeep.ts`, `packages/opencode/src/rpc/rpc-server.ts`.
 
 **Directories:** lowercase-kebab. Subdirectories group by layer (`core/`, `rpc/`, `tests/`, `tui/`, `util/`).
