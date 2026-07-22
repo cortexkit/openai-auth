@@ -63,7 +63,7 @@
   "dependencies": {
     "@opentui/core": ">=0.4.4",
     "@opentui/solid": ">=0.4.4",
-    "ai": "^7.0.30",
+    "ai": "^7.0.34",
     "jsonc-parser": "^3.3.1",
     "solid-js": "1.9.12"
   }
