@@ -105,8 +105,8 @@ export interface StreamResponsesWebSocketOptions {
   onAbort?: (error: Error) => void
   /** Push per-turn quota from a codex.rate_limits in-band frame. */
   onQuota?: (s: Record<string, unknown>) => void
-  /** Called when response.failed carries a rate_limit_reached_type — the only mid-stream quota-exhaustion signal on this transport. */
-  onRateLimitReached?: (window: string) => void
+  /** Called when the transport reports quota exhaustion for the current connection. */
+  onRateLimitReached?: (window: string, resetAt?: number) => void
 }
 
 export interface WrappedError {
@@ -156,6 +156,24 @@ export function normalizeHeaders(
 
 export function isAbortError(error: unknown): error is DOMException {
   return error instanceof DOMException && error.name === 'AbortError'
+}
+
+// Errors rejected during the connect/upgrade phase (before the socket opens),
+// as opposed to failures mid-stream. The standard WebSocket API exposes no HTTP
+// status/body on a failed upgrade, so the pool keys off this marker to fall back
+// to HTTP (which surfaces the real status) rather than treat it as a stream error.
+const upgradeFailures = new WeakSet<object>()
+
+export function isUpgradeFailure(error: unknown): boolean {
+  return (
+    typeof error === 'object' && error !== null && upgradeFailures.has(error)
+  )
+}
+
+function upgradeFailure(message: string, cause?: unknown): Error {
+  const error = new Error(message, cause === undefined ? undefined : { cause })
+  upgradeFailures.add(error)
+  return error
 }
 
 export function connectResponsesWebSocket(
@@ -222,13 +240,13 @@ export function connectResponsesWebSocket(
 
     function onError(error: Event) {
       cleanup()
-      reject(new Error(errorMessage(error), { cause: error }))
+      reject(upgradeFailure(errorMessage(error), error))
     }
 
     function onClose(event: CloseEvent) {
       cleanup()
       reject(
-        new Error(
+        upgradeFailure(
           closeMessage(
             'WebSocket closed before open',
             event.code,
@@ -329,6 +347,26 @@ export function streamResponsesWebSocket(
       // biome-ignore lint/suspicious/noExplicitAny: ws event parsed from JSON
       const quotaFrame = normalizeWsFrame(event as any)
       options.onQuota?.(quotaFrame as Record<string, unknown>)
+      return
+    }
+
+    const admissionRateLimit = !emitted
+      ? parseRateLimitSignal(event)
+      : undefined
+    if (admissionRateLimit && event) {
+      completed = true
+      cleanup()
+      options.onRateLimitReached?.(
+        admissionRateLimit.window,
+        admissionRateLimit.resetAt,
+      )
+      options.onTerminal?.(event)
+      options.onFirstEvent?.()
+      controller?.error(
+        new ResponseStreamError(
+          `OpenAI account rate limit reached at admission (${admissionRateLimit.window})`,
+        ),
+      )
       return
     }
 
@@ -444,8 +482,12 @@ export function streamResponsesWebSocket(
 
     const translatedEvent = event ? translateHostedWebSearchEvent(event) : event
     if (!translatedEvent) {
+      // Filtered/control frame (e.g. a hosted-web-search lifecycle event) — no
+      // SSE output is enqueued, so it must NOT set `emitted`. Setting it here
+      // would block the no-replay reroute for a later admission-time rate limit
+      // (the `!emitted` gate above). onFirstEvent still fires so the idle timer
+      // and the pool's first-event gate register the activity.
       if (!emitted) options.onFirstEvent?.()
-      emitted = true
       resetIdleTimeout('idle timeout waiting for websocket')
       return
     }
@@ -677,6 +719,47 @@ function parseWrappedError(
         ? event.error.message
         : `${status}`,
   }
+}
+
+export function parseRateLimitSignal(value: unknown):
+  | {
+      window: string
+      resetAt?: number
+    }
+  | undefined {
+  if (typeof value === 'string') {
+    try {
+      return parseRateLimitSignal(JSON.parse(value))
+    } catch {
+      return undefined
+    }
+  }
+  if (!isRecord(value)) return undefined
+
+  const causeSignal = parseRateLimitSignal(value.cause)
+  if (causeSignal) return causeSignal
+  const bodySignal = parseRateLimitSignal(value.body)
+  if (bodySignal) return bodySignal
+
+  const detail = isRecord(value.error) ? value.error : value
+  const type = typeof detail.type === 'string' ? detail.type : undefined
+  const status = value.status ?? value.status_code
+  if (type !== 'usage_limit_reached' && status !== 429) return undefined
+
+  const resetsAtSeconds = detail.resets_at
+  const resetsInSeconds = detail.resets_in_seconds
+  const resetAt =
+    typeof resetsAtSeconds === 'number' &&
+    Number.isFinite(resetsAtSeconds) &&
+    resetsAtSeconds > 0
+      ? resetsAtSeconds * 1000
+      : typeof resetsInSeconds === 'number' &&
+          Number.isFinite(resetsInSeconds) &&
+          resetsInSeconds > 0
+        ? Date.now() + resetsInSeconds * 1000
+        : undefined
+
+  return { window: type ?? 'primary', resetAt }
 }
 
 function cancelError(reason: unknown) {

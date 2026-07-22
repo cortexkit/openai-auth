@@ -354,6 +354,38 @@ describe('resolveMidStreamRateLimitResetAt', () => {
     ).toBe(now + 300_000)
   })
 
+  it('prefers an explicit provider reset over cached quota reset math', async () => {
+    const { resolveMidStreamRateLimitResetAt } = await import(
+      '../core/quota-manager.ts'
+    )
+    const providerResetAt = now + 900_000
+    const quota = {
+      primary: {
+        usedPercent: 100,
+        remainingPercent: 0,
+        resetsAt: new Date(now + 300_000).toISOString(),
+        checkedAt: now,
+      },
+    }
+    const resolveWithExplicitReset = resolveMidStreamRateLimitResetAt as (
+      snapshot: typeof quota,
+      window: string,
+      now: number,
+      defaultMs: number,
+      explicitResetAt?: number,
+    ) => number
+
+    expect(
+      resolveWithExplicitReset(
+        quota,
+        'usage_limit_reached',
+        now,
+        defaultMs,
+        providerResetAt,
+      ),
+    ).toBe(providerResetAt)
+  })
+
   it('uses the bounded default (NOT the other window) when the named window is absent', async () => {
     // The frame named `primary`, but only `secondary` has a cached reset. We
     // must NOT borrow secondary's reset — an unrelated window can reset far in

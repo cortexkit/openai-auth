@@ -53,23 +53,27 @@ export function quotaWindowResetIsPast(
 }
 
 /**
- * Resolve when a mid-stream-exhausted account's window actually resets, from
- * its own last-known cached quota snapshot (a response.failed frame carries no
- * reset time itself). The frame always names the exhausted window (primary or
- * secondary), so use only THAT window's cached reset; if it's unknown, fall
- * back to a conservative bounded default rather than borrowing the OTHER
- * window's reset — an unrelated window can reset far in the future and would
- * blackhole the account long past its actual rate-limit. The default is
- * self-correcting: if the account is still exhausted, the next response.failed
- * frame re-marks it. Pure — single source of truth shared by the fetch-override
- * reroute and its unit tests.
+ * Resolve when a WS-exhausted account becomes usable. Admission errors can
+ * carry the provider's authoritative reset; response.failed frames do not, so
+ * those fall back to the named window in the last-known quota snapshot. Never
+ * borrow the other window's reset — an unrelated window can blackhole the
+ * account long past its actual limit. The bounded default self-corrects when a
+ * later request reports exhaustion again.
  */
 export function resolveMidStreamRateLimitResetAt(
   quota: OAuthQuotaSnapshot | undefined,
   window: string,
   now: number,
   defaultMs: number,
+  explicitResetAt?: number,
 ): number {
+  if (
+    explicitResetAt !== undefined &&
+    Number.isFinite(explicitResetAt) &&
+    explicitResetAt > now
+  ) {
+    return explicitResetAt
+  }
   const named =
     window === PRIMARY
       ? quota?.primary

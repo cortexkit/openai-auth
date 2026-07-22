@@ -1483,6 +1483,123 @@ describe('integration: killswitch enforcement', () => {
     )
   })
 
+  it('reroutes to a healthy fallback after main rejects WebSocket admission with usage_limit_reached', async () => {
+    const fallback: OAuthAccount = {
+      id: 'fb-admission-healthy',
+      type: 'oauth',
+      access: 'sk-fb-admission-access',
+      refresh: 'sk-fb-admission-refresh',
+      expires: Date.now() + 24 * 3600_000,
+      enabled: true,
+      addedAt: Date.now(),
+      lastUsed: Date.now(),
+    }
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [fallback],
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let mainSends = 0
+    let fallbackSends = 0
+    let hooks: Hooks | undefined
+    await withFakeWebSocket(
+      ({ message, authorization }) => ({
+        send() {
+          if (authorization === 'Bearer access-main-admission-rl') {
+            mainSends++
+            message(
+              JSON.stringify({
+                type: 'error',
+                error: {
+                  type: 'usage_limit_reached',
+                  message: 'The usage limit has been reached',
+                  plan_type: 'team',
+                  resets_at: 1_784_958_366,
+                  eligible_promo: null,
+                  resets_in_seconds: 514_504,
+                },
+              }),
+            )
+            return
+          }
+          fallbackSends++
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: `resp_fb_admission_${fallbackSends}` },
+            }),
+          )
+        },
+      }),
+      async () => {
+        try {
+          hooks = await CodexAuthPlugin(createMockPluginInput(), {
+            experimentalWebSockets: true,
+          })
+          const authHook = hooks.auth
+          if (!authHook?.loader) throw new Error('No auth loader')
+          const loaderResult = await authHook.loader(
+            async () => ({
+              type: 'oauth' as const,
+              provider: 'openai',
+              access: 'access-main-admission-rl',
+              refresh: refreshToken,
+              expires: Date.now() + 24 * 3600_000,
+              accountId: 'chatgpt-main-admission-rl',
+            }),
+            {
+              id: 'openai',
+              label: 'OpenAI',
+              models: [],
+            } as unknown as Parameters<
+              NonNullable<(typeof authHook)['loader']>
+            >[1],
+          )
+          const fetchOverride = (loaderResult as Record<string, unknown>)
+            .fetch as (url: string, init?: RequestInit) => Promise<Response>
+          const wsRequest: RequestInit = {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'session-id': 'ws-admission-rate-limit-reroute-session',
+            },
+            body: JSON.stringify({ model: 'gpt-5.5', input: [], stream: true }),
+          }
+
+          const first = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            wsRequest,
+          )
+          expect(first.status).toBe(200)
+          await expect(first.text()).rejects.toMatchObject({
+            isRetryable: true,
+          })
+
+          const second = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            wsRequest,
+          )
+          expect(second.status).toBe(200)
+          await second.text()
+
+          expect(mainSends).toBe(1)
+          expect(fallbackSends).toBe(1)
+        } finally {
+          globalThis.fetch = originalFetch
+          await hooks?.dispose?.()
+        }
+      },
+    )
+  })
+
   it('excludes a rate-limited fallback from candidate selection after a mid-stream mark', async () => {
     // fallback-first: the single fallback is tried before main. Its own
     // mid-stream rate_limit_reached_type mark must make usableFallbackCandidates

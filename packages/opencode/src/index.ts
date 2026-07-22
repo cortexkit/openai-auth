@@ -1277,13 +1277,12 @@ export async function CodexAuthPlugin(
           await writeMachineSidebarState(quotaManager, latestStorage)
         }
 
-        // Resolve when a mid-stream-exhausted account's window actually resets,
-        // from its own last-known cached quota. The resolution logic itself
-        // lives in quota-manager.ts (single source of truth, unit-tested
-        // there) — this wrapper only supplies the account's cached snapshot.
+        // The pure resolver prefers an admission error's explicit reset and
+        // otherwise uses this account's cached named-window quota.
         function midStreamRateLimitResetAt(
           accountKey: string,
           window: string,
+          explicitResetAt?: number,
         ): number {
           const quota =
             accountKey === 'main'
@@ -1294,6 +1293,7 @@ export async function CodexAuthPlugin(
             window,
             Date.now(),
             DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS,
+            explicitResetAt,
           )
         }
 
@@ -1314,13 +1314,10 @@ export async function CodexAuthPlugin(
                   true,
                 )
               },
-              // Mid-stream quota exhaustion (response.failed carrying
-              // rate_limit_reached_type) — the frame itself is the authority,
-              // so this marks the account rate-limited without any quota-API
-              // call. The fetch override then reroutes away from it: a
-              // rate-limited main is treated like a killswitch block, and a
-              // rate-limited fallback is dropped from candidate selection.
-              onRateLimitReached: (window, accountId) => {
+              // WS quota exhaustion is authoritative without a quota-API call.
+              // Admission errors supply their own reset; response.failed uses
+              // the cached named-window reset or the bounded default.
+              onRateLimitReached: (window, accountId, explicitResetAt) => {
                 if (!accountId) {
                   // The loader always sets the internal quota-account header,
                   // so this should never fire today — but a future call site
@@ -1332,7 +1329,11 @@ export async function CodexAuthPlugin(
                   )
                 }
                 const accountKey = accountId ?? 'main'
-                const resetAt = midStreamRateLimitResetAt(accountKey, window)
+                const resetAt = midStreamRateLimitResetAt(
+                  accountKey,
+                  window,
+                  explicitResetAt,
+                )
                 quotaManager.markRateLimited(accountKey, resetAt)
                 logQ.debug('mid-stream rate limit mark', {
                   pid: process.pid,
