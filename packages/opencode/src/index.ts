@@ -1375,6 +1375,7 @@ export async function CodexAuthPlugin(
 
         async function writeRequestSidebarRouting(
           sessionId: string | undefined,
+          parentSessionId: string | undefined,
           activeId: string,
           route: RoutingMode,
           accounts: readonly { id: string; enabled?: boolean }[],
@@ -1386,6 +1387,13 @@ export async function CodexAuthPlugin(
               accounts,
               boundSidebarFile,
             )
+            if (parentSessionId && parentSessionId !== sessionId) {
+              await upsertSidebarActiveRouting(
+                { sessionId: parentSessionId, ...input },
+                accounts,
+                boundSidebarFile,
+              )
+            }
             return
           }
           await setSidebarLegacyRouting(input, boundSidebarFile)
@@ -1988,9 +1996,10 @@ export async function CodexAuthPlugin(
         return {
           apiKey: OAUTH_DUMMY_KEY,
           async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
-            const sidebarSessionId = resolveSidebarSessionId(
-              effectiveRequestHeaders(requestInput, init),
-            )
+            const requestHeaders = effectiveRequestHeaders(requestInput, init)
+            const sidebarSessionId = resolveSidebarSessionId(requestHeaders)
+            const sidebarParentSessionId =
+              requestHeaders.get('x-parent-session-id')?.trim() || undefined
             // Routing is purely mode-driven. The primary is ALWAYS the main
             // account; fallback-first is handled by a proactive gate below that
             // tries usable fallbacks before main. There is no per-account pin.
@@ -2198,10 +2207,11 @@ export async function CodexAuthPlugin(
 
             await writeRequestSidebarRouting(
               sidebarSessionId,
+              sidebarParentSessionId,
               servedActiveId,
               mode,
               reqStorage?.accounts ?? [],
-            )
+            ).catch(() => {})
             return finalResponse
           },
           async dispose() {

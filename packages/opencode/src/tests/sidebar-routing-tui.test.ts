@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import {
   DEFAULT_SIDEBAR_STATE,
   drainSidebarWrites,
+  isQuotaExhausted,
+  isUsableRoutingEntry,
   normalizeSidebarState,
   removeSidebarActiveRouting,
   resolveSessionSidebarRouting,
@@ -18,6 +20,67 @@ function state(overrides: Partial<SidebarState>): SidebarState {
 }
 
 const now = 2 * 60 * 60 * 1000
+
+describe('quota exhaustion guard', () => {
+  test('malformed persisted quota values stay fail-open', () => {
+    const future = new Date(now + 60_000).toISOString()
+    const window = { remainingPercent: 0, checkedAt: now, windowMinutes: 10080 }
+    expect(
+      isQuotaExhausted(
+        {
+          primary: {
+            ...window,
+            usedPercent: Number.NaN,
+            resetsAt: future,
+          },
+        },
+        now,
+      ),
+    ).toBe(false)
+    expect(
+      isQuotaExhausted(
+        {
+          primary: {
+            ...window,
+            usedPercent: '100' as unknown as number,
+            resetsAt: future,
+          },
+        },
+        now,
+      ),
+    ).toBe(false)
+    expect(
+      isQuotaExhausted(
+        {
+          primary: {
+            ...window,
+            usedPercent: 100,
+            resetsAt: 'not-a-date',
+          },
+        },
+        now,
+      ),
+    ).toBe(false)
+    expect(
+      isQuotaExhausted(
+        {
+          primary: {
+            ...window,
+            usedPercent: 100,
+            resetsAt: (now + 60_000) as unknown as string,
+          },
+        },
+        now,
+      ),
+    ).toBe(false)
+    expect(
+      isQuotaExhausted(
+        { primary: { ...window, usedPercent: 100, resetsAt: future } },
+        now,
+      ),
+    ).toBe(true)
+  })
+})
 
 describe('session sidebar routing', () => {
   test('selects each session own usable routing entry', () => {
@@ -116,6 +179,193 @@ describe('session sidebar routing', () => {
     })
   })
 
+  test('derives a non-exhausted fallback when the session entry targets an exhausted fallback', () => {
+    const shared = state({
+      route: 'fallback-first',
+      fallbacks: [
+        {
+          id: 'work-alt',
+          label: 'Work',
+          quota: {
+            primary: {
+              usedPercent: 100,
+              remainingPercent: 0,
+              resetsAt: new Date(now + 60_000).toISOString(),
+            },
+          },
+          killed: false,
+          enabled: true,
+        },
+        {
+          id: 'client-alt',
+          label: 'Client',
+          quota: {
+            primary: {
+              usedPercent: 6,
+              remainingPercent: 94,
+              resetsAt: new Date(now + 60_000).toISOString(),
+            },
+          },
+          killed: false,
+          enabled: true,
+        },
+      ],
+      activeRouting: {
+        'parent-session': {
+          activeId: 'work-alt',
+          route: 'fallback-first',
+          updatedAt: now,
+        },
+      },
+    })
+
+    expect(resolveSessionSidebarRouting(shared, 'parent-session', now)).toEqual(
+      { activeId: 'client-alt', route: 'fallback-first' },
+    )
+  })
+
+  test('derives a fallback when the session entry targets exhausted main', () => {
+    const shared = state({
+      route: 'fallback-first',
+      main: {
+        quota: {
+          primary: {
+            usedPercent: 100,
+            remainingPercent: 0,
+            resetsAt: new Date(now + 60_000).toISOString(),
+          },
+        },
+        killed: false,
+      },
+      fallbacks: [
+        {
+          id: 'fallback-1',
+          label: 'Fallback',
+          quota: null,
+          killed: false,
+          enabled: true,
+        },
+      ],
+      activeRouting: {
+        'parent-session': {
+          activeId: 'main',
+          route: 'main-first',
+          updatedAt: now,
+        },
+      },
+    })
+
+    expect(resolveSessionSidebarRouting(shared, 'parent-session', now)).toEqual(
+      { activeId: 'fallback-1', route: 'fallback-first' },
+    )
+  })
+
+  test('honors an exhausted entry after its quota window reset has elapsed', () => {
+    const shared = state({
+      route: 'fallback-first',
+      fallbacks: [
+        {
+          id: 'fallback-1',
+          label: 'Fallback',
+          quota: {
+            primary: {
+              usedPercent: 100,
+              remainingPercent: 0,
+              resetsAt: new Date(now - 1).toISOString(),
+            },
+          },
+          killed: false,
+          enabled: true,
+        },
+      ],
+      activeRouting: {
+        'parent-session': {
+          activeId: 'fallback-1',
+          route: 'main-first',
+          updatedAt: now,
+        },
+      },
+    })
+
+    expect(resolveSessionSidebarRouting(shared, 'parent-session', now)).toEqual(
+      { activeId: 'fallback-1', route: 'main-first' },
+    )
+  })
+
+  test('honors entries when quota is missing or unknown', () => {
+    const shared = state({
+      fallbacks: [
+        {
+          id: 'missing-quota',
+          label: 'Missing quota',
+          quota: {},
+          killed: false,
+          enabled: true,
+        },
+        {
+          id: 'null-quota',
+          label: 'Null quota',
+          quota: null,
+          killed: false,
+          enabled: true,
+        },
+      ],
+      activeRouting: {
+        missing: {
+          activeId: 'missing-quota',
+          route: 'fallback-first',
+          updatedAt: now,
+        },
+        null: {
+          activeId: 'null-quota',
+          route: 'fallback-first',
+          updatedAt: now,
+        },
+      },
+    })
+
+    expect(resolveSessionSidebarRouting(shared, 'missing', now).activeId).toBe(
+      'missing-quota',
+    )
+    expect(resolveSessionSidebarRouting(shared, 'null', now).activeId).toBe(
+      'null-quota',
+    )
+  })
+
+  test('keeps the first enabled fallback when every fallback is exhausted', () => {
+    const exhaustedQuota = {
+      primary: {
+        usedPercent: 100,
+        remainingPercent: 0,
+        resetsAt: new Date(now + 60_000).toISOString(),
+      },
+    }
+    const shared = state({
+      route: 'fallback-first',
+      fallbacks: [
+        {
+          id: 'fallback-1',
+          label: 'First',
+          quota: exhaustedQuota,
+          killed: false,
+          enabled: true,
+        },
+        {
+          id: 'fallback-2',
+          label: 'Second',
+          quota: exhaustedQuota,
+          killed: false,
+          enabled: true,
+        },
+      ],
+    })
+
+    expect(resolveSessionSidebarRouting(shared, 'missing', now)).toEqual({
+      activeId: 'fallback-1',
+      route: 'fallback-first',
+    })
+  })
+
   test('does not derive a killed fallback for a missing session', () => {
     const shared = state({
       route: 'fallback-first',
@@ -134,6 +384,16 @@ describe('session sidebar routing', () => {
       activeId: 'main',
       route: 'fallback-first',
     })
+  })
+
+  test('treats a routing entry targeting a killed fallback as unusable', () => {
+    const accounts = [{ id: 'killed-fb', enabled: true, killed: true }]
+    const entry = {
+      activeId: 'killed-fb',
+      route: 'fallback-first',
+      updatedAt: now,
+    }
+    expect(isUsableRoutingEntry(entry, accounts, now)).toBe(false)
   })
 
   test('present entry for a removed fallback derives instead of highlighting it', () => {

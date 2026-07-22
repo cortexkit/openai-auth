@@ -295,6 +295,7 @@ export const ACTIVE_ROUTING_MAX_ENTRIES = 128
 export type SidebarRoutingAccount = {
   id: string
   enabled?: boolean
+  killed?: boolean
 }
 
 export function isUsableRoutingEntry(
@@ -308,9 +309,28 @@ export function isUsableRoutingEntry(
   return (
     entry.activeId === 'main' ||
     accounts.some(
-      (account) => account.enabled !== false && account.id === entry.activeId,
+      (account) =>
+        account.enabled !== false &&
+        account.killed !== true &&
+        account.id === entry.activeId,
     )
   )
+}
+
+export function isQuotaExhausted(
+  quota: AccountQuota | null | undefined,
+  now = Date.now(),
+): boolean {
+  const primary = quota?.primary
+  if (
+    typeof primary?.resetsAt !== 'string' ||
+    !Number.isFinite(primary.usedPercent) ||
+    primary.usedPercent < 100
+  ) {
+    return false
+  }
+  const resetsAt = Date.parse(primary.resetsAt)
+  return Number.isFinite(resetsAt) && resetsAt > now
 }
 
 export function resolveSessionSidebarRouting(
@@ -322,13 +342,24 @@ export function resolveSessionSidebarRouting(
     return { activeId: state.activeId ?? 'main', route: state.route }
   }
   const own = sessionId ? state.activeRouting?.[sessionId] : undefined
-  if (own && isUsableRoutingEntry(own, state.fallbacks, now)) {
+  const ownQuota =
+    own?.activeId === 'main'
+      ? state.main.quota
+      : state.fallbacks.find((account) => account.id === own?.activeId)?.quota
+  if (
+    own &&
+    isUsableRoutingEntry(own, state.fallbacks, now) &&
+    !isQuotaExhausted(ownQuota, now)
+  ) {
     return { activeId: own.activeId, route: own.route }
   }
 
-  const fallback = state.fallbacks.find(
+  const enabledFallbacks = state.fallbacks.filter(
     (account) => account.enabled && !account.killed,
   )
+  const fallback =
+    enabledFallbacks.find((account) => !isQuotaExhausted(account.quota, now)) ??
+    enabledFallbacks[0]
   return {
     activeId:
       state.route === 'fallback-first' && fallback ? fallback.id : 'main',

@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, test } from 'bun:test'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -21,6 +27,7 @@ import {
   drainSidebarWrites,
   getSidebarStateFile,
   normalizeSidebarState,
+  resolveSessionSidebarRouting,
   type SidebarState,
 } from '../sidebar-state.ts'
 import {
@@ -414,6 +421,106 @@ describe('integration: HTTP quota push', () => {
       )
       expect(sidebar.main.quota?.primary?.usedPercent).toBe(42)
       expect(sidebar.main.quota?.secondary?.usedPercent).toBe(15)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('records served routing for child and parent sessions', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const authHook = hooks.auth
+      if (!authHook?.loader) throw new Error('No auth loader')
+      const loaderResult = await authHook.loader(
+        async () => ({
+          type: 'oauth' as const,
+          provider: 'openai',
+          access: accessToken,
+          refresh: refreshToken,
+          expires: Date.now() + 3600_000,
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+      )
+      const fetchOverride = (loaderResult as Record<string, unknown>).fetch as
+        | ((url: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
+        | undefined
+      if (!fetchOverride) throw new Error('No fetch in loader result')
+
+      const serve = async (sessionId: string, parentId?: string) => {
+        const headers = new Headers({
+          'content-type': 'application/json',
+          'session-id': sessionId,
+        })
+        if (parentId) headers.set('x-parent-session-id', parentId)
+        const response = await fetchOverride(
+          'https://api.openai.com/v1/responses',
+          {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ model: 'gpt-5.5', input: [] }),
+          },
+        )
+        expect(response.status).toBe(200)
+        await response.body?.cancel()
+      }
+
+      await serve('child-session', 'parent-session')
+      await serve('child-only-session')
+      await serve('same-session', 'same-session')
+      await drainSidebarWrites()
+
+      const sidebar = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      )
+      expect(Object.keys(sidebar.activeRouting ?? {}).sort()).toEqual([
+        'child-only-session',
+        'child-session',
+        'parent-session',
+        'same-session',
+      ])
+      expect(sidebar.activeRouting?.['child-session']).toMatchObject({
+        activeId: 'main',
+        route: 'main-first',
+      })
+      expect(sidebar.activeRouting?.['parent-session']).toEqual(
+        sidebar.activeRouting?.['child-session'],
+      )
+      expect(sidebar.activeRouting?.['child-only-session']).toMatchObject({
+        activeId: 'main',
+        route: 'main-first',
+      })
+      expect(sidebar.activeRouting?.['same-session']).toMatchObject({
+        activeId: 'main',
+        route: 'main-first',
+      })
+
+      renameSync(sidebarFile, `${sidebarFile}.saved`)
+      mkdirSync(sidebarFile)
+      await serve('unwritable-child', 'unwritable-parent')
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
@@ -2738,6 +2845,88 @@ describe('integration: active fallback routing', () => {
       })
       expect(sidebar.activeId).toBe('main')
       expect(sidebar.route).toBe('main-first')
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('records fallback-served routing on the parent session', async () => {
+    seedStorage({ access: 'fallback-access-token' })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({
+          'x-opencode-session': 'child-session',
+          'x-parent-session-id': 'parent-session',
+        }),
+      )
+      await drainSidebarWrites()
+
+      const sidebar = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      )
+      expect(sidebar.activeRouting?.['child-session']).toMatchObject({
+        activeId: 'fallback-1',
+        route: 'fallback-first',
+      })
+      // A fallback (not main) served the child; the parent entry must mirror
+      // that same fallback so the parent's sidebar highlights the live account.
+      expect(sidebar.activeRouting?.['parent-session']).toMatchObject({
+        activeId: 'fallback-1',
+        route: 'fallback-first',
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('uses legacy display routing when the request carries no session headers', async () => {
+    seedStorage({ access: 'fallback-access-token' })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit(),
+      )
+      await drainSidebarWrites()
+
+      const sidebar = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      )
+      // Sessionless requests write only the legacy display fields, never a
+      // per-session entry.
+      expect(sidebar.activeRouting).toBeUndefined()
+      expect(sidebar.activeId).toBe('fallback-1')
+      expect(sidebar.route).toBe('fallback-first')
+      // Resolving without a session reads those legacy fields and must yield
+      // defined routing rather than crash or return undefined.
+      expect(resolveSessionSidebarRouting(sidebar, undefined)).toEqual({
+        activeId: 'fallback-1',
+        route: 'fallback-first',
+      })
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
