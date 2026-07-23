@@ -111,7 +111,7 @@ Token values and authorization/cookie headers are redacted from the log. Convers
 
 ## Slash commands
 
-All commands open an interactive control surface in the TUI (a selectable dialog), and also accept the explicit argument forms below.
+All commands open an interactive control surface in the TUI (a selectable dialog). Commands with listed arguments also accept those explicit argument forms.
 
 | Command | Arguments | Purpose |
 | --- | --- | --- |
@@ -120,6 +120,7 @@ All commands open an interactive control surface in the TUI (a selectable dialog
 | `/openai-routing` | `main-first` · `fallback-first` | Set account preference order. |
 | `/openai-killswitch` | `on` · `off` · `set <acct>:<5h>,<1w> ...` | Hard-block accounts below per-window quota thresholds. |
 | `/openai-cachekeep` | `on` · `off` · `subagents on` · `subagents off` | Idle prompt-cache keep-warm; optional subagent mode. |
+| `/openai-reset` | Modal only | Spend one applicable reset credit for an exhausted account after explicit confirmation. |
 | `/openai-logging` | `<level>` | Set log level (`error`/`warn`/`info`/`debug`/`trace`) live. |
 | `/openai-dump` | `on` · `off` | Toggle transport request dumps for cache debugging. |
 

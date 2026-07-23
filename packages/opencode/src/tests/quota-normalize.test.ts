@@ -185,12 +185,16 @@ describe('quota normalize → QuotaSnapshot', () => {
         },
         secondary_window: null,
       },
-      rate_limit_reset_credits: { available_count: 4 },
+      rate_limit_reset_credits: {
+        available_count: 4,
+        applicable_available_count: 3,
+      },
     } as Parameters<typeof normalizeWham>[0])
 
     expect(snapshot.primary?.windowMinutes).toBe(10_080)
     expect(snapshot.secondary).toBeUndefined()
     expect(snapshot.resetCreditsAvailable).toBe(4)
+    expect(snapshot.resetCreditsApplicable).toBe(3)
   })
 
   it('omits invalid window lengths and reset-credit counts', () => {

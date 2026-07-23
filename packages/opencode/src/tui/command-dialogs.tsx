@@ -1,5 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
+import { createLogger } from '../logger'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
 import {
   type AccountQuota,
@@ -8,7 +9,10 @@ import {
   resolveSessionSidebarRouting,
   type SidebarState,
 } from '../sidebar-state.js'
+import { errorMessage } from '../util/error'
 import { openUrl } from '../util/open-url'
+
+const log = createLogger('rpc-tui')
 
 type ApplyFn = (
   command: OpenDialogPayload['command'],
@@ -94,6 +98,242 @@ export function buildCachekeepDialogOptions(payload: OpenDialogPayload) {
   ]
 }
 
+type ResetAccountKnob = {
+  accountKey: string
+  label: string
+  usedPercent?: number
+  availableCount?: number
+  applicableAvailableCount?: number
+  eligible: boolean
+  reason?: string
+  selectedCreditId?: string
+  selectedCreditExpiresAt?: string
+}
+
+type ResetPreviewKnob = ResetAccountKnob & {
+  chatgptAccountId?: string
+  resetTime?: string
+}
+
+type ResetDialogOption = {
+  title: string
+  value: string
+  description: string
+  disabled?: boolean
+}
+
+function resetAccountOptions(payload: OpenDialogPayload): ResetDialogOption[] {
+  const accounts = Array.isArray(payload.knobs.accounts)
+    ? (payload.knobs.accounts as ResetAccountKnob[])
+    : []
+  return [
+    ...accounts.map((account) => {
+      const used =
+        account.usedPercent === undefined
+          ? 'quota unavailable'
+          : `${account.usedPercent}%`
+      const counts = `${account.applicableAvailableCount ?? 0}/${account.availableCount ?? 0}`
+      const status = account.eligible
+        ? 'eligible'
+        : (account.reason ?? 'unavailable')
+      const details = `${used} · ${counts}`
+      const shortDate =
+        account.selectedCreditExpiresAt?.slice(0, 10) ?? 'unknown'
+      return {
+        title: `${account.label} — ${status}`,
+        value: `account:${account.accountKey}`,
+        description: account.eligible
+          ? `${details} · exp ${shortDate}`
+          : details,
+      }
+    }),
+    {
+      title: 'Refresh',
+      value: 'refresh',
+      description: 'Re-check account quota and reset credits',
+    },
+    {
+      title: 'Close',
+      value: 'close',
+      description: 'Close this dialog',
+    },
+  ]
+}
+
+function resetResultOptions(payload: OpenDialogPayload): ResetDialogOption[] {
+  const accountKey =
+    typeof payload.knobs.accountKey === 'string'
+      ? payload.knobs.accountKey
+      : undefined
+  const chatgptAccountId =
+    typeof payload.knobs.chatgptAccountId === 'string'
+      ? payload.knobs.chatgptAccountId
+      : undefined
+  const code = typeof payload.knobs.code === 'string' ? payload.knobs.code : ''
+  const retrySafe =
+    (code === 'ambiguous' ||
+      code === 'http_error' ||
+      code === 'expired_unreconciled' ||
+      payload.knobs.stateWriteFailed === true) &&
+    typeof payload.knobs.retryGuidance === 'string' &&
+    accountKey !== undefined &&
+    chatgptAccountId !== undefined
+  return [
+    {
+      title: payload.text,
+      value: 'result',
+      description: 'Command result',
+    },
+    ...(retrySafe
+      ? [
+          {
+            title: 'Retry',
+            value: 'retry',
+            description:
+              'Reuse the bound request and credit identifiers for this uncertain outcome',
+          },
+        ]
+      : []),
+    {
+      title: 'Refresh',
+      value: 'refresh',
+      description: 'Re-check account quota and reset credits',
+    },
+    {
+      title: 'Close',
+      value: 'close',
+      description: 'Close this dialog',
+    },
+  ]
+}
+
+function openResetDialog(
+  api: TuiPluginApi,
+  payload: OpenDialogPayload,
+  apply: ApplyFn,
+) {
+  let applyGeneration = 0
+  const render = (state: OpenDialogPayload) => {
+    const applyAndRender = (args: string) => {
+      const generation = ++applyGeneration
+      log.debug('reset dialog apply', { args, generation })
+      void apply('openai-reset', args)
+        .then((result) => {
+          log.debug('reset dialog apply result', {
+            generation,
+            currentGeneration: applyGeneration,
+            stage: result.knobs?.stage,
+            accountRows: Array.isArray(result.knobs?.accounts)
+              ? (result.knobs.accounts as unknown[]).length
+              : undefined,
+          })
+          if (generation !== applyGeneration) return
+          if (typeof result.knobs?.stage !== 'string') {
+            render({
+              command: 'openai-reset',
+              text: 'The reset request is still completing or returned no result. Choose Refresh to check the current state — do NOT re-confirm.',
+              knobs: { stage: 'result', code: 'unknown' },
+            })
+            return
+          }
+          render({
+            command: 'openai-reset',
+            text: result.text,
+            knobs: result.knobs,
+          })
+        })
+        .catch((error) => {
+          if (generation !== applyGeneration) return
+          log.warn('reset dialog apply rejected', {
+            error: errorMessage(error),
+          })
+          render({
+            command: 'openai-reset',
+            text: 'Command failed — the plugin could not complete the request; the plugin log has details.',
+            knobs: { stage: 'result', code: 'error' },
+          })
+        })
+    }
+    const stage = state.knobs.stage
+    log.debug('reset dialog render', {
+      stage,
+      accountRows: Array.isArray(state.knobs.accounts)
+        ? (state.knobs.accounts as unknown[]).length
+        : undefined,
+      knobKeys: Object.keys(state.knobs),
+    })
+    api.ui.dialog.setSize('xlarge')
+
+    if (stage === 'confirm') {
+      const preview = state.knobs.preview as ResetPreviewKnob | undefined
+      const accountKey = preview?.accountKey
+      const chatgptAccountId = preview?.chatgptAccountId
+      const applicableCount = preview?.applicableAvailableCount ?? 0
+      const DialogConfirm = api.ui.DialogConfirm
+      api.ui.dialog.replace(() => (
+        <DialogConfirm
+          title='Reset quota window'
+          message={`${state.text}\n\nThis SPENDS 1 of ${applicableCount} reset credits — irreversible.\n\nChoose Reset to continue or Cancel to return.\n\nEnter = Cancel (host default). Press Tab then Enter to Reset.`}
+          onConfirm={() => {
+            if (!accountKey || !chatgptAccountId) return
+            applyAndRender(
+              `confirm ${encodeURIComponent(accountKey)} ${encodeURIComponent(chatgptAccountId)}`,
+            )
+          }}
+          onCancel={() => applyAndRender('refresh')}
+        />
+      ))
+      return
+    }
+
+    const DialogSelect = api.ui.DialogSelect<string>
+    const options =
+      stage === 'result'
+        ? resetResultOptions(state)
+        : resetAccountOptions(state)
+    api.ui.dialog.replace(() => (
+      <DialogSelect
+        title={
+          stage === 'result' ? 'OpenAI reset result' : 'OpenAI reset credits'
+        }
+        options={options}
+        onSelect={(option) => {
+          if (option.disabled) return
+          if (option.value === 'result') return
+          if (option.value === 'close') {
+            applyGeneration += 1
+            api.ui.dialog.clear()
+            return
+          }
+          if (option.value === 'refresh') {
+            applyAndRender('refresh')
+            return
+          }
+          if (option.value === 'retry') {
+            const accountKey = state.knobs.accountKey
+            const chatgptAccountId = state.knobs.chatgptAccountId
+            if (
+              typeof accountKey !== 'string' ||
+              typeof chatgptAccountId !== 'string'
+            ) {
+              return
+            }
+            applyAndRender(
+              `retry ${encodeURIComponent(accountKey)} ${encodeURIComponent(chatgptAccountId)}`,
+            )
+            return
+          }
+          if (!option.value.startsWith('account:')) return
+          const accountKey = option.value.slice('account:'.length)
+          applyAndRender(`select ${encodeURIComponent(accountKey)}`)
+        }}
+      />
+    ))
+  }
+
+  render(payload)
+}
+
 function showText(api: TuiPluginApi, text: string) {
   api.ui.dialog.setSize('xlarge')
   api.ui.dialog.replace(() => (
@@ -147,6 +387,11 @@ export function openCommandDialog(
   apply: ApplyFn,
   sessionId?: string,
 ) {
+  if (payload.command === 'openai-reset') {
+    openResetDialog(api, payload, apply)
+    return
+  }
+
   if (payload.command === 'openai-routing') {
     const current = (payload.knobs.mode as string) ?? 'main-first'
     const DialogSelect = api.ui.DialogSelect<string>

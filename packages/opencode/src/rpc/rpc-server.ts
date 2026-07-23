@@ -55,7 +55,12 @@ export async function startRpcServer(
   options: RpcServerOptions,
 ): Promise<RpcServerHandle> {
   const token = randomBytes(32).toString('hex')
-  const timeoutMs = options.timeoutMs ?? 2000
+  // Safety net, not a per-command SLA: it must outlast the slowest legitimate
+  // apply (a reset redemption is bounded by a 60s consume call), so the socket
+  // is never destroyed out from under a handler that is still working. Fast
+  // commands respond in milliseconds regardless; per-command deadlines belong
+  // to the client, which passes its own timeout.
+  const timeoutMs = options.timeoutMs ?? 90_000
   const server = createServer((req, res) => {
     req.setTimeout(timeoutMs, () => {
       req.socket.destroy()

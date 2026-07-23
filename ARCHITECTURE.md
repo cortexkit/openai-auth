@@ -111,8 +111,8 @@
 **Commands (dialogs):**
 - Purpose: Per-slash-command payload builders producing `OpenDialogPayload` (text + knobs) and applying user selections to storage. Copies the command context copy per invocation to prevent concurrent sessions from crossing feedback.
 - Location: `packages/opencode/src/commands.ts`
-- Contains: Command name constants (`OPENAI_*_COMMAND_NAME`), `MODAL_COMMANDS`, `CommandContext` DI shape, `buildDialogPayload`, `applyCommand`, `executeQuotaCommand`/`executeAccountCommand`/`executeRoutingCommand`/`executeKillswitchCommand`/`executeDumpCommand`/`executeLoggingCommand`/`executeCachekeepCommand`.
-- Depends on: `core/accounts.ts`, `core/cachekeep.ts`, `core/oauth.ts`, `core/refresh-all-quota.ts`, `quota-manager.ts`, `rpc/protocol.ts`, `logger.ts`, `config.ts`.
+- Contains: Command name constants (`OPENAI_*_COMMAND_NAME`), `MODAL_COMMANDS`, `CommandContext` DI shape, `buildDialogPayload`, `applyCommand`, `executeQuotaCommand`/`executeAccountCommand`/`executeRoutingCommand`/`executeKillswitchCommand`/`executeDumpCommand`/`executeLoggingCommand`/`executeCachekeepCommand`/`executeResetCommand`.
+- Depends on: `core/accounts.ts`, `core/cachekeep.ts`, `core/oauth.ts`, `core/refresh-all-quota.ts`, `core/reset-credits.ts`, `quota-manager.ts`, `rpc/protocol.ts`, `logger.ts`, `config.ts`.
 - Used by: Plugin loader (`auth.loader`), RPC `apply` dispatch.
 
 **CLI (`openai-auth`):**
@@ -164,6 +164,18 @@
 4. TUI's `tui.tsx` polls the loader's loopback RPC (`/rpc/pending-notifications`), receives the dialog, and renders it via `command-dialogs.tsx`.
 5. User clicks Apply → TUI POSTs `/rpc/apply` → loader's `apply` calls `buildDialogPayload`, mutates storage via `mutateAccounts`, and returns updated knobs for the TUI to re-render.
 
+**`/openai-reset` credit redemption:**
+
+1. The account list reuses each account's valid L1 access token to fetch `wham/usage` and reset-credit inventory in parallel, producing a per-account preview. Only exhausted accounts with an applicable, eligible credit and a stable ChatGPT account identity can continue.
+2. Selecting an account opens an explicit L2 confirmation bound to its stable `chatgptAccountId`; the dialog states that one reset credit will be spent and that the action is irreversible.
+3. Confirmation resolves the target again and rejects the redemption if its ChatGPT identity no longer matches the bound identity.
+4. A new attempt re-fetches quota and credits and re-checks exhaustion and applicable-credit preconditions immediately before claiming a credit. Under the persisted-pair retry rule (3a), an explicit retry instead requires an active in-flight attempt and reuses its `creditId` and `redeemRequestId` pair.
+5. `consumeResetCredit` sends the explicit credit ID and redemption UUID to the consume endpoint in a POST bounded by a 60-second timeout. The read-only credit-list GET is bounded by a 15-second timeout; an abort surfaces as an `http_error` list failure.
+6. Terminal server outcomes (`reset`, `already_redeemed`, `nothing_to_reset`, `no_credit`) clear the matching in-flight pair and persist `lastOutcome`; only the credit-spending `reset` and `already_redeemed` outcomes start cooldown. HTTP and ambiguous outcomes preserve the pair so a retry can reuse the same identifiers; an expired unreconciled pair requires an explicit replay, while corrupt local state is recorded as locally ambiguous instead of issuing a consume request.
+7. A successful or already-redeemed outcome runs the normal targeted quota refresh for the selected account, pushes the result through `QuotaManager`, refreshes the sidebar snapshot, and fetches the remaining applicable-credit count.
+
+Server-side deduplication of a repeated `redeem_request_id` is verified live (2026-07-23): replaying a consumed `(redeem_request_id, credit_id)` returns `already_redeemed` with `windows_reset: 0`, the account's available-credit count does not decrement a second time, and the response carries the original redemption's `redeemed_at`. Replaying a consumed identifier is therefore safe — the server dedupes on it and never spends another credit — which is the invariant the retry path relies on.
+
 **Cache keep-warm (idle session):**
 
 1. Every main-agent (and optionally subagent) request is captured by `buildKeepwarmCapture` from `sendWithAccessToken`. Outside of the configured clock window, capture is skipped.
@@ -193,6 +205,11 @@
 - Purpose: Idle prompt-cache warmer with per-session targets, idle caps (1 h main / 30 min subagent, extended to 75 min for GPT-5.6 subagents), clock window checks, and 10-min backoff after a failed warm.
 - Location: `packages/opencode/src/core/cachekeep.ts`
 - Pattern: Target map keyed by session id; interval timer; bounded (`maxTargets`, `maxBytes`) so a long-lived process cannot leak; model-aware TTL adjustment (30-min TTL for GPT-5.6 models) and gpt-5.6 subagent 2-warm limits.
+
+**Reset credit redemption coordinator:**
+- Purpose: Preview reset-credit eligibility and redeem exactly one explicit credit for an exhausted account after identity-bound confirmation.
+- Location: `packages/opencode/src/core/reset-credits.ts`; command orchestration in `packages/opencode/src/commands.ts` `executeResetCommand`.
+- Pattern: Persisted `(creditId, redeemRequestId)` claim before the consume POST; confirm-time identity and new-attempt precondition checks; terminal-only finalization with bounded, identifier-stable retry for ambiguous outcomes.
 
 **`OpenAIWebSocketPool` / `createWebSocketFetch`:**
 - Purpose: Session-keyed WebSocket pool with continuation chaining (`previous_response_id`), per-account discriminator so a switch forces a fresh socket, and stream-failure retries.

@@ -137,6 +137,7 @@
 - `packages/opencode/src/core/oauth.ts` — PKCE, OAuth flow, JWT parsing.
 - `packages/opencode/src/core/quota-manager.ts` — quota cache, backoff, and mid-stream rate limit marking.
 - `packages/opencode/src/core/cachekeep.ts` — prompt-cache warmer with model-aware TTL, clock window, and subagent warm caps.
+- `packages/opencode/src/core/reset-credits.ts` — reset-credit listing, eligibility checks, persisted redemption claims, bounded consume requests, and terminal-outcome finalization.
 - `packages/opencode/src/prompt-context.ts` — assistant model/variant resolver for synthetic command replies.
 - `packages/opencode/src/core/provider.ts` — Codex injection seam (`codexRefreshFn`, `whamUsageFn`).
 - `packages/opencode/src/core/backoff.ts` — retry/backoff math.
@@ -154,6 +155,7 @@
 
 **Tests:**
 - `packages/opencode/src/tests/` — co-located bun tests (`*.test.ts`).
+- `packages/opencode/src/tests/reset-credits.test.ts` — reset-credit listing and consumption, redemption preconditions, and atomic persisted redemption state.
 - `packages/opencode/bunfig.toml` — bun test config.
 - Run: `bun run test` (root) → `cd packages/opencode && bun run test`.
 
@@ -171,7 +173,7 @@ Example: `packages/opencode/src/tests/accounts-store.test.ts` tests `packages/op
 **Types/classes:** PascalCase (`CodexAuthPlugin`, `FallbackAccountManager`, `QuotaManager`, `CacheKeepManager`, `OpenAIWebSocketPool`, `ResponseStreamError`).
 Example: `packages/opencode/src/core/cachekeep.ts` exports `CacheKeepManager`.
 
-**Command name constants:** SCREAMING_SNAKE_CASE prefixed with `OPENAI_` (`OPENAI_QUOTA_COMMAND_NAME`, `OPENAI_ACCOUNT_COMMAND_NAME`, `OPENAI_ROUTING_COMMAND_NAME`, `OPENAI_KILLSWITCH_COMMAND_NAME`, `OPENAI_DUMP_COMMAND_NAME`, `OPENAI_LOGGING_COMMAND_NAME`, `OPENAI_CACHEKEEP_COMMAND_NAME`).
+**Command name constants:** SCREAMING_SNAKE_CASE prefixed with `OPENAI_` (`OPENAI_QUOTA_COMMAND_NAME`, `OPENAI_ACCOUNT_COMMAND_NAME`, `OPENAI_ROUTING_COMMAND_NAME`, `OPENAI_KILLSWITCH_COMMAND_NAME`, `OPENAI_DUMP_COMMAND_NAME`, `OPENAI_LOGGING_COMMAND_NAME`, `OPENAI_CACHEKEEP_COMMAND_NAME`, `OPENAI_RESET_COMMAND_NAME`).
 Example: `packages/opencode/src/commands.ts`.
 
 **Environment variables:** SCREAMING_SNAKE_CASE with the `CORTEXKIT_OPENAI_AUTH_*` and `OPENCODE_OPENAI_AUTH_*` prefixes (negative-prefixed `CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH` for the default-on cache fix).
