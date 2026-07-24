@@ -1,11 +1,13 @@
 export interface QuotaWindow {
   usedPercent: number
   remainingPercent: number
+  checkedAt?: number
   resetsAt?: string
   windowMinutes?: number
 }
 
 export interface AccountQuota {
+  checkedAt?: number
   primary?: QuotaWindow
   secondary?: QuotaWindow
   resetCreditsAvailable?: number
@@ -80,6 +82,8 @@ export function getPresentQuotaWindows(
 export interface SidebarAccountState {
   id: string
   label: string | undefined
+  /** ChatGPT identity of the account this quota belongs to. */
+  accountId?: string
   quota: AccountQuota | null
   killed: boolean
   enabled: boolean
@@ -97,6 +101,8 @@ export type ActiveRoutingMap = Record<string, ActiveRoutingEntry>
 export interface SidebarState {
   main: {
     quota: AccountQuota | null
+    /** ChatGPT identity of the main account this quota belongs to. */
+    mainAccountId?: string
     killed: boolean
     quotaBackedOff?: boolean
     quotaBackoffUntil?: number
@@ -212,6 +218,9 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
     main = {
       quota: ('quota' in m ? m.quota : null) as AccountQuota | null,
       killed: typeof m.killed === 'boolean' ? m.killed : false,
+      ...(typeof m.mainAccountId === 'string'
+        ? { mainAccountId: m.mainAccountId }
+        : {}),
       // Preserve optional backoff fields if present
       ...(typeof m.quotaBackedOff === 'boolean'
         ? { quotaBackedOff: m.quotaBackedOff }
@@ -247,6 +256,9 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
         .map((e) => ({
           id: e.id as string,
           label: typeof e.label === 'string' ? e.label : undefined,
+          ...(typeof e.accountId === 'string'
+            ? { accountId: e.accountId }
+            : {}),
           quota: ('quota' in e ? e.quota : null) as AccountQuota | null,
           killed: typeof e.killed === 'boolean' ? e.killed : false,
           enabled: typeof e.enabled === 'boolean' ? e.enabled : true,
@@ -280,9 +292,11 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
   }
 }
 
-export async function getSidebarState(): Promise<SidebarState> {
+export async function getSidebarState(
+  stateFile = getSidebarStateFile(),
+): Promise<SidebarState> {
   try {
-    const raw = await readFile(getSidebarStateFile(), 'utf8')
+    const raw = await readFile(stateFile, 'utf8')
     return normalizeSidebarState(JSON.parse(raw))
   } catch {
     return DEFAULT_SIDEBAR_STATE
@@ -496,6 +510,156 @@ export type SidebarMachineState = Pick<
   'main' | 'fallbacks' | 'planType' | 'credits' | 'lastUpdated'
 > & { route: string }
 
+// The freshest signal across every timestamp a snapshot carries: either window
+// (primary/secondary) or the legacy top-level stamp. A retired primary window
+// (null) with a fresh secondary must still outrank an older incoming primary, so
+// the comparison takes the max rather than the first present value.
+function latestQuotaCheckedAt(quota: AccountQuota | null): number | undefined {
+  let latest: number | undefined
+  for (const checkedAt of [
+    quota?.primary?.checkedAt,
+    quota?.secondary?.checkedAt,
+    quota?.checkedAt,
+  ]) {
+    if (typeof checkedAt === 'number' && Number.isFinite(checkedAt)) {
+      latest = latest === undefined ? checkedAt : Math.max(latest, checkedAt)
+    }
+  }
+  return latest
+}
+
+function freshestQuota(
+  incoming: AccountQuota | null,
+  existing: AccountQuota | null,
+): AccountQuota | null {
+  const incomingCheckedAt = latestQuotaCheckedAt(incoming)
+  const existingCheckedAt = latestQuotaCheckedAt(existing)
+  if (
+    existingCheckedAt !== undefined &&
+    (incomingCheckedAt === undefined || existingCheckedAt > incomingCheckedAt)
+  ) {
+    return existing
+  }
+  return incoming
+}
+
+// True when both sides assert the same stable account identity. An unknown
+// identity on either side is NOT a confirmed match — merging windows across an
+// unconfirmed identity could combine two accounts' quota, so the caller
+// whole-picks instead.
+function sameAccountIdentity(
+  incoming: string | undefined,
+  existing: string | undefined,
+): boolean {
+  return (
+    incoming !== undefined && existing !== undefined && incoming === existing
+  )
+}
+
+// A window's checkedAt when it is a usable timestamp, else undefined — so an
+// absent or invalid stamp sorts oldest and a timestamped window always wins
+// over an untimestamped one. The optional fallback is the enclosing snapshot's
+// checkedAt, used when the window itself carries no usable stamp (files written
+// by versions that did not propagate the entry timestamp onto each present
+// window): a present window with no stamp is still "live", so it must sort by
+// SOME timestamp — the snapshot's is the next-best signal.
+function finiteWindowCheckedAt(
+  window: QuotaWindow | undefined,
+  fallback?: number,
+): number | undefined {
+  const checkedAt = window?.checkedAt
+  if (typeof checkedAt === 'number' && Number.isFinite(checkedAt)) {
+    return checkedAt
+  }
+  if (typeof fallback === 'number' && Number.isFinite(fallback)) {
+    return fallback
+  }
+  return undefined
+}
+
+// Fresher of two same-slot windows. When both sides report the window, the
+// window's own stamp decides (falling back to each side's snapshot stamp when
+// the window itself has none). When the slots disagree on presence, the FRESHER
+// snapshot's slot is authoritative — a quota snapshot reports every live window,
+// so an absent slot there means the wire retired it, which a stale window on the
+// other side must not resurrect (and a fresher snapshot's present window must
+// not be dropped by a stale window-less write).
+function freshestWindow(
+  incoming: QuotaWindow | undefined,
+  existing: QuotaWindow | undefined,
+  existingSnapshotIsFresher: boolean,
+  incomingSnapshotCheckedAt: number | undefined,
+  existingSnapshotCheckedAt: number | undefined,
+): QuotaWindow | undefined {
+  if (incoming && existing) {
+    const incomingAt = finiteWindowCheckedAt(
+      incoming,
+      incomingSnapshotCheckedAt,
+    )
+    const existingAt = finiteWindowCheckedAt(
+      existing,
+      existingSnapshotCheckedAt,
+    )
+    if (
+      existingAt !== undefined &&
+      (incomingAt === undefined || existingAt > incomingAt)
+    ) {
+      return existing
+    }
+    return incoming
+  }
+  return existingSnapshotIsFresher ? existing : incoming
+}
+
+// Merge two same-account snapshots window-by-window: each slot keeps the
+// fresher of the two sides, so a newer primary on one side and a newer
+// secondary on the other both survive instead of one side's whole snapshot
+// replacing the other's. The snapshot stamp becomes the freshest window stamp
+// of the merged result. Only safe when both snapshots share an account identity
+// (sameAccountIdentity) — an identity switch must whole-pick (freshestQuota) so
+// windows from two accounts are never combined.
+function mergeQuotaByWindow(
+  incoming: AccountQuota | null,
+  existing: AccountQuota | null,
+): AccountQuota | null {
+  if (!incoming) return existing
+  if (!existing) return incoming
+  const incomingAt = latestQuotaCheckedAt(incoming)
+  const existingAt = latestQuotaCheckedAt(existing)
+  const existingSnapshotIsFresher =
+    existingAt !== undefined &&
+    (incomingAt === undefined || existingAt > incomingAt)
+  const primary = freshestWindow(
+    incoming.primary,
+    existing.primary,
+    existingSnapshotIsFresher,
+    incoming.checkedAt,
+    existing.checkedAt,
+  )
+  const secondary = freshestWindow(
+    incoming.secondary,
+    existing.secondary,
+    existingSnapshotIsFresher,
+    incoming.checkedAt,
+    existing.checkedAt,
+  )
+  let checkedAt: number | undefined
+  for (const stamp of [
+    finiteWindowCheckedAt(primary),
+    finiteWindowCheckedAt(secondary),
+  ]) {
+    if (stamp !== undefined) {
+      checkedAt = checkedAt === undefined ? stamp : Math.max(checkedAt, stamp)
+    }
+  }
+  return {
+    ...incoming,
+    primary,
+    secondary,
+    checkedAt: checkedAt ?? incoming.checkedAt,
+  }
+}
+
 export function setSidebarMachineState(
   machineState: SidebarMachineState,
   file = getSidebarStateFile(),
@@ -504,13 +668,63 @@ export function setSidebarMachineState(
   return enqueueSidebarWrite(async () => {
     await writeMergedSidebarState(
       file,
-      (latest) => ({
-        ...latest,
-        ...machineState,
-        activeId: latest.activeId,
-        activeRouting: latest.activeRouting,
-        lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
-      }),
+      (latest) => {
+        const latestFallbacks = new Map(
+          latest.fallbacks.map((account) => [account.id, account]),
+        )
+        // A same-identity merge combines the freshest of each window across the
+        // two sides; a differing or unknown identity whole-picks the fresher
+        // snapshot so windows from two accounts are never combined.
+        const mainSameIdentity = sameAccountIdentity(
+          machineState.main.mainAccountId,
+          latest.main.mainAccountId,
+        )
+        const mergedMainQuota = mainSameIdentity
+          ? mergeQuotaByWindow(machineState.main.quota, latest.main.quota)
+          : freshestQuota(machineState.main.quota, latest.main.quota)
+        return {
+          ...latest,
+          ...machineState,
+          main: {
+            ...machineState.main,
+            quota: mergedMainQuota,
+            // On a whole-pick the identity follows the winning snapshot, so a
+            // reader never pairs one account's id with another account's quota
+            // (a re-login race would otherwise resurrect the stale-account bug).
+            // On a same-identity merge both sides already agree, so the incoming
+            // id is the shared one.
+            mainAccountId: mainSameIdentity
+              ? machineState.main.mainAccountId
+              : mergedMainQuota === latest.main.quota &&
+                  mergedMainQuota !== machineState.main.quota
+                ? latest.main.mainAccountId
+                : machineState.main.mainAccountId,
+          },
+          fallbacks: machineState.fallbacks.map((account) => {
+            const existing = latestFallbacks.get(account.id)
+            const fallbackSameIdentity = sameAccountIdentity(
+              account.accountId,
+              existing?.accountId,
+            )
+            const mergedQuota = fallbackSameIdentity
+              ? mergeQuotaByWindow(account.quota, existing?.quota ?? null)
+              : freshestQuota(account.quota, existing?.quota ?? null)
+            return {
+              ...account,
+              quota: mergedQuota,
+              accountId: fallbackSameIdentity
+                ? account.accountId
+                : mergedQuota === existing?.quota &&
+                    mergedQuota !== account.quota
+                  ? existing?.accountId
+                  : account.accountId,
+            }
+          }),
+          activeId: latest.activeId,
+          activeRouting: latest.activeRouting,
+          lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
+        }
+      },
       hooks,
     )
   })

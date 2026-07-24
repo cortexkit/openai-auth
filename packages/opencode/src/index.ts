@@ -40,6 +40,10 @@ import {
   shouldFallbackStatus,
 } from './core/accounts'
 import {
+  BackgroundQuotaRefresh,
+  refreshQuotaInBackground,
+} from './core/background-quota-refresh'
+import {
   buildRefreshOperationError,
   formatRefreshBackoffMessage,
   hashRefreshToken,
@@ -98,7 +102,9 @@ import { getRpcDir } from './rpc/rpc-dir'
 import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server'
 import {
   type AccountQuota,
+  getSidebarState,
   getSidebarStateFile,
+  type QuotaWindow,
   removeSidebarActiveRouting,
   type SidebarMachineState,
   type SidebarState,
@@ -461,15 +467,50 @@ export function mergePushedQuotaMetadata(
   }
 }
 
+// Returns the window unchanged when it already carries a usable checkedAt, or
+// the same window with the entry timestamp stamped onto it when it does not.
+// Absent windows are returned unchanged so we never fabricate a slot the wire
+// did not report. The stamp keeps mergeQuotaByWindow's per-window freshness
+// comparison meaningful against files written without window stamps (old code
+// only wrote the snapshot-level checkedAt).
+function stampWindowCheckedAt(
+  window: QuotaWindow | undefined,
+  entryCheckedAt: number,
+): QuotaWindow | undefined {
+  if (!window) return window
+  if (
+    typeof window.checkedAt === 'number' &&
+    Number.isFinite(window.checkedAt)
+  ) {
+    return window
+  }
+  return { ...window, checkedAt: entryCheckedAt }
+}
+
 export function buildSidebarMachineState(
   qm: QuotaManager,
   store: AccountStorage,
   now = Date.now(),
 ): SidebarMachineState {
-  const mainQuota = qm.getMain()?.quota
+  const mainEntry = qm.getMain()
+  const mainQuota = mainEntry?.quota
   return {
     main: {
-      quota: (mainQuota as AccountQuota | undefined) ?? null,
+      quota: mainQuota
+        ? {
+            ...(mainQuota as AccountQuota),
+            checkedAt: mainEntry.checkedAt,
+            primary: stampWindowCheckedAt(
+              mainQuota.primary,
+              mainEntry.checkedAt,
+            ),
+            secondary: stampWindowCheckedAt(
+              mainQuota.secondary,
+              mainEntry.checkedAt,
+            ),
+          }
+        : null,
+      mainAccountId: store.mainAccountId,
       killed: false,
       ...(mainQuota?.resetCreditsAvailable !== undefined
         ? { resetCredits: mainQuota.resetCreditsAvailable }
@@ -478,11 +519,30 @@ export function buildSidebarMachineState(
     fallbacks: store.accounts
       .filter((account) => account.enabled)
       .map((account) => {
-        const fallbackQuota = qm.getFallback(account.id)?.quota
+        const fallbackEntry = qm.getFallback(account.id)
+        const fallbackQuota = fallbackEntry?.quota
         return {
           id: account.id,
           label: (account as { label?: string }).label,
-          quota: (fallbackQuota as AccountQuota | undefined) ?? null,
+          // Identity follows the cached snapshot (the identity that quota was
+          // captured under), falling back to the live account — so a re-login
+          // never pairs the previous identity's stale quota with the new one.
+          accountId:
+            fallbackEntry?.accountId ?? (account as OAuthAccount).accountId,
+          quota: fallbackQuota
+            ? {
+                ...(fallbackQuota as AccountQuota),
+                checkedAt: fallbackEntry.checkedAt,
+                primary: stampWindowCheckedAt(
+                  fallbackQuota.primary,
+                  fallbackEntry.checkedAt,
+                ),
+                secondary: stampWindowCheckedAt(
+                  fallbackQuota.secondary,
+                  fallbackEntry.checkedAt,
+                ),
+              }
+            : null,
           killed: false,
           enabled: true,
           ...(fallbackQuota?.resetCreditsAvailable !== undefined
@@ -692,6 +752,12 @@ export async function CodexAuthPlugin(
   let activeRpcServer: RpcServerHandle | null = null
   let sidebarStateFileForEvents: string | undefined
 
+  // Per-loader poller: each plugin invocation owns its timer and callback, so
+  // one loader disposing or re-starting never stops or overwrites another's
+  // background refresh (a module-level singleton let the last loader win and
+  // let any disposal kill the shared poller).
+  const backgroundQuotaRefresh = new BackgroundQuotaRefresh()
+
   async function sendIgnoredMessage(sessionId: string, text: string) {
     const session = input.client.session as
       | { promptAsync?: (req: unknown) => Promise<unknown> }
@@ -717,6 +783,7 @@ export async function CodexAuthPlugin(
 
   return {
     async dispose() {
+      backgroundQuotaRefresh.stop()
       for (const websocketFetch of websocketFetches) websocketFetch.close()
       websocketFetches.length = 0
       if (activeRpcServer) {
@@ -1426,6 +1493,7 @@ export async function CodexAuthPlugin(
             refreshAllQuota({
               getAuth,
               codexRefreshFn,
+              refreshMainWithLease,
               fallbackManager,
               quotaManager,
               loadAccounts,
@@ -1776,7 +1844,8 @@ export async function CodexAuthPlugin(
           if (!isKillswitchEnabled(fallbackStorage)) return notRateLimited
           return notRateLimited.filter((c) =>
             killswitchPassesPolicy(
-              quotaManager.peekFallbackForPolicy(c.quotaAccountId)?.quota,
+              quotaManager.peekFallbackForPolicy(c.quotaAccountId, c.accountId)
+                ?.quota,
               fallbackStorage,
               c.quotaAccountId,
               Date.now(),
@@ -1967,6 +2036,7 @@ export async function CodexAuthPlugin(
           void refreshAllQuota({
             getAuth,
             codexRefreshFn,
+            refreshMainWithLease,
             fallbackManager,
             quotaManager,
             loadAccounts,
@@ -1988,6 +2058,46 @@ export async function CodexAuthPlugin(
             }),
           )
         }
+
+        backgroundQuotaRefresh.start(
+          async () => {
+            const results = await refreshQuotaInBackground({
+              getAuth,
+              codexRefreshFn,
+              refreshMainWithLease,
+              fallbackManager,
+              quotaManager,
+              loadAccounts,
+              writeSidebarState: (qm, store) =>
+                backgroundQuotaRefresh.isStopped()
+                  ? Promise.resolve()
+                  : writeMachineSidebarState(qm, store),
+              client: input.client as Parameters<
+                typeof refreshAllQuota
+              >[0]['client'],
+              fetchImpl: fetch,
+              now: Date.now,
+              configPath: getConfigPath(),
+              storageMainAccountId: storage?.mainAccountId,
+              isOAuthAccountFn: isOAuthAccount,
+              whamFn: whamUsageFn,
+              readSidebarState: () => getSidebarState(boundSidebarFile),
+            })
+            const failures = results.filter((result) => !result.ok)
+            if (failures.length > 0) {
+              logQ.warn('background quota refresh completed with failures', {
+                pid: process.pid,
+                failures,
+              })
+            }
+          },
+          (error) => {
+            logQ.warn('background quota refresh failed', {
+              pid: process.pid,
+              error: error instanceof Error ? error.message : String(error),
+            })
+          },
+        )
 
         // -------------------------------------------------------------------
         // Fetch override that selects the active account, refreshes if
@@ -2215,6 +2325,7 @@ export async function CodexAuthPlugin(
             return finalResponse
           },
           async dispose() {
+            backgroundQuotaRefresh.stop()
             cacheKeepManager.stop()
             if (
               cacheKeepGlobal.__openaiAuthCacheKeepManager === cacheKeepManager
