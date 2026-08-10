@@ -52,6 +52,8 @@ export interface CacheKeepManagerOptions {
   maxBytes?: number
   /** Returns the configured clock-hour window; undefined means always warm. */
   getWindow?: () => CacheKeepWindow | undefined
+  /** Returns whether main-agent targets bypass only the idle warm cap. */
+  getSustain?: () => boolean
 }
 
 export interface CacheKeepStatus {
@@ -63,6 +65,7 @@ export interface CacheKeepStatus {
   maxSubagentIdleMs: number
   ttlMs: number
   leadMs: number
+  sustain: boolean
   window?: CacheKeepWindow
   targets: Array<{
     sessionKey: string
@@ -317,6 +320,7 @@ export class CacheKeepManager {
   private readonly maxTargets: number
   private readonly maxBytes: number
   private readonly getWindow?: () => CacheKeepWindow | undefined
+  private readonly getSustain?: () => boolean
 
   private timer: ReturnType<typeof setInterval> | null = null
   private startedAt: number | null = null
@@ -360,6 +364,7 @@ export class CacheKeepManager {
     this.maxTargets = options.maxTargets ?? DEFAULT_MAX_TARGETS
     this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
     this.getWindow = options.getWindow
+    this.getSustain = options.getSustain
   }
 
   // -- public API ------------------------------------------------------------
@@ -484,7 +489,10 @@ export class CacheKeepManager {
           ? this.maxSubagentIdleMs
           : this.maxIdleWarmMs
       }
-      if (target.lastRealRequestAt < bound) {
+      if (
+        !(target.isSubagent !== true && this.getSustain?.() === true) &&
+        target.lastRealRequestAt < bound
+      ) {
         this.log.debug(
           'cachekeep pruned idle target',
           this.logPayload({
@@ -570,6 +578,7 @@ export class CacheKeepManager {
       maxSubagentIdleMs: this.maxSubagentIdleMs,
       ttlMs: this.ttlMs,
       leadMs: this.leadMs,
+      sustain: this.getSustain?.() === true,
       window: this.getWindow?.(),
       targets,
     }

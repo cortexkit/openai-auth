@@ -76,8 +76,14 @@ export interface CommandContext {
   setCacheKeepEnabled?: (enabled: boolean) => void
   /** Updates the live loader's persisted-subagent cachekeep gate. */
   setCacheKeepSubagents?: (enabled: boolean) => void
+  /** Updates the live loader's main-agent idle-cap bypass gate. */
+  setCacheKeepSustain?: (enabled: boolean) => void
   /** Updates the live loader's clock-hour warm window. undefined = no window. */
   setCacheKeepWindow?: (window: CacheKeepWindow | undefined) => void
+  /** Clears only the sticky account assignment for one OpenCode session. */
+  clearStickyRouting?: (sessionId: string) => Promise<boolean>
+  /** Resolves the current session's usable sticky account, if one exists. */
+  getStickyRouting?: (sessionId: string) => Promise<string | undefined>
 }
 
 const log = createLogger('commands')
@@ -87,9 +93,13 @@ const log = createLogger('commands')
 // ---------------------------------------------------------------------------
 
 function routingDescription(mode: RoutingMode) {
-  return mode === 'fallback-first'
-    ? 'Try usable fallback accounts before the main account.'
-    : 'Try the main account first. Use fallback accounts only when required.'
+  if (mode === 'fallback-first') {
+    return 'Try usable fallback accounts before the main account.'
+  }
+  if (mode === 'sticky-balanced') {
+    return 'Keep each session on its assigned account while balancing new sessions.'
+  }
+  return 'Try the main account first. Use fallback accounts only when required.'
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +191,9 @@ async function executeAccountCommand(
       )
     } else {
       const mode: RoutingMode = storage.routing?.mode ?? 'main-first'
-      lines.push(`Routing: \`${mode}\` (set with \`/openai-routing\`).`)
+      lines.push(
+        `Routing: \`${mode}\` (set with \`/openai-routing\`). Modes: main-first, fallback-first, or sticky-balanced. \`/openai-routing reset\` clears this session's pin.`,
+      )
       lines.push('')
       for (const a of accounts) {
         const type = (a as { type?: string }).type ?? 'oauth'
@@ -358,7 +370,7 @@ async function executeAccountCommand(
 
   return {
     command: 'openai-account',
-    text: '## Account Commands\n\n- `/openai-account` — show accounts\n- `/openai-account add [label]` — add a new account\n- `/openai-account remove <id>` — remove\n- `/openai-account order <a> <b>` — swap fallback positions\n\nRouting is set with `/openai-routing` (main-first / fallback-first).',
+    text: '## Account Commands\n\n- `/openai-account` — show accounts\n- `/openai-account add [label]` — add a new account\n- `/openai-account remove <id>` — remove\n- `/openai-account order <a> <b>` — swap fallback positions\n\nRouting modes are `main-first`, `fallback-first`, and `sticky-balanced`. `/openai-routing reset` clears the current session pin.',
     knobs: { accounts },
   }
 }
@@ -374,9 +386,35 @@ async function executeRoutingCommand(
   }
   const currentMode: RoutingMode = storage.routing?.mode ?? 'main-first'
 
+  if (tokens.length === 1 && tokens[0] === 'reset') {
+    if (!ctx.sessionId) {
+      return {
+        command: 'openai-routing',
+        text: '## OpenAI Routing Reset\n\nNo current session is available, so no pin was changed.',
+        knobs: { mode: currentMode },
+      }
+    }
+    if (!ctx.clearStickyRouting) {
+      return {
+        command: 'openai-routing',
+        text: '## OpenAI Routing Reset\n\nThis runtime cannot clear the current session pin.',
+        knobs: { mode: currentMode },
+      }
+    }
+    await ctx.clearStickyRouting(ctx.sessionId)
+    log.info('routing session pin cleared')
+    return {
+      command: 'openai-routing',
+      text: "## OpenAI Routing Reset\n\nThis session's pin was cleared. The next request may choose the same account if it remains the best selection.",
+      knobs: { mode: currentMode },
+    }
+  }
+
   if (
     tokens.length === 1 &&
-    (tokens[0] === 'main-first' || tokens[0] === 'fallback-first')
+    (tokens[0] === 'main-first' ||
+      tokens[0] === 'fallback-first' ||
+      tokens[0] === 'sticky-balanced')
   ) {
     const mode = tokens[0] as RoutingMode
     // Scalar-field write MUST go through mutateAccounts (read-fresh under lock,
@@ -390,14 +428,25 @@ async function executeRoutingCommand(
     log.info('routing mode changed', { mode })
     return {
       command: 'openai-routing',
-      text: `## OpenAI Routing Updated\n\nMode: \`${mode}\`\n- ${routingDescription(mode)}\n\nUsage: \`/openai-routing\`, \`/openai-routing main-first\`, or \`/openai-routing fallback-first\`.`,
+      text: `## OpenAI Routing Updated\n\nMode: \`${mode}\`\n- ${routingDescription(mode)}\n\nUsage: \`/openai-routing\`, \`/openai-routing main-first\`, \`/openai-routing fallback-first\`, or \`/openai-routing sticky-balanced\`.`,
       knobs: { mode },
     }
   }
 
+  const stickyPin =
+    currentMode === 'sticky-balanced' && ctx.sessionId
+      ? await ctx.getStickyRouting?.(ctx.sessionId)
+      : undefined
+  const stickyPinDescription =
+    currentMode === 'sticky-balanced'
+      ? stickyPin
+        ? `\n- Session pin: \`${stickyPin}\`. Use \`/openai-routing reset\` to clear it.`
+        : '\n- Session pin: none yet. A request will choose one when a usable account is available.'
+      : ''
+
   return {
     command: 'openai-routing',
-    text: `## OpenAI Routing\n\n- Mode: \`${currentMode}\`\n- ${routingDescription(currentMode)}\n\nUsage: \`/openai-routing\`, \`/openai-routing main-first\`, or \`/openai-routing fallback-first\`.`,
+    text: `## OpenAI Routing\n\n- Mode: \`${currentMode}\`\n- ${routingDescription(currentMode)}${stickyPinDescription}\n\nUsage: \`/openai-routing\`, \`/openai-routing main-first\`, \`/openai-routing fallback-first\`, or \`/openai-routing sticky-balanced\`.`,
     knobs: { mode: currentMode },
   }
 }
@@ -687,6 +736,7 @@ async function executeCachekeepCommand(
       `Status: **${enabled ? 'ON' : 'OFF'}**`,
       `Timer: **${status.running ? 'armed' : 'idle'}**`,
       `Subagent warming: **${storage?.cachekeep?.subagents === true ? 'ON' : 'OFF'}**`,
+      `Idle policy: **sustain ${status.sustain ? 'ON' : 'OFF'} (main only)**`,
       `Window: **${windowLabel}**`,
     ]
     lines.push(`Tracked sessions: **${status.tracked}**`)
@@ -717,7 +767,7 @@ async function executeCachekeepCommand(
     )
     lines.push('')
     lines.push(
-      'Commands: `/openai-cachekeep on` | `/openai-cachekeep off` | `/openai-cachekeep HH-HH` | `/openai-cachekeep window clear` | `/openai-cachekeep subagents on` | `/openai-cachekeep subagents off` | `/openai-cachekeep`',
+      'Commands: `/openai-cachekeep on` | `/openai-cachekeep off` | `/openai-cachekeep sustain on` | `/openai-cachekeep sustain off` | `/openai-cachekeep HH-HH` | `/openai-cachekeep window clear` | `/openai-cachekeep subagents on` | `/openai-cachekeep subagents off` | `/openai-cachekeep`',
     )
     const lastWarmAt = Math.max(
       0,
@@ -729,6 +779,7 @@ async function executeCachekeepCommand(
       knobs: {
         enabled,
         subagents: storage?.cachekeep?.subagents === true,
+        sustain: status.sustain,
         window: liveWindow,
         running: status.running,
         tracked: status.tracked,
@@ -766,6 +817,7 @@ async function executeCachekeepCommand(
       knobs: {
         enabled: true,
         subagents: storage?.cachekeep?.subagents === true,
+        sustain: status.sustain,
         window: status.window,
         running: status.running,
         tracked: status.tracked,
@@ -788,7 +840,51 @@ async function executeCachekeepCommand(
     return {
       command: 'openai-cachekeep',
       text: '## Cachekeep Disabled',
-      knobs: { enabled: false, running: false, tracked: 0 },
+      knobs: {
+        enabled: false,
+        sustain: storage?.cachekeep?.sustain === true,
+        running: false,
+        tracked: 0,
+      },
+    }
+  }
+
+  if (tokens[0] === 'sustain') {
+    const sustainCmd = tokens[1]
+    if (tokens.length !== 2 || (sustainCmd !== 'on' && sustainCmd !== 'off')) {
+      return {
+        command: 'openai-cachekeep',
+        text: 'Usage: `/openai-cachekeep sustain on` | `/openai-cachekeep sustain off`',
+        knobs: {},
+      }
+    }
+    const value = sustainCmd === 'on'
+    await mutateAccounts((current) => {
+      current.cachekeep = {
+        ...(current.cachekeep ?? {}),
+        sustain: value,
+      }
+      return current
+    }, ctx.accountStoragePath)
+    log.info(`cachekeep sustain ${value ? 'enabled' : 'disabled'}`)
+    ctx.setCacheKeepSustain?.(value)
+    const nextStatus = mgr?.status()
+    return {
+      command: 'openai-cachekeep',
+      text: value
+        ? '## Cachekeep Sustain Enabled\n\nSustain keeps main-agent sessions warming past the idle cap for this process. Clock windows still apply.\n\nBefore enabling sustain with Magic Context, set a non-expiring `cache_ttl` for models used by main sessions; elapsed-time cold-cache assumptions are no longer valid.'
+        : '## Cachekeep Sustain Disabled\n\nMain-agent sessions again stop warming at the configured idle cap.',
+      knobs: {
+        enabled,
+        subagents: storage?.cachekeep?.subagents === true,
+        sustain: value,
+        window: nextStatus?.window,
+        running: nextStatus?.running ?? false,
+        tracked: nextStatus?.tracked ?? 0,
+        generatedAt: nextStatus?.generatedAt ?? Date.now(),
+        maxIdleWarmMs: nextStatus?.maxIdleWarmMs ?? 60 * 60 * 1000,
+        maxSubagentIdleMs: nextStatus?.maxSubagentIdleMs ?? 30 * 60 * 1000,
+      },
     }
   }
 
@@ -822,6 +918,7 @@ async function executeCachekeepCommand(
       knobs: {
         enabled,
         subagents: value,
+        sustain: nextStatus?.sustain ?? storage?.cachekeep?.sustain === true,
         window: nextStatus?.window,
         running: nextStatus?.running ?? false,
         tracked: nextStatus?.tracked ?? 0,
@@ -853,6 +950,7 @@ async function executeCachekeepCommand(
         knobs: {
           enabled,
           subagents: storage?.cachekeep?.subagents === true,
+          sustain: nextStatus?.sustain ?? storage?.cachekeep?.sustain === true,
           window: undefined,
           running: nextStatus?.running ?? false,
           tracked: nextStatus?.tracked ?? 0,
@@ -899,6 +997,7 @@ async function executeCachekeepCommand(
       knobs: {
         enabled,
         subagents: storage?.cachekeep?.subagents === true,
+        sustain: nextStatus?.sustain ?? storage?.cachekeep?.sustain === true,
         window: { startHour, endHour },
         running: nextStatus?.running ?? false,
         tracked: nextStatus?.tracked ?? 0,
@@ -911,7 +1010,7 @@ async function executeCachekeepCommand(
 
   return {
     command: 'openai-cachekeep',
-    text: 'Usage: `/openai-cachekeep`, `/openai-cachekeep on`, `/openai-cachekeep off`, `/openai-cachekeep HH-HH`, `/openai-cachekeep window clear`, `/openai-cachekeep subagents on`, `/openai-cachekeep subagents off`',
+    text: 'Usage: `/openai-cachekeep`, `/openai-cachekeep on`, `/openai-cachekeep off`, `/openai-cachekeep sustain on`, `/openai-cachekeep sustain off`, `/openai-cachekeep HH-HH`, `/openai-cachekeep window clear`, `/openai-cachekeep subagents on`, `/openai-cachekeep subagents off`',
     knobs: {},
   }
 }

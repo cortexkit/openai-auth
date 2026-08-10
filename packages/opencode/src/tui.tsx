@@ -17,6 +17,7 @@ import {
   Show,
 } from 'solid-js'
 import { createLogger } from './logger.js'
+import type { ApplyRequest, CommandModalName } from './rpc/protocol.js'
 import { createRpcClient } from './rpc/rpc-client.js'
 import { getRpcDir } from './rpc/rpc-dir.js'
 import {
@@ -30,6 +31,7 @@ import {
   type QuotaWindow,
   resolveActiveAccount,
   resolveSessionSidebarRouting,
+  resolveSessionStickyAccount,
   type SidebarState,
 } from './sidebar-state.js'
 import { openCommandDialog } from './tui/command-dialogs.js'
@@ -50,6 +52,14 @@ let rpcPollStarted = false
 const log = createLogger('rpc-tui')
 
 const ID = 'cortexkit.openai-auth'
+
+export function buildApplyRequest(
+  command: CommandModalName,
+  arguments_: string,
+  sessionId?: string,
+): ApplyRequest {
+  return { command, arguments: arguments_, sessionId }
+}
 
 // Read package metadata from either the raw src/ entry or its generated
 // src/tui-compiled/ counterpart. Avoid a JSON import because package.json sits
@@ -498,6 +508,32 @@ export function resolveQuotaDialogActiveId(
     : state.activeId
 }
 
+export interface RoutingDisplayRow {
+  label: string
+  value: string
+  tone: Tone
+}
+
+export function buildRoutingRowsForDisplay(
+  state: SidebarState,
+  sessionId: string | undefined,
+  now = Date.now(),
+): RoutingDisplayRow[] {
+  const routing = resolveSessionSidebarRouting(state, sessionId, now)
+  const rows: RoutingDisplayRow[] = [
+    { label: 'Route', value: routing.route, tone: 'accent' },
+  ]
+  const pinnedAccountId = resolveSessionStickyAccount(state, sessionId, now)
+  if (pinnedAccountId) {
+    const pinnedAccount = resolveActiveAccount({
+      ...state,
+      activeId: pinnedAccountId,
+    })
+    rows.push({ label: 'Pin', value: pinnedAccount.name, tone: 'accent' })
+  }
+  return rows
+}
+
 interface SidebarController {
   prefs: () => OpenaiAuthTuiPrefs
   collapsed: () => boolean
@@ -782,12 +818,16 @@ function QuotaSidebar(props: {
         {/* Routing */}
         <Show when={prefs().sections.routing}>
           <SectionHeader theme={theme()} title='Routing' />
-          <StatRow
-            theme={theme()}
-            label='Route'
-            value={sessionRouting().route}
-            tone='accent'
-          />
+          <For each={buildRoutingRowsForDisplay(state(), props.sessionId)}>
+            {(row) => (
+              <StatRow
+                theme={theme()}
+                label={row.label}
+                value={row.value}
+                tone={row.tone}
+              />
+            )}
+          </For>
         </Show>
 
         {/* Plan and credits — whichever are present */}
@@ -897,7 +937,8 @@ const tui: TuiPlugin = async (api) => {
             openCommandDialog(
               api,
               message.payload,
-              (command, args) => rpcClient.apply({ command, arguments: args }),
+              (command, args) =>
+                rpcClient.apply(buildApplyRequest(command, args, sessionId)),
               sessionId,
             )
           }

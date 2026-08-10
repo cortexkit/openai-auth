@@ -98,6 +98,33 @@ export interface ActiveRoutingEntry {
 
 export type ActiveRoutingMap = Record<string, ActiveRoutingEntry>
 
+export interface StickyAssignment {
+  accountId: string
+  assignedAt: number
+  lastSeenAt: number
+  inputBytes: number
+  quotaCheckedAt?: number
+}
+
+export type StickyAssignmentMap = Record<string, StickyAssignment>
+
+export interface StickyAssignmentChoice {
+  accountId: string
+  quotaCheckedAt?: number
+}
+
+export interface ResolveStickyAssignmentInput {
+  sessionId: string
+  requestBytes: number
+  now: number
+  validPinnedAccountIds: readonly string[]
+  excludeAccountIds?: readonly string[]
+  quotaCheckedAtByAccount: Readonly<Record<string, number | undefined>>
+  choose: (
+    pendingBytes: ReadonlyMap<string, number>,
+  ) => StickyAssignmentChoice | undefined
+}
+
 export interface SidebarState {
   main: {
     quota: AccountQuota | null
@@ -116,13 +143,14 @@ export interface SidebarState {
   /** Machine-global routing mode and compatibility value for older readers. */
   route: string
   activeRouting?: ActiveRoutingMap
+  stickyAssignments?: StickyAssignmentMap
   planType?: string
   credits?: number
   lastUpdated: number
 }
 
-import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { acquireRefreshFileLock } from './core/refresh-file-lock'
@@ -133,6 +161,14 @@ const logSb = createLogger('sidebar')
 const STATE_FILE_ENV = 'OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE'
 const DEFAULT_STATE_DIR = join(tmpdir(), 'opencode-openai-auth')
 const DEFAULT_STATE_FILE = join(DEFAULT_STATE_DIR, 'sidebar-state.json')
+const SESSION_HASH_PATTERN = /^[a-f0-9]{64}$/
+export const STICKY_ASSIGNMENT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+export const STICKY_ASSIGNMENT_MAX_ENTRIES = 256
+const STICKY_ASSIGNMENT_LAST_SEEN_TOUCH_MS = 60 * 60 * 1000
+
+export function hashSidebarSessionId(sessionId: string): string {
+  return createHash('sha256').update(sessionId).digest('hex')
+}
 
 function normalizeResetCredits(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0
@@ -172,6 +208,60 @@ function normalizeActiveRouting(value: unknown): ActiveRoutingMap | undefined {
       activeId: entry.activeId,
       route: entry.route,
       updatedAt: entry.updatedAt,
+    }
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined
+}
+
+function normalizeStickyAssignments(
+  value: unknown,
+): StickyAssignmentMap | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined
+  }
+
+  const normalized: StickyAssignmentMap = {}
+  for (const [sessionHash, rawAssignment] of Object.entries(value)) {
+    if (
+      !SESSION_HASH_PATTERN.test(sessionHash) ||
+      rawAssignment === null ||
+      typeof rawAssignment !== 'object' ||
+      Array.isArray(rawAssignment)
+    ) {
+      continue
+    }
+    const assignment = rawAssignment as Record<string, unknown>
+    if (
+      typeof assignment.accountId !== 'string' ||
+      assignment.accountId.length === 0 ||
+      typeof assignment.assignedAt !== 'number' ||
+      !Number.isFinite(assignment.assignedAt) ||
+      assignment.assignedAt < 0 ||
+      typeof assignment.lastSeenAt !== 'number' ||
+      !Number.isFinite(assignment.lastSeenAt) ||
+      assignment.lastSeenAt < 0 ||
+      typeof assignment.inputBytes !== 'number' ||
+      !Number.isFinite(assignment.inputBytes) ||
+      assignment.inputBytes < 0
+    ) {
+      continue
+    }
+    const quotaCheckedAt = assignment.quotaCheckedAt
+    if (
+      quotaCheckedAt !== undefined &&
+      (typeof quotaCheckedAt !== 'number' ||
+        !Number.isFinite(quotaCheckedAt) ||
+        quotaCheckedAt < 0)
+    ) {
+      continue
+    }
+    normalized[sessionHash] = {
+      accountId: assignment.accountId,
+      assignedAt: assignment.assignedAt,
+      lastSeenAt: assignment.lastSeenAt,
+      inputBytes: assignment.inputBytes,
+      ...(quotaCheckedAt === undefined ? {} : { quotaCheckedAt }),
     }
   }
 
@@ -280,6 +370,7 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
   const planType = typeof r.planType === 'string' ? r.planType : undefined
   const credits = typeof r.credits === 'number' ? r.credits : undefined
   const activeRouting = normalizeActiveRouting(r.activeRouting)
+  const stickyAssignments = normalizeStickyAssignments(r.stickyAssignments)
   return {
     main,
     fallbacks,
@@ -287,6 +378,7 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
     route,
     lastUpdated,
     ...(activeRouting !== undefined ? { activeRouting } : {}),
+    ...(stickyAssignments !== undefined ? { stickyAssignments } : {}),
     ...(planType !== undefined ? { planType } : {}),
     ...(credits !== undefined ? { credits } : {}),
   }
@@ -314,12 +406,13 @@ export type SidebarRoutingAccount = {
 
 export function isUsableRoutingEntry(
   entry: ActiveRoutingEntry,
-  accounts: readonly SidebarRoutingAccount[],
+  accounts: readonly SidebarRoutingAccount[] | undefined,
   now = Date.now(),
 ): boolean {
   const fresh =
     entry.updatedAt >= now - ACTIVE_ROUTING_MAX_AGE_MS && entry.updatedAt <= now
   if (!fresh) return false
+  if (accounts === undefined) return true
   return (
     entry.activeId === 'main' ||
     accounts.some(
@@ -367,6 +460,38 @@ export function isQuotaExhausted(
   return exhaustedQuotaResetAt(quota, now) !== undefined
 }
 
+export function resolveSessionStickyAccount(
+  state: SidebarState,
+  sessionId: string | undefined,
+  now = Date.now(),
+): string | undefined {
+  if (!sessionId || state.route !== 'sticky-balanced') return undefined
+  const assignment = state.stickyAssignments?.[hashSidebarSessionId(sessionId)]
+  if (
+    !assignment ||
+    assignment.lastSeenAt < now - STICKY_ASSIGNMENT_MAX_AGE_MS
+  ) {
+    return undefined
+  }
+  if (assignment.accountId === 'main') {
+    return state.main?.killed || isQuotaExhausted(state.main?.quota, now)
+      ? undefined
+      : 'main'
+  }
+  const fallback = state.fallbacks?.find(
+    (account) => account.id === assignment.accountId,
+  )
+  if (
+    !fallback ||
+    fallback.enabled === false ||
+    fallback.killed === true ||
+    isQuotaExhausted(fallback.quota, now)
+  ) {
+    return undefined
+  }
+  return fallback.id
+}
+
 export function resolveSessionSidebarRouting(
   state: SidebarState,
   sessionId?: string,
@@ -388,6 +513,11 @@ export function resolveSessionSidebarRouting(
     return { activeId: own.activeId, route: own.route }
   }
 
+  const stickyAccountId = resolveSessionStickyAccount(state, sessionId, now)
+  if (stickyAccountId) {
+    return { activeId: stickyAccountId, route: state.route }
+  }
+
   const enabledFallbacks = state.fallbacks.filter(
     (account) => account.enabled && !account.killed,
   )
@@ -403,7 +533,7 @@ export function resolveSessionSidebarRouting(
 
 export function pruneActiveRouting(
   activeRouting: ActiveRoutingMap | undefined,
-  accounts: readonly SidebarRoutingAccount[],
+  accounts: readonly SidebarRoutingAccount[] | undefined,
   now = Date.now(),
   removedSessionId?: string,
 ): ActiveRoutingMap | undefined {
@@ -420,6 +550,175 @@ export function pruneActiveRouting(
           .sort((left, right) => right[1].updatedAt - left[1].updatedAt)
           .slice(0, ACTIVE_ROUTING_MAX_ENTRIES)
   return bounded.length > 0 ? Object.fromEntries(bounded) : undefined
+}
+
+export function pruneStickyAssignments(
+  assignments: StickyAssignmentMap | undefined,
+  validAccountIds: ReadonlySet<string> | undefined,
+  now = Date.now(),
+  removedSessionHash?: string,
+): StickyAssignmentMap | undefined {
+  if (!assignments) return undefined
+  let accountNotInRoster = 0
+  let expired = 0
+  let explicitRemoval = 0
+  const kept: [string, StickyAssignment][] = []
+  for (const [sessionHash, assignment] of Object.entries(assignments)) {
+    if (sessionHash === removedSessionHash) {
+      explicitRemoval += 1
+      continue
+    }
+    if (assignment.lastSeenAt < now - STICKY_ASSIGNMENT_MAX_AGE_MS) {
+      expired += 1
+      continue
+    }
+    if (
+      validAccountIds !== undefined &&
+      !validAccountIds.has(assignment.accountId)
+    ) {
+      accountNotInRoster += 1
+      continue
+    }
+    kept.push([sessionHash, assignment])
+  }
+  const removed = accountNotInRoster + expired + explicitRemoval
+  if (removed > 0) {
+    logSb.debug('pruned sticky assignments', {
+      pid: process.pid,
+      removed,
+      reasons: {
+        'account-not-in-roster': accountNotInRoster,
+        expired,
+        'explicit-removal': explicitRemoval,
+      },
+    })
+  }
+  return kept.length > 0 ? Object.fromEntries(kept) : undefined
+}
+
+function limitStickyAssignments(
+  assignments: StickyAssignmentMap,
+  protectedSessionHash: string,
+): StickyAssignmentMap {
+  const overflow =
+    Object.keys(assignments).length - STICKY_ASSIGNMENT_MAX_ENTRIES
+  if (overflow <= 0) return assignments
+  const evicted = new Set(
+    Object.entries(assignments)
+      .filter(([sessionHash]) => sessionHash !== protectedSessionHash)
+      .sort(
+        ([leftHash, left], [rightHash, right]) =>
+          left.lastSeenAt - right.lastSeenAt ||
+          leftHash.localeCompare(rightHash),
+      )
+      .slice(0, overflow)
+      .map(([sessionHash]) => sessionHash),
+  )
+  return Object.fromEntries(
+    Object.entries(assignments).filter(
+      ([sessionHash]) => !evicted.has(sessionHash),
+    ),
+  )
+}
+
+function stickyAssignmentsEqual(
+  left: StickyAssignmentMap | undefined,
+  right: StickyAssignmentMap | undefined,
+): boolean {
+  if (left === right) return true
+  if (!left || !right) return false
+  const leftEntries = Object.entries(left)
+  if (leftEntries.length !== Object.keys(right).length) return false
+  return leftEntries.every(([sessionHash, assignment]) =>
+    Object.is(right[sessionHash], assignment),
+  )
+}
+
+function isValidStickyAssignment(
+  assignment: StickyAssignment | undefined,
+  validPinnedAccountIds: ReadonlySet<string>,
+  excludedAccountIds: ReadonlySet<string>,
+  now: number,
+): assignment is StickyAssignment {
+  return (
+    assignment !== undefined &&
+    validPinnedAccountIds.has(assignment.accountId) &&
+    !excludedAccountIds.has(assignment.accountId) &&
+    assignment.lastSeenAt >= now - STICKY_ASSIGNMENT_MAX_AGE_MS
+  )
+}
+
+function stickyAssignmentNeedsMetadataUpdate(
+  assignment: StickyAssignment,
+  requestBytes: number,
+  now: number,
+): boolean {
+  return (
+    requestBytes > assignment.inputBytes ||
+    now - assignment.lastSeenAt >= STICKY_ASSIGNMENT_LAST_SEEN_TOUCH_MS
+  )
+}
+
+function readonlyPendingBytes(
+  pendingBytes: Map<string, number>,
+): ReadonlyMap<string, number> {
+  const snapshot = new Map(pendingBytes)
+  const view: ReadonlyMap<string, number> = {
+    get size() {
+      return snapshot.size
+    },
+    has: (key: string) => snapshot.has(key),
+    get: (key: string) => snapshot.get(key),
+    entries: () => snapshot.entries(),
+    keys: () => snapshot.keys(),
+    values: () => snapshot.values(),
+    forEach: (
+      callback: (
+        value: number,
+        key: string,
+        map: ReadonlyMap<string, number>,
+      ) => void,
+      thisArg?: unknown,
+    ) => {
+      snapshot.forEach((value, key) => {
+        callback.call(thisArg, value, key, view)
+      })
+    },
+    [Symbol.iterator]: () => snapshot[Symbol.iterator](),
+  }
+  return Object.freeze(view)
+}
+
+function pendingBytesForAssignments(
+  assignments: StickyAssignmentMap | undefined,
+  quotaCheckedAtByAccount: Readonly<Record<string, number | undefined>>,
+): ReadonlyMap<string, number> {
+  const pendingBytes = new Map<string, number>()
+  for (const assignment of Object.values(assignments ?? {})) {
+    if (
+      assignment.quotaCheckedAt !==
+      quotaCheckedAtByAccount[assignment.accountId]
+    ) {
+      continue
+    }
+    pendingBytes.set(
+      assignment.accountId,
+      (pendingBytes.get(assignment.accountId) ?? 0) + assignment.inputBytes,
+    )
+  }
+  return readonlyPendingBytes(pendingBytes)
+}
+
+function usableRoutingAccountIds(
+  accounts: readonly SidebarRoutingAccount[] | undefined,
+): ReadonlySet<string> | undefined {
+  if (accounts === undefined) return undefined
+  return new Set([
+    'main',
+    ...accounts
+      .filter((account) => account.enabled !== false && account.killed !== true)
+      .map((account) => account.id),
+  ])
 }
 
 // Serialization chain: concurrent calls are queued so a stale background
@@ -484,7 +783,7 @@ function parseSidebarState(raw: string): SidebarState {
 }
 
 async function acquireSidebarWriteLock(file: string) {
-  await mkdir(dirname(file), { recursive: true })
+  await ensureSidebarStateDirectory(file)
   const deadline = Date.now() + SIDEBAR_WRITE_LOCK_WAIT_MS
   while (Date.now() <= deadline) {
     const lock = await acquireRefreshFileLock({
@@ -499,9 +798,21 @@ async function acquireSidebarWriteLock(file: string) {
   throw new Error('Timed out waiting for the sidebar state write lock')
 }
 
+async function ensureSidebarStateDirectory(file: string): Promise<void> {
+  const dir = dirname(file)
+  await mkdir(dir, { recursive: true, mode: 0o700 })
+  if (file !== DEFAULT_STATE_FILE) return
+  await chmod(dir, 0o700).catch((error) => {
+    logSb.warn('sidebar directory permission remediation failed', {
+      pid: process.pid,
+      error: error instanceof Error ? error.message : String(error),
+    })
+  })
+}
+
 async function writeMergedSidebarState(
   file: string,
-  merge: (latest: SidebarState) => SidebarState,
+  merge: (latest: SidebarState) => SidebarState | undefined,
   hooks?: SidebarMergeHooks,
 ): Promise<void> {
   const lock = await acquireSidebarWriteLock(file)
@@ -511,6 +822,7 @@ async function writeMergedSidebarState(
     for (let attempt = 0; attempt < MAX_MERGE_ATTEMPTS; attempt += 1) {
       const rawBefore = await readRawSidebar(file)
       const next = merge(parseSidebarState(rawBefore))
+      if (!next) return
       if (attempt === 0) await hooks?.beforeRecheck?.()
       const rawRecheck = await readRawSidebar(file)
       if (rawRecheck !== rawBefore) continue
@@ -519,7 +831,8 @@ async function writeMergedSidebarState(
     }
 
     const latest = await readSidebarState(file)
-    await doWriteSidebarState(merge(latest), file)
+    const next = merge(latest)
+    if (next) await doWriteSidebarState(next, file)
   } finally {
     await lock.release()
   }
@@ -570,6 +883,12 @@ export function setSidebarMachineState(
           machineState.main.quota,
           latest.main.quota,
         )
+        const now = Date.now()
+        const stickyAssignments = pruneStickyAssignments(
+          latest.stickyAssignments,
+          usableRoutingAccountIds(machineState.fallbacks),
+          now,
+        )
         return {
           ...latest,
           ...machineState,
@@ -602,7 +921,8 @@ export function setSidebarMachineState(
           }),
           activeId: latest.activeId,
           activeRouting: latest.activeRouting,
-          lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
+          stickyAssignments,
+          lastUpdated: Math.max(now, latest.lastUpdated + 1),
         }
       },
       hooks,
@@ -612,7 +932,7 @@ export function setSidebarMachineState(
 
 export function upsertSidebarActiveRouting(
   input: { sessionId: string } & ActiveRoutingEntry,
-  accounts: readonly SidebarRoutingAccount[],
+  accounts: readonly SidebarRoutingAccount[] | undefined,
   file = getSidebarStateFile(),
   hooks?: SidebarMergeHooks,
 ): Promise<void> {
@@ -632,11 +952,17 @@ export function upsertSidebarActiveRouting(
           accounts,
           Date.now(),
         )
+        const stickyAssignments = pruneStickyAssignments(
+          latest.stickyAssignments,
+          usableRoutingAccountIds(accounts),
+          Date.now(),
+        )
         return {
           ...latest,
           activeId: input.activeId,
           route: input.route,
           activeRouting,
+          stickyAssignments,
           lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
         }
       },
@@ -661,7 +987,7 @@ export function setSidebarLegacyRouting(
 
 export function removeSidebarActiveRouting(
   sessionId: string,
-  accounts: readonly SidebarRoutingAccount[],
+  accounts: readonly SidebarRoutingAccount[] | undefined,
   file = getSidebarStateFile(),
   hooks?: SidebarMergeHooks,
 ): Promise<void> {
@@ -676,9 +1002,16 @@ export function removeSidebarActiveRouting(
           now,
           sessionId,
         )
+        const stickyAssignments = pruneStickyAssignments(
+          latest.stickyAssignments,
+          usableRoutingAccountIds(accounts),
+          now,
+          hashSidebarSessionId(sessionId),
+        )
         return {
           ...latest,
           activeRouting,
+          stickyAssignments,
           lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
         }
       },
@@ -687,14 +1020,164 @@ export function removeSidebarActiveRouting(
   })
 }
 
+export async function resolveSidebarStickyAssignment(
+  input: ResolveStickyAssignmentInput,
+  file = getSidebarStateFile(),
+  hooks?: SidebarMergeHooks,
+): Promise<StickyAssignment | undefined> {
+  const sessionHash = hashSidebarSessionId(input.sessionId)
+  const validPinnedAccountIds = new Set(input.validPinnedAccountIds)
+  const excludedAccountIds = new Set(input.excludeAccountIds)
+  const existing = (await readSidebarState(file)).stickyAssignments?.[
+    sessionHash
+  ]
+  if (
+    isValidStickyAssignment(
+      existing,
+      validPinnedAccountIds,
+      excludedAccountIds,
+      input.now,
+    ) &&
+    !stickyAssignmentNeedsMetadataUpdate(
+      existing,
+      input.requestBytes,
+      input.now,
+    )
+  ) {
+    return existing
+  }
+
+  let resolved: StickyAssignment | undefined
+  await enqueueSidebarWrite(async () => {
+    await writeMergedSidebarState(
+      file,
+      (latest) => {
+        const stickyAssignments = pruneStickyAssignments(
+          latest.stickyAssignments,
+          validPinnedAccountIds,
+          input.now,
+        )
+        const assignmentsPruned = !stickyAssignmentsEqual(
+          latest.stickyAssignments,
+          stickyAssignments,
+        )
+        const current = stickyAssignments?.[sessionHash]
+        if (
+          isValidStickyAssignment(
+            current,
+            validPinnedAccountIds,
+            excludedAccountIds,
+            input.now,
+          )
+        ) {
+          const metadataNeedsUpdate = stickyAssignmentNeedsMetadataUpdate(
+            current,
+            input.requestBytes,
+            input.now,
+          )
+          const assignment = metadataNeedsUpdate
+            ? {
+                ...current,
+                inputBytes: Math.max(current.inputBytes, input.requestBytes),
+                ...(input.now - current.lastSeenAt >=
+                STICKY_ASSIGNMENT_LAST_SEEN_TOUCH_MS
+                  ? { lastSeenAt: input.now }
+                  : {}),
+              }
+            : current
+          resolved = assignment
+          if (!assignmentsPruned && !metadataNeedsUpdate) return undefined
+          return {
+            ...latest,
+            stickyAssignments: {
+              ...stickyAssignments,
+              [sessionHash]: assignment,
+            },
+            lastUpdated: Math.max(input.now, latest.lastUpdated + 1),
+          }
+        }
+
+        const choice = input.choose(
+          pendingBytesForAssignments(
+            stickyAssignments,
+            input.quotaCheckedAtByAccount,
+          ),
+        )
+        if (!choice) {
+          resolved = undefined
+          if (!assignmentsPruned) return undefined
+          return {
+            ...latest,
+            stickyAssignments,
+            lastUpdated: Math.max(input.now, latest.lastUpdated + 1),
+          }
+        }
+
+        resolved = {
+          accountId: choice.accountId,
+          assignedAt: input.now,
+          lastSeenAt: input.now,
+          inputBytes: input.requestBytes,
+          ...(choice.quotaCheckedAt === undefined
+            ? {}
+            : { quotaCheckedAt: choice.quotaCheckedAt }),
+        }
+        return {
+          ...latest,
+          stickyAssignments: limitStickyAssignments(
+            {
+              ...stickyAssignments,
+              [sessionHash]: resolved,
+            },
+            sessionHash,
+          ),
+          lastUpdated: Math.max(input.now, latest.lastUpdated + 1),
+        }
+      },
+      hooks,
+    )
+  })
+  return resolved
+}
+
+export async function clearSidebarStickyAssignment(
+  sessionId: string,
+  file = getSidebarStateFile(),
+): Promise<boolean> {
+  const sessionHash = hashSidebarSessionId(sessionId)
+  let removed = false
+  await enqueueSidebarWrite(async () => {
+    await writeMergedSidebarState(file, (latest) => {
+      const assignments = latest.stickyAssignments
+      if (assignments?.[sessionHash] === undefined) {
+        removed = false
+        return undefined
+      }
+      removed = true
+      const { [sessionHash]: _removed, ...remaining } = assignments
+      return {
+        ...latest,
+        ...(Object.keys(remaining).length > 0
+          ? { stickyAssignments: remaining }
+          : { stickyAssignments: undefined }),
+        lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
+      }
+    })
+  })
+  return removed
+}
+
 async function doWriteSidebarState(
   state: SidebarState,
   file: string,
 ): Promise<void> {
   const tempPath = `${file}.${randomUUID()}.tmp`
   try {
-    await mkdir(dirname(file), { recursive: true })
-    await writeFile(tempPath, JSON.stringify(state), 'utf8')
+    await ensureSidebarStateDirectory(file)
+    await writeFile(tempPath, JSON.stringify(normalizeSidebarState(state)), {
+      encoding: 'utf8',
+      mode: 0o600,
+    })
     await rename(tempPath, file)
   } catch (e) {
     await rm(tempPath, { force: true }).catch(() => {})

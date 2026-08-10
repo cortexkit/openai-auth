@@ -161,7 +161,7 @@ export function isValidApiBaseURL(value: string | undefined) {
 // Storage types
 // ---------------------------------------------------------------------------
 
-export type RoutingMode = 'main-first' | 'fallback-first'
+export type RoutingMode = 'main-first' | 'fallback-first' | 'sticky-balanced'
 
 export type KillswitchThresholds = Partial<
   Record<QuotaWindowName | '5h' | '1w', number>
@@ -180,9 +180,8 @@ export type AccountStorage = {
     provider: 'openai'
   }
   routing?: {
-    // Routing is purely mode-driven (main-first | fallback-first). There is no
-    // persisted "active account" pin — the account that serves each request is
-    // decided per-request by the mode + quota/killswitch policy.
+    // Sticky-balanced retains a per-session pin in sidebar state; configuration
+    // here selects only the routing policy, never the serving account itself.
     mode?: RoutingMode
   }
   fallbackOn?: number[]
@@ -220,6 +219,7 @@ export type AccountStorage = {
   cachekeep?: {
     enabled?: boolean
     subagents?: boolean
+    sustain?: boolean
     /** Clock-hour window start (0-23, inclusive) — keeps cachekeep idle warming
      *  inside `[startHour, endHour)` local hours. Omit to warm unconditionally. */
     startHour?: number
@@ -1126,7 +1126,7 @@ function normalizeKillswitchThresholds(
   }
 }
 
-function getKillswitchThresholdsForAccount(
+export function getKillswitchThresholdsForAccount(
   storage: AccountStorage | null,
   accountId?: string,
 ): { primary: number; secondary: number } {

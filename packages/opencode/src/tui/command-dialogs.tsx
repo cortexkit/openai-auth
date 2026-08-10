@@ -18,6 +18,7 @@ type ApplyFn = (
 export function buildCachekeepDialogOptions(payload: OpenDialogPayload) {
   const enabled = payload.knobs.enabled === true
   const subagents = payload.knobs.subagents === true
+  const sustain = payload.knobs.sustain === true
   const running = payload.knobs.running === true
   const tracked = Number(payload.knobs.tracked ?? 0)
   const generatedAt = Number(payload.knobs.generatedAt ?? Date.now())
@@ -31,7 +32,7 @@ export function buildCachekeepDialogOptions(payload: OpenDialogPayload) {
     | undefined
   const windowLabel = windowKnob
     ? `${String(windowKnob.startHour).padStart(2, '0')}-${String(windowKnob.endHour).padStart(2, '0')}`
-    : 'always'
+    : 'always (no window)'
   const lastWarm = lastWarmAt
     ? `${Math.ceil((generatedAt - lastWarmAt) / 1000)}s ago`
     : 'none yet'
@@ -44,6 +45,7 @@ export function buildCachekeepDialogOptions(payload: OpenDialogPayload) {
     `last warm ${lastWarm}`,
     `window ${windowLabel}`,
     `${idleWindow}m idle cap`,
+    `sustain ${sustain ? 'on' : 'off'}`,
     `subagent idle ${subIdleWindow}m`,
   ].filter((part) => part.length > 0)
 
@@ -66,6 +68,14 @@ export function buildCachekeepDialogOptions(payload: OpenDialogPayload) {
       description: subagents
         ? `Warm subagent sessions (${subIdleWindow}m idle cap). Disable to skip subagents.`
         : `Skip subagent sessions. Enable to warm them too (${subIdleWindow}m idle cap).`,
+    },
+    {
+      title: sustain
+        ? 'Sustain main sessions: on'
+        : 'Sustain main sessions: off',
+      value: sustain ? 'sustain off' : 'sustain on',
+      description:
+        'main-only, idle-cap only; the configured clock window still applies.',
     },
     {
       title: windowKnob ? `Warm window: ${windowLabel}` : 'Set warm window…',
@@ -165,6 +175,18 @@ export function openCommandDialog(
             title: 'Fallback first',
             value: 'fallback-first',
             description: 'Prefer fallback accounts, preserve main',
+          },
+          {
+            title: 'Sticky balanced',
+            value: 'sticky-balanced',
+            description:
+              'Keep each session on one account while balancing new sessions',
+          },
+          {
+            title: "Reset this session's pin",
+            value: 'reset',
+            description:
+              'Unpin this session; the next request may still choose the same account',
           },
         ]}
         onSelect={(option) => {
@@ -436,8 +458,8 @@ function openAccountDialog(
               showAddFlow()
               return
             }
-            // Main has no per-account actions (routing is mode-driven; main is
-            // not removable or reorderable) — the row is informational only.
+            // Main has no per-account actions: it is not removable or reorderable,
+            // regardless of whether the active session uses mode or sticky routing.
             if (option.value === 'main') return
             showL2Fallback(option.value)
           }}

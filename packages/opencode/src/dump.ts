@@ -200,6 +200,7 @@ export async function dumpCodexRequest(input: {
   transport: DumpTransport
   phase: DumpPhase
   bodyText: string
+  accountId?: string
   url?: string
   method?: string
   headers?: DumpHeaders
@@ -231,6 +232,7 @@ export async function dumpCodexRequest(input: {
       session: shortSession(sessionID),
       transport: input.transport,
       phase: input.phase,
+      accountId: input.accountId,
       status: input.status,
       error: input.error,
       bodyBytes: input.bodyText.length,
@@ -251,6 +253,7 @@ export async function dumpCodexRequest(input: {
           redactForDump({
             url: input.url,
             method: input.method,
+            accountId: input.accountId,
             headers: headersToRecord(input.headers),
           }),
           null,

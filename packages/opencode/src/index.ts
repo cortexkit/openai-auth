@@ -26,6 +26,7 @@ import {
   type AccountStorage,
   type FallbackAccount,
   FallbackAccountManager,
+  getKillswitchThresholdsForAccount,
   isCostZeroingEnabled,
   isKillswitchEnabled,
   isOAuthAccount,
@@ -72,6 +73,12 @@ import {
 } from './core/quota-manager'
 import { refreshAllQuota } from './core/refresh-all-quota'
 import { acquireRefreshFileLock } from './core/refresh-file-lock'
+import {
+  decideStickyBreak,
+  type StickyBreakDecision,
+  selectStickyCandidate,
+  snapshotCheckedAt,
+} from './core/sticky-routing'
 import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
 import {
   HostedWebSearchTool,
@@ -99,11 +106,15 @@ import { getRpcDir } from './rpc/rpc-dir'
 import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server'
 import {
   type AccountQuota,
+  clearSidebarStickyAssignment,
   exhaustedQuotaResetAt,
   getSidebarState,
   getSidebarStateFile,
+  hashSidebarSessionId,
   isQuotaExhausted,
   removeSidebarActiveRouting,
+  resolveSessionStickyAccount,
+  resolveSidebarStickyAssignment,
   type SidebarMachineState,
   type SidebarState,
   setSidebarLegacyRouting,
@@ -761,7 +772,7 @@ export async function CodexAuthPlugin(
       }
       if (codexSessions.delete(info.id)) persistCodexSessions()
       if (sidebarStateFileForEvents) {
-        const accounts = (await loadAccounts(getConfigPath()))?.accounts ?? []
+        const accounts = (await loadAccounts(getConfigPath()))?.accounts
         await removeSidebarActiveRouting(
           info.id,
           accounts,
@@ -974,6 +985,7 @@ export async function CodexAuthPlugin(
         const cacheKeepLogger = createLogger('cachekeep')
         let cacheKeepEnabled = storage?.cachekeep?.enabled === true
         let cacheKeepSubagents = storage?.cachekeep?.subagents === true
+        let cacheKeepSustain = storage?.cachekeep?.sustain === true
         let cacheKeepWindow = getCacheKeepWindow(storage)
         let mainRefreshPromise:
           | Promise<{ access: string; refresh: string; expires: number }>
@@ -1219,6 +1231,7 @@ export async function CodexAuthPlugin(
           logger: cacheKeepLogger,
           now: Date.now,
           getWindow: () => cacheKeepWindow,
+          getSustain: () => cacheKeepSustain,
         })
         cacheKeepGlobal.__openaiAuthCacheKeepManager = cacheKeepManager
 
@@ -1424,7 +1437,7 @@ export async function CodexAuthPlugin(
           parentSessionId: string | undefined,
           activeId: string,
           route: RoutingMode,
-          accounts: readonly { id: string; enabled?: boolean }[],
+          accounts: readonly { id: string; enabled?: boolean }[] | undefined,
         ) {
           const input = { activeId, route, updatedAt: Date.now() }
           if (sessionId) {
@@ -1434,6 +1447,31 @@ export async function CodexAuthPlugin(
               boundSidebarFile,
             )
             if (parentSessionId && parentSessionId !== sessionId) {
+              if (route === 'sticky-balanced') {
+                const parentPinnedId = (await getSidebarState(boundSidebarFile))
+                  .stickyAssignments?.[hashSidebarSessionId(parentSessionId)]
+                  ?.accountId
+                const parentPinIsUsable =
+                  accounts === undefined ||
+                  parentPinnedId === 'main' ||
+                  accounts.some(
+                    (account) =>
+                      account.enabled !== false &&
+                      account.id === parentPinnedId,
+                  )
+                if (!parentPinnedId || !parentPinIsUsable) return
+                await upsertSidebarActiveRouting(
+                  {
+                    sessionId: parentSessionId,
+                    activeId: parentPinnedId,
+                    route,
+                    updatedAt: Date.now(),
+                  },
+                  accounts,
+                  boundSidebarFile,
+                )
+                return
+              }
               await upsertSidebarActiveRouting(
                 { sessionId: parentSessionId, ...input },
                 accounts,
@@ -1461,9 +1499,19 @@ export async function CodexAuthPlugin(
           setCacheKeepSubagents: (enabled) => {
             cacheKeepSubagents = enabled
           },
+          setCacheKeepSustain: (enabled) => {
+            cacheKeepSustain = enabled
+          },
           setCacheKeepWindow: (window) => {
             cacheKeepWindow = window
           },
+          clearStickyRouting: (sessionId) =>
+            clearSidebarStickyAssignment(sessionId, boundSidebarFile),
+          getStickyRouting: async (sessionId) =>
+            resolveSessionStickyAccount(
+              await getSidebarState(boundSidebarFile),
+              sessionId,
+            ),
           refreshSidebar: async () => {
             const store = await loadAccounts(getConfigPath())
             await writeMachineSidebarState(quotaManager, store)
@@ -1500,11 +1548,15 @@ export async function CodexAuthPlugin(
               dir: getRpcDir(input.directory),
               drain: drainNotifications,
               apply: async (request: ApplyRequest): Promise<ApplyResult> => {
+                const callCtx: CommandContext = {
+                  // biome-ignore lint/style/noNonNullAssertion: cmdCtx is set in the loader before RPC server starts, and command.execute.before has a null guard
+                  ...cmdCtx!,
+                  sessionId: request.sessionId,
+                }
                 const payload = await buildDialogPayload(
                   request.command,
                   request.arguments,
-                  // biome-ignore lint/style/noNonNullAssertion: cmdCtx is set in the loader before RPC server starts, and command.execute.before has a null guard
-                  cmdCtx!,
+                  callCtx,
                 )
                 return { text: payload.text, knobs: payload.knobs }
               },
@@ -1606,6 +1658,7 @@ export async function CodexAuthPlugin(
             logT.debug('WS transport', {
               pid: process.pid,
               pathname: parsed.pathname,
+              accountId: keepwarmAccountKey,
             })
             if (keepwarmCapture) {
               cacheKeepManager.track(
@@ -1639,6 +1692,7 @@ export async function CodexAuthPlugin(
           logT.debug('HTTP transport', {
             pid: process.pid,
             pathname: parsed.pathname,
+            accountId: keepwarmAccountKey,
           })
           try {
             const response = await fetch(url, finalInit)
@@ -1647,6 +1701,7 @@ export async function CodexAuthPlugin(
               transport: 'http',
               phase: 'http',
               bodyText: finalInit.body,
+              accountId: keepwarmAccountKey,
               url: url.toString(),
               method: finalInit.method,
               headers: finalInit.headers,
@@ -1659,6 +1714,7 @@ export async function CodexAuthPlugin(
               transport: 'http',
               phase: 'http',
               bodyText: finalInit.body,
+              accountId: keepwarmAccountKey,
               url: url.toString(),
               method: finalInit.method,
               headers: finalInit.headers,
@@ -1722,26 +1778,38 @@ export async function CodexAuthPlugin(
               resetAtMs: number
             }
 
-        // Freshness key for a quota snapshot: each window's own checkedAt,
-        // then the snapshot-level checkedAt, then the cache entry's checkedAt.
-        // Both primary and secondary windows are consulted — an account whose
-        // only fresh window is the secondary must not be judged on the older
-        // primary timestamp.
-        function quotaCheckedAt(
+        function freshestQuotaSnapshot(
           quota: AccountQuota | null | undefined,
-          entryCheckedAt?: number,
-        ): number | undefined {
-          for (const checkedAt of [
-            quota?.primary?.checkedAt,
-            quota?.secondary?.checkedAt,
-            quota?.checkedAt,
-            entryCheckedAt,
-          ]) {
-            if (typeof checkedAt === 'number' && Number.isFinite(checkedAt)) {
-              return checkedAt
-            }
+          entryCheckedAt: number | undefined,
+          fileQuota: AccountQuota | null | undefined,
+          fileAccountId?: string,
+          currentAccountId?: string,
+        ): {
+          quota: AccountQuota | null | undefined
+          quotaCheckedAt: number | undefined
+          source: 'memory' | 'file'
+        } {
+          // snapshotCheckedAt consults primary AND secondary, so the freshness
+          // comparison is true both-window aware (PR #57 fix #2). A file row is
+          // trusted only when its identity matches the live caller's — an
+          // unstamped file with a known live identity is treated as absent
+          // (PR #57 fix #1: the re-login bug), and a stamped file whose
+          // identity differs is treated as absent for the same reason. Both
+          // sides unknown fails open (both undefined compare equal).
+          const memoryCheckedAt = snapshotCheckedAt(quota, entryCheckedAt)
+          const fileCheckedAt = snapshotCheckedAt(fileQuota)
+          const useFile =
+            fileAccountId === currentAccountId &&
+            fileQuota != null &&
+            (quota === undefined ||
+              (fileCheckedAt !== undefined &&
+                (memoryCheckedAt === undefined ||
+                  fileCheckedAt > memoryCheckedAt)))
+          return {
+            quota: useFile ? fileQuota : quota,
+            quotaCheckedAt: useFile ? fileCheckedAt : memoryCheckedAt,
+            source: useFile ? 'file' : 'memory',
           }
-          return undefined
         }
 
         // Selects the fresher quota source and judges it. The file wins only
@@ -1760,20 +1828,15 @@ export async function CodexAuthPlugin(
           currentAccountId?: string,
         ): AdmissionQuotaDecision {
           const memoryQuota = memoryEntry?.quota as AccountQuota | undefined
-          const memoryCheckedAt = quotaCheckedAt(
+          const freshest = freshestQuotaSnapshot(
             memoryQuota,
             memoryEntry?.checkedAt,
+            fileQuota,
+            fileAccountId,
+            currentAccountId,
           )
-          const fileCheckedAt = quotaCheckedAt(fileQuota)
-          const useFile =
-            fileAccountId === currentAccountId &&
-            fileQuota != null &&
-            (memoryQuota === undefined ||
-              (fileCheckedAt !== undefined &&
-                (memoryCheckedAt === undefined ||
-                  fileCheckedAt > memoryCheckedAt)))
-          const source = useFile ? 'file' : 'memory'
-          const quota = useFile ? fileQuota : memoryQuota
+          const source = freshest.source
+          const quota = freshest.quota
           if (!isQuotaExhausted(quota, now)) return { exhausted: false }
 
           const reset = exhaustedQuotaResetAt(quota, now)
@@ -1885,6 +1948,285 @@ export async function CodexAuthPlugin(
             candidate: FallbackCandidate
             decision: Extract<AdmissionQuotaDecision, { exhausted: true }>
           }>
+        }
+
+        type StickyRouteCandidate = {
+          accountId: string
+          wireAccountId?: string
+          access: string
+          keepwarmAccountKey: string
+          fallback?: FallbackAccount
+          quota: AccountQuota | null | undefined
+          quotaCheckedAt?: number
+          reservePercent: { primary: number; secondary: number }
+          configuredOrder: number
+          resetCreditsApplicable?: number
+          // Killswitch gate resolved at roster build, using the non-invalidating
+          // policy peek so a routine token refresh does not flip a killed
+          // account to "unknown". `false` excludes the candidate from both
+          // weighted placement and the mode-fallback fail-open branch.
+          killswitchPasses?: boolean
+        }
+
+        function resetCreditsApplicable(value: unknown): number | undefined {
+          // Field key fix: the storage shape is `resetCreditsAvailable` on
+          // both OAuthQuotaSnapshot (core/accounts.ts:88) and AccountQuota
+          // (sidebar-state.ts:13). The previous read of
+          // `resetCreditsApplicable` was always undefined and the
+          // credit-priority sort in selectStickyCandidate never fired in
+          // production. The candidate field stays named
+          // `resetCreditsApplicable` so the sort comparator downstream is
+          // unchanged.
+          const credits = (value as { resetCreditsAvailable?: unknown } | null)
+            ?.resetCreditsAvailable
+          return typeof credits === 'number' && Number.isFinite(credits)
+            ? credits
+            : undefined
+        }
+
+        async function buildStickyRouteRoster(input: {
+          storage: Awaited<ReturnType<typeof loadAccounts>>
+          sidebarState: SidebarState
+          primaryAccess: string
+          mainAccountIdentity?: string
+        }): Promise<StickyRouteCandidate[]> {
+          const killswitchEnabled = isKillswitchEnabled(input.storage)
+          const killswitchNow = Date.now()
+          const mainMemory = quotaManager.peekMainForPolicy(
+            input.mainAccountIdentity,
+          )
+          const mainFreshest = freshestQuotaSnapshot(
+            mainMemory?.quota as AccountQuota | undefined,
+            mainMemory?.checkedAt,
+            input.sidebarState.main.quota,
+            input.sidebarState.main.mainAccountId,
+            input.mainAccountIdentity,
+          )
+          // Killswitch (opt-in): pre-resolve the gate for each candidate so the
+          // placement selector (weighted + mode-fallback) and the break decision
+          // can both honour it without redoing the read. Undefined = passes —
+          // the dominant path with killswitch disabled is byte-identical.
+          const mainKillswitchPasses = killswitchEnabled
+            ? killswitchPassesPolicy(
+                mainMemory?.quota,
+                input.storage,
+                undefined,
+                killswitchNow,
+              )
+            : undefined
+          const roster: StickyRouteCandidate[] = [
+            {
+              accountId: 'main',
+              wireAccountId: input.mainAccountIdentity,
+              access: input.primaryAccess,
+              keepwarmAccountKey: 'main',
+              quota: mainFreshest.quota,
+              quotaCheckedAt: mainFreshest.quotaCheckedAt,
+              reservePercent: getKillswitchThresholdsForAccount(input.storage),
+              configuredOrder: 0,
+              resetCreditsApplicable: resetCreditsApplicable(
+                mainFreshest.quota,
+              ),
+              killswitchPasses: mainKillswitchPasses,
+            },
+          ]
+          const usableFallbacks =
+            await fallbackManager.getUsableFallbackAccounts(input.storage)
+          for (const fallback of usableFallbacks) {
+            if (!fallback.access) continue
+            const fileEntry = input.sidebarState.fallbacks.find(
+              (account) => account.id === fallback.id,
+            )
+            const memoryEntry = quotaManager.peekFallbackForPolicy(
+              fallback.id,
+              fallback.accountId,
+            )
+            const freshest = freshestQuotaSnapshot(
+              memoryEntry?.quota as AccountQuota | undefined,
+              memoryEntry?.checkedAt,
+              fileEntry?.quota,
+              fileEntry?.accountId,
+              fallback.accountId,
+            )
+            const fallbackKillswitchPasses = killswitchEnabled
+              ? killswitchPassesPolicy(
+                  memoryEntry?.quota,
+                  input.storage,
+                  fallback.id,
+                  killswitchNow,
+                )
+              : undefined
+            roster.push({
+              accountId: fallback.id,
+              wireAccountId: fallback.accountId,
+              access: fallback.access,
+              keepwarmAccountKey: fallback.id,
+              fallback,
+              quota: freshest.quota,
+              quotaCheckedAt: freshest.quotaCheckedAt,
+              reservePercent: getKillswitchThresholdsForAccount(
+                input.storage,
+                fallback.id,
+              ),
+              configuredOrder: roster.length,
+              resetCreditsApplicable: resetCreditsApplicable(freshest.quota),
+              killswitchPasses: fallbackKillswitchPasses,
+            })
+          }
+          return roster
+        }
+
+        function stickyBreakDecision(
+          candidate: StickyRouteCandidate,
+          sidebarState: SidebarState,
+          status: number | undefined,
+          now: number,
+          storage: Awaited<ReturnType<typeof loadAccounts>> | null,
+        ): StickyBreakDecision {
+          // Pre-resolved by the roster builder using the non-invalidating
+          // policy peek. Pass it through so a retained pin whose account has
+          // fallen below floor since the pin was created migrates the same
+          // way an exhausted pin does. Undefined = passes (killswitch
+          // disabled or no quota seen).
+          const killswitchPasses = isKillswitchEnabled(storage)
+            ? candidate.killswitchPasses
+            : undefined
+          if (candidate.accountId === 'main') {
+            const memoryEntry = quotaManager.peekMainForPolicy(
+              candidate.wireAccountId,
+            )
+            const freshest = freshestQuotaSnapshot(
+              memoryEntry?.quota as AccountQuota | undefined,
+              memoryEntry?.checkedAt,
+              sidebarState.main.quota,
+              sidebarState.main.mainAccountId,
+              candidate.wireAccountId,
+            )
+            return decideStickyBreak({
+              quota: freshest.quota,
+              quotaCheckedAt: freshest.quotaCheckedAt,
+              status,
+              now,
+              killswitchPasses,
+            })
+          }
+          const fileEntry = sidebarState.fallbacks.find(
+            (account) => account.id === candidate.accountId,
+          )
+          const memoryEntry = quotaManager.peekFallbackForPolicy(
+            candidate.accountId,
+            candidate.wireAccountId,
+          )
+          const freshest = freshestQuotaSnapshot(
+            memoryEntry?.quota as AccountQuota | undefined,
+            memoryEntry?.checkedAt,
+            fileEntry?.quota,
+            fileEntry?.accountId,
+            candidate.wireAccountId,
+          )
+          return decideStickyBreak({
+            quota: freshest.quota,
+            quotaCheckedAt: freshest.quotaCheckedAt,
+            status,
+            now,
+            killswitchPasses,
+          })
+        }
+
+        function stickyRateLimitKey(candidate: StickyRouteCandidate): string {
+          return candidate.accountId === 'main'
+            ? 'main'
+            : candidate.keepwarmAccountKey
+        }
+
+        function isStickyRouteCandidateRateLimited(
+          candidate: StickyRouteCandidate,
+        ): boolean {
+          return quotaManager.isRateLimited(stickyRateLimitKey(candidate))
+        }
+
+        async function resolveStickyRouteCandidate(input: {
+          sessionId: string
+          requestBytes: number
+          candidates: readonly StickyRouteCandidate[]
+          excludeAccountIds?: readonly string[]
+          now: number
+        }): Promise<StickyRouteCandidate | undefined> {
+          const eligibleCandidates = input.candidates.filter(
+            (candidate) => !isStickyRouteCandidateRateLimited(candidate),
+          )
+          const candidatesById = new Map(
+            eligibleCandidates.map((candidate) => [
+              candidate.accountId,
+              candidate,
+            ]),
+          )
+          const quotaCheckedAtByAccount = Object.fromEntries(
+            eligibleCandidates.map((candidate) => [
+              candidate.accountId,
+              candidate.quotaCheckedAt,
+            ]),
+          )
+          const excluded = new Set(input.excludeAccountIds)
+          let placement:
+            | {
+                accountId: string
+                source: 'weighted' | 'mode-fallback'
+                pendingBytes: number
+              }
+            | undefined
+          const assignment = await resolveSidebarStickyAssignment(
+            {
+              sessionId: input.sessionId,
+              requestBytes: input.requestBytes,
+              now: input.now,
+              validPinnedAccountIds: [...candidatesById.keys()],
+              excludeAccountIds: input.excludeAccountIds,
+              quotaCheckedAtByAccount,
+              choose: (pendingBytes) => {
+                const eligible = eligibleCandidates.filter(
+                  (candidate) => !excluded.has(candidate.accountId),
+                )
+                if (eligible.length === 0) return undefined
+                const selected = selectStickyCandidate({
+                  candidates: eligible,
+                  pendingBytes,
+                  requestBytes: input.requestBytes,
+                  now: input.now,
+                  onEmptyWeightedSet: () => {
+                    logA.debug(
+                      'sticky routing: no fresh weighted candidates; using configured order',
+                    )
+                  },
+                })
+                // Every candidate killed by the killswitch filter. The caller
+                // will translate the placed-pin absence into the shared
+                // `killswitchBlockedResponse`, the same shape the ordered
+                // modes produce.
+                if (!selected) return undefined
+                placement = {
+                  accountId: selected.accountId,
+                  source: selected.source,
+                  pendingBytes: pendingBytes.get(selected.accountId) ?? 0,
+                }
+                return selected
+              },
+            },
+            boundSidebarFile,
+          )
+          if (placement && assignment?.accountId === placement.accountId) {
+            logA.debug('sticky routing: placed session pin', {
+              pid: process.pid,
+              sessionHash: hashSidebarSessionId(input.sessionId),
+              accountId: placement.accountId,
+              source: placement.source,
+              requestBytes: input.requestBytes,
+              pendingBytes: placement.pendingBytes,
+            })
+          }
+          return assignment
+            ? candidatesById.get(assignment.accountId)
+            : undefined
         }
 
         async function usableFallbackCandidates(
@@ -2193,9 +2535,8 @@ export async function CodexAuthPlugin(
             const sidebarSessionId = resolveSidebarSessionId(requestHeaders)
             const sidebarParentSessionId =
               requestHeaders.get('x-parent-session-id')?.trim() || undefined
-            // Routing is purely mode-driven. The primary is ALWAYS the main
-            // account; fallback-first is handled by a proactive gate below that
-            // tries usable fallbacks before main. There is no per-account pin.
+            // Main-first and fallback-first select per request; sticky-balanced
+            // resolves a per-session pin from sidebar state before sending.
             const reqStorage = await loadRequestAccounts()
 
             // Main primary uses opencode's auth slot.
@@ -2261,6 +2602,151 @@ export async function CodexAuthPlugin(
               return requestSidebarStatePromise
             }
             const sidebarState = await requestSidebarState()
+
+            if (
+              mode === 'sticky-balanced' &&
+              sidebarSessionId &&
+              isReplayableRequest(requestInput, init) &&
+              typeof init?.body === 'string'
+            ) {
+              const requestBytes = Buffer.byteLength(init.body, 'utf8')
+              const stickyRoster = await buildStickyRouteRoster({
+                storage: reqStorage,
+                sidebarState,
+                primaryAccess,
+                mainAccountIdentity,
+              })
+              let stickyCandidate = await resolveStickyRouteCandidate({
+                sessionId: sidebarSessionId,
+                requestBytes,
+                candidates: stickyRoster,
+                now: Date.now(),
+              })
+
+              if (stickyCandidate) {
+                const preSendBreak = isStickyRouteCandidateRateLimited(
+                  stickyCandidate,
+                )
+                  ? { action: 'migrate' as const, reason: 'exhausted' as const }
+                  : stickyBreakDecision(
+                      stickyCandidate,
+                      sidebarState,
+                      undefined,
+                      Date.now(),
+                      reqStorage,
+                    )
+                if (preSendBreak.action === 'migrate') {
+                  const replacement = await resolveStickyRouteCandidate({
+                    sessionId: sidebarSessionId,
+                    requestBytes,
+                    candidates: stickyRoster,
+                    excludeAccountIds: [stickyCandidate.accountId],
+                    now: Date.now(),
+                  })
+                  if (replacement) {
+                    logA.debug('sticky routing: migrated session pin', {
+                      pid: process.pid,
+                      sessionHash: hashSidebarSessionId(sidebarSessionId),
+                      fromAccountId: stickyCandidate.accountId,
+                      toAccountId: replacement.accountId,
+                      reason: preSendBreak.reason,
+                    })
+                    stickyCandidate = replacement
+                  }
+                }
+
+                let stickyResponse = await sendWithAccessToken(
+                  requestInput,
+                  init,
+                  stickyCandidate.access,
+                  stickyCandidate.wireAccountId,
+                  stickyCandidate.keepwarmAccountKey,
+                )
+
+                const pushStickyQuota = async (
+                  response: Response,
+                  candidate: StickyRouteCandidate,
+                ) => {
+                  try {
+                    const snapshot = normalizeQuotaHeaders(response.headers)
+                    await pushQuota(
+                      snapshot as Record<string, unknown>,
+                      candidate.access,
+                      candidate.accountId === 'main'
+                        ? undefined
+                        : candidate.accountId,
+                      candidate.accountId === 'main'
+                        ? candidate.wireAccountId
+                        : undefined,
+                      isCompleteQuotaHeaderFrame(response.headers),
+                    )
+                  } catch {
+                    // Quota push is advisory; preserve the provider response.
+                  }
+                }
+
+                await pushStickyQuota(stickyResponse, stickyCandidate)
+                const responseBreak = stickyBreakDecision(
+                  stickyCandidate,
+                  sidebarState,
+                  stickyResponse.status,
+                  Date.now(),
+                  reqStorage,
+                )
+                const retryableStickyFailure =
+                  stickyResponse.status === 401 ||
+                  stickyResponse.status === 403 ||
+                  stickyResponse.status === 429
+                if (
+                  retryableStickyFailure &&
+                  responseBreak.action === 'migrate'
+                ) {
+                  const replacement = await resolveStickyRouteCandidate({
+                    sessionId: sidebarSessionId,
+                    requestBytes,
+                    candidates: stickyRoster,
+                    excludeAccountIds: [stickyCandidate.accountId],
+                    now: Date.now(),
+                  })
+                  if (replacement) {
+                    logA.debug('sticky routing: migrated session pin', {
+                      pid: process.pid,
+                      sessionHash: hashSidebarSessionId(sidebarSessionId),
+                      fromAccountId: stickyCandidate.accountId,
+                      toAccountId: replacement.accountId,
+                      reason: responseBreak.reason,
+                    })
+                    const previousResponse = stickyResponse
+                    stickyResponse = await sendWithAccessToken(
+                      requestInput,
+                      init,
+                      replacement.access,
+                      replacement.wireAccountId,
+                      replacement.keepwarmAccountKey,
+                    )
+                    previousResponse.body?.cancel().catch(() => {})
+                    stickyCandidate = replacement
+                    await pushStickyQuota(stickyResponse, stickyCandidate)
+                  }
+                }
+
+                if (
+                  stickyCandidate.fallback &&
+                  !shouldFallbackStatus(stickyResponse.status, reqStorage)
+                ) {
+                  await fallbackManager.markUsed(stickyCandidate.fallback)
+                }
+                await writeRequestSidebarRouting(
+                  sidebarSessionId,
+                  sidebarParentSessionId,
+                  stickyCandidate.accountId,
+                  mode,
+                  reqStorage?.accounts,
+                ).catch(() => {})
+                return stickyResponse
+              }
+            }
+
             const mainQuotaDecision = admissionQuotaDecision(
               quotaManager.peekMainForPolicy(mainAccountIdentity),
               sidebarState.main.quota,
@@ -2468,7 +2954,7 @@ export async function CodexAuthPlugin(
               sidebarParentSessionId,
               servedActiveId,
               mode,
-              reqStorage?.accounts ?? [],
+              reqStorage?.accounts,
             ).catch(() => {})
             return finalResponse
           },
@@ -2596,7 +3082,7 @@ export async function CodexAuthPlugin(
         [OPENAI_ROUTING_COMMAND_NAME]: {
           template: OPENAI_ROUTING_COMMAND_NAME,
           description:
-            'Show or change OpenAI account routing between main-first and fallback-first.',
+            'Show or change OpenAI account routing between main-first, fallback-first, and sticky-balanced.',
         },
         [OPENAI_KILLSWITCH_COMMAND_NAME]: {
           template: OPENAI_KILLSWITCH_COMMAND_NAME,

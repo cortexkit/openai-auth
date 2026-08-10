@@ -134,6 +134,38 @@ describe('accounts store', () => {
     expect(state.accounts[account.id].access).toBe('acc-token')
   })
 
+  it('round-trips sticky-balanced routing mode', async () => {
+    const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
+
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        routing: { mode: 'sticky-balanced' },
+        accounts: [],
+      },
+      cfgPath,
+    )
+
+    expect((await loadAccounts(cfgPath))?.routing?.mode).toBe('sticky-balanced')
+  })
+
+  it('round-trips cachekeep sustain', async () => {
+    const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
+
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        cachekeep: { enabled: true, sustain: true },
+      },
+      cfgPath,
+    )
+
+    expect((await loadAccounts(cfgPath))?.cachekeep?.sustain).toBe(true)
+  })
+
   it('state file has 0600 permissions', async () => {
     const { saveAccounts } = await import('../core/accounts.ts')
     const { statSync } = await import('node:fs')

@@ -42,6 +42,25 @@ describe('command dialogs', () => {
     expect(options.map((option) => option.title)).toContain('Refresh status')
   })
 
+  test('cachekeep modal exposes a main-only sustain toggle', () => {
+    const options = buildCachekeepDialogOptions({
+      command: 'openai-cachekeep',
+      text: '',
+      knobs: {
+        enabled: true,
+        running: true,
+        tracked: 1,
+        sustain: false,
+      },
+    })
+
+    expect(options).toContainEqual({
+      title: 'Sustain main sessions: off',
+      value: 'sustain on',
+      description: expect.stringContaining('main-only'),
+    })
+  })
+
   // The cachekeep dialog is implemented as JSX over the runtime-provided
   // `TuiPluginApi`. To exercise its onSelect without spinning the real TUI,
   // intercept the renderer's render fn and the runtime DialogSelect
@@ -50,6 +69,11 @@ describe('command dialogs', () => {
   function makeCachekeepDialogHarness() {
     let capturedRenderer: (() => unknown) | null = null
     let capturedOnSelect: ((option: { value: string }) => void) | null = null
+    let capturedOptions: Array<{
+      title: string
+      value: string
+      description?: string
+    }> = []
     const clearCount = { value: 0 }
     const replaceCount = { value: 0 }
 
@@ -68,8 +92,14 @@ describe('command dialogs', () => {
         toast: () => {},
         DialogSelect: ((props: {
           onSelect: (option: { value: string }) => void
+          options?: Array<{
+            title: string
+            value: string
+            description?: string
+          }>
         }) => {
           capturedOnSelect = props.onSelect
+          capturedOptions = props.options ?? []
           return null
         }) as unknown as TuiPluginApi['ui']['DialogSelect'],
       },
@@ -81,10 +111,33 @@ describe('command dialogs', () => {
         capturedRenderer?.()
       },
       getOnSelect: () => capturedOnSelect,
+      getOptions: () => capturedOptions,
       clearCount,
       replaceCount,
     }
   }
+
+  test('routing reset dialog exposes sticky-balanced selection and reset', () => {
+    const { api, renderDialog, getOptions } = makeCachekeepDialogHarness()
+
+    openCommandDialog(
+      api,
+      { command: 'openai-routing', text: '', knobs: { mode: 'main-first' } },
+      mock(async () => ({ text: '', knobs: {} })),
+    )
+
+    renderDialog()
+    expect(getOptions()).toContainEqual({
+      title: 'Sticky balanced',
+      value: 'sticky-balanced',
+      description: expect.any(String),
+    })
+    expect(getOptions()).toContainEqual({
+      title: "Reset this session's pin",
+      value: 'reset',
+      description: expect.any(String),
+    })
+  })
 
   test('cachekeep dialog "clear_window" applies "window clear" (not the literal option value)', async () => {
     const { api, renderDialog, getOnSelect } = makeCachekeepDialogHarness()

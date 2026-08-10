@@ -23,6 +23,7 @@ export interface RpcNotification {
 export interface ApplyRequest {
   command: CommandModalName
   arguments: string
+  sessionId?: string
 }
 
 export interface ApplyResult {

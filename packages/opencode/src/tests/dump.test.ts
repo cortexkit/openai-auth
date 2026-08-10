@@ -384,6 +384,37 @@ describe('request dumps', () => {
     })
   })
 
+  test('records the internal serving account without exposing a ChatGPT account id', async () => {
+    await withDumpEnv(async (dumpDir) => {
+      await dumpCodexRequest({
+        sessionID: 'ses_dump_account',
+        transport: 'http',
+        phase: 'http',
+        accountId: 'work-alt',
+        bodyText: JSON.stringify({ input: [] }),
+        headers: { 'chatgpt-account-id': 'chatgpt-account-secret' },
+      })
+
+      const files = await readdir(dumpDir)
+      const metadata = JSON.parse(
+        await readFile(join(dumpDir, requireFile(files, '.meta.json')), 'utf8'),
+      )
+      const request = JSON.parse(
+        await readFile(
+          join(dumpDir, requireFile(files, '.request.json')),
+          'utf8',
+        ),
+      )
+
+      expect(metadata.accountId).toBe('work-alt')
+      expect(request.accountId).toBe('work-alt')
+      expect(request.headers['chatgpt-account-id']).toBe('[redacted]')
+      expect(JSON.stringify({ metadata, request })).not.toContain(
+        'chatgpt-account-secret',
+      )
+    })
+  })
+
   test('redacts credentials from JSON dump bodies', async () => {
     await withDumpEnv(async (dumpDir) => {
       const bearer = 'Bearer dump-body-token'

@@ -21,13 +21,17 @@ afterEach(async () => {
 })
 
 describe('rpc-server', () => {
-  test('health is open; pending-notifications requires bearer and drains', async () => {
+  test('apply callback receives sessionId unchanged; health is open and pending-notifications drains', async () => {
     resetNotificationsForTest()
     dir = await mkdtemp(join(tmpdir(), 'oa-rpcsrv-'))
+    let receivedApply: unknown
     const server = await startRpcServer({
       dir,
       drain: drainNotifications,
-      apply: async () => ({ text: 'ok', knobs: {} }),
+      apply: async (request) => {
+        receivedApply = request
+        return { text: 'ok', knobs: {} }
+      },
     })
     stop = server.stop
     const base = `http://127.0.0.1:${server.port}`
@@ -69,10 +73,19 @@ describe('rpc-server', () => {
         'content-type': 'application/json',
         authorization: `Bearer ${server.token}`,
       },
-      body: JSON.stringify({ command: 'openai-quota', arguments: '' }),
+      body: JSON.stringify({
+        command: 'openai-routing',
+        arguments: 'reset',
+        sessionId: 'session-a',
+      }),
     })
     expect(applyOk.status).toBe(200)
     expect(await applyOk.json()).toEqual({ text: 'ok', knobs: {} })
+    expect(receivedApply).toEqual({
+      command: 'openai-routing',
+      arguments: 'reset',
+      sessionId: 'session-a',
+    })
   })
 
   test('rejects body exceeding 1 MB byte limit', async () => {

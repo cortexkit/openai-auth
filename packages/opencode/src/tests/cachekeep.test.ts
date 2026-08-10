@@ -391,6 +391,137 @@ describe('CacheKeepManager.track', () => {
     expect(status.targets[0]!.sessionKey).toBe('sess-2')
   })
 
+  test('sustain toggles main idle pruning at runtime without recreating the manager', () => {
+    let sustain = false
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: TTL_MS,
+      maxIdleWarmMs: 60_000,
+      getSustain: () => sustain,
+    })
+
+    mgr.track('pruned-while-off', JSON.stringify({ input: 'old' }), 'main')
+    clock.advance(60_001)
+    mgr.track('trigger-off', JSON.stringify({ input: 'new' }), 'main')
+    expect(mgr.status().targets.map((target) => target.sessionKey)).toEqual([
+      'trigger-off',
+    ])
+
+    sustain = true
+    mgr.track('kept-while-on', JSON.stringify({ input: 'kept' }), 'main')
+    clock.advance(60_001)
+    mgr.track('trigger-on', JSON.stringify({ input: 'newer' }), 'main')
+    expect(mgr.status().targets.map((target) => target.sessionKey)).toEqual([
+      'trigger-off',
+      'kept-while-on',
+      'trigger-on',
+    ])
+    expect(mgr.status().sustain).toBe(true)
+
+    sustain = false
+    clock.advance(60_001)
+    mgr.track('trigger-off-again', JSON.stringify({ input: 'latest' }), 'main')
+    expect(mgr.status().targets.map((target) => target.sessionKey)).toEqual([
+      'trigger-off-again',
+    ])
+    expect(mgr.status().sustain).toBe(false)
+  })
+
+  test('sustain bypasses idle pruning but leaves maxTargets and maxBytes eviction active', async () => {
+    const body = JSON.stringify({ input: 'x'.repeat(100) })
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: TTL_MS,
+      maxIdleWarmMs: 1,
+      maxTargets: 8,
+      maxBytes: body.length * 2 - 1,
+      getSustain: () => true,
+    })
+
+    mgr.track('sustained-old', body, 'main')
+    clock.advance(2)
+    await mgr.tick()
+    expect(mgr.status().targets.map((target) => target.sessionKey)).toEqual([
+      'sustained-old',
+    ])
+
+    mgr.track('newer', body, 'main')
+    expect(mgr.status().targets.map((target) => target.sessionKey)).toEqual([
+      'newer',
+    ])
+
+    const capped = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: TTL_MS,
+      maxIdleWarmMs: 1,
+      maxTargets: 1,
+      getSustain: () => true,
+    })
+
+    capped.track('sustained-old', JSON.stringify({ input: 'old' }), 'main')
+    clock.advance(2)
+    await capped.tick()
+    expect(capped.status().targets.map((target) => target.sessionKey)).toEqual([
+      'sustained-old',
+    ])
+
+    capped.track('newer', JSON.stringify({ input: 'new' }), 'main')
+    expect(capped.status().targets.map((target) => target.sessionKey)).toEqual([
+      'newer',
+    ])
+  })
+
+  test('sustain leaves the configured clock window in control of capture and warming', async () => {
+    let window: { startHour: number; endHour: number } | undefined
+    const mgr = new CacheKeepManager({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl: CODEX_URL,
+      logger: log,
+      now: clock.now,
+      ttlMs: TTL_MS,
+      leadMs: LEAD_MS,
+      getSustain: () => true,
+      getWindow: () => window,
+    })
+    const outsideHour = new Date(clock.now()).getHours()
+    window = undefined
+    mgr.track(
+      'captured-before-window',
+      JSON.stringify({ input: 'old' }),
+      'main',
+    )
+    window = {
+      startHour: (outsideHour + 1) % 24,
+      endHour: (outsideHour + 2) % 24,
+    }
+
+    mgr.track('blocked-by-window', JSON.stringify({ input: 'new' }), 'main')
+    expect(mgr.status().targets.map((target) => target.sessionKey)).toEqual([
+      'captured-before-window',
+    ])
+
+    clock.advance(TTL_MS - LEAD_MS + 1)
+    await mgr.tick()
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
   test('caps Map size at default maxTargets (32)', () => {
     const mgr = new CacheKeepManager({
       fetchImpl,
@@ -451,7 +582,7 @@ describe('CacheKeepManager.track', () => {
     expect(status.targets[0]!.sessionKey).toBe('sess-1')
   })
 
-  test('evicts least-recently-used target instead of oldest inserted target', async () => {
+  test('sustain leaves least-recently-used eviction active', async () => {
     const mgr = new CacheKeepManager({
       fetchImpl,
       getMainToken,
@@ -461,7 +592,9 @@ describe('CacheKeepManager.track', () => {
       now: clock.now,
       ttlMs: TTL_MS,
       leadMs: LEAD_MS,
+      maxIdleWarmMs: 1,
       maxTargets: 2,
+      getSustain: () => true,
     })
     mgr.track(
       'main',
@@ -518,6 +651,7 @@ describe('CacheKeepManager subagent pruneStale', () => {
       now: clock.now,
       maxIdleWarmMs: 60 * 60 * 1000, // 1h main
       maxSubagentIdleMs: 30 * 60 * 1000, // 30min subagent
+      getSustain: () => true,
     })
     mgr.track(
       'sub-sess',
@@ -1446,6 +1580,7 @@ describe('CacheKeepManager tick/prewarm', () => {
       ttlMs: longTtl,
       leadMs: LEAD_MS,
       maxSubagentIdleMs: 60 * 60 * 1000, // large so the idle prune doesn't fire first
+      getSustain: () => true,
     })
     mgr.track(
       'sub-56',
@@ -1486,6 +1621,7 @@ describe('CacheKeepManager tick/prewarm', () => {
       ttlMs: longTtl,
       leadMs: LEAD_MS,
       maxSubagentIdleMs: 30 * 60 * 1000, // same as TTL — would prune pre-change
+      getSustain: () => true,
     })
     mgr.track(
       'sub-56',
@@ -1527,6 +1663,7 @@ describe('CacheKeepManager tick/prewarm', () => {
       ttlMs: longTtl,
       leadMs: LEAD_MS,
       maxSubagentIdleMs: 30 * 60 * 1000,
+      getSustain: () => true,
     })
     mgr.track(
       'sub-56-stuck',

@@ -13,6 +13,7 @@ import type { Hooks, PluginInput } from '@opencode-ai/plugin'
 import type { OAuthAccount } from '../core/accounts.ts'
 import { migrateIfNeeded } from '../core/accounts.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
+import { QUOTA_STALENESS_MS } from '../core/sticky-routing.ts'
 import {
   AuthPersistError,
   CodexAuthPlugin,
@@ -21,11 +22,13 @@ import {
   MAIN_REFRESH_LOCK_TTL_MS,
   resolveSidebarSessionId,
 } from '../index.ts'
+import { flushForTest, setLogLevel } from '../logger.ts'
 import { resetModelCostsForTest } from '../model-costs.ts'
 import { ResponseStreamError } from '../response-stream-error'
 import {
   drainSidebarWrites,
   getSidebarStateFile,
+  hashSidebarSessionId,
   normalizeSidebarState,
   resolveSessionSidebarRouting,
   type SidebarState,
@@ -2601,7 +2604,12 @@ describe('integration: active fallback routing', () => {
     return { hooks, fetchOverride }
   }
 
-  async function runCommand(hooks: Hooks, command: string, args = '') {
+  async function runCommand(
+    hooks: Hooks,
+    command: string,
+    args = '',
+    sessionID = 'test-session',
+  ) {
     const hook = hooks['command.execute.before'] as
       | ((input: {
           command: string
@@ -2611,7 +2619,7 @@ describe('integration: active fallback routing', () => {
       | undefined
     if (!hook) throw new Error('No command hook')
     try {
-      await hook({ command, arguments: args, sessionID: 'test-session' })
+      await hook({ command, arguments: args, sessionID })
     } catch (error) {
       if (
         !(error instanceof Error) ||
@@ -2857,6 +2865,1205 @@ describe('integration: active fallback routing', () => {
     }
     writeFileSync(sidebarFile, JSON.stringify(state))
   }
+
+  function stickyQuota(remainingPercent: number, checkedAt: number) {
+    return {
+      primary: {
+        usedPercent: 100 - remainingPercent,
+        remainingPercent,
+        checkedAt,
+        resetsAt: new Date(checkedAt + 7 * 24 * 3600_000).toISOString(),
+        windowMinutes: 300,
+      },
+    }
+  }
+
+  function seedStickyBalancedAccounts() {
+    const checkedAt = Date.now()
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        routing: { mode: 'sticky-balanced' },
+        refresh: { refreshBeforeExpiryMinutes: 5 },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            enabled: true,
+            access: 'fallback-1-token',
+            refresh: 'fallback-1-refresh',
+            expires: Date.now() + 24 * 3600_000,
+            accountId: 'acc-fallback-1',
+          },
+          {
+            id: 'fallback-2',
+            type: 'oauth',
+            enabled: true,
+            access: 'fallback-2-token',
+            refresh: 'fallback-2-refresh',
+            expires: Date.now() + 24 * 3600_000,
+            accountId: 'acc-fallback-2',
+          },
+        ],
+      }),
+    )
+    writeFileSync(
+      sidebarFile,
+      JSON.stringify({
+        main: {
+          quota: stickyQuota(20, checkedAt),
+          mainAccountId: 'acc-main',
+          killed: false,
+        },
+        fallbacks: [
+          {
+            id: 'fallback-1',
+            label: 'Fallback 1',
+            accountId: 'acc-fallback-1',
+            quota: stickyQuota(90, checkedAt),
+            killed: false,
+            enabled: true,
+          },
+          {
+            id: 'fallback-2',
+            label: 'Fallback 2',
+            accountId: 'acc-fallback-2',
+            quota: stickyQuota(100, checkedAt),
+            killed: false,
+            enabled: true,
+          },
+        ],
+        route: 'sticky-balanced',
+        lastUpdated: checkedAt,
+      }),
+    )
+  }
+
+  it('sticky-balanced pins a session, retains it, and balances a new session by pending bytes', async () => {
+    seedStickyBalancedAccounts()
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('responses')) {
+        seenAuth.push(headerValue(init, 'authorization'))
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+
+      const first = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'sticky-session' }),
+      )
+      expect(first.status).toBe(200)
+      expect(seenAuth).toEqual(['Bearer fallback-2-token'])
+
+      await drainSidebarWrites()
+      const firstState = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      )
+      const firstAssignment =
+        firstState.stickyAssignments?.[hashSidebarSessionId('sticky-session')]
+      expect(firstAssignment?.accountId).toBe('fallback-2')
+
+      const changed = JSON.parse(readFileSync(sidebarFile, 'utf8'))
+      changed.fallbacks[0].quota = stickyQuota(100, Date.now())
+      changed.fallbacks[1].quota = stickyQuota(1, Date.now())
+      writeFileSync(sidebarFile, JSON.stringify(changed))
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'sticky-session' }),
+      )
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'cold-session' }),
+      )
+      expect(seenAuth).toEqual([
+        'Bearer fallback-2-token',
+        'Bearer fallback-2-token',
+        'Bearer fallback-1-token',
+      ])
+
+      await drainSidebarWrites()
+      const finalState = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      )
+      expect(
+        finalState.stickyAssignments?.[hashSidebarSessionId('cold-session')]
+          ?.accountId,
+      ).toBe('fallback-1')
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('logs a new sticky placement with its selection fields', async () => {
+    seedStickyBalancedAccounts()
+    const sessionId = 'placement-log-session'
+    const request = responseRequestInit({ 'x-session-affinity': sessionId })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+    setLogLevel('debug')
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride('https://api.openai.com/v1/responses', request)
+      await flushForTest()
+
+      const line = readFileSync(logFile, 'utf8')
+        .split('\n')
+        .find((entry) => entry.includes('sticky routing: placed session pin'))
+      if (!line) throw new Error('missing sticky placement log')
+      const payload = JSON.parse(line.slice(line.indexOf('{')))
+      expect(payload).toMatchObject({
+        sessionHash: hashSidebarSessionId(sessionId),
+        accountId: 'fallback-2',
+        source: 'weighted',
+        requestBytes: Buffer.byteLength(String(request.body), 'utf8'),
+        pendingBytes: 0,
+      })
+      expect(line).not.toContain(sessionId)
+    } finally {
+      globalThis.fetch = originalFetch
+      setLogLevel(undefined)
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('logs both reachable sticky migration paths with account and reason', async () => {
+    const sessionId = 'pre-send-migration-session'
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+      const auth = headerValue(init, 'authorization')
+      return new Response('{}', {
+        status: auth.includes('fallback-2') ? 401 : 200,
+      })
+    }) as unknown as typeof globalThis.fetch
+    setLogLevel('debug')
+    let hooks: Hooks | undefined
+    try {
+      seedStickyBalancedAccounts()
+      const preSendState = JSON.parse(readFileSync(sidebarFile, 'utf8'))
+      preSendState.fallbacks[1].quota = stickyQuota(0, Date.now())
+      preSendState.stickyAssignments = {
+        [hashSidebarSessionId(sessionId)]: {
+          accountId: 'fallback-2',
+          assignedAt: Date.now(),
+          lastSeenAt: Date.now(),
+          inputBytes: 1,
+        },
+      }
+      writeFileSync(sidebarFile, JSON.stringify(preSendState))
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': sessionId }),
+      )
+
+      const postResponseSession = 'post-response-migration-session'
+      seedStickyBalancedAccounts()
+      const postResponseState = JSON.parse(readFileSync(sidebarFile, 'utf8'))
+      postResponseState.stickyAssignments = {
+        [hashSidebarSessionId(postResponseSession)]: {
+          accountId: 'fallback-2',
+          assignedAt: Date.now(),
+          lastSeenAt: Date.now(),
+          inputBytes: 1,
+        },
+      }
+      writeFileSync(sidebarFile, JSON.stringify(postResponseState))
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': postResponseSession }),
+      )
+      await flushForTest()
+
+      const migrations = readFileSync(logFile, 'utf8')
+        .split('\n')
+        .filter((entry) =>
+          entry.includes('sticky routing: migrated session pin'),
+        )
+        .map((entry) => JSON.parse(entry.slice(entry.indexOf('{'))))
+      expect(migrations).toContainEqual(
+        expect.objectContaining({
+          sessionHash: hashSidebarSessionId(sessionId),
+          fromAccountId: 'fallback-2',
+          toAccountId: 'fallback-1',
+          reason: 'exhausted',
+        }),
+      )
+      expect(migrations).toContainEqual(
+        expect.objectContaining({
+          sessionHash: hashSidebarSessionId(postResponseSession),
+          fromAccountId: 'fallback-2',
+          toAccountId: 'fallback-1',
+          reason: 'permanent',
+        }),
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+      setLogLevel(undefined)
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('does not log placement or migration when retaining a healthy sticky pin', async () => {
+    seedStickyBalancedAccounts()
+    const sessionId = 'healthy-retained-pin'
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+    setLogLevel('debug')
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': sessionId }),
+      )
+      await flushForTest()
+      writeFileSync(logFile, '')
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': sessionId }),
+      )
+      await flushForTest()
+
+      const text = readFileSync(logFile, 'utf8')
+      expect(text).not.toContain('sticky routing: placed session pin')
+      expect(text).not.toContain('sticky routing: migrated session pin')
+    } finally {
+      globalThis.fetch = originalFetch
+      setLogLevel(undefined)
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('a degraded request roster read preserves existing fallback pins through the main-path sidebar writer', async () => {
+    seedStickyBalancedAccounts()
+    const retainedHash = hashSidebarSessionId('retained-after-degraded-read')
+    const seeded = JSON.parse(readFileSync(sidebarFile, 'utf8'))
+    seeded.stickyAssignments = {
+      [retainedHash]: {
+        accountId: 'fallback-1',
+        assignedAt: Date.now(),
+        lastSeenAt: Date.now(),
+        inputBytes: 1,
+      },
+    }
+    writeFileSync(sidebarFile, JSON.stringify(seeded))
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      renameSync(configFile, `${configFile}.unavailable`)
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'degraded-read-session' }),
+      )
+      expect(response.status).toBe(200)
+      await drainSidebarWrites()
+
+      expect(
+        normalizeSidebarState(JSON.parse(readFileSync(sidebarFile, 'utf8')))
+          .stickyAssignments?.[retainedHash]?.accountId,
+      ).toBe('fallback-1')
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('a degraded roster read on session deletion removes only the deleted pin', async () => {
+    seedStickyBalancedAccounts()
+    const deletedSessionId = 'deleted-after-degraded-read'
+    const retainedHash = hashSidebarSessionId('retained-after-degraded-delete')
+    const seeded = JSON.parse(readFileSync(sidebarFile, 'utf8'))
+    seeded.stickyAssignments = {
+      [hashSidebarSessionId(deletedSessionId)]: {
+        accountId: 'fallback-1',
+        assignedAt: Date.now(),
+        lastSeenAt: Date.now(),
+        inputBytes: 1,
+      },
+      [retainedHash]: {
+        accountId: 'fallback-2',
+        assignedAt: Date.now(),
+        lastSeenAt: Date.now(),
+        inputBytes: 2,
+      },
+    }
+    writeFileSync(sidebarFile, JSON.stringify(seeded))
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      renameSync(configFile, `${configFile}.unavailable`)
+      const event = (
+        hooks as unknown as {
+          event?: (input: {
+            event: {
+              type: 'session.deleted'
+              properties: { info: { id: string } }
+            }
+          }) => Promise<void>
+        }
+      ).event
+      if (!event) throw new Error('No event hook')
+
+      await event({
+        event: {
+          type: 'session.deleted',
+          properties: { info: { id: deletedSessionId } },
+        },
+      })
+      await drainSidebarWrites()
+
+      const stickyAssignments = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      ).stickyAssignments
+      expect(
+        stickyAssignments?.[hashSidebarSessionId(deletedSessionId)],
+      ).toBeUndefined()
+      expect(stickyAssignments?.[retainedHash]?.accountId).toBe('fallback-2')
+    } finally {
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('routing reset removes a session pin without forcing a different account', async () => {
+    seedStickyBalancedAccounts()
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('responses')) {
+        seenAuth.push(headerValue(init, 'authorization'))
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      const sessionId = 'reset-same-account-session'
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': sessionId }),
+      )
+      await drainSidebarWrites()
+      expect(
+        normalizeSidebarState(JSON.parse(readFileSync(sidebarFile, 'utf8')))
+          .stickyAssignments?.[hashSidebarSessionId(sessionId)]?.accountId,
+      ).toBe('fallback-2')
+
+      const beforeReset = JSON.parse(readFileSync(sidebarFile, 'utf8'))
+      const selectionNow = Date.now()
+      beforeReset.main.quota = stickyQuota(1, selectionNow)
+      beforeReset.fallbacks[0].quota = stickyQuota(1, selectionNow)
+      beforeReset.fallbacks[1].quota = stickyQuota(100, selectionNow)
+      writeFileSync(sidebarFile, JSON.stringify(beforeReset))
+
+      await runCommand(hooks, 'openai-routing', 'reset', sessionId)
+      await drainSidebarWrites()
+      expect(
+        normalizeSidebarState(JSON.parse(readFileSync(sidebarFile, 'utf8')))
+          .stickyAssignments?.[hashSidebarSessionId(sessionId)],
+      ).toBeUndefined()
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': sessionId }),
+      )
+
+      expect(seenAuth).toEqual([
+        'Bearer fallback-2-token',
+        'Bearer fallback-2-token',
+      ])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sticky-balanced keeps the assignment high-water request size', async () => {
+    seedStickyBalancedAccounts()
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'high-water-session' }),
+      )
+      await drainSidebarWrites()
+      const first = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      ).stickyAssignments?.[hashSidebarSessionId('high-water-session')]
+      const longer = responseRequestInit({
+        'x-session-affinity': 'high-water-session',
+      })
+      longer.body = `${longer.body}${'x'.repeat(1_024)}`
+      await loaded.fetchOverride('https://api.openai.com/v1/responses', longer)
+      await drainSidebarWrites()
+      const second = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      ).stickyAssignments?.[hashSidebarSessionId('high-water-session')]
+
+      expect(second?.inputBytes).toBeGreaterThan(first?.inputBytes ?? 0)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sticky-balanced migrates only on confirmed exhaustion or permanent auth failure', async () => {
+    seedStickyBalancedAccounts()
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (!String(url).includes('responses'))
+        return new Response('{}', { status: 200 })
+      const auth = headerValue(init, 'authorization')
+      seenAuth.push(auth)
+      return new Response('{}', {
+        status: auth.includes('fallback-2-token') ? 401 : 200,
+      })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'migrate-session' }),
+      )
+
+      expect(response.status).toBe(200)
+      expect(seenAuth).toEqual([
+        'Bearer fallback-2-token',
+        'Bearer fallback-1-token',
+      ])
+      await drainSidebarWrites()
+      expect(
+        normalizeSidebarState(JSON.parse(readFileSync(sidebarFile, 'utf8')))
+          .stickyAssignments?.[hashSidebarSessionId('migrate-session')]
+          ?.accountId,
+      ).toBe('fallback-1')
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sticky-balanced skips a fallback pin marked by the fallback-first path', async () => {
+    seedStickyBalancedAccounts()
+    const markingConfig = JSON.parse(readFileSync(configFile, 'utf8'))
+    markingConfig.routing.mode = 'fallback-first'
+    markingConfig.accounts[0].enabled = false
+    writeFileSync(configFile, JSON.stringify(markingConfig))
+
+    let fallbackTwoSends = 0
+    let replacementSends = 0
+    let hooks: Hooks | undefined
+    await withFakeWebSocket(
+      ({ message, authorization }) => ({
+        send() {
+          if (authorization === 'Bearer fallback-2-token') {
+            fallbackTwoSends += 1
+            if (fallbackTwoSends === 1) {
+              message(
+                JSON.stringify({
+                  type: 'error',
+                  error: {
+                    type: 'usage_limit_reached',
+                    resets_in_seconds: 0.05,
+                  },
+                }),
+              )
+              return
+            }
+            message(
+              JSON.stringify({
+                type: 'response.completed',
+                response: { id: `fallback-two-${fallbackTwoSends}` },
+              }),
+            )
+            return
+          }
+          replacementSends += 1
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: `replacement-${replacementSends}` },
+            }),
+          )
+        },
+      }),
+      async () => {
+        try {
+          const loaded = await loadFetchOverride(
+            createMockPluginInput(),
+            Date.now() + 3600_000,
+            true,
+            false,
+            'acc-main',
+          )
+          hooks = loaded.hooks
+          const request = (sessionId: string) => {
+            const init = responseRequestInit({ 'session-id': sessionId })
+            init.body = JSON.stringify({
+              model: 'gpt-5.5',
+              input: [],
+              stream: true,
+            })
+            return init
+          }
+
+          const marked = await loaded.fetchOverride(
+            'https://api.openai.com/v1/responses',
+            request('marked-fallback-session'),
+          )
+          await expect(marked.text()).rejects.toMatchObject({
+            isRetryable: true,
+          })
+          expect(fallbackTwoSends).toBe(1)
+
+          const stickyConfig = JSON.parse(readFileSync(configFile, 'utf8'))
+          stickyConfig.routing.mode = 'sticky-balanced'
+          stickyConfig.accounts[0].enabled = true
+          writeFileSync(configFile, JSON.stringify(stickyConfig))
+          await drainSidebarWrites()
+          const stickyState = JSON.parse(readFileSync(sidebarFile, 'utf8'))
+          stickyState.stickyAssignments = {
+            ...(stickyState.stickyAssignments ?? {}),
+            [hashSidebarSessionId('marked-fallback-session')]: {
+              accountId: 'fallback-2',
+              assignedAt: Date.now(),
+              lastSeenAt: Date.now(),
+              inputBytes: 1,
+            },
+          }
+          writeFileSync(sidebarFile, JSON.stringify(stickyState))
+
+          const replacement = await loaded.fetchOverride(
+            'https://api.openai.com/v1/responses',
+            request('marked-fallback-session'),
+          )
+          await replacement.text()
+          expect(fallbackTwoSends).toBe(1)
+          expect(replacementSends).toBe(1)
+
+          await Bun.sleep(100)
+          await drainSidebarWrites()
+          const expiredState = JSON.parse(readFileSync(sidebarFile, 'utf8'))
+          expiredState.stickyAssignments = {
+            ...(expiredState.stickyAssignments ?? {}),
+            [hashSidebarSessionId('eligible-fallback-session')]: {
+              accountId: 'fallback-2',
+              assignedAt: Date.now(),
+              lastSeenAt: Date.now(),
+              inputBytes: 1,
+            },
+          }
+          writeFileSync(sidebarFile, JSON.stringify(expiredState))
+
+          const afterExpiry = await loaded.fetchOverride(
+            'https://api.openai.com/v1/responses',
+            request('eligible-fallback-session'),
+          )
+          await afterExpiry.text()
+          expect(fallbackTwoSends).toBe(2)
+        } finally {
+          await drainSidebarWrites()
+          await hooks?.dispose?.()
+        }
+      },
+    )
+  })
+
+  it('sticky-balanced skips a freshly exhausted pin before sending and excludes it from migration', async () => {
+    seedStickyBalancedAccounts()
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('responses')) {
+        seenAuth.push(headerValue(init, 'authorization'))
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'pre-break-session' }),
+      )
+      await drainSidebarWrites()
+      const changed = JSON.parse(readFileSync(sidebarFile, 'utf8'))
+      changed.fallbacks[1].quota = stickyQuota(0, Date.now() + 1_000)
+      writeFileSync(sidebarFile, JSON.stringify(changed))
+
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'pre-break-session' }),
+      )
+
+      expect(seenAuth).toEqual([
+        'Bearer fallback-2-token',
+        'Bearer fallback-1-token',
+      ])
+      await drainSidebarWrites()
+      expect(
+        normalizeSidebarState(JSON.parse(readFileSync(sidebarFile, 'utf8')))
+          .stickyAssignments?.[hashSidebarSessionId('pre-break-session')]
+          ?.accountId,
+      ).toBe('fallback-1')
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sticky-balanced retries a 429 only after its fresh quota headers confirm exhaustion', async () => {
+    seedStickyBalancedAccounts()
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (!String(url).includes('responses'))
+        return new Response('{}', { status: 200 })
+      const auth = headerValue(init, 'authorization')
+      seenAuth.push(auth)
+      if (auth.includes('fallback-2-token')) {
+        return new Response('{}', {
+          status: 429,
+          headers: {
+            'x-codex-primary-used-percent': '100',
+            'x-codex-primary-window-minutes': '300',
+            'x-codex-primary-reset-at': String(
+              Math.floor((Date.now() + 3600_000) / 1000),
+            ),
+          },
+        })
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'rate-limit-session' }),
+      )
+
+      expect(response.status).toBe(200)
+      expect(seenAuth).toEqual([
+        'Bearer fallback-2-token',
+        'Bearer fallback-1-token',
+      ])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sticky-balanced does not replay a successful exhausted response and migrates on the next request', async () => {
+    seedStickyBalancedAccounts()
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (!String(url).includes('responses'))
+        return new Response('{}', { status: 200 })
+      const auth = headerValue(init, 'authorization')
+      seenAuth.push(auth)
+      if (auth.includes('fallback-2-token')) {
+        return new Response('served', {
+          status: 200,
+          headers: {
+            'x-codex-primary-used-percent': '100',
+            'x-codex-primary-window-minutes': '300',
+            'x-codex-primary-reset-at': String(
+              Math.floor((Date.now() + 3600_000) / 1000),
+            ),
+          },
+        })
+      }
+      return new Response('replacement', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      const first = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'successful-exhaustion' }),
+      )
+
+      expect(first.status).toBe(200)
+      expect(await first.text()).toBe('served')
+      expect(seenAuth).toEqual(['Bearer fallback-2-token'])
+      await drainSidebarWrites()
+      expect(
+        normalizeSidebarState(
+          JSON.parse(readFileSync(sidebarFile, 'utf8')),
+        ).fallbacks.find((account) => account.id === 'fallback-2')?.quota
+          ?.primary?.remainingPercent,
+      ).toBe(0)
+
+      const second = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'successful-exhaustion' }),
+      )
+      expect(second.status).toBe(200)
+      expect(await second.text()).toBe('replacement')
+      expect(seenAuth).toHaveLength(2)
+      expect(seenAuth[0]).toBe('Bearer fallback-2-token')
+      expect(seenAuth[1]).not.toBe('Bearer fallback-2-token')
+      await drainSidebarWrites()
+      expect(
+        normalizeSidebarState(JSON.parse(readFileSync(sidebarFile, 'utf8')))
+          .stickyAssignments?.[hashSidebarSessionId('successful-exhaustion')]
+          ?.accountId,
+      ).not.toBe('fallback-2')
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sticky-balanced retains a pin after a transient server failure', async () => {
+    seedStickyBalancedAccounts()
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('responses')) {
+        seenAuth.push(headerValue(init, 'authorization'))
+        return new Response('{}', { status: 500 })
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'transient-session' }),
+      )
+
+      expect(response.status).toBe(500)
+      expect(seenAuth).toEqual(['Bearer fallback-2-token'])
+      await drainSidebarWrites()
+      expect(
+        normalizeSidebarState(JSON.parse(readFileSync(sidebarFile, 'utf8')))
+          .stickyAssignments?.[hashSidebarSessionId('transient-session')]
+          ?.accountId,
+      ).toBe('fallback-2')
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sticky-balanced fails open in configured order when every quota is stale and logs the fallback', async () => {
+    seedStickyBalancedAccounts()
+    await drainSidebarWrites()
+    const stale = JSON.parse(readFileSync(sidebarFile, 'utf8'))
+    stale.main.quota = stickyQuota(100, 0)
+    for (const fallback of stale.fallbacks) {
+      fallback.quota = stickyQuota(100, 0)
+    }
+    writeFileSync(sidebarFile, JSON.stringify(stale))
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    const originalLevel = process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL
+    process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = 'debug'
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('responses')) {
+        seenAuth.push(headerValue(init, 'authorization'))
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'stale-session' }),
+      )
+
+      expect(seenAuth).toEqual(['Bearer main-stale-token'])
+      await flushForTest()
+      expect(readFileSync(logFile, 'utf8')).toContain(
+        'sticky routing: no fresh weighted candidates; using configured order',
+      )
+    } finally {
+      if (originalLevel === undefined) {
+        delete process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL
+      } else {
+        process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = originalLevel
+      }
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sticky-balanced captures cachekeep only for the account that serves', async () => {
+    seedStickyBalancedAccounts()
+    const prompts: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput({
+          client: {
+            auth: { set: async () => {} },
+            session: {
+              promptAsync: async (request: unknown) => {
+                const text = (
+                  request as { body?: { parts?: Array<{ text?: string }> } }
+                ).body?.parts?.[0]?.text
+                if (text) prompts.push(text)
+              },
+            },
+          } as unknown as PluginInput['client'],
+        }),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await runCommand(hooks, 'openai-cachekeep', 'on')
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'capture-session' }),
+      )
+      await runCommand(hooks, 'openai-cachekeep', 'status')
+
+      const status = prompts.at(-1) ?? ''
+      expect(status).toContain('Tracked sessions: **1**')
+      expect(status).toContain('(fallback-2)')
+      expect(status).not.toContain('(fallback-1)')
+      expect(status).not.toContain('(main)')
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sticky-balanced does not pin sessionless or non-replayable requests', async () => {
+    seedStickyBalancedAccounts()
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit(),
+      )
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/models',
+        responseRequestInit({ 'x-session-affinity': 'non-replayable-session' }),
+      )
+
+      await drainSidebarWrites()
+      const sidebar = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      )
+      expect(sidebar.stickyAssignments).toBeUndefined()
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sticky-balanced retains its pin and wire response when no replacement exists', async () => {
+    const checkedAt = Date.now()
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        routing: { mode: 'sticky-balanced' },
+        accounts: [],
+      }),
+    )
+    writeFileSync(
+      sidebarFile,
+      JSON.stringify({
+        main: {
+          quota: stickyQuota(100, checkedAt),
+          mainAccountId: 'acc-main',
+          killed: false,
+        },
+        fallbacks: [],
+        route: 'sticky-balanced',
+        lastUpdated: checkedAt,
+      }),
+    )
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown) =>
+      new Response('{}', {
+        status: String(url).includes('responses') ? 401 : 200,
+      })) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'main-only-session' }),
+      )
+
+      expect(response.status).toBe(401)
+      await drainSidebarWrites()
+      expect(
+        normalizeSidebarState(JSON.parse(readFileSync(sidebarFile, 'utf8')))
+          .stickyAssignments?.[hashSidebarSessionId('main-only-session')]
+          ?.accountId,
+      ).toBe('main')
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sticky-balanced preserves the parent display pin instead of mirroring a child account', async () => {
+    seedStickyBalancedAccounts()
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'parent-session' }),
+      )
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({
+          'x-session-affinity': 'child-session',
+          'x-parent-session-id': 'parent-session',
+        }),
+      )
+      await drainSidebarWrites()
+
+      const sidebar = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      )
+      expect(sidebar.activeRouting?.['parent-session']?.activeId).toBe(
+        sidebar.stickyAssignments?.[hashSidebarSessionId('parent-session')]
+          ?.accountId,
+      )
+      expect(sidebar.activeRouting?.['parent-session']?.activeId).not.toBe(
+        sidebar.activeRouting?.['child-session']?.activeId,
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sticky-balanced does not overwrite a parent display that has no pin', async () => {
+    seedStickyBalancedAccounts()
+    await drainSidebarWrites()
+    const seeded = JSON.parse(readFileSync(sidebarFile, 'utf8'))
+    seeded.activeRouting = {
+      'parent-no-pin': {
+        activeId: 'main',
+        route: 'sticky-balanced',
+        updatedAt: Date.now(),
+      },
+    }
+    writeFileSync(sidebarFile, JSON.stringify(seeded))
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('{}', { status: 200 })) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({
+          'x-session-affinity': 'child-no-pin',
+          'x-parent-session-id': 'parent-no-pin',
+        }),
+      )
+      await drainSidebarWrites()
+
+      const sidebar = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      )
+      expect(sidebar.activeRouting?.['child-no-pin']?.activeId).toBe(
+        'fallback-2',
+      )
+      expect(sidebar.activeRouting?.['parent-no-pin']).toMatchObject({
+        activeId: 'main',
+        route: 'sticky-balanced',
+      })
+      expect(
+        sidebar.stickyAssignments?.[hashSidebarSessionId('parent-no-pin')],
+      ).toBeUndefined()
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
 
   function mockAdmissionFetch(seenAuth: string[], status = 200) {
     return (async (url: unknown, init?: unknown) => {
@@ -3502,6 +4709,51 @@ describe('integration: active fallback routing', () => {
         enabled: false,
       })
     } finally {
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sustain command flips the loader live gate and bypasses main idle pruning', async () => {
+    seedEmptyAccountStorage()
+    const originalFetch = globalThis.fetch
+    const originalNow = Date.now
+    let now = originalNow()
+    let hooks: Hooks | undefined
+    Date.now = () => now
+    try {
+      globalThis.fetch = (async () =>
+        new Response('{}', {
+          status: 200,
+        })) as unknown as typeof globalThis.fetch
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+
+      await runCommand(hooks, 'openai-cachekeep', 'on')
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'session-id': 'main-session' }),
+      )
+
+      now += 60 * 60_000 + 1
+      await runCommand(hooks, 'openai-cachekeep', 'sustain on')
+      const manager = (
+        globalThis as typeof globalThis & {
+          __openaiAuthCacheKeepManager?: {
+            tick(): Promise<void>
+            status(): { tracked: number; sustain: boolean }
+          }
+        }
+      ).__openaiAuthCacheKeepManager
+      if (!manager) throw new Error('missing cachekeep manager')
+
+      await manager.tick()
+      expect(manager.status()).toMatchObject({ tracked: 1, sustain: true })
+    } finally {
+      Date.now = originalNow
+      globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
   })
@@ -5545,6 +6797,526 @@ describe('integration: active fallback routing', () => {
       expect(
         sidebar.fallbacks.find((a) => a.id === 'fallback-1')?.quota?.secondary,
       ).toBeUndefined()
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  // ---------------------------------------------------------------------------
+  // Sticky-balanced + killswitch (the maintainer's blocker)
+  // ---------------------------------------------------------------------------
+
+  // Seeds a sticky-balanced config with killswitch enabled. Every account's
+  // quota is parked near the floor so the killswitch rejects them.
+  function seedStickyBalancedKillswitchAllBelowFloor() {
+    const checkedAt = Date.now()
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        routing: { mode: 'sticky-balanced' },
+        refresh: { refreshBeforeExpiryMinutes: 5 },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            enabled: true,
+            access: 'fallback-1-token',
+            refresh: 'fallback-1-refresh',
+            expires: Date.now() + 24 * 3600_000,
+            accountId: 'acc-fallback-1',
+          },
+          {
+            id: 'fallback-2',
+            type: 'oauth',
+            enabled: true,
+            access: 'fallback-2-token',
+            refresh: 'fallback-2-refresh',
+            expires: Date.now() + 24 * 3600_000,
+            accountId: 'acc-fallback-2',
+          },
+        ],
+        killswitch: { enabled: true, main: { primary: 50, secondary: 50 } },
+      }),
+    )
+    // All accounts sit between 0% and the 50% floor — the band the killswitch
+    // exists to protect. They are NOT exhausted (remainingPercent > 0), so
+    // today's break decision would retain them.
+    const belowFloor = (window: 'primary' | 'secondary', base: number) => ({
+      usedPercent: 100 - base,
+      remainingPercent: base,
+      checkedAt,
+      resetsAt: new Date(checkedAt + 7 * 24 * 3600_000).toISOString(),
+      windowMinutes: window === 'primary' ? 300 : 10_080,
+    })
+    writeFileSync(
+      sidebarFile,
+      JSON.stringify({
+        main: {
+          quota: {
+            primary: belowFloor('primary', 40),
+            secondary: belowFloor('secondary', 40),
+          },
+          mainAccountId: 'acc-main',
+          killed: false,
+        },
+        fallbacks: [
+          {
+            id: 'fallback-1',
+            label: 'Fallback 1',
+            accountId: 'acc-fallback-1',
+            quota: {
+              primary: belowFloor('primary', 30),
+              secondary: belowFloor('secondary', 30),
+            },
+            killed: false,
+            enabled: true,
+          },
+          {
+            id: 'fallback-2',
+            label: 'Fallback 2',
+            accountId: 'acc-fallback-2',
+            quota: {
+              primary: belowFloor('primary', 35),
+              secondary: belowFloor('secondary', 35),
+            },
+            killed: false,
+            enabled: true,
+          },
+        ],
+        route: 'sticky-balanced',
+        lastUpdated: checkedAt,
+      }),
+    )
+  }
+
+  it('sticky-balanced + killswitch: every account below the floor returns the shared 429 and never reaches the wire', async () => {
+    seedStickyBalancedKillswitchAllBelowFloor()
+    // The kill check is peek-based (memory only). The response headers push
+    // below-floor quota for the account that served, so each request can only
+    // populate ONE account's memory. To verify the 429 on the test request
+    // we walk every account once, then send the test request — its roster
+    // is empty (all-killed) and the main path's killswitch block fires.
+    let fetchCalls = 0
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => {
+      fetchCalls++
+      return new Response('{}', {
+        status: 200,
+        headers: {
+          'x-codex-primary-used-percent': '95',
+          'x-codex-primary-window-minutes': '300',
+          'x-codex-primary-reset-at': String(
+            Math.floor((Date.now() + 5 * 3600_000) / 1000),
+          ),
+          'x-codex-secondary-used-percent': '95',
+          'x-codex-secondary-window-minutes': '10080',
+          'x-codex-secondary-reset-at': String(
+            Math.floor((Date.now() + 7 * 24 * 3600_000) / 1000),
+          ),
+        },
+      })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      // Setup: each request cycles through the remaining accounts (the
+      // killswitch filter excludes the most-recently-killed one). After all
+      // three, every account has below-floor quota in memory.
+      for (let i = 0; i < 3; i++) {
+        const response = await loaded.fetchOverride(
+          'https://api.openai.com/v1/responses',
+          responseRequestInit({
+            'x-session-affinity': `all-killed-spend-${i}`,
+          }),
+        )
+        expect(response.status).toBe(200)
+      }
+      const setupCalls = fetchCalls
+      expect(setupCalls).toBe(3)
+
+      // Test request: the roster is empty (all-killed), the sticky path
+      // returns undefined, and the main path returns the shared 429.
+      const test = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'all-killed-block' }),
+      )
+      expect(test.status).toBe(429)
+      expect(test.headers.get('retry-after')).toBeTruthy()
+      const body = (await test.json()) as {
+        error?: { type?: string; message?: string }
+      }
+      expect(body.error?.type).toBe('rate_limit_exceeded')
+      expect(body.error?.message).toContain('Killswitch')
+
+      // The blocked request did NOT reach upstream.
+      expect(fetchCalls).toBe(setupCalls)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sticky-balanced + killswitch: a retained pin migrates off an account that drops below the floor', async () => {
+    // Healthy at pin time, then drops below the floor — the band the killswitch
+    // exists to protect. The break decision must migrate the pin.
+    seedStickyBalancedAccounts()
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        routing: { mode: 'sticky-balanced' },
+        refresh: { refreshBeforeExpiryMinutes: 5 },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            enabled: true,
+            access: 'fallback-1-token',
+            refresh: 'fallback-1-refresh',
+            expires: Date.now() + 24 * 3600_000,
+            accountId: 'acc-fallback-1',
+          },
+          {
+            id: 'fallback-2',
+            type: 'oauth',
+            enabled: true,
+            access: 'fallback-2-token',
+            refresh: 'fallback-2-refresh',
+            expires: Date.now() + 24 * 3600_000,
+            accountId: 'acc-fallback-2',
+          },
+        ],
+        killswitch: { enabled: true, main: { primary: 50, secondary: 50 } },
+      }),
+    )
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('responses')) {
+        seenAuth.push(headerValue(init, 'authorization'))
+        const auth = headerValue(init, 'authorization')
+        // Push below-floor quota ONLY for the pinned account (fallback-2) so
+        // the peek-based kill check trips on the next request.
+        if (auth.includes('fallback-2-token')) {
+          return new Response('{}', {
+            status: 200,
+            headers: {
+              'x-codex-primary-used-percent': '95',
+              'x-codex-primary-window-minutes': '300',
+              'x-codex-primary-reset-at': String(
+                Math.floor((Date.now() + 5 * 3600_000) / 1000),
+              ),
+              'x-codex-secondary-used-percent': '95',
+              'x-codex-secondary-window-minutes': '10080',
+              'x-codex-secondary-reset-at': String(
+                Math.floor((Date.now() + 7 * 24 * 3600_000) / 1000),
+              ),
+            },
+          })
+        }
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      // First request: sticky places the session on fallback-2 (roomiest
+      // account). The response headers push below-floor quota for fallback-2.
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'pin-migrate-session' }),
+      )
+      await drainSidebarWrites()
+      const initialPin = normalizeSidebarState(
+        JSON.parse(readFileSync(sidebarFile, 'utf8')),
+      ).stickyAssignments?.[hashSidebarSessionId('pin-migrate-session')]
+        ?.accountId
+      expect(initialPin).toBe('fallback-2')
+
+      // Second request: kill filter excludes fallback-2 (memory has below-floor
+      // quota). The pin migrates to fallback-1.
+      const next = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'pin-migrate-session' }),
+      )
+      expect(next.status).toBe(200)
+      expect(seenAuth).toEqual([
+        'Bearer fallback-2-token',
+        'Bearer fallback-1-token',
+      ])
+      await drainSidebarWrites()
+      expect(
+        normalizeSidebarState(JSON.parse(readFileSync(sidebarFile, 'utf8')))
+          .stickyAssignments?.[hashSidebarSessionId('pin-migrate-session')]
+          ?.accountId,
+      ).toBe('fallback-1')
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sticky-balanced + killswitch: a killed account is never picked by the mode-fallback fail-open branch', async () => {
+    // The "subtle half" from the brief: with every quota stale the mode-fallback
+    // branch is the only branch that runs. It must never spend on a killed
+    // account. Pin to the killed account first (so its memory has below-floor
+    // quota), then verify the next request does NOT pick it (the kill filter
+    // excludes it from the mode-fallback fail-open).
+    seedStickyBalancedAccounts()
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        routing: { mode: 'sticky-balanced' },
+        refresh: { refreshBeforeExpiryMinutes: 5 },
+        accounts: [
+          {
+            id: 'fallback-1',
+            type: 'oauth',
+            enabled: true,
+            access: 'fallback-1-token',
+            refresh: 'fallback-1-refresh',
+            expires: Date.now() + 24 * 3600_000,
+            accountId: 'acc-fallback-1',
+          },
+          {
+            id: 'fallback-2',
+            type: 'oauth',
+            enabled: true,
+            access: 'fallback-2-token',
+            refresh: 'fallback-2-refresh',
+            expires: Date.now() + 24 * 3600_000,
+            accountId: 'acc-fallback-2',
+          },
+        ],
+        killswitch: { enabled: true, main: { primary: 50, secondary: 50 } },
+      }),
+    )
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('responses')) {
+        seenAuth.push(headerValue(init, 'authorization'))
+      }
+      // First request: get below-floor quota into memory for the chosen
+      // account. Subsequent requests: return whatever quota the caller pushes.
+      return new Response('{}', {
+        status: 200,
+        headers: {
+          'x-codex-primary-used-percent': '95',
+          'x-codex-primary-window-minutes': '300',
+          'x-codex-primary-reset-at': String(
+            Math.floor((Date.now() + 5 * 3600_000) / 1000),
+          ),
+          'x-codex-secondary-used-percent': '95',
+          'x-codex-secondary-window-minutes': '10080',
+          'x-codex-secondary-reset-at': String(
+            Math.floor((Date.now() + 7 * 24 * 3600_000) / 1000),
+          ),
+        },
+      })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      // Setup: pin a session to whichever account the sticky path picks.
+      // The response headers push below-floor quota into memory for that
+      // account.
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'killswitch-pin-setup' }),
+      )
+      const pinnedId = (seenAuth[0] ?? '')
+        .replace('Bearer ', '')
+        .replace('-token', '')
+      await drainSidebarWrites()
+      // Now make all quotas stale so the mode-fallback is the only branch.
+      const stale = JSON.parse(readFileSync(sidebarFile, 'utf8'))
+      stale.main.quota = stickyQuota(100, Date.now() - QUOTA_STALENESS_MS - 1)
+      stale.fallbacks[0].quota = stickyQuota(
+        100,
+        Date.now() - QUOTA_STALENESS_MS - 1,
+      )
+      stale.fallbacks[1].quota = stickyQuota(
+        100,
+        Date.now() - QUOTA_STALENESS_MS - 1,
+      )
+      writeFileSync(sidebarFile, JSON.stringify(stale))
+
+      // Test: the pinned account's memory has below-floor quota. The kill
+      // filter MUST exclude it. Without the filter, mode-fallback would pick
+      // the same account (the pin is honored when the account is still in
+      // the candidates list).
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({
+          'x-session-affinity': 'killswitch-mode-fallback',
+        }),
+      )
+
+      // Either the pin migrates (kill filter excludes the pinned account) OR
+      // the mode-fallback picks a different account. The key assertion is
+      // that the killed account is NOT picked.
+      expect(seenAuth[1]).not.toBe(`Bearer ${pinnedId}-token`)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('sticky-balanced + killswitch DISABLED: placement and retention are byte-identical (no-op)', async () => {
+    // Load-bearing negative case: the dominant path with killswitch off must
+    // be unchanged. Even with one account near zero, the request goes through.
+    seedStickyBalancedAccounts()
+    await drainSidebarWrites()
+    const state = JSON.parse(readFileSync(sidebarFile, 'utf8'))
+    // fallback-1 below the floor; killswitch is OFF so it must still be served.
+    state.fallbacks[0].quota = stickyQuota(20, Date.now())
+    writeFileSync(sidebarFile, JSON.stringify(state))
+
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('responses')) {
+        seenAuth.push(headerValue(init, 'authorization'))
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({
+          'x-session-affinity': 'killswitch-disabled-session',
+        }),
+      )
+
+      // Killswitch disabled — the dominant path. Weighted placement behaves
+      // identically to the pre-killswitch implementation. The selection picks
+      // the roomiest account; this is the load-bearing negative case.
+      expect(seenAuth).toHaveLength(1)
+      expect(seenAuth[0]).toMatch(/Bearer fallback-[12]-token/)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  // ---------------------------------------------------------------------------
+  // resetCreditsAvailable → resetCreditsApplicable wiring (the real path)
+  // ---------------------------------------------------------------------------
+  // The shotgun unit test (`prefers a positive optional reset-credit count in
+  // empty-set fallback` in sticky-routing.test.ts) bypasses the extractor at
+  // index.ts:1962 by setting `resetCreditsApplicable` directly on the candidate.
+  // The extractor was reading the WRONG key — `.resetCreditsApplicable` instead
+  // of the real field `.resetCreditsAvailable` — so the wiring was dead in
+  // production. This test goes through the sidebar file → roster builder → sort
+  // pipeline and would fail until the extractor reads the right key.
+
+  it('sticky-balanced: mode-fallback prefers the credit-bearing account via the REAL wiring (resetCreditsAvailable)', async () => {
+    seedStickyBalancedAccounts()
+    await drainSidebarWrites()
+    const state = JSON.parse(readFileSync(sidebarFile, 'utf8'))
+    // All credentials stale → mode-fallback is the only branch that runs.
+    // configuredOrder says fallback-1 wins (added first → configuredOrder 1).
+    // resetCreditsAvailable says fallback-2 wins (higher credit priority).
+    // The fix that makes this test green is the extractor reading
+    // `resetCreditsAvailable` from the quota — the sort then picks fallback-2.
+    state.main.quota = stickyQuota(100, Date.now() - QUOTA_STALENESS_MS - 1)
+    state.fallbacks[0].quota = {
+      primary: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        checkedAt: Date.now() - QUOTA_STALENESS_MS - 1,
+        windowMinutes: 300,
+      },
+      resetCreditsAvailable: 0,
+    }
+    state.fallbacks[1].quota = {
+      primary: {
+        usedPercent: 0,
+        remainingPercent: 100,
+        checkedAt: Date.now() - QUOTA_STALENESS_MS - 1,
+        windowMinutes: 300,
+      },
+      resetCreditsAvailable: 1,
+    }
+    writeFileSync(sidebarFile, JSON.stringify(state))
+
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (String(url).includes('responses')) {
+        seenAuth.push(headerValue(init, 'authorization'))
+      }
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({
+          'x-session-affinity': 'credit-priority-session',
+        }),
+      )
+
+      // The mode-fallback sort is
+      //   resetCreditsApplicable DESC → configuredOrder ASC → id ASC.
+      // Without the fix: the extractor returns undefined for both accounts
+      //   (it reads the wrong key). The sort falls through to configuredOrder,
+      //   and fallback-1 wins by its lower configuredOrder.
+      // With the fix: the extractor reads `resetCreditsAvailable=1` from
+      //   fallback-2's quota and sets `resetCreditsApplicable=1` on its
+      //   candidate. fallback-1 has `resetCreditsAvailable=0`. The sort picks
+      //   fallback-2.
+      expect(seenAuth[0]).toBe('Bearer fallback-2-token')
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()

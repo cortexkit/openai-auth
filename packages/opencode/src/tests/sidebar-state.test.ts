@@ -1,12 +1,22 @@
 import { describe, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import { acquireRefreshFileLock } from '../core/refresh-file-lock'
+import { flushForTest, setLogLevel } from '../logger'
 import {
   ACTIVE_ROUTING_MAX_AGE_MS,
   type AccountQuota,
+  clearSidebarStickyAssignment,
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
   drainSidebarWrites,
@@ -16,14 +26,19 @@ import {
   getPresentQuotaWindows,
   getSidebarState,
   getSidebarStateFile,
+  hashSidebarSessionId,
   isQuotaExhausted,
   isUsableRoutingEntry,
   normalizeSidebarState,
   pruneActiveRouting,
+  pruneStickyAssignments,
   removeSidebarActiveRouting,
   resolveActiveAccount,
+  resolveSessionSidebarRouting,
+  resolveSidebarStickyAssignment,
   type SidebarAccountState,
   type SidebarState,
+  STICKY_ASSIGNMENT_MAX_ENTRIES,
   setSidebarLegacyRouting,
   setSidebarMachineState,
   setSidebarState,
@@ -351,6 +366,878 @@ describe('normalizeSidebarState', () => {
     expect(result.activeRouting).toBeUndefined()
     expect(result.activeId).toBe('fallback-1')
     expect(result.route).toBe('fallback-first')
+  })
+
+  test('normalizes sticky assignments without retaining malformed siblings', () => {
+    const result = normalizeSidebarState({
+      ...DEFAULT_SIDEBAR_STATE,
+      stickyAssignments: {
+        [hashSidebarSessionId('valid-session')]: {
+          accountId: 'fallback-1',
+          assignedAt: 100,
+          lastSeenAt: 200,
+          inputBytes: 300,
+          quotaCheckedAt: 400,
+        },
+        missingAccount: { assignedAt: 100, lastSeenAt: 200, inputBytes: 300 },
+        invalidTimestamp: {
+          accountId: 'fallback-1',
+          assignedAt: Number.NaN,
+          lastSeenAt: 200,
+          inputBytes: 300,
+        },
+        negativeBytes: {
+          accountId: 'fallback-1',
+          assignedAt: 100,
+          lastSeenAt: 200,
+          inputBytes: -1,
+        },
+      },
+    })
+
+    expect(result.stickyAssignments).toEqual({
+      [hashSidebarSessionId('valid-session')]: {
+        accountId: 'fallback-1',
+        assignedAt: 100,
+        lastSeenAt: 200,
+        inputBytes: 300,
+        quotaCheckedAt: 400,
+      },
+    })
+  })
+
+  test('old files without sticky assignments remain valid', () => {
+    expect(
+      normalizeSidebarState(DEFAULT_SIDEBAR_STATE).stickyAssignments,
+    ).toBeUndefined()
+  })
+})
+
+describe('sticky assignments', () => {
+  const now = 2 * 7 * 24 * 60 * 60 * 1000
+
+  test('hashes session ids without retaining the source identifier', () => {
+    expect(hashSidebarSessionId('session-a')).toMatch(/^[a-f0-9]{64}$/)
+    expect(hashSidebarSessionId('session-a')).not.toContain('session-a')
+    expect(hashSidebarSessionId('session-a')).toBe(
+      hashSidebarSessionId('session-a'),
+    )
+  })
+
+  test('unknown roster keeps fresh fallback pins while expiry and explicit removal still prune', () => {
+    const result = pruneStickyAssignments(
+      {
+        freshFallback: {
+          accountId: 'fallback-1',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 1,
+        },
+        expired: {
+          accountId: 'fallback-2',
+          assignedAt: 1,
+          lastSeenAt: now - 7 * 24 * 60 * 60 * 1000 - 1,
+          inputBytes: 2,
+        },
+        explicitlyRemoved: {
+          accountId: 'fallback-3',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 3,
+        },
+      },
+      undefined,
+      now,
+      'explicitlyRemoved',
+    )
+
+    expect(result).toEqual({
+      freshFallback: {
+        accountId: 'fallback-1',
+        assignedAt: now,
+        lastSeenAt: now,
+        inputBytes: 1,
+      },
+    })
+  })
+
+  test('prunes expired, disabled, and explicitly removed assignments', () => {
+    const result = pruneStickyAssignments(
+      {
+        stale: {
+          accountId: 'main',
+          assignedAt: 1,
+          lastSeenAt: now - 7 * 24 * 60 * 60 * 1000 - 1,
+          inputBytes: 1,
+        },
+        disabled: {
+          accountId: 'disabled-fallback',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 2,
+        },
+        removed: {
+          accountId: 'main',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 3,
+        },
+        keep: {
+          accountId: 'main',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 4,
+        },
+      },
+      new Set(['main']),
+      now,
+      'removed',
+    )
+
+    expect(result).toEqual({
+      keep: {
+        accountId: 'main',
+        assignedAt: now,
+        lastSeenAt: now,
+        inputBytes: 4,
+      },
+    })
+  })
+
+  test('logs pruned sticky assignments by reason without raw session ids', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-prune-log-'))
+    const logFile = join(tempDir, 'sidebar.log')
+    const originalLogFile = process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+    await flushForTest()
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
+    setLogLevel('debug')
+
+    try {
+      pruneStickyAssignments(
+        {
+          'raw-session-account': {
+            accountId: 'removed-fallback',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 1,
+          },
+          'raw-session-expired': {
+            accountId: 'main',
+            assignedAt: 1,
+            lastSeenAt: now - 7 * 24 * 60 * 60 * 1000 - 1,
+            inputBytes: 2,
+          },
+          'raw-session-explicit': {
+            accountId: 'main',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 3,
+          },
+        },
+        new Set(['main']),
+        now,
+        'raw-session-explicit',
+      )
+      await flushForTest()
+
+      const text = readFileSync(logFile, 'utf8')
+      expect(text).toContain('[sidebar] pruned sticky assignments')
+      expect(text).toContain('"removed":3')
+      expect(text).toContain('"account-not-in-roster":1')
+      expect(text).toContain('"expired":1')
+      expect(text).toContain('"explicit-removal":1')
+      expect(text).not.toContain('raw-session-')
+    } finally {
+      await flushForTest()
+      setLogLevel(undefined)
+      if (originalLogFile === undefined) {
+        delete process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+      } else {
+        process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = originalLogFile
+      }
+    }
+  })
+
+  test('returns a fresh valid sticky assignment without choosing', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-resolve-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'fresh-session'
+    const assignment = {
+      accountId: 'account-a',
+      assignedAt: now - 1,
+      lastSeenAt: now,
+      inputBytes: 128,
+      quotaCheckedAt: 10,
+    }
+    await setSidebarState(
+      make({
+        stickyAssignments: { [hashSidebarSessionId(sessionId)]: assignment },
+        lastUpdated: now,
+      }),
+      file,
+    )
+
+    const result = await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 128,
+        now,
+        validPinnedAccountIds: ['account-a'],
+        quotaCheckedAtByAccount: { 'account-a': 10 },
+        choose: () => {
+          throw new Error('choose must not run for a fresh valid assignment')
+        },
+      },
+      file,
+    )
+
+    expect(result).toEqual(assignment)
+  })
+
+  test('replaces excluded, expired, and disabled sticky assignments', async () => {
+    const cases = [
+      {
+        name: 'excluded',
+        lastSeenAt: now,
+        validPinnedAccountIds: ['account-a', 'account-b'],
+        excludeAccountIds: ['account-a'],
+      },
+      {
+        name: 'expired',
+        lastSeenAt: now - SEVEN_DAY_MS - 1,
+        validPinnedAccountIds: ['account-a', 'account-b'],
+      },
+      {
+        name: 'disabled',
+        lastSeenAt: now,
+        validPinnedAccountIds: ['account-b'],
+      },
+    ]
+
+    for (const scenario of cases) {
+      const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-replace-'))
+      const file = join(tempDir, 'sidebar-state.json')
+      const sessionId = `${scenario.name}-session`
+      await setSidebarState(
+        make({
+          stickyAssignments: {
+            [hashSidebarSessionId(sessionId)]: {
+              accountId: 'account-a',
+              assignedAt: now - 100,
+              lastSeenAt: scenario.lastSeenAt,
+              inputBytes: 100,
+              quotaCheckedAt: 10,
+            },
+          },
+          lastUpdated: now,
+        }),
+        file,
+      )
+      let chooseCalls = 0
+
+      const result = await resolveSidebarStickyAssignment(
+        {
+          sessionId,
+          requestBytes: 200,
+          now,
+          validPinnedAccountIds: scenario.validPinnedAccountIds,
+          ...(scenario.excludeAccountIds
+            ? { excludeAccountIds: scenario.excludeAccountIds }
+            : {}),
+          quotaCheckedAtByAccount: { 'account-a': 10, 'account-b': 20 },
+          choose: () => {
+            chooseCalls += 1
+            return { accountId: 'account-b', quotaCheckedAt: 20 }
+          },
+        },
+        file,
+      )
+
+      expect(chooseCalls).toBe(1)
+      expect(result).toEqual({
+        accountId: 'account-b',
+        assignedAt: now,
+        lastSeenAt: now,
+        inputBytes: 200,
+        quotaCheckedAt: 20,
+      })
+    }
+  })
+
+  test('evicts the least recently seen assignment when adding beyond the sticky cap', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-cap-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'current-session'
+    const entries = Object.fromEntries(
+      Array.from({ length: STICKY_ASSIGNMENT_MAX_ENTRIES }, (_, index) => {
+        const entrySessionId = `existing-${index}`
+        return [
+          hashSidebarSessionId(entrySessionId),
+          {
+            accountId: 'account-a',
+            assignedAt: now - index,
+            lastSeenAt: now - index,
+            inputBytes: 1,
+          },
+        ]
+      }),
+    )
+    await setSidebarState(make({ stickyAssignments: entries }), file)
+
+    await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 10,
+        now,
+        validPinnedAccountIds: ['account-a', 'account-b'],
+        quotaCheckedAtByAccount: { 'account-a': 10, 'account-b': 20 },
+        choose: () => ({ accountId: 'account-b', quotaCheckedAt: 20 }),
+      },
+      file,
+    )
+
+    const assignments = (await getSidebarState(file)).stickyAssignments
+    expect(Object.keys(assignments ?? {})).toHaveLength(
+      STICKY_ASSIGNMENT_MAX_ENTRIES,
+    )
+    expect(assignments?.[hashSidebarSessionId('existing-255')]).toBeUndefined()
+    expect(assignments?.[hashSidebarSessionId(sessionId)]).toMatchObject({
+      accountId: 'account-b',
+      lastSeenAt: now,
+    })
+  })
+
+  test('does not lower sticky assignment input-byte high water', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-high-water-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'high-water-session'
+    await setSidebarState(
+      make({
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'account-a',
+            assignedAt: now - 1,
+            lastSeenAt: now,
+            inputBytes: 200,
+            quotaCheckedAt: 10,
+          },
+        },
+      }),
+      file,
+    )
+
+    await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 100,
+        now,
+        validPinnedAccountIds: ['account-a'],
+        quotaCheckedAtByAccount: { 'account-a': 10 },
+        choose: () => {
+          throw new Error('choose must not run for a valid assignment')
+        },
+      },
+      file,
+    )
+
+    expect(
+      (await getSidebarState(file)).stickyAssignments?.[
+        hashSidebarSessionId(sessionId)
+      ]?.inputBytes,
+    ).toBe(200)
+  })
+
+  test('raises sticky assignment input-byte high water', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-high-water-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'raise-high-water-session'
+    await setSidebarState(
+      make({
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'account-a',
+            assignedAt: now - 1,
+            lastSeenAt: now,
+            inputBytes: 100,
+            quotaCheckedAt: 10,
+          },
+        },
+      }),
+      file,
+    )
+
+    const result = await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 200,
+        now,
+        validPinnedAccountIds: ['account-a'],
+        quotaCheckedAtByAccount: { 'account-a': 10 },
+        choose: () => {
+          throw new Error('choose must not run for a valid assignment')
+        },
+      },
+      file,
+    )
+
+    expect(result?.inputBytes).toBe(200)
+    expect(
+      (await getSidebarState(file)).stickyAssignments?.[
+        hashSidebarSessionId(sessionId)
+      ]?.inputBytes,
+    ).toBe(200)
+  })
+
+  test('touches sticky assignment last-seen time only after one hour', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-last-seen-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'last-seen-session'
+    const initialLastSeenAt = now - 30 * 60 * 1000
+    await setSidebarState(
+      make({
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'account-a',
+            assignedAt: now - 1,
+            lastSeenAt: initialLastSeenAt,
+            inputBytes: 100,
+            quotaCheckedAt: 10,
+          },
+        },
+      }),
+      file,
+    )
+
+    await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 100,
+        now,
+        validPinnedAccountIds: ['account-a'],
+        quotaCheckedAtByAccount: { 'account-a': 10 },
+        choose: () => {
+          throw new Error('choose must not run for a valid assignment')
+        },
+      },
+      file,
+    )
+    expect(
+      (await getSidebarState(file)).stickyAssignments?.[
+        hashSidebarSessionId(sessionId)
+      ]?.lastSeenAt,
+    ).toBe(initialLastSeenAt)
+
+    const afterOneHour = now + 31 * 60 * 1000
+    await resolveSidebarStickyAssignment(
+      {
+        sessionId,
+        requestBytes: 100,
+        now: afterOneHour,
+        validPinnedAccountIds: ['account-a'],
+        quotaCheckedAtByAccount: { 'account-a': 10 },
+        choose: () => {
+          throw new Error('choose must not run for a valid assignment')
+        },
+      },
+      file,
+    )
+    expect(
+      (await getSidebarState(file)).stickyAssignments?.[
+        hashSidebarSessionId(sessionId)
+      ]?.lastSeenAt,
+    ).toBe(afterOneHour)
+  })
+
+  test('clears only one hashed sticky assignment', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-clear-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'session-to-clear'
+    const otherSessionId = 'session-to-keep'
+    await setSidebarState(
+      make({
+        activeRouting: {
+          routing: { activeId: 'main', route: 'main-first', updatedAt: now },
+        },
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'account-a',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 100,
+          },
+          [hashSidebarSessionId(otherSessionId)]: {
+            accountId: 'account-b',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 200,
+          },
+        },
+        lastUpdated: now,
+      }),
+      file,
+    )
+    const before = await getSidebarState(file)
+
+    expect(await clearSidebarStickyAssignment(sessionId, file)).toBe(true)
+    const after = await getSidebarState(file)
+    const {
+      stickyAssignments: _beforeAssignments,
+      lastUpdated: _beforeUpdated,
+      ...beforeRest
+    } = before
+    const { stickyAssignments, lastUpdated, ...afterRest } = after
+    expect(afterRest).toEqual(beforeRest)
+    expect(lastUpdated).toBeGreaterThan(before.lastUpdated)
+    expect(stickyAssignments).toEqual({
+      [hashSidebarSessionId(otherSessionId)]: {
+        accountId: 'account-b',
+        assignedAt: now,
+        lastSeenAt: now,
+        inputBytes: 200,
+      },
+    })
+
+    const rawAfterFirstClear = readFileSync(file, 'utf8')
+    const serializedAssignments =
+      JSON.parse(rawAfterFirstClear).stickyAssignments
+    expect(Object.keys(serializedAssignments)).toEqual([
+      hashSidebarSessionId(otherSessionId),
+    ])
+    expect(Object.keys(serializedAssignments)[0]).toMatch(/^[a-f0-9]{64}$/)
+    expect(rawAfterFirstClear).not.toContain(sessionId)
+    expect(rawAfterFirstClear).not.toContain(otherSessionId)
+
+    expect(await clearSidebarStickyAssignment(sessionId, file)).toBe(false)
+    expect(readFileSync(file, 'utf8')).toBe(rawAfterFirstClear)
+  })
+
+  test('concurrent resolution for one new session returns one assignment', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-same-session-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    const sessionId = 'same-new-session'
+    let releaseFirstWrite: (() => void) | undefined
+    const firstWriteReleased = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve
+    })
+    let firstWriteEntered: (() => void) | undefined
+    const firstWriteReached = new Promise<void>((resolve) => {
+      firstWriteEntered = resolve
+    })
+    let chooseCalls = 0
+    const input = {
+      sessionId,
+      requestBytes: 100,
+      now,
+      validPinnedAccountIds: ['account-a'],
+      quotaCheckedAtByAccount: { 'account-a': 10 },
+      choose: () => {
+        chooseCalls += 1
+        return { accountId: 'account-a', quotaCheckedAt: 10 }
+      },
+    }
+
+    const first = resolveSidebarStickyAssignment(input, file, {
+      beforeRecheck: async () => {
+        firstWriteEntered?.()
+        await firstWriteReleased
+      },
+    })
+    await firstWriteReached
+    const second = resolveSidebarStickyAssignment(input, file)
+    releaseFirstWrite?.()
+
+    const [firstResult, secondResult] = await Promise.all([first, second])
+    expect(chooseCalls).toBe(1)
+    expect(secondResult).toEqual(firstResult)
+    expect(
+      Object.keys((await getSidebarState(file)).stickyAssignments ?? {}),
+    ).toEqual([hashSidebarSessionId(sessionId)])
+  })
+
+  test('disperses a thundering herd through shared pending bytes', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-herd-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    let releaseFirstWrite: (() => void) | undefined
+    const firstWriteReleased = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve
+    })
+    let firstWriteEntered: (() => void) | undefined
+    const firstWriteReached = new Promise<void>((resolve) => {
+      firstWriteEntered = resolve
+    })
+    let secondPendingBytes: ReadonlyMap<string, number> | undefined
+
+    const first = resolveSidebarStickyAssignment(
+      {
+        sessionId: 'herd-first',
+        requestBytes: 400,
+        now,
+        validPinnedAccountIds: ['account-a', 'account-b'],
+        quotaCheckedAtByAccount: { 'account-a': 10, 'account-b': 10 },
+        choose: () => ({ accountId: 'account-a', quotaCheckedAt: 10 }),
+      },
+      file,
+      {
+        beforeRecheck: async () => {
+          firstWriteEntered?.()
+          await firstWriteReleased
+        },
+      },
+    )
+    await firstWriteReached
+    const second = resolveSidebarStickyAssignment(
+      {
+        sessionId: 'herd-second',
+        requestBytes: 250,
+        now,
+        validPinnedAccountIds: ['account-a', 'account-b'],
+        quotaCheckedAtByAccount: { 'account-a': 10, 'account-b': 10 },
+        choose: (pendingBytes) => {
+          secondPendingBytes = pendingBytes
+          return pendingBytes.get('account-a') === 400
+            ? { accountId: 'account-b', quotaCheckedAt: 10 }
+            : { accountId: 'account-a', quotaCheckedAt: 10 }
+        },
+      },
+      file,
+    )
+    releaseFirstWrite?.()
+
+    const [firstResult, secondResult] = await Promise.all([first, second])
+    expect(firstResult?.accountId).toBe('account-a')
+    expect(secondPendingBytes?.get('account-a')).toBe(400)
+    expect(secondResult?.accountId).toBe('account-b')
+  })
+
+  test('drops pending bytes when an account has a fresh quota snapshot', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-pending-'))
+    const file = join(tempDir, 'sidebar-state.json')
+    await setSidebarState(
+      make({
+        stickyAssignments: {
+          [hashSidebarSessionId('prior-session')]: {
+            accountId: 'account-a',
+            assignedAt: now - 1,
+            lastSeenAt: now,
+            inputBytes: 400,
+            quotaCheckedAt: 10,
+          },
+        },
+      }),
+      file,
+    )
+    let pendingBytes: ReadonlyMap<string, number> | undefined
+
+    const result = await resolveSidebarStickyAssignment(
+      {
+        sessionId: 'fresh-snapshot-session',
+        requestBytes: 100,
+        now,
+        validPinnedAccountIds: ['account-a', 'account-b'],
+        quotaCheckedAtByAccount: { 'account-a': 11, 'account-b': 10 },
+        choose: (pending) => {
+          pendingBytes = pending
+          return pending.get('account-a') === undefined
+            ? { accountId: 'account-a', quotaCheckedAt: 11 }
+            : { accountId: 'account-b', quotaCheckedAt: 10 }
+        },
+      },
+      file,
+    )
+
+    expect(pendingBytes?.get('account-a')).toBeUndefined()
+    expect(result?.accountId).toBe('account-a')
+  })
+})
+
+describe('session sidebar routing with sticky assignments', () => {
+  const now = 2 * 7 * 24 * 60 * 60 * 1000
+
+  function stickyState(overrides: Partial<SidebarState> = {}): SidebarState {
+    return make({
+      route: 'sticky-balanced',
+      fallbacks: [
+        fb({
+          id: 'fallback-1',
+          enabled: true,
+          killed: false,
+          quota: quota(20),
+        }),
+        fb({
+          id: 'fallback-2',
+          enabled: true,
+          killed: false,
+          quota: quota(30),
+        }),
+      ],
+      ...overrides,
+    })
+  }
+
+  test('uses a usable active routing entry before a sticky pin', () => {
+    const sessionId = 'active-routing-wins'
+    const result = resolveSessionSidebarRouting(
+      stickyState({
+        activeRouting: {
+          [sessionId]: {
+            activeId: 'fallback-1',
+            route: 'sticky-balanced',
+            updatedAt: now,
+          },
+        },
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'fallback-2',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 1,
+          },
+        },
+      }),
+      sessionId,
+      now,
+    )
+
+    expect(result).toEqual({ activeId: 'fallback-1', route: 'sticky-balanced' })
+  })
+
+  test('uses a hashed usable sticky pin when no active routing entry survives', () => {
+    const sessionId = 'hashed-sticky-session'
+    const result = resolveSessionSidebarRouting(
+      stickyState({
+        stickyAssignments: {
+          [sessionId]: {
+            accountId: 'fallback-1',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 1,
+          },
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'fallback-2',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 2,
+          },
+        },
+      }),
+      sessionId,
+      now,
+    )
+
+    expect(result).toEqual({ activeId: 'fallback-2', route: 'sticky-balanced' })
+  })
+
+  test('falls back to the existing mode routing when no usable sticky pin exists', () => {
+    const sessionId = 'stale-sticky-session'
+    const result = resolveSessionSidebarRouting(
+      stickyState({
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: 'fallback-2',
+            assignedAt: 1,
+            lastSeenAt: now - 7 * 24 * 60 * 60 * 1000 - 1,
+            inputBytes: 1,
+          },
+        },
+      }),
+      sessionId,
+      now,
+    )
+
+    expect(result).toEqual({ activeId: 'main', route: 'sticky-balanced' })
+  })
+
+  test('leaves non-sticky routing modes unchanged even when a sticky pin exists', () => {
+    const sessionId = 'non-sticky-session'
+    const assignment = {
+      [hashSidebarSessionId(sessionId)]: {
+        accountId: 'fallback-2',
+        assignedAt: now,
+        lastSeenAt: now,
+        inputBytes: 1,
+      },
+    }
+
+    expect(
+      resolveSessionSidebarRouting(
+        stickyState({ route: 'main-first', stickyAssignments: assignment }),
+        sessionId,
+        now,
+      ),
+    ).toEqual({ activeId: 'main', route: 'main-first' })
+    expect(
+      resolveSessionSidebarRouting(
+        stickyState({ route: 'fallback-first', stickyAssignments: assignment }),
+        sessionId,
+        now,
+      ),
+    ).toEqual({ activeId: 'fallback-1', route: 'fallback-first' })
+  })
+
+  test('does not display a sticky pin whose account is exhausted, disabled, or killed', () => {
+    const cases = [
+      {
+        name: 'exhausted',
+        fallback: fb({
+          id: 'fallback-2',
+          enabled: true,
+          killed: false,
+          quota: {
+            primary: {
+              usedPercent: 100,
+              remainingPercent: 0,
+              resetsAt: new Date(now + 60_000).toISOString(),
+            },
+          },
+        }),
+      },
+      {
+        name: 'disabled',
+        fallback: fb({
+          id: 'fallback-2',
+          enabled: false,
+          killed: false,
+          quota: quota(20),
+        }),
+      },
+      {
+        name: 'killed',
+        fallback: fb({
+          id: 'fallback-2',
+          enabled: true,
+          killed: true,
+          quota: quota(20),
+        }),
+      },
+    ]
+    for (const scenario of cases) {
+      const sessionId = `${scenario.name}-sticky-session`
+      const result = resolveSessionSidebarRouting(
+        stickyState({
+          fallbacks: [
+            fb({
+              id: 'fallback-1',
+              enabled: true,
+              killed: false,
+              quota: quota(20),
+            }),
+            scenario.fallback,
+          ],
+          stickyAssignments: {
+            [hashSidebarSessionId(sessionId)]: {
+              accountId: 'fallback-2',
+              assignedAt: now,
+              lastSeenAt: now,
+              inputBytes: 1,
+            },
+          },
+        }),
+        sessionId,
+        now,
+      )
+
+      expect(result).toEqual({ activeId: 'main', route: 'sticky-balanced' })
+    }
   })
 })
 
@@ -935,6 +1822,194 @@ test('upsert creates a missing sidebar state directory before locking', async ()
   })
 })
 
+test('upsert preserves fresh fallback pins when the roster is unknown', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-unknown-roster-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const fallbackPinHash = hashSidebarSessionId('fresh-fallback-pin')
+  await setSidebarState(
+    make({
+      stickyAssignments: {
+        [fallbackPinHash]: {
+          accountId: 'fallback-1',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 1,
+        },
+      },
+    }),
+    file,
+  )
+
+  await upsertSidebarActiveRouting(
+    {
+      sessionId: 'request-session',
+      activeId: 'main',
+      route: 'main-first',
+      updatedAt: now,
+    },
+    undefined,
+    file,
+  )
+  await drainSidebarWrites()
+
+  expect(
+    normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+      .stickyAssignments,
+  ).toEqual({
+    [fallbackPinHash]: {
+      accountId: 'fallback-1',
+      assignedAt: now,
+      lastSeenAt: now,
+      inputBytes: 1,
+    },
+  })
+})
+
+test('upsert treats an empty roster as authoritative and prunes fallback pins', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-empty-roster-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const fallbackPinHash = hashSidebarSessionId('empty-roster-fallback-pin')
+  await setSidebarState(
+    make({
+      stickyAssignments: {
+        [fallbackPinHash]: {
+          accountId: 'fallback-1',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 1,
+        },
+      },
+    }),
+    file,
+  )
+
+  await upsertSidebarActiveRouting(
+    {
+      sessionId: 'request-session',
+      activeId: 'main',
+      route: 'main-first',
+      updatedAt: now,
+    },
+    [],
+    file,
+  )
+  await drainSidebarWrites()
+
+  expect(
+    normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+      .stickyAssignments,
+  ).toBeUndefined()
+})
+
+test('upsert prunes only fallback pins absent from an authoritative roster', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-populated-roster-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const retainedHash = hashSidebarSessionId('retained-fallback-pin')
+  const prunedHash = hashSidebarSessionId('pruned-fallback-pin')
+  await setSidebarState(
+    make({
+      stickyAssignments: {
+        [retainedHash]: {
+          accountId: 'fallback-present',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 1,
+        },
+        [prunedHash]: {
+          accountId: 'fallback-removed',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 2,
+        },
+      },
+    }),
+    file,
+  )
+
+  await upsertSidebarActiveRouting(
+    {
+      sessionId: 'request-session',
+      activeId: 'main',
+      route: 'main-first',
+      updatedAt: now,
+    },
+    [{ id: 'fallback-present', enabled: true }],
+    file,
+  )
+  await drainSidebarWrites()
+
+  expect(
+    normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+      .stickyAssignments,
+  ).toEqual({
+    [retainedHash]: {
+      accountId: 'fallback-present',
+      assignedAt: now,
+      lastSeenAt: now,
+      inputBytes: 1,
+    },
+  })
+})
+
+test('removal with an unknown roster preserves other pins and removes its explicit hash', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-unknown-removal-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  await setSidebarState(
+    make({
+      stickyAssignments: {
+        [hashSidebarSessionId('removed-session')]: {
+          accountId: 'fallback-1',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 1,
+        },
+        [hashSidebarSessionId('other-session')]: {
+          accountId: 'fallback-2',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 2,
+        },
+      },
+    }),
+    file,
+  )
+
+  await removeSidebarActiveRouting('removed-session', undefined, file)
+  await drainSidebarWrites()
+
+  expect(
+    normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+      .stickyAssignments,
+  ).toEqual({
+    [hashSidebarSessionId('other-session')]: {
+      accountId: 'fallback-2',
+      assignedAt: now,
+      lastSeenAt: now,
+      inputBytes: 2,
+    },
+  })
+})
+
+test('setSidebarState leaves an existing foreign directory permission unchanged', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-private-'))
+  const dir = join(tempDir, 'existing')
+  const file = join(dir, 'sidebar-state.json')
+  mkdirSync(dir, { mode: 0o755 })
+  chmodSync(dir, 0o755)
+  writeFileSync(file, JSON.stringify(DEFAULT_SIDEBAR_STATE), { mode: 0o644 })
+  chmodSync(file, 0o644)
+
+  await setSidebarState(make({ lastUpdated: 1 }), file)
+  await drainSidebarWrites()
+
+  expect(statSync(dirname(file)).mode & 0o777).toBe(0o755)
+  expect(statSync(file).mode & 0o777).toBe(0o600)
+})
+
 test('upserting session B preserves session A and refreshes legacy fields', async () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-routing-'))
   const file = join(tempDir, 'sidebar-state.json')
@@ -1356,6 +2431,154 @@ test('machine writes preserve routing while retaining reset-credit fields', asyn
   expect(written.fallbacks[0]?.resetCredits).toBe(2)
   expect(written.activeId).toBe('fallback-1')
   expect(written.activeRouting?.['sess-a']?.activeId).toBe('fallback-1')
+})
+
+test('every routing writer preserves sticky assignments', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-rmw-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const stickyAssignments = {
+    [hashSidebarSessionId('session-a')]: {
+      accountId: 'fallback-1',
+      assignedAt: now,
+      lastSeenAt: now,
+      inputBytes: 128,
+    },
+  }
+
+  await setSidebarState(
+    make({
+      fallbacks: [fb({ id: 'fallback-1', enabled: true })],
+      stickyAssignments,
+    }),
+    file,
+  )
+  await setSidebarMachineState(
+    {
+      main: main(null),
+      fallbacks: [fb({ id: 'fallback-1', enabled: true })],
+      route: 'main-first',
+      lastUpdated: now,
+    },
+    file,
+  )
+  expect((await getSidebarState(file)).stickyAssignments).toEqual(
+    stickyAssignments,
+  )
+
+  await upsertSidebarActiveRouting(
+    {
+      sessionId: 'routing-session',
+      activeId: 'fallback-1',
+      route: 'fallback-first',
+      updatedAt: now,
+    },
+    [{ id: 'fallback-1', enabled: true }],
+    file,
+  )
+  expect((await getSidebarState(file)).stickyAssignments).toEqual(
+    stickyAssignments,
+  )
+
+  await setSidebarLegacyRouting(
+    { activeId: 'main', route: 'main-first', updatedAt: now },
+    file,
+  )
+  expect((await getSidebarState(file)).stickyAssignments).toEqual(
+    stickyAssignments,
+  )
+
+  await removeSidebarActiveRouting(
+    'routing-session',
+    [{ id: 'fallback-1', enabled: true }],
+    file,
+  )
+  await drainSidebarWrites()
+  expect((await getSidebarState(file)).stickyAssignments).toEqual(
+    stickyAssignments,
+  )
+})
+
+test('routing writers prune disabled and killed sticky assignments', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-sticky-prune-rmw-'))
+  const now = Date.now()
+  const accounts = [
+    { id: 'disabled', enabled: false },
+    { id: 'killed', enabled: true, killed: true },
+    { id: 'healthy', enabled: true },
+  ]
+  const fallbacks = accounts.map((account) => fb(account))
+  const expectedStickyAssignments = {
+    [hashSidebarSessionId('healthy-session')]: {
+      accountId: 'healthy',
+      assignedAt: now,
+      lastSeenAt: now,
+      inputBytes: 128,
+    },
+  }
+
+  async function seed(file: string) {
+    await setSidebarState(
+      make({
+        fallbacks,
+        stickyAssignments: {
+          [hashSidebarSessionId('disabled-session')]: {
+            accountId: 'disabled',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 128,
+          },
+          [hashSidebarSessionId('killed-session')]: {
+            accountId: 'killed',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 128,
+          },
+          ...expectedStickyAssignments,
+        },
+      }),
+      file,
+    )
+  }
+
+  const machineFile = join(tempDir, 'machine.json')
+  await seed(machineFile)
+  await setSidebarMachineState(
+    {
+      main: main(null),
+      fallbacks,
+      route: 'main-first',
+      lastUpdated: now,
+    },
+    machineFile,
+  )
+  expect((await getSidebarState(machineFile)).stickyAssignments).toEqual(
+    expectedStickyAssignments,
+  )
+
+  const upsertFile = join(tempDir, 'upsert.json')
+  await seed(upsertFile)
+  await upsertSidebarActiveRouting(
+    {
+      sessionId: 'routing-session',
+      activeId: 'healthy',
+      route: 'fallback-first',
+      updatedAt: now,
+    },
+    accounts,
+    upsertFile,
+  )
+  expect((await getSidebarState(upsertFile)).stickyAssignments).toEqual(
+    expectedStickyAssignments,
+  )
+
+  const removeFile = join(tempDir, 'remove.json')
+  await seed(removeFile)
+  await removeSidebarActiveRouting('routing-session', accounts, removeFile)
+  await drainSidebarWrites()
+  expect((await getSidebarState(removeFile)).stickyAssignments).toEqual(
+    expectedStickyAssignments,
+  )
 })
 
 test('machine writes cannot clobber fresher main and fallback quota from disk', async () => {

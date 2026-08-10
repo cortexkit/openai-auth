@@ -61,7 +61,7 @@ The plugin supports more than one ChatGPT account: a single **main** account (th
 - **Remove** a fallback with `/openai-account remove <id>`.
 - Each account is identified by its stable ChatGPT account id, so the same account is never added twice.
 
-Which account serves is decided by [routing](#routing) mode — there is no manual "active account" to pin. A request that a fallback can serve is buffered so the retry is safe, and selection skips accounts the [killswitch](#killswitch) has gated out.
+Which account serves is decided by [routing](#routing) mode. There is no manual active-account selector: `sticky-balanced` creates a session pin automatically, while the other modes follow their configured order. A request that a fallback can serve is buffered so the retry is safe, and selection skips accounts the [killswitch](#killswitch) has gated out.
 
 ### Routing
 
@@ -71,6 +71,11 @@ Which account serves is decided by [routing](#routing) mode — there is no manu
 | --- | --- |
 | `main-first` (default) | Send on the main account; on a `401`/`403`/`429`, transparently retry on the next usable fallback. |
 | `fallback-first` | Try usable fallback accounts first (preserving the main account's quota), and fall through to the main account only if no fallback can serve. |
+| `sticky-balanced` | For a cold session, choose the account with the lowest projected pressure against its usable quota. Keep that account pinned for the session. |
+
+`sticky-balanced` does not rebalance mid-session. A pin stays in place until fresh quota confirms exhaustion or the account has a permanent authentication failure (`401`/`403`). A transient failure, stale or unknown quota, and `429` without confirmed exhaustion retain the pin; there is no Retry-After hold. This avoids changing an account while a session's continuation and cache context still belong to the first account.
+
+Pins use a SHA-256 hash of the session id as their key in the machine-global sidebar state and expire after seven days. Cold placement excludes accounts with stale or unknown quota from weighted selection. If every account is excluded, it fails open to the configured mode order. Equal projected-pressure scores break deterministically by configured order, then account id; a shared pending-byte bridge makes simultaneous cold placements account for each other. Subagents receive independent pins, and a resumed subagent reuses its own pin. `/openai-routing reset` clears only the current session's pin, so the next placement may legitimately choose the same account again.
 
 ### Killswitch
 
@@ -94,9 +99,29 @@ Codex reports usage on **two rolling windows** — a 5-hour primary window and a
 
 - `/openai-cachekeep on` / `off` — enable or disable. The setting is **persisted**, so it stays on across restarts and applies to every session until you turn it off.
 - `/openai-cachekeep subagents on` / `off` — also keep subagent sessions warm (off by default). Useful when the same subagent is reused repeatedly. Subagent sessions warm only while recently active (a 30-minute idle cap, versus one hour for the main session).
+- `/openai-cachekeep sustain on` / `off` — bypass main-session idle pruning. It defaults to off, is main-agent-only, and does not change subagent limits.
 - `/openai-cachekeep` — show status: enabled state, subagent mode, tracked sessions, and last-warm cost.
 
-Keep-warm only ever runs for **main-agent** sessions unless subagent mode is on, and an idle session stops warming once it passes its idle cap (then resumes if it becomes active again). Each warm reuses the session's own cached prefix, so its marginal cost is small (typically a near-100% cache hit plus a few dozen output tokens).
+Keep-warm only ever runs for **main-agent** sessions unless subagent mode is on, and it never warms an account that is not serving that session. `sustain` is orthogonal to the clock window: the configured window still controls capture and warming. `sustain` bypasses only the main idle-pruning bound; the target-count, memory-byte, and LRU caps still apply. Subagent idle and warm-count limits remain unchanged.
+
+Cost matters. A GPT-5.6 session needs about two warms per hour, roughly 1K output tokens per hour at about a 99.4% cache hit rate. Non-5.6 sessions need about twelve warms per hour, which is the higher-cost case.
+
+`sustain` deliberately does not use the sibling `anthropic-auth` plugin's `always` term. In that plugin, `always` means ignore the clock schedule; here, `sustain` means bypass main idle pruning. They control different axes.
+
+### Sustain prerequisite: Magic Context
+
+Before enabling sustain for a main-session model, update `~/.config/cortexkit/magic-context.jsonc` with Magic Context's supported schema. Preserve existing per-model entries and set only models used by sustained **main** sessions to `"never"`:
+
+```jsonc
+{
+  "cache_ttl": {
+    "default": "5m",
+    "openai/gpt-5.6-sol": "never"
+  }
+}
+```
+
+Magic Context does not run in subagent sessions, so no subagent exception is needed. This setting is required because keeping a cache alive indefinitely falsifies an elapsed-time heuristic that assumes a cache is cold and therefore safe to mutate for free.
 
 ## Logging
 
@@ -117,9 +142,9 @@ All commands open an interactive control surface in the TUI (a selectable dialog
 | --- | --- | --- |
 | `/openai-quota` | — | Show 5h + weekly quota for all accounts (polls the usage endpoint). |
 | `/openai-account` | `add [label]` · `remove <id>` · `order <a> <b>` | List and manage accounts; add runs OAuth, order swaps fallback positions. |
-| `/openai-routing` | `main-first` · `fallback-first` | Set account preference order. |
+| `/openai-routing` | `main-first` · `fallback-first` · `sticky-balanced` · `reset` | Set account preference order, enable sticky balanced routing, or clear the current session pin. |
 | `/openai-killswitch` | `on` · `off` · `set <acct>:<5h>,<1w> ...` | Hard-block accounts below per-window quota thresholds. |
-| `/openai-cachekeep` | `on` · `off` · `subagents on` · `subagents off` | Idle prompt-cache keep-warm; optional subagent mode. |
+| `/openai-cachekeep` | `on` · `off` · `subagents on` · `subagents off` · `sustain on` · `sustain off` | Idle prompt-cache keep-warm; optional subagent mode and main-only idle-pruning bypass. |
 | `/openai-logging` | `<level>` | Set log level (`error`/`warn`/`info`/`debug`/`trace`) live. |
 | `/openai-dump` | `on` · `off` | Toggle transport request dumps for cache debugging. |
 

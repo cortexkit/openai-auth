@@ -7,10 +7,10 @@
 **Key Characteristics:**
 - Registers as the built-in `openai` provider; OpenCode loads external server plugins after its internal ones, so this package transparently supersedes OpenCode's internal OpenAI auth hook.
 - Rewrites OpenAI Responses requests into Codex's wire shape (headers, body, tools, turn metadata) so the Codex backend treats traffic as if it came from the official Codex CLI.
-- Reactive (not preemptive) account fallback: a `401`/`403`/`429` triggers a retry on the next usable account, respecting routing mode. Enforce the killswitch as a hard circuit-breaker directly on the request path to block requests or filter candidates before spending when cached quota falls below configured thresholds.
+- Reactive account fallback for ordered modes, plus sticky-balanced cold-session placement. Sticky pins migrate only on confirmed quota exhaustion or permanent auth failure; there is no mid-session rebalance or Retry-After hold. Enforce the killswitch as a hard circuit-breaker directly on the request path to block requests or filter candidates before spending when cached quota falls below configured thresholds.
 - Push-only quota tracking: quota comes from `x-codex-*` HTTP response headers or `codex.rate_limits` WS frames — no extra polling during normal traffic.
 - Three transport modes share the cache-stabilizer behavior: HTTP/SSE, native WebSocket, and a hand-rolled RFC 6455 WebSocket (Bun.connect or node:net/node:tls).
-- TUI sidebar reads a serialized `sidebar-state.json` snapshot pushed by the auth loader; the loader and TUI exchange dialogs/notifications over a loopback HTTP RPC bound to a per-process token.
+- TUI sidebar reads a serialized, machine-global `sidebar-state.json` snapshot pushed by the auth loader; it owns SHA-256-keyed sticky assignments with a seven-day TTL. The loader and TUI exchange dialogs/notifications over a loopback HTTP RPC bound to a per-process token.
 - Plugin is split into a generic, provider-agnostic core (`core/`) and Codex-specific seams (`provider.ts`, `oauth.ts`) so the same shape could host another OAuth provider.
 
 ## Layers
@@ -51,7 +51,7 @@
 - Used by: Plugin loader (`/login openai` `methods`), CLI (`login`), `/openai-account add`.
 
 **Cache keep-warm:**
-- Purpose: Track idle main-agent (and optionally subagent) sessions and replay the last real request as a `store:false` shadow request just before Codex evicts the prompt cache. Employs model-aware TTL (raising GPT-5.6 TTL to 30 min from the 5-min default), gpt-5.6 subagent 2-warm caps, a process clock-bound window (outside of which warming and capture are skipped), and extended subagent idle bounds (75 min for GPT-5.6 subagents).
+- Purpose: Track idle main-agent (and optionally subagent) sessions and replay the last real request as a `store:false` shadow request just before Codex evicts the prompt cache. Employs model-aware TTL (raising GPT-5.6 TTL to 30 min from the 5-min default), gpt-5.6 subagent 2-warm caps, a process clock-bound window (outside of which warming and capture are skipped), and extended subagent idle bounds (75 min for GPT-5.6 subagents). `sustain` defaults off and bypasses only main idle pruning; it leaves the clock window, subagent limits, target-count, byte, and LRU caps intact.
 - Location: `packages/opencode/src/core/cachekeep.ts`
 - Contains: `CacheKeepManager` class (target map, timer, idle caps, backoff), `buildKeepwarmCapture`, `buildKeepwarmBody`, model-aware TTL matcher (`isGpt56Model`, `ttlForModel`), clock window checker (`isWithinCacheKeepWindow`), SSE/JSON usage extraction.
 - Depends on: `core/accounts.ts` (`findCachekeepFallbackAccount` exported from `index.ts`), `quota-normalize.ts`.
@@ -140,14 +140,13 @@
 5. `auth.loader` constructs `QuotaManager`, `FallbackAccountManager`, and (if any fallback accounts) starts `fallbackManager.startBackgroundRefresh()`.
 6. Each refresh runs through `codexRefreshFn` with file-lock + lease concurrency — `core/refresh-file-lock.ts`, `index.ts` `refreshMainWithLease`. Refreshed token persistence retries up to 3 times to prevent transient file locks or API write errors from invalidating sessions.
 
-**Reactive fallback (per request):**
+**Routing and request flow (per request):**
 
-1. Plugin loader `auth.fetch` resolves the session affinity ID from the request's headers (`x-session-affinity`, `x-opencode-session`, `x-session-id`, `session-id`) and determines the routing mode (purely mode-driven: `main-first` or `fallback-first`). If `fallback-first` mode is active and the request is replayable, it proactively tries usable fallback accounts before the main account.
-2. Strips any existing `authorization` header, refreshes an expired main token via `refreshMainWithLease`, or refreshes a fallback via `fallbackManager.refreshAccount`. Derives the main ChatGPT identity from the access token JWT to ensure correct quota/killswitch tracking after a main-account switch.
-3. If a proactive fallback serves, its response is used. If a proactive fallback request throws a transport error (both caller-aborts and indeterminate transport failures), routing halts immediately and the error propagates to prevent request duplication and double-billing. Otherwise (or under `main-first` mode), checks if the primary account is blocked by the killswitch (verifying cached quota against configured thresholds) or by a mid-stream rate-limit mark. If blocked, it synthesizes a 429 response carrying a `Retry-After` header derived from the earliest known reset time across all accounts (or the mid-stream mark's own reset time, whichever is tighter).
-4. If the request is not blocked by the killswitch, calls `sendWithAccessToken` which rewrites headers/body via `prepareCodexRequest`, picks HTTP or WS transport, and optionally tracks the body for cachekeep — `packages/opencode/src/index.ts`.
-5. If the primary request fails with a fallback status (`401`/`403`/`429`), is blocked by the killswitch, or encounters mid-stream rate-limit exhaustion before streaming starts, and the request is replayable, `tryFallbackAccounts` reactively iterates usable fallback accounts (filtering candidates below their killswitch thresholds and unconditionally excluding those with active mid-stream rate-limit marks) and retries each candidate — `packages/opencode/src/index.ts`. Indeterminate transport failures on reactive fallbacks halt routing immediately to prevent duplication. If a fallback attempt fails, its advisory quota headers are pushed to the cache. Reactive fallback is skipped if the proactive gate already tried all fallbacks in `fallback-first` mode.
-6. The final response's `x-codex-*` headers are normalized via `normalizeQuotaHeaders` and pushed into `QuotaManager` (main or per-account). The loader then calls `writeRequestSidebarRouting` to write the routing snapshot to `sidebar-state.json`. If a session ID is present, it registers the active account to that session in `activeRouting` (pruned to 128 entries and 1 hour age); otherwise, it falls back to legacy routing. The TUI sidebar resolves the active account for its session via `resolveSessionSidebarRouting`.
+1. Resolve the session key from `x-session-affinity`, `x-opencode-session`, `x-session-id`, or `session-id`.
+2. Read the shared sidebar state once. In `sticky-balanced` mode, retain a valid pin or create one using least projected pressure against fresh quota; stale and unknown quota are excluded, and an empty weighted set fails open to configured order. Equal scores use configured order then account id, while a shared pending-byte bridge accounts for concurrent cold sessions.
+3. Send on the chosen account. Ordered modes retain their normal main-first or fallback-first retry behavior; sticky-balanced does not rebalance a live session and has no Retry-After hold.
+4. Classify a sticky break after the send. Only confirmed exhaustion and permanent auth failure migrate the pin; transient, stale, and unknown outcomes retain it.
+5. Repin immediately on migration, then write the served account to the display state. Main and fallback quota headers are normalized into `QuotaManager`; `activeRouting` remains a short-lived display record, while `stickyAssignments` owns the seven-day, SHA-256-keyed session pins. A child session uses its own pin, and the parent display keeps its own pin rather than mirroring the child.
 
 **Quota push (no extra polling during normal traffic):**
 
@@ -168,7 +167,7 @@
 
 1. Every main-agent (and optionally subagent) request is captured by `buildKeepwarmCapture` from `sendWithAccessToken`. Outside of the configured clock window, capture is skipped.
 2. `cacheKeepManager.track` stores the body + replay headers per session, computing `cacheExpiresAt` using model-aware TTL (30 min for GPT-5.6 models, 5 min otherwise).
-3. A 60s timer fires; if the current hour is within the clock window, it checks each tracked session. For sessions within `leadMs` of expiry and within their respective idle caps (1 h main, 30 min subagent, or 75 min for GPT-5.6 subagents), it calls `buildKeepwarmBody(body)` (`store:false`, token caps removed) and replays via `fetchImpl`.
+3. A 60s timer fires; if the current hour is within the clock window, it checks each tracked session. For sessions within `leadMs` of expiry and within their respective idle caps (1 h main, 30 min subagent, or 75 min for GPT-5.6 subagents), it calls `buildKeepwarmBody(body)` (`store:false`, token caps removed) and replays via `fetchImpl`. With `sustain on`, only the main 1-hour idle pruning bound is bypassed; the window and all memory/LRU caps still apply.
 4. Successful warms increment `warmCount`. A GPT-5.6 subagent session is immediately removed/evicted from tracking once its `warmCount` reaches the 2-warm cap.
 5. Failures trigger a 10-min backoff per session.
 
@@ -190,7 +189,7 @@
 - Pattern: Push-only (no `fetchQuotaFn` injected — quota comes via `setMain`/`setFallback`); active refresh is orchestrated by `refreshAllQuota`.
 
 **`CacheKeepManager`:**
-- Purpose: Idle prompt-cache warmer with per-session targets, idle caps (1 h main / 30 min subagent, extended to 75 min for GPT-5.6 subagents), clock window checks, and 10-min backoff after a failed warm.
+- Purpose: Idle prompt-cache warmer with per-session targets, idle caps (1 h main / 30 min subagent, extended to 75 min for GPT-5.6 subagents), clock window checks, and 10-min backoff after a failed warm. Main-only `sustain` bypasses idle pruning without affecting the other bounds.
 - Location: `packages/opencode/src/core/cachekeep.ts`
 - Pattern: Target map keyed by session id; interval timer; bounded (`maxTargets`, `maxBytes`) so a long-lived process cannot leak; model-aware TTL adjustment (30-min TTL for GPT-5.6 models) and gpt-5.6 subagent 2-warm limits.
 
@@ -205,9 +204,9 @@
 - Pattern: HTTP server on `127.0.0.1:<ephemeral>` with a 32-byte bearer token written to `port-<pid>.json`; client discovers via pid-liveness scan of the dir.
 
 **Sidebar snapshot:**
-- Purpose: Loader → TUI surface for quota/killswitch/routing without coupling the TUI to the auth storage schema.
+- Purpose: Loader → TUI surface for quota/killswitch/routing without coupling the TUI to the auth storage schema; also owns machine-global sticky assignments.
 - Location: `packages/opencode/src/sidebar-state.ts`
-- Pattern: Promise-chained writes (no interleaved/stale writes); file path bound at loader-run time; `normalizeSidebarState` is the tolerant-read entry point so a malformed file never crashes the TUI. Writes machine-wide quota state via `setSidebarMachineState` and session-specific active routing records via `upsertSidebarActiveRouting`, preserving concurrency through a file-level write lock and a promise serialization chain.
+- Pattern: Promise-chained writes (no interleaved/stale writes); file path bound at loader-run time; `normalizeSidebarState` is the tolerant-read entry point so a malformed file never crashes the TUI. Writes machine-wide quota state via `setSidebarMachineState`, short-lived session display records via `upsertSidebarActiveRouting`, and SHA-256-keyed sticky assignments via `resolveSidebarStickyAssignment`; file locking and a promise serialization chain preserve concurrent placement and pending-byte accounting. Pins expire after seven days.
 
 ## Entry Points
 
@@ -255,6 +254,8 @@
 **Caching:** Two layers.
 - **In-memory quota cache:** `QuotaManager` (per-account fingerprint; 5-min refresh-after default; `respectBackoff` gates active polling).
 - **Prompt cache keep-warm:** `CacheKeepManager` tracks per-session last request and replays as `store:false` before the Codex ~5-min eviction window.
+
+`/openai-cachekeep sustain on|off` is main-agent-only and defaults off. It is orthogonal to the clock window, retains memory/LRU limits, and never warms a non-active account. GPT-5.6 targets warm about twice per hour per session (about 1K output tokens/hour at about 99.4% cache hit); non-5.6 targets warm about twelve times per hour. Before enabling it for a main-session model, the operator must preserve existing entries in `~/.config/cortexkit/magic-context.jsonc` and set that model's `cache_ttl` to `"never"`. Magic Context does not run in subagent sessions. An indefinitely live cache invalidates elapsed-time assumptions that a cache is cold and that mutation is free. The sibling anthropic plugin's `always` means ignore the clock schedule; this plugin's `sustain` means bypass main idle pruning.
 
 **Storage:** Config and state are stored in two separate files under `$OPENCODE_CONFIG_DIR`: config at `openai-auth.json` (default `~/.config/opencode/openai-auth.json`, overridable via `OPENCODE_OPENAI_AUTH_FILE`) containing settings and metadata without credentials, and state at `openai-auth-state.json` (overridable via `OPENCODE_OPENAI_AUTH_STATE_FILE`) containing access/refresh tokens and API keys. Atomic writes via `writeJsonAtomic` (temp + `rename`, mode `0o600`). File-level locks at `<config>.save.lock` and `<config>.main-refresh.lock` coordinate cross-process refresh and quota seed. A separate `openai-auth-sessions.json` persists Codex UUIDv7 thread/turn ids for prompt-cache continuity. Sidebar state lives at `tmpdir/opencode-openai-auth/sidebar-state.json` (override `OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE`). Loopback RPC port files live in `$XDG_STATE_HOME/cortexkit/openai-auth/rpc/<sha256(projectDir)>/port-<pid>.json`.
 

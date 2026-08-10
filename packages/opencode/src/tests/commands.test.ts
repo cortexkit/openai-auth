@@ -8,7 +8,13 @@ import {
   spyOn,
   test,
 } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CommandContext } from '../commands'
@@ -29,6 +35,10 @@ import { loadAccounts, type OAuthAccount, saveAccounts } from '../core/accounts'
 import { QuotaManager } from '../core/quota-manager'
 import { createLogger, flushForTest, setLogLevel } from '../logger'
 import { resetNotificationsForTest } from '../rpc/notifications'
+import {
+  clearSidebarStickyAssignment,
+  hashSidebarSessionId,
+} from '../sidebar-state'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
 
 function makeAccount(
@@ -128,6 +138,292 @@ describe('commands', () => {
     expect(storage?.routing?.mode).toBe('fallback-first')
   })
 
+  test('routing command persists and reports sticky-balanced', async () => {
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+    }
+
+    const payload = await buildDialogPayload(
+      'openai-routing',
+      'sticky-balanced',
+      ctx,
+    )
+
+    expect(payload.knobs.mode).toBe('sticky-balanced')
+    expect(payload.text).toContain('sticky-balanced')
+    expect((await loadAccounts(configPath))?.routing?.mode).toBe(
+      'sticky-balanced',
+    )
+  })
+
+  test('account command lists sticky-balanced routing and session reset', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [makeAccount('fallback-1')],
+      },
+      configPath,
+    )
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+    }
+
+    const payload = await buildDialogPayload('openai-account', '', ctx)
+
+    expect(payload.text).toContain(
+      'main-first, fallback-first, or sticky-balanced',
+    )
+    expect(payload.text).toContain('/openai-routing reset')
+  })
+
+  test('routing reset clears only the current session pin', async () => {
+    const clearStickyRouting = mock(async () => true)
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+      sessionId: 'session-a',
+      clearStickyRouting,
+    }
+
+    const payload = await buildDialogPayload('openai-routing', 'reset', ctx)
+
+    expect(clearStickyRouting).toHaveBeenCalledTimes(1)
+    expect(clearStickyRouting).toHaveBeenCalledWith('session-a')
+    expect(payload.knobs.mode).toBe('main-first')
+    expect(payload.text).toContain('pin was cleared')
+    expect(payload.text).toContain('may choose the same account')
+  })
+
+  test('routing status reports a sticky session pin and its reset command', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        routing: { mode: 'sticky-balanced' },
+      },
+      configPath,
+    )
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+      sessionId: 'sticky-status-session',
+      getStickyRouting: async () => 'fallback-1',
+    }
+
+    const payload = await buildDialogPayload('openai-routing', '', ctx)
+
+    expect(payload.text).toContain('Session pin: `fallback-1`')
+    expect(payload.text).toContain('/openai-routing reset')
+  })
+
+  test('routing reset and cachekeep sustain log their setting changes without a raw session id', async () => {
+    const logFile = join(tmpDir, 'commands.log')
+    const savedLogFile = process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+    try {
+      await flushForTest()
+      process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
+      setLogLevel('info')
+      const ctx: CommandContext = {
+        accountStoragePath: configPath,
+        quotaManager: new QuotaManager({
+          storage: { version: 1, accounts: [] },
+        }),
+        loadAccounts,
+        client: makeClient(),
+        sessionId: 'raw-command-session',
+        clearStickyRouting: async () => true,
+        cacheKeepManager: {
+          status: () => ({ generatedAt: Date.now() }),
+        } as CommandContext['cacheKeepManager'],
+      }
+
+      await buildDialogPayload('openai-routing', 'reset', ctx)
+      await buildDialogPayload('openai-cachekeep', 'sustain on', ctx)
+      await flushForTest()
+
+      const text = readFileSync(logFile, 'utf8')
+      expect(text).toContain('routing session pin cleared')
+      expect(text).toContain('cachekeep sustain enabled')
+      expect(text).not.toContain('raw-command-session')
+    } finally {
+      await flushForTest()
+      if (savedLogFile === undefined) {
+        delete process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+      } else {
+        process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = savedLogFile
+      }
+      setLogLevel(undefined)
+    }
+  })
+
+  test('routing reset without a current session changes nothing', async () => {
+    const clearStickyRouting = mock(async () => true)
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+      clearStickyRouting,
+    }
+
+    const payload = await buildDialogPayload('openai-routing', 'reset', ctx)
+
+    expect(clearStickyRouting).not.toHaveBeenCalled()
+    expect(payload.text).toContain('No current session')
+  })
+
+  test('routing reset removes only one sticky pin and leaves health and display state intact', async () => {
+    const sidebarPath = join(tmpDir, 'sidebar-state.json')
+    const now = Date.now()
+    const sessionA = 'session-a'
+    const sessionB = 'session-b'
+    const hashA = hashSidebarSessionId(sessionA)
+    const hashB = hashSidebarSessionId(sessionB)
+    writeFileSync(
+      sidebarPath,
+      JSON.stringify({
+        main: {
+          quota: {
+            primary: {
+              usedPercent: 20,
+              remainingPercent: 80,
+              checkedAt: now,
+              resetsAt: new Date(now + 60_000).toISOString(),
+            },
+          },
+          killed: true,
+          quotaBackedOff: true,
+          quotaBackoffUntil: now + 60_000,
+          refreshBackedOff: true,
+          refreshBackoffUntil: now + 120_000,
+        },
+        fallbacks: [
+          {
+            id: 'fallback-1',
+            label: 'Fallback 1',
+            quota: null,
+            killed: false,
+            enabled: true,
+          },
+        ],
+        activeId: 'fallback-1',
+        route: 'sticky-balanced',
+        activeRouting: {
+          [sessionA]: {
+            activeId: 'fallback-1',
+            route: 'sticky-balanced',
+            updatedAt: now,
+          },
+          [sessionB]: {
+            activeId: 'main',
+            route: 'sticky-balanced',
+            updatedAt: now,
+          },
+        },
+        stickyAssignments: {
+          [hashA]: {
+            accountId: 'fallback-1',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 100,
+          },
+          [hashB]: {
+            accountId: 'main',
+            assignedAt: now,
+            lastSeenAt: now,
+            inputBytes: 200,
+          },
+        },
+        lastUpdated: now,
+      }),
+    )
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        routing: { mode: 'sticky-balanced' },
+        killswitch: { enabled: true },
+      },
+      configPath,
+    )
+    const quotaManager = new QuotaManager({
+      storage: { version: 1, accounts: [] },
+      now: () => now,
+    })
+    quotaManager.markRateLimited('main', now + 60_000)
+    const cacheKeepManager = {
+      status: () => ({ running: true, tracked: 2, generatedAt: now }),
+    } as unknown as CommandContext['cacheKeepManager']
+    const before = JSON.parse(readFileSync(sidebarPath, 'utf8'))
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager,
+      loadAccounts,
+      client: makeClient(),
+      sessionId: sessionA,
+      cacheKeepManager,
+      clearStickyRouting: (sessionId) =>
+        clearSidebarStickyAssignment(sessionId, sidebarPath),
+    }
+
+    await buildDialogPayload('openai-routing', 'reset', ctx)
+
+    const after = JSON.parse(readFileSync(sidebarPath, 'utf8'))
+    expect(after.stickyAssignments?.[hashA]).toBeUndefined()
+    expect(after.stickyAssignments?.[hashB]).toEqual(
+      before.stickyAssignments[hashB],
+    )
+    const {
+      stickyAssignments: _beforePins,
+      lastUpdated: _beforeUpdated,
+      ...beforeWithoutPins
+    } = before
+    const {
+      stickyAssignments: _afterPins,
+      lastUpdated: _afterUpdated,
+      ...afterWithoutPins
+    } = after
+    expect(afterWithoutPins).toEqual(beforeWithoutPins)
+    expect(quotaManager.isRateLimited('main')).toBe(true)
+    expect(cacheKeepManager?.status().tracked).toBe(2)
+    expect((await loadAccounts(configPath))?.killswitch).toEqual({
+      enabled: true,
+    })
+  })
+
+  test.each(['always', 'hold'])(
+    'routing command rejects obsolete alias %s',
+    async (alias) => {
+      const ctx: CommandContext = {
+        accountStoragePath: configPath,
+        quotaManager: new QuotaManager({
+          storage: { version: 1, accounts: [] },
+        }),
+        loadAccounts,
+        client: makeClient(),
+      }
+
+      const payload = await buildDialogPayload('openai-routing', alias, ctx)
+
+      expect(payload.knobs.mode).toBe('main-first')
+      expect(payload.text).toContain('sticky-balanced')
+      expect((await loadAccounts(configPath))?.routing?.mode).toBeUndefined()
+    },
+  )
+
   test('scalar command (routing) with a STALE snapshot does not resurrect a removed account or its secrets', async () => {
     // Disk authoritatively has only account `a` (e.g. `gone` was just removed by
     // another session). The scalar command handler, however, loaded a STALE
@@ -223,6 +519,7 @@ describe('commands', () => {
           maxSubagentIdleMs: 30 * 60 * 1000,
           ttlMs: 5 * 60 * 1000,
           leadMs: 5000,
+          sustain: false,
           targets: [],
         }),
       } as unknown as CommandContext['cacheKeepManager'],
@@ -233,7 +530,10 @@ describe('commands', () => {
     expect(payload.command).toBe('openai-cachekeep')
     expect(payload.text).toContain('Status: **ON**')
     expect(payload.text).toContain('Timer: **idle**')
+    expect(payload.text).toContain('Idle policy: **sustain OFF (main only)**')
+    expect(payload.text).toContain('Window: **always (no window)**')
     expect(payload.knobs.enabled).toBe(true)
+    expect(payload.knobs.sustain).toBe(false)
     expect(payload.knobs.running).toBe(false)
     expect(payload.knobs.tracked).toBe(0)
   })
@@ -331,6 +631,88 @@ describe('commands', () => {
     expect(off.knobs.subagents).toBe(false)
     expect((await loadAccounts(configPath))?.cachekeep?.subagents).toBe(false)
     expect(setCacheKeepSubagents).toHaveBeenCalledWith(false)
+  })
+
+  test('/openai-cachekeep sustain on/off persists and flips the live gate', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        cachekeep: { enabled: true, subagents: true, sustain: false },
+      },
+      configPath,
+    )
+    const setCacheKeepSustain = mock(() => {})
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+      setCacheKeepSustain,
+      cacheKeepManager: {
+        status: () => ({
+          running: true,
+          tracked: 0,
+          generatedAt: 1700000000000,
+          startedAt: 1700000000000,
+          maxIdleWarmMs: 60 * 60 * 1000,
+          maxSubagentIdleMs: 30 * 60 * 1000,
+          ttlMs: 5 * 60 * 1000,
+          leadMs: 5000,
+          sustain: true,
+          targets: [],
+        }),
+      } as unknown as CommandContext['cacheKeepManager'],
+    }
+
+    const on = await buildDialogPayload('openai-cachekeep', 'sustain on', ctx)
+    expect(on.knobs.sustain).toBe(true)
+    expect(on.text).toContain('non-expiring `cache_ttl`')
+    expect((await loadAccounts(configPath))?.cachekeep).toEqual({
+      enabled: true,
+      subagents: true,
+      sustain: true,
+    })
+    expect(setCacheKeepSustain).toHaveBeenCalledWith(true)
+
+    const off = await buildDialogPayload('openai-cachekeep', 'sustain off', ctx)
+    expect(off.knobs.sustain).toBe(false)
+    expect((await loadAccounts(configPath))?.cachekeep).toEqual({
+      enabled: true,
+      subagents: true,
+      sustain: false,
+    })
+    expect(setCacheKeepSustain).toHaveBeenCalledWith(false)
+  })
+
+  test('/openai-cachekeep does not accept always or hold as sustain aliases', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        cachekeep: { enabled: true, sustain: false },
+      },
+      configPath,
+    )
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+    }
+
+    const always = await buildDialogPayload(
+      'openai-cachekeep',
+      'always on',
+      ctx,
+    )
+    const hold = await buildDialogPayload('openai-cachekeep', 'hold on', ctx)
+
+    expect(always.text).toContain('Usage:')
+    expect(hold.text).toContain('Usage:')
+    expect((await loadAccounts(configPath))?.cachekeep?.sustain).toBe(false)
   })
 
   test('/openai-cachekeep on creates a store when none exists', async () => {

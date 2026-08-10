@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'bun:test'
-import type { SidebarState } from '../sidebar-state.ts'
+import { hashSidebarSessionId, type SidebarState } from '../sidebar-state.ts'
 import {
+  buildApplyRequest,
   buildQuotaRowsForDisplay,
+  buildRoutingRowsForDisplay,
   getQuotaMetadataRows,
   isQuotaLoaded,
 } from '../tui.tsx'
@@ -102,5 +104,71 @@ describe('dynamic quota TUI rows', () => {
       { label: 'resets', value: '2' },
     ])
     expect(tui.getAccountMetadataRows?.()).toEqual([])
+  })
+
+  test('modal routing apply sends sessionId on its RPC request', () => {
+    expect(buildApplyRequest('openai-routing', 'reset', 'session-a')).toEqual({
+      command: 'openai-routing',
+      arguments: 'reset',
+      sessionId: 'session-a',
+    })
+  })
+
+  test('sticky-balanced routing renders a compact pin row only when the session has a usable pin', () => {
+    const sessionId = 'sticky-render-session'
+    const state: SidebarState = {
+      main: { quota: null, killed: false },
+      fallbacks: [
+        {
+          id: 'fallback-1',
+          label: 'Work',
+          quota: null,
+          killed: false,
+          enabled: true,
+        },
+      ],
+      activeId: undefined,
+      route: 'sticky-balanced',
+      stickyAssignments: {
+        'not-the-session-hash': {
+          accountId: 'fallback-1',
+          assignedAt: now,
+          lastSeenAt: now,
+          inputBytes: 1,
+        },
+      },
+      lastUpdated: now,
+    }
+
+    expect(buildRoutingRowsForDisplay(state, sessionId, now)).toEqual([
+      { label: 'Route', value: 'sticky-balanced', tone: 'accent' },
+    ])
+
+    state.stickyAssignments = {
+      [hashSidebarSessionId(sessionId)]: {
+        accountId: 'fallback-1',
+        assignedAt: now,
+        lastSeenAt: now,
+        inputBytes: 1,
+      },
+    }
+    expect(buildRoutingRowsForDisplay(state, sessionId, now)).toEqual([
+      { label: 'Route', value: 'sticky-balanced', tone: 'accent' },
+      { label: 'Pin', value: 'Work', tone: 'accent' },
+    ])
+  })
+
+  test('non-sticky routing renders the existing route row without a pin row', () => {
+    const state: SidebarState = {
+      main: { quota: null, killed: false },
+      fallbacks: [],
+      activeId: 'main',
+      route: 'main-first',
+      lastUpdated: now,
+    }
+
+    expect(buildRoutingRowsForDisplay(state, 'session-a', now)).toEqual([
+      { label: 'Route', value: 'main-first', tone: 'accent' },
+    ])
   })
 })

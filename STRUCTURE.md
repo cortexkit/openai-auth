@@ -19,7 +19,7 @@
 │   │   │   ├── logger.ts          # Leveled, redacting, rotating logger
 │   │   │   ├── model-costs.ts     # Dev catalog parser and cost restorer
 │   │   │   ├── quota-normalize.ts # HTTP/WS/wham → OAuthQuotaSnapshot
-│   │   │   ├── sidebar-state.ts   # Loader→TUI snapshot file
+│   │   │   ├── sidebar-state.ts   # Loader→TUI snapshot and sticky-pin state
 │   │   │   ├── tui-preferences.ts # Shared tui-preferences.jsonc reader/writer/watcher
 │   │   │   ├── tui.tsx            # TUI sidebar component
 │   │   │   ├── ws.ts              # Low-level WS connect/stream
@@ -74,7 +74,7 @@
 - Key files:
   - `packages/opencode/src/core/accounts.ts` — `loadAccounts`/`mutateAccounts` (authoritative read-modify-write), `saveAccounts` (test seeding only), `saveAccountState` (updates state secrets, gated by config roster), `FallbackAccountManager`, account types
   - `packages/opencode/src/core/quota-manager.ts` — in-memory quota cache, backoff, and mid-stream rate limit marking
-  - `packages/opencode/src/core/cachekeep.ts` — `CacheKeepManager` (idle prompt-cache warmer with model-aware TTLs, subagent 2-warm limits, clock windows, and idle pruning)
+  - `packages/opencode/src/core/cachekeep.ts` — `CacheKeepManager` (idle prompt-cache warmer with model-aware TTLs, subagent 2-warm limits, clock windows, idle pruning, and main-only sustain)
   - `packages/opencode/src/core/oauth.ts` — PKCE, callback server, device-code flow, JWT parsing
   - `packages/opencode/src/core/backoff.ts` — refresh/quota backoff math + `hashRefreshToken`
   - `packages/opencode/src/core/refresh-file-lock.ts` — single-writer eviction-marker lock
@@ -136,7 +136,7 @@
 - `packages/opencode/src/core/accounts.ts` — multi-account store, `FallbackAccountManager`.
 - `packages/opencode/src/core/oauth.ts` — PKCE, OAuth flow, JWT parsing.
 - `packages/opencode/src/core/quota-manager.ts` — quota cache, backoff, and mid-stream rate limit marking.
-- `packages/opencode/src/core/cachekeep.ts` — prompt-cache warmer with model-aware TTL, clock window, and subagent warm caps.
+- `packages/opencode/src/core/cachekeep.ts` — prompt-cache warmer with model-aware TTL, clock window, subagent warm caps, and main-only sustain that bypasses idle pruning but not memory/LRU caps.
 - `packages/opencode/src/prompt-context.ts` — assistant model/variant resolver for synthetic command replies.
 - `packages/opencode/src/core/provider.ts` — Codex injection seam (`codexRefreshFn`, `whamUsageFn`).
 - `packages/opencode/src/core/backoff.ts` — retry/backoff math.
@@ -147,7 +147,7 @@
 - `packages/opencode/src/raw-ws-bun.ts` / `packages/opencode/src/raw-ws-node.ts` — hand-rolled RFC 6455 clients.
 - `packages/opencode/src/hosted-web-search.ts` — provider-hosted `web_search` tool + replay/SSE translation.
 - `packages/opencode/src/quota-normalize.ts` — HTTP/WS/wham → `OAuthQuotaSnapshot`.
-- `packages/opencode/src/sidebar-state.ts` — loader→TUI snapshot file + tolerant reader.
+- `packages/opencode/src/sidebar-state.ts` — loader→TUI snapshot, tolerant reader, and SHA-256-keyed sticky session assignments with seven-day TTL.
 - `packages/opencode/src/dump.ts` — optional transport request dumps for cache debugging.
 - `packages/opencode/src/logger.ts` — leveled, secret-redacting, size-rotating logger.
 - `packages/opencode/src/model-costs.ts` — model cost resolution and restoration from `models.dev` catalog.
