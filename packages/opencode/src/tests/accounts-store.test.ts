@@ -1416,6 +1416,106 @@ describe('mutateAccounts load-time roster preservation', () => {
     // re-add or fix the URL — the loader does not silently swallow it.
     expect(preserved?.baseURL).toBe('not-a-url')
   })
+
+  // N1 regression: when the mutator re-adds a load-dropped entry (the
+  // exact shape of `re-login` for an account whose state entry is missing),
+  // the preserved raw entry must not be appended alongside the mutator's
+  // fresh version. The two id sets the helper accepts answer distinct
+  // questions — `loadedIds` (pre-mutator) decides what to preserve, and
+  // `emittedIds` (post-mutator) decides whether the writer is already
+  // emitting that id — and the F3 extraction dropped the second one.
+  it('mutator re-add of a load-dropped entry does NOT append a duplicate raw entry', async () => {
+    const { saveAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    const healthy = oauthAccount('healthy')
+    const broken = oauthAccount('broken')
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [healthy, broken],
+      },
+      cfgPath,
+    )
+    // Strip 'broken' from state — it is now load-dropped.
+    const stateRaw = readFileSync(statePath, 'utf8')
+    const stateObj = JSON.parse(stateRaw)
+    delete stateObj.accounts.broken
+    writeFileSync(statePath, JSON.stringify(stateObj))
+
+    // Mutator re-adds 'broken' with fresh tokens — the shape of re-login.
+    await mutateAccounts((current) => {
+      current.accounts.push({
+        ...oauthAccount('broken'),
+        access: 'fresh-access-broken',
+        refresh: 'fresh-refresh-broken',
+        expires: Date.now() + 3600_000,
+      })
+      return current
+    }, cfgPath)
+
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    const brokenEntries = cfg.accounts.filter(
+      (a: { id: string }) => a.id === 'broken',
+    )
+    // Exactly ONE entry for 'broken' — the mutator's fresh one. A second
+    // (stale raw) entry here is the F3-extraction regression.
+    expect(brokenEntries.length).toBe(1)
+    // Pin where the survivor lives: the state file carries the fresh
+    // tokens because accountConfig strips them from config, so the test
+    // asserts on state.broken.refresh rather than the config-side
+    // accountConfig projection.
+    const stateAfter = JSON.parse(readFileSync(statePath, 'utf8'))
+    expect(stateAfter.accounts.broken.refresh).toBe('fresh-refresh-broken')
+  })
+
+  // Padded id variant of the same regression: a load-dropped entry whose
+  // raw id is `   padded   ` (whitespace) loads with no state record
+  // and would re-append against the mutator's trimmed `padded` entry
+  // unless the writer's "already emitting" set is built with trim() on
+  // both sides. collectConfigRosterIds trims on the load side; this
+  // test pins the trim on the writer side.
+  it('mutator re-add of a load-dropped WHITESPACE-PADDED id does NOT duplicate', async () => {
+    const { saveAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    const rawId = '   padded   '
+    const trimmedId = 'padded'
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [oauthAccount('healthy'), oauthAccount(rawId)],
+      },
+      cfgPath,
+    )
+    // Strip the state entry for the padded id so it is load-dropped.
+    const stateRaw = readFileSync(statePath, 'utf8')
+    const stateObj = JSON.parse(stateRaw)
+    delete stateObj.accounts[rawId]
+    writeFileSync(statePath, JSON.stringify(stateObj))
+
+    // Mutator re-adds under the trimmed id (normalizeAccountBase trims
+    // the raw whitespace from any id the caller passes).
+    await mutateAccounts((current) => {
+      current.accounts.push({
+        ...oauthAccount(trimmedId),
+        access: 'fresh-access',
+        refresh: 'fresh-refresh',
+        expires: Date.now() + 3600_000,
+      })
+      return current
+    }, cfgPath)
+
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    const paddedEntries = cfg.accounts.filter(
+      (a: { id: string }) => a.id === trimmedId,
+    )
+    expect(paddedEntries.length).toBe(1)
+    // The raw padded entry must NOT be present (its trimmed form is the
+    // fresh one already on disk; the raw is what would duplicate).
+    const rawEntries = cfg.accounts.filter(
+      (a: { id: string }) => a.id === rawId,
+    )
+    expect(rawEntries.length).toBe(0)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1477,7 +1577,6 @@ describe('normalizeStorage roster drop is loud on every load', () => {
     logFile = join(dir, 'drop.log')
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
     process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = 'info'
-    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
   })
   afterEach(() => {
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
@@ -1648,5 +1747,81 @@ describe('roster-drop WARN dedupes identical repeats, re-warns on set change', (
     expect(warns.length).toBe(2)
     expect(logTxt).toContain(firstId)
     expect(logTxt).toContain(secondId)
+  })
+
+  // The dedup key must not allow a single id containing a comma to hash
+  // to the same value as two ids whose join-string is identical. Set A
+  // = {`a,b`} and Set B = {`a`, `b`} have different ids but the same
+  // `[...droppedIds].sort().join(',')` output (`a,b`). The bug suppresses
+  // the second WARN silently. Use JSON.stringify so the two sets map to
+  // distinct keys and both WARN.
+  it('warn dedup key resists comma-collision in id strings', async () => {
+    const { loadAccounts } = await import('../core/accounts.ts')
+    const { flushForTest } = await import('../logger.ts')
+
+    function writeConfigAndState(
+      accounts: Array<{ id: string; refresh: string }>,
+    ) {
+      const cfg = {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: accounts.map((a) => ({
+          id: a.id,
+          type: 'oauth',
+          enabled: true,
+        })),
+      }
+      const state = {
+        version: 1,
+        accounts: Object.fromEntries(
+          accounts.map((a) => [
+            a.id,
+            {
+              access: `acc-${a.id}`,
+              refresh: a.refresh,
+              expires: Date.now() + 3600_000,
+            },
+          ]),
+        ),
+      }
+      writeFileSync(cfgPath, `${JSON.stringify(cfg)}\n`)
+      writeFileSync(statePath, `${JSON.stringify(state)}\n`)
+    }
+
+    // Setup 1: a single load-dropped entry with id 'a,b' (literal comma)
+    // — strip its refresh from state so normalize cannot accept it.
+    writeConfigAndState([
+      { id: 'h-n2-comma', refresh: 'r-hn2-comma' },
+      { id: 'a,b', refresh: 'r-abc' },
+    ])
+    // Strip 'a,b' from state at the field level (state value is keyed by id).
+    const stateRaw1 = readFileSync(statePath, 'utf8')
+    const stateObj1 = JSON.parse(stateRaw1)
+    delete stateObj1.accounts['a,b']
+    writeFileSync(statePath, JSON.stringify(stateObj1))
+    await loadAccounts(cfgPath) // load 1: drops = ['a,b']
+
+    // Setup 2: write fresh config + state with two load-dropped entries
+    // 'a' and 'b' (no commas in their ids). Direct file writes avoid any
+    // saveAccounts-side append that would skew the drop set.
+    writeConfigAndState([
+      { id: 'h-n2-comma', refresh: 'r-hn2-comma' },
+      { id: 'a', refresh: 'r-a' },
+      { id: 'b', refresh: 'r-b' },
+    ])
+    const stateRaw2 = readFileSync(statePath, 'utf8')
+    const stateObj2 = JSON.parse(stateRaw2)
+    delete stateObj2.accounts.a
+    delete stateObj2.accounts.b
+    writeFileSync(statePath, JSON.stringify(stateObj2))
+    await loadAccounts(cfgPath) // load 2: drops = ['a','b']
+    await flushForTest()
+
+    const logTxt = readFileSync(logFile, 'utf8')
+    const warns = logTxt.match(/WARN \[accounts\]/g) ?? []
+    // Buggy join(',') dedup: 'a,b' (load 1) and 'a,b' (load 2) collide;
+    // second WARN suppressed → 1. JSON dedup: keys differ
+    // ('["a,b"]' vs '["a","b"]') → 2.
+    expect(warns.length).toBe(2)
   })
 })

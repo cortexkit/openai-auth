@@ -543,7 +543,11 @@ const warnedRosterDrops = new Set<string>()
 
 function emitRosterDropWarning(droppedIds: readonly string[]): void {
   if (droppedIds.length === 0) return
-  const key = [...droppedIds].sort().join(',')
+  // JSON.stringify so id strings that contain a comma can't hash to the
+  // same key as a comma-less split of the same characters — e.g.
+  // {`a,b`} would join to `a,b`, colliding with {`a`, `b`} on join and
+  // silently suppressing the second WARN.
+  const key = JSON.stringify([...droppedIds].sort())
   if (warnedRosterDrops.has(key)) return
   warnedRosterDrops.add(key)
   logA.warn('account load-dropped, preserved on disk', {
@@ -1034,16 +1038,39 @@ export async function saveAccounts(
 
       // Preserve load-dropped raw entries — shared pipeline with mutateAccounts
       // (no allowDrop seam here; this writer has no caller-driven removal
-      // intent). The WARN and dedup live on the shared helper, so both
-      // writers stay in sync.
-      const latestAccountIds = new Set(merged.accounts.map((a) => a.id))
-      const additions = buildPreservedAdditions(
+      // intent). The WARN lives on the shared helper. `latestAccountIds`
+      // is the loaded (post-normalize) set: an id that survived the load
+      // is NOT actually load-dropped and must not be re-appended as a raw
+      // entry. `latest` can be null (no config file); in that case the
+      // loaded set is empty and the emitted set is whatever the caller's
+      // `storage` arg carries — which is fine because there is no raw
+      // config to preserve from.
+      const latestAccountIds = latest
+        ? new Set(latest.accounts.map((a) => a.id))
+        : new Set<string>()
+      const preserved = buildPreservedAdditions(
         configJson.value,
         latestAccountIds,
         new Set(),
       )
-
+      // Drop preserved entries whose ids the writer is already emitting via
+      // the serialized output. trim() on both sides matches collectConfigRosterIds
+      // and guards against whitespace-padded raw entries duplicating
+      // already-trimmed serialized ids.
       const baseConfig = configFromStorage(merged)
+      const writtenIds = new Set(
+        (Array.isArray(baseConfig.accounts) ? baseConfig.accounts : [])
+          .map((e) =>
+            isRecord(e) && typeof e.id === 'string' ? e.id.trim() : '',
+          )
+          .filter(Boolean),
+      )
+      const additions = preserved.filter((raw) => {
+        if (!isRecord(raw)) return false
+        if (typeof raw.id !== 'string') return false
+        return !writtenIds.has(raw.id.trim())
+      })
+
       const nextConfig = {
         ...existing,
         ...baseConfig,
@@ -1151,14 +1178,28 @@ function pickRawRosterEntriesForPreservation(
  * own copy of the iteration logic) is drift-prone by construction: the
  * next invariant change would land on one writer only.
  *
- * `loadedIds` is the writer's outgoing account-id set: in mutateAccounts
- * it is the pre-mutator loaded roster; in saveAccounts it is the merged
- * candidate set. Either side of that distinction gets the same
- * preservation behaviour.
- *
- * Any id already in `loadedIds` is filtered out of `additions` so the
- * writer does not duplicate a raw entry the caller/merger already
- * accounted for.
+ * Takes two distinct id sets because they answer two distinct questions;
+ * collapsing them back into one (as an earlier refactor did) is wrong
+ * because an id the caller is actively emitting must NOT be appended a
+ * second time as a stale raw entry. A re-login path is the live example:
+ * the mutator pushes a fresh entry for an id whose state entry was
+ * missing, the load-time preserver sees the same id in raw config and
+ * would otherwise append the stale raw entry alongside the fresh one.
+ * - `loadedIds`: what normalizeStorage produced for the merged
+ *   config+state — the PRE-mutator / post-normalize set. Drives the
+ *   pickRawRosterEntriesForPreservation decision (an id that survived
+ *   normalization is not actually load-dropped).
+ * - `emittedIds`: what the writer is about to write — POST-mutator
+ *   for mutateAccounts (the ids in `next.accounts`), POST-union for
+ *   saveAccounts (the ids in `merged.accounts`). Drives the dedup
+ *   filter on the raw entries the writer appends.
+ */
+/**
+ * Walks a list of mixed-shape config entries (some are normalized account
+ * configs, some are raw preserved entries passed through verbatim) and
+ * collects the string ids. Used for the write-debug log so the
+ * diagnostic surface reflects what landed on disk rather than what the
+ * mutator returned.
  */
 /**
  * Walks a list of mixed-shape config entries (some are normalized account
@@ -1178,6 +1219,29 @@ function collectStringIds(entries: unknown): string[] {
   return ids
 }
 
+/**
+ * Returns the raw config entries that survived load-time rejection (i.e.
+ * they exist on disk as raw entries but normalizeAccount could not accept
+ * them — state entry missing, baseURL malformed, etc.) so a subsequent
+ * write can carry them back to disk verbatim instead of silently erasing
+ * the operator's account. The WARN is emitted here (dedup'd by
+ * emitRosterDropWarning) so the load-drop signal is centralized.
+ *
+ * `loadedIds` is the set of ids that DID survive normalization (pre-
+ * mutator / post-normalize) — used by pickRawRosterEntriesForPreservation
+ * to distinguish a real load-time drop from an id the writer is about
+ * to refresh via re-login. Wrong `loadedIds` here turns "deliberate
+ * removal" into "preservation resurrection" because both look the same
+ * at the load boundary.
+ *
+ * The dedup against the writer's *output* (a stale raw entry must not
+ * be appended alongside a fresh entry the writer just re-added) is the
+ * call site's responsibility because it needs the writer's serialized
+ * output (`configFromStorage(next)` for mutateAccounts, the same against
+ * `merged` for saveAccounts) and a trim on BOTH sides (raw and
+ * serialized ids may differ in whitespace — see collectionConfigRosterIds
+ * for the matching trim on the load side).
+ */
 function buildPreservedAdditions(
   rawConfigValue: unknown,
   loadedIds: Set<string>,
@@ -1193,11 +1257,7 @@ function buildPreservedAdditions(
       allowDrop,
     )
   emitRosterDropWarning(preservedIds)
-  return preservedRawEntries.filter((raw) => {
-    if (!isRecord(raw)) return false
-    if (typeof raw.id !== 'string') return false
-    return !loadedIds.has(raw.id.trim())
-  })
+  return preservedRawEntries
 }
 
 /**
@@ -1269,13 +1329,32 @@ export async function mutateAccounts(
       // — if it was in current.accounts, normalizeAccount accepted it and
       // there is no load-time drop to preserve.
       const allowDrop = new Set(options.allowDrop ?? [])
-      const additions = buildPreservedAdditions(
+      const preserved = buildPreservedAdditions(
         configJson.value,
         currentAccountIds,
         allowDrop,
       )
-
+      // Drop preserved entries whose ids the mutator is already emitting in
+      // normalized form via baseConfig.accounts — the live example is a
+      // re-login: the mutator pushes a fresh entry for an id whose state
+      // entry was missing, and a stale raw entry for the same id must
+      // NOT be appended alongside it (round-4 had this regression). trim()
+      // on both sides matches collectConfigRosterIds so a whitespace-
+      // padded raw id doesn't sneak past the comparison.
       const baseConfig = configFromStorage(next)
+      const writtenIds = new Set(
+        (Array.isArray(baseConfig.accounts) ? baseConfig.accounts : [])
+          .map((e) =>
+            isRecord(e) && typeof e.id === 'string' ? e.id.trim() : '',
+          )
+          .filter(Boolean),
+      )
+      const additions = preserved.filter((raw) => {
+        if (!isRecord(raw)) return false
+        if (typeof raw.id !== 'string') return false
+        return !writtenIds.has(raw.id.trim())
+      })
+
       const existing = isRecord(configJson.value) ? configJson.value : {}
       const nextConfig = {
         ...existing,
