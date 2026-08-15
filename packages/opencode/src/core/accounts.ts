@@ -525,6 +525,32 @@ function normalizeResetState(value: unknown): ResetStateByAccount | undefined {
   return Object.keys(normalized).length > 0 ? normalized : undefined
 }
 
+// Module-level dedup of the load-dropped-entries WARN. The preserve
+// invariant keeps broken entries on disk indefinitely — every
+// loadAccounts, every main-refresh tick — so logging the same drop set on
+// every call is spam by construction. The first occurrence stays loud;
+// identical repeats are suppressed; a change in the drop set (any new
+// id appearing, an id being fixed and gone) yields a new key and re-warns.
+//
+// Dedup key: sorted, comma-joined ids. The set grows monotonically within
+// the process; there is no reset. If the same logical drop recurs after
+// a process restart it will re-warn — which is the desired behaviour
+// because the operator opens a fresh log file on restart anyway.
+//
+// Keyed on the SORTED form so that id-ordering differences (e.g. drop
+// set [a,b] vs [b,a] in different writes) deduplicate as the same event.
+const warnedRosterDrops = new Set<string>()
+
+function emitRosterDropWarning(droppedIds: readonly string[]): void {
+  if (droppedIds.length === 0) return
+  const key = [...droppedIds].sort().join(',')
+  if (warnedRosterDrops.has(key)) return
+  warnedRosterDrops.add(key)
+  logA.warn('account load-dropped, preserved on disk', {
+    droppedIds,
+  })
+}
+
 function normalizeStorage(value: unknown): AccountStorage | null {
   if (!isRecord(value) || !Array.isArray(value.accounts)) return null
   const inputAccounts = value.accounts
@@ -555,12 +581,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     for (const id of inputIds) {
       if (!loadedIds.has(id)) dropped.push(id)
     }
-    if (dropped.length > 0) {
-      logA.warn(
-        'account dropped during load (state entry missing or unusable)',
-        { droppedIds: dropped },
-      )
-    }
+    emitRosterDropWarning(dropped)
   }
 
   return {
@@ -1011,33 +1032,18 @@ export async function saveAccounts(
       const merged = mergeStorageForSave(latest, storage)
       const existing = isRecord(configJson.value) ? configJson.value : {}
 
-      // Preserve load-dropped raw entries (parallel to mutateAccounts). This
-      // function is currently called only by tests, but it is exported and
-      // could be reached by an external consumer; the same roster invariant
-      // applies — a load-dropped id stays on disk verbatim until explicitly
-      // removed.
-      const rawIds = collectConfigRosterIds(configJson.value)
+      // Preserve load-dropped raw entries — shared pipeline with mutateAccounts
+      // (no allowDrop seam here; this writer has no caller-driven removal
+      // intent). The WARN and dedup live on the shared helper, so both
+      // writers stay in sync.
       const latestAccountIds = new Set(merged.accounts.map((a) => a.id))
-      const { preservedRawEntries, preservedIds } =
-        pickRawRosterEntriesForPreservation(
-          configJson.value,
-          rawIds ?? new Set(),
-          latestAccountIds,
-          new Set(),
-        )
-      if (preservedIds.length > 0) {
-        logA.warn('account load-dropped, preserved on disk', {
-          preservedIds,
-        })
-      }
+      const additions = buildPreservedAdditions(
+        configJson.value,
+        latestAccountIds,
+        new Set(),
+      )
 
       const baseConfig = configFromStorage(merged)
-      const additions = preservedRawEntries.filter((raw) => {
-        if (!isRecord(raw)) return false
-        if (typeof raw.id !== 'string') return false
-        return !latestAccountIds.has(raw.id.trim())
-      })
-
       const nextConfig = {
         ...existing,
         ...baseConfig,
@@ -1099,6 +1105,14 @@ function collectConfigRosterIds(value: unknown): Set<string> | null {
  * Returns the raw entries in raw-file order (the order they appear in
  * `rawValue.accounts`); preserved entries are appended to the end of
  * nextConfig.accounts after the normalized ones.
+ *
+ * Credentials (e.g. a config-inline `refresh`) on a preserved raw entry
+ * are NOT stripped before the write. Why: mergeConfigAndState spreads the
+ * state entry over the config entry, so a refresh living only in the
+ * config file is load-bearing — an account whose only token copy sits in
+ * the config loads fine today. Stripping credentials here would convert a
+ * recoverable account into a permanently dead one — the same argument that
+ * makes preserve beat refuse-to-write, one layer down.
  */
 function pickRawRosterEntriesForPreservation(
   rawValue: unknown,
@@ -1126,6 +1140,64 @@ function pickRawRosterEntriesForPreservation(
     preservedIds.push(id)
   }
   return { preservedRawEntries, preservedIds }
+}
+
+/**
+ * Shared roster-preservation pipeline used by both `mutateAccounts` and
+ * `saveAccounts`. Returns the raw entries that should be appended to the
+ * writer's outgoing accounts list so a load-dropped entry survives the
+ * write. The WARN is emitted here (dedup'd by emitRosterDropWarning) so
+ * both writers stay in sync — the alternative (each writer owning its
+ * own copy of the iteration logic) is drift-prone by construction: the
+ * next invariant change would land on one writer only.
+ *
+ * `loadedIds` is the writer's outgoing account-id set: in mutateAccounts
+ * it is the pre-mutator loaded roster; in saveAccounts it is the merged
+ * candidate set. Either side of that distinction gets the same
+ * preservation behaviour.
+ *
+ * Any id already in `loadedIds` is filtered out of `additions` so the
+ * writer does not duplicate a raw entry the caller/merger already
+ * accounted for.
+ */
+/**
+ * Walks a list of mixed-shape config entries (some are normalized account
+ * configs, some are raw preserved entries passed through verbatim) and
+ * collects the string ids. Used for the write-debug log so the
+ * diagnostic surface reflects what landed on disk rather than what the
+ * mutator returned.
+ */
+function collectStringIds(entries: unknown): string[] {
+  if (!Array.isArray(entries)) return []
+  const ids: string[] = []
+  for (const entry of entries) {
+    if (!isRecord(entry)) continue
+    if (typeof entry.id !== 'string') continue
+    ids.push(entry.id)
+  }
+  return ids
+}
+
+function buildPreservedAdditions(
+  rawConfigValue: unknown,
+  loadedIds: Set<string>,
+  allowDrop: Set<string>,
+): Array<Record<string, unknown>> {
+  const rawIds = collectConfigRosterIds(rawConfigValue)
+  if (rawIds === null) return []
+  const { preservedRawEntries, preservedIds } =
+    pickRawRosterEntriesForPreservation(
+      rawConfigValue,
+      rawIds,
+      loadedIds,
+      allowDrop,
+    )
+  emitRosterDropWarning(preservedIds)
+  return preservedRawEntries.filter((raw) => {
+    if (!isRecord(raw)) return false
+    if (typeof raw.id !== 'string') return false
+    return !loadedIds.has(raw.id.trim())
+  })
 }
 
 /**
@@ -1183,40 +1255,27 @@ export async function mutateAccounts(
       // current.accounts afterwards would observe the mutated set, not the
       // loaded one — and a legitimate removal by the mutator would look
       // identical to a load-time drop.
+      // Snapshot the pre-mutator account ids BEFORE running the mutator:
+      // the mutator may edit `current.accounts` in place, so reading
+      // current.accounts afterwards would observe the mutated set, not the
+      // loaded one — and a legitimate removal by the mutator would look
+      // identical to a load-time drop.
       const currentAccountIds = new Set(current.accounts.map((a) => a.id))
       const next = mutate(current) ?? current
 
-      // Preserve load-dropped raw entries. The comparison uses
-      // `currentAccountIds` (pre-mutator) so a legitimate removal by the
-      // mutator is NOT preserved back onto disk — if it was in
-      // `current.accounts`, normalizeAccount accepted it, and there is no
-      // load-time drop to preserve.
-      const rawIds = collectConfigRosterIds(configJson.value)
+      // Preserve load-dropped raw entries via the shared pipeline. The
+      // comparison is against `currentAccountIds` (pre-mutator) so a
+      // legitimate removal by the mutator is NOT preserved back onto disk
+      // — if it was in current.accounts, normalizeAccount accepted it and
+      // there is no load-time drop to preserve.
       const allowDrop = new Set(options.allowDrop ?? [])
-      const { preservedRawEntries, preservedIds } =
-        pickRawRosterEntriesForPreservation(
-          configJson.value,
-          rawIds ?? new Set(),
-          currentAccountIds,
-          allowDrop,
-        )
-      if (preservedIds.length > 0) {
-        logA.warn('account load-dropped, preserved on disk', {
-          preservedIds,
-        })
-      }
+      const additions = buildPreservedAdditions(
+        configJson.value,
+        currentAccountIds,
+        allowDrop,
+      )
 
       const baseConfig = configFromStorage(next)
-      // Skip a raw entry whose id the mutator already added back, to avoid
-      // duplicating it on disk. (The mutator sees normalized FallbackAccounts;
-      // a raw entry has the same id since normalizeAccountBase trims.)
-      const nextAccountIds = new Set(next.accounts.map((a) => a.id))
-      const additions = preservedRawEntries.filter((raw) => {
-        if (!isRecord(raw)) return false
-        if (typeof raw.id !== 'string') return false
-        return !nextAccountIds.has(raw.id.trim())
-      })
-
       const existing = isRecord(configJson.value) ? configJson.value : {}
       const nextConfig = {
         ...existing,
@@ -1228,9 +1287,13 @@ export async function mutateAccounts(
       }
       await writeJsonAtomic(path, nextConfig)
       await writeJsonAtomic(statePath, stateFromStorage(next))
+      // Log the actual written roster (nextConfig.accounts), not the
+      // mutator's output (next.accounts). next.accounts omits preserved
+      // entries — which this log was created specifically to surface — so
+      // logging it here would defeat the post-incident forensic use.
       logA.debug('account config written', {
-        accountCount: next.accounts.length,
-        accountIds: next.accounts.map((a) => a.id),
+        accountCount: nextConfig.accounts.length,
+        accountIds: collectStringIds(nextConfig.accounts),
       })
       return next
     } finally {

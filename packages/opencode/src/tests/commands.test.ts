@@ -1348,6 +1348,47 @@ describe('commands', () => {
     expect(cfg.accounts.map((a: { id: string }) => a.id)).toEqual(['healthy'])
   })
 
+  // An id that was never on disk (fat-finger typo) must report Not
+  // Found — lying "Removed" would silently mask the operator's typo and
+  // leave their real account untouched. The message comes from a closure
+  // flag OR'd with a pre-read saw-it: a never-existed id has neither
+  // signal, so it reports Not Found. The unrelated healthy account is NOT
+  // collateral damage.
+  test('openai-account remove of a nonexistent id reports Not Found', async () => {
+    const account = makeAccount('acct-present')
+    const qm = new QuotaManager({
+      storage: { version: 1 as const, accounts: [account] },
+    })
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: qm,
+      loadAccounts,
+      client: makeClient(),
+    }
+    await saveAccounts(
+      {
+        version: 1 as const,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [account],
+      },
+      configPath,
+    )
+
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'remove ghost-id',
+      ctx,
+    )
+    expect(payload.text).toContain('Not Found')
+    expect(payload.text).toContain('ghost-id')
+    expect(payload.text).not.toContain('Removed')
+    // The healthy account must NOT have been removed by an unrelated typo.
+    const cfg = JSON.parse(readFileSync(configPath, 'utf8'))
+    expect(cfg.accounts.map((a: { id: string }) => a.id)).toEqual([
+      'acct-present',
+    ])
+  })
+
   test('refreshSidebar called after order', async () => {
     const account = makeAccount('acct-1')
     const acct2 = makeAccount('acct-2')

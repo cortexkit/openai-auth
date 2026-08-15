@@ -128,8 +128,20 @@ export async function codexRefreshFn(input: {
       isRefreshError: true,
     }) as ProviderHttpError
   }
-  // An omitted/empty refresh_token is not malformed: it means the server
-  // declined to rotate, and we keep the current one.
+  // A missing or empty-string refresh_token legitimately means "no rotation"
+  // (the server declined to rotate; keep the current one). A *defined* non-
+  // string value (number, boolean, null, object) is a genuinely malformed
+  // response — swallow-and-reuse here would turn a wire-shape regression
+  // into a successful refresh report.
+  if (
+    tokens.refresh_token !== undefined &&
+    typeof tokens.refresh_token !== 'string'
+  ) {
+    throw Object.assign(new Error('Token refresh failed: malformed response'), {
+      status: response.status,
+      isRefreshError: true,
+    }) as ProviderHttpError
+  }
   const rotatedRefresh =
     typeof tokens.refresh_token === 'string' && tokens.refresh_token
       ? tokens.refresh_token

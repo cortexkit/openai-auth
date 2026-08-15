@@ -1513,4 +1513,140 @@ describe('normalizeStorage roster drop is loud on every load', () => {
     expect(logTxt).not.toContain('ref-silent-drop')
     expect(logTxt).not.toContain('acc-silent-drop')
   })
+
+  // The write-debug log exists specifically so the post-incident forensic
+  // trail reflects what landed on disk — not what the mutator returned.
+  // Preserved entries are appended to nextConfig.accounts after the
+  // mutator runs, so logging next.accounts would under-report.
+  it('write-debug log lists the actual written roster (preserved entry included)', async () => {
+    const { saveAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    const { flushForTest } = await import('../logger.ts')
+    process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = 'debug'
+    // Use a UUID so the dropped-id dedup state does not collide with
+    // any other test in this process.
+    const preservedId = `preserve-${randomUUID()}`
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [oauthAccount('healthy'), oauthAccount(preservedId)],
+      },
+      cfgPath,
+    )
+    const stateRaw = readFileSync(statePath, 'utf8')
+    const stateObj = JSON.parse(stateRaw)
+    delete stateObj.accounts[preservedId]
+    writeFileSync(statePath, JSON.stringify(stateObj))
+
+    // Mutator touches only refresh metadata — mirrors updateMainRefreshState.
+    await mutateAccounts((current) => {
+      current.refresh = current.refresh ?? {}
+      current.refresh.intervalMinutes = 11
+      return current
+    }, cfgPath)
+    await flushForTest()
+
+    const logTxt = readFileSync(logFile, 'utf8')
+    // Pull only the DEBUG line for the config write — the WARN line also
+    // contains the preserved id (as preservedIds), so a flat toContain()
+    // would be ambiguous between DEBUG and WARN.
+    const debugLine = logTxt
+      .split('\n')
+      .find((line) => line.includes('account config written'))
+    expect(debugLine).toBeDefined()
+    // The DEBUG payload must list BOTH the healthy entry and the preserved
+    // entry — exactly what landed on disk. This is the assertion that
+    // reddens when the log uses next.accounts (only the healthy entry).
+    expect(debugLine).toContain(preservedId)
+    expect(debugLine).toContain('healthy')
+  })
+})
+
+// The preserve invariant keeps a load-dropped entry on disk indefinitely.
+// That guarantees the WARN condition persists forever — every main-refresh
+// tick, every loadAccounts — which the original fix would spam. The dedup
+// keeps the first occurrence loud and suppresses identical repeats; a
+// change in the dropped-id set (any new id appearing) still re-warns. Each
+// test uses UUID ids so dedup state does not leak between tests.
+describe('roster-drop WARN dedupes identical repeats, re-warns on set change', () => {
+  let logFile: string
+
+  beforeEach(() => {
+    logFile = join(dir, 'dedup.log')
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
+    process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = 'info'
+  })
+  afterEach(() => {
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+    delete process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL
+  })
+
+  it('two consecutive loads with the same dropped id emit exactly one WARN', async () => {
+    const { saveAccounts, loadAccounts } = await import('../core/accounts.ts')
+    const { flushForTest } = await import('../logger.ts')
+    const droppedId = `dedup-${randomUUID()}`
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [oauthAccount('keep'), oauthAccount(droppedId)],
+      },
+      cfgPath,
+    )
+    const stateRaw = readFileSync(statePath, 'utf8')
+    const stateObj = JSON.parse(stateRaw)
+    delete stateObj.accounts[droppedId]
+    writeFileSync(statePath, JSON.stringify(stateObj))
+
+    await loadAccounts(cfgPath)
+    await loadAccounts(cfgPath) // identical dropped set — should be deduped
+    await flushForTest()
+
+    const logTxt = readFileSync(logFile, 'utf8')
+    const warns = logTxt.match(/WARN \[accounts\]/g) ?? []
+    expect(warns.length).toBe(1)
+    expect(logTxt).toContain(droppedId)
+  })
+
+  it('a new dropped id (different from the previously-warned set) re-warns', async () => {
+    const { saveAccounts, loadAccounts } = await import('../core/accounts.ts')
+    const { flushForTest } = await import('../logger.ts')
+    const firstId = `dedup-A-${randomUUID()}`
+    const secondId = `dedup-B-${randomUUID()}`
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [oauthAccount('keep'), oauthAccount(firstId)],
+      },
+      cfgPath,
+    )
+    const stateRaw = readFileSync(statePath, 'utf8')
+    const stateObj = JSON.parse(stateRaw)
+    delete stateObj.accounts[firstId]
+    writeFileSync(statePath, JSON.stringify(stateObj))
+    await loadAccounts(cfgPath)
+
+    // Different broken id — warn again.
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [oauthAccount('keep'), oauthAccount(secondId)],
+      },
+      cfgPath,
+    )
+    const stateRaw2 = readFileSync(statePath, 'utf8')
+    const stateObj2 = JSON.parse(stateRaw2)
+    delete stateObj2.accounts[secondId]
+    writeFileSync(statePath, JSON.stringify(stateObj2))
+    await loadAccounts(cfgPath)
+    await flushForTest()
+
+    const logTxt = readFileSync(logFile, 'utf8')
+    const warns = logTxt.match(/WARN \[accounts\]/g) ?? []
+    expect(warns.length).toBe(2)
+    expect(logTxt).toContain(firstId)
+    expect(logTxt).toContain(secondId)
+  })
 })

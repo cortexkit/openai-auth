@@ -142,32 +142,32 @@ async function main() {
         process.exit(1)
       }
 
-      // A load-dropped entry sits in the raw config but is absent from the
-      // mutator's `current.accounts`; the mutator's splice would no-op and
-      // the load-time preservation pass would resurrect it. Pre-check the
-      // raw roster and pass `allowDrop` so the entry is gone end-to-end.
+      // `allowDrop` is unconditional — for a healthy entry it is a no-op,
+      // for a load-dropped entry it suppresses the preservation pass that
+      // would otherwise resurrect the raw entry. The user-facing message
+      // comes from two signals OR'd together: the mutator's splice and a
+      // pre-read of the raw roster that the mutator's current.accounts
+      // cannot see. The pre-read is purely diagnostic — a stale read can
+      // only change the message when another writer races us, and the
+      // mutator signal covers exactly that case.
       const configPath = getAccountStoragePath()
       const rawRoster = await readConfigRosterIds(configPath)
-      const existedOnDisk = rawRoster ? rawRoster.has(targetId) : false
+      const preReadSawIt = rawRoster ? rawRoster.has(targetId) : false
 
-      let removed = false
+      let mutatorSplicedIt = false
       await mutateAccounts(
         (current) => {
           const idx = current.accounts.findIndex((a) => a.id === targetId)
           if (idx === -1) return current
           current.accounts.splice(idx, 1)
-          removed = true
+          mutatorSplicedIt = true
           return current
         },
         configPath,
-        existedOnDisk ? { allowDrop: [targetId] } : undefined,
+        { allowDrop: [targetId] },
       )
 
-      // The mutator could not find the id in current.accounts because it was
-      // load-dropped; allowDrop prevented preservation, so the on-disk entry
-      // is gone — count it as a successful removal.
-      if (!removed && existedOnDisk) removed = true
-
+      const removed = mutatorSplicedIt || preReadSawIt
       if (!removed) {
         console.error(`No account with id "${targetId}".`)
         process.exit(1)
