@@ -16,7 +16,11 @@ import type {
   OAuthAccount,
 } from '../core/accounts.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
-import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
+import {
+  FLOOR_AUTH_FILE,
+  FLOOR_LOG_FILE,
+  FLOOR_STATE_FILE,
+} from './setup-env.ts'
 
 let dir: string
 let cfgPath: string
@@ -1148,5 +1152,365 @@ describe('mutateAccounts (authoritative structural edits)', () => {
     // 'keep' WITHOUT losing the concurrently-added 'concurrent'.
     const loaded = await loadAccounts(cfgPath)
     expect(loaded?.accounts.map((a) => a.id).sort()).toEqual(['concurrent'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Roster-drop preservation — a load-dropped entry (raw config roster has it,
+// but normalizeAccount rejected the merged record so it is absent from
+// current.accounts) is carried through to the written config verbatim. The
+// alternative — refusing to write — breaks any code path that shares the
+// writer with a load-dropped entry (e.g. updateMainRefreshState) and blocks
+// the only paths that could repair the account (remove, re-add). Preserve
+// is the right primitive: the dropped entry survives the write, the
+// operator gets a WARN, and a deliberate removal uses the allowDrop option
+// to override preservation for a single id.
+// ---------------------------------------------------------------------------
+
+describe('mutateAccounts load-time roster preservation', () => {
+  // The mutator is free to write whatever it likes; preserve is a wrapper
+  // around the disk write that re-inserts raw entries whose ids normalize
+  // rejected, so they cannot be silently erased by the next config write.
+  function writeConfigWithMixedEntries(accounts: unknown[]) {
+    writeFileSync(cfgPath, `${JSON.stringify({ version: 1, accounts })}\n`)
+    writeFileSync(
+      statePath,
+      `${JSON.stringify({ version: 1, accounts: {} })}\n`,
+    )
+  }
+
+  // Anti-regression for the original incident: a load-dropped entry survives
+  // an unrelated mutateAccounts call. The mutator never even touches 'b';
+  // preservation is what keeps it on disk.
+  it('PRESERVES a load-dropped entry after an unrelated mutateAccounts call (writes through)', async () => {
+    const { saveAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [oauthAccount('a'), oauthAccount('b')],
+      },
+      cfgPath,
+    )
+    const stateRaw = readFileSync(statePath, 'utf8')
+    const stateObj = JSON.parse(stateRaw)
+    delete stateObj.accounts.b
+    writeFileSync(statePath, JSON.stringify(stateObj))
+
+    // Mutator only touches the refresh metadata, never the accounts list —
+    // mirrors updateMainRefreshState's shape.
+    await mutateAccounts((current) => {
+      current.refresh = current.refresh ?? {}
+      current.refresh.intervalMinutes = 7
+      return current
+    }, cfgPath)
+
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    // 'b' is still on disk, verbatim from the original raw entry.
+    expect(cfg.accounts.map((a: { id: string }) => a.id).sort()).toEqual([
+      'a',
+      'b',
+    ])
+    const preservedB = cfg.accounts.find((a: { id: string }) => a.id === 'b')
+    expect(preservedB).toBeDefined()
+    // Mutator's refresh change persisted too — preservation does not block
+    // legitimate mutator writes.
+    expect(cfg.refresh?.intervalMinutes).toBe(7)
+  })
+
+  // updateMainRefreshState goes through mutateAccounts on the same config
+  // path. A broken FALLBACK state entry (raw config has the id but state
+  // has no refresh for it) must not break MAIN refresh. This test pins
+  // that failure mode directly.
+  it('updateMainRefreshState-shaped mutation succeeds while a broken fallback exists (main refresh must not break)', async () => {
+    const { saveAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    const main = oauthAccount('main')
+    const broken = oauthAccount('broken')
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [main, broken],
+      },
+      cfgPath,
+    )
+    const stateRaw = readFileSync(statePath, 'utf8')
+    const stateObj = JSON.parse(stateRaw)
+    delete stateObj.accounts.broken
+    writeFileSync(statePath, JSON.stringify(stateObj))
+
+    // Same shape as updateMainRefreshState in src/index.ts: touches only
+    // refresh/main lease metadata. Must not throw.
+    let resolved = false
+    let rejected: unknown
+    try {
+      await mutateAccounts((current) => {
+        current.refresh = current.refresh ?? {}
+        current.refresh.mainRefreshLeaseId = 'lease-1'
+        current.refresh.mainRefreshLeaseUntil = Date.now() + 60_000
+        return current
+      }, cfgPath)
+      resolved = true
+    } catch (error) {
+      rejected = error
+    }
+
+    expect(resolved).toBe(true)
+    expect(rejected).toBeUndefined()
+
+    // Both accounts still on disk.
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    expect(cfg.accounts.map((a: { id: string }) => a.id).sort()).toEqual([
+      'broken',
+      'main',
+    ])
+    // The mutator's refresh metadata went to the state file (where
+    // configFromStorage routes refresh lease fields) — the test only
+    // asserts the call did not throw, which is the MUST invariant.
+    expect(typeof cfg.refresh).toBe('object')
+  })
+
+  // Removal of a load-dropped account via allowDrop: the entry is in raw
+  // config (so the operator could see it via cli list, which reads raw),
+  // absent from current.accounts (load-dropped), and the allowDrop option
+  // suppresses preservation so it is gone from disk after the call.
+  it('removes a load-dropped account end to end when allowDrop is set', async () => {
+    const { saveAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    const a = oauthAccount('a')
+    const broken = oauthAccount('broken')
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [a, broken],
+      },
+      cfgPath,
+    )
+    const stateRaw = readFileSync(statePath, 'utf8')
+    const stateObj = JSON.parse(stateRaw)
+    delete stateObj.accounts.broken
+    writeFileSync(statePath, JSON.stringify(stateObj))
+
+    // The mutator cannot find 'broken' in current.accounts (it was
+    // load-dropped). Without allowDrop, preserve would put it back. With
+    // allowDrop set, preservation is skipped and the entry is gone.
+    await mutateAccounts(
+      (current) => {
+        const idx = current.accounts.findIndex(
+          (candidate) => candidate.id === 'broken',
+        )
+        if (idx !== -1) current.accounts.splice(idx, 1)
+        return current
+      },
+      cfgPath,
+      { allowDrop: ['broken'] },
+    )
+
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    expect(cfg.accounts.map((a: { id: string }) => a.id)).toEqual(['a'])
+  })
+
+  // A normal removal (target id is in current.accounts) still works
+  // without allowDrop.
+  it('allows a normal removal through the mutator', async () => {
+    const { loadAccounts, saveAccounts, mutateAccounts } = await import(
+      '../core/accounts.ts'
+    )
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [oauthAccount('a'), oauthAccount('b'), oauthAccount('c')],
+      },
+      cfgPath,
+    )
+
+    await mutateAccounts((current) => {
+      current.accounts = current.accounts.filter(
+        (account) => account.id !== 'b',
+      )
+      return current
+    }, cfgPath)
+
+    const loaded = await loadAccounts(cfgPath)
+    expect(loaded?.accounts.map((a) => a.id)).toEqual(['a', 'c'])
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    expect(cfg.accounts.map((a: { id: string }) => a.id)).toEqual(['a', 'c'])
+  })
+
+  // First-run with no config file: no raw roster to preserve from; the
+  // mutator runs as before.
+  it('does not throw on first run with no config file', async () => {
+    const { mutateAccounts } = await import('../core/accounts.ts')
+    expect(existsSync(cfgPath)).toBe(false)
+    expect(existsSync(statePath)).toBe(false)
+
+    await expect(
+      mutateAccounts((current) => {
+        current.accounts.push(oauthAccount('first'))
+        return current
+      }, cfgPath),
+    ).resolves.toBeDefined()
+
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    expect(cfg.accounts.map((a: { id: string }) => a.id)).toEqual(['first'])
+  })
+
+  // The roster predicate aligns with normalizeAccountBase: trim, skip
+  // blank/whitespace-only. A garbage entry that synthesize-a-uuid on load
+  // must not be treated as "dropped" and preserved spuriously.
+  it('blank and whitespace-padded raw ids do not trigger spurious preservation', async () => {
+    const { mutateAccounts } = await import('../core/accounts.ts')
+    writeConfigWithMixedEntries([
+      { id: 'real-a', type: 'oauth', enabled: true },
+      { id: '   ', type: 'oauth', enabled: true }, // whitespace only → not in roster
+      { id: '', type: 'oauth', enabled: true }, // empty → not in roster
+      { id: 7, type: 'oauth', enabled: true }, // non-string id → not in roster
+      { id: '   padded   ', type: 'oauth', enabled: true }, // padded with content → trimmed to 'padded', in roster
+      {}, // no id → not in roster
+      null, // not a record → not in roster
+      'string', // not a record → not in roster
+    ])
+
+    await mutateAccounts((current) => current, cfgPath)
+
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    const ids = cfg.accounts.map((a: { id: string }) => a.id)
+    // 'real-a' and '   padded   ' are the only records whose id (after
+    // trim) was a non-empty string; both are load-dropped in this scenario
+    // (state is empty) so both are preserved verbatim. The blank /
+    // non-string / non-record entries were never in the roster.
+    expect(ids.sort()).toEqual(['   padded   ', 'real-a'].sort())
+  })
+
+  // An api-type account rejected for a bad baseURL is also load-dropped, and
+  // the raw entry is preserved verbatim so re-add or re-login can fix it.
+  it('also preserves a load-dropped api-type account (verbatim from raw)', async () => {
+    const { mutateAccounts } = await import('../core/accounts.ts')
+    writeFileSync(
+      cfgPath,
+      `${JSON.stringify({
+        version: 1,
+        accounts: [
+          { id: 'good-api', type: 'api', baseURL: 'https://example.test' },
+          { id: 'bad-api', type: 'api', baseURL: 'not-a-url' },
+        ],
+      })}\n`,
+    )
+    writeFileSync(
+      statePath,
+      `${JSON.stringify({ version: 1, accounts: {} })}\n`,
+    )
+
+    await mutateAccounts((current) => current, cfgPath)
+
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    expect(cfg.accounts.map((a: { id: string }) => a.id).sort()).toEqual([
+      'bad-api',
+      'good-api',
+    ])
+    const preserved = cfg.accounts.find(
+      (a: { id: string }) => a.id === 'bad-api',
+    )
+    // Verbatim: the bad baseURL is kept so the operator can repair it via
+    // re-add or fix the URL — the loader does not silently swallow it.
+    expect(preserved?.baseURL).toBe('not-a-url')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// saveAccounts is exported but currently has no production callers. The same
+// roster invariant applies (a load-dropped id stays on disk verbatim), so the
+// preserve logic from mutateAccounts is mirrored here. This test pins that
+// parallelism so a future regression to either writer is caught.
+// ---------------------------------------------------------------------------
+
+describe('saveAccounts load-time roster preservation', () => {
+  it('preserves a load-dropped entry on a re-save even when the caller passes a storage without it (parallel to mutateAccounts)', async () => {
+    const { saveAccounts } = await import('../core/accounts.ts')
+    // Seed config + state for [a, broken].
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [oauthAccount('a'), oauthAccount('broken')],
+      },
+      cfgPath,
+    )
+    // Strip 'broken' from the state file so the next saveAccounts call
+    // re-reads a config where 'broken' is load-dropped — and the caller
+    // passes a storage that does NOT mention 'broken' (the typical
+    // caller-side view, since they cannot see load-dropped ids via
+    // loadAccounts either).
+    const stateRaw = readFileSync(statePath, 'utf8')
+    const stateObj = JSON.parse(stateRaw)
+    delete stateObj.accounts.broken
+    writeFileSync(statePath, JSON.stringify(stateObj))
+
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [oauthAccount('a')],
+      },
+      cfgPath,
+    )
+
+    // 'broken' must come back to disk verbatim because saveAccounts
+    // preserves load-dropped entries — the caller-side storage doesn't
+    // know about it, but it was in the original raw roster.
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    expect(cfg.accounts.map((a: { id: string }) => a.id).sort()).toEqual([
+      'a',
+      'broken',
+    ])
+  })
+})
+
+describe('normalizeStorage roster drop is loud on every load', () => {
+  // The same drop path is hit by plain loadAccounts — not just by mutations —
+  // and the previous version was silent, which is why the original incident
+  // had no log trail. The accounts-channel WARN names the dropped ids.
+  let logFile: string
+
+  beforeEach(() => {
+    logFile = join(dir, 'drop.log')
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
+    process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = 'info'
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
+  })
+  afterEach(() => {
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+    delete process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL
+  })
+
+  it('emits a WARN naming the dropped ids when loadAccounts filters them out', async () => {
+    const { saveAccounts, loadAccounts } = await import('../core/accounts.ts')
+    const { flushForTest } = await import('../logger.ts')
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [oauthAccount('keep-a'), oauthAccount('silent-drop')],
+      },
+      cfgPath,
+    )
+    const stateRaw = readFileSync(statePath, 'utf8')
+    const stateObj = JSON.parse(stateRaw)
+    delete stateObj.accounts['silent-drop']
+    writeFileSync(statePath, JSON.stringify(stateObj))
+
+    const loaded = await loadAccounts(cfgPath)
+    await flushForTest()
+    // The dropped id must not have survived the load.
+    expect(loaded?.accounts.map((a) => a.id)).toEqual(['keep-a'])
+
+    const logTxt = readFileSync(logFile, 'utf8')
+    // WARN on the accounts channel naming the dropped id.
+    expect(logTxt).toMatch(/WARN \[accounts\]/)
+    expect(logTxt).toContain('silent-drop')
+    // No token values are leaked through the WARN.
+    expect(logTxt).not.toContain('ref-silent-drop')
+    expect(logTxt).not.toContain('acc-silent-drop')
   })
 })

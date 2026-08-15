@@ -7,6 +7,7 @@ import {
   mutateAccounts,
   type OAuthAccount,
   type RoutingMode,
+  readConfigRosterIds,
 } from './core/accounts'
 import type { FallbackAccount } from './core/accounts.ts'
 import type { CacheKeepManager, CacheKeepWindow } from './core/cachekeep'
@@ -265,17 +266,33 @@ async function executeAccountCommand(
 
   if (tokens[0] === 'remove' && tokens[1]) {
     const targetId = tokens[1]
+    // A load-dropped entry sits in the raw config but is absent from the
+    // mutator's `current.accounts`; the mutator's splice would no-op and
+    // the load-time preservation pass would resurrect it. Pre-check the
+    // raw roster and pass `allowDrop` so the entry is gone end-to-end.
+    const rawRoster = await readConfigRosterIds(ctx.accountStoragePath)
+    const existedOnDisk = rawRoster ? rawRoster.has(targetId) : false
+
     // Structural edit: route through mutateAccounts so the deletion is written
     // authoritatively. saveAccounts union-merges latest ∪ incoming by id, which
     // would resurrect the removed account from the on-disk `latest` set.
     let removed = false
-    const next = await mutateAccounts((current) => {
-      const idx = current.accounts.findIndex((a) => a.id === targetId)
-      if (idx === -1) return current
-      removed = true
-      current.accounts.splice(idx, 1)
-      return current
-    }, ctx.accountStoragePath)
+    const next = await mutateAccounts(
+      (current) => {
+        const idx = current.accounts.findIndex((a) => a.id === targetId)
+        if (idx === -1) return current
+        current.accounts.splice(idx, 1)
+        removed = true
+        return current
+      },
+      ctx.accountStoragePath,
+      existedOnDisk ? { allowDrop: [targetId] } : undefined,
+    )
+
+    // The mutator could not find the id in current.accounts because it was
+    // load-dropped; allowDrop prevented preservation, so the on-disk entry
+    // is gone — count it as a successful removal.
+    if (!removed && existedOnDisk) removed = true
 
     if (!removed) {
       return {

@@ -64,6 +64,60 @@ describe('error contract', () => {
     }
   })
 
+  // OpenAI's refresh grant rotates the refresh token single-use. When the
+  // server returns no refresh_token (or an empty one) on a successful
+  // exchange, the caller MUST keep using the current refresh token rather
+  // than throw a malformed-response error — otherwise refresh backoff would
+  // arm across every account on the first non-rotating response.
+
+  it('reuses the input refresh token when the response omits refresh_token', async () => {
+    const mockFetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: async () => ({
+        access_token: 'rotated-access',
+        // refresh_token intentionally absent
+        expires_in: 3600,
+      }),
+    })
+
+    const result = await codexRefreshFn({
+      refreshToken: 'keep-this-refresh',
+      fetchImpl: mockFetch as unknown as typeof fetch,
+      now: () => 1_700_000_000_000,
+    })
+
+    // The refresh token in the result is the INPUT token, unchanged.
+    expect(result.refresh).toBe('keep-this-refresh')
+    expect(result.access).toBe('rotated-access')
+    expect(result.expiresIn).toBe(3600)
+  })
+
+  it('still throws when access_token is missing on a 200 response', async () => {
+    const mockFetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: async () => ({
+        // access_token intentionally absent
+        refresh_token: 'irrelevant',
+        expires_in: 3600,
+      }),
+    })
+
+    try {
+      await codexRefreshFn({
+        refreshToken: 'test-refresh',
+        fetchImpl: mockFetch as unknown as typeof fetch,
+        now: () => Date.now(),
+      })
+      expect.unreachable('should have thrown')
+    } catch (error) {
+      expect((error as Error).message.toLowerCase()).toContain('malformed')
+    }
+  })
+
   // -------------------------------------------------------------------
   // isTransientRefreshError duck-types .status
   // -------------------------------------------------------------------

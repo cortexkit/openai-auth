@@ -110,7 +110,12 @@ describe('codexRefreshFn token validation', () => {
     expect(thrown?.isRefreshError).toBe(true)
   })
 
-  it('throws structured refresh error when refresh_token is missing', async () => {
+  it('keeps the input refresh token when the response omits refresh_token', async () => {
+    // OpenAI's refresh grant rotates the refresh token single-use. An absent
+    // refresh_token on a successful exchange therefore means "keep using
+    // the current refresh token" — throwing 'malformed response' here would
+    // arm refresh backoff across every account on the first non-rotating
+    // response.
     const mockFetch = mock(async () => {
       return new Response(
         JSON.stringify({
@@ -121,21 +126,16 @@ describe('codexRefreshFn token validation', () => {
       )
     })
 
-    let thrown: ProviderHttpError | undefined
-    try {
-      await codexRefreshFn({
-        refreshToken: 'some-refresh',
-        fetchImpl: mockFetch as unknown as typeof fetch,
-        now: mockNow,
-      })
-    } catch (e) {
-      thrown = e as ProviderHttpError
-    }
+    const result = await codexRefreshFn({
+      refreshToken: 'kept-input-refresh',
+      fetchImpl: mockFetch as unknown as typeof fetch,
+      now: mockNow,
+    })
 
-    expect(thrown).toBeDefined()
-    expect(thrown?.message).toContain('malformed response')
-    expect(thrown?.status).toBe(200)
-    expect(thrown?.isRefreshError).toBe(true)
+    expect(result.access).toBe('valid-access')
+    expect(result.refresh).toBe('kept-input-refresh')
+    expect(result.expiresIn).toBe(3600)
+    expect(result.expires).toBe(mockNow() + 3600 * 1000)
   })
 
   it('throws structured refresh error when expires_in is missing or not a number', async () => {

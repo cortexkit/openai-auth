@@ -5,6 +5,7 @@ import {
   loadAccounts,
   mutateAccounts,
   type OAuthAccount,
+  readConfigRosterIds,
 } from './core/accounts'
 import {
   assertFallbackAccountIdAllowed,
@@ -141,17 +142,33 @@ async function main() {
         process.exit(1)
       }
 
-      // Structural edit: route through mutateAccounts so the deletion is written
-      // authoritatively rather than union-merged back in by saveAccounts.
-      let found = false
-      await mutateAccounts((current) => {
-        const idx = current.accounts.findIndex((a) => a.id === targetId)
-        if (idx === -1) return current
-        found = true
-        current.accounts.splice(idx, 1)
-        return current
-      })
-      if (!found) {
+      // A load-dropped entry sits in the raw config but is absent from the
+      // mutator's `current.accounts`; the mutator's splice would no-op and
+      // the load-time preservation pass would resurrect it. Pre-check the
+      // raw roster and pass `allowDrop` so the entry is gone end-to-end.
+      const configPath = getAccountStoragePath()
+      const rawRoster = await readConfigRosterIds(configPath)
+      const existedOnDisk = rawRoster ? rawRoster.has(targetId) : false
+
+      let removed = false
+      await mutateAccounts(
+        (current) => {
+          const idx = current.accounts.findIndex((a) => a.id === targetId)
+          if (idx === -1) return current
+          current.accounts.splice(idx, 1)
+          removed = true
+          return current
+        },
+        configPath,
+        existedOnDisk ? { allowDrop: [targetId] } : undefined,
+      )
+
+      // The mutator could not find the id in current.accounts because it was
+      // load-dropped; allowDrop prevented preservation, so the on-disk entry
+      // is gone — count it as a successful removal.
+      if (!removed && existedOnDisk) removed = true
+
+      if (!removed) {
         console.error(`No account with id "${targetId}".`)
         process.exit(1)
       }

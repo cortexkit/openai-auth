@@ -67,7 +67,10 @@ export const CODEX_ISSUER = 'https://auth.openai.com'
 interface TokenResponse {
   id_token: string
   access_token: string
-  refresh_token: string
+  // OpenAI's refresh grant rotates the refresh token single-use; an absent
+  // refresh_token means "keep using the current one". Treat both missing
+  // and empty-string as the same signal rather than a malformed response.
+  refresh_token?: string
   expires_in?: number
 }
 
@@ -118,8 +121,6 @@ export async function codexRefreshFn(input: {
     !tokens ||
     typeof tokens.access_token !== 'string' ||
     !tokens.access_token ||
-    typeof tokens.refresh_token !== 'string' ||
-    !tokens.refresh_token ||
     typeof tokens.expires_in !== 'number'
   ) {
     throw Object.assign(new Error('Token refresh failed: malformed response'), {
@@ -127,9 +128,15 @@ export async function codexRefreshFn(input: {
       isRefreshError: true,
     }) as ProviderHttpError
   }
+  // An omitted/empty refresh_token is not malformed: it means the server
+  // declined to rotate, and we keep the current one.
+  const rotatedRefresh =
+    typeof tokens.refresh_token === 'string' && tokens.refresh_token
+      ? tokens.refresh_token
+      : input.refreshToken
   return {
     access: tokens.access_token,
-    refresh: tokens.refresh_token,
+    refresh: rotatedRefresh,
     expires: input.now() + tokens.expires_in * 1000,
     expiresIn: tokens.expires_in,
   }
