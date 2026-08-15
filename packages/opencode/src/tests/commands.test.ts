@@ -1294,6 +1294,101 @@ describe('commands', () => {
     expect(refreshCalls.length).toBe(1)
   })
 
+  // Pins the allowDrop wiring at the command level. The mutateAccounts
+  // primitive is already unit-tested; this test drives the real
+  // openai-account remove path so a future refactor that drops allowDrop
+  // from the call site would leave a load-dropped account preserved on
+  // disk after the remove command — and this test catches it.
+  test('openai-account remove of a load-dropped account actually removes it from disk', async () => {
+    const healthy = makeAccount('healthy')
+    const broken = makeAccount('broken')
+    const qm = new QuotaManager({
+      storage: { version: 1 as const, accounts: [healthy, broken] },
+    })
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: qm,
+      loadAccounts,
+      client: makeClient(),
+    }
+
+    // Seed two oauth accounts, then strip 'broken' from the state file.
+    // On the next read the merge yields a record with no refresh,
+    // normalizeAccount rejects it, and 'broken' is load-dropped — the
+    // exact condition under which preserve would silently resurrect it
+    // without allowDrop.
+    await saveAccounts(
+      {
+        version: 1 as const,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [healthy, broken],
+      },
+      configPath,
+    )
+    const stateRaw = readFileSync(statePath, 'utf8')
+    const stateObj = JSON.parse(stateRaw)
+    delete stateObj.accounts.broken
+    writeFileSync(statePath, JSON.stringify(stateObj))
+
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'remove broken',
+      ctx,
+    )
+
+    // The response must say the account was removed (not "Not Found" —
+    // which is what the mutator's missing-in-current.accounts check would
+    // report when allowDrop is missing).
+    expect(payload.text).toContain('Removed account `broken`')
+    expect(payload.text).not.toContain('Not Found')
+
+    // And it must actually be gone from disk. This is the assertion that
+    // reddens when allowDrop is stripped from the call site.
+    const cfg = JSON.parse(readFileSync(configPath, 'utf8'))
+    expect(cfg.accounts.map((a: { id: string }) => a.id)).toEqual(['healthy'])
+  })
+
+  // An id that was never on disk (fat-finger typo) must report Not
+  // Found — lying "Removed" would silently mask the operator's typo and
+  // leave their real account untouched. The message comes from a closure
+  // flag OR'd with a pre-read saw-it: a never-existed id has neither
+  // signal, so it reports Not Found. The unrelated healthy account is NOT
+  // collateral damage.
+  test('openai-account remove of a nonexistent id reports Not Found', async () => {
+    const account = makeAccount('acct-present')
+    const qm = new QuotaManager({
+      storage: { version: 1 as const, accounts: [account] },
+    })
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: qm,
+      loadAccounts,
+      client: makeClient(),
+    }
+    await saveAccounts(
+      {
+        version: 1 as const,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [account],
+      },
+      configPath,
+    )
+
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'remove ghost-id',
+      ctx,
+    )
+    expect(payload.text).toContain('Not Found')
+    expect(payload.text).toContain('ghost-id')
+    expect(payload.text).not.toContain('Removed')
+    // The healthy account must NOT have been removed by an unrelated typo.
+    const cfg = JSON.parse(readFileSync(configPath, 'utf8'))
+    expect(cfg.accounts.map((a: { id: string }) => a.id)).toEqual([
+      'acct-present',
+    ])
+  })
+
   test('refreshSidebar called after order', async () => {
     const account = makeAccount('acct-1')
     const acct2 = makeAccount('acct-2')

@@ -67,7 +67,10 @@ export const CODEX_ISSUER = 'https://auth.openai.com'
 interface TokenResponse {
   id_token: string
   access_token: string
-  refresh_token: string
+  // OpenAI's refresh grant rotates the refresh token single-use; an absent
+  // refresh_token means "keep using the current one". Treat both missing
+  // and empty-string as the same signal rather than a malformed response.
+  refresh_token?: string
   expires_in?: number
 }
 
@@ -118,8 +121,6 @@ export async function codexRefreshFn(input: {
     !tokens ||
     typeof tokens.access_token !== 'string' ||
     !tokens.access_token ||
-    typeof tokens.refresh_token !== 'string' ||
-    !tokens.refresh_token ||
     typeof tokens.expires_in !== 'number'
   ) {
     throw Object.assign(new Error('Token refresh failed: malformed response'), {
@@ -127,9 +128,27 @@ export async function codexRefreshFn(input: {
       isRefreshError: true,
     }) as ProviderHttpError
   }
+  // A missing or empty-string refresh_token legitimately means "no rotation"
+  // (the server declined to rotate; keep the current one). A *defined* non-
+  // string value (number, boolean, null, object) is a genuinely malformed
+  // response — swallow-and-reuse here would turn a wire-shape regression
+  // into a successful refresh report.
+  if (
+    tokens.refresh_token !== undefined &&
+    typeof tokens.refresh_token !== 'string'
+  ) {
+    throw Object.assign(new Error('Token refresh failed: malformed response'), {
+      status: response.status,
+      isRefreshError: true,
+    }) as ProviderHttpError
+  }
+  const rotatedRefresh =
+    typeof tokens.refresh_token === 'string' && tokens.refresh_token
+      ? tokens.refresh_token
+      : input.refreshToken
   return {
     access: tokens.access_token,
-    refresh: tokens.refresh_token,
+    refresh: rotatedRefresh,
     expires: input.now() + tokens.expires_in * 1000,
     expiresIn: tokens.expires_in,
   }

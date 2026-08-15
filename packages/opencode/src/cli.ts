@@ -5,6 +5,7 @@ import {
   loadAccounts,
   mutateAccounts,
   type OAuthAccount,
+  readConfigRosterIds,
 } from './core/accounts'
 import {
   assertFallbackAccountIdAllowed,
@@ -141,17 +142,33 @@ async function main() {
         process.exit(1)
       }
 
-      // Structural edit: route through mutateAccounts so the deletion is written
-      // authoritatively rather than union-merged back in by saveAccounts.
-      let found = false
-      await mutateAccounts((current) => {
-        const idx = current.accounts.findIndex((a) => a.id === targetId)
-        if (idx === -1) return current
-        found = true
-        current.accounts.splice(idx, 1)
-        return current
-      })
-      if (!found) {
+      // `allowDrop` is unconditional — for a healthy entry it is a no-op,
+      // for a load-dropped entry it suppresses the preservation pass that
+      // would otherwise resurrect the raw entry. The user-facing message
+      // comes from two signals OR'd together: the mutator's splice and a
+      // pre-read of the raw roster that the mutator's current.accounts
+      // cannot see. The pre-read is purely diagnostic — a stale read can
+      // only change the message when another writer races us, and the
+      // mutator signal covers exactly that case.
+      const configPath = getAccountStoragePath()
+      const rawRoster = await readConfigRosterIds(configPath)
+      const preReadSawIt = rawRoster ? rawRoster.has(targetId) : false
+
+      let mutatorSplicedIt = false
+      await mutateAccounts(
+        (current) => {
+          const idx = current.accounts.findIndex((a) => a.id === targetId)
+          if (idx === -1) return current
+          current.accounts.splice(idx, 1)
+          mutatorSplicedIt = true
+          return current
+        },
+        configPath,
+        { allowDrop: [targetId] },
+      )
+
+      const removed = mutatorSplicedIt || preReadSawIt
+      if (!removed) {
         console.error(`No account with id "${targetId}".`)
         process.exit(1)
       }

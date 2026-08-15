@@ -64,6 +64,123 @@ describe('error contract', () => {
     }
   })
 
+  // OpenAI's refresh grant rotates the refresh token single-use. When the
+  // server returns no refresh_token (or an empty one) on a successful
+  // exchange, the caller MUST keep using the current refresh token rather
+  // than throw a malformed-response error — otherwise refresh backoff would
+  // arm across every account on the first non-rotating response.
+
+  it('reuses the input refresh token when the response omits refresh_token', async () => {
+    const mockFetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: async () => ({
+        access_token: 'rotated-access',
+        // refresh_token intentionally absent
+        expires_in: 3600,
+      }),
+    })
+
+    const result = await codexRefreshFn({
+      refreshToken: 'keep-this-refresh',
+      fetchImpl: mockFetch as unknown as typeof fetch,
+      now: () => 1_700_000_000_000,
+    })
+
+    // The refresh token in the result is the INPUT token, unchanged.
+    expect(result.refresh).toBe('keep-this-refresh')
+    expect(result.access).toBe('rotated-access')
+    expect(result.expiresIn).toBe(3600)
+  })
+
+  it('still throws when access_token is missing on a 200 response', async () => {
+    const mockFetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: async () => ({
+        // access_token intentionally absent
+        refresh_token: 'irrelevant',
+        expires_in: 3600,
+      }),
+    })
+
+    try {
+      await codexRefreshFn({
+        refreshToken: 'test-refresh',
+        fetchImpl: mockFetch as unknown as typeof fetch,
+        now: () => Date.now(),
+      })
+      expect.unreachable('should have thrown')
+    } catch (error) {
+      expect((error as Error).message.toLowerCase()).toContain('malformed')
+    }
+  })
+
+  // A missing refresh_token or an empty-string refresh_token legitimately
+  // means "no rotation" (the server declined to rotate; keep using the
+  // current one). A DEFINED non-string value — a number, null, an object,
+  // etc. — is a genuinely malformed response and must throw, not be
+  // silently swallowed as a successful refresh.
+  it.each([
+    ['number', 12345],
+    ['null', null],
+    ['object', { malformed: true }],
+    ['boolean', true],
+    ['array', ['refresh']],
+  ])(
+    'throws malformed response when refresh_token is a defined non-string (%s)',
+    async (_label, refreshValue) => {
+      const mockFetch = jest.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({
+          access_token: 'valid-access',
+          refresh_token: refreshValue,
+          expires_in: 3600,
+        }),
+      })
+
+      try {
+        await codexRefreshFn({
+          refreshToken: 'kept-input-refresh',
+          fetchImpl: mockFetch as unknown as typeof fetch,
+          now: () => Date.now(),
+        })
+        expect.unreachable('should have thrown')
+      } catch (error) {
+        const e = error as ProviderHttpError
+        expect(e.message.toLowerCase()).toContain('malformed')
+        expect(e.status).toBe(200)
+        expect(e.isRefreshError).toBe(true)
+      }
+    },
+  )
+
+  it('reuses the input refresh token when refresh_token is an empty string', async () => {
+    const mockFetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: async () => ({
+        access_token: 'rotated-access',
+        refresh_token: '',
+        expires_in: 3600,
+      }),
+    })
+
+    const result = await codexRefreshFn({
+      refreshToken: 'kept-input-refresh',
+      fetchImpl: mockFetch as unknown as typeof fetch,
+      now: () => Date.now(),
+    })
+
+    expect(result.refresh).toBe('kept-input-refresh')
+    expect(result.access).toBe('rotated-access')
+  })
+
   // -------------------------------------------------------------------
   // isTransientRefreshError duck-types .status
   // -------------------------------------------------------------------

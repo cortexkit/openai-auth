@@ -7,6 +7,7 @@ import {
   mutateAccounts,
   type OAuthAccount,
   type RoutingMode,
+  readConfigRosterIds,
 } from './core/accounts'
 import type { FallbackAccount } from './core/accounts.ts'
 import type { CacheKeepManager, CacheKeepWindow } from './core/cachekeep'
@@ -268,14 +269,38 @@ async function executeAccountCommand(
     // Structural edit: route through mutateAccounts so the deletion is written
     // authoritatively. saveAccounts union-merges latest ∪ incoming by id, which
     // would resurrect the removed account from the on-disk `latest` set.
-    let removed = false
-    const next = await mutateAccounts((current) => {
-      const idx = current.accounts.findIndex((a) => a.id === targetId)
-      if (idx === -1) return current
-      removed = true
-      current.accounts.splice(idx, 1)
-      return current
-    }, ctx.accountStoragePath)
+    //
+    // `allowDrop` is unconditional for the target id. For a healthy entry it
+    // is a no-op (the mutator splices, preservation already wouldn't fire for
+    // a loaded id). For a load-dropped entry the mutator's splice no-ops,
+    // but preservation would resurrect the raw entry — allowDrop suppresses
+    // it. Behaviour (disk state) is therefore race-free inside the lock.
+    //
+    // The user-facing message comes from two signals OR'd together:
+    //   - the mutator's splice (authoritative for healthy ids)
+    //   - a pre-read of the raw roster that the mutator's current.accounts
+    //     cannot see (load-dropped ids, which normalize rejected).
+    // The pre-read is purely diagnostic — its staleness can only change the
+    // message when another writer races us between read and lock, and the
+    // mutator signal covers exactly that case. It is NOT load-bearing for
+    // disk behaviour; that is `allowDrop`'s job now.
+    const rawRoster = await readConfigRosterIds(ctx.accountStoragePath)
+    const preReadSawIt = rawRoster ? rawRoster.has(targetId) : false
+
+    let mutatorSplicedIt = false
+    const next = await mutateAccounts(
+      (current) => {
+        const idx = current.accounts.findIndex((a) => a.id === targetId)
+        if (idx === -1) return current
+        current.accounts.splice(idx, 1)
+        mutatorSplicedIt = true
+        return current
+      },
+      ctx.accountStoragePath,
+      { allowDrop: [targetId] },
+    )
+
+    const removed = mutatorSplicedIt || preReadSawIt
 
     if (!removed) {
       return {
