@@ -1751,10 +1751,21 @@ describe('roster-drop WARN dedupes identical repeats, re-warns on set change', (
 
   // The dedup key must not allow a single id containing a comma to hash
   // to the same value as two ids whose join-string is identical. Set A
-  // = {`a,b`} and Set B = {`a`, `b`} have different ids but the same
-  // `[...droppedIds].sort().join(',')` output (`a,b`). The bug suppresses
+  // = {`<prefix>:a,b`} and Set B = {`<prefix>:a`, `b`} (where the prefix
+  // is constructed to start with a char < `b` so the sort order lines up
+  // both setups to the same joined string) have different ids but the
+  // same `[...droppedIds].sort().join(',')` output. The bug suppresses
   // the second WARN silently. Use JSON.stringify so the two sets map to
   // distinct keys and both WARN.
+  //
+  // `warnedRosterDrops` is module-level and never reset, so the dropped-id
+  // sets here are built from a unique randomUUID() prefix to keep them
+  // from colliding with any earlier test in the process. The prefix is
+  // itself load-bearing for the bug-trigger: the two setups' sort+join
+  // characters must be byte-identical, which is impossible to arrange
+  // when both setups use the same prefix-segmented ids on each side, so
+  // Setup 2's second id is left unprefixed (just `b`) and the prefix's
+  // leading character is forced below `b` in lex order.
   it('warn dedup key resists comma-collision in id strings', async () => {
     const { loadAccounts } = await import('../core/accounts.ts')
     const { flushForTest } = await import('../logger.ts')
@@ -1788,40 +1799,46 @@ describe('roster-drop WARN dedupes identical repeats, re-warns on set change', (
       writeFileSync(statePath, `${JSON.stringify(state)}\n`)
     }
 
-    // Setup 1: a single load-dropped entry with id 'a,b' (literal comma)
-    // — strip its refresh from state so normalize cannot accept it.
+    // Prefix starts with `a` so `${prefix}:a` < `b` lexicographically;
+    // that ordering is what makes Setup 2's two-id join
+    // (`${prefix}:a,b`) equal Setup 1's one-id join. randomUUID() makes
+    // the prefix unique within the process so the dedup set cannot be
+    // polluted by prior tests.
+    const prefix = `a${randomUUID().slice(0, 8)}`
+    const healthyId = `${prefix}:healthy`
+    const collapsedId = `${prefix}:a,b`
+    const split1Id = `${prefix}:a`
+    const split2Id = 'b'
+
     writeConfigAndState([
-      { id: 'h-n2-comma', refresh: 'r-hn2-comma' },
-      { id: 'a,b', refresh: 'r-abc' },
+      { id: healthyId, refresh: `r-${healthyId}` },
+      { id: collapsedId, refresh: `r-${collapsedId}` },
     ])
-    // Strip 'a,b' from state at the field level (state value is keyed by id).
     const stateRaw1 = readFileSync(statePath, 'utf8')
     const stateObj1 = JSON.parse(stateRaw1)
-    delete stateObj1.accounts['a,b']
+    delete stateObj1.accounts[collapsedId]
     writeFileSync(statePath, JSON.stringify(stateObj1))
-    await loadAccounts(cfgPath) // load 1: drops = ['a,b']
+    await loadAccounts(cfgPath) // load 1: drops = [collapsedId]
 
-    // Setup 2: write fresh config + state with two load-dropped entries
-    // 'a' and 'b' (no commas in their ids). Direct file writes avoid any
-    // saveAccounts-side append that would skew the drop set.
     writeConfigAndState([
-      { id: 'h-n2-comma', refresh: 'r-hn2-comma' },
-      { id: 'a', refresh: 'r-a' },
-      { id: 'b', refresh: 'r-b' },
+      { id: healthyId, refresh: `r-${healthyId}` },
+      { id: split1Id, refresh: `r-${split1Id}` },
+      { id: split2Id, refresh: `r-${split2Id}` },
     ])
     const stateRaw2 = readFileSync(statePath, 'utf8')
     const stateObj2 = JSON.parse(stateRaw2)
-    delete stateObj2.accounts.a
-    delete stateObj2.accounts.b
+    delete stateObj2.accounts[split1Id]
+    delete stateObj2.accounts[split2Id]
     writeFileSync(statePath, JSON.stringify(stateObj2))
-    await loadAccounts(cfgPath) // load 2: drops = ['a','b']
+    await loadAccounts(cfgPath) // load 2: drops = [split1Id, split2Id]
     await flushForTest()
 
     const logTxt = readFileSync(logFile, 'utf8')
     const warns = logTxt.match(/WARN \[accounts\]/g) ?? []
-    // Buggy join(',') dedup: 'a,b' (load 1) and 'a,b' (load 2) collide;
-    // second WARN suppressed → 1. JSON dedup: keys differ
-    // ('["a,b"]' vs '["a","b"]') → 2.
+    // Buggy join(',') dedup: `${prefix}:a,b` (load 1) and `${prefix}:a,b`
+    // (load 2, after sort) collide; second WARN suppressed → 1.
+    // JSON dedup: keys differ (`["${prefix}:a,b"]` vs
+    // `["${prefix}:a","b"]`) → 2.
     expect(warns.length).toBe(2)
   })
 })

@@ -1170,38 +1170,6 @@ function pickRawRosterEntriesForPreservation(
 }
 
 /**
- * Shared roster-preservation pipeline used by both `mutateAccounts` and
- * `saveAccounts`. Returns the raw entries that should be appended to the
- * writer's outgoing accounts list so a load-dropped entry survives the
- * write. The WARN is emitted here (dedup'd by emitRosterDropWarning) so
- * both writers stay in sync — the alternative (each writer owning its
- * own copy of the iteration logic) is drift-prone by construction: the
- * next invariant change would land on one writer only.
- *
- * Takes two distinct id sets because they answer two distinct questions;
- * collapsing them back into one (as an earlier refactor did) is wrong
- * because an id the caller is actively emitting must NOT be appended a
- * second time as a stale raw entry. A re-login path is the live example:
- * the mutator pushes a fresh entry for an id whose state entry was
- * missing, the load-time preserver sees the same id in raw config and
- * would otherwise append the stale raw entry alongside the fresh one.
- * - `loadedIds`: what normalizeStorage produced for the merged
- *   config+state — the PRE-mutator / post-normalize set. Drives the
- *   pickRawRosterEntriesForPreservation decision (an id that survived
- *   normalization is not actually load-dropped).
- * - `emittedIds`: what the writer is about to write — POST-mutator
- *   for mutateAccounts (the ids in `next.accounts`), POST-union for
- *   saveAccounts (the ids in `merged.accounts`). Drives the dedup
- *   filter on the raw entries the writer appends.
- */
-/**
- * Walks a list of mixed-shape config entries (some are normalized account
- * configs, some are raw preserved entries passed through verbatim) and
- * collects the string ids. Used for the write-debug log so the
- * diagnostic surface reflects what landed on disk rather than what the
- * mutator returned.
- */
-/**
  * Walks a list of mixed-shape config entries (some are normalized account
  * configs, some are raw preserved entries passed through verbatim) and
  * collects the string ids. Used for the write-debug log so the
@@ -1220,27 +1188,25 @@ function collectStringIds(entries: unknown): string[] {
 }
 
 /**
- * Returns the raw config entries that survived load-time rejection (i.e.
- * they exist on disk as raw entries but normalizeAccount could not accept
- * them — state entry missing, baseURL malformed, etc.) so a subsequent
- * write can carry them back to disk verbatim instead of silently erasing
- * the operator's account. The WARN is emitted here (dedup'd by
- * emitRosterDropWarning) so the load-drop signal is centralized.
+ * Returns the raw config entries that survived load-time rejection so a
+ * subsequent writer can carry them back to disk verbatim instead of
+ * silently erasing them. The WARN is emitted here (dedup'd by
+ * emitRosterDropWarning) so the load-drop signal lives in one place —
+ * the alternative (each writer owning its own iteration logic) is
+ * drift-prone by construction: the next invariant change would land
+ * on one writer only.
  *
- * `loadedIds` is the set of ids that DID survive normalization (pre-
- * mutator / post-normalize) — used by pickRawRosterEntriesForPreservation
- * to distinguish a real load-time drop from an id the writer is about
- * to refresh via re-login. Wrong `loadedIds` here turns "deliberate
- * removal" into "preservation resurrection" because both look the same
- * at the load boundary.
+ * `loadedIds` answers the load-side question: what ids survived
+ * normalization? An id in that set is not actually load-dropped and
+ * must not be preserved as a raw entry.
  *
- * The dedup against the writer's *output* (a stale raw entry must not
- * be appended alongside a fresh entry the writer just re-added) is the
- * call site's responsibility because it needs the writer's serialized
- * output (`configFromStorage(next)` for mutateAccounts, the same against
- * `merged` for saveAccounts) and a trim on BOTH sides (raw and
- * serialized ids may differ in whitespace — see collectionConfigRosterIds
- * for the matching trim on the load side).
+ * The writer-side question — is this id already being emitted in the
+ * caller's serialized output? — is the call site's responsibility. It
+ * sees its own output (`configFromStorage(next)` for mutateAccounts,
+ * `configFromStorage(merged)` for saveAccounts) and applies the dedup
+ * filter there, with `id.trim()` on both sides. The split exists
+ * because the helper has no view into the writer's specific output
+ * and the trim must match `collectConfigRosterIds` on the load side.
  */
 function buildPreservedAdditions(
   rawConfigValue: unknown,
