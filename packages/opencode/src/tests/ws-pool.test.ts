@@ -277,6 +277,41 @@ describe('createWebSocketFetch', () => {
     )
   })
 
+  test('keeps a rate-limit response.failed retryable after a lifecycle frame before output', async () => {
+    const rateLimitCalls: string[] = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(JSON.stringify({ type: 'response.created' }))
+          message(
+            JSON.stringify({
+              type: 'response.failed',
+              response: {
+                failed: { rate_limit_reached_type: 'secondary' },
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          onRateLimitReached: (window) => rateLimitCalls.push(window),
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+
+        await expect(response.text()).rejects.toBeInstanceOf(
+          ResponseStreamError,
+        )
+        expect(rateLimitCalls).toEqual(['secondary'])
+        websocketFetch.close()
+      },
+    )
+  })
+
   test('marks an admission-time usage limit with the provider reset before rejecting the stream', async () => {
     const resetAtSeconds = 1_784_958_366
     const rateLimitCalls: Array<{
@@ -427,6 +462,43 @@ describe('createWebSocketFetch', () => {
             rateLimitCalls[0]!.resetAt,
           ),
         ).toBe(61_000)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('marks a 429 after a lifecycle frame before output', async () => {
+    const rateLimitCalls: string[] = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(JSON.stringify({ type: 'response.created' }))
+          message(
+            JSON.stringify({
+              type: 'error',
+              status: 429,
+              error: {
+                type: 'rate_limit_exceeded',
+                message: 'Rate limit exceeded',
+              },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          onRateLimitReached: (window) => rateLimitCalls.push(window),
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+
+        await expect(response.text()).rejects.toMatchObject({
+          isRetryable: true,
+        })
+        expect(rateLimitCalls).toEqual(['rate_limit_exceeded'])
         websocketFetch.close()
       },
     )
@@ -1964,6 +2036,312 @@ describe('createWebSocketFetch', () => {
     )
   })
 
+  test('keeps a socket error before output retryable', async () => {
+    await withFakeWebSocket(
+      ({ error }) => ({
+        send() {
+          error('connection dropped')
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          firstEventGraceMs: 0,
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+        const error = await response.text().then(
+          () => undefined,
+          (caught) => caught,
+        )
+
+        expect(error).toBeInstanceOf(ResponseStreamError)
+        expect(error).toMatchObject({ isRetryable: true })
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('keeps a socket error after a lifecycle frame but before output retryable', async () => {
+    let failSocket: () => void = () => {
+      throw new Error('socket failure was not initialized')
+    }
+    await withFakeWebSocket(
+      ({ error, message }) => ({
+        send() {
+          message(JSON.stringify({ type: 'response.created' }))
+          failSocket = () => error('connection dropped')
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+        const reader = response.body!.getReader()
+
+        expect(new TextDecoder().decode((await reader.read()).value)).toContain(
+          'response.created',
+        )
+        failSocket()
+        const error = await reader.read().then(
+          () => undefined,
+          (caught) => caught,
+        )
+
+        expect(error).toBeInstanceOf(ResponseStreamError)
+        expect(error).toMatchObject({ isRetryable: true })
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('surfaces a socket error after output without a retryable stream marker', async () => {
+    let failSocket: () => void = () => {
+      throw new Error('socket failure was not initialized')
+    }
+    await withFakeWebSocket(
+      ({ error, message }) => ({
+        send() {
+          message(JSON.stringify({ type: 'response.output_text.delta' }))
+          failSocket = () => error('connection dropped')
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+        const reader = response.body!.getReader()
+
+        expect(new TextDecoder().decode((await reader.read()).value)).toContain(
+          'response.output_text.delta',
+        )
+        failSocket()
+        const error = await reader.read().then(
+          () => undefined,
+          (caught) => caught,
+        )
+
+        expect(error).toBeInstanceOf(Error)
+        expect(error).not.toBeInstanceOf(ResponseStreamError)
+        expect(APICallError.isInstance(error)).toBe(false)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('surfaces an early close after output without a retryable stream marker', async () => {
+    let failSocket: () => void = () => {
+      throw new Error('socket failure was not initialized')
+    }
+    await withFakeWebSocket(
+      ({ close, message }) => ({
+        send() {
+          message(JSON.stringify({ type: 'response.output_text.delta' }))
+          failSocket = () => close(1006, 'connection dropped')
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+        const reader = response.body!.getReader()
+
+        expect(new TextDecoder().decode((await reader.read()).value)).toContain(
+          'response.output_text.delta',
+        )
+        failSocket()
+        const error = await reader.read().then(
+          () => undefined,
+          (caught) => caught,
+        )
+
+        expect(error).toBeInstanceOf(Error)
+        expect(error).not.toBeInstanceOf(ResponseStreamError)
+        expect(APICallError.isInstance(error)).toBe(false)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('surfaces an idle timeout after output without a retryable stream marker', async () => {
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(JSON.stringify({ type: 'response.output_text.delta' }))
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+          idleTimeout: 1,
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+        const reader = response.body!.getReader()
+
+        expect(new TextDecoder().decode((await reader.read()).value)).toContain(
+          'response.output_text.delta',
+        )
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        const error = await reader.read().then(
+          () => undefined,
+          (caught) => caught,
+        )
+
+        expect(error).toBeInstanceOf(Error)
+        expect(error).not.toBeInstanceOf(ResponseStreamError)
+        expect(APICallError.isInstance(error)).toBe(false)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('surfaces a binary frame after output without a retryable stream marker', async () => {
+    let failSocket: () => void = () => {
+      throw new Error('socket failure was not initialized')
+    }
+    await withFakeWebSocket(
+      ({ binary, message }) => ({
+        send() {
+          message(JSON.stringify({ type: 'response.output_text.delta' }))
+          failSocket = () => binary(new Uint8Array([1]))
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+        const reader = response.body!.getReader()
+
+        expect(new TextDecoder().decode((await reader.read()).value)).toContain(
+          'response.output_text.delta',
+        )
+        failSocket()
+        const error = await reader.read().then(
+          () => undefined,
+          (caught) => caught,
+        )
+
+        expect(error).toBeInstanceOf(Error)
+        expect(error).not.toBeInstanceOf(ResponseStreamError)
+        expect(APICallError.isInstance(error)).toBe(false)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('surfaces a connection-limit callback failure after output without a retryable stream marker', async () => {
+    let failSocket: () => void = () => {
+      throw new Error('socket failure was not initialized')
+    }
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(JSON.stringify({ type: 'response.output_text.delta' }))
+          failSocket = () =>
+            message(
+              JSON.stringify({
+                type: 'error',
+                error: {
+                  code: 'websocket_connection_limit_reached',
+                  message: 'Responses websocket connection limit reached',
+                },
+              }),
+            )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+        const reader = response.body!.getReader()
+
+        expect(new TextDecoder().decode((await reader.read()).value)).toContain(
+          'response.output_text.delta',
+        )
+        failSocket()
+        const error = await reader.read().then(
+          () => undefined,
+          (caught) => caught,
+        )
+
+        expect(error).toBeInstanceOf(Error)
+        expect(error).not.toBeInstanceOf(ResponseStreamError)
+        expect(APICallError.isInstance(error)).toBe(false)
+        websocketFetch.close()
+      },
+    )
+  })
+
+  test('surfaces a wrapped 503 after output without a retryable stream marker', async () => {
+    let failSocket: () => void = () => {
+      throw new Error('socket failure was not initialized')
+    }
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(JSON.stringify({ type: 'response.output_text.delta' }))
+          failSocket = () =>
+            message(
+              JSON.stringify({
+                type: 'error',
+                status: 503,
+                error: { message: 'upstream unavailable' },
+              }),
+            )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          streamRequest({ input: [] }),
+        )
+        const reader = response.body!.getReader()
+
+        expect(new TextDecoder().decode((await reader.read()).value)).toContain(
+          'response.output_text.delta',
+        )
+        failSocket()
+        const error = await reader.read().then(
+          () => undefined,
+          (caught) => caught,
+        )
+
+        expect(error).toBeInstanceOf(Error)
+        expect(error).not.toBeInstanceOf(ResponseStreamError)
+        expect(APICallError.isInstance(error)).toBe(false)
+        websocketFetch.close()
+      },
+    )
+  })
+
   test('preserves provider header timeout abort reason so OpenCode can retry it', async () => {
     class HeaderTimeoutError extends Error {
       override readonly name = 'ProviderHeaderTimeoutError'
@@ -2006,6 +2384,8 @@ function streamRequest(body: Record<string, unknown>): RequestInit {
 
 type FakeWebSocketContext = {
   message(data: string): void
+  binary(data: Uint8Array): void
+  error(message?: string): void
   close(code?: number, reason?: string): void
 }
 
@@ -2037,6 +2417,8 @@ async function withFakeWebSocket(
       this.url = url
       this.behavior = behavior({
         message: (data) => this.emit('message', { data }),
+        binary: (data) => this.emit('message', { data }),
+        error: (message = '') => this.emit('error', { message }),
         close: (code = 1000, reason = '') => {
           this.readyState = FakeWebSocket.CLOSED
           this.emit('close', { code, reason })
