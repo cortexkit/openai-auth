@@ -1,5 +1,6 @@
+import { realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 
 /**
  * Where the account store lives.
@@ -37,13 +38,66 @@ export function getAccountStoragePath() {
 
 /** Derive the state-file path from the config path without reading env vars. */
 export function deriveStatePath(configPath: string): string {
-  return configPath.endsWith(ACCOUNT_FILE_NAME)
+  return basename(configPath) === ACCOUNT_FILE_NAME
     ? join(dirname(configPath), ACCOUNT_STATE_FILE_NAME)
     : `${configPath}.state.json`
 }
 
+function normalizePathForComparison(path: string, platform: NodeJS.Platform) {
+  const resolved = resolve(path)
+  return platform === 'win32' || platform === 'darwin'
+    ? resolved.toLowerCase()
+    : resolved
+}
+
+function realpathForComparison(path: string): string | undefined {
+  try {
+    return realpathSync.native(path)
+  } catch {
+    try {
+      return join(realpathSync.native(dirname(path)), basename(path))
+    } catch {
+      return undefined
+    }
+  }
+}
+
+/**
+ * Detect path aliases without requiring either file to exist. This is defense
+ * in depth: hardlinks and bind mounts can still make distinct paths share a
+ * file, because neither is distinguishable through pathname identity.
+ */
+export function accountPathsCollide(
+  configPath: string,
+  statePath: string,
+  platform: NodeJS.Platform = process.platform,
+) {
+  if (
+    normalizePathForComparison(configPath, platform) ===
+    normalizePathForComparison(statePath, platform)
+  ) {
+    return true
+  }
+
+  const configIdentity = realpathForComparison(configPath)
+  const stateIdentity = realpathForComparison(statePath)
+  return (
+    configIdentity !== undefined &&
+    stateIdentity !== undefined &&
+    normalizePathForComparison(configIdentity, platform) ===
+      normalizePathForComparison(stateIdentity, platform)
+  )
+}
+
 export function getAccountStatePath(configPath = getAccountStoragePath()) {
   const explicit = process.env.OPENCODE_OPENAI_AUTH_STATE_FILE?.trim()
-  if (explicit) return explicit
+  if (explicit) {
+    if (accountPathsCollide(configPath, explicit)) {
+      throw new Error(
+        `OPENCODE_OPENAI_AUTH_STATE_FILE resolves to the config path (${resolve(configPath)}). Set OPENCODE_OPENAI_AUTH_STATE_FILE to a different file.`,
+      )
+    }
+    return explicit
+  }
   return deriveStatePath(configPath)
 }
