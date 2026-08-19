@@ -62,7 +62,7 @@
     "@opencode-ai/plugin": "*"
   },
   "dependencies": {
-    "@opentui/core": ">=0.5.1",
+    "@opentui/core": ">=0.5.3",
     "@opentui/solid": ">=0.5.1",
     "ai": "^7.0.48",
     "jsonc-parser": "^3.3.1",
