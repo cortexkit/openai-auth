@@ -279,6 +279,7 @@ export function streamResponsesWebSocket(
   let cleanupSocket = () => {}
   let completed = false
   let emitted = false
+  let emittedOutput = false
   let idleTimer: ReturnType<typeof setTimeout> | undefined
   // Call ids the response finalizes (one response.output_item.done per item).
   // Only these are guaranteed present in the response previous_response_id will
@@ -302,10 +303,36 @@ export function streamResponsesWebSocket(
   }
 
   function invalidate(error: ResponseStreamError) {
+    fail(error, error)
+  }
+
+  // Gated on generated output rather than user-visible text: a
+  // `response.output_item.done` carrying a function_call produces no text at
+  // all, yet it is exactly the point after which a replay would re-run a
+  // side-effecting tool and bill for it twice. Duplicate text is the cheap
+  // half of the hazard; a re-dispatched tool call is the expensive one.
+  //
+  // What that conservatism costs: a transport failure in the window after the
+  // first output item but before anything the user would notice now ends the
+  // turn instead of rerouting. We give up a reroute rather than risk a double
+  // charge. Narrowing this further needs a dispatch-based discriminator (has
+  // OpenCode acted on the frame yet?), not a visibility-based one.
+  function invalidateTransport(error: ResponseStreamError) {
+    if (emittedOutput) {
+      fail(
+        new Error(error.message, { cause: error }),
+        new ResponseStreamError(error.message, { cause: error }),
+      )
+      return
+    }
+    invalidate(error)
+  }
+
+  function fail(error: Error, connectionError: ResponseStreamError) {
     if (completed) return
     completed = true
     cleanup()
-    options.onConnectionInvalid?.(error)
+    options.onConnectionInvalid?.(connectionError)
     controller?.error(error)
   }
 
@@ -314,7 +341,7 @@ export function streamResponsesWebSocket(
     if (!options.idleTimeout) return
     if (idleTimer) clearTimeout(idleTimer)
     idleTimer = setTimeout(
-      () => invalidate(new ResponseStreamError(message)),
+      () => invalidateTransport(new ResponseStreamError(message)),
       options.idleTimeout,
     )
   }
@@ -322,7 +349,9 @@ export function streamResponsesWebSocket(
   async function onMessage(message: MessageEvent) {
     if (completed) return
     if (typeof message.data !== 'string') {
-      invalidate(new ResponseStreamError('Unexpected binary WebSocket frame'))
+      invalidateTransport(
+        new ResponseStreamError('Unexpected binary WebSocket frame'),
+      )
       return
     }
 
@@ -350,7 +379,7 @@ export function streamResponsesWebSocket(
       return
     }
 
-    const admissionRateLimit = !emitted
+    const admissionRateLimit = !emittedOutput
       ? parseRateLimitSignal(event)
       : undefined
     if (admissionRateLimit && event) {
@@ -385,7 +414,7 @@ export function streamResponsesWebSocket(
           return
         }
       } catch (error) {
-        invalidate(
+        invalidateTransport(
           new ResponseStreamError(
             error instanceof Error ? error.message : String(error),
             {
@@ -403,15 +432,16 @@ export function streamResponsesWebSocket(
       completed = true
       cleanup()
       options.onTerminal?.(event)
+      const error = new APICallError({
+        message: wrappedError.message,
+        url: socket.url,
+        requestBodyValues: options.body,
+        statusCode: wrappedError.status,
+        responseHeaders: wrappedError.headers,
+        responseBody: wrappedError.body,
+      })
       controller?.error(
-        new APICallError({
-          message: wrappedError.message,
-          url: socket.url,
-          requestBodyValues: options.body,
-          statusCode: wrappedError.status,
-          responseHeaders: wrappedError.headers,
-          responseBody: wrappedError.body,
-        }),
+        emittedOutput ? new Error(error.message, { cause: error }) : error,
       )
       return
     }
@@ -454,7 +484,7 @@ export function streamResponsesWebSocket(
         // to THIS connection via the captured callback.
         options.onRateLimitReached?.(label)
         options.onTerminal?.(event)
-        if (!emitted) {
+        if (!emittedOutput) {
           // Nothing was streamed yet (rate limit at admission, the common
           // case): force a retryable stream error so OpenCode re-issues and the
           // fetch override reroutes to a healthy account THIS turn.
@@ -504,6 +534,12 @@ export function streamResponsesWebSocket(
       ),
     )
     emitted = true
+    if (
+      translatedEvent.type !== 'response.created' &&
+      translatedEvent.type !== 'response.in_progress'
+    ) {
+      emittedOutput = true
+    }
     resetIdleTimeout('idle timeout waiting for websocket')
 
     if (!translatedEvent) return
@@ -538,12 +574,14 @@ export function streamResponsesWebSocket(
   }
 
   function onError(error: Event) {
-    invalidate(new ResponseStreamError(errorMessage(error), { cause: error }))
+    invalidateTransport(
+      new ResponseStreamError(errorMessage(error), { cause: error }),
+    )
   }
 
   function onClose(event: CloseEvent) {
     if (completed) return
-    invalidate(
+    invalidateTransport(
       new ResponseStreamError(
         closeMessage(
           'WebSocket closed before response.completed',
