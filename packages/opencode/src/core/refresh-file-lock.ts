@@ -27,7 +27,14 @@ export async function acquireRefreshFileLock(options: {
       | 'stale-marker-stat'
       | 'stale-marker-claimed'
       | 'stale-lock-confirmed'
-      | 'eviction-marker-acquired',
+      | 'eviction-marker-acquired'
+      | 'renewal-owner-confirmed'
+      | 'renewal-marker-unavailable'
+      | 'renewal-write-fenced'
+      | 'renewal-write-ready'
+      | 'relinquish-read'
+      | 'renewal-finished'
+      | 'release-owner-confirmed',
   ) => void | Promise<void>
 }): Promise<{ release: () => Promise<void> } | null> {
   const accountPath = options.path ?? getAccountStoragePath()
@@ -37,6 +44,18 @@ export async function acquireRefreshFileLock(options: {
   const now = options.now ?? Date.now
   let renewTimer: ReturnType<typeof setTimeout> | null = null
   let released = false
+  let renewalInFlight: Promise<void> | null = null
+  // Fencing-token eviction: a directory-based marker (mkdir O_EXCL) serializes
+  // destructive removal and generation-sensitive owner mutations. The marker
+  // holds an owner file so ownership survives a stale-marker recovery rename:
+  // the recovering contender renames the stale directory, then must re-check
+  // ownership before acting — preventing the 3rd interleaving where a stale
+  // observer renames the FRESH marker the mkdir-winner created.
+  const evictPath = `${lockPath}.evicting`
+  const evictOwnerPath = join(evictPath, 'owner.json')
+  const evictOwnerId = randomUUID()
+  const EVICT_TTL = 5_000
+  const MAX_STEAL_ATTEMPTS = 8
 
   async function readOwner() {
     try {
@@ -87,105 +106,197 @@ export async function acquireRefreshFileLock(options: {
     }
   }
 
+  async function backoff() {
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.floor(Math.random() * 4)),
+    )
+  }
+
+  async function lockIsLive() {
+    try {
+      const currentOwner = await readOwner()
+      return Number(currentOwner?.expiresAt) > now()
+    } catch {
+      try {
+        const current = await stat(lockPath)
+        return current.mtimeMs + options.ttlMs > now()
+      } catch {
+        // Lock doesn't exist — safe to acquire.
+        return false
+      }
+    }
+  }
+
+  // Fail-closed: any read error means we do NOT own the marker.
+  async function ownsEvictionMarker() {
+    try {
+      const owner = JSON.parse(await readFile(evictOwnerPath, 'utf8'))
+      return owner?.ownerId === evictOwnerId
+    } catch {
+      return false
+    }
+  }
+
+  async function releaseEvictionMarker() {
+    if (await ownsEvictionMarker()) {
+      await rm(evictPath, { recursive: true, force: true }).catch(() => {})
+    }
+  }
+
+  async function tryAcquireEvictionMarker() {
+    await mkdir(evictPath)
+    try {
+      await writeFile(
+        evictOwnerPath,
+        `${JSON.stringify({ ownerId: evictOwnerId, createdAt: now() })}\n`,
+        { encoding: 'utf8', mode: 0o600, flag: 'wx' },
+      )
+    } catch (error) {
+      // A competing contender can rename our just-created marker directory
+      // away between the mkdir above and this write (the stale-marker steal
+      // path below does exactly that). That is a lost race, not a failure, so
+      // report it as such and let the caller back off and retry rather than
+      // failing the whole lock acquisition.
+      if (isLostMarkerRaceError(error)) return false
+      await releaseEvictionMarker()
+      throw error
+    }
+    if (options.onStep) await options.onStep('eviction-marker-acquired')
+    return true
+  }
+
+  async function recoverStaleEvictionMarker(): Promise<
+    'fresh' | 'missing' | 'recovered'
+  > {
+    let evictStat: Awaited<ReturnType<typeof stat>>
+    try {
+      evictStat = await stat(evictPath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'missing'
+      throw error
+    }
+    if (evictStat.mtimeMs + EVICT_TTL > now()) return 'fresh'
+
+    if (options.onStep) await options.onStep('stale-marker-stat')
+    const claimedPath = `${evictPath}.${randomUUID()}`
+    try {
+      await rename(evictPath, claimedPath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'missing'
+      throw error
+    }
+    if (options.onStep) await options.onStep('stale-marker-claimed')
+    await rm(claimedPath, { recursive: true, force: true }).catch(() => {})
+    return 'recovered'
+  }
+
+  async function withEvictionMarker(action: () => Promise<void>) {
+    try {
+      if (!(await tryAcquireEvictionMarker())) return false
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false
+      throw error
+    }
+
+    try {
+      await action()
+    } finally {
+      await releaseEvictionMarker()
+    }
+    return true
+  }
+
+  // Marker loss after a write may mean our record replaced a successor's.
+  // Delete only a record still owned by us; a concurrent successor write can
+  // then yield zero winners, never two.
+  async function relinquishLockAfterMarkerLoss() {
+    for (let attempt = 0; attempt < MAX_STEAL_ATTEMPTS; attempt++) {
+      if (options.onStep) await options.onStep('relinquish-read')
+      let owner: { ownerId?: string } | undefined
+      try {
+        owner = await readOwner()
+      } catch {
+        return
+      }
+      if (owner?.ownerId !== ownerId) return
+      try {
+        await rm(lockPath, { recursive: true, force: true })
+        return
+      } catch {
+        await backoff()
+      }
+    }
+  }
+
   function scheduleRenewal() {
     if (!options.renew || released) return
     const intervalMs =
       options.renewIntervalMs ?? Math.max(1_000, Math.floor(options.ttlMs / 3))
     renewTimer = setRefreshLockRenewalTimeout(() => {
-      void (async () => {
+      const renewal = (async () => {
+        let shouldReschedule = !released
         try {
-          const owner = await readOwner()
-          const currentNow = now()
-          if (
-            released ||
-            owner?.ownerId !== ownerId ||
-            Number(owner?.expiresAt) <= currentNow
-          ) {
-            return
+          const markerAcquired = await withEvictionMarker(async () => {
+            const owner = await readOwner()
+            const currentNow = now()
+            if (released || owner?.ownerId !== ownerId) {
+              shouldReschedule = false
+              return
+            }
+            // An expired lease is no longer ours to extend; a contender may
+            // already be eligible to acquire it.
+            if (Number(owner?.expiresAt) <= currentNow) {
+              shouldReschedule = false
+              return
+            }
+            if (options.onStep) await options.onStep('renewal-owner-confirmed')
+            if (released) {
+              shouldReschedule = false
+              return
+            }
+            if (!(await ownsEvictionMarker())) return
+            if (options.onStep) await options.onStep('renewal-write-fenced')
+            if (released) {
+              shouldReschedule = false
+              return
+            }
+            if (!(await ownsEvictionMarker())) return
+            if (options.onStep) await options.onStep('renewal-write-ready')
+            await writeOwner()
+            if (!(await ownsEvictionMarker())) {
+              // Marker read errors fail closed: prompt relinquish avoids ambiguity
+              // instead of waiting for TTL; both outcomes keep zero or one winner.
+              shouldReschedule = false
+              await relinquishLockAfterMarkerLoss()
+              return
+            }
+          })
+          if (!markerAcquired && options.onStep) {
+            await options.onStep('renewal-marker-unavailable')
           }
-          await writeOwner()
-          scheduleRenewal()
         } catch {
-          // If renewal fails, contenders will wait until the last written expiry.
+          // Transient marker and filesystem failures retry on the next interval.
+        } finally {
+          if (options.onStep) {
+            try {
+              await options.onStep('renewal-finished')
+            } catch {
+              // Test seams must not turn an otherwise-safe renewal into a rejection.
+            }
+          }
+          if (shouldReschedule && !released) scheduleRenewal()
         }
       })()
+      renewalInFlight = renewal
+      void renewal.finally(() => {
+        if (renewalInFlight === renewal) renewalInFlight = null
+      })
     }, intervalMs)
     if ('unref' in renewTimer) renewTimer.unref()
   }
 
   let acquired = await tryAcquire()
   if (!acquired) {
-    // Fencing-token eviction: a directory-based marker (mkdir O_EXCL) serializes
-    // destructive removal to one contender at a time. The marker holds an owner
-    // file so ownership survives a stale-marker recovery rename: the recovering
-    // contender renames the stale directory, then must re-check ownership before
-    // acting — preventing the 3rd interleaving where a stale observer renames the
-    // FRESH marker the mkdir-winner created.
-    const evictPath = `${lockPath}.evicting`
-    const evictOwnerPath = join(evictPath, 'owner.json')
-    const evictOwnerId = randomUUID()
-    const EVICT_TTL = 5_000
-    const MAX_STEAL_ATTEMPTS = 8
-
-    async function backoff() {
-      await new Promise((resolve) =>
-        setTimeout(resolve, Math.floor(Math.random() * 4)),
-      )
-    }
-
-    async function lockIsLive() {
-      try {
-        const currentOwner = await readOwner()
-        return Number(currentOwner?.expiresAt) > now()
-      } catch {
-        try {
-          const current = await stat(lockPath)
-          return current.mtimeMs + options.ttlMs > now()
-        } catch {
-          // Lock doesn't exist — safe to acquire.
-          return false
-        }
-      }
-    }
-
-    // Fail-closed: any read error means we do NOT own the marker.
-    async function ownsEvictionMarker() {
-      try {
-        const owner = JSON.parse(await readFile(evictOwnerPath, 'utf8'))
-        return owner?.ownerId === evictOwnerId
-      } catch {
-        return false
-      }
-    }
-
-    async function tryAcquireEvictionMarker() {
-      await mkdir(evictPath)
-      try {
-        await writeFile(
-          evictOwnerPath,
-          `${JSON.stringify({ ownerId: evictOwnerId, createdAt: now() })}\n`,
-          { encoding: 'utf8', mode: 0o600, flag: 'wx' },
-        )
-      } catch (error) {
-        // A competing contender can rename our just-created marker directory
-        // away between the mkdir above and this write (the stale-marker steal
-        // path below does exactly that). That is a lost race, not a failure, so
-        // report it as such and let the caller back off and retry rather than
-        // failing the whole lock acquisition.
-        if (isLostMarkerRaceError(error)) return false
-        await releaseEvictionMarker()
-        throw error
-      }
-      await options.onStep?.('eviction-marker-acquired')
-      return true
-    }
-
-    async function releaseEvictionMarker() {
-      if (await ownsEvictionMarker()) {
-        await rm(evictPath, { recursive: true, force: true }).catch(() => {})
-      }
-    }
-
     for (let attempt = 0; attempt < MAX_STEAL_ATTEMPTS; attempt++) {
       acquired = await tryAcquire()
       if (acquired) break
@@ -200,31 +311,8 @@ export async function acquireRefreshFileLock(options: {
         const code = (evictError as NodeJS.ErrnoException).code
         if (code !== 'EEXIST') throw evictError
 
-        let evictStat: Awaited<ReturnType<typeof stat>>
-        try {
-          evictStat = await stat(evictPath)
-        } catch (statError) {
-          if ((statError as NodeJS.ErrnoException).code === 'ENOENT') {
-            await backoff()
-            continue
-          }
-          throw statError
-        }
-        if (evictStat.mtimeMs + EVICT_TTL > now()) return null
-
-        await options.onStep?.('stale-marker-stat')
-        const claimedPath = `${evictPath}.${randomUUID()}`
-        try {
-          await rename(evictPath, claimedPath)
-        } catch (renameError) {
-          if ((renameError as NodeJS.ErrnoException).code === 'ENOENT') {
-            await backoff()
-            continue
-          }
-          throw renameError
-        }
-        await options.onStep?.('stale-marker-claimed')
-        await rm(claimedPath, { recursive: true, force: true }).catch(() => {})
+        const recovered = await recoverStaleEvictionMarker()
+        if (recovered === 'fresh') return null
         await backoff()
         continue
       }
@@ -234,7 +322,7 @@ export async function acquireRefreshFileLock(options: {
         // Fence check 1: verify we still own the marker before acting on the
         // stale-lock-confirmed decision.
         if (!(await ownsEvictionMarker())) return null
-        await options.onStep?.('stale-lock-confirmed')
+        if (options.onStep) await options.onStep('stale-lock-confirmed')
         // Fence check 2: re-verify ownership after the seam (another contender
         // may have renamed our fresh marker while we were paused here).
         if (!(await ownsEvictionMarker())) return null
@@ -269,13 +357,25 @@ export async function acquireRefreshFileLock(options: {
         clearRefreshLockRenewalTimeout(renewTimer)
         renewTimer = null
       }
-      try {
-        const owner = await readOwner()
-        if (owner?.ownerId !== ownerId) return
-      } catch {
-        return
+      await renewalInFlight
+      for (let attempt = 0; attempt < MAX_STEAL_ATTEMPTS; attempt++) {
+        try {
+          const markerAcquired = await withEvictionMarker(async () => {
+            const owner = await readOwner()
+            if (owner?.ownerId !== ownerId) return
+            if (options.onStep) await options.onStep('release-owner-confirmed')
+            if (!(await ownsEvictionMarker())) return
+            await rm(lockPath, { recursive: true, force: true }).catch(() => {})
+          })
+          if (markerAcquired) return
+          await recoverStaleEvictionMarker()
+        } catch {
+          return
+        }
+        await backoff()
       }
-      await rm(lockPath, { recursive: true, force: true }).catch(() => {})
+      // Do not delete by pathname without the marker: bounded retries leave the
+      // lease to expire rather than risking removal of a successor's lock.
     },
   }
 }
