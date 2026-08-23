@@ -41,24 +41,35 @@ const names = [
   ...src.matchAll(/^\s*(?:it|test)\(\s*'((?:[^'\\]|\\.)*)'/gm),
 ].map((m) => m[1].replace(/\\'/g, "'"))
 
+// bun treats -t as a regex, but test names are literal source text.
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 const failed = []
+const unscannable = []
 for (const name of names) {
-  const out = run(['test', file, '-t', name])
+  const out = run(['test', file, '-t', escapeRegExp(name)])
   const m = out.match(/(\d+)\s+pass[\s\S]*?(\d+)\s+fail/)
-  // No match means the filter selected nothing — a name this script could not
-  // round-trip, not a failure. Report those separately rather than as defects.
+  // No match leaves this test's isolation unproven, not order-dependent.
   if (!m) {
-    failed.push(`${name}  [not selected by -t]`)
+    unscannable.push(name)
     continue
   }
   if (m[2] !== '0') failed.push(name)
 }
 
 console.log(`scanned ${names.length} tests individually`)
-if (failed.length === 0) {
+if (failed.length === 0 && unscannable.length === 0) {
   console.log('all pass in isolation')
-} else {
+}
+if (failed.length > 0) {
   console.log(`ORDER-DEPENDENT (${failed.length}):`)
   for (const name of failed) console.log(`  ${name}`)
+  process.exitCode = 1
+}
+if (unscannable.length > 0) {
+  console.log(`UNSCANNABLE (${unscannable.length}):`)
+  for (const name of unscannable) console.log(`  ${name}`)
   process.exitCode = 1
 }
