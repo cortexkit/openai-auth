@@ -13,7 +13,6 @@
  * the whole file.
  */
 import { spawnSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
 
 const file = process.argv[2]
 if (!file) {
@@ -28,6 +27,16 @@ function run(args) {
   return `${result.stdout ?? ''}${result.stderr ?? ''}`
 }
 
+// Only passed tests are candidates: skipped and todo tests did not establish
+// the whole-file baseline. A literal ` > ` in a test name is ambiguous here.
+function passedNames(output) {
+  return [
+    ...output.matchAll(
+      /^\(pass\)\s+(.+?)(?:\s+\[(?:\d+(?:\.\d+)?|\.\d+)(?:ns|µs|μs|ms|s)\])?$/gm,
+    ),
+  ].map((m) => m[1].replaceAll(' > ', ' '))
+}
+
 const whole = run(['test', file])
 const wholeMatch = whole.match(/(\d+)\s+pass[\s\S]*?(\d+)\s+fail/)
 if (wholeMatch?.[2] !== '0') {
@@ -36,12 +45,10 @@ if (wholeMatch?.[2] !== '0') {
 }
 console.log(`whole file: ${wholeMatch[1]} pass, 0 fail`)
 
-const src = readFileSync(file, 'utf8')
-const names = [
-  ...src.matchAll(/^\s*(?:it|test)\(\s*'((?:[^'\\]|\\.)*)'/gm),
-].map((m) => m[1].replace(/\\'/g, "'"))
+const names = passedNames(whole)
+const wholeCount = Number(wholeMatch[1])
 
-// bun treats -t as a regex, but test names are literal source text.
+// bun treats -t as a regex, but test names are literal reporter output.
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
@@ -49,7 +56,7 @@ function escapeRegExp(value) {
 const failed = []
 const unscannable = []
 for (const name of names) {
-  const out = run(['test', file, '-t', escapeRegExp(name)])
+  const out = run(['test', file, '-t', `^${escapeRegExp(name)}$`])
   const m = out.match(/(\d+)\s+pass[\s\S]*?(\d+)\s+fail/)
   // No match leaves this test's isolation unproven, not order-dependent.
   if (!m) {
@@ -60,6 +67,11 @@ for (const name of names) {
 }
 
 console.log(`scanned ${names.length} tests individually`)
+if (names.length !== wholeCount) {
+  unscannable.push(
+    `reporter parse mismatch: extracted ${names.length}, Bun reported ${wholeCount}`,
+  )
+}
 if (failed.length === 0 && unscannable.length === 0) {
   console.log('all pass in isolation')
 }
