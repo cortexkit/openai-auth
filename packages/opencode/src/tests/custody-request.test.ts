@@ -943,10 +943,20 @@ describe('custody request resolution', () => {
         expect(runtime.getCache()?.isReauth(handle, clock)).toBe(false)
         expect(runtime.getCache()?.isBlocked(handle)).toBe(false)
         expect((await runtime.getCache()?.peek(handle))?.recordVersion).toBe(20)
+        await fetchOverride(url, init)
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(reports).toEqual([
+          { recordVersion: 17, reporterSource: 'direct' },
+          { recordVersion: 18, reporterSource: 'direct' },
+          { recordVersion: 20, reporterSource: 'direct' },
+        ])
+
+        version = 21
+        await runtime.runTick()
         vaultSucceeds = true
         expect((await fetchOverride(url, init)).status).toBe(200)
         expect(authorizations.at(-1)).toBe(
-          `Bearer ${jwtFor('acct-bound-request-cache', '20')}`,
+          `Bearer ${jwtFor('acct-bound-request-cache', '21')}`,
         )
 
         vaultSucceeds = false
@@ -956,6 +966,7 @@ describe('custody request resolution', () => {
           { recordVersion: 17, reporterSource: 'direct' },
           { recordVersion: 18, reporterSource: 'direct' },
           { recordVersion: 20, reporterSource: 'direct' },
+          { recordVersion: 21, reporterSource: 'direct' },
         ])
       },
     )
