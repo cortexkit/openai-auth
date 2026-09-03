@@ -49,6 +49,17 @@ export type FallbackAccessResolution =
   | { token: string; provenance: 'local' }
   | { token: string; provenance: VaultProvenance }
 
+export function stampVaultProvenance(
+  response: Response,
+  provenance: VaultProvenance | 'local' | undefined,
+  responseProvenance: WeakMap<Response, VaultProvenance>,
+): Response {
+  if (provenance && provenance !== 'local') {
+    responseProvenance.set(response, provenance)
+  }
+  return response
+}
+
 export function custodyTombstoneKey(provider: string): string {
   return `${CUSTODY_TOMBSTONE_PREFIX}${provider}`
 }
@@ -222,6 +233,10 @@ export function verifyServedFallbackIdentity(
 export type ResolveFallbackAccessOptions = {
   cache?: ClaustrumCredentialCache
   manifestHandle?: string
+  completeEnrollmentDeps?: CompleteEnrollmentDeps
+  refreshBeforeExpiryMs?: number
+  now?: () => number
+  requestPath?: boolean
 }
 
 export async function resolveFallbackAccess(
@@ -244,10 +259,15 @@ export async function resolveFallbackAccess(
     const handle = options.manifestHandle
     const cache = options.cache
     if (!handle || !cache) return CUSTODY_REFUSE
-    let served: ServedFallbackCredential
-    try {
-      served = await cache.get(handle, 30_000)
-    } catch {
+    let served = await cache.peek(handle)
+    if (!served && !options.requestPath) {
+      try {
+        served = await cache.get(handle, 30_000)
+      } catch {
+        return CUSTODY_REFUSE
+      }
+    }
+    if (!served || served.expiresAtMs <= (options.now ?? Date.now)()) {
       return CUSTODY_REFUSE
     }
     const check = verifyServedFallbackIdentity(served, account)
@@ -261,11 +281,45 @@ export async function resolveFallbackAccess(
     }
   }
 
-  // Live / enrolling path. The vault toggle is not consulted here — a
-  // live, non-tombstoned account always serves its local access. The
-  // enrolling state (manifest entry, no tombstone) is still "local" because
-  // enrollment means "local cache is the source of truth until the
-  // tombstone appears".
+  if (enrolling(account, manifestState, CUSTODY_OWNING_PROVIDER)) {
+    const now = (options.now ?? Date.now)()
+    const refreshBeforeExpiryMs = options.refreshBeforeExpiryMs ?? 0
+    if (
+      account.access &&
+      account.expires &&
+      account.expires - now > refreshBeforeExpiryMs
+    ) {
+      return { token: account.access, provenance: 'local' }
+    }
+    if (!options.completeEnrollmentDeps) return CUSTODY_REFUSE
+    const outcome = await completeFallbackEnrollment(
+      account,
+      options.completeEnrollmentDeps,
+    )
+    if (outcome.kind !== 'succeeded') return CUSTODY_REFUSE
+    const completedStorage = await options.completeEnrollmentDeps.loadAccounts(
+      options.completeEnrollmentDeps.configPath,
+    )
+    const completedAccount = completedStorage?.accounts.find(
+      (candidate) => candidate.id === account.id,
+    )
+    if (!completedStorage || completedAccount?.type !== 'oauth') {
+      return CUSTODY_REFUSE
+    }
+    const completedManifest =
+      await options.completeEnrollmentDeps.readCustodyManifest(
+        options.completeEnrollmentDeps.manifestPath,
+      )
+    return resolveFallbackAccess(
+      completedAccount,
+      completedStorage,
+      completedManifest,
+      {
+        ...options,
+      },
+    )
+  }
+
   if (!account.access) return CUSTODY_REFUSE
   return { token: account.access, provenance: 'local' }
 }
