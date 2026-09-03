@@ -55,7 +55,7 @@ describe('plugin-wide claustrum gate', () => {
     })
   })
 
-  it('round-trips enabled:true + manifestWrite:false (the in-task default)', async () => {
+  it('round-trips enabled:true + manifestWrite:false', async () => {
     await saveAccounts(
       {
         version: 1,

@@ -926,10 +926,6 @@ export function __createCustodyRuntimeForTest(
         })
         return
       }
-      // Race the boot warm AND the boot completion sweep against the bound.
-      // A cap miss leaves both in flight detached — the warm populates the
-      // cache, the sweep tombstones `enrolling` accounts under their refresh
-      // locks. The next tick re-reads manifest and runs both passes again.
       const manifest = await options.readCustodyManifest(manifestPath)
       latestManifest = manifest
       const enabledHandles = enabledManifestHandles(manifest, options.storage)
@@ -951,18 +947,16 @@ export function __createCustodyRuntimeForTest(
             ),
         )
       }
+      // The sweep must finish before the loader can arm background refresh;
+      // otherwise both paths can contend for an enrolling account's lock.
+      await Promise.all(sweepPromises)
+      // A cap miss leaves the warm in flight detached; the next tick picks up
+      // any cache entry that completes after the bound.
       await raceAggregateWarm(
         enabledHandles,
         cache,
         options.storage,
         CUSTODY_WARM_AWAIT_MS,
-        sweepPromises,
-      )
-      // First tick at t+0 (gate-on but cache may still be empty mid-handshake).
-      void runtime.runTick().catch((error) =>
-        log.warn('custody first tick failed', {
-          error: error instanceof Error ? error.message : String(error),
-        }),
       )
       scheduleNextTick()
     },
@@ -1965,6 +1959,13 @@ export async function CodexAuthPlugin(
           },
         })
         await custodyRuntime.boot()
+        // The loader owns the detached first tick so direct runtime callers
+        // can observe boot completion without background work racing them.
+        void custodyRuntime.runTick().catch((error) =>
+          custodyLogger.warn('custody first tick failed', {
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        )
         custodyRuntimeRef = custodyRuntime
         // Start background refresh only when fallback accounts are configured;
         // single-account paths must not create extra token refresh traffic.

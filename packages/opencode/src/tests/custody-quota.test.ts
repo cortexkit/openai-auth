@@ -552,7 +552,7 @@ describe('refresh-inert quota poll', () => {
     // enters, the resolver returns a vault-served credential, and we
     // refuse to probe at all — a vault-served probe whose 401 cannot reach
     // the vault is the silent-401 failure of issue #118 recreated under
-    // custody (spec §6.4: quota 401 on a vault-served probe MUST reach
+    // custody (a quota 401 on a vault-served probe must reach
     // the vault). The local-refresh block is bypassed.
     const warn = mock(() => {})
     const deps = makeDeps({
