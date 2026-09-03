@@ -254,9 +254,12 @@ export type AccountStorage = {
   /** Vault-custody policy toggle. Gates serving only: when true, an account
    *  that is both manifest-enrolled and tombstoned (`custodied`) serves its
    *  access token from the Claustrum vault; without the toggle the same
-   *  account is `excluded`. Does NOT participate in the refresh gate. */
+   *  account is `excluded`. Does NOT participate in the refresh gate.
+   *  `manifestWrite` arms the enroll verb's manifest write step; absent
+   *  values default to false. */
   claustrum?: {
     enabled?: boolean
+    manifestWrite?: boolean
   }
   accounts: FallbackAccount[]
 }
@@ -627,6 +630,18 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     cachekeep: isRecord(value.cachekeep) ? value.cachekeep : undefined,
     mainAccountId:
       typeof value.mainAccountId === 'string' ? value.mainAccountId : undefined,
+    // claustrum: one plugin-wide gate. No per-account map (intentional —
+    // membership is the manifest entry). Coerce only true booleans; anything
+    // else collapses to false so a typo (e.g. `"enabled": "true"`) does not
+    // silently arm the vault path. manifestWrite defaults false here; the
+    // absent-value default is flipped in a later task once the vendored lock
+    // is available. Explicit false is always an operator kill switch.
+    claustrum: isRecord(value.claustrum)
+      ? {
+          enabled: value.claustrum.enabled === true,
+          manifestWrite: value.claustrum.manifestWrite === true,
+        }
+      : undefined,
     accounts: normalizedAccounts,
   }
 }
@@ -925,6 +940,17 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     logging: storage.logging,
     cachekeep: storage.cachekeep,
     mainAccountId: storage.mainAccountId,
+    // Only the explicit booleans land on disk — false is the operator's
+    // kill switch and must survive a round-trip; an absent claustrum is
+    // omitted entirely so old files normalize byte-identical.
+    ...(storage.claustrum !== undefined
+      ? {
+          claustrum: {
+            enabled: storage.claustrum.enabled === true,
+            manifestWrite: storage.claustrum.manifestWrite === true,
+          },
+        }
+      : {}),
     accounts: storage.accounts.map(accountConfig),
   })
 }
