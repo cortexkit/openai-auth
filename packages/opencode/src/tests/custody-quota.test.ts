@@ -346,10 +346,19 @@ describe('refresh-inert quota poll', () => {
 
     const results = await refreshAllQuota(deps, { accountKey: 'fb-1' })
 
-    expect(results.find((result) => result.account === 'fb-1')).toMatchObject({
-      ok: false,
-    })
-    expect(logger.warn).toHaveBeenCalled()
+    expect(results).toEqual([
+      {
+        account: 'fb-1',
+        ok: false,
+        error: 'wham usage check failed: 401',
+      },
+    ])
+    const warnMessages = logger.warn.mock.calls as unknown as Array<
+      [string, unknown?]
+    >
+    expect(warnMessages.map(([message]) => message)).toContain(
+      'custody auth-failure report failed',
+    )
   })
 
   it('enrolling account + live local token → wham uses local, zero local refresh, a 401 is neither reported nor force-refreshed', async () => {
