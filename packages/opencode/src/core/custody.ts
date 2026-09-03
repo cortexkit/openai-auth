@@ -344,6 +344,43 @@ export class ClaustrumCredentialCache {
   }
 
   /**
+   * Public read-only view of a peek result. Exposes only the version and
+   * expiry — never the credential material — so a projection layer can
+   * surface a vault `recordVersion` without ever seeing a token.
+   */
+  async peekMetadata(
+    handle: string,
+  ): Promise<{ recordVersion: number; expiresAtMs: number } | undefined> {
+    const record = this.#resident.get(handle)
+    if (!record) return undefined
+    return {
+      recordVersion: record.recordVersion,
+      expiresAtMs: record.expiresAtMs,
+    }
+  }
+
+  /**
+   * True iff a recent auth failure on this handle has been reported to the
+   * daemon. The blocked set is informational; the resolver still attempts a
+   * fetch on `get`, which clears the flag on success.
+   */
+  isBlocked(handle: string): boolean {
+    return this.#blocked.has(handle)
+  }
+
+  /**
+   * True iff the bound-and-reauth fence has fired for this handle and the
+   * reauth window has not yet elapsed. Callers that project "needs reauth"
+   * UI should gate on this; the resolver still attempts a `get`, which
+   * clears the fence on a successful fetch.
+   */
+  isReauth(handle: string, now: number = this.#now()): boolean {
+    const until = this.#reauth.get(handle)
+    if (until === undefined) return false
+    return until > now
+  }
+
+  /**
    * Get the live resident record. If a live record exists and the caller
    * did not pass `force:true`, it returns immediately (no daemon I/O).
    * Otherwise it issues a single-flight `getCredential` call.
@@ -510,6 +547,51 @@ export class ClaustrumCredentialCache {
     this.#reportBound.clear()
     void this.#transport.then((client) => client.close()).catch(() => {})
   }
+}
+
+// ---------------------------------------------------------------------------
+// Enroll-pending store (process-local; sweep is the writer)
+// ---------------------------------------------------------------------------
+
+export type EnrollPendingReason =
+  | 'unavailable'
+  | 'gone'
+  | 'identityMismatch'
+  | 'nullClaim'
+
+const enrollPending = new Map<string, EnrollPendingReason>()
+
+/**
+ * Latch the first failure reason for an account. Subsequent marks do NOT
+ * overwrite — the operator should see the original cause until the sweep
+ * either clears the entry (on a successful completion) or restarts the
+ * process (the store is module-local and dies on restart).
+ */
+export function markEnrollPending(
+  accountId: string,
+  reason: EnrollPendingReason,
+): void {
+  if (enrollPending.has(accountId)) return
+  enrollPending.set(accountId, reason)
+}
+
+export function clearEnrollPending(accountId: string): void {
+  enrollPending.delete(accountId)
+}
+
+export function enrollPendingReason(
+  accountId: string,
+): EnrollPendingReason | undefined {
+  return enrollPending.get(accountId)
+}
+
+/**
+ * Wipe the store. Test-only; production code must use mark/clear. The double
+ * underscore marks it as not part of the public surface — a future sweep
+ * writer is the only legitimate caller in production.
+ */
+export function __resetEnrollPendingForTest(): void {
+  enrollPending.clear()
 }
 
 // ---------------------------------------------------------------------------

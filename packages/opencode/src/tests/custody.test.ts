@@ -20,15 +20,19 @@ import {
   saveAccounts,
 } from '../core/accounts.ts'
 import {
+  __resetEnrollPendingForTest,
   ClaustrumCredentialCache,
   CUSTODY_EXCLUDED,
   CUSTODY_REFUSE,
   CUSTODY_TOMBSTONE_PREFIX,
+  clearEnrollPending,
   custodied,
   custodyTombstoneKey,
   enrolled,
   enrolling,
+  enrollPendingReason,
   excluded,
+  markEnrollPending,
   refreshInert,
   resolveFallbackAccess,
   tombstoned,
@@ -1072,5 +1076,151 @@ describe('setup-env preload guard', () => {
     expect(() =>
       assertFloor('CLAUSTRUM_OPENCODE_HANDLES', 'relative/handles.json'),
     ).toThrow(/not absolute/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Enroll-pending store — process-local, latch semantics, sweep is the writer.
+// ---------------------------------------------------------------------------
+
+describe('enroll-pending store', () => {
+  afterEach(() => {
+    __resetEnrollPendingForTest()
+  })
+
+  it('returns undefined for an account with no recorded failure', () => {
+    expect(enrollPendingReason('unknown')).toBeUndefined()
+  })
+
+  it('latches the first reason and ignores later marks for the same account', () => {
+    markEnrollPending('acct-a', 'unavailable')
+    markEnrollPending('acct-a', 'identityMismatch')
+    markEnrollPending('acct-a', 'gone')
+    expect(enrollPendingReason('acct-a')).toBe('unavailable')
+  })
+
+  it('keeps the per-account reasons independent', () => {
+    markEnrollPending('acct-a', 'unavailable')
+    markEnrollPending('acct-b', 'identityMismatch')
+    expect(enrollPendingReason('acct-a')).toBe('unavailable')
+    expect(enrollPendingReason('acct-b')).toBe('identityMismatch')
+  })
+
+  it('clears a previously latched reason', () => {
+    markEnrollPending('acct-a', 'nullClaim')
+    expect(enrollPendingReason('acct-a')).toBe('nullClaim')
+    clearEnrollPending('acct-a')
+    expect(enrollPendingReason('acct-a')).toBeUndefined()
+  })
+
+  it('clears everything on a test reset', () => {
+    markEnrollPending('acct-a', 'gone')
+    markEnrollPending('acct-b', 'unavailable')
+    __resetEnrollPendingForTest()
+    expect(enrollPendingReason('acct-a')).toBeUndefined()
+    expect(enrollPendingReason('acct-b')).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Cache read accessors — projection-only, no behaviour change.
+// ---------------------------------------------------------------------------
+
+describe('cache read accessors', () => {
+  it('isBlocked is false on a fresh handle and stays false after a successful get', async () => {
+    const cache = new ClaustrumCredentialCache({
+      connector: async () => makeFakeClient() as never,
+    })
+    const handle = `ckh_${'b'.repeat(43)}`
+    expect(cache.isBlocked(handle)).toBe(false)
+    await cache.get(handle, 30_000)
+    expect(cache.isBlocked(handle)).toBe(false)
+    cache.close()
+  })
+
+  it('isBlocked is true after reportAuthFailure and false after a successful get clears it', async () => {
+    let nextVersion = 1
+    const fake = makeFakeClient({
+      getCredential: async () => ({
+        material: 'acc-live',
+        recordVersion: nextVersion,
+        expiresAtMs: Date.now() + 60_000,
+      }),
+    })
+    const cache = new ClaustrumCredentialCache({
+      connector: async () => fake as never,
+    })
+    const handle = `ckh_${'c'.repeat(43)}`
+    await cache.get(handle, 30_000)
+    await cache.reportAuthFailure({
+      handle,
+      providerStatus: 401,
+      recordVersion: 1,
+    })
+    expect(cache.isBlocked(handle)).toBe(true)
+    // The next get must observe a higher version so the rejected-version
+    // fence does not stall the fetch (cache invariant: rejected versions stay
+    // rejected until a higher version arrives).
+    nextVersion = 2
+    await cache.get(handle, 30_000)
+    expect(cache.isBlocked(handle)).toBe(false)
+    cache.close()
+  })
+
+  it('isReauth is false when no reauth-until has been recorded', () => {
+    const cache = new ClaustrumCredentialCache({
+      connector: async () => makeFakeClient() as never,
+    })
+    expect(cache.isReauth('any-handle')).toBe(false)
+    cache.close()
+  })
+
+  it('isReauth is true inside the reauth window and false after it elapses', async () => {
+    const now = 1_000_000
+    const fake = makeFakeClient()
+    const cache = new ClaustrumCredentialCache({
+      connector: async () => fake as never,
+      now: () => now,
+    })
+    const handle = `ckh_${'r'.repeat(43)}`
+    await cache.get(handle, 30_000)
+    // Two reports on the same version trip the reauth bound.
+    await cache.reportAuthFailure({
+      handle,
+      providerStatus: 401,
+      recordVersion: 1,
+    })
+    // The second report sees a new recordVersion so it is not dropped by the
+    // monotonic per-handle fence.
+    await cache.reportAuthFailure({
+      handle,
+      providerStatus: 401,
+      recordVersion: 2,
+    })
+    expect(cache.isReauth(handle, now)).toBe(true)
+    // One hour past the reauth deadline: no longer in reauth.
+    expect(cache.isReauth(handle, now + 60 * 60 * 1000 + 1)).toBe(false)
+    cache.close()
+  })
+
+  it('peekMetadata exposes version and expiry but never the credential material', async () => {
+    const fake = makeFakeClient({
+      getCredential: async () => ({
+        material: 'acc-secret',
+        recordVersion: 42,
+        expiresAtMs: 1_700_000_000_000,
+      }),
+    })
+    const cache = new ClaustrumCredentialCache({
+      connector: async () => fake as never,
+    })
+    const handle = `ckh_${'m'.repeat(43)}`
+    await cache.get(handle, 30_000)
+    const meta = await cache.peekMetadata(handle)
+    expect(meta).toEqual({ recordVersion: 42, expiresAtMs: 1_700_000_000_000 })
+    // No `material`, no `payload`, no token material on the metadata surface.
+    expect((meta as { material?: unknown }).material).toBeUndefined()
+    expect((meta as { payload?: unknown }).payload).toBeUndefined()
+    cache.close()
   })
 })
