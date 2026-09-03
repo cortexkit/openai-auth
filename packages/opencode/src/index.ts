@@ -442,8 +442,14 @@ interface CodexAuthPluginOptions {
   experimentalWebSockets?: boolean
   responsesLite?: boolean
   custody?: {
+    /** Test seam: the transport backing the loader-owned runtime. */
     transport: ClaustrumCacheTransportLike
+    /** Test seam: override the connection-file detection result. */
     detection?: 'available' | 'absent'
+    /** Test seam: observes the loader-owned runtime for explicit ticks. */
+    onRuntime?: (runtime: CustodyRuntime) => void
+    /** Test seam: controls the runtime clock for expiry-bound scenarios. */
+    now?: () => number
   }
 }
 
@@ -1033,6 +1039,7 @@ export function __createCustodyRuntimeForTest(
   ): Promise<void> {
     if (!cache) return
     for (const [accountId, handle] of enabledHandles) {
+      if (cache.isReauth(handle, now())) continue
       const storage = await options.loadAccounts(options.configPath)
       const account = storage?.accounts.find((a) => a.id === accountId)
       if (account?.type !== 'oauth') continue
@@ -1957,7 +1964,9 @@ export async function CodexAuthPlugin(
             error: (msg, meta) =>
               custodyLogger.error(msg, meta ?? {}) as unknown as undefined,
           },
+          now: custodyOptions?.now,
         })
+        custodyOptions?.onRuntime?.(custodyRuntime)
         await custodyRuntime.boot()
         // The loader owns the detached first tick so direct runtime callers
         // can observe boot completion without background work racing them.
@@ -2005,6 +2014,7 @@ export async function CodexAuthPlugin(
             cache,
             manifestHandle: handle,
             requestPath: true,
+            now: custodyOptions?.now ?? Date.now,
             refreshBeforeExpiryMs:
               (currentStorage.refresh?.refreshBeforeExpiryMinutes ?? 240) *
               60_000,
@@ -2703,12 +2713,18 @@ export async function CodexAuthPlugin(
           const provenance = responseVaultProvenance.get(response)
           if (
             !provenance ||
-            response.status !== 401 ||
             url.hostname !== 'chatgpt.com' ||
             !url.pathname.startsWith('/backend-api/codex/')
           ) {
             return
           }
+          if (response.status >= 200 && response.status < 300) {
+            custodyRuntimeForDeps
+              .getCache()
+              ?.markVaultSuccess(provenance.handle)
+            return
+          }
+          if (response.status !== 401) return
           void reportAuthFailureForCustody({
             handle: provenance.handle,
             providerStatus: response.status,
