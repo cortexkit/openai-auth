@@ -18,8 +18,10 @@ import {
   __resetBootQuotaSeedForTest,
   type ClaustrumCacheTransportLike,
   CodexAuthPlugin,
+  type CustodyRuntime,
   createResetTargetResolver,
 } from '../index.ts'
+import { hashSidebarSessionId } from '../sidebar-state.ts'
 import {
   enrollmentManifest,
   liveAccount,
@@ -34,9 +36,12 @@ import {
   FLOOR_STATE_FILE,
 } from './setup-env.ts'
 
-function jwtFor(accountId: string): string {
+function jwtFor(accountId: string, tag?: string): string {
   const payload = Buffer.from(
-    JSON.stringify({ chatgpt_account_id: accountId }),
+    JSON.stringify({
+      chatgpt_account_id: accountId,
+      ...(tag ? { tag } : {}),
+    }),
   ).toString('base64url')
   return `header.${payload}.signature`
 }
@@ -60,6 +65,8 @@ async function withCustodyLoader(
     routing?: { mode: 'main-first' | 'fallback-first' | 'sticky-balanced' }
     claustrumEnabled?: boolean
     credential?: { material: string; recordVersion: number } | undefined
+    credentialForGet?: () => { material: string; recordVersion: number }
+    now?: () => number
     sidebar?: Record<string, unknown>
     respond: (authorization: string, url: string) => number
   },
@@ -68,6 +75,7 @@ async function withCustodyLoader(
     authorizations: string[]
     reports: Array<{ recordVersion: number; reporterSource: string }>
     gets: () => number
+    runtime: CustodyRuntime
     cacheKeepManager: {
       track: CacheKeepManager['track']
       tick: CacheKeepManager['tick']
@@ -83,6 +91,7 @@ async function withCustodyLoader(
   const authorizations: string[] = []
   const reports: Array<{ recordVersion: number; reporterSource: string }> = []
   let gets = 0
+  let runtime: CustodyRuntime | undefined
   process.env.OPENCODE_OPENAI_AUTH_FILE = configPath
   process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = join(directory, 'state.json')
   process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = join(
@@ -121,10 +130,11 @@ async function withCustodyLoader(
   const transport: ClaustrumCacheTransportLike = {
     async getCredential() {
       gets++
-      if (!options.credential) throw new Error('vault unavailable')
+      const credential = options.credentialForGet?.() ?? options.credential
+      if (!credential) throw new Error('vault unavailable')
       return {
-        ...options.credential,
-        expiresAtMs: Date.now() + 60_000,
+        ...credential,
+        expiresAtMs: (options.now ?? Date.now)() + 60_000,
       }
     },
     async statusCredential() {
@@ -153,7 +163,16 @@ async function withCustodyLoader(
       serverUrl: new URL('http://localhost:0'),
       $: {},
     } as never,
-    { custody: { transport, detection: 'available' } },
+    {
+      custody: {
+        transport,
+        detection: 'available',
+        now: options.now,
+        onRuntime: (value) => {
+          runtime = value
+        },
+      },
+    },
   )
   try {
     const loader = hooks.auth?.loader
@@ -175,11 +194,13 @@ async function withCustodyLoader(
       }
     ).__openaiAuthCacheKeepManager
     if (!cacheKeepManager) throw new Error('expected cachekeep manager')
+    if (!runtime) throw new Error('expected custody runtime')
     await run({
       fetchOverride,
       authorizations,
       reports,
       gets: () => gets,
+      runtime,
       cacheKeepManager,
     })
   } finally {
@@ -649,6 +670,293 @@ describe('custody request resolution', () => {
         target.cacheExpiresAt = Date.now()
         await cacheKeepManager.tick()
         expect(authorizations).toContain(`Bearer ${vaultAccess}`)
+      },
+    )
+  })
+
+  it('reports a vault 401 from the sticky replacement send', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'custody-sticky-replacement-'))
+    const configPath = join(directory, 'openai-auth.json')
+    const manifestPath = join(directory, 'handles.json')
+    const sidebarPath = join(directory, 'sidebar.json')
+    const sessionId = 'sticky-replacement-session'
+    const checkedAt = Date.now() + 5 * 60_000
+    const local = liveAccount('sticky-local', {
+      accountId: 'acct-sticky-local',
+      enabled: true,
+    })
+    const vault = makeSentinelAccount({
+      id: 'sticky-vault',
+      accountId: 'acct-sticky-vault',
+      enabled: true,
+    })
+    const manifest = enrollmentManifest(vault.id)
+    if (!manifest.ok) throw new Error('expected manifest fixture')
+    const vaultAccess = jwtFor('acct-sticky-vault')
+    const authorizations: string[] = []
+    const reports: Array<{ recordVersion: number; reporterSource: string }> = []
+    const originalFetch = globalThis.fetch
+    process.env.OPENCODE_OPENAI_AUTH_FILE = configPath
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = join(directory, 'state.json')
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = sidebarPath
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = join(directory, 'test.log')
+    process.env.OPENCODE_CONFIG_DIR = directory
+    process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [local, vault],
+        claustrum: { enabled: true },
+        routing: { mode: 'sticky-balanced' },
+      }),
+    )
+    writeFileSync(manifestPath, JSON.stringify(manifest.value))
+    chmodSync(manifestPath, 0o600)
+    writeFileSync(
+      sidebarPath,
+      JSON.stringify({
+        main: {
+          quota: {
+            primary: { remainingPercent: 20, checkedAt },
+          },
+          mainAccountId: 'acc-main',
+        },
+        fallbacks: [
+          {
+            id: local.id,
+            accountId: local.accountId,
+            enabled: true,
+            quota: { primary: { remainingPercent: 90, checkedAt } },
+          },
+          {
+            id: vault.id,
+            accountId: vault.accountId,
+            enabled: true,
+            quota: { primary: { remainingPercent: 100, checkedAt } },
+          },
+        ],
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId: local.id,
+            assignedAt: Date.now(),
+            lastSeenAt: Date.now(),
+            inputBytes: 1,
+          },
+        },
+      }),
+    )
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const urlText = String(url)
+      if (urlText.includes('wham')) {
+        return new Response('{}', { status: 500 })
+      }
+      if (urlText.endsWith('/responses')) {
+        authorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+      }
+      return new Response('{}', { status: 401 })
+    }) as typeof globalThis.fetch
+    const transport: ClaustrumCacheTransportLike = {
+      async getCredential() {
+        return {
+          material: vaultAccess,
+          recordVersion: 71,
+          expiresAtMs: Date.now() + 60_000,
+        }
+      },
+      async statusCredential() {
+        return {
+          ready: true,
+          lastErrorCode: null,
+          leaseHeld: false,
+          recordVersion: 71,
+        }
+      },
+      async reportAuthFailure(params) {
+        reports.push({
+          recordVersion: params.recordVersion,
+          reporterSource: params.reporterSource,
+        })
+      },
+      close() {},
+    }
+    const hooks = await CodexAuthPlugin(
+      {
+        client: { auth: { set: async () => {} } },
+        project: { id: 'test', name: 'test' },
+        directory: '',
+        worktree: directory,
+        experimental_workspace: { register: () => {} },
+        serverUrl: new URL('http://localhost:0'),
+        $: {},
+      } as never,
+      { custody: { transport, detection: 'available' } },
+    )
+    try {
+      const loader = hooks.auth?.loader
+      if (!loader) throw new Error('expected auth loader')
+      const result = await loader(
+        async () => ({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 3_600_000,
+        }),
+        {} as never,
+      )
+      const fetchOverride = (result as { fetch?: typeof globalThis.fetch })
+        .fetch
+      if (!fetchOverride) throw new Error('expected fetch override')
+      const response = await fetchOverride(
+        'https://chatgpt.com/backend-api/codex/responses',
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'session-id': sessionId,
+          },
+          body: JSON.stringify({ model: 'gpt-5.5', input: [] }),
+        },
+      )
+      expect(response.status).toBe(401)
+      expect(authorizations).toEqual([
+        `Bearer ${local.access}`,
+        `Bearer ${vaultAccess}`,
+      ])
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(reports).toEqual([{ recordVersion: 71, reporterSource: 'direct' }])
+    } finally {
+      await hooks.dispose?.()
+      globalThis.fetch = originalFetch
+      process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+      process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+        FLOOR_SIDEBAR_STATE_FILE
+      process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+      process.env.CLAUSTRUM_OPENCODE_HANDLES = FLOOR_CLAUSTRUM_HANDLES
+      delete process.env.OPENCODE_CONFIG_DIR
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('refuses a reported vault credential until a tick refills the request cache', async () => {
+    const fallback = makeSentinelAccount({
+      id: 'invalidate-request-cache',
+      accountId: 'acct-invalidate-request-cache',
+    })
+    const vault17 = jwtFor('acct-invalidate-request-cache')
+    const vault18 = jwtFor('acct-invalidate-request-cache', 'v18')
+    let credential = { material: vault17, recordVersion: 17 }
+    await withCustodyLoader(
+      {
+        accounts: [fallback],
+        routing: { mode: 'fallback-first' },
+        credentialForGet: () => credential,
+        respond: (authorization, url) =>
+          url.endsWith('/responses') && authorization !== 'Bearer main-access'
+            ? 401
+            : 200,
+      },
+      async ({ fetchOverride, authorizations, reports, runtime }) => {
+        const [url, init] = codexRequest()
+        expect((await fetchOverride(url, init)).status).toBe(200)
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(reports).toEqual([
+          { recordVersion: 17, reporterSource: 'direct' },
+        ])
+
+        const afterRejected = authorizations.length
+        expect((await fetchOverride(url, init)).status).toBe(200)
+        expect(authorizations.slice(afterRejected)).toEqual([
+          'Bearer main-access',
+        ])
+
+        credential = { material: vault18, recordVersion: 18 }
+        await runtime.runTick()
+        expect((await fetchOverride(url, init)).status).toBe(200)
+        expect(authorizations).toContain(`Bearer ${vault18}`)
+      },
+    )
+  })
+
+  it('bounds repeated vault 401 reports until a later vault success resets the handle', async () => {
+    const fallback = makeSentinelAccount({
+      id: 'bound-request-cache',
+      accountId: 'acct-bound-request-cache',
+    })
+    const manifest = enrollmentManifest(fallback.id)
+    if (!manifest.ok) throw new Error('expected manifest fixture')
+    const handle = manifest.value.providers[0]!.accounts[0]!.handle
+    let clock = Date.now()
+    let version = 17
+    let vaultSucceeds = false
+    await withCustodyLoader(
+      {
+        accounts: [fallback],
+        routing: { mode: 'fallback-first' },
+        now: () => clock,
+        credentialForGet: () => ({
+          material: jwtFor('acct-bound-request-cache', String(version)),
+          recordVersion: version,
+        }),
+        respond: (authorization, url) => {
+          if (!url.endsWith('/responses')) return 200
+          if (authorization === 'Bearer main-access') return 200
+          return vaultSucceeds ? 200 : 401
+        },
+      },
+      async ({ fetchOverride, reports, gets, runtime, authorizations }) => {
+        const [url, init] = codexRequest()
+        await fetchOverride(url, init)
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(reports).toEqual([
+          { recordVersion: 17, reporterSource: 'direct' },
+        ])
+
+        version = 18
+        await runtime.runTick()
+        await fetchOverride(url, init)
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(reports).toEqual([
+          { recordVersion: 17, reporterSource: 'direct' },
+          { recordVersion: 18, reporterSource: 'direct' },
+        ])
+
+        const getsBeforeReauthTick = gets()
+        version = 19
+        await runtime.runTick()
+        expect(gets()).toBe(getsBeforeReauthTick)
+        const reauthRequestStart = authorizations.length
+        await fetchOverride(url, init)
+        expect(authorizations.slice(reauthRequestStart)).toEqual([
+          'Bearer main-access',
+        ])
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(reports).toHaveLength(2)
+
+        clock += 60 * 60_000 + 1
+        version = 20
+        await runtime.runTick()
+        expect(runtime.getCache()?.isReauth(handle, clock)).toBe(false)
+        expect(runtime.getCache()?.isBlocked(handle)).toBe(false)
+        expect((await runtime.getCache()?.peek(handle))?.recordVersion).toBe(20)
+        vaultSucceeds = true
+        expect((await fetchOverride(url, init)).status).toBe(200)
+        expect(authorizations.at(-1)).toBe(
+          `Bearer ${jwtFor('acct-bound-request-cache', '20')}`,
+        )
+
+        vaultSucceeds = false
+        await fetchOverride(url, init)
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(reports).toEqual([
+          { recordVersion: 17, reporterSource: 'direct' },
+          { recordVersion: 18, reporterSource: 'direct' },
+          { recordVersion: 20, reporterSource: 'direct' },
+        ])
       },
     )
   })
