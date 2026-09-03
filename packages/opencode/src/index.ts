@@ -277,6 +277,11 @@ interface ResetTargetResolverDeps {
     account: OAuthAccount,
     storage: AccountStorage,
   ) => ReturnType<typeof resolveFallbackAccess>
+  reportAuthFailure?: (params: {
+    handle: string
+    providerStatus: number
+    recordVersion: number
+  }) => Promise<void>
 }
 
 function resetTargetNeedsRefresh(
@@ -406,6 +411,16 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
       label: resolved.label ?? accountKey,
       accessToken: accessResolution.token,
       chatgptAccountId: freshAccount.accountId,
+      onAuthFailure:
+        accessResolution.provenance === 'local'
+          ? undefined
+          : async (status: number) => {
+              await deps.reportAuthFailure?.({
+                handle: accessResolution.provenance.handle,
+                providerStatus: status,
+                recordVersion: accessResolution.provenance.recordVersion,
+              })
+            },
     }
   }
 }
@@ -2334,7 +2349,19 @@ export async function CodexAuthPlugin(
             )
             if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED)
               throw new Error(`no access token for ${accountId}`)
-            return access.token
+            return {
+              token: access.token,
+              onAuthFailure:
+                access.provenance === 'local'
+                  ? undefined
+                  : async (status: number) => {
+                      await reportAuthFailureForCustody({
+                        handle: access.provenance.handle,
+                        providerStatus: status,
+                        recordVersion: access.provenance.recordVersion,
+                      })
+                    },
+            }
           },
           codexResponsesUrl: codexApiEndpoint,
           logger: cacheKeepLogger,
@@ -2621,6 +2648,7 @@ export async function CodexAuthPlugin(
             now: Date.now,
             isFallbackRefreshInert: isFallbackAccountRefreshInert,
             resolveFallbackAccess: resolveAccountAccessForCustody,
+            reportAuthFailure: reportAuthFailureForCustody,
           }),
           ...buildResetRedemptionDeps(),
           cacheKeepManager,

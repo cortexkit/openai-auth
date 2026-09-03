@@ -116,6 +116,7 @@ export interface ResetTargetIdentity {
   label: string
   accessToken: string
   chatgptAccountId?: string
+  onAuthFailure?: (status: number) => Promise<void>
 }
 
 const log = createLogger('commands')
@@ -1222,8 +1223,9 @@ async function buildResetPreviewRow(
   accountKey: string,
   ctx: ResetCommandContext,
 ): Promise<ResetPreviewRow> {
+  let target: ResetTargetIdentity | undefined
   try {
-    const target = await ctx.resolveResetTarget(accountKey)
+    target = await ctx.resolveResetTarget(accountKey)
     const wireAccountId =
       target.accountKey === 'main' ? undefined : target.chatgptAccountId
     const [quota, credits] = await Promise.all([
@@ -1269,6 +1271,8 @@ async function buildResetPreviewRow(
       selectedCreditExpiresAt: selectedCredit?.expiresAt,
     }
   } catch (error) {
+    if ((error as { status?: unknown })?.status === 401)
+      await target?.onAuthFailure?.(401)
     log.warn('reset preview row failed', {
       accountKey,
       error: (error as Error)?.message ?? String(error),

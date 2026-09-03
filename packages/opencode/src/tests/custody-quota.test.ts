@@ -322,6 +322,36 @@ describe('refresh-inert quota poll', () => {
     expect(deps.quotaManager.getFallback('fb-1')).toBeNull()
   })
 
+  it('records a vault 401 outcome when the custody reporter throws', async () => {
+    const logger = { debug: mock(() => undefined), warn: mock(() => undefined) }
+    const deps = makeDeps({
+      refreshInert: true,
+      resolverResult: {
+        token: 'vault-served-access',
+        provenance: {
+          handle: 'ckh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          recordVersion: 43,
+        },
+      },
+      whamBehaviour: () => {
+        throw Object.assign(new Error('wham usage check failed: 401'), {
+          status: 401,
+        })
+      },
+      reportImpl: async () => {
+        throw new Error('report transport unavailable')
+      },
+      logger,
+    })
+
+    const results = await refreshAllQuota(deps, { accountKey: 'fb-1' })
+
+    expect(results.find((result) => result.account === 'fb-1')).toMatchObject({
+      ok: false,
+    })
+    expect(logger.warn).toHaveBeenCalled()
+  })
+
   it('enrolling account + live local token → wham uses local, zero local refresh, a 401 is neither reported nor force-refreshed', async () => {
     const reportCalls: Array<{
       handle: string

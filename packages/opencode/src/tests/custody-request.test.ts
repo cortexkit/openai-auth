@@ -674,6 +674,71 @@ describe('custody request resolution', () => {
     )
   })
 
+  it('reports the served vault version after a cachekeep replay 401', async () => {
+    const fallback = makeSentinelAccount({
+      id: 'cachekeep-vault-401',
+      accountId: 'acct-cachekeep-vault-401',
+    })
+    const vaultAccess = jwtFor('acct-cachekeep-vault-401')
+    await withCustodyLoader(
+      {
+        accounts: [fallback],
+        credential: { material: vaultAccess, recordVersion: 54 },
+        respond: (_authorization, url) =>
+          url.endsWith('/responses') ? 401 : 200,
+      },
+      async ({ cacheKeepManager, reports }) => {
+        cacheKeepManager.track(
+          'cachekeep-vault-401',
+          JSON.stringify({ model: 'gpt-5.5', input: [] }),
+          fallback.id,
+        )
+        const target = (
+          cacheKeepManager as never as {
+            targets: Map<string, { cacheExpiresAt: number }>
+          }
+        ).targets.get('cachekeep-vault-401')
+        if (!target) throw new Error('expected cachekeep target')
+        target.cacheExpiresAt = Date.now()
+        await cacheKeepManager.tick()
+        expect(reports).toEqual([
+          { recordVersion: 54, reporterSource: 'direct' },
+        ])
+      },
+    )
+  })
+
+  it('does not report a local cachekeep replay 401', async () => {
+    const fallback = liveAccount('cachekeep-local-401', {
+      accountId: 'acct-cachekeep-local-401',
+      expires: Date.now() + 24 * 60 * 60_000,
+    })
+    await withCustodyLoader(
+      {
+        accounts: [fallback],
+        claustrumEnabled: false,
+        respond: (_authorization, url) =>
+          url.endsWith('/responses') ? 401 : 200,
+      },
+      async ({ cacheKeepManager, reports }) => {
+        cacheKeepManager.track(
+          'cachekeep-local-401',
+          JSON.stringify({ model: 'gpt-5.5', input: [] }),
+          fallback.id,
+        )
+        const target = (
+          cacheKeepManager as never as {
+            targets: Map<string, { cacheExpiresAt: number }>
+          }
+        ).targets.get('cachekeep-local-401')
+        if (!target) throw new Error('expected cachekeep target')
+        target.cacheExpiresAt = Date.now()
+        await cacheKeepManager.tick()
+        expect(reports).toEqual([])
+      },
+    )
+  })
+
   it('reports a vault 401 from the sticky replacement send', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'custody-sticky-replacement-'))
     const configPath = join(directory, 'openai-auth.json')

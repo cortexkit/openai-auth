@@ -2024,6 +2024,46 @@ describe('commands', () => {
     expect(payload.knobs).toEqual({})
   })
 
+  test('reset preview reports a vault-served wham 401 before marking the account ineligible', async () => {
+    const reports: number[] = []
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+      resolveResetTarget: async () => ({
+        accountKey: 'fallback-a',
+        label: 'fallback-a',
+        accessToken: 'vault-access',
+        chatgptAccountId: 'chatgpt-fallback-a',
+        onAuthFailure: async (status) => {
+          reports.push(status)
+        },
+      }),
+      fetchImpl: fetchStub(async (input) => {
+        if (String(input).includes('/wham/usage')) {
+          return Response.json({ error: 'unauthorized' }, { status: 401 })
+        }
+        return Response.json({ credits: [], available_count: 0 })
+      }),
+      now: () => Date.parse('2026-07-17T12:00:00.000Z'),
+      randomUUID: () => 'uuid',
+      refreshResetTargetQuota: async (accountKey) => ({
+        account: accountKey,
+        ok: true,
+      }),
+    }
+
+    const payload = await buildDialogPayload(
+      'openai-reset',
+      'select fallback-a',
+      ctx,
+    )
+
+    expect(payload.knobs.code).toBe('not_eligible')
+    expect(reports).toEqual([401])
+  })
+
   test('reset identity resolver returns tagged displayable target errors', async () => {
     const now = Date.parse('2026-07-17T12:00:00.000Z')
     const resolver = () =>

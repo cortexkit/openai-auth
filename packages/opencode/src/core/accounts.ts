@@ -18,6 +18,7 @@ import {
   refreshBackoffActive,
 } from './backoff.ts'
 import {
+  assertNotCustodyTombstone,
   CustodyTombstoneRefreshError,
   enrolling,
   refreshInert,
@@ -2593,6 +2594,7 @@ export class FallbackAccountManager {
 
   async refreshAccountQuota(account: OAuthAccount, storage: AccountStorage) {
     const target = account
+    assertNotCustodyTombstone(target, 'openai')
     if (!target.access) {
       throw new Error(`Fallback account ${account.id} has no access token`)
     }
