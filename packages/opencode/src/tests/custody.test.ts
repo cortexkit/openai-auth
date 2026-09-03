@@ -894,7 +894,7 @@ describe('ClaustrumCredentialCache', () => {
     cache.close()
   })
 
-  it('applies a two-cycle-then-one-hour bound: third report on a new version enters reauth without reporting again', async () => {
+  it('keeps the two-cycle bound through a fresh get until a served vault request succeeds', async () => {
     const reports: number[] = []
     let nextVersion = 1
     const fake = makeFakeClient({
@@ -936,12 +936,19 @@ describe('ClaustrumCredentialCache', () => {
       providerStatus: 401,
     })
     expect(reports).toEqual([1, 2])
-    // A later successful get clears the bound. The fake's nextVersion bumped
-    // to 3 after the v=2 report, but the v=3 report was suppressed by the
-    // bound, so nextVersion stays at 3 — the get lands at v=3.
+    // A fresh vault record is not evidence that it works. The fake's nextVersion
+    // stays at 3 because the bound suppresses the v=3 report.
     const after = await cache.get(handle, 30_000)
     expect(after.recordVersion).toBe(3)
-    // Now a 4th report on the re-fetched v=3 must actually go through.
+    expect(cache.isReauth(handle)).toBe(true)
+    await cache.reportAuthFailure({
+      handle,
+      recordVersion: 3,
+      providerStatus: 401,
+    })
+    expect(reports).toEqual([1, 2])
+    cache.markVaultSuccess(handle)
+    expect(cache.isReauth(handle)).toBe(false)
     await cache.reportAuthFailure({
       handle,
       recordVersion: 3,

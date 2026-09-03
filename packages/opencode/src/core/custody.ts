@@ -245,6 +245,12 @@ export async function resolveFallbackAccess(
     const handle = options.manifestHandle
     const cache = options.cache
     if (!handle || !cache) return CUSTODY_REFUSE
+    const now = (options.now ?? Date.now)()
+    // Reauth and blocked are vault verdicts about the credential; serving a
+    // peeked record would ignore them.
+    if (cache.isBlocked(handle) || cache.isReauth(handle, now)) {
+      return CUSTODY_REFUSE
+    }
     let served = await cache.peek(handle)
     if (!served && !options.requestPath) {
       try {
@@ -253,7 +259,7 @@ export async function resolveFallbackAccess(
         return CUSTODY_REFUSE
       }
     }
-    if (!served || served.expiresAtMs <= (options.now ?? Date.now)()) {
+    if (!served || served.expiresAtMs <= now) {
       return CUSTODY_REFUSE
     }
     const check = verifyServedFallbackIdentity(served, account)
@@ -426,6 +432,12 @@ export class ClaustrumCredentialCache {
     return until > now
   }
 
+  markVaultSuccess(handle: string): void {
+    this.#reauth.delete(handle)
+    this.#reportBound.delete(handle)
+    this.#reported.delete(handle)
+  }
+
   /**
    * Get the live resident record. If a live record exists and the caller
    * did not pass `force:true`, it returns immediately (no daemon I/O).
@@ -487,15 +499,9 @@ export class ClaustrumCredentialCache {
           expiresAtMs,
         }
         this.#resident.set(handle, record)
-        // A successful get clears the bound, the fence, and any blocked/reauth
-        // entries — the operator has reached the vault cleanly. Clearing the
-        // fence means a daemon-issued retry at the same version (e.g. after
-        // the operator re-authenticates) reports cleanly instead of being
-        // silently dropped by the monotonic fence.
+        // A served version is not evidence it works; only a 2xx request resets
+        // the bound. A fresh record can still immediately fail upstream.
         this.#blocked.delete(handle)
-        this.#reauth.delete(handle)
-        this.#reportBound.delete(handle)
-        this.#reported.delete(handle)
         this.#rejectedVersions.delete(handle)
         return record
       }
@@ -539,8 +545,7 @@ export class ClaustrumCredentialCache {
     // successful get clears the bound and lifts the suppression.
     const bound = this.#reportBound.get(handle)
     if (bound && bound.count >= 2) {
-      const reauthUntil = this.#reauth.get(handle)
-      if (reauthUntil && reauthUntil > now) return
+      return
     }
     const client = await this.#transport
     try {

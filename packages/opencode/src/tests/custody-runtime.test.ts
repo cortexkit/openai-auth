@@ -25,7 +25,6 @@ import {
   __resetEnrollPendingForTest,
   CUSTODY_TOMBSTONE_PREFIX,
   enrollPendingReason,
-  markEnrollPending,
 } from '../core/custody.ts'
 import {
   type CustodyManifestReadResult,
