@@ -681,6 +681,15 @@ export class CustodyTombstoneRefreshError extends Error {
   }
 }
 
+export function assertNotCustodyTombstone(
+  account: OAuthAccount,
+  provider: string,
+): void {
+  if (tombstoned(account, provider)) {
+    throw new CustodyTombstoneRefreshError(provider)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Enroll-completion sweep (§7.3)
 // ---------------------------------------------------------------------------
