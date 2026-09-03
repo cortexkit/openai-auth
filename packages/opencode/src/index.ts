@@ -67,7 +67,6 @@ import {
   enrolling,
   enrollPendingReason,
   excluded,
-  markEnrollPending,
   refreshInert,
   resolveFallbackAccess,
   tombstoned,
@@ -1003,15 +1002,23 @@ export function __createCustodyRuntimeForTest(
       const storage = await options.loadAccounts(options.configPath)
       const account = storage?.accounts.find((a) => a.id === accountId)
       if (account?.type !== 'oauth') continue
-      // A tombstoned account with an entry present is the warm target; the
-      // completion sweep above already handled any `enrolling` residue, so
-      // every account reaching this pass is either custodied or enrolling
-      // without a yet-known handle.
-      if (!refreshInert(account, manifest, CUSTODY_OWNING_PROVIDER)) continue
+      // The completion sweep above handled `enrolling` accounts. The warm
+      // pass targets `custodied` ones only — `enrolling` is not the warm's
+      // job, and overwriting the latch with a successful get would render the
+      // sidebar as `vault` for an account the operator has not completed.
+      if (
+        !custodied(account, manifest, options.storage ?? ({} as AccountStorage))
+      )
+        continue
       try {
         const record = await cache.get(handle)
-        // Cache may hand back a ResidentRecord; we only need it populated.
-        void record
+        // Surface the served recordVersion to the projection so the sidebar
+        // carries it through `getCustodyProjection`. A failed `get` leaves
+        // the existing projection untouched.
+        projectionByAccountId.set(accountId, {
+          state: 'vault',
+          recordVersion: record.recordVersion,
+        })
       } catch {
         // Per-tick error handling is the cache's job (retry / reauth / gone
         // / reduce_and_retry). Nothing to do at this layer.
@@ -1067,7 +1074,7 @@ export function __createCustodyRuntimeForTest(
     if (outcome.kind === 'succeeded') {
       projectionByAccountId.set(account.id, {
         state: 'vault',
-        recordVersion: 0,
+        recordVersion: outcome.recordVersion,
       })
       return
     }
@@ -1081,11 +1088,27 @@ export function __createCustodyRuntimeForTest(
         nullClaim: 'nullClaim',
         unavailable: 'unavailable',
       }
-      markEnrollPending(account.id, map[outcome.reason])
-      projectionByAccountId.set(account.id, {
-        state: 'enrollPending',
-        reason: map[outcome.reason],
-      })
+      const reason = map[outcome.reason]
+      // `completeFallbackEnrollment` already latched `enrollPendingReason`;
+      // the projection becomes `enrollPending` exactly once, on the same
+      // transition that set the latch. A later failure with a different
+      // reason does NOT overwrite the original cause — the operator sees
+      // the first failure until the sweep clears it.
+      const isLatched = enrollPendingReason(account.id) !== undefined
+      if (isLatched) {
+        const existing = projectionByAccountId.get(account.id)
+        if (existing?.state !== 'enrollPending') {
+          projectionByAccountId.set(account.id, {
+            state: 'enrollPending',
+            reason,
+          })
+        }
+      }
+      // Per-process, per-(account,reason) dedupe at one hour (spec §7.3).
+      // First failure emits a warn; subsequent failures within the hour are
+      // silent. The next failure past the hour emits again. Never logs the
+      // handle or any credential material.
+      logSweepFailureOnce(log, account.id, reason, outcome.recordVersion, now())
       return
     }
     // skipped outcomes clear the latch and refresh the projection from
@@ -1110,6 +1133,37 @@ export function __createCustodyRuntimeForTest(
   }
 
   return runtime
+}
+
+const SWEEP_FAILURE_LOG_DEDUPE_WINDOW_MS = 60 * 60_000
+// Per-process dedupe map for sweep-failure log lines. Keyed by
+// `${accountId}:${reason}`; an entry is created on first failure and
+// refreshed when the hour window elapses.
+const sweepFailureLogDedupe = new Map<string, number>()
+
+function logSweepFailureOnce(
+  logger: { warn: (message: string, meta?: Record<string, unknown>) => void },
+  accountId: string,
+  reason: 'gone' | 'nullClaim' | 'identityMismatch' | 'unavailable',
+  recordVersion: number | undefined,
+  nowMs: number,
+): void {
+  const key = `${accountId}:${reason}`
+  const last = sweepFailureLogDedupe.get(key)
+  if (last !== undefined && nowMs - last < SWEEP_FAILURE_LOG_DEDUPE_WINDOW_MS) {
+    return
+  }
+  sweepFailureLogDedupe.set(key, nowMs)
+  logger.warn('custody enroll-completion sweep failed', {
+    accountId,
+    reason,
+    ...(typeof recordVersion === 'number' ? { recordVersion } : {}),
+  })
+}
+
+// Test-only dedupe reset; not part of the production surface.
+export function __resetSweepFailureLogDedupeForTest(): void {
+  sweepFailureLogDedupe.clear()
 }
 
 function custodyMinTtlMs(storage: AccountStorage | null): number {
