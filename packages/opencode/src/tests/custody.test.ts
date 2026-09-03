@@ -36,7 +36,11 @@ import {
   verifyServedFallbackIdentity,
 } from '../core/custody.ts'
 import { readCustodyManifest } from '../core/custody-manifest.ts'
-import { FLOOR_CLAUSTRUM_HANDLES } from './setup-env.ts'
+import {
+  assertFloor,
+  FLOOR_CLAUSTRUM_HANDLES,
+  FLOOR_CLAUSTRUM_HANDLES_LOCK,
+} from './setup-env.ts'
 
 const TEST_OAUTH_HANDLES_ENV = 'CLAUSTRUM_OPENCODE_HANDLES'
 const TOMBSTONE_OPENAI = `${CUSTODY_TOMBSTONE_PREFIX}openai`
@@ -502,9 +506,10 @@ describe('predicates', () => {
     ).toBe(false)
   })
 
-  it('D11 mutation: refresh gate must NOT consult claustrum.enabled — the toggle lives in the policy predicates', async () => {
+  it('D11 mutation: toggle in resolver must NOT short-circuit a live, enrolled account — it observes the predicates', async () => {
     // A live, enrolled account with claustrum.enabled:false is "enrolling" and
-    // its access token must still be served from local on a refresh.
+    // its access token must still be served from local. The toggle gates
+    // custodied serving only, not refresh-gate decisions.
     await writeManifest([
       {
         provider: 'openai',
@@ -1038,6 +1043,83 @@ describe('golden fixture', () => {
     const anthropic = source.providers.find((p) => p.provider === 'anthropic')
     expect(anthropic).toBeDefined()
     expect(anthropic?.shape).toBe('oauth')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Preload isolation assertion
+// ---------------------------------------------------------------------------
+
+describe('setup-env preload guard', () => {
+  // The assertion logic accepts a `floorDir` override so the test can place
+  // the synthetic live-default INSIDE a fake floor and verify that the
+  // live-default branch (not the FLOOR_DIR branch) is what fires. Without
+  // the override, a poisoned path under fakeHome fails the FLOOR_DIR
+  // check first and the live-default branch is never exercised.
+
+  it('refuses a path under a synthetic ~/.config-shaped directory inside an allowed floor', () => {
+    // Pretend the operator's home is a temp dir; the assertion must treat
+    // its <home>/.config subtree as the live default and refuse any path
+    // resolved there, even if a misconfigured env were to point at it.
+    const fakeFloor = mkdtempSync(join(tmpdir(), 'setup-env-fake-floor-'))
+    const fakeHome = join(fakeFloor, 'home')
+    mkdirSync(fakeHome, { recursive: true })
+    const fakeConfig = join(fakeHome, '.config')
+    const fakeCortexkit = join(fakeConfig, 'cortexkit')
+    mkdirSync(fakeCortexkit, { recursive: true })
+    const poisonedPath = join(fakeCortexkit, 'opencode-handles.json')
+    expect(() =>
+      assertFloor(
+        'CLAUSTRUM_OPENCODE_HANDLES',
+        poisonedPath,
+        `${poisonedPath}.lock`,
+        {
+          floorDir: fakeFloor,
+          homeConfig: fakeConfig,
+          homeLocalShare: join(fakeHome, '.local', 'share'),
+        },
+      ),
+    ).toThrow(/live default/)
+  })
+
+  it('refuses a path under a synthetic ~/.local/share-shaped directory inside an allowed floor', () => {
+    const fakeFloor = mkdtempSync(join(tmpdir(), 'setup-env-fake-floor-'))
+    const fakeHome = join(fakeFloor, 'home')
+    mkdirSync(fakeHome, { recursive: true })
+    const fakeLocalShare = join(fakeHome, '.local', 'share')
+    const fakeCortexkit = join(fakeLocalShare, 'cortexkit')
+    mkdirSync(fakeCortexkit, { recursive: true })
+    const poisonedPath = join(fakeCortexkit, 'opencode-handles.json')
+    expect(() =>
+      assertFloor(
+        'CLAUSTRUM_OPENCODE_HANDLES',
+        poisonedPath,
+        `${poisonedPath}.lock`,
+        {
+          floorDir: fakeFloor,
+          homeConfig: join(fakeHome, '.config'),
+          homeLocalShare: fakeLocalShare,
+        },
+      ),
+    ).toThrow(/live default/)
+  })
+
+  it('accepts the floor path itself (sanity check the guard is not over-eager)', () => {
+    // The floor path resolves under FLOOR_DIR, not under any live default,
+    // so the guard must not throw for it.
+    expect(() =>
+      assertFloor(
+        'CLAUSTRUM_OPENCODE_HANDLES',
+        FLOOR_CLAUSTRUM_HANDLES,
+        FLOOR_CLAUSTRUM_HANDLES_LOCK,
+      ),
+    ).not.toThrow()
+  })
+
+  it('refuses a non-absolute path even when the live-default branches would pass', () => {
+    expect(() =>
+      assertFloor('CLAUSTRUM_OPENCODE_HANDLES', 'relative/handles.json'),
+    ).toThrow(/not absolute/)
   })
 })
 

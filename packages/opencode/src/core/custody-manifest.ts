@@ -300,7 +300,7 @@ function isSafeIdentifier(value: string): boolean {
 export const CUSTODY_MANIFEST_TENANT = TENANT
 
 // Sentinel exposed for callers that want to assert the owning filter
-// without re-hardcoding it (e.g. fixtures, future tasks).
+// without re-hardcoding it (e.g. fixtures).
 export const CUSTODY_OWNING_PROVIDER = OWNING_PROVIDER
 export const CUSTODY_OWNING_SHAPE = OWNING_SHAPE
 export const CUSTODY_OWNING_SERVE = OWNING_SERVE
