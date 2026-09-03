@@ -30,8 +30,6 @@ import {
 } from './accounts.ts'
 import {
   CUSTODY_OWNING_PROVIDER,
-  CUSTODY_OWNING_SERVE,
-  CUSTODY_OWNING_SHAPE,
   type CustodyManifestReadResult,
   custodyManifestHandles,
 } from './custody-manifest.ts'
@@ -88,23 +86,10 @@ function owningAccount(
   account: OAuthAccount,
   manifest: CustodyManifestReadResult,
 ): boolean {
-  if (!manifest.ok) return false
-  for (const provider of manifest.value.providers) {
-    if (
-      provider.provider !== CUSTODY_OWNING_PROVIDER ||
-      provider.shape !== CUSTODY_OWNING_SHAPE ||
-      provider.serve !== CUSTODY_OWNING_SERVE
-    ) {
-      continue
-    }
-    // Case-exact label === account.id. Lower-casing either side would let a
-    // manifest with label "Main" claim local id "main" — wrong: the local
-    // id is the source of truth, so the join must be case-exact both ways.
-    for (const entry of provider.accounts) {
-      if (entry.label === account.id) return true
-    }
-  }
-  return false
+  // Case-exact label === account.id. Lower-casing either side would let a
+  // manifest with label "Main" claim local id "main" — wrong: the local
+  // id is the source of truth, so the join must be case-exact both ways.
+  return custodyManifestHandles(manifest).has(account.id)
 }
 
 /**

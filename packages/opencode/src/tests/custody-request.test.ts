@@ -2,7 +2,8 @@ import { beforeEach, describe, expect, it } from 'bun:test'
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { OAuthAccount } from '../core/accounts.ts'
+import { FallbackAccountManager, type OAuthAccount } from '../core/accounts.ts'
+import type { CacheKeepManager } from '../core/cachekeep.ts'
 import {
   ClaustrumCredentialCache,
   CUSTODY_REFUSE,
@@ -67,6 +68,10 @@ async function withCustodyLoader(
     authorizations: string[]
     reports: Array<{ recordVersion: number; reporterSource: string }>
     gets: () => number
+    cacheKeepManager: {
+      track: CacheKeepManager['track']
+      tick: CacheKeepManager['tick']
+    }
   }) => Promise<void>,
 ): Promise<void> {
   const directory = mkdtempSync(join(tmpdir(), 'custody-request-loader-'))
@@ -164,7 +169,19 @@ async function withCustodyLoader(
     )
     const fetchOverride = (result as { fetch?: typeof globalThis.fetch }).fetch
     if (!fetchOverride) throw new Error('expected fetch override')
-    await run({ fetchOverride, authorizations, reports, gets: () => gets })
+    const cacheKeepManager = (
+      globalThis as typeof globalThis & {
+        __openaiAuthCacheKeepManager?: CacheKeepManager
+      }
+    ).__openaiAuthCacheKeepManager
+    if (!cacheKeepManager) throw new Error('expected cachekeep manager')
+    await run({
+      fetchOverride,
+      authorizations,
+      reports,
+      gets: () => gets,
+      cacheKeepManager,
+    })
   } finally {
     await hooks.dispose?.()
     globalThis.fetch = originalFetch
@@ -478,7 +495,8 @@ describe('custody request resolution', () => {
       {
         accounts: [fallback],
         credential: { material: vaultAccess, recordVersion: 23 },
-        respond: () => 401,
+        respond: (_authorization, url) =>
+          url.endsWith('/responses') ? 401 : 200,
       },
       async ({ fetchOverride, authorizations, reports }) => {
         const [url, init] = codexRequest()
@@ -560,6 +578,77 @@ describe('custody request resolution', () => {
         expect(reports).toEqual([
           { recordVersion: 43, reporterSource: 'direct' },
         ])
+      },
+    )
+  })
+
+  it('keeps a due manifest account out of local refresh during cachekeep replay', async () => {
+    const fallback = enrollingAccount({
+      id: 'cachekeep-local',
+      expires: Date.now() - 1_000,
+    })
+    const originalRefresh = FallbackAccountManager.prototype.refreshAccount
+    let refreshes = 0
+    FallbackAccountManager.prototype.refreshAccount = async function (...args) {
+      refreshes++
+      return originalRefresh.apply(this, args)
+    }
+    try {
+      await withCustodyLoader(
+        {
+          accounts: [fallback],
+          claustrumEnabled: false,
+          respond: () => 200,
+        },
+        async ({ cacheKeepManager }) => {
+          cacheKeepManager.track(
+            'cachekeep-local',
+            JSON.stringify({ model: 'gpt-5.5', input: [] }),
+            fallback.id,
+          )
+          const target = (
+            cacheKeepManager as never as {
+              targets: Map<string, { cacheExpiresAt: number }>
+            }
+          ).targets.get('cachekeep-local')
+          if (!target) throw new Error('expected cachekeep target')
+          target.cacheExpiresAt = Date.now()
+          await cacheKeepManager.tick()
+          expect(refreshes).toBe(0)
+        },
+      )
+    } finally {
+      FallbackAccountManager.prototype.refreshAccount = originalRefresh
+    }
+  })
+
+  it('uses the vault bearer during a cachekeep replay', async () => {
+    const fallback = makeSentinelAccount({
+      id: 'cachekeep-vault',
+      accountId: 'acct-cachekeep-vault',
+    })
+    const vaultAccess = jwtFor('acct-cachekeep-vault')
+    await withCustodyLoader(
+      {
+        accounts: [fallback],
+        credential: { material: vaultAccess, recordVersion: 53 },
+        respond: () => 200,
+      },
+      async ({ cacheKeepManager, authorizations }) => {
+        cacheKeepManager.track(
+          'cachekeep-vault',
+          JSON.stringify({ model: 'gpt-5.5', input: [] }),
+          fallback.id,
+        )
+        const target = (
+          cacheKeepManager as never as {
+            targets: Map<string, { cacheExpiresAt: number }>
+          }
+        ).targets.get('cachekeep-vault')
+        if (!target) throw new Error('expected cachekeep target')
+        target.cacheExpiresAt = Date.now()
+        await cacheKeepManager.tick()
+        expect(authorizations).toContain(`Bearer ${vaultAccess}`)
       },
     )
   })

@@ -19,6 +19,8 @@ import type { QuotaManager } from './quota-manager'
 
 const log = createLogger('quota')
 
+export const CUSTODY_DEPS_INCOMPLETE = 'custody-deps-incomplete'
+
 /**
  * True when a thrown provider error carries HTTP 401.
  *
@@ -363,7 +365,7 @@ export async function refreshAllQuota(
             recordOutcome({
               account: acct.id,
               ok: false,
-              error: 'custody-deps-incomplete',
+              error: CUSTODY_DEPS_INCOMPLETE,
             })
             continue
           }
@@ -408,7 +410,7 @@ export async function refreshAllQuota(
             recordOutcome({
               account: acct.id,
               ok: false,
-              error: 'custody-deps-incomplete',
+              error: CUSTODY_DEPS_INCOMPLETE,
             })
             continue
           }
