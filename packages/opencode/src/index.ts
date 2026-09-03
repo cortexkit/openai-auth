@@ -68,7 +68,6 @@ import {
   custodied,
   enrolling,
   enrollPendingReason,
-  excluded,
   refreshInert,
   resolveFallbackAccess,
   stampVaultProvenance,
@@ -77,8 +76,7 @@ import {
 } from './core/custody.ts'
 import {
   CUSTODY_OWNING_PROVIDER,
-  CUSTODY_OWNING_SERVE,
-  CUSTODY_OWNING_SHAPE,
+  custodyManifestHandles,
   defaultCustodyManifestPath,
   readCustodyManifest,
 } from './core/custody-manifest.ts'
@@ -142,6 +140,7 @@ import {
   getSidebarStateFile,
   hashSidebarSessionId,
   isQuotaExhausted,
+  projectCustodyForSidebar,
   type QuotaWindow,
   removeSidebarActiveRouting,
   resolveSessionStickyAccount,
@@ -214,6 +213,11 @@ const DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS = 60_000
 const HANDLED_SENTINEL = '__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__'
 
 let bootQuotaSeedStarted = false
+
+export function __resetBootQuotaSeedForTest(): void {
+  bootQuotaSeedStarted = false
+}
+
 const logModels = createLogger('models')
 let loggedCostRestoration = false
 let warnedCostCatalogUnavailable = false
@@ -846,6 +850,9 @@ export function __createCustodyRuntimeForTest(
   // (boot or tick). A test that probes projection before the first sweep sees
   // no entry — the sidebar omits `custody` for that account.
   const projectionByAccountId = new Map<string, SidebarAccountCustody>()
+  let latestManifest:
+    | Awaited<ReturnType<typeof options.readCustodyManifest>>
+    | undefined
 
   const isEnabled = () => detection?.status === 'available'
 
@@ -861,7 +868,13 @@ export function __createCustodyRuntimeForTest(
       // the live predicates. The toggle is irrelevant here (refreshInert binds
       // on manifest entry OR tombstone), but the projection still reports the
       // ownership shape.
-      return projectFromPredicates(account, options.storage, currentNow, cache)
+      return projectFromPredicates(
+        account,
+        options.storage,
+        currentNow,
+        cache,
+        latestManifest,
+      )
     },
     async boot() {
       if (closed) return
@@ -918,6 +931,7 @@ export function __createCustodyRuntimeForTest(
       // cache, the sweep tombstones `enrolling` accounts under their refresh
       // locks. The next tick re-reads manifest and runs both passes again.
       const manifest = await options.readCustodyManifest(manifestPath)
+      latestManifest = manifest
       const enabledHandles = enabledManifestHandles(manifest, options.storage)
       const sweepPromises: Promise<void>[] = []
       for (const account of oauthAccounts(options.storage)) {
@@ -961,6 +975,7 @@ export function __createCustodyRuntimeForTest(
       // Re-read manifest (hot-reload on mtime) so an operator edit lands at
       // the next tick without a restart.
       const manifest = await options.readCustodyManifest(manifestPath)
+      latestManifest = manifest
       const enabledHandles = enabledManifestHandles(manifest, options.storage)
       // Step 1: completion sweep — every enrolling account under its refresh
       // lock, identity-verified, tombstoned on success. The sweep is the only
@@ -1146,6 +1161,7 @@ export function __createCustodyRuntimeForTest(
         options.storage,
         refreshNow,
         cache,
+        manifest,
       )
       if (projection) projectionByAccountId.set(account.id, projection)
       // Custodied-on-disk accounts lose any latched reason.
@@ -1205,31 +1221,13 @@ function enabledManifestHandles(
   storage: AccountStorage | null,
 ): Map<string, string> {
   const result = new Map<string, string>()
-  if (!manifest.ok) return result
-  for (const provider of manifest.value.providers) {
-    if (
-      provider.provider !== CUSTODY_OWNING_PROVIDER ||
-      provider.shape !== CUSTODY_OWNING_SHAPE ||
-      provider.serve !== CUSTODY_OWNING_SERVE
-    ) {
-      continue
-    }
-    for (const entry of provider.accounts) {
-      const account = storage?.accounts.find((a) => a.id === entry.label)
-      if (!account) continue
-      if (account.type !== 'oauth') continue
-      // enabled here = `refreshInert` (toggle-independent). The resolver and
-      // quota path consult this same predicate; the tick's reach matches.
-      if (
-        !refreshInert(
-          account as OAuthAccount,
-          manifest,
-          CUSTODY_OWNING_PROVIDER,
-        )
-      )
-        continue
-      result.set(entry.label, entry.handle)
-    }
+  for (const [label, handle] of custodyManifestHandles(manifest)) {
+    const account = storage?.accounts.find((a) => a.id === label)
+    if (account?.type !== 'oauth') continue
+    // enabled here = `refreshInert` (toggle-independent). The resolver and
+    // quota path consult this same predicate; the tick's reach matches.
+    if (!refreshInert(account, manifest, CUSTODY_OWNING_PROVIDER)) continue
+    result.set(label, handle)
   }
   return result
 }
@@ -1239,26 +1237,28 @@ function projectFromPredicates(
   storage: AccountStorage | null,
   currentNow: number,
   cacheInstance: ClaustrumCredentialCache | undefined,
+  manifest: Awaited<ReturnType<typeof readCustodyManifest>> | undefined,
 ): SidebarAccountCustody | undefined {
-  const latched = enrollPendingReason(account.id)
-  if (latched) return { state: 'enrollPending', reason: latched }
   const safeStorage = storage ?? ({} as AccountStorage)
-  const emptyManifest = {
-    ok: true as const,
-    value: { version: 1 as const, providers: [] },
+  const handle = manifest
+    ? custodyManifestHandles(manifest).get(account.id)
+    : undefined
+  if (
+    !enrollPendingReason(account.id) &&
+    !tombstoned(account, CUSTODY_OWNING_PROVIDER) &&
+    !handle
+  ) {
+    return undefined
   }
-  if (excluded(account, emptyManifest, safeStorage, CUSTODY_OWNING_PROVIDER)) {
-    return { state: 'needsLogin' }
-  }
-  if (tombstoned(account, CUSTODY_OWNING_PROVIDER)) {
-    return { state: 'vaultReauth' }
-  }
-  // Without a cache peek we cannot report `vault` with recordVersion; the
-  // writer runs `getCustodyProjection` after every sweep, so a subsequent
-  // write will surface it. The synchronous fallback is `local`.
-  void currentNow
-  void cacheInstance
-  return undefined
+  return projectCustodyForSidebar({
+    tombstoned: tombstoned(account, CUSTODY_OWNING_PROVIDER),
+    storageEnabled: safeStorage.claustrum?.enabled === true,
+    enrolled: handle !== undefined,
+    handle,
+    enrollPendingReason: enrollPendingReason(account.id),
+    cache: cacheInstance,
+    now: currentNow,
+  })
 }
 
 async function raceAggregateWarm(
@@ -1340,20 +1340,7 @@ function lookupManifestHandle(
     : never,
   accountId: string,
 ): string | undefined {
-  if (!manifest.ok) return undefined
-  for (const provider of manifest.value.providers) {
-    if (
-      provider.provider !== CUSTODY_OWNING_PROVIDER ||
-      provider.shape !== CUSTODY_OWNING_SHAPE ||
-      provider.serve !== CUSTODY_OWNING_SERVE
-    ) {
-      continue
-    }
-    for (const entry of provider.accounts) {
-      if (entry.label === accountId) return entry.handle
-    }
-  }
-  return undefined
+  return custodyManifestHandles(manifest).get(accountId)
 }
 
 export function buildSidebarMachineState(
@@ -2539,14 +2526,14 @@ export async function CodexAuthPlugin(
               store,
               Date.now(),
               mainAccountIdentity,
-              projectCustodyForSidebar,
+              runtimeCustodyProjection,
             ),
             boundSidebarFile,
           )
         }
         // Closure-resolved once per loader; the runtime owns the cached
         // projection map, the writer reads it sync.
-        function projectCustodyForSidebar(
+        function runtimeCustodyProjection(
           account: FallbackAccount,
           currentNow: number,
         ): SidebarAccountCustody | undefined {
@@ -2734,7 +2721,7 @@ export async function CodexAuthPlugin(
           accessToken: string,
           accountId?: string,
           keepwarmAccountKey: string = 'main',
-          provenance?: VaultProvenance,
+          provenance?: VaultProvenance | 'local',
         ): Promise<Response> {
           const headers = effectiveRequestHeaders(requestInput, init)
           headers.delete('x-api-key')
@@ -3577,9 +3564,7 @@ export async function CodexAuthPlugin(
                 candidate.access,
                 candidate.accountId,
                 candidate.keepwarmAccountKey,
-                candidate.provenance === 'local'
-                  ? undefined
-                  : candidate.provenance,
+                candidate.provenance,
               )
             } catch (error) {
               // A caller abort and an indeterminate transport failure both
@@ -3658,9 +3643,7 @@ export async function CodexAuthPlugin(
                 candidate.access,
                 candidate.accountId,
                 candidate.keepwarmAccountKey,
-                candidate.provenance === 'local'
-                  ? undefined
-                  : candidate.provenance,
+                candidate.provenance,
               )
             } catch (error) {
               if (
@@ -3894,9 +3877,7 @@ export async function CodexAuthPlugin(
                   stickyCandidate.access,
                   stickyCandidate.wireAccountId,
                   stickyCandidate.keepwarmAccountKey,
-                  stickyCandidate.provenance === 'local'
-                    ? undefined
-                    : stickyCandidate.provenance,
+                  stickyCandidate.provenance,
                 )
 
                 const pushStickyQuota = async (
@@ -3959,9 +3940,7 @@ export async function CodexAuthPlugin(
                       replacement.access,
                       replacement.wireAccountId,
                       replacement.keepwarmAccountKey,
-                      replacement.provenance === 'local'
-                        ? undefined
-                        : replacement.provenance,
+                      replacement.provenance,
                     )
                     previousResponse.body?.cancel().catch(() => {})
                     stickyCandidate = replacement

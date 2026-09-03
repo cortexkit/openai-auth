@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test'
+import { beforeEach, describe, expect, it } from 'bun:test'
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -14,6 +14,7 @@ import {
   type VaultProvenance,
 } from '../core/custody.ts'
 import {
+  __resetBootQuotaSeedForTest,
   type ClaustrumCacheTransportLike,
   CodexAuthPlugin,
   createResetTargetResolver,
@@ -193,6 +194,10 @@ function codexRequest(sessionId?: string): [string, RequestInit] {
 }
 
 describe('custody request resolution', () => {
+  beforeEach(() => {
+    __resetBootQuotaSeedForTest()
+  })
+
   it('uses the configured custody transport in the loader', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'custody-loader-'))
     const configPath = join(directory, 'openai-auth.json')
@@ -315,9 +320,16 @@ describe('custody request resolution', () => {
     )
     writeFileSync(manifestPath, JSON.stringify(manifest.value))
     chmodSync(manifestPath, 0o600)
-    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
-      authorizations.push(new Headers(init?.headers).get('authorization') ?? '')
-      return new Response('{}', { status: 401 })
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      const urlText = String(url)
+      if (urlText.endsWith('/responses')) {
+        authorizations.push(
+          new Headers(init?.headers).get('authorization') ?? '',
+        )
+      }
+      return new Response('{}', {
+        status: urlText.includes('wham') ? 200 : 401,
+      })
     }) as typeof globalThis.fetch
     const transport: ClaustrumCacheTransportLike = {
       async getCredential() {
@@ -619,7 +631,7 @@ describe('custody request resolution', () => {
         {
           accounts: [fallback],
           credential: { material: vaultAccess, recordVersion: 37 },
-          respond: () => 401,
+          respond: (_authorization, url) => (url.includes('wham') ? 200 : 401),
         },
         async ({ fetchOverride, reports }) => {
           const init: RequestInit = {
