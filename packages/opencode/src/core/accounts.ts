@@ -1968,11 +1968,10 @@ export class FallbackAccountManager {
 
   // Boolean form: the entry gates use this to skip the account without
   // throwing — throwing inside a loop body would force a catch that loses
-  // the surrounding selection bookkeeping.
+  // the surrounding selection bookkeeping. Derived from the granular
+  // custodyAccountState so there is one source of truth for the gate.
   private async isCustodyRefreshInert(account: OAuthAccount): Promise<boolean> {
-    if (!this.custodyReadManifest) return false
-    const manifest = await this.custodyReadManifest()
-    return refreshInert(account, manifest, this.custodyProvider)
+    return (await this.custodyAccountState(account)) !== null
   }
 
   // Granular form for `getUsableFallbackAccounts`: tombstoned accounts are
@@ -1987,7 +1986,9 @@ export class FallbackAccountManager {
     if (!this.custodyReadManifest) return null
     if (tombstoned(account, this.custodyProvider)) return 'tombstoned'
     const manifest = await this.custodyReadManifest()
-    return enrolling(account, manifest) ? 'enrolling' : null
+    return enrolling(account, manifest, this.custodyProvider)
+      ? 'enrolling'
+      : null
   }
 
   /**

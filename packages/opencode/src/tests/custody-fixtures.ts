@@ -1,0 +1,81 @@
+/**
+ * Shared fixtures for custody tests.
+ *
+ * The custody test files (`custody.test.ts`, `custody-refresh.test.ts`) need
+ * the same factory inputs — sentinel accounts, live accounts, manifest
+ * snapshots — and drifted apart as each file grew its own copy. Keeping the
+ * factories here ensures both files pin the same tombstone id, expiry math,
+ * and owning-provider manifest shape, so any future drift shows up as a
+ * single shared-helper edit instead of two divergent copies.
+ */
+
+import type { AccountStorage, OAuthAccount } from '../core/accounts.ts'
+import { CUSTODY_TOMBSTONE_PREFIX } from '../core/custody.ts'
+import type { CustodyManifestReadResult } from '../core/custody-manifest.ts'
+
+const CUSTODY_PROVIDER = 'openai'
+
+export const TOMBSTONE_OPENAI = `${CUSTODY_TOMBSTONE_PREFIX}${CUSTODY_PROVIDER}`
+
+export function makeSentinelAccount(
+  overrides: Partial<OAuthAccount> = {},
+): OAuthAccount {
+  return {
+    id: 'custody-1',
+    type: 'oauth',
+    access: TOMBSTONE_OPENAI,
+    refresh: TOMBSTONE_OPENAI,
+    expires: 0,
+    addedAt: 1_000,
+    ...overrides,
+  }
+}
+
+export function liveAccount(
+  id: string,
+  overrides: Partial<OAuthAccount> = {},
+): OAuthAccount {
+  return {
+    id,
+    type: 'oauth',
+    access: `acc-${id}`,
+    refresh: `ref-${id}`,
+    expires: Date.now() + 3_600_000,
+    addedAt: 1_000,
+    ...overrides,
+  }
+}
+
+export function liveStorage(
+  accounts: OAuthAccount[],
+  overrides: Partial<AccountStorage> = {},
+): AccountStorage {
+  return {
+    version: 1,
+    main: { type: 'opencode', provider: CUSTODY_PROVIDER },
+    accounts,
+    ...overrides,
+  }
+}
+
+export function emptyManifest(): CustodyManifestReadResult {
+  return { ok: true, value: { version: 1, providers: [] } }
+}
+
+export function enrollmentManifest(label: string): CustodyManifestReadResult {
+  const handle = `ckh_${'a'.repeat(43)}`
+  return {
+    ok: true,
+    value: {
+      version: 1,
+      providers: [
+        {
+          provider: CUSTODY_PROVIDER,
+          shape: 'oauth',
+          serve: 'openai-auth',
+          accounts: [{ label, handle, credential_id: `oauth:openai:${label}` }],
+        },
+      ],
+    },
+  }
+}

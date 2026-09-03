@@ -5,20 +5,21 @@ import {
   mkdirSync,
   mkdtempSync,
   openSync,
+  readFileSync,
   rmSync,
   writeFileSync,
   writeSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { getAccountStoragePath } from '../core/account-paths.ts'
+import type { OAuthAccount } from '../core/accounts.ts'
 import {
-  getAccountStatePath,
-  getAccountStoragePath,
-} from '../core/account-paths.ts'
-import type { AccountStorage, OAuthAccount } from '../core/accounts.ts'
-import { loadAccounts, saveAccounts } from '../core/accounts.ts'
+  loadAccounts,
+  normalizeAccount,
+  saveAccounts,
+} from '../core/accounts.ts'
 import {
-  __resetCustodyStateForTest,
   ClaustrumCredentialCache,
   CUSTODY_EXCLUDED,
   CUSTODY_REFUSE,
@@ -28,7 +29,6 @@ import {
   enrolled,
   enrolling,
   excluded,
-  normalizeAccount,
   refreshInert,
   resolveFallbackAccess,
   tombstoned,
@@ -37,55 +37,18 @@ import {
 } from '../core/custody.ts'
 import { readCustodyManifest } from '../core/custody-manifest.ts'
 import {
+  liveAccount,
+  liveStorage,
+  makeSentinelAccount,
+  TOMBSTONE_OPENAI,
+} from './custody-fixtures.ts'
+import {
   assertFloor,
   FLOOR_CLAUSTRUM_HANDLES,
   FLOOR_CLAUSTRUM_HANDLES_LOCK,
 } from './setup-env.ts'
 
 const TEST_OAUTH_HANDLES_ENV = 'CLAUSTRUM_OPENCODE_HANDLES'
-const TOMBSTONE_OPENAI = `${CUSTODY_TOMBSTONE_PREFIX}openai`
-
-function mkSentinelToken(): string {
-  return TOMBSTONE_OPENAI
-}
-
-function makeSentinelAccount(): OAuthAccount {
-  return {
-    id: 'tombstoned-acct',
-    type: 'oauth',
-    access: mkSentinelToken(),
-    refresh: mkSentinelToken(),
-    expires: 0,
-    addedAt: 1000,
-  }
-}
-
-function liveAccount(
-  id: string,
-  overrides: Partial<OAuthAccount> = {},
-): OAuthAccount {
-  return {
-    id,
-    type: 'oauth',
-    access: `acc-${id}`,
-    refresh: `ref-${id}`,
-    expires: Date.now() + 3600_000,
-    addedAt: 1000,
-    ...overrides,
-  }
-}
-
-function liveStorage(
-  accounts: OAuthAccount[],
-  overrides: Partial<AccountStorage> = {},
-): AccountStorage {
-  return {
-    version: 1,
-    main: { type: 'opencode', provider: 'openai' },
-    accounts,
-    ...overrides,
-  }
-}
 
 let handlesDir: string
 let handlesPath: string
@@ -94,13 +57,11 @@ beforeEach(async () => {
   handlesDir = mkdtempSync(join(tmpdir(), 'custody-test-'))
   handlesPath = join(handlesDir, 'opencode-handles.json')
   process.env[TEST_OAUTH_HANDLES_ENV] = handlesPath
-  __resetCustodyStateForTest()
 })
 
 afterEach(() => {
   // Restore to floor — never delete, so any in-flight reads resolve to a temp path.
   process.env[TEST_OAUTH_HANDLES_ENV] = FLOOR_CLAUSTRUM_HANDLES
-  __resetCustodyStateForTest()
   try {
     rmSync(handlesDir, { recursive: true, force: true })
   } catch {}
@@ -118,10 +79,10 @@ describe('custodyTombstoneKey', () => {
 
   it('normalizes an oauth entry whose access/refresh are both the sentinel (preserves the account on load)', async () => {
     const sentinel = makeSentinelAccount()
-    // The mutation: if normalizeAccount dropped the entry, the list would be empty
-    // and the tombstone would vanish. We assert it survives normalisation as an
-    // account with access===refresh===sentinel and expires===0 so callers can
-    // observe the tombstone rather than silently losing the entry.
+    // If normalizeAccount dropped the entry, the list would be empty and the
+    // tombstone would vanish. Assert it survives normalisation as an account
+    // with access===refresh===sentinel and expires===0 so callers can observe
+    // the tombstone rather than silently losing the entry.
     const normalized = normalizeAccount({
       id: sentinel.id,
       type: 'oauth',
@@ -156,9 +117,6 @@ describe('custodyTombstoneKey', () => {
 // ---------------------------------------------------------------------------
 
 async function writeManifest(providers: unknown[]): Promise<void> {
-  const parent = join(handlesDir, 'parent')
-  mkdirSync(parent, { mode: 0o700, recursive: true })
-  chmodSync(parent, 0o700)
   const fd = openSync(
     handlesPath,
     fsConstants.O_CREAT | fsConstants.O_WRONLY | fsConstants.O_TRUNC,
@@ -166,8 +124,9 @@ async function writeManifest(providers: unknown[]): Promise<void> {
   )
   const json = JSON.stringify({ version: 1, providers })
   writeSync(fd, json)
-  // Re-open + chmod to be defensive — fs.openSync with O_CREAT handles mode on most
-  // platforms but some tests want to assert the post-write mode too.
+  // Belt-and-braces: openSync with O_CREAT honours mode on POSIX but some
+  // platforms may differ — chmod to the desired 0o600 to keep the manifest
+  // reader's mode check deterministic across test runs.
   chmodSync(handlesPath, 0o600)
 }
 
@@ -348,7 +307,7 @@ describe('readCustodyManifest', () => {
       mode: 0o600,
     })
     // 0o755 = no sticky bit, no group/other write — but no longer 0700 either.
-    // The brief says safe parent; here we use a too-permissive parent to trip the check.
+    // Too-permissive parent (0o755) trips the safe-parent check.
     chmodSync(unsafeParent, 0o755)
     const result = await readCustodyManifest(unsafePath)
     expect(result.ok).toBe(false)
@@ -364,7 +323,7 @@ describe('readCustodyManifest', () => {
 // ---------------------------------------------------------------------------
 
 describe('predicates', () => {
-  it('enrolled = case-exact manifest account label === account.id, ignores storage.claustrum', async () => {
+  it('enrolled = case-exact manifest account label === account.id (storage toggle is not a parameter)', async () => {
     await writeManifest([
       {
         provider: 'openai',
@@ -384,12 +343,8 @@ describe('predicates', () => {
     expect(enrolled(acct, m)).toBe(true)
     const other = liveAccount('other')
     expect(enrolled(other, m)).toBe(false)
-    // Storage.claustrum must NOT influence enrollment.
-    expect(
-      enrolled(acct, m, {
-        claustrum: { enabled: false },
-      } as unknown as AccountStorage),
-    ).toBe(true)
+    // Storage.claustrum cannot influence enrollment — the predicate does not
+    // accept it as a parameter; the test name states the invariant.
   })
 
   it('tombstoned = oauth access AND refresh AND expires===0 match the per-provider sentinel', () => {
@@ -406,7 +361,7 @@ describe('predicates', () => {
         {
           ...makeSentinelAccount(),
           access: 'live-access',
-          refresh: mkSentinelToken(),
+          refresh: TOMBSTONE_OPENAI,
         },
         'openai',
       ),
@@ -506,7 +461,7 @@ describe('predicates', () => {
     ).toBe(false)
   })
 
-  it('D11 mutation: toggle in resolver must NOT short-circuit a live, enrolled account — it observes the predicates', async () => {
+  it('does not refresh an entry-present account when claustrum.enabled is false (toggle gates custodied serving, not local access)', async () => {
     // A live, enrolled account with claustrum.enabled:false is "enrolling" and
     // its access token must still be served from local. The toggle gates
     // custodied serving only, not refresh-gate decisions.
@@ -579,7 +534,7 @@ describe('verifyServedFallbackIdentity', () => {
     })
   })
 
-  it('D11 mutation: verifier must compare the PARSED CLAIM, not the served string field', () => {
+  it('verifier compares the PARSED CLAIM, not the served string field', () => {
     // Mutation: bind the comparison to the served string instead of the parsed
     // claim. Then a mislabelled record (served string says "acct-X" but the
     // token claims a different account) would incorrectly pass.
@@ -1020,7 +975,6 @@ describe('golden fixture', () => {
     // is the byte-for-byte copy from upstream — see check:claustrum-golden.
     // Here we just assert that the local copy exists and contains the
     // tenant-stable structure the manifest reader expects.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const fixturePath = join(
       import.meta.dir,
       'fixtures',
@@ -1028,9 +982,7 @@ describe('golden fixture', () => {
       'handles.json',
     )
     expect(fixturePath.endsWith('handles.json')).toBe(true)
-    const source = JSON.parse(
-      require('node:fs').readFileSync(fixturePath, 'utf8'),
-    ) as {
+    const source = JSON.parse(readFileSync(fixturePath, 'utf8')) as {
       version: number
       providers: Array<{ provider: string; shape: string; serve: string }>
     }
@@ -1122,9 +1074,3 @@ describe('setup-env preload guard', () => {
     ).toThrow(/not absolute/)
   })
 })
-
-// Required imports referenced above.
-function _typeProbe() {
-  void getAccountStatePath
-}
-_typeProbe()

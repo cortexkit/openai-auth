@@ -17,10 +17,8 @@
  * short-circuit, and stamping `lastRefreshError` with it would re-arm the
  * refresh backoff against an inert account.
  *
- * Each mutation listed in the plan's mutation table is exercised by the
- * standard RED-then-GREEN run: applying the mutation makes the relevant test
- * fail RED; reverting returns it to GREEN. The named tests here are the
- * witnesses the gate run references when confirming the mutation cycle.
+ * Each gated mutation is exercised by a standard RED-then-GREEN run; the
+ * named tests are the witnesses.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
@@ -36,87 +34,24 @@ import {
   type OAuthAccount,
   saveAccounts,
 } from '../core/accounts.ts'
-import {
-  CUSTODY_TOMBSTONE_PREFIX,
-  CustodyTombstoneRefreshError,
-} from '../core/custody.ts'
+import { CustodyTombstoneRefreshError } from '../core/custody.ts'
 import type { CustodyManifestReadResult } from '../core/custody-manifest.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
+import {
+  emptyManifest,
+  enrollmentManifest,
+  liveAccount,
+  liveStorage,
+  makeSentinelAccount,
+  TOMBSTONE_OPENAI,
+} from './custody-fixtures.ts'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_CLAUSTRUM_HANDLES,
   FLOOR_STATE_FILE,
 } from './setup-env.ts'
 
-const TOMBSTONE_OPENAI = `${CUSTODY_TOMBSTONE_PREFIX}openai`
 const CUSTODY_PROVIDER = 'openai'
-
-// ---------------------------------------------------------------------------
-// Fixture helpers
-// ---------------------------------------------------------------------------
-
-function makeSentinelAccount(
-  overrides: Partial<OAuthAccount> = {},
-): OAuthAccount {
-  return {
-    id: 'custody-1',
-    type: 'oauth',
-    access: TOMBSTONE_OPENAI,
-    refresh: TOMBSTONE_OPENAI,
-    expires: 0,
-    addedAt: 1_000,
-    ...overrides,
-  }
-}
-
-function liveAccount(
-  id: string,
-  overrides: Partial<OAuthAccount> = {},
-): OAuthAccount {
-  return {
-    id,
-    type: 'oauth',
-    access: `acc-${id}`,
-    refresh: `ref-${id}`,
-    expires: Date.now() + 3_600_000,
-    addedAt: 1_000,
-    ...overrides,
-  }
-}
-
-function liveStorage(
-  accounts: OAuthAccount[],
-  overrides: Partial<AccountStorage> = {},
-): AccountStorage {
-  return {
-    version: 1,
-    main: { type: 'opencode', provider: 'openai' },
-    accounts,
-    ...overrides,
-  }
-}
-
-function emptyManifest(): CustodyManifestReadResult {
-  return { ok: true, value: { version: 1, providers: [] } }
-}
-
-function enrollmentManifest(label: string): CustodyManifestReadResult {
-  const handle = `ckh_${'a'.repeat(43)}`
-  return {
-    ok: true,
-    value: {
-      version: 1,
-      providers: [
-        {
-          provider: CUSTODY_PROVIDER,
-          shape: 'oauth',
-          serve: 'openai-auth',
-          accounts: [{ label, handle, credential_id: `oauth:openai:${label}` }],
-        },
-      ],
-    },
-  }
-}
 
 let dir: string
 let cfgPath: string
@@ -157,7 +92,7 @@ describe('CustodyTombstoneRefreshError contract', () => {
 })
 
 // ---------------------------------------------------------------------------
-// 2a — Choke point: refreshAccountNow throws on refreshInert
+// Choke point: refreshAccountNow throws on refreshInert
 // ---------------------------------------------------------------------------
 
 describe('choke point (refreshAccountNow) refuses refreshInert accounts', () => {
@@ -190,9 +125,8 @@ describe('choke point (refreshAccountNow) refuses refreshInert accounts', () => 
       thrown = e
     }
 
-    // Mutation witness: removing the choke-point assertion lets refreshFn
-    // observe the sentinel as the refresh token. The assertion below fires
-    // RED until the gate is in place.
+    // Removing the choke-point assertion lets refreshFn observe the sentinel
+    // as the refresh token — the assertion below pins the gate in place.
     expect(refreshFnCalls).toBe(0)
     expect(observedRefreshToken).toBeUndefined()
     expect(thrown).toBeInstanceOf(CustodyTombstoneRefreshError)
@@ -233,10 +167,10 @@ describe('choke point (refreshAccountNow) refuses refreshInert accounts', () => 
 })
 
 // ---------------------------------------------------------------------------
-// Must B — getUsableFallbackAccounts candidate shape (spec §3 D14)
+// getUsableFallbackAccounts candidate shape (spec §3)
 // ---------------------------------------------------------------------------
 
-describe('getUsableFallbackAccounts candidate shape (spec §3 D14)', () => {
+describe('getUsableFallbackAccounts candidate shape (spec §3)', () => {
   it('enrolling + valid local token → present in usable, zero refreshFn calls', async () => {
     // Enrolling (manifest entry, not tombstoned) stays a usable candidate —
     // it serves its local access token while that token is valid. The local
@@ -513,12 +447,12 @@ describe('manager entry gates skip refreshInert accounts', () => {
 })
 
 // ---------------------------------------------------------------------------
-// D11 — enrolled + claustrum.enabled=false + live secret → ZERO refreshFn
+// enrolled + claustrum.enabled=false + live secret → ZERO refreshFn
 // ---------------------------------------------------------------------------
 
-describe('D11: enrolled + claustrum.enabled=false → skip local refresh', () => {
+describe('enrolled + claustrum.enabled=false → skip local refresh', () => {
   it('getUsableFallbackAccounts: ZERO refreshFn calls', async () => {
-    const account = liveAccount('d11-1', { expires: Date.now() - 1_000 })
+    const account = liveAccount('enrolled-1', { expires: Date.now() - 1_000 })
     await saveAccounts(
       liveStorage([account], { claustrum: { enabled: false } }),
       cfgPath,
@@ -526,7 +460,7 @@ describe('D11: enrolled + claustrum.enabled=false → skip local refresh', () =>
     const storage = (await loadAccounts(cfgPath))!
 
     const { manager: rawManager, refreshCalls } = await makeSpyManager({
-      readManifest: () => Promise.resolve(enrollmentManifest('d11-1')),
+      readManifest: () => Promise.resolve(enrollmentManifest('enrolled-1')),
     })
 
     await rawManager.getUsableFallbackAccounts(storage)
@@ -535,14 +469,14 @@ describe('D11: enrolled + claustrum.enabled=false → skip local refresh', () =>
   })
 
   it('refreshDueAccounts: ZERO refreshFn calls', async () => {
-    const account = liveAccount('d11-2', { expires: Date.now() - 1_000 })
+    const account = liveAccount('enrolled-2', { expires: Date.now() - 1_000 })
     await saveAccounts(
       liveStorage([account], { claustrum: { enabled: false } }),
       cfgPath,
     )
 
     const { manager, refreshCalls } = await makeSpyManager({
-      readManifest: () => Promise.resolve(enrollmentManifest('d11-2')),
+      readManifest: () => Promise.resolve(enrollmentManifest('enrolled-2')),
     })
 
     await manager.refreshDueAccounts()
@@ -551,14 +485,14 @@ describe('D11: enrolled + claustrum.enabled=false → skip local refresh', () =>
   })
 
   it('refreshQuotaForDueAccounts: ZERO refreshFn calls', async () => {
-    const account = liveAccount('d11-3', { expires: Date.now() - 1_000 })
+    const account = liveAccount('enrolled-3', { expires: Date.now() - 1_000 })
     await saveAccounts(
       liveStorage([account], { claustrum: { enabled: false } }),
       cfgPath,
     )
 
     const { manager, refreshCalls } = await makeSpyManager({
-      readManifest: () => Promise.resolve(enrollmentManifest('d11-3')),
+      readManifest: () => Promise.resolve(enrollmentManifest('enrolled-3')),
     })
 
     await manager.refreshQuotaForDueAccounts()
@@ -567,14 +501,14 @@ describe('D11: enrolled + claustrum.enabled=false → skip local refresh', () =>
   })
 
   it('refreshQuotaForAllAccounts: ZERO refreshFn calls', async () => {
-    const account = liveAccount('d11-4', { expires: Date.now() - 1_000 })
+    const account = liveAccount('enrolled-4', { expires: Date.now() - 1_000 })
     await saveAccounts(
       liveStorage([account], { claustrum: { enabled: false } }),
       cfgPath,
     )
 
     const { manager, refreshCalls } = await makeSpyManager({
-      readManifest: () => Promise.resolve(enrollmentManifest('d11-4')),
+      readManifest: () => Promise.resolve(enrollmentManifest('enrolled-4')),
     })
 
     await manager.refreshQuotaForAllAccounts({ force: true })
@@ -584,7 +518,7 @@ describe('D11: enrolled + claustrum.enabled=false → skip local refresh', () =>
 })
 
 // ---------------------------------------------------------------------------
-// 2g — error writers ignore CustodyTombstoneRefreshError
+// error writers ignore CustodyTombstoneRefreshError
 // ---------------------------------------------------------------------------
 
 describe('recordRefreshError refuses to persist CustodyTombstoneRefreshError', () => {
@@ -654,7 +588,7 @@ describe('recordRefreshError refuses to persist CustodyTombstoneRefreshError', (
 })
 
 // ---------------------------------------------------------------------------
-// 10d — waiter (waitForConcurrentFallbackRefresh) per-poll refreshInert re-check
+// waiter (waitForConcurrentFallbackRefresh) per-poll refreshInert re-check
 // ---------------------------------------------------------------------------
 
 async function acquireLockExternally(accountId: string) {
@@ -667,8 +601,8 @@ async function acquireLockExternally(accountId: string) {
 }
 
 describe('waiter (waitForConcurrentFallbackRefresh) re-evaluates refreshInert per poll', () => {
-  it('10d: force:true caller enters before the tombstone, lands inside the wait → throws', async () => {
-    const accountId = 'waiter-10d'
+  it('force:true caller enters before the tombstone, lands inside the wait → throws', async () => {
+    const accountId = 'waiter-poll'
     const account = liveAccount(accountId, { expires: Date.now() - 1_000 })
     await saveAccounts(liveStorage([account]), cfgPath)
 
@@ -676,13 +610,11 @@ describe('waiter (waitForConcurrentFallbackRefresh) re-evaluates refreshInert pe
     expect(holder).not.toBeNull()
     if (!holder) throw new Error('failed to acquire lock externally')
 
-    let _refreshFnCalls = 0
     let observedRefreshToken: string | undefined
     const manager = new FallbackAccountManager({
       configPath: cfgPath,
       custody: { readManifest: () => Promise.resolve(emptyManifest()) },
       refreshFn: async ({ refreshToken }) => {
-        _refreshFnCalls++
         observedRefreshToken = refreshToken
         return {
           access: 'unused',
@@ -728,8 +660,8 @@ describe('waiter (waitForConcurrentFallbackRefresh) re-evaluates refreshInert pe
     expect(observedRefreshToken).not.toBe(TOMBSTONE_OPENAI)
   })
 
-  it('D11 (waiter): manifest-only change while polling → throws before any return', async () => {
-    const accountId = 'waiter-d11'
+  it('manifest-only change while polling → throws before any return', async () => {
+    const accountId = 'waiter-poll'
     const account = liveAccount(accountId, { expires: Date.now() - 1_000 })
     await saveAccounts(liveStorage([account]), cfgPath)
 
