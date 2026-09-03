@@ -1,5 +1,5 @@
 /**
- * Phase 5 — Custody refresh gates (plan task 3).
+ * Custody refresh gates.
  *
  * Each local fallback refresh path must refuse to invoke the injected refresh
  * provider when the account is `refreshInert` (custody-manifest entry OR
@@ -233,45 +233,185 @@ describe('choke point (refreshAccountNow) refuses refreshInert accounts', () => 
 })
 
 // ---------------------------------------------------------------------------
-// Manager entry gates — four groups
+// Must B — getUsableFallbackAccounts candidate shape (spec §3 D14)
 // ---------------------------------------------------------------------------
 
-async function _makeManager(opts: {
-  refreshFn?: AccountManagerOptions['refreshFn']
-  readManifest?: () => Promise<CustodyManifestReadResult>
-}): Promise<{
-  manager: FallbackAccountManager
-  refreshCalls: () => number
-}> {
-  let calls = 0
-  const refreshFn =
-    opts.refreshFn ??
-    (async () => {
-      calls++
-      return {
-        access: 'unused',
-        refresh: 'unused',
-        expires: Date.now() + 3_600_000,
-        expiresIn: 3600,
-      }
+describe('getUsableFallbackAccounts candidate shape (spec §3 D14)', () => {
+  it('enrolling + valid local token → present in usable, zero refreshFn calls', async () => {
+    // Enrolling (manifest entry, not tombstoned) stays a usable candidate —
+    // it serves its local access token while that token is valid. The local
+    // refresher must NOT run.
+    const account = liveAccount('enr-1', { expires: Date.now() + 3_600_000 })
+    await saveAccounts(liveStorage([account]), cfgPath)
+    const storage = (await loadAccounts(cfgPath))!
+
+    const { manager, refreshCalls } = await makeSpyManager({
+      readManifest: () => Promise.resolve(enrollmentManifest('enr-1')),
     })
-  const tracked: AccountManagerOptions['refreshFn'] = async (input) => {
-    calls++
-    return refreshFn(input)
-  }
-  const manager = new FallbackAccountManager({
-    configPath: cfgPath,
-    custody: {
-      readManifest:
-        opts.readManifest ?? (() => Promise.resolve(emptyManifest())),
-    },
-    refreshFn: tracked,
-    fetchQuotaFn: async () => {
-      throw new Error('no fetchQuotaFn configured for this test')
-    },
+
+    const usable = await manager.getUsableFallbackAccounts(storage)
+    expect(usable).toHaveLength(1)
+    expect(usable[0]?.id).toBe('enr-1')
+    expect(refreshCalls()).toBe(0)
+    expect(manager.refreshAccountCalls).toHaveLength(0)
   })
-  return { manager, refreshCalls: () => calls }
+
+  it('enrolling + expired local token → absent this round, zero refreshFn calls', async () => {
+    // The local refresh was intentionally skipped, so the candidate carries
+    // the still-expired local token. `hasUnexpiredAccessToken` rejects it
+    // before selection — without the explicit skip in the loop the
+    // `accountPassesQuotaPolicy` gate (which never sees an error path) would
+    // happily push an expired account into the candidate list.
+    const account = liveAccount('enr-2', { expires: Date.now() - 1_000 })
+    await saveAccounts(liveStorage([account]), cfgPath)
+    const storage = (await loadAccounts(cfgPath))!
+
+    const { manager, refreshCalls } = await makeSpyManager({
+      readManifest: () => Promise.resolve(enrollmentManifest('enr-2')),
+    })
+
+    const usable = await manager.getUsableFallbackAccounts(storage)
+    expect(usable).toHaveLength(0)
+    expect(refreshCalls()).toBe(0)
+    expect(manager.refreshAccountCalls).toHaveLength(0)
+  })
+
+  it('tombstoned account → absent from usable, zero refreshFn calls', async () => {
+    // Until the vault resolver serves tombstoned accounts the sentinel would
+    // be treated as a usable token, so the
+    // entry gate short-circuits to `continue` before any selection logic.
+    const account = makeSentinelAccount({ id: 'tomb-1' })
+    await saveAccounts(liveStorage([account]), cfgPath)
+    const storage = (await loadAccounts(cfgPath))!
+
+    const { manager, refreshCalls } = await makeSpyManager({
+      readManifest: () => Promise.resolve(emptyManifest()),
+    })
+
+    const usable = await manager.getUsableFallbackAccounts(storage)
+    expect(usable).toHaveLength(0)
+    expect(refreshCalls()).toBe(0)
+    expect(manager.refreshAccountCalls).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// refreshAccountNow — per-reload re-checks (one test per reload site)
+// ---------------------------------------------------------------------------
+
+// Overrides `load` so the manager injects the tombstone sentinel into the
+// in-memory storage on the Nth call. Each test sets `injectAt` to the call
+// number that should observe the tombstone.
+class InjectTombstoneOnLoad extends FallbackAccountManager {
+  loadCalls = 0
+  constructor(
+    options: AccountManagerOptions,
+    private readonly injectAt: number,
+    private readonly targetId: string,
+  ) {
+    super(options)
+  }
+  override async load(): Promise<AccountStorage | null> {
+    this.loadCalls++
+    const loaded = await super.load()
+    if (
+      this.loadCalls === this.injectAt &&
+      loaded &&
+      Array.isArray(loaded.accounts)
+    ) {
+      const target = loaded.accounts.find((a) => a.id === this.targetId)
+      if (target && target.type === 'oauth') {
+        target.access = TOMBSTONE_OPENAI
+        target.refresh = TOMBSTONE_OPENAI
+        target.expires = 0
+      }
+    }
+    return loaded
+  }
 }
+
+describe('refreshAccountNow per-reload choke-point re-checks', () => {
+  it('under-lock load (call 2) sees tombstone injected mid-flight → throws', async () => {
+    const accountId = 'ul-1'
+    const account = liveAccount(accountId, { expires: Date.now() - 1_000 })
+    await saveAccounts(liveStorage([account]), cfgPath)
+
+    let refreshFnCalls = 0
+    let observedRefreshToken: string | undefined
+    const manager = new InjectTombstoneOnLoad(
+      {
+        configPath: cfgPath,
+        custody: { readManifest: () => Promise.resolve(emptyManifest()) },
+        refreshFn: async ({ refreshToken }) => {
+          refreshFnCalls++
+          observedRefreshToken = refreshToken
+          return {
+            access: 'unused',
+            refresh: 'unused',
+            expires: Date.now() + 3_600_000,
+            expiresIn: 3600,
+          }
+        },
+      },
+      2,
+      accountId,
+    )
+
+    const storage = (await loadAccounts(cfgPath))!
+    let thrown: unknown
+    try {
+      await manager.refreshAccount(account, storage, { force: true })
+    } catch (e) {
+      thrown = e
+    }
+
+    expect(thrown).toBeInstanceOf(CustodyTombstoneRefreshError)
+    expect(refreshFnCalls).toBe(0)
+    expect(observedRefreshToken).toBeUndefined()
+  })
+
+  it('post-save load (call 3) sees tombstone injected mid-flight → throws', async () => {
+    const accountId = 'ps-1'
+    const account = liveAccount(accountId, { expires: Date.now() - 1_000 })
+    await saveAccounts(liveStorage([account]), cfgPath)
+
+    let refreshFnCalls = 0
+    const manager = new InjectTombstoneOnLoad(
+      {
+        configPath: cfgPath,
+        custody: { readManifest: () => Promise.resolve(emptyManifest()) },
+        refreshFn: async () => {
+          refreshFnCalls++
+          return {
+            access: 'rotated-access',
+            refresh: 'rotated-refresh',
+            expires: Date.now() + 3_600_000,
+            expiresIn: 3600,
+          }
+        },
+      },
+      3,
+      accountId,
+    )
+
+    const storage = (await loadAccounts(cfgPath))!
+    let thrown: unknown
+    try {
+      await manager.refreshAccount(account, storage, { force: true })
+    } catch (e) {
+      thrown = e
+    }
+
+    expect(thrown).toBeInstanceOf(CustodyTombstoneRefreshError)
+    // The refreshFn ran successfully (it returned valid tokens); the choke
+    // point fires only on the post-save load, AFTER the save.
+    expect(refreshFnCalls).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Manager entry gates — four groups
+// ---------------------------------------------------------------------------
 
 // Spies on the public `refreshAccount` method so the entry-gate tests can
 // observe that the manager entry-gate prevents the call to `refreshAccount`
@@ -379,7 +519,10 @@ describe('manager entry gates skip refreshInert accounts', () => {
 describe('D11: enrolled + claustrum.enabled=false → skip local refresh', () => {
   it('getUsableFallbackAccounts: ZERO refreshFn calls', async () => {
     const account = liveAccount('d11-1', { expires: Date.now() - 1_000 })
-    await saveAccounts(liveStorage([account]), cfgPath)
+    await saveAccounts(
+      liveStorage([account], { claustrum: { enabled: false } }),
+      cfgPath,
+    )
     const storage = (await loadAccounts(cfgPath))!
 
     const { manager: rawManager, refreshCalls } = await makeSpyManager({
@@ -393,7 +536,10 @@ describe('D11: enrolled + claustrum.enabled=false → skip local refresh', () =>
 
   it('refreshDueAccounts: ZERO refreshFn calls', async () => {
     const account = liveAccount('d11-2', { expires: Date.now() - 1_000 })
-    await saveAccounts(liveStorage([account]), cfgPath)
+    await saveAccounts(
+      liveStorage([account], { claustrum: { enabled: false } }),
+      cfgPath,
+    )
 
     const { manager, refreshCalls } = await makeSpyManager({
       readManifest: () => Promise.resolve(enrollmentManifest('d11-2')),
@@ -406,7 +552,10 @@ describe('D11: enrolled + claustrum.enabled=false → skip local refresh', () =>
 
   it('refreshQuotaForDueAccounts: ZERO refreshFn calls', async () => {
     const account = liveAccount('d11-3', { expires: Date.now() - 1_000 })
-    await saveAccounts(liveStorage([account]), cfgPath)
+    await saveAccounts(
+      liveStorage([account], { claustrum: { enabled: false } }),
+      cfgPath,
+    )
 
     const { manager, refreshCalls } = await makeSpyManager({
       readManifest: () => Promise.resolve(enrollmentManifest('d11-3')),
@@ -419,7 +568,10 @@ describe('D11: enrolled + claustrum.enabled=false → skip local refresh', () =>
 
   it('refreshQuotaForAllAccounts: ZERO refreshFn calls', async () => {
     const account = liveAccount('d11-4', { expires: Date.now() - 1_000 })
-    await saveAccounts(liveStorage([account]), cfgPath)
+    await saveAccounts(
+      liveStorage([account], { claustrum: { enabled: false } }),
+      cfgPath,
+    )
 
     const { manager, refreshCalls } = await makeSpyManager({
       readManifest: () => Promise.resolve(enrollmentManifest('d11-4')),
@@ -632,16 +784,21 @@ describe('waiter (waitForConcurrentFallbackRefresh) re-evaluates refreshInert pe
 // ---------------------------------------------------------------------------
 
 describe('refresh backoff keyed by refresh-token hash', () => {
-  it('permanent error stamped on T1 + storage token now T2 → refreshFn invoked', async () => {
+  // The non-force path is the only path that consults refreshBackoffActive.
+  // Driving `refreshDueAccounts` (or any caller that lets the per-call
+  // backoff check run) is the only way to exercise the hash-keying —
+  // `refreshAccount({force:true})` short-circuits before the check and
+  // would never observe a key mismatch.
+  it('permanent error stamped on T1 + storage token now T2 → refreshDueAccounts attempts again', async () => {
     const now = 1_700_000_000_000
     const account = liveAccount('bk-1', {
       access: 'old-access',
       refresh: 'T2-fresh',
-      expires: now - 1_000,
+      expires: now - 1_000, // expired → due path runs the backoff check
       lastRefreshError: {
         message: 'Token refresh failed: 401',
         checkedAt: now - 60_000,
-        nextRetryAt: now + 24 * 60 * 60_000,
+        nextRetryAt: now + 24 * 60 * 60_000, // 24h permanent backoff window
         retryCount: 1,
         tokenHash:
           // sha256("T1-stale") — distinct from the storage's current T2 hash.
@@ -668,15 +825,17 @@ describe('refresh backoff keyed by refresh-token hash', () => {
       },
     })
 
-    const storage = (await loadAccounts(cfgPath))!
-    await manager.refreshAccount(account, storage, { force: true })
+    await manager.refreshDueAccounts()
+    // Token-hash mismatch on the backoff key is the bypass: the account's
+    // current refresh token (T2) does not hash to the key the error was
+    // stamped with (T1), so the backoff is inert.
     expect(refreshFnCalls).toBe(1)
     expect(observedRefreshToken).toBe('T2-fresh')
   })
 })
 
 // ---------------------------------------------------------------------------
-// Exports — task 8 reads these
+// Exports consumed by the enroll verb
 // ---------------------------------------------------------------------------
 
 describe('lock-name + TTL exports for the refresh choke point', () => {
