@@ -61,6 +61,8 @@ import {
   ClaustrumCredentialCache,
   type CompleteEnrollmentDeps,
   type CompleteEnrollmentOutcome,
+  CUSTODY_EXCLUDED,
+  CUSTODY_REFUSE,
   clearEnrollPending,
   completeFallbackEnrollment,
   custodied,
@@ -69,7 +71,9 @@ import {
   excluded,
   refreshInert,
   resolveFallbackAccess,
+  stampVaultProvenance,
   tombstoned,
+  type VaultProvenance,
 } from './core/custody.ts'
 import {
   CUSTODY_OWNING_PROVIDER,
@@ -261,6 +265,14 @@ interface ResetTargetResolverDeps {
   loadAccounts: typeof loadAccounts
   accountStoragePath: string
   now: () => number
+  isFallbackRefreshInert?: (
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ) => Promise<boolean>
+  resolveFallbackAccess?: (
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ) => ReturnType<typeof resolveFallbackAccess>
 }
 
 function resetTargetNeedsRefresh(
@@ -338,6 +350,7 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
 
     let resolved = account
     if (
+      !(await deps.isFallbackRefreshInert?.(resolved, storage)) &&
       resetTargetNeedsRefresh(
         resolved.access,
         resolved.expires,
@@ -347,7 +360,15 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
     ) {
       resolved = await deps.refreshFallbackAccount(resolved, storage)
     }
-    if (!resolved.access) {
+    const accessResolution = deps.resolveFallbackAccess
+      ? await deps.resolveFallbackAccess(resolved, storage)
+      : resolved.access
+        ? { token: resolved.access, provenance: 'local' as const }
+        : CUSTODY_REFUSE
+    if (
+      accessResolution === CUSTODY_REFUSE ||
+      accessResolution === CUSTODY_EXCLUDED
+    ) {
       throw new ResetTargetResolutionError(
         'token_unavailable',
         `Fallback account ${accountKey} has no usable access token.`,
@@ -379,7 +400,7 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
     return {
       accountKey,
       label: resolved.label ?? accountKey,
-      accessToken: resolved.access,
+      accessToken: accessResolution.token,
       chatgptAccountId: freshAccount.accountId,
     }
   }
@@ -416,6 +437,10 @@ interface CodexAuthPluginOptions {
   codexApiEndpoint?: string
   experimentalWebSockets?: boolean
   responsesLite?: boolean
+  custody?: {
+    transport: ClaustrumCacheTransportLike
+    detection?: 'available' | 'absent'
+  }
 }
 
 interface CodexSessionMetadata {
@@ -1909,6 +1934,7 @@ export async function CodexAuthPlugin(
               now: opts.now,
             }),
           quotaManager,
+          custody: { readManifest: readCustodyManifest },
           onFallbackStorageChanged: invalidateRequestStorageCache,
         })
         // -------------------------------------------------------------------
@@ -1918,6 +1944,7 @@ export async function CodexAuthPlugin(
         // cache + transport regardless of whether custody is enabled.
         // -------------------------------------------------------------------
         const custodyLogger = createLogger('custody')
+        const custodyOptions = options.custody
         const custodyRuntime = __createCustodyRuntimeForTest({
           storage,
           configPath: getConfigPath(),
@@ -1925,6 +1952,20 @@ export async function CodexAuthPlugin(
           mutateAccounts,
           readCustodyManifest,
           acquireRefreshFileLock,
+          ...(custodyOptions
+            ? {
+                detectClaustrumConnection: async () =>
+                  custodyOptions.detection === 'absent'
+                    ? { status: 'absent' as const, path: 'test' }
+                    : {
+                        status: 'available' as const,
+                        schema: 1,
+                        wireVersion: 1,
+                        endpoints: [],
+                      },
+                cacheConnector: async () => custodyOptions.transport,
+              }
+            : {}),
           logger: {
             info: (msg, meta) =>
               custodyLogger.info(msg, meta ?? {}) as unknown as undefined,
@@ -1975,6 +2016,21 @@ export async function CodexAuthPlugin(
           return resolveFallbackAccess(account, currentStorage, manifest, {
             cache,
             manifestHandle: handle,
+            requestPath: true,
+            refreshBeforeExpiryMs:
+              (currentStorage.refresh?.refreshBeforeExpiryMinutes ?? 240) *
+              60_000,
+            completeEnrollmentDeps: {
+              loadAccounts,
+              readCustodyManifest,
+              acquireRefreshFileLock,
+              configPath: getConfigPath(),
+              cache,
+              minTtlMs: custodyMinTtlMs(currentStorage),
+              mutateAccounts,
+              provider: CUSTODY_OWNING_PROVIDER,
+              now: Date.now,
+            },
           })
         }
         async function reportAuthFailureForCustody(params: {
@@ -2262,13 +2318,26 @@ export async function CodexAuthPlugin(
               : undefined
             if (!account)
               throw new Error(`fallback account ${accountId} not found`)
-            const refreshed = await fallbackManager.refreshAccount(
-              account,
-              fbStorage ?? { version: 1 as const, accounts: [account] },
+            const currentStorage = fbStorage ?? {
+              version: 1 as const,
+              accounts: [account],
+            }
+            let resolved = account
+            if (
+              !(await isFallbackAccountRefreshInert(account, currentStorage))
+            ) {
+              resolved = await fallbackManager.refreshAccount(
+                account,
+                currentStorage,
+              )
+            }
+            const access = await resolveAccountAccessForCustody(
+              resolved,
+              currentStorage,
             )
-            if (!refreshed.access)
+            if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED)
               throw new Error(`no access token for ${accountId}`)
-            return refreshed.access
+            return access.token
           },
           codexResponsesUrl: codexApiEndpoint,
           logger: cacheKeepLogger,
@@ -2553,6 +2622,8 @@ export async function CodexAuthPlugin(
             loadAccounts,
             accountStoragePath: getConfigPath(),
             now: Date.now,
+            isFallbackRefreshInert: isFallbackAccountRefreshInert,
+            resolveFallbackAccess: resolveAccountAccessForCustody,
           }),
           ...buildResetRedemptionDeps(),
           cacheKeepManager,
@@ -2638,12 +2709,32 @@ export async function CodexAuthPlugin(
         // sendWithAccessToken — the one primitive that both main and fallback
         // sends call.  Wraps the existing Codex transform + send.
         // -------------------------------------------------------------------
+        const responseVaultProvenance = new WeakMap<Response, VaultProvenance>()
+
+        function observeVaultAuthFailure(response: Response, url: URL): void {
+          const provenance = responseVaultProvenance.get(response)
+          if (
+            !provenance ||
+            response.status !== 401 ||
+            url.hostname !== 'chatgpt.com' ||
+            !url.pathname.startsWith('/backend-api/codex/')
+          ) {
+            return
+          }
+          void reportAuthFailureForCustody({
+            handle: provenance.handle,
+            providerStatus: response.status,
+            recordVersion: provenance.recordVersion,
+          }).catch(() => {})
+        }
+
         async function sendWithAccessToken(
           requestInput: RequestInfo | URL,
           init: RequestInit | undefined,
           accessToken: string,
           accountId?: string,
           keepwarmAccountKey: string = 'main',
+          provenance?: VaultProvenance,
         ): Promise<Response> {
           const headers = effectiveRequestHeaders(requestInput, init)
           headers.delete('x-api-key')
@@ -2684,6 +2775,15 @@ export async function CodexAuthPlugin(
             parsed.pathname.includes('/chat/completions')
               ? new URL(codexApiEndpoint)
               : parsed
+          const stamp = (response: Response) => {
+            const stamped = stampVaultProvenance(
+              response,
+              provenance,
+              responseVaultProvenance,
+            )
+            observeVaultAuthFailure(stamped, url)
+            return stamped
+          }
 
           const prepared = prepareCodexRequest({
             init: {
@@ -2735,11 +2835,13 @@ export async function CodexAuthPlugin(
                 keepwarmCapture.isSubagent,
               )
             }
-            return websocketFetch(url, requestInit)
+            return stamp(await websocketFetch(url, requestInit))
           }
           const finalInit =
             OpenAIWebSocketPool.withoutInternalHeaders(requestInit)
-          if (typeof finalInit?.body !== 'string') return fetch(url, finalInit)
+          if (typeof finalInit?.body !== 'string') {
+            return stamp(await fetch(url, finalInit))
+          }
 
           // Keepwarm capture: track every request body for idle
           // prompt-cache warming. Cheap — stores the already-serialized string.
@@ -2772,7 +2874,7 @@ export async function CodexAuthPlugin(
               headers: finalInit.headers,
               status: response.status,
             })
-            return translateHostedWebSearchResponse(response)
+            return stamp(translateHostedWebSearchResponse(response))
           } catch (error) {
             await dumpCodexRequest({
               sessionID,
@@ -3021,6 +3123,7 @@ export async function CodexAuthPlugin(
         // -------------------------------------------------------------------
         type FallbackCandidate = {
           access: string
+          provenance: VaultProvenance | 'local'
           accountId?: string
           keepwarmAccountKey: string
           quotaAccountId: string
@@ -3040,6 +3143,7 @@ export async function CodexAuthPlugin(
           accountId: string
           wireAccountId?: string
           access: string
+          provenance?: VaultProvenance | 'local'
           keepwarmAccountKey: string
           fallback?: FallbackAccount
           quota: AccountQuota | null | undefined
@@ -3118,8 +3222,14 @@ export async function CodexAuthPlugin(
           ]
           const usableFallbacks =
             await fallbackManager.getUsableFallbackAccounts(input.storage)
+          if (!input.storage) return roster
           for (const fallback of usableFallbacks) {
-            if (!fallback.access) continue
+            const access = await resolveAccountAccessForCustody(
+              fallback,
+              input.storage,
+            )
+            if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED)
+              continue
             const fileEntry = input.sidebarState.fallbacks.find(
               (account) => account.id === fallback.id,
             )
@@ -3145,7 +3255,8 @@ export async function CodexAuthPlugin(
             roster.push({
               accountId: fallback.id,
               wireAccountId: fallback.accountId,
-              access: fallback.access,
+              access: access.token,
+              provenance: access.provenance,
               keepwarmAccountKey: fallback.id,
               fallback,
               quota: freshest.quota,
@@ -3329,16 +3440,23 @@ export async function CodexAuthPlugin(
           const usableFallbacks =
             await fallbackManager.getUsableFallbackAccounts(fallbackStorage)
           const candidates: FallbackCandidate[] = []
+          if (!fallbackStorage)
+            return { current: [], retained: [], skipped: [] }
           for (const fb of usableFallbacks) {
-            if (fb.access) {
-              candidates.push({
-                access: fb.access,
-                accountId: fb.accountId,
-                keepwarmAccountKey: fb.id,
-                quotaAccountId: fb.id,
-                fallback: fb,
-              })
-            }
+            const access = await resolveAccountAccessForCustody(
+              fb,
+              fallbackStorage,
+            )
+            if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED)
+              continue
+            candidates.push({
+              access: access.token,
+              provenance: access.provenance,
+              accountId: fb.accountId,
+              keepwarmAccountKey: fb.id,
+              quotaAccountId: fb.id,
+              fallback: fb,
+            })
           }
           // Mid-stream rate-limit mark: never re-try a fallback a prior request
           // just exhausted mid-generation. Unlike the killswitch quota filter
@@ -3459,6 +3577,9 @@ export async function CodexAuthPlugin(
                 candidate.access,
                 candidate.accountId,
                 candidate.keepwarmAccountKey,
+                candidate.provenance === 'local'
+                  ? undefined
+                  : candidate.provenance,
               )
             } catch (error) {
               // A caller abort and an indeterminate transport failure both
@@ -3537,6 +3658,9 @@ export async function CodexAuthPlugin(
                 candidate.access,
                 candidate.accountId,
                 candidate.keepwarmAccountKey,
+                candidate.provenance === 'local'
+                  ? undefined
+                  : candidate.provenance,
               )
             } catch (error) {
               if (
@@ -3770,6 +3894,9 @@ export async function CodexAuthPlugin(
                   stickyCandidate.access,
                   stickyCandidate.wireAccountId,
                   stickyCandidate.keepwarmAccountKey,
+                  stickyCandidate.provenance === 'local'
+                    ? undefined
+                    : stickyCandidate.provenance,
                 )
 
                 const pushStickyQuota = async (
@@ -3832,6 +3959,9 @@ export async function CodexAuthPlugin(
                       replacement.access,
                       replacement.wireAccountId,
                       replacement.keepwarmAccountKey,
+                      replacement.provenance === 'local'
+                        ? undefined
+                        : replacement.provenance,
                     )
                     previousResponse.body?.cancel().catch(() => {})
                     stickyCandidate = replacement
@@ -3985,6 +4115,7 @@ export async function CodexAuthPlugin(
                   primaryAccess,
                   mainAccountIdentity,
                   'main',
+                  undefined,
                 )
               }
             }
