@@ -633,9 +633,8 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     // claustrum: one plugin-wide gate. No per-account map (intentional —
     // membership is the manifest entry). Coerce only true booleans; anything
     // else collapses to false so a typo (e.g. `"enabled": "true"`) does not
-    // silently arm the vault path. manifestWrite defaults false here; the
-    // absent-value default is flipped in a later task once the vendored lock
-    // is available. Explicit false is always an operator kill switch.
+    // silently arm the vault path. manifestWrite defaults false; explicit
+    // false is always an operator kill switch.
     claustrum: isRecord(value.claustrum)
       ? {
           enabled: value.claustrum.enabled === true,
@@ -1701,7 +1700,7 @@ function isAccountStore(value: Record<string, unknown>): boolean {
  * Tolerates expired/revoked tokens (migrates them; refresh handles validity).
  *
  * Guards against first-run races with the same save-lock order used by
- * structural account mutations.
+ * structural account writes.
  */
 export async function migrateIfNeeded(
   existingToken:
@@ -2135,15 +2134,6 @@ export class FallbackAccountManager {
               throw error
             }
           }
-        }
-        // Enrolling + due: refresh was intentionally skipped, so the local
-        // token is still expired. The catch path's `hasUsableCandidateToken`
-        // guard only fires on error (none thrown here), so check it inline.
-        if (
-          state === 'enrolling' &&
-          !hasUnexpiredAccessToken(candidate, this.now())
-        ) {
-          continue
         }
         this.seedFallbackQuota(candidate, storage)
         // Quota is pushed per-turn from transport headers/WS frames; selection

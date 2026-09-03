@@ -13,7 +13,7 @@
  *
  * The injected deps are optional — absent deps mean pre-custody behaviour,
  * which the existing `refresh-all-quota.test.ts` suite pins. Each test
- * here is named for the BEHAVIOUR it guards (mutation a test guards is
+ * here is named for the behaviour it guards (the deliberately defeated branch is
  * stated as behaviour in the name).
  */
 
@@ -80,7 +80,7 @@ interface MakeDepsOptions {
   /** Use a tombstoned account as the only fallback (sentinel access/refresh, expires 0). */
   tombstoned?: boolean
   /** Throw on a tombstoned account when refreshAccount is called — mirrors real
-   *  FallbackAccountManager behaviour for the "no gate" mutation. */
+   *  FallbackAccountManager behaviour when the gate is absent. */
   tombstoneRefreshThrows?: boolean
   /** Captured warn messages (matches the `quota` logger.debug/warn pair). */
   logger?: { debug: ReturnType<typeof mock>; warn: ReturnType<typeof mock> }
@@ -624,7 +624,7 @@ describe('refresh-inert quota poll', () => {
     expect(fb?.ok).toBe(false)
   })
 
-  it('mutation: drop the refresh-inert arm → wham never called and loop exits with "no usable access token"', async () => {
+  it('fails closed when a refresh-inert account has no resolver', async () => {
     // With the refresh-inert branch removed but the local-refresh block
     // remaining, a tombstoned account goes through the existing refresh
     // path which exposes the sentinel's expired expiry — the loop exits
@@ -646,7 +646,7 @@ describe('refresh-inert quota poll', () => {
     expect(fb?.error?.toLowerCase()).toContain('no usable access token')
   })
 
-  it('mutation: remove the custody deps → tombstone-class error observed on the quota path', async () => {
+  it('does not refresh locally when custody dependencies are incomplete', async () => {
     // Without the custody deps wired in, the loop falls into the local
     // refresh block which invokes the manager's choke point. The choke
     // point throws `CustodyTombstoneRefreshError` for a tombstoned account,

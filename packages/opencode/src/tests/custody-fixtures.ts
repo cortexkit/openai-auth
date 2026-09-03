@@ -63,7 +63,11 @@ export function emptyManifest(): CustodyManifestReadResult {
 }
 
 export function enrollmentManifest(label: string): CustodyManifestReadResult {
-  const handle = `ckh_${'a'.repeat(43)}`
+  const suffix =
+    label === 'custody-1'
+      ? 'a'.repeat(43)
+      : Buffer.from(label).toString('base64url').padEnd(43, 'a').slice(0, 43)
+  const handle = `ckh_${suffix}`
   return {
     ok: true,
     value: {

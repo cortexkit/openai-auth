@@ -304,3 +304,24 @@ export const CUSTODY_MANIFEST_TENANT = TENANT
 export const CUSTODY_OWNING_PROVIDER = OWNING_PROVIDER
 export const CUSTODY_OWNING_SHAPE = OWNING_SHAPE
 export const CUSTODY_OWNING_SERVE = OWNING_SERVE
+
+/** Returns the owning tenant's case-exact account-label to vault-handle map. */
+export function custodyManifestHandles(
+  manifest: CustodyManifestReadResult,
+): ReadonlyMap<string, string> {
+  if (!manifest.ok) return new Map()
+  const handles = new Map<string, string>()
+  for (const provider of manifest.value.providers) {
+    if (
+      provider.provider !== OWNING_PROVIDER ||
+      provider.shape !== OWNING_SHAPE ||
+      provider.serve !== OWNING_SERVE
+    ) {
+      continue
+    }
+    for (const account of provider.accounts) {
+      handles.set(account.label, account.handle)
+    }
+  }
+  return handles
+}
