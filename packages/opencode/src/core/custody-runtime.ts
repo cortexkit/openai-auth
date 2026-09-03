@@ -294,12 +294,6 @@ export function __createCustodyRuntimeForTest(
     },
   }
 
-  async function _runBootSweep(): Promise<void> {
-    // Boot performs the completion sweep inline before returning; this legacy
-    // entrypoint remains only for callers that still reference the symbol.
-    return
-  }
-
   async function runCompletionSweep(
     manifest: ReturnType<typeof options.readCustodyManifest> extends Promise<
       infer R

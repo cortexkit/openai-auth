@@ -5,8 +5,8 @@
  * completion sweep before the background refresh is armed, ticks every five
  * minutes with jitter, and projects custody state into the sidebar. These
  * tests drive the runtime directly through `__createCustodyRuntimeForTest`
- * with injectable deps so each scenario is observable without the full
- * plugin.
+ * with injectable deps; the loader-order case drives `CodexAuthPlugin` through
+ * its custody seam so the handoff to background refresh is observable.
  */
 
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test'
@@ -930,6 +930,8 @@ describe('custody boot order', () => {
         {} as never,
       )
       await entered
+      expect(starts).not.toHaveBeenCalled()
+      await new Promise((resolve) => setTimeout(resolve, 125))
       expect(starts).not.toHaveBeenCalled()
       releaseResolve()
       await loading
