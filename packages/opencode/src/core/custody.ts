@@ -20,10 +20,9 @@
  * messages/causes, or any surface that could be dumped or sidetabled.
  */
 
+import { setTimeout as sleep } from 'node:timers/promises'
 import { createLogger } from '../logger.ts'
-import type { ManifestHandleFile } from '../vendor/claustrum-client/manifest-lock.ts'
 import type { AccountStorage, OAuthAccount } from './accounts.ts'
-import { normalizeAccount as normalizeAccountFromStore } from './accounts.ts'
 import {
   CUSTODY_OWNING_PROVIDER,
   CUSTODY_OWNING_SERVE,
@@ -63,22 +62,6 @@ export type ServedFallbackCredential = {
 // Tombstone sentinel — survives `normalizeAccount`
 // ---------------------------------------------------------------------------
 
-/**
- * The tombstone sentinel is a non-empty string, distinct from any real
- * refresh token. An OAuth account is tombstoned iff access+refresh are both
- * the sentinel AND `expires === 0`. The empty sentinel is dropped by
- * `normalizeAccount` (refresh is required to be a non-empty string for an
- * oauth entry to survive), so a tombstone survives normalization as the
- * sentinel value, never as the empty string.
- *
- * Re-exported here so the custody test suite can assert the sentinel
- * survives normalization without dragging the entire account-store surface
- * into the import.
- */
-export function normalizeAccount(value: unknown): OAuthAccount | null {
-  return normalizeAccountFromStore(value) as OAuthAccount | null
-}
-
 // ---------------------------------------------------------------------------
 // Predicates
 // ---------------------------------------------------------------------------
@@ -114,7 +97,6 @@ function owningAccount(
 export function enrolled(
   account: OAuthAccount,
   manifest: CustodyManifestReadResult,
-  _storage?: Pick<AccountStorage, 'claustrum'>,
 ): boolean {
   return owningAccount(account, manifest)
 }
@@ -144,10 +126,11 @@ export function custodied(
   account: OAuthAccount,
   manifest: CustodyManifestReadResult,
   storage: Pick<AccountStorage, 'claustrum'>,
+  provider: string = CUSTODY_OWNING_PROVIDER,
 ): boolean {
   if (!storage.claustrum?.enabled) return false
   if (!enrolled(account, manifest)) return false
-  return tombstoned(account, CUSTODY_OWNING_PROVIDER)
+  return tombstoned(account, provider)
 }
 
 /**
@@ -157,10 +140,9 @@ export function custodied(
 export function enrolling(
   account: OAuthAccount,
   manifest: CustodyManifestReadResult,
+  provider: string = CUSTODY_OWNING_PROVIDER,
 ): boolean {
-  return (
-    enrolled(account, manifest) && !tombstoned(account, CUSTODY_OWNING_PROVIDER)
-  )
+  return enrolled(account, manifest) && !tombstoned(account, provider)
 }
 
 /**
@@ -244,8 +226,10 @@ export async function resolveFallbackAccess(
 ): Promise<
   FallbackAccessResolution | typeof CUSTODY_REFUSE | typeof CUSTODY_EXCLUDED
 > {
-  const manifestState: CustodyManifestReadResult =
-    manifest ?? (await readDefaultManifestForResolver())
+  const manifestState: CustodyManifestReadResult = manifest ?? {
+    ok: true,
+    value: { version: 1, providers: [] },
+  }
 
   if (tombstoned(account, CUSTODY_OWNING_PROVIDER)) {
     if (!storage.claustrum?.enabled) return CUSTODY_EXCLUDED
@@ -280,17 +264,6 @@ export async function resolveFallbackAccess(
   return { token: account.access, provenance: 'local' }
 }
 
-async function readDefaultManifestForResolver(): Promise<CustodyManifestReadResult> {
-  // The resolver contract does not require reading the manifest here —
-  // callers pass an explicit manifest snapshot. When none is passed, the
-  // resolver behaves as if no manifest entry exists, which is the safe
-  // default for a non-custodied account.
-  return {
-    ok: true,
-    value: { version: 1, providers: [] } satisfies ManifestHandleFile,
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Credential cache
 // ---------------------------------------------------------------------------
@@ -300,6 +273,7 @@ export type ClaustrumCredentialCacheOptions = {
     connectionFile: string
     handshakeTimeoutMs?: number
   }) => Promise<ClaustrumCacheTransport>
+  now?: () => number
 }
 
 export type ClaustrumCacheTransport = {
@@ -350,6 +324,7 @@ export class ClaustrumCredentialCache {
   readonly #blocked = new Set<string>()
   readonly #reauth = new Map<string, number>() // handle -> reauthUntilMs
   readonly #reportBound = new Map<string, ReportBound>() // handle -> bound
+  readonly #now: () => number
   #closed = false
 
   constructor(options: ClaustrumCredentialCacheOptions) {
@@ -357,6 +332,7 @@ export class ClaustrumCredentialCache {
       connectionFile: '',
       handshakeTimeoutMs: 5_000,
     })
+    this.#now = options.now ?? Date.now
   }
 
   /**
@@ -441,7 +417,7 @@ export class ClaustrumCredentialCache {
         return record
       }
       // Same poisoned version — back off and retry.
-      await new Promise((resolve) => setTimeout(resolve, 5 * (attempt + 1)))
+      await sleep(5 * (attempt + 1))
     }
     throw new Error('custody credential rejected version after retries')
   }
@@ -465,7 +441,7 @@ export class ClaustrumCredentialCache {
   }): Promise<void> {
     if (this.#closed) return
     const { handle, recordVersion, providerStatus } = params
-    const now = Date.now()
+    const now = this.#now()
     // Version fence (monotonic per handle): once a version has been reported
     // for this handle, subsequent reports for the same version are dropped
     // without round-tripping to the daemon. A cleared resident (after a
@@ -557,14 +533,4 @@ export class CustodyTombstoneRefreshError extends Error {
     super(`custody tombstoned: ${custodyTombstoneKey(provider)}`)
     this.name = 'CustodyTombstoneRefreshError'
   }
-}
-
-// ---------------------------------------------------------------------------
-// Test seam
-// ---------------------------------------------------------------------------
-
-export function __resetCustodyStateForTest(): void {
-  // Process-local cache state lives inside each ClaustrumCredentialCache
-  // instance — closing the test's instance clears it. No module-level
-  // mutable state remains after the close, so this seam is a no-op.
 }
