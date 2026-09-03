@@ -17,7 +17,12 @@ import {
   quotaBackoffActive,
   refreshBackoffActive,
 } from './backoff.ts'
-import { CustodyTombstoneRefreshError, refreshInert } from './custody.ts'
+import {
+  CustodyTombstoneRefreshError,
+  enrolling,
+  refreshInert,
+  tombstoned,
+} from './custody.ts'
 import type { CustodyManifestReadResult } from './custody-manifest.ts'
 import { extractAccountId } from './oauth'
 import type {
@@ -1948,8 +1953,9 @@ export class FallbackAccountManager {
   }
 
   // Throws CustodyTombstoneRefreshError when the account is refresh-inert
-  // (manifest entry OR tombstone sentinel). The storage toggle is
-  // intentionally ignored — see the drift preamble.
+  // (manifest entry OR tombstone sentinel). The storage toggle does not
+  // participate: enabling or disabling it must not resurrect a local
+  // refresher over a vault-held family.
   private async assertNotCustodyInert(
     account: OAuthAccount | undefined,
   ): Promise<void> {
@@ -1967,6 +1973,21 @@ export class FallbackAccountManager {
     if (!this.custodyReadManifest) return false
     const manifest = await this.custodyReadManifest()
     return refreshInert(account, manifest, this.custodyProvider)
+  }
+
+  // Granular form for `getUsableFallbackAccounts`: tombstoned accounts are
+  // never usable candidates until the vault resolver serves them; enrolling
+  // accounts (manifest entry, not tombstoned) remain
+  // usable while their local token is valid but must never be refreshed
+  // locally — the refresh gate is the source of truth, the selection path
+  // is a separate concern.
+  private async custodyAccountState(
+    account: OAuthAccount,
+  ): Promise<'enrolling' | 'tombstoned' | null> {
+    if (!this.custodyReadManifest) return null
+    if (tombstoned(account, this.custodyProvider)) return 'tombstoned'
+    const manifest = await this.custodyReadManifest()
+    return enrolling(account, manifest) ? 'enrolling' : null
   }
 
   /**
@@ -2043,10 +2064,15 @@ export class FallbackAccountManager {
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
       if (isMainAccountFallback(storage, account)) continue
-      // Entry gate: an enrolled or tombstoned account never serves the local
-      // refresh path. The manifest reader re-reads per call so a manifest
-      // entry appearing between iterations is still observed.
-      if (await this.isCustodyRefreshInert(account)) continue
+      // (i) Tombstoned: never a candidate here. Until the vault resolver
+      // serves tombstoned accounts, the sentinel would otherwise be treated
+      // as a usable token.
+      const state = await this.custodyAccountState(account)
+      if (state === 'tombstoned') continue
+      // (ii) Enrolling (manifest entry, not tombstoned): keep the account
+      // as a candidate while its local token is valid, but never refresh
+      // it locally — the manifest says the vault owns the family.
+      const skipRefresh = state === 'enrolling'
       let refreshFailed = false
       let candidate = account
       try {
@@ -2061,30 +2087,38 @@ export class FallbackAccountManager {
               formatRefreshBackoffMessage(refreshError, this.now()),
             )
           }
-          try {
-            candidate = await this.refreshAccount(candidate, storage)
-            changed = true
-          } catch (error) {
-            if (isAccountRemovedDuringRefreshError(error)) continue
-            refreshFailed = true
-            const stored = storage.accounts.find(
-              (candidate): candidate is OAuthAccount =>
-                candidate.id === account.id && isOAuthAccount(candidate),
-            )
-            if (
-              stored &&
-              !refreshBackoffActive(
-                stored.lastRefreshError,
-                stored.refresh,
-                this.now(),
-              )
-            ) {
-              recordRefreshError(stored, error, this.now())
-              updateStoredAccount(storage, stored)
+          if (!skipRefresh) {
+            try {
+              candidate = await this.refreshAccount(candidate, storage)
               changed = true
+            } catch (error) {
+              if (isAccountRemovedDuringRefreshError(error)) continue
+              refreshFailed = true
+              const stored = storage.accounts.find(
+                (candidate): candidate is OAuthAccount =>
+                  candidate.id === account.id && isOAuthAccount(candidate),
+              )
+              if (
+                stored &&
+                !refreshBackoffActive(
+                  stored.lastRefreshError,
+                  stored.refresh,
+                  this.now(),
+                )
+              ) {
+                recordRefreshError(stored, error, this.now())
+                updateStoredAccount(storage, stored)
+                changed = true
+              }
+              throw error
             }
-            throw error
           }
+        }
+        // Enrolling + due: refresh was intentionally skipped, so the local
+        // token is still expired. The catch path's `hasUsableCandidateToken`
+        // guard only fires on error (none thrown here), so check it inline.
+        if (skipRefresh && !hasUnexpiredAccessToken(candidate, this.now())) {
+          continue
         }
         this.seedFallbackQuota(candidate, storage)
         // Quota is pushed per-turn from transport headers/WS frames; selection
