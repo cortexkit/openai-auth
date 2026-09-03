@@ -88,6 +88,30 @@ export interface SidebarAccountState {
   killed: boolean
   enabled: boolean
   resetCredits?: number
+  /** Vault-custody projection (fallback accounts only). Six states,
+   *  four reasons — see `projectCustodyForSidebar`. The main slot is
+   *  always rendered as frozen-local and never carries this field. */
+  custody?: SidebarAccountCustody
+}
+
+export type SidebarCustodyState =
+  | 'vault'
+  | 'vaultReauth'
+  | 'vaultGone'
+  | 'needsLogin'
+  | 'enrollPending'
+  | 'local'
+
+export type SidebarCustodyReason =
+  | 'unavailable'
+  | 'gone'
+  | 'identityMismatch'
+  | 'nullClaim'
+
+export interface SidebarAccountCustody {
+  state: SidebarCustodyState
+  reason?: SidebarCustodyReason
+  recordVersion?: number
 }
 
 export interface ActiveRoutingEntry {
@@ -183,6 +207,57 @@ function resetCreditsField(value: unknown): { resetCredits?: number } {
   return credits !== undefined ? { resetCredits: credits } : {}
 }
 
+const CUSTODY_STATES = new Set<SidebarCustodyState>([
+  'vault',
+  'vaultReauth',
+  'vaultGone',
+  'needsLogin',
+  'enrollPending',
+  'local',
+])
+
+const CUSTODY_REASONS = new Set<SidebarCustodyReason>([
+  'unavailable',
+  'gone',
+  'identityMismatch',
+  'nullClaim',
+])
+
+/**
+ * Tolerant reader for the per-fallback `custody` projection. Unknown state
+ * or reason values are dropped (NOT replaced with a default — a stale state
+ * file with an experimental `vaultHealing` value must not silently render
+ * as `local`, it must render as no-projection-at-all). Valid values round-
+ * trip byte-identical. The output never contains a handle or a token; the
+ * only emitted fields are `state`, `reason`, and `recordVersion`.
+ */
+function normalizeSidebarCustody(
+  value: unknown,
+): SidebarAccountCustody | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined
+  }
+  const c = value as Record<string, unknown>
+  if (
+    typeof c.state !== 'string' ||
+    !CUSTODY_STATES.has(c.state as SidebarCustodyState)
+  ) {
+    return undefined
+  }
+  const state = c.state as SidebarCustodyState
+  const out: SidebarAccountCustody = { state }
+  if (
+    typeof c.reason === 'string' &&
+    CUSTODY_REASONS.has(c.reason as SidebarCustodyReason)
+  ) {
+    out.reason = c.reason as SidebarCustodyReason
+  }
+  if (typeof c.recordVersion === 'number' && Number.isFinite(c.recordVersion)) {
+    out.recordVersion = c.recordVersion
+  }
+  return out
+}
+
 function normalizeActiveRouting(value: unknown): ActiveRoutingMap | undefined {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return undefined
@@ -276,6 +351,125 @@ export function getSidebarStateFile(): string {
   return process.env[STATE_FILE_ENV] || DEFAULT_STATE_FILE
 }
 
+/**
+ * Shape of the cache inputs the custody projection consumes. Defined as a
+ * structural type (not a class import) so the projection stays pure and
+ * testable: production wires a `ClaustrumCredentialCache`; tests wire a
+ * fake. Only the read surface is referenced — never the credential material.
+ */
+export interface CustodyCacheReadView {
+  isBlocked(handle: string): boolean
+  isReauth(handle: string, now?: number): boolean
+  peekMetadata(
+    handle: string,
+  ): Promise<{ recordVersion: number; expiresAtMs: number } | undefined>
+}
+
+export interface ProjectCustodyInput {
+  /** Local oauth account (for tombstone / refresh-token checks). */
+  tombstoned: boolean
+  /** Whether the plugin-wide claustrum storage toggle is on. */
+  storageEnabled: boolean
+  /** Whether the manifest has a case-exact entry for this account id. */
+  enrolled: boolean
+  /** Handle from the manifest entry (required to query cache state). */
+  handle?: string
+  /** Latched enroll failure reason from the process-local store. */
+  enrollPendingReason?:
+    | 'unavailable'
+    | 'gone'
+    | 'identityMismatch'
+    | 'nullClaim'
+  /** Live read-only view of the cache; absent on unenrolled/tombstone-false. */
+  cache?: CustodyCacheReadView
+  /** Caller-supplied "now" so tests can drive the reauth fence deterministically. */
+  now?: number
+}
+
+/**
+ * Project a fallback account into a six-state custody view for the sidebar.
+ *
+ * Order of checks (high priority first):
+ *   1. Latched enroll-pending reason — the sweep set a reason; render it.
+ *   2. Excluded (tombstoned + storage off) — the operator must relink the
+ *      account; the vault refuses to serve.
+ *   3. Custodied (tombstoned + storage on + enrolled) — consult the cache:
+ *      blocked → `vaultGone`, reauth-bound → `vaultReauth`, live resident
+ *      record → `vault` with the served recordVersion, otherwise
+ *      `vaultReauth` (no record yet; the operator must wait for the next
+ *      successful `get`).
+ *   4. Custody-refuse (tombstoned + storage on + NOT enrolled) — the manifest
+ *      does not recognize the account, so it reads as `needsLogin` to the
+ *      operator. Same UX as excluded; the underlying reason differs.
+ *   5. Ordinary fallback / enrolling without a failure — `local`.
+ *
+ * The projection is display-only. The output never contains a handle, a
+ * token, a payload, or any sentinel string.
+ */
+export function projectCustodyForSidebar(
+  input: ProjectCustodyInput,
+): SidebarAccountCustody {
+  if (input.enrollPendingReason) {
+    return { state: 'enrollPending', reason: input.enrollPendingReason }
+  }
+  if (input.tombstoned && !input.storageEnabled) {
+    return { state: 'needsLogin' }
+  }
+  if (input.tombstoned && input.storageEnabled) {
+    if (!input.enrolled) {
+      return { state: 'needsLogin' }
+    }
+    const handle = input.handle
+    const cache = input.cache
+    if (handle && cache?.isBlocked(handle)) {
+      return { state: 'vaultGone' }
+    }
+    if (handle && cache?.isReauth(handle, input.now)) {
+      return { state: 'vaultReauth' }
+    }
+    return { state: 'vaultReauth' }
+  }
+  return { state: 'local' }
+}
+
+/**
+ * Async companion used by the build path: resolves the resident record and
+ * upgrades the `vaultReauth` fallback to a `vault` with recordVersion when
+ * a live credential is present. Sync callers (and the normalizer) use
+ * `projectCustodyForSidebar` directly.
+ */
+export async function projectCustodyForSidebarAsync(
+  input: ProjectCustodyInput,
+): Promise<SidebarAccountCustody> {
+  if (input.enrollPendingReason) {
+    return { state: 'enrollPending', reason: input.enrollPendingReason }
+  }
+  if (input.tombstoned && !input.storageEnabled) {
+    return { state: 'needsLogin' }
+  }
+  if (input.tombstoned && input.storageEnabled) {
+    if (!input.enrolled) {
+      return { state: 'needsLogin' }
+    }
+    const handle = input.handle
+    const cache = input.cache
+    if (handle && cache?.isBlocked(handle)) {
+      return { state: 'vaultGone' }
+    }
+    if (handle && cache?.isReauth(handle, input.now)) {
+      return { state: 'vaultReauth' }
+    }
+    if (handle && cache) {
+      const peeked = await cache.peekMetadata(handle)
+      if (peeked) {
+        return { state: 'vault', recordVersion: peeked.recordVersion }
+      }
+    }
+    return { state: 'vaultReauth' }
+  }
+  return { state: 'local' }
+}
+
 export const DEFAULT_SIDEBAR_STATE: SidebarState = {
   main: { quota: null, killed: false },
   fallbacks: [],
@@ -347,17 +541,21 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
             !Array.isArray(entry) &&
             typeof (entry as Record<string, unknown>).id === 'string',
         )
-        .map((e) => ({
-          id: e.id as string,
-          label: typeof e.label === 'string' ? e.label : undefined,
-          ...(typeof e.accountId === 'string'
-            ? { accountId: e.accountId }
-            : {}),
-          quota: ('quota' in e ? e.quota : null) as AccountQuota | null,
-          killed: typeof e.killed === 'boolean' ? e.killed : false,
-          enabled: typeof e.enabled === 'boolean' ? e.enabled : true,
-          ...resetCreditsField(e.resetCredits),
-        }))
+        .map((e) => {
+          const custody = normalizeSidebarCustody(e.custody)
+          return {
+            id: e.id as string,
+            label: typeof e.label === 'string' ? e.label : undefined,
+            ...(typeof e.accountId === 'string'
+              ? { accountId: e.accountId }
+              : {}),
+            quota: ('quota' in e ? e.quota : null) as AccountQuota | null,
+            killed: typeof e.killed === 'boolean' ? e.killed : false,
+            enabled: typeof e.enabled === 'boolean' ? e.enabled : true,
+            ...resetCreditsField(e.resetCredits),
+            ...(custody ? { custody } : {}),
+          }
+        })
     : []
 
   // activeId — string or undefined
