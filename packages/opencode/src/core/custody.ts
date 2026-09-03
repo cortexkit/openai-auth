@@ -659,10 +659,11 @@ export type CompleteEnrollmentDeps = {
 export type CompleteEnrollmentOutcome =
   | { kind: 'skipped'; reason: 'notEnrolling' }
   | { kind: 'skipped'; reason: 'lockBusy' }
-  | { kind: 'succeeded' }
+  | { kind: 'succeeded'; recordVersion: number }
   | {
       kind: 'failed'
       reason: 'gone' | 'nullClaim' | 'identityMismatch' | 'unavailable'
+      recordVersion?: number
     }
 
 /**
@@ -747,8 +748,16 @@ export async function completeFallbackEnrollment(
     if (identity.reason !== 'ok') {
       const reason: CompleteEnrollmentOutcome & { kind: 'failed' } =
         identity.reason === 'nullClaim'
-          ? { kind: 'failed', reason: 'nullClaim' }
-          : { kind: 'failed', reason: 'identityMismatch' }
+          ? {
+              kind: 'failed',
+              reason: 'nullClaim',
+              recordVersion: served.recordVersion,
+            }
+          : {
+              kind: 'failed',
+              reason: 'identityMismatch',
+              recordVersion: served.recordVersion,
+            }
       latchEnrollPending(liveAccount.id, reason.reason)
       return reason
     }
@@ -771,7 +780,7 @@ export async function completeFallbackEnrollment(
       }
     }, deps.configPath)
     clearEnrollPending(liveAccount.id)
-    return { kind: 'succeeded' }
+    return { kind: 'succeeded', recordVersion: served.recordVersion }
   } finally {
     await lock.release().catch(() => {})
   }
