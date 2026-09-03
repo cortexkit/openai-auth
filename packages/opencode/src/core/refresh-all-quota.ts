@@ -2,12 +2,18 @@ import { createLogger } from '../logger'
 import { getSidebarState, type SidebarState } from '../sidebar-state'
 import { errorMessage } from '../util/error'
 import type {
+  AccountStorage,
   FallbackAccountManager,
   isOAuthAccount,
   loadAccounts,
   OAuthAccount,
 } from './accounts'
 import { formatRefreshBackoffMessage, refreshBackoffActive } from './backoff.ts'
+import {
+  CUSTODY_EXCLUDED,
+  CUSTODY_REFUSE,
+  type FallbackAccessResolution,
+} from './custody.ts'
 import type { whamUsageFn } from './provider'
 import type { QuotaManager } from './quota-manager'
 
@@ -75,6 +81,27 @@ export interface RefreshAllQuotaDeps {
   logger?: QuotaLogger
   skipFresherThanMs?: number
   readSidebarState?: () => Promise<SidebarState>
+  /**
+   * Custody deps. Absent → pre-custody behaviour (the existing local-refresh
+   * block runs as before, no tombstone handling). When present, every
+   * refresh-inert account is short-circuited into the resolver arm and the
+   * local-refresh block is skipped entirely.
+   */
+  isFallbackRefreshInert?: (
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ) => Promise<boolean> | boolean
+  resolveFallbackAccess?: (
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ) => Promise<
+    FallbackAccessResolution | typeof CUSTODY_REFUSE | typeof CUSTODY_EXCLUDED
+  >
+  reportCustodyAuthFailure?: (params: {
+    handle: string
+    providerStatus: number
+    recordVersion: number
+  }) => Promise<void>
 }
 
 export interface RefreshAllQuotaOptions {
@@ -305,6 +332,86 @@ export async function refreshAllQuota(
             ),
             permanent: true,
           })
+          continue
+        }
+
+        // Refresh-inert arm: a manifest entry OR a tombstone sentinel makes
+        // local refresh inert regardless of `claustrum.enabled` (spec §3).
+        // The local-refresh block below is therefore unreachable for a
+        // refresh-inert account — the resolver decides what goes on the wire.
+        // All three custody deps must be wired together; absent any one, this
+        // arm is skipped and pre-custody behaviour runs.
+        if (
+          deps.isFallbackRefreshInert &&
+          deps.resolveFallbackAccess &&
+          deps.reportCustodyAuthFailure &&
+          (await deps.isFallbackRefreshInert(acct as OAuthAccount, storage))
+        ) {
+          let access: Awaited<
+            ReturnType<NonNullable<typeof deps.resolveFallbackAccess>>
+          >
+          try {
+            access = await deps.resolveFallbackAccess(
+              acct as OAuthAccount,
+              storage,
+            )
+          } catch (resolveError) {
+            recordOutcome({
+              account: acct.id,
+              ok: false,
+              error: errorMessage(resolveError),
+            })
+            continue
+          }
+          if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED) {
+            recordOutcome({
+              account: acct.id,
+              ok: false,
+              error: 'custody: no vault credential',
+            })
+            continue
+          }
+          try {
+            const snap = await whamFn({
+              accessToken: access.token,
+              fetchImpl: deps.fetchImpl,
+              now: deps.now,
+              accountId: (acct as OAuthAccount).accountId,
+              accountKey: acct.id,
+            })
+            deps.quotaManager.setFallback(
+              acct.id,
+              {
+                quota: snap,
+                refreshAfter: deps.now() + 5 * 60_000,
+                checkedAt: deps.now(),
+              },
+              access.token,
+              true,
+              (acct as OAuthAccount).accountId,
+            )
+            quotaUpdated = true
+            recordOutcome({ account: acct.id, ok: true })
+          } catch (quotaError) {
+            if (!isUnauthorized(quotaError)) throw quotaError
+            // Quota-endpoint 401. The vault-served provenance is the only
+            // signal that this token came from the vault — a local-provenance
+            // 401 (an enrolled, non-tombstoned account) is not reported and,
+            // because the local-refresh block is skipped, does not trigger a
+            // forced refresh either. A 429 is never a report.
+            if (access.provenance !== 'local') {
+              await deps.reportCustodyAuthFailure({
+                handle: access.provenance.handle,
+                providerStatus: 401,
+                recordVersion: access.provenance.recordVersion,
+              })
+            }
+            recordOutcome({
+              account: acct.id,
+              ok: false,
+              error: errorMessage(quotaError),
+            })
+          }
           continue
         }
 
