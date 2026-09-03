@@ -244,6 +244,13 @@ export type AccountStorage = {
   }
   /** Stable ChatGPT account identifier of the main account (extracted from OAuth token). */
   mainAccountId?: string
+  /** Vault-custody policy toggle. Gates serving only: when true, an account
+   *  that is both manifest-enrolled and tombstoned (`custodied`) serves its
+   *  access token from the Claustrum vault; without the toggle the same
+   *  account is `excluded`. Does NOT participate in the refresh gate. */
+  claustrum?: {
+    enabled?: boolean
+  }
   accounts: FallbackAccount[]
 }
 
@@ -440,7 +447,7 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
   return Object.keys(quota).length ? quota : undefined
 }
 
-function normalizeAccount(value: unknown): FallbackAccount | null {
+export function normalizeAccount(value: unknown): FallbackAccount | null {
   if (!isRecord(value)) return null
   if (value.type === 'api') {
     const baseURL =
