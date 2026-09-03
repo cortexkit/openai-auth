@@ -58,6 +58,28 @@ import {
   getCacheKeepWindow,
 } from './core/cachekeep'
 import {
+  ClaustrumCredentialCache,
+  type CompleteEnrollmentDeps,
+  type CompleteEnrollmentOutcome,
+  clearEnrollPending,
+  completeFallbackEnrollment,
+  custodied,
+  enrolling,
+  enrollPendingReason,
+  excluded,
+  markEnrollPending,
+  refreshInert,
+  resolveFallbackAccess,
+  tombstoned,
+} from './core/custody.ts'
+import {
+  CUSTODY_OWNING_PROVIDER,
+  CUSTODY_OWNING_SERVE,
+  CUSTODY_OWNING_SHAPE,
+  defaultCustodyManifestPath,
+  readCustodyManifest,
+} from './core/custody-manifest.ts'
+import {
   base64UrlEncode,
   beginDeviceAuth,
   buildAuthorizeUrl,
@@ -121,6 +143,7 @@ import {
   removeSidebarActiveRouting,
   resolveSessionStickyAccount,
   resolveSidebarStickyAssignment,
+  type SidebarAccountCustody,
   type SidebarMachineState,
   type SidebarState,
   setSidebarLegacyRouting,
@@ -131,6 +154,11 @@ import { errorMessage } from './util/error'
 import { isRecord } from './util/record'
 import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
+import {
+  ClaustrumClient,
+  detectClaustrumConnection,
+  getDefaultClaustrumConnectionPath,
+} from './vendor/claustrum-client/index.ts'
 import { OpenAIWebSocketPool, orderCodexBody } from './ws-pool'
 
 const ALLOWED_MODELS = new Set([
@@ -680,11 +708,584 @@ function stampWindowCheckedAt(
   return { ...window, checkedAt: entryCheckedAt }
 }
 
+// ---------------------------------------------------------------------------
+// Custody runtime — owns the vendored client, the credential cache, the boot /
+// tick loop, and the live custody projection handed to the sidebar writer.
+//
+// Construction is dependency-injected so the loader and the runtime tests
+// share one entry point. Production passes the real vendored client detector /
+// connector; tests pass a fake. The runtime never reaches outside the injected
+// surface, so a unit test can drive every observable without going through the
+// loader.
+// ---------------------------------------------------------------------------
+
+type RuntimeLogger = {
+  info: (message: string, meta?: Record<string, unknown>) => void
+  warn: (message: string, meta?: Record<string, unknown>) => void
+  debug: (message: string, meta?: Record<string, unknown>) => void
+  error: (message: string, meta?: Record<string, unknown>) => void
+}
+
+export type CustodyRuntimeOptions = {
+  /** Storage snapshot at loader time — used for the boot sweep pass. */
+  storage: AccountStorage | null
+  configPath: string
+  manifestPath?: string
+  /** Test seam: the vendored detector. Production passes the real function. */
+  detectClaustrumConnection?: typeof detectClaustrumConnection
+  /** Test seam: transport factory passed to `ClaustrumCredentialCache`. */
+  cacheConnector?: (options: {
+    connectionFile: string
+    handshakeTimeoutMs?: number
+  }) => Promise<ClaustrumCacheTransportLike>
+  loadAccounts: typeof loadAccounts
+  mutateAccounts: typeof mutateAccounts
+  readCustodyManifest: typeof readCustodyManifest
+  acquireRefreshFileLock: typeof acquireRefreshFileLock
+  now?: () => number
+  setIntervalFn?: (
+    callback: () => void,
+    intervalMs: number,
+  ) => ReturnType<typeof setInterval>
+  clearIntervalFn?: (handle: ReturnType<typeof setInterval>) => void
+  logger: RuntimeLogger
+}
+
+export type ClaustrumCacheTransportLike = {
+  getCredential(
+    handle: string,
+    minTtlMs?: number,
+  ): Promise<{
+    material: string
+    recordVersion: number
+    expiresAtMs: number | null
+  }>
+  statusCredential(handle: string): Promise<{
+    ready: boolean
+    lastErrorCode: string | null
+    leaseHeld: boolean
+    recordVersion: number
+  }>
+  reportAuthFailure(params: {
+    handle: string
+    providerStatus: number
+    recordVersion: number
+    reporterSource: 'direct' | 'relay_status_field' | 'relay_message_parse'
+  }): Promise<void>
+  close(): void
+}
+
+export type CustodyRuntime = {
+  /** Run the initial completion sweep. Resolves BEFORE the background refresh is armed. */
+  boot(): Promise<void>
+  /** Clear the timer and close the cache + transport. Idempotent. */
+  dispose(): void
+  /** Force one tick pass (used by the timer and tests). */
+  runTick(): Promise<void>
+  /** Sync projection read for the sidebar writer. */
+  getCustodyProjection(
+    account: OAuthAccount,
+    now: number,
+  ): SidebarAccountCustody | undefined
+  /** Whether the custody runtime is enabled for this process. */
+  isEnabled(): boolean
+  /** Cache handle (undefined when custody is disabled). */
+  getCache(): ClaustrumCredentialCache | undefined
+  /** Transport handle (undefined when custody is disabled). */
+  getTransport(): ClaustrumCacheTransportLike | undefined
+  /** True if the detection step produced an `available` connection file. */
+  wasDetected(): boolean
+}
+
+const CUSTODY_TICK_INTERVAL_MS = 5 * 60_000
+const CUSTODY_TICK_JITTER_MS = 30_000
+const CUSTODY_HANDSHAKE_TIMEOUT_MS = 5_000
+// Aggregate-bound warm: the loader races its await against this cap and
+// proceeds; the warm itself keeps populating the cache detached.
+const CUSTODY_WARM_AWAIT_MS = 100
+
+export function __createCustodyRuntimeForTest(
+  options: CustodyRuntimeOptions,
+): CustodyRuntime {
+  const log = options.logger
+  const now = options.now ?? Date.now
+  const manifestPath = options.manifestPath ?? defaultCustodyManifestPath()
+  const cacheConnector = options.cacheConnector ?? defaultCacheConnector(log)
+  const detect = options.detectClaustrumConnection ?? detectClaustrumConnection
+
+  let cache: ClaustrumCredentialCache | undefined
+  let transport: ClaustrumCacheTransportLike | undefined
+  let detection: Awaited<ReturnType<typeof detect>> | undefined
+  let timer: ReturnType<typeof setInterval> | undefined
+  let closed = false
+  // Live custody projection per account id. Updated after every sweep pass
+  // (boot or tick). A test that probes projection before the first sweep sees
+  // no entry — the sidebar omits `custody` for that account.
+  const projectionByAccountId = new Map<string, SidebarAccountCustody>()
+
+  const isEnabled = () => detection?.status === 'available'
+
+  const runtime: CustodyRuntime = {
+    isEnabled,
+    wasDetected: () => detection?.status === 'available',
+    getCache: () => cache,
+    getTransport: () => transport,
+    getCustodyProjection: (account, currentNow) => {
+      const cached = projectionByAccountId.get(account.id)
+      if (cached) return cached
+      // Refresh-inert accounts without a stored projection are projected from
+      // the live predicates. The toggle is irrelevant here (refreshInert binds
+      // on manifest entry OR tombstone), but the projection still reports the
+      // ownership shape.
+      return projectFromPredicates(account, options.storage, currentNow, cache)
+    },
+    async boot() {
+      if (closed) return
+      try {
+        detection = await detect()
+      } catch (error) {
+        log.warn('custody detection failed', {
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return
+      }
+      if (detection.status !== 'available') {
+        if (detection.status === 'malformed') {
+          log.warn('custody connection malformed; disabled for this process', {
+            reason: detection.reason,
+          })
+        } else {
+          log.info('custody not configured; no client/timer created', {})
+        }
+        return
+      }
+      // Toggle-off: the manager still gates on `refreshInert` from the manifest
+      // entry, but the runtime must not connect a client or schedule vault
+      // calls. The predicates observe disk state; the cache is dormant until
+      // the operator flips the toggle on and a tick reconnects.
+      if (!options.storage?.claustrum?.enabled) {
+        log.info(
+          'custody connection available but plugin toggle is off; manifest read for the refresh gate, no client/timer',
+          {},
+        )
+        return
+      }
+      try {
+        cache = new ClaustrumCredentialCache({
+          connector: cacheConnector,
+          now,
+        })
+        // Eagerly resolve the transport so the first warm is a cache.get, not a
+        // handshake. A failure here lands in the catch below; the runtime
+        // stays disabled for this process until the next tick reconnects.
+        const client = await cacheConnector({
+          connectionFile: resolveConnectionPath(detection),
+          handshakeTimeoutMs: CUSTODY_HANDSHAKE_TIMEOUT_MS,
+        })
+        transport = client
+      } catch (error) {
+        log.warn('custody connect failed; disabled until tick reconnect', {
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return
+      }
+      // Race the boot warm AND the boot completion sweep against the bound.
+      // A cap miss leaves both in flight detached — the warm populates the
+      // cache, the sweep tombstones `enrolling` accounts under their refresh
+      // locks. The next tick re-reads manifest and runs both passes again.
+      const manifest = await options.readCustodyManifest(manifestPath)
+      const enabledHandles = enabledManifestHandles(manifest, options.storage)
+      const sweepPromises: Promise<void>[] = []
+      for (const account of oauthAccounts(options.storage)) {
+        if (!enrolling(account, manifest, CUSTODY_OWNING_PROVIDER)) continue
+        const handle = enabledHandles.get(account.id)
+        if (!handle) continue
+        const sweepDeps = buildSweepDeps(cache)
+        sweepPromises.push(
+          completeFallbackEnrollment(account, sweepDeps)
+            .then((outcome) =>
+              applyOutcomeToProjection(account, outcome, manifest),
+            )
+            .catch((error) =>
+              log.warn('custody boot sweep failed', {
+                error: error instanceof Error ? error.message : String(error),
+              }),
+            ),
+        )
+      }
+      await raceAggregateWarm(
+        enabledHandles,
+        cache,
+        options.storage,
+        CUSTODY_WARM_AWAIT_MS,
+        sweepPromises,
+      )
+      // First tick at t+0 (gate-on but cache may still be empty mid-handshake).
+      void runtime.runTick().catch((error) =>
+        log.warn('custody first tick failed', {
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      )
+      scheduleNextTick()
+    },
+    async runTick() {
+      if (closed || !cache) return
+      // Toggle-off after the runtime was armed (operator edit): the cache
+      // remains, but no vault calls happen. The manager still observes
+      // `refreshInert` from disk.
+      if (!options.storage?.claustrum?.enabled) return
+      // Re-read manifest (hot-reload on mtime) so an operator edit lands at
+      // the next tick without a restart.
+      const manifest = await options.readCustodyManifest(manifestPath)
+      const enabledHandles = enabledManifestHandles(manifest, options.storage)
+      // Step 1: completion sweep — every enrolling account under its refresh
+      // lock, identity-verified, tombstoned on success. The sweep is the only
+      // place a get happens for an enrolling account.
+      await runCompletionSweep(manifest, enabledHandles)
+      // Step 2: warm / outcome pass — one get per enabled custodied account.
+      await runWarmPass(manifest, enabledHandles)
+    },
+    dispose() {
+      if (closed) return
+      closed = true
+      if (timer) {
+        const clear = options.clearIntervalFn ?? clearInterval
+        clear(timer)
+        timer = undefined
+      }
+      try {
+        cache?.close()
+      } catch {}
+      try {
+        transport?.close()
+      } catch {}
+      cache = undefined
+      transport = undefined
+    },
+  }
+
+  async function _runBootSweep(): Promise<void> {
+    // The boot sweep is now fired-and-forgotten inside `boot()`; the bound
+    // there races both the warm and the sweep. This entrypoint is kept so the
+    // dispose / log surfaces still typecheck; it is a no-op.
+    return
+  }
+
+  async function runCompletionSweep(
+    manifest: ReturnType<typeof options.readCustodyManifest> extends Promise<
+      infer R
+    >
+      ? R
+      : never,
+    enabledHandles: Map<string, string>,
+  ): Promise<void> {
+    if (!cache) return
+    const storage = await options.loadAccounts(options.configPath)
+    const sweepDeps = buildSweepDeps(cache)
+    for (const account of oauthAccounts(storage)) {
+      if (!enrolling(account, manifest, CUSTODY_OWNING_PROVIDER)) continue
+      if (!enabledHandles.has(account.id)) continue
+      const outcome = await completeFallbackEnrollment(account, sweepDeps)
+      applyOutcomeToProjection(account, outcome, manifest)
+    }
+  }
+
+  async function runWarmPass(
+    manifest: ReturnType<typeof options.readCustodyManifest> extends Promise<
+      infer R
+    >
+      ? R
+      : never,
+    enabledHandles: Map<string, string>,
+  ): Promise<void> {
+    if (!cache) return
+    for (const [accountId, handle] of enabledHandles) {
+      const storage = await options.loadAccounts(options.configPath)
+      const account = storage?.accounts.find((a) => a.id === accountId)
+      if (account?.type !== 'oauth') continue
+      // A tombstoned account with an entry present is the warm target; the
+      // completion sweep above already handled any `enrolling` residue, so
+      // every account reaching this pass is either custodied or enrolling
+      // without a yet-known handle.
+      if (!refreshInert(account, manifest, CUSTODY_OWNING_PROVIDER)) continue
+      try {
+        const record = await cache.get(handle)
+        // Cache may hand back a ResidentRecord; we only need it populated.
+        void record
+      } catch {
+        // Per-tick error handling is the cache's job (retry / reauth / gone
+        // / reduce_and_retry). Nothing to do at this layer.
+      }
+    }
+  }
+
+  function scheduleNextTick(): void {
+    if (closed) return
+    const setI = options.setIntervalFn ?? setInterval
+    const jitter = Math.floor((Math.random() * 2 - 1) * CUSTODY_TICK_JITTER_MS)
+    const intervalMs = CUSTODY_TICK_INTERVAL_MS + jitter
+    const handle = setI(() => {
+      if (closed) return
+      void runtime.runTick().catch((error) =>
+        log.warn('custody tick failed', {
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      )
+    }, intervalMs)
+    timer = handle as ReturnType<typeof setInterval>
+    if (timer && typeof timer === 'object' && 'unref' in timer) {
+      ;(timer as { unref?: () => void }).unref?.()
+    }
+  }
+
+  function buildSweepDeps(
+    cacheInstance: ClaustrumCredentialCache,
+  ): CompleteEnrollmentDeps {
+    return {
+      loadAccounts: options.loadAccounts,
+      readCustodyManifest: options.readCustodyManifest,
+      acquireRefreshFileLock: options.acquireRefreshFileLock,
+      configPath: options.configPath,
+      manifestPath,
+      cache: cacheInstance,
+      minTtlMs: custodyMinTtlMs(options.storage),
+      mutateAccounts: options.mutateAccounts,
+      provider: CUSTODY_OWNING_PROVIDER,
+      now,
+    }
+  }
+
+  function applyOutcomeToProjection(
+    account: OAuthAccount,
+    outcome: CompleteEnrollmentOutcome,
+    manifest: ReturnType<typeof options.readCustodyManifest> extends Promise<
+      infer R
+    >
+      ? R
+      : never,
+  ): void {
+    if (outcome.kind === 'succeeded') {
+      projectionByAccountId.set(account.id, {
+        state: 'vault',
+        recordVersion: 0,
+      })
+      return
+    }
+    if (outcome.kind === 'failed') {
+      const map: Record<
+        typeof outcome.reason,
+        'gone' | 'unavailable' | 'identityMismatch' | 'nullClaim'
+      > = {
+        gone: 'gone',
+        identityMismatch: 'identityMismatch',
+        nullClaim: 'nullClaim',
+        unavailable: 'unavailable',
+      }
+      markEnrollPending(account.id, map[outcome.reason])
+      projectionByAccountId.set(account.id, {
+        state: 'enrollPending',
+        reason: map[outcome.reason],
+      })
+      return
+    }
+    // skipped outcomes clear the latch and refresh the projection from
+    // predicates so the sidebar stays in sync with disk.
+    if (outcome.reason === 'notEnrolling') {
+      // A successful tombstone wrote disk; re-read state.
+      const refreshNow = now()
+      const projection = projectFromPredicates(
+        account,
+        options.storage,
+        refreshNow,
+        cache,
+      )
+      if (projection) projectionByAccountId.set(account.id, projection)
+      // Custodied-on-disk accounts lose any latched reason.
+      if (
+        custodied(account, manifest, options.storage ?? ({} as AccountStorage))
+      ) {
+        clearEnrollPending(account.id)
+      }
+    }
+  }
+
+  return runtime
+}
+
+function custodyMinTtlMs(storage: AccountStorage | null): number {
+  const minutes = storage?.refresh?.refreshBeforeExpiryMinutes ?? 240
+  // refreshBeforeExpiryMinutes + 30 min — keeps the cache ahead of the
+  // refresh gate's pre-expiry window without over-fetching.
+  return (minutes + 30) * 60_000
+}
+
+function enabledManifestHandles(
+  manifest: ReturnType<typeof readCustodyManifest> extends Promise<infer R>
+    ? R
+    : never,
+  storage: AccountStorage | null,
+): Map<string, string> {
+  const result = new Map<string, string>()
+  if (!manifest.ok) return result
+  for (const provider of manifest.value.providers) {
+    if (
+      provider.provider !== CUSTODY_OWNING_PROVIDER ||
+      provider.shape !== CUSTODY_OWNING_SHAPE ||
+      provider.serve !== CUSTODY_OWNING_SERVE
+    ) {
+      continue
+    }
+    for (const entry of provider.accounts) {
+      const account = storage?.accounts.find((a) => a.id === entry.label)
+      if (!account) continue
+      if (account.type !== 'oauth') continue
+      // enabled here = `refreshInert` (toggle-independent). The resolver and
+      // quota path consult this same predicate; the tick's reach matches.
+      if (
+        !refreshInert(
+          account as OAuthAccount,
+          manifest,
+          CUSTODY_OWNING_PROVIDER,
+        )
+      )
+        continue
+      result.set(entry.label, entry.handle)
+    }
+  }
+  return result
+}
+
+function projectFromPredicates(
+  account: OAuthAccount,
+  storage: AccountStorage | null,
+  currentNow: number,
+  cacheInstance: ClaustrumCredentialCache | undefined,
+): SidebarAccountCustody | undefined {
+  const latched = enrollPendingReason(account.id)
+  if (latched) return { state: 'enrollPending', reason: latched }
+  const safeStorage = storage ?? ({} as AccountStorage)
+  const emptyManifest = {
+    ok: true as const,
+    value: { version: 1 as const, providers: [] },
+  }
+  if (excluded(account, emptyManifest, safeStorage, CUSTODY_OWNING_PROVIDER)) {
+    return { state: 'needsLogin' }
+  }
+  if (tombstoned(account, CUSTODY_OWNING_PROVIDER)) {
+    return { state: 'vaultReauth' }
+  }
+  // Without a cache peek we cannot report `vault` with recordVersion; the
+  // writer runs `getCustodyProjection` after every sweep, so a subsequent
+  // write will surface it. The synchronous fallback is `local`.
+  void currentNow
+  void cacheInstance
+  return undefined
+}
+
+async function raceAggregateWarm(
+  handles: Map<string, string>,
+  cacheInstance: ClaustrumCredentialCache,
+  storage: AccountStorage | null,
+  capMs: number,
+  extraPromises: Promise<void>[] = [],
+): Promise<void> {
+  void storage
+  if (handles.size === 0 && extraPromises.length === 0) return
+  const promises: Promise<void>[] = [...extraPromises]
+  for (const [, handle] of handles) {
+    promises.push(
+      cacheInstance
+        .get(handle)
+        .then(() => undefined)
+        .catch(() => {
+          // Slow warm does not delay the loader beyond the bound. The promise
+          // stays in flight detached; the next tick picks up the populated cache.
+        }),
+    )
+  }
+  await Promise.race([
+    Promise.all(promises),
+    new Promise<void>((resolve) => setTimeout(resolve, capMs)),
+  ])
+}
+
+function oauthAccounts(storage: AccountStorage | null): OAuthAccount[] {
+  if (!storage) return []
+  return storage.accounts.filter((a): a is OAuthAccount => a.type === 'oauth')
+}
+
+function defaultCacheConnector(log: RuntimeLogger) {
+  return async (options: {
+    connectionFile: string
+    handshakeTimeoutMs?: number
+  }): Promise<ClaustrumCacheTransportLike> => {
+    const client = await ClaustrumClient.connect({
+      connectionFile: options.connectionFile,
+      handshakeTimeoutMs: options.handshakeTimeoutMs,
+    })
+    return clientToTransport(client, log)
+  }
+}
+
+function clientToTransport(
+  client: ClaustrumClient,
+  _log: RuntimeLogger,
+): ClaustrumCacheTransportLike {
+  return {
+    getCredential: (handle, minTtlMs) => client.getCredential(handle, minTtlMs),
+    statusCredential: (handle) => client.statusCredential(handle),
+    reportAuthFailure: (params) =>
+      client.reportAuthFailure({
+        handle: params.handle,
+        providerStatus: params.providerStatus,
+        recordVersion: params.recordVersion,
+        reporterSource: params.reporterSource,
+      }),
+    close: () => client.close(),
+  }
+}
+
+function resolveConnectionPath(
+  detection: Awaited<ReturnType<typeof detectClaustrumConnection>>,
+): string {
+  if (detection.status !== 'available') return detection.path ?? ''
+  // The detection step resolves the path internally; reach for the default
+  // helper to hand the same path back to the cache. `available` does not
+  // carry the resolved path on its surface (only `absent` / `malformed` do).
+  return getDefaultClaustrumConnectionPath()
+}
+
+function lookupManifestHandle(
+  manifest: ReturnType<typeof readCustodyManifest> extends Promise<infer R>
+    ? R
+    : never,
+  accountId: string,
+): string | undefined {
+  if (!manifest.ok) return undefined
+  for (const provider of manifest.value.providers) {
+    if (
+      provider.provider !== CUSTODY_OWNING_PROVIDER ||
+      provider.shape !== CUSTODY_OWNING_SHAPE ||
+      provider.serve !== CUSTODY_OWNING_SERVE
+    ) {
+      continue
+    }
+    for (const entry of provider.accounts) {
+      if (entry.label === accountId) return entry.handle
+    }
+  }
+  return undefined
+}
+
 export function buildSidebarMachineState(
   qm: QuotaManager,
   store: AccountStorage,
   now = Date.now(),
   mainAccountIdentity = store.mainAccountId,
+  projectCustody?: (
+    account: FallbackAccount,
+    now: number,
+  ) => SidebarAccountCustody | undefined,
 ): SidebarMachineState {
   const mainEntry = qm.getMain()
   const mainQuota = mainEntry?.quota
@@ -717,6 +1318,11 @@ export function buildSidebarMachineState(
       .map((account) => {
         const fallbackEntry = qm.getFallback(account.id)
         const fallbackQuota = fallbackEntry?.quota
+        // Sync projection: the loader pre-resolves custody state once per write
+        // (cache peek is async; the runtime owns the map) and threads a sync
+        // lookup in. An absent callback leaves `custody` unset, which is the
+        // pre-custody shape — the normalizer drops it without rendering.
+        const custodyProjection = projectCustody?.(account, now)
         return {
           id: account.id,
           label: (account as { label?: string }).label,
@@ -744,6 +1350,7 @@ export function buildSidebarMachineState(
           ...(fallbackQuota?.resetCreditsAvailable !== undefined
             ? { resetCredits: fallbackQuota.resetCreditsAvailable }
             : {}),
+          ...(custodyProjection ? { custody: custodyProjection } : {}),
         }
       }),
     route: store.routing?.mode ?? 'main-first',
@@ -947,6 +1554,11 @@ export async function CodexAuthPlugin(
   let cmdCtx: CommandContext | null = null
   let activeRpcServer: RpcServerHandle | null = null
   let sidebarStateFileForEvents: string | undefined
+  // Custody runtime — assigned inside the loader so dispose can close the
+  // vendored client and clear the custody tick timer after the loader has
+  // returned. Built unconditionally so a custody-disabled process still has
+  // a runtime to dispose (no-op tick + close).
+  let custodyRuntimeRef: CustodyRuntime | undefined
 
   // Per-loader poller: each plugin invocation owns its timer and callback, so
   // one loader disposing or re-starting never stops or overwrites another's
@@ -980,6 +1592,7 @@ export async function CodexAuthPlugin(
   return {
     async dispose() {
       backgroundQuotaRefresh.stop()
+      custodyRuntimeRef?.dispose()
       for (const websocketFetch of websocketFetches) websocketFetch.close()
       websocketFetches.length = 0
       if (activeRpcServer) {
@@ -1244,10 +1857,115 @@ export async function CodexAuthPlugin(
           quotaManager,
           onFallbackStorageChanged: invalidateRequestStorageCache,
         })
+        // -------------------------------------------------------------------
+        // Custody runtime — vendored client, cache, completion sweep, tick.
+        // Constructed unconditionally so the boot sweep can resolve before
+        // the background refresh is armed and so dispose() can close the
+        // cache + transport regardless of whether custody is enabled.
+        // -------------------------------------------------------------------
+        const custodyLogger = createLogger('custody')
+        const custodyRuntime = __createCustodyRuntimeForTest({
+          storage,
+          configPath: getConfigPath(),
+          loadAccounts,
+          mutateAccounts,
+          readCustodyManifest,
+          acquireRefreshFileLock,
+          logger: {
+            info: (msg, meta) =>
+              custodyLogger.info(msg, meta ?? {}) as unknown as undefined,
+            warn: (msg, meta) =>
+              custodyLogger.warn(msg, meta ?? {}) as unknown as undefined,
+            debug: (msg, meta) =>
+              custodyLogger.debug(msg, meta ?? {}) as unknown as undefined,
+            error: (msg, meta) =>
+              custodyLogger.error(msg, meta ?? {}) as unknown as undefined,
+          },
+        })
+        await custodyRuntime.boot()
+        custodyRuntimeRef = custodyRuntime
         // Start background refresh only when fallback accounts are configured;
         // single-account paths must not create extra token refresh traffic.
+        // The boot order above guarantees the initial completion sweep has
+        // resolved — any `enrolling` account has been tombstoned before the
+        // background loop starts gating on `refreshInert`.
         if (storage && storage.accounts.length > 0) {
           fallbackManager.startBackgroundRefresh()
+        }
+
+        // -------------------------------------------------------------------
+        // Custody deps for the four quota constructions (spec §6.6). One
+        // builder, used everywhere; omission at any one site fails closed
+        // via `custody-deps-incomplete` (the poller's own guard). Each
+        // closure captures `storage` and the live custodyRuntime so the
+        // resolver and reporter see fresh state per invocation.
+        // -------------------------------------------------------------------
+        const custodyRuntimeForDeps = custodyRuntime
+        async function isFallbackAccountRefreshInert(
+          account: OAuthAccount,
+          _currentStorage: AccountStorage,
+        ): Promise<boolean> {
+          const manifest = await readCustodyManifest()
+          return refreshInert(account, manifest, CUSTODY_OWNING_PROVIDER)
+        }
+        async function resolveAccountAccessForCustody(
+          account: OAuthAccount,
+          currentStorage: AccountStorage,
+        ): ReturnType<typeof resolveFallbackAccess> {
+          const manifest = await readCustodyManifest()
+          const cache = custodyRuntimeForDeps.getCache()
+          const handle = lookupManifestHandle(manifest, account.id)
+          if (!cache || !handle) {
+            return resolveFallbackAccess(account, currentStorage, manifest)
+          }
+          return resolveFallbackAccess(account, currentStorage, manifest, {
+            cache,
+            manifestHandle: handle,
+          })
+        }
+        async function reportAuthFailureForCustody(params: {
+          handle: string
+          providerStatus: number
+          recordVersion: number
+        }): Promise<void> {
+          const cache = custodyRuntimeForDeps.getCache()
+          if (!cache) return
+          await cache.reportAuthFailure({
+            handle: params.handle,
+            providerStatus: params.providerStatus,
+            recordVersion: params.recordVersion,
+          })
+        }
+        function buildRefreshAllQuotaDeps(
+          overrides: Partial<
+            Pick<
+              Parameters<typeof refreshAllQuota>[0],
+              'respectBackoff' | 'skipFresherThanMs' | 'readSidebarState'
+            >
+          > = {},
+        ): Parameters<typeof refreshAllQuota>[0] {
+          return {
+            getAuth,
+            codexRefreshFn,
+            refreshMainWithLease,
+            fallbackManager,
+            quotaManager,
+            loadAccounts,
+            writeSidebarState: writeMachineSidebarState,
+            client: input.client as Parameters<
+              typeof refreshAllQuota
+            >[0]['client'],
+            fetchImpl: fetch,
+            now: Date.now,
+            configPath: getConfigPath(),
+            storageMainAccountId: storage?.mainAccountId,
+            isOAuthAccountFn: isOAuthAccount,
+            whamFn: whamUsageFn,
+            isFallbackRefreshInert: isFallbackAccountRefreshInert,
+            resolveFallbackAccess: resolveAccountAccessForCustody,
+            reportCustodyAuthFailure: reportAuthFailureForCustody,
+            ...overrides,
+          }
         }
 
         // -------------------------------------------------------------------
@@ -1698,9 +2416,19 @@ export async function CodexAuthPlugin(
               store,
               Date.now(),
               mainAccountIdentity,
+              projectCustodyForSidebar,
             ),
             boundSidebarFile,
           )
+        }
+        // Closure-resolved once per loader; the runtime owns the cached
+        // projection map, the writer reads it sync.
+        function projectCustodyForSidebar(
+          account: FallbackAccount,
+          currentNow: number,
+        ): SidebarAccountCustody | undefined {
+          if (account.type !== 'oauth') return undefined
+          return custodyRuntimeForDeps.getCustodyProjection(account, currentNow)
         }
 
         async function writeRequestSidebarRouting(
@@ -1798,41 +2526,10 @@ export async function CodexAuthPlugin(
             await writeMachineSidebarState(quotaManager, store)
           },
           refreshAllQuota: async () =>
-            refreshAllQuota({
-              getAuth,
-              codexRefreshFn,
-              refreshMainWithLease,
-              fallbackManager,
-              quotaManager,
-              loadAccounts,
-              writeSidebarState: writeMachineSidebarState,
-              client: input.client as CommandContext['client'],
-              fetchImpl: fetch,
-              now: Date.now,
-              configPath: getConfigPath(),
-              storageMainAccountId: storage?.mainAccountId,
-              isOAuthAccountFn: isOAuthAccount,
-              whamFn: whamUsageFn,
-            }),
+            refreshAllQuota(buildRefreshAllQuotaDeps()),
           refreshResetTargetQuota: async (accountKey) => {
             const results = await refreshAllQuota(
-              {
-                getAuth,
-                codexRefreshFn,
-                refreshMainWithLease,
-                fallbackManager,
-                quotaManager,
-                loadAccounts,
-                writeSidebarState: writeMachineSidebarState,
-                client: input.client as CommandContext['client'],
-                fetchImpl: fetch,
-                now: Date.now,
-                configPath: getConfigPath(),
-                storageMainAccountId: storage?.mainAccountId,
-                isOAuthAccountFn: isOAuthAccount,
-                whamFn: whamUsageFn,
-                respectBackoff: false,
-              },
+              buildRefreshAllQuotaDeps({ respectBackoff: false }),
               { accountKey },
             )
             return (
@@ -2849,25 +3546,9 @@ export async function CodexAuthPlugin(
           void writeMachineSidebarState(quotaManager, storage).catch(() => {})
 
           // Background: refresh from the API, then the sidebar shows fresh numbers
-          void refreshAllQuota({
-            getAuth,
-            codexRefreshFn,
-            refreshMainWithLease,
-            fallbackManager,
-            quotaManager,
-            loadAccounts,
-            writeSidebarState: writeMachineSidebarState,
-            client: input.client as Parameters<
-              typeof refreshAllQuota
-            >[0]['client'],
-            fetchImpl: fetch,
-            now: Date.now,
-            configPath: getConfigPath(),
-            storageMainAccountId: storage?.mainAccountId,
-            isOAuthAccountFn: isOAuthAccount,
-            whamFn: whamUsageFn,
-            respectBackoff: true,
-          }).catch((error) =>
+          void refreshAllQuota(
+            buildRefreshAllQuotaDeps({ respectBackoff: true }),
+          ).catch((error) =>
             logQ.warn('boot quota seed failed', {
               pid: process.pid,
               error: errorMessage(error),
@@ -2877,28 +3558,11 @@ export async function CodexAuthPlugin(
 
         backgroundQuotaRefresh.start(
           async () => {
-            const results = await refreshQuotaInBackground({
-              getAuth,
-              codexRefreshFn,
-              refreshMainWithLease,
-              fallbackManager,
-              quotaManager,
-              loadAccounts,
-              writeSidebarState: (qm, store) =>
-                backgroundQuotaRefresh.isStopped()
-                  ? Promise.resolve()
-                  : writeMachineSidebarState(qm, store),
-              client: input.client as Parameters<
-                typeof refreshAllQuota
-              >[0]['client'],
-              fetchImpl: fetch,
-              now: Date.now,
-              configPath: getConfigPath(),
-              storageMainAccountId: storage?.mainAccountId,
-              isOAuthAccountFn: isOAuthAccount,
-              whamFn: whamUsageFn,
-              readSidebarState: () => getSidebarState(boundSidebarFile),
-            })
+            const results = await refreshQuotaInBackground(
+              buildRefreshAllQuotaDeps({
+                readSidebarState: () => getSidebarState(boundSidebarFile),
+              }),
+            )
             const failures = results.filter((result) => !result.ok)
             if (failures.length > 0) {
               logQ.warn('background quota refresh completed with failures', {
