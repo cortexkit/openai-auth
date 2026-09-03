@@ -22,7 +22,12 @@
 
 import { setTimeout as sleep } from 'node:timers/promises'
 import { createLogger } from '../logger.ts'
-import type { AccountStorage, OAuthAccount } from './accounts.ts'
+import {
+  type AccountStorage,
+  FALLBACK_REFRESH_LOCK_TTL_MS,
+  fallbackRefreshLockName,
+  type OAuthAccount,
+} from './accounts.ts'
 import {
   CUSTODY_OWNING_PROVIDER,
   CUSTODY_OWNING_SERVE,
@@ -30,6 +35,7 @@ import {
   type CustodyManifestReadResult,
 } from './custody-manifest.ts'
 import { extractAccountIdFromClaims, parseJwtClaims } from './oauth.ts'
+import type { acquireRefreshFileLock } from './refresh-file-lock.ts'
 
 const log = createLogger('custody')
 
@@ -615,4 +621,203 @@ export class CustodyTombstoneRefreshError extends Error {
     super(`custody tombstoned: ${custodyTombstoneKey(provider)}`)
     this.name = 'CustodyTombstoneRefreshError'
   }
+}
+
+// ---------------------------------------------------------------------------
+// Enroll-completion sweep (§7.3)
+// ---------------------------------------------------------------------------
+
+export type CompleteEnrollmentDeps = {
+  loadAccounts: (path: string) => Promise<AccountStorage | null>
+  readCustodyManifest: (path?: string) => Promise<CustodyManifestReadResult>
+  acquireRefreshFileLock: typeof acquireRefreshFileLock
+  configPath: string
+  manifestPath?: string
+  cache: ClaustrumCredentialCache
+  /** Minimum TTL (ms) handed to the vault for the verify-get. */
+  minTtlMs: number
+  /**
+   * Read-modify-write the account store. The sweep calls this once on a
+   * successful verify, setting `access` + `refresh` to the tombstone sentinel
+   * and `expires = 0` — that single write is the only durable effect.
+   */
+  mutateAccounts: (
+    mutate: (current: AccountStorage) => AccountStorage | undefined,
+    path?: string,
+  ) => Promise<unknown>
+  /** Provider name; defaults to the owning provider (openai). */
+  provider?: string
+  /** Caller-supplied clock so tests can drive the boot/hour log dedupe. */
+  now?: () => number
+}
+
+/**
+ * Outcome of a single sweep pass. Surfaced only for tests and the boot/tick
+ * orchestration; the production caller (`runEnrollCompletionSweep`) folds the
+ * reason into the process-local enroll-pending store and the sidebar projection.
+ */
+export type CompleteEnrollmentOutcome =
+  | { kind: 'skipped'; reason: 'notEnrolling' }
+  | { kind: 'skipped'; reason: 'lockBusy' }
+  | { kind: 'succeeded' }
+  | {
+      kind: 'failed'
+      reason: 'gone' | 'nullClaim' | 'identityMismatch' | 'unavailable'
+    }
+
+/**
+ * Per-account completion step (spec §7.3). Re-reads enrollment state from disk,
+ * takes the account's refresh lock without joining a wait, force-fetches one
+ * vault credential, verifies the served claim matches the local account id,
+ * and tombstonese on success. The first failure latches via the enroll-pending
+ * store; later failures do not overwrite. The sweep never writes or removes a
+ * manifest entry — that is an operator act.
+ *
+ * Idempotent: a second sweep on an already-tombstoned account no-ops at the
+ * `notEnrolling` guard. A concurrent enroll in another process lands the same
+ * sentinel under its own save-lock; the tombstone is the join point.
+ */
+export async function completeFallbackEnrollment(
+  account: OAuthAccount,
+  deps: CompleteEnrollmentDeps,
+): Promise<CompleteEnrollmentOutcome> {
+  const provider = deps.provider ?? CUSTODY_OWNING_PROVIDER
+  const manifest = await deps.readCustodyManifest(deps.manifestPath)
+  const storage = await deps.loadAccounts(deps.configPath)
+  if (!storage) return { kind: 'skipped', reason: 'notEnrolling' }
+  const liveAccount = storage.accounts.find(
+    (candidate) => candidate.id === account.id,
+  )
+  if (liveAccount?.type !== 'oauth') {
+    return { kind: 'skipped', reason: 'notEnrolling' }
+  }
+  if (!enrolling(liveAccount, manifest, provider)) {
+    return { kind: 'skipped', reason: 'notEnrolling' }
+  }
+  const manifestHandle = handleForAccount(liveAccount, manifest)
+  if (!manifestHandle) return { kind: 'skipped', reason: 'notEnrolling' }
+
+  const lockName = fallbackRefreshLockName(liveAccount.id)
+  // Skip this pass if another holder is mid-flight; never join-wait. The
+  // refresh choke point already serialises refreshers and the next tick will
+  // pick up any residue.
+  const lock = await deps.acquireRefreshFileLock({
+    name: lockName,
+    ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+    path: deps.configPath,
+  })
+  if (!lock) return { kind: 'skipped', reason: 'lockBusy' }
+  try {
+    // Re-check under the lock: a concurrent tombstone write that completed
+    // between the outer read and the lock acquisition must turn this pass
+    // into a no-op. The manifest is read again to honour a hot-reloaded entry
+    // removal too — but the loader does not own the entry-removal path; the
+    // outer guard is the contract.
+    const recheckManifest = await deps.readCustodyManifest(deps.manifestPath)
+    const recheckStorage = await deps.loadAccounts(deps.configPath)
+    const recheckAccount = recheckStorage?.accounts.find(
+      (candidate) => candidate.id === account.id,
+    )
+    if (
+      !recheckStorage ||
+      !recheckAccount ||
+      recheckAccount.type !== 'oauth' ||
+      !enrolling(recheckAccount, recheckManifest, provider)
+    ) {
+      return { kind: 'skipped', reason: 'notEnrolling' }
+    }
+    let served: Awaited<ReturnType<ClaustrumCredentialCache['get']>>
+    try {
+      served = await deps.cache.get(manifestHandle, deps.minTtlMs, {
+        force: true,
+      })
+    } catch (error) {
+      const reason = classifyGetError(error)
+      latchEnrollPending(liveAccount.id, reason)
+      return { kind: 'failed', reason }
+    }
+    const identity = verifyServedFallbackIdentity(
+      {
+        payload: { access: served.payload.access },
+        recordVersion: served.recordVersion,
+        expiresAtMs: served.expiresAtMs,
+      },
+      recheckAccount,
+    )
+    if (identity.reason !== 'ok') {
+      const reason: CompleteEnrollmentOutcome & { kind: 'failed' } =
+        identity.reason === 'nullClaim'
+          ? { kind: 'failed', reason: 'nullClaim' }
+          : { kind: 'failed', reason: 'identityMismatch' }
+      latchEnrollPending(liveAccount.id, reason.reason)
+      return reason
+    }
+    // Success: tombstone both oauth fields in one mutate. The sentinel is the
+    // gate that flips `enrolling` to `custodied`; the manifest entry stays
+    // untouched (operator-owned).
+    const sentinel = custodyTombstoneKey(provider)
+    await deps.mutateAccounts((current) => {
+      const target = current.accounts.find((a) => a.id === account.id)
+      if (target?.type !== 'oauth') return current
+      const next: OAuthAccount = {
+        ...target,
+        access: sentinel,
+        refresh: sentinel,
+        expires: 0,
+      }
+      return {
+        ...current,
+        accounts: current.accounts.map((a) => (a.id === account.id ? next : a)),
+      }
+    }, deps.configPath)
+    clearEnrollPending(liveAccount.id)
+    return { kind: 'succeeded' }
+  } finally {
+    await lock.release().catch(() => {})
+  }
+}
+
+function handleForAccount(
+  account: OAuthAccount,
+  manifest: CustodyManifestReadResult,
+): string | undefined {
+  if (!manifest.ok) return undefined
+  for (const provider of manifest.value.providers) {
+    if (
+      provider.provider !== CUSTODY_OWNING_PROVIDER ||
+      provider.shape !== CUSTODY_OWNING_SHAPE ||
+      provider.serve !== CUSTODY_OWNING_SERVE
+    ) {
+      continue
+    }
+    for (const entry of provider.accounts) {
+      if (entry.label === account.id) return entry.handle
+    }
+  }
+  return undefined
+}
+
+function classifyGetError(error: unknown): 'gone' | 'unavailable' {
+  // `ClaustrumCredentialError.action === 'gone'` is the vault's verdict for
+  // not_found / permanent; everything else folds into `unavailable` so the
+  // boot/hour log surfaces the difference only when the vault says so.
+  if (
+    error &&
+    typeof error === 'object' &&
+    'action' in error &&
+    (error as { action?: unknown }).action === 'gone'
+  ) {
+    return 'gone'
+  }
+  return 'unavailable'
+}
+
+function latchEnrollPending(
+  accountId: string,
+  reason: 'gone' | 'nullClaim' | 'identityMismatch' | 'unavailable',
+): void {
+  // First failure latches — later failures must not overwrite the original
+  // cause. The boot/hour log in the loader keys on whether the store
+  // already had a reason for this account.
+  markEnrollPending(accountId, reason)
 }
