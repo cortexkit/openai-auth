@@ -13,8 +13,8 @@
  *    enrolling accounts still serve local access, tombstoned ones report
  *    `excluded`.
  *
- * `resolveFallbackAccess` is async from day one so the inline completion
- * (task 7) can be added without touching call sites.
+ * `resolveFallbackAccess` is async from day one so an inline completion
+ * seam can be slotted in without touching call sites.
  *
  * Handle values and credential payloads NEVER appear in logs, thrown-error
  * messages/causes, or any surface that could be dumped or sidetabled.
@@ -122,8 +122,8 @@ export function enrolled(
 /**
  * `tombstoned` = oauth access AND refresh both equal the per-provider
  * sentinel AND `expires === 0`. The provider name lives in the argument so
- * this same predicate composes for any future provider — the opencode
- * consumer passes `'openai'`.
+ * this predicate composes across providers — the opencode consumer passes
+ * `'openai'`.
  */
 export function tombstoned(account: OAuthAccount, provider: string): boolean {
   if (account.type !== 'oauth') return false
@@ -281,10 +281,10 @@ export async function resolveFallbackAccess(
 }
 
 async function readDefaultManifestForResolver(): Promise<CustodyManifestReadResult> {
-  // The brief's resolver contract does not require reading the manifest
-  // here — callers (the refresh gate in task 7) pass an explicit manifest
-  // snapshot. When none is passed, the resolver behaves as if no manifest
-  // entry exists, which is the safe default for a non-custodied account.
+  // The resolver contract does not require reading the manifest here —
+  // callers pass an explicit manifest snapshot. When none is passed, the
+  // resolver behaves as if no manifest entry exists, which is the safe
+  // default for a non-custodied account.
   return {
     ok: true,
     value: { version: 1, providers: [] } satisfies ManifestHandleFile,
@@ -375,7 +375,7 @@ export class ClaustrumCredentialCache {
    * `force:true` ALWAYS issues a new daemon call (it bypasses both the
    * resident record and any pending in-flight that originated from a
    * non-force caller). Two concurrent force:true calls share the same
-   * new in-flight promise, so the second and later force:true verifies
+   * new in-flight promise, so the second and subsequent force:true verifies
    * collapse onto the first one. A non-force caller issued while a
    * force:true fetch is pending still joins that force-fetch in-flight —
    * the cache never races two parallel daemon calls for the same handle.
@@ -451,7 +451,7 @@ export class ClaustrumCredentialCache {
    * version-fenced (one report per handle per recordVersion), and after
    * two reports on the same version a one-hour bound fires — the third
    * and subsequent reports on the same version are suppressed, and the
-   * handle is moved into the `reauth` set for an hour. A later successful
+   * handle is moved into the `reauth` set for an hour. A subsequent successful
    * `get` clears the bound and the reauth entry.
    *
    * The reported version is invalidated from the resident record in
@@ -469,8 +469,8 @@ export class ClaustrumCredentialCache {
     // Version fence (monotonic per handle): once a version has been reported
     // for this handle, subsequent reports for the same version are dropped
     // without round-tripping to the daemon. A cleared resident (after a
-    // successful get re-fetching a higher version) lets a future report at
-    // a higher version bypass the fence again.
+    // successful get re-fetching a higher version) lets a report at a
+    // higher version bypass the fence again.
     const lastReported = this.#reported.get(handle)
     if (lastReported !== undefined && lastReported >= recordVersion) {
       return
@@ -541,11 +541,10 @@ export class ClaustrumCredentialCache {
 // ---------------------------------------------------------------------------
 
 /**
- * Defence-in-depth error class. The refresh gate is not part of task 2 — the
- * predicates above are the policy source of truth. If a future caller wants
- * to short-circuit the gate on a tombstone, raising this error (status 503)
- * is the wired-in escape hatch. Construction is intentionally cheap; no
- * payload leakage through `message`/`cause`.
+ * Defence-in-depth error class. The predicates above are the policy source
+ * of truth; this error is the wired-in escape hatch for a caller that wants
+ * to short-circuit on a tombstone (status 503). Construction is intentionally
+ * cheap; no payload leakage through `message`/`cause`.
  */
 export class CustodyTombstoneRefreshError extends Error {
   readonly code = 'CUSTODY_TOMBSTONED'
@@ -567,6 +566,5 @@ export class CustodyTombstoneRefreshError extends Error {
 export function __resetCustodyStateForTest(): void {
   // Process-local cache state lives inside each ClaustrumCredentialCache
   // instance — closing the test's instance clears it. No module-level
-  // mutable state remains after the close, so this seam is a no-op kept
-  // for future task hooks (e.g. process-wide blocked/reauth sets).
+  // mutable state remains after the close, so this seam is a no-op.
 }
