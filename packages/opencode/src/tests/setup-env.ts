@@ -25,6 +25,13 @@ export const FLOOR_AUTH_FILE = join(FLOOR_DIR, 'openai-auth.json')
 export const FLOOR_STATE_FILE = join(FLOOR_DIR, 'openai-auth-state.json')
 export const FLOOR_LOG_FILE = join(FLOOR_DIR, 'openai-auth.log')
 export const FLOOR_MODELS_CACHE = join(FLOOR_DIR, 'models.json')
+// Custody manifest floor: resolved under FLOOR_DIR so even an in-flight read
+// that outlives a test's afterEach (background timers, deferred cache lookups)
+// points at a temp path, never at the operator's live default.
+// The lock sidecar is exported because the manifest writer owns it, but tests
+// only need the floor path to restore the env var cleanly.
+export const FLOOR_CLAUSTRUM_HANDLES = join(FLOOR_DIR, 'opencode-handles.json')
+export const FLOOR_CLAUSTRUM_HANDLES_LOCK = `${FLOOR_CLAUSTRUM_HANDLES}.lock`
 
 // Set the floor values only if the env is not already set (a parent process
 // or CI may have pre-configured them intentionally).
@@ -42,6 +49,9 @@ if (!process.env.OPENCODE_OPENAI_AUTH_LOG_FILE) {
 }
 if (!process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE) {
   process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE = FLOOR_MODELS_CACHE
+}
+if (!process.env.CLAUSTRUM_OPENCODE_HANDLES) {
+  process.env.CLAUSTRUM_OPENCODE_HANDLES = FLOOR_CLAUSTRUM_HANDLES
 }
 
 // Belt-and-suspenders: remove the floor temp dir when the test process exits
