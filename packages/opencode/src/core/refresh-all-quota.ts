@@ -137,6 +137,10 @@ export async function refreshAllQuota(
 
   const results: RefreshAllQuotaResult[] = []
   const logger = deps.logger ?? log
+  // Partial-custody-deps log dedupe: at most one warn per poll per missing
+  // dep, regardless of how many refresh-inert accounts we observe. A full
+  // polling cycle could otherwise log per-account.
+  const custodyPartialDepsLogged = new Set<'resolver' | 'reporter'>()
   const recordOutcome = (result: RefreshAllQuotaResult) => {
     results.push(result)
     const payload = {
@@ -339,14 +343,30 @@ export async function refreshAllQuota(
         // local refresh inert regardless of `claustrum.enabled` (spec §3).
         // The local-refresh block below is therefore unreachable for a
         // refresh-inert account — the resolver decides what goes on the wire.
-        // All three custody deps must be wired together; absent any one, this
-        // arm is skipped and pre-custody behaviour runs.
+        // Only `isFallbackRefreshInert` is required to enter; a partial
+        // wiring (resolver or reporter missing) fails closed instead of
+        // falling through into local refresh, because resuming a local
+        // refresher against a vault-held family is the split-custody
+        // incident the refresh gate exists to prevent.
         if (
           deps.isFallbackRefreshInert &&
-          deps.resolveFallbackAccess &&
-          deps.reportCustodyAuthFailure &&
           (await deps.isFallbackRefreshInert(acct as OAuthAccount, storage))
         ) {
+          if (!deps.resolveFallbackAccess) {
+            if (!custodyPartialDepsLogged.has('resolver')) {
+              logger.warn('custody deps incomplete: resolver absent', {
+                pid: process.pid,
+                accountId: acct.id,
+              })
+              custodyPartialDepsLogged.add('resolver')
+            }
+            recordOutcome({
+              account: acct.id,
+              ok: false,
+              error: 'custody-deps-incomplete',
+            })
+            continue
+          }
           let access: Awaited<
             ReturnType<NonNullable<typeof deps.resolveFallbackAccess>>
           >
@@ -368,6 +388,27 @@ export async function refreshAllQuota(
               account: acct.id,
               ok: false,
               error: 'custody: no vault credential',
+            })
+            continue
+          }
+          // Vault-provenance probe requires a reporter — a quota 401 on a
+          // vault-served credential MUST reach the vault (spec §6.4), so
+          // probing without one would be the silent-401 failure of issue
+          // #118 recreated under custody. Refuse the probe up front.
+          // Local-provenance probes need no reporter: a local 401 is not
+          // credential evidence (the vault is not on the wire).
+          if (access.provenance !== 'local' && !deps.reportCustodyAuthFailure) {
+            if (!custodyPartialDepsLogged.has('reporter')) {
+              logger.warn(
+                'custody deps incomplete: reporter absent; vault probe refused',
+                { pid: process.pid, accountId: acct.id },
+              )
+              custodyPartialDepsLogged.add('reporter')
+            }
+            recordOutcome({
+              account: acct.id,
+              ok: false,
+              error: 'custody-deps-incomplete',
             })
             continue
           }
@@ -400,7 +441,11 @@ export async function refreshAllQuota(
             // because the local-refresh block is skipped, does not trigger a
             // forced refresh either. A 429 is never a report.
             if (access.provenance !== 'local') {
-              await deps.reportCustodyAuthFailure({
+              await (
+                deps.reportCustodyAuthFailure as NonNullable<
+                  typeof deps.reportCustodyAuthFailure
+                >
+              )({
                 handle: access.provenance.handle,
                 providerStatus: 401,
                 recordVersion: access.provenance.recordVersion,

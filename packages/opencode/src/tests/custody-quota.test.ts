@@ -49,6 +49,8 @@ function makeQuotaSnapshot(usedPercent: number): OAuthQuotaSnapshot {
   return { primary: window }
 }
 
+type CustodyDepsShape = 'all' | 'none' | 'no-resolver' | 'no-reporter'
+
 interface MakeDepsOptions {
   refreshInert?: boolean
   resolverResult?:
@@ -65,9 +67,15 @@ interface MakeDepsOptions {
     recordVersion: number
   }) => Promise<void>
   whamBehaviour?: (input: Parameters<typeof whamUsageFn>[0]) => unknown
-  injectCustodyDeps?: boolean
+  /** Selects which custody deps are wired. Default 'all' (everything
+   *  injected); 'none' injects nothing; 'no-resolver'/'no-reporter'
+   *  omit one of the optional deps to test the partial-injection
+   *  fail-closed path. */
+  injectCustodyDeps?: CustodyDepsShape
   skipFresherThanMs?: number
-  isOauth?: boolean
+  now?: () => number
+  /** Inject a pre-seeded QuotaManager (used by the freshness test). */
+  quotaManager?: QuotaManager
   accountId?: string
   /** Use a tombstoned account as the only fallback (sentinel access/refresh, expires 0). */
   tombstoned?: boolean
@@ -92,9 +100,11 @@ type DepsWithMocks = RefreshAllQuotaDeps & {
 }
 
 function makeDeps(opts: MakeDepsOptions = {}) {
-  const qm = new QuotaManager({
-    storage: { version: 1 as const, accounts: [] },
-  })
+  const qm =
+    opts.quotaManager ??
+    new QuotaManager({
+      storage: { version: 1 as const, accounts: [] },
+    })
 
   const accountId = opts.accountId ?? 'acct-1'
   const fallbackAccount = opts.tombstoned
@@ -188,7 +198,7 @@ function makeDeps(opts: MakeDepsOptions = {}) {
       },
     },
     fetchImpl: fetch,
-    now: () => Date.now(),
+    now: opts.now ?? (() => Date.now()),
     configPath: '/tmp/test-config.json',
     storageMainAccountId: 'chatgpt-main',
     isOAuthAccountFn: ((a: unknown) =>
@@ -197,21 +207,29 @@ function makeDeps(opts: MakeDepsOptions = {}) {
     whamFn,
     readSidebarState: mock(async () => DEFAULT_SIDEBAR_STATE),
   }
+  if (opts.skipFresherThanMs !== undefined) {
+    deps.skipFresherThanMs = opts.skipFresherThanMs
+  }
   if (opts.logger) {
     deps.logger = opts.logger as unknown as RefreshAllQuotaDeps['logger']
   }
 
-  if (opts.injectCustodyDeps !== false) {
+  const shape: CustodyDepsShape = opts.injectCustodyDeps ?? 'all'
+  if (shape !== 'none') {
     deps.isFallbackRefreshInert = mock(
       async () => opts.refreshInert ?? false,
     ) as never
-    deps.resolveFallbackAccess = mock(
-      async (account: unknown, store: unknown) => {
-        resolverCalls.push({ account, storage: store })
-        return await resolverResultFn()
-      },
-    ) as never
-    deps.reportCustodyAuthFailure = mock(reportImpl) as never
+    if (shape !== 'no-resolver') {
+      deps.resolveFallbackAccess = mock(
+        async (account: unknown, store: unknown) => {
+          resolverCalls.push({ account, storage: store })
+          return await resolverResultFn()
+        },
+      ) as never
+    }
+    if (shape !== 'no-reporter') {
+      deps.reportCustodyAuthFailure = mock(reportImpl) as never
+    }
   }
 
   const extended = deps as DepsWithMocks
@@ -403,7 +421,9 @@ describe('refresh-inert quota poll', () => {
   it('plain local account 401 → existing forced local refresh still happens (regression guard)', async () => {
     // When the refreshInert gate is false, the existing local-refresh block
     // remains in charge — a 401 from the quota endpoint must still trigger
-    // the forced refresh introduced by #118.
+    // the forced refresh introduced by #118, AND that forced refresh must
+    // be called with `force: true` (a non-forced refresh would not rotate
+    // the rejected token).
     const deps = makeDeps({
       refreshInert: false,
       whamBehaviour: (input: { accessToken: string }) => {
@@ -418,7 +438,13 @@ describe('refresh-inert quota poll', () => {
 
     await refreshAllQuota(deps, { accountKey: 'fb-1' })
 
-    expect(deps.refreshAccount).toHaveBeenCalled()
+    // Pre-poll call (force not set) plus the forced-401 call (force: true).
+    // The forced call is the regression-critical one: pin it explicitly.
+    expect(deps.refreshAccount).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'fb-1' }),
+      expect.anything(),
+      expect.objectContaining({ force: true }),
+    )
   })
 
   it('CUSTODY_REFUSE → no wham, ok:false', async () => {
@@ -447,6 +473,155 @@ describe('refresh-inert quota poll', () => {
     expect(fb?.ok).toBe(false)
     expect(deps.whamFn).not.toHaveBeenCalled()
     expect(deps.refreshAccount).not.toHaveBeenCalled()
+  })
+
+  it('fresh quota snapshot on a refresh-inert account → freshness skip fires before the resolver arm', async () => {
+    // A refresh-inert account whose quota was checked inside the freshness
+    // window must NOT call the resolver or wham — the freshness skip is
+    // upstream of the custody arm in the loop. Moving the arm above the
+    // freshness skip would cause a probe here.
+    const now = Date.now()
+    const qm = new QuotaManager({
+      storage: { version: 1 as const, accounts: [] },
+      now: () => now,
+    })
+    qm.setFallback(
+      'fb-1',
+      {
+        quota: makeQuotaSnapshot(5),
+        refreshAfter: now + 5 * 60_000,
+        checkedAt: now - 60_000, // 1 minute ago — within the 4-minute window
+      },
+      'acc-local-fb1',
+      false,
+      'acct-1',
+    )
+    const deps = makeDeps({
+      refreshInert: true,
+      skipFresherThanMs: 4 * 60_000,
+      now: () => now,
+      quotaManager: qm,
+    })
+
+    const results = await refreshAllQuota(deps, { accountKey: 'fb-1' })
+
+    const fb = results.find((r) => r.account === 'fb-1')
+    expect(fb?.ok).toBe(true)
+    expect(deps.whamFn).not.toHaveBeenCalled()
+    expect(deps.resolveFallbackAccess as never).not.toHaveBeenCalled()
+  })
+
+  it('refresh-inert account + resolver absent → ok:false with custody-deps-incomplete, no local refresh', async () => {
+    // Partial injection: the predicate is wired (so the loop knows the
+    // account is refresh-inert) but the resolver is not. The arm must
+    // fail closed and surface a typed reason — a fall-through into local
+    // refresh would resume a refresher over a vault-held family.
+    const warn = mock(() => {})
+    const deps = makeDeps({
+      refreshInert: true,
+      injectCustodyDeps: 'no-resolver',
+      logger: { debug: mock(() => {}), warn },
+    })
+
+    const results = await refreshAllQuota(deps, { accountKey: 'fb-1' })
+
+    const fb = results.find((r) => r.account === 'fb-1')
+    expect(fb?.ok).toBe(false)
+    expect(fb?.error).toBe('custody-deps-incomplete')
+    expect(deps.refreshAccount).not.toHaveBeenCalled()
+    expect(deps.whamFn).not.toHaveBeenCalled()
+    // The "deps incomplete" warn fired at least once with a stable, typed
+    // message; subsequent refresh-inert accounts in the same poll dedupe
+    // (one warn per poll per missing dep) — a full poll-cycle warn count
+    // is bounded, not per-account.
+    const partialWarns = warn.mock.calls.filter((call) =>
+      String((call as unknown[])[0] ?? '').includes('custody deps incomplete'),
+    )
+    expect(partialWarns).toHaveLength(1)
+    // The warn payload does not contain a handle or token field.
+    const head = partialWarns[0]
+    if (!head) throw new Error('expected one partial-deps warn')
+    const payload = JSON.stringify(head)
+    expect(payload).not.toMatch(/ckh_/)
+    expect(payload).not.toMatch(/acc-/)
+  })
+
+  it('refresh-inert account + reporter absent → vault probe refused: whamFn never called, outcome custody-deps-incomplete', async () => {
+    // Partial injection: resolver is wired but reporter is not. The arm
+    // enters, the resolver returns a vault-served credential, and we
+    // refuse to probe at all — a vault-served probe whose 401 cannot reach
+    // the vault is the silent-401 failure of issue #118 recreated under
+    // custody (spec §6.4: quota 401 on a vault-served probe MUST reach
+    // the vault). The local-refresh block is bypassed.
+    const warn = mock(() => {})
+    const deps = makeDeps({
+      refreshInert: true,
+      resolverResult: {
+        token: 'vault-served-access',
+        provenance: {
+          handle: 'ckh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          recordVersion: 42,
+        },
+      },
+      whamBehaviour: () => {
+        throw Object.assign(new Error('wham usage check failed: 401'), {
+          status: 401,
+        })
+      },
+      injectCustodyDeps: 'no-reporter',
+      logger: { debug: mock(() => {}), warn },
+    })
+
+    const results = await refreshAllQuota(deps, { accountKey: 'fb-1' })
+
+    // Probe was refused BEFORE whamFn could be called.
+    expect(deps.whamFn).not.toHaveBeenCalled()
+    // Local-refresh block was bypassed.
+    expect(deps.refreshAccount).not.toHaveBeenCalled()
+    const fb = results.find((r) => r.account === 'fb-1')
+    expect(fb?.ok).toBe(false)
+    expect(fb?.error).toBe('custody-deps-incomplete')
+    // The dedicated warn fired (not just the per-outcome recordOutcome warn).
+    const refuseWarns = warn.mock.calls.filter((call) =>
+      String((call as unknown[])[0] ?? '').includes('vault probe refused'),
+    )
+    expect(refuseWarns).toHaveLength(1)
+    const payload = JSON.stringify(refuseWarns[0])
+    expect(payload).not.toMatch(/ckh_/)
+    expect(payload).not.toMatch(/acc-/)
+  })
+
+  it('refresh-inert account + reporter absent → LOCAL-provenance probe still happens', async () => {
+    // A local-provenance 401 is not credential evidence — the vault is not
+    // on the wire, so the reporter-absent guard must NOT fire. The probe
+    // happens, and a local 401 is silently logged as the failure.
+    const warn = mock(() => {})
+    const deps = makeDeps({
+      refreshInert: true,
+      resolverResult: { token: 'acc-local-fb1', provenance: 'local' },
+      whamBehaviour: () => {
+        throw Object.assign(new Error('wham usage check failed: 401'), {
+          status: 401,
+        })
+      },
+      injectCustodyDeps: 'no-reporter',
+      logger: { debug: mock(() => {}), warn },
+    })
+
+    const results = await refreshAllQuota(deps, { accountKey: 'fb-1' })
+
+    // Probe happened with the local token.
+    expect(deps.whamFn).toHaveBeenCalledWith(
+      expect.objectContaining({ accessToken: 'acc-local-fb1' }),
+    )
+    // No "vault probe refused" warn — local probes are allowed without a reporter.
+    const refuseWarns = warn.mock.calls.filter((call) =>
+      String((call as unknown[])[0] ?? '').includes('vault probe refused'),
+    )
+    expect(refuseWarns).toHaveLength(0)
+    expect(deps.refreshAccount).not.toHaveBeenCalled()
+    const fb = results.find((r) => r.account === 'fb-1')
+    expect(fb?.ok).toBe(false)
   })
 
   it('mutation: drop the refresh-inert arm → wham never called and loop exits with "no usable access token"', async () => {
@@ -482,7 +657,7 @@ describe('refresh-inert quota poll', () => {
     const warn = mock(() => {})
     const deps = makeDeps({
       tombstoned: true,
-      injectCustodyDeps: false,
+      injectCustodyDeps: 'none',
       refreshInert: false,
       tombstoneRefreshThrows: true,
       logger: { debug, warn },
