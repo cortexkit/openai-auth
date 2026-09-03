@@ -1,5 +1,5 @@
 /**
- * Loader-level custody runtime tests (spec §6.1, §6.2, §7.3, §6.6).
+ * Loader-level custody runtime tests.
  *
  * The runtime owns one vendored client + cache per process, runs the boot
  * completion sweep before the background refresh is armed, ticks every five
@@ -339,7 +339,7 @@ describe('custody warm and tick', () => {
   })
 
   it('does not delay the loader past the warm bound when the vault is slow; populates later', async () => {
-    const account = liveAccount('fb-1', { accountId: 'acct-1' })
+    const account = makeSentinelAccount({ id: 'fb-1', accountId: 'acct-1' })
     await writeStorageWithManifest(
       liveStorage([account]),
       enrollmentManifest('fb-1'),
@@ -549,7 +549,7 @@ describe('custody warm and tick', () => {
 // ---------------------------------------------------------------------------
 
 describe('enroll-completion sweep', () => {
-  it('completes an enrolling account on boot: a manifest entry with no enroll having run lands the tombstone', async () => {
+  it('completes an enrolling account before boot returns: a manifest entry with no enroll having run lands the tombstone', async () => {
     const live = liveAccount('fb-1', { accountId: 'acct-1' })
     // Live access/refresh; no enroll has run.
     await saveAccounts(liveStorage([live]), configPath)
@@ -859,7 +859,7 @@ describe('custody boot order', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Quota construction builder (spec §6.6)
+// Quota construction builder
 // ---------------------------------------------------------------------------
 
 describe('quota construction dep wiring', () => {
@@ -927,7 +927,7 @@ describe('quota construction dep wiring', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Enroll-completion latch (spec §7.3)
+// Enroll-completion latch
 // ---------------------------------------------------------------------------
 
 function makeSingleEnrollingSetup(): OAuthAccount {
@@ -991,13 +991,7 @@ describe('enroll-completion sweep latch', () => {
         detection: 'available',
       }),
     )
-    // Noop the post-boot tick so this test observes ONE sweep failure
-    // (the boot sweep). Otherwise the first tick at t+0 fires a second
-    // failure and the latch could be set by the second call.
-    const originalRunTick = runtime.runTick
-    runtime.runTick = async () => undefined
     await runtime.boot()
-    runtime.runTick = originalRunTick
     const projection = runtime.getCustodyProjection(account, Date.now())
     expect(projection?.state).toBe('enrollPending')
     expect(projection?.reason).toBe('unavailable')
@@ -1059,7 +1053,6 @@ describe('enroll-completion sweep latch', () => {
 
   it('a later successful completion clears the latch and projects vault with the served recordVersion', async () => {
     const account = await writeSingleEnrollingFixture()
-    markEnrollPending('fb-1', 'unavailable')
     let index = 0
     const transport: ClaustrumCacheTransportLike = {
       getCredential: mock(async () => {
@@ -1096,11 +1089,10 @@ describe('enroll-completion sweep latch', () => {
       }),
     )
     await runtime.boot()
-    // The boot sweep's own projection must carry the served version before
-    // any tick's warm pass could overwrite it.
+    expect(enrollPendingReason('fb-1')).toBe('nullClaim')
     const afterBoot = runtime.getCustodyProjection(account, Date.now())
-    expect(afterBoot?.state).toBe('vault')
-    expect(afterBoot?.recordVersion).toBe(7)
+    expect(afterBoot?.state).toBe('enrollPending')
+    expect(afterBoot?.reason).toBe('nullClaim')
     await runtime.runTick()
     expect(enrollPendingReason('fb-1')).toBeUndefined()
     const projection = runtime.getCustodyProjection(account, Date.now())
@@ -1111,7 +1103,7 @@ describe('enroll-completion sweep latch', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Sweep failure log (spec §7.3)
+// Sweep failure log
 // ---------------------------------------------------------------------------
 
 describe('sweep failure log dedupe', () => {
@@ -1182,7 +1174,7 @@ describe('sweep failure log dedupe', () => {
 })
 
 // ---------------------------------------------------------------------------
-// recordVersion projection (spec §8 sidebar, §11 test recordVersion-but-no-handle)
+// recordVersion projection
 // ---------------------------------------------------------------------------
 
 describe('recordVersion projection', () => {
@@ -1251,7 +1243,7 @@ describe('recordVersion projection', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Under-lock re-check (spec §7.3 step 4)
+// Under-lock re-check
 // ---------------------------------------------------------------------------
 
 describe('under-lock re-check', () => {

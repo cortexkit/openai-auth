@@ -170,7 +170,7 @@ describe('choke point (refreshAccountNow) refuses refreshInert accounts', () => 
 // getUsableFallbackAccounts candidate shape
 // ---------------------------------------------------------------------------
 
-describe('getUsableFallbackAccounts candidate shape (spec §3)', () => {
+describe('getUsableFallbackAccounts candidate shape', () => {
   it('enrolling + valid local token → present in usable, zero refreshFn calls', async () => {
     // Enrolling (manifest entry, not tombstoned) stays a usable candidate —
     // it serves its local access token while that token is valid. The local
