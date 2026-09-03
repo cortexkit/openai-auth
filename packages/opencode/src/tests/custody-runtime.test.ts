@@ -20,7 +20,12 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AccountStorage, OAuthAccount } from '../core/accounts.ts'
-import { loadAccounts, mutateAccounts, saveAccounts } from '../core/accounts.ts'
+import {
+  FallbackAccountManager,
+  loadAccounts,
+  mutateAccounts,
+  saveAccounts,
+} from '../core/accounts.ts'
 import {
   __resetEnrollPendingForTest,
   CUSTODY_TOMBSTONE_PREFIX,
@@ -36,6 +41,7 @@ import {
   __createCustodyRuntimeForTest,
   __resetSweepFailureLogDedupeForTest,
   type ClaustrumCacheTransportLike,
+  CodexAuthPlugin,
   type CustodyRuntimeOptions,
 } from '../index.ts'
 import type { detectClaustrumConnection } from '../vendor/claustrum-client/index.ts'
@@ -548,6 +554,47 @@ describe('custody warm and tick', () => {
 // ---------------------------------------------------------------------------
 
 describe('enroll-completion sweep', () => {
+  it('writes both tombstone fields and expiry in exactly one account mutation', async () => {
+    const live = liveAccount('fb-1', { accountId: 'acct-1' })
+    await writeStorageWithManifest(
+      liveStorage([live]),
+      enrollmentManifest(live.id),
+    )
+    const { transport } = makeTransport(() => ({
+      material: makeJwt('acct-1'),
+      recordVersion: 21,
+      expiresAtMs: Date.now() + 600_000,
+    }))
+    const writes: OAuthAccount[] = []
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({
+        storage: liveStorage([live]),
+        transport,
+        detection: 'available',
+        mutateAccounts: async (transform, path) => {
+          const before = await loadAccounts(path)
+          if (before) {
+            const after = transform(before)
+            const changed = after?.accounts.find(
+              (account) => account.id === live.id,
+            )
+            if (changed?.type === 'oauth') writes.push(changed)
+          }
+          return mutateAccounts(transform, path)
+        },
+      }),
+    )
+    await runtime.boot()
+    expect(writes).toEqual([
+      expect.objectContaining({
+        access: TOMBSTONE_OPENAI,
+        refresh: TOMBSTONE_OPENAI,
+        expires: 0,
+      }),
+    ])
+    runtime.dispose()
+  })
+
   it('completes an enrolling account before boot returns: a manifest entry with no enroll having run lands the tombstone', async () => {
     const live = liveAccount('fb-1', { accountId: 'acct-1' })
     // Live access/refresh; no enroll has run.
@@ -794,6 +841,124 @@ describe('custody runtime disposal', () => {
 // ---------------------------------------------------------------------------
 
 describe('custody boot order', () => {
+  it('does not arm fallback refresh until a blocked enrollment completion has tombstoned storage', async () => {
+    const live = liveAccount('fb-1', { accountId: 'acct-1' })
+    const manifest = enrollmentManifest(live.id)
+    if (!manifest.ok) throw new Error('expected manifest fixture')
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        ...liveStorage([live]),
+        claustrum: { enabled: true, manifestWrite: false },
+      }),
+    )
+    writeFileSync(manifestPath, JSON.stringify(manifest.value))
+    chmodSync(manifestPath, 0o600)
+
+    let enteredResolve!: () => void
+    let releaseResolve!: () => void
+    const entered = new Promise<void>((resolve) => {
+      enteredResolve = resolve
+    })
+    const release = new Promise<void>((resolve) => {
+      releaseResolve = resolve
+    })
+    const transport: ClaustrumCacheTransportLike = {
+      async getCredential() {
+        enteredResolve()
+        await release
+        return {
+          material: makeJwt('acct-1'),
+          recordVersion: 31,
+          expiresAtMs: Date.now() + 600_000,
+        }
+      },
+      async statusCredential() {
+        return {
+          ready: true,
+          lastErrorCode: null,
+          leaseHeld: false,
+          recordVersion: 31,
+        }
+      },
+      async reportAuthFailure() {},
+      close() {},
+    }
+    const originalStart =
+      FallbackAccountManager.prototype.startBackgroundRefresh
+    const starts = mock(function (this: FallbackAccountManager) {
+      return originalStart.call(this)
+    })
+    FallbackAccountManager.prototype.startBackgroundRefresh = starts
+    const originalAuthFile = process.env.OPENCODE_OPENAI_AUTH_FILE
+    const originalStateFile = process.env.OPENCODE_OPENAI_AUTH_STATE_FILE
+    const originalSidebarFile =
+      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE
+    const originalLogFile = process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+    const originalConfigDir = process.env.OPENCODE_CONFIG_DIR
+    process.env.OPENCODE_OPENAI_AUTH_FILE = configPath
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = join(scratchDir, 'state.json')
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = join(
+      scratchDir,
+      'sidebar.json',
+    )
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = join(scratchDir, 'test.log')
+    process.env.OPENCODE_CONFIG_DIR = scratchDir
+    let hooks: Awaited<ReturnType<typeof CodexAuthPlugin>> | undefined
+    try {
+      hooks = await CodexAuthPlugin(
+        {
+          client: { auth: { set: async () => {} } },
+          project: { id: 'test', name: 'test' },
+          directory: '',
+          worktree: scratchDir,
+          experimental_workspace: { register: () => {} },
+          serverUrl: new URL('http://localhost:0'),
+          $: {},
+        } as never,
+        { custody: { transport, detection: 'available' } },
+      )
+      const loader = hooks.auth?.loader
+      if (!loader) throw new Error('expected auth loader')
+      const loading = loader(
+        async () => ({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 3_600_000,
+        }),
+        {} as never,
+      )
+      await entered
+      expect(starts).not.toHaveBeenCalled()
+      releaseResolve()
+      await loading
+      expect(starts).toHaveBeenCalledTimes(1)
+      const after = await loadAccounts(configPath)
+      const tombstoned = after?.accounts.find(
+        (account) => account.id === live.id,
+      )
+      if (tombstoned?.type !== 'oauth')
+        throw new Error('expected oauth account')
+      expect(tombstoned).toMatchObject({
+        access: TOMBSTONE_OPENAI,
+        refresh: TOMBSTONE_OPENAI,
+        expires: 0,
+      })
+    } finally {
+      releaseResolve()
+      await hooks?.dispose?.()
+      FallbackAccountManager.prototype.startBackgroundRefresh = originalStart
+      process.env.OPENCODE_OPENAI_AUTH_FILE = originalAuthFile
+      process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = originalStateFile
+      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = originalSidebarFile
+      process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = originalLogFile
+      if (originalConfigDir === undefined)
+        delete process.env.OPENCODE_CONFIG_DIR
+      else process.env.OPENCODE_CONFIG_DIR = originalConfigDir
+    }
+  })
+
   it('runs the initial completion sweep before the first tick fires', async () => {
     const live = liveAccount('fb-1', { accountId: 'acct-1' })
     await saveAccounts(liveStorage([live]), configPath)

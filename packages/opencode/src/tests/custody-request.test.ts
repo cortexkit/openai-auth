@@ -2,7 +2,11 @@ import { beforeEach, describe, expect, it } from 'bun:test'
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { FallbackAccountManager, type OAuthAccount } from '../core/accounts.ts'
+import {
+  FallbackAccountManager,
+  loadAccounts,
+  type OAuthAccount,
+} from '../core/accounts.ts'
 import type { CacheKeepManager } from '../core/cachekeep.ts'
 import {
   ClaustrumCredentialCache,
@@ -68,6 +72,11 @@ async function withCustodyLoader(
     credentialForGet?: () => { material: string; recordVersion: number }
     now?: () => number
     sidebar?: Record<string, unknown>
+    observeRequest?: (
+      authorization: string,
+      url: string,
+      configPath: string,
+    ) => Promise<void> | void
     respond: (authorization: string, url: string) => number
   },
   run: (input: {
@@ -122,6 +131,7 @@ async function withCustodyLoader(
   globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
     const authorization = new Headers(init?.headers).get('authorization') ?? ''
     const urlText = String(url)
+    await options.observeRequest?.(authorization, urlText, configPath)
     if (urlText.endsWith('/responses')) authorizations.push(authorization)
     return new Response('{}', {
       status: options.respond(authorization, urlText),
@@ -315,6 +325,40 @@ describe('custody request resolution', () => {
       delete process.env.OPENCODE_CONFIG_DIR
       rmSync(directory, { recursive: true, force: true })
     }
+  })
+
+  it('persists the tombstone before sending an enrollment credential', async () => {
+    const fallback = enrollingAccount()
+    const vaultAccess = jwtFor('acct-1')
+    let observed: OAuthAccount | undefined
+    await withCustodyLoader(
+      {
+        accounts: [fallback],
+        credential: { material: vaultAccess, recordVersion: 18 },
+        observeRequest: async (authorization, url, configPath) => {
+          if (!url.endsWith('/responses')) return
+          if (authorization !== `Bearer ${vaultAccess}`) return
+          const storage = await loadAccounts(configPath)
+          const account = storage?.accounts.find(
+            (candidate) => candidate.id === fallback.id,
+          )
+          if (account?.type === 'oauth') observed = account
+        },
+        respond: (authorization, url) =>
+          url.endsWith('/responses') && authorization === 'Bearer main-access'
+            ? 401
+            : 200,
+      },
+      async ({ fetchOverride }) => {
+        const [url, init] = codexRequest()
+        expect((await fetchOverride(url, init)).status).toBe(200)
+      },
+    )
+    expect(observed).toMatchObject({
+      access: makeSentinelAccount().access,
+      refresh: makeSentinelAccount().refresh,
+      expires: 0,
+    })
   })
 
   it('sends the vault bearer and fences repeated fallback-first 401 reports', async () => {
