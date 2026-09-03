@@ -2091,15 +2091,10 @@ export class FallbackAccountManager {
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
       if (isMainAccountFallback(storage, account)) continue
-      // (i) Tombstoned: never a candidate here. Until the vault resolver
-      // serves tombstoned accounts, the sentinel would otherwise be treated
-      // as a usable token.
       const state = await this.custodyAccountState(account)
-      if (state === 'tombstoned') continue
-      // (ii) Enrolling (manifest entry, not tombstoned): keep the account
-      // as a candidate while its local token is valid, but never refresh
-      // it locally — the manifest says the vault owns the family.
-      const skipRefresh = state === 'enrolling'
+      // Custody owns these families; the request resolver decides whether a
+      // vault or still-valid local bearer exists before send.
+      const skipRefresh = state === 'enrolling' || state === 'tombstoned'
       let refreshFailed = false
       let candidate = account
       try {
@@ -2144,7 +2139,10 @@ export class FallbackAccountManager {
         // Enrolling + due: refresh was intentionally skipped, so the local
         // token is still expired. The catch path's `hasUsableCandidateToken`
         // guard only fires on error (none thrown here), so check it inline.
-        if (skipRefresh && !hasUnexpiredAccessToken(candidate, this.now())) {
+        if (
+          state === 'enrolling' &&
+          !hasUnexpiredAccessToken(candidate, this.now())
+        ) {
           continue
         }
         this.seedFallbackQuota(candidate, storage)

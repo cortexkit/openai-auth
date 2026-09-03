@@ -210,10 +210,7 @@ describe('getUsableFallbackAccounts candidate shape (spec §3)', () => {
     expect(manager.refreshAccountCalls).toHaveLength(0)
   })
 
-  it('tombstoned account → absent from usable, zero refreshFn calls', async () => {
-    // Until the vault resolver serves tombstoned accounts the sentinel would
-    // be treated as a usable token, so the
-    // entry gate short-circuits to `continue` before any selection logic.
+  it('tombstoned account stays selectable without local refresh', async () => {
     const account = makeSentinelAccount({ id: 'tomb-1' })
     await saveAccounts(liveStorage([account]), cfgPath)
     const storage = (await loadAccounts(cfgPath))!
@@ -223,7 +220,8 @@ describe('getUsableFallbackAccounts candidate shape (spec §3)', () => {
     })
 
     const usable = await manager.getUsableFallbackAccounts(storage)
-    expect(usable).toHaveLength(0)
+    expect(usable).toHaveLength(1)
+    expect(usable[0]?.id).toBe('tomb-1')
     expect(refreshCalls()).toBe(0)
     expect(manager.refreshAccountCalls).toHaveLength(0)
   })
@@ -410,7 +408,7 @@ describe('manager entry gates skip refreshInert accounts', () => {
     })
 
     const usable = await manager.getUsableFallbackAccounts(storage)
-    expect(usable).toEqual([])
+    expect(usable.map((candidate) => candidate.id)).toEqual(['a-1'])
     expect(refreshCalls()).toBe(0)
     expect(manager.refreshAccountCalls).toHaveLength(0)
   })
