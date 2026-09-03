@@ -27,6 +27,7 @@ import {
 import type { whamUsageFn } from '../core/provider.ts'
 import { QuotaManager } from '../core/quota-manager.ts'
 import {
+  CUSTODY_DEPS_INCOMPLETE,
   type RefreshAllQuotaDeps,
   refreshAllQuota,
 } from '../core/refresh-all-quota.ts'
@@ -527,7 +528,7 @@ describe('refresh-inert quota poll', () => {
 
     const fb = results.find((r) => r.account === 'fb-1')
     expect(fb?.ok).toBe(false)
-    expect(fb?.error).toBe('custody-deps-incomplete')
+    expect(fb?.error).toBe(CUSTODY_DEPS_INCOMPLETE)
     expect(deps.refreshAccount).not.toHaveBeenCalled()
     expect(deps.whamFn).not.toHaveBeenCalled()
     // The "deps incomplete" warn fired at least once with a stable, typed
@@ -580,7 +581,7 @@ describe('refresh-inert quota poll', () => {
     expect(deps.refreshAccount).not.toHaveBeenCalled()
     const fb = results.find((r) => r.account === 'fb-1')
     expect(fb?.ok).toBe(false)
-    expect(fb?.error).toBe('custody-deps-incomplete')
+    expect(fb?.error).toBe(CUSTODY_DEPS_INCOMPLETE)
     // The dedicated warn fired (not just the per-outcome recordOutcome warn).
     const refuseWarns = warn.mock.calls.filter((call) =>
       String((call as unknown[])[0] ?? '').includes('vault probe refused'),
