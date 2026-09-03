@@ -443,22 +443,15 @@ export async function refreshAllQuota(
             // because the local-refresh block is skipped, does not trigger a
             // forced refresh either. A 429 is never a report.
             if (access.provenance !== 'local') {
-              try {
-                await (
-                  deps.reportCustodyAuthFailure as NonNullable<
-                    typeof deps.reportCustodyAuthFailure
-                  >
-                )({
-                  handle: access.provenance.handle,
-                  providerStatus: 401,
-                  recordVersion: access.provenance.recordVersion,
-                })
-              } catch (reportError) {
-                logger.warn('custody auth-failure report failed', {
-                  accountId: acct.id,
-                  error: errorMessage(reportError),
-                })
-              }
+              await (
+                deps.reportCustodyAuthFailure as NonNullable<
+                  typeof deps.reportCustodyAuthFailure
+                >
+              )({
+                handle: access.provenance.handle,
+                providerStatus: 401,
+                recordVersion: access.provenance.recordVersion,
+              })
             }
             recordOutcome({
               account: acct.id,
