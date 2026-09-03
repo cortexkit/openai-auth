@@ -363,7 +363,11 @@ type InflightSlot = {
   promise: Promise<ResidentRecord>
 }
 
-type ReportBound = { count: number; firstReportedAt: number }
+type ReportBound = {
+  count: number
+  firstReportedAt: number
+  reauthUntil?: number
+}
 
 const REAUTH_HOUR_MS = 60 * 60 * 1000
 
@@ -423,8 +427,8 @@ export class ClaustrumCredentialCache {
   /**
    * True iff the bound-and-reauth fence has fired for this handle and the
    * reauth window has not yet elapsed. Callers that project "needs reauth"
-   * UI should gate on this; the resolver still attempts a `get`, which
-   * clears the fence on a successful fetch.
+   * UI should gate on this. The fence clears after a proven 2xx vault request
+   * or when the reauth window expires.
    */
   isReauth(handle: string, now: number = this.#now()): boolean {
     const until = this.#reauth.get(handle)
@@ -516,8 +520,8 @@ export class ClaustrumCredentialCache {
    * version-fenced (one report per handle per recordVersion), and after
    * two reports on the same version a one-hour bound fires — the third
    * and subsequent reports on the same version are suppressed, and the
-   * handle is moved into the `reauth` set for an hour. A subsequent successful
-   * `get` clears the bound and the reauth entry.
+   * handle is moved into the `reauth` set for an hour. A proven 2xx vault
+   * request or expiry of that window clears the bound and reauth entry.
    *
    * The reported version is invalidated from the resident record in
    * `finally`, so a follow-up `get` cannot accidentally serve the same
@@ -542,10 +546,17 @@ export class ClaustrumCredentialCache {
     }
     // Two-cycle bound: after 2 distinct versions have been reported for this
     // handle, the next report (any version) is suppressed for one hour. A
-    // successful get clears the bound and lifts the suppression.
-    const bound = this.#reportBound.get(handle)
+    // a proven 2xx vault request or expiry lifts the suppression.
+    let bound = this.#reportBound.get(handle)
     if (bound && bound.count >= 2) {
-      return
+      if (bound.reauthUntil !== undefined && now >= bound.reauthUntil) {
+        this.#reportBound.delete(handle)
+        this.#reauth.delete(handle)
+        this.#reported.delete(handle)
+        bound = undefined
+      } else {
+        return
+      }
     }
     const client = await this.#transport
     try {
@@ -561,6 +572,8 @@ export class ClaustrumCredentialCache {
       this.#reportBound.set(handle, {
         count: (prior?.count ?? 0) + 1,
         firstReportedAt: prior?.firstReportedAt ?? now,
+        reauthUntil:
+          (prior?.count ?? 0) + 1 >= 2 ? now + REAUTH_HOUR_MS : undefined,
       })
       if ((prior?.count ?? 0) + 1 >= 2) {
         this.#reauth.set(handle, now + REAUTH_HOUR_MS)

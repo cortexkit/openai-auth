@@ -1004,9 +1004,8 @@ export function __createCustodyRuntimeForTest(
   }
 
   async function _runBootSweep(): Promise<void> {
-    // The boot sweep is now fired-and-forgotten inside `boot()`; the bound
-    // there races both the warm and the sweep. This entrypoint is kept so the
-    // dispose / log surfaces still typecheck; it is a no-op.
+    // Boot performs the completion sweep inline before returning; this legacy
+    // entrypoint remains only for callers that still reference the symbol.
     return
   }
 
