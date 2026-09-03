@@ -708,6 +708,59 @@ describe('resolveFallbackAccess', () => {
     expect(result).toBe(CUSTODY_REFUSE)
     cache.close()
   })
+
+  it('refuses a reauth handle even when its resident vault record is populated', async () => {
+    const handle = `ckh_${'r'.repeat(43)}`
+    const account = makeSentinelAccount({ accountId: 'acct-reauth' })
+    await writeManifest([
+      {
+        provider: 'openai',
+        shape: 'oauth',
+        serve: 'openai-auth',
+        accounts: [
+          { label: account.id, handle, credential_id: 'oauth:openai:x' },
+        ],
+      },
+    ])
+    const storage = liveStorage([account], { claustrum: { enabled: true } })
+    const manifest = await readCustodyManifest(handlesPath)
+    let version = 1
+    const cache = new ClaustrumCredentialCache({
+      connector: async () =>
+        makeFakeClient({
+          getCredential: async () => ({
+            material: jwtFor('acct-reauth'),
+            recordVersion: version,
+            expiresAtMs: Date.now() + 60_000,
+          }),
+        }) as never,
+    })
+    await cache.get(handle)
+    await cache.reportAuthFailure({
+      handle,
+      providerStatus: 401,
+      recordVersion: 1,
+    })
+    version = 2
+    await cache.get(handle)
+    await cache.reportAuthFailure({
+      handle,
+      providerStatus: 401,
+      recordVersion: 2,
+    })
+    version = 3
+    await cache.get(handle)
+    expect(await cache.peek(handle)).toBeDefined()
+    expect(cache.isReauth(handle)).toBe(true)
+    expect(
+      await resolveFallbackAccess(account, storage, manifest, {
+        cache,
+        manifestHandle: handle,
+        requestPath: true,
+      }),
+    ).toBe(CUSTODY_REFUSE)
+    cache.close()
+  })
 })
 
 // ---------------------------------------------------------------------------
