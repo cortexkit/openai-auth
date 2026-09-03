@@ -17,6 +17,8 @@ import {
   quotaBackoffActive,
   refreshBackoffActive,
 } from './backoff.ts'
+import { CustodyTombstoneRefreshError, refreshInert } from './custody.ts'
+import type { CustodyManifestReadResult } from './custody-manifest.ts'
 import { extractAccountId } from './oauth'
 import type {
   ProviderQuotaFn,
@@ -296,6 +298,11 @@ export type AccountStateSaveScope = {
   accounts?: true | string[]
 }
 
+export type AccountManagerCustodyOptions = {
+  readManifest?: () => Promise<CustodyManifestReadResult>
+  provider?: string
+}
+
 export type AccountManagerOptions = {
   now?: () => number
   fetchImpl?: typeof fetch
@@ -307,6 +314,9 @@ export type AccountManagerOptions = {
   fetchQuotaFn?: ProviderQuotaFn
   /** QuotaManager instance for unified cache (constructor-injected). */
   quotaManager?: import('./quota-manager.ts').QuotaManager
+  /** Custody gates — manifest reader + provider (default: openai). When
+   * absent, the manager behaves exactly as before this field existed. */
+  custody?: AccountManagerCustodyOptions
 }
 
 export type AccountRefreshError = {
@@ -1773,6 +1783,12 @@ function recordRefreshError(
   error: unknown,
   now: number,
 ) {
+  // The tombstone class is the wired-in short-circuit: stamping a permanent
+  // backoff onto an account the vault owns would re-arm refresh against an
+  // inert target. Defence in depth — the choke point already throws before
+  // this is reached in the gate paths, but a direct caller still has to
+  // observe the same contract.
+  if (error instanceof CustodyTombstoneRefreshError) return
   account.lastRefreshError = buildRefreshOperationError({
     error,
     now,
@@ -1786,6 +1802,7 @@ function recordQuotaRefreshError(
   error: unknown,
   now: number,
 ) {
+  if (error instanceof CustodyTombstoneRefreshError) return
   account.lastQuotaRefreshError = buildQuotaOperationError({
     error,
     now,
@@ -1804,7 +1821,7 @@ function recordQuotaRefreshError(
   }
 }
 
-function fallbackRefreshLockName(accountId: string) {
+export function fallbackRefreshLockName(accountId: string) {
   return `fallback-oauth-refresh-${createHash('sha256')
     .update(accountId)
     .digest('base64url')
@@ -1885,7 +1902,7 @@ export function getQuotaCheckIntervalMs(storage: AccountStorage | null) {
 
 const BACKGROUND_TICK_MS = 60_000
 const BACKGROUND_TICK_JITTER_MS = 60_000
-const FALLBACK_REFRESH_LOCK_TTL_MS = 10 * 60_000
+export const FALLBACK_REFRESH_LOCK_TTL_MS = 10 * 60_000
 const FALLBACK_REFRESH_JOIN_WAIT_MS = 10_000
 const FALLBACK_REFRESH_JOIN_POLL_MS = 100
 const DEFAULT_REFRESH_INTERVAL_MINUTES = 10
@@ -1914,6 +1931,10 @@ export class FallbackAccountManager {
   readonly quotaManager: import('./quota-manager.ts').QuotaManager | null
   private readonly onFallbackStorageChanged: (() => void) | undefined
   private readonly options: AccountManagerOptions
+  private readonly custodyReadManifest:
+    | (() => Promise<CustodyManifestReadResult>)
+    | null
+  private readonly custodyProvider: string
 
   constructor(options: AccountManagerOptions = {}) {
     this.options = options
@@ -1922,6 +1943,30 @@ export class FallbackAccountManager {
     this.configPath = options.configPath ?? getAccountStoragePath()
     this.quotaManager = options.quotaManager ?? null
     this.onFallbackStorageChanged = options.onFallbackStorageChanged
+    this.custodyReadManifest = options.custody?.readManifest ?? null
+    this.custodyProvider = options.custody?.provider ?? 'openai'
+  }
+
+  // Throws CustodyTombstoneRefreshError when the account is refresh-inert
+  // (manifest entry OR tombstone sentinel). The storage toggle is
+  // intentionally ignored — see the drift preamble.
+  private async assertNotCustodyInert(
+    account: OAuthAccount | undefined,
+  ): Promise<void> {
+    if (!this.custodyReadManifest || !account) return
+    const manifest = await this.custodyReadManifest()
+    if (refreshInert(account, manifest, this.custodyProvider)) {
+      throw new CustodyTombstoneRefreshError(this.custodyProvider)
+    }
+  }
+
+  // Boolean form: the entry gates use this to skip the account without
+  // throwing — throwing inside a loop body would force a catch that loses
+  // the surrounding selection bookkeeping.
+  private async isCustodyRefreshInert(account: OAuthAccount): Promise<boolean> {
+    if (!this.custodyReadManifest) return false
+    const manifest = await this.custodyReadManifest()
+    return refreshInert(account, manifest, this.custodyProvider)
   }
 
   /**
@@ -1998,6 +2043,10 @@ export class FallbackAccountManager {
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
       if (isMainAccountFallback(storage, account)) continue
+      // Entry gate: an enrolled or tombstoned account never serves the local
+      // refresh path. The manifest reader re-reads per call so a manifest
+      // entry appearing between iterations is still observed.
+      if (await this.isCustodyRefreshInert(account)) continue
       let refreshFailed = false
       let candidate = account
       try {
@@ -2158,6 +2207,7 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (await this.isCustodyRefreshInert(account)) continue
       if (!tokenNeedsRefresh(account, storage, this.now())) continue
       if (
         refreshBackoffActive(
@@ -2200,6 +2250,7 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (await this.isCustodyRefreshInert(account)) continue
       let next = account
       try {
         if (tokenNeedsRefresh(next, storage, this.now())) {
@@ -2247,6 +2298,7 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (await this.isCustodyRefreshInert(account)) continue
       let next = account
       try {
         if (tokenNeedsRefresh(next, storage, this.now())) {
@@ -2327,6 +2379,12 @@ export class FallbackAccountManager {
       )
       if (!latestAccount) continue
 
+      // Per-poll custody gate: a manifest write is NOT a storage change, so
+      // the `changed` test below cannot see it. The per-poll gate reads the
+      // manifest fresh on every iteration and throws before any return —
+      // `force:true` must NEVER receive an enrolled or tombstoned account.
+      await this.assertNotCustodyInert(latestAccount)
+
       const changed =
         latestAccount.access !== previous.access ||
         latestAccount.refresh !== previous.refresh ||
@@ -2369,6 +2427,9 @@ export class FallbackAccountManager {
       (candidate): candidate is OAuthAccount =>
         candidate.id === account.id && isOAuthAccount(candidate),
     )
+    // Choke point (initial load): refuse any provider call when the
+    // reloaded account is enrolled or tombstoned. The toggle is ignored.
+    await this.assertNotCustodyInert(latestAccount)
     if (
       latestAccount &&
       !options.force &&
@@ -2407,6 +2468,10 @@ export class FallbackAccountManager {
         (candidate): candidate is OAuthAccount =>
           candidate.id === account.id && isOAuthAccount(candidate),
       )
+      // Choke point (under-lock load): a tombstone landing while the lock
+      // was contended, or a manifest entry appearing on disk, both abort
+      // the refresh before the provider call.
+      await this.assertNotCustodyInert(latestAccount)
       if (
         latestAccount &&
         !options.force &&
@@ -2448,6 +2513,15 @@ export class FallbackAccountManager {
       updateStoredAccount(storage, sourceAccount)
       await this.save(storage)
       const refreshedStorage = await this.load()
+      // Choke point (post-save load): a concurrent custody write landing
+      // between save and the verification load must invalidate the result
+      // even though the refreshFn succeeded.
+      await this.assertNotCustodyInert(
+        refreshedStorage?.accounts.find(
+          (candidate): candidate is OAuthAccount =>
+            candidate.id === account.id && isOAuthAccount(candidate),
+        ),
+      )
       if (
         !refreshedStorage?.accounts.some(
           (candidate) => candidate.id === account.id,
