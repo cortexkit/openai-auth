@@ -52,7 +52,7 @@ import {
   FLOOR_CLAUSTRUM_HANDLES_LOCK,
 } from './setup-env.ts'
 
-const HANDLE = 'ckh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+const HANDLE = 'ckh_ZmItMQaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 
 let scratchDir: string
 let configPath: string

@@ -17,7 +17,7 @@
  * short-circuit, and stamping `lastRefreshError` with it would re-arm the
  * refresh backoff against an inert account.
  *
- * Each gated mutation is exercised by a standard RED-then-GREEN run; the
+ * Each gated branch is exercised by a standard RED-then-GREEN run; the
  * named tests are the witnesses.
  */
 
@@ -167,7 +167,7 @@ describe('choke point (refreshAccountNow) refuses refreshInert accounts', () => 
 })
 
 // ---------------------------------------------------------------------------
-// getUsableFallbackAccounts candidate shape (spec §3)
+// getUsableFallbackAccounts candidate shape
 // ---------------------------------------------------------------------------
 
 describe('getUsableFallbackAccounts candidate shape (spec §3)', () => {
@@ -190,12 +190,9 @@ describe('getUsableFallbackAccounts candidate shape (spec §3)', () => {
     expect(manager.refreshAccountCalls).toHaveLength(0)
   })
 
-  it('enrolling + expired local token → absent this round, zero refreshFn calls', async () => {
-    // The local refresh was intentionally skipped, so the candidate carries
-    // the still-expired local token. `hasUnexpiredAccessToken` rejects it
-    // before selection — without the explicit skip in the loop the
-    // `accountPassesQuotaPolicy` gate (which never sees an error path) would
-    // happily push an expired account into the candidate list.
+  it('keeps an expired enrolling account for the request resolver without refreshing it', async () => {
+    // The resolver completes an expired enrollment inline. Selection must keep
+    // the account available while still preventing a local refresh.
     const account = liveAccount('enr-2', { expires: Date.now() - 1_000 })
     await saveAccounts(liveStorage([account]), cfgPath)
     const storage = (await loadAccounts(cfgPath))!
@@ -205,7 +202,8 @@ describe('getUsableFallbackAccounts candidate shape (spec §3)', () => {
     })
 
     const usable = await manager.getUsableFallbackAccounts(storage)
-    expect(usable).toHaveLength(0)
+    expect(usable).toHaveLength(1)
+    expect(usable[0]?.id).toBe('enr-2')
     expect(refreshCalls()).toBe(0)
     expect(manager.refreshAccountCalls).toHaveLength(0)
   })

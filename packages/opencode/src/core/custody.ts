@@ -33,6 +33,7 @@ import {
   CUSTODY_OWNING_SERVE,
   CUSTODY_OWNING_SHAPE,
   type CustodyManifestReadResult,
+  custodyManifestHandles,
 } from './custody-manifest.ts'
 import { extractAccountIdFromClaims, parseJwtClaims } from './oauth.ts'
 import type { acquireRefreshFileLock } from './refresh-file-lock.ts'
@@ -749,7 +750,7 @@ export async function completeFallbackEnrollment(
   if (!enrolling(liveAccount, manifest, provider)) {
     return { kind: 'skipped', reason: 'notEnrolling' }
   }
-  const manifestHandle = handleForAccount(liveAccount, manifest)
+  const manifestHandle = custodyManifestHandles(manifest).get(liveAccount.id)
   if (!manifestHandle) return { kind: 'skipped', reason: 'notEnrolling' }
 
   const lockName = fallbackRefreshLockName(liveAccount.id)
@@ -838,26 +839,6 @@ export async function completeFallbackEnrollment(
   } finally {
     await lock.release().catch(() => {})
   }
-}
-
-function handleForAccount(
-  account: OAuthAccount,
-  manifest: CustodyManifestReadResult,
-): string | undefined {
-  if (!manifest.ok) return undefined
-  for (const provider of manifest.value.providers) {
-    if (
-      provider.provider !== CUSTODY_OWNING_PROVIDER ||
-      provider.shape !== CUSTODY_OWNING_SHAPE ||
-      provider.serve !== CUSTODY_OWNING_SERVE
-    ) {
-      continue
-    }
-    for (const entry of provider.accounts) {
-      if (entry.label === account.id) return entry.handle
-    }
-  }
-  return undefined
 }
 
 function classifyGetError(error: unknown): 'gone' | 'unavailable' {
