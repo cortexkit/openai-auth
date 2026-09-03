@@ -32,6 +32,7 @@ import {
   defaultCustodyManifestPath,
   readCustodyManifest,
 } from '../core/custody-manifest.ts'
+import { CUSTODY_DEPS_INCOMPLETE } from '../core/refresh-all-quota.ts'
 import {
   __createCustodyRuntimeForTest,
   __resetSweepFailureLogDedupeForTest,
@@ -921,7 +922,7 @@ describe('quota construction dep wiring', () => {
     const results = await refreshAllQuota(deps, { accountKey: 'fb-1' })
     const fb = results.find((r) => r.account === 'fb-1')
     expect(fb?.ok).toBe(false)
-    expect(fb?.error).toBe('custody-deps-incomplete')
+    expect(fb?.error).toBe(CUSTODY_DEPS_INCOMPLETE)
   })
 })
 
