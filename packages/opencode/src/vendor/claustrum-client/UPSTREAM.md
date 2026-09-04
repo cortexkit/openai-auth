@@ -16,6 +16,8 @@ condition is: swap to a published `@cortexkit/claustrum-client` release
 when one exists at or after `d69ceed`, at which point this directory is
 removed and the dependency flips to a normal package import.
 
+Review this pin on or before 2026-10-04; if `@cortexkit/claustrum-client` is not published by then, decide whether to keep vendoring or drop the feature.
+
 The two test files in `src/tests/` (upstream) were NOT copied; the
 opencode test suite owns its own tests under `src/tests/custody.test.ts`.
 
