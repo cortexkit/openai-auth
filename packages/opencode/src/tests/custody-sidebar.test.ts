@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -72,6 +72,20 @@ describe('plugin-wide claustrum gate', () => {
     })
   })
 
+  it('defaults an omitted manifestWrite key to false', async () => {
+    writeFileSync(
+      cfgPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        claustrum: { enabled: true },
+      }),
+    )
+    const loaded = await loadAccounts(cfgPath)
+    expect(loaded?.claustrum).toEqual({ enabled: true, manifestWrite: false })
+  })
+
   it('normalizes old config files with no claustrum block byte-identical (no implicit block on read)', async () => {
     // An old config (no `claustrum` key) must read as `claustrum === undefined`
     // and round-trip back to disk with no `claustrum` key written. Adding
@@ -142,7 +156,7 @@ describe('plugin-wide claustrum gate', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Sidebar projection — six states, four reasons, main frozen-local
+// Sidebar projection — six states, five reasons, main frozen-local
 // ---------------------------------------------------------------------------
 
 function makeCache(
