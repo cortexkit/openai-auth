@@ -256,8 +256,12 @@ export type AccountStorage = {
    *  that is both manifest-enrolled and tombstoned (`custodied`) serves its
    *  access token from the Claustrum vault; without the toggle the same
    *  account is `excluded`. Does NOT participate in the refresh gate.
-   *  `manifestWrite` arms custody writes that destroy local oauth secrets;
-   *  absent values keep manifest reads reversible (no local-secret destroy). */
+   *  `manifestWrite` arms EVERY custody write that destroys local oauth
+   *  secrets — defined by that property, not by the verb that happens to
+   *  perform it, so a new destructive path (the enroll verb, a future sweep)
+   *  inherits the gate by construction rather than by someone remembering to
+   *  add it. Absent or false keeps manifest reads reversible: no local secret
+   *  is ever overwritten. */
   claustrum?: {
     enabled?: boolean
     manifestWrite?: boolean
