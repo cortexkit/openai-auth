@@ -58,6 +58,17 @@ export function liveStorage(
   }
 }
 
+export function withManifestWrite(storage: AccountStorage): AccountStorage {
+  return {
+    ...storage,
+    claustrum: {
+      ...storage.claustrum,
+      enabled: storage.claustrum?.enabled ?? true,
+      manifestWrite: true,
+    },
+  }
+}
+
 export function emptyManifest(): CustodyManifestReadResult {
   return { ok: true, value: { version: 1, providers: [] } }
 }

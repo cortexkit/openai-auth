@@ -107,6 +107,7 @@ export type SidebarCustodyReason =
   | 'gone'
   | 'identityMismatch'
   | 'nullClaim'
+  | 'completionDisarmed'
 
 export interface SidebarAccountCustody {
   state: SidebarCustodyState
@@ -221,6 +222,7 @@ const CUSTODY_REASONS = new Set<SidebarCustodyReason>([
   'gone',
   'identityMismatch',
   'nullClaim',
+  'completionDisarmed',
 ])
 
 /**
@@ -380,6 +382,7 @@ export interface ProjectCustodyInput {
     | 'gone'
     | 'identityMismatch'
     | 'nullClaim'
+    | 'completionDisarmed'
   /** Live read-only view of the cache; absent on unenrolled/tombstone-false. */
   cache?: CustodyCacheReadView
   /** Caller-supplied "now" so tests can drive the reauth fence deterministically. */

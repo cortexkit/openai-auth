@@ -27,6 +27,7 @@ import {
 } from '../index.ts'
 import { hashSidebarSessionId } from '../sidebar-state.ts'
 import {
+  emptyManifest,
   enrollmentManifest,
   liveAccount,
   liveStorage,
@@ -68,6 +69,7 @@ async function withCustodyLoader(
     accounts: OAuthAccount[]
     routing?: { mode: 'main-first' | 'fallback-first' | 'sticky-balanced' }
     claustrumEnabled?: boolean
+    manifestWrite?: boolean
     credential?: { material: string; recordVersion: number } | undefined
     credentialForGet?: () => { material: string; recordVersion: number }
     now?: () => number
@@ -89,6 +91,7 @@ async function withCustodyLoader(
       track: CacheKeepManager['track']
       tick: CacheKeepManager['tick']
     }
+    configPath: string
   }) => Promise<void>,
 ): Promise<void> {
   const directory = mkdtempSync(join(tmpdir(), 'custody-request-loader-'))
@@ -116,7 +119,10 @@ async function withCustodyLoader(
       version: 1,
       main: { type: 'opencode', provider: 'openai' },
       accounts: options.accounts,
-      claustrum: { enabled: options.claustrumEnabled ?? true },
+      claustrum: {
+        enabled: options.claustrumEnabled ?? true,
+        manifestWrite: options.manifestWrite === true,
+      },
       routing: options.routing,
     }),
   )
@@ -212,6 +218,7 @@ async function withCustodyLoader(
       gets: () => gets,
       runtime,
       cacheKeepManager,
+      configPath,
     })
   } finally {
     await hooks.dispose?.()
@@ -334,6 +341,7 @@ describe('custody request resolution', () => {
     await withCustodyLoader(
       {
         accounts: [fallback],
+        manifestWrite: true,
         credential: { material: vaultAccess, recordVersion: 18 },
         observeRequest: async (authorization, url, configPath) => {
           if (!url.endsWith('/responses')) return
@@ -359,6 +367,47 @@ describe('custody request resolution', () => {
       refresh: makeSentinelAccount().refresh,
       expires: 0,
     })
+  })
+
+  it('skips an expired enrolling account while preserving its local secrets when completion is disarmed', async () => {
+    const expired = enrollingAccount()
+    const next = enrollingAccount({
+      id: 'next',
+      access: 'next-access',
+      refresh: 'next-refresh',
+      expires: Date.now() + 100_000,
+    })
+    const secretsBefore = JSON.stringify({
+      access: expired.access,
+      refresh: expired.refresh,
+    })
+    await withCustodyLoader(
+      {
+        accounts: [expired, next],
+        routing: { mode: 'fallback-first' },
+        credential: { material: jwtFor('acct-1'), recordVersion: 18 },
+        respond: (authorization) =>
+          authorization === 'Bearer main-access' ? 401 : 200,
+      },
+      async ({ fetchOverride, authorizations, configPath }) => {
+        const [url, init] = codexRequest()
+        expect((await fetchOverride(url, init)).status).toBe(200)
+        expect(authorizations).toContain('Bearer next-access')
+        const storage = await loadAccounts(configPath)
+        const preserved = storage?.accounts.find(
+          (account) => account.id === expired.id,
+        )
+        expect(preserved?.type).toBe('oauth')
+        if (preserved?.type !== 'oauth')
+          throw new Error('expected oauth account')
+        expect(
+          JSON.stringify({
+            access: preserved.access,
+            refresh: preserved.refresh,
+          }),
+        ).toBe(secretsBefore)
+      },
+    )
   })
 
   it('sends the vault bearer and fences repeated fallback-first 401 reports', async () => {
@@ -1169,7 +1218,9 @@ describe('custody request resolution', () => {
 
   it('serves a valid local enrollment without refreshing it', async () => {
     const account = enrollingAccount({ expires: 100_000 })
-    const storage = liveStorage([account], { claustrum: { enabled: true } })
+    const storage = liveStorage([account], {
+      claustrum: { enabled: true, manifestWrite: true },
+    })
     const manifest = enrollmentManifest(account.id)
     if (!manifest.ok) throw new Error('expected manifest fixture')
     const handle = manifest.value.providers[0]?.accounts[0]?.handle
@@ -1209,9 +1260,28 @@ describe('custody request resolution', () => {
     cache.close()
   })
 
+  it('serves a local account after its manifest entry is removed', async () => {
+    const account = enrollingAccount({ expires: 100_000 })
+    const storage = liveStorage([account], {
+      claustrum: { enabled: true, manifestWrite: false },
+    })
+    const result = await resolveFallbackAccess(
+      account,
+      storage,
+      emptyManifest(),
+      {
+        now: () => 1_000,
+      },
+    )
+
+    expect(result).toEqual({ token: 'local-access', provenance: 'local' })
+  })
+
   it('completes a due enrollment before serving vault access', async () => {
     const account = enrollingAccount()
-    let storage = liveStorage([account], { claustrum: { enabled: true } })
+    let storage = liveStorage([account], {
+      claustrum: { enabled: true, manifestWrite: true },
+    })
     const manifest = enrollmentManifest(account.id)
     if (!manifest.ok) throw new Error('expected manifest fixture')
     const handle = manifest.value.providers[0]?.accounts[0]?.handle
@@ -1272,7 +1342,9 @@ describe('custody request resolution', () => {
 
   it('refuses a due enrollment when the served claim differs from its local identity', async () => {
     const account = enrollingAccount()
-    let storage = liveStorage([account], { claustrum: { enabled: true } })
+    let storage = liveStorage([account], {
+      claustrum: { enabled: true, manifestWrite: true },
+    })
     const manifest = enrollmentManifest(account.id)
     if (!manifest.ok) throw new Error('expected manifest fixture')
     const handle = manifest.value.providers[0]?.accounts[0]?.handle
@@ -1332,7 +1404,9 @@ describe('custody request resolution', () => {
 
   it('refuses a due enrollment when completion cannot fetch vault material', async () => {
     const account = enrollingAccount()
-    const storage = liveStorage([account], { claustrum: { enabled: true } })
+    const storage = liveStorage([account], {
+      claustrum: { enabled: true, manifestWrite: true },
+    })
     const manifest = enrollmentManifest(account.id)
     if (!manifest.ok) throw new Error('expected manifest fixture')
     const handle = manifest.value.providers[0]?.accounts[0]?.handle
