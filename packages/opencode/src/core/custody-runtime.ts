@@ -22,6 +22,7 @@ import {
   custodied,
   enrolling,
   enrollPendingReason,
+  markEnrollPending,
   refreshInert,
   tombstoned,
 } from './custody.ts'
@@ -140,6 +141,7 @@ export function __createCustodyRuntimeForTest(
 
   let cache: ClaustrumCredentialCache | undefined
   let transport: ClaustrumCacheTransportLike | undefined
+  let completionDisarmedLogged = false
   let detection: Awaited<ReturnType<typeof detect>> | undefined
   let timer: ReturnType<typeof setInterval> | undefined
   let closed = false
@@ -229,6 +231,10 @@ export function __createCustodyRuntimeForTest(
       const sweepPromises: Promise<void>[] = []
       for (const account of oauthAccounts(options.storage)) {
         if (!enrolling(account, manifest, CUSTODY_OWNING_PROVIDER)) continue
+        if (options.storage?.claustrum?.manifestWrite !== true) {
+          markCompletionDisarmed(account, true)
+          continue
+        }
         const handle = enabledHandles.get(account.id)
         if (!handle) continue
         const sweepDeps = buildSweepDeps(cache)
@@ -307,10 +313,31 @@ export function __createCustodyRuntimeForTest(
     const sweepDeps = buildSweepDeps(cache)
     for (const account of oauthAccounts(storage)) {
       if (!enrolling(account, manifest, CUSTODY_OWNING_PROVIDER)) continue
+      if (options.storage?.claustrum?.manifestWrite !== true) {
+        markCompletionDisarmed(account, false)
+        continue
+      }
       if (!enabledHandles.has(account.id)) continue
       const outcome = await completeFallbackEnrollment(account, sweepDeps)
       applyOutcomeToProjection(account, outcome, manifest)
     }
+  }
+
+  function markCompletionDisarmed(
+    account: OAuthAccount,
+    logAtBoot: boolean,
+  ): void {
+    markEnrollPending(account.id, 'completionDisarmed')
+    projectionByAccountId.set(account.id, {
+      state: 'enrollPending',
+      reason: 'completionDisarmed',
+    })
+    if (!logAtBoot || completionDisarmedLogged) return
+    completionDisarmedLogged = true
+    log.info(
+      'custody enrollment completion is disarmed; set claustrum.manifestWrite=true to arm it',
+      {},
+    )
   }
 
   async function runWarmPass(
