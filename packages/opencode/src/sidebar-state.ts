@@ -88,8 +88,9 @@ export interface SidebarAccountState {
   killed: boolean
   enabled: boolean
   resetCredits?: number
-  /** Vault-custody projection (fallback accounts only). Six states,
-   *  four reasons — see `projectCustodyForSidebar`. The main slot is
+  /** Vault-custody projection (fallback accounts only). Six states; the
+   *  enroll-pending reasons are `EnrollPendingReason` — see
+   *  `projectCustodyForSidebar`. The main slot is
    *  always rendered as frozen-local and never carries this field. */
   custody?: SidebarAccountCustody
 }
