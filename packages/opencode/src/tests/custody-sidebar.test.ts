@@ -309,10 +309,20 @@ describe('projectCustodyForSidebar — enroll-pending reason', () => {
     expect(out).toEqual({ state: 'enrollPending', reason: 'unavailable' })
   })
 
-  it('all four operator reasons are distinct, individual states', () => {
+  it('all operator reasons render as enrollPending', () => {
     const reasons: Array<
-      'unavailable' | 'gone' | 'identityMismatch' | 'nullClaim'
-    > = ['unavailable', 'gone', 'identityMismatch', 'nullClaim']
+      | 'unavailable'
+      | 'gone'
+      | 'identityMismatch'
+      | 'nullClaim'
+      | 'completionDisarmed'
+    > = [
+      'unavailable',
+      'gone',
+      'identityMismatch',
+      'nullClaim',
+      'completionDisarmed',
+    ]
     const observed = new Set<string>()
     for (const reason of reasons) {
       const out = projectCustodyForSidebar({
@@ -325,7 +335,7 @@ describe('projectCustodyForSidebar — enroll-pending reason', () => {
       expect(out.state).toBe('enrollPending')
       observed.add(out.reason!)
     }
-    expect(observed.size).toBe(4)
+    expect(observed.size).toBe(5)
   })
 })
 

@@ -283,6 +283,10 @@ export async function resolveFallbackAccess(
     ) {
       return { token: account.access, provenance: 'local' }
     }
+    if (storage.claustrum?.manifestWrite !== true) {
+      latchEnrollPending(account.id, 'completionDisarmed')
+      return CUSTODY_REFUSE
+    }
     if (!options.completeEnrollmentDeps) return CUSTODY_REFUSE
     const outcome = await completeFallbackEnrollment(
       account,
@@ -622,6 +626,7 @@ export type EnrollPendingReason =
   | 'gone'
   | 'identityMismatch'
   | 'nullClaim'
+  | 'completionDisarmed'
 
 const enrollPending = new Map<string, EnrollPendingReason>()
 
@@ -870,7 +875,7 @@ function classifyGetError(error: unknown): 'gone' | 'unavailable' {
 
 function latchEnrollPending(
   accountId: string,
-  reason: 'gone' | 'nullClaim' | 'identityMismatch' | 'unavailable',
+  reason: EnrollPendingReason,
 ): void {
   // First failure latches — later failures must not overwrite the original
   // cause. The boot/hour log in the loader keys on whether the store
