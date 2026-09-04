@@ -70,6 +70,7 @@ async function withCustodyLoader(
     routing?: { mode: 'main-first' | 'fallback-first' | 'sticky-balanced' }
     claustrumEnabled?: boolean
     manifestWrite?: boolean
+    omitManifestWrite?: boolean
     credential?: { material: string; recordVersion: number } | undefined
     credentialForGet?: () => { material: string; recordVersion: number }
     now?: () => number
@@ -119,10 +120,12 @@ async function withCustodyLoader(
       version: 1,
       main: { type: 'opencode', provider: 'openai' },
       accounts: options.accounts,
-      claustrum: {
-        enabled: options.claustrumEnabled ?? true,
-        manifestWrite: options.manifestWrite === true,
-      },
+      claustrum: options.omitManifestWrite
+        ? { enabled: options.claustrumEnabled ?? true }
+        : {
+            enabled: options.claustrumEnabled ?? true,
+            manifestWrite: options.manifestWrite === true,
+          },
       routing: options.routing,
     }),
   )
@@ -385,6 +388,7 @@ describe('custody request resolution', () => {
       {
         accounts: [expired, next],
         routing: { mode: 'fallback-first' },
+        omitManifestWrite: true,
         credential: { material: jwtFor('acct-1'), recordVersion: 18 },
         respond: (authorization) =>
           authorization === 'Bearer main-access' ? 401 : 200,
@@ -1261,7 +1265,7 @@ describe('custody request resolution', () => {
   })
 
   it('serves a local account after its manifest entry is removed', async () => {
-    const account = enrollingAccount({ expires: 100_000 })
+    const account = enrollingAccount({ expires: 1_000 })
     const storage = liveStorage([account], {
       claustrum: { enabled: true, manifestWrite: false },
     })

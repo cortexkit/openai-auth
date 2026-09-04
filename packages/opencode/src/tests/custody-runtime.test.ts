@@ -327,7 +327,7 @@ describe('custody warm and tick', () => {
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
         storage: liveStorage([account], {
-          claustrum: { enabled: true, manifestWrite: false },
+          claustrum: { enabled: true },
         }),
         transport,
         detection: 'available',

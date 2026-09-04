@@ -257,7 +257,7 @@ export type AccountStorage = {
    *  access token from the Claustrum vault; without the toggle the same
    *  account is `excluded`. Does NOT participate in the refresh gate.
    *  `manifestWrite` arms custody writes that destroy local oauth secrets;
-   *  absent values keep phase-A manifest reads reversible. */
+   *  absent values keep manifest reads reversible (no local-secret destroy). */
   claustrum?: {
     enabled?: boolean
     manifestWrite?: boolean
