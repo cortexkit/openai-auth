@@ -17,12 +17,10 @@ import {
   ClaustrumCredentialCache,
   type CompleteEnrollmentDeps,
   type CompleteEnrollmentOutcome,
-  clearEnrollPending,
   completeFallbackEnrollment,
   custodied,
   enrolling,
   enrollPendingReason,
-  markEnrollPending,
   refreshInert,
   tombstoned,
 } from './custody.ts'
@@ -141,7 +139,6 @@ export function __createCustodyRuntimeForTest(
 
   let cache: ClaustrumCredentialCache | undefined
   let transport: ClaustrumCacheTransportLike | undefined
-  let completionDisarmedLogged = false
   let detection: Awaited<ReturnType<typeof detect>> | undefined
   let timer: ReturnType<typeof setInterval> | undefined
   let closed = false
@@ -195,13 +192,9 @@ export function __createCustodyRuntimeForTest(
         }
         return
       }
-      // Toggle-off: the manager still gates on `refreshInert` from the manifest
-      // entry, but the runtime must not connect a client or schedule vault
-      // calls. The predicates observe disk state; the cache is dormant until
-      // the operator flips the toggle on and a tick reconnects.
-      if (!options.storage?.claustrum?.enabled) {
+      if (options.storage?.claustrum?.mode !== 'claustrum') {
         log.info(
-          'custody connection available but plugin toggle is off; manifest read for the refresh gate, no client/timer',
+          'custody connection available but mode is local; manifest read for the refresh gate, no client/timer',
           {},
         )
         return
@@ -231,10 +224,6 @@ export function __createCustodyRuntimeForTest(
       const sweepPromises: Promise<void>[] = []
       for (const account of oauthAccounts(options.storage)) {
         if (!enrolling(account, manifest, CUSTODY_OWNING_PROVIDER)) continue
-        if (options.storage?.claustrum?.manifestWrite !== true) {
-          markCompletionDisarmed(account, true)
-          continue
-        }
         const handle = enabledHandles.get(account.id)
         if (!handle) continue
         const sweepDeps = buildSweepDeps(cache)
@@ -265,10 +254,7 @@ export function __createCustodyRuntimeForTest(
     },
     async runTick() {
       if (closed || !cache) return
-      // Toggle-off after the runtime was armed (operator edit): the cache
-      // remains, but no vault calls happen. The manager still observes
-      // `refreshInert` from disk.
-      if (!options.storage?.claustrum?.enabled) return
+      if (options.storage?.claustrum?.mode !== 'claustrum') return
       // Re-read manifest (hot-reload on mtime) so an operator edit lands at
       // the next tick without a restart.
       const manifest = await options.readCustodyManifest(manifestPath)
@@ -313,31 +299,10 @@ export function __createCustodyRuntimeForTest(
     const sweepDeps = buildSweepDeps(cache)
     for (const account of oauthAccounts(storage)) {
       if (!enrolling(account, manifest, CUSTODY_OWNING_PROVIDER)) continue
-      if (options.storage?.claustrum?.manifestWrite !== true) {
-        markCompletionDisarmed(account, false)
-        continue
-      }
       if (!enabledHandles.has(account.id)) continue
       const outcome = await completeFallbackEnrollment(account, sweepDeps)
       applyOutcomeToProjection(account, outcome, manifest)
     }
-  }
-
-  function markCompletionDisarmed(
-    account: OAuthAccount,
-    logAtBoot: boolean,
-  ): void {
-    markEnrollPending(account.id, 'completionDisarmed')
-    projectionByAccountId.set(account.id, {
-      state: 'enrollPending',
-      reason: 'completionDisarmed',
-    })
-    if (!logAtBoot || completionDisarmedLogged) return
-    completionDisarmedLogged = true
-    log.info(
-      'custody enrollment completion is disarmed; set claustrum.manifestWrite=true to arm it',
-      {},
-    )
   }
 
   async function runWarmPass(
@@ -441,21 +406,10 @@ export function __createCustodyRuntimeForTest(
         unavailable: 'unavailable',
       }
       const reason = map[outcome.reason]
-      // `completeFallbackEnrollment` already latched `enrollPendingReason`;
-      // the projection becomes `enrollPending` exactly once, on the same
-      // transition that set the latch. A later failure with a different
-      // reason does NOT overwrite the original cause — the operator sees
-      // the first failure until the sweep clears it.
-      const isLatched = enrollPendingReason(account.id) !== undefined
-      if (isLatched) {
-        const existing = projectionByAccountId.get(account.id)
-        if (existing?.state !== 'enrollPending') {
-          projectionByAccountId.set(account.id, {
-            state: 'enrollPending',
-            reason,
-          })
-        }
-      }
+      projectionByAccountId.set(account.id, {
+        state: 'inert',
+        reason: reason === 'unavailable' ? 'vault-cold' : 'identity-mismatch',
+      })
       // Per-process, per-(account,reason) dedupe at one hour (spec §7.3).
       // First failure emits a warn; subsequent failures within the hour are
       // silent. The next failure past the hour emits again. Never logs the
@@ -463,8 +417,7 @@ export function __createCustodyRuntimeForTest(
       logSweepFailureOnce(log, account.id, reason, outcome.recordVersion, now())
       return
     }
-    // skipped outcomes clear the latch and refresh the projection from
-    // predicates so the sidebar stays in sync with disk.
+    // A completed tombstone write changes the row's startup coordinate.
     if (outcome.reason === 'notEnrolling') {
       // A successful tombstone wrote disk; re-read state.
       const refreshNow = now()
@@ -476,12 +429,6 @@ export function __createCustodyRuntimeForTest(
         manifest,
       )
       if (projection) projectionByAccountId.set(account.id, projection)
-      // Custodied-on-disk accounts lose any latched reason.
-      if (
-        custodied(account, manifest, options.storage ?? ({} as AccountStorage))
-      ) {
-        clearEnrollPending(account.id)
-      }
     }
   }
 
