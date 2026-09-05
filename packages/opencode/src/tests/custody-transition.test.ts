@@ -59,6 +59,7 @@ function fakeCoordinatorDeps(
     writes,
     released,
     storage: () => current,
+    authSlot,
     deps: {
       accountIds: current.accounts.map((account) => account.id),
       acquireLock: async ({
@@ -144,11 +145,11 @@ function fakeCoordinatorDeps(
           options.all ??
           (async () => ({ openai: authSlot, anthropic: { type: 'oauth' } })),
         get: async () => authSlot,
-        set: async () => {
+        set: async ({ body }) => {
           options.beforeSet?.()
-          authSlot.access = 'claustrum-tombstone:v1:openai'
-          authSlot.refresh = 'claustrum-tombstone:v1:openai'
-          authSlot.expires = 0
+          authSlot.access = body.access
+          authSlot.refresh = body.refresh
+          authSlot.expires = body.expires
           writes.push('main')
           options.afterSet?.()
         },
@@ -449,6 +450,19 @@ describe('enterClaustrumMode coordinator', () => {
     expect(fixture.traces.filter((step) => step.startsWith('warn:'))).toEqual([
       'warn:host auth store read empty; refusing to write — possible torn read',
     ])
+  })
+
+  it('writes an empty access token to the main custody tombstone', async () => {
+    const transition = await import('../core/custody-transition.ts')
+    const fixture = fakeCoordinatorDeps()
+
+    await transition.enterClaustrumMode(fixture.deps)
+
+    expect(fixture.authSlot).toMatchObject({
+      access: '',
+      refresh: 'claustrum-tombstone:v1:openai',
+      expires: 0,
+    })
   })
 
   it('reports a host overwrite observed by post-write readback', async () => {

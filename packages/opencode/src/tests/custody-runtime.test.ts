@@ -831,7 +831,7 @@ describe('fingerprint-gated reconciliation resume', () => {
     await runtime.runTick()
     expect(writes).toBe(1)
     expect(main).toMatchObject({
-      access: TOMBSTONE_OPENAI,
+      access: '',
       refresh: TOMBSTONE_OPENAI,
       expires: 0,
     })

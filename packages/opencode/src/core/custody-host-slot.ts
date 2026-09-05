@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { custodyTombstoneKey, tombstoned } from './custody.ts'
+import { canonicalCustodyTombstone, tombstoned } from './custody.ts'
 import {
   type CustodyManifestReadResult,
   custodyManifestHandles,
@@ -143,9 +143,10 @@ export function classifyMainAuthSlot(value: unknown): MainAuthSlot {
   ) {
     return { kind: 'real', oauth }
   }
+  const tombstone = canonicalCustodyTombstone(MAIN_PROVIDER)
   if (
-    oauth.access === custodyTombstoneKey(MAIN_PROVIDER) &&
-    oauth.expires === 0
+    oauth.access === tombstone.access &&
+    oauth.expires === tombstone.expires
   ) {
     return { kind: 'tombstone', oauth }
   }
