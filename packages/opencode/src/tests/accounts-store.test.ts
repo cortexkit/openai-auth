@@ -297,6 +297,42 @@ describe('accounts store', () => {
     expect(reloaded?.accounts[1]?.enabled).toBe(false)
   })
 
+  it('persists row history only in config and records removed account ids', async () => {
+    const { loadAccounts, mutateAccounts, saveAccounts } = await import(
+      '../core/accounts.ts'
+    )
+    const storage: AccountStorage = {
+      version: 1,
+      claustrum: { mode: 'local', rowHistory: ['previous'] },
+      accounts: [oauthAccount('kept'), oauthAccount('removed')],
+    }
+    await saveAccounts(storage, cfgPath)
+
+    expect((await loadAccounts(cfgPath))?.claustrum?.rowHistory).toEqual([
+      'previous',
+    ])
+    expect(
+      JSON.parse(readFileSync(cfgPath, 'utf8')).claustrum.rowHistory,
+    ).toEqual(['previous'])
+    expect(
+      JSON.parse(readFileSync(statePath, 'utf8')).claustrum,
+    ).toBeUndefined()
+
+    await mutateAccounts(
+      (current) => ({
+        ...current,
+        accounts: current.accounts.filter(
+          (account) => account.id !== 'removed',
+        ),
+      }),
+      cfgPath,
+    )
+
+    const after = await loadAccounts(cfgPath)
+    expect(after?.accounts.map((account) => account.id)).toEqual(['kept'])
+    expect(after?.claustrum?.rowHistory).toEqual(['previous', 'removed'])
+  })
+
   it('missing claustrum config loads as local without rewriting the file', async () => {
     const accounts = await import('../core/accounts.ts')
     const beforeExists = existsSync(cfgPath)
