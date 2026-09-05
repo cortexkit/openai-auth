@@ -23,6 +23,7 @@ import type {
 const CUSTODY_PROVIDER = 'openai'
 
 export const TOMBSTONE_OPENAI = `${CUSTODY_TOMBSTONE_PREFIX}${CUSTODY_PROVIDER}`
+export const CUSTODY_FIXTURE_NOW = 4_102_444_800_000
 
 export function makeSentinelAccount(
   overrides: Partial<OAuthAccount> = {},
@@ -30,7 +31,7 @@ export function makeSentinelAccount(
   return {
     id: 'custody-1',
     type: 'oauth',
-    access: TOMBSTONE_OPENAI,
+    access: '',
     refresh: TOMBSTONE_OPENAI,
     expires: 0,
     addedAt: 1_000,
@@ -41,7 +42,7 @@ export function makeSentinelAccount(
 export function liveAccount(
   id: string,
   overrides: Partial<OAuthAccount> = {},
-  now = 4_102_444_800_000,
+  now = CUSTODY_FIXTURE_NOW,
 ): OAuthAccount {
   return {
     id,
@@ -95,6 +96,8 @@ export function emptyManifest(): CustodyManifestReadResult {
     revision: manifestRevision(JSON.stringify(value)),
   }
 }
+
+export const localCustody = { readManifest: async () => emptyManifest() }
 
 export function enrollmentManifest(label: string): CustodyManifestReadResult {
   const suffix =

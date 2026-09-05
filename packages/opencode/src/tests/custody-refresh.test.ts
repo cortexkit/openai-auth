@@ -3,8 +3,8 @@
  *
  * Each local fallback refresh path must refuse to invoke the injected refresh
  * provider when the account is `refreshInert` (custody-manifest entry OR
- * tombstone sentinel in storage), regardless of `claustrum.enabled`. The
- * storage toggle never participates in this gate: enabling or disabling it
+ * tombstone sentinel in storage), regardless of claustrum mode. The storage
+ * mode never participates in this gate: changing it
  * must not resurrect a local refresher over a vault-held family.
  *
  * The choke point lives in `refreshAccountNow` — every `this.load()` inside
@@ -133,7 +133,7 @@ describe('choke point (refreshAccountNow) refuses refreshInert accounts', () => 
     expect(thrown).toBeInstanceOf(CustodyTombstoneRefreshError)
   })
 
-  it('enrolled manifest account (live storage, toggle off) → throws before refreshFn', async () => {
+  it('enrolled manifest account in local mode → throws before refreshFn', async () => {
     const account = liveAccount('enrolling-1')
     await saveAccounts(liveStorage([account]), cfgPath)
     const storage = (await loadAccounts(cfgPath))!
@@ -465,10 +465,10 @@ describe('manager entry gates skip refreshInert accounts', () => {
 })
 
 // ---------------------------------------------------------------------------
-// enrolled + claustrum.enabled=false + live secret → ZERO refreshFn
+// enrolled + local mode + live secret → ZERO refreshFn
 // ---------------------------------------------------------------------------
 
-describe('enrolled + claustrum.enabled=false → skip local refresh', () => {
+describe('enrolled + local mode → skip local refresh', () => {
   it('getUsableFallbackAccounts: ZERO refreshFn calls', async () => {
     const account = liveAccount('enrolled-1', { expires: Date.now() - 1_000 })
     await saveAccounts(
@@ -722,7 +722,7 @@ describe('waiter (waitForConcurrentFallbackRefresh) re-evaluates refreshInert pe
     })
 
     await new Promise((resolve) => setTimeout(resolve, 150))
-    manifestMode = 'enrolled' // claustrum.enabled:false is implicit (omitted)
+    manifestMode = 'enrolled' // local mode is implicit when claustrum is omitted
 
     let thrown: unknown
     try {

@@ -34,10 +34,10 @@ afterEach(() => {
 })
 
 // ---------------------------------------------------------------------------
-// Storage shape — the one plugin-wide gate survives every storage path
+// Storage shape — one plugin-wide mode survives every storage path
 // ---------------------------------------------------------------------------
 
-describe('plugin-wide claustrum gate', () => {
+describe('plugin-wide claustrum mode', () => {
   it('round-trips explicit local mode on disk', async () => {
     const storage: AccountStorage = {
       version: 1,
