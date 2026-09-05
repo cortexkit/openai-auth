@@ -278,6 +278,34 @@ export async function resolveFallbackAccess(
   if (enrolling(account, manifestState, CUSTODY_OWNING_PROVIDER)) {
     const now = (options.now ?? Date.now)()
     const refreshBeforeExpiryMs = options.refreshBeforeExpiryMs ?? 0
+    if (claustrumMode(storage) === 'claustrum') {
+      if (!options.completeEnrollmentDeps) return CUSTODY_REFUSE
+      const outcome = await completeFallbackEnrollment(
+        account,
+        options.completeEnrollmentDeps,
+      )
+      if (outcome.kind !== 'succeeded') return CUSTODY_REFUSE
+      const completedStorage =
+        await options.completeEnrollmentDeps.loadAccounts(
+          options.completeEnrollmentDeps.configPath,
+        )
+      const completedAccount = completedStorage?.accounts.find(
+        (candidate) => candidate.id === account.id,
+      )
+      if (!completedStorage || completedAccount?.type !== 'oauth') {
+        return CUSTODY_REFUSE
+      }
+      const completedManifest =
+        await options.completeEnrollmentDeps.readCustodyManifest(
+          options.completeEnrollmentDeps.manifestPath,
+        )
+      return resolveFallbackAccess(
+        completedAccount,
+        completedStorage,
+        completedManifest,
+        options,
+      )
+    }
     if (
       account.access &&
       account.expires &&
@@ -285,37 +313,7 @@ export async function resolveFallbackAccess(
     ) {
       return { token: account.access, provenance: 'local' }
     }
-    if (claustrumMode(storage) !== 'claustrum') {
-      latchEnrollPending(account.id, 'completionDisarmed')
-      return CUSTODY_REFUSE
-    }
-    if (!options.completeEnrollmentDeps) return CUSTODY_REFUSE
-    const outcome = await completeFallbackEnrollment(
-      account,
-      options.completeEnrollmentDeps,
-    )
-    if (outcome.kind !== 'succeeded') return CUSTODY_REFUSE
-    const completedStorage = await options.completeEnrollmentDeps.loadAccounts(
-      options.completeEnrollmentDeps.configPath,
-    )
-    const completedAccount = completedStorage?.accounts.find(
-      (candidate) => candidate.id === account.id,
-    )
-    if (!completedStorage || completedAccount?.type !== 'oauth') {
-      return CUSTODY_REFUSE
-    }
-    const completedManifest =
-      await options.completeEnrollmentDeps.readCustodyManifest(
-        options.completeEnrollmentDeps.manifestPath,
-      )
-    return resolveFallbackAccess(
-      completedAccount,
-      completedStorage,
-      completedManifest,
-      {
-        ...options,
-      },
-    )
+    return CUSTODY_REFUSE
   }
 
   if (!account.access) return CUSTODY_REFUSE

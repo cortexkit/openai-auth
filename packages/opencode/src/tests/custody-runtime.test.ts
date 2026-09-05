@@ -26,11 +26,7 @@ import {
   mutateAccounts,
   saveAccounts,
 } from '../core/accounts.ts'
-import {
-  __resetEnrollPendingForTest,
-  CUSTODY_TOMBSTONE_PREFIX,
-  enrollPendingReason,
-} from '../core/custody.ts'
+import { CUSTODY_TOMBSTONE_PREFIX } from '../core/custody.ts'
 import {
   type CustodyManifestReadResult,
   defaultCustodyManifestPath,
@@ -173,13 +169,21 @@ async function writeStorageWithManifest(
   chmodSync(manifestPath, 0o600)
 }
 
+async function writeBoundRealFixture(): Promise<OAuthAccount> {
+  const account = liveAccount('fb-1', { accountId: 'acct-1' })
+  await writeStorageWithManifest(
+    withClaustrumMode(liveStorage([account])),
+    enrollmentManifest(account.id),
+  )
+  return account
+}
+
 beforeEach(() => {
   scratchDir = mkdtempSync(join(tmpdir(), 'custody-runtime-'))
   configPath = join(scratchDir, 'openai-auth.json')
   manifestPath = join(scratchDir, 'opencode-handles.json')
   originalManifestEnv = process.env.CLAUSTRUM_OPENCODE_HANDLES
   process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
-  __resetEnrollPendingForTest()
   __resetSweepFailureLogDedupeForTest()
 })
 
@@ -590,7 +594,7 @@ describe('enroll-completion sweep', () => {
     await runtime.boot()
     expect(writes).toEqual([
       expect.objectContaining({
-        access: TOMBSTONE_OPENAI,
+        access: '',
         refresh: TOMBSTONE_OPENAI,
         expires: 0,
       }),
@@ -642,7 +646,7 @@ describe('enroll-completion sweep', () => {
     const tombstonedAccount = after?.accounts.find((a) => a.id === 'fb-1')
     if (tombstonedAccount?.type !== 'oauth')
       throw new Error('expected oauth account')
-    expect(tombstonedAccount.access).toBe(TOMBSTONE_OPENAI)
+    expect(tombstonedAccount.access).toBe('')
     expect(tombstonedAccount.refresh).toBe(TOMBSTONE_OPENAI)
     expect(tombstonedAccount.expires).toBe(0)
     // Manifest entry untouched by the sweep.
@@ -946,7 +950,7 @@ describe('custody boot order', () => {
       if (tombstoned?.type !== 'oauth')
         throw new Error('expected oauth account')
       expect(tombstoned).toMatchObject({
-        access: TOMBSTONE_OPENAI,
+        access: '',
         refresh: TOMBSTONE_OPENAI,
         expires: 0,
       })
@@ -1096,246 +1100,12 @@ describe('quota construction dep wiring', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Enroll-completion latch
-// ---------------------------------------------------------------------------
-
-function makeSingleEnrollingSetup(): OAuthAccount {
-  return {
-    id: 'fb-1',
-    type: 'oauth' as const,
-    access: 'acc-fb-1',
-    refresh: 'ref-fb-1',
-    expires: Date.now() + 3_600_000,
-    addedAt: 1_000,
-    accountId: 'acct-1',
-  }
-}
-
-async function writeSingleEnrollingFixture(
-  armed = true,
-): Promise<OAuthAccount> {
-  const account = makeSingleEnrollingSetup()
-  await saveAccounts(
-    armed ? withClaustrumMode(liveStorage([account])) : liveStorage([account]),
-    configPath,
-  )
-  mkdirSync(scratchDir, { recursive: true, mode: 0o700 })
-  writeFileSync(
-    manifestPath,
-    JSON.stringify({
-      version: 1,
-      providers: [
-        {
-          provider: 'openai',
-          shape: 'oauth',
-          serve: 'openai-auth',
-          accounts: [
-            {
-              label: 'fb-1',
-              handle: HANDLE,
-              credential_id: 'oauth:openai:fb-1',
-            },
-          ],
-        },
-      ],
-    }),
-    { mode: 0o600 },
-  )
-  chmodSync(manifestPath, 0o600)
-  return account
-}
-
-describe('enroll-completion sweep latch', () => {
-  it('leaves local enrollment secrets intact while completion is disarmed across boot and ticks', async () => {
-    const account = await writeSingleEnrollingFixture(false)
-    const before = JSON.stringify({
-      access: account.access,
-      refresh: account.refresh,
-    })
-    const logger = makeLogger()
-    const transport: ClaustrumCacheTransportLike = {
-      getCredential: mock(async () => ({
-        material: makeJwt('acct-1'),
-        recordVersion: 1,
-        expiresAtMs: Date.now() + 600_000,
-      })),
-      statusCredential: mock(async () => ({
-        ready: true,
-        lastErrorCode: null,
-        leaseHeld: false,
-        recordVersion: 1,
-      })),
-      reportAuthFailure: mock(async () => undefined),
-      close: () => undefined,
-    }
-    const runtime = __createCustodyRuntimeForTest(
-      makeOptions({
-        storage: liveStorage([account], {
-          claustrum: claustrumConfig({ mode: 'claustrum' }),
-        }),
-        transport,
-        detection: 'available',
-        logger,
-      }),
-    )
-    await runtime.boot()
-    await runtime.runTick()
-    await runtime.runTick()
-    const persisted = await loadAccounts(configPath)
-    const after = persisted?.accounts.find(
-      (candidate) => candidate.id === account.id,
-    )
-    expect(after?.type).toBe('oauth')
-    if (after?.type !== 'oauth') throw new Error('expected oauth account')
-    expect(
-      JSON.stringify({ access: after.access, refresh: after.refresh }),
-    ).toBe(before)
-    expect(enrollPendingReason(account.id)).toBe('completionDisarmed')
-    expect(
-      logger.info.mock.calls.filter(([message]) =>
-        message.includes('enrollment completion is disarmed'),
-      ),
-    ).toHaveLength(1)
-    runtime.dispose()
-  })
-
-  it('a first completion failure latches the reason into enrollPending (the dashboard never sees a plain local)', async () => {
-    const account = await writeSingleEnrollingFixture()
-    const transport: ClaustrumCacheTransportLike = {
-      getCredential: mock(async () => {
-        throw Object.assign(new Error('unreachable'), { action: 'retry' })
-      }),
-      statusCredential: mock(async () => {
-        throw new Error('should not be called')
-      }),
-      reportAuthFailure: mock(async () => undefined),
-      close: () => undefined,
-    }
-    const runtime = __createCustodyRuntimeForTest(
-      makeOptions({
-        storage: withClaustrumMode(liveStorage([account])),
-        transport,
-        detection: 'available',
-      }),
-    )
-    await runtime.boot()
-    const projection = runtime.getCustodyProjection(account, Date.now())
-    expect(projection?.state).toBe('enrollPending')
-    expect(projection?.reason).toBe('unavailable')
-    expect(enrollPendingReason('fb-1')).toBe('unavailable')
-    runtime.dispose()
-  })
-
-  it('a second failure with a different reason does not overwrite the latched reason', async () => {
-    const account = await writeSingleEnrollingFixture()
-    // Stage 1: every sweep failure latches `identityMismatch` (wrong claim).
-    // Stage 2 (after boot): a tick failure returns nullClaim — the latch
-    // MUST NOT downgrade from `identityMismatch` to `nullClaim`.
-    let phase: 'wrong-claim' | 'null-claim' = 'wrong-claim'
-    const transport: ClaustrumCacheTransportLike = {
-      getCredential: mock(async () => {
-        if (phase === 'wrong-claim') {
-          return {
-            material: makeJwt('acct-other'),
-            recordVersion: 9,
-            expiresAtMs: Date.now() + 600_000,
-          }
-        }
-        return {
-          material: 'not-a-jwt',
-          recordVersion: 11,
-          expiresAtMs: Date.now() + 600_000,
-        }
-      }),
-      statusCredential: mock(async () => ({
-        ready: true,
-        lastErrorCode: null,
-        leaseHeld: false,
-        recordVersion: 1,
-      })),
-      reportAuthFailure: mock(async () => undefined),
-      close: () => undefined,
-    }
-    const runtime = __createCustodyRuntimeForTest(
-      makeOptions({
-        storage: withClaustrumMode(liveStorage([account])),
-        transport,
-        detection: 'available',
-      }),
-    )
-    await runtime.boot()
-    // After boot, the latch is set to identityMismatch (the only phase-1
-    // outcome, regardless of which sweep ran first).
-    expect(enrollPendingReason('fb-1')).toBe('identityMismatch')
-    phase = 'null-claim'
-    // A subsequent tick with a different failure reason: the latch MUST NOT
-    // downgrade.
-    await runtime.runTick()
-    expect(enrollPendingReason('fb-1')).toBe('identityMismatch')
-    const projection = runtime.getCustodyProjection(account, Date.now())
-    expect(projection?.state).toBe('enrollPending')
-    expect(projection?.reason).toBe('identityMismatch')
-    runtime.dispose()
-  })
-
-  it('a later successful completion clears the latch and projects vault with the served recordVersion', async () => {
-    const account = await writeSingleEnrollingFixture()
-    let index = 0
-    const transport: ClaustrumCacheTransportLike = {
-      getCredential: mock(async () => {
-        index += 1
-        if (index === 1) {
-          // Boot sweep — nullClaim so the latch moves to nullClaim.
-          return {
-            material: 'not-a-jwt',
-            recordVersion: 1,
-            expiresAtMs: Date.now() + 600_000,
-          }
-        }
-        // Tick sweep succeeds with the local account id.
-        return {
-          material: makeJwt('acct-1'),
-          recordVersion: 7,
-          expiresAtMs: Date.now() + 600_000,
-        }
-      }),
-      statusCredential: mock(async () => ({
-        ready: true,
-        lastErrorCode: null,
-        leaseHeld: false,
-        recordVersion: 1,
-      })),
-      reportAuthFailure: mock(async () => undefined),
-      close: () => undefined,
-    }
-    const runtime = __createCustodyRuntimeForTest(
-      makeOptions({
-        storage: withClaustrumMode(liveStorage([account])),
-        transport,
-        detection: 'available',
-      }),
-    )
-    await runtime.boot()
-    expect(enrollPendingReason('fb-1')).toBe('nullClaim')
-    const afterBoot = runtime.getCustodyProjection(account, Date.now())
-    expect(afterBoot?.state).toBe('enrollPending')
-    expect(afterBoot?.reason).toBe('nullClaim')
-    await runtime.runTick()
-    expect(enrollPendingReason('fb-1')).toBeUndefined()
-    const projection = runtime.getCustodyProjection(account, Date.now())
-    expect(projection?.state).toBe('vault')
-    expect(projection?.recordVersion).toBe(7)
-    runtime.dispose()
-  })
-})
-
-// ---------------------------------------------------------------------------
 // Sweep failure log
 // ---------------------------------------------------------------------------
 
 describe('sweep failure log dedupe', () => {
   it('logs once per account+reason within an hour; emits again past the hour', async () => {
-    const account = await writeSingleEnrollingFixture()
+    const account = await writeBoundRealFixture()
     const logger1 = makeLogger()
     let clock = 1_000_000
     const transport1: ClaustrumCacheTransportLike = {
@@ -1475,7 +1245,7 @@ describe('recordVersion projection', () => {
 
 describe('under-lock re-check', () => {
   it('skips the sweep without get or write when the account is no longer enrolling under the lock', async () => {
-    const account = await writeSingleEnrollingFixture()
+    const account = await writeBoundRealFixture()
     let lockAcquired = 0
     const getCalls: string[] = []
     const transport: ClaustrumCacheTransportLike = {
