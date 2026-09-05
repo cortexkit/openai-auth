@@ -6,7 +6,7 @@ import type {
   OAuthAccount,
 } from './accounts.ts'
 import { isOAuthAccount } from './accounts.ts'
-import { custodyTombstoneKey, tombstoned } from './custody.ts'
+import { canonicalCustodyTombstone, tombstoned } from './custody.ts'
 import { asCompleteMainOauthSlot } from './custody-host-slot.ts'
 import {
   type CustodyManifestReadResult,
@@ -363,9 +363,7 @@ export async function enterClaustrumMode(
           outcomes[participant.id] = 'new-local-family-under-claustrum'
           continue
         }
-        nextAccount.access = custodyTombstoneKey('openai')
-        nextAccount.refresh = custodyTombstoneKey('openai')
-        nextAccount.expires = 0
+        Object.assign(nextAccount, canonicalCustodyTombstone('openai'))
         try {
           await transaction.write(next)
           const written = (await transaction.read()).accounts.find(
@@ -454,30 +452,19 @@ export async function writeMainCustodyTombstone(
     return 'torn-read-deferred'
   }
   try {
+    const tombstone = canonicalCustodyTombstone('openai')
     const writeAuth = deps.auth.set.bind(deps.auth)
     await writeAuth({
       path: { id: 'openai' },
-      body: {
-        type: 'oauth',
-        access: custodyTombstoneKey('openai'),
-        refresh: custodyTombstoneKey('openai'),
-        expires: 0,
-      },
+      body: tombstone,
     })
     const after = asCompleteMainOauthSlot(
       await deps.auth.get({ path: { id: 'openai' } }),
     )
     return after &&
-      tombstoned(
-        {
-          id: 'main',
-          type: 'oauth',
-          access: after.access,
-          refresh: after.refresh,
-          expires: after.expires ?? 0,
-        },
-        'openai',
-      )
+      after.access === tombstone.access &&
+      after.refresh === tombstone.refresh &&
+      after.expires === tombstone.expires
       ? 'tombstoned'
       : 'new-local-family-under-claustrum'
   } catch {

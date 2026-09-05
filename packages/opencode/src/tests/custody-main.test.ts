@@ -9,7 +9,10 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { loadAccounts, saveAccounts } from '../core/accounts.ts'
-import { custodyTombstoneKey } from '../core/custody.ts'
+import {
+  canonicalCustodyTombstone,
+  custodyTombstoneKey,
+} from '../core/custody.ts'
 import {
   classifyMainAuthSlot,
   confirmMainAuthSlot,
@@ -24,12 +27,7 @@ import {
   liveStorage,
 } from './custody-fixtures.ts'
 
-const canonicalTombstone = {
-  type: 'oauth' as const,
-  access: custodyTombstoneKey('openai'),
-  refresh: custodyTombstoneKey('openai'),
-  expires: 0,
-}
+const canonicalTombstone = canonicalCustodyTombstone('openai')
 
 function mainJwt(accountId: string | undefined): string {
   const header = Buffer.from(JSON.stringify({ alg: 'none' })).toString(

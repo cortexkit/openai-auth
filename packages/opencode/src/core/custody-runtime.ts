@@ -21,8 +21,8 @@ import {
   ClaustrumCredentialCache,
   type CompleteEnrollmentDeps,
   type CompleteEnrollmentOutcome,
+  canonicalCustodyTombstone,
   custodied,
-  custodyTombstoneKey,
   enrolling,
   reconcileFallbackCustody,
   refreshInert,
@@ -412,7 +412,6 @@ export function __createCustodyRuntimeForTest(
         ) {
           continue
         }
-        const sentinel = custodyTombstoneKey(CUSTODY_OWNING_PROVIDER)
         await options.mutateAccounts((current) => {
           if (
             current.claustrum?.mode !== 'claustrum' ||
@@ -436,10 +435,7 @@ export function __createCustodyRuntimeForTest(
               ...current.accounts,
               {
                 id: accountId,
-                type: 'oauth',
-                access: '',
-                refresh: sentinel,
-                expires: 0,
+                ...canonicalCustodyTombstone(CUSTODY_OWNING_PROVIDER),
                 enabled: true,
               },
             ],
@@ -520,15 +516,15 @@ export function __createCustodyRuntimeForTest(
               })
               return false
             }
-            const sentinel = custodyTombstoneKey(CUSTODY_OWNING_PROVIDER)
             const next = structuredClone(current)
             const target = next.accounts.find(
               (candidate) => candidate.id === accountId,
             )
             if (!target || !isOAuthAccount(target)) return false
-            target.access = ''
-            target.refresh = sentinel
-            target.expires = 0
+            Object.assign(
+              target,
+              canonicalCustodyTombstone(CUSTODY_OWNING_PROVIDER),
+            )
             await transaction.write(next)
             const written = (await transaction.read()).accounts.find(
               (candidate) => candidate.id === accountId,
@@ -676,7 +672,6 @@ export function __createCustodyRuntimeForTest(
       ) {
         return
       }
-      const sentinel = custodyTombstoneKey(CUSTODY_OWNING_PROVIDER)
       await options.mutateAccounts((current) => {
         const live = current.accounts.find(
           (account) => account.id === accountId,
@@ -690,10 +685,7 @@ export function __createCustodyRuntimeForTest(
             account.id === accountId
               ? {
                   ...metadata,
-                  type: 'oauth',
-                  access: '',
-                  refresh: sentinel,
-                  expires: 0,
+                  ...canonicalCustodyTombstone(CUSTODY_OWNING_PROVIDER),
                 }
               : account,
           ),

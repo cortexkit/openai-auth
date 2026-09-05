@@ -67,6 +67,15 @@ export function custodyTombstoneKey(provider: string): string {
   return `${CUSTODY_TOMBSTONE_PREFIX}${provider}`
 }
 
+export function canonicalCustodyTombstone(provider: string) {
+  return {
+    type: 'oauth' as const,
+    access: '',
+    refresh: custodyTombstoneKey(provider),
+    expires: 0,
+  }
+}
+
 export function assertNoCustodyTombstoneMaterial(refreshToken: string): void {
   if (refreshToken.startsWith(CUSTODY_TOMBSTONE_PREFIX)) {
     throw new CustodyTombstoneRefreshError('unknown')
