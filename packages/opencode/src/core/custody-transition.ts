@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto'
 import {
   type AccountStorage,
+  type AccountStoreTransaction,
+  claustrumMode,
   fallbackRefreshLockName,
   type OAuthAccount,
 } from './accounts.ts'
@@ -9,6 +11,7 @@ import {
   type CustodyManifestReadResult,
   custodyManifestHandles,
 } from './custody-manifest.ts'
+import type { CustodyInertReason } from './custody-state.ts'
 
 export type ClaustrumMode = 'local' | 'claustrum'
 
@@ -27,7 +30,7 @@ export const MAIN_REFRESH_LOCK_NAME = 'main-refresh'
 export type TransitionOutcome =
   | 'ready'
   | 'tombstoned'
-  | 'mismatch'
+  | Extract<CustodyInertReason, 'new-local-family-under-claustrum'>
   | 'vault-cold'
   | 'vault-reauth'
   | 'identity-mismatch'
@@ -42,15 +45,6 @@ export type TransitionResult = {
 }
 
 type Release = { release(): Promise<void> }
-
-export type AccountStoreTransaction = {
-  read(): Promise<AccountStorage>
-  write(storage: AccountStorage): Promise<void>
-  writeMode(
-    mode: ClaustrumMode,
-    transition?: CustodyTransitionState,
-  ): Promise<void>
-}
 
 export type EnterClaustrumModeDeps = {
   accountIds: readonly string[]
@@ -69,7 +63,10 @@ export type EnterClaustrumModeDeps = {
   }): Promise<
     Exclude<
       TransitionOutcome,
-      `aborted:${string}` | 'tombstoned' | 'mismatch' | 'torn-read-deferred'
+      | `aborted:${string}`
+      | 'tombstoned'
+      | 'new-local-family-under-claustrum'
+      | 'torn-read-deferred'
     >
   >
   auth: {
@@ -172,7 +169,7 @@ function fallbackFingerprint(account: OAuthAccount): string | undefined {
 function incomplete(outcomes: Record<string, TransitionOutcome>): boolean {
   return Object.values(outcomes).some(
     (outcome) =>
-      outcome === 'mismatch' ||
+      outcome === 'new-local-family-under-claustrum' ||
       outcome === 'torn-read-deferred' ||
       outcome.startsWith('aborted:'),
   )
@@ -247,23 +244,30 @@ export async function enterClaustrumMode(
         }
       }
       const handles = custodyManifestHandles(manifest)
-      const fingerprints: CustodyTransitionState['fingerprints'] = {
-        fallbacks: {},
-      }
-      const mainSlot = asOauthSlot(
-        await deps.auth.get({ path: { id: 'openai' } }),
-      )
-      if (mainSlot) {
-        fingerprints.main = custodySlotFingerprint(
-          mainSlot.access,
-          mainSlot.refresh,
+      const persisted =
+        claustrumMode(initial) === 'claustrum'
+          ? initial.claustrum?.transition
+          : undefined
+      const fingerprints: CustodyTransitionState['fingerprints'] = persisted
+        ? persisted.fingerprints
+        : { fallbacks: {} }
+      const capturedGeneration =
+        persisted?.storeGeneration ?? accountStoreGeneration(initial)
+      if (!persisted) {
+        const mainSlot = asOauthSlot(
+          await deps.auth.get({ path: { id: 'openai' } }),
         )
+        if (mainSlot) {
+          fingerprints.main = custodySlotFingerprint(
+            mainSlot.access,
+            mainSlot.refresh,
+          )
+        }
+        for (const account of enabledOauthAccounts(initial)) {
+          const fingerprint = fallbackFingerprint(account)
+          if (fingerprint) fingerprints.fallbacks[account.id] = fingerprint
+        }
       }
-      for (const account of enabledOauthAccounts(initial)) {
-        const fingerprint = fallbackFingerprint(account)
-        if (fingerprint) fingerprints.fallbacks[account.id] = fingerprint
-      }
-      const capturedGeneration = accountStoreGeneration(initial)
       await step('captured')
 
       for (const participant of currentParticipants) {
@@ -284,34 +288,34 @@ export async function enterClaustrumMode(
         return { status: 'aborted', outcomes, reason: 'preflight-failed' }
       }
 
-      const revalidatedManifest = await deps.readManifest()
-      const revalidated = await transaction.read()
-      if (
-        !revalidatedManifest.ok ||
-        revalidatedManifest.revision !== manifest.revision
-      ) {
-        return {
-          status: 'aborted',
-          outcomes,
-          reason: 'manifest-revision-changed',
+      if (!persisted) {
+        const revalidatedManifest = await deps.readManifest()
+        const revalidated = await transaction.read()
+        if (
+          !revalidatedManifest.ok ||
+          revalidatedManifest.revision !== manifest.revision
+        ) {
+          return {
+            status: 'aborted',
+            outcomes,
+            reason: 'manifest-revision-changed',
+          }
         }
-      }
-      if (accountStoreGeneration(revalidated) !== capturedGeneration) {
-        return {
-          status: 'aborted',
-          outcomes,
-          reason: 'store-generation-changed',
+        if (accountStoreGeneration(revalidated) !== capturedGeneration) {
+          return {
+            status: 'aborted',
+            outcomes,
+            reason: 'store-generation-changed',
+          }
         }
+        await step('revalidated')
+        await transaction.writeMode('claustrum', {
+          manifestRevision: manifest.revision,
+          storeGeneration: capturedGeneration,
+          fingerprints,
+        })
+        await step('mode-written')
       }
-      await step('revalidated')
-
-      const transition: CustodyTransitionState = {
-        manifestRevision: manifest.revision,
-        storeGeneration: capturedGeneration,
-        fingerprints,
-      }
-      await transaction.writeMode('claustrum', transition)
-      await step('mode-written')
 
       let materialWriteFailed = false
       for (const participant of participants) {
@@ -321,17 +325,17 @@ export async function enterClaustrumMode(
           (candidate): candidate is OAuthAccount =>
             candidate.id === participant.id && candidate.type === 'oauth',
         )
+        if (account && tombstoned(account, 'openai')) {
+          outcomes[participant.id] = 'tombstoned'
+          continue
+        }
         const expected = fingerprints.fallbacks[participant.id]
         if (
           !account ||
           !expected ||
           fallbackFingerprint(account) !== expected
         ) {
-          outcomes[participant.id] = 'mismatch'
-          continue
-        }
-        if (tombstoned(account, 'openai')) {
-          outcomes[participant.id] = 'tombstoned'
+          outcomes[participant.id] = 'new-local-family-under-claustrum'
           continue
         }
         const next = structuredClone(current)
@@ -340,7 +344,7 @@ export async function enterClaustrumMode(
             candidate.id === participant.id && candidate.type === 'oauth',
         )
         if (!nextAccount) {
-          outcomes[participant.id] = 'mismatch'
+          outcomes[participant.id] = 'new-local-family-under-claustrum'
           continue
         }
         nextAccount.access = custodyTombstoneKey('openai')
@@ -371,13 +375,27 @@ export async function enterClaustrumMode(
       const currentMain = asOauthSlot(
         await deps.auth.get({ path: { id: 'openai' } }),
       )
-      if (!fingerprints.main || !currentMain) {
-        outcomes.main = 'mismatch'
+      if (
+        currentMain &&
+        tombstoned(
+          {
+            id: 'main',
+            type: 'oauth',
+            access: currentMain.access,
+            refresh: currentMain.refresh,
+            expires: currentMain.expires ?? 0,
+          },
+          'openai',
+        )
+      ) {
+        outcomes.main = 'tombstoned'
+      } else if (!fingerprints.main || !currentMain) {
+        outcomes.main = 'new-local-family-under-claustrum'
       } else if (
         custodySlotFingerprint(currentMain.access, currentMain.refresh) !==
         fingerprints.main
       ) {
-        outcomes.main = 'mismatch'
+        outcomes.main = 'new-local-family-under-claustrum'
       } else {
         const all = await deps.auth.all()
         if (Object.keys(all).length === 0) {
@@ -415,7 +433,7 @@ export async function enterClaustrumMode(
                 'openai',
               )
                 ? 'tombstoned'
-                : 'mismatch'
+                : 'new-local-family-under-claustrum'
           } catch {
             outcomes.main = 'aborted:write-failed'
           }
