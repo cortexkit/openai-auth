@@ -123,6 +123,7 @@ export type AccountOperationError = {
 
 export type OAuthAccount = AccountBase & {
   type: 'oauth'
+  corrupt?: false
   access?: string
   refresh: string
   expires?: number
@@ -132,6 +133,18 @@ export type OAuthAccount = AccountBase & {
   quota?: OAuthQuotaSnapshot
 }
 
+export type CorruptOAuthAccount = AccountBase & {
+  type: 'oauth'
+  corrupt: true
+  access?: undefined
+  refresh?: undefined
+  expires?: undefined
+  lastRefreshedAt?: undefined
+  lastRefreshError?: undefined
+  lastQuotaRefreshError?: undefined
+  quota?: undefined
+}
+
 export type ApiKeyAccount = AccountBase & {
   type: 'api'
   apiKey?: string
@@ -139,12 +152,12 @@ export type ApiKeyAccount = AccountBase & {
   authHeader?: 'authorization-bearer' | 'x-api-key'
 }
 
-export type FallbackAccount = OAuthAccount | ApiKeyAccount
+export type FallbackAccount = OAuthAccount | CorruptOAuthAccount | ApiKeyAccount
 
 export function isOAuthAccount(
   account: FallbackAccount,
 ): account is OAuthAccount {
-  return account.type === 'oauth'
+  return account.type === 'oauth' && account.corrupt !== true
 }
 
 export function isApiKeyAccount(
@@ -494,7 +507,19 @@ export function normalizeAccount(value: unknown): FallbackAccount | null {
   }
 
   if (value.type !== 'oauth') return null
-  if (typeof value.refresh !== 'string' || !value.refresh.trim()) return null
+  if (typeof value.refresh !== 'string' || !value.refresh.trim()) {
+    if (
+      !Object.hasOwn(value, 'refresh') ||
+      typeof value.id !== 'string' ||
+      !value.id.trim()
+    )
+      return null
+    return {
+      ...normalizeAccountBase(value),
+      type: 'oauth',
+      corrupt: true,
+    }
+  }
 
   return {
     ...normalizeAccountBase(value),
@@ -845,6 +870,7 @@ function accountRuntimeState(account: FallbackAccount) {
       lastUsed: account.lastUsed,
     })
   }
+  if (account.corrupt) return {}
   return objectWithDefinedEntries({
     access: account.access,
     refresh: account.refresh,

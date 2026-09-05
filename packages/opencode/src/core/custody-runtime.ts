@@ -7,11 +7,12 @@ import {
   detectClaustrumConnection,
   getDefaultClaustrumConnectionPath,
 } from '../vendor/claustrum-client/index.ts'
-import type {
-  AccountStorage,
-  loadAccounts,
-  mutateAccounts,
-  OAuthAccount,
+import {
+  type AccountStorage,
+  isOAuthAccount,
+  type loadAccounts,
+  type mutateAccounts,
+  type OAuthAccount,
 } from './accounts.ts'
 import {
   ClaustrumCredentialCache,
@@ -318,7 +319,7 @@ export function __createCustodyRuntimeForTest(
       if (cache.isReauth(handle, now())) continue
       const storage = await options.loadAccounts(options.configPath)
       const account = storage?.accounts.find((a) => a.id === accountId)
-      if (account?.type !== 'oauth') continue
+      if (!account || !isOAuthAccount(account)) continue
       // The completion sweep above handled `enrolling` accounts. The warm
       // pass targets `custodied` ones only — `enrolling` is not the warm's
       // job, and overwriting the latch with a successful get would render the
