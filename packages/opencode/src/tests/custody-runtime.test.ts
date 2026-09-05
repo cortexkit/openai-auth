@@ -46,6 +46,7 @@ import {
 } from '../index.ts'
 import type { detectClaustrumConnection } from '../vendor/claustrum-client/index.ts'
 import {
+  claustrumConfig,
   emptyManifest,
   enrollmentManifest,
   liveAccount,
@@ -212,10 +213,8 @@ function makeOptions(
   const storage = overrides.storage
     ? {
         ...overrides.storage,
-        claustrum: overrides.storage.claustrum ?? {
-          enabled: true,
-          manifestWrite: false,
-        },
+        claustrum:
+          overrides.storage.claustrum ?? claustrumConfig({ mode: 'claustrum' }),
       }
     : overrides.storage
   return {
@@ -327,7 +326,7 @@ describe('custody warm and tick', () => {
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
         storage: liveStorage([account], {
-          claustrum: { enabled: true },
+          claustrum: claustrumConfig({ mode: 'claustrum' }),
         }),
         transport,
         detection: 'available',
@@ -444,7 +443,7 @@ describe('custody warm and tick', () => {
       version: 1,
       main: { type: 'opencode', provider: 'openai' },
       accounts: [account],
-      claustrum: { enabled: false, manifestWrite: false },
+      claustrum: claustrumConfig({ mode: 'local' }),
     }
     await writeStorageWithManifest(storage, enrollmentManifest('fb-1'))
     const transport: ClaustrumCacheTransportLike = {
@@ -852,7 +851,7 @@ describe('custody boot order', () => {
       configPath,
       JSON.stringify({
         ...liveStorage([live]),
-        claustrum: { enabled: true, manifestWrite: true },
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
       }),
     )
     writeFileSync(manifestPath, JSON.stringify(manifest.value))
@@ -1171,7 +1170,7 @@ describe('enroll-completion sweep latch', () => {
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
         storage: liveStorage([account], {
-          claustrum: { enabled: true, manifestWrite: false },
+          claustrum: claustrumConfig({ mode: 'claustrum' }),
         }),
         transport,
         detection: 'available',
