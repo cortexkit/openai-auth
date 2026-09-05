@@ -233,6 +233,8 @@ export function __createCustodyRuntimeForTest(
         scheduleNextTick()
         return
       }
+      const connectedCache = cache
+      if (!connectedCache) return
       if (!bootManifest.ok && bootManifest.reason !== 'absent') {
         projectManifestUnreadable(
           await options.loadAccounts(options.configPath),
@@ -263,7 +265,7 @@ export function __createCustodyRuntimeForTest(
           continue
         const handle = enabledHandles.get(account.id)
         if (!handle) continue
-        const sweepDeps = buildSweepDeps(cache)
+        const sweepDeps = buildSweepDeps(connectedCache)
         sweepPromises.push(
           reconcileFallbackCustody(account, sweepDeps)
             .then((outcome) =>
@@ -283,7 +285,7 @@ export function __createCustodyRuntimeForTest(
       // any cache entry that completes after the bound.
       await raceAggregateWarm(
         enabledHandles,
-        cache,
+        connectedCache,
         currentStorage,
         CUSTODY_WARM_AWAIT_MS,
       )
@@ -356,6 +358,7 @@ export function __createCustodyRuntimeForTest(
     if (closed) return false
     if (cache) return true
     if (reconnecting) return reconnecting
+    if (!detection) return false
     const attempt = (async () => {
       let candidate: ClaustrumCredentialCache | undefined
       try {
