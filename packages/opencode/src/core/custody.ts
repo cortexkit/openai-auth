@@ -32,6 +32,7 @@ import {
   CUSTODY_OWNING_PROVIDER,
   type CustodyManifestReadResult,
   custodyManifestHandles,
+  manifestRevision,
 } from './custody-manifest.ts'
 import { extractAccountIdFromClaims, parseJwtClaims } from './oauth.ts'
 import type { acquireRefreshFileLock } from './refresh-file-lock.ts'
@@ -236,6 +237,7 @@ export async function resolveFallbackAccess(
   const manifestState: CustodyManifestReadResult = manifest ?? {
     ok: true,
     value: { version: 1, providers: [] },
+    revision: manifestRevision('{"version":1,"providers":[]}'),
   }
 
   if (tombstoned(account, CUSTODY_OWNING_PROVIDER)) {

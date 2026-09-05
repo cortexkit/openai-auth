@@ -53,7 +53,7 @@ import {
   liveStorage,
   makeSentinelAccount,
   TOMBSTONE_OPENAI,
-  withManifestWrite,
+  withClaustrumMode,
 } from './custody-fixtures.ts'
 import {
   FLOOR_CLAUSTRUM_HANDLES,
@@ -371,7 +371,7 @@ describe('custody warm and tick', () => {
     }
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
-        storage: withManifestWrite(liveStorage([account])),
+        storage: withClaustrumMode(liveStorage([account])),
         transport: slowTransport,
         detection: 'available',
       }),
@@ -416,7 +416,7 @@ describe('custody warm and tick', () => {
     }
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
-        storage: withManifestWrite(liveStorage([account])),
+        storage: withClaustrumMode(liveStorage([account])),
         transport,
         detection: 'available',
         setIntervalFn: setIntervalFn as unknown as (
@@ -496,6 +496,7 @@ describe('custody warm and tick', () => {
           },
         ],
       },
+      revision: 'test-manifest-revision',
     }
     await writeStorageWithManifest(liveStorage([a, b]), manifest)
     const { transport, captured } = makeTransport(({ handle }) => ({
@@ -570,7 +571,7 @@ describe('enroll-completion sweep', () => {
     const writes: OAuthAccount[] = []
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
-        storage: withManifestWrite(liveStorage([live])),
+        storage: withClaustrumMode(liveStorage([live])),
         transport,
         detection: 'available',
         mutateAccounts: async (transform, path) => {
@@ -631,7 +632,7 @@ describe('enroll-completion sweep', () => {
     }))
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
-        storage: withManifestWrite(liveStorage([live])),
+        storage: withClaustrumMode(liveStorage([live])),
         transport,
         detection: 'available',
       }),
@@ -687,7 +688,7 @@ describe('enroll-completion sweep', () => {
     }))
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
-        storage: withManifestWrite(liveStorage([live])),
+        storage: withClaustrumMode(liveStorage([live])),
         transport,
         detection: 'available',
       }),
@@ -741,7 +742,7 @@ describe('enroll-completion sweep', () => {
     }))
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
-        storage: withManifestWrite(liveStorage([live])),
+        storage: withClaustrumMode(liveStorage([live])),
         transport,
         detection: 'available',
       }),
@@ -788,7 +789,7 @@ describe('enroll-completion sweep', () => {
     }))
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
-        storage: withManifestWrite(liveStorage([live])),
+        storage: withClaustrumMode(liveStorage([live])),
         transport,
         detection: 'available',
         acquireRefreshFileLock: async () => null,
@@ -1006,7 +1007,7 @@ describe('custody boot order', () => {
     let tickScheduledAt: number | undefined
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
-        storage: withManifestWrite(liveStorage([live])),
+        storage: withClaustrumMode(liveStorage([live])),
         transport: wrapped,
         detection: 'available',
         setIntervalFn: (cb, ms) => {
@@ -1115,7 +1116,7 @@ async function writeSingleEnrollingFixture(
 ): Promise<OAuthAccount> {
   const account = makeSingleEnrollingSetup()
   await saveAccounts(
-    armed ? withManifestWrite(liveStorage([account])) : liveStorage([account]),
+    armed ? withClaustrumMode(liveStorage([account])) : liveStorage([account]),
     configPath,
   )
   mkdirSync(scratchDir, { recursive: true, mode: 0o700 })
@@ -1212,7 +1213,7 @@ describe('enroll-completion sweep latch', () => {
     }
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
-        storage: withManifestWrite(liveStorage([account])),
+        storage: withClaustrumMode(liveStorage([account])),
         transport,
         detection: 'available',
       }),
@@ -1257,7 +1258,7 @@ describe('enroll-completion sweep latch', () => {
     }
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
-        storage: withManifestWrite(liveStorage([account])),
+        storage: withClaustrumMode(liveStorage([account])),
         transport,
         detection: 'available',
       }),
@@ -1309,7 +1310,7 @@ describe('enroll-completion sweep latch', () => {
     }
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
-        storage: withManifestWrite(liveStorage([account])),
+        storage: withClaustrumMode(liveStorage([account])),
         transport,
         detection: 'available',
       }),
@@ -1349,7 +1350,7 @@ describe('sweep failure log dedupe', () => {
     }
     const runtime1 = __createCustodyRuntimeForTest(
       makeOptions({
-        storage: withManifestWrite(liveStorage([account])),
+        storage: withClaustrumMode(liveStorage([account])),
         transport: transport1,
         detection: 'available',
         logger: logger1,
@@ -1383,7 +1384,7 @@ describe('sweep failure log dedupe', () => {
     }
     const runtime2 = __createCustodyRuntimeForTest(
       makeOptions({
-        storage: withManifestWrite(liveStorage([account])),
+        storage: withClaustrumMode(liveStorage([account])),
         transport: transport2,
         detection: 'available',
         logger: logger2,
@@ -1451,7 +1452,7 @@ describe('recordVersion projection', () => {
     }
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
-        storage: withManifestWrite(liveStorage([account])),
+        storage: withClaustrumMode(liveStorage([account])),
         transport,
         detection: 'available',
       }),
@@ -1497,7 +1498,7 @@ describe('under-lock re-check', () => {
     }
     const runtime = __createCustodyRuntimeForTest(
       makeOptions({
-        storage: withManifestWrite(liveStorage([account])),
+        storage: withClaustrumMode(liveStorage([account])),
         transport,
         detection: 'available',
         acquireRefreshFileLock: async () => {

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test'
+import { createHash } from 'node:crypto'
 import type { AccountStorage } from '../core/accounts.ts'
 import { liveAccount } from './custody-fixtures.ts'
 
@@ -31,6 +32,29 @@ describe('custody transition fingerprints', () => {
         accounts: [disabled, liveAccount('fallback-2')],
       }),
     )
+  })
+
+  it('account store generation uses UTF-8 byte ordering for row fences', async () => {
+    const transition = await import('../core/custody-transition.ts')
+    const z = liveAccount('z')
+    const umlaut = liveAccount('ä')
+    const rows = [z, umlaut].map((account) => ({
+      id: account.id,
+      enabled: account.enabled !== false,
+      accountId: account.accountId ?? '',
+      access: account.access ?? '',
+      refresh: account.refresh,
+      expires: account.expires ?? null,
+    }))
+    const byteOrdered = createHash('sha256')
+      .update(JSON.stringify(rows))
+      .digest('hex')
+
+    expect(
+      transition.accountStoreGeneration({
+        accounts: [umlaut, z],
+      }),
+    ).toBe(byteOrdered)
   })
 
   it('live account expiry is deterministic from injected now unless expires is explicit', () => {

@@ -125,7 +125,7 @@ describe('plugin-wide claustrum gate', () => {
       main: { type: 'opencode' as const, provider: 'openai' as const },
       accounts: [],
       claustrum: claustrumConfig({ mode: 'claustrum' }),
-    } as AccountStorage & {
+    } as unknown as AccountStorage & {
       claustrum: NonNullable<AccountStorage['claustrum']> &
         Record<'accounts', unknown>
     }

@@ -50,7 +50,7 @@ export function defaultCustodyManifestPath(
 }
 
 export type CustodyManifestReadResult =
-  | { ok: true; value: ManifestHandleFile; revision?: string }
+  | { ok: true; value: ManifestHandleFile; revision: string }
   | { ok: false; reason: 'absent' }
   | { ok: false; reason: 'tooLarge'; message: string }
   | {
