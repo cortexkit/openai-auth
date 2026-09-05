@@ -1,6 +1,14 @@
 import { describe, expect, mock, test } from 'bun:test'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import {
+  type CustodyInertReason,
+  evaluateCustodyStartup,
+} from '../core/custody-state.ts'
 import { acquireCustodyTransitionMutex } from '../core/custody-transition.ts'
 import { CodexAuthPlugin } from '../index.ts'
+import { enrollmentManifest } from './custody-fixtures.ts'
 
 type Deferred<T> = {
   promise: Promise<T>
@@ -34,8 +42,26 @@ type TokenResponse = {
 }
 
 type Authorize = () => Promise<{
-  callback(): Promise<{ access: string }>
+  callback(): Promise<{ access: string; refresh: string }>
 }>
+
+type HostOauth = {
+  type: 'oauth'
+  access: string
+  refresh: string
+  expires: number
+}
+
+type VerifiedMainLoginRecord = {
+  mainSlotFamilyFingerprint(slot: HostOauth): string
+  hasVerifiedInProcessMainLogin(slot: HostOauth): boolean
+}
+
+async function verifiedMainLoginRecord(): Promise<VerifiedMainLoginRecord> {
+  return (await import(
+    '../core/custody-host-slot.ts'
+  )) as unknown as VerifiedMainLoginRecord
+}
 
 async function makeAuthorizeMethods() {
   const browserTokens = deferred<TokenResponse>()
@@ -50,11 +76,16 @@ async function makeAuthorizeMethods() {
     tokens: headlessTokens.promise,
   }))
 
-  let hostAccess: string | undefined
+  let hostSlot: HostOauth | undefined
   let rejectAuthGet = false
   let now = 0
   const sleeps: Array<Deferred<void>> = []
   const warnings: string[] = []
+  const hostAuthSet = mock(
+    async ({ body }: { path: { id: string }; body: HostOauth }) => {
+      hostSlot = body
+    },
+  )
   const hooks = await CodexAuthPlugin(
     {
       client: {
@@ -62,11 +93,9 @@ async function makeAuthorizeMethods() {
           all: async () => ({}),
           get: async () => {
             if (rejectAuthGet) throw new Error('host read failed')
-            return hostAccess
-              ? { type: 'oauth', access: hostAccess }
-              : undefined
+            return hostSlot
           },
-          set: async () => {},
+          set: hostAuthSet,
         },
       },
       project: { id: 'test', name: 'test' },
@@ -114,14 +143,21 @@ async function makeAuthorizeMethods() {
     headlessStarted,
     browserTokens,
     headlessTokens,
-    hostSet: (access: string) => {
-      hostAccess = access
+    hostSet: (access: string, refresh = 'refresh') => {
+      hostSlot = { type: 'oauth', access, refresh, expires: 60_000 }
+    },
+    otherWindowSet: async (access: string, refresh = 'refresh') => {
+      await hostAuthSet({
+        path: { id: 'openai' },
+        body: { type: 'oauth', access, refresh, expires: 60_000 },
+      })
+    },
+    hostSlot: () => hostSlot,
+    advanceTo: (next: number) => {
+      now = next
     },
     rejectHostReads: () => {
       rejectAuthGet = true
-    },
-    advanceTo: (next: number) => {
-      now = next
     },
     sleeps,
     warnings,
@@ -332,4 +368,155 @@ describe('production authorize custody leases', () => {
       }
     },
   )
+
+  test('keeps bound manifest bytes after a local authorize callback writes a new host family', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'custody-authorize-local-'))
+    const manifestPath = join(directory, 'opencode-handles.json')
+    const configPath = join(directory, 'openai-auth.json')
+    const priorManifestPath = process.env.CLAUSTRUM_OPENCODE_HANDLES
+    const priorConfigPath = process.env.OPENCODE_OPENAI_AUTH_FILE
+    let fixture: Awaited<ReturnType<typeof makeAuthorizeMethods>> | undefined
+    try {
+      const manifest = enrollmentManifest('main')
+      if (!manifest.ok) throw new Error('expected enrollment manifest')
+      writeFileSync(manifestPath, JSON.stringify(manifest.value))
+      process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+      process.env.OPENCODE_OPENAI_AUTH_FILE = configPath
+      const before = readFileSync(manifestPath)
+      const record = await verifiedMainLoginRecord()
+      fixture = await makeAuthorizeMethods()
+      fixture.hostSet('before-login', 'before-refresh')
+      const beforeFingerprint = record.mainSlotFamilyFingerprint(
+        fixture.hostSlot()!,
+      )
+
+      const flow = await fixture.browser()
+      fixture.browserTokens.resolve({
+        access_token: 'after-login',
+        refresh_token: 'after-refresh',
+        id_token: 'id',
+        expires_in: 60,
+      })
+      const result = await flow.callback()
+      await waitForSleep(fixture.sleeps)
+      fixture.hostSet(result.access, result.refresh)
+      fixture.sleeps[0]!.resolve()
+      for (let turn = 0; turn < 32; turn += 1) await Promise.resolve()
+
+      const afterFingerprint = record.mainSlotFamilyFingerprint(
+        fixture.hostSlot()!,
+      )
+      expect(afterFingerprint).not.toBe(beforeFingerprint)
+      expect(afterFingerprint).toBe(
+        record.mainSlotFamilyFingerprint({
+          type: 'oauth',
+          access: 'after-login',
+          refresh: 'after-refresh',
+          expires: 60_000,
+        }),
+      )
+      expect(readFileSync(manifestPath)).toEqual(before)
+    } finally {
+      await fixture?.dispose?.()
+      if (priorManifestPath === undefined) {
+        delete process.env.CLAUSTRUM_OPENCODE_HANDLES
+      } else {
+        process.env.CLAUSTRUM_OPENCODE_HANDLES = priorManifestPath
+      }
+      if (priorConfigPath === undefined) {
+        delete process.env.OPENCODE_OPENAI_AUTH_FILE
+      } else {
+        process.env.OPENCODE_OPENAI_AUTH_FILE = priorConfigPath
+      }
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('records only the authorize callback family after its exact host readback', async () => {
+    const fixture = await makeAuthorizeMethods()
+    try {
+      const record = await verifiedMainLoginRecord()
+      const flow = await fixture.browser()
+      fixture.browserTokens.resolve({
+        access_token: 'minted-access',
+        refresh_token: 'minted-refresh',
+        id_token: 'id',
+        expires_in: 60,
+      })
+      const result = await flow.callback()
+      await waitForSleep(fixture.sleeps)
+
+      await fixture.otherWindowSet('other-access', 'other-refresh')
+      fixture.sleeps[0]!.resolve()
+      await waitForSleep(fixture.sleeps, 2)
+      expect(record.hasVerifiedInProcessMainLogin(fixture.hostSlot()!)).toBe(
+        false,
+      )
+
+      fixture.hostSet(result.access, result.refresh)
+      fixture.sleeps[1]!.resolve()
+      for (let turn = 0; turn < 32; turn += 1) await Promise.resolve()
+
+      expect(record.hasVerifiedInProcessMainLogin(fixture.hostSlot()!)).toBe(
+        true,
+      )
+    } finally {
+      await fixture.dispose?.()
+    }
+  })
+
+  test('keeps an unrecorded bound real slot inert and resolves a recorded local re-login as enrolled', async () => {
+    const record = await verifiedMainLoginRecord()
+    const unrecordedSlot: HostOauth = {
+      type: 'oauth',
+      access: 'unrecorded-access',
+      refresh: 'unrecorded-refresh',
+      expires: 60_000,
+    }
+    const reason: CustodyInertReason = 'new-local-family-under-claustrum'
+
+    expect(record.hasVerifiedInProcessMainLogin(unrecordedSlot)).toBe(false)
+    expect(
+      evaluateCustodyStartup({
+        mode: 'claustrum',
+        manifest: 'present',
+        local: 'real',
+        vault: () => 'serves',
+        fingerprintMatch: false,
+      }),
+    ).toEqual({ kind: 'INERT', reason })
+
+    const fixture = await makeAuthorizeMethods()
+    try {
+      const flow = await fixture.headless()
+      fixture.headlessTokens.resolve({
+        access_token: 'verified-access',
+        refresh_token: 'verified-refresh',
+        id_token: 'id',
+        expires_in: 60,
+      })
+      const result = await flow.callback()
+      await waitForSleep(fixture.sleeps)
+      fixture.hostSet(result.access, result.refresh)
+      fixture.sleeps[0]!.resolve()
+      for (let turn = 0; turn < 32; turn += 1) await Promise.resolve()
+
+      expect(record.hasVerifiedInProcessMainLogin(fixture.hostSlot()!)).toBe(
+        true,
+      )
+      expect(
+        evaluateCustodyStartup({
+          mode: 'local',
+          manifest: 'present',
+          local: 'real',
+          vault: () => 'serves',
+          verifiedLogin: record.hasVerifiedInProcessMainLogin(
+            fixture.hostSlot()!,
+          ),
+        }),
+      ).toEqual({ kind: 'INERT', reason: 'enrolled-under-local' })
+    } finally {
+      await fixture.dispose?.()
+    }
+  })
 })
