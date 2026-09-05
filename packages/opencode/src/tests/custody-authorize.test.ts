@@ -510,9 +510,6 @@ describe('production authorize custody leases', () => {
           manifest: 'present',
           local: 'real',
           vault: () => 'serves',
-          verifiedLogin: record.hasVerifiedInProcessMainLogin(
-            fixture.hostSlot()!,
-          ),
         }),
       ).toEqual({ kind: 'INERT', reason: 'enrolled-under-local' })
     } finally {
