@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it, mock } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -461,6 +461,32 @@ describe('enterClaustrumMode coordinator', () => {
     await pending
   })
 
+  it('does not start a second barrier preflight while the first holds the transition mutex', async () => {
+    const transition = await import('../core/custody-transition.ts')
+    const firstPreflightEntered = deferred()
+    const releaseFirstPreflight = deferred()
+    const first = fakeCoordinatorDeps({
+      preflight: async () => {
+        firstPreflightEntered.resolve()
+        await releaseFirstPreflight.promise
+        return 'ready'
+      },
+    })
+    const secondPreflight = mock(async () => 'ready' as const)
+    const second = fakeCoordinatorDeps({ preflight: secondPreflight })
+
+    const firstRun = transition.enterClaustrumMode(first.deps)
+    await firstPreflightEntered.promise
+    const secondRun = transition.enterClaustrumMode(second.deps)
+    for (let turn = 0; turn < 32; turn += 1) await Promise.resolve()
+
+    expect(secondPreflight).not.toHaveBeenCalled()
+    releaseFirstPreflight.resolve()
+    await firstRun
+    await secondRun
+    expect(secondPreflight).toHaveBeenCalled()
+  })
+
   it('makes a fake authorize callback wait until the barrier releases the shared mutex', async () => {
     const transition = await import('../core/custody-transition.ts')
     const preflightEntered = deferred()
@@ -539,5 +565,57 @@ describe('enterClaustrumMode coordinator', () => {
       'mode:local',
       'release:claustrum-mode',
     ])
+  })
+})
+
+describe('main login transition lease', () => {
+  it('retains the lease until host readback observes the exact minted access token', async () => {
+    const transition = await import('../core/custody-transition.ts')
+    let now = 0
+    let reads = 0
+    const release = mock(async () => {})
+    const warn = mock(() => {})
+
+    await transition.releaseCustodyLoginLeaseAfterHostWrite({
+      accessToken: 'minted-access',
+      getAuth: async () => {
+        reads += 1
+        return reads === 2 ? { access: 'minted-access' } : { access: 'other' }
+      },
+      release,
+      warn,
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms
+      },
+    })
+
+    expect(release).toHaveBeenCalledTimes(1)
+    expect(warn).not.toHaveBeenCalled()
+    expect(reads).toBe(2)
+  })
+
+  it('releases and warns once when host write readback misses the five-second bound', async () => {
+    const transition = await import('../core/custody-transition.ts')
+    let now = 0
+    const release = mock(async () => {})
+    const warn = mock(() => {})
+
+    await transition.releaseCustodyLoginLeaseAfterHostWrite({
+      accessToken: 'minted-access',
+      getAuth: async () => ({ access: 'other' }),
+      release,
+      warn,
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms
+      },
+    })
+
+    expect(release).toHaveBeenCalledTimes(1)
+    expect(warn).toHaveBeenCalledWith(
+      'host write not observed within 5s; lease released',
+    )
+    expect(now).toBe(5_000)
   })
 })
