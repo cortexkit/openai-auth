@@ -171,6 +171,7 @@ export interface SidebarState {
     quota: AccountQuota | null
     /** ChatGPT identity of the main account this quota belongs to. */
     mainAccountId?: string
+    custody?: SidebarAccountCustody
     killed: boolean
     quotaBackedOff?: boolean
     quotaBackoffUntil?: number
@@ -428,6 +429,10 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
       ...(typeof m.mainAccountId === 'string'
         ? { mainAccountId: m.mainAccountId }
         : {}),
+      ...(() => {
+        const custody = normalizeSidebarCustody(m.custody)
+        return custody ? { custody } : {}
+      })(),
       // Preserve optional backoff fields if present
       ...(typeof m.quotaBackedOff === 'boolean'
         ? { quotaBackedOff: m.quotaBackedOff }
