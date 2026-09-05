@@ -91,42 +91,14 @@ export interface SidebarAccountState {
   custody?: SidebarAccountCustody
 }
 
-type PersistedSidebarCustodyState = 'vault' | 'needsLogin' | 'local' | 'inert'
+export type SidebarCustodyState = 'vault' | 'needsLogin' | 'local' | 'inert'
 
-type PersistedSidebarCustodyReason = CustodyInertReason | 'corrupt'
-
-/** @deprecated v6 sidebar vocabulary retained until the custody runtime projects v7 verdicts. */
-type LegacySidebarCustodyState = 'vaultReauth' | 'vaultGone' | 'enrollPending'
-
-type LegacySidebarCustodyReason =
-  | 'unavailable'
-  | 'gone'
-  | 'identityMismatch'
-  | 'nullClaim'
-  | 'completionDisarmed'
-
-export type SidebarCustodyState =
-  | PersistedSidebarCustodyState
-  | LegacySidebarCustodyState
-
-export type SidebarCustodyReason =
-  | PersistedSidebarCustodyReason
-  | LegacySidebarCustodyReason
+export type SidebarCustodyReason = CustodyInertReason | 'corrupt'
 
 export interface SidebarAccountCustody {
   state: SidebarCustodyState
   reason?: SidebarCustodyReason
   recordVersion?: number
-}
-
-export interface LegacyProjectCustodyInput {
-  tombstoned: boolean
-  storageEnabled: boolean
-  enrolled: boolean
-  handle?: string
-  enrollPendingReason?: LegacySidebarCustodyReason
-  cache?: unknown
-  now?: number
 }
 
 export interface ActiveRoutingEntry {
@@ -228,14 +200,14 @@ function resetCreditsField(value: unknown): { resetCredits?: number } {
   return credits !== undefined ? { resetCredits: credits } : {}
 }
 
-const CUSTODY_STATES = new Set<PersistedSidebarCustodyState>([
+const CUSTODY_STATES = new Set<SidebarCustodyState>([
   'vault',
   'needsLogin',
   'local',
   'inert',
 ])
 
-const CUSTODY_REASONS = new Set<PersistedSidebarCustodyReason>([
+const CUSTODY_REASONS = new Set<SidebarCustodyReason>([
   ...CUSTODY_INERT_REASONS,
   'corrupt',
 ])
@@ -256,17 +228,17 @@ function normalizeSidebarCustody(
   const c = value as Record<string, unknown>
   if (
     typeof c.state !== 'string' ||
-    !CUSTODY_STATES.has(c.state as PersistedSidebarCustodyState)
+    !CUSTODY_STATES.has(c.state as SidebarCustodyState)
   ) {
     return undefined
   }
-  const state = c.state as PersistedSidebarCustodyState
+  const state = c.state as SidebarCustodyState
   const out: SidebarAccountCustody = { state }
   if (
     typeof c.reason === 'string' &&
-    CUSTODY_REASONS.has(c.reason as PersistedSidebarCustodyReason)
+    CUSTODY_REASONS.has(c.reason as SidebarCustodyReason)
   ) {
-    out.reason = c.reason as PersistedSidebarCustodyReason
+    out.reason = c.reason as SidebarCustodyReason
   }
   return out
 }
@@ -365,17 +337,8 @@ export function getSidebarStateFile(): string {
 }
 
 export function projectCustodyForSidebar(
-  verdict: CustodyVerdict | LegacyProjectCustodyInput,
+  verdict: CustodyVerdict,
 ): SidebarAccountCustody {
-  if ('tombstoned' in verdict) {
-    if (!verdict.tombstoned) return { state: 'local' }
-    if (!verdict.storageEnabled || !verdict.enrolled) {
-      return { state: 'needsLogin' }
-    }
-    return verdict.enrollPendingReason
-      ? { state: 'inert', reason: 'manifest-unreadable' }
-      : { state: 'inert', reason: 'vault-reauth' }
-  }
   switch (verdict.kind) {
     case 'LOCAL':
       return { state: 'local' }

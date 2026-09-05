@@ -18,7 +18,7 @@ import type {
 } from '../core/accounts.ts'
 import { refreshInert } from '../core/custody.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
-import { claustrumConfig, localCustody } from './custody-fixtures.ts'
+import { localCustody } from './custody-fixtures.ts'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_LOG_FILE,
@@ -360,52 +360,6 @@ describe('accounts store', () => {
     )
     expect(readFileSync(cfgPath, 'utf8')).toBe(existingBytes)
     expect(statSync(cfgPath).mtimeMs).toBe(existingMtimeMs)
-  })
-
-  it('legacy claustrum switches are rejected instead of bypassing the readiness barrier', async () => {
-    const { loadAccounts } = await import('../core/accounts.ts')
-
-    for (const claustrum of [{ enabled: false }, { manifestWrite: false }]) {
-      writeFileSync(
-        cfgPath,
-        JSON.stringify({ version: 1, accounts: [], claustrum }),
-      )
-
-      await expect(loadAccounts(cfgPath)).rejects.toThrow(
-        'Remove the legacy claustrum switches and run /openai-account claustrum',
-      )
-    }
-  })
-
-  it('claustrum mode never arms the enrollment-completion write', async () => {
-    const { loadAccounts } = await import('../core/accounts.ts')
-    writeFileSync(
-      cfgPath,
-      JSON.stringify({
-        version: 1,
-        accounts: [],
-        claustrum: claustrumConfig({ mode: 'claustrum' }),
-      }),
-    )
-
-    expect((await loadAccounts(cfgPath))?.claustrum?.manifestWrite).toBe(false)
-  })
-
-  it('in-memory legacy enabled state serializes as local mode', async () => {
-    const { saveAccounts } = await import('../core/accounts.ts')
-    await saveAccounts(
-      {
-        version: 1,
-        main: { type: 'opencode', provider: 'openai' },
-        accounts: [],
-        claustrum: { enabled: true },
-      },
-      cfgPath,
-    )
-
-    expect(JSON.parse(readFileSync(cfgPath, 'utf8')).claustrum.mode).toBe(
-      'local',
-    )
   })
 
   it('mode and takeover fingerprints round-trip in one config write', async () => {

@@ -14,26 +14,23 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getAccountStoragePath } from '../core/account-paths.ts'
 import {
+  type AccountStorage,
   loadAccounts,
   normalizeAccount,
   saveAccounts,
 } from '../core/accounts.ts'
 import {
-  __resetEnrollPendingForTest,
   assertNoCustodyTombstoneMaterial,
   ClaustrumCredentialCache,
   CUSTODY_EXCLUDED,
   CUSTODY_REFUSE,
   CUSTODY_TOMBSTONE_PREFIX,
-  clearEnrollPending,
-  completeFallbackEnrollment,
   custodied,
   custodyTombstoneKey,
   enrolled,
   enrolling,
-  enrollPendingReason,
   excluded,
-  markEnrollPending,
+  reconcileFallbackCustody,
   refreshInert,
   resolveFallbackAccess,
   tombstoned,
@@ -883,7 +880,7 @@ describe('resolveFallbackAccess', () => {
   })
 })
 
-describe('completeFallbackEnrollment', () => {
+describe('reconcileFallbackCustody', () => {
   it('writes the canonical tombstone with empty access after vault verification', async () => {
     const now = CUSTODY_FIXTURE_NOW
     const account = liveAccount('completion-1', {
@@ -902,7 +899,7 @@ describe('completeFallbackEnrollment', () => {
         }) as never,
     })
 
-    const result = await completeFallbackEnrollment(account, {
+    const result = await reconcileFallbackCustody(account, {
       loadAccounts: async () => storage,
       readCustodyManifest: async () => enrollmentManifest(account.id),
       acquireRefreshFileLock,
@@ -923,6 +920,149 @@ describe('completeFallbackEnrollment', () => {
     expect(completed.refresh).toBe(TOMBSTONE_OPENAI)
     expect(completed.expires).toBe(0)
     cache.close()
+  })
+})
+
+describe('binding-pending request reconciliation', () => {
+  it('uses the account lock before binding the first served identity', async () => {
+    const account = makeSentinelAccount({
+      id: 'binding-pending',
+      accountId: undefined,
+    })
+    let storage = liveStorage([account], {
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    })
+    let lockCalls = 0
+    const cache = new ClaustrumCredentialCache({
+      connector: async () =>
+        makeFakeClient({
+          getCredential: async () => ({
+            material: jwtFor('acct-bound'),
+            recordVersion: 9,
+            expiresAtMs: Date.now() + 60_000,
+          }),
+        }) as never,
+    })
+    const manifest = enrollmentManifest(account.id)
+    const resolution = await resolveFallbackAccess(account, storage, manifest, {
+      cache,
+      manifestHandle: manifest.ok
+        ? manifest.value.providers[0]?.accounts[0]?.handle
+        : undefined,
+      requestPath: true,
+      completeEnrollmentDeps: {
+        loadAccounts: async () => storage,
+        readCustodyManifest: async () => manifest,
+        acquireRefreshFileLock: async () => {
+          lockCalls += 1
+          return { release: async () => {} }
+        },
+        configPath: join(handlesDir, 'binding-store.json'),
+        cache,
+        minTtlMs: 30_000,
+        mutateAccounts: async (mutate) => {
+          storage = mutate(storage) ?? storage
+        },
+      },
+    })
+
+    expect(lockCalls).toBe(1)
+    expect(storage.accounts[0]).toMatchObject({ accountId: 'acct-bound' })
+    expect(resolution).toMatchObject({ token: jwtFor('acct-bound') })
+    cache.close()
+  })
+
+  it('makes inline request reconciliation wait behind a parked sweep', async () => {
+    const account = liveAccount('serialized', { accountId: 'acct-serialized' })
+    let storage = liveStorage([account], {
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    })
+    let releaseSweep = () => {}
+    let sweepEntered = () => {}
+    const entered = new Promise<void>((resolve) => {
+      sweepEntered = resolve
+    })
+    const sweepCache = new ClaustrumCredentialCache({
+      connector: async () =>
+        makeFakeClient({
+          getCredential: async () => {
+            sweepEntered()
+            await new Promise<void>((resolve) => {
+              releaseSweep = resolve
+            })
+            return {
+              material: jwtFor('acct-serialized'),
+              recordVersion: 10,
+              expiresAtMs: Date.now() + 60_000,
+            }
+          },
+        }) as never,
+    })
+    const requestCache = new ClaustrumCredentialCache({
+      connector: async () =>
+        makeFakeClient({
+          getCredential: async () => ({
+            material: jwtFor('acct-serialized'),
+            recordVersion: 11,
+            expiresAtMs: Date.now() + 60_000,
+          }),
+        }) as never,
+    })
+    const manifest = enrollmentManifest(account.id)
+    let lockHeld = false
+    let releaseWaiter = () => {}
+    const waitForRelease = () =>
+      new Promise<void>((resolve) => {
+        releaseWaiter = resolve
+      })
+    const shared = {
+      loadAccounts: async () => storage,
+      readCustodyManifest: async () => manifest,
+      acquireRefreshFileLock: async () => {
+        if (lockHeld) await waitForRelease()
+        lockHeld = true
+        return {
+          release: async () => {
+            lockHeld = false
+            releaseWaiter()
+          },
+        }
+      },
+      configPath: join(handlesDir, 'serialized-store.json'),
+      minTtlMs: 30_000,
+      mutateAccounts: async (
+        mutate: (current: AccountStorage) => AccountStorage | undefined,
+      ) => {
+        storage = mutate(storage) ?? storage
+      },
+    }
+    const sweep = reconcileFallbackCustody(account, {
+      ...shared,
+      cache: sweepCache,
+    })
+    await entered
+
+    let requestSettled = false
+    const request = resolveFallbackAccess(account, storage, manifest, {
+      cache: requestCache,
+      manifestHandle: manifest.ok
+        ? manifest.value.providers[0]?.accounts[0]?.handle
+        : undefined,
+      requestPath: true,
+      completeEnrollmentDeps: { ...shared, cache: requestCache },
+    }).then((result) => {
+      requestSettled = true
+      return result
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(requestSettled).toBe(false)
+
+    releaseSweep()
+    await sweep
+    expect(await request).toBe(CUSTODY_REFUSE)
+    sweepCache.close()
+    requestCache.close()
   })
 })
 
@@ -1299,49 +1439,6 @@ describe('setup-env preload guard', () => {
     expect(() =>
       assertFloor('CLAUSTRUM_OPENCODE_HANDLES', 'relative/handles.json'),
     ).toThrow(/not absolute/)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Enroll-pending store — process-local, latch semantics, sweep is the writer.
-// ---------------------------------------------------------------------------
-
-describe('enroll-pending store', () => {
-  afterEach(() => {
-    __resetEnrollPendingForTest()
-  })
-
-  it('returns undefined for an account with no recorded failure', () => {
-    expect(enrollPendingReason('unknown')).toBeUndefined()
-  })
-
-  it('latches the first reason and ignores later marks for the same account', () => {
-    markEnrollPending('acct-a', 'unavailable')
-    markEnrollPending('acct-a', 'identityMismatch')
-    markEnrollPending('acct-a', 'gone')
-    expect(enrollPendingReason('acct-a')).toBe('unavailable')
-  })
-
-  it('keeps the per-account reasons independent', () => {
-    markEnrollPending('acct-a', 'unavailable')
-    markEnrollPending('acct-b', 'identityMismatch')
-    expect(enrollPendingReason('acct-a')).toBe('unavailable')
-    expect(enrollPendingReason('acct-b')).toBe('identityMismatch')
-  })
-
-  it('clears a previously latched reason', () => {
-    markEnrollPending('acct-a', 'nullClaim')
-    expect(enrollPendingReason('acct-a')).toBe('nullClaim')
-    clearEnrollPending('acct-a')
-    expect(enrollPendingReason('acct-a')).toBeUndefined()
-  })
-
-  it('clears everything on a test reset', () => {
-    markEnrollPending('acct-a', 'gone')
-    markEnrollPending('acct-b', 'unavailable')
-    __resetEnrollPendingForTest()
-    expect(enrollPendingReason('acct-a')).toBeUndefined()
-    expect(enrollPendingReason('acct-b')).toBeUndefined()
   })
 })
 
