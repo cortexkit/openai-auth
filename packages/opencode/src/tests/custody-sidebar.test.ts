@@ -154,7 +154,7 @@ describe('normalizeSidebarState — v7 custody reader', () => {
     }
   })
 
-  test('drops unknown and removed v6 reasons without retaining the state', () => {
+  test('drops unknown and removed v6 reasons but keeps the inert state', () => {
     for (const reason of [
       'experimental',
       'unavailable',
