@@ -47,6 +47,8 @@ export type TransitionResult = {
   reason?: string
 }
 
+export type CustodyHostAuth = EnterClaustrumModeDeps['auth']
+
 type Release = { release(): Promise<void> }
 
 export type EnterClaustrumModeDeps = {
@@ -78,7 +80,7 @@ export type EnterClaustrumModeDeps = {
     set(input: {
       path: { id: string }
       body: { type: 'oauth'; access: string; refresh: string; expires: number }
-    }): Promise<void>
+    }): Promise<unknown>
   }
   onStep?(step: string): void | Promise<void>
   warn?(message: string): void
@@ -385,73 +387,16 @@ export async function enterClaustrumMode(
         return { status: 'incomplete', outcomes }
       }
 
-      const currentMain = asCompleteMainOauthSlot(
-        await deps.auth.get({ path: { id: 'openai' } }),
-      )
-      if (
-        currentMain &&
-        tombstoned(
-          {
-            id: 'main',
-            type: 'oauth',
-            access: currentMain.access,
-            refresh: currentMain.refresh,
-            expires: currentMain.expires ?? 0,
-          },
-          'openai',
-        )
-      ) {
-        outcomes.main = 'tombstoned'
-      } else if (!fingerprints.main || !currentMain) {
-        outcomes.main = 'new-local-family-under-claustrum'
-      } else if (
-        custodySlotFingerprint(currentMain.access, currentMain.refresh) !==
-        fingerprints.main
-      ) {
-        outcomes.main = 'new-local-family-under-claustrum'
-      } else {
-        const all = await deps.auth.all()
-        if (Object.keys(all).length === 0) {
-          if (!warnedTornRead) {
-            warnedTornRead = true
-            deps.warn?.(
-              'host auth store read empty; refusing to write — possible torn read',
-            )
-          }
-          outcomes.main = 'torn-read-deferred'
-        } else {
-          try {
-            await deps.auth.set({
-              path: { id: 'openai' },
-              body: {
-                type: 'oauth',
-                access: custodyTombstoneKey('openai'),
-                refresh: custodyTombstoneKey('openai'),
-                expires: 0,
-              },
-            })
-            const after = asCompleteMainOauthSlot(
-              await deps.auth.get({ path: { id: 'openai' } }),
-            )
-            outcomes.main =
-              after &&
-              tombstoned(
-                {
-                  id: 'main',
-                  type: 'oauth',
-                  access: after.access,
-                  refresh: after.refresh,
-                  expires: after.expires ?? 0,
-                },
-                'openai',
-              )
-                ? 'tombstoned'
-                : 'new-local-family-under-claustrum'
-          } catch {
-            outcomes.main = 'aborted:write-failed'
-          }
-        }
-      }
+      outcomes.main = fingerprints.main
+        ? await writeMainCustodyTombstone(fingerprints.main, {
+            auth: deps.auth,
+            warn: (message) => {
+              if (warnedTornRead) return
+              warnedTornRead = true
+              deps.warn?.(message)
+            },
+          })
+        : 'new-local-family-under-claustrum'
       await step('material-written')
       if (!incomplete(outcomes)) {
         await transaction.writeMode('claustrum')
@@ -465,6 +410,77 @@ export async function enterClaustrumMode(
     for (const lock of locks.reverse()) await lock.release()
     await step('mutex-released')
     await mutex.release()
+  }
+}
+
+export async function writeMainCustodyTombstone(
+  expectedFingerprint: string,
+  deps: {
+    auth: CustodyHostAuth
+    warn?(message: string): void
+  },
+): Promise<TransitionOutcome> {
+  const current = asCompleteMainOauthSlot(
+    await deps.auth.get({ path: { id: 'openai' } }),
+  )
+  if (
+    current &&
+    tombstoned(
+      {
+        id: 'main',
+        type: 'oauth',
+        access: current.access,
+        refresh: current.refresh,
+        expires: current.expires ?? 0,
+      },
+      'openai',
+    )
+  ) {
+    return 'tombstoned'
+  }
+  if (
+    !current ||
+    custodySlotFingerprint(current.access, current.refresh) !==
+      expectedFingerprint
+  ) {
+    return 'new-local-family-under-claustrum'
+  }
+  const all = await deps.auth.all()
+  if (Object.keys(all).length === 0) {
+    deps.warn?.(
+      'host auth store read empty; refusing to write — possible torn read',
+    )
+    return 'torn-read-deferred'
+  }
+  try {
+    const writeAuth = deps.auth.set.bind(deps.auth)
+    await writeAuth({
+      path: { id: 'openai' },
+      body: {
+        type: 'oauth',
+        access: custodyTombstoneKey('openai'),
+        refresh: custodyTombstoneKey('openai'),
+        expires: 0,
+      },
+    })
+    const after = asCompleteMainOauthSlot(
+      await deps.auth.get({ path: { id: 'openai' } }),
+    )
+    return after &&
+      tombstoned(
+        {
+          id: 'main',
+          type: 'oauth',
+          access: after.access,
+          refresh: after.refresh,
+          expires: after.expires ?? 0,
+        },
+        'openai',
+      )
+      ? 'tombstoned'
+      : 'new-local-family-under-claustrum'
+  } catch {
+    return 'aborted:write-failed'
   }
 }
 

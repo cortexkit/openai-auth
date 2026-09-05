@@ -15,6 +15,7 @@ import {
   type loadAccounts,
   type mutateAccounts,
   type OAuthAccount,
+  type withAccountStoreTransaction,
 } from './accounts.ts'
 import {
   ClaustrumCredentialCache,
@@ -38,6 +39,12 @@ import {
   evaluateCustodyStartup,
   type VaultCustodyState,
 } from './custody-state.ts'
+import {
+  type CustodyHostAuth,
+  custodySlotFingerprint,
+  MAIN_REFRESH_LOCK_NAME,
+  writeMainCustodyTombstone,
+} from './custody-transition.ts'
 import { extractAccountIdFromClaims, parseJwtClaims } from './oauth.ts'
 import type { acquireRefreshFileLock } from './refresh-file-lock.ts'
 
@@ -73,8 +80,10 @@ export type CustodyRuntimeOptions = {
   }) => Promise<ClaustrumCacheTransportLike>
   loadAccounts: typeof loadAccounts
   mutateAccounts: typeof mutateAccounts
+  withAccountStoreTransaction: typeof withAccountStoreTransaction
   readCustodyManifest: typeof readCustodyManifest
   acquireRefreshFileLock: typeof acquireRefreshFileLock
+  auth?: CustodyHostAuth
   resolveFallbackVaultState?: (input: {
     accountId: string
     handle: string
@@ -233,10 +242,17 @@ export function __createCustodyRuntimeForTest(
       }
       const manifest = await options.readCustodyManifest(manifestPath)
       latestManifest = manifest
+      await runFingerprintResumePass()
       await runFallbackInstallPass(manifest)
       const enabledHandles = enabledManifestHandles(manifest, options.storage)
       const sweepPromises: Promise<void>[] = []
       for (const account of oauthAccounts(options.storage)) {
+        if (
+          options.storage?.claustrum?.transition?.fingerprints.fallbacks[
+            account.id
+          ]
+        )
+          continue
         if (!enrolling(account, manifest, CUSTODY_OWNING_PROVIDER)) continue
         const handle = enabledHandles.get(account.id)
         if (!handle) continue
@@ -273,6 +289,7 @@ export function __createCustodyRuntimeForTest(
       // the next tick without a restart.
       const manifest = await options.readCustodyManifest(manifestPath)
       latestManifest = manifest
+      await runFingerprintResumePass()
       await runFallbackInstallPass(manifest)
       const enabledHandles = enabledManifestHandles(manifest, options.storage)
       // Step 1: completion sweep — every enrolling account under its refresh
@@ -313,11 +330,127 @@ export function __createCustodyRuntimeForTest(
     const storage = await options.loadAccounts(options.configPath)
     const sweepDeps = buildSweepDeps(cache)
     for (const account of oauthAccounts(storage)) {
+      if (storage?.claustrum?.transition?.fingerprints.fallbacks[account.id])
+        continue
       if (!enrolling(account, manifest, CUSTODY_OWNING_PROVIDER)) continue
       if (!enabledHandles.has(account.id)) continue
       const outcome = await completeFallbackEnrollment(account, sweepDeps)
       applyOutcomeToProjection(account, outcome, manifest)
     }
+  }
+
+  async function runFingerprintResumePass(): Promise<void> {
+    const initial = await options.loadAccounts(options.configPath)
+    const transition = initial?.claustrum?.transition
+    if (initial?.claustrum?.mode !== 'claustrum' || !transition) return
+    let incomplete = false
+
+    for (const [accountId, expected] of Object.entries(
+      transition.fingerprints.fallbacks,
+    )) {
+      const lock = await options.acquireRefreshFileLock({
+        name: fallbackRefreshLockName(accountId),
+        ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+        path: options.configPath,
+        renew: true,
+      })
+      if (!lock) {
+        incomplete = true
+        continue
+      }
+      try {
+        const completed = await options.withAccountStoreTransaction(
+          async (transaction) => {
+            const current = await transaction.read()
+            const account = current.accounts.find(
+              (candidate) => candidate.id === accountId,
+            )
+            if (account?.type === 'oauth' && tombstoned(account, 'openai')) {
+              return true
+            }
+            if (
+              !account ||
+              !isOAuthAccount(account) ||
+              !account.access ||
+              custodySlotFingerprint(account.access, account.refresh) !==
+                expected
+            ) {
+              projectionByAccountId.set(accountId, {
+                state: 'inert',
+                reason: 'new-local-family-under-claustrum',
+              })
+              return false
+            }
+            const sentinel = custodyTombstoneKey(CUSTODY_OWNING_PROVIDER)
+            const next = structuredClone(current)
+            const target = next.accounts.find(
+              (candidate) => candidate.id === accountId,
+            )
+            if (!target || !isOAuthAccount(target)) return false
+            target.access = ''
+            target.refresh = sentinel
+            target.expires = 0
+            await transaction.write(next)
+            const written = (await transaction.read()).accounts.find(
+              (candidate) => candidate.id === accountId,
+            )
+            return !!(
+              written?.type === 'oauth' && tombstoned(written, 'openai')
+            )
+          },
+          options.configPath,
+        )
+        if (!completed) incomplete = true
+      } catch {
+        incomplete = true
+      } finally {
+        await lock.release().catch(() => {})
+      }
+    }
+
+    if (transition.fingerprints.main) {
+      if (!options.auth) {
+        incomplete = true
+      } else {
+        const lock = await options.acquireRefreshFileLock({
+          name: MAIN_REFRESH_LOCK_NAME,
+          ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+          path: options.configPath,
+          renew: true,
+        })
+        if (!lock) {
+          incomplete = true
+        } else {
+          try {
+            const outcome = await writeMainCustodyTombstone(
+              transition.fingerprints.main,
+              {
+                auth: options.auth,
+                warn: (message) => log.warn(message, {}),
+              },
+            )
+            if (outcome !== 'tombstoned') incomplete = true
+          } finally {
+            await lock.release().catch(() => {})
+          }
+        }
+      }
+    }
+
+    if (incomplete) return
+    await options.withAccountStoreTransaction(async (transaction) => {
+      const current = await transaction.read()
+      if (
+        current.claustrum?.mode !== 'claustrum' ||
+        current.claustrum.transition?.manifestRevision !==
+          transition.manifestRevision ||
+        current.claustrum.transition?.storeGeneration !==
+          transition.storeGeneration
+      ) {
+        return
+      }
+      await transaction.writeMode('claustrum')
+    }, options.configPath)
   }
 
   async function runFallbackInstallPass(
