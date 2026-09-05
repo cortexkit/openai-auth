@@ -16,7 +16,7 @@ import {
   projectCustodyForSidebarAsync,
   type SidebarState,
 } from '../sidebar-state.ts'
-import { liveAccount } from './custody-fixtures.ts'
+import { claustrumConfig, liveAccount } from './custody-fixtures.ts'
 
 let authDir: string
 let cfgPath: string
@@ -43,7 +43,7 @@ describe('plugin-wide claustrum gate', () => {
       version: 1,
       main: { type: 'opencode', provider: 'openai' },
       accounts: [],
-      claustrum: { enabled: false, manifestWrite: false },
+      claustrum: claustrumConfig({ mode: 'local' }),
     }
     // loadAccounts/saveAccounts write through the configFromStorage path,
     // so a successful round-trip proves both directions preserve both fields.
@@ -61,7 +61,7 @@ describe('plugin-wide claustrum gate', () => {
         version: 1,
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
-        claustrum: { enabled: true, manifestWrite: false },
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
       },
       cfgPath,
     )
@@ -79,7 +79,7 @@ describe('plugin-wide claustrum gate', () => {
         version: 1,
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
-        claustrum: { enabled: true },
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
       }),
     )
     const loaded = await loadAccounts(cfgPath)
@@ -111,10 +111,7 @@ describe('plugin-wide claustrum gate', () => {
         version: 1,
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
-        claustrum: {
-          enabled: 'true' as unknown as boolean,
-          manifestWrite: 1 as unknown as boolean,
-        },
+        claustrum: claustrumConfig({ mode: 'local' }),
       },
       cfgPath,
     )
@@ -133,13 +130,10 @@ describe('plugin-wide claustrum gate', () => {
       version: 1 as const,
       main: { type: 'opencode' as const, provider: 'openai' as const },
       accounts: [],
-      claustrum: { enabled: true, manifestWrite: false },
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
     } as AccountStorage & {
-      claustrum: {
-        enabled: boolean
-        manifestWrite: boolean
-        accounts?: unknown
-      }
+      claustrum: NonNullable<AccountStorage['claustrum']> &
+        Record<'accounts', unknown>
     }
     storage.claustrum.accounts = { work: { enabled: true } }
     await saveAccounts(storage, cfgPath)
