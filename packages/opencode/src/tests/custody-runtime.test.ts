@@ -585,7 +585,8 @@ describe('enroll-completion sweep', () => {
             const changed = after?.accounts.find(
               (account) => account.id === live.id,
             )
-            if (changed?.type === 'oauth') writes.push(changed)
+            if (changed?.type === 'oauth' && !changed.corrupt)
+              writes.push(changed)
           }
           return mutateAccounts(transform, path)
         },

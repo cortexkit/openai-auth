@@ -24,9 +24,11 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { createLogger } from '../logger.ts'
 import {
   type AccountStorage,
+  type CorruptOAuthAccount,
   claustrumMode,
   FALLBACK_REFRESH_LOCK_TTL_MS,
   fallbackRefreshLockName,
+  isOAuthAccount,
   type OAuthAccount,
 } from './accounts.ts'
 import {
@@ -90,8 +92,10 @@ export type ServedFallbackCredential = {
 // Predicates
 // ---------------------------------------------------------------------------
 
+type OAuthCustodyAccount = OAuthAccount | CorruptOAuthAccount
+
 function owningAccount(
-  account: OAuthAccount,
+  account: OAuthCustodyAccount,
   manifest: CustodyManifestReadResult,
 ): boolean {
   // Case-exact label === account.id. Lower-casing either side would let a
@@ -106,7 +110,7 @@ function owningAccount(
  * intentionally ignored: enrollment is a manifest fact, not a policy choice.
  */
 export function enrolled(
-  account: OAuthAccount,
+  account: OAuthCustodyAccount,
   manifest: CustodyManifestReadResult,
 ): boolean {
   return owningAccount(account, manifest)
@@ -116,8 +120,11 @@ export function enrolled(
  * `tombstoned` = oauth refresh equals the exact per-provider sentinel. Access
  * and expiry are ignored so partial writes remain custody evidence.
  */
-export function tombstoned(account: OAuthAccount, provider: string): boolean {
-  if (account.type !== 'oauth') return false
+export function tombstoned(
+  account: OAuthCustodyAccount,
+  provider: string,
+): boolean {
+  if (account.corrupt) return false
   return account.refresh === custodyTombstoneKey(provider)
 }
 
@@ -155,7 +162,7 @@ export function enrolling(
  * fall back to the local/vault read.
  */
 export function refreshInert(
-  account: OAuthAccount,
+  account: OAuthCustodyAccount,
   manifest: CustodyManifestReadResult,
   provider: string,
 ): boolean {
@@ -292,7 +299,11 @@ export async function resolveFallbackAccess(
       const completedAccount = completedStorage?.accounts.find(
         (candidate) => candidate.id === account.id,
       )
-      if (!completedStorage || completedAccount?.type !== 'oauth') {
+      if (
+        !completedStorage ||
+        !completedAccount ||
+        !isOAuthAccount(completedAccount)
+      ) {
         return CUSTODY_REFUSE
       }
       const completedManifest =
@@ -761,7 +772,7 @@ export async function completeFallbackEnrollment(
   const liveAccount = storage.accounts.find(
     (candidate) => candidate.id === account.id,
   )
-  if (liveAccount?.type !== 'oauth') {
+  if (!liveAccount || !isOAuthAccount(liveAccount)) {
     return { kind: 'skipped', reason: 'notEnrolling' }
   }
   if (!enrolling(liveAccount, manifest, provider)) {
@@ -794,7 +805,7 @@ export async function completeFallbackEnrollment(
     if (
       !recheckStorage ||
       !recheckAccount ||
-      recheckAccount.type !== 'oauth' ||
+      !isOAuthAccount(recheckAccount) ||
       !enrolling(recheckAccount, recheckManifest, provider)
     ) {
       return { kind: 'skipped', reason: 'notEnrolling' }
@@ -838,7 +849,7 @@ export async function completeFallbackEnrollment(
     const sentinel = custodyTombstoneKey(provider)
     await deps.mutateAccounts((current) => {
       const target = current.accounts.find((a) => a.id === account.id)
-      if (target?.type !== 'oauth') return current
+      if (!target || !isOAuthAccount(target)) return current
       const next: OAuthAccount = {
         ...target,
         access: '',

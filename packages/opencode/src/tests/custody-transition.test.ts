@@ -91,6 +91,7 @@ function fakeCoordinatorDeps(
                 next.accounts.find(
                   (account) =>
                     account.type === 'oauth' &&
+                    !account.corrupt &&
                     account.id === options.failFallbackId &&
                     account.refresh.startsWith('claustrum-tombstone'),
                 )
