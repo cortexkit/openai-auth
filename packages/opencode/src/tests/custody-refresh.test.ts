@@ -165,6 +165,27 @@ describe('choke point (refreshAccountNow) refuses refreshInert accounts', () => 
     expect(refreshFnCalls).toBe(0)
     expect(thrown).toBeInstanceOf(CustodyTombstoneRefreshError)
   })
+
+  it('tombstoned storage account refuses before a manifest read can fail', async () => {
+    const account = makeSentinelAccount({ access: '' })
+    await saveAccounts(liveStorage([account]), cfgPath)
+    const storage = (await loadAccounts(cfgPath))!
+    let manifestReads = 0
+    const manager = new FallbackAccountManager({
+      configPath: cfgPath,
+      custody: {
+        readManifest: async () => {
+          manifestReads++
+          throw new Error('manifest reader must not run')
+        },
+      },
+    })
+
+    await expect(
+      manager.refreshAccount(account, storage, { force: true }),
+    ).rejects.toBeInstanceOf(CustodyTombstoneRefreshError)
+    expect(manifestReads).toBe(0)
+  })
 })
 
 // ---------------------------------------------------------------------------
