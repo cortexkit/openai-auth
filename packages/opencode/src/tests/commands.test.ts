@@ -1,5 +1,4 @@
 import {
-  afterAll,
   afterEach,
   beforeEach,
   describe,
@@ -18,18 +17,8 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CommandContext } from '../commands'
-// Static import for tests that don't need mocking.
 import { buildDialogPayload, renderResetCoordinatorResult } from '../commands'
 import { getSettings } from '../config'
-// Snapshot the REAL oauth module exports at load time (before any mock.module
-// runs). bun's mock.module leaks process-wide and mock.restore() does NOT undo
-// it, so without restoring here the beginAccountLogin stub below would poison
-// every later test file that imports ../core/oauth. We spread into a PLAIN object
-// so the snapshot holds the original function references even after the live
-// namespace is later replaced; afterAll re-installs it.
-import * as oauthLiveNamespace from '../core/oauth'
-
-const oauthRealExports = { ...oauthLiveNamespace }
 
 import type {
   AccountQuotaWindow,
@@ -98,6 +87,13 @@ function makeClient(): CommandContext['client'] {
       set: mock(async () => {}),
     },
   } as unknown as CommandContext['client']
+}
+
+function withAccountLogin(
+  ctx: CommandContext,
+  beginAccountLogin: NonNullable<CommandContext['beginAccountLogin']>,
+): CommandContext {
+  return { ...ctx, beginAccountLogin }
 }
 
 function fetchStub(
@@ -3258,7 +3254,7 @@ describe('commands', () => {
 })
 
 // -----------------------------------------------------------------------
-// Account add command (uses mock.module for beginAccountLogin)
+// Account add command
 // -----------------------------------------------------------------------
 describe('commands (add)', () => {
   let tmpDir: string
@@ -3294,12 +3290,6 @@ describe('commands (add)', () => {
     }
   })
 
-  // mock.module('../core/oauth', ...) below leaks process-wide; re-install the
-  // real module so later test files (e.g. oauth.test.ts) see the genuine exports.
-  afterAll(() => {
-    mock.module('../core/oauth', () => oauthRealExports)
-  })
-
   test('/openai-account add returns dialog with auth URL', async () => {
     const resolveAccount = makeAccount('added-acct', { label: 'work' })
     const beginSpy = mock((_opts?: unknown) =>
@@ -3309,13 +3299,6 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    // Dynamic re-import to pick up the mock
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3327,7 +3310,11 @@ describe('commands (add)', () => {
       client: makeClient(),
     }
 
-    const payload = await bdp('openai-account', 'add work', ctx)
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'add work',
+      withAccountLogin(ctx, beginSpy),
+    )
 
     expect(payload.command).toBe('openai-account')
     expect(payload.text).toContain('https://auth.openai.com/oauth/authorize')
@@ -3347,12 +3334,6 @@ describe('commands (add)', () => {
         completion: completionPromise,
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3367,7 +3348,11 @@ describe('commands (add)', () => {
       client,
     }
 
-    const payload = await bdp('openai-account', 'add work', ctx)
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'add work',
+      withAccountLogin(ctx, beginSpy),
+    )
     expect(payload.text).toContain('Add OpenAI Account')
 
     // Resolve the detached completion
@@ -3396,12 +3381,6 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3414,13 +3393,21 @@ describe('commands (add)', () => {
     }
 
     // First add
-    await bdp('openai-account', 'add personal', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add personal',
+      withAccountLogin(ctx, beginSpy),
+    )
     await waitUntil(
       async () => ((await loadAccounts(configPath))?.accounts.length ?? 0) >= 1,
     )
 
     // Second add with same label
-    await bdp('openai-account', 'add personal', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add personal',
+      withAccountLogin(ctx, beginSpy),
+    )
     // Absence assertion: the duplicate must NOT be added, so there is no
     // observable effect to poll for. Wait long enough for the completion to
     // have run and been rejected.
@@ -3439,12 +3426,6 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3456,7 +3437,11 @@ describe('commands (add)', () => {
       client: makeClient(),
     }
 
-    await bdp('openai-account', 'add fb', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add fb',
+      withAccountLogin(ctx, beginSpy),
+    )
     await waitUntil(
       async () => ((await loadAccounts(configPath))?.accounts.length ?? 0) >= 1,
     )
@@ -3487,12 +3472,6 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3504,7 +3483,11 @@ describe('commands (add)', () => {
       client: makeClient(),
     }
 
-    await bdp('openai-account', 'add test', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add test',
+      withAccountLogin(ctx, beginSpy),
+    )
     // Absence assertion: the main account must NOT be added as a fallback, so
     // there is no observable effect to poll for. Wait long enough for the
     // completion to have run and been rejected.
@@ -3534,12 +3517,6 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3555,7 +3532,11 @@ describe('commands (add)', () => {
       },
     }
 
-    await bdp('openai-account', 'add test', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add test',
+      withAccountLogin(ctx, beginSpy),
+    )
     await waitUntil(() => notifyCalls.length >= 1)
 
     expect(notifyCalls.length).toBe(1)
@@ -3570,12 +3551,6 @@ describe('commands (add)', () => {
         completion: Promise.reject(new Error('OAuth timeout')),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3591,7 +3566,11 @@ describe('commands (add)', () => {
       },
     }
 
-    await bdp('openai-account', 'add test', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add test',
+      withAccountLogin(ctx, beginSpy),
+    )
     await waitUntil(() => notifyCalls.length >= 1)
 
     expect(notifyCalls.length).toBe(1)
@@ -3606,12 +3585,6 @@ describe('commands (add)', () => {
         completion: new Promise(() => {}),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3623,7 +3596,11 @@ describe('commands (add)', () => {
       client: makeClient(),
     }
 
-    const payload = await bdp('openai-account', 'add work', ctx)
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'add work',
+      withAccountLogin(ctx, beginSpy),
+    )
 
     expect(payload.command).toBe('openai-account')
     expect(payload.knobs.url).toBe(
@@ -3643,12 +3620,6 @@ describe('commands (add)', () => {
         completion: new Promise(() => {}),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3660,7 +3631,11 @@ describe('commands (add)', () => {
       client: makeClient(),
     }
 
-    const payload = await bdp('openai-account', 'add --headless', ctx)
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'add --headless',
+      withAccountLogin(ctx, beginSpy),
+    )
 
     expect(payload.command).toBe('openai-account')
     expect(payload.knobs.verificationUrl).toBe(
@@ -3679,12 +3654,6 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3700,7 +3669,11 @@ describe('commands (add)', () => {
       },
     }
 
-    await bdp('openai-account', 'add work', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add work',
+      withAccountLogin(ctx, beginSpy),
+    )
     await waitUntil(() => refreshCalls.length >= 1)
 
     expect(refreshCalls.length).toBe(1)
@@ -3716,12 +3689,6 @@ describe('commands (add)', () => {
         completion: new Promise(() => {}),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3733,7 +3700,11 @@ describe('commands (add)', () => {
       client: makeClient(),
     }
 
-    await bdp('openai-account', 'add my-label', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add my-label',
+      withAccountLogin(ctx, beginSpy),
+    )
 
     expect(beginSpy).toHaveBeenCalled()
     const callArg = beginSpy.mock.calls[0]?.[0] as
@@ -3750,12 +3721,6 @@ describe('commands (add)', () => {
         completion: new Promise(() => {}),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3767,7 +3732,11 @@ describe('commands (add)', () => {
       client: makeClient(),
     }
 
-    await bdp('openai-account', 'add --headless my-label', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add --headless my-label',
+      withAccountLogin(ctx, beginSpy),
+    )
 
     expect(beginSpy).toHaveBeenCalled()
     const callArg = beginSpy.mock.calls[0]?.[0] as
@@ -3789,12 +3758,6 @@ describe('commands (add)', () => {
         completion: completionPromise,
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3812,7 +3775,11 @@ describe('commands (add)', () => {
       },
     }
 
-    await bdp('openai-account', 'add work', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add work',
+      withAccountLogin(ctx, beginSpy),
+    )
     ctx.sessionId = 'session-two'
     ctx.notify = (payload) => {
       secondSessionCalls.push(payload.text)
@@ -4001,14 +3968,11 @@ describe('commands (claustrum mode)', () => {
     const completion = new Promise<OAuthAccount>((resolve) => {
       resolveAccount = resolve
     })
-    mock.module('../core/oauth', () => ({
-      ...oauthRealExports,
-      beginAccountLogin: async () => ({
-        url: 'https://auth.openai.com/test',
-        instructions: 'test',
-        completion,
-      }),
-    }))
+    const beginAccountLogin = async () => ({
+      url: 'https://auth.openai.com/test',
+      instructions: 'test',
+      completion,
+    })
     const notifications: string[] = []
 
     await buildDialogPayload(
@@ -4018,6 +3982,7 @@ describe('commands (claustrum mode)', () => {
         notify: (payload) => {
           notifications.push(payload.text)
         },
+        beginAccountLogin,
         withFallbackAccountLock: async (_id, action) => action(),
       }),
     )
