@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   type AccountStorage,
   type AccountStoreTransaction,
-  mutateAccounts,
+  getAccountStatePath,
   saveAccounts,
   withAccountStoreTransaction,
 } from '../core/accounts.ts'
@@ -334,22 +334,19 @@ describe('enterClaustrumMode coordinator', () => {
       await saveAccounts(liveStorage([liveAccount('fallback-a')]), path)
       const entered = deferred()
       const release = deferred()
-      let mutationFinished = false
       const held = withAccountStoreTransaction(async () => {
         entered.resolve()
         await release.promise
         return { status: 'completed', outcomes: {} }
       }, path)
       await entered.promise
-      const mutation = mutateAccounts((storage) => storage, path).then(() => {
-        mutationFinished = true
-      })
-
-      await Promise.resolve()
-      expect(mutationFinished).toBe(false)
+      const statePath = getAccountStatePath(path)
+      expect(existsSync(`${path}.save.lock`)).toBe(true)
+      expect(existsSync(`${statePath}.save.lock`)).toBe(true)
       release.resolve()
-      await Promise.all([held, mutation])
-      expect(mutationFinished).toBe(true)
+      await held
+      expect(existsSync(`${path}.save.lock`)).toBe(false)
+      expect(existsSync(`${statePath}.save.lock`)).toBe(false)
     } finally {
       rmSync(directory, { recursive: true, force: true })
     }
