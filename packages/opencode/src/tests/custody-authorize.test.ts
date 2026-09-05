@@ -202,7 +202,7 @@ describe('production authorize custody leases', () => {
         barrierAcquired = true
         await lease.release()
       })
-      await Promise.resolve()
+      for (let turn = 0; turn < 32; turn += 1) await Promise.resolve()
       expect(barrierAcquired).toBe(false)
 
       fixture.hostSet('minted-access')
