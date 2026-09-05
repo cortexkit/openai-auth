@@ -564,6 +564,25 @@ describe('enterClaustrumMode coordinator', () => {
     await pending
   })
 
+  it('releases the transition mutex when the final observer throws', async () => {
+    const transition = await import('../core/custody-transition.ts')
+    const fixture = fakeCoordinatorDeps()
+    fixture.deps.onStep = (step: string) => {
+      fixture.traces.push(step)
+      if (step === 'mutex-released') throw new Error('observer failed')
+    }
+
+    await expect(
+      transition.enterClaustrumMode(fixture.deps),
+    ).resolves.toMatchObject({
+      status: 'completed',
+    })
+
+    const second = await transition.acquireCustodyTransitionMutex()
+    expect(typeof second.release).toBe('function')
+    await second.release()
+  })
+
   it('does not start a second barrier preflight while the first holds the transition mutex', async () => {
     const transition = await import('../core/custody-transition.ts')
     const firstPreflightEntered = deferred()
