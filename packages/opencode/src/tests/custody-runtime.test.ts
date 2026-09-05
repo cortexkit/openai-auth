@@ -349,6 +349,77 @@ describe('custody detection', () => {
   })
 })
 
+describe('orphan binding discovery', () => {
+  it('creates one binding-pending row before the manifest join across two runtimes', async () => {
+    const storage = liveStorage([], {
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    })
+    await writeStorageWithManifest(storage, enrollmentManifest('new-account'))
+    const { transport } = makeTransport(() => ({
+      material: makeJwt('acct-new'),
+      recordVersion: 1,
+      expiresAtMs: Date.now() + 600_000,
+    }))
+    const first = __createCustodyRuntimeForTest(
+      makeOptions({ storage, transport, detection: 'available' }),
+    )
+    const second = __createCustodyRuntimeForTest(
+      makeOptions({ storage, transport, detection: 'available' }),
+    )
+
+    await Promise.all([first.boot(), second.boot()])
+
+    const after = await loadAccounts(configPath)
+    expect(after?.accounts).toEqual([
+      {
+        id: 'new-account',
+        type: 'oauth',
+        access: '',
+        refresh: TOMBSTONE_OPENAI,
+        expires: 0,
+        enabled: true,
+      },
+    ])
+    expect(after?.claustrum?.rowHistory).toEqual(['new-account'])
+    first.dispose()
+    second.dispose()
+  })
+
+  it('logs an orphan once under local mode without creating a row or client', async () => {
+    const storage = liveStorage([], {
+      claustrum: claustrumConfig({ mode: 'local' }),
+    })
+    await writeStorageWithManifest(storage, enrollmentManifest('new-account'))
+    const logger = makeLogger()
+    let connections = 0
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({
+        storage,
+        transport: makeTransport(() => {
+          throw new Error('unused')
+        }).transport,
+        detection: 'available',
+        logger,
+        cacheConnector: async () => {
+          connections += 1
+          throw new Error('must not connect')
+        },
+      }),
+    )
+
+    await runtime.boot()
+
+    expect((await loadAccounts(configPath))?.accounts).toEqual([])
+    expect(connections).toBe(0)
+    expect(
+      logger.info.mock.calls.filter(([message]) =>
+        message.includes('orphan-binding: awaiting discovery'),
+      ),
+    ).toHaveLength(1)
+    runtime.dispose()
+  })
+})
+
 describe('fingerprint-gated reconciliation resume', () => {
   it('tombstones a matching fallback row and clears the completed transition', async () => {
     const account = liveAccount('fb-1')
