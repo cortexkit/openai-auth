@@ -711,8 +711,8 @@ describe('refresh-inert quota poll', () => {
     // is that refreshAccount was reached for a tombstoned account.
     expect(deps.refreshAccount).toHaveBeenCalled()
     const called = deps.refreshAccount.mock.calls[0]?.[0] as
-      | { access?: string }
+      | { refresh?: string }
       | undefined
-    expect(called?.access).toBe(TOMBSTONE_OPENAI)
+    expect(called?.refresh).toBe(TOMBSTONE_OPENAI)
   })
 })
