@@ -29,6 +29,7 @@ import {
   loadAccounts,
   mutateAccounts,
   saveAccounts,
+  withAccountStoreTransaction,
 } from '../core/accounts.ts'
 import { CUSTODY_TOMBSTONE_PREFIX } from '../core/custody.ts'
 import {
@@ -36,6 +37,7 @@ import {
   defaultCustodyManifestPath,
   readCustodyManifest,
 } from '../core/custody-manifest.ts'
+import { custodySlotFingerprint } from '../core/custody-transition.ts'
 import { CUSTODY_DEPS_INCOMPLETE } from '../core/refresh-all-quota.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
 import {
@@ -259,6 +261,7 @@ function makeOptions(
     cacheConnector: async () => overrides.transport,
     loadAccounts: (path?: string) => loadAccounts(path ?? configPath),
     mutateAccounts,
+    withAccountStoreTransaction,
     readCustodyManifest,
     acquireRefreshFileLock: async () => ({
       release: async () => {},
@@ -353,6 +356,255 @@ describe('custody detection', () => {
     expect(
       warnMessages.some((msg) => msg.includes('connection malformed')),
     ).toBe(true)
+    runtime.dispose()
+  })
+})
+
+describe('fingerprint-gated reconciliation resume', () => {
+  it('tombstones a matching fallback row and clears the completed transition', async () => {
+    const account = liveAccount('fb-1')
+    const storage = liveStorage([account], {
+      claustrum: claustrumConfig({
+        mode: 'claustrum',
+        transition: {
+          manifestRevision: 'revision-1',
+          storeGeneration: 'generation-1',
+          fingerprints: {
+            fallbacks: {
+              [account.id]: custodySlotFingerprint(
+                account.access!,
+                account.refresh,
+              ),
+            },
+          },
+        },
+      }),
+    })
+    await writeStorageWithManifest(storage, enrollmentManifest(account.id))
+    const { transport } = makeTransport(() => {
+      throw new Error('resume must not depend on the vault')
+    })
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({ storage, transport, detection: 'available' }),
+    )
+
+    await runtime.boot()
+
+    const after = await loadAccounts(configPath)
+    expect(after?.accounts[0]).toMatchObject({
+      access: '',
+      refresh: TOMBSTONE_OPENAI,
+      expires: 0,
+    })
+    expect(after?.claustrum?.transition).toBeUndefined()
+    runtime.dispose()
+  })
+
+  it('keeps a mismatched fallback real and retains all transition fingerprints', async () => {
+    const account = liveAccount('fb-1', { access: 'new-local-access' })
+    const transition = {
+      manifestRevision: 'revision-1',
+      storeGeneration: 'generation-1',
+      fingerprints: {
+        fallbacks: {
+          [account.id]: custodySlotFingerprint(
+            'old-local-access',
+            account.refresh,
+          ),
+        },
+      },
+    }
+    const storage = liveStorage([account], {
+      claustrum: claustrumConfig({ mode: 'claustrum', transition }),
+    })
+    await writeStorageWithManifest(storage, enrollmentManifest(account.id))
+    const { transport } = makeTransport(() => {
+      throw new Error('resume must not depend on the vault')
+    })
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({ storage, transport, detection: 'available' }),
+    )
+
+    await runtime.boot()
+
+    const after = await loadAccounts(configPath)
+    expect(after?.accounts[0]).toMatchObject({
+      access: 'new-local-access',
+      refresh: account.refresh,
+    })
+    expect(after?.claustrum?.transition).toEqual(transition)
+    runtime.dispose()
+  })
+
+  it('skips an already-tombstoned fallback before comparing its stale fingerprint', async () => {
+    const account = makeSentinelAccount({ id: 'fb-1' })
+    const storage = liveStorage([account], {
+      claustrum: claustrumConfig({
+        mode: 'claustrum',
+        transition: {
+          manifestRevision: 'revision-1',
+          storeGeneration: 'generation-1',
+          fingerprints: {
+            fallbacks: {
+              [account.id]: custodySlotFingerprint('old-access', 'old-refresh'),
+            },
+          },
+        },
+      }),
+    })
+    await writeStorageWithManifest(storage, enrollmentManifest(account.id))
+    const { transport } = makeTransport(() => {
+      throw new Error('resume must not depend on the vault')
+    })
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({ storage, transport, detection: 'available' }),
+    )
+
+    await runtime.boot()
+
+    expect(
+      (await loadAccounts(configPath))?.claustrum?.transition,
+    ).toBeUndefined()
+    runtime.dispose()
+  })
+
+  it('retains the transition while any persisted fallback fingerprint is incomplete', async () => {
+    const matching = liveAccount('matching')
+    const mismatch = liveAccount('mismatch', { access: 'new-access' })
+    const transition = {
+      manifestRevision: 'revision-1',
+      storeGeneration: 'generation-1',
+      fingerprints: {
+        fallbacks: {
+          matching: custodySlotFingerprint(matching.access!, matching.refresh),
+          mismatch: custodySlotFingerprint('old-access', mismatch.refresh),
+        },
+      },
+    }
+    const storage = liveStorage([matching, mismatch], {
+      claustrum: claustrumConfig({ mode: 'claustrum', transition }),
+    })
+    await writeStorageWithManifest(storage, enrollmentManifest(matching.id))
+    const { transport } = makeTransport(() => {
+      throw new Error('resume must not depend on the vault')
+    })
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({ storage, transport, detection: 'available' }),
+    )
+
+    await runtime.boot()
+
+    const after = await loadAccounts(configPath)
+    expect(after?.accounts[0]).toMatchObject({ refresh: TOMBSTONE_OPENAI })
+    expect(after?.accounts[1]).toMatchObject({ access: 'new-access' })
+    expect(after?.claustrum?.transition).toEqual(transition)
+    runtime.dispose()
+  })
+
+  it('resumes main through the guarded host-slot path and retries an empty auth map on tick', async () => {
+    const main = {
+      type: 'oauth' as const,
+      access: 'main-access',
+      refresh: 'main-refresh',
+      expires: 1,
+    }
+    const transition = {
+      manifestRevision: 'revision-1',
+      storeGeneration: 'generation-1',
+      fingerprints: {
+        main: custodySlotFingerprint(main.access, main.refresh),
+        fallbacks: {},
+      },
+    }
+    const storage = liveStorage([], {
+      claustrum: claustrumConfig({ mode: 'claustrum', transition }),
+    })
+    await writeStorageWithManifest(storage, enrollmentManifest('main'))
+    const { transport } = makeTransport(() => {
+      throw new Error('resume must not depend on the vault')
+    })
+    let empty = true
+    let writes = 0
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({
+        storage,
+        transport,
+        detection: 'available',
+        auth: {
+          all: async () => (empty ? {} : { openai: main }),
+          get: async () => main,
+          set: async ({ body }) => {
+            writes += 1
+            Object.assign(main, body)
+          },
+        },
+      }),
+    )
+
+    await runtime.boot()
+    expect(writes).toBe(0)
+    expect((await loadAccounts(configPath))?.claustrum?.transition).toEqual(
+      transition,
+    )
+
+    empty = false
+    await runtime.runTick()
+    expect(writes).toBe(1)
+    expect(main).toMatchObject({
+      access: TOMBSTONE_OPENAI,
+      refresh: TOMBSTONE_OPENAI,
+      expires: 0,
+    })
+    expect(
+      (await loadAccounts(configPath))?.claustrum?.transition,
+    ).toBeUndefined()
+    runtime.dispose()
+  })
+
+  it('keeps main resume incomplete when the post-write readback is real', async () => {
+    const main = {
+      type: 'oauth' as const,
+      access: 'main-access',
+      refresh: 'main-refresh',
+      expires: 1,
+    }
+    const transition = {
+      manifestRevision: 'revision-1',
+      storeGeneration: 'generation-1',
+      fingerprints: {
+        main: custodySlotFingerprint(main.access, main.refresh),
+        fallbacks: {},
+      },
+    }
+    const storage = liveStorage([], {
+      claustrum: claustrumConfig({ mode: 'claustrum', transition }),
+    })
+    await writeStorageWithManifest(storage, enrollmentManifest('main'))
+    const { transport } = makeTransport(() => {
+      throw new Error('resume must not depend on the vault')
+    })
+    let writes = 0
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({
+        storage,
+        transport,
+        detection: 'available',
+        auth: {
+          all: async () => ({ openai: main }),
+          get: async () => main,
+          set: async () => {
+            writes += 1
+          },
+        },
+      }),
+    )
+
+    await runtime.boot()
+
+    expect(writes).toBe(1)
+    expect((await loadAccounts(configPath))?.claustrum?.transition).toEqual(
+      transition,
+    )
     runtime.dispose()
   })
 })
@@ -606,6 +858,44 @@ describe('custody warm and tick', () => {
 // ---------------------------------------------------------------------------
 
 describe('enroll-completion sweep', () => {
+  it('does not install a tombstone into a gone main host slot', async () => {
+    const storage = liveStorage([], {
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    })
+    await writeStorageWithManifest(storage, enrollmentManifest('main'))
+    const { transport } = makeTransport(() => ({
+      material: makeJwt('acct-main'),
+      recordVersion: 1,
+      expiresAtMs: Date.now() + 600_000,
+    }))
+    let accountMutations = 0
+    let hostWrites = 0
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({
+        storage,
+        transport,
+        detection: 'available',
+        mutateAccounts: async (transform, path) => {
+          accountMutations += 1
+          return mutateAccounts(transform, path)
+        },
+        auth: {
+          all: async () => ({ anthropic: { type: 'oauth' } }),
+          get: async () => undefined,
+          set: async () => {
+            hostWrites += 1
+          },
+        },
+      }),
+    )
+
+    await runtime.boot()
+
+    expect(accountMutations).toBe(0)
+    expect(hostWrites).toBe(0)
+    runtime.dispose()
+  })
+
   for (const vaultState of ['serves', 'cold', 'needs_reauth'] as const) {
     it(`installs the exact fallback tombstone over a corrupt marker when the vault ${vaultState}`, async () => {
       const corrupt = corruptAccount()
