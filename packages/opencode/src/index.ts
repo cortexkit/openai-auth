@@ -473,6 +473,8 @@ interface CodexAuthPluginOptions {
     now?: () => number
     /** Test seam: controls bounded host-write observation without real timers. */
     sleep?: (ms: number) => Promise<void>
+    /** Test seam: observes the account lock around custody binding checks. */
+    withFallbackAccountLock?: CommandContext['withFallbackAccountLock']
     /** Test seam: replaces external OAuth I/O while preserving the hook callback. */
     authorize?: {
       browser?: () => Promise<{
@@ -2196,7 +2198,7 @@ export async function CodexAuthPlugin(
         // Start the loopback RPC server so the TUI can drain notifications and
         // dispatch apply commands.
         // -------------------------------------------------------------------
-        const withFallbackAccountLock = async <T>(
+        const defaultWithFallbackAccountLock = async <T>(
           accountId: string,
           action: () => Promise<T>,
         ): Promise<T> => {
@@ -2213,6 +2215,9 @@ export async function CodexAuthPlugin(
             await lock.release()
           }
         }
+        const withFallbackAccountLock =
+          custodyOptions?.withFallbackAccountLock ??
+          defaultWithFallbackAccountLock
         const checkUsableCustodyBinding = async (account: OAuthAccount) => {
           const manifest = await readCustodyManifest()
           if (!manifest.ok) {
