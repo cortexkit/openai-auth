@@ -145,7 +145,11 @@ function fakeCoordinatorDeps(
           options.all ??
           (async () => ({ openai: authSlot, anthropic: { type: 'oauth' } })),
         get: async () => authSlot,
-        set: async ({ body }) => {
+        set: async ({
+          body,
+        }: {
+          body: { access: string; refresh: string; expires: number }
+        }) => {
           options.beforeSet?.()
           authSlot.access = body.access
           authSlot.refresh = body.refresh
