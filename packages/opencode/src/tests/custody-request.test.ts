@@ -11,9 +11,6 @@ import type { CacheKeepManager } from '../core/cachekeep.ts'
 import {
   ClaustrumCredentialCache,
   CUSTODY_REFUSE,
-  clearEnrollPending,
-  enrollPendingReason,
-  markEnrollPending,
   resolveFallbackAccess,
   stampVaultProvenance,
   type VaultProvenance,
@@ -465,17 +462,13 @@ describe('custody request resolution', () => {
     })
   })
 
-  it('skips an expired enrolling account while preserving its local secrets when completion is disarmed', async () => {
+  it('reconciles an expired bound row to the vault before fallback routing', async () => {
     const expired = enrollingAccount()
     const next = enrollingAccount({
       id: 'next',
       access: 'next-access',
       refresh: 'next-refresh',
       expires: Date.now() + 100_000,
-    })
-    const secretsBefore = JSON.stringify({
-      access: expired.access,
-      refresh: expired.refresh,
     })
     await withCustodyLoader(
       {
@@ -488,7 +481,7 @@ describe('custody request resolution', () => {
       async ({ fetchOverride, authorizations, configPath }) => {
         const [url, init] = codexRequest()
         expect((await fetchOverride(url, init)).status).toBe(200)
-        expect(authorizations).toContain('Bearer next-access')
+        expect(authorizations).toContain(`Bearer ${jwtFor('acct-1')}`)
         const storage = await loadAccounts(configPath)
         const preserved = storage?.accounts.find(
           (account) => account.id === expired.id,
@@ -496,12 +489,11 @@ describe('custody request resolution', () => {
         expect(preserved?.type).toBe('oauth')
         if (preserved?.type !== 'oauth')
           throw new Error('expected oauth account')
-        expect(
-          JSON.stringify({
-            access: preserved.access,
-            refresh: preserved.refresh,
-          }),
-        ).toBe(secretsBefore)
+        expect(preserved).toMatchObject({
+          access: '',
+          refresh: 'claustrum-tombstone:v1:openai',
+          expires: 0,
+        })
       },
     )
   })
@@ -1312,7 +1304,7 @@ describe('custody request resolution', () => {
     })
   })
 
-  it('serves a valid local enrollment without refreshing it', async () => {
+  it('refuses a bound real row under claustrum before it can serve local access', async () => {
     const account = enrollingAccount({ expires: 100_000 })
     const storage = liveStorage([account], {
       claustrum: claustrumConfig({ mode: 'claustrum' }),
@@ -1341,8 +1333,6 @@ describe('custody request resolution', () => {
           close() {},
         }) as never,
     })
-    markEnrollPending(account.id, 'unavailable')
-
     const result = await resolveFallbackAccess(account, storage, manifest, {
       cache,
       manifestHandle: handle,
@@ -1350,9 +1340,8 @@ describe('custody request resolution', () => {
       now: () => 1_000,
     })
 
-    expect(result).toEqual({ token: 'local-access', provenance: 'local' })
+    expect(result).toBe(CUSTODY_REFUSE)
     expect(vaultGets).toBe(0)
-    clearEnrollPending(account.id)
     cache.close()
   })
 
@@ -1488,13 +1477,11 @@ describe('custody request resolution', () => {
     })
 
     expect(result).toBe(CUSTODY_REFUSE)
-    expect(enrollPendingReason(account.id)).toBe('identityMismatch')
     const intact = storage.accounts[0]
     expect(intact?.type).toBe('oauth')
     if (intact?.type !== 'oauth') throw new Error('expected oauth account')
     expect(intact.access).toBe('local-access')
     expect(intact.refresh).toBe('local-refresh')
-    clearEnrollPending(account.id)
     cache.close()
   })
 
@@ -1544,8 +1531,6 @@ describe('custody request resolution', () => {
     })
 
     expect(result).toBe(CUSTODY_REFUSE)
-    expect(enrollPendingReason(account.id)).toBe('unavailable')
-    clearEnrollPending(account.id)
     cache.close()
   })
 
