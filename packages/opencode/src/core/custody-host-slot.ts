@@ -221,6 +221,10 @@ async function mainVaultState(
   }
 }
 
+function verifiedInProcessLogin(slot: MainAuthSlot): boolean {
+  return slot.kind === 'real' && hasVerifiedInProcessMainLogin(slot.oauth)
+}
+
 export async function reconcileMainSlotBeforeHooks(
   deps: MainSlotReconciliationDeps,
 ): Promise<CustodyVerdict | undefined> {
@@ -234,6 +238,7 @@ export async function reconcileMainSlotBeforeHooks(
       mode: deps.mode,
       manifest,
       local: slot.kind,
+      verifiedInProcessLogin: verifiedInProcessLogin(slot),
       // The absent-slot recovery row remains takeover-incomplete while a bound
       // vault is merely cold or latched; only a missing/disputed binding changes
       // the typed factory verdict.
@@ -249,6 +254,7 @@ export async function reconcileMainSlotBeforeHooks(
     mode: deps.mode,
     manifest,
     local: slot.kind,
+    verifiedInProcessLogin: verifiedInProcessLogin(slot),
     vault: () => vault,
   })
 }

@@ -18,6 +18,7 @@ export type VaultCustodyState =
 
 export const CUSTODY_INERT_REASONS = [
   'enrolled-under-local',
+  'needs-login',
   'mode-mismatch',
   'corrupt-under-binding',
   'manifest-unreadable',
@@ -57,6 +58,7 @@ export interface EvaluateCustodyStartupInput {
   vault: () => VaultCustodyState
   manifestFailureReason?: string
   fingerprintMatch?: boolean
+  verifiedInProcessLogin: boolean
   isMain?: boolean
 }
 
@@ -84,10 +86,15 @@ function evaluateLocal(local: LocalCustodyState): CustodyVerdict {
   return unreachable(local)
 }
 
-function evaluateLocalWithBinding(local: LocalCustodyState): CustodyVerdict {
+function evaluateLocalWithBinding(
+  local: LocalCustodyState,
+  verifiedInProcessLogin: boolean,
+): CustodyVerdict {
   switch (local) {
     case 'real':
-      return { kind: 'INERT', reason: 'enrolled-under-local' }
+      return verifiedInProcessLogin
+        ? { kind: 'LOCAL' }
+        : { kind: 'INERT', reason: 'needs-login' }
     case 'tombstone':
     case 'empty':
     case 'slot-absent':
@@ -218,7 +225,7 @@ export function evaluateCustodyStartup(
   switch (input.mode) {
     case 'local':
       return input.manifest === 'present'
-        ? evaluateLocalWithBinding(input.local)
+        ? evaluateLocalWithBinding(input.local, input.verifiedInProcessLogin)
         : evaluateLocal(input.local)
     case 'claustrum':
       if (input.manifest === 'absent') {
