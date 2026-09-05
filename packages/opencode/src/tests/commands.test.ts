@@ -30,6 +30,7 @@ import {
   type OAuthAccount,
   saveAccounts,
 } from '../core/accounts'
+import { CUSTODY_INERT_REASONS } from '../core/custody-state.ts'
 import { QuotaManager } from '../core/quota-manager'
 import { runResetCreditRedemption } from '../core/reset-credits'
 import { buildResetRedemptionDeps, createResetTargetResolver } from '../index'
@@ -4044,31 +4045,34 @@ describe('commands (claustrum mode)', () => {
     expect((await loadAccounts(configPath))?.accounts[0]?.enabled).toBe(false)
   })
 
-  test('enable keeps a claustrum row disabled when its binding is cold', async () => {
-    await saveAccounts(
-      {
-        version: 1,
-        accounts: [makeAccount('fallback-a', { enabled: false })],
-        claustrum: { mode: 'claustrum' },
-      },
-      configPath,
-    )
+  for (const reason of ['vault-cold', 'vault-reauth'] as const) {
+    test(`enable keeps a claustrum row disabled when its binding is ${reason}`, async () => {
+      expect(CUSTODY_INERT_REASONS).toContain(reason)
+      await saveAccounts(
+        {
+          version: 1,
+          accounts: [makeAccount('fallback-a', { enabled: false })],
+          claustrum: { mode: 'claustrum' },
+        },
+        configPath,
+      )
 
-    const payload = await buildDialogPayload(
-      'openai-account',
-      'enable fallback-a',
-      context({
-        withFallbackAccountLock: async (_id, action) => action(),
-        checkUsableCustodyBinding: async () => ({
-          ready: false as const,
-          reason: 'vault-cold' as const,
+      const payload = await buildDialogPayload(
+        'openai-account',
+        'enable fallback-a',
+        context({
+          withFallbackAccountLock: async (_id, action) => action(),
+          checkUsableCustodyBinding: async () => ({
+            ready: false as const,
+            reason,
+          }),
         }),
-      }),
-    )
+      )
 
-    expect((await loadAccounts(configPath))?.accounts[0]?.enabled).toBe(false)
-    expect(payload.text).toContain('vault-cold')
-  })
+      expect((await loadAccounts(configPath))?.accounts[0]?.enabled).toBe(false)
+      expect(payload.text).toContain(reason)
+    })
+  }
 
   test('add completion refuses persistence when claustrum begins before OAuth finishes', async () => {
     let resolveAccount!: (account: OAuthAccount) => void

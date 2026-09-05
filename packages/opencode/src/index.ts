@@ -2242,11 +2242,14 @@ export async function CodexAuthPlugin(
           if (!handle)
             return { ready: false as const, reason: 'no-handle' as const }
           const cache = custodyRuntime.getCache()
-          if (!cache || cache.isBlocked(handle)) {
+          if (!cache) {
             return { ready: false as const, reason: 'vault-cold' as const }
           }
           if (cache.isReauth(handle, custodyOptions?.now?.() ?? Date.now())) {
             return { ready: false as const, reason: 'vault-reauth' as const }
+          }
+          if (cache.isBlocked(handle)) {
+            return { ready: false as const, reason: 'vault-cold' as const }
           }
           try {
             const credential = await cache.get(handle, custodyMinTtlMs(storage))
