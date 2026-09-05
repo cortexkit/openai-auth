@@ -843,18 +843,13 @@ export async function reconcileFallbackCustody(
         recordVersion: served.recordVersion,
       }
     }
-    // Empty access prevents a sentinel from reaching bearer-token code that
-    // does not inspect refresh; the manifest entry remains operator-owned.
-    const sentinel = custodyTombstoneKey(provider)
     await deps.mutateAccounts((current) => {
       const target = current.accounts.find((a) => a.id === account.id)
       if (!target || !isOAuthAccount(target)) return current
       const next: OAuthAccount = {
         ...target,
         accountId: target.accountId ?? servedAccountId,
-        access: '',
-        refresh: sentinel,
-        expires: 0,
+        ...canonicalCustodyTombstone(provider),
       }
       return {
         ...current,
