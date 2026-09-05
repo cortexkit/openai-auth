@@ -619,7 +619,7 @@ export function openCommandDialog(
   }
 
   if (payload.command === 'openai-account') {
-    openAccountDialog(api, apply, sessionId)
+    openAccountDialog(api, apply, sessionId, payload)
     return
   }
 
@@ -676,10 +676,22 @@ export function buildAccountDialogRows(
   ]
 }
 
+export function accountDialogModeOption(mode: unknown) {
+  const claustrum = mode === 'claustrum'
+  return {
+    title: claustrum ? 'Leave Claustrum' : 'Enter Claustrum',
+    value: claustrum ? '__local__' : '__claustrum__',
+    description: claustrum
+      ? 'Require fresh local logins before local refresh resumes'
+      : 'Verify every enabled account before custody takes over',
+  }
+}
+
 function openAccountDialog(
   api: TuiPluginApi,
   apply: ApplyFn,
   sessionId?: string,
+  payload?: OpenDialogPayload,
 ) {
   const DialogConfirm = api.ui.DialogConfirm
 
@@ -691,6 +703,7 @@ function openAccountDialog(
         <DialogSelectInner
           title='OpenAI Accounts'
           options={[
+            accountDialogModeOption(payload?.knobs.claustrumMode),
             ...buildAccountDialogRows(state, sessionId),
             {
               title: 'Add account\u2026',
@@ -699,6 +712,18 @@ function openAccountDialog(
             },
           ]}
           onSelect={(option) => {
+            if (
+              option.value === '__claustrum__' ||
+              option.value === '__local__'
+            ) {
+              const args =
+                option.value === '__claustrum__' ? 'claustrum' : 'local'
+              void apply('openai-account', args).then((r) => {
+                api.ui.toast({ message: r.text })
+                showL1()
+              })
+              return
+            }
             if (option.value === '__add__') {
               showAddFlow()
               return

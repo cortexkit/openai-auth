@@ -6,6 +6,7 @@ import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import { flushForTest, setLogLevel } from '../logger.js'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
 import {
+  accountDialogModeOption,
   buildAccountDialogRows,
   buildCachekeepDialogOptions,
   formatQuotaWindows,
@@ -140,6 +141,14 @@ describe('command dialogs', () => {
       title: "Reset this session's pin",
       value: 'reset',
       description: expect.any(String),
+    })
+  })
+
+  test('account dialog projects the global custody mode into explicit enter and exit actions', () => {
+    expect(accountDialogModeOption('local')).toEqual({
+      title: 'Enter Claustrum',
+      value: '__claustrum__',
+      description: 'Verify every enabled account before custody takes over',
     })
   })
 

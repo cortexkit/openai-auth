@@ -3817,3 +3817,120 @@ describe('commands (add)', () => {
     expect(secondSessionCalls).toHaveLength(0)
   })
 })
+
+describe('commands (claustrum mode)', () => {
+  let tmpDir: string
+  let configPath: string
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'openai-auth-cmd-claustrum-'))
+    configPath = join(tmpDir, 'openai-auth.json')
+  })
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  function context(overrides: Partial<CommandContext> = {}): CommandContext {
+    return {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+      ...overrides,
+    }
+  }
+
+  test('claustrum enters through the readiness barrier and renders the cross-window warning', async () => {
+    const enterClaustrumMode = mock(async () => ({
+      status: 'completed' as const,
+      outcomes: { 'fallback-a': 'tombstoned' as const },
+    }))
+
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'claustrum',
+      context({ enterClaustrumMode }),
+    )
+
+    expect(enterClaustrumMode).toHaveBeenCalledTimes(1)
+    expect(payload.text).toContain(
+      'do not run a login in another OpenCode window during this transition',
+    )
+    expect(payload.text).toContain('fallback-a')
+  })
+
+  test('local exits through the shared mode lock and tells the operator how to finish the exit', async () => {
+    const leaveClaustrumMode = mock(async () => {})
+
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'local',
+      context({ leaveClaustrumMode }),
+    )
+
+    expect(leaveClaustrumMode).toHaveBeenCalledTimes(1)
+    expect(payload.text).toContain('/login openai')
+    expect(payload.text).toContain('ck auth')
+  })
+
+  test('enable re-reads claustrum mode under the account lock and binds a pending row before enabling it', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        accounts: [makeAccount('fallback-a', { enabled: false })],
+        claustrum: { mode: 'claustrum' },
+      },
+      configPath,
+    )
+    const withFallbackAccountLock = mock(async (_id, action) => action())
+    const checkUsableCustodyBinding = mock(async () => ({
+      ready: true as const,
+      accountId: 'served-account',
+    }))
+
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'enable fallback-a',
+      context({ withFallbackAccountLock, checkUsableCustodyBinding }),
+    )
+
+    expect(withFallbackAccountLock).toHaveBeenCalledWith(
+      'fallback-a',
+      expect.any(Function),
+    )
+    expect(checkUsableCustodyBinding).toHaveBeenCalledTimes(1)
+    expect((await loadAccounts(configPath))?.accounts[0]).toMatchObject({
+      id: 'fallback-a',
+      accountId: 'served-account',
+      enabled: true,
+    })
+    expect(payload.text).toContain('enabled')
+  })
+
+  test('enable keeps a claustrum row disabled when its binding is cold', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        accounts: [makeAccount('fallback-a', { enabled: false })],
+        claustrum: { mode: 'claustrum' },
+      },
+      configPath,
+    )
+
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'enable fallback-a',
+      context({
+        withFallbackAccountLock: async (_id, action) => action(),
+        checkUsableCustodyBinding: async () => ({
+          ready: false as const,
+          reason: 'vault-cold' as const,
+        }),
+      }),
+    )
+
+    expect((await loadAccounts(configPath))?.accounts[0]?.enabled).toBe(false)
+    expect(payload.text).toContain('vault-cold')
+  })
+})

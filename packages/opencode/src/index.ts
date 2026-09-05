@@ -27,8 +27,10 @@ import { getConfigDir, getConfigPath, getSettings } from './config'
 import {
   type AccountStorage,
   claustrumMode,
+  FALLBACK_REFRESH_LOCK_TTL_MS,
   type FallbackAccount,
   FallbackAccountManager,
+  fallbackRefreshLockName,
   getKillswitchThresholdsForAccount,
   isCostZeroingEnabled,
   isKillswitchEnabled,
@@ -42,6 +44,7 @@ import {
   type OAuthQuotaSnapshot,
   type RoutingMode,
   shouldFallbackStatus,
+  withAccountStoreTransaction,
 } from './core/accounts'
 import {
   BackgroundQuotaRefresh,
@@ -79,7 +82,13 @@ import {
   custodyManifestHandles,
   readCustodyManifest,
 } from './core/custody-manifest.ts'
-import { MAIN_REFRESH_LOCK_NAME } from './core/custody-transition.ts'
+import {
+  acquireCustodyTransitionMutex,
+  enterClaustrumMode,
+  leaveClaustrumMode,
+  MAIN_REFRESH_LOCK_NAME,
+  releaseCustodyLoginLeaseAfterHostWrite,
+} from './core/custody-transition.ts'
 import {
   base64UrlEncode,
   beginDeviceAuth,
@@ -460,6 +469,8 @@ interface CodexAuthPluginOptions {
     onRuntime?: (runtime: CustodyRuntime) => void
     /** Test seam: controls the runtime clock for expiry-bound scenarios. */
     now?: () => number
+    /** Test seam: controls bounded host-write observation without real timers. */
+    sleep?: (ms: number) => Promise<void>
   }
 }
 
@@ -1051,6 +1062,14 @@ export async function CodexAuthPlugin(
   // command.execute.before reads this; if null (auth not loaded yet),
   // the command is rejected with a message.
   let cmdCtx: CommandContext | null = null
+  const hostAuth = input.client.auth as unknown as {
+    all(): Promise<Record<string, unknown>>
+    get(input: { path: { id: string } }): Promise<unknown>
+    set(input: {
+      path: { id: string }
+      body: { type: 'oauth'; access: string; refresh: string; expires: number }
+    }): Promise<unknown>
+  }
   let activeRpcServer: RpcServerHandle | null = null
   let sidebarStateFileForEvents: string | undefined
   // Custody runtime — assigned inside the loader so dispose can close the
@@ -2162,11 +2181,152 @@ export async function CodexAuthPlugin(
         // Start the loopback RPC server so the TUI can drain notifications and
         // dispatch apply commands.
         // -------------------------------------------------------------------
+        const withFallbackAccountLock = async <T>(
+          accountId: string,
+          action: () => Promise<T>,
+        ): Promise<T> => {
+          const lock = await acquireRefreshFileLock({
+            name: fallbackRefreshLockName(accountId),
+            ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+            path: getConfigPath(),
+            renew: true,
+          })
+          if (!lock) throw new Error('Fallback account lock unavailable')
+          try {
+            return await action()
+          } finally {
+            await lock.release()
+          }
+        }
+        const checkUsableCustodyBinding = async (account: OAuthAccount) => {
+          const manifest = await readCustodyManifest()
+          if (!manifest.ok) {
+            return {
+              ready: false as const,
+              reason: 'manifest-unreadable' as const,
+            }
+          }
+          const handle = lookupManifestHandle(manifest, account.id)
+          if (!handle)
+            return { ready: false as const, reason: 'no-handle' as const }
+          const cache = custodyRuntime.getCache()
+          if (!cache || cache.isBlocked(handle)) {
+            return { ready: false as const, reason: 'vault-cold' as const }
+          }
+          if (cache.isReauth(handle, custodyOptions?.now?.() ?? Date.now())) {
+            return { ready: false as const, reason: 'vault-reauth' as const }
+          }
+          try {
+            const credential = await cache.get(handle, custodyMinTtlMs(storage))
+            const accountId = mainAccountIdFromServedCredential(
+              credential.payload.access,
+            )
+            if (
+              !accountId ||
+              (account.accountId && account.accountId !== accountId)
+            ) {
+              return {
+                ready: false as const,
+                reason: 'identity-mismatch' as const,
+              }
+            }
+            return { ready: true as const, accountId }
+          } catch {
+            return {
+              ready: false as const,
+              reason: cache.isReauth(
+                handle,
+                custodyOptions?.now?.() ?? Date.now(),
+              )
+                ? ('vault-reauth' as const)
+                : ('vault-cold' as const),
+            }
+          }
+        }
         cmdCtx = {
           accountStoragePath: getConfigPath(),
           quotaManager,
           loadAccounts,
           client: input.client as CommandContext['client'],
+          withFallbackAccountLock,
+          checkUsableCustodyBinding,
+          enterClaustrumMode: async () => {
+            const current = await loadAccounts(getConfigPath())
+            const accountIds = (current?.accounts ?? [])
+              .filter(
+                (account): account is OAuthAccount =>
+                  account.type === 'oauth' && account.enabled !== false,
+              )
+              .map((account) => account.id)
+            return enterClaustrumMode({
+              accountIds,
+              acquireLock: ({ name, renew }) =>
+                acquireRefreshFileLock({
+                  name,
+                  ttlMs:
+                    name === MAIN_REFRESH_LOCK_NAME
+                      ? MAIN_REFRESH_LOCK_TTL_MS
+                      : FALLBACK_REFRESH_LOCK_TTL_MS,
+                  path: getConfigPath(),
+                  renew,
+                }),
+              withStoreTransaction: (action) =>
+                withAccountStoreTransaction(action, getConfigPath()),
+              readManifest: readCustodyManifest,
+              preflight: async ({ accountId, handle }) => {
+                const cache = custodyRuntime.getCache()
+                if (!cache || cache.isBlocked(handle)) return 'vault-cold'
+                if (
+                  cache.isReauth(handle, custodyOptions?.now?.() ?? Date.now())
+                ) {
+                  return 'vault-reauth'
+                }
+                try {
+                  const credential = await cache.get(
+                    handle,
+                    custodyMinTtlMs(current),
+                  )
+                  const servedAccountId = mainAccountIdFromServedCredential(
+                    credential.payload.access,
+                  )
+                  if (
+                    !servedAccountId ||
+                    (accountId && accountId !== servedAccountId)
+                  ) {
+                    return 'identity-mismatch'
+                  }
+                  return 'ready'
+                } catch {
+                  return cache.isReauth(
+                    handle,
+                    custodyOptions?.now?.() ?? Date.now(),
+                  )
+                    ? 'vault-reauth'
+                    : 'vault-cold'
+                }
+              },
+              auth: {
+                all: () => hostAuth.all(),
+                get: (value) => hostAuth.get(value),
+                set: async (value) => {
+                  await hostAuth.set(value)
+                },
+              },
+              warn: (message) => custodyLogger.warn(message),
+            })
+          },
+          leaveClaustrumMode: () =>
+            leaveClaustrumMode({
+              acquireLock: ({ name, renew }) =>
+                acquireRefreshFileLock({
+                  name,
+                  ttlMs: MAIN_REFRESH_LOCK_TTL_MS,
+                  path: getConfigPath(),
+                  renew,
+                }),
+              withStoreTransaction: (action) =>
+                withAccountStoreTransaction(action, getConfigPath()),
+            }),
           resolveResetTarget: createResetTargetResolver({
             getAuth,
             refreshMainWithLease,
@@ -3779,35 +3939,60 @@ export async function CodexAuthPlugin(
           label: 'ChatGPT Pro/Plus (browser)',
           type: 'oauth',
           authorize: async () => {
-            const { redirectUri } = await startOAuthServer()
-            const pkce = await generatePKCE()
-            const state = base64UrlEncode(
-              crypto.getRandomValues(new Uint8Array(32)).buffer,
-            )
-            const authUrl = buildAuthorizeUrl(redirectUri, pkce, state)
+            const mutex = await acquireCustodyTransitionMutex()
+            try {
+              const { redirectUri } = await startOAuthServer()
+              const pkce = await generatePKCE()
+              const state = base64UrlEncode(
+                crypto.getRandomValues(new Uint8Array(32)).buffer,
+              )
+              const authUrl = buildAuthorizeUrl(redirectUri, pkce, state)
+              const callbackPromise = waitForOAuthCallback(pkce, state)
 
-            const callbackPromise = waitForOAuthCallback(pkce, state)
-
-            return {
-              url: authUrl,
-              instructions:
-                'Complete authorization in your browser. This window will close automatically.',
-              method: 'auto' as const,
-              callback: async () => {
-                try {
-                  const tokens = await callbackPromise
-                  const accountId = extractAccountId(tokens)
-                  return {
-                    type: 'success' as const,
-                    refresh: tokens.refresh_token,
-                    access: tokens.access_token,
-                    expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-                    accountId,
+              return {
+                url: authUrl,
+                instructions:
+                  'Complete authorization in your browser. This window will close automatically.',
+                method: 'auto' as const,
+                callback: async () => {
+                  try {
+                    const tokens = await callbackPromise
+                    const result = {
+                      type: 'success' as const,
+                      refresh: tokens.refresh_token,
+                      access: tokens.access_token,
+                      expires:
+                        (custodyOptions?.now ?? Date.now)() +
+                        (tokens.expires_in ?? 3600) * 1000,
+                      accountId: extractAccountId(tokens),
+                    }
+                    void releaseCustodyLoginLeaseAfterHostWrite({
+                      accessToken: tokens.access_token,
+                      getAuth: async () => {
+                        const auth = await hostAuth.get({
+                          path: { id: 'openai' },
+                        })
+                        return isRecord(auth) && typeof auth.access === 'string'
+                          ? { access: auth.access }
+                          : undefined
+                      },
+                      release: () => mutex.release(),
+                      warn: (message) => custodyLogger.warn(message),
+                      now: custodyOptions?.now ?? Date.now,
+                      sleep: custodyOptions?.sleep ?? ((ms) => Bun.sleep(ms)),
+                    }).catch(() => mutex.release())
+                    return result
+                  } catch (error) {
+                    await mutex.release()
+                    throw error
+                  } finally {
+                    flowCleanup(state)
                   }
-                } finally {
-                  flowCleanup(state)
-                }
-              },
+                },
+              }
+            } catch (error) {
+              await mutex.release()
+              throw error
             }
           },
         },
@@ -3815,26 +4000,50 @@ export async function CodexAuthPlugin(
           label: 'ChatGPT Pro/Plus (headless)',
           type: 'oauth',
           authorize: async () => {
-            const { deviceData, url, instructions } = await beginDeviceAuth()
-
-            return {
-              url,
-              instructions,
-              method: 'auto' as const,
-              async callback() {
-                try {
-                  const tokens = await completeDeviceAuth(deviceData)
-                  return {
-                    type: 'success' as const,
-                    refresh: tokens.refresh_token,
-                    access: tokens.access_token,
-                    expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-                    accountId: extractAccountId(tokens),
+            const mutex = await acquireCustodyTransitionMutex()
+            try {
+              const { deviceData, url, instructions } = await beginDeviceAuth()
+              return {
+                url,
+                instructions,
+                method: 'auto' as const,
+                async callback() {
+                  try {
+                    const tokens = await completeDeviceAuth(deviceData)
+                    const result = {
+                      type: 'success' as const,
+                      refresh: tokens.refresh_token,
+                      access: tokens.access_token,
+                      expires:
+                        (custodyOptions?.now ?? Date.now)() +
+                        (tokens.expires_in ?? 3600) * 1000,
+                      accountId: extractAccountId(tokens),
+                    }
+                    void releaseCustodyLoginLeaseAfterHostWrite({
+                      accessToken: tokens.access_token,
+                      getAuth: async () => {
+                        const auth = await hostAuth.get({
+                          path: { id: 'openai' },
+                        })
+                        return isRecord(auth) && typeof auth.access === 'string'
+                          ? { access: auth.access }
+                          : undefined
+                      },
+                      release: () => mutex.release(),
+                      warn: (message) => custodyLogger.warn(message),
+                      now: custodyOptions?.now ?? Date.now,
+                      sleep: custodyOptions?.sleep ?? ((ms) => Bun.sleep(ms)),
+                    }).catch(() => mutex.release())
+                    return result
+                  } catch {
+                    await mutex.release()
+                    return { type: 'failed' as const }
                   }
-                } catch {
-                  return { type: 'failed' as const }
-                }
-              },
+                },
+              }
+            } catch (error) {
+              await mutex.release()
+              throw error
             }
           },
         },

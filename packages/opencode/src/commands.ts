@@ -1,5 +1,6 @@
 import { getSettings } from './config'
 import {
+  claustrumMode,
   DEFAULT_KILLSWITCH_THRESHOLDS,
   type loadAccounts as defaultLoadAccounts,
   isSafeResetAccountKey,
@@ -11,6 +12,8 @@ import {
 } from './core/accounts'
 import type { FallbackAccount } from './core/accounts.ts'
 import type { CacheKeepManager, CacheKeepWindow } from './core/cachekeep'
+import type { CustodyInertReason } from './core/custody-state.ts'
+import type { TransitionResult } from './core/custody-transition.ts'
 import { beginAccountLogin, upsertAccount } from './core/oauth'
 import { whamUsageFn } from './core/provider'
 import type { QuotaManager } from './core/quota-manager'
@@ -109,6 +112,18 @@ export interface CommandContext {
   refreshResetTargetQuota?: (
     accountKey: string,
   ) => Promise<RefreshAllQuotaResult>
+  enterClaustrumMode?: () => Promise<TransitionResult>
+  leaveClaustrumMode?: () => Promise<void>
+  withFallbackAccountLock?: <T>(
+    accountId: string,
+    action: () => Promise<T>,
+  ) => Promise<T>
+  checkUsableCustodyBinding?: (
+    account: OAuthAccount,
+  ) => Promise<
+    | { ready: true; accountId: string }
+    | { ready: false; reason: CustodyInertReason }
+  >
 }
 
 export interface ResetTargetIdentity {
@@ -279,6 +294,136 @@ async function executeAccountCommand(
   }
   const accounts = storage.accounts ?? []
 
+  if (tokens[0] === 'claustrum') {
+    if (!ctx.enterClaustrumMode) {
+      return {
+        command: 'openai-account',
+        text: '## Claustrum Unavailable\n\nThe custody runtime is not ready. Try again after OpenAI auth finishes initializing.',
+        knobs: {
+          accounts: accounts.map(accountKnob),
+          claustrumMode: claustrumMode(storage),
+        },
+      }
+    }
+    const result = await ctx.enterClaustrumMode()
+    const rows = Object.entries(result.outcomes).map(
+      ([id, outcome]) => `- \`${id}\`: ${outcome}`,
+    )
+    return {
+      command: 'openai-account',
+      text: [
+        `## Claustrum ${result.status}`,
+        '',
+        'do not run a login in another OpenCode window during this transition',
+        '',
+        ...(rows.length > 0 ? rows : ['- No enabled OAuth accounts.']),
+        ...(result.reason ? ['', `Reason: ${result.reason}`] : []),
+      ].join('\n'),
+      knobs: {
+        accounts: accounts.map(accountKnob),
+        claustrumMode: claustrumMode(storage),
+      },
+    }
+  }
+
+  if (tokens[0] === 'local') {
+    if (!ctx.leaveClaustrumMode) {
+      return {
+        command: 'openai-account',
+        text: '## Local Mode Unavailable\n\nThe custody runtime is not ready. Try again after OpenAI auth finishes initializing.',
+        knobs: {
+          accounts: accounts.map(accountKnob),
+          claustrumMode: claustrumMode(storage),
+        },
+      }
+    }
+    await ctx.leaveClaustrumMode()
+    return {
+      command: 'openai-account',
+      text: '## Local Mode\n\nClaustrum mode is now local. Run a fresh `/login openai` for each account, then remove its binding with `ck auth` before it can refresh locally.',
+      knobs: { accounts: accounts.map(accountKnob), claustrumMode: 'local' },
+    }
+  }
+
+  if ((tokens[0] === 'enable' || tokens[0] === 'disable') && tokens[1]) {
+    const targetId = tokens[1]
+    const enabled = tokens[0] === 'enable'
+    const withLock =
+      ctx.withFallbackAccountLock ?? (async (_id, action) => action())
+    let refusal: CustodyInertReason | undefined
+    let found = false
+    const next = await withLock(targetId, async () => {
+      const current = await ctx.loadAccounts(ctx.accountStoragePath)
+      const currentAccount = current?.accounts.find(
+        (account): account is OAuthAccount =>
+          account.id === targetId && account.type === 'oauth',
+      )
+      if (!currentAccount)
+        return current ?? { version: 1 as const, accounts: [] }
+      if (enabled && claustrumMode(current) === 'claustrum') {
+        const binding = ctx.checkUsableCustodyBinding
+          ? await ctx.checkUsableCustodyBinding(currentAccount)
+          : {
+              ready: false as const,
+              reason: 'unbound-under-claustrum' as const,
+            }
+        if (!binding.ready) {
+          refusal = binding.reason
+          return current
+        }
+        return mutateAccounts((latest) => {
+          const account = latest.accounts.find(
+            (candidate): candidate is OAuthAccount =>
+              candidate.id === targetId && candidate.type === 'oauth',
+          )
+          if (!account) return latest
+          found = true
+          account.accountId = binding.accountId
+          account.enabled = true
+          return latest
+        }, ctx.accountStoragePath)
+      }
+      return mutateAccounts((latest) => {
+        const account = latest.accounts.find(
+          (candidate) => candidate.id === targetId,
+        )
+        if (!account) return latest
+        found = true
+        account.enabled = enabled
+        return latest
+      }, ctx.accountStoragePath)
+    })
+    const resolvedNext = next ?? { version: 1 as const, accounts: [] }
+    if (refusal) {
+      return {
+        command: 'openai-account',
+        text: `## Cannot Enable Account\n\n\`${targetId}\` remains disabled: ${refusal}. Resolve the custody binding, then try again.`,
+        knobs: {
+          accounts: resolvedNext.accounts.map(accountKnob),
+          claustrumMode: claustrumMode(resolvedNext),
+        },
+      }
+    }
+    if (!found) {
+      return {
+        command: 'openai-account',
+        text: `## Account Not Found\n\nNo account with id \`${targetId}\` exists.`,
+        knobs: {
+          accounts: resolvedNext.accounts.map(accountKnob),
+          claustrumMode: claustrumMode(resolvedNext),
+        },
+      }
+    }
+    return {
+      command: 'openai-account',
+      text: `## Account ${enabled ? 'Enabled' : 'Disabled'}\n\n\`${targetId}\` is ${enabled ? 'enabled' : 'disabled'}.`,
+      knobs: {
+        accounts: resolvedNext.accounts.map(accountKnob),
+        claustrumMode: claustrumMode(resolvedNext),
+      },
+    }
+  }
+
   if (tokens.length === 0) {
     // Show status
     const lines = ['## OpenAI Accounts', '']
@@ -299,12 +444,15 @@ async function executeAccountCommand(
     }
     lines.push('')
     lines.push(
-      'Commands: `/openai-account add [label]` | `/openai-account remove <id>`',
+      `Claustrum mode: \`${claustrumMode(storage)}\`\n\nCommands: \`/openai-account claustrum\` | \`/openai-account local\` | \`/openai-account add [label]\` | \`/openai-account enable <id>\` | \`/openai-account disable <id>\` | \`/openai-account remove <id>\``,
     )
     return {
       command: 'openai-account',
       text: lines.join('\n'),
-      knobs: { accounts: accounts.map(accountKnob) },
+      knobs: {
+        accounts: accounts.map(accountKnob),
+        claustrumMode: claustrumMode(storage),
+      },
     }
   }
 
@@ -416,25 +564,33 @@ async function executeAccountCommand(
     completion
       .then(async (account) => {
         let rejectedAsMain = false
-        // Route the add through mutateAccounts: read-modify-write under the lock
-        // so a concurrent add/remove cannot clobber this insertion, and so the
-        // main-identity check reads the freshest mainAccountId.
-        await mutateAccounts((current) => {
-          if (
-            account.accountId &&
-            current.mainAccountId &&
-            account.accountId === current.mainAccountId
-          ) {
-            rejectedAsMain = true
-            return current
+        let rejectedByMode = false
+        const withLock =
+          ctx.withFallbackAccountLock ?? (async (_id, action) => action())
+        await withLock(account.id, async () => {
+          const currentStorage = await ctx.loadAccounts(ctx.accountStoragePath)
+          if (claustrumMode(currentStorage ?? {}) === 'claustrum') {
+            rejectedByMode = true
+            return
           }
-          upsertAccount(current.accounts, account as OAuthAccount)
-          return current
-        }, ctx.accountStoragePath)
+          await mutateAccounts((current) => {
+            if (
+              account.accountId &&
+              current.mainAccountId &&
+              account.accountId === current.mainAccountId
+            ) {
+              rejectedAsMain = true
+              return current
+            }
+            upsertAccount(current.accounts, account as OAuthAccount)
+            return current
+          }, ctx.accountStoragePath)
+        })
 
-        if (rejectedAsMain) {
-          const msg =
-            'That account is already your main account — not added as a fallback.'
+        if (rejectedAsMain || rejectedByMode) {
+          const msg = rejectedByMode
+            ? 'That account cannot be added while Claustrum mode is active. Run `/openai-account local` first.'
+            : 'That account is already your main account — not added as a fallback.'
           // Log the internal account id, never the ChatGPT stable id (a sensitive
           // identity from the OAuth claims).
           log.warn('account add rejected (main identity)', {
@@ -491,8 +647,11 @@ async function executeAccountCommand(
 
   return {
     command: 'openai-account',
-    text: '## Account Commands\n\n- `/openai-account` — show accounts\n- `/openai-account add [label]` — add a new account\n- `/openai-account remove <id>` — remove\n- `/openai-account order <a> <b>` — swap fallback positions\n\nRouting modes are `main-first`, `fallback-first`, and `sticky-balanced`. `/openai-routing reset` clears the current session pin.',
-    knobs: { accounts: accounts.map(accountKnob) },
+    text: '## Account Commands\n\n- `/openai-account claustrum` — enter Claustrum mode\n- `/openai-account local` — leave Claustrum mode\n- `/openai-account add [label]` — add a new account\n- `/openai-account enable <id>` — enable a fallback\n- `/openai-account disable <id>` — disable a fallback\n- `/openai-account remove <id>` — remove\n- `/openai-account order <a> <b>` — swap fallback positions\n\nRouting modes are `main-first`, `fallback-first`, and `sticky-balanced`. `/openai-routing reset` clears the current session pin.',
+    knobs: {
+      accounts: accounts.map(accountKnob),
+      claustrumMode: claustrumMode(storage),
+    },
   }
 }
 
