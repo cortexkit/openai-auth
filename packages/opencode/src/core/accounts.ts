@@ -1029,7 +1029,7 @@ function mergeStorageForSave(
   }
 }
 
-async function acquireSaveAccountsLock(path: string) {
+async function acquireSaveAccountsLock(path: string, renew = false) {
   const startedAt = Date.now()
   const deadline = startedAt + SAVE_ACCOUNTS_LOCK_WAIT_MS
   let attempts = 0
@@ -1039,6 +1039,7 @@ async function acquireSaveAccountsLock(path: string) {
       name: 'save',
       ttlMs: SAVE_ACCOUNTS_LOCK_TTL_MS,
       path,
+      renew,
     })
     if (lock) return lock
 
@@ -1085,40 +1086,128 @@ export function claustrumMode(
   return storage?.claustrum?.mode === 'claustrum' ? 'claustrum' : 'local'
 }
 
-export async function writeClaustrumModeAndTransition(
-  path: string,
-  mode: ClaustrumMode,
-  transition?: CustodyTransitionState,
-): Promise<void> {
+export type AccountStoreTransaction = {
+  read(): Promise<AccountStorage>
+  write(storage: AccountStorage): Promise<void>
+  writeMode(
+    mode: ClaustrumMode,
+    transition?: CustodyTransitionState,
+  ): Promise<void>
+}
+
+export async function withAccountStoreTransaction<T>(
+  action: (transaction: AccountStoreTransaction) => Promise<T>,
+  path = getAccountStoragePath(),
+): Promise<T> {
   const statePath = getAccountStatePath(path)
-  const lock = await acquireSaveAccountsLock(path)
+  const lock = await acquireSaveAccountsLock(path, true)
   try {
-    const stateLock = await acquireSaveAccountsLock(statePath)
+    const stateLock = await acquireSaveAccountsLock(statePath, true)
     try {
       const configJson = await readJsonIfPresent(path)
-      const existing = isRecord(configJson.value)
-        ? configJson.value
-        : { version: 1, accounts: [] }
-      const existingClaustrum = isRecord(existing.claustrum)
-        ? existing.claustrum
-        : {}
-      const rowHistory = Array.isArray(existingClaustrum.rowHistory)
-        ? existingClaustrum.rowHistory.filter(
-            (entry): entry is string => typeof entry === 'string',
-          )
-        : undefined
-      const claustrum = {
-        mode,
-        ...(mode === 'claustrum' && transition ? { transition } : {}),
-        ...(rowHistory ? { rowHistory } : {}),
+      const stateJson = await readJsonIfPresent(statePath)
+      let current =
+        (configJson.exists
+          ? normalizeStorage(
+              mergeConfigAndState(configJson.value, stateJson.value),
+            )
+          : null) ?? emptyAccountStorage()
+      const currentAccountIds = new Set(
+        current.accounts.map((account) => account.id),
+      )
+
+      const write = async (next: AccountStorage) => {
+        const baseConfig = configFromStorage(next)
+        const preserved = buildPreservedAdditions(
+          configJson.value,
+          currentAccountIds,
+          new Set(),
+        )
+        const writtenIds = new Set(
+          (Array.isArray(baseConfig.accounts) ? baseConfig.accounts : [])
+            .map((entry) =>
+              isRecord(entry) && typeof entry.id === 'string'
+                ? entry.id.trim()
+                : '',
+            )
+            .filter(Boolean),
+        )
+        const additions = preserved.filter(
+          (entry) =>
+            isRecord(entry) &&
+            typeof entry.id === 'string' &&
+            !writtenIds.has(entry.id.trim()),
+        )
+        const existing = isRecord(configJson.value) ? configJson.value : {}
+        const nextConfig = {
+          ...existing,
+          ...baseConfig,
+          accounts: [
+            ...(Array.isArray(baseConfig.accounts) ? baseConfig.accounts : []),
+            ...additions,
+          ],
+        }
+        await writeJsonAtomic(path, nextConfig)
+        await writeJsonAtomic(statePath, stateFromStorage(next))
+        configJson.value = nextConfig
+        current = structuredClone(next)
       }
-      await writeJsonAtomic(path, { ...existing, claustrum })
+
+      const writeMode = async (
+        mode: ClaustrumMode,
+        transition?: CustodyTransitionState,
+      ) => {
+        const existing = isRecord(configJson.value)
+          ? configJson.value
+          : { version: 1, accounts: [] }
+        const existingClaustrum = isRecord(existing.claustrum)
+          ? existing.claustrum
+          : {}
+        const rowHistory = Array.isArray(existingClaustrum.rowHistory)
+          ? existingClaustrum.rowHistory.filter(
+              (entry): entry is string => typeof entry === 'string',
+            )
+          : undefined
+        const claustrum = {
+          mode,
+          ...(mode === 'claustrum' && transition ? { transition } : {}),
+          ...(rowHistory ? { rowHistory } : {}),
+        }
+        const nextConfig = { ...existing, claustrum }
+        await writeJsonAtomic(path, nextConfig)
+        configJson.value = nextConfig
+        current = {
+          ...current,
+          claustrum: {
+            mode,
+            ...(mode === 'claustrum' && transition ? { transition } : {}),
+            ...(rowHistory ? { rowHistory } : {}),
+          },
+        }
+      }
+
+      return await action({
+        read: async () => structuredClone(current),
+        write,
+        writeMode,
+      })
     } finally {
       await stateLock.release()
     }
   } finally {
     await lock.release()
   }
+}
+
+export async function writeClaustrumModeAndTransition(
+  path: string,
+  mode: ClaustrumMode,
+  transition?: CustodyTransitionState,
+): Promise<void> {
+  await withAccountStoreTransaction(
+    (transaction) => transaction.writeMode(mode, transition),
+    path,
+  )
 }
 
 function stateFromStorage(storage: AccountStorage): AccountRuntimeState {

@@ -1,5 +1,14 @@
 import { createHash } from 'node:crypto'
-import type { AccountStorage } from './accounts.ts'
+import {
+  type AccountStorage,
+  fallbackRefreshLockName,
+  type OAuthAccount,
+} from './accounts.ts'
+import { custodyTombstoneKey, tombstoned } from './custody.ts'
+import {
+  type CustodyManifestReadResult,
+  custodyManifestHandles,
+} from './custody-manifest.ts'
 
 export type ClaustrumMode = 'local' | 'claustrum'
 
@@ -9,6 +18,437 @@ export type CustodyTransitionState = {
   fingerprints: {
     main?: string
     fallbacks: Record<string, string>
+  }
+}
+
+export const MODE_LOCK_NAME = 'claustrum-mode'
+export const MAIN_REFRESH_LOCK_NAME = 'main-refresh'
+
+export type TransitionOutcome =
+  | 'ready'
+  | 'tombstoned'
+  | 'mismatch'
+  | 'vault-cold'
+  | 'vault-reauth'
+  | 'identity-mismatch'
+  | 'no-handle'
+  | 'torn-read-deferred'
+  | `aborted:${string}`
+
+export type TransitionResult = {
+  status: 'completed' | 'incomplete' | 'aborted'
+  outcomes: Record<string, TransitionOutcome>
+  reason?: string
+}
+
+type Release = { release(): Promise<void> }
+
+export type AccountStoreTransaction = {
+  read(): Promise<AccountStorage>
+  write(storage: AccountStorage): Promise<void>
+  writeMode(
+    mode: ClaustrumMode,
+    transition?: CustodyTransitionState,
+  ): Promise<void>
+}
+
+export type EnterClaustrumModeDeps = {
+  accountIds: readonly string[]
+  acquireLock(options: {
+    name: string
+    renew: boolean
+  }): Promise<Release | null>
+  withStoreTransaction(
+    action: (transaction: AccountStoreTransaction) => Promise<TransitionResult>,
+  ): Promise<TransitionResult>
+  readManifest(): Promise<CustodyManifestReadResult>
+  preflight(input: {
+    id: string
+    accountId?: string
+    handle: string
+  }): Promise<
+    Exclude<
+      TransitionOutcome,
+      `aborted:${string}` | 'tombstoned' | 'mismatch' | 'torn-read-deferred'
+    >
+  >
+  auth: {
+    all(): Promise<Record<string, unknown>>
+    get(input: { path: { id: string } }): Promise<unknown>
+    set(input: {
+      path: { id: string }
+      body: { type: 'oauth'; access: string; refresh: string; expires: number }
+    }): Promise<void>
+  }
+  onStep?(step: string): void | Promise<void>
+  warn?(message: string): void
+}
+
+let custodyMutexTail = Promise.resolve()
+
+export async function acquireCustodyTransitionMutex(): Promise<Release> {
+  let release!: () => void
+  const next = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const previous = custodyMutexTail
+  custodyMutexTail = previous.then(() => next)
+  await previous
+  let released = false
+  return {
+    async release() {
+      if (released) return
+      released = true
+      release()
+    },
+  }
+}
+
+type Participant = {
+  id: string
+  accountId?: string
+  kind: 'main' | 'fallback'
+}
+
+function asOauthSlot(
+  value: unknown,
+): { access: string; refresh: string; expires?: number } | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as Record<string, unknown>
+  if (candidate.type !== 'oauth') return undefined
+  if (
+    typeof candidate.access !== 'string' ||
+    typeof candidate.refresh !== 'string'
+  ) {
+    return undefined
+  }
+  return {
+    access: candidate.access,
+    refresh: candidate.refresh,
+    ...(typeof candidate.expires === 'number'
+      ? { expires: candidate.expires }
+      : {}),
+  }
+}
+
+function enabledOauthAccounts(storage: AccountStorage): OAuthAccount[] {
+  return storage.accounts.filter(
+    (account): account is OAuthAccount =>
+      account.type === 'oauth' && account.enabled !== false,
+  )
+}
+
+function compareAccountIds(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
+function transitionParticipants(
+  accountIds: readonly string[],
+  storage?: AccountStorage,
+): Participant[] {
+  return [
+    { id: 'main', accountId: storage?.mainAccountId, kind: 'main' as const },
+    ...accountIds.map((id) => ({
+      id,
+      accountId: storage?.accounts.find((account) => account.id === id)
+        ?.accountId,
+      kind: 'fallback' as const,
+    })),
+  ].sort((left, right) => compareAccountIds(left.id, right.id))
+}
+
+function lockName(participant: Participant): string {
+  return participant.kind === 'main'
+    ? MAIN_REFRESH_LOCK_NAME
+    : fallbackRefreshLockName(participant.id)
+}
+
+function fallbackFingerprint(account: OAuthAccount): string | undefined {
+  return account.access
+    ? custodySlotFingerprint(account.access, account.refresh)
+    : undefined
+}
+
+function incomplete(outcomes: Record<string, TransitionOutcome>): boolean {
+  return Object.values(outcomes).some(
+    (outcome) =>
+      outcome === 'mismatch' ||
+      outcome === 'torn-read-deferred' ||
+      outcome.startsWith('aborted:'),
+  )
+}
+
+export async function enterClaustrumMode(
+  deps: EnterClaustrumModeDeps,
+): Promise<TransitionResult> {
+  const mutex = await acquireCustodyTransitionMutex()
+  const locks: Release[] = []
+  const outcomes: Record<string, TransitionOutcome> = {}
+  let warnedTornRead = false
+
+  const step = async (name: string) => {
+    await deps.onStep?.(name)
+  }
+
+  try {
+    await step('mutex-acquired')
+    if (
+      deps.accountIds.includes('main') ||
+      new Set(deps.accountIds).size !== deps.accountIds.length
+    ) {
+      return { status: 'aborted', outcomes, reason: 'duplicate-account-lock' }
+    }
+    const modeLock = await deps.acquireLock({
+      name: MODE_LOCK_NAME,
+      renew: true,
+    })
+    if (!modeLock)
+      return { status: 'aborted', outcomes, reason: 'mode-lock-unavailable' }
+    locks.push(modeLock)
+
+    const participants = transitionParticipants(deps.accountIds)
+    for (const participant of participants) {
+      const accountLock = await deps.acquireLock({
+        name: lockName(participant),
+        renew: true,
+      })
+      if (!accountLock) {
+        return {
+          status: 'aborted',
+          outcomes,
+          reason: `account-lock-unavailable:${participant.id}`,
+        }
+      }
+      locks.push(accountLock)
+    }
+
+    return await deps.withStoreTransaction(async (transaction) => {
+      const initial = await transaction.read()
+      const currentParticipants = transitionParticipants(
+        deps.accountIds,
+        initial,
+      )
+      const currentAccountIds = enabledOauthAccounts(initial)
+        .map((account) => account.id)
+        .sort(compareAccountIds)
+      const lockedAccountIds = [...deps.accountIds].sort(compareAccountIds)
+      if (
+        currentAccountIds.length !== lockedAccountIds.length ||
+        currentAccountIds.some((id, index) => id !== lockedAccountIds[index])
+      ) {
+        return { status: 'aborted', outcomes, reason: 'account-roster-changed' }
+      }
+      const manifest = await deps.readManifest()
+      if (!manifest.ok) {
+        return {
+          status: 'aborted',
+          outcomes,
+          reason: `manifest-${manifest.reason}`,
+        }
+      }
+      const handles = custodyManifestHandles(manifest)
+      const fingerprints: CustodyTransitionState['fingerprints'] = {
+        fallbacks: {},
+      }
+      const mainSlot = asOauthSlot(
+        await deps.auth.get({ path: { id: 'openai' } }),
+      )
+      if (mainSlot) {
+        fingerprints.main = custodySlotFingerprint(
+          mainSlot.access,
+          mainSlot.refresh,
+        )
+      }
+      for (const account of enabledOauthAccounts(initial)) {
+        const fingerprint = fallbackFingerprint(account)
+        if (fingerprint) fingerprints.fallbacks[account.id] = fingerprint
+      }
+      const capturedGeneration = accountStoreGeneration(initial)
+      await step('captured')
+
+      for (const participant of currentParticipants) {
+        const handle = handles.get(participant.id)
+        if (!handle) {
+          outcomes[participant.id] = 'no-handle'
+          continue
+        }
+        const outcome = await deps.preflight({
+          id: participant.id,
+          accountId: participant.accountId,
+          handle,
+        })
+        outcomes[participant.id] = outcome
+      }
+      await step('preflight')
+      if (Object.values(outcomes).some((outcome) => outcome !== 'ready')) {
+        return { status: 'aborted', outcomes, reason: 'preflight-failed' }
+      }
+
+      const revalidatedManifest = await deps.readManifest()
+      const revalidated = await transaction.read()
+      if (
+        !revalidatedManifest.ok ||
+        revalidatedManifest.revision !== manifest.revision
+      ) {
+        return {
+          status: 'aborted',
+          outcomes,
+          reason: 'manifest-revision-changed',
+        }
+      }
+      if (accountStoreGeneration(revalidated) !== capturedGeneration) {
+        return {
+          status: 'aborted',
+          outcomes,
+          reason: 'store-generation-changed',
+        }
+      }
+      await step('revalidated')
+
+      const transition: CustodyTransitionState = {
+        manifestRevision: manifest.revision,
+        storeGeneration: capturedGeneration,
+        fingerprints,
+      }
+      await transaction.writeMode('claustrum', transition)
+      await step('mode-written')
+
+      let materialWriteFailed = false
+      for (const participant of participants) {
+        if (participant.kind === 'main') continue
+        const current = await transaction.read()
+        const account = current.accounts.find(
+          (candidate): candidate is OAuthAccount =>
+            candidate.id === participant.id && candidate.type === 'oauth',
+        )
+        const expected = fingerprints.fallbacks[participant.id]
+        if (
+          !account ||
+          !expected ||
+          fallbackFingerprint(account) !== expected
+        ) {
+          outcomes[participant.id] = 'mismatch'
+          continue
+        }
+        if (tombstoned(account, 'openai')) {
+          outcomes[participant.id] = 'tombstoned'
+          continue
+        }
+        const next = structuredClone(current)
+        const nextAccount = next.accounts.find(
+          (candidate): candidate is OAuthAccount =>
+            candidate.id === participant.id && candidate.type === 'oauth',
+        )
+        if (!nextAccount) {
+          outcomes[participant.id] = 'mismatch'
+          continue
+        }
+        nextAccount.access = custodyTombstoneKey('openai')
+        nextAccount.refresh = custodyTombstoneKey('openai')
+        nextAccount.expires = 0
+        try {
+          await transaction.write(next)
+          const written = (await transaction.read()).accounts.find(
+            (candidate): candidate is OAuthAccount =>
+              candidate.id === participant.id && candidate.type === 'oauth',
+          )
+          outcomes[participant.id] =
+            written && tombstoned(written, 'openai')
+              ? 'tombstoned'
+              : 'aborted:post-write-readback'
+        } catch {
+          outcomes[participant.id] = 'aborted:write-failed'
+          materialWriteFailed = true
+          break
+        }
+      }
+
+      if (materialWriteFailed) {
+        await step('material-written')
+        return { status: 'incomplete', outcomes }
+      }
+
+      const currentMain = asOauthSlot(
+        await deps.auth.get({ path: { id: 'openai' } }),
+      )
+      if (!fingerprints.main || !currentMain) {
+        outcomes.main = 'mismatch'
+      } else if (
+        custodySlotFingerprint(currentMain.access, currentMain.refresh) !==
+        fingerprints.main
+      ) {
+        outcomes.main = 'mismatch'
+      } else {
+        const all = await deps.auth.all()
+        if (Object.keys(all).length === 0) {
+          if (!warnedTornRead) {
+            warnedTornRead = true
+            deps.warn?.(
+              'host auth store read empty; refusing to write — possible torn read',
+            )
+          }
+          outcomes.main = 'torn-read-deferred'
+        } else {
+          try {
+            await deps.auth.set({
+              path: { id: 'openai' },
+              body: {
+                type: 'oauth',
+                access: custodyTombstoneKey('openai'),
+                refresh: custodyTombstoneKey('openai'),
+                expires: 0,
+              },
+            })
+            const after = asOauthSlot(
+              await deps.auth.get({ path: { id: 'openai' } }),
+            )
+            outcomes.main =
+              after &&
+              tombstoned(
+                {
+                  id: 'main',
+                  type: 'oauth',
+                  access: after.access,
+                  refresh: after.refresh,
+                  expires: after.expires ?? 0,
+                },
+                'openai',
+              )
+                ? 'tombstoned'
+                : 'mismatch'
+          } catch {
+            outcomes.main = 'aborted:write-failed'
+          }
+        }
+      }
+      await step('material-written')
+      if (!incomplete(outcomes)) {
+        await transaction.writeMode('claustrum')
+      }
+      return {
+        status: incomplete(outcomes) ? 'incomplete' : 'completed',
+        outcomes,
+      }
+    })
+  } finally {
+    for (const lock of locks.reverse()) await lock.release()
+    await step('mutex-released')
+    await mutex.release()
+  }
+}
+
+export async function leaveClaustrumMode(
+  deps: Pick<EnterClaustrumModeDeps, 'acquireLock' | 'withStoreTransaction'>,
+): Promise<void> {
+  const modeLock = await deps.acquireLock({ name: MODE_LOCK_NAME, renew: true })
+  if (!modeLock) throw new Error('Claustrum mode lock unavailable')
+  try {
+    await deps.withStoreTransaction(async (transaction) => {
+      await transaction.writeMode('local')
+      return { status: 'completed', outcomes: {} }
+    })
+  } finally {
+    await modeLock.release()
   }
 }
 
