@@ -123,7 +123,7 @@ export async function releaseCustodyLoginLeaseAfterHostWrite(input: {
     } catch {
       // A transient host read must not strand the process-local exclusion lease.
     }
-    await input.sleep(Math.min(100, deadline - input.now()))
+    await input.sleep(Math.max(0, Math.min(100, deadline - input.now())))
   }
   input.warn('host write not observed within 5s; lease released')
   await input.release()
