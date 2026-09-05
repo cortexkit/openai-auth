@@ -17,7 +17,7 @@ import type {
   OAuthAccount,
 } from '../core/accounts.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
-import { claustrumConfig } from './custody-fixtures.ts'
+import { claustrumConfig, emptyManifest } from './custody-fixtures.ts'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_LOG_FILE,
@@ -27,6 +27,7 @@ import {
 let dir: string
 let cfgPath: string
 let statePath: string
+const localCustody = { readManifest: async () => emptyManifest() }
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'oai-acct-'))
@@ -44,6 +45,15 @@ afterEach(() => {
   try {
     rmSync(dir, { recursive: true, force: true })
   } catch {}
+})
+
+describe('AccountManager custody injection', () => {
+  it('does not allow manager construction without custody injection', () => {
+    const omitted = { configPath: cfgPath }
+    // @ts-expect-error Required because an omitted policy reader silently re-enables local refresh.
+    const rejected: AccountManagerOptions = omitted
+    void rejected
+  })
 })
 
 function oauthAccount(
@@ -93,7 +103,10 @@ describe('request-path bookkeeping never fails the caller', () => {
     )
 
     breakStateWrites()
-    const manager = new FallbackAccountManager({ configPath: cfgPath })
+    const manager = new FallbackAccountManager({
+      custody: localCustody,
+      configPath: cfgPath,
+    })
 
     // Must resolve, not reject: the caller has a provider response to return.
     expect(await manager.markUsed(account).then(() => 'resolved')).toBe(
@@ -121,6 +134,7 @@ describe('request-path bookkeeping never fails the caller', () => {
 
     breakStateWrites()
     const manager = new FallbackAccountManager({
+      custody: localCustody,
       configPath: cfgPath,
       refreshFn: async () => ({
         access: 'rotated-access',
@@ -880,6 +894,7 @@ describe('removed fallback refresh guard', () => {
       account.id,
       cfgPath,
       {
+        custody: localCustody,
         configPath: cfgPath,
         now: () => now,
         refreshFn: async () => {
@@ -949,6 +964,7 @@ describe('removed fallback refresh guard', () => {
         }) => void)
       | undefined
     const manager = new FallbackAccountManager({
+      custody: localCustody,
       configPath: cfgPath,
       now: () => now,
       refreshFn: async () => {
@@ -1026,6 +1042,7 @@ describe('removed fallback refresh guard', () => {
       account.id,
       cfgPath,
       {
+        custody: localCustody,
         configPath: cfgPath,
         now: () => now,
         refreshFn: async () => {
