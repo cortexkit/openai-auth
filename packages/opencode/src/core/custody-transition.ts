@@ -406,9 +406,11 @@ export async function enterClaustrumMode(
       }
     })
   } finally {
-    for (const lock of locks.reverse()) await lock.release()
-    await step('mutex-released')
+    for (const lock of locks.reverse()) {
+      await lock.release().catch(() => {})
+    }
     await mutex.release()
+    await step('mutex-released').catch(() => {})
   }
 }
 
