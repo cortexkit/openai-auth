@@ -723,11 +723,7 @@ export type CompleteEnrollmentDeps = {
   now?: () => number
 }
 
-/**
- * Outcome of a single sweep pass. Surfaced only for tests and the boot/tick
- * orchestration; the production caller (`runEnrollCompletionSweep`) folds the
- * reason into the process-local enroll-pending store and the sidebar projection.
- */
+/** Outcome of one locked fallback reconciliation attempt. */
 export type CompleteEnrollmentOutcome =
   | { kind: 'skipped'; reason: 'notEnrolling' }
   | { kind: 'skipped'; reason: 'lockBusy' }
@@ -739,16 +735,8 @@ export type CompleteEnrollmentOutcome =
     }
 
 /**
- * Per-account completion step (spec §7.3). Re-reads enrollment state from disk,
- * takes the account's refresh lock without joining a wait, force-fetches one
- * vault credential, verifies the served claim matches the local account id,
- * and tombstonese on success. The first failure latches via the enroll-pending
- * store; later failures do not overwrite. The sweep never writes or removes a
- * manifest entry — that is an operator act.
- *
- * Idempotent: a second sweep on an already-tombstoned account no-ops at the
- * `notEnrolling` guard. A concurrent enroll in another process lands the same
- * sentinel under its own save-lock; the tombstone is the join point.
+ * Re-reads the row under its refresh lock, binds the first served identity, and
+ * tombstones real material only after the served claim matches an existing bind.
  */
 export async function reconcileFallbackCustody(
   account: OAuthAccount,

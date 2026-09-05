@@ -358,14 +358,57 @@ describe('orphan binding discovery', () => {
     const { transport } = makeTransport(() => {
       throw new Error('binding stays pending until a credential serves')
     })
-    const first = __createCustodyRuntimeForTest(
-      makeOptions({ storage, transport, detection: 'available' }),
-    )
-    const second = __createCustodyRuntimeForTest(
-      makeOptions({ storage, transport, detection: 'available' }),
-    )
+    let mutations = 0
+    let lockAcquisitions = 0
+    let releaseFirst = () => {}
+    let markFirstAcquired = () => {}
+    const firstAcquired = new Promise<void>((resolve) => {
+      markFirstAcquired = resolve
+    })
+    const holdFirst = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    const joinSawRow: boolean[] = []
+    const shared = {
+      storage,
+      transport,
+      detection: 'available' as const,
+      acquireRefreshFileLock,
+      mutateAccounts: async (...args: Parameters<typeof mutateAccounts>) => {
+        mutations += 1
+        return mutateAccounts(...args)
+      },
+      onReconcileStep: async (
+        step: 'discovery-lock-acquired' | 'enabled-manifest-join',
+      ) => {
+        if (step === 'discovery-lock-acquired') {
+          lockAcquisitions += 1
+          if (lockAcquisitions === 1) {
+            markFirstAcquired()
+            await holdFirst
+          }
+          return
+        }
+        joinSawRow.push(
+          (await loadAccounts(configPath))?.accounts.some(
+            (account) => account.id === 'new-account',
+          ) ?? false,
+        )
+      },
+    }
+    const first = __createCustodyRuntimeForTest(makeOptions(shared))
+    const second = __createCustodyRuntimeForTest(makeOptions(shared))
 
-    await Promise.all([first.boot(), second.boot()])
+    const firstBoot = first.boot()
+    await firstAcquired
+    let secondSettled = false
+    const secondBoot = second.boot().then(() => {
+      secondSettled = true
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(secondSettled).toBe(false)
+    releaseFirst()
+    await Promise.all([firstBoot, secondBoot])
 
     const after = await loadAccounts(configPath)
     expect(after?.accounts).toEqual([
@@ -379,6 +422,9 @@ describe('orphan binding discovery', () => {
       },
     ])
     expect(after?.claustrum?.rowHistory).toEqual(['new-account'])
+    expect(mutations).toBe(1)
+    expect(lockAcquisitions).toBe(2)
+    expect(joinSawRow).toEqual([true, true])
     first.dispose()
     second.dispose()
   })
@@ -452,6 +498,45 @@ describe('orphan binding discovery', () => {
 })
 
 describe('manifest revision reconciliation', () => {
+  it('does not rediscover a removed row when the manifest revision is unchanged', async () => {
+    const storage = liveStorage([], {
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    })
+    await writeStorageWithManifest(storage, enrollmentManifest('unchanged'))
+    const { transport } = makeTransport(() => {
+      throw new Error('vault unavailable')
+    })
+    let mutations = 0
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({
+        storage,
+        transport,
+        detection: 'available',
+        mutateAccounts: async (...args: Parameters<typeof mutateAccounts>) => {
+          mutations += 1
+          return mutateAccounts(...args)
+        },
+      }),
+    )
+    await runtime.boot()
+    await mutateAccounts(
+      (current) => ({
+        ...current,
+        accounts: current.accounts.filter(
+          (account) => account.id !== 'unchanged',
+        ),
+      }),
+      configPath,
+    )
+    mutations = 0
+
+    await runtime.runTick()
+
+    expect(mutations).toBe(0)
+    expect((await loadAccounts(configPath))?.accounts).toEqual([])
+    runtime.dispose()
+  })
+
   it('discovers a new manifest row on the first tick after its revision changes', async () => {
     const storage = liveStorage([], {
       claustrum: claustrumConfig({ mode: 'claustrum' }),
@@ -507,6 +592,50 @@ describe('manifest revision reconciliation', () => {
       state: 'inert',
       reason: 'manifest-unreadable',
     })
+    runtime.dispose()
+  })
+
+  it('refuses an unreadable manifest on tick before writes or credential inspection', async () => {
+    const account = makeSentinelAccount({ id: 'tick-unreadable' })
+    const storage = liveStorage([account], {
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    })
+    await writeStorageWithManifest(storage, enrollmentManifest(account.id))
+    const { transport, captured } = makeTransport(() => {
+      throw new Error('must not inspect vault credentials')
+    })
+    let mutations = 0
+    let joins = 0
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({
+        storage,
+        transport,
+        detection: 'available',
+        mutateAccounts: async (...args: Parameters<typeof mutateAccounts>) => {
+          mutations += 1
+          return mutateAccounts(...args)
+        },
+        onReconcileStep: (step) => {
+          if (step === 'enabled-manifest-join') joins += 1
+        },
+      }),
+    )
+    await runtime.boot()
+    captured.getCalls.length = 0
+    mutations = 0
+    joins = 0
+    writeFileSync(manifestPath, '{not-json')
+
+    await runtime.runTick()
+
+    expect(mutations).toBe(0)
+    expect(captured.getCalls).toEqual([])
+    expect(joins).toBe(0)
+    expect(runtime.getCustodyProjection(account, Date.now())).toEqual({
+      state: 'inert',
+      reason: 'manifest-unreadable',
+    })
+    expect((await loadAccounts(configPath))?.accounts[0]).toEqual(account)
     runtime.dispose()
   })
 })
