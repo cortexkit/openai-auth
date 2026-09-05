@@ -687,6 +687,52 @@ export function accountDialogModeOption(mode: unknown) {
   }
 }
 
+export function buildFallbackAccountOptions(input: {
+  id: string
+  label?: string
+  enabled: boolean
+  index: number
+  count: number
+}) {
+  const name = input.label ?? input.id
+  const options: Array<{
+    title: string
+    value: string
+    description: string
+  }> = [
+    {
+      title: input.enabled ? 'Disable' : 'Enable',
+      value: input.enabled ? 'disable' : 'enable',
+      description: `${input.enabled ? 'Disable' : 'Enable'} ${name}`,
+    },
+    {
+      title: 'Remove',
+      value: 'remove',
+      description: `Remove ${name}`,
+    },
+  ]
+  if (input.index > 0) {
+    options.push({
+      title: 'Move up',
+      value: 'move_up',
+      description: 'Swap with the preceding fallback',
+    })
+  }
+  if (input.index < input.count - 1) {
+    options.push({
+      title: 'Move down',
+      value: 'move_down',
+      description: 'Swap with the following fallback',
+    })
+  }
+  options.push({
+    title: 'Back',
+    value: 'back',
+    description: 'Return to account list',
+  })
+  return options
+}
+
 function openAccountDialog(
   api: TuiPluginApi,
   apply: ApplyFn,
@@ -694,6 +740,7 @@ function openAccountDialog(
   payload?: OpenDialogPayload,
 ) {
   const DialogConfirm = api.ui.DialogConfirm
+  let claustrumMode = payload?.knobs.claustrumMode
 
   function showL1() {
     void getSidebarState().then((state) => {
@@ -703,7 +750,7 @@ function openAccountDialog(
         <DialogSelectInner
           title='OpenAI Accounts'
           options={[
-            accountDialogModeOption(payload?.knobs.claustrumMode),
+            accountDialogModeOption(claustrumMode),
             ...buildAccountDialogRows(state, sessionId),
             {
               title: 'Add account\u2026',
@@ -720,6 +767,7 @@ function openAccountDialog(
                 option.value === '__claustrum__' ? 'claustrum' : 'local'
               void apply('openai-account', args).then((r) => {
                 api.ui.toast({ message: r.text })
+                claustrumMode = r.knobs.claustrumMode
                 showL1()
               })
               return
@@ -747,44 +795,12 @@ function openAccountDialog(
         showL1()
         return
       }
-      const options: Array<{
-        title: string
-        value: string
-        description: string
-      }> = []
-
-      options.push({
-        title: 'Remove',
-        value: 'remove',
-        description: `Remove ${fb.label ?? fb.id}`,
-      })
-
-      if (fbIndex > 0) {
-        const neighbor = state.fallbacks[fbIndex - 1]
-        if (neighbor) {
-          options.push({
-            title: 'Move up',
-            value: 'move_up',
-            description: `Swap with ${neighbor.label ?? neighbor.id}`,
-          })
-        }
-      }
-
-      if (fbIndex < state.fallbacks.length - 1) {
-        const neighbor = state.fallbacks[fbIndex + 1]
-        if (neighbor) {
-          options.push({
-            title: 'Move down',
-            value: 'move_down',
-            description: `Swap with ${neighbor.label ?? neighbor.id}`,
-          })
-        }
-      }
-
-      options.push({
-        title: 'Back',
-        value: 'back',
-        description: 'Return to account list',
+      const options = buildFallbackAccountOptions({
+        id: fb.id,
+        label: fb.label,
+        enabled: fb.enabled,
+        index: fbIndex,
+        count: state.fallbacks.length,
       })
 
       api.ui.dialog.setSize('xlarge')
@@ -808,6 +824,15 @@ function openAccountDialog(
                   onCancel={() => showL2Fallback(id)}
                 />
               ))
+              return
+            }
+            if (option.value === 'enable' || option.value === 'disable') {
+              void apply('openai-account', `${option.value} ${id}`).then(
+                (r) => {
+                  api.ui.toast({ message: r.text })
+                  showL1()
+                },
+              )
               return
             }
             if (option.value === 'move_up') {
