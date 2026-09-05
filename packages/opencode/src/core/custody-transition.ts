@@ -1,12 +1,12 @@
 import { createHash } from 'node:crypto'
-import {
-  type AccountStorage,
-  type AccountStoreTransaction,
-  claustrumMode,
-  fallbackRefreshLockName,
-  type OAuthAccount,
+import { fallbackRefreshLockName } from './account-paths.ts'
+import type {
+  AccountStorage,
+  AccountStoreTransaction,
+  OAuthAccount,
 } from './accounts.ts'
 import { custodyTombstoneKey, tombstoned } from './custody.ts'
+import { asCompleteMainOauthSlot } from './custody-host-slot.ts'
 import {
   type CustodyManifestReadResult,
   custodyManifestHandles,
@@ -30,11 +30,14 @@ export const MAIN_REFRESH_LOCK_NAME = 'main-refresh'
 export type TransitionOutcome =
   | 'ready'
   | 'tombstoned'
-  | Extract<CustodyInertReason, 'new-local-family-under-claustrum'>
-  | 'vault-cold'
-  | 'vault-reauth'
-  | 'identity-mismatch'
-  | 'no-handle'
+  | Extract<
+      CustodyInertReason,
+      | 'new-local-family-under-claustrum'
+      | 'vault-cold'
+      | 'vault-reauth'
+      | 'identity-mismatch'
+      | 'no-handle'
+    >
   | 'torn-read-deferred'
   | `aborted:${string}`
 
@@ -105,27 +108,6 @@ type Participant = {
   id: string
   accountId?: string
   kind: 'main' | 'fallback'
-}
-
-function asOauthSlot(
-  value: unknown,
-): { access: string; refresh: string; expires?: number } | undefined {
-  if (!value || typeof value !== 'object') return undefined
-  const candidate = value as Record<string, unknown>
-  if (candidate.type !== 'oauth') return undefined
-  if (
-    typeof candidate.access !== 'string' ||
-    typeof candidate.refresh !== 'string'
-  ) {
-    return undefined
-  }
-  return {
-    access: candidate.access,
-    refresh: candidate.refresh,
-    ...(typeof candidate.expires === 'number'
-      ? { expires: candidate.expires }
-      : {}),
-  }
 }
 
 function enabledOauthAccounts(storage: AccountStorage): OAuthAccount[] {
@@ -245,7 +227,7 @@ export async function enterClaustrumMode(
       }
       const handles = custodyManifestHandles(manifest)
       const persisted =
-        claustrumMode(initial) === 'claustrum'
+        initial.claustrum?.mode === 'claustrum'
           ? initial.claustrum?.transition
           : undefined
       const fingerprints: CustodyTransitionState['fingerprints'] = persisted
@@ -254,7 +236,7 @@ export async function enterClaustrumMode(
       const capturedGeneration =
         persisted?.storeGeneration ?? accountStoreGeneration(initial)
       if (!persisted) {
-        const mainSlot = asOauthSlot(
+        const mainSlot = asCompleteMainOauthSlot(
           await deps.auth.get({ path: { id: 'openai' } }),
         )
         if (mainSlot) {
@@ -372,7 +354,7 @@ export async function enterClaustrumMode(
         return { status: 'incomplete', outcomes }
       }
 
-      const currentMain = asOauthSlot(
+      const currentMain = asCompleteMainOauthSlot(
         await deps.auth.get({ path: { id: 'openai' } }),
       )
       if (
@@ -417,7 +399,7 @@ export async function enterClaustrumMode(
                 expires: 0,
               },
             })
-            const after = asOauthSlot(
+            const after = asCompleteMainOauthSlot(
               await deps.auth.get({ path: { id: 'openai' } }),
             )
             outcomes.main =

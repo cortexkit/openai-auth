@@ -75,6 +75,20 @@ function asOauthSlot(value: unknown): MainOauthSlot | undefined {
   }
 }
 
+export function asCompleteMainOauthSlot(
+  value: unknown,
+): { access: string; refresh: string; expires?: number } | undefined {
+  const oauth = asOauthSlot(value)
+  if (typeof oauth?.access !== 'string' || typeof oauth.refresh !== 'string') {
+    return undefined
+  }
+  return {
+    access: oauth.access,
+    refresh: oauth.refresh,
+    ...(typeof oauth.expires === 'number' ? { expires: oauth.expires } : {}),
+  }
+}
+
 export function classifyMainAuthSlot(value: unknown): MainAuthSlot {
   const oauth = asOauthSlot(value)
   if (!oauth) return { kind: 'indeterminate' }

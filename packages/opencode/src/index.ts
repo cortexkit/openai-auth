@@ -1058,7 +1058,7 @@ export async function CodexAuthPlugin(
   // returned. Built unconditionally so a custody-disabled process still has
   // a runtime to dispose (no-op tick + close).
   let custodyRuntimeRef: CustodyRuntime | undefined
-  // Task 8 extends this factory-owned handle with the live cache rather than
+  // The runtime accepts this factory-owned bootstrap rather than opening a second connection.
   // allowing the runtime path to open a second Claustrum connection.
   const custodyBootstrap: CustodyBootstrap = {}
   const custodyOptions = options.custody

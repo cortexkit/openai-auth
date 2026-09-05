@@ -18,6 +18,7 @@ import {
 import { type ClaustrumCacheTransportLike, CodexAuthPlugin } from '../index.ts'
 import { getSidebarState } from '../sidebar-state.ts'
 import {
+  CUSTODY_FIXTURE_NOW,
   claustrumConfig,
   enrollmentManifest,
   liveStorage,
@@ -67,7 +68,7 @@ async function withMainLoader(
     authSetCalls: () => number
   }) => Promise<void>,
 ): Promise<void> {
-  const directory = mkdtempSync(join(tmpdir(), 'custody-main-review-'))
+  const directory = mkdtempSync(join(tmpdir(), 'custody-main-'))
   const configPath = join(directory, 'openai-auth.json')
   const manifestPath = join(directory, 'opencode-handles.json')
   const prior = {
@@ -369,7 +370,7 @@ describe('main host slot', () => {
           getCredential: async () => ({
             material: mainJwt('stored-main'),
             recordVersion: 1,
-            expiresAtMs: Date.now() + 60_000,
+            expiresAtMs: CUSTODY_FIXTURE_NOW + 60_000,
           }),
           statusCredential: async () => ({
             ready: true,
@@ -403,7 +404,7 @@ describe('main host slot', () => {
           getCredential: async () => ({
             material: mainJwt('other-main'),
             recordVersion: 1,
-            expiresAtMs: Date.now() + 60_000,
+            expiresAtMs: CUSTODY_FIXTURE_NOW + 60_000,
           }),
           statusCredential: async () => ({
             ready: true,
@@ -499,7 +500,7 @@ describe('main host slot', () => {
         return {
           material: mainJwt('served-main'),
           recordVersion: 1,
-          expiresAtMs: Date.now() + 60_000,
+          expiresAtMs: CUSTODY_FIXTURE_NOW + 60_000,
         }
       },
       statusCredential: async () => ({

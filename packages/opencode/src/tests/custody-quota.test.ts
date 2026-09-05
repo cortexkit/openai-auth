@@ -8,7 +8,7 @@
  *
  * The toggle is irrelevant on this path: an entry-present account probes
  * with its valid LOCAL token but never enters local refresh, even with
- * `claustrum.enabled:false`. The existing forced-401 refresh and the
+ * `claustrum.mode:'local'`. The existing forced-401 refresh and the
  * pre-poll refresh are not reached for refresh-inert accounts.
  *
  * The injected deps are optional — absent deps mean pre-custody behaviour,

@@ -1,10 +1,11 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { createLogger } from '../logger.ts'
 import {
   ACCOUNT_FILE_NAME,
   ACCOUNT_STATE_FILE_NAME,
   deriveStatePath,
+  fallbackRefreshLockName,
   getAccountStatePath,
   getAccountStoragePath,
 } from './account-paths'
@@ -61,6 +62,7 @@ export {
   ACCOUNT_FILE_NAME,
   ACCOUNT_STATE_FILE_NAME,
   deriveStatePath,
+  fallbackRefreshLockName,
   getAccountStatePath,
   getAccountStoragePath,
 }
@@ -2038,13 +2040,6 @@ function recordQuotaRefreshError(
   if (e?.isRefreshError === true) {
     recordRefreshError(account, error, now)
   }
-}
-
-export function fallbackRefreshLockName(accountId: string) {
-  return `fallback-oauth-refresh-${createHash('sha256')
-    .update(accountId)
-    .digest('base64url')
-    .slice(0, 16)}`
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
