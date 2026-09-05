@@ -668,7 +668,10 @@ export function __createCustodyRuntimeForTest(
       const reason = map[outcome.reason]
       projectionByAccountId.set(account.id, {
         state: 'inert',
-        reason: reason === 'unavailable' ? 'vault-cold' : 'identity-mismatch',
+        reason:
+          reason === 'unavailable'
+            ? 'takeover-incomplete/vault-unavailable'
+            : 'identity-mismatch',
       })
       // Per-process, per-(account,reason) dedupe at one hour (spec §7.3).
       // First failure emits a warn; subsequent failures within the hour are
@@ -809,7 +812,7 @@ async function raceAggregateWarm(
 
 function oauthAccounts(storage: AccountStorage | null): OAuthAccount[] {
   if (!storage) return []
-  return storage.accounts.filter((a): a is OAuthAccount => a.type === 'oauth')
+  return storage.accounts.filter(isOAuthAccount)
 }
 
 function defaultCacheConnector(log: RuntimeLogger) {

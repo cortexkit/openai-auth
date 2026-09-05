@@ -181,18 +181,7 @@ async function writeCorruptStorageWithManifest(
   storage: AccountStorage,
   manifest: CustodyManifestReadResult,
 ): Promise<void> {
-  writeFileSync(
-    configPath,
-    JSON.stringify({
-      ...storage,
-      accounts: storage.accounts.map((account) =>
-        account.type === 'oauth' && account.corrupt
-          ? { ...account, corrupt: undefined, refresh: '' }
-          : account,
-      ),
-    }),
-    { mode: 0o600 },
-  )
+  await saveAccounts(storage, configPath)
   if (!manifest.ok) return
   writeFileSync(manifestPath, JSON.stringify(manifest.value), { mode: 0o600 })
   chmodSync(manifestPath, 0o600)
@@ -609,6 +598,52 @@ describe('fingerprint-gated reconciliation resume', () => {
   })
 })
 
+describe('real fallback reconciliation', () => {
+  for (const [vaultState, reason] of [
+    ['cold', 'takeover-incomplete/vault-unavailable'],
+    ['needs_reauth', 'takeover-incomplete/vault-unavailable'],
+  ] as const) {
+    it(`retains real local material inert when the vault is ${vaultState}`, async () => {
+      const account = liveAccount('fb-1', { accountId: 'acct-1' })
+      const storage = liveStorage([account], {
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
+      })
+      await writeStorageWithManifest(storage, enrollmentManifest(account.id))
+      const { transport } = makeTransport(() => {
+        throw new Error('vault unavailable')
+      })
+      let writes = 0
+      const runtime = __createCustodyRuntimeForTest(
+        makeOptions({
+          storage,
+          transport,
+          detection: 'available',
+          resolveFallbackVaultState: async () => vaultState,
+          mutateAccounts: async (transform, path) => {
+            writes += 1
+            return mutateAccounts(transform, path)
+          },
+        }),
+      )
+
+      await runtime.boot()
+      await runtime.runTick()
+
+      expect(writes).toBe(0)
+      expect((await loadAccounts(configPath))?.accounts[0]).toMatchObject({
+        access: account.access,
+        refresh: account.refresh,
+        expires: account.expires,
+      })
+      expect(runtime.getCustodyProjection(account, Date.now())).toEqual({
+        state: 'inert',
+        reason,
+      })
+      runtime.dispose()
+    })
+  }
+})
+
 // ---------------------------------------------------------------------------
 // Warm / tick
 // ---------------------------------------------------------------------------
@@ -998,6 +1033,102 @@ describe('enroll-completion sweep', () => {
 
     expect((await loadAccounts(configPath))?.accounts).toEqual([corrupt])
     expect(captured.getCalls).toEqual([])
+    runtime.dispose()
+  })
+
+  it('does not install when the manifest handle changes before the account lock', async () => {
+    const corrupt = corruptAccount()
+    const storage: AccountStorage = {
+      version: 1,
+      accounts: [corrupt],
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    }
+    await writeCorruptStorageWithManifest(
+      storage,
+      enrollmentManifest(corrupt.id),
+    )
+    const { transport } = makeTransport(() => ({
+      material: makeJwt('acct-1'),
+      recordVersion: 1,
+      expiresAtMs: Date.now() + 600_000,
+    }))
+    let writes = 0
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({
+        storage,
+        transport,
+        detection: 'available',
+        resolveFallbackVaultState: async () => 'serves',
+        acquireRefreshFileLock: async () => {
+          const manifest = enrollmentManifest(corrupt.id)
+          if (!manifest.ok) throw new Error('expected manifest')
+          manifest.value.providers[0]!.accounts[0]!.handle =
+            `ckh_${'z'.repeat(43)}`
+          writeFileSync(manifestPath, JSON.stringify(manifest.value))
+          return { release: async () => {} }
+        },
+        mutateAccounts: async (transform, path) => {
+          writes += 1
+          return mutateAccounts(transform, path)
+        },
+      }),
+    )
+
+    await runtime.boot()
+
+    expect(writes).toBe(0)
+    expect((await loadAccounts(configPath))?.accounts[0]).toMatchObject({
+      corrupt: true,
+    })
+    runtime.dispose()
+  })
+
+  it('does not install when mode changes before the account lock', async () => {
+    const corrupt = corruptAccount()
+    const storage: AccountStorage = {
+      version: 1,
+      accounts: [corrupt],
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    }
+    await writeCorruptStorageWithManifest(
+      storage,
+      enrollmentManifest(corrupt.id),
+    )
+    const { transport } = makeTransport(() => ({
+      material: makeJwt('acct-1'),
+      recordVersion: 1,
+      expiresAtMs: Date.now() + 600_000,
+    }))
+    let writes = 0
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({
+        storage,
+        transport,
+        detection: 'available',
+        resolveFallbackVaultState: async () => 'serves',
+        acquireRefreshFileLock: async () => {
+          writeFileSync(
+            configPath,
+            JSON.stringify({
+              ...storage,
+              claustrum: claustrumConfig({ mode: 'local' }),
+            }),
+          )
+          return { release: async () => {} }
+        },
+        mutateAccounts: async (transform, path) => {
+          writes += 1
+          return mutateAccounts(transform, path)
+        },
+      }),
+    )
+
+    await runtime.boot()
+
+    expect(writes).toBe(0)
+    expect((await loadAccounts(configPath))?.accounts[0]).toMatchObject({
+      corrupt: true,
+    })
     runtime.dispose()
   })
 
