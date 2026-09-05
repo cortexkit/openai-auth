@@ -9,6 +9,7 @@ import {
   accountDialogModeOption,
   buildAccountDialogRows,
   buildCachekeepDialogOptions,
+  buildFallbackAccountOptions,
   formatQuotaWindows,
   openCommandDialog,
 } from '../tui/command-dialogs'
@@ -150,6 +151,23 @@ describe('command dialogs', () => {
       value: '__claustrum__',
       description: 'Verify every enabled account before custody takes over',
     })
+  })
+
+  test('fallback actions expose mode verbs without resurrecting custody on or off', () => {
+    const options = buildFallbackAccountOptions({
+      id: 'fallback-a',
+      label: 'Fallback A',
+      enabled: false,
+      index: 0,
+      count: 1,
+    })
+    const values = options.map((option) => option.value)
+    const titles = options.map((option) => option.title.toLowerCase())
+
+    expect(values).toContain('enable')
+    expect(values).toContain('remove')
+    expect(titles.join(' ')).not.toContain('custody on')
+    expect(titles.join(' ')).not.toContain('custody off')
   })
 
   type ResetSelectOption = {
