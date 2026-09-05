@@ -1,4 +1,6 @@
 import { describe, expect, it, jest, mock } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import {
   buildQuotaOperationError,
   isTransientQuotaError,
@@ -80,6 +82,44 @@ describe('codexRefreshFn token validation', () => {
     expect(result.refresh).toBe('valid-refresh')
     expect(result.expiresIn).toBe(3600)
     expect(result.expires).toBe(mockNow() + 3600 * 1000)
+  })
+
+  it('refuses any custody tombstone prefix before touching transport', async () => {
+    const fetchSpy = mock(async () => new Response('{}', { status: 200 }))
+
+    await expect(
+      codexRefreshFn({
+        refreshToken: 'claustrum-tombstone:v1:anthropic',
+        fetchImpl: fetchSpy as unknown as typeof fetch,
+        now: mockNow,
+      }),
+    ).rejects.toThrow('custody tombstone')
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('places custody refusal before every refresh transport operation', () => {
+    const source = readFileSync(
+      fileURLToPath(new URL('../core/provider.ts', import.meta.url)),
+      'utf8',
+    )
+    const start = source.indexOf('export async function codexRefreshFn')
+    const end = source.indexOf('export async function whamUsageFn')
+    const fn = source.slice(start, end)
+    const body = fn.slice(fn.indexOf('}> {') + '}> {'.length).trimStart()
+    const refusal = fn.indexOf(
+      'assertNoCustodyTombstoneMaterial(input.refreshToken)',
+    )
+    const firstTransport = Math.min(
+      ...['input.fetchImpl', 'URLSearchParams', 'await response']
+        .map((token) => fn.indexOf(token))
+        .filter((index) => index >= 0),
+    )
+
+    expect(
+      body.startsWith('assertNoCustodyTombstoneMaterial(input.refreshToken)'),
+    ).toBe(true)
+    expect(refusal).toBeGreaterThanOrEqual(0)
+    expect(refusal).toBeLessThan(firstTransport)
   })
 
   it('throws structured refresh error when access_token is missing', async () => {

@@ -13,12 +13,12 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getAccountStoragePath } from '../core/account-paths.ts'
-import type { OAuthAccount } from '../core/accounts.ts'
 import {
   loadAccounts,
   normalizeAccount,
   saveAccounts,
 } from '../core/accounts.ts'
+import * as custodyPolicy from '../core/custody.ts'
 import {
   __resetEnrollPendingForTest,
   ClaustrumCredentialCache,
@@ -26,6 +26,7 @@ import {
   CUSTODY_REFUSE,
   CUSTODY_TOMBSTONE_PREFIX,
   clearEnrollPending,
+  completeFallbackEnrollment,
   custodied,
   custodyTombstoneKey,
   enrolled,
@@ -40,8 +41,10 @@ import {
   verifyServedFallbackIdentity,
 } from '../core/custody.ts'
 import { readCustodyManifest } from '../core/custody-manifest.ts'
+import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
 import {
   claustrumConfig,
+  enrollmentManifest,
   liveAccount,
   liveStorage,
   makeSentinelAccount,
@@ -82,12 +85,12 @@ describe('custodyTombstoneKey', () => {
     expect(CUSTODY_TOMBSTONE_PREFIX).toBe('claustrum-tombstone:v1:')
   })
 
-  it('normalizes an oauth entry whose access/refresh are both the sentinel (preserves the account on load)', async () => {
-    const sentinel = makeSentinelAccount()
+  it('normalizes a canonical tombstone with empty access (preserves the account on load)', async () => {
+    const sentinel = makeSentinelAccount({ access: '' })
     // If normalizeAccount dropped the entry, the list would be empty and the
     // tombstone would vanish. Assert it survives normalisation as an account
-    // with access===refresh===sentinel and expires===0 so callers can observe
-    // the tombstone rather than silently losing the entry.
+    // with empty access, sentinel refresh, and expiry zero so callers can
+    // observe the tombstone rather than silently losing the entry.
     const normalized = normalizeAccount({
       id: sentinel.id,
       type: 'oauth',
@@ -98,20 +101,20 @@ describe('custodyTombstoneKey', () => {
     expect(normalized).not.toBeNull()
     expect(normalized?.type).toBe('oauth')
     if (normalized?.type !== 'oauth') throw new Error('expected oauth')
-    expect(normalized.access).toBe(TOMBSTONE_OPENAI)
+    expect(normalized.access).toBe('')
     expect(normalized.refresh).toBe(TOMBSTONE_OPENAI)
     expect(normalized.expires).toBe(0)
   })
 
-  it('round-trips a sentinel-only account through saveAccounts/loadAccounts', async () => {
-    const cfg = liveStorage([makeSentinelAccount()])
+  it('round-trips a canonical tombstone through saveAccounts/loadAccounts', async () => {
+    const cfg = liveStorage([makeSentinelAccount({ access: '' })])
     await saveAccounts(cfg, getAccountStoragePath())
     const loaded = await loadAccounts()
     expect(loaded).not.toBeNull()
     const account = loaded?.accounts[0]
     expect(account?.type).toBe('oauth')
     if (account?.type !== 'oauth') throw new Error('expected oauth')
-    expect(account.access).toBe(TOMBSTONE_OPENAI)
+    expect(account.access).toBe('')
     expect(account.refresh).toBe(TOMBSTONE_OPENAI)
     expect(account.expires).toBe(0)
   })
@@ -414,31 +417,30 @@ describe('predicates', () => {
     // accept it as a parameter; the test name states the invariant.
   })
 
-  it('tombstoned = oauth access AND refresh AND expires===0 match the per-provider sentinel', () => {
+  it('recognizes an oauth tombstone from the exact provider refresh sentinel alone', () => {
     expect(tombstoned(makeSentinelAccount(), 'openai')).toBe(true)
-    // Partial: access-only or refresh-only sentinel must NOT count.
+    // A refresh mismatch remains a local credential, regardless of access.
     expect(
       tombstoned(
         { ...makeSentinelAccount(), refresh: 'live-refresh' },
         'openai',
       ),
     ).toBe(false)
+    // A partial or corrupt write is still custody evidence. Removing this
+    // refresh-only recognition would send the sentinel into local refresh.
     expect(
       tombstoned(
-        {
-          ...makeSentinelAccount(),
-          access: 'live-access',
+        makeSentinelAccount({
+          access: 'stale',
           refresh: TOMBSTONE_OPENAI,
-        },
+          expires: Date.now() + 60_000,
+        }),
         'openai',
       ),
-    ).toBe(false)
-    // expires must be exactly 0 — an `undefined` expiry must NOT count.
-    const { expires: _e, ...rest } = makeSentinelAccount()
-    expect(tombstoned(rest as OAuthAccount, 'openai')).toBe(false)
+    ).toBe(true)
   })
 
-  it('custodied requires storage.claustrum.enabled true + enrolled + tombstoned', async () => {
+  it('custodied requires claustrum mode + enrolled + tombstoned', async () => {
     const m = await readCustodyManifest(handlesPath) // empty manifest
     const sentinel = makeSentinelAccount()
     expect(
@@ -479,6 +481,43 @@ describe('predicates', () => {
         liveStorage([], { claustrum: claustrumConfig({ mode: 'claustrum' }) }),
       ),
     ).toBe(true)
+  })
+
+  it('foreign tombstone is not OpenAI custody but is refused before refresh', () => {
+    const foreign = makeSentinelAccount({
+      access: '',
+      refresh: 'claustrum-tombstone:v1:anthropic',
+    })
+    const storage = liveStorage([foreign], {
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    })
+    expect(custodied(foreign, enrollmentManifest(foreign.id), storage)).toBe(
+      false,
+    )
+    const assertNoTombstoneMaterial = (
+      custodyPolicy as typeof custodyPolicy & {
+        assertNoCustodyTombstoneMaterial: (refreshToken: string) => void
+      }
+    ).assertNoCustodyTombstoneMaterial
+    expect(typeof assertNoTombstoneMaterial).toBe('function')
+    expect(() => assertNoTombstoneMaterial(foreign.refresh)).toThrow()
+  })
+
+  it('refuses every tombstone prefix but permits empty and ordinary refresh material', () => {
+    const assertNoTombstoneMaterial = (
+      custodyPolicy as typeof custodyPolicy & {
+        assertNoCustodyTombstoneMaterial: (refreshToken: string) => void
+      }
+    ).assertNoCustodyTombstoneMaterial
+    expect(typeof assertNoTombstoneMaterial).toBe('function')
+    expect(() =>
+      assertNoTombstoneMaterial('claustrum-tombstone:v1:openai'),
+    ).toThrow()
+    expect(() =>
+      assertNoTombstoneMaterial('claustrum-tombstone:v1:anthropic'),
+    ).toThrow()
+    expect(() => assertNoTombstoneMaterial('ordinary-refresh')).not.toThrow()
+    expect(() => assertNoTombstoneMaterial('')).not.toThrow()
   })
 
   it('enrolling = enrolled && !tombstoned; refreshInert = enrolled || tombstoned; excluded = tombstoned && !custodied', async () => {
@@ -687,6 +726,17 @@ describe('resolveFallbackAccess', () => {
     expect(result).toBe(CUSTODY_EXCLUDED)
   })
 
+  it('mode=local + enrolled tombstone is excluded and never serves local access', async () => {
+    const acct = makeSentinelAccount({ access: '' })
+    const manifest = enrollmentManifest(acct.id)
+    const storage = liveStorage([acct], {
+      claustrum: claustrumConfig({ mode: 'local' }),
+    })
+    expect(await resolveFallbackAccess(acct, storage, manifest)).toBe(
+      CUSTODY_EXCLUDED,
+    )
+  })
+
   it('returns vault provenance for a custodied account whose live cache serves the credential', async () => {
     const handle = `ckh_${'a'.repeat(43)}`
     const acct = makeSentinelAccount()
@@ -838,6 +888,46 @@ describe('resolveFallbackAccess', () => {
         requestPath: true,
       }),
     ).toBe(CUSTODY_REFUSE)
+    cache.close()
+  })
+})
+
+describe('completeFallbackEnrollment', () => {
+  it('writes the canonical tombstone with empty access after vault verification', async () => {
+    const account = liveAccount('completion-1', {
+      accountId: 'acct-completion',
+    })
+    let storage = liveStorage([account])
+    const cache = new ClaustrumCredentialCache({
+      connector: async () =>
+        makeFakeClient({
+          getCredential: async () => ({
+            material: jwtFor('acct-completion'),
+            recordVersion: 7,
+            expiresAtMs: Date.now() + 60_000,
+          }),
+        }) as never,
+    })
+
+    const result = await completeFallbackEnrollment(account, {
+      loadAccounts: async () => storage,
+      readCustodyManifest: async () => enrollmentManifest(account.id),
+      acquireRefreshFileLock,
+      configPath: join(handlesDir, 'completion-store.json'),
+      cache,
+      minTtlMs: 30_000,
+      mutateAccounts: async (mutate) => {
+        storage = mutate(storage) ?? storage
+      },
+    })
+
+    expect(result).toEqual({ kind: 'succeeded', recordVersion: 7 })
+    const completed = storage.accounts[0]
+    expect(completed?.type).toBe('oauth')
+    if (completed?.type !== 'oauth') throw new Error('expected oauth')
+    expect(completed.access).toBe('')
+    expect(completed.refresh).toBe(TOMBSTONE_OPENAI)
+    expect(completed.expires).toBe(0)
     cache.close()
   })
 })
