@@ -106,7 +106,9 @@ export async function acquireCustodyTransitionMutex(): Promise<Release> {
 
 export async function releaseCustodyLoginLeaseAfterHostWrite(input: {
   accessToken: string
-  getAuth(): Promise<{ access?: string } | undefined>
+  refreshToken: string
+  getAuth(): Promise<{ access?: string; refresh?: string } | undefined>
+  onObserved?(auth: { access: string; refresh: string }): void | Promise<void>
   release(): Promise<void>
   warn(message: string): void
   now(): number
@@ -116,7 +118,11 @@ export async function releaseCustodyLoginLeaseAfterHostWrite(input: {
   while (input.now() < deadline) {
     try {
       const auth = await input.getAuth()
-      if (auth?.access === input.accessToken) {
+      if (
+        auth?.access === input.accessToken &&
+        auth.refresh === input.refreshToken
+      ) {
+        await input.onObserved?.({ access: auth.access, refresh: auth.refresh })
         await input.release()
         return
       }

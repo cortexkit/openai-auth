@@ -76,6 +76,7 @@ import {
   classifyMainAuthSlot,
   mainAccountIdFromServedCredential,
   reconcileMainSlotBeforeHooks,
+  recordVerifiedInProcessMainLogin,
 } from './core/custody-host-slot.ts'
 import {
   CUSTODY_OWNING_PROVIDER,
@@ -3998,14 +3999,23 @@ export async function CodexAuthPlugin(
                     }
                     void releaseCustodyLoginLeaseAfterHostWrite({
                       accessToken: tokens.access_token,
+                      refreshToken: tokens.refresh_token,
                       getAuth: async () => {
                         const auth = await hostAuth.get({
                           path: { id: 'openai' },
                         })
-                        return isRecord(auth) && typeof auth.access === 'string'
-                          ? { access: auth.access }
+                        return isRecord(auth) &&
+                          typeof auth.access === 'string' &&
+                          typeof auth.refresh === 'string'
+                          ? { access: auth.access, refresh: auth.refresh }
                           : undefined
                       },
+                      onObserved: ({ access, refresh }) =>
+                        recordVerifiedInProcessMainLogin({
+                          type: 'oauth',
+                          access,
+                          refresh,
+                        }),
                       release: () => mutex.release(),
                       warn: (message) =>
                         custodyOptions?.warn?.(message) ??
@@ -4063,14 +4073,23 @@ export async function CodexAuthPlugin(
                     }
                     void releaseCustodyLoginLeaseAfterHostWrite({
                       accessToken: tokens.access_token,
+                      refreshToken: tokens.refresh_token,
                       getAuth: async () => {
                         const auth = await hostAuth.get({
                           path: { id: 'openai' },
                         })
-                        return isRecord(auth) && typeof auth.access === 'string'
-                          ? { access: auth.access }
+                        return isRecord(auth) &&
+                          typeof auth.access === 'string' &&
+                          typeof auth.refresh === 'string'
+                          ? { access: auth.access, refresh: auth.refresh }
                           : undefined
                       },
+                      onObserved: ({ access, refresh }) =>
+                        recordVerifiedInProcessMainLogin({
+                          type: 'oauth',
+                          access,
+                          refresh,
+                        }),
                       release: () => mutex.release(),
                       warn: (message) =>
                         custodyOptions?.warn?.(message) ??
