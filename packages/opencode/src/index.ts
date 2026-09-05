@@ -193,6 +193,7 @@ const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
 const CODEX_VERSION = '0.153.0'
 const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
 const CODEX_SANDBOX = 'seccomp'
+export const getMainRefreshLockName = () => MAIN_REFRESH_LOCK_NAME
 export const MAIN_REFRESH_LOCK_TTL_MS = 2 * 60_000
 export const MAIN_REFRESH_LEASE_TTL_MS = 90_000
 const CONCURRENT_MAIN_REFRESH_WAIT_MS = 4_000

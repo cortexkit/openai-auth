@@ -1,10 +1,16 @@
 import { describe, expect, it } from 'bun:test'
 import { createHash } from 'node:crypto'
-import type { AccountStorage } from '../core/accounts.ts'
-import type {
-  AccountStoreTransaction,
-  TransitionResult,
-} from '../core/custody-transition.ts'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import {
+  type AccountStorage,
+  type AccountStoreTransaction,
+  mutateAccounts,
+  saveAccounts,
+  withAccountStoreTransaction,
+} from '../core/accounts.ts'
+import type { TransitionResult } from '../core/custody-transition.ts'
 import { liveAccount, liveStorage } from './custody-fixtures.ts'
 
 type Deferred = {
@@ -78,7 +84,7 @@ function fakeCoordinatorDeps(
         try {
           return await action({
             read: async () => structuredClone(current),
-            write: async (next) => {
+            write: async (next: AccountStorage) => {
               const failed =
                 options.failFallbackId &&
                 next.accounts.find(
@@ -91,9 +97,12 @@ function fakeCoordinatorDeps(
               current = structuredClone(next)
               writes.push('fallback')
             },
-            writeMode: async () => {
+            writeMode: async (mode, transition) => {
               writes.push('mode')
-              current.claustrum = { mode: 'claustrum' }
+              current.claustrum = {
+                mode,
+                ...(transition ? { transition } : {}),
+              }
             },
           })
         } finally {
@@ -217,12 +226,16 @@ describe('custody transition fingerprints', () => {
 describe('enterClaustrumMode coordinator', () => {
   it('holds the five fences and executes the normative event order', async () => {
     const transition = await import('../core/custody-transition.ts')
+    const index = await import('../index.ts')
     const fixture = fakeCoordinatorDeps()
 
     const result = await transition.enterClaustrumMode(fixture.deps)
 
     expect(result.status).toBe('completed')
     expect(transition.MAIN_REFRESH_LOCK_NAME).toBe('main-refresh')
+    expect(index.getMainRefreshLockName()).toBe(
+      transition.MAIN_REFRESH_LOCK_NAME,
+    )
     expect(fixture.traces).toEqual([
       'mutex-acquired',
       'acquire:claustrum-mode:true',
@@ -276,6 +289,72 @@ describe('enterClaustrumMode coordinator', () => {
     expect(moved.writes).toEqual([])
   })
 
+  it('aborts before mode when the fenced store generation changes', async () => {
+    const transition = await import('../core/custody-transition.ts')
+    const fixture = fakeCoordinatorDeps({
+      preflight: async () => {
+        fixture.storage().accounts.push(liveAccount('new-racing-row'))
+        return 'ready'
+      },
+    })
+
+    const result = await transition.enterClaustrumMode(fixture.deps)
+
+    expect(result).toMatchObject({
+      status: 'aborted',
+      reason: 'store-generation-changed',
+    })
+    expect(fixture.writes).toEqual([])
+  })
+
+  it('does not read or write when the mode lock is unavailable', async () => {
+    const transition = await import('../core/custody-transition.ts')
+    const fixture = fakeCoordinatorDeps()
+    let reads = 0
+    fixture.deps.readManifest = async () => {
+      reads++
+      throw new Error('must not read')
+    }
+    fixture.deps.acquireLock = (async () => null) as never
+
+    await expect(
+      transition.enterClaustrumMode(fixture.deps),
+    ).resolves.toMatchObject({
+      status: 'aborted',
+      reason: 'mode-lock-unavailable',
+    })
+    expect(reads).toBe(0)
+    expect(fixture.writes).toEqual([])
+  })
+
+  it('holds both real save locks until the transaction releases', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'oai-custody-transition-'))
+    const path = join(directory, 'accounts.json')
+    try {
+      await saveAccounts(liveStorage([liveAccount('fallback-a')]), path)
+      const entered = deferred()
+      const release = deferred()
+      let mutationFinished = false
+      const held = withAccountStoreTransaction(async () => {
+        entered.resolve()
+        await release.promise
+        return { status: 'completed', outcomes: {} }
+      }, path)
+      await entered.promise
+      const mutation = mutateAccounts((storage) => storage, path).then(() => {
+        mutationFinished = true
+      })
+
+      await Promise.resolve()
+      expect(mutationFinished).toBe(false)
+      release.resolve()
+      await Promise.all([held, mutation])
+      expect(mutationFinished).toBe(true)
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   it('defers a host tombstone on an empty auth map and warns exactly once', async () => {
     const transition = await import('../core/custody-transition.ts')
     const fixture = fakeCoordinatorDeps({ all: async () => ({}) })
@@ -290,23 +369,27 @@ describe('enterClaustrumMode coordinator', () => {
     ])
   })
 
-  it('reports an immediate host overwrite as a mismatch after the tombstone write', async () => {
+  it('reports a host overwrite observed by post-write readback', async () => {
     const transition = await import('../core/custody-transition.ts')
-    const fixture = fakeCoordinatorDeps({
-      afterSet: () => {
-        // The fake host races after our write; readback must classify it now.
-      },
-    })
-    fixture.deps.auth.get = async () => ({
-      type: 'oauth',
-      access: 'new-access',
-      refresh: 'new-refresh',
-      expires: 2,
-    })
+    const fixture = fakeCoordinatorDeps()
+    fixture.deps.auth.get = async () =>
+      fixture.writes.includes('main')
+        ? {
+            type: 'oauth',
+            access: 'new-access',
+            refresh: 'new-refresh',
+            expires: 2,
+          }
+        : {
+            type: 'oauth',
+            access: 'main-access',
+            refresh: 'main-refresh',
+            expires: 1,
+          }
 
     const result = await transition.enterClaustrumMode(fixture.deps)
 
-    expect(result.outcomes.main).toBe('mismatch')
+    expect(result.outcomes.main).toBe('new-local-family-under-claustrum')
   })
 
   it('retains the mode and prior tombstones when one fallback write fails', async () => {
@@ -324,6 +407,43 @@ describe('enterClaustrumMode coordinator', () => {
     })
     expect(fixture.storage().claustrum?.mode).toBe('claustrum')
     expect(fixture.writes).toEqual(['mode', 'fallback'])
+  })
+
+  it('resumes only a remaining row that still matches its persisted fingerprint', async () => {
+    const transition = await import('../core/custody-transition.ts')
+    const fixture = fakeCoordinatorDeps({ failFallbackId: 'fallback-b' })
+    await transition.enterClaustrumMode(fixture.deps)
+    const changed = fixture
+      .storage()
+      .accounts.find(
+        (account) => account.type === 'oauth' && account.id === 'fallback-b',
+      )
+    if (changed?.type !== 'oauth') throw new Error('missing fallback-b')
+    changed.access = 'new-local-access'
+
+    const result = await transition.enterClaustrumMode(fixture.deps)
+
+    expect(result.outcomes).toMatchObject({
+      'fallback-a': 'tombstoned',
+      'fallback-b': 'new-local-family-under-claustrum',
+    })
+    expect(changed.access).toBe('new-local-access')
+  })
+
+  it('resumes a deferred main tombstone and clears fingerprints only after completion', async () => {
+    const transition = await import('../core/custody-transition.ts')
+    let empty = true
+    const fixture = fakeCoordinatorDeps({
+      all: async () => (empty ? {} : { openai: {} }),
+    })
+    await transition.enterClaustrumMode(fixture.deps)
+    empty = false
+
+    const result = await transition.enterClaustrumMode(fixture.deps)
+
+    expect(result.status).toBe('completed')
+    expect(result.outcomes.main).toBe('tombstoned')
+    expect(fixture.storage().claustrum?.transition).toBeUndefined()
   })
 
   it('serializes a barrier behind a shared process mutex', async () => {
