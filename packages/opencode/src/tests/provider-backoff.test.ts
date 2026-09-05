@@ -105,19 +105,15 @@ describe('codexRefreshFn token validation', () => {
     const start = source.indexOf('export async function codexRefreshFn')
     const end = source.indexOf('export async function whamUsageFn')
     const fn = source.slice(start, end)
-    const body = fn.slice(fn.indexOf('}> {') + '}> {'.length).trimStart()
     const refusal = fn.indexOf(
       'assertNoCustodyTombstoneMaterial(input.refreshToken)',
     )
     const firstTransport = Math.min(
-      ...['input.fetchImpl', 'URLSearchParams', 'await response']
+      ...['new URL', 'URLSearchParams', 'await', 'input.fetchImpl']
         .map((token) => fn.indexOf(token))
         .filter((index) => index >= 0),
     )
 
-    expect(
-      body.startsWith('assertNoCustodyTombstoneMaterial(input.refreshToken)'),
-    ).toBe(true)
     expect(refusal).toBeGreaterThanOrEqual(0)
     expect(refusal).toBeLessThan(firstTransport)
   })

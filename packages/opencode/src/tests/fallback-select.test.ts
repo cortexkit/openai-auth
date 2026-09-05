@@ -22,14 +22,12 @@ import {
   saveAccounts,
 } from '../core/accounts.ts'
 import { hashRefreshToken } from '../core/backoff.ts'
-import { emptyManifest } from './custody-fixtures.ts'
+import { localCustody } from './custody-fixtures.ts'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-const localCustody = { readManifest: async () => emptyManifest() }
 
 function makeOAuthAccount(overrides: Partial<OAuthAccount> = {}): OAuthAccount {
   return {

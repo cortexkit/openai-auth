@@ -17,7 +17,7 @@ import type {
   OAuthAccount,
 } from '../core/accounts.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
-import { claustrumConfig, emptyManifest } from './custody-fixtures.ts'
+import { claustrumConfig, localCustody } from './custody-fixtures.ts'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_LOG_FILE,
@@ -27,7 +27,6 @@ import {
 let dir: string
 let cfgPath: string
 let statePath: string
-const localCustody = { readManifest: async () => emptyManifest() }
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'oai-acct-'))

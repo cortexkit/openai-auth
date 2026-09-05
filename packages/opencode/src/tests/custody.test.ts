@@ -18,9 +18,9 @@ import {
   normalizeAccount,
   saveAccounts,
 } from '../core/accounts.ts'
-import * as custodyPolicy from '../core/custody.ts'
 import {
   __resetEnrollPendingForTest,
+  assertNoCustodyTombstoneMaterial,
   ClaustrumCredentialCache,
   CUSTODY_EXCLUDED,
   CUSTODY_REFUSE,
@@ -43,6 +43,7 @@ import {
 import { readCustodyManifest } from '../core/custody-manifest.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
 import {
+  CUSTODY_FIXTURE_NOW,
   claustrumConfig,
   enrollmentManifest,
   liveAccount,
@@ -433,7 +434,7 @@ describe('predicates', () => {
         makeSentinelAccount({
           access: 'stale',
           refresh: TOMBSTONE_OPENAI,
-          expires: Date.now() + 60_000,
+          expires: CUSTODY_FIXTURE_NOW + 60_000,
         }),
         'openai',
       ),
@@ -494,30 +495,20 @@ describe('predicates', () => {
     expect(custodied(foreign, enrollmentManifest(foreign.id), storage)).toBe(
       false,
     )
-    const assertNoTombstoneMaterial = (
-      custodyPolicy as typeof custodyPolicy & {
-        assertNoCustodyTombstoneMaterial: (refreshToken: string) => void
-      }
-    ).assertNoCustodyTombstoneMaterial
-    expect(typeof assertNoTombstoneMaterial).toBe('function')
-    expect(() => assertNoTombstoneMaterial(foreign.refresh)).toThrow()
+    expect(() => assertNoCustodyTombstoneMaterial(foreign.refresh)).toThrow()
   })
 
   it('refuses every tombstone prefix but permits empty and ordinary refresh material', () => {
-    const assertNoTombstoneMaterial = (
-      custodyPolicy as typeof custodyPolicy & {
-        assertNoCustodyTombstoneMaterial: (refreshToken: string) => void
-      }
-    ).assertNoCustodyTombstoneMaterial
-    expect(typeof assertNoTombstoneMaterial).toBe('function')
     expect(() =>
-      assertNoTombstoneMaterial('claustrum-tombstone:v1:openai'),
+      assertNoCustodyTombstoneMaterial('claustrum-tombstone:v1:openai'),
     ).toThrow()
     expect(() =>
-      assertNoTombstoneMaterial('claustrum-tombstone:v1:anthropic'),
+      assertNoCustodyTombstoneMaterial('claustrum-tombstone:v1:anthropic'),
     ).toThrow()
-    expect(() => assertNoTombstoneMaterial('ordinary-refresh')).not.toThrow()
-    expect(() => assertNoTombstoneMaterial('')).not.toThrow()
+    expect(() =>
+      assertNoCustodyTombstoneMaterial('ordinary-refresh'),
+    ).not.toThrow()
+    expect(() => assertNoCustodyTombstoneMaterial('')).not.toThrow()
   })
 
   it('enrolling = enrolled && !tombstoned; refreshInert = enrolled || tombstoned; excluded = tombstoned && !custodied', async () => {
@@ -571,9 +562,9 @@ describe('predicates', () => {
     ).toBe(false)
   })
 
-  it('does not refresh an entry-present account when claustrum.enabled is false (toggle gates custodied serving, not local access)', async () => {
-    // A live, enrolled account with claustrum.enabled:false is "enrolling" and
-    // its access token must still be served from local. The toggle gates
+  it('does not refresh an entry-present account in local mode (mode gates custodied serving, not local access)', async () => {
+    // A live, enrolled account in local mode is "enrolling" and its access
+    // token must still be served from local. The mode gates
     // custodied serving only, not refresh-gate decisions.
     await writeManifest([
       {
@@ -716,7 +707,7 @@ describe('resolveFallbackAccess', () => {
     expect(result).toBe(CUSTODY_REFUSE)
   })
 
-  it('returns CUSTODY_EXCLUDED for tombstoned + claustrum.enabled=false', async () => {
+  it('returns CUSTODY_EXCLUDED for tombstoned accounts in local mode', async () => {
     const acct = makeSentinelAccount()
     const m = await readCustodyManifest(handlesPath) // empty
     const storage = liveStorage([acct], {
@@ -894,17 +885,19 @@ describe('resolveFallbackAccess', () => {
 
 describe('completeFallbackEnrollment', () => {
   it('writes the canonical tombstone with empty access after vault verification', async () => {
+    const now = CUSTODY_FIXTURE_NOW
     const account = liveAccount('completion-1', {
       accountId: 'acct-completion',
     })
     let storage = liveStorage([account])
     const cache = new ClaustrumCredentialCache({
+      now: () => now,
       connector: async () =>
         makeFakeClient({
           getCredential: async () => ({
             material: jwtFor('acct-completion'),
             recordVersion: 7,
-            expiresAtMs: Date.now() + 60_000,
+            expiresAtMs: now + 60_000,
           }),
         }) as never,
     })
@@ -919,6 +912,7 @@ describe('completeFallbackEnrollment', () => {
       mutateAccounts: async (mutate) => {
         storage = mutate(storage) ?? storage
       },
+      now: () => now,
     })
 
     expect(result).toEqual({ kind: 'succeeded', recordVersion: 7 })

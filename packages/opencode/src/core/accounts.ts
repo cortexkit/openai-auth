@@ -665,7 +665,8 @@ function normalizeClaustrum(value: unknown): AccountStorage['claustrum'] {
     mode,
     transition,
     rowHistory,
-    // Transitional shim until Task 3 removes consumers; Phase-B-only manifestWrite stays disarmed under every mode.
+    // Transitional fields derive from mode while custody-runtime's enable and
+    // manifestWrite gates read them; remove them when those gates read claustrumMode().
     enabled: mode === 'claustrum',
     manifestWrite: false,
   }

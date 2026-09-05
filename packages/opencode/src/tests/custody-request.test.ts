@@ -33,6 +33,7 @@ import {
   liveAccount,
   liveStorage,
   makeSentinelAccount,
+  TOMBSTONE_OPENAI,
 } from './custody-fixtures.ts'
 import {
   FLOOR_AUTH_FILE,
@@ -70,8 +71,6 @@ async function withCustodyLoader(
     accounts: OAuthAccount[]
     routing?: { mode: 'main-first' | 'fallback-first' | 'sticky-balanced' }
     claustrumEnabled?: boolean
-    manifestWrite?: boolean
-    omitManifestWrite?: boolean
     credential?: { material: string; recordVersion: number } | undefined
     credentialForGet?: () => { material: string; recordVersion: number }
     now?: () => number
@@ -342,7 +341,6 @@ describe('custody request resolution', () => {
     await withCustodyLoader(
       {
         accounts: [fallback],
-        manifestWrite: true,
         credential: { material: vaultAccess, recordVersion: 18 },
         observeRequest: async (authorization, url, configPath) => {
           if (!url.endsWith('/responses')) return
@@ -386,7 +384,6 @@ describe('custody request resolution', () => {
       {
         accounts: [expired, next],
         routing: { mode: 'fallback-first' },
-        omitManifestWrite: true,
         credential: { material: jwtFor('acct-1'), recordVersion: 18 },
         respond: (authorization) =>
           authorization === 'Bearer main-access' ? 401 : 200,
@@ -574,7 +571,7 @@ describe('custody request resolution', () => {
         expect(authorizations.filter(Boolean)).toEqual([
           `Bearer ${local.access}`,
         ])
-        expect(authorizations.join(' ')).not.toContain(refused.access)
+        expect(authorizations.join(' ')).not.toContain(TOMBSTONE_OPENAI)
       },
     )
   })
@@ -596,7 +593,7 @@ describe('custody request resolution', () => {
         const [url, init] = codexRequest()
         expect((await fetchOverride(url, init)).status).toBe(200)
         expect(authorizations).toEqual(['Bearer main-access'])
-        expect(authorizations.join(' ')).not.toContain(tombstone.access)
+        expect(authorizations.join(' ')).not.toContain(TOMBSTONE_OPENAI)
       },
     )
   })
