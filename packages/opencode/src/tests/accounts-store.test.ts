@@ -188,7 +188,7 @@ function createManagerRemovingAccountOnFirstLoad(
 
 describe('accounts store', () => {
   it('RETAINS a corrupt OAuth row as gone and refresh-inert when its binding exists', async () => {
-    const { loadAccounts } = await import('../core/accounts.ts')
+    const { isOAuthAccount, loadAccounts } = await import('../core/accounts.ts')
     const { enrollmentManifest } = await import('./custody-fixtures.ts')
     writeFileSync(
       cfgPath,
@@ -222,6 +222,7 @@ describe('accounts store', () => {
       account?.type === 'oauth' &&
         refreshInert(account, enrollmentManifest(account.id), 'openai'),
     ).toBe(true)
+    expect(account && isOAuthAccount(account)).toBe(false)
   })
 
   it('round-trips a corrupt OAuth marker through save without changing roster order', async () => {
