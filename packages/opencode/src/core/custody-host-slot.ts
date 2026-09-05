@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { custodyTombstoneKey, tombstoned } from './custody.ts'
 import {
   type CustodyManifestReadResult,
@@ -8,12 +9,47 @@ import { extractAccountIdFromClaims, parseJwtClaims } from './oauth.ts'
 
 const MAIN_PROVIDER = 'openai'
 const SLOT_ABSENT_CONFIRMATION_MS = 250
+const verifiedInProcessMainLoginFingerprints = new Set<string>()
 
 export type MainOauthSlot = {
   type: 'oauth'
   access?: string
   refresh?: string
   expires?: number
+}
+
+export function mainSlotFamilyFingerprint(
+  slot: MainOauthSlot,
+): string | undefined {
+  if (typeof slot.access !== 'string' || typeof slot.refresh !== 'string') {
+    return undefined
+  }
+  const access = Buffer.from(slot.access)
+  const refresh = Buffer.from(slot.refresh)
+  const length = (value: Buffer) => {
+    const encoded = Buffer.alloc(4)
+    encoded.writeUInt32BE(value.length)
+    return encoded
+  }
+  return createHash('sha256')
+    .update(length(access))
+    .update(access)
+    .update(length(refresh))
+    .update(refresh)
+    .digest('hex')
+}
+
+export function recordVerifiedInProcessMainLogin(slot: MainOauthSlot): void {
+  const fingerprint = mainSlotFamilyFingerprint(slot)
+  if (fingerprint) verifiedInProcessMainLoginFingerprints.add(fingerprint)
+}
+
+export function hasVerifiedInProcessMainLogin(slot: MainOauthSlot): boolean {
+  const fingerprint = mainSlotFamilyFingerprint(slot)
+  return (
+    fingerprint !== undefined &&
+    verifiedInProcessMainLoginFingerprints.has(fingerprint)
+  )
 }
 
 export type MainAuthSlot =

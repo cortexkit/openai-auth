@@ -662,9 +662,12 @@ describe('main login transition lease', () => {
 
     await transition.releaseCustodyLoginLeaseAfterHostWrite({
       accessToken: 'minted-access',
+      refreshToken: 'minted-refresh',
       getAuth: async () => {
         reads += 1
-        return reads === 2 ? { access: 'minted-access' } : { access: 'other' }
+        return reads === 2
+          ? { access: 'minted-access', refresh: 'minted-refresh' }
+          : { access: 'other', refresh: 'other-refresh' }
       },
       release,
       warn,
@@ -687,7 +690,8 @@ describe('main login transition lease', () => {
 
     await transition.releaseCustodyLoginLeaseAfterHostWrite({
       accessToken: 'minted-access',
-      getAuth: async () => ({ access: 'other' }),
+      refreshToken: 'minted-refresh',
+      getAuth: async () => ({ access: 'other', refresh: 'other-refresh' }),
       release,
       warn,
       now: () => now,
