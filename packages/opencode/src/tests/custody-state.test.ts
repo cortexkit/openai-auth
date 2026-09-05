@@ -550,7 +550,6 @@ describe('evaluateCustodyStartup — §16 invariants', () => {
 
   test('exports the complete v7 inert-reason vocabulary', () => {
     expect(CUSTODY_INERT_REASONS).toEqual([
-      'enrolled-under-local',
       'needs-login',
       'mode-mismatch',
       'corrupt-under-binding',
