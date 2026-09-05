@@ -462,6 +462,28 @@ describe('custody request resolution', () => {
     })
   })
 
+  it('binds an absent account id from the first served credential', async () => {
+    const fallback = makeSentinelAccount({
+      id: 'custody-1',
+      accountId: undefined,
+    })
+    await withCustodyLoader(
+      {
+        accounts: [fallback],
+        credential: { material: jwtFor('acct-bound'), recordVersion: 19 },
+        respond: () => 200,
+      },
+      async ({ fetchOverride, configPath }) => {
+        const [url, init] = codexRequest()
+        expect((await fetchOverride(url, init)).status).toBe(200)
+        const bound = (await loadAccounts(configPath))?.accounts.find(
+          (account) => account.id === fallback.id,
+        )
+        expect(bound).toMatchObject({ accountId: 'acct-bound' })
+      },
+    )
+  })
+
   it('reconciles an expired bound row to the vault before fallback routing', async () => {
     const expired = enrollingAccount()
     const next = enrollingAccount({
