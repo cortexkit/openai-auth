@@ -38,24 +38,19 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('plugin-wide claustrum gate', () => {
-  it('preserves the shape and round-trips enabled:false + manifestWrite:false on disk', async () => {
+  it('round-trips explicit local mode on disk', async () => {
     const storage: AccountStorage = {
       version: 1,
       main: { type: 'opencode', provider: 'openai' },
       accounts: [],
       claustrum: claustrumConfig({ mode: 'local' }),
     }
-    // loadAccounts/saveAccounts write through the configFromStorage path,
-    // so a successful round-trip proves both directions preserve both fields.
     await saveAccounts(storage, cfgPath)
     const loaded = await loadAccounts(cfgPath)
-    expect(loaded?.claustrum).toEqual({
-      enabled: false,
-      manifestWrite: false,
-    })
+    expect(loaded?.claustrum?.mode).toBe('local')
   })
 
-  it('round-trips enabled:true + manifestWrite:false', async () => {
+  it('round-trips explicit claustrum mode on disk', async () => {
     await saveAccounts(
       {
         version: 1,
@@ -66,24 +61,23 @@ describe('plugin-wide claustrum gate', () => {
       cfgPath,
     )
     const loaded = await loadAccounts(cfgPath)
-    expect(loaded?.claustrum).toEqual({
-      enabled: true,
-      manifestWrite: false,
-    })
+    expect(loaded?.claustrum?.mode).toBe('claustrum')
   })
 
-  it('defaults an omitted manifestWrite key to false', async () => {
+  it('rejects a legacy enabled switch instead of accepting it as mode', async () => {
+    const claustrum = Object.fromEntries([['enabled', true]])
     writeFileSync(
       cfgPath,
       JSON.stringify({
         version: 1,
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
-        claustrum: claustrumConfig({ mode: 'claustrum' }),
+        claustrum,
       }),
     )
-    const loaded = await loadAccounts(cfgPath)
-    expect(loaded?.claustrum).toEqual({ enabled: true, manifestWrite: false })
+    await expect(loadAccounts(cfgPath)).rejects.toThrow(
+      'Remove the legacy claustrum switches and run /openai-account claustrum',
+    )
   })
 
   it('normalizes old config files with no claustrum block byte-identical (no implicit block on read)', async () => {
@@ -103,23 +97,23 @@ describe('plugin-wide claustrum gate', () => {
     expect(loaded?.claustrum).toBeUndefined()
   })
 
-  it('coerces non-boolean claustrum fields to false (typos cannot arm the vault path)', async () => {
-    // A string "true" must NOT flip the toggle. The storage normalizer
-    // accepts only `=== true`; any other shape collapses to false.
-    await saveAccounts(
-      {
+  it('rejects legacy switches with non-boolean values instead of coercing them', async () => {
+    const claustrum = Object.fromEntries([
+      ['enabled', 'true'],
+      ['manifestWrite', 1],
+    ])
+    writeFileSync(
+      cfgPath,
+      JSON.stringify({
         version: 1,
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
-        claustrum: claustrumConfig({ mode: 'local' }),
-      },
-      cfgPath,
+        claustrum,
+      }),
     )
-    const loaded = await loadAccounts(cfgPath)
-    expect(loaded?.claustrum).toEqual({
-      enabled: false,
-      manifestWrite: false,
-    })
+    await expect(loadAccounts(cfgPath)).rejects.toThrow(
+      'Remove the legacy claustrum switches and run /openai-account claustrum',
+    )
   })
 
   it('never emits a per-account claustrum.accounts map on disk', async () => {
