@@ -41,6 +41,7 @@ import {
 } from '../core/custody.ts'
 import { readCustodyManifest } from '../core/custody-manifest.ts'
 import {
+  claustrumConfig,
   liveAccount,
   liveStorage,
   makeSentinelAccount,
@@ -135,6 +136,68 @@ async function writeManifest(providers: unknown[]): Promise<void> {
 }
 
 describe('readCustodyManifest', () => {
+  it('manifest revision changes when only parsed source whitespace changes', async () => {
+    const source = JSON.stringify({
+      version: 1,
+      providers: [
+        {
+          provider: 'openai',
+          shape: 'oauth',
+          serve: 'openai-auth',
+          accounts: [
+            {
+              label: 'main',
+              handle: `ckh_${'a'.repeat(43)}`,
+              credential_id: 'oauth:openai:main',
+            },
+          ],
+        },
+      ],
+    })
+    writeFileSync(handlesPath, source, { mode: 0o600 })
+    chmodSync(handlesPath, 0o600)
+    const first = await readCustodyManifest(handlesPath)
+    writeFileSync(handlesPath, `\n${source}\n`, { mode: 0o600 })
+    chmodSync(handlesPath, 0o600)
+    const second = await readCustodyManifest(handlesPath)
+
+    expect(first.ok).toBe(true)
+    expect(second.ok).toBe(true)
+    if (!first.ok || !second.ok) throw new Error('expected valid manifests')
+    expect(first.revision).not.toBe(second.revision)
+  })
+
+  it('manifest revision is stable for the same bytes across two reads', async () => {
+    const source = JSON.stringify({
+      version: 1,
+      providers: [
+        {
+          provider: 'openai',
+          shape: 'oauth',
+          serve: 'openai-auth',
+          accounts: [
+            {
+              label: 'main',
+              handle: `ckh_${'a'.repeat(43)}`,
+              credential_id: 'oauth:openai:main',
+            },
+          ],
+        },
+      ],
+    })
+    writeFileSync(handlesPath, source, { mode: 0o600 })
+    chmodSync(handlesPath, 0o600)
+
+    const first = await readCustodyManifest(handlesPath)
+    const second = await readCustodyManifest(handlesPath)
+
+    expect(first.ok).toBe(true)
+    expect(second.ok).toBe(true)
+    if (!first.ok || !second.ok) throw new Error('expected valid manifests')
+    expect(first.revision).toMatch(/^[a-f0-9]{64}$/)
+    expect(first.revision).toBe(second.revision)
+  })
+
   it('reads a regular 0600 file owned by the current uid', async () => {
     const handle = `ckh_${'a'.repeat(43)}`
     await writeManifest([
@@ -379,7 +442,11 @@ describe('predicates', () => {
     const m = await readCustodyManifest(handlesPath) // empty manifest
     const sentinel = makeSentinelAccount()
     expect(
-      custodied(sentinel, m, liveStorage([], { claustrum: { enabled: true } })),
+      custodied(
+        sentinel,
+        m,
+        liveStorage([], { claustrum: claustrumConfig({ mode: 'claustrum' }) }),
+      ),
     ).toBe(false)
     await writeManifest([
       {
@@ -401,7 +468,7 @@ describe('predicates', () => {
       custodied(
         sentinel,
         m2,
-        liveStorage([], { claustrum: { enabled: false } }),
+        liveStorage([], { claustrum: claustrumConfig({ mode: 'local' }) }),
       ),
     ).toBe(false)
     // Toggle ON → custodied.
@@ -409,7 +476,7 @@ describe('predicates', () => {
       custodied(
         sentinel,
         m2,
-        liveStorage([], { claustrum: { enabled: true } }),
+        liveStorage([], { claustrum: claustrumConfig({ mode: 'claustrum' }) }),
       ),
     ).toBe(true)
   })
@@ -450,7 +517,7 @@ describe('predicates', () => {
       excluded(
         tomb,
         m,
-        liveStorage([], { claustrum: { enabled: false } }),
+        liveStorage([], { claustrum: claustrumConfig({ mode: 'local' }) }),
         'openai',
       ),
     ).toBe(true)
@@ -459,7 +526,7 @@ describe('predicates', () => {
       excluded(
         tomb,
         m,
-        liveStorage([], { claustrum: { enabled: true } }),
+        liveStorage([], { claustrum: claustrumConfig({ mode: 'claustrum' }) }),
         'openai',
       ),
     ).toBe(false)
@@ -485,7 +552,9 @@ describe('predicates', () => {
     ])
     const m = await readCustodyManifest(handlesPath)
     const acct = liveAccount('main')
-    const storage = liveStorage([acct], { claustrum: { enabled: false } })
+    const storage = liveStorage([acct], {
+      claustrum: claustrumConfig({ mode: 'local' }),
+    })
     // resolveFallbackAccess observes the predicates; with toggle off + live cache,
     // it must serve local access, NOT consult the vault.
     const result = await resolveFallbackAccess(acct, storage, m)
@@ -601,7 +670,9 @@ describe('resolveFallbackAccess', () => {
   it('returns CUSTODY_REFUSE when the manifest is empty but the account is tombstoned', async () => {
     const acct = makeSentinelAccount()
     const m = await readCustodyManifest(handlesPath) // empty
-    const storage = liveStorage([acct], { claustrum: { enabled: true } })
+    const storage = liveStorage([acct], {
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    })
     const result = await resolveFallbackAccess(acct, storage, m)
     expect(result).toBe(CUSTODY_REFUSE)
   })
@@ -609,7 +680,9 @@ describe('resolveFallbackAccess', () => {
   it('returns CUSTODY_EXCLUDED for tombstoned + claustrum.enabled=false', async () => {
     const acct = makeSentinelAccount()
     const m = await readCustodyManifest(handlesPath) // empty
-    const storage = liveStorage([acct], { claustrum: { enabled: false } })
+    const storage = liveStorage([acct], {
+      claustrum: claustrumConfig({ mode: 'local' }),
+    })
     const result = await resolveFallbackAccess(acct, storage, m)
     expect(result).toBe(CUSTODY_EXCLUDED)
   })
@@ -626,7 +699,9 @@ describe('resolveFallbackAccess', () => {
       },
     ])
     const m = await readCustodyManifest(handlesPath)
-    const storage = liveStorage([acct], { claustrum: { enabled: true } })
+    const storage = liveStorage([acct], {
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    })
     const served = jwtFor('acct-X')
     const cache = new ClaustrumCredentialCache({
       connector: async () =>
@@ -680,7 +755,9 @@ describe('resolveFallbackAccess', () => {
       },
     ])
     const m = await readCustodyManifest(handlesPath)
-    const storage = liveStorage([acct], { claustrum: { enabled: true } })
+    const storage = liveStorage([acct], {
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    })
     const cache = new ClaustrumCredentialCache({
       connector: async () =>
         (async () => ({
@@ -722,7 +799,9 @@ describe('resolveFallbackAccess', () => {
         ],
       },
     ])
-    const storage = liveStorage([account], { claustrum: { enabled: true } })
+    const storage = liveStorage([account], {
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    })
     const manifest = await readCustodyManifest(handlesPath)
     let version = 1
     const cache = new ClaustrumCredentialCache({

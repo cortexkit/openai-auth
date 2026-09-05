@@ -11,6 +11,7 @@
  * lstat/O_NOFOLLOW/fstat + 0600/uid + parent + 256 KiB cap + bounded read.
  */
 
+import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
 import {
   lstat as nodeLstat,
@@ -49,7 +50,7 @@ export function defaultCustodyManifestPath(
 }
 
 export type CustodyManifestReadResult =
-  | { ok: true; value: ManifestHandleFile }
+  | { ok: true; value: ManifestHandleFile; revision?: string }
   | { ok: false; reason: 'absent' }
   | { ok: false; reason: 'tooLarge'; message: string }
   | {
@@ -226,10 +227,14 @@ export async function readCustodyManifest(
     if (!parsed) {
       return { ok: false, reason: 'invalid', message: 'invalid manifest' }
     }
-    return { ok: true, value: parsed }
+    return { ok: true, value: parsed, revision: manifestRevision(source) }
   } finally {
     await descriptor?.close()
   }
+}
+
+export function manifestRevision(source: string): string {
+  return createHash('sha256').update(source, 'utf8').digest('hex')
 }
 
 function errno(error: unknown): string {
