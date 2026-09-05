@@ -12,6 +12,10 @@
 import type { AccountStorage, OAuthAccount } from '../core/accounts.ts'
 import { CUSTODY_TOMBSTONE_PREFIX } from '../core/custody.ts'
 import type { CustodyManifestReadResult } from '../core/custody-manifest.ts'
+import type {
+  ClaustrumMode,
+  CustodyTransitionState,
+} from '../core/custody-transition.ts'
 
 const CUSTODY_PROVIDER = 'openai'
 
@@ -34,13 +38,14 @@ export function makeSentinelAccount(
 export function liveAccount(
   id: string,
   overrides: Partial<OAuthAccount> = {},
+  now = 4_102_444_800_000,
 ): OAuthAccount {
   return {
     id,
     type: 'oauth',
     access: `acc-${id}`,
     refresh: `ref-${id}`,
-    expires: Date.now() + 3_600_000,
+    expires: now + 3_600_000,
     addedAt: 1_000,
     ...overrides,
   }
@@ -58,14 +63,24 @@ export function liveStorage(
   }
 }
 
+export function claustrumConfig(
+  options: {
+    mode?: ClaustrumMode
+    transition?: CustodyTransitionState
+    rowHistory?: string[]
+  } = {},
+): NonNullable<AccountStorage['claustrum']> {
+  return {
+    mode: options.mode ?? 'claustrum',
+    ...(options.transition ? { transition: options.transition } : {}),
+    ...(options.rowHistory ? { rowHistory: options.rowHistory } : {}),
+  }
+}
+
 export function withManifestWrite(storage: AccountStorage): AccountStorage {
   return {
     ...storage,
-    claustrum: {
-      ...storage.claustrum,
-      enabled: storage.claustrum?.enabled ?? true,
-      manifestWrite: true,
-    },
+    claustrum: claustrumConfig({ mode: 'claustrum' }),
   }
 }
 

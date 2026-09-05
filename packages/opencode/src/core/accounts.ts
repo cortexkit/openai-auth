@@ -25,6 +25,10 @@ import {
   tombstoned,
 } from './custody.ts'
 import type { CustodyManifestReadResult } from './custody-manifest.ts'
+import type {
+  ClaustrumMode,
+  CustodyTransitionState,
+} from './custody-transition.ts'
 import { extractAccountId } from './oauth'
 import type {
   ProviderQuotaFn,
@@ -65,6 +69,12 @@ export {
 // Re-export the widened QuotaWindowName + consts from the injection seam
 // ---------------------------------------------------------------------------
 
+export {
+  accountStoreGeneration,
+  type ClaustrumMode,
+  type CustodyTransitionState,
+  custodySlotFingerprint,
+} from './custody-transition.ts'
 export type { QuotaWindowName }
 export { PRIMARY, SECONDARY }
 
@@ -252,17 +262,10 @@ export type AccountStorage = {
   }
   /** Stable ChatGPT account identifier of the main account (extracted from OAuth token). */
   mainAccountId?: string
-  /** Vault-custody policy toggle. Gates serving only: when true, an account
-   *  that is both manifest-enrolled and tombstoned (`custodied`) serves its
-   *  access token from the Claustrum vault; without the toggle the same
-   *  account is `excluded`. Does NOT participate in the refresh gate.
-   *  `manifestWrite` arms EVERY custody write that destroys local oauth
-   *  secrets — defined by that property, not by the verb that happens to
-   *  perform it, so a new destructive path (the enroll verb, a future sweep)
-   *  inherits the gate by construction rather than by someone remembering to
-   *  add it. Absent or false keeps manifest reads reversible: no local secret
-   *  is ever overwritten. */
   claustrum?: {
+    mode?: ClaustrumMode
+    transition?: CustodyTransitionState
+    rowHistory?: string[]
     enabled?: boolean
     manifestWrite?: boolean
   }
@@ -635,18 +638,64 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     cachekeep: isRecord(value.cachekeep) ? value.cachekeep : undefined,
     mainAccountId:
       typeof value.mainAccountId === 'string' ? value.mainAccountId : undefined,
-    // claustrum: one plugin-wide gate. No per-account map (intentional —
-    // membership is the manifest entry). Coerce only true booleans; anything
-    // else collapses to false so a typo (e.g. `"enabled": "true"`) does not
-    // silently arm the vault path. manifestWrite defaults false; explicit
-    // false is always an operator kill switch.
-    claustrum: isRecord(value.claustrum)
-      ? {
-          enabled: value.claustrum.enabled === true,
-          manifestWrite: value.claustrum.manifestWrite === true,
-        }
-      : undefined,
+    claustrum: normalizeClaustrum(value.claustrum),
     accounts: normalizedAccounts,
+  }
+}
+
+function normalizeClaustrum(value: unknown): AccountStorage['claustrum'] {
+  if (!isRecord(value)) return undefined
+  if (
+    Object.hasOwn(value, 'enabled') ||
+    Object.hasOwn(value, 'manifestWrite')
+  ) {
+    throw new Error(
+      'Remove the legacy claustrum switches and run /openai-account claustrum',
+    )
+  }
+  const mode = value.mode === 'claustrum' ? 'claustrum' : 'local'
+  const transition = normalizeCustodyTransition(value.transition)
+  const rowHistory = Array.isArray(value.rowHistory)
+    ? value.rowHistory.filter(
+        (entry): entry is string => typeof entry === 'string',
+      )
+    : undefined
+
+  return {
+    mode,
+    transition,
+    rowHistory,
+    enabled: mode === 'claustrum',
+    manifestWrite: mode === 'claustrum',
+  }
+}
+
+function normalizeCustodyTransition(
+  value: unknown,
+): CustodyTransitionState | undefined {
+  if (!isRecord(value) || !isRecord(value.fingerprints)) return undefined
+  if (
+    typeof value.manifestRevision !== 'string' ||
+    typeof value.storeGeneration !== 'string' ||
+    !isRecord(value.fingerprints.fallbacks)
+  ) {
+    return undefined
+  }
+  const fallbacks = Object.fromEntries(
+    Object.entries(value.fingerprints.fallbacks).filter(
+      (entry): entry is [string, string] => typeof entry[1] === 'string',
+    ),
+  )
+  return {
+    manifestRevision: value.manifestRevision,
+    storeGeneration: value.storeGeneration,
+    fingerprints: {
+      main:
+        typeof value.fingerprints.main === 'string'
+          ? value.fingerprints.main
+          : undefined,
+      fallbacks,
+    },
   }
 }
 
@@ -944,14 +993,18 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     logging: storage.logging,
     cachekeep: storage.cachekeep,
     mainAccountId: storage.mainAccountId,
-    // Only the explicit booleans land on disk — false is the operator's
-    // kill switch and must survive a round-trip; an absent claustrum is
-    // omitted entirely so old files normalize byte-identical.
     ...(storage.claustrum !== undefined
       ? {
           claustrum: {
-            enabled: storage.claustrum.enabled === true,
-            manifestWrite: storage.claustrum.manifestWrite === true,
+            mode:
+              storage.claustrum.mode ??
+              (storage.claustrum.enabled === true ? 'claustrum' : 'local'),
+            ...(storage.claustrum.transition
+              ? { transition: storage.claustrum.transition }
+              : {}),
+            ...(storage.claustrum.rowHistory
+              ? { rowHistory: storage.claustrum.rowHistory }
+              : {}),
           },
         }
       : {}),
@@ -1024,6 +1077,48 @@ async function acquireSaveAccountsLock(path: string) {
       `lock contention; a much larger one means this process's event loop was ` +
       `saturated and the wait expired without getting scheduled.`,
   )
+}
+
+export function claustrumMode(
+  storage: Pick<AccountStorage, 'claustrum'> | null | undefined,
+): ClaustrumMode {
+  return storage?.claustrum?.mode === 'claustrum' ? 'claustrum' : 'local'
+}
+
+export async function writeClaustrumModeAndTransition(
+  path: string,
+  mode: ClaustrumMode,
+  transition?: CustodyTransitionState,
+): Promise<void> {
+  const statePath = getAccountStatePath(path)
+  const lock = await acquireSaveAccountsLock(path)
+  try {
+    const stateLock = await acquireSaveAccountsLock(statePath)
+    try {
+      const configJson = await readJsonIfPresent(path)
+      const existing = isRecord(configJson.value)
+        ? configJson.value
+        : { version: 1, accounts: [] }
+      const existingClaustrum = isRecord(existing.claustrum)
+        ? existing.claustrum
+        : {}
+      const rowHistory = Array.isArray(existingClaustrum.rowHistory)
+        ? existingClaustrum.rowHistory.filter(
+            (entry): entry is string => typeof entry === 'string',
+          )
+        : undefined
+      const claustrum = {
+        mode,
+        ...(mode === 'claustrum' && transition ? { transition } : {}),
+        ...(rowHistory ? { rowHistory } : {}),
+      }
+      await writeJsonAtomic(path, { ...existing, claustrum })
+    } finally {
+      await stateLock.release()
+    }
+  } finally {
+    await lock.release()
+  }
 }
 
 function stateFromStorage(storage: AccountStorage): AccountRuntimeState {
