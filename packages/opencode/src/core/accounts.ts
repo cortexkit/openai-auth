@@ -665,8 +665,9 @@ function normalizeClaustrum(value: unknown): AccountStorage['claustrum'] {
     mode,
     transition,
     rowHistory,
+    // Transitional shim until Task 3 removes consumers; Phase-B-only manifestWrite stays disarmed under every mode.
     enabled: mode === 'claustrum',
-    manifestWrite: mode === 'claustrum',
+    manifestWrite: false,
   }
 }
 

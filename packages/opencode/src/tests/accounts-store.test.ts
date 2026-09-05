@@ -17,6 +17,7 @@ import type {
   OAuthAccount,
 } from '../core/accounts.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
+import { claustrumConfig } from './custody-fixtures.ts'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_LOG_FILE,
@@ -203,6 +204,20 @@ describe('accounts store', () => {
         'Remove the legacy claustrum switches and run /openai-account claustrum',
       )
     }
+  })
+
+  it('claustrum mode never arms the enrollment-completion write', async () => {
+    const { loadAccounts } = await import('../core/accounts.ts')
+    writeFileSync(
+      cfgPath,
+      JSON.stringify({
+        version: 1,
+        accounts: [],
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
+      }),
+    )
+
+    expect((await loadAccounts(cfgPath))?.claustrum?.manifestWrite).toBe(false)
   })
 
   it('mode and takeover fingerprints round-trip in one config write', async () => {
