@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import {
+  claustrumMode,
+  FALLBACK_REFRESH_LOCK_TTL_MS,
+  fallbackRefreshLockName,
   getAccountStoragePath,
   loadAccounts,
   mutateAccounts,
@@ -12,6 +15,7 @@ import {
   beginAccountLogin,
   upsertAccount,
 } from './core/oauth'
+import { acquireRefreshFileLock } from './core/refresh-file-lock'
 import { openUrl } from './util/open-url'
 
 export { openUrl as openBrowserForLogin } from './util/open-url'
@@ -87,21 +91,45 @@ async function main() {
       // Read-modify-write under the store lock so a concurrent add/remove
       // (another CLI invocation or a TUI command) cannot clobber this insertion,
       // and the self-fallback check sees the freshest mainAccountId.
-      let selfFallback = false
-      await mutateAccounts((current) => {
-        // Reject self-fallback: adding main's ChatGPT account as a fallback
-        // would let routing retry on the account that just returned 429.
-        if (
-          account.accountId &&
-          current.mainAccountId &&
-          account.accountId === current.mainAccountId
-        ) {
-          selfFallback = true
-          return current
-        }
-        upsertAccount(current.accounts, account as unknown as OAuthAccount)
-        return current
+      const configPath = getAccountStoragePath()
+      const lock = await acquireRefreshFileLock({
+        name: fallbackRefreshLockName(account.id),
+        ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+        path: configPath,
+        renew: true,
       })
+      if (!lock) throw new Error('Fallback account lock unavailable')
+      let selfFallback = false
+      let blockedByClaustrum = false
+      try {
+        if (
+          claustrumMode((await loadAccounts(configPath)) ?? {}) === 'claustrum'
+        ) {
+          blockedByClaustrum = true
+        } else {
+          await mutateAccounts((current) => {
+            if (
+              account.accountId &&
+              current.mainAccountId &&
+              account.accountId === current.mainAccountId
+            ) {
+              selfFallback = true
+              return current
+            }
+            upsertAccount(current.accounts, account as unknown as OAuthAccount)
+            return current
+          }, configPath)
+        }
+      } finally {
+        await lock.release()
+      }
+
+      if (blockedByClaustrum) {
+        console.error(
+          '\nError: Claustrum mode is active. Run /openai-account local before adding a fallback account.',
+        )
+        process.exit(1)
+      }
 
       if (selfFallback) {
         console.error(

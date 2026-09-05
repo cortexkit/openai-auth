@@ -104,6 +104,31 @@ export async function acquireCustodyTransitionMutex(): Promise<Release> {
   }
 }
 
+export async function releaseCustodyLoginLeaseAfterHostWrite(input: {
+  accessToken: string
+  getAuth(): Promise<{ access?: string } | undefined>
+  release(): Promise<void>
+  warn(message: string): void
+  now(): number
+  sleep(ms: number): Promise<void>
+}): Promise<void> {
+  const deadline = input.now() + 5_000
+  while (input.now() < deadline) {
+    try {
+      const auth = await input.getAuth()
+      if (auth?.access === input.accessToken) {
+        await input.release()
+        return
+      }
+    } catch {
+      // A transient host read must not strand the process-local exclusion lease.
+    }
+    await input.sleep(Math.min(100, deadline - input.now()))
+  }
+  input.warn('host write not observed within 5s; lease released')
+  await input.release()
+}
+
 type Participant = {
   id: string
   accountId?: string
