@@ -19,7 +19,11 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AccountStorage, OAuthAccount } from '../core/accounts.ts'
+import type {
+  AccountStorage,
+  CorruptOAuthAccount,
+  OAuthAccount,
+} from '../core/accounts.ts'
 import {
   FallbackAccountManager,
   loadAccounts,
@@ -33,6 +37,7 @@ import {
   readCustodyManifest,
 } from '../core/custody-manifest.ts'
 import { CUSTODY_DEPS_INCOMPLETE } from '../core/refresh-all-quota.ts'
+import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
 import {
   __createCustodyRuntimeForTest,
   __resetSweepFailureLogDedupeForTest,
@@ -62,6 +67,7 @@ let scratchDir: string
 let configPath: string
 let manifestPath: string
 let originalManifestEnv: string | undefined
+let originalStateEnv: string | undefined
 
 type Detections = 'available' | 'absent' | 'malformed'
 type DetectionResult = Awaited<ReturnType<typeof detectClaustrumConnection>>
@@ -169,6 +175,27 @@ async function writeStorageWithManifest(
   chmodSync(manifestPath, 0o600)
 }
 
+async function writeCorruptStorageWithManifest(
+  storage: AccountStorage,
+  manifest: CustodyManifestReadResult,
+): Promise<void> {
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      ...storage,
+      accounts: storage.accounts.map((account) =>
+        account.type === 'oauth' && account.corrupt
+          ? { ...account, corrupt: undefined, refresh: '' }
+          : account,
+      ),
+    }),
+    { mode: 0o600 },
+  )
+  if (!manifest.ok) return
+  writeFileSync(manifestPath, JSON.stringify(manifest.value), { mode: 0o600 })
+  chmodSync(manifestPath, 0o600)
+}
+
 async function writeBoundRealFixture(): Promise<OAuthAccount> {
   const account = liveAccount('fb-1', { accountId: 'acct-1' })
   await writeStorageWithManifest(
@@ -183,13 +210,16 @@ beforeEach(() => {
   configPath = join(scratchDir, 'openai-auth.json')
   manifestPath = join(scratchDir, 'opencode-handles.json')
   originalManifestEnv = process.env.CLAUSTRUM_OPENCODE_HANDLES
+  originalStateEnv = process.env.OPENCODE_OPENAI_AUTH_STATE_FILE
   process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+  process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = join(scratchDir, 'state.json')
   __resetSweepFailureLogDedupeForTest()
 })
 
 afterEach(() => {
   process.env.CLAUSTRUM_OPENCODE_HANDLES =
     originalManifestEnv ?? FLOOR_CLAUSTRUM_HANDLES
+  process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = originalStateEnv
   try {
     rmSync(scratchDir, { recursive: true, force: true })
   } catch {}
@@ -235,6 +265,21 @@ function makeOptions(
     }),
     logger: overrides.logger ?? makeLogger(),
     ...rest,
+  }
+}
+
+function corruptAccount(
+  id = 'fb-1',
+  overrides: Partial<CorruptOAuthAccount> = {},
+): CorruptOAuthAccount {
+  return {
+    id,
+    type: 'oauth',
+    corrupt: true,
+    enabled: false,
+    accountId: 'acct-1',
+    addedAt: 123,
+    ...overrides,
   }
 }
 
@@ -561,6 +606,207 @@ describe('custody warm and tick', () => {
 // ---------------------------------------------------------------------------
 
 describe('enroll-completion sweep', () => {
+  for (const vaultState of ['serves', 'cold', 'needs_reauth'] as const) {
+    it(`installs the exact fallback tombstone over a corrupt marker when the vault ${vaultState}`, async () => {
+      const corrupt = corruptAccount()
+      const storage: AccountStorage = {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [corrupt],
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
+      }
+      await writeCorruptStorageWithManifest(
+        storage,
+        enrollmentManifest(corrupt.id),
+      )
+      const { transport } = makeTransport(() => ({
+        material: makeJwt('acct-1'),
+        recordVersion: 1,
+        expiresAtMs: Date.now() + 600_000,
+      }))
+      const runtime = __createCustodyRuntimeForTest(
+        makeOptions({
+          storage,
+          transport,
+          detection: 'available',
+          resolveFallbackVaultState: async () => vaultState,
+        }),
+      )
+
+      expect((await loadAccounts(configPath))?.accounts[0]).toMatchObject({
+        id: 'fb-1',
+        corrupt: true,
+      })
+
+      await runtime.boot()
+
+      expect((await loadAccounts(configPath))?.accounts).toEqual([
+        {
+          id: 'fb-1',
+          type: 'oauth',
+          access: '',
+          refresh: TOMBSTONE_OPENAI,
+          expires: 0,
+          enabled: false,
+          accountId: 'acct-1',
+          addedAt: 123,
+        },
+      ])
+      runtime.dispose()
+    })
+  }
+
+  for (const vaultState of ['no_handle', 'identity_mismatch'] as const) {
+    it(`does not install a corrupt fallback marker for ${vaultState}`, async () => {
+      const corrupt = corruptAccount()
+      const storage: AccountStorage = {
+        version: 1,
+        accounts: [corrupt],
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
+      }
+      await writeCorruptStorageWithManifest(
+        storage,
+        enrollmentManifest(corrupt.id),
+      )
+      const { transport } = makeTransport(() => ({
+        material: makeJwt('acct-1'),
+        recordVersion: 1,
+        expiresAtMs: Date.now() + 600_000,
+      }))
+      const runtime = __createCustodyRuntimeForTest(
+        makeOptions({
+          storage,
+          transport,
+          detection: 'available',
+          resolveFallbackVaultState: async () => vaultState,
+        }),
+      )
+
+      await runtime.boot()
+
+      expect((await loadAccounts(configPath))?.accounts).toEqual([corrupt])
+      runtime.dispose()
+    })
+  }
+
+  it('does not install a corrupt fallback marker without a manifest binding', async () => {
+    const corrupt = corruptAccount()
+    const storage: AccountStorage = {
+      version: 1,
+      accounts: [corrupt],
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    }
+    await writeCorruptStorageWithManifest(storage, emptyManifest())
+    const { transport, captured } = makeTransport(() => {
+      throw new Error('vault must not be consulted')
+    })
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({ storage, transport, detection: 'available' }),
+    )
+
+    await runtime.boot()
+
+    expect((await loadAccounts(configPath))?.accounts).toEqual([corrupt])
+    expect(captured.getCalls).toEqual([])
+    runtime.dispose()
+  })
+
+  it('preserves fallback roster order and enabled metadata during install', async () => {
+    const first = liveAccount('fb-first')
+    const corrupt = corruptAccount('fb-corrupt', { enabled: true })
+    const last = liveAccount('fb-last')
+    const storage: AccountStorage = {
+      version: 1,
+      accounts: [first, corrupt, last],
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    }
+    await writeCorruptStorageWithManifest(
+      storage,
+      enrollmentManifest(corrupt.id),
+    )
+    const { transport } = makeTransport(() => ({
+      material: makeJwt('acct-1'),
+      recordVersion: 1,
+      expiresAtMs: Date.now() + 600_000,
+    }))
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({
+        storage,
+        transport,
+        detection: 'available',
+        resolveFallbackVaultState: async () => 'serves',
+      }),
+    )
+
+    await runtime.boot()
+
+    const after = await loadAccounts(configPath)
+    expect(after?.accounts.map((account) => account.id)).toEqual([
+      'fb-first',
+      'fb-corrupt',
+      'fb-last',
+    ])
+    expect(after?.accounts[1]?.enabled).toBe(true)
+    runtime.dispose()
+  })
+
+  it('re-reads the corrupt marker under the refresh lock so two processes install once', async () => {
+    const corrupt = corruptAccount()
+    const storage: AccountStorage = {
+      version: 1,
+      accounts: [corrupt],
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    }
+    await writeCorruptStorageWithManifest(
+      storage,
+      enrollmentManifest(corrupt.id),
+    )
+    let installs = 0
+    const countingMutate: typeof mutateAccounts = async (transform, path) =>
+      mutateAccounts((current) => {
+        const before = current.accounts.find(
+          (account) => account.id === corrupt.id,
+        )
+        const next = transform(current)
+        if (before?.type === 'oauth' && before.corrupt) installs += 1
+        return next
+      }, path)
+    const firstWithCount = __createCustodyRuntimeForTest({
+      ...makeOptions({
+        storage,
+        transport: makeTransport(() => ({
+          material: makeJwt('acct-1'),
+          recordVersion: 1,
+          expiresAtMs: Date.now() + 600_000,
+        })).transport,
+        detection: 'available',
+        resolveFallbackVaultState: async () => 'serves',
+        acquireRefreshFileLock,
+      }),
+      mutateAccounts: countingMutate,
+    })
+    const secondWithCount = __createCustodyRuntimeForTest({
+      ...makeOptions({
+        storage,
+        transport: makeTransport(() => ({
+          material: makeJwt('acct-1'),
+          recordVersion: 1,
+          expiresAtMs: Date.now() + 600_000,
+        })).transport,
+        detection: 'available',
+        resolveFallbackVaultState: async () => 'serves',
+        acquireRefreshFileLock,
+      }),
+      mutateAccounts: countingMutate,
+    })
+
+    await Promise.all([firstWithCount.boot(), secondWithCount.boot()])
+
+    expect(installs).toBe(1)
+    firstWithCount.dispose()
+    secondWithCount.dispose()
+  })
+
   it('writes both tombstone fields and expiry in exactly one account mutation', async () => {
     const live = liveAccount('fb-1', { accountId: 'acct-1' })
     await writeStorageWithManifest(

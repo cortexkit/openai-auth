@@ -7,8 +7,10 @@ import {
   detectClaustrumConnection,
   getDefaultClaustrumConnectionPath,
 } from '../vendor/claustrum-client/index.ts'
+import { fallbackRefreshLockName } from './account-paths.ts'
 import {
   type AccountStorage,
+  FALLBACK_REFRESH_LOCK_TTL_MS,
   isOAuthAccount,
   type loadAccounts,
   type mutateAccounts,
@@ -20,6 +22,7 @@ import {
   type CompleteEnrollmentOutcome,
   completeFallbackEnrollment,
   custodied,
+  custodyTombstoneKey,
   enrolling,
   enrollPendingReason,
   refreshInert,
@@ -31,6 +34,11 @@ import {
   defaultCustodyManifestPath,
   type readCustodyManifest,
 } from './custody-manifest.ts'
+import {
+  evaluateCustodyStartup,
+  type VaultCustodyState,
+} from './custody-state.ts'
+import { extractAccountIdFromClaims, parseJwtClaims } from './oauth.ts'
 import type { acquireRefreshFileLock } from './refresh-file-lock.ts'
 
 // ---------------------------------------------------------------------------
@@ -67,6 +75,10 @@ export type CustodyRuntimeOptions = {
   mutateAccounts: typeof mutateAccounts
   readCustodyManifest: typeof readCustodyManifest
   acquireRefreshFileLock: typeof acquireRefreshFileLock
+  resolveFallbackVaultState?: (input: {
+    accountId: string
+    handle: string
+  }) => Promise<VaultCustodyState>
   now?: () => number
   setIntervalFn?: (
     callback: () => void,
@@ -221,6 +233,7 @@ export function __createCustodyRuntimeForTest(
       }
       const manifest = await options.readCustodyManifest(manifestPath)
       latestManifest = manifest
+      await runFallbackInstallPass(manifest)
       const enabledHandles = enabledManifestHandles(manifest, options.storage)
       const sweepPromises: Promise<void>[] = []
       for (const account of oauthAccounts(options.storage)) {
@@ -260,6 +273,7 @@ export function __createCustodyRuntimeForTest(
       // the next tick without a restart.
       const manifest = await options.readCustodyManifest(manifestPath)
       latestManifest = manifest
+      await runFallbackInstallPass(manifest)
       const enabledHandles = enabledManifestHandles(manifest, options.storage)
       // Step 1: completion sweep — every enrolling account under its refresh
       // lock, identity-verified, tombstoned on success. The sweep is the only
@@ -303,6 +317,118 @@ export function __createCustodyRuntimeForTest(
       if (!enabledHandles.has(account.id)) continue
       const outcome = await completeFallbackEnrollment(account, sweepDeps)
       applyOutcomeToProjection(account, outcome, manifest)
+    }
+  }
+
+  async function runFallbackInstallPass(
+    manifest: Awaited<ReturnType<typeof options.readCustodyManifest>>,
+  ): Promise<void> {
+    if (!cache || !manifest.ok) return
+    const storage = await options.loadAccounts(options.configPath)
+    if (storage?.claustrum?.mode !== 'claustrum') return
+    const handles = custodyManifestHandles(manifest)
+    for (const account of storage.accounts) {
+      if (account.type !== 'oauth' || account.corrupt !== true) continue
+      const handle = handles.get(account.id)
+      const vault = handle
+        ? await resolveFallbackVaultState(account.id, account.accountId, handle)
+        : 'no_handle'
+      const verdict = evaluateCustodyStartup({
+        mode: 'claustrum',
+        manifest: handle ? 'present' : 'absent',
+        local: 'gone',
+        vault: () => vault,
+        verifiedInProcessLogin: false,
+      })
+      if (
+        !('installTombstone' in verdict) ||
+        !verdict.installTombstone ||
+        !handle
+      )
+        continue
+      await installFallbackTombstone(account.id, handle)
+    }
+  }
+
+  async function resolveFallbackVaultState(
+    accountId: string,
+    expectedAccountId: string | undefined,
+    handle: string,
+  ): Promise<VaultCustodyState> {
+    if (options.resolveFallbackVaultState) {
+      return options.resolveFallbackVaultState({ accountId, handle })
+    }
+    if (!cache) return 'cold'
+    if (cache.isReauth(handle, now())) return 'needs_reauth'
+    try {
+      const served = await cache.get(handle, custodyMinTtlMs(options.storage), {
+        force: true,
+      })
+      const claims = parseJwtClaims(served.payload.access)
+      const servedAccountId = claims
+        ? extractAccountIdFromClaims(claims)
+        : undefined
+      return expectedAccountId && servedAccountId !== expectedAccountId
+        ? 'identity_mismatch'
+        : servedAccountId
+          ? 'serves'
+          : 'identity_mismatch'
+    } catch {
+      return cache.isReauth(handle, now()) ? 'needs_reauth' : 'cold'
+    }
+  }
+
+  async function installFallbackTombstone(
+    accountId: string,
+    expectedHandle: string,
+  ): Promise<void> {
+    const lock = await options.acquireRefreshFileLock({
+      name: fallbackRefreshLockName(accountId),
+      ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+      path: options.configPath,
+      renew: true,
+    })
+    if (!lock) return
+    try {
+      const manifest = await options.readCustodyManifest(manifestPath)
+      const storage = await options.loadAccounts(options.configPath)
+      const target = storage?.accounts.find(
+        (account) => account.id === accountId,
+      )
+      if (
+        storage?.claustrum?.mode !== 'claustrum' ||
+        !manifest.ok ||
+        custodyManifestHandles(manifest).get(accountId) !== expectedHandle ||
+        target?.type !== 'oauth' ||
+        target.corrupt !== true
+      ) {
+        return
+      }
+      const sentinel = custodyTombstoneKey(CUSTODY_OWNING_PROVIDER)
+      await options.mutateAccounts((current) => {
+        const live = current.accounts.find(
+          (account) => account.id === accountId,
+        )
+        if (live?.type !== 'oauth' || live.corrupt !== true) return current
+        const { corrupt: _corrupt, ...metadata } = live
+        void _corrupt
+        return {
+          ...current,
+          accounts: current.accounts.map((account) =>
+            account.id === accountId
+              ? {
+                  ...metadata,
+                  type: 'oauth',
+                  access: '',
+                  refresh: sentinel,
+                  expires: 0,
+                }
+              : account,
+          ),
+        }
+      }, options.configPath)
+    } finally {
+      await lock.release().catch(() => {})
     }
   }
 
