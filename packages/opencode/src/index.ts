@@ -91,6 +91,7 @@ import {
 } from './core/custody-transition.ts'
 import {
   base64UrlEncode,
+  beginAccountLogin,
   beginDeviceAuth,
   buildAuthorizeUrl,
   completeDeviceAuth,
@@ -2262,6 +2263,7 @@ export async function CodexAuthPlugin(
           quotaManager,
           loadAccounts,
           client: input.client as CommandContext['client'],
+          beginAccountLogin,
           withFallbackAccountLock,
           checkUsableCustodyBinding,
           enterClaustrumMode: async () => {
