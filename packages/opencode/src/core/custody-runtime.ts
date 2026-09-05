@@ -93,6 +93,10 @@ export type CustodyRuntimeOptions = {
     intervalMs: number,
   ) => ReturnType<typeof setInterval>
   clearIntervalFn?: (handle: ReturnType<typeof setInterval>) => void
+  onReconcileStep?: (
+    step: 'discovery-lock-acquired' | 'enabled-manifest-join',
+    accountId?: string,
+  ) => void | Promise<void>
   logger: RuntimeLogger
 }
 
@@ -253,6 +257,7 @@ export function __createCustodyRuntimeForTest(
       await runFingerprintResumePass()
       await runFallbackInstallPass(bootManifest)
       const currentStorage = await options.loadAccounts(options.configPath)
+      await options.onReconcileStep?.('enabled-manifest-join')
       const enabledHandles = enabledManifestHandles(
         bootManifest,
         currentStorage,
@@ -314,16 +319,19 @@ export function __createCustodyRuntimeForTest(
         )
         return
       }
-      const currentStorage = await runDiscoveryPass(manifest)
       if (manifest.ok && manifest.revision === previousRevision) {
+        const currentStorage = await options.loadAccounts(options.configPath)
         await runFingerprintResumePass()
+        await options.onReconcileStep?.('enabled-manifest-join')
         const enabledHandles = enabledManifestHandles(manifest, currentStorage)
         await runCompletionSweep(manifest, enabledHandles)
         await runWarmPass(manifest, enabledHandles)
         return
       }
+      const currentStorage = await runDiscoveryPass(manifest)
       await runFingerprintResumePass()
       await runFallbackInstallPass(manifest)
+      await options.onReconcileStep?.('enabled-manifest-join')
       const enabledHandles = enabledManifestHandles(manifest, currentStorage)
       // Step 1: completion sweep — every enrolling account under its refresh
       // lock, identity-verified, tombstoned on success. The sweep is the only
@@ -380,14 +388,19 @@ export function __createCustodyRuntimeForTest(
         log.info(`orphan-binding: ${cause}`, { accountId })
       }
       if (storage.claustrum?.mode !== 'claustrum') continue
-      const lock = await options.acquireRefreshFileLock({
-        name: fallbackRefreshLockName(accountId),
-        ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
-        path: options.configPath,
-        renew: true,
-      })
+      let lock = null
+      while (!lock && !closed) {
+        lock = await options.acquireRefreshFileLock({
+          name: fallbackRefreshLockName(accountId),
+          ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+          path: options.configPath,
+          renew: true,
+        })
+        if (!lock) await new Promise((resolve) => setTimeout(resolve, 5))
+      }
       if (!lock) continue
       try {
+        await options.onReconcileStep?.('discovery-lock-acquired', accountId)
         const recheckManifest = await options.readCustodyManifest(manifestPath)
         const recheckStorage = await options.loadAccounts(options.configPath)
         if (
