@@ -16,6 +16,7 @@ import type {
   AccountStorage,
   OAuthAccount,
 } from '../core/accounts.ts'
+import { refreshInert } from '../core/custody.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
 import { claustrumConfig, localCustody } from './custody-fixtures.ts'
 import {
@@ -186,6 +187,43 @@ function createManagerRemovingAccountOnFirstLoad(
 }
 
 describe('accounts store', () => {
+  it('RETAINS a corrupt OAuth row as gone and refresh-inert when its binding exists', async () => {
+    const { loadAccounts } = await import('../core/accounts.ts')
+    const { enrollmentManifest } = await import('./custody-fixtures.ts')
+    writeFileSync(
+      cfgPath,
+      `${JSON.stringify({
+        version: 1,
+        accounts: [
+          {
+            id: 'corrupt-fallback',
+            type: 'oauth',
+            enabled: true,
+            refresh: '',
+          },
+        ],
+      })}\n`,
+    )
+    writeFileSync(
+      statePath,
+      `${JSON.stringify({ version: 1, accounts: {} })}\n`,
+    )
+
+    const storage = await loadAccounts(cfgPath)
+    const account = storage?.accounts[0]
+
+    expect(account).toEqual({
+      id: 'corrupt-fallback',
+      type: 'oauth',
+      enabled: true,
+      corrupt: true,
+    })
+    expect(
+      account?.type === 'oauth' &&
+        refreshInert(account, enrollmentManifest(account.id), 'openai'),
+    ).toBe(true)
+  })
+
   it('missing claustrum config loads as local without rewriting the file', async () => {
     const accounts = await import('../core/accounts.ts')
     const beforeExists = existsSync(cfgPath)

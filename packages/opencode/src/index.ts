@@ -2142,7 +2142,7 @@ export async function CodexAuthPlugin(
           account: FallbackAccount,
           currentNow: number,
         ): SidebarAccountCustody | undefined {
-          if (account.type !== 'oauth') return undefined
+          if (!isOAuthAccount(account)) return undefined
           return custodyRuntimeForDeps.getCustodyProjection(account, currentNow)
         }
 

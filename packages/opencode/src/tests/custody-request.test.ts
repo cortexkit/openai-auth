@@ -443,7 +443,7 @@ describe('custody request resolution', () => {
           const account = storage?.accounts.find(
             (candidate) => candidate.id === fallback.id,
           )
-          if (account?.type === 'oauth') observed = account
+          if (account?.type === 'oauth' && !account.corrupt) observed = account
         },
         respond: (authorization, url) =>
           url.endsWith('/responses') && authorization === 'Bearer main-access'
