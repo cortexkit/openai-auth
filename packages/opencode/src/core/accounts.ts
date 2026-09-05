@@ -315,7 +315,7 @@ export type AccountStateSaveScope = {
 }
 
 export type AccountManagerCustodyOptions = {
-  readManifest?: () => Promise<CustodyManifestReadResult>
+  readManifest: () => Promise<CustodyManifestReadResult>
   provider?: string
 }
 
@@ -330,9 +330,9 @@ export type AccountManagerOptions = {
   fetchQuotaFn?: ProviderQuotaFn
   /** QuotaManager instance for unified cache (constructor-injected). */
   quotaManager?: import('./quota-manager.ts').QuotaManager
-  /** Custody gates — manifest reader + provider (default: openai). When
-   * absent, the manager behaves exactly as before this field existed. */
-  custody?: AccountManagerCustodyOptions
+  // Required because an omitted policy reader silently re-enables local refresh;
+  // anthropic-auth incident 1 demonstrated that optional custody wiring fails open.
+  custody: AccountManagerCustodyOptions
 }
 
 export type AccountRefreshError = {
@@ -2060,20 +2060,18 @@ export class FallbackAccountManager {
   readonly quotaManager: import('./quota-manager.ts').QuotaManager | null
   private readonly onFallbackStorageChanged: (() => void) | undefined
   private readonly options: AccountManagerOptions
-  private readonly custodyReadManifest:
-    | (() => Promise<CustodyManifestReadResult>)
-    | null
+  private readonly custodyReadManifest: () => Promise<CustodyManifestReadResult>
   private readonly custodyProvider: string
 
-  constructor(options: AccountManagerOptions = {}) {
+  constructor(options: AccountManagerOptions) {
     this.options = options
     this.now = options.now ?? Date.now
     this.fetchImpl = options.fetchImpl ?? fetch
     this.configPath = options.configPath ?? getAccountStoragePath()
     this.quotaManager = options.quotaManager ?? null
     this.onFallbackStorageChanged = options.onFallbackStorageChanged
-    this.custodyReadManifest = options.custody?.readManifest ?? null
-    this.custodyProvider = options.custody?.provider ?? 'openai'
+    this.custodyReadManifest = options.custody.readManifest
+    this.custodyProvider = options.custody.provider ?? 'openai'
   }
 
   // Throws CustodyTombstoneRefreshError when the account is refresh-inert
@@ -2083,7 +2081,8 @@ export class FallbackAccountManager {
   private async assertNotCustodyInert(
     account: OAuthAccount | undefined,
   ): Promise<void> {
-    if (!this.custodyReadManifest || !account) return
+    if (!account) return
+    assertNotCustodyTombstone(account, this.custodyProvider)
     const manifest = await this.custodyReadManifest()
     if (refreshInert(account, manifest, this.custodyProvider)) {
       throw new CustodyTombstoneRefreshError(this.custodyProvider)
@@ -2107,7 +2106,6 @@ export class FallbackAccountManager {
   private async custodyAccountState(
     account: OAuthAccount,
   ): Promise<'enrolling' | 'tombstoned' | null> {
-    if (!this.custodyReadManifest) return null
     if (tombstoned(account, this.custodyProvider)) return 'tombstoned'
     const manifest = await this.custodyReadManifest()
     return enrolling(account, manifest, this.custodyProvider)

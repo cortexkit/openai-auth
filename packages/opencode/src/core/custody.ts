@@ -3,12 +3,12 @@
  *
  * Three layers, in order of trust:
  *
- * 1. **Tombstone sentinel** — when an account's access+refresh both equal
- *    `claustrum-tombstone:v1:<provider>` and `expires === 0`, the account is
- *    tombstoned. Predicates alone observe this; the storage toggle is irrelevant.
+ * 1. **Tombstone sentinel** — when an account's refresh equals
+ *    `claustrum-tombstone:v1:<provider>`, the account is tombstoned. Predicates
+ *    alone observe this; the storage mode is irrelevant.
  * 2. **Manifest enrollment** — case-exact `manifest.label === account.id` under
  *    the opencode-claustrum owning filter. Other tenants are ignored.
- * 3. **Storage toggle** — `storage.claustrum?.enabled === true` arms the
+ * 3. **Storage mode** — `storage.claustrum?.mode === 'claustrum'` arms the
  *    custody path. Without it the predicates evaluate as if custody were off:
  *    enrolling accounts still serve local access, tombstoned ones report
  *    `excluded`.
@@ -24,6 +24,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { createLogger } from '../logger.ts'
 import {
   type AccountStorage,
+  claustrumMode,
   FALLBACK_REFRESH_LOCK_TTL_MS,
   fallbackRefreshLockName,
   type OAuthAccount,
@@ -64,6 +65,12 @@ export function custodyTombstoneKey(provider: string): string {
   return `${CUSTODY_TOMBSTONE_PREFIX}${provider}`
 }
 
+export function assertNoCustodyTombstoneMaterial(refreshToken: string): void {
+  if (refreshToken.startsWith(CUSTODY_TOMBSTONE_PREFIX)) {
+    throw new CustodyTombstoneRefreshError('unknown')
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Served credential (normalized)
 // ---------------------------------------------------------------------------
@@ -95,7 +102,7 @@ function owningAccount(
 
 /**
  * `enrolled` = the manifest contains a case-exact `label === account.id`
- * entry under the opencode-claustrum owning filter. The storage toggle is
+ * entry under the opencode-claustrum owning filter. The storage mode is
  * intentionally ignored: enrollment is a manifest fact, not a policy choice.
  */
 export function enrolled(
@@ -106,24 +113,17 @@ export function enrolled(
 }
 
 /**
- * `tombstoned` = oauth access AND refresh both equal the per-provider
- * sentinel AND `expires === 0`. The provider name lives in the argument so
- * this predicate composes across providers — the opencode consumer passes
- * `'openai'`.
+ * `tombstoned` = oauth refresh equals the exact per-provider sentinel. Access
+ * and expiry are ignored so partial writes remain custody evidence.
  */
 export function tombstoned(account: OAuthAccount, provider: string): boolean {
   if (account.type !== 'oauth') return false
-  const sentinel = custodyTombstoneKey(provider)
-  return (
-    account.access === sentinel &&
-    account.refresh === sentinel &&
-    account.expires === 0
-  )
+  return account.refresh === custodyTombstoneKey(provider)
 }
 
 /**
- * `custodied` = storage.claustrum?.enabled AND enrolled AND tombstoned.
- * The storage toggle is the only knob that arms the vault path; without it
+ * `custodied` = mode=claustrum AND enrolled AND tombstoned. The storage mode
+ * is the only knob that arms the vault path; without it
  * a tombstoned account is `excluded`, not `custodied`.
  */
 export function custodied(
@@ -132,7 +132,7 @@ export function custodied(
   storage: Pick<AccountStorage, 'claustrum'>,
   provider: string = CUSTODY_OWNING_PROVIDER,
 ): boolean {
-  if (!storage.claustrum?.enabled) return false
+  if (claustrumMode(storage) !== 'claustrum') return false
   if (!enrolled(account, manifest)) return false
   return tombstoned(account, provider)
 }
@@ -164,7 +164,7 @@ export function refreshInert(
 
 /**
  * `excluded` = tombstoned AND NOT custodied. The account is dead in the
- * vault's view but the operator has not turned on the storage toggle —
+ * vault's view but the operator has not selected claustrum mode —
  * refuse to serve any token for it.
  */
 export function excluded(
@@ -241,7 +241,7 @@ export async function resolveFallbackAccess(
   }
 
   if (tombstoned(account, CUSTODY_OWNING_PROVIDER)) {
-    if (!storage.claustrum?.enabled) return CUSTODY_EXCLUDED
+    if (claustrumMode(storage) !== 'claustrum') return CUSTODY_EXCLUDED
     if (!enrolled(account, manifestState)) return CUSTODY_REFUSE
     // Custodied path: must have a manifest handle and a live cache hit.
     const handle = options.manifestHandle
@@ -285,7 +285,7 @@ export async function resolveFallbackAccess(
     ) {
       return { token: account.access, provenance: 'local' }
     }
-    if (storage.claustrum?.manifestWrite !== true) {
+    if (claustrumMode(storage) !== 'claustrum') {
       latchEnrollPending(account.id, 'completionDisarmed')
       return CUSTODY_REFUSE
     }
@@ -712,8 +712,8 @@ export type CompleteEnrollmentDeps = {
   minTtlMs: number
   /**
    * Read-modify-write the account store. The sweep calls this once on a
-   * successful verify, setting `access` + `refresh` to the tombstone sentinel
-   * and `expires = 0` — that single write is the only durable effect.
+   * successful verify, setting empty `access`, sentinel `refresh`, and
+   * `expires = 0` — that single write is the only durable effect.
    */
   mutateAccounts: (
     mutate: (current: AccountStorage) => AccountStorage | undefined,
@@ -835,16 +835,15 @@ export async function completeFallbackEnrollment(
       latchEnrollPending(liveAccount.id, reason.reason)
       return reason
     }
-    // Success: tombstone both oauth fields in one mutate. The sentinel is the
-    // gate that flips `enrolling` to `custodied`; the manifest entry stays
-    // untouched (operator-owned).
+    // Empty access prevents a sentinel from reaching bearer-token code that
+    // does not inspect refresh; the manifest entry remains operator-owned.
     const sentinel = custodyTombstoneKey(provider)
     await deps.mutateAccounts((current) => {
       const target = current.accounts.find((a) => a.id === account.id)
       if (target?.type !== 'oauth') return current
       const next: OAuthAccount = {
         ...target,
-        access: sentinel,
+        access: '',
         refresh: sentinel,
         expires: 0,
       }
