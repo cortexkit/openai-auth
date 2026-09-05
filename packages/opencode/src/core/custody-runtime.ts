@@ -259,7 +259,11 @@ export function __createCustodyRuntimeForTest(
           ]
         )
           continue
-        if (!enrolling(account, bootManifest, CUSTODY_OWNING_PROVIDER)) continue
+        if (
+          !enrolling(account, bootManifest, CUSTODY_OWNING_PROVIDER) &&
+          !(tombstoned(account, CUSTODY_OWNING_PROVIDER) && !account.accountId)
+        )
+          continue
         const handle = enabledHandles.get(account.id)
         if (!handle) continue
         const sweepDeps = buildSweepDeps(cache)
@@ -419,7 +423,11 @@ export function __createCustodyRuntimeForTest(
     for (const account of oauthAccounts(storage)) {
       if (storage?.claustrum?.transition?.fingerprints.fallbacks[account.id])
         continue
-      if (!enrolling(account, manifest, CUSTODY_OWNING_PROVIDER)) continue
+      if (
+        !enrolling(account, manifest, CUSTODY_OWNING_PROVIDER) &&
+        !(tombstoned(account, CUSTODY_OWNING_PROVIDER) && !account.accountId)
+      )
+        continue
       if (!enabledHandles.has(account.id)) continue
       const outcome = await completeFallbackEnrollment(account, sweepDeps)
       applyOutcomeToProjection(account, outcome, manifest)

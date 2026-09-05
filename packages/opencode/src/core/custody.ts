@@ -250,6 +250,26 @@ export async function resolveFallbackAccess(
   if (tombstoned(account, CUSTODY_OWNING_PROVIDER)) {
     if (claustrumMode(storage) !== 'claustrum') return CUSTODY_EXCLUDED
     if (!enrolled(account, manifestState)) return CUSTODY_REFUSE
+    if (!account.accountId && options.completeEnrollmentDeps) {
+      const outcome = await completeFallbackEnrollment(
+        account,
+        options.completeEnrollmentDeps,
+      )
+      if (outcome.kind !== 'succeeded') return CUSTODY_REFUSE
+      const reboundStorage = await options.completeEnrollmentDeps.loadAccounts(
+        options.completeEnrollmentDeps.configPath,
+      )
+      const rebound = reboundStorage?.accounts.find(
+        (candidate) => candidate.id === account.id,
+      )
+      if (!reboundStorage || !rebound || !isOAuthAccount(rebound)) {
+        return CUSTODY_REFUSE
+      }
+      return resolveFallbackAccess(rebound, reboundStorage, manifestState, {
+        ...options,
+        completeEnrollmentDeps: undefined,
+      })
+    }
     // Custodied path: must have a manifest handle and a live cache hit.
     const handle = options.manifestHandle
     const cache = options.cache
@@ -775,7 +795,10 @@ export async function completeFallbackEnrollment(
   if (!liveAccount || !isOAuthAccount(liveAccount)) {
     return { kind: 'skipped', reason: 'notEnrolling' }
   }
-  if (!enrolling(liveAccount, manifest, provider)) {
+  if (
+    !enrolling(liveAccount, manifest, provider) &&
+    !(tombstoned(liveAccount, provider) && !liveAccount.accountId)
+  ) {
     return { kind: 'skipped', reason: 'notEnrolling' }
   }
   const manifestHandle = custodyManifestHandles(manifest).get(liveAccount.id)
@@ -806,7 +829,8 @@ export async function completeFallbackEnrollment(
       !recheckStorage ||
       !recheckAccount ||
       !isOAuthAccount(recheckAccount) ||
-      !enrolling(recheckAccount, recheckManifest, provider)
+      (!enrolling(recheckAccount, recheckManifest, provider) &&
+        !(tombstoned(recheckAccount, provider) && !recheckAccount.accountId))
     ) {
       return { kind: 'skipped', reason: 'notEnrolling' }
     }
@@ -844,6 +868,17 @@ export async function completeFallbackEnrollment(
       latchEnrollPending(liveAccount.id, reason.reason)
       return reason
     }
+    const claims = parseJwtClaims(served.payload.access)
+    const servedAccountId = claims
+      ? extractAccountIdFromClaims(claims)
+      : undefined
+    if (!servedAccountId) {
+      return {
+        kind: 'failed',
+        reason: 'nullClaim',
+        recordVersion: served.recordVersion,
+      }
+    }
     // Empty access prevents a sentinel from reaching bearer-token code that
     // does not inspect refresh; the manifest entry remains operator-owned.
     const sentinel = custodyTombstoneKey(provider)
@@ -852,6 +887,7 @@ export async function completeFallbackEnrollment(
       if (!target || !isOAuthAccount(target)) return current
       const next: OAuthAccount = {
         ...target,
+        accountId: target.accountId ?? servedAccountId,
         access: '',
         refresh: sentinel,
         expires: 0,

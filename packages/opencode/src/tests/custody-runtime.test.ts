@@ -355,11 +355,9 @@ describe('orphan binding discovery', () => {
       claustrum: claustrumConfig({ mode: 'claustrum' }),
     })
     await writeStorageWithManifest(storage, enrollmentManifest('new-account'))
-    const { transport } = makeTransport(() => ({
-      material: makeJwt('acct-new'),
-      recordVersion: 1,
-      expiresAtMs: Date.now() + 600_000,
-    }))
+    const { transport } = makeTransport(() => {
+      throw new Error('binding stays pending until a credential serves')
+    })
     const first = __createCustodyRuntimeForTest(
       makeOptions({ storage, transport, detection: 'available' }),
     )
