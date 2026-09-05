@@ -164,6 +164,7 @@ export function __createCustodyRuntimeForTest(
 
   let cache: ClaustrumCredentialCache | undefined
   let transport: ClaustrumCacheTransportLike | undefined
+  let reconnecting: Promise<boolean> | undefined
   let detection: Awaited<ReturnType<typeof detect>> | undefined
   let timer: ReturnType<typeof setInterval> | undefined
   let closed = false
@@ -228,23 +229,8 @@ export function __createCustodyRuntimeForTest(
         )
         return
       }
-      try {
-        cache = new ClaustrumCredentialCache({
-          connector: cacheConnector,
-          now,
-        })
-        // Eagerly resolve the transport so the first warm is a cache.get, not a
-        // handshake. A failure here lands in the catch below; the runtime
-        // stays disabled for this process until the next tick reconnects.
-        const client = await cacheConnector({
-          connectionFile: resolveConnectionPath(detection),
-          handshakeTimeoutMs: CUSTODY_HANDSHAKE_TIMEOUT_MS,
-        })
-        transport = client
-      } catch (error) {
-        log.warn('custody connect failed; disabled until tick reconnect', {
-          error: error instanceof Error ? error.message : String(error),
-        })
+      if (!(await connectCache())) {
+        scheduleNextTick()
         return
       }
       if (!bootManifest.ok && bootManifest.reason !== 'absent') {
@@ -304,14 +290,16 @@ export function __createCustodyRuntimeForTest(
       scheduleNextTick()
     },
     async runTick() {
-      if (closed || !cache) return
+      if (closed) return
       if (options.storage?.claustrum?.mode !== 'claustrum') return
       // Re-read manifest (hot-reload on mtime) so an operator edit lands at
       // the next tick without a restart.
       const previousRevision = latestManifest?.ok
         ? latestManifest.revision
         : undefined
-      const manifest = await options.readCustodyManifest(manifestPath)
+      const manifestPromise = options.readCustodyManifest(manifestPath)
+      const reconnect = cache ? undefined : connectCache()
+      const manifest = await manifestPromise
       latestManifest = manifest
       if (!manifest.ok && manifest.reason !== 'absent') {
         projectManifestUnreadable(
@@ -319,8 +307,12 @@ export function __createCustodyRuntimeForTest(
         )
         return
       }
+      const currentStorage =
+        manifest.ok && manifest.revision !== previousRevision
+          ? await runDiscoveryPass(manifest)
+          : await options.loadAccounts(options.configPath)
+      if (!cache && !(await reconnect)) return
       if (manifest.ok && manifest.revision === previousRevision) {
-        const currentStorage = await options.loadAccounts(options.configPath)
         await runFingerprintResumePass()
         await options.onReconcileStep?.('enabled-manifest-join')
         const enabledHandles = enabledManifestHandles(manifest, currentStorage)
@@ -328,7 +320,6 @@ export function __createCustodyRuntimeForTest(
         await runWarmPass(manifest, enabledHandles)
         return
       }
-      const currentStorage = await runDiscoveryPass(manifest)
       await runFingerprintResumePass()
       await runFallbackInstallPass(manifest)
       await options.onReconcileStep?.('enabled-manifest-join')
@@ -351,12 +342,53 @@ export function __createCustodyRuntimeForTest(
       try {
         cache?.close()
       } catch {}
-      try {
-        transport?.close()
-      } catch {}
+      if (!cache) {
+        try {
+          transport?.close()
+        } catch {}
+      }
       cache = undefined
       transport = undefined
     },
+  }
+
+  async function connectCache(): Promise<boolean> {
+    if (closed) return false
+    if (cache) return true
+    if (reconnecting) return reconnecting
+    const attempt = (async () => {
+      let candidate: ClaustrumCredentialCache | undefined
+      try {
+        const connection = cacheConnector({
+          connectionFile: resolveConnectionPath(detection),
+          handshakeTimeoutMs: CUSTODY_HANDSHAKE_TIMEOUT_MS,
+        })
+        candidate = new ClaustrumCredentialCache({
+          connector: () => connection,
+          now,
+        })
+        const client = await connection
+        if (closed) {
+          candidate.close()
+          return false
+        }
+        cache = candidate
+        transport = client
+        return true
+      } catch (error) {
+        candidate?.close()
+        log.warn('custody connect failed; disabled until tick reconnect', {
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return false
+      }
+    })()
+    reconnecting = attempt
+    try {
+      return await attempt
+    } finally {
+      if (reconnecting === attempt) reconnecting = undefined
+    }
   }
 
   function projectManifestUnreadable(storage: AccountStorage | null): void {
@@ -907,7 +939,7 @@ function projectFromPredicates(
     kind: 'INERT',
     reason: cacheInstance?.isReauth(handle, currentNow)
       ? 'vault-reauth'
-      : 'takeover-incomplete/vault-unavailable',
+      : 'vault-cold',
   })
 }
 

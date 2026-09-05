@@ -1168,6 +1168,129 @@ describe('custody warm and tick', () => {
     await runtime.runTick() // should be a no-op
     expect(transport.close).toHaveBeenCalled()
   })
+
+  it('reconnects on the next tick after a cold boot and reprojects a served binding', async () => {
+    let now = 1_000
+    const account = makeSentinelAccount({ id: 'fb-1', accountId: 'acct-1' })
+    const storage = withClaustrumMode(liveStorage([account]))
+    await writeStorageWithManifest(storage, enrollmentManifest(account.id))
+    const { transport } = makeTransport(() => ({
+      material: makeCustodyJwt('acct-1'),
+      recordVersion: 12,
+      expiresAtMs: now + 600_000,
+    }))
+    let available = false
+    let attempts = 0
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({
+        storage,
+        transport,
+        detection: 'available',
+        now: () => now,
+        cacheConnector: async () => {
+          attempts += 1
+          if (!available) throw new Error('vault cold')
+          return transport
+        },
+      }),
+    )
+
+    await runtime.boot()
+    expect(runtime.getCustodyProjection(account, now)).toEqual({
+      state: 'inert',
+      reason: 'vault-cold',
+    })
+    expect(attempts).toBe(1)
+
+    available = true
+    now += 1
+    await runtime.runTick()
+
+    expect(attempts).toBe(2)
+    expect(runtime.getCustodyProjection(account, now)).toEqual({
+      state: 'vault',
+      recordVersion: 12,
+    })
+    runtime.dispose()
+  })
+
+  it('bounds a cold vault reconnect to one attempt per tick', async () => {
+    const account = makeSentinelAccount({ id: 'fb-1', accountId: 'acct-1' })
+    const storage = withClaustrumMode(liveStorage([account]))
+    await writeStorageWithManifest(storage, enrollmentManifest(account.id))
+    const { transport } = makeTransport(() => {
+      throw new Error('vault must remain cold')
+    })
+    let attempts = 0
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({
+        storage,
+        transport,
+        detection: 'available',
+        cacheConnector: async () => {
+          attempts += 1
+          throw new Error('vault cold')
+        },
+      }),
+    )
+
+    await runtime.boot()
+    await runtime.runTick()
+    await runtime.runTick()
+    await runtime.runTick()
+
+    expect(attempts).toBe(4)
+    expect(runtime.getCustodyProjection(account, Date.now())).toEqual({
+      state: 'inert',
+      reason: 'vault-cold',
+    })
+    runtime.dispose()
+  })
+
+  it('disposes cleanly while a tick reconnect is pending', async () => {
+    const account = makeSentinelAccount({ id: 'fb-1', accountId: 'acct-1' })
+    const storage = withClaustrumMode(liveStorage([account]))
+    await writeStorageWithManifest(storage, enrollmentManifest(account.id))
+    const { transport, captured } = makeTransport(() => ({
+      material: makeCustodyJwt('acct-1'),
+      recordVersion: 1,
+      expiresAtMs: Date.now() + 600_000,
+    }))
+    let attempts = 0
+    let markReconnectEntered!: () => void
+    const reconnectEntered = new Promise<void>((resolve) => {
+      markReconnectEntered = resolve
+    })
+    let releaseReconnect!: () => void
+    const reconnectReleased = new Promise<void>((resolve) => {
+      releaseReconnect = resolve
+    })
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({
+        storage,
+        transport,
+        detection: 'available',
+        cacheConnector: async () => {
+          attempts += 1
+          if (attempts === 1) throw new Error('vault cold')
+          markReconnectEntered()
+          await reconnectReleased
+          return transport
+        },
+      }),
+    )
+
+    await runtime.boot()
+    const tick = runtime.runTick()
+    await reconnectEntered
+    runtime.dispose()
+    releaseReconnect()
+    await tick
+
+    expect(runtime.getCache()).toBeUndefined()
+    expect(runtime.getTransport()).toBeUndefined()
+    expect(captured.closeCalls).toBe(1)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1789,6 +1912,7 @@ describe('custody runtime disposal', () => {
     await runtime.boot()
     runtime.dispose()
     runtime.dispose()
+    await Promise.resolve()
     expect(transport.close).toHaveBeenCalledTimes(1)
   })
 })
