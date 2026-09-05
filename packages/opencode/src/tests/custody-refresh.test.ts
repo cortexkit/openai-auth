@@ -38,6 +38,7 @@ import { CustodyTombstoneRefreshError } from '../core/custody.ts'
 import type { CustodyManifestReadResult } from '../core/custody-manifest.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
 import {
+  claustrumConfig,
   emptyManifest,
   enrollmentManifest,
   liveAccount,
@@ -450,7 +451,9 @@ describe('enrolled + claustrum.enabled=false → skip local refresh', () => {
   it('getUsableFallbackAccounts: ZERO refreshFn calls', async () => {
     const account = liveAccount('enrolled-1', { expires: Date.now() - 1_000 })
     await saveAccounts(
-      liveStorage([account], { claustrum: { enabled: false } }),
+      liveStorage([account], {
+        claustrum: claustrumConfig({ mode: 'local' }),
+      }),
       cfgPath,
     )
     const storage = (await loadAccounts(cfgPath))!
@@ -467,7 +470,9 @@ describe('enrolled + claustrum.enabled=false → skip local refresh', () => {
   it('refreshDueAccounts: ZERO refreshFn calls', async () => {
     const account = liveAccount('enrolled-2', { expires: Date.now() - 1_000 })
     await saveAccounts(
-      liveStorage([account], { claustrum: { enabled: false } }),
+      liveStorage([account], {
+        claustrum: claustrumConfig({ mode: 'local' }),
+      }),
       cfgPath,
     )
 
@@ -483,7 +488,9 @@ describe('enrolled + claustrum.enabled=false → skip local refresh', () => {
   it('refreshQuotaForDueAccounts: ZERO refreshFn calls', async () => {
     const account = liveAccount('enrolled-3', { expires: Date.now() - 1_000 })
     await saveAccounts(
-      liveStorage([account], { claustrum: { enabled: false } }),
+      liveStorage([account], {
+        claustrum: claustrumConfig({ mode: 'local' }),
+      }),
       cfgPath,
     )
 
@@ -499,7 +506,9 @@ describe('enrolled + claustrum.enabled=false → skip local refresh', () => {
   it('refreshQuotaForAllAccounts: ZERO refreshFn calls', async () => {
     const account = liveAccount('enrolled-4', { expires: Date.now() - 1_000 })
     await saveAccounts(
-      liveStorage([account], { claustrum: { enabled: false } }),
+      liveStorage([account], {
+        claustrum: claustrumConfig({ mode: 'local' }),
+      }),
       cfgPath,
     )
 

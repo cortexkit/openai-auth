@@ -27,6 +27,7 @@ import {
 } from '../index.ts'
 import { hashSidebarSessionId } from '../sidebar-state.ts'
 import {
+  claustrumConfig,
   emptyManifest,
   enrollmentManifest,
   liveAccount,
@@ -120,12 +121,9 @@ async function withCustodyLoader(
       version: 1,
       main: { type: 'opencode', provider: 'openai' },
       accounts: options.accounts,
-      claustrum: options.omitManifestWrite
-        ? { enabled: options.claustrumEnabled ?? true }
-        : {
-            enabled: options.claustrumEnabled ?? true,
-            manifestWrite: options.manifestWrite === true,
-          },
+      claustrum: claustrumConfig({
+        mode: options.claustrumEnabled === false ? 'local' : 'claustrum',
+      }),
       routing: options.routing,
     }),
   )
@@ -273,7 +271,7 @@ describe('custody request resolution', () => {
         version: 1,
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
-        claustrum: { enabled: true },
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
       }),
     )
     let closes = 0
@@ -449,7 +447,7 @@ describe('custody request resolution', () => {
         version: 1,
         main: { type: 'opencode', provider: 'openai' },
         accounts: [fallback],
-        claustrum: { enabled: true },
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
         routing: { mode: 'fallback-first' },
       }),
     )
@@ -870,7 +868,7 @@ describe('custody request resolution', () => {
         version: 1,
         main: { type: 'opencode', provider: 'openai' },
         accounts: [local, vault],
-        claustrum: { enabled: true },
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
         routing: { mode: 'sticky-balanced' },
       }),
     )
@@ -1223,7 +1221,7 @@ describe('custody request resolution', () => {
   it('serves a valid local enrollment without refreshing it', async () => {
     const account = enrollingAccount({ expires: 100_000 })
     const storage = liveStorage([account], {
-      claustrum: { enabled: true, manifestWrite: true },
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
     })
     const manifest = enrollmentManifest(account.id)
     if (!manifest.ok) throw new Error('expected manifest fixture')
@@ -1267,7 +1265,7 @@ describe('custody request resolution', () => {
   it('serves a local account after its manifest entry is removed', async () => {
     const account = enrollingAccount({ expires: 1_000 })
     const storage = liveStorage([account], {
-      claustrum: { enabled: true, manifestWrite: false },
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
     })
     const result = await resolveFallbackAccess(
       account,
@@ -1284,7 +1282,7 @@ describe('custody request resolution', () => {
   it('completes a due enrollment before serving vault access', async () => {
     const account = enrollingAccount()
     let storage = liveStorage([account], {
-      claustrum: { enabled: true, manifestWrite: true },
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
     })
     const manifest = enrollmentManifest(account.id)
     if (!manifest.ok) throw new Error('expected manifest fixture')
@@ -1347,7 +1345,7 @@ describe('custody request resolution', () => {
   it('refuses a due enrollment when the served claim differs from its local identity', async () => {
     const account = enrollingAccount()
     let storage = liveStorage([account], {
-      claustrum: { enabled: true, manifestWrite: true },
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
     })
     const manifest = enrollmentManifest(account.id)
     if (!manifest.ok) throw new Error('expected manifest fixture')
@@ -1409,7 +1407,7 @@ describe('custody request resolution', () => {
   it('refuses a due enrollment when completion cannot fetch vault material', async () => {
     const account = enrollingAccount()
     const storage = liveStorage([account], {
-      claustrum: { enabled: true, manifestWrite: true },
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
     })
     const manifest = enrollmentManifest(account.id)
     if (!manifest.ok) throw new Error('expected manifest fixture')
@@ -1459,7 +1457,9 @@ describe('custody request resolution', () => {
 
   it('skips reset refresh when a fallback is refresh-inert', async () => {
     const account = liveAccount('custody-1', { expires: 0 })
-    const storage = liveStorage([account], { claustrum: { enabled: false } })
+    const storage = liveStorage([account], {
+      claustrum: claustrumConfig({ mode: 'local' }),
+    })
     let refreshes = 0
     const resolve = createResetTargetResolver({
       getAuth: async () => ({ type: 'oauth' }),

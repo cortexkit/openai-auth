@@ -36,7 +36,11 @@ import {
   resolveSessionSidebarRouting,
   type SidebarState,
 } from '../sidebar-state.ts'
-import { enrollmentManifest, makeSentinelAccount } from './custody-fixtures.ts'
+import {
+  claustrumConfig,
+  enrollmentManifest,
+  makeSentinelAccount,
+} from './custody-fixtures.ts'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_LOG_FILE,
@@ -2608,7 +2612,7 @@ describe('integration: 429 → reactive fallback', () => {
         version: 1,
         main: { type: 'opencode', provider: 'openai' },
         accounts: [fallback],
-        claustrum: { enabled: true },
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
         routing: { mode: 'fallback-first' },
       }),
     )
