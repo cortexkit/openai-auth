@@ -168,6 +168,7 @@ export function __createCustodyRuntimeForTest(
   // (boot or tick). A test that probes projection before the first sweep sees
   // no entry — the sidebar omits `custody` for that account.
   const projectionByAccountId = new Map<string, SidebarAccountCustody>()
+  const orphanLogKeys = new Set<string>()
   let latestManifest:
     | Awaited<ReturnType<typeof options.readCustodyManifest>>
     | undefined
@@ -214,6 +215,9 @@ export function __createCustodyRuntimeForTest(
         }
         return
       }
+      const bootManifest = await options.readCustodyManifest(manifestPath)
+      latestManifest = bootManifest
+      await runDiscoveryPass(bootManifest)
       if (options.storage?.claustrum?.mode !== 'claustrum') {
         log.info(
           'custody connection available but mode is local; manifest read for the refresh gate, no client/timer',
@@ -240,27 +244,29 @@ export function __createCustodyRuntimeForTest(
         })
         return
       }
-      const manifest = await options.readCustodyManifest(manifestPath)
-      latestManifest = manifest
       await runFingerprintResumePass()
-      await runFallbackInstallPass(manifest)
-      const enabledHandles = enabledManifestHandles(manifest, options.storage)
+      await runFallbackInstallPass(bootManifest)
+      const currentStorage = await options.loadAccounts(options.configPath)
+      const enabledHandles = enabledManifestHandles(
+        bootManifest,
+        currentStorage,
+      )
       const sweepPromises: Promise<void>[] = []
-      for (const account of oauthAccounts(options.storage)) {
+      for (const account of oauthAccounts(currentStorage)) {
         if (
-          options.storage?.claustrum?.transition?.fingerprints.fallbacks[
+          currentStorage?.claustrum?.transition?.fingerprints.fallbacks[
             account.id
           ]
         )
           continue
-        if (!enrolling(account, manifest, CUSTODY_OWNING_PROVIDER)) continue
+        if (!enrolling(account, bootManifest, CUSTODY_OWNING_PROVIDER)) continue
         const handle = enabledHandles.get(account.id)
         if (!handle) continue
         const sweepDeps = buildSweepDeps(cache)
         sweepPromises.push(
           completeFallbackEnrollment(account, sweepDeps)
             .then((outcome) =>
-              applyOutcomeToProjection(account, outcome, manifest),
+              applyOutcomeToProjection(account, outcome, bootManifest),
             )
             .catch((error) =>
               log.warn('custody boot sweep failed', {
@@ -277,7 +283,7 @@ export function __createCustodyRuntimeForTest(
       await raceAggregateWarm(
         enabledHandles,
         cache,
-        options.storage,
+        currentStorage,
         CUSTODY_WARM_AWAIT_MS,
       )
       scheduleNextTick()
@@ -289,9 +295,10 @@ export function __createCustodyRuntimeForTest(
       // the next tick without a restart.
       const manifest = await options.readCustodyManifest(manifestPath)
       latestManifest = manifest
+      const currentStorage = await runDiscoveryPass(manifest)
       await runFingerprintResumePass()
       await runFallbackInstallPass(manifest)
-      const enabledHandles = enabledManifestHandles(manifest, options.storage)
+      const enabledHandles = enabledManifestHandles(manifest, currentStorage)
       // Step 1: completion sweep — every enrolling account under its refresh
       // lock, identity-verified, tombstoned on success. The sweep is the only
       // place a get happens for an enrolling account.
@@ -316,6 +323,86 @@ export function __createCustodyRuntimeForTest(
       cache = undefined
       transport = undefined
     },
+  }
+
+  async function runDiscoveryPass(
+    manifest: Awaited<ReturnType<typeof options.readCustodyManifest>>,
+  ): Promise<AccountStorage | null> {
+    let storage = await options.loadAccounts(options.configPath)
+    if (!storage || !manifest.ok) return storage
+    for (const [accountId, expectedHandle] of custodyManifestHandles(
+      manifest,
+    )) {
+      if (!storage) break
+      if (accountId === 'main') continue
+      if (storage.accounts.some((account) => account.id === accountId)) continue
+      const cause = storage.claustrum?.rowHistory?.includes(accountId)
+        ? 'row removed'
+        : 'awaiting discovery'
+      const logKey = `${accountId}:${cause}`
+      if (!orphanLogKeys.has(logKey)) {
+        orphanLogKeys.add(logKey)
+        log.info(`orphan-binding: ${cause}`, { accountId })
+      }
+      if (storage.claustrum?.mode !== 'claustrum') continue
+      const lock = await options.acquireRefreshFileLock({
+        name: fallbackRefreshLockName(accountId),
+        ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+        path: options.configPath,
+        renew: true,
+      })
+      if (!lock) continue
+      try {
+        const recheckManifest = await options.readCustodyManifest(manifestPath)
+        const recheckStorage = await options.loadAccounts(options.configPath)
+        if (
+          recheckStorage?.claustrum?.mode !== 'claustrum' ||
+          !recheckManifest.ok ||
+          custodyManifestHandles(recheckManifest).get(accountId) !==
+            expectedHandle ||
+          recheckStorage.accounts.some((account) => account.id === accountId)
+        ) {
+          continue
+        }
+        const sentinel = custodyTombstoneKey(CUSTODY_OWNING_PROVIDER)
+        await options.mutateAccounts((current) => {
+          if (
+            current.claustrum?.mode !== 'claustrum' ||
+            current.accounts.some((account) => account.id === accountId)
+          ) {
+            return current
+          }
+          return {
+            ...current,
+            claustrum: {
+              ...current.claustrum,
+              mode: 'claustrum',
+              rowHistory: [
+                ...new Set([
+                  ...(current.claustrum?.rowHistory ?? []),
+                  accountId,
+                ]),
+              ],
+            },
+            accounts: [
+              ...current.accounts,
+              {
+                id: accountId,
+                type: 'oauth',
+                access: '',
+                refresh: sentinel,
+                expires: 0,
+                enabled: true,
+              },
+            ],
+          }
+        }, options.configPath)
+      } finally {
+        await lock.release().catch(() => {})
+      }
+      storage = await options.loadAccounts(options.configPath)
+    }
+    return storage
   }
 
   async function runCompletionSweep(
