@@ -224,6 +224,78 @@ describe('accounts store', () => {
     ).toBe(true)
   })
 
+  it('round-trips a corrupt OAuth marker through save without changing roster order', async () => {
+    const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
+    writeFileSync(
+      cfgPath,
+      `${JSON.stringify({
+        version: 1,
+        accounts: [
+          { id: 'first', type: 'oauth', refresh: 'first-refresh' },
+          { id: 'corrupt-fallback', type: 'oauth', refresh: '' },
+          { id: 'last', type: 'oauth', refresh: 'last-refresh' },
+        ],
+      })}\n`,
+    )
+    writeFileSync(
+      statePath,
+      `${JSON.stringify({ version: 1, accounts: {} })}\n`,
+    )
+
+    const loaded = await loadAccounts(cfgPath)
+    if (!loaded) throw new Error('expected account storage')
+    await saveAccounts(loaded, cfgPath)
+    const reloaded = await loadAccounts(cfgPath)
+
+    expect(reloaded?.accounts.map((account) => account.id)).toEqual([
+      'first',
+      'corrupt-fallback',
+      'last',
+    ])
+    expect(reloaded?.accounts[1]).toMatchObject({
+      id: 'corrupt-fallback',
+      type: 'oauth',
+      corrupt: true,
+    })
+  })
+
+  it('keeps a corrupt OAuth marker when a sibling row is mutated', async () => {
+    const { loadAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    writeFileSync(
+      cfgPath,
+      `${JSON.stringify({
+        version: 1,
+        accounts: [
+          { id: 'corrupt-fallback', type: 'oauth', refresh: '' },
+          { id: 'healthy', type: 'oauth', refresh: 'healthy-refresh' },
+        ],
+      })}\n`,
+    )
+    writeFileSync(
+      statePath,
+      `${JSON.stringify({ version: 1, accounts: {} })}\n`,
+    )
+
+    await mutateAccounts((current) => {
+      const healthy = current.accounts.find(
+        (account) => account.id === 'healthy',
+      )
+      if (healthy) healthy.enabled = false
+      return current
+    }, cfgPath)
+
+    const reloaded = await loadAccounts(cfgPath)
+    expect(reloaded?.accounts.map((account) => account.id)).toEqual([
+      'corrupt-fallback',
+      'healthy',
+    ])
+    expect(reloaded?.accounts[0]).toMatchObject({
+      id: 'corrupt-fallback',
+      corrupt: true,
+    })
+    expect(reloaded?.accounts[1]?.enabled).toBe(false)
+  })
+
   it('missing claustrum config loads as local without rewriting the file', async () => {
     const accounts = await import('../core/accounts.ts')
     const beforeExists = existsSync(cfgPath)
