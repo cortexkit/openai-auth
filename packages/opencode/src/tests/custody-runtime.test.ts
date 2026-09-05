@@ -418,6 +418,66 @@ describe('orphan binding discovery', () => {
   })
 })
 
+describe('manifest revision reconciliation', () => {
+  it('discovers a new manifest row on the first tick after its revision changes', async () => {
+    const storage = liveStorage([], {
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    })
+    await writeStorageWithManifest(storage, emptyManifest())
+    const { transport } = makeTransport(() => {
+      throw new Error('vault unavailable')
+    })
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({ storage, transport, detection: 'available' }),
+    )
+    await runtime.boot()
+    const nextManifest = enrollmentManifest('revision-account')
+    if (!nextManifest.ok) throw new Error('expected manifest')
+    writeFileSync(manifestPath, JSON.stringify(nextManifest.value))
+
+    await runtime.runTick()
+
+    expect((await loadAccounts(configPath))?.accounts[0]).toMatchObject({
+      id: 'revision-account',
+      refresh: TOMBSTONE_OPENAI,
+      accountId: undefined,
+    })
+    runtime.dispose()
+  })
+
+  it('refuses an unreadable manifest before credential inspection and projects its cause', async () => {
+    const account = liveAccount('fb-1')
+    const storage = liveStorage([account], {
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    })
+    await saveAccounts(storage, configPath)
+    const { transport, captured } = makeTransport(() => {
+      throw new Error('must not inspect vault credentials')
+    })
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({
+        storage,
+        transport,
+        detection: 'available',
+        readCustodyManifest: async () => ({
+          ok: false,
+          reason: 'invalid',
+          message: 'invalid manifest',
+        }),
+      }),
+    )
+
+    await runtime.boot()
+
+    expect(captured.getCalls).toEqual([])
+    expect(runtime.getCustodyProjection(account, Date.now())).toEqual({
+      state: 'inert',
+      reason: 'manifest-unreadable',
+    })
+    runtime.dispose()
+  })
+})
+
 describe('fingerprint-gated reconciliation resume', () => {
   it('tombstones a matching fallback row and clears the completed transition', async () => {
     const account = liveAccount('fb-1')
