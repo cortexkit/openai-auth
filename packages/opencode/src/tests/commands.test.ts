@@ -3908,6 +3908,59 @@ describe('commands (claustrum mode)', () => {
     expect(payload.text).toContain('enabled')
   })
 
+  test('enable observes a mode switch that happens while its account lock is held', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        accounts: [makeAccount('fallback-a', { enabled: false })],
+        claustrum: { mode: 'local' },
+      },
+      configPath,
+    )
+    let markLockEntered!: () => void
+    const lockEntered = new Promise<void>((resolve) => {
+      markLockEntered = resolve
+    })
+    let releaseAction!: () => void
+    const allowAction = new Promise<void>((resolve) => {
+      releaseAction = resolve
+    })
+    const withFallbackAccountLock = async <T>(
+      _id: string,
+      action: () => Promise<T>,
+    ): Promise<T> => {
+      markLockEntered()
+      await allowAction
+      return action()
+    }
+    const run = buildDialogPayload(
+      'openai-account',
+      'enable fallback-a',
+      context({
+        withFallbackAccountLock,
+        checkUsableCustodyBinding: async () => ({
+          ready: false as const,
+          reason: 'vault-cold' as const,
+        }),
+      }),
+    )
+
+    await lockEntered
+    await saveAccounts(
+      {
+        version: 1,
+        accounts: [makeAccount('fallback-a', { enabled: false })],
+        claustrum: { mode: 'claustrum' },
+      },
+      configPath,
+    )
+    releaseAction()
+    const payload = await run
+
+    expect(payload.text).toContain('vault-cold')
+    expect((await loadAccounts(configPath))?.accounts[0]?.enabled).toBe(false)
+  })
+
   test('enable keeps a claustrum row disabled when its binding is cold', async () => {
     await saveAccounts(
       {
@@ -3932,5 +3985,63 @@ describe('commands (claustrum mode)', () => {
 
     expect((await loadAccounts(configPath))?.accounts[0]?.enabled).toBe(false)
     expect(payload.text).toContain('vault-cold')
+  })
+
+  test('add completion refuses persistence when claustrum begins before OAuth finishes', async () => {
+    let resolveAccount!: (account: OAuthAccount) => void
+    const completion = new Promise<OAuthAccount>((resolve) => {
+      resolveAccount = resolve
+    })
+    mock.module('../core/oauth', () => ({
+      ...oauthRealExports,
+      beginAccountLogin: async () => ({
+        url: 'https://auth.openai.com/test',
+        instructions: 'test',
+        completion,
+      }),
+    }))
+    const notifications: string[] = []
+
+    await buildDialogPayload(
+      'openai-account',
+      'add work',
+      context({
+        notify: (payload) => {
+          notifications.push(payload.text)
+        },
+        withFallbackAccountLock: async (_id, action) => action(),
+      }),
+    )
+    await saveAccounts(
+      { version: 1, accounts: [], claustrum: { mode: 'claustrum' } },
+      configPath,
+    )
+    resolveAccount(makeAccount('fallback-a', { label: 'work' }))
+    await waitUntil(() => notifications.length === 1)
+
+    expect((await loadAccounts(configPath))?.accounts).toEqual([])
+    expect(notifications[0]).toContain('/openai-account local')
+  })
+
+  test('remove leaves the custody manifest bytes untouched', async () => {
+    await saveAccounts(
+      { version: 1, accounts: [makeAccount('fallback-a')] },
+      configPath,
+    )
+    const manifestPath = join(tmpDir, 'opencode-handles.json')
+    const manifestBytes = '{"version":1,"providers":["fixture"]}\n'
+    const prior = process.env.CLAUSTRUM_OPENCODE_HANDLES
+    try {
+      process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+      writeFileSync(manifestPath, manifestBytes)
+
+      await buildDialogPayload('openai-account', 'remove fallback-a', context())
+
+      expect(readFileSync(manifestPath, 'utf8')).toBe(manifestBytes)
+      expect((await loadAccounts(configPath))?.accounts).toEqual([])
+    } finally {
+      if (prior === undefined) delete process.env.CLAUSTRUM_OPENCODE_HANDLES
+      else process.env.CLAUSTRUM_OPENCODE_HANDLES = prior
+    }
   })
 })
