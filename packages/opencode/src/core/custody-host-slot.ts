@@ -1,4 +1,4 @@
-import { custodyTombstoneKey } from './custody.ts'
+import { custodyTombstoneKey, tombstoned } from './custody.ts'
 import {
   type CustodyManifestReadResult,
   custodyManifestHandles,
@@ -78,7 +78,19 @@ function asOauthSlot(value: unknown): MainOauthSlot | undefined {
 export function classifyMainAuthSlot(value: unknown): MainAuthSlot {
   const oauth = asOauthSlot(value)
   if (!oauth) return { kind: 'indeterminate' }
-  if (oauth.refresh !== custodyTombstoneKey(MAIN_PROVIDER)) {
+  if (
+    !tombstoned(
+      {
+        id: 'main',
+        type: 'oauth',
+        access: oauth.access ?? '',
+        refresh: oauth.refresh ?? '',
+        expires: oauth.expires ?? 0,
+        addedAt: 0,
+      },
+      MAIN_PROVIDER,
+    )
+  ) {
     return { kind: 'real', oauth }
   }
   if (
