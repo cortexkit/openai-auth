@@ -85,6 +85,7 @@ import {
 } from './core/custody-manifest.ts'
 import {
   acquireCustodyTransitionMutex,
+  type CustodyHostAuth,
   enterClaustrumMode,
   leaveClaustrumMode,
   MAIN_REFRESH_LOCK_NAME,
@@ -1105,14 +1106,17 @@ export async function CodexAuthPlugin(
 
   function createCustodyRuntime(
     storage: AccountStorage | null,
+    auth?: CustodyHostAuth,
   ): CustodyRuntime {
     return __createCustodyRuntimeForTest({
       storage,
       configPath: getConfigPath(),
       loadAccounts,
       mutateAccounts,
+      withAccountStoreTransaction,
       readCustodyManifest,
       acquireRefreshFileLock,
+      auth,
       ...(custodyOptions
         ? {
             detectClaustrumConnection: async () =>
@@ -1146,10 +1150,15 @@ export async function CodexAuthPlugin(
   const factoryAuth = input.client.auth as {
     get?: (input: { path: { id: string } }) => Promise<unknown>
     all?: () => Promise<Record<string, unknown>>
+    set: CustodyHostAuth['set']
   }
   if (factoryAuth.get && factoryAuth.all) {
     if (claustrumMode(factoryStorage ?? {}) === 'claustrum') {
-      custodyRuntimeRef = createCustodyRuntime(factoryStorage)
+      custodyRuntimeRef = createCustodyRuntime(factoryStorage, {
+        all: factoryAuth.all,
+        get: factoryAuth.get,
+        set: factoryAuth.set,
+      })
       custodyOptions?.onRuntime?.(custodyRuntimeRef)
       await custodyRuntimeRef.boot()
     }
