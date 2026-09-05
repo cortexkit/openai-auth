@@ -153,6 +153,37 @@ describe('command dialogs', () => {
     })
   })
 
+  test('account dialog shows Leave Claustrum after the enter result updates its knobs', async () => {
+    const harness = makeResetDialogHarness()
+    const apply = mock(async () => ({
+      text: 'entered',
+      knobs: { claustrumMode: 'claustrum' },
+    }))
+
+    openCommandDialog(
+      harness.api,
+      {
+        command: 'openai-account',
+        text: '',
+        knobs: { claustrumMode: 'local' },
+      },
+      apply,
+    )
+    await Bun.sleep(0)
+    harness.renderDialog()
+
+    expect(harness.select('__claustrum__')).toBe(true)
+    await Bun.sleep(0)
+    harness.renderDialog()
+
+    expect(harness.getSelectProps()?.options).toContainEqual(
+      expect.objectContaining({
+        title: 'Leave Claustrum',
+        value: '__local__',
+      }),
+    )
+  })
+
   test('fallback actions expose mode verbs without resurrecting custody on or off', () => {
     const options = buildFallbackAccountOptions({
       id: 'fallback-a',
