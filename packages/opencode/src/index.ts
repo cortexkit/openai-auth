@@ -26,6 +26,7 @@ import {
 import { getConfigDir, getConfigPath, getSettings } from './config'
 import {
   type AccountStorage,
+  claustrumMode,
   type FallbackAccount,
   FallbackAccountManager,
   getKillswitchThresholdsForAccount,
@@ -65,6 +66,12 @@ import {
   stampVaultProvenance,
   type VaultProvenance,
 } from './core/custody.ts'
+import {
+  type CustodyBootstrap,
+  classifyMainAuthSlot,
+  mainAccountIdFromServedCredential,
+  reconcileMainSlotBeforeHooks,
+} from './core/custody-host-slot.ts'
 import {
   CUSTODY_OWNING_PROVIDER,
   custodyManifestHandles,
@@ -1047,6 +1054,84 @@ export async function CodexAuthPlugin(
   // returned. Built unconditionally so a custody-disabled process still has
   // a runtime to dispose (no-op tick + close).
   let custodyRuntimeRef: CustodyRuntime | undefined
+  // Task 8 extends this factory-owned handle with the live cache rather than
+  // allowing the runtime path to open a second Claustrum connection.
+  const custodyBootstrap: CustodyBootstrap = {}
+  const custodyOptions = options.custody
+  const custodyLogger = createLogger('custody')
+
+  function createCustodyRuntime(
+    storage: AccountStorage | null,
+  ): CustodyRuntime {
+    return __createCustodyRuntimeForTest({
+      storage,
+      configPath: getConfigPath(),
+      loadAccounts,
+      mutateAccounts,
+      readCustodyManifest,
+      acquireRefreshFileLock,
+      ...(custodyOptions
+        ? {
+            detectClaustrumConnection: async () =>
+              custodyOptions.detection === 'absent'
+                ? { status: 'absent' as const, path: 'test' }
+                : {
+                    status: 'available' as const,
+                    schema: 1,
+                    wireVersion: 1,
+                    endpoints: [],
+                  },
+            cacheConnector: async () => custodyOptions.transport,
+          }
+        : {}),
+      logger: {
+        info: (msg, meta) =>
+          custodyLogger.info(msg, meta ?? {}) as unknown as undefined,
+        warn: (msg, meta) =>
+          custodyLogger.warn(msg, meta ?? {}) as unknown as undefined,
+        debug: (msg, meta) =>
+          custodyLogger.debug(msg, meta ?? {}) as unknown as undefined,
+        error: (msg, meta) =>
+          custodyLogger.error(msg, meta ?? {}) as unknown as undefined,
+      },
+      now: custodyOptions?.now,
+    })
+  }
+
+  const factoryStorage = await loadAccounts(getConfigPath())
+  const factoryManifest = await readCustodyManifest()
+  const factoryAuth = input.client.auth as {
+    get?: (input: { path: { id: string } }) => Promise<unknown>
+    all?: () => Promise<Record<string, unknown>>
+  }
+  if (factoryAuth.get && factoryAuth.all) {
+    if (claustrumMode(factoryStorage ?? {}) === 'claustrum') {
+      custodyRuntimeRef = createCustodyRuntime(factoryStorage)
+      custodyOptions?.onRuntime?.(custodyRuntimeRef)
+      await custodyRuntimeRef.boot()
+    }
+    const factoryCache = custodyRuntimeRef?.getCache()
+    if (factoryCache) custodyBootstrap.cache = factoryCache
+    custodyBootstrap.mainVerdict = await reconcileMainSlotBeforeHooks({
+      client: { auth: factoryAuth },
+      mode: claustrumMode(factoryStorage ?? {}),
+      manifest: factoryManifest,
+      getCredential: factoryCache
+        ? async (handle) => {
+            const credential = await factoryCache.get(
+              handle,
+              custodyMinTtlMs(factoryStorage),
+            )
+            return { access: credential.payload.access }
+          }
+        : undefined,
+      isReauth: factoryCache
+        ? (handle) => factoryCache.isReauth(handle)
+        : undefined,
+      now: Date.now,
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    })
+  }
 
   // Per-loader poller: each plugin invocation owns its timer and callback, so
   // one loader disposing or re-starting never stops or overwrites another's
@@ -1221,16 +1306,22 @@ export async function CodexAuthPlugin(
         const auth = await getAuth()
         if (auth.type !== 'oauth') return {}
 
+        const mainSlot = classifyMainAuthSlot(auth)
+        const recognizedMainTombstone =
+          mainSlot.kind === 'tombstone' || mainSlot.kind === 'empty'
+
         // Migration: seed the multi-account store from the existing token (idempotent)
-        await migrateIfNeeded(
-          {
-            type: 'oauth',
-            access: auth.access ?? '',
-            refresh: auth.refresh ?? '',
-            expires: auth.expires ?? 0,
-          },
-          getConfigPath(),
-        )
+        if (!recognizedMainTombstone) {
+          await migrateIfNeeded(
+            {
+              type: 'oauth',
+              access: auth.access ?? '',
+              refresh: auth.refresh ?? '',
+              expires: auth.expires ?? 0,
+            },
+            getConfigPath(),
+          )
+        }
 
         // Construct managers for push-only quota updates from response headers.
         // Wrap the first boot-time read so a corrupt store surfaces a clear,
@@ -1352,43 +1443,36 @@ export async function CodexAuthPlugin(
         // the background refresh is armed and so dispose() can close the
         // cache + transport regardless of whether custody is enabled.
         // -------------------------------------------------------------------
-        const custodyLogger = createLogger('custody')
-        const custodyOptions = options.custody
-        const custodyRuntime = __createCustodyRuntimeForTest({
-          storage,
-          configPath: getConfigPath(),
-          loadAccounts,
-          mutateAccounts,
-          readCustodyManifest,
-          acquireRefreshFileLock,
-          ...(custodyOptions
-            ? {
-                detectClaustrumConnection: async () =>
-                  custodyOptions.detection === 'absent'
-                    ? { status: 'absent' as const, path: 'test' }
-                    : {
-                        status: 'available' as const,
-                        schema: 1,
-                        wireVersion: 1,
-                        endpoints: [],
-                      },
-                cacheConnector: async () => custodyOptions.transport,
-              }
-            : {}),
-          logger: {
-            info: (msg, meta) =>
-              custodyLogger.info(msg, meta ?? {}) as unknown as undefined,
-            warn: (msg, meta) =>
-              custodyLogger.warn(msg, meta ?? {}) as unknown as undefined,
-            debug: (msg, meta) =>
-              custodyLogger.debug(msg, meta ?? {}) as unknown as undefined,
-            error: (msg, meta) =>
-              custodyLogger.error(msg, meta ?? {}) as unknown as undefined,
-          },
-          now: custodyOptions?.now,
-        })
-        custodyOptions?.onRuntime?.(custodyRuntime)
-        await custodyRuntime.boot()
+        const custodyRuntime =
+          custodyRuntimeRef ?? createCustodyRuntime(storage)
+        if (!custodyRuntimeRef) {
+          custodyOptions?.onRuntime?.(custodyRuntime)
+          await custodyRuntime.boot()
+          custodyRuntimeRef = custodyRuntime
+        }
+        if (recognizedMainTombstone) {
+          const manifest = await readCustodyManifest()
+          const handle = lookupManifestHandle(manifest, 'main')
+          const cache = custodyRuntime.getCache()
+          if (handle && cache) {
+            const credential = await cache.get(handle, custodyMinTtlMs(storage))
+            const servedMainAccountId = mainAccountIdFromServedCredential(
+              credential.payload.access,
+            )
+            if (
+              servedMainAccountId &&
+              servedMainAccountId !== storage?.mainAccountId
+            ) {
+              await mutateAccounts((current) => {
+                current.mainAccountId = servedMainAccountId
+                return current
+              }, getConfigPath())
+              if (storage) storage.mainAccountId = servedMainAccountId
+              custodyBootstrap.mainAccountId = servedMainAccountId
+              invalidateRequestStorageCache()
+            }
+          }
+        }
         // The loader owns the detached first tick so direct runtime callers
         // can observe boot completion without background work racing them.
         void custodyRuntime.runTick().catch((error) =>
