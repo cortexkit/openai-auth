@@ -116,7 +116,7 @@ export interface CommandContext {
   ) => Promise<RefreshAllQuotaResult>
   enterClaustrumMode?: () => Promise<TransitionResult>
   leaveClaustrumMode?: () => Promise<void>
-  withFallbackAccountLock?: <T>(
+  withFallbackAccountLock: <T>(
     accountId: string,
     action: () => Promise<T>,
   ) => Promise<T>
@@ -308,6 +308,10 @@ async function executeAccountCommand(
       }
     }
     const result = await ctx.enterClaustrumMode()
+    const nextStorage = (await ctx.loadAccounts(ctx.accountStoragePath)) ?? {
+      version: 1 as const,
+      accounts: [],
+    }
     const rows = Object.entries(result.outcomes).map(
       ([id, outcome]) => `- \`${id}\`: ${outcome}`,
     )
@@ -322,8 +326,8 @@ async function executeAccountCommand(
         ...(result.reason ? ['', `Reason: ${result.reason}`] : []),
       ].join('\n'),
       knobs: {
-        accounts: accounts.map(accountKnob),
-        claustrumMode: claustrumMode(storage),
+        accounts: nextStorage.accounts.map(accountKnob),
+        claustrumMode: claustrumMode(nextStorage),
       },
     }
   }
@@ -340,21 +344,26 @@ async function executeAccountCommand(
       }
     }
     await ctx.leaveClaustrumMode()
+    const nextStorage = (await ctx.loadAccounts(ctx.accountStoragePath)) ?? {
+      version: 1 as const,
+      accounts: [],
+    }
     return {
       command: 'openai-account',
       text: '## Local Mode\n\nClaustrum mode is now local. Run a fresh `/login openai` for each account, then remove its binding with `ck auth` before it can refresh locally.',
-      knobs: { accounts: accounts.map(accountKnob), claustrumMode: 'local' },
+      knobs: {
+        accounts: nextStorage.accounts.map(accountKnob),
+        claustrumMode: claustrumMode(nextStorage),
+      },
     }
   }
 
   if ((tokens[0] === 'enable' || tokens[0] === 'disable') && tokens[1]) {
     const targetId = tokens[1]
     const enabled = tokens[0] === 'enable'
-    const withLock =
-      ctx.withFallbackAccountLock ?? (async (_id, action) => action())
     let refusal: CustodyInertReason | undefined
     let found = false
-    const next = await withLock(targetId, async () => {
+    const next = await ctx.withFallbackAccountLock(targetId, async () => {
       const current = await ctx.loadAccounts(ctx.accountStoragePath)
       const currentAccount = current?.accounts.find(
         (account): account is OAuthAccount =>
@@ -567,14 +576,11 @@ async function executeAccountCommand(
     // never reach the user.
     completion
       .then(async (account) => {
-        let rejectedAsMain = false
-        let rejectedByMode = false
-        const withLock =
-          ctx.withFallbackAccountLock ?? (async (_id, action) => action())
-        await withLock(account.id, async () => {
+        let rejection: 'claustrum mode' | 'main identity' | undefined
+        await ctx.withFallbackAccountLock(account.id, async () => {
           const currentStorage = await ctx.loadAccounts(ctx.accountStoragePath)
           if (claustrumMode(currentStorage ?? {}) === 'claustrum') {
-            rejectedByMode = true
+            rejection = 'claustrum mode'
             return
           }
           await mutateAccounts((current) => {
@@ -583,7 +589,7 @@ async function executeAccountCommand(
               current.mainAccountId &&
               account.accountId === current.mainAccountId
             ) {
-              rejectedAsMain = true
+              rejection = 'main identity'
               return current
             }
             upsertAccount(current.accounts, account as OAuthAccount)
@@ -591,13 +597,14 @@ async function executeAccountCommand(
           }, ctx.accountStoragePath)
         })
 
-        if (rejectedAsMain || rejectedByMode) {
-          const msg = rejectedByMode
-            ? 'That account cannot be added while Claustrum mode is active. Run `/openai-account local` first.'
-            : 'That account is already your main account — not added as a fallback.'
+        if (rejection) {
+          const msg =
+            rejection === 'claustrum mode'
+              ? 'That account cannot be added while Claustrum mode is active. Run `/openai-account local` first.'
+              : 'That account is already your main account — not added as a fallback.'
           // Log the internal account id, never the ChatGPT stable id (a sensitive
           // identity from the OAuth claims).
-          log.warn('account add rejected (main identity)', {
+          log.warn(`account add rejected (${rejection})`, {
             id: account.id,
             sessionId,
           })

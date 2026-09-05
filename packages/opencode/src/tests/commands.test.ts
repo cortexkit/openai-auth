@@ -89,6 +89,9 @@ function makeClient(): CommandContext['client'] {
   } as unknown as CommandContext['client']
 }
 
+const withFallbackAccountLock: CommandContext['withFallbackAccountLock'] =
+  async (_id, action) => action()
+
 function withAccountLogin(
   ctx: CommandContext,
   beginAccountLogin: unknown,
@@ -256,6 +259,7 @@ async function makeResetCommandHarness(
     quotaManager,
     loadAccounts,
     client: makeClient(),
+    withFallbackAccountLock,
     resolveResetTarget,
     fetchImpl: makeResetWire(fixture),
     now: () => now,
@@ -342,6 +346,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload('openai-routing', '', ctx)
@@ -359,6 +364,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     // Set to fallback-first
@@ -380,6 +386,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload(
@@ -409,6 +416,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload('openai-account', '', ctx)
@@ -426,6 +434,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       sessionId: 'session-a',
       clearStickyRouting,
     }
@@ -454,6 +463,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       sessionId: 'sticky-status-session',
       getStickyRouting: async () => 'fallback-1',
     }
@@ -478,6 +488,7 @@ describe('commands', () => {
         }),
         loadAccounts,
         client: makeClient(),
+        withFallbackAccountLock,
         sessionId: 'raw-command-session',
         clearStickyRouting: async () => true,
         cacheKeepManager: {
@@ -511,6 +522,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       clearStickyRouting,
     }
 
@@ -609,6 +621,7 @@ describe('commands', () => {
       quotaManager,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       sessionId: sessionA,
       cacheKeepManager,
       clearStickyRouting: (sessionId) =>
@@ -650,6 +663,7 @@ describe('commands', () => {
         }),
         loadAccounts,
         client: makeClient(),
+        withFallbackAccountLock,
       }
 
       const payload = await buildDialogPayload('openai-routing', alias, ctx)
@@ -690,6 +704,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     // Every account-command surface that returns an accounts knob.
@@ -808,6 +823,7 @@ describe('commands', () => {
       // Inject the stale snapshot as what the handler reads for display.
       loadAccounts: (async () => staleSnapshot) as typeof loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     await buildDialogPayload('openai-routing', 'fallback-first', ctx)
@@ -836,6 +852,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       cacheKeepManager: {
         status: () => ({
           running: false,
@@ -882,6 +899,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       setCacheKeepEnabled,
       cacheKeepManager: {
         start,
@@ -929,6 +947,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       setCacheKeepSubagents,
       cacheKeepManager: {
         status: () => ({
@@ -976,6 +995,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       setCacheKeepSustain,
       cacheKeepManager: {
         status: () => ({
@@ -1028,6 +1048,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const always = await buildDialogPayload(
@@ -1050,6 +1071,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       cacheKeepManager: {
         start,
         status: () => ({
@@ -1091,6 +1113,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       setCacheKeepWindow,
       cacheKeepManager: {
         status: () => ({
@@ -1139,6 +1162,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       setCacheKeepWindow,
       cacheKeepManager: {
         status: () => ({
@@ -1185,6 +1209,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       setCacheKeepWindow,
       cacheKeepManager: {
         status: () => ({
@@ -1224,6 +1249,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       cacheKeepManager: {
         status: () => ({
           running: true,
@@ -1279,6 +1305,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client,
+      withFallbackAccountLock,
       refreshSidebar: async () => {
         refreshCalls.push(1)
       },
@@ -1310,6 +1337,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     // Seed two oauth accounts, then strip 'broken' from the state file.
@@ -1364,6 +1392,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
     await saveAccounts(
       {
@@ -1403,6 +1432,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client,
+      withFallbackAccountLock,
       refreshSidebar: async () => {
         refreshCalls.push(1)
       },
@@ -1439,6 +1469,7 @@ describe('commands', () => {
         quotaManager: qm,
         loadAccounts,
         client: makeClient(),
+        withFallbackAccountLock,
       }
 
       // Gate: start from 'info' (debug suppressed)
@@ -1495,6 +1526,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const offPayload = await buildDialogPayload('openai-dump', '', ctx)
@@ -1528,6 +1560,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload('openai-killswitch', '', ctx)
@@ -1548,6 +1581,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload('openai-quota', '', ctx)
@@ -1584,6 +1618,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       refreshAllQuota: async () => {
         qm.setMain('access-main', {
           quota: makeQuotaSnapshot(15),
@@ -1648,6 +1683,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload('openai-quota', '', ctx)
@@ -1671,6 +1707,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       refreshAllQuota: async () => {
         qm.setMain('access-main', {
           quota: makeQuotaSnapshot(10),
@@ -1721,6 +1758,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       refreshAllQuota: async () => {
         // Fresh main, stale fallback, and the poll itself reports success for
         // both — the shape that made a 31-hour-old bar look current.
@@ -1766,6 +1804,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       refreshAllQuota: async () => [
         { account: 'main', ok: true },
         {
@@ -1802,6 +1841,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       // refreshAllQuota intentionally omitted
     }
 
@@ -1999,6 +2039,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       resolveResetTarget,
       fetchImpl: fetchStub(async () => Response.json({})),
       now: () => now,
@@ -2023,6 +2064,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload('openai-reset', '', ctx)
@@ -2039,6 +2081,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       resolveResetTarget: async () => ({
         accountKey: 'fallback-a',
         label: 'fallback-a',
@@ -3311,6 +3354,7 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload(
@@ -3349,6 +3393,7 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client,
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload(
@@ -3393,6 +3438,7 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     // First add
@@ -3438,6 +3484,7 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     await buildDialogPayload(
@@ -3484,6 +3531,7 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     await buildDialogPayload(
@@ -3530,6 +3578,7 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       notify: (payload) => {
         notifyCalls.push({ text: payload.text })
       },
@@ -3564,6 +3613,7 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       notify: (payload) => {
         notifyCalls.push({ text: payload.text })
       },
@@ -3597,6 +3647,7 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload(
@@ -3632,6 +3683,7 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload(
@@ -3667,6 +3719,7 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       refreshSidebar: async () => {
         refreshCalls.push(1)
       },
@@ -3701,6 +3754,7 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     await buildDialogPayload(
@@ -3733,6 +3787,7 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     await buildDialogPayload(
@@ -3772,6 +3827,7 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       sessionId: 'session-one',
       notify: (payload) => {
         firstSessionCalls.push(payload.text)
@@ -3816,6 +3872,7 @@ describe('commands (claustrum mode)', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock: async (_id, action) => action(),
       ...overrides,
     }
   }
@@ -3851,6 +3908,42 @@ describe('commands (claustrum mode)', () => {
     expect(leaveClaustrumMode).toHaveBeenCalledTimes(1)
     expect(payload.text).toContain('/login openai')
     expect(payload.text).toContain('ck auth')
+  })
+
+  test('transition apply knobs reload the persisted mode after each barrier', async () => {
+    await saveAccounts(
+      { version: 1, accounts: [], claustrum: { mode: 'local' } },
+      configPath,
+    )
+    const enterClaustrumMode = mock(async () => {
+      await saveAccounts(
+        { version: 1, accounts: [], claustrum: { mode: 'claustrum' } },
+        configPath,
+      )
+      return { status: 'completed' as const, outcomes: {} }
+    })
+
+    const entered = await buildDialogPayload(
+      'openai-account',
+      'claustrum',
+      context({ enterClaustrumMode }),
+    )
+
+    expect(entered.knobs.claustrumMode).toBe('claustrum')
+
+    const leaveClaustrumMode = mock(async () => {
+      await saveAccounts(
+        { version: 1, accounts: [], claustrum: { mode: 'local' } },
+        configPath,
+      )
+    })
+    const left = await buildDialogPayload(
+      'openai-account',
+      'local',
+      context({ leaveClaustrumMode }),
+    )
+
+    expect(left.knobs.claustrumMode).toBe('local')
   })
 
   test('account status and help retain Claustrum mode verbs without custody on or off', async () => {
