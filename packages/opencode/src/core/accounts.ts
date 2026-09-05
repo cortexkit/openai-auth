@@ -281,8 +281,6 @@ export type AccountStorage = {
     mode?: ClaustrumMode
     transition?: CustodyTransitionState
     rowHistory?: string[]
-    enabled?: boolean
-    manifestWrite?: boolean
   }
   accounts: FallbackAccount[]
 }
@@ -680,14 +678,6 @@ function normalizeStorage(value: unknown): AccountStorage | null {
 
 function normalizeClaustrum(value: unknown): AccountStorage['claustrum'] {
   if (!isRecord(value)) return undefined
-  if (
-    Object.hasOwn(value, 'enabled') ||
-    Object.hasOwn(value, 'manifestWrite')
-  ) {
-    throw new Error(
-      'Remove the legacy claustrum switches and run /openai-account claustrum',
-    )
-  }
   const mode = value.mode === 'claustrum' ? 'claustrum' : 'local'
   const transition = normalizeCustodyTransition(value.transition)
   const rowHistory = Array.isArray(value.rowHistory)
@@ -700,10 +690,6 @@ function normalizeClaustrum(value: unknown): AccountStorage['claustrum'] {
     mode,
     transition,
     rowHistory,
-    // Transitional fields derive from mode while custody-runtime's enable and
-    // manifestWrite gates read them; remove them when those gates read claustrumMode().
-    enabled: mode === 'claustrum',
-    manifestWrite: false,
   }
 }
 
