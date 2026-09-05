@@ -5,6 +5,7 @@ import type {
   AccountStoreTransaction,
   OAuthAccount,
 } from './accounts.ts'
+import { isOAuthAccount } from './accounts.ts'
 import { custodyTombstoneKey, tombstoned } from './custody.ts'
 import { asCompleteMainOauthSlot } from './custody-host-slot.ts'
 import {
@@ -146,7 +147,7 @@ type Participant = {
 function enabledOauthAccounts(storage: AccountStorage): OAuthAccount[] {
   return storage.accounts.filter(
     (account): account is OAuthAccount =>
-      account.type === 'oauth' && account.enabled !== false,
+      isOAuthAccount(account) && account.enabled !== false,
   )
 }
 
