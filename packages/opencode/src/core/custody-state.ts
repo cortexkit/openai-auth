@@ -17,7 +17,6 @@ export type VaultCustodyState =
   | 'no_handle'
 
 export const CUSTODY_INERT_REASONS = [
-  'enrolled-under-local',
   'needs-login',
   'mode-mismatch',
   'corrupt-under-binding',
