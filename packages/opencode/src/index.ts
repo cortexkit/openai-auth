@@ -26,8 +26,11 @@ import {
 import { getConfigDir, getConfigPath, getSettings } from './config'
 import {
   type AccountStorage,
+  claustrumMode,
+  FALLBACK_REFRESH_LOCK_TTL_MS,
   type FallbackAccount,
   FallbackAccountManager,
+  fallbackRefreshLockName,
   getKillswitchThresholdsForAccount,
   isCostZeroingEnabled,
   isKillswitchEnabled,
@@ -41,6 +44,7 @@ import {
   type OAuthQuotaSnapshot,
   type RoutingMode,
   shouldFallbackStatus,
+  withAccountStoreTransaction,
 } from './core/accounts'
 import {
   BackgroundQuotaRefresh,
@@ -58,7 +62,38 @@ import {
   getCacheKeepWindow,
 } from './core/cachekeep'
 import {
+  CUSTODY_EXCLUDED,
+  CUSTODY_REFUSE,
+  CustodyTombstoneRefreshError,
+  refreshInert,
+  resolveFallbackAccess,
+  stampVaultProvenance,
+  tombstoned,
+  type VaultProvenance,
+} from './core/custody.ts'
+import {
+  type CustodyBootstrap,
+  classifyMainAuthSlot,
+  mainAccountIdFromServedCredential,
+  reconcileMainSlotBeforeHooks,
+  recordVerifiedInProcessMainLogin,
+} from './core/custody-host-slot.ts'
+import {
+  CUSTODY_OWNING_PROVIDER,
+  custodyManifestHandles,
+  readCustodyManifest,
+} from './core/custody-manifest.ts'
+import {
+  acquireCustodyTransitionMutex,
+  type CustodyHostAuth,
+  enterClaustrumMode,
+  leaveClaustrumMode,
+  MAIN_REFRESH_LOCK_NAME,
+  releaseCustodyLoginLeaseAfterHostWrite,
+} from './core/custody-transition.ts'
+import {
   base64UrlEncode,
+  beginAccountLogin,
   beginDeviceAuth,
   buildAuthorizeUrl,
   completeDeviceAuth,
@@ -68,6 +103,7 @@ import {
   generatePKCE,
   parseJwtClaims,
   startOAuthServer,
+  type TokenResponse,
   USER_AGENT,
   waitForOAuthCallback,
 } from './core/oauth'
@@ -117,10 +153,12 @@ import {
   getSidebarStateFile,
   hashSidebarSessionId,
   isQuotaExhausted,
+  projectCustodyForSidebar,
   type QuotaWindow,
   removeSidebarActiveRouting,
   resolveSessionStickyAccount,
   resolveSidebarStickyAssignment,
+  type SidebarAccountCustody,
   type SidebarMachineState,
   type SidebarState,
   setSidebarLegacyRouting,
@@ -168,7 +206,7 @@ const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
 const CODEX_VERSION = '0.153.0'
 const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
 const CODEX_SANDBOX = 'seccomp'
-const MAIN_REFRESH_LOCK_NAME = 'main-refresh'
+export const getMainRefreshLockName = () => MAIN_REFRESH_LOCK_NAME
 export const MAIN_REFRESH_LOCK_TTL_MS = 2 * 60_000
 export const MAIN_REFRESH_LEASE_TTL_MS = 90_000
 const CONCURRENT_MAIN_REFRESH_WAIT_MS = 4_000
@@ -183,6 +221,11 @@ const DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS = 60_000
 const HANDLED_SENTINEL = '__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__'
 
 let bootQuotaSeedStarted = false
+
+export function __resetBootQuotaSeedForTest(): void {
+  bootQuotaSeedStarted = false
+}
+
 const logModels = createLogger('models')
 let loggedCostRestoration = false
 let warnedCostCatalogUnavailable = false
@@ -234,6 +277,19 @@ interface ResetTargetResolverDeps {
   loadAccounts: typeof loadAccounts
   accountStoragePath: string
   now: () => number
+  isFallbackRefreshInert?: (
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ) => Promise<boolean>
+  resolveFallbackAccess?: (
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ) => ReturnType<typeof resolveFallbackAccess>
+  reportAuthFailure?: (params: {
+    handle: string
+    providerStatus: number
+    recordVersion: number
+  }) => Promise<void>
 }
 
 function resetTargetNeedsRefresh(
@@ -311,6 +367,7 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
 
     let resolved = account
     if (
+      !(await deps.isFallbackRefreshInert?.(resolved, storage)) &&
       resetTargetNeedsRefresh(
         resolved.access,
         resolved.expires,
@@ -320,7 +377,15 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
     ) {
       resolved = await deps.refreshFallbackAccount(resolved, storage)
     }
-    if (!resolved.access) {
+    const accessResolution = deps.resolveFallbackAccess
+      ? await deps.resolveFallbackAccess(resolved, storage)
+      : resolved.access
+        ? { token: resolved.access, provenance: 'local' as const }
+        : CUSTODY_REFUSE
+    if (
+      accessResolution === CUSTODY_REFUSE ||
+      accessResolution === CUSTODY_EXCLUDED
+    ) {
       throw new ResetTargetResolutionError(
         'token_unavailable',
         `Fallback account ${accountKey} has no usable access token.`,
@@ -352,8 +417,18 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
     return {
       accountKey,
       label: resolved.label ?? accountKey,
-      accessToken: resolved.access,
+      accessToken: accessResolution.token,
       chatgptAccountId: freshAccount.accountId,
+      onAuthFailure:
+        accessResolution.provenance === 'local'
+          ? undefined
+          : async (status: number) => {
+              await deps.reportAuthFailure?.({
+                handle: accessResolution.provenance.handle,
+                providerStatus: status,
+                recordVersion: accessResolution.provenance.recordVersion,
+              })
+            },
     }
   }
 }
@@ -389,6 +464,35 @@ interface CodexAuthPluginOptions {
   codexApiEndpoint?: string
   experimentalWebSockets?: boolean
   responsesLite?: boolean
+  custody?: {
+    /** Test seam: the transport backing the loader-owned runtime. */
+    transport: ClaustrumCacheTransportLike
+    /** Test seam: override the connection-file detection result. */
+    detection?: 'available' | 'absent'
+    /** Test seam: observes the loader-owned runtime for explicit ticks. */
+    onRuntime?: (runtime: CustodyRuntime) => void
+    /** Test seam: controls the runtime clock for expiry-bound scenarios. */
+    now?: () => number
+    /** Test seam: controls bounded host-write observation without real timers. */
+    sleep?: (ms: number) => Promise<void>
+    /** Test seam: observes a host-write observation deadline warning. */
+    warn?: (message: string) => void
+    /** Test seam: observes the account lock around custody binding checks. */
+    withFallbackAccountLock?: CommandContext['withFallbackAccountLock']
+    /** Test seam: replaces external OAuth I/O while preserving the hook callback. */
+    authorize?: {
+      browser?: () => Promise<{
+        url: string
+        tokens: Promise<TokenResponse>
+        cleanup?: () => void
+      }>
+      headless?: () => Promise<{
+        url: string
+        instructions: string
+        tokens: Promise<TokenResponse>
+      }>
+    }
+  }
 }
 
 interface CodexSessionMetadata {
@@ -687,11 +791,39 @@ function stampWindowCheckedAt(
   return { ...window, checkedAt: entryCheckedAt }
 }
 
+import {
+  __createCustodyRuntimeForTest,
+  type ClaustrumCacheTransportLike,
+  type CustodyRuntime,
+  custodyMinTtlMs,
+} from './core/custody-runtime.ts'
+
+export {
+  __createCustodyRuntimeForTest,
+  __resetSweepFailureLogDedupeForTest,
+  type ClaustrumCacheTransportLike,
+  type CustodyRuntime,
+  type CustodyRuntimeOptions,
+} from './core/custody-runtime.ts'
+
+function lookupManifestHandle(
+  manifest: ReturnType<typeof readCustodyManifest> extends Promise<infer R>
+    ? R
+    : never,
+  accountId: string,
+): string | undefined {
+  return custodyManifestHandles(manifest).get(accountId)
+}
+
 export function buildSidebarMachineState(
   qm: QuotaManager,
   store: AccountStorage,
   now = Date.now(),
   mainAccountIdentity = store.mainAccountId,
+  projectCustody?: (
+    account: FallbackAccount,
+    now: number,
+  ) => SidebarAccountCustody | undefined,
 ): SidebarMachineState {
   const mainEntry = qm.getMain()
   const mainQuota = mainEntry?.quota
@@ -724,6 +856,11 @@ export function buildSidebarMachineState(
       .map((account) => {
         const fallbackEntry = qm.getFallback(account.id)
         const fallbackQuota = fallbackEntry?.quota
+        // Sync projection: the loader pre-resolves custody state once per write
+        // (cache peek is async; the runtime owns the map) and threads a sync
+        // lookup in. An absent callback leaves `custody` unset, which is the
+        // pre-custody shape — the normalizer drops it without rendering.
+        const custodyProjection = projectCustody?.(account, now)
         return {
           id: account.id,
           label: (account as { label?: string }).label,
@@ -751,6 +888,7 @@ export function buildSidebarMachineState(
           ...(fallbackQuota?.resetCreditsAvailable !== undefined
             ? { resetCredits: fallbackQuota.resetCreditsAvailable }
             : {}),
+          ...(custodyProjection ? { custody: custodyProjection } : {}),
         }
       }),
     route: store.routing?.mode ?? 'main-first',
@@ -1004,8 +1142,118 @@ export async function CodexAuthPlugin(
   // command.execute.before reads this; if null (auth not loaded yet),
   // the command is rejected with a message.
   let cmdCtx: CommandContext | null = null
+  const hostAuth = input.client.auth as unknown as {
+    all(): Promise<Record<string, unknown>>
+    get(input: { path: { id: string } }): Promise<unknown>
+    set(input: {
+      path: { id: string }
+      body: { type: 'oauth'; access: string; refresh: string; expires: number }
+    }): Promise<unknown>
+  }
   let activeRpcServer: RpcServerHandle | null = null
   let sidebarStateFileForEvents: string | undefined
+  // Custody runtime — assigned inside the loader so dispose can close the
+  // vendored client and clear the custody tick timer after the loader has
+  // returned. Built unconditionally so a custody-disabled process still has
+  // a runtime to dispose (no-op tick + close).
+  let custodyRuntimeRef: CustodyRuntime | undefined
+  // The runtime accepts this factory-owned bootstrap rather than opening a second connection.
+  // allowing the runtime path to open a second Claustrum connection.
+  const custodyBootstrap: CustodyBootstrap = {}
+  const custodyOptions = options.custody
+  const custodyLogger = createLogger('custody')
+
+  function createCustodyRuntime(
+    storage: AccountStorage | null,
+    auth?: CustodyHostAuth,
+  ): CustodyRuntime {
+    return __createCustodyRuntimeForTest({
+      storage,
+      configPath: getConfigPath(),
+      loadAccounts,
+      mutateAccounts,
+      withAccountStoreTransaction,
+      readCustodyManifest,
+      acquireRefreshFileLock,
+      auth,
+      ...(custodyOptions
+        ? {
+            detectClaustrumConnection: async () =>
+              custodyOptions.detection === 'absent'
+                ? { status: 'absent' as const, path: 'test' }
+                : {
+                    status: 'available' as const,
+                    schema: 1,
+                    wireVersion: 1,
+                    endpoints: [],
+                  },
+            cacheConnector: async () => custodyOptions.transport,
+          }
+        : {}),
+      logger: {
+        info: (msg, meta) =>
+          custodyLogger.info(msg, meta ?? {}) as unknown as undefined,
+        warn: (msg, meta) =>
+          custodyLogger.warn(msg, meta ?? {}) as unknown as undefined,
+        debug: (msg, meta) =>
+          custodyLogger.debug(msg, meta ?? {}) as unknown as undefined,
+        error: (msg, meta) =>
+          custodyLogger.error(msg, meta ?? {}) as unknown as undefined,
+      },
+      now: custodyOptions?.now,
+    })
+  }
+
+  const factoryStorage = await loadAccounts(getConfigPath())
+  const factoryManifest = await readCustodyManifest()
+  const factoryAuth = input.client.auth as {
+    get?: (input: { path: { id: string } }) => Promise<unknown>
+    all?: () => Promise<Record<string, unknown>>
+    set: CustodyHostAuth['set']
+  }
+  if (factoryAuth.get && factoryAuth.all) {
+    if (claustrumMode(factoryStorage ?? {}) === 'claustrum') {
+      custodyRuntimeRef = createCustodyRuntime(factoryStorage, {
+        all: factoryAuth.all,
+        get: factoryAuth.get,
+        set: factoryAuth.set,
+      })
+      custodyOptions?.onRuntime?.(custodyRuntimeRef)
+      await custodyRuntimeRef.boot()
+    }
+    const factoryCache = custodyRuntimeRef?.getCache()
+    if (factoryCache) custodyBootstrap.cache = factoryCache
+    custodyBootstrap.mainVerdict = await reconcileMainSlotBeforeHooks({
+      client: { auth: factoryAuth },
+      mode: claustrumMode(factoryStorage ?? {}),
+      manifest: factoryManifest,
+      mainAccountId: factoryStorage?.mainAccountId,
+      getCredential: factoryCache
+        ? async (handle) => {
+            const credential = await factoryCache.get(
+              handle,
+              custodyMinTtlMs(factoryStorage),
+            )
+            return { access: credential.payload.access }
+          }
+        : undefined,
+      isReauth: factoryCache
+        ? (handle) => factoryCache.isReauth(handle)
+        : undefined,
+      now: Date.now,
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    })
+    if (custodyBootstrap.mainVerdict) {
+      const sidebar = await getSidebarState()
+      await setSidebarMachineState({
+        ...sidebar,
+        main: {
+          ...sidebar.main,
+          custody: projectCustodyForSidebar(custodyBootstrap.mainVerdict),
+        },
+      })
+    }
+  }
 
   // Per-loader poller: each plugin invocation owns its timer and callback, so
   // one loader disposing or re-starting never stops or overwrites another's
@@ -1039,6 +1287,7 @@ export async function CodexAuthPlugin(
   return {
     async dispose() {
       backgroundQuotaRefresh.stop()
+      custodyRuntimeRef?.dispose()
       for (const websocketFetch of websocketFetches) websocketFetch.close()
       websocketFetches.length = 0
       if (activeRpcServer) {
@@ -1179,16 +1428,22 @@ export async function CodexAuthPlugin(
         const auth = await getAuth()
         if (auth.type !== 'oauth') return {}
 
+        const mainSlot = classifyMainAuthSlot(auth)
+        const recognizedMainTombstone =
+          mainSlot.kind === 'tombstone' || mainSlot.kind === 'empty'
+
         // Migration: seed the multi-account store from the existing token (idempotent)
-        await migrateIfNeeded(
-          {
-            type: 'oauth',
-            access: auth.access ?? '',
-            refresh: auth.refresh ?? '',
-            expires: auth.expires ?? 0,
-          },
-          getConfigPath(),
-        )
+        if (!recognizedMainTombstone) {
+          await migrateIfNeeded(
+            {
+              type: 'oauth',
+              access: auth.access ?? '',
+              refresh: auth.refresh ?? '',
+              expires: auth.expires ?? 0,
+            },
+            getConfigPath(),
+          )
+        }
 
         // Construct managers for push-only quota updates from response headers.
         // Wrap the first boot-time read so a corrupt store surfaces a clear,
@@ -1244,7 +1499,7 @@ export async function CodexAuthPlugin(
         // (migrateIfNeeded only sets it once on first run). The CLI add path
         // rejects against the persisted value — acceptable because the plugin
         // refreshes it here each time the auth loader runs.
-        if (storage && auth.access) {
+        if (storage && auth.access && !recognizedMainTombstone) {
           const liveAccountId = extractAccountId({
             id_token: '',
             access_token: auth.access,
@@ -1301,12 +1556,159 @@ export async function CodexAuthPlugin(
               now: opts.now,
             }),
           quotaManager,
+          custody: { readManifest: readCustodyManifest },
           onFallbackStorageChanged: invalidateRequestStorageCache,
         })
+        // -------------------------------------------------------------------
+        // Custody runtime — vendored client, cache, completion sweep, tick.
+        // Constructed unconditionally so the boot sweep can resolve before
+        // the background refresh is armed and so dispose() can close the
+        // cache + transport regardless of whether custody is enabled.
+        // -------------------------------------------------------------------
+        const custodyRuntime =
+          custodyRuntimeRef ?? createCustodyRuntime(storage)
+        if (!custodyRuntimeRef) {
+          custodyOptions?.onRuntime?.(custodyRuntime)
+          await custodyRuntime.boot()
+          custodyRuntimeRef = custodyRuntime
+        }
+        if (recognizedMainTombstone) {
+          const manifest = await readCustodyManifest()
+          const handle = lookupManifestHandle(manifest, 'main')
+          const cache = custodyRuntime.getCache()
+          if (handle && cache) {
+            try {
+              const credential = await cache.get(
+                handle,
+                custodyMinTtlMs(storage),
+              )
+              const servedMainAccountId = mainAccountIdFromServedCredential(
+                credential.payload.access,
+              )
+              if (
+                servedMainAccountId &&
+                servedMainAccountId !== storage?.mainAccountId
+              ) {
+                await mutateAccounts((current) => {
+                  current.mainAccountId = servedMainAccountId
+                  return current
+                }, getConfigPath())
+                if (storage) storage.mainAccountId = servedMainAccountId
+                custodyBootstrap.mainAccountId = servedMainAccountId
+                invalidateRequestStorageCache()
+              }
+            } catch {
+              // The factory verdict already records vault cold/reauth; the loader
+              // must preserve its inert state instead of turning it into a crash.
+            }
+          }
+        }
+        // The loader owns the detached first tick so direct runtime callers
+        // can observe boot completion without background work racing them.
+        void custodyRuntime.runTick().catch((error) =>
+          custodyLogger.warn('custody first tick failed', {
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        )
+        custodyRuntimeRef = custodyRuntime
         // Start background refresh only when fallback accounts are configured;
         // single-account paths must not create extra token refresh traffic.
+        // The boot order above guarantees the initial completion sweep has
+        // resolved — any `enrolling` account has been tombstoned before the
+        // background loop starts gating on `refreshInert`.
         if (storage && storage.accounts.length > 0) {
           fallbackManager.startBackgroundRefresh()
+        }
+
+        // -------------------------------------------------------------------
+        // Custody deps for the four quota constructions (spec §6.6). One
+        // builder, used everywhere; omission at any one site fails closed
+        // via `custody-deps-incomplete` (the poller's own guard). Each
+        // closure captures `storage` and the live custodyRuntime so the
+        // resolver and reporter see fresh state per invocation.
+        // -------------------------------------------------------------------
+        const custodyRuntimeForDeps = custodyRuntime
+        async function isFallbackAccountRefreshInert(
+          account: OAuthAccount,
+          _currentStorage: AccountStorage,
+        ): Promise<boolean> {
+          const manifest = await readCustodyManifest()
+          return refreshInert(account, manifest, CUSTODY_OWNING_PROVIDER)
+        }
+        async function resolveAccountAccessForCustody(
+          account: OAuthAccount,
+          currentStorage: AccountStorage,
+        ): ReturnType<typeof resolveFallbackAccess> {
+          const manifest = await readCustodyManifest()
+          const cache = custodyRuntimeForDeps.getCache()
+          const handle = lookupManifestHandle(manifest, account.id)
+          if (!cache || !handle) {
+            return resolveFallbackAccess(account, currentStorage, manifest)
+          }
+          return resolveFallbackAccess(account, currentStorage, manifest, {
+            cache,
+            manifestHandle: handle,
+            requestPath: true,
+            now: custodyOptions?.now ?? Date.now,
+            refreshBeforeExpiryMs:
+              (currentStorage.refresh?.refreshBeforeExpiryMinutes ?? 240) *
+              60_000,
+            completeEnrollmentDeps: {
+              loadAccounts,
+              readCustodyManifest,
+              acquireRefreshFileLock,
+              configPath: getConfigPath(),
+              cache,
+              minTtlMs: custodyMinTtlMs(currentStorage),
+              mutateAccounts,
+              provider: CUSTODY_OWNING_PROVIDER,
+              now: Date.now,
+            },
+          })
+        }
+        async function reportAuthFailureForCustody(params: {
+          handle: string
+          providerStatus: number
+          recordVersion: number
+        }): Promise<void> {
+          const cache = custodyRuntimeForDeps.getCache()
+          if (!cache) return
+          await cache.reportAuthFailure({
+            handle: params.handle,
+            providerStatus: params.providerStatus,
+            recordVersion: params.recordVersion,
+          })
+        }
+        function buildRefreshAllQuotaDeps(
+          overrides: Partial<
+            Pick<
+              Parameters<typeof refreshAllQuota>[0],
+              'respectBackoff' | 'skipFresherThanMs' | 'readSidebarState'
+            >
+          > = {},
+        ): Parameters<typeof refreshAllQuota>[0] {
+          return {
+            getAuth,
+            codexRefreshFn,
+            refreshMainWithLease,
+            fallbackManager,
+            quotaManager,
+            loadAccounts,
+            writeSidebarState: writeMachineSidebarState,
+            client: input.client as Parameters<
+              typeof refreshAllQuota
+            >[0]['client'],
+            fetchImpl: fetch,
+            now: Date.now,
+            configPath: getConfigPath(),
+            storageMainAccountId: storage?.mainAccountId,
+            isOAuthAccountFn: isOAuthAccount,
+            whamFn: whamUsageFn,
+            isFallbackRefreshInert: isFallbackAccountRefreshInert,
+            resolveFallbackAccess: resolveAccountAccessForCustody,
+            reportCustodyAuthFailure: reportAuthFailureForCustody,
+            ...overrides,
+          }
         }
 
         // -------------------------------------------------------------------
@@ -1409,6 +1811,21 @@ export async function CodexAuthPlugin(
             mainRefreshPromise = (async () => {
               const freshAuth = await getAuth()
               if (freshAuth.type !== 'oauth') throw new Error('not oauth')
+              if (
+                tombstoned(
+                  {
+                    id: 'main',
+                    type: 'oauth',
+                    access: freshAuth.access ?? '',
+                    refresh: freshAuth.refresh ?? '',
+                    expires: freshAuth.expires ?? 0,
+                    addedAt: 0,
+                  },
+                  CUSTODY_OWNING_PROVIDER,
+                )
+              ) {
+                throw new CustodyTombstoneRefreshError(CUSTODY_OWNING_PROVIDER)
+              }
               if (!freshAuth.refresh) {
                 throw new Error('Token refresh failed: missing refresh token')
               }
@@ -1549,13 +1966,38 @@ export async function CodexAuthPlugin(
               : undefined
             if (!account)
               throw new Error(`fallback account ${accountId} not found`)
-            const refreshed = await fallbackManager.refreshAccount(
-              account,
-              fbStorage ?? { version: 1 as const, accounts: [account] },
+            const currentStorage = fbStorage ?? {
+              version: 1 as const,
+              accounts: [account],
+            }
+            let resolved = account
+            if (
+              !(await isFallbackAccountRefreshInert(account, currentStorage))
+            ) {
+              resolved = await fallbackManager.refreshAccount(
+                account,
+                currentStorage,
+              )
+            }
+            const access = await resolveAccountAccessForCustody(
+              resolved,
+              currentStorage,
             )
-            if (!refreshed.access)
+            if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED)
               throw new Error(`no access token for ${accountId}`)
-            return refreshed.access
+            return {
+              token: access.token,
+              onAuthFailure:
+                access.provenance === 'local'
+                  ? undefined
+                  : async (status: number) => {
+                      await reportAuthFailureForCustody({
+                        handle: access.provenance.handle,
+                        providerStatus: status,
+                        recordVersion: access.provenance.recordVersion,
+                      })
+                    },
+            }
           },
           codexResponsesUrl: codexApiEndpoint,
           logger: cacheKeepLogger,
@@ -1757,9 +2199,19 @@ export async function CodexAuthPlugin(
               store,
               Date.now(),
               mainAccountIdentity,
+              runtimeCustodyProjection,
             ),
             boundSidebarFile,
           )
+        }
+        // Closure-resolved once per loader; the runtime owns the cached
+        // projection map, the writer reads it sync.
+        function runtimeCustodyProjection(
+          account: FallbackAccount,
+          currentNow: number,
+        ): SidebarAccountCustody | undefined {
+          if (!isOAuthAccount(account)) return undefined
+          return custodyRuntimeForDeps.getCustodyProjection(account, currentNow)
         }
 
         async function writeRequestSidebarRouting(
@@ -1817,11 +2269,159 @@ export async function CodexAuthPlugin(
         // Start the loopback RPC server so the TUI can drain notifications and
         // dispatch apply commands.
         // -------------------------------------------------------------------
+        const defaultWithFallbackAccountLock = async <T>(
+          accountId: string,
+          action: () => Promise<T>,
+        ): Promise<T> => {
+          const lock = await acquireRefreshFileLock({
+            name: fallbackRefreshLockName(accountId),
+            ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+            path: getConfigPath(),
+            renew: true,
+          })
+          if (!lock) throw new Error('Fallback account lock unavailable')
+          try {
+            return await action()
+          } finally {
+            await lock.release()
+          }
+        }
+        const withFallbackAccountLock =
+          custodyOptions?.withFallbackAccountLock ??
+          defaultWithFallbackAccountLock
+        const checkUsableCustodyBinding = async (account: OAuthAccount) => {
+          const manifest = await readCustodyManifest()
+          if (!manifest.ok) {
+            return {
+              ready: false as const,
+              reason: 'manifest-unreadable' as const,
+            }
+          }
+          const handle = lookupManifestHandle(manifest, account.id)
+          if (!handle)
+            return { ready: false as const, reason: 'no-handle' as const }
+          const cache = custodyRuntime.getCache()
+          if (!cache) {
+            return { ready: false as const, reason: 'vault-cold' as const }
+          }
+          if (cache.isReauth(handle, custodyOptions?.now?.() ?? Date.now())) {
+            return { ready: false as const, reason: 'vault-reauth' as const }
+          }
+          if (cache.isBlocked(handle)) {
+            return { ready: false as const, reason: 'vault-cold' as const }
+          }
+          try {
+            const credential = await cache.get(handle, custodyMinTtlMs(storage))
+            const accountId = mainAccountIdFromServedCredential(
+              credential.payload.access,
+            )
+            if (
+              !accountId ||
+              (account.accountId && account.accountId !== accountId)
+            ) {
+              return {
+                ready: false as const,
+                reason: 'identity-mismatch' as const,
+              }
+            }
+            return { ready: true as const, accountId }
+          } catch {
+            return {
+              ready: false as const,
+              reason: cache.isReauth(
+                handle,
+                custodyOptions?.now?.() ?? Date.now(),
+              )
+                ? ('vault-reauth' as const)
+                : ('vault-cold' as const),
+            }
+          }
+        }
         cmdCtx = {
           accountStoragePath: getConfigPath(),
           quotaManager,
           loadAccounts,
           client: input.client as CommandContext['client'],
+          beginAccountLogin,
+          withFallbackAccountLock,
+          checkUsableCustodyBinding,
+          enterClaustrumMode: async () => {
+            const current = await loadAccounts(getConfigPath())
+            const accountIds = (current?.accounts ?? [])
+              .filter(
+                (account): account is OAuthAccount =>
+                  account.type === 'oauth' && account.enabled !== false,
+              )
+              .map((account) => account.id)
+            return enterClaustrumMode({
+              accountIds,
+              acquireLock: ({ name, renew }) =>
+                acquireRefreshFileLock({
+                  name,
+                  ttlMs:
+                    name === MAIN_REFRESH_LOCK_NAME
+                      ? MAIN_REFRESH_LOCK_TTL_MS
+                      : FALLBACK_REFRESH_LOCK_TTL_MS,
+                  path: getConfigPath(),
+                  renew,
+                }),
+              withStoreTransaction: (action) =>
+                withAccountStoreTransaction(action, getConfigPath()),
+              readManifest: readCustodyManifest,
+              preflight: async ({ accountId, handle }) => {
+                const cache = custodyRuntime.getCache()
+                if (!cache || cache.isBlocked(handle)) return 'vault-cold'
+                if (
+                  cache.isReauth(handle, custodyOptions?.now?.() ?? Date.now())
+                ) {
+                  return 'vault-reauth'
+                }
+                try {
+                  const credential = await cache.get(
+                    handle,
+                    custodyMinTtlMs(current),
+                  )
+                  const servedAccountId = mainAccountIdFromServedCredential(
+                    credential.payload.access,
+                  )
+                  if (
+                    !servedAccountId ||
+                    (accountId && accountId !== servedAccountId)
+                  ) {
+                    return 'identity-mismatch'
+                  }
+                  return 'ready'
+                } catch {
+                  return cache.isReauth(
+                    handle,
+                    custodyOptions?.now?.() ?? Date.now(),
+                  )
+                    ? 'vault-reauth'
+                    : 'vault-cold'
+                }
+              },
+              auth: {
+                all: () => hostAuth.all(),
+                get: (value) => hostAuth.get(value),
+                set: async (value) => {
+                  await hostAuth.set(value)
+                },
+              },
+              warn: (message) => custodyLogger.warn(message),
+            })
+          },
+          leaveClaustrumMode: () =>
+            leaveClaustrumMode({
+              acquireLock: ({ name, renew }) =>
+                acquireRefreshFileLock({
+                  name,
+                  ttlMs: MAIN_REFRESH_LOCK_TTL_MS,
+                  path: getConfigPath(),
+                  renew,
+                }),
+              withStoreTransaction: (action) =>
+                withAccountStoreTransaction(action, getConfigPath()),
+            }),
           resolveResetTarget: createResetTargetResolver({
             getAuth,
             refreshMainWithLease,
@@ -1830,6 +2430,9 @@ export async function CodexAuthPlugin(
             loadAccounts,
             accountStoragePath: getConfigPath(),
             now: Date.now,
+            isFallbackRefreshInert: isFallbackAccountRefreshInert,
+            resolveFallbackAccess: resolveAccountAccessForCustody,
+            reportAuthFailure: reportAuthFailureForCustody,
           }),
           ...buildResetRedemptionDeps(),
           cacheKeepManager,
@@ -1857,41 +2460,10 @@ export async function CodexAuthPlugin(
             await writeMachineSidebarState(quotaManager, store)
           },
           refreshAllQuota: async () =>
-            refreshAllQuota({
-              getAuth,
-              codexRefreshFn,
-              refreshMainWithLease,
-              fallbackManager,
-              quotaManager,
-              loadAccounts,
-              writeSidebarState: writeMachineSidebarState,
-              client: input.client as CommandContext['client'],
-              fetchImpl: fetch,
-              now: Date.now,
-              configPath: getConfigPath(),
-              storageMainAccountId: storage?.mainAccountId,
-              isOAuthAccountFn: isOAuthAccount,
-              whamFn: whamUsageFn,
-            }),
+            refreshAllQuota(buildRefreshAllQuotaDeps()),
           refreshResetTargetQuota: async (accountKey) => {
             const results = await refreshAllQuota(
-              {
-                getAuth,
-                codexRefreshFn,
-                refreshMainWithLease,
-                fallbackManager,
-                quotaManager,
-                loadAccounts,
-                writeSidebarState: writeMachineSidebarState,
-                client: input.client as CommandContext['client'],
-                fetchImpl: fetch,
-                now: Date.now,
-                configPath: getConfigPath(),
-                storageMainAccountId: storage?.mainAccountId,
-                isOAuthAccountFn: isOAuthAccount,
-                whamFn: whamUsageFn,
-                respectBackoff: false,
-              },
+              buildRefreshAllQuotaDeps({ respectBackoff: false }),
               { accountKey },
             )
             return (
@@ -1946,12 +2518,38 @@ export async function CodexAuthPlugin(
         // sendWithAccessToken — the one primitive that both main and fallback
         // sends call.  Wraps the existing Codex transform + send.
         // -------------------------------------------------------------------
+        const responseVaultProvenance = new WeakMap<Response, VaultProvenance>()
+
+        function observeVaultAuthFailure(response: Response, url: URL): void {
+          const provenance = responseVaultProvenance.get(response)
+          if (
+            !provenance ||
+            url.hostname !== 'chatgpt.com' ||
+            !url.pathname.startsWith('/backend-api/codex/')
+          ) {
+            return
+          }
+          if (response.status >= 200 && response.status < 300) {
+            custodyRuntimeForDeps
+              .getCache()
+              ?.markVaultSuccess(provenance.handle)
+            return
+          }
+          if (response.status !== 401) return
+          void reportAuthFailureForCustody({
+            handle: provenance.handle,
+            providerStatus: response.status,
+            recordVersion: provenance.recordVersion,
+          }).catch(() => {})
+        }
+
         async function sendWithAccessToken(
           requestInput: RequestInfo | URL,
           init: RequestInit | undefined,
           accessToken: string,
           accountId?: string,
           keepwarmAccountKey: string = 'main',
+          provenance?: VaultProvenance | 'local',
         ): Promise<Response> {
           const headers = effectiveRequestHeaders(requestInput, init)
           headers.delete('x-api-key')
@@ -1992,6 +2590,15 @@ export async function CodexAuthPlugin(
             parsed.pathname.includes('/chat/completions')
               ? new URL(codexApiEndpoint)
               : parsed
+          const stamp = (response: Response) => {
+            const stamped = stampVaultProvenance(
+              response,
+              provenance,
+              responseVaultProvenance,
+            )
+            observeVaultAuthFailure(stamped, url)
+            return stamped
+          }
 
           const prepared = prepareCodexRequest({
             init: {
@@ -2043,11 +2650,13 @@ export async function CodexAuthPlugin(
                 keepwarmCapture.isSubagent,
               )
             }
-            return websocketFetch(url, requestInit)
+            return stamp(await websocketFetch(url, requestInit))
           }
           const finalInit =
             OpenAIWebSocketPool.withoutInternalHeaders(requestInit)
-          if (typeof finalInit?.body !== 'string') return fetch(url, finalInit)
+          if (typeof finalInit?.body !== 'string') {
+            return stamp(await fetch(url, finalInit))
+          }
 
           // Keepwarm capture: track every request body for idle
           // prompt-cache warming. Cheap — stores the already-serialized string.
@@ -2080,7 +2689,7 @@ export async function CodexAuthPlugin(
               headers: finalInit.headers,
               status: response.status,
             })
-            return translateHostedWebSearchResponse(response)
+            return stamp(translateHostedWebSearchResponse(response))
           } catch (error) {
             await dumpCodexRequest({
               sessionID,
@@ -2329,6 +2938,7 @@ export async function CodexAuthPlugin(
         // -------------------------------------------------------------------
         type FallbackCandidate = {
           access: string
+          provenance: VaultProvenance | 'local'
           accountId?: string
           keepwarmAccountKey: string
           quotaAccountId: string
@@ -2348,6 +2958,7 @@ export async function CodexAuthPlugin(
           accountId: string
           wireAccountId?: string
           access: string
+          provenance?: VaultProvenance | 'local'
           keepwarmAccountKey: string
           fallback?: FallbackAccount
           quota: AccountQuota | null | undefined
@@ -2426,8 +3037,14 @@ export async function CodexAuthPlugin(
           ]
           const usableFallbacks =
             await fallbackManager.getUsableFallbackAccounts(input.storage)
+          if (!input.storage) return roster
           for (const fallback of usableFallbacks) {
-            if (!fallback.access) continue
+            const access = await resolveAccountAccessForCustody(
+              fallback,
+              input.storage,
+            )
+            if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED)
+              continue
             const fileEntry = input.sidebarState.fallbacks.find(
               (account) => account.id === fallback.id,
             )
@@ -2453,7 +3070,8 @@ export async function CodexAuthPlugin(
             roster.push({
               accountId: fallback.id,
               wireAccountId: fallback.accountId,
-              access: fallback.access,
+              access: access.token,
+              provenance: access.provenance,
               keepwarmAccountKey: fallback.id,
               fallback,
               quota: freshest.quota,
@@ -2637,16 +3255,23 @@ export async function CodexAuthPlugin(
           const usableFallbacks =
             await fallbackManager.getUsableFallbackAccounts(fallbackStorage)
           const candidates: FallbackCandidate[] = []
+          if (!fallbackStorage)
+            return { current: [], retained: [], skipped: [] }
           for (const fb of usableFallbacks) {
-            if (fb.access) {
-              candidates.push({
-                access: fb.access,
-                accountId: fb.accountId,
-                keepwarmAccountKey: fb.id,
-                quotaAccountId: fb.id,
-                fallback: fb,
-              })
-            }
+            const access = await resolveAccountAccessForCustody(
+              fb,
+              fallbackStorage,
+            )
+            if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED)
+              continue
+            candidates.push({
+              access: access.token,
+              provenance: access.provenance,
+              accountId: fb.accountId,
+              keepwarmAccountKey: fb.id,
+              quotaAccountId: fb.id,
+              fallback: fb,
+            })
           }
           // Mid-stream rate-limit mark: never re-try a fallback a prior request
           // just exhausted mid-generation. Unlike the killswitch quota filter
@@ -2767,6 +3392,7 @@ export async function CodexAuthPlugin(
                 candidate.access,
                 candidate.accountId,
                 candidate.keepwarmAccountKey,
+                candidate.provenance,
               )
             } catch (error) {
               // A caller abort and an indeterminate transport failure both
@@ -2845,6 +3471,7 @@ export async function CodexAuthPlugin(
                 candidate.access,
                 candidate.accountId,
                 candidate.keepwarmAccountKey,
+                candidate.provenance,
               )
             } catch (error) {
               if (
@@ -2908,25 +3535,9 @@ export async function CodexAuthPlugin(
           void writeMachineSidebarState(quotaManager, storage).catch(() => {})
 
           // Background: refresh from the API, then the sidebar shows fresh numbers
-          void refreshAllQuota({
-            getAuth,
-            codexRefreshFn,
-            refreshMainWithLease,
-            fallbackManager,
-            quotaManager,
-            loadAccounts,
-            writeSidebarState: writeMachineSidebarState,
-            client: input.client as Parameters<
-              typeof refreshAllQuota
-            >[0]['client'],
-            fetchImpl: fetch,
-            now: Date.now,
-            configPath: getConfigPath(),
-            storageMainAccountId: storage?.mainAccountId,
-            isOAuthAccountFn: isOAuthAccount,
-            whamFn: whamUsageFn,
-            respectBackoff: true,
-          }).catch((error) =>
+          void refreshAllQuota(
+            buildRefreshAllQuotaDeps({ respectBackoff: true }),
+          ).catch((error) =>
             logQ.warn('boot quota seed failed', {
               pid: process.pid,
               error: errorMessage(error),
@@ -2936,28 +3547,11 @@ export async function CodexAuthPlugin(
 
         backgroundQuotaRefresh.start(
           async () => {
-            const results = await refreshQuotaInBackground({
-              getAuth,
-              codexRefreshFn,
-              refreshMainWithLease,
-              fallbackManager,
-              quotaManager,
-              loadAccounts,
-              writeSidebarState: (qm, store) =>
-                backgroundQuotaRefresh.isStopped()
-                  ? Promise.resolve()
-                  : writeMachineSidebarState(qm, store),
-              client: input.client as Parameters<
-                typeof refreshAllQuota
-              >[0]['client'],
-              fetchImpl: fetch,
-              now: Date.now,
-              configPath: getConfigPath(),
-              storageMainAccountId: storage?.mainAccountId,
-              isOAuthAccountFn: isOAuthAccount,
-              whamFn: whamUsageFn,
-              readSidebarState: () => getSidebarState(boundSidebarFile),
-            })
+            const results = await refreshQuotaInBackground(
+              buildRefreshAllQuotaDeps({
+                readSidebarState: () => getSidebarState(boundSidebarFile),
+              }),
+            )
             const failures = results.filter((result) => !result.ok)
             if (failures.length > 0) {
               logQ.warn('background quota refresh completed with failures', {
@@ -3111,6 +3705,7 @@ export async function CodexAuthPlugin(
                   stickyCandidate.access,
                   stickyCandidate.wireAccountId,
                   stickyCandidate.keepwarmAccountKey,
+                  stickyCandidate.provenance,
                 )
 
                 const pushStickyQuota = async (
@@ -3173,6 +3768,7 @@ export async function CodexAuthPlugin(
                       replacement.access,
                       replacement.wireAccountId,
                       replacement.keepwarmAccountKey,
+                      replacement.provenance,
                     )
                     previousResponse.body?.cancel().catch(() => {})
                     stickyCandidate = replacement
@@ -3326,6 +3922,7 @@ export async function CodexAuthPlugin(
                   primaryAccess,
                   mainAccountIdentity,
                   'main',
+                  undefined,
                 )
               }
             }
@@ -3437,35 +4034,78 @@ export async function CodexAuthPlugin(
           label: 'ChatGPT Pro/Plus (browser)',
           type: 'oauth',
           authorize: async () => {
-            const { redirectUri } = await startOAuthServer()
-            const pkce = await generatePKCE()
-            const state = base64UrlEncode(
-              crypto.getRandomValues(new Uint8Array(32)).buffer,
-            )
-            const authUrl = buildAuthorizeUrl(redirectUri, pkce, state)
+            const mutex = await acquireCustodyTransitionMutex()
+            try {
+              const flow = custodyOptions?.authorize?.browser
+                ? await custodyOptions.authorize.browser()
+                : await (async () => {
+                    const { redirectUri } = await startOAuthServer()
+                    const pkce = await generatePKCE()
+                    const state = base64UrlEncode(
+                      crypto.getRandomValues(new Uint8Array(32)).buffer,
+                    )
+                    return {
+                      url: buildAuthorizeUrl(redirectUri, pkce, state),
+                      tokens: waitForOAuthCallback(pkce, state),
+                      cleanup: () => flowCleanup(state),
+                    }
+                  })()
 
-            const callbackPromise = waitForOAuthCallback(pkce, state)
-
-            return {
-              url: authUrl,
-              instructions:
-                'Complete authorization in your browser. This window will close automatically.',
-              method: 'auto' as const,
-              callback: async () => {
-                try {
-                  const tokens = await callbackPromise
-                  const accountId = extractAccountId(tokens)
-                  return {
-                    type: 'success' as const,
-                    refresh: tokens.refresh_token,
-                    access: tokens.access_token,
-                    expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-                    accountId,
+              return {
+                url: flow.url,
+                instructions:
+                  'Complete authorization in your browser. This window will close automatically.',
+                method: 'auto' as const,
+                callback: async () => {
+                  try {
+                    const tokens = await flow.tokens
+                    const result = {
+                      type: 'success' as const,
+                      refresh: tokens.refresh_token,
+                      access: tokens.access_token,
+                      expires:
+                        (custodyOptions?.now ?? Date.now)() +
+                        (tokens.expires_in ?? 3600) * 1000,
+                      accountId: extractAccountId(tokens),
+                    }
+                    void releaseCustodyLoginLeaseAfterHostWrite({
+                      accessToken: tokens.access_token,
+                      refreshToken: tokens.refresh_token,
+                      getAuth: async () => {
+                        const auth = await hostAuth.get({
+                          path: { id: 'openai' },
+                        })
+                        return isRecord(auth) &&
+                          typeof auth.access === 'string' &&
+                          typeof auth.refresh === 'string'
+                          ? { access: auth.access, refresh: auth.refresh }
+                          : undefined
+                      },
+                      onObserved: ({ access, refresh }) =>
+                        recordVerifiedInProcessMainLogin({
+                          type: 'oauth',
+                          access,
+                          refresh,
+                        }),
+                      release: () => mutex.release(),
+                      warn: (message) =>
+                        custodyOptions?.warn?.(message) ??
+                        custodyLogger.warn(message),
+                      now: custodyOptions?.now ?? Date.now,
+                      sleep: custodyOptions?.sleep ?? ((ms) => Bun.sleep(ms)),
+                    }).catch(() => mutex.release())
+                    return result
+                  } catch (error) {
+                    await mutex.release()
+                    throw error
+                  } finally {
+                    flow.cleanup?.()
                   }
-                } finally {
-                  flowCleanup(state)
-                }
-              },
+                },
+              }
+            } catch (error) {
+              await mutex.release()
+              throw error
             }
           },
         },
@@ -3473,26 +4113,71 @@ export async function CodexAuthPlugin(
           label: 'ChatGPT Pro/Plus (headless)',
           type: 'oauth',
           authorize: async () => {
-            const { deviceData, url, instructions } = await beginDeviceAuth()
-
-            return {
-              url,
-              instructions,
-              method: 'auto' as const,
-              async callback() {
-                try {
-                  const tokens = await completeDeviceAuth(deviceData)
-                  return {
-                    type: 'success' as const,
-                    refresh: tokens.refresh_token,
-                    access: tokens.access_token,
-                    expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-                    accountId: extractAccountId(tokens),
+            const mutex = await acquireCustodyTransitionMutex()
+            try {
+              const flow = custodyOptions?.authorize?.headless
+                ? await custodyOptions.authorize.headless()
+                : await (async () => {
+                    const { deviceData, url, instructions } =
+                      await beginDeviceAuth()
+                    return {
+                      url,
+                      instructions,
+                      tokens: completeDeviceAuth(deviceData),
+                    }
+                  })()
+              return {
+                url: flow.url,
+                instructions: flow.instructions,
+                method: 'auto' as const,
+                async callback() {
+                  try {
+                    const tokens = await flow.tokens
+                    const result = {
+                      type: 'success' as const,
+                      refresh: tokens.refresh_token,
+                      access: tokens.access_token,
+                      expires:
+                        (custodyOptions?.now ?? Date.now)() +
+                        (tokens.expires_in ?? 3600) * 1000,
+                      accountId: extractAccountId(tokens),
+                    }
+                    void releaseCustodyLoginLeaseAfterHostWrite({
+                      accessToken: tokens.access_token,
+                      refreshToken: tokens.refresh_token,
+                      getAuth: async () => {
+                        const auth = await hostAuth.get({
+                          path: { id: 'openai' },
+                        })
+                        return isRecord(auth) &&
+                          typeof auth.access === 'string' &&
+                          typeof auth.refresh === 'string'
+                          ? { access: auth.access, refresh: auth.refresh }
+                          : undefined
+                      },
+                      onObserved: ({ access, refresh }) =>
+                        recordVerifiedInProcessMainLogin({
+                          type: 'oauth',
+                          access,
+                          refresh,
+                        }),
+                      release: () => mutex.release(),
+                      warn: (message) =>
+                        custodyOptions?.warn?.(message) ??
+                        custodyLogger.warn(message),
+                      now: custodyOptions?.now ?? Date.now,
+                      sleep: custodyOptions?.sleep ?? ((ms) => Bun.sleep(ms)),
+                    }).catch(() => mutex.release())
+                    return result
+                  } catch {
+                    await mutex.release()
+                    return { type: 'failed' as const }
                   }
-                } catch {
-                  return { type: 'failed' as const }
-                }
-              },
+                },
+              }
+            } catch (error) {
+              await mutex.release()
+              throw error
             }
           },
         },

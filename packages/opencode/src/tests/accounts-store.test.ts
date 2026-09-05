@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
@@ -15,7 +16,9 @@ import type {
   AccountStorage,
   OAuthAccount,
 } from '../core/accounts.ts'
+import { refreshInert } from '../core/custody.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
+import { localCustody } from './custody-fixtures.ts'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_LOG_FILE,
@@ -42,6 +45,15 @@ afterEach(() => {
   try {
     rmSync(dir, { recursive: true, force: true })
   } catch {}
+})
+
+describe('AccountManager custody injection', () => {
+  it('does not allow manager construction without custody injection', () => {
+    const omitted = { configPath: cfgPath }
+    // @ts-expect-error Required because an omitted policy reader silently re-enables local refresh.
+    const rejected: AccountManagerOptions = omitted
+    void rejected
+  })
 })
 
 function oauthAccount(
@@ -91,7 +103,10 @@ describe('request-path bookkeeping never fails the caller', () => {
     )
 
     breakStateWrites()
-    const manager = new FallbackAccountManager({ configPath: cfgPath })
+    const manager = new FallbackAccountManager({
+      custody: localCustody,
+      configPath: cfgPath,
+    })
 
     // Must resolve, not reject: the caller has a provider response to return.
     expect(await manager.markUsed(account).then(() => 'resolved')).toBe(
@@ -119,6 +134,7 @@ describe('request-path bookkeeping never fails the caller', () => {
 
     breakStateWrites()
     const manager = new FallbackAccountManager({
+      custody: localCustody,
       configPath: cfgPath,
       refreshFn: async () => ({
         access: 'rotated-access',
@@ -171,6 +187,212 @@ function createManagerRemovingAccountOnFirstLoad(
 }
 
 describe('accounts store', () => {
+  it('RETAINS a corrupt OAuth row as gone and refresh-inert when its binding exists', async () => {
+    const { isOAuthAccount, loadAccounts } = await import('../core/accounts.ts')
+    const { enrollmentManifest } = await import('./custody-fixtures.ts')
+    writeFileSync(
+      cfgPath,
+      `${JSON.stringify({
+        version: 1,
+        accounts: [
+          {
+            id: 'corrupt-fallback',
+            type: 'oauth',
+            enabled: true,
+            refresh: '',
+          },
+        ],
+      })}\n`,
+    )
+    writeFileSync(
+      statePath,
+      `${JSON.stringify({ version: 1, accounts: {} })}\n`,
+    )
+
+    const storage = await loadAccounts(cfgPath)
+    const account = storage?.accounts[0]
+
+    expect(account).toEqual({
+      id: 'corrupt-fallback',
+      type: 'oauth',
+      enabled: true,
+      corrupt: true,
+    })
+    expect(
+      account?.type === 'oauth' &&
+        refreshInert(account, enrollmentManifest(account.id), 'openai'),
+    ).toBe(true)
+    expect(account && isOAuthAccount(account)).toBe(false)
+  })
+
+  it('round-trips a corrupt OAuth marker through save without changing roster order', async () => {
+    const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
+    writeFileSync(
+      cfgPath,
+      `${JSON.stringify({
+        version: 1,
+        accounts: [
+          { id: 'first', type: 'oauth', refresh: 'first-refresh' },
+          { id: 'corrupt-fallback', type: 'oauth', refresh: '' },
+          { id: 'last', type: 'oauth', refresh: 'last-refresh' },
+        ],
+      })}\n`,
+    )
+    writeFileSync(
+      statePath,
+      `${JSON.stringify({ version: 1, accounts: {} })}\n`,
+    )
+
+    const loaded = await loadAccounts(cfgPath)
+    if (!loaded) throw new Error('expected account storage')
+    await saveAccounts(loaded, cfgPath)
+    const reloaded = await loadAccounts(cfgPath)
+
+    expect(reloaded?.accounts.map((account) => account.id)).toEqual([
+      'first',
+      'corrupt-fallback',
+      'last',
+    ])
+    expect(reloaded?.accounts[1]).toMatchObject({
+      id: 'corrupt-fallback',
+      type: 'oauth',
+      corrupt: true,
+    })
+  })
+
+  it('keeps a corrupt OAuth marker when a sibling row is mutated', async () => {
+    const { loadAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    writeFileSync(
+      cfgPath,
+      `${JSON.stringify({
+        version: 1,
+        accounts: [
+          { id: 'corrupt-fallback', type: 'oauth', refresh: '' },
+          { id: 'healthy', type: 'oauth', refresh: 'healthy-refresh' },
+        ],
+      })}\n`,
+    )
+    writeFileSync(
+      statePath,
+      `${JSON.stringify({ version: 1, accounts: {} })}\n`,
+    )
+
+    await mutateAccounts((current) => {
+      const healthy = current.accounts.find(
+        (account) => account.id === 'healthy',
+      )
+      if (healthy) healthy.enabled = false
+      return current
+    }, cfgPath)
+
+    const reloaded = await loadAccounts(cfgPath)
+    expect(reloaded?.accounts.map((account) => account.id)).toEqual([
+      'corrupt-fallback',
+      'healthy',
+    ])
+    expect(reloaded?.accounts[0]).toMatchObject({
+      id: 'corrupt-fallback',
+      corrupt: true,
+    })
+    expect(reloaded?.accounts[1]?.enabled).toBe(false)
+  })
+
+  it('persists row history only in config and records removed account ids', async () => {
+    const { loadAccounts, mutateAccounts, saveAccounts } = await import(
+      '../core/accounts.ts'
+    )
+    const storage: AccountStorage = {
+      version: 1,
+      claustrum: { mode: 'local', rowHistory: ['previous'] },
+      accounts: [oauthAccount('kept'), oauthAccount('removed')],
+    }
+    await saveAccounts(storage, cfgPath)
+
+    expect((await loadAccounts(cfgPath))?.claustrum?.rowHistory).toEqual([
+      'previous',
+    ])
+    expect(
+      JSON.parse(readFileSync(cfgPath, 'utf8')).claustrum.rowHistory,
+    ).toEqual(['previous'])
+    expect(
+      JSON.parse(readFileSync(statePath, 'utf8')).claustrum,
+    ).toBeUndefined()
+
+    await mutateAccounts(
+      (current) => ({
+        ...current,
+        accounts: current.accounts.filter(
+          (account) => account.id !== 'removed',
+        ),
+      }),
+      cfgPath,
+    )
+
+    const after = await loadAccounts(cfgPath)
+    expect(after?.accounts.map((account) => account.id)).toEqual(['kept'])
+    expect(after?.claustrum?.rowHistory).toEqual(['previous', 'removed'])
+  })
+
+  it('missing claustrum config loads as local without rewriting the file', async () => {
+    const accounts = await import('../core/accounts.ts')
+    const beforeExists = existsSync(cfgPath)
+    const beforeBytes = beforeExists ? readFileSync(cfgPath, 'utf8') : undefined
+    const beforeMtimeMs = beforeExists ? statSync(cfgPath).mtimeMs : undefined
+
+    const storage = await accounts.loadAccounts(cfgPath)
+
+    expect(accounts.claustrumMode(storage)).toBe('local')
+    expect(existsSync(cfgPath)).toBe(beforeExists)
+    expect(
+      existsSync(cfgPath) ? readFileSync(cfgPath, 'utf8') : undefined,
+    ).toBe(beforeBytes)
+    expect(existsSync(cfgPath) ? statSync(cfgPath).mtimeMs : undefined).toBe(
+      beforeMtimeMs,
+    )
+
+    const existingSource = JSON.stringify({ version: 1, accounts: [] })
+    writeFileSync(cfgPath, existingSource)
+    const existingBytes = readFileSync(cfgPath, 'utf8')
+    const existingMtimeMs = statSync(cfgPath).mtimeMs
+
+    expect(accounts.claustrumMode(await accounts.loadAccounts(cfgPath))).toBe(
+      'local',
+    )
+    expect(readFileSync(cfgPath, 'utf8')).toBe(existingBytes)
+    expect(statSync(cfgPath).mtimeMs).toBe(existingMtimeMs)
+  })
+
+  it('mode and takeover fingerprints round-trip in one config write', async () => {
+    const accounts = await import('../core/accounts.ts')
+    const transition = {
+      manifestRevision: 'manifest-revision',
+      storeGeneration: 'store-generation',
+      fingerprints: {
+        main: 'main-fingerprint',
+        fallbacks: { 'fallback-1': 'fallback-fingerprint' },
+      },
+    }
+    writeFileSync(
+      cfgPath,
+      JSON.stringify({ version: 1, accounts: [], unknownSetting: true }),
+    )
+
+    await accounts.writeClaustrumModeAndTransition(
+      cfgPath,
+      'claustrum',
+      transition,
+    )
+
+    expect(existsSync(statePath)).toBe(false)
+    const config = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    expect(config.unknownSetting).toBe(true)
+    expect(config.claustrum.mode).toBe('claustrum')
+    expect(config.claustrum.transition).toEqual(transition)
+    expect(accounts.claustrumMode(await accounts.loadAccounts(cfgPath))).toBe(
+      'claustrum',
+    )
+  })
+
   it('load/save round-trip: accounts, main provider, version', async () => {
     const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
 
@@ -772,6 +994,7 @@ describe('removed fallback refresh guard', () => {
       account.id,
       cfgPath,
       {
+        custody: localCustody,
         configPath: cfgPath,
         now: () => now,
         refreshFn: async () => {
@@ -841,6 +1064,7 @@ describe('removed fallback refresh guard', () => {
         }) => void)
       | undefined
     const manager = new FallbackAccountManager({
+      custody: localCustody,
       configPath: cfgPath,
       now: () => now,
       refreshFn: async () => {
@@ -918,6 +1142,7 @@ describe('removed fallback refresh guard', () => {
       account.id,
       cfgPath,
       {
+        custody: localCustody,
         configPath: cfgPath,
         now: () => now,
         refreshFn: async () => {

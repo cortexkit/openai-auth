@@ -52,7 +52,8 @@ function isSecretKey(key: string): boolean {
   if (k.endsWith('token') && !k.endsWith('tokens')) return true
   return false
 }
-const TOKEN_VALUE = /\b(Bearer\s+[\w.-]+|sk-[\w-]+|eyJ[\w.-]+)\b/g
+const TOKEN_VALUE =
+  /\b(Bearer\s+[\w.-]+|sk-[\w-]+|eyJ[\w.-]+|ckh_[A-Za-z0-9_-]{20,})\b/g
 export function redact(value: unknown): unknown {
   return redactInner(value, new WeakSet<object>())
 }
@@ -138,8 +139,9 @@ function safeSerialize(data: unknown): string {
 
 function emit(channel: string, level: Level, message: string, data?: unknown) {
   if (ORDER[level] > ORDER[configuredLevel()]) return
+  const redactedMessage = redact(message)
   const line =
-    `[${new Date().toISOString()}] ${level.toUpperCase()} [${channel}] ${message}` +
+    `[${new Date().toISOString()}] ${level.toUpperCase()} [${channel}] ${redactedMessage}` +
     (data === undefined ? '' : safeSerialize(data)) +
     '\n'
   buffer.push(line)

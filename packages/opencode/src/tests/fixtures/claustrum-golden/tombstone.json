@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "fixtures": {
+    "api": {
+      "provider": "deepseek",
+      "entry": { "type": "api", "key": "claustrum-tombstone:v1:deepseek" }
+    },
+    "oauth": {
+      "provider": "anthropic",
+      "entry": {
+        "type": "oauth",
+        "refresh": "claustrum-tombstone:v1:anthropic",
+        "access": "claustrum-tombstone:v1:anthropic",
+        "expires": 0
+      }
+    }
+  }
+}

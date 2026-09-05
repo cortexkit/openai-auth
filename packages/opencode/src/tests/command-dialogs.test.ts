@@ -6,13 +6,24 @@ import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import { flushForTest, setLogLevel } from '../logger.js'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
 import {
+  accountDialogModeOption,
   buildAccountDialogRows,
   buildCachekeepDialogOptions,
+  buildFallbackAccountOptions,
   formatQuotaWindows,
   openCommandDialog,
 } from '../tui/command-dialogs'
 
 describe('command dialogs', () => {
+  async function waitUntil(predicate: () => boolean): Promise<void> {
+    const deadline = Date.now() + 1_000
+    while (Date.now() < deadline) {
+      if (predicate()) return
+      await Bun.sleep(5)
+    }
+    throw new Error('dialog did not render before timeout')
+  }
+
   test('cachekeep modal shows Turn on when disabled', () => {
     const options = buildCachekeepDialogOptions({
       command: 'openai-cachekeep',
@@ -141,6 +152,89 @@ describe('command dialogs', () => {
       value: 'reset',
       description: expect.any(String),
     })
+  })
+
+  test('account dialog projects the global custody mode into explicit enter and exit actions', () => {
+    expect(accountDialogModeOption('local')).toEqual({
+      title: 'Enter Claustrum',
+      value: '__claustrum__',
+      description: 'Verify every enabled account before custody takes over',
+    })
+  })
+
+  test('account dialog shows Leave Claustrum after the enter result updates its knobs', async () => {
+    const harness = makeResetDialogHarness()
+    const apply = mock(async () => ({
+      text: 'entered',
+      knobs: { claustrumMode: 'claustrum' },
+    }))
+
+    openCommandDialog(
+      harness.api,
+      {
+        command: 'openai-account',
+        text: '',
+        knobs: { claustrumMode: 'local' },
+      },
+      apply,
+    )
+    await waitUntil(() => harness.replaceCount.value > 0)
+    harness.renderDialog()
+
+    expect(harness.select('__claustrum__')).toBe(true)
+    await waitUntil(() => harness.replaceCount.value > 1)
+    harness.renderDialog()
+
+    expect(harness.getSelectProps()?.options).toContainEqual(
+      expect.objectContaining({
+        title: 'Leave Claustrum',
+        value: '__local__',
+      }),
+    )
+  })
+
+  test('account rows and fallback actions expose mode verbs without custody on or off', () => {
+    const rows = buildAccountDialogRows({
+      main: { quota: null, killed: false },
+      fallbacks: [
+        {
+          id: 'fallback-a',
+          label: 'Fallback A',
+          quota: null,
+          killed: false,
+          enabled: false,
+        },
+      ],
+      activeId: 'main',
+      route: 'main-first',
+      lastUpdated: Date.now(),
+    })
+    const options = buildFallbackAccountOptions({
+      id: 'fallback-a',
+      label: 'Fallback A',
+      enabled: false,
+      index: 0,
+      count: 1,
+    })
+    const values = options.map((option) => option.value)
+    const titles = options.map((option) => option.title.toLowerCase())
+
+    expect(values).toContain('enable')
+    expect(values).toContain('remove')
+    expect(
+      rows
+        .map((row) => row.title)
+        .join(' ')
+        .toLowerCase(),
+    ).not.toContain('custody on')
+    expect(
+      rows
+        .map((row) => row.title)
+        .join(' ')
+        .toLowerCase(),
+    ).not.toContain('custody off')
+    expect(titles.join(' ')).not.toContain('custody on')
+    expect(titles.join(' ')).not.toContain('custody off')
   })
 
   type ResetSelectOption = {
