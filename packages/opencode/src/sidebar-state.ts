@@ -88,32 +88,45 @@ export interface SidebarAccountState {
   killed: boolean
   enabled: boolean
   resetCredits?: number
-  /** Vault-custody projection (fallback accounts only). Six states; the
-   *  enroll-pending reasons are `EnrollPendingReason` — see
-   *  `projectCustodyForSidebar`. The main slot is
-   *  always rendered as frozen-local and never carries this field. */
   custody?: SidebarAccountCustody
 }
 
-export type SidebarCustodyState =
-  | 'vault'
-  | 'vaultReauth'
-  | 'vaultGone'
-  | 'needsLogin'
-  | 'enrollPending'
-  | 'local'
+type PersistedSidebarCustodyState = 'vault' | 'needsLogin' | 'local' | 'inert'
 
-export type SidebarCustodyReason =
+type PersistedSidebarCustodyReason = CustodyInertReason | 'corrupt'
+
+/** @deprecated v6 sidebar vocabulary retained until the custody runtime projects v7 verdicts. */
+type LegacySidebarCustodyState = 'vaultReauth' | 'vaultGone' | 'enrollPending'
+
+type LegacySidebarCustodyReason =
   | 'unavailable'
   | 'gone'
   | 'identityMismatch'
   | 'nullClaim'
   | 'completionDisarmed'
 
+export type SidebarCustodyState =
+  | PersistedSidebarCustodyState
+  | LegacySidebarCustodyState
+
+export type SidebarCustodyReason =
+  | PersistedSidebarCustodyReason
+  | LegacySidebarCustodyReason
+
 export interface SidebarAccountCustody {
   state: SidebarCustodyState
   reason?: SidebarCustodyReason
   recordVersion?: number
+}
+
+export interface LegacyProjectCustodyInput {
+  tombstoned: boolean
+  storageEnabled: boolean
+  enrolled: boolean
+  handle?: string
+  enrollPendingReason?: LegacySidebarCustodyReason
+  cache?: unknown
+  now?: number
 }
 
 export interface ActiveRoutingEntry {
@@ -181,6 +194,11 @@ import { createHash, randomUUID } from 'node:crypto'
 import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import {
+  CUSTODY_INERT_REASONS,
+  type CustodyInertReason,
+  type CustodyVerdict,
+} from './core/custody-state'
 import { acquireRefreshFileLock } from './core/refresh-file-lock'
 import { createLogger } from './logger'
 
@@ -209,21 +227,16 @@ function resetCreditsField(value: unknown): { resetCredits?: number } {
   return credits !== undefined ? { resetCredits: credits } : {}
 }
 
-const CUSTODY_STATES = new Set<SidebarCustodyState>([
+const CUSTODY_STATES = new Set<PersistedSidebarCustodyState>([
   'vault',
-  'vaultReauth',
-  'vaultGone',
   'needsLogin',
-  'enrollPending',
   'local',
+  'inert',
 ])
 
-const CUSTODY_REASONS = new Set<SidebarCustodyReason>([
-  'unavailable',
-  'gone',
-  'identityMismatch',
-  'nullClaim',
-  'completionDisarmed',
+const CUSTODY_REASONS = new Set<PersistedSidebarCustodyReason>([
+  ...CUSTODY_INERT_REASONS,
+  'corrupt',
 ])
 
 /**
@@ -231,8 +244,7 @@ const CUSTODY_REASONS = new Set<SidebarCustodyReason>([
  * or reason values are dropped (NOT replaced with a default — a stale state
  * file with an experimental `vaultHealing` value must not silently render
  * as `local`, it must render as no-projection-at-all). Valid values round-
- * trip byte-identical. The output never contains a handle or a token; the
- * only emitted fields are `state`, `reason`, and `recordVersion`.
+ * trip byte-identical. The output contains only `state` and `reason`.
  */
 function normalizeSidebarCustody(
   value: unknown,
@@ -243,20 +255,17 @@ function normalizeSidebarCustody(
   const c = value as Record<string, unknown>
   if (
     typeof c.state !== 'string' ||
-    !CUSTODY_STATES.has(c.state as SidebarCustodyState)
+    !CUSTODY_STATES.has(c.state as PersistedSidebarCustodyState)
   ) {
     return undefined
   }
-  const state = c.state as SidebarCustodyState
+  const state = c.state as PersistedSidebarCustodyState
   const out: SidebarAccountCustody = { state }
   if (
     typeof c.reason === 'string' &&
-    CUSTODY_REASONS.has(c.reason as SidebarCustodyReason)
+    CUSTODY_REASONS.has(c.reason as PersistedSidebarCustodyReason)
   ) {
-    out.reason = c.reason as SidebarCustodyReason
-  }
-  if (typeof c.recordVersion === 'number' && Number.isFinite(c.recordVersion)) {
-    out.recordVersion = c.recordVersion
+    out.reason = c.reason as PersistedSidebarCustodyReason
   }
   return out
 }
@@ -354,124 +363,30 @@ export function getSidebarStateFile(): string {
   return process.env[STATE_FILE_ENV] || DEFAULT_STATE_FILE
 }
 
-/**
- * Shape of the cache inputs the custody projection consumes. Defined as a
- * structural type (not a class import) so the projection stays pure and
- * testable: production wires a `ClaustrumCredentialCache`; tests wire a
- * fake. Only the read surface is referenced — never the credential material.
- */
-export interface CustodyCacheReadView {
-  isBlocked(handle: string): boolean
-  isReauth(handle: string, now?: number): boolean
-  peekMetadata(
-    handle: string,
-  ): Promise<{ recordVersion: number; expiresAtMs: number } | undefined>
-}
-
-export interface ProjectCustodyInput {
-  /** Local oauth account (for tombstone / refresh-token checks). */
-  tombstoned: boolean
-  /** Whether the plugin-wide claustrum storage toggle is on. */
-  storageEnabled: boolean
-  /** Whether the manifest has a case-exact entry for this account id. */
-  enrolled: boolean
-  /** Handle from the manifest entry (required to query cache state). */
-  handle?: string
-  /** Latched enroll failure reason from the process-local store. */
-  enrollPendingReason?:
-    | 'unavailable'
-    | 'gone'
-    | 'identityMismatch'
-    | 'nullClaim'
-    | 'completionDisarmed'
-  /** Live read-only view of the cache; absent on unenrolled/tombstone-false. */
-  cache?: CustodyCacheReadView
-  /** Caller-supplied "now" so tests can drive the reauth fence deterministically. */
-  now?: number
-}
-
-/**
- * Project a fallback account into a six-state custody view for the sidebar.
- *
- * Order of checks (high priority first):
- *   1. Latched enroll-pending reason — the sweep set a reason; render it.
- *   2. Excluded (tombstoned + storage off) — the operator must relink the
- *      account; the vault refuses to serve.
- *   3. Custodied (tombstoned + storage on + enrolled) — consult the cache:
- *      blocked → `vaultGone`, reauth-bound → `vaultReauth`, live resident
- *      record → `vault` with the served recordVersion, otherwise
- *      `vaultReauth` (no record yet; the operator must wait for the next
- *      successful `get`).
- *   4. Custody-refuse (tombstoned + storage on + NOT enrolled) — the manifest
- *      does not recognize the account, so it reads as `needsLogin` to the
- *      operator. Same UX as excluded; the underlying reason differs.
- *   5. Ordinary fallback / enrolling without a failure — `local`.
- *
- * The projection is display-only. The output never contains a handle, a
- * token, a payload, or any sentinel string.
- */
 export function projectCustodyForSidebar(
-  input: ProjectCustodyInput,
+  verdict: CustodyVerdict | LegacyProjectCustodyInput,
 ): SidebarAccountCustody {
-  if (input.enrollPendingReason) {
-    return { state: 'enrollPending', reason: input.enrollPendingReason }
-  }
-  if (input.tombstoned && !input.storageEnabled) {
-    return { state: 'needsLogin' }
-  }
-  if (input.tombstoned && input.storageEnabled) {
-    if (!input.enrolled) {
+  if ('tombstoned' in verdict) {
+    if (!verdict.tombstoned) return { state: 'local' }
+    if (!verdict.storageEnabled || !verdict.enrolled) {
       return { state: 'needsLogin' }
     }
-    const handle = input.handle
-    const cache = input.cache
-    if (handle && cache?.isBlocked(handle)) {
-      return { state: 'vaultGone' }
-    }
-    if (handle && cache?.isReauth(handle, input.now)) {
-      return { state: 'vaultReauth' }
-    }
-    return { state: 'vaultReauth' }
+    return verdict.enrollPendingReason
+      ? { state: 'inert', reason: 'manifest-unreadable' }
+      : { state: 'inert', reason: 'vault-reauth' }
   }
-  return { state: 'local' }
-}
-
-/**
- * Async companion used by the build path: resolves the resident record and
- * upgrades the `vaultReauth` fallback to a `vault` with recordVersion when
- * a live credential is present. Sync callers (and the normalizer) use
- * `projectCustodyForSidebar` directly.
- */
-export async function projectCustodyForSidebarAsync(
-  input: ProjectCustodyInput,
-): Promise<SidebarAccountCustody> {
-  if (input.enrollPendingReason) {
-    return { state: 'enrollPending', reason: input.enrollPendingReason }
+  switch (verdict.kind) {
+    case 'LOCAL':
+      return { state: 'local' }
+    case 'VAULT':
+      return { state: 'vault' }
+    case 'INERT':
+      return { state: 'inert', reason: verdict.reason }
+    case 'NEEDS_LOGIN':
+      return verdict.reason === 'corrupt'
+        ? { state: 'needsLogin', reason: 'corrupt' }
+        : { state: 'needsLogin' }
   }
-  if (input.tombstoned && !input.storageEnabled) {
-    return { state: 'needsLogin' }
-  }
-  if (input.tombstoned && input.storageEnabled) {
-    if (!input.enrolled) {
-      return { state: 'needsLogin' }
-    }
-    const handle = input.handle
-    const cache = input.cache
-    if (handle && cache?.isBlocked(handle)) {
-      return { state: 'vaultGone' }
-    }
-    if (handle && cache?.isReauth(handle, input.now)) {
-      return { state: 'vaultReauth' }
-    }
-    if (handle && cache) {
-      const peeked = await cache.peekMetadata(handle)
-      if (peeked) {
-        return { state: 'vault', recordVersion: peeked.recordVersion }
-      }
-    }
-    return { state: 'vaultReauth' }
-  }
-  return { state: 'local' }
 }
 
 export const DEFAULT_SIDEBAR_STATE: SidebarState = {
