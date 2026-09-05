@@ -1175,7 +1175,7 @@ export async function CodexAuthPlugin(
       now: Date.now,
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     })
-    if (custodyBootstrap.mainVerdict?.kind === 'INERT') {
+    if (custodyBootstrap.mainVerdict) {
       const sidebar = await getSidebarState()
       await setSidebarMachineState({
         ...sidebar,
