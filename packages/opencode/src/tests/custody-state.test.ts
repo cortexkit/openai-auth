@@ -82,7 +82,7 @@ const localCases: LocalCase[] = [
     name: 'local × present × real',
     manifest: 'present',
     local: 'real',
-    want: { kind: 'INERT', reason: 'enrolled-under-local' },
+    want: { kind: 'INERT', reason: 'needs-login' },
   },
   {
     name: 'local × present × tombstone',
@@ -373,6 +373,7 @@ describe('evaluateCustodyStartup — §16 coordinate table', () => {
         manifest,
         local,
         vault: vault('serves'),
+        verifiedInProcessLogin: false,
       }),
     ).toEqual(want)
   })
@@ -385,6 +386,7 @@ describe('evaluateCustodyStartup — §16 coordinate table', () => {
         local: row.local,
         vault: vault(row.vault),
         fingerprintMatch: row.fingerprintMatch,
+        verifiedInProcessLogin: false,
       }),
     ).toEqual(row.want)
 
@@ -396,6 +398,7 @@ describe('evaluateCustodyStartup — §16 coordinate table', () => {
           local: row.local,
           vault: vault(row.vault),
           fingerprintMatch: false,
+          verifiedInProcessLogin: false,
         }),
       ).toEqual(row.mismatchWant)
     }
@@ -409,6 +412,7 @@ describe('evaluateCustodyStartup — §16 invariants', () => {
         mode: 'local',
         manifest: 'absent',
         local: 'real',
+        verifiedInProcessLogin: false,
         vault: () => {
           throw new Error('vault accessor was called')
         },
@@ -434,6 +438,7 @@ describe('evaluateCustodyStartup — §16 invariants', () => {
           manifest: 'unreadable',
           manifestFailureReason: failureReason,
           local: 'empty',
+          verifiedInProcessLogin: false,
           vault: () => {
             throw new Error('vault accessor was called')
           },
@@ -448,6 +453,7 @@ describe('evaluateCustodyStartup — §16 invariants', () => {
         mode: 'claustrum',
         manifest: 'absent',
         local: 'tombstone',
+        verifiedInProcessLogin: false,
         vault: () => {
           throw new Error('vault accessor was called')
         },
@@ -468,12 +474,14 @@ describe('evaluateCustodyStartup — §16 invariants', () => {
         manifest: 'present',
         local: 'tombstone',
         vault: vault(vaultState),
+        verifiedInProcessLogin: false,
       })
       const partial = evaluateCustodyStartup({
         mode: 'claustrum',
         manifest: 'present',
         local: 'empty',
         vault: vault(vaultState),
+        verifiedInProcessLogin: false,
       })
       expect({
         kind: partial.kind,
@@ -486,7 +494,7 @@ describe('evaluateCustodyStartup — §16 invariants', () => {
     }
   })
 
-  test('main real material with a present binding remains enrolled under local mode', () => {
+  test('verified local re-login is the only bound real slot that serves locally', () => {
     expect(
       evaluateCustodyStartup({
         mode: 'local',
@@ -494,8 +502,9 @@ describe('evaluateCustodyStartup — §16 invariants', () => {
         local: 'real',
         isMain: true,
         vault: vault('serves'),
+        verifiedInProcessLogin: true,
       }),
-    ).toEqual({ kind: 'INERT', reason: 'enrolled-under-local' })
+    ).toEqual({ kind: 'LOCAL' })
   })
 
   test('install only applies to fallback gone rows with a present binding', () => {
@@ -506,6 +515,7 @@ describe('evaluateCustodyStartup — §16 invariants', () => {
         local: row.local,
         vault: vault(row.vault),
         fingerprintMatch: row.fingerprintMatch,
+        verifiedInProcessLogin: false,
       })
       if (
         row.manifest !== 'present' ||
@@ -527,6 +537,7 @@ describe('evaluateCustodyStartup — §16 invariants', () => {
         local: row.local,
         vault: vault(row.vault),
         fingerprintMatch: row.fingerprintMatch,
+        verifiedInProcessLogin: false,
       })
       if (verdict.kind !== 'VAULT') continue
       expect(verdict.installTombstone === true).toBe(
@@ -540,6 +551,7 @@ describe('evaluateCustodyStartup — §16 invariants', () => {
   test('exports the complete v7 inert-reason vocabulary', () => {
     expect(CUSTODY_INERT_REASONS).toEqual([
       'enrolled-under-local',
+      'needs-login',
       'mode-mismatch',
       'corrupt-under-binding',
       'manifest-unreadable',
