@@ -40,6 +40,8 @@ claustrum?: {
 
 `rowHistory` distinguishes an orphan whose row was removed from one awaiting first discovery. `transition` survives a committed mode write until all fingerprint-gated tombstones complete.
 
+The canonical custody tombstone is `{ type: 'oauth', access: '', refresh: custodyTombstoneKey(provider), expires: 0 }`. Recognition is exact on `refresh`; the empty `access` prevents the tombstone from being usable as bearer material.
+
 `custodySlotFingerprint(access, refresh)` is lowercase hexadecimal SHA-256 over:
 
 ```text
@@ -58,8 +60,6 @@ The prefix is `claustrum-tombstone:v1:` and the per-provider sentinel is `claust
 
 ## Verdict-reason vocabulary
 
-- `INERT:enrolled-under-local`
-  - Unused by the evaluator: superseded by `needs-login`; removal is a follow-up source change.
 - `INERT:needs-login`
 - `INERT:mode-mismatch`
 - `INERT:corrupt-under-binding`
@@ -214,7 +214,7 @@ An entry with no fallback row is an `orphan-binding`, not a local coordinate. Ru
 
 `FallbackAccountManager` is constructed as `new FallbackAccountManager(options: AccountManagerOptions)`, where `AccountManagerOptions` requires `custody: { readManifest: () => Promise<CustodyManifestReadResult>; provider?: string }`. Every production call site must supply that `custody` object; an omitted policy reader would silently re-enable local refresh.
 
-The requirement exists because anthropic-auth incident 1 showed optional custody wiring failing open. `CorruptOAuthAccount` preserves a malformed OAuth row as typed custody-relevant state rather than silently dropping it as an ordinary missing account.
+The requirement exists because anthropic-auth incident 1 demonstrated that optional custody wiring fails open. `CorruptOAuthAccount` preserves a malformed OAuth row as typed custody-relevant state rather than silently dropping it as an ordinary missing account.
 
 ## Test list
 
