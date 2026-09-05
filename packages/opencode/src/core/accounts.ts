@@ -997,9 +997,7 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     ...(storage.claustrum !== undefined
       ? {
           claustrum: {
-            mode:
-              storage.claustrum.mode ??
-              (storage.claustrum.enabled === true ? 'claustrum' : 'local'),
+            mode: storage.claustrum.mode ?? 'local',
             ...(storage.claustrum.transition
               ? { transition: storage.claustrum.transition }
               : {}),

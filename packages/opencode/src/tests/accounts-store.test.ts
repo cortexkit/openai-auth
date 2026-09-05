@@ -189,6 +189,17 @@ describe('accounts store', () => {
     expect(existsSync(cfgPath) ? statSync(cfgPath).mtimeMs : undefined).toBe(
       beforeMtimeMs,
     )
+
+    const existingSource = JSON.stringify({ version: 1, accounts: [] })
+    writeFileSync(cfgPath, existingSource)
+    const existingBytes = readFileSync(cfgPath, 'utf8')
+    const existingMtimeMs = statSync(cfgPath).mtimeMs
+
+    expect(accounts.claustrumMode(await accounts.loadAccounts(cfgPath))).toBe(
+      'local',
+    )
+    expect(readFileSync(cfgPath, 'utf8')).toBe(existingBytes)
+    expect(statSync(cfgPath).mtimeMs).toBe(existingMtimeMs)
   })
 
   it('legacy claustrum switches are rejected instead of bypassing the readiness barrier', async () => {
@@ -218,6 +229,23 @@ describe('accounts store', () => {
     )
 
     expect((await loadAccounts(cfgPath))?.claustrum?.manifestWrite).toBe(false)
+  })
+
+  it('in-memory legacy enabled state serializes as local mode', async () => {
+    const { saveAccounts } = await import('../core/accounts.ts')
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        claustrum: { enabled: true },
+      },
+      cfgPath,
+    )
+
+    expect(JSON.parse(readFileSync(cfgPath, 'utf8')).claustrum.mode).toBe(
+      'local',
+    )
   })
 
   it('mode and takeover fingerprints round-trip in one config write', async () => {
