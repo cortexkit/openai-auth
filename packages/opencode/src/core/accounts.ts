@@ -507,6 +507,14 @@ export function normalizeAccount(value: unknown): FallbackAccount | null {
   }
 
   if (value.type !== 'oauth') return null
+  if (value.corrupt === true) {
+    if (typeof value.id !== 'string' || !value.id.trim()) return null
+    return {
+      ...normalizeAccountBase(value),
+      type: 'oauth',
+      corrupt: true,
+    }
+  }
   if (typeof value.refresh !== 'string' || !value.refresh.trim()) {
     if (
       !Object.hasOwn(value, 'refresh') ||
@@ -855,6 +863,8 @@ function accountConfig(account: FallbackAccount) {
     id: account.id,
     label: account.label,
     type: account.type,
+    corrupt:
+      account.type === 'oauth' && account.corrupt === true ? true : undefined,
     enabled: account.enabled,
     addedAt: account.addedAt,
     accountId: account.accountId,
