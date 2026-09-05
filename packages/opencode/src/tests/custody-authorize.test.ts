@@ -1,8 +1,6 @@
-import { afterAll, describe, expect, mock, test } from 'bun:test'
+import { describe, expect, mock, test } from 'bun:test'
 import { acquireCustodyTransitionMutex } from '../core/custody-transition.ts'
-import * as oauthLiveNamespace from '../core/oauth.ts'
-
-const oauthRealExports = { ...oauthLiveNamespace }
+import { CodexAuthPlugin } from '../index.ts'
 
 type Deferred<T> = {
   promise: Promise<T>
@@ -28,6 +26,7 @@ async function waitForSleep(sleeps: Array<Deferred<void>>): Promise<void> {
 type TokenResponse = {
   access_token: string
   refresh_token: string
+  id_token: string
   expires_in: number
 }
 
@@ -39,22 +38,14 @@ async function makeAuthorizeMethods() {
   const browserTokens = deferred<TokenResponse>()
   const headlessTokens = deferred<TokenResponse>()
   const browserStarted = mock(async () => ({
-    redirectUri: 'http://test/callback',
+    url: 'http://test/callback',
+    tokens: browserTokens.promise,
   }))
   const headlessStarted = mock(async () => ({
-    deviceData: { device_auth_id: 'test', user_code: 'TEST', interval: '1' },
     url: 'http://test/device',
     instructions: 'test',
+    tokens: headlessTokens.promise,
   }))
-
-  mock.module('../core/oauth.ts', () => ({
-    ...oauthRealExports,
-    startOAuthServer: browserStarted,
-    waitForOAuthCallback: () => browserTokens.promise,
-    beginDeviceAuth: headlessStarted,
-    completeDeviceAuth: () => headlessTokens.promise,
-  }))
-  const { CodexAuthPlugin } = await import('../index.ts')
 
   let hostAccess: string | undefined
   const sleeps: Array<Deferred<void>> = []
@@ -96,6 +87,7 @@ async function makeAuthorizeMethods() {
           sleeps.push(next)
           await next.promise
         },
+        authorize: { browser: browserStarted, headless: headlessStarted },
       },
     },
   )
@@ -118,10 +110,6 @@ async function makeAuthorizeMethods() {
     dispose: hooks.dispose,
   }
 }
-
-afterAll(() => {
-  mock.module('../core/oauth.ts', () => oauthRealExports)
-})
 
 describe('production authorize custody leases', () => {
   test.each([
@@ -154,12 +142,14 @@ describe('production authorize custody leases', () => {
           fixture.browserTokens.resolve({
             access_token: access,
             refresh_token: 'refresh',
+            id_token: 'id',
             expires_in: 60,
           })
         } else {
           fixture.headlessTokens.resolve({
             access_token: access,
             refresh_token: 'refresh',
+            id_token: 'id',
             expires_in: 60,
           })
         }
@@ -183,6 +173,7 @@ describe('production authorize custody leases', () => {
       fixture.browserTokens.resolve({
         access_token: 'minted-access',
         refresh_token: 'refresh',
+        id_token: 'id',
         expires_in: 60,
       })
       await flow.callback()

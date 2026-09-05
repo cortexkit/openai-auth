@@ -100,6 +100,7 @@ import {
   generatePKCE,
   parseJwtClaims,
   startOAuthServer,
+  type TokenResponse,
   USER_AGENT,
   waitForOAuthCallback,
 } from './core/oauth'
@@ -471,6 +472,19 @@ interface CodexAuthPluginOptions {
     now?: () => number
     /** Test seam: controls bounded host-write observation without real timers. */
     sleep?: (ms: number) => Promise<void>
+    /** Test seam: replaces external OAuth I/O while preserving the hook callback. */
+    authorize?: {
+      browser?: () => Promise<{
+        url: string
+        tokens: Promise<TokenResponse>
+        cleanup?: () => void
+      }>
+      headless?: () => Promise<{
+        url: string
+        instructions: string
+        tokens: Promise<TokenResponse>
+      }>
+    }
   }
 }
 
@@ -3941,22 +3955,29 @@ export async function CodexAuthPlugin(
           authorize: async () => {
             const mutex = await acquireCustodyTransitionMutex()
             try {
-              const { redirectUri } = await startOAuthServer()
-              const pkce = await generatePKCE()
-              const state = base64UrlEncode(
-                crypto.getRandomValues(new Uint8Array(32)).buffer,
-              )
-              const authUrl = buildAuthorizeUrl(redirectUri, pkce, state)
-              const callbackPromise = waitForOAuthCallback(pkce, state)
+              const flow = custodyOptions?.authorize?.browser
+                ? await custodyOptions.authorize.browser()
+                : await (async () => {
+                    const { redirectUri } = await startOAuthServer()
+                    const pkce = await generatePKCE()
+                    const state = base64UrlEncode(
+                      crypto.getRandomValues(new Uint8Array(32)).buffer,
+                    )
+                    return {
+                      url: buildAuthorizeUrl(redirectUri, pkce, state),
+                      tokens: waitForOAuthCallback(pkce, state),
+                      cleanup: () => flowCleanup(state),
+                    }
+                  })()
 
               return {
-                url: authUrl,
+                url: flow.url,
                 instructions:
                   'Complete authorization in your browser. This window will close automatically.',
                 method: 'auto' as const,
                 callback: async () => {
                   try {
-                    const tokens = await callbackPromise
+                    const tokens = await flow.tokens
                     const result = {
                       type: 'success' as const,
                       refresh: tokens.refresh_token,
@@ -3986,7 +4007,7 @@ export async function CodexAuthPlugin(
                     await mutex.release()
                     throw error
                   } finally {
-                    flowCleanup(state)
+                    flow.cleanup?.()
                   }
                 },
               }
@@ -4002,14 +4023,24 @@ export async function CodexAuthPlugin(
           authorize: async () => {
             const mutex = await acquireCustodyTransitionMutex()
             try {
-              const { deviceData, url, instructions } = await beginDeviceAuth()
+              const flow = custodyOptions?.authorize?.headless
+                ? await custodyOptions.authorize.headless()
+                : await (async () => {
+                    const { deviceData, url, instructions } =
+                      await beginDeviceAuth()
+                    return {
+                      url,
+                      instructions,
+                      tokens: completeDeviceAuth(deviceData),
+                    }
+                  })()
               return {
-                url,
-                instructions,
+                url: flow.url,
+                instructions: flow.instructions,
                 method: 'auto' as const,
                 async callback() {
                   try {
-                    const tokens = await completeDeviceAuth(deviceData)
+                    const tokens = await flow.tokens
                     const result = {
                       type: 'success' as const,
                       refresh: tokens.refresh_token,
