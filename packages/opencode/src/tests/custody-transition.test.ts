@@ -7,6 +7,7 @@ import {
   type AccountStorage,
   type AccountStoreTransaction,
   getAccountStatePath,
+  mutateAccounts,
   saveAccounts,
   withAccountStoreTransaction,
 } from '../core/accounts.ts'
@@ -347,6 +348,89 @@ describe('enterClaustrumMode coordinator', () => {
       await held
       expect(existsSync(`${path}.save.lock`)).toBe(false)
       expect(existsSync(`${statePath}.save.lock`)).toBe(false)
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('blocks a CLI-shaped account write behind the barrier store transaction', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'oai-custody-store-lock-'))
+    const path = join(directory, 'accounts.json')
+    const transition = await import('../core/custody-transition.ts')
+    const account = liveAccount('fallback-a')
+    const entered = deferred()
+    const release = deferred()
+    const authSlot = {
+      type: 'oauth',
+      access: 'main-access',
+      refresh: 'main-refresh',
+      expires: 1,
+    }
+    try {
+      await saveAccounts(liveStorage([account]), path)
+
+      const uncontendedStarted = performance.now()
+      await mutateAccounts((current) => current, path)
+      const uncontendedMs = performance.now() - uncontendedStarted
+
+      const barrier = transition.enterClaustrumMode({
+        accountIds: [account.id],
+        acquireLock: async () => ({ release: async () => {} }),
+        withStoreTransaction: async (action) =>
+          await withAccountStoreTransaction(action, path),
+        readManifest: async () => ({
+          ok: true as const,
+          revision: 'revision-1',
+          value: {
+            version: 1 as const,
+            providers: [
+              {
+                provider: 'openai',
+                shape: 'oauth' as const,
+                serve: 'openai-auth',
+                accounts: [
+                  {
+                    label: 'main',
+                    handle: `ckh_${'m'.repeat(43)}`,
+                    credential_id: 'oauth:openai:main',
+                  },
+                  {
+                    label: account.id,
+                    handle: `ckh_${'a'.repeat(43)}`,
+                    credential_id: `oauth:openai:${account.id}`,
+                  },
+                ],
+              },
+            ],
+          },
+        }),
+        preflight: async () => 'ready',
+        auth: {
+          all: async () => ({ openai: authSlot }),
+          get: async () => authSlot,
+          set: async () => {},
+        },
+        onStep: async (step) => {
+          if (step !== 'revalidated') return
+          entered.resolve()
+          await release.promise
+        },
+      })
+      await entered.promise
+
+      let settled = false
+      const cliWrite = mutateAccounts((current) => {
+        current.accounts.push(liveAccount('cli-shaped-write'))
+        return current
+      }, path).then(() => {
+        settled = true
+      })
+      await Bun.sleep(Math.max(20, Math.ceil(uncontendedMs * 2)))
+      expect(settled).toBe(false)
+
+      release.resolve()
+      await Promise.all([barrier, cliWrite])
+      expect(settled).toBe(true)
     } finally {
       rmSync(directory, { recursive: true, force: true })
     }
