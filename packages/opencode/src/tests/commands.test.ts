@@ -90,9 +90,12 @@ function makeClient(): CommandContext['client'] {
 
 function withAccountLogin(
   ctx: CommandContext,
-  beginAccountLogin: NonNullable<CommandContext['beginAccountLogin']>,
+  beginAccountLogin: unknown,
 ): CommandContext {
-  return { ...ctx, beginAccountLogin }
+  return {
+    ...ctx,
+    beginAccountLogin: beginAccountLogin as CommandContext['beginAccountLogin'],
+  }
 }
 
 function fetchStub(
@@ -3841,6 +3844,26 @@ describe('commands (claustrum mode)', () => {
     expect(payload.text).toContain('ck auth')
   })
 
+  test('account status and help retain Claustrum mode verbs without custody on or off', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        accounts: [makeAccount('fallback-a')],
+        claustrum: { mode: 'local' },
+      },
+      configPath,
+    )
+
+    const status = await buildDialogPayload('openai-account', '', context())
+    const help = await buildDialogPayload('openai-account', 'help', context())
+
+    for (const payload of [status, help]) {
+      expect(payload.text).toContain('claustrum')
+      expect(payload.text.toLowerCase()).not.toContain('custody on')
+      expect(payload.text.toLowerCase()).not.toContain('custody off')
+    }
+  })
+
   test('enable re-reads claustrum mode under the account lock and binds a pending row before enabling it', async () => {
     await saveAccounts(
       {
@@ -3973,7 +3996,8 @@ describe('commands (claustrum mode)', () => {
         notify: (payload) => {
           notifications.push(payload.text)
         },
-        beginAccountLogin,
+        beginAccountLogin:
+          beginAccountLogin as CommandContext['beginAccountLogin'],
         withFallbackAccountLock: async (_id, action) => action(),
       }),
     )
