@@ -30,6 +30,7 @@ import {
   enrollmentManifest,
   liveAccount,
   liveStorage,
+  makeCustodyRequestJwt,
   makeSentinelAccount,
   TOMBSTONE_OPENAI,
 } from './custody-fixtures.ts'
@@ -40,16 +41,6 @@ import {
   FLOOR_SIDEBAR_STATE_FILE,
   FLOOR_STATE_FILE,
 } from './setup-env.ts'
-
-function jwtFor(accountId: string, tag?: string): string {
-  const payload = Buffer.from(
-    JSON.stringify({
-      chatgpt_account_id: accountId,
-      ...(tag ? { tag } : {}),
-    }),
-  ).toString('base64url')
-  return `header.${payload}.signature`
-}
 
 function enrollingAccount(overrides: Partial<OAuthAccount> = {}): OAuthAccount {
   return {
@@ -284,7 +275,7 @@ describe('custody request resolution', () => {
       {
         accounts: [account],
         credential: {
-          material: jwtFor('served-account'),
+          material: makeCustodyRequestJwt('served-account'),
           recordVersion: 1,
         },
         respond: () => 200,
@@ -313,7 +304,7 @@ describe('custody request resolution', () => {
       {
         accounts: [account],
         credential: {
-          material: jwtFor('served-account'),
+          material: makeCustodyRequestJwt('served-account'),
           recordVersion: 1,
         },
         respond: () => 200,
@@ -430,7 +421,7 @@ describe('custody request resolution', () => {
 
   it('persists the tombstone before sending an enrollment credential', async () => {
     const fallback = enrollingAccount()
-    const vaultAccess = jwtFor('acct-1')
+    const vaultAccess = makeCustodyRequestJwt('acct-1')
     let observed: OAuthAccount | undefined
     await withCustodyLoader(
       {
@@ -470,7 +461,10 @@ describe('custody request resolution', () => {
     await withCustodyLoader(
       {
         accounts: [fallback],
-        credential: { material: jwtFor('acct-bound'), recordVersion: 19 },
+        credential: {
+          material: makeCustodyRequestJwt('acct-bound'),
+          recordVersion: 19,
+        },
         respond: () => 200,
       },
       async ({ fetchOverride, configPath }) => {
@@ -496,14 +490,19 @@ describe('custody request resolution', () => {
       {
         accounts: [expired, next],
         routing: { mode: 'fallback-first' },
-        credential: { material: jwtFor('acct-1'), recordVersion: 18 },
+        credential: {
+          material: makeCustodyRequestJwt('acct-1'),
+          recordVersion: 18,
+        },
         respond: (authorization) =>
           authorization === 'Bearer main-access' ? 401 : 200,
       },
       async ({ fetchOverride, authorizations, configPath }) => {
         const [url, init] = codexRequest()
         expect((await fetchOverride(url, init)).status).toBe(200)
-        expect(authorizations).toContain(`Bearer ${jwtFor('acct-1')}`)
+        expect(authorizations).toContain(
+          `Bearer ${makeCustodyRequestJwt('acct-1')}`,
+        )
         const storage = await loadAccounts(configPath)
         const preserved = storage?.accounts.find(
           (account) => account.id === expired.id,
@@ -530,7 +529,7 @@ describe('custody request resolution', () => {
     })
     const manifest = enrollmentManifest(fallback.id)
     if (!manifest.ok) throw new Error('expected manifest fixture')
-    const vaultAccess = jwtFor('acct-1')
+    const vaultAccess = makeCustodyRequestJwt('acct-1')
     const authorizations: string[] = []
     const reports: Array<{
       handle: string
@@ -697,7 +696,10 @@ describe('custody request resolution', () => {
         accounts: [tombstone],
         routing: { mode: 'fallback-first' },
         claustrumEnabled: false,
-        credential: { material: jwtFor('acct-disabled'), recordVersion: 11 },
+        credential: {
+          material: makeCustodyRequestJwt('acct-disabled'),
+          recordVersion: 11,
+        },
         respond: () => 200,
       },
       async ({ fetchOverride, authorizations }) => {
@@ -714,7 +716,7 @@ describe('custody request resolution', () => {
       id: 'reactive',
       accountId: 'acct-reactive',
     })
-    const vaultAccess = jwtFor('acct-reactive')
+    const vaultAccess = makeCustodyRequestJwt('acct-reactive')
     await withCustodyLoader(
       {
         accounts: [fallback],
@@ -742,7 +744,7 @@ describe('custody request resolution', () => {
       id: 'sticky',
       accountId: 'acct-sticky',
     })
-    const vaultAccess = jwtFor('acct-sticky')
+    const vaultAccess = makeCustodyRequestJwt('acct-sticky')
     const checkedAt = Date.now()
     await withCustodyLoader(
       {
@@ -775,7 +777,7 @@ describe('custody request resolution', () => {
       id: 'sticky-401',
       accountId: 'acct-sticky-401',
     })
-    const vaultAccess = jwtFor('acct-sticky-401')
+    const vaultAccess = makeCustodyRequestJwt('acct-sticky-401')
     const checkedAt = Date.now()
     await withCustodyLoader(
       {
@@ -851,7 +853,7 @@ describe('custody request resolution', () => {
       id: 'cachekeep-vault',
       accountId: 'acct-cachekeep-vault',
     })
-    const vaultAccess = jwtFor('acct-cachekeep-vault')
+    const vaultAccess = makeCustodyRequestJwt('acct-cachekeep-vault')
     await withCustodyLoader(
       {
         accounts: [fallback],
@@ -882,7 +884,7 @@ describe('custody request resolution', () => {
       id: 'cachekeep-vault-401',
       accountId: 'acct-cachekeep-vault-401',
     })
-    const vaultAccess = jwtFor('acct-cachekeep-vault-401')
+    const vaultAccess = makeCustodyRequestJwt('acct-cachekeep-vault-401')
     await withCustodyLoader(
       {
         accounts: [fallback],
@@ -960,7 +962,7 @@ describe('custody request resolution', () => {
     })
     const manifest = enrollmentManifest(vault.id)
     if (!manifest.ok) throw new Error('expected manifest fixture')
-    const vaultAccess = jwtFor('acct-sticky-vault')
+    const vaultAccess = makeCustodyRequestJwt('acct-sticky-vault')
     const authorizations: string[] = []
     const reports: Array<{ recordVersion: number; reporterSource: string }> = []
     const originalFetch = globalThis.fetch
@@ -1115,8 +1117,11 @@ describe('custody request resolution', () => {
       id: 'invalidate-request-cache',
       accountId: 'acct-invalidate-request-cache',
     })
-    const vault17 = jwtFor('acct-invalidate-request-cache')
-    const vault18 = jwtFor('acct-invalidate-request-cache', 'v18')
+    const vault17 = makeCustodyRequestJwt('acct-invalidate-request-cache')
+    const vault18 = makeCustodyRequestJwt(
+      'acct-invalidate-request-cache',
+      'v18',
+    )
     let credential = { material: vault17, recordVersion: 17 }
     await withCustodyLoader(
       {
@@ -1167,7 +1172,10 @@ describe('custody request resolution', () => {
         routing: { mode: 'fallback-first' },
         now: () => clock,
         credentialForGet: () => ({
-          material: jwtFor('acct-bound-request-cache', String(version)),
+          material: makeCustodyRequestJwt(
+            'acct-bound-request-cache',
+            String(version),
+          ),
           recordVersion: version,
         }),
         respond: (authorization, url) => {
@@ -1224,7 +1232,7 @@ describe('custody request resolution', () => {
         vaultSucceeds = true
         expect((await fetchOverride(url, init)).status).toBe(200)
         expect(authorizations.at(-1)).toBe(
-          `Bearer ${jwtFor('acct-bound-request-cache', '21')}`,
+          `Bearer ${makeCustodyRequestJwt('acct-bound-request-cache', '21')}`,
         )
 
         vaultSucceeds = false
@@ -1258,7 +1266,7 @@ describe('custody request resolution', () => {
         id: 'forbidden',
         accountId: 'acct-forbidden',
       })
-      const vaultAccess = jwtFor('acct-forbidden')
+      const vaultAccess = makeCustodyRequestJwt('acct-forbidden')
       await withCustodyLoader(
         {
           accounts: [fallback],
@@ -1280,7 +1288,7 @@ describe('custody request resolution', () => {
         id: 'limited',
         accountId: 'acct-limited',
       })
-      const vaultAccess = jwtFor('acct-limited')
+      const vaultAccess = makeCustodyRequestJwt('acct-limited')
       await withCustodyLoader(
         {
           accounts: [fallback],
@@ -1302,7 +1310,7 @@ describe('custody request resolution', () => {
         id: 'outside',
         accountId: 'acct-outside',
       })
-      const vaultAccess = jwtFor('acct-outside')
+      const vaultAccess = makeCustodyRequestJwt('acct-outside')
       await withCustodyLoader(
         {
           accounts: [fallback],
@@ -1393,7 +1401,7 @@ describe('custody request resolution', () => {
     if (!manifest.ok) throw new Error('expected manifest fixture')
     const handle = manifest.value.providers[0]?.accounts[0]?.handle
     if (!handle) throw new Error('expected fixture handle')
-    const vaultAccess = jwtFor('acct-1')
+    const vaultAccess = makeCustodyRequestJwt('acct-1')
     const cache = new ClaustrumCredentialCache({
       connector: async () =>
         ({
@@ -1461,7 +1469,7 @@ describe('custody request resolution', () => {
         ({
           async getCredential() {
             return {
-              material: jwtFor('wrong-account'),
+              material: makeCustodyRequestJwt('wrong-account'),
               recordVersion: 8,
               expiresAtMs: 10_000,
             }

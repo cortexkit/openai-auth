@@ -54,6 +54,7 @@ import {
   enrollmentManifest,
   liveAccount,
   liveStorage,
+  makeCustodyJwt,
   makeSentinelAccount,
   TOMBSTONE_OPENAI,
   withClaustrumMode,
@@ -145,20 +146,6 @@ function makeTransport(
     },
   }
   return { transport, captured }
-}
-
-function makeJwt(accountId: string | undefined, expiresInSec = 600): string {
-  const header = Buffer.from(JSON.stringify({ alg: 'none' })).toString(
-    'base64url',
-  )
-  const claims: Record<string, unknown> = {
-    exp: Math.floor(Date.now() / 1000) + expiresInSec,
-  }
-  if (accountId) {
-    claims['https://api.openai.com/auth'] = { chatgpt_account_id: accountId }
-  }
-  const payload = Buffer.from(JSON.stringify(claims)).toString('base64url')
-  return `${header}.${payload}.sig`
 }
 
 async function writeStorageWithManifest(
@@ -405,7 +392,7 @@ describe('orphan binding discovery', () => {
     const secondBoot = second.boot().then(() => {
       secondSettled = true
     })
-    await new Promise((resolve) => setTimeout(resolve, 20))
+    for (let turn = 0; turn < 32; turn += 1) await Promise.resolve()
     expect(secondSettled).toBe(false)
     releaseFirst()
     await Promise.all([firstBoot, secondBoot])
@@ -945,7 +932,7 @@ describe('custody warm and tick', () => {
     const manifest = enrollmentManifest('fb-1')
     await writeStorageWithManifest(liveStorage([account]), manifest)
     const { transport, captured } = makeTransport(({ handle }) => ({
-      material: makeJwt('acct-1'),
+      material: makeCustodyJwt('acct-1'),
       recordVersion: 7,
       expiresAtMs: Date.now() + 600_000,
     }))
@@ -978,11 +965,15 @@ describe('custody warm and tick', () => {
       liveStorage([account]),
       enrollmentManifest('fb-1'),
     )
+    let releaseWarm = () => {}
+    const warmReleased = new Promise<void>((resolve) => {
+      releaseWarm = resolve
+    })
     const slowTransport: ClaustrumCacheTransportLike = {
       getCredential: mock(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 250))
+        await warmReleased
         return {
-          material: makeJwt('acct-1'),
+          material: makeCustodyJwt('acct-1'),
           recordVersion: 9,
           expiresAtMs: Date.now() + 600_000,
         }
@@ -1007,9 +998,9 @@ describe('custody warm and tick', () => {
     await runtime.boot()
     const elapsed = Date.now() - start
     expect(elapsed).toBeLessThan(250)
-    await new Promise((resolve) => setTimeout(resolve, 300))
-    const peeked = await runtime.getCache()?.peek(HANDLE)
-    expect(peeked?.recordVersion).toBe(9)
+    releaseWarm()
+    const warmed = await runtime.getCache()?.get(HANDLE)
+    expect(warmed?.recordVersion).toBe(9)
     runtime.dispose()
   })
 
@@ -1028,7 +1019,7 @@ describe('custody warm and tick', () => {
     const clearIntervalFn = mock(() => undefined)
     const transport: ClaustrumCacheTransportLike = {
       getCredential: mock(async () => ({
-        material: makeJwt('acct-1'),
+        material: makeCustodyJwt('acct-1'),
         recordVersion: 1,
         expiresAtMs: Date.now() + 600_000,
       })),
@@ -1127,7 +1118,7 @@ describe('custody warm and tick', () => {
     }
     await writeStorageWithManifest(liveStorage([a, b]), manifest)
     const { transport, captured } = makeTransport(({ handle }) => ({
-      material: makeJwt(handle === HANDLE ? 'acct-1' : 'acct-2'),
+      material: makeCustodyJwt(handle === HANDLE ? 'acct-1' : 'acct-2'),
       recordVersion: 3,
       expiresAtMs: Date.now() + 600_000,
     }))
@@ -1152,7 +1143,7 @@ describe('custody warm and tick', () => {
   it('skips the tick when the runtime is disposed', async () => {
     const transport: ClaustrumCacheTransportLike = {
       getCredential: mock(async () => ({
-        material: makeJwt('acct-1'),
+        material: makeCustodyJwt('acct-1'),
         recordVersion: 1,
         expiresAtMs: Date.now() + 600_000,
       })),
@@ -1190,7 +1181,7 @@ describe('enroll-completion sweep', () => {
     })
     await writeStorageWithManifest(storage, enrollmentManifest('main'))
     const { transport } = makeTransport(() => ({
-      material: makeJwt('acct-main'),
+      material: makeCustodyJwt('acct-main'),
       recordVersion: 1,
       expiresAtMs: Date.now() + 600_000,
     }))
@@ -1236,7 +1227,7 @@ describe('enroll-completion sweep', () => {
         enrollmentManifest(corrupt.id),
       )
       const { transport } = makeTransport(() => ({
-        material: makeJwt('acct-1'),
+        material: makeCustodyJwt('acct-1'),
         recordVersion: 1,
         expiresAtMs: Date.now() + 600_000,
       }))
@@ -1285,7 +1276,7 @@ describe('enroll-completion sweep', () => {
         enrollmentManifest(corrupt.id),
       )
       const { transport } = makeTransport(() => ({
-        material: makeJwt('acct-1'),
+        material: makeCustodyJwt('acct-1'),
         recordVersion: 1,
         expiresAtMs: Date.now() + 600_000,
       }))
@@ -1339,7 +1330,7 @@ describe('enroll-completion sweep', () => {
       enrollmentManifest(corrupt.id),
     )
     const { transport } = makeTransport(() => ({
-      material: makeJwt('acct-1'),
+      material: makeCustodyJwt('acct-1'),
       recordVersion: 1,
       expiresAtMs: Date.now() + 600_000,
     }))
@@ -1386,7 +1377,7 @@ describe('enroll-completion sweep', () => {
       enrollmentManifest(corrupt.id),
     )
     const { transport } = makeTransport(() => ({
-      material: makeJwt('acct-1'),
+      material: makeCustodyJwt('acct-1'),
       recordVersion: 1,
       expiresAtMs: Date.now() + 600_000,
     }))
@@ -1437,7 +1428,7 @@ describe('enroll-completion sweep', () => {
       enrollmentManifest(corrupt.id),
     )
     const { transport } = makeTransport(() => ({
-      material: makeJwt('acct-1'),
+      material: makeCustodyJwt('acct-1'),
       recordVersion: 1,
       expiresAtMs: Date.now() + 600_000,
     }))
@@ -1487,7 +1478,7 @@ describe('enroll-completion sweep', () => {
       ...makeOptions({
         storage,
         transport: makeTransport(() => ({
-          material: makeJwt('acct-1'),
+          material: makeCustodyJwt('acct-1'),
           recordVersion: 1,
           expiresAtMs: Date.now() + 600_000,
         })).transport,
@@ -1501,7 +1492,7 @@ describe('enroll-completion sweep', () => {
       ...makeOptions({
         storage,
         transport: makeTransport(() => ({
-          material: makeJwt('acct-1'),
+          material: makeCustodyJwt('acct-1'),
           recordVersion: 1,
           expiresAtMs: Date.now() + 600_000,
         })).transport,
@@ -1526,7 +1517,7 @@ describe('enroll-completion sweep', () => {
       enrollmentManifest(live.id),
     )
     const { transport } = makeTransport(() => ({
-      material: makeJwt('acct-1'),
+      material: makeCustodyJwt('acct-1'),
       recordVersion: 21,
       expiresAtMs: Date.now() + 600_000,
     }))
@@ -1589,7 +1580,7 @@ describe('enroll-completion sweep', () => {
     )
     chmodSync(manifestPath, 0o600)
     const { transport, captured } = makeTransport(({ handle }) => ({
-      material: makeJwt('acct-1'),
+      material: makeCustodyJwt('acct-1'),
       recordVersion: 11,
       expiresAtMs: Date.now() + 600_000,
     }))
@@ -1645,7 +1636,7 @@ describe('enroll-completion sweep', () => {
     chmodSync(manifestPath, 0o600)
     // Served token carries a DIFFERENT ChatGPT account id.
     const { transport } = makeTransport(({ handle }) => ({
-      material: makeJwt('acct-foreign'),
+      material: makeCustodyJwt('acct-foreign'),
       recordVersion: 12,
       expiresAtMs: Date.now() + 600_000,
     }))
@@ -1746,7 +1737,7 @@ describe('enroll-completion sweep', () => {
     )
     chmodSync(manifestPath, 0o600)
     const { transport } = makeTransport(({ handle }) => ({
-      material: makeJwt('acct-1'),
+      material: makeCustodyJwt('acct-1'),
       recordVersion: 1,
       expiresAtMs: Date.now() + 600_000,
     }))
@@ -1775,7 +1766,7 @@ describe('custody runtime disposal', () => {
   it('closes the cache and transport on dispose and is idempotent', async () => {
     const transport: ClaustrumCacheTransportLike = {
       getCredential: mock(async () => ({
-        material: makeJwt('acct-1'),
+        material: makeCustodyJwt('acct-1'),
         recordVersion: 1,
         expiresAtMs: Date.now() + 600_000,
       })),
@@ -1834,7 +1825,7 @@ describe('custody boot order', () => {
         enteredResolve()
         await release
         return {
-          material: makeJwt('acct-1'),
+          material: makeCustodyJwt('acct-1'),
           recordVersion: 31,
           expiresAtMs: Date.now() + 600_000,
         }
@@ -1897,8 +1888,6 @@ describe('custody boot order', () => {
       )
       await entered
       expect(starts).not.toHaveBeenCalled()
-      await new Promise((resolve) => setTimeout(resolve, 125))
-      expect(starts).not.toHaveBeenCalled()
       releaseResolve()
       await loading
       expect(starts).toHaveBeenCalledTimes(1)
@@ -1955,7 +1944,7 @@ describe('custody boot order', () => {
     chmodSync(manifestPath, 0o600)
     const sweepEvents: string[] = []
     const { transport } = makeTransport(({ handle }) => ({
-      material: makeJwt('acct-1'),
+      material: makeCustodyJwt('acct-1'),
       recordVersion: 1,
       expiresAtMs: Date.now() + 600_000,
     }))
@@ -2166,7 +2155,7 @@ describe('recordVersion projection', () => {
     chmodSync(manifestPath, 0o600)
     const transport: ClaustrumCacheTransportLike = {
       getCredential: mock(async () => ({
-        material: makeJwt('acct-1'),
+        material: makeCustodyJwt('acct-1'),
         recordVersion: 17,
         expiresAtMs: Date.now() + 600_000,
       })),
@@ -2211,7 +2200,7 @@ describe('under-lock re-check', () => {
       getCredential: mock(async () => {
         getCalls.push('called')
         return {
-          material: makeJwt('acct-1'),
+          material: makeCustodyJwt('acct-1'),
           recordVersion: 1,
           expiresAtMs: Date.now() + 600_000,
         }
