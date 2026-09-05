@@ -25,6 +25,46 @@ const CUSTODY_PROVIDER = 'openai'
 export const TOMBSTONE_OPENAI = `${CUSTODY_TOMBSTONE_PREFIX}${CUSTODY_PROVIDER}`
 export const CUSTODY_FIXTURE_NOW = 4_102_444_800_000
 
+function custodyJwt(
+  accountId: string | undefined,
+  options: {
+    expiresInSec?: number
+    nestedAccountClaim: boolean
+    tag?: string
+  },
+): string {
+  const header = Buffer.from(JSON.stringify({ alg: 'none' })).toString(
+    'base64url',
+  )
+  const claims: Record<string, unknown> = {}
+  if (options.expiresInSec !== undefined) {
+    claims.exp = Math.floor(Date.now() / 1000) + options.expiresInSec
+  }
+  if (accountId) {
+    if (options.nestedAccountClaim) {
+      claims['https://api.openai.com/auth'] = {
+        chatgpt_account_id: accountId,
+      }
+    } else {
+      claims.chatgpt_account_id = accountId
+    }
+  }
+  if (options.tag) claims.tag = options.tag
+  const payload = Buffer.from(JSON.stringify(claims)).toString('base64url')
+  return `${header}.${payload}.sig`
+}
+
+export function makeCustodyJwt(
+  accountId: string | undefined,
+  expiresInSec = 600,
+): string {
+  return custodyJwt(accountId, { expiresInSec, nestedAccountClaim: true })
+}
+
+export function makeCustodyRequestJwt(accountId: string, tag?: string): string {
+  return custodyJwt(accountId, { nestedAccountClaim: false, tag })
+}
+
 export function makeSentinelAccount(
   overrides: Partial<OAuthAccount> = {},
 ): OAuthAccount {
