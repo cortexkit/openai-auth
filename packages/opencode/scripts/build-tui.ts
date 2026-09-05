@@ -11,6 +11,7 @@ const shippedSourceFiles = [
   'tui/command-dialogs.tsx',
   'sidebar-state.ts',
   'core/account-paths.ts',
+  'core/custody-state.ts',
   'core/refresh-file-lock.ts',
   'tui-preferences.ts',
   'logger.ts',

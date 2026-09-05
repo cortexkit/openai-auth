@@ -40,6 +40,7 @@
     "src/tui",
     "src/tui-compiled",
     "src/sidebar-state.ts",
+    "src/core/custody-state.ts",
     "src/tui-preferences.ts",
     "src/logger.ts",
     "src/core/account-paths.ts",
