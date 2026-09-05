@@ -15,9 +15,12 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve }
 }
 
-async function waitForSleep(sleeps: Array<Deferred<void>>): Promise<void> {
+async function waitForSleep(
+  sleeps: Array<Deferred<void>>,
+  count = 1,
+): Promise<void> {
   for (let turn = 0; turn < 32; turn += 1) {
-    if (sleeps.length > 0) return
+    if (sleeps.length >= count) return
     await Promise.resolve()
   }
   throw new Error('expected host readback poller to sleep')
@@ -48,14 +51,21 @@ async function makeAuthorizeMethods() {
   }))
 
   let hostAccess: string | undefined
+  let rejectAuthGet = false
+  let now = 0
   const sleeps: Array<Deferred<void>> = []
+  const warnings: string[] = []
   const hooks = await CodexAuthPlugin(
     {
       client: {
         auth: {
           all: async () => ({}),
-          get: async () =>
-            hostAccess ? { type: 'oauth', access: hostAccess } : undefined,
+          get: async () => {
+            if (rejectAuthGet) throw new Error('host read failed')
+            return hostAccess
+              ? { type: 'oauth', access: hostAccess }
+              : undefined
+          },
           set: async () => {},
         },
       },
@@ -81,13 +91,14 @@ async function makeAuthorizeMethods() {
           reportAuthFailure: async () => {},
           close: () => {},
         },
-        now: () => 0,
+        now: () => now,
         sleep: async () => {
           const next = deferred<void>()
           sleeps.push(next)
           await next.promise
         },
         authorize: { browser: browserStarted, headless: headlessStarted },
+        warn: (message: string) => warnings.push(message),
       },
     },
   )
@@ -106,7 +117,14 @@ async function makeAuthorizeMethods() {
     hostSet: (access: string) => {
       hostAccess = access
     },
+    rejectHostReads: () => {
+      rejectAuthGet = true
+    },
+    advanceTo: (next: number) => {
+      now = next
+    },
     sleeps,
+    warnings,
     dispose: hooks.dispose,
   }
 }
@@ -195,4 +213,123 @@ describe('production authorize custody leases', () => {
       await fixture.dispose?.()
     }
   })
+
+  test.each([
+    ['browser', 'minted-browser'],
+    ['headless', 'minted-headless'],
+  ] as const)(
+    '%s releases at the five-second bound when the host never writes',
+    async (kind, access) => {
+      const fixture = await makeAuthorizeMethods()
+      try {
+        const flow = await (kind === 'browser'
+          ? fixture.browser
+          : fixture.headless)()
+        const tokens =
+          kind === 'browser' ? fixture.browserTokens : fixture.headlessTokens
+        tokens.resolve({
+          access_token: access,
+          refresh_token: 'refresh',
+          id_token: 'id',
+          expires_in: 60,
+        })
+
+        await expect(flow.callback()).resolves.toMatchObject({ access })
+        await waitForSleep(fixture.sleeps)
+        fixture.advanceTo(5_000)
+        fixture.sleeps[0]!.resolve()
+
+        const acquired = await acquireCustodyTransitionMutex()
+        await acquired.release()
+        expect(fixture.warnings).toEqual([
+          'host write not observed within 5s; lease released',
+        ])
+      } finally {
+        await fixture.dispose?.()
+      }
+    },
+  )
+
+  test.each([
+    ['browser', 'minted-browser'],
+    ['headless', 'minted-headless'],
+  ] as const)(
+    '%s contains a rejected host readback and releases at the bound',
+    async (kind, access) => {
+      const fixture = await makeAuthorizeMethods()
+      try {
+        const flow = await (kind === 'browser'
+          ? fixture.browser
+          : fixture.headless)()
+        const tokens =
+          kind === 'browser' ? fixture.browserTokens : fixture.headlessTokens
+        tokens.resolve({
+          access_token: access,
+          refresh_token: 'refresh',
+          id_token: 'id',
+          expires_in: 60,
+        })
+        fixture.rejectHostReads()
+
+        await expect(flow.callback()).resolves.toMatchObject({ access })
+        await waitForSleep(fixture.sleeps)
+        fixture.advanceTo(5_000)
+        fixture.sleeps[0]!.resolve()
+
+        const acquired = await acquireCustodyTransitionMutex()
+        await acquired.release()
+        expect(fixture.warnings).toEqual([
+          'host write not observed within 5s; lease released',
+        ])
+      } finally {
+        await fixture.dispose?.()
+      }
+    },
+  )
+
+  test.each([
+    ['browser', 'minted-browser'],
+    ['headless', 'minted-headless'],
+  ] as const)(
+    '%s ignores a different host token until the five-second bound',
+    async (kind, access) => {
+      const fixture = await makeAuthorizeMethods()
+      try {
+        const flow = await (kind === 'browser'
+          ? fixture.browser
+          : fixture.headless)()
+        const tokens =
+          kind === 'browser' ? fixture.browserTokens : fixture.headlessTokens
+        tokens.resolve({
+          access_token: access,
+          refresh_token: 'refresh',
+          id_token: 'id',
+          expires_in: 60,
+        })
+        await flow.callback()
+        await waitForSleep(fixture.sleeps)
+
+        fixture.hostSet('different-access')
+        fixture.sleeps[0]!.resolve()
+        await waitForSleep(fixture.sleeps, 2)
+
+        let acquired = false
+        const pending = acquireCustodyTransitionMutex().then(async (lease) => {
+          acquired = true
+          await lease.release()
+        })
+        await Promise.resolve()
+        expect(acquired).toBe(false)
+
+        fixture.advanceTo(5_000)
+        fixture.sleeps[1]!.resolve()
+        await pending
+        expect(fixture.warnings).toEqual([
+          'host write not observed within 5s; lease released',
+        ])
+      } finally {
+        await fixture.dispose?.()
+      }
+    },
+  )
 })
