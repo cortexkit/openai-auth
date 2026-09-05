@@ -39,27 +39,6 @@ describe('plugin-wide claustrum mode', () => {
     }
   })
 
-  test('rejects legacy switches rather than accepting them as a mode', async () => {
-    const authDir = mkdtempSync(join(tmpdir(), 'oai-custody-sidebar-'))
-    const cfgPath = join(authDir, 'openai-auth.json')
-    try {
-      writeFileSync(
-        cfgPath,
-        JSON.stringify({
-          version: 1,
-          main: { type: 'opencode', provider: 'openai' },
-          accounts: [],
-          claustrum: { enabled: true, manifestWrite: true },
-        }),
-      )
-      await expect(loadAccounts(cfgPath)).rejects.toThrow(
-        'Remove the legacy claustrum switches and run /openai-account claustrum',
-      )
-    } finally {
-      rmSync(authDir, { recursive: true, force: true })
-    }
-  })
-
   test('keeps a config with no claustrum block byte-identical on read', async () => {
     const authDir = mkdtempSync(join(tmpdir(), 'oai-custody-sidebar-'))
     const cfgPath = join(authDir, 'openai-auth.json')
@@ -117,36 +96,11 @@ describe('projectCustodyForSidebar — v7 verdict projection', () => {
   ] as const)('projects $verdict.kind', ({ verdict, want }) => {
     expect(projectCustodyForSidebar(verdict as CustodyVerdict)).toEqual(want)
   })
-
-  test('accepts legacy consumer inputs without projecting v6 sidebar vocabulary', () => {
-    const projected = projectCustodyForSidebar({
-      tombstoned: true,
-      storageEnabled: true,
-      enrolled: true,
-      enrollPendingReason: 'completionDisarmed',
-      cache: {
-        isBlocked: () => false,
-        isReauth: () => false,
-        async peekMetadata() {
-          return { recordVersion: 7, expiresAtMs: 1 }
-        },
-      },
-    })
-    expect(projected).toEqual({ state: 'inert', reason: 'manifest-unreadable' })
-    expect(JSON.stringify(projected)).not.toContain('enrollPending')
-    expect(JSON.stringify(projected)).not.toContain('completionDisarmed')
-    expect(JSON.stringify(projected)).not.toContain('recordVersion')
-  })
 })
 
 describe('normalizeSidebarState — v7 custody reader', () => {
   test('drops unknown states and removed v6 states', () => {
-    for (const state of [
-      'vaultHealing',
-      'vaultReauth',
-      'vaultGone',
-      'enrollPending',
-    ]) {
+    for (const state of ['vaultHealing', 'vaultReauth', 'vaultGone']) {
       expect(
         normalizeSidebarState(stateWithCustody({ state })).fallbacks[0]
           ?.custody,
@@ -161,7 +115,6 @@ describe('normalizeSidebarState — v7 custody reader', () => {
       'gone',
       'identityMismatch',
       'nullClaim',
-      'completionDisarmed',
     ]) {
       expect(
         normalizeSidebarState(stateWithCustody({ state: 'inert', reason }))
@@ -212,17 +165,5 @@ describe('normalizeSidebarState — v7 custody reader', () => {
         }),
       ).fallbacks[0]?.custody,
     ).toEqual({ state: 'inert', reason: 'takeover-incomplete' })
-  })
-
-  test('drops v6 state, reason, and recordVersion from consumer output', () => {
-    expect(
-      normalizeSidebarState(
-        stateWithCustody({
-          state: 'enrollPending',
-          reason: 'completionDisarmed',
-          recordVersion: 7,
-        }),
-      ).fallbacks[0]?.custody,
-    ).toBeUndefined()
   })
 })

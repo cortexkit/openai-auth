@@ -416,6 +416,39 @@ describe('orphan binding discovery', () => {
     ).toHaveLength(1)
     runtime.dispose()
   })
+
+  it('names a removed row from history and recreates it under claustrum', async () => {
+    const storage = liveStorage([], {
+      claustrum: claustrumConfig({
+        mode: 'claustrum',
+        rowHistory: ['removed-account'],
+      }),
+    })
+    await writeStorageWithManifest(
+      storage,
+      enrollmentManifest('removed-account'),
+    )
+    const logger = makeLogger()
+    const { transport } = makeTransport(() => {
+      throw new Error('vault unavailable')
+    })
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({ storage, transport, detection: 'available', logger }),
+    )
+
+    await runtime.boot()
+
+    expect((await loadAccounts(configPath))?.accounts[0]).toMatchObject({
+      id: 'removed-account',
+      refresh: TOMBSTONE_OPENAI,
+    })
+    expect(
+      logger.info.mock.calls.some(([message]) =>
+        message.includes('orphan-binding: row removed'),
+      ),
+    ).toBe(true)
+    runtime.dispose()
+  })
 })
 
 describe('manifest revision reconciliation', () => {

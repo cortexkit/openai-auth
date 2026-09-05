@@ -21,11 +21,10 @@ import {
   ClaustrumCredentialCache,
   type CompleteEnrollmentDeps,
   type CompleteEnrollmentOutcome,
-  completeFallbackEnrollment,
   custodied,
   custodyTombstoneKey,
   enrolling,
-  enrollPendingReason,
+  reconcileFallbackCustody,
   refreshInert,
   tombstoned,
 } from './custody.ts'
@@ -275,7 +274,7 @@ export function __createCustodyRuntimeForTest(
         if (!handle) continue
         const sweepDeps = buildSweepDeps(cache)
         sweepPromises.push(
-          completeFallbackEnrollment(account, sweepDeps)
+          reconcileFallbackCustody(account, sweepDeps)
             .then((outcome) =>
               applyOutcomeToProjection(account, outcome, bootManifest),
             )
@@ -461,7 +460,7 @@ export function __createCustodyRuntimeForTest(
       )
         continue
       if (!enabledHandles.has(account.id)) continue
-      const outcome = await completeFallbackEnrollment(account, sweepDeps)
+      const outcome = await reconcileFallbackCustody(account, sweepDeps)
       applyOutcomeToProjection(account, outcome, manifest)
     }
   }
@@ -892,21 +891,18 @@ function projectFromPredicates(
   const handle = manifest
     ? custodyManifestHandles(manifest).get(account.id)
     : undefined
-  if (
-    !enrollPendingReason(account.id) &&
-    !tombstoned(account, CUSTODY_OWNING_PROVIDER) &&
-    !handle
-  ) {
+  if (!tombstoned(account, CUSTODY_OWNING_PROVIDER) && !handle) {
     return undefined
   }
+  if (!tombstoned(account, CUSTODY_OWNING_PROVIDER)) return undefined
+  if (safeStorage.claustrum?.mode !== 'claustrum' || !handle) {
+    return projectCustodyForSidebar({ kind: 'NEEDS_LOGIN' })
+  }
   return projectCustodyForSidebar({
-    tombstoned: tombstoned(account, CUSTODY_OWNING_PROVIDER),
-    storageEnabled: safeStorage.claustrum?.enabled === true,
-    enrolled: handle !== undefined,
-    handle,
-    enrollPendingReason: enrollPendingReason(account.id),
-    cache: cacheInstance,
-    now: currentNow,
+    kind: 'INERT',
+    reason: cacheInstance?.isReauth(handle, currentNow)
+      ? 'vault-reauth'
+      : 'takeover-incomplete/vault-unavailable',
   })
 }
 

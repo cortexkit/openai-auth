@@ -251,18 +251,28 @@ export async function resolveFallbackAccess(
     if (claustrumMode(storage) !== 'claustrum') return CUSTODY_EXCLUDED
     if (!enrolled(account, manifestState)) return CUSTODY_REFUSE
     if (!account.accountId && options.completeEnrollmentDeps) {
-      const outcome = await completeFallbackEnrollment(
+      const outcome = await reconcileFallbackCustody(
         account,
         options.completeEnrollmentDeps,
       )
-      if (outcome.kind !== 'succeeded') return CUSTODY_REFUSE
+      if (
+        outcome.kind === 'failed' ||
+        (outcome.kind === 'skipped' && outcome.reason === 'lockBusy')
+      ) {
+        return CUSTODY_REFUSE
+      }
       const reboundStorage = await options.completeEnrollmentDeps.loadAccounts(
         options.completeEnrollmentDeps.configPath,
       )
       const rebound = reboundStorage?.accounts.find(
         (candidate) => candidate.id === account.id,
       )
-      if (!reboundStorage || !rebound || !isOAuthAccount(rebound)) {
+      if (
+        !reboundStorage ||
+        !rebound ||
+        !isOAuthAccount(rebound) ||
+        !rebound.accountId
+      ) {
         return CUSTODY_REFUSE
       }
       return resolveFallbackAccess(rebound, reboundStorage, manifestState, {
@@ -307,11 +317,16 @@ export async function resolveFallbackAccess(
     const refreshBeforeExpiryMs = options.refreshBeforeExpiryMs ?? 0
     if (claustrumMode(storage) === 'claustrum') {
       if (!options.completeEnrollmentDeps) return CUSTODY_REFUSE
-      const outcome = await completeFallbackEnrollment(
+      const outcome = await reconcileFallbackCustody(
         account,
         options.completeEnrollmentDeps,
       )
-      if (outcome.kind !== 'succeeded') return CUSTODY_REFUSE
+      if (
+        outcome.kind === 'failed' ||
+        (outcome.kind === 'skipped' && outcome.reason === 'lockBusy')
+      ) {
+        return CUSTODY_REFUSE
+      }
       const completedStorage =
         await options.completeEnrollmentDeps.loadAccounts(
           options.completeEnrollmentDeps.configPath,
@@ -649,52 +664,6 @@ export class ClaustrumCredentialCache {
 }
 
 // ---------------------------------------------------------------------------
-// Enroll-pending store (process-local; sweep is the writer)
-// ---------------------------------------------------------------------------
-
-export type EnrollPendingReason =
-  | 'unavailable'
-  | 'gone'
-  | 'identityMismatch'
-  | 'nullClaim'
-  | 'completionDisarmed'
-
-const enrollPending = new Map<string, EnrollPendingReason>()
-
-/**
- * Latch the first failure reason for an account. Subsequent marks do NOT
- * overwrite — the operator should see the original cause until the sweep
- * either clears the entry (on a successful completion) or restarts the
- * process (the store is module-local and dies on restart).
- */
-export function markEnrollPending(
-  accountId: string,
-  reason: EnrollPendingReason,
-): void {
-  if (enrollPending.has(accountId)) return
-  enrollPending.set(accountId, reason)
-}
-
-export function clearEnrollPending(accountId: string): void {
-  enrollPending.delete(accountId)
-}
-
-export function enrollPendingReason(
-  accountId: string,
-): EnrollPendingReason | undefined {
-  return enrollPending.get(accountId)
-}
-
-/**
- * Wipe the store. Test-only; production code must use mark/clear. The double
- * underscore marks it as not part of the public surface — a future sweep
- * writer is the only legitimate caller in production.
- */
-export function __resetEnrollPendingForTest(): void {
-  enrollPending.clear()
-}
-
-// ---------------------------------------------------------------------------
 // Refresh error (defence in depth)
 // ---------------------------------------------------------------------------
 
@@ -781,7 +750,7 @@ export type CompleteEnrollmentOutcome =
  * `notEnrolling` guard. A concurrent enroll in another process lands the same
  * sentinel under its own save-lock; the tombstone is the join point.
  */
-export async function completeFallbackEnrollment(
+export async function reconcileFallbackCustody(
   account: OAuthAccount,
   deps: CompleteEnrollmentDeps,
 ): Promise<CompleteEnrollmentOutcome> {
@@ -841,7 +810,6 @@ export async function completeFallbackEnrollment(
       })
     } catch (error) {
       const reason = classifyGetError(error)
-      latchEnrollPending(liveAccount.id, reason)
       return { kind: 'failed', reason }
     }
     const identity = verifyServedFallbackIdentity(
@@ -865,7 +833,6 @@ export async function completeFallbackEnrollment(
               reason: 'identityMismatch',
               recordVersion: served.recordVersion,
             }
-      latchEnrollPending(liveAccount.id, reason.reason)
       return reason
     }
     const claims = parseJwtClaims(served.payload.access)
@@ -897,7 +864,6 @@ export async function completeFallbackEnrollment(
         accounts: current.accounts.map((a) => (a.id === account.id ? next : a)),
       }
     }, deps.configPath)
-    clearEnrollPending(liveAccount.id)
     return { kind: 'succeeded', recordVersion: served.recordVersion }
   } finally {
     await lock.release().catch(() => {})
@@ -917,14 +883,4 @@ function classifyGetError(error: unknown): 'gone' | 'unavailable' {
     return 'gone'
   }
   return 'unavailable'
-}
-
-function latchEnrollPending(
-  accountId: string,
-  reason: EnrollPendingReason,
-): void {
-  // First failure latches — later failures must not overwrite the original
-  // cause. The boot/hour log in the loader keys on whether the store
-  // already had a reason for this account.
-  markEnrollPending(accountId, reason)
 }
