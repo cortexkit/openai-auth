@@ -79,6 +79,7 @@ import {
   custodyManifestHandles,
   readCustodyManifest,
 } from './core/custody-manifest.ts'
+import { MAIN_REFRESH_LOCK_NAME } from './core/custody-transition.ts'
 import {
   base64UrlEncode,
   beginDeviceAuth,
@@ -192,7 +193,6 @@ const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
 const CODEX_VERSION = '0.153.0'
 const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
 const CODEX_SANDBOX = 'seccomp'
-const MAIN_REFRESH_LOCK_NAME = 'main-refresh'
 export const MAIN_REFRESH_LOCK_TTL_MS = 2 * 60_000
 export const MAIN_REFRESH_LEASE_TTL_MS = 90_000
 const CONCURRENT_MAIN_REFRESH_WAIT_MS = 4_000
