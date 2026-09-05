@@ -109,6 +109,8 @@ export interface CommandContext {
   fetchImpl?: typeof fetch
   now?: () => number
   randomUUID?: () => string
+  /** Starts an OAuth account-add flow; injected by the runtime boundary. */
+  beginAccountLogin?: typeof beginAccountLogin
   refreshResetTargetQuota?: (
     accountKey: string,
   ) => Promise<RefreshAllQuotaResult>
@@ -550,7 +552,9 @@ async function executeAccountCommand(
     const headless = tokens.includes('--headless')
     const labelTokens = tokens.filter((t) => t !== 'add' && t !== '--headless')
     const label = labelTokens.length > 0 ? labelTokens.join(' ') : undefined
-    const { url, instructions, completion } = await beginAccountLogin({
+    const { url, instructions, completion } = await (
+      ctx.beginAccountLogin ?? beginAccountLogin
+    )({
       label,
       headless,
     })
