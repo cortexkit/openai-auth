@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
@@ -171,6 +172,70 @@ function createManagerRemovingAccountOnFirstLoad(
 }
 
 describe('accounts store', () => {
+  it('missing claustrum config loads as local without rewriting the file', async () => {
+    const accounts = await import('../core/accounts.ts')
+    const beforeExists = existsSync(cfgPath)
+    const beforeBytes = beforeExists ? readFileSync(cfgPath, 'utf8') : undefined
+    const beforeMtimeMs = beforeExists ? statSync(cfgPath).mtimeMs : undefined
+
+    const storage = await accounts.loadAccounts(cfgPath)
+
+    expect(accounts.claustrumMode(storage)).toBe('local')
+    expect(existsSync(cfgPath)).toBe(beforeExists)
+    expect(
+      existsSync(cfgPath) ? readFileSync(cfgPath, 'utf8') : undefined,
+    ).toBe(beforeBytes)
+    expect(existsSync(cfgPath) ? statSync(cfgPath).mtimeMs : undefined).toBe(
+      beforeMtimeMs,
+    )
+  })
+
+  it('legacy claustrum switches are rejected instead of bypassing the readiness barrier', async () => {
+    const { loadAccounts } = await import('../core/accounts.ts')
+
+    for (const claustrum of [{ enabled: false }, { manifestWrite: false }]) {
+      writeFileSync(
+        cfgPath,
+        JSON.stringify({ version: 1, accounts: [], claustrum }),
+      )
+
+      await expect(loadAccounts(cfgPath)).rejects.toThrow(
+        'Remove the legacy claustrum switches and run /openai-account claustrum',
+      )
+    }
+  })
+
+  it('mode and takeover fingerprints round-trip in one config write', async () => {
+    const accounts = await import('../core/accounts.ts')
+    const transition = {
+      manifestRevision: 'manifest-revision',
+      storeGeneration: 'store-generation',
+      fingerprints: {
+        main: 'main-fingerprint',
+        fallbacks: { 'fallback-1': 'fallback-fingerprint' },
+      },
+    }
+    writeFileSync(
+      cfgPath,
+      JSON.stringify({ version: 1, accounts: [], unknownSetting: true }),
+    )
+
+    await accounts.writeClaustrumModeAndTransition(
+      cfgPath,
+      'claustrum',
+      transition,
+    )
+
+    expect(existsSync(statePath)).toBe(false)
+    const config = JSON.parse(readFileSync(cfgPath, 'utf8'))
+    expect(config.unknownSetting).toBe(true)
+    expect(config.claustrum.mode).toBe('claustrum')
+    expect(config.claustrum.transition).toEqual(transition)
+    expect(accounts.claustrumMode(await accounts.loadAccounts(cfgPath))).toBe(
+      'claustrum',
+    )
+  })
+
   it('load/save round-trip: accounts, main provider, version', async () => {
     const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
 
