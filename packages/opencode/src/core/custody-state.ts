@@ -58,7 +58,6 @@ export interface EvaluateCustodyStartupInput {
   manifestFailureReason?: string
   fingerprintMatch?: boolean
   isMain?: boolean
-  verifiedLogin?: boolean
 }
 
 function unreachable(value: never): never {

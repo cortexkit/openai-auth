@@ -486,14 +486,13 @@ describe('evaluateCustodyStartup — §16 invariants', () => {
     }
   })
 
-  test('main real material with a present binding and no verified login record is inert', () => {
+  test('main real material with a present binding remains enrolled under local mode', () => {
     expect(
       evaluateCustodyStartup({
         mode: 'local',
         manifest: 'present',
         local: 'real',
         isMain: true,
-        verifiedLogin: false,
         vault: vault('serves'),
       }),
     ).toEqual({ kind: 'INERT', reason: 'enrolled-under-local' })
