@@ -11,7 +11,10 @@
 
 import type { AccountStorage, OAuthAccount } from '../core/accounts.ts'
 import { CUSTODY_TOMBSTONE_PREFIX } from '../core/custody.ts'
-import type { CustodyManifestReadResult } from '../core/custody-manifest.ts'
+import {
+  type CustodyManifestReadResult,
+  manifestRevision,
+} from '../core/custody-manifest.ts'
 import type {
   ClaustrumMode,
   CustodyTransitionState,
@@ -77,7 +80,7 @@ export function claustrumConfig(
   }
 }
 
-export function withManifestWrite(storage: AccountStorage): AccountStorage {
+export function withClaustrumMode(storage: AccountStorage): AccountStorage {
   return {
     ...storage,
     claustrum: claustrumConfig({ mode: 'claustrum' }),
@@ -85,7 +88,12 @@ export function withManifestWrite(storage: AccountStorage): AccountStorage {
 }
 
 export function emptyManifest(): CustodyManifestReadResult {
-  return { ok: true, value: { version: 1, providers: [] } }
+  const value = { version: 1 as const, providers: [] }
+  return {
+    ok: true,
+    value,
+    revision: manifestRevision(JSON.stringify(value)),
+  }
 }
 
 export function enrollmentManifest(label: string): CustodyManifestReadResult {
@@ -94,18 +102,20 @@ export function enrollmentManifest(label: string): CustodyManifestReadResult {
       ? 'a'.repeat(43)
       : Buffer.from(label).toString('base64url').padEnd(43, 'a').slice(0, 43)
   const handle = `ckh_${suffix}`
+  const value = {
+    version: 1 as const,
+    providers: [
+      {
+        provider: CUSTODY_PROVIDER,
+        shape: 'oauth' as const,
+        serve: 'openai-auth',
+        accounts: [{ label, handle, credential_id: `oauth:openai:${label}` }],
+      },
+    ],
+  }
   return {
     ok: true,
-    value: {
-      version: 1,
-      providers: [
-        {
-          provider: CUSTODY_PROVIDER,
-          shape: 'oauth',
-          serve: 'openai-auth',
-          accounts: [{ label, handle, credential_id: `oauth:openai:${label}` }],
-        },
-      ],
-    },
+    value,
+    revision: manifestRevision(JSON.stringify(value)),
   }
 }

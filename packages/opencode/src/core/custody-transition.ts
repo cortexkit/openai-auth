@@ -44,7 +44,7 @@ export function accountStoreGeneration(
       expires: account.expires ?? null,
     }))
     .sort((left, right) =>
-      JSON.stringify(left).localeCompare(JSON.stringify(right)),
+      left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
     )
 
   return createHash('sha256').update(JSON.stringify(rows)).digest('hex')
