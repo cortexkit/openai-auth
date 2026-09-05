@@ -473,6 +473,8 @@ interface CodexAuthPluginOptions {
     now?: () => number
     /** Test seam: controls bounded host-write observation without real timers. */
     sleep?: (ms: number) => Promise<void>
+    /** Test seam: observes a host-write observation deadline warning. */
+    warn?: (message: string) => void
     /** Test seam: observes the account lock around custody binding checks. */
     withFallbackAccountLock?: CommandContext['withFallbackAccountLock']
     /** Test seam: replaces external OAuth I/O while preserving the hook callback. */
@@ -4005,7 +4007,9 @@ export async function CodexAuthPlugin(
                           : undefined
                       },
                       release: () => mutex.release(),
-                      warn: (message) => custodyLogger.warn(message),
+                      warn: (message) =>
+                        custodyOptions?.warn?.(message) ??
+                        custodyLogger.warn(message),
                       now: custodyOptions?.now ?? Date.now,
                       sleep: custodyOptions?.sleep ?? ((ms) => Bun.sleep(ms)),
                     }).catch(() => mutex.release())
@@ -4068,7 +4072,9 @@ export async function CodexAuthPlugin(
                           : undefined
                       },
                       release: () => mutex.release(),
-                      warn: (message) => custodyLogger.warn(message),
+                      warn: (message) =>
+                        custodyOptions?.warn?.(message) ??
+                        custodyLogger.warn(message),
                       now: custodyOptions?.now ?? Date.now,
                       sleep: custodyOptions?.sleep ?? ((ms) => Bun.sleep(ms)),
                     }).catch(() => mutex.release())
