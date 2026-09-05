@@ -1562,6 +1562,19 @@ export async function mutateAccounts(
       // identical to a load-time drop.
       const currentAccountIds = new Set(current.accounts.map((a) => a.id))
       const next = mutate(current) ?? current
+      const nextAccountIds = new Set(next.accounts.map((account) => account.id))
+      const removedIds = [...currentAccountIds].filter(
+        (accountId) => !nextAccountIds.has(accountId),
+      )
+      if (removedIds.length > 0) {
+        next.claustrum = {
+          ...next.claustrum,
+          mode: next.claustrum?.mode ?? 'local',
+          rowHistory: [
+            ...new Set([...(next.claustrum?.rowHistory ?? []), ...removedIds]),
+          ],
+        }
+      }
 
       // Preserve load-dropped raw entries via the shared pipeline. The
       // comparison is against `currentAccountIds` (pre-mutator) so a
