@@ -61,9 +61,11 @@ import {
 import {
   CUSTODY_EXCLUDED,
   CUSTODY_REFUSE,
+  CustodyTombstoneRefreshError,
   refreshInert,
   resolveFallbackAccess,
   stampVaultProvenance,
+  tombstoned,
   type VaultProvenance,
 } from './core/custody.ts'
 import {
@@ -137,6 +139,7 @@ import {
   getSidebarStateFile,
   hashSidebarSessionId,
   isQuotaExhausted,
+  projectCustodyForSidebar,
   type QuotaWindow,
   removeSidebarActiveRouting,
   resolveSessionStickyAccount,
@@ -1116,6 +1119,7 @@ export async function CodexAuthPlugin(
       client: { auth: factoryAuth },
       mode: claustrumMode(factoryStorage ?? {}),
       manifest: factoryManifest,
+      mainAccountId: factoryStorage?.mainAccountId,
       getCredential: factoryCache
         ? async (handle) => {
             const credential = await factoryCache.get(
@@ -1131,6 +1135,16 @@ export async function CodexAuthPlugin(
       now: Date.now,
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     })
+    if (custodyBootstrap.mainVerdict?.kind === 'INERT') {
+      const sidebar = await getSidebarState()
+      await setSidebarMachineState({
+        ...sidebar,
+        main: {
+          ...sidebar.main,
+          custody: projectCustodyForSidebar(custodyBootstrap.mainVerdict),
+        },
+      })
+    }
   }
 
   // Per-loader poller: each plugin invocation owns its timer and callback, so
@@ -1377,7 +1391,7 @@ export async function CodexAuthPlugin(
         // (migrateIfNeeded only sets it once on first run). The CLI add path
         // rejects against the persisted value — acceptable because the plugin
         // refreshes it here each time the auth loader runs.
-        if (storage && auth.access) {
+        if (storage && auth.access && !recognizedMainTombstone) {
           const liveAccountId = extractAccountId({
             id_token: '',
             access_token: auth.access,
@@ -1455,21 +1469,29 @@ export async function CodexAuthPlugin(
           const handle = lookupManifestHandle(manifest, 'main')
           const cache = custodyRuntime.getCache()
           if (handle && cache) {
-            const credential = await cache.get(handle, custodyMinTtlMs(storage))
-            const servedMainAccountId = mainAccountIdFromServedCredential(
-              credential.payload.access,
-            )
-            if (
-              servedMainAccountId &&
-              servedMainAccountId !== storage?.mainAccountId
-            ) {
-              await mutateAccounts((current) => {
-                current.mainAccountId = servedMainAccountId
-                return current
-              }, getConfigPath())
-              if (storage) storage.mainAccountId = servedMainAccountId
-              custodyBootstrap.mainAccountId = servedMainAccountId
-              invalidateRequestStorageCache()
+            try {
+              const credential = await cache.get(
+                handle,
+                custodyMinTtlMs(storage),
+              )
+              const servedMainAccountId = mainAccountIdFromServedCredential(
+                credential.payload.access,
+              )
+              if (
+                servedMainAccountId &&
+                servedMainAccountId !== storage?.mainAccountId
+              ) {
+                await mutateAccounts((current) => {
+                  current.mainAccountId = servedMainAccountId
+                  return current
+                }, getConfigPath())
+                if (storage) storage.mainAccountId = servedMainAccountId
+                custodyBootstrap.mainAccountId = servedMainAccountId
+                invalidateRequestStorageCache()
+              }
+            } catch {
+              // The factory verdict already records vault cold/reauth; the loader
+              // must preserve its inert state instead of turning it into a crash.
             }
           }
         }
@@ -1681,6 +1703,21 @@ export async function CodexAuthPlugin(
             mainRefreshPromise = (async () => {
               const freshAuth = await getAuth()
               if (freshAuth.type !== 'oauth') throw new Error('not oauth')
+              if (
+                tombstoned(
+                  {
+                    id: 'main',
+                    type: 'oauth',
+                    access: freshAuth.access ?? '',
+                    refresh: freshAuth.refresh ?? '',
+                    expires: freshAuth.expires ?? 0,
+                    addedAt: 0,
+                  },
+                  CUSTODY_OWNING_PROVIDER,
+                )
+              ) {
+                throw new CustodyTombstoneRefreshError(CUSTODY_OWNING_PROVIDER)
+              }
               if (!freshAuth.refresh) {
                 throw new Error('Token refresh failed: missing refresh token')
               }
