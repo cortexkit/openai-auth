@@ -244,6 +244,13 @@ export function __createCustodyRuntimeForTest(
         })
         return
       }
+      if (!bootManifest.ok && bootManifest.reason !== 'absent') {
+        projectManifestUnreadable(
+          await options.loadAccounts(options.configPath),
+        )
+        scheduleNextTick()
+        return
+      }
       await runFingerprintResumePass()
       await runFallbackInstallPass(bootManifest)
       const currentStorage = await options.loadAccounts(options.configPath)
@@ -297,9 +304,25 @@ export function __createCustodyRuntimeForTest(
       if (options.storage?.claustrum?.mode !== 'claustrum') return
       // Re-read manifest (hot-reload on mtime) so an operator edit lands at
       // the next tick without a restart.
+      const previousRevision = latestManifest?.ok
+        ? latestManifest.revision
+        : undefined
       const manifest = await options.readCustodyManifest(manifestPath)
       latestManifest = manifest
+      if (!manifest.ok && manifest.reason !== 'absent') {
+        projectManifestUnreadable(
+          await options.loadAccounts(options.configPath),
+        )
+        return
+      }
       const currentStorage = await runDiscoveryPass(manifest)
+      if (manifest.ok && manifest.revision === previousRevision) {
+        await runFingerprintResumePass()
+        const enabledHandles = enabledManifestHandles(manifest, currentStorage)
+        await runCompletionSweep(manifest, enabledHandles)
+        await runWarmPass(manifest, enabledHandles)
+        return
+      }
       await runFingerprintResumePass()
       await runFallbackInstallPass(manifest)
       const enabledHandles = enabledManifestHandles(manifest, currentStorage)
@@ -327,6 +350,15 @@ export function __createCustodyRuntimeForTest(
       cache = undefined
       transport = undefined
     },
+  }
+
+  function projectManifestUnreadable(storage: AccountStorage | null): void {
+    for (const account of oauthAccounts(storage)) {
+      projectionByAccountId.set(account.id, {
+        state: 'inert',
+        reason: 'manifest-unreadable',
+      })
+    }
   }
 
   async function runDiscoveryPass(
