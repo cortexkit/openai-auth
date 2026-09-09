@@ -28,7 +28,7 @@
     "@opencode-ai/plugin": "1.18.25",
     "@tsconfig/bun": "1.0.11",
     "@types/bun": "1.4.0",
-    "bun-types": "1.4.0",
+    "bun-types": "1.4.2",
     "lefthook": "2.1.12",
     "typescript": "7.0.2"
   }
