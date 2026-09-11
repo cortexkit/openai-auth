@@ -3326,7 +3326,8 @@ describe('integration: active fallback routing', () => {
   it('logs both reachable sticky migration paths with account and reason', async () => {
     const sessionId = 'pre-send-migration-session'
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (!isResponsesSend(url)) return new Response('{}', { status: 500 })
       const auth = headerValue(init, 'authorization')
       return new Response('{}', {
         status: auth.includes('fallback-2') ? 401 : 200,
@@ -3335,6 +3336,16 @@ describe('integration: active fallback routing', () => {
     setLogLevel('debug')
     let hooks: Hooks | undefined
     try {
+      seedStickyBalancedAccounts()
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await drainSidebarWrites()
       seedStickyBalancedAccounts()
       const preSendState = JSON.parse(readFileSync(sidebarFile, 'utf8'))
       preSendState.fallbacks[1].quota = stickyQuota(0, Date.now())
@@ -3347,14 +3358,6 @@ describe('integration: active fallback routing', () => {
         },
       }
       writeFileSync(sidebarFile, JSON.stringify(preSendState))
-      const loaded = await loadFetchOverride(
-        createMockPluginInput(),
-        Date.now() + 3600_000,
-        false,
-        false,
-        'acc-main',
-      )
-      hooks = loaded.hooks
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'x-session-affinity': sessionId }),
@@ -3670,8 +3673,7 @@ describe('integration: active fallback routing', () => {
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
     globalThis.fetch = (async (url: unknown, init?: unknown) => {
-      if (!String(url).includes('responses'))
-        return new Response('{}', { status: 200 })
+      if (!isResponsesSend(url)) return new Response('{}', { status: 500 })
       const auth = headerValue(init, 'authorization')
       seenAuth.push(auth)
       return new Response('{}', {
@@ -3689,6 +3691,8 @@ describe('integration: active fallback routing', () => {
         'acc-main',
       )
       hooks = loaded.hooks
+      await drainSidebarWrites()
+      seedStickyBalancedAccounts()
       const response = await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'x-session-affinity': 'migrate-session' }),
@@ -4163,6 +4167,8 @@ describe('integration: active fallback routing', () => {
         'acc-main',
       )
       hooks = loaded.hooks
+      await drainSidebarWrites()
+      seedStickyBalancedAccounts()
       await runCommand(hooks, 'openai-cachekeep', 'on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
@@ -4383,14 +4389,8 @@ describe('integration: active fallback routing', () => {
 
   function mockAdmissionFetch(seenAuth: string[], status = 200) {
     return (async (url: unknown, init?: unknown) => {
-      if (String(url).includes('responses')) {
-        // Record the turn's own send only: the loader also issues an authorized,
-        // unawaited quota refresh at init, so recording every authorized fetch
-        // makes this assertion race it.
-        if (isResponsesSend(url)) {
-          seenAuth.push(headerValue(init, 'authorization'))
-        }
-      }
+      if (!isResponsesSend(url)) return new Response('{}', { status: 500 })
+      seenAuth.push(headerValue(init, 'authorization'))
       return new Response('{}', { status })
     }) as unknown as typeof globalThis.fetch
   }
@@ -5291,6 +5291,7 @@ describe('integration: active fallback routing', () => {
         now + 3600_000,
       )
       hooks = loaded.hooks
+      await drainSidebarWrites()
       writeAdmissionSidebarState({
         fallbackIds: ['work-alt', 'client-alt'],
         fallbackQuotas: {
@@ -5406,6 +5407,7 @@ describe('integration: active fallback routing', () => {
         now + 3600_000,
       )
       hooks = loaded.hooks
+      await drainSidebarWrites()
       writeAdmissionSidebarState({
         fallbackIds: ['work-alt', 'client-alt'],
         fallbackQuotas: {
@@ -5447,6 +5449,7 @@ describe('integration: active fallback routing', () => {
         now + 3600_000,
       )
       hooks = loaded.hooks
+      await drainSidebarWrites()
       writeAdmissionSidebarState({
         fallbackIds: ['work-alt', 'client-alt'],
         fallbackQuotas: {
