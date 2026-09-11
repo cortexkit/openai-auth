@@ -127,7 +127,7 @@ describe('command hook session isolation', () => {
       experimentalWebSockets: false,
     })
 
-    const loaderResult = await plugin.auth?.loader?.(
+    await plugin.auth?.loader?.(
       async () => ({
         type: 'oauth',
         provider: 'openai',
@@ -204,6 +204,6 @@ describe('command hook session isolation', () => {
     expect(added).toBeDefined()
     expect(added?.sessionId).toBe('sess-A')
 
-    await loaderResult?.dispose?.()
+    await plugin.dispose?.()
   })
 })
