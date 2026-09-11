@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+
+import { getConfigPath } from '../config'
 import type { AccountStorage } from '../core/accounts'
 import {
   buildKeepwarmBody,
@@ -2466,7 +2468,9 @@ describe('CacheKeepManager token resolution', () => {
       if (!loaderResult?.fetch) throw new Error('No fetch override')
 
       const cacheKeepGlobal = globalThis as any
-      const mgr = cacheKeepGlobal.__openaiAuthCacheKeepManager
+      const mgr = cacheKeepGlobal.__openaiAuthCacheKeepManagers?.get(
+        getConfigPath(),
+      )
       expect(mgr).toBeDefined()
 
       const mockFetch = mock(async () => new Response('{}'))
@@ -2530,7 +2534,7 @@ describe('RPC server dispose', () => {
     await rm(tempDir, { recursive: true, force: true })
   })
 
-  test('RPC server stops and unlinks port file on loader dispose', async () => {
+  test('loader options do not expose an RPC lifecycle dispose hook', async () => {
     const originalRpcDir = process.env.OPENCODE_OPENAI_AUTH_RPC_DIR
     process.env.OPENCODE_OPENAI_AUTH_RPC_DIR = tempDir
 
@@ -2564,25 +2568,19 @@ describe('RPC server dispose', () => {
       )
 
       // Verify port file exists in tempDir
-      let files = await readdir(tempDir)
+      const files = await readdir(tempDir)
       expect(
         files.some((f) => f.startsWith('port-') && f.endsWith('.json')),
       ).toBe(true)
 
-      // Dispose the loader
-      await loaderResult?.dispose?.()
-
-      // Verify port file is gone
-      files = await readdir(tempDir)
-      expect(
-        files.some((f) => f.startsWith('port-') && f.endsWith('.json')),
-      ).toBe(false)
+      expect(loaderResult?.dispose).toBeUndefined()
+      await plugin.dispose?.()
     } finally {
       process.env.OPENCODE_OPENAI_AUTH_RPC_DIR = originalRpcDir
     }
   })
 
-  test('RPC server stops and unlinks port file on plugin dispose', async () => {
+  test('plugin dispose clears the RPC registry entry and unlinks the port file', async () => {
     const originalRpcDir = process.env.OPENCODE_OPENAI_AUTH_RPC_DIR
     process.env.OPENCODE_OPENAI_AUTH_RPC_DIR = tempDir
 
@@ -2621,14 +2619,18 @@ describe('RPC server dispose', () => {
         files.some((f) => f.startsWith('port-') && f.endsWith('.json')),
       ).toBe(true)
 
-      // Dispose the plugin
+      const rpcGlobal = globalThis as {
+        __openaiAuthRpcServers?: Map<string, unknown>
+      }
+      expect(rpcGlobal.__openaiAuthRpcServers?.size ?? 0).toBeGreaterThan(0)
+
       await plugin.dispose?.()
 
-      // Verify port file is gone
       files = await readdir(tempDir)
       expect(
         files.some((f) => f.startsWith('port-') && f.endsWith('.json')),
       ).toBe(false)
+      expect(rpcGlobal.__openaiAuthRpcServers?.size ?? 0).toBe(0)
     } finally {
       process.env.OPENCODE_OPENAI_AUTH_RPC_DIR = originalRpcDir
     }

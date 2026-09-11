@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { unlink } from 'node:fs/promises'
+import { readFile, unlink } from 'node:fs/promises'
 import {
   createServer,
   type IncomingMessage,
@@ -78,6 +78,7 @@ export async function startRpcServer(
   // every endpoint holding a dead connection for 90s.
   const handlerTimeoutMs = options.timeoutMs ?? 90_000
   const receiptTimeoutMs = options.receiptTimeoutMs ?? 2_000
+  let warnedMissingNotificationSession = false
   const server = createServer((req, res) => {
     req.setTimeout(handlerTimeoutMs, () => {
       req.socket.destroy()
@@ -107,9 +108,17 @@ export async function startRpcServer(
       const body = await readBody(req)
       const params = JSON.parse(body || '{}') as Record<string, unknown>
       if (method === 'pending-notifications') {
+        const sessionId =
+          typeof params.sessionId === 'string' ? params.sessionId : undefined
+        if (sessionId === undefined && !warnedMissingNotificationSession) {
+          warnedMissingNotificationSession = true
+          log.warn('rpc notification drain missing session id', {
+            pid: process.pid,
+          })
+        }
         const messages = options.drain(
           Number(params.lastReceivedId ?? 0),
-          typeof params.sessionId === 'string' ? params.sessionId : undefined,
+          sessionId,
         )
         return json(200, { messages })
       }
@@ -164,9 +173,12 @@ export async function startRpcServer(
     token,
     async stop() {
       await new Promise<void>((resolve) => server.close(() => resolve()))
-      await unlink(join(options.dir, `port-${process.pid}.json`)).catch(
-        () => {},
-      )
+      const portFile = join(options.dir, `port-${process.pid}.json`)
+      const current = await readFile(portFile, 'utf8')
+        .then((raw) => JSON.parse(raw) as { port?: unknown; token?: unknown })
+        .catch(() => undefined)
+      if (current?.port === port && current.token === token)
+        await unlink(portFile).catch(() => {})
     },
   }
 }
