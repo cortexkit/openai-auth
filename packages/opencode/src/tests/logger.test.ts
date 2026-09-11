@@ -204,4 +204,17 @@ describe('logger redaction', () => {
     expect(txt).toContain('"ok":1')
     expect(txt).toMatch(/REDACTED|\*\*\*/)
   })
+
+  it('redacts manifest handles embedded in messages without masking short ckh tokens', async () => {
+    process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = 'debug'
+    const { createLogger, flushForTest } = await import('../logger.ts')
+    const log = createLogger('transport')
+    const handle = `ckh_${'a'.repeat(43)}`
+    log.warn(`daemon rejected ${handle}; short token ckh_x remains diagnostic`)
+    await flushForTest()
+    const txt = readFileSync(logFile, 'utf8')
+    expect(txt).not.toContain(handle)
+    expect(txt).toContain('***REDACTED***')
+    expect(txt).toContain('ckh_x')
+  })
 })

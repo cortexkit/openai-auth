@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { localCustody } from './custody-fixtures.ts'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
 
 // ---------------------------------------------------------------------------
@@ -1173,6 +1174,7 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
     })
 
     const manager = new FallbackAccountManager({
+      custody: localCustody,
       configPath: cfgPath,
       refreshFn: async () => {
         throw refreshError
@@ -1222,6 +1224,7 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
 
     // fetchQuotaFn throws a 401 with no isRefreshError (exactly as whamUsageFn does).
     const manager = new FallbackAccountManager({
+      custody: localCustody,
       configPath: cfgPath,
       fetchQuotaFn: async () => {
         throw Object.assign(new Error('wham usage check failed: 401'), {
@@ -1264,6 +1267,7 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
 
     // fetchQuotaFn throws a non-401 quota error (no isRefreshError).
     const manager = new FallbackAccountManager({
+      custody: localCustody,
       configPath: cfgPath,
       fetchQuotaFn: async () => {
         throw Object.assign(new Error('wham usage check failed: 429'), {

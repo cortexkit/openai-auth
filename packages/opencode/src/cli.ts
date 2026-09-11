@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import {
+  claustrumMode,
+  FALLBACK_REFRESH_LOCK_TTL_MS,
+  fallbackRefreshLockName,
   getAccountStoragePath,
   loadAccounts,
   mutateAccounts,
@@ -12,12 +15,24 @@ import {
   beginAccountLogin,
   upsertAccount,
 } from './core/oauth'
+import { acquireRefreshFileLock } from './core/refresh-file-lock'
 import { openUrl } from './util/open-url'
 
 export { openUrl as openBrowserForLogin } from './util/open-url'
 
-function usage() {
-  console.log(`Usage:
+type CliDeps = Partial<{
+  beginAccountLogin: typeof beginAccountLogin
+  openUrl: typeof openUrl
+  getAccountStoragePath: typeof getAccountStoragePath
+  loadAccounts: typeof loadAccounts
+  mutateAccounts: typeof mutateAccounts
+  acquireRefreshFileLock: typeof acquireRefreshFileLock
+  log: typeof console.log
+  error: typeof console.error
+}>
+
+function usage(log: typeof console.log = console.log) {
+  log(`Usage:
   npx @cortexkit/opencode-openai-auth login [--label <name>] [--headless]
   npx @cortexkit/opencode-openai-auth list
   npx @cortexkit/opencode-openai-auth remove <id>
@@ -48,13 +63,24 @@ function parseArgs(argv: string[]) {
   return { positional, flags }
 }
 
-async function main() {
-  const { positional, flags } = parseArgs(process.argv.slice(2))
+export async function runCli(
+  argv = process.argv.slice(2),
+  deps: CliDeps = {},
+): Promise<number> {
+  const login = deps.beginAccountLogin ?? beginAccountLogin
+  const open = deps.openUrl ?? openUrl
+  const storagePath = deps.getAccountStoragePath ?? getAccountStoragePath
+  const load = deps.loadAccounts ?? loadAccounts
+  const mutate = deps.mutateAccounts ?? mutateAccounts
+  const acquireLock = deps.acquireRefreshFileLock ?? acquireRefreshFileLock
+  const log = deps.log ?? console.log
+  const writeError = deps.error ?? console.error
+  const { positional, flags } = parseArgs(argv)
   const [command, ...rest] = positional
 
   if (!command || command === 'help') {
-    usage()
-    process.exit(0)
+    usage(log)
+    return 0
   }
 
   switch (command) {
@@ -65,81 +91,103 @@ async function main() {
       try {
         assertFallbackAccountIdAllowed(label)
       } catch (error) {
-        console.error(
+        writeError(
           `\nError: ${error instanceof Error ? error.message : String(error)}`,
         )
-        process.exit(1)
+        return 1
       }
 
-      const { url, instructions, completion } = await beginAccountLogin({
+      const { url, instructions, completion } = await login({
         label,
         headless,
       })
 
-      console.log('\nOpen this URL in your browser and complete sign-in:\n')
-      console.log(`${url}\n`)
-      if (instructions) console.log(`${instructions}\n`)
+      log('\nOpen this URL in your browser and complete sign-in:\n')
+      log(`${url}\n`)
+      if (instructions) log(`${instructions}\n`)
 
-      openUrl(url)
+      open(url)
 
       const account = await completion
 
       // Read-modify-write under the store lock so a concurrent add/remove
       // (another CLI invocation or a TUI command) cannot clobber this insertion,
       // and the self-fallback check sees the freshest mainAccountId.
-      let selfFallback = false
-      await mutateAccounts((current) => {
-        // Reject self-fallback: adding main's ChatGPT account as a fallback
-        // would let routing retry on the account that just returned 429.
-        if (
-          account.accountId &&
-          current.mainAccountId &&
-          account.accountId === current.mainAccountId
-        ) {
-          selfFallback = true
-          return current
-        }
-        upsertAccount(current.accounts, account as unknown as OAuthAccount)
-        return current
+      const configPath = storagePath()
+      const lock = await acquireLock({
+        name: fallbackRefreshLockName(account.id),
+        ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+        path: configPath,
+        renew: true,
       })
-
-      if (selfFallback) {
-        console.error(
-          '\nError: that account is already your main (same ChatGPT account).',
-        )
-        console.error(
-          'A self-fallback would retry on the account that just returned 429.',
-        )
-        process.exit(1)
+      if (!lock) throw new Error('Fallback account lock unavailable')
+      let selfFallback = false
+      let blockedByClaustrum = false
+      try {
+        if (claustrumMode((await load(configPath)) ?? {}) === 'claustrum') {
+          blockedByClaustrum = true
+        } else {
+          await mutate((current) => {
+            if (
+              account.accountId &&
+              current.mainAccountId &&
+              account.accountId === current.mainAccountId
+            ) {
+              selfFallback = true
+              return current
+            }
+            upsertAccount(current.accounts, account as unknown as OAuthAccount)
+            return current
+          }, configPath)
+        }
+      } finally {
+        await lock.release()
       }
 
-      console.log(`\n✓ Added account ${account.id}`)
-      if (account.label) console.log(`  Label: ${account.label}`)
-      break
+      if (blockedByClaustrum) {
+        writeError(
+          '\nError: Claustrum mode is active. Run /openai-account local before adding a fallback account.',
+        )
+        return 1
+      }
+
+      if (selfFallback) {
+        writeError(
+          '\nError: that account is already your main (same ChatGPT account).',
+        )
+        writeError(
+          'A self-fallback would retry on the account that just returned 429.',
+        )
+        return 1
+      }
+
+      log(`\n✓ Added account ${account.id}`)
+      if (account.label) log(`  Label: ${account.label}`)
+      return 0
     }
 
     case 'list': {
-      const storage = await loadAccounts()
+      const storage = await load()
       if (!storage || storage.accounts.length === 0) {
-        console.log('No fallback accounts configured.')
+        log('No fallback accounts configured.')
       } else {
         for (const a of storage.accounts) {
           const label = (a as { label?: string }).label
           const parts = [`  ${a.id}`]
           if (label) parts.push(`(${label})`)
           parts.push(a.enabled !== false ? '[enabled]' : '[disabled]')
-          console.log(parts.join(' '))
+          log(parts.join(' '))
         }
       }
-      break
+      return 0
     }
 
     case 'remove': {
       const targetId = rest[0]
       if (!targetId) {
-        console.error('Error: remove requires an account ID.')
-        usage()
-        process.exit(1)
+        writeError('Error: remove requires an account ID.')
+        usage(log)
+        return 1
       }
 
       // `allowDrop` is unconditional — for a healthy entry it is a no-op,
@@ -150,12 +198,12 @@ async function main() {
       // cannot see. The pre-read is purely diagnostic — a stale read can
       // only change the message when another writer races us, and the
       // mutator signal covers exactly that case.
-      const configPath = getAccountStoragePath()
+      const configPath = storagePath()
       const rawRoster = await readConfigRosterIds(configPath)
       const preReadSawIt = rawRoster ? rawRoster.has(targetId) : false
 
       let mutatorSplicedIt = false
-      await mutateAccounts(
+      await mutate(
         (current) => {
           const idx = current.accounts.findIndex((a) => a.id === targetId)
           if (idx === -1) return current
@@ -169,18 +217,22 @@ async function main() {
 
       const removed = mutatorSplicedIt || preReadSawIt
       if (!removed) {
-        console.error(`No account with id "${targetId}".`)
-        process.exit(1)
+        writeError(`No account with id "${targetId}".`)
+        return 1
       }
-      console.log(`Removed account ${targetId}.`)
-      break
+      log(`Removed account ${targetId}.`)
+      return 0
     }
 
     default:
-      console.error(`Unknown command: ${command}`)
-      usage()
-      process.exit(1)
+      writeError(`Unknown command: ${command}`)
+      usage(log)
+      return 1
   }
+}
+
+async function main() {
+  process.exit(await runCli())
 }
 
 if (import.meta.main) {
