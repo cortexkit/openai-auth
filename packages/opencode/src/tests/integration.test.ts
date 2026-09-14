@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, test } from 'bun:test'
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -16,7 +17,9 @@ import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
 import { QUOTA_STALENESS_MS } from '../core/sticky-routing.ts'
 import {
   AuthPersistError,
+  type ClaustrumCacheTransportLike,
   CodexAuthPlugin,
+  type CustodyRuntime,
   findCachekeepFallbackAccount,
   MAIN_REFRESH_LEASE_TTL_MS,
   MAIN_REFRESH_LOCK_TTL_MS,
@@ -33,6 +36,11 @@ import {
   resolveSessionSidebarRouting,
   type SidebarState,
 } from '../sidebar-state.ts'
+import {
+  claustrumConfig,
+  enrollmentManifest,
+  makeSentinelAccount,
+} from './custody-fixtures.ts'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_LOG_FILE,
@@ -2580,6 +2588,128 @@ describe('integration: 429 → reactive fallback', () => {
       globalThis.fetch = originalFetch
     }
   })
+
+  it('reports a vault-backed 401 returned by the WebSocket branch', async () => {
+    const fallback = makeSentinelAccount({
+      id: 'ws-custody',
+      accountId: 'acct-ws-custody',
+      enabled: true,
+    })
+    const manifest = enrollmentManifest(fallback.id)
+    if (!manifest.ok) throw new Error('expected manifest fixture')
+    const manifestPath = join(configDir, 'handles.json')
+    const vaultAccess = `header.${Buffer.from(JSON.stringify({ chatgpt_account_id: fallback.accountId })).toString('base64url')}.signature`
+    const reports: number[] = []
+    let runtime: CustodyRuntime | undefined
+    let hooks: Hooks | undefined
+    const originalFetch = globalThis.fetch
+    process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+    writeFileSync(manifestPath, JSON.stringify(manifest.value))
+    chmodSync(manifestPath, 0o600)
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [fallback],
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
+        routing: { mode: 'fallback-first' },
+      }),
+    )
+    globalThis.fetch = (async (url: unknown) =>
+      new Response('{}', {
+        status: String(url).includes('wham') ? 500 : 401,
+      })) as typeof globalThis.fetch
+    const transport: ClaustrumCacheTransportLike = {
+      async getCredential() {
+        return {
+          material: vaultAccess,
+          recordVersion: 101,
+          expiresAtMs: Date.now() + 60_000,
+        }
+      },
+      async statusCredential() {
+        return {
+          ready: true,
+          lastErrorCode: null,
+          leaseHeld: false,
+          recordVersion: 101,
+        }
+      },
+      async reportAuthFailure(params) {
+        reports.push(params.recordVersion)
+      },
+      close() {},
+    }
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'error',
+              status: 401,
+              error: { message: 'expired' },
+            }),
+          )
+        },
+      }),
+      async () => {
+        try {
+          hooks = await CodexAuthPlugin(createMockPluginInput(), {
+            experimentalWebSockets: true,
+            custody: {
+              transport,
+              detection: 'available',
+              onRuntime: (value) => {
+                runtime = value
+              },
+            },
+          })
+          const loader = hooks.auth?.loader
+          if (!loader) throw new Error('expected auth loader')
+          const result = await loader(
+            async () => ({
+              type: 'oauth' as const,
+              access: 'main-access',
+              refresh: 'main-refresh',
+              expires: Date.now() + 3_600_000,
+            }),
+            {} as never,
+          )
+          if (!runtime) throw new Error('expected custody runtime')
+          await runtime.runTick()
+          expect(runtime.isEnabled()).toBe(true)
+          expect(
+            runtime
+              .getCache()
+              ?.peek(manifest.value.providers[0]!.accounts[0]!.handle),
+          ).toBeDefined()
+          const fetchOverride = (result as { fetch?: typeof globalThis.fetch })
+            .fetch
+          if (!fetchOverride) throw new Error('expected fetch override')
+          const response = await fetchOverride(
+            'https://api.openai.com/v1/responses',
+            {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                model: 'gpt-5.5',
+                input: [],
+                stream: true,
+              }),
+            },
+          )
+          expect(response.status).toBe(401)
+          await new Promise((resolve) => setTimeout(resolve, 0))
+          expect(reports).toEqual([101])
+        } finally {
+          await hooks?.dispose?.()
+        }
+      },
+    )
+    globalThis.fetch = originalFetch
+    delete process.env.CLAUSTRUM_OPENCODE_HANDLES
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -3196,7 +3326,8 @@ describe('integration: active fallback routing', () => {
   it('logs both reachable sticky migration paths with account and reason', async () => {
     const sessionId = 'pre-send-migration-session'
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async (_url: unknown, init?: unknown) => {
+    globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      if (!isResponsesSend(url)) return new Response('{}', { status: 500 })
       const auth = headerValue(init, 'authorization')
       return new Response('{}', {
         status: auth.includes('fallback-2') ? 401 : 200,
@@ -3205,6 +3336,16 @@ describe('integration: active fallback routing', () => {
     setLogLevel('debug')
     let hooks: Hooks | undefined
     try {
+      seedStickyBalancedAccounts()
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await drainSidebarWrites()
       seedStickyBalancedAccounts()
       const preSendState = JSON.parse(readFileSync(sidebarFile, 'utf8'))
       preSendState.fallbacks[1].quota = stickyQuota(0, Date.now())
@@ -3217,14 +3358,6 @@ describe('integration: active fallback routing', () => {
         },
       }
       writeFileSync(sidebarFile, JSON.stringify(preSendState))
-      const loaded = await loadFetchOverride(
-        createMockPluginInput(),
-        Date.now() + 3600_000,
-        false,
-        false,
-        'acc-main',
-      )
-      hooks = loaded.hooks
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'x-session-affinity': sessionId }),
@@ -3540,8 +3673,7 @@ describe('integration: active fallback routing', () => {
     const seenAuth: string[] = []
     const originalFetch = globalThis.fetch
     globalThis.fetch = (async (url: unknown, init?: unknown) => {
-      if (!String(url).includes('responses'))
-        return new Response('{}', { status: 200 })
+      if (!isResponsesSend(url)) return new Response('{}', { status: 500 })
       const auth = headerValue(init, 'authorization')
       seenAuth.push(auth)
       return new Response('{}', {
@@ -3559,6 +3691,8 @@ describe('integration: active fallback routing', () => {
         'acc-main',
       )
       hooks = loaded.hooks
+      await drainSidebarWrites()
+      seedStickyBalancedAccounts()
       const response = await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'x-session-affinity': 'migrate-session' }),
@@ -4033,6 +4167,8 @@ describe('integration: active fallback routing', () => {
         'acc-main',
       )
       hooks = loaded.hooks
+      await drainSidebarWrites()
+      seedStickyBalancedAccounts()
       await runCommand(hooks, 'openai-cachekeep', 'on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
@@ -4253,14 +4389,8 @@ describe('integration: active fallback routing', () => {
 
   function mockAdmissionFetch(seenAuth: string[], status = 200) {
     return (async (url: unknown, init?: unknown) => {
-      if (String(url).includes('responses')) {
-        // Record the turn's own send only: the loader also issues an authorized,
-        // unawaited quota refresh at init, so recording every authorized fetch
-        // makes this assertion race it.
-        if (isResponsesSend(url)) {
-          seenAuth.push(headerValue(init, 'authorization'))
-        }
-      }
+      if (!isResponsesSend(url)) return new Response('{}', { status: 500 })
+      seenAuth.push(headerValue(init, 'authorization'))
       return new Response('{}', { status })
     }) as unknown as typeof globalThis.fetch
   }
@@ -5161,6 +5291,7 @@ describe('integration: active fallback routing', () => {
         now + 3600_000,
       )
       hooks = loaded.hooks
+      await drainSidebarWrites()
       writeAdmissionSidebarState({
         fallbackIds: ['work-alt', 'client-alt'],
         fallbackQuotas: {
@@ -5276,6 +5407,7 @@ describe('integration: active fallback routing', () => {
         now + 3600_000,
       )
       hooks = loaded.hooks
+      await drainSidebarWrites()
       writeAdmissionSidebarState({
         fallbackIds: ['work-alt', 'client-alt'],
         fallbackQuotas: {
@@ -5317,6 +5449,7 @@ describe('integration: active fallback routing', () => {
         now + 3600_000,
       )
       hooks = loaded.hooks
+      await drainSidebarWrites()
       writeAdmissionSidebarState({
         fallbackIds: ['work-alt', 'client-alt'],
         fallbackQuotas: {

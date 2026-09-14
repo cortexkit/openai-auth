@@ -1,10 +1,11 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { createLogger } from '../logger.ts'
 import {
   ACCOUNT_FILE_NAME,
   ACCOUNT_STATE_FILE_NAME,
   deriveStatePath,
+  fallbackRefreshLockName,
   getAccountStatePath,
   getAccountStoragePath,
 } from './account-paths'
@@ -17,6 +18,18 @@ import {
   quotaBackoffActive,
   refreshBackoffActive,
 } from './backoff.ts'
+import {
+  assertNotCustodyTombstone,
+  CustodyTombstoneRefreshError,
+  enrolling,
+  refreshInert,
+  tombstoned,
+} from './custody.ts'
+import type { CustodyManifestReadResult } from './custody-manifest.ts'
+import type {
+  ClaustrumMode,
+  CustodyTransitionState,
+} from './custody-transition.ts'
 import { extractAccountId } from './oauth'
 import type {
   ProviderQuotaFn,
@@ -49,6 +62,7 @@ export {
   ACCOUNT_FILE_NAME,
   ACCOUNT_STATE_FILE_NAME,
   deriveStatePath,
+  fallbackRefreshLockName,
   getAccountStatePath,
   getAccountStoragePath,
 }
@@ -57,6 +71,12 @@ export {
 // Re-export the widened QuotaWindowName + consts from the injection seam
 // ---------------------------------------------------------------------------
 
+export {
+  accountStoreGeneration,
+  type ClaustrumMode,
+  type CustodyTransitionState,
+  custodySlotFingerprint,
+} from './custody-transition.ts'
 export type { QuotaWindowName }
 export { PRIMARY, SECONDARY }
 
@@ -103,6 +123,7 @@ export type AccountOperationError = {
 
 export type OAuthAccount = AccountBase & {
   type: 'oauth'
+  corrupt?: false
   access?: string
   refresh: string
   expires?: number
@@ -112,6 +133,18 @@ export type OAuthAccount = AccountBase & {
   quota?: OAuthQuotaSnapshot
 }
 
+export type CorruptOAuthAccount = AccountBase & {
+  type: 'oauth'
+  corrupt: true
+  access?: undefined
+  refresh?: undefined
+  expires?: undefined
+  lastRefreshedAt?: undefined
+  lastRefreshError?: undefined
+  lastQuotaRefreshError?: undefined
+  quota?: undefined
+}
+
 export type ApiKeyAccount = AccountBase & {
   type: 'api'
   apiKey?: string
@@ -119,12 +152,12 @@ export type ApiKeyAccount = AccountBase & {
   authHeader?: 'authorization-bearer' | 'x-api-key'
 }
 
-export type FallbackAccount = OAuthAccount | ApiKeyAccount
+export type FallbackAccount = OAuthAccount | CorruptOAuthAccount | ApiKeyAccount
 
 export function isOAuthAccount(
   account: FallbackAccount,
 ): account is OAuthAccount {
-  return account.type === 'oauth'
+  return account.type === 'oauth' && account.corrupt !== true
 }
 
 export function isApiKeyAccount(
@@ -244,6 +277,11 @@ export type AccountStorage = {
   }
   /** Stable ChatGPT account identifier of the main account (extracted from OAuth token). */
   mainAccountId?: string
+  claustrum?: {
+    mode?: ClaustrumMode
+    transition?: CustodyTransitionState
+    rowHistory?: string[]
+  }
   accounts: FallbackAccount[]
 }
 
@@ -289,6 +327,11 @@ export type AccountStateSaveScope = {
   accounts?: true | string[]
 }
 
+export type AccountManagerCustodyOptions = {
+  readManifest: () => Promise<CustodyManifestReadResult>
+  provider?: string
+}
+
 export type AccountManagerOptions = {
   now?: () => number
   fetchImpl?: typeof fetch
@@ -300,6 +343,9 @@ export type AccountManagerOptions = {
   fetchQuotaFn?: ProviderQuotaFn
   /** QuotaManager instance for unified cache (constructor-injected). */
   quotaManager?: import('./quota-manager.ts').QuotaManager
+  // Required because an omitted policy reader silently re-enables local refresh;
+  // anthropic-auth incident 1 demonstrated that optional custody wiring fails open.
+  custody: AccountManagerCustodyOptions
 }
 
 export type AccountRefreshError = {
@@ -440,7 +486,7 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
   return Object.keys(quota).length ? quota : undefined
 }
 
-function normalizeAccount(value: unknown): FallbackAccount | null {
+export function normalizeAccount(value: unknown): FallbackAccount | null {
   if (!isRecord(value)) return null
   if (value.type === 'api') {
     const baseURL =
@@ -459,7 +505,27 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
   }
 
   if (value.type !== 'oauth') return null
-  if (typeof value.refresh !== 'string' || !value.refresh.trim()) return null
+  if (value.corrupt === true) {
+    if (typeof value.id !== 'string' || !value.id.trim()) return null
+    return {
+      ...normalizeAccountBase(value),
+      type: 'oauth',
+      corrupt: true,
+    }
+  }
+  if (typeof value.refresh !== 'string' || !value.refresh.trim()) {
+    if (
+      !Object.hasOwn(value, 'refresh') ||
+      typeof value.id !== 'string' ||
+      !value.id.trim()
+    )
+      return null
+    return {
+      ...normalizeAccountBase(value),
+      type: 'oauth',
+      corrupt: true,
+    }
+  }
 
   return {
     ...normalizeAccountBase(value),
@@ -605,7 +671,54 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     cachekeep: isRecord(value.cachekeep) ? value.cachekeep : undefined,
     mainAccountId:
       typeof value.mainAccountId === 'string' ? value.mainAccountId : undefined,
+    claustrum: normalizeClaustrum(value.claustrum),
     accounts: normalizedAccounts,
+  }
+}
+
+function normalizeClaustrum(value: unknown): AccountStorage['claustrum'] {
+  if (!isRecord(value)) return undefined
+  const mode = value.mode === 'claustrum' ? 'claustrum' : 'local'
+  const transition = normalizeCustodyTransition(value.transition)
+  const rowHistory = Array.isArray(value.rowHistory)
+    ? value.rowHistory.filter(
+        (entry): entry is string => typeof entry === 'string',
+      )
+    : undefined
+
+  return {
+    mode,
+    transition,
+    rowHistory,
+  }
+}
+
+function normalizeCustodyTransition(
+  value: unknown,
+): CustodyTransitionState | undefined {
+  if (!isRecord(value) || !isRecord(value.fingerprints)) return undefined
+  if (
+    typeof value.manifestRevision !== 'string' ||
+    typeof value.storeGeneration !== 'string' ||
+    !isRecord(value.fingerprints.fallbacks)
+  ) {
+    return undefined
+  }
+  const fallbacks = Object.fromEntries(
+    Object.entries(value.fingerprints.fallbacks).filter(
+      (entry): entry is [string, string] => typeof entry[1] === 'string',
+    ),
+  )
+  return {
+    manifestRevision: value.manifestRevision,
+    storeGeneration: value.storeGeneration,
+    fingerprints: {
+      main:
+        typeof value.fingerprints.main === 'string'
+          ? value.fingerprints.main
+          : undefined,
+      fallbacks,
+    },
   }
 }
 
@@ -736,6 +849,8 @@ function accountConfig(account: FallbackAccount) {
     id: account.id,
     label: account.label,
     type: account.type,
+    corrupt:
+      account.type === 'oauth' && account.corrupt === true ? true : undefined,
     enabled: account.enabled,
     addedAt: account.addedAt,
     accountId: account.accountId,
@@ -751,6 +866,7 @@ function accountRuntimeState(account: FallbackAccount) {
       lastUsed: account.lastUsed,
     })
   }
+  if (account.corrupt) return {}
   return objectWithDefinedEntries({
     access: account.access,
     refresh: account.refresh,
@@ -903,6 +1019,19 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     logging: storage.logging,
     cachekeep: storage.cachekeep,
     mainAccountId: storage.mainAccountId,
+    ...(storage.claustrum !== undefined
+      ? {
+          claustrum: {
+            mode: storage.claustrum.mode ?? 'local',
+            ...(storage.claustrum.transition
+              ? { transition: storage.claustrum.transition }
+              : {}),
+            ...(storage.claustrum.rowHistory
+              ? { rowHistory: storage.claustrum.rowHistory }
+              : {}),
+          },
+        }
+      : {}),
     accounts: storage.accounts.map(accountConfig),
   })
 }
@@ -924,7 +1053,7 @@ function mergeStorageForSave(
   }
 }
 
-async function acquireSaveAccountsLock(path: string) {
+async function acquireSaveAccountsLock(path: string, renew = false) {
   const startedAt = Date.now()
   const deadline = startedAt + SAVE_ACCOUNTS_LOCK_WAIT_MS
   let attempts = 0
@@ -934,6 +1063,7 @@ async function acquireSaveAccountsLock(path: string) {
       name: 'save',
       ttlMs: SAVE_ACCOUNTS_LOCK_TTL_MS,
       path,
+      renew,
     })
     if (lock) return lock
 
@@ -971,6 +1101,136 @@ async function acquireSaveAccountsLock(path: string) {
       `${SAVE_ACCOUNTS_LOCK_RETRY_MS}ms). A gap near the retry interval means ` +
       `lock contention; a much larger one means this process's event loop was ` +
       `saturated and the wait expired without getting scheduled.`,
+  )
+}
+
+export function claustrumMode(
+  storage: Pick<AccountStorage, 'claustrum'> | null | undefined,
+): ClaustrumMode {
+  return storage?.claustrum?.mode === 'claustrum' ? 'claustrum' : 'local'
+}
+
+export type AccountStoreTransaction = {
+  read(): Promise<AccountStorage>
+  write(storage: AccountStorage): Promise<void>
+  writeMode(
+    mode: ClaustrumMode,
+    transition?: CustodyTransitionState,
+  ): Promise<void>
+}
+
+export async function withAccountStoreTransaction<T>(
+  action: (transaction: AccountStoreTransaction) => Promise<T>,
+  path = getAccountStoragePath(),
+): Promise<T> {
+  const statePath = getAccountStatePath(path)
+  const lock = await acquireSaveAccountsLock(path, true)
+  try {
+    const stateLock = await acquireSaveAccountsLock(statePath, true)
+    try {
+      const configJson = await readJsonIfPresent(path)
+      const stateJson = await readJsonIfPresent(statePath)
+      let current =
+        (configJson.exists
+          ? normalizeStorage(
+              mergeConfigAndState(configJson.value, stateJson.value),
+            )
+          : null) ?? emptyAccountStorage()
+      const currentAccountIds = new Set(
+        current.accounts.map((account) => account.id),
+      )
+
+      const write = async (next: AccountStorage) => {
+        const baseConfig = configFromStorage(next)
+        const preserved = buildPreservedAdditions(
+          configJson.value,
+          currentAccountIds,
+          new Set(),
+        )
+        const writtenIds = new Set(
+          (Array.isArray(baseConfig.accounts) ? baseConfig.accounts : [])
+            .map((entry) =>
+              isRecord(entry) && typeof entry.id === 'string'
+                ? entry.id.trim()
+                : '',
+            )
+            .filter(Boolean),
+        )
+        const additions = preserved.filter(
+          (entry) =>
+            isRecord(entry) &&
+            typeof entry.id === 'string' &&
+            !writtenIds.has(entry.id.trim()),
+        )
+        const existing = isRecord(configJson.value) ? configJson.value : {}
+        const nextConfig = {
+          ...existing,
+          ...baseConfig,
+          accounts: [
+            ...(Array.isArray(baseConfig.accounts) ? baseConfig.accounts : []),
+            ...additions,
+          ],
+        }
+        await writeJsonAtomic(path, nextConfig)
+        await writeJsonAtomic(statePath, stateFromStorage(next))
+        configJson.value = nextConfig
+        current = structuredClone(next)
+      }
+
+      const writeMode = async (
+        mode: ClaustrumMode,
+        transition?: CustodyTransitionState,
+      ) => {
+        const existing = isRecord(configJson.value)
+          ? configJson.value
+          : { version: 1, accounts: [] }
+        const existingClaustrum = isRecord(existing.claustrum)
+          ? existing.claustrum
+          : {}
+        const rowHistory = Array.isArray(existingClaustrum.rowHistory)
+          ? existingClaustrum.rowHistory.filter(
+              (entry): entry is string => typeof entry === 'string',
+            )
+          : undefined
+        const claustrum = {
+          mode,
+          ...(mode === 'claustrum' && transition ? { transition } : {}),
+          ...(rowHistory ? { rowHistory } : {}),
+        }
+        const nextConfig = { ...existing, claustrum }
+        await writeJsonAtomic(path, nextConfig)
+        configJson.value = nextConfig
+        current = {
+          ...current,
+          claustrum: {
+            mode,
+            ...(mode === 'claustrum' && transition ? { transition } : {}),
+            ...(rowHistory ? { rowHistory } : {}),
+          },
+        }
+      }
+
+      return await action({
+        read: async () => structuredClone(current),
+        write,
+        writeMode,
+      })
+    } finally {
+      await stateLock.release()
+    }
+  } finally {
+    await lock.release()
+  }
+}
+
+export async function writeClaustrumModeAndTransition(
+  path: string,
+  mode: ClaustrumMode,
+  transition?: CustodyTransitionState,
+): Promise<void> {
+  await withAccountStoreTransaction(
+    (transaction) => transaction.writeMode(mode, transition),
+    path,
   )
 }
 
@@ -1288,6 +1548,19 @@ export async function mutateAccounts(
       // identical to a load-time drop.
       const currentAccountIds = new Set(current.accounts.map((a) => a.id))
       const next = mutate(current) ?? current
+      const nextAccountIds = new Set(next.accounts.map((account) => account.id))
+      const removedIds = [...currentAccountIds].filter(
+        (accountId) => !nextAccountIds.has(accountId),
+      )
+      if (removedIds.length > 0) {
+        next.claustrum = {
+          ...next.claustrum,
+          mode: next.claustrum?.mode ?? 'local',
+          rowHistory: [
+            ...new Set([...(next.claustrum?.rowHistory ?? []), ...removedIds]),
+          ],
+        }
+      }
 
       // Preserve load-dropped raw entries via the shared pipeline. The
       // comparison is against `currentAccountIds` (pre-mutator) so a
@@ -1653,7 +1926,7 @@ function isAccountStore(value: Record<string, unknown>): boolean {
  * Tolerates expired/revoked tokens (migrates them; refresh handles validity).
  *
  * Guards against first-run races with the same save-lock order used by
- * structural account mutations.
+ * structural account writes.
  */
 export async function migrateIfNeeded(
   existingToken:
@@ -1766,6 +2039,12 @@ function recordRefreshError(
   error: unknown,
   now: number,
 ) {
+  // The tombstone class is the wired-in short-circuit: stamping a permanent
+  // backoff onto an account the vault owns would re-arm refresh against an
+  // inert target. Defence in depth — the choke point already throws before
+  // this is reached in the gate paths, but a direct caller still has to
+  // observe the same contract.
+  if (error instanceof CustodyTombstoneRefreshError) return
   account.lastRefreshError = buildRefreshOperationError({
     error,
     now,
@@ -1779,6 +2058,7 @@ function recordQuotaRefreshError(
   error: unknown,
   now: number,
 ) {
+  if (error instanceof CustodyTombstoneRefreshError) return
   account.lastQuotaRefreshError = buildQuotaOperationError({
     error,
     now,
@@ -1795,13 +2075,6 @@ function recordQuotaRefreshError(
   if (e?.isRefreshError === true) {
     recordRefreshError(account, error, now)
   }
-}
-
-function fallbackRefreshLockName(accountId: string) {
-  return `fallback-oauth-refresh-${createHash('sha256')
-    .update(accountId)
-    .digest('base64url')
-    .slice(0, 16)}`
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -1878,7 +2151,7 @@ export function getQuotaCheckIntervalMs(storage: AccountStorage | null) {
 
 const BACKGROUND_TICK_MS = 60_000
 const BACKGROUND_TICK_JITTER_MS = 60_000
-const FALLBACK_REFRESH_LOCK_TTL_MS = 10 * 60_000
+export const FALLBACK_REFRESH_LOCK_TTL_MS = 10 * 60_000
 const FALLBACK_REFRESH_JOIN_WAIT_MS = 10_000
 const FALLBACK_REFRESH_JOIN_POLL_MS = 100
 const DEFAULT_REFRESH_INTERVAL_MINUTES = 10
@@ -1907,14 +2180,57 @@ export class FallbackAccountManager {
   readonly quotaManager: import('./quota-manager.ts').QuotaManager | null
   private readonly onFallbackStorageChanged: (() => void) | undefined
   private readonly options: AccountManagerOptions
+  private readonly custodyReadManifest: () => Promise<CustodyManifestReadResult>
+  private readonly custodyProvider: string
 
-  constructor(options: AccountManagerOptions = {}) {
+  constructor(options: AccountManagerOptions) {
     this.options = options
     this.now = options.now ?? Date.now
     this.fetchImpl = options.fetchImpl ?? fetch
     this.configPath = options.configPath ?? getAccountStoragePath()
     this.quotaManager = options.quotaManager ?? null
     this.onFallbackStorageChanged = options.onFallbackStorageChanged
+    this.custodyReadManifest = options.custody.readManifest
+    this.custodyProvider = options.custody.provider ?? 'openai'
+  }
+
+  // Throws CustodyTombstoneRefreshError when the account is refresh-inert
+  // (manifest entry OR tombstone sentinel). The storage toggle does not
+  // participate: enabling or disabling it must not resurrect a local
+  // refresher over a vault-held family.
+  private async assertNotCustodyInert(
+    account: OAuthAccount | undefined,
+  ): Promise<void> {
+    if (!account) return
+    assertNotCustodyTombstone(account, this.custodyProvider)
+    const manifest = await this.custodyReadManifest()
+    if (refreshInert(account, manifest, this.custodyProvider)) {
+      throw new CustodyTombstoneRefreshError(this.custodyProvider)
+    }
+  }
+
+  // Boolean form: the entry gates use this to skip the account without
+  // throwing — throwing inside a loop body would force a catch that loses
+  // the surrounding selection bookkeeping. Derived from the granular
+  // custodyAccountState so there is one source of truth for the gate.
+  private async isCustodyRefreshInert(account: OAuthAccount): Promise<boolean> {
+    return (await this.custodyAccountState(account)) !== null
+  }
+
+  // Granular form for `getUsableFallbackAccounts`: tombstoned accounts are
+  // never usable candidates until the vault resolver serves them; enrolling
+  // accounts (manifest entry, not tombstoned) remain
+  // usable while their local token is valid but must never be refreshed
+  // locally — the refresh gate is the source of truth, the selection path
+  // is a separate concern.
+  private async custodyAccountState(
+    account: OAuthAccount,
+  ): Promise<'enrolling' | 'tombstoned' | null> {
+    if (tombstoned(account, this.custodyProvider)) return 'tombstoned'
+    const manifest = await this.custodyReadManifest()
+    return enrolling(account, manifest, this.custodyProvider)
+      ? 'enrolling'
+      : null
   }
 
   /**
@@ -1991,6 +2307,10 @@ export class FallbackAccountManager {
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
       if (isMainAccountFallback(storage, account)) continue
+      const state = await this.custodyAccountState(account)
+      // Custody owns these families; the request resolver decides whether a
+      // vault or still-valid local bearer exists before send.
+      const skipRefresh = state === 'enrolling' || state === 'tombstoned'
       let refreshFailed = false
       let candidate = account
       try {
@@ -2005,29 +2325,31 @@ export class FallbackAccountManager {
               formatRefreshBackoffMessage(refreshError, this.now()),
             )
           }
-          try {
-            candidate = await this.refreshAccount(candidate, storage)
-            changed = true
-          } catch (error) {
-            if (isAccountRemovedDuringRefreshError(error)) continue
-            refreshFailed = true
-            const stored = storage.accounts.find(
-              (candidate): candidate is OAuthAccount =>
-                candidate.id === account.id && isOAuthAccount(candidate),
-            )
-            if (
-              stored &&
-              !refreshBackoffActive(
-                stored.lastRefreshError,
-                stored.refresh,
-                this.now(),
-              )
-            ) {
-              recordRefreshError(stored, error, this.now())
-              updateStoredAccount(storage, stored)
+          if (!skipRefresh) {
+            try {
+              candidate = await this.refreshAccount(candidate, storage)
               changed = true
+            } catch (error) {
+              if (isAccountRemovedDuringRefreshError(error)) continue
+              refreshFailed = true
+              const stored = storage.accounts.find(
+                (candidate): candidate is OAuthAccount =>
+                  candidate.id === account.id && isOAuthAccount(candidate),
+              )
+              if (
+                stored &&
+                !refreshBackoffActive(
+                  stored.lastRefreshError,
+                  stored.refresh,
+                  this.now(),
+                )
+              ) {
+                recordRefreshError(stored, error, this.now())
+                updateStoredAccount(storage, stored)
+                changed = true
+              }
+              throw error
             }
-            throw error
           }
         }
         this.seedFallbackQuota(candidate, storage)
@@ -2151,6 +2473,7 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (await this.isCustodyRefreshInert(account)) continue
       if (!tokenNeedsRefresh(account, storage, this.now())) continue
       if (
         refreshBackoffActive(
@@ -2193,6 +2516,7 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (await this.isCustodyRefreshInert(account)) continue
       let next = account
       try {
         if (tokenNeedsRefresh(next, storage, this.now())) {
@@ -2240,6 +2564,7 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (await this.isCustodyRefreshInert(account)) continue
       let next = account
       try {
         if (tokenNeedsRefresh(next, storage, this.now())) {
@@ -2320,6 +2645,12 @@ export class FallbackAccountManager {
       )
       if (!latestAccount) continue
 
+      // Per-poll custody gate: a manifest write is NOT a storage change, so
+      // the `changed` test below cannot see it. The per-poll gate reads the
+      // manifest fresh on every iteration and throws before any return —
+      // `force:true` must NEVER receive an enrolled or tombstoned account.
+      await this.assertNotCustodyInert(latestAccount)
+
       const changed =
         latestAccount.access !== previous.access ||
         latestAccount.refresh !== previous.refresh ||
@@ -2362,6 +2693,9 @@ export class FallbackAccountManager {
       (candidate): candidate is OAuthAccount =>
         candidate.id === account.id && isOAuthAccount(candidate),
     )
+    // Choke point (initial load): refuse any provider call when the
+    // reloaded account is enrolled or tombstoned. The toggle is ignored.
+    await this.assertNotCustodyInert(latestAccount)
     if (
       latestAccount &&
       !options.force &&
@@ -2400,6 +2734,10 @@ export class FallbackAccountManager {
         (candidate): candidate is OAuthAccount =>
           candidate.id === account.id && isOAuthAccount(candidate),
       )
+      // Choke point (under-lock load): a tombstone landing while the lock
+      // was contended, or a manifest entry appearing on disk, both abort
+      // the refresh before the provider call.
+      await this.assertNotCustodyInert(latestAccount)
       if (
         latestAccount &&
         !options.force &&
@@ -2441,6 +2779,15 @@ export class FallbackAccountManager {
       updateStoredAccount(storage, sourceAccount)
       await this.save(storage)
       const refreshedStorage = await this.load()
+      // Choke point (post-save load): a concurrent custody write landing
+      // between save and the verification load must invalidate the result
+      // even though the refreshFn succeeded.
+      await this.assertNotCustodyInert(
+        refreshedStorage?.accounts.find(
+          (candidate): candidate is OAuthAccount =>
+            candidate.id === account.id && isOAuthAccount(candidate),
+        ),
+      )
       if (
         !refreshedStorage?.accounts.some(
           (candidate) => candidate.id === account.id,
@@ -2463,6 +2810,7 @@ export class FallbackAccountManager {
 
   async refreshAccountQuota(account: OAuthAccount, storage: AccountStorage) {
     const target = account
+    assertNotCustodyTombstone(target, 'openai')
     if (!target.access) {
       throw new Error(`Fallback account ${account.id} has no access token`)
     }

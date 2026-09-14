@@ -1,5 +1,4 @@
 import {
-  afterAll,
   afterEach,
   beforeEach,
   describe,
@@ -18,18 +17,8 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CommandContext } from '../commands'
-// Static import for tests that don't need mocking.
 import { buildDialogPayload, renderResetCoordinatorResult } from '../commands'
 import { getSettings } from '../config'
-// Snapshot the REAL oauth module exports at load time (before any mock.module
-// runs). bun's mock.module leaks process-wide and mock.restore() does NOT undo
-// it, so without restoring here the beginAccountLogin stub below would poison
-// every later test file that imports ../core/oauth. We spread into a PLAIN object
-// so the snapshot holds the original function references even after the live
-// namespace is later replaced; afterAll re-installs it.
-import * as oauthLiveNamespace from '../core/oauth'
-
-const oauthRealExports = { ...oauthLiveNamespace }
 
 import type {
   AccountQuotaWindow,
@@ -42,6 +31,7 @@ import {
   type OAuthAccount,
   saveAccounts,
 } from '../core/accounts'
+import { CUSTODY_INERT_REASONS } from '../core/custody-state.ts'
 import { QuotaManager } from '../core/quota-manager'
 import { runResetCreditRedemption } from '../core/reset-credits'
 import { buildResetRedemptionDeps, createResetTargetResolver } from '../index'
@@ -98,6 +88,19 @@ function makeClient(): CommandContext['client'] {
       set: mock(async () => {}),
     },
   } as unknown as CommandContext['client']
+}
+
+const withFallbackAccountLock: CommandContext['withFallbackAccountLock'] =
+  async (_id, action) => action()
+
+function withAccountLogin(
+  ctx: CommandContext,
+  beginAccountLogin: unknown,
+): CommandContext {
+  return {
+    ...ctx,
+    beginAccountLogin: beginAccountLogin as CommandContext['beginAccountLogin'],
+  }
 }
 
 function fetchStub(
@@ -257,6 +260,7 @@ async function makeResetCommandHarness(
     quotaManager,
     loadAccounts,
     client: makeClient(),
+    withFallbackAccountLock,
     resolveResetTarget,
     fetchImpl: makeResetWire(fixture),
     now: () => now,
@@ -343,6 +347,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload('openai-routing', '', ctx)
@@ -360,6 +365,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     // Set to fallback-first
@@ -381,6 +387,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload(
@@ -410,6 +417,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload('openai-account', '', ctx)
@@ -427,6 +435,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       sessionId: 'session-a',
       clearStickyRouting,
     }
@@ -455,6 +464,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       sessionId: 'sticky-status-session',
       getStickyRouting: async () => 'fallback-1',
     }
@@ -479,6 +489,7 @@ describe('commands', () => {
         }),
         loadAccounts,
         client: makeClient(),
+        withFallbackAccountLock,
         sessionId: 'raw-command-session',
         clearStickyRouting: async () => true,
         cacheKeepManager: {
@@ -512,6 +523,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       clearStickyRouting,
     }
 
@@ -610,6 +622,7 @@ describe('commands', () => {
       quotaManager,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       sessionId: sessionA,
       cacheKeepManager,
       clearStickyRouting: (sessionId) =>
@@ -651,6 +664,7 @@ describe('commands', () => {
         }),
         loadAccounts,
         client: makeClient(),
+        withFallbackAccountLock,
       }
 
       const payload = await buildDialogPayload('openai-routing', alias, ctx)
@@ -691,6 +705,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     // Every account-command surface that returns an accounts knob.
@@ -809,6 +824,7 @@ describe('commands', () => {
       // Inject the stale snapshot as what the handler reads for display.
       loadAccounts: (async () => staleSnapshot) as typeof loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     await buildDialogPayload('openai-routing', 'fallback-first', ctx)
@@ -837,6 +853,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       cacheKeepManager: {
         status: () => ({
           running: false,
@@ -883,6 +900,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       setCacheKeepEnabled,
       cacheKeepManager: {
         start,
@@ -930,6 +948,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       setCacheKeepSubagents,
       cacheKeepManager: {
         status: () => ({
@@ -977,6 +996,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       setCacheKeepSustain,
       cacheKeepManager: {
         status: () => ({
@@ -1029,6 +1049,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const always = await buildDialogPayload(
@@ -1051,6 +1072,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       cacheKeepManager: {
         start,
         status: () => ({
@@ -1092,6 +1114,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       setCacheKeepWindow,
       cacheKeepManager: {
         status: () => ({
@@ -1140,6 +1163,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       setCacheKeepWindow,
       cacheKeepManager: {
         status: () => ({
@@ -1186,6 +1210,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       setCacheKeepWindow,
       cacheKeepManager: {
         status: () => ({
@@ -1225,6 +1250,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       cacheKeepManager: {
         status: () => ({
           running: true,
@@ -1280,6 +1306,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client,
+      withFallbackAccountLock,
       refreshSidebar: async () => {
         refreshCalls.push(1)
       },
@@ -1311,6 +1338,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     // Seed two oauth accounts, then strip 'broken' from the state file.
@@ -1365,6 +1393,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
     await saveAccounts(
       {
@@ -1404,6 +1433,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client,
+      withFallbackAccountLock,
       refreshSidebar: async () => {
         refreshCalls.push(1)
       },
@@ -1440,6 +1470,7 @@ describe('commands', () => {
         quotaManager: qm,
         loadAccounts,
         client: makeClient(),
+        withFallbackAccountLock,
       }
 
       // Gate: start from 'info' (debug suppressed)
@@ -1496,6 +1527,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const offPayload = await buildDialogPayload('openai-dump', '', ctx)
@@ -1529,6 +1561,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload('openai-killswitch', '', ctx)
@@ -1549,6 +1582,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload('openai-quota', '', ctx)
@@ -1585,6 +1619,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       refreshAllQuota: async () => {
         qm.setMain('access-main', {
           quota: makeQuotaSnapshot(15),
@@ -1649,6 +1684,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload('openai-quota', '', ctx)
@@ -1672,6 +1708,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       refreshAllQuota: async () => {
         qm.setMain('access-main', {
           quota: makeQuotaSnapshot(10),
@@ -1722,6 +1759,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       refreshAllQuota: async () => {
         // Fresh main, stale fallback, and the poll itself reports success for
         // both — the shape that made a 31-hour-old bar look current.
@@ -1767,6 +1805,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       refreshAllQuota: async () => [
         { account: 'main', ok: true },
         {
@@ -1803,6 +1842,7 @@ describe('commands', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       // refreshAllQuota intentionally omitted
     }
 
@@ -2000,6 +2040,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       resolveResetTarget,
       fetchImpl: fetchStub(async () => Response.json({})),
       now: () => now,
@@ -2024,6 +2065,7 @@ describe('commands', () => {
       quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     const payload = await buildDialogPayload('openai-reset', '', ctx)
@@ -2031,6 +2073,47 @@ describe('commands', () => {
     expect(payload.command).toBe('openai-reset')
     expect(payload.text).toContain('Unavailable')
     expect(payload.knobs).toEqual({})
+  })
+
+  test('reset preview reports a vault-served wham 401 before marking the account ineligible', async () => {
+    const reports: number[] = []
+    const ctx: CommandContext = {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+      withFallbackAccountLock,
+      resolveResetTarget: async () => ({
+        accountKey: 'fallback-a',
+        label: 'fallback-a',
+        accessToken: 'vault-access',
+        chatgptAccountId: 'chatgpt-fallback-a',
+        onAuthFailure: async (status) => {
+          reports.push(status)
+        },
+      }),
+      fetchImpl: fetchStub(async (input) => {
+        if (String(input).includes('/wham/usage')) {
+          return Response.json({ error: 'unauthorized' }, { status: 401 })
+        }
+        return Response.json({ credits: [], available_count: 0 })
+      }),
+      now: () => Date.parse('2026-07-17T12:00:00.000Z'),
+      randomUUID: () => 'uuid',
+      refreshResetTargetQuota: async (accountKey) => ({
+        account: accountKey,
+        ok: true,
+      }),
+    }
+
+    const payload = await buildDialogPayload(
+      'openai-reset',
+      'select fallback-a',
+      ctx,
+    )
+
+    expect(payload.knobs.code).toBe('not_eligible')
+    expect(reports).toEqual([401])
   })
 
   test('reset identity resolver returns tagged displayable target errors', async () => {
@@ -3218,7 +3301,7 @@ describe('commands', () => {
 })
 
 // -----------------------------------------------------------------------
-// Account add command (uses mock.module for beginAccountLogin)
+// Account add command
 // -----------------------------------------------------------------------
 describe('commands (add)', () => {
   let tmpDir: string
@@ -3254,12 +3337,6 @@ describe('commands (add)', () => {
     }
   })
 
-  // mock.module('../core/oauth', ...) below leaks process-wide; re-install the
-  // real module so later test files (e.g. oauth.test.ts) see the genuine exports.
-  afterAll(() => {
-    mock.module('../core/oauth', () => oauthRealExports)
-  })
-
   test('/openai-account add returns dialog with auth URL', async () => {
     const resolveAccount = makeAccount('added-acct', { label: 'work' })
     const beginSpy = mock((_opts?: unknown) =>
@@ -3269,13 +3346,6 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    // Dynamic re-import to pick up the mock
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3285,9 +3355,14 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
-    const payload = await bdp('openai-account', 'add work', ctx)
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'add work',
+      withAccountLogin(ctx, beginSpy),
+    )
 
     expect(payload.command).toBe('openai-account')
     expect(payload.text).toContain('https://auth.openai.com/oauth/authorize')
@@ -3307,12 +3382,6 @@ describe('commands (add)', () => {
         completion: completionPromise,
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3325,9 +3394,14 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client,
+      withFallbackAccountLock,
     }
 
-    const payload = await bdp('openai-account', 'add work', ctx)
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'add work',
+      withAccountLogin(ctx, beginSpy),
+    )
     expect(payload.text).toContain('Add OpenAI Account')
 
     // Resolve the detached completion
@@ -3356,12 +3430,6 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3371,16 +3439,25 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
     // First add
-    await bdp('openai-account', 'add personal', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add personal',
+      withAccountLogin(ctx, beginSpy),
+    )
     await waitUntil(
       async () => ((await loadAccounts(configPath))?.accounts.length ?? 0) >= 1,
     )
 
     // Second add with same label
-    await bdp('openai-account', 'add personal', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add personal',
+      withAccountLogin(ctx, beginSpy),
+    )
     // Absence assertion: the duplicate must NOT be added, so there is no
     // observable effect to poll for. Wait long enough for the completion to
     // have run and been rejected.
@@ -3399,12 +3476,6 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3414,9 +3485,14 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
-    await bdp('openai-account', 'add fb', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add fb',
+      withAccountLogin(ctx, beginSpy),
+    )
     await waitUntil(
       async () => ((await loadAccounts(configPath))?.accounts.length ?? 0) >= 1,
     )
@@ -3447,12 +3523,6 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3462,9 +3532,14 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
-    await bdp('openai-account', 'add test', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add test',
+      withAccountLogin(ctx, beginSpy),
+    )
     // Absence assertion: the main account must NOT be added as a fallback, so
     // there is no observable effect to poll for. Wait long enough for the
     // completion to have run and been rejected.
@@ -3494,12 +3569,6 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3510,12 +3579,17 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       notify: (payload) => {
         notifyCalls.push({ text: payload.text })
       },
     }
 
-    await bdp('openai-account', 'add test', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add test',
+      withAccountLogin(ctx, beginSpy),
+    )
     await waitUntil(() => notifyCalls.length >= 1)
 
     expect(notifyCalls.length).toBe(1)
@@ -3530,12 +3604,6 @@ describe('commands (add)', () => {
         completion: Promise.reject(new Error('OAuth timeout')),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3546,12 +3614,17 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       notify: (payload) => {
         notifyCalls.push({ text: payload.text })
       },
     }
 
-    await bdp('openai-account', 'add test', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add test',
+      withAccountLogin(ctx, beginSpy),
+    )
     await waitUntil(() => notifyCalls.length >= 1)
 
     expect(notifyCalls.length).toBe(1)
@@ -3566,12 +3639,6 @@ describe('commands (add)', () => {
         completion: new Promise(() => {}),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3581,9 +3648,14 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
-    const payload = await bdp('openai-account', 'add work', ctx)
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'add work',
+      withAccountLogin(ctx, beginSpy),
+    )
 
     expect(payload.command).toBe('openai-account')
     expect(payload.knobs.url).toBe(
@@ -3603,12 +3675,6 @@ describe('commands (add)', () => {
         completion: new Promise(() => {}),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3618,9 +3684,14 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
-    const payload = await bdp('openai-account', 'add --headless', ctx)
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'add --headless',
+      withAccountLogin(ctx, beginSpy),
+    )
 
     expect(payload.command).toBe('openai-account')
     expect(payload.knobs.verificationUrl).toBe(
@@ -3639,12 +3710,6 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3655,12 +3720,17 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       refreshSidebar: async () => {
         refreshCalls.push(1)
       },
     }
 
-    await bdp('openai-account', 'add work', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add work',
+      withAccountLogin(ctx, beginSpy),
+    )
     await waitUntil(() => refreshCalls.length >= 1)
 
     expect(refreshCalls.length).toBe(1)
@@ -3676,12 +3746,6 @@ describe('commands (add)', () => {
         completion: new Promise(() => {}),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3691,9 +3755,14 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
-    await bdp('openai-account', 'add my-label', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add my-label',
+      withAccountLogin(ctx, beginSpy),
+    )
 
     expect(beginSpy).toHaveBeenCalled()
     const callArg = beginSpy.mock.calls[0]?.[0] as
@@ -3710,12 +3779,6 @@ describe('commands (add)', () => {
         completion: new Promise(() => {}),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3725,9 +3788,14 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
     }
 
-    await bdp('openai-account', 'add --headless my-label', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add --headless my-label',
+      withAccountLogin(ctx, beginSpy),
+    )
 
     expect(beginSpy).toHaveBeenCalled()
     const callArg = beginSpy.mock.calls[0]?.[0] as
@@ -3749,12 +3817,6 @@ describe('commands (add)', () => {
         completion: completionPromise,
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
-      return { ...actual, beginAccountLogin: beginSpy }
-    })
-
-    const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
       storage: { version: 1 as const, accounts: [] },
@@ -3766,13 +3828,18 @@ describe('commands (add)', () => {
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
+      withFallbackAccountLock,
       sessionId: 'session-one',
       notify: (payload) => {
         firstSessionCalls.push(payload.text)
       },
     }
 
-    await bdp('openai-account', 'add work', ctx)
+    await buildDialogPayload(
+      'openai-account',
+      'add work',
+      withAccountLogin(ctx, beginSpy),
+    )
     ctx.sessionId = 'session-two'
     ctx.notify = (payload) => {
       secondSessionCalls.push(payload.text)
@@ -3784,5 +3851,292 @@ describe('commands (add)', () => {
     expect(firstSessionCalls).toHaveLength(1)
     expect(firstSessionCalls[0]).toContain('Account Added')
     expect(secondSessionCalls).toHaveLength(0)
+  })
+})
+
+describe('commands (claustrum mode)', () => {
+  let tmpDir: string
+  let configPath: string
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'openai-auth-cmd-claustrum-'))
+    configPath = join(tmpDir, 'openai-auth.json')
+  })
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  function context(overrides: Partial<CommandContext> = {}): CommandContext {
+    return {
+      accountStoragePath: configPath,
+      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      loadAccounts,
+      client: makeClient(),
+      withFallbackAccountLock: async (_id, action) => action(),
+      ...overrides,
+    }
+  }
+
+  test('claustrum enters through the readiness barrier and renders the cross-window warning', async () => {
+    const enterClaustrumMode = mock(async () => ({
+      status: 'completed' as const,
+      outcomes: { 'fallback-a': 'tombstoned' as const },
+    }))
+
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'claustrum',
+      context({ enterClaustrumMode }),
+    )
+
+    expect(enterClaustrumMode).toHaveBeenCalledTimes(1)
+    expect(payload.text).toContain(
+      'do not run a login in another OpenCode window during this transition',
+    )
+    expect(payload.text).toContain('fallback-a')
+  })
+
+  test('local exits through the shared mode lock and tells the operator how to finish the exit', async () => {
+    const leaveClaustrumMode = mock(async () => {})
+
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'local',
+      context({ leaveClaustrumMode }),
+    )
+
+    expect(leaveClaustrumMode).toHaveBeenCalledTimes(1)
+    expect(payload.text).toContain('/login openai')
+    expect(payload.text).toContain('ck auth')
+  })
+
+  test('transition apply knobs reload the persisted mode after each barrier', async () => {
+    await saveAccounts(
+      { version: 1, accounts: [], claustrum: { mode: 'local' } },
+      configPath,
+    )
+    const enterClaustrumMode = mock(async () => {
+      await saveAccounts(
+        { version: 1, accounts: [], claustrum: { mode: 'claustrum' } },
+        configPath,
+      )
+      return { status: 'completed' as const, outcomes: {} }
+    })
+
+    const entered = await buildDialogPayload(
+      'openai-account',
+      'claustrum',
+      context({ enterClaustrumMode }),
+    )
+
+    expect(entered.knobs.claustrumMode).toBe('claustrum')
+
+    const leaveClaustrumMode = mock(async () => {
+      await saveAccounts(
+        { version: 1, accounts: [], claustrum: { mode: 'local' } },
+        configPath,
+      )
+    })
+    const left = await buildDialogPayload(
+      'openai-account',
+      'local',
+      context({ leaveClaustrumMode }),
+    )
+
+    expect(left.knobs.claustrumMode).toBe('local')
+  })
+
+  test('account status and help retain Claustrum mode verbs without custody on or off', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        accounts: [makeAccount('fallback-a')],
+        claustrum: { mode: 'local' },
+      },
+      configPath,
+    )
+
+    const status = await buildDialogPayload('openai-account', '', context())
+    const help = await buildDialogPayload('openai-account', 'help', context())
+
+    for (const payload of [status, help]) {
+      expect(payload.text).toContain('claustrum')
+      expect(payload.text.toLowerCase()).not.toContain('custody on')
+      expect(payload.text.toLowerCase()).not.toContain('custody off')
+    }
+  })
+
+  test('enable re-reads claustrum mode under the account lock and binds a pending row before enabling it', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        accounts: [makeAccount('fallback-a', { enabled: false })],
+        claustrum: { mode: 'claustrum' },
+      },
+      configPath,
+    )
+    const withFallbackAccountLock = mock(async (_id, action) => action())
+    const checkUsableCustodyBinding = mock(async () => ({
+      ready: true as const,
+      accountId: 'served-account',
+    }))
+
+    const payload = await buildDialogPayload(
+      'openai-account',
+      'enable fallback-a',
+      context({ withFallbackAccountLock, checkUsableCustodyBinding }),
+    )
+
+    expect(withFallbackAccountLock).toHaveBeenCalledWith(
+      'fallback-a',
+      expect.any(Function),
+    )
+    expect(checkUsableCustodyBinding).toHaveBeenCalledTimes(1)
+    expect((await loadAccounts(configPath))?.accounts[0]).toMatchObject({
+      id: 'fallback-a',
+      accountId: 'served-account',
+      enabled: true,
+    })
+    expect(payload.text).toContain('enabled')
+  })
+
+  test('enable observes a mode switch that happens while its account lock is held', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        accounts: [makeAccount('fallback-a', { enabled: false })],
+        claustrum: { mode: 'local' },
+      },
+      configPath,
+    )
+    let markLockEntered!: () => void
+    const lockEntered = new Promise<void>((resolve) => {
+      markLockEntered = resolve
+    })
+    let releaseAction!: () => void
+    const allowAction = new Promise<void>((resolve) => {
+      releaseAction = resolve
+    })
+    const withFallbackAccountLock = async <T>(
+      _id: string,
+      action: () => Promise<T>,
+    ): Promise<T> => {
+      markLockEntered()
+      await allowAction
+      return action()
+    }
+    const run = buildDialogPayload(
+      'openai-account',
+      'enable fallback-a',
+      context({
+        withFallbackAccountLock,
+        checkUsableCustodyBinding: async () => ({
+          ready: false as const,
+          reason: 'vault-cold' as const,
+        }),
+      }),
+    )
+
+    await lockEntered
+    await saveAccounts(
+      {
+        version: 1,
+        accounts: [makeAccount('fallback-a', { enabled: false })],
+        claustrum: { mode: 'claustrum' },
+      },
+      configPath,
+    )
+    releaseAction()
+    const payload = await run
+
+    expect(payload.text).toContain('vault-cold')
+    expect((await loadAccounts(configPath))?.accounts[0]?.enabled).toBe(false)
+  })
+
+  for (const reason of ['vault-cold', 'vault-reauth'] as const) {
+    test(`enable keeps a claustrum row disabled when its binding is ${reason}`, async () => {
+      expect(CUSTODY_INERT_REASONS).toContain(reason)
+      await saveAccounts(
+        {
+          version: 1,
+          accounts: [makeAccount('fallback-a', { enabled: false })],
+          claustrum: { mode: 'claustrum' },
+        },
+        configPath,
+      )
+
+      const payload = await buildDialogPayload(
+        'openai-account',
+        'enable fallback-a',
+        context({
+          withFallbackAccountLock: async (_id, action) => action(),
+          checkUsableCustodyBinding: async () => ({
+            ready: false as const,
+            reason,
+          }),
+        }),
+      )
+
+      expect((await loadAccounts(configPath))?.accounts[0]?.enabled).toBe(false)
+      expect(payload.text).toContain(reason)
+    })
+  }
+
+  test('add completion refuses persistence when claustrum begins before OAuth finishes', async () => {
+    let resolveAccount!: (account: OAuthAccount) => void
+    const completion = new Promise<OAuthAccount>((resolve) => {
+      resolveAccount = resolve
+    })
+    const beginAccountLogin = async () => ({
+      url: 'https://auth.openai.com/test',
+      instructions: 'test',
+      completion,
+    })
+    const notifications: string[] = []
+
+    await buildDialogPayload(
+      'openai-account',
+      'add work',
+      context({
+        notify: (payload) => {
+          notifications.push(payload.text)
+        },
+        beginAccountLogin:
+          beginAccountLogin as CommandContext['beginAccountLogin'],
+        withFallbackAccountLock: async (_id, action) => action(),
+      }),
+    )
+    await saveAccounts(
+      { version: 1, accounts: [], claustrum: { mode: 'claustrum' } },
+      configPath,
+    )
+    resolveAccount(makeAccount('fallback-a', { label: 'work' }))
+    await waitUntil(() => notifications.length === 1)
+
+    expect((await loadAccounts(configPath))?.accounts).toEqual([])
+    expect(notifications[0]).toContain('/openai-account local')
+  })
+
+  test('remove leaves the custody manifest bytes untouched', async () => {
+    await saveAccounts(
+      { version: 1, accounts: [makeAccount('fallback-a')] },
+      configPath,
+    )
+    const manifestPath = join(tmpDir, 'opencode-handles.json')
+    const manifestBytes = '{"version":1,"providers":["fixture"]}\n'
+    const prior = process.env.CLAUSTRUM_OPENCODE_HANDLES
+    try {
+      process.env.CLAUSTRUM_OPENCODE_HANDLES = manifestPath
+      writeFileSync(manifestPath, manifestBytes)
+
+      await buildDialogPayload('openai-account', 'remove fallback-a', context())
+
+      expect(readFileSync(manifestPath, 'utf8')).toBe(manifestBytes)
+      expect((await loadAccounts(configPath))?.accounts).toEqual([])
+    } finally {
+      if (prior === undefined) delete process.env.CLAUSTRUM_OPENCODE_HANDLES
+      else process.env.CLAUSTRUM_OPENCODE_HANDLES = prior
+    }
   })
 })

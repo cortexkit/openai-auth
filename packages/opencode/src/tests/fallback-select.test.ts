@@ -22,6 +22,7 @@ import {
   saveAccounts,
 } from '../core/accounts.ts'
 import { hashRefreshToken } from '../core/backoff.ts'
+import { localCustody } from './custody-fixtures.ts'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
 
 // ---------------------------------------------------------------------------
@@ -80,6 +81,7 @@ describe('fallback selection', () => {
     const storage = makeStorage([account])
 
     const manager = new FallbackAccountManager({
+      custody: localCustody,
       now: () => Date.now(),
       fetchImpl: fetch,
     })
@@ -95,6 +97,7 @@ describe('fallback selection', () => {
     storage.quota = { failClosedOnUnknownQuota: true, enabled: true }
 
     const manager = new FallbackAccountManager({
+      custody: localCustody,
       now: () => Date.now(),
       fetchImpl: fetch,
     })
@@ -391,6 +394,7 @@ describe('fallback selection', () => {
     storage.mainAccountId = 'chatgpt-main'
 
     const manager = new FallbackAccountManager({
+      custody: localCustody,
       now: () => Date.now(),
       fetchImpl: fetch,
     })
@@ -422,6 +426,7 @@ describe('fallback selection', () => {
         .mockRejectedValue(new Error('fetch failed while refreshing token'))
 
       const manager = new FallbackAccountManager({
+        custody: localCustody,
         now: () => now,
         fetchImpl: fetch,
         refreshFn: refreshFn as AccountManagerOptions['refreshFn'],
@@ -456,6 +461,7 @@ describe('fallback selection', () => {
     const refreshFn = jest.fn()
 
     const manager = new FallbackAccountManager({
+      custody: localCustody,
       now: () => now,
       fetchImpl: fetch,
       refreshFn: refreshFn as AccountManagerOptions['refreshFn'],
@@ -497,6 +503,7 @@ describe('fallback selection', () => {
       const setFallback = jest.fn()
 
       const manager = new FallbackAccountManager({
+        custody: localCustody,
         now: () => now,
         fetchImpl: fetch,
         refreshFn: refreshFn as AccountManagerOptions['refreshFn'],
@@ -532,6 +539,7 @@ describe('fallback selection', () => {
     })
 
     const manager = new FallbackAccountManager({
+      custody: localCustody,
       now: () => Date.now(),
       fetchImpl: fetch,
       fetchQuotaFn: fetchQuotaFn as AccountManagerOptions['fetchQuotaFn'],
@@ -549,6 +557,7 @@ describe('fallback selection', () => {
     const storage = makeStorage([account])
 
     const manager = new FallbackAccountManager({
+      custody: localCustody,
       now: () => Date.now(),
       fetchImpl: fetch,
       // NO fetchQuotaFn injected
@@ -564,6 +573,7 @@ describe('fallback selection', () => {
     const _storage = makeStorage([account])
 
     const manager = new FallbackAccountManager({
+      custody: localCustody,
       now: () => Date.now(),
       fetchImpl: fetch,
       // NO fetchQuotaFn injected
@@ -590,6 +600,7 @@ describe('fallback selection', () => {
       const _storage = makeStorage([account])
 
       const manager = new FallbackAccountManager({
+        custody: localCustody,
         now: () => Date.now(),
         fetchImpl: fetch,
       })
