@@ -10,6 +10,7 @@ import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
+import { getConfigPath } from '../config.ts'
 import type { OAuthAccount } from '../core/accounts.ts'
 import { migrateIfNeeded } from '../core/accounts.ts'
 import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
@@ -4952,12 +4953,15 @@ describe('integration: active fallback routing', () => {
       await runCommand(hooks, 'openai-cachekeep', 'sustain on')
       const manager = (
         globalThis as typeof globalThis & {
-          __openaiAuthCacheKeepManager?: {
-            tick(): Promise<void>
-            status(): { tracked: number; sustain: boolean }
-          }
+          __openaiAuthCacheKeepManagers?: Map<
+            string,
+            {
+              tick(): Promise<void>
+              status(): { tracked: number; sustain: boolean }
+            }
+          >
         }
-      ).__openaiAuthCacheKeepManager
+      ).__openaiAuthCacheKeepManagers?.get(getConfigPath())
       if (!manager) throw new Error('missing cachekeep manager')
 
       await manager.tick()
@@ -6900,9 +6904,12 @@ describe('integration: active fallback routing', () => {
           now += 30 * 60_000
           const manager = (
             globalThis as typeof globalThis & {
-              __openaiAuthCacheKeepManager?: { tick(): Promise<void> }
+              __openaiAuthCacheKeepManagers?: Map<
+                string,
+                { tick(): Promise<void> }
+              >
             }
-          ).__openaiAuthCacheKeepManager
+          ).__openaiAuthCacheKeepManagers?.get(getConfigPath())
           if (!manager) throw new Error('missing cachekeep manager')
           await manager.tick()
         },

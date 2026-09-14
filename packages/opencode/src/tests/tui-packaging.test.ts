@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
 
 // ---------------------------------------------------------------------------
@@ -176,5 +176,35 @@ describe('tui packaging (compiled ./tui entry shim)', () => {
 
     const missing = reachable.filter((rel) => !shipped.has(rel))
     expect(missing).toEqual([])
+  })
+
+  test('the built plugin bundle removes the singular RPC global', () => {
+    // The bundle is produced by `bun run build`, which CI runs as a separate
+    // step before `bun run test` (see .github/workflows/ci.yml). Reading the
+    // bundle directly here keeps the test dependent on the same freshness
+    // guarantee CI provides instead of rebuilding inside the test.
+    const bundle = join(PKG_DIR, 'dist', 'index.js')
+    if (!existsSync(bundle)) {
+      throw new Error(
+        'Built plugin bundle is missing: dist/index.js (run `bun run build` first)',
+      )
+    }
+    if (statSync(bundle).size < 1_024) {
+      throw new Error(
+        'Built plugin bundle is unexpectedly small: dist/index.js',
+      )
+    }
+
+    const source = readFileSync(bundle, 'utf8')
+    const registryCount = source.match(/__openaiAuthRpcServers/g)?.length ?? 0
+    if (registryCount < 1) {
+      throw new Error('Built plugin bundle is missing the RPC registry global')
+    }
+
+    const singularCount =
+      source.match(/__openaiAuthRpcServer[^s]/g)?.length ?? 0
+    if (singularCount !== 0) {
+      throw new Error('Built plugin bundle retains the singular RPC global')
+    }
   })
 })

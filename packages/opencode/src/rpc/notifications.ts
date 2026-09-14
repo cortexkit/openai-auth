@@ -5,7 +5,6 @@ const TUI_CONNECTED_WINDOW_MS = 3_000
 
 let queue: RpcNotification[] = []
 let nextId = 1
-let lastDrainAtAny = 0
 const lastDrainAtBySession = new Map<string, number>()
 
 export function pushNotification(
@@ -21,7 +20,6 @@ export function drainNotifications(
   sessionId?: string,
 ): RpcNotification[] {
   const now = Date.now()
-  lastDrainAtAny = now
   if (sessionId !== undefined) lastDrainAtBySession.set(sessionId, now)
   const matches = (n: RpcNotification) =>
     sessionId === undefined ||
@@ -30,25 +28,21 @@ export function drainNotifications(
   if (lastReceivedId > 0) {
     queue = queue.filter((n) => {
       if (n.id > lastReceivedId) return true
-      if (sessionId === undefined) return false
+      if (sessionId === undefined) return true
       return n.sessionId !== sessionId
     })
   }
   return queue.filter((n) => n.id > lastReceivedId && matches(n))
 }
 
-export function isTuiConnected(sessionId?: string): boolean {
+export function isTuiConnected(sessionId: string): boolean {
   const now = Date.now()
-  if (sessionId !== undefined) {
-    const at = lastDrainAtBySession.get(sessionId) ?? 0
-    return at > 0 && now - at < TUI_CONNECTED_WINDOW_MS
-  }
-  return lastDrainAtAny > 0 && now - lastDrainAtAny < TUI_CONNECTED_WINDOW_MS
+  const at = lastDrainAtBySession.get(sessionId) ?? 0
+  return at > 0 && now - at < TUI_CONNECTED_WINDOW_MS
 }
 
 export function resetNotificationsForTest(): void {
   queue = []
   nextId = 1
-  lastDrainAtAny = 0
   lastDrainAtBySession.clear()
 }
