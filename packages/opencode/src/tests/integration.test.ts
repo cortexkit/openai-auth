@@ -17,6 +17,7 @@ import {
 } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
 import { getAccountPaths } from '../core/account-paths'
+import { getConfigPath } from '../config.ts'
 import { QUOTA_STALENESS_MS } from '../core/sticky-routing.ts'
 import {
   AuthPersistError,
@@ -5157,12 +5158,15 @@ describe('integration: active fallback routing', () => {
       await runCommand(hooks, 'openai-cachekeep', 'sustain on')
       const manager = (
         globalThis as typeof globalThis & {
-          __openaiAuthCacheKeepManager?: {
-            tick(): Promise<void>
-            status(): { tracked: number; sustain: boolean }
-          }
+          __openaiAuthCacheKeepManagers?: Map<
+            string,
+            {
+              tick(): Promise<void>
+              status(): { tracked: number; sustain: boolean }
+            }
+          >
         }
-      ).__openaiAuthCacheKeepManager
+      ).__openaiAuthCacheKeepManagers?.get(getConfigPath())
       if (!manager) throw new Error('missing cachekeep manager')
 
       await manager.tick()
@@ -7108,9 +7112,12 @@ describe('integration: active fallback routing', () => {
           now += 30 * 60_000
           const manager = (
             globalThis as typeof globalThis & {
-              __openaiAuthCacheKeepManager?: { tick(): Promise<void> }
+              __openaiAuthCacheKeepManagers?: Map<
+                string,
+                { tick(): Promise<void> }
+              >
             }
-          ).__openaiAuthCacheKeepManager
+          ).__openaiAuthCacheKeepManagers?.get(getConfigPath())
           if (!manager) throw new Error('missing cachekeep manager')
           await manager.tick()
         },
