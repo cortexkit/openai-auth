@@ -21,13 +21,13 @@
     "prepublishOnly": "bun run build"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.12",
+    "@biomejs/biome": "2.5.13",
     "@earendil-works/pi-ai": "0.85.1",
     "@earendil-works/pi-coding-agent": "0.85.1",
     "@earendil-works/pi-tui": "0.85.1",
-    "@opencode-ai/plugin": "1.18.29",
+    "@opencode-ai/plugin": "1.18.30",
     "@tsconfig/bun": "1.0.11",
-    "@types/bun": "1.4.1",
+    "@types/bun": "1.4.2",
     "bun-types": "1.4.2",
     "lefthook": "2.1.12",
     "typescript": "7.0.2"
