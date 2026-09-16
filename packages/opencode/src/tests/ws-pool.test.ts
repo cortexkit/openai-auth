@@ -2,7 +2,11 @@ import { describe, expect, test } from 'bun:test'
 import { APICallError } from 'ai'
 import { DUMP_SESSION_HEADER } from '../dump'
 import { ResponseStreamError } from '../response-stream-error'
-import { connectResponsesWebSocket, TERMINAL_AFTER_OUTPUT_MESSAGE } from '../ws'
+import {
+  connectResponsesWebSocket,
+  OVERSIZED_FRAME_MESSAGE,
+  TERMINAL_AFTER_OUTPUT_MESSAGE,
+} from '../ws'
 import {
   applyTurnId,
   CODEX_BODY_KEY_ORDER,
@@ -2714,8 +2718,11 @@ describe('transport close provenance', () => {
       /try your request again|retry your request|resource exhausted|resource_exhausted/i,
       /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
     ]
+    // Both messages carry a decision the host must not overturn: one says the
+    // turn is finished, the other says this socket cannot carry this request.
     for (const pattern of hostRetryablePatterns) {
       expect(pattern.test(TERMINAL_AFTER_OUTPUT_MESSAGE)).toBe(false)
+      expect(pattern.test(OVERSIZED_FRAME_MESSAGE)).toBe(false)
     }
     // The inputs that used to reach this message, each of which the host reads
     // as retryable. They are the reason the message is fixed text.
@@ -2730,6 +2737,7 @@ describe('transport close provenance', () => {
         hostRetryablePatterns.some((pattern) => pattern.test(leaked)),
       ).toBe(true)
       expect(TERMINAL_AFTER_OUTPUT_MESSAGE).not.toContain(leaked)
+      expect(OVERSIZED_FRAME_MESSAGE).not.toContain(leaked)
     }
   })
 

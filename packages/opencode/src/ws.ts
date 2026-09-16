@@ -693,18 +693,29 @@ export function streamResponsesWebSocket(
     if (completed) return
     // 1009 is the peer refusing this request's size. Resending the same bytes
     // over the same transport is pointless, so it is not retryable here; the
-    // pool routes it to HTTP instead when nothing has streamed yet. The size
-    // goes in the message because it is the part an operator can act on.
+    // pool routes it to HTTP instead when nothing has streamed yet.
     const oversized = event.code === 1009
+    // The host can override a non-retryable flag by matching the message text,
+    // so this one is built without the peer's reason and without the size: a
+    // reason mentioning a lost connection, or a size that reads as 503 KB,
+    // would revive the resend loop this flag exists to stop. Both are logged.
     const failure = new ResponseStreamError(
-      closeMessage(
-        'WebSocket closed before response.completed',
-        event.code,
-        event.reason,
-        oversized ? sentBytes : undefined,
-      ),
+      oversized
+        ? OVERSIZED_FRAME_MESSAGE
+        : closeMessage(
+            'WebSocket closed before response.completed',
+            event.code,
+            event.reason,
+          ),
       { retryable: !oversized },
     )
+    if (oversized) {
+      logT.warn('websocket peer refused the request size', {
+        ...sessionKeys,
+        requestBytes: sentBytes,
+        reason: event.reason.toString(),
+      })
+    }
     invalidateTransport(oversized ? markOversizedFrame(failure) : failure)
   }
 
@@ -961,24 +972,22 @@ function responseIDOf(event: Record<string, unknown>) {
 export const TERMINAL_AFTER_OUTPUT_MESSAGE =
   'The response ended early after part of it had already been shown. It was not sent again, because repeating it would duplicate that output and re-run any tools it had started. The transport log records what ended it.'
 
-function closeMessage(
-  message: string,
-  code: number,
-  reason: string | Buffer,
-  sentBytes?: number,
-) {
-  const details = [`code ${code}`]
-  if (code === 1009) details.push('message too big')
-  if (reason.length > 0) details.push(reason.toString())
-  if (sentBytes !== undefined && sentBytes > 0)
-    details.push(`request was ${formatBytes(sentBytes)}`)
-  return `${message} (${details.join(': ')})`
-}
+/**
+ * Surfaced when the peer refuses the request frame as too large (close 1009).
+ *
+ * Fixed text for the same reason as {@link TERMINAL_AFTER_OUTPUT_MESSAGE}: the
+ * host can override this error's non-retryable flag by matching the message,
+ * and resending a frame the peer has already measured and refused is the one
+ * outcome this path exists to prevent. The size and the peer's reason are
+ * logged instead.
+ */
+export const OVERSIZED_FRAME_MESSAGE =
+  'The request was larger than the websocket would carry, so it was sent over HTTP instead. Resending it unchanged over the same socket cannot succeed. The transport log records the size.'
 
-function formatBytes(bytes: number) {
-  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`
-  return `${bytes} B`
+function closeMessage(message: string, code: number, reason: string | Buffer) {
+  const details = [`code ${code}`]
+  if (reason.length > 0) details.push(reason.toString())
+  return `${message} (${details.join(': ')})`
 }
 
 export * as OpenAIWebSocket from './ws'
