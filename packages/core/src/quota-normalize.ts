@@ -1,4 +1,4 @@
-import type { AccountQuotaWindow, OAuthQuotaSnapshot } from './core/accounts.ts'
+import type { AccountQuotaWindow, OAuthQuotaSnapshot } from './accounts.ts'
 
 // ---------------------------------------------------------------------------
 // Shared helper: Codex reset_at is epoch SECONDS; tolerate ms and ISO too.

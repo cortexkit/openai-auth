@@ -3,12 +3,12 @@ import {
   buildQuotaOperationError,
   isTransientQuotaError,
   isTransientRefreshError,
-} from '../core/backoff.ts'
+} from '../backoff.ts'
 import {
   codexRefreshFn,
   type ProviderHttpError,
   whamUsageFn,
-} from '../core/provider.ts'
+} from '../provider.ts'
 
 function fetchUntilAborted() {
   const fetchMock = mock(

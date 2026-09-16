@@ -14,7 +14,7 @@ import type { PluginInput } from '@opencode-ai/plugin'
 // Snapshot the REAL oauth module before mock.module runs; bun's mock.module
 // leaks process-wide and mock.restore() does not undo it, so afterAll re-installs
 // this plain-object snapshot to protect later test files.
-import * as oauthLiveNamespace from '../core/oauth'
+import * as oauthLiveNamespace from '../../../core/src/oauth.ts'
 import {
   drainNotifications,
   resetNotificationsForTest,
@@ -103,7 +103,7 @@ describe('command hook session isolation', () => {
   })
 
   afterAll(() => {
-    mock.module('../core/oauth', () => oauthRealExports)
+    mock.module('../../../core/src/oauth.ts', () => oauthRealExports)
   })
 
   test('a second session interleaving inside the add await-window does not steal the add notification', async () => {
@@ -117,7 +117,7 @@ describe('command hook session isolation', () => {
     }>()
     const completionGate = deferred<unknown>()
 
-    mock.module('../core/oauth', () => ({
+    mock.module('../../../core/src/oauth.ts', () => ({
       ...oauthRealExports,
       beginAccountLogin: mock(() => beginGate.promise),
     }))

@@ -11,8 +11,11 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import type { AccountStorage } from '../core/accounts.ts'
-import { acquireRefreshFileLock } from '../core/refresh-file-lock'
+import {
+  type AccountStorage,
+  acquireRefreshFileLock,
+} from '@cortexkit/openai-auth-core/internal'
+import { getAccountStoragePath } from '../core/account-paths'
 import { buildSidebarMachineState } from '../index.ts'
 import { flushForTest, setLogLevel } from '../logger'
 import {
@@ -3420,11 +3423,14 @@ test("machine write keeps A's newer secondary when a concurrent normal write car
   // to each side's snapshot stamp (A: T2, B: T1), so A's secondary is kept.
   const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-crossed-'))
   const file = join(tempDir, 'sidebar-state.json')
-  const { QuotaManager } = await import('../core/quota-manager.ts')
+  const { QuotaManager } = await import('@cortexkit/openai-auth-core/internal')
   const T2 = 1_700_000_000_000 // newer — A's snapshot
   const T1 = T2 - 5_000 // older — B's snapshot
 
-  const qmA = new QuotaManager({ storage: null })
+  const qmA = new QuotaManager({
+    configPath: getAccountStoragePath(),
+    storage: null,
+  })
   // Cast to bypass the required-checkedAt type so A's windows reach the
   // file without per-window stamps — the same shape an old writer would
   // produce.
@@ -3452,7 +3458,10 @@ test("machine write keeps A's newer secondary when a concurrent normal write car
   await setSidebarMachineState(buildSidebarMachineState(qmA, storeA, T2), file)
   await drainSidebarWrites()
 
-  const qmB = new QuotaManager({ storage: null })
+  const qmB = new QuotaManager({
+    configPath: getAccountStoragePath(),
+    storage: null,
+  })
   qmB.setMain(
     'token-b',
     {
@@ -3535,8 +3544,10 @@ test('read-side snapshot fallback keeps pre-fix unstamped windows alive against 
   // setSidebarMachineState), same account identity so per-window merge fires.
   // B carries crossed per-window stamps: primary at T1 (older than A's
   // snapshot), secondary at T3 (newer).
-  const { QuotaManager: QM } = await import('../core/quota-manager.ts')
-  const qmB = new QM({ storage: null })
+  const { QuotaManager: QM } = await import(
+    '@cortexkit/openai-auth-core/internal'
+  )
+  const qmB = new QM({ storage: null, configPath: getAccountStoragePath() })
   qmB.setMain(
     'token-b',
     {
@@ -3620,8 +3631,10 @@ test('write-side stamping prevents snapshot-max freshness inflation in multi-gen
   )
 
   // Merge #2: incoming at T2_5, both windows stamped.
-  const { QuotaManager: QM } = await import('../core/quota-manager.ts')
-  const qm = new QM({ storage: null })
+  const { QuotaManager: QM } = await import(
+    '@cortexkit/openai-auth-core/internal'
+  )
+  const qm = new QM({ storage: null, configPath: getAccountStoragePath() })
   qm.setMain(
     'token',
     {
@@ -3677,7 +3690,7 @@ test('write-side stamping prevents snapshot-max freshness inflation in multi-gen
     'utf8',
   )
 
-  const qm2 = new QM({ storage: null })
+  const qm2 = new QM({ storage: null, configPath: getAccountStoragePath() })
   qm2.setMain(
     'token2',
     {

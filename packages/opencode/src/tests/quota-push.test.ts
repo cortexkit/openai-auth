@@ -1,20 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import type {
-  AccountStorage,
-  OAuthAccount,
-  OAuthQuotaSnapshot,
-} from '../core/accounts.ts'
-import type { QuotaManager } from '../core/quota-manager.ts'
+import {
+  type AccountStorage,
+  isCompleteQuotaHeaderFrame,
+  normalizeQuotaHeaders,
+  type OAuthAccount,
+  type OAuthQuotaSnapshot,
+  type QuotaManager,
+} from '@cortexkit/openai-auth-core/internal'
+import { getAccountStoragePath } from '../core/account-paths'
 import {
   buildSidebarMachineState,
   buildSidebarState,
   mergePushedQuotaMetadata,
 } from '../index.ts'
-import {
-  isCompleteQuotaHeaderFrame,
-  normalizeQuotaHeaders,
-} from '../quota-normalize.ts'
 import type { SidebarState } from '../sidebar-state.ts'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
 
@@ -60,11 +59,14 @@ function goodSnapshot(): OAuthQuotaSnapshot {
 
 describe('QuotaManager push', () => {
   it('setMain push updates getMain without any network', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const token = `access-${randomUUID()}`
     const snapshot = goodSnapshot()
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       fetchQuotaFn: () => {
         throw new Error('must not be called')
@@ -85,12 +87,15 @@ describe('QuotaManager push', () => {
   })
 
   it('peekMainForPolicy survives a token refresh but drops on an account switch', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const oldToken = `access-old-${randomUUID()}`
     const newToken = `access-new-${randomUUID()}`
     const snapshot = goodSnapshot()
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       fetchQuotaFn: () => {
         throw new Error('must not be called')
@@ -136,12 +141,15 @@ describe('QuotaManager push', () => {
   })
 
   it('peekFallbackForPolicy survives a token refresh (keyed by stable account id)', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const oldToken = `fb-old-${randomUUID()}`
     const newToken = `fb-new-${randomUUID()}`
     const snapshot = goodSnapshot()
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       fetchQuotaFn: () => {
         throw new Error('must not be called')
@@ -165,10 +173,13 @@ describe('QuotaManager push', () => {
   })
 
   it('peekFallbackForPolicy drops a quota bound to a different identity (re-login on a stable id)', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const snapshot = goodSnapshot()
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       fetchQuotaFn: () => {
         throw new Error('must not be called')
@@ -197,10 +208,13 @@ describe('QuotaManager push', () => {
   })
 
   it('seedFallbacksFromAccounts binds persisted quota to the account identity', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const now = Date.now()
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       fetchQuotaFn: () => {
         throw new Error('must not be called')
@@ -231,11 +245,14 @@ describe('QuotaManager push', () => {
   })
 
   it('conditional push: empty snapshot does NOT overwrite a valid cached one', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const token = `access-${randomUUID()}`
     const snapshot = goodSnapshot()
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       fetchQuotaFn: () => {
         throw new Error('must not be called')
@@ -261,9 +278,14 @@ describe('QuotaManager push', () => {
   })
 
   it('malformed quota headers cannot erase a valid cached snapshot', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const token = `access-${randomUUID()}`
-    const qm = new QuotaManager({ storage: null })
+    const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
+      storage: null,
+    })
     qm.setMain(token, {
       quota: goodSnapshot(),
       refreshAfter: Date.now() + 60_000,
@@ -288,11 +310,14 @@ describe('QuotaManager push', () => {
   })
 
   it('conditional push: reset-credit metadata alone does NOT count as a window and must not overwrite a valid cached snapshot', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const token = `access-${randomUUID()}`
     const snapshot = goodSnapshot()
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       fetchQuotaFn: () => {
         throw new Error('must not be called')
@@ -319,11 +344,14 @@ describe('QuotaManager push', () => {
   })
 
   it('conditional push: an explicit zero-window quota IS a real window and overwrites the cache', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const token = `access-${randomUUID()}`
     const snapshot = goodSnapshot()
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       fetchQuotaFn: () => {
         throw new Error('must not be called')
@@ -348,12 +376,15 @@ describe('QuotaManager push', () => {
   })
 
   it('setFallback push updates getFallback without any network', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const accountId = randomUUID()
     const token = `access-${randomUUID()}`
     const snapshot = goodSnapshot()
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       fetchQuotaFn: () => {
         throw new Error('must not be called')
@@ -377,12 +408,15 @@ describe('QuotaManager push', () => {
   })
 
   it('conditional push: empty fallback snapshot does NOT overwrite a valid cached one', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const accountId = randomUUID()
     const token = `access-${randomUUID()}`
     const snapshot = goodSnapshot()
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       fetchQuotaFn: () => {
         throw new Error('must not be called')
@@ -474,8 +508,12 @@ describe('QuotaManager push', () => {
   })
 
   it('round-trips resetCreditsApplicable from wham normalization through the main quota cache', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
-    const { normalizeWham } = await import('../quota-normalize.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
+    const { normalizeWham } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const snapshot = normalizeWham({
       rate_limit: {
         primary_window: {
@@ -491,7 +529,10 @@ describe('QuotaManager push', () => {
       },
     } as Parameters<typeof normalizeWham>[0])
 
-    const qm: QuotaManager = new QuotaManager({ storage: null })
+    const qm: QuotaManager = new QuotaManager({
+      configPath: getAccountStoragePath(),
+      storage: null,
+    })
     qm.setMain('main-token', { quota: snapshot, refreshAfter: 2, checkedAt: 1 })
 
     const cached = qm.peekMainForPolicy()?.quota
@@ -500,8 +541,13 @@ describe('QuotaManager push', () => {
   })
 
   it('publishes each account reset-credit count independently of the active account', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
-    const qm: QuotaManager = new QuotaManager({ storage: null })
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
+    const qm: QuotaManager = new QuotaManager({
+      configPath: getAccountStoragePath(),
+      storage: null,
+    })
     qm.setMain('main-token', {
       quota: {
         primary: {

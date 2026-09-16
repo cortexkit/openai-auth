@@ -1,4 +1,4 @@
-import { isRecord } from './util/record'
+import { isRecord } from '@cortexkit/openai-auth-core/internal'
 
 // Codex marks Responses Lite per transport. WebSocket requests carry a
 // request-scoped client_metadata key; HTTP requests carry a header instead.

@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { getAccountPaths, getAccountStoragePath } from '../core/account-paths'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
 
 // ---------------------------------------------------------------------------
@@ -57,7 +58,7 @@ describe('#1 refresh-file-lock: stale-lock steal guard', () => {
   it('a fresh lock (different ownerId) written between reads causes the steal to abort', async () => {
     const { writeFile } = await import('node:fs/promises')
     const { acquireRefreshFileLock } = await import(
-      '../core/refresh-file-lock.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     const lockPath = join(dir, 'openai-auth.json')
@@ -102,7 +103,7 @@ describe('#1 refresh-file-lock: stale-lock steal guard', () => {
   it('a stale lock with the same ownerId on re-read is correctly stolen', async () => {
     const { writeFile } = await import('node:fs/promises')
     const { acquireRefreshFileLock } = await import(
-      '../core/refresh-file-lock.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     const lockPath = join(dir, 'openai-auth.json')
@@ -133,10 +134,13 @@ describe('#1 refresh-file-lock: stale-lock steal guard', () => {
 
 describe('#3 QuotaManager.refreshMain: token-keyed deduplication', () => {
   it('two concurrent calls with DIFFERENT tokens each trigger their own fetch', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     let fetchCount = 0
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       fetchQuotaFn: async ({ accessToken }) => {
         fetchCount++
@@ -166,10 +170,13 @@ describe('#3 QuotaManager.refreshMain: token-keyed deduplication', () => {
   })
 
   it('two concurrent calls with the SAME token share one in-flight fetch', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     let fetchCount = 0
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       fetchQuotaFn: async () => {
         fetchCount++
@@ -203,7 +210,7 @@ describe('#3 QuotaManager.refreshMain: token-keyed deduplication', () => {
 describe('#5 saveAccountState: concurrent writes are serialized', () => {
   it('concurrent saveAccountState calls complete without throwing (lock serializes them)', async () => {
     const { saveAccounts, saveAccountState, loadAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     const acct1 = {
@@ -222,31 +229,34 @@ describe('#5 saveAccountState: concurrent writes are serialized', () => {
     }
 
     // Establish baseline
-    await saveAccounts({ version: 1, accounts: [acct1, acct2] }, cfgPath)
+    await saveAccounts(
+      { version: 1, accounts: [acct1, acct2] },
+      getAccountPaths(cfgPath),
+    )
 
     // Three concurrent state saves with the same storage — all should complete
     // without error (the lock serializes them so none corrupts the file).
     const storage = { version: 1 as const, accounts: [acct1, acct2] }
     await expect(
       Promise.all([
-        saveAccountState(storage, cfgPath),
-        saveAccountState(storage, cfgPath),
-        saveAccountState(storage, cfgPath),
+        saveAccountState(storage, getAccountPaths(cfgPath)),
+        saveAccountState(storage, getAccountPaths(cfgPath)),
+        saveAccountState(storage, getAccountPaths(cfgPath)),
       ]),
     ).resolves.toBeDefined()
 
     // File must be valid JSON after concurrent writes
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded).not.toBeNull()
     expect(loaded!.accounts.length).toBe(2)
   })
 
   it('saveAccountState with a held lock waits rather than corrupting the file', async () => {
     const { acquireRefreshFileLock } = await import(
-      '../core/refresh-file-lock.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     const { saveAccounts, saveAccountState, loadAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     const acct = {
@@ -256,7 +266,10 @@ describe('#5 saveAccountState: concurrent writes are serialized', () => {
       refresh: 'ref-1',
       expires: Date.now() + 3_600_000,
     }
-    await saveAccounts({ version: 1, accounts: [acct] }, cfgPath)
+    await saveAccounts(
+      { version: 1, accounts: [acct] },
+      getAccountPaths(cfgPath),
+    )
 
     // Hold the state-save lock so saveAccountState must wait
     const lock = await acquireRefreshFileLock({
@@ -269,7 +282,7 @@ describe('#5 saveAccountState: concurrent writes are serialized', () => {
     let settled = false
     const savePromise = saveAccountState(
       { version: 1, accounts: [{ ...acct, access: 'acc-v2' }] },
-      cfgPath,
+      getAccountPaths(cfgPath),
     ).finally(() => {
       settled = true
     })
@@ -282,7 +295,7 @@ describe('#5 saveAccountState: concurrent writes are serialized', () => {
     await lock!.release()
     await savePromise
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     const la = loaded!.accounts.find((a) => a.id === 'acct-lock') as {
       access?: string
     }
@@ -296,24 +309,28 @@ describe('#5 saveAccountState: concurrent writes are serialized', () => {
 
 describe('#6 readJsonIfPresent error handling', () => {
   it('ENOENT → saveAccountState treats file as absent (no throw)', async () => {
-    const { saveAccountState } = await import('../core/accounts.ts')
+    const { saveAccountState } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     // statePath does not exist yet — should not throw
     expect(existsSync(statePath)).toBe(false)
     await expect(
-      saveAccountState({ version: 1, accounts: [] }, cfgPath),
+      saveAccountState({ version: 1, accounts: [] }, getAccountPaths(cfgPath)),
     ).resolves.toBeUndefined()
     expect(existsSync(statePath)).toBe(true)
   })
 
   it('corrupt JSON in state file → saveAccountState throws instead of silently overwriting', async () => {
-    const { saveAccountState } = await import('../core/accounts.ts')
+    const { saveAccountState } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     // Write a corrupt state file
     writeFileSync(statePath, 'NOT VALID JSON', { mode: 0o600 })
 
     await expect(
-      saveAccountState({ version: 1, accounts: [] }, cfgPath),
+      saveAccountState({ version: 1, accounts: [] }, getAccountPaths(cfgPath)),
     ).rejects.toThrow()
 
     // The corrupt file must NOT have been silently overwritten
@@ -364,7 +381,7 @@ describe('MUST 1 — refresh-file-lock: atomic steal elects a single owner', () 
   it('two concurrent steals of the same stale lock elect exactly one owner', async () => {
     const { writeFile } = await import('node:fs/promises')
     const { acquireRefreshFileLock } = await import(
-      '../core/refresh-file-lock.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     const lockPath = join(dir, 'openai-auth.json')
@@ -508,7 +525,7 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
     // renames the FRESH eviction-marker directory that contender A (the mkdir-winner)
     // created. The four ownsEvictionMarker() fence checks must detect the theft.
     const { acquireRefreshFileLock } = await import(
-      '../core/refresh-file-lock.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     const lockPath = join(dir, 'openai-auth.json')
@@ -586,7 +603,7 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
     // dependent errno: ENOENT on Linux, EINVAL/ENOTDIR on macOS/APFS. All three
     // must be treated as a lost race so the acquire retries instead of throwing.
     const { isLostMarkerRaceError } = await import(
-      '../core/refresh-file-lock.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     for (const code of ['ENOENT', 'EINVAL', 'ENOTDIR']) {
@@ -608,7 +625,7 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
     // making the full suite depend on tens of thousands of real fs races.
     // Every round must still elect exactly one winner with zero marker leaks.
     const { acquireRefreshFileLock } = await import(
-      '../core/refresh-file-lock.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     const lockPath = join(dir, 'openai-auth.json')
@@ -655,7 +672,7 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
 describe('MUST 2 (R2) — saveAccounts: state-lock held across state-file read', () => {
   it('interleaved saveAccounts + saveAccountState: saveAccountState update is not lost', async () => {
     const { saveAccounts, saveAccountState, loadAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     const acct = {
@@ -666,7 +683,10 @@ describe('MUST 2 (R2) — saveAccounts: state-lock held across state-file read',
       expires: Date.now() + 3_600_000,
     }
 
-    await saveAccounts({ version: 1, accounts: [acct] }, cfgPath)
+    await saveAccounts(
+      { version: 1, accounts: [acct] },
+      getAccountPaths(cfgPath),
+    )
 
     // Run many interleaved pairs; if the state-lock is not held across the
     // read, at least one saveAccountState update will be lost.
@@ -677,11 +697,11 @@ describe('MUST 2 (R2) — saveAccounts: state-lock held across state-file read',
       tasks.push(
         saveAccounts(
           { version: 1, accounts: [{ ...acct, access: `acc-v${v}` }] },
-          cfgPath,
+          getAccountPaths(cfgPath),
         ),
         saveAccountState(
           { version: 1, accounts: [{ ...acct, access: `acc-v${v}` }] },
-          cfgPath,
+          getAccountPaths(cfgPath),
         ),
       )
     }
@@ -689,16 +709,18 @@ describe('MUST 2 (R2) — saveAccounts: state-lock held across state-file read',
     await expect(Promise.all(tasks)).resolves.toBeDefined()
 
     // State file must be valid JSON after all concurrent writes.
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded).not.toBeNull()
     expect(loaded!.accounts.length).toBe(1)
   })
 
   it('externally-held state-lock blocks saveAccounts before it reads the state file', async () => {
     const { acquireRefreshFileLock } = await import(
-      '../core/refresh-file-lock.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
-    const { saveAccounts, loadAccounts } = await import('../core/accounts.ts')
+    const { saveAccounts, loadAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     const acct = {
       id: 'acct-must2r2b',
@@ -708,7 +730,10 @@ describe('MUST 2 (R2) — saveAccounts: state-lock held across state-file read',
       expires: Date.now() + 3_600_000,
     }
 
-    await saveAccounts({ version: 1, accounts: [acct] }, cfgPath)
+    await saveAccounts(
+      { version: 1, accounts: [acct] },
+      getAccountPaths(cfgPath),
+    )
 
     // Hold the state lock externally — saveAccounts must block before reading
     // the state file (not just before writing it).
@@ -722,7 +747,7 @@ describe('MUST 2 (R2) — saveAccounts: state-lock held across state-file read',
     let settled = false
     const savePromise = saveAccounts(
       { version: 1, accounts: [{ ...acct, access: 'acc-v2' }] },
-      cfgPath,
+      getAccountPaths(cfgPath),
     ).finally(() => {
       settled = true
     })
@@ -735,7 +760,7 @@ describe('MUST 2 (R2) — saveAccounts: state-lock held across state-file read',
     await stateLock!.release()
     await savePromise
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded).not.toBeNull()
     expect(loaded!.accounts.find((a) => a.id === acct.id)).toBeDefined()
   })
@@ -748,10 +773,10 @@ describe('MUST 2 (R2) — saveAccounts: state-lock held across state-file read',
 describe('MUST 2 (R2) — saveAccountState: reads state file after acquiring lock', () => {
   it('externally-held state-lock blocks saveAccountState before it reads', async () => {
     const { acquireRefreshFileLock } = await import(
-      '../core/refresh-file-lock.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     const { saveAccounts, saveAccountState, loadAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     const acct = {
@@ -762,7 +787,10 @@ describe('MUST 2 (R2) — saveAccountState: reads state file after acquiring loc
       expires: Date.now() + 3_600_000,
     }
 
-    await saveAccounts({ version: 1, accounts: [acct] }, cfgPath)
+    await saveAccounts(
+      { version: 1, accounts: [acct] },
+      getAccountPaths(cfgPath),
+    )
 
     // Hold the state lock — saveAccountState must block before reading.
     const stateLock = await acquireRefreshFileLock({
@@ -775,7 +803,7 @@ describe('MUST 2 (R2) — saveAccountState: reads state file after acquiring loc
     let settled = false
     const savePromise = saveAccountState(
       { version: 1, accounts: [{ ...acct, access: 'acc-v2' }] },
-      cfgPath,
+      getAccountPaths(cfgPath),
     ).finally(() => {
       settled = true
     })
@@ -786,7 +814,7 @@ describe('MUST 2 (R2) — saveAccountState: reads state file after acquiring loc
     await stateLock!.release()
     await savePromise
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     const la = loaded!.accounts.find((a) => a.id === acct.id) as {
       access?: string
     }
@@ -805,11 +833,14 @@ describe('MUST 2 — QuotaManager._fetchMain: token-scoped inflight clear', () =
     // after fetch-A completes, its finally must NOT clear fetch-B's inflight
     // slot — so a same-token-B caller that arrives AFTER fetch-A's finally
     // still dedups with the in-flight fetch-B (fetchCount stays at 2, not 3).
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     let fetchCount = 0
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       fetchQuotaFn: async ({ accessToken }) => {
         fetchCount++
@@ -853,11 +884,14 @@ describe('MUST 2 — QuotaManager._fetchMain: token-scoped inflight clear', () =
     // unconditionally null inflightMain/Fp. With the fix, it only clears if
     // inflightMainFp === thisFetchFp. Verify by checking that after fetch-A
     // completes, a new token-B call still dedups with the queued fetch-B.
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     let fetchCount = 0
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       fetchQuotaFn: async ({ accessToken }) => {
         fetchCount++
@@ -988,7 +1022,7 @@ describe('MUST 3 — ws-pool: account-scoped pool key', () => {
 describe('MUST 4 — saveAccounts: state-file write is protected by state-path lock', () => {
   it('concurrent saveAccounts + saveAccountState do not lose the state-file update', async () => {
     const { saveAccounts, saveAccountState, loadAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     const acct = {
@@ -1000,7 +1034,10 @@ describe('MUST 4 — saveAccounts: state-file write is protected by state-path l
     }
 
     // Establish baseline
-    await saveAccounts({ version: 1, accounts: [acct] }, cfgPath)
+    await saveAccounts(
+      { version: 1, accounts: [acct] },
+      getAccountPaths(cfgPath),
+    )
 
     // Run saveAccounts and saveAccountState concurrently many times.
     // If the state-file lock is not held by saveAccounts, one of these
@@ -1010,8 +1047,14 @@ describe('MUST 4 — saveAccounts: state-file write is protected by state-path l
     for (let i = 0; i < iterations; i++) {
       const updatedAcct = { ...acct, access: `acc-v${i + 2}` }
       tasks.push(
-        saveAccounts({ version: 1, accounts: [updatedAcct] }, cfgPath),
-        saveAccountState({ version: 1, accounts: [updatedAcct] }, cfgPath),
+        saveAccounts(
+          { version: 1, accounts: [updatedAcct] },
+          getAccountPaths(cfgPath),
+        ),
+        saveAccountState(
+          { version: 1, accounts: [updatedAcct] },
+          getAccountPaths(cfgPath),
+        ),
       )
     }
 
@@ -1019,7 +1062,7 @@ describe('MUST 4 — saveAccounts: state-file write is protected by state-path l
     await expect(Promise.all(tasks)).resolves.toBeDefined()
 
     // The state file must be valid JSON after all concurrent writes
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded).not.toBeNull()
     expect(loaded!.accounts.length).toBe(1)
   })
@@ -1029,9 +1072,11 @@ describe('MUST 4 — saveAccounts: state-file write is protected by state-path l
     // We hold the state lock externally and verify that saveAccounts eventually
     // completes (it must acquire the state lock after the config lock).
     const { acquireRefreshFileLock } = await import(
-      '../core/refresh-file-lock.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
-    const { saveAccounts, loadAccounts } = await import('../core/accounts.ts')
+    const { saveAccounts, loadAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     const acct = {
       id: 'acct-must4b',
@@ -1041,7 +1086,10 @@ describe('MUST 4 — saveAccounts: state-file write is protected by state-path l
       expires: Date.now() + 3_600_000,
     }
 
-    await saveAccounts({ version: 1, accounts: [acct] }, cfgPath)
+    await saveAccounts(
+      { version: 1, accounts: [acct] },
+      getAccountPaths(cfgPath),
+    )
 
     // Hold the state lock
     const stateLock = await acquireRefreshFileLock({
@@ -1054,7 +1102,7 @@ describe('MUST 4 — saveAccounts: state-file write is protected by state-path l
     let settled = false
     const savePromise = saveAccounts(
       { version: 1, accounts: [{ ...acct, access: 'acc-v2' }] },
-      cfgPath,
+      getAccountPaths(cfgPath),
     ).finally(() => {
       settled = true
     })
@@ -1067,7 +1115,7 @@ describe('MUST 4 — saveAccounts: state-file write is protected by state-path l
     await stateLock!.release()
     await savePromise
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded).not.toBeNull()
   })
 })
@@ -1096,7 +1144,9 @@ describe('saveAccounts: honors OPENCODE_OPENAI_AUTH_STATE_FILE override', () => 
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = overrideStatePath
 
     try {
-      const { saveAccounts } = await import('../core/accounts.ts')
+      const { saveAccounts } = await import(
+        '@cortexkit/openai-auth-core/internal'
+      )
 
       const acct = {
         id: 'acct-override',
@@ -1106,7 +1156,10 @@ describe('saveAccounts: honors OPENCODE_OPENAI_AUTH_STATE_FILE override', () => 
         expires: Date.now() + 3_600_000,
       }
 
-      await saveAccounts({ version: 1, accounts: [acct] }, overrideCfgPath)
+      await saveAccounts(
+        { version: 1, accounts: [acct] },
+        getAccountPaths(overrideCfgPath),
+      )
 
       // State must be written to the override path.
       expect(existsSync(overrideStatePath)).toBe(true)
@@ -1151,7 +1204,7 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
     // quota loop left lastRefreshError undefined. GREEN: with isRefreshError===true
     // the refresh backoff is armed regardless of status.
     const { FallbackAccountManager, saveAccounts, loadAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     // Account with an expired token so tokenNeedsRefresh returns true.
@@ -1164,7 +1217,10 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
       enabled: true,
     }
 
-    await saveAccounts({ version: 1 as const, accounts: [account] }, cfgPath)
+    await saveAccounts(
+      { version: 1 as const, accounts: [account] },
+      getAccountPaths(cfgPath),
+    )
 
     // refreshFn throws a non-401 error tagged as a refresh error (as codexRefreshFn does).
     const refreshError = Object.assign(new Error('Token refresh failed: 500'), {
@@ -1173,7 +1229,7 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
     })
 
     const manager = new FallbackAccountManager({
-      configPath: cfgPath,
+      paths: getAccountPaths(cfgPath),
       refreshFn: async () => {
         throw refreshError
       },
@@ -1190,7 +1246,7 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
     await manager.refreshQuotaForAllAccounts({ force: true })
 
     // Reload from disk — the manager persists the updated account after the catch.
-    const reloaded = await loadAccounts(cfgPath)
+    const reloaded = await loadAccounts(getAccountPaths(cfgPath))
     const stored = reloaded?.accounts.find((a) => a.id === account.id) as
       | { lastRefreshError?: unknown }
       | undefined
@@ -1205,7 +1261,7 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
     // the 401 implies is needed. Only the quota backoff (lastQuotaRefreshError)
     // must be armed, correctly throttling the quota endpoint.
     const { FallbackAccountManager, saveAccounts, loadAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     // Token is valid — no refresh needed. The 401 comes from the quota endpoint.
@@ -1218,11 +1274,14 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
       enabled: true,
     }
 
-    await saveAccounts({ version: 1 as const, accounts: [account] }, cfgPath)
+    await saveAccounts(
+      { version: 1 as const, accounts: [account] },
+      getAccountPaths(cfgPath),
+    )
 
     // fetchQuotaFn throws a 401 with no isRefreshError (exactly as whamUsageFn does).
     const manager = new FallbackAccountManager({
-      configPath: cfgPath,
+      paths: getAccountPaths(cfgPath),
       fetchQuotaFn: async () => {
         throw Object.assign(new Error('wham usage check failed: 401'), {
           status: 401,
@@ -1233,7 +1292,7 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
 
     await manager.refreshQuotaForAllAccounts({ force: true })
 
-    const reloaded = await loadAccounts(cfgPath)
+    const reloaded = await loadAccounts(getAccountPaths(cfgPath))
     const stored = reloaded?.accounts.find((a) => a.id === account.id) as
       | { lastRefreshError?: unknown; lastQuotaRefreshError?: unknown }
       | undefined
@@ -1248,7 +1307,7 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
     // A 429 from the quota endpoint (not a refresh error) must only arm quota
     // backoff, not refresh backoff. This is the correct boundary.
     const { FallbackAccountManager, saveAccounts, loadAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     const account = {
@@ -1260,11 +1319,14 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
       enabled: true,
     }
 
-    await saveAccounts({ version: 1 as const, accounts: [account] }, cfgPath)
+    await saveAccounts(
+      { version: 1 as const, accounts: [account] },
+      getAccountPaths(cfgPath),
+    )
 
     // fetchQuotaFn throws a non-401 quota error (no isRefreshError).
     const manager = new FallbackAccountManager({
-      configPath: cfgPath,
+      paths: getAccountPaths(cfgPath),
       fetchQuotaFn: async () => {
         throw Object.assign(new Error('wham usage check failed: 429'), {
           status: 429,
@@ -1275,7 +1337,7 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
 
     await manager.refreshQuotaForAllAccounts({ force: true })
 
-    const reloaded = await loadAccounts(cfgPath)
+    const reloaded = await loadAccounts(getAccountPaths(cfgPath))
     const stored = reloaded?.accounts.find((a) => a.id === account.id) as
       | { lastRefreshError?: unknown; lastQuotaRefreshError?: unknown }
       | undefined
@@ -1293,7 +1355,9 @@ describe('REFRESH-BACKOFF — recordQuotaRefreshError arms refresh backoff only 
 
 describe('#12 NaN used_percent → no quota window', () => {
   it('normalizeWsFrame: NaN primary used_percent → no primary window in snapshot', async () => {
-    const { normalizeWsFrame } = await import('../quota-normalize.ts')
+    const { normalizeWsFrame } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     const snap = normalizeWsFrame({
       type: 'codex.rate_limits',
@@ -1311,7 +1375,9 @@ describe('#12 NaN used_percent → no quota window', () => {
   })
 
   it('normalizeWsFrame: real object-shaped additional_rate_limits is ignored, not crashed', async () => {
-    const { normalizeWsFrame } = await import('../quota-normalize.ts')
+    const { normalizeWsFrame } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     // The real wire frame keys additional_rate_limits by model name with nested
     // primary/secondary buckets — not a flat metered array. It is not consumed,
@@ -1333,7 +1399,9 @@ describe('#12 NaN used_percent → no quota window', () => {
   })
 
   it('normalizeWham: NaN primary used_percent → no primary window in snapshot', async () => {
-    const { normalizeWham } = await import('../quota-normalize.ts')
+    const { normalizeWham } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     const snap = normalizeWham({
       rate_limit: {
@@ -1353,7 +1421,9 @@ describe('#12 NaN used_percent → no quota window', () => {
   })
 
   it('normalizeWham: object-shaped additional_rate_limits is ignored, not crashed', async () => {
-    const { normalizeWham } = await import('../quota-normalize.ts')
+    const { normalizeWham } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     const snap = normalizeWham({
       rate_limit: {
@@ -1371,7 +1441,9 @@ describe('#12 NaN used_percent → no quota window', () => {
   })
 
   it('Infinity used_percent → no window (also non-finite)', async () => {
-    const { normalizeWsFrame } = await import('../quota-normalize.ts')
+    const { normalizeWsFrame } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     const snap = normalizeWsFrame({
       type: 'codex.rate_limits',

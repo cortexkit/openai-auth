@@ -1,16 +1,18 @@
 // Low-level OpenAI Responses WebSocket protocol helpers. Session pooling,
 // fallback, and continuation state intentionally live above this file.
 
+import {
+  errorMessage,
+  isRecord,
+  normalizeWsFrame,
+} from '@cortexkit/openai-auth-core/internal'
 import { APICallError } from 'ai'
 import { DUMP_SESSION_HEADER, dumpDiagnostic } from './dump'
 import { translateHostedWebSearchEvent } from './hosted-web-search'
 import { createLogger } from './logger'
-import { normalizeWsFrame } from './quota-normalize'
 import { RawWebSocket } from './raw-ws'
 import { ResponseStreamError } from './response-stream-error'
-import { errorMessage } from './util/error'
 import { ProxyEnv } from './util/proxy-env'
-import { isRecord } from './util/record'
 
 const logQ = createLogger('quota')
 // Transport lifecycle. Separate from the request dumper on purpose: a stream

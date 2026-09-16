@@ -5,7 +5,7 @@ import {
   normalizeWham,
   normalizeWsFrame,
   toResetIso,
-} from '../quota-normalize.ts'
+} from '@cortexkit/openai-auth-core/internal'
 import { formatResetIn } from '../tui.tsx'
 
 describe('quota normalize → QuotaSnapshot', () => {

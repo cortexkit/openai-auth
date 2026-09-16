@@ -1,0 +1,30 @@
+# Test-count baseline for the core extraction.
+# Measured at base commit 7f7b5891bcbef5b3a2ec1b48ea2e6c8b57db854e on a clean tree,
+# before any extraction edit, after `bun install` completed successfully at the
+# workspace root (the pre-existing checkout could not resolve `jsonc-parser`).
+
+== packages/opencode: bun test src/tests
+1137 pass
+1 fail
+4388 expect() calls
+Ran 1138 tests across 45 files.
+
+failing test (pre-existing at this commit, reproduced on a second isolated run of
+src/tests/refresh-file-lock.test.ts alone):
+  acquireRefreshFileLock > elects one owner across 512 plain stale-lock contentions
+  ^ timed out after 5000ms
+
+== packages/pi: bun test src/tests
+3 pass
+0 fail
+11 expect() calls
+Ran 3 tests across 1 file.
+
+== totals
+1140 pass
+1 fail
+1141 tests
+
+== typecheck
+packages/opencode: tsc -> exit 0
+packages/pi:       tsc -> exit 0

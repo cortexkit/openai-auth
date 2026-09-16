@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { getAccountPaths } from '../core/account-paths'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
 
 let dir: string
@@ -35,7 +36,7 @@ describe('migration', () => {
     )
 
     const { migrateIfNeeded, loadAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     const existingToken = {
@@ -45,7 +46,7 @@ describe('migration', () => {
       expires: Date.now() + 3600_000,
     }
 
-    await migrateIfNeeded(existingToken, cfgPath)
+    await migrateIfNeeded(existingToken, getAccountPaths(cfgPath))
 
     const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
     // Transport keys preserved (FE-5)
@@ -55,7 +56,7 @@ describe('migration', () => {
     expect(cfg.version).toBe(1)
     expect(Array.isArray(cfg.accounts)).toBe(true)
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded).not.toBeNull()
     // FIX 1: main.type==='opencode' means the active token lives in
     // opencode's single-slot store (read via getAuth). accounts[] is
@@ -70,7 +71,7 @@ describe('migration', () => {
     writeFileSync(cfgPath, JSON.stringify({ webSockets: true, dump: false }))
 
     const { migrateIfNeeded, loadAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     const existingToken = {
@@ -81,14 +82,14 @@ describe('migration', () => {
     }
 
     // First migration
-    await migrateIfNeeded(existingToken, cfgPath)
-    const loaded1 = await loadAccounts(cfgPath)
+    await migrateIfNeeded(existingToken, getAccountPaths(cfgPath))
+    const loaded1 = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded1!.main?.type).toBe('opencode')
     expect(loaded1!.accounts.length).toBe(0)
 
     // Second migration — must be a no-op
-    await migrateIfNeeded(existingToken, cfgPath)
-    const loaded2 = await loadAccounts(cfgPath)
+    await migrateIfNeeded(existingToken, getAccountPaths(cfgPath))
+    const loaded2 = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded2!.main?.type).toBe('opencode')
     expect(loaded2!.accounts.length).toBe(0)
   })
@@ -97,7 +98,7 @@ describe('migration', () => {
     writeFileSync(cfgPath, JSON.stringify({ dump: true }))
 
     const { migrateIfNeeded, loadAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     const expiredToken = {
@@ -107,8 +108,8 @@ describe('migration', () => {
       expires: Date.now() - 3600_000, // expired 1 hour ago
     }
 
-    await migrateIfNeeded(expiredToken, cfgPath)
-    const loaded = await loadAccounts(cfgPath)
+    await migrateIfNeeded(expiredToken, getAccountPaths(cfgPath))
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded!.main?.type).toBe('opencode')
     expect(loaded!.accounts.length).toBe(0)
   })
@@ -117,11 +118,11 @@ describe('migration', () => {
     writeFileSync(cfgPath, JSON.stringify({ webSockets: true }))
 
     const { migrateIfNeeded, loadAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
-    await migrateIfNeeded(undefined, cfgPath)
-    const loaded = await loadAccounts(cfgPath)
+    await migrateIfNeeded(undefined, getAccountPaths(cfgPath))
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded).toBeNull() // still a settings-only file
   })
 })

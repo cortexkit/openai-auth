@@ -17,33 +17,36 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+// Snapshot the REAL oauth module exports at load time (before any mock.module
+// runs). bun's mock.module leaks process-wide and mock.restore() does NOT undo
+// it, so without restoring here the beginAccountLogin stub below would poison
+// every later test file that imports the core oauth module. We spread into a PLAIN object
+// so the snapshot holds the original function references even after the live
+// namespace is later replaced; afterAll re-installs it.
+import * as oauthLiveNamespace from '../../../core/src/oauth.ts'
 import type { CommandContext } from '../commands'
 // Static import for tests that don't need mocking.
 import { buildDialogPayload, renderResetCoordinatorResult } from '../commands'
 import { getSettings } from '../config'
-// Snapshot the REAL oauth module exports at load time (before any mock.module
-// runs). bun's mock.module leaks process-wide and mock.restore() does NOT undo
-// it, so without restoring here the beginAccountLogin stub below would poison
-// every later test file that imports ../core/oauth. We spread into a PLAIN object
-// so the snapshot holds the original function references even after the live
-// namespace is later replaced; afterAll re-installs it.
-import * as oauthLiveNamespace from '../core/oauth'
 
 const oauthRealExports = { ...oauthLiveNamespace }
 
-import type {
-  AccountQuotaWindow,
-  AccountStorage,
-  OAuthQuotaSnapshot,
-} from '../core/accounts'
 import {
+  type AccountQuotaWindow,
+  type AccountStorage,
   loadAccounts,
   mutateAccounts,
   type OAuthAccount,
+  type OAuthQuotaSnapshot,
+  QuotaManager,
+  runResetCreditRedemption,
   saveAccounts,
-} from '../core/accounts'
-import { QuotaManager } from '../core/quota-manager'
-import { runResetCreditRedemption } from '../core/reset-credits'
+} from '@cortexkit/openai-auth-core/internal'
+import {
+  getAccountPaths,
+  getAccountStatePath,
+  getAccountStoragePath,
+} from '../core/account-paths'
 import { buildResetRedemptionDeps, createResetTargetResolver } from '../index'
 import { createLogger, flushForTest, setLogLevel } from '../logger'
 import { resetNotificationsForTest } from '../rpc/notifications'
@@ -51,6 +54,7 @@ import {
   clearSidebarStickyAssignment,
   hashSidebarSessionId,
 } from '../sidebar-state'
+import { PackageVersion } from '../version'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
 
 // The account-add completion runs detached from buildDialogPayload and performs
@@ -232,7 +236,11 @@ async function makeResetCommandHarness(
   fixture: ResetWireFixture,
 ) {
   const quotaManager = new QuotaManager({
-    storage: (await loadAccounts(configPath)) ?? { version: 1, accounts: [] },
+    configPath: getAccountStoragePath(),
+    storage: (await loadAccounts(getAccountPaths(configPath))) ?? {
+      version: 1,
+      accounts: [],
+    },
     now: () => now,
   })
   const resolveResetTarget = createResetTargetResolver({
@@ -250,10 +258,13 @@ async function makeResetCommandHarness(
     refreshFallbackAccount: async (account) => account,
     loadAccounts,
     accountStoragePath: configPath,
+    accountStatePath: getAccountStatePath(configPath),
     now: () => now,
   })
   const ctx: CommandContext = {
+    packageVersion: PackageVersion,
     accountStoragePath: configPath,
+    accountStatePath: getAccountStatePath(configPath),
     quotaManager,
     loadAccounts,
     client: makeClient(),
@@ -264,7 +275,7 @@ async function makeResetCommandHarness(
     refreshResetTargetQuota: async (accountKey) => {
       fixture.sidebarRefreshes += 1
       fixture.targetRefreshes.push(accountKey)
-      const storage = await loadAccounts(configPath)
+      const storage = await loadAccounts(getAccountPaths(configPath))
       const fallback = storage?.accounts.find(
         (account) => account.id === accountKey && account.type === 'oauth',
       ) as OAuthAccount | undefined
@@ -336,10 +347,13 @@ describe('commands', () => {
   // -----------------------------------------------------------------------
   test('routing command builds dialog payload with mode knob', async () => {
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -353,10 +367,13 @@ describe('commands', () => {
 
   test('routing command apply changes mode', async () => {
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -371,14 +388,19 @@ describe('commands', () => {
     expect(payload.knobs.mode).toBe('fallback-first')
 
     // Verify persisted
-    const storage = await loadAccounts(configPath)
+    const storage = await loadAccounts(getAccountPaths(configPath))
     expect(storage?.routing?.mode).toBe('fallback-first')
   })
 
   test('routing command persists and reports sticky-balanced', async () => {
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
     }
@@ -391,9 +413,9 @@ describe('commands', () => {
 
     expect(payload.knobs.mode).toBe('sticky-balanced')
     expect(payload.text).toContain('sticky-balanced')
-    expect((await loadAccounts(configPath))?.routing?.mode).toBe(
-      'sticky-balanced',
-    )
+    expect(
+      (await loadAccounts(getAccountPaths(configPath)))?.routing?.mode,
+    ).toBe('sticky-balanced')
   })
 
   test('account command lists sticky-balanced routing and session reset', async () => {
@@ -403,11 +425,16 @@ describe('commands', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [makeAccount('fallback-1')],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
     }
@@ -423,8 +450,13 @@ describe('commands', () => {
   test('routing reset clears only the current session pin', async () => {
     const clearStickyRouting = mock(async () => true)
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
       sessionId: 'session-a',
@@ -448,11 +480,16 @@ describe('commands', () => {
         accounts: [],
         routing: { mode: 'sticky-balanced' },
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
       sessionId: 'sticky-status-session',
@@ -473,8 +510,11 @@ describe('commands', () => {
       process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
       setLogLevel('info')
       const ctx: CommandContext = {
+        packageVersion: PackageVersion,
         accountStoragePath: configPath,
+        accountStatePath: getAccountStatePath(configPath),
         quotaManager: new QuotaManager({
+          configPath: getAccountStoragePath(),
           storage: { version: 1, accounts: [] },
         }),
         loadAccounts,
@@ -508,8 +548,13 @@ describe('commands', () => {
   test('routing reset without a current session changes nothing', async () => {
     const clearStickyRouting = mock(async () => true)
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
       clearStickyRouting,
@@ -594,9 +639,10 @@ describe('commands', () => {
         routing: { mode: 'sticky-balanced' },
         killswitch: { enabled: true },
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const quotaManager = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1, accounts: [] },
       now: () => now,
     })
@@ -606,7 +652,9 @@ describe('commands', () => {
     } as unknown as CommandContext['cacheKeepManager']
     const before = JSON.parse(readFileSync(sidebarPath, 'utf8'))
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager,
       loadAccounts,
       client: makeClient(),
@@ -636,7 +684,9 @@ describe('commands', () => {
     expect(afterWithoutPins).toEqual(beforeWithoutPins)
     expect(quotaManager.isRateLimited('main')).toBe(true)
     expect(cacheKeepManager?.status().tracked).toBe(2)
-    expect((await loadAccounts(configPath))?.killswitch).toEqual({
+    expect(
+      (await loadAccounts(getAccountPaths(configPath)))?.killswitch,
+    ).toEqual({
       enabled: true,
     })
   })
@@ -645,8 +695,11 @@ describe('commands', () => {
     'routing command rejects obsolete alias %s',
     async (alias) => {
       const ctx: CommandContext = {
+        packageVersion: PackageVersion,
         accountStoragePath: configPath,
+        accountStatePath: getAccountStatePath(configPath),
         quotaManager: new QuotaManager({
+          configPath: getAccountStoragePath(),
           storage: { version: 1, accounts: [] },
         }),
         loadAccounts,
@@ -657,7 +710,9 @@ describe('commands', () => {
 
       expect(payload.knobs.mode).toBe('main-first')
       expect(payload.text).toContain('sticky-balanced')
-      expect((await loadAccounts(configPath))?.routing?.mode).toBeUndefined()
+      expect(
+        (await loadAccounts(getAccountPaths(configPath)))?.routing?.mode,
+      ).toBeUndefined()
     },
   )
 
@@ -683,12 +738,17 @@ describe('commands', () => {
           },
         ],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
 
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
     }
@@ -775,7 +835,7 @@ describe('commands', () => {
           },
         ],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
 
     // A stale in-memory snapshot the command handler "loaded" before the remove.
@@ -804,8 +864,13 @@ describe('commands', () => {
       ],
     }
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       // Inject the stale snapshot as what the handler reads for display.
       loadAccounts: (async () => staleSnapshot) as typeof loadAccounts,
       client: makeClient(),
@@ -814,7 +879,7 @@ describe('commands', () => {
     await buildDialogPayload('openai-routing', 'fallback-first', ctx)
 
     // Authoritative disk read: `gone` must not have been resurrected.
-    const storage = await loadAccounts(configPath)
+    const storage = await loadAccounts(getAccountPaths(configPath))
     expect(storage?.accounts.map((acc) => acc.id)).toEqual(['a'])
     expect(storage?.routing?.mode).toBe('fallback-first')
     const stateRaw = readFileSync(statePath, 'utf8')
@@ -830,11 +895,16 @@ describe('commands', () => {
         accounts: [],
         cachekeep: { enabled: true },
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
       cacheKeepManager: {
@@ -873,14 +943,19 @@ describe('commands', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const start = mock(() => {})
     const stop = mock(() => {})
     const setCacheKeepEnabled = mock(() => {})
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
       setCacheKeepEnabled,
@@ -903,13 +978,17 @@ describe('commands', () => {
 
     const on = await buildDialogPayload('openai-cachekeep', 'on', ctx)
     expect(on.knobs.enabled).toBe(true)
-    expect((await loadAccounts(configPath))?.cachekeep?.enabled).toBe(true)
+    expect(
+      (await loadAccounts(getAccountPaths(configPath)))?.cachekeep?.enabled,
+    ).toBe(true)
     expect(start).toHaveBeenCalledTimes(1)
     expect(setCacheKeepEnabled).toHaveBeenCalledWith(true)
 
     const off = await buildDialogPayload('openai-cachekeep', 'off', ctx)
     expect(off.knobs.enabled).toBe(false)
-    expect((await loadAccounts(configPath))?.cachekeep?.enabled).toBe(false)
+    expect(
+      (await loadAccounts(getAccountPaths(configPath)))?.cachekeep?.enabled,
+    ).toBe(false)
     expect(stop).toHaveBeenCalledTimes(1)
     expect(setCacheKeepEnabled).toHaveBeenCalledWith(false)
   })
@@ -922,12 +1001,17 @@ describe('commands', () => {
         accounts: [],
         cachekeep: { enabled: true, subagents: false },
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const setCacheKeepSubagents = mock(() => {})
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
       setCacheKeepSubagents,
@@ -948,7 +1032,9 @@ describe('commands', () => {
 
     const on = await buildDialogPayload('openai-cachekeep', 'subagents on', ctx)
     expect(on.knobs.subagents).toBe(true)
-    expect((await loadAccounts(configPath))?.cachekeep?.subagents).toBe(true)
+    expect(
+      (await loadAccounts(getAccountPaths(configPath)))?.cachekeep?.subagents,
+    ).toBe(true)
     expect(setCacheKeepSubagents).toHaveBeenCalledWith(true)
 
     const off = await buildDialogPayload(
@@ -957,7 +1043,9 @@ describe('commands', () => {
       ctx,
     )
     expect(off.knobs.subagents).toBe(false)
-    expect((await loadAccounts(configPath))?.cachekeep?.subagents).toBe(false)
+    expect(
+      (await loadAccounts(getAccountPaths(configPath)))?.cachekeep?.subagents,
+    ).toBe(false)
     expect(setCacheKeepSubagents).toHaveBeenCalledWith(false)
   })
 
@@ -969,12 +1057,17 @@ describe('commands', () => {
         accounts: [],
         cachekeep: { enabled: true, subagents: true, sustain: false },
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const setCacheKeepSustain = mock(() => {})
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
       setCacheKeepSustain,
@@ -997,7 +1090,9 @@ describe('commands', () => {
     const on = await buildDialogPayload('openai-cachekeep', 'sustain on', ctx)
     expect(on.knobs.sustain).toBe(true)
     expect(on.text).toContain('non-expiring `cache_ttl`')
-    expect((await loadAccounts(configPath))?.cachekeep).toEqual({
+    expect(
+      (await loadAccounts(getAccountPaths(configPath)))?.cachekeep,
+    ).toEqual({
       enabled: true,
       subagents: true,
       sustain: true,
@@ -1006,7 +1101,9 @@ describe('commands', () => {
 
     const off = await buildDialogPayload('openai-cachekeep', 'sustain off', ctx)
     expect(off.knobs.sustain).toBe(false)
-    expect((await loadAccounts(configPath))?.cachekeep).toEqual({
+    expect(
+      (await loadAccounts(getAccountPaths(configPath)))?.cachekeep,
+    ).toEqual({
       enabled: true,
       subagents: true,
       sustain: false,
@@ -1022,11 +1119,16 @@ describe('commands', () => {
         accounts: [],
         cachekeep: { enabled: true, sustain: false },
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
     }
@@ -1040,15 +1142,22 @@ describe('commands', () => {
 
     expect(always.text).toContain('Usage:')
     expect(hold.text).toContain('Usage:')
-    expect((await loadAccounts(configPath))?.cachekeep?.sustain).toBe(false)
+    expect(
+      (await loadAccounts(getAccountPaths(configPath)))?.cachekeep?.sustain,
+    ).toBe(false)
   })
 
   test('/openai-cachekeep on creates a store when none exists', async () => {
     expect(existsSync(configPath)).toBe(false)
     const start = mock(() => {})
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
       cacheKeepManager: {
@@ -1069,7 +1178,7 @@ describe('commands', () => {
 
     await buildDialogPayload('openai-cachekeep', 'on', ctx)
 
-    const storage = await loadAccounts(configPath)
+    const storage = await loadAccounts(getAccountPaths(configPath))
     expect(storage?.accounts).toEqual([])
     expect(storage?.cachekeep?.enabled).toBe(true)
   })
@@ -1084,12 +1193,17 @@ describe('commands', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const setCacheKeepWindow = mock(() => {})
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
       setCacheKeepWindow,
@@ -1114,7 +1228,7 @@ describe('commands', () => {
       startHour: 9,
       endHour: 18,
     })
-    const storage = await loadAccounts(configPath)
+    const storage = await loadAccounts(getAccountPaths(configPath))
     expect(storage?.cachekeep?.startHour).toBe(9)
     expect(storage?.cachekeep?.endHour).toBe(18)
   })
@@ -1132,12 +1246,17 @@ describe('commands', () => {
           endHour: 18,
         },
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const setCacheKeepWindow = mock(() => {})
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
       setCacheKeepWindow,
@@ -1163,7 +1282,7 @@ describe('commands', () => {
     )
     expect(payload.knobs.window).toBeUndefined()
     expect(setCacheKeepWindow).toHaveBeenCalledWith(undefined)
-    const storage = await loadAccounts(configPath)
+    const storage = await loadAccounts(getAccountPaths(configPath))
     expect(storage?.cachekeep?.startHour).toBeUndefined()
     expect(storage?.cachekeep?.endHour).toBeUndefined()
     // enabled/subagents stay — only the window fields are dropped.
@@ -1178,12 +1297,17 @@ describe('commands', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const setCacheKeepWindow = mock(() => {})
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
       setCacheKeepWindow,
@@ -1205,7 +1329,7 @@ describe('commands', () => {
     const payload = await buildDialogPayload('openai-cachekeep', '9-9', ctx)
     expect(payload.text.toLowerCase()).toContain('invalid')
     expect(setCacheKeepWindow).not.toHaveBeenCalled()
-    const storage = await loadAccounts(configPath)
+    const storage = await loadAccounts(getAccountPaths(configPath))
     expect(storage?.cachekeep?.startHour).toBeUndefined()
     expect(storage?.cachekeep?.endHour).toBeUndefined()
   })
@@ -1218,11 +1342,16 @@ describe('commands', () => {
         accounts: [],
         cachekeep: { enabled: true, startHour: 9, endHour: 18 },
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
       cacheKeepManager: {
@@ -1270,13 +1399,16 @@ describe('commands', () => {
   test('refreshSidebar called after remove', async () => {
     const account = makeAccount('acct-1')
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [account] },
     })
     const client = makeClient()
 
     const refreshCalls: number[] = []
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client,
@@ -1289,7 +1421,7 @@ describe('commands', () => {
       version: 1 as const,
       accounts: [account],
     }
-    await saveAccounts(initial, configPath)
+    await saveAccounts(initial, getAccountPaths(configPath))
 
     await buildDialogPayload('openai-account', 'remove acct-1', ctx)
     expect(refreshCalls.length).toBe(1)
@@ -1304,10 +1436,13 @@ describe('commands', () => {
     const healthy = makeAccount('healthy')
     const broken = makeAccount('broken')
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [healthy, broken] },
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -1324,7 +1459,7 @@ describe('commands', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [healthy, broken],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const stateRaw = readFileSync(statePath, 'utf8')
     const stateObj = JSON.parse(stateRaw)
@@ -1358,10 +1493,13 @@ describe('commands', () => {
   test('openai-account remove of a nonexistent id reports Not Found', async () => {
     const account = makeAccount('acct-present')
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [account] },
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -1372,7 +1510,7 @@ describe('commands', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [account],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
 
     const payload = await buildDialogPayload(
@@ -1394,13 +1532,16 @@ describe('commands', () => {
     const account = makeAccount('acct-1')
     const acct2 = makeAccount('acct-2')
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [account, acct2] },
     })
     const client = makeClient()
 
     const refreshCalls: number[] = []
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client,
@@ -1413,7 +1554,7 @@ describe('commands', () => {
       version: 1 as const,
       accounts: [account, acct2],
     }
-    await saveAccounts(initial, configPath)
+    await saveAccounts(initial, getAccountPaths(configPath))
 
     await buildDialogPayload('openai-account', 'order acct-1 acct-2', ctx)
     expect(refreshCalls.length).toBe(1)
@@ -1433,10 +1574,13 @@ describe('commands', () => {
       delete process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL
 
       const qm = new QuotaManager({
+        configPath: getAccountStoragePath(),
         storage: { version: 1 as const, accounts: [] },
       })
       const ctx: CommandContext = {
+        packageVersion: PackageVersion,
         accountStoragePath: configPath,
+        accountStatePath: getAccountStatePath(configPath),
         quotaManager: qm,
         loadAccounts,
         client: makeClient(),
@@ -1489,10 +1633,13 @@ describe('commands', () => {
   // -----------------------------------------------------------------------
   test('dump command toggles enabled state', async () => {
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -1505,7 +1652,7 @@ describe('commands', () => {
     expect(onPayload.knobs.enabled).toBe(true)
 
     // After toggle: verify persistence in account storage
-    const storage = await loadAccounts(configPath)
+    const storage = await loadAccounts(getAccountPaths(configPath))
     expect(storage?.dump?.enabled).toBe(true)
 
     // The dump gates read resolved settings, which are memoized per process.
@@ -1522,10 +1669,13 @@ describe('commands', () => {
   // -----------------------------------------------------------------------
   test('killswitch command shows status with knobs', async () => {
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -1542,10 +1692,13 @@ describe('commands', () => {
   // -----------------------------------------------------------------------
   test('quota command returns text (quota snapshot)', async () => {
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -1577,11 +1730,14 @@ describe('commands', () => {
 
   test('refreshAllQuota populates main + 2 fallbacks → output shows quota', async () => {
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
 
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -1627,6 +1783,7 @@ describe('commands', () => {
 
   test('quota command shows reset credits under their own account only', async () => {
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     qm.setMain('access-main', {
@@ -1645,7 +1802,9 @@ describe('commands', () => {
       checkedAt: Date.now(),
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -1664,11 +1823,14 @@ describe('commands', () => {
 
   test('refreshAllQuota with one failure → short retry state for failing account', async () => {
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
 
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -1709,6 +1871,7 @@ describe('commands', () => {
     // skips it. Keying the age on the poll would then report freshness the
     // numbers do not have.
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const threeHoursAgo = Date.now() - 3 * 3600_000
@@ -1718,7 +1881,9 @@ describe('commands', () => {
       staleSnapshot.secondary.checkedAt = threeHoursAgo
 
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -1759,11 +1924,14 @@ describe('commands', () => {
     // line sends the operator into an indefinite wait while the account stays
     // dead. The message has to name the one action that works: re-adding it.
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
 
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -1789,6 +1957,7 @@ describe('commands', () => {
 
   test('refreshAllQuota undefined → falls back to cached display', async () => {
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     // Pre-populate cache
@@ -1799,7 +1968,9 @@ describe('commands', () => {
     })
 
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -1836,7 +2007,7 @@ describe('commands', () => {
           }),
         ],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
 
     const refreshMainWithLease = mock(async () => ({
@@ -1858,6 +2029,7 @@ describe('commands', () => {
       refreshFallbackAccount,
       loadAccounts,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       now: () => now,
     })
 
@@ -1887,6 +2059,7 @@ describe('commands', () => {
     })
     const deps = {
       configPath,
+      statePath: getAccountStatePath(configPath),
       mutateAccountsFn: mutateAccounts,
       loadAccountsFn: loadAccounts,
       now: () => now,
@@ -1972,7 +2145,7 @@ describe('commands', () => {
           }),
         ],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const refreshMainWithLease = mock(async () => ({
       access: 'refreshed-main',
@@ -1993,11 +2166,17 @@ describe('commands', () => {
       refreshFallbackAccount,
       loadAccounts,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       now: () => now,
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
       resolveResetTarget,
@@ -2020,8 +2199,13 @@ describe('commands', () => {
 
   test('reset command reports unavailable when runtime dependencies are not wired', async () => {
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
-      quotaManager: new QuotaManager({ storage: { version: 1, accounts: [] } }),
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
       loadAccounts,
       client: makeClient(),
     }
@@ -2051,6 +2235,7 @@ describe('commands', () => {
         refreshFallbackAccount: async (account) => account,
         loadAccounts,
         accountStoragePath: configPath,
+        accountStatePath: getAccountStatePath(configPath),
         now: () => now,
       })
 
@@ -2060,7 +2245,7 @@ describe('commands', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     await expect(resolver()('missing')).rejects.toMatchObject({
       code: 'unknown_account',
@@ -2073,7 +2258,7 @@ describe('commands', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [makeAccount('disabled', { enabled: false })],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     await expect(resolver()('disabled')).rejects.toMatchObject({
       code: 'disabled_account',
@@ -2092,7 +2277,7 @@ describe('commands', () => {
           },
         ],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     await expect(resolver()('api-account')).rejects.toMatchObject({
       code: 'non_oauth_account',
@@ -2105,7 +2290,7 @@ describe('commands', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [makeAccount('tokenless', { access: '', expires: 0 })],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     await expect(resolver()('tokenless')).rejects.toMatchObject({
       code: 'token_unavailable',
@@ -2122,7 +2307,7 @@ describe('commands', () => {
         mainAccountId: 'old-account',
         accounts: [],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const resolveTarget = createResetTargetResolver({
       getAuth: async () => ({
@@ -2139,6 +2324,7 @@ describe('commands', () => {
       refreshFallbackAccount: async (account) => account,
       loadAccounts,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       now: () => now,
     })
 
@@ -2155,7 +2341,7 @@ describe('commands', () => {
         mainAccountId: 'old-account',
         accounts: [],
       },
-      configPath,
+      getAccountPaths(configPath),
     )
     const resolveTarget = createResetTargetResolver({
       getAuth: async () => ({
@@ -2172,6 +2358,7 @@ describe('commands', () => {
       refreshFallbackAccount: async (account) => account,
       loadAccounts,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       now: () => now,
     })
 
@@ -2212,6 +2399,7 @@ describe('commands', () => {
         refreshFallbackAccount,
         loadAccounts: loadAccountsFn,
         accountStoragePath: configPath,
+        accountStatePath: getAccountStatePath(configPath),
         now: () => now,
       })
 
@@ -2245,7 +2433,7 @@ describe('commands', () => {
             }),
           ],
         },
-        configPath,
+        getAccountPaths(configPath),
       )
       const refreshMainWithLease = mock(async () => ({
         access: 'refreshed-main-token',
@@ -2268,6 +2456,7 @@ describe('commands', () => {
         refreshFallbackAccount,
         loadAccounts,
         accountStoragePath: configPath,
+        accountStatePath: getAccountStatePath(configPath),
         now: () => now,
       })
 
@@ -2299,7 +2488,7 @@ describe('commands', () => {
           mainAccountId: 'chatgpt-main',
           accounts,
         },
-        configPath,
+        getAccountPaths(configPath),
       )
     }
 
@@ -2735,7 +2924,7 @@ describe('commands', () => {
             storage.mainAccountId = 'chatgpt-main-replacement'
           }
           return storage
-        }, configPath)
+        }, getAccountPaths(configPath))
 
         const payload = await buildDialogPayload(
           'openai-reset',
@@ -2795,7 +2984,9 @@ describe('commands', () => {
       const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
       await buildDialogPayload('openai-reset', 'select fallback-a', ctx)
       expect(
-        (await loadAccounts(configPath))?.reset?.['fallback-a'],
+        (await loadAccounts(getAccountPaths(configPath)))?.reset?.[
+          'fallback-a'
+        ],
       ).toBeUndefined()
       fixture.usedPercent['chatgpt-fallback-a'] = 20
       const postsBefore = fixture.calls.filter(
@@ -2825,7 +3016,9 @@ describe('commands', () => {
         ),
       ).toHaveLength(listsBefore)
       expect(
-        (await loadAccounts(configPath))?.reset?.['fallback-a'],
+        (await loadAccounts(getAccountPaths(configPath)))?.reset?.[
+          'fallback-a'
+        ],
       ).toBeUndefined()
     })
 
@@ -2853,7 +3046,7 @@ describe('commands', () => {
           'fallback-a': { cooldownUntil: now + 30_000 },
         }
         return storage
-      }, configPath)
+      }, getAccountPaths(configPath))
       const fixture = resetFixture()
       const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
 
@@ -2881,7 +3074,7 @@ describe('commands', () => {
           },
         }
         return storage
-      }, configPath)
+      }, getAccountPaths(configPath))
       const fixture = resetFixture()
       const { ctx } = await makeResetCommandHarness(configPath, now, fixture)
 
@@ -3180,7 +3373,9 @@ describe('commands', () => {
         'confirm fallback-a chatgpt-fallback-a',
         harness.ctx,
       )
-      const state = (await loadAccounts(configPath))?.reset?.['fallback-a']
+      const state = (await loadAccounts(getAccountPaths(configPath)))?.reset?.[
+        'fallback-a'
+      ]
       expect(state?.inFlight?.redeemRequestId).toBe('reset-request-id')
       firstFixture.throwOnPost = false
       firstFixture.outcome = 'nothing_to_reset'
@@ -3254,10 +3449,10 @@ describe('commands (add)', () => {
     }
   })
 
-  // mock.module('../core/oauth', ...) below leaks process-wide; re-install the
+  // mock.module('../../../core/src/oauth.ts', ...) below leaks process-wide; re-install the
   // real module so later test files (e.g. oauth.test.ts) see the genuine exports.
   afterAll(() => {
-    mock.module('../core/oauth', () => oauthRealExports)
+    mock.module('../../../core/src/oauth.ts', () => oauthRealExports)
   })
 
   test('/openai-account add returns dialog with auth URL', async () => {
@@ -3269,8 +3464,8 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
+    mock.module('../../../core/src/oauth.ts', () => {
+      const actual = require('../../../core/src/oauth.ts')
       return { ...actual, beginAccountLogin: beginSpy }
     })
 
@@ -3278,10 +3473,13 @@ describe('commands (add)', () => {
     const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -3307,21 +3505,24 @@ describe('commands (add)', () => {
         completion: completionPromise,
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
+    mock.module('../../../core/src/oauth.ts', () => {
+      const actual = require('../../../core/src/oauth.ts')
       return { ...actual, beginAccountLogin: beginSpy }
     })
 
     const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const client = makeClient()
     const setSpy = spyOn(client.auth, 'set')
 
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client,
@@ -3335,11 +3536,13 @@ describe('commands (add)', () => {
 
     // Wait for the detached .then to flush
     await waitUntil(
-      async () => ((await loadAccounts(configPath))?.accounts.length ?? 0) >= 1,
+      async () =>
+        ((await loadAccounts(getAccountPaths(configPath)))?.accounts.length ??
+          0) >= 1,
     )
 
     // Verify the account was persisted
-    const storage = await loadAccounts(configPath)
+    const storage = await loadAccounts(getAccountPaths(configPath))
     expect(storage?.accounts).toHaveLength(1)
     expect(storage?.accounts[0]?.id).toBe('added-acct')
 
@@ -3356,18 +3559,21 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
+    mock.module('../../../core/src/oauth.ts', () => {
+      const actual = require('../../../core/src/oauth.ts')
       return { ...actual, beginAccountLogin: beginSpy }
     })
 
     const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -3376,7 +3582,9 @@ describe('commands (add)', () => {
     // First add
     await bdp('openai-account', 'add personal', ctx)
     await waitUntil(
-      async () => ((await loadAccounts(configPath))?.accounts.length ?? 0) >= 1,
+      async () =>
+        ((await loadAccounts(getAccountPaths(configPath)))?.accounts.length ??
+          0) >= 1,
     )
 
     // Second add with same label
@@ -3386,7 +3594,7 @@ describe('commands (add)', () => {
     // have run and been rejected.
     await new Promise((r) => setTimeout(r, 250))
 
-    const storage = await loadAccounts(configPath)
+    const storage = await loadAccounts(getAccountPaths(configPath))
     expect(storage?.accounts).toHaveLength(1)
   })
 
@@ -3399,18 +3607,21 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
+    mock.module('../../../core/src/oauth.ts', () => {
+      const actual = require('../../../core/src/oauth.ts')
       return { ...actual, beginAccountLogin: beginSpy }
     })
 
     const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -3418,10 +3629,12 @@ describe('commands (add)', () => {
 
     await bdp('openai-account', 'add fb', ctx)
     await waitUntil(
-      async () => ((await loadAccounts(configPath))?.accounts.length ?? 0) >= 1,
+      async () =>
+        ((await loadAccounts(getAccountPaths(configPath)))?.accounts.length ??
+          0) >= 1,
     )
 
-    const storage = await loadAccounts(configPath)
+    const storage = await loadAccounts(getAccountPaths(configPath))
     for (const a of storage?.accounts ?? []) {
       expect(a.id).not.toBe('main')
     }
@@ -3435,7 +3648,7 @@ describe('commands (add)', () => {
       mainAccountId: 'chatgpt-main-999',
       accounts: [] as OAuthAccount[],
     }
-    await saveAccounts(seed, configPath)
+    await saveAccounts(seed, getAccountPaths(configPath))
 
     const resolveAccount = makeAccount('would-be-fallback', {
       accountId: 'chatgpt-main-999',
@@ -3447,18 +3660,21 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
+    mock.module('../../../core/src/oauth.ts', () => {
+      const actual = require('../../../core/src/oauth.ts')
       return { ...actual, beginAccountLogin: beginSpy }
     })
 
     const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -3471,7 +3687,7 @@ describe('commands (add)', () => {
     await new Promise((r) => setTimeout(r, 250))
 
     // Storage accounts[] should still be empty — main was rejected
-    const storage = await loadAccounts(configPath)
+    const storage = await loadAccounts(getAccountPaths(configPath))
     expect(storage?.accounts).toHaveLength(0)
   })
 
@@ -3482,7 +3698,7 @@ describe('commands (add)', () => {
       mainAccountId: 'chatgpt-main-999',
       accounts: [] as OAuthAccount[],
     }
-    await saveAccounts(seed, configPath)
+    await saveAccounts(seed, getAccountPaths(configPath))
 
     const resolveAccount = makeAccount('would-be-fallback', {
       accountId: 'chatgpt-main-999',
@@ -3494,19 +3710,22 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
+    mock.module('../../../core/src/oauth.ts', () => {
+      const actual = require('../../../core/src/oauth.ts')
       return { ...actual, beginAccountLogin: beginSpy }
     })
 
     const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const notifyCalls: Array<{ text: string }> = []
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -3530,19 +3749,22 @@ describe('commands (add)', () => {
         completion: Promise.reject(new Error('OAuth timeout')),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
+    mock.module('../../../core/src/oauth.ts', () => {
+      const actual = require('../../../core/src/oauth.ts')
       return { ...actual, beginAccountLogin: beginSpy }
     })
 
     const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const notifyCalls: Array<{ text: string }> = []
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -3566,18 +3788,21 @@ describe('commands (add)', () => {
         completion: new Promise(() => {}),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
+    mock.module('../../../core/src/oauth.ts', () => {
+      const actual = require('../../../core/src/oauth.ts')
       return { ...actual, beginAccountLogin: beginSpy }
     })
 
     const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -3603,18 +3828,21 @@ describe('commands (add)', () => {
         completion: new Promise(() => {}),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
+    mock.module('../../../core/src/oauth.ts', () => {
+      const actual = require('../../../core/src/oauth.ts')
       return { ...actual, beginAccountLogin: beginSpy }
     })
 
     const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -3639,19 +3867,22 @@ describe('commands (add)', () => {
         completion: Promise.resolve(resolveAccount),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
+    mock.module('../../../core/src/oauth.ts', () => {
+      const actual = require('../../../core/src/oauth.ts')
       return { ...actual, beginAccountLogin: beginSpy }
     })
 
     const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const refreshCalls: number[] = []
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -3664,7 +3895,7 @@ describe('commands (add)', () => {
     await waitUntil(() => refreshCalls.length >= 1)
 
     expect(refreshCalls.length).toBe(1)
-    const storage = await loadAccounts(configPath)
+    const storage = await loadAccounts(getAccountPaths(configPath))
     expect(storage?.accounts).toHaveLength(1)
   })
 
@@ -3676,18 +3907,21 @@ describe('commands (add)', () => {
         completion: new Promise(() => {}),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
+    mock.module('../../../core/src/oauth.ts', () => {
+      const actual = require('../../../core/src/oauth.ts')
       return { ...actual, beginAccountLogin: beginSpy }
     })
 
     const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -3710,18 +3944,21 @@ describe('commands (add)', () => {
         completion: new Promise(() => {}),
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
+    mock.module('../../../core/src/oauth.ts', () => {
+      const actual = require('../../../core/src/oauth.ts')
       return { ...actual, beginAccountLogin: beginSpy }
     })
 
     const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),
@@ -3749,20 +3986,23 @@ describe('commands (add)', () => {
         completion: completionPromise,
       }),
     )
-    mock.module('../core/oauth', () => {
-      const actual = require('../core/oauth')
+    mock.module('../../../core/src/oauth.ts', () => {
+      const actual = require('../../../core/src/oauth.ts')
       return { ...actual, beginAccountLogin: beginSpy }
     })
 
     const { buildDialogPayload: bdp } = await import('../commands')
 
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: { version: 1 as const, accounts: [] },
     })
     const firstSessionCalls: string[] = []
     const secondSessionCalls: string[] = []
     const ctx: CommandContext = {
+      packageVersion: PackageVersion,
       accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
       quotaManager: qm,
       loadAccounts,
       client: makeClient(),

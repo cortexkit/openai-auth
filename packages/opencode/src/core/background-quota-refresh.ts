@@ -1,9 +1,9 @@
 import {
+  acquireRefreshFileLock,
   type RefreshAllQuotaDeps,
   type RefreshAllQuotaResult,
   refreshAllQuota,
-} from './refresh-all-quota'
-import { acquireRefreshFileLock } from './refresh-file-lock'
+} from '@cortexkit/openai-auth-core/internal'
 
 export const BACKGROUND_QUOTA_REFRESH_INTERVAL_MS = 5 * 60_000
 export const BACKGROUND_QUOTA_REFRESH_JITTER_MS = 30_000
@@ -57,7 +57,7 @@ export function refreshQuotaInBackground(
   deps: RefreshAllQuotaDeps,
   refreshFn: RefreshAllQuotaFn = refreshAllQuota,
   acquireLock: BackgroundLockAcquirer = () =>
-    acquireBackgroundRefreshLock(deps.configPath),
+    acquireBackgroundRefreshLock(deps.paths.configPath),
 ): Promise<RefreshAllQuotaResult[]> {
   // The lock is advisory and only serializes the fetch across processes. A
   // clean null means another live owner is already refreshing, so this tick

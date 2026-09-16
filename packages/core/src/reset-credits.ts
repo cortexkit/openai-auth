@@ -1,4 +1,5 @@
 import {
+  type AccountPaths,
   type AccountStorage,
   isSafeResetAccountKey,
   type loadAccounts,
@@ -59,10 +60,21 @@ export type ResetPrecondition =
 
 export interface ResetStateDeps {
   configPath: string
+  /**
+   * Kept as its own field rather than folded into an `AccountPaths` so the
+   * caller supplies the same two values the rest of its context already
+   * carries, and the store calls below compose the pair where they need it.
+   */
+  statePath: string
   mutateAccountsFn: typeof mutateAccounts
   loadAccountsFn: typeof loadAccounts
   now: () => number
   randomUUID: () => string
+}
+
+/** The config/state pair these deps describe, in the shape the store takes. */
+function storePaths(deps: ResetStateDeps): AccountPaths {
+  return { configPath: deps.configPath, statePath: deps.statePath }
 }
 
 export interface ResetResolvedTarget {
@@ -318,7 +330,7 @@ async function inspectResetAttempt(
   if (!isSafeResetAccountKey(accountKey)) {
     return { kind: 'fresh', beforeState: undefined }
   }
-  const current = await deps.loadAccountsFn(deps.configPath)
+  const current = await deps.loadAccountsFn(storePaths(deps))
   return inspectResetState(
     current ? resetStateForAccount(current, accountKey) : undefined,
     deps.now(),
@@ -338,7 +350,7 @@ async function resolveCorruptResetAttempt(
       resolveCorruptState(current, accountKey, now)
     }
     return current
-  }, deps.configPath)
+  }, storePaths(deps))
   if (!decision) throw new Error('corrupt reset state mutation did not run')
   return decision
 }
@@ -414,7 +426,7 @@ export async function claimResetAttempt(
       claim: { inFlight: claimedInFlight, selectedCredit },
     }
     return current
-  }, deps.configPath)
+  }, storePaths(deps))
   if (!decision) throw new Error('reset claim mutation did not run')
   return decision
 }
@@ -447,7 +459,7 @@ export async function finalizeResetAttempt(
       delete state.cooldownUntil
     }
     return current
-  }, deps.configPath)
+  }, storePaths(deps))
 }
 
 export function resetWindowIsExhausted(

@@ -2,17 +2,16 @@ import { describe, expect, mock, test } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type {
-  AccountQuotaWindow,
-  FallbackAccount,
-  OAuthQuotaSnapshot,
-} from '../core/accounts'
-import { hashRefreshToken } from '../core/backoff.ts'
-import { QuotaManager } from '../core/quota-manager'
 import {
+  type AccountQuotaWindow,
+  type FallbackAccount,
+  hashRefreshToken,
+  type OAuthQuotaSnapshot,
+  QuotaManager,
   type RefreshAllQuotaDeps,
   refreshAllQuota,
-} from '../core/refresh-all-quota'
+} from '@cortexkit/openai-auth-core/internal'
+import { getAccountStoragePath } from '../core/account-paths'
 import {
   DEFAULT_SIDEBAR_STATE,
   getSidebarState,
@@ -69,6 +68,7 @@ interface MakeDepsOptions extends Partial<RefreshAllQuotaDeps> {
 
 function makeDeps(opts: MakeDepsOptions = {}): RefreshAllQuotaDeps {
   const qm = new QuotaManager({
+    configPath: getAccountStoragePath(),
     storage: { version: 1 as const, accounts: [] },
   })
 
@@ -131,7 +131,10 @@ function makeDeps(opts: MakeDepsOptions = {}): RefreshAllQuotaDeps {
     },
     fetchImpl: fetch,
     now: () => Date.now(),
-    configPath: '/tmp/test-config.json',
+    paths: {
+      configPath: '/tmp/test-config.json',
+      statePath: '/tmp/test-config.state.json',
+    },
     storageMainAccountId: 'chatgpt-main',
     isOAuthAccountFn: ((a: unknown) =>
       (a as { type?: string })?.type ===
@@ -653,6 +656,7 @@ describe('refreshAllQuota', () => {
   test('respectBackoff skips wham for main when quota API is backed off', async () => {
     const now = Date.now()
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: {
         version: 1 as const,
         accounts: [],
@@ -682,6 +686,7 @@ describe('refreshAllQuota', () => {
   test('respectBackoff: false (default) still fetches main even when backed off', async () => {
     const now = Date.now()
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: {
         version: 1 as const,
         accounts: [],
@@ -710,6 +715,7 @@ describe('refreshAllQuota', () => {
     // Set up a QuotaManager where a fallback is in backoff by triggering
     // a failing refreshFallback call that arms the error state.
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: {
         version: 1 as const,
         accounts: [

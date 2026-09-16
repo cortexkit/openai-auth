@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import { getAccountStoragePath } from './account-paths'
 
 const setRefreshLockRenewalTimeout = globalThis.setTimeout.bind(globalThis)
 const clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
@@ -18,7 +17,12 @@ export function isLostMarkerRaceError(error: unknown): boolean {
 export async function acquireRefreshFileLock(options: {
   name: string
   ttlMs: number
-  path?: string
+  /**
+   * File the lock is named after. Required: the lock and the write it guards
+   * must target the same file, and a default resolved in here could only ever
+   * be one host's path.
+   */
+  path: string
   now?: () => number
   renew?: boolean
   renewIntervalMs?: number
@@ -37,8 +41,7 @@ export async function acquireRefreshFileLock(options: {
       | 'release-owner-confirmed',
   ) => void | Promise<void>
 }): Promise<{ release: () => Promise<void> } | null> {
-  const accountPath = options.path ?? getAccountStoragePath()
-  const lockPath = `${accountPath}.${options.name}.lock`
+  const lockPath = `${options.path}.${options.name}.lock`
   const legacyOwnerPath = join(lockPath, 'owner.json')
   const ownerId = randomUUID()
   const now = options.now ?? Date.now

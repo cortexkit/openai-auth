@@ -1,13 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { createLogger } from '../logger.ts'
-import {
-  ACCOUNT_FILE_NAME,
-  ACCOUNT_STATE_FILE_NAME,
-  deriveStatePath,
-  getAccountStatePath,
-  getAccountStoragePath,
-} from './account-paths'
 import { writeJsonAtomic } from './atomic-write'
 import {
   buildQuotaOperationError,
@@ -17,7 +9,14 @@ import {
   quotaBackoffActive,
   refreshBackoffActive,
 } from './backoff.ts'
+import { createLogger } from './logger.ts'
 import { extractAccountId } from './oauth'
+import {
+  ACCOUNT_FILE_NAME,
+  ACCOUNT_STATE_FILE_NAME,
+  type AccountPaths,
+  deriveStatePath,
+} from './paths'
 import type {
   ProviderQuotaFn,
   ProviderRefreshFn,
@@ -42,16 +41,11 @@ const SAVE_ACCOUNTS_LOCK_RETRY_MS = 50
 // Paths
 // ---------------------------------------------------------------------------
 
+export type { AccountPaths }
 // Re-exported so existing importers keep their current entry point; the
-// definitions live in account-paths.ts so the lock module can share them
-// without an import cycle.
-export {
-  ACCOUNT_FILE_NAME,
-  ACCOUNT_STATE_FILE_NAME,
-  deriveStatePath,
-  getAccountStatePath,
-  getAccountStoragePath,
-}
+// definitions live in paths.ts so the lock module can share them without an
+// import cycle.
+export { ACCOUNT_FILE_NAME, ACCOUNT_STATE_FILE_NAME, deriveStatePath }
 
 // ---------------------------------------------------------------------------
 // Re-export the widened QuotaWindowName + consts from the injection seam
@@ -292,7 +286,8 @@ export type AccountStateSaveScope = {
 export type AccountManagerOptions = {
   now?: () => number
   fetchImpl?: typeof fetch
-  configPath?: string
+  /** Config and state file the manager reads and writes. Host-resolved. */
+  paths: AccountPaths
   onFallbackStorageChanged?: () => void
   /** Provider token-refresh function (constructor-injected). */
   refreshFn?: ProviderRefreshFn
@@ -718,10 +713,10 @@ function mergeConfigAndState(
 // Load / save
 // ---------------------------------------------------------------------------
 
-export async function loadAccounts(path = getAccountStoragePath()) {
-  const config = await readJsonIfPresent(path)
+export async function loadAccounts(paths: AccountPaths) {
+  const config = await readJsonIfPresent(paths.configPath)
   if (!config.exists) return null
-  const state = await readJsonIfPresent(getAccountStatePath(path))
+  const state = await readJsonIfPresent(paths.statePath)
   return normalizeStorage(mergeConfigAndState(config.value, state.value))
 }
 
@@ -999,8 +994,9 @@ function stateFromStorage(storage: AccountStorage): AccountRuntimeState {
 
 export async function saveAccounts(
   storage: AccountStorage,
-  path = getAccountStoragePath(),
+  paths: AccountPaths,
 ) {
+  const path = paths.configPath
   // Serialize concurrent read-modify-write to prevent lost updates when
   // the CLI and a TUI command (or two commands) modify the store at once.
   //
@@ -1014,11 +1010,10 @@ export async function saveAccounts(
   // could write the state file in the window after saveAccounts read it
   // but before saveAccounts re-wrote it, producing a lost update.
   //
-  // Snapshot the state path once (honoring OPENCODE_OPENAI_AUTH_STATE_FILE)
-  // so the lock target and write target are identical within this call and
-  // consistent with every other state-file accessor (loadAccounts,
-  // saveAccountState, migrate — all use getAccountStatePath).
-  const statePath = getAccountStatePath(path)
+  // The caller supplies the state path, so the lock target and the write target
+  // are identical within this call and consistent with every other state-file
+  // accessor (loadAccounts, saveAccountState, migrate all take the same pair).
+  const statePath = paths.statePath
   const lock = await acquireSaveAccountsLock(path)
   try {
     const stateLock = await acquireSaveAccountsLock(statePath)
@@ -1096,7 +1091,7 @@ export async function saveAccounts(
  * missing array is structurally different from an empty one (it implies the
  * user has never written a roster, not that they wrote an empty one).
  *
- * Roster rule (aligned with normalizeAccountBase in core/accounts.ts): an
+ * Roster rule (aligned with normalizeAccountBase above): an
  * entry counts as a roster member only when its `id` is a string with at
  * least one non-whitespace character. Non-record entries, entries whose id
  * is not a string, entries with a non-string id (number, boolean, null),
@@ -1259,10 +1254,11 @@ function buildPreservedAdditions(
  */
 export async function mutateAccounts(
   mutate: (current: AccountStorage) => AccountStorage | undefined,
-  path = getAccountStoragePath(),
+  paths: AccountPaths,
   options: { allowDrop?: readonly string[] } = {},
 ): Promise<AccountStorage> {
-  const statePath = getAccountStatePath(path)
+  const path = paths.configPath
+  const statePath = paths.statePath
   const lock = await acquireSaveAccountsLock(path)
   try {
     const stateLock = await acquireSaveAccountsLock(statePath)
@@ -1401,14 +1397,14 @@ function pruneUndefined(value: unknown): unknown {
 
 export async function saveAccountState(
   storage: AccountStorage,
-  path = getAccountStoragePath(),
+  paths: AccountPaths,
   scope: AccountStateSaveScope = {
     mainQuota: true,
     mainRefresh: true,
     accounts: true,
   },
 ) {
-  const statePath = getAccountStatePath(path)
+  const statePath = paths.statePath
   // Serialize concurrent read-modify-write on the state file to prevent lost
   // updates when two callers (e.g. quota push + sidebar refresh) race.
   const lock = await acquireSaveAccountsLock(statePath)
@@ -1430,7 +1426,7 @@ export async function saveAccountState(
       // secrets (access/refresh/apiKey) into the state file. Read unlocked: the
       // config is written atomically (temp+rename), so this sees a complete
       // file, and the state lock we hold serializes the state write itself.
-      const roster = await readConfigRosterIds(path)
+      const roster = await readConfigRosterIds(paths.configPath)
       next.accounts = { ...(isRecord(next.accounts) ? next.accounts : {}) }
       for (const account of storage.accounts) {
         if (ids && !ids.has(account.id)) continue
@@ -1659,9 +1655,10 @@ export async function migrateIfNeeded(
   existingToken:
     | { type: 'oauth'; access: string; refresh: string; expires: number }
     | undefined,
-  path = getAccountStoragePath(),
+  paths: AccountPaths,
 ) {
-  const statePath = getAccountStatePath(path)
+  const path = paths.configPath
+  const statePath = paths.statePath
   const lock = await acquireSaveAccountsLock(path)
   try {
     const stateLock = await acquireSaveAccountsLock(statePath)
@@ -1900,7 +1897,7 @@ const _clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
 export class FallbackAccountManager {
   private readonly now: () => number
   private readonly fetchImpl: typeof fetch
-  private readonly configPath: string
+  private readonly paths: AccountPaths
   private readonly refreshPromises = new Map<string, Promise<OAuthAccount>>()
   private refreshTimer: ReturnType<typeof setInterval> | null = null
   private quotaTimer: ReturnType<typeof setInterval> | null = null
@@ -1908,11 +1905,11 @@ export class FallbackAccountManager {
   private readonly onFallbackStorageChanged: (() => void) | undefined
   private readonly options: AccountManagerOptions
 
-  constructor(options: AccountManagerOptions = {}) {
+  constructor(options: AccountManagerOptions) {
     this.options = options
     this.now = options.now ?? Date.now
     this.fetchImpl = options.fetchImpl ?? fetch
-    this.configPath = options.configPath ?? getAccountStoragePath()
+    this.paths = options.paths
     this.quotaManager = options.quotaManager ?? null
     this.onFallbackStorageChanged = options.onFallbackStorageChanged
   }
@@ -1948,11 +1945,11 @@ export class FallbackAccountManager {
   }
 
   async load() {
-    return loadAccounts(this.configPath)
+    return loadAccounts(this.paths)
   }
 
   async save(storage: AccountStorage, accountIds?: string[]) {
-    await saveAccountState(storage, this.configPath, {
+    await saveAccountState(storage, this.paths, {
       accounts: accountIds ?? true,
     })
   }
@@ -2375,7 +2372,7 @@ export class FallbackAccountManager {
     const fileLock = await acquireRefreshFileLock({
       name: fallbackRefreshLockName(sourceAccount.id),
       ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
-      path: this.configPath,
+      path: this.paths.configPath,
       now: this.now,
       renew: true,
     })

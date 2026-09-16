@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test'
-import type { AccountStorage } from '../core/accounts.ts'
+import type { AccountStorage } from '@cortexkit/openai-auth-core/internal'
+import { getAccountStoragePath } from '../core/account-paths'
 
 describe('QuotaManager refresh scheduling', () => {
   const storage: AccountStorage = {
@@ -12,11 +13,14 @@ describe('QuotaManager refresh scheduling', () => {
   }
 
   it('defers a blocked single-primary snapshot until its future reset', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const now = Date.UTC(2026, 6, 16, 12, 0, 0)
     const resetAt = now + 60 * 60 * 1000
     const token = 'blocked-single-primary'
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage,
       now: () => now,
       fetchQuotaFn: async () => ({
@@ -36,10 +40,13 @@ describe('QuotaManager refresh scheduling', () => {
   })
 
   it('polls a healthy single-primary snapshot at the normal interval', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const now = Date.UTC(2026, 6, 16, 13, 0, 0)
     const token = 'healthy-single-primary'
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage,
       now: () => now,
       fetchQuotaFn: async () => ({
@@ -66,9 +73,12 @@ describe('QuotaManager refresh scheduling', () => {
  */
 describe('QuotaManager mid-stream rate-limit marks', () => {
   it('markRateLimited makes isRateLimited true; it clears once now() passes resetAt', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     let now = 1_000_000
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       now: () => now,
       fetchQuotaFn: () => {
@@ -91,9 +101,12 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
   })
 
   it('marking one account does not mark another (per-account isolation)', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const now = 2_000_000
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       now: () => now,
       fetchQuotaFn: () => {
@@ -113,9 +126,12 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
   })
 
   it('re-marking the same account keeps the LATER reset', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     let now = 3_000_000
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       now: () => now,
       fetchQuotaFn: () => {
@@ -136,9 +152,12 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
   })
 
   it('re-marking the same account with an EQUAL reset is idempotent (not dropped)', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     let now = 3_500_000
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       now: () => now,
       fetchQuotaFn: () => {
@@ -158,9 +177,12 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
   })
 
   it('setMain clears a mark when the only present window is healthy (single-primary wire)', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const now = 4_000_000
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       now: () => now,
       fetchQuotaFn: () => {
@@ -190,9 +212,12 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
   })
 
   it('setMain does not clear the mark when a present window is still exhausted', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const now = 4_050_000
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       now: () => now,
       fetchQuotaFn: () => {
@@ -217,9 +242,12 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
   })
 
   it('setMain clears the mark when both present windows are healthy', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const now = 4_080_000
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       now: () => now,
       fetchQuotaFn: () => {
@@ -242,9 +270,12 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
   })
 
   it('setMain clears the mark on a genuine main-account SWITCH, even with a non-healthy snapshot', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const now = 4_500_000
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       now: () => now,
       fetchQuotaFn: () => {
@@ -274,9 +305,12 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
   })
 
   it('setMain does NOT clear the mark on a same-account token refresh', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const now = 4_600_000
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       now: () => now,
       fetchQuotaFn: () => {
@@ -305,10 +339,13 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
   })
 
   it('setFallback clears a mark on a genuine fallback-account re-login', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const now = 4_650_000
     const fallbackId = 'fallback-1'
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       now: () => now,
       fetchQuotaFn: () => {
@@ -333,10 +370,13 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
   })
 
   it('setFallback does NOT clear a mark when a quota push has the same identity', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const now = 4_660_000
     const fallbackId = 'fallback-1'
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       now: () => now,
       fetchQuotaFn: () => {
@@ -365,10 +405,13 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
   })
 
   it('setFallback preserves a mark and prior binding when the incoming identity is unknown', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const now = 4_670_000
     const fallbackId = 'fallback-1'
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       now: () => now,
       fetchQuotaFn: () => {
@@ -393,10 +436,13 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
   })
 
   it('setFallback preserves a mark on first identity binding', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const now = 4_680_000
     const fallbackId = 'fallback-1'
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       now: () => now,
       fetchQuotaFn: () => {
@@ -418,9 +464,12 @@ describe('QuotaManager mid-stream rate-limit marks', () => {
   })
 
   it('refreshMain clears a stale main mark once a healthy quota poll lands (bypasses setMain)', async () => {
-    const { QuotaManager } = await import('../core/quota-manager.ts')
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const now = 4_700_000
     const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
       storage: null,
       now: () => now,
       fetchQuotaFn: async () => ({
@@ -446,7 +495,7 @@ describe('resolveMidStreamRateLimitResetAt', () => {
 
   it('prefers the named window when present and future', async () => {
     const { resolveMidStreamRateLimitResetAt } = await import(
-      '../core/quota-manager.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     const quota = {
       primary: {
@@ -469,7 +518,7 @@ describe('resolveMidStreamRateLimitResetAt', () => {
 
   it('prefers an explicit provider reset over cached quota reset math', async () => {
     const { resolveMidStreamRateLimitResetAt } = await import(
-      '../core/quota-manager.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     const providerResetAt = now + 900_000
     const quota = {
@@ -505,7 +554,7 @@ describe('resolveMidStreamRateLimitResetAt', () => {
     // the future and would blackhole the account long past its real rate-limit.
     // Fall back to the bounded, self-correcting default instead.
     const { resolveMidStreamRateLimitResetAt } = await import(
-      '../core/quota-manager.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     const quota = {
       secondary: {
@@ -522,7 +571,7 @@ describe('resolveMidStreamRateLimitResetAt', () => {
 
   it('falls back to the default when every window is past or absent', async () => {
     const { resolveMidStreamRateLimitResetAt } = await import(
-      '../core/quota-manager.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     const quota = {
       primary: {
@@ -542,7 +591,7 @@ describe('resolveMidStreamRateLimitResetAt', () => {
 
   it('falls back to the default when resetsAt is unparseable', async () => {
     const { resolveMidStreamRateLimitResetAt } = await import(
-      '../core/quota-manager.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     const quota = {
       primary: {
@@ -559,7 +608,7 @@ describe('resolveMidStreamRateLimitResetAt', () => {
 
   it('uses primary from a single-primary snapshot', async () => {
     const { resolveMidStreamRateLimitResetAt } = await import(
-      '../core/quota-manager.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     const primaryReset = new Date(now + 300_000).toISOString()
     const quota = {
@@ -579,7 +628,7 @@ describe('resolveMidStreamRateLimitResetAt', () => {
 
   it('does not borrow primary for a secondary-named frame', async () => {
     const { resolveMidStreamRateLimitResetAt } = await import(
-      '../core/quota-manager.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     const quota = {
       primary: {

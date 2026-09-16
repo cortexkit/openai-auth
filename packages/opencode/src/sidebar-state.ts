@@ -155,7 +155,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { acquireRefreshFileLock } from './core/refresh-file-lock'
+import { acquireRefreshFileLock } from '@cortexkit/openai-auth-core/internal'
 import { createLogger } from './logger'
 
 const logSb = createLogger('sidebar')

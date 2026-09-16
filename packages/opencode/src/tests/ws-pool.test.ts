@@ -455,7 +455,7 @@ describe('createWebSocketFetch', () => {
           { window: 'rate_limit_exceeded', resetAt: undefined },
         ])
         const { resolveMidStreamRateLimitResetAt } = await import(
-          '../core/quota-manager'
+          '@cortexkit/openai-auth-core/internal'
         )
         expect(
           resolveMidStreamRateLimitResetAt(

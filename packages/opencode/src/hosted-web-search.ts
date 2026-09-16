@@ -1,6 +1,5 @@
+import { isRecord } from '@cortexkit/openai-auth-core/internal'
 import { type ToolDefinition, tool } from '@opencode-ai/plugin'
-
-import { isRecord } from './util/record'
 
 const HOSTED_WEB_SEARCH_ID_PREFIX = 'ws_'
 const hostedWebSearchItems = new Map<string, Record<string, unknown>>()

@@ -1,4 +1,6 @@
 /** @jsxImportSource @opentui/solid */
+
+import { errorMessage, openUrl } from '@cortexkit/openai-auth-core/internal'
 import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import { createLogger } from '../logger'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
@@ -9,8 +11,6 @@ import {
   resolveSessionSidebarRouting,
   type SidebarState,
 } from '../sidebar-state.js'
-import { errorMessage } from '../util/error'
-import { openUrl } from '../util/open-url'
 
 const log = createLogger('rpc-tui')
 

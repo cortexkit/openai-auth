@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { AccountStorage } from '../core/accounts'
+import type { AccountStorage } from '@cortexkit/openai-auth-core/internal'
 import {
   buildKeepwarmBody,
   buildKeepwarmCapture,

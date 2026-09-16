@@ -1,20 +1,19 @@
 #!/usr/bin/env node
 
 import {
-  getAccountStoragePath,
+  assertFallbackAccountIdAllowed,
+  beginAccountLogin,
   loadAccounts,
   mutateAccounts,
   type OAuthAccount,
+  openUrl,
   readConfigRosterIds,
-} from './core/accounts'
-import {
-  assertFallbackAccountIdAllowed,
-  beginAccountLogin,
   upsertAccount,
-} from './core/oauth'
-import { openUrl } from './util/open-url'
+} from '@cortexkit/openai-auth-core/internal'
+import { getAccountPaths, getAccountStoragePath } from './core/account-paths'
+import { PackageVersion } from './version'
 
-export { openUrl as openBrowserForLogin } from './util/open-url'
+export { openUrl as openBrowserForLogin } from '@cortexkit/openai-auth-core/internal'
 
 function usage() {
   console.log(`Usage:
@@ -74,6 +73,7 @@ async function main() {
       const { url, instructions, completion } = await beginAccountLogin({
         label,
         headless,
+        version: PackageVersion,
       })
 
       console.log('\nOpen this URL in your browser and complete sign-in:\n')
@@ -101,7 +101,7 @@ async function main() {
         }
         upsertAccount(current.accounts, account as unknown as OAuthAccount)
         return current
-      })
+      }, getAccountPaths())
 
       if (selfFallback) {
         console.error(
@@ -119,7 +119,7 @@ async function main() {
     }
 
     case 'list': {
-      const storage = await loadAccounts()
+      const storage = await loadAccounts(getAccountPaths())
       if (!storage || storage.accounts.length === 0) {
         console.log('No fallback accounts configured.')
       } else {
@@ -163,7 +163,7 @@ async function main() {
           mutatorSplicedIt = true
           return current
         },
-        configPath,
+        getAccountPaths(configPath),
         { allowDrop: [targetId] },
       )
 

@@ -9,10 +9,13 @@ import {
 import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import {
+  acquireRefreshFileLock,
+  migrateIfNeeded,
+  type OAuthAccount,
+} from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
-import type { OAuthAccount } from '../core/accounts.ts'
-import { migrateIfNeeded } from '../core/accounts.ts'
-import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
+import { getAccountPaths } from '../core/account-paths'
 import { QUOTA_STALENESS_MS } from '../core/sticky-routing.ts'
 import {
   AuthPersistError,
@@ -259,7 +262,7 @@ describe('integration: migration', () => {
         refresh: 'test-refresh-token',
         expires: Date.now() + 3600_000,
       },
-      configFile,
+      getAccountPaths(configFile),
     )
 
     const cfg = JSON.parse(readFileSync(configFile, 'utf8'))
@@ -287,7 +290,7 @@ describe('integration: migration', () => {
         refresh: 'r1',
         expires: Date.now() + 3600_000,
       },
-      configFile,
+      getAccountPaths(configFile),
     )
     const first = JSON.parse(readFileSync(configFile, 'utf8'))
 
@@ -299,7 +302,7 @@ describe('integration: migration', () => {
         refresh: 'r2',
         expires: Date.now() + 3600_000,
       },
-      configFile,
+      getAccountPaths(configFile),
     )
     const second = JSON.parse(readFileSync(configFile, 'utf8'))
 
@@ -7763,13 +7766,13 @@ describe('integration: no real config read', () => {
   })
 
   it('getAccountStoragePath uses the isolated temp file', () => {
-    const { getAccountStoragePath } = require('../core/accounts.ts')
+    const { getAccountStoragePath } = require('../core/account-paths.ts')
     const path = getAccountStoragePath()
     expect(path).toBe(configFile)
   })
 
   it('getAccountStatePath uses the isolated temp file', () => {
-    const { getAccountStatePath } = require('../core/accounts.ts')
+    const { getAccountStatePath } = require('../core/account-paths.ts')
     const path = getAccountStatePath()
     expect(path).toBe(stateFile)
   })

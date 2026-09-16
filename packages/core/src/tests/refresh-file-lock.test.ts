@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { mkdir, readFile, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
+import { acquireRefreshFileLock } from '../refresh-file-lock.ts'
 
 let dir: string
 

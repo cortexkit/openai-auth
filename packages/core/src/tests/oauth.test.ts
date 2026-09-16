@@ -4,6 +4,7 @@ import {
   base64UrlEncode,
   beginAccountLogin,
   buildAuthorizeUrl,
+  buildUserAgent,
   completeDeviceAuth,
   escapeHtml,
   extractAccountId,
@@ -19,10 +20,21 @@ import {
   startOAuthServer,
   upsertAccount,
   waitForOAuthCallback,
-} from '../core/oauth'
+} from '../oauth'
 
 const RESERVED_ACCOUNT_ID_ERROR =
   '"main" is a reserved account id; choose a different label.'
+
+// Host package version the device-auth calls below send. Any string works for
+// these tests; the byte-for-byte User-Agent OpenCode sends is pinned separately
+// in user-agent.test.ts.
+const TEST_VERSION = '9.9.9'
+
+describe('User-Agent', () => {
+  test('is the product name and the version the host supplied', () => {
+    expect(buildUserAgent('1.2.3')).toBe('cortexkit-opencode-openai-auth/1.2.3')
+  })
+})
 
 // ---------------------------------------------------------------------------
 // upsertAccount
@@ -355,7 +367,11 @@ describe('reserved fallback account ids', () => {
 
   test('headless login rejects a reserved label before starting device auth', async () => {
     await expect(
-      beginAccountLogin({ headless: true, label: 'MaIn' }),
+      beginAccountLogin({
+        headless: true,
+        label: 'MaIn',
+        version: TEST_VERSION,
+      }),
     ).rejects.toThrow(RESERVED_ACCOUNT_ID_ERROR)
   })
 
@@ -397,7 +413,10 @@ describe('reserved fallback account ids', () => {
       throw new Error(`unexpected fetch: ${urlStr}`)
     }) as unknown as typeof globalThis.fetch
 
-    const { completion } = await beginAccountLogin({ headless: true })
+    const { completion } = await beginAccountLogin({
+      headless: true,
+      version: TEST_VERSION,
+    })
     await expect(completion).rejects.toThrow(RESERVED_ACCOUNT_ID_ERROR)
   })
 
@@ -419,7 +438,9 @@ describe('reserved fallback account ids', () => {
       return originalFetch(url as RequestInfo, init as RequestInit | undefined)
     }) as unknown as typeof globalThis.fetch
 
-    const { url, completion } = await beginAccountLogin()
+    const { url, completion } = await beginAccountLogin({
+      version: TEST_VERSION,
+    })
     const completionError = completion.catch((error) => error)
     const state = new URL(url).searchParams.get('state')
     expect(state).toBeString()
@@ -862,7 +883,7 @@ describe('Device flow polling timeout and abort (Fix 2)', () => {
     }
 
     const start = Date.now()
-    await expect(completeDeviceAuth(deviceData)).rejects.toThrow(
+    await expect(completeDeviceAuth(deviceData, TEST_VERSION)).rejects.toThrow(
       'Device authorization expired',
     )
     expect(Date.now() - start).toBeLessThan(3000) // should fail quickly
@@ -883,7 +904,7 @@ describe('Device flow polling timeout and abort (Fix 2)', () => {
     setTimeout(() => controller.abort(), 100)
 
     await expect(
-      completeDeviceAuth(deviceData, controller.signal),
+      completeDeviceAuth(deviceData, TEST_VERSION, controller.signal),
     ).rejects.toThrow('Device authorization cancelled')
   })
 })
@@ -971,7 +992,10 @@ describe('login stamps lastRefreshedAt (token-rollback root fix)', () => {
     }) as unknown as typeof globalThis.fetch
 
     const before = Date.now()
-    const { completion } = await beginAccountLogin({ headless: true })
+    const { completion } = await beginAccountLogin({
+      headless: true,
+      version: TEST_VERSION,
+    })
     const account = (await completion) as IngestAccount
 
     expect(typeof account.lastRefreshedAt).toBe('number')

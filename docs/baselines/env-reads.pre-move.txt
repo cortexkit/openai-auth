@@ -1,0 +1,66 @@
+# process.env enumeration over the s1 move list.
+# Measured at base commit 7f7b5891bcbef5b3a2ec1b48ea2e6c8b57db854e, clean tree, before any s1 edit.
+# command per file: grep -n 'process\.env' <file>
+
+== packages/opencode/src/core/accounts.ts
+  (no matches)
+== packages/opencode/src/core/oauth.ts
+  (no matches)
+== packages/opencode/src/core/reset-credits.ts
+  (no matches)
+== packages/opencode/src/core/quota-manager.ts
+  (no matches)
+== packages/opencode/src/core/refresh-all-quota.ts
+  (no matches)
+== packages/opencode/src/core/backoff.ts
+  (no matches)
+== packages/opencode/src/core/cachekeep.ts
+  (no matches)
+== packages/opencode/src/core/background-quota-refresh.ts
+  (no matches)
+== packages/opencode/src/core/atomic-write.ts
+  (no matches)
+== packages/opencode/src/core/provider.ts
+  (no matches)
+== packages/opencode/src/core/sticky-routing.ts
+  (no matches)
+== packages/opencode/src/core/account-paths.ts
+  23:  if (process.env.OPENCODE_CONFIG_DIR?.trim()) {
+  24:    return process.env.OPENCODE_CONFIG_DIR.trim()
+  27:    process.env.XDG_CONFIG_HOME || join(homedir(), '.config'),
+  34:    process.env.OPENCODE_OPENAI_AUTH_FILE?.trim() ||
+  93:  const explicit = process.env.OPENCODE_OPENAI_AUTH_STATE_FILE?.trim()
+== packages/opencode/src/core/refresh-file-lock.ts
+  (no matches)
+== packages/opencode/src/logger.ts
+  19:const isTestEnv = process.env.NODE_ENV === 'test'
+  24:    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE ??
+  34:  const env = process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL as Level | undefined
+== packages/opencode/src/commands.ts
+  (no matches)
+== packages/opencode/src/rpc/notifications.ts
+  (no matches)
+== packages/opencode/src/rpc/port-file.ts
+  (no matches)
+== packages/opencode/src/rpc/protocol.ts
+  (no matches)
+== packages/opencode/src/rpc/rpc-client.ts
+  (no matches)
+== packages/opencode/src/rpc/rpc-dir.ts
+  21:  const base = process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state')
+  27:  const override = process.env[RPC_DIR_ENV]?.trim()
+  38:  const override = process.env[RPC_DIR_ENV]?.trim()
+== packages/opencode/src/rpc/rpc-server.ts
+  (no matches)
+== packages/opencode/src/util/error.ts
+  (no matches)
+== packages/opencode/src/util/open-url.ts
+  (no matches)
+== packages/opencode/src/util/proxy-env.ts
+  2:  return process.env[name] ?? process.env[name.toLowerCase()]
+== packages/opencode/src/util/record.ts
+  (no matches)
+== packages/opencode/src/util/stable-json.ts
+  (no matches)
+== packages/opencode/src/util/uuid-v7.ts
+  (no matches)
