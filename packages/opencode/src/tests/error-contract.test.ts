@@ -11,10 +11,11 @@
 import { describe, expect, it, jest } from 'bun:test'
 import {
   buildRefreshOperationError,
+  codexRefreshFn,
   isTransientRefreshError,
   NON_TRANSIENT_REFRESH_RETRY_DELAY_MS,
-} from '../core/backoff.ts'
-import { codexRefreshFn, type ProviderHttpError } from '../core/provider.ts'
+  type ProviderHttpError,
+} from '@cortexkit/openai-auth-core/internal'
 
 describe('error contract', () => {
   // -------------------------------------------------------------------

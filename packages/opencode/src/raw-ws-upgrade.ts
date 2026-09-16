@@ -1,4 +1,4 @@
-import { isRecord } from './util/record'
+import { isRecord } from '@cortexkit/openai-auth-core/internal'
 
 export function rejectedUpgradeStatus(statusLine: string): number | undefined {
   const status = Number(statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})/)?.[1])

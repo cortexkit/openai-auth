@@ -1,6 +1,8 @@
+import {
+  type AccountStorage,
+  normalizeQuotaHeaders,
+} from '@cortexkit/openai-auth-core/internal'
 import { sanitizeHttpFallbackInit } from '../codex-http'
-import { normalizeQuotaHeaders } from '../quota-normalize'
-import type { AccountStorage } from './accounts.ts'
 
 // ---------------------------------------------------------------------------
 // Types

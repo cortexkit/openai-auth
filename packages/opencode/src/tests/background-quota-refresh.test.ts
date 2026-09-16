@@ -3,6 +3,12 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  acquireRefreshFileLock,
+  type RefreshAllQuotaDeps,
+  type RefreshAllQuotaResult,
+} from '@cortexkit/openai-auth-core/internal'
+import { getAccountPaths } from '../core/account-paths'
+import {
   acquireBackgroundRefreshLock,
   BACKGROUND_QUOTA_FRESHNESS_MS,
   BACKGROUND_QUOTA_REFRESH_INTERVAL_MS,
@@ -12,11 +18,6 @@ import {
   BackgroundQuotaRefresh,
   refreshQuotaInBackground,
 } from '../core/background-quota-refresh'
-import type {
-  RefreshAllQuotaDeps,
-  RefreshAllQuotaResult,
-} from '../core/refresh-all-quota'
-import { acquireRefreshFileLock } from '../core/refresh-file-lock'
 
 function timerHarness() {
   let callback: (() => void) | undefined
@@ -65,7 +66,12 @@ describe('BackgroundQuotaRefresh', () => {
   })
 
   test('concurrent background ticks claim a lock so only one refreshes', async () => {
-    const deps = { configPath: '/tmp/test-config.json' } as RefreshAllQuotaDeps
+    const deps = {
+      paths: {
+        configPath: '/tmp/test-config.json',
+        statePath: '/tmp/test-config.state.json',
+      },
+    } as RefreshAllQuotaDeps
     let held = false
     const release = mock(async () => {
       held = false
@@ -99,7 +105,12 @@ describe('BackgroundQuotaRefresh', () => {
   })
 
   test('a lock-mechanism failure fails open and still refreshes', async () => {
-    const deps = { configPath: '/tmp/test-config.json' } as RefreshAllQuotaDeps
+    const deps = {
+      paths: {
+        configPath: '/tmp/test-config.json',
+        statePath: '/tmp/test-config.state.json',
+      },
+    } as RefreshAllQuotaDeps
     const acquireLock = mock(async () => {
       throw new Error('lock filesystem unavailable')
     })
@@ -114,7 +125,7 @@ describe('BackgroundQuotaRefresh', () => {
     const dir = mkdtempSync(join(tmpdir(), 'oai-bg-lock-'))
     const configPath = join(dir, 'config.json')
     try {
-      const deps = { configPath } as RefreshAllQuotaDeps
+      const deps = { paths: getAccountPaths(configPath) } as RefreshAllQuotaDeps
       let resolveRefresh!: () => void
       const refreshFn = mock(
         () =>

@@ -6,6 +6,7 @@
       "name": "@cortexkit/openai-auth",
       "devDependencies": {
         "@biomejs/biome": "2.5.13",
+        "@cortexkit/openai-auth-core": "workspace:*",
         "@earendil-works/pi-ai": "0.85.1",
         "@earendil-works/pi-coding-agent": "0.85.1",
         "@earendil-works/pi-tui": "0.85.1",
@@ -17,9 +18,12 @@
         "typescript": "7.0.2",
       },
     },
+    "packages/core": {
+      "name": "@cortexkit/openai-auth-core",
+    },
     "packages/opencode": {
       "name": "@cortexkit/opencode-openai-auth",
-      "version": "0.7.1",
+      "version": "0.7.2",
       "bin": {
         "openai-auth": "./dist/cli.js",
       },
@@ -36,7 +40,7 @@
     },
     "packages/pi": {
       "name": "@cortexkit/pi-openai-auth",
-      "version": "0.7.1",
+      "version": "0.7.2",
       "peerDependencies": {
         "@earendil-works/pi-ai": ">=0.80.10",
         "@earendil-works/pi-coding-agent": ">=0.80.10",
@@ -178,6 +182,8 @@
     "@biomejs/cli-win32-arm64": ["@biomejs/cli-win32-arm64@2.5.13", "", { "os": "win32", "cpu": "arm64" }, "sha512-+WD13qshXrr0Icv4BfsAdzm8Fs3TL+nZ59zEQxsYNd8lcgZJ0A5+OrlwsL1PipVCmWeRpxgIPD6DAcEd7smkCQ=="],
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.5.13", "", { "os": "win32", "cpu": "x64" }, "sha512-VOofU/nW761XWzUeUNE8zzYNyPrxuMuNFMizL0qz7J75yeV8N7WFheUlk1/K6dOkaFpH9wJ+lDKlwjAbw0346w=="],
+
+    "@cortexkit/openai-auth-core": ["@cortexkit/openai-auth-core@workspace:packages/core"],
 
     "@cortexkit/opencode-openai-auth": ["@cortexkit/opencode-openai-auth@workspace:packages/opencode"],
 

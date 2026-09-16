@@ -9,7 +9,8 @@ import {
   type OAuthAccount,
   saveAccountState,
   saveAccounts,
-} from '../core/accounts.ts'
+} from '@cortexkit/openai-auth-core/internal'
+import { getAccountPaths } from '../core/account-paths'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
 
 let dir: string
@@ -59,7 +60,7 @@ describe('account runtime state merge', () => {
       lastRefreshedAt: 1_700_000_000_000,
       quota: quotaAt(100),
     }
-    await saveAccounts(makeStorage(original), cfgPath)
+    await saveAccounts(makeStorage(original), getAccountPaths(cfgPath))
 
     const rotated: OAuthAccount = {
       ...original,
@@ -69,15 +70,18 @@ describe('account runtime state merge', () => {
       lastRefreshedAt: 1_700_000_500_000,
       quota: quotaAt(100),
     }
-    await saveAccountState(makeStorage(rotated), cfgPath)
+    await saveAccountState(makeStorage(rotated), getAccountPaths(cfgPath))
 
     const staleSnapshotWithNewerQuota: OAuthAccount = {
       ...original,
       quota: quotaAt(1_700_000_600_000),
     }
-    await saveAccountState(makeStorage(staleSnapshotWithNewerQuota), cfgPath)
+    await saveAccountState(
+      makeStorage(staleSnapshotWithNewerQuota),
+      getAccountPaths(cfgPath),
+    )
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     const account = loaded?.accounts[0] as OAuthAccount
 
     expect(account.access).toBe('new-access-token')
@@ -96,7 +100,10 @@ describe('account runtime state merge', () => {
       expires: 1_700_003_600_000,
       quota: quotaAt(100),
     }
-    await saveAccounts(makeStorage(freshWithoutRefreshTime), cfgPath)
+    await saveAccounts(
+      makeStorage(freshWithoutRefreshTime),
+      getAccountPaths(cfgPath),
+    )
 
     const staleWithNewerQuota: OAuthAccount = {
       id: freshWithoutRefreshTime.id,
@@ -106,9 +113,12 @@ describe('account runtime state merge', () => {
       expires: 1_700_000_100_000,
       quota: quotaAt(1_700_000_600_000),
     }
-    await saveAccountState(makeStorage(staleWithNewerQuota), cfgPath)
+    await saveAccountState(
+      makeStorage(staleWithNewerQuota),
+      getAccountPaths(cfgPath),
+    )
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     const account = loaded?.accounts[0] as OAuthAccount
 
     expect(account.access).toBe('fresh-access-token')
@@ -128,7 +138,7 @@ describe('account runtime state merge', () => {
       lastRefreshedAt: 1_700_000_000_000,
       quota: quotaAt(100),
     }
-    await saveAccounts(makeStorage(laterExpiry), cfgPath)
+    await saveAccounts(makeStorage(laterExpiry), getAccountPaths(cfgPath))
 
     const staleEqualRefreshTime: OAuthAccount = {
       id: laterExpiry.id,
@@ -139,9 +149,12 @@ describe('account runtime state merge', () => {
       lastRefreshedAt: laterExpiry.lastRefreshedAt,
       quota: quotaAt(1_700_000_600_000),
     }
-    await saveAccountState(makeStorage(staleEqualRefreshTime), cfgPath)
+    await saveAccountState(
+      makeStorage(staleEqualRefreshTime),
+      getAccountPaths(cfgPath),
+    )
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     const account = loaded?.accounts[0] as OAuthAccount
 
     expect(account.access).toBe('later-expiry-access-token')
@@ -165,7 +178,10 @@ describe('account runtime state merge', () => {
       },
       quota: quotaAt(100),
     }
-    await saveAccounts(makeStorage(accountWithBackoff), cfgPath)
+    await saveAccounts(
+      makeStorage(accountWithBackoff),
+      getAccountPaths(cfgPath),
+    )
 
     const staleWithoutError: OAuthAccount = {
       id: accountWithBackoff.id,
@@ -175,9 +191,12 @@ describe('account runtime state merge', () => {
       expires: accountWithBackoff.expires,
       quota: quotaAt(1_700_000_600_000),
     }
-    await saveAccountState(makeStorage(staleWithoutError), cfgPath)
+    await saveAccountState(
+      makeStorage(staleWithoutError),
+      getAccountPaths(cfgPath),
+    )
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     const account = loaded?.accounts[0] as OAuthAccount
 
     expect(account.lastRefreshError?.message).toBe('active refresh backoff')

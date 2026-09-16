@@ -10,12 +10,13 @@ import {
 import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type {
-  AccountManagerOptions,
-  AccountStorage,
-  OAuthAccount,
-} from '../core/accounts.ts'
-import { acquireRefreshFileLock } from '../core/refresh-file-lock.ts'
+import {
+  type AccountManagerOptions,
+  type AccountStorage,
+  acquireRefreshFileLock,
+  type OAuthAccount,
+} from '@cortexkit/openai-auth-core/internal'
+import { getAccountPaths } from '../core/account-paths'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_LOG_FILE,
@@ -78,7 +79,7 @@ describe('request-path bookkeeping never fails the caller', () => {
 
   it('markUsed swallows a save failure and leaves the served response intact', async () => {
     const { FallbackAccountManager, saveAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     const account = oauthAccount('fb-1')
     await saveAccounts(
@@ -87,11 +88,13 @@ describe('request-path bookkeeping never fails the caller', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [account],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
 
     breakStateWrites()
-    const manager = new FallbackAccountManager({ configPath: cfgPath })
+    const manager = new FallbackAccountManager({
+      paths: getAccountPaths(cfgPath),
+    })
 
     // Must resolve, not reject: the caller has a provider response to return.
     expect(await manager.markUsed(account).then(() => 'resolved')).toBe(
@@ -101,7 +104,7 @@ describe('request-path bookkeeping never fails the caller', () => {
 
   it('fallback selection swallows a bookkeeping save failure and still returns candidates', async () => {
     const { FallbackAccountManager, saveAccounts, loadAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     // An expired token forces the refresh branch, which sets `changed` and makes
     // selection attempt the bookkeeping save.
@@ -112,14 +115,14 @@ describe('request-path bookkeeping never fails the caller', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [account],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
-    const storage = await loadAccounts(cfgPath)
+    const storage = await loadAccounts(getAccountPaths(cfgPath))
     expect(storage).not.toBeNull()
 
     breakStateWrites()
     const manager = new FallbackAccountManager({
-      configPath: cfgPath,
+      paths: getAccountPaths(cfgPath),
       refreshFn: async () => ({
         access: 'rotated-access',
         refresh: 'rotated-refresh',
@@ -139,8 +142,9 @@ function wait(ms: number) {
 }
 
 type FallbackAccountManagerConstructor =
-  typeof import('../core/accounts.ts').FallbackAccountManager
-type MutateAccountsFn = typeof import('../core/accounts.ts').mutateAccounts
+  typeof import('@cortexkit/openai-auth-core/internal').FallbackAccountManager
+type MutateAccountsFn =
+  typeof import('@cortexkit/openai-auth-core/internal').mutateAccounts
 
 function createManagerRemovingAccountOnFirstLoad(
   FallbackAccountManagerCtor: FallbackAccountManagerConstructor,
@@ -161,7 +165,7 @@ function createManagerRemovingAccountOnFirstLoad(
             (candidate) => candidate.id !== accountId,
           )
           return current
-        }, configPath)
+        }, getAccountPaths(configPath))
       }
       return loaded
     }
@@ -172,7 +176,9 @@ function createManagerRemovingAccountOnFirstLoad(
 
 describe('accounts store', () => {
   it('load/save round-trip: accounts, main provider, version', async () => {
-    const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
+    const { loadAccounts, saveAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     const account: OAuthAccount = {
       id: randomUUID(),
@@ -190,11 +196,11 @@ describe('accounts store', () => {
       accounts: [account],
     }
 
-    await saveAccounts(storage, cfgPath)
+    await saveAccounts(storage, getAccountPaths(cfgPath))
     expect(existsSync(cfgPath)).toBe(true)
     expect(existsSync(statePath)).toBe(true)
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded).not.toBeNull()
     expect(loaded!.main?.provider).toBe('openai')
     expect(loaded!.accounts.length).toBe(1)
@@ -213,7 +219,9 @@ describe('accounts store', () => {
   })
 
   it('round-trips sticky-balanced routing mode', async () => {
-    const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
+    const { loadAccounts, saveAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     await saveAccounts(
       {
@@ -222,14 +230,18 @@ describe('accounts store', () => {
         routing: { mode: 'sticky-balanced' },
         accounts: [],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
 
-    expect((await loadAccounts(cfgPath))?.routing?.mode).toBe('sticky-balanced')
+    expect((await loadAccounts(getAccountPaths(cfgPath)))?.routing?.mode).toBe(
+      'sticky-balanced',
+    )
   })
 
   it('round-trips cachekeep sustain', async () => {
-    const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
+    const { loadAccounts, saveAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     await saveAccounts(
       {
@@ -238,14 +250,18 @@ describe('accounts store', () => {
         accounts: [],
         cachekeep: { enabled: true, sustain: true },
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
 
-    expect((await loadAccounts(cfgPath))?.cachekeep?.sustain).toBe(true)
+    expect(
+      (await loadAccounts(getAccountPaths(cfgPath)))?.cachekeep?.sustain,
+    ).toBe(true)
   })
 
   it('state file has 0600 permissions', async () => {
-    const { saveAccounts } = await import('../core/accounts.ts')
+    const { saveAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const { statSync } = await import('node:fs')
 
     const account: OAuthAccount = {
@@ -262,7 +278,7 @@ describe('accounts store', () => {
       accounts: [account],
     }
 
-    await saveAccounts(storage, cfgPath)
+    await saveAccounts(storage, getAccountPaths(cfgPath))
     const mode = statSync(statePath).mode & 0o777
     // 0600 or 0o600 — on some systems umask may apply; at minimum the file must NOT be world-readable
     expect(mode & 0o077).toBe(0)
@@ -270,7 +286,9 @@ describe('accounts store', () => {
   })
 
   it('atomic write: no partial/tmp file left behind', async () => {
-    const { saveAccounts } = await import('../core/accounts.ts')
+    const { saveAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const { readdirSync } = await import('node:fs')
 
     const account: OAuthAccount = {
@@ -287,7 +305,7 @@ describe('accounts store', () => {
       accounts: [account],
     }
 
-    await saveAccounts(storage, cfgPath)
+    await saveAccounts(storage, getAccountPaths(cfgPath))
 
     // No .tmp files left behind
     const files = readdirSync(dir)
@@ -297,7 +315,7 @@ describe('accounts store', () => {
 
   it('saveAccountState writes state that loadAccounts merges back', async () => {
     const { saveAccounts, saveAccountState, loadAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
 
     const acct1: OAuthAccount = {
@@ -322,7 +340,7 @@ describe('accounts store', () => {
       main: { type: 'opencode', provider: 'openai' },
       accounts: [acct1, acct2],
     }
-    await saveAccounts(storage, cfgPath)
+    await saveAccounts(storage, getAccountPaths(cfgPath))
 
     // Now update only acct2's state via saveAccountState
     const updatedAcct2: OAuthAccount = {
@@ -335,9 +353,9 @@ describe('accounts store', () => {
       main: { type: 'opencode', provider: 'openai' },
       accounts: [acct1, updatedAcct2],
     }
-    await saveAccountState(updateStorage, cfgPath)
+    await saveAccountState(updateStorage, getAccountPaths(cfgPath))
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded!.accounts.length).toBe(2)
 
     // acct2 access token should be the updated one from state
@@ -354,7 +372,9 @@ describe('accounts store', () => {
   })
 
   it('round-trips optional dynamic quota metadata through the runtime state file', async () => {
-    const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
+    const { loadAccounts, saveAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const account = oauthAccount('quota-metadata', {
       quota: {
         primary: {
@@ -375,10 +395,10 @@ describe('accounts store', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [account],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     const quota = (loaded?.accounts[0] as OAuthAccount | undefined)?.quota
     expect(quota?.primary?.windowMinutes).toBe(10_080)
     expect(quota?.resetCreditsAvailable).toBe(4)
@@ -386,7 +406,9 @@ describe('accounts store', () => {
   })
 
   it('loads an older quota snapshot without dynamic metadata', async () => {
-    const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
+    const { loadAccounts, saveAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const account = oauthAccount('old-quota', {
       quota: {
         primary: {
@@ -403,31 +425,35 @@ describe('accounts store', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [account],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     const quota = (loaded?.accounts[0] as OAuthAccount | undefined)?.quota
     expect(quota?.primary?.windowMinutes).toBeUndefined()
     expect(quota?.resetCreditsAvailable).toBeUndefined()
   })
 
   it('drops missing and malformed reset state while retaining storage version', async () => {
-    const { loadAccounts } = await import('../core/accounts.ts')
+    const { loadAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     for (const reset of [undefined, null, [], 'invalid']) {
       const config: Record<string, unknown> = { version: 1, accounts: [] }
       if (reset !== undefined) config.reset = reset
       writeFileSync(cfgPath, `${JSON.stringify(config)}\n`)
 
-      const loaded = await loadAccounts(cfgPath)
+      const loaded = await loadAccounts(getAccountPaths(cfgPath))
       expect(loaded?.version).toBe(1)
       expect(loaded?.reset).toBeUndefined()
     }
   })
 
   it('normalizes reset state per account without discarding valid siblings', async () => {
-    const { loadAccounts } = await import('../core/accounts.ts')
+    const { loadAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     writeFileSync(
       cfgPath,
       `${JSON.stringify({
@@ -477,7 +503,7 @@ describe('accounts store', () => {
       })}\n`,
     )
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded).toMatchObject({
       version: 1,
       reset: {
@@ -525,13 +551,15 @@ describe('accounts store', () => {
   })
 
   it('drops prototype-sensitive reset account keys without polluting lookups', async () => {
-    const { loadAccounts } = await import('../core/accounts.ts')
+    const { loadAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     writeFileSync(
       cfgPath,
       '{"version":1,"accounts":[],"reset":{"__proto__":{"cooldownUntil":999},"constructor":{"cooldownUntil":999},"prototype":{"cooldownUntil":999},"safe":{"cooldownUntil":123}}}\n',
     )
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
 
     expect(loaded?.reset).toEqual({ safe: { cooldownUntil: 123 } })
     expect(
@@ -543,7 +571,9 @@ describe('accounts store', () => {
   })
 
   it('mutateAccounts persists independent reset states and unknown config keys', async () => {
-    const { loadAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    const { loadAccounts, mutateAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     writeFileSync(
       cfgPath,
       `${JSON.stringify({
@@ -569,9 +599,9 @@ describe('accounts store', () => {
         },
       }
       return current
-    }, cfgPath)
+    }, getAccountPaths(cfgPath))
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded?.reset).toEqual({
       main: {
         inFlight: {
@@ -592,7 +622,9 @@ describe('accounts store', () => {
   })
 
   it('saveAccounts waits for the file lock and merges with the latest on-disk accounts', async () => {
-    const { loadAccounts, saveAccounts } = await import('../core/accounts.ts')
+    const { loadAccounts, saveAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
 
     const staleAccount: OAuthAccount = {
       id: 'stale-writer',
@@ -619,7 +651,7 @@ describe('accounts store', () => {
     let settled = false
     const staleSave = saveAccounts(
       { version: 1, accounts: [staleAccount] },
-      cfgPath,
+      getAccountPaths(cfgPath),
     ).finally(() => {
       settled = true
     })
@@ -639,7 +671,7 @@ describe('accounts store', () => {
     await lock?.release()
     await staleSave
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded?.accounts.map((account) => account.id).sort()).toEqual([
       'latest-writer',
       'stale-writer',
@@ -650,7 +682,7 @@ describe('accounts store', () => {
 describe('account store migration locking', () => {
   it('serializes first-run migration with a concurrent structural add', async () => {
     const { loadAccounts, migrateIfNeeded, mutateAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     writeFileSync(
       cfgPath,
@@ -672,13 +704,16 @@ describe('account store migration locking', () => {
       refresh: 'existing-refresh',
       expires: Date.now() + 3600_000,
     }
-    const migration = migrateIfNeeded(existingToken, cfgPath).finally(() => {
+    const migration = migrateIfNeeded(
+      existingToken,
+      getAccountPaths(cfgPath),
+    ).finally(() => {
       migrationSettled = true
     })
     const addFallback = mutateAccounts((current) => {
       current.accounts.push(oauthAccount('concurrent-fallback'))
       return current
-    }, cfgPath).finally(() => {
+    }, getAccountPaths(cfgPath)).finally(() => {
       mutationSettled = true
     })
 
@@ -697,7 +732,7 @@ describe('account store migration locking', () => {
       }),
     ])
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded?.main?.provider).toBe('openai')
     expect(loaded?.accounts.map((account) => account.id)).toContain(
       'concurrent-fallback',
@@ -710,7 +745,9 @@ describe('account store migration locking', () => {
   })
 
   it('leaves an already migrated store unchanged on a second migration', async () => {
-    const { migrateIfNeeded } = await import('../core/accounts.ts')
+    const { migrateIfNeeded } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     writeFileSync(cfgPath, `${JSON.stringify({ webSockets: true })}\n`)
 
     await migrateIfNeeded(
@@ -720,7 +757,7 @@ describe('account store migration locking', () => {
         refresh: 'first-refresh',
         expires: Date.now() + 3600_000,
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
     const firstConfig = readFileSync(cfgPath, 'utf8')
     const firstState = readFileSync(statePath, 'utf8')
@@ -732,7 +769,7 @@ describe('account store migration locking', () => {
         refresh: 'second-refresh',
         expires: Date.now() + 3600_000,
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
 
     expect(readFileSync(cfgPath, 'utf8')).toBe(firstConfig)
@@ -748,7 +785,7 @@ describe('removed fallback refresh guard', () => {
       loadAccounts,
       mutateAccounts,
       saveAccounts,
-    } = await import('../core/accounts.ts')
+    } = await import('@cortexkit/openai-auth-core/internal')
     const now = 1_700_000_000_000
     const account = oauthAccount('removed-during-refresh', {
       access: 'stale-access',
@@ -761,9 +798,9 @@ describe('removed fallback refresh guard', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [account],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
-    const snapshot = (await loadAccounts(cfgPath))!
+    const snapshot = (await loadAccounts(getAccountPaths(cfgPath)))!
     let refreshCalls = 0
 
     const manager = createManagerRemovingAccountOnFirstLoad(
@@ -772,7 +809,7 @@ describe('removed fallback refresh guard', () => {
       account.id,
       cfgPath,
       {
-        configPath: cfgPath,
+        paths: getAccountPaths(cfgPath),
         now: () => now,
         refreshFn: async () => {
           refreshCalls++
@@ -801,7 +838,7 @@ describe('removed fallback refresh guard', () => {
       'ACCOUNT_REMOVED_DURING_REFRESH',
     )
     expect(refreshCalls).toBe(0)
-    expect((await loadAccounts(cfgPath))?.accounts).toEqual([])
+    expect((await loadAccounts(getAccountPaths(cfgPath)))?.accounts).toEqual([])
   })
 
   it('rejects and skips an account removed while provider refresh is in flight', async () => {
@@ -811,7 +848,7 @@ describe('removed fallback refresh guard', () => {
       loadAccounts,
       mutateAccounts,
       saveAccounts,
-    } = await import('../core/accounts.ts')
+    } = await import('@cortexkit/openai-auth-core/internal')
     const now = 1_700_000_000_000
     const account = oauthAccount('removed-during-provider-refresh', {
       access: 'expired-access',
@@ -825,9 +862,9 @@ describe('removed fallback refresh guard', () => {
         accounts: [account],
         quota: { failClosedOnUnknownQuota: false },
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
-    const snapshot = (await loadAccounts(cfgPath))!
+    const snapshot = (await loadAccounts(getAccountPaths(cfgPath)))!
     let signalRefreshStarted: (() => void) | undefined
     const refreshStarted = new Promise<void>((resolve) => {
       signalRefreshStarted = resolve
@@ -841,7 +878,7 @@ describe('removed fallback refresh guard', () => {
         }) => void)
       | undefined
     const manager = new FallbackAccountManager({
-      configPath: cfgPath,
+      paths: getAccountPaths(cfgPath),
       now: () => now,
       refreshFn: async () => {
         signalRefreshStarted?.()
@@ -862,7 +899,7 @@ describe('removed fallback refresh guard', () => {
         (candidate) => candidate.id !== account.id,
       )
       return current
-    }, cfgPath)
+    }, getAccountPaths(cfgPath))
     resolveRefresh?.({
       access: 'fresh-access',
       refresh: 'fresh-refresh',
@@ -884,7 +921,7 @@ describe('removed fallback refresh guard', () => {
         ? directRefreshResult.reason
         : null,
     ).toBeInstanceOf(AccountRemovedDuringRefreshError)
-    expect((await loadAccounts(cfgPath))?.accounts).toEqual([])
+    expect((await loadAccounts(getAccountPaths(cfgPath)))?.accounts).toEqual([])
   })
 
   it('skips a removed account instead of selecting it through fail-open', async () => {
@@ -893,7 +930,7 @@ describe('removed fallback refresh guard', () => {
       loadAccounts,
       mutateAccounts,
       saveAccounts,
-    } = await import('../core/accounts.ts')
+    } = await import('@cortexkit/openai-auth-core/internal')
     const now = 1_700_000_000_000
     const account = oauthAccount('removed-before-selection', {
       access: 'still-unexpired-access',
@@ -907,9 +944,9 @@ describe('removed fallback refresh guard', () => {
         accounts: [account],
         quota: { failClosedOnUnknownQuota: false },
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
-    const snapshot = (await loadAccounts(cfgPath))!
+    const snapshot = (await loadAccounts(getAccountPaths(cfgPath)))!
     let refreshCalls = 0
 
     const manager = createManagerRemovingAccountOnFirstLoad(
@@ -918,7 +955,7 @@ describe('removed fallback refresh guard', () => {
       account.id,
       cfgPath,
       {
-        configPath: cfgPath,
+        paths: getAccountPaths(cfgPath),
         now: () => now,
         refreshFn: async () => {
           refreshCalls++
@@ -949,7 +986,7 @@ describe('mutateAccounts (authoritative structural edits)', () => {
 
   it('removal persists and is NOT resurrected by a load/save round-trip', async () => {
     const { loadAccounts, saveAccounts, mutateAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     await saveAccounts(
       {
@@ -957,16 +994,16 @@ describe('mutateAccounts (authoritative structural edits)', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [oauth('a'), oauth('b'), oauth('c')],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
 
     await mutateAccounts((current) => {
       const idx = current.accounts.findIndex((a) => a.id === 'b')
       current.accounts.splice(idx, 1)
       return current
-    }, cfgPath)
+    }, getAccountPaths(cfgPath))
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded?.accounts.map((a) => a.id)).toEqual(['a', 'c'])
 
     // The config file on disk must also no longer contain the removed id —
@@ -993,7 +1030,7 @@ describe('mutateAccounts (authoritative structural edits)', () => {
 
   it('saveAccountState with a stale snapshot does NOT re-add a removed account to state (incl. api-key)', async () => {
     const { loadAccounts, saveAccounts, mutateAccounts, saveAccountState } =
-      await import('../core/accounts.ts')
+      await import('@cortexkit/openai-auth-core/internal')
     const apiAccount = {
       id: 'api-1',
       type: 'api' as const,
@@ -1008,20 +1045,20 @@ describe('mutateAccounts (authoritative structural edits)', () => {
       main: { type: 'opencode' as const, provider: 'openai' as const },
       accounts: [oauth('a'), oauth('b'), apiAccount],
     }
-    await saveAccounts(initial, cfgPath)
+    await saveAccounts(initial, getAccountPaths(cfgPath))
 
     // Background worker holds a stale snapshot (still has b + api-1).
-    const stale = (await loadAccounts(cfgPath))!
+    const stale = (await loadAccounts(getAccountPaths(cfgPath)))!
 
     // b and api-1 are removed authoritatively.
     await mutateAccounts((current) => {
       current.accounts = current.accounts.filter((acc) => acc.id === 'a')
       return current
-    }, cfgPath)
+    }, getAccountPaths(cfgPath))
 
     // Stale worker writes state (default scope accounts:true). The roster gate
     // must drop the removed ids instead of re-writing their secrets.
-    await saveAccountState(stale, cfgPath)
+    await saveAccountState(stale, getAccountPaths(cfgPath))
 
     const stateRaw = readFileSync(statePath, 'utf8')
     const state = JSON.parse(stateRaw)
@@ -1032,7 +1069,7 @@ describe('mutateAccounts (authoritative structural edits)', () => {
 
   it('saveAccountState prunes a pre-existing orphan state entry absent from config', async () => {
     const { saveAccounts, saveAccountState } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     // Config roster = [a]; but the state file already has an orphan b at rest
     // (e.g. left by an earlier crash between the config and state writes).
@@ -1042,7 +1079,7 @@ describe('mutateAccounts (authoritative structural edits)', () => {
         main: { type: 'opencode' as const, provider: 'openai' as const },
         accounts: [oauth('a')],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
     const orphanState = {
       version: 1,
@@ -1060,7 +1097,7 @@ describe('mutateAccounts (authoritative structural edits)', () => {
         main: { type: 'opencode' as const, provider: 'openai' as const },
         accounts: [oauth('a')],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
 
     const stateRaw = readFileSync(statePath, 'utf8')
@@ -1070,7 +1107,7 @@ describe('mutateAccounts (authoritative structural edits)', () => {
 
   it('reordering persists (union-merge would have ignored it)', async () => {
     const { loadAccounts, saveAccounts, mutateAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     await saveAccounts(
       {
@@ -1078,7 +1115,7 @@ describe('mutateAccounts (authoritative structural edits)', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [oauth('x'), oauth('y'), oauth('z')],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
 
     // Swap x and z.
@@ -1087,15 +1124,15 @@ describe('mutateAccounts (authoritative structural edits)', () => {
       current.accounts[0] = current.accounts[2]!
       current.accounts[2] = tmp
       return current
-    }, cfgPath)
+    }, getAccountPaths(cfgPath))
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded?.accounts.map((a) => a.id)).toEqual(['z', 'y', 'x'])
   })
 
   it('preserves a concurrent add committed by another writer before the lock', async () => {
     const { loadAccounts, saveAccounts, mutateAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     await saveAccounts(
       {
@@ -1103,7 +1140,7 @@ describe('mutateAccounts (authoritative structural edits)', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [oauth('keep')],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
 
     // Hold the save lock so the mutate call blocks until we release it.
@@ -1119,7 +1156,7 @@ describe('mutateAccounts (authoritative structural edits)', () => {
       const idx = current.accounts.findIndex((a) => a.id === 'keep')
       if (idx !== -1) current.accounts.splice(idx, 1)
       return current
-    }, cfgPath)
+    }, getAccountPaths(cfgPath))
 
     // While blocked, another writer commits a brand-new account directly to disk
     // (writeFile, not saveAccounts — saveAccounts would block on the same lock).
@@ -1150,7 +1187,7 @@ describe('mutateAccounts (authoritative structural edits)', () => {
 
     // mutateAccounts read the freshest state under the lock, so it removed
     // 'keep' WITHOUT losing the concurrently-added 'concurrent'.
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded?.accounts.map((a) => a.id).sort()).toEqual(['concurrent'])
   })
 })
@@ -1183,14 +1220,16 @@ describe('mutateAccounts load-time roster preservation', () => {
   // an unrelated mutateAccounts call. The mutator never even touches 'b';
   // preservation is what keeps it on disk.
   it('PRESERVES a load-dropped entry after an unrelated mutateAccounts call (writes through)', async () => {
-    const { saveAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    const { saveAccounts, mutateAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     await saveAccounts(
       {
         version: 1,
         main: { type: 'opencode', provider: 'openai' },
         accounts: [oauthAccount('a'), oauthAccount('b')],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
     const stateRaw = readFileSync(statePath, 'utf8')
     const stateObj = JSON.parse(stateRaw)
@@ -1203,7 +1242,7 @@ describe('mutateAccounts load-time roster preservation', () => {
       current.refresh = current.refresh ?? {}
       current.refresh.intervalMinutes = 7
       return current
-    }, cfgPath)
+    }, getAccountPaths(cfgPath))
 
     const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
     // 'b' is still on disk, verbatim from the original raw entry.
@@ -1223,7 +1262,9 @@ describe('mutateAccounts load-time roster preservation', () => {
   // has no refresh for it) must not break MAIN refresh. This test pins
   // that failure mode directly.
   it('updateMainRefreshState-shaped mutation succeeds while a broken fallback exists (main refresh must not break)', async () => {
-    const { saveAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    const { saveAccounts, mutateAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const main = oauthAccount('main')
     const broken = oauthAccount('broken')
     await saveAccounts(
@@ -1232,7 +1273,7 @@ describe('mutateAccounts load-time roster preservation', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [main, broken],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
     const stateRaw = readFileSync(statePath, 'utf8')
     const stateObj = JSON.parse(stateRaw)
@@ -1249,7 +1290,7 @@ describe('mutateAccounts load-time roster preservation', () => {
         current.refresh.mainRefreshLeaseId = 'lease-1'
         current.refresh.mainRefreshLeaseUntil = Date.now() + 60_000
         return current
-      }, cfgPath)
+      }, getAccountPaths(cfgPath))
       resolved = true
     } catch (error) {
       rejected = error
@@ -1275,7 +1316,9 @@ describe('mutateAccounts load-time roster preservation', () => {
   // absent from current.accounts (load-dropped), and the allowDrop option
   // suppresses preservation so it is gone from disk after the call.
   it('removes a load-dropped account end to end when allowDrop is set', async () => {
-    const { saveAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    const { saveAccounts, mutateAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const a = oauthAccount('a')
     const broken = oauthAccount('broken')
     await saveAccounts(
@@ -1284,7 +1327,7 @@ describe('mutateAccounts load-time roster preservation', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [a, broken],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
     const stateRaw = readFileSync(statePath, 'utf8')
     const stateObj = JSON.parse(stateRaw)
@@ -1302,7 +1345,7 @@ describe('mutateAccounts load-time roster preservation', () => {
         if (idx !== -1) current.accounts.splice(idx, 1)
         return current
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
       { allowDrop: ['broken'] },
     )
 
@@ -1314,7 +1357,7 @@ describe('mutateAccounts load-time roster preservation', () => {
   // without allowDrop.
   it('allows a normal removal through the mutator', async () => {
     const { loadAccounts, saveAccounts, mutateAccounts } = await import(
-      '../core/accounts.ts'
+      '@cortexkit/openai-auth-core/internal'
     )
     await saveAccounts(
       {
@@ -1322,7 +1365,7 @@ describe('mutateAccounts load-time roster preservation', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [oauthAccount('a'), oauthAccount('b'), oauthAccount('c')],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
 
     await mutateAccounts((current) => {
@@ -1330,9 +1373,9 @@ describe('mutateAccounts load-time roster preservation', () => {
         (account) => account.id !== 'b',
       )
       return current
-    }, cfgPath)
+    }, getAccountPaths(cfgPath))
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     expect(loaded?.accounts.map((a) => a.id)).toEqual(['a', 'c'])
     const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
     expect(cfg.accounts.map((a: { id: string }) => a.id)).toEqual(['a', 'c'])
@@ -1341,7 +1384,9 @@ describe('mutateAccounts load-time roster preservation', () => {
   // First-run with no config file: no raw roster to preserve from; the
   // mutator runs as before.
   it('does not throw on first run with no config file', async () => {
-    const { mutateAccounts } = await import('../core/accounts.ts')
+    const { mutateAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     expect(existsSync(cfgPath)).toBe(false)
     expect(existsSync(statePath)).toBe(false)
 
@@ -1349,7 +1394,7 @@ describe('mutateAccounts load-time roster preservation', () => {
       mutateAccounts((current) => {
         current.accounts.push(oauthAccount('first'))
         return current
-      }, cfgPath),
+      }, getAccountPaths(cfgPath)),
     ).resolves.toBeDefined()
 
     const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
@@ -1360,7 +1405,9 @@ describe('mutateAccounts load-time roster preservation', () => {
   // blank/whitespace-only. A garbage entry that synthesize-a-uuid on load
   // must not be treated as "dropped" and preserved spuriously.
   it('blank and whitespace-padded raw ids do not trigger spurious preservation', async () => {
-    const { mutateAccounts } = await import('../core/accounts.ts')
+    const { mutateAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     writeConfigWithMixedEntries([
       { id: 'real-a', type: 'oauth', enabled: true },
       { id: '   ', type: 'oauth', enabled: true }, // whitespace only → not in roster
@@ -1372,7 +1419,7 @@ describe('mutateAccounts load-time roster preservation', () => {
       'string', // not a record → not in roster
     ])
 
-    await mutateAccounts((current) => current, cfgPath)
+    await mutateAccounts((current) => current, getAccountPaths(cfgPath))
 
     const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
     const ids = cfg.accounts.map((a: { id: string }) => a.id)
@@ -1386,7 +1433,9 @@ describe('mutateAccounts load-time roster preservation', () => {
   // An api-type account rejected for a bad baseURL is also load-dropped, and
   // the raw entry is preserved verbatim so re-add or re-login can fix it.
   it('also preserves a load-dropped api-type account (verbatim from raw)', async () => {
-    const { mutateAccounts } = await import('../core/accounts.ts')
+    const { mutateAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     writeFileSync(
       cfgPath,
       `${JSON.stringify({
@@ -1402,7 +1451,7 @@ describe('mutateAccounts load-time roster preservation', () => {
       `${JSON.stringify({ version: 1, accounts: {} })}\n`,
     )
 
-    await mutateAccounts((current) => current, cfgPath)
+    await mutateAccounts((current) => current, getAccountPaths(cfgPath))
 
     const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
     expect(cfg.accounts.map((a: { id: string }) => a.id).sort()).toEqual([
@@ -1425,7 +1474,9 @@ describe('mutateAccounts load-time roster preservation', () => {
   // `emittedIds` (post-mutator) decides whether the writer is already
   // emitting that id — and the F3 extraction dropped the second one.
   it('mutator re-add of a load-dropped entry does NOT append a duplicate raw entry', async () => {
-    const { saveAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    const { saveAccounts, mutateAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const healthy = oauthAccount('healthy')
     const broken = oauthAccount('broken')
     await saveAccounts(
@@ -1434,7 +1485,7 @@ describe('mutateAccounts load-time roster preservation', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [healthy, broken],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
     // Strip 'broken' from state — it is now load-dropped.
     const stateRaw = readFileSync(statePath, 'utf8')
@@ -1451,7 +1502,7 @@ describe('mutateAccounts load-time roster preservation', () => {
         expires: Date.now() + 3600_000,
       })
       return current
-    }, cfgPath)
+    }, getAccountPaths(cfgPath))
 
     const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
     const brokenEntries = cfg.accounts.filter(
@@ -1475,7 +1526,9 @@ describe('mutateAccounts load-time roster preservation', () => {
   // both sides. collectConfigRosterIds trims on the load side; this
   // test pins the trim on the writer side.
   it('mutator re-add of a load-dropped WHITESPACE-PADDED id does NOT duplicate', async () => {
-    const { saveAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    const { saveAccounts, mutateAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const rawId = '   padded   '
     const trimmedId = 'padded'
     await saveAccounts(
@@ -1484,7 +1537,7 @@ describe('mutateAccounts load-time roster preservation', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [oauthAccount('healthy'), oauthAccount(rawId)],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
     // Strip the state entry for the padded id so it is load-dropped.
     const stateRaw = readFileSync(statePath, 'utf8')
@@ -1502,7 +1555,7 @@ describe('mutateAccounts load-time roster preservation', () => {
         expires: Date.now() + 3600_000,
       })
       return current
-    }, cfgPath)
+    }, getAccountPaths(cfgPath))
 
     const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'))
     const paddedEntries = cfg.accounts.filter(
@@ -1527,7 +1580,9 @@ describe('mutateAccounts load-time roster preservation', () => {
 
 describe('saveAccounts load-time roster preservation', () => {
   it('preserves a load-dropped entry on a re-save even when the caller passes a storage without it (parallel to mutateAccounts)', async () => {
-    const { saveAccounts } = await import('../core/accounts.ts')
+    const { saveAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     // Seed config + state for [a, broken].
     await saveAccounts(
       {
@@ -1535,7 +1590,7 @@ describe('saveAccounts load-time roster preservation', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [oauthAccount('a'), oauthAccount('broken')],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
     // Strip 'broken' from the state file so the next saveAccounts call
     // re-reads a config where 'broken' is load-dropped — and the caller
@@ -1553,7 +1608,7 @@ describe('saveAccounts load-time roster preservation', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [oauthAccount('a')],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
 
     // 'broken' must come back to disk verbatim because saveAccounts
@@ -1584,7 +1639,9 @@ describe('normalizeStorage roster drop is loud on every load', () => {
   })
 
   it('emits a WARN naming the dropped ids when loadAccounts filters them out', async () => {
-    const { saveAccounts, loadAccounts } = await import('../core/accounts.ts')
+    const { saveAccounts, loadAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const { flushForTest } = await import('../logger.ts')
     await saveAccounts(
       {
@@ -1592,14 +1649,14 @@ describe('normalizeStorage roster drop is loud on every load', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [oauthAccount('keep-a'), oauthAccount('silent-drop')],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
     const stateRaw = readFileSync(statePath, 'utf8')
     const stateObj = JSON.parse(stateRaw)
     delete stateObj.accounts['silent-drop']
     writeFileSync(statePath, JSON.stringify(stateObj))
 
-    const loaded = await loadAccounts(cfgPath)
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
     await flushForTest()
     // The dropped id must not have survived the load.
     expect(loaded?.accounts.map((a) => a.id)).toEqual(['keep-a'])
@@ -1618,7 +1675,9 @@ describe('normalizeStorage roster drop is loud on every load', () => {
   // Preserved entries are appended to nextConfig.accounts after the
   // mutator runs, so logging next.accounts would under-report.
   it('write-debug log lists the actual written roster (preserved entry included)', async () => {
-    const { saveAccounts, mutateAccounts } = await import('../core/accounts.ts')
+    const { saveAccounts, mutateAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const { flushForTest } = await import('../logger.ts')
     process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = 'debug'
     // Use a UUID so the dropped-id dedup state does not collide with
@@ -1630,7 +1689,7 @@ describe('normalizeStorage roster drop is loud on every load', () => {
         main: { type: 'opencode', provider: 'openai' },
         accounts: [oauthAccount('healthy'), oauthAccount(preservedId)],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
     const stateRaw = readFileSync(statePath, 'utf8')
     const stateObj = JSON.parse(stateRaw)
@@ -1642,7 +1701,7 @@ describe('normalizeStorage roster drop is loud on every load', () => {
       current.refresh = current.refresh ?? {}
       current.refresh.intervalMinutes = 11
       return current
-    }, cfgPath)
+    }, getAccountPaths(cfgPath))
     await flushForTest()
 
     const logTxt = readFileSync(logFile, 'utf8')
@@ -1681,7 +1740,9 @@ describe('roster-drop WARN dedupes identical repeats, re-warns on set change', (
   })
 
   it('two consecutive loads with the same dropped id emit exactly one WARN', async () => {
-    const { saveAccounts, loadAccounts } = await import('../core/accounts.ts')
+    const { saveAccounts, loadAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const { flushForTest } = await import('../logger.ts')
     const droppedId = `dedup-${randomUUID()}`
     await saveAccounts(
@@ -1690,15 +1751,15 @@ describe('roster-drop WARN dedupes identical repeats, re-warns on set change', (
         main: { type: 'opencode', provider: 'openai' },
         accounts: [oauthAccount('keep'), oauthAccount(droppedId)],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
     const stateRaw = readFileSync(statePath, 'utf8')
     const stateObj = JSON.parse(stateRaw)
     delete stateObj.accounts[droppedId]
     writeFileSync(statePath, JSON.stringify(stateObj))
 
-    await loadAccounts(cfgPath)
-    await loadAccounts(cfgPath) // identical dropped set — should be deduped
+    await loadAccounts(getAccountPaths(cfgPath))
+    await loadAccounts(getAccountPaths(cfgPath)) // identical dropped set — should be deduped
     await flushForTest()
 
     const logTxt = readFileSync(logFile, 'utf8')
@@ -1708,7 +1769,9 @@ describe('roster-drop WARN dedupes identical repeats, re-warns on set change', (
   })
 
   it('a new dropped id (different from the previously-warned set) re-warns', async () => {
-    const { saveAccounts, loadAccounts } = await import('../core/accounts.ts')
+    const { saveAccounts, loadAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const { flushForTest } = await import('../logger.ts')
     const firstId = `dedup-A-${randomUUID()}`
     const secondId = `dedup-B-${randomUUID()}`
@@ -1718,13 +1781,13 @@ describe('roster-drop WARN dedupes identical repeats, re-warns on set change', (
         main: { type: 'opencode', provider: 'openai' },
         accounts: [oauthAccount('keep'), oauthAccount(firstId)],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
     const stateRaw = readFileSync(statePath, 'utf8')
     const stateObj = JSON.parse(stateRaw)
     delete stateObj.accounts[firstId]
     writeFileSync(statePath, JSON.stringify(stateObj))
-    await loadAccounts(cfgPath)
+    await loadAccounts(getAccountPaths(cfgPath))
 
     // Different broken id — warn again.
     await saveAccounts(
@@ -1733,13 +1796,13 @@ describe('roster-drop WARN dedupes identical repeats, re-warns on set change', (
         main: { type: 'opencode', provider: 'openai' },
         accounts: [oauthAccount('keep'), oauthAccount(secondId)],
       },
-      cfgPath,
+      getAccountPaths(cfgPath),
     )
     const stateRaw2 = readFileSync(statePath, 'utf8')
     const stateObj2 = JSON.parse(stateRaw2)
     delete stateObj2.accounts[secondId]
     writeFileSync(statePath, JSON.stringify(stateObj2))
-    await loadAccounts(cfgPath)
+    await loadAccounts(getAccountPaths(cfgPath))
     await flushForTest()
 
     const logTxt = readFileSync(logFile, 'utf8')
@@ -1767,7 +1830,9 @@ describe('roster-drop WARN dedupes identical repeats, re-warns on set change', (
   // Setup 2's second id is left unprefixed (just `b`) and the prefix's
   // leading character is forced below `b` in lex order.
   it('warn dedup key resists comma-collision in id strings', async () => {
-    const { loadAccounts } = await import('../core/accounts.ts')
+    const { loadAccounts } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
     const { flushForTest } = await import('../logger.ts')
 
     function writeConfigAndState(
@@ -1818,7 +1883,7 @@ describe('roster-drop WARN dedupes identical repeats, re-warns on set change', (
     const stateObj1 = JSON.parse(stateRaw1)
     delete stateObj1.accounts[collapsedId]
     writeFileSync(statePath, JSON.stringify(stateObj1))
-    await loadAccounts(cfgPath) // load 1: drops = [collapsedId]
+    await loadAccounts(getAccountPaths(cfgPath)) // load 1: drops = [collapsedId]
 
     writeConfigAndState([
       { id: healthyId, refresh: `r-${healthyId}` },
@@ -1830,7 +1895,7 @@ describe('roster-drop WARN dedupes identical repeats, re-warns on set change', (
     delete stateObj2.accounts[split1Id]
     delete stateObj2.accounts[split2Id]
     writeFileSync(statePath, JSON.stringify(stateObj2))
-    await loadAccounts(cfgPath) // load 2: drops = [split1Id, split2Id]
+    await loadAccounts(getAccountPaths(cfgPath)) // load 2: drops = [split1Id, split2Id]
     await flushForTest()
 
     const logTxt = readFileSync(logFile, 'utf8')

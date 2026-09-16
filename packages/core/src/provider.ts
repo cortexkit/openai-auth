@@ -6,10 +6,10 @@
  * directly.
  */
 
-import { createLogger } from '../logger.ts'
-import { errorMessage } from '../util/error.ts'
 import type { OAuthQuotaSnapshot } from './accounts.ts'
 import { parseRetryAfter } from './backoff.ts'
+import { createLogger } from './logger.ts'
+import { errorMessage } from './util/error.ts'
 
 const log = createLogger('quota')
 type QuotaLogger = Pick<typeof log, 'debug' | 'warn'>
@@ -190,7 +190,7 @@ export async function whamUsageFn(input: {
         retryAfter,
       }) as ProviderHttpError
     }
-    const { normalizeWham } = await import('../quota-normalize.ts')
+    const { normalizeWham } = await import('./quota-normalize.ts')
     const snapshot = normalizeWham(await res.json())
     logger.debug('wham usage fetch succeeded', {
       pid: process.pid,

@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto'
 import { chmod, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { isRecord } from '@cortexkit/openai-auth-core/internal'
 import { getSettings } from './config'
 import { createLogger, redact, redactStrings } from './logger'
-import { isRecord } from './util/record'
 
 const log = createLogger('dump')
 

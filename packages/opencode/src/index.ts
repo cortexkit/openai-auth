@@ -7,8 +7,52 @@ import {
 } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
+import {
+  type AccountStorage,
+  acquireRefreshFileLock,
+  base64UrlEncode,
+  beginDeviceAuth,
+  buildAuthorizeUrl,
+  buildRefreshOperationError,
+  buildUserAgent,
+  codexRefreshFn,
+  completeDeviceAuth,
+  errorMessage,
+  extractAccountId,
+  extractAccountIdFromClaims,
+  type FallbackAccount,
+  FallbackAccountManager,
+  flowCleanup,
+  formatRefreshBackoffMessage,
+  generatePKCE,
+  getKillswitchThresholdsForAccount,
+  hashRefreshToken,
+  isCompleteQuotaHeaderFrame,
+  isCostZeroingEnabled,
+  isKillswitchEnabled,
+  isOAuthAccount,
+  isRecord,
+  killswitchPassesPolicy,
+  killswitchRetryAfterSeconds,
+  loadAccounts,
+  migrateIfNeeded,
+  mutateAccounts,
+  normalizeQuotaHeaders,
+  type OAuthAccount,
+  type OAuthQuotaSnapshot,
+  parseJwtClaims,
+  type QuotaEntry,
+  QuotaManager,
+  type RoutingMode,
+  refreshAllQuota,
+  refreshBackoffActive,
+  resolveMidStreamRateLimitResetAt,
+  shouldFallbackStatus,
+  startOAuthServer,
+  waitForOAuthCallback,
+  whamUsageFn,
+} from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, Plugin, PluginInput } from '@opencode-ai/plugin'
-
 import {
   buildDialogPayload,
   type CommandContext,
@@ -24,61 +68,16 @@ import {
   type ResetTargetIdentity,
 } from './commands'
 import { getConfigDir, getConfigPath, getSettings } from './config'
-import {
-  type AccountStorage,
-  type FallbackAccount,
-  FallbackAccountManager,
-  getKillswitchThresholdsForAccount,
-  isCostZeroingEnabled,
-  isKillswitchEnabled,
-  isOAuthAccount,
-  killswitchPassesPolicy,
-  killswitchRetryAfterSeconds,
-  loadAccounts,
-  migrateIfNeeded,
-  mutateAccounts,
-  type OAuthAccount,
-  type OAuthQuotaSnapshot,
-  type RoutingMode,
-  shouldFallbackStatus,
-} from './core/accounts'
+import { getAccountPaths, getAccountStatePath } from './core/account-paths'
 import {
   BackgroundQuotaRefresh,
   refreshQuotaInBackground,
 } from './core/background-quota-refresh'
 import {
-  buildRefreshOperationError,
-  formatRefreshBackoffMessage,
-  hashRefreshToken,
-  refreshBackoffActive,
-} from './core/backoff'
-import {
   buildKeepwarmCapture,
   CacheKeepManager,
   getCacheKeepWindow,
 } from './core/cachekeep'
-import {
-  base64UrlEncode,
-  beginDeviceAuth,
-  buildAuthorizeUrl,
-  completeDeviceAuth,
-  extractAccountId,
-  extractAccountIdFromClaims,
-  flowCleanup,
-  generatePKCE,
-  parseJwtClaims,
-  startOAuthServer,
-  USER_AGENT,
-  waitForOAuthCallback,
-} from './core/oauth'
-import { codexRefreshFn, whamUsageFn } from './core/provider'
-import {
-  type QuotaEntry,
-  QuotaManager,
-  resolveMidStreamRateLimitResetAt,
-} from './core/quota-manager'
-import { refreshAllQuota } from './core/refresh-all-quota'
-import { acquireRefreshFileLock } from './core/refresh-file-lock'
 import {
   decideStickyBreak,
   type StickyBreakDecision,
@@ -93,10 +92,6 @@ import {
 import { createLogger, setLogLevel } from './logger'
 import { loadModelsDevCosts } from './model-costs'
 import { resolvePromptContext } from './prompt-context'
-import {
-  isCompleteQuotaHeaderFrame,
-  normalizeQuotaHeaders,
-} from './quota-normalize'
 import {
   drainNotifications,
   isTuiConnected,
@@ -127,10 +122,9 @@ import {
   setSidebarMachineState,
   upsertSidebarActiveRouting,
 } from './sidebar-state'
-import { errorMessage } from './util/error'
-import { isRecord } from './util/record'
 import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
+import { PackageVersion } from './version'
 import { OpenAIWebSocketPool, orderCodexBody } from './ws-pool'
 
 const ALLOWED_MODELS = new Set([
@@ -233,6 +227,7 @@ interface ResetTargetResolverDeps {
   ) => Promise<OAuthAccount>
   loadAccounts: typeof loadAccounts
   accountStoragePath: string
+  accountStatePath: string
   now: () => number
 }
 
@@ -250,7 +245,10 @@ function resetTargetNeedsRefresh(
 export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
   return async (accountKey: string): Promise<ResetTargetIdentity> => {
     if (accountKey === 'main') {
-      const storage = await deps.loadAccounts(deps.accountStoragePath)
+      const storage = await deps.loadAccounts({
+        configPath: deps.accountStoragePath,
+        statePath: deps.accountStatePath,
+      })
       let auth = await deps.getAuth()
       if (auth.type !== 'oauth') {
         throw new ResetTargetResolutionError(
@@ -277,7 +275,10 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
       const liveAccountId = claims
         ? extractAccountIdFromClaims(claims)
         : undefined
-      const freshStorage = await deps.loadAccounts(deps.accountStoragePath)
+      const freshStorage = await deps.loadAccounts({
+        configPath: deps.accountStoragePath,
+        statePath: deps.accountStatePath,
+      })
       return {
         accountKey,
         label: 'Main account',
@@ -286,7 +287,10 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
       }
     }
 
-    const storage = await deps.loadAccounts(deps.accountStoragePath)
+    const storage = await deps.loadAccounts({
+      configPath: deps.accountStoragePath,
+      statePath: deps.accountStatePath,
+    })
     const account = storage?.accounts.find(
       (candidate) => candidate.id === accountKey,
     )
@@ -327,7 +331,10 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
       )
     }
 
-    const freshStorage = await deps.loadAccounts(deps.accountStoragePath)
+    const freshStorage = await deps.loadAccounts({
+      configPath: deps.accountStoragePath,
+      statePath: deps.accountStatePath,
+    })
     const freshAccount = freshStorage?.accounts.find(
       (candidate) => candidate.id === accountKey,
     )
@@ -382,7 +389,7 @@ export {
   extractAccountIdFromClaims,
   type IdTokenClaims,
   parseJwtClaims,
-} from './core/oauth'
+} from '@cortexkit/openai-auth-core/internal'
 
 interface CodexAuthPluginOptions {
   issuer?: string
@@ -1061,7 +1068,8 @@ export async function CodexAuthPlugin(
       }
       if (codexSessions.delete(info.id)) persistCodexSessions()
       if (sidebarStateFileForEvents) {
-        const accounts = (await loadAccounts(getConfigPath()))?.accounts
+        const accounts = (await loadAccounts(getAccountPaths(getConfigPath())))
+          ?.accounts
         await removeSidebarActiveRouting(
           info.id,
           accounts,
@@ -1076,7 +1084,7 @@ export async function CodexAuthPlugin(
       async models(provider, ctx) {
         if (ctx.auth?.type !== 'oauth') return provider.models
 
-        const storage = await loadAccounts(getConfigPath())
+        const storage = await loadAccounts(getAccountPaths(getConfigPath()))
         const zeroCosts = !storage || isCostZeroingEnabled(storage)
         const catalog = zeroCosts ? null : await loadModelsDevCosts()
         if (!zeroCosts && catalog && !loggedCostRestoration) {
@@ -1187,13 +1195,15 @@ export async function CodexAuthPlugin(
             refresh: auth.refresh ?? '',
             expires: auth.expires ?? 0,
           },
-          getConfigPath(),
+          getAccountPaths(getConfigPath()),
         )
 
         // Construct managers for push-only quota updates from response headers.
         // Wrap the first boot-time read so a corrupt store surfaces a clear,
         // actionable message instead of a raw JSON.parse SyntaxError.
-        const storage = await loadAccounts(getConfigPath()).catch((err) => {
+        const storage = await loadAccounts(
+          getAccountPaths(getConfigPath()),
+        ).catch((err) => {
           const path = getConfigPath()
           throw new Error(
             `OpenAI auth store at ${path} is corrupt or unreadable: ${err instanceof Error ? err.message : String(err)}. Fix or remove it to continue.`,
@@ -1221,7 +1231,7 @@ export async function CodexAuthPlugin(
             ) {
               return requestStorageCache.storage
             }
-            const next = await loadAccounts(path)
+            const next = await loadAccounts(getAccountPaths(path))
             requestStorageCache = {
               path,
               mtimeMs: stat.mtimeMs,
@@ -1231,7 +1241,7 @@ export async function CodexAuthPlugin(
             return next
           } catch {
             requestStorageCache = undefined
-            return loadAccounts(path)
+            return loadAccounts(getAccountPaths(path))
           }
         }
 
@@ -1257,7 +1267,7 @@ export async function CodexAuthPlugin(
             await mutateAccounts((current) => {
               current.mainAccountId = liveAccountId
               return current
-            }, getConfigPath())
+            }, getAccountPaths(getConfigPath()))
             storage.mainAccountId = liveAccountId
             invalidateRequestStorageCache()
           }
@@ -1289,11 +1299,13 @@ export async function CodexAuthPlugin(
 
         const quotaManager = new QuotaManager({
           storage,
+          configPath: getConfigPath(),
           fetchQuotaFn: undefined, // push-only: quota comes from HTTP headers / WS frames
         })
         let currentMainIdentity: string | undefined
         let mainIdentityGeneration = 0
         const fallbackManager = new FallbackAccountManager({
+          paths: getAccountPaths(getConfigPath()),
           refreshFn: (opts) =>
             codexRefreshFn({
               refreshToken: opts.refreshToken,
@@ -1363,7 +1375,7 @@ export async function CodexAuthPlugin(
             current.refresh = current.refresh ?? {}
             update(current)
             return current
-          }, getConfigPath())
+          }, getAccountPaths(getConfigPath()))
           invalidateRequestStorageCache()
         }
 
@@ -1414,7 +1426,9 @@ export async function CodexAuthPlugin(
               }
 
               const refreshTokenHash = hashRefreshToken(freshAuth.refresh)
-              const latestStorage = await loadAccounts(getConfigPath())
+              const latestStorage = await loadAccounts(
+                getAccountPaths(getConfigPath()),
+              )
               const mainError = latestStorage?.refresh?.mainLastRefreshError
               if (
                 mainError &&
@@ -1460,7 +1474,9 @@ export async function CodexAuthPlugin(
                     refreshTokenHash
                 })
 
-                const latestLease = await loadAccounts(getConfigPath())
+                const latestLease = await loadAccounts(
+                  getAccountPaths(getConfigPath()),
+                )
                 if (
                   latestLease?.refresh?.mainRefreshLeaseId !== leaseId ||
                   latestLease.refresh.mainRefreshLeaseTokenHash !==
@@ -1819,6 +1835,8 @@ export async function CodexAuthPlugin(
         // -------------------------------------------------------------------
         cmdCtx = {
           accountStoragePath: getConfigPath(),
+          accountStatePath: getAccountStatePath(getConfigPath()),
+          packageVersion: PackageVersion,
           quotaManager,
           loadAccounts,
           client: input.client as CommandContext['client'],
@@ -1829,6 +1847,7 @@ export async function CodexAuthPlugin(
               fallbackManager.refreshAccount(account, currentStorage),
             loadAccounts,
             accountStoragePath: getConfigPath(),
+            accountStatePath: getAccountStatePath(getConfigPath()),
             now: Date.now,
           }),
           ...buildResetRedemptionDeps(),
@@ -1853,7 +1872,7 @@ export async function CodexAuthPlugin(
               sessionId,
             ),
           refreshSidebar: async () => {
-            const store = await loadAccounts(getConfigPath())
+            const store = await loadAccounts(getAccountPaths(getConfigPath()))
             await writeMachineSidebarState(quotaManager, store)
           },
           refreshAllQuota: async () =>
@@ -1868,7 +1887,8 @@ export async function CodexAuthPlugin(
               client: input.client as CommandContext['client'],
               fetchImpl: fetch,
               now: Date.now,
-              configPath: getConfigPath(),
+              paths: getAccountPaths(getConfigPath()),
+              readSidebarState: () => getSidebarState(boundSidebarFile),
               storageMainAccountId: storage?.mainAccountId,
               isOAuthAccountFn: isOAuthAccount,
               whamFn: whamUsageFn,
@@ -1886,7 +1906,8 @@ export async function CodexAuthPlugin(
                 client: input.client as CommandContext['client'],
                 fetchImpl: fetch,
                 now: Date.now,
-                configPath: getConfigPath(),
+                paths: getAccountPaths(getConfigPath()),
+                readSidebarState: () => getSidebarState(boundSidebarFile),
                 storageMainAccountId: storage?.mainAccountId,
                 isOAuthAccountFn: isOAuthAccount,
                 whamFn: whamUsageFn,
@@ -2921,7 +2942,8 @@ export async function CodexAuthPlugin(
             >[0]['client'],
             fetchImpl: fetch,
             now: Date.now,
-            configPath: getConfigPath(),
+            paths: getAccountPaths(getConfigPath()),
+            readSidebarState: () => getSidebarState(boundSidebarFile),
             storageMainAccountId: storage?.mainAccountId,
             isOAuthAccountFn: isOAuthAccount,
             whamFn: whamUsageFn,
@@ -2952,7 +2974,7 @@ export async function CodexAuthPlugin(
               >[0]['client'],
               fetchImpl: fetch,
               now: Date.now,
-              configPath: getConfigPath(),
+              paths: getAccountPaths(getConfigPath()),
               storageMainAccountId: storage?.mainAccountId,
               isOAuthAccountFn: isOAuthAccount,
               whamFn: whamUsageFn,
@@ -3473,7 +3495,8 @@ export async function CodexAuthPlugin(
           label: 'ChatGPT Pro/Plus (headless)',
           type: 'oauth',
           authorize: async () => {
-            const { deviceData, url, instructions } = await beginDeviceAuth()
+            const { deviceData, url, instructions } =
+              await beginDeviceAuth(PackageVersion)
 
             return {
               url,
@@ -3481,7 +3504,10 @@ export async function CodexAuthPlugin(
               method: 'auto' as const,
               async callback() {
                 try {
-                  const tokens = await completeDeviceAuth(deviceData)
+                  const tokens = await completeDeviceAuth(
+                    deviceData,
+                    PackageVersion,
+                  )
                   return {
                     type: 'success' as const,
                     refresh: tokens.refresh_token,
@@ -3506,7 +3532,7 @@ export async function CodexAuthPlugin(
       if (input.model.providerID !== 'openai') return
       output.headers.originator = 'opencode'
       output.headers['User-Agent'] =
-        `${USER_AGENT} (${os.platform()} ${os.release()}; ${os.arch()})`
+        `${buildUserAgent(PackageVersion)} (${os.platform()} ${os.release()}; ${os.arch()})`
       output.headers['session-id'] = input.sessionID
       // Temporary fetch-layer hack: title generation currently shares the conversation
       // session ID, so the OpenAI plugin marks it for HTTP fallback until transport

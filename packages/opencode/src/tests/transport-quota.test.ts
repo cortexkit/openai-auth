@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'bun:test'
-import type { OAuthQuotaSnapshot } from '../core/accounts.ts'
-import { normalizeQuotaHeaders, normalizeWsFrame } from '../quota-normalize.ts'
+import {
+  normalizeQuotaHeaders,
+  normalizeWsFrame,
+  type OAuthQuotaSnapshot,
+} from '@cortexkit/openai-auth-core/internal'
 
 /**
  * Minimal WebSocket stub that can drive streamResponsesWebSocket.

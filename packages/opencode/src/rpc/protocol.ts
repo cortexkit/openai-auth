@@ -1,33 +1,12 @@
-export type CommandModalName =
-  | 'openai-quota'
-  | 'openai-account'
-  | 'openai-routing'
-  | 'openai-killswitch'
-  | 'openai-dump'
-  | 'openai-logging'
-  | 'openai-cachekeep'
-  | 'openai-reset'
-
-export interface OpenDialogPayload {
-  command: CommandModalName
-  text: string
-  knobs: Record<string, unknown>
-}
-
-export interface RpcNotification {
-  id: number
-  type: 'open-dialog'
-  payload: OpenDialogPayload
-  sessionId?: string
-}
-
-export interface ApplyRequest {
-  command: CommandModalName
-  arguments: string
-  sessionId?: string
-}
-
-export interface ApplyResult {
-  text: string
-  knobs: Record<string, unknown>
-}
+/**
+ * The RPC payload types now live in the shared core, because both hosts build
+ * the same payloads. This file stays on disk as a re-export so the existing
+ * build entry and every importer that names `rpc/protocol` keep working.
+ */
+export type {
+  ApplyRequest,
+  ApplyResult,
+  CommandModalName,
+  OpenDialogPayload,
+  RpcNotification,
+} from '@cortexkit/openai-auth-core/internal'

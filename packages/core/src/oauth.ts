@@ -1,6 +1,5 @@
 import { createServer } from 'node:http'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { PackageVersion } from '../version'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -10,7 +9,17 @@ export const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 export const ISSUER = 'https://auth.openai.com'
 export const OAUTH_PORT = 1455
 export const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000
-export const USER_AGENT = `cortexkit-opencode-openai-auth/${PackageVersion}`
+/**
+ * Product half of the `User-Agent` this client sends. The version half comes
+ * from whichever host is running, which is why every call that reaches the
+ * provider takes the version as an argument instead of reading it from a file
+ * that belongs to one host.
+ */
+export const USER_AGENT_PRODUCT = 'cortexkit-opencode-openai-auth'
+
+export function buildUserAgent(version: string): string {
+  return `${USER_AGENT_PRODUCT}/${version}`
+}
 export const RESERVED_ACCOUNT_ID = 'main'
 export const RESERVED_ACCOUNT_ID_ERROR = `"${RESERVED_ACCOUNT_ID}" is a reserved account id; choose a different label.`
 
@@ -540,7 +549,7 @@ export interface DeviceAuthInit {
   expires_in?: number | string
 }
 
-export async function beginDeviceAuth(): Promise<{
+export async function beginDeviceAuth(version: string): Promise<{
   deviceData: DeviceAuthInit
   url: string
   instructions: string
@@ -551,7 +560,7 @@ export async function beginDeviceAuth(): Promise<{
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': USER_AGENT,
+        'User-Agent': buildUserAgent(version),
       },
       body: JSON.stringify({ client_id: CLIENT_ID }),
     },
@@ -571,6 +580,7 @@ export async function beginDeviceAuth(): Promise<{
 
 export async function completeDeviceAuth(
   deviceData: DeviceAuthInit,
+  version: string,
   signal?: AbortSignal,
 ): Promise<TokenResponse> {
   const interval = Math.max(parseInt(deviceData.interval, 10) || 5, 1) * 1000
@@ -596,7 +606,7 @@ export async function completeDeviceAuth(
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': USER_AGENT,
+        'User-Agent': buildUserAgent(version),
       },
       body: JSON.stringify({
         device_auth_id: deviceData.device_auth_id,
@@ -745,6 +755,8 @@ export interface BeginAccountLoginOptions {
   label?: string
   headless?: boolean
   signal?: AbortSignal
+  /** Host package version, sent as the version half of the `User-Agent`. */
+  version: string
 }
 
 export interface BeginAccountLoginResult {
@@ -771,16 +783,16 @@ export interface BeginAccountLoginResult {
  * (potentially 30-60s) wait, avoiding a deadlock.
  */
 export async function beginAccountLogin(
-  opts: BeginAccountLoginOptions = {},
+  opts: BeginAccountLoginOptions,
 ): Promise<BeginAccountLoginResult> {
-  const { label, headless = false, signal } = opts
+  const { label, headless = false, signal, version } = opts
   assertFallbackAccountIdAllowed(label)
 
   if (headless) {
-    const { deviceData, url, instructions } = await beginDeviceAuth()
+    const { deviceData, url, instructions } = await beginDeviceAuth(version)
 
     const completion = (async (): Promise<IngestAccount> => {
-      const tokens = await completeDeviceAuth(deviceData, signal)
+      const tokens = await completeDeviceAuth(deviceData, version, signal)
       const now = Date.now()
       const accountId = extractAccountId(tokens)
       return {

@@ -4,12 +4,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  type AccountPaths,
   type AccountStorage,
+  deriveStatePath,
   loadAccounts,
   mutateAccounts,
   type OAuthQuotaSnapshot,
   type ResetInFlight,
-} from '../core/accounts.ts'
+} from '../accounts.ts'
 import {
   claimResetAttempt,
   consumeResetCredit,
@@ -22,7 +24,7 @@ import {
   type RunResetCreditDeps,
   runResetCreditRedemption,
   selectCreditToSpend,
-} from '../core/reset-credits.ts'
+} from '../reset-credits.ts'
 
 function fetchStub(
   implementation: (
@@ -533,10 +535,15 @@ function deferred<T>(): Deferred<T> {
 
 let redemptionDir: string
 let redemptionConfigPath: string
+let redemptionPaths: AccountPaths
 
 beforeEach(() => {
   redemptionDir = mkdtempSync(join(tmpdir(), 'oai-reset-redemption-'))
   redemptionConfigPath = join(redemptionDir, 'openai-auth.json')
+  redemptionPaths = {
+    configPath: redemptionConfigPath,
+    statePath: deriveStatePath(redemptionConfigPath),
+  }
   writeFileSync(
     redemptionConfigPath,
     JSON.stringify({
@@ -596,6 +603,7 @@ function redemptionDeps(
 ): RunResetCreditDeps {
   return {
     configPath: redemptionConfigPath,
+    statePath: redemptionPaths.statePath,
     mutateAccountsFn: mutateAccounts,
     loadAccountsFn: loadAccounts,
     now: options.now ?? (() => Date.parse('2026-07-17T12:00:00.000Z')),
@@ -639,11 +647,11 @@ async function seedResetState(
     current.reset ??= {}
     current.reset[accountKey] = state
     return current
-  }, redemptionConfigPath)
+  }, redemptionPaths)
 }
 
 async function persistedResetState(accountKey = 'main') {
-  return (await loadAccounts(redemptionConfigPath))?.reset?.[accountKey]
+  return (await loadAccounts(redemptionPaths))?.reset?.[accountKey]
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
@@ -1120,7 +1128,7 @@ describe('atomic reset credit redemption', () => {
       }),
     )
     expect(
-      (await loadAccounts(redemptionConfigPath))?.reset?.main?.inFlight,
+      (await loadAccounts(redemptionPaths))?.reset?.main?.inFlight,
     ).toEqual({
       redeemRequestId: 'partial-request',
       startedAt: Date.parse('2026-07-17T11:59:00.000Z'),
@@ -1177,7 +1185,7 @@ describe('atomic reset credit redemption', () => {
 
     expect(decision.kind).toBe('fresh')
     expect(mutationCount).toBe(0)
-    expect((await loadAccounts(redemptionConfigPath))?.reset).toBeUndefined()
+    expect((await loadAccounts(redemptionPaths))?.reset).toBeUndefined()
   })
 
   it('observes persisted in-flight state from a new coordinator invocation', async () => {

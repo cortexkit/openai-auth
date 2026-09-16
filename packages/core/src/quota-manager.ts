@@ -166,6 +166,12 @@ export type QuotaEntry = {
 export type QuotaManagerOptions = {
   storage: AccountStorage | null
   fetchImpl?: typeof fetch
+  /**
+   * Account config file this manager's cross-process refresh locks are named
+   * after. Host-resolved and required, so two hosts pointing at different
+   * stores never contend on one another's lock.
+   */
+  configPath: string
   now?: () => number
   /** Injected quota-fetch function — replaces the hard-imported Anthropic fetchOAuthQuotaSnapshot */
   fetchQuotaFn?: ProviderQuotaFn
@@ -228,10 +234,12 @@ export class QuotaManager {
   private readonly fetchQuotaFn: ProviderQuotaFn | undefined
   private readonly onMainQuotaFetched: QuotaManagerOptions['onMainQuotaFetched']
   private readonly onApiError: QuotaManagerOptions['onApiError']
+  private readonly configPath: string
 
   constructor(opts: QuotaManagerOptions) {
     this.storage = opts.storage
     this.fetchImpl = opts.fetchImpl ?? fetch
+    this.configPath = opts.configPath
     this.now = opts.now ?? Date.now
     this.fetchQuotaFn = opts.fetchQuotaFn
     this.onMainQuotaFetched = opts.onMainQuotaFetched
@@ -743,6 +751,7 @@ export class QuotaManager {
         const fileLock = await acquireRefreshFileLock({
           name: 'opencode-main-quota-refresh',
           ttlMs: 30_000,
+          path: this.configPath,
         })
         if (!fileLock) {
           const cached = this.main
@@ -806,6 +815,7 @@ export class QuotaManager {
         const fileLock = await acquireRefreshFileLock({
           name: QuotaManager.quotaLockName(accountId),
           ttlMs: 30_000,
+          path: this.configPath,
         })
         if (!fileLock) {
           const cached = this.getFallback(accountId, accessToken)

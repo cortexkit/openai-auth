@@ -6,20 +6,24 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const sourceRoot = join(pluginRoot, 'src')
 const outputRoot = join(sourceRoot, 'tui-compiled')
+// Files under src/ that the TUI entry reaches and that are copied or compiled
+// into src/tui-compiled. The refresh file lock, the error helper and the URL
+// opener are no longer here: they live in @cortexkit/openai-auth-core, so the
+// files that used to import them now carry a package specifier instead of a
+// relative path. Rewriting those specifiers into the compiled output is the
+// packaging work that follows this extraction; until it lands, the compiled
+// TUI source names the core package rather than inlining it.
 const shippedSourceFiles = [
   'tui.tsx',
   'tui/command-dialogs.tsx',
   'sidebar-state.ts',
   'core/account-paths.ts',
-  'core/refresh-file-lock.ts',
   'tui-preferences.ts',
   'logger.ts',
   'rpc/rpc-client.ts',
   'rpc/rpc-dir.ts',
   'rpc/port-file.ts',
   'rpc/protocol.ts',
-  'util/error.ts',
-  'util/open-url.ts',
 ] as const
 const runtimeSpecifiers = new Set([
   '@opentui/core',
