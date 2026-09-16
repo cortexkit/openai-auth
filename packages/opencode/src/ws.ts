@@ -393,11 +393,15 @@ export function streamResponsesWebSocket(
       // On a continuation the prior response id is named too: the turn cannot
       // be retried here, so the operator resending it by hand is the recovery,
       // and that is the identifier the provider can act on.
-      const context =
-        previousResponseID === undefined
-          ? ''
-          : ` (continuation of ${previousResponseID})`
-      const message = `${error.message}${context} (not retried: output already emitted)`
+      // Deliberately fixed text, carrying neither the provider's wording nor
+      // any identifier. The host decides retries by pattern-matching this
+      // string (opencode v1.18.30, session/retry.ts `retryable`), and a match
+      // wins even over an explicit non-retryable flag. So a provider message
+      // like "Rate limit reached", a peer close reason, or an id that happens
+      // to contain 429 or 503 would turn this no-replay into a replay and
+      // duplicate output the user already saw. What died is in the log line
+      // below, which is written at warn and not gated on the dump setting.
+      const message = TERMINAL_AFTER_OUTPUT_MESSAGE
       logT.warn('stream failed after output; not retried', {
         reason: error.message,
         emittedOutput: true,
@@ -946,6 +950,16 @@ function responseIDOf(event: Record<string, unknown>) {
   if (!isRecord(response)) return undefined
   return typeof response.id === 'string' ? response.id : undefined
 }
+
+/**
+ * Surfaced when a stream dies after output has reached the reader.
+ *
+ * Must not contain any substring the host reads as retryable — no provider
+ * wording, no response ids, no byte counts. `ws-pool.test.ts` pins it against
+ * the host's pattern set.
+ */
+export const TERMINAL_AFTER_OUTPUT_MESSAGE =
+  'The response ended early after part of it had already been shown. It was not sent again, because repeating it would duplicate that output and re-run any tools it had started. The transport log records what ended it.'
 
 function closeMessage(
   message: string,

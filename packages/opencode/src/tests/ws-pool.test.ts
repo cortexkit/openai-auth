@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { APICallError } from 'ai'
 import { DUMP_SESSION_HEADER } from '../dump'
 import { ResponseStreamError } from '../response-stream-error'
-import { connectResponsesWebSocket } from '../ws'
+import { connectResponsesWebSocket, TERMINAL_AFTER_OUTPUT_MESSAGE } from '../ws'
 import {
   applyTurnId,
   CODEX_BODY_KEY_ORDER,
@@ -2540,9 +2540,10 @@ describe('createWebSocketFetch', () => {
         // text and re-run tools, so the turn ends here.
         expect(APICallError.isInstance(caught)).toBe(false)
         const failure = caught as Error
-        expect(failure.message).toContain('message too big')
-        expect(failure.message).toMatch(/request was \d+(\.\d+)? (KB|MB)/)
-        expect(failure.message).toContain('not retried: output already emitted')
+        expect(failure.message).toBe(TERMINAL_AFTER_OUTPUT_MESSAGE)
+        // The size and the close code are diagnostics, and they travel in the
+        // log rather than the surfaced message, which the host pattern-matches.
+        expect(failure.message).not.toMatch(/request was \d/)
         websocketFetch.close()
       },
     )
@@ -2686,8 +2687,8 @@ describe('transport close provenance', () => {
         } catch (err) {
           streamError = err
         }
-        expect((streamError as { message: string })?.message).toContain(
-          'not retried: output already emitted',
+        expect((streamError as { message: string })?.message).toBe(
+          TERMINAL_AFTER_OUTPUT_MESSAGE,
         )
         // Still terminal: a retryable error here would replay the turn and
         // duplicate whatever was already streamed.
@@ -2695,6 +2696,41 @@ describe('transport close provenance', () => {
         websocketFetch.close()
       },
     )
+  })
+
+  test('the after-output message cannot be read as retryable by the host', () => {
+    // opencode decides retries by matching the error message against this set
+    // (v1.18.30, packages/opencode/src/session/retry.ts). A match wins even
+    // over an explicit non-retryable flag, so any provider wording, peer close
+    // reason, byte count or response id that reached the surfaced message could
+    // turn a deliberate no-replay into a replay. Copied verbatim; if opencode
+    // adds a pattern this test is where the divergence should show up.
+    const hostRetryablePatterns = [
+      /429|500|502|503|504|524/i,
+      /rate increased too quickly|rate limit|rate-limit|rate_limit|too many requests/i,
+      /overloaded|service unavailable|service_unavailable|service-unavailable|internal error|internal_error|internal server error|server error|server_error|server-error|provider returned error|provider_returned_error|provider-returned-error/i,
+      /terminated|fetch failed|failed to fetch|network[-_\s]error|upstream connect|connection error|connection refused|connection lost|socket connection was closed|socket hang up|reset before headers|getaddrinfo|enotfound|eai_again|econnrefused|econnreset|etimedout/i,
+      /^timeout$|\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\b/i,
+      /try your request again|retry your request|resource exhausted|resource_exhausted/i,
+      /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
+    ]
+    for (const pattern of hostRetryablePatterns) {
+      expect(pattern.test(TERMINAL_AFTER_OUTPUT_MESSAGE)).toBe(false)
+    }
+    // The inputs that used to reach this message, each of which the host reads
+    // as retryable. They are the reason the message is fixed text.
+    for (const leaked of [
+      'Rate limit reached for gpt-5.6-sol',
+      'Internal server error',
+      'upstream connect error or disconnect/reset before headers',
+      'request was 503 KB',
+      'continuation of resp_0429aa',
+    ]) {
+      expect(
+        hostRetryablePatterns.some((pattern) => pattern.test(leaked)),
+      ).toBe(true)
+      expect(TERMINAL_AFTER_OUTPUT_MESSAGE).not.toContain(leaked)
+    }
   })
 
   test('a close before any output stays retryable and unsuffixed', async () => {
