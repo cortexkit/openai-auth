@@ -23,6 +23,7 @@ import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
 import { streamSimple as streamSimpleOpenAICodexResponses } from '@earendil-works/pi-ai/compat'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
+import { registerCommands } from './commands.ts'
 import { RawWebSocket } from './raw-ws-node.ts'
 
 const BASE_URL = 'https://chatgpt.com/backend-api'
@@ -187,6 +188,7 @@ function streamOpenAI(
 }
 
 export default function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
+  registerCommands(pi)
   pi.registerProvider('openai-codex', {
     name: 'OpenAI Codex (CortexKit OAuth)',
     baseUrl: BASE_URL,

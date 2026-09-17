@@ -55,6 +55,7 @@ describe('Pi OpenAI auth extension', () => {
     }> = []
 
     cortexKitPiOpenAIAuth({
+      registerCommand() {},
       registerProvider(id: string, provider: RegisteredProvider) {
         registrations.push({ id, provider })
       },
@@ -70,6 +71,23 @@ describe('Pi OpenAI auth extension', () => {
       'gpt-5.4',
       'gpt-5.4-mini',
       'gpt-5.3-codex-spark',
+    ])
+  })
+
+  it('registers exactly the three supported account commands', () => {
+    const commandNames: string[] = []
+
+    cortexKitPiOpenAIAuth({
+      registerCommand(name: string) {
+        commandNames.push(name)
+      },
+      registerProvider() {},
+    } as never)
+
+    expect(commandNames.sort()).toEqual([
+      'openai-account',
+      'openai-quota',
+      'openai-routing',
     ])
   })
 

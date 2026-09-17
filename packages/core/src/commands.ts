@@ -145,6 +145,8 @@ export interface CommandContext {
   fetchImpl?: typeof fetch
   now?: () => number
   randomUUID?: () => string
+  /** Starts OAuth for a fallback account; omitted to use the default browser/device flow. */
+  beginAccountLogin?: typeof beginAccountLogin
   refreshResetTargetQuota?: (
     accountKey: string,
   ) => Promise<RefreshAllQuotaResult>
@@ -342,7 +344,7 @@ async function executeAccountCommand(
   }
   const accounts = storage.accounts ?? []
 
-  if (tokens.length === 0) {
+  if (tokens.length === 0 || (tokens.length === 1 && tokens[0] === 'list')) {
     // Show status
     const lines = ['## OpenAI Accounts', '']
     if (accounts.length === 0) {
@@ -465,7 +467,9 @@ async function executeAccountCommand(
     const headless = tokens.includes('--headless')
     const labelTokens = tokens.filter((t) => t !== 'add' && t !== '--headless')
     const label = labelTokens.length > 0 ? labelTokens.join(' ') : undefined
-    const { url, instructions, completion } = await beginAccountLogin({
+    const { url, instructions, completion } = await (
+      ctx.beginAccountLogin ?? beginAccountLogin
+    )({
       label,
       headless,
       version: ctx.packageVersion,
