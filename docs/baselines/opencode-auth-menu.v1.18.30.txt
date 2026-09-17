@@ -1,0 +1,26 @@
+# Captured with opencode-ai 1.18.30. Each menu action returns the same empty auto result and failed callback.
+# Command shape: opencode auth login --provider <fixture> --method <fixture>
+
+[Add account]
+exit_code=0
+stdout_json="┌  Add credential\n\u001b[?25l│\n◆  Failed to authorize\n\u001b[?25h│\n└  Done\n\n"
+
+[Auth current]
+exit_code=0
+stdout_json="┌  Add credential\n\u001b[?25l│\n◆  Failed to authorize\n\u001b[?25h│\n└  Done\n\n"
+
+[Check quotas]
+exit_code=0
+stdout_json="┌  Add credential\n\u001b[?25l│\n◆  Failed to authorize\n\u001b[?25h│\n└  Done\n\n"
+
+[Auth doctor]
+exit_code=0
+stdout_json="┌  Add credential\n\u001b[?25l│\n◆  Failed to authorize\n\u001b[?25h│\n└  Done\n\n"
+
+[Apply repairs]
+exit_code=0
+stdout_json="┌  Add credential\n\u001b[?25l│\n◆  Failed to authorize\n\u001b[?25h│\n└  Done\n\n"
+
+[Delete all accounts]
+exit_code=0
+stdout_json="┌  Add credential\n\u001b[?25l│\n◆  Failed to authorize\n\u001b[?25h│\n└  Done\n\n"

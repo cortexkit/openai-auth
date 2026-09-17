@@ -1252,8 +1252,18 @@ function buildPreservedAdditions(
  * mutator's splice still no-ops on a dropped id, but the absence of
  * preservation completes the removal end-to-end.
  */
+interface MutateAccountsContext {
+  /** Valid string ids read from the raw config while both store locks are held. */
+  rawRosterIds: readonly string[]
+  /** Ids retained after normalization and validation, before the mutator ran. */
+  loadedRosterIds: readonly string[]
+}
+
 export async function mutateAccounts(
-  mutate: (current: AccountStorage) => AccountStorage | undefined,
+  mutate: (
+    current: AccountStorage,
+    context?: MutateAccountsContext,
+  ) => AccountStorage | undefined,
   paths: AccountPaths,
   options: { allowDrop?: readonly string[] } = {},
 ): Promise<AccountStorage> {
@@ -1283,7 +1293,12 @@ export async function mutateAccounts(
       // loaded one — and a legitimate removal by the mutator would look
       // identical to a load-time drop.
       const currentAccountIds = new Set(current.accounts.map((a) => a.id))
-      const next = mutate(current) ?? current
+      const rawRosterIds = collectConfigRosterIds(configJson.value) ?? new Set()
+      const next =
+        mutate(current, {
+          rawRosterIds: [...rawRosterIds],
+          loadedRosterIds: [...currentAccountIds],
+        }) ?? current
 
       // Preserve load-dropped raw entries via the shared pipeline. The
       // comparison is against `currentAccountIds` (pre-mutator) so a
