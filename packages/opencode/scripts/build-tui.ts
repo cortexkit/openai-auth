@@ -1,18 +1,14 @@
-import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { dirname, join, relative } from 'node:path'
+import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const sourceRoot = join(pluginRoot, 'src')
 const outputRoot = join(sourceRoot, 'tui-compiled')
-// Files under src/ that the TUI entry reaches and that are copied or compiled
-// into src/tui-compiled. The refresh file lock, the error helper and the URL
-// opener are no longer here: they live in @cortexkit/openai-auth-core, so the
-// files that used to import them now carry a package specifier instead of a
-// relative path. Rewriting those specifiers into the compiled output is the
-// packaging work that follows this extraction; until it lands, the compiled
-// TUI source names the core package rather than inlining it.
+// Files under src/ that the TUI entry reaches. Each output variant is flattened
+// and its relative imports are rewritten so only generated files are reachable.
 const shippedSourceFiles = [
   'tui.tsx',
   'tui/command-dialogs.tsx',
@@ -25,6 +21,16 @@ const shippedSourceFiles = [
   'rpc/port-file.ts',
   'rpc/protocol.ts',
 ] as const
+const sharedCoreSourceFiles = [
+  'paths.ts',
+  'refresh-file-lock.ts',
+  'util/error.ts',
+  'util/open-url.ts',
+] as const
+const coreSpecifiers = new Set([
+  '@cortexkit/openai-auth-core',
+  '@cortexkit/openai-auth-core/internal',
+])
 const runtimeSpecifiers = new Set([
   '@opentui/core',
   '@opentui/core/testing',
@@ -51,6 +57,102 @@ type SolidTransformModule = {
 
 function runtimeModuleId(specifier: string): string {
   return `opentui:runtime-module:${encodeURIComponent(specifier)}`
+}
+
+function posixPath(path: string): string {
+  return path.replaceAll('\\', '/')
+}
+
+function generatedFileName(relativePath: string): string {
+  return relativePath.replaceAll('/', '-')
+}
+
+const shippedSourceSet = new Set<string>(shippedSourceFiles)
+
+function resolveShippedSource(
+  importerRelativePath: string,
+  specifier: string,
+): string | null {
+  const importerDirectory = dirname(join(sourceRoot, importerRelativePath))
+  const unresolved = resolve(importerDirectory, specifier)
+  const candidates = [unresolved]
+
+  if (specifier.endsWith('.js')) {
+    const withoutExtension = unresolved.slice(0, -3)
+    candidates.push(`${withoutExtension}.ts`, `${withoutExtension}.tsx`)
+  } else if (!specifier.endsWith('.ts') && !specifier.endsWith('.tsx')) {
+    candidates.push(`${unresolved}.ts`, `${unresolved}.tsx`)
+  }
+
+  const sourceFile = candidates.find((candidate) => existsSync(candidate))
+  if (!sourceFile) return null
+
+  const relativePath = posixPath(relative(sourceRoot, sourceFile))
+  if (!shippedSourceSet.has(relativePath)) {
+    throw new Error(
+      `${importerRelativePath} reaches ${relativePath}, which is missing from shippedSourceFiles`,
+    )
+  }
+  return relativePath
+}
+
+function relativeImport(fromFile: string, toFile: string): string {
+  const specifier = posixPath(relative(dirname(fromFile), toFile))
+  return specifier.startsWith('.') ? specifier : `./${specifier}`
+}
+
+function rewriteGeneratedImports(
+  code: string,
+  sourceRelativePath: string,
+  outputFile: string,
+  variantRoot: string,
+): string {
+  const relativeImportPattern =
+    /(\bfrom\s+|\bimport\s*\(\s*|\bimport\s+)(['"])(\.[^'"]*)\2/g
+  let rewritten = code.replace(
+    relativeImportPattern,
+    (match, prefix: string, quote: string, specifier: string) => {
+      const target = resolveShippedSource(sourceRelativePath, specifier)
+      if (!target) return match
+      const targetFile = join(variantRoot, generatedFileName(target))
+      return `${prefix}${quote}${relativeImport(outputFile, targetFile)}${quote}`
+    },
+  )
+
+  const sharedInternal = relativeImport(
+    outputFile,
+    join(outputRoot, 'shared', 'internal.ts'),
+  )
+  rewritten = rewritten.replace(
+    /(['"])(@cortexkit\/openai-auth-core(?:\/internal)?)\1/g,
+    (match, quote: string, specifier: string) =>
+      coreSpecifiers.has(specifier)
+        ? `${quote}${sharedInternal}${quote}`
+        : match,
+  )
+  return rewritten
+}
+
+async function writeSharedCore(): Promise<void> {
+  const sharedRoot = join(outputRoot, 'shared')
+  const coreSourceRoot = join(pluginRoot, '..', 'core', 'src')
+
+  for (const relativePath of sharedCoreSourceFiles) {
+    const outputFile = join(sharedRoot, relativePath)
+    await mkdir(dirname(outputFile), { recursive: true })
+    await writeFile(outputFile, await readFile(join(coreSourceRoot, relativePath)))
+  }
+
+  await writeFile(
+    join(sharedRoot, 'internal.ts'),
+    [
+      "export { type AccountPaths, ACCOUNT_FILE_NAME, ACCOUNT_STATE_FILE_NAME, deriveStatePath } from './paths.ts'",
+      "export { acquireRefreshFileLock } from './refresh-file-lock.ts'",
+      "export { errorMessage } from './util/error.ts'",
+      "export { openUrl } from './util/open-url.ts'",
+      '',
+    ].join('\n'),
+  )
 }
 
 function asTransformSolidSource(
@@ -124,38 +226,53 @@ async function loadTransformSolidSource(): Promise<TransformSolidSource> {
 async function compileTsx(
   transformSolidSource: TransformSolidSource,
   sourceFile: string,
-  outputFile: string,
-): Promise<void> {
-  const code = await readFile(sourceFile, 'utf8')
-  const compiled = await transformSolidSource(code, {
+  code: string,
+): Promise<string> {
+  return transformSolidSource(code, {
     filename: sourceFile,
     moduleName: runtimeModuleId('@opentui/solid'),
     resolvePath: (specifier) =>
       runtimeSpecifiers.has(specifier) ? runtimeModuleId(specifier) : null,
   })
-
-  await mkdir(dirname(outputFile), { recursive: true })
-  await writeFile(outputFile, compiled)
 }
 
 const transformSolidSource = await loadTransformSolidSource()
+const rawRoot = join(outputRoot, 'raw')
+const runtimeRoot = join(outputRoot, 'runtime')
 await rm(outputRoot, { recursive: true, force: true })
+await writeSharedCore()
 
 for (const relativePath of shippedSourceFiles) {
   const sourceFile = join(sourceRoot, relativePath)
-  const outputFile = join(outputRoot, relativePath)
-  await mkdir(dirname(outputFile), { recursive: true })
+  const source = await readFile(sourceFile, 'utf8')
+  const outputName = generatedFileName(relativePath)
+  const rawOutputFile = join(rawRoot, outputName)
+  const runtimeOutputFile = join(runtimeRoot, outputName)
 
-  if (sourceFile.endsWith('.tsx')) {
-    // OpenTUI skips its Solid compile-time transform for packages loaded from
-    // node_modules. Precompile JSX reactivity while binding all Solid/OpenTUI
-    // imports to the host's process-wide virtual runtime registry.
-    await compileTsx(transformSolidSource, sourceFile, outputFile)
-  } else {
-    await copyFile(sourceFile, outputFile)
-  }
+  await mkdir(dirname(rawOutputFile), { recursive: true })
+  await writeFile(
+    rawOutputFile,
+    rewriteGeneratedImports(source, relativePath, rawOutputFile, rawRoot),
+  )
+
+  // OpenTUI skips its Solid compile-time transform for packages loaded from
+  // node_modules. Precompile JSX reactivity while binding all Solid/OpenTUI
+  // imports to the host's process-wide virtual runtime registry.
+  const runtimeSource = sourceFile.endsWith('.tsx')
+    ? await compileTsx(transformSolidSource, sourceFile, source)
+    : source
+  await mkdir(dirname(runtimeOutputFile), { recursive: true })
+  await writeFile(
+    runtimeOutputFile,
+    rewriteGeneratedImports(
+      runtimeSource,
+      relativePath,
+      runtimeOutputFile,
+      runtimeRoot,
+    ),
+  )
 }
 
 console.log(
-  `build-tui: wrote ${shippedSourceFiles.length} file(s) to ${relative(pluginRoot, outputRoot)}`,
+  `build-tui: wrote raw and runtime variants for ${shippedSourceFiles.length} file(s) to ${relative(pluginRoot, outputRoot)}`,
 )

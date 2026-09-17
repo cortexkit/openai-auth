@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.build.json",
+  "compilerOptions": {
+    "paths": {
+      "@cortexkit/openai-auth-core": ["../core/dist/index.d.ts"],
+      "@cortexkit/openai-auth-core/internal": ["../core/dist/internal.d.ts"]
+    }
+  }
+}

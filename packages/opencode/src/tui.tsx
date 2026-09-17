@@ -61,14 +61,15 @@ export function buildApplyRequest(
   return { command, arguments: arguments_, sessionId }
 }
 
-// Read package metadata from either the raw src/ entry or its generated
-// src/tui-compiled/ counterpart. Avoid a JSON import because package.json sits
-// outside the declaration build's rootDir.
+// Read package metadata from the development source or either generated TUI
+// variant. Avoid a JSON import because package.json sits outside the declaration
+// build's rootDir.
 const PLUGIN_VERSION: string = (() => {
   const here = dirname(fileURLToPath(import.meta.url))
   for (const packageFile of [
     join(here, '..', 'package.json'),
     join(here, '..', '..', 'package.json'),
+    join(here, '..', '..', '..', 'package.json'),
   ]) {
     try {
       const raw = readFileSync(packageFile, 'utf8')

@@ -30,11 +30,15 @@
     ]
   },
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --external '@earendil-works/pi-ai' --external '@earendil-works/pi-ai/*' --external '@earendil-works/pi-coding-agent' --external '@earendil-works/pi-coding-agent/*' --external '@earendil-works/pi-tui' --external '@earendil-works/pi-tui/*' --minify && bun run build:types",
+    "build:types": "cd ../core && bun run build && cd ../pi && tsdown --config tsdown.config.ts",
     "test": "bun test src/tests",
     "typecheck": "tsc",
     "types": "tsc",
     "prepublishOnly": "bun run build"
+  },
+  "devDependencies": {
+    "@cortexkit/openai-auth-core": "workspace:*"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.80.10",
