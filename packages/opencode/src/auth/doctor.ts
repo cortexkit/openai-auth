@@ -129,16 +129,18 @@ export function createAuthDoctorReport(input: {
     })
     authNeedsRestore = true
   } else if (
-    !input.auth.refresh ||
-    !input.storage?.accounts.some(
-      (account) =>
-        isOAuthAccount(account) && account.refresh === input.auth?.refresh,
-    )
+    // Only a mismatch against a copy we actually hold is worth reporting. The
+    // ordinary store keeps the main credential out of the fallback roster
+    // entirely, so asking whether the roster contains it calls every healthy
+    // install broken and points the operator at a repair that is not offered,
+    // because the repair needs that same missing copy to restore from.
+    storedMain &&
+    (!input.auth.refresh || storedMain.refresh !== input.auth.refresh)
   ) {
     findings.push({
       code: 'main-refresh-not-in-store',
       message:
-        "OpenCode's main refresh token is absent from the account store.",
+        "OpenCode's main credential does not match the copy in the account store.",
     })
     authNeedsRestore = true
   }

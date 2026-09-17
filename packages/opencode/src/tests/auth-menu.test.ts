@@ -237,7 +237,11 @@ describe('OpenCode auth menu', () => {
     ])
   })
 
-  test('pins the OpenCode login-failure stdout and zero exit code after every action', () => {
+  // Reads the committed capture only. It does not run OpenCode, so it cannot
+  // notice the host changing what it prints; what it does catch is someone
+  // editing the record of what an operator sees without meaning to. The
+  // behaviour behind it is defended by the tests that exercise the callback.
+  test('the recorded auth-login capture still says every action reports a failed login', () => {
     const baseline = readFileSync(
       fileURLToPath(
         new URL(
@@ -279,6 +283,40 @@ describe('OpenCode auth menu', () => {
     const result = await oauthMethod(methods, 0).authorize({})
 
     expect(networkCalls).toBe(0)
+    await expectMenuCompletionFailed(result)
+  })
+
+  // The state every ordinary user is in: signed in, no fallbacks yet. Gating
+  // the menu on the fallback roster hid it from exactly the person who came to
+  // add their first one, on a machine where the removed binary was the only
+  // other way to do it.
+  test('opens for a signed-in user who has no fallback accounts yet', async () => {
+    const paths = tempPaths()
+    await seedStore(paths, [])
+    const { client, getAuth } = createClient({
+      type: 'oauth',
+      refresh: 'main-refresh',
+      access: 'main-access',
+      expires: Date.now() + 86_400_000,
+    })
+    const show = mock(async () => 'cancel' as const)
+    const authorizeBrowser = mock(async () => ({
+      url: 'https://auth.example/browser',
+      instructions: 'Browser instructions',
+      method: 'auto' as const,
+      callback: async () => ({ type: 'failed' as const }),
+    }))
+    const methods = createAuthMethods({
+      client,
+      getAuth,
+      getPaths: () => paths,
+      dependencies: { showAuthMenu: show, authorizeBrowser },
+    })
+
+    const result = await oauthMethod(methods, 0).authorize({})
+
+    expect(show).toHaveBeenCalledTimes(1)
+    expect(authorizeBrowser).not.toHaveBeenCalled()
     await expectMenuCompletionFailed(result)
   })
 

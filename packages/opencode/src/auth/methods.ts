@@ -190,6 +190,22 @@ export function createAuthMethods({
 
   const readAuth = async (): Promise<AuthDetails> =>
     (await getAuth?.().catch(() => undefined)) ?? { type: 'missing' }
+
+  /**
+   * Whether this machine is past its first sign-in.
+   *
+   * A signed-in account is the thing that makes the menu meaningful, and it is
+   * usually the only account there is: fallbacks are stored separately and a
+   * normal store starts with none. Asking about the fallback roster instead
+   * would hide the menu from exactly the person who came to add their first
+   * one — and since the standalone command was removed, a headless machine
+   * would have no way to add it at all.
+   */
+  const hasSomethingToManage = async (): Promise<boolean> => {
+    if ((await readAuth()).type !== 'missing') return true
+    const storage = await deps.loadAccounts(getPaths())
+    return (storage?.accounts.length ?? 0) > 0
+  }
   const setMainAuth = async (credential: {
     refresh: string
     access?: string
@@ -438,12 +454,11 @@ export function createAuthMethods({
       label: 'ChatGPT Pro/Plus (browser)',
       type: 'oauth',
       authorize: async (inputs?: Record<string, string>) => {
-        if (inputs) {
-          const storage = await deps.loadAccounts(getPaths())
-          if (storage && storage.accounts.length > 0) {
-            await runMenuAction(await deps.showAuthMenu())
-            return completedMenuResult()
-          }
+        // `inputs` is only present when this runs from `opencode auth login`;
+        // the TUI never sends it, so the TUI always signs in as before.
+        if (inputs && (await hasSomethingToManage())) {
+          await runMenuAction(await deps.showAuthMenu())
+          return completedMenuResult()
         }
 
         return deps.authorizeBrowser()

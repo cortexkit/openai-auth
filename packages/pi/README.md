@@ -37,8 +37,15 @@ Restart Pi after installing, then authenticate through Pi's normal login flow:
 The extension registers three commands in Pi:
 
 - `openai-account` — list configured fallback accounts, `openai-account add [label]` to add a fallback account via OAuth (browser or `--headless`), or `openai-account remove <id>` to remove one.
-- `openai-quota` — display 5h and weekly quota for all accounts.
-- `openai-routing` — configure routing order (`main-first`, `fallback-first`, `sticky-balanced`) or reset session pins.
+- `openai-quota` — show the quota last recorded for each stored fallback account.
+- `openai-routing` — set the routing order (`main-first`, `fallback-first`, `sticky-balanced`) or reset session pins.
+
+These manage the account store. **Pi requests do not yet route through it** — the
+extension streams through the credential Pi itself supplies, so a routing choice is
+recorded but does not move traffic between accounts, and quota shows the last values
+written to the store rather than fetching current ones. The OpenCode plugin is where
+routing is live today. The store format is shared between the two, so what you configure
+here is what Pi will use once its request path reads it.
 
 ## License
 

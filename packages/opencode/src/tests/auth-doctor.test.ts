@@ -50,13 +50,29 @@ describe('OpenAI auth doctor', () => {
     ).toContain('auth-slot-not-oauth')
   })
 
-  test('detects a main refresh token absent from the account store', () => {
+  test('detects a stored main credential that disagrees with the auth slot', () => {
     expect(
       findingCodes({
-        auth: { type: 'oauth', refresh: 'not-stored' },
-        storage: storage([account('fallback')]),
+        auth: { type: 'oauth', refresh: 'rotated-since' },
+        storage: storage([
+          account('main', { refresh: 'refresh-main' }),
+          account('fallback'),
+        ]),
       }),
     ).toContain('main-refresh-not-in-store')
+  })
+
+  // The shape of every healthy install: the main credential lives in
+  // OpenCode's auth slot and the roster holds fallbacks only. Reporting that
+  // as a fault sent people to a repair that was never offered, because the
+  // repair restores from a copy this store deliberately does not keep.
+  test('reports nothing when main is simply not kept in the roster', () => {
+    expect(
+      findingCodes({
+        auth: { type: 'oauth', refresh: 'lives-only-in-the-auth-slot' },
+        storage: storage([account('fallback')]),
+      }),
+    ).not.toContain('main-refresh-not-in-store')
   })
 
   test('detects an empty account store', () => {

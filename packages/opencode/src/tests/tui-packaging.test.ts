@@ -157,4 +157,43 @@ describe('tui packaging (compiled ./tui entry shim)', () => {
     const missing = reachable.filter((rel) => !shipped.has(rel))
     expect(missing).toEqual([])
   })
+
+  // The check above proves every file is present; it says nothing about whether
+  // the generated tree links. It cannot: the shared re-export shim is written
+  // by the generator, so a file can be shipped while the symbols it imports
+  // from that shim are missing. That shipped once — `bun run build` succeeded,
+  // the suite was green, and importing the generated logger threw
+  // `export 'createLogger' not found`. Loading the modules is the only check
+  // that sees it.
+  test('both generated variants link', async () => {
+    const compiledRoot = join(PKG_DIR, 'src', 'tui-compiled')
+    if (!existsSync(compiledRoot)) {
+      throw new Error(
+        'src/tui-compiled is absent — run `bun run build:tui` before this suite, or this test silently proves nothing',
+      )
+    }
+    // The logger is the deepest core consumer in the shipped set, so it is the
+    // one that fails first when the shim goes stale. Importing it pulls the
+    // shim and every module the shim forwards.
+    for (const variant of ['runtime', 'raw']) {
+      const target = join(compiledRoot, variant, 'logger.ts')
+      expect(existsSync(target)).toBe(true)
+      await import(target)
+    }
+  })
+
+  // Whatever the shipped sources import from the core shim must be something
+  // the shim actually forwards. Naming symbols by hand is what let these drift
+  // apart, so the generator forwards whole modules; this pins that it kept
+  // doing so rather than reverting to a list that looks right and is not.
+  test('the generated core shim forwards whole modules', () => {
+    const shim = readFileSync(
+      join(PKG_DIR, 'src', 'tui-compiled', 'shared', 'internal.ts'),
+      'utf8',
+    )
+    const lines = shim.split('\n').filter((line) => line.startsWith('export'))
+    expect(lines.length).toBeGreaterThan(0)
+    const named = lines.filter((line) => !/^export \* from '/.test(line))
+    expect(named).toEqual([])
+  })
 })
