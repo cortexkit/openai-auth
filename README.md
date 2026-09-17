@@ -57,7 +57,7 @@ The account you log in with via `/login openai` is your **main** account, stored
 
 The plugin supports more than one ChatGPT account: a single **main** account (the one from `/login openai`, held in OpenCode's auth store) plus any number of **fallback** accounts (held in the plugin's own account store). When the main account hits a rate limit, traffic automatically rolls over to a healthy fallback for the rest of the limit window, then returns.
 
-- **Add a fallback** in the TUI with `/openai-account add [label]` (runs the same browser/headless OAuth flow as login), or from a shell with the `openai-auth` CLI (see [CLI](#cli)).
+- **Add a fallback** in the TUI with `/openai-account add [label]` (or through the menu's **Add account…** action, which supports both browser and headless OAuth flows).
 - **Remove** a fallback with `/openai-account remove <id>`.
 - Each account is identified by its stable ChatGPT account id, so the same account is never added twice.
 
@@ -149,17 +149,17 @@ All commands open an interactive control surface in the TUI (a selectable dialog
 | `/openai-logging` | `<level>` | Set log level (`error`/`warn`/`info`/`debug`/`trace`) live. |
 | `/openai-dump` | `on` · `off` | Toggle transport request dumps for cache debugging. |
 
-## CLI
+## Account management
 
-The package exposes an `openai-auth` command for managing fallback accounts from a shell (useful on headless machines or in scripts). Run it with `npx` — no global install needed:
+Fallback accounts can be managed via slash commands or through the interactive TUI:
 
 ```text
-npx @cortexkit/opencode-openai-auth login [--label <name>] [--headless]   # add a fallback account via OAuth
-npx @cortexkit/opencode-openai-auth list                                   # list fallback accounts
-npx @cortexkit/opencode-openai-auth remove <id>                            # remove a fallback account
+/openai-account add [--headless] [label]   # add a fallback account via OAuth (browser or headless device code)
+/openai-account                            # list fallback accounts and open the account dialog
+/openai-account remove <id>                # remove a fallback account
 ```
 
-`login` uses the browser flow by default; `--headless` uses the device-code flow. These manage **fallback** accounts only — the main account comes from `/login openai`.
+You can also run `/openai-account` without arguments to open the interactive **OpenAI Accounts** dialog in the TUI, which supports adding accounts (including the device-code flow when no browser is available), reordering fallbacks, and removing fallback accounts. The main account is authenticated separately via `/login openai`.
 
 ## Configuration
 
@@ -190,7 +190,7 @@ Config file: `~/.config/opencode/openai-auth.json` (the directory follows `OPENC
 
 Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty. The `webSearch` negative env var (`CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH`), when set to a truthy value, disables the cache fix and always wins over the config file.
 
-The same `openai-auth.json` file also holds the managed **account store** (accounts, routing, killswitch thresholds, quota cache, log level, and cache-keep state). Those keys are written by the slash commands and the CLI — edit them through the commands rather than by hand. The plugin distinguishes the two: a settings-only file is never overwritten with account data, and account operations preserve your transport settings.
+The same `openai-auth.json` file also holds the managed **account store** (accounts, routing, killswitch thresholds, quota cache, log level, and cache-keep state). Those keys are written by the slash commands — edit them through the commands rather than by hand. The plugin distinguishes the two: a settings-only file is never overwritten with account data, and account operations preserve your transport settings.
 
 Example — opt into the WebSocket transport via the config file:
 

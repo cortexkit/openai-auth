@@ -10,9 +10,6 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "bin": {
-    "openai-auth": "./dist/cli.js"
-  },
   "exports": {
     ".": {
       "import": "./dist/index.js",
@@ -42,7 +39,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/cli.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && bun run build:types && bun run build:tui",
+    "build": "rm -rf dist && bun build src/index.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && bun run build:types && bun run build:tui",
     "build:tui": "bun scripts/build-tui.ts",
     "build:types": "cd ../core && bun run build && cd ../opencode && tsdown --config tsdown.config.ts",
     "build:dev": "rm -rf dist && tsc -p tsconfig.build.json",

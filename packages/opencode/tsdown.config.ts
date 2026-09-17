@@ -2,7 +2,6 @@ import { defineConfig } from 'tsdown'
 
 const entries = {
   index: 'src/index.ts',
-  cli: 'src/cli.ts',
   'sidebar-state': 'src/sidebar-state.ts',
   'tui-preferences': 'src/tui-preferences.ts',
   'rpc/rpc-client': 'src/rpc/rpc-client.ts',

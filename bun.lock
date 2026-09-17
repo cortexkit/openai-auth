@@ -26,9 +26,6 @@
     "packages/opencode": {
       "name": "@cortexkit/opencode-openai-auth",
       "version": "0.7.2",
-      "bin": {
-        "openai-auth": "./dist/cli.js",
-      },
       "dependencies": {
         "@opentui/core": ">=0.5.11",
         "@opentui/solid": ">=0.5.11",
