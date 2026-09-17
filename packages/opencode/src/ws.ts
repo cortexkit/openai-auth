@@ -646,10 +646,7 @@ export function streamResponsesWebSocket(
         hasContinuation: previousResponseID !== undefined,
       })
     }
-    if (
-      translatedEvent.type !== 'response.created' &&
-      translatedEvent.type !== 'response.in_progress'
-    ) {
+    if (!isNonEmittingFrame(translatedEvent.type)) {
       emittedOutput = true
     }
     resetIdleTimeout('idle timeout waiting for websocket')
@@ -971,6 +968,31 @@ function responseIDOf(event: Record<string, unknown>) {
  * wording, no response ids, no byte counts. `ws-pool.test.ts` pins it against
  * the host's pattern set.
  */
+/**
+ * True for frames the host cannot turn into anything the reader sees.
+ *
+ * This decides whether a turn that dies mid-stream may be retried. Getting it
+ * wrong in one direction replays output someone already read; in the other it
+ * throws away a turn that nothing had come out of yet.
+ *
+ * Two lifecycle frames announce a response without carrying any of it. The
+ * `codex.` frames are the transport's own envelope — the host's parser has no
+ * branch for them and yields nothing (`openai-responses.ts` at v1.18.30 ends
+ * its dispatch with `NO_EVENTS`), so a stream that died right after one has
+ * shown the reader nothing at all. `codex.rate_limits` never reaches here; it
+ * is consumed for quota further up.
+ *
+ * Everything else counts, including the frame that merely opens a reasoning or
+ * text part, because the host opens a durable part from it.
+ */
+function isNonEmittingFrame(type: string): boolean {
+  return (
+    type === 'response.created' ||
+    type === 'response.in_progress' ||
+    type.startsWith('codex.')
+  )
+}
+
 export const TERMINAL_AFTER_OUTPUT_MESSAGE =
   'The response ended early after part of it had already been shown. It was not sent again, because repeating it would duplicate that output and re-run any tools it had started. The transport log records what ended it.'
 

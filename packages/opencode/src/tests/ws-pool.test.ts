@@ -2782,6 +2782,119 @@ describe('transport close provenance', () => {
       },
     )
   })
+
+  // Observed six times in one day against the live backend: a continuation dies
+  // with a bare 1006 after the transport's own envelope frame and nothing else.
+  // The reader has seen nothing at that point, because the host's parser has no
+  // branch for a `codex.` frame, so the turn can safely be sent again. Treating
+  // the envelope as output threw those turns away.
+  test('the transport envelope frame alone does not bar a retry', async () => {
+    await withFakeWebSocket(
+      ({ message, close }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'codex.response.metadata',
+              thread_id: 'th-1',
+            }),
+          )
+          message(
+            JSON.stringify({
+              type: 'response.created',
+              response: { id: 'resp-1' },
+            }),
+          )
+          close(1006, 'socket closed')
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-envelope-only',
+              authorization: 'Bearer tok-main',
+            },
+            body: JSON.stringify({ stream: true, input: [] }),
+          },
+        )
+        let streamError: unknown
+        try {
+          await response.text()
+        } catch (err) {
+          streamError = err
+        }
+        expect(streamError).toBeInstanceOf(ResponseStreamError)
+        expect((streamError as { isRetryable?: boolean }).isRetryable).toBe(
+          true,
+        )
+        expect((streamError as { message: string }).message).not.toBe(
+          TERMINAL_AFTER_OUTPUT_MESSAGE,
+        )
+        websocketFetch.close()
+      },
+    )
+  })
+
+  // The other direction, and the one that must never regress: a reasoning part
+  // has been opened, so something is on screen and the turn is finished.
+  test('an opened reasoning part does bar a retry', async () => {
+    await withFakeWebSocket(
+      ({ message, close }) => ({
+        send() {
+          message(
+            JSON.stringify({
+              type: 'codex.response.metadata',
+              thread_id: 'th-2',
+            }),
+          )
+          message(
+            JSON.stringify({
+              type: 'response.created',
+              response: { id: 'resp-2' },
+            }),
+          )
+          message(
+            JSON.stringify({
+              type: 'response.output_item.added',
+              item: { type: 'reasoning', id: 'rs_1' },
+            }),
+          )
+          close(1006, 'socket closed')
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const response = await websocketFetch(
+          'https://example.test/backend-api/codex/responses',
+          {
+            method: 'POST',
+            headers: {
+              'session-id': 'sess-part-opened',
+              authorization: 'Bearer tok-main',
+            },
+            body: JSON.stringify({ stream: true, input: [] }),
+          },
+        )
+        let streamError: unknown
+        try {
+          await response.text()
+        } catch (err) {
+          streamError = err
+        }
+        expect((streamError as { message: string }).message).toBe(
+          TERMINAL_AFTER_OUTPUT_MESSAGE,
+        )
+        expect(streamError).not.toBeInstanceOf(ResponseStreamError)
+      },
+    )
+  })
 })
 
 async function withFakeWebSocket(
