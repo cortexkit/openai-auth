@@ -418,6 +418,38 @@ describe('commands', () => {
     ).toBe('sticky-balanced')
   })
 
+  // `list` and no argument are the same request. Pi's surface documents `list`,
+  // and a bare `/openai-account` is what OpenCode users type; both reach the
+  // roster rather than the usage text, so the two hosts describe one command.
+  test('account list shows the roster, not the usage text', async () => {
+    await saveAccounts(
+      {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [makeAccount('fallback-1')],
+      },
+      getAccountPaths(configPath),
+    )
+    const ctx: CommandContext = {
+      packageVersion: PackageVersion,
+      accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: new QuotaManager({
+        configPath: getAccountStoragePath(),
+        storage: { version: 1, accounts: [] },
+      }),
+      loadAccounts,
+      client: makeClient(),
+    }
+
+    const listed = await buildDialogPayload('openai-account', 'list', ctx)
+    const bare = await buildDialogPayload('openai-account', '', ctx)
+
+    expect(listed.text).toBe(bare.text)
+    expect(listed.text).toContain('## OpenAI Accounts')
+    expect(listed.text).not.toContain('## Account Commands')
+  })
+
   test('account command lists sticky-balanced routing and session reset', async () => {
     await saveAccounts(
       {
