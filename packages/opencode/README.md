@@ -58,6 +58,8 @@ Account management (fallback accounts; the main account comes from `/login opena
 
 All account operations can also be performed interactively via the `/openai-account` TUI dialog.
 
+On a headless machine, where the slash commands are out of reach, `opencode auth login` offers the same account actions — add, re-authenticate the main account, force a quota check, diagnose and repair the stored credentials, or delete every fallback. It prints `Failed to authorize` on return even when the action succeeded, because the menu writes its own changes and reports none of them as a sign-in; confirm with `/openai-account`.
+
 ## Configuration
 
 Settings resolve as environment variable → config file (`~/.config/opencode/openai-auth.json`) → default.

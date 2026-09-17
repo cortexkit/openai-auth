@@ -161,6 +161,23 @@ Fallback accounts can be managed via slash commands or through the interactive T
 
 You can also run `/openai-account` without arguments to open the interactive **OpenAI Accounts** dialog in the TUI, which supports adding accounts (including the device-code flow when no browser is available), reordering fallbacks, and removing fallback accounts. The main account is authenticated separately via `/login openai`.
 
+### From a terminal, without a TUI session
+
+Once at least one account exists, `opencode auth login` offers an account menu for this provider:
+
+```text
+Add account          add a fallback account (device code when no browser is available)
+Auth current         re-authenticate the main account in place
+Check quotas         refresh every account's quota now, ignoring backoff
+Auth doctor          report problems with the stored credentials
+Apply repairs        fix what the doctor found
+Delete all accounts  remove every fallback account
+```
+
+This is the path for headless machines, where the slash commands are out of reach. The first login on a new machine goes straight to sign-in as usual; the menu appears only once there is something to manage.
+
+One quirk worth knowing: the menu prints `Failed to authorize` when it returns, even when the action succeeded. The menu writes its own changes and deliberately reports nothing back as a sign-in, because a fallback account must not be filed as the main credential. Check the result with `/openai-account`.
+
 ## Configuration
 
 Settings come from two sources. **Environment variables take precedence over the config file**, and any unset value falls back to the default.
