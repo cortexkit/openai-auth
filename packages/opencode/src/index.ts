@@ -10,21 +10,15 @@ import { join } from 'node:path'
 import {
   type AccountStorage,
   acquireRefreshFileLock,
-  base64UrlEncode,
-  beginDeviceAuth,
-  buildAuthorizeUrl,
   buildRefreshOperationError,
   buildUserAgent,
   codexRefreshFn,
-  completeDeviceAuth,
   errorMessage,
   extractAccountId,
   extractAccountIdFromClaims,
   type FallbackAccount,
   FallbackAccountManager,
-  flowCleanup,
   formatRefreshBackoffMessage,
-  generatePKCE,
   getKillswitchThresholdsForAccount,
   hashRefreshToken,
   isCompleteQuotaHeaderFrame,
@@ -48,11 +42,10 @@ import {
   refreshBackoffActive,
   resolveMidStreamRateLimitResetAt,
   shouldFallbackStatus,
-  startOAuthServer,
-  waitForOAuthCallback,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, Plugin, PluginInput } from '@opencode-ai/plugin'
+import { createAuthMethods } from './auth/methods'
 import {
   buildDialogPayload,
   type CommandContext,
@@ -1020,6 +1013,15 @@ export async function CodexAuthPlugin(
   // let any disposal kill the shared poller).
   const backgroundQuotaRefresh = new BackgroundQuotaRefresh()
 
+  let loaderGetAuth:
+    | Parameters<NonNullable<NonNullable<Hooks['auth']>['loader']>>[0]
+    | undefined
+  const authMethods = createAuthMethods({
+    client: input.client,
+    getAuth: async () => loaderGetAuth?.(),
+    fetchImpl: fetch,
+  })
+
   async function sendIgnoredMessage(sessionId: string, text: string) {
     const session = input.client.session as
       | { promptAsync?: (req: unknown) => Promise<unknown> }
@@ -1184,6 +1186,7 @@ export async function CodexAuthPlugin(
     auth: {
       provider: 'openai',
       async loader(getAuth) {
+        loaderGetAuth = getAuth
         const auth = await getAuth()
         if (auth.type !== 'oauth') return {}
 
@@ -3454,79 +3457,7 @@ export async function CodexAuthPlugin(
           },
         }
       },
-      methods: [
-        {
-          label: 'ChatGPT Pro/Plus (browser)',
-          type: 'oauth',
-          authorize: async () => {
-            const { redirectUri } = await startOAuthServer()
-            const pkce = await generatePKCE()
-            const state = base64UrlEncode(
-              crypto.getRandomValues(new Uint8Array(32)).buffer,
-            )
-            const authUrl = buildAuthorizeUrl(redirectUri, pkce, state)
-
-            const callbackPromise = waitForOAuthCallback(pkce, state)
-
-            return {
-              url: authUrl,
-              instructions:
-                'Complete authorization in your browser. This window will close automatically.',
-              method: 'auto' as const,
-              callback: async () => {
-                try {
-                  const tokens = await callbackPromise
-                  const accountId = extractAccountId(tokens)
-                  return {
-                    type: 'success' as const,
-                    refresh: tokens.refresh_token,
-                    access: tokens.access_token,
-                    expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-                    accountId,
-                  }
-                } finally {
-                  flowCleanup(state)
-                }
-              },
-            }
-          },
-        },
-        {
-          label: 'ChatGPT Pro/Plus (headless)',
-          type: 'oauth',
-          authorize: async () => {
-            const { deviceData, url, instructions } =
-              await beginDeviceAuth(PackageVersion)
-
-            return {
-              url,
-              instructions,
-              method: 'auto' as const,
-              async callback() {
-                try {
-                  const tokens = await completeDeviceAuth(
-                    deviceData,
-                    PackageVersion,
-                  )
-                  return {
-                    type: 'success' as const,
-                    refresh: tokens.refresh_token,
-                    access: tokens.access_token,
-                    expires: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-                    accountId: extractAccountId(tokens),
-                  }
-                } catch {
-                  return { type: 'failed' as const }
-                }
-              },
-            }
-          },
-        },
-        {
-          label: 'Manually enter API Key',
-          type: 'api',
-        },
-      ],
+      methods: authMethods,
     },
     'chat.headers': async (input, output) => {
       if (input.model.providerID !== 'openai') return
