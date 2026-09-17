@@ -115,11 +115,21 @@
 - Depends on: `core/accounts.ts`, `core/cachekeep.ts`, `core/oauth.ts`, `core/refresh-all-quota.ts`, `core/reset-credits.ts`, `quota-manager.ts`, `rpc/protocol.ts`, `logger.ts`, `config.ts`.
 - Used by: Plugin loader (`auth.loader`), RPC `apply` dispatch.
 
+**Auth methods and the account menu:**
+- Purpose: The three `/login openai` entries, plus an account menu rendered inside `opencode auth login` on a machine past its first sign-in. Replaces the removed `openai-auth` binary.
+- Location: `packages/opencode/src/auth/methods.ts` (entries, menu actions, `createAuthMethods`), `packages/opencode/src/auth/doctor.ts` (`createAuthDoctorReport`, `findStoredMainCredential`), `packages/opencode/src/auth/ui/` (`auth-menu.ts`, `select.ts`, `confirm.ts`, `ansi.ts` — first-party terminal code, no prompt library).
+- Contains: Six actions (add account, auth current, check quotas, auth doctor, apply repairs, delete all accounts); the doctor's findings and their repairs; `AUTH_MENU_ACTIONS`.
+- Key behaviours: `authorize(inputs?)` receives `inputs` only from the CLI, so the TUI path is unchanged. The menu opens when a main credential exists, not when the fallback roster is non-empty — gating on the roster hid it from the user adding their first fallback. Every action returns a failed callback (`AuthOAuthResult` has no top-level failure shape), because add writes a *fallback* and reporting it as a login would file it as the main credential; the resulting `Failed to authorize` line is captured in `docs/baselines/opencode-auth-menu.v1.18.30.txt`. Delete-all passes an explicit id list to `allowDrop`, built inside the mutation from the raw roster ids `mutateAccounts` exposes.
+- Depends on: `packages/core/src/index.ts` and `./internal`, `refresh-all-quota.ts`, the loader-captured `getAuth`, `client.auth.set`.
+- Used by: `packages/opencode/src/index.ts` `auth.methods`.
+
 **Pi extension (sibling package):**
-- Purpose: Same Codex OAuth capability for the Pi coding agent (separate OpenAI Codex Responses API surface).
-- Location: `packages/pi/src/index.ts`, `packages/pi/src/raw-ws-node.ts`
-- Contains: Provider registration (`openai-codex`), model list (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`), custom streaming wrapper, hand-rolled WebSocket shim.
-- Depends on: `@earendil-works/pi-ai` (imported via `/compat` to match Pi loader's alias table), `@earendil-works/pi-coding-agent`, `node:net`/`node:tls`.
+- Purpose: Same Codex OAuth capability for the Pi coding agent (separate OpenAI Codex Responses API surface), plus the shared account commands.
+- Location: `packages/pi/src/index.ts`, `packages/pi/src/commands.ts`, `packages/pi/src/paths.ts`, `packages/pi/src/routing.ts`, `packages/pi/src/raw-ws-node.ts`
+- Contains: Provider registration (`openai-codex`), model list (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`), custom streaming wrapper, hand-rolled WebSocket shim, and thin wrappers registering `openai-account`, `openai-quota` and `openai-routing` over the shared core bodies. Not `openai-reset`: it spends an irreversible credit bound to a ChatGPT identity Pi has no concept of.
+- Storage: its own paths (`PI_OPENAI_AUTH_FILE` else `PI_AGENT_DIR` else `~/.pi/agent`), never the `OPENCODE_*` variables for either file.
+- Known gap: the Pi request path does not read the store, so a routing choice persists without moving traffic. Tracked as issue #153.
+- Depends on: `@earendil-works/pi-ai` (imported via `/compat` to match Pi loader's alias table), `@earendil-works/pi-coding-agent`, `node:net`/`node:tls`, `@cortexkit/openai-auth-core`.
 - Used by: Pi extension loader.
 
 ## Data Flow

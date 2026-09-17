@@ -102,6 +102,12 @@
   - `packages/core/src/paths.ts` — shared file names (`ACCOUNT_FILE_NAME`, `ACCOUNT_STATE_FILE_NAME`) and `deriveStatePath`
   - `packages/core/src/provider.ts` — Codex-specific injection seam (`codexRefreshFn`, `whamUsageFn`)
 
+**`packages/opencode/src/auth/`:**
+- Purpose: The `/login openai` method entries and the account menu rendered inside `opencode auth login`. Replaces the removed `openai-auth` binary.
+- Contains: `methods.ts` (`createAuthMethods`, the six menu actions), `doctor.ts` (`createAuthDoctorReport`, `findStoredMainCredential`), `ui/auth-menu.ts`, `ui/select.ts`, `ui/confirm.ts`, `ui/ansi.ts`.
+- Key files: `packages/opencode/src/auth/methods.ts`, `packages/opencode/src/auth/doctor.ts`.
+- Note: the `ui/` files are first-party terminal code on purpose — the package carries no prompt-library runtime dependency.
+
 **`packages/opencode/src/rpc/`:**
 - Purpose: Loopback HTTP RPC between the auth loader and the TUI sidebar.
 - Contains: `rpc-server.ts` (bearer-token HTTP server, 1 MiB body cap), `port-file.ts` (`port-<pid>.json` write + discovery), `rpc-client.ts` (TUI-side client with 2s timeout), `rpc-dir.ts` (`XDG_STATE_HOME/cortexkit/openai-auth/rpc/openai-auth-<sha256(projectDir)>/` with startup sweeps for dead port files and empty project directories), `notifications.ts` (queue + per-session TUI-connected tracking), `protocol.ts` (wire types).
@@ -128,9 +134,9 @@
 - Key files: `packages/opencode/scripts/build-tui.ts`.
 
 **`packages/pi/src/`:**
-- Purpose: Sibling package exposing the same Codex OAuth capability to the Pi coding agent.
-- Contains: `index.ts` (Pi extension entry, provider registration, custom streaming wrapper), `raw-ws-node.ts`.
-- Key files: `packages/pi/src/index.ts`.
+- Purpose: Sibling package exposing the same Codex OAuth capability to the Pi coding agent, plus the shared account commands.
+- Contains: `index.ts` (Pi extension entry, provider registration, custom streaming wrapper), `commands.ts` (thin wrappers registering `openai-account`, `openai-quota`, `openai-routing` over the shared core bodies), `paths.ts` (Pi-only store paths), `routing.ts` (process-local session pins), `raw-ws-node.ts`.
+- Key files: `packages/pi/src/index.ts`, `packages/pi/src/commands.ts`, `packages/pi/src/paths.ts`.
 
 **`scripts/`:**
 - Purpose: Release + local dev tooling.
