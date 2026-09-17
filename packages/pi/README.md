@@ -32,6 +32,14 @@ Restart Pi after installing, then authenticate through Pi's normal login flow:
 /login openai-codex
 ```
 
+## Commands
+
+The extension registers three commands in Pi:
+
+- `openai-account` — list configured fallback accounts, `openai-account add [label]` to add a fallback account via OAuth (browser or `--headless`), or `openai-account remove <id>` to remove one.
+- `openai-quota` — display 5h and weekly quota for all accounts.
+- `openai-routing` — configure routing order (`main-first`, `fallback-first`, `sticky-balanced`) or reset session pins.
+
 ## License
 
 MIT

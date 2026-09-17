@@ -5,7 +5,7 @@
 ```
 [project-root]/
 ├── packages/
-│   ├── opencode/                  # @cortexkit/opencode-openai-auth (OpenCode plugin + CLI + TUI)
+│   ├── opencode/                  # @cortexkit/opencode-openai-auth (OpenCode plugin + TUI)
 │   │   ├── src/                   # All plugin source
 │   │   │   ├── core/              # Generic, provider-agnostic core
 │   │   │   ├── rpc/               # Loopback HTTP RPC between loader and TUI
@@ -13,7 +13,6 @@
 │   │   │   ├── tui/               # TUI sidebar Solid components
 │   │   │   ├── util/              # Small dependency-free helpers
 │   │   │   ├── index.ts           # CodexAuthPlugin entry
-│   │   │   ├── cli.ts             # `openai-auth` binary
 │   │   │   ├── codex-http.ts      # HTTP fallback sanitization for WebSocket downgrades
 │   │   │   ├── commands.ts        # /openai-* dialog builders
 │   │   │   ├── config.ts          # Settings resolution (env > file > default)
@@ -142,14 +141,13 @@
 
 **Entry Points:**
 - `packages/opencode/src/index.ts` — OpenCode plugin (server hook). The plugin registers as `openai` provider.
-- `packages/opencode/src/cli.ts` — `openai-auth` CLI (manages fallback accounts; executed via `npx @cortexkit/opencode-openai-auth`).
 - `packages/opencode/src/tui/entry.mjs` — TUI export shim; loads the precompiled TUI for packaged hosts and raw TSX for compatible local loaders.
 - `packages/opencode/src/tui.tsx` — TUI sidebar source; compiled into `src/tui-compiled/` during the package build.
 - `packages/pi/src/index.ts` — Pi extension entry.
 
 **Configuration:**
 - `packages/opencode/src/config.ts` — settings resolution (env > file > default), memoization invalidation (`refreshSettings`), `DEFAULT_CODEX_API_ENDPOINT`, env-var constants.
-- `packages/opencode/package.json` — `bin.openai-auth` entry point, `oc-plugin` field declaring `["server", "tui"]`, exports map (`./tui`, `./tui-prefs`).
+- `packages/opencode/package.json` — `oc-plugin` field declaring `["server", "tui"]`, exports map (`./tui`, `./tui-prefs`).
 - `packages/opencode/src/tui-preferences.ts` — shared `tui-preferences.jsonc` reader/writer/watcher (used by the TUI sidebar slot config).
 - `biome.json` — formatter/linter config.
 - `lefthook.yml` — pre-commit biome check.
@@ -193,7 +191,7 @@
 
 ## Naming Conventions
 
-**Files:** lowercase-kebab or lowercase-flat. Top-level files use bare lowercase names (`index.ts`, `cli.ts`, `codex-http.ts`, `commands.ts`, `config.ts`, `logger.ts`, `model-costs.ts`, `quota-normalize.ts`, `sidebar-state.ts`, `ws-pool.ts`, `hosted-web-search.ts`, `response-stream-error.ts`, `raw-ws-bun.ts`, `raw-ws-node.ts`, `raw-ws-upgrade.ts`, `version.ts`). Subdirectory files share the directory name as a prefix where it helps (`core/accounts.ts`, `core/oauth.ts`, `rpc/rpc-server.ts`, `rpc/port-file.ts`, `util/uuid-v7.ts`).
+**Files:** lowercase-kebab or lowercase-flat. Top-level files use bare lowercase names (`index.ts`, `codex-http.ts`, `commands.ts`, `config.ts`, `logger.ts`, `model-costs.ts`, `quota-normalize.ts`, `sidebar-state.ts`, `ws-pool.ts`, `hosted-web-search.ts`, `response-stream-error.ts`, `raw-ws-bun.ts`, `raw-ws-node.ts`, `raw-ws-upgrade.ts`, `version.ts`). Subdirectory files share the directory name as a prefix where it helps (`core/accounts.ts`, `core/oauth.ts`, `rpc/rpc-server.ts`, `rpc/port-file.ts`, `util/uuid-v7.ts`).
 Example: `packages/opencode/src/core/cachekeep.ts`, `packages/opencode/src/rpc/rpc-server.ts`.
 
 **Directories:** lowercase-kebab. Subdirectories group by layer (`core/`, `rpc/`, `tests/`, `tui/`, `util/`).

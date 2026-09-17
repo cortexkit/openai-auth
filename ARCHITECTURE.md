@@ -27,7 +27,7 @@
 - Location: `packages/core/src/accounts.ts`, `packages/core/src/atomic-write.ts`, `packages/core/src/refresh-file-lock.ts`, `packages/core/src/paths.ts` (shared file names + `deriveStatePath`), plus the host path resolver `packages/opencode/src/core/account-paths.ts`
 - Contains: `deriveStatePath` in `account-paths.ts` (derives `${configPath}.state.json` when custom config paths are used, preventing distinct account files from sharing one state document, with `accountPathsCollide` detecting aliases), `loadAccounts`/`migrateIfNeeded` (serialized under the shared save lock to coordinate concurrent migrations and mutations), `mutateAccounts` (authoritative read-modify-write for structural mutations and scalar writes, preserving load-dropped raw entries on disk with an `allowDrop` option for intentional caller removals, preventing concurrent union-merge resurrection of deleted accounts/secrets), `saveAccounts` (test seeding only), `saveAccountState` (updates state secrets, gated by config roster to prevent resurrection of deleted account secrets), `FallbackAccountManager` (background refresh, `getUsableFallbackAccounts`, fire-and-forget `markUsed` telemetry), `OAuthAccount`/`ApiKeyAccount` types, single-writer eviction-marker file lock with separated acquire window, lock TTL, and generation-fenced renewal and release (distinguishes holder contention from event-loop starvation in timeout errors, verifies owner and marker identity to avoid deleting or extending a successor's lock, and recreates missing parent directories automatically on `ENOENT`), atomic JSON write (temp + rename, mode `0o600`).
 - Depends on: `core/oauth.ts` (`extractAccountId`), `core/provider.ts` (`ProviderQuotaFn`), `core/backoff.ts`.
-- Used by: Plugin loader, CLI (`cli.ts`), `/openai-account`/`/openai-routing`/`/openai-killswitch` commands, every quota push.
+- Used by: Plugin loader, `/openai-account`/`/openai-routing`/`/openai-killswitch` commands, every quota push.
 
 **Quota cache and policy:**
 - Purpose: In-memory cache of main + per-fallback quota snapshots, dedup of inflight fetches, refresh-after math, backoff gating, and mid-stream rate-limit marks.
@@ -114,13 +114,6 @@
  - Contains: Command name constants (`OPENAI_*_COMMAND_NAME`), `MODAL_COMMANDS`, `CommandContext` DI shape, `buildDialogPayload`, `applyCommand`, `scrubKnobs`, `hostCommandBodies`.
 - Depends on: `core/accounts.ts`, `core/cachekeep.ts`, `core/oauth.ts`, `core/refresh-all-quota.ts`, `core/reset-credits.ts`, `quota-manager.ts`, `rpc/protocol.ts`, `logger.ts`, `config.ts`.
 - Used by: Plugin loader (`auth.loader`), RPC `apply` dispatch.
-
-**CLI (`openai-auth`):**
-- Purpose: Manage fallback accounts from a shell — useful on headless machines or in scripts.
-- Location: `packages/opencode/src/cli.ts`
-- Contains: `login`/`list`/`remove` subcommands, browser or device-code (`--headless`) OAuth flow, self-fallback rejection (refuses to add the main account as a fallback).
-- Depends on: `core/accounts.ts`, `core/oauth.ts`, `util/open-url.ts`.
-- Used by: The published `openai-auth` CLI (run via `npx @cortexkit/opencode-openai-auth`).
 
 **Pi extension (sibling package):**
 - Purpose: Same Codex OAuth capability for the Pi coding agent (separate OpenAI Codex Responses API surface).
@@ -244,11 +237,6 @@ Server-side deduplication of a repeated `redeem_request_id` is verified live (20
 - Location: `packages/opencode/src/index.ts` (`CodexAuthPlugin`)
 - Triggers: OpenCode loads `@cortexkit/opencode-openai-auth` per `~/.config/opencode/opencode.json` `plugin` field.
 - Responsibilities: Returns `Hooks`; `provider.models` filters the OpenAI model list (allow-list + GPT >5.4 fallback) and zeroes OAuth costs; `auth.loader` does the heavy lifting on first OAuth request; `auth.fetch` is the per-request wrapper; `command.execute.before` returns `cleanAbort` for `/openai-*`; `tool.web_search` registers `HostedWebSearchTool`; `event` cleans session state on `session.deleted`; `dispose` closes WS, stops cachekeep, stops background refresh, and stops background quota polling.
-
-**CLI entry:**
-- Location: `packages/opencode/src/cli.ts`
-- Triggers: The `openai-auth` CLI (run via `npx @cortexkit/opencode-openai-auth`).
-- Responsibilities: Manages fallback accounts (`login [--headless]`, `list`, `remove`); rejects adding the main account as a fallback.
 
 **TUI entry:**
 - Location: `packages/opencode/src/tui/entry.mjs` (exported as `./tui`; dispatches to the precompiled or raw TUI)

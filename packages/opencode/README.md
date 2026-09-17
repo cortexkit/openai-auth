@@ -30,7 +30,7 @@ Restart OpenCode after changing plugin config, then authenticate:
 - Per-turn quota tracking (5-hour + weekly windows) on both transports, with a sidebar readout and an explicit all-accounts refresh.
 - Idle prompt-cache keep-warm, with an optional subagent mode and main-only sustain mode.
 - Leveled, secret-redacting, rotating log file.
-- Interactive in-TUI control surfaces for every command, plus an `openai-auth` CLI for managing fallback accounts headlessly.
+- Interactive in-TUI control surfaces for every command, including fallback account management and headless device-code authentication.
 - Optional OpenAI Responses WebSocket transport (HTTP is the default).
 
 ## Commands
@@ -48,13 +48,17 @@ Each opens an interactive dialog in the TUI. Commands with listed arguments also
 | `/openai-logging` | `<level>` | Set log level live. |
 | `/openai-dump` | `on` · `off` | Toggle transport request dumps. |
 
-CLI (fallback accounts only; the main account comes from `/login openai`). Run via `npx` — no global install needed:
+Account management (fallback accounts; the main account comes from `/login openai`):
 
 ```text
-npx @cortexkit/opencode-openai-auth login [--label <name>] [--headless]
-npx @cortexkit/opencode-openai-auth list
-npx @cortexkit/opencode-openai-auth remove <id>
+/openai-account add [--headless] [label]
+/openai-account
+/openai-account remove <id>
 ```
+
+All account operations can also be performed interactively via the `/openai-account` TUI dialog.
+
+On a headless machine, where the slash commands are out of reach, `opencode auth login` offers the same account actions — add, re-authenticate the main account, force a quota check, diagnose and repair the stored credentials, or delete every fallback. It prints `Failed to authorize` on return even when the action succeeded, because the menu writes its own changes and reports none of them as a sign-in; confirm with `/openai-account`.
 
 ## Configuration
 
