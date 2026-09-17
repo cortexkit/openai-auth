@@ -1,0 +1,77 @@
+# Packaging baseline for inlining the private core into published hosts.
+# Measured at commit dfd36fc50e315b88ea48ba5cbd959bc33a7d5697
+#   (docs: record the shared core package in the architecture notes).
+# That commit is documentation-only on top of ccf0522759cf4c5a041c99cccf4ef5a69a433f63
+#   (feat(core): extract the shared command core into @cortexkit/openai-auth-core).
+# Packaging inputs (manifests, build scripts, source, tsconfigs) are identical to ccf0522.
+#
+# Tree was clean. `bun install` at the workspace root completed with no lockfile
+# changes. Hosts were built with the existing package scripts:
+#   packages/opencode: bun run build
+#   packages/pi:       bun run build
+# Then `bun pm pack` in each host, extract into an empty directory outside the
+# workspace (/tmp), `npm install --omit=dev --ignore-scripts` in the extracted
+# package, then checks 1 and 2.
+#
+# bun 1.4.2, node v22.23.1, npm 10.9.8.
+
+== check 1: node --input-type=module -e "await import('<spec>')"
+Run from the extracted package directory after npm install --omit=dev.
+Subpaths are the published export keys; Node resolves the package name from
+the extracted package.json.
+
+-- @cortexkit/opencode-openai-auth (.)
+   await import('@cortexkit/opencode-openai-auth') -> exit 0
+   await import('./dist/index.js') -> exit 0
+   GREEN
+
+-- @cortexkit/opencode-openai-auth/tui (./tui)
+   await import('@cortexkit/opencode-openai-auth/tui') -> exit 1
+   await import('./src/tui/entry.mjs') -> exit 1
+   RED (plain node cannot load the TUI)
+   Error [ERR_UNSUPPORTED_ESM_URL_SCHEME]: Only URLs with a scheme in: file,
+   data, and node are supported by the default ESM loader. Received protocol
+   'opentui:'
+   (entry.mjs probes the OpenTUI runtime registry, then loads compiled TSX
+   which imports opentui:runtime-module:... virtual specifiers.)
+
+-- @cortexkit/opencode-openai-auth/tui-prefs (./tui-prefs)
+   await import('@cortexkit/opencode-openai-auth/tui-prefs') -> exit 1
+   await import('./dist/tui-preferences.js') -> exit 1
+   RED
+   Error: Cannot find module './impl/format'
+   Require stack: .../dist/index-ygp4rfqb.js
+   (bun --splitting plus jsonc-parser's CJS wrapper; pre-existing, not a
+   missing core specifier.)
+
+-- @cortexkit/pi-openai-auth (.)
+   await import('@cortexkit/pi-openai-auth') -> exit 0
+   await import('./dist/index.js') -> exit 0
+   GREEN
+
+== check 2: every path named by types and exports[*].types exists
+in the extracted tree.
+
+-- @cortexkit/opencode-openai-auth
+   types: ./dist/index.d.ts -> exists
+   exports[.].types: ./dist/index.d.ts -> exists
+   exports[./tui].types: ./dist/tui.d.ts -> exists
+   exports[./tui-prefs].types: ./dist/tui-preferences.d.ts -> exists
+   GREEN
+
+-- @cortexkit/pi-openai-auth
+   types: ./dist/index.d.ts -> exists
+   exports[.].types: ./dist/index.d.ts -> exists
+   GREEN
+
+== notes (not part of checks 1–2, observed while packing)
+- Extracted opencode package.json has no @cortexkit/openai-auth-core key
+  (hosts do not declare it yet). npm install --omit=dev succeeded
+  (141 packages).
+- Extracted pi package.json has no dependencies; npm install --omit=dev
+  still succeeded (227 packages, npm installing peerDependencies).
+- files lists src/core/refresh-file-lock.ts, which does not exist after
+  the extraction; bun pm pack skipped it without failing.
+- Emitted dist/*.d.ts and copied TUI source still name
+  @cortexkit/openai-auth-core; that is the gap this slice closes.
+  A runtime import cannot see it, which is why check 3 exists post-change.
