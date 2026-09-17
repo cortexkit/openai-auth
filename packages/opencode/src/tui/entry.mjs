@@ -22,12 +22,12 @@ try {
   }
   // Older hosts and bare Bun do not provide the virtual registry. Their source
   // loader still applies the Solid transform, so retain the raw TSX fallback.
-  mod = await import('../tui.tsx')
+  mod = await import('../tui-compiled/raw/tui.tsx')
 }
 
 if (!mod) {
   try {
-    mod = await import('../tui-compiled/tui.tsx')
+    mod = await import('../tui-compiled/runtime/tui.tsx')
   } catch (error) {
     console.error('OpenAI Auth compiled TUI failed to load', error)
     throw error

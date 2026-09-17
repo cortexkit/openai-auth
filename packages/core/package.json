@@ -1,5 +1,6 @@
 {
   "name": "@cortexkit/openai-auth-core",
+  "version": "0.0.0",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -14,6 +15,7 @@
     }
   },
   "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "test": "bun test src/tests",
     "typecheck": "tsc",
     "types": "tsc"
