@@ -203,6 +203,31 @@ interface WhamUsageResponse {
     available_count?: number
     applicable_available_count?: number
   } | null
+  credits?: {
+    has_credits?: boolean
+    unlimited?: boolean
+    overage_limit_reached?: boolean
+    balance?: unknown
+  } | null
+  spend_control?: {
+    reached?: boolean
+    individual_limit?: {
+      source?: string
+      unit?: string
+      limit?: unknown
+      used?: unknown
+      remaining?: unknown
+      used_percent?: unknown
+      remaining_percent?: unknown
+      reset_at?: string | number
+    } | null
+  } | null
+}
+
+function nonNegativeNumberish(value: unknown): number | undefined {
+  if (value == null || value === '') return undefined
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined
 }
 
 function windowFromWham(
@@ -255,6 +280,50 @@ export function normalizeWham(json: WhamUsageResponse): OAuthQuotaSnapshot {
   )
   if (resetCreditsApplicable !== undefined) {
     snapshot.resetCreditsApplicable = resetCreditsApplicable
+  }
+  const individualLimit = json.spend_control?.individual_limit
+  if (individualLimit && typeof json.spend_control?.reached === 'boolean') {
+    const limit = nonNegativeNumberish(individualLimit.limit)
+    const used = nonNegativeNumberish(individualLimit.used)
+    const remaining = nonNegativeNumberish(individualLimit.remaining)
+    const usedPercent = nonNegativeNumberish(individualLimit.used_percent)
+    const remainingPercent = nonNegativeNumberish(
+      individualLimit.remaining_percent,
+    )
+    if (
+      limit !== undefined &&
+      used !== undefined &&
+      remaining !== undefined &&
+      usedPercent !== undefined &&
+      remainingPercent !== undefined
+    ) {
+      snapshot.spendControl = {
+        limit,
+        used,
+        remaining,
+        usedPercent,
+        remainingPercent,
+        resetsAt: toResetIso(individualLimit.reset_at),
+        unit: individualLimit.unit,
+        source: individualLimit.source,
+        reached: json.spend_control.reached,
+      }
+    }
+  }
+  const credits = json.credits
+  if (
+    credits &&
+    typeof credits.has_credits === 'boolean' &&
+    typeof credits.unlimited === 'boolean' &&
+    typeof credits.overage_limit_reached === 'boolean'
+  ) {
+    const balance = nonNegativeNumberish(credits.balance)
+    snapshot.credits = {
+      hasCredits: credits.has_credits,
+      unlimited: credits.unlimited,
+      overageLimitReached: credits.overage_limit_reached,
+      ...(balance !== undefined ? { balance } : {}),
+    }
   }
   return snapshot
 }

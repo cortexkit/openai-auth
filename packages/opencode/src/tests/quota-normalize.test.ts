@@ -197,6 +197,83 @@ describe('quota normalize → QuotaSnapshot', () => {
     expect(snapshot.resetCreditsApplicable).toBe(3)
   })
 
+  it('wham keeps absent spend controls out of a normal snapshot', () => {
+    const withoutSpendControl = normalizeWham({ rate_limit: {} })
+    const nullSpendControl = normalizeWham({
+      rate_limit: {},
+      spend_control: null,
+    } as Parameters<typeof normalizeWham>[0])
+    const nullIndividualLimit = normalizeWham({
+      rate_limit: {},
+      spend_control: { reached: false, individual_limit: null },
+    } as Parameters<typeof normalizeWham>[0])
+
+    expect(withoutSpendControl).toEqual({})
+    expect(nullSpendControl.spendControl).toBeUndefined()
+    expect(nullIndividualLimit.spendControl).toBeUndefined()
+  })
+
+  it('wham normalizes a spend-control credit budget with string numerics', () => {
+    const snapshot = normalizeWham({
+      rate_limit: {},
+      credits: {
+        has_credits: true,
+        unlimited: false,
+        overage_limit_reached: false,
+        balance: null,
+      },
+      spend_control: {
+        reached: false,
+        individual_limit: {
+          source: 'workspace_spend_controls',
+          unit: 'credit',
+          limit: '2500',
+          used: '501.7787666320801',
+          remaining: '1998.22123336792',
+          used_percent: '20',
+          remaining_percent: '80',
+          reset_at: '1790812800',
+        },
+      },
+    } as Parameters<typeof normalizeWham>[0])
+
+    expect(snapshot.spendControl).toEqual({
+      limit: 2500,
+      used: 501.7787666320801,
+      remaining: 1998.22123336792,
+      usedPercent: 20,
+      remainingPercent: 80,
+      resetsAt: new Date(1790812800 * 1000).toISOString(),
+      unit: 'credit',
+      source: 'workspace_spend_controls',
+      reached: false,
+    })
+    expect(snapshot.credits).toEqual({
+      hasCredits: true,
+      unlimited: false,
+      overageLimitReached: false,
+    })
+  })
+
+  it('wham preserves a numeric credit balance when the provider supplies one', () => {
+    const snapshot = normalizeWham({
+      rate_limit: {},
+      credits: {
+        has_credits: true,
+        unlimited: false,
+        overage_limit_reached: false,
+        balance: '12.5',
+      },
+    } as Parameters<typeof normalizeWham>[0])
+
+    expect(snapshot.credits).toEqual({
+      hasCredits: true,
+      unlimited: false,
+      overageLimitReached: false,
+      balance: 12.5,
+    })
+  })
+
   it('omits invalid window lengths and reset-credit counts', () => {
     const headers = normalizeQuotaHeaders(
       new Headers({
