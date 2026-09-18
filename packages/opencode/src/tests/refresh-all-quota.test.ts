@@ -554,7 +554,9 @@ describe('refreshAllQuota', () => {
   })
 
   test('a tombstoned main uses the custody resolver without refreshing local auth', async () => {
-    const resolveMainAccess = mock(async () => CUSTODY_REFUSE)
+    const resolveMainAccess = mock(
+      async (): Promise<typeof CUSTODY_REFUSE> => CUSTODY_REFUSE,
+    )
     const deps = makeDeps({
       getAuth: mock(async () => ({
         type: 'oauth' as const,
