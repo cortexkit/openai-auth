@@ -2,4 +2,10 @@ pre-commit:
   commands:
     biome:
       glob: "*.{ts,js,json}"
-      run: bunx biome check {staged_files}
+      # --no-errors-on-unmatched: staging only files biome is configured to
+      # ignore leaves it with nothing to check, which it reports as an error.
+      # That made a vendor-only commit impossible - the vendored client lives
+      # under an ignored path, and a snapshot is easiest to verify against its
+      # upstream pin when it is alone in a commit. An empty set is not a lint
+      # failure. A real one in a mixed set still fails.
+      run: bunx biome check --no-errors-on-unmatched {staged_files}
