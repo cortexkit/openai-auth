@@ -1165,7 +1165,9 @@ export async function CodexAuthPlugin(
       body: { type: 'oauth'; access: string; refresh: string; expires: number }
     }): Promise<unknown>
   }
-  let activeRpcServer: RpcServerHandle | null = null
+  const ownedCacheKeepManagers = new Map<string, CacheKeepManager>()
+  const ownedRpcServers = new Map<string, RpcServerHandle>()
+  let activeFallbackManager: FallbackAccountManager | undefined
   let sidebarStateFileForEvents: string | undefined
   // Custody runtime — assigned inside the loader so dispose can close the
   // vendored client and clear the custody tick timer after the loader has
@@ -1429,18 +1431,33 @@ export async function CodexAuthPlugin(
     async dispose() {
       backgroundQuotaRefresh.stop()
       custodyRuntimeRef?.dispose()
+      activeFallbackManager?.stopBackgroundRefresh()
+      activeFallbackManager = undefined
       for (const websocketFetch of websocketFetches) websocketFetch.close()
       websocketFetches.length = 0
-      if (activeRpcServer) {
-        await activeRpcServer.stop().catch(() => {})
-        const rpcGlobal = globalThis as {
-          __openaiAuthRpcServer?: RpcServerHandle
-        }
-        if (rpcGlobal.__openaiAuthRpcServer === activeRpcServer) {
-          rpcGlobal.__openaiAuthRpcServer = undefined
-        }
-        activeRpcServer = null
+      const cacheKeepGlobal = globalThis as {
+        __openaiAuthCacheKeepManagers?: Map<string, CacheKeepManager>
       }
+      for (const [key, manager] of ownedCacheKeepManagers) {
+        if (
+          cacheKeepGlobal.__openaiAuthCacheKeepManagers?.get(key) === manager
+        ) {
+          manager.stop()
+          cacheKeepGlobal.__openaiAuthCacheKeepManagers.delete(key)
+        }
+      }
+      ownedCacheKeepManagers.clear()
+
+      const rpcGlobal = globalThis as {
+        __openaiAuthRpcServers?: Map<string, RpcServerHandle>
+      }
+      for (const [key, rpcServer] of ownedRpcServers) {
+        if (rpcGlobal.__openaiAuthRpcServers?.get(key) === rpcServer) {
+          await rpcServer.stop().catch(() => {})
+          rpcGlobal.__openaiAuthRpcServers.delete(key)
+        }
+      }
+      ownedRpcServers.clear()
     },
     async event(input) {
       if (input.event.type !== 'session.deleted') return
@@ -1574,6 +1591,10 @@ export async function CodexAuthPlugin(
         const mainSlot = classifyMainAuthSlot(auth)
         const recognizedMainTombstone =
           mainSlot.kind === 'tombstone' || mainSlot.kind === 'empty'
+        const rpcDir = input.directory
+          ? await resolveRpcDir(input.directory)
+          : undefined
+        const cacheKeepKey = rpcDir?.dir ?? getConfigPath()
 
         // Migration: seed the multi-account store from the existing token (idempotent)
         if (!recognizedMainTombstone) {
@@ -2128,9 +2149,12 @@ export async function CodexAuthPlugin(
           return mainRefreshPromise
         }
         const cacheKeepGlobal = globalThis as {
-          __openaiAuthCacheKeepManager?: CacheKeepManager
+          __openaiAuthCacheKeepManagers?: Map<string, CacheKeepManager>
         }
-        cacheKeepGlobal.__openaiAuthCacheKeepManager?.stop()
+        const cacheKeepManagers =
+          cacheKeepGlobal.__openaiAuthCacheKeepManagers ?? new Map()
+        cacheKeepGlobal.__openaiAuthCacheKeepManagers = cacheKeepManagers
+        cacheKeepManagers.get(cacheKeepKey)?.stop()
         const cacheKeepManager = new CacheKeepManager({
           fetchImpl: fetch,
           getMainToken: async () => {
@@ -2193,7 +2217,8 @@ export async function CodexAuthPlugin(
           getWindow: () => cacheKeepWindow,
           getSustain: () => cacheKeepSustain,
         })
-        cacheKeepGlobal.__openaiAuthCacheKeepManager = cacheKeepManager
+        cacheKeepManagers.set(cacheKeepKey, cacheKeepManager)
+        ownedCacheKeepManagers.set(cacheKeepKey, cacheKeepManager)
 
         async function pushQuota(
           snapshot: Record<string, unknown>,
@@ -2525,6 +2550,8 @@ export async function CodexAuthPlugin(
             }
           }
         }
+        activeFallbackManager?.stopBackgroundRefresh()
+        activeFallbackManager = fallbackManager
         cmdCtx = {
           accountStoragePath: getConfigPath(),
           accountStatePath: getAccountStatePath(getConfigPath()),
@@ -2674,14 +2701,16 @@ export async function CodexAuthPlugin(
         }
 
         let rpcServer: RpcServerHandle | null = null
-        if (input.directory) {
-          const rpcDir = await resolveRpcDir(input.directory)
+        if (rpcDir) {
           const rpcGlobal = globalThis as {
-            __openaiAuthRpcServer?: RpcServerHandle
+            __openaiAuthRpcServers?: Map<string, RpcServerHandle>
           }
-          if (rpcGlobal.__openaiAuthRpcServer) {
-            await rpcGlobal.__openaiAuthRpcServer.stop().catch(() => {})
-            rpcGlobal.__openaiAuthRpcServer = undefined
+          const rpcServers = rpcGlobal.__openaiAuthRpcServers ?? new Map()
+          rpcGlobal.__openaiAuthRpcServers = rpcServers
+          const existingRpcServer = rpcServers.get(rpcDir.dir)
+          if (existingRpcServer) {
+            await existingRpcServer.stop().catch(() => {})
+            rpcServers.delete(rpcDir.dir)
           }
           try {
             rpcServer = await startRpcServer({
@@ -2703,8 +2732,8 @@ export async function CodexAuthPlugin(
                 return { text: payload.text, knobs: payload.knobs }
               },
             })
-            rpcGlobal.__openaiAuthRpcServer = rpcServer
-            activeRpcServer = rpcServer
+            rpcServers.set(rpcDir.dir, rpcServer)
+            ownedRpcServers.set(rpcDir.dir, rpcServer)
           } catch {
             // RPC is best-effort; the plugin must not fail if the port file
             // can't be written (e.g. missing directory in test environments).
@@ -3744,18 +3773,18 @@ export async function CodexAuthPlugin(
         // sidebar shows real numbers shortly after start instead of "checking…".
         // Non-blocking, best-effort — a failure must never crash the loader.
         // -------------------------------------------------------------------
+        // Seed fallback quota from persisted account.quota so the immediate
+        // machine snapshot shows last-known fallback numbers.
+        if (storage) {
+          const oauthAccts: OAuthAccount[] = []
+          for (const a of storage.accounts) {
+            if (isOAuthAccount(a)) oauthAccts.push(a)
+          }
+          quotaManager.seedFallbacksFromAccounts(oauthAccts)
+        }
+
         if (!bootQuotaSeedStarted) {
           bootQuotaSeedStarted = true
-
-          // Seed fallback quota from persisted account.quota so the immediate
-          // The immediate machine snapshot shows last-known fallback numbers.
-          if (storage) {
-            const oauthAccts: OAuthAccount[] = []
-            for (const a of storage.accounts) {
-              if (isOAuthAccount(a)) oauthAccts.push(a)
-            }
-            quotaManager.seedFallbacksFromAccounts(oauthAccts)
-          }
 
           // Immediate: show persisted quota so the sidebar isn't blank
           void writeMachineSidebarState(quotaManager, storage).catch(() => {})
@@ -4252,26 +4281,6 @@ export async function CodexAuthPlugin(
               reqStorage?.accounts,
             ).catch(() => {})
             return finalResponse
-          },
-          async dispose() {
-            backgroundQuotaRefresh.stop()
-            cacheKeepManager.stop()
-            if (
-              cacheKeepGlobal.__openaiAuthCacheKeepManager === cacheKeepManager
-            ) {
-              cacheKeepGlobal.__openaiAuthCacheKeepManager = undefined
-            }
-            fallbackManager.stopBackgroundRefresh()
-            if (activeRpcServer) {
-              await activeRpcServer.stop().catch(() => {})
-              const rpcGlobal = globalThis as {
-                __openaiAuthRpcServer?: RpcServerHandle
-              }
-              if (rpcGlobal.__openaiAuthRpcServer === activeRpcServer) {
-                rpcGlobal.__openaiAuthRpcServer = undefined
-              }
-              activeRpcServer = null
-            }
           },
         }
       },

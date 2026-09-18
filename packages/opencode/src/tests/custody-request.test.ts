@@ -217,9 +217,9 @@ async function withCustodyLoader(
     if (!fetchOverride) throw new Error('expected fetch override')
     const cacheKeepManager = (
       globalThis as typeof globalThis & {
-        __openaiAuthCacheKeepManager?: CacheKeepManager
+        __openaiAuthCacheKeepManagers?: Map<string, CacheKeepManager>
       }
-    ).__openaiAuthCacheKeepManager
+    ).__openaiAuthCacheKeepManagers?.get(configPath)
     if (!cacheKeepManager) throw new Error('expected cachekeep manager')
     if (!runtime) throw new Error('expected custody runtime')
     const commandHook = (

@@ -46,6 +46,15 @@ describe('notifications', () => {
     expect(isTuiConnected('s1')).toBe(true)
   })
 
+  test('a drain for one session does not make an unscoped probe connected', () => {
+    drainNotifications(0, 's2')
+    expect(isTuiConnected('s1')).toBe(false)
+    expect(isTuiConnected(undefined as never)).toBe(false)
+  })
+
+  // @ts-expect-error TUI connectivity must always be scoped to a session.
+  isTuiConnected()
+
   test('queue cap evicts oldest beyond 100', () => {
     for (let i = 0; i < 130; i++)
       pushNotification(payload('openai-quota'), 's1')
