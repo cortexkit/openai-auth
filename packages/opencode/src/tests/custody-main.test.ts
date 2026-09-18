@@ -7,7 +7,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   canonicalCustodyTombstone,
   custodyTombstoneKey,
@@ -431,6 +431,118 @@ describe('main host slot', () => {
         ).toBe('claustrum')
       },
     )
+  })
+
+  test('enters claustrum when the host auth client exposes only set', async () => {
+    const auth = {
+      type: 'oauth' as const,
+      access: mainJwt('stored-main'),
+      refresh: 'refresh-main',
+      expires: CUSTODY_FIXTURE_NOW + 60_000,
+    }
+    const previousDataHome = process.env.XDG_DATA_HOME
+    try {
+      await withMainLoader(
+        {
+          auth,
+          hostAuthOnlySet: true,
+          storage: liveStorage([], {
+            mainAccountId: 'stored-main',
+            claustrum: claustrumConfig({ mode: 'claustrum' }),
+          }),
+          transport: {
+            getCredential: async () => ({
+              material: mainJwt('stored-main'),
+              recordVersion: 1,
+              expiresAtMs: CUSTODY_FIXTURE_NOW + 60_000,
+            }),
+            statusCredential: async () => ({
+              ready: true,
+              lastErrorCode: null,
+              leaseHeld: false,
+              recordVersion: 1,
+            }),
+            reportAuthFailure: async () => {},
+            close: () => {},
+          },
+        },
+        async ({ loader, executeCommand, configPath, authSetCalls }) => {
+          const dataHome = join(dirname(configPath), 'data')
+          const authPath = join(dataHome, 'opencode', 'auth.json')
+          mkdirSync(dirname(authPath), { recursive: true })
+          writeFileSync(authPath, JSON.stringify({ openai: auth }))
+          process.env.XDG_DATA_HOME = dataHome
+          await loader(async () => auth, {})
+          await expect(
+            executeCommand({
+              command: 'openai-account',
+              arguments: 'claustrum',
+              sessionID: 'session-1',
+            }),
+          ).rejects.toThrow('__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__')
+          expect(authSetCalls()).toBe(1)
+        },
+      )
+    } finally {
+      if (previousDataHome === undefined) delete process.env.XDG_DATA_HOME
+      else process.env.XDG_DATA_HOME = previousDataHome
+    }
+  })
+
+  test('defers the host tombstone when its auth file is malformed', async () => {
+    const auth = {
+      type: 'oauth' as const,
+      access: mainJwt('stored-main'),
+      refresh: 'refresh-main',
+      expires: CUSTODY_FIXTURE_NOW + 60_000,
+    }
+    const previousDataHome = process.env.XDG_DATA_HOME
+    try {
+      await withMainLoader(
+        {
+          auth,
+          hostAuthOnlySet: true,
+          storage: liveStorage([], {
+            mainAccountId: 'stored-main',
+            claustrum: claustrumConfig({ mode: 'claustrum' }),
+          }),
+          transport: {
+            getCredential: async () => ({
+              material: mainJwt('stored-main'),
+              recordVersion: 1,
+              expiresAtMs: CUSTODY_FIXTURE_NOW + 60_000,
+            }),
+            statusCredential: async () => ({
+              ready: true,
+              lastErrorCode: null,
+              leaseHeld: false,
+              recordVersion: 1,
+            }),
+            reportAuthFailure: async () => {},
+            close: () => {},
+          },
+        },
+        async ({ loader, executeCommand, configPath, authSetCalls }) => {
+          const dataHome = join(dirname(configPath), 'data')
+          const authPath = join(dataHome, 'opencode', 'auth.json')
+          mkdirSync(dirname(authPath), { recursive: true })
+          writeFileSync(authPath, '{not json')
+          process.env.XDG_DATA_HOME = dataHome
+          await loader(async () => auth, {})
+          await expect(
+            executeCommand({
+              command: 'openai-account',
+              arguments: 'claustrum',
+              sessionID: 'session-1',
+            }),
+          ).rejects.toThrow('__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__')
+          expect(authSetCalls()).toBe(0)
+        },
+      )
+    } finally {
+      if (previousDataHome === undefined) delete process.env.XDG_DATA_HOME
+      else process.env.XDG_DATA_HOME = previousDataHome
+    }
   })
 
   test('writes the factory slot-absent verdict into the main sidebar row', async () => {

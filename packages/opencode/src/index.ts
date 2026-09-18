@@ -2621,7 +2621,21 @@ export async function CodexAuthPlugin(
                 }
               },
               auth: {
-                all: () => hostAuth.all(),
+                all: async () => {
+                  if (typeof hostAuth.all === 'function') return hostAuth.all()
+                  const dataHome =
+                    process.env.XDG_DATA_HOME ??
+                    join(os.homedir(), '.local', 'share')
+                  const authPath = join(dataHome, 'opencode', 'auth.json')
+                  try {
+                    const parsed: unknown = JSON.parse(
+                      readFileSync(authPath, 'utf8'),
+                    )
+                    return isRecord(parsed) ? parsed : {}
+                  } catch {
+                    return {}
+                  }
+                },
                 get: async (value) => {
                   if (typeof hostAuth.get === 'function') {
                     return hostAuth.get(value)
