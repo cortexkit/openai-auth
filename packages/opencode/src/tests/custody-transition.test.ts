@@ -244,7 +244,7 @@ describe('enterClaustrumMode coordinator', () => {
     expect(index.getMainRefreshLockName()).toBe(
       transition.MAIN_REFRESH_LOCK_NAME,
     )
-    expect(fixture.traces).toEqual([
+    expect(fixture.traces.filter((step) => !step.startsWith('warn:'))).toEqual([
       'mutex-acquired',
       'acquire:claustrum-mode:true',
       'acquire:fallback-oauth-refresh-ztmmMIFaJkALBOTT:true',
@@ -455,7 +455,11 @@ describe('enterClaustrumMode coordinator', () => {
     expect(result.status).toBe('incomplete')
     expect(result.outcomes.main).toBe('torn-read-deferred')
     expect(fixture.writes).toEqual(['mode', 'fallback', 'fallback'])
-    expect(fixture.traces.filter((step) => step.startsWith('warn:'))).toEqual([
+    expect(
+      fixture.traces.filter((step) =>
+        step.startsWith('warn:host auth store read empty'),
+      ),
+    ).toEqual([
       'warn:host auth store read empty; refusing to write — possible torn read',
     ])
   })

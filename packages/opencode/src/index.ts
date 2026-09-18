@@ -2590,8 +2590,20 @@ export async function CodexAuthPlugin(
                 ),
               readManifest: readCustodyManifest,
               preflight: async ({ accountId, handle }) => {
+                custodyLogger.info('preflight probing participant', {
+                  accountId,
+                  hasHandle: handle.length > 0,
+                })
                 const cache = await custodyRuntime.ensureCache()
-                if (!cache || cache.isBlocked(handle)) return 'vault-cold'
+                const blocked = cache?.isBlocked(handle)
+                if (!cache || blocked) {
+                  custodyLogger.warn('preflight vault-cold', {
+                    accountId,
+                    hasCache: cache !== undefined,
+                    blocked,
+                  })
+                  return 'vault-cold'
+                }
                 if (
                   cache.isReauth(handle, custodyOptions?.now?.() ?? Date.now())
                 ) {
@@ -4331,6 +4343,10 @@ export async function CodexAuthPlugin(
       output.maxOutputTokens = undefined
     },
     config: async (config: { command?: Record<string, unknown> }) => {
+      createLogger('commands').info('registering commands', {
+        existing: Object.keys(config.command ?? {}).length,
+        pid: process.pid,
+      })
       config.command = {
         ...(config.command ?? {}),
         [OPENAI_QUOTA_COMMAND_NAME]: {
@@ -4379,8 +4395,19 @@ export async function CodexAuthPlugin(
       arguments: string
       sessionID: string
     }) => {
+      createLogger('commands').info('command hook entered', {
+        command: input.command,
+        arguments: input.arguments,
+        modal: MODAL_COMMANDS.includes(input.command as CommandModalName),
+        hasCmdCtx: cmdCtx !== null,
+        pid: process.pid,
+      })
       if (!MODAL_COMMANDS.includes(input.command as CommandModalName)) return
       if (!cmdCtx) {
+        createLogger('commands').warn('command rejected: context not loaded', {
+          command: input.command,
+          pid: process.pid,
+        })
         await sendIgnoredMessage(
           input.sessionID,
           'OpenAI auth plugin is still initializing. Send a request first, then try again.',
