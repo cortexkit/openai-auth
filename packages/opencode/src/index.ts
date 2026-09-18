@@ -763,11 +763,11 @@ export function findCachekeepFallbackAccount(
   )
 }
 
-// wham is the only source that reports reset-credit counts; header/WS pushes
-// never carry the fields. An incoming push that omits them inherits the last
-// known counts for the same account so the sidebar and the reset dialog do
-// not lose them on every per-turn header/WS update — but an explicit incoming
-// value (including 0) always wins over a stale cached one.
+// wham is the only source that reports reset-credit counts and spend-control
+// budgets; header/WS pushes never carry those fields. An incoming push that
+// omits them inherits the last known reading for the same account so the
+// sidebar and command output do not lose it on every per-turn update — but an
+// explicit incoming value (including 0) always wins over a stale cached one.
 export function mergePushedQuotaMetadata(
   incoming: OAuthQuotaSnapshot,
   previous: OAuthQuotaSnapshot | undefined,
@@ -782,6 +782,12 @@ export function mergePushedQuotaMetadata(
     if (merged[key] === undefined && carried !== undefined) {
       merged[key] = carried
     }
+  }
+  if (
+    merged.spendControl === undefined &&
+    previous.spendControl !== undefined
+  ) {
+    merged.spendControl = previous.spendControl
   }
   return merged
 }

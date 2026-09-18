@@ -2938,6 +2938,53 @@ test('machine writes cannot clobber fresher main and fallback quota from disk', 
   expect(written.activeRouting?.session?.activeId).toBe('fallback-1')
 })
 
+test('machine writes keep the fresher spend-control budget for the same account', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-spend-control-fresh-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  const stale = now - 10 * 60_000
+  const currentBudget = {
+    limit: 2500,
+    used: 501.7787666320801,
+    remaining: 1998.2212333679199,
+    usedPercent: 20.071150665283206,
+    remainingPercent: 79.9288493347168,
+    resetsAt: '2026-10-01T00:00:00.000Z',
+    unit: 'credits',
+    source: 'individual_limit',
+    reached: false,
+  }
+  await setSidebarState(
+    make({
+      main: {
+        ...main({ ...quota(10, now), spendControl: currentBudget }),
+        mainAccountId: 'acct-x',
+      },
+    }),
+    file,
+  )
+
+  await setSidebarMachineState(
+    {
+      main: {
+        ...main({
+          ...quota(90, stale),
+          spendControl: { ...currentBudget, used: 2400, remaining: 100 },
+        }),
+        mainAccountId: 'acct-x',
+      },
+      fallbacks: [],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.quota?.spendControl).toEqual(currentBudget)
+})
+
 test('machine write keeps the existing identity when the existing quota wins the merge (re-login race)', async () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-identity-keep-'))
   const file = join(tempDir, 'sidebar-state.json')

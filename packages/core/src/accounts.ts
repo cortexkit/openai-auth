@@ -90,6 +90,27 @@ export interface OAuthQuotaSnapshot {
   secondary?: AccountQuotaWindow
   resetCreditsAvailable?: number
   resetCreditsApplicable?: number
+  spendControl?: OAuthSpendControlReading
+  credits?: OAuthCredits
+}
+
+export interface OAuthSpendControlReading {
+  limit: number
+  used: number
+  remaining: number
+  usedPercent: number
+  remainingPercent: number
+  resetsAt?: string
+  unit?: string
+  source?: string
+  reached: boolean
+}
+
+export interface OAuthCredits {
+  hasCredits: boolean
+  unlimited: boolean
+  overageLimitReached: boolean
+  balance?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +495,58 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
     const credits = typeof value[key] === 'number' ? value[key] : Number.NaN
     if (Number.isFinite(credits) && credits >= 0) {
       quota[key] = credits
+    }
+  }
+
+  const spendControl = value.spendControl
+  if (isRecord(spendControl)) {
+    const limit = Number(spendControl.limit)
+    const used = Number(spendControl.used)
+    const remaining = Number(spendControl.remaining)
+    const usedPercent = Number(spendControl.usedPercent)
+    const remainingPercent = Number(spendControl.remainingPercent)
+    if (
+      Number.isFinite(limit) &&
+      Number.isFinite(used) &&
+      Number.isFinite(remaining) &&
+      Number.isFinite(usedPercent) &&
+      Number.isFinite(remainingPercent) &&
+      typeof spendControl.reached === 'boolean'
+    ) {
+      quota.spendControl = {
+        limit,
+        used,
+        remaining,
+        usedPercent,
+        remainingPercent,
+        resetsAt:
+          typeof spendControl.resetsAt === 'string'
+            ? spendControl.resetsAt
+            : undefined,
+        unit:
+          typeof spendControl.unit === 'string' ? spendControl.unit : undefined,
+        source:
+          typeof spendControl.source === 'string'
+            ? spendControl.source
+            : undefined,
+        reached: spendControl.reached,
+      }
+    }
+  }
+
+  const credits = value.credits
+  if (
+    isRecord(credits) &&
+    typeof credits.hasCredits === 'boolean' &&
+    typeof credits.unlimited === 'boolean' &&
+    typeof credits.overageLimitReached === 'boolean'
+  ) {
+    const balance = Number(credits.balance)
+    quota.credits = {
+      hasCredits: credits.hasCredits,
+      unlimited: credits.unlimited,
+      overageLimitReached: credits.overageLimitReached,
+      ...(Number.isFinite(balance) ? { balance } : {}),
     }
   }
 

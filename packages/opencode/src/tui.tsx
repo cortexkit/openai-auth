@@ -241,7 +241,7 @@ function CollapsedRow(props: {
 }
 
 export interface QuotaDisplayRow {
-  key: 'primary' | 'secondary'
+  key: 'primary' | 'secondary' | 'spendControl'
   label: string
   window: QuotaWindow
   pacing: QuotaPacing | null
@@ -254,7 +254,7 @@ export function buildQuotaRowsForDisplay(
   now: number,
   pacingEnabled: boolean,
 ): QuotaDisplayRow[] {
-  return getPresentQuotaWindows(quota).map((row) => ({
+  const rows: QuotaDisplayRow[] = getPresentQuotaWindows(quota).map((row) => ({
     key: row.key,
     label: row.label,
     window: row.window,
@@ -263,6 +263,20 @@ export function buildQuotaRowsForDisplay(
         ? computeQuotaPacing(row.window, row.windowMs, now)
         : null,
   }))
+  const spendControl = quota?.spendControl
+  if (spendControl) {
+    rows.push({
+      key: 'spendControl',
+      label: 'credits',
+      window: {
+        usedPercent: spendControl.usedPercent,
+        remainingPercent: spendControl.remainingPercent,
+        resetsAt: spendControl.resetsAt,
+      },
+      pacing: null,
+    })
+  }
+  return rows
 }
 
 export function isQuotaLoaded(quota: AccountQuota | null): boolean {

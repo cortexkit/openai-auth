@@ -6,6 +6,7 @@ import {
   isSafeResetAccountKey,
   mutateAccounts,
   type OAuthAccount,
+  type OAuthSpendControlReading,
   type RoutingMode,
   readConfigRosterIds,
 } from './accounts'
@@ -248,6 +249,16 @@ function quotaAge(checkedAt: number | undefined, now: number): string {
   return ` (${Math.floor(ageMs / 60_000)}m old)`
 }
 
+function formatSpendControlLine(
+  spendControl: OAuthSpendControlReading,
+  indent = '',
+): string {
+  const resets = spendControl.resetsAt
+    ? ` · resets ${spendControl.resetsAt}`
+    : ''
+  return `${indent}- credits: ${Math.round(spendControl.usedPercent)}% used (${Math.round(spendControl.used)} / ${Math.round(spendControl.limit)}, ${Math.round(spendControl.remaining)} remaining)${resets}`
+}
+
 async function executeQuotaCommand(
   ctx: CommandContext,
 ): Promise<OpenDialogPayload> {
@@ -274,6 +285,9 @@ async function executeQuotaCommand(
     if (q.resetCreditsAvailable !== undefined) {
       lines.push(`- resets: ${q.resetCreditsAvailable}`)
     }
+    if (q.spendControl) {
+      lines.push(formatSpendControlLine(q.spendControl))
+    }
   } else {
     lines.push('No main quota snapshot available. Send a request first.')
   }
@@ -297,6 +311,9 @@ async function executeQuotaCommand(
       }
       if (entry.quota.resetCreditsAvailable !== undefined) {
         lines.push(`  - resets: ${entry.quota.resetCreditsAvailable}`)
+      }
+      if (entry.quota.spendControl) {
+        lines.push(formatSpendControlLine(entry.quota.spendControl, '  '))
       }
     }
   }
