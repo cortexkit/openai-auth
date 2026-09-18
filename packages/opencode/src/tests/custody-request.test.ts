@@ -59,6 +59,13 @@ async function withCustodyLoader(
     accounts: OAuthAccount[]
     routing?: { mode: 'main-first' | 'fallback-first' | 'sticky-balanced' }
     claustrumEnabled?: boolean
+    manifestLabel?: string
+    mainAuth?: {
+      type: 'oauth'
+      access: string
+      refresh: string
+      expires: number
+    }
     credential?: { material: string; recordVersion: number } | undefined
     credentialForGet?: () => { material: string; recordVersion: number }
     now?: () => number
@@ -95,7 +102,9 @@ async function withCustodyLoader(
   const directory = mkdtempSync(join(tmpdir(), 'custody-request-loader-'))
   const configPath = join(directory, 'openai-auth.json')
   const manifestPath = join(directory, 'handles.json')
-  const manifest = enrollmentManifest(options.accounts[0]?.id ?? 'custody-1')
+  const manifest = enrollmentManifest(
+    options.manifestLabel ?? options.accounts[0]?.id ?? 'custody-1',
+  )
   if (!manifest.ok) throw new Error('expected manifest fixture')
   const originalFetch = globalThis.fetch
   const authorizations: string[] = []
@@ -195,12 +204,13 @@ async function withCustodyLoader(
     const loader = hooks.auth?.loader
     if (!loader) throw new Error('expected auth loader')
     const result = await loader(
-      async () => ({
-        type: 'oauth' as const,
-        access: 'main-access',
-        refresh: 'main-refresh',
-        expires: Date.now() + 3_600_000,
-      }),
+      async () =>
+        options.mainAuth ?? {
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 3_600_000,
+        },
       {} as never,
     )
     const fetchOverride = (result as { fetch?: typeof globalThis.fetch }).fetch
@@ -710,6 +720,80 @@ describe('custody request resolution', () => {
         expect((await fetchOverride(url, init)).status).toBe(200)
         expect(authorizations).toEqual(['Bearer main-access'])
         expect(authorizations.join(' ')).not.toContain(TOMBSTONE_OPENAI)
+      },
+    )
+  })
+
+  it('uses the vault bearer for a tombstoned main send', async () => {
+    const vaultAccess = 'VAULT-MAIN-TOKEN-xyz'
+    await withCustodyLoader(
+      {
+        accounts: [],
+        manifestLabel: 'main',
+        mainAuth: {
+          type: 'oauth',
+          access: '',
+          refresh: TOMBSTONE_OPENAI,
+          expires: 0,
+        },
+        credential: { material: vaultAccess, recordVersion: 71 },
+        respond: () => 401,
+      },
+      async ({ fetchOverride, authorizations, gets, reports }) => {
+        const [url, init] = codexRequest()
+        expect((await fetchOverride(url, init)).status).toBe(401)
+        expect(gets()).toBeGreaterThan(0)
+        expect(authorizations).toEqual([`Bearer ${vaultAccess}`])
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(reports).toEqual([
+          { recordVersion: 71, reporterSource: 'direct' },
+        ])
+      },
+    )
+  })
+
+  it('refuses a tombstoned main without a cached vault bearer and serves a fallback', async () => {
+    const fallback = liveAccount('fallback', { accountId: 'acct-fallback' })
+    await withCustodyLoader(
+      {
+        accounts: [fallback],
+        manifestLabel: 'main',
+        mainAuth: {
+          type: 'oauth',
+          access: 'stale-main-access',
+          refresh: TOMBSTONE_OPENAI,
+          expires: Date.now() + 60_000,
+        },
+        credential: undefined,
+        respond: (authorization) =>
+          authorization === `Bearer ${fallback.access}` ? 200 : 401,
+      },
+      async ({ fetchOverride, authorizations }) => {
+        const [url, init] = codexRequest()
+        expect((await fetchOverride(url, init)).status).toBe(200)
+        expect(authorizations).toEqual([`Bearer ${fallback.access}`])
+      },
+    )
+  })
+
+  it('serves real main material in local mode', async () => {
+    await withCustodyLoader(
+      {
+        accounts: [],
+        claustrumEnabled: false,
+        mainAuth: {
+          type: 'oauth',
+          access: 'local-main-access',
+          refresh: 'local-main-refresh',
+          expires: Date.now() + 60_000,
+        },
+        credential: undefined,
+        respond: () => 200,
+      },
+      async ({ fetchOverride, authorizations }) => {
+        const [url, init] = codexRequest()
+        expect((await fetchOverride(url, init)).status).toBe(200)
+        expect(authorizations).toEqual(['Bearer local-main-access'])
       },
     )
   })

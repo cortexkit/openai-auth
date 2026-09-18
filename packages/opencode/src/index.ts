@@ -1793,6 +1793,32 @@ export async function CodexAuthPlugin(
             },
           })
         }
+        async function resolveMainAccessForCustody(
+          currentStorage: Awaited<ReturnType<typeof loadAccounts>>,
+        ): ReturnType<typeof resolveFallbackAccess> {
+          if (claustrumMode(currentStorage) !== 'claustrum') {
+            return CUSTODY_EXCLUDED
+          }
+          const manifest = await readCustodyManifest()
+          const handle = lookupManifestHandle(manifest, 'main')
+          const cache = custodyRuntimeForDeps.getCache()
+          const refuse = (
+            reason: 'no-handle' | 'blocked' | 'reauth' | 'cache-miss',
+          ): typeof CUSTODY_REFUSE => {
+            custodyLogger.warn('custody main request refused', { reason })
+            return CUSTODY_REFUSE
+          }
+          if (!handle || !cache) return refuse('no-handle')
+          const now = (custodyOptions?.now ?? Date.now)()
+          if (cache.isBlocked(handle)) return refuse('blocked')
+          if (cache.isReauth(handle, now)) return refuse('reauth')
+          const served = await cache.peek(handle)
+          if (!served || served.expiresAtMs <= now) return refuse('cache-miss')
+          return {
+            token: served.payload.access,
+            provenance: { handle, recordVersion: served.recordVersion },
+          }
+        }
         async function reportAuthFailureForCustody(params: {
           handle: string
           providerStatus: number
@@ -3139,6 +3165,8 @@ export async function CodexAuthPlugin(
           sidebarState: SidebarState
           primaryAccess: string
           mainAccountIdentity?: string
+          mainCustodyRefused: boolean
+          primaryProvenance?: VaultProvenance
         }): Promise<StickyRouteCandidate[]> {
           const killswitchEnabled = isKillswitchEnabled(input.storage)
           const killswitchNow = Date.now()
@@ -3164,22 +3192,27 @@ export async function CodexAuthPlugin(
                 killswitchNow,
               )
             : undefined
-          const roster: StickyRouteCandidate[] = [
-            {
-              accountId: 'main',
-              wireAccountId: input.mainAccountIdentity,
-              access: input.primaryAccess,
-              keepwarmAccountKey: 'main',
-              quota: mainFreshest.quota,
-              quotaCheckedAt: mainFreshest.quotaCheckedAt,
-              reservePercent: getKillswitchThresholdsForAccount(input.storage),
-              configuredOrder: 0,
-              resetCreditsApplicable: resetCreditsApplicable(
-                mainFreshest.quota,
-              ),
-              killswitchPasses: mainKillswitchPasses,
-            },
-          ]
+          const roster: StickyRouteCandidate[] = input.mainCustodyRefused
+            ? []
+            : [
+                {
+                  accountId: 'main',
+                  wireAccountId: input.mainAccountIdentity,
+                  access: input.primaryAccess,
+                  provenance: input.primaryProvenance,
+                  keepwarmAccountKey: 'main',
+                  quota: mainFreshest.quota,
+                  quotaCheckedAt: mainFreshest.quotaCheckedAt,
+                  reservePercent: getKillswitchThresholdsForAccount(
+                    input.storage,
+                  ),
+                  configuredOrder: 0,
+                  resetCreditsApplicable: resetCreditsApplicable(
+                    mainFreshest.quota,
+                  ),
+                  killswitchPasses: mainKillswitchPasses,
+                },
+              ]
           const usableFallbacks =
             await fallbackManager.getUsableFallbackAccounts(input.storage)
           if (!input.storage) return roster
@@ -3738,31 +3771,47 @@ export async function CodexAuthPlugin(
             const myGeneration = ++mainIdentityGeneration
             if (currentAuth.type !== 'oauth') return fetch(requestInput, init)
             init = await materializeRequestInit(requestInput, init)
-            let primaryAccess: string = currentAuth.access ?? ''
+            const mainCustodyOwned =
+              recognizedMainTombstone &&
+              claustrumMode(reqStorage) === 'claustrum'
+            let primaryAccess = ''
+            let primaryProvenance: VaultProvenance | undefined
+            let mainCustodyRefused = false
 
-            // Refresh expired main tokens and mirror them into opencode's slot.
-            if (
-              !currentAuth.access ||
-              (currentAuth.expires ?? 0) < Date.now()
-            ) {
-              logR.debug('token refresh triggered', {
-                pid: process.pid,
-                hasAccess: Boolean(currentAuth.access),
-                expiresInMs: currentAuth.expires
-                  ? currentAuth.expires - Date.now()
-                  : undefined,
-              })
-              try {
-                const refreshed = await refreshMainWithLease()
-                currentAuth.access = refreshed.access
-                currentAuth.refresh = refreshed.refresh
-                currentAuth.expires = refreshed.expires
-              } catch (error) {
-                if (isAuthPersistError(error)) throw error
-                // Use stale token on refresh failure
+            if (mainCustodyOwned) {
+              const access = await resolveMainAccessForCustody(reqStorage)
+              if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED) {
+                mainCustodyRefused = true
+              } else {
+                primaryAccess = access.token
+                primaryProvenance =
+                  access.provenance === 'local' ? undefined : access.provenance
               }
+            } else {
+              // Refresh expired main tokens and mirror them into opencode's slot.
+              if (
+                !currentAuth.access ||
+                (currentAuth.expires ?? 0) < Date.now()
+              ) {
+                logR.debug('token refresh triggered', {
+                  pid: process.pid,
+                  hasAccess: Boolean(currentAuth.access),
+                  expiresInMs: currentAuth.expires
+                    ? currentAuth.expires - Date.now()
+                    : undefined,
+                })
+                try {
+                  const refreshed = await refreshMainWithLease()
+                  currentAuth.access = refreshed.access
+                  currentAuth.refresh = refreshed.refresh
+                  currentAuth.expires = refreshed.expires
+                } catch (error) {
+                  if (isAuthPersistError(error)) throw error
+                  // Use stale token on refresh failure
+                }
+              }
+              primaryAccess = currentAuth.access ?? ''
             }
-            primaryAccess = currentAuth.access ?? ''
 
             const authWithAccount = currentAuth as typeof currentAuth & {
               accountId?: string
@@ -3804,6 +3853,8 @@ export async function CodexAuthPlugin(
                 sidebarState,
                 primaryAccess,
                 mainAccountIdentity,
+                mainCustodyRefused,
+                primaryProvenance,
               })
               let stickyCandidate = await resolveStickyRouteCandidate({
                 sessionId: sidebarSessionId,
@@ -4061,14 +4112,16 @@ export async function CodexAuthPlugin(
                 )
               } else {
                 // Send through the main account.
-                response = await sendWithAccessToken(
-                  requestInput,
-                  init,
-                  primaryAccess,
-                  mainAccountIdentity,
-                  'main',
-                  undefined,
-                )
+                response = mainCustodyRefused
+                  ? new Response(null, { status: 401 })
+                  : await sendWithAccessToken(
+                      requestInput,
+                      init,
+                      primaryAccess,
+                      mainAccountIdentity,
+                      'main',
+                      primaryProvenance,
+                    )
               }
             }
 

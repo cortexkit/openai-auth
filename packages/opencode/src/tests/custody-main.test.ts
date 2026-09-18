@@ -425,7 +425,7 @@ describe('main host slot', () => {
     )
   })
 
-  test('does not acquire refresh state or call the token endpoint for a tombstoned main slot', async () => {
+  test('does not acquire refresh state or send a tombstoned main slot', async () => {
     const originalFetch = globalThis.fetch
     const urls: string[] = []
     globalThis.fetch = (async (url: string | URL | Request) => {
@@ -465,9 +465,7 @@ describe('main host slot', () => {
               body: '{}',
             },
           )
-          expect(urls).toEqual([
-            'https://chatgpt.com/backend-api/codex/responses',
-          ])
+          expect(urls).toEqual([])
           expect(
             (await loadAccounts(getAccountPaths(configPath)))?.refresh
               ?.mainRefreshLeaseId,
