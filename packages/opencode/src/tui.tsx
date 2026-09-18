@@ -249,12 +249,42 @@ export interface QuotaDisplayRow {
   pacing: QuotaPacing | null
 }
 
+const SPEND_CONTROL_LABEL = 'credits'
+
+// Labels a quota snapshot contributes to the sidebar, independent of pacing or
+// the wall clock — the label column is sized from these alone.
+function quotaRowLabels(quota: AccountQuota | null): string[] {
+  const labels = getPresentQuotaWindows(quota).map((row) => row.label)
+  if (quota?.spendControl) labels.push(SPEND_CONTROL_LABEL)
+  return labels
+}
+
+// The label column is a property of the whole sidebar, not of one account's row
+// set: every account's bars must start at the same column, so the width is
+// derived once from every account rendered (main plus fallbacks) and threaded
+// into each account's rows. The +1 keeps a separator before the longest label's
+// bar; 3 is the floor the short 5h/7d labels already relied on.
+export function computeQuotaLabelWidth(
+  quotas: ReadonlyArray<AccountQuota | null | undefined>,
+): number {
+  let width = 3
+  for (const quota of quotas) {
+    for (const label of quotaRowLabels(quota ?? null)) {
+      width = Math.max(width, label.length + 1)
+    }
+  }
+  return width
+}
+
 // Maps present quota windows onto display rows and computes pacing against each
 // dynamic duration or the historical 5h/7d duration for legacy snapshots.
+// `labelWidth` comes from computeQuotaLabelWidth for rendered sidebars; callers
+// that only inspect pacing may omit it and get this row set's own width.
 export function buildQuotaRowsForDisplay(
   quota: AccountQuota | null,
   now: number,
   pacingEnabled: boolean,
+  labelWidth?: number,
 ): QuotaDisplayRow[] {
   const rows: Array<Omit<QuotaDisplayRow, 'labelWidth'>> =
     getPresentQuotaWindows(quota).map((row) => ({
@@ -270,7 +300,7 @@ export function buildQuotaRowsForDisplay(
   if (spendControl) {
     rows.push({
       key: 'spendControl',
-      label: 'credits',
+      label: SPEND_CONTROL_LABEL,
       window: {
         usedPercent: spendControl.usedPercent,
         remainingPercent: spendControl.remainingPercent,
@@ -279,8 +309,9 @@ export function buildQuotaRowsForDisplay(
       pacing: null,
     })
   }
-  const labelWidth = Math.max(3, ...rows.map((row) => row.label.length))
-  return rows.map((row) => ({ ...row, labelWidth }))
+  const width =
+    labelWidth ?? Math.max(3, ...rows.map((row) => row.label.length + 1))
+  return rows.map((row) => ({ ...row, labelWidth: width }))
 }
 
 export function isQuotaLoaded(quota: AccountQuota | null): boolean {
@@ -414,6 +445,7 @@ function AccountBlock(props: {
   killed: boolean
   active: boolean
   pacingEnabled: boolean
+  labelWidth: number
   resetCredits?: number
   marginTop?: number
 }) {
@@ -422,7 +454,12 @@ function AccountBlock(props: {
   const statusTone = (): Tone =>
     props.killed ? 'err' : props.active ? 'ok' : 'muted'
   const rows = () =>
-    buildQuotaRowsForDisplay(props.quota, Date.now(), props.pacingEnabled)
+    buildQuotaRowsForDisplay(
+      props.quota,
+      Date.now(),
+      props.pacingEnabled,
+      props.labelWidth,
+    )
   return (
     <box width='100%' flexDirection='column' marginTop={props.marginTop ?? 0}>
       <box width='100%' flexDirection='row' justifyContent='space-between'>
@@ -502,6 +539,11 @@ function QuotaDialogContent(props: {
   const enabledFallbacks = () =>
     (state().fallbacks ?? []).filter((f) => f.enabled)
   const activeId = () => resolveQuotaDialogActiveId(state(), props.sessionId)
+  const quotaLabelWidth = () =>
+    computeQuotaLabelWidth([
+      state().main?.quota ?? null,
+      ...enabledFallbacks().map((fb) => fb.quota),
+    ])
   return (
     <box flexDirection='column' padding={2} width='100%' alignItems='center'>
       <box flexDirection='column' width={58}>
@@ -518,6 +560,7 @@ function QuotaDialogContent(props: {
           killed={state().main?.killed ?? false}
           active={activeId() === 'main'}
           pacingEnabled={prefs().sections.pacing}
+          labelWidth={quotaLabelWidth()}
           resetCredits={state().main?.resetCredits}
         />
         <Show when={prefs().sections.fallbackAccounts}>
@@ -531,6 +574,7 @@ function QuotaDialogContent(props: {
                 killed={fb.killed}
                 active={activeId() === fb.id}
                 pacingEnabled={prefs().sections.pacing}
+                labelWidth={quotaLabelWidth()}
                 resetCredits={fb.resetCredits}
                 marginTop={1}
               />
@@ -711,6 +755,11 @@ function QuotaSidebar(props: {
     route: sessionRouting().route,
   })
   const activeAccount = () => resolveActiveAccount(sessionState())
+  const quotaLabelWidth = () =>
+    computeQuotaLabelWidth([
+      state().main?.quota ?? null,
+      ...enabledFallbacks().map((fb) => fb.quota),
+    ])
   const activeQuotaSummary = () =>
     getCollapsedQuotaSummary(activeAccount().quota)
   const activePacingDeficit = () => {
@@ -843,6 +892,7 @@ function QuotaSidebar(props: {
               killed={state().main?.killed ?? false}
               active={sessionRouting().activeId === 'main'}
               pacingEnabled={prefs().sections.pacing}
+              labelWidth={quotaLabelWidth()}
               resetCredits={state().main?.resetCredits}
             />
             <Show when={prefs().sections.fallbackAccounts}>
@@ -856,6 +906,7 @@ function QuotaSidebar(props: {
                     killed={fb.killed}
                     active={sessionRouting().activeId === fb.id}
                     pacingEnabled={prefs().sections.pacing}
+                    labelWidth={quotaLabelWidth()}
                     resetCredits={fb.resetCredits}
                     marginTop={1}
                   />

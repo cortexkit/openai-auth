@@ -4,6 +4,7 @@ import {
   buildApplyRequest,
   buildQuotaRowsForDisplay,
   buildRoutingRowsForDisplay,
+  computeQuotaLabelWidth,
   getAccountMetadataRows,
   getQuotaMetadataRows,
   isQuotaLoaded,
@@ -14,10 +15,32 @@ describe('dynamic quota TUI rows', () => {
 
   function projectQuotaRow(row: {
     label: string
-    labelWidth?: number
+    labelWidth: number
     window: { usedPercent: number }
   }): string {
-    return `${row.label.padEnd(row.labelWidth ?? 3)}▓▓▓▓▓▓▓▓ ${String(Math.round(row.window.usedPercent)).padStart(3)}%`
+    return `${row.label.padEnd(row.labelWidth)}▓▓▓▓▓▓▓▓ ${String(Math.round(row.window.usedPercent)).padStart(3)}%`
+  }
+
+  const twoWindows = {
+    primary: { usedPercent: 0, remainingPercent: 100, windowMinutes: 300 },
+    secondary: {
+      usedPercent: 51,
+      remainingPercent: 49,
+      windowMinutes: 10_080,
+    },
+  }
+  const withSpendControl = {
+    ...twoWindows,
+    spendControl: {
+      limit: 2500,
+      used: 501.7787666320801,
+      remaining: 1998.2212333679199,
+      usedPercent: 20.071150665283206,
+      remainingPercent: 79.9288493347168,
+      unit: 'credit',
+      source: 'individual_limit',
+      reached: false,
+    },
   }
 
   test('one 7-day primary window produces one 7d row paced over seven days', () => {
@@ -127,51 +150,55 @@ describe('dynamic quota TUI rows', () => {
     expect(rows.some((row) => row.key === 'spendControl')).toBe(false)
   })
 
-  test('aligns quota bars to the longest displayed label without widening two-window rows', () => {
-    const withCredits = buildQuotaRowsForDisplay(
-      {
-        primary: { usedPercent: 0, remainingPercent: 100, windowMinutes: 300 },
-        secondary: {
-          usedPercent: 51,
-          remainingPercent: 49,
-          windowMinutes: 10_080,
-        },
-        spendControl: {
-          limit: 2500,
-          used: 501.7787666320801,
-          remaining: 1998.2212333679199,
-          usedPercent: 20.071150665283206,
-          remainingPercent: 79.9288493347168,
-          unit: 'credit',
-          source: 'individual_limit',
-          reached: false,
-        },
-      },
-      now,
-      false,
-    )
-    const withoutCredits = buildQuotaRowsForDisplay(
-      {
-        primary: { usedPercent: 0, remainingPercent: 100, windowMinutes: 300 },
-        secondary: {
-          usedPercent: 51,
-          remainingPercent: 49,
-          windowMinutes: 10_080,
-        },
-      },
-      now,
-      false,
-    )
+  test('a sidebar with no spend control anywhere keeps the three-column label width', () => {
+    const fallback = {
+      primary: { usedPercent: 12, remainingPercent: 88, windowMinutes: 300 },
+    }
+    const labelWidth = computeQuotaLabelWidth([twoWindows, fallback])
 
-    expect(withCredits.map(projectQuotaRow)).toEqual([
-      '5h     ▓▓▓▓▓▓▓▓   0%',
-      '7d     ▓▓▓▓▓▓▓▓  51%',
-      'credits▓▓▓▓▓▓▓▓  20%',
+    expect(labelWidth).toBe(3)
+    expect(
+      buildQuotaRowsForDisplay(twoWindows, now, false, labelWidth).map(
+        projectQuotaRow,
+      ),
+    ).toEqual(['5h ▓▓▓▓▓▓▓▓   0%', '7d ▓▓▓▓▓▓▓▓  51%'])
+    expect(
+      buildQuotaRowsForDisplay(fallback, now, false, labelWidth).map(
+        projectQuotaRow,
+      ),
+    ).toEqual(['5h ▓▓▓▓▓▓▓▓  12%'])
+  })
+
+  test('one account with spend control widens every account label column', () => {
+    const labelWidth = computeQuotaLabelWidth([twoWindows, withSpendControl])
+
+    expect(labelWidth).toBe(8)
+    expect(
+      buildQuotaRowsForDisplay(twoWindows, now, false, labelWidth).map(
+        projectQuotaRow,
+      ),
+    ).toEqual(['5h      ▓▓▓▓▓▓▓▓   0%', '7d      ▓▓▓▓▓▓▓▓  51%'])
+    expect(
+      buildQuotaRowsForDisplay(withSpendControl, now, false, labelWidth).map(
+        projectQuotaRow,
+      ),
+    ).toEqual([
+      '5h      ▓▓▓▓▓▓▓▓   0%',
+      '7d      ▓▓▓▓▓▓▓▓  51%',
+      'credits ▓▓▓▓▓▓▓▓  20%',
     ])
-    expect(withoutCredits.map(projectQuotaRow)).toEqual([
-      '5h ▓▓▓▓▓▓▓▓   0%',
-      '7d ▓▓▓▓▓▓▓▓  51%',
-    ])
+  })
+
+  test('the longest label keeps a separator before its bar', () => {
+    const labelWidth = computeQuotaLabelWidth([withSpendControl])
+    const creditsRow = buildQuotaRowsForDisplay(
+      withSpendControl,
+      now,
+      false,
+      labelWidth,
+    ).find((row) => row.key === 'spendControl')
+
+    expect(creditsRow?.label.padEnd(creditsRow.labelWidth)).toBe('credits ')
   })
 
   test('distinguishes an unloaded quota from a loaded snapshot with no windows', () => {
