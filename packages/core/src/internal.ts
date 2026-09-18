@@ -19,6 +19,8 @@ export {
   type ResetTargetIdentity,
   renderResetCoordinatorResult,
 } from './commands'
+export * from './custody'
+export * from './custody-manifest'
 export * from './logger'
 export * from './oauth'
 export * from './paths'
@@ -32,3 +34,12 @@ export * from './reset-credits'
 export * from './util/error'
 export * from './util/open-url'
 export * from './util/record'
+// Named rather than `export *`: the vendored client carries transport
+// internals (the subc wire types, its error classes) that are not part of this
+// package's surface, and a blanket re-export puts them in it. The host needs
+// exactly these two to locate the vault socket.
+export {
+  ClaustrumClient,
+  detectClaustrumConnection,
+  getDefaultClaustrumConnectionPath,
+} from './vendor/claustrum-client/index'

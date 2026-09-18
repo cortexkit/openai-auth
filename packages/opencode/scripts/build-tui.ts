@@ -14,6 +14,7 @@ const shippedSourceFiles = [
   'tui/command-dialogs.tsx',
   'sidebar-state.ts',
   'core/account-paths.ts',
+  'core/custody-state.ts',
   'tui-preferences.ts',
   'logger.ts',
   'rpc/rpc-client.ts',

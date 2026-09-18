@@ -17,6 +17,7 @@ import {
   type OAuthAccount,
 } from '@cortexkit/openai-auth-core/internal'
 import { getAccountPaths } from '../core/account-paths'
+import { localCustody } from './custody-fixtures.ts'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_LOG_FILE,
@@ -94,6 +95,7 @@ describe('request-path bookkeeping never fails the caller', () => {
     breakStateWrites()
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(cfgPath),
+      custody: localCustody,
     })
 
     // Must resolve, not reject: the caller has a provider response to return.
@@ -123,6 +125,7 @@ describe('request-path bookkeeping never fails the caller', () => {
     breakStateWrites()
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(cfgPath),
+      custody: localCustody,
       refreshFn: async () => ({
         access: 'rotated-access',
         refresh: 'rotated-refresh',
@@ -810,6 +813,7 @@ describe('removed fallback refresh guard', () => {
       cfgPath,
       {
         paths: getAccountPaths(cfgPath),
+        custody: localCustody,
         now: () => now,
         refreshFn: async () => {
           refreshCalls++
@@ -879,6 +883,7 @@ describe('removed fallback refresh guard', () => {
       | undefined
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(cfgPath),
+      custody: localCustody,
       now: () => now,
       refreshFn: async () => {
         signalRefreshStarted?.()
@@ -956,6 +961,7 @@ describe('removed fallback refresh guard', () => {
       cfgPath,
       {
         paths: getAccountPaths(cfgPath),
+        custody: localCustody,
         now: () => now,
         refreshFn: async () => {
           refreshCalls++

@@ -4,6 +4,7 @@ import {
   beginAccountLogin,
   beginDeviceAuth,
   buildAuthorizeUrl,
+  claustrumMode,
   completeDeviceAuth,
   extractAccountId,
   flowCleanup,
@@ -249,6 +250,13 @@ export function createAuthMethods({
   }
 
   const addAccount = async () => {
+    const storage = await deps.loadAccounts(getPaths())
+    if (claustrumMode(storage) === 'claustrum') {
+      console.log(
+        'That account cannot be added while Claustrum mode is active. Run `/openai-account local` first.',
+      )
+      return
+    }
     const account = await runOwnedLogin()
     let selfFallback = false
     await deps.mutateAccounts((current) => {
