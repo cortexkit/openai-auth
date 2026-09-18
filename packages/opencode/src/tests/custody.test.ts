@@ -53,6 +53,7 @@ import {
   enrollmentManifest,
   liveAccount,
   liveStorage,
+  makeCustodyJwt,
   makeSentinelAccount,
   TOMBSTONE_OPENAI,
 } from './custody-fixtures.ts'
@@ -1023,6 +1024,35 @@ describe('resolveFallbackAccess', () => {
     expect(prov.handle).toBe(handle)
     expect(prov.recordVersion).toBe(7)
     expect(result.token).toBe(served)
+    cache.close()
+  })
+
+  it('refuses a served vault credential whose asserted account differs from its bound identity', async () => {
+    const handle = `ckh_${'m'.repeat(43)}`
+    const account = makeSentinelAccount({ accountId: 'acct-bound' })
+    const manifest = enrollmentManifest(account.id)
+    const cache = new ClaustrumCredentialCache({
+      connector: async () =>
+        makeFakeClient({
+          getCredential: async () => ({
+            material: makeCustodyJwt('acct-other'),
+            recordVersion: 8,
+            expiresAtMs: Date.now() + 60_000,
+            accountId: 'acct-other',
+          }),
+        }) as never,
+    })
+
+    expect(
+      await resolveFallbackAccess(
+        account,
+        liveStorage([account], {
+          claustrum: claustrumConfig({ mode: 'claustrum' }),
+        }),
+        manifest,
+        { cache, manifestHandle: handle },
+      ),
+    ).toBe(CUSTODY_REFUSE)
     cache.close()
   })
 
