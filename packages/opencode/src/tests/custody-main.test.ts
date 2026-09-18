@@ -417,7 +417,7 @@ describe('main host slot', () => {
           close: () => {},
         },
       },
-      async ({ loader, executeCommand, configPath }) => {
+      async ({ loader, executeCommand, configPath, authSetCalls }) => {
         await loader(async () => auth, {})
         await expect(
           executeCommand({
@@ -429,6 +429,7 @@ describe('main host slot', () => {
         expect(
           (await loadAccounts(getAccountPaths(configPath)))?.claustrum?.mode,
         ).toBe('claustrum')
+        expect(authSetCalls()).toBe(1)
       },
     )
   })
