@@ -507,6 +507,40 @@ describe('QuotaManager push', () => {
     expect(explicit.resetCreditsAvailable).toBe(4)
   })
 
+  it('preserves the spend-control budget when a per-turn push omits it', () => {
+    const previous: OAuthQuotaSnapshot = {
+      primary: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        checkedAt: 1,
+        windowMinutes: 300,
+      },
+      spendControl: {
+        limit: 2500,
+        used: 501.7787666320801,
+        remaining: 1998.2212333679199,
+        usedPercent: 20.071150665283206,
+        remainingPercent: 79.9288493347168,
+        resetsAt: '2026-10-01T00:00:00.000Z',
+        unit: 'credits',
+        source: 'individual_limit',
+        reached: false,
+      },
+    }
+    const incoming: OAuthQuotaSnapshot = {
+      primary: {
+        usedPercent: 20,
+        remainingPercent: 80,
+        checkedAt: 2,
+        windowMinutes: 300,
+      },
+    }
+
+    expect(mergePushedQuotaMetadata(incoming, previous).spendControl).toEqual(
+      previous.spendControl,
+    )
+  })
+
   it('round-trips resetCreditsApplicable from wham normalization through the main quota cache', async () => {
     const { QuotaManager } = await import(
       '@cortexkit/openai-auth-core/internal'

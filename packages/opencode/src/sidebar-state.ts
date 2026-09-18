@@ -6,10 +6,23 @@ export interface QuotaWindow {
   windowMinutes?: number
 }
 
+export interface SpendControlReading {
+  limit: number
+  used: number
+  remaining: number
+  usedPercent: number
+  remainingPercent: number
+  resetsAt?: string
+  unit?: string
+  source?: string
+  reached: boolean
+}
+
 export interface AccountQuota {
   checkedAt?: number
   primary?: QuotaWindow
   secondary?: QuotaWindow
+  spendControl?: SpendControlReading
   resetCreditsAvailable?: number
 }
 
@@ -1089,6 +1102,9 @@ function mergeQuotaByWindow(
     incoming.checkedAt,
     existing.checkedAt,
   )
+  const spendControl = existingSnapshotIsFresher
+    ? (existing.spendControl ?? incoming.spendControl)
+    : (incoming.spendControl ?? existing.spendControl)
   let checkedAt: number | undefined
   for (const stamp of [
     finiteWindowCheckedAt(primary),
@@ -1102,6 +1118,7 @@ function mergeQuotaByWindow(
     ...incoming,
     primary,
     secondary,
+    ...(spendControl !== undefined ? { spendControl } : {}),
     checkedAt: checkedAt ?? incoming.checkedAt,
   }
 }
