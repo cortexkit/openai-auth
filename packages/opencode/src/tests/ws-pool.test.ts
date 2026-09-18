@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { APICallError } from 'ai'
 import { DUMP_SESSION_HEADER } from '../dump'
+import { EMPTY_BEARER_MESSAGE } from '../index'
 import { ResponseStreamError } from '../response-stream-error'
 import {
   connectResponsesWebSocket,
@@ -2718,12 +2719,23 @@ describe('transport close provenance', () => {
       /try your request again|retry your request|resource exhausted|resource_exhausted/i,
       /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
     ]
-    // Both messages carry a decision the host must not overturn: one says the
-    // turn is finished, the other says this socket cannot carry this request.
+    // Each message carries a decision the host must not overturn: the turn is
+    // finished, this socket cannot carry this request, or there is no
+    // credential to send. Retrying any of them repeats a defect instead of
+    // recovering from a hiccup.
     for (const pattern of hostRetryablePatterns) {
       expect(pattern.test(TERMINAL_AFTER_OUTPUT_MESSAGE)).toBe(false)
       expect(pattern.test(OVERSIZED_FRAME_MESSAGE)).toBe(false)
+      expect(pattern.test(EMPTY_BEARER_MESSAGE)).toBe(false)
     }
+    // An operator names their own fallback accounts, so an id reaching a
+    // surfaced message is the same hazard as provider wording. This is the one
+    // the empty-bearer guard would have hit: the account it refuses for is a
+    // label, and it goes to the log rather than into the message.
+    expect(
+      hostRetryablePatterns.some((pattern) => pattern.test('acct-429')),
+    ).toBe(true)
+    expect(EMPTY_BEARER_MESSAGE).not.toContain('acct-429')
     // The inputs that used to reach this message, each of which the host reads
     // as retryable. They are the reason the message is fixed text.
     for (const leaked of [
@@ -2738,6 +2750,7 @@ describe('transport close provenance', () => {
       ).toBe(true)
       expect(TERMINAL_AFTER_OUTPUT_MESSAGE).not.toContain(leaked)
       expect(OVERSIZED_FRAME_MESSAGE).not.toContain(leaked)
+      expect(EMPTY_BEARER_MESSAGE).not.toContain(leaked)
     }
   })
 

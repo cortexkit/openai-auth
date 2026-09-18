@@ -23,6 +23,7 @@ import {
   type ClaustrumCacheTransportLike,
   CodexAuthPlugin,
   type CustodyRuntime,
+  EMPTY_BEARER_MESSAGE,
   findCachekeepFallbackAccount,
   MAIN_REFRESH_LEASE_TTL_MS,
   MAIN_REFRESH_LOCK_TTL_MS,
@@ -896,6 +897,77 @@ describe('integration: killswitch enforcement', () => {
 
       // The blocked request did NOT reach upstream — no extra spend.
       expect(mock.calls()).toBe(1)
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  // A defect that empties the access token used to reach the wire as `Bearer `
+  // and come back as a provider 401, which sends whoever debugs it to the
+  // provider's status page instead of to the plugin. The refusal is local, and
+  // it is deliberately not custody-specific: any path that loses a credential
+  // gets the same answer.
+  it('refuses to send when the access token is empty, and does not reach upstream', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    let upstreamCalls = 0
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input)
+      // Fail the token refresh so the slot keeps its empty access, which is the
+      // state the guard exists for. Everything else is quota chatter.
+      if (url.includes('oauth/token')) {
+        return new Response('{"error":"invalid_grant"}', { status: 400 })
+      }
+      if (url.includes('/responses')) upstreamCalls += 1
+      return new Response('{}', { status: 500 })
+    }) as unknown as typeof fetch
+
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const authHook = hooks.auth
+      if (!authHook?.loader) throw new Error('No auth loader')
+      const loaderResult = await authHook.loader(
+        async () => ({
+          type: 'oauth' as const,
+          provider: 'openai',
+          access: '',
+          refresh: 'refresh-that-will-not-exchange',
+          expires: Date.now() - 1000,
+        }),
+        {
+          id: 'openai',
+          label: 'OpenAI',
+          models: [],
+        } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
+      )
+      const fetchOverride = (loaderResult as Record<string, unknown>).fetch as (
+        url: string,
+        init?: RequestInit,
+      ) => Promise<Response>
+
+      let refusal: unknown
+      try {
+        await fetchOverride('https://api.openai.com/v1/responses', REQ_INIT)
+      } catch (error) {
+        refusal = error
+      }
+
+      expect((refusal as Error | undefined)?.message).toBe(EMPTY_BEARER_MESSAGE)
+      // The point of refusing locally: the provider never sees it, so it never
+      // answers for a bug that is ours.
+      expect(upstreamCalls).toBe(0)
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()

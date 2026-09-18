@@ -176,6 +176,18 @@ const ALLOWED_MODELS = new Set([
 // using Codex with a ChatGPT account") and serves only the named gpt-6-astra
 // variant, so any -fast/-pro synthetics inheriting api.id "gpt-6" drop with it.
 const DISALLOWED_MODELS = new Set(['gpt-5.6', 'gpt-6'])
+
+/**
+ * Surfaced when a request would go to the wire with no credential.
+ *
+ * Fixed text on purpose. The host decides retries by matching this string
+ * (opencode v1.18.30, session/retry.ts), so no account label, provider wording
+ * or number may reach it - an operator-chosen id like `acct-429` would read as
+ * retryable and hide a local defect behind a retry loop. Details go to the
+ * transport log.
+ */
+export const EMPTY_BEARER_MESSAGE =
+  'Refusing to send a request with no access token. This is a defect in the plugin, not a problem with the provider or the account; the transport log names the account and the path that produced it.'
 // Exact models currently marked `use_responses_lite` in Codex's catalog. Read
 // from the backend's own model list rather than assumed:
 //   GET /backend-api/codex/models?client_version=<v>
@@ -2736,6 +2748,28 @@ export async function CodexAuthPlugin(
           keepwarmAccountKey: string = 'main',
           provenance?: VaultProvenance | 'local',
         ): Promise<Response> {
+          // Nothing may leave here without a credential. An empty token is
+          // always a local defect, but on the wire it becomes `Bearer ` and
+          // comes back as a provider 401 - indistinguishable from an expired
+          // or revoked account, so whoever debugs it starts at the provider
+          // and not at the bug. That cost a day when a tombstoned main
+          // resolved its vault credential and then dropped it. Refusing here
+          // makes the whole class say where it came from, once, for every
+          // path that reaches the wire.
+          //
+          // The message is fixed text and carries no account id: a fallback's
+          // id is an operator-chosen label, the host decides retries by
+          // pattern-matching this string, and a label like `acct-429` would
+          // read as retryable. The id goes to the log instead.
+          if (!accessToken.trim()) {
+            logT.warn('refusing to send a request with no access token', {
+              account: keepwarmAccountKey,
+              accountId,
+              hasProvenance: Boolean(provenance && provenance !== 'local'),
+            })
+            throw new Error(EMPTY_BEARER_MESSAGE)
+          }
+
           const headers = effectiveRequestHeaders(requestInput, init)
           headers.delete('x-api-key')
           headers.delete('api-key')
