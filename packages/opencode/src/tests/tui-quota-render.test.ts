@@ -53,6 +53,71 @@ describe('dynamic quota TUI rows', () => {
     expect(buildQuotaRowsForDisplay({}, now, true)).toEqual([])
   })
 
+  test('renders a third credit-budget bar when spend control is present', () => {
+    const rows = buildQuotaRowsForDisplay(
+      {
+        primary: {
+          usedPercent: 3,
+          remainingPercent: 97,
+          windowMinutes: 300,
+        },
+        secondary: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          windowMinutes: 10_080,
+        },
+        spendControl: {
+          limit: 2500,
+          used: 501.7787666320801,
+          remaining: 1998.2212333679199,
+          usedPercent: 20.071150665283206,
+          remainingPercent: 79.9288493347168,
+          resetsAt: '2026-10-01T00:00:00.000Z',
+          unit: 'credits',
+          source: 'individual_limit',
+          reached: false,
+        },
+      },
+      now,
+      false,
+    )
+
+    expect(
+      rows.map((row) => [row.key, row.label, row.window.usedPercent]),
+    ).toEqual([
+      ['primary', '5h', 3],
+      ['secondary', '7d', 20],
+      ['spendControl', 'credits', 20.071150665283206],
+    ])
+  })
+
+  test('renders the existing two-bar sidebar output without spend control', () => {
+    const rows = buildQuotaRowsForDisplay(
+      {
+        primary: {
+          usedPercent: 3,
+          remainingPercent: 97,
+          windowMinutes: 300,
+        },
+        secondary: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          windowMinutes: 10_080,
+        },
+      },
+      now,
+      false,
+    )
+
+    expect(
+      rows.map((row) => [row.key, row.label, row.window.usedPercent]),
+    ).toEqual([
+      ['primary', '5h', 3],
+      ['secondary', '7d', 20],
+    ])
+    expect(rows.some((row) => row.key === 'spendControl')).toBe(false)
+  })
+
   test('distinguishes an unloaded quota from a loaded snapshot with no windows', () => {
     expect(isQuotaLoaded(null)).toBe(false)
     expect(isQuotaLoaded({})).toBe(true)
