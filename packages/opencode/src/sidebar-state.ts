@@ -526,6 +526,27 @@ export function isUsableRoutingEntry(
   )
 }
 
+// The credit budget's own exhaustion signal, shared by admission and sticky
+// migration so both agree on what "spent" means. `reached` is the provider's
+// authoritative boolean — the percentage is only a display approximation — and
+// the check fails open on a missing or lapsed reset exactly like a rate-limit
+// window, so a stale or corrupt reading never blocks.
+export function spendControlExhaustedResetAt(
+  quota: AccountQuota | null | undefined,
+  now = Date.now(),
+): { resetsAt: string; resetAtMs: number } | undefined {
+  const spendControl = quota?.spendControl
+  if (
+    spendControl?.reached !== true ||
+    typeof spendControl.resetsAt !== 'string'
+  ) {
+    return undefined
+  }
+  const resetAtMs = Date.parse(spendControl.resetsAt)
+  if (!Number.isFinite(resetAtMs) || resetAtMs <= now) return undefined
+  return { resetsAt: spendControl.resetsAt, resetAtMs }
+}
+
 // Earliest future reset among the quota's exhausted windows, or undefined when
 // no present window is exhausted. Every present window is evaluated — matching
 // the admission policy, which rejects an account when ANY live window is below
@@ -553,20 +574,10 @@ export function exhaustedQuotaResetAt(
     }
   }
   // The credit budget is a third axis on its own reset clock (a month, not
-  // 5h/7d). `reached` is the provider's authoritative boolean — the percentage
-  // is only a display approximation — and it fails open on a missing or lapsed
-  // reset exactly like the windows above, so a stale reading never blocks.
-  const spendControl = quota?.spendControl
-  if (
-    spendControl?.reached === true &&
-    typeof spendControl.resetsAt === 'string'
-  ) {
-    const resetAtMs = Date.parse(spendControl.resetsAt)
-    if (Number.isFinite(resetAtMs) && resetAtMs > now) {
-      if (!earliest || resetAtMs < earliest.resetAtMs) {
-        earliest = { resetsAt: spendControl.resetsAt, resetAtMs }
-      }
-    }
+  // 5h/7d), judged by the same shared signal sticky migration uses.
+  const spendReset = spendControlExhaustedResetAt(quota, now)
+  if (spendReset && (!earliest || spendReset.resetAtMs < earliest.resetAtMs)) {
+    earliest = spendReset
   }
   return earliest
 }
