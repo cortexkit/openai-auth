@@ -882,18 +882,44 @@ describe('verifyServedFallbackIdentity', () => {
         payload: { access: jwtFor('acct-X') },
         recordVersion: 1,
         expiresAtMs: Date.now() + 60_000,
+        servedAccountId: 'acct-X',
       },
       acct,
     )
     expect(result).toEqual({ reason: 'ok' })
   })
 
-  // The conditional branch: the vendored ServedCredential has no served id,
-  // so the normalized servedAccountId is undefined today. The test is `test.skip`
-  // with a documented reason until the wire contract adds the field.
-  it.skip('labelDisagreesWithClaim branch when a served id is present and disagrees', () => {
-    // Placeholder — pending wire contract addition. Skipped intentionally so the
-    // missing field does not mask the implementation gap.
+  it('returns labelDisagreesWithClaim when the served account id disagrees with its token claim', () => {
+    const acct = liveAccount('main', { accountId: 'acct-X' })
+    const result = verifyServedFallbackIdentity(
+      {
+        payload: { access: jwtFor('acct-X') },
+        recordVersion: 1,
+        expiresAtMs: Date.now() + 60_000,
+        servedAccountId: 'acct-Y',
+      },
+      acct,
+    )
+    expect(result).toEqual({
+      reason: 'identityMismatch',
+      detail: 'labelDisagreesWithClaim',
+    })
+  })
+
+  it('refuses an absent served account id rather than treating it as agreement', () => {
+    const acct = liveAccount('main', { accountId: 'acct-X' })
+    const result = verifyServedFallbackIdentity(
+      {
+        payload: { access: jwtFor('acct-X') },
+        recordVersion: 1,
+        expiresAtMs: Date.now() + 60_000,
+      },
+      acct,
+    )
+    expect(result).toEqual({
+      reason: 'identityMismatch',
+      detail: 'labelDisagreesWithClaim',
+    })
   })
 })
 
@@ -970,6 +996,7 @@ describe('resolveFallbackAccess', () => {
               material: served,
               recordVersion: 7,
               expiresAtMs: Date.now() + 60_000,
+              accountId: 'acct-X',
             }
           },
           async statusCredential() {
@@ -1118,6 +1145,7 @@ describe('reconcileFallbackCustody', () => {
             material: jwtFor('acct-completion'),
             recordVersion: 7,
             expiresAtMs: now + 60_000,
+            accountId: 'acct-completion',
           }),
         }) as never,
     })
@@ -1168,6 +1196,7 @@ describe('binding-pending request reconciliation', () => {
             material: jwtFor('acct-bound'),
             recordVersion: 9,
             expiresAtMs: Date.now() + 60_000,
+            accountId: 'acct-bound',
           }),
         }) as never,
     })
@@ -1227,6 +1256,7 @@ describe('binding-pending request reconciliation', () => {
               material: jwtFor('acct-serialized'),
               recordVersion: 10,
               expiresAtMs: Date.now() + 60_000,
+              accountId: 'acct-serialized',
             }
           },
         }) as never,
@@ -1238,6 +1268,7 @@ describe('binding-pending request reconciliation', () => {
             material: jwtFor('acct-serialized'),
             recordVersion: 11,
             expiresAtMs: Date.now() + 60_000,
+            accountId: 'acct-serialized',
           }),
         }) as never,
     })
@@ -1362,6 +1393,23 @@ describe('ClaustrumCredentialCache', () => {
     const second = await cache.get(handle, 30_000)
     expect(fake.calls.get).toBe(1)
     expect(second.recordVersion).toBe(first.recordVersion)
+    cache.close()
+  })
+
+  it('preserves the served account id for fallback identity verification', async () => {
+    const fake = makeFakeClient({
+      getCredential: async () => ({
+        material: 'acc-live',
+        recordVersion: 1,
+        expiresAtMs: Date.now() + 60_000,
+        accountId: 'acct-X',
+      }),
+    })
+    const cache = new ClaustrumCredentialCache({
+      connector: async () => fake as never,
+    })
+    const record = await cache.get(`ckh_${'h'.repeat(43)}`, 30_000)
+    expect(record.servedAccountId).toBe('acct-X')
     cache.close()
   })
 

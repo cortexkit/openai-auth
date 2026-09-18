@@ -238,12 +238,9 @@ export type ServedIdentityCheck =
     }
 
 /**
- * Parse the served access token, compare its `chatgpt_account_id` claim
- * against the local account's `accountId`, and (when present) check the
- * served-account-id label field agrees. The vendored `ServedCredential` has
- * no served id today, so the labelDisagreesWithClaim branch is conditional —
- * the test asserting it is `test.skip` until the wire contract adds the
- * field.
+ * The JWT claim, vault-served account id, and local binding must agree before
+ * a fallback credential is served. Missing served identity is a refusal: it
+ * cannot establish that the vault returned the credential bound to this row.
  */
 export function verifyServedFallbackIdentity(
   served: ServedFallbackCredential,
@@ -256,7 +253,11 @@ export function verifyServedFallbackIdentity(
   if (account.accountId && claimId !== account.accountId) {
     return { reason: 'identityMismatch', detail: 'claimDiffersFromLocal' }
   }
-  if (served.servedAccountId && served.servedAccountId !== claimId) {
+  if (
+    !served.servedAccountId ||
+    (account.accountId && served.servedAccountId !== account.accountId) ||
+    served.servedAccountId !== claimId
+  ) {
     return { reason: 'identityMismatch', detail: 'labelDisagreesWithClaim' }
   }
   return { reason: 'ok' }
@@ -428,6 +429,7 @@ export type ClaustrumCacheTransport = {
     material: string
     recordVersion: number
     expiresAtMs: number | null
+    accountId?: string
   }>
   statusCredential(handle: string): Promise<{
     ready: boolean
@@ -448,6 +450,7 @@ type ResidentRecord = {
   payload: { access: string }
   recordVersion: number
   expiresAtMs: number
+  servedAccountId?: string
 }
 
 type InflightSlot = {
@@ -593,6 +596,7 @@ export class ClaustrumCredentialCache {
           payload: { access: response.material },
           recordVersion: response.recordVersion,
           expiresAtMs,
+          servedAccountId: response.accountId,
         }
         this.#resident.set(handle, record)
         // A served version is not evidence it works; only a 2xx request resets
@@ -845,6 +849,7 @@ export async function reconcileFallbackCustody(
         payload: { access: served.payload.access },
         recordVersion: served.recordVersion,
         expiresAtMs: served.expiresAtMs,
+        servedAccountId: served.servedAccountId,
       },
       recheckAccount,
     )

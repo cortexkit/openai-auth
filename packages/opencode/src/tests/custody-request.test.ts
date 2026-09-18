@@ -59,8 +59,18 @@ async function withCustodyLoader(
     accounts: OAuthAccount[]
     routing?: { mode: 'main-first' | 'fallback-first' | 'sticky-balanced' }
     claustrumEnabled?: boolean
-    credential?: { material: string; recordVersion: number } | undefined
-    credentialForGet?: () => { material: string; recordVersion: number }
+    credential?:
+      | {
+          material: string
+          recordVersion: number
+          accountId?: string
+        }
+      | undefined
+    credentialForGet?: () => {
+      material: string
+      recordVersion: number
+      accountId?: string
+    }
     now?: () => number
     sidebar?: Record<string, unknown>
     observeRequest?: (
@@ -147,6 +157,8 @@ async function withCustodyLoader(
       if (!credential) throw new Error('vault unavailable')
       return {
         ...credential,
+        accountId:
+          credential.accountId ?? servedAccountIdFromJwt(credential.material),
         expiresAtMs: (options.now ?? Date.now)() + 60_000,
       }
     },
@@ -243,6 +255,24 @@ async function withCustodyLoader(
     process.env.CLAUSTRUM_OPENCODE_HANDLES = FLOOR_CLAUSTRUM_HANDLES
     delete process.env.OPENCODE_CONFIG_DIR
     rmSync(directory, { recursive: true, force: true })
+  }
+}
+
+function servedAccountIdFromJwt(access: string): string | undefined {
+  const encodedPayload = access.split('.')[1]
+  if (!encodedPayload) return undefined
+  try {
+    const claims = JSON.parse(
+      Buffer.from(encodedPayload, 'base64url').toString('utf8'),
+    ) as {
+      chatgpt_account_id?: unknown
+      'https://api.openai.com/auth'?: { chatgpt_account_id?: unknown }
+    }
+    const nested = claims['https://api.openai.com/auth']?.chatgpt_account_id
+    const accountId = claims.chatgpt_account_id ?? nested
+    return typeof accountId === 'string' ? accountId : undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -579,6 +609,7 @@ describe('custody request resolution', () => {
         vaultGets++
         return {
           material: vaultAccess,
+          accountId: 'acct-1',
           recordVersion: 17,
           expiresAtMs: Date.now() + 60_000,
         }
@@ -1036,6 +1067,7 @@ describe('custody request resolution', () => {
       async getCredential() {
         return {
           material: vaultAccess,
+          accountId: 'acct-sticky-vault',
           recordVersion: 71,
           expiresAtMs: Date.now() + 60_000,
         }
@@ -1411,6 +1443,7 @@ describe('custody request resolution', () => {
           async getCredential() {
             return {
               material: vaultAccess,
+              accountId: 'acct-1',
               recordVersion: 7,
               expiresAtMs: 10_000,
             }

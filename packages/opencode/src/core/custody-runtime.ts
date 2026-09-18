@@ -106,6 +106,7 @@ export type ClaustrumCacheTransportLike = {
     material: string
     recordVersion: number
     expiresAtMs: number | null
+    accountId?: string
   }>
   statusCredential(handle: string): Promise<{
     ready: boolean
