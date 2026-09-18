@@ -688,7 +688,11 @@ export function __createCustodyRuntimeForTest(
       // local fallback, at a moment the vault writes no audit row for a
       // served get — so we would be the only witness to an outage caused by
       // this check. Only a claim that positively disagrees refuses.
-      if (expectedAccountId && servedAccountId !== expectedAccountId) {
+      if (
+        expectedAccountId &&
+        servedAccountId &&
+        servedAccountId !== expectedAccountId
+      ) {
         return 'identity_mismatch'
       }
       if (!servedAccountId) {
