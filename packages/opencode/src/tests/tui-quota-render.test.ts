@@ -8,6 +8,7 @@ import {
   getAccountMetadataRows,
   getQuotaMetadataRows,
   isQuotaLoaded,
+  renderedQuotas,
 } from '../tui.tsx'
 
 describe('dynamic quota TUI rows', () => {
@@ -167,6 +168,25 @@ describe('dynamic quota TUI rows', () => {
         projectQuotaRow,
       ),
     ).toEqual(['5h ▓▓▓▓▓▓▓▓  12%'])
+  })
+
+  // The width is only as correct as the set it measures, and the set is built
+  // in the sidebar where no test can reach it. A fallback dropped here narrows
+  // the column back to the defect this fixed, with every unit test still green.
+  test('the measured set covers main and every enabled fallback', () => {
+    const measured = renderedQuotas({
+      main: { quota: twoWindows },
+      fallbacks: [
+        { enabled: true, quota: withSpendControl },
+        { enabled: false, quota: withSpendControl },
+      ],
+    })
+
+    expect(measured).toEqual([twoWindows, withSpendControl])
+    // A disabled account draws no rows, so counting it would widen the column
+    // for a row nobody sees.
+    expect(measured).toHaveLength(2)
+    expect(computeQuotaLabelWidth(measured)).toBe(8)
   })
 
   test('one account with spend control widens every account label column', () => {

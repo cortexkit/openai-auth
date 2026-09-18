@@ -264,6 +264,27 @@ function quotaRowLabels(quota: AccountQuota | null): string[] {
 // derived once from every account rendered (main plus fallbacks) and threaded
 // into each account's rows. The +1 keeps a separator before the longest label's
 // bar; 3 is the floor the short 5h/7d labels already relied on.
+/**
+ * Every quota the sidebar will draw, in one list.
+ *
+ * The label column is shared by all of them, so the width has to be measured
+ * over this exact set — measuring a subset is what made stacked accounts
+ * disagree about where the bar starts. Named rather than inlined at each call
+ * site because the set is the part that can be got wrong, and a call site
+ * cannot be tested without the host's rendering runtime.
+ */
+export function renderedQuotas(state: {
+  main?: { quota?: AccountQuota | null } | null
+  fallbacks?: ReadonlyArray<{ enabled?: boolean; quota?: AccountQuota | null }>
+}): ReadonlyArray<AccountQuota | null | undefined> {
+  return [
+    state.main?.quota ?? null,
+    ...(state.fallbacks ?? [])
+      .filter((fallback) => fallback.enabled)
+      .map((fallback) => fallback.quota),
+  ]
+}
+
 export function computeQuotaLabelWidth(
   quotas: ReadonlyArray<AccountQuota | null | undefined>,
 ): number {
@@ -546,11 +567,7 @@ function QuotaDialogContent(props: {
   const enabledFallbacks = () =>
     (state().fallbacks ?? []).filter((f) => f.enabled)
   const activeId = () => resolveQuotaDialogActiveId(state(), props.sessionId)
-  const quotaLabelWidth = () =>
-    computeQuotaLabelWidth([
-      state().main?.quota ?? null,
-      ...enabledFallbacks().map((fb) => fb.quota),
-    ])
+  const quotaLabelWidth = () => computeQuotaLabelWidth(renderedQuotas(state()))
   return (
     <box flexDirection='column' padding={2} width='100%' alignItems='center'>
       <box flexDirection='column' width={58}>
@@ -762,11 +779,7 @@ function QuotaSidebar(props: {
     route: sessionRouting().route,
   })
   const activeAccount = () => resolveActiveAccount(sessionState())
-  const quotaLabelWidth = () =>
-    computeQuotaLabelWidth([
-      state().main?.quota ?? null,
-      ...enabledFallbacks().map((fb) => fb.quota),
-    ])
+  const quotaLabelWidth = () => computeQuotaLabelWidth(renderedQuotas(state()))
   const activeQuotaSummary = () =>
     getCollapsedQuotaSummary(activeAccount().quota)
   const activePacingDeficit = () => {
