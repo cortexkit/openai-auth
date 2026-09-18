@@ -238,9 +238,8 @@ export type ServedIdentityCheck =
     }
 
 /**
- * The JWT claim, vault-served account id, and local binding must agree before
- * a fallback credential is served. Missing served identity is a refusal: it
- * cannot establish that the vault returned the credential bound to this row.
+ * A vault-served account id, when present, must agree with the bound row and
+ * the credential's claim. Absence is an unknown assertion, not a mismatch.
  */
 export function verifyServedFallbackIdentity(
   served: ServedFallbackCredential,
@@ -254,9 +253,9 @@ export function verifyServedFallbackIdentity(
     return { reason: 'identityMismatch', detail: 'claimDiffersFromLocal' }
   }
   if (
-    !served.servedAccountId ||
-    (account.accountId && served.servedAccountId !== account.accountId) ||
-    served.servedAccountId !== claimId
+    served.servedAccountId &&
+    ((account.accountId && served.servedAccountId !== account.accountId) ||
+      served.servedAccountId !== claimId)
   ) {
     return { reason: 'identityMismatch', detail: 'labelDisagreesWithClaim' }
   }

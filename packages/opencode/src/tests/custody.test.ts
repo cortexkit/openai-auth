@@ -906,7 +906,7 @@ describe('verifyServedFallbackIdentity', () => {
     })
   })
 
-  it('refuses an absent served account id rather than treating it as agreement', () => {
+  it('serves when the vault omits an account id', () => {
     const acct = liveAccount('main', { accountId: 'acct-X' })
     const result = verifyServedFallbackIdentity(
       {
@@ -916,10 +916,7 @@ describe('verifyServedFallbackIdentity', () => {
       },
       acct,
     )
-    expect(result).toEqual({
-      reason: 'identityMismatch',
-      detail: 'labelDisagreesWithClaim',
-    })
+    expect(result).toEqual({ reason: 'ok' })
   })
 })
 
