@@ -2622,7 +2622,19 @@ export async function CodexAuthPlugin(
               },
               auth: {
                 all: () => hostAuth.all(),
-                get: (value) => hostAuth.get(value),
+                get: async (value) => {
+                  if (typeof hostAuth.get === 'function') {
+                    return hostAuth.get(value)
+                  }
+                  if (value.path.id !== 'openai' || !loaderGetAuth) {
+                    custodyLogger.warn('auth.get unavailable for slot', {
+                      id: value.path.id,
+                      hasLoaderGetAuth: loaderGetAuth !== undefined,
+                    })
+                    return undefined
+                  }
+                  return loaderGetAuth()
+                },
                 set: async (value) => {
                   await hostAuth.set(value)
                 },

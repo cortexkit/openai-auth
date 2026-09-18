@@ -58,6 +58,8 @@ async function withMainLoader(
     storage: ReturnType<typeof liveStorage>
     transport: ClaustrumCacheTransportLike
     slotAbsent?: boolean
+    hostAuthOnlySet?: boolean
+    hostAuthWithoutGet?: boolean
   },
   run: (input: {
     loader: (
@@ -66,6 +68,11 @@ async function withMainLoader(
     ) => Promise<unknown>
     configPath: string
     authSetCalls: () => number
+    executeCommand: (input: {
+      command: string
+      arguments: string
+      sessionID: string
+    }) => Promise<void>
   }) => Promise<void>,
 ): Promise<void> {
   const directory = mkdtempSync(join(tmpdir(), 'custody-main-'))
@@ -95,10 +102,22 @@ async function withMainLoader(
     mkdirSync(directory, { recursive: true, mode: 0o700 })
     writeFileSync(manifestPath, JSON.stringify(manifest.value), { mode: 0o600 })
     chmodSync(manifestPath, 0o600)
-    hooks = await CodexAuthPlugin(
-      {
-        client: {
-          auth: {
+    const hostAuth = options.hostAuthOnlySet
+      ? {
+          _client: {},
+          set: async () => {
+            authSetCalls += 1
+          },
+        }
+      : options.hostAuthWithoutGet
+        ? {
+            _client: {},
+            all: async () => ({ openai: options.auth }),
+            set: async () => {
+              authSetCalls += 1
+            },
+          }
+        : {
             get: async () => (options.slotAbsent ? undefined : options.auth),
             all: async () =>
               options.slotAbsent
@@ -107,7 +126,12 @@ async function withMainLoader(
             set: async () => {
               authSetCalls += 1
             },
-          },
+          }
+    hooks = await CodexAuthPlugin(
+      {
+        client: {
+          auth: hostAuth,
+          session: { promptAsync: async () => {} },
         },
         project: { id: 'test', name: 'test' },
         directory: '',
@@ -127,6 +151,11 @@ async function withMainLoader(
       ) => Promise<unknown>,
       configPath,
       authSetCalls: () => authSetCalls,
+      executeCommand: hooks['command.execute.before'] as (input: {
+        command: string
+        arguments: string
+        sessionID: string
+      }) => Promise<void>,
     })
   } finally {
     await hooks?.dispose?.()
@@ -353,6 +382,53 @@ describe('main host slot', () => {
           loader(async () => canonicalTombstone, {}),
         ).resolves.toBeDefined()
         expect(authSetCalls()).toBe(0)
+      },
+    )
+  })
+
+  test('enters claustrum when the host auth client lacks get', async () => {
+    const auth = {
+      type: 'oauth' as const,
+      access: mainJwt('stored-main'),
+      refresh: 'refresh-main',
+      expires: CUSTODY_FIXTURE_NOW + 60_000,
+    }
+    await withMainLoader(
+      {
+        auth,
+        hostAuthWithoutGet: true,
+        storage: liveStorage([], {
+          mainAccountId: 'stored-main',
+          claustrum: claustrumConfig({ mode: 'claustrum' }),
+        }),
+        transport: {
+          getCredential: async () => ({
+            material: mainJwt('stored-main'),
+            recordVersion: 1,
+            expiresAtMs: CUSTODY_FIXTURE_NOW + 60_000,
+          }),
+          statusCredential: async () => ({
+            ready: true,
+            lastErrorCode: null,
+            leaseHeld: false,
+            recordVersion: 1,
+          }),
+          reportAuthFailure: async () => {},
+          close: () => {},
+        },
+      },
+      async ({ loader, executeCommand, configPath }) => {
+        await loader(async () => auth, {})
+        await expect(
+          executeCommand({
+            command: 'openai-account',
+            arguments: 'claustrum',
+            sessionID: 'session-1',
+          }),
+        ).rejects.toThrow('__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__')
+        expect(
+          (await loadAccounts(getAccountPaths(configPath)))?.claustrum?.mode,
+        ).toBe('claustrum')
       },
     )
   })
