@@ -1349,6 +1349,35 @@ describe('enroll-completion sweep', () => {
     runtime.dispose()
   })
 
+  it('keeps a corrupt fallback marker when the served credential asserts a different account', async () => {
+    const corrupt = corruptAccount()
+    const storage: AccountStorage = {
+      version: 1,
+      accounts: [corrupt],
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    }
+    await writeCorruptStorageWithManifest(
+      storage,
+      enrollmentManifest(corrupt.id),
+    )
+    const { transport, captured } = makeTransport(() => ({
+      material: makeCustodyJwt('acct-other'),
+      recordVersion: 21,
+      expiresAtMs: Date.now() + 600_000,
+    }))
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({ storage, transport, detection: 'available' }),
+    )
+
+    await runtime.boot()
+
+    expect(captured.getCalls).not.toEqual([])
+    expect((await loadAccounts(getAccountPaths(configPath)))?.accounts).toEqual(
+      [corrupt],
+    )
+    runtime.dispose()
+  })
+
   for (const vaultState of ['serves', 'cold', 'needs_reauth'] as const) {
     it(`installs the exact fallback tombstone over a corrupt marker when the vault ${vaultState}`, async () => {
       const corrupt = corruptAccount()
