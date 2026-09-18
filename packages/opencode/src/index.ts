@@ -2589,7 +2589,7 @@ export async function CodexAuthPlugin(
                 ),
               readManifest: readCustodyManifest,
               preflight: async ({ accountId, handle }) => {
-                const cache = custodyRuntime.getCache()
+                const cache = await custodyRuntime.ensureCache()
                 if (!cache || cache.isBlocked(handle)) return 'vault-cold'
                 if (
                   cache.isReauth(handle, custodyOptions?.now?.() ?? Date.now())
