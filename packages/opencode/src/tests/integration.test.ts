@@ -16,8 +16,9 @@ import {
   type OAuthAccount,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
-import { getAccountPaths } from '../core/account-paths'
+
 import { getConfigPath } from '../config.ts'
+import { getAccountPaths } from '../core/account-paths'
 import { QUOTA_STALENESS_MS } from '../core/sticky-routing.ts'
 import {
   AuthPersistError,
