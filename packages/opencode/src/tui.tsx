@@ -243,6 +243,7 @@ function CollapsedRow(props: {
 export interface QuotaDisplayRow {
   key: 'primary' | 'secondary' | 'spendControl'
   label: string
+  labelWidth: number
   window: QuotaWindow
   pacing: QuotaPacing | null
 }
@@ -254,15 +255,16 @@ export function buildQuotaRowsForDisplay(
   now: number,
   pacingEnabled: boolean,
 ): QuotaDisplayRow[] {
-  const rows: QuotaDisplayRow[] = getPresentQuotaWindows(quota).map((row) => ({
-    key: row.key,
-    label: row.label,
-    window: row.window,
-    pacing:
-      pacingEnabled && row.windowMs !== null
-        ? computeQuotaPacing(row.window, row.windowMs, now)
-        : null,
-  }))
+  const rows: Array<Omit<QuotaDisplayRow, 'labelWidth'>> =
+    getPresentQuotaWindows(quota).map((row) => ({
+      key: row.key,
+      label: row.label,
+      window: row.window,
+      pacing:
+        pacingEnabled && row.windowMs !== null
+          ? computeQuotaPacing(row.window, row.windowMs, now)
+          : null,
+    }))
   const spendControl = quota?.spendControl
   if (spendControl) {
     rows.push({
@@ -276,7 +278,8 @@ export function buildQuotaRowsForDisplay(
       pacing: null,
     })
   }
-  return rows
+  const labelWidth = Math.max(3, ...rows.map((row) => row.label.length))
+  return rows.map((row) => ({ ...row, labelWidth }))
 }
 
 export function isQuotaLoaded(quota: AccountQuota | null): boolean {
@@ -310,6 +313,7 @@ function QuotaRow(props: {
   theme: ThemeCurrent
   appearance: AppearancePrefs
   label: string
+  labelWidth: number
   window: { usedPercent: number; resetsAt?: string } | undefined
   pacing: QuotaPacing | null
 }) {
@@ -329,7 +333,9 @@ function QuotaRow(props: {
       when={props.window}
       fallback={
         <box width='100%' flexDirection='row'>
-          <text fg={props.theme.textMuted}>{props.label.padEnd(3)}</text>
+          <text fg={props.theme.textMuted}>
+            {props.label.padEnd(props.labelWidth)}
+          </text>
           <text fg={props.theme.textMuted}>{'\u2014'}</text>
         </box>
       }
@@ -339,7 +345,9 @@ function QuotaRow(props: {
           the right edge so reset times align in their own right column. */}
       <box width='100%' flexDirection='row' justifyContent='space-between'>
         <box flexDirection='row'>
-          <text fg={props.theme.textMuted}>{props.label.padEnd(3)}</text>
+          <text fg={props.theme.textMuted}>
+            {props.label.padEnd(props.labelWidth)}
+          </text>
           <For each={quotaBarSegments(used(), props.appearance, props.pacing)}>
             {(segment) => (
               <text fg={toneColor(props.theme, segment.tone)}>
@@ -359,7 +367,7 @@ function QuotaRow(props: {
       </box>
       <Show when={paceLine()}>
         <box width='100%' flexDirection='row'>
-          <text fg={props.theme.textMuted}>{'   '}</text>
+          <text fg={props.theme.textMuted}>{''.padEnd(props.labelWidth)}</text>
           <text
             fg={toneColor(
               props.theme,
@@ -418,6 +426,7 @@ function AccountBlock(props: {
                 theme={props.theme}
                 appearance={props.appearance}
                 label={row.label}
+                labelWidth={row.labelWidth}
                 window={row.window}
                 pacing={row.pacing}
               />

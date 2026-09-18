@@ -11,6 +11,14 @@ import {
 describe('dynamic quota TUI rows', () => {
   const now = Date.UTC(2026, 6, 16, 12, 0, 0)
 
+  function projectQuotaRow(row: {
+    label: string
+    labelWidth?: number
+    window: { usedPercent: number }
+  }): string {
+    return `${row.label.padEnd(row.labelWidth ?? 3)}▓▓▓▓▓▓▓▓ ${String(Math.round(row.window.usedPercent)).padStart(3)}%`
+  }
+
   test('one 7-day primary window produces one 7d row paced over seven days', () => {
     const rows = buildQuotaRowsForDisplay(
       {
@@ -116,6 +124,53 @@ describe('dynamic quota TUI rows', () => {
       ['secondary', '7d', 20],
     ])
     expect(rows.some((row) => row.key === 'spendControl')).toBe(false)
+  })
+
+  test('aligns quota bars to the longest displayed label without widening two-window rows', () => {
+    const withCredits = buildQuotaRowsForDisplay(
+      {
+        primary: { usedPercent: 0, remainingPercent: 100, windowMinutes: 300 },
+        secondary: {
+          usedPercent: 51,
+          remainingPercent: 49,
+          windowMinutes: 10_080,
+        },
+        spendControl: {
+          limit: 2500,
+          used: 501.7787666320801,
+          remaining: 1998.2212333679199,
+          usedPercent: 20.071150665283206,
+          remainingPercent: 79.9288493347168,
+          unit: 'credit',
+          source: 'individual_limit',
+          reached: false,
+        },
+      },
+      now,
+      false,
+    )
+    const withoutCredits = buildQuotaRowsForDisplay(
+      {
+        primary: { usedPercent: 0, remainingPercent: 100, windowMinutes: 300 },
+        secondary: {
+          usedPercent: 51,
+          remainingPercent: 49,
+          windowMinutes: 10_080,
+        },
+      },
+      now,
+      false,
+    )
+
+    expect(withCredits.map(projectQuotaRow)).toEqual([
+      '5h     ▓▓▓▓▓▓▓▓   0%',
+      '7d     ▓▓▓▓▓▓▓▓  51%',
+      'credits▓▓▓▓▓▓▓▓  20%',
+    ])
+    expect(withoutCredits.map(projectQuotaRow)).toEqual([
+      '5h ▓▓▓▓▓▓▓▓   0%',
+      '7d ▓▓▓▓▓▓▓▓  51%',
+    ])
   })
 
   test('distinguishes an unloaded quota from a loaded snapshot with no windows', () => {
