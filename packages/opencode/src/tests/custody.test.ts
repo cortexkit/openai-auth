@@ -1056,6 +1056,37 @@ describe('resolveFallbackAccess', () => {
     cache.close()
   })
 
+  it('serves a vault credential whose account claim is absent', async () => {
+    const handle = `ckh_${'u'.repeat(43)}`
+    const account = makeSentinelAccount({ accountId: 'acct-bound' })
+    const access = makeCustodyJwt(undefined)
+    const cache = new ClaustrumCredentialCache({
+      connector: async () =>
+        makeFakeClient({
+          getCredential: async () => ({
+            material: access,
+            recordVersion: 9,
+            expiresAtMs: Date.now() + 60_000,
+          }),
+        }) as never,
+    })
+
+    const result = await resolveFallbackAccess(
+      account,
+      liveStorage([account], {
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
+      }),
+      enrollmentManifest(account.id),
+      { cache, manifestHandle: handle },
+    )
+
+    expect(result).toEqual({
+      token: access,
+      provenance: { handle, recordVersion: 9 },
+    })
+    cache.close()
+  })
+
   it('returns CUSTODY_REFUSE for custodied account with empty cache', async () => {
     const handle = `ckh_${'a'.repeat(43)}`
     const acct = makeSentinelAccount()
