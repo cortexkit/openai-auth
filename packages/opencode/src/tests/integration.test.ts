@@ -5398,6 +5398,108 @@ describe('integration: active fallback routing', () => {
     }
   })
 
+  function spentCreditBudget(
+    resetsAt: string,
+  ): NonNullable<SidebarState['main']['quota']>['spendControl'] {
+    return {
+      limit: 2500,
+      used: 2500,
+      remaining: 0,
+      usedPercent: 100,
+      remainingPercent: 0,
+      resetsAt,
+      reached: true,
+    }
+  }
+
+  it('admission quota skips a fallback whose credit budget is spent', async () => {
+    const now = Date.now()
+    const reset = new Date(now + 7 * 24 * 3600_000).toISOString()
+    const creditReset = new Date(now + 30 * 24 * 3600_000).toISOString()
+    seedAdmissionAccounts(['work-alt', 'client-alt'])
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+      await drainSidebarWrites()
+      writeAdmissionSidebarState({
+        fallbackIds: ['work-alt', 'client-alt'],
+        fallbackQuotas: {
+          'work-alt': {
+            ...admissionQuota(20, reset, now),
+            spendControl: spentCreditBudget(creditReset),
+          },
+          'client-alt': admissionQuota(20, reset, now),
+        },
+        fallbackAccountIds: {
+          'work-alt': 'chatgpt-work-alt',
+          'client-alt': 'chatgpt-client-alt',
+        },
+        activeId: 'work-alt',
+      })
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(response.status).toBe(200)
+      expect(seenAuth).toEqual(['Bearer client-alt-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
+  it('admission quota preserves the last fallback when every credit budget is spent', async () => {
+    const now = Date.now()
+    const reset = new Date(now + 7 * 24 * 3600_000).toISOString()
+    const creditReset = new Date(now + 30 * 24 * 3600_000).toISOString()
+    seedAdmissionAccounts(['work-alt'])
+    const seenAuth: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = mockAdmissionFetch(seenAuth)
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+      )
+      hooks = loaded.hooks
+      await drainSidebarWrites()
+      writeAdmissionSidebarState({
+        fallbackIds: ['work-alt'],
+        fallbackQuotas: {
+          'work-alt': {
+            ...admissionQuota(20, reset, now),
+            spendControl: spentCreditBudget(creditReset),
+          },
+        },
+        fallbackAccountIds: { 'work-alt': 'chatgpt-work-alt' },
+        mainQuota: admissionQuota(100, reset, now),
+      })
+
+      const response = await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        requestInit(),
+      )
+
+      expect(response.status).toBe(200)
+      expect(seenAuth).toEqual(['Bearer work-alt-token'])
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
   it('admission quota skips a file-exhausted fallback with an empty process quota cache', async () => {
     const now = Date.now()
     const reset = new Date(now + 7 * 24 * 3600_000).toISOString()

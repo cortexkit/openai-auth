@@ -512,3 +512,69 @@ describe('selectStickyCandidate', () => {
     expect(select(candidates).accountId).toBe('a')
   })
 })
+
+describe('selectStickyCandidate credit budget', () => {
+  const creditReset = new Date(now + 30 * 24 * 3600_000).toISOString()
+
+  function withSpendControl(
+    base: AccountQuota,
+    remainingPercent: number,
+  ): AccountQuota {
+    return {
+      ...base,
+      spendControl: {
+        limit: 2500,
+        used: 2500 - remainingPercent,
+        remaining: remainingPercent,
+        usedPercent: 100 - remainingPercent,
+        remainingPercent,
+        resetsAt: creditReset,
+        reached: false,
+      },
+    }
+  }
+
+  test('deprioritises a nearly-spent credit budget in cold placement', () => {
+    // Identical rate-limit windows: only the credit axis separates the two, so
+    // the roomier budget must win despite the nearly-spent account's earlier
+    // configured order.
+    expect(
+      select([
+        candidate('nearly-spent', withSpendControl(quota(50), 1), 0),
+        candidate('roomy', withSpendControl(quota(50), 80), 1),
+      ]).accountId,
+    ).toBe('roomy')
+  })
+
+  test('ignores a malformed credit reading instead of excluding the account', () => {
+    const malformed: AccountQuota = {
+      ...quota(50),
+      spendControl: {
+        limit: 2500,
+        used: 0,
+        remaining: 2500,
+        usedPercent: 0,
+        remainingPercent: Number.NaN,
+        reached: false,
+      },
+    }
+    expect(
+      select([
+        candidate('malformed', malformed, 0),
+        candidate('plain', quota(50), 1),
+      ]).accountId,
+    ).toBe('malformed')
+  })
+
+  test('routes a candidate with no spend control by its rate-limit windows alone', () => {
+    // Pins the exact pre-credit selection: an account with no spend control
+    // must be weighted by its rate-limit windows only, never treated as zero or
+    // full credit pressure.
+    expect(
+      select([
+        candidate('tight', quota(10), 0),
+        candidate('roomy', quota(90), 1),
+      ]),
+    ).toEqual({ accountId: 'roomy', quotaCheckedAt: now, source: 'weighted' })
+  })
+})
