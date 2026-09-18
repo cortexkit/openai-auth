@@ -881,16 +881,20 @@ export async function reconcileFallbackCustody(
             }
       return reason
     }
+    // `verifyServedFallbackIdentity` above has already read this claim from the
+    // same token and refused when it is missing, so by here it exists. Re-deriving
+    // it is how we get the value; re-checking it would be a branch nothing can
+    // enter, and a guard that cannot fire reads like a backstop while defending
+    // nothing. The refusal lives in one place, at :869, where the comment
+    // explaining why a bind path refuses what a verify path tolerates also lives.
     const claims = parseJwtClaims(served.payload.access)
     const servedAccountId = claims
       ? extractAccountIdFromClaims(claims)
       : undefined
     if (!servedAccountId) {
-      return {
-        kind: 'failed',
-        reason: 'nullClaim',
-        recordVersion: served.recordVersion,
-      }
+      throw new Error(
+        'unreachable: the served identity check refuses a missing claim before this point',
+      )
     }
     await deps.mutateAccounts((current) => {
       const target = current.accounts.find((a) => a.id === account.id)
