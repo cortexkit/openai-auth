@@ -777,12 +777,17 @@ export function mergePushedQuotaMetadata(
   for (const key of [
     'resetCreditsAvailable',
     'resetCreditsApplicable',
-    'spendControl',
   ] as const) {
     const carried = previous[key]
     if (merged[key] === undefined && carried !== undefined) {
       merged[key] = carried
     }
+  }
+  if (
+    merged.spendControl === undefined &&
+    previous.spendControl !== undefined
+  ) {
+    merged.spendControl = previous.spendControl
   }
   return merged
 }

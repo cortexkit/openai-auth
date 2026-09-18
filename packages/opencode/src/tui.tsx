@@ -254,7 +254,7 @@ export function buildQuotaRowsForDisplay(
   now: number,
   pacingEnabled: boolean,
 ): QuotaDisplayRow[] {
-  const rows = getPresentQuotaWindows(quota).map((row) => ({
+  const rows: QuotaDisplayRow[] = getPresentQuotaWindows(quota).map((row) => ({
     key: row.key,
     label: row.label,
     window: row.window,
