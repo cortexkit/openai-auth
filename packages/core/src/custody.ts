@@ -238,12 +238,8 @@ export type ServedIdentityCheck =
     }
 
 /**
- * Parse the served access token, compare its `chatgpt_account_id` claim
- * against the local account's `accountId`, and (when present) check the
- * served-account-id label field agrees. The vendored `ServedCredential` has
- * no served id today, so the labelDisagreesWithClaim branch is conditional —
- * the test asserting it is `test.skip` until the wire contract adds the
- * field.
+ * A vault-served account id, when present, must agree with the bound row and
+ * the credential's claim. Absence is an unknown assertion, not a mismatch.
  */
 export function verifyServedFallbackIdentity(
   served: ServedFallbackCredential,
@@ -256,7 +252,11 @@ export function verifyServedFallbackIdentity(
   if (account.accountId && claimId !== account.accountId) {
     return { reason: 'identityMismatch', detail: 'claimDiffersFromLocal' }
   }
-  if (served.servedAccountId && served.servedAccountId !== claimId) {
+  if (
+    served.servedAccountId &&
+    ((account.accountId && served.servedAccountId !== account.accountId) ||
+      served.servedAccountId !== claimId)
+  ) {
     return { reason: 'identityMismatch', detail: 'labelDisagreesWithClaim' }
   }
   return { reason: 'ok' }
@@ -344,9 +344,23 @@ export async function resolveFallbackAccess(
       return CUSTODY_REFUSE
     }
     const check = verifyServedFallbackIdentity(served, account)
-    if (check.reason !== 'ok') {
+    // This is a VERIFY site: a binding already exists and the check confirms
+    // it. `nullClaim` means the vault had nothing to assert, which proves
+    // neither the right identity nor the wrong one — refusing on it would turn
+    // the vault's silence into an outage with no local credential to fall back
+    // on. Only a positive contradiction refuses.
+    //
+    // `reconcileFallbackCustody` calls the same function on a BIND path and
+    // must keep refusing `nullClaim`: there, absence means there is nothing to
+    // record, and binding an identity nobody asserted is worse than refusing.
+    if (check.reason === 'identityMismatch') {
       log.warn('custody identity check refused', { reason: check.reason })
       return CUSTODY_REFUSE
+    }
+    if (check.reason === 'nullClaim') {
+      log.warn('custody identity unverifiable; serving', {
+        credentialId: handle,
+      })
     }
     return {
       token: served.payload.access,
@@ -428,6 +442,7 @@ export type ClaustrumCacheTransport = {
     material: string
     recordVersion: number
     expiresAtMs: number | null
+    accountId?: string
   }>
   statusCredential(handle: string): Promise<{
     ready: boolean
@@ -448,6 +463,7 @@ type ResidentRecord = {
   payload: { access: string }
   recordVersion: number
   expiresAtMs: number
+  servedAccountId?: string
 }
 
 type InflightSlot = {
@@ -593,6 +609,7 @@ export class ClaustrumCredentialCache {
           payload: { access: response.material },
           recordVersion: response.recordVersion,
           expiresAtMs,
+          servedAccountId: response.accountId,
         }
         this.#resident.set(handle, record)
         // A served version is not evidence it works; only a 2xx request resets
@@ -845,6 +862,7 @@ export async function reconcileFallbackCustody(
         payload: { access: served.payload.access },
         recordVersion: served.recordVersion,
         expiresAtMs: served.expiresAtMs,
+        servedAccountId: served.servedAccountId,
       },
       recheckAccount,
     )

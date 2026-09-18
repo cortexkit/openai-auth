@@ -1349,6 +1349,95 @@ describe('enroll-completion sweep', () => {
     runtime.dispose()
   })
 
+  it('keeps a corrupt fallback marker when the served credential asserts a different account', async () => {
+    const corrupt = corruptAccount()
+    const storage: AccountStorage = {
+      version: 1,
+      accounts: [corrupt],
+      claustrum: claustrumConfig({ mode: 'claustrum' }),
+    }
+    await writeCorruptStorageWithManifest(
+      storage,
+      enrollmentManifest(corrupt.id),
+    )
+    const { transport, captured } = makeTransport(() => ({
+      material: makeCustodyJwt('acct-other'),
+      recordVersion: 21,
+      expiresAtMs: Date.now() + 600_000,
+    }))
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({ storage, transport, detection: 'available' }),
+    )
+
+    await runtime.boot()
+
+    expect(captured.getCalls).not.toEqual([])
+    expect((await loadAccounts(getAccountPaths(configPath)))?.accounts).toEqual(
+      [corrupt],
+    )
+    runtime.dispose()
+  })
+
+  it('installs an unasserted corrupt fallback credential and logs only that absence', async () => {
+    const boot = async (
+      servedAccountId: string | undefined,
+      logger: ReturnType<typeof makeLogger>,
+    ) => {
+      const corrupt = corruptAccount()
+      const storage: AccountStorage = {
+        version: 1,
+        accounts: [corrupt],
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
+      }
+      await writeCorruptStorageWithManifest(
+        storage,
+        enrollmentManifest(corrupt.id),
+      )
+      const { transport } = makeTransport(() => ({
+        material: makeCustodyJwt(servedAccountId),
+        recordVersion: 22,
+        expiresAtMs: Date.now() + 600_000,
+      }))
+      const runtime = __createCustodyRuntimeForTest(
+        makeOptions({ storage, transport, detection: 'available', logger }),
+      )
+
+      await runtime.boot()
+      const accounts = (await loadAccounts(getAccountPaths(configPath)))
+        ?.accounts
+      runtime.dispose()
+      return accounts
+    }
+
+    const matchingLogger = makeLogger()
+    await boot('acct-1', matchingLogger)
+    expect(
+      matchingLogger.warn.mock.calls.map(([message, metadata]) => ({
+        message,
+        metadata,
+      })),
+    ).not.toContainEqual({
+      message: 'custody identity unverifiable; serving',
+      metadata: { credentialId: HANDLE },
+    })
+
+    const absentLogger = makeLogger()
+    const accounts = await boot(undefined, absentLogger)
+    expect(accounts?.[0]).toMatchObject({
+      refresh: TOMBSTONE_OPENAI,
+      accountId: 'acct-1',
+    })
+    expect(
+      absentLogger.warn.mock.calls.map(([message, metadata]) => ({
+        message,
+        metadata,
+      })),
+    ).toContainEqual({
+      message: 'custody identity unverifiable; serving',
+      metadata: { credentialId: HANDLE },
+    })
+  })
+
   for (const vaultState of ['serves', 'cold', 'needs_reauth'] as const) {
     it(`installs the exact fallback tombstone over a corrupt marker when the vault ${vaultState}`, async () => {
       const corrupt = corruptAccount()

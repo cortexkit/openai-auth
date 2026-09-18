@@ -31,10 +31,30 @@ export type ClaustrumClientOptions = {
   logger?: (errorClass: string) => void
 }
 
+/**
+ * Credential material plus optional non-secret identity metadata. Missing wire fields remain
+ * `undefined`; a present non-string identity value rejects the response as invalid.
+ */
 export type ServedCredential = {
   material: string
   recordVersion: number
   expiresAtMs: number | null
+  /**
+   * Operator-chosen record label for verifying a caller-held binding. It is not a routing key:
+   * account-scoped routing joins `accountId` with `recordVersion`.
+   */
+  credentialId?: string
+  /** Non-secret Code Assist project identity, present only for antigravity credentials. */
+  projectId?: string
+  /**
+   * Provider account identity the served token executes under. Account-scoped routing joins this
+   * value with `recordVersion`; it is neither the operator's credential label nor the bearer handle.
+   */
+  accountId?: string
+  /** Non-secret account display metadata captured at login. */
+  email?: string
+  /** Non-secret organization or workspace display metadata captured at login. */
+  orgName?: string
 }
 
 export type CredentialStatus = {
@@ -58,6 +78,10 @@ function asRecordVersion(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
     ? value
     : undefined
+}
+
+function isOptionalString(value: unknown): value is string | undefined {
+  return value === undefined || typeof value === 'string'
 }
 
 function decodeCredential(response: unknown, logUnknownClass: (errorClass: string) => void): ServedCredential {
@@ -85,10 +109,29 @@ function decodeCredential(response: unknown, logUnknownClass: (errorClass: strin
   if (expiresAtMs === undefined) {
     throw asCredentialError(response, 'invalid_expiry', logUnknownClass)
   }
+  const credentialId = result?.credential_id
+  const projectId = result?.project_id
+  const accountId = result?.account_id
+  const email = result?.email
+  const orgName = result?.org_name
+  if (
+    !isOptionalString(credentialId) ||
+    !isOptionalString(projectId) ||
+    !isOptionalString(accountId) ||
+    !isOptionalString(email) ||
+    !isOptionalString(orgName)
+  ) {
+    throw asCredentialError(response, 'invalid_response', logUnknownClass)
+  }
   return {
     material: new TextDecoder().decode(Uint8Array.from(payload)),
     recordVersion,
     expiresAtMs,
+    credentialId,
+    projectId,
+    accountId,
+    email,
+    orgName,
   }
 }
 

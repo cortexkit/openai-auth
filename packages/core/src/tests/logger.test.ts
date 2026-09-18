@@ -153,6 +153,21 @@ describe('logger redaction', () => {
     expect(txt).toContain('"chatgpt_account_id":"***REDACTED***"')
   })
 
+  it('redacts served identity email and organization values from emitted log lines', async () => {
+    initLogger({ file: logFile, level: 'debug' })
+    const { createLogger, flushForTest } = await import('../logger.ts')
+    const log = createLogger('transport')
+    log.info('served-identity', {
+      email: 'served.identity@example.test',
+      orgName: 'Served Identity Organization',
+    })
+    await flushForTest()
+    const txt = readFileSync(logFile, 'utf8')
+    expect(txt).not.toContain('served.identity@example.test')
+    expect(txt).not.toContain('Served Identity Organization')
+    expect(txt).toContain('***REDACTED***')
+  })
+
   it('keeps token COUNT keys (input_tokens, cached_tokens, output_tokens) unredacted', async () => {
     initLogger({ file: logFile, level: 'debug' })
     const { createLogger, flushForTest } = await import('../logger.ts')

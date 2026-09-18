@@ -53,6 +53,7 @@ import {
   enrollmentManifest,
   liveAccount,
   liveStorage,
+  makeCustodyJwt,
   makeSentinelAccount,
   TOMBSTONE_OPENAI,
 } from './custody-fixtures.ts'
@@ -882,18 +883,41 @@ describe('verifyServedFallbackIdentity', () => {
         payload: { access: jwtFor('acct-X') },
         recordVersion: 1,
         expiresAtMs: Date.now() + 60_000,
+        servedAccountId: 'acct-X',
       },
       acct,
     )
     expect(result).toEqual({ reason: 'ok' })
   })
 
-  // The conditional branch: the vendored ServedCredential has no served id,
-  // so the normalized servedAccountId is undefined today. The test is `test.skip`
-  // with a documented reason until the wire contract adds the field.
-  it.skip('labelDisagreesWithClaim branch when a served id is present and disagrees', () => {
-    // Placeholder — pending wire contract addition. Skipped intentionally so the
-    // missing field does not mask the implementation gap.
+  it('returns labelDisagreesWithClaim when the served account id disagrees with its token claim', () => {
+    const acct = liveAccount('main', { accountId: 'acct-X' })
+    const result = verifyServedFallbackIdentity(
+      {
+        payload: { access: jwtFor('acct-X') },
+        recordVersion: 1,
+        expiresAtMs: Date.now() + 60_000,
+        servedAccountId: 'acct-Y',
+      },
+      acct,
+    )
+    expect(result).toEqual({
+      reason: 'identityMismatch',
+      detail: 'labelDisagreesWithClaim',
+    })
+  })
+
+  it('serves when the vault omits an account id', () => {
+    const acct = liveAccount('main', { accountId: 'acct-X' })
+    const result = verifyServedFallbackIdentity(
+      {
+        payload: { access: jwtFor('acct-X') },
+        recordVersion: 1,
+        expiresAtMs: Date.now() + 60_000,
+      },
+      acct,
+    )
+    expect(result).toEqual({ reason: 'ok' })
   })
 })
 
@@ -970,6 +994,7 @@ describe('resolveFallbackAccess', () => {
               material: served,
               recordVersion: 7,
               expiresAtMs: Date.now() + 60_000,
+              accountId: 'acct-X',
             }
           },
           async statusCredential() {
@@ -999,6 +1024,66 @@ describe('resolveFallbackAccess', () => {
     expect(prov.handle).toBe(handle)
     expect(prov.recordVersion).toBe(7)
     expect(result.token).toBe(served)
+    cache.close()
+  })
+
+  it('refuses a served vault credential whose asserted account differs from its bound identity', async () => {
+    const handle = `ckh_${'m'.repeat(43)}`
+    const account = makeSentinelAccount({ accountId: 'acct-bound' })
+    const manifest = enrollmentManifest(account.id)
+    const cache = new ClaustrumCredentialCache({
+      connector: async () =>
+        makeFakeClient({
+          getCredential: async () => ({
+            material: makeCustodyJwt('acct-other'),
+            recordVersion: 8,
+            expiresAtMs: Date.now() + 60_000,
+            accountId: 'acct-other',
+          }),
+        }) as never,
+    })
+
+    expect(
+      await resolveFallbackAccess(
+        account,
+        liveStorage([account], {
+          claustrum: claustrumConfig({ mode: 'claustrum' }),
+        }),
+        manifest,
+        { cache, manifestHandle: handle },
+      ),
+    ).toBe(CUSTODY_REFUSE)
+    cache.close()
+  })
+
+  it('serves a vault credential whose account claim is absent', async () => {
+    const handle = `ckh_${'u'.repeat(43)}`
+    const account = makeSentinelAccount({ accountId: 'acct-bound' })
+    const access = makeCustodyJwt(undefined)
+    const cache = new ClaustrumCredentialCache({
+      connector: async () =>
+        makeFakeClient({
+          getCredential: async () => ({
+            material: access,
+            recordVersion: 9,
+            expiresAtMs: Date.now() + 60_000,
+          }),
+        }) as never,
+    })
+
+    const result = await resolveFallbackAccess(
+      account,
+      liveStorage([account], {
+        claustrum: claustrumConfig({ mode: 'claustrum' }),
+      }),
+      enrollmentManifest(account.id),
+      { cache, manifestHandle: handle },
+    )
+
+    expect(result).toEqual({
+      token: access,
+      provenance: { handle, recordVersion: 9 },
+    })
     cache.close()
   })
 
@@ -1118,6 +1203,7 @@ describe('reconcileFallbackCustody', () => {
             material: jwtFor('acct-completion'),
             recordVersion: 7,
             expiresAtMs: now + 60_000,
+            accountId: 'acct-completion',
           }),
         }) as never,
     })
@@ -1149,6 +1235,58 @@ describe('reconcileFallbackCustody', () => {
     expect(completed.expires).toBe(0)
     cache.close()
   })
+
+  it('does not tombstone an enrolling account when the served credential omits its identity claim', async () => {
+    const now = CUSTODY_FIXTURE_NOW
+    const account = liveAccount('completion-unasserted', {
+      accountId: 'acct-completion',
+    })
+    let storage = liveStorage([account])
+    let tombstoneWrites = 0
+    const cache = new ClaustrumCredentialCache({
+      now: () => now,
+      connector: async () =>
+        makeFakeClient({
+          getCredential: async () => ({
+            material: makeCustodyJwt(undefined),
+            recordVersion: 10,
+            expiresAtMs: now + 60_000,
+          }),
+        }) as never,
+    })
+
+    const result = await reconcileFallbackCustody(account, {
+      loadAccounts: async () => storage,
+      readCustodyManifest: async () => enrollmentManifest(account.id),
+      acquireRefreshFileLock,
+      configPath: join(handlesDir, 'completion-unasserted-store.json'),
+      paths: {
+        configPath: join(handlesDir, 'completion-unasserted-store.json'),
+        statePath: join(handlesDir, 'completion-unasserted-store-state.json'),
+      },
+      cache,
+      minTtlMs: 30_000,
+      mutateAccounts: async (mutate) => {
+        tombstoneWrites += 1
+        storage = mutate(storage) ?? storage
+        return storage
+      },
+      now: () => now,
+    })
+
+    expect(result).toEqual({
+      kind: 'failed',
+      reason: 'nullClaim',
+      recordVersion: 10,
+    })
+    expect(tombstoneWrites).toBe(0)
+    expect(storage.accounts[0]).toMatchObject({
+      access: account.access,
+      refresh: account.refresh,
+      expires: account.expires,
+    })
+    cache.close()
+  })
 })
 
 describe('binding-pending request reconciliation', () => {
@@ -1168,6 +1306,7 @@ describe('binding-pending request reconciliation', () => {
             material: jwtFor('acct-bound'),
             recordVersion: 9,
             expiresAtMs: Date.now() + 60_000,
+            accountId: 'acct-bound',
           }),
         }) as never,
     })
@@ -1227,6 +1366,7 @@ describe('binding-pending request reconciliation', () => {
               material: jwtFor('acct-serialized'),
               recordVersion: 10,
               expiresAtMs: Date.now() + 60_000,
+              accountId: 'acct-serialized',
             }
           },
         }) as never,
@@ -1238,6 +1378,7 @@ describe('binding-pending request reconciliation', () => {
             material: jwtFor('acct-serialized'),
             recordVersion: 11,
             expiresAtMs: Date.now() + 60_000,
+            accountId: 'acct-serialized',
           }),
         }) as never,
     })
@@ -1362,6 +1503,23 @@ describe('ClaustrumCredentialCache', () => {
     const second = await cache.get(handle, 30_000)
     expect(fake.calls.get).toBe(1)
     expect(second.recordVersion).toBe(first.recordVersion)
+    cache.close()
+  })
+
+  it('preserves the served account id for fallback identity verification', async () => {
+    const fake = makeFakeClient({
+      getCredential: async () => ({
+        material: 'acc-live',
+        recordVersion: 1,
+        expiresAtMs: Date.now() + 60_000,
+        accountId: 'acct-X',
+      }),
+    })
+    const cache = new ClaustrumCredentialCache({
+      connector: async () => fake as never,
+    })
+    const record = await cache.get(`ckh_${'h'.repeat(43)}`, 30_000)
+    expect(record.servedAccountId).toBe('acct-X')
     cache.close()
   })
 
