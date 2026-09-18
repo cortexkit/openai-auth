@@ -496,6 +496,72 @@ describe('OpenCode auth menu', () => {
     await expectMenuCompletionFailed(result)
   })
 
+  test('Check quotas serves a custody fallback through the injected vault resolver', async () => {
+    const paths = tempPaths()
+    const now = Date.now()
+    await seedStore(paths, [
+      account('custodied', {
+        access: '',
+        refresh: 'claustrum-tombstone:v1:openai',
+      }),
+    ])
+    const main = {
+      type: 'oauth',
+      refresh: 'main-refresh',
+      access: 'main-access',
+      expires: now + 86_400_000,
+    }
+    const { client, getAuth } = createClient(main)
+    const fetchedAuthorization: string[] = []
+    const fetchImpl = mock(async (_input: unknown, init?: RequestInit) => {
+      fetchedAuthorization.push(
+        new Headers(init?.headers).get('authorization') ?? '',
+      )
+      return new Response(
+        JSON.stringify({
+          rate_limit: {
+            primary_window: {
+              used_percent: 25,
+              limit_window_seconds: 18_000,
+            },
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    })
+    const isFallbackRefreshInert = mock(async () => true)
+    const resolveFallbackAccess = mock(async () => ({
+      token: 'vault-fallback-access',
+      provenance: { handle: 'vault-handle', recordVersion: 7 },
+    }))
+    const reportCustodyAuthFailure = mock(async () => {})
+    const methods = createAuthMethods({
+      client,
+      getAuth,
+      getPaths: () => paths,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      dependencies: {
+        showAuthMenu: async () => 'check-quotas',
+        custodyQuotaDeps: {
+          isFallbackRefreshInert,
+          resolveFallbackAccess,
+          reportCustodyAuthFailure,
+        } as never,
+      } as never,
+    })
+    spyOn(console, 'log').mockImplementation(() => {})
+
+    const result = await oauthMethod(methods, 0).authorize({})
+
+    expect(isFallbackRefreshInert).toHaveBeenCalledTimes(1)
+    expect(resolveFallbackAccess).toHaveBeenCalledTimes(1)
+    expect(fetchedAuthorization).toEqual([
+      'Bearer main-access',
+      'Bearer vault-fallback-access',
+    ])
+    await expectMenuCompletionFailed(result)
+  })
+
   test('Auth doctor leaves both store files byte-unchanged', async () => {
     const paths = tempPaths()
     await seedStore(paths, [account('main', { accountId: 'chatgpt-main' })])

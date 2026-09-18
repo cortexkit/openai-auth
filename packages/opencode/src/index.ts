@@ -1302,21 +1302,30 @@ export async function CodexAuthPlugin(
   let loaderGetAuth:
     | Parameters<NonNullable<NonNullable<Hooks['auth']>['loader']>>[0]
     | undefined
+  const custodyQuotaDepsForAuthMenu: Pick<
+    Parameters<typeof refreshAllQuota>[0],
+    | 'isFallbackRefreshInert'
+    | 'resolveFallbackAccess'
+    | 'reportCustodyAuthFailure'
+  > = {}
   const authMethods = createAuthMethods({
     client: input.client,
     getAuth: async () => loaderGetAuth?.(),
     fetchImpl: fetch,
-    dependencies: custodyOptions?.authorize
-      ? {
-          authorizeBrowser: custodyAuthorize(
-            custodyOptions.authorize.browser,
-            'Complete authorization in your browser. This window will close automatically.',
-          ),
-          authorizeHeadless: custodyAuthorize(
-            custodyOptions.authorize.headless,
-          ),
-        }
-      : undefined,
+    dependencies: {
+      ...(custodyOptions?.authorize
+        ? {
+            authorizeBrowser: custodyAuthorize(
+              custodyOptions.authorize.browser,
+              'Complete authorization in your browser. This window will close automatically.',
+            ),
+            authorizeHeadless: custodyAuthorize(
+              custodyOptions.authorize.headless,
+            ),
+          }
+        : {}),
+      custodyQuotaDeps: custodyQuotaDepsForAuthMenu,
+    },
   })
   const wrapCustodyAuthorize =
     (
@@ -1832,6 +1841,11 @@ export async function CodexAuthPlugin(
             recordVersion: params.recordVersion,
           })
         }
+        Object.assign(custodyQuotaDepsForAuthMenu, {
+          isFallbackRefreshInert: isFallbackAccountRefreshInert,
+          resolveFallbackAccess: resolveAccountAccessForCustody,
+          reportCustodyAuthFailure: reportAuthFailureForCustody,
+        })
         function buildRefreshAllQuotaDeps(
           overrides: Partial<
             Pick<
