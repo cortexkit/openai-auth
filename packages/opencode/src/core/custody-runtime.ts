@@ -139,6 +139,8 @@ export type CustodyRuntime = {
   isEnabled(): boolean
   /** Cache handle (undefined when custody is disabled). */
   getCache(): ClaustrumCredentialCache | undefined
+  /** Connect the cache on demand and return it. */
+  ensureCache(): Promise<ClaustrumCredentialCache | undefined>
   /** Transport handle (undefined when custody is disabled). */
   getTransport(): ClaustrumCacheTransportLike | undefined
   /** True if the detection step produced an `available` connection file. */
@@ -182,6 +184,11 @@ export function __createCustodyRuntimeForTest(
     isEnabled,
     wasDetected: () => detection?.status === 'available',
     getCache: () => cache,
+    async ensureCache() {
+      if (cache) return cache
+      await connectCache()
+      return cache
+    },
     getTransport: () => transport,
     getCustodyProjection: (account, currentNow) => {
       const cached = projectionByAccountId.get(account.id)

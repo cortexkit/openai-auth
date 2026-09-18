@@ -211,7 +211,23 @@ export async function enterClaustrumMode(
       return { status: 'aborted', outcomes, reason: 'mode-lock-unavailable' }
     locks.push(modeLock)
 
+    deps.warn?.(
+      `transition deps: ${JSON.stringify({
+        acquireLock: typeof deps.acquireLock,
+        withStoreTransaction: typeof deps.withStoreTransaction,
+        readManifest: typeof deps.readManifest,
+        preflight: typeof deps.preflight,
+        auth: typeof deps.auth,
+        authAll: typeof deps.auth?.all,
+        authGet: typeof deps.auth?.get,
+        authSet: typeof deps.auth?.set,
+        accountIds: deps.accountIds?.length,
+      })}`,
+    )
     const participants = transitionParticipants(deps.accountIds)
+    deps.warn?.(
+      `transition participants: ${participants.map((participant) => participant.id).join(',')}`,
+    )
     for (const participant of participants) {
       const accountLock = await deps.acquireLock({
         name: lockName(participant),
@@ -262,9 +278,13 @@ export async function enterClaustrumMode(
       const capturedGeneration =
         persisted?.storeGeneration ?? accountStoreGeneration(initial)
       if (!persisted) {
+        deps.warn?.(
+          `capturing main slot fingerprint; auth.get is ${typeof deps.auth?.get}`,
+        )
         const mainSlot = asCompleteMainOauthSlot(
           await deps.auth.get({ path: { id: 'openai' } }),
         )
+        deps.warn?.(`main slot captured: ${mainSlot ? 'complete' : 'absent'}`)
         if (mainSlot) {
           fingerprints.main = custodySlotFingerprint(
             mainSlot.access,
@@ -278,8 +298,16 @@ export async function enterClaustrumMode(
       }
       await step('captured')
 
+      deps.warn?.(
+        `handles resolved: isMap=${handles instanceof Map} size=${
+          handles instanceof Map ? handles.size : 'n/a'
+        }`,
+      )
       for (const participant of currentParticipants) {
         const handle = handles.get(participant.id)
+        deps.warn?.(
+          `participant ${participant.id}: handle=${handle ? 'yes' : 'NO'}`,
+        )
         if (!handle) {
           outcomes[participant.id] = 'no-handle'
           continue

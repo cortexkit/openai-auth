@@ -355,6 +355,7 @@ async function executeAccountCommand(
   ctx: CommandContext,
 ): Promise<OpenDialogPayload> {
   const tokens = args.trim().split(/\s+/).filter(Boolean)
+  log.info('account command parsed', { args, tokens })
   const storage = (await ctx.loadAccounts(storePaths(ctx))) ?? {
     version: 1 as const,
     accounts: [],
@@ -362,7 +363,12 @@ async function executeAccountCommand(
   const accounts = storage.accounts ?? []
 
   if (tokens[0] === 'claustrum') {
+    log.info('claustrum mode requested', {
+      hasEnterFn: typeof ctx.enterClaustrumMode === 'function',
+      accounts: accounts.length,
+    })
     if (!ctx.enterClaustrumMode) {
+      log.warn('claustrum refused: transition fn absent from command context')
       return {
         command: 'openai-account',
         text: '## Claustrum Unavailable\n\nThe custody runtime is not ready. Try again after OpenAI auth finishes initializing.',
@@ -372,7 +378,21 @@ async function executeAccountCommand(
         },
       }
     }
-    const result = await ctx.enterClaustrumMode()
+    log.info('claustrum transition starting', {})
+    let result: Awaited<ReturnType<NonNullable<typeof ctx.enterClaustrumMode>>>
+    try {
+      result = await ctx.enterClaustrumMode()
+    } catch (error) {
+      log.error('claustrum transition threw', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      throw error
+    }
+    log.info('claustrum transition finished', {
+      status: result.status,
+      reason: result.reason,
+      outcomes: result.outcomes,
+    })
     const nextStorage = (await ctx.loadAccounts(storePaths(ctx))) ?? {
       version: 1 as const,
       accounts: [],
@@ -398,7 +418,11 @@ async function executeAccountCommand(
   }
 
   if (tokens[0] === 'local') {
+    log.info('local mode requested', {
+      hasLeaveFn: typeof ctx.leaveClaustrumMode === 'function',
+    })
     if (!ctx.leaveClaustrumMode) {
+      log.warn('local refused: transition fn absent from command context')
       return {
         command: 'openai-account',
         text: '## Local Mode Unavailable\n\nThe custody runtime is not ready. Try again after OpenAI auth finishes initializing.',

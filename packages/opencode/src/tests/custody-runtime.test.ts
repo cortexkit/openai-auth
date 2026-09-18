@@ -268,6 +268,26 @@ function corruptAccount(
 // ---------------------------------------------------------------------------
 
 describe('custody detection', () => {
+  it('connects the cache on demand while the store is local', async () => {
+    const storage = liveStorage([], {
+      claustrum: claustrumConfig({ mode: 'local' }),
+    })
+    const { transport } = makeTransport(() => {
+      throw new Error('credential reads are not part of cache connection')
+    })
+    const runtime = __createCustodyRuntimeForTest(
+      makeOptions({ storage, transport, detection: 'available' }),
+    )
+
+    await runtime.boot()
+
+    expect(runtime.getCache()).toBeUndefined()
+    const cache = await runtime.ensureCache()
+    expect(cache).toBe(runtime.getCache())
+    expect(runtime.getCache()).toBeDefined()
+    runtime.dispose()
+  })
+
   it('logs once at info and creates no client or timer when the connection file is absent', async () => {
     const transport: ClaustrumCacheTransportLike = {
       getCredential: mock(async () => {
