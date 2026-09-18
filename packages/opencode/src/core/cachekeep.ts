@@ -35,7 +35,13 @@ export interface Target {
 export interface CacheKeepManagerOptions {
   fetchImpl: typeof fetch
   getMainToken: () => Promise<string>
-  refreshFallback: (accountId: string) => Promise<string>
+  refreshFallback: (accountId: string) => Promise<
+    | string
+    | {
+        token: string
+        onAuthFailure?: (status: number) => Promise<void>
+      }
+  >
   codexResponsesUrl: string
   logger: {
     info: (msg: string, data?: unknown) => void
@@ -57,6 +63,13 @@ export interface CacheKeepManagerOptions {
   /** Returns whether main-agent targets bypass only the idle warm cap. */
   getSustain?: () => boolean
 }
+
+type CacheKeepFallbackAccess =
+  | string
+  | {
+      token: string
+      onAuthFailure?: (status: number) => Promise<void>
+    }
 
 export interface CacheKeepStatus {
   running: boolean
@@ -310,7 +323,9 @@ export class CacheKeepManager {
   private readonly targets = new Map<string, Target>()
   private readonly fetchImpl: typeof fetch
   private readonly getMainToken: () => Promise<string>
-  private readonly refreshFallback: (accountId: string) => Promise<string>
+  private readonly refreshFallback: (
+    accountId: string,
+  ) => Promise<CacheKeepFallbackAccess>
   private readonly codexResponsesUrl: string
   private readonly log: CacheKeepManagerOptions['logger']
   private readonly now: () => number
@@ -631,9 +646,16 @@ export class CacheKeepManager {
   private async prewarm(sessionKey: string, target: Target): Promise<void> {
     // Resolve token
     let accessToken: string
+    let onAuthFailure: ((status: number) => Promise<void>) | undefined
     try {
       if (target.accountId && target.accountId !== 'main') {
-        accessToken = await this.refreshFallback(target.accountId)
+        const resolved = await this.refreshFallback(target.accountId)
+        if (typeof resolved === 'string') {
+          accessToken = resolved
+        } else {
+          accessToken = resolved.token
+          onAuthFailure = resolved.onAuthFailure
+        }
       } else {
         accessToken = await this.getMainToken()
       }
@@ -713,6 +735,7 @@ export class CacheKeepManager {
 
       if (!response.ok) {
         target.backoffUntil = this.now() + BACKOFF_MS
+        if (response.status === 401) await onAuthFailure?.(response.status)
         this.log.warn(
           'cachekeep failed',
           this.logPayload({

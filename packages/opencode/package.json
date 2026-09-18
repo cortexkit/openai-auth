@@ -55,6 +55,7 @@
     "@cortexkit/openai-auth-core": "workspace:*"
   },
   "dependencies": {
+    "@cortexkit/subc-client": "^0.8.1",
     "@opentui/core": ">=0.5.11",
     "@opentui/solid": ">=0.5.11",
     "ai": "^7.0.99",

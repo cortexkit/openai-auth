@@ -22,11 +22,15 @@
     "packages/core": {
       "name": "@cortexkit/openai-auth-core",
       "version": "0.0.0",
+      "dependencies": {
+        "@cortexkit/subc-client": "^0.8.1",
+      },
     },
     "packages/opencode": {
       "name": "@cortexkit/opencode-openai-auth",
-      "version": "0.7.2",
+      "version": "0.8.0",
       "dependencies": {
+        "@cortexkit/subc-client": "^0.8.1",
         "@opentui/core": ">=0.5.11",
         "@opentui/solid": ">=0.5.11",
         "ai": "^7.0.99",
@@ -42,7 +46,7 @@
     },
     "packages/pi": {
       "name": "@cortexkit/pi-openai-auth",
-      "version": "0.7.2",
+      "version": "0.8.0",
       "devDependencies": {
         "@cortexkit/openai-auth-core": "workspace:*",
       },
@@ -193,6 +197,8 @@
     "@cortexkit/opencode-openai-auth": ["@cortexkit/opencode-openai-auth@workspace:packages/opencode"],
 
     "@cortexkit/pi-openai-auth": ["@cortexkit/pi-openai-auth@workspace:packages/pi"],
+
+    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.8.1", "", {}, "sha512-8U9w3AnSff0QYlLVzcKOuTULakRtVpcGJrquGHxOQQlWZGzXZdCs8nroLMeoM2xhFGwxIh8xFk832w1KG6akAA=="],
 
     "@earendil-works/chord": ["@earendil-works/chord@0.85.1", "", { "dependencies": { "esbuild": "0.28.1" } }, "sha512-VDlkEC3dhCzQ5fcyH1OhG19dq+6jCn+rqc/iXFivwDYGR5anwo2RCiXij9PpHhqNR5GuhhE+Er69Zi1Sn4eY6w=="],
 

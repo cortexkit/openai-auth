@@ -619,7 +619,7 @@ export function openCommandDialog(
   }
 
   if (payload.command === 'openai-account') {
-    openAccountDialog(api, apply, sessionId)
+    openAccountDialog(api, apply, sessionId, payload)
     return
   }
 
@@ -676,12 +676,71 @@ export function buildAccountDialogRows(
   ]
 }
 
+export function accountDialogModeOption(mode: unknown) {
+  const claustrum = mode === 'claustrum'
+  return {
+    title: claustrum ? 'Leave Claustrum' : 'Enter Claustrum',
+    value: claustrum ? '__local__' : '__claustrum__',
+    description: claustrum
+      ? 'Require fresh local logins before local refresh resumes'
+      : 'Verify every enabled account before custody takes over',
+  }
+}
+
+export function buildFallbackAccountOptions(input: {
+  id: string
+  label?: string
+  enabled: boolean
+  index: number
+  count: number
+}) {
+  const name = input.label ?? input.id
+  const options: Array<{
+    title: string
+    value: string
+    description: string
+  }> = [
+    {
+      title: input.enabled ? 'Disable' : 'Enable',
+      value: input.enabled ? 'disable' : 'enable',
+      description: `${input.enabled ? 'Disable' : 'Enable'} ${name}`,
+    },
+    {
+      title: 'Remove',
+      value: 'remove',
+      description: `Remove ${name}`,
+    },
+  ]
+  if (input.index > 0) {
+    options.push({
+      title: 'Move up',
+      value: 'move_up',
+      description: 'Swap with the preceding fallback',
+    })
+  }
+  if (input.index < input.count - 1) {
+    options.push({
+      title: 'Move down',
+      value: 'move_down',
+      description: 'Swap with the following fallback',
+    })
+  }
+  options.push({
+    title: 'Back',
+    value: 'back',
+    description: 'Return to account list',
+  })
+  return options
+}
+
 function openAccountDialog(
   api: TuiPluginApi,
   apply: ApplyFn,
   sessionId?: string,
+  payload?: OpenDialogPayload,
 ) {
   const DialogConfirm = api.ui.DialogConfirm
+  let claustrumMode = payload?.knobs.claustrumMode
 
   function showL1() {
     void getSidebarState().then((state) => {
@@ -691,6 +750,7 @@ function openAccountDialog(
         <DialogSelectInner
           title='OpenAI Accounts'
           options={[
+            accountDialogModeOption(claustrumMode),
             ...buildAccountDialogRows(state, sessionId),
             {
               title: 'Add account\u2026',
@@ -699,6 +759,19 @@ function openAccountDialog(
             },
           ]}
           onSelect={(option) => {
+            if (
+              option.value === '__claustrum__' ||
+              option.value === '__local__'
+            ) {
+              const args =
+                option.value === '__claustrum__' ? 'claustrum' : 'local'
+              void apply('openai-account', args).then((r) => {
+                api.ui.toast({ message: r.text })
+                claustrumMode = r.knobs.claustrumMode
+                showL1()
+              })
+              return
+            }
             if (option.value === '__add__') {
               showAddFlow()
               return
@@ -722,44 +795,12 @@ function openAccountDialog(
         showL1()
         return
       }
-      const options: Array<{
-        title: string
-        value: string
-        description: string
-      }> = []
-
-      options.push({
-        title: 'Remove',
-        value: 'remove',
-        description: `Remove ${fb.label ?? fb.id}`,
-      })
-
-      if (fbIndex > 0) {
-        const neighbor = state.fallbacks[fbIndex - 1]
-        if (neighbor) {
-          options.push({
-            title: 'Move up',
-            value: 'move_up',
-            description: `Swap with ${neighbor.label ?? neighbor.id}`,
-          })
-        }
-      }
-
-      if (fbIndex < state.fallbacks.length - 1) {
-        const neighbor = state.fallbacks[fbIndex + 1]
-        if (neighbor) {
-          options.push({
-            title: 'Move down',
-            value: 'move_down',
-            description: `Swap with ${neighbor.label ?? neighbor.id}`,
-          })
-        }
-      }
-
-      options.push({
-        title: 'Back',
-        value: 'back',
-        description: 'Return to account list',
+      const options = buildFallbackAccountOptions({
+        id: fb.id,
+        label: fb.label,
+        enabled: fb.enabled,
+        index: fbIndex,
+        count: state.fallbacks.length,
       })
 
       api.ui.dialog.setSize('xlarge')
@@ -783,6 +824,15 @@ function openAccountDialog(
                   onCancel={() => showL2Fallback(id)}
                 />
               ))
+              return
+            }
+            if (option.value === 'enable' || option.value === 'disable') {
+              void apply('openai-account', `${option.value} ${id}`).then(
+                (r) => {
+                  api.ui.toast({ message: r.text })
+                  showL1()
+                },
+              )
               return
             }
             if (option.value === 'move_up') {

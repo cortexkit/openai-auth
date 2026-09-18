@@ -19,5 +19,8 @@
     "test": "bun test src/tests",
     "typecheck": "tsc",
     "types": "tsc"
+  },
+  "dependencies": {
+    "@cortexkit/subc-client": "^0.8.1"
   }
 }
