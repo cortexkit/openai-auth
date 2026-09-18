@@ -1235,6 +1235,58 @@ describe('reconcileFallbackCustody', () => {
     expect(completed.expires).toBe(0)
     cache.close()
   })
+
+  it('does not tombstone an enrolling account when the served credential omits its identity claim', async () => {
+    const now = CUSTODY_FIXTURE_NOW
+    const account = liveAccount('completion-unasserted', {
+      accountId: 'acct-completion',
+    })
+    let storage = liveStorage([account])
+    let tombstoneWrites = 0
+    const cache = new ClaustrumCredentialCache({
+      now: () => now,
+      connector: async () =>
+        makeFakeClient({
+          getCredential: async () => ({
+            material: makeCustodyJwt(undefined),
+            recordVersion: 10,
+            expiresAtMs: now + 60_000,
+          }),
+        }) as never,
+    })
+
+    const result = await reconcileFallbackCustody(account, {
+      loadAccounts: async () => storage,
+      readCustodyManifest: async () => enrollmentManifest(account.id),
+      acquireRefreshFileLock,
+      configPath: join(handlesDir, 'completion-unasserted-store.json'),
+      paths: {
+        configPath: join(handlesDir, 'completion-unasserted-store.json'),
+        statePath: join(handlesDir, 'completion-unasserted-store-state.json'),
+      },
+      cache,
+      minTtlMs: 30_000,
+      mutateAccounts: async (mutate) => {
+        tombstoneWrites += 1
+        storage = mutate(storage) ?? storage
+        return storage
+      },
+      now: () => now,
+    })
+
+    expect(result).toEqual({
+      kind: 'failed',
+      reason: 'nullClaim',
+      recordVersion: 10,
+    })
+    expect(tombstoneWrites).toBe(0)
+    expect(storage.accounts[0]).toMatchObject({
+      access: account.access,
+      refresh: account.refresh,
+      expires: account.expires,
+    })
+    cache.close()
+  })
 })
 
 describe('binding-pending request reconciliation', () => {
