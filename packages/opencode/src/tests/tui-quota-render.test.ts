@@ -254,7 +254,7 @@ describe('dynamic quota TUI rows', () => {
     expect(tui.getAccountMetadataRows?.()).toEqual([])
   })
 
-  test('renders rounded credit-budget amounts with the reported unit', () => {
+  test('renders grouped credit amounts with a pluralised unit', () => {
     const rows = getAccountMetadataRows(undefined, {
       limit: 2500,
       used: 501.7787666320801,
@@ -269,10 +269,24 @@ describe('dynamic quota TUI rows', () => {
 
     expect(rows).toContainEqual({
       label: 'credits',
-      value: '502 / 2.5k credit',
+      value: '502 / 2,500 credits',
     })
     expect(rendered).not.toContain('501.7787666320801')
     expect(rendered).not.toContain('$')
+  })
+
+  test('a single-credit budget keeps the unit singular', () => {
+    expect(
+      getAccountMetadataRows(undefined, {
+        limit: 1,
+        used: 1,
+        remaining: 0,
+        usedPercent: 100,
+        remainingPercent: 0,
+        unit: 'credit',
+        reached: true,
+      }),
+    ).toContainEqual({ label: 'credits', value: '1 / 1 credit' })
   })
 
   test('modal routing apply sends sessionId on its RPC request', () => {

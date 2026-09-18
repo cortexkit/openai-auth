@@ -257,8 +257,10 @@ function formatSpendControlLine(
     ? ` · resets ${spendControl.resetsAt}`
     : ''
   const amount = (value: number) => Math.round(value).toLocaleString('en-US')
-  const unit = spendControl.unit ?? 'units'
-  return `${indent}- credits: ${Math.round(spendControl.usedPercent)}% used (${amount(spendControl.used)} / ${amount(spendControl.limit)} ${unit}, ${amount(spendControl.remaining)} remaining)${resets}`
+  const unit = spendControl.unit ?? 'unit'
+  const plural =
+    spendControl.limit === 1 || unit.endsWith('s') ? unit : `${unit}s`
+  return `${indent}- credits: ${Math.round(spendControl.usedPercent)}% used (${amount(spendControl.used)} / ${amount(spendControl.limit)} ${plural}, ${amount(spendControl.remaining)} remaining)${resets}`
 }
 
 async function executeQuotaCommand(

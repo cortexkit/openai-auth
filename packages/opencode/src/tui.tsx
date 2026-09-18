@@ -329,15 +329,22 @@ export function getQuotaMetadataRows(
   return rows
 }
 
-function formatCompactSpendAmount(value: number): string {
-  if (value < 1000) return String(Math.round(value))
-  return `${(value / 1000).toFixed(value % 1000 === 0 ? 0 : 1)}k`
+function formatGroupedAmount(value: number): string {
+  return Math.round(value).toLocaleString('en-US')
+}
+
+// The unit names the budget the amounts are counted in, so it agrees with the
+// total rather than staying singular against a plural quantity.
+function pluralizeUnit(unit: string, count: number): string {
+  if (count === 1) return unit
+  return unit.endsWith('s') ? unit : `${unit}s`
 }
 
 export function formatSpendControlAmounts(
   spendControl: SpendControlReading,
 ): string {
-  return `${formatCompactSpendAmount(spendControl.used)} / ${formatCompactSpendAmount(spendControl.limit)} ${spendControl.unit ?? 'units'}`
+  const unit = pluralizeUnit(spendControl.unit ?? 'unit', spendControl.limit)
+  return `${formatGroupedAmount(spendControl.used)} / ${formatGroupedAmount(spendControl.limit)} ${unit}`
 }
 
 export function getAccountMetadataRows(
