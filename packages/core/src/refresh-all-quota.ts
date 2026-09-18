@@ -128,6 +128,11 @@ export interface RefreshAllQuotaDeps {
   ) => Promise<
     FallbackAccessResolution | typeof CUSTODY_REFUSE | typeof CUSTODY_EXCLUDED
   >
+  resolveMainAccess?: (
+    storage: AccountStorage,
+  ) => Promise<
+    FallbackAccessResolution | typeof CUSTODY_REFUSE | typeof CUSTODY_EXCLUDED
+  >
   reportCustodyAuthFailure?: (params: {
     handle: string
     providerStatus: number
@@ -230,8 +235,24 @@ export async function refreshAllQuota(
           recordOutcome({ account: 'main', ok: true })
         } else {
           if (!auth.access || (auth.expires ?? 0) < deps.now()) {
-            const tokens = await deps.refreshMainWithLease()
-            auth = { ...auth, access: tokens.access, expires: tokens.expires }
+            const resolvedMain = deps.resolveMainAccess
+              ? await deps.resolveMainAccess(
+                  storage ?? { version: 1, accounts: [] },
+                )
+              : CUSTODY_EXCLUDED
+            if (resolvedMain === CUSTODY_REFUSE) {
+              recordOutcome({
+                account: 'main',
+                ok: false,
+                error: 'custody refused',
+              })
+              auth = { ...auth, access: undefined }
+            } else if (resolvedMain !== CUSTODY_EXCLUDED) {
+              auth = { ...auth, access: resolvedMain.token }
+            } else {
+              const tokens = await deps.refreshMainWithLease()
+              auth = { ...auth, access: tokens.access, expires: tokens.expires }
+            }
           }
 
           if (auth.access) {
@@ -258,7 +279,7 @@ export async function refreshAllQuota(
               quotaUpdated = true
               recordOutcome({ account: 'main', ok: true })
             }
-          } else {
+          } else if (!results.some((result) => result.account === 'main')) {
             recordOutcome({
               account: 'main',
               ok: false,

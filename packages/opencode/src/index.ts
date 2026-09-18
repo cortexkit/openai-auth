@@ -1910,6 +1910,7 @@ export async function CodexAuthPlugin(
             whamFn: whamUsageFn,
             isFallbackRefreshInert: isFallbackAccountRefreshInert,
             resolveFallbackAccess: resolveAccountAccessForCustody,
+            resolveMainAccess: resolveMainAccessForCustody,
             reportCustodyAuthFailure: reportAuthFailureForCustody,
             ...(respectBackoff === undefined ? {} : { respectBackoff }),
             ...(skipFresherThanMs === undefined ? {} : { skipFresherThanMs }),
