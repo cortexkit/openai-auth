@@ -8,7 +8,7 @@ import {
   snapshotCheckedAt,
   sustainableWindowWeight,
 } from '../core/sticky-routing.ts'
-import type { AccountQuota } from '../sidebar-state.ts'
+import { type AccountQuota, isQuotaExhausted } from '../sidebar-state.ts'
 
 const now = Date.UTC(2026, 7, 10, 12, 0, 0)
 
@@ -347,6 +347,109 @@ describe('decideStickyBreak', () => {
         now,
       }),
     ).toEqual({ action: 'retain', reason: 'healthy' })
+  })
+})
+
+describe('decideStickyBreak credit budget', () => {
+  const creditReset = new Date(now + 30 * 24 * 3600_000).toISOString()
+
+  function withSpendControl(
+    base: AccountQuota,
+    overrides: Partial<NonNullable<AccountQuota['spendControl']>> = {},
+  ): AccountQuota {
+    return {
+      ...base,
+      spendControl: {
+        limit: 2500,
+        used: 2500,
+        remaining: 0,
+        usedPercent: 100,
+        remainingPercent: 0,
+        resetsAt: creditReset,
+        reached: true,
+        ...overrides,
+      },
+    }
+  }
+
+  test('migrates a pin on an account with a reached credit budget', () => {
+    expect(
+      decideStickyBreak({
+        quota: withSpendControl(quota(50)),
+        status: 400,
+        now,
+      }),
+    ).toEqual({ action: 'migrate', reason: 'exhausted', resetsAt: creditReset })
+  })
+
+  test('retains a pin on a stale credit reading', () => {
+    expect(
+      decideStickyBreak({
+        quota: withSpendControl(quota(50, now - QUOTA_STALENESS_MS - 1)),
+        status: 400,
+        now,
+      }),
+    ).toEqual({ action: 'retain', reason: 'stale' })
+  })
+
+  test.each([
+    ['a malformed reset', { resetsAt: 'not-a-date' }],
+    ['a missing reset', { resetsAt: undefined }],
+    ['a lapsed reset', { resetsAt: new Date(now - 3600_000).toISOString() }],
+  ])(
+    'retains a pin on a reached credit budget with %s',
+    (_label, overrides) => {
+      expect(
+        decideStickyBreak({
+          quota: withSpendControl(quota(50), overrides),
+          status: 400,
+          now,
+        }),
+      ).toEqual({ action: 'retain', reason: 'healthy' })
+    },
+  )
+
+  test('decides a no-spend-control account exactly as today', () => {
+    expect(decideStickyBreak({ quota: quota(50), status: 400, now })).toEqual({
+      action: 'retain',
+      reason: 'healthy',
+    })
+    expect(
+      decideStickyBreak({
+        quota: quota(0, now, creditReset),
+        status: 400,
+        now,
+      }),
+    ).toEqual({
+      action: 'migrate',
+      reason: 'exhausted',
+      windowKey: 'primary',
+      resetsAt: creditReset,
+    })
+  })
+
+  test('trusts the reached boolean over a spent-looking percentage', () => {
+    expect(
+      decideStickyBreak({
+        quota: withSpendControl(quota(50), {
+          reached: false,
+          usedPercent: 100,
+          remainingPercent: 0,
+        }),
+        status: 400,
+        now,
+      }),
+    ).toEqual({ action: 'retain', reason: 'healthy' })
+  })
+
+  test('admission and migration agree on a spent credit budget', () => {
+    const spent = withSpendControl(quota(50))
+    expect(isQuotaExhausted(spent, now)).toBe(true)
+    expect(decideStickyBreak({ quota: spent, status: 400, now })).toEqual({
+      action: 'migrate',
+      reason: 'exhausted',
+      resetsAt: creditReset,
+    })
   })
 })
 
