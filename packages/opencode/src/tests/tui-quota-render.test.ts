@@ -4,6 +4,7 @@ import {
   buildApplyRequest,
   buildQuotaRowsForDisplay,
   buildRoutingRowsForDisplay,
+  getAccountMetadataRows,
   getQuotaMetadataRows,
   isQuotaLoaded,
 } from '../tui.tsx'
@@ -224,6 +225,27 @@ describe('dynamic quota TUI rows', () => {
       { label: 'resets', value: '2' },
     ])
     expect(tui.getAccountMetadataRows?.()).toEqual([])
+  })
+
+  test('renders rounded credit-budget amounts with the reported unit', () => {
+    const rows = getAccountMetadataRows(undefined, {
+      limit: 2500,
+      used: 501.7787666320801,
+      remaining: 1998.22123336792,
+      usedPercent: 20.071150665283206,
+      remainingPercent: 79.9288493347168,
+      unit: 'credit',
+      source: 'individual_limit',
+      reached: false,
+    })
+    const rendered = JSON.stringify(rows)
+
+    expect(rows).toContainEqual({
+      label: 'credits',
+      value: '502 / 2.5k credit',
+    })
+    expect(rendered).not.toContain('501.7787666320801')
+    expect(rendered).not.toContain('$')
   })
 
   test('modal routing apply sends sessionId on its RPC request', () => {

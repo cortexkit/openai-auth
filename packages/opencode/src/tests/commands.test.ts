@@ -1868,7 +1868,7 @@ describe('commands', () => {
           usedPercent: 20.071150665283206,
           remainingPercent: 79.9288493347168,
           resetsAt: '2026-10-01T00:00:00.000Z',
-          unit: 'credits',
+          unit: 'credit',
           source: 'individual_limit',
           reached: false,
         },
@@ -1896,7 +1896,7 @@ describe('commands', () => {
     )
 
     expect(mainSection).toContain(
-      '- credits: 20% used (502 / 2500, 1998 remaining) · resets 2026-10-01T00:00:00.000Z',
+      '- credits: 20% used (502 / 2,500 credit, 1,998 remaining) · resets 2026-10-01T00:00:00.000Z',
     )
     expect(fallbackSection).not.toContain('credits:')
   })

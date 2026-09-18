@@ -33,6 +33,7 @@ import {
   resolveSessionSidebarRouting,
   resolveSessionStickyAccount,
   type SidebarState,
+  type SpendControlReading,
 } from './sidebar-state.js'
 import { openCommandDialog } from './tui/command-dialogs.js'
 import {
@@ -297,12 +298,32 @@ export function getQuotaMetadataRows(
   return rows
 }
 
+function formatCompactSpendAmount(value: number): string {
+  if (value < 1000) return String(Math.round(value))
+  return `${(value / 1000).toFixed(value % 1000 === 0 ? 0 : 1)}k`
+}
+
+export function formatSpendControlAmounts(
+  spendControl: SpendControlReading,
+): string {
+  return `${formatCompactSpendAmount(spendControl.used)} / ${formatCompactSpendAmount(spendControl.limit)} ${spendControl.unit ?? 'units'}`
+}
+
 export function getAccountMetadataRows(
   resetCredits: number | undefined,
+  spendControl?: SpendControlReading,
 ): Array<{ label: string; value: string }> {
-  return resetCredits === undefined
-    ? []
-    : [{ label: 'resets', value: String(resetCredits) }]
+  const rows: Array<{ label: string; value: string }> = []
+  if (spendControl) {
+    rows.push({
+      label: 'credits',
+      value: formatSpendControlAmounts(spendControl),
+    })
+  }
+  if (resetCredits !== undefined) {
+    rows.push({ label: 'resets', value: String(resetCredits) })
+  }
+  return rows
 }
 
 // Quota window row: muted label left, tone-colored bar + percentage right,
@@ -434,7 +455,12 @@ function AccountBlock(props: {
           </For>
         </Show>
       </Show>
-      <For each={getAccountMetadataRows(props.resetCredits)}>
+      <For
+        each={getAccountMetadataRows(
+          props.resetCredits,
+          props.quota?.spendControl,
+        )}
+      >
         {(row) => (
           <StatRow
             theme={props.theme}
