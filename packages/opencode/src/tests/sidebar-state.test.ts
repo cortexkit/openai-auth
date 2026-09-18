@@ -3315,6 +3315,66 @@ describe('isQuotaExhausted / exhaustedQuotaResetAt', () => {
     const quota: AccountQuota = { secondary: windowAt(30, future) }
     expect(isQuotaExhausted(quota, now)).toBe(false)
   })
+
+  const spendControlAt = (
+    reached: boolean,
+    resetsAt?: string,
+  ): AccountQuota['spendControl'] => ({
+    limit: 2500,
+    used: reached ? 2500 : 500,
+    remaining: reached ? 0 : 2000,
+    usedPercent: reached ? 100 : 20,
+    remainingPercent: reached ? 0 : 80,
+    ...(resetsAt === undefined ? {} : { resetsAt }),
+    reached,
+  })
+
+  test('a reached credit budget with a future reset exhausts the account', () => {
+    const quota: AccountQuota = {
+      primary: windowAt(20, future),
+      spendControl: spendControlAt(true, laterFuture),
+    }
+    expect(isQuotaExhausted(quota, now)).toBe(true)
+    expect(exhaustedQuotaResetAt(quota, now)).toEqual({
+      resetsAt: laterFuture,
+      resetAtMs: Date.parse(laterFuture),
+    })
+  })
+
+  test('a healthy credit budget does not exhaust the account', () => {
+    const quota: AccountQuota = {
+      primary: windowAt(20, future),
+      spendControl: spendControlAt(false, laterFuture),
+    }
+    expect(isQuotaExhausted(quota, now)).toBe(false)
+  })
+
+  test('the credit reset competes with window resets for the earliest', () => {
+    const quota: AccountQuota = {
+      primary: windowAt(100, laterFuture),
+      spendControl: spendControlAt(true, future),
+    }
+    expect(exhaustedQuotaResetAt(quota, now)).toEqual({
+      resetsAt: future,
+      resetAtMs: Date.parse(future),
+    })
+  })
+
+  test.each([
+    ['missing reset', spendControlAt(true)],
+    ['malformed reset', spendControlAt(true, 'not-a-date')],
+    ['reset already past', spendControlAt(true, past)],
+  ])(
+    'fails open on a reached credit budget with %s',
+    (_label, spendControl) => {
+      const quota: AccountQuota = {
+        primary: windowAt(20, future),
+        spendControl,
+      }
+      expect(isQuotaExhausted(quota, now)).toBe(false)
+      expect(exhaustedQuotaResetAt(quota, now)).toBeUndefined()
+    },
+  )
 })
 test('machine write ranks a fresh secondary window above an older incoming primary', async () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-secondary-fresh-'))

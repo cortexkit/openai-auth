@@ -8,7 +8,7 @@ import {
   snapshotCheckedAt,
   sustainableWindowWeight,
 } from '../core/sticky-routing.ts'
-import type { AccountQuota } from '../sidebar-state.ts'
+import { type AccountQuota, isQuotaExhausted } from '../sidebar-state.ts'
 
 const now = Date.UTC(2026, 7, 10, 12, 0, 0)
 
@@ -350,6 +350,109 @@ describe('decideStickyBreak', () => {
   })
 })
 
+describe('decideStickyBreak credit budget', () => {
+  const creditReset = new Date(now + 30 * 24 * 3600_000).toISOString()
+
+  function withSpendControl(
+    base: AccountQuota,
+    overrides: Partial<NonNullable<AccountQuota['spendControl']>> = {},
+  ): AccountQuota {
+    return {
+      ...base,
+      spendControl: {
+        limit: 2500,
+        used: 2500,
+        remaining: 0,
+        usedPercent: 100,
+        remainingPercent: 0,
+        resetsAt: creditReset,
+        reached: true,
+        ...overrides,
+      },
+    }
+  }
+
+  test('migrates a pin on an account with a reached credit budget', () => {
+    expect(
+      decideStickyBreak({
+        quota: withSpendControl(quota(50)),
+        status: 400,
+        now,
+      }),
+    ).toEqual({ action: 'migrate', reason: 'exhausted', resetsAt: creditReset })
+  })
+
+  test('retains a pin on a stale credit reading', () => {
+    expect(
+      decideStickyBreak({
+        quota: withSpendControl(quota(50, now - QUOTA_STALENESS_MS - 1)),
+        status: 400,
+        now,
+      }),
+    ).toEqual({ action: 'retain', reason: 'stale' })
+  })
+
+  test.each([
+    ['a malformed reset', { resetsAt: 'not-a-date' }],
+    ['a missing reset', { resetsAt: undefined }],
+    ['a lapsed reset', { resetsAt: new Date(now - 3600_000).toISOString() }],
+  ])(
+    'retains a pin on a reached credit budget with %s',
+    (_label, overrides) => {
+      expect(
+        decideStickyBreak({
+          quota: withSpendControl(quota(50), overrides),
+          status: 400,
+          now,
+        }),
+      ).toEqual({ action: 'retain', reason: 'healthy' })
+    },
+  )
+
+  test('decides a no-spend-control account exactly as today', () => {
+    expect(decideStickyBreak({ quota: quota(50), status: 400, now })).toEqual({
+      action: 'retain',
+      reason: 'healthy',
+    })
+    expect(
+      decideStickyBreak({
+        quota: quota(0, now, creditReset),
+        status: 400,
+        now,
+      }),
+    ).toEqual({
+      action: 'migrate',
+      reason: 'exhausted',
+      windowKey: 'primary',
+      resetsAt: creditReset,
+    })
+  })
+
+  test('trusts the reached boolean over a spent-looking percentage', () => {
+    expect(
+      decideStickyBreak({
+        quota: withSpendControl(quota(50), {
+          reached: false,
+          usedPercent: 100,
+          remainingPercent: 0,
+        }),
+        status: 400,
+        now,
+      }),
+    ).toEqual({ action: 'retain', reason: 'healthy' })
+  })
+
+  test('admission and migration agree on a spent credit budget', () => {
+    const spent = withSpendControl(quota(50))
+    expect(isQuotaExhausted(spent, now)).toBe(true)
+    expect(decideStickyBreak({ quota: spent, status: 400, now })).toEqual({
+      action: 'migrate',
+      reason: 'exhausted',
+      resetsAt: creditReset,
+    })
+  })
+})
+
 describe('selectStickyCandidate', () => {
   test('excludes candidates with missing quota', () => {
     expect(
@@ -510,5 +613,71 @@ describe('selectStickyCandidate', () => {
     ]
     expect(select(candidates).accountId).toBe('a')
     expect(select(candidates).accountId).toBe('a')
+  })
+})
+
+describe('selectStickyCandidate credit budget', () => {
+  const creditReset = new Date(now + 30 * 24 * 3600_000).toISOString()
+
+  function withSpendControl(
+    base: AccountQuota,
+    remainingPercent: number,
+  ): AccountQuota {
+    return {
+      ...base,
+      spendControl: {
+        limit: 2500,
+        used: 2500 - remainingPercent,
+        remaining: remainingPercent,
+        usedPercent: 100 - remainingPercent,
+        remainingPercent,
+        resetsAt: creditReset,
+        reached: false,
+      },
+    }
+  }
+
+  test('deprioritises a nearly-spent credit budget in cold placement', () => {
+    // Identical rate-limit windows: only the credit axis separates the two, so
+    // the roomier budget must win despite the nearly-spent account's earlier
+    // configured order.
+    expect(
+      select([
+        candidate('nearly-spent', withSpendControl(quota(50), 1), 0),
+        candidate('roomy', withSpendControl(quota(50), 80), 1),
+      ]).accountId,
+    ).toBe('roomy')
+  })
+
+  test('ignores a malformed credit reading instead of excluding the account', () => {
+    const malformed: AccountQuota = {
+      ...quota(50),
+      spendControl: {
+        limit: 2500,
+        used: 0,
+        remaining: 2500,
+        usedPercent: 0,
+        remainingPercent: Number.NaN,
+        reached: false,
+      },
+    }
+    expect(
+      select([
+        candidate('malformed', malformed, 0),
+        candidate('plain', quota(50), 1),
+      ]).accountId,
+    ).toBe('malformed')
+  })
+
+  test('routes a candidate with no spend control by its rate-limit windows alone', () => {
+    // Pins the exact pre-credit selection: an account with no spend control
+    // must be weighted by its rate-limit windows only, never treated as zero or
+    // full credit pressure.
+    expect(
+      select([
+        candidate('tight', quota(10), 0),
+        candidate('roomy', quota(90), 1),
+      ]),
+    ).toEqual({ accountId: 'roomy', quotaCheckedAt: now, source: 'weighted' })
   })
 })

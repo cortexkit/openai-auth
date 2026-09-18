@@ -3,6 +3,7 @@ import {
   getPresentQuotaWindows,
   type QuotaWindow,
   type QuotaWindowKey,
+  spendControlExhaustedResetAt,
 } from '../sidebar-state'
 
 export const QUOTA_STALENESS_MS = 15 * 60_000
@@ -87,6 +88,19 @@ export function decideStickyBreak(input: {
           ? { resetsAt: window.resetsAt }
           : {}),
       }
+    }
+  }
+
+  // A reached credit budget is confirmed exhaustion on its own axis, so a warm
+  // pin migrates exactly as it does for an exhausted window. Judged by the same
+  // shared signal admission uses, so the two never disagree on what "spent"
+  // means. A stale, malformed, or missing reading falls through to retain.
+  const spendReset = spendControlExhaustedResetAt(input.quota, input.now)
+  if (spendReset) {
+    return {
+      action: 'migrate',
+      reason: 'exhausted',
+      resetsAt: spendReset.resetsAt,
     }
   }
 
@@ -179,6 +193,14 @@ function candidateWeight(
       )
     },
   )
+  // The credit budget is a third pressure axis on its own reset clock (a month,
+  // not 5h/7d), so its own resetsAt drives the spend rate. It has no configured
+  // reserve, and a malformed reading is ignored rather than allowed to zero the
+  // account's weight.
+  const spendControl = candidate.quota.spendControl
+  if (spendControl && Number.isFinite(spendControl.remainingPercent)) {
+    weights.push(sustainableWindowWeight(spendControl, 0, now))
+  }
   const weight = weights.length > 0 ? Math.min(...weights) : 0
   return weight > 0 ? { candidate, quotaCheckedAt, weight } : undefined
 }
