@@ -2,21 +2,29 @@
 
 This directory is a vendoring of `@cortexkit/claustrum-client` from
 [`cortexkit/claustrum`][repo], pinned at merge commit
-`1828f35cca9c69b8fdd80edda3ba01196de4bda7` (PR #52). The pin is
-temporary: once `@cortexkit/claustrum-client` is published on the registry
-at or after `1828f35cca9c69b8fdd80edda3ba01196de4bda7`, this directory is
-removed and the dependency becomes a normal package import.
+`1828f35cca9c69b8fdd80edda3ba01196de4bda7` (PR #52).
+
+**Do not swap to `@cortexkit/claustrum-client@0.1.0`.** It is on npm, and it
+is *older* than this snapshot: it was built from commit `2d5e217`, which
+predates eight client commits including `1828f35` itself. Installing it would
+remove the served-identity fields the custody code reads for `accountId`, the
+ancestor-walk permission hardening, and the manifest writer lock. A published
+version is not by itself the signal to swap; being at or after `1828f35` is.
+
+CKCRED will cut `0.2.0` from current master, which includes everything through
+`1828f35`, and will say so with the version and commit. At that point the swap
+is a version bump.
 
 The seven production files (`detect.ts`, `errors.ts`, `handles.ts`,
 `identity.ts`, `index.ts`, `manifest-lock.ts`, `wire.ts`) are copied
 byte-for-byte from `.opencode/vendor-src/claustrum-client-1828f35/src/`.
 **Do not edit them
-in place** — they are a snapshot of the upstream source. The replacement
-condition is: swap to a published `@cortexkit/claustrum-client` release
-when one exists at or after `1828f35cca9c69b8fdd80edda3ba01196de4bda7`, at which point this directory is
-removed and the dependency flips to a normal package import.
+in place** — they are a snapshot of the upstream source.
 
-Review this pin on or before 2026-10-04; if `@cortexkit/claustrum-client` is not published by then, decide whether to keep vendoring or drop the feature.
+Review this pin on or before 2026-10-04. Check the candidate release's source
+commit rather than its version number: the ordering that matters is whether it
+contains `1828f35`, and `0.1.0` is the counter-example proving a higher version
+number does not imply it.
 
 The three test files in `src/tests/` (upstream) were NOT copied; the
 opencode test suite owns its own tests under `src/tests/custody.test.ts`.
