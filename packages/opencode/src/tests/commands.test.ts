@@ -1853,6 +1853,54 @@ describe('commands', () => {
     expect(fb2Section).not.toContain('resets:')
   })
 
+  test('quota command shows spend control only for accounts that report it', async () => {
+    const qm = new QuotaManager({
+      configPath: getAccountStoragePath(),
+      storage: { version: 1 as const, accounts: [] },
+    })
+    qm.setMain('access-main', {
+      quota: {
+        ...makeQuotaSnapshot(15),
+        spendControl: {
+          limit: 2500,
+          used: 501.7787666320801,
+          remaining: 1998.2212333679199,
+          usedPercent: 20.071150665283206,
+          remainingPercent: 79.9288493347168,
+          resetsAt: '2026-10-01T00:00:00.000Z',
+          unit: 'credits',
+          source: 'individual_limit',
+          reached: false,
+        },
+      },
+      refreshAfter: Date.now() + 5 * 60 * 1000,
+      checkedAt: Date.now(),
+    })
+    qm.setFallback('fb-1', {
+      quota: makeQuotaSnapshot(42),
+      refreshAfter: Date.now() + 5 * 60 * 1000,
+      checkedAt: Date.now(),
+    })
+    const ctx: CommandContext = {
+      packageVersion: PackageVersion,
+      accountStoragePath: configPath,
+      accountStatePath: getAccountStatePath(configPath),
+      quotaManager: qm,
+      loadAccounts,
+      client: makeClient(),
+    }
+
+    const payload = await buildDialogPayload('openai-quota', '', ctx)
+    const [mainSection, fallbackSection = ''] = payload.text.split(
+      '### Fallback accounts',
+    )
+
+    expect(mainSection).toContain(
+      '- credits: 20% used (502 / 2500, 1998 remaining) · resets 2026-10-01T00:00:00.000Z',
+    )
+    expect(fallbackSection).not.toContain('credits:')
+  })
+
   test('refreshAllQuota with one failure → short retry state for failing account', async () => {
     const qm = new QuotaManager({
       configPath: getAccountStoragePath(),
