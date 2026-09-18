@@ -682,11 +682,21 @@ export function __createCustodyRuntimeForTest(
       const servedAccountId = claims
         ? extractAccountIdFromClaims(claims)
         : undefined
-      return expectedAccountId && servedAccountId !== expectedAccountId
-        ? 'identity_mismatch'
-        : servedAccountId
-          ? 'serves'
-          : 'identity_mismatch'
+      // Absence and contradiction are different answers. A served token with
+      // no `chatgpt_account_id` claim means the vault could not assert an
+      // identity; treating that as a mismatch takes the account dark with no
+      // local fallback, at a moment the vault writes no audit row for a
+      // served get — so we would be the only witness to an outage caused by
+      // this check. Only a claim that positively disagrees refuses.
+      if (expectedAccountId && servedAccountId !== expectedAccountId) {
+        return 'identity_mismatch'
+      }
+      if (!servedAccountId) {
+        log.warn('custody identity unverifiable; serving', {
+          credentialId: handle,
+        })
+      }
+      return 'serves'
     } catch {
       return cache.isReauth(handle, now()) ? 'needs_reauth' : 'cold'
     }

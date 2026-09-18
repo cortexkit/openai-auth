@@ -344,9 +344,23 @@ export async function resolveFallbackAccess(
       return CUSTODY_REFUSE
     }
     const check = verifyServedFallbackIdentity(served, account)
-    if (check.reason !== 'ok') {
+    // This is a VERIFY site: a binding already exists and the check confirms
+    // it. `nullClaim` means the vault had nothing to assert, which proves
+    // neither the right identity nor the wrong one — refusing on it would turn
+    // the vault's silence into an outage with no local credential to fall back
+    // on. Only a positive contradiction refuses.
+    //
+    // `reconcileFallbackCustody` calls the same function on a BIND path and
+    // must keep refusing `nullClaim`: there, absence means there is nothing to
+    // record, and binding an identity nobody asserted is worse than refusing.
+    if (check.reason === 'identityMismatch') {
       log.warn('custody identity check refused', { reason: check.reason })
       return CUSTODY_REFUSE
+    }
+    if (check.reason === 'nullClaim') {
+      log.warn('custody identity unverifiable; serving', {
+        credentialId: handle,
+      })
     }
     return {
       token: served.payload.access,
