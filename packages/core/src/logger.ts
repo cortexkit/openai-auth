@@ -85,6 +85,12 @@ function isSecretKey(key: string): boolean {
   // needed for debugging — so it is intentionally NOT redacted by name. The genuine
   // ChatGPT id is kept out of logs at the source instead.
   if (k === 'chatgptaccountid') return true
+  // Operator identity carried on a served vault credential. These arrived with
+  // the client widening that added `accountId`/`email`/`orgName`/`projectId`;
+  // they are personal data with no diagnostic value, so they never reach a log
+  // file. The structural guard is not logging a served credential wholesale —
+  // this list only closes the fields that exist today.
+  if (k === 'email' || k === 'orgname' || k === 'organizationname') return true
   if (k.includes('apikey')) return true
   if (k.endsWith('secret') || k.endsWith('password')) return true
   if (k.endsWith('token') && !k.endsWith('tokens')) return true
