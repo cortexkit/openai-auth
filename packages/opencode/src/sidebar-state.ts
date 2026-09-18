@@ -552,6 +552,22 @@ export function exhaustedQuotaResetAt(
       earliest = { resetsAt: window.resetsAt, resetAtMs }
     }
   }
+  // The credit budget is a third axis on its own reset clock (a month, not
+  // 5h/7d). `reached` is the provider's authoritative boolean — the percentage
+  // is only a display approximation — and it fails open on a missing or lapsed
+  // reset exactly like the windows above, so a stale reading never blocks.
+  const spendControl = quota?.spendControl
+  if (
+    spendControl?.reached === true &&
+    typeof spendControl.resetsAt === 'string'
+  ) {
+    const resetAtMs = Date.parse(spendControl.resetsAt)
+    if (Number.isFinite(resetAtMs) && resetAtMs > now) {
+      if (!earliest || resetAtMs < earliest.resetAtMs) {
+        earliest = { resetsAt: spendControl.resetsAt, resetAtMs }
+      }
+    }
+  }
   return earliest
 }
 

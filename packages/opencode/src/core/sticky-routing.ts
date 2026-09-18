@@ -179,6 +179,14 @@ function candidateWeight(
       )
     },
   )
+  // The credit budget is a third pressure axis on its own reset clock (a month,
+  // not 5h/7d), so its own resetsAt drives the spend rate. It has no configured
+  // reserve, and a malformed reading is ignored rather than allowed to zero the
+  // account's weight.
+  const spendControl = candidate.quota.spendControl
+  if (spendControl && Number.isFinite(spendControl.remainingPercent)) {
+    weights.push(sustainableWindowWeight(spendControl, 0, now))
+  }
   const weight = weights.length > 0 ? Math.min(...weights) : 0
   return weight > 0 ? { candidate, quotaCheckedAt, weight } : undefined
 }
