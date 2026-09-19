@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
@@ -24,13 +23,6 @@ import {
 
 export type { AccountPaths }
 export { ACCOUNT_FILE_NAME, ACCOUNT_STATE_FILE_NAME, deriveStatePath }
-
-export function fallbackRefreshLockName(accountId: string) {
-  return `fallback-oauth-refresh-${createHash('sha256')
-    .update(accountId)
-    .digest('base64url')
-    .slice(0, 16)}`
-}
 
 function getConfigDir() {
   if (process.env.OPENCODE_CONFIG_DIR?.trim()) {
