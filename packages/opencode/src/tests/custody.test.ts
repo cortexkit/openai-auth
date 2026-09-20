@@ -180,15 +180,26 @@ describe('readCustodyManifest', () => {
     )
   })
 
-  it('keeps the Claustrum snapshot with the core manifest reader', () => {
-    const coreVendor = new URL(
-      '../../../core/src/vendor/claustrum-client/UPSTREAM.md',
-      import.meta.url,
-    )
-    const hostVendor = new URL('../vendor/claustrum-client', import.meta.url)
+  // The client was vendored while it was unpublished, and the guard then was
+  // that exactly one copy existed. It is a package now, so the guard is that
+  // none does: a re-vendored copy would be a second implementation of the wire
+  // that no version bump can reach, which is how the published 0.1.0 came to be
+  // eight commits behind the snapshot we were carrying.
+  it('reads the vault through the published client, with no vendored copy', () => {
+    for (const vendored of [
+      '../../../core/src/vendor/claustrum-client',
+      '../vendor/claustrum-client',
+    ]) {
+      expect(existsSync(new URL(vendored, import.meta.url))).toBe(false)
+    }
 
-    expect(existsSync(coreVendor)).toBe(true)
-    expect(existsSync(hostVendor)).toBe(false)
+    const internalSource = readFileSync(
+      new URL('../../../core/src/internal.ts', import.meta.url),
+      'utf8',
+    )
+
+    expect(internalSource).toContain("from '@cortexkit/claustrum-client'")
+    expect(internalSource).not.toContain('vendor/claustrum-client')
   })
 
   it('uses the manifest owning-provider constant when preserving tombstones', () => {

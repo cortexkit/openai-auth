@@ -26,7 +26,7 @@ import type {
   ManifestHandleAccount,
   ManifestHandleFile,
   ManifestHandleProvider,
-} from './vendor/claustrum-client/manifest-lock.ts'
+} from '@cortexkit/claustrum-client'
 
 const HANDLE_FILE_MAX_BYTES = 256 * 1024
 const IDENTIFIER_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/
