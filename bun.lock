@@ -23,7 +23,7 @@
       "name": "@cortexkit/openai-auth-core",
       "version": "0.0.0",
       "dependencies": {
-        "@cortexkit/claustrum-client": "^0.2.0",
+        "@cortexkit/claustrum-client": "^0.3.0",
         "@cortexkit/subc-client": "^0.8.1",
       },
     },
@@ -193,7 +193,7 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.5.13", "", { "os": "win32", "cpu": "x64" }, "sha512-VOofU/nW761XWzUeUNE8zzYNyPrxuMuNFMizL0qz7J75yeV8N7WFheUlk1/K6dOkaFpH9wJ+lDKlwjAbw0346w=="],
 
-    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.2.0", "", { "dependencies": { "@cortexkit/subc-client": "^0.8.1" } }, "sha512-/Jif9rlXpkXxaVpvYZu4/oXMYHUtzTEUuAtSzM1fa1v/v9iAOxfr4asz5fi2aIFtGLiUaIT+BrbKIs0N1NAlOg=="],
+    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.3.0", "", { "dependencies": { "@cortexkit/subc-client": "^0.8.1" } }, "sha512-vX28AlhG6vsk2PDNIQMkMmcP2gg+tcODuuz/xppVyLnveNL8aVZlZll1TkT1T9UMKeLDk/vvfOkeMSAC9ZaKGA=="],
 
     "@cortexkit/openai-auth-core": ["@cortexkit/openai-auth-core@workspace:packages/core"],
 

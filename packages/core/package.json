@@ -21,7 +21,7 @@
     "types": "tsc"
   },
   "dependencies": {
-    "@cortexkit/claustrum-client": "^0.2.0",
+    "@cortexkit/claustrum-client": "^0.3.0",
     "@cortexkit/subc-client": "^0.8.1"
   }
 }
