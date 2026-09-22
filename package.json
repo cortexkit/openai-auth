@@ -6,7 +6,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "cd packages/core && bun run build && cd ../opencode && bun run build && cd ../pi && bun run build",
+    "build": "bun scripts/check-installed-ranges.mjs && cd packages/core && bun run build && cd ../opencode && bun run build && cd ../pi && bun run build",
     "dev": "bun scripts/dev.ts",
     "dev:clean": "bun scripts/dev-clean.ts",
     "analyze:cache": "bun scripts/analyze-cache-cliffs.mjs",
@@ -18,7 +18,8 @@
     "lint": "biome lint .",
     "pack:opencode:dry": "cd packages/opencode && bun pm pack --dry-run",
     "pack:pi:dry": "cd packages/pi && bun pm pack --dry-run",
-    "prepublishOnly": "bun run build"
+    "prepublishOnly": "bun run build",
+    "check:ranges": "bun scripts/check-installed-ranges.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.13",
