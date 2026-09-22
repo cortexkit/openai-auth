@@ -173,8 +173,9 @@ const ALLOWED_MODELS = new Set([
 // api.id ("gpt-5.6"), so filtering on api.id drops them all at once while
 // keeping the working variants (api.id gpt-5.6-luna, etc.).
 // Same shape for gpt-6: the backend rejects the bare id ("not supported when
-// using Codex with a ChatGPT account") and serves only the named gpt-6-astra
-// variant, so any -fast/-pro synthetics inheriting api.id "gpt-6" drop with it.
+// using Codex with a ChatGPT account") and serves only the named variants
+// (gpt-6-astra, gpt-6-sol, gpt-6-luna), so any -fast/-pro synthetics inheriting
+// api.id "gpt-6" drop with it.
 const DISALLOWED_MODELS = new Set(['gpt-5.6', 'gpt-6'])
 
 /**
@@ -191,21 +192,26 @@ export const EMPTY_BEARER_MESSAGE =
 // Exact models currently marked `use_responses_lite` in Codex's catalog. Read
 // from the backend's own model list rather than assumed:
 //   GET /backend-api/codex/models?client_version=<v>
-// reports `use_responses_lite` per model, and gpt-6-astra is marked true.
+// reports `use_responses_lite` per model, and every gpt-6 variant is marked true.
 const RESPONSES_LITE_MODELS = new Set([
   'gpt-5.6-sol',
   'gpt-5.6-terra',
   'gpt-5.6-luna',
   'gpt-6-astra',
+  'gpt-6-sol',
+  'gpt-6-luna',
 ])
 const OAUTH_DUMMY_KEY = 'opencode-oauth-dummy-key'
 const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
-// gpt-6-astra requires Codex client >= 0.153.0; below that the backend 400s with
-// "requires a newer version of Codex". Measured against the live backend: 0.152.0
-// is refused and 0.153.0 is accepted. Verified non-regressive for every model we
-// surface (gpt-5.3-codex-spark, 5.4, 5.4-mini, 5.5, and the three 5.6 variants),
-// so one version serves the whole range.
-const CODEX_VERSION = '0.153.0'
+// gpt-6-sol and gpt-6-luna require Codex client >= 0.155.0 (gpt-6-astra needs
+// 0.153.0). The backend's model catalog reports this as `minimal_client_version`
+// and simply omits both models below it; a request at 0.153.0 answers 400, and
+// at 0.155.0 completes. Verified non-regressive at 0.155.0 for gpt-6-astra,
+// gpt-5.5 and the three 5.6 variants, so one version serves the whole range.
+// gpt-5.4, gpt-5.4-mini and gpt-5.3-codex-spark answer 400 at BOTH versions
+// ("not supported when using Codex with a ChatGPT account") - a backend
+// retirement, not something this version causes.
+const CODEX_VERSION = '0.155.0'
 const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
 const CODEX_SANDBOX = 'seccomp'
 export const getMainRefreshLockName = () => MAIN_REFRESH_LOCK_NAME
@@ -1009,10 +1015,21 @@ function stripResponsesLiteImageDetails(value: unknown) {
     stripResponsesLiteImageDetails(nested)
 }
 
-// Only gpt-6-astra accepts `configuration_update`; measured against the backend,
-// gpt-5.6-sol answers 400 "The 'configuration_update' item type is not supported
-// with this model" for the identical body.
-const MID_CONVERSATION_EFFORT_MODELS = new Set(['gpt-6-astra'])
+// Models where a `configuration_update` item is both accepted and shown to change
+// effort. Accepted is not enough: a silently ignored item also completes with 200,
+// so each entry was measured by reasoning tokens on one hard prompt at low effort,
+// without and with an update to xhigh:
+//   gpt-6-sol    91 -> 516
+//   gpt-6-luna   1034 -> 3126
+// gpt-5.6-sol is deliberately NOT here. It answered 400 for this item until
+// September 2026, now accepts it, and moved 2292 -> 3785 on a single sample -
+// too weak to tell from noise, on a model people already run, where the
+// request-level effort change it uses today is known to work.
+const MID_CONVERSATION_EFFORT_MODELS = new Set([
+  'gpt-6-astra',
+  'gpt-6-sol',
+  'gpt-6-luna',
+])
 
 /**
  * Change reasoning effort mid-session without disturbing the replayed prefix.
@@ -1572,7 +1589,16 @@ export async function CodexAuthPlugin(
                       // 861,550 input tokens when measured — so do not "correct"
                       // these numbers upward to that ceiling without re-reading
                       // the rate card first.
-                      model.id.includes('gpt-5.6')
+                      //
+                      // gpt-6-sol and gpt-6-luna are NOT exempt either, even
+                      // though they share astra's 872k reported window. The rate
+                      // card, re-read 2026-09-25, names only GPT-6 Astra in its
+                      // Codex long-context exception; the surcharge row applies
+                      // to everything else. Checking the model family is the
+                      // wrong test - it is the rate card's named list.
+                      model.id.includes('gpt-5.6') ||
+                        model.id.includes('gpt-6-sol') ||
+                        model.id.includes('gpt-6-luna')
                       ? {
                           context: 372_000,
                           input: 244_000,

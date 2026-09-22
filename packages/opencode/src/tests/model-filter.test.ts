@@ -106,6 +106,8 @@ async function surfacedModels() {
       'gpt-6-astra-pro': model('gpt-6-astra-pro', 'gpt-6-astra', {
         reasoningMode: 'pro',
       }),
+      'gpt-6-sol': model('gpt-6-sol', 'gpt-6-sol'),
+      'gpt-6-luna': model('gpt-6-luna', 'gpt-6-luna'),
     },
   }
 
@@ -412,6 +414,23 @@ describe('provider.models filter', () => {
       input: 244_000,
       output: 128_000,
     })
+  })
+
+  it("surfaces gpt-6-sol and gpt-6-luna under the surcharge line, not astra's window", async () => {
+    // Both report the same 872k window as gpt-6-astra, which makes "it is a
+    // gpt-6 model, give it astra's window" the natural mistake. The rate card's
+    // Codex long-context exception names GPT-6 Astra alone, so these two pay
+    // 2x input and 1.5x output on the whole request above 272k input tokens and
+    // are held under that line like the 5.6 family.
+    const models = await surfacedModels()
+    for (const id of ['gpt-6-sol', 'gpt-6-luna']) {
+      expect(models[id]).toBeDefined()
+      expect(models[id]?.limit).toEqual({
+        context: 372_000,
+        input: 244_000,
+        output: 128_000,
+      })
+    }
   })
 
   it('drops the bare gpt-6 and its synthetics', async () => {

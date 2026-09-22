@@ -3081,9 +3081,79 @@ describe('integration: active fallback routing', () => {
     )
   })
 
-  test('a model that rejects the item keeps the request-level effort change', async () => {
-    // gpt-5.6-sol answers 400 for configuration_update, so the only correct
-    // behaviour there is to let the request-level value change as before.
+  test.each(['gpt-6-sol', 'gpt-6-luna'])(
+    '%s carries a mid-session effort change as a configuration_update',
+    async (model) => {
+      // Both were measured changing effort through the item, not merely
+      // accepting it, so they get the same prefix-preserving treatment as astra.
+      const sent = await captureEffortChange(model, ['low', 'xhigh'])
+      expect((sent[1]?.reasoning as Record<string, unknown>)?.effort).toBe(
+        'low',
+      )
+      const input = sent[1]?.input as Array<Record<string, unknown>>
+      expect(input[input.length - 2]).toEqual({
+        type: 'configuration_update',
+        reasoning: { effort: 'xhigh' },
+      })
+    },
+  )
+
+  test("the spoofed Codex version meets every surfaced model's minimum", async () => {
+    // The backend decides which models exist from this header. Below a model's
+    // minimum it omits the model from its catalog and answers 400 to a request,
+    // so lowering the version silently removes working models. Minimums are the
+    // catalog's own `minimal_client_version`, read 2026-09-25.
+    const minimums: Record<string, string> = {
+      'gpt-6-sol': '0.155.0',
+      'gpt-6-luna': '0.155.0',
+      'gpt-6-astra': '0.153.0',
+      'gpt-5.6-sol': '0.144.0',
+    }
+    seedEmptyAccountStorage()
+    const originalFetch = globalThis.fetch
+    let version = ''
+    let hooks: Hooks | undefined
+    try {
+      globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+        if (isResponsesSend(url)) version = headerValue(init, 'version')
+        return new Response('{}', { status: 200 })
+      }) as typeof globalThis.fetch
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+      await loaded.fetchOverride('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'session-id': 's-v' },
+        body: JSON.stringify({
+          model: 'gpt-6-sol',
+          input: [
+            { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+          ],
+        }),
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+    const parts = (v: string) => v.split('.').map(Number)
+    const atLeast = (have: string, need: string) => {
+      const [a, b] = [parts(have), parts(need)]
+      for (let i = 0; i < 3; i++)
+        if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0)
+      return true
+    }
+    expect(version).toMatch(/^\d+\.\d+\.\d+$/)
+    for (const [model, need] of Object.entries(minimums)) {
+      expect({ model, ok: atLeast(version, need) }).toEqual({ model, ok: true })
+    }
+  })
+
+  test('a model without measured support keeps the request-level effort change', async () => {
+    // gpt-5.6-sol now accepts configuration_update but showed only a weak effect
+    // on one sample, so it keeps the request-level change it has always used.
+    // Moving it onto the item is a deliberate decision, not a side effect.
     const sent = await captureEffortChange('gpt-5.6-sol', ['low', 'xhigh'])
     const input = sent[1]?.input as Array<Record<string, unknown>>
     expect((sent[1]?.reasoning as Record<string, unknown>)?.effort).toBe(
