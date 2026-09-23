@@ -1246,7 +1246,7 @@ describe('mutateAccounts load-time roster preservation', () => {
     // mirrors updateMainRefreshState's shape.
     await mutateAccounts((current) => {
       current.refresh = current.refresh ?? {}
-      current.refresh.intervalMinutes = 7
+      current.refresh.refreshBeforeExpiryMinutes = 300
       return current
     }, getAccountPaths(cfgPath))
 
@@ -1260,7 +1260,7 @@ describe('mutateAccounts load-time roster preservation', () => {
     expect(preservedB).toBeDefined()
     // Mutator's refresh change persisted too — preservation does not block
     // legitimate mutator writes.
-    expect(cfg.refresh?.intervalMinutes).toBe(7)
+    expect(cfg.refresh?.refreshBeforeExpiryMinutes).toBe(300)
   })
 
   // updateMainRefreshState goes through mutateAccounts on the same config
@@ -1705,7 +1705,7 @@ describe('normalizeStorage roster drop is loud on every load', () => {
     // Mutator touches only refresh metadata — mirrors updateMainRefreshState.
     await mutateAccounts((current) => {
       current.refresh = current.refresh ?? {}
-      current.refresh.intervalMinutes = 11
+      current.refresh.refreshBeforeExpiryMinutes = 310
       return current
     }, getAccountPaths(cfgPath))
     await flushForTest()

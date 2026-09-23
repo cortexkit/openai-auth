@@ -248,7 +248,6 @@ export type AccountStorage = {
   fallbackOn?: number[]
   refresh?: {
     enabled?: boolean
-    intervalMinutes?: number
     refreshBeforeExpiryMinutes?: number
     mainLastRefreshError?: AccountOperationError
     mainRefreshLeaseId?: string
@@ -261,7 +260,6 @@ export type AccountStorage = {
     refreshEveryNRequests?: number
     minimumRemaining?: Partial<Record<QuotaWindowName | '5h' | '1w', number>>
     failClosedOnUnknownQuota?: boolean
-    showToasts?: boolean
     mainQuota?: OAuthQuotaSnapshot
     mainQuotaCheckedAt?: number
     mainQuotaToken?: string
@@ -1071,7 +1069,6 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
   const refresh = storage.refresh
     ? objectWithDefinedEntries({
         enabled: storage.refresh.enabled,
-        intervalMinutes: storage.refresh.intervalMinutes,
         refreshBeforeExpiryMinutes: storage.refresh.refreshBeforeExpiryMinutes,
       })
     : undefined
@@ -1082,7 +1079,6 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
         refreshEveryNRequests: storage.quota.refreshEveryNRequests,
         minimumRemaining: storage.quota.minimumRemaining,
         failClosedOnUnknownQuota: storage.quota.failClosedOnUnknownQuota,
-        showToasts: storage.quota.showToasts,
       })
     : undefined
 
@@ -2260,13 +2256,6 @@ export function fallbackRefreshLockName(accountId: string): string {
 }
 const FALLBACK_REFRESH_JOIN_WAIT_MS = 10_000
 const FALLBACK_REFRESH_JOIN_POLL_MS = 100
-const DEFAULT_REFRESH_INTERVAL_MINUTES = 10
-
-export function getRefreshIntervalMs(storage: AccountStorage | null) {
-  const minutes =
-    storage?.refresh?.intervalMinutes ?? DEFAULT_REFRESH_INTERVAL_MINUTES
-  return Math.max(1, minutes) * 60_000
-}
 
 // ---------------------------------------------------------------------------
 // FallbackAccountManager

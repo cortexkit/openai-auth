@@ -121,7 +121,6 @@ export const INTERNAL_VALUE_EXPORTS = [
   'generatePKCE',
   'getKillswitchThresholdsForAccount',
   'getQuotaCheckIntervalMs',
-  'getRefreshIntervalMs',
   'hashRefreshToken',
   'initLogger',
   'isApiKeyAccount',
