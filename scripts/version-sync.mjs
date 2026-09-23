@@ -20,6 +20,15 @@ const packageJsonPaths = [
   join(root, 'packages', 'pi', 'package.json'),
 ]
 const versionTsPath = join(root, 'packages', 'opencode', 'src', 'version.ts')
+// READMEs show pinned install lines. They are rewritten here so the pin moves
+// with every release; left to hand edits, all three sat at 0.1.0 until 0.9.0.
+const readmePaths = [
+  join(root, 'README.md'),
+  join(root, 'packages', 'opencode', 'README.md'),
+  join(root, 'packages', 'pi', 'README.md'),
+]
+const PINNED_INSTALL_RE =
+  /(@cortexkit\/(?:opencode|pi)-openai-auth)@\d+\.\d+\.\d+(?:-[\w.]+)?/g
 
 function parseArgs(argv) {
   const args = argv.slice(2)
@@ -106,6 +115,19 @@ if (currentVersionTs === nextVersionTs) {
 } else {
   console.log(`${versionTsRelativePath}: syncing PackageVersion → ${version}`)
   if (!dryRun) writeFileSync(versionTsPath, nextVersionTs, 'utf-8')
+}
+
+for (const readmePath of readmePaths) {
+  if (!existsSync(readmePath)) continue
+  const relativePath = readmePath.slice(root.length + 1)
+  const current = readFileSync(readmePath, 'utf-8')
+  const next = current.replace(PINNED_INSTALL_RE, `$1@${version}`)
+  if (next === current) {
+    console.log(`${relativePath}: install pins already at target`)
+    continue
+  }
+  console.log(`${relativePath}: install pins → ${version}`)
+  if (!dryRun) writeFileSync(readmePath, next, 'utf-8')
 }
 
 console.log(`\n${dryRun ? '[DRY RUN] ' : ''}Done.`)

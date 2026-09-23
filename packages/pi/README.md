@@ -11,7 +11,7 @@ This package is part of the CortexKit OpenAI Auth monorepo, which supports both 
 Install with Pi's package manager:
 
 ```bash
-pi install npm:@cortexkit/pi-openai-auth@0.1.0
+pi install npm:@cortexkit/pi-openai-auth@0.9.0
 ```
 
 For an unpinned install:
