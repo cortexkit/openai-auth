@@ -25,7 +25,7 @@
     "@biomejs/biome": "2.5.13",
     "@cortexkit/openai-auth-core": "workspace:*",
     "@earendil-works/pi-ai": "0.85.1",
-    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-coding-agent": "0.86.0",
     "@earendil-works/pi-tui": "0.85.1",
     "@opencode-ai/plugin": "1.18.30",
     "@tsconfig/bun": "1.0.11",
