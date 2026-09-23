@@ -22,6 +22,6 @@
   },
   "dependencies": {
     "@cortexkit/claustrum-client": "^0.3.0",
-    "@cortexkit/subc-client": "^0.8.1"
+    "@cortexkit/subc-client": "^0.13.1"
   }
 }
