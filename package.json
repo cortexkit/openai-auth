@@ -22,16 +22,16 @@
     "check:ranges": "bun scripts/check-installed-ranges.mjs"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.13",
+    "@biomejs/biome": "2.5.14",
     "@cortexkit/openai-auth-core": "workspace:*",
-    "@earendil-works/pi-ai": "0.85.1",
-    "@earendil-works/pi-coding-agent": "0.85.1",
-    "@earendil-works/pi-tui": "0.85.1",
-    "@opencode-ai/plugin": "1.18.30",
+    "@earendil-works/pi-ai": "0.87.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@earendil-works/pi-tui": "0.87.1",
+    "@opencode-ai/plugin": "1.18.31",
     "@tsconfig/bun": "1.0.11",
     "@types/bun": "1.4.2",
     "bun-types": "1.4.2",
-    "lefthook": "2.1.12",
+    "lefthook": "2.1.14",
     "tsdown": "0.23.0",
     "typescript": "7.0.2"
   }
