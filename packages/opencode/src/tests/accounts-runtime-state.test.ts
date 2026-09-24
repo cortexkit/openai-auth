@@ -128,6 +128,97 @@ describe('account runtime state merge', () => {
     expect(account.quota?.primary?.checkedAt).toBe(1_700_000_600_000)
   })
 
+  it('does not let a future lastRefreshedAt keep an expired token over a newer refresh', async () => {
+    const now = Date.now()
+    const futureStamped: OAuthAccount = {
+      id: 'fallback-future-stamp',
+      type: 'oauth',
+      access: 'old-access-token',
+      refresh: 'old-refresh-token',
+      expires: now - 60_000,
+      lastRefreshedAt: now + 6 * 60 * 60 * 1000,
+      quota: quotaAt(100),
+    }
+    await saveAccounts(makeStorage(futureStamped), getAccountPaths(cfgPath))
+
+    const refreshed: OAuthAccount = {
+      ...futureStamped,
+      access: 'new-access-token',
+      refresh: 'new-refresh-token',
+      expires: now + 60 * 60 * 1000,
+      lastRefreshedAt: now,
+    }
+    await saveAccountState(makeStorage(refreshed), getAccountPaths(cfgPath))
+
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
+    const account = loaded?.accounts[0] as OAuthAccount
+    expect(account.access).toBe('new-access-token')
+    expect(account.refresh).toBe('new-refresh-token')
+  })
+
+  it('trusts a stamp slightly ahead of the clock, so a stale save cannot roll back a rotated token', async () => {
+    // A clock stepped back a little after another process refreshed leaves that
+    // refresh stamped a few seconds in the future. It is still the newest
+    // token; distrusting it would let the stale save win and restore a refresh
+    // token the provider has already rotated away.
+    const now = Date.now()
+    const justRotated: OAuthAccount = {
+      id: 'fallback-small-skew',
+      type: 'oauth',
+      access: 'rotated-access-token',
+      refresh: 'rotated-refresh-token',
+      expires: now + 60 * 60 * 1000,
+      lastRefreshedAt: now + 2_000,
+      quota: quotaAt(100),
+    }
+    await saveAccounts(makeStorage(justRotated), getAccountPaths(cfgPath))
+
+    const stale: OAuthAccount = {
+      ...justRotated,
+      access: 'stale-access-token',
+      refresh: 'stale-refresh-token',
+      expires: now + 2 * 60 * 60 * 1000,
+      lastRefreshedAt: now - 60 * 60 * 1000,
+    }
+    await saveAccountState(makeStorage(stale), getAccountPaths(cfgPath))
+
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
+    const account = loaded?.accounts[0] as OAuthAccount
+    expect(account.refresh).toBe('rotated-refresh-token')
+  })
+
+  it('still prefers a newer past refresh over a later-expiry older one', async () => {
+    // Capping future stamps must not turn every comparison into an expires
+    // comparison: two ordinary past stamps still decide by lastRefreshedAt.
+    const now = Date.now()
+    const olderLongLived: OAuthAccount = {
+      id: 'fallback-past-stamps',
+      type: 'oauth',
+      access: 'older-access-token',
+      refresh: 'older-refresh-token',
+      expires: now + 10 * 60 * 60 * 1000,
+      lastRefreshedAt: now - 2 * 60 * 60 * 1000,
+      quota: quotaAt(100),
+    }
+    await saveAccounts(makeStorage(olderLongLived), getAccountPaths(cfgPath))
+
+    const newerShortLived: OAuthAccount = {
+      ...olderLongLived,
+      access: 'newer-access-token',
+      refresh: 'newer-refresh-token',
+      expires: now + 60 * 60 * 1000,
+      lastRefreshedAt: now - 60 * 1000,
+    }
+    await saveAccountState(
+      makeStorage(newerShortLived),
+      getAccountPaths(cfgPath),
+    )
+
+    const loaded = await loadAccounts(getAccountPaths(cfgPath))
+    const account = loaded?.accounts[0] as OAuthAccount
+    expect(account.access).toBe('newer-access-token')
+  })
+
   it('uses expires as the token tie-breaker when lastRefreshedAt values match', async () => {
     const laterExpiry: OAuthAccount = {
       id: 'fallback-equal-refresh-time',

@@ -989,13 +989,34 @@ function selectSameTokenState(
     : existing
 }
 
+// How far ahead of the local clock a lastRefreshedAt may sit and still be
+// trusted. Small skew is normal (a clock slewed or stepped back slightly after
+// another process wrote), and distrusting it would be dangerous: a stale save
+// could then beat a just-rotated token and roll back its refresh token.
+const FUTURE_REFRESH_STAMP_TOLERANCE_MS = 5 * 60_000
+
+/**
+ * lastRefreshedAt comes from the writer's clock, so it can sit far in the
+ * future: a clock that ran ahead and was corrected, or a state file restored
+ * from another machine. Taken at face value, such a stamp beats every genuine
+ * refresh until the wall clock catches up, keeping an expired token and
+ * discarding each new one. A stamp that far ahead says nothing reliable about
+ * when the token was minted, so it counts as absent and the comparison falls
+ * through to the other side's stamp, then to expires.
+ */
+function trustedRefreshStamp(stamp: number | undefined, now: number): number {
+  if (stamp === undefined) return 0
+  return stamp > now + FUTURE_REFRESH_STAMP_TOLERANCE_MS ? 0 : stamp
+}
+
 function applyNewerTokenState(
   merged: AccountRuntimeEntry,
   existing: AccountRuntimeEntry,
   incoming: AccountRuntimeEntry,
 ) {
-  const existingRefreshAt = existing.lastRefreshedAt ?? 0
-  const incomingRefreshAt = incoming.lastRefreshedAt ?? 0
+  const now = Date.now()
+  const existingRefreshAt = trustedRefreshStamp(existing.lastRefreshedAt, now)
+  const incomingRefreshAt = trustedRefreshStamp(incoming.lastRefreshedAt, now)
   const existingExpires = existing.expires ?? 0
   const incomingExpires = incoming.expires ?? 0
   const tokenSource =
