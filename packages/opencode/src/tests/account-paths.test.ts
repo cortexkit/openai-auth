@@ -2,12 +2,12 @@ import { describe, expect, it } from 'bun:test'
 import { mkdirSync, mkdtempSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-
 import {
   accountPathsCollide,
   deriveStatePath,
   getAccountStatePath,
 } from '../core/account-paths.ts'
+import { restoreEnv } from './setup-env'
 
 describe('account path resolution', () => {
   it('derives distinct state paths for distinct config filenames', () => {
@@ -40,7 +40,7 @@ describe('account path resolution', () => {
       )
     } finally {
       if (previousStatePath === undefined) {
-        delete process.env.OPENCODE_OPENAI_AUTH_STATE_FILE
+        restoreEnv('OPENCODE_OPENAI_AUTH_STATE_FILE')
       } else {
         process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = previousStatePath
       }
@@ -84,7 +84,7 @@ describe('account path resolution', () => {
       )
     } finally {
       if (previousStatePath === undefined) {
-        delete process.env.OPENCODE_OPENAI_AUTH_STATE_FILE
+        restoreEnv('OPENCODE_OPENAI_AUTH_STATE_FILE')
       } else {
         process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = previousStatePath
       }

@@ -60,6 +60,7 @@ import {
   TOMBSTONE_OPENAI,
   withClaustrumMode,
 } from './custody-fixtures.ts'
+import { restoreEnv } from './setup-env'
 import {
   FLOOR_CLAUSTRUM_HANDLES,
   FLOOR_CLAUSTRUM_HANDLES_LOCK,
@@ -2168,8 +2169,7 @@ describe('custody boot order', () => {
       process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = originalStateFile
       process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = originalSidebarFile
       process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = originalLogFile
-      if (originalConfigDir === undefined)
-        delete process.env.OPENCODE_CONFIG_DIR
+      if (originalConfigDir === undefined) restoreEnv('OPENCODE_CONFIG_DIR')
       else process.env.OPENCODE_CONFIG_DIR = originalConfigDir
     }
   })

@@ -28,6 +28,7 @@ import {
   enrollmentManifest,
   liveStorage,
 } from './custody-fixtures.ts'
+import { restoreEnv } from './setup-env'
 
 const canonicalTombstone = canonicalCustodyTombstone('openai')
 
@@ -485,7 +486,7 @@ describe('main host slot', () => {
         },
       )
     } finally {
-      if (previousDataHome === undefined) delete process.env.XDG_DATA_HOME
+      if (previousDataHome === undefined) restoreEnv('XDG_DATA_HOME')
       else process.env.XDG_DATA_HOME = previousDataHome
     }
   })
@@ -541,7 +542,7 @@ describe('main host slot', () => {
         },
       )
     } finally {
-      if (previousDataHome === undefined) delete process.env.XDG_DATA_HOME
+      if (previousDataHome === undefined) restoreEnv('XDG_DATA_HOME')
       else process.env.XDG_DATA_HOME = previousDataHome
     }
   })
@@ -771,21 +772,20 @@ describe('main host slot', () => {
       expect(authSetCalls).toBe(0)
     } finally {
       await hooks?.dispose?.()
-      if (priorConfigPath === undefined)
-        delete process.env.OPENCODE_OPENAI_AUTH_FILE
+      if (priorConfigPath === undefined) restoreEnv('OPENCODE_OPENAI_AUTH_FILE')
       else process.env.OPENCODE_OPENAI_AUTH_FILE = priorConfigPath
       if (priorStatePath === undefined)
-        delete process.env.OPENCODE_OPENAI_AUTH_STATE_FILE
+        restoreEnv('OPENCODE_OPENAI_AUTH_STATE_FILE')
       else process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = priorStatePath
       if (priorManifestPath === undefined)
-        delete process.env.CLAUSTRUM_OPENCODE_HANDLES
+        restoreEnv('CLAUSTRUM_OPENCODE_HANDLES')
       else process.env.CLAUSTRUM_OPENCODE_HANDLES = priorManifestPath
       if (priorSidebarPath === undefined)
-        delete process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE
+        restoreEnv('OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE')
       else
         process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = priorSidebarPath
       if (priorLogPath === undefined)
-        delete process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+        restoreEnv('OPENCODE_OPENAI_AUTH_LOG_FILE')
       else process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = priorLogPath
       rmSync(directory, { recursive: true, force: true })
     }
@@ -853,18 +853,17 @@ describe('main host slot', () => {
       expect(await loadAccounts(getAccountPaths(configPath))).toBeNull()
     } finally {
       await hooks?.dispose?.()
-      if (priorConfigPath === undefined)
-        delete process.env.OPENCODE_OPENAI_AUTH_FILE
+      if (priorConfigPath === undefined) restoreEnv('OPENCODE_OPENAI_AUTH_FILE')
       else process.env.OPENCODE_OPENAI_AUTH_FILE = priorConfigPath
       if (priorStatePath === undefined)
-        delete process.env.OPENCODE_OPENAI_AUTH_STATE_FILE
+        restoreEnv('OPENCODE_OPENAI_AUTH_STATE_FILE')
       else process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = priorStatePath
       if (priorSidebarPath === undefined)
-        delete process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE
+        restoreEnv('OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE')
       else
         process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = priorSidebarPath
       if (priorLogPath === undefined)
-        delete process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+        restoreEnv('OPENCODE_OPENAI_AUTH_LOG_FILE')
       else process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = priorLogPath
       rmSync(directory, { recursive: true, force: true })
     }

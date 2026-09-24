@@ -23,6 +23,7 @@ import {
 import { discoverPortFile } from '../rpc/port-file'
 import { resolveRpcDir } from '../rpc/rpc-dir'
 import { startRpcServer } from '../rpc/rpc-server'
+import { restoreEnv } from './setup-env'
 
 let stop: (() => Promise<void>) | null = null
 let dir: string
@@ -92,11 +93,6 @@ async function writeAccountStore(path: string, accountId: string) {
       ],
     }),
   )
-}
-
-function restoreEnv(name: string, value: string | undefined) {
-  if (value === undefined) delete process.env[name]
-  else process.env[name] = value
 }
 
 afterEach(async () => {
@@ -421,7 +417,7 @@ describe('rpc-server', () => {
       expect(log).toContain(`"pid":${process.pid}`)
     } finally {
       if (savedLogFile === undefined) {
-        delete process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+        restoreEnv('OPENCODE_OPENAI_AUTH_LOG_FILE')
       } else {
         process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = savedLogFile
       }

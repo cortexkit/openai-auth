@@ -7,7 +7,7 @@ import {
   resetModelCostsForTest,
   toSdkCost,
 } from '../model-costs'
-import { FLOOR_MODELS_CACHE } from './setup-env'
+import { FLOOR_MODELS_CACHE, restoreEnv, unsetEnv } from './setup-env'
 
 const REAL_CATALOG_COST = {
   input: 5,
@@ -75,7 +75,7 @@ describe('models.dev costs', () => {
     if (restoreDisableFetch === undefined)
       delete process.env.OPENCODE_DISABLE_MODELS_FETCH
     else process.env.OPENCODE_DISABLE_MODELS_FETCH = restoreDisableFetch
-    if (restoreXdgCacheHome === undefined) delete process.env.XDG_CACHE_HOME
+    if (restoreXdgCacheHome === undefined) restoreEnv('XDG_CACHE_HOME')
     else process.env.XDG_CACHE_HOME = restoreXdgCacheHome
     if (restoreLocalAppData === undefined) delete process.env.LOCALAPPDATA
     else process.env.LOCALAPPDATA = restoreLocalAppData
@@ -128,7 +128,7 @@ describe('models.dev costs', () => {
         },
       }),
     )
-    delete process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE
+    unsetEnv('OPENCODE_OPENAI_AUTH_MODELS_CACHE')
     process.env.OPENCODE_MODELS_PATH = hostPath
     globalThis.fetch = failingFetch('network must not be needed')
     resetModelCostsForTest()
@@ -148,7 +148,7 @@ describe('models.dev costs', () => {
         },
       }),
     )
-    delete process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE
+    unsetEnv('OPENCODE_OPENAI_AUTH_MODELS_CACHE')
     delete process.env.OPENCODE_MODELS_PATH
     process.env.XDG_CACHE_HOME = xdgCache
     globalThis.fetch = failingFetch('network must not be needed')

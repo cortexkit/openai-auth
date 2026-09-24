@@ -19,6 +19,7 @@ import {
   drainNotifications,
   resetNotificationsForTest,
 } from '../rpc/notifications'
+import { restoreEnv } from './setup-env'
 
 const oauthRealExports = { ...oauthLiveNamespace }
 
@@ -89,11 +90,10 @@ describe('command hook session isolation', () => {
   afterEach(async () => {
     globalThis.fetch = originalFetch
     mock.restore()
-    if (originalConfigEnv === undefined)
-      delete process.env.OPENCODE_OPENAI_AUTH_FILE
+    if (originalConfigEnv === undefined) restoreEnv('OPENCODE_OPENAI_AUTH_FILE')
     else process.env.OPENCODE_OPENAI_AUTH_FILE = originalConfigEnv
     if (originalStateEnv === undefined)
-      delete process.env.OPENCODE_OPENAI_AUTH_STATE_FILE
+      restoreEnv('OPENCODE_OPENAI_AUTH_STATE_FILE')
     else process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = originalStateEnv
     try {
       await rm(tmpDir, { recursive: true, force: true })

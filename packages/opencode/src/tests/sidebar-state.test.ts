@@ -10,7 +10,6 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-
 import {
   type AccountStorage,
   acquireRefreshFileLock,
@@ -49,6 +48,7 @@ import {
   setSidebarState,
   upsertSidebarActiveRouting,
 } from '../sidebar-state'
+import { restoreEnv } from './setup-env'
 import { FLOOR_SIDEBAR_STATE_FILE } from './setup-env.ts'
 
 // computeQuotaPacing takes an explicit windowMs, independent of the slot
@@ -596,7 +596,7 @@ describe('sticky assignments', () => {
       await flushForTest()
       setLogLevel(undefined)
       if (originalLogFile === undefined) {
-        delete process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+        restoreEnv('OPENCODE_OPENAI_AUTH_LOG_FILE')
       } else {
         process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = originalLogFile
       }

@@ -16,7 +16,6 @@ import {
   type OAuthAccount,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
-
 import { getConfigPath } from '../config.ts'
 import { getAccountPaths } from '../core/account-paths'
 import { QUOTA_STALENESS_MS } from '../core/sticky-routing.ts'
@@ -47,6 +46,7 @@ import {
   enrollmentManifest,
   makeSentinelAccount,
 } from './custody-fixtures.ts'
+import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_LOG_FILE,
@@ -364,7 +364,7 @@ describe('integration: HTTP quota push', () => {
       FLOOR_SIDEBAR_STATE_FILE
     // Restore to floor (not delete) — keeps in-flight writes away from live defaults.
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    delete process.env.OPENCODE_CONFIG_DIR
+    restoreEnv('OPENCODE_CONFIG_DIR')
     delete process.env.NODE_ENV
   })
 
@@ -781,7 +781,7 @@ describe('integration: killswitch enforcement', () => {
     process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
       FLOOR_SIDEBAR_STATE_FILE
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    delete process.env.OPENCODE_CONFIG_DIR
+    restoreEnv('OPENCODE_CONFIG_DIR')
     delete process.env.NODE_ENV
   })
 
@@ -2231,7 +2231,7 @@ describe('integration: WS quota push', () => {
       FLOOR_SIDEBAR_STATE_FILE
     // Restore to floor (not delete) — keeps in-flight writes away from live defaults.
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    delete process.env.OPENCODE_CONFIG_DIR
+    restoreEnv('OPENCODE_CONFIG_DIR')
     delete process.env.NODE_ENV
   })
 
@@ -2548,7 +2548,7 @@ describe('integration: 429 → reactive fallback', () => {
       FLOOR_SIDEBAR_STATE_FILE
     // Restore to floor (not delete) — keeps in-flight writes away from live defaults.
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    delete process.env.OPENCODE_CONFIG_DIR
+    restoreEnv('OPENCODE_CONFIG_DIR')
     delete process.env.NODE_ENV
   })
 
@@ -2785,7 +2785,7 @@ describe('integration: 429 → reactive fallback', () => {
       },
     )
     globalThis.fetch = originalFetch
-    delete process.env.CLAUSTRUM_OPENCODE_HANDLES
+    restoreEnv('CLAUSTRUM_OPENCODE_HANDLES')
   })
 })
 
@@ -2822,7 +2822,7 @@ describe('integration: active fallback routing', () => {
       FLOOR_SIDEBAR_STATE_FILE
     // Restore to floor (not delete) — keeps in-flight writes away from live defaults.
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    delete process.env.OPENCODE_CONFIG_DIR
+    restoreEnv('OPENCODE_CONFIG_DIR')
     delete process.env.NODE_ENV
   })
 
@@ -8139,7 +8139,7 @@ describe('integration: no real config read', () => {
       FLOOR_SIDEBAR_STATE_FILE
     // Restore to floor (not delete) — keeps in-flight writes away from live defaults.
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    delete process.env.OPENCODE_CONFIG_DIR
+    restoreEnv('OPENCODE_CONFIG_DIR')
     delete process.env.NODE_ENV
   })
 
@@ -8256,7 +8256,7 @@ describe('integration: models cost-zeroing', () => {
     process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
     process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE = FLOOR_MODELS_CACHE
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-    delete process.env.OPENCODE_CONFIG_DIR
+    restoreEnv('OPENCODE_CONFIG_DIR')
     delete process.env.NODE_ENV
     resetModelCostsForTest()
   })

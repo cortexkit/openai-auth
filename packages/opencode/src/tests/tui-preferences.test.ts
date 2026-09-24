@@ -13,6 +13,7 @@ import {
   TUI_PREFS_FILE_ENV,
   watchTuiPreferences,
 } from '../tui-preferences'
+import { unsetEnv } from './setup-env'
 
 let dir: string
 let file: string
@@ -50,7 +51,7 @@ describe('getTuiPreferencesFile', () => {
 
   test('XDG_CONFIG_HOME fallback appends opencode/', () => {
     delete process.env[TUI_PREFS_FILE_ENV]
-    delete process.env.OPENCODE_CONFIG_DIR
+    unsetEnv('OPENCODE_CONFIG_DIR')
     process.env.XDG_CONFIG_HOME = '/xdg'
     expect(getTuiPreferencesFile()).toBe('/xdg/opencode/tui-preferences.jsonc')
   })

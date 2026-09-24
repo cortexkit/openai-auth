@@ -18,6 +18,7 @@ import {
   enrollmentManifest,
   liveStorage,
 } from './custody-fixtures.ts'
+import { restoreEnv } from './setup-env'
 
 type Deferred<T> = {
   promise: Promise<T>
@@ -518,12 +519,12 @@ describe('production authorize custody leases', () => {
     } finally {
       await fixture?.dispose?.()
       if (priorManifestPath === undefined) {
-        delete process.env.CLAUSTRUM_OPENCODE_HANDLES
+        restoreEnv('CLAUSTRUM_OPENCODE_HANDLES')
       } else {
         process.env.CLAUSTRUM_OPENCODE_HANDLES = priorManifestPath
       }
       if (priorConfigPath === undefined) {
-        delete process.env.OPENCODE_OPENAI_AUTH_FILE
+        restoreEnv('OPENCODE_OPENAI_AUTH_FILE')
       } else {
         process.env.OPENCODE_OPENAI_AUTH_FILE = priorConfigPath
       }

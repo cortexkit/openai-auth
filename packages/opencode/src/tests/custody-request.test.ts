@@ -33,6 +33,7 @@ import {
   makeSentinelAccount,
   TOMBSTONE_OPENAI,
 } from './custody-fixtures.ts'
+import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,
   FLOOR_CLAUSTRUM_HANDLES,
@@ -251,7 +252,7 @@ async function withCustodyLoader(
       FLOOR_SIDEBAR_STATE_FILE
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
     process.env.CLAUSTRUM_OPENCODE_HANDLES = FLOOR_CLAUSTRUM_HANDLES
-    delete process.env.OPENCODE_CONFIG_DIR
+    restoreEnv('OPENCODE_CONFIG_DIR')
     rmSync(directory, { recursive: true, force: true })
   }
 }
@@ -427,7 +428,7 @@ describe('custody request resolution', () => {
       process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
         FLOOR_SIDEBAR_STATE_FILE
       process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-      delete process.env.OPENCODE_CONFIG_DIR
+      restoreEnv('OPENCODE_CONFIG_DIR')
       rmSync(directory, { recursive: true, force: true })
     }
   })
@@ -669,7 +670,7 @@ describe('custody request resolution', () => {
         FLOOR_SIDEBAR_STATE_FILE
       process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
       process.env.CLAUSTRUM_OPENCODE_HANDLES = FLOOR_CLAUSTRUM_HANDLES
-      delete process.env.OPENCODE_CONFIG_DIR
+      restoreEnv('OPENCODE_CONFIG_DIR')
       rmSync(directory, { recursive: true, force: true })
     }
   })
@@ -1194,7 +1195,7 @@ describe('custody request resolution', () => {
         FLOOR_SIDEBAR_STATE_FILE
       process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
       process.env.CLAUSTRUM_OPENCODE_HANDLES = FLOOR_CLAUSTRUM_HANDLES
-      delete process.env.OPENCODE_CONFIG_DIR
+      restoreEnv('OPENCODE_CONFIG_DIR')
       rmSync(directory, { recursive: true, force: true })
     }
   })

@@ -28,6 +28,7 @@ import type { CommandContext } from '../commands'
 // Static import for tests that don't need mocking.
 import { buildDialogPayload, renderResetCoordinatorResult } from '../commands'
 import { getSettings } from '../config'
+import { restoreEnv } from './setup-env'
 
 const oauthRealExports = { ...oauthLiveNamespace }
 
@@ -569,7 +570,7 @@ describe('commands', () => {
     } finally {
       await flushForTest()
       if (savedLogFile === undefined) {
-        delete process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
+        restoreEnv('OPENCODE_OPENAI_AUTH_LOG_FILE')
       } else {
         process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = savedLogFile
       }

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { writePortFile } from '../rpc/port-file'
 import { getRpcDir, resolveRpcDir } from '../rpc/rpc-dir'
+import { restoreEnv } from './setup-env'
 
 const ENV_KEY = 'OPENCODE_OPENAI_AUTH_RPC_DIR'
 
@@ -24,7 +25,7 @@ afterEach(async () => {
     process.env[ENV_KEY] = savedEnv
   }
   if (savedStateHome === undefined) {
-    delete process.env.XDG_STATE_HOME
+    restoreEnv('XDG_STATE_HOME')
   } else {
     process.env.XDG_STATE_HOME = savedStateHome
   }
