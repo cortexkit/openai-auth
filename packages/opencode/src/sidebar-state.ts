@@ -23,6 +23,8 @@ export interface AccountQuota {
   primary?: QuotaWindow
   secondary?: QuotaWindow
   spendControl?: SpendControlReading
+  // The source reported that no credit budget exists; see OAuthQuotaSnapshot.
+  spendControlCleared?: true
   resetCreditsAvailable?: number
 }
 
@@ -1104,6 +1106,19 @@ function freshestWindow(
 // of the merged result. Only safe when both snapshots share an account identity
 // (sameAccountIdentity) — an identity switch must whole-pick (freshestQuota) so
 // windows from two accounts are never combined.
+// The fresher side decides the budget when it knows anything about it: its own
+// reading, or its report that no budget exists. Only when it says nothing (a
+// header or WebSocket push, which never carries spend control) does the other
+// side's reading survive, and even then not if that side reported none.
+function mergeSpendControl(
+  fresher: AccountQuota,
+  older: AccountQuota,
+): SpendControlReading | undefined {
+  if (fresher.spendControl !== undefined) return fresher.spendControl
+  if (fresher.spendControlCleared === true) return undefined
+  return older.spendControl
+}
+
 function mergeQuotaByWindow(
   incoming: AccountQuota | null,
   existing: AccountQuota | null,
@@ -1130,8 +1145,12 @@ function mergeQuotaByWindow(
     existing.checkedAt,
   )
   const spendControl = existingSnapshotIsFresher
-    ? (existing.spendControl ?? incoming.spendControl)
-    : (incoming.spendControl ?? existing.spendControl)
+    ? mergeSpendControl(existing, incoming)
+    : mergeSpendControl(incoming, existing)
+  const spendControlCleared =
+    spendControl === undefined &&
+    (incoming.spendControlCleared === true ||
+      existing.spendControlCleared === true)
   let checkedAt: number | undefined
   for (const stamp of [
     finiteWindowCheckedAt(primary),
@@ -1141,11 +1160,19 @@ function mergeQuotaByWindow(
       checkedAt = checkedAt === undefined ? stamp : Math.max(checkedAt, stamp)
     }
   }
+  // Both budget fields are decided above, so neither may leak in from the
+  // spread: an older incoming budget must not survive a fresher "no budget".
+  const {
+    spendControl: _incomingSpendControl,
+    spendControlCleared: _incomingCleared,
+    ...incomingRest
+  } = incoming
   return {
-    ...incoming,
+    ...incomingRest,
     primary,
     secondary,
     ...(spendControl !== undefined ? { spendControl } : {}),
+    ...(spendControlCleared ? { spendControlCleared: true as const } : {}),
     checkedAt: checkedAt ?? incoming.checkedAt,
   }
 }

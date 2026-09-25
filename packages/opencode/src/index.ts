@@ -789,8 +789,10 @@ export function mergePushedQuotaMetadata(
       merged[key] = carried
     }
   }
+  // A snapshot that explicitly reports no budget must not inherit the old one.
   if (
     merged.spendControl === undefined &&
+    merged.spendControlCleared !== true &&
     previous.spendControl !== undefined
   ) {
     merged.spendControl = previous.spendControl

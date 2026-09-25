@@ -282,6 +282,12 @@ export function normalizeWham(json: WhamUsageResponse): OAuthQuotaSnapshot {
     snapshot.resetCreditsApplicable = resetCreditsApplicable
   }
   const individualLimit = json.spend_control?.individual_limit
+  // An explicit null is wham saying the account has no budget (it left the
+  // workspace that set one, or the budget was removed). That differs from the
+  // key being absent, which says nothing, so only the null form clears.
+  if (json.spend_control === null || individualLimit === null) {
+    snapshot.spendControlCleared = true
+  }
   if (individualLimit && typeof json.spend_control?.reached === 'boolean') {
     const limit = nonNegativeNumberish(individualLimit.limit)
     const used = nonNegativeNumberish(individualLimit.used)

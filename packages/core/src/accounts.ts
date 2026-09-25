@@ -91,6 +91,14 @@ export interface OAuthQuotaSnapshot {
   resetCreditsAvailable?: number
   resetCreditsApplicable?: number
   spendControl?: OAuthSpendControlReading
+  /**
+   * Set when the source explicitly reported that the account has no credit
+   * budget (wham's `spend_control` or `individual_limit` is null). An absent
+   * `spendControl` alone only means the source did not carry the field: header
+   * and WebSocket pushes never do, so merges keep the previous budget for them.
+   * This marker is what lets a merge drop a budget that no longer exists.
+   */
+  spendControlCleared?: true
   credits?: OAuthCredits
 }
 

@@ -46,6 +46,7 @@ import {
   setSidebarLegacyRouting,
   setSidebarMachineState,
   setSidebarState,
+  spendControlExhaustedResetAt,
   upsertSidebarActiveRouting,
 } from '../sidebar-state'
 import { restoreEnv } from './setup-env'
@@ -2983,6 +2984,111 @@ test('machine writes keep the fresher spend-control budget for the same account'
 
   const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
   expect(written.main.quota?.spendControl).toEqual(currentBudget)
+})
+
+describe('a removed credit budget', () => {
+  const spentBudget = {
+    limit: 2500,
+    used: 2500,
+    remaining: 0,
+    usedPercent: 100,
+    remainingPercent: 0,
+    resetsAt: new Date(Date.now() + 5 * 86_400_000).toISOString(),
+    unit: 'credits',
+    source: 'individual_limit',
+    reached: true,
+  }
+
+  async function writeThen(
+    file: string,
+    now: number,
+    next: AccountQuota,
+  ): Promise<AccountQuota | null | undefined> {
+    await setSidebarState(
+      make({
+        main: {
+          ...main({ ...quota(10, now - 60_000), spendControl: spentBudget }),
+          mainAccountId: 'acct-x',
+        },
+      }),
+      file,
+    )
+    await setSidebarMachineState(
+      {
+        main: { ...main(next), mainAccountId: 'acct-x' },
+        fallbacks: [],
+        route: 'main-first',
+        lastUpdated: now + 1,
+      },
+      file,
+    )
+    await drainSidebarWrites()
+    return normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8'))).main
+      .quota
+  }
+
+  test('is cleared by a fresh poll that reports no budget, and stops reading as exhausted', async () => {
+    const file = join(
+      mkdtempSync(join(tmpdir(), 'oai-sb-spend-cleared-')),
+      's.json',
+    )
+    const now = Date.now()
+    const written = await writeThen(file, now, {
+      ...quota(12, now),
+      spendControlCleared: true,
+    })
+    expect(written?.spendControl).toBeUndefined()
+    expect(spendControlExhaustedResetAt(written ?? null, now)).toBeUndefined()
+  })
+
+  test('is kept by a fresh push that does not carry spend control', async () => {
+    // Header and WebSocket pushes never carry the budget; the stored one must
+    // survive them, or every turn would erase it.
+    const file = join(
+      mkdtempSync(join(tmpdir(), 'oai-sb-spend-kept-')),
+      's.json',
+    )
+    const now = Date.now()
+    const written = await writeThen(file, now, quota(12, now))
+    expect(written?.spendControl).toEqual(spentBudget)
+  })
+
+  test('is not revived by an older snapshot after a fresher one reported none', async () => {
+    const file = join(
+      mkdtempSync(join(tmpdir(), 'oai-sb-spend-revive-')),
+      's.json',
+    )
+    const now = Date.now()
+    await setSidebarState(
+      make({
+        main: {
+          ...main({ ...quota(10, now), spendControlCleared: true }),
+          mainAccountId: 'acct-x',
+        },
+      }),
+      file,
+    )
+    await setSidebarMachineState(
+      {
+        main: {
+          ...main({
+            ...quota(90, now - 10 * 60_000),
+            spendControl: spentBudget,
+          }),
+          mainAccountId: 'acct-x',
+        },
+        fallbacks: [],
+        route: 'main-first',
+        lastUpdated: now + 1,
+      },
+      file,
+    )
+    await drainSidebarWrites()
+    const written = normalizeSidebarState(
+      JSON.parse(readFileSync(file, 'utf8')),
+    )
+    expect(written.main.quota?.spendControl).toBeUndefined()
+  })
 })
 
 test('machine write keeps the existing identity when the existing quota wins the merge (re-login race)', async () => {

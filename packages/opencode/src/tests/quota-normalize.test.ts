@@ -211,6 +211,10 @@ describe('quota normalize → QuotaSnapshot', () => {
     expect(withoutSpendControl).toEqual({})
     expect(nullSpendControl.spendControl).toBeUndefined()
     expect(nullIndividualLimit.spendControl).toBeUndefined()
+    // An explicit null says "no budget"; an absent key says nothing.
+    expect(withoutSpendControl.spendControlCleared).toBeUndefined()
+    expect(nullSpendControl.spendControlCleared).toBe(true)
+    expect(nullIndividualLimit.spendControlCleared).toBe(true)
   })
 
   it('wham normalizes a spend-control credit budget with string numerics', () => {
