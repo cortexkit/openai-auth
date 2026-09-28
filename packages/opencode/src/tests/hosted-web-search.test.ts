@@ -1,10 +1,56 @@
 import { describe, expect, test } from 'bun:test'
 
+import type { ToolContext } from '@opencode-ai/plugin'
 import {
+  HostedWebSearchTool,
+  NOT_AN_OPENAI_SESSION_MESSAGE,
   rewriteHostedWebSearchReplay,
   translateHostedWebSearchEvent,
   translateHostedWebSearchResponse,
 } from '../hosted-web-search'
+
+// The host passes `callID` at runtime without declaring it on ToolContext.
+function toolContext(callID?: string): ToolContext {
+  return {
+    sessionID: 'ses_1',
+    messageID: 'msg_1',
+    agent: 'build',
+    directory: '/tmp',
+    worktree: '/tmp',
+    abort: new AbortController().signal,
+    metadata: () => {},
+    ask: async () => {},
+    ...(callID === undefined ? {} : { callID }),
+  } as ToolContext
+}
+
+async function runSearch(callID?: string): Promise<string> {
+  const result = await HostedWebSearchTool.execute(
+    { query: 'anthropic web search' },
+    toolContext(callID),
+  )
+  return typeof result === 'string' ? result : result.output
+}
+
+describe('hosted web search tool', () => {
+  test('a call from another provider says no search was performed', async () => {
+    // An Anthropic tool call id: this session is not an OpenAI one, so the
+    // empty action must not be passed off as a result.
+    expect(await runSearch('toolu_01AbCd')).toBe(NOT_AN_OPENAI_SESSION_MESSAGE)
+  })
+
+  test('a hosted OpenAI call still records the action for replay', async () => {
+    expect(JSON.parse(await runSearch('ws_0123abcd'))).toEqual({
+      action: { query: 'anthropic web search' },
+    })
+  })
+
+  test('a call without an id keeps the hosted behaviour', async () => {
+    expect(JSON.parse(await runSearch())).toEqual({
+      action: { query: 'anthropic web search' },
+    })
+  })
+})
 
 describe('hosted web search replay', () => {
   test('rewrites local web_search function replay to Codex web_search_call item', () => {

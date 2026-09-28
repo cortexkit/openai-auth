@@ -4,15 +4,35 @@ import { type ToolDefinition, tool } from '@opencode-ai/plugin'
 const HOSTED_WEB_SEARCH_ID_PREFIX = 'ws_'
 const hostedWebSearchItems = new Map<string, Record<string, unknown>>()
 
+export const NOT_AN_OPENAI_SESSION_MESSAGE =
+  'No search was performed. This web_search is run by OpenAI on its own servers and only works in sessions using an OpenAI model. Use another search tool in this session.'
+
 export const HostedWebSearchTool: ToolDefinition = tool({
   description:
-    'Provider-executed OpenAI web search. This tool is handled server-side by OpenAI; the local plugin records the hosted action for deterministic replay.',
+    'Web search run by OpenAI on its servers. Only works in sessions using an OpenAI model; on any other provider it performs no search.',
   args: {
     type: tool.schema.string().optional(),
     query: tool.schema.string().optional(),
     queries: tool.schema.array(tool.schema.string()).optional(),
   },
-  async execute(args) {
+  async execute(args, context) {
+    // A real call only exists on an OpenAI session, where this plugin turns
+    // OpenAI's server-side search into a local call with a `ws_` id. Any other
+    // provider calling this tool gets an empty action back that looks like a
+    // result, so it is told plainly that nothing was searched. The host passes
+    // the call id at runtime without declaring it on the context type; when it
+    // is absent the call is treated as hosted, which is today's behaviour.
+    const callID = (context as { callID?: unknown }).callID
+    if (
+      typeof callID === 'string' &&
+      !callID.startsWith(HOSTED_WEB_SEARCH_ID_PREFIX)
+    ) {
+      return {
+        title: 'OpenAI Web Search',
+        output: NOT_AN_OPENAI_SESSION_MESSAGE,
+        metadata: {},
+      }
+    }
     return {
       title: 'OpenAI Web Search',
       output: JSON.stringify({ action: args }),

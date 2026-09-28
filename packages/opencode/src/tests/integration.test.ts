@@ -16,7 +16,7 @@ import {
   type OAuthAccount,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
-import { getConfigPath } from '../config.ts'
+import { getConfigPath, resetSettingsForTest } from '../config.ts'
 import { getAccountPaths } from '../core/account-paths'
 import { QUOTA_STALENESS_MS } from '../core/sticky-routing.ts'
 import {
@@ -7102,6 +7102,97 @@ describe('integration: active fallback routing', () => {
           'x-openai-internal-codex-responses-lite',
         ),
       ).toBe(testCase.marked ? 'true' : null)
+    }
+  })
+
+  describe('with hosted web search switched off', () => {
+    const NO_WEB_SEARCH = 'CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH'
+    let saved: string | undefined
+
+    beforeEach(() => {
+      saved = process.env[NO_WEB_SEARCH]
+      process.env[NO_WEB_SEARCH] = '1'
+      resetSettingsForTest()
+    })
+
+    afterEach(() => {
+      restoreEnv(NO_WEB_SEARCH, saved)
+      resetSettingsForTest()
+    })
+
+    it('registers no web_search tool', async () => {
+      const hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      try {
+        expect(hooks.tool?.web_search).toBeUndefined()
+      } finally {
+        await hooks.dispose?.()
+      }
+    })
+
+    it('keeps the Exa search tool on the wire', async () => {
+      // Exa is dropped only because the hosted search replaces it; with that
+      // off, dropping it would leave the session with no search at all.
+      seedEmptyAccountStorage()
+      const originalFetch = globalThis.fetch
+      let sent: Record<string, unknown> | undefined
+      let hooks: Hooks | undefined
+      try {
+        globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+          if (isResponsesSend(url) && typeof init?.body === 'string')
+            sent = JSON.parse(init.body)
+          return new Response('{}', { status: 200 })
+        }) as typeof globalThis.fetch
+        const loaded = await loadFetchOverride(
+          createMockPluginInput(),
+          Date.now() + 3600_000,
+        )
+        hooks = loaded.hooks
+        await loaded.fetchOverride('https://api.openai.com/v1/responses', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'session-id': 'sess-no-web-search',
+          },
+          body: JSON.stringify({
+            model: 'gpt-5.5',
+            input: [
+              { role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+            ],
+            tools: [
+              { type: 'function', name: 'read', parameters: {} },
+              {
+                type: 'function',
+                name: 'websearch_web_search_exa',
+                parameters: {},
+              },
+            ],
+          }),
+        })
+      } finally {
+        globalThis.fetch = originalFetch
+        await hooks?.dispose?.()
+      }
+      if (!sent) throw new Error('no request reached the responses endpoint')
+      const tools = sent.tools as Array<Record<string, unknown>>
+      const names = tools.map((tool) => tool.name ?? tool.type)
+      // The Codex request rewrite adds `strict: false` to each tool, so this
+      // confirms the request was rewritten rather than passed along unchanged.
+      expect(tools.every((tool) => tool.strict === false)).toBe(true)
+      expect(names).toContain('websearch_web_search_exa')
+      expect(names).not.toContain('web_search')
+    })
+  })
+
+  it('registers the hosted web_search tool when it is on', async () => {
+    const hooks = await CodexAuthPlugin(createMockPluginInput(), {
+      experimentalWebSockets: false,
+    })
+    try {
+      expect(hooks.tool?.web_search).toBeDefined()
+    } finally {
+      await hooks.dispose?.()
     }
   })
 

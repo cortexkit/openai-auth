@@ -729,7 +729,9 @@ function prepareCodexRequest(input: {
   if (Array.isArray(parsed.tools))
     parsed.tools = parsed.tools.map(normalizeCodexTool)
   removeHostedWebSearchFunctionTool(parsed)
-  removeExaWebSearchFunctionTool(parsed)
+  // The Exa tool is dropped only because the hosted search replaces it. With
+  // hosted search off, dropping it would leave the session with no search.
+  if (getSettings().webSearch) removeExaWebSearchFunctionTool(parsed)
   rewriteHostedWebSearchReplay(parsed)
   maybeInjectCacheStabilizerTool(parsed)
   applyMidConversationEffort(parsed, input.metadata)
@@ -1612,9 +1614,13 @@ export async function CodexAuthPlugin(
         )
       },
     },
-    tool: {
-      web_search: HostedWebSearchTool,
-    },
+    // Plugin tools are offered to every session whatever its provider, so the
+    // hosted search is registered only when it is switched on. With it off,
+    // nothing registers a `web_search` that could not actually search.
+    // Read once at load: changing `webSearch` takes effect after a restart.
+    ...(getSettings().webSearch
+      ? { tool: { web_search: HostedWebSearchTool } }
+      : {}),
     auth: {
       provider: 'openai',
       async loader(getAuth) {
