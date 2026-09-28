@@ -10,7 +10,7 @@ The plugin registers the built-in `openai` provider id. OpenCode loads external 
 
 ```json
 {
-  "plugin": ["@cortexkit/opencode-openai-auth@0.9.1"]
+  "plugin": ["@cortexkit/opencode-openai-auth@0.10.0"]
 }
 ```
 
