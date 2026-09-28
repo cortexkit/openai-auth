@@ -586,21 +586,16 @@ describe('createWebSocketFetch', () => {
     )
   })
 
-  test('keeps admission rate-limit reroute alive after a filtered control frame (no emitted output)', async () => {
-    // A hosted-web-search lifecycle frame is filtered from the SSE output
-    // (translateHostedWebSearchEvent returns undefined), so it must NOT mark the
-    // stream as having emitted. If it did, a following admission-time usage limit
-    // would skip the retryable reroute and silently enqueue the error frame.
+  test('keeps admission rate-limit reroute alive after a dropped frame (no emitted output)', async () => {
+    // A frame that does not parse as an event is dropped from the SSE output,
+    // so it must NOT mark the stream as having emitted. If it did, a following
+    // admission-time usage limit would skip the retryable reroute and silently
+    // enqueue the error frame.
     const rateLimitCalls: Array<{ window: string; accountId?: string }> = []
     await withFakeWebSocket(
       ({ message }) => ({
         send() {
-          message(
-            JSON.stringify({
-              type: 'response.web_search_call.searching',
-              item_id: 'ws_1',
-            }),
-          )
+          message('not a json event')
           message(
             JSON.stringify({
               type: 'error',

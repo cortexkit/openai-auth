@@ -97,7 +97,7 @@ describe('request dumps', () => {
         (
           seen[0]?.body.tools as Array<Record<string, unknown>> | undefined
         )?.some((tool) => tool.type === 'web_search') ?? false,
-      ).toBe(true)
+      ).toBe(false)
     } finally {
       globalThis.fetch = originalFetch
       restoreEnv('CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT', originalEndpoint)
@@ -351,7 +351,7 @@ describe('request dumps', () => {
         for (const file of [bodyFile, metaFile, requestFile]) {
           expect((await stat(join(dumpDir, file))).mode & 0o777).toBe(0o600)
         }
-        expect(body).toContain('"type":"web_search"')
+        expect(body).not.toContain('"type":"web_search"')
         expect(meta).toMatchObject({
           transport: 'http',
           phase: 'http',
@@ -359,7 +359,6 @@ describe('request dumps', () => {
           body: {
             parseable: true,
             inputCount: 1,
-            hasWebSearch: true,
           },
         })
         expect(request.headers.authorization).toBe('[redacted]')
@@ -621,14 +620,13 @@ describe('request dumps', () => {
 
         expect(prewarm).toMatchObject({
           transport: 'websocket',
-          body: { generate: false, inputCount: 0, hasWebSearch: true },
+          body: { generate: false, inputCount: 0 },
         })
         expect(main).toMatchObject({
           transport: 'websocket',
           body: {
             previousResponseID: 'resp_prewarm',
             inputCount: 1,
-            hasWebSearch: true,
           },
         })
       } finally {

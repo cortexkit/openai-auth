@@ -2087,7 +2087,7 @@ export async function migrateIfNeeded(
         if (accountId) storage.mainAccountId = accountId
       }
 
-      // Merge with existing transport keys so saving the account store preserves webSearch/webSockets/rawWebSocket/dump/dumpDir.
+      // Merge with existing transport keys so saving the account store preserves webSockets/rawWebSocket/dump/dumpDir.
       const existingFields =
         existing.exists && isRecord(existing.value) ? existing.value : {}
       const nextConfig = { ...existingFields, ...configFromStorage(storage) }

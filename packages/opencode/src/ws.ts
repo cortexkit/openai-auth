@@ -7,8 +7,7 @@ import {
   normalizeWsFrame,
 } from '@cortexkit/openai-auth-core/internal'
 import { APICallError } from 'ai'
-import { DUMP_SESSION_HEADER, dumpDiagnostic } from './dump'
-import { translateHostedWebSearchEvent } from './hosted-web-search'
+import { DUMP_SESSION_HEADER } from './dump'
 import { createLogger } from './logger'
 import { RawWebSocket } from './raw-ws'
 import { ResponseStreamError } from './response-stream-error'
@@ -600,29 +599,22 @@ export function streamResponsesWebSocket(
       }
     }
 
-    if (event) {
-      void logProviderNativeWebSearchEvent(event, options.sessionID)
-      recordFinalizedFunctionCall(event, finalizedFunctionCallIds)
-    }
-
-    const translatedEvent = event ? translateHostedWebSearchEvent(event) : event
-    if (!translatedEvent) {
-      // Filtered/control frame (e.g. a hosted-web-search lifecycle event) — no
-      // SSE output is enqueued, so it must NOT set `emitted`. Setting it here
-      // would block the no-replay reroute for a later admission-time rate limit
-      // (the `!emitted` gate above). onFirstEvent still fires so the idle timer
-      // and the pool's first-event gate register the activity.
+    if (!event) {
+      // A frame that did not parse as an event — nothing is enqueued, so it
+      // must NOT set `emitted`. Setting it here would block the no-replay
+      // reroute for a later admission-time rate limit (the `!emitted` gate
+      // above). onFirstEvent still fires so the idle timer and the pool's
+      // first-event gate register the activity.
       if (!emitted) options.onFirstEvent?.()
       resetIdleTimeout('idle timeout waiting for websocket')
       return
     }
-    const outputText =
-      translatedEvent === event ? text : JSON.stringify(translatedEvent)
+    recordFinalizedFunctionCall(event, finalizedFunctionCallIds)
 
     if (!emitted) options.onFirstEvent?.()
     controller?.enqueue(
       encoder.encode(
-        `${outputText
+        `${text
           .split(/\r?\n/)
           .map((line) => `data: ${line}`)
           .join('\n')}\n\n`,
@@ -632,10 +624,10 @@ export function streamResponsesWebSocket(
     lastFrameAt = Date.now()
     if (createdResponseID !== undefined) framesSinceCreated++
     if (openingFrameTypes.length < OPENING_FRAME_LIMIT) {
-      openingFrameTypes.push(String(translatedEvent.type))
+      openingFrameTypes.push(String(event.type))
     }
-    if (translatedEvent.type === 'response.created') {
-      createdResponseID = responseIDOf(translatedEvent)
+    if (event.type === 'response.created') {
+      createdResponseID = responseIDOf(event)
       // Logged rather than dumped: a response that dies before completing has
       // no id anywhere else, and dumps are off by default, so without this the
       // only way to name it to the provider is "the one after <previous id>".
@@ -646,38 +638,33 @@ export function streamResponsesWebSocket(
         hasContinuation: previousResponseID !== undefined,
       })
     }
-    if (!isNonEmittingFrame(translatedEvent.type)) {
+    if (!isNonEmittingFrame(event.type)) {
       emittedOutput = true
     }
     resetIdleTimeout('idle timeout waiting for websocket')
 
-    if (!translatedEvent) return
-
-    if (
-      translatedEvent.type === 'response.completed' ||
-      translatedEvent.type === 'response.done'
-    ) {
+    if (event.type === 'response.completed' || event.type === 'response.done') {
       completed = true
       // Belt-and-suspenders: the completed frame may carry the full output list;
       // fold any finalized function_call ids it lists into the streamed set.
-      collectFinalizedFromResponse(translatedEvent, finalizedFunctionCallIds)
-      options.onComplete?.(translatedEvent, finalizedFunctionCallIds)
-      options.onTerminal?.(translatedEvent)
+      collectFinalizedFromResponse(event, finalizedFunctionCallIds)
+      options.onComplete?.(event, finalizedFunctionCallIds)
+      options.onTerminal?.(event)
       closeCompleted()
       return
     }
 
     if (
-      translatedEvent.type === 'response.failed' ||
-      translatedEvent.type === 'response.incomplete' ||
-      translatedEvent.type === 'error'
+      event.type === 'response.failed' ||
+      event.type === 'response.incomplete' ||
+      event.type === 'error'
     ) {
       // A rate-limit response.failed is intercepted earlier (errored as a
       // retryable stream failure so OpenCode reroutes). Any OTHER terminal
       // failure/incomplete/error reaching here is non-reroutable and closes
       // the stream benignly.
       completed = true
-      options.onTerminal?.(translatedEvent)
+      options.onTerminal?.(event)
       closeCompleted()
     }
   }
@@ -787,38 +774,6 @@ export function streamResponsesWebSocket(
       headers: { 'content-type': 'text/event-stream' },
     },
   )
-}
-
-async function logProviderNativeWebSearchEvent(
-  event: Record<string, unknown>,
-  sessionID: string | undefined,
-) {
-  if (!isProviderNativeWebSearchEvent(event)) return
-  await dumpDiagnostic({
-    component: 'ws',
-    event: 'provider_native_web_search_event',
-    sessionID,
-    serverEventType: event.type,
-    itemType: isRecord(event.item) ? event.item.type : undefined,
-    serverEvent: event,
-  })
-}
-
-function isProviderNativeWebSearchEvent(event: Record<string, unknown>) {
-  if (
-    typeof event.type === 'string' &&
-    (event.type.startsWith('response.web_search_call.') ||
-      event.type.startsWith('response.web_search_preview_call.'))
-  ) {
-    return true
-  }
-  if (isRecord(event.item) && typeof event.item.type === 'string') {
-    return (
-      event.item.type === 'web_search_call' ||
-      event.item.type === 'web_search_preview_call'
-    )
-  }
-  return false
 }
 
 // A function/custom tool call is "finalized" once the response emits its

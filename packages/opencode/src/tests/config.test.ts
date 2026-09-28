@@ -11,7 +11,6 @@ describe('config resolution', () => {
   const ENV_KEYS = [
     'OPENCODE_OPENAI_AUTH_FILE',
     'CORTEXKIT_OPENAI_AUTH_DUMP',
-    'CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH',
     'CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE',
   ]
 
@@ -175,28 +174,14 @@ describe('config resolution', () => {
       }
     })
 
-    test('ignores unrecognized values for negative env (NO_WEB_SEARCH)', async () => {
+    test('a config file that still sets the removed webSearch key loads normally', async () => {
       await writeFile(
         configPath,
-        JSON.stringify({
-          webSearch: true,
-        }),
+        JSON.stringify({ webSearch: true, dump: true }),
       )
-
-      // Unrecognized value should fall through to config (true)
-      process.env.CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH = 'maybe'
       resetSettingsForTest()
-      expect(getSettings().webSearch).toBe(true)
-
-      // Documented truthy value (true) for NO_WEB_SEARCH disables webSearch
-      process.env.CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH = 'true'
-      resetSettingsForTest()
-      expect(getSettings().webSearch).toBe(false)
-
-      // Documented falsey value (false) for NO_WEB_SEARCH enables webSearch
-      process.env.CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH = 'false'
-      resetSettingsForTest()
-      expect(getSettings().webSearch).toBe(true)
+      expect(getSettings().dump).toBe(true)
+      expect('webSearch' in getSettings()).toBe(false)
     })
   })
 })

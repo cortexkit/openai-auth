@@ -2,7 +2,7 @@
 
 ChatGPT Plus/Pro OAuth support for [OpenCode](https://opencode.ai).
 
-This OpenCode plugin lets OpenCode talk to the OpenAI Codex backend using a ChatGPT Plus/Pro subscription instead of a pay-as-you-go API key. It rewrites OpenCode's outbound OpenAI requests into Codex's request shape, filters the model list to OAuth-eligible models, zeroes provider costs for those models, and adds a prompt-cache stabilizer.
+This OpenCode plugin lets OpenCode talk to the OpenAI Codex backend using a ChatGPT Plus/Pro subscription instead of a pay-as-you-go API key. It rewrites OpenCode's outbound OpenAI requests into Codex's request shape, filters the model list to OAuth-eligible models, and zeroes provider costs for those models.
 
 The plugin registers the built-in `openai` provider id. OpenCode loads external plugins after its built-ins, so this package supersedes OpenCode's internal OpenAI auth hook without any change to your model configuration.
 
@@ -25,7 +25,6 @@ Restart OpenCode after changing plugin config, then authenticate:
 - ChatGPT Plus/Pro OAuth login (browser and headless device flows), plus a manual API-key fallback.
 - Codex request rewriting for OAuth requests, with Codex identity parity.
 - OAuth model filtering and zero-cost display.
-- Prompt-cache stabilizer (`web_search`) that keeps tool-continuation requests on the backend's cached path (on by default).
 - Multiple ChatGPT accounts with automatic reactive fallback on rate limits, `main-first`, `fallback-first`, or sticky-balanced routing, and a per-account quota killswitch.
 - Per-turn quota tracking (5-hour + weekly windows) on both transports, with a sidebar readout and an explicit all-accounts refresh.
 - Idle prompt-cache keep-warm, with an optional subagent mode and main-only sustain mode.
@@ -66,15 +65,14 @@ Settings resolve as environment variable → config file (`~/.config/opencode/op
 
 | Config field | Environment variable | Default | Purpose |
 | --- | --- | --- | --- |
-| `webSearch` | `CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH` (set to disable) | `true` | Inject the `web_search` prompt-cache stabilizer. |
 | `webSockets` | `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS` | `false` | Use the Codex Responses WebSocket transport instead of HTTP. |
 | `rawWebSocket` | `CORTEXKIT_OPENAI_AUTH_RAW_WS` | `false` | Use the hand-rolled raw TCP/TLS client with Codex-style incremental streaming. Bun uses `Bun.connect`; Node/OpenCode Desktop uses `node:net`/`node:tls`. |
-| `responsesLite` | `CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE` | `false` | Send `gpt-5.6-sol`/`-terra`/`-luna` requests in Codex's Responses Lite shape, matching the Codex CLI. Bypasses the `web_search` stabilizer for these models. |
+| `responsesLite` | `CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE` | `false` | Send `gpt-5.6-sol`/`-terra`/`-luna` requests in Codex's Responses Lite shape, matching the Codex CLI. |
 | `dump` | `CORTEXKIT_OPENAI_AUTH_DUMP` | `false` | Dump final Codex request bodies for cache debugging. |
 | `dumpDir` | `OPENCODE_OPENAI_AUTH_DUMP_DIR` | OS temp dir: `opencode-openai-auth-dumps` | Directory for request dump files. |
 | `codexApiEndpoint` | `CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT` | `https://chatgpt.com/backend-api/codex/responses` | Send rewritten Codex requests to a compatible proxy/relay instead of ChatGPT's backend endpoint. |
 
-See the [repository README](https://github.com/cortexkit/openai-auth#readme) for transport differences and why `web_search` is needed.
+See the [repository README](https://github.com/cortexkit/openai-auth#readme) for transport differences.
 
 `sticky-balanced` places a cold session by least projected quota pressure, then keeps its SHA-256-keyed sidebar-state pin for up to seven days. It does not rebalance mid-session or use a Retry-After hold; it migrates only after confirmed exhaustion or permanent auth failure. Stale or unknown quota is excluded from weighted placement; when the killswitch is enabled, accounts below their per-account threshold are also excluded from both weighted placement AND the mode-fallback fail-open branch — that branch otherwise orders by `resetCreditsApplicable` first, then configured order, then account id. Subagents have separate pins and reuse them when resumed.
 

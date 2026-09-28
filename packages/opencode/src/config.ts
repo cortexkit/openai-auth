@@ -19,8 +19,6 @@ export const DEFAULT_CODEX_API_ENDPOINT =
 
 /** Shape of ~/.config/opencode/openai-auth.json (all fields optional). */
 export interface OpenAIAuthConfig {
-  /** Inject the native web_search tool to keep the Codex prompt cache stable. Default true. */
-  webSearch?: boolean
   /** Use the WebSocket transport for /responses instead of plain HTTP. Default false. */
   webSockets?: boolean
   /** Use the hand-rolled raw TCP/TLS WebSocket client (incremental streaming). Default false. */
@@ -36,7 +34,6 @@ export interface OpenAIAuthConfig {
 }
 
 export interface ResolvedSettings {
-  webSearch: boolean
   webSockets: boolean
   rawWebSocket: boolean
   responsesLite: boolean
@@ -48,8 +45,6 @@ export interface ResolvedSettings {
 const CONFIG_FILE_NAME = 'openai-auth.json'
 
 const ENV = {
-  // Negative for back-compat: presence disables the (default-on) web_search cache fix.
-  noWebSearch: 'CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH',
   webSockets: 'CORTEXKIT_OPENAI_AUTH_WEBSOCKETS',
   rawWebSocket: 'CORTEXKIT_OPENAI_AUTH_RAW_WS',
   responsesLite: 'CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE',
@@ -119,16 +114,6 @@ function resolveBool(
 
 function resolve(): ResolvedSettings {
   const config = readConfigFile()
-  // web_search is default-on and gated by a NEGATIVE env (NO_WEB_SEARCH). If that env is
-  // explicitly set it always wins; otherwise the positive config field, otherwise default true.
-  const noWebSearchEnv = envBool(ENV.noWebSearch)
-  const webSearch =
-    noWebSearchEnv !== undefined
-      ? !noWebSearchEnv
-      : typeof config.webSearch === 'boolean'
-        ? config.webSearch
-        : true
-
   let dumpConfig: boolean | undefined
   if (config.dump !== undefined && config.dump !== null) {
     if (typeof config.dump === 'object') {
@@ -139,7 +124,6 @@ function resolve(): ResolvedSettings {
   }
 
   return {
-    webSearch,
     webSockets: resolveBool(ENV.webSockets, config.webSockets, false),
     rawWebSocket: resolveBool(ENV.rawWebSocket, config.rawWebSocket, false),
     responsesLite: resolveBool(ENV.responsesLite, config.responsesLite, false),

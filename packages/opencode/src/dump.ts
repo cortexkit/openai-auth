@@ -262,7 +262,6 @@ function bodySummary(bodyText: string) {
     toolsCount: tools.length,
     toolTypes,
     toolsHash: hashJson(tools),
-    hasWebSearch: toolTypes.includes('web_search'),
     clientMetadataKeys: clientMetadata
       ? Object.keys(clientMetadata).sort()
       : [],

@@ -2,7 +2,7 @@
 
 ChatGPT Plus/Pro OAuth support for [OpenCode](https://opencode.ai), maintained by CortexKit.
 
-This plugin lets OpenCode talk to the OpenAI **Codex** backend (`https://chatgpt.com/backend-api/codex/responses`) using a ChatGPT Plus/Pro subscription instead of a pay-as-you-go API key. It rewrites OpenCode's outbound OpenAI requests into Codex's request shape, filters the model list to OAuth-eligible models, zeroes provider costs for those models, and adds a prompt-cache stabilizer that keeps tool-continuation requests on the backend's cached path.
+This plugin lets OpenCode talk to the OpenAI **Codex** backend (`https://chatgpt.com/backend-api/codex/responses`) using a ChatGPT Plus/Pro subscription instead of a pay-as-you-go API key. It rewrites OpenCode's outbound OpenAI requests into Codex's request shape, filters the model list to OAuth-eligible models, and zeroes provider costs for those models.
 
 On top of single-account auth it adds a full account-management layer: multiple ChatGPT accounts with automatic fallback when one is rate-limited, live quota visibility, a per-account killswitch, an idle prompt-cache keep-warm, and interactive in-TUI control surfaces for all of it.
 
@@ -12,7 +12,7 @@ The plugin intentionally registers the built-in `openai` provider id. OpenCode l
 
 | Package | Agent | Purpose |
 | --- | --- | --- |
-| `@cortexkit/opencode-openai-auth` | OpenCode | ChatGPT Plus/Pro OAuth, Codex request rewriting, model filtering, prompt-cache stabilizer, multi-account fallback, quota tracking, cache keep-warm, and an optional OpenAI Responses WebSocket transport. |
+| `@cortexkit/opencode-openai-auth` | OpenCode | ChatGPT Plus/Pro OAuth, Codex request rewriting, model filtering, multi-account fallback, quota tracking, cache keep-warm, and an optional OpenAI Responses WebSocket transport. |
 
 ## Install
 
@@ -186,7 +186,6 @@ Config file: `~/.config/opencode/openai-auth.json` (the directory follows `OPENC
 
 ```json
 {
-  "webSearch": true,
   "webSockets": false,
   "rawWebSocket": false,
   "responsesLite": false,
@@ -197,15 +196,16 @@ Config file: `~/.config/opencode/openai-auth.json` (the directory follows `OPENC
 
 | Setting | Config field | Environment variable | Default | Purpose |
 | --- | --- | --- | --- | --- |
-| Prompt-cache fix | `webSearch` | `CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH` (set to disable) | `true` | Appends a native `web_search` tool to the wire request so Codex keeps tool-continuation requests on the stable prompt cache. See [Why `web_search`](#why-web_search). |
 | WebSocket transport | `webSockets` | `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS` | `false` | Use the Codex Responses WebSocket transport instead of plain HTTP. See [Transports](#transports). |
 | Hand-rolled WS client | `rawWebSocket` | `CORTEXKIT_OPENAI_AUTH_RAW_WS` | `false` | When WebSockets are enabled, use the hand-rolled raw TCP/TLS client that surfaces Codex-style incremental streaming. Bun uses `Bun.connect`; Node/OpenCode Desktop uses `node:net`/`node:tls`. |
-| Responses Lite | `responsesLite` | `CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE` | `false` | Send `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` requests in Codex's Responses Lite shape — the wire format the Codex CLI itself uses for these models. Lite carries tools inline in the input, so it bypasses the `web_search` prompt-cache stabilizer for these models (see [Why `web_search`](#why-web_search)). |
+| Responses Lite | `responsesLite` | `CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE` | `false` | Send `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` requests in Codex's Responses Lite shape — the wire format the Codex CLI itself uses for these models. |
 | Request dumps | `dump` | `CORTEXKIT_OPENAI_AUTH_DUMP` | `false` | Write final Codex request bodies and redacted request metadata for cache debugging. Bodies may contain prompt/session content. |
 | Dump directory | `dumpDir` | `OPENCODE_OPENAI_AUTH_DUMP_DIR` | OS temp dir: `opencode-openai-auth-dumps` | Destination for `.body.json`, `.meta.json`, and `.request.json` dump files. |
 | Codex endpoint | `codexApiEndpoint` | `CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT` | `https://chatgpt.com/backend-api/codex/responses` | Send rewritten Codex requests to a compatible proxy/relay instead of ChatGPT's backend endpoint. |
 
-Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty. The `webSearch` negative env var (`CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH`), when set to a truthy value, disables the cache fix and always wins over the config file.
+Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty.
+
+The `webSearch` setting and `CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH` have been removed, along with the `web_search` tool the plugin used to add to requests; a config file that still sets `webSearch` loads normally and the key is ignored.
 
 The same `openai-auth.json` file also holds the managed **account store** (accounts, routing, killswitch thresholds, quota cache, log level, and cache-keep state). Those keys are written by the slash commands — edit them through the commands rather than by hand. The plugin distinguishes the two: a settings-only file is never overwritten with account data, and account operations preserve your transport settings.
 
@@ -216,12 +216,6 @@ Example — opt into the WebSocket transport via the config file:
   "webSockets": true,
   "rawWebSocket": true
 }
-```
-
-Example — disable the cache fix for one run via env:
-
-```sh
-CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH=1 opencode
 ```
 
 Example — route OAuth/Codex traffic through a local Codex-compatible proxy:
@@ -258,22 +252,9 @@ The plugin can reach the Codex backend over plain HTTP or over the OpenAI Respon
 | --- | --- | --- | --- |
 | HTTP (default) | — | Server-sent events | Simplest and the default. One request/response per turn step. |
 | Native WebSocket | `webSockets: true` | Coarse | Uses the runtime's native WebSocket with a session-keyed connection pool and `previous_response_id` continuation chaining. Native clients can batch frames, so streaming is coarser than Codex's raw client. |
-| Hand-rolled WebSocket | `webSockets: true` + `rawWebSocket: true` | Codex-style incremental | A hand-rolled RFC 6455 client. Bun uses `Bun.connect`; Node/OpenCode Desktop uses `node:net`/`node:tls`. Exists only to surface Codex-style incremental streaming (token-by-token rather than batched); it is not required for the cache fix. |
+| Hand-rolled WebSocket | `webSockets: true` + `rawWebSocket: true` | Codex-style incremental | A hand-rolled RFC 6455 client. Bun uses `Bun.connect`; Node/OpenCode Desktop uses `node:net`/`node:tls`. Exists only to surface Codex-style incremental streaming (token-by-token rather than batched). |
 
 WebSocket continuation chaining relies on `previous_response_id`, which only resolves on the connection that produced it. A dropped or reconnected socket discards its continuation and starts a fresh chain.
-
-## Why `web_search`
-
-The Codex/OAuth backend has a prompt-cache quirk: on tool-continuation requests whose `tools` array contains **only** custom `function`-type tools (no OpenAI-native tool type), the cached prefix intermittently drops to zero mid-turn, re-billing the full prefix as uncached. Measured on a clean build, this happens on roughly 8–20% of tool-bearing requests across every transport.
-
-Appending a single native `web_search` tool to the wire `tools` array flips every tool-bearing request onto the backend's stable cache path and eliminates the drops. The behavior is specific to `web_search` — adding other native tools (image generation, extra dummy function tools) does not fix it — and it is independent of transport.
-
-Two things make this safe:
-
-- The model does not invoke `web_search` on coding tasks, so it acts as an invisible cache anchor. (It is server-executed, so a hypothetical invocation would run a real search — acceptable given it never fires in practice.)
-- Beyond removing the drops, anchoring the request also roughly doubles the steady cached prefix, so it is a net cost win, not just a stability fix.
-
-The fix is on by default. Disable it only for diagnostics, with `webSearch: false` or `CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH=1`.
 
 ## Development
 

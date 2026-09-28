@@ -116,11 +116,6 @@ import {
   selectStickyCandidate,
 } from './core/sticky-routing'
 import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
-import {
-  HostedWebSearchTool,
-  rewriteHostedWebSearchReplay,
-  translateHostedWebSearchResponse,
-} from './hosted-web-search'
 import { createLogger, setLogLevel } from './logger'
 import { loadModelsDevCosts } from './model-costs'
 import { resolvePromptContext } from './prompt-context'
@@ -728,12 +723,6 @@ function prepareCodexRequest(input: {
   parsed.parallel_tool_calls ??= true
   if (Array.isArray(parsed.tools))
     parsed.tools = parsed.tools.map(normalizeCodexTool)
-  removeHostedWebSearchFunctionTool(parsed)
-  // The Exa tool is dropped only because the hosted search replaces it. With
-  // hosted search off, dropping it would leave the session with no search.
-  if (getSettings().webSearch) removeExaWebSearchFunctionTool(parsed)
-  rewriteHostedWebSearchReplay(parsed)
-  maybeInjectCacheStabilizerTool(parsed)
   applyMidConversationEffort(parsed, input.metadata)
   if (useResponsesLite) rewriteResponsesLiteBody(parsed)
   const clientMetadata: Record<string, unknown> = {
@@ -981,33 +970,6 @@ export function resolveSidebarSessionId(headers: Headers): string | undefined {
     undefined
   )
 }
-
-// Prompt-cache stabilizer (ON by default; opt out via config `webSearch: false` or
-// CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH=1 — env wins over config).
-//
-// The Codex `responses` backend only puts a request on the STABLE prompt-cache path when its
-// OpenAI's prompt-cache path for tool-continuation requests is hashed against
-// the tool type set. Requests carrying only custom `function` tools can
-// intermittently fail to hit the cache, dropping cached_tokens to 0.
-// Appending a native `web_search` tool — which executes server-side and is
-// never actually invoked by the model on coding tasks — redirects every
-// tool-bearing request onto the stable cache path. Only injected when the
-// request already carries tools (agentic turns); tool-less requests have no
-// cache-continuation risk and are left untouched.
-function maybeInjectCacheStabilizerTool(parsed: Record<string, unknown>) {
-  if (!getSettings().webSearch) return
-  if (!Array.isArray(parsed.tools) || parsed.tools.length === 0) return
-  if (parsed.tools.some((t) => isRecord(t) && t.type === 'web_search')) return
-  parsed.tools = [
-    ...parsed.tools,
-    {
-      type: 'web_search',
-      external_web_access: false,
-      search_content_types: ['text', 'image'],
-    },
-  ]
-}
-
 function stripResponsesLiteImageDetails(value: unknown) {
   if (Array.isArray(value)) {
     for (const item of value) stripResponsesLiteImageDetails(item)
@@ -1113,30 +1075,6 @@ function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
   parsed.input = [...prefix, ...input]
   delete parsed.tools
   delete parsed.instructions
-}
-
-function removeHostedWebSearchFunctionTool(parsed: Record<string, unknown>) {
-  if (!Array.isArray(parsed.tools)) return
-  parsed.tools = parsed.tools.filter(
-    (item) =>
-      !(
-        isRecord(item) &&
-        item.type === 'function' &&
-        item.name === 'web_search'
-      ),
-  )
-}
-
-function removeExaWebSearchFunctionTool(parsed: Record<string, unknown>) {
-  if (!Array.isArray(parsed.tools)) return
-  parsed.tools = parsed.tools.filter(
-    (item) =>
-      !(
-        isRecord(item) &&
-        item.type === 'function' &&
-        item.name === 'websearch_web_search_exa'
-      ),
-  )
 }
 
 // Match Codex's function-tool shape: drop the JSON-Schema `$schema` dialect marker
@@ -1614,13 +1552,6 @@ export async function CodexAuthPlugin(
         )
       },
     },
-    // Plugin tools are offered to every session whatever its provider, so the
-    // hosted search is registered only when it is switched on. With it off,
-    // nothing registers a `web_search` that could not actually search.
-    // Read once at load: changing `webSearch` takes effect after a restart.
-    ...(getSettings().webSearch
-      ? { tool: { web_search: HostedWebSearchTool } }
-      : {}),
     auth: {
       provider: 'openai',
       async loader(getAuth) {
@@ -1745,7 +1676,6 @@ export async function CodexAuthPlugin(
             : getSettings().webSockets
               ? 'websocket'
               : 'http',
-          webSearch: getSettings().webSearch,
         })
 
         const quotaManager = new QuotaManager({
@@ -3016,7 +2946,7 @@ export async function CodexAuthPlugin(
               headers: finalInit.headers,
               status: response.status,
             })
-            return stamp(translateHostedWebSearchResponse(response))
+            return stamp(response)
           } catch (error) {
             await dumpCodexRequest({
               sessionID,
