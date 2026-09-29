@@ -2433,7 +2433,9 @@ describe('createWebSocketFetch', () => {
               JSON.stringify({
                 type: 'error',
                 status: 503,
-                error: { message: 'upstream unavailable' },
+                // Wording the host's retry patterns match: it must not be
+                // what reaches the host after output.
+                error: { message: 'Service Unavailable' },
               }),
             )
         },
@@ -2460,6 +2462,7 @@ describe('createWebSocketFetch', () => {
         expect(error).toBeInstanceOf(Error)
         expect(error).not.toBeInstanceOf(ResponseStreamError)
         expect(APICallError.isInstance(error)).toBe(false)
+        expect((error as Error).message).toBe(TERMINAL_AFTER_OUTPUT_MESSAGE)
         websocketFetch.close()
       },
     )

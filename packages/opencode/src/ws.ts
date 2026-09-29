@@ -606,8 +606,50 @@ export function streamResponsesWebSocket(
         responseHeaders: wrappedError.headers,
         responseBody: wrappedError.body,
       })
+      // Routed by what the reader already has, as a transport failure is.
+      // The provider's wording and status must not reach the host once
+      // something durable was shown or a tool dispatched: the host retries on
+      // a message match ("Service Unavailable", "429") even over a
+      // non-retryable flag, and that retry would repeat text or re-run a tool.
+      // onTerminal above has already dropped any continuation and invalidated
+      // the connection for this non-completed response.
+      const outcome = outputShape()
+      if (outcome === 'none' || outcome === 'unfinished-calls') {
+        if (outcome === 'unfinished-calls') {
+          logT.warn(
+            'protocol error after unfinished function calls only; surfaced as before output',
+            {
+              ...sessionKeys,
+              status: wrappedError.status,
+              reason: wrappedError.message,
+              outputShape: outcome,
+              responseID: createdResponseID,
+              previousResponseID,
+            },
+          )
+        }
+        controller?.error(error)
+        return
+      }
+      logT.warn(
+        outcome === 'finished-calls'
+          ? 'protocol error after finished function calls only; ended as completed'
+          : 'protocol error after output; not retried',
+        {
+          ...sessionKeys,
+          status: wrappedError.status,
+          reason: wrappedError.message,
+          outputShape: outcome,
+          responseID: createdResponseID,
+          previousResponseID,
+        },
+      )
+      if (outcome === 'finished-calls') {
+        closeWithSyntheticCompletion()
+        return
+      }
       controller?.error(
-        emittedOutput ? new Error(error.message, { cause: error }) : error,
+        new Error(TERMINAL_AFTER_OUTPUT_MESSAGE, { cause: error }),
       )
       return
     }
@@ -1122,12 +1164,21 @@ const SYNTHETIC_COMPLETED_EVENT = {
  * wrong in one direction replays output someone already read; in the other it
  * throws away a turn that nothing had come out of yet.
  *
- * Two lifecycle frames announce a response without carrying any of it. The
- * `codex.` frames are the transport's own envelope — the host's parser has no
- * branch for them and yields nothing (`openai-responses.ts` at v1.18.30 ends
- * its dispatch with `NO_EVENTS`), so a stream that died right after one has
- * shown the reader nothing at all. `codex.rate_limits` never reaches here; it
- * is consumed for quota further up.
+ * These frames are still forwarded to the reader; they are only left out when
+ * deciding what the reader has been shown.
+ *
+ * Two lifecycle frames announce a response without carrying any of it, and
+ * the `codex.` frames are the transport's own envelope. In the parser the
+ * stock host runtime uses (@ai-sdk/openai 3.0.88, `doStream` in
+ * dist/index.mjs), `response.created` yields only a `response-metadata` part
+ * (response id, timestamp, model), which carries no content. Neither
+ * `response.in_progress` nor any `codex.` type is in its chunk schema, so
+ * they parse through the catch-all as `unknown_chunk`, which the stream
+ * transform has no branch for and yields nothing. The experimental native
+ * runtime likewise ignores them (`openai-responses.ts` at v1.18.30 ends its
+ * dispatch with `NO_EVENTS`). So a stream that died right after one has shown
+ * the reader nothing at all. `codex.rate_limits` never reaches here; it is
+ * consumed for quota further up.
  *
  * Everything else counts, including the frame that merely opens a reasoning or
  * text part, because the host opens a durable part from it.

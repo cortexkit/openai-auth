@@ -4,6 +4,7 @@ import { describe, expect, test } from 'bun:test'
 // prove is how that parser reads our SSE, so the pin must track the host, not
 // the newest release.
 import { createOpenAI } from '@ai-sdk/openai'
+import { APICallError } from 'ai'
 import { ResponseStreamError } from '../response-stream-error'
 import { streamResponsesWebSocket, TERMINAL_AFTER_OUTPUT_MESSAGE } from '../ws'
 
@@ -36,6 +37,9 @@ function fakeSocket() {
     },
     peerClose(code: number, reason: string) {
       emit('close', { code, reason })
+    },
+    peerError(message: string) {
+      emit('error', { message })
     },
   }
 }
@@ -97,16 +101,22 @@ const rateLimitFailed: Frame = {
   response: { id: 'resp_1', failed: { rate_limit_reached_type: 'primary' } },
 }
 
+// A frame the transport forwards but leaves out of its classification (a
+// `codex.` envelope type) and the parser yields nothing for. With raw chunks
+// on, the parser still reports it as a `raw` part, so seeing it proves every
+// frame written before it has been parsed.
+const BARRIER_TYPE = 'codex.test_barrier'
+
 /**
  * Streams `frames` through the WebSocket transport into the real AI SDK
- * parser, reads parts until `readyWhen` has been seen (so the parser has
- * consumed every frame before the failure, as it would have in the host),
- * then applies `failure` and drains the rest.
+ * parser, reads parts until the parser has consumed every one of them (as it
+ * would have in the host before the failure), then applies `failure` and
+ * drains the rest.
  */
 async function run(options: {
   frames: Frame[]
-  readyWhen: (part: Part) => boolean
   failure: (socket: ReturnType<typeof fakeSocket>) => void
+  idleTimeout?: number
 }) {
   const socket = fakeSocket()
   const calls = {
@@ -118,6 +128,7 @@ async function run(options: {
   const response = streamResponsesWebSocket({
     socket: socket as unknown as WebSocket,
     body: { model: 'gpt-5.5', input: [] },
+    idleTimeout: options.idleTimeout,
     onComplete: () => {
       calls.completed++
     },
@@ -132,6 +143,7 @@ async function run(options: {
     },
   })
   for (const frame of options.frames) socket.write(frame)
+  socket.write({ type: BARRIER_TYPE })
 
   const provider = createOpenAI({
     apiKey: 'test',
@@ -139,6 +151,7 @@ async function run(options: {
   })
   const { stream } = await provider.responses('gpt-5.5').doStream({
     prompt: [{ role: 'user', content: [{ type: 'text', text: 'go' }] }],
+    includeRawChunks: true,
     tools: [
       {
         type: 'function',
@@ -152,10 +165,15 @@ async function run(options: {
   })
   const reader = stream.getReader()
   const parts: Part[] = []
-  while (!parts.some(options.readyWhen)) {
+  const isBarrier = (part: Part) =>
+    part.type === 'raw' &&
+    (part.rawValue as Frame | undefined)?.type === BARRIER_TYPE
+  while (true) {
     const next = await reader.read()
-    if (next.done) throw new Error('stream ended before the expected part')
-    parts.push(next.value as Part)
+    if (next.done) throw new Error('stream ended before every frame was parsed')
+    const part = next.value as Part
+    if (isBarrier(part)) break
+    if (part.type !== 'raw') parts.push(part)
   }
   options.failure(socket)
   let error: unknown
@@ -163,7 +181,8 @@ async function run(options: {
     while (true) {
       const next = await reader.read()
       if (next.done) break
-      parts.push(next.value as Part)
+      const part = next.value as Part
+      if (part.type !== 'raw') parts.push(part)
     }
   } catch (caught) {
     error = caught
@@ -174,16 +193,21 @@ async function run(options: {
 
 const serviceRestart = (socket: ReturnType<typeof fakeSocket>) =>
   socket.peerClose(1012, 'service restart')
+const socketError = (socket: ReturnType<typeof fakeSocket>) =>
+  socket.peerError('connection reset')
+// Nothing to do: the transport's idle timer fires on its own.
+const idle = () => {}
 const rateLimit = (socket: ReturnType<typeof fakeSocket>) =>
   socket.write(rateLimitFailed)
-const isDeltaFor = (callId: string) => (part: Part) =>
-  part.type === 'tool-input-delta' && part.id === callId
+const wrappedError =
+  (status: number, message: string) =>
+  (socket: ReturnType<typeof fakeSocket>) =>
+    socket.write({ type: 'error', status, error: { message } })
 
 describe('websocket failure after function calls only (real AI SDK parser)', () => {
   test('a close while the only call is still streaming fails retryably and runs nothing', async () => {
     const { error, calls, ofType } = await run({
       frames: [created, callAdded(1), callDelta(1, '{"path":')],
-      readyWhen: isDeltaFor('call_1'),
       failure: serviceRestart,
     })
 
@@ -205,7 +229,6 @@ describe('websocket failure after function calls only (real AI SDK parser)', () 
         callDelta(1, '{"path":"a"}'),
         callArgsDone(1, '{"path":"a"}'),
       ],
-      readyWhen: isDeltaFor('call_1'),
       failure: serviceRestart,
     })
 
@@ -225,7 +248,6 @@ describe('websocket failure after function calls only (real AI SDK parser)', () 
         callAdded(2),
         callDelta(2, '{"pa'),
       ],
-      readyWhen: isDeltaFor('call_2'),
       failure: serviceRestart,
     })
 
@@ -257,7 +279,6 @@ describe('websocket failure after function calls only (real AI SDK parser)', () 
           item: { type: 'message', id: 'msg_1' },
         },
       ],
-      readyWhen: (part) => part.type === 'text-start',
       failure: serviceRestart,
     })
 
@@ -278,7 +299,6 @@ describe('websocket failure after function calls only (real AI SDK parser)', () 
           item: { type: 'reasoning', id: 'rs_1' },
         },
       ],
-      readyWhen: (part) => part.type === 'reasoning-start',
       failure: serviceRestart,
     })
 
@@ -295,7 +315,6 @@ describe('websocket failure after function calls only (real AI SDK parser)', () 
         callDelta(1, '{'),
         { type: 'response.some_future_frame', output_index: 1 },
       ],
-      readyWhen: isDeltaFor('call_1'),
       failure: serviceRestart,
     })
 
@@ -310,7 +329,6 @@ describe('websocket failure after function calls only (real AI SDK parser)', () 
         callDelta(1, '{'),
         { ...callDelta(9, '{'), item_id: 'fc_unknown' },
       ],
-      readyWhen: isDeltaFor('call_1'),
       failure: serviceRestart,
     })
 
@@ -328,7 +346,6 @@ describe('websocket failure after function calls only (real AI SDK parser)', () 
         callDelta(1, '{}'),
         { ...done, item: { ...(done.item as Frame), status: 'incomplete' } },
       ],
-      readyWhen: isDeltaFor('call_1'),
       failure: serviceRestart,
     })
 
@@ -341,7 +358,6 @@ describe('mid-stream rate limit after function calls only (real AI SDK parser)',
   test('with only an unfinished call it fails retryably so the turn reroutes', async () => {
     const { error, calls, ofType } = await run({
       frames: [created, callAdded(1), callDelta(1, '{"path":')],
-      readyWhen: isDeltaFor('call_1'),
       failure: rateLimit,
     })
 
@@ -361,7 +377,6 @@ describe('mid-stream rate limit after function calls only (real AI SDK parser)',
         callAdded(2),
         callDelta(2, '{'),
       ],
-      readyWhen: isDeltaFor('call_2'),
       failure: rateLimit,
     })
 
@@ -388,13 +403,121 @@ describe('mid-stream rate limit after function calls only (real AI SDK parser)',
           item: { type: 'message', id: 'msg_1' },
         },
       ],
-      readyWhen: (part) => part.type === 'text-start',
       failure: rateLimit,
     })
 
     expect(error).toBeUndefined()
     expect(ofType('finish')[0]).toMatchObject({
       finishReason: { unified: 'other' },
+    })
+  })
+})
+
+const unfinishedCallFrames = () => [
+  created,
+  callAdded(1),
+  callDelta(1, '{"path":'),
+]
+const finishedCallFrames = () => [
+  created,
+  callAdded(1),
+  callDone(1, '{"path":"a"}'),
+  callAdded(2),
+  callDelta(2, '{'),
+]
+
+// The idle timeout is long enough for the reader to reach the barrier first,
+// short enough to keep the suite fast.
+const IDLE_MS = 100
+
+describe('other transport failures after function calls only (real AI SDK parser)', () => {
+  for (const [name, failure, idleTimeout] of [
+    ['a socket error', socketError, undefined],
+    ['an idle timeout', idle, IDLE_MS],
+  ] as const) {
+    test(`${name} while the only call is still streaming fails retryably`, async () => {
+      const { error, calls, ofType } = await run({
+        frames: unfinishedCallFrames(),
+        failure,
+        idleTimeout,
+      })
+
+      expect(ofType('tool-call')).toHaveLength(0)
+      expect(error).toBeInstanceOf(ResponseStreamError)
+      expect(error).toMatchObject({ isRetryable: true })
+      expect(calls.completed).toBe(0)
+    })
+
+    test(`${name} after a finished call completes with that call`, async () => {
+      const { error, calls, ofType } = await run({
+        frames: finishedCallFrames(),
+        failure,
+        idleTimeout,
+      })
+
+      expect(error).toBeUndefined()
+      expect(ofType('tool-call')).toHaveLength(1)
+      expect(ofType('tool-call')[0]).toMatchObject({ toolCallId: 'call_1' })
+      expect(ofType('finish')[0]).toMatchObject({
+        finishReason: { unified: 'tool-calls' },
+      })
+      expect(calls.completed).toBe(0)
+      expect(calls.invalid).toHaveLength(1)
+    })
+  }
+})
+
+describe('wrapped protocol error after output (real AI SDK parser)', () => {
+  // The provider wording used here is what the host's retry patterns match
+  // ("rate limit", "service unavailable", 429, 503). After anything durable
+  // it must not reach the host, or the host would replay the step.
+  test('after a finished call it completes with that call and no error', async () => {
+    const { error, calls, ofType } = await run({
+      frames: finishedCallFrames(),
+      failure: wrappedError(429, 'Rate limit exceeded'),
+    })
+
+    expect(error).toBeUndefined()
+    expect(ofType('error')).toHaveLength(0)
+    expect(ofType('tool-call')).toHaveLength(1)
+    expect(ofType('tool-call')[0]).toMatchObject({ toolCallId: 'call_1' })
+    expect(ofType('finish')[0]).toMatchObject({
+      finishReason: { unified: 'tool-calls' },
+    })
+    expect(calls.completed).toBe(0)
+    // Reported as a non-completed terminal, which drops any continuation and
+    // invalidates the connection.
+    expect(calls.terminal).toEqual(['error'])
+  })
+
+  test('after streamed text it surfaces only the fixed terminal message', async () => {
+    const { error } = await run({
+      frames: [
+        created,
+        {
+          type: 'response.output_text.delta',
+          item_id: 'msg_1',
+          delta: 'partial answer',
+        },
+      ],
+      failure: wrappedError(503, 'Service Unavailable'),
+    })
+
+    expect((error as Error).message).toBe(TERMINAL_AFTER_OUTPUT_MESSAGE)
+    expect(APICallError.isInstance(error)).toBe(false)
+  })
+
+  test('after only an unfinished call it surfaces the provider error unchanged', async () => {
+    const { error, ofType } = await run({
+      frames: unfinishedCallFrames(),
+      failure: wrappedError(503, 'Service Unavailable'),
+    })
+
+    expect(ofType('tool-call')).toHaveLength(0)
+    expect(APICallError.isInstance(error)).toBe(true)
+    expect(error).toMatchObject({
+      statusCode: 503,
+      message: 'Service Unavailable',
     })
   })
 })
