@@ -520,4 +520,18 @@ describe('wrapped protocol error after output (real AI SDK parser)', () => {
       message: 'Service Unavailable',
     })
   })
+
+  test('a rate limit after only an unfinished call marks the account and fails retryably', async () => {
+    // Marking the account is what sends the retry to a different one; without
+    // it the host would retry the exhausted account.
+    const { error, calls, ofType } = await run({
+      frames: unfinishedCallFrames(),
+      failure: wrappedError(429, 'Rate limit exceeded'),
+    })
+
+    expect(ofType('tool-call')).toHaveLength(0)
+    expect(calls.rateLimited).toHaveLength(1)
+    expect(error).toBeInstanceOf(ResponseStreamError)
+    expect(error).toMatchObject({ isRetryable: true })
+  })
 })

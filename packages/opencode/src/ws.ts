@@ -545,9 +545,14 @@ export function streamResponsesWebSocket(
       return
     }
 
-    const admissionRateLimit = !emittedOutput
-      ? parseRateLimitSignal(event)
-      : undefined
+    // Also after function calls that never finished: nothing ran, so this is
+    // still a refusal of the whole response, and marking the account is what
+    // makes the retry go to a different one.
+    const shapeAtSignal = outputShape()
+    const admissionRateLimit =
+      shapeAtSignal === 'none' || shapeAtSignal === 'unfinished-calls'
+        ? parseRateLimitSignal(event)
+        : undefined
     if (admissionRateLimit && event) {
       completed = true
       cleanup()
