@@ -2903,6 +2903,110 @@ describe('transport close provenance', () => {
       },
     )
   })
+
+  // Two turns on one session. The first main response streams one finished
+  // function call and then either completes for real or is cut by a service
+  // restart (close 1012). Returns the second turn's main request.
+  async function secondMainAfterFinishedCall(end: 'completed' | 'restart') {
+    const mains: Array<Record<string, unknown>> = []
+    let main = 0
+    await withFakeWebSocket(
+      ({ message, close }) => ({
+        send(data) {
+          const parsed = JSON.parse(data) as Record<string, unknown>
+          if (parsed.generate === false) {
+            message(
+              JSON.stringify({
+                type: 'response.completed',
+                response: { id: `resp_prewarm_${main}` },
+              }),
+            )
+            return
+          }
+          mains.push(parsed)
+          main += 1
+          message(
+            JSON.stringify({
+              type: 'response.created',
+              response: { id: `resp_main_${main}` },
+            }),
+          )
+          message(
+            JSON.stringify({
+              type: 'response.output_item.done',
+              output_index: 0,
+              item: {
+                type: 'function_call',
+                id: 'fc_1',
+                call_id: 'call_1',
+                name: 'read',
+                arguments: '{}',
+                status: 'completed',
+              },
+            }),
+          )
+          if (main === 1 && end === 'restart') {
+            close(1012, 'service restart')
+            return
+          }
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: `resp_main_${main}` },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const websocketFetch = createWebSocketFetch({
+          url: 'https://example.test/backend-api/codex/responses',
+        })
+        const url = 'https://example.test/backend-api/codex/responses'
+        const user = {
+          role: 'user',
+          content: [{ type: 'input_text', text: 'go' }],
+        }
+        const first = await websocketFetch(
+          url,
+          streamRequest({ input: [user] }),
+        )
+        // Ends normally either way: a cut after a finished call is completed.
+        expect(await first.text()).toContain('response.completed')
+        await websocketFetch(
+          url,
+          streamRequest({
+            input: [
+              user,
+              { type: 'function_call', call_id: 'call_1', name: 'read' },
+              { type: 'function_call_output', call_id: 'call_1', output: 'ok' },
+            ],
+          }),
+        ).then((response) => response.text())
+        websocketFetch.close()
+      },
+    )
+    const second = mains[1]
+    if (!second) throw new Error('missing second main request')
+    return second
+  }
+
+  test('a response completed in place of a cut stream is never chained to', async () => {
+    // The server did not finish that response, so previous_response_id naming
+    // it would be rejected. (The next turn runs on a fresh socket, which may
+    // chain to its own prewarm; it must not chain to the cut response.)
+    const second = await secondMainAfterFinishedCall('restart')
+    expect(second.previous_response_id).not.toBe('resp_main_1')
+    expect(second.input).toContainEqual({
+      type: 'function_call',
+      call_id: 'call_1',
+      name: 'read',
+    })
+  })
+
+  test('a response the server completed is chained to (control)', async () => {
+    const second = await secondMainAfterFinishedCall('completed')
+    expect(second.previous_response_id).toBe('resp_main_1')
+  })
 })
 
 async function withFakeWebSocket(

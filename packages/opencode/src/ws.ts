@@ -339,6 +339,14 @@ export function streamResponsesWebSocket(
   // Only these are guaranteed present in the response previous_response_id will
   // chain to, so only these are safe to trim from a later continuation suffix.
   const finalizedFunctionCallIds = new Set<string>()
+  // What the non-lifecycle frames handed to the reader amount to, so a
+  // failure can be ended in the least destructive way that still never shows
+  // or runs anything twice (see outputShape).
+  const emittedCalls: EmittedCallState = {
+    addedItemIds: new Set(),
+    finished: false,
+    other: false,
+  }
 
   function cleanup() {
     if (idleTimer) clearTimeout(idleTimer)
@@ -358,6 +366,41 @@ export function streamResponsesWebSocket(
 
   function invalidate(error: ResponseStreamError) {
     fail(error, error)
+  }
+
+  function outputShape(): OutputShape {
+    if (!emittedOutput) return 'none'
+    if (emittedCalls.other) return 'other'
+    return emittedCalls.finished ? 'finished-calls' : 'unfinished-calls'
+  }
+
+  // Ends a response whose only output was function calls, at least one of
+  // them finished, as though the server had completed it. The host has
+  // already dispatched each finished call (the AI SDK emits `tool-call` on the
+  // call's output_item.done and the host runs it straight away), so erroring
+  // here would leave those tools running under a failed turn, and retrying
+  // would run them again. Completing lets the host record the calls, wait for
+  // them, and send their results in the next request, which is what the Codex
+  // CLI does after a disconnect: keep what finished, regenerate what did not.
+  // Calls that never finished stay unfinished; the AI SDK's flush does not
+  // turn a pending tool input into a call, so nothing half-streamed runs.
+  //
+  // onComplete is deliberately not called. The server never completed this
+  // response, so it cannot be chained to with previous_response_id; the
+  // caller has already reported the connection as invalid or terminal, which
+  // drops any stored continuation.
+  //
+  // The experimental native runtime (OPENCODE_EXPERIMENTAL_NATIVE_LLM=1) is
+  // safe here too: its Responses parser (opencode v1.18.30,
+  // packages/llm/src/protocols/openai-responses.ts `onResponseFinish`) only
+  // closes open text and reasoning blocks on finish and never finalizes a
+  // pending tool stream, so a call that did not finish is not run with partial
+  // arguments there either.
+  function closeWithSyntheticCompletion() {
+    controller?.enqueue(
+      encoder.encode(`data: ${JSON.stringify(SYNTHETIC_COMPLETED_EVENT)}\n\n`),
+    )
+    closeCompleted()
   }
 
   // Gated on generated output rather than user-visible text: a
@@ -386,7 +429,25 @@ export function streamResponsesWebSocket(
       msSinceLastFrame:
         lastFrameAt === undefined ? undefined : Date.now() - lastFrameAt,
     }
-    if (emittedOutput) {
+    const outcome = outputShape()
+    if (outcome === 'finished-calls') {
+      if (completed) return
+      logT.warn(
+        'stream failed after finished function calls only; ended as completed',
+        {
+          reason: error.message,
+          emittedOutput: true,
+          outputShape: outcome,
+          ...shape,
+        },
+      )
+      completed = true
+      cleanup()
+      options.onConnectionInvalid?.(error)
+      closeWithSyntheticCompletion()
+      return
+    }
+    if (outcome === 'other') {
       // Say why this is terminal. Without the suffix the message is identical
       // to the retryable case, so a deliberate no-replay reads as a transport
       // bug and sends the reader hunting for a fault that is not there.
@@ -406,6 +467,7 @@ export function streamResponsesWebSocket(
       logT.warn('stream failed after output; not retried', {
         reason: error.message,
         emittedOutput: true,
+        outputShape: outcome,
         ...shape,
       })
       fail(
@@ -414,11 +476,21 @@ export function streamResponsesWebSocket(
       )
       return
     }
-    logT.warn('stream failed before output; retryable', {
-      reason: error.message,
-      emittedOutput: false,
-      ...shape,
-    })
+    // Only function calls that never finished count as no output: the host
+    // shows a pending tool part for them but runs nothing until a call
+    // finishes, so regenerating the turn neither repeats a tool nor repeats
+    // anything the reader has read.
+    logT.warn(
+      outcome === 'none'
+        ? 'stream failed before output; retryable'
+        : 'stream failed after unfinished function calls only; retryable',
+      {
+        reason: error.message,
+        emittedOutput: outcome !== 'none',
+        outputShape: outcome,
+        ...shape,
+      },
+    )
     invalidate(error)
   }
 
@@ -578,9 +650,26 @@ export function streamResponsesWebSocket(
         // to THIS connection via the captured callback.
         options.onRateLimitReached?.(label)
         options.onTerminal?.(event)
-        if (!emittedOutput) {
+        const outcome = outputShape()
+        if (outcome !== 'none') {
+          logT.warn(
+            outcome === 'other'
+              ? 'rate limit reached after output; ended without retry'
+              : outcome === 'finished-calls'
+                ? 'rate limit reached after finished function calls only; ended as completed'
+                : 'rate limit reached after unfinished function calls only; retryable',
+            {
+              ...sessionKeys,
+              outputShape: outcome,
+              responseID: createdResponseID,
+              previousResponseID,
+            },
+          )
+        }
+        if (outcome === 'none' || outcome === 'unfinished-calls') {
           // Nothing was streamed yet (rate limit at admission, the common
-          // case): force a retryable stream error so OpenCode re-issues and the
+          // case), or only function calls that never finished and so never
+          // ran: force a retryable stream error so OpenCode re-issues and the
           // fetch override reroutes to a healthy account THIS turn.
           options.onFirstEvent?.()
           controller?.error(
@@ -588,6 +677,12 @@ export function streamResponsesWebSocket(
               `OpenAI account rate limit reached mid-stream (${label})`,
             ),
           )
+        } else if (outcome === 'finished-calls') {
+          // Only function calls streamed and at least one finished, so the
+          // host is already running it. onTerminal above has dropped the
+          // continuation for this failed response; end it as completed so the
+          // finished calls are recorded and their results sent next turn.
+          closeWithSyntheticCompletion()
         } else {
           // Output/reasoning/tool parts already streamed and OpenCode persisted
           // them. Retrying would replay the whole turn — duplicate text, re-run
@@ -640,6 +735,7 @@ export function streamResponsesWebSocket(
     }
     if (!isNonEmittingFrame(event.type)) {
       emittedOutput = true
+      recordEmittedCallFrame(event, emittedCalls)
     }
     resetIdleTimeout('idle timeout waiting for websocket')
 
@@ -915,6 +1011,102 @@ function responseIDOf(event: Record<string, unknown>) {
   if (!isRecord(response)) return undefined
   return typeof response.id === 'string' ? response.id : undefined
 }
+
+/**
+ * How a response that fails mid-stream may be ended, judged by what it had
+ * already handed to the reader beyond lifecycle frames.
+ *
+ * - `none`: nothing; retry.
+ * - `unfinished-calls`: only function calls, none finished. The host shows a
+ *   pending tool part but runs nothing, so a retry repeats nothing; retry.
+ * - `finished-calls`: only function calls, at least one finished and so
+ *   already running; end the response as completed.
+ * - `other`: anything else; end the turn with an error and no retry.
+ */
+type OutputShape = 'none' | 'unfinished-calls' | 'finished-calls' | 'other'
+
+interface EmittedCallState {
+  /** Item ids of function_call items opened with output_item.added. */
+  addedItemIds: Set<string>
+  /** A function call finished: the host has emitted `tool-call` and run it. */
+  finished: boolean
+  /** A frame outside the function-call allow-list reached the reader. */
+  other: boolean
+}
+
+/**
+ * Folds one emitted non-lifecycle frame into the call state.
+ *
+ * An allow-list, not a deny-list: only the frames that make up a function
+ * call are recognised, and anything else, including frame types that do not
+ * exist yet, marks the response as having shown something that cannot be
+ * safely regenerated or completed. A message or reasoning item counts as
+ * `other` from its output_item.added onwards, because the host opens a text
+ * or reasoning part for it before any delta arrives.
+ *
+ * A call counts as finished only when its output_item.done is one the AI SDK
+ * turns into a `tool-call` (status `completed` with string id, call_id, name
+ * and arguments). Its schema drops any other done frame as an unknown chunk, so
+ * such a call never ran; but it is not in the allow-list either, so it ends
+ * the turn the old way rather than being guessed at.
+ */
+function recordEmittedCallFrame(
+  event: Record<string, unknown>,
+  state: EmittedCallState,
+) {
+  const item = isRecord(event.item) ? event.item : undefined
+  switch (event.type) {
+    case 'response.output_item.added':
+      if (item?.type === 'function_call' && typeof item.id === 'string') {
+        state.addedItemIds.add(item.id)
+        return
+      }
+      break
+    case 'response.function_call_arguments.delta':
+    case 'response.function_call_arguments.done':
+      if (
+        typeof event.item_id === 'string' &&
+        state.addedItemIds.has(event.item_id)
+      ) {
+        return
+      }
+      break
+    case 'response.output_item.done':
+      if (
+        item?.type === 'function_call' &&
+        item.status === 'completed' &&
+        typeof item.id === 'string' &&
+        typeof item.call_id === 'string' &&
+        typeof item.name === 'string' &&
+        typeof item.arguments === 'string'
+      ) {
+        state.finished = true
+        return
+      }
+      break
+  }
+  state.other = true
+}
+
+/**
+ * Stands in for the server's response.completed when a response that only
+ * streamed function calls is cut off after one of them finished.
+ *
+ * Shaped to pass the AI SDK's finished-chunk schema (@ai-sdk/openai 3.0.88
+ * requires `response.usage.input_tokens` and `output_tokens`); a chunk that
+ * fails it becomes an error part instead of a finish. The AI SDK derives the
+ * `tool-calls` finish reason from the calls it saw finish, not from this
+ * event. Usage is zero because the real figure was never reported. It carries
+ * no response id: nothing may chain to a response the server did not finish.
+ */
+const SYNTHETIC_COMPLETED_EVENT = {
+  type: 'response.completed',
+  response: {
+    status: 'completed',
+    incomplete_details: null,
+    usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+  },
+} as const
 
 /**
  * Surfaced when a stream dies after output has reached the reader.
