@@ -170,8 +170,9 @@ const ALLOWED_MODELS = new Set([
 // Same shape for gpt-6: the backend rejects the bare id ("not supported when
 // using Codex with a ChatGPT account") and serves only the named variants
 // (gpt-6-astra, gpt-6-sol, gpt-6-luna), so any -fast/-pro synthetics inheriting
-// api.id "gpt-6" drop with it.
-const DISALLOWED_MODELS = new Set(['gpt-5.6', 'gpt-6'])
+// api.id "gpt-6" drop with it. gpt-6.1 is the same again: only gpt-6.1-sol is
+// served, and the bare id (like gpt-6.1-luna and gpt-6.1-astra) answers 400.
+const DISALLOWED_MODELS = new Set(['gpt-5.6', 'gpt-6', 'gpt-6.1'])
 
 /**
  * Surfaced when a request would go to the wire with no credential.
@@ -195,18 +196,22 @@ const RESPONSES_LITE_MODELS = new Set([
   'gpt-6-astra',
   'gpt-6-sol',
   'gpt-6-luna',
+  'gpt-6.1-sol',
 ])
 const OAUTH_DUMMY_KEY = 'opencode-oauth-dummy-key'
 const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
-// gpt-6-sol and gpt-6-luna require Codex client >= 0.155.0 (gpt-6-astra needs
-// 0.153.0). The backend's model catalog reports this as `minimal_client_version`
-// and simply omits both models below it; a request at 0.153.0 answers 400, and
-// at 0.155.0 completes. Verified non-regressive at 0.155.0 for gpt-6-astra,
-// gpt-5.5 and the three 5.6 variants, so one version serves the whole range.
-// gpt-5.4, gpt-5.4-mini and gpt-5.3-codex-spark answer 400 at BOTH versions
-// ("not supported when using Codex with a ChatGPT account") - a backend
-// retirement, not something this version causes.
-const CODEX_VERSION = '0.155.0'
+// gpt-6.1-sol requires Codex client >= 0.159.0: the backend's model catalog
+// lists it from 0.159.0 and a request answers 400 ("not supported when using
+// Codex with a ChatGPT account") at 0.158.0, measured 2026-09-29. Its catalog
+// `minimal_client_version` says 0.153.0, which is wrong, so the catalog listing
+// and a real request are the evidence, not that field. gpt-6-sol and gpt-6-luna
+// need 0.155.0 and gpt-6-astra 0.153.0. Verified at 0.159.0 that gpt-6.1-sol,
+// the three gpt-6 models, gpt-5.5 and the three 5.6 variants all complete, so
+// one version serves the whole range. gpt-5.4, gpt-5.4-mini and
+// gpt-5.3-codex-spark answer 400 at every version ("not supported when using
+// Codex with a ChatGPT account") - a backend retirement, not something this
+// version causes.
+const CODEX_VERSION = '0.159.0'
 const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
 const CODEX_SANDBOX = 'seccomp'
 export const getMainRefreshLockName = () => MAIN_REFRESH_LOCK_NAME
@@ -987,6 +992,8 @@ function stripResponsesLiteImageDetails(value: unknown) {
 // without and with an update to xhigh:
 //   gpt-6-sol    91 -> 516
 //   gpt-6-luna   1034 -> 3126
+//   gpt-6.1-sol  878, 938 -> 1227, 1247 (two samples each; a request-level
+//                xhigh on the same prompt gave 733 and 1456)
 // gpt-5.6-sol is deliberately NOT here. It answered 400 for this item until
 // September 2026, now accepts it, and moved 2292 -> 3785 on a single sample -
 // too weak to tell from noise, on a model people already run, where the
@@ -995,6 +1002,7 @@ const MID_CONVERSATION_EFFORT_MODELS = new Set([
   'gpt-6-astra',
   'gpt-6-sol',
   'gpt-6-luna',
+  'gpt-6.1-sol',
 ])
 
 /**
@@ -1538,9 +1546,17 @@ export async function CodexAuthPlugin(
                       // Codex long-context exception; the surcharge row applies
                       // to everything else. Checking the model family is the
                       // wrong test - it is the rate card's named list.
+                      //
+                      // gpt-6.1-sol is held here too. Its published pricing,
+                      // read 2026-09-29 at developers.openai.com/api/docs/models/
+                      // gpt-6.1-sol, charges 2x input and 1.5x output on the full
+                      // request above 272K input tokens, and nothing names it in a
+                      // Codex exception. (The rate card itself could not be
+                      // fetched that day; re-check it before raising this.)
                       model.id.includes('gpt-5.6') ||
                         model.id.includes('gpt-6-sol') ||
-                        model.id.includes('gpt-6-luna')
+                        model.id.includes('gpt-6-luna') ||
+                        model.id.includes('gpt-6.1-sol')
                       ? {
                           context: 372_000,
                           input: 244_000,

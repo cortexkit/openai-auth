@@ -108,6 +108,9 @@ async function surfacedModels() {
       }),
       'gpt-6-sol': model('gpt-6-sol', 'gpt-6-sol'),
       'gpt-6-luna': model('gpt-6-luna', 'gpt-6-luna'),
+      'gpt-6.1-sol': model('gpt-6.1-sol', 'gpt-6.1-sol'),
+      'gpt-6.1': model('gpt-6.1', 'gpt-6.1'),
+      'gpt-6.1-fast': model('gpt-6.1-fast', 'gpt-6.1'),
     },
   }
 
@@ -416,14 +419,14 @@ describe('provider.models filter', () => {
     })
   })
 
-  it("surfaces gpt-6-sol and gpt-6-luna under the surcharge line, not astra's window", async () => {
+  it("surfaces gpt-6-sol, gpt-6-luna and gpt-6.1-sol under the surcharge line, not astra's window", async () => {
     // Both report the same 872k window as gpt-6-astra, which makes "it is a
     // gpt-6 model, give it astra's window" the natural mistake. The rate card's
     // Codex long-context exception names GPT-6 Astra alone, so these two pay
     // 2x input and 1.5x output on the whole request above 272k input tokens and
     // are held under that line like the 5.6 family.
     const models = await surfacedModels()
-    for (const id of ['gpt-6-sol', 'gpt-6-luna']) {
+    for (const id of ['gpt-6-sol', 'gpt-6-luna', 'gpt-6.1-sol']) {
       expect(models[id]).toBeDefined()
       expect(models[id]?.limit).toEqual({
         context: 372_000,
@@ -439,6 +442,13 @@ describe('provider.models filter', () => {
     const models = await surfacedModels()
     expect(models['gpt-6']).toBeUndefined()
     expect(models['gpt-6-fast']).toBeUndefined()
+  })
+
+  it('drops the bare gpt-6.1 and its synthetics', async () => {
+    // Only gpt-6.1-sol is served; the bare id answers 400 like gpt-6 does.
+    const models = await surfacedModels()
+    expect(models['gpt-6.1']).toBeUndefined()
+    expect(models['gpt-6.1-fast']).toBeUndefined()
   })
 
   it('keeps allow-listed models and drops pre-5.4 models', async () => {

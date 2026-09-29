@@ -3081,7 +3081,7 @@ describe('integration: active fallback routing', () => {
     )
   })
 
-  test.each(['gpt-6-sol', 'gpt-6-luna'])(
+  test.each(['gpt-6-sol', 'gpt-6-luna', 'gpt-6.1-sol'])(
     '%s carries a mid-session effort change as a configuration_update',
     async (model) => {
       // Both were measured changing effort through the item, not merely
@@ -3102,8 +3102,11 @@ describe('integration: active fallback routing', () => {
     // The backend decides which models exist from this header. Below a model's
     // minimum it omits the model from its catalog and answers 400 to a request,
     // so lowering the version silently removes working models. Minimums are the
-    // catalog's own `minimal_client_version`, read 2026-09-25.
+    // catalog's own `minimal_client_version`, read 2026-09-25, except
+    // gpt-6.1-sol, whose catalog field says 0.153.0 while the catalog only
+    // lists it, and a request only completes, from 0.159.0 (measured 2026-09-29).
     const minimums: Record<string, string> = {
+      'gpt-6.1-sol': '0.159.0',
       'gpt-6-sol': '0.155.0',
       'gpt-6-luna': '0.155.0',
       'gpt-6-astra': '0.153.0',
