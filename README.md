@@ -28,7 +28,7 @@ Pinning is strongly recommended for any OpenCode plugin:
 
 ```json
 {
-  "plugin": ["@cortexkit/opencode-openai-auth@0.10.0"]
+  "plugin": ["@cortexkit/opencode-openai-auth@0.11.0"]
 }
 ```
 
