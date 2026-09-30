@@ -1155,3 +1155,97 @@ describe('refreshAllQuota', () => {
     expect(deps.whamFn).not.toHaveBeenCalled()
   })
 })
+
+// Once the main account has been moved into the account pool, OpenCode's main
+// slot holds only a placeholder and the main credential is the roster row
+// `main`. The poll must serve main from that row (recorded as main, never as a
+// fallback) and must never refresh the placeholder.
+describe('refreshAllQuota with the main account in the pool', () => {
+  const placeholder = {
+    type: 'oauth' as const,
+    access: '',
+    refresh: 'common-auth-placeholder:v1:openai',
+    expires: 0,
+  }
+  const poolMain: FallbackAccount = {
+    id: 'main',
+    type: 'oauth',
+    access: 'access-pool-main',
+    refresh: 'refresh-pool-main',
+    expires: Date.now() + 3600_000,
+    enabled: true,
+    accountId: 'chatgpt-pool-main',
+  }
+  const fallback: FallbackAccount = {
+    id: 'fb-1',
+    type: 'oauth',
+    access: 'access-fb1',
+    refresh: 'refresh-fb1',
+    expires: Date.now() + 3600_000,
+    enabled: true,
+    accountId: 'chatgpt-fb1',
+  }
+
+  test('polls row main as the main account and never refreshes the placeholder', async () => {
+    const deps = makeDeps({ accounts: [poolMain, fallback] })
+    deps.getAuth = mock(async () => ({ ...placeholder }))
+    const setFallback = mock(
+      deps.quotaManager.setFallback.bind(deps.quotaManager),
+    )
+    deps.quotaManager.setFallback = setFallback
+
+    const results = await refreshAllQuota(deps)
+
+    expect(results.filter((r) => r.account === 'main')).toEqual([
+      { account: 'main', ok: true },
+    ])
+    expect(deps.refreshMainWithLease).not.toHaveBeenCalled()
+    expect(deps.codexRefreshFn).not.toHaveBeenCalled()
+    expect(deps.whamFn).toHaveBeenCalledWith(
+      expect.objectContaining({ accessToken: 'access-pool-main' }),
+    )
+    expect(deps.quotaManager.getMain()?.quota?.primary?.usedPercent).toBe(30)
+    expect(setFallback.mock.calls.map((call) => call[0])).toEqual(['fb-1'])
+  })
+
+  test('reports main unavailable, and still polls the fallbacks, when row main is missing', async () => {
+    const deps = makeDeps({ accounts: [fallback] })
+    deps.getAuth = mock(async () => ({ ...placeholder }))
+
+    const results = await refreshAllQuota(deps)
+
+    expect(results).toContainEqual({
+      account: 'main',
+      ok: false,
+      error: 'main account row is missing from the account pool',
+    })
+    expect(results).toContainEqual({ account: 'fb-1', ok: true })
+    expect(deps.refreshMainWithLease).not.toHaveBeenCalled()
+    expect(deps.codexRefreshFn).not.toHaveBeenCalled()
+  })
+
+  test('skips a roster row holding the live main account', async () => {
+    // makeDeps records mainAccountId chatgpt-main; this row holds that account
+    // while the slot still holds its real credential.
+    const shadow: FallbackAccount = {
+      ...poolMain,
+      id: 'shadow',
+      access: 'access-shadow',
+      refresh: 'refresh-shadow',
+      accountId: 'chatgpt-main',
+    }
+    const deps = makeDeps({ accounts: [shadow, fallback] })
+
+    await refreshAllQuota(deps)
+
+    const refreshed = (
+      deps.fallbackManager.refreshAccount as unknown as {
+        mock: { calls: Array<[{ id: string }]> }
+      }
+    ).mock.calls.map((call) => call[0].id)
+    expect(refreshed).toEqual(['fb-1'])
+    expect(deps.whamFn).not.toHaveBeenCalledWith(
+      expect.objectContaining({ accessToken: 'access-shadow' }),
+    )
+  })
+})

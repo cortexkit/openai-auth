@@ -116,6 +116,18 @@ import {
   releaseCustodyLoginLeaseAfterHostWrite,
 } from './core/custody-transition.ts'
 import {
+  findPoolMainRow,
+  isPoolMainPlaceholder,
+  MainAccountInPoolError,
+  type PoolMainAccess,
+  resolvePoolMainAccess,
+  withoutPoolMainRow,
+} from './core/pool-main'
+import {
+  type ProcessHeartbeatHandle,
+  startProcessHeartbeat,
+} from './core/process-heartbeat'
+import {
   decideStickyBreak,
   type StickyBreakDecision,
   selectStickyCandidate,
@@ -297,6 +309,14 @@ interface ResetTargetResolverDeps {
     account: OAuthAccount,
     storage: AccountStorage,
   ) => Promise<OAuthAccount>
+  /**
+   * Refresh the pool row `main` while it serves as the main account. Defaults
+   * to refreshFallbackAccount.
+   */
+  refreshPoolMainRow?: (
+    account: OAuthAccount,
+    storage: AccountStorage,
+  ) => Promise<OAuthAccount>
   loadAccounts: typeof loadAccounts
   accountStoragePath: string
   accountStatePath: string
@@ -328,6 +348,72 @@ function resetTargetNeedsRefresh(
 }
 
 export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
+  // The main account while the slot holds the pool placeholder: the pool row
+  // `main`, refreshed and resolved the way a fallback row is, but reported as
+  // the main account.
+  async function resolvePoolMainTarget(): Promise<ResetTargetIdentity> {
+    const storage = await deps.loadAccounts({
+      configPath: deps.accountStoragePath,
+      statePath: deps.accountStatePath,
+    })
+    const row = findPoolMainRow(storage)
+    if (!storage || !row) {
+      throw new ResetTargetResolutionError(
+        'token_unavailable',
+        'Main OpenAI account has no usable access token.',
+      )
+    }
+    let resolved = row
+    if (
+      !(await deps.isFallbackRefreshInert?.(resolved, storage)) &&
+      resetTargetNeedsRefresh(
+        resolved.access,
+        resolved.expires,
+        storage,
+        deps.now(),
+      )
+    ) {
+      resolved = await (deps.refreshPoolMainRow ?? deps.refreshFallbackAccount)(
+        resolved,
+        storage,
+      )
+    }
+    const accessResolution = deps.resolveFallbackAccess
+      ? await deps.resolveFallbackAccess(resolved, storage)
+      : resolved.access
+        ? { token: resolved.access, provenance: 'local' as const }
+        : CUSTODY_REFUSE
+    if (
+      accessResolution === CUSTODY_REFUSE ||
+      accessResolution === CUSTODY_EXCLUDED ||
+      !accessResolution.token
+    ) {
+      throw new ResetTargetResolutionError(
+        'token_unavailable',
+        'Main OpenAI account has no usable access token.',
+      )
+    }
+    const claims = parseJwtClaims(accessResolution.token)
+    return {
+      accountKey: 'main',
+      label: 'Main account',
+      accessToken: accessResolution.token,
+      chatgptAccountId:
+        resolved.accountId ??
+        (claims ? extractAccountIdFromClaims(claims) : undefined),
+      onAuthFailure:
+        accessResolution.provenance === 'local'
+          ? undefined
+          : async (status: number) => {
+              await deps.reportAuthFailure?.({
+                handle: accessResolution.provenance.handle,
+                providerStatus: status,
+                recordVersion: accessResolution.provenance.recordVersion,
+              })
+            },
+    }
+  }
+
   return async (accountKey: string): Promise<ResetTargetIdentity> => {
     if (accountKey === 'main') {
       const storage = await deps.loadAccounts({
@@ -335,6 +421,7 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
         statePath: deps.accountStatePath,
       })
       let auth = await deps.getAuth()
+      if (isPoolMainPlaceholder(auth)) return resolvePoolMainTarget()
       if (auth.type !== 'oauth') {
         throw new ResetTargetResolutionError(
           'non_oauth_account',
@@ -344,7 +431,15 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
       if (
         resetTargetNeedsRefresh(auth.access, auth.expires, storage, deps.now())
       ) {
-        auth = { type: 'oauth', ...(await deps.refreshMainWithLease()) }
+        try {
+          auth = { type: 'oauth', ...(await deps.refreshMainWithLease()) }
+        } catch (error) {
+          // The slot became the placeholder while this refresh waited.
+          if (error instanceof MainAccountInPoolError) {
+            return resolvePoolMainTarget()
+          }
+          throw error
+        }
       }
       if (!auth.access) {
         throw new ResetTargetResolutionError(
@@ -1171,6 +1266,9 @@ export async function CodexAuthPlugin(
   // returned. Built unconditionally so a custody-disabled process still has
   // a runtime to dispose (no-op tick + close).
   let custodyRuntimeRef: CustodyRuntime | undefined
+  // This instance's entry in the per-process heartbeat directory, written by
+  // the first loader run and dropped on dispose.
+  let processHeartbeat: Promise<ProcessHeartbeatHandle> | undefined
   // The runtime accepts this factory-owned bootstrap rather than opening a second connection.
   // allowing the runtime path to open a second Claustrum connection.
   const custodyBootstrap: CustodyBootstrap = {}
@@ -1452,6 +1550,10 @@ export async function CodexAuthPlugin(
         await adoption.release().catch(() => {})
       }
       ownedRpcServers.clear()
+
+      const heartbeat = processHeartbeat
+      processHeartbeat = undefined
+      await (await heartbeat)?.release()
     },
     async event(input) {
       if (input.event.type !== 'session.deleted') return
@@ -1598,6 +1700,11 @@ export async function CodexAuthPlugin(
       provider: 'openai',
       async loader(getAuth) {
         loaderGetAuth = getAuth
+        processHeartbeat ??= startProcessHeartbeat({
+          version: PackageVersion,
+          logger: createLogger('heartbeat'),
+        })
+        await processHeartbeat
         const auth = await getAuth()
         if (auth.type !== 'oauth') return {}
 
@@ -1926,7 +2033,7 @@ export async function CodexAuthPlugin(
           return {
             getAuth,
             codexRefreshFn,
-            refreshMainWithLease,
+            refreshMainWithLease: refreshMainToken,
             fallbackManager,
             quotaManager,
             loadAccounts,
@@ -2024,6 +2131,9 @@ export async function CodexAuthPlugin(
               ),
             )
             const latest = await getAuth()
+            // Main moved into the account pool while this process waited.
+            if (isPoolMainPlaceholder(latest))
+              throw new MainAccountInPoolError()
             if (latest.type !== 'oauth' || !latest.access) continue
             const changed =
               latest.access !== previous.access ||
@@ -2046,38 +2156,53 @@ export async function CodexAuthPlugin(
           return null
         }
 
+        // The refresh token in a slot value, or a throw when the value must not
+        // be refreshed: the pool placeholder (main lives in the pool row), a
+        // custody tombstone, or a slot with no refresh token.
+        function refreshableMainToken(auth: {
+          type: string
+          access?: string
+          refresh?: string
+          expires?: number
+        }): string {
+          if (isPoolMainPlaceholder(auth)) throw new MainAccountInPoolError()
+          if (auth.type !== 'oauth') throw new Error('not oauth')
+          if (
+            tombstoned(
+              {
+                id: 'main',
+                type: 'oauth',
+                access: auth.access ?? '',
+                refresh: auth.refresh ?? '',
+                expires: auth.expires ?? 0,
+                addedAt: 0,
+              },
+              CUSTODY_OWNING_PROVIDER,
+            )
+          ) {
+            throw new CustodyTombstoneRefreshError(CUSTODY_OWNING_PROVIDER)
+          }
+          if (!auth.refresh) {
+            throw new Error('Token refresh failed: missing refresh token')
+          }
+          return auth.refresh
+        }
+
         async function refreshMainWithLease() {
           if (!mainRefreshPromise) {
             mainRefreshPromise = (async () => {
               const freshAuth = await getAuth()
+              const freshRefresh = refreshableMainToken(freshAuth)
               if (freshAuth.type !== 'oauth') throw new Error('not oauth')
-              if (
-                tombstoned(
-                  {
-                    id: 'main',
-                    type: 'oauth',
-                    access: freshAuth.access ?? '',
-                    refresh: freshAuth.refresh ?? '',
-                    expires: freshAuth.expires ?? 0,
-                    addedAt: 0,
-                  },
-                  CUSTODY_OWNING_PROVIDER,
-                )
-              ) {
-                throw new CustodyTombstoneRefreshError(CUSTODY_OWNING_PROVIDER)
-              }
-              if (!freshAuth.refresh) {
-                throw new Error('Token refresh failed: missing refresh token')
-              }
 
-              const refreshTokenHash = hashRefreshToken(freshAuth.refresh)
+              const freshTokenHash = hashRefreshToken(freshRefresh)
               const latestStorage = await loadAccounts(
                 getAccountPaths(getConfigPath()),
               )
               const mainError = latestStorage?.refresh?.mainLastRefreshError
               if (
                 mainError &&
-                refreshBackoffActive(mainError, freshAuth.refresh, Date.now())
+                refreshBackoffActive(mainError, freshRefresh, Date.now())
               ) {
                 throw new Error(
                   formatRefreshBackoffMessage(mainError, Date.now()),
@@ -2088,7 +2213,7 @@ export async function CodexAuthPlugin(
                 latestStorage?.refresh?.mainRefreshLeaseUntil &&
                 latestStorage.refresh.mainRefreshLeaseUntil > Date.now() &&
                 latestStorage.refresh.mainRefreshLeaseTokenHash ===
-                  refreshTokenHash
+                  freshTokenHash
               ) {
                 const concurrent = await waitForConcurrentMainRefresh(freshAuth)
                 if (concurrent) return concurrent
@@ -2107,6 +2232,59 @@ export async function CodexAuthPlugin(
                 throw new Error('Codex OAuth refresh is already in progress')
               }
 
+              // Read the slot again now that the lock is held. Everything
+              // above ran unlocked, so another process may since have rotated
+              // the token (refreshing the one read earlier would spend a
+              // refresh token that is already spent) or moved main into the
+              // account pool (the slot then holds only the placeholder).
+              let current: {
+                access?: string
+                refresh: string
+                expires?: number
+              }
+              try {
+                const underLock = await getAuth()
+                const underLockRefresh = refreshableMainToken(underLock)
+                if (underLock.type !== 'oauth') throw new Error('not oauth')
+                if (underLockRefresh !== freshRefresh) {
+                  if (
+                    underLock.access &&
+                    (underLock.expires ?? 0) > Date.now()
+                  ) {
+                    logR.debug('main token rotated while awaiting the lock', {
+                      pid: process.pid,
+                    })
+                    await fileLock.release().catch(() => {})
+                    return {
+                      access: underLock.access,
+                      refresh: underLockRefresh,
+                      expires: underLock.expires ?? 0,
+                    }
+                  }
+                  const storageNow = await loadAccounts(
+                    getAccountPaths(getConfigPath()),
+                  )
+                  const currentError = storageNow?.refresh?.mainLastRefreshError
+                  if (
+                    currentError &&
+                    refreshBackoffActive(
+                      currentError,
+                      underLockRefresh,
+                      Date.now(),
+                    )
+                  ) {
+                    throw new Error(
+                      formatRefreshBackoffMessage(currentError, Date.now()),
+                    )
+                  }
+                }
+                current = { ...underLock, refresh: underLockRefresh }
+              } catch (error) {
+                await fileLock.release().catch(() => {})
+                throw error
+              }
+
+              const refreshTokenHash = hashRefreshToken(current.refresh)
               const leaseId = crypto.randomUUID()
               let leaseTokenHash: string | undefined = refreshTokenHash
               try {
@@ -2131,7 +2309,7 @@ export async function CodexAuthPlugin(
                 }
 
                 const tokens = await codexRefreshFn({
-                  refreshToken: freshAuth.refresh,
+                  refreshToken: current.refresh,
                   fetchImpl: fetch,
                   now: Date.now,
                 })
@@ -2148,14 +2326,14 @@ export async function CodexAuthPlugin(
                 leaseTokenHash = undefined
                 return tokens
               } catch (error) {
-                if (freshAuth.refresh && !isAuthPersistError(error)) {
+                if (!isAuthPersistError(error)) {
                   await updateMainRefreshState((nextStorage) => {
                     nextStorage.refresh = nextStorage.refresh ?? {}
                     nextStorage.refresh.mainLastRefreshError =
                       buildRefreshOperationError({
                         error,
                         now: Date.now(),
-                        refreshToken: freshAuth.refresh ?? '',
+                        refreshToken: current.refresh,
                         previous: nextStorage.refresh.mainLastRefreshError,
                       })
                   }).catch(() => {})
@@ -2183,6 +2361,56 @@ export async function CodexAuthPlugin(
           }
           return mainRefreshPromise
         }
+
+        // The main account's credential while the slot holds the pool
+        // placeholder: the pool row `main`, refreshed through the per-row
+        // refresh path. Undefined when that row has no usable token.
+        function resolvePooledMain(
+          currentStorage: Awaited<ReturnType<typeof loadAccounts>>,
+        ): Promise<PoolMainAccess | undefined> {
+          return resolvePoolMainAccess({
+            storage: currentStorage,
+            now: Date.now,
+            isRefreshInert: isFallbackAccountRefreshInert,
+            refreshAccount: (account, accountStorage) =>
+              fallbackManager.refreshAccount(account, accountStorage, {
+                asPoolMain: true,
+              }),
+            resolveAccess: resolveAccountAccessForCustody,
+            warn: (message, meta) =>
+              logR.warn(message, { pid: process.pid, ...meta }),
+          })
+        }
+
+        async function pooledMainTokens() {
+          const pooled = await resolvePooledMain(
+            await loadAccounts(getAccountPaths(getConfigPath())),
+          )
+          if (!pooled) {
+            throw new Error(
+              'The main OpenAI account has no usable token in the account pool',
+            )
+          }
+          return {
+            access: pooled.token,
+            refresh: pooled.account.refresh,
+            expires: pooled.account.expires ?? 0,
+          }
+        }
+
+        // refreshMainWithLease for callers that only need a working main
+        // token: when main turns out to live in the pool, the pool row's
+        // token is returned instead of an error.
+        async function refreshMainToken() {
+          try {
+            return await refreshMainWithLease()
+          } catch (error) {
+            if (error instanceof MainAccountInPoolError) {
+              return pooledMainTokens()
+            }
+            throw error
+          }
+        }
         const cacheKeepGlobal = globalThis as {
           __openaiAuthCacheKeepManagers?: Map<string, CacheKeepManager>
         }
@@ -2194,10 +2422,14 @@ export async function CodexAuthPlugin(
           fetchImpl: fetch,
           getMainToken: async () => {
             const auth = await getAuth()
+            // Main lives in the pool row; the placeholder is never refreshed.
+            if (isPoolMainPlaceholder(auth)) {
+              return (await pooledMainTokens()).access
+            }
             if (auth.type !== 'oauth') throw new Error('not oauth')
             if (!auth.access || (auth.expires ?? 0) < Date.now()) {
               try {
-                return (await refreshMainWithLease()).access
+                return (await refreshMainToken()).access
               } catch (error) {
                 if (isAuthPersistError(error)) throw error
                 if (auth.access) return auth.access
@@ -2804,6 +3036,10 @@ export async function CodexAuthPlugin(
             refreshMainWithLease,
             refreshFallbackAccount: (account, currentStorage) =>
               fallbackManager.refreshAccount(account, currentStorage),
+            refreshPoolMainRow: (account, currentStorage) =>
+              fallbackManager.refreshAccount(account, currentStorage, {
+                asPoolMain: true,
+              }),
             loadAccounts,
             accountStoragePath: getConfigPath(),
             accountStatePath: getAccountStatePath(getConfigPath()),
@@ -4061,9 +4297,35 @@ export async function CodexAuthPlugin(
               claustrumMode(reqStorage) === 'claustrum'
             let primaryAccess = ''
             let primaryProvenance: VaultProvenance | undefined
+            // True when main has no credential to send: custody refused it, or
+            // main lives in the account pool and its row has no usable token.
+            // Main is then skipped and the fallbacks serve.
             let mainCustodyRefused = false
+            // Set when the slot holds the account-pool placeholder, so main is
+            // the pool row `main` (and that row is not also a fallback).
+            let pooledMain: PoolMainAccess | undefined
+            let mainInPool = isPoolMainPlaceholder(currentAuth)
+            const usePooledMain = async () => {
+              mainInPool = true
+              pooledMain = await resolvePooledMain(reqStorage)
+              if (pooledMain) {
+                primaryAccess = pooledMain.token
+                primaryProvenance =
+                  pooledMain.provenance === 'local'
+                    ? undefined
+                    : pooledMain.provenance
+              } else {
+                primaryAccess = ''
+                mainCustodyRefused = true
+                logA.warn('main account in the pool has no usable token', {
+                  pid: process.pid,
+                })
+              }
+            }
 
-            if (mainCustodyOwned) {
+            if (mainInPool) {
+              await usePooledMain()
+            } else if (mainCustodyOwned) {
               const access = await resolveMainAccessForCustody(reqStorage)
               if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED) {
                 mainCustodyRefused = true
@@ -4092,11 +4354,22 @@ export async function CodexAuthPlugin(
                   currentAuth.expires = refreshed.expires
                 } catch (error) {
                   if (isAuthPersistError(error)) throw error
-                  // Use stale token on refresh failure
+                  // Main moved into the account pool while this request
+                  // waited; serve it from there.
+                  if (error instanceof MainAccountInPoolError) {
+                    await usePooledMain()
+                  }
+                  // Otherwise use the stale token on refresh failure.
                 }
               }
-              primaryAccess = currentAuth.access ?? ''
+              if (!mainInPool) primaryAccess = currentAuth.access ?? ''
             }
+            // The fallback roster for this request. While main is the pool
+            // row `main`, that row is main and must not be tried again as a
+            // fallback.
+            const fallbackStorage = mainInPool
+              ? withoutPoolMainRow(reqStorage)
+              : reqStorage
 
             const authWithAccount = currentAuth as typeof currentAuth & {
               accountId?: string
@@ -4107,7 +4380,8 @@ export async function CodexAuthPlugin(
             // main-account SWITCH (a loader that outlives a re-auth would
             // otherwise judge account B by account A's cached quota).
             const mainAccountIdentity =
-              authWithAccount.accountId ??
+              pooledMain?.account.accountId ??
+              (mainInPool ? undefined : authWithAccount.accountId) ??
               (primaryAccess
                 ? extractAccountIdFromClaims(
                     parseJwtClaims(primaryAccess) ?? {},
@@ -4131,7 +4405,7 @@ export async function CodexAuthPlugin(
             ) {
               const requestBytes = Buffer.byteLength(init.body, 'utf8')
               const stickyRoster = await buildStickyRouteRoster({
-                storage: reqStorage,
+                storage: fallbackStorage,
                 sidebarState,
                 primaryAccess,
                 mainAccountIdentity,
@@ -4298,7 +4572,7 @@ export async function CodexAuthPlugin(
               | undefined
             const requestFallbackSelection = () => {
               fallbackSelectionPromise ??= usableFallbackCandidates(
-                reqStorage,
+                fallbackStorage,
                 sidebarState,
               )
               return fallbackSelectionPromise

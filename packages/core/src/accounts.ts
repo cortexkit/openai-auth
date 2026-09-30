@@ -371,6 +371,16 @@ export type AccountManagerOptions = {
   custody: AccountManagerCustodyOptions
 }
 
+export type RefreshAccountOptions = {
+  /** Refresh even when the token is not yet due. */
+  force?: boolean
+  /**
+   * The row is being refreshed as the main account while the main slot holds
+   * the pool placeholder, so the main-row shield does not apply.
+   */
+  asPoolMain?: boolean
+}
+
 export type AccountRefreshError = {
   accountId: string
   message: string
@@ -1144,6 +1154,50 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
   })
 }
 
+const CREDENTIAL_FIELDS = [
+  'access',
+  'refresh',
+  'expires',
+  'lastRefreshedAt',
+  'lastRefreshError',
+] as const
+
+/**
+ * The incoming account, but with its credential taken from whichever side holds
+ * the newer token, by the same comparison saveAccountState uses.
+ *
+ * A full-store save writes a snapshot the caller loaded some time ago. If a
+ * refresh rotated the token on disk after that load, writing the snapshot's
+ * token back would restore a refresh token the provider has already spent,
+ * and the account would be dead at its next refresh. Everything other than the
+ * credential still comes from the incoming snapshot.
+ *
+ * A custody tombstone is a deliberate retirement of the credential, not a
+ * token, so an incoming tombstone always wins.
+ */
+function keepNewerCredential(
+  onDisk: FallbackAccount,
+  incoming: FallbackAccount,
+): FallbackAccount {
+  if (!isOAuthAccount(onDisk) || !isOAuthAccount(incoming)) return incoming
+  if (incoming.refresh === custodyTombstoneKey(CUSTODY_OWNING_PROVIDER)) {
+    return incoming
+  }
+  const incomingEntry = accountRuntimeState(incoming) as AccountRuntimeEntry
+  const chosen: AccountRuntimeEntry = { ...incomingEntry }
+  applyNewerTokenState(
+    chosen,
+    accountRuntimeState(onDisk) as AccountRuntimeEntry,
+    incomingEntry,
+  )
+  const result: Record<string, unknown> = { ...incoming }
+  for (const field of CREDENTIAL_FIELDS) {
+    if (field in chosen) result[field] = chosen[field]
+    else delete result[field]
+  }
+  return result as OAuthAccount
+}
+
 function mergeStorageForSave(
   latest: AccountStorage | null,
   incoming: AccountStorage,
@@ -1152,7 +1206,13 @@ function mergeStorageForSave(
 
   const accounts = new Map<string, FallbackAccount>()
   for (const account of latest.accounts) accounts.set(account.id, account)
-  for (const account of incoming.accounts) accounts.set(account.id, account)
+  for (const account of incoming.accounts) {
+    const onDisk = accounts.get(account.id)
+    accounts.set(
+      account.id,
+      onDisk ? keepNewerCredential(onDisk, account) : account,
+    )
+  }
 
   return {
     ...latest,
@@ -2139,12 +2199,87 @@ function hasUnexpiredAccessToken(account: OAuthAccount, now: number) {
   )
 }
 
-function isMainAccountFallback(storage: AccountStorage, account: OAuthAccount) {
+/**
+ * Whether a roster row holds the same ChatGPT account as OpenCode's main slot
+ * (`mainAccountId`). Such a row is a second copy of main's credential: the
+ * account-pool migration writes main into row `main` and sets `mainAccountId`
+ * while the slot copy is still live. Two places refreshing one rotating refresh
+ * token spend it twice, so a shielded row is neither selected as a fallback
+ * nor refreshed by any background loop; the slot's own refresher owns it.
+ */
+export function isShieldedMainRow(
+  storage: Pick<AccountStorage, 'mainAccountId'> | null | undefined,
+  account: Pick<OAuthAccount, 'accountId'>,
+): boolean {
   return Boolean(
-    storage.mainAccountId &&
+    storage?.mainAccountId &&
       account.accountId &&
       account.accountId === storage.mainAccountId,
   )
+}
+
+/**
+ * Thrown when something asks to refresh a row that `isShieldedMainRow` hides.
+ * Callers that loop over the roster skip such rows before calling refresh; this
+ * is the last guard for any path that did not.
+ */
+export class ShieldedMainRowRefreshError extends Error {
+  constructor(accountId: string) {
+    super(
+      `Refusing to refresh account ${accountId}: it holds the main account's credential while the main slot is live`,
+    )
+    this.name = 'ShieldedMainRowRefreshError'
+  }
+}
+
+/**
+ * The refresh value the account-pool migration writes into OpenCode's `openai`
+ * slot once the main account has moved into the pool row `main`. The full slot
+ * value is `{type:'oauth', access:'', refresh:<this>, expires:0}`. It is not a
+ * credential: it must never be refreshed or sent. It is recognised by an exact
+ * match on the refresh value only, never by prefix, so a future placeholder
+ * version or an unrelated token can never be mistaken for it.
+ */
+export const POOL_MAIN_PLACEHOLDER_REFRESH = 'common-auth-placeholder:v1:openai'
+
+/** Roster id of the row that holds the main account after the pool migration. */
+export const POOL_MAIN_ROW_ID = 'main'
+
+/** Whether a value read from OpenCode's `openai` slot is the pool placeholder. */
+export function isPoolMainPlaceholder(auth: unknown): boolean {
+  return (
+    isRecord(auth) &&
+    auth.type === 'oauth' &&
+    auth.refresh === POOL_MAIN_PLACEHOLDER_REFRESH
+  )
+}
+
+/**
+ * The roster row that serves as the main account while the slot holds the pool
+ * placeholder: the enabled, readable OAuth row with id `main`, if there is one.
+ */
+export function findPoolMainRow(
+  storage: AccountStorage | null | undefined,
+): OAuthAccount | undefined {
+  return storage?.accounts.find(
+    (account): account is OAuthAccount =>
+      account.id === POOL_MAIN_ROW_ID &&
+      account.enabled !== false &&
+      isOAuthAccount(account),
+  )
+}
+
+/** The storage with the pool's main row left out, for fallback selection. */
+export function withoutPoolMainRow<T extends AccountStorage | null | undefined>(
+  storage: T,
+): T {
+  if (!storage) return storage
+  return {
+    ...storage,
+    accounts: storage.accounts.filter(
+      (account) => account.id !== POOL_MAIN_ROW_ID,
+    ),
+  }
 }
 
 function updateStoredAccount(storage: AccountStorage, account: OAuthAccount) {
@@ -2432,7 +2567,7 @@ export class FallbackAccountManager {
 
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
-      if (isMainAccountFallback(storage, account)) continue
+      if (isShieldedMainRow(storage, account)) continue
       const state = await this.custodyAccountState(account)
       // Custody owns these families; the request resolver decides whether a
       // vault or still-valid local bearer exists before send.
@@ -2599,6 +2734,7 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (isShieldedMainRow(storage, account)) continue
       if (await this.isCustodyRefreshInert(account)) continue
       if (!tokenNeedsRefresh(account, storage, this.now())) continue
       if (
@@ -2642,6 +2778,7 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (isShieldedMainRow(storage, account)) continue
       if (await this.isCustodyRefreshInert(account)) continue
       let next = account
       try {
@@ -2690,6 +2827,7 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (isShieldedMainRow(storage, account)) continue
       if (await this.isCustodyRefreshInert(account)) continue
       let next = account
       try {
@@ -2730,10 +2868,19 @@ export class FallbackAccountManager {
     return { storage, errors }
   }
 
+  /**
+   * Refresh one roster row's token when it is due (or always, with `force`).
+   *
+   * A row hidden by `isShieldedMainRow` is refused, because its credential is
+   * also live in the main slot. `asPoolMain` lifts that refusal for the one
+   * caller entitled to it: the path serving row `main` as the main account
+   * while the slot holds only the pool placeholder, when no live slot copy
+   * exists for the shield to protect.
+   */
   async refreshAccount(
     account: OAuthAccount,
     storage: AccountStorage,
-    options: { force?: boolean } = {},
+    options: RefreshAccountOptions = {},
   ): Promise<OAuthAccount> {
     const existing = this.refreshPromises.get(account.id)
     if (existing) {
@@ -2757,7 +2904,7 @@ export class FallbackAccountManager {
     account: OAuthAccount,
     storage: AccountStorage,
     previous: OAuthAccount,
-    options: { force?: boolean },
+    options: RefreshAccountOptions,
   ): Promise<OAuthAccount | null> {
     const deadline = Date.now() + FALLBACK_REFRESH_JOIN_WAIT_MS
     while (Date.now() < deadline) {
@@ -2809,10 +2956,21 @@ export class FallbackAccountManager {
     return null
   }
 
+  private assertNotShieldedMainRow(
+    storage: AccountStorage | null,
+    account: OAuthAccount | undefined,
+    options: RefreshAccountOptions,
+  ) {
+    if (options.asPoolMain || !account) return
+    if (isShieldedMainRow(storage, account)) {
+      throw new ShieldedMainRowRefreshError(account.id)
+    }
+  }
+
   private async refreshAccountNow(
     account: OAuthAccount,
     storage: AccountStorage,
-    options: { force?: boolean },
+    options: RefreshAccountOptions,
   ): Promise<OAuthAccount> {
     let latestStorage = await this.load()
     let latestAccount = latestStorage?.accounts.find(
@@ -2822,6 +2980,7 @@ export class FallbackAccountManager {
     // Choke point (initial load): refuse any provider call when the
     // reloaded account is enrolled or tombstoned. The toggle is ignored.
     await this.assertNotCustodyInert(latestAccount)
+    this.assertNotShieldedMainRow(latestStorage, latestAccount, options)
     if (
       latestAccount &&
       !options.force &&
@@ -2862,8 +3021,10 @@ export class FallbackAccountManager {
       )
       // Choke point (under-lock load): a tombstone landing while the lock
       // was contended, or a manifest entry appearing on disk, both abort
-      // the refresh before the provider call.
+      // the refresh before the provider call. The same holds for a shield
+      // that appeared while this process waited.
       await this.assertNotCustodyInert(latestAccount)
+      this.assertNotShieldedMainRow(latestStorage, latestAccount, options)
       if (
         latestAccount &&
         !options.force &&
