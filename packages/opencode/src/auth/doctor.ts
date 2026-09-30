@@ -2,7 +2,9 @@ import { readFile } from 'node:fs/promises'
 import {
   type AccountPaths,
   type AccountStorage,
+  findPoolMainRow,
   isOAuthAccount,
+  isPoolMainPlaceholder,
   NON_TRANSIENT_REFRESH_RETRY_DELAY_MS,
   type OAuthAccount,
   readConfigRosterIds,
@@ -20,6 +22,7 @@ export type AuthDoctorFindingCode =
   | 'auth-slot-missing'
   | 'auth-slot-not-oauth'
   | 'main-refresh-not-in-store'
+  | 'main-pool-row-missing'
   | 'no-accounts'
   | 'no-enabled-accounts'
   | 'armed-non-transient-refresh-backoff'
@@ -116,7 +119,19 @@ export function createAuthDoctorReport(input: {
   const storedMain = findStoredMainCredential(input.storage)
 
   let authNeedsRestore = false
-  if (!input.auth) {
+  if (isPoolMainPlaceholder(input.auth)) {
+    // The main account lives in the pool row `main` and the slot holds only
+    // the migration's placeholder. That is healthy while the row exists.
+    // Copying the row back into the slot is never offered: it would leave one
+    // refresh token in two places, each refreshing it on its own.
+    if (!findPoolMainRow(input.storage)) {
+      findings.push({
+        code: 'main-pool-row-missing',
+        message:
+          'The main account was moved into the account pool, but the pool has no usable `main` row.',
+      })
+    }
+  } else if (!input.auth) {
     findings.push({
       code: 'auth-slot-missing',
       message: "OpenCode's OpenAI auth slot is missing.",
