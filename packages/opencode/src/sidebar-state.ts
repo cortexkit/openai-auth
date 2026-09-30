@@ -179,6 +179,7 @@ export interface SidebarState {
 }
 
 import { createHash } from 'node:crypto'
+import { statSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -914,15 +915,33 @@ function sidebarFileFor(file: string): SidebarFile<SidebarState> {
   return sidebarFile
 }
 
-async function logWriteFailure(write: Promise<void>): Promise<void> {
+// Files whose last write failed. A file that keeps failing (a lock another
+// process holds, a full or read-only disk) is retried by its writers, so only
+// the first failure of a run is logged at warn; the rest go to debug until a
+// write succeeds again.
+const failingSidebarFiles = new Set<string>()
+
+async function logWriteFailure(
+  file: string,
+  write: Promise<void>,
+): Promise<void> {
   try {
     await write
   } catch (e) {
-    logSb.warn('sidebar write failed', {
+    const fields = {
       pid: process.pid,
       error: e instanceof Error ? e.message : String(e),
-    })
+    }
+    if (failingSidebarFiles.has(file)) {
+      logSb.debug('sidebar write failed again', fields)
+    } else {
+      failingSidebarFiles.add(file)
+      logSb.warn('sidebar write failed', fields)
+    }
     throw e
+  }
+  if (failingSidebarFiles.delete(file)) {
+    logSb.info('sidebar write recovered', { pid: process.pid })
   }
 }
 
@@ -942,7 +961,10 @@ export function setSidebarState(
   file = getSidebarStateFile(),
 ): Promise<void> {
   return enqueueSidebarWrite(() =>
-    logWriteFailure(sidebarFileFor(file).write(normalizeSidebarState(state))),
+    logWriteFailure(
+      file,
+      sidebarFileFor(file).write(normalizeSidebarState(state)),
+    ),
   )
 }
 
@@ -957,6 +979,7 @@ function writeMergedSidebarState(
 ): Promise<void> {
   // Every state reaches disk normalized, as each write has always been.
   return logWriteFailure(
+    file,
     sidebarFileFor(file).update((latest) => {
       const next = merge(latest)
       return next === undefined ? undefined : normalizeSidebarState(next)
@@ -1315,22 +1338,20 @@ export function removeSidebarActiveRouting(
   })
 }
 
-export async function resolveSidebarStickyAssignment(
+/**
+ * True when the session's recorded pin can be used as-is: still valid for this
+ * request, not placed on a slot that now holds a different ChatGPT account,
+ * and carrying no metadata that needs refreshing.
+ */
+function stickyAssignmentIsCurrent(
+  existing: StickyAssignment | undefined,
   input: ResolveStickyAssignmentInput,
-  file = getSidebarStateFile(),
-  hooks?: SidebarMergeHooks,
-): Promise<StickyAssignment | undefined> {
-  const sessionHash = hashSidebarSessionId(input.sessionId)
-  const validPinnedAccountIds = new Set(input.validPinnedAccountIds)
-  const excludedAccountIds = new Set(input.excludeAccountIds)
-  const existing = (await readSidebarState(file)).stickyAssignments?.[
-    sessionHash
-  ]
-  if (
+): existing is StickyAssignment {
+  return (
     isValidStickyAssignment(
       existing,
-      validPinnedAccountIds,
-      excludedAccountIds,
+      new Set(input.validPinnedAccountIds),
+      new Set(input.excludeAccountIds),
       input.now,
     ) &&
     !hasStickyIdentityMismatch(
@@ -1343,127 +1364,266 @@ export async function resolveSidebarStickyAssignment(
       input.now,
       input.wireAccountIdByAccount?.[existing.accountId],
     )
+  )
+}
+
+export interface StickyAssignmentPlan {
+  /** The pin the session should use, or undefined when nothing is eligible. */
+  assignment: StickyAssignment | undefined
+  /** The state to persist, or undefined when `latest` already records it. */
+  next: SidebarState | undefined
+}
+
+/**
+ * Decide a session's pin from one state snapshot, without touching the file.
+ *
+ * This is the whole placement decision: prune dead pins, keep a still-valid
+ * pin (refreshing its metadata), or place the session afresh through
+ * `input.choose` weighted by the bytes other sessions already committed to
+ * each account. The locked file merge and the request path both use it, so
+ * the two cannot drift apart.
+ */
+export function planSidebarStickyAssignment(
+  latest: SidebarState,
+  input: ResolveStickyAssignmentInput,
+): StickyAssignmentPlan {
+  const sessionHash = hashSidebarSessionId(input.sessionId)
+  const validPinnedAccountIds = new Set(input.validPinnedAccountIds)
+  const excludedAccountIds = new Set(input.excludeAccountIds)
+  const stickyAssignments = pruneStickyAssignments(
+    latest.stickyAssignments,
+    validPinnedAccountIds,
+    input.now,
+  )
+  const assignmentsPruned = !stickyAssignmentsEqual(
+    latest.stickyAssignments,
+    stickyAssignments,
+  )
+  const current = stickyAssignments?.[sessionHash]
+  const currentIdentityMismatch =
+    current !== undefined &&
+    hasStickyIdentityMismatch(
+      current,
+      input.wireAccountIdByAccount?.[current.accountId],
+    )
+  if (
+    isValidStickyAssignment(
+      current,
+      validPinnedAccountIds,
+      excludedAccountIds,
+      input.now,
+    ) &&
+    !currentIdentityMismatch
   ) {
-    return existing
+    const metadataNeedsUpdate = stickyAssignmentNeedsMetadataUpdate(
+      current,
+      input.requestBytes,
+      input.now,
+      input.wireAccountIdByAccount?.[current.accountId],
+    )
+    const assignment = metadataNeedsUpdate
+      ? {
+          ...current,
+          inputBytes: Math.max(current.inputBytes, input.requestBytes),
+          ...(current.wireAccountId === undefined &&
+          input.wireAccountIdByAccount?.[current.accountId] !== undefined
+            ? {
+                wireAccountId:
+                  input.wireAccountIdByAccount?.[current.accountId],
+              }
+            : {}),
+          ...(input.now - current.lastSeenAt >=
+          STICKY_ASSIGNMENT_LAST_SEEN_TOUCH_MS
+            ? { lastSeenAt: input.now }
+            : {}),
+        }
+      : current
+    if (!assignmentsPruned && !metadataNeedsUpdate) {
+      return { assignment, next: undefined }
+    }
+    return {
+      assignment,
+      next: {
+        ...latest,
+        stickyAssignments: {
+          ...stickyAssignments,
+          [sessionHash]: assignment,
+        },
+        lastUpdated: Math.max(input.now, latest.lastUpdated + 1),
+      },
+    }
   }
+
+  const choice = input.choose(
+    pendingBytesForAssignments(
+      stickyAssignments,
+      input.quotaCheckedAtByAccount,
+      // Pending bytes weigh how much traffic each account is already
+      // committed to, so the session being placed must not weigh its own
+      // stale entry: that entry belongs to the account it is moving off,
+      // and counting it would bias placement away from a perfectly good
+      // destination. Other sessions' entries still count.
+      currentIdentityMismatch ? sessionHash : undefined,
+    ),
+  )
+  if (!choice) {
+    if (!assignmentsPruned) return { assignment: undefined, next: undefined }
+    return {
+      assignment: undefined,
+      next: {
+        ...latest,
+        stickyAssignments,
+        lastUpdated: Math.max(input.now, latest.lastUpdated + 1),
+      },
+    }
+  }
+
+  const assignment: StickyAssignment = {
+    accountId: choice.accountId,
+    assignedAt: input.now,
+    lastSeenAt: input.now,
+    inputBytes: input.requestBytes,
+    ...(choice.quotaCheckedAt === undefined
+      ? {}
+      : { quotaCheckedAt: choice.quotaCheckedAt }),
+    ...(input.wireAccountIdByAccount?.[choice.accountId] === undefined
+      ? {}
+      : {
+          wireAccountId: input.wireAccountIdByAccount?.[choice.accountId],
+        }),
+  }
+  return {
+    assignment,
+    next: {
+      ...latest,
+      stickyAssignments: limitStickyAssignments(
+        {
+          ...stickyAssignments,
+          [sessionHash]: assignment,
+        },
+        sessionHash,
+      ),
+      lastUpdated: Math.max(input.now, latest.lastUpdated + 1),
+    },
+  }
+}
+
+/**
+ * Resolve a session's pin against the file itself: an unlocked read serves a
+ * current pin, anything else is decided and written under the sidebar lock.
+ * The request path does not use this (it cannot wait on the lock); see
+ * `planSidebarStickyAssignment` and `persistSidebarStickyAssignment`.
+ */
+export async function resolveSidebarStickyAssignment(
+  input: ResolveStickyAssignmentInput,
+  file = getSidebarStateFile(),
+  hooks?: SidebarMergeHooks,
+): Promise<StickyAssignment | undefined> {
+  const sessionHash = hashSidebarSessionId(input.sessionId)
+  const existing = (await readSidebarState(file)).stickyAssignments?.[
+    sessionHash
+  ]
+  if (stickyAssignmentIsCurrent(existing, input)) return existing
 
   let resolved: StickyAssignment | undefined
   await enqueueSidebarWrite(async () => {
     await writeMergedSidebarState(
       file,
       (latest) => {
-        const stickyAssignments = pruneStickyAssignments(
-          latest.stickyAssignments,
-          validPinnedAccountIds,
-          input.now,
-        )
-        const assignmentsPruned = !stickyAssignmentsEqual(
-          latest.stickyAssignments,
-          stickyAssignments,
-        )
-        const current = stickyAssignments?.[sessionHash]
-        const currentIdentityMismatch =
-          current !== undefined &&
-          hasStickyIdentityMismatch(
-            current,
-            input.wireAccountIdByAccount?.[current.accountId],
-          )
-        if (
-          isValidStickyAssignment(
-            current,
-            validPinnedAccountIds,
-            excludedAccountIds,
-            input.now,
-          ) &&
-          !currentIdentityMismatch
-        ) {
-          const metadataNeedsUpdate = stickyAssignmentNeedsMetadataUpdate(
-            current,
-            input.requestBytes,
-            input.now,
-            input.wireAccountIdByAccount?.[current.accountId],
-          )
-          const assignment = metadataNeedsUpdate
-            ? {
-                ...current,
-                inputBytes: Math.max(current.inputBytes, input.requestBytes),
-                ...(current.wireAccountId === undefined &&
-                input.wireAccountIdByAccount?.[current.accountId] !== undefined
-                  ? {
-                      wireAccountId:
-                        input.wireAccountIdByAccount?.[current.accountId],
-                    }
-                  : {}),
-                ...(input.now - current.lastSeenAt >=
-                STICKY_ASSIGNMENT_LAST_SEEN_TOUCH_MS
-                  ? { lastSeenAt: input.now }
-                  : {}),
-              }
-            : current
-          resolved = assignment
-          if (!assignmentsPruned && !metadataNeedsUpdate) return undefined
-          return {
-            ...latest,
-            stickyAssignments: {
-              ...stickyAssignments,
-              [sessionHash]: assignment,
-            },
-            lastUpdated: Math.max(input.now, latest.lastUpdated + 1),
-          }
-        }
-
-        const choice = input.choose(
-          pendingBytesForAssignments(
-            stickyAssignments,
-            input.quotaCheckedAtByAccount,
-            // Pending bytes weigh how much traffic each account is already
-            // committed to, so the session being placed must not weigh its own
-            // stale entry: that entry belongs to the account it is moving off,
-            // and counting it would bias placement away from a perfectly good
-            // destination. Other sessions' entries still count.
-            currentIdentityMismatch ? sessionHash : undefined,
-          ),
-        )
-        if (!choice) {
-          resolved = undefined
-          if (!assignmentsPruned) return undefined
-          return {
-            ...latest,
-            stickyAssignments,
-            lastUpdated: Math.max(input.now, latest.lastUpdated + 1),
-          }
-        }
-
-        resolved = {
-          accountId: choice.accountId,
-          assignedAt: input.now,
-          lastSeenAt: input.now,
-          inputBytes: input.requestBytes,
-          ...(choice.quotaCheckedAt === undefined
-            ? {}
-            : { quotaCheckedAt: choice.quotaCheckedAt }),
-          ...(input.wireAccountIdByAccount?.[choice.accountId] === undefined
-            ? {}
-            : {
-                wireAccountId: input.wireAccountIdByAccount?.[choice.accountId],
-              }),
-        }
-        return {
-          ...latest,
-          stickyAssignments: limitStickyAssignments(
-            {
-              ...stickyAssignments,
-              [sessionHash]: resolved,
-            },
-            sessionHash,
-          ),
-          lastUpdated: Math.max(input.now, latest.lastUpdated + 1),
-        }
+        const plan = planSidebarStickyAssignment(latest, input)
+        resolved = plan.assignment
+        return plan.next
       },
       hooks,
     )
   })
   return resolved
+}
+
+/**
+ * Decide a session's pin in memory from a snapshot, for the request path.
+ * Returns the plan without reading or writing the file; the caller persists
+ * `plan.next` in the background when it is defined.
+ */
+export function planSidebarStickyAssignmentFromSnapshot(
+  state: SidebarState,
+  input: ResolveStickyAssignmentInput,
+): StickyAssignmentPlan {
+  const existing =
+    state.stickyAssignments?.[hashSidebarSessionId(input.sessionId)]
+  // Mirrors resolveSidebarStickyAssignment: a current pin is used as-is even
+  // when other sessions' pins would be pruned, so a steady session never
+  // causes a write on its own account.
+  if (stickyAssignmentIsCurrent(existing, input)) {
+    return { assignment: existing, next: undefined }
+  }
+  return planSidebarStickyAssignment(state, input)
+}
+
+/**
+ * Record a pin the request path already decided and used.
+ *
+ * The merge prunes pins the same way placement does, then writes the given
+ * pin, unless another process has since placed the same session later than
+ * this one did: that newer pin is kept and this process picks it up on its
+ * next refresh. When both describe the same placement, the high-water request
+ * size and last-seen time are kept.
+ */
+export function persistSidebarStickyAssignment(
+  input: {
+    sessionId: string
+    assignment: StickyAssignment
+    validPinnedAccountIds: readonly string[]
+  },
+  file = getSidebarStateFile(),
+): Promise<void> {
+  const sessionHash = hashSidebarSessionId(input.sessionId)
+  const validPinnedAccountIds = new Set(input.validPinnedAccountIds)
+  return enqueueSidebarWrite(async () => {
+    await writeMergedSidebarState(file, (latest) => {
+      const now = Date.now()
+      const stickyAssignments = pruneStickyAssignments(
+        latest.stickyAssignments,
+        validPinnedAccountIds,
+        now,
+      )
+      const current = stickyAssignments?.[sessionHash]
+      if (current && current.assignedAt > input.assignment.assignedAt) {
+        if (stickyAssignmentsEqual(latest.stickyAssignments, stickyAssignments))
+          return undefined
+        return {
+          ...latest,
+          stickyAssignments,
+          lastUpdated: Math.max(now, latest.lastUpdated + 1),
+        }
+      }
+      const samePlacement =
+        current !== undefined &&
+        current.accountId === input.assignment.accountId &&
+        current.assignedAt === input.assignment.assignedAt
+      const assignment = samePlacement
+        ? {
+            ...input.assignment,
+            inputBytes: Math.max(
+              current.inputBytes,
+              input.assignment.inputBytes,
+            ),
+            lastSeenAt: Math.max(
+              current.lastSeenAt,
+              input.assignment.lastSeenAt,
+            ),
+          }
+        : input.assignment
+      return {
+        ...latest,
+        stickyAssignments: limitStickyAssignments(
+          { ...stickyAssignments, [sessionHash]: assignment },
+          sessionHash,
+        ),
+        lastUpdated: Math.max(now, latest.lastUpdated + 1),
+      }
+    })
+  })
 }
 
 export async function clearSidebarStickyAssignment(
@@ -1500,6 +1660,324 @@ export async function clearSidebarStickyAssignment(
  */
 export function drainSidebarWrites(): Promise<void> {
   return sidebarWriteChain
+}
+
+// ---------------------------------------------------------------------------
+// Request-path access to the sidebar file.
+//
+// The sidebar file is bookkeeping: display state plus the cross-process pin
+// and pending-bytes ledger. A turn must never fail, or wait, because that file
+// could not be read, locked or written. The request path therefore reads it
+// through a cache and hands every write to a background queue.
+// ---------------------------------------------------------------------------
+
+/**
+ * Longest a request waits for a lock-free read of a local bookkeeping file
+ * before it goes ahead with the previous snapshot. A read of these few-kilobyte
+ * files normally takes well under a millisecond; the budget only bounds a
+ * pathological disk. The read keeps running and refreshes the cache for the
+ * next request.
+ */
+export const HOT_PATH_READ_BUDGET_MS = 500
+
+/**
+ * Settle with `read` if it settles within `budgetMs`, otherwise with the value
+ * `stale` returns at that moment. A rejection within the budget is passed on;
+ * one after it is dropped, because the caller has already moved on.
+ */
+export function settleWithinBudget<T>(
+  read: Promise<T>,
+  budgetMs: number,
+  stale: () => T,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => resolve(stale()), budgetMs)
+    timer.unref?.()
+    read.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        clearTimeout(timer)
+        reject(error)
+      },
+    )
+  })
+}
+
+export interface SidebarSnapshot {
+  state: SidebarState
+  /**
+   * `Date.now()` when the read that produced `state` started (0 when no read
+   * has completed yet). Anything written to the file before this time is in
+   * `state`.
+   */
+  readAt: number
+}
+
+export interface SidebarStateCache {
+  /**
+   * The snapshot for one request. Costs one `stat` when the file is
+   * unchanged. A changed file (or the first call) is read without any lock,
+   * waiting at most `HOT_PATH_READ_BUDGET_MS`; past that the previous
+   * snapshot is served, or the default state when there is none, which is
+   * what an unreadable file has always meant.
+   */
+  get(): Promise<SidebarSnapshot>
+  /** Read the file now and keep the result; for background callers. */
+  read(): Promise<SidebarSnapshot>
+  /** Re-read in the background if the file changed since the last read. */
+  refreshInBackground(): void
+}
+
+export function createSidebarStateCache(
+  file: string,
+  options: { readBudgetMs?: number } = {},
+): SidebarStateCache {
+  const readBudgetMs = options.readBudgetMs ?? HOT_PATH_READ_BUDGET_MS
+  let snapshot: (SidebarSnapshot & { key: string | undefined }) | undefined
+  let inflight:
+    | { key: string | undefined; promise: Promise<SidebarSnapshot> }
+    | undefined
+
+  // Atomic writes replace the file, so the inode changes on every write even
+  // when the size and a coarse mtime would not.
+  const statKey = (): string | undefined => {
+    try {
+      const stat = statSync(file)
+      return `${stat.ino}:${stat.size}:${stat.mtimeMs}`
+    } catch {
+      return undefined
+    }
+  }
+
+  const startRead = (key: string | undefined): Promise<SidebarSnapshot> => {
+    if (inflight && inflight.key === key) return inflight.promise
+    const readAt = Date.now()
+    // getSidebarState never rejects: an unreadable file is the default state.
+    const promise = getSidebarState(file).then((state) => {
+      if (!snapshot || snapshot.readAt <= readAt) {
+        snapshot = { state, readAt, key }
+      }
+      return { state, readAt }
+    })
+    const entry = { key, promise }
+    inflight = entry
+    const clear = () => {
+      if (inflight === entry) inflight = undefined
+    }
+    promise.then(clear, clear)
+    return promise
+  }
+
+  return {
+    get() {
+      const key = statKey()
+      if (snapshot && snapshot.key === key) {
+        return Promise.resolve({
+          state: snapshot.state,
+          readAt: snapshot.readAt,
+        })
+      }
+      return settleWithinBudget(startRead(key), readBudgetMs, () =>
+        snapshot
+          ? { state: snapshot.state, readAt: snapshot.readAt }
+          : { state: DEFAULT_SIDEBAR_STATE, readAt: 0 },
+      )
+    },
+    read() {
+      return startRead(statKey())
+    },
+    refreshInBackground() {
+      const key = statKey()
+      if (snapshot?.key === key) return
+      void startRead(key)
+    },
+  }
+}
+
+/**
+ * A pin this process decided and is using, possibly not yet on disk. It keeps
+ * the session on the same account in this process even when persisting it
+ * failed, and it is dropped once a snapshot read after the pin landed is in
+ * hand: from then on the file is authoritative, including a newer placement
+ * another process made.
+ */
+export interface StickyPinOverlayEntry {
+  assignment: StickyAssignment
+  /** `Date.now()` after the pin was written to the file. */
+  persistedAt?: number
+}
+
+export type StickyPinOverlay = Map<string, StickyPinOverlayEntry>
+
+/** Record a pin, keeping the map within the file's own pin limit. */
+export function rememberStickyPin(
+  overlay: StickyPinOverlay,
+  sessionHash: string,
+  assignment: StickyAssignment,
+): StickyPinOverlayEntry {
+  const entry: StickyPinOverlayEntry = { assignment }
+  overlay.delete(sessionHash)
+  overlay.set(sessionHash, entry)
+  while (overlay.size > STICKY_ASSIGNMENT_MAX_ENTRIES) {
+    const oldest = overlay.keys().next().value
+    if (oldest === undefined) break
+    overlay.delete(oldest)
+  }
+  return entry
+}
+
+/** The snapshot's state with this process's not-yet-visible pins applied. */
+export function applyStickyPinOverlay(
+  snapshot: SidebarSnapshot,
+  overlay: StickyPinOverlay,
+): SidebarState {
+  if (overlay.size === 0) return snapshot.state
+  const assignments: StickyAssignmentMap = {
+    ...snapshot.state.stickyAssignments,
+  }
+  let applied = false
+  for (const [sessionHash, entry] of overlay) {
+    if (
+      entry.persistedAt !== undefined &&
+      snapshot.readAt > entry.persistedAt
+    ) {
+      overlay.delete(sessionHash)
+      continue
+    }
+    assignments[sessionHash] = entry.assignment
+    applied = true
+  }
+  if (!applied) return snapshot.state
+  return { ...snapshot.state, stickyAssignments: assignments }
+}
+
+export interface SidebarBookkeepingQueue {
+  /**
+   * Start a write now and return without waiting for it. Starting it
+   * synchronously puts it on the shared write chain in call order, so
+   * `drainSidebarWrites` covers it. A failure is logged once and retried from
+   * a timer; a newer write under the same key replaces a pending retry.
+   * `label` names the kind of write in logs and must not identify a session.
+   */
+  enqueue(key: string, label: string, write: () => Promise<void>): void
+  /** Forget a pending retry and ignore the outcome of a write in flight. */
+  cancel(key: string): void
+  /** Stop retrying; writes already started still run. */
+  stop(): void
+}
+
+export function createSidebarBookkeepingQueue(options: {
+  logger: ReturnType<typeof createLogger>
+  retryDelayMs?: number
+  maxRetryDelayMs?: number
+  /** Called after each write that lands. */
+  onWritten?: () => void
+}): SidebarBookkeepingQueue {
+  const baseDelayMs = options.retryDelayMs ?? 500
+  const maxDelayMs = options.maxRetryDelayMs ?? 30_000
+  const generation = new Map<string, number>()
+  const retries = new Map<
+    string,
+    { label: string; write: () => Promise<void> }
+  >()
+  // Keys whose last write failed. Only the first failure of a run is logged
+  // at warn, so a lock held for a minute does not log once per retry.
+  const failing = new Set<string>()
+  let sequence = 0
+  let delayMs = baseDelayMs
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let stopped = false
+
+  const schedule = () => {
+    if (timer || stopped || retries.size === 0) return
+    timer = setTimeout(() => {
+      timer = undefined
+      const due = [...retries]
+      retries.clear()
+      delayMs = Math.min(delayMs * 2, maxDelayMs)
+      for (const [key, retry] of due) {
+        const current = generation.get(key)
+        if (current !== undefined)
+          attempt(key, retry.label, retry.write, current)
+      }
+    }, delayMs)
+    timer.unref?.()
+  }
+
+  const attempt = (
+    key: string,
+    label: string,
+    write: () => Promise<void>,
+    ownGeneration: number,
+  ) => {
+    let running: Promise<void>
+    try {
+      running = write()
+    } catch (error) {
+      running = Promise.reject(error)
+    }
+    running.then(
+      () => {
+        if (generation.get(key) !== ownGeneration) return
+        generation.delete(key)
+        if (failing.delete(key)) {
+          options.logger.info('sidebar bookkeeping write recovered', {
+            pid: process.pid,
+            write: label,
+          })
+        }
+        if (failing.size === 0) delayMs = baseDelayMs
+        options.onWritten?.()
+      },
+      (error: unknown) => {
+        if (generation.get(key) !== ownGeneration) return
+        const fields = {
+          pid: process.pid,
+          write: label,
+          error: error instanceof Error ? error.message : String(error),
+        }
+        if (stopped) {
+          generation.delete(key)
+          options.logger.debug('sidebar bookkeeping write dropped', fields)
+          return
+        }
+        if (failing.has(key)) {
+          options.logger.debug('sidebar bookkeeping write failed again', fields)
+        } else {
+          failing.add(key)
+          options.logger.warn(
+            'sidebar bookkeeping write failed; retrying in the background',
+            fields,
+          )
+        }
+        retries.set(key, { label, write })
+        schedule()
+      },
+    )
+  }
+
+  return {
+    enqueue(key, label, write) {
+      sequence += 1
+      generation.set(key, sequence)
+      retries.delete(key)
+      attempt(key, label, write, sequence)
+    },
+    cancel(key) {
+      generation.delete(key)
+      retries.delete(key)
+      failing.delete(key)
+    },
+    stop() {
+      stopped = true
+      if (timer) clearTimeout(timer)
+      timer = undefined
+      retries.clear()
+    },
+  }
 }
 
 // Resolve the currently-active account from activeId for the collapsed sidebar
