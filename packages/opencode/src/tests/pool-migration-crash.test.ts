@@ -93,21 +93,6 @@ const PRE_TOLERANT_DOUBLE = stepsFrom(
 )
 
 /**
- * The declared shield gap. A tolerant build (the current core, which is what
- * runs beside a migration once the fence is open) skips the row that
- * `mainAccountId` names in its background refresh too. The migration drops
- * `mainAccountId` just before it writes the placeholder, so that older builds
- * see the `main` row once the slot no longer serves it. A crash between those
- * two writes leaves the token in both places with no shield, and a tolerant
- * build then refreshes it twice as well; the next migration run clears it by
- * writing the placeholder.
- */
-const TOLERANT_SHIELD_GAP = stepsFrom(
-  'after-shield-drop',
-  'before-placeholder-write',
-)
-
-/**
  * The version fence as the crashed migrator would have seen it with a
  * pre-tolerant build running: this test process plays that build and
  * registers the way such builds do (an RPC port file and no heartbeat), and
@@ -144,12 +129,19 @@ describe('a crash at every step of the migration', () => {
         'after-verify',
         'store:pull:after-config-write',
         'after-carry-over',
-        'after-shield-drop',
         'before-placeholder-write',
         'after-placeholder-write',
         'after-record-clear',
       ]),
     )
+    // Nothing is written between the fence read and the placeholder, and
+    // the shield goes in the same write that clears the record.
+    expect(recorded.slice(-4)).toEqual([
+      'after-carry-over',
+      'before-placeholder-write',
+      'after-placeholder-write',
+      'after-record-clear',
+    ])
   })
 
   for (const [index, step] of recorded.entries()) {
@@ -184,11 +176,15 @@ describe('a crash at every step of the migration', () => {
       } else {
         expect(preTolerant.refreshedTwice).toEqual([])
       }
-      // A tolerant build refreshes it twice only in the declared shield gap.
+      // A tolerant build (the current core, which is what runs beside a
+      // migration once the fence is open) never refreshes a token twice:
+      // the shield stays up until the placeholder is in the slot, and from
+      // then on it serves main from row `main`.
       const tolerant = await refreshAsOlderBuild(h, 'tolerant')
       expect(tolerant.submitted).toContain('r-main')
-      expect(tolerant.refreshedTwice).toEqual(
-        TOLERANT_SHIELD_GAP.has(step) ? ['r-main'] : [],
+      expect(tolerant.refreshedTwice).toEqual([])
+      expect(tolerant.mainServedFrom).toBe(
+        isPoolPlaceholder(await h.slotValue()) ? 'row main' : 'slot',
       )
 
       // A newer build can read the pool (or sees a legacy roster it will
@@ -284,6 +280,45 @@ describe('the carry-over of the legacy main state', () => {
       retryCount: 1,
       tokenHash: hashRefreshToken('r-main'),
     })
+  }, 30_000)
+})
+
+describe('the shield lasts until the placeholder is in the slot', () => {
+  it('a crash between the placeholder write and the shield drop: a tolerant build serves main from row main with no double refresh, and a re-run drops the shield', async () => {
+    await seedLegacyInstall(h)
+    const child = await runChild({
+      dir: h.dir,
+      mode: 'migrate',
+      exitAtName: 'after-placeholder-write',
+    })
+    expect(child.code).toBe(CRASH_EXIT_CODE)
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+    const crashed = await h.config()
+    expect(crashed.mainAccountId).toBe('acct-main')
+    expect(crashed[POOL_MIGRATION_KEY].pending).toMatchObject({
+      rowId: 'main',
+    })
+
+    // The tolerant build's background refresh skips the shielded row and its
+    // main path refreshes row `main` once, as the main account.
+    expect(await refreshAsOlderBuild(h, 'tolerant')).toEqual({
+      refreshedTwice: [],
+      submitted: ['r-fb1', 'r-main'],
+      mainServedFrom: 'row main',
+    })
+
+    expect(
+      await settle(() => migrateToPool(h.deps({ ...SHORT_LOCKS }))),
+    ).toMatchObject({
+      status: 'completed',
+      operation: 'resumed',
+      placeholder: 'already-present',
+    })
+    const config = await h.config()
+    expect(config.mainAccountId).toBeUndefined()
+    expect(config[POOL_MIGRATION_KEY].pending).toBeUndefined()
+    expect(config[POOL_MIGRATION_KEY].migratedAt).toBeNumber()
+    expect(await h.placeholderWrites()).toBe(1)
   }, 30_000)
 })
 

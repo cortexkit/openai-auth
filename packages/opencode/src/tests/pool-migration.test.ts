@@ -371,13 +371,19 @@ describe('older builds running at the same time', () => {
     ])
     expect(await poolTokens(h)).toEqual(['r-fb1', 'r-fb2', 'r-main'])
     expect(await legacyUsableFallbackIds(h)).toEqual(['fb1', 'fb2', 'main'])
-    for (const build of ['pre-tolerant', 'tolerant'] as const) {
-      const older = await refreshAsOlderBuild(h, build)
-      expect(older.submitted).toEqual(
-        ['r-fb1', 'r-fb2', 'r-main', POOL_PLACEHOLDER.refresh].sort(),
-      )
-      expect(older.refreshedTwice).toEqual([])
-    }
+    // A pre-tolerant build still tries the slot and submits the placeholder
+    // (which fails and is not counted); a tolerant one serves main from row
+    // `main` instead.
+    const preTolerant = await refreshAsOlderBuild(h, 'pre-tolerant')
+    expect(preTolerant.submitted).toEqual(
+      ['r-fb1', 'r-fb2', 'r-main', POOL_PLACEHOLDER.refresh].sort(),
+    )
+    expect(preTolerant.refreshedTwice).toEqual([])
+    expect(await refreshAsOlderBuild(h, 'tolerant')).toEqual({
+      refreshedTwice: [],
+      submitted: ['r-fb1', 'r-fb2', 'r-main'],
+      mainServedFrom: 'row main',
+    })
   })
 
   it('a legacy mutateAccounts after the migration keeps the pool and the main row', async () => {
@@ -477,13 +483,13 @@ describe('adoption of a later login in the slot', () => {
     expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main-2'])
   })
 
-  it('the fence refuses the placeholder when the slot changed after it was read, and the next run adopts the newcomer', async () => {
+  it('the fence refuses the placeholder when the slot changed after the transfer read it, and the next run adopts the newcomer', async () => {
     await migrated()
     await h.setSlot(login('acct-new', 'r-new'))
     const outcome = await adoptHostSlotLogin(
       h.deps({
         onStep: async (step) => {
-          if (step === 'after-shield-drop')
+          if (step === 'after-verify')
             await h.setSlot(login('acct-other', 'r-other'))
         },
       }),
@@ -752,32 +758,27 @@ describe('the slot reads at the placeholder fence', () => {
     }
   }
 
-  for (const [where, step] of [
-    ['at the first fence read', 'after-verify'],
-    ['at the read after the shield drop', 'after-shield-drop'],
-  ] as const) {
-    it(`one missing read of the slot ${where} is not taken for a slot that moved on`, async () => {
-      await migrated()
-      await h.setSlot(login('acct-new', 'r-new'))
-      const host = unreliableSlot()
-      const outcome = await adoptHostSlotLogin(
-        h.deps({
-          slot: host.slot,
-          onStep: async (reached) => {
-            if (reached === step) host.missOnce()
-          },
-        }),
-      )
-      expect(host.missed()).toBe(1)
-      expect(outcome).toMatchObject({
-        status: 'completed',
-        rowId: 'acct-new',
-        placeholder: 'written',
-      })
-      expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
-      expect((await h.config())[POOL_MIGRATION_KEY].pending).toBeUndefined()
+  it('one missing read of the slot at the fence is not taken for a slot that moved on', async () => {
+    await migrated()
+    await h.setSlot(login('acct-new', 'r-new'))
+    const host = unreliableSlot()
+    const outcome = await adoptHostSlotLogin(
+      h.deps({
+        slot: host.slot,
+        onStep: async (reached) => {
+          if (reached === 'after-verify') host.missOnce()
+        },
+      }),
+    )
+    expect(host.missed()).toBe(1)
+    expect(outcome).toMatchObject({
+      status: 'completed',
+      rowId: 'acct-new',
+      placeholder: 'written',
     })
-  }
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+    expect((await h.config())[POOL_MIGRATION_KEY].pending).toBeUndefined()
+  })
 
   for (const [how, reason] of [
     ['absent', 'host-slot-indeterminate'],

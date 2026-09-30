@@ -19,7 +19,10 @@ import {
   type AccountPaths,
   FallbackAccountManager,
   hashRefreshToken,
+  isPoolMainPlaceholder,
+  loadAccounts,
 } from '@cortexkit/openai-auth-core/internal'
+import { resolvePoolMainAccess } from '../../core/pool-main.ts'
 import {
   type HostSlotAdapter,
   isPoolPlaceholder,
@@ -270,7 +273,9 @@ export function singleUseTokenEndpoint() {
       return {
         access: jwt('rotated', String(issued)),
         refresh: `${token}~${issued}`,
-        expires: FAR + 3_600_000,
+        // Well past the older build's clock (below), so a rotated token is
+        // not due again within the same run.
+        expires: FAR + 30 * 86_400_000,
       }
     },
     /** Real refresh tokens submitted more than once. */
@@ -294,28 +299,41 @@ export function singleUseTokenEndpoint() {
  *   `mainAccountId` (vendored in `pool-migration-legacy-refresh.ts`). The
  *   version fence keeps the migration from starting while one is alive.
  * - `tolerant`: the current core, whose background refresh skips the row
- *   `mainAccountId` shields (the real `FallbackAccountManager`).
+ *   `mainAccountId` shields (the real `FallbackAccountManager`), and which
+ *   serves main from row `main` whenever the slot holds the placeholder.
  */
 export type OlderBuild = 'pre-tolerant' | 'tolerant'
+
+export interface OlderBuildRun {
+  /** Real refresh tokens refreshed more than once. */
+  refreshedTwice: string[]
+  /** Every token submitted to the token endpoint. */
+  submitted: string[]
+  /** Where the build got a working main token from, if anywhere. */
+  mainServedFrom: 'slot' | 'row main' | 'nowhere'
+}
 
 /**
  * Runs an older build's own refresh paths against a copy of the install (the
  * source is left as it is, for the run that follows): the background refresh
- * of every due roster row, then the refresh of the slot credential. The
- * older build's clock is set past every token's expiry and every recorded
- * backoff, so each path refreshes whatever it would ever refresh. Returns
- * the refresh tokens that were refreshed twice.
+ * of every due roster row, then the main account's refresh. The older
+ * build's clock is set past every token's expiry and every recorded backoff,
+ * so each path refreshes whatever it would ever refresh.
  *
- * Both builds refresh the slot through `legacyRefreshMain` (vendored from the
- * pre-tolerant plugin entry; the tolerant entry's version is a closure in
- * `index.ts`). The tolerant one also honours the main refresh backoff and
- * re-reads the slot under its lock, which only ever makes it refresh less, so
- * the vendored path over-counts rather than hides a double refresh.
+ * The main account: a tolerant build that finds the placeholder in the slot
+ * serves main from row `main` through the plugin's own `resolvePoolMainAccess`
+ * (refreshing the row as the main account, past the shield). Otherwise, and
+ * always for a pre-tolerant build, it refreshes the slot through
+ * `legacyRefreshMain` (vendored from the pre-tolerant plugin entry; the
+ * tolerant entry's version is a closure in `index.ts`). The tolerant one
+ * also honours the main refresh backoff and re-reads the slot under its
+ * lock, which only ever makes it refresh less, so the vendored path
+ * over-counts rather than hides a double refresh.
  */
 export async function refreshAsOlderBuild(
   source: Harness,
   build: OlderBuild,
-): Promise<{ refreshedTwice: string[]; submitted: string[] }> {
+): Promise<OlderBuildRun> {
   const copy = harness()
   try {
     for (const [from, to] of [
@@ -326,30 +344,64 @@ export async function refreshAsOlderBuild(
       if (existsSync(from)) await copyFile(from, to)
     const endpoint = singleUseTokenEndpoint()
     const now = () => FAR + 60_000
-    const refresh = async (token: string) => ({
-      ...(await endpoint.refresh(token)),
-      expiresIn: 3_600,
-    })
+    // The legacy writers stamp `lastRefreshedAt` as `expires - expiresIn`
+    // and distrust a stamp far ahead of the real clock, which the clock
+    // above would produce; this lifetime puts the stamp at the real time of
+    // the refresh, so a rotated token wins the writer's newer-token check.
+    const refresh = async (token: string) => {
+      const tokens = await endpoint.refresh(token)
+      return {
+        ...tokens,
+        expiresIn: Math.floor((tokens.expires - Date.now()) / 1000),
+      }
+    }
+    let mainServedFrom: OlderBuildRun['mainServedFrom'] = 'nowhere'
+    const refreshSlot = async () => {
+      await legacyRefreshMain({
+        paths: copy.paths,
+        slot: copy.slot,
+        refresh: endpoint.refresh,
+      }).then(
+        () => {
+          mainServedFrom = 'slot'
+        },
+        () => {},
+      )
+    }
     if (build === 'pre-tolerant') {
       await preTolerantRefreshDueAccounts({ paths: copy.paths, now, refresh })
+      await refreshSlot()
     } else {
-      await new FallbackAccountManager({
+      const manager = new FallbackAccountManager({
         paths: copy.paths,
         custody: {
           readManifest: async () => ({ ok: false, reason: 'absent' }),
         },
         now,
         refreshFn: async ({ refreshToken }) => refresh(refreshToken),
-      }).refreshDueAccounts()
+      })
+      await manager.refreshDueAccounts()
+      if (isPoolMainPlaceholder(await copy.slotValue())) {
+        const served = await resolvePoolMainAccess({
+          storage: await loadAccounts(copy.paths),
+          now,
+          isRefreshInert: async () => false,
+          refreshAccount: (account, storage) =>
+            manager.refreshAccount(account, storage, { asPoolMain: true }),
+          resolveAccess: async (account) => ({
+            token: account.access ?? '',
+            provenance: 'local' as const,
+          }),
+        })
+        if (served) mainServedFrom = 'row main'
+      } else {
+        await refreshSlot()
+      }
     }
-    await legacyRefreshMain({
-      paths: copy.paths,
-      slot: copy.slot,
-      refresh: endpoint.refresh,
-    }).catch(() => {})
     return {
       refreshedTwice: endpoint.refreshedTwice(),
       submitted: endpoint.submitted(),
+      mainServedFrom,
     }
   } finally {
     copy.cleanup()
