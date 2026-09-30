@@ -298,7 +298,8 @@ describe('older builds running at the same time', () => {
     })
     expect((await h.slotValue())?.refresh).toBe('r-main')
     expect(await h.row('main')).toBeUndefined()
-    // The lease expires: the next run migrates.
+    // Once the legacy lease's end time has passed (a clock two minutes on),
+    // the lease no longer counts and the migration proceeds.
     expect(
       await migrateToPool(h.deps({ now: () => Date.now() + 120_000 })),
     ).toMatchObject({ status: 'completed', rowId: 'main' })
@@ -467,8 +468,9 @@ describe('adoption of a later login in the slot', () => {
         },
       }),
     )
-    // Documented outcome: the placeholder wins the slot; the earlier login is
-    // in the pool; the late login is lost and the user logs in again.
+    // Declared race (the host slot has no compare-and-replace): the
+    // placeholder overwrites the late login in the slot, the earlier login is
+    // in the pool, and the late login is lost until the user logs in again.
     expect(outcome).toMatchObject({
       status: 'completed',
       rowId: 'acct-new',

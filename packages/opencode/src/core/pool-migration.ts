@@ -98,7 +98,11 @@ export function isPoolPlaceholder(value: unknown): boolean {
  */
 export const POOL_MIGRATION_KEY = 'openaiAuthPool'
 
-/** Mirrors `MAIN_REFRESH_LOCK_TTL_MS` in the plugin entry (`index.ts`). */
+/**
+ * Lease length of the `main-refresh` file lock, the same value older builds
+ * use (`MAIN_REFRESH_LOCK_TTL_MS` in the plugin entry `index.ts`), so a
+ * crashed holder on either side blocks the other for the same bounded time.
+ */
 export const LEGACY_MAIN_REFRESH_LOCK_TTL_MS = 2 * 60_000
 
 /** The host login slot, shaped like the plugin's `client.auth`. */
@@ -258,7 +262,11 @@ export interface PendingTransfer {
 export interface PoolMigrationBookkeeping {
   migratedAt?: number
   pending?: PendingTransfer
-  /** A slot value adoption must not take (see the `ambiguous` outcome). */
+  /**
+   * Fence fingerprint of a host-slot value that must not be imported: the
+   * slot copy left behind by an `ambiguous` outcome, which may be a spent
+   * token. Any new login changes the slot value and is adopted normally.
+   */
   declinedSlotFingerprint?: string
 }
 
@@ -1165,8 +1173,10 @@ async function runUnderMainLock(
     }
     if (first.kind === 'transfer' && first.fresh) idHint = first.record.rowId
 
-    // Older builds refresh the target row under its fallback lock; hold it
-    // across the whole transfer, then decide again under it.
+    // Older builds refresh a roster row while holding its fallback refresh
+    // lock (`fallbackRefreshLockName`). Hold the target row's lock across
+    // the whole transfer, then re-read and plan again under it, so the row
+    // cannot be rotated between the decision and the write.
     const rowLock = await acquireLock(
       ctx,
       fallbackRefreshLockName(first.record.rowId),

@@ -58,9 +58,11 @@ const recorded = await (async () => {
 })()
 
 /**
- * The window between dropping the `mainAccountId` shield and the placeholder
- * write: there an older build would serve main from both the slot and the
- * row. Declared; the rows below assert that outcome instead of uniqueness.
+ * Between removing `mainAccountId` from the config (which until then keeps
+ * older builds off the `main` row) and writing the placeholder, an older
+ * build can serve main's token from both the slot and the row. That gap is
+ * a declared boundary of the migration; crashes at these two steps assert
+ * that outcome instead of a single copy.
  */
 const SHIELD_GAP = new Set(['after-shield-drop', 'before-placeholder-write'])
 
@@ -291,7 +293,8 @@ describe('a crash while adopting a later login', () => {
     })
     expect((await h.slotValue())?.refresh).toBe('r-main-2')
     expect((await h.config())[POOL_MIGRATION_KEY].pending).toBeUndefined()
-    // The stale slot value is not adopted over the rotated row later either.
+    // A later adoption run must not write the older token still in the slot
+    // over the rotated row credential.
     expect(await adoptHostSlotLogin(h.deps({ ...SHORT_LOCKS }))).toEqual({
       status: 'nothing-to-import',
       slot: 'declined',
@@ -299,7 +302,7 @@ describe('a crash while adopting a later login', () => {
     expect((await h.row('main'))?.credential).toMatchObject({
       refresh: 'r-main-3',
     })
-    // The user's next login resolves it.
+    // A new login puts a fresh credential into the slot, which is adopted.
     await h.setSlot(login('acct-main', 'r-main-4', 'again'))
     expect(await adoptHostSlotLogin(h.deps({ ...SHORT_LOCKS }))).toMatchObject({
       status: 'completed',
