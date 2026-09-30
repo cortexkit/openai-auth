@@ -101,8 +101,13 @@ describe('background refresh honours the main-row shield', () => {
     await managerRecording(refreshed, []).refreshDueAccounts()
     expect(refreshed).toEqual(['refresh-other'])
     const stored = await loadAccounts(paths)
-    const shadow = stored?.accounts.find((a) => a.id === 'shadow')
-    expect((shadow as OAuthAccount).refresh).toBe('refresh-shadow')
+    const shadow = stored?.accounts.find(
+      (a) => a.id === 'shadow',
+    ) as OAuthAccount
+    expect(shadow.refresh).toBe('refresh-shadow')
+    // Not even attempted: an attempt refused further down would still arm a
+    // refresh backoff on the row.
+    expect(shadow.lastRefreshError).toBeUndefined()
   })
 
   it('refreshQuotaForDueAccounts skips the row holding the main account', async () => {
@@ -112,6 +117,10 @@ describe('background refresh honours the main-row shield', () => {
     await managerRecording(refreshed, polled).refreshQuotaForDueAccounts()
     expect(refreshed).toEqual(['refresh-other'])
     expect(polled).not.toContain('access-shadow')
+    const shadow = (await loadAccounts(paths))?.accounts.find(
+      (a) => a.id === 'shadow',
+    ) as OAuthAccount
+    expect(shadow.lastQuotaRefreshError).toBeUndefined()
   })
 
   it('refreshQuotaForAllAccounts skips the row holding the main account', async () => {
