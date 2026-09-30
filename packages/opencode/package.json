@@ -57,7 +57,7 @@
   },
   "dependencies": {
     "@cortexkit/subc-client": "^0.8.1",
-    "@opentui/core": ">=0.5.11",
+    "@opentui/core": ">=0.5.12",
     "@opentui/solid": ">=0.5.11",
     "ai": "^7.0.107",
     "jsonc-parser": "^3.3.1",
