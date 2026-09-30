@@ -22,5 +22,8 @@
   },
   "dependencies": {
     "@cortexkit/claustrum-client": "^0.4.0"
+  },
+  "devDependencies": {
+    "@cortexkit/common-auth": "0.1.0"
   }
 }
