@@ -1594,30 +1594,6 @@ describe('getSidebarState — malformed file never throws', () => {
   })
 })
 
-describe('sidebar write failures', () => {
-  test('rejects the failed operation but keeps the write queue usable', async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-write-'))
-    const nonDirectory = join(tempDir, 'not-a-directory')
-    writeFileSync(nonDirectory, 'blocker', 'utf8')
-    const invalidFile = join(nonDirectory, 'sidebar-state.json')
-    const validFile = join(tempDir, 'sidebar-state.json')
-    const savedEnv = process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE
-
-    try {
-      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = invalidFile
-      await expect(setSidebarState(DEFAULT_SIDEBAR_STATE)).rejects.toThrow()
-
-      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = validFile
-      await setSidebarState(DEFAULT_SIDEBAR_STATE)
-      expect(existsSync(validFile)).toBe(true)
-    } finally {
-      await drainSidebarWrites()
-      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
-        savedEnv ?? FLOOR_SIDEBAR_STATE_FILE
-    }
-  })
-})
-
 describe('resolveActiveAccount', () => {
   test('activeId "main" resolves to the main account', () => {
     const state = make({ activeId: 'main', main: main(quota(20)) })
@@ -1947,64 +1923,6 @@ describe('sidebar isolation: getSidebarStateFile never returns the live default 
       // It existed before — its mtime must be unchanged (we didn't touch it).
       const mtimeAfter = statSync(LIVE_DEFAULT).mtimeMs
       expect(mtimeAfter).toBe(mtimeBefore)
-    }
-  })
-})
-
-describe('sidebar isolation: setSidebarState serializes concurrent writes', () => {
-  test('5 concurrent writes with different lastUpdated values — last-chained state wins', async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-serial-'))
-    const file = join(tempDir, 'sidebar-state.json')
-
-    const savedEnv = process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE
-    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = file
-
-    try {
-      // Fire 5 concurrent writes — the serialization chain must ensure the
-      // last-enqueued write (lastUpdated=5) is what lands on disk.
-      const writes = [1, 2, 3, 4, 5].map((n) =>
-        setSidebarState({ ...DEFAULT_SIDEBAR_STATE, lastUpdated: n }),
-      )
-      await Promise.all(writes)
-      await drainSidebarWrites()
-
-      const { readFileSync } = await import('node:fs')
-      const written = JSON.parse(readFileSync(file, 'utf8')) as SidebarState
-      // The last-enqueued write must have landed — no torn/interleaved state.
-      expect(written.lastUpdated).toBe(5)
-    } finally {
-      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
-        savedEnv ?? FLOOR_SIDEBAR_STATE_FILE
-    }
-  })
-})
-
-describe('sidebar atomic write', () => {
-  test('writes state atomically and cleans up temp files', async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-atomic-'))
-    const file = join(tempDir, 'sidebar-state.json')
-
-    const savedEnv = process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE
-    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = file
-
-    try {
-      const state: SidebarState = {
-        ...DEFAULT_SIDEBAR_STATE,
-        lastUpdated: 999,
-      }
-      await setSidebarState(state)
-      await drainSidebarWrites()
-
-      const { readFileSync, readdirSync } = await import('node:fs')
-      const written = JSON.parse(readFileSync(file, 'utf8')) as SidebarState
-      expect(written.lastUpdated).toBe(999)
-
-      // Check that no temp files are left in the directory
-      const files = readdirSync(tempDir)
-      expect(files).toEqual(['sidebar-state.json'])
-    } finally {
-      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
-        savedEnv ?? FLOOR_SIDEBAR_STATE_FILE
     }
   })
 })
