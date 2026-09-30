@@ -599,6 +599,13 @@ export {
   parseJwtClaims,
 } from '@cortexkit/openai-auth-core/internal'
 
+// The account-pool migration ships switched off in the release that first
+// understands the migrated layout, so every install runs that release (a safe
+// version to go back to) before any credential moves. The next release turns
+// this on; the version fence then waits for every running process to be on
+// it before migrating.
+const POOL_MIGRATION_ENABLED = false
+
 interface CodexAuthPluginOptions {
   /**
    * Test seams for the background account-pool migration and adoption
@@ -610,7 +617,10 @@ interface CodexAuthPluginOptions {
       PoolLifecycleDeps,
       'fence' | 'migrate' | 'adopt' | 'timers' | 'random' | 'runDeps' | 'log'
     >
-  >
+  > & {
+    /** Overrides POOL_MIGRATION_ENABLED, so tests can run the migration. */
+    enabled?: boolean
+  }
   issuer?: string
   codexApiEndpoint?: string
   experimentalWebSockets?: boolean
@@ -1292,7 +1302,10 @@ export async function CodexAuthPlugin(
   // Background account-pool migration and adoption of later host-slot
   // logins. Needs the host slot's full adapter (get, set and all); a client
   // without it (some embedders and tests) runs without the pool migration.
+  const { enabled: poolMigrationEnabled, ...poolMigrationDeps } =
+    options.poolMigration ?? {}
   const poolLifecycle: PoolLifecycle | undefined =
+    (poolMigrationEnabled ?? POOL_MIGRATION_ENABLED) &&
     typeof (hostAuth as Partial<typeof hostAuth>).get === 'function' &&
     typeof (hostAuth as Partial<typeof hostAuth>).all === 'function'
       ? createPoolLifecycle({
@@ -1303,7 +1316,7 @@ export async function CodexAuthPlugin(
             all: () => hostAuth.all(),
           },
           version: PackageVersion,
-          ...options.poolMigration,
+          ...poolMigrationDeps,
         })
       : undefined
   // The runtime accepts this factory-owned bootstrap rather than opening a second connection.

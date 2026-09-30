@@ -144,7 +144,7 @@ function installWire(): Wire {
 
 type PoolOptions = Partial<
   Pick<PoolLifecycleDeps, 'fence' | 'migrate' | 'adopt' | 'runDeps' | 'log'>
->
+> & { enabled?: boolean }
 
 function pluginInput(): PluginInput {
   return {
@@ -187,7 +187,11 @@ const quietLog = { info: () => {}, warn: () => {} }
 async function loadPlugin(poolMigration: PoolOptions = {}, extra = {}) {
   hooks = await CodexAuthPlugin(pluginInput(), {
     experimentalWebSockets: false,
-    poolMigration: { log: quietLog, ...poolMigration },
+    poolMigration: {
+      log: quietLog,
+      ...poolMigration,
+      enabled: 'enabled' in poolMigration ? poolMigration.enabled : true,
+    },
     ...extra,
   })
   const authHook = hooks.auth
@@ -218,6 +222,19 @@ function send(
 }
 
 describe('the migration after the loader starts', () => {
+  it('is switched off by default in this release: nothing moves', async () => {
+    await seedLegacy()
+    const wire = installWire()
+    const { fetchOverride } = await loadPlugin({ enabled: undefined })
+    const before = readFileSync(configFile, 'utf8')
+    expect((await send(fetchOverride)).status).toBe(200)
+    // Long enough for a background run to have written its record.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(isPoolPlaceholder(await slotValue())).toBe(false)
+    expect(readFileSync(configFile, 'utf8')).toBe(before)
+    expect(wire.sends).toEqual([`Bearer ${jwt('acct-main')}`])
+  })
+
   it('runs in the background: a request meanwhile is served from the slot, and afterwards from row main', async () => {
     await seedLegacy()
     const wire = installWire()
