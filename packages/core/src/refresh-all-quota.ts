@@ -342,7 +342,8 @@ export async function refreshAllQuota(
           recordOutcome({
             account: acct.id,
             ok: false,
-            error: 'account holds the main credential while the main slot is live',
+            error:
+              'account holds the main credential while the main slot is live',
           })
         }
         continue
@@ -351,7 +352,11 @@ export async function refreshAllQuota(
         ? ((acct as OAuthAccount).accountId ?? liveMainAccountId)
         : undefined
       const storeReading = (
-        entry: { quota: Awaited<ReturnType<typeof whamFn>>; refreshAfter: number; checkedAt: number },
+        entry: {
+          quota: Awaited<ReturnType<typeof whamFn>>
+          refreshAfter: number
+          checkedAt: number
+        },
         token: string,
         accountId: string | undefined,
       ) => {
@@ -573,11 +578,11 @@ export async function refreshAllQuota(
 
         let refreshed: OAuthAccount
         try {
-          refreshed = await deps.fallbackManager.refreshAccount(
-            acct,
-            storage,
-            asMain ? { asPoolMain: true } : undefined,
-          )
+          refreshed = asMain
+            ? await deps.fallbackManager.refreshAccount(acct, storage, {
+                asPoolMain: true,
+              })
+            : await deps.fallbackManager.refreshAccount(acct, storage)
         } catch (refreshError) {
           // Continue with the existing token — a transient refresh blip should
           // not stop a quota poll that the current token may still satisfy —
@@ -626,10 +631,11 @@ export async function refreshAllQuota(
             pid: process.pid,
             accountId: acct.id,
           })
-          refreshed = await deps.fallbackManager.refreshAccount(acct, storage, {
-            force: true,
-            asPoolMain: asMain,
-          })
+          refreshed = await deps.fallbackManager.refreshAccount(
+            acct,
+            storage,
+            asMain ? { force: true, asPoolMain: true } : { force: true },
+          )
           if (!refreshed.access) {
             recordOutcome({
               account: acct.id,

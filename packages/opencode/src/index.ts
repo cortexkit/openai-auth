@@ -2132,7 +2132,8 @@ export async function CodexAuthPlugin(
             )
             const latest = await getAuth()
             // Main moved into the account pool while this process waited.
-            if (isPoolMainPlaceholder(latest)) throw new MainAccountInPoolError()
+            if (isPoolMainPlaceholder(latest))
+              throw new MainAccountInPoolError()
             if (latest.type !== 'oauth' || !latest.access) continue
             const changed =
               latest.access !== previous.access ||
@@ -2263,8 +2264,7 @@ export async function CodexAuthPlugin(
                   const storageNow = await loadAccounts(
                     getAccountPaths(getConfigPath()),
                   )
-                  const currentError =
-                    storageNow?.refresh?.mainLastRefreshError
+                  const currentError = storageNow?.refresh?.mainLastRefreshError
                   if (
                     currentError &&
                     refreshBackoffActive(
