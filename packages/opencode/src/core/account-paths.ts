@@ -6,7 +6,7 @@ import {
   ACCOUNT_STATE_FILE_NAME,
   type AccountPaths,
   deriveStatePath,
-} from '@cortexkit/openai-auth-core/internal'
+} from '@cortexkit/openai-auth-core/tui-support'
 
 /**
  * Where OpenCode's account store lives.

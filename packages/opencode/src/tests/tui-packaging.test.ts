@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
 
 // ---------------------------------------------------------------------------
@@ -119,52 +119,57 @@ describe('tui packaging (compiled ./tui entry shim)', () => {
     ])
 
     const entrySource = readFileSync(join(PKG_DIR, tuiEntry), 'utf8')
+    // The entry reaches the variants only through the selector the TUI build
+    // copies next to them, never through a bare @cortexkit/common-auth import:
+    // that package is inlined at build time and not installed with the plugin.
     expect(relativeSpecs(entrySource)).toEqual([
-      '../tui-compiled/raw/tui.tsx',
-      '../tui-compiled/runtime/tui.tsx',
+      '../tui-compiled/runtime/selector.js',
     ])
+    expect(entrySource).not.toContain('@cortexkit/common-auth')
+    expect(entrySource).toContain("'../tui-compiled/raw/tui.tsx'")
+    expect(entrySource).toContain("'../tui-compiled/runtime/tui.js'")
     expect(entrySource).not.toContain("import('../tui.tsx')")
   })
 
-  // Both generated variants are produced from the static shippedSourceFiles
-  // list in scripts/build-tui.ts. A source file reachable from tui.tsx but
-  // missing from that list is absent from src/tui-compiled/, and the TUI then
-  // fails at load time. Walk the real import graph and require coverage.
+  // scripts/build-tui.ts emits the import closure of tui.tsx, computed by the
+  // shared TUI build. A source file reachable from tui.tsx but absent from a
+  // generated variant would make the TUI fail at load time, so walk the real
+  // import graph and require every reachable file in both variants.
   test('every src/ file reachable from tui.tsx is in build-tui shippedSourceFiles', () => {
-    const script = readFileSync(
-      join(PKG_DIR, 'scripts', 'build-tui.ts'),
-      'utf8',
-    )
-    const arrayMatch = script.match(
-      /const shippedSourceFiles = \[([\s\S]*?)\] as const/,
-    )
-    if (!arrayMatch) {
+    const compiledRoot = join(PKG_DIR, 'src', 'tui-compiled')
+    if (!existsSync(compiledRoot)) {
       throw new Error(
-        'scripts/build-tui.ts no longer declares shippedSourceFiles — update this test to match the new build mechanism',
+        'src/tui-compiled is absent — run `bun run build:tui` before this suite, or this test silently proves nothing',
       )
     }
-    const shipped = new Set(
-      [...arrayMatch[1]!.matchAll(/'([^']+)'/g)].map((m) => m[1]!),
-    )
-
-    // tui-compiled is build output; the graph of interest is the raw source
-    // fallback starting at src/tui.tsx (the same graph build-tui compiles).
     const reachable = [...collectReachableSrcFiles('src/tui.tsx')]
       .filter((rel) => !rel.startsWith('src/tui-compiled/'))
       .map((rel) => rel.replace(/^src\//, ''))
       .sort()
+    expect(reachable.length).toBeGreaterThan(1)
 
-    const missing = reachable.filter((rel) => !shipped.has(rel))
+    // raw keeps .tsx for the host's Solid transform; everything else is .js.
+    const emittedName = (rel: string, variant: string) =>
+      variant === 'raw' && rel.endsWith('.tsx')
+        ? rel
+        : rel.replace(/\.tsx?$/, '.js')
+    const missing = ['raw', 'runtime'].flatMap((variant) =>
+      reachable
+        .map((rel) => `${variant}/${emittedName(rel, variant)}`)
+        .filter((rel) => !existsSync(join(compiledRoot, rel))),
+    )
     expect(missing).toEqual([])
   })
 
-  // The check above proves every file is present; it says nothing about whether
-  // the generated tree links. It cannot: the shared re-export shim is written
-  // by the generator, so a file can be shipped while the symbols it imports
-  // from that shim are missing. That shipped once — `bun run build` succeeded,
-  // the suite was green, and importing the generated logger threw
-  // `export 'createLogger' not found`. Loading the modules is the only check
-  // that sees it.
+  // Presence says nothing about whether the generated tree links: an inlined
+  // module can be copied while a name it imports is missing. That shipped once —
+  // `bun run build` succeeded, the suite was green, and importing the generated
+  // logger threw `export 'createLogger' not found`. Loading the modules is the
+  // only check that sees it. Every emitted module that bare Bun can load is
+  // imported, in both variants: that covers the inlined core and
+  // @cortexkit/common-auth copies, and the selector the entry imports. The
+  // modules left out import the host's virtual OpenTUI runtime or raw TSX,
+  // which only the host can load.
   test('both generated variants link', async () => {
     const compiledRoot = join(PKG_DIR, 'src', 'tui-compiled')
     if (!existsSync(compiledRoot)) {
@@ -172,23 +177,32 @@ describe('tui packaging (compiled ./tui entry shim)', () => {
         'src/tui-compiled is absent — run `bun run build:tui` before this suite, or this test silently proves nothing',
       )
     }
-    // The logger is the deepest core consumer in the shipped set, so it is the
-    // one that fails first when the shim goes stale. Importing it pulls the
-    // shim and every module the shim forwards.
     for (const variant of ['runtime', 'raw']) {
-      const target = join(compiledRoot, variant, 'logger.ts')
-      expect(existsSync(target)).toBe(true)
-      await import(target)
+      const variantRoot = join(compiledRoot, variant)
+      const loadable = readdirSync(variantRoot, { recursive: true })
+        .map(String)
+        .filter((rel) => rel.endsWith('.js'))
+        .filter(
+          (rel) =>
+            !/from\s+"opentui:runtime-module:/.test(
+              readFileSync(join(variantRoot, rel), 'utf8'),
+            ),
+        )
+        .sort()
+      // The logger is the deepest core consumer, so it goes stale first.
+      expect(loadable).toContain('logger.js')
+      expect(loadable).toContain('selector.js')
+      for (const rel of loadable) await import(join(variantRoot, rel))
     }
   })
 
-  // Whatever the shipped sources import from the core shim must be something
-  // the shim actually forwards. Naming symbols by hand is what let these drift
-  // apart, so the generator forwards whole modules; this pins that it kept
-  // doing so rather than reverting to a list that looks right and is not.
+  // Whatever the TUI imports from core must be something core forwards. Naming
+  // symbols by hand is what let these drift apart, so the core module the TUI
+  // reaches forwards whole modules; this pins that it kept doing so rather than
+  // reverting to a list that looks right and is not.
   test('the generated core shim forwards whole modules', () => {
     const shim = readFileSync(
-      join(PKG_DIR, 'src', 'tui-compiled', 'shared', 'internal.ts'),
+      join(PKG_DIR, '..', 'core', 'src', 'tui-support.ts'),
       'utf8',
     )
     const lines = shim.split('\n').filter((line) => line.startsWith('export'))

@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 
-import { errorMessage, openUrl } from '@cortexkit/openai-auth-core/internal'
+import { errorMessage, openUrl } from '@cortexkit/openai-auth-core/tui-support'
 import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import { createLogger } from '../logger'
 import type { OpenDialogPayload } from '../rpc/protocol.js'
