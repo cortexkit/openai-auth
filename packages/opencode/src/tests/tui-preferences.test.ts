@@ -57,46 +57,6 @@ describe('getTuiPreferencesFile', () => {
   })
 })
 
-describe('readTuiPreferencesFile', () => {
-  test('missing file returns empty object', async () => {
-    expect(await readTuiPreferencesFile()).toEqual({})
-  })
-
-  test('parses JSONC with comments and trailing commas', async () => {
-    await writeFile(
-      file,
-      `// header comment\n{\n  // plugin\n  "openai-auth": { "order": 5, },\n}\n`,
-      'utf8',
-    )
-    const root = await readTuiPreferencesFile()
-    expect(root).toEqual({ 'openai-auth': { order: 5 } })
-  })
-
-  test('malformed file returns empty object', async () => {
-    await writeFile(file, '{{{{ not json', 'utf8')
-    expect(await readTuiPreferencesFile()).toEqual({})
-  })
-
-  test('unterminated object returns empty object', async () => {
-    await writeFile(file, '{"openai-auth": {"order": 5}', 'utf8')
-    expect(await readTuiPreferencesFile()).toEqual({})
-  })
-
-  test('trailing garbage after object returns empty object', async () => {
-    await writeFile(
-      file,
-      '{"openai-auth":{"order":5}} trailing garbage',
-      'utf8',
-    )
-    expect(await readTuiPreferencesFile()).toEqual({})
-  })
-
-  test('non-object root returns empty object', async () => {
-    await writeFile(file, '[1, 2, 3]', 'utf8')
-    expect(await readTuiPreferencesFile()).toEqual({})
-  })
-})
-
 describe('resolveOpenaiAuthPrefs', () => {
   test('empty root yields defaults', () => {
     const prefs = resolveOpenaiAuthPrefs({})
@@ -292,157 +252,29 @@ describe('computeEffectiveOrder', () => {
   })
 })
 
-describe('queueTuiPreferenceUpdate', () => {
-  test('creates file with template on first write', async () => {
+// The shared reader, writer and watcher are tested in @cortexkit/common-auth.
+// These pin what this plugin adds on top: its own header on a file it creates,
+// and updates that never reject.
+describe('openai-auth preferences writer', () => {
+  test('a file this plugin creates starts with the openai-auth header', async () => {
     await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
     const text = await readFile(file, 'utf8')
-    expect(text).toContain('Shared preferences for opencode TUI plugins')
-    const root = await readTuiPreferencesFile()
-    expect(root).toEqual({ 'openai-auth': { collapsed: true } })
-  })
-
-  test('preserves comments and unrelated keys on update', async () => {
-    const original = `// my notes
-{
-  // keep me
-  "other-plugin": { "forceToTop": true },
-  "openai-auth": {
-    "pollMs": 2000, // tuned
-    "collapsed": false
-  }
-}
-`
-    await writeFile(file, original, 'utf8')
-    await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
-    const text = await readFile(file, 'utf8')
-    expect(text).toContain('// my notes')
-    expect(text).toContain('// keep me')
-    expect(text).toContain('// tuned')
-    expect(text).toContain('"pollMs": 2000')
-    const root = await readTuiPreferencesFile()
-    expect(root['other-plugin']).toEqual({ forceToTop: true })
-    expect((root['openai-auth'] as Record<string, unknown>).collapsed).toBe(
-      true,
+    expect(text).toStartWith(
+      '// Shared preferences for opencode TUI plugins.\n// One top-level key per plugin (short name).',
     )
-  })
-
-  test('writes nested paths', async () => {
-    await queueTuiPreferenceUpdate(PLUGIN_KEY, ['header', 'label'], 'Q')
-    const root = await readTuiPreferencesFile()
-    expect(root).toEqual({ 'openai-auth': { header: { label: 'Q' } } })
-  })
-
-  test('rapid sequential updates land the final value', async () => {
-    const writes = [true, false, true, false].map((value) =>
-      queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], value),
-    )
-    await Promise.all(writes)
-    const root = await readTuiPreferencesFile()
-    expect((root['openai-auth'] as Record<string, unknown>).collapsed).toBe(
-      false,
-    )
-  })
-
-  test('no temp files are left behind', async () => {
-    await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
-    const { readdir } = await import('node:fs/promises')
-    const entries = await readdir(dir)
-    expect(entries).toEqual(['tui-preferences.jsonc'])
-  })
-})
-
-describe('watchTuiPreferences', () => {
-  test('fires after the file changes', async () => {
-    await writeFile(file, '{}', 'utf8')
-    let fired = 0
-    const dispose = watchTuiPreferences(() => {
-      fired += 1
+    expect(await readTuiPreferencesFile()).toEqual({
+      'openai-auth': { collapsed: true },
     })
-    try {
-      await new Promise((resolve) => setTimeout(resolve, 50))
-      await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
-      await new Promise((resolve) => setTimeout(resolve, 400))
-      expect(fired).toBeGreaterThanOrEqual(1)
-    } finally {
-      dispose()
-    }
   })
 
-  test('debounces bursts into few callbacks', async () => {
-    await writeFile(file, '{}', 'utf8')
-    let fired = 0
-    const dispose = watchTuiPreferences(() => {
-      fired += 1
-    })
-    try {
-      await new Promise((resolve) => setTimeout(resolve, 50))
-      for (let i = 0; i < 5; i++) {
-        await queueTuiPreferenceUpdate(PLUGIN_KEY, ['pollMs'], 1000 + i)
-      }
-      await new Promise((resolve) => setTimeout(resolve, 400))
-      expect(fired).toBeGreaterThanOrEqual(1)
-      expect(fired).toBeLessThan(5)
-    } finally {
-      dispose()
-    }
-  })
-
-  test('missing directory returns a no-op disposer', () => {
-    process.env[TUI_PREFS_FILE_ENV] = join(dir, 'nope', 'missing.jsonc')
-    const dispose = watchTuiPreferences(() => {})
-    expect(typeof dispose).toBe('function')
-    dispose()
-  })
-
-  test('dispose stops callbacks', async () => {
-    await writeFile(file, '{}', 'utf8')
-    let fired = 0
-    const dispose = watchTuiPreferences(() => {
-      fired += 1
-    })
-    await new Promise((resolve) => setTimeout(resolve, 50))
-    dispose()
-    await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
-    await new Promise((resolve) => setTimeout(resolve, 300))
-    expect(fired).toBe(0)
-  })
-
-  test('ignores sibling files that share the preferences name as a prefix', async () => {
-    await writeFile(file, '{}', 'utf8')
-    let fired = 0
-    const dispose = watchTuiPreferences(() => {
-      fired += 1
-    })
-    try {
-      await new Promise((resolve) => setTimeout(resolve, 50))
-      await writeFile(
-        join(dir, 'tui-preferences.jsonc.backup'),
-        'noise',
-        'utf8',
-      )
-      await new Promise((resolve) => setTimeout(resolve, 300))
-      expect(fired).toBe(0)
-      await queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true)
-      await new Promise((resolve) => setTimeout(resolve, 400))
-      expect(fired).toBeGreaterThanOrEqual(1)
-    } finally {
-      dispose()
-    }
-  })
-
-  test('does not fire when the file is rewritten with identical content', async () => {
-    await writeFile(file, '{}', 'utf8')
-    let fired = 0
-    const dispose = watchTuiPreferences(() => {
-      fired += 1
-    })
-    try {
-      await new Promise((resolve) => setTimeout(resolve, 50))
-      await writeFile(file, '{}', 'utf8')
-      await new Promise((resolve) => setTimeout(resolve, 400))
-      expect(fired).toBe(0)
-    } finally {
-      dispose()
-    }
+  test('a failed update resolves instead of rejecting', async () => {
+    // A regular file where the preferences directory should be makes both the
+    // directory creation and the write fail.
+    const blocker = join(dir, 'not-a-directory')
+    await writeFile(blocker, 'x', 'utf8')
+    process.env[TUI_PREFS_FILE_ENV] = join(blocker, 'tui-preferences.jsonc')
+    await expect(
+      queueTuiPreferenceUpdate(PLUGIN_KEY, ['collapsed'], true),
+    ).resolves.toBeUndefined()
   })
 })
