@@ -52,7 +52,7 @@
     "@opencode-ai/plugin": "*"
   },
   "devDependencies": {
-    "@ai-sdk/openai": "3.0.88",
+    "@ai-sdk/openai": "4.0.78",
     "@cortexkit/openai-auth-core": "workspace:*"
   },
   "dependencies": {
