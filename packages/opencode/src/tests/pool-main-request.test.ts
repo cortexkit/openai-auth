@@ -145,24 +145,32 @@ const QUOTA_HEADERS = {
 interface Wire {
   /** Authorization header of every model request, in order. */
   sends: string[]
-  /** Request body of every token-refresh POST, in order. */
-  refreshBodies: string[]
+  /** Refresh token sent by every token-refresh POST, in order. */
+  refreshTokens: string[]
 }
 
 /**
- * Replace the network. Model requests answer with `respond(token)`; token
- * refreshes answer with `refreshResponse` (a fresh token pair by default).
- * Quota polls fail, so only the request under test can write quota.
+ * Replace the network. Model requests answer with `respond(bearer)`. A token
+ * refresh answers with a fresh pair, except for the placeholder, which the
+ * real endpoint would reject. Quota polls fail, so only the request under
+ * test can write quota.
  */
 function installWire(
   respond: (bearer: string) => Response = () =>
     new Response('{}', { status: 200, headers: QUOTA_HEADERS }),
 ): Wire {
-  const wire: Wire = { sends: [], refreshBodies: [] }
+  const wire: Wire = { sends: [], refreshTokens: [] }
   globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
     const target = String(url)
     if (target.includes('/oauth/token')) {
-      wire.refreshBodies.push(String(init?.body ?? ''))
+      // The body is form-encoded, so read the field rather than matching the
+      // raw text (the placeholder's colons are escaped on the wire).
+      const refreshToken =
+        new URLSearchParams(String(init?.body ?? '')).get('refresh_token') ?? ''
+      wire.refreshTokens.push(refreshToken)
+      if (refreshToken === PLACEHOLDER.refresh) {
+        return new Response('{"error":"invalid_grant"}', { status: 400 })
+      }
       return new Response(
         JSON.stringify({
           access_token: 'refreshed-access',
@@ -219,9 +227,7 @@ async function sidebar(): Promise<SidebarState> {
 }
 
 function expectPlaceholderNeverRefreshed(wire: Wire) {
-  for (const body of wire.refreshBodies) {
-    expect(body).not.toContain(PLACEHOLDER.refresh)
-  }
+  expect(wire.refreshTokens).not.toContain(PLACEHOLDER.refresh)
 }
 
 describe('placeholder recognition', () => {
@@ -324,9 +330,7 @@ describe('request path with the main account in the pool', () => {
     )
 
     expect(response.status).toBe(200)
-    expect(wire.refreshBodies).toHaveLength(1)
-    expect(wire.refreshBodies[0]).toContain('main-refresh')
-    expectPlaceholderNeverRefreshed(wire)
+    expect(wire.refreshTokens).toEqual(['main-refresh'])
     expect(wire.sends).toEqual(['Bearer refreshed-access'])
   })
 
@@ -380,9 +384,7 @@ describe('main refresh re-reads the slot once it holds the lock', () => {
     )
 
     expect(response.status).toBe(200)
-    expect(wire.refreshBodies).toHaveLength(1)
-    expect(wire.refreshBodies[0]).toContain('main-R2')
-    expect(wire.refreshBodies[0]).not.toContain('main-R1')
+    expect(wire.refreshTokens).toEqual(['main-R2'])
     expect(wire.sends).toEqual(['Bearer refreshed-access'])
   })
 
@@ -404,7 +406,7 @@ describe('main refresh re-reads the slot once it holds the lock', () => {
     )
 
     expect(response.status).toBe(200)
-    expect(wire.refreshBodies).toEqual([])
+    expect(wire.refreshTokens).toEqual([])
     expect(wire.sends).toEqual(['Bearer main-R2-access'])
   })
 
@@ -421,7 +423,7 @@ describe('main refresh re-reads the slot once it holds the lock', () => {
     )
 
     expect(response.status).toBe(200)
-    expect(wire.refreshBodies).toEqual([])
+    expect(wire.refreshTokens).toEqual([])
     expect(wire.sends).toEqual(['Bearer main-token'])
   })
 })
