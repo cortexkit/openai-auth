@@ -73,6 +73,26 @@ export interface PoolMainAccessDeps {
  * inside the refresh-before-expiry window, unless a refresh backoff is armed
  * or custody owns the credential. A failed refresh still serves a token that
  * has not expired.
+ *
+ * The refresh goes through `FallbackAccountManager.refreshAccount` (the
+ * legacy per-row path), not through `refreshPoolRow` in `pool-migration.ts`,
+ * and that is deliberate:
+ * - It already takes the row's legacy fallback lock, the lock every older
+ *   build refreshes that row under, so an older build and this path never
+ *   refresh the row at once. The migration's own writes to the row take the
+ *   same lock (through the store), so they serialise with it too.
+ * - What `refreshPoolRow` adds is `main-refresh` and the legacy main lease,
+ *   which matter only while the row and the slot hold the same token. That
+ *   is only while a transfer is in flight, and then the row is shielded
+ *   (`mainAccountId`) and this path is not reached: it runs only once the
+ *   slot holds the placeholder, i.e. once the slot's copy is gone. An older
+ *   build that could still refresh the slot copy after that is exactly the
+ *   pre-tolerant build the version fence keeps away; downgrading to one is
+ *   unsupported.
+ * - Moving this one path onto the pool store alone would leave two writers
+ *   of one row with different lock sets (the background refresh and
+ *   fallback selection still use the legacy path). The request path moves
+ *   onto the pool as a whole, together with routing and quota.
  */
 export async function resolvePoolMainAccess(
   deps: PoolMainAccessDeps,

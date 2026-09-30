@@ -77,6 +77,12 @@ export interface CreateAuthMethodsOptions {
   fetchImpl?: typeof fetch
   packageVersion?: string
   dependencies?: Partial<AuthMethodDependencies>
+  /**
+   * Called, and awaited, after these methods write a credential into
+   * OpenCode's `openai` slot themselves. The plugin adopts it into the account
+   * pool there on a migrated install; a failure never fails the login.
+   */
+  onMainSlotWritten?: () => Promise<void>
 }
 
 export function openBrowserForMenu(
@@ -179,6 +185,7 @@ export function createAuthMethods({
   fetchImpl = fetch,
   packageVersion = PackageVersion,
   dependencies,
+  onMainSlotWritten,
 }: CreateAuthMethodsOptions): AuthMethod[] {
   const deps: AuthMethodDependencies = {
     authorizeBrowser: dependencies?.authorizeBrowser ?? authorizeBrowser,
@@ -224,6 +231,7 @@ export function createAuthMethods({
       path: { id: 'openai' },
       body: { type: 'oauth', ...credential },
     } as never)
+    await onMainSlotWritten?.().catch(() => {})
   }
 
   const runOwnedLogin = async () => {
