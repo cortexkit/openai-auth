@@ -23,13 +23,13 @@
       "name": "@cortexkit/openai-auth-core",
       "version": "0.0.0",
       "dependencies": {
-        "@cortexkit/claustrum-client": "^0.3.0",
+        "@cortexkit/claustrum-client": "^0.4.0",
         "@cortexkit/subc-client": "^0.8.1",
       },
     },
     "packages/opencode": {
       "name": "@cortexkit/opencode-openai-auth",
-      "version": "0.10.0",
+      "version": "0.11.0",
       "dependencies": {
         "@cortexkit/subc-client": "^0.8.1",
         "@opentui/core": ">=0.5.11",
@@ -48,7 +48,7 @@
     },
     "packages/pi": {
       "name": "@cortexkit/pi-openai-auth",
-      "version": "0.10.0",
+      "version": "0.11.0",
       "devDependencies": {
         "@cortexkit/openai-auth-core": "workspace:*",
       },
@@ -186,7 +186,7 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.5.14", "", { "os": "win32", "cpu": "x64" }, "sha512-oJWmBhoHsnhUKIke+0gXDX0mltJrWHA1UyHsrTlXwX0TL64ilVZAo+TYZm97baecV0esBdpzy3k96q+09JaZUQ=="],
 
-    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.3.0", "", { "dependencies": { "@cortexkit/subc-client": "^0.8.1" } }, "sha512-vX28AlhG6vsk2PDNIQMkMmcP2gg+tcODuuz/xppVyLnveNL8aVZlZll1TkT1T9UMKeLDk/vvfOkeMSAC9ZaKGA=="],
+    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.4.0", "", { "dependencies": { "@cortexkit/subc-client": "^0.16.0" } }, "sha512-xjUXf/lB3T8R7oaOu9T1Obnn47bAdN5UbyaTpywyiY4wdvTbqHBnB3qX0KpDFTeZ7m35tRPDevcWvOzJIgUhMw=="],
 
     "@cortexkit/openai-auth-core": ["@cortexkit/openai-auth-core@workspace:packages/core"],
 
@@ -913,6 +913,8 @@
     "@babel/helper-compilation-targets/semver": ["semver@6.3.1", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA=="],
 
     "@babel/helper-create-class-features-plugin/semver": ["semver@6.3.1", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA=="],
+
+    "@cortexkit/claustrum-client/@cortexkit/subc-client": ["@cortexkit/subc-client@0.16.1", "", {}, "sha512-TJqOcfMVxhCfZMANmEH/9w+L+zYxFSy5p5Zl/shDErtGSeUF6HFiwZ7OR/P2qFvpSg/yxCbsdenZ7rs5SE6fhA=="],
 
     "@opentui/core/diff": ["diff@9.0.0", "", {}, "sha512-svtcdpS8CgJyqAjEQIXdb3OjhFVVYjzGAPO8WGCmRbrml64SPw/jJD4GoE98aR7r25A0XcgrK3F02yw9R/vhQw=="],
 
