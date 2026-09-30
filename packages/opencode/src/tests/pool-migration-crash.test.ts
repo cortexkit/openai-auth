@@ -67,37 +67,59 @@ const recorded = await (async () => {
   }
 })()
 
-/**
- * From the pool row write until the placeholder write, the slot and the
- * `main` row hold the same refresh token. An older build's background
- * refresh ignores `mainAccountId` (that shield only steers its request
- * routing), so after a crash in this window an older build refreshes the
- * token from the row and then again from the slot, and the second refresh
- * fails because the first spent it. Only a version older than the first
- * pool-tolerant release does this, and the version fence keeps the migration
- * from starting while one is alive; what remains is a downgrade to such a
- * version after the crash, which is unsupported. Crash rows in this window
- * assert exactly that double refresh, and that the fence would have been
- * shut with that older build running.
- */
-const BOTH_COPIES = (() => {
-  const first = recorded.indexOf('store:add:after-state-write')
-  const last = recorded.indexOf('before-placeholder-write')
-  if (first < 0 || last < first) throw new Error('unexpected step sequence')
-  return new Set(recorded.slice(first, last + 1))
-})()
+/** The recorded steps from `first` through `last`, both included. */
+function stepsFrom(first: string, last: string): Set<string> {
+  const from = recorded.indexOf(first)
+  const to = recorded.indexOf(last)
+  if (from < 0 || to < from) throw new Error('unexpected step sequence')
+  return new Set(recorded.slice(from, to + 1))
+}
 
 /**
- * The version fence as the crashed migrator would have seen it had the
- * older build been running: this test process plays that older build and
- * registers the way every plugin version does (an RPC port file, no
- * heartbeat), and the crashed child is the migrating process.
+ * From the pool row write until the placeholder write, the slot and the
+ * `main` row hold the same refresh token. A pre-tolerant build (0.11.0 and
+ * earlier) ignores `mainAccountId` in its background refresh (that shield
+ * only steers its request routing), so after a crash anywhere in this window
+ * it refreshes the token from the row and then again from the slot, and the
+ * second refresh fails because the first spent it. The version fence keeps
+ * the migration from starting while such a build is alive; what remains is a
+ * downgrade to one after the crash, which is unsupported. Crash rows in this
+ * window assert exactly that double refresh for the pre-tolerant build, and
+ * that the fence is shut while it runs.
  */
-async function fenceWithOlderBuildRunning(migratorPid: number | undefined) {
+const PRE_TOLERANT_DOUBLE = stepsFrom(
+  'store:add:after-state-write',
+  'before-placeholder-write',
+)
+
+/**
+ * The declared shield gap. A tolerant build (the current core, which is what
+ * runs beside a migration once the fence is open) skips the row that
+ * `mainAccountId` names in its background refresh too. The migration drops
+ * `mainAccountId` just before it writes the placeholder, so that older builds
+ * see the `main` row once the slot no longer serves it. A crash between those
+ * two writes leaves the token in both places with no shield, and a tolerant
+ * build then refreshes it twice as well; the next migration run clears it by
+ * writing the placeholder.
+ */
+const TOLERANT_SHIELD_GAP = stepsFrom(
+  'after-shield-drop',
+  'before-placeholder-write',
+)
+
+/**
+ * The version fence as the crashed migrator would have seen it with a
+ * pre-tolerant build running: this test process plays that build and
+ * registers the way such builds do (an RPC port file and no heartbeat), and
+ * the crashed child is the migrating process.
+ */
+async function fenceWithPreTolerantBuildRunning(
+  migratorPid: number | undefined,
+) {
   const stateHome = join(h.dir, 'xdg-state')
   await writePortFile(
     join(rpcStateRoot(stateHome), 'openai-auth-0123456789abcdef'),
-    { pid: process.pid, port: 1, token: 'older-build' },
+    { pid: process.pid, port: 1, token: 'pre-tolerant-build' },
   )
   return migrationFenceOpen({
     stateHome,
@@ -147,20 +169,27 @@ describe('a crash at every step of the migration', () => {
       const byId = new Map(legacy?.accounts.map((a) => [a.id, a]))
       expect(byId.get('fb1')).toMatchObject({ refresh: 'r-fb1' })
       expect(byId.get('key1')).toMatchObject({ apiKey: 'sk-key1' })
-      // ...and the older build's refresh paths never refresh one token
-      // twice, except in the declared BOTH_COPIES window, where the slot and
-      // the `main` row hold the same token.
-      const older = await refreshAsOlderBuild(h)
-      expect(older.submitted).toContain('r-main')
-      if (BOTH_COPIES.has(step)) {
-        expect(older.refreshedTwice).toEqual(['r-main'])
-        expect(await fenceWithOlderBuildRunning(child.pid)).toMatchObject({
-          open: false,
-          blockers: [{ pid: process.pid, version: 'unknown' }],
-        })
+      // A pre-tolerant build refreshes main's token twice only inside
+      // PRE_TOLERANT_DOUBLE, and there the fence is shut while it runs.
+      const preTolerant = await refreshAsOlderBuild(h, 'pre-tolerant')
+      expect(preTolerant.submitted).toContain('r-main')
+      if (PRE_TOLERANT_DOUBLE.has(step)) {
+        expect(preTolerant.refreshedTwice).toEqual(['r-main'])
+        expect(await fenceWithPreTolerantBuildRunning(child.pid)).toMatchObject(
+          {
+            open: false,
+            blockers: [{ pid: process.pid, version: 'unknown' }],
+          },
+        )
       } else {
-        expect(older.refreshedTwice).toEqual([])
+        expect(preTolerant.refreshedTwice).toEqual([])
       }
+      // A tolerant build refreshes it twice only in the declared shield gap.
+      const tolerant = await refreshAsOlderBuild(h, 'tolerant')
+      expect(tolerant.submitted).toContain('r-main')
+      expect(tolerant.refreshedTwice).toEqual(
+        TOLERANT_SHIELD_GAP.has(step) ? ['r-main'] : [],
+      )
 
       // A newer build can read the pool (or sees a legacy roster it will
       // migrate), no two rows share a token, and main's token is reachable.
@@ -199,7 +228,8 @@ describe('a crash at every step of the migration', () => {
       expect(config[POOL_MIGRATION_KEY].migratedAt).toBeNumber()
       expect(config.routing).toEqual({ mode: 'fallback-first' })
       expect(config.webSockets).toBe(true)
-      expect((await refreshAsOlderBuild(h)).refreshedTwice).toEqual([])
+      for (const build of ['pre-tolerant', 'tolerant'] as const)
+        expect((await refreshAsOlderBuild(h, build)).refreshedTwice).toEqual([])
       expect(await legacyUsableFallbackIds(h)).toEqual(['fb1', 'main'])
     }, 30_000)
   }

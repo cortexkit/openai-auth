@@ -28,6 +28,7 @@ import {
   type PoolMigrationFenceDeps,
 } from '../../core/pool-migration.ts'
 import { legacyRefreshMain } from './legacy-main-refresh.ts'
+import { preTolerantRefreshDueAccounts } from './pool-migration-legacy-refresh.ts'
 
 /** A version fence with no older process running. */
 export const OPEN_FENCE = async () => ({ open: true as const })
@@ -288,16 +289,32 @@ export function singleUseTokenEndpoint() {
 }
 
 /**
+ * Which older openai-auth build runs beside the migration:
+ * - `pre-tolerant`: 0.11.0 and earlier, whose background refresh ignores
+ *   `mainAccountId` (vendored in `pool-migration-legacy-refresh.ts`). The
+ *   version fence keeps the migration from starting while one is alive.
+ * - `tolerant`: the current core, whose background refresh skips the row
+ *   `mainAccountId` shields (the real `FallbackAccountManager`).
+ */
+export type OlderBuild = 'pre-tolerant' | 'tolerant'
+
+/**
  * Runs an older build's own refresh paths against a copy of the install (the
  * source is left as it is, for the run that follows): the background refresh
- * of every due roster row (the real `FallbackAccountManager`), then the
- * refresh of the slot credential (`legacyRefreshMain`, vendored from the
- * older plugin entry). The older build's clock is set past every token's
- * expiry and every recorded backoff, so each path refreshes whatever it would
- * ever refresh. Returns the refresh tokens that were refreshed twice.
+ * of every due roster row, then the refresh of the slot credential. The
+ * older build's clock is set past every token's expiry and every recorded
+ * backoff, so each path refreshes whatever it would ever refresh. Returns
+ * the refresh tokens that were refreshed twice.
+ *
+ * Both builds refresh the slot through `legacyRefreshMain` (vendored from the
+ * pre-tolerant plugin entry; the tolerant entry's version is a closure in
+ * `index.ts`). The tolerant one also honours the main refresh backoff and
+ * re-reads the slot under its lock, which only ever makes it refresh less, so
+ * the vendored path over-counts rather than hides a double refresh.
  */
 export async function refreshAsOlderBuild(
   source: Harness,
+  build: OlderBuild,
 ): Promise<{ refreshedTwice: string[]; submitted: string[] }> {
   const copy = harness()
   try {
@@ -308,16 +325,23 @@ export async function refreshAsOlderBuild(
     ] as const)
       if (existsSync(from)) await copyFile(from, to)
     const endpoint = singleUseTokenEndpoint()
-    const manager = new FallbackAccountManager({
-      paths: copy.paths,
-      custody: { readManifest: async () => ({ ok: false, reason: 'absent' }) },
-      now: () => FAR + 60_000,
-      refreshFn: async ({ refreshToken }) => ({
-        ...(await endpoint.refresh(refreshToken)),
-        expiresIn: 3_600,
-      }),
+    const now = () => FAR + 60_000
+    const refresh = async (token: string) => ({
+      ...(await endpoint.refresh(token)),
+      expiresIn: 3_600,
     })
-    await manager.refreshDueAccounts()
+    if (build === 'pre-tolerant') {
+      await preTolerantRefreshDueAccounts({ paths: copy.paths, now, refresh })
+    } else {
+      await new FallbackAccountManager({
+        paths: copy.paths,
+        custody: {
+          readManifest: async () => ({ ok: false, reason: 'absent' }),
+        },
+        now,
+        refreshFn: async ({ refreshToken }) => refresh(refreshToken),
+      }).refreshDueAccounts()
+    }
     await legacyRefreshMain({
       paths: copy.paths,
       slot: copy.slot,

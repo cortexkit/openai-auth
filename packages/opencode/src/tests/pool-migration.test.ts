@@ -371,11 +371,13 @@ describe('older builds running at the same time', () => {
     ])
     expect(await poolTokens(h)).toEqual(['r-fb1', 'r-fb2', 'r-main'])
     expect(await legacyUsableFallbackIds(h)).toEqual(['fb1', 'fb2', 'main'])
-    const older = await refreshAsOlderBuild(h)
-    expect(older.submitted).toEqual(
-      ['r-fb1', 'r-fb2', 'r-main', POOL_PLACEHOLDER.refresh].sort(),
-    )
-    expect(older.refreshedTwice).toEqual([])
+    for (const build of ['pre-tolerant', 'tolerant'] as const) {
+      const older = await refreshAsOlderBuild(h, build)
+      expect(older.submitted).toEqual(
+        ['r-fb1', 'r-fb2', 'r-main', POOL_PLACEHOLDER.refresh].sort(),
+      )
+      expect(older.refreshedTwice).toEqual([])
+    }
   })
 
   it('a legacy mutateAccounts after the migration keeps the pool and the main row', async () => {
