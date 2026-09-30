@@ -19,8 +19,9 @@ const log = createLogger('rpc')
 
 /**
  * Registry of running servers, one per project directory, shared by every
- * plugin instance in the process. The name is the global this plugin has
- * always kept its servers under.
+ * plugin instance in the process. adoptRpcServer keeps it on `globalThis`
+ * under `Symbol.for(key)`; the key is the name of the `globalThis` property
+ * earlier versions of this plugin kept their servers in.
  */
 export const RPC_SERVER_REGISTRY_KEY = '__openaiAuthRpcServers'
 

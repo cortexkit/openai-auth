@@ -189,7 +189,9 @@ describe('tui packaging (compiled ./tui entry shim)', () => {
             ),
         )
         .sort()
-      // The logger is the deepest core consumer, so it goes stale first.
+      // The generated logger imports the most inlined core and library code,
+      // and the selector is what src/tui/entry.mjs imports, so both must be in
+      // the imported set for the check below to mean anything.
       expect(loadable).toContain('logger.js')
       expect(loadable).toContain('selector.js')
       for (const rel of loadable) await import(join(variantRoot, rel))
