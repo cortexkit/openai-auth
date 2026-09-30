@@ -21,7 +21,11 @@ export {
   detectClaustrumConnection,
   getDefaultClaustrumConnectionPath,
 } from '@cortexkit/claustrum-client'
-export { writeJsonAtomic } from '@cortexkit/common-auth/fs'
+export {
+  acquireRefreshFileLock,
+  isLostMarkerRaceError,
+  writeJsonAtomic,
+} from '@cortexkit/common-auth/fs'
 export * from './accounts'
 export * from './backoff'
 export {
@@ -39,7 +43,6 @@ export * from './provider'
 export * from './quota-manager'
 export * from './quota-normalize'
 export * from './refresh-all-quota'
-export * from './refresh-file-lock'
 export * from './reset-credits'
 export * from './util/error'
 export * from './util/open-url'

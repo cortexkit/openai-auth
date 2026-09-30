@@ -22,6 +22,7 @@
 
 import { createHash } from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
+import type { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import {
   type AccountPaths,
   type AccountStorage,
@@ -42,7 +43,14 @@ import {
 } from './custody-manifest.ts'
 import { createLogger } from './logger.ts'
 import { extractAccountIdFromClaims, parseJwtClaims } from './oauth.ts'
-import type { acquireRefreshFileLock } from './refresh-file-lock.ts'
+
+/**
+ * The part of acquireRefreshFileLock the custody paths use: acquire, or get
+ * null when the lock is held, and release. Injected so tests can substitute it.
+ */
+export type RefreshFileLockAcquirer = (
+  options: Parameters<typeof acquireRefreshFileLock>[0],
+) => Promise<{ release: () => Promise<void> } | null>
 
 const log = createLogger('custody')
 
@@ -761,7 +769,7 @@ export function assertNotCustodyTombstone(
 export type CompleteEnrollmentDeps = {
   loadAccounts: typeof loadAccounts
   readCustodyManifest: (path?: string) => Promise<CustodyManifestReadResult>
-  acquireRefreshFileLock: typeof acquireRefreshFileLock
+  acquireRefreshFileLock: RefreshFileLockAcquirer
   configPath: string
   paths: AccountPaths
   manifestPath?: string

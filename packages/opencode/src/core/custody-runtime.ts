@@ -1,4 +1,4 @@
-import type { acquireRefreshFileLock } from '@cortexkit/openai-auth-core/internal'
+import type { RefreshFileLockAcquirer } from '@cortexkit/openai-auth-core/internal'
 import {
   type AccountStorage,
   ClaustrumClient,
@@ -79,7 +79,7 @@ export type CustodyRuntimeOptions = {
   mutateAccounts: typeof mutateAccounts
   withAccountStoreTransaction: typeof withAccountStoreTransaction
   readCustodyManifest: typeof readCustodyManifest
-  acquireRefreshFileLock: typeof acquireRefreshFileLock
+  acquireRefreshFileLock: RefreshFileLockAcquirer
   auth?: CustodyHostAuth
   resolveFallbackVaultState?: (input: {
     accountId: string

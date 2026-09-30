@@ -11,7 +11,6 @@ import {
   readTuiPreferencesFile,
   resolveOpenaiAuthPrefs,
   TUI_PREFS_FILE_ENV,
-  watchTuiPreferences,
 } from '../tui-preferences'
 import { unsetEnv } from './setup-env'
 

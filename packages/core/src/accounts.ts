@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { writeJsonAtomic } from '@cortexkit/common-auth/fs'
+import {
+  acquireRefreshFileLock,
+  writeJsonAtomic,
+} from '@cortexkit/common-auth/fs'
 import {
   buildQuotaOperationError,
   buildRefreshOperationError,
@@ -38,7 +41,6 @@ import type {
 } from './provider.ts'
 import { PRIMARY, SECONDARY } from './provider.ts'
 import { quotaWindowResetIsPast } from './quota-manager.ts'
-import { acquireRefreshFileLock } from './refresh-file-lock'
 
 const logR = createLogger('refresh')
 const logA = createLogger('accounts')
