@@ -478,6 +478,40 @@ describe('adoption of a later login in the slot', () => {
     expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main', 'r-new'])
   })
 
+  it('waits for an older build refreshing the target row under its fallback lock', async () => {
+    await migrated()
+    await h.setSlot(login('acct-main', 'r-main', 'fresh-access'))
+    const held = await acquireRefreshFileLock({
+      name: fallbackRefreshLockName('main'),
+      ttlMs: 60_000,
+      path: h.paths.configPath,
+    })
+    const outcome = await adoptHostSlotLogin(
+      h.deps({ legacyLocks: { timeoutMs: 300 } }),
+    )
+    await held?.release()
+    expect(outcome).toEqual({ status: 'retry', reason: 'lock-contention' })
+    expect((await h.row('main'))?.credential).toMatchObject({
+      access: jwt('acct-main'),
+    })
+    expect((await h.slotValue())?.refresh).toBe('r-main')
+  })
+
+  it('refuses the placeholder write when the host auth map reads empty', async () => {
+    await migrated()
+    await h.setSlot(login('acct-new', 'r-new'))
+    const outcome = await adoptHostSlotLogin(
+      h.deps({ slot: { ...h.slot, all: async () => ({}) } }),
+    )
+    expect(outcome).toEqual({ status: 'retry', reason: 'torn-read' })
+    expect((await h.slotValue())?.refresh).toBe('r-new')
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'acct-new',
+      operation: 'resumed',
+    })
+  })
+
   it('a login landing right after the placeholder write is reported and adopted next', async () => {
     await migrated()
     await h.setSlot(login('acct-new', 'r-new'))
