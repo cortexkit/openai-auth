@@ -13,9 +13,11 @@
 // longer does (it skips a row shielded by `mainAccountId`), so the old rules
 // are kept here rather than imported.
 //
-// Left out: the custody-manifest checks (the fixtures have no manifest), the
-// join-a-concurrent-refresh wait when the row lock is taken (these runs are
-// sequential), and logging. Loading and saving go through the current
+// Left out: the custody-manifest checks and the custody-tombstone exception
+// in the error bookkeeping (the fixtures have no manifest), the
+// join-a-concurrent-refresh wait when the row lock is taken and the
+// in-process sharing of one refresh per row (these runs are sequential and
+// single-caller), and logging. Loading and saving go through the current
 // legacy-format reader and writer.
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import {
