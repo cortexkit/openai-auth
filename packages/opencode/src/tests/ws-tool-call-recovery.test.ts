@@ -354,6 +354,206 @@ describe('websocket failure after function calls only (real AI SDK parser)', () 
   })
 })
 
+// The envelope and lifecycle frames the Codex backend sends on a WebSocket
+// turn before the first output item.
+const opening: Frame[] = [
+  { type: 'codex.response.metadata', thread_id: 'th_1' },
+  created,
+  { type: 'response.in_progress', response: { id: 'resp_1' } },
+]
+
+function reasoningAdded(n: number): Frame {
+  return {
+    type: 'response.output_item.added',
+    output_index: n,
+    item: {
+      type: 'reasoning',
+      id: `rs_${n}`,
+      encrypted_content: 'enc_added',
+      summary: [],
+    },
+  }
+}
+
+function reasoningDone(n: number, summary: unknown[] = []): Frame {
+  return {
+    type: 'response.output_item.done',
+    output_index: n,
+    item: {
+      type: 'reasoning',
+      id: `rs_${n}`,
+      encrypted_content: 'enc_done',
+      summary,
+    },
+  }
+}
+
+describe('websocket failure after reasoning without text (real AI SDK parser)', () => {
+  // A shape the transport log records on real cut turns: a reasoning item
+  // opens and the socket dies while the model is still thinking. The host has
+  // opened an empty reasoning part and nothing else.
+  test('a close after only an opened reasoning item fails retryably', async () => {
+    const { error, calls, ofType } = await run({
+      frames: [...opening, reasoningAdded(0)],
+      failure: serviceRestart,
+    })
+
+    expect(ofType('reasoning-start')).toHaveLength(1)
+    expect(ofType('reasoning-delta')).toHaveLength(0)
+    expect(ofType('finish')).toHaveLength(0)
+    expect(error).toBeInstanceOf(ResponseStreamError)
+    expect(error).toMatchObject({ isRetryable: true })
+    expect((error as Error).message).not.toBe(TERMINAL_AFTER_OUTPUT_MESSAGE)
+    expect(calls.completed).toBe(0)
+    expect(calls.invalid).toHaveLength(1)
+  })
+
+  // The other shape the transport log records: a reasoning item finishes with
+  // no summary, then a function call starts streaming and the socket dies
+  // before the call finishes.
+  test('a close after a finished empty reasoning item and an unfinished call fails retryably', async () => {
+    const { error, calls, ofType } = await run({
+      frames: [
+        ...opening,
+        reasoningAdded(0),
+        reasoningDone(0),
+        callAdded(1),
+        callDelta(1, '{"pa'),
+        callDelta(1, 'th":'),
+      ],
+      failure: serviceRestart,
+    })
+
+    expect(ofType('reasoning-end')).toHaveLength(1)
+    expect(ofType('reasoning-delta')).toHaveLength(0)
+    expect(ofType('tool-input-start')).toHaveLength(1)
+    expect(ofType('tool-call')).toHaveLength(0)
+    expect(error).toBeInstanceOf(ResponseStreamError)
+    expect(error).toMatchObject({ isRetryable: true })
+    expect(calls.completed).toBe(0)
+  })
+
+  for (const [name, frame] of [
+    [
+      'a summary part',
+      {
+        type: 'response.reasoning_summary_part.added',
+        item_id: 'rs_0',
+        output_index: 0,
+        summary_index: 0,
+        part: { type: 'summary_text', text: '' },
+      },
+    ],
+    [
+      'summary text',
+      {
+        type: 'response.reasoning_summary_text.delta',
+        item_id: 'rs_0',
+        output_index: 0,
+        summary_index: 0,
+        delta: 'Considering the file',
+      },
+    ],
+    [
+      'reasoning text',
+      {
+        type: 'response.reasoning_text.delta',
+        item_id: 'rs_0',
+        output_index: 0,
+        content_index: 0,
+        delta: 'Considering the file',
+      },
+    ],
+    [
+      'a legacy summary delta',
+      {
+        type: 'response.reasoning_summary.delta',
+        item_id: 'rs_0',
+        output_index: 0,
+        delta: 'Considering the file',
+      },
+    ],
+  ] as const) {
+    test(`a close after reasoning with ${name} ends the turn without retry`, async () => {
+      const { error } = await run({
+        frames: [...opening, reasoningAdded(0), frame],
+        failure: serviceRestart,
+      })
+
+      expect((error as Error).message).toBe(TERMINAL_AFTER_OUTPUT_MESSAGE)
+      expect(error).not.toBeInstanceOf(ResponseStreamError)
+    })
+  }
+
+  test('a reasoning item finished with a summary ends the turn without retry', async () => {
+    const { error } = await run({
+      frames: [
+        ...opening,
+        reasoningAdded(0),
+        reasoningDone(0, [{ type: 'summary_text', text: 'Considered it' }]),
+      ],
+      failure: serviceRestart,
+    })
+
+    expect((error as Error).message).toBe(TERMINAL_AFTER_OUTPUT_MESSAGE)
+  })
+
+  test('a message item after empty reasoning ends the turn without retry', async () => {
+    const { error } = await run({
+      frames: [
+        ...opening,
+        reasoningAdded(0),
+        reasoningDone(0),
+        {
+          type: 'response.output_item.added',
+          output_index: 1,
+          item: { type: 'message', id: 'msg_1' },
+        },
+      ],
+      failure: serviceRestart,
+    })
+
+    expect((error as Error).message).toBe(TERMINAL_AFTER_OUTPUT_MESSAGE)
+  })
+
+  test('a finished call after empty reasoning ends the turn without retry or completion', async () => {
+    const { error, ofType } = await run({
+      frames: [
+        ...opening,
+        reasoningAdded(0),
+        reasoningDone(0),
+        callAdded(1),
+        callDone(1, '{"path":"a"}'),
+      ],
+      failure: serviceRestart,
+    })
+
+    expect(ofType('finish')).toHaveLength(0)
+    expect((error as Error).message).toBe(TERMINAL_AFTER_OUTPUT_MESSAGE)
+  })
+
+  test('a mid-stream rate limit after only empty reasoning fails retryably so the turn reroutes', async () => {
+    const { error, calls } = await run({
+      frames: [...opening, reasoningAdded(0)],
+      failure: rateLimit,
+    })
+
+    expect(error).toBeInstanceOf(ResponseStreamError)
+    expect(error).toMatchObject({ isRetryable: true })
+    expect(calls.rateLimited).toEqual(['primary'])
+  })
+
+  test('a wrapped protocol error after only empty reasoning surfaces the provider error unchanged', async () => {
+    const { error } = await run({
+      frames: [...opening, reasoningAdded(0), reasoningDone(0)],
+      failure: wrappedError(503, 'Service Unavailable'),
+    })
+
+    expect(APICallError.isInstance(error)).toBe(true)
+    expect(error).toMatchObject({ statusCode: 503 })
+  })
+})
+
 describe('mid-stream rate limit after function calls only (real AI SDK parser)', () => {
   test('with only an unfinished call it fails retryably so the turn reroutes', async () => {
     const { error, calls, ofType } = await run({

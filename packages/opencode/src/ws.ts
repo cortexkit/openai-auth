@@ -311,6 +311,11 @@ export function streamResponsesWebSocket(
   // response is ever in question.
   const openingFrameTypes: string[] = []
   const OPENING_FRAME_LIMIT = 12
+  // The item type each response.output_item.added opened, in order, logged
+  // with the frame types. The frame types alone cannot tell a reasoning item
+  // from a message or a function call, yet a message ends a cut turn for good
+  // while a reasoning item with no text lets it be retried.
+  const openingItemTypes: string[] = []
   // Enough to describe a killed response to the provider. Without the id a
   // response that never completed can only be identified as "the one after
   // <previous_response_id>", and without the frame counters the gap between the
@@ -344,6 +349,7 @@ export function streamResponsesWebSocket(
   // or runs anything twice (see outputShape).
   const emittedCalls: EmittedCallState = {
     addedItemIds: new Set(),
+    reasoningItemIds: new Set(),
     finished: false,
     other: false,
   }
@@ -371,7 +377,15 @@ export function streamResponsesWebSocket(
   function outputShape(): OutputShape {
     if (!emittedOutput) return 'none'
     if (emittedCalls.other) return 'other'
-    return emittedCalls.finished ? 'finished-calls' : 'unfinished-calls'
+    // A reasoning item alongside a finished function call has not been shown
+    // to be safe to end as completed, so that case ends the turn with an error
+    // and no retry, as any reasoning item did before.
+    if (emittedCalls.finished)
+      return emittedCalls.reasoningItemIds.size > 0 ? 'other' : 'finished-calls'
+    // Reasoning items that produced no reasoning text put nothing readable on
+    // screen, so they do not stop a retry; recordEmittedCallFrame explains why
+    // replaying them afterwards is safe.
+    return emittedCalls.addedItemIds.size > 0 ? 'unfinished-calls' : 'none'
   }
 
   // Ends a response whose only output was function calls, at least one of
@@ -422,6 +436,7 @@ export function streamResponsesWebSocket(
     const shape = {
       ...sessionKeys,
       openingFrameTypes,
+      openingItemTypes,
       responseID: createdResponseID,
       previousResponseID,
       hasContinuation: previousResponseID !== undefined,
@@ -476,18 +491,28 @@ export function streamResponsesWebSocket(
       )
       return
     }
-    // Only function calls that never finished count as no output: the host
+    // Function calls that never finished count as no output: the host
     // shows a pending tool part for them but runs nothing until a call
     // finishes, so regenerating the turn neither repeats a tool nor repeats
     // anything the reader has read.
+    //
+    // Reasoning items that produced no reasoning text count as no output too.
+    // The retry leaves each one already opened in the host's assistant message
+    // as an empty reasoning part with no text to repeat. The host replays it as
+    // a reasoning input item carrying its encrypted content, which the Codex
+    // backend accepts.
+    const emptyReasoningItems = emittedCalls.reasoningItemIds.size
     logT.warn(
-      outcome === 'none'
-        ? 'stream failed before output; retryable'
-        : 'stream failed after unfinished function calls only; retryable',
+      outcome === 'unfinished-calls'
+        ? 'stream failed after unfinished function calls only; retryable'
+        : emptyReasoningItems > 0
+          ? 'stream failed after reasoning without text only; retryable'
+          : 'stream failed before output; retryable',
       {
         reason: error.message,
-        emittedOutput: outcome !== 'none',
+        emittedOutput,
         outputShape: outcome,
+        emptyReasoningItems,
         ...shape,
       },
     )
@@ -767,6 +792,14 @@ export function streamResponsesWebSocket(
     if (createdResponseID !== undefined) framesSinceCreated++
     if (openingFrameTypes.length < OPENING_FRAME_LIMIT) {
       openingFrameTypes.push(String(event.type))
+    }
+    if (
+      event.type === 'response.output_item.added' &&
+      openingItemTypes.length < OPENING_FRAME_LIMIT
+    ) {
+      openingItemTypes.push(
+        isRecord(event.item) ? String(event.item.type) : 'unknown',
+      )
     }
     if (event.type === 'response.created') {
       createdResponseID = responseIDOf(event)
@@ -1063,18 +1096,27 @@ function responseIDOf(event: Record<string, unknown>) {
  * How a response that fails mid-stream may be ended, judged by what it had
  * already handed to the reader beyond lifecycle frames.
  *
- * - `none`: nothing; retry.
- * - `unfinished-calls`: only function calls, none finished. The host shows a
- *   pending tool part but runs nothing, so a retry repeats nothing; retry.
+ * - `none`: nothing, or only reasoning items that produced no reasoning text;
+ *   retry.
+ * - `unfinished-calls`: only function calls, none finished, possibly after
+ *   reasoning items without text. The host shows a pending tool part but runs
+ *   nothing, so a retry repeats nothing; retry.
  * - `finished-calls`: only function calls, at least one finished and so
  *   already running; end the response as completed.
- * - `other`: anything else; end the turn with an error and no retry.
+ * - `other`: anything else, including a reasoning item alongside a finished
+ *   call; end the turn with an error and no retry.
  */
 type OutputShape = 'none' | 'unfinished-calls' | 'finished-calls' | 'other'
 
 interface EmittedCallState {
   /** Item ids of function_call items opened with output_item.added. */
   addedItemIds: Set<string>
+  /**
+   * Item ids of reasoning items opened with output_item.added. Any reasoning
+   * text for them marks the response `other`, so while this is non-empty and
+   * `other` is false, none of them has produced any text.
+   */
+  reasoningItemIds: Set<string>
   /** A function call finished: the host has emitted `tool-call` and run it. */
   finished: boolean
   /** A frame outside the function-call allow-list reached the reader. */
@@ -1087,9 +1129,23 @@ interface EmittedCallState {
  * An allow-list, not a deny-list: only the frames that make up a function
  * call are recognised, and anything else, including frame types that do not
  * exist yet, marks the response as having shown something that cannot be
- * safely regenerated or completed. A message or reasoning item counts as
- * `other` from its output_item.added onwards, because the host opens a text
- * or reasoning part for it before any delta arrives.
+ * safely regenerated or completed. A message item counts as `other` from its
+ * output_item.added onwards, because the host opens a text part for it before
+ * any delta arrives.
+ *
+ * A reasoning item is allowed only while it has produced no reasoning text:
+ * its output_item.added, and its output_item.done if that carries no summary
+ * or content. Any frame carrying reasoning text (summary part, summary delta,
+ * reasoning text delta) is outside the list and marks the response `other`.
+ * An empty reasoning item has nothing to repeat. OpenCode 1.18.30 retries
+ * by running the request again and keeps the parts the failed attempt
+ * already published (session/processor.ts), so the retry leaves an empty
+ * reasoning part in the message. The TUI shows it only as a "Thinking" or
+ * "Thought" header, and the web UI shows nothing for it. @ai-sdk/openai
+ * 3.0.88 replays that part with store false as `{ type: 'reasoning', id,
+ * encrypted_content, summary: [] }`, and the Codex backend accepts that in a
+ * later request, for an item cut after its added frame and for one cut after
+ * its done frame.
  *
  * A call counts as finished only when its output_item.done is one the AI SDK
  * turns into a `tool-call` (status `completed` with string id, call_id, name
@@ -1106,6 +1162,10 @@ function recordEmittedCallFrame(
     case 'response.output_item.added':
       if (item?.type === 'function_call' && typeof item.id === 'string') {
         state.addedItemIds.add(item.id)
+        return
+      }
+      if (isEmptyReasoningItem(item) && typeof item?.id === 'string') {
+        state.reasoningItemIds.add(item.id)
         return
       }
       break
@@ -1130,9 +1190,31 @@ function recordEmittedCallFrame(
         state.finished = true
         return
       }
+      if (
+        isEmptyReasoningItem(item) &&
+        typeof item?.id === 'string' &&
+        state.reasoningItemIds.has(item.id)
+      ) {
+        return
+      }
       break
   }
   state.other = true
+}
+
+/**
+ * A reasoning item whose own summary and content lists are empty. The parser
+ * takes reasoning text only from delta frames, never from these lists, but an
+ * item that carries text in them has not been checked for safe retry, so it
+ * keeps ending the turn without one.
+ */
+function isEmptyReasoningItem(item: Record<string, unknown> | undefined) {
+  if (item?.type !== 'reasoning') return false
+  const empty = (value: unknown) =>
+    value === undefined ||
+    value === null ||
+    (Array.isArray(value) && value.length === 0)
+  return empty(item.summary) && empty(item.content)
 }
 
 /**
@@ -1186,7 +1268,8 @@ const SYNTHETIC_COMPLETED_EVENT = {
  * consumed for quota further up.
  *
  * Everything else counts, including the frame that merely opens a reasoning or
- * text part, because the host opens a durable part from it.
+ * text part, because the host opens a durable part from it. Whether what
+ * counted may still be retried is decided by recordEmittedCallFrame.
  */
 function isNonEmittingFrame(type: string): boolean {
   return (
