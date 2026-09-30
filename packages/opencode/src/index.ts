@@ -2,6 +2,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  type Stats,
   statSync,
   writeFileSync,
 } from 'node:fs'
@@ -137,22 +138,32 @@ import { resolveRpcDir } from './rpc/rpc-dir'
 import { RPC_SERVER_REGISTRY_KEY, startRpcServer } from './rpc/rpc-server'
 import {
   type AccountQuota,
+  applyStickyPinOverlay,
   clearSidebarStickyAssignment,
+  createSidebarBookkeepingQueue,
+  createSidebarStateCache,
   exhaustedQuotaResetAt,
   getSidebarState,
   getSidebarStateFile,
+  HOT_PATH_READ_BUDGET_MS,
   hashSidebarSessionId,
   isQuotaExhausted,
+  persistSidebarStickyAssignment,
+  planSidebarStickyAssignmentFromSnapshot,
   projectCustodyForSidebar,
   type QuotaWindow,
+  rememberStickyPin,
   removeSidebarActiveRouting,
   resolveSessionStickyAccount,
-  resolveSidebarStickyAssignment,
   type SidebarAccountCustody,
+  type SidebarBookkeepingQueue,
   type SidebarMachineState,
+  type SidebarSnapshot,
   type SidebarState,
+  type StickyPinOverlay,
   setSidebarLegacyRouting,
   setSidebarMachineState,
+  settleWithinBudget,
   upsertSidebarActiveRouting,
 } from './sidebar-state'
 import { stableStringify } from './util/stable-json'
@@ -1146,6 +1157,15 @@ export async function CodexAuthPlugin(
   const ownedRpcServers = new Map<string, RpcServerAdoption>()
   let activeFallbackManager: FallbackAccountManager | undefined
   let sidebarStateFileForEvents: string | undefined
+  // Sticky-balanced session-to-account pins this process placed and is using,
+  // whose writes may not have reached the sidebar file yet (see
+  // StickyPinOverlayEntry). Kept here rather than in the loader so session
+  // deletion and dispose can reach them.
+  const stickyPinOverlay: StickyPinOverlay = new Map()
+  let stickyPinOverlayFile: string | undefined
+  // Background writer for the sidebar updates requests make (routing display,
+  // pushed quota, sticky pins); the loader installs one per run.
+  let sidebarBookkeeping: SidebarBookkeepingQueue | undefined
   // Custody runtime — assigned inside the loader so dispose can close the
   // vendored client and clear the custody tick timer after the loader has
   // returned. Built unconditionally so a custody-disabled process still has
@@ -1407,6 +1427,7 @@ export async function CodexAuthPlugin(
   return {
     async dispose() {
       backgroundQuotaRefresh.stop()
+      sidebarBookkeeping?.stop()
       custodyRuntimeRef?.dispose()
       activeFallbackManager?.stopBackgroundRefresh()
       activeFallbackManager = undefined
@@ -1440,6 +1461,11 @@ export async function CodexAuthPlugin(
         cmdCtx?.cacheKeepManager?.remove(meta.threadID)
       }
       if (codexSessions.delete(info.id)) persistCodexSessions()
+      // A pin still waiting to be written would otherwise land after the
+      // removal below and resurrect the deleted session's entry.
+      const deletedSessionHash = hashSidebarSessionId(info.id)
+      stickyPinOverlay.delete(deletedSessionHash)
+      sidebarBookkeeping?.cancel(`pin:${deletedSessionHash}`)
       if (sidebarStateFileForEvents) {
         const accounts = (await loadAccounts(getAccountPaths(getConfigPath())))
           ?.accounts
@@ -1618,29 +1644,51 @@ export async function CodexAuthPlugin(
             }
           | undefined
 
+        // The newest store snapshot this loader has read. It is the answer when
+        // a request's read overruns its budget, and what background sidebar
+        // writes describe, so neither has to read the store again.
+        let lastRequestStorage = storage
+
+        // The store read on the request path. An unchanged config file costs
+        // one stat. A changed one is read without any lock (loadAccounts only
+        // reads), waiting at most HOT_PATH_READ_BUDGET_MS before going ahead
+        // with the last snapshot; the read then finishes in the background and
+        // serves the next request. A read that fails within the budget still
+        // fails the request, as an unreadable store always has.
         async function loadRequestAccounts() {
           const path = getConfigPath()
+          let stat: Stats | undefined
           try {
-            const stat = statSync(path)
-            if (
-              requestStorageCache?.path === path &&
-              requestStorageCache.mtimeMs === stat.mtimeMs &&
-              requestStorageCache.size === stat.size
-            ) {
-              return requestStorageCache.storage
-            }
-            const next = await loadAccounts(getAccountPaths(path))
-            requestStorageCache = {
-              path,
-              mtimeMs: stat.mtimeMs,
-              size: stat.size,
-              storage: next,
-            }
-            return next
+            stat = statSync(path)
           } catch {
-            requestStorageCache = undefined
-            return loadAccounts(getAccountPaths(path))
+            stat = undefined
           }
+          if (
+            stat &&
+            requestStorageCache?.path === path &&
+            requestStorageCache.mtimeMs === stat.mtimeMs &&
+            requestStorageCache.size === stat.size
+          ) {
+            return requestStorageCache.storage
+          }
+          if (!stat) requestStorageCache = undefined
+          const read = loadAccounts(getAccountPaths(path)).then((next) => {
+            if (stat) {
+              requestStorageCache = {
+                path,
+                mtimeMs: stat.mtimeMs,
+                size: stat.size,
+                storage: next,
+              }
+            }
+            lastRequestStorage = next
+            return next
+          })
+          return settleWithinBudget(
+            read,
+            HOT_PATH_READ_BUDGET_MS,
+            () => lastRequestStorage,
+          )
         }
 
         function invalidateRequestStorageCache() {
@@ -2207,7 +2255,12 @@ export async function CodexAuthPlugin(
         cacheKeepManagers.set(cacheKeepKey, cacheKeepManager)
         ownedCacheKeepManagers.set(cacheKeepKey, cacheKeepManager)
 
-        async function pushQuota(
+        // Records a quota snapshot from a response or a WebSocket frame. The
+        // in-memory quota cache, which every routing decision reads, is updated
+        // before this returns; the sidebar copy is written in the background.
+        // Never throws, so the WebSocket frame handler and the request path can
+        // call it without guarding.
+        function pushQuota(
           snapshot: Record<string, unknown>,
           accessToken: string,
           accountId?: string,
@@ -2215,7 +2268,31 @@ export async function CodexAuthPlugin(
           // policy read survives a token refresh but still drops on a switch.
           mainAccountIdentity?: string,
           completeSnapshot = false,
-        ) {
+        ): void {
+          try {
+            recordPushedQuota(
+              snapshot,
+              accessToken,
+              accountId,
+              mainAccountIdentity,
+              completeSnapshot,
+            )
+          } catch (error) {
+            logQ.warn('quota push failed', {
+              pid: process.pid,
+              accountId: accountId ?? 'main',
+              error: errorMessage(error),
+            })
+          }
+        }
+
+        function recordPushedQuota(
+          snapshot: Record<string, unknown>,
+          accessToken: string,
+          accountId: string | undefined,
+          mainAccountIdentity: string | undefined,
+          completeSnapshot: boolean,
+        ): void {
           if (Object.keys(snapshot).length === 0 && !completeSnapshot) return
           const now = Date.now()
           const quota = snapshot as OAuthQuotaSnapshot
@@ -2292,14 +2369,20 @@ export async function CodexAuthPlugin(
             accountId: accountId ?? 'main',
             snapshot: entry.quota,
           })
-          const latestStorage = await loadRequestAccounts()
-          await writeMachineSidebarState(
-            quotaManager,
-            latestStorage,
-            accountId && accountId !== 'main'
-              ? latestStorage?.mainAccountId
-              : resolvedMainIdentity,
-          )
+          const fallbackPush = Boolean(accountId && accountId !== 'main')
+          sidebarBookkeepingQueue.enqueue('machine-state', 'quota', () => {
+            // The sidebar state is built when this queued write starts (and
+            // again on a retry), from the in-memory quota cache and the
+            // newest account-store snapshot at that moment.
+            const latestStorage = lastRequestStorage
+            return writeMachineSidebarState(
+              quotaManager,
+              latestStorage,
+              fallbackPush
+                ? latestStorage?.mainAccountId
+                : resolvedMainIdentity,
+            )
+          })
         }
 
         // The pure resolver prefers an admission error's explicit reset and
@@ -2331,7 +2414,7 @@ export async function CodexAuthPlugin(
               // connection's own account, not the shared mutable globals.
               onQuota: (s, accessToken, accountId, servedChatgptAccountId) => {
                 const isMainBucket = !accountId || accountId === 'main'
-                void pushQuota(
+                pushQuota(
                   s,
                   accessToken,
                   accountId,
@@ -2414,35 +2497,79 @@ export async function CodexAuthPlugin(
           return custodyRuntimeForDeps.getCustodyProjection(account, currentNow)
         }
 
-        async function writeRequestSidebarRouting(
+        // -------------------------------------------------------------------
+        // Request-path sidebar access. The sidebar file is bookkeeping, so the
+        // request path never waits on its lock: reads come from a cache (one
+        // stat when unchanged, see createSidebarStateCache) and every write is
+        // handed to a background queue that logs a failure once and retries it
+        // until it lands. After a write lands the cache is refreshed so the
+        // next request starts warm.
+        // -------------------------------------------------------------------
+        const sidebarCache = createSidebarStateCache(boundSidebarFile)
+        // Warm the cache so the first request normally finds it filled. A
+        // request that still finds it empty does one bounded lock-free read.
+        void sidebarCache.read()
+        sidebarBookkeeping?.stop()
+        const sidebarBookkeepingQueue = createSidebarBookkeepingQueue({
+          logger: logT,
+          onWritten: () => sidebarCache.refreshInBackground(),
+        })
+        sidebarBookkeeping = sidebarBookkeepingQueue
+        if (stickyPinOverlayFile !== boundSidebarFile) {
+          // Session-to-account pins belong to one sidebar file; clear them when
+          // this loader is bound to a different file.
+          stickyPinOverlay.clear()
+          stickyPinOverlayFile = boundSidebarFile
+        }
+
+        // Records which account served a request, for the sidebar display.
+        // Returns at once; the writes run in the background. `stickyState` is
+        // the request's sidebar snapshot with this process's session-to-account
+        // pins applied, so sticky mode can show a parent session's own pin.
+        function queueRequestSidebarRouting(
           sessionId: string | undefined,
           parentSessionId: string | undefined,
           activeId: string,
           route: RoutingMode,
           accounts: readonly { id: string; enabled?: boolean }[] | undefined,
-        ) {
+          stickyState: SidebarState,
+        ): void {
           const input = { activeId, route, updatedAt: Date.now() }
-          if (sessionId) {
-            await upsertSidebarActiveRouting(
-              { sessionId, ...input },
-              accounts,
-              boundSidebarFile,
+          if (!sessionId) {
+            sidebarBookkeepingQueue.enqueue('routing:legacy', 'routing', () =>
+              setSidebarLegacyRouting(input, boundSidebarFile),
             )
-            if (parentSessionId && parentSessionId !== sessionId) {
-              if (route === 'sticky-balanced') {
-                const parentPinnedId = (await getSidebarState(boundSidebarFile))
-                  .stickyAssignments?.[hashSidebarSessionId(parentSessionId)]
-                  ?.accountId
-                const parentPinIsUsable =
-                  accounts === undefined ||
-                  parentPinnedId === 'main' ||
-                  accounts.some(
-                    (account) =>
-                      account.enabled !== false &&
-                      account.id === parentPinnedId,
-                  )
-                if (!parentPinnedId || !parentPinIsUsable) return
-                await upsertSidebarActiveRouting(
+            return
+          }
+          sidebarBookkeepingQueue.enqueue(
+            `routing:${sessionId}`,
+            'routing',
+            () =>
+              upsertSidebarActiveRouting(
+                { sessionId, ...input },
+                accounts,
+                boundSidebarFile,
+              ),
+          )
+          if (!parentSessionId || parentSessionId === sessionId) return
+          if (route === 'sticky-balanced') {
+            const parentPinnedId =
+              stickyState.stickyAssignments?.[
+                hashSidebarSessionId(parentSessionId)
+              ]?.accountId
+            const parentPinIsUsable =
+              accounts === undefined ||
+              parentPinnedId === 'main' ||
+              accounts.some(
+                (account) =>
+                  account.enabled !== false && account.id === parentPinnedId,
+              )
+            if (!parentPinnedId || !parentPinIsUsable) return
+            sidebarBookkeepingQueue.enqueue(
+              `routing:${parentSessionId}`,
+              'routing',
+              () =>
+                upsertSidebarActiveRouting(
                   {
                     sessionId: parentSessionId,
                     activeId: parentPinnedId,
@@ -2451,18 +2578,20 @@ export async function CodexAuthPlugin(
                   },
                   accounts,
                   boundSidebarFile,
-                )
-                return
-              }
-              await upsertSidebarActiveRouting(
+                ),
+            )
+            return
+          }
+          sidebarBookkeepingQueue.enqueue(
+            `routing:${parentSessionId}`,
+            'routing',
+            () =>
+              upsertSidebarActiveRouting(
                 { sessionId: parentSessionId, ...input },
                 accounts,
                 boundSidebarFile,
-              )
-            }
-            return
-          }
-          await setSidebarLegacyRouting(input, boundSidebarFile)
+              ),
+          )
         }
 
         // -------------------------------------------------------------------
@@ -2697,11 +2826,24 @@ export async function CodexAuthPlugin(
           setCacheKeepWindow: (window) => {
             cacheKeepWindow = window
           },
-          clearStickyRouting: (sessionId) =>
-            clearSidebarStickyAssignment(sessionId, boundSidebarFile),
+          clearStickyRouting: async (sessionId) => {
+            // Drop this process's copy first so neither the next request nor a
+            // pending retry can put the pin back after the file is cleared.
+            const sessionHash = hashSidebarSessionId(sessionId)
+            const hadLocalPin = stickyPinOverlay.delete(sessionHash)
+            sidebarBookkeepingQueue.cancel(`pin:${sessionHash}`)
+            const removedFromFile = await clearSidebarStickyAssignment(
+              sessionId,
+              boundSidebarFile,
+            )
+            return removedFromFile || hadLocalPin
+          },
           getStickyRouting: async (sessionId) =>
             resolveSessionStickyAccount(
-              await getSidebarState(boundSidebarFile),
+              applyStickyPinOverlay(
+                await sidebarCache.read(),
+                stickyPinOverlay,
+              ),
               sessionId,
             ),
           refreshSidebar: async () => {
@@ -3435,13 +3577,27 @@ export async function CodexAuthPlugin(
           return quotaManager.isRateLimited(stickyRateLimitKey(candidate))
         }
 
-        async function resolveStickyRouteCandidate(input: {
+        // Places or keeps the session's pin and returns the candidate to send
+        // with. The decision is made in memory from the request's sidebar
+        // snapshot plus this process's own recent pins, exactly as the locked
+        // file merge would make it; the pin and its pending-bytes entry are
+        // then written in the background.
+        //
+        // Accepted trade-off: another process's placements reach this one
+        // only through the snapshot, so a session placed elsewhere in the last
+        // moment may not yet count toward pending bytes here, and a pin
+        // another process wrote that the snapshot has not seen is picked up
+        // on the next refresh. Placement is load balancing, not a correctness
+        // boundary, so slightly stale weights are preferable to a turn that
+        // waits on (or fails with) the sidebar lock.
+        function resolveStickyRouteCandidate(input: {
           sessionId: string
           requestBytes: number
           candidates: readonly StickyRouteCandidate[]
+          sidebarSnapshot: SidebarSnapshot
           excludeAccountIds?: readonly string[]
           now: number
-        }): Promise<StickyRouteCandidate | undefined> {
+        }): StickyRouteCandidate | undefined {
           const eligibleCandidates = input.candidates.filter(
             (candidate) => !isStickyRouteCandidateRateLimited(candidate),
           )
@@ -3464,19 +3620,23 @@ export async function CodexAuthPlugin(
             ]),
           )
           const excluded = new Set(input.excludeAccountIds)
-          let placement:
+          // Assigned inside `choose`; the assertion keeps TypeScript from
+          // narrowing it to `undefined` across that synchronous callback.
+          let placement = undefined as
             | {
                 accountId: string
                 source: 'weighted' | 'mode-fallback'
                 pendingBytes: number
               }
             | undefined
-          const assignment = await resolveSidebarStickyAssignment(
+          const validPinnedAccountIds = [...candidatesById.keys()]
+          const plan = planSidebarStickyAssignmentFromSnapshot(
+            applyStickyPinOverlay(input.sidebarSnapshot, stickyPinOverlay),
             {
               sessionId: input.sessionId,
               requestBytes: input.requestBytes,
               now: input.now,
-              validPinnedAccountIds: [...candidatesById.keys()],
+              validPinnedAccountIds,
               excludeAccountIds: input.excludeAccountIds,
               quotaCheckedAtByAccount,
               wireAccountIdByAccount,
@@ -3509,8 +3669,8 @@ export async function CodexAuthPlugin(
                 return selected
               },
             },
-            boundSidebarFile,
           )
+          const assignment = plan.assignment
           if (placement && assignment?.accountId === placement.accountId) {
             logA.debug('sticky routing: placed session pin', {
               pid: process.pid,
@@ -3520,6 +3680,29 @@ export async function CodexAuthPlugin(
               requestBytes: input.requestBytes,
               pendingBytes: placement.pendingBytes,
             })
+          }
+          if (assignment && plan.next !== undefined) {
+            const sessionHash = hashSidebarSessionId(input.sessionId)
+            const entry = rememberStickyPin(
+              stickyPinOverlay,
+              sessionHash,
+              assignment,
+            )
+            sidebarBookkeepingQueue.enqueue(
+              `pin:${sessionHash}`,
+              'sticky-pin',
+              async () => {
+                await persistSidebarStickyAssignment(
+                  {
+                    sessionId: input.sessionId,
+                    assignment,
+                    validPinnedAccountIds,
+                  },
+                  boundSidebarFile,
+                )
+                entry.persistedAt = Date.now()
+              },
+            )
           }
           return assignment
             ? candidatesById.get(assignment.accountId)
@@ -3624,13 +3807,13 @@ export async function CodexAuthPlugin(
           return selection.retained
         }
 
-        async function pushFailedFallbackQuota(
+        function pushFailedFallbackQuota(
           response: Response,
           candidate: FallbackCandidate,
         ) {
           try {
             const snapshot = normalizeQuotaHeaders(response.headers)
-            await pushQuota(
+            pushQuota(
               snapshot as Record<string, unknown>,
               candidate.access,
               candidate.quotaAccountId,
@@ -3709,7 +3892,7 @@ export async function CodexAuthPlugin(
                 activeId: candidate.keepwarmAccountKey,
               }
             }
-            await pushFailedFallbackQuota(response, candidate)
+            pushFailedFallbackQuota(response, candidate)
             // This fallback failed — discard its body and try the next.
             response.body?.cancel().catch(() => {})
           }
@@ -3783,7 +3966,7 @@ export async function CodexAuthPlugin(
               void fallbackManager.markUsed(candidate.fallback)
               return { response, ...lastQuotaTarget }
             }
-            await pushFailedFallbackQuota(response, candidate)
+            pushFailedFallbackQuota(response, candidate)
           }
 
           // All fallbacks exhausted. Return the last response — its body is
@@ -3827,7 +4010,9 @@ export async function CodexAuthPlugin(
           async () => {
             const results = await refreshQuotaInBackground(
               buildRefreshAllQuotaDeps({
-                readSidebarState: () => getSidebarState(boundSidebarFile),
+                // Reading through the request cache keeps it fresh on every
+                // background tick as well.
+                readSidebarState: async () => (await sidebarCache.read()).state,
               }),
             )
             const failures = results.filter((result) => !result.ok)
@@ -3932,14 +4117,11 @@ export async function CodexAuthPlugin(
               currentMainIdentity = mainAccountIdentity
             }
             const mode: RoutingMode = reqStorage?.routing?.mode ?? 'main-first'
-            // One shared sidebar read per request: admission decisions for main
-            // and the fallbacks must all judge the same snapshot.
-            let requestSidebarStatePromise: Promise<SidebarState> | undefined
-            const requestSidebarState = () => {
-              requestSidebarStatePromise ??= getSidebarState(boundSidebarFile)
-              return requestSidebarStatePromise
-            }
-            const sidebarState = await requestSidebarState()
+            // One shared sidebar snapshot per request: admission decisions for
+            // main and the fallbacks must all judge the same snapshot. It comes
+            // from the cache and never waits on the sidebar lock.
+            const sidebarSnapshot = await sidebarCache.get()
+            const sidebarState = sidebarSnapshot.state
 
             if (
               mode === 'sticky-balanced' &&
@@ -3956,10 +4138,11 @@ export async function CodexAuthPlugin(
                 mainCustodyRefused,
                 primaryProvenance,
               })
-              let stickyCandidate = await resolveStickyRouteCandidate({
+              let stickyCandidate = resolveStickyRouteCandidate({
                 sessionId: sidebarSessionId,
                 requestBytes,
                 candidates: stickyRoster,
+                sidebarSnapshot,
                 now: Date.now(),
               })
 
@@ -3976,10 +4159,11 @@ export async function CodexAuthPlugin(
                       reqStorage,
                     )
                 if (preSendBreak.action === 'migrate') {
-                  const replacement = await resolveStickyRouteCandidate({
+                  const replacement = resolveStickyRouteCandidate({
                     sessionId: sidebarSessionId,
                     requestBytes,
                     candidates: stickyRoster,
+                    sidebarSnapshot,
                     excludeAccountIds: [stickyCandidate.accountId],
                     now: Date.now(),
                   })
@@ -4004,13 +4188,13 @@ export async function CodexAuthPlugin(
                   stickyCandidate.provenance,
                 )
 
-                const pushStickyQuota = async (
+                const pushStickyQuota = (
                   response: Response,
                   candidate: StickyRouteCandidate,
                 ) => {
                   try {
                     const snapshot = normalizeQuotaHeaders(response.headers)
-                    await pushQuota(
+                    pushQuota(
                       snapshot as Record<string, unknown>,
                       candidate.access,
                       candidate.accountId === 'main'
@@ -4026,7 +4210,7 @@ export async function CodexAuthPlugin(
                   }
                 }
 
-                await pushStickyQuota(stickyResponse, stickyCandidate)
+                pushStickyQuota(stickyResponse, stickyCandidate)
                 const responseBreak = stickyBreakDecision(
                   stickyCandidate,
                   sidebarState,
@@ -4042,10 +4226,11 @@ export async function CodexAuthPlugin(
                   retryableStickyFailure &&
                   responseBreak.action === 'migrate'
                 ) {
-                  const replacement = await resolveStickyRouteCandidate({
+                  const replacement = resolveStickyRouteCandidate({
                     sessionId: sidebarSessionId,
                     requestBytes,
                     candidates: stickyRoster,
+                    sidebarSnapshot,
                     excludeAccountIds: [stickyCandidate.accountId],
                     now: Date.now(),
                   })
@@ -4068,7 +4253,7 @@ export async function CodexAuthPlugin(
                     )
                     previousResponse.body?.cancel().catch(() => {})
                     stickyCandidate = replacement
-                    await pushStickyQuota(stickyResponse, stickyCandidate)
+                    pushStickyQuota(stickyResponse, stickyCandidate)
                   }
                 }
 
@@ -4080,13 +4265,14 @@ export async function CodexAuthPlugin(
                   // awaited on the request path.
                   void fallbackManager.markUsed(stickyCandidate.fallback)
                 }
-                await writeRequestSidebarRouting(
+                queueRequestSidebarRouting(
                   sidebarSessionId,
                   sidebarParentSessionId,
                   stickyCandidate.accountId,
                   mode,
                   reqStorage?.accounts,
-                ).catch(() => {})
+                  applyStickyPinOverlay(sidebarSnapshot, stickyPinOverlay),
+                )
                 return stickyResponse
               }
             }
@@ -4276,7 +4462,7 @@ export async function CodexAuthPlugin(
             try {
               const snapshot = normalizeQuotaHeaders(finalResponse.headers)
               if (fallbackServed) {
-                await pushQuota(
+                pushQuota(
                   snapshot as Record<string, unknown>,
                   fallbackQuotaAccess,
                   fallbackQuotaAccountId,
@@ -4284,7 +4470,7 @@ export async function CodexAuthPlugin(
                   isCompleteQuotaHeaderFrame(finalResponse.headers),
                 )
               } else {
-                await pushQuota(
+                pushQuota(
                   snapshot as Record<string, unknown>,
                   primaryAccess,
                   undefined,
@@ -4296,13 +4482,14 @@ export async function CodexAuthPlugin(
               // Quota push is best-effort — never break the response
             }
 
-            await writeRequestSidebarRouting(
+            queueRequestSidebarRouting(
               sidebarSessionId,
               sidebarParentSessionId,
               servedActiveId,
               mode,
               reqStorage?.accounts,
-            ).catch(() => {})
+              applyStickyPinOverlay(sidebarSnapshot, stickyPinOverlay),
+            )
             return finalResponse
           },
         }
