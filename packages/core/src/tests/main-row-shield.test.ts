@@ -89,7 +89,13 @@ function managerRecording(refreshed: string[], polled: string[]) {
     },
     fetchQuotaFn: async ({ accessToken }) => {
       polled.push(accessToken)
-      return { primary: { usedPercent: 10, remainingPercent: 90 } }
+      return {
+        primary: {
+          usedPercent: 10,
+          remainingPercent: 90,
+          checkedAt: Date.now(),
+        },
+      }
     },
   })
 }
