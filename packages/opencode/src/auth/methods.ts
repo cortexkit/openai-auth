@@ -10,6 +10,7 @@ import {
   flowCleanup,
   generatePKCE,
   isOAuthAccount,
+  isPoolMainPlaceholder,
   loadAccounts,
   mutateAccounts,
   type OAuthAccount,
@@ -388,6 +389,10 @@ export function createAuthMethods({
     const paths = getPaths()
     for (const repair of report.repairs) {
       if (repair.type === 'restore-main-credential') {
+        // Never copy a credential over the account-pool placeholder: main
+        // then lives in the pool row, and a second copy in the slot would be
+        // refreshed independently of it.
+        if (isPoolMainPlaceholder(await readAuth())) continue
         const storage = await deps.loadAccounts(paths)
         const account = findStoredMainCredential(storage)
         if (!account) continue

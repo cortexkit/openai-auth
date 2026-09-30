@@ -56,6 +56,7 @@ import type {
   QuotaEntry,
   QuotaManagerOptions,
   QuotaWindowName,
+  RefreshAccountOptions,
   RefreshAllQuotaDeps,
   RefreshAllQuotaOptions,
   RefreshAllQuotaResult,
@@ -134,6 +135,7 @@ type InternalSurface = {
   quotaEntry: QuotaEntry
   quotaManagerOptions: QuotaManagerOptions
   quotaWindowName: QuotaWindowName
+  refreshAccountOptions: RefreshAccountOptions
   refreshAllQuotaDeps: RefreshAllQuotaDeps
   refreshAllQuotaOptions: RefreshAllQuotaOptions
   refreshAllQuotaResult: RefreshAllQuotaResult

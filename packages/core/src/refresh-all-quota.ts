@@ -1,10 +1,13 @@
-import type {
-  AccountPaths,
-  AccountStorage,
-  FallbackAccountManager,
-  isOAuthAccount,
-  loadAccounts,
-  OAuthAccount,
+import {
+  type AccountPaths,
+  type AccountStorage,
+  type FallbackAccountManager,
+  findPoolMainRow,
+  type isOAuthAccount,
+  isPoolMainPlaceholder,
+  isShieldedMainRow,
+  type loadAccounts,
+  type OAuthAccount,
 } from './accounts'
 import { formatRefreshBackoffMessage, refreshBackoffActive } from './backoff.ts'
 import {
@@ -214,11 +217,24 @@ export async function refreshAllQuota(
   // open to the captured id so the main refresh still runs.
   const storage = await deps.loadAccounts(deps.paths).catch(() => undefined)
   const liveMainAccountId = storage?.mainAccountId ?? deps.storageMainAccountId
+  // Set when the main slot holds the account-pool placeholder: the main account
+  // is then the roster row `main`, polled as main by the roster loop below.
+  let poolMainRow: OAuthAccount | undefined
   if (!options.accountKey || options.accountKey === 'main') {
     // --- MAIN ---
     try {
       let auth = await deps.getAuth()
-      if (auth.type === 'oauth') {
+      if (isPoolMainPlaceholder(auth)) {
+        // The placeholder is not a credential: it is never refreshed or sent.
+        poolMainRow = findPoolMainRow(storage)
+        if (!poolMainRow) {
+          recordOutcome({
+            account: 'main',
+            ok: false,
+            error: 'main account row is missing from the account pool',
+          })
+        }
+      } else if (auth.type === 'oauth') {
         const sharedMainQuota =
           sharedSidebarState &&
           liveMainAccountId !== undefined &&
@@ -306,11 +322,49 @@ export async function refreshAllQuota(
   // --- FALLBACKS ---
   if (storage) {
     for (const acct of storage.accounts) {
+      // The pool's main row is polled and recorded as the main account.
+      const asMain = poolMainRow !== undefined && acct === poolMainRow
       if (
+        !asMain &&
         options.accountKey &&
         (options.accountKey === 'main' || acct.id !== options.accountKey)
       ) {
         continue
+      }
+      if (
+        !asMain &&
+        deps.isOAuthAccountFn(acct) &&
+        isShieldedMainRow(storage, acct)
+      ) {
+        // A second copy of the live main credential: refreshing it here would
+        // spend the refresh token the main slot still uses.
+        if (options.accountKey) {
+          recordOutcome({
+            account: acct.id,
+            ok: false,
+            error:
+              'account holds the main credential while the main slot is live',
+          })
+        }
+        continue
+      }
+      const mainIdentity = asMain
+        ? ((acct as OAuthAccount).accountId ?? liveMainAccountId)
+        : undefined
+      const storeReading = (
+        entry: {
+          quota: Awaited<ReturnType<typeof whamFn>>
+          refreshAfter: number
+          checkedAt: number
+        },
+        token: string,
+        accountId: string | undefined,
+      ) => {
+        if (asMain) {
+          deps.quotaManager.setMain(token, entry, mainIdentity, true)
+        } else {
+          deps.quotaManager.setFallback(acct.id, entry, token, true, accountId)
+        }
       }
       if (acct.enabled === false || !deps.isOAuthAccountFn(acct)) {
         if (options.accountKey) {
@@ -326,16 +380,25 @@ export async function refreshAllQuota(
       try {
         const sharedFb = sharedFallbacks.get(acct.id)
         const currentAccountId = (acct as OAuthAccount).accountId
-        const sharedFbQuota =
-          sharedFb &&
-          currentAccountId !== undefined &&
-          sharedFb.accountId === currentAccountId
+        const sharedFbQuota = asMain
+          ? sharedSidebarState &&
+            mainIdentity !== undefined &&
+            sharedSidebarState.main.mainAccountId === mainIdentity
+            ? sharedSidebarState.main.quota
+            : undefined
+          : sharedFb &&
+              currentAccountId !== undefined &&
+              sharedFb.accountId === currentAccountId
             ? sharedFb.quota
             : undefined
         if (
           isFresh(
-            deps.quotaManager.peekFallbackForPolicy(acct.id, currentAccountId)
-              ?.checkedAt,
+            asMain
+              ? deps.quotaManager.peekMainForPolicy(mainIdentity)?.checkedAt
+              : deps.quotaManager.peekFallbackForPolicy(
+                  acct.id,
+                  currentAccountId,
+                )?.checkedAt,
             sharedFbQuota?.primary?.checkedAt,
             sharedFbQuota?.secondary?.checkedAt,
             sharedFbQuota?.checkedAt,
@@ -347,10 +410,12 @@ export async function refreshAllQuota(
 
         if (
           deps.respectBackoff &&
-          deps.quotaManager.isFallbackBackedOff(
-            acct.id,
-            (acct as OAuthAccount).access,
-          )
+          (asMain
+            ? deps.quotaManager.isBackedOff()
+            : deps.quotaManager.isFallbackBackedOff(
+                acct.id,
+                (acct as OAuthAccount).access,
+              ))
         ) {
           recordOutcome({ account: acct.id, ok: true })
           continue
@@ -466,15 +531,13 @@ export async function refreshAllQuota(
               accountId: (acct as OAuthAccount).accountId,
               accountKey: acct.id,
             })
-            deps.quotaManager.setFallback(
-              acct.id,
+            storeReading(
               {
                 quota: snap,
                 refreshAfter: deps.now() + 5 * 60_000,
                 checkedAt: deps.now(),
               },
               access.token,
-              true,
               (acct as OAuthAccount).accountId,
             )
             quotaUpdated = true
@@ -515,7 +578,11 @@ export async function refreshAllQuota(
 
         let refreshed: OAuthAccount
         try {
-          refreshed = await deps.fallbackManager.refreshAccount(acct, storage)
+          refreshed = asMain
+            ? await deps.fallbackManager.refreshAccount(acct, storage, {
+                asPoolMain: true,
+              })
+            : await deps.fallbackManager.refreshAccount(acct, storage)
         } catch (refreshError) {
           // Continue with the existing token — a transient refresh blip should
           // not stop a quota poll that the current token may still satisfy —
@@ -564,9 +631,11 @@ export async function refreshAllQuota(
             pid: process.pid,
             accountId: acct.id,
           })
-          refreshed = await deps.fallbackManager.refreshAccount(acct, storage, {
-            force: true,
-          })
+          refreshed = await deps.fallbackManager.refreshAccount(
+            acct,
+            storage,
+            asMain ? { force: true, asPoolMain: true } : { force: true },
+          )
           if (!refreshed.access) {
             recordOutcome({
               account: acct.id,
@@ -583,15 +652,13 @@ export async function refreshAllQuota(
             accountKey: acct.id,
           })
         }
-        deps.quotaManager.setFallback(
-          acct.id,
+        storeReading(
           {
             quota: snap,
             refreshAfter: deps.now() + 5 * 60 * 1000,
             checkedAt: deps.now(),
           },
           refreshed.access,
-          true,
           refreshed.accountId,
         )
         quotaUpdated = true
