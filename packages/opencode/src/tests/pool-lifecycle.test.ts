@@ -300,6 +300,24 @@ describe('adopting later logins', () => {
     expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
   })
 
+  it('an older version started after the migration holds adoption back until it exits', async () => {
+    const { lifecycle, timers } = await migratedLifecycle()
+    writeOlderHeartbeat()
+    await h.setSlot(login('acct-new', 'r-new'))
+    await lifecycle.requestAdoption()
+    expect(await h.row('acct-new')).toBeUndefined()
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(false)
+    expect(timers.delays().length).toBeGreaterThan(0)
+
+    alive.delete(OLDER_PID)
+    timers.fire()
+    await lifecycle.idle()
+    expect((await h.row('acct-new'))?.credential).toMatchObject({
+      refresh: 'r-new',
+    })
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+  })
+
   it('two triggers at once run one adoption', async () => {
     let adoptions = 0
     const { lifecycle } = await migratedLifecycle({

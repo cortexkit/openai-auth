@@ -59,9 +59,10 @@
 // finds one (`poolTransferPendingFor`). Either its lease was set first (the
 // re-read sees the lease, or the rotated slot once the lease is gone) or the
 // record was (and it never refreshes). An older build does not look for the
-// record; the fence keeps older builds away from the migration, and the
-// placeholder fence below restarts a transfer whose slot moved on to a new
-// token of the same account.
+// record; the version fence keeps older builds away from the migration, the
+// background runner (`pool-lifecycle.ts`) applies the same fence before each
+// adoption, and the placeholder fence below restarts a transfer whose slot
+// moved on to a new token of the same account.
 
 import { readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'

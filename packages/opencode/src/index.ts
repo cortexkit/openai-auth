@@ -116,6 +116,11 @@ import {
   releaseCustodyLoginLeaseAfterHostWrite,
 } from './core/custody-transition.ts'
 import {
+  createPoolLifecycle,
+  type PoolLifecycle,
+  type PoolLifecycleDeps,
+} from './core/pool-lifecycle'
+import {
   findPoolMainRow,
   isPoolMainPlaceholder,
   MainAccountInPoolError,
@@ -123,11 +128,6 @@ import {
   resolvePoolMainAccess,
   withoutPoolMainRow,
 } from './core/pool-main'
-import {
-  createPoolLifecycle,
-  type PoolLifecycle,
-  type PoolLifecycleDeps,
-} from './core/pool-lifecycle'
 import {
   PoolTransferPendingError,
   poolTransferPendingInConfigFile,

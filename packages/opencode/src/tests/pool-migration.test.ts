@@ -906,7 +906,7 @@ describe('the version fence', () => {
     })
   })
 
-  it('adoption after the migration is not fenced', async () => {
+  it('adoptHostSlotLogin itself ignores the fence; the background runner applies it', async () => {
     await migrated()
     await h.setSlot(login('acct-new', 'r-new'))
     expect(await adoptHostSlotLogin(h.deps({ fence: shut }))).toMatchObject({

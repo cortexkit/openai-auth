@@ -16,7 +16,7 @@ import {
 import { __resetProcessHeartbeatForTest } from '../core/process-heartbeat.ts'
 import { CodexAuthPlugin } from '../index.ts'
 import { drainSidebarWrites } from '../sidebar-state.ts'
-import { fileSlot, FAR, jwt, login } from './fixtures/pool-migration-harness.ts'
+import { FAR, fileSlot, jwt, login } from './fixtures/pool-migration-harness.ts'
 import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,

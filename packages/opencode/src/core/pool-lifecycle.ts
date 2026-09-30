@@ -132,6 +132,8 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
   let queue: Promise<void> = Promise.resolve()
   let pendingAdoption: Promise<void> | undefined
   let lastNoticedRefresh: string | undefined
+  // Logged once per set of blocking processes, not on every retry.
+  let lastAdoptionBlockers: string | undefined
 
   const runDeps = (): PoolMigrationDeps => ({
     paths: deps.paths(),
@@ -207,6 +209,23 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
   async function runAdoption(): Promise<void> {
     let outcome: PoolTransferOutcome
     try {
+      // Adoption copies a slot token into the pool the same way migration
+      // does, so it waits behind the same fence: an older process that does
+      // not know the pending-transfer record could refresh the slot token
+      // between the copy and the placeholder. Until it exits, the login is
+      // served from the slot as before.
+      const gate = await fence()
+      if (!gate.open) {
+        const key = JSON.stringify(gate.blockers)
+        if (key !== lastAdoptionBlockers) {
+          lastAdoptionBlockers = key
+          log.info('host login adoption waits for older plugin versions', {
+            blockers: gate.blockers,
+          })
+        }
+        schedule(retryDelay())
+        return
+      }
       outcome = await adopt(runDeps())
     } catch (error) {
       log.warn('adopting the host login into the account pool failed', {
