@@ -4,6 +4,9 @@ import { dirname, join, resolve } from 'node:path'
 
 const RPC_DIR_ENV = 'OPENCODE_OPENAI_AUTH_RPC_DIR'
 
+/** Name prefix of this plugin's per-project RPC state directories. */
+export const RPC_DIRECTORY_PREFIX = 'openai-auth-'
+
 export interface RpcDirResolution {
   dir: string
   secureDir: boolean
@@ -29,7 +32,10 @@ export function getRpcDir(projectDirectory: string): string {
   // so server and TUI halves always resolve the same dir. An absolute override is
   // used as-is (resolve(base, absolute) returns the absolute path unchanged).
   if (override) return resolve(projectDirectory, override)
-  return join(defaultRpcRoot(), `openai-auth-${rpcHash(projectDirectory)}`)
+  return join(
+    defaultRpcRoot(),
+    `${RPC_DIRECTORY_PREFIX}${rpcHash(projectDirectory)}`,
+  )
 }
 
 export async function resolveRpcDir(

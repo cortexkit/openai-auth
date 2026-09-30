@@ -10,7 +10,7 @@
  */
 
 import { createHash } from 'node:crypto'
-
+import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import type {
   AccountOperationError,
   AccountQuotaWindow,
@@ -21,7 +21,6 @@ import type {
 import { buildQuotaOperationError, quotaBackoffActive } from './backoff.ts'
 import { assertNotCustodyTombstone } from './custody.ts'
 import { PRIMARY, type ProviderQuotaFn, SECONDARY } from './provider.ts'
-import { acquireRefreshFileLock } from './refresh-file-lock'
 
 export type { ProviderQuotaFn }
 

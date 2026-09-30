@@ -8,6 +8,10 @@ import {
 import os from 'node:os'
 import { join } from 'node:path'
 import {
+  adoptRpcServer,
+  type RpcServerAdoption,
+} from '@cortexkit/common-auth/rpc'
+import {
   type AccountStorage,
   acquireRefreshFileLock,
   beginAccountLogin,
@@ -130,7 +134,7 @@ import type {
   CommandModalName,
 } from './rpc/protocol'
 import { resolveRpcDir } from './rpc/rpc-dir'
-import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server'
+import { RPC_SERVER_REGISTRY_KEY, startRpcServer } from './rpc/rpc-server'
 import {
   type AccountQuota,
   clearSidebarStickyAssignment,
@@ -1139,7 +1143,7 @@ export async function CodexAuthPlugin(
     }): Promise<unknown>
   }
   const ownedCacheKeepManagers = new Map<string, CacheKeepManager>()
-  const ownedRpcServers = new Map<string, RpcServerHandle>()
+  const ownedRpcServers = new Map<string, RpcServerAdoption>()
   let activeFallbackManager: FallbackAccountManager | undefined
   let sidebarStateFileForEvents: string | undefined
   // Custody runtime — assigned inside the loader so dispose can close the
@@ -1421,14 +1425,10 @@ export async function CodexAuthPlugin(
       }
       ownedCacheKeepManagers.clear()
 
-      const rpcGlobal = globalThis as {
-        __openaiAuthRpcServers?: Map<string, RpcServerHandle>
-      }
-      for (const [key, rpcServer] of ownedRpcServers) {
-        if (rpcGlobal.__openaiAuthRpcServers?.get(key) === rpcServer) {
-          await rpcServer.stop().catch(() => {})
-          rpcGlobal.__openaiAuthRpcServers.delete(key)
-        }
+      // Release stops a server only while it is still the registered one, so
+      // a replaced instance cannot stop its successor's server.
+      for (const adoption of ownedRpcServers.values()) {
+        await adoption.release().catch(() => {})
       }
       ownedRpcServers.clear()
     },
@@ -2725,40 +2725,38 @@ export async function CodexAuthPlugin(
           },
         }
 
-        let rpcServer: RpcServerHandle | null = null
         if (rpcDir) {
-          const rpcGlobal = globalThis as {
-            __openaiAuthRpcServers?: Map<string, RpcServerHandle>
-          }
-          const rpcServers = rpcGlobal.__openaiAuthRpcServers ?? new Map()
-          rpcGlobal.__openaiAuthRpcServers = rpcServers
-          const existingRpcServer = rpcServers.get(rpcDir.dir)
-          if (existingRpcServer) {
-            await existingRpcServer.stop().catch(() => {})
-            rpcServers.delete(rpcDir.dir)
-          }
+          const activeRpcDir = rpcDir
           try {
-            rpcServer = await startRpcServer({
-              dir: rpcDir.dir,
-              secureDir: rpcDir.secureDir,
-              sweepRoot: rpcDir.sweepRoot,
-              drain: drainNotifications,
-              apply: async (request: ApplyRequest): Promise<ApplyResult> => {
-                const callCtx: CommandContext = {
-                  // biome-ignore lint/style/noNonNullAssertion: cmdCtx is set in the loader before RPC server starts, and command.execute.before has a null guard
-                  ...cmdCtx!,
-                  sessionId: request.sessionId,
-                }
-                const payload = await buildDialogPayload(
-                  request.command,
-                  request.arguments,
-                  callCtx,
-                )
-                return { text: payload.text, knobs: payload.knobs }
-              },
-            })
-            rpcServers.set(rpcDir.dir, rpcServer)
-            ownedRpcServers.set(rpcDir.dir, rpcServer)
+            // One server per project directory per process: adopting stops a
+            // server an earlier loader run left for the same directory.
+            const adoption = await adoptRpcServer(
+              RPC_SERVER_REGISTRY_KEY,
+              activeRpcDir.dir,
+              () =>
+                startRpcServer({
+                  dir: activeRpcDir.dir,
+                  secureDir: activeRpcDir.secureDir,
+                  sweepRoot: activeRpcDir.sweepRoot,
+                  drain: drainNotifications,
+                  apply: async (
+                    request: ApplyRequest,
+                  ): Promise<ApplyResult> => {
+                    const callCtx: CommandContext = {
+                      // biome-ignore lint/style/noNonNullAssertion: cmdCtx is set in the loader before RPC server starts, and command.execute.before has a null guard
+                      ...cmdCtx!,
+                      sessionId: request.sessionId,
+                    }
+                    const payload = await buildDialogPayload(
+                      request.command,
+                      request.arguments,
+                      callCtx,
+                    )
+                    return { text: payload.text, knobs: payload.knobs }
+                  },
+                }),
+            )
+            ownedRpcServers.set(activeRpcDir.dir, adoption)
           } catch {
             // RPC is best-effort; the plugin must not fail if the port file
             // can't be written (e.g. missing directory in test environments).

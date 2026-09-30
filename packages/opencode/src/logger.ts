@@ -20,7 +20,7 @@ import {
   flushLogs,
   initLogger,
   type Level,
-} from '@cortexkit/openai-auth-core/internal'
+} from '@cortexkit/openai-auth-core/tui-support'
 
 export {
   createLogger,
@@ -30,7 +30,7 @@ export {
   redact,
   redactStrings,
   setLogLevel,
-} from '@cortexkit/openai-auth-core/internal'
+} from '@cortexkit/openai-auth-core/tui-support'
 
 const LEVELS: readonly Level[] = ['error', 'warn', 'info', 'debug', 'trace']
 

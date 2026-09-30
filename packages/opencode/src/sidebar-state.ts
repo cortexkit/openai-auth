@@ -178,11 +178,15 @@ export interface SidebarState {
   lastUpdated: number
 }
 
-import { createHash, randomUUID } from 'node:crypto'
-import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { acquireRefreshFileLock } from '@cortexkit/openai-auth-core/internal'
+import { join } from 'node:path'
+import {
+  createSidebarFile,
+  type SidebarFile,
+  type SidebarFileHooks,
+} from '@cortexkit/common-auth/sidebar-file'
 import {
   CUSTODY_INERT_REASONS,
   type CustodyInertReason,
@@ -877,20 +881,49 @@ function usableRoutingAccountIds(
 }
 
 // Serialization chain: concurrent calls are queued so a stale background
-// write cannot land after a newer one and corrupt the file.
+// write cannot land after a newer one and corrupt the file. It spans every
+// state file, as it always has, so drainSidebarWrites waits for all of them.
 let sidebarWriteChain: Promise<void> = Promise.resolve()
-const MAX_MERGE_ATTEMPTS = 3
-const SIDEBAR_WRITE_LOCK_TTL_MS = 10_000
-const SIDEBAR_WRITE_LOCK_WAIT_MS = 15_000
 
-interface SidebarMergeHooks {
-  beforeRecheck?: () => void | Promise<void>
-}
+type SidebarMergeHooks = Pick<SidebarFileHooks, 'beforeRecheck'>
 
 function enqueueSidebarWrite(operation: () => Promise<void>): Promise<void> {
   const result = sidebarWriteChain.then(operation)
   sidebarWriteChain = result.catch(() => {})
   return result
+}
+
+// One shared-library sidebar file per path. It takes the 'sidebar-write' lock
+// for every write and re-merges when an older, unlocked writer changed the file
+// meanwhile. Only this plugin's default directory is made private (0700); a
+// directory an operator or caller named keeps its permissions.
+const sidebarFiles = new Map<string, SidebarFile<SidebarState>>()
+
+function sidebarFileFor(file: string): SidebarFile<SidebarState> {
+  let sidebarFile = sidebarFiles.get(file)
+  if (!sidebarFile) {
+    sidebarFile = createSidebarFile<SidebarState>({
+      path: file,
+      defaultValue: DEFAULT_SIDEBAR_STATE,
+      normalize: normalizeSidebarState,
+      secureDir: file === DEFAULT_STATE_FILE,
+      logger: logSb,
+    })
+    sidebarFiles.set(file, sidebarFile)
+  }
+  return sidebarFile
+}
+
+async function logWriteFailure(write: Promise<void>): Promise<void> {
+  try {
+    await write
+  } catch (e) {
+    logSb.warn('sidebar write failed', {
+      pid: process.pid,
+      error: e instanceof Error ? e.message : String(e),
+    })
+    throw e
+  }
 }
 
 /**
@@ -908,89 +941,27 @@ export function setSidebarState(
   state: SidebarState,
   file = getSidebarStateFile(),
 ): Promise<void> {
-  return enqueueSidebarWrite(() => doWriteSidebarState(state, file))
+  return enqueueSidebarWrite(() =>
+    logWriteFailure(sidebarFileFor(file).write(normalizeSidebarState(state))),
+  )
 }
 
-async function readSidebarState(file: string): Promise<SidebarState> {
-  try {
-    return parseSidebarState(await readRawSidebar(file))
-  } catch {
-    return DEFAULT_SIDEBAR_STATE
-  }
+function readSidebarState(file: string): Promise<SidebarState> {
+  return sidebarFileFor(file).read()
 }
 
-async function readRawSidebar(file: string): Promise<string> {
-  try {
-    return await readFile(file, 'utf8')
-  } catch (error) {
-    if ((error as { code?: string }).code === 'ENOENT') return ''
-    throw error
-  }
-}
-
-function parseSidebarState(raw: string): SidebarState {
-  if (raw === '') return DEFAULT_SIDEBAR_STATE
-  try {
-    return normalizeSidebarState(JSON.parse(raw))
-  } catch {
-    return DEFAULT_SIDEBAR_STATE
-  }
-}
-
-async function acquireSidebarWriteLock(file: string) {
-  await ensureSidebarStateDirectory(file)
-  const deadline = Date.now() + SIDEBAR_WRITE_LOCK_WAIT_MS
-  while (Date.now() <= deadline) {
-    const lock = await acquireRefreshFileLock({
-      name: 'sidebar-write',
-      path: file,
-      ttlMs: SIDEBAR_WRITE_LOCK_TTL_MS,
-      renew: true,
-    })
-    if (lock) return lock
-    await new Promise((resolve) => setTimeout(resolve, 10))
-  }
-  throw new Error('Timed out waiting for the sidebar state write lock')
-}
-
-async function ensureSidebarStateDirectory(file: string): Promise<void> {
-  const dir = dirname(file)
-  await mkdir(dir, { recursive: true, mode: 0o700 })
-  if (file !== DEFAULT_STATE_FILE) return
-  await chmod(dir, 0o700).catch((error) => {
-    logSb.warn('sidebar directory permission remediation failed', {
-      pid: process.pid,
-      error: error instanceof Error ? error.message : String(error),
-    })
-  })
-}
-
-async function writeMergedSidebarState(
+function writeMergedSidebarState(
   file: string,
   merge: (latest: SidebarState) => SidebarState | undefined,
   hooks?: SidebarMergeHooks,
 ): Promise<void> {
-  const lock = await acquireSidebarWriteLock(file)
-  try {
-    // The file lock serializes current writers. Rechecking also preserves data
-    // from older plugin processes that do not participate in this lock.
-    for (let attempt = 0; attempt < MAX_MERGE_ATTEMPTS; attempt += 1) {
-      const rawBefore = await readRawSidebar(file)
-      const next = merge(parseSidebarState(rawBefore))
-      if (!next) return
-      if (attempt === 0) await hooks?.beforeRecheck?.()
-      const rawRecheck = await readRawSidebar(file)
-      if (rawRecheck !== rawBefore) continue
-      await doWriteSidebarState(next, file)
-      return
-    }
-
-    const latest = await readSidebarState(file)
-    const next = merge(latest)
-    if (next) await doWriteSidebarState(next, file)
-  } finally {
-    await lock.release()
-  }
+  // Every state reaches disk normalized, as each write has always been.
+  return logWriteFailure(
+    sidebarFileFor(file).update((latest) => {
+      const next = merge(latest)
+      return next === undefined ? undefined : normalizeSidebarState(next)
+    }, hooks),
+  )
 }
 
 export type SidebarMachineState = Pick<
@@ -1520,28 +1491,6 @@ export async function clearSidebarStickyAssignment(
     })
   })
   return removed
-}
-
-async function doWriteSidebarState(
-  state: SidebarState,
-  file: string,
-): Promise<void> {
-  const tempPath = `${file}.${randomUUID()}.tmp`
-  try {
-    await ensureSidebarStateDirectory(file)
-    await writeFile(tempPath, JSON.stringify(normalizeSidebarState(state)), {
-      encoding: 'utf8',
-      mode: 0o600,
-    })
-    await rename(tempPath, file)
-  } catch (e) {
-    await rm(tempPath, { force: true }).catch(() => {})
-    logSb.warn('sidebar write failed', {
-      pid: process.pid,
-      error: e instanceof Error ? e.message : String(e),
-    })
-    throw e
-  }
 }
 
 /**

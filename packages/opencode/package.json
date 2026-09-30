@@ -53,6 +53,7 @@
   },
   "devDependencies": {
     "@ai-sdk/openai": "3.0.88",
+    "@cortexkit/common-auth": "0.1.2",
     "@cortexkit/openai-auth-core": "workspace:*"
   },
   "dependencies": {

@@ -1,8 +1,12 @@
-import { watch } from 'node:fs'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
-import { applyEdits, modify, type ParseError, parse } from 'jsonc-parser'
+import { dirname, join } from 'node:path'
+import {
+  createTuiPreferenceWriter,
+  readTuiPreferencesFile as readCommonTuiPreferencesFile,
+  type TuiPreferenceWriter,
+  watchTuiPreferences as watchCommonTuiPreferences,
+} from '@cortexkit/common-auth/tui-prefs'
 
 export const TUI_PREFS_FILE_ENV = 'OPENCODE_TUI_PREFERENCES_FILE'
 const FILE_NAME = 'tui-preferences.jsonc'
@@ -23,23 +27,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-// Tolerant read: missing file, parse errors, or a non-object root all resolve
-// to {} so the sidebar never crashes on user-edited content. jsonc-parser's
-// fault-tolerant parse can still hand back a partial object for an
-// unterminated/bracketed file or trailing garbage, so we collect errors and
-// treat any reported fault as malformed.
-export async function readTuiPreferencesFile(): Promise<
-  Record<string, unknown>
-> {
-  try {
-    const raw = await readFile(getTuiPreferencesFile(), 'utf8')
-    const errors: ParseError[] = []
-    const root: unknown = parse(raw, errors, { allowTrailingComma: true })
-    if (errors.length > 0) return {}
-    return isRecord(root) ? root : {}
-  } catch {
-    return {}
-  }
+// Tolerant read: a missing file, parse errors or a non-object root all resolve
+// to {} so the sidebar never crashes on user-edited content.
+export function readTuiPreferencesFile(): Promise<Record<string, unknown>> {
+  return readCommonTuiPreferencesFile(getTuiPreferencesFile())
 }
 
 export const PLUGIN_KEY = 'openai-auth'
@@ -224,105 +215,55 @@ const TEMPLATE = `// Shared preferences for opencode TUI plugins.
 
 type JsonValue = string | number | boolean | null
 
-async function writePreference(
-  pluginKey: string,
-  path: string[],
-  value: JsonValue,
-): Promise<void> {
-  const file = getTuiPreferencesFile()
-  await mkdir(dirname(file), { recursive: true })
-  let text: string
-  try {
-    text = await readFile(file, 'utf8')
-  } catch {
-    text = ''
+// One writer per file and plugin key. The file is resolved on every call, as
+// it always has been, so a changed environment variable takes effect on the
+// next update.
+const writers = new Map<string, TuiPreferenceWriter>()
+
+function writerFor(file: string, pluginKey: string): TuiPreferenceWriter {
+  const key = JSON.stringify([file, pluginKey])
+  let writer = writers.get(key)
+  if (!writer) {
+    writer = createTuiPreferenceWriter({ file, pluginKey })
+    writers.set(key, writer)
   }
-  if (text.trim() === '') text = TEMPLATE
-  const edits = modify(text, [pluginKey, ...path], value, {
-    formattingOptions: { insertSpaces: true, tabSize: 2 },
-  })
-  const next = applyEdits(text, edits)
-  const tmp = `${file}.${process.pid}.tmp`
-  await writeFile(tmp, next, 'utf8')
-  await rename(tmp, file)
+  return writer
+}
+
+// The shared writer starts a missing file from its own generic header. Create
+// the file with this plugin's header first, so a file it creates reads the same
+// as before. 'wx' only creates: an existing file, or one another process
+// creates first, is left alone.
+async function seedPreferencesFile(file: string): Promise<void> {
+  await mkdir(dirname(file), { recursive: true })
+  await writeFile(file, TEMPLATE, { encoding: 'utf8', flag: 'wx' }).catch(
+    () => {},
+  )
 }
 
 let writeChain: Promise<void> = Promise.resolve()
 
-// Writes are serialized on a promise chain: each update re-reads the file,
-// applies a minimal comment-preserving edit to one property, and replaces the
-// file atomically (temp + rename in the same directory). Best-effort by
-// design — preferences are never worth crashing the TUI over.
+// Updates run one after another in call order, so the last call wins. Each
+// re-reads the file, applies a minimal comment-preserving edit to one property
+// and replaces the file atomically, under the shared preferences lock so other
+// plugins' writers cannot interleave. Best-effort by design: preferences are
+// never worth crashing the TUI over, so failures resolve.
 export function queueTuiPreferenceUpdate(
   pluginKey: string,
   path: string[],
   value: JsonValue,
 ): Promise<void> {
+  const file = getTuiPreferencesFile()
+  const writer = writerFor(file, pluginKey)
   writeChain = writeChain
-    .then(() => writePreference(pluginKey, path, value))
+    .then(() => seedPreferencesFile(file))
+    .then(() => writer.queueTuiPreferenceUpdate(path, value))
     .catch(() => {})
   return writeChain
 }
 
-const WATCH_DEBOUNCE_MS = 150
-
-// Watches the directory rather than the file: editors and our own atomic
-// writes replace the file via rename, which kills file-level watchers.
-//
-// Filtering is two-stage:
-//   1. Filename pre-filter: only debounce events for the preferences file
-//      name, or our atomic-write temp file. This is a cheap first pass that
-//      drops the common case (unrelated sibling files).
-//   2. Content check inside the debounce: after the timer fires, re-read
-//      the file and compare it against the last seen content. Only fire
-//      `onChange` when the content actually changed. This is the authority.
-//      Some platforms (notably macOS FSEvents and a few inotify backends)
-//      can misattribute a rename of an unrelated sibling file to the
-//      real preferences filename in addition to emitting the sibling's
-//      own event, so a name-only filter still produces a stray callback.
-//      A content comparison is robust against that, against coalesced
-//      events, and against mtime granularity.
-//
-// Returns a disposer; never throws.
+// Fires `onChange` when the preferences file's content changes. Returns a
+// disposer; never throws.
 export function watchTuiPreferences(onChange: () => void): () => void {
-  const file = getTuiPreferencesFile()
-  const name = basename(file)
-  let timer: ReturnType<typeof setTimeout> | null = null
-  let lastSeen: string | null = null
-  // Seed asynchronously; a real change that fires before the seed resolves
-  // still wins because the debounce re-reads the file fresh and compares
-  // against `lastSeen` (which will be `null` → does not match → fires).
-  void readFile(file, 'utf8')
-    .then((text) => {
-      if (lastSeen === null) lastSeen = text
-    })
-    .catch(() => {})
-  try {
-    const watcher = watch(dirname(file), (_event, filename) => {
-      // Exact match against the preferences file name, plus the temp file
-      // we use for atomic writes (carrying our pid + `.tmp`).
-      const isOurs =
-        filename === name ||
-        (filename?.startsWith(`${name}.`) && filename.endsWith('.tmp'))
-      if (filename != null && !isOurs) return
-      if (timer) clearTimeout(timer)
-      timer = setTimeout(() => {
-        timer = null
-        void readFile(file, 'utf8')
-          .catch(() => null)
-          .then((text) => {
-            if (text === null) return
-            if (text === lastSeen) return
-            lastSeen = text
-            onChange()
-          })
-      }, WATCH_DEBOUNCE_MS)
-    })
-    return () => {
-      if (timer) clearTimeout(timer)
-      watcher.close()
-    }
-  } catch {
-    return () => {}
-  }
+  return watchCommonTuiPreferences(getTuiPreferencesFile(), onChange)
 }

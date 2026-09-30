@@ -1,48 +1,52 @@
+/**
+ * The plugin's notification queue, on the shared RPC machinery.
+ *
+ * `@cortexkit/common-auth/rpc` keeps one queue per scope. This plugin has
+ * always used a single queue for the whole process, shared by every plugin
+ * instance and drained by whichever RPC server the TUI reaches, so every call
+ * here passes the same constant scope. Its fields are only a lookup key: the
+ * queue is in memory and nothing is written under `rpcRoot`.
+ */
+import {
+  drainNotifications as drainCommonNotifications,
+  isTuiConnected as isCommonTuiConnected,
+  type NotificationScope,
+  pushNotification as pushCommonNotification,
+  resetNotificationsForTest as resetCommonNotificationsForTest,
+} from '@cortexkit/common-auth/rpc'
 import type { OpenDialogPayload, RpcNotification } from './protocol'
+import { RPC_DIRECTORY_PREFIX } from './rpc-dir'
 
-const QUEUE_CAP = 100
-const TUI_CONNECTED_WINDOW_MS = 3_000
-
-let queue: RpcNotification[] = []
-let nextId = 1
-const lastDrainAtBySession = new Map<string, number>()
+const PROCESS_QUEUE_SCOPE: NotificationScope = {
+  rpcRoot: 'openai-auth',
+  directoryPrefix: RPC_DIRECTORY_PREFIX,
+  registrationSessionId: 'process',
+}
 
 export function pushNotification(
   payload: OpenDialogPayload,
   sessionId?: string,
 ): void {
-  queue.push({ id: nextId++, type: 'open-dialog', payload, sessionId })
-  if (queue.length > QUEUE_CAP) queue = queue.slice(queue.length - QUEUE_CAP)
+  pushCommonNotification(PROCESS_QUEUE_SCOPE, payload, sessionId)
 }
 
 export function drainNotifications(
   lastReceivedId = 0,
   sessionId?: string,
 ): RpcNotification[] {
-  const now = Date.now()
-  if (sessionId !== undefined) lastDrainAtBySession.set(sessionId, now)
-  const matches = (n: RpcNotification) =>
-    sessionId === undefined ||
-    n.sessionId === undefined ||
-    n.sessionId === sessionId
-  if (lastReceivedId > 0) {
-    queue = queue.filter((n) => {
-      if (n.id > lastReceivedId) return true
-      if (sessionId === undefined) return true
-      return n.sessionId !== sessionId
-    })
-  }
-  return queue.filter((n) => n.id > lastReceivedId && matches(n))
+  // Only payloads built by this plugin are ever pushed, so each carries one of
+  // its command names.
+  return drainCommonNotifications(
+    PROCESS_QUEUE_SCOPE,
+    lastReceivedId,
+    sessionId,
+  ) as RpcNotification[]
 }
 
 export function isTuiConnected(sessionId: string): boolean {
-  const now = Date.now()
-  const at = lastDrainAtBySession.get(sessionId) ?? 0
-  return at > 0 && now - at < TUI_CONNECTED_WINDOW_MS
+  return isCommonTuiConnected(PROCESS_QUEUE_SCOPE, sessionId)
 }
 
 export function resetNotificationsForTest(): void {
-  queue = []
-  nextId = 1
-  lastDrainAtBySession.clear()
+  resetCommonNotificationsForTest(PROCESS_QUEUE_SCOPE)
 }

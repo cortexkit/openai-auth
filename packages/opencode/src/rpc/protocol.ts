@@ -9,4 +9,4 @@ export type {
   CommandModalName,
   OpenDialogPayload,
   RpcNotification,
-} from '@cortexkit/openai-auth-core/internal'
+} from '@cortexkit/openai-auth-core/tui-support'
