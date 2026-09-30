@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { writeJsonAtomic } from './atomic-write'
+import { writeJsonAtomic } from '@cortexkit/common-auth/fs'
 import {
   buildQuotaOperationError,
   buildRefreshOperationError,

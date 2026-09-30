@@ -21,8 +21,8 @@ export {
   detectClaustrumConnection,
   getDefaultClaustrumConnectionPath,
 } from '@cortexkit/claustrum-client'
+export { writeJsonAtomic } from '@cortexkit/common-auth/fs'
 export * from './accounts'
-export * from './atomic-write'
 export * from './backoff'
 export {
   type CacheKeepManager,
