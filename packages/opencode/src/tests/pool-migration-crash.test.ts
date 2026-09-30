@@ -157,6 +157,25 @@ describe('a crash at every step of the migration', () => {
   }
 })
 
+describe('the shield that keeps older builds off the main row', () => {
+  it('an install without mainAccountId is shielded too: after a crash with the row written, an older build serves main only from the slot', async () => {
+    await seedLegacyInstall(h)
+    const config = await h.config()
+    delete config.mainAccountId
+    await Bun.write(h.paths.configPath, JSON.stringify(config))
+    const child = await runChild({
+      dir: h.dir,
+      mode: 'migrate',
+      exitAtName: 'after-row-write',
+    })
+    expect(child.code).toBe(CRASH_EXIT_CODE)
+    expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main'])
+    expect((await h.slotValue())?.refresh).toBe('r-main')
+    expect(await legacyServedTokens(h)).toEqual(['r-fb1', 'r-main'])
+    expect(await legacyUsableFallbackIds(h)).toEqual(['fb1'])
+  }, 30_000)
+})
+
 describe('two migrators at once', () => {
   it('two processes migrating together make one pool, one main row and one placeholder write', async () => {
     await seedLegacyInstall(h)
