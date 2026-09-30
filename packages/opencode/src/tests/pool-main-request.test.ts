@@ -15,7 +15,12 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type {
+  AccountStorage,
+  OAuthAccount,
+} from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
+import { createAuthDoctorReport } from '../auth/doctor.ts'
 import {
   isPoolMainPlaceholder,
   POOL_MAIN_PLACEHOLDER_REFRESH,
@@ -25,7 +30,7 @@ import {
   __resetProcessHeartbeatForTest,
   processHeartbeatPath,
 } from '../core/process-heartbeat.ts'
-import { CodexAuthPlugin } from '../index.ts'
+import { CodexAuthPlugin, createResetTargetResolver } from '../index.ts'
 import {
   drainSidebarWrites,
   hashSidebarSessionId,
@@ -350,10 +355,74 @@ describe('request path with the main account in the pool', () => {
   })
 })
 
+describe('other main-slot readers with the main account in the pool', () => {
+  function storageWith(accounts: OAuthAccount[]): AccountStorage {
+    return {
+      version: 1,
+      main: { type: 'opencode', provider: 'openai' },
+      accounts,
+    }
+  }
+  const poolMain = row('main') as OAuthAccount
+
+  it('the auth doctor calls the layout healthy and never offers to copy row main into the slot', () => {
+    const report = createAuthDoctorReport({
+      auth: { ...PLACEHOLDER },
+      storage: storageWith([poolMain]),
+    })
+    expect(report.findings).toEqual([])
+    expect(report.repairs).toEqual([])
+  })
+
+  it('the auth doctor reports a missing row main without a repair', () => {
+    const report = createAuthDoctorReport({
+      auth: { ...PLACEHOLDER },
+      storage: storageWith([row('fallback-1') as OAuthAccount]),
+    })
+    expect(report.findings.map((finding) => finding.code)).toEqual([
+      'main-pool-row-missing',
+    ])
+    expect(report.repairs).toEqual([])
+  })
+
+  it('reset-credit target resolution resolves main to row main, refreshing it as the pool main', async () => {
+    const dueMain = { ...poolMain, expires: Date.now() + 60_000 }
+    const refreshedRows: string[] = []
+    const resolve = createResetTargetResolver({
+      getAuth: async () => ({ ...PLACEHOLDER }),
+      refreshMainWithLease: async () => {
+        throw new Error('the placeholder must never be refreshed')
+      },
+      refreshFallbackAccount: async () => {
+        throw new Error('row main must be refreshed as the pool main')
+      },
+      refreshPoolMainRow: async (account) => {
+        refreshedRows.push(account.id)
+        return { ...account, access: 'main-refreshed-token' }
+      },
+      loadAccounts: async () => storageWith([dueMain]),
+      accountStoragePath: configFile,
+      accountStatePath: join(configDir, 'openai-auth-state.json'),
+      now: Date.now,
+    })
+
+    const target = await resolve('main')
+
+    expect(refreshedRows).toEqual(['main'])
+    expect(target).toMatchObject({
+      accountKey: 'main',
+      label: 'Main account',
+      accessToken: 'main-refreshed-token',
+      chatgptAccountId: 'chatgpt-main',
+    })
+  })
+})
+
 describe('main refresh re-reads the slot once it holds the lock', () => {
-  // Another process changes the slot exactly while this one takes the
-  // main-refresh lock: the slot reads as `before` until the lock file exists
-  // and as `after` from then on.
+  // Models another process changing the slot in the window between this
+  // process's first read and its taking the main-refresh lock. The slot reads
+  // as `before` until this process has created the lock file and as `after`
+  // from then on, so only a read made while holding the lock can see `after`.
   function slotChangingUnderLock(before: SlotValue, after: SlotValue) {
     const lockFile = `${configFile}.main-refresh.lock`
     return async () => ({ ...(existsSync(lockFile) ? after : before) })

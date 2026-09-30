@@ -1156,10 +1156,10 @@ describe('refreshAllQuota', () => {
   })
 })
 
-// After the account-pool migration the main slot holds a placeholder and the
-// main account is the roster row `main`. The poll must serve main from that row
-// (recorded as main, never as a fallback) and must never refresh the
-// placeholder.
+// Once the main account has been moved into the account pool, OpenCode's main
+// slot holds only a placeholder and the main credential is the roster row
+// `main`. The poll must serve main from that row (recorded as main, never as a
+// fallback) and must never refresh the placeholder.
 describe('refreshAllQuota with the main account in the pool', () => {
   const placeholder = {
     type: 'oauth' as const,
