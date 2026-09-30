@@ -4,6 +4,8 @@
 // the slot fence and its declared race, and refreshing a pool row while
 // older builds may refresh the same token.
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore } from '@cortexkit/common-auth/store'
@@ -24,6 +26,7 @@ import { classifyMainAuthSlot } from '../core/custody-host-slot.ts'
 import { MAIN_REFRESH_LOCK_NAME } from '../core/custody-transition.ts'
 import {
   adoptHostSlotLogin,
+  type HostSlotAdapter,
   isPoolPlaceholder,
   LegacyMainRefreshInFlightError,
   migrateToPool,
@@ -31,17 +34,21 @@ import {
   POOL_PLACEHOLDER,
   refreshPoolRow,
 } from '../core/pool-migration.ts'
+import {
+  migrationFenceOpen,
+  processHeartbeatDir,
+} from '../core/version-fence.ts'
 import { legacyRefreshMain } from './fixtures/legacy-main-refresh.ts'
 import {
   FAR,
   type Harness,
   harness,
   jwt,
-  legacyServedTokens,
   legacyUsableFallbackIds,
   login,
   MAIN_QUOTA,
   poolTokens,
+  refreshAsOlderBuild,
   seedLegacyInstall,
 } from './fixtures/pool-migration-harness.ts'
 
@@ -281,28 +288,57 @@ describe('older builds running at the same time', () => {
     expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
   })
 
-  it('an active legacy lease on the slot token is waited out and never imported under', async () => {
-    await seedLegacyInstall(h)
+  async function leaseSlotToken(holder: string) {
     await mutateAccounts((current) => {
       current.refresh = {
         ...current.refresh,
-        mainRefreshLeaseId: 'crashed-holder',
+        mainRefreshLeaseId: holder,
         mainRefreshLeaseUntil: Date.now() + 60_000,
         mainRefreshLeaseTokenHash: hashRefreshToken('r-main'),
       }
       return current
     }, h.paths)
+  }
+
+  it('an active legacy lease on the slot token is waited out: the migration imports once the older build releases it', async () => {
+    await seedLegacyInstall(h)
+    await leaseSlotToken('older-build')
+    let rowWhileLeased: unknown = 'not checked'
+    const released = (async () => {
+      await Bun.sleep(200)
+      rowWhileLeased = await h.row('main')
+      // The older build's refresh ends and clears its lease, as
+      // `refreshMainWithLease` does in its `finally`.
+      await mutateAccounts((current) => {
+        if (current.refresh) {
+          current.refresh.mainRefreshLeaseId = undefined
+          current.refresh.mainRefreshLeaseUntil = undefined
+          current.refresh.mainRefreshLeaseTokenHash = undefined
+        }
+        return current
+      }, h.paths)
+    })()
+    const outcome = await migrateToPool(
+      h.deps({ leaseWait: { timeoutMs: 5_000, pollMs: 20 } }),
+    )
+    await released
+    expect(rowWhileLeased).toBeUndefined()
+    expect(outcome).toMatchObject({ status: 'completed', rowId: 'main' })
+    expect((await h.row('main'))?.credential).toMatchObject({
+      refresh: 'r-main',
+    })
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+  })
+
+  it('a legacy lease that outlasts the wait ends the run retryably and imports nothing', async () => {
+    await seedLegacyInstall(h)
+    await leaseSlotToken('crashed-holder')
     expect(await migrateToPool(h.deps())).toEqual({
       status: 'retry',
       reason: 'legacy-refresh-in-progress',
     })
     expect((await h.slotValue())?.refresh).toBe('r-main')
     expect(await h.row('main')).toBeUndefined()
-    // Once the legacy lease's end time has passed (a clock two minutes on),
-    // the lease no longer counts and the migration proceeds.
-    expect(
-      await migrateToPool(h.deps({ now: () => Date.now() + 120_000 })),
-    ).toMatchObject({ status: 'completed', rowId: 'main' })
   })
 
   it('a legacy mutateAccounts adding and removing fallbacks during the migration loses nothing', async () => {
@@ -334,7 +370,12 @@ describe('older builds running at the same time', () => {
       'fb2',
     ])
     expect(await poolTokens(h)).toEqual(['r-fb1', 'r-fb2', 'r-main'])
-    expect(await legacyServedTokens(h)).toEqual(['r-fb1', 'r-fb2', 'r-main'])
+    expect(await legacyUsableFallbackIds(h)).toEqual(['fb1', 'fb2', 'main'])
+    const older = await refreshAsOlderBuild(h)
+    expect(older.submitted).toEqual(
+      ['r-fb1', 'r-fb2', 'r-main', POOL_PLACEHOLDER.refresh].sort(),
+    )
+    expect(older.refreshedTwice).toEqual([])
   })
 
   it('a legacy mutateAccounts after the migration keeps the pool and the main row', async () => {
@@ -480,7 +521,36 @@ describe('adoption of a later login in the slot', () => {
     expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main', 'r-new'])
   })
 
-  it('waits for an older build refreshing the target row under its fallback lock', async () => {
+  it('waits for an older build refreshing the target row under its fallback lock, then adopts', async () => {
+    await migrated()
+    await h.setSlot(login('acct-main', 'r-main', 'fresh-access'))
+    const held = await acquireRefreshFileLock({
+      name: fallbackRefreshLockName('main'),
+      ttlMs: 60_000,
+      path: h.paths.configPath,
+    })
+    let rowWhileHeld: unknown
+    const released = (async () => {
+      await Bun.sleep(300)
+      rowWhileHeld = (await h.row('main'))?.credential
+      await held?.release()
+    })()
+    const outcome = await adoptHostSlotLogin(h.deps())
+    await released
+    expect(rowWhileHeld).toMatchObject({ access: jwt('acct-main') })
+    expect(outcome).toMatchObject({
+      status: 'completed',
+      rowId: 'main',
+      operation: 'rotate',
+      placeholder: 'written',
+    })
+    expect((await h.row('main'))?.credential).toMatchObject({
+      access: jwt('acct-main', 'fresh-access'),
+      refresh: 'r-main',
+    })
+  })
+
+  it('gives up retryably when the target row lock outlasts its bound', async () => {
     await migrated()
     await h.setSlot(login('acct-main', 'r-main', 'fresh-access'))
     const held = await acquireRefreshFileLock({
@@ -533,6 +603,312 @@ describe('adoption of a later login in the slot', () => {
   })
 })
 
+describe('verification of the row write', () => {
+  it('a row write that lands wrong stops the transfer before the slot is touched', async () => {
+    await seedLegacyInstall(h)
+    const outcome = await migrateToPool(
+      h.deps({
+        store: {
+          // Right after the store writes the new row's credential, something
+          // rewrites it: the row no longer holds the slot's token.
+          onStep: async (step, info) => {
+            if (info.operation !== 'add' || step !== 'after-state-write') return
+            const state = await h.state()
+            state.accounts.main = { ...state.accounts.main, refresh: 'r-wrong' }
+            await Bun.write(h.paths.statePath, JSON.stringify(state))
+          },
+        },
+      }),
+    )
+    expect(outcome).toEqual({ status: 'retry', reason: 'verify-failed' })
+    expect(await h.slotValue()).toEqual(login('acct-main', 'r-main'))
+    expect(await h.placeholderWrites()).toBe(0)
+    const config = await h.config()
+    expect(config[POOL_MIGRATION_KEY].pending).toMatchObject({ rowId: 'main' })
+    expect(config[POOL_MIGRATION_KEY].migratedAt).toBeUndefined()
+    expect(config.mainAccountId).toBe('acct-main')
+  })
+})
+
+describe('the plan is made again under the row lock', () => {
+  /**
+   * A `sleep` that makes `change` happen the first time the run sleeps,
+   * which is while it waits for a held row lock: after its first plan and
+   * before the plan it makes under the lock.
+   */
+  function sleepThat(change: () => Promise<void>) {
+    let fired = false
+    return {
+      fired: () => fired,
+      sleep: async (ms: number) => {
+        if (!fired) {
+          fired = true
+          await change()
+        }
+        await Bun.sleep(ms)
+      },
+    }
+  }
+
+  function holdRowLock(rowId: string) {
+    return acquireRefreshFileLock({
+      name: fallbackRefreshLockName(rowId),
+      ttlMs: 60_000,
+      path: h.paths.configPath,
+    })
+  }
+
+  it('a new login while the run waits for the row lock: the plan made under the lock wins', async () => {
+    await migrated()
+    await h.setSlot(login('acct-main', 'r-main-2'))
+    const held = await holdRowLock('main')
+    const hook = sleepThat(async () => {
+      await h.setSlot(login('acct-main', 'r-main-3', 'third'))
+      await held?.release()
+    })
+    const outcome = await adoptHostSlotLogin(h.deps({ sleep: hook.sleep }))
+    expect(hook.fired()).toBe(true)
+    expect(outcome).toMatchObject({
+      status: 'completed',
+      rowId: 'main',
+      operation: 'replace',
+      placeholder: 'written',
+    })
+    expect((await h.row('main'))?.credential).toMatchObject({
+      refresh: 'r-main-3',
+    })
+    expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main-3'])
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+  })
+
+  it('a new login for another row while the run waits: that row is written only under its own lock', async () => {
+    await migrated()
+    await h.setSlot(login('acct-main', 'r-main-2'))
+    const mainHeld = await holdRowLock('main')
+    // An older build refreshes fb1 for the whole run.
+    const fb1Held = await holdRowLock('fb1')
+    const hook = sleepThat(async () => {
+      await h.setSlot(login('acct-fb1', 'r-fb1-2'))
+      await mainHeld?.release()
+    })
+    const outcome = await adoptHostSlotLogin(
+      h.deps({ sleep: hook.sleep, legacyLocks: { timeoutMs: 1_000 } }),
+    )
+    await fb1Held?.release()
+    expect(hook.fired()).toBe(true)
+    expect(outcome).toEqual({ status: 'retry', reason: 'lock-contention' })
+    expect((await h.row('fb1'))?.credential).toMatchObject({ refresh: 'r-fb1' })
+    expect((await h.row('main'))?.credential).toMatchObject({
+      refresh: 'r-main',
+    })
+    expect((await h.slotValue())?.refresh).toBe('r-fb1-2')
+    // Once the older build is done with fb1, the next run adopts into it.
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'fb1',
+      operation: 'replace',
+    })
+    expect((await h.row('fb1'))?.credential).toMatchObject({
+      refresh: 'r-fb1-2',
+    })
+  })
+})
+
+describe('the slot reads at the placeholder fence', () => {
+  /** The file slot, with reads that can be made to fail on demand. */
+  function unreliableSlot() {
+    let missing = 0
+    let missed = 0
+    let torn: 'no' | 'absent' | 'partial' = 'no'
+    const slot: HostSlotAdapter = {
+      get: async (input) => {
+        if (torn === 'absent') return undefined
+        if (torn === 'partial') return { type: 'oauth' }
+        if (missing > 0) {
+          missing--
+          missed++
+          return undefined
+        }
+        return h.slot.get(input)
+      },
+      set: (input) => h.slot.set(input),
+      all: async () => (torn === 'no' ? h.slot.all() : {}),
+    }
+    return {
+      slot,
+      missed: () => missed,
+      missOnce: () => {
+        missing = 1
+      },
+      tear: (how: 'absent' | 'partial') => {
+        torn = how
+      },
+    }
+  }
+
+  for (const [where, step] of [
+    ['at the first fence read', 'after-verify'],
+    ['at the read after the shield drop', 'after-shield-drop'],
+  ] as const) {
+    it(`one missing read of the slot ${where} is not taken for a slot that moved on`, async () => {
+      await migrated()
+      await h.setSlot(login('acct-new', 'r-new'))
+      const host = unreliableSlot()
+      const outcome = await adoptHostSlotLogin(
+        h.deps({
+          slot: host.slot,
+          onStep: async (reached) => {
+            if (reached === step) host.missOnce()
+          },
+        }),
+      )
+      expect(host.missed()).toBe(1)
+      expect(outcome).toMatchObject({
+        status: 'completed',
+        rowId: 'acct-new',
+        placeholder: 'written',
+      })
+      expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+      expect((await h.config())[POOL_MIGRATION_KEY].pending).toBeUndefined()
+    })
+  }
+
+  for (const [how, reason] of [
+    ['absent', 'host-slot-indeterminate'],
+    ['partial', 'torn-read'],
+  ] as const) {
+    it(`a torn host read at the fence (slot ${how}, auth map empty) ends the run retryably and keeps the record`, async () => {
+      await migrated()
+      await h.setSlot(login('acct-new', 'r-new'))
+      const host = unreliableSlot()
+      const outcome = await adoptHostSlotLogin(
+        h.deps({
+          slot: host.slot,
+          onStep: async (reached) => {
+            if (reached === 'after-verify') host.tear(how)
+          },
+        }),
+      )
+      expect(outcome).toEqual({ status: 'retry', reason })
+      expect((await h.slotValue())?.refresh).toBe('r-new')
+      expect(await h.placeholderWrites()).toBe(1)
+      expect((await h.config())[POOL_MIGRATION_KEY].pending).toMatchObject({
+        rowId: 'acct-new',
+      })
+      // With the host readable again, the next run finishes the transfer.
+      expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+        status: 'completed',
+        rowId: 'acct-new',
+        operation: 'resumed',
+        placeholder: 'written',
+      })
+    })
+  }
+})
+
+describe('the version fence', () => {
+  const blockers = [{ pid: 4242, version: 'unknown', detail: 'port-4242.json' }]
+  const shut = async () => ({ open: false as const, blockers })
+
+  it('while an older version runs, the migration writes nothing and names it', async () => {
+    await seedLegacyInstall(h)
+    const before = await h.bytes()
+    expect(await migrateToPool(h.deps({ fence: shut }))).toEqual({
+      status: 'deferred',
+      reason: 'older-version-running',
+      blockers,
+    })
+    expect(await h.bytes()).toEqual(before)
+    expect(await h.placeholderWrites()).toBe(0)
+    // Once it is gone the migration runs.
+    expect(await migrateToPool(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'main',
+    })
+  })
+
+  it('reads the processes on disk: a live older version defers the migration', async () => {
+    await seedLegacyInstall(h)
+    const stateHome = join(h.dir, 'xdg-state')
+    mkdirSync(processHeartbeatDir(stateHome), { recursive: true })
+    writeFileSync(
+      join(processHeartbeatDir(stateHome), '4242.json'),
+      JSON.stringify({ pid: 4242, version: '0.11.0', startedAt: 1 }),
+    )
+    const live = new Set([4242])
+    const fence = () =>
+      migrationFenceOpen({
+        stateHome,
+        currentVersion: '0.12.0',
+        isAlive: (pid) => live.has(pid),
+      })
+    const before = await h.bytes()
+    expect(await migrateToPool(h.deps({ fence }))).toMatchObject({
+      status: 'deferred',
+      blockers: [{ pid: 4242, version: '0.11.0' }],
+    })
+    expect(await h.bytes()).toEqual(before)
+    live.delete(4242)
+    expect(await migrateToPool(h.deps({ fence }))).toMatchObject({
+      status: 'completed',
+    })
+  })
+
+  it('a fence that fails keeps the migration deferred', async () => {
+    await seedLegacyInstall(h)
+    const before = await h.bytes()
+    expect(
+      await migrateToPool(
+        h.deps({
+          fence: async () => {
+            throw new Error('no state directory')
+          },
+        }),
+      ),
+    ).toEqual({
+      status: 'deferred',
+      reason: 'older-version-running',
+      blockers: [
+        { pid: 'unknown', version: 'unknown', detail: 'no state directory' },
+      ],
+    })
+    expect(await h.bytes()).toEqual(before)
+  })
+
+  it('an interrupted transfer is not resumed while the fence is shut', async () => {
+    await seedLegacyInstall(h)
+    const crash = new Error('crash after the row write')
+    await expect(
+      migrateToPool(
+        h.deps({
+          onStep: async (step) => {
+            if (step === 'after-row-write') throw crash
+          },
+        }),
+      ),
+    ).rejects.toBe(crash)
+    const before = await h.bytes()
+    expect((await h.config())[POOL_MIGRATION_KEY].pending).toBeDefined()
+    expect(await migrateToPool(h.deps({ fence: shut }))).toMatchObject({
+      status: 'deferred',
+    })
+    expect(await h.bytes()).toEqual(before)
+    expect(await migrateToPool(h.deps())).toMatchObject({
+      status: 'completed',
+      operation: 'resumed',
+    })
+  })
+
+  it('adoption after the migration is not fenced', async () => {
+    await migrated()
+    await h.setSlot(login('acct-new', 'r-new'))
+    expect(await adoptHostSlotLogin(h.deps({ fence: shut }))).toMatchObject({
+      status: 'completed',
+      rowId: 'acct-new',
+    })
+  })
+})
+
 describe('refreshing a pool row while older builds run', () => {
   const rotated = {
     access: 'a-next',
@@ -541,47 +917,70 @@ describe('refreshing a pool row while older builds run', () => {
   }
   const quick = { legacyLocks: { timeoutMs: 300 } }
 
-  it('waits on the legacy fallback lock an older build refreshes the row under', async () => {
-    await migrated()
-    const held = await acquireRefreshFileLock({
-      name: fallbackRefreshLockName('main'),
-      ttlMs: 60_000,
-      path: h.paths.configPath,
-    })
-    let called = false
-    const failure = await refreshPoolRow(
-      { paths: h.paths, store: openStore(), ...quick },
-      'main',
-      async () => {
-        called = true
-        return rotated
-      },
-    ).catch((error: unknown) => error)
-    await held?.release()
-    expect(failure).toMatchObject({ kind: 'lock-contention' })
-    expect(called).toBe(false)
-  })
+  for (const [lock, rowId] of [
+    ['the legacy fallback lock an older build refreshes the row under', 'main'],
+    ['the legacy main-refresh lock, for any row', 'fb1'],
+  ] as const) {
+    const name = () =>
+      rowId === 'main'
+        ? fallbackRefreshLockName('main')
+        : MAIN_REFRESH_LOCK_NAME
 
-  it('waits on the legacy main-refresh lock for any row', async () => {
-    await migrated()
-    const held = await acquireRefreshFileLock({
-      name: MAIN_REFRESH_LOCK_NAME,
-      ttlMs: 60_000,
-      path: h.paths.configPath,
+    it(`waits on ${lock}, and refreshes once it is released`, async () => {
+      await migrated()
+      const held = await acquireRefreshFileLock({
+        name: name(),
+        ttlMs: 60_000,
+        path: h.paths.configPath,
+      })
+      let calledWhileHeld: boolean | undefined
+      let called = false
+      const released = (async () => {
+        await Bun.sleep(300)
+        calledWhileHeld = called
+        await held?.release()
+      })()
+      const outcome = await refreshPoolRow(
+        {
+          paths: h.paths,
+          store: openStore(),
+          legacyLocks: { timeoutMs: 5_000 },
+        },
+        rowId,
+        async () => {
+          called = true
+          return rotated
+        },
+      )
+      await released
+      expect(calledWhileHeld).toBe(false)
+      expect(outcome).toMatchObject({ status: 'rotated', rowId })
+      expect((await h.row(rowId))?.credential).toMatchObject({
+        refresh: 'r-next',
+      })
     })
-    let called = false
-    const failure = await refreshPoolRow(
-      { paths: h.paths, store: openStore(), ...quick },
-      'fb1',
-      async () => {
-        called = true
-        return rotated
-      },
-    ).catch((error: unknown) => error)
-    await held?.release()
-    expect(failure).toMatchObject({ kind: 'lock-contention' })
-    expect(called).toBe(false)
-  })
+
+    it(`gives up on ${lock} after its bound without calling the provider`, async () => {
+      await migrated()
+      const held = await acquireRefreshFileLock({
+        name: name(),
+        ttlMs: 60_000,
+        path: h.paths.configPath,
+      })
+      let called = false
+      const failure = await refreshPoolRow(
+        { paths: h.paths, store: openStore(), ...quick },
+        rowId,
+        async () => {
+          called = true
+          return rotated
+        },
+      ).catch((error: unknown) => error)
+      await held?.release()
+      expect(failure).toMatchObject({ kind: 'lock-contention' })
+      expect(called).toBe(false)
+    })
+  }
 
   it('never refreshes a token covered by an active legacy main lease', async () => {
     await migrated()

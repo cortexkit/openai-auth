@@ -238,7 +238,13 @@ export async function migrationFenceOpen(
     }
   }
 
+  // Directory listings come in no fixed order; report blockers by pid.
+  const rank = (b: VersionFenceBlocker) =>
+    b.pid === 'unknown' ? Number.POSITIVE_INFINITY : b.pid
   return blockers.size === 0
     ? { open: true }
-    : { open: false, blockers: [...blockers.values()] }
+    : {
+        open: false,
+        blockers: [...blockers.values()].sort((a, b) => rank(a) - rank(b)),
+      }
 }

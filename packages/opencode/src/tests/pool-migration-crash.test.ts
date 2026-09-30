@@ -4,9 +4,14 @@
 // slot write), and the survivor checks what an older build and a newer build
 // can still do before re-running the migration to completion.
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { join } from 'node:path'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore } from '@cortexkit/common-auth/store'
-import { loadAccounts } from '@cortexkit/openai-auth-core/internal'
+import {
+  hashRefreshToken,
+  loadAccounts,
+} from '@cortexkit/openai-auth-core/internal'
+import packageJson from '../../package.json' with { type: 'json' }
 import {
   adoptHostSlotLogin,
   isPoolPlaceholder,
@@ -14,17 +19,22 @@ import {
   POOL_MIGRATION_KEY,
   type PoolTransferOutcome,
 } from '../core/pool-migration.ts'
+import { migrationFenceOpen, rpcStateRoot } from '../core/version-fence.ts'
+import { writePortFile } from '../rpc/port-file.ts'
 import {
   CRASH_EXIT_CODE,
+  FAR,
   type Harness,
   harness,
-  legacyServedTokens,
   legacyUsableFallbackIds,
   login,
+  MAIN_QUOTA,
   poolTokens,
+  refreshAsOlderBuild,
   runChild,
   SHORT_LOCKS,
   seedLegacyInstall,
+  T0,
 } from './fixtures/pool-migration-harness.ts'
 
 let h: Harness
@@ -58,13 +68,43 @@ const recorded = await (async () => {
 })()
 
 /**
- * Between removing `mainAccountId` from the config (which until then keeps
- * older builds off the `main` row) and writing the placeholder, an older
- * build can serve main's token from both the slot and the row. That gap is
- * a declared boundary of the migration; crashes at these two steps assert
- * that outcome instead of a single copy.
+ * From the pool row write until the placeholder write, the slot and the
+ * `main` row hold the same refresh token. An older build's background
+ * refresh ignores `mainAccountId` (that shield only steers its request
+ * routing), so after a crash in this window an older build refreshes the
+ * token from the row and then again from the slot, and the second refresh
+ * fails because the first spent it. Only a version older than the first
+ * pool-tolerant release does this, and the version fence keeps the migration
+ * from starting while one is alive; what remains is a downgrade to such a
+ * version after the crash, which is unsupported. Crash rows in this window
+ * assert exactly that double refresh, and that the fence would have been
+ * shut with that older build running.
  */
-const SHIELD_GAP = new Set(['after-shield-drop', 'before-placeholder-write'])
+const BOTH_COPIES = (() => {
+  const first = recorded.indexOf('store:add:after-state-write')
+  const last = recorded.indexOf('before-placeholder-write')
+  if (first < 0 || last < first) throw new Error('unexpected step sequence')
+  return new Set(recorded.slice(first, last + 1))
+})()
+
+/**
+ * The version fence as the crashed migrator would have seen it had the
+ * older build been running: this test process plays that older build and
+ * registers the way every plugin version does (an RPC port file, no
+ * heartbeat), and the crashed child is the migrating process.
+ */
+async function fenceWithOlderBuildRunning(migratorPid: number | undefined) {
+  const stateHome = join(h.dir, 'xdg-state')
+  await writePortFile(
+    join(rpcStateRoot(stateHome), 'openai-auth-0123456789abcdef'),
+    { pid: process.pid, port: 1, token: 'older-build' },
+  )
+  return migrationFenceOpen({
+    stateHome,
+    currentVersion: packageJson.version,
+    ...(migratorPid !== undefined ? { selfPid: migratorPid } : {}),
+  })
+}
 
 describe('a crash at every step of the migration', () => {
   it('walks every store write, every module write and both slot-write sides', () => {
@@ -107,14 +147,19 @@ describe('a crash at every step of the migration', () => {
       const byId = new Map(legacy?.accounts.map((a) => [a.id, a]))
       expect(byId.get('fb1')).toMatchObject({ refresh: 'r-fb1' })
       expect(byId.get('key1')).toMatchObject({ apiKey: 'sk-key1' })
-      // ...and serves main from exactly one place (slot or `main` row),
-      // except in the declared shield gap, where it can see both.
-      const served = await legacyServedTokens(h)
-      expect(served).toEqual(
-        SHIELD_GAP.has(step)
-          ? ['r-fb1', 'r-main', 'r-main']
-          : ['r-fb1', 'r-main'],
-      )
+      // ...and its own refresh paths never refresh one token twice, except
+      // in the declared window where the slot and the row share it.
+      const older = await refreshAsOlderBuild(h)
+      expect(older.submitted).toContain('r-main')
+      if (BOTH_COPIES.has(step)) {
+        expect(older.refreshedTwice).toEqual(['r-main'])
+        expect(await fenceWithOlderBuildRunning(child.pid)).toMatchObject({
+          open: false,
+          blockers: [{ pid: process.pid, version: 'unknown' }],
+        })
+      } else {
+        expect(older.refreshedTwice).toEqual([])
+      }
 
       // A newer build can read the pool (or sees a legacy roster it will
       // migrate), no two rows share a token, and main's token is reachable.
@@ -153,14 +198,65 @@ describe('a crash at every step of the migration', () => {
       expect(config[POOL_MIGRATION_KEY].migratedAt).toBeNumber()
       expect(config.routing).toEqual({ mode: 'fallback-first' })
       expect(config.webSockets).toBe(true)
-      expect(await legacyServedTokens(h)).toEqual(['r-fb1', 'r-main'])
+      expect((await refreshAsOlderBuild(h)).refreshedTwice).toEqual([])
       expect(await legacyUsableFallbackIds(h)).toEqual(['fb1', 'main'])
     }, 30_000)
   }
 })
 
+describe('the carry-over of the legacy main state', () => {
+  it('a crash after the carry-over and a re-run carry it once: no quota reading or backoff is doubled', async () => {
+    await seedLegacyInstall(h)
+    const child = await runChild({
+      dir: h.dir,
+      mode: 'migrate',
+      exitAtName: 'after-carry-over',
+    })
+    expect(child.code).toBe(CRASH_EXIT_CODE)
+    const carried = (await h.row('main'))?.quota
+    const expectedQuota = {
+      limits: [
+        {
+          scope: 'all',
+          label: 'primary',
+          kind: 'reading',
+          checkedAt: MAIN_QUOTA.primary.checkedAt,
+          usedPercent: 40,
+          resetsAt: MAIN_QUOTA.primary.resetsAt,
+          windowMinutes: 300,
+        },
+        {
+          scope: 'all',
+          label: 'secondary',
+          kind: 'reading',
+          checkedAt: MAIN_QUOTA.secondary.checkedAt,
+          usedPercent: 10,
+          resetsAt: MAIN_QUOTA.secondary.resetsAt,
+          windowMinutes: 10_080,
+        },
+      ],
+    }
+    expect(carried).toEqual(expectedQuota)
+
+    // The re-run resumes at the row and carries everything over again.
+    expect(
+      await settle(() => migrateToPool(h.deps({ ...SHORT_LOCKS }))),
+    ).toMatchObject({ status: 'completed', operation: 'resumed' })
+    expect((await h.row('main'))?.quota).toEqual(expectedQuota)
+    const legacyMain = (await h.state()).accounts.main
+    expect(legacyMain.quota).toEqual(MAIN_QUOTA)
+    expect(legacyMain.lastRefreshError).toEqual({
+      message: 'Token refresh failed: 500',
+      checkedAt: T0,
+      nextRetryAt: FAR,
+      retryCount: 1,
+      tokenHash: hashRefreshToken('r-main'),
+    })
+  }, 30_000)
+})
+
 describe('the shield that keeps older builds off the main row', () => {
-  it('an install without mainAccountId is shielded too: after a crash with the row written, an older build serves main only from the slot', async () => {
+  it('an install without mainAccountId is shielded too: after a crash with the row written, an older build routes requests for main only to the slot', async () => {
     await seedLegacyInstall(h)
     const config = await h.config()
     delete config.mainAccountId
@@ -173,7 +269,6 @@ describe('the shield that keeps older builds off the main row', () => {
     expect(child.code).toBe(CRASH_EXIT_CODE)
     expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main'])
     expect((await h.slotValue())?.refresh).toBe('r-main')
-    expect(await legacyServedTokens(h)).toEqual(['r-fb1', 'r-main'])
     expect(await legacyUsableFallbackIds(h)).toEqual(['fb1'])
   }, 30_000)
 })

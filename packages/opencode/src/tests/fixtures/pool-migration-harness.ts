@@ -3,7 +3,13 @@
 // slot (so several processes can share it), and the checks a crash row runs.
 import { spawn } from 'node:child_process'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
-import { appendFile, readFile, rename, writeFile } from 'node:fs/promises'
+import {
+  appendFile,
+  copyFile,
+  readFile,
+  rename,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -11,18 +17,17 @@ import { quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore, type PoolRow } from '@cortexkit/common-auth/store'
 import {
   type AccountPaths,
-  type AccountStorage,
   FallbackAccountManager,
   hashRefreshToken,
-  isOAuthAccount,
-  loadAccounts,
 } from '@cortexkit/openai-auth-core/internal'
 import {
   type HostSlotAdapter,
   isPoolPlaceholder,
+  POOL_PLACEHOLDER_REFRESH,
   type PoolMigrationDeps,
   type PoolMigrationFenceDeps,
 } from '../../core/pool-migration.ts'
+import { legacyRefreshMain } from './legacy-main-refresh.ts'
 
 /** A version fence with no older process running. */
 export const OPEN_FENCE = async () => ({ open: true as const })
@@ -243,24 +248,88 @@ export async function seedLegacyInstall(h: Harness): Promise<void> {
 }
 
 /**
- * The refresh tokens an older build would serve from: the slot's (unless it
- * holds the placeholder) plus every enabled OAuth roster row it does not skip
- * as a copy of main (`mainAccountId`), read with the legacy loader.
+ * A token endpoint that rotates refresh tokens the way OpenAI's does: each
+ * refresh token works once, and refreshing it returns a new one. It records
+ * every token submitted, so a token refreshed twice (the second attempt
+ * fails: the first spent it) shows up whichever caller made it.
  */
-export async function legacyServedTokens(h: Harness): Promise<string[]> {
-  const legacy = (await loadAccounts(h.paths)) as AccountStorage
-  const tokens: string[] = []
-  const slot = await h.slotValue()
-  if (slot && !isPoolPlaceholder(slot) && typeof slot.refresh === 'string')
-    tokens.push(slot.refresh)
-  for (const account of legacy.accounts) {
-    if (!isOAuthAccount(account) || account.corrupt) continue
-    if (account.enabled === false) continue
-    if (legacy.mainAccountId && account.accountId === legacy.mainAccountId)
-      continue
-    tokens.push(account.refresh)
+export function singleUseTokenEndpoint() {
+  const submitted = new Map<string, number>()
+  let issued = 0
+  return {
+    async refresh(token: string) {
+      submitted.set(token, (submitted.get(token) ?? 0) + 1)
+      if (
+        !token ||
+        token === POOL_PLACEHOLDER_REFRESH ||
+        (submitted.get(token) ?? 0) > 1
+      )
+        throw new Error('invalid_grant: refresh token already used or unknown')
+      issued++
+      return {
+        access: jwt('rotated', String(issued)),
+        refresh: `${token}~${issued}`,
+        expires: FAR + 3_600_000,
+      }
+    },
+    /** Real refresh tokens submitted more than once. */
+    refreshedTwice(): string[] {
+      return [...submitted]
+        .filter(
+          ([token, count]) => count > 1 && token !== POOL_PLACEHOLDER_REFRESH,
+        )
+        .map(([token]) => token)
+        .sort()
+    },
+    submitted(): string[] {
+      return [...submitted.keys()].sort()
+    },
   }
-  return tokens.sort()
+}
+
+/**
+ * Runs an older build's own refresh paths against a copy of the install (the
+ * source is left as it is, for the run that follows): the background refresh
+ * of every due roster row (the real `FallbackAccountManager`), then the
+ * refresh of the slot credential (`legacyRefreshMain`, vendored from the
+ * older plugin entry). The older build's clock is set past every token's
+ * expiry and every recorded backoff, so each path refreshes whatever it would
+ * ever refresh. Returns the refresh tokens that were refreshed twice.
+ */
+export async function refreshAsOlderBuild(
+  source: Harness,
+): Promise<{ refreshedTwice: string[]; submitted: string[] }> {
+  const copy = harness()
+  try {
+    for (const [from, to] of [
+      [source.paths.configPath, copy.paths.configPath],
+      [source.paths.statePath, copy.paths.statePath],
+      [source.authPath, copy.authPath],
+    ] as const)
+      if (existsSync(from)) await copyFile(from, to)
+    const endpoint = singleUseTokenEndpoint()
+    const manager = new FallbackAccountManager({
+      paths: copy.paths,
+      custody: { readManifest: async () => ({ ok: false, reason: 'absent' }) },
+      now: () => FAR + 60_000,
+      refreshFn: async ({ refreshToken }) => ({
+        ...(await endpoint.refresh(refreshToken)),
+        expiresIn: 3_600,
+      }),
+    })
+    await manager.refreshDueAccounts()
+    await legacyRefreshMain({
+      paths: copy.paths,
+      slot: copy.slot,
+      refresh: endpoint.refresh,
+    }).catch(() => {})
+    return {
+      refreshedTwice: endpoint.refreshedTwice(),
+      submitted: endpoint.submitted(),
+    }
+  } finally {
+    copy.cleanup()
+  }
 }
 
 /** The legacy fallback manager's own usable set (real older-build code). */
@@ -301,6 +370,7 @@ export interface ChildTask {
 }
 
 export interface ChildRun {
+  pid: number | undefined
   code: number | null
   steps: string[]
   outcome?: Json
@@ -328,6 +398,7 @@ export function runChild(task: ChildTask): Promise<ChildRun> {
         .map((line) => line.slice('step:'.length))
       const outcomeLine = lines.find((line) => line.startsWith('outcome:'))
       resolve({
+        pid: child.pid,
         code,
         steps,
         output: out,
