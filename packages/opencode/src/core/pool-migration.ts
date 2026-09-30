@@ -27,7 +27,9 @@
 // takes the legacy locks, which covers an older process the fence could not
 // see: one started after the check. What the fence does not cover is a
 // downgrade, after a migration ran or crashed, to a version older than the
-// first release that tolerates the pool; that downgrade is unsupported.
+// release shipped ahead of this migration to run alongside the pool (the
+// first one that writes the process heartbeat `version-fence.ts` reads);
+// that downgrade is unsupported.
 
 import { readFile } from 'node:fs/promises'
 import {
@@ -1069,7 +1071,10 @@ async function completeTransfer(
 
 const deferredLogged = new Set<string>()
 
-/** The version fence, fail-closed: a fence that throws keeps it shut. */
+/**
+ * The processes that block the migration. A fence check that throws counts
+ * as blocked: the migration then writes nothing, as for an older process.
+ */
 async function fenceBlockers(
   fence: () => Promise<VersionFenceResult>,
 ): Promise<VersionFenceBlocker[]> {

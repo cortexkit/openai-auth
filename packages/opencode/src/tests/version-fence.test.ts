@@ -29,7 +29,8 @@ beforeEach(() => {
   live = new Set([SELF])
 })
 afterEach(() => {
-  // Undo the permission changes some rows make, so the directory can go.
+  // Some tests make a directory unreadable; restore it so cleanup can
+  // remove the temporary state home.
   for (const dir of [processHeartbeatDir(stateHome), rpcStateRoot(stateHome)])
     try {
       chmodSync(dir, 0o700)

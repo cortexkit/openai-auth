@@ -147,8 +147,9 @@ describe('a crash at every step of the migration', () => {
       const byId = new Map(legacy?.accounts.map((a) => [a.id, a]))
       expect(byId.get('fb1')).toMatchObject({ refresh: 'r-fb1' })
       expect(byId.get('key1')).toMatchObject({ apiKey: 'sk-key1' })
-      // ...and its own refresh paths never refresh one token twice, except
-      // in the declared window where the slot and the row share it.
+      // ...and the older build's refresh paths never refresh one token
+      // twice, except in the declared BOTH_COPIES window, where the slot and
+      // the `main` row hold the same token.
       const older = await refreshAsOlderBuild(h)
       expect(older.submitted).toContain('r-main')
       if (BOTH_COPIES.has(step)) {
@@ -238,7 +239,8 @@ describe('the carry-over of the legacy main state', () => {
     }
     expect(carried).toEqual(expectedQuota)
 
-    // The re-run resumes at the row and carries everything over again.
+    // The re-run resumes the recorded transfer after the `main` row write
+    // and carries the legacy quota and backoff over a second time.
     expect(
       await settle(() => migrateToPool(h.deps({ ...SHORT_LOCKS }))),
     ).toMatchObject({ status: 'completed', operation: 'resumed' })

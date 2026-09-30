@@ -685,7 +685,8 @@ describe('the plan is made again under the row lock', () => {
     await migrated()
     await h.setSlot(login('acct-main', 'r-main-2'))
     const mainHeld = await holdRowLock('main')
-    // An older build refreshes fb1 for the whole run.
+    // An older build holds the fb1 row's fallback refresh lock for the whole
+    // run, as it does while it refreshes that row.
     const fb1Held = await holdRowLock('fb1')
     const hook = sleepThat(async () => {
       await h.setSlot(login('acct-fb1', 'r-fb1-2'))
@@ -702,7 +703,8 @@ describe('the plan is made again under the row lock', () => {
       refresh: 'r-main',
     })
     expect((await h.slotValue())?.refresh).toBe('r-fb1-2')
-    // Once the older build is done with fb1, the next run adopts into it.
+    // Once the older build has released the fb1 lock, the next run adopts
+    // the slot login into the fb1 row.
     expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
       status: 'completed',
       rowId: 'fb1',
@@ -797,7 +799,8 @@ describe('the slot reads at the placeholder fence', () => {
       expect((await h.config())[POOL_MIGRATION_KEY].pending).toMatchObject({
         rowId: 'acct-new',
       })
-      // With the host readable again, the next run finishes the transfer.
+      // Once the host slot reads normally again, the next run resumes the
+      // recorded transfer and writes the placeholder.
       expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
         status: 'completed',
         rowId: 'acct-new',
@@ -822,7 +825,7 @@ describe('the version fence', () => {
     })
     expect(await h.bytes()).toEqual(before)
     expect(await h.placeholderWrites()).toBe(0)
-    // Once it is gone the migration runs.
+    // Once the fence opens (no older process left), the migration runs.
     expect(await migrateToPool(h.deps())).toMatchObject({
       status: 'completed',
       rowId: 'main',
