@@ -124,6 +124,15 @@ import {
   withoutPoolMainRow,
 } from './core/pool-main'
 import {
+  createPoolLifecycle,
+  type PoolLifecycle,
+  type PoolLifecycleDeps,
+} from './core/pool-lifecycle'
+import {
+  PoolTransferPendingError,
+  poolTransferPendingInConfigFile,
+} from './core/pool-migration'
+import {
   type ProcessHeartbeatHandle,
   startProcessHeartbeat,
 } from './core/process-heartbeat'
@@ -591,6 +600,17 @@ export {
 } from '@cortexkit/openai-auth-core/internal'
 
 interface CodexAuthPluginOptions {
+  /**
+   * Test seams for the background account-pool migration and adoption
+   * (`core/pool-lifecycle.ts`): its fence, timers, run functions and
+   * per-run dependencies.
+   */
+  poolMigration?: Partial<
+    Pick<
+      PoolLifecycleDeps,
+      'fence' | 'migrate' | 'adopt' | 'timers' | 'random' | 'runDeps' | 'log'
+    >
+  >
   issuer?: string
   codexApiEndpoint?: string
   experimentalWebSockets?: boolean
@@ -1269,6 +1289,23 @@ export async function CodexAuthPlugin(
   // This instance's entry in the per-process heartbeat directory, written by
   // the first loader run and dropped on dispose.
   let processHeartbeat: Promise<ProcessHeartbeatHandle> | undefined
+  // Background account-pool migration and adoption of later host-slot
+  // logins. Needs the host slot's full adapter (get, set and all); a client
+  // without it (some embedders and tests) runs without the pool migration.
+  const poolLifecycle: PoolLifecycle | undefined =
+    typeof (hostAuth as Partial<typeof hostAuth>).get === 'function' &&
+    typeof (hostAuth as Partial<typeof hostAuth>).all === 'function'
+      ? createPoolLifecycle({
+          paths: () => getAccountPaths(getConfigPath()),
+          slot: {
+            get: (request) => hostAuth.get(request),
+            set: (request) => hostAuth.set(request as never),
+            all: () => hostAuth.all(),
+          },
+          version: PackageVersion,
+          ...options.poolMigration,
+        })
+      : undefined
   // The runtime accepts this factory-owned bootstrap rather than opening a second connection.
   // allowing the runtime path to open a second Claustrum connection.
   const custodyBootstrap: CustodyBootstrap = {}
@@ -1435,6 +1472,9 @@ export async function CodexAuthPlugin(
         : {}),
       custodyQuotaDeps: custodyQuotaDepsForAuthMenu,
     },
+    onMainSlotWritten: async () => {
+      await poolLifecycle?.requestAdoption()
+    },
   })
   const wrapCustodyAuthorize =
     (
@@ -1468,12 +1508,16 @@ export async function CodexAuthPlugin(
                     ? { access: auth.access, refresh: auth.refresh }
                     : undefined
                 },
-                onObserved: ({ access, refresh }) =>
-                  recordVerifiedInProcessMainLogin({
+                onObserved: ({ access, refresh }) => {
+                  // The host has written this login into its slot; on a
+                  // migrated install it moves into the pool (not awaited).
+                  void poolLifecycle?.requestAdoption()
+                  return recordVerifiedInProcessMainLogin({
                     type: 'oauth',
                     access,
                     refresh,
-                  }),
+                  })
+                },
                 release: () => mutex.release(),
                 warn: (message) =>
                   custodyOptions?.warn?.(message) ??
@@ -1524,6 +1568,7 @@ export async function CodexAuthPlugin(
 
   return {
     async dispose() {
+      poolLifecycle?.dispose()
       backgroundQuotaRefresh.stop()
       sidebarBookkeeping?.stop()
       custodyRuntimeRef?.dispose()
@@ -1705,6 +1750,10 @@ export async function CodexAuthPlugin(
           logger: createLogger('heartbeat'),
         })
         await processHeartbeat
+        // The account-pool migration waits for the heartbeat: it is how this
+        // process shows up to another one's version fence. Never awaited
+        // here, and it cannot throw.
+        poolLifecycle?.start()
         const auth = await getAuth()
         if (auth.type !== 'oauth') return {}
 
@@ -2289,6 +2338,18 @@ export async function CodexAuthPlugin(
               let leaseTokenHash: string | undefined = refreshTokenHash
               try {
                 await updateMainRefreshState((nextStorage) => {
+                  // Checked in the same locked write that sets the lease:
+                  // either the migration's pending record was written first
+                  // and this refresh never starts, or this lease was, and
+                  // the migration sees it and plans again (see the
+                  // lock-order note in core/pool-migration.ts).
+                  if (
+                    poolTransferPendingInConfigFile(
+                      getConfigPath(),
+                      current.refresh,
+                    )
+                  )
+                    throw new PoolTransferPendingError()
                   nextStorage.refresh = nextStorage.refresh ?? {}
                   nextStorage.refresh.mainRefreshLeaseId = leaseId
                   nextStorage.refresh.mainRefreshLeaseUntil =
@@ -2326,19 +2387,21 @@ export async function CodexAuthPlugin(
                 leaseTokenHash = undefined
                 return tokens
               } catch (error) {
-                if (!isAuthPersistError(error)) {
-                  await updateMainRefreshState((nextStorage) => {
-                    nextStorage.refresh = nextStorage.refresh ?? {}
-                    nextStorage.refresh.mainLastRefreshError =
-                      buildRefreshOperationError({
-                        error,
-                        now: Date.now(),
-                        refreshToken: current.refresh,
-                        previous: nextStorage.refresh.mainLastRefreshError,
-                      })
-                  }).catch(() => {})
+                if (!(error instanceof PoolTransferPendingError)) {
+                  if (!isAuthPersistError(error)) {
+                    await updateMainRefreshState((nextStorage) => {
+                      nextStorage.refresh = nextStorage.refresh ?? {}
+                      nextStorage.refresh.mainLastRefreshError =
+                        buildRefreshOperationError({
+                          error,
+                          now: Date.now(),
+                          refreshToken: current.refresh,
+                          previous: nextStorage.refresh.mainLastRefreshError,
+                        })
+                    }).catch(() => {})
+                  }
+                  throw error
                 }
-                throw error
               } finally {
                 if (leaseTokenHash) {
                   await updateMainRefreshState((nextStorage) => {
@@ -2355,6 +2418,14 @@ export async function CodexAuthPlugin(
                 }
                 await fileLock.release().catch(() => {})
               }
+              // Reached only when a pool transfer covers this token: nothing
+              // was sent, the lock is released (the migration needs it to
+              // write the placeholder), and this waits for the slot to
+              // change. The placeholder there ends the wait with
+              // MainAccountInPoolError, which callers serve from row `main`.
+              const concurrent = await waitForConcurrentMainRefresh(current)
+              if (concurrent) return concurrent
+              throw new Error('Codex OAuth refresh is already in progress')
             })().finally(() => {
               mainRefreshPromise = undefined
             })
@@ -4305,9 +4376,19 @@ export async function CodexAuthPlugin(
             // the pool row `main` (and that row is not also a fallback).
             let pooledMain: PoolMainAccess | undefined
             let mainInPool = isPoolMainPlaceholder(currentAuth)
-            const usePooledMain = async () => {
+            // A real credential in the slot of a migrated install is a later
+            // login: this request serves it as always, and it is adopted into
+            // the pool in the background.
+            if (
+              poolLifecycle?.migrated() &&
+              !mainInPool &&
+              currentAuth.refresh?.trim() &&
+              classifyMainAuthSlot(currentAuth).kind === 'real'
+            )
+              poolLifecycle.noticeRealSlot(currentAuth.refresh)
+            const usePooledMain = async (storage = reqStorage) => {
               mainInPool = true
-              pooledMain = await resolvePooledMain(reqStorage)
+              pooledMain = await resolvePooledMain(storage)
               if (pooledMain) {
                 primaryAccess = pooledMain.token
                 primaryProvenance =
@@ -4355,9 +4436,13 @@ export async function CodexAuthPlugin(
                 } catch (error) {
                   if (isAuthPersistError(error)) throw error
                   // Main moved into the account pool while this request
-                  // waited; serve it from there.
+                  // waited; serve it from there. The store read at the
+                  // start of the request predates the move (row `main` may
+                  // not have existed yet), so it is read again.
                   if (error instanceof MainAccountInPoolError) {
-                    await usePooledMain()
+                    await usePooledMain(
+                      await loadAccounts(getAccountPaths(getConfigPath())),
+                    )
                   }
                   // Otherwise use the stale token on refresh failure.
                 }
