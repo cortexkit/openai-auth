@@ -199,8 +199,9 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
         log.warn('account pool migration will be tried again', { outcome })
       schedule(retryDelay())
     }
-    // `deferred-claustrum`: custody mode keeps the legacy store; the module
-    // has logged it. A later process start looks again.
+    // `deferred-claustrum`: the install keeps its credentials in Claustrum
+    // custody, which stays on the legacy store, so there is nothing to retry
+    // (`pool-migration.ts` logs this once). A later process start looks again.
   }
 
   async function runAdoption(): Promise<void> {

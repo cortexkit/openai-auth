@@ -503,8 +503,8 @@ export function poolTransferPendingFor(
 }
 
 /**
- * `poolTransferPendingFor` over the config file on disk, read synchronously so
- * it can run inside a `mutateAccounts` callback (which holds the `save` lock
+ * Runs `poolTransferPendingFor` on the config file on disk, read synchronously
+ * so it can run inside a `mutateAccounts` callback (which holds the `save` lock
  * pair the record is written under). A file that cannot be read or parsed
  * holds no record this check can honour, so it answers false.
  */
@@ -1324,8 +1324,9 @@ async function run(
     if (error instanceof PoolOperationError)
       return {
         status: 'retry',
-        // A legacy lock the store waited for is the same contention as one
-        // this module waited for itself.
+        // The store ran out of time waiting for a lock (a legacy lock passed
+        // to it included): the same retryable contention as a lock this
+        // module waited for itself.
         reason:
           error.kind === 'lock-contention'
             ? 'lock-contention'

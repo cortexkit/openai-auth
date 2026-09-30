@@ -84,7 +84,8 @@ const setSlot = (value: unknown) =>
   slot.set({ path: { id: 'openai' }, body: value })
 
 async function waitFor(check: () => Promise<boolean>, what: string) {
-  // Inside the default five-second test timeout, so a miss names itself.
+  // Shorter than the default five-second test timeout, so a condition that
+  // never holds fails with its own name rather than a bare timeout.
   const deadline = Date.now() + 4_000
   while (Date.now() < deadline) {
     if (await check()) return
