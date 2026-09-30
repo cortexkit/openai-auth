@@ -908,7 +908,10 @@ async function carryLegacyMainState(ctx: Context, row: PoolRow): Promise<void> {
  * whose wire identity equals `mainAccountId`, which is what hides the
  * migrated `main` row from them while the slot may still hold the same
  * token; this runs only once the slot no longer does (the placeholder is in,
- * or the slot moved on), and from then on they must see the row.
+ * or the slot moved on). From then on the row is the only live copy, so
+ * older builds must see it: otherwise a pre-tolerant build could not use the
+ * account as a fallback, and a tolerant one would not refresh the row in the
+ * background.
  */
 async function writeFinished(
   ctx: Context,

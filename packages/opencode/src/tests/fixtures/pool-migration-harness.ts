@@ -273,7 +273,8 @@ export function singleUseTokenEndpoint() {
       return {
         access: jwt('rotated', String(issued)),
         refresh: `${token}~${issued}`,
-        // Well past the older build's clock (below), so a rotated token is
+        // Thirty days past FAR, well beyond the older build's clock in
+        // `refreshAsOlderBuild` (FAR plus a minute), so a rotated token is
         // not due again within the same run.
         expires: FAR + 30 * 86_400_000,
       }
@@ -325,7 +326,8 @@ export interface OlderBuildRun {
  * (refreshing the row as the main account, past the shield). Otherwise, and
  * always for a pre-tolerant build, it refreshes the slot through
  * `legacyRefreshMain` (vendored from the pre-tolerant plugin entry; the
- * tolerant entry's version is a closure in `index.ts`). The tolerant one
+ * tolerant entry's own slot refresh lives inside the plugin loader in
+ * `index.ts` and cannot be imported). The tolerant one
  * also honours the main refresh backoff and re-reads the slot under its
  * lock, which only ever makes it refresh less, so the vendored path
  * over-counts rather than hides a double refresh.
@@ -345,9 +347,11 @@ export async function refreshAsOlderBuild(
     const endpoint = singleUseTokenEndpoint()
     const now = () => FAR + 60_000
     // The legacy writers stamp `lastRefreshedAt` as `expires - expiresIn`
-    // and distrust a stamp far ahead of the real clock, which the clock
-    // above would produce; this lifetime puts the stamp at the real time of
-    // the refresh, so a rotated token wins the writer's newer-token check.
+    // and ignore a stamp more than five minutes ahead of the real clock. A
+    // lifetime measured from FAR would put the stamp decades ahead and the
+    // writer would keep the older token; measuring `expiresIn` from the
+    // real clock puts the stamp at the real time of the refresh, so a
+    // rotated token wins the writer's newer-token check.
     const refresh = async (token: string) => {
       const tokens = await endpoint.refresh(token)
       return {
