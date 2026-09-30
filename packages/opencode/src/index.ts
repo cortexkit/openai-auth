@@ -1157,13 +1157,14 @@ export async function CodexAuthPlugin(
   const ownedRpcServers = new Map<string, RpcServerAdoption>()
   let activeFallbackManager: FallbackAccountManager | undefined
   let sidebarStateFileForEvents: string | undefined
-  // Sticky pins this process placed and is using but whose write may not have
-  // reached the sidebar file yet (see StickyPinOverlayEntry). Kept here rather
-  // than in the loader so session deletion and dispose can reach it.
+  // Sticky-balanced session-to-account pins this process placed and is using,
+  // whose writes may not have reached the sidebar file yet (see
+  // StickyPinOverlayEntry). Kept here rather than in the loader so session
+  // deletion and dispose can reach them.
   const stickyPinOverlay: StickyPinOverlay = new Map()
   let stickyPinOverlayFile: string | undefined
-  // Background writer for the request path's sidebar bookkeeping; the loader
-  // installs one per run.
+  // Background writer for the sidebar updates requests make (routing display,
+  // pushed quota, sticky pins); the loader installs one per run.
   let sidebarBookkeeping: SidebarBookkeepingQueue | undefined
   // Custody runtime — assigned inside the loader so dispose can close the
   // vendored client and clear the custody tick timer after the loader has
@@ -2370,8 +2371,9 @@ export async function CodexAuthPlugin(
           })
           const fallbackPush = Boolean(accountId && accountId !== 'main')
           sidebarBookkeepingQueue.enqueue('machine-state', 'quota', () => {
-            // Built when the write starts (again on a retry), from the
-            // quota cache and the newest store snapshot at that moment.
+            // The sidebar state is built when this queued write starts (and
+            // again on a retry), from the in-memory quota cache and the
+            // newest account-store snapshot at that moment.
             const latestStorage = lastRequestStorage
             return writeMachineSidebarState(
               quotaManager,
@@ -2514,16 +2516,16 @@ export async function CodexAuthPlugin(
         })
         sidebarBookkeeping = sidebarBookkeepingQueue
         if (stickyPinOverlayFile !== boundSidebarFile) {
-          // Pins belong to one sidebar file; a loader bound to another file
-          // must not carry them over.
+          // Session-to-account pins belong to one sidebar file; clear them when
+          // this loader is bound to a different file.
           stickyPinOverlay.clear()
           stickyPinOverlayFile = boundSidebarFile
         }
 
         // Records which account served a request, for the sidebar display.
         // Returns at once; the writes run in the background. `stickyState` is
-        // the request's sidebar snapshot with this process's pins applied; in
-        // sticky mode a parent session shows its own pin from it.
+        // the request's sidebar snapshot with this process's session-to-account
+        // pins applied, so sticky mode can show a parent session's own pin.
         function queueRequestSidebarRouting(
           sessionId: string | undefined,
           parentSessionId: string | undefined,

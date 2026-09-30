@@ -382,7 +382,7 @@ describe('request path never waits on bookkeeping', () => {
       expect(whileHeld?.activeRouting?.[sessionId]).toBeUndefined()
 
       await releaseLocks()
-      const served = seen[0]
+      const served = seen[0] ?? ''
       const servedId =
         served === 'Bearer main-access-token'
           ? 'main'
