@@ -7,6 +7,7 @@ import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
@@ -75,6 +76,36 @@ describe('the version fence', () => {
     portFile(11)
     portFile(12)
     expect(await fence()).toEqual({ open: true })
+  })
+
+  it('reads heartbeats exactly as the plugin writes them (process-heartbeat.ts)', async () => {
+    // The writer's output: `${JSON.stringify(heartbeat)}\n` in a 0600 file,
+    // written to `<pid>.json.<uuid>.tmp` and renamed into a 0700 directory.
+    const dir = processHeartbeatDir(stateHome)
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const write = (pid: number, version: string) => {
+      const target = join(dir, `${pid}.json`)
+      const temporary = `${target}.${crypto.randomUUID()}.tmp`
+      writeFileSync(
+        temporary,
+        `${JSON.stringify({ pid, version, startedAt: 1_900_000_000_000 })}\n`,
+        { mode: 0o600 },
+      )
+      renameSync(temporary, target)
+      return target
+    }
+    live.add(71).add(72).add(73)
+    write(71, CURRENT)
+    portFile(71)
+    expect(await fence()).toEqual({ open: true })
+    const older = write(72, '0.11.0')
+    portFile(72)
+    // A temporary file left by an interrupted write is not a heartbeat.
+    writeFileSync(join(dir, '73.json.0000.tmp'), '{"pid":73', { mode: 0o600 })
+    expect(await fence()).toEqual({
+      open: false,
+      blockers: [{ pid: 72, version: '0.11.0', detail: older }],
+    })
   })
 
   it('is shut by a live heartbeat of an older version', async () => {
