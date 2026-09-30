@@ -15,12 +15,30 @@
 // record, written before a row is touched, lets any later run tell whether
 // an interrupted transfer never happened, finished, or was overtaken.
 //
-// Older openai-auth builds may run against the same files at the same time.
-// They refresh the slot credential under the `main-refresh` file lock plus a
-// lease in `state.main`, and every enabled roster row (the migrated `main`
-// row included) under a per-account fallback lock. Every step here that
-// copies a credential takes those same locks, so an old and a new build can
-// never rotate one refresh token at once.
+// While a transfer is in flight the slot and the row may hold the same
+// token, and `mainAccountId` (the shield) names the row's identity so older
+// builds leave the row alone. The shield is dropped only after the
+// placeholder is in the slot, in the same write that clears the record, so
+// the two copies never stand unshielded, crash or not.
+//
+// Pre-tolerant openai-auth builds (0.11.0 and earlier) honour the shield
+// only when picking a fallback for a request: their background refresh
+// refreshes every enabled roster row (the migrated `main` row included)
+// under a per-account fallback lock, and the slot credential under the
+// `main-refresh` lock plus a lease in `state.main`. After a crash with both
+// copies in place they would refresh one token twice, and with the
+// placeholder in while the shield is still up they cannot serve main at
+// all. So the migration runs only while no older process is alive (the
+// version fence, `version-fence.ts`, is a required input of
+// `migrateToPool`). The tolerant release shipped ahead of this migration
+// honours the shield in its background refresh too, and serves main from
+// row `main` whenever the slot holds the placeholder. Every step here that
+// copies a credential still takes the legacy locks, which covers an older
+// process the fence could not see: one started after the check. What the
+// fence does not cover is a downgrade, after a migration ran or crashed, to
+// a pre-tolerant version (older than the first release that writes the
+// process heartbeat `version-fence.ts` reads); that downgrade is
+// unsupported.
 
 import { readFile } from 'node:fs/promises'
 import {
@@ -61,6 +79,10 @@ import {
   mainSlotFamilyFingerprint,
 } from './custody-host-slot.ts'
 import { MAIN_REFRESH_LOCK_NAME } from './custody-transition.ts'
+import type {
+  VersionFenceBlocker,
+  VersionFenceResult,
+} from './version-fence.ts'
 
 const PROVIDER = 'openai'
 
@@ -124,7 +146,6 @@ export type PoolMigrationStep =
   | 'after-row-write'
   | 'after-verify'
   | 'after-carry-over'
-  | 'after-shield-drop'
   | 'before-placeholder-write'
   | 'after-placeholder-write'
   | 'after-record-clear'
@@ -188,6 +209,16 @@ export type SlotNothingKind =
 export type PoolTransferOutcome =
   /** Custody mode: the legacy store stays in charge; nothing was written. */
   | { status: 'deferred-claustrum' }
+  /**
+   * An openai-auth process older than this one is running (see
+   * `version-fence.ts`); nothing was written. The migration runs once they
+   * are gone.
+   */
+  | {
+      status: 'deferred'
+      reason: 'older-version-running'
+      blockers: VersionFenceBlocker[]
+    }
   /** Migration already recorded as done; nothing was imported. */
   | { status: 'already-migrated' }
   /** Adoption asked for before the migration ran. */
@@ -872,10 +903,15 @@ async function carryLegacyMainState(ctx: Context, row: PoolRow): Promise<void> {
 
 /**
  * Bookkeeping written once a transfer (or a migration with nothing to
- * import) is over: the record goes, and `mainAccountId` goes with it. Older
- * builds skip every roster row whose wire identity equals `mainAccountId`,
- * which is what hides the migrated `main` row from them while the slot still
- * holds the same token; once the slot no longer serves it they must see it.
+ * import) is over, in one write: the record goes, `mainAccountId` goes with
+ * it, and a migration is marked done. Older builds skip every roster row
+ * whose wire identity equals `mainAccountId`, which is what hides the
+ * migrated `main` row from them while the slot may still hold the same
+ * token; this runs only once the slot no longer does (the placeholder is in,
+ * or the slot moved on). From then on the row is the only live copy, so
+ * older builds must see it: otherwise a pre-tolerant build could not use the
+ * account as a fallback, and a tolerant one would not refresh the row in the
+ * background.
  */
 async function writeFinished(
   ctx: Context,
@@ -910,8 +946,11 @@ async function clearRecord(ctx: Context): Promise<void> {
 }
 
 /**
- * Writes the record and, while the slot and the row share one token, shields
- * the row from older builds by naming its identity in `mainAccountId`.
+ * Writes the record and, while the slot and the row may share one token,
+ * shields the row from older builds by naming its identity in
+ * `mainAccountId`. Tolerant builds honour the shield in request routing and
+ * in background refresh; pre-tolerant builds only in request routing, which
+ * is why the migration itself waits for the version fence.
  */
 async function writeRecord(
   ctx: Context,
@@ -948,12 +987,24 @@ async function finishTransfer(
     operation,
     placeholder,
   })
-  const current = viewOf(await ctx.slot.get({ path: { id: PROVIDER } }))
+  // This fence read decides whether the transfer may end without the
+  // placeholder ("the slot moved on"), which drops the record and the shield
+  // and leaves whatever the slot holds live. So it follows `readSlot`'s
+  // rule, never a single raw read: a transient absence while the host
+  // rewrites its file must not pass for a slot that moved on while it still
+  // holds the token the row now holds too. An unsettled read, or an auth map
+  // that reads empty (a torn read of the host file), ends the run retryably
+  // with the record kept; the next run resumes here.
+  const current = await readSlot(ctx)
+  if (current.kind === 'indeterminate')
+    return { status: 'retry', reason: 'host-slot-indeterminate' }
   if (current.kind === 'placeholder') {
     await writeFinished(ctx, mode)
     await ctx.onStep('after-record-clear')
     return completed('already-present')
   }
+  if (Object.keys(await ctx.slot.all()).length === 0)
+    return { status: 'retry', reason: 'torn-read' }
   if (
     current.kind !== 'real' ||
     current.fingerprint !== record.slotFingerprint
@@ -962,21 +1013,13 @@ async function finishTransfer(
     await ctx.onStep('after-record-clear')
     return completed('slot-moved-on')
   }
-  if (Object.keys(await ctx.slot.all()).length === 0)
-    return { status: 'retry', reason: 'torn-read' }
-  // From here an older build may serve the row: the slot copy is about to go.
-  await updateConfig(ctx, (config) => {
-    if (!('mainAccountId' in config)) return false
-    delete config.mainAccountId
-    return true
-  })
-  await ctx.onStep('after-shield-drop')
-  const fenced = viewOf(await ctx.slot.get({ path: { id: PROVIDER } }))
-  if (fenced.kind !== 'real' || fenced.fingerprint !== record.slotFingerprint) {
-    await writeFinished(ctx, mode)
-    await ctx.onStep('after-record-clear')
-    return completed('slot-moved-on')
-  }
+  // The shield (`mainAccountId`) stays up across the placeholder write and
+  // goes only in `writeFinished` below, so there is no moment when the slot
+  // and the row share the token without it. Once the placeholder is in, a
+  // tolerant build serves main from row `main` itself (lifting the shield
+  // for that one path); its background refresh keeps skipping the row until
+  // the shield goes. A crash in between leaves exactly that, and the next
+  // run finds the placeholder and drops the shield.
   await ctx.onStep('before-placeholder-write')
   await ctx.slot.set({ path: { id: PROVIDER }, body: { ...POOL_PLACEHOLDER } })
   await ctx.onStep('after-placeholder-write')
@@ -1031,9 +1074,31 @@ async function completeTransfer(
 
 const deferredLogged = new Set<string>()
 
+/**
+ * The processes that block the migration. A fence check that throws counts
+ * as blocked: the migration then writes nothing, as for an older process.
+ */
+async function fenceBlockers(
+  fence: () => Promise<VersionFenceResult>,
+): Promise<VersionFenceBlocker[]> {
+  try {
+    const result = await fence()
+    return result.open ? [] : result.blockers
+  } catch (error) {
+    return [
+      {
+        pid: 'unknown',
+        version: 'unknown',
+        detail: error instanceof Error ? error.message : String(error),
+      },
+    ]
+  }
+}
+
 async function run(
   deps: PoolMigrationDeps,
   mode: 'migrate' | 'adopt',
+  fence?: () => Promise<VersionFenceResult>,
 ): Promise<PoolTransferOutcome> {
   const ctx = context(deps)
   let config: Record<string, unknown>
@@ -1050,6 +1115,26 @@ async function run(
     if (early.status === 'already-migrated' && 'mainAccountId' in config)
       await repairShield(ctx)
     return early
+  }
+  if (fence) {
+    // Checked before any lock or write. An older process starting after
+    // this check and before the run ends is not seen; the next run is.
+    const blockers = await fenceBlockers(fence)
+    if (blockers.length > 0) {
+      const key = `${ctx.paths.configPath}\0${blockers.map((b) => b.pid).join(',')}`
+      if (!deferredLogged.has(key)) {
+        deferredLogged.add(key)
+        ctx.log.info(
+          'account pool migration deferred: an older openai-auth version is running',
+          { blockers },
+        )
+      }
+      return {
+        status: 'deferred',
+        reason: 'older-version-running',
+        blockers,
+      }
+    }
   }
 
   let mainLock: HeldLock
@@ -1119,7 +1204,7 @@ async function runUnderMainLock(
       // exists. `mainAccountId` is deliberately kept here: older builds skip
       // the roster row whose identity it names, which keeps them off the
       // `main` row while the slot still holds the same token. It is dropped
-      // just before the placeholder lands (see `finishTransfer`).
+      // only after the placeholder has landed (see `finishTransfer`).
       await ctx.store.initialize()
       await ctx.onStep('after-pool-key-write')
       load = await ctx.store.read()
@@ -1190,6 +1275,10 @@ async function runUnderMainLock(
       const lockedSlot = await readSlotHonouringLease(ctx)
       if (lockedSlot.kind === 'retry')
         return { status: 'retry', reason: 'legacy-refresh-in-progress' }
+      // A `finish` plan does not depend on the slot, but an unsettled read
+      // here means the host is mid-write; leave the record for the next run.
+      if (lockedSlot.kind === 'indeterminate')
+        return { status: 'retry', reason: 'host-slot-indeterminate' }
       const second = plan(
         mode,
         readPoolMigrationBookkeeping(lockedConfig),
@@ -1226,16 +1315,26 @@ async function repairShield(ctx: Context): Promise<void> {
   })
 }
 
+/** What the migration needs beyond an adoption run. */
+export interface PoolMigrationFenceDeps {
+  /**
+   * The version fence (`migrationFenceOpen` in `version-fence.ts`, bound to
+   * this build's version). While it is shut the migration writes nothing.
+   */
+  fence: () => Promise<VersionFenceResult>
+}
+
 /**
  * One-time move of the host-slot credential into the pool row `main`
  * (fallback rows are already pool rows: same ids, same files). Local custody
- * mode only; under claustrum mode it writes nothing and logs once. A re-run
- * after completion does nothing.
+ * mode only; under claustrum mode it writes nothing and logs once. It also
+ * writes nothing while an older openai-auth process runs (`deferred`). A
+ * re-run after completion does nothing.
  */
 export function migrateToPool(
-  deps: PoolMigrationDeps,
+  deps: PoolMigrationDeps & PoolMigrationFenceDeps,
 ): Promise<PoolTransferOutcome> {
-  return run(deps, 'migrate')
+  return run(deps, 'migrate', deps.fence)
 }
 
 /**

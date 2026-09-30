@@ -10,6 +10,7 @@ import {
   type ChildTask,
   CRASH_EXIT_CODE,
   fileSlot,
+  OPEN_FENCE,
   SHORT_LOCKS,
 } from './pool-migration-harness.ts'
 
@@ -38,6 +39,7 @@ const deps = {
       reach(`store:${info.operation}:${step}`),
   },
   onStep: (step: string) => reach(step),
+  fence: OPEN_FENCE,
 }
 
 try {
