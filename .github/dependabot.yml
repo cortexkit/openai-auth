@@ -6,6 +6,11 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+    ignore:
+      # A test-only pin to the exact parser OpenCode 1 ships: the WebSocket
+      # recovery tests prove how that version reads our stream, so it moves
+      # when the supported OpenCode release moves, not when a new one exists.
+      - dependency-name: "@ai-sdk/openai"
 
   - package-ecosystem: "github-actions"
     directory: "/"
