@@ -1238,13 +1238,6 @@ const SYNTHETIC_COMPLETED_EVENT = {
 } as const
 
 /**
- * Surfaced when a stream dies after output has reached the reader.
- *
- * Must not contain any substring the host reads as retryable — no provider
- * wording, no response ids, no byte counts. `ws-pool.test.ts` pins it against
- * the host's pattern set.
- */
-/**
  * True for frames the host cannot turn into anything the reader sees.
  *
  * This decides whether a turn that dies mid-stream may be retried. Getting it
@@ -1279,6 +1272,15 @@ function isNonEmittingFrame(type: string): boolean {
   )
 }
 
+/**
+ * Surfaced when a stream dies after output has reached the reader.
+ *
+ * Must not contain any substring the host reads as retryable — no provider
+ * wording, no response ids, no byte counts. `ws-pool.test.ts` pins it against
+ * the host's pattern set. Its exact text is also matched by prefrontal, which
+ * auto-resumes a worker session that ends with it, so a wording change must
+ * be coordinated with that consumer.
+ */
 export const TERMINAL_AFTER_OUTPUT_MESSAGE =
   'The response ended early after part of it had already been shown. It was not sent again, because repeating it would duplicate that output and re-run any tools it had started. The transport log records what ended it.'
 
