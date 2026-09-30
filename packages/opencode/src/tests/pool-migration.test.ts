@@ -711,7 +711,9 @@ describe('the plan is made again under the row lock', () => {
     expect((await h.row('fb1'))?.credential).toMatchObject({
       refresh: 'r-fb1-2',
     })
-  })
+    // Two lock waits (one of them to its one-second bound) plus two full
+    // runs: more than the default five seconds on a loaded machine.
+  }, 15_000)
 })
 
 describe('the slot reads at the placeholder fence', () => {
