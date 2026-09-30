@@ -15,12 +15,19 @@
 // record, written before a row is touched, lets any later run tell whether
 // an interrupted transfer never happened, finished, or was overtaken.
 //
-// Older openai-auth builds may run against the same files at the same time.
-// They refresh the slot credential under the `main-refresh` file lock plus a
-// lease in `state.main`, and every enabled roster row (the migrated `main`
-// row included) under a per-account fallback lock. Every step here that
-// copies a credential takes those same locks, so an old and a new build can
-// never rotate one refresh token at once.
+// Older openai-auth builds refresh the slot credential under the
+// `main-refresh` file lock plus a lease in `state.main`, and every enabled
+// roster row (the migrated `main` row included, whatever `mainAccountId`
+// says) under a per-account fallback lock. The locks keep one refresh from
+// overlapping another, but they cannot stop two of those older paths from
+// refreshing, one after the other, a token that a crashed transfer left in
+// both the slot and the row. So the migration runs only while no older
+// process is alive (the version fence, `version-fence.ts`, is a required
+// input of `migrateToPool`). Every step here that copies a credential still
+// takes the legacy locks, which covers an older process the fence could not
+// see: one started after the check. What the fence does not cover is a
+// downgrade, after a migration ran or crashed, to a version older than the
+// first release that tolerates the pool; that downgrade is unsupported.
 
 import { readFile } from 'node:fs/promises'
 import {
@@ -61,6 +68,10 @@ import {
   mainSlotFamilyFingerprint,
 } from './custody-host-slot.ts'
 import { MAIN_REFRESH_LOCK_NAME } from './custody-transition.ts'
+import type {
+  VersionFenceBlocker,
+  VersionFenceResult,
+} from './version-fence.ts'
 
 const PROVIDER = 'openai'
 
@@ -188,6 +199,16 @@ export type SlotNothingKind =
 export type PoolTransferOutcome =
   /** Custody mode: the legacy store stays in charge; nothing was written. */
   | { status: 'deferred-claustrum' }
+  /**
+   * An openai-auth process older than this one is running (see
+   * `version-fence.ts`); nothing was written. The migration runs once they
+   * are gone.
+   */
+  | {
+      status: 'deferred'
+      reason: 'older-version-running'
+      blockers: VersionFenceBlocker[]
+    }
   /** Migration already recorded as done; nothing was imported. */
   | { status: 'already-migrated' }
   /** Adoption asked for before the migration ran. */
@@ -911,7 +932,10 @@ async function clearRecord(ctx: Context): Promise<void> {
 
 /**
  * Writes the record and, while the slot and the row share one token, shields
- * the row from older builds by naming its identity in `mainAccountId`.
+ * the row from older builds by naming its identity in `mainAccountId`. The
+ * shield covers older builds' request routing only (their fallback
+ * selection skips that identity); their background refresh ignores it,
+ * which is why the migration itself waits for the version fence.
  */
 async function writeRecord(
   ctx: Context,
@@ -948,12 +972,24 @@ async function finishTransfer(
     operation,
     placeholder,
   })
-  const current = viewOf(await ctx.slot.get({ path: { id: PROVIDER } }))
+  // Both slot reads below decide whether the transfer may end without the
+  // placeholder ("the slot moved on"), which drops the record and leaves
+  // whatever the slot holds live. So they follow `readSlot`'s rule, never a
+  // single raw read: a transient absence while the host rewrites its file
+  // must not pass for a slot that moved on while it still holds the token
+  // the row now holds too. An unsettled read, or an auth map that reads
+  // empty (a torn read of the host file), ends the run retryably with the
+  // record kept; the next run resumes here.
+  const current = await readSlot(ctx)
+  if (current.kind === 'indeterminate')
+    return { status: 'retry', reason: 'host-slot-indeterminate' }
   if (current.kind === 'placeholder') {
     await writeFinished(ctx, mode)
     await ctx.onStep('after-record-clear')
     return completed('already-present')
   }
+  if (Object.keys(await ctx.slot.all()).length === 0)
+    return { status: 'retry', reason: 'torn-read' }
   if (
     current.kind !== 'real' ||
     current.fingerprint !== record.slotFingerprint
@@ -962,8 +998,6 @@ async function finishTransfer(
     await ctx.onStep('after-record-clear')
     return completed('slot-moved-on')
   }
-  if (Object.keys(await ctx.slot.all()).length === 0)
-    return { status: 'retry', reason: 'torn-read' }
   // From here an older build may serve the row: the slot copy is about to go.
   await updateConfig(ctx, (config) => {
     if (!('mainAccountId' in config)) return false
@@ -971,7 +1005,11 @@ async function finishTransfer(
     return true
   })
   await ctx.onStep('after-shield-drop')
-  const fenced = viewOf(await ctx.slot.get({ path: { id: PROVIDER } }))
+  const fenced = await readSlot(ctx)
+  if (fenced.kind === 'indeterminate')
+    return { status: 'retry', reason: 'host-slot-indeterminate' }
+  if (Object.keys(await ctx.slot.all()).length === 0)
+    return { status: 'retry', reason: 'torn-read' }
   if (fenced.kind !== 'real' || fenced.fingerprint !== record.slotFingerprint) {
     await writeFinished(ctx, mode)
     await ctx.onStep('after-record-clear')
@@ -1031,9 +1069,28 @@ async function completeTransfer(
 
 const deferredLogged = new Set<string>()
 
+/** The version fence, fail-closed: a fence that throws keeps it shut. */
+async function fenceBlockers(
+  fence: () => Promise<VersionFenceResult>,
+): Promise<VersionFenceBlocker[]> {
+  try {
+    const result = await fence()
+    return result.open ? [] : result.blockers
+  } catch (error) {
+    return [
+      {
+        pid: 'unknown',
+        version: 'unknown',
+        detail: error instanceof Error ? error.message : String(error),
+      },
+    ]
+  }
+}
+
 async function run(
   deps: PoolMigrationDeps,
   mode: 'migrate' | 'adopt',
+  fence?: () => Promise<VersionFenceResult>,
 ): Promise<PoolTransferOutcome> {
   const ctx = context(deps)
   let config: Record<string, unknown>
@@ -1050,6 +1107,26 @@ async function run(
     if (early.status === 'already-migrated' && 'mainAccountId' in config)
       await repairShield(ctx)
     return early
+  }
+  if (fence) {
+    // Checked before any lock or write. An older process starting after
+    // this check and before the run ends is not seen; the next run is.
+    const blockers = await fenceBlockers(fence)
+    if (blockers.length > 0) {
+      const key = `${ctx.paths.configPath}\0${blockers.map((b) => b.pid).join(',')}`
+      if (!deferredLogged.has(key)) {
+        deferredLogged.add(key)
+        ctx.log.info(
+          'account pool migration deferred: an older openai-auth version is running',
+          { blockers },
+        )
+      }
+      return {
+        status: 'deferred',
+        reason: 'older-version-running',
+        blockers,
+      }
+    }
   }
 
   let mainLock: HeldLock
@@ -1190,6 +1267,10 @@ async function runUnderMainLock(
       const lockedSlot = await readSlotHonouringLease(ctx)
       if (lockedSlot.kind === 'retry')
         return { status: 'retry', reason: 'legacy-refresh-in-progress' }
+      // A `finish` plan does not depend on the slot, but an unsettled read
+      // here means the host is mid-write; leave the record for the next run.
+      if (lockedSlot.kind === 'indeterminate')
+        return { status: 'retry', reason: 'host-slot-indeterminate' }
       const second = plan(
         mode,
         readPoolMigrationBookkeeping(lockedConfig),
@@ -1226,16 +1307,26 @@ async function repairShield(ctx: Context): Promise<void> {
   })
 }
 
+/** What the migration needs beyond an adoption run. */
+export interface PoolMigrationFenceDeps {
+  /**
+   * The version fence (`migrationFenceOpen` in `version-fence.ts`, bound to
+   * this build's version). While it is shut the migration writes nothing.
+   */
+  fence: () => Promise<VersionFenceResult>
+}
+
 /**
  * One-time move of the host-slot credential into the pool row `main`
  * (fallback rows are already pool rows: same ids, same files). Local custody
- * mode only; under claustrum mode it writes nothing and logs once. A re-run
- * after completion does nothing.
+ * mode only; under claustrum mode it writes nothing and logs once. It also
+ * writes nothing while an older openai-auth process runs (`deferred`). A
+ * re-run after completion does nothing.
  */
 export function migrateToPool(
-  deps: PoolMigrationDeps,
+  deps: PoolMigrationDeps & PoolMigrationFenceDeps,
 ): Promise<PoolTransferOutcome> {
-  return run(deps, 'migrate')
+  return run(deps, 'migrate', deps.fence)
 }
 
 /**

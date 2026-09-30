@@ -21,7 +21,11 @@ import {
   type HostSlotAdapter,
   isPoolPlaceholder,
   type PoolMigrationDeps,
+  type PoolMigrationFenceDeps,
 } from '../../core/pool-migration.ts'
+
+/** A version fence with no older process running. */
+export const OPEN_FENCE = async () => ({ open: true as const })
 
 // Parsed files are inspected field by field.
 // biome-ignore lint/suspicious/noExplicitAny: arbitrary parsed JSON
@@ -63,7 +67,9 @@ export interface Harness {
   bytes(): Promise<Record<string, string | null>>
   rows(): Promise<PoolRow[]>
   row(id: string): Promise<PoolRow | undefined>
-  deps(extra?: Partial<PoolMigrationDeps>): PoolMigrationDeps
+  deps(
+    extra?: Partial<PoolMigrationDeps & PoolMigrationFenceDeps>,
+  ): PoolMigrationDeps & PoolMigrationFenceDeps
   cleanup(): void
 }
 
@@ -153,6 +159,7 @@ export function harness(): Harness {
       slot,
       legacyLocks: { timeoutMs: 10_000 },
       leaseWait: { timeoutMs: 300, pollMs: 20 },
+      fence: OPEN_FENCE,
       ...extra,
     }),
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
