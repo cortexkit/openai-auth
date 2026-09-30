@@ -2852,8 +2852,10 @@ describe('transport close provenance', () => {
   })
 
   // The other direction, and the one that must never regress: a reasoning part
-  // has been opened, so something is on screen and the turn is finished.
-  test('an opened reasoning part does bar a retry', async () => {
+  // has shown text, so the reader has seen output and the cut turn must not be
+  // retried. A reasoning item that never produced text does not bar a retry
+  // (covered in ws-tool-call-recovery.test.ts).
+  test('a reasoning part that has shown text does bar a retry', async () => {
     await withFakeWebSocket(
       ({ message, close }) => ({
         send() {
@@ -2873,6 +2875,14 @@ describe('transport close provenance', () => {
             JSON.stringify({
               type: 'response.output_item.added',
               item: { type: 'reasoning', id: 'rs_1' },
+            }),
+          )
+          message(
+            JSON.stringify({
+              type: 'response.reasoning_summary_text.delta',
+              item_id: 'rs_1',
+              summary_index: 0,
+              delta: 'Considering the file',
             }),
           )
           close(1006, 'socket closed')
