@@ -179,10 +179,10 @@ export interface SidebarState {
 }
 
 import { createHash } from 'node:crypto'
-import { statSync } from 'node:fs'
+import { constants, copyFileSync, mkdirSync, statSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import {
   createSidebarFile,
   type SidebarFile,
@@ -198,8 +198,24 @@ import { createLogger } from './logger'
 const logSb = createLogger('sidebar')
 
 const STATE_FILE_ENV = 'OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE'
-const DEFAULT_STATE_DIR = join(tmpdir(), 'opencode-openai-auth')
-const DEFAULT_STATE_FILE = join(DEFAULT_STATE_DIR, 'sidebar-state.json')
+// The file holds session pins that live for seven days, so it belongs in the
+// user's state directory, beside the RPC port files, not in a temp folder the
+// system cleans. Resolved per call so XDG_STATE_HOME set after load is honoured.
+function defaultStateFile(): string {
+  const base = process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state')
+  return join(base, 'cortexkit', 'openai-auth', 'sidebar-state.json')
+}
+// Where versions before this one kept the file. Read once, never written.
+let legacySidebarStateFile = join(
+  tmpdir(),
+  'opencode-openai-auth',
+  'sidebar-state.json',
+)
+/** Test seam: point the one-time import at a fixture instead of the temp folder. */
+export function setLegacySidebarStateFileForTest(file: string): void {
+  legacySidebarStateFile = file
+  importedDefaultFiles.clear()
+}
 const SESSION_HASH_PATTERN = /^[a-f0-9]{64}$/
 export const STICKY_ASSIGNMENT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 export const STICKY_ASSIGNMENT_MAX_ENTRIES = 256
@@ -353,7 +369,33 @@ function normalizeStickyAssignments(
 }
 
 export function getSidebarStateFile(): string {
-  return process.env[STATE_FILE_ENV] || DEFAULT_STATE_FILE
+  const override = process.env[STATE_FILE_ENV]
+  if (override) return override
+  const file = defaultStateFile()
+  // Every reader and writer resolves the path here, so importing on first
+  // resolution covers the TUI, the cache and the write queue alike.
+  if (!importedDefaultFiles.has(file)) {
+    importedDefaultFiles.add(file)
+    importLegacySidebarState(file, legacySidebarStateFile)
+  }
+  return file
+}
+
+const importedDefaultFiles = new Set<string>()
+
+/**
+ * Seed the default state file from the old temp-folder copy, once, so pins
+ * survive the move. Copy only: older plugin versions still running keep
+ * writing the old file until they restart. COPYFILE_EXCL makes two processes
+ * racing here harmless, and any failure just means starting with no pins.
+ */
+function importLegacySidebarState(file: string, legacyFile: string): void {
+  try {
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
+    copyFileSync(legacyFile, file, constants.COPYFILE_EXCL)
+  } catch {
+    // Absent legacy file, already imported, or unreadable: nothing to carry.
+  }
 }
 
 export function projectCustodyForSidebar(
@@ -907,7 +949,7 @@ function sidebarFileFor(file: string): SidebarFile<SidebarState> {
       path: file,
       defaultValue: DEFAULT_SIDEBAR_STATE,
       normalize: normalizeSidebarState,
-      secureDir: file === DEFAULT_STATE_FILE,
+      secureDir: file === defaultStateFile(),
       logger: logSb,
     })
     sidebarFiles.set(file, sidebarFile)
