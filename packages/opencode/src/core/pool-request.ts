@@ -24,7 +24,6 @@ import {
   type OrderedAttempt,
   type RoutingRow,
   type StickySelection,
-  selectStickyCandidate,
 } from '@cortexkit/common-auth/routing'
 import type { PoolRow } from '@cortexkit/common-auth/store'
 import {
@@ -45,11 +44,12 @@ import {
   FORMER_MAIN_ID,
   type PoolBlock,
   type PoolRoutingInput,
-  pinnedRowRefusal,
   planOrdered,
+  routePinnedRow,
   type StickyAdmission,
+  type StickyRouteOptions,
+  selectStickyRow,
   stickyBreak,
-  stickyCandidates,
 } from './pool-routing'
 
 /** One sticky pin decision handed to the caller's pin ledger. */
@@ -280,6 +280,22 @@ async function serveSticky(
   const byId = new Map(rows.map((row) => [row.id, row]))
   let routing = routingInput(ctx, rows)
   let sticky = admitSticky(routing)
+  const options: StickyRouteOptions = {
+    requestBytes,
+    // Each account's killswitch thresholds are its reserve: placement weighs
+    // only the quota above the floor the killswitch would stop it at.
+    reservePercent: (id) =>
+      getKillswitchThresholdsForAccount(
+        ctx.storage,
+        id === FORMER_MAIN_ID ? undefined : id,
+      ),
+    resetCredits: ctx.resetCredits,
+    onEmptyWeightedSet: () => {
+      ctx.log.debug(
+        'sticky routing: no fresh weighted candidates; using configured order',
+      )
+    },
+  }
 
   const placer =
     (input: PoolRoutingInput, admission: StickyAdmission) =>
@@ -305,29 +321,8 @@ async function serveSticky(
         wireAccountIdByAccount: Object.fromEntries(
           rows.map((row) => [row.id, row.identity]),
         ),
-        select: (pendingBytes) => {
-          const candidates = stickyCandidates(input, admission, {
-            exclude: excluded,
-            reservePercent: (id) =>
-              getKillswitchThresholdsForAccount(
-                ctx.storage,
-                id === FORMER_MAIN_ID ? undefined : id,
-              ),
-            resetCredits: ctx.resetCredits,
-          })
-          if (candidates.length === 0) return undefined
-          return selectStickyCandidate({
-            candidates,
-            pendingBytes,
-            requestBytes,
-            now: input.now,
-            onEmptyWeightedSet: () => {
-              ctx.log.debug(
-                'sticky routing: no fresh weighted candidates; using configured order',
-              )
-            },
-          })
-        },
+        select: (pendingBytes) =>
+          selectStickyRow(input, options, excluded, pendingBytes),
         persist,
       })
     }
@@ -350,17 +345,16 @@ async function serveSticky(
     return true
   }
 
-  const verdict = pinnedRowRefusal(routing, sticky, id)
-  if (verdict === 'serve') {
-    const before = stickyBreak(routing, sticky, id)
-    if (before.action === 'migrate') migrate(before.reason)
-  } else if (verdict === 'migrate') {
-    // When no other row can take the session, a pinned row that is only
-    // exhausted is still sent to (the reading may be stale and the provider
-    // has the final say); a row the killswitch blocks never is.
-    if (!migrate('exhausted') && routing.killswitch.get(id) === false)
+  const pinned = routePinnedRow(routing, options, id)
+  if (pinned.kind === 'none') return undefined
+  if (pinned.kind === 'move') {
+    // The pin ledger re-places the session with its own pending bytes. If it
+    // finds no other row after all, a pinned row that is only exhausted is
+    // still sent to (as on the `last-path` route); a row below its
+    // killswitch floor never is.
+    if (!migrate(pinned.reason) && pinned.reason === 'killswitch')
       return undefined
-  } else {
+  } else if (pinned.kind === 'detour') {
     const detour = place([id], false)
     if (!detour) return undefined
     ctx.log.debug('sticky routing: pinned account awaits a quota reading', {

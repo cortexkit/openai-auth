@@ -5,24 +5,32 @@
 // - A new login becomes a row through `store.add`; a login of an account a row
 //   already holds replaces that row's credential (`store.replace`), the way the
 //   legacy roster merged a re-added account into its existing entry.
-// - Disabling goes through `store.disable`. The store has no enable or remove
-//   operation, so enabling flips the roster row's `enabled` flag, and removing
-//   drops the roster row and its credential, both through the legacy roster
-//   writer (`mutateAccounts`). That writer takes the same `save` locks the
-//   store holds around its own writes, so the two never interleave, and the
-//   store drops the removed row's pool entry on its next write.
+// - Disabling, enabling and removing go through `store.disable`,
+//   `store.enable` and `store.remove`. Each takes the row's pool lock, then
+//   the legacy `main-refresh` lock and the row's legacy fallback refresh lock
+//   (passed as `extraLocks`, the order `refreshPoolRow` takes them in), then
+//   the store locks. An older openai-auth process refreshes a roster row under
+//   those legacy locks, so none of the three lands in the middle of such a
+//   refresh, nor in the middle of this build's own refresh of the row.
 // - Reordering swaps two roster rows; the roster order is the pool's order.
+//   The store has no reorder operation, so this goes through the legacy
+//   roster writer (`mutateAccounts`), which takes the same `save` locks the
+//   store holds around its own writes.
 // - Row `main` holds the account OpenCode's login slot points at (the slot
-//   keeps only a placeholder), so it is never removed.
+//   keeps only a placeholder), so it is never removed. Neither is a row the
+//   migration's pending-transfer record names: the migration is copying the
+//   login slot's credential into that row and will write it again.
 
 import { readFileSync } from 'node:fs'
 import { type QuotaObservation, quotaCodec } from '@cortexkit/common-auth/quota'
 import {
   type OpenPoolStoreOptions,
+  PoolOperationError,
   openPoolStore,
   type PoolRow,
   type PoolStore,
   type PullRequest,
+  type RemoveView,
 } from '@cortexkit/common-auth/store'
 import type { CommandContext } from '@cortexkit/openai-auth-core'
 import {
@@ -30,7 +38,11 @@ import {
   mutateAccounts,
   POOL_MAIN_ROW_ID,
 } from '@cortexkit/openai-auth-core/internal'
-import { readPoolMigrationBookkeeping } from './pool-migration'
+import {
+  type LegacyLockOptions,
+  legacyRefreshLocks,
+  readPoolMigrationBookkeeping,
+} from './pool-migration'
 
 /** The `disabledReason` value the store records on a row the user disabled. */
 export const POOL_USER_DISABLED_REASON = 'disabled-by-user'
@@ -65,7 +77,35 @@ export type PoolAddOutcome =
   /** Row `main` (the account OpenCode signs in with) already holds this account. */
   | { status: 'main-identity'; id: string }
 
-export type PoolRemoveOutcome = 'removed' | 'not-found' | 'main-refused'
+/**
+ * The message shown when the user asks to remove a row the account-pool
+ * migration is still moving the login slot's credential into.
+ */
+export function poolTransferRemovalRefused(id: string): string {
+  return `The account-pool migration is moving OpenCode's login into \`${id}\` right now, so it cannot be removed yet. Try again once the migration has finished.`
+}
+
+/**
+ * The message shown when enabling a row would let one ChatGPT account serve
+ * from two enabled rows. `holder` is the enabled row holding it, when known.
+ */
+export function poolDuplicateIdentityRefused(
+  id: string,
+  holder: string | undefined,
+): string {
+  const other = holder ? `\`${holder}\`` : 'another enabled account'
+  return `\`${id}\` is the same ChatGPT account as ${other}, so it stays disabled: one account never serves from two rows. Disable or remove ${other} first.`
+}
+
+/** What enabling, disabling or removing one row came to. */
+export type PoolRowOutcome =
+  | { status: 'done' }
+  | { status: 'not-found' }
+  /** The pool refused the change; `message` tells the user why. */
+  | { status: 'refused'; message: string }
+
+/** Lock timing for the legacy locks the row writes take; tests shorten it. */
+export type PoolRowWriteOptions = { legacyLocks?: Partial<LegacyLockOptions> }
 
 /** Opens the store at `paths`, with a quota poll hook when one is given. */
 export function openAccountPool(
@@ -200,53 +240,109 @@ export async function addPoolAccount(
   }
 }
 
-/** Disables a row through the store; false when no such row exists. */
+function isFailure(error: unknown, kind: PoolOperationError['kind']): boolean {
+  return error instanceof PoolOperationError && error.kind === kind
+}
+
+/**
+ * Why `remove` must leave row `id` alone, judged on the files the store read
+ * under its locks: row `main`, or the row a pending migration transfer names.
+ */
+export function poolRemovalRefusal(
+  id: string,
+  view: Pick<RemoveView, 'config'>,
+): string | undefined {
+  if (id === POOL_MAIN_ROW_ID) return POOL_MAIN_REMOVAL_REFUSED
+  const pending = readPoolMigrationBookkeeping(
+    view.config as Record<string, unknown>,
+  ).pending
+  if (pending?.rowId === id) return poolTransferRemovalRefused(id)
+  return undefined
+}
+
+/** Disables a row through the store. */
 export async function disablePoolAccount(
   store: PoolStore,
+  paths: AccountPaths,
   id: string,
-): Promise<boolean> {
-  const load = await store.read()
-  if (load.status !== 'ready' || !load.rows.some((row) => row.id === id))
-    return false
-  await store.disable(id, POOL_USER_DISABLED_REASON)
-  return true
+  options: PoolRowWriteOptions = {},
+): Promise<PoolRowOutcome> {
+  try {
+    await store.disable(id, POOL_USER_DISABLED_REASON, {
+      extraLocks: legacyRefreshLocks(paths, id, options.legacyLocks),
+    })
+    return { status: 'done' }
+  } catch (error) {
+    if (isFailure(error, 'unknown-row')) return { status: 'not-found' }
+    throw error
+  }
 }
 
-/** Enables a roster row; false when no such row exists. */
+/**
+ * Enables a row through the store. A row whose ChatGPT account another
+ * enabled row already holds stays disabled, and the outcome says which row.
+ */
 export async function enablePoolAccount(
+  store: PoolStore,
   paths: AccountPaths,
   id: string,
-): Promise<boolean> {
-  let found = false
-  await mutateAccounts((current) => {
-    const account = current.accounts.find((candidate) => candidate.id === id)
-    if (!account) return current
-    found = true
-    account.enabled = true
-    return current
-  }, paths)
-  return found
+  options: PoolRowWriteOptions = {},
+): Promise<PoolRowOutcome> {
+  try {
+    await store.enable(id, {
+      extraLocks: legacyRefreshLocks(paths, id, options.legacyLocks),
+    })
+    return { status: 'done' }
+  } catch (error) {
+    if (isFailure(error, 'unknown-row')) return { status: 'not-found' }
+    if (isFailure(error, 'duplicate-identity')) {
+      const load = await store.read()
+      const rows = load.status === 'ready' ? load.rows : []
+      const identity = rows.find((row) => row.id === id)?.identity
+      const holder = identity
+        ? rows.find(
+            (row) =>
+              row.id !== id &&
+              row.enabled &&
+              row.type === 'oauth' &&
+              row.identity === identity,
+          )?.id
+        : undefined
+      return {
+        status: 'refused',
+        message: poolDuplicateIdentityRefused(id, holder),
+      }
+    }
+    throw error
+  }
 }
 
-/** Removes a row and its credential; row `main` is refused. */
+/**
+ * Removes a row and its credential through the store. Row `main` and a row a
+ * pending migration transfer names are refused (`poolRemovalRefusal`).
+ */
 export async function removePoolAccount(
+  store: PoolStore,
   paths: AccountPaths,
   id: string,
-): Promise<PoolRemoveOutcome> {
-  if (id === POOL_MAIN_ROW_ID) return 'main-refused'
-  let removed = false
-  await mutateAccounts(
-    (current) => {
-      const index = current.accounts.findIndex((account) => account.id === id)
-      if (index === -1) return current
-      current.accounts.splice(index, 1)
-      removed = true
-      return current
-    },
-    paths,
-    { allowDrop: [id] },
-  )
-  return removed ? 'removed' : 'not-found'
+  options: PoolRowWriteOptions = {},
+): Promise<PoolRowOutcome> {
+  let refusal: string | undefined
+  try {
+    await store.remove(id, {
+      extraLocks: legacyRefreshLocks(paths, id, options.legacyLocks),
+      protect: (target, view) => {
+        refusal = poolRemovalRefusal(target, view)
+        return refusal
+      },
+    })
+    return { status: 'done' }
+  } catch (error) {
+    if (isFailure(error, 'row-protected') && refusal !== undefined)
+      return { status: 'refused', message: refusal }
+    if (isFailure(error, 'unknown-row')) return { status: 'not-found' }
+    throw error
+  }
 }
 
 /**
@@ -286,13 +382,13 @@ export function commandAccountPool(deps: {
   paths: () => AccountPaths
   store: () => PoolStore
   afterWrite?: () => unknown
+  rowWrites?: PoolRowWriteOptions
 }): NonNullable<CommandContext['accountPool']> {
   const written = async <T>(result: T): Promise<T> => {
     await deps.afterWrite?.()
     return result
   }
   return {
-    mainRemovalRefused: POOL_MAIN_REMOVAL_REFUSED,
     rows: async () => {
       const rows = await migratedPoolRows(deps.paths(), deps.store())
       return rows?.map((row) => ({
@@ -317,9 +413,23 @@ export function commandAccountPool(deps: {
             : {}),
         }),
       ),
-    disable: async (id) => written(await disablePoolAccount(deps.store(), id)),
-    enable: async (id) => written(await enablePoolAccount(deps.paths(), id)),
-    remove: async (id) => written(await removePoolAccount(deps.paths(), id)),
+    disable: async (id) =>
+      written(
+        await disablePoolAccount(
+          deps.store(),
+          deps.paths(),
+          id,
+          deps.rowWrites,
+        ),
+      ),
+    enable: async (id) =>
+      written(
+        await enablePoolAccount(deps.store(), deps.paths(), id, deps.rowWrites),
+      ),
+    remove: async (id) =>
+      written(
+        await removePoolAccount(deps.store(), deps.paths(), id, deps.rowWrites),
+      ),
     reorder: async (first, second) =>
       written(await swapPoolAccounts(deps.paths(), first, second)),
   }

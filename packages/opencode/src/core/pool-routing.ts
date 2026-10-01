@@ -2,11 +2,13 @@
 // routing library (`@cortexkit/common-auth/routing`).
 //
 // The library decides which rows may serve a request (admission) and in what
-// order (`routeOrdered`), places sticky sessions (`selectStickyCandidate`)
-// and classifies when a sticky session must leave its row
-// (`decideStickyBreak`). openai-auth supplies what the library leaves to its
-// caller: rate-limit marks, refresh backoff, killswitch verdicts, reserve
-// percentages, reset credits and the session pin ledger.
+// order (`routeOrdered`), routes sticky sessions (`routeSticky`: whether a
+// session's pin serves, moves or is served around, and where a session is
+// placed) and classifies when a sticky session must leave its row after a
+// response (`decideStickyBreak`). openai-auth supplies what the library
+// leaves to its caller: rate-limit marks, refresh backoff, killswitch
+// verdicts, per-account reserve percentages (the killswitch thresholds),
+// reset credits and the session pin ledger.
 //
 // Two openai-auth rules sit on top of the library's result here, because the
 // library has no input that expresses them:
@@ -33,8 +35,10 @@ import {
   orderForPlacement,
   type RoutingRow,
   routeOrdered,
+  routeSticky,
   type StickyBreakDecision,
-  type StickySelectionCandidate,
+  type StickyRoute,
+  type StickySelection,
 } from '@cortexkit/common-auth/routing'
 
 /** The row the migration moved the main account into. */
@@ -187,12 +191,14 @@ export function planOrdered(
   }
 }
 
-/** Admission for one sticky-balanced request, indexed for the placement steps. */
+/**
+ * Admission for one sticky-balanced request, as the pin ledger and the
+ * response-time break decision read it.
+ */
 export interface StickyAdmission {
-  admission: AdmissionResult
+  /** Each row's quota as admission projected it (a refused row's own projection otherwise). */
   projections: ReadonlyMap<string, ProjectedQuota>
-  admitted: ReadonlySet<string>
-  refused: ReadonlyMap<string, AdmissionRefusal>
+  /** Rows a rate-limit mark or refresh backoff keeps from this request. */
   excluded: ReadonlySet<string>
 }
 
@@ -210,44 +216,125 @@ export function admitSticky(input: PoolRoutingInput): StickyAdmission {
     if (row.projection) projections.set(row.id, row.projection)
   }
   return {
-    admission,
     projections,
-    admitted: new Set(admission.admitted.map((row) => row.id)),
-    refused: new Map(admission.refused.map((refusal) => [refusal.id, refusal])),
     excluded: new Set(admission.excluded.map((entry) => entry.id)),
   }
 }
 
+/** What sticky routing needs beyond the routing input. */
+export interface StickyRouteOptions {
+  requestBytes: number
+  /** Reserve percent per window label for one row: its killswitch thresholds. */
+  reservePercent: (id: string) => Readonly<Record<string, number>>
+  resetCredits: (id: string) => number | undefined
+  onEmptyWeightedSet?: () => void
+}
+
 /**
- * The sticky placement candidates: admitted rows, minus `exclude`, with the
- * caller's reserves, reset credits and killswitch verdicts. A killed row
- * stays in the list so the library's selector can refuse it in both of its
- * branches, as it does for openai-auth's own roster.
+ * The library's sticky routing over the routing input. A pin moves when its
+ * row is confirmed unable to serve (a spent window with a future reset, a
+ * spent credit budget, or a killswitch verdict) and stays while its row only
+ * waits for a reading or is briefly excluded. The killswitch verdict is fed
+ * for every reading, stale or fresh, as the ordered modes and the placement
+ * of new sessions use it: a row below its floor is never spent on.
  */
-export function stickyCandidates(
+function routePoolSticky(
   input: PoolRoutingInput,
-  sticky: StickyAdmission,
-  options: {
-    exclude: ReadonlySet<string>
-    reservePercent: (id: string) => Readonly<Record<string, number>>
-    resetCredits: (id: string) => number | undefined
+  options: StickyRouteOptions,
+  extra: {
+    pin?: string
+    exclude?: ReadonlySet<string>
+    pendingBytes?: ReadonlyMap<string, number>
   },
-): StickySelectionCandidate[] {
-  const out: StickySelectionCandidate[] = []
-  input.rows.forEach((row, configuredOrder) => {
-    if (!sticky.admitted.has(row.id) || options.exclude.has(row.id)) return
-    const killswitchPasses = input.killswitch.get(row.id)
+): StickyRoute {
+  const exclude = extra.exclude
+  const rows = exclude
+    ? input.rows.filter((row) => !exclude.has(row.id))
+    : input.rows
+  const resetCredits = new Map<string, number>()
+  for (const row of rows) {
     const credits = options.resetCredits(row.id)
-    out.push({
-      accountId: row.id,
-      quota: sticky.projections.get(row.id),
-      reservePercent: options.reservePercent(row.id),
-      configuredOrder,
-      ...(credits === undefined ? {} : { resetCreditsApplicable: credits }),
-      ...(killswitchPasses === undefined ? {} : { killswitchPasses }),
-    })
+    if (credits !== undefined) resetCredits.set(row.id, credits)
+  }
+  return routeSticky({
+    rows,
+    now: input.now,
+    rateLimitMarks: input.rateLimitMarks,
+    refreshBackoff: input.refreshBackoff,
+    requestPull: input.requestPull,
+    killswitch: input.killswitch,
+    requestBytes: options.requestBytes,
+    ...(extra.pendingBytes ? { pendingBytes: extra.pendingBytes } : {}),
+    rowReservePercent: (row) => options.reservePercent(row.id),
+    refusedPinPolicy: 'move-on-confirmed-exhaustion',
+    resetCreditsApplicable: resetCredits,
+    ...(extra.pin === undefined ? {} : { pin: { accountId: extra.pin } }),
+    ...(options.onEmptyWeightedSet
+      ? { onEmptyWeightedSet: options.onEmptyWeightedSet }
+      : {}),
   })
-  return out
+}
+
+/**
+ * Places a session that holds no usable pin: the row the library routes a
+ * pinless request to, leaving out `exclude`, weighed by the bytes other
+ * sessions committed to each row. Undefined when no row is admissible.
+ */
+export function selectStickyRow(
+  input: PoolRoutingInput,
+  options: StickyRouteOptions,
+  exclude: ReadonlySet<string>,
+  pendingBytes: ReadonlyMap<string, number>,
+): StickySelection | undefined {
+  const route = routePoolSticky(input, options, { exclude, pendingBytes })
+  // With no pin passed in, the library never dispatches by pin.
+  if (route.outcome !== 'dispatch' || route.source === 'pin') return undefined
+  return {
+    accountId: route.accountId,
+    source: route.source,
+    ...(route.quotaCheckedAt === undefined
+      ? {}
+      : { quotaCheckedAt: route.quotaCheckedAt }),
+  }
+}
+
+/**
+ * What a session pinned to row `id` does with this request.
+ *
+ * - `serve`: the pinned row serves.
+ * - `move`: the row is confirmed unable to serve (killed, a spent window, a
+ *   spent credit budget) and another row can, so the session moves for good.
+ * - `detour`: the row's quota is not known yet, so this one request goes
+ *   elsewhere and the pin stays, to be used again once a reading arrives.
+ * - `last-path`: no other row can serve and the pinned row is refused only
+ *   as confirmed exhausted (not killed). openai-auth still sends to it: the
+ *   reading may be stale and the provider has the final say. The library
+ *   keeps the pin here but dispatches nothing, so this rule is openai-auth's.
+ * - `none`: nothing can serve; the request is routed like an unpinned one.
+ */
+export type PinnedRowRoute =
+  | { kind: 'serve' }
+  | { kind: 'move'; reason: 'killswitch' | 'exhausted' }
+  | { kind: 'detour' }
+  | { kind: 'last-path' }
+  | { kind: 'none' }
+
+export function routePinnedRow(
+  input: PoolRoutingInput,
+  options: StickyRouteOptions,
+  id: string,
+): PinnedRowRoute {
+  const killed = input.killswitch.get(id) === false
+  const route = routePoolSticky(input, options, { pin: id })
+  if (route.outcome === 'dispatch') {
+    if (route.pin.action === 'assign')
+      return { kind: 'move', reason: killed ? 'killswitch' : 'exhausted' }
+    return route.accountId === id ? { kind: 'serve' } : { kind: 'detour' }
+  }
+  const refusal = route.admission.refused.find((entry) => entry.id === id)
+  if (!killed && refusal && isConfirmedExhaustion(refusal))
+    return { kind: 'last-path' }
+  return { kind: 'none' }
 }
 
 /** Whether a sticky session must leave row `id`, judged on its current quota. */
@@ -264,23 +351,4 @@ export function stickyBreak(
     ...(status === undefined ? {} : { status }),
     ...(killswitchPasses === undefined ? {} : { killswitchPasses }),
   })
-}
-
-/**
- * How a pinned row admission did not admit is treated. `migrate`: the
- * account is confirmed unable to serve (exhausted, spent budget, killed), so
- * the session moves for good. `detour`: its quota is unknown, so this one
- * request goes elsewhere and the pin stays, to be used again once a reading
- * arrives (the library's rule for a refused pin).
- */
-export function pinnedRowRefusal(
-  input: PoolRoutingInput,
-  sticky: StickyAdmission,
-  id: string,
-): 'serve' | 'migrate' | 'detour' {
-  if (input.killswitch.get(id) === false) return 'migrate'
-  if (sticky.admitted.has(id)) return 'serve'
-  const refusal = sticky.refused.get(id)
-  if (refusal && isConfirmedExhaustion(refusal)) return 'migrate'
-  return 'detour'
 }

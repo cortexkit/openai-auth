@@ -10,6 +10,7 @@ import { join } from 'node:path'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import {
   type AccountPaths,
+  fallbackRefreshLockName,
   loadAccounts,
   type OAuthAccount,
   QuotaManager,
@@ -18,6 +19,7 @@ import type { Hooks } from '@opencode-ai/plugin'
 import { createAuthMethods } from '../auth/methods'
 import { buildDialogPayload, type CommandContext } from '../commands'
 import { PoolAccountSource } from '../core/pool-account-source'
+import { MAIN_REFRESH_LOCK_NAME } from '../core/custody-transition'
 import { commandAccountPool, openAccountPool } from '../core/pool-accounts'
 import { buildPoolSidebarMachineState } from '../core/pool-sidebar'
 import {
@@ -536,6 +538,116 @@ describe('/openai-account on a migrated install', () => {
       'fallback-1',
     ])
   })
+
+  it('refuses to remove a row a pending migration transfer names', async () => {
+    const raw = readJson(files.configFile)
+    raw.openaiAuthPool = {
+      ...(raw.openaiAuthPool as Record<string, unknown>),
+      pending: {
+        rowId: 'fallback-1',
+        operation: 'rotate',
+        rowFingerprint: null,
+        slotFingerprint: 'slot-fingerprint',
+        credentialFingerprint: 'credential-fingerprint',
+        carryLegacyMain: false,
+        recordedAt: 1,
+      },
+    }
+    writeFileSync(files.configFile, JSON.stringify(raw))
+
+    const refused = await buildDialogPayload(
+      'openai-account',
+      'remove fallback-1',
+      commandContext(),
+    )
+    expect(refused.text).toContain('Cannot Remove Account')
+    expect(refused.text).toContain('migration is moving')
+    expect(config().accounts.map((row) => row.id)).toEqual([
+      'main',
+      'fallback-1',
+    ])
+    expect(stateAccounts()['fallback-1']?.access).toBe('fallback-1-token')
+  })
+
+  it('refuses to enable a row whose ChatGPT account another enabled row holds', async () => {
+    seedPool(files, [
+      { id: 'main', quota: quotaMap(10) },
+      { id: 'fallback-1', quota: quotaMap(10) },
+      { id: 'fallback-2', quota: quotaMap(10), enabled: false },
+    ])
+    const raw = readJson(files.configFile) as {
+      accounts: Array<{ id: string; accountId?: string }>
+    }
+    const twin = raw.accounts.find((row) => row.id === 'fallback-2')
+    if (!twin) throw new Error('fallback-2 not seeded')
+    twin.accountId = 'chatgpt-fallback-1'
+    writeFileSync(files.configFile, JSON.stringify(raw))
+
+    const refused = await buildDialogPayload(
+      'openai-account',
+      'enable fallback-2',
+      commandContext(),
+    )
+    expect(refused.text).toContain('Cannot Enable Account')
+    expect(refused.text).toContain(
+      '`fallback-2` is the same ChatGPT account as `fallback-1`',
+    )
+    expect(
+      config().accounts.find((row) => row.id === 'fallback-2')?.enabled,
+    ).toBe(false)
+  })
+
+  // An older openai-auth process refreshes a roster row under the row's
+  // fallback refresh lock and the slot's token under `main-refresh`; a row
+  // write must wait for either rather than land in the middle of a refresh.
+  const fallbackLock = fallbackRefreshLockName('fallback-1')
+  for (const [command, lockLabel, lockName] of [
+    ['disable', 'fallback refresh', fallbackLock],
+    ['enable', 'fallback refresh', fallbackLock],
+    ['remove', 'fallback refresh', fallbackLock],
+    ['disable', 'main-refresh', MAIN_REFRESH_LOCK_NAME],
+    ['enable', 'main-refresh', MAIN_REFRESH_LOCK_NAME],
+    ['remove', 'main-refresh', MAIN_REFRESH_LOCK_NAME],
+  ] as const) {
+    it(`${command} waits for the legacy ${lockLabel} lock and completes once it is released`, async () => {
+      if (command === 'enable') {
+        seedPool(files, [
+          { id: 'main', quota: quotaMap(10) },
+          { id: 'fallback-1', quota: quotaMap(10), enabled: false },
+        ])
+      }
+      const before = readFileSync(files.configFile, 'utf8')
+      const lock = await acquireRefreshFileLock({
+        name: lockName,
+        ttlMs: 60_000,
+        path: files.configFile,
+      })
+      if (!lock) throw new Error('legacy lock not taken')
+      let settled = false
+      const pending = buildDialogPayload(
+        'openai-account',
+        `${command} fallback-1`,
+        commandContext(),
+      ).finally(() => {
+        settled = true
+      })
+      try {
+        await sleep(400)
+        expect(settled).toBe(false)
+        expect(readFileSync(files.configFile, 'utf8')).toBe(before)
+      } finally {
+        await lock.release()
+      }
+
+      const done = await pending
+      expect(done.text).not.toContain('Cannot')
+      const row = config().accounts.find(
+        (candidate) => candidate.id === 'fallback-1',
+      )
+      if (command === 'remove') expect(row).toBeUndefined()
+      else expect(row?.enabled).toBe(command === 'enable')
+    })
+  }
 
   it('/openai-killswitch keys thresholds by row id and leaves row main to `main`', async () => {
     await buildDialogPayload(

@@ -196,15 +196,24 @@ export interface CommandAccountPool {
     status: 'added' | 'added-disabled' | 'replaced' | 'main-identity'
     id: string
   }>
-  disable(id: string): Promise<boolean>
-  enable(id: string): Promise<boolean>
-  /** Row `main` is never removed: it resolves to `main-refused`. */
-  remove(id: string): Promise<'removed' | 'not-found' | 'main-refused'>
+  disable(id: string): Promise<CommandPoolRowOutcome>
+  /** Refused while another enabled row holds the same ChatGPT account. */
+  enable(id: string): Promise<CommandPoolRowOutcome>
+  /**
+   * Refused for row `main`, and for a row the pool migration is still moving
+   * a login into.
+   */
+  remove(id: string): Promise<CommandPoolRowOutcome>
   /** Swaps two rows' positions in the roster order. */
   reorder(first: string, second: string): Promise<boolean>
-  /** The refusal text for removing row `main`. */
-  mainRemovalRefused: string
 }
+
+/** What enabling, disabling or removing one pool row came to. */
+export type CommandPoolRowOutcome =
+  | { status: 'done' }
+  | { status: 'not-found' }
+  /** The pool refused the change; `message` tells the user why. */
+  | { status: 'refused'; message: string }
 
 export interface ResetTargetIdentity {
   accountKey: string
@@ -877,10 +886,15 @@ async function executePoolAccountCommand(
   if ((tokens[0] === 'enable' || tokens[0] === 'disable') && tokens[1]) {
     const targetId = tokens[1]
     const enabled = tokens[0] === 'enable'
-    const found = enabled
+    const outcome = enabled
       ? await pool.enable(targetId)
       : await pool.disable(targetId)
-    if (!found) return notFound(targetId)
+    if (outcome.status === 'not-found') return notFound(targetId)
+    if (outcome.status === 'refused') {
+      return payload(
+        `## Cannot ${enabled ? 'Enable' : 'Disable'} Account\n\n${outcome.message}`,
+      )
+    }
     void ctx.refreshSidebar?.().catch(() => {})
     return payload(
       `## Account ${enabled ? 'Enabled' : 'Disabled'}\n\n\`${targetId}\` is ${enabled ? 'enabled' : 'disabled'}.`,
@@ -919,10 +933,10 @@ async function executePoolAccountCommand(
   if (tokens[0] === 'remove' && tokens[1]) {
     const targetId = tokens[1]
     const outcome = await pool.remove(targetId)
-    if (outcome === 'main-refused') {
-      return payload(`## Cannot Remove Account\n\n${pool.mainRemovalRefused}`)
+    if (outcome.status === 'refused') {
+      return payload(`## Cannot Remove Account\n\n${outcome.message}`)
     }
-    if (outcome === 'not-found') return notFound(targetId)
+    if (outcome.status === 'not-found') return notFound(targetId)
     log.info('account removed', { id: targetId })
     void ctx.refreshSidebar?.().catch(() => {})
     return payload(`## Account Removed\n\nRemoved account \`${targetId}\`.`)
