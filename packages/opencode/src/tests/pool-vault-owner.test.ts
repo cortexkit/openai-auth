@@ -66,4 +66,50 @@ describe('a pool row whose account the vault holds', () => {
     expect(polled).toContain('beta')
     expect(results.map((result) => result.id)).toEqual(['beta'])
   })
+
+  // Before the vault's first roster no row is known to be the vault's, so the
+  // first-sight polls wait for it, for a bounded time. A roster that does not
+  // come in time skips them for now; a later read tries again.
+  it("skips the first-sight polls when the vault's first roster does not come within the bound, and polls once it has", async () => {
+    seedPool({ configFile: paths.configPath, stateFile: paths.statePath }, [
+      { id: 'alpha' },
+      { id: 'beta' },
+    ])
+    const polled: string[] = []
+    const roster = Promise.withResolvers<void>()
+    let identities = new Set<string>()
+    const source = new PoolAccountSource({
+      paths: () => paths,
+      refreshProvider: async () => {
+        throw new Error('no refresh expected')
+      },
+      pullQuota: async (request) => {
+        polled.push(request.id)
+        return undefined
+      },
+      vaultIdentities: () => identities,
+      vaultFirstRoster: roster.promise,
+      vaultFirstRosterBackgroundWaitMs: 50,
+    })
+
+    await source.load()
+    await Bun.sleep(150)
+    await source.poolStore().pullsSettled()
+    expect(polled).toEqual([])
+
+    // The roster comes after the bound: the skipped polls are not run on
+    // their own, only by the next read.
+    identities = new Set(['chatgpt-alpha'])
+    roster.resolve()
+    await Bun.sleep(50)
+    await source.poolStore().pullsSettled()
+    expect(polled).toEqual([])
+
+    await source.load()
+    await source.poolStore().pullsSettled()
+    source.dispose()
+    await source.settled()
+
+    expect(polled).toEqual(['beta'])
+  })
 })

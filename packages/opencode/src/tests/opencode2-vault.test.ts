@@ -67,6 +67,8 @@ async function start(
     /** Runs on the seeded files before setup. */
     prepare?: (files: PoolFiles) => void
     fetch?: typeof fetch
+    /** Runs the pool lifecycle (migration, then adoptions of slot logins). */
+    poolMigration?: boolean
   } = {},
 ) {
   const files = poolFiles()
@@ -93,6 +95,7 @@ async function start(
     fence: async () => ({ open: true }),
     heartbeat: false,
     fetch: options.fetch ?? usageOnly,
+    ...(options.poolMigration ? { poolMigration: true } : {}),
     vault: {
       stateDir,
       connectionFile: () => daemon.connectionFile,
@@ -124,7 +127,7 @@ async function start(
   // The vault writes the quota reading to the roster file, then loads the
   // file back into memory; routing sees the reading once that load is done.
   await Bun.sleep(100)
-  return { host, daemon }
+  return { host, daemon, files }
 }
 
 type Host = Awaited<ReturnType<typeof start>>['host']
@@ -252,5 +255,229 @@ describe('vault accounts on OpenCode 2', () => {
     )
     await Bun.sleep(100)
     expect(refreshed.some((token) => token.includes('B-refresh'))).toBe(false)
+  })
+
+  // The pool source polls every row once when it first reads the pool. Those
+  // polls must wait until the vault has read which accounts it holds, or the
+  // local copy of a vault account is polled with its own token at startup.
+  it('never polls the quota of a pool row signing in as an account the vault holds, from the first read on', async () => {
+    const polls: string[] = []
+    const recording = (async (input: unknown, init?: RequestInit) => {
+      if (String(input).includes('/wham/usage'))
+        polls.push(new Headers(init?.headers).get('authorization') ?? '')
+      return usageOnly(input as never, init)
+    }) as unknown as typeof fetch
+    await start(
+      'fallback-first',
+      [{ id: 'main' }, { id: 'B', identity: 'chatgpt-vault' }],
+      { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+      { fetch: recording },
+    )
+    await waitFor(
+      () => polls.includes('Bearer main-token'),
+      'the first quota poll of row main',
+    )
+    // Every row's first quota poll is fired at once, but each takes the pool
+    // store's lock in turn, so a second row's poll can come well after row
+    // main's; wait long enough for it to show.
+    await Bun.sleep(1_000)
+    expect(polls).not.toContain('Bearer B-token')
+  })
+
+  it('a vault daemon that never answers holds neither setup nor, past a bounded wait, a pool request', async () => {
+    const files = poolFiles()
+    seedPool(files, 'fallback-first', [{ id: 'main' }])
+    const stateDir = join(files.dir, 'vault')
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+    const { tokenPath } = vaultPaths(stateDir, 'opencode')
+    writeFileSync(
+      tokenPath,
+      JSON.stringify({ token: ENROLLMENT_TOKEN, token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    chmodSync(tokenPath, 0o600)
+    const host = fakeOpenCode2Host()
+    const starting = Date.now()
+    const stop = await setupOpenAIAuth(host.ctx, {
+      paths: files.paths,
+      slot: opencode1HostSlot(join(files.dir, 'auth.json')),
+      fence: async () => ({ open: true }),
+      heartbeat: false,
+      fetch: usageOnly,
+      vault: {
+        stateDir,
+        // The connection is never made, so the first roster read never ends.
+        connectScoped: () => new Promise(() => {}),
+        pollIntervalMs: 0,
+      },
+    })
+    cleanups.push(() => rmSync(files.dir, { recursive: true, force: true }))
+    cleanups.push(async () => {
+      await stop?.()
+    })
+    expect(Date.now() - starting).toBeLessThan(1_000)
+
+    const sending = Date.now()
+    const served = await send(host, 200)
+
+    expect(served.get('authorization')).toBe('Bearer main-token')
+    // The request's token step waited for the roster, but only up to
+    // VAULT_FIRST_ROSTER_WAIT_MS (2 s).
+    expect(Date.now() - sending).toBeGreaterThanOrEqual(1_900)
+    expect(Date.now() - sending).toBeLessThan(4_000)
+  }, 10_000)
+
+  // A login on an install that has not migrated yet waits for the pool
+  // lifecycle to go idle, and the lifecycle's adoption waits for the vault's
+  // first roster. With a daemon that never answers, that adoption must give
+  // up after its bound without adopting, so the login still completes.
+  it('a vault daemon that never answers holds no login on an unmigrated install, and nothing is adopted', async () => {
+    const files = poolFiles()
+    writeFileSync(
+      files.configPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        routing: { mode: 'main-first' },
+        accounts: [],
+      }),
+    )
+    const authPath = join(files.dir, 'auth.json')
+    writeFileSync(
+      authPath,
+      JSON.stringify({
+        openai: {
+          type: 'oauth',
+          access: chatgptAccessToken('chatgpt-main'),
+          refresh: 'slot-refresh',
+          expires: Date.now() + 3_600_000,
+        },
+      }),
+    )
+    const stateDir = join(files.dir, 'vault')
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+    const { tokenPath } = vaultPaths(stateDir, 'opencode')
+    writeFileSync(
+      tokenPath,
+      JSON.stringify({ token: ENROLLMENT_TOKEN, token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    chmodSync(tokenPath, 0o600)
+    // The migration waits at its version fence until the login is under
+    // way. Once the install is migrated, the next fence read (the
+    // adoption's) finds a later login in the slot, which an adoption that
+    // did not wait for the vault would take into the pool.
+    const later = {
+      type: 'oauth',
+      access: chatgptAccessToken('chatgpt-later'),
+      refresh: 'later-refresh',
+      expires: Date.now() + 3_600_000,
+    }
+    const releaseMigration = Promise.withResolvers<void>()
+    let laterWritten = false
+    const fence = async () => {
+      if (files.readConfig().openaiAuthPool?.migratedAt === undefined) {
+        await releaseMigration.promise
+      } else if (!laterWritten) {
+        laterWritten = true
+        writeFileSync(authPath, JSON.stringify({ openai: later }))
+      }
+      return { open: true as const }
+    }
+    const host = fakeOpenCode2Host()
+    const stop = await setupOpenAIAuth(host.ctx, {
+      paths: files.paths,
+      slot: opencode1HostSlot(authPath),
+      fence,
+      heartbeat: false,
+      fetch: usageOnly,
+      poolMigration: true,
+      beginLogin: (async () => ({
+        url: 'https://auth.test/authorize',
+        instructions: 'sign in',
+        completion: Promise.resolve({
+          id: 'chatgpt-new',
+          type: 'oauth' as const,
+          access: 'new-access',
+          refresh: 'new-refresh',
+          expires: Date.now() + 3_600_000,
+          enabled: true,
+          addedAt: Date.now(),
+          lastUsed: Date.now(),
+          accountId: 'chatgpt-new',
+        }),
+      })) as never,
+      vault: {
+        stateDir,
+        // The connection is never made, so the first roster read never ends.
+        connectScoped: () => new Promise(() => {}),
+        pollIntervalMs: 0,
+        firstRosterWaitMs: 300,
+      },
+    })
+    cleanups.push(() => rmSync(files.dir, { recursive: true, force: true }))
+    cleanups.push(async () => {
+      await stop?.()
+    })
+
+    const method = host.methods.find(
+      (entry) =>
+        entry.integrationID === 'openai' &&
+        entry.method.id === 'chatgpt-browser',
+    )
+    if (!method) throw new Error('no chatgpt-browser method registered')
+    const signing = Date.now()
+    const authorization = await method.authorize({})
+    const signedIn = authorization.callback
+    // Long enough for the login to reach its wait for the migration.
+    await Bun.sleep(100)
+    releaseMigration.resolve()
+    await signedIn
+
+    // The adoption gave up after its 300 ms bound; the rest is the migration
+    // and the login write, which take longer on a loaded machine. A login
+    // held by an unbounded wait would never finish (the test times out).
+    expect(Date.now() - signing).toBeLessThan(8_000)
+    const accounts = files.readConfig().accounts
+    expect(accounts.map((account) => account.accountId)).toContain(
+      'chatgpt-new',
+    )
+    expect(laterWritten).toBe(true)
+    expect(accounts.map((account) => account.accountId)).not.toContain(
+      'chatgpt-later',
+    )
+    expect(JSON.parse(readFileSync(authPath, 'utf8')).openai).toEqual(later)
+  }, 15_000)
+
+  it('does not adopt a login in the host slot while the vault serves this host its accounts', async () => {
+    const login = {
+      type: 'oauth',
+      access: chatgptAccessToken('chatgpt-login'),
+      refresh: 'login-refresh',
+      expires: Date.now() + 3_600_000,
+    }
+    const { files } = await start(
+      'fallback-first',
+      [{ id: 'main' }],
+      { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+      {
+        poolMigration: true,
+        prepare: (seeded) =>
+          writeFileSync(
+            join(seeded.dir, 'auth.json'),
+            JSON.stringify({ openai: login }),
+          ),
+      },
+    )
+    // The lifecycle's first run (already migrated, then one adoption) starts
+    // with setup; an adoption would have replaced the slot login with the
+    // pool placeholder and added a row by now.
+    await Bun.sleep(300)
+    expect(
+      JSON.parse(readFileSync(join(files.dir, 'auth.json'), 'utf8')).openai,
+    ).toEqual(login)
+    expect(files.readConfig().accounts.map((account) => account.id)).toEqual([
+      'main',
+    ])
   })
 })

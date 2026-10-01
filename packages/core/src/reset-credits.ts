@@ -141,8 +141,12 @@ export interface RunResetCreditResult {
   outcome: ResetRedemptionOutcome
   retrySafety: string
   /**
-   * True when the server refused the consume outright, so five minutes after
-   * the redemption started a new spend may replace it.
+   * True when the server refused the consume outright and the saved pair
+   * records that refusal once this answer is written, so five minutes after
+   * the redemption started a new spend may replace it. Absent for a refusal
+   * the saved pair does not record: one written after another send of the
+   * same pair got an unknown outcome (`SavedResetPair.unknownAnswers`), or
+   * one whose state write failed. Such a pair still blocks a new spend.
    */
   refused?: boolean
   finalizeStateWriteFailed?: boolean
@@ -558,6 +562,12 @@ export async function claimResetAttempt(
  * `sentAs`. A terminal answer clears the pair. Any other answer keeps it,
  * binding a pair saved without an account to `sentAs` and noting whether the
  * server refused it outright (`SavedResetPair.rejectedStatus`).
+ *
+ * Resolves to the saved pair as it stands once the answer is written, or
+ * undefined when no pair matching `completing` is saved any more (a terminal
+ * answer cleared it, or another attempt settled or replaced it). Another
+ * send of the same pair may have changed the saved pair since `completing`
+ * was read, so this, not `outcome`, says what a new spend may do.
  */
 export async function finalizeResetAttempt(
   deps: ResetStateDeps,
@@ -565,17 +575,16 @@ export async function finalizeResetAttempt(
   completing: SavedResetPair,
   outcome: ResetConsumeOutcome,
   sentAs?: string,
-): Promise<void> {
-  if (!isSafeResetAccountKey(accountKey)) return
+): Promise<SavedResetPair | undefined> {
+  if (!isSafeResetAccountKey(accountKey)) return undefined
   if (!isTerminalConsumeKind(outcome.kind)) {
-    await recordUnreconciledAnswer(
+    return recordUnreconciledAnswer(
       deps,
       accountKey,
       completing,
       outcome,
       sentAs,
     )
-    return
   }
   await deps.mutateAccountsFn((current) => {
     const state = resetStateForAccount(current, accountKey)
@@ -598,6 +607,20 @@ export async function finalizeResetAttempt(
     }
     return current
   }, storePaths(deps))
+  return undefined
+}
+
+/** The pair saved in `state`, when it is the same pair as `completing`. */
+function savedPairMatching(
+  state: ResetAccountState | undefined,
+  completing: SavedResetPair,
+): SavedResetPair | undefined {
+  const persisted = validInFlight(state?.inFlight)
+  return persisted &&
+    persisted.redeemRequestId === completing.redeemRequestId &&
+    persisted.creditId === completing.creditId
+    ? persisted
+    : undefined
 }
 
 async function recordUnreconciledAnswer(
@@ -606,25 +629,27 @@ async function recordUnreconciledAnswer(
   completing: SavedResetPair,
   outcome: ResetConsumeOutcome,
   sentAs: string | undefined,
-): Promise<void> {
+): Promise<SavedResetPair | undefined> {
   const refusal = isRefusedConsume(outcome) ? outcome.status : undefined
   const bind = completing.chatgptAccountId === undefined && sentAs !== undefined
-  // A repeated refusal changes nothing. An unknown outcome is always written:
-  // `completing` is the pair as read before the send, and another send of it
-  // may have recorded a refusal since.
-  if (!bind && refusal !== undefined && refusal === completing.rejectedStatus)
-    return
+  // A repeated refusal changes nothing, so it is not written; the saved pair
+  // is only read, without the lock, to report what it allows now (another
+  // send's unknown outcome may have withdrawn the refusal since). An unknown
+  // outcome is always written: `completing` is the pair as read before the
+  // send, and another send of it may have recorded a refusal since.
+  if (!bind && refusal !== undefined && refusal === completing.rejectedStatus) {
+    const current = await deps.loadAccountsFn(storePaths(deps))
+    return savedPairMatching(
+      current ? resetStateForAccount(current, accountKey) : undefined,
+      completing,
+    )
+  }
+  let saved: SavedResetPair | undefined
   await deps.mutateAccountsFn((current) => {
+    saved = undefined
     const state = resetStateForAccount(current, accountKey)
-    const persisted = validInFlight(state?.inFlight)
-    if (
-      !state ||
-      !persisted ||
-      persisted.redeemRequestId !== completing.redeemRequestId ||
-      persisted.creditId !== completing.creditId
-    ) {
-      return current
-    }
+    const persisted = savedPairMatching(state, completing)
+    if (!state || !persisted) return current
     const next: SavedResetPair = { ...persisted }
     if (next.chatgptAccountId === undefined && sentAs !== undefined) {
       next.chatgptAccountId = sentAs
@@ -638,8 +663,10 @@ async function recordUnreconciledAnswer(
       next.rejectedStatus = refusal
     }
     state.inFlight = next
+    saved = next
     return current
   }, storePaths(deps))
+  return saved
 }
 
 export function resetWindowIsExhausted(
@@ -892,6 +919,24 @@ function retrySafetyFor(outcome: ResetConsumeOutcome): string {
   return 'The outcome is uncertain. A retry within five minutes reuses the same request and credit identifiers; this does not prove the server did nothing.'
 }
 
+/**
+ * What a refusal the saved pair does not record allows: `saved` is the pair
+ * as it stands after the answer was written (`finalizeResetAttempt`), and
+ * `stateWriteFailed` says that write failed, so the saved state is unknown.
+ */
+function unrecordedRefusalSafety(
+  stateWriteFailed: boolean,
+  saved: SavedResetPair | undefined,
+): string {
+  if (stateWriteFailed) {
+    return 'The server refused the request, but recording the refusal failed, so the saved redemption may still be treated as unknown and block a new attempt. A retry reuses the same request and credit identifiers; this does not prove the server did nothing.'
+  }
+  if (saved) {
+    return 'The server refused the request, but another send of the same request had an unknown outcome, so the saved redemption still blocks a new attempt until a retry settles it. A retry reuses the same request and credit identifiers; this does not prove the server did nothing.'
+  }
+  return 'The server refused the request, and another attempt has already settled or replaced the saved redemption. A new attempt is gated by the current saved state and fresh preconditions.'
+}
+
 export async function runResetCreditRedemption(
   deps: RunResetCreditDeps,
   input: RunResetCreditInput,
@@ -990,9 +1035,10 @@ export async function runResetCreditRedemption(
     claim.inFlight.creditId,
     claim.inFlight.redeemRequestId,
   )
-  let finalizeStateWriteFailed = false
+  let saved: SavedResetPair | undefined
+  let stateWriteFailed = false
   try {
-    await finalizeResetAttempt(
+    saved = await finalizeResetAttempt(
       deps,
       input.accountKey,
       claim.inFlight,
@@ -1000,8 +1046,16 @@ export async function runResetCreditRedemption(
       identity,
     )
   } catch {
-    finalizeStateWriteFailed = isTerminalConsumeKind(outcome.kind)
+    stateWriteFailed = true
   }
+  const finalizeStateWriteFailed =
+    stateWriteFailed && isTerminalConsumeKind(outcome.kind)
+  // Reported as refused only when the saved pair records a refusal, since
+  // that, not this send's answer, is what lets a new spend replace it.
+  const refused =
+    isRefusedConsume(outcome) &&
+    !stateWriteFailed &&
+    saved?.rejectedStatus !== undefined
   return {
     target,
     selectedCredit: claim.selectedCredit,
@@ -1009,8 +1063,10 @@ export async function runResetCreditRedemption(
     outcome,
     retrySafety: finalizeStateWriteFailed
       ? 'The server returned a terminal result, but the state write failed. A retry within five minutes reuses the same request and credit identifiers.'
-      : retrySafetyFor(outcome),
-    ...(isRefusedConsume(outcome) ? { refused: true } : {}),
+      : isRefusedConsume(outcome) && !refused
+        ? unrecordedRefusalSafety(stateWriteFailed, saved)
+        : retrySafetyFor(outcome),
+    ...(refused ? { refused: true } : {}),
     ...(finalizeStateWriteFailed ? { finalizeStateWriteFailed: true } : {}),
   }
 }

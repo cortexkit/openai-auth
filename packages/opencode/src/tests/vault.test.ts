@@ -20,7 +20,10 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { MenuTerminal } from '@cortexkit/common-auth/auth-menu'
-import { readClaustrumEnrollmentToken } from '@cortexkit/common-auth/claustrum'
+import {
+  connectClaustrumScopedClient,
+  readClaustrumEnrollmentToken,
+} from '@cortexkit/common-auth/claustrum'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore } from '@cortexkit/common-auth/store'
 import {
@@ -50,8 +53,10 @@ import {
   quotaMap,
   readJson,
   seedPool,
+  sleep,
   usageBody,
   type Wire,
+  waitFor,
 } from './fixtures/pool-install'
 
 /** The network, with the main row's quota polls reading it exhausted. */
@@ -455,6 +460,78 @@ describe('routing', () => {
     ])
     expect(wire.sends).not.toContain('Bearer alpha-token')
   })
+
+  // The pool source polls every row once when it first reads the pool. Those
+  // polls must wait until the vault has read which accounts it holds, or the
+  // local copy of a vault account is polled with its own token at startup.
+  test('a pool row signing in as an account the vault holds is not polled at startup', async () => {
+    const running = await startDaemon({
+      'oauth:openai:alpha': vaultLogin('chatgpt-alpha'),
+    })
+    enroll()
+    seedPool(files, [
+      { id: 'main', quota: quotaMap(10) },
+      { id: 'alpha', quota: quotaMap(5) },
+    ])
+    const wire = installWire()
+    // The vault's connection opens 150 ms late, so its first roster read ends
+    // well after the loader's first pool read. A pool source whose first
+    // polls do not wait for the roster then polls row alpha on every run,
+    // instead of only on runs where its pool read happens to come first.
+    hooks = await loadPlugin({
+      vault: {
+        stateDir,
+        connectionFile: () => running.connectionFile,
+        connectScoped: async () => {
+          await sleep(150)
+          return connectClaustrumScopedClient({
+            connectionFile: running.connectionFile,
+            projectRoot: dir,
+            storagePath: vaultPaths(stateDir, 'opencode').tokenPath,
+          })
+        },
+        pollIntervalMs: 0,
+      },
+    })
+
+    await waitFor(
+      () => (wire.polls.includes('Bearer main-token') ? true : undefined),
+      'the first quota poll of row main',
+    )
+    // Every row's first quota poll is fired at once, but each takes the pool
+    // store's lock in turn, so a second row's poll can come well after row
+    // main's; wait long enough for it to show.
+    await sleep(1_000)
+    expect(wire.polls).not.toContain('Bearer alpha-token')
+  })
+
+  test('a vault daemon that never answers holds neither the loader nor, past a bounded wait, a pool request', async () => {
+    await startDaemon({ 'oauth:openai:alpha': vaultLogin('chatgpt-alpha') })
+    enroll()
+    seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+    const wire = installWire()
+    const loading = Date.now()
+    hooks = await loadPlugin({
+      vault: {
+        stateDir,
+        // The connection is never made, so the first roster read never ends.
+        connectScoped: () => new Promise(() => {}),
+        pollIntervalMs: 0,
+      },
+    })
+    const send = await fetchOverride()
+    expect(Date.now() - loading).toBeLessThan(1_000)
+
+    const sending = Date.now()
+    const response = await request(send)
+
+    expect(response.status).toBe(200)
+    expect(wire.sends).toEqual(['Bearer main-token'])
+    // The request's token step waited for the roster, but only up to
+    // VAULT_FIRST_ROSTER_WAIT_MS (2 s).
+    expect(Date.now() - sending).toBeGreaterThanOrEqual(1_900)
+    expect(Date.now() - sending).toBeLessThan(4_000)
+  }, 10_000)
 
   test('a static OpenAI API key in the vault is never listed, read, routed or reported', async () => {
     const running = await startDaemon({

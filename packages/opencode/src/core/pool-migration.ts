@@ -349,6 +349,12 @@ export type PoolTransferOutcome =
          */
         | 'placeholder-overwritten'
         | 'unsettled'
+        /**
+         * An adoption found the vault's first roster read still unfinished
+         * after its wait, so whether the vault serves this host was unknown;
+         * nothing was adopted.
+         */
+        | 'vault-roster-pending'
         | `store-${string}`
     }
   | { status: 'error'; reason: string }
