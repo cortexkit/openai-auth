@@ -20,6 +20,7 @@ import type {
 import packageJson from '../package.json' with { type: 'json' }
 import { getPiAccountPaths } from './paths.ts'
 import { clearPiStickyRouting, getPiStickyRouting } from './routing.ts'
+import type { PiPoolCommands } from './runtime.ts'
 
 export type PiCommandDependencies = {
   accountPaths?: () => AccountPaths
@@ -29,6 +30,12 @@ export type PiCommandDependencies = {
   now?: () => number
   packageVersion?: string
   randomUUID?: () => string
+  /**
+   * The account pool the request path routes across. With it, the commands
+   * list the pool's rows (Pi's login as `main`) and show their quota once
+   * the pool is in use; without it, they work on the legacy account list.
+   */
+  pool?: PiPoolCommands
 }
 
 const clientStub: CommandContext['client'] = {
@@ -48,9 +55,26 @@ async function createCommandContext(
     fetchImpl: dependencies.fetchImpl,
     now: dependencies.now,
   })
-  quotaManager.seedFallbacksFromAccounts(
-    (storage?.accounts ?? []).filter(isOAuthAccount),
-  )
+  const pool = dependencies.pool
+  if (pool) {
+    // Pi's login is the `main` row: take the token Pi holds for it now, as a
+    // request would, so the commands list it and show its quota.
+    try {
+      pool.observeLogin(
+        await ctx.modelRegistry?.getApiKeyForProvider('openai-codex'),
+      )
+    } catch {
+      // No login: the commands list the pool's rows alone.
+    }
+  }
+  const poolActive = pool ? await pool.poolActive() : false
+  if (pool && poolActive) {
+    pool.seedQuota(quotaManager)
+  } else {
+    quotaManager.seedFallbacksFromAccounts(
+      (storage?.accounts ?? []).filter(isOAuthAccount),
+    )
+  }
 
   return {
     accountStoragePath: paths.configPath,
@@ -67,6 +91,22 @@ async function createCommandContext(
     now: dependencies.now,
     randomUUID: dependencies.randomUUID,
     beginAccountLogin: dependencies.beginAccountLogin,
+    ...(pool
+      ? {
+          accountPool: pool.accountPool,
+          ...(poolActive
+            ? {
+                // `/openai-quota` polls every account, then reads the quota
+                // manager, so the manager is filled again after the polls.
+                refreshAllQuota: async () => {
+                  const results = await pool.refreshAllQuota()
+                  pool.seedQuota(quotaManager)
+                  return results
+                },
+              }
+            : {}),
+        }
+      : {}),
   }
 }
 
