@@ -290,8 +290,9 @@ export async function setupOpenAIAuth(
       models.dispose(),
       imported,
     ])
-    // Quota a response carried is written in the background; give those
-    // writes a bounded moment so a clean shutdown keeps them.
+    // Quota readings taken from responses are written to the pool files in
+    // the background; wait a bounded time for those writes so a clean
+    // shutdown does not lose them.
     await Promise.race([
       source.settled(),
       new Promise((resolve) =>

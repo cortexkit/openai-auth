@@ -25,7 +25,7 @@ export interface WireRecord {
   readonly identity: Identity
   /** The `chatgpt-account-id` header as sent. */
   readonly accountHeader: string | null
-  /** Any header carried a value the host should never send. */
+  /** Some header carried one of the `forbidden` values the mock was started with. */
   readonly forbiddenSeen: boolean
   readonly rejected?: RejectMode
 }
@@ -252,7 +252,8 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
         )
       }
       const index = ++requests
-      // Only agent-loop requests carry tool definitions.
+      // The agent loop (the model turn that may call tools) sends tool
+      // definitions; title requests do not, so `tools` tells them apart.
       const kind = /"tools"\s*:/.test(body) ? 'primary' : 'other'
       const rejected = kind === 'primary' ? takeReject(identity) : undefined
       if (kind === 'primary')

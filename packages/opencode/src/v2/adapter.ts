@@ -68,7 +68,7 @@ export const OPENAI_PROVIDER_ID = 'openai'
 /**
  * How long a row stays marked after a refusal that named no reset and whose
  * window has no known reset either; the value OpenCode 1 uses
- * (`DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS` in the plugin entry).
+ * (`DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS` in `src/index.ts`).
  */
 export const DEFAULT_LIMIT_MARK_MS = 60_000
 
@@ -259,8 +259,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   const { source, pins } = deps
   const now = deps.now ?? Date.now
   const log = deps.log
-  // The bearer last handed out per row: quota readings are attributed to a
-  // row only when they came back for that row's own token.
+  // The token last handed out for each row. A quota reading is recorded on a
+  // row only together with the token the request was sent with, and the pool
+  // drops it when that token is not the row's own (`recordSnapshot`).
   const tokens = new Map<string, string>()
   // The row each session's latest agent-loop request went to, which its
   // title, compaction and generate requests follow in the ordered modes.
@@ -350,8 +351,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           storage,
           id === FORMER_MAIN_ID ? undefined : id,
         ),
-      // Reset credits come from the quota poll's full reading, which only
-      // OpenCode 1's in-memory quota cache keeps; no tie-break here.
+      // OpenCode 1 breaks placement ties by the reset credits an account
+      // holds, which only its in-memory quota cache records; nothing here
+      // records them, so ties fall to the roster order.
       resetCredits: () => undefined,
     }
     const sticky = admitSticky(routing)
@@ -385,8 +387,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     if (pinned.kind === 'move') {
       const replacement = place([...base, id], persist)
       if (replacement) return replacement.accountId
-      // No other row after all: a row that is only exhausted is still sent
-      // to, as OpenCode 1 does; one below its killswitch floor never is.
+      // No other row can take the session: a row whose quota reads spent is
+      // still sent to, as OpenCode 1 does (the reading may be stale and the
+      // provider decides); a row below its killswitch floor never is.
       return pinned.reason === 'killswitch' ? undefined : id
     }
     if (pinned.kind === 'detour') {

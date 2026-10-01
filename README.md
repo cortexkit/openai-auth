@@ -55,7 +55,7 @@ The account you log in with via `/login openai` is your **main** account, stored
 
 ## OpenCode 2
 
-The same package runs on OpenCode 2 (`@opencode/cli`, tested on 2.0.21). OpenCode 2 loads a package plugin's `./server` entry, which holds the OpenCode 2 plugin (and, for OpenCode 1, which prefers that entry too, the same OpenCode 1 plugin as the package root):
+The same package runs on OpenCode 2 (`@opencode/cli`, tested on 2.0.21). OpenCode 2 loads the plugin from the package's `./server` entry. OpenCode 1 also prefers that entry over the package root, so it carries the same OpenCode 1 plugin as the root as well:
 
 ```json
 {
@@ -68,14 +68,14 @@ or `opencode plugin add @cortexkit/opencode-openai-auth`. Sign in with `opencode
 How it differs from OpenCode 1:
 
 - **OpenCode 2 sends the requests itself**, through its own OpenAI driver over HTTP or its WebSocket. The plugin does not rewrite them: it picks the account and sets that account's `Authorization` and `chatgpt-account-id` through OpenCode 2's session hooks (`@cortexkit/common-auth/opencode2`).
-- **One account pool for both hosts.** OpenCode 2 reads and writes the same files as OpenCode 1 (`~/.config/opencode/openai-auth.json` and its state file). An install whose accounts have not moved to the pool yet moves them on the first OpenCode 2 start, the same way OpenCode 1 does: OpenCode 1's `openai` login (`~/.local/share/opencode/auth.json`) becomes row `main`, and the move waits until no older openai-auth process is running. Until then OpenAI requests are refused.
+- **One account pool for both hosts.** OpenCode 2 reads and writes the same files as OpenCode 1 (`~/.config/opencode/openai-auth.json` and its state file). An install whose accounts are not in the shared account pool yet (the main login still in OpenCode 1's own login store) moves them there on the first OpenCode 2 start, the same way OpenCode 1 does: OpenCode 1's `openai` login (`~/.local/share/opencode/auth.json`) becomes row `main`, and the move waits until no older openai-auth process is running. Until then OpenAI requests are refused.
 - **Logins land in the pool.** The two ChatGPT logins replace OpenCode 2's built-in ones. Signing in again with an account the pool already holds replaces that account's credential; the first login of a pool with no `main` account becomes `main`; any other login adds an account. OpenCode 2 itself only stores a placeholder that works against nothing. A ChatGPT login OpenCode 2 held before the plugin was installed is copied into the pool at start, unless the pool already holds that account.
 - **Routing** follows the same settings (`main-first`, `fallback-first`, `sticky-balanced`, the killswitch and quota floors). A session's side requests (title, compaction, generate) go to the session's account. Sticky pins live in the server process, so a restarted server places its sessions again.
 - **Rate limits.** A usage-limit or rate-limit refusal that arrives before any output is retried at once on another account, and that account is marked limited. Once output has started a request is never retried.
 - **Quota** from the `x-codex-*` response headers and `codex.rate_limits` frames is recorded on the account that served.
 - **Models**: the same allow and deny lists and context caps as on OpenCode 1.
 
-Not on OpenCode 2 yet: the `/openai` menu and the sidebar (account management works from OpenCode 1, or `opencode auth login` there), cache keep-warm, request dumps, reset credits, Claustrum custody (an install in custody mode does not move to the pool, so OpenCode 2 refuses its requests), cost zeroing, and the Codex request shaping OpenCode 1 does: the Codex client identity (`version`, `originator: codex_exec`, its user agent), turn-metadata headers, Responses Lite, and the mid-conversation reasoning-effort update for the gpt-6 family. OpenCode 2's driver sends its own identity (`originator: opencode`, `session-id`, `x-codex-beta-features: remote_compaction_v2`, `prompt_cache_key` set to the session). While the plugin is loaded, provider `openai` is served from the pool only: an OpenAI API key does not work through it.
+Not on OpenCode 2 yet: the `/openai` menu and the sidebar (account management works from OpenCode 1, or `opencode auth login` there), cache keep-warm, request dumps, reset credits, Claustrum custody (an install that keeps its credentials in the Claustrum vault does not move to the pool, so OpenCode 2 refuses its requests), cost zeroing, and the Codex request shaping OpenCode 1 does: the Codex client identity (`version`, `originator: codex_exec`, its user agent), turn-metadata headers, Responses Lite, and the mid-conversation reasoning-effort update for the gpt-6 family. OpenCode 2's driver sends its own identity (`originator: opencode`, `session-id`, `x-codex-beta-features: remote_compaction_v2`, `prompt_cache_key` set to the session). While the plugin is loaded, provider `openai` is served from the pool only: an OpenAI API key does not work through it.
 
 ## Multiple accounts
 
