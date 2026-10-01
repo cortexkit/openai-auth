@@ -978,6 +978,65 @@ describe('commands', () => {
       expect(saved?.cooldownUntil).toBeGreaterThan(now)
     })
 
+    test('/openai reset credits: Retry of a pair saved under another ChatGPT account sends nothing and says how to recover', async () => {
+      const fixture = resetFixture({ outcome: 'no_credit' })
+      await resetSection(fixture)
+      const saved = {
+        redeemRequestId: 'request-of-another-account',
+        creditId: 'credit-of-another-account',
+        startedAt: now - 1_000,
+        chatgptAccountId: 'chatgpt-someone-else',
+      }
+      await settingsMutateAccounts(
+        openAccountPool(getAccountPaths(configPath)),
+        undefined,
+      )((current) => {
+        current.reset = { 'fallback-a': { inFlight: saved } }
+        return current
+      }, getAccountPaths(configPath))
+
+      const restarted = await resetSection(fixture, { restart: true })
+      for (const action of ['retry', 'spend']) {
+        const outcome = await restarted.run('fallback-a', action)
+        expect(text(outcome)).toContain('Nothing was sent')
+        expect(text(outcome)).toContain('Sign this account back in')
+        expect(text(outcome)).not.toContain('chatgpt-someone-else')
+      }
+
+      expect(postIds(fixture)).toEqual([])
+      expect(savedReset()['fallback-a']?.inFlight).toEqual(saved)
+    })
+
+    test('/openai reset credits: a refused redemption expires, and Spend then starts a new one', async () => {
+      const refusing = resetFixture({ postStatus: 400 })
+      const refused = await (await resetSection(refusing)).run(
+        'fallback-a',
+        'spend',
+      )
+      expect(text(refused)).toContain('The server refused the request')
+      expect(savedReset()['fallback-a']?.inFlight).toMatchObject({
+        chatgptAccountId: 'chatgpt-fallback-a',
+        rejectedStatus: 400,
+      })
+
+      const later = resetFixture({ freshAfterPost: true })
+      const spent = await (
+        await resetSection(later, { restart: true, at: now + 6 * 60_000 })
+      ).run('fallback-a', 'spend')
+
+      expect(text(spent)).toContain('Code: `reset`')
+      // A new redemption re-reads the credits before it claims one; a replay
+      // of the saved pair would not.
+      expect(
+        later.calls.some(
+          (call) =>
+            call.method === 'GET' &&
+            call.url.endsWith('rate-limit-reset-credits'),
+        ),
+      ).toBe(true)
+      expect(savedReset()['fallback-a']?.inFlight).toBeUndefined()
+    })
+
     test('ambiguous local renderer preserves no-request guidance without success or retry guarantees', async () => {
       const result = {
         target: {
