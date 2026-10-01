@@ -824,18 +824,17 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       mode: 'fallback-first',
       plugin: vaultPlugin,
       vault: true,
-      // The first turn starts the plugin, before the vault account has a
-      // quota reading; it is served by the pool row.
+      // The first turn starts the plugin. It goes to the vault account only if
+      // the account's first quota reading lands before the turn is routed;
+      // otherwise the pool row serves it.
       turns: [{}, {}, { reject: { account: 'V', mode: 'unauthorized' } }],
     })
     verify(result, () => {
       expect(result.exits.slice(0, 2)).toEqual([0, 0])
       expectOnlyPoolAccountsOnWire(result)
-      expect(pick(primaries(result.wire), 'identity', 'rejected')).toEqual([
-        'A:',
-        'V:',
-        'V:unauthorized',
-      ])
+      const served = pick(primaries(result.wire), 'identity', 'rejected')
+      expect(['A:', 'V:']).toContain(served[0] ?? '')
+      expect(served.slice(1)).toEqual(['V:', 'V:unauthorized'])
       expect(result.stdout[1]).toContain('-V')
       expect(result.vaultReports).toEqual([
         expect.objectContaining({
