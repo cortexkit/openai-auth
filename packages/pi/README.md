@@ -34,11 +34,7 @@ Restart Pi after installing, then authenticate through Pi's normal login flow:
 
 ## Commands
 
-The extension registers three commands in Pi:
-
-- `openai-account` — list your accounts (the one you signed in to Pi with is `main`), `openai-account add [label]` to add a fallback account via OAuth (browser or `--headless`), `openai-account enable|disable|remove <id>`, or `openai-account order <a> <b>` to swap two fallbacks.
-- `openai-quota` — check and show the current quota of `main` and every fallback account.
-- `openai-routing` — set the routing order (`main-first`, `fallback-first`, `sticky-balanced`) or reset this session's pin.
+The extension registers one command in Pi, `openai`, which opens a menu: Accounts (add a fallback account via OAuth, disable, enable, move or remove one), Quota (check now), Routing (`ordered`, `main-first`, `fallback-first`, `sticky-balanced`, and the roster order), Limits (the killswitch and per-account floors), Pi login (the quota of the account you signed in to Pi with, routed as `main`) and This session (clear the session's pin).
 
 ## How requests are routed
 

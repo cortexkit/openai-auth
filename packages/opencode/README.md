@@ -29,35 +29,14 @@ Restart OpenCode after changing plugin config, then authenticate:
 - Per-turn quota tracking (5-hour + weekly windows) on both transports, with a sidebar readout and an explicit all-accounts refresh.
 - Idle prompt-cache keep-warm, with an optional subagent mode and main-only sustain mode.
 - Leveled, secret-redacting, rotating log file.
-- Interactive in-TUI control surfaces for every command, including fallback account management and headless device-code authentication.
+- One interactive `/openai` menu in the TUI, including account management and headless device-code authentication.
 - Optional OpenAI Responses WebSocket transport (HTTP is the default).
 
 ## Commands
 
-Each opens an interactive dialog in the TUI. Commands with listed arguments also accept those explicit arguments:
+One command, `/openai`, opens one menu in the TUI: Accounts (add with browser or device-code sign-in, disable, enable, move, remove), Quota, Routing, Limits (the killswitch and per-account floors), Cache (keep-warm), Diagnostics (request dumps, log level), Reset credits, This session (the sticky pin) and Claustrum. The menu works on the account pool; until the accounts have moved to it, `/openai` shows only that notice and the processes holding the move back. The earlier per-feature commands (`/openai-account`, `/openai-quota`, `/openai-routing`, `/openai-killswitch`, `/openai-cachekeep`, `/openai-dump`, `/openai-logging`, `/openai-reset`) are gone.
 
-| Command | Arguments | Purpose |
-| --- | --- | --- |
-| `/openai-quota` | — | Show 5h + weekly quota for all accounts. |
-| `/openai-account` | `add [label]` · `remove <id>` · `order <a> <b>` | Manage main + fallback accounts. |
-| `/openai-routing` | `main-first` · `fallback-first` · `sticky-balanced` · `reset` | Routing order, sticky balanced session pins, or clear the current pin. |
-| `/openai-killswitch` | `on` · `off` · `set <acct>:<5h>,<1w> ...` | Hard-block accounts below quota thresholds. |
-| `/openai-cachekeep` | `on` · `off` · `subagents on` · `subagents off` · `sustain on` · `sustain off` | Idle prompt-cache keep-warm; sustain bypasses only main idle pruning. |
-| `/openai-reset` | Modal only | Spend one applicable reset credit for an exhausted account after explicit confirmation. |
-| `/openai-logging` | `<level>` | Set log level live. |
-| `/openai-dump` | `on` · `off` | Toggle transport request dumps. |
-
-Account management (fallback accounts; the main account comes from `/login openai`):
-
-```text
-/openai-account add [--headless] [label]
-/openai-account
-/openai-account remove <id>
-```
-
-All account operations can also be performed interactively via the `/openai-account` TUI dialog.
-
-On a headless machine, where the slash commands are out of reach, `opencode auth login` offers the same account actions — add, re-authenticate the main account, force a quota check, diagnose and repair the stored credentials, or delete every fallback. It prints `Failed to authorize` on return even when the action succeeded, because the menu writes its own changes and reports none of them as a sign-in; confirm with `/openai-account`.
+On a headless machine, where `/openai` is out of reach, `opencode auth login` offers the account actions — add, re-authenticate, remove, enable or disable, check quotas, the auth doctor, or delete every account except `main`. It prints `Failed to authorize` on return even when the action succeeded, because the menu writes its own changes and reports none of them as a sign-in; confirm with `/openai`.
 
 ## Configuration
 
@@ -76,7 +55,7 @@ See the [repository README](https://github.com/cortexkit/openai-auth#readme) for
 
 `sticky-balanced` places a cold session by least projected quota pressure, then keeps its SHA-256-keyed sidebar-state pin for up to seven days. It does not rebalance mid-session or use a Retry-After hold; it migrates only after confirmed exhaustion or permanent auth failure. Stale or unknown quota is excluded from weighted placement; when the killswitch is enabled, accounts below their per-account threshold are also excluded from both weighted placement AND the mode-fallback fail-open branch — that branch otherwise orders by `resetCreditsApplicable` first, then configured order, then account id. Subagents have separate pins and reuse them when resumed.
 
-`/openai-cachekeep sustain on|off` defaults off, applies only to main sessions, remains subject to the clock window and memory/LRU caps, and never warms non-active accounts. It costs about two GPT-5.6 warms per hour per session (about 1K output tokens/hour at about 99.4% cache hit); non-5.6 sessions warm about twelve times per hour. Before enabling it for a main-session model, preserve existing entries in `~/.config/cortexkit/magic-context.jsonc` and set that model's `cache_ttl` to `"never"`; Magic Context does not run in subagents. `sustain` means bypass main idle pruning, unlike the sibling anthropic plugin's `always`, which means ignore the clock schedule.
+Sustain (the Cache section of `/openai`) defaults off, applies only to main sessions, remains subject to the clock window and memory/LRU caps, and never warms non-active accounts. It costs about two GPT-5.6 warms per hour per session (about 1K output tokens/hour at about 99.4% cache hit); non-5.6 sessions warm about twelve times per hour. Before enabling it for a main-session model, preserve existing entries in `~/.config/cortexkit/magic-context.jsonc` and set that model's `cache_ttl` to `"never"`; Magic Context does not run in subagents. `sustain` means bypass main idle pruning, unlike the sibling anthropic plugin's `always`, which means ignore the clock schedule.
 
 ## License
 
