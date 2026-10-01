@@ -1030,7 +1030,8 @@ describe('commands', () => {
       expect(
         later.calls.some(
           (call) =>
-            call.method === 'GET' && call.url.endsWith('rate-limit-reset-credits'),
+            call.method === 'GET' &&
+            call.url.endsWith('rate-limit-reset-credits'),
         ),
       ).toBe(true)
       expect(savedReset()['fallback-a']?.inFlight).toBeUndefined()

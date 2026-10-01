@@ -140,6 +140,11 @@ export interface RunResetCreditResult {
   beforeState: ResetAccountState | undefined
   outcome: ResetRedemptionOutcome
   retrySafety: string
+  /**
+   * True when the server refused the consume outright, so five minutes after
+   * the redemption started a new spend may replace it.
+   */
+  refused?: boolean
   finalizeStateWriteFailed?: boolean
 }
 
@@ -288,7 +293,7 @@ function isDefiniteRefusal(status: unknown): status is number {
 }
 
 /** Whether the server refused this consume outright (`isDefiniteRefusal`). */
-export function isRefusedConsume(outcome: ResetConsumeOutcome): boolean {
+function isRefusedConsume(outcome: ResetConsumeOutcome): boolean {
   return outcome.kind === 'http_error' && isDefiniteRefusal(outcome.status)
 }
 
@@ -979,6 +984,7 @@ export async function runResetCreditRedemption(
     retrySafety: finalizeStateWriteFailed
       ? 'The server returned a terminal result, but the state write failed. A retry within five minutes reuses the same request and credit identifiers.'
       : retrySafetyFor(outcome),
+    ...(isRefusedConsume(outcome) ? { refused: true } : {}),
     ...(finalizeStateWriteFailed ? { finalizeStateWriteFailed: true } : {}),
   }
 }

@@ -992,8 +992,8 @@ describe('atomic reset credit redemption', () => {
   }
 
   // These two seed a pair that records its ChatGPT account, as every pair
-  // minted now does; a pair saved without one is bound on its first send
-  // (see 'reset redemption bound to its ChatGPT account').
+  // minted now does; an older pair saved without one is bound to the account
+  // it is first sent under, which changes it.
   it('preserves the exact in-flight object after an ambiguous outcome', async () => {
     const inFlight: SavedResetPair = {
       redeemRequestId: 'ambiguous-request',
@@ -1322,7 +1322,7 @@ describe('reset redemption bound to its ChatGPT account', () => {
     }
   }
 
-  /** Deps whose row `main` now resolves to `identity`. */
+  /** Redemption dependencies with row `main` signed in as `identity`. */
   function depsAs(
     identity: string,
     options: Parameters<typeof redemptionDeps>[0] = {},
@@ -1377,7 +1377,8 @@ describe('reset redemption bound to its ChatGPT account', () => {
       const saved = pair(startedAt, { chatgptAccountId: 'account-a' })
       await seedResetState('main', { inFlight: saved })
       const posts: ReturnType<typeof requestBody>[] = []
-      // A terminal reply, had the pair been sent, would clear A's record.
+      // Had the pair been sent, this terminal reply would have cleared
+      // account-a's saved pair.
       const deps = depsAs('account-b', {
         fetchImpl: recordingWire(
           () => Response.json({ code: 'no_credit' }),
@@ -1385,7 +1386,10 @@ describe('reset redemption bound to its ChatGPT account', () => {
         ),
       })
 
-      const refused = runResetCreditRedemption(deps, inputAs('account-b', retry))
+      const refused = runResetCreditRedemption(
+        deps,
+        inputAs('account-b', retry),
+      )
 
       await expect(refused).rejects.toMatchObject({
         name: 'ResetRedemptionError',

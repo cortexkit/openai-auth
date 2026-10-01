@@ -49,7 +49,6 @@ import type { RefreshAllQuotaResult } from './refresh-all-quota'
 import {
   countEligibleResetCredits,
   evaluateResetPrecondition,
-  isRefusedConsume,
   listResetCredits,
   ResetCreditError,
   ResetRedemptionError,
@@ -1443,9 +1442,9 @@ export async function renderResetCoordinatorResult(
     )
   }
   if (code === 'ambiguous' || code === 'http_error') {
-    const refused = isRefusedConsume(result.outcome)
+    const refused = result.refused
       ? ' The server refused the request; five minutes after the redemption started, "Spend a reset credit" starts a new one instead.'
-        : ''
+      : ''
     return resetResultPayload(
       accountKey,
       code,
