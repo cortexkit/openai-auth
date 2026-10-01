@@ -463,6 +463,21 @@ describe('Pi requests on the account pool', () => {
     expect(codexTokens()).toEqual([MAIN_TOKEN])
   })
 
+  test('every account gets a quota check as soon as it is seen, before any request', async () => {
+    const runtime = makeRuntime()
+
+    await runtime.start()
+    await runtime.pool.settled()
+    runtime.main.observeToken(MAIN_TOKEN)
+    await runtime.main.pending()
+
+    const polled = calls
+      .filter((call) => call.url === WHAM_URL)
+      .map((call) => call.token)
+    expect(polled.sort()).toEqual([ALPHA_TOKEN, BETA_TOKEN, MAIN_TOKEN].sort())
+    expect(codexTokens()).toEqual([])
+  })
+
   test('a pool row holding the account Pi signs in with is never sent with', async () => {
     rmSync(paths.configPath)
     rmSync(paths.statePath)
