@@ -2246,6 +2246,9 @@ export async function CodexAuthPlugin(
               await reclaimExpiredPoolTransfer(
                 getAccountPaths(getConfigPath()),
                 current.refresh,
+                current.access !== undefined
+                  ? { slotAccess: current.access }
+                  : {},
               ).catch(() => false)
 
               const refreshTokenHash = hashRefreshToken(current.refresh)

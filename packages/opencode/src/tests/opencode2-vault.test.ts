@@ -26,6 +26,7 @@ import { opencode1HostSlot } from '../v2/host-slot'
 import { setupOpenAIAuth } from '../v2/setup'
 import {
   fakeOpenCode2Host,
+  type PoolFiles,
   type PoolSeedRow,
   poolFiles,
   type RoutingModeSeed,
@@ -62,9 +63,15 @@ async function start(
   mode: RoutingModeSeed,
   rows: PoolSeedRow[],
   credentials: Record<string, MockCredential>,
+  options: {
+    /** Runs on the seeded files before setup. */
+    prepare?: (files: PoolFiles) => void
+    fetch?: typeof fetch
+  } = {},
 ) {
   const files = poolFiles()
   seedPool(files, mode, rows)
+  options.prepare?.(files)
   const daemon: MockDaemon = await startMockDaemon({
     directory: files.dir,
     credentials,
@@ -85,7 +92,7 @@ async function start(
     slot: opencode1HostSlot(join(files.dir, 'auth.json')),
     fence: async () => ({ open: true }),
     heartbeat: false,
-    fetch: usageOnly,
+    fetch: options.fetch ?? usageOnly,
     vault: {
       stateDir,
       connectionFile: () => daemon.connectionFile,
@@ -209,5 +216,41 @@ describe('vault accounts on OpenCode 2', () => {
     for (let index = 0; index < 3; index++)
       bearers.add((await send(host, 200)).get('authorization'))
     expect([...bearers]).toEqual([`Bearer ${VAULT_ACCESS}`])
+  })
+
+  it('never refreshes the token of a pool row signing in as an account the vault holds', async () => {
+    // Every row's token is inside the refresh window, so the request path
+    // refreshes the due ones before it picks an account.
+    const refreshed: string[] = []
+    const recording = (async (input: unknown, init?: RequestInit) => {
+      if (String(input).includes('/oauth/token')) {
+        const body = new URLSearchParams(String(init?.body ?? ''))
+        refreshed.push(body.get('refresh_token') ?? String(init?.body))
+      }
+      return usageOnly(input as never, init)
+    }) as unknown as typeof fetch
+    const { host } = await start(
+      'fallback-first',
+      [{ id: 'main' }, { id: 'B', identity: 'chatgpt-vault' }],
+      { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+      {
+        fetch: recording,
+        prepare: (files) => {
+          const state = files.readState() as {
+            accounts: Record<string, { expires?: number }>
+          }
+          for (const account of Object.values(state.accounts))
+            account.expires = Date.now() + 3 * 60_000
+          writeFileSync(files.statePath, JSON.stringify(state))
+        },
+      },
+    )
+    await send(host, 200)
+    await waitFor(
+      () => refreshed.some((token) => token.includes('main-refresh')),
+      'the refresh of row main',
+    )
+    await Bun.sleep(100)
+    expect(refreshed.some((token) => token.includes('B-refresh'))).toBe(false)
   })
 })

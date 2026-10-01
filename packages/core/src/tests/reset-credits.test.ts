@@ -993,8 +993,10 @@ describe('atomic reset credit redemption', () => {
 
   // These two seed a pair that records its ChatGPT account, as every pair
   // minted now does; an older pair saved without one is bound to the account
-  // it is first sent under, which changes it.
-  it('preserves the exact in-flight object after an ambiguous outcome', async () => {
+  // it is first sent under, which changes it. The pair the server dedupes
+  // on, its start and its account stay exactly as they were; the only thing
+  // added is the count of unknown answers (`SavedResetPair.unknownAnswers`).
+  it('preserves the in-flight pair after an ambiguous outcome, counting the unknown answer', async () => {
     const inFlight: SavedResetPair = {
       redeemRequestId: 'ambiguous-request',
       creditId: 'ambiguous-credit',
@@ -1008,10 +1010,12 @@ describe('atomic reset credit redemption', () => {
 
     await runResetCreditRedemption(deps, redemptionInput())
 
-    expect(await persistedResetState()).toEqual({ inFlight })
+    expect(await persistedResetState()).toEqual({
+      inFlight: { ...inFlight, unknownAnswers: 1 },
+    })
   })
 
-  it('preserves the exact in-flight object and skips cooldown on http_error', async () => {
+  it('preserves the in-flight pair and skips cooldown on http_error, counting the unknown answer', async () => {
     const inFlight: SavedResetPair = {
       redeemRequestId: 'http-request',
       creditId: 'http-credit',
@@ -1027,7 +1031,9 @@ describe('atomic reset credit redemption', () => {
 
     await runResetCreditRedemption(deps, redemptionInput())
 
-    expect(await persistedResetState()).toEqual({ inFlight })
+    expect(await persistedResetState()).toEqual({
+      inFlight: { ...inFlight, unknownAnswers: 1 },
+    })
   })
 
   it('times out a hanging consume without allowing a second UUID before TTL', async () => {
@@ -1365,6 +1371,7 @@ describe('reset redemption bound to its ChatGPT account', () => {
       creditId: 'credit-1',
       startedAt: NOW,
       chatgptAccountId: 'account-a',
+      unknownAnswers: 1,
     })
   })
 
@@ -1432,6 +1439,7 @@ describe('reset redemption bound to its ChatGPT account', () => {
     expect((await persistedResetState())?.inFlight).toEqual({
       ...legacy,
       chatgptAccountId: 'account-a',
+      unknownAnswers: 1,
     })
 
     const other = depsAs('account-b', {
@@ -1521,6 +1529,100 @@ describe('reset redemption bound to its ChatGPT account', () => {
     })
   }
 
+  // Two processes may send the same saved pair at once (two Retry presses).
+  // A refusal of one send says nothing about the other: had that other send
+  // gone through, a new spend would redeem a second credit. So once any send
+  // of the pair got an unknown outcome, the pair keeps locking Spend, in
+  // whichever order the two answers are written.
+  for (const first of ['refusal', 'unknown outcome'] as const) {
+    it(`a refusal and a concurrent unknown outcome of the same pair keep it locking Spend (the ${first} written first)`, async () => {
+      await seedResetState('main', {
+        inFlight: pair(YOUNG, { chatgptAccountId: 'account-a' }),
+      })
+      const posts: ReturnType<typeof requestBody>[] = []
+      const bothSent = Promise.withResolvers<void>()
+      const answerRefusal = Promise.withResolvers<void>()
+      const answerUnknown = Promise.withResolvers<void>()
+      const wire = (answer: Promise<void>, reply: () => Response) =>
+        recordingWire(async () => {
+          if (posts.length === 2) bothSent.resolve()
+          await bothSent.promise
+          await answer
+          return reply()
+        }, posts)
+      const refused = runResetCreditRedemption(
+        depsAs('account-a', {
+          fetchImpl: wire(answerRefusal.promise, () =>
+            Response.json({ error: 'bad credit' }, { status: 400 }),
+          ),
+        }),
+        inputAs('account-a', true),
+      )
+      const unknown = runResetCreditRedemption(
+        depsAs('account-a', {
+          fetchImpl: wire(
+            answerUnknown.promise,
+            () => new Response('{bad-json'),
+          ),
+        }),
+        inputAs('account-a', true),
+      )
+      if (first === 'refusal') {
+        answerRefusal.resolve()
+        await refused
+        answerUnknown.resolve()
+        await unknown
+      } else {
+        answerUnknown.resolve()
+        await unknown
+        answerRefusal.resolve()
+        await refused
+      }
+      expect(posts).toHaveLength(2)
+
+      const later = depsAs('account-a', {
+        now: () => LATER,
+        fetchImpl: recordingWire(() => Response.json({ code: 'reset' }), posts),
+      })
+      await expect(
+        runResetCreditRedemption(later, inputAs('account-a', false)),
+      ).rejects.toMatchObject({ kind: 'expired_unreconciled' })
+      expect(posts).toHaveLength(2)
+    })
+  }
+
+  it('a refusal of a send made after an unknown outcome was recorded still lets the pair expire', async () => {
+    await seedResetState('main', {
+      inFlight: pair(YOUNG, { chatgptAccountId: 'account-a' }),
+    })
+    const posts: ReturnType<typeof requestBody>[] = []
+    await runResetCreditRedemption(
+      depsAs('account-a', {
+        fetchImpl: recordingWire(() => new Response('{bad-json'), posts),
+      }),
+      inputAs('account-a', true),
+    )
+    await runResetCreditRedemption(
+      depsAs('account-a', {
+        fetchImpl: recordingWire(
+          () => Response.json({ error: 'bad credit' }, { status: 400 }),
+          posts,
+        ),
+      }),
+      inputAs('account-a', true),
+    )
+
+    const later = depsAs('account-a', {
+      now: () => LATER,
+      fetchImpl: recordingWire(() => Response.json({ code: 'reset' }), posts),
+    })
+    await runResetCreditRedemption(later, inputAs('account-a', false))
+    expect(posts.at(-1)).toEqual({
+      redeem_request_id: 'uuid-new',
+      credit_id: 'credit-1',
+    })
+  })
+
   it('a later unknown outcome withdraws a refusal, so the pair locks again', async () => {
     await seedResetState('main', {
       inFlight: pair(YOUNG, {
@@ -1537,7 +1639,7 @@ describe('reset redemption bound to its ChatGPT account', () => {
     )
 
     expect((await persistedResetState())?.inFlight).toEqual(
-      pair(YOUNG, { chatgptAccountId: 'account-a' }),
+      pair(YOUNG, { chatgptAccountId: 'account-a', unknownAnswers: 1 }),
     )
   })
 })

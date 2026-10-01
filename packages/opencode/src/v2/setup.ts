@@ -172,6 +172,31 @@ export async function setupOpenAIAuth(
     return async () => {}
   }
 
+  // The vault serves nothing until this host is enrolled as
+  // `openai-auth-opencode` (from OpenCode 1's `opencode auth login` menu).
+  // Until then each poll only checks for the enrollment token file, so an
+  // enrollment another process finished is picked up. It is built before the
+  // pool source, whose first load already asks which accounts it holds, and
+  // started further down.
+  const vault = new OpenAiVault({
+    host: 'opencode',
+    stateDir: options.vault?.stateDir ?? vaultStateDir(paths().statePath),
+    reservedRouteIds: () => source.peek().rows.map((row) => row.id),
+    ...(options.vault?.connectionFile
+      ? { connectionFile: options.vault.connectionFile }
+      : {}),
+    ...(options.vault?.connectScoped
+      ? { connectScoped: options.vault.connectScoped }
+      : {}),
+    ...(options.vault?.connectEnrollment
+      ? { connectEnrollment: options.vault.connectEnrollment }
+      : {}),
+    ...(options.vault?.pollIntervalMs !== undefined
+      ? { pollIntervalMs: options.vault.pollIntervalMs }
+      : {}),
+    fetchImpl: () => fetchImpl,
+  })
+
   const source = new PoolAccountSource({
     paths,
     refreshProvider: async (credential) => {
@@ -201,6 +226,11 @@ export async function setupOpenAIAuth(
       })
       return observationFromSnapshot(snapshot, Date.now(), true)
     },
+    // One ChatGPT account has one owner. A local pool row signing in as an
+    // account the vault holds for this host belongs to the vault, so this
+    // source neither refreshes that row's token nor polls quota with it
+    // (request routing already skips it). OpenCode 1 wires the same set.
+    vaultIdentities: () => vault.identities(),
     log: createLogger('pool'),
   })
   await source.load()
@@ -239,28 +269,6 @@ export async function setupOpenAIAuth(
     : undefined
   lifecycle?.start()
 
-  // The vault serves nothing until this host is enrolled as
-  // `openai-auth-opencode` (from OpenCode 1's `opencode auth login` menu).
-  // Until then each poll only checks for the enrollment token file, so an
-  // enrollment another process finished is picked up.
-  const vault = new OpenAiVault({
-    host: 'opencode',
-    stateDir: options.vault?.stateDir ?? vaultStateDir(paths().statePath),
-    reservedRouteIds: () => source.peek().rows.map((row) => row.id),
-    ...(options.vault?.connectionFile
-      ? { connectionFile: options.vault.connectionFile }
-      : {}),
-    ...(options.vault?.connectScoped
-      ? { connectScoped: options.vault.connectScoped }
-      : {}),
-    ...(options.vault?.connectEnrollment
-      ? { connectEnrollment: options.vault.connectEnrollment }
-      : {}),
-    ...(options.vault?.pollIntervalMs !== undefined
-      ? { pollIntervalMs: options.vault.pollIntervalMs }
-      : {}),
-    fetchImpl: () => fetchImpl,
-  })
   vault.start()
   const pollVault = () => {
     if (vault.enrolled()) void vault.pollStale(VAULT_STALE_AFTER_MS)
