@@ -537,8 +537,9 @@ describe('the doctor restore writes the slot under main-refresh', () => {
         },
       },
     } as unknown as CreateAuthMethodsOptions['client']
-    // Doctor (the only action before the move), then yes on the repair:
-    // the confirmation lists No first.
+    // The install is not migrated to the account pool yet, so the menu offers
+    // only the doctor: Enter runs it, then Down and Enter answer yes to its
+    // restore repair (the confirmation lists No first).
     const scripted = scriptedTerminal([ENTER, DOWN, ENTER])
     const methods = createAuthMethods({
       client,

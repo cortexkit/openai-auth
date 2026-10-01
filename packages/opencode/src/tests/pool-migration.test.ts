@@ -196,7 +196,9 @@ describe('migration', () => {
     expect(main?.quota).toBeUndefined()
     expect(main?.needsFirstReading).toBe(true)
     expect((await h.state()).accounts.main.quota).toBeUndefined()
-    // The backoff is keyed on its own refresh-token hash and still carried.
+    // The refresh backoff from `state.main` is still copied onto row main:
+    // it names the refresh token it was recorded for (by hash), so it can
+    // never apply to another login's token.
     expect((await h.state()).accounts.main.lastRefreshError.tokenHash).toBe(
       hashRefreshToken('r-main'),
     )
@@ -568,8 +570,9 @@ describe('adoption of a later login in the slot', () => {
     const main = await h.row('main')
     expect(main?.identity).toBe('acct-later')
     expect(main?.credential).toMatchObject({ refresh: 'r-later' })
-    // The legacy `state.main` belongs to whatever was main before the
-    // migration; an adoption never carries it.
+    // `state.main` (quota, refresh backoff) describes the login that was in
+    // the slot before the migration, not this later login, so an adoption
+    // never copies it onto the row.
     expect(main?.quota).toBeUndefined()
     expect((await h.state()).accounts.main.lastRefreshError).toBeUndefined()
   })
@@ -1143,7 +1146,8 @@ describe('an expired pending-transfer record', () => {
       false,
     )
     expect((await h.config()).mainAccountId).toBe('acct-main')
-    // The slot refresh rotated the token meanwhile.
+    // With the record gone, this build's slot refresh may rotate the slot's
+    // token; the next run must pick up the rotated one.
     await h.setSlot(login('acct-main', 'r-main-2', 'rotated'))
     expect(await migrateToPool(h.deps())).toMatchObject({
       status: 'completed',

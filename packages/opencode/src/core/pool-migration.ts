@@ -415,7 +415,11 @@ async function readConfig(path: string): Promise<Record<string, unknown>> {
   return value
 }
 
-/** What taking a legacy lock and writing the config under it need. */
+/**
+ * The part of a run's context that `acquireLock` and `updateConfig` use:
+ * the file paths, the clock, the sleep between lock attempts and the lock
+ * timings. Code outside a run builds just this much to write the config.
+ */
 type LockContext = Pick<Context, 'paths' | 'now' | 'sleep' | 'locks'>
 
 /** Takes one file lock, polling while a live holder has it. */

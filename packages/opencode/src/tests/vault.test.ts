@@ -306,8 +306,10 @@ describe('refresh', () => {
       connectionFile: () => running.connectionFile,
       pollIntervalMs: 0,
     })
-    // The poll's first discovery starts before this host is enrolled, and is
-    // still in flight when the enrollment lands and refresh is asked for.
+    // The poll's first roster discovery starts before this host is enrolled
+    // (so it finds no accounts) and is still in flight when the enrollment
+    // lands and refresh is called. Refresh must not hand back that empty
+    // result.
     vault.start()
     enroll()
     await vault.refresh()

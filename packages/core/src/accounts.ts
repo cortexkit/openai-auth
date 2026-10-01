@@ -2361,7 +2361,10 @@ export class FallbackAccountManager {
     return loadAccounts(this.paths)
   }
 
-  /** Queued selection bookkeeping saves (`getUsableFallbackAccounts`), in order. */
+  /**
+   * The background saves `getUsableFallbackAccounts` queues (refresh errors
+   * it recorded, `lastUsed` merges), chained so they land in order.
+   */
   private selectionBookkeeping: Promise<void> = Promise.resolve()
 
   /** Resolves once every queued selection bookkeeping save has ended. */

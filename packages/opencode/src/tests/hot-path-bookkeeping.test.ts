@@ -360,8 +360,9 @@ describe('request path never waits on bookkeeping', () => {
       fetchImpl: fetch,
     })
     // The refresh persists its own rotated token; right after it, another
-    // writer takes the state file's save lock. What is left for selection to
-    // save is bookkeeping, which must not hold up the request.
+    // writer takes the state file's save lock. What selection still saves
+    // (recorded refresh errors, `lastUsed`) only feeds later decisions, so
+    // the request must not wait for that lock.
     manager.refreshAccount = async (account) => {
       await holdLock(stateFile, 'save')
       return {
