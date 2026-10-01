@@ -10,12 +10,16 @@
 //    slot (`host-slot.ts`). An install that has not migrated yet migrates on
 //    the first OpenCode 2 start, behind the same version fence as on OpenCode
 //    1; until then the pool serves nothing and requests are refused.
-// 3. The hooks recipe (`installOpenCode2Auth`) with openai-auth's adapter
-//    (`adapter.ts`): account choice, credential headers, quota, refusals.
-// 4. The ChatGPT logins (`login.ts`), writing into the pool; OpenCode 2's
+// 3. This host's Claustrum vault connection (`OpenAiVault` in the core
+//    package, enrolled as `openai-auth-opencode`, the name OpenCode 1 uses),
+//    whose OpenAI accounts are routed beside the pool rows.
+// 4. The hooks recipe (`installOpenCode2Auth`) with openai-auth's adapter
+//    (`adapter.ts`): account choice, credential headers, request rewrites,
+//    quota, refusals.
+// 5. The ChatGPT logins (`login.ts`), writing into the pool; OpenCode 2's
 //    credential table only ever receives a placeholder.
-// 5. The model rules (`models.ts`).
-// 6. A ChatGPT login OpenCode 2 already held before this plugin ran is copied
+// 6. The model rules (`models.ts`).
+// 7. A ChatGPT login OpenCode 2 already held before this plugin ran is copied
 //    into the pool when the pool does not hold that account yet, since the
 //    host's next refresh of it through the methods above hands back a
 //    placeholder.
@@ -32,11 +36,14 @@ import {
   extractAccountId,
   extractAccountIdFromClaims,
   loadAccounts,
+  OpenAiVault,
+  type OpenAiVaultOptions,
   parseJwtClaims,
+  vaultStateDir,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Plugin } from '@opencode/plugin'
-import { getConfigPath } from '../config'
+import { getConfigPath, getSettings } from '../config'
 import { getAccountPaths } from '../core/account-paths'
 import { oauthAccess, PoolAccountSource } from '../core/pool-account-source'
 import { poolMigrated } from '../core/pool-accounts'
@@ -79,6 +86,15 @@ function identityOfToken(token: string): string | undefined {
 /** Longest a shutdown waits for queued quota writes before it lets go. */
 const SETTLE_ON_DISPOSE_MS = 5_000
 
+/**
+ * How often the vault accounts are checked for a stale quota reading, and
+ * how old a reading may be before a new one is taken; the values OpenCode
+ * 1's background refresh uses. A vault account's quota lives in the vault
+ * roster, so the pool's own polls do not cover it.
+ */
+const VAULT_POLL_INTERVAL_MS = 60_000
+const VAULT_STALE_AFTER_MS = 4 * 60_000
+
 /** Test and embedding seams; every field has a production default. */
 export interface OpenAIAuthV2Options {
   /** The account config and state files; read on every use. */
@@ -95,6 +111,17 @@ export interface OpenAIAuthV2Options {
   fence?: PoolLifecycleDeps['fence']
   /** Whether to write this process's heartbeat (other processes' fence reads it). */
   heartbeat?: boolean
+  /** The vault's directory and connections; the production ones by default. */
+  vault?: Partial<
+    Pick<
+      OpenAiVaultOptions,
+      | 'stateDir'
+      | 'connectionFile'
+      | 'connectScoped'
+      | 'connectEnrollment'
+      | 'pollIntervalMs'
+    >
+  >
 }
 
 type SetupContext = Pick<
@@ -182,11 +209,43 @@ export async function setupOpenAIAuth(
   })
   lifecycle.start()
 
+  // The vault serves nothing until this host is enrolled as
+  // `openai-auth-opencode` (from OpenCode 1's `opencode auth login` menu).
+  // Until then each poll only checks for the enrollment token file, so an
+  // enrollment another process finished is picked up.
+  const vault = new OpenAiVault({
+    host: 'opencode',
+    stateDir: options.vault?.stateDir ?? vaultStateDir(paths().statePath),
+    reservedRouteIds: () => source.peek().rows.map((row) => row.id),
+    ...(options.vault?.connectionFile
+      ? { connectionFile: options.vault.connectionFile }
+      : {}),
+    ...(options.vault?.connectScoped
+      ? { connectScoped: options.vault.connectScoped }
+      : {}),
+    ...(options.vault?.connectEnrollment
+      ? { connectEnrollment: options.vault.connectEnrollment }
+      : {}),
+    ...(options.vault?.pollIntervalMs !== undefined
+      ? { pollIntervalMs: options.vault.pollIntervalMs }
+      : {}),
+    fetchImpl: () => fetchImpl,
+  })
+  vault.start()
+  const pollVault = () => {
+    if (vault.enrolled()) void vault.pollStale(VAULT_STALE_AFTER_MS)
+  }
+  void vault.refresh().then(pollVault)
+  const vaultPoll = setInterval(pollVault, VAULT_POLL_INTERVAL_MS)
+  vaultPoll.unref?.()
+
   const pins = new SessionPins()
   const openai = createOpenAIAdapter({
     source,
     storage: () => loadAccounts(paths()),
     pins,
+    vault,
+    responsesLite: () => getSettings().responsesLite,
     log,
   })
   const installation = await installOpenCode2Auth(ctx, openai.adapter, {
@@ -283,6 +342,7 @@ export async function setupOpenAIAuth(
 
   return async () => {
     abort.abort()
+    clearInterval(vaultPoll)
     lifecycle.dispose()
     await Promise.allSettled([
       installation.dispose(),
@@ -300,6 +360,7 @@ export async function setupOpenAIAuth(
       ),
     ])
     source.dispose()
+    vault.close()
     await heartbeat?.release()
   }
 }

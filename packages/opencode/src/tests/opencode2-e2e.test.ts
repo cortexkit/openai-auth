@@ -20,6 +20,13 @@ import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
+import { vaultPaths, vaultStateDir } from '@cortexkit/openai-auth-core/internal'
+import {
+  type MockDaemon,
+  startMockDaemon,
+  vaultLogin,
+} from '../../../core/src/tests/fixtures/mock-claustrum.ts'
+import { CODEX_USER_AGENT, CODEX_VERSION } from '../index'
 import {
   MOCK_ACCOUNTS,
   type MockAccount,
@@ -27,6 +34,7 @@ import {
   type RejectMode,
   startMockCodex,
   type WireRecord,
+  type WireSample,
 } from './fixtures/opencode2-mock-codex'
 import { installPackedPlugin, PACKAGE_NAME } from './fixtures/opencode2-pack'
 
@@ -38,12 +46,20 @@ const PASSWORD = 'openai-auth-e2e-loopback-only'
 const HOUR = 3600_000
 
 type Transport = 'http' | 'websocket'
-type Turn = { reject?: { account: MockAccount; mode: RejectMode } }
+type Turn = {
+  reject?: { account: MockAccount; mode: RejectMode }
+  /** The model variant (reasoning effort) this turn is sent with. */
+  variant?: string
+}
 
 let scratch = ''
 let cli = ''
 let serverPlugin = ''
 let loginPlugin = ''
+let vaultPlugin = ''
+
+/** The vault account's record version, which a 401 must be reported with. */
+const VAULT_RECORD_VERSION = 7
 
 function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -87,7 +103,11 @@ function isolatedEnv(root: string) {
 }
 
 /** The pool in its migrated layout under the host's config directory. */
-function seedPool(configDir: string, accounts: MockAccount[]) {
+function seedPool(
+  configDir: string,
+  accounts: MockAccount[],
+  mode: 'sticky-balanced' | 'fallback-first' = 'sticky-balanced',
+) {
   mkdirSync(configDir, { recursive: true })
   const checkedAt = Date.now()
   const quota = (used: number) => ({
@@ -111,7 +131,7 @@ function seedPool(configDir: string, accounts: MockAccount[]) {
     JSON.stringify({
       version: 1,
       main: { type: 'opencode', provider: 'openai' },
-      routing: { mode: 'sticky-balanced' },
+      routing: { mode },
       accounts: accounts.map((account) => ({
         id: rowId(account),
         type: 'oauth',
@@ -204,6 +224,10 @@ async function runCli(
 
 interface ScenarioResult {
   readonly wire: WireRecord[]
+  /** Agent-loop requests and frames as sent, with their headers. */
+  readonly samples: WireSample[]
+  /** What the mock vault was told: one entry per 401 report. */
+  readonly vaultReports: MockDaemon['reports']
   readonly stdout: string[]
   readonly exits: Array<number | null>
   readonly config: {
@@ -226,15 +250,51 @@ async function runScenario(input: {
   turns: Turn[]
   plugin?: string
   login?: boolean
+  mode?: 'sticky-balanced' | 'fallback-first'
+  /** The model every turn uses; `gpt-5.5` by default. */
+  model?: string
+  /** Serve account V from a mock Claustrum vault this host is enrolled in. */
+  vault?: boolean
 }): Promise<ScenarioResult> {
   const root = mkdtempSync(join(tmpdir(), 'oai-oc2-e2e-'))
   const project = join(root, 'project')
   mkdirSync(project, { recursive: true })
   spawnSync('git', ['init', '-q'], { cwd: project })
   const mock: MockCodex = startMockCodex([PLACEHOLDER])
-  const env = isolatedEnv(root)
-  const configDir = join(env.XDG_CONFIG_HOME, 'opencode')
-  seedPool(configDir, input.accounts)
+  const isolated = isolatedEnv(root)
+  const env: Record<string, string> = {
+    ...isolated,
+    // Read by the vault plugin entry, which sends its quota polls to the mock.
+    OPENAI_AUTH_E2E_MOCK_URL: mock.url,
+  }
+  const configDir = join(isolated.XDG_CONFIG_HOME, 'opencode')
+  seedPool(configDir, input.accounts, input.mode)
+  let daemon: MockDaemon | undefined
+  let rosterPath = ''
+  if (input.vault) {
+    daemon = await startMockDaemon({
+      directory: root,
+      credentials: {
+        'oauth:openai:work': vaultLogin(MOCK_ACCOUNTS.V.id, {
+          record_version: VAULT_RECORD_VERSION,
+        }),
+      },
+    })
+    env.OPENAI_AUTH_E2E_CLAUSTRUM = daemon.connectionFile
+    // An approved enrollment, as Connect in `opencode auth login` leaves it.
+    const paths = vaultPaths(
+      vaultStateDir(join(configDir, 'openai-auth-state.json')),
+      'opencode',
+    )
+    rosterPath = paths.rosterPath
+    mkdirSync(join(paths.tokenPath, '..'), { recursive: true, mode: 0o700 })
+    writeFileSync(
+      paths.tokenPath,
+      JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
+  }
+  const model = input.model ?? 'gpt-5.5'
   writeFileSync(
     join(configDir, 'opencode.json'),
     JSON.stringify(
@@ -249,7 +309,11 @@ async function runScenario(input: {
               apiKey: PLACEHOLDER,
               transport: input.transport,
             },
-            models: { 'gpt-5.5': { name: 'GPT-5.5 (mock)' } },
+            models: {
+              'gpt-5.5': { name: 'GPT-5.5 (mock)' },
+              'gpt-6-sol': { name: 'GPT-6 Sol (mock)' },
+              'gpt-6.1-sol': { name: 'GPT-6.1 Sol (mock)' },
+            },
           },
         },
       },
@@ -309,7 +373,24 @@ async function runScenario(input: {
       exported = dump.stdout
       clientLog.push(`--- export ---\n${dump.stdout}\n${dump.stderr}`)
     }
+    // The host starts the plugin with the first session. The plugin then
+    // reads the vault's roster and takes a quota reading of its account in
+    // the background; routing admits the account once it has one.
+    const vaultReady = async () => {
+      const deadline = Date.now() + 30_000
+      const ready = () => {
+        try {
+          return JSON.parse(readFileSync(rosterPath, 'utf8')).rows.some(
+            (row: { quota?: unknown }) => row.quota,
+          )
+        } catch {
+          return false
+        }
+      }
+      while (!ready() && Date.now() < deadline) await Bun.sleep(100)
+    }
     for (const [index, turn] of input.turns.entries()) {
+      if (input.vault && index === 1) await vaultReady()
       if (turn.reject) mock.reject(turn.reject.account, turn.reject.mode)
       const result = await runCli(
         [
@@ -319,7 +400,7 @@ async function runScenario(input: {
           '--format',
           'json',
           '--model',
-          'openai/gpt-5.5',
+          `openai/${model}${turn.variant ? `#${turn.variant}` : ''}`,
           ...(index > 0 ? ['--continue'] : []),
           `Turn ${index + 1}: say hello.`,
         ],
@@ -337,6 +418,7 @@ async function runScenario(input: {
     clearTimeout(timer)
     await serverOutput
     await mock.stop()
+    await daemon?.stop()
   }
   const read = (path: string) => {
     try {
@@ -349,9 +431,10 @@ async function runScenario(input: {
   const state = read(join(configDir, 'openai-auth-state.json'))
   let pluginLog = ''
   try {
-    pluginLog = readFileSync(env.OPENCODE_OPENAI_AUTH_LOG_FILE, 'utf8')
+    pluginLog = readFileSync(isolated.OPENCODE_OPENAI_AUTH_LOG_FILE, 'utf8')
   } catch {}
   const diagnostics = [
+    `vault reports: ${JSON.stringify(daemon?.reports ?? [])}`,
     `wire: ${JSON.stringify(mock.records)}`,
     `samples: ${JSON.stringify(mock.samples)}`,
     `stdout: ${JSON.stringify(stdout)}`,
@@ -362,6 +445,8 @@ async function runScenario(input: {
   rmSync(root, { recursive: true, force: true })
   return {
     wire: [...mock.records],
+    samples: [...mock.samples],
+    vaultReports: [...(daemon?.reports ?? [])],
     stdout,
     exits,
     config,
@@ -395,6 +480,28 @@ const pick = (entries: readonly object[], ...keys: string[]) =>
   entries.map((entry) =>
     keys.map((key) => (entry as Record<string, unknown>)[key] ?? '').join(':'),
   )
+/** The agent-loop samples of one transport, in order. */
+const samplesOn = (result: ScenarioResult, transport: 'http' | 'ws') =>
+  result.samples.filter((sample) => sample.transport === transport)
+type SentBody = {
+  previous_response_id?: string
+  reasoning?: { effort?: string }
+  input: Array<{ type?: string; role?: string; reasoning?: unknown }>
+}
+const bodyOf = (sample: WireSample | undefined) =>
+  (sample?.body ?? { input: [] }) as SentBody
+const EFFORT_UPDATE_HIGH = {
+  type: 'configuration_update',
+  reasoning: { effort: 'high' },
+}
+
+/** The Codex client identity, as OpenCode 1 sends it. */
+function expectCodexClient(headers: Record<string, string>) {
+  expect(headers.version).toBe(CODEX_VERSION)
+  expect(headers['user-agent']).toBe(CODEX_USER_AGENT)
+  expect(headers.originator).toBe('codex_exec')
+}
+
 const usedOn = (result: ScenarioResult, row: string) =>
   result.config.commonAuthPool?.rows?.[row]?.quota?.limits?.find(
     (limit) => limit.usedPercent !== undefined,
@@ -481,6 +588,29 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         '',
       ].join('\n'),
     )
+    // The same entry with its quota polls sent to the scenario's mock and its
+    // vault pointed at the scenario's mock Claustrum daemon.
+    vaultPlugin = join(consumer, 'vault-plugin')
+    mkdirSync(vaultPlugin, { recursive: true })
+    writeFileSync(
+      join(vaultPlugin, 'index.js'),
+      [
+        `import { createOpenAIAuthPlugin } from '${PACKAGE_NAME}/server'`,
+        'const mock = process.env.OPENAI_AUTH_E2E_MOCK_URL',
+        'export default createOpenAIAuthPlugin({',
+        '  fetch: (input, init) => fetch(',
+        '    String(input instanceof Request ? input.url : input).replace(',
+        "      'https://chatgpt.com', mock),",
+        '    init,',
+        '  ),',
+        '  vault: {',
+        '    connectionFile: () => process.env.OPENAI_AUTH_E2E_CLAUSTRUM,',
+        '    pollIntervalMs: 0,',
+        '  },',
+        '})',
+        '',
+      ].join('\n'),
+    )
   }, 300_000)
 
   afterAll(() => {
@@ -561,6 +691,158 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         'B:',
       ])
       expect(result.stdout[0]).toContain('-B')
+    })
+  }, 180_000)
+
+  test('http: every request carries the Codex client identity', async () => {
+    const result = await runScenario({
+      transport: 'http',
+      accounts: ['A'],
+      turns: [{}, {}],
+    })
+    verify(result, () => {
+      expect(result.exits).toEqual([0, 0])
+      const sent = samplesOn(result, 'http')
+      expect(sent.length).toBe(2)
+      for (const sample of sent) expectCodexClient(sample.headers)
+    })
+  }, 180_000)
+
+  test('websocket: the handshake carries the Codex client identity and one socket serves every turn', async () => {
+    const result = await runScenario({
+      transport: 'websocket',
+      accounts: ['A'],
+      turns: [{}, {}, {}],
+    })
+    verify(result, () => {
+      expect(result.exits).toEqual([0, 0, 0])
+      const handshakes = result.wire.filter(
+        (record) => record.action === 'handshake',
+      )
+      expect(handshakes.length).toBe(1)
+      const frames = primaries(result.wire)
+      expect(pick(frames, 'connection')).toEqual(['1', '1', '1'])
+      // Each sample carries the handshake headers of its socket.
+      for (const sample of samplesOn(result, 'ws'))
+        expectCodexClient(sample.headers)
+      // Turns after the first chain on the reused socket.
+      const bodies = samplesOn(result, 'ws').map(bodyOf)
+      expect(
+        bodies.map((body) => body.previous_response_id !== undefined),
+      ).toEqual([false, true, true])
+    })
+  }, 180_000)
+
+  test('websocket: an effort change goes in as an update item, the effort stays pinned, and the turns after it chain on the same socket', async () => {
+    const result = await runScenario({
+      transport: 'websocket',
+      accounts: ['A'],
+      model: 'gpt-6.1-sol',
+      turns: [
+        { variant: 'low' },
+        { variant: 'low' },
+        { variant: 'high' },
+        { variant: 'high' },
+      ],
+    })
+    verify(result, () => {
+      expect(result.exits).toEqual([0, 0, 0, 0])
+      expect(
+        result.wire.filter((record) => record.action === 'handshake').length,
+      ).toBe(1)
+      expect(pick(primaries(result.wire), 'connection')).toEqual([
+        '1',
+        '1',
+        '1',
+        '1',
+      ])
+      const [first, second, change, after] = samplesOn(result, 'ws').map(bodyOf)
+      for (const body of [first, second, change, after])
+        expect(body?.reasoning?.effort).toBe('low')
+      // The host sends the turn whose effort changed in full (its own request
+      // changed); the rewrite adds the update right before the new user
+      // message and changes nothing else.
+      expect(second?.previous_response_id).toBeDefined()
+      expect(change?.previous_response_id).toBeUndefined()
+      const changeInput = change?.input ?? []
+      expect(changeInput.at(-2)).toEqual(EFFORT_UPDATE_HIGH)
+      expect(changeInput.at(-1)?.role).toBe('user')
+      expect(
+        changeInput.filter((item) => item.type === 'configuration_update'),
+      ).toHaveLength(1)
+      // The next turn is incremental again: chained, with only the update
+      // and the new user message.
+      expect(after?.previous_response_id).toBeDefined()
+      expect(after?.input).toHaveLength(2)
+      expect(after?.input[0]).toEqual(EFFORT_UPDATE_HIGH)
+      expect(after?.input[1]?.role).toBe('user')
+    })
+  }, 240_000)
+
+  test('http: an effort change goes in as an update item before the new user message, the effort stays pinned', async () => {
+    const result = await runScenario({
+      transport: 'http',
+      accounts: ['A'],
+      model: 'gpt-6.1-sol',
+      turns: [{ variant: 'low' }, { variant: 'high' }],
+    })
+    verify(result, () => {
+      expect(result.exits).toEqual([0, 0])
+      const [first, change] = samplesOn(result, 'http').map(bodyOf)
+      expect(first?.reasoning?.effort).toBe('low')
+      expect(change?.reasoning?.effort).toBe('low')
+      const input = change?.input ?? []
+      expect(input.at(-2)).toEqual(EFFORT_UPDATE_HIGH)
+      expect(input.at(-1)?.role).toBe('user')
+      expectCodexClient(samplesOn(result, 'http')[1]?.headers ?? {})
+    })
+  }, 180_000)
+
+  test('http: on a model whose effort change the host carries itself, the rewrite adds no second update', async () => {
+    const result = await runScenario({
+      transport: 'http',
+      accounts: ['A'],
+      model: 'gpt-6-sol',
+      turns: [{ variant: 'low' }, { variant: 'high' }],
+    })
+    verify(result, () => {
+      expect(result.exits).toEqual([0, 0])
+      const [, change] = samplesOn(result, 'http').map(bodyOf)
+      expect(change?.reasoning?.effort).toBe('low')
+      expect(
+        (change?.input ?? []).filter(
+          (item) => item.type === 'configuration_update',
+        ),
+      ).toEqual([EFFORT_UPDATE_HIGH])
+    })
+  }, 180_000)
+
+  test('http: a vault account is served with the token the vault hands out, and a 401 is reported with its record version', async () => {
+    const result = await runScenario({
+      transport: 'http',
+      accounts: ['A'],
+      mode: 'fallback-first',
+      plugin: vaultPlugin,
+      vault: true,
+      // The first turn starts the plugin. It goes to the vault account only if
+      // the account's first quota reading lands before the turn is routed;
+      // otherwise the pool row serves it.
+      turns: [{}, {}, { reject: { account: 'V', mode: 'unauthorized' } }],
+    })
+    verify(result, () => {
+      expect(result.exits.slice(0, 2)).toEqual([0, 0])
+      expectOnlyPoolAccountsOnWire(result)
+      const served = pick(primaries(result.wire), 'identity', 'rejected')
+      expect(['A:', 'V:']).toContain(served[0] ?? '')
+      expect(served.slice(1)).toEqual(['V:', 'V:unauthorized'])
+      expect(result.stdout[1]).toContain('-V')
+      expect(result.vaultReports).toEqual([
+        expect.objectContaining({
+          credential_id: 'oauth:openai:work',
+          provider_status: 401,
+          record_version: VAULT_RECORD_VERSION,
+        }),
+      ])
     })
   }, 180_000)
 

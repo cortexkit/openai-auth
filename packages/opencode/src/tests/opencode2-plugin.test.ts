@@ -17,6 +17,7 @@ import {
   inspectCodexEvent,
   quotaFromCodexHeaders,
 } from '../v2/adapter'
+import { CODEX_CLIENT_HEADERS } from '../v2/codex-wire'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { applyCodexModelRules } from '../v2/models'
 import { SessionPins } from '../v2/pins'
@@ -659,7 +660,7 @@ describe('OpenCode 2 adapter: event rules', () => {
     )
   })
 
-  it('sends a row without a usable token with no credential rather than the placeholder', () => {
+  it('sends a row without a usable token with no credential rather than the placeholder', async () => {
     const row = {
       id: 'main',
       type: 'oauth' as const,
@@ -674,13 +675,19 @@ describe('OpenCode 2 adapter: event rules', () => {
       storage: async () => null,
       pins: new SessionPins(),
     })
-    expect(
-      openai.adapter.accountHeaders({
-        ...scope(),
-        providerID: 'openai',
-        modelID: 'gpt-5.5',
-        accountId: 'main',
-      }),
-    ).toEqual({ authorization: null, 'chatgpt-account-id': null })
+    const result = await openai.adapter.accountHeaders({
+      ...scope(),
+      providerID: 'openai',
+      modelID: 'gpt-5.5',
+      accountId: 'main',
+    })
+    // The client identity still goes out; no credential and no attempt value.
+    expect(result).toEqual({
+      headers: {
+        ...CODEX_CLIENT_HEADERS,
+        authorization: null,
+        'chatgpt-account-id': null,
+      },
+    })
   })
 })

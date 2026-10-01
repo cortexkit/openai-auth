@@ -3,19 +3,25 @@
 // turn. It records which account each request arrived under (bearer and
 // `chatgpt-account-id` together), reports quota the way Codex does
 // (`x-codex-*` headers, `codex.rate_limits` frames), and refuses on request
-// with Codex's usage-limit shapes.
+// with Codex's usage-limit shapes or a 401. It also answers the quota poll
+// (`/backend-api/wham/usage`) for a plugin pointed at it.
+
+import { chatgptAccessToken } from '../../../../core/src/tests/fixtures/mock-claustrum.ts'
 
 export const MOCK_ACCOUNTS = {
   A: { token: 'tok-A', id: 'acct-A', used: 33 },
   B: { token: 'tok-B', id: 'acct-B', used: 55 },
   C: { token: 'tok-C', id: 'acct-C', used: 12 },
+  // The account the mock Claustrum vault serves: its token is a JWT naming
+  // the account, as the vault's OpenAI logins are.
+  V: { token: chatgptAccessToken('acct-V'), id: 'acct-V', used: 21 },
 } as const
 
 export type MockAccount = keyof typeof MOCK_ACCOUNTS
 export type Identity = MockAccount | 'none'
 
 /** How the next agent-loop request of an account is refused. */
-export type RejectMode = 'usage-limit'
+export type RejectMode = 'usage-limit' | 'unauthorized'
 
 export interface WireRecord {
   readonly transport: 'http' | 'ws'
@@ -241,6 +247,27 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
           return undefined
         return new Response('upgrade failed', { status: 400 })
       }
+      if (
+        request.method === 'GET' &&
+        new URL(request.url).pathname === '/backend-api/wham/usage'
+      ) {
+        const token = /^Bearer (.+)$/i.exec(
+          request.headers.get('authorization') ?? '',
+        )?.[1]
+        const account = Object.values(MOCK_ACCOUNTS).find(
+          (entry) => entry.token === token,
+        )
+        if (!account) return new Response('{}', { status: 401 })
+        return Response.json({
+          rate_limit: {
+            primary_window: {
+              used_percent: account.used,
+              limit_window_seconds: 18_000,
+              reset_at: Math.floor(Date.now() / 1000) + 7200,
+            },
+          },
+        })
+      }
       const body = await request.text()
       if (
         request.method !== 'POST' ||
@@ -275,6 +302,17 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
         return Response.json(
           { error: USAGE_LIMIT },
           { status: 429, headers: quotaHeaders(identity) },
+        )
+      }
+      if (rejected === 'unauthorized') {
+        return Response.json(
+          {
+            error: {
+              message: 'Your authentication token has expired.',
+              code: 'token_expired',
+            },
+          },
+          { status: 401 },
         )
       }
       return new Response(
