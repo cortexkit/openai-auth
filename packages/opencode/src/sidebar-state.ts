@@ -176,6 +176,12 @@ export interface SidebarState {
   planType?: string
   credits?: number
   lastUpdated: number
+  /**
+   * True when the accounts come from the shared account pool (a migrated
+   * install): `main` is then the pool row `main` and `fallbacks` are the
+   * other rows in roster order. Absent on any other install.
+   */
+  accountPool?: boolean
 }
 
 import { createHash } from 'node:crypto'
@@ -532,6 +538,7 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
     ...(stickyAssignments !== undefined ? { stickyAssignments } : {}),
     ...(planType !== undefined ? { planType } : {}),
     ...(credits !== undefined ? { credits } : {}),
+    ...(r.accountPool === true ? { accountPool: true } : {}),
   }
 }
 
@@ -1031,7 +1038,7 @@ function writeMergedSidebarState(
 
 export type SidebarMachineState = Pick<
   SidebarState,
-  'main' | 'fallbacks' | 'planType' | 'credits' | 'lastUpdated'
+  'main' | 'fallbacks' | 'planType' | 'credits' | 'lastUpdated' | 'accountPool'
 > & { route: string }
 
 // The freshest signal across every timestamp a snapshot carries: either window
@@ -1283,6 +1290,9 @@ export function setSidebarMachineState(
           activeRouting: latest.activeRouting,
           stickyAssignments,
           lastUpdated: Math.max(now, latest.lastUpdated + 1),
+          // Taken from the snapshot being written, never carried over from the
+          // file: it says where this snapshot's accounts came from.
+          accountPool: machineState.accountPool === true ? true : undefined,
         }
       },
       hooks,

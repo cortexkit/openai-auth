@@ -30,6 +30,14 @@ import type {
 } from '@opencode-ai/plugin'
 import { getConfigPath } from '../config'
 import { type AccountPaths, getAccountPaths } from '../core/account-paths'
+import {
+  addPoolAccount,
+  migratedPoolRows,
+  openAccountPool,
+  pollPoolRowsOnce,
+  removeAllPoolAccountsExceptMain,
+} from '../core/pool-accounts'
+import { observationFromSnapshot } from '../core/pool-quota'
 import { PackageVersion } from '../version'
 import {
   type AuthDetails,
@@ -67,6 +75,8 @@ export interface AuthMethodDependencies {
     | 'resolveFallbackAccess'
     | 'reportCustodyAuthFailure'
   >
+  /** Opens the account pool's store (a migrated install's accounts). */
+  openAccountPool: typeof openAccountPool
 }
 
 export interface CreateAuthMethodsOptions {
@@ -202,7 +212,12 @@ export function createAuthMethods({
     openBrowser: dependencies?.openBrowser ?? openBrowserForMenu,
     now: dependencies?.now ?? Date.now,
     custodyQuotaDeps: dependencies?.custodyQuotaDeps ?? {},
+    openAccountPool: dependencies?.openAccountPool ?? openAccountPool,
   }
+
+  /** Whether the install is migrated: its accounts are account-pool rows. */
+  const poolInstall = async (paths: AccountPaths): Promise<boolean> =>
+    (await migratedPoolRows(paths, deps.openAccountPool(paths))) !== undefined
 
   const readAuth = async (): Promise<AuthDetails> =>
     (await getAuth?.().catch(() => undefined)) ?? { type: 'missing' }
@@ -274,6 +289,24 @@ export function createAuthMethods({
       return
     }
     const account = await runOwnedLogin()
+    const paths = getPaths()
+    if (await poolInstall(paths)) {
+      // A migrated install keeps every account as a pool row: the login
+      // becomes a row, or replaces the credential of the row holding it.
+      const added = await addPoolAccount(deps.openAccountPool(paths), account)
+      if (added.status === 'main-identity') {
+        console.log('That account is already the OpenCode main credential.')
+      } else if (added.status === 'replaced') {
+        console.log(`Updated the sign-in of account ${added.id}.`)
+      } else if (added.status === 'added-disabled') {
+        console.log(
+          `Added account ${added.id}, disabled: another enabled account is the same ChatGPT account.`,
+        )
+      } else {
+        console.log(`Added account ${added.id}.`)
+      }
+      return
+    }
     let selfFallback = false
     await deps.mutateAccounts((current) => {
       if (
@@ -306,6 +339,35 @@ export function createAuthMethods({
 
   const checkQuotas = async () => {
     const paths = getPaths()
+    if (await poolInstall(paths)) {
+      // Every pool row is polled through the store with the token it holds;
+      // like the legacy check below, nothing is refreshed.
+      const results = await pollPoolRowsOnce(
+        paths,
+        async (request) => {
+          const credential = request.credential
+          if (credential.type !== 'oauth' || !credential.access)
+            throw new Error('No usable access token for quota check')
+          const snapshot = await whamUsageFn({
+            accessToken: credential.access,
+            fetchImpl,
+            now: deps.now,
+            ...(request.identity ? { accountId: request.identity } : {}),
+            accountKey: request.id,
+          })
+          return observationFromSnapshot(snapshot, deps.now(), true)
+        },
+        deps.openAccountPool,
+      )
+      printQuotaResults(
+        results.map((result) => ({
+          account: result.id,
+          ok: result.ok,
+          ...(result.error !== undefined ? { error: result.error } : {}),
+        })),
+      )
+      return
+    }
     const storage = await deps.loadAccounts(paths)
     const quotaManager = new QuotaManager({
       storage,
@@ -428,6 +490,24 @@ export function createAuthMethods({
   }
 
   const deleteAllAccounts = async () => {
+    const paths = getPaths()
+    if (await poolInstall(paths)) {
+      // Row `main` holds the account OpenCode signs in with (its login slot
+      // holds only a placeholder pointing at it), so it stays.
+      if (
+        !(await deps.confirm(
+          'Delete every account except `main`, the one OpenCode signs in with?',
+        ))
+      ) {
+        console.log('Delete cancelled.')
+        return
+      }
+      const removed = await removeAllPoolAccountsExceptMain(paths)
+      console.log(
+        `Deleted ${removed.length} account(s). Kept \`main\`, the account OpenCode signs in with.`,
+      )
+      return
+    }
     if (!(await deps.confirm('Delete all fallback accounts?'))) {
       console.log('Delete cancelled.')
       return

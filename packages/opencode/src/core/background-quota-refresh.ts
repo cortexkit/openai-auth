@@ -1,4 +1,5 @@
 import {
+  type AccountStorage,
   acquireRefreshFileLock,
   type RefreshAllQuotaDeps,
   type RefreshAllQuotaResult,
@@ -67,27 +68,82 @@ export function refreshQuotaInBackground(
   return claimBackgroundRefresh(deps, refreshFn, acquireLock)
 }
 
-async function claimBackgroundRefresh(
+function claimBackgroundRefresh(
   deps: RefreshAllQuotaDeps,
   refreshFn: RefreshAllQuotaFn,
   acquireLock: BackgroundLockAcquirer,
 ): Promise<RefreshAllQuotaResult[]> {
+  return runUnderBackgroundLease(
+    async () =>
+      refreshFn({
+        ...deps,
+        respectBackoff: true,
+        skipFresherThanMs: BACKGROUND_QUOTA_FRESHNESS_MS,
+      }),
+    acquireLock,
+    [],
+  )
+}
+
+/**
+ * Runs one background pass while holding the cross-process
+ * `bg-quota-refresh` lease. When another live process holds it, the pass is
+ * skipped and `skipped` is returned: that process polls for everyone and
+ * writes the shared files. A failure of the lock mechanism itself fails
+ * open and runs the pass anyway.
+ */
+export async function runUnderBackgroundLease<T>(
+  run: () => Promise<T>,
+  acquireLock: BackgroundLockAcquirer,
+  skipped: T,
+): Promise<T> {
   let lock: BackgroundLockHandle | null | undefined
   try {
     lock = await acquireLock()
   } catch {
     lock = undefined
   }
-  if (lock === null) return []
+  if (lock === null) return skipped
   try {
-    return await refreshFn({
-      ...deps,
-      respectBackoff: true,
-      skipFresherThanMs: BACKGROUND_QUOTA_FRESHNESS_MS,
-    })
+    return await run()
   } finally {
     await lock?.release().catch(() => {})
   }
+}
+
+/** What the background pass of a migrated install needs from the account pool. */
+export interface PoolBackgroundSource {
+  active(): Promise<boolean>
+  refreshDueTokens(storage: AccountStorage | null): Promise<void>
+  pollRows(
+    storage: AccountStorage | null,
+    options: { skipReadWithinMs?: number },
+  ): Promise<Array<{ id: string; ok: boolean; error?: string }>>
+}
+
+/**
+ * The idle background pass of a migrated install, under the same lease as
+ * the legacy pass: refresh every pool row's due token, then poll the quota
+ * of every row whose reading is older than `BACKGROUND_QUOTA_FRESHNESS_MS`,
+ * all through the pool source (the legacy refreshers never touch a pool
+ * row). Resolves to the rows it polled, or to an empty list when another
+ * process holds the lease.
+ */
+export function refreshPoolInBackground(
+  source: PoolBackgroundSource,
+  storage: AccountStorage | null,
+  acquireLock: BackgroundLockAcquirer,
+): Promise<Array<{ id: string; ok: boolean; error?: string }>> {
+  return runUnderBackgroundLease(
+    async () => {
+      await source.refreshDueTokens(storage)
+      return source.pollRows(storage, {
+        skipReadWithinMs: BACKGROUND_QUOTA_FRESHNESS_MS,
+      })
+    },
+    acquireLock,
+    [],
+  )
 }
 
 export class BackgroundQuotaRefresh {
