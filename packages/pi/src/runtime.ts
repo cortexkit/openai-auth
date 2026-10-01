@@ -33,10 +33,7 @@ import {
   type RoutingMode,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
-import {
-  observationFromSnapshot,
-  windowsFromQuotaMap,
-} from '@cortexkit/openai-auth-core/pool-quota'
+import { observationFromSnapshot } from '@cortexkit/openai-auth-core/pool-quota'
 import {
   FORMER_MAIN_ID,
   POOL_QUOTA_UNKNOWN_RETRY_SECONDS,
