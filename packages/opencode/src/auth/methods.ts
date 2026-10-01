@@ -32,6 +32,7 @@ import { getConfigPath } from '../config'
 import { type AccountPaths, getAccountPaths } from '../core/account-paths'
 import {
   addPoolAccount,
+  formatPoolDeleteAll,
   migratedPoolRows,
   openAccountPool,
   pollPoolRowsOnce,
@@ -502,10 +503,11 @@ export function createAuthMethods({
         console.log('Delete cancelled.')
         return
       }
-      const removed = await removeAllPoolAccountsExceptMain(paths)
-      console.log(
-        `Deleted ${removed.length} account(s). Kept \`main\`, the account OpenCode signs in with.`,
+      const outcome = await removeAllPoolAccountsExceptMain(
+        deps.openAccountPool(paths),
+        paths,
       )
+      console.log(formatPoolDeleteAll(outcome))
       return
     }
     if (!(await deps.confirm('Delete all fallback accounts?'))) {

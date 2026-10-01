@@ -13,9 +13,15 @@
 //   those legacy locks, so none of the three lands in the middle of such a
 //   refresh, nor in the middle of this build's own refresh of the row.
 // - Reordering swaps two roster rows; the roster order is the pool's order.
-//   The store has no reorder operation, so this goes through the legacy
-//   roster writer (`mutateAccounts`), which takes the same `save` locks the
-//   store holds around its own writes.
+//   It goes through `store.reorder`, which rewrites only the order of the
+//   roster in one config write. It holds the legacy `main-refresh` lock as its
+//   only extra lock: no row's credential changes, so no row's fallback lock
+//   is needed.
+// - Deleting every account is `store.remove` once per roster row, each with
+//   the same refusals and locks as a single removal, so row `main` and a row
+//   a pending transfer names stay.
+// - The store is the only writer of a migrated install's roster in this
+//   module: nothing here calls the legacy roster writer (`mutateAccounts`).
 // - Row `main` holds the account OpenCode's login slot points at (the slot
 //   keeps only a placeholder), so it is never removed. Neither is a row the
 //   migration's pending-transfer record names: the migration is copying the
@@ -26,6 +32,7 @@ import { type QuotaObservation, quotaCodec } from '@cortexkit/common-auth/quota'
 import {
   type OpenPoolStoreOptions,
   PoolOperationError,
+  type PoolLockSpec,
   openPoolStore,
   type PoolRow,
   type PoolStore,
@@ -35,9 +42,9 @@ import {
 import type { CommandContext } from '@cortexkit/openai-auth-core'
 import {
   type AccountPaths,
-  mutateAccounts,
   POOL_MAIN_ROW_ID,
 } from '@cortexkit/openai-auth-core/internal'
+import { MAIN_REFRESH_LOCK_NAME } from './custody-transition'
 import {
   type LegacyLockOptions,
   legacyRefreshLocks,
@@ -345,32 +352,76 @@ export async function removePoolAccount(
   }
 }
 
+/** The outcome of removing every account of a migrated install. */
+export interface PoolRemoveAllOutcome {
+  /** The rows removed, in roster order. */
+  removed: string[]
+  /** The rows the pool refused to remove, each with the reason to show. */
+  kept: Array<{ id: string; message: string }>
+  /** The rows whose removal failed; each is left whole. */
+  failed: Array<{ id: string; message: string }>
+}
+
 /**
- * Removes every row except `main`, and the credentials they hold. Resolves to
- * the removed ids.
+ * Removes every roster row, and the credential it holds, through the store,
+ * one `removePoolAccount` per row: row `main` and a row a pending migration
+ * transfer names are refused and kept (`poolRemovalRefusal`). A row another
+ * process removed meanwhile is skipped. A failed removal leaves that row
+ * whole and the loop goes on to the next.
+ *
+ * Every roster row that carries an id is a row here, the ones the store
+ * reads as invalid included (removing one is a repair). A roster entry with
+ * no string id is no row of the pool, so it stays where it is.
  */
 export async function removeAllPoolAccountsExceptMain(
+  store: PoolStore,
   paths: AccountPaths,
-): Promise<string[]> {
-  const allowDrop: string[] = []
-  await mutateAccounts(
-    (current, context) => {
-      const removed = new Set(
-        [
-          ...(context?.rawRosterIds ?? []),
-          ...current.accounts.map((account) => account.id),
-        ].filter((id) => id !== POOL_MAIN_ROW_ID),
-      )
-      allowDrop.splice(0, allowDrop.length, ...removed)
-      current.accounts = current.accounts.filter(
-        (account) => account.id === POOL_MAIN_ROW_ID,
-      )
-      return current
-    },
-    paths,
-    { allowDrop },
+  options: PoolRowWriteOptions = {},
+): Promise<PoolRemoveAllOutcome> {
+  const outcome: PoolRemoveAllOutcome = { removed: [], kept: [], failed: [] }
+  for (const id of await poolRosterIds(store)) {
+    try {
+      const result = await removePoolAccount(store, paths, id, options)
+      if (result.status === 'done') outcome.removed.push(id)
+      else if (result.status === 'refused')
+        outcome.kept.push({ id, message: result.message })
+    } catch (error) {
+      if (!(error instanceof PoolOperationError)) throw error
+      outcome.failed.push({ id, message: error.message })
+    }
+  }
+  return outcome
+}
+
+/** The auth menu's report of a delete-all: what went, what stayed and why. */
+export function formatPoolDeleteAll(outcome: PoolRemoveAllOutcome): string {
+  const lines = [`Deleted ${outcome.removed.length} account(s).`]
+  for (const { id, message } of outcome.kept) {
+    lines.push(
+      id === POOL_MAIN_ROW_ID
+        ? 'Kept `main`, the account OpenCode signs in with.'
+        : `Kept \`${id}\`. ${message}`,
+    )
+  }
+  for (const { id, message } of outcome.failed)
+    lines.push(`Could not delete \`${id}\`: ${message}`)
+  return lines.join('\n')
+}
+
+/**
+ * The distinct roster ids in roster order. The store reads a second roster
+ * row with an already-seen id as a row of its own, but `reorder` and
+ * `remove` name each id once.
+ */
+async function poolRosterIds(store: PoolStore): Promise<string[]> {
+  const load = await store.read()
+  if (load.status === 'ready')
+    return [...new Set(load.rows.map((row) => row.id))]
+  throw new Error(
+    load.status === 'error'
+      ? `the account pool cannot be read: ${load.reason}`
+      : 'the account pool is not migrated yet',
   )
-  return allowDrop
 }
 
 /**
@@ -431,28 +482,68 @@ export function commandAccountPool(deps: {
         await removePoolAccount(deps.store(), deps.paths(), id, deps.rowWrites),
       ),
     reorder: async (first, second) =>
-      written(await swapPoolAccounts(deps.paths(), first, second)),
+      written(
+        await swapPoolAccounts(
+          deps.store(),
+          deps.paths(),
+          first,
+          second,
+          deps.rowWrites,
+        ),
+      ),
   }
 }
 
-/** Swaps two rows' positions in the roster; false unless both exist. */
+/**
+ * The legacy lock a write of the roster order holds: `main-refresh` only.
+ * The order names no single row and changes no row's credential, so it takes
+ * no row's fallback refresh lock.
+ */
+function legacyRosterOrderLocks(
+  paths: AccountPaths,
+  options: PoolRowWriteOptions,
+): PoolLockSpec[] {
+  return legacyRefreshLocks(
+    paths,
+    POOL_MAIN_ROW_ID,
+    options.legacyLocks,
+  ).filter((lock) => lock.name === MAIN_REFRESH_LOCK_NAME)
+}
+
+/**
+ * How many times a swap re-reads the roster when the order it built no
+ * longer matches the roster (another process added or removed a row between
+ * the read and the write).
+ */
+const SWAP_ATTEMPTS = 3
+
+/**
+ * Swaps two rows' positions in the roster through `store.reorder`; false
+ * unless both exist. Every other row keeps its position and every row its
+ * bytes.
+ */
 export async function swapPoolAccounts(
+  store: PoolStore,
   paths: AccountPaths,
   first: string,
   second: string,
+  options: PoolRowWriteOptions = {},
 ): Promise<boolean> {
-  let swapped = false
-  await mutateAccounts((current) => {
-    const a = current.accounts.findIndex((account) => account.id === first)
-    const b = current.accounts.findIndex((account) => account.id === second)
-    if (a === -1 || b === -1) return current
-    const held = current.accounts[a]
-    const other = current.accounts[b]
-    if (!held || !other) return current
-    current.accounts[a] = other
-    current.accounts[b] = held
-    swapped = true
-    return current
-  }, paths)
-  return swapped
+  for (let attempt = 1; ; attempt++) {
+    const ids = await poolRosterIds(store)
+    const a = ids.indexOf(first)
+    const b = ids.indexOf(second)
+    if (a === -1 || b === -1) return false
+    ids[a] = second
+    ids[b] = first
+    try {
+      await store.reorder(ids, {
+        extraLocks: legacyRosterOrderLocks(paths, options),
+      })
+      return true
+    } catch (error) {
+      if (attempt < SWAP_ATTEMPTS && isFailure(error, 'invalid-order')) continue
+      throw error
+    }
+  }
 }

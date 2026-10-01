@@ -12,6 +12,7 @@ import {
   type AccountPaths,
   fallbackRefreshLockName,
   loadAccounts,
+  mutateAccounts,
   type OAuthAccount,
   QuotaManager,
 } from '@cortexkit/openai-auth-core/internal'
@@ -649,6 +650,112 @@ describe('/openai-account on a migrated install', () => {
     })
   }
 
+  it('order swaps two rows through the store; every row, pool entry and the state file stay as they were', async () => {
+    seedPool(files, [
+      { id: 'main', quota: quotaMap(10) },
+      { id: 'fallback-1', quota: quotaMap(10) },
+      { id: 'fallback-2', quota: quotaMap(10) },
+    ])
+    const raw = readJson(files.configFile) as {
+      accounts: Array<Record<string, unknown>>
+    }
+    // A field neither the store nor the legacy loader recognises:
+    // `store.reorder` moves the row as it is, while the legacy roster writer
+    // rebuilds each row from the fields it loaded.
+    raw.accounts[1] = { ...raw.accounts[1], futureField: { kept: true } }
+    // A row the store reads as invalid keeps its position; the legacy roster
+    // writer could not load it and appended it after the others.
+    raw.accounts.splice(2, 0, { id: 'broken', type: 'mystery' })
+    writeFileSync(files.configFile, JSON.stringify(raw))
+    const rowsBefore = new Map(
+      raw.accounts.map((row) => [row.id, JSON.stringify(row)]),
+    )
+    const entriesBefore = JSON.stringify(config().commonAuthPool)
+    const stateBefore = readFileSync(files.stateFile, 'utf8')
+
+    const done = await buildDialogPayload(
+      'openai-account',
+      'order main fallback-2',
+      commandContext(),
+    )
+
+    expect(done.text).toContain('Accounts Reordered')
+    const after = (
+      readJson(files.configFile) as {
+        accounts: Array<Record<string, unknown>>
+      }
+    ).accounts
+    expect(after.map((row) => row.id)).toEqual([
+      'fallback-2',
+      'fallback-1',
+      'broken',
+      'main',
+    ])
+    for (const row of after)
+      expect(JSON.stringify(row)).toBe(rowsBefore.get(row.id) as string)
+    expect(JSON.stringify(config().commonAuthPool)).toBe(entriesBefore)
+    expect(readFileSync(files.stateFile, 'utf8')).toBe(stateBefore)
+  })
+
+  it('order waits for the legacy main-refresh lock and completes once it is released', async () => {
+    const before = readFileSync(files.configFile, 'utf8')
+    const lock = await acquireRefreshFileLock({
+      name: MAIN_REFRESH_LOCK_NAME,
+      ttlMs: 60_000,
+      path: files.configFile,
+    })
+    if (!lock) throw new Error('legacy lock not taken')
+    let settled = false
+    const pending = buildDialogPayload(
+      'openai-account',
+      'order fallback-1 main',
+      commandContext(),
+    ).finally(() => {
+      settled = true
+    })
+    try {
+      await sleep(400)
+      expect(settled).toBe(false)
+      expect(readFileSync(files.configFile, 'utf8')).toBe(before)
+    } finally {
+      await lock.release()
+    }
+
+    expect((await pending).text).toContain('Accounts Reordered')
+    expect(config().accounts.map((row) => row.id)).toEqual([
+      'fallback-1',
+      'main',
+    ])
+  })
+
+  // The order changes no row's credential, so it holds `main-refresh` only and
+  // never waits on a row's fallback refresh lock.
+  it('order does not wait for a row fallback refresh lock', async () => {
+    const lock = await acquireRefreshFileLock({
+      name: fallbackLock,
+      ttlMs: 60_000,
+      path: files.configFile,
+    })
+    if (!lock) throw new Error('legacy lock not taken')
+    try {
+      const done = await Promise.race([
+        buildDialogPayload(
+          'openai-account',
+          'order fallback-1 main',
+          commandContext(),
+        ),
+        sleep(2_000).then(() => undefined),
+      ])
+      expect(done?.text).toContain('Accounts Reordered')
+      expect(config().accounts.map((row) => row.id)).toEqual([
+        'fallback-1',
+        'main',
+      ])
+    } finally {
+      await lock.release()
+    }
+  })
+
   it('/openai-killswitch keys thresholds by row id and leaves row main to `main`', async () => {
     await buildDialogPayload(
       'openai-killswitch',
@@ -801,6 +908,13 @@ describe('cachekeep and reset credits on a migrated install', () => {
 describe('the auth menu on a migrated install', () => {
   type MenuAction = 'add-account' | 'delete-all' | 'check-quotas'
 
+  // Every call the menu makes to the legacy roster writer. On a migrated
+  // install the store is the roster's only writer, so this stays empty.
+  let legacyRosterWrites: unknown[]
+  beforeEach(() => {
+    legacyRosterWrites = []
+  })
+
   function methods(
     action: MenuAction,
     loginAccount = login('menu-acct', 'chatgpt-menu'),
@@ -813,6 +927,10 @@ describe('the auth menu on a migrated install', () => {
         showAuthMenu: async () => action,
         confirm: async () => true,
         openBrowser: async () => true,
+        mutateAccounts: (async (...args: Parameters<typeof mutateAccounts>) => {
+          legacyRosterWrites.push(args)
+          return mutateAccounts(...args)
+        }) as typeof mutateAccounts,
         beginAccountLogin: (async () => ({
           url: 'https://auth.example/login',
           instructions: 'Sign in.',
@@ -837,6 +955,7 @@ describe('the auth menu on a migrated install', () => {
   it('add-account writes a pool row', async () => {
     seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
     const output = await runMenu('add-account')
+    expect(legacyRosterWrites).toEqual([])
     expect(output).toContain('Added account menu-acct.')
     expect(config().accounts.map((row) => row.id)).toEqual([
       'main',
@@ -869,8 +988,88 @@ describe('the auth menu on a migrated install', () => {
       { id: 'fallback-2', quota: quotaMap(10) },
     ])
     const output = await runMenu('delete-all')
+    expect(legacyRosterWrites).toEqual([])
+    expect(output).toContain('Deleted 2 account(s).')
     expect(output).toContain('Kept `main`')
     expect(config().accounts.map((row) => row.id)).toEqual(['main'])
     expect(Object.keys(stateAccounts())).toEqual(['main'])
+  })
+
+  it('delete-all keeps main and a row a pending transfer names, and removes the rest through the store', async () => {
+    seedPool(files, [
+      { id: 'main', quota: quotaMap(10) },
+      { id: 'fallback-1', quota: quotaMap(10) },
+      { id: 'fallback-2', quota: quotaMap(10) },
+      { id: 'fallback-3', quota: quotaMap(10) },
+    ])
+    const raw = readJson(files.configFile) as {
+      accounts: Array<Record<string, unknown>>
+      openaiAuthPool: Record<string, unknown>
+    }
+    raw.openaiAuthPool = {
+      ...raw.openaiAuthPool,
+      pending: {
+        rowId: 'fallback-2',
+        operation: 'rotate',
+        rowFingerprint: null,
+        slotFingerprint: 'slot-fingerprint',
+        credentialFingerprint: 'credential-fingerprint',
+        carryLegacyMain: false,
+        recordedAt: 1,
+      },
+    }
+    // A row the store reads as invalid is a row like any other here: it goes.
+    // An entry with no id is no row of the pool, so it stays as it is.
+    raw.accounts.push({ id: 'broken', type: 'mystery' }, { label: 'no id' })
+    writeFileSync(files.configFile, JSON.stringify(raw))
+
+    const output = await runMenu('delete-all')
+
+    expect(legacyRosterWrites).toEqual([])
+    expect(output).toContain('Deleted 3 account(s).')
+    expect(output).toContain('Kept `main`, the account OpenCode signs in with.')
+    expect(output).toContain('Kept `fallback-2`. The account-pool migration')
+    const roster = (
+      readJson(files.configFile) as { accounts: Array<{ id?: string }> }
+    ).accounts
+    expect(roster.map((row) => row.id ?? null)).toEqual([
+      'main',
+      'fallback-2',
+      null,
+    ])
+    expect(Object.keys(stateAccounts())).toEqual(['main', 'fallback-2'])
+    // `store.remove` drops a removed row's pool entry with its roster row; the
+    // legacy roster writer left the entries behind.
+    expect(Object.keys(config().commonAuthPool.rows)).toEqual([
+      'main',
+      'fallback-2',
+    ])
+  })
+
+  it('delete-all waits for a row legacy fallback refresh lock before removing it', async () => {
+    seedPool(files, [
+      { id: 'main', quota: quotaMap(10) },
+      { id: 'fallback-1', quota: quotaMap(10) },
+    ])
+    const before = readFileSync(files.configFile, 'utf8')
+    const lock = await acquireRefreshFileLock({
+      name: fallbackRefreshLockName('fallback-1'),
+      ttlMs: 60_000,
+      path: files.configFile,
+    })
+    if (!lock) throw new Error('legacy lock not taken')
+    let settled = false
+    const pending = runMenu('delete-all').finally(() => {
+      settled = true
+    })
+    try {
+      await sleep(400)
+      expect(settled).toBe(false)
+      expect(readFileSync(files.configFile, 'utf8')).toBe(before)
+    } finally {
+      await lock.release()
+    }
+    expect(await pending).toContain('Deleted 1 account(s).')
+    expect(config().accounts.map((row) => row.id)).toEqual(['main'])
   })
 })
