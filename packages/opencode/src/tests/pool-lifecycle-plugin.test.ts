@@ -241,10 +241,20 @@ function send(
 }
 
 describe('the migration after the loader starts', () => {
-  it('is switched off by default in this release: nothing moves', async () => {
+  it('runs by default: with no override the main login moves into the pool', async () => {
+    await seedLegacy()
+    installWire({ usage: true })
+    await loadPlugin({ enabled: undefined })
+    await waitFor(
+      async () => isPoolPlaceholder(await slotValue()),
+      'the placeholder in the slot',
+    )
+  })
+
+  it('moves nothing while switched off', async () => {
     await seedLegacy()
     const wire = installWire()
-    const { fetchOverride } = await loadPlugin({ enabled: undefined })
+    const { fetchOverride } = await loadPlugin({ enabled: false })
     const before = readFileSync(configFile, 'utf8')
     expect((await send(fetchOverride)).status).toBe(200)
     // Long enough for a background run to have written its record.
