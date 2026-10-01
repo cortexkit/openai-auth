@@ -35,6 +35,18 @@ export const RESPONSES_LITE_HEADER = 'x-openai-internal-codex-responses-lite'
 /** Most sessions whose first effort is remembered. */
 const MAX_PINNED_SESSIONS = 1024
 
+/**
+ * The models OpenCode 2's own OpenAI driver already carries an effort change
+ * for: it records the change in the session's history, sends it as a
+ * `configuration_update` item and keeps the request-level effort at the
+ * session's first value, on HTTP and WebSocket alike. This is the rule its
+ * Responses protocol applies on 2.0.21 (`supportsEffortUpdates` there: a
+ * model id ending in `gpt-6-astra`, `gpt-6-sol` or `gpt-6-luna`, unless the
+ * model's own settings say otherwise). The rewrite leaves these models to
+ * the host, so the two never both act on one request.
+ */
+const HOST_EFFORT_UPDATE_MODEL = /(?:^|\/)gpt-6-(?:astra|sol|luna)$/i
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
@@ -52,7 +64,9 @@ export type WireForm = 'http' | 'ws'
 /**
  * OpenCode 1's mid-conversation effort rule (`applyMidConversationEffort`),
  * for the models where a `configuration_update` item is known to change
- * effort (`MID_CONVERSATION_EFFORT_MODELS`).
+ * effort (`MID_CONVERSATION_EFFORT_MODELS`) and the host does not carry the
+ * change itself (`HOST_EFFORT_UPDATE_MODEL`); on 2.0.21 that leaves
+ * `gpt-6.1-sol`.
  *
  * The backend keys its prompt cache on the request-level
  * `reasoning.effort`, so a session that changes effort part-way would have
@@ -105,6 +119,7 @@ export class MidConversationEffort {
     if (scope.kind !== 'primary') return false
     const model = typeof body.model === 'string' ? body.model : ''
     if (!MID_CONVERSATION_EFFORT_MODELS.has(model)) return false
+    if (HOST_EFFORT_UPDATE_MODEL.test(model)) return false
     const reasoning = isRecord(body.reasoning) ? body.reasoning : undefined
     const effort =
       typeof reasoning?.effort === 'string' ? reasoning.effort : undefined

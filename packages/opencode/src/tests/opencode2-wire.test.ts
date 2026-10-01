@@ -52,7 +52,7 @@ function frame(
 ) {
   return JSON.stringify({
     type: 'response.create',
-    model: 'gpt-6-sol',
+    model: 'gpt-6.1-sol',
     input,
     instructions: 'be brief',
     tools: [{ type: 'function', name: 'x' }],
@@ -70,7 +70,7 @@ function httpBody(
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'gpt-6-sol',
+      model: 'gpt-6.1-sol',
       input,
       instructions: 'be brief',
       tools: [{ type: 'function', name: 'x' }],
@@ -159,6 +159,15 @@ describe('mid-conversation effort on WebSocket frames', () => {
         effort,
       ),
     ).toBe(undefined)
+    // OpenCode 2 carries an effort change for the gpt-6 models itself.
+    for (const model of ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'])
+      expect(
+        rewriteCodexFrame(
+          frame('high', [user('two')], { model }),
+          SESSION,
+          effort,
+        ),
+      ).toBe(undefined)
     // A title request neither pins nor is rewritten.
     const title = { sessionID: 'ses_2', kind: 'title' }
     expect(rewriteCodexFrame(frame('low', [user('t')]), title, effort)).toBe(
@@ -307,7 +316,7 @@ describe('through the OpenCode 2 entry', () => {
 
   const draftScope = (kind: RequestKind = 'primary') => ({
     ...scope('ses_1', kind),
-    model: { providerID: 'openai', id: 'gpt-6-sol' },
+    model: { providerID: 'openai', id: 'gpt-6.1-sol' },
   })
 
   it('sends the Codex client identity with the credential, the same on every request', async () => {
