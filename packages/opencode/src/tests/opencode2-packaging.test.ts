@@ -42,9 +42,23 @@ describe('packed package on plain Node', () => {
     )
     expect(result.stderr).toBe('')
     expect(JSON.parse(result.stdout)).toEqual({
-      id: 'cortexkit.openai-auth',
+      id: 'cortexkit-openai-auth',
       setup: 'function',
       factory: 'function',
+    })
+  })
+
+  // OpenCode 1 loads a package's `./server` export in preference to its root,
+  // so that entry must carry the root's OpenCode 1 plugin unchanged.
+  test('./server carries the same OpenCode 1 plugin and id as the root', () => {
+    const result = node(
+      `const s = await import('${PACKAGE_NAME}/server'); const r = await import('${PACKAGE_NAME}'); console.log(JSON.stringify({ server: typeof s.default.server, same: s.default.server === r.default.server, id: s.default.id === r.default.id }))`,
+    )
+    expect(result.stderr).toBe('')
+    expect(JSON.parse(result.stdout)).toEqual({
+      server: 'function',
+      same: true,
+      id: true,
     })
   })
 

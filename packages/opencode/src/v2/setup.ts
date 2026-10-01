@@ -62,8 +62,11 @@ import {
 import { registerCodexModelRules } from './models'
 import { SessionPins } from './pins'
 
-/** The plugin id OpenCode 2 lists this plugin under. */
-export const OPENAI_AUTH_PLUGIN_ID = 'cortexkit.openai-auth'
+/**
+ * The plugin id both hosts list this plugin under: the OpenCode 1 plugin's
+ * own id, since OpenCode 1 reads the `./server` entry as well.
+ */
+export const OPENAI_AUTH_PLUGIN_ID = 'cortexkit-openai-auth'
 
 /** Longest a shutdown waits for queued quota writes before it lets go. */
 const SETTLE_ON_DISPOSE_MS = 5_000

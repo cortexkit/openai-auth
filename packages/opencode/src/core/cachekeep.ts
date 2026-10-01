@@ -25,8 +25,8 @@ import {
 import { sanitizeHttpFallbackInit } from '../codex-http'
 import {
   hashSidebarSessionId,
-  STICKY_ASSIGNMENT_MAX_AGE_MS,
   type SidebarState,
+  STICKY_ASSIGNMENT_MAX_AGE_MS,
 } from '../sidebar-state'
 
 export {

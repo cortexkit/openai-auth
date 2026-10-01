@@ -165,9 +165,18 @@ const quotaFrame = (identity: Identity) => ({
   },
 })
 
+/** One agent-loop request as sent: its headers and its parsed body. */
+export interface WireSample {
+  readonly transport: 'http' | 'ws'
+  readonly headers: Record<string, string>
+  readonly body: unknown
+}
+
 export interface MockCodex {
   readonly url: string
   readonly records: WireRecord[]
+  /** Agent-loop requests in full, for reading what the host's driver sends. */
+  readonly samples: WireSample[]
   /** Refuses the next agent-loop request of `account` once. */
   reject(account: MockAccount, mode: RejectMode): void
   stop(): Promise<void>
@@ -175,6 +184,14 @@ export interface MockCodex {
 
 export function startMockCodex(forbidden: readonly string[]): MockCodex {
   const records: WireRecord[] = []
+  const samples: WireSample[] = []
+  const parse = (text: string): unknown => {
+    try {
+      return JSON.parse(text)
+    } catch {
+      return text
+    }
+  }
   const rejects: Array<{ account: MockAccount; mode: RejectMode }> = []
   let requests = 0
   let connections = 0
@@ -191,6 +208,7 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
     connection: number
     identity: Identity
     accountHeader: string | null
+    headers: Record<string, string>
   }
 
   const server = Bun.serve<Socket>({
@@ -212,7 +230,12 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
         })
         if (
           server.upgrade(request, {
-            data: { connection, identity, accountHeader },
+            data: {
+              connection,
+              identity,
+              accountHeader,
+              headers: Object.fromEntries(request.headers),
+            },
           })
         )
           return undefined
@@ -232,6 +255,12 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
       // Only agent-loop requests carry tool definitions.
       const kind = /"tools"\s*:/.test(body) ? 'primary' : 'other'
       const rejected = kind === 'primary' ? takeReject(identity) : undefined
+      if (kind === 'primary')
+        samples.push({
+          transport: 'http',
+          headers: Object.fromEntries(request.headers),
+          body: parse(body),
+        })
       records.push({
         transport: 'http',
         action: 'request',
@@ -260,8 +289,9 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
       )
     },
     websocket: {
-      message(socket) {
-        const { connection, identity, accountHeader } = socket.data
+      message(socket, message) {
+        const { connection, identity, accountHeader, headers } = socket.data
+        samples.push({ transport: 'ws', headers, body: parse(String(message)) })
         const index = ++requests
         const rejected = takeReject(identity)
         records.push({
@@ -291,6 +321,7 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
   return {
     url: `http://127.0.0.1:${server.port}`,
     records,
+    samples,
     reject(account, mode) {
       rejects.push({ account, mode })
     },

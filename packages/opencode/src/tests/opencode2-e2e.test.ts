@@ -353,6 +353,7 @@ async function runScenario(input: {
   } catch {}
   const diagnostics = [
     `wire: ${JSON.stringify(mock.records)}`,
+    `samples: ${JSON.stringify(mock.samples)}`,
     `stdout: ${JSON.stringify(stdout)}`,
     ...clientLog,
     `--- plugin log (tail) ---\n${pluginLog.slice(-6000)}`,
