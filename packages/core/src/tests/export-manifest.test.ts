@@ -17,7 +17,7 @@ describe('core export surface', () => {
     )
   })
 
-  it('keeps the command bodies private so no host can skip the scrubbing', () => {
+  it('exposes no command body a host could call around the menu', () => {
     const everything = [...Object.keys(root), ...Object.keys(internal)]
     const bodies = everything.filter((name) => /^execute[A-Z]/.test(name))
     expect(bodies).toEqual([])
@@ -27,8 +27,7 @@ describe('core export surface', () => {
     // The seam is what runs the scrubbing, so `.` is deliberately small. Store,
     // OAuth and reset entry points live on ./internal, where an import of them
     // is visible as a host reaching past the seam.
-    expect(ROOT_VALUE_EXPORTS).toContain('buildDialogPayload')
-    expect(ROOT_VALUE_EXPORTS).toContain('applyCommand')
+    expect(ROOT_VALUE_EXPORTS).toContain('createOpenAiMenu')
     expect(ROOT_VALUE_EXPORTS).toContain('scrubKnobs')
     expect(ROOT_VALUE_EXPORTS).not.toContain('loadAccounts')
     expect(ROOT_VALUE_EXPORTS).not.toContain('mutateAccounts')
