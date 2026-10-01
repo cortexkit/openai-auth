@@ -321,7 +321,8 @@ describe('vault accounts on OpenCode 2', () => {
     const served = await send(host, 200)
 
     expect(served.get('authorization')).toBe('Bearer main-token')
-    // The request's token step waited for the roster, but only for its bound.
+    // The request's token step waited for the roster, but only up to
+    // VAULT_FIRST_ROSTER_WAIT_MS (2 s).
     expect(Date.now() - sending).toBeGreaterThanOrEqual(1_900)
     expect(Date.now() - sending).toBeLessThan(4_000)
   }, 10_000)

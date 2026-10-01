@@ -393,8 +393,8 @@ describe('adoption beside the Claustrum vault', () => {
           vault: {
             stateDir,
             connectionFile: () => daemon.connectionFile,
-            // Opened a second late, so the roster read ends well after the
-            // migration reaches its adoption.
+            // The vault connection opens a second late, so its first roster
+            // read ends well after the migration reaches its adoption.
             connectScoped: async () => {
               await Bun.sleep(1_000)
               return connectClaustrumScopedClient({

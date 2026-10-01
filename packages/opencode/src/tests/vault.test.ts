@@ -527,7 +527,8 @@ describe('routing', () => {
 
     expect(response.status).toBe(200)
     expect(wire.sends).toEqual(['Bearer main-token'])
-    // The request's token step waited for the roster, but only for its bound.
+    // The request's token step waited for the roster, but only up to
+    // VAULT_FIRST_ROSTER_WAIT_MS (2 s).
     expect(Date.now() - sending).toBeGreaterThanOrEqual(1_900)
     expect(Date.now() - sending).toBeLessThan(4_000)
   }, 10_000)
