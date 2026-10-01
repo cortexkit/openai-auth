@@ -13,6 +13,7 @@ import { join } from 'node:path'
 import {
   acquireRefreshFileLock,
   migrateIfNeeded,
+  mutateAccounts,
   type OAuthAccount,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
@@ -2867,7 +2868,7 @@ describe('integration: active fallback routing', () => {
    * What the `/openai` Cache section does to the live loader besides saving
    * the setting: these tests run on an install the menu does not open on.
    */
-  function cacheKeep(action: 'on' | 'off' | 'sustain on') {
+  async function cacheKeep(action: 'on' | 'off' | 'sustain on') {
     const ctx = __menuContextForTest()
     if (!ctx?.cacheKeepManager) throw new Error('no /openai context loaded')
     if (action === 'sustain on') {
@@ -2875,10 +2876,16 @@ describe('integration: active fallback routing', () => {
       return
     }
     const on = action === 'on'
-    // Saved as the menu's write would save it, so a later loader run reads it.
-    const config = JSON.parse(readFileSync(ctx.accountStoragePath, 'utf8'))
-    config.cachekeep = { ...(config.cachekeep ?? {}), enabled: on }
-    writeFileSync(ctx.accountStoragePath, JSON.stringify(config))
+    // Saved as the menu's write would save it, so a later loader run reads
+    // it, and through the locked writer: the loader's own background writes
+    // to the same file may be running.
+    await mutateAccounts(
+      (current) => {
+        current.cachekeep = { ...(current.cachekeep ?? {}), enabled: on }
+        return current
+      },
+      { configPath: ctx.accountStoragePath, statePath: ctx.accountStatePath },
+    )
     ctx.setCacheKeepEnabled?.(on)
     if (on) ctx.cacheKeepManager.start()
     else ctx.cacheKeepManager.stop()
@@ -4321,7 +4328,7 @@ describe('integration: active fallback routing', () => {
       hooks = loaded.hooks
       await drainSidebarWrites()
       seedStickyBalancedAccounts()
-      cacheKeep('on')
+      await cacheKeep('on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'x-session-affinity': 'capture-session' }),
@@ -4364,7 +4371,7 @@ describe('integration: active fallback routing', () => {
       hooks = loaded.hooks
       await drainSidebarWrites()
       seedStickyBalancedAccounts()
-      cacheKeep('on')
+      await cacheKeep('on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'x-session-affinity': 'moved-session' }),
@@ -5176,7 +5183,7 @@ describe('integration: active fallback routing', () => {
       )
       hooks = loaded.hooks
 
-      cacheKeep('on')
+      await cacheKeep('on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'session-id': 'main-session' }),
@@ -5220,7 +5227,7 @@ describe('integration: active fallback routing', () => {
         Date.now() + 3600_000,
       )
       firstHooks = first.hooks
-      cacheKeep('on')
+      await cacheKeep('on')
 
       const second = await loadFetchOverride(
         createMockPluginInput({ client }),
@@ -5260,14 +5267,14 @@ describe('integration: active fallback routing', () => {
       )
       hooks = loaded.hooks
 
-      cacheKeep('on')
+      await cacheKeep('on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'session-id': 'main-session' }),
       )
 
       now += 60 * 60_000 + 1
-      cacheKeep('sustain on')
+      await cacheKeep('sustain on')
       const manager = (
         globalThis as typeof globalThis & {
           __openaiAuthCacheKeepManagers?: Map<
@@ -6458,7 +6465,7 @@ describe('integration: active fallback routing', () => {
       )
       hooks = loaded.hooks
 
-      cacheKeep('on')
+      await cacheKeep('on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'session-id': 'main-session' }),
@@ -6510,7 +6517,7 @@ describe('integration: active fallback routing', () => {
       )
       hooks = loaded.hooks
 
-      cacheKeep('on')
+      await cacheKeep('on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({
@@ -7373,7 +7380,7 @@ describe('integration: active fallback routing', () => {
             true,
           )
           hooks = loaded.hooks
-          cacheKeep('on')
+          await cacheKeep('on')
           const request = responsesLiteRequestInit(
             'gpt-5.6-sol',
             'responses-lite-keepwarm',
