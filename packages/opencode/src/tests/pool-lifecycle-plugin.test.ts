@@ -114,10 +114,29 @@ interface Wire {
   refreshTokens: string[]
 }
 
-function installWire(): Wire {
+/**
+ * Replace the network. With `usage`, quota polls answer with a reading (a
+ * migrated install refuses an account until its first reading lands);
+ * otherwise they fail like every other unexpected call.
+ */
+function installWire(options: { usage?: boolean } = {}): Wire {
   const wire: Wire = { sends: [], refreshTokens: [] }
   globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
     const target = String(url)
+    if (options.usage && target.includes('/wham/usage')) {
+      return new Response(
+        JSON.stringify({
+          rate_limit: {
+            primary_window: {
+              used_percent: 10,
+              limit_window_seconds: 18_000,
+              reset_at: Math.floor((Date.now() + 3600_000) / 1000),
+            },
+          },
+        }),
+        { status: 200 },
+      )
+    }
     if (target.includes('/oauth/token')) {
       wire.refreshTokens.push(
         new URLSearchParams(String(init?.body ?? '')).get('refresh_token') ??
@@ -237,7 +256,7 @@ describe('the migration after the loader starts', () => {
 
   it('runs in the background: a request meanwhile is served from the slot, and afterwards from row main', async () => {
     await seedLegacy()
-    const wire = installWire()
+    const wire = installWire({ usage: true })
     const park = parkAt('after-record-write')
     // The loader returns while the migration is parked mid-transfer.
     const { fetchOverride } = await loadPlugin({
@@ -263,6 +282,14 @@ describe('the migration after the loader starts', () => {
     const state = readJson(stateFile)
     state.accounts.main = { ...state.accounts.main, access: 'row-main-access' }
     writeFileSync(stateFile, JSON.stringify(state))
+    // A migrated install serves from the account pool, which refuses an
+    // account whose quota is unknown. The migration itself starts row
+    // main's first quota poll; the request goes out once that reading is in.
+    await waitFor(
+      async () =>
+        readJson(configFile).commonAuthPool?.rows?.main?.quota !== undefined,
+      "row main's first quota reading",
+    )
 
     const after = await send(fetchOverride)
     expect(after.status).toBe(200)
