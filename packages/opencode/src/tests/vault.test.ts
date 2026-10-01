@@ -418,6 +418,100 @@ describe('routing', () => {
     ])
     expect(wire.sends).not.toContain('Bearer alpha-token')
   })
+
+  test('a static OpenAI API key in the vault is never listed, read, routed or reported', async () => {
+    const running = await startDaemon({
+      'apikey:openai:platform': {
+        payload: JSON.stringify({ access_token: 'sk-vault-platform-key' }),
+        record_version: 3,
+        expires_at_ms: null,
+        type: 'api_key',
+        refresh_adapter: null,
+      },
+      'oauth:openai:vault': vaultLogin('chatgpt-vault'),
+    })
+    enroll()
+    seedPool(files, [{ id: 'main', quota: quotaMap(100) }])
+    const wire = wireWithExhaustedMain()
+    // Every model request answers 401, so a key that was sent would be
+    // reported to the vault.
+    const recorded = globalThis.fetch
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      if (!String(url).includes('/responses'))
+        return recorded(url as string, init)
+      wire.sends.push(new Headers(init?.headers).get('authorization') ?? '')
+      return new Response('{}', { status: 401 })
+    }) as typeof globalThis.fetch
+    const { vault } = await plugin()
+    await setMode('fallback-first')
+    const send = await fetchOverride()
+
+    await request(send)
+
+    expect(vault.snapshot()?.rows.map((row) => row.credentialId)).toEqual([
+      'oauth:openai:vault',
+    ])
+    expect(vault.routes().map((route) => route.kind)).not.toContain('api-key')
+    expect(running.gets.map((get) => get.credential_id)).not.toContain(
+      'apikey:openai:platform',
+    )
+    expect(wire.sends).not.toContain('Bearer sk-vault-platform-key')
+    expect(running.reports.map((report) => report.credential_id)).not.toContain(
+      'apikey:openai:platform',
+    )
+  })
+
+  test('in an ordered mode, a vault account the vault will not serve passes the request to the next account', async () => {
+    const running = await startDaemon({
+      'oauth:openai:vault': vaultLogin('chatgpt-vault'),
+    })
+    enroll()
+    seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+    const wire = installWire()
+    await plugin()
+    await setMode('fallback-first')
+    // The vault account has a quota reading, so admission puts it first; the
+    // vault then refuses to serve it.
+    const credential = running.credentials['oauth:openai:vault']
+    if (!credential) throw new Error('no credential')
+    credential.refuse = 'credential_unavailable'
+    const send = await fetchOverride()
+    const gets = running.gets.length
+
+    const response = await request(send)
+
+    expect(response.status).toBe(200)
+    expect(running.gets.slice(gets).map((get) => get.credential_id)).toContain(
+      'oauth:openai:vault',
+    )
+    expect(wire.sends).toEqual(['Bearer main-token'])
+  })
+
+  test('in an ordered mode, a refused vault account passes the request to another vault account', async () => {
+    const running = await startDaemon({
+      'oauth:openai:a': vaultLogin('chatgpt-a'),
+      'oauth:openai:b': vaultLogin('chatgpt-b'),
+    })
+    enroll()
+    seedPool(files, [{ id: 'main', quota: quotaMap(100) }])
+    const wire = wireWithExhaustedMain()
+    await plugin()
+    await setMode('fallback-first')
+    const credential = running.credentials['oauth:openai:a']
+    if (!credential) throw new Error('no credential')
+    credential.refuse = 'credential_unavailable'
+    const send = await fetchOverride()
+    const gets = running.gets.length
+
+    const response = await request(send)
+
+    expect(response.status).toBe(200)
+    expect(running.gets.slice(gets).map((get) => get.credential_id)).toEqual([
+      'oauth:openai:a',
+      'oauth:openai:b',
+    ])
+    expect(wire.sends).toEqual([`Bearer ${chatgptAccessToken('chatgpt-b')}`])
+  })
 })
 
 describe('the host slot', () => {

@@ -252,6 +252,38 @@ describe('Pi and the Claustrum vault', () => {
     })
   }
 
+  test('in an ordered mode, a vault account the vault will not serve passes the request to the next account', async () => {
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: {
+        'oauth:openai:a': vaultLogin('chatgpt-a'),
+        'oauth:openai:b': vaultLogin('chatgpt-b'),
+      },
+    })
+    enroll()
+    const target = vault()
+    const runtime = runtimeWith(target)
+    await target.refresh()
+    await target.pollStale(0)
+    await setMode('fallback-first')
+    // Both accounts have a quota reading, so admission orders them; the vault
+    // then refuses to serve the first.
+    const credential = daemon.credentials['oauth:openai:a']
+    if (!credential) throw new Error('no credential')
+    credential.refuse = 'credential_unavailable'
+    const gets = daemon.gets.length
+
+    const events = await send(runtime)
+
+    expect(events[0]?.type).toBe('start')
+    expect(daemon.gets.slice(gets).map((get) => get.credential_id)).toEqual([
+      'oauth:openai:a',
+      'oauth:openai:b',
+    ])
+    expect(codexTokens).toEqual([chatgptAccessToken('chatgpt-b')])
+    target.close()
+  })
+
   test('a 401 on a vault account is reported to the vault with the version it was served', async () => {
     daemon = await startMockDaemon({
       directory: dir,

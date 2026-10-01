@@ -360,9 +360,17 @@ async function serveOrdered(
   const byId = new Map(rows.map((row) => [row.id, row]))
   const retryStatuses = getFallbackStatuses(ctx.storage)
   const attempts: OrderedAttempt[] = []
+  // Accounts that had nothing to send with (a vault account the vault would
+  // not serve, a row without a usable token). Nothing reached the provider,
+  // so the next account in the order is tried as if this one were not there.
+  const unsent = new Set<string>()
   let last: PoolRequestResult | undefined
   for (;;) {
-    const id = nextOrderedAttempt(plan.order, attempts, retryStatuses)
+    const id = nextOrderedAttempt(
+      plan.order.filter((candidate) => !unsent.has(candidate)),
+      attempts,
+      retryStatuses,
+    )
     const row = id === undefined ? undefined : byId.get(id)
     if (!row) break
     let response: Response | undefined
@@ -381,7 +389,10 @@ async function serveOrdered(
       })
       return last
     }
-    if (!response) break
+    if (!response) {
+      unsent.add(row.id)
+      continue
+    }
     // Only the response returned keeps its body; an earlier one is dropped
     // once a later attempt has produced a replacement.
     last?.response.body?.cancel().catch(() => {})

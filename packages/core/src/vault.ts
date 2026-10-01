@@ -55,13 +55,20 @@ export const VAULT_PLUGIN_NAME = 'openai-auth'
 
 /**
  * Which vault credentials are OpenAI's: OAuth logins refreshed by the vault's
- * `openai` adapter, and static API keys, both granted to this consumer under
- * the `openai-native` category.
+ * `openai` adapter, granted to this consumer under the `openai-native`
+ * category.
+ *
+ * Static API keys (`apikey:openai`) are not admitted: they are never listed,
+ * read or routed. Every request this plugin sends goes to the ChatGPT Codex
+ * endpoint, which takes ChatGPT logins; a platform API key sent there as a
+ * bearer would be refused, and that 401 would be reported to the vault as
+ * the death of a key that works elsewhere. Admit them only once there is a
+ * transport that sends an API key where it is accepted.
  */
 export const VAULT_FAMILY: ClaustrumFamily = {
   refreshAdapter: 'openai',
   category: 'openai-native',
-  apiKeys: true,
+  apiKeys: false,
 }
 
 export type VaultHost = 'opencode' | 'pi'

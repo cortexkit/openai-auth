@@ -75,7 +75,7 @@ How it differs from OpenCode 1:
 - **Quota** from the `x-codex-*` response headers and `codex.rate_limits` frames is recorded on the account that served.
 - **Models**: the same allow and deny lists and context caps as on OpenCode 1.
 
-Not on OpenCode 2 yet: the `/openai` menu and the sidebar (account management works from OpenCode 1, or `opencode auth login` there), cache keep-warm, request dumps, reset credits, Claustrum custody (an install that keeps its credentials in the Claustrum vault does not move to the pool, so OpenCode 2 refuses its requests), cost zeroing, and the Codex request shaping OpenCode 1 does: the Codex client identity (`version`, `originator: codex_exec`, its user agent), turn-metadata headers, Responses Lite, and the mid-conversation reasoning-effort update for the gpt-6 family. OpenCode 2's driver sends its own identity (`originator: opencode`, `session-id`, `x-codex-beta-features: remote_compaction_v2`, `prompt_cache_key` set to the session). While the plugin is loaded, provider `openai` is served from the pool only: an OpenAI API key does not work through it.
+Not on OpenCode 2 yet: the `/openai` menu and the sidebar (account management works from OpenCode 1, or `opencode auth login` there), cache keep-warm, request dumps, reset credits, the Claustrum vault's accounts (OpenCode 2 routes the account pool's own rows only; vault accounts serve on OpenCode 1 and Pi), cost zeroing, and the Codex request shaping OpenCode 1 does: the Codex client identity (`version`, `originator: codex_exec`, its user agent), turn-metadata headers, Responses Lite, and the mid-conversation reasoning-effort update for the gpt-6 family. OpenCode 2's driver sends its own identity (`originator: opencode`, `session-id`, `x-codex-beta-features: remote_compaction_v2`, `prompt_cache_key` set to the session). While the plugin is loaded, provider `openai` is served from the pool only: an OpenAI API key does not work through it.
 
 ## Multiple accounts
 
@@ -208,6 +208,8 @@ and let it read your OpenAI accounts with:
 ```
 
 The token the vault then issues is kept owner-only in `openai-auth-vault/` next to the account state file. The vault accounts route through the same routing modes and limits as your own; each request fetches its token from the vault, and a token the provider rejects is reported back to the vault. An account you also signed in to here is served by the vault only (one account, one owner). While the vault serves accounts, a login written into OpenCode's own `openai` slot is refused rather than served beside them: remove it, or disconnect.
+
+Static OpenAI API keys held in the vault (`apikey:openai`) are not used: they are never listed, read or routed. Every request this plugin sends goes to the ChatGPT Codex endpoint, which takes ChatGPT logins, not platform API keys, so only the vault's OpenAI logins serve.
 
 An install that used the vault custody of earlier versions may still hold its tombstones (in accounts, or in OpenCode's slot) and the `claustrum.mode` setting. They are never sent; the auth doctor lists them, with the remedy: connect the vault, or sign in to the account again.
 

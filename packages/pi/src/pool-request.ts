@@ -216,13 +216,28 @@ async function routeOrdered<A extends RouteAttempt>(
   const byId = new Map(accounts.map((account) => [account.id, account]))
   const retryStatuses = getFallbackStatuses(ctx.storage)
   const attempts: OrderedAttempt[] = []
+  // Accounts that had nothing to send with (a vault account the vault would
+  // not serve, an account without a token). Nothing reached the provider, so
+  // the next account in the order is tried as if this one were not there.
+  const unsent = new Set<string>()
   let last: { attempt: A; accountId: string } | undefined
   for (;;) {
-    const id = nextOrderedAttempt(plan.order, attempts, retryStatuses)
-    const account = id === undefined ? undefined : byId.get(id)
-    if (!sendable(account)) break
+    const id = nextOrderedAttempt(
+      plan.order.filter((candidate) => !unsent.has(candidate)),
+      attempts,
+      retryStatuses,
+    )
+    if (id === undefined) break
+    const account = byId.get(id)
+    if (!sendable(account)) {
+      unsent.add(id)
+      continue
+    }
     const attempt = await ctx.send(account)
-    if (!attempt) break
+    if (!attempt) {
+      unsent.add(id)
+      continue
+    }
     last = { attempt, accountId: account.id }
     attempts.push({
       id: account.id,
