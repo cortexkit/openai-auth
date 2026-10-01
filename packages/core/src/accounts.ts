@@ -369,6 +369,12 @@ export type AccountManagerOptions = {
   // Required because an omitted policy reader silently re-enables local refresh;
   // anthropic-auth incident 1 demonstrated that optional custody wiring fails open.
   custody: AccountManagerCustodyOptions
+  /**
+   * Asked before every background refresh pass; true skips the pass. A host
+   * whose accounts moved into a shared account pool refreshes them there, and
+   * this keeps the per-account background refresh off those rows.
+   */
+  backgroundRefreshPaused?: () => boolean | Promise<boolean>
 }
 
 export type RefreshAccountOptions = {
@@ -2537,6 +2543,7 @@ export class FallbackAccountManager {
 
   startBackgroundRefresh() {
     const run = async () => {
+      if (await this.options.backgroundRefreshPaused?.()) return
       await this.refreshDueAccounts()
       // quota auto-runners are passive-only (gated behind fetchQuotaFn injection)
       if (this.options.fetchQuotaFn) {

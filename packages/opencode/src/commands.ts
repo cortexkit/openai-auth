@@ -64,9 +64,17 @@ async function executeKillswitchCommand(
     accounts: [],
   }
   const config: KillswitchConfig = storage.killswitch ?? {}
-  const accountIds = (storage.accounts ?? [])
-    .filter((a) => a.enabled !== false)
-    .map((a) => a.id)
+  // On a migrated install the roster holds row `main` too. It is the main
+  // account, judged against `config.main`, so it is not listed (or set) as an
+  // account of its own.
+  const poolRows = await ctx.accountPool?.rows()
+  const accountIds = poolRows
+    ? poolRows
+        .filter((row) => row.enabled && row.id !== 'main')
+        .map((row) => row.id)
+    : (storage.accounts ?? [])
+        .filter((a) => a.enabled !== false)
+        .map((a) => a.id)
 
   const tokens = args.trim().toLowerCase().split(/\s+/).filter(Boolean)
 

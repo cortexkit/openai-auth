@@ -167,6 +167,43 @@ export interface CommandContext {
   ) => Promise<
     { ready: true; accountId: string } | { ready: false; reason: string }
   >
+  /**
+   * The shared account pool, on a host that can move accounts into it. Its
+   * `rows()` resolves to undefined until the install is migrated, and the
+   * commands then work on the legacy account list as before.
+   */
+  accountPool?: CommandAccountPool
+}
+
+/** One pool row as the account commands see it: no credential fields. */
+export interface CommandPoolRow {
+  id: string
+  type: 'oauth' | 'api'
+  enabled: boolean
+  label?: string
+}
+
+/**
+ * Account management on a migrated install, where every account (the one
+ * OpenCode signs in with included, as row `main`) is a row of the account
+ * pool. The host implements it over the pool store.
+ */
+export interface CommandAccountPool {
+  /** The rows in roster order, or undefined when the install is not migrated. */
+  rows(): Promise<readonly CommandPoolRow[] | undefined>
+  /** Adds a new login as a row, or replaces the credential of the row holding that account. */
+  add(account: OAuthAccount): Promise<{
+    status: 'added' | 'added-disabled' | 'replaced' | 'main-identity'
+    id: string
+  }>
+  disable(id: string): Promise<boolean>
+  enable(id: string): Promise<boolean>
+  /** Row `main` is never removed: it resolves to `main-refused`. */
+  remove(id: string): Promise<'removed' | 'not-found' | 'main-refused'>
+  /** Swaps two rows' positions in the roster order. */
+  reorder(first: string, second: string): Promise<boolean>
+  /** The refusal text for removing row `main`. */
+  mainRemovalRefused: string
 }
 
 export interface ResetTargetIdentity {
@@ -371,6 +408,16 @@ function accountKnob(account: FallbackAccount) {
   }
 }
 
+/** `accountKnob` for a pool row, built field by field for the same reason. */
+function poolRowKnob(row: CommandPoolRow) {
+  return {
+    id: row.id,
+    type: row.type,
+    enabled: row.enabled,
+    label: row.label,
+  }
+}
+
 async function executeAccountCommand(
   args: string,
   ctx: CommandContext,
@@ -466,6 +513,17 @@ async function executeAccountCommand(
         claustrumMode: claustrumMode(nextStorage),
       },
     }
+  }
+
+  const poolRows = await ctx.accountPool?.rows()
+  if (ctx.accountPool && poolRows) {
+    return executePoolAccountCommand(
+      tokens,
+      ctx,
+      ctx.accountPool,
+      poolRows,
+      claustrumMode(storage),
+    )
   }
 
   if ((tokens[0] === 'enable' || tokens[0] === 'disable') && tokens[1]) {
@@ -787,6 +845,180 @@ async function executeAccountCommand(
       claustrumMode: claustrumMode(storage),
     },
   }
+}
+
+/**
+ * `/openai-account` on a migrated install. Every account is a pool row: the
+ * one OpenCode signs in with is row `main` and is listed as the main account,
+ * the others follow in roster order. Adding writes a row, disabling goes
+ * through the store, and row `main` cannot be removed.
+ */
+async function executePoolAccountCommand(
+  tokens: readonly string[],
+  ctx: CommandContext,
+  pool: CommandAccountPool,
+  rows: readonly CommandPoolRow[],
+  mode: ReturnType<typeof claustrumMode>,
+): Promise<OpenDialogPayload> {
+  const payload = async (
+    text: string,
+    current?: readonly CommandPoolRow[],
+  ): Promise<OpenDialogPayload> => {
+    const listed = current ?? (await pool.rows()) ?? []
+    return {
+      command: 'openai-account',
+      text,
+      knobs: { accounts: listed.map(poolRowKnob), claustrumMode: mode },
+    }
+  }
+  const notFound = (id: string) =>
+    payload(`## Account Not Found\n\nNo account with id \`${id}\` exists.`)
+
+  if ((tokens[0] === 'enable' || tokens[0] === 'disable') && tokens[1]) {
+    const targetId = tokens[1]
+    const enabled = tokens[0] === 'enable'
+    const found = enabled
+      ? await pool.enable(targetId)
+      : await pool.disable(targetId)
+    if (!found) return notFound(targetId)
+    void ctx.refreshSidebar?.().catch(() => {})
+    return payload(
+      `## Account ${enabled ? 'Enabled' : 'Disabled'}\n\n\`${targetId}\` is ${enabled ? 'enabled' : 'disabled'}.`,
+    )
+  }
+
+  if (tokens.length === 0 || (tokens.length === 1 && tokens[0] === 'list')) {
+    const lines = ['## OpenAI Accounts', '']
+    if (rows.length === 0) {
+      lines.push(
+        'No accounts configured. Use `/login openai` to add your main account, or `/openai-account add` to add another account.',
+      )
+    } else {
+      const storage = await ctx.loadAccounts(storePaths(ctx))
+      const routing: RoutingMode = storage?.routing?.mode ?? 'main-first'
+      lines.push(
+        `Routing: \`${routing}\` (set with \`/openai-routing\`). Modes: main-first, fallback-first, or sticky-balanced. \`/openai-routing reset\` clears this session's pin.`,
+      )
+      lines.push('')
+      for (const row of rows) {
+        const notes = [
+          row.type,
+          ...(row.id === 'main' ? ['main account'] : []),
+          ...(row.enabled ? [] : ['disabled']),
+        ]
+        lines.push(`- \`${row.id}\` (${notes.join(', ')})`)
+      }
+    }
+    lines.push('')
+    lines.push(
+      `Claustrum mode: \`${mode}\`\n\nCommands: \`/openai-account add [label]\` | \`/openai-account enable <id>\` | \`/openai-account disable <id>\` | \`/openai-account remove <id>\` | \`/openai-account order <a> <b>\``,
+    )
+    return payload(lines.join('\n'), rows)
+  }
+
+  if (tokens[0] === 'remove' && tokens[1]) {
+    const targetId = tokens[1]
+    const outcome = await pool.remove(targetId)
+    if (outcome === 'main-refused') {
+      return payload(`## Cannot Remove Account\n\n${pool.mainRemovalRefused}`)
+    }
+    if (outcome === 'not-found') return notFound(targetId)
+    log.info('account removed', { id: targetId })
+    void ctx.refreshSidebar?.().catch(() => {})
+    return payload(`## Account Removed\n\nRemoved account \`${targetId}\`.`)
+  }
+
+  if (tokens[0] === 'order' && tokens.length >= 3) {
+    const first = tokens[1] ?? ''
+    const second = tokens[2] ?? ''
+    if (!(await pool.reorder(first, second))) {
+      return payload('## Invalid Order\n\nBoth account IDs must exist.')
+    }
+    log.info('accounts reordered', { a: first, b: second })
+    void ctx.refreshSidebar?.().catch(() => {})
+    return payload(
+      `## Accounts Reordered\n\nSwapped positions of \`${first}\` and \`${second}\`.`,
+    )
+  }
+
+  if (tokens[0] === 'add') {
+    if (mode === 'claustrum') {
+      return {
+        command: 'openai-account',
+        text: '## Add Failed\n\nThat account cannot be added while Claustrum mode is active. Run `/openai-account local` first.',
+        knobs: {},
+      }
+    }
+    const headless = tokens.includes('--headless')
+    const labelTokens = tokens.filter((t) => t !== 'add' && t !== '--headless')
+    const label = labelTokens.length > 0 ? labelTokens.join(' ') : undefined
+    const { url, instructions, completion } = await (
+      ctx.beginAccountLogin ?? beginAccountLogin
+    )({
+      label,
+      headless,
+      version: ctx.packageVersion,
+    })
+    const notify = ctx.notify
+    const sessionId = ctx.sessionId
+    // Detached for the same reason as the legacy add: the dialog has to show
+    // the URL before the sign-in completes.
+    completion
+      .then(async (account) => {
+        const added = await pool.add(account as OAuthAccount)
+        if (added.status === 'main-identity') {
+          log.warn('account add rejected (main identity)', {
+            id: account.id,
+            sessionId,
+          })
+          notify?.({
+            command: 'openai-account',
+            text: '## Add Failed\n\nThat account is already your main account — not added again.',
+            knobs: {},
+          })
+          return
+        }
+        log.info('account added', { id: added.id, outcome: added.status })
+        ctx.refreshSidebar?.().catch(() => {})
+        const text =
+          added.status === 'replaced'
+            ? `## Account Updated\n\nAccount \`${added.id}\` already held this login's account; its sign-in was replaced.`
+            : added.status === 'added-disabled'
+              ? `## Account Added (Disabled)\n\nAdded account \`${added.id}\`, but another enabled account is the same ChatGPT account, so it was added disabled.`
+              : `## Account Added\n\nAdded account \`${added.id}\`${account.label ? ` ("${account.label}")` : ''}.\n\nRun \`/openai-account\` to confirm.`
+        notify?.({ command: 'openai-account', text, knobs: {} })
+      })
+      .catch((err: unknown) => {
+        const message =
+          err instanceof Error ? err.message : String(err ?? 'unknown error')
+        log.warn('account add failed', { error: message, sessionId })
+        notify?.({
+          command: 'openai-account',
+          text: `## Add Failed\n\nAccount add failed: ${message}`,
+          knobs: {},
+        })
+      })
+
+    if (headless) {
+      const userCode =
+        instructions.match(/Enter code: (.+)/)?.[1] ?? instructions
+      return {
+        command: 'openai-account',
+        text: `## Device Code\n\n1. Open this verification URL:\n\n${url}\n\n2. Enter the code: **${userCode}**\n\n${instructions}\n\nThe account will be added automatically — run \`/openai-account\` to confirm.`,
+        knobs: { verificationUrl: url, userCode, instructions },
+      }
+    }
+    return {
+      command: 'openai-account',
+      text: `## Add OpenAI Account\n\nOpen this URL and complete sign-in:\n\n${url}\n\n${instructions}\n\nThe account will be added automatically — run \`/openai-account\` to confirm.`,
+      knobs: { url, instructions },
+    }
+  }
+
+  return payload(
+    "## Account Commands\n\n- `/openai-account add [label]` — add a new account\n- `/openai-account enable <id>` — enable an account\n- `/openai-account disable <id>` — disable an account\n- `/openai-account remove <id>` — remove an account (not `main`)\n- `/openai-account order <a> <b>` — swap two accounts' positions\n\nRouting modes are `main-first`, `fallback-first`, and `sticky-balanced`. `/openai-routing reset` clears the current session pin.",
+    rows,
+  )
 }
 
 async function executeRoutingCommand(
@@ -1283,13 +1515,17 @@ async function executeResetCommand(
   const action = tokens[0]
   if (!action || action === 'refresh') {
     const storage = await ctx.loadAccounts(storePaths(ctx))
+    // A migrated install's roster holds the main account as row `main`,
+    // which `main` already covers, so it is listed once.
     const accountKeys = [
-      'main',
-      ...(storage?.accounts ?? [])
-        .filter(
-          (account) => account.enabled !== false && account.type === 'oauth',
-        )
-        .map((account) => account.id),
+      ...new Set([
+        'main',
+        ...(storage?.accounts ?? [])
+          .filter(
+            (account) => account.enabled !== false && account.type === 'oauth',
+          )
+          .map((account) => account.id),
+      ]),
     ]
     log.debug('reset accounts stage requested', { accountKeys })
     const accounts = await Promise.all(

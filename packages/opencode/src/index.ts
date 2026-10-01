@@ -49,6 +49,7 @@ import {
   parseJwtClaims,
   type QuotaEntry,
   QuotaManager,
+  type RefreshAllQuotaResult,
   type RoutingMode,
   refreshAllQuota,
   refreshBackoffActive,
@@ -87,7 +88,9 @@ import {
 import { getConfigDir, getConfigPath, getSettings } from './config'
 import { getAccountPaths, getAccountStatePath } from './core/account-paths'
 import {
+  acquireBackgroundRefreshLock,
   BackgroundQuotaRefresh,
+  refreshPoolInBackground,
   refreshQuotaInBackground,
 } from './core/background-quota-refresh'
 import {
@@ -116,6 +119,7 @@ import {
   releaseCustodyLoginLeaseAfterHostWrite,
 } from './core/custody-transition.ts'
 import { PoolAccountSource } from './core/pool-account-source'
+import { commandAccountPool } from './core/pool-accounts'
 import {
   createPoolLifecycle,
   type PoolLifecycle,
@@ -142,6 +146,7 @@ import {
   servePoolRequest,
 } from './core/pool-request'
 import { POOL_QUOTA_UNKNOWN_RETRY_SECONDS } from './core/pool-routing'
+import { buildPoolSidebarMachineState } from './core/pool-sidebar'
 import {
   type ProcessHeartbeatHandle,
   startProcessHeartbeat,
@@ -336,6 +341,12 @@ interface ResetTargetResolverDeps {
     account: OAuthAccount,
     storage: AccountStorage,
   ) => Promise<OAuthAccount>
+  /**
+   * On a migrated install, the pool row behind an account key (`main` is row
+   * `main`) and its usable bearer, refreshed through the pool. Undefined when
+   * the install is not migrated; the legacy slot and roster then apply.
+   */
+  poolAccess?: (accountKey: string) => Promise<PoolResetAccess | undefined>
   loadAccounts: typeof loadAccounts
   accountStoragePath: string
   accountStatePath: string
@@ -364,6 +375,62 @@ function resetTargetNeedsRefresh(
   const refreshBeforeExpiryMs =
     (storage?.refresh?.refreshBeforeExpiryMinutes ?? 240) * 60_000
   return !access || !expires || expires - now <= refreshBeforeExpiryMs
+}
+
+/** A pool row as the reset-credit resolver sees it; `row` is absent when no row has the id. */
+export interface PoolResetAccess {
+  row?: {
+    id: string
+    type: 'oauth' | 'api'
+    enabled: boolean
+    label?: string
+    identity?: string
+  }
+  token?: string
+}
+
+/** The reset target for a pool row, or the refusal the legacy resolver gives. */
+function poolResetTarget(
+  accountKey: string,
+  pooled: PoolResetAccess,
+): ResetTargetIdentity {
+  const isMain = accountKey === 'main'
+  const row = pooled.row
+  const noToken = () =>
+    new ResetTargetResolutionError(
+      'token_unavailable',
+      isMain
+        ? 'Main OpenAI account has no usable access token.'
+        : `Fallback account ${accountKey} has no usable access token.`,
+    )
+  if (!row) {
+    if (isMain) throw noToken()
+    throw new ResetTargetResolutionError(
+      'unknown_account',
+      `Fallback account ${accountKey} was not found.`,
+    )
+  }
+  if (!row.enabled) {
+    throw new ResetTargetResolutionError(
+      'disabled_account',
+      `${isMain ? 'Main' : 'Fallback'} account ${accountKey} is disabled.`,
+    )
+  }
+  if (row.type !== 'oauth') {
+    throw new ResetTargetResolutionError(
+      'non_oauth_account',
+      `${isMain ? 'Main' : 'Fallback'} account ${accountKey} is not an OAuth account.`,
+    )
+  }
+  if (!pooled.token) throw noToken()
+  const claims = parseJwtClaims(pooled.token)
+  return {
+    accountKey,
+    label: isMain ? 'Main account' : (row.label ?? accountKey),
+    accessToken: pooled.token,
+    chatgptAccountId:
+      row.identity ?? (claims ? extractAccountIdFromClaims(claims) : undefined),
+  }
 }
 
 export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
@@ -434,6 +501,8 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
   }
 
   return async (accountKey: string): Promise<ResetTargetIdentity> => {
+    const pooled = await deps.poolAccess?.(accountKey)
+    if (pooled) return poolResetTarget(accountKey, pooled)
     if (accountKey === 'main') {
       const storage = await deps.loadAccounts({
         configPath: deps.accountStoragePath,
@@ -631,6 +700,8 @@ interface CodexAuthPluginOptions {
     /** Overrides POOL_MIGRATION_ENABLED, so tests can run the migration. */
     enabled?: boolean
   }
+  /** Test seam: the timers of the background quota poller. */
+  backgroundQuota?: ConstructorParameters<typeof BackgroundQuotaRefresh>[0]
   issuer?: string
   codexApiEndpoint?: string
   experimentalWebSockets?: boolean
@@ -1488,7 +1559,9 @@ export async function CodexAuthPlugin(
   // one loader disposing or re-starting never stops or overwrites another's
   // background refresh (a module-level singleton let the last loader win and
   // let any disposal kill the shared poller).
-  const backgroundQuotaRefresh = new BackgroundQuotaRefresh()
+  const backgroundQuotaRefresh = new BackgroundQuotaRefresh(
+    options.backgroundQuota,
+  )
 
   let loaderGetAuth:
     | Parameters<NonNullable<NonNullable<Hooks['auth']>['loader']>>[0]
@@ -1986,7 +2059,34 @@ export async function CodexAuthPlugin(
               accountKey: request.id,
               logger: logQ,
             })
-            return observationFromSnapshot(snapshot, Date.now(), true)
+            // The pool's quota map keeps the windows and the credit budget
+            // but not the reset-credit count, which only this poll reports.
+            // The in-memory quota cache keeps the whole reading, the way a
+            // legacy poll leaves it, for the sidebar's reset credits and the
+            // reset-credit routing tie-break.
+            const checkedAt = Date.now()
+            const entry = {
+              quota: snapshot,
+              refreshAfter: checkedAt + 5 * 60 * 1000,
+              checkedAt,
+            }
+            if (request.id === 'main') {
+              quotaManager.setMain(
+                credential.access,
+                entry,
+                request.identity,
+                true,
+              )
+            } else {
+              quotaManager.setFallback(
+                request.id,
+                entry,
+                credential.access,
+                true,
+                request.identity,
+              )
+            }
+            return observationFromSnapshot(snapshot, checkedAt, true)
           },
           log: createLogger('pool'),
         })
@@ -2003,6 +2103,9 @@ export async function CodexAuthPlugin(
           quotaManager,
           custody: { readManifest: readCustodyManifest },
           onFallbackStorageChanged: invalidateRequestStorageCache,
+          // On a migrated install the roster rows are pool rows, which the
+          // pool source refreshes; this background refresh must not.
+          backgroundRefreshPaused: () => poolSource.active(),
         })
         // -------------------------------------------------------------------
         // Custody runtime — vendored client, cache, completion sweep, tick.
@@ -2192,6 +2295,33 @@ export async function CodexAuthPlugin(
             ...(respectBackoff === undefined ? {} : { respectBackoff }),
             ...(skipFresherThanMs === undefined ? {} : { skipFresherThanMs }),
           }
+        }
+
+        // A manual quota check on a migrated install (`/openai-quota`, the
+        // reset command's precondition): polls the named rows, or every row,
+        // through the pool source, in the result shape the commands report.
+        async function pollPoolRows(
+          ids?: readonly string[],
+        ): Promise<RefreshAllQuotaResult[]> {
+          const results = await poolSource.pollRows(
+            await loadAccounts(getAccountPaths(getConfigPath())),
+            ids ? { ids } : {},
+          )
+          return results.map((result) => ({
+            account: result.id,
+            ok: result.ok,
+            ...(result.error !== undefined ? { error: result.error } : {}),
+          }))
+        }
+
+        // The bearer for one pool row outside a request (cachekeep, reset
+        // credits): refreshed through the pool source when due, never through
+        // the legacy per-account refresh or the host slot.
+        async function poolRowAccess(id: string) {
+          return poolSource.accessFor(
+            id,
+            await loadAccounts(getAccountPaths(getConfigPath())),
+          )
         }
 
         // -------------------------------------------------------------------
@@ -2579,6 +2709,13 @@ export async function CodexAuthPlugin(
         const cacheKeepManager = new CacheKeepManager({
           fetchImpl: fetch,
           getMainToken: async () => {
+            // A migrated install's main account is the pool row `main`; the
+            // slot is never read for it.
+            if (await poolSource.active()) {
+              const access = await poolRowAccess('main')
+              if (!access) throw new Error('main pool row has no usable token')
+              return access.token
+            }
             const auth = await getAuth()
             // Main lives in the pool row; the placeholder is never refreshed.
             if (isPoolMainPlaceholder(auth)) {
@@ -2597,6 +2734,12 @@ export async function CodexAuthPlugin(
             return auth.access
           },
           refreshFallback: async (accountId: string) => {
+            if (await poolSource.active()) {
+              // The warmed request recorded the pool row that served it.
+              const access = await poolRowAccess(accountId)
+              if (!access) throw new Error(`no access token for ${accountId}`)
+              return { token: access.token }
+            }
             const fbStorage = await loadRequestAccounts()
             const account = fbStorage
               ? findCachekeepFallbackAccount(fbStorage.accounts, accountId)
@@ -2875,6 +3018,24 @@ export async function CodexAuthPlugin(
           store: Awaited<ReturnType<typeof loadAccounts>>,
           mainAccountIdentity = store?.mainAccountId,
         ) {
+          // A migrated install's accounts are the pool's rows: row `main` is
+          // the main account and the rest follow in roster order, with the
+          // quota the pool holds for each.
+          const pool = await poolSource.current()
+          if (pool.active) {
+            await setSidebarMachineState(
+              buildPoolSidebarMachineState(
+                pool.rows,
+                store,
+                Date.now(),
+                (id) =>
+                  (id === 'main' ? qm.getMain() : qm.getFallback(id))?.quota
+                    ?.resetCreditsAvailable,
+              ),
+              boundSidebarFile,
+            )
+            return
+          }
           if (!store) return
           await setSidebarMachineState(
             buildSidebarMachineState(
@@ -3078,6 +3239,12 @@ export async function CodexAuthPlugin(
           beginAccountLogin,
           withFallbackAccountLock,
           checkUsableCustodyBinding,
+          accountPool: commandAccountPool({
+            paths: () => getAccountPaths(getConfigPath()),
+            store: () => poolSource.poolStore(),
+            // Route on the changed rows at once, and poll a new row.
+            afterWrite: () => poolSource.load(),
+          }),
           enterClaustrumMode: async () => {
             const current = await loadAccounts(getAccountPaths(getConfigPath()))
             const accountIds = (current?.accounts ?? [])
@@ -3208,6 +3375,11 @@ export async function CodexAuthPlugin(
               fallbackManager.refreshAccount(account, currentStorage, {
                 asPoolMain: true,
               }),
+            poolAccess: async (accountKey) =>
+              poolSource.rowAccess(
+                accountKey,
+                await loadAccounts(getAccountPaths(getConfigPath())),
+              ),
             loadAccounts,
             accountStoragePath: getConfigPath(),
             accountStatePath: getAccountStatePath(getConfigPath()),
@@ -3254,9 +3426,27 @@ export async function CodexAuthPlugin(
             const store = await loadAccounts(getAccountPaths(getConfigPath()))
             await writeMachineSidebarState(quotaManager, store)
           },
-          refreshAllQuota: async () =>
-            refreshAllQuota(buildRefreshAllQuotaDeps()),
+          // On a migrated install every row is polled through the pool
+          // source, the same path its background poll takes.
+          refreshAllQuota: async () => {
+            if (await poolSource.active()) {
+              const results = await pollPoolRows()
+              await writeMachineSidebarState(quotaManager, lastRequestStorage)
+              return results
+            }
+            return refreshAllQuota(buildRefreshAllQuotaDeps())
+          },
           refreshResetTargetQuota: async (accountKey) => {
+            if (await poolSource.active()) {
+              const [result] = await pollPoolRows([accountKey])
+              return (
+                result ?? {
+                  account: accountKey,
+                  ok: false,
+                  error: 'targeted quota refresh returned no result',
+                }
+              )
+            }
             const results = await refreshAllQuota(
               buildRefreshAllQuotaDeps({ respectBackoff: false }),
               { accountKey },
@@ -4449,19 +4639,49 @@ export async function CodexAuthPlugin(
           // Immediate: show persisted quota so the sidebar isn't blank
           void writeMachineSidebarState(quotaManager, storage).catch(() => {})
 
-          // Background: refresh from the API, then the sidebar shows fresh numbers
-          void refreshAllQuota(
-            buildRefreshAllQuotaDeps({ respectBackoff: true }),
-          ).catch((error) =>
-            logQ.warn('boot quota seed failed', {
-              pid: process.pid,
-              error: errorMessage(error),
-            }),
-          )
+          // Background: refresh from the API, then the sidebar shows fresh
+          // numbers. A migrated install skips it: the pool source's load
+          // above already polls every pool row, and the legacy seed would
+          // refresh and poll the same rows a second way.
+          if (!(await poolSource.active())) {
+            void refreshAllQuota(
+              buildRefreshAllQuotaDeps({ respectBackoff: true }),
+            ).catch((error) =>
+              logQ.warn('boot quota seed failed', {
+                pid: process.pid,
+                error: errorMessage(error),
+              }),
+            )
+          }
         }
 
         backgroundQuotaRefresh.start(
           async () => {
+            // A migrated install refreshes and polls its pool rows through
+            // the pool source, under the same cross-process lease; the
+            // legacy pass below would read the same rows as a main slot
+            // plus fallbacks.
+            if (await poolSource.active()) {
+              const polled = await refreshPoolInBackground(
+                poolSource,
+                await loadAccounts(getAccountPaths(getConfigPath())),
+                () => acquireBackgroundRefreshLock(getConfigPath()),
+              )
+              if (polled.length > 0) {
+                await writeMachineSidebarState(quotaManager, lastRequestStorage)
+              }
+              const failures = polled.filter((result) => !result.ok)
+              if (failures.length > 0) {
+                logQ.warn(
+                  'background pool quota poll completed with failures',
+                  {
+                    pid: process.pid,
+                    failures,
+                  },
+                )
+              }
+              return
+            }
             const results = await refreshQuotaInBackground(
               buildRefreshAllQuotaDeps({
                 // Reading through the request cache keeps it fresh on every

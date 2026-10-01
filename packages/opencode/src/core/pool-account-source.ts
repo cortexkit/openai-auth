@@ -31,7 +31,9 @@
 
 import { readFileSync, statSync } from 'node:fs'
 import {
+  isQuotaMap,
   mergeQuotaObservation,
+  projectQuota,
   type QuotaObservation,
   quotaCodec,
 } from '@cortexkit/common-auth/quota'
@@ -121,6 +123,25 @@ type PendingObservation = {
 
 type Snapshot = PoolView & { key: string | undefined; readAt: number }
 
+/** How one row's quota poll ended, for callers that report it (`/openai-quota`). */
+export interface PoolPollResult {
+  id: string
+  ok: boolean
+  error?: string
+}
+
+/**
+ * The time of a row's oldest quota reading, or undefined when it has none: a
+ * row is only as fresh as its stalest window.
+ */
+export function quotaReadAt(row: Pick<PoolRow, 'quota'>): number | undefined {
+  if (!isQuotaMap(row.quota)) return undefined
+  const projection = projectQuota(row.quota)
+  return projection.limits.some((limit) => limit.kind === 'reading')
+    ? projection.checkedAt
+    : undefined
+}
+
 function identityOfToken(access: string | undefined): string | undefined {
   if (!access) return undefined
   const claims = parseJwtClaims(access)
@@ -189,6 +210,8 @@ export class PoolAccountSource {
   private readonly marks = new Map<string, number>()
   private readonly lastPull = new Map<string, number>()
   private readonly polled = new Set<string>()
+  /** The latest poll outcome per row id, read back by `pollRows`. */
+  private readonly pollOutcomes = new Map<string, PoolPollResult>()
   private disposed = false
 
   constructor(deps: PoolAccountSourceDeps) {
@@ -244,6 +267,11 @@ export class PoolAccountSource {
       now: this.now,
       pull: (request) => this.pull(request),
       onPullFailure: (rowId, error) => {
+        this.pollOutcomes.set(rowId, {
+          id: rowId,
+          ok: false,
+          error: error.message,
+        })
         this.log.warn('pool quota poll failed', {
           rowId,
           kind: error.kind,
@@ -396,8 +424,19 @@ export class PoolAccountSource {
   private async pull(
     request: PullRequest,
   ): Promise<QuotaObservation | undefined> {
-    const observation = await this.deps.pullQuota(request)
-    if (!observation) throw new Error('the quota poll returned no reading')
+    let observation: QuotaObservation | undefined
+    try {
+      observation = await this.deps.pullQuota(request)
+      if (!observation) throw new Error('the quota poll returned no reading')
+    } catch (error) {
+      this.pollOutcomes.set(request.id, {
+        id: request.id,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      throw error
+    }
+    this.pollOutcomes.set(request.id, { id: request.id, ok: true })
     const row = this.snapshot.rows.find((r) => r.id === request.id)
     if (
       row &&
@@ -512,6 +551,7 @@ export class PoolAccountSource {
   async prepareTokens(
     rows: readonly PoolRow[],
     storage: AccountStorage | null,
+    options: { waitForAll?: boolean } = {},
   ): Promise<void> {
     const now = this.now()
     const windowMs = refreshBeforeExpiryMs(storage)
@@ -524,7 +564,12 @@ export class PoolAccountSource {
       const due = !token.access || !token.expires || left <= windowMs
       if (!due || this.refreshBackedOff(row, storage, now)) continue
       const refresh = this.refresh(row.id)
-      if (!token.access || !token.expires || left <= POOL_TOKEN_MIN_VALIDITY_MS)
+      if (
+        options.waitForAll ||
+        !token.access ||
+        !token.expires ||
+        left <= POOL_TOKEN_MIN_VALIDITY_MS
+      )
         waits.push(refresh)
     }
     await Promise.all(waits)
@@ -673,6 +718,124 @@ export class PoolAccountSource {
       )
     }
     return out
+  }
+
+  // -------------------------------------------------------------------------
+  // Callers outside the request path: the background poller, commands,
+  // cachekeep and reset credits. None of them may refresh or poll a pool row
+  // any other way, so a row has one refresher and one poller.
+  // -------------------------------------------------------------------------
+
+  /** Whether the pool serves this install now (re-reads changed files). */
+  async active(): Promise<boolean> {
+    return (await this.current()).active
+  }
+
+  /** The store the rows live in, for account management (add, disable). */
+  poolStore(): PoolStore {
+    return this.storeFor(this.deps.paths())
+  }
+
+  /**
+   * Refreshes every candidate row whose token is inside the refresh window,
+   * waiting for all of them; rows in a refresh backoff are left alone. The
+   * idle counterpart of `prepareTokens`, for the background poller.
+   */
+  async refreshDueTokens(storage: AccountStorage | null): Promise<void> {
+    const view = await this.current()
+    if (!view.active || this.disposed) return
+    await this.prepareTokens(view.rows, storage, { waitForAll: true })
+  }
+
+  /**
+   * Polls the quota of every candidate OAuth row (or of the rows named in
+   * `ids`) through the store, the same pull path the first and admission
+   * polls take, and resolves once every poll has ended. A row whose oldest
+   * reading is newer than `skipReadWithinMs` is left out. Due tokens are
+   * refreshed first so a poll is not sent with a token that ran out.
+   */
+  async pollRows(
+    storage: AccountStorage | null,
+    options: { ids?: readonly string[]; skipReadWithinMs?: number } = {},
+  ): Promise<PoolPollResult[]> {
+    const view = await this.load()
+    if (!view.active || this.disposed) return []
+    const now = this.now()
+    const targets = view.rows.filter((row) => {
+      if (!row.candidate || row.type !== 'oauth') return false
+      if (options.ids && !options.ids.includes(row.id)) return false
+      if (options.skipReadWithinMs === undefined) return true
+      const readAt = quotaReadAt(row)
+      return readAt === undefined || now - readAt >= options.skipReadWithinMs
+    })
+    if (targets.length === 0) return []
+    await this.prepareTokens(targets, storage, { waitForAll: true })
+    for (const row of targets) {
+      this.pollOutcomes.delete(row.id)
+      this.requestReading(row.id, true)
+    }
+    await this.poolStore().pullsSettled()
+    return targets.map(
+      (row) =>
+        this.pollOutcomes.get(row.id) ?? {
+          id: row.id,
+          ok: false,
+          error: 'the quota poll did not run',
+        },
+    )
+  }
+
+  /**
+   * The bearer to use for one row outside a request (cachekeep, reset
+   * credits), refreshed through the pool first when it is due. Undefined when
+   * the row is missing, not a candidate, or holds no usable token.
+   */
+  async accessFor(
+    id: string,
+    storage: AccountStorage | null,
+  ): Promise<{ row: PoolRow; token: string } | undefined> {
+    const view = await this.current()
+    if (!view.active) return undefined
+    const row = view.rows.find((candidate) => candidate.id === id)
+    if (!row?.candidate) return undefined
+    await this.prepareTokens([row], storage)
+    const current =
+      this.snapshot.rows.find((candidate) => candidate.id === id) ?? row
+    const token = this.usableToken(current)
+    return token ? { row: current, token } : undefined
+  }
+
+  /**
+   * The row behind an account key (`main` is row `main`) and its bearer, for
+   * a caller that reports a missing or disabled row itself (reset credits).
+   * Undefined when the pool does not serve this install; `row` is absent when
+   * no row has the id, `token` when the row holds no usable one.
+   */
+  async rowAccess(
+    id: string,
+    storage: AccountStorage | null,
+  ): Promise<
+    | {
+        row?: Pick<PoolRow, 'id' | 'type' | 'enabled' | 'label' | 'identity'>
+        token?: string
+      }
+    | undefined
+  > {
+    const view = await this.current()
+    if (!view.active) return undefined
+    const row = view.rows.find((candidate) => candidate.id === id)
+    if (!row) return {}
+    const access = await this.accessFor(id, storage)
+    return {
+      row: {
+        id: row.id,
+        type: row.type,
+        enabled: row.enabled,
+        ...(row.label !== undefined ? { label: row.label } : {}),
+        ...(row.identity !== undefined ? { identity: row.identity } : {}),
+      },
+      ...(access ? { token: access.token } : {}),
+    }
   }
 
   // -------------------------------------------------------------------------
