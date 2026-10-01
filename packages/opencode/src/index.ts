@@ -1306,8 +1306,8 @@ export async function CodexAuthPlugin(
   // pushed quota, sticky pins); the loader installs one per run.
   let sidebarBookkeeping: SidebarBookkeepingQueue | undefined
   // This host's connection to the Claustrum vault (`vault.ts` in the core
-  // package). It serves only on a migrated install, beside the pool rows;
-  // it is closed on dispose.
+  // package). Its accounts are routed only on a migrated install, beside the
+  // pool rows; it is closed on dispose.
   const vault = new OpenAiVault({
     host: 'opencode',
     stateDir:

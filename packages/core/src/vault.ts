@@ -50,7 +50,7 @@ import { errorMessage } from './util/error'
 
 const log = createLogger('vault')
 
-/** The plugin part of both enrollment names. */
+/** The plugin part of each host's enrollment name (`openai-auth-opencode`, `openai-auth-pi`). */
 export const VAULT_PLUGIN_NAME = 'openai-auth'
 
 /**
@@ -171,8 +171,8 @@ export class OpenAiVault {
       tokenPath: this.paths.tokenPath,
       family: VAULT_FAMILY,
       connect: () => this.#connectScoped(),
-      // Custody is on exactly while this host holds an enrollment token: the
-      // consumer then lists and serves, and without one it serves nothing.
+      // The consumer lists and serves vault accounts only while this host
+      // holds an enrollment token; without one it serves nothing.
       isCustodyActive: () => this.enrolled(),
       ...(options.reservedRouteIds
         ? { reservedRouteIds: options.reservedRouteIds }
@@ -199,7 +199,8 @@ export class OpenAiVault {
       connectionFile: this.#connectionFile(),
       projectRoot: this.#options.projectRoot ?? process.cwd(),
       storagePath: this.paths.tokenPath,
-      // The client's own default prints transport error classes to stderr.
+      // The Claustrum client's default logger prints transport error classes
+      // to stderr; they go to this plugin's debug log instead.
       logger: (errorClass: string) =>
         log.debug('vault transport error', { errorClass }),
     }
@@ -380,8 +381,9 @@ export class OpenAiVault {
         } catch (error) {
           failure = errorMessage(error)
           const status = (error as { status?: unknown } | null)?.status
-          // The status goes back to the consumer, which reports a 401 to the
-          // vault; anything else is just a failed reading.
+          // An HTTP failure is returned as a response so the consumer sees
+          // its status and reports a 401 to the vault; an error with no
+          // status is a failed reading and is thrown.
           if (typeof status === 'number') return new Response(null, { status })
           throw error
         }
@@ -398,8 +400,9 @@ export class OpenAiVault {
   }
 
   /**
-   * Asks for a quota reading of a vault account admission refused for want
-   * of one. At most one reading per account is in flight.
+   * Asks for a quota reading of a vault account that admission refused
+   * because it has no reading yet. At most one reading per account is in
+   * flight.
    */
   requestReading(routeId: string): void {
     if (this.#pulls.has(routeId)) return
@@ -558,7 +561,7 @@ function latestReadingAt(quota: QuotaMap | undefined): number | undefined {
   return times.length > 0 ? Math.max(...times) : undefined
 }
 
-/** What to run with `ck` for a pending enrollment, line by line. */
+/** The `ck` (Claustrum CLI) commands that approve a pending enrollment, line by line. */
 export function vaultApprovalInstructions(
   name: string,
   status: ClaustrumEnrollmentStatus,

@@ -248,7 +248,7 @@ export type SlotNothingKind =
   | 'declined'
 
 export type PoolTransferOutcome =
-  /** Adoption under the vault (see `vaultServes`); nothing was written. */
+  /** An adoption while the vault serves this host its accounts (see `vaultServes`); nothing was written. */
   | { status: 'vault-owns-accounts' }
   /**
    * An openai-auth process older than this one is running (see
@@ -1348,7 +1348,10 @@ async function run(
   }
 }
 
-/** The checks that end a run before any lock: the marker and the vault. */
+/**
+ * The checks that end a run before any lock: the migration marker (already
+ * migrated, or not yet for an adoption) and, for an adoption, the vault.
+ */
 function gate(
   ctx: Context,
   mode: 'migrate' | 'adopt',

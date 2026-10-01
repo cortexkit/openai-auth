@@ -670,7 +670,7 @@ export interface VaultSectionDeps {
     | 'routes'
     | 'snapshot'
   >
-  /** Runs after a change to which vault accounts route (the host re-reads them). */
+  /** Runs after the vault accounts this host may route change (connected, disconnected, one disabled or enabled). */
   changed?(): unknown
   /** How Connect polls for the operator's approval (tests shorten it). */
   wait?: VaultWaitOptions

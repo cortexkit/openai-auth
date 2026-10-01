@@ -170,7 +170,8 @@ async function setMode(mode: PoolMode) {
     files.configFile,
     JSON.stringify({ ...config, routing: { mode } }),
   )
-  // Past the request path's one-stat cache of the config file.
+  // The request path re-reads the config only when its modification time
+  // changes; a short pause makes sure the next request sees the new mode.
   await Bun.sleep(5)
 }
 
@@ -345,7 +346,8 @@ describe('routing', () => {
 
     await request(send)
 
-    // The vault's 401 went to the vault (main, tried next, may still answer).
+    // The vault account was tried first and answered 401 (fallback-first
+    // then tries main, whose answer the request returns).
     expect(wire.sends[0]).toBe(`Bearer ${VAULT_ACCESS}`)
     expect(running.reports).toEqual([
       {
@@ -530,7 +532,9 @@ describe('what the handle-mode custody left behind', () => {
     const response = await request(send)
 
     expect(response.status).toBe(200)
-    // Only the pool path routes vault accounts.
+    // Vault accounts are routed only by the request path of a migrated
+    // install (the pool path); the path for a real login in the slot never
+    // sends with them.
     expect(wire.sends).toEqual([`Bearer ${VAULT_ACCESS}`])
   })
 

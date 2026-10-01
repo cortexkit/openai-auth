@@ -97,7 +97,7 @@ export interface PiOpenAIRuntimeDeps {
   now?: () => number
   firstReadingWaitMs?: number
   readBudgetMs?: number
-  /** Replaces this host's vault (tests); by default it lives next to the account files. */
+  /** Replaces Pi's connection to the Claustrum vault (tests); by default its files live next to the account files. */
   vault?: OpenAiVault
 }
 
@@ -264,7 +264,8 @@ export class PiOpenAIRuntime {
 
   /**
    * Reads the pool once, which starts every row's first quota poll, and
-   * starts following the vault. Never rejects.
+   * starts the vault's background poll of Pi's vault accounts. Never
+   * rejects.
    */
   start(): Promise<void> {
     this.vault.start()
