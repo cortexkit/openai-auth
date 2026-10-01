@@ -441,7 +441,7 @@ async function enableUnderCustody(
       load.status === 'ready'
         ? load.rows.find((candidate) => candidate.id === id)
         : undefined
-    if (!row || row.type !== 'oauth') return enable(locks)
+    if (row?.type !== 'oauth') return enable(locks)
     const binding = check
       ? await check({
           id,
