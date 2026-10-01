@@ -16,8 +16,9 @@
 //    credential table only ever receives a placeholder.
 // 5. The model rules (`models.ts`).
 // 6. A ChatGPT login OpenCode 2 already held before this plugin ran is copied
-//    into the pool once, since the host's next refresh of it through the
-//    methods above hands back a placeholder.
+//    into the pool when the pool does not hold that account yet, since the
+//    host's next refresh of it through the methods above hands back a
+//    placeholder.
 
 import {
   installOpenCode2Auth,
@@ -29,13 +30,15 @@ import {
   beginAccountLogin,
   codexRefreshFn,
   extractAccountId,
+  extractAccountIdFromClaims,
   loadAccounts,
+  parseJwtClaims,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Plugin } from '@opencode/plugin'
 import { getConfigPath } from '../config'
 import { getAccountPaths } from '../core/account-paths'
-import { PoolAccountSource } from '../core/pool-account-source'
+import { oauthAccess, PoolAccountSource } from '../core/pool-account-source'
 import { poolMigrated } from '../core/pool-accounts'
 import {
   createPoolLifecycle,
@@ -67,6 +70,11 @@ import { SessionPins } from './pins'
  * own id, since OpenCode 1 reads the `./server` entry as well.
  */
 export const OPENAI_AUTH_PLUGIN_ID = 'cortexkit-openai-auth'
+
+function identityOfToken(token: string): string | undefined {
+  const claims = token ? parseJwtClaims(token) : undefined
+  return claims ? extractAccountIdFromClaims(claims) : undefined
+}
 
 /** Longest a shutdown waits for queued quota writes before it lets go. */
 const SETTLE_ON_DISPOSE_MS = 5_000
@@ -231,7 +239,18 @@ export async function setupOpenAIAuth(
     const accountId =
       typeof value.metadata?.accountID === 'string'
         ? value.metadata.accountID
-        : undefined
+        : identityOfToken(value.access)
+    // Only an account the pool does not hold yet: the pool may have rotated
+    // this login's tokens since, and the host's copy would then be spent.
+    const view = await source.load()
+    if (
+      view.rows.some(
+        (row) =>
+          (accountId !== undefined && row.identity === accountId) ||
+          oauthAccess(row)?.refresh === value.refresh,
+      )
+    )
+      return
     await storeLogin({
       id: accountId ?? crypto.randomUUID(),
       refresh: value.refresh,

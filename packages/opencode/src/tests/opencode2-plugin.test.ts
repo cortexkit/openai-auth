@@ -418,6 +418,26 @@ describe('OpenCode 2 entry: logins', () => {
     expect(main?.accountId).toBe('chatgpt-first')
   })
 
+  it('leaves an account the pool already holds alone when OpenCode 2 still has an older login of it', async () => {
+    const files = poolFiles()
+    seedPool(files, 'main-first', [{ id: 'main' }])
+    const { stop } = await start(files, {
+      activeCredential: {
+        type: 'oauth',
+        methodID: 'chatgpt-browser',
+        access: 'stale-access',
+        refresh: 'stale-refresh',
+        expires: Date.now() + 3600_000,
+        metadata: { accountID: 'chatgpt-main' },
+      } as unknown as Credential.Value,
+    })
+    await stop()
+    expect(files.readState().accounts.main?.refresh).toBe('main-refresh')
+    expect(files.readConfig().accounts.map((account) => account.id)).toEqual([
+      'main',
+    ])
+  })
+
   it('copies a ChatGPT login OpenCode 2 already held into the pool', async () => {
     const files = poolFiles()
     seedPool(files, 'main-first', [{ id: 'main' }])
