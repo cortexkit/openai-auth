@@ -20,6 +20,7 @@ import { getConfigPath } from '../config.ts'
 import { getAccountPaths } from '../core/account-paths'
 import { QUOTA_STALENESS_MS } from '../core/sticky-routing.ts'
 import {
+  __menuContextForTest,
   AuthPersistError,
   type ClaustrumCacheTransportLike,
   CodexAuthPlugin,
@@ -2862,30 +2863,31 @@ describe('integration: active fallback routing', () => {
     return { hooks, fetchOverride }
   }
 
-  async function runCommand(
-    hooks: Hooks,
-    command: string,
-    args = '',
-    sessionID = 'test-session',
-  ) {
-    const hook = hooks['command.execute.before'] as
-      | ((input: {
-          command: string
-          arguments: string
-          sessionID: string
-        }) => Promise<void>)
-      | undefined
-    if (!hook) throw new Error('No command hook')
-    try {
-      await hook({ command, arguments: args, sessionID })
-    } catch (error) {
-      if (
-        !(error instanceof Error) ||
-        error.message !== '__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__'
-      ) {
-        throw error
-      }
+  /**
+   * What the `/openai` Cache section does to the live loader besides saving
+   * the setting: these tests run on an install the menu does not open on.
+   */
+  function cacheKeep(action: 'on' | 'off' | 'sustain on') {
+    const ctx = __menuContextForTest()
+    if (!ctx?.cacheKeepManager) throw new Error('no /openai context loaded')
+    if (action === 'sustain on') {
+      ctx.setCacheKeepSustain?.(true)
+      return
     }
+    const on = action === 'on'
+    // Saved as the menu's write would save it, so a later loader run reads it.
+    const config = JSON.parse(readFileSync(ctx.accountStoragePath, 'utf8'))
+    config.cachekeep = { ...(config.cachekeep ?? {}), enabled: on }
+    writeFileSync(ctx.accountStoragePath, JSON.stringify(config))
+    ctx.setCacheKeepEnabled?.(on)
+    if (on) ctx.cacheKeepManager.start()
+    else ctx.cacheKeepManager.stop()
+  }
+
+  function cacheKeepStatus() {
+    const manager = __menuContextForTest()?.cacheKeepManager
+    if (!manager) throw new Error('no /openai context loaded')
+    return manager.status()
   }
 
   function requestInit(): RequestInit {
@@ -3755,7 +3757,7 @@ describe('integration: active fallback routing', () => {
       beforeReset.fallbacks[1].quota = stickyQuota(100, selectionNow)
       writeFileSync(sidebarFile, JSON.stringify(beforeReset))
 
-      await runCommand(hooks, 'openai-routing', 'reset', sessionId)
+      await __menuContextForTest()?.clearStickyRouting?.(sessionId)
       await drainSidebarWrites()
       expect(
         normalizeSidebarState(JSON.parse(readFileSync(sidebarFile, 'utf8')))
@@ -4319,18 +4321,16 @@ describe('integration: active fallback routing', () => {
       hooks = loaded.hooks
       await drainSidebarWrites()
       seedStickyBalancedAccounts()
-      await runCommand(hooks, 'openai-cachekeep', 'on')
+      cacheKeep('on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'x-session-affinity': 'capture-session' }),
       )
-      await runCommand(hooks, 'openai-cachekeep', 'status')
-
-      const status = prompts.at(-1) ?? ''
-      expect(status).toContain('Tracked sessions: **1**')
-      expect(status).toContain('(fallback-2)')
-      expect(status).not.toContain('(fallback-1)')
-      expect(status).not.toContain('(main)')
+      const status = cacheKeepStatus()
+      expect(status.tracked).toBe(1)
+      expect(
+        status.targets.map((target) => target.accountId ?? 'main'),
+      ).toEqual(['fallback-2'])
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
@@ -4364,7 +4364,7 @@ describe('integration: active fallback routing', () => {
       hooks = loaded.hooks
       await drainSidebarWrites()
       seedStickyBalancedAccounts()
-      await runCommand(hooks, 'openai-cachekeep', 'on')
+      cacheKeep('on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'x-session-affinity': 'moved-session' }),
@@ -5176,17 +5176,16 @@ describe('integration: active fallback routing', () => {
       )
       hooks = loaded.hooks
 
-      await runCommand(hooks, 'openai-cachekeep', 'on')
+      cacheKeep('on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'session-id': 'main-session' }),
       )
-      await runCommand(hooks, 'openai-cachekeep', 'status')
-
-      const status = prompts.at(-1) ?? ''
-      expect(status).toContain('Tracked sessions: **1**')
-      expect(status).toContain('(fallback-1)')
-      expect(status).not.toContain('(chatgpt-work-alt)')
+      const status = cacheKeepStatus()
+      expect(status.tracked).toBe(1)
+      expect(
+        status.targets.map((target) => target.accountId ?? 'main'),
+      ).toEqual(['fallback-1'])
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
@@ -5221,7 +5220,7 @@ describe('integration: active fallback routing', () => {
         Date.now() + 3600_000,
       )
       firstHooks = first.hooks
-      await runCommand(firstHooks, 'openai-cachekeep', 'on')
+      cacheKeep('on')
 
       const second = await loadFetchOverride(
         createMockPluginInput({ client }),
@@ -5233,44 +5232,13 @@ describe('integration: active fallback routing', () => {
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'session-id': 'main-session' }),
       )
-      await runCommand(secondHooks, 'openai-cachekeep', 'status')
-
-      const status = prompts.at(-1) ?? ''
-      expect(status).toContain('Timer: **armed**')
-      expect(status).toContain('Tracked sessions: **1**')
+      const status = cacheKeepStatus()
+      expect(status.running).toBe(true)
+      expect(status.tracked).toBe(1)
     } finally {
       globalThis.fetch = originalFetch
       await secondHooks?.dispose?.()
       await firstHooks?.dispose?.()
-    }
-  })
-
-  it('persists cachekeep enabled on and off', async () => {
-    seedStorage({ access: 'fallback-access-token' })
-    const client = {
-      auth: { set: async () => {} },
-      session: { promptAsync: async () => {} },
-    } as unknown as PluginInput['client']
-
-    let hooks: Hooks | undefined
-    try {
-      const loaded = await loadFetchOverride(
-        createMockPluginInput({ client }),
-        Date.now() + 3600_000,
-      )
-      hooks = loaded.hooks
-
-      await runCommand(hooks, 'openai-cachekeep', 'on')
-      expect(JSON.parse(readFileSync(configFile, 'utf8')).cachekeep).toEqual({
-        enabled: true,
-      })
-
-      await runCommand(hooks, 'openai-cachekeep', 'off')
-      expect(JSON.parse(readFileSync(configFile, 'utf8')).cachekeep).toEqual({
-        enabled: false,
-      })
-    } finally {
-      await hooks?.dispose?.()
     }
   })
 
@@ -5292,14 +5260,14 @@ describe('integration: active fallback routing', () => {
       )
       hooks = loaded.hooks
 
-      await runCommand(hooks, 'openai-cachekeep', 'on')
+      cacheKeep('on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'session-id': 'main-session' }),
       )
 
       now += 60 * 60_000 + 1
-      await runCommand(hooks, 'openai-cachekeep', 'sustain on')
+      cacheKeep('sustain on')
       const manager = (
         globalThis as typeof globalThis & {
           __openaiAuthCacheKeepManagers?: Map<
@@ -6490,14 +6458,12 @@ describe('integration: active fallback routing', () => {
       )
       hooks = loaded.hooks
 
-      await runCommand(hooks, 'openai-cachekeep', 'on')
+      cacheKeep('on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'session-id': 'main-session' }),
       )
-      await runCommand(hooks, 'openai-cachekeep', 'status')
-
-      expect(prompts.at(-1)).toContain('Tracked sessions: **1**')
+      expect(cacheKeepStatus().tracked).toBe(1)
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
@@ -6544,7 +6510,7 @@ describe('integration: active fallback routing', () => {
       )
       hooks = loaded.hooks
 
-      await runCommand(hooks, 'openai-cachekeep', 'on')
+      cacheKeep('on')
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({
@@ -6552,9 +6518,7 @@ describe('integration: active fallback routing', () => {
           'x-parent-session-id': 'parent-session',
         }),
       )
-      await runCommand(hooks, 'openai-cachekeep', 'status')
-
-      expect(prompts.at(-1)).toContain('Tracked sessions: **0**')
+      expect(cacheKeepStatus().tracked).toBe(0)
     } finally {
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
@@ -7409,7 +7373,7 @@ describe('integration: active fallback routing', () => {
             true,
           )
           hooks = loaded.hooks
-          await runCommand(hooks, 'openai-cachekeep', 'on')
+          cacheKeep('on')
           const request = responsesLiteRequestInit(
             'gpt-5.6-sol',
             'responses-lite-keepwarm',

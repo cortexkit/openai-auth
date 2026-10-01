@@ -120,6 +120,7 @@ import {
 } from './core/custody-transition.ts'
 import { PoolAccountSource } from './core/pool-account-source'
 import {
+  migratedPoolRows,
   openAccountPool,
   poolMigrated,
   poolSettingsLocks,
@@ -696,6 +697,18 @@ async function writeLoaderSettings(
     edit(current)
     return current
   }, paths)
+}
+
+/** The `/openai` context the latest loader run built, for tests. */
+let menuContextForTest: OpenCodeMenuContext | null = null
+
+/**
+ * Test seam: the context the latest loader run gave the `/openai` menu, so a
+ * test of the loader's live gates (keep-warm, sticky pins) can drive them on
+ * an install the menu itself would not open on.
+ */
+export function __menuContextForTest(): OpenCodeMenuContext | null {
+  return menuContextForTest
 }
 
 function jitterMs(baseMs: number) {
@@ -3194,18 +3207,27 @@ export async function CodexAuthPlugin(
         // -------------------------------------------------------------------
         activeFallbackManager?.stopBackgroundRefresh()
         activeFallbackManager = fallbackManager
-        cmdCtx = {
-          accountStoragePath: getConfigPath(),
-          accountStatePath: getAccountStatePath(getConfigPath()),
+        const menuPaths = getAccountPaths(getConfigPath())
+        cmdCtx = menuContextForTest = {
+          accountStoragePath: menuPaths.configPath,
+          accountStatePath: menuPaths.statePath,
           packageVersion: PackageVersion,
           quotaManager,
           loadAccounts,
           beginAccountLogin,
-          store: () => poolSource.poolStore(),
+          // The files this loader run serves, fixed now: the menu works on
+          // them even if another project's run changes the environment.
+          store: () => openAccountPool(menuPaths),
           // The menu needs the pool; until the install has migrated it shows
           // only what holds the move back (the version fence's blockers).
           migration: async () => {
-            if (await poolSource.active()) return { migrated: true }
+            if (
+              (await migratedPoolRows(
+                menuPaths,
+                openAccountPool(menuPaths),
+              )) !== undefined
+            )
+              return { migrated: true }
             const fence = await (
               poolMigrationDeps.fence ??
               (() => migrationFenceOpen({ currentVersion: PackageVersion }))
