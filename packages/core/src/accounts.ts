@@ -847,6 +847,27 @@ function mergeConfigAndState(
   const refreshConfig = isRecord(configValue.refresh) ? configValue.refresh : {}
   const mainQuotaSource = mainState ?? quotaConfig
   const mainRefreshSource = mainState ?? refreshConfig
+  // The main slot's refresh lease and backoff. Legacy writers keep them in
+  // the state file (`state.main`) and strip them from the config. On an
+  // install whose accounts moved into the shared account pool, the plugin
+  // writes them through the pool store's settings write, which never touches
+  // the state file, so they land in the config's `refresh` object under
+  // their storage names. The config copy therefore wins when present: it is
+  // the only one a migrated install's refresh writes, and that refresh reads
+  // its own lease back to verify it. A lease is taken whole from one source,
+  // never assembled from fields of two writers.
+  const configLeaseHeld = refreshConfig.mainRefreshLeaseId !== undefined
+  const mainLease = configLeaseHeld
+    ? {
+        id: refreshConfig.mainRefreshLeaseId,
+        until: refreshConfig.mainRefreshLeaseUntil,
+        tokenHash: refreshConfig.mainRefreshLeaseTokenHash,
+      }
+    : {
+        id: mainRefreshSource.refreshLeaseId,
+        until: mainRefreshSource.refreshLeaseUntil,
+        tokenHash: mainRefreshSource.refreshLeaseTokenHash,
+      }
 
   const hasAccounts = Array.isArray(configValue.accounts)
   const accounts = hasAccounts
@@ -864,10 +885,12 @@ function mergeConfigAndState(
     ...configValue,
     refresh: objectWithDefinedEntries({
       ...refreshConfig,
-      mainLastRefreshError: mainRefreshSource.lastRefreshError,
-      mainRefreshLeaseId: mainRefreshSource.refreshLeaseId,
-      mainRefreshLeaseUntil: mainRefreshSource.refreshLeaseUntil,
-      mainRefreshLeaseTokenHash: mainRefreshSource.refreshLeaseTokenHash,
+      mainLastRefreshError:
+        refreshConfig.mainLastRefreshError ??
+        mainRefreshSource.lastRefreshError,
+      mainRefreshLeaseId: mainLease.id,
+      mainRefreshLeaseUntil: mainLease.until,
+      mainRefreshLeaseTokenHash: mainLease.tokenHash,
     }),
     quota: objectWithDefinedEntries({
       ...quotaConfig,
