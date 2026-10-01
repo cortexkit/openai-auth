@@ -342,6 +342,46 @@ export class OpenAiVault {
   }
 
   /**
+   * Authorizes one send on a vault account for a caller that sends the
+   * request itself (OpenCode 2's host does): the receipt holds the token to
+   * send with and the record version a 401 on that send is reported
+   * against (`reportFailure`). Undefined when the vault refused (not
+   * enrolled, declined, cold, unreachable): the caller treats the account
+   * like a row with no token. Authorize again for every send; a receipt is
+   * never reused.
+   */
+  async authorize(
+    routeId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<ClaustrumScopedAttempt | undefined> {
+    try {
+      return await this.#consumer.authorize(routeId, options.signal)
+    } catch (error) {
+      this.#fail('vault refused to serve an account', error)
+      return undefined
+    }
+  }
+
+  /**
+   * Reports the provider's answer to a send made with `authorize`'s receipt.
+   * Only a 401 is reported, against the receipt's record version; anything
+   * else is ignored. The roster is re-read afterwards so an account the
+   * vault now marks as needing a new login stops routing. Never rejects.
+   */
+  async reportFailure(
+    attempt: ClaustrumScopedAttempt,
+    status: number,
+  ): Promise<void> {
+    if (status !== 401) return
+    try {
+      await this.#consumer.reportFailure(attempt, 401, 'direct')
+    } catch (error) {
+      this.#fail('vault failure report failed', error)
+    }
+    await this.refresh()
+  }
+
+  /**
    * Records a quota snapshot (response headers, a WebSocket rate-limit frame,
    * a usage poll) for a vault account, fenced on the account the attempt was
    * served for. Runs in the background; a failure is logged.

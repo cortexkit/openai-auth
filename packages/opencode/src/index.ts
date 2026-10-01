@@ -292,7 +292,7 @@ export const EMPTY_BEARER_MESSAGE =
 // from the backend's own model list rather than assumed:
 //   GET /backend-api/codex/models?client_version=<v>
 // reports `use_responses_lite` per model, and every gpt-6 variant is marked true.
-const RESPONSES_LITE_MODELS = new Set([
+export const RESPONSES_LITE_MODELS: ReadonlySet<string> = new Set([
   'gpt-5.6-sol',
   'gpt-5.6-terra',
   'gpt-5.6-luna',
@@ -314,8 +314,8 @@ const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
 // gpt-5.3-codex-spark answer 400 at every version ("not supported when using
 // Codex with a ChatGPT account") - a backend retirement, not something this
 // version causes.
-const CODEX_VERSION = '0.159.0'
-const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
+export const CODEX_VERSION = '0.159.0'
+export const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
 const CODEX_SANDBOX = 'seccomp'
 export const getMainRefreshLockName = () => MAIN_REFRESH_LOCK_NAME
 export const MAIN_REFRESH_LOCK_TTL_MS = 2 * 60_000
@@ -1230,7 +1230,7 @@ function stripResponsesLiteImageDetails(value: unknown) {
 // September 2026, now accepts it, and moved 2292 -> 3785 on a single sample -
 // too weak to tell from noise, on a model people already run, where the
 // request-level effort change it uses today is known to work.
-const MID_CONVERSATION_EFFORT_MODELS = new Set([
+export const MID_CONVERSATION_EFFORT_MODELS: ReadonlySet<string> = new Set([
   'gpt-6-astra',
   'gpt-6-sol',
   'gpt-6-luna',
@@ -1286,7 +1286,7 @@ function applyMidConversationEffort(
 
 // Responses Lite trades capabilities for Codex's compact request shape. It is
 // opt-in because it disables parallel tool calls and excludes hosted tools.
-function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
+export function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
   const reasoning = isRecord(parsed.reasoning) ? { ...parsed.reasoning } : {}
   reasoning.context = 'all_turns'
   parsed.reasoning = reasoning

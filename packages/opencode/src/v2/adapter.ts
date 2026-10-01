@@ -11,7 +11,10 @@
 //   memory (`pins.ts`). A request of another kind than the agent loop (title,
 //   compaction, generate) follows the session's account;
 // - the row's credential (`accountHeaders`): its bearer and its
-//   `chatgpt-account-id`;
+//   `chatgpt-account-id`, with the Codex client identity (`codex-wire.ts`);
+// - the request body and WebSocket frame rewrites that keep OpenCode 1's
+//   wire behaviour (`rewriteRequest`, `rewriteWebSocketFrame`, see
+//   `codex-wire.ts`): mid-conversation effort and Responses Lite;
 // - what a response says about the row: quota from the `x-codex-*` headers
 //   and `codex.rate_limits` frames, refusals for a usage or rate limit, and
 //   whether output has started (openai-auth's own rule, `isNonEmittingFrame`).
@@ -20,11 +23,24 @@
 // account, and never after output; `attach` records the refusal as a
 // rate-limit mark on the row first, so the next `chooseAccount` routes
 // around it.
+//
+// The OpenAI accounts the Claustrum vault serves this host are routed beside
+// the pool rows, through the same admission and modes, by OpenCode 1's rules
+// (`core/pool-request.ts`): a pool row signing in as a ChatGPT account the
+// vault holds is left out, and only ChatGPT logins are admitted, never API
+// keys. A vault account holds no token: when routing picks one, the vault is
+// asked to authorize that one send, and a refusal moves the request to the
+// next account before anything is sent. The receipt (served token and record
+// version) becomes the attempt's `data`, never a header, and a 401 on that
+// attempt is reported to the vault against that record version.
 
+import type { ClaustrumScopedAttempt } from '@cortexkit/common-auth/claustrum'
 import type {
+  AccountHeadersResult,
+  AccountRequest,
+  Attempt,
   ChooseAccountInput,
   EventVerdict,
-  HeaderEdits,
   HostError,
   LimitSignal,
   OpenCode2AuthAdapter,
@@ -42,6 +58,7 @@ import {
   killswitchPassesPolicy,
   normalizeQuotaHeaders,
   normalizeWsFrame,
+  type OpenAiVault,
   parseJwtClaims,
   type RoutingMode,
   resolveMidStreamRateLimitResetAt,
@@ -60,6 +77,12 @@ import {
   selectStickyRow,
 } from '../core/pool-routing'
 import { isNonEmittingFrame, parseRateLimitSignal } from '../ws'
+import {
+  CODEX_CLIENT_HEADERS,
+  MidConversationEffort,
+  rewriteCodexFrame,
+  rewriteCodexHttpRequest,
+} from './codex-wire'
 import type { SessionPins } from './pins'
 
 /** The provider (and integration) OpenCode 2 serves ChatGPT logins under. */
@@ -112,21 +135,64 @@ export interface OpenAIAdapterLogger {
   warn(message: string, data?: Record<string, unknown>): void
 }
 
+/** The parts of this host's vault (`OpenAiVault`) the adapter uses. */
+export type VaultAccess = Pick<
+  OpenAiVault,
+  | 'routes'
+  | 'identities'
+  | 'authorize'
+  | 'reportFailure'
+  | 'recordSnapshot'
+  | 'requestReading'
+>
+
+/**
+ * What one send went out with, carried as the attempt's `data`: the pool
+ * row's token (a quota reading is recorded only with the token it was taken
+ * under), or the vault's receipt for that send.
+ */
+export type OpenAIAttemptData =
+  | { readonly kind: 'pool'; readonly token: string }
+  | {
+      readonly kind: 'vault'
+      readonly routeId: string
+      readonly receipt: ClaustrumScopedAttempt
+    }
+
 export interface OpenAIAdapterDeps {
   source: PoolAccess
   /** The settings a request reads (routing mode, killswitch, quota policy). */
   storage: () => Promise<AccountStorage | null>
   pins: SessionPins
+  /** This host's vault accounts; absent when none are routed. */
+  vault?: VaultAccess
+  /** Whether the Responses Lite shape is on (the `responsesLite` setting). */
+  responsesLite?: () => boolean
   now?: () => number
   log?: OpenAIAdapterLogger
 }
 
 export interface OpenAIAdapter {
-  readonly adapter: OpenCode2AuthAdapter<CodexQuotaReading>
+  readonly adapter: OpenCode2AuthAdapter<CodexQuotaReading, OpenAIAttemptData>
   /** Records quota and refusals from the installer's events on the pool. */
-  attach(installation: OpenCode2AuthInstallation<CodexQuotaReading>): void
+  attach(
+    installation: OpenCode2AuthInstallation<
+      CodexQuotaReading,
+      OpenAIAttemptData
+    >,
+  ): void
   /** Drops a session's pin and remembered account. */
   forgetSession(sessionId: string): void
+}
+
+/** One account a request may go to: a pool row or a vault account. */
+interface Target {
+  id: string
+  /** The ChatGPT account it signs in as, when known. */
+  identity?: string
+  quota: unknown
+  /** The pool row; absent for a vault account. */
+  row?: PoolRow
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -259,10 +325,16 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   const { source, pins } = deps
   const now = deps.now ?? Date.now
   const log = deps.log
-  // The token last handed out for each row. A quota reading is recorded on a
-  // row only together with the token the request was sent with, and the pool
-  // drops it when that token is not the row's own (`recordSnapshot`).
-  const tokens = new Map<string, string>()
+  const vault = deps.vault
+  const effort = new MidConversationEffort()
+  // Vault receipts authorized while choosing an account, waiting for the
+  // `accountHeaders` call that follows for the same request and account.
+  const receipts = new Map<string, ClaustrumScopedAttempt>()
+  const receiptKey = (scope: AccountRequest) =>
+    `${scope.sessionID}\u0000${scope.kind}\u0000${scope.accountId}`
+  // Rate-limit marks of vault accounts (the pool source marks only its own
+  // rows): account id to the mark's expiry time.
+  const vaultMarks = new Map<string, number>()
   // The row each session's latest agent-loop request went to, which its
   // title, compaction and generate requests follow in the ordered modes.
   const sessionAccounts = new Map<string, string>()
@@ -277,37 +349,87 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     }
   }
 
+  /**
+   * The accounts one request may be sent with now: the routable pool rows,
+   * then the vault's ChatGPT logins.
+   */
+  const currentTargets = (
+    storage: AccountStorage | null,
+    at: number,
+  ): Target[] => {
+    const rows = routableRows(
+      source.peek().rows,
+      storage,
+      at,
+      vault?.identities() ?? new Set<string>(),
+    )
+    const routes = (vault?.routes() ?? []).filter(
+      (route) => route.kind === 'oauth',
+    )
+    return [
+      ...rows.map(
+        (row): Target => ({
+          id: row.id,
+          ...(row.identity !== undefined ? { identity: row.identity } : {}),
+          quota: row.quota,
+          row,
+        }),
+      ),
+      ...routes.map(
+        (route): Target => ({
+          id: route.id,
+          ...(route.identity !== undefined ? { identity: route.identity } : {}),
+          quota: route.quota,
+        }),
+      ),
+    ]
+  }
+
   const routingInput = (
-    rows: readonly PoolRow[],
+    targets: readonly Target[],
     storage: AccountStorage | null,
     at: number,
   ): PoolRoutingInput => {
     const killswitch = new Map<string, boolean>()
     if (isKillswitchEnabled(storage)) {
-      for (const row of rows) {
+      for (const target of targets) {
         killswitch.set(
-          row.id,
+          target.id,
           killswitchPassesPolicy(
-            windowsFromQuotaMap(row.quota),
+            windowsFromQuotaMap(target.quota),
             storage,
-            row.id === FORMER_MAIN_ID ? undefined : row.id,
+            target.id === FORMER_MAIN_ID ? undefined : target.id,
             at,
           ),
         )
       }
     }
-    const routingRows: RoutingRow[] = rows.map((row) => ({
-      id: row.id,
+    const routingRows: RoutingRow[] = targets.map((target) => ({
+      id: target.id,
       kind: 'oauth',
-      ...(isQuotaMap(row.quota) ? { quota: row.quota } : {}),
+      ...(isQuotaMap(target.quota) ? { quota: target.quota } : {}),
     }))
+    const rows = targets.flatMap((target) => (target.row ? [target.row] : []))
+    const vaultIds = new Set(
+      targets.filter((target) => !target.row).map((target) => target.id),
+    )
+    const rateLimitMarks = source.rateLimitMarks(rows)
+    for (const id of vaultIds) {
+      const until = vaultMarks.get(id)
+      if (until === undefined) continue
+      if (until <= at) vaultMarks.delete(id)
+      else rateLimitMarks.set(id, until)
+    }
     return {
       rows: routingRows,
       now: at,
-      rateLimitMarks: source.rateLimitMarks(rows),
+      rateLimitMarks,
       refreshBackoff: source.refreshBackoffFor(rows),
       killswitch,
-      requestPull: (id) => source.requestReading(id),
+      requestPull: (id) =>
+        vaultIds.has(id)
+          ? vault?.requestReading(id)
+          : source.requestReading(id),
     }
   }
 
@@ -338,7 +460,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
    */
   const chooseSticky = (
     routing: PoolRoutingInput,
-    rows: readonly PoolRow[],
+    targets: readonly Target[],
     storage: AccountStorage | null,
     sessionId: string,
     excluded: ReadonlySet<string>,
@@ -372,7 +494,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           ]),
         ),
         wireAccountIdByAccount: Object.fromEntries(
-          rows.map((row) => [row.id, row.identity]),
+          targets.map((target) => [target.id, target.identity]),
         ),
         select: (pendingBytes) =>
           selectStickyRow(routing, options, new Set(exclude), pendingBytes),
@@ -413,30 +535,54 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     }
     await source.prepareTokens(source.peek().rows, storage)
     const at = now()
-    const rows = routableRows(source.peek().rows, storage, at)
-    const routing = routingInput(rows, storage, at)
+    const targets = currentTargets(storage, at)
+    const byId = new Map(targets.map((target) => [target.id, target]))
+    const routing = routingInput(targets, storage, at)
     const excluded = new Set<string>(
       input.rerouteFrom ? [input.rerouteFrom.accountId] : [],
     )
     const mode: RoutingMode = storage?.routing?.mode ?? 'main-first'
     const primary = input.kind === 'primary'
+    // Vault accounts the vault would not serve for this request. Nothing was
+    // sent with them, so the choice runs again as if they were not there.
+    const refused = new Set<string>()
     let accountId: string | undefined
-    if (mode === 'sticky-balanced') {
-      accountId = chooseSticky(
+    for (;;) {
+      const skip = new Set([...excluded, ...refused])
+      accountId = undefined
+      if (mode === 'sticky-balanced') {
+        accountId = chooseSticky(
+          routing,
+          targets,
+          storage,
+          input.sessionID,
+          skip,
+          // A vault refusal may be passing (the vault unreachable for a
+          // moment), so it does not move the session's pin.
+          primary && refused.size === 0,
+        )
+      }
+      accountId ??= chooseOrdered(
         routing,
-        rows,
-        storage,
-        input.sessionID,
-        excluded,
-        primary,
+        mode,
+        skip,
+        primary ? undefined : sessionAccounts.get(input.sessionID),
       )
+      if (accountId === undefined || refused.has(accountId)) {
+        accountId = undefined
+        break
+      }
+      if (!vault || byId.get(accountId)?.row) break
+      const receipt = await vault.authorize(accountId)
+      if (receipt) {
+        receipts.set(receiptKey({ ...input, accountId }), receipt)
+        break
+      }
+      log?.debug('the vault refused to serve an account; choosing again', {
+        accountId,
+      })
+      refused.add(accountId)
     }
-    accountId ??= chooseOrdered(
-      routing,
-      mode,
-      excluded,
-      primary ? undefined : sessionAccounts.get(input.sessionID),
-    )
     if (accountId !== undefined && primary)
       rememberSessionAccount(input.sessionID, accountId)
     log?.debug('pool account chosen', {
@@ -450,37 +596,77 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     return accountId
   }
 
-  const accountHeaders = ({
-    accountId,
-  }: {
-    accountId: string
-  }): HeaderEdits => {
+  const accountHeaders = async (
+    request: AccountRequest,
+  ): Promise<AccountHeadersResult<OpenAIAttemptData>> => {
+    const { accountId } = request
+    // Never throw here: a throw in the WebSocket handshake switches the
+    // session to HTTP for good. Removing the credential sends the request
+    // without one, which the provider refuses, rather than with the host's
+    // placeholder.
+    const none = {
+      headers: {
+        ...CODEX_CLIENT_HEADERS,
+        authorization: null,
+        'chatgpt-account-id': null,
+      },
+    }
     const row = source
       .peek()
       .rows.find((candidate) => candidate.id === accountId)
+    if (!row && vault) {
+      const key = receiptKey(request)
+      const receipt = receipts.get(key) ?? (await vault.authorize(accountId))
+      receipts.delete(key)
+      if (!receipt) {
+        log?.warn('the vault refused to serve an account; sending without', {
+          accountId,
+        })
+        return none
+      }
+      return {
+        headers: {
+          ...CODEX_CLIENT_HEADERS,
+          authorization: `Bearer ${receipt.accessToken}`,
+          'chatgpt-account-id':
+            receipt.accountIdentity ??
+            identityOfToken(receipt.accessToken) ??
+            null,
+        },
+        attempt: { kind: 'vault', routeId: accountId, receipt },
+      }
+    }
     const token = row ? source.usableToken(row) : undefined
     if (!row || !token) {
-      // Never throw here: a throw in the WebSocket handshake switches the
-      // session to HTTP for good. Removing the header sends the request
-      // without a credential, which the provider refuses, rather than with
-      // the host's placeholder.
       log?.warn('pool row holds no usable token; sending without one', {
         accountId,
       })
-      return { authorization: null, 'chatgpt-account-id': null }
+      return none
     }
-    tokens.set(accountId, token)
     const identity = row.identity ?? identityOfToken(token)
     return {
-      authorization: `Bearer ${token}`,
-      'chatgpt-account-id': identity ?? null,
+      headers: {
+        ...CODEX_CLIENT_HEADERS,
+        authorization: `Bearer ${token}`,
+        'chatgpt-account-id': identity ?? null,
+      },
+      attempt: { kind: 'pool', token },
     }
   }
 
-  const adapter: OpenCode2AuthAdapter<CodexQuotaReading> = {
+  const adapter: OpenCode2AuthAdapter<CodexQuotaReading, OpenAIAttemptData> = {
     providerID: OPENAI_PROVIDER_ID,
     chooseAccount,
     accountHeaders,
+    rewriteRequest: ({ request, sessionID, kind }) =>
+      rewriteCodexHttpRequest(
+        request,
+        { sessionID, kind },
+        effort,
+        deps.responsesLite?.() ?? false,
+      ),
+    rewriteWebSocketFrame: ({ frame, sessionID, kind }) =>
+      rewriteCodexFrame(frame, { sessionID, kind }, effort),
     quotaFromHeaders: (headers) => quotaFromCodexHeaders(headers),
     async limitFromResponse({ status, headers, body }) {
       if (status < 400) return undefined
@@ -509,39 +695,84 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           : undefined)
       return signal ? toLimit(signal, now(), error.status) : undefined
     },
+    // A 401 on a send the vault authorized is reported against the record
+    // version that send used; nothing else is reported. Only an HTTP
+    // response has a status here: a refused WebSocket handshake reaches no
+    // hook.
+    async onAttemptEnd(attempt, outcome) {
+      const data = attempt.data
+      if (data?.kind !== 'vault' || outcome.status !== 401) return
+      log?.warn('a vault account answered 401; reporting it to the vault', {
+        accountId: attempt.accountId,
+      })
+      await vault?.reportFailure(data.receipt, 401)
+    },
   }
 
-  const recordQuota = (accountId: string, reading: CodexQuotaReading) => {
-    const token = tokens.get(accountId)
-    if (!token) return
-    source.recordSnapshot(accountId, reading.snapshot, token, reading.complete)
+  const recordQuota = (
+    accountId: string,
+    reading: CodexQuotaReading,
+    handle: Attempt<OpenAIAttemptData>,
+  ) => {
+    const data = handle.data
+    if (data?.kind === 'vault') {
+      // A vault account's quota lives in the vault roster, kept only while
+      // the account still signs in as the one this send was served for.
+      void vault?.recordSnapshot(
+        accountId,
+        reading.snapshot,
+        reading.complete,
+        data.receipt,
+      )
+      return
+    }
+    // The pool drops a reading whose token is not the row's own any more.
+    if (data?.kind === 'pool')
+      source.recordSnapshot(
+        accountId,
+        reading.snapshot,
+        data.token,
+        reading.complete,
+      )
   }
 
-  const markLimited = (accountId: string, limit: LimitSignal) => {
+  const markLimited = (
+    accountId: string,
+    limit: LimitSignal,
+    handle: Attempt<OpenAIAttemptData>,
+  ) => {
     const at = now()
-    const row = source
-      .peek()
-      .rows.find((candidate) => candidate.id === accountId)
+    const fromVault = handle.data?.kind === 'vault'
+    const quota = fromVault
+      ? vault?.routes().find((route) => route.id === accountId)?.quota
+      : source.peek().rows.find((candidate) => candidate.id === accountId)
+          ?.quota
     const until = resolveMidStreamRateLimitResetAt(
-      row ? windowsFromQuotaMap(row.quota) : undefined,
+      windowsFromQuotaMap(quota),
       limit.reason,
       at,
       DEFAULT_LIMIT_MARK_MS,
       limit.retryAfterMs !== undefined ? at + limit.retryAfterMs : undefined,
     )
-    source.markRateLimited(accountId, until)
+    if (!fromVault) {
+      source.markRateLimited(accountId, until)
+      return
+    }
+    const existing = vaultMarks.get(accountId)
+    if (existing === undefined || existing < until)
+      vaultMarks.set(accountId, until)
   }
 
   return {
     adapter,
     attach(installation) {
       installation.on('quota', (event) =>
-        recordQuota(event.accountId, event.quota),
+        recordQuota(event.accountId, event.quota, event.handle),
       )
       // The installer waits for this listener before it asks the host to
       // retry, so the mark is in place when `chooseAccount` runs again.
       installation.on('limit', (event) => {
-        markLimited(event.accountId, event.limit)
+        markLimited(event.accountId, event.limit, event.handle)
         log?.debug('pool row refused the request', {
           accountId: event.accountId,
           via: event.via,
@@ -553,6 +784,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     forgetSession(sessionId) {
       pins.forget(sessionId)
       sessionAccounts.delete(sessionId)
+      effort.forget(sessionId)
     },
   }
 }
