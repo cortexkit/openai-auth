@@ -204,7 +204,17 @@ export class PoolAccountSource {
   private store: { configPath: string; store: PoolStore } | undefined
   private readonly refreshing = new Map<string, Promise<void>>()
   private readonly backoff = new Map<string, BackoffEntry>()
-  private readonly rotated = new Map<string, PoolRow['credential']>()
+  /**
+   * Credentials this process rotated, by row id, with the credential epoch
+   * of the row they were rotated from. A rotation keeps the epoch; a
+   * replacement (a re-login, another account) bumps it, so an entry whose
+   * epoch no longer matches the row's belongs to a credential the row no
+   * longer holds.
+   */
+  private readonly rotated = new Map<
+    string,
+    { credential: PoolRow['credential']; credentialEpoch: number | undefined }
+  >()
   private readonly pending = new Map<string, PendingObservation[]>()
   private readonly writes = new Map<string, Promise<void>>()
   private readonly marks = new Map<string, number>()
@@ -342,8 +352,15 @@ export class PoolAccountSource {
     const now = this.now()
     return rows.map((row) => {
       let next = row
-      const rotated = this.rotated.get(row.id)
-      if (rotated?.type === 'oauth' && row.credential?.type === 'oauth') {
+      const own = this.rotated.get(row.id)
+      const rotated = own?.credential
+      if (own && own.credentialEpoch !== row.credentialEpoch) {
+        // The row's credential was replaced since this process rotated it.
+        this.rotated.delete(row.id)
+      } else if (
+        rotated?.type === 'oauth' &&
+        row.credential?.type === 'oauth'
+      ) {
         const fileStamp = row.credential.lastRefreshedAt ?? 0
         const ownStamp = rotated.lastRefreshedAt ?? 0
         if (fileStamp >= ownStamp) this.rotated.delete(row.id)
@@ -621,6 +638,13 @@ export class PoolAccountSource {
     const paths = this.deps.paths()
     const before = this.snapshot.rows.find((row) => row.id === id)
     const refreshToken = before ? oauthAccess(before)?.refresh : undefined
+    // The epoch of the row the store actually refreshed, read under its
+    // locks. A rotation keeps it, so the rotated credential belongs to it.
+    let refreshedEpoch: number | undefined
+    const provider: ProviderRefresh = (credential, row) => {
+      refreshedEpoch = row.credentialEpoch
+      return this.deps.refreshProvider(credential, row)
+    }
     try {
       const outcome = await refreshPoolRow(
         {
@@ -632,18 +656,25 @@ export class PoolAccountSource {
             : {}),
         },
         id,
-        this.deps.refreshProvider,
+        provider,
       )
       if (outcome.status === 'rotated') {
         this.backoff.delete(id)
-        this.rotated.set(id, outcome.credential)
-        this.replaceRow(id, (row) => ({
-          ...row,
+        this.rotated.set(id, {
           credential: outcome.credential,
-          ...(outcome.identity !== undefined && row.identity === undefined
-            ? { identity: outcome.identity }
-            : {}),
-        }))
+          credentialEpoch: refreshedEpoch,
+        })
+        this.replaceRow(id, (row) =>
+          row.credentialEpoch !== refreshedEpoch
+            ? row
+            : {
+                ...row,
+                credential: outcome.credential,
+                ...(outcome.identity !== undefined && row.identity === undefined
+                  ? { identity: outcome.identity }
+                  : {}),
+              },
+        )
         return
       }
       this.recordRefreshFailure(id, refreshToken, new Error(outcome.reason))
