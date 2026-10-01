@@ -151,9 +151,9 @@ function routeBlock(
 }
 
 /**
- * The accounts to try, in order, for `main-first` and `fallback-first`.
- * `placement` puts the former main row first or last; a non-replayable
- * request always uses main-first and is sent to one account.
+ * The accounts to try, in order, for the ordered modes. `placement` keeps
+ * the roster order (`roster`) or puts row `main` first or last; a request
+ * that cannot be replayed always goes to row `main` alone.
  */
 export function planOrdered(
   input: PoolRoutingInput & {

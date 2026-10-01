@@ -228,8 +228,8 @@ export type KillswitchConfig = {
   main?: KillswitchThresholds
   accounts?: Record<string, KillswitchThresholds>
   /**
-   * Set to `KILLSWITCH_FLOORS_SCHEMA` once the block is in the shared menu's
-   * vocabulary (see `getKillswitchThresholdsForAccount`).
+   * `KILLSWITCH_FLOORS_SCHEMA` once the block holds explicit per-account
+   * floors; see that constant for how the two formats differ.
    */
   schema?: string
 }

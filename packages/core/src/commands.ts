@@ -301,9 +301,9 @@ export function settingsMutateAccounts(
 // The not-migrated notice
 // ---------------------------------------------------------------------------
 
-/** One live process that keeps the install from migrating. */
+/** One live process, on an older version, that keeps the accounts from moving to the account pool. */
 export interface MigrationBlocker {
-  /** `'unknown'` when a whole directory of processes could not be read. */
+  /** `'unknown'` when the directory of process heartbeats could not be read. */
   pid: number | 'unknown'
   version: string
 }
