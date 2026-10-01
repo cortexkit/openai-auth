@@ -38,7 +38,12 @@ const assistant = (text: string) => ({
   role: 'assistant',
   content: [{ type: 'output_text', text }],
 })
-const call = { type: 'function_call', call_id: 'c1', name: 'x', arguments: '{}' }
+const call = {
+  type: 'function_call',
+  call_id: 'c1',
+  name: 'x',
+  arguments: '{}',
+}
 const output = { type: 'function_call_output', call_id: 'c1', output: 'ok' }
 const update = (effort: string) => ({
   type: 'configuration_update',
@@ -83,9 +88,9 @@ function httpBody(
 describe('mid-conversation effort on WebSocket frames', () => {
   it('pins the first effort, then adds the update before the new user message of an incremental frame and changes nothing else', () => {
     const effort = new MidConversationEffort()
-    expect(rewriteCodexFrame(frame('low', [user('one')]), SESSION, effort)).toBe(
-      undefined,
-    )
+    expect(
+      rewriteCodexFrame(frame('low', [user('one')]), SESSION, effort),
+    ).toBe(undefined)
     const incremental = frame('high', [user('two')], {
       previous_response_id: 'resp_1',
     })
@@ -98,9 +103,7 @@ describe('mid-conversation effort on WebSocket frames', () => {
       input: [update('high'), user('two')],
     })
     // The field order the host sent is kept.
-    expect(Object.keys(rewritten)).toEqual(
-      Object.keys(JSON.parse(incremental)),
-    )
+    expect(Object.keys(rewritten)).toEqual(Object.keys(JSON.parse(incremental)))
   })
 
   it('keeps the pinned effort on a tool-output frame without adding the update again', () => {
@@ -209,7 +212,13 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
       false,
     )
     const step = await rewriteCodexHttpRequest(
-      httpBody('high', [user('one'), assistant('a'), user('two'), call, output]),
+      httpBody('high', [
+        user('one'),
+        assistant('a'),
+        user('two'),
+        call,
+        output,
+      ]),
       SESSION,
       effort,
       false,

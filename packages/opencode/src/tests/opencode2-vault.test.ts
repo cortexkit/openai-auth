@@ -5,7 +5,13 @@
 // the vault against the exact record version it used.
 
 import { afterEach, describe, expect, it } from 'bun:test'
-import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { join } from 'node:path'
 import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import { vaultPaths } from '@cortexkit/openai-auth-core/internal'
@@ -108,8 +114,8 @@ async function start(
       return false
     }
   }, 'the vault accounts and their quota')
-  // The vault re-reads the roster file into memory right after writing it;
-  // routing sees the reading once that read has finished.
+  // The vault writes the quota reading to the roster file, then loads the
+  // file back into memory; routing sees the reading once that load is done.
   await Bun.sleep(100)
   return { host, daemon }
 }
@@ -143,15 +149,11 @@ async function send(host: Host, status: number) {
 
 describe('vault accounts on OpenCode 2', () => {
   it('sends with the token the vault serves, and reports a 401 against that send record version only', async () => {
-    const { host, daemon } = await start(
-      'fallback-first',
-      [{ id: 'main' }],
-      {
-        'oauth:openai:vault': vaultLogin('chatgpt-vault', {
-          record_version: 7,
-        }),
-      },
-    )
+    const { host, daemon } = await start('fallback-first', [{ id: 'main' }], {
+      'oauth:openai:vault': vaultLogin('chatgpt-vault', {
+        record_version: 7,
+      }),
+    })
     const served = await send(host, 500)
     expect(served.get('authorization')).toBe(`Bearer ${VAULT_ACCESS}`)
     expect(served.get('chatgpt-account-id')).toBe('chatgpt-vault')
@@ -179,7 +181,8 @@ describe('vault accounts on OpenCode 2', () => {
     if (credential) credential.refuse = 'credential_unavailable'
     const gets = daemon.gets.length
     const served = await send(host, 200)
-    // The vault was asked for this send and refused it.
+    // The vault was asked to authorize this send and refused, so the request
+    // went to the pool row instead.
     expect(daemon.gets.slice(gets)).toEqual([
       expect.objectContaining({ credential_id: 'oauth:openai:vault' }),
     ])

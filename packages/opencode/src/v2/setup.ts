@@ -87,10 +87,10 @@ function identityOfToken(token: string): string | undefined {
 const SETTLE_ON_DISPOSE_MS = 5_000
 
 /**
- * How often vault accounts nobody sent on for a while get a quota reading,
- * and how old a reading may be before they do; the cadence and age OpenCode
- * 1's background refresh uses for them. Their quota lives in the vault
- * roster, so the pool's own polls do not cover them.
+ * How often the vault accounts are checked for a stale quota reading, and
+ * how old a reading may be before a new one is taken; the values OpenCode
+ * 1's background refresh uses. A vault account's quota lives in the vault
+ * roster, so the pool's own polls do not cover it.
  */
 const VAULT_POLL_INTERVAL_MS = 60_000
 const VAULT_STALE_AFTER_MS = 4 * 60_000
@@ -209,9 +209,10 @@ export async function setupOpenAIAuth(
   })
   lifecycle.start()
 
-  // The vault serves nothing until this host is enrolled (from OpenCode 1's
-  // `opencode auth login` menu, under the same name); it polls cheaply until
-  // then and notices an enrollment another process finished.
+  // The vault serves nothing until this host is enrolled as
+  // `openai-auth-opencode` (from OpenCode 1's `opencode auth login` menu).
+  // Until then each poll only checks for the enrollment token file, so an
+  // enrollment another process finished is picked up.
   const vault = new OpenAiVault({
     host: 'opencode',
     stateDir: options.vault?.stateDir ?? vaultStateDir(paths().statePath),

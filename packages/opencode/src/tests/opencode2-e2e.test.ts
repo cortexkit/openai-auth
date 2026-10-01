@@ -261,12 +261,13 @@ async function runScenario(input: {
   mkdirSync(project, { recursive: true })
   spawnSync('git', ['init', '-q'], { cwd: project })
   const mock: MockCodex = startMockCodex([PLACEHOLDER])
+  const isolated = isolatedEnv(root)
   const env: Record<string, string> = {
-    ...isolatedEnv(root),
-    // Read by the vault plugin entry: where quota polls and the vault go.
+    ...isolated,
+    // Read by the vault plugin entry, which sends its quota polls to the mock.
     OPENAI_AUTH_E2E_MOCK_URL: mock.url,
   }
-  const configDir = join(env.XDG_CONFIG_HOME ?? '', 'opencode')
+  const configDir = join(isolated.XDG_CONFIG_HOME, 'opencode')
   seedPool(configDir, input.accounts, input.mode)
   let daemon: MockDaemon | undefined
   let rosterPath = ''
@@ -430,7 +431,7 @@ async function runScenario(input: {
   const state = read(join(configDir, 'openai-auth-state.json'))
   let pluginLog = ''
   try {
-    pluginLog = readFileSync(env.OPENCODE_OPENAI_AUTH_LOG_FILE, 'utf8')
+    pluginLog = readFileSync(isolated.OPENCODE_OPENAI_AUTH_LOG_FILE, 'utf8')
   } catch {}
   const diagnostics = [
     `vault reports: ${JSON.stringify(daemon?.reports ?? [])}`,
@@ -726,9 +727,9 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         expectCodexClient(sample.headers)
       // Turns after the first chain on the reused socket.
       const bodies = samplesOn(result, 'ws').map(bodyOf)
-      expect(bodies.map((body) => body.previous_response_id !== undefined)).toEqual(
-        [false, true, true],
-      )
+      expect(
+        bodies.map((body) => body.previous_response_id !== undefined),
+      ).toEqual([false, true, true])
     })
   }, 180_000)
 
@@ -755,9 +756,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         '1',
         '1',
       ])
-      const [first, second, change, after] = samplesOn(result, 'ws').map(
-        bodyOf,
-      )
+      const [first, second, change, after] = samplesOn(result, 'ws').map(bodyOf)
       for (const body of [first, second, change, after])
         expect(body?.reasoning?.effort).toBe('low')
       // The host sends the turn whose effort changed in full (its own request

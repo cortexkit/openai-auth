@@ -327,8 +327,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   const log = deps.log
   const vault = deps.vault
   const effort = new MidConversationEffort()
-  // Vault receipts authorized while choosing an account, waiting for the
-  // `accountHeaders` call that follows for the same request and account.
+  // Vault receipts authorized while choosing an account, kept until the
+  // installer's `accountHeaders` call for the same session, request kind and
+  // account (it follows `chooseAccount` at once) takes them.
   const receipts = new Map<string, ClaustrumScopedAttempt>()
   const receiptKey = (scope: AccountRequest) =>
     `${scope.sessionID}\u0000${scope.kind}\u0000${scope.accountId}`
@@ -543,8 +544,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     )
     const mode: RoutingMode = storage?.routing?.mode ?? 'main-first'
     const primary = input.kind === 'primary'
-    // Vault accounts the vault would not serve for this request. Nothing was
-    // sent with them, so the choice runs again as if they were not there.
+    // Vault accounts the vault refused to authorize for this request. Nothing
+    // was sent with them yet, so the choice runs again without them.
     const refused = new Set<string>()
     let accountId: string | undefined
     for (;;) {
@@ -557,8 +558,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           storage,
           input.sessionID,
           skip,
-          // A vault refusal may be passing (the vault unreachable for a
-          // moment), so it does not move the session's pin.
+          // A vault refusal may be temporary (the vault unreachable for a
+          // moment), so choosing again after one does not move the session's
+          // sticky pin.
           primary && refused.size === 0,
         )
       }
@@ -695,10 +697,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           : undefined)
       return signal ? toLimit(signal, now(), error.status) : undefined
     },
-    // A 401 on a send the vault authorized is reported against the record
-    // version that send used; nothing else is reported. Only an HTTP
-    // response has a status here: a refused WebSocket handshake reaches no
-    // hook.
+    // A 401 on a send the vault authorized is reported to the vault against
+    // the record version in that send's receipt; no other status is
+    // reported. Only an HTTP response gives a status here: OpenCode 2 runs no
+    // plugin hook for a WebSocket handshake the server refuses.
     async onAttemptEnd(attempt, outcome) {
       const data = attempt.data
       if (data?.kind !== 'vault' || outcome.status !== 401) return

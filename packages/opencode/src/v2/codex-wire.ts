@@ -32,7 +32,7 @@ export const CODEX_CLIENT_HEADERS: Readonly<Record<string, string>> = {
 /** The header OpenCode 1 sends on an HTTP request in the Lite shape. */
 export const RESPONSES_LITE_HEADER = 'x-openai-internal-codex-responses-lite'
 
-/** Most sessions whose first effort is remembered. */
+/** At most this many sessions keep their pinned first effort; the oldest goes first. */
 const MAX_PINNED_SESSIONS = 1024
 
 /**
@@ -58,7 +58,7 @@ const isUserMessage = (item: unknown) =>
 const isConfigurationUpdate = (item: unknown) =>
   isRecord(item) && item.type === 'configuration_update'
 
-/** Where a request body goes out. */
+/** The transport a request body is sent over. */
 export type WireForm = 'http' | 'ws'
 
 /**
@@ -147,7 +147,10 @@ export class MidConversationEffort {
     }
     body.reasoning = { ...reasoning, effort: pinned }
     if (!isConfigurationUpdate(input[at - 1]))
-      input.splice(at, 0, { type: 'configuration_update', reasoning: { effort } })
+      input.splice(at, 0, {
+        type: 'configuration_update',
+        reasoning: { effort },
+      })
     return true
   }
 
@@ -231,6 +234,6 @@ export function rewriteCodexFrame(
   effort: MidConversationEffort,
 ): string | undefined {
   const body = parseObject(frame)
-  if (!body || body.type !== 'response.create') return undefined
+  if (body?.type !== 'response.create') return undefined
   return effort.apply(body, scope, 'ws') ? JSON.stringify(body) : undefined
 }
