@@ -417,6 +417,65 @@ describe('adoption beside the Claustrum vault', () => {
   })
 })
 
+describe('adoption beside a vault that never answers', () => {
+  // The adoption waits for the vault's first roster only for a bounded time.
+  // Past it the run adopts nothing and ends retryable, so the lifecycle is
+  // free again and its next scheduled run tries once more.
+  it('gives up after its bound without adopting, and ends retryable', async () => {
+    const stateDir = join(dir, 'vault')
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+    const { tokenPath } = vaultPaths(stateDir, 'opencode')
+    writeFileSync(
+      tokenPath,
+      JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    chmodSync(tokenPath, 0o600)
+    await seedLegacy()
+    installWire({ usage: true })
+    let adopted = 0
+    const warnings: Array<{ message: string; data: unknown }> = []
+    await loadPlugin(
+      {
+        adopt: async (deps) => {
+          adopted++
+          return adoptHostSlotLogin(deps)
+        },
+        log: {
+          info: () => {},
+          warn: (message: string, data?: unknown) => {
+            warnings.push({ message, data })
+          },
+        },
+      },
+      {
+        vault: {
+          stateDir,
+          // The connection is never made, so the first roster read never ends.
+          connectScoped: () => new Promise(() => {}),
+          pollIntervalMs: 0,
+          firstRosterWaitMs: 300,
+        },
+      },
+    )
+    await waitFor(
+      async () =>
+        warnings.some(
+          (warning) =>
+            warning.message === 'host login adoption will be tried again',
+        ),
+      'the adoption to end retryable',
+    )
+    expect(
+      warnings.find(
+        (warning) =>
+          warning.message === 'host login adoption will be tried again',
+      )?.data,
+    ).toEqual({ outcome: { status: 'retry', reason: 'vault-roster-pending' } })
+    expect(adopted).toBe(0)
+  })
+})
+
 describe('later logins on a migrated install', () => {
   async function migratedPlugin(extra = {}) {
     await seedLegacy()

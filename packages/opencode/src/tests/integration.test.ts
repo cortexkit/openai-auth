@@ -371,9 +371,22 @@ describe('integration: HTTP quota push', () => {
     }
     writeFileSync(configFile, JSON.stringify(store))
 
-    // Mock fetch to return a 200 with x-codex-* headers
+    // The turn's request answers 200 with x-codex-* headers. Everything else
+    // the loader sends on its own (the startup quota poll of main, token
+    // exchanges) answers 500: a poll answered with the turn's body would
+    // read as a quota with no windows and, landing after the push, replace
+    // the pushed one in the sidebar. The startup poll is held until the push
+    // has been written, the order in which that overwrite showed up under
+    // suite load, so the test always covers it.
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async (_url: unknown, _init?: unknown) => {
+    const pollRelease = Promise.withResolvers<void>()
+    const pollAnswered = Promise.withResolvers<void>()
+    globalThis.fetch = (async (url: unknown, _init?: unknown) => {
+      if (!isResponsesSend(url)) {
+        await pollRelease.promise
+        pollAnswered.resolve()
+        return new Response('unavailable', { status: 500 })
+      }
       return new Response('{"choices":[{"delta":{"content":"hello"}}]}', {
         status: 200,
         headers: {
@@ -438,6 +451,14 @@ describe('integration: HTTP quota push', () => {
       // Don't consume the body — we only care about the side-effect (quota push)
       await response.body?.cancel()
 
+      // The push is written by the background sidebar writer; wait for its
+      // queue to empty. Then let the startup poll answer, give its result
+      // time to be handled, and wait for the writer again before reading.
+      await drainSidebarWrites()
+      pollRelease.resolve()
+      await pollAnswered.promise
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      await drainSidebarWrites()
       const sidebar = await waitForSidebarState(
         sidebarFile,
         (s) =>

@@ -89,6 +89,37 @@ const LOCAL_REFRESH_RETRY_MS = 30_000
  */
 export const VAULT_FIRST_ROSTER_WAIT_MS = 2_000
 
+/**
+ * Longest background work waits for the vault's first roster: the first
+ * quota polls of new rows here, and each host's adoption of a slot login.
+ * Past it that work is skipped for now (nothing is done under uncertainty)
+ * and tried again later.
+ */
+export const VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS = 10_000
+
+/**
+ * Whether `promise` settles (resolves or rejects) within `ms`. Never rejects,
+ * and its timer never keeps the process alive.
+ */
+export async function settlesWithin(
+  promise: Promise<unknown>,
+  ms: number,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const settled = await Promise.race([
+    promise.then(
+      () => true,
+      () => true,
+    ),
+    new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), ms)
+      timer.unref?.()
+    }),
+  ])
+  clearTimeout(timer)
+  return settled
+}
+
 /** Observations kept per row to re-apply over a re-read the store write has not reached yet. */
 const PENDING_OBSERVATIONS_PER_ROW = 8
 const PENDING_OBSERVATION_MAX_AGE_MS = 30 * 60_000
@@ -125,13 +156,16 @@ export interface PoolAccountSourceDeps {
   /**
    * Settles (resolved or rejected) once the vault has read its first roster.
    * Until then `vaultIdentities` is empty even for an account the vault
-   * holds, so the first-sight quota polls of new rows wait for it, and a
-   * token step waits for it at most `vaultFirstRosterWaitMs`. Nothing else
-   * waits for it. Absent: there is no vault roster to wait for.
+   * holds, so the first-sight quota polls of new rows wait for it (at most
+   * `vaultFirstRosterBackgroundWaitMs`, else they are skipped this time),
+   * and a token step waits for it at most `vaultFirstRosterWaitMs`. Nothing
+   * else waits for it. Absent: there is no vault roster to wait for.
    */
   vaultFirstRoster?: Promise<unknown>
   /** Overrides `VAULT_FIRST_ROSTER_WAIT_MS` (tests). */
   vaultFirstRosterWaitMs?: number
+  /** Overrides `VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS` (tests). */
+  vaultFirstRosterBackgroundWaitMs?: number
 }
 
 type BackoffEntry = {
@@ -271,18 +305,7 @@ export class PoolAccountSource {
   private async awaitVaultRoster(ms: number): Promise<void> {
     const first = this.deps.vaultFirstRoster
     if (this.vaultRosterSettled || !first) return
-    let timer: ReturnType<typeof setTimeout> | undefined
-    await Promise.race([
-      first.then(
-        () => undefined,
-        () => undefined,
-      ),
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, ms)
-        timer.unref?.()
-      }),
-    ])
-    clearTimeout(timer)
+    await settlesWithin(first, ms)
   }
 
   // -------------------------------------------------------------------------
@@ -476,13 +499,26 @@ export class PoolAccountSource {
     const first = this.deps.vaultFirstRoster
     if (!this.vaultRosterSettled && first) {
       // Which rows the vault owns is not known yet. These polls run in the
-      // background anyway, so they wait for the roster rather than poll a
-      // vault account's local row with that row's own token. One deferred
-      // pass covers every read until then: it polls the rows as they are.
+      // background anyway, so they wait for the roster (for a bounded time)
+      // rather than poll a vault account's local row with that row's own
+      // token. One deferred pass covers every read until then: it polls the
+      // rows as they are. When the roster does not come within the bound the
+      // polls are skipped this time; a later read tries again, and admission
+      // still asks for a reading of any row it refuses for want of one.
       if (this.pollsAwaitVault) return
       this.pollsAwaitVault = true
-      const pollNow = () => this.pollUnseenRows()
-      void first.then(pollNow, pollNow)
+      void settlesWithin(
+        first,
+        this.deps.vaultFirstRosterBackgroundWaitMs ??
+          VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS,
+      ).then((settled) => {
+        this.pollsAwaitVault = false
+        if (settled) this.pollUnseenRows()
+        else
+          this.log.info(
+            'first quota polls skipped: the vault has not read its accounts yet',
+          )
+      })
       return
     }
     for (const row of this.snapshot.rows) {

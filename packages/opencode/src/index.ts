@@ -92,7 +92,11 @@ import {
   routedAccountForSession,
 } from './core/cachekeep'
 import { classifyMainAuthSlot, MAIN_REFRESH_LOCK_NAME } from './core/host-slot'
-import { PoolAccountSource } from './core/pool-account-source'
+import {
+  PoolAccountSource,
+  settlesWithin,
+  VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS,
+} from './core/pool-account-source'
 import {
   migratedPoolRows,
   openAccountPool,
@@ -763,7 +767,14 @@ interface CodexAuthPluginOptions {
       | 'connectEnrollment'
       | 'pollIntervalMs'
     >
-  >
+  > & {
+    /**
+     * Longest an adoption or the pool source's first quota polls wait for
+     * the vault's first roster; `VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS` by
+     * default.
+     */
+    firstRosterWaitMs?: number
+  }
   /** Test seams for the OAuth logins of the auth methods. */
   login?: {
     /** Controls the wait for the host's slot write without real timers. */
@@ -1418,6 +1429,8 @@ export async function CodexAuthPlugin(
   // token step waits for it for a bounded time (`PoolAccountSource`).
   const vaultFirstRoster = Promise.withResolvers<void>()
   let vaultFirstRosterStarted = false
+  const vaultRosterWaitMs =
+    options.vault?.firstRosterWaitMs ?? VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS
   // This instance's entry in the per-process heartbeat directory, written by
   // the first loader run and dropped on dispose.
   let processHeartbeat: Promise<ProcessHeartbeatHandle> | undefined
@@ -1462,9 +1475,17 @@ export async function CodexAuthPlugin(
           },
           // Until the vault's first roster read has settled, `vaultServes` is
           // false even on a host the vault serves, so an adoption waits for
-          // it. Only this background run waits, never the loader.
+          // it. Only this background run waits, never the loader, and only
+          // for a bounded time: past it the run adopts nothing and ends
+          // retryable, so the lifecycle stays free and tries again later.
           adopt: async (deps) => {
-            await vaultFirstRoster.promise
+            if (
+              !(await settlesWithin(
+                vaultFirstRoster.promise,
+                vaultRosterWaitMs,
+              ))
+            )
+              return { status: 'retry', reason: 'vault-roster-pending' }
             const outcome = await (
               poolMigrationDeps.adopt ?? adoptHostSlotLogin
             )(deps)
@@ -1955,6 +1976,7 @@ export async function CodexAuthPlugin(
           },
           vaultIdentities: () => vault.identities(),
           vaultFirstRoster: vaultFirstRoster.promise,
+          vaultFirstRosterBackgroundWaitMs: vaultRosterWaitMs,
           log: createLogger('pool'),
         })
         poolAccountSource = poolSource

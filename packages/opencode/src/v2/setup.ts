@@ -62,7 +62,11 @@ import {
 import type { Plugin } from '@opencode/plugin'
 import { getConfigPath, getSettings } from '../config'
 import { getAccountPaths } from '../core/account-paths'
-import { PoolAccountSource } from '../core/pool-account-source'
+import {
+  PoolAccountSource,
+  settlesWithin,
+  VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS,
+} from '../core/pool-account-source'
 import { poolMigrated } from '../core/pool-accounts'
 import {
   createPoolLifecycle,
@@ -141,7 +145,14 @@ export interface OpenAIAuthV2Options {
       | 'connectEnrollment'
       | 'pollIntervalMs'
     >
-  >
+  > & {
+    /**
+     * Longest an adoption or the pool source's first quota polls wait for
+     * the vault's first roster; `VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS` by
+     * default.
+     */
+    firstRosterWaitMs?: number
+  }
 }
 
 type SetupContext = Pick<
@@ -190,6 +201,8 @@ export async function setupOpenAIAuth(
   // for it in the background, and a request's token step waits for it for a
   // bounded time (`PoolAccountSource`). Setup itself never waits for it.
   const vaultFirstRoster = Promise.withResolvers<void>()
+  const vaultRosterWaitMs =
+    options.vault?.firstRosterWaitMs ?? VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS
   const vault = new OpenAiVault({
     host: 'opencode',
     stateDir: options.vault?.stateDir ?? vaultStateDir(paths().statePath),
@@ -244,6 +257,7 @@ export async function setupOpenAIAuth(
     // (request routing already skips it). OpenCode 1 wires the same set.
     vaultIdentities: () => vault.identities(),
     vaultFirstRoster: vaultFirstRoster.promise,
+    vaultFirstRosterBackgroundWaitMs: vaultRosterWaitMs,
     log: createLogger('pool'),
   })
   await source.load()
@@ -278,9 +292,15 @@ export async function setupOpenAIAuth(
           return outcome
         },
         // `vaultServes` is false until the vault's first roster read has
-        // settled, so an adoption waits for it (in the background).
+        // settled, so an adoption waits for it, in the background and for a
+        // bounded time: past it the run adopts nothing and ends retryable,
+        // so the lifecycle (and a login waiting for it to go idle) is never
+        // held, and the next scheduled run tries again.
         adopt: async (deps) => {
-          await vaultFirstRoster.promise
+          if (
+            !(await settlesWithin(vaultFirstRoster.promise, vaultRosterWaitMs))
+          )
+            return { status: 'retry', reason: 'vault-roster-pending' }
           const outcome = await adoptHostSlotLogin(deps)
           void source.load()
           return outcome
