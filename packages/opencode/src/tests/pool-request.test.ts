@@ -602,7 +602,7 @@ describe('ordered routing on a migrated install', () => {
     expect(wire.sends).toEqual([bearer('fallback-1'), bearer('main')])
   })
 
-  for (const mode of ['main-first', 'fallback-first'] as const) {
+  for (const mode of MODES) {
     it(`${mode}: a request that cannot be replayed goes to main once and is never retried`, async () => {
       seedPool(mode, [
         { id: 'main', quota: healthy() },
@@ -785,6 +785,63 @@ describe('sticky-balanced on a migrated install', () => {
 
     await fetchOverride(URL_RESPONSES, request('s-move'))
     expect(wire.sends.at(-1)).toBe(bearer('fallback-1'))
+  })
+
+  it('places a new session by the bytes other sessions committed to each row', async () => {
+    seedPool('sticky-balanced', [
+      { id: 'main', quota: healthy() },
+      { id: 'fallback-1', quota: healthy() },
+    ])
+    // No quota on the responses: the readings the pins were judged on stay
+    // current, so the first session's bytes still weigh on its row.
+    const wire = installWire({
+      respond: () => new Response('{}', { status: 200 }),
+      usage: () => new Response('', { status: 503 }),
+    })
+    const fetchOverride = await loadFetch()
+
+    await fetchOverride(URL_RESPONSES, request('s-first'))
+    await fetchOverride(URL_RESPONSES, request('s-second'))
+
+    expect(wire.sends).toEqual([bearer('main'), bearer('fallback-1')])
+    const state = await sidebar()
+    expect(pinOf(state, 's-first')).toBe('main')
+    expect(pinOf(state, 's-second')).toBe('fallback-1')
+  })
+
+  it('moves a pin off a row that falls below the killswitch threshold', async () => {
+    seedPool(
+      'sticky-balanced',
+      [
+        { id: 'main', quota: healthy() },
+        { id: 'fallback-1', quota: healthy() },
+      ],
+      { killswitch: { enabled: true } },
+    )
+    let used = 42
+    const wire = installWire({
+      respond: (b) =>
+        new Response('{}', {
+          status: 200,
+          headers: quotaHeaders(b === bearer('main') ? used : 42),
+        }),
+      usage: () => new Response('', { status: 503 }),
+    })
+    const fetchOverride = await loadFetch()
+
+    await fetchOverride(URL_RESPONSES, request('s-floor'))
+    expect(pinOf(await sidebar(), 's-floor')).toBe('main')
+    // This response leaves main below its 5% floor.
+    used = 98
+    await fetchOverride(URL_RESPONSES, request('s-floor'))
+    await fetchOverride(URL_RESPONSES, request('s-floor'))
+
+    expect(wire.sends).toEqual([
+      bearer('main'),
+      bearer('main'),
+      bearer('fallback-1'),
+    ])
+    expect(pinOf(await sidebar(), 's-floor')).toBe('fallback-1')
   })
 
   it('a 429 without exhausting quota keeps the pin and the response', async () => {
