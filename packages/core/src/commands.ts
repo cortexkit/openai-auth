@@ -3,7 +3,8 @@
  * cache, diagnostics and the provider extras, built on the shared command
  * menu (`@cortexkit/common-auth/commands`). Both hosts build their menu with
  * `createOpenAiMenu`; each supplies what only it has (OpenCode its cache
- * keep-warm manager, dumps and Claustrum mode, Pi its own login and pool).
+ * keep-warm manager and dumps, Pi its own login and pool; both their
+ * connection to the Claustrum vault).
  *
  * The menu works on the account pool, so it needs a migrated install. Until
  * then `/openai` shows only why (`migrationNoticeMenu`).
@@ -33,7 +34,6 @@ import type {
 } from '@cortexkit/common-auth/store'
 import {
   type AccountStorage,
-  type ClaustrumMode,
   DEFAULT_KILLSWITCH_THRESHOLDS,
   type loadAccounts as defaultLoadAccounts,
   type mutateAccounts as defaultMutateAccounts,
@@ -58,6 +58,13 @@ import {
   selectCreditToSpend,
 } from './reset-credits'
 import { isRecord } from './util/record.ts'
+import {
+  type OpenAiVault,
+  type VaultWaitOptions,
+  vaultApprovalInstructions,
+  vaultConnectOutcome,
+  vaultEnrollmentLine,
+} from './vault'
 
 /** The one slash command, without the slash. */
 export const OPENAI_COMMAND_NAME = 'openai'
@@ -277,14 +284,6 @@ export interface AccountRules {
    * re-login becomes).
    */
   rowLocks?(id: string): readonly PoolLockSpec[]
-  /**
-   * Wraps enabling row `id`. `enable` does the store write with the given
-   * locks (the row's locks when none are given). The default enables at once.
-   */
-  enableRow?(
-    id: string,
-    enable: (extraLocks?: readonly PoolLockSpec[]) => Promise<{ id: string }>,
-  ): Promise<{ id: string }>
 }
 
 /**
@@ -343,16 +342,8 @@ export function withAccountRules(
       credential: replaced.credential,
     }
   }
-  const enable: PoolStore['enable'] = (id, options) => {
-    const run = (extraLocks?: readonly PoolLockSpec[]) =>
-      store.enable(id, {
-        ...(options ?? {}),
-        ...((extraLocks ?? locksFor(id, options?.extraLocks))
-          ? { extraLocks: extraLocks ?? locksFor(id, options?.extraLocks) }
-          : {}),
-      })
-    return rules.enableRow ? rules.enableRow(id, run) : run()
-  }
+  const enable: PoolStore['enable'] = (id, options) =>
+    store.enable(id, withLocks(id, options))
   const members: Partial<Record<keyof PoolStore, unknown>> = {
     add,
     replace,
@@ -555,8 +546,6 @@ export interface MenuLoginFlow {
 export interface MenuLoginDeps {
   /** Starts a browser login, or a device-code login when `headless`. */
   begin(options: { label?: string; headless: boolean }): Promise<MenuLoginFlow>
-  /** Why no account can be added now (Claustrum mode); undefined allows it. */
-  refusal?(): Promise<string | undefined>
   /** The main account's ChatGPT identity; a login of that account is refused. */
   mainIdentity?(): Promise<string | undefined>
 }
@@ -592,8 +581,6 @@ export function menuLogin(
       },
     ],
     run: async (values) => {
-      const refusal = await deps.refusal?.()
-      if (refusal) return { status: 'cancelled', message: refusal }
       const label =
         typeof values.label === 'string' && values.label.trim().length > 0
           ? values.label.trim()
@@ -670,72 +657,142 @@ export function sessionSection(deps: SessionSectionDeps): PluginExtraSection {
   }
 }
 
-export interface ClaustrumSectionDeps {
-  mode(): Promise<ClaustrumMode>
-  enter?(): Promise<{
-    status: 'completed' | 'incomplete' | 'aborted'
-    outcomes: Record<string, string>
-    reason?: string
-  }>
-  leave?(): Promise<void>
+export interface VaultSectionDeps {
+  vault: Pick<
+    OpenAiVault,
+    | 'name'
+    | 'status'
+    | 'connectStep'
+    | 'waitForApproval'
+    | 'disconnect'
+    | 'decline'
+    | 'accept'
+    | 'routes'
+    | 'snapshot'
+  >
+  /** Runs after the vault accounts this host may route change (connected, disconnected, one disabled or enabled). */
+  changed?(): unknown
+  /** How Connect polls for the operator's approval (tests shorten it). */
+  wait?: VaultWaitOptions
 }
 
-/** Claustrum mode: accounts served from the vault, and back to local. */
-export function claustrumSection(
-  deps: ClaustrumSectionDeps,
-): PluginExtraSection {
+/**
+ * The Claustrum vault: whether this host is connected, the OpenAI accounts
+ * the vault serves it, Connect (enrollment, approved by the operator with
+ * `ck`), Disconnect (forget this host's token), and enabling or disabling
+ * each vault account here (a disabled one is declined: it stays listed and
+ * never routes).
+ */
+export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
+  const { vault } = deps
   return {
-    id: 'claustrum',
-    title: 'Claustrum',
+    id: 'vault',
+    title: 'Vault',
     build: async () => {
-      const mode = await deps.mode()
-      const unavailable =
-        'The custody runtime is not ready. Try again after OpenAI auth finishes initializing.'
+      const status = await vault.status()
+      const connected = status.enrollment.state === 'approved'
+      const routing = vault.routes().length
       return {
-        lines: [`Mode: ${mode}.`],
-        actions:
-          mode === 'local'
+        lines: [
+          vaultEnrollmentLine(status.host, status.name, status.enrollment),
+          ...vaultApprovalInstructions(status.name, status.enrollment),
+          ...(connected
             ? [
-                {
-                  id: 'enter',
-                  label: 'Enter Claustrum mode',
-                  description:
-                    'Do not run a login in another OpenCode window during the transition.',
-                  run: async () => {
-                    if (!deps.enter) return { ok: false, text: unavailable }
-                    const result = await deps.enter()
-                    log.info('claustrum transition finished', {
-                      status: result.status,
-                      reason: result.reason,
-                      outcomes: result.outcomes,
-                    })
-                    const rows = Object.entries(result.outcomes).map(
-                      ([id, outcome]) => `${id}: ${outcome}`,
-                    )
-                    return {
-                      ok: result.status === 'completed',
-                      text: [
-                        `Claustrum ${result.status}.`,
-                        ...(rows.length > 0
-                          ? rows
-                          : ['No enabled OAuth accounts.']),
-                        ...(result.reason ? [`Reason: ${result.reason}`] : []),
-                      ].join('\n'),
-                    }
-                  },
-                },
+                status.accounts.length === 0
+                  ? 'The vault serves no OpenAI account to this host yet.'
+                  : `The vault serves ${status.accounts.length} OpenAI account${status.accounts.length === 1 ? '' : 's'}; ${routing} can route now.`,
               ]
-            : [
-                {
-                  id: 'leave',
-                  label: 'Return to local mode',
+            : []),
+          ...(status.lastError ? [`Last error: ${status.lastError}`] : []),
+        ],
+        items: status.accounts.map((row) => ({
+          id: row.routeId,
+          label: row.label,
+          detail: [
+            row.credentialType === 'api_key' ? 'API key' : 'login',
+            row.state === 'active' ? 'active' : `vault state ${row.state}`,
+            row.enabled ? 'enabled' : 'disabled here',
+          ].join(', '),
+          actions: [
+            row.enabled
+              ? {
+                  id: 'disable',
+                  label: 'Disable on this host',
+                  description:
+                    'It stays in the vault and in this list, and is never sent from this host until enabled again.',
                   run: async () => {
-                    if (!deps.leave) return { ok: false, text: unavailable }
-                    await deps.leave()
-                    return 'Claustrum mode is now local. Run a fresh `/login openai` for each account, then remove its binding with `ck auth` before it can refresh locally.'
+                    await vault.decline(row.routeId)
+                    await deps.changed?.()
+                    return `${row.label} is disabled on this host.`
+                  },
+                }
+              : {
+                  id: 'enable',
+                  label: 'Enable on this host',
+                  run: async () => {
+                    await vault.accept(row.routeId)
+                    await deps.changed?.()
+                    return `${row.label} is enabled on this host.`
                   },
                 },
-              ],
+          ],
+        })),
+        actions: connected
+          ? [
+              {
+                id: 'disconnect',
+                label: 'Disconnect',
+                description:
+                  "Forgets this host's vault token; its vault accounts stop routing at once. Revoke the enrollment itself with `ck auth enroll revoke`.",
+                confirm:
+                  'Disconnect from the vault? Connecting again needs a new approval with `ck`.',
+                run: async () => {
+                  await vault.disconnect()
+                  await deps.changed?.()
+                  return `Disconnected: ${vault.name} no longer reads from the vault. Run \`ck auth enroll revoke --name ${vault.name}\` to revoke it in the vault too.`
+                },
+              },
+            ]
+          : [
+              {
+                id: 'connect',
+                label: 'Connect',
+                description:
+                  'Asks the vault to enroll this host; you approve the request with `ck`.',
+                run: async ({ invocation }) => {
+                  const step = await vault.connectStep()
+                  if (step.state !== 'pending' && step.state !== 'busy') {
+                    await deps.changed?.()
+                    return vaultConnectOutcome(vault, step)
+                  }
+                  // The approval happens outside this menu; keep polling for
+                  // it and report the outcome to the session that asked.
+                  void vault
+                    .waitForApproval(deps.wait)
+                    .then(async (final) => {
+                      await deps.changed?.()
+                      const outcome = vaultConnectOutcome(vault, final)
+                      invocation.notify(
+                        outcome.text,
+                        outcome.ok ? 'info' : 'warning',
+                      )
+                    })
+                    .catch((error: unknown) => {
+                      invocation.notify(
+                        `Connecting to the vault failed: ${error instanceof Error ? error.message : String(error)}`,
+                        'error',
+                      )
+                    })
+                  return {
+                    ok: true,
+                    text: [
+                      ...vaultApprovalInstructions(vault.name, step),
+                      'Waiting for the approval; you are told here when it lands.',
+                    ].join('\n'),
+                  }
+                },
+              },
+            ],
       }
     },
   }
@@ -916,8 +973,6 @@ export interface OpenAiMenuOptions {
   extraLocks?: readonly PoolLockSpec[]
   /** The legacy locks a write of one row takes; see `AccountRules`. */
   rowLocks?: AccountRules['rowLocks']
-  /** Wraps enabling a row (OpenCode's Claustrum binding check). */
-  enableRow?: AccountRules['enableRow']
   /** Whether the install is migrated; absent means it always is (Pi). */
   migration?(): Promise<MenuMigrationState>
   login?: MenuLoginDeps
@@ -959,7 +1014,6 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
     store: withSettingsMigration(
       withAccountRules(options.store, {
         ...(options.rowLocks ? { rowLocks: options.rowLocks } : {}),
-        ...(options.enableRow ? { enableRow: options.enableRow } : {}),
       }),
     ),
     ...(options.extraLocks ? { extraLocks: options.extraLocks } : {}),

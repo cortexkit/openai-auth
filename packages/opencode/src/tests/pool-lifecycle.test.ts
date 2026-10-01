@@ -253,20 +253,6 @@ describe('the migration in the background', () => {
     await lifecycle.idle()
     expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
   })
-
-  it('under claustrum custody mode nothing runs again', async () => {
-    await seedLegacyInstall(h)
-    const config = await h.config()
-    writeFileSync(
-      h.paths.configPath,
-      JSON.stringify({ ...config, claustrum: { mode: 'claustrum' } }),
-    )
-    const { lifecycle, timers } = create()
-    lifecycle.start()
-    await lifecycle.idle()
-    expect(timers.delays()).toEqual([])
-    expect((await h.slotValue())?.refresh).toBe('r-main')
-  })
 })
 
 describe('adopting later logins', () => {

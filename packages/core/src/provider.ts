@@ -8,8 +8,8 @@
 
 import type { OAuthQuotaSnapshot } from './accounts.ts'
 import { parseRetryAfter } from './backoff.ts'
-import { assertNoCustodyTombstoneMaterial } from './custody.ts'
 import { createLogger } from './logger.ts'
+import { assertNotTombstoneRefresh } from './tombstone.ts'
 import { errorMessage } from './util/error.ts'
 
 const log = createLogger('quota')
@@ -99,7 +99,7 @@ export async function codexRefreshFn(input: {
   expires: number
   expiresIn: number
 }> {
-  assertNoCustodyTombstoneMaterial(input.refreshToken)
+  assertNotTombstoneRefresh(input.refreshToken)
   const response = await input.fetchImpl(`${CODEX_ISSUER}/oauth/token`, {
     method: 'POST',
     signal: AbortSignal.timeout(15_000),

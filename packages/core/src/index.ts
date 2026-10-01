@@ -9,8 +9,6 @@
 export {
   type AccountRules,
   type CacheKeepManager,
-  type ClaustrumSectionDeps,
-  claustrumSection,
   createOpenAiMenu,
   FLOOR_LABELS,
   killswitchInFloors,
@@ -36,6 +34,8 @@ export {
   scrubKnobs,
   sessionSection,
   settingsMutateAccounts,
+  type VaultSectionDeps,
+  vaultSection,
   withAccountRules,
   withSettingsMigration,
   writeSettings,

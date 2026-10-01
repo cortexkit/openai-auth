@@ -34,7 +34,9 @@ Restart Pi after installing, then authenticate through Pi's normal login flow:
 
 ## Commands
 
-The extension registers one command in Pi, `openai`, which opens a menu: Accounts (add a fallback account via OAuth, disable, enable, move or remove one), Quota (check now), Routing (`ordered`, `main-first`, `fallback-first`, `sticky-balanced`, and the roster order), Limits (the killswitch and per-account floors), Pi login (the quota of the account you signed in to Pi with, routed as `main`) and This session (clear the session's pin).
+The extension registers one command in Pi, `openai`, which opens a menu: Accounts (add a fallback account via OAuth, disable, enable, move or remove one), Quota (check now), Routing (`ordered`, `main-first`, `fallback-first`, `sticky-balanced`, and the roster order), Limits (the killswitch and per-account floors), Pi login (the quota of the account you signed in to Pi with, routed as `main`), This session (clear the session's pin) and Vault.
+
+The Vault section connects Pi to a [Claustrum](https://github.com/cortexkit/claustrum) vault: Connect proposes the enrollment `openai-auth-pi` and shows the `ck auth enroll approve --request-id <id>` and `ck auth grant --principal enrolled:openai-auth-pi --selector-kind category --selector openai-native --operation read` commands to run; Pi tells you when the approval lands. The OpenAI accounts the vault then serves Pi are routed beside your own (an account you also hold here is served by the vault only), each request fetching its token from the vault. Disconnect forgets Pi's token; each vault account can be disabled or enabled on Pi alone.
 
 ## How requests are routed
 

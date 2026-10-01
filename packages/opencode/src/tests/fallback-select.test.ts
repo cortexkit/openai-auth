@@ -23,7 +23,6 @@ import {
   saveAccounts,
 } from '@cortexkit/openai-auth-core/internal'
 import { getAccountPaths } from '../core/account-paths'
-import { localCustody } from './custody-fixtures.ts'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
 
 // ---------------------------------------------------------------------------
@@ -83,7 +82,6 @@ describe('fallback selection', () => {
 
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(),
-      custody: localCustody,
       now: () => Date.now(),
       fetchImpl: fetch,
     })
@@ -100,7 +98,6 @@ describe('fallback selection', () => {
 
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(),
-      custody: localCustody,
       now: () => Date.now(),
       fetchImpl: fetch,
     })
@@ -398,7 +395,6 @@ describe('fallback selection', () => {
 
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(),
-      custody: localCustody,
       now: () => Date.now(),
       fetchImpl: fetch,
     })
@@ -431,7 +427,6 @@ describe('fallback selection', () => {
 
       const manager = new FallbackAccountManager({
         paths: getAccountPaths(),
-        custody: localCustody,
         now: () => now,
         fetchImpl: fetch,
         refreshFn: refreshFn as AccountManagerOptions['refreshFn'],
@@ -467,7 +462,6 @@ describe('fallback selection', () => {
 
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(),
-      custody: localCustody,
       now: () => now,
       fetchImpl: fetch,
       refreshFn: refreshFn as AccountManagerOptions['refreshFn'],
@@ -510,7 +504,6 @@ describe('fallback selection', () => {
 
       const manager = new FallbackAccountManager({
         paths: getAccountPaths(),
-        custody: localCustody,
         now: () => now,
         fetchImpl: fetch,
         refreshFn: refreshFn as AccountManagerOptions['refreshFn'],
@@ -547,7 +540,6 @@ describe('fallback selection', () => {
 
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(),
-      custody: localCustody,
       now: () => Date.now(),
       fetchImpl: fetch,
       fetchQuotaFn: fetchQuotaFn as AccountManagerOptions['fetchQuotaFn'],
@@ -566,7 +558,6 @@ describe('fallback selection', () => {
 
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(),
-      custody: localCustody,
       now: () => Date.now(),
       fetchImpl: fetch,
       // NO fetchQuotaFn injected
@@ -583,7 +574,6 @@ describe('fallback selection', () => {
 
     const manager = new FallbackAccountManager({
       paths: getAccountPaths(),
-      custody: localCustody,
       now: () => Date.now(),
       fetchImpl: fetch,
       // NO fetchQuotaFn injected
@@ -611,7 +601,6 @@ describe('fallback selection', () => {
 
       const manager = new FallbackAccountManager({
         paths: getAccountPaths(),
-        custody: localCustody,
         now: () => Date.now(),
         fetchImpl: fetch,
       })

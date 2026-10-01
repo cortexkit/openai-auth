@@ -75,7 +75,7 @@ How it differs from OpenCode 1:
 - **Quota** from the `x-codex-*` response headers and `codex.rate_limits` frames is recorded on the account that served.
 - **Models**: the same allow and deny lists and context caps as on OpenCode 1.
 
-Not on OpenCode 2 yet: the `/openai` menu and the sidebar (account management works from OpenCode 1, or `opencode auth login` there), cache keep-warm, request dumps, reset credits, Claustrum custody (an install that keeps its credentials in the Claustrum vault does not move to the pool, so OpenCode 2 refuses its requests), cost zeroing, and the Codex request shaping OpenCode 1 does: the Codex client identity (`version`, `originator: codex_exec`, its user agent), turn-metadata headers, Responses Lite, and the mid-conversation reasoning-effort update for the gpt-6 family. OpenCode 2's driver sends its own identity (`originator: opencode`, `session-id`, `x-codex-beta-features: remote_compaction_v2`, `prompt_cache_key` set to the session). While the plugin is loaded, provider `openai` is served from the pool only: an OpenAI API key does not work through it.
+Not on OpenCode 2 yet: the `/openai` menu and the sidebar (account management works from OpenCode 1, or `opencode auth login` there), cache keep-warm, request dumps, reset credits, the Claustrum vault's accounts (OpenCode 2 routes the account pool's own rows only; vault accounts serve on OpenCode 1 and Pi), cost zeroing, and the Codex request shaping OpenCode 1 does: the Codex client identity (`version`, `originator: codex_exec`, its user agent), turn-metadata headers, Responses Lite, and the mid-conversation reasoning-effort update for the gpt-6 family. OpenCode 2's driver sends its own identity (`originator: opencode`, `session-id`, `x-codex-beta-features: remote_compaction_v2`, `prompt_cache_key` set to the session). While the plugin is loaded, provider `openai` is served from the pool only: an OpenAI API key does not work through it.
 
 ## Multiple accounts
 
@@ -173,7 +173,7 @@ One command, `/openai`, opens one menu in the TUI. Its sections, in order:
 | Diagnostics | Request dumps and the log level. |
 | Reset credits | Preview an account, spend one reset credit after explicit confirmation, or retry the last redemption. |
 | This session | The session's sticky pin, and clearing it. |
-| Claustrum | Enter Claustrum mode, or return to local mode. |
+| Vault | Whether this host is connected to the Claustrum vault, the OpenAI accounts the vault serves it, and the last error. **Connect** asks the vault to enroll this host; **Disconnect** forgets its token. Each vault account can be disabled (it stays listed and is never sent from this host) or enabled again. |
 
 Settings the menu changes are saved through the account pool's store, under the names `routing.mode`, `killswitch.{enabled,accounts}`, `logging.level`, `cacheKeep.*` and `dump.enabled`. The menu needs the account pool: until every OpenCode process on the machine runs a version that understands it and the accounts have moved, `/openai` shows only that notice and the processes still holding the move back.
 
@@ -190,10 +190,28 @@ Remove account            remove one account (not main)
 Enable or disable account
 Check quotas              poll every account's quota now
 Auth doctor               report problems with the stored credentials, and offer repairs
+Connect to the Claustrum vault   serve OpenAI accounts held in the vault
 Delete all accounts       remove every account except main
 ```
 
 This is the path for headless machines, where `/openai` is out of reach. The first login on a new machine goes straight to sign-in as usual. Before the accounts have moved to the account pool, the menu shows only that notice and the doctor.
+
+### The Claustrum vault
+
+The OpenAI accounts held in a [Claustrum](https://github.com/cortexkit/claustrum) vault can serve beside your own accounts, once the accounts have moved to the account pool. Each host enrolls under its own name, `openai-auth-opencode` for OpenCode and `openai-auth-pi` for Pi, so either can be revoked alone. Connect (in `opencode auth login`, or the Vault section of `/openai`) proposes the enrollment and tells you what to run:
+
+```text
+Enrollment request <id> for openai-auth-opencode is waiting for approval. Approve it with:
+  ck auth enroll approve --request-id <id>
+and let it read your OpenAI accounts with:
+  ck auth grant --principal enrolled:openai-auth-opencode --selector-kind category --selector openai-native --operation read
+```
+
+The token the vault then issues is kept owner-only in `openai-auth-vault/` next to the account state file. The vault accounts route through the same routing modes and limits as your own; each request fetches its token from the vault, and a token the provider rejects is reported back to the vault. An account you also signed in to here is served by the vault only (one account, one owner). While the vault serves accounts, a login written into OpenCode's own `openai` slot is refused rather than served beside them: remove it, or disconnect.
+
+Static OpenAI API keys held in the vault (`apikey:openai`) are not used: they are never listed, read or routed. Every request this plugin sends goes to the ChatGPT Codex endpoint, which takes ChatGPT logins, not platform API keys, so only the vault's OpenAI logins serve.
+
+An install that used the vault custody of earlier versions may still hold its tombstones (in accounts, or in OpenCode's slot) and the `claustrum.mode` setting. They are never sent; the auth doctor lists them, with the remedy: connect the vault, or sign in to the account again.
 
 One quirk worth knowing: the menu prints `Failed to authorize` when it returns, even when the action succeeded. The menu writes its own changes and deliberately reports nothing back as a sign-in, because a fallback account must not be filed as the main credential. Check the result with `/openai`.
 

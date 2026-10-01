@@ -1,5 +1,5 @@
 // In-process rows for the account-pool migration and host-slot adoption:
-// the placeholder, custody mode, older builds running against the same files
+// the placeholder, the Claustrum vault, older builds running against the same files
 // (through openai-auth's real legacy functions), adoption of later logins,
 // the slot fence and its declared race, and refreshing a pool row while
 // older builds may refresh the same token.
@@ -20,10 +20,11 @@ import {
   refreshBackoffActive,
   saveAccountState,
   saveAccounts,
-  writeClaustrumModeAndTransition,
 } from '@cortexkit/openai-auth-core/internal'
-import { classifyMainAuthSlot } from '../core/custody-host-slot.ts'
-import { MAIN_REFRESH_LOCK_NAME } from '../core/custody-transition.ts'
+import {
+  classifyMainAuthSlot,
+  MAIN_REFRESH_LOCK_NAME,
+} from '../core/host-slot.ts'
 import {
   adoptHostSlotLogin,
   type HostSlotAdapter,
@@ -87,7 +88,7 @@ async function migrated() {
 }
 
 describe('the slot placeholder', () => {
-  it('only an exact match counts as the placeholder, and it is not the custody tombstone', () => {
+  it('only an exact match counts as the placeholder, and it is not the tombstone of the removed vault custody', () => {
     expect(isPoolPlaceholder({ ...POOL_PLACEHOLDER })).toBe(true)
     expect(POOL_PLACEHOLDER.refresh.startsWith('claustrum-tombstone:')).toBe(
       false,
@@ -229,31 +230,39 @@ describe('migration', () => {
   })
 })
 
-describe('claustrum custody mode', () => {
-  it('writes nothing and logs the deferral once; after a switch to local mode it migrates', async () => {
+describe('the Claustrum vault', () => {
+  it('a config still naming the custody mode of older versions migrates like any other', async () => {
     await seedLegacyInstall(h)
-    await writeClaustrumModeAndTransition(h.paths, 'claustrum')
-    const before = await h.bytes()
-    const info: string[] = []
-    const log = {
-      info: (message: string) => info.push(message),
-      warn: () => {},
-    }
-    expect(await migrateToPool(h.deps({ log }))).toEqual({
-      status: 'deferred-claustrum',
-    })
-    expect(await adoptHostSlotLogin(h.deps({ log }))).toEqual({
-      status: 'deferred-claustrum',
-    })
-    expect(await h.bytes()).toEqual(before)
-    expect(info).toHaveLength(1)
-
-    await writeClaustrumModeAndTransition(h.paths, 'local')
-    expect(await migrateToPool(h.deps({ log }))).toMatchObject({
+    const config = await h.config()
+    writeFileSync(
+      h.paths.configPath,
+      JSON.stringify({ ...config, claustrum: { mode: 'claustrum' } }),
+    )
+    expect(await migrateToPool(h.deps())).toMatchObject({
       status: 'completed',
       rowId: 'main',
     })
     expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main'])
+  })
+
+  it('while the vault serves this host, a login in the slot is not adopted and nothing is written', async () => {
+    await migrated()
+    await h.setSlot(login('acct-new', 'r-new'))
+    const before = await h.bytes()
+    const warned: string[] = []
+    const log = {
+      info: () => {},
+      warn: (message: string) => warned.push(message),
+    }
+    expect(
+      await adoptHostSlotLogin({ ...h.deps({ log }), vaultServes: () => true }),
+    ).toEqual({ status: 'vault-owns-accounts' })
+    expect(await h.bytes()).toEqual(before)
+    expect(warned).toHaveLength(1)
+    // Without the vault the same login is adopted.
+    expect(await adoptHostSlotLogin(h.deps({ log }))).toMatchObject({
+      status: 'completed',
+    })
   })
 })
 

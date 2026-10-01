@@ -35,13 +35,13 @@ export const FLOOR_AUTH_FILE = join(FLOOR_DIR, 'openai-auth.json')
 export const FLOOR_STATE_FILE = join(FLOOR_DIR, 'openai-auth-state.json')
 export const FLOOR_LOG_FILE = join(FLOOR_DIR, 'openai-auth.log')
 export const FLOOR_MODELS_CACHE = join(FLOOR_DIR, 'models.json')
-// Custody manifest floor: resolved under FLOOR_DIR so even an in-flight read
-// that outlives a test's afterEach (background timers, deferred cache lookups)
-// points at a temp path, never at the operator's live default.
-// The lock sidecar is exported because the manifest writer owns it, but tests
-// only need the floor path to restore the env var cleanly.
-export const FLOOR_CLAUSTRUM_HANDLES = join(FLOOR_DIR, 'opencode-handles.json')
-export const FLOOR_CLAUSTRUM_HANDLES_LOCK = `${FLOOR_CLAUSTRUM_HANDLES}.lock`
+// The Claustrum vault's connection file, floored so no test reaches a vault
+// running on the developer's machine: nothing exists here, so a connection
+// fails at once unless a test points the plugin at its mock daemon.
+export const FLOOR_CLAUSTRUM_CONNECTION = join(
+  FLOOR_DIR,
+  'claustrum-connection.json',
+)
 
 // Set the floor values only if the env is not already set (a parent process
 // or CI may have pre-configured them intentionally).
@@ -60,8 +60,8 @@ if (!process.env.OPENCODE_OPENAI_AUTH_LOG_FILE) {
 if (!process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE) {
   process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE = FLOOR_MODELS_CACHE
 }
-if (!process.env.CLAUSTRUM_OPENCODE_HANDLES) {
-  process.env.CLAUSTRUM_OPENCODE_HANDLES = FLOOR_CLAUSTRUM_HANDLES
+if (!process.env.CLAUSTRUM_SUBC_CONNECTION) {
+  process.env.CLAUSTRUM_SUBC_CONNECTION = FLOOR_CLAUSTRUM_CONNECTION
 }
 
 // Directory roots. The leaf files above are not enough on their own: a test
@@ -106,7 +106,7 @@ export const FLOOR_ENV: Readonly<Record<string, string>> = Object.freeze({
   OPENCODE_OPENAI_AUTH_MODELS_CACHE: envValue(
     'OPENCODE_OPENAI_AUTH_MODELS_CACHE',
   ),
-  CLAUSTRUM_OPENCODE_HANDLES: envValue('CLAUSTRUM_OPENCODE_HANDLES'),
+  CLAUSTRUM_SUBC_CONNECTION: envValue('CLAUSTRUM_SUBC_CONNECTION'),
   ...FLOOR_ROOTS,
 })
 
@@ -271,11 +271,7 @@ assertFloor(
   'OPENCODE_OPENAI_AUTH_MODELS_CACHE',
   envPath('OPENCODE_OPENAI_AUTH_MODELS_CACHE'),
 )
-assertFloor(
-  'CLAUSTRUM_OPENCODE_HANDLES',
-  envPath('CLAUSTRUM_OPENCODE_HANDLES'),
-  FLOOR_CLAUSTRUM_HANDLES_LOCK,
-)
+assertFloor('CLAUSTRUM_SUBC_CONNECTION', envPath('CLAUSTRUM_SUBC_CONNECTION'))
 for (const name of Object.keys(FLOOR_ROOTS)) {
   assertFloor(name, envPath(name))
 }

@@ -373,20 +373,7 @@ describe('later logins on a migrated install', () => {
       expires_in: number
     }>()
     const { methods } = await migratedPlugin({
-      custody: {
-        transport: {
-          getCredential: async () => {
-            throw new Error('not used')
-          },
-          statusCredential: async () => ({
-            ready: false,
-            lastErrorCode: null,
-            leaseHeld: false,
-            recordVersion: 0,
-          }),
-          reportAuthFailure: async () => {},
-          close: () => {},
-        },
+      login: {
         authorize: {
           browser: async () => ({ url: 'about:blank', tokens: tokens.promise }),
         },

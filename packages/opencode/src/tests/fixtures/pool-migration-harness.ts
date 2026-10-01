@@ -378,9 +378,6 @@ export async function refreshAsOlderBuild(
     } else {
       const manager = new FallbackAccountManager({
         paths: copy.paths,
-        custody: {
-          readManifest: async () => ({ ok: false, reason: 'absent' }),
-        },
         now,
         refreshFn: async ({ refreshToken }) => refresh(refreshToken),
       })
@@ -389,13 +386,8 @@ export async function refreshAsOlderBuild(
         const served = await resolvePoolMainAccess({
           storage: await loadAccounts(copy.paths),
           now,
-          isRefreshInert: async () => false,
           refreshAccount: (account, storage) =>
             manager.refreshAccount(account, storage, { asPoolMain: true }),
-          resolveAccess: async (account) => ({
-            token: account.access ?? '',
-            provenance: 'local' as const,
-          }),
         })
         if (served) mainServedFrom = 'row main'
       } else {
@@ -416,7 +408,6 @@ export async function refreshAsOlderBuild(
 export async function legacyUsableFallbackIds(h: Harness): Promise<string[]> {
   const manager = new FallbackAccountManager({
     paths: h.paths,
-    custody: { readManifest: async () => ({ ok: false, reason: 'absent' }) },
     refreshFn: async () => {
       throw new Error('no refresh expected')
     },

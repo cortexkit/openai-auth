@@ -38,6 +38,7 @@
     "prepublishOnly": "bun run build"
   },
   "devDependencies": {
+    "@cortexkit/claustrum-client": "0.5.0",
     "@cortexkit/common-auth": "0.2.9",
     "@cortexkit/openai-auth-core": "workspace:*"
   },

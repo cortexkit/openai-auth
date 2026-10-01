@@ -4,6 +4,7 @@ import {
   type DoctorCheck,
   doctorAction,
   type LoginAccount,
+  type MenuAction,
   type MenuLogin,
   type MenuOutcome,
   type MenuTerminal,
@@ -24,15 +25,19 @@ import {
   beginAccountLogin,
   beginDeviceAuth,
   buildAuthorizeUrl,
-  claustrumMode,
   completeDeviceAuth,
   extractAccountId,
   flowCleanup,
   generatePKCE,
   loadAccounts,
   mutateAccounts,
+  type OpenAiVault,
   POOL_MAIN_ROW_ID,
   startOAuthServer,
+  type VaultWaitOptions,
+  vaultApprovalInstructions,
+  vaultConnectOutcome,
+  vaultEnrollmentLine,
   waitForOAuthCallback,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
@@ -76,6 +81,8 @@ export interface AuthMethodDependencies {
   migrationBlockers(): Promise<readonly MigrationBlocker[]>
   /** The terminal the menu draws on; the process's own by default. */
   terminal?: MenuTerminal
+  /** How Connect waits for the operator's approval (tests shorten it). */
+  vaultWait?: VaultWaitOptions
 }
 
 export interface CreateAuthMethodsOptions {
@@ -93,6 +100,14 @@ export interface CreateAuthMethodsOptions {
    * failure never fails the repair.
    */
   onMainSlotWritten?: () => Promise<void>
+  /**
+   * This host's connection to the Claustrum vault. With it, the menu of a
+   * migrated install offers to connect (enroll) this host.
+   */
+  vault?: Pick<
+    OpenAiVault,
+    'host' | 'name' | 'status' | 'waitForApproval' | 'routes' | 'snapshot'
+  >
 }
 
 const MENU_TITLE = 'OpenAI accounts'
@@ -164,6 +179,7 @@ export function createAuthMethods({
   packageVersion = PackageVersion,
   dependencies,
   onMainSlotWritten,
+  vault,
 }: CreateAuthMethodsOptions): AuthMethod[] {
   const deps: AuthMethodDependencies = {
     authorizeBrowser: dependencies?.authorizeBrowser ?? authorizeBrowser,
@@ -191,6 +207,7 @@ export function createAuthMethods({
             }))
       }),
     ...(dependencies?.terminal ? { terminal: dependencies.terminal } : {}),
+    ...(dependencies?.vaultWait ? { vaultWait: dependencies.vaultWait } : {}),
   }
 
   const readAuth = async (): Promise<AuthDetails> =>
@@ -321,11 +338,56 @@ export function createAuthMethods({
     extraLocks: poolSettingsLocks(paths),
     pollQuota,
     doctor: doctorChecks(true),
-    custody: async () =>
-      claustrumMode(await deps.loadAccounts(paths)) === 'claustrum',
     status: async () => {
       const storage = await deps.loadAccounts(paths)
-      return [`Routing: ${storage?.routing?.mode ?? 'main-first'}`]
+      return [
+        `Routing: ${storage?.routing?.mode ?? 'main-first'}`,
+        ...(vault
+          ? [
+              vaultEnrollmentLine(
+                vault.host,
+                vault.name,
+                (await vault.status()).enrollment,
+              ),
+            ]
+          : []),
+      ]
+    },
+    ...(vault ? { extraActions: [connectVaultAction(vault)] } : {}),
+  })
+
+  /**
+   * Enrolls this host with the Claustrum vault: proposes it, tells the
+   * operator the `ck` commands that approve it, and waits for the approval.
+   * Interrupting the wait loses nothing: the request stays on disk, and
+   * Connect resumes it.
+   */
+  const connectVaultAction = (
+    target: NonNullable<CreateAuthMethodsOptions['vault']>,
+  ): MenuAction => ({
+    id: 'vault-connect',
+    label: 'Connect to the Claustrum vault',
+    hint: 'serve OpenAI accounts held in the vault',
+    run: async (context) => {
+      context.print(`Asking the Claustrum vault to enroll ${target.name}…`)
+      let shown: string | undefined
+      const status = await target.waitForApproval({
+        ...deps.vaultWait,
+        onPending: (pending) => {
+          const key =
+            pending.state === 'pending'
+              ? (pending.requestId ?? pending.retryCode ?? '')
+              : pending.state
+          if (key === shown) return
+          shown = key
+          for (const line of vaultApprovalInstructions(target.name, pending))
+            context.print(line)
+          context.print(
+            'Waiting for the approval… (stop with Ctrl-C; Connect picks the request up again)',
+          )
+        },
+      })
+      context.print(vaultConnectOutcome(target, status).text)
     },
   })
 

@@ -19,7 +19,7 @@ import type {
   OAuthQuotaSnapshot,
 } from './accounts.ts'
 import { buildQuotaOperationError, quotaBackoffActive } from './backoff.ts'
-import { assertNotCustodyTombstone } from './custody.ts'
+import { isTombstoned } from './tombstone.ts'
 import { PRIMARY, type ProviderQuotaFn, SECONDARY } from './provider.ts'
 
 export type { ProviderQuotaFn }
@@ -504,8 +504,7 @@ export class QuotaManager {
 
     for (const account of accounts) {
       if (account.enabled === false) continue
-      assertNotCustodyTombstone(account, 'openai')
-      if (!account.access) continue
+      if (isTombstoned(account) || !account.access) continue
 
       const cached = this.getFallback(account.id, account.access)
       if (cached && now < cached.refreshAfter) continue

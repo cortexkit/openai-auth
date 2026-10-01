@@ -11,7 +11,6 @@
 
 import type {
   AccountRules,
-  ClaustrumSectionDeps,
   MenuLoginDeps,
   MenuLoginFlow,
   MenuMigrationState,
@@ -27,6 +26,7 @@ import type {
   ResetTargetIdentity as RootResetTargetIdentity,
   RpcNotification as RootRpcNotification,
   SessionSectionDeps,
+  VaultSectionDeps,
 } from '../index.ts'
 import type {
   AccountBase,
@@ -58,6 +58,7 @@ import type {
   NotifyPayload,
   OAuthAccount,
   OAuthQuotaSnapshot,
+  OpenAiVaultOptions,
   OpenDialogPayload,
   PendingOAuth,
   PkceCodes,
@@ -96,6 +97,11 @@ import type {
   SidebarQuotaReading,
   SidebarQuotaSnapshot,
   TokenResponse,
+  VaultHost,
+  VaultPaths,
+  VaultRoute,
+  VaultStatus,
+  VaultWaitOptions,
 } from '../internal.ts'
 
 type RootSurface = {
@@ -103,7 +109,6 @@ type RootSurface = {
   applyRequest: RootApplyRequest
   applyResult: RootApplyResult
   cacheKeepManager: RootCacheKeepManager
-  claustrumSectionDeps: ClaustrumSectionDeps
   menuLoginDeps: MenuLoginDeps
   menuLoginFlow: MenuLoginFlow
   menuMigrationState: MenuMigrationState
@@ -116,6 +121,7 @@ type RootSurface = {
   resetTargetIdentity: RootResetTargetIdentity
   rpcNotification: RootRpcNotification
   sessionSectionDeps: SessionSectionDeps
+  vaultSectionDeps: VaultSectionDeps
 }
 
 type InternalSurface = {
@@ -148,6 +154,7 @@ type InternalSurface = {
   level: Level
   oauthAccount: OAuthAccount
   oauthQuotaSnapshot: OAuthQuotaSnapshot
+  openAiVaultOptions: OpenAiVaultOptions
   openDialogPayload: OpenDialogPayload
   pendingOAuth: PendingOAuth
   pkceCodes: PkceCodes
@@ -186,6 +193,11 @@ type InternalSurface = {
   sidebarQuotaReading: SidebarQuotaReading
   sidebarQuotaSnapshot: SidebarQuotaSnapshot
   tokenResponse: TokenResponse
+  vaultHost: VaultHost
+  vaultPaths: VaultPaths
+  vaultRoute: VaultRoute
+  vaultStatus: VaultStatus
+  vaultWaitOptions: VaultWaitOptions
 }
 
 // Referencing both aliases is what makes an unused-name error impossible to

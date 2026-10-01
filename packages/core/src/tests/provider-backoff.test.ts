@@ -11,6 +11,7 @@ import {
   type ProviderHttpError,
   whamUsageFn,
 } from '../provider.ts'
+import { TombstoneRefreshError } from '../tombstone.ts'
 
 function fetchUntilAborted() {
   const fetchMock = mock(
@@ -84,7 +85,7 @@ describe('codexRefreshFn token validation', () => {
     expect(result.expires).toBe(mockNow() + 3600 * 1000)
   })
 
-  it('refuses any custody tombstone prefix before touching transport', async () => {
+  it('refuses any tombstone left by the removed vault custody before touching transport', async () => {
     const fetchSpy = mock(async () => new Response('{}', { status: 200 }))
 
     await expect(
@@ -93,11 +94,11 @@ describe('codexRefreshFn token validation', () => {
         fetchImpl: fetchSpy as unknown as typeof fetch,
         now: mockNow,
       }),
-    ).rejects.toThrow('custody tombstone')
+    ).rejects.toThrow(TombstoneRefreshError)
     expect(fetchSpy).not.toHaveBeenCalled()
   })
 
-  it('places custody refusal before every refresh transport operation', () => {
+  it('places the tombstone refusal before every refresh transport operation', () => {
     const source = readFileSync(
       fileURLToPath(new URL('../provider.ts', import.meta.url)),
       'utf8',
@@ -105,9 +106,7 @@ describe('codexRefreshFn token validation', () => {
     const start = source.indexOf('export async function codexRefreshFn')
     const end = source.indexOf('export async function whamUsageFn')
     const fn = source.slice(start, end)
-    const refusal = fn.indexOf(
-      'assertNoCustodyTombstoneMaterial(input.refreshToken)',
-    )
+    const refusal = fn.indexOf('assertNotTombstoneRefresh(input.refreshToken)')
     const firstTransport = Math.min(
       ...['new URL', 'URLSearchParams', 'await', 'input.fetchImpl']
         .map((token) => fn.indexOf(token))

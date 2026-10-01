@@ -9,10 +9,8 @@
 
 import {
   type AccountStorage,
-  CUSTODY_EXCLUDED,
-  CUSTODY_REFUSE,
-  type FallbackAccessResolution,
   findPoolMainRow,
+  isTombstoned,
   type OAuthAccount,
   refreshBackoffActive,
 } from '@cortexkit/openai-auth-core/internal'
@@ -40,27 +38,16 @@ export interface PoolMainAccess {
   /** The row as it stands after any refresh. */
   account: OAuthAccount
   token: string
-  provenance: FallbackAccessResolution['provenance']
 }
 
 export interface PoolMainAccessDeps {
   storage: AccountStorage | null | undefined
   now: () => number
-  isRefreshInert: (
-    account: OAuthAccount,
-    storage: AccountStorage,
-  ) => Promise<boolean>
   /** Refresh the row through the per-row refresh path, as the main account. */
   refreshAccount: (
     account: OAuthAccount,
     storage: AccountStorage,
   ) => Promise<OAuthAccount>
-  resolveAccess: (
-    account: OAuthAccount,
-    storage: AccountStorage,
-  ) => Promise<
-    FallbackAccessResolution | typeof CUSTODY_REFUSE | typeof CUSTODY_EXCLUDED
-  >
   warn?: (message: string, meta: Record<string, unknown>) => void
 }
 
@@ -70,9 +57,9 @@ export interface PoolMainAccessDeps {
  * treats main as unavailable and lets the fallbacks serve).
  *
  * The row is refreshed on the same terms a fallback is: when its token is
- * inside the refresh-before-expiry window, unless a refresh backoff is armed
- * or custody owns the credential. A failed refresh still serves a token that
- * has not expired.
+ * inside the refresh-before-expiry window, unless a refresh backoff is armed.
+ * A failed refresh still serves a token that has not expired. A row holding
+ * a tombstone left by the removed vault custody has no token at all.
  *
  * The refresh goes through `FallbackAccountManager.refreshAccount` (the
  * legacy per-row path), not through `refreshPoolRow` in `pool-migration.ts`,
@@ -99,7 +86,7 @@ export async function resolvePoolMainAccess(
 ): Promise<PoolMainAccess | undefined> {
   const storage = deps.storage
   const row = findPoolMainRow(storage)
-  if (!storage || !row) return undefined
+  if (!storage || !row || isTombstoned(row)) return undefined
 
   let account = row
   const now = deps.now()
@@ -111,8 +98,7 @@ export async function resolvePoolMainAccess(
     account.expires - now <= refreshWindowMs
   if (
     due &&
-    !refreshBackoffActive(account.lastRefreshError, account.refresh, now) &&
-    !(await deps.isRefreshInert(account, storage))
+    !refreshBackoffActive(account.lastRefreshError, account.refresh, now)
   ) {
     try {
       account = await deps.refreshAccount(account, storage)
@@ -123,14 +109,9 @@ export async function resolvePoolMainAccess(
     }
   }
 
-  const access = await deps.resolveAccess(account, storage)
-  if (access === CUSTODY_REFUSE || access === CUSTODY_EXCLUDED) return undefined
-  if (!access.token.trim()) return undefined
-  if (
-    access.provenance === 'local' &&
-    (typeof account.expires !== 'number' || account.expires <= deps.now())
-  ) {
+  const token = account.access?.trim()
+  if (!token) return undefined
+  if (typeof account.expires !== 'number' || account.expires <= deps.now())
     return undefined
-  }
-  return { account, token: access.token, provenance: access.provenance }
+  return { account, token }
 }
