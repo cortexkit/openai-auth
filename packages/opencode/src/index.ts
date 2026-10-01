@@ -181,7 +181,7 @@ import { uuidV7 } from './util/uuid-v7'
 import { PackageVersion } from './version'
 import { OpenAIWebSocketPool, orderCodexBody } from './ws-pool'
 
-const ALLOWED_MODELS = new Set([
+export const ALLOWED_MODELS = new Set([
   'gpt-5.5',
   'gpt-5.3-codex-spark',
   'gpt-5.4',
@@ -197,7 +197,85 @@ const ALLOWED_MODELS = new Set([
 // (gpt-6-astra, gpt-6-sol, gpt-6-luna), so any -fast/-pro synthetics inheriting
 // api.id "gpt-6" drop with it. gpt-6.1 is the same again: only gpt-6.1-sol is
 // served, and the bare id (like gpt-6.1-luna and gpt-6.1-astra) answers 400.
-const DISALLOWED_MODELS = new Set(['gpt-5.6', 'gpt-6', 'gpt-6.1'])
+export const DISALLOWED_MODELS = new Set(['gpt-5.6', 'gpt-6', 'gpt-6.1'])
+
+/**
+ * Whether a model (by its API id) is offered on a ChatGPT login: the allow
+ * list, else not the deny list and a GPT version above 5.4. The caller drops
+ * `pro` reasoning variants itself. Shared by the OpenCode 1 models hook and
+ * the OpenCode 2 model transform.
+ */
+export function codexOAuthModelListed(apiId: string): boolean {
+  if (ALLOWED_MODELS.has(apiId)) return true
+  if (DISALLOWED_MODELS.has(apiId)) return false
+  // The minor is optional: a major-only id like gpt-6-astra carries no
+  // decimal, and requiring one silently dropped it from the catalogue even
+  // though the backend serves it.
+  const match = apiId.match(/^gpt-(\d+(?:\.\d+)?)/)
+  const version = match?.[1]
+  return version ? parseFloat(version) > 5.4 : false
+}
+
+/**
+ * The context window a ChatGPT login gets for a model (by its id), or
+ * undefined to keep the model's own. Shared by the OpenCode 1 models hook and
+ * the OpenCode 2 model transform.
+ */
+export function codexOAuthModelLimit(
+  modelId: string,
+): { context: number; input: number; output: number } | undefined {
+  if (modelId.includes('gpt-5.5'))
+    return { context: 400_000, input: 272_000, output: 128_000 }
+  // gpt-6-astra pays no long-context surcharge on the Codex backend, so it
+  // keeps the full window that backend reports. Per OpenAI's enterprise rate
+  // card, read 2026-09-05 at help.openai.com/en/articles/20001415 — section
+  // "GPT-6 Astra — Codex long-context exception": "GPT-6 Astra usage in Codex
+  // does not incur additional long-context multipliers above 272K input
+  // tokens." The exemption is per-surface: the same model billed through the
+  // platform API does pay it (developers.openai.com/api/docs/models/gpt-6-astra).
+  //
+  // That makes this correct for the DEFAULT endpoint. A `codexApiEndpoint`
+  // override pointed at a relay or a differently-billed surface inherits this
+  // window without inheriting the exemption, which is the operator's to
+  // re-check.
+  //
+  // 872k is the Codex backend's own reported max_context_window, from
+  // GET /backend-api/codex/models?client_version=<v>. The configured window
+  // follows that reported number rather than the hard ceiling probing found
+  // just above it (876,934 input tokens accepted on 2026-09-04), since the
+  // reported number is the one the backend maintains. Input and output draw on
+  // one shared budget, so `input` is that window minus the 128k output
+  // reserve.
+  if (modelId.includes('gpt-6-astra'))
+    return { context: 872_000, input: 744_000, output: 128_000 }
+  // The 5.6 family is NOT exempt — same rate card, same date: above 272k input
+  // tokens it costs 2x input and 1.5x output ON THE WHOLE REQUEST, so `input`
+  // is held under that line at 244k and `context` is that cap plus the 128k
+  // output reserve. This is a cost decision, never a capability one —
+  // gpt-5.6-sol accepted 861,550 input tokens when measured — so do not
+  // "correct" these numbers upward to that ceiling without re-reading the rate
+  // card first.
+  //
+  // gpt-6-sol and gpt-6-luna are NOT exempt either, even though they share
+  // astra's 872k reported window. The rate card, re-read 2026-09-25, names
+  // only GPT-6 Astra in its Codex long-context exception; the surcharge row
+  // applies to everything else. Checking the model family is the wrong test -
+  // it is the rate card's named list.
+  //
+  // gpt-6.1-sol is held here too. Its published pricing, read 2026-09-29 at
+  // developers.openai.com/api/docs/models/gpt-6.1-sol, charges 2x input and
+  // 1.5x output on the full request above 272K input tokens, and nothing names
+  // it in a Codex exception. (The rate card itself could not be fetched that
+  // day; re-check it before raising this.)
+  if (
+    modelId.includes('gpt-5.6') ||
+    modelId.includes('gpt-6-sol') ||
+    modelId.includes('gpt-6-luna') ||
+    modelId.includes('gpt-6.1-sol')
+  )
+    return { context: 372_000, input: 244_000, output: 128_000 }
+  return undefined
+}
 
 /**
  * Surfaced when a request would go to the wire with no credential.
@@ -1598,17 +1676,11 @@ export async function CodexAuthPlugin(
 
         return Object.fromEntries(
           Object.entries(provider.models)
-            .filter(([, model]) => {
-              if (model.options.reasoningMode === 'pro') return false
-              if (ALLOWED_MODELS.has(model.api.id)) return true
-              if (DISALLOWED_MODELS.has(model.api.id)) return false
-              // The minor is optional: a major-only id like gpt-6-astra carries
-              // no decimal, and requiring one silently dropped it from the
-              // catalogue even though the backend serves it.
-              const match = model.api.id.match(/^gpt-(\d+(?:\.\d+)?)/)
-              const version = match?.[1]
-              return version ? parseFloat(version) > 5.4 : false
-            })
+            .filter(
+              ([, model]) =>
+                model.options.reasoningMode !== 'pro' &&
+                codexOAuthModelListed(model.api.id),
+            )
             .map(([modelID, model]) => [
               modelID,
               {
@@ -1618,76 +1690,7 @@ export async function CodexAuthPlugin(
                   : (catalog?.[model.api.id] ??
                     catalog?.[modelID] ??
                     model.cost),
-                limit: model.id.includes('gpt-5.5')
-                  ? {
-                      context: 400_000,
-                      input: 272_000,
-                      output: 128_000,
-                    }
-                  : // gpt-6-astra pays no long-context surcharge on the Codex
-                    // backend, so it keeps the full window that backend reports.
-                    // Per OpenAI's enterprise rate card, read 2026-09-05 at
-                    // help.openai.com/en/articles/20001415 — section "GPT-6 Astra
-                    // — Codex long-context exception": "GPT-6 Astra usage in
-                    // Codex does not incur additional long-context multipliers
-                    // above 272K input tokens." The exemption is per-surface:
-                    // the same model billed through the platform API does pay it
-                    // (developers.openai.com/api/docs/models/gpt-6-astra).
-                    //
-                    // That makes this correct for the DEFAULT endpoint. A
-                    // `codexApiEndpoint` override pointed at a relay or a
-                    // differently-billed surface inherits this window without
-                    // inheriting the exemption, which is the operator's to
-                    // re-check.
-                    //
-                    // 872k is the Codex backend's own reported
-                    // max_context_window, from
-                    // GET /backend-api/codex/models?client_version=<v>. The
-                    // configured window follows that reported number rather than
-                    // the hard ceiling probing found just above it (876,934
-                    // input tokens accepted on 2026-09-04), since the reported
-                    // number is the one the backend maintains. Input and output
-                    // draw on one shared budget, so `input` is that window minus
-                    // the 128k output reserve.
-                    model.id.includes('gpt-6-astra')
-                    ? {
-                        context: 872_000,
-                        input: 744_000,
-                        output: 128_000,
-                      }
-                    : // The 5.6 family is NOT exempt — same rate card, same date:
-                      // above 272k input tokens it costs 2x input and 1.5x
-                      // output ON THE WHOLE REQUEST, so
-                      // `input` is held under that line at 244k and `context` is
-                      // that cap plus the 128k output reserve. This is a cost
-                      // decision, never a capability one — gpt-5.6-sol accepted
-                      // 861,550 input tokens when measured — so do not "correct"
-                      // these numbers upward to that ceiling without re-reading
-                      // the rate card first.
-                      //
-                      // gpt-6-sol and gpt-6-luna are NOT exempt either, even
-                      // though they share astra's 872k reported window. The rate
-                      // card, re-read 2026-09-25, names only GPT-6 Astra in its
-                      // Codex long-context exception; the surcharge row applies
-                      // to everything else. Checking the model family is the
-                      // wrong test - it is the rate card's named list.
-                      //
-                      // gpt-6.1-sol is held here too. Its published pricing,
-                      // read 2026-09-29 at developers.openai.com/api/docs/models/
-                      // gpt-6.1-sol, charges 2x input and 1.5x output on the full
-                      // request above 272K input tokens, and nothing names it in a
-                      // Codex exception. (The rate card itself could not be
-                      // fetched that day; re-check it before raising this.)
-                      model.id.includes('gpt-5.6') ||
-                        model.id.includes('gpt-6-sol') ||
-                        model.id.includes('gpt-6-luna') ||
-                        model.id.includes('gpt-6.1-sol')
-                      ? {
-                          context: 372_000,
-                          input: 244_000,
-                          output: 128_000,
-                        }
-                      : model.limit,
+                limit: codexOAuthModelLimit(model.id) ?? model.limit,
               },
             ]),
         )

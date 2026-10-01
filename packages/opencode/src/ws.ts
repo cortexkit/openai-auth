@@ -1264,7 +1264,7 @@ const SYNTHETIC_COMPLETED_EVENT = {
  * text part, because the host opens a durable part from it. Whether what
  * counted may still be retried is decided by recordEmittedCallFrame.
  */
-function isNonEmittingFrame(type: string): boolean {
+export function isNonEmittingFrame(type: string): boolean {
   return (
     type === 'response.created' ||
     type === 'response.in_progress' ||

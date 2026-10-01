@@ -20,6 +20,10 @@ Restart OpenCode after changing plugin config, then authenticate:
 /login openai
 ```
 
+## OpenCode 2
+
+On OpenCode 2 (`@opencode/cli`, tested on 2.0.21) list the same package under `plugins`; OpenCode 2 loads its `./server` entry. OpenCode 2's own OpenAI driver sends the requests, and the plugin chooses the account from the shared account pool and sets its credential through OpenCode 2's session hooks. Logins (`opencode auth login openai`) go into the pool; OpenCode 2 keeps only a placeholder. The `/openai` menu, the sidebar, keep-warm and OpenCode 1's Codex request shaping are not available there yet. See the [repository README](https://github.com/cortexkit/openai-auth#opencode-2) for the details.
+
 ## Features
 
 - ChatGPT Plus/Pro OAuth login (browser and headless device flows), plus a manual API-key fallback.
