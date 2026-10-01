@@ -618,10 +618,16 @@ export interface ResetCreditsDeps {
 }
 
 /**
+ * The ChatGPT account each account's latest redemption in this process was
+ * bound to, by config path and account key. The retry action replays that
+ * attempt and must stay bound to the same ChatGPT account.
+ */
+const boundRedemptions = new Map<string, string>()
+
+/**
  * Spends one reset credit on `accountKey`. A first attempt fetches a fresh
  * preview and binds the redemption to the ChatGPT account it names; a retry
- * replays the previous attempt's identifiers against the account's current
- * identity.
+ * replays the previous attempt's identifiers, bound to the same account.
  */
 async function spendResetCredit(
   deps: ResetCreditsDeps,
@@ -634,10 +640,20 @@ async function spendResetCredit(
       'invalid_account_key',
       'That account cannot take a reset credit.',
     )
+  const bindingKey = `${deps.configPath}\u0000${accountKey}`
   let expected: string | undefined
   try {
     if (retry) {
-      expected = (await deps.resolveResetTarget(accountKey)).chatgptAccountId
+      // A retry replays the previous attempt's request and credit ids, so it
+      // must go to the ChatGPT account that attempt was checked against, not
+      // to whatever the account signs in with now.
+      expected = boundRedemptions.get(bindingKey)
+      if (!expected)
+        return resetResultPayload(
+          accountKey,
+          'retry_without_binding',
+          'There is no redemption from this process to retry. Spend a reset credit to start one.',
+        )
     } else {
       const preview = await buildResetPreviewRow(accountKey, deps)
       if (!preview.eligible)
@@ -654,6 +670,7 @@ async function spendResetCredit(
         'not_eligible',
         'Cannot reset: stable ChatGPT account identity unavailable.',
       )
+    if (!retry) boundRedemptions.set(bindingKey, expected)
     log.info('reset redemption decision', { accountKey, retry })
     const result = await runResetCreditRedemption(
       {
