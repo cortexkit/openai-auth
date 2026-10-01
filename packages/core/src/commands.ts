@@ -246,8 +246,8 @@ export function withSettingsMigration(store: PoolStore): PoolStore {
     return store.updateSettings(async (settings) => {
       migrateLegacySettings(settings, ids)
       const next = (await mutator(settings)) ?? settings
-      // Any block that existed is marked by now, so an unmarked one was
-      // created by this write (turning the killswitch on, or setting a first
+      // Every block that existed was given `schema: KILLSWITCH_FLOORS_SCHEMA`
+      // above, so one without it was created by this write (turning the killswitch on, or setting a first
       // floor). Every account it does not name gets the default floors, as
       // turning the killswitch on always did, so enabling it protects every
       // account rather than none.
@@ -293,8 +293,9 @@ export interface AccountRules {
  * - remove, enable, disable and replace take `rowLocks(id)`;
  * - an add of a login whose ChatGPT identity (or, failing that, whose id) an
  *   OAuth row already holds replaces that row's credential instead of adding
- *   a disabled duplicate: signing in again refreshes the account. The
- *   account row `main` holds is refused; it is OpenCode's own sign-in.
+ *   a disabled duplicate: signing in again refreshes the account. A login of
+ *   the ChatGPT account in row `main` is refused; it is OpenCode's own
+ *   sign-in.
  *
  * Every other member is the store's own.
  */
@@ -778,8 +779,9 @@ async function spendResetCredit(
     // A redemption saved as in flight (its credit and request ids, under the
     // `reset` key) is what keeps an unknown outcome from becoming a second
     // spend: the coordinator replays exactly those ids (the server dedupes on
-    // the request id) or refuses. So with one saved, or for a retry, nothing
-    // is previewed: the request goes to the account's current identity and
+    // the request id) or, once the pair is older than its five-minute window
+    // and the attempt is a new spend, refuses. So with one saved, or for a
+    // retry, nothing is previewed: the request goes to the account's current identity and
     // the coordinator decides from the saved state, even after a restart.
     const saved = (
       await deps.loadAccounts({

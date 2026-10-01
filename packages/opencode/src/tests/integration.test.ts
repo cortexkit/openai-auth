@@ -2876,9 +2876,9 @@ describe('integration: active fallback routing', () => {
       return
     }
     const on = action === 'on'
-    // Saved as the menu's write would save it, so a later loader run reads
-    // it, and through the locked writer: the loader's own background writes
-    // to the same file may be running.
+    // `cachekeep.enabled` is saved as the menu's write saves it, so a later
+    // loader run reads it, and through the locked writer: the loader's own
+    // background writes to the same file may be running.
     await mutateAccounts(
       (current) => {
         current.cachekeep = { ...(current.cachekeep ?? {}), enabled: on }
