@@ -74,7 +74,7 @@ describe('Pi OpenAI auth extension', () => {
     ])
   })
 
-  it('registers exactly the three supported account commands', () => {
+  it('registers exactly the one /openai command', () => {
     const commandNames: string[] = []
 
     cortexKitPiOpenAIAuth({
@@ -84,11 +84,7 @@ describe('Pi OpenAI auth extension', () => {
       registerProvider() {},
     } as never)
 
-    expect(commandNames.sort()).toEqual([
-      'openai-account',
-      'openai-quota',
-      'openai-routing',
-    ])
+    expect(commandNames).toEqual(['openai'])
   })
 
   it('restores the original WebSocket only after every installation is removed', () => {
