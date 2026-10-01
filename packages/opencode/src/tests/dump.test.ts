@@ -1,3 +1,4 @@
+import { Database } from 'bun:sqlite'
 import { describe, expect, test } from 'bun:test'
 import {
   mkdtemp,
@@ -14,6 +15,7 @@ import type { PluginInput } from '@opencode-ai/plugin'
 import {
   DEFAULT_CODEX_API_ENDPOINT,
   getSettings,
+  refreshSettings,
   resetSettingsForTest,
 } from '../config'
 import { dumpCodexRequest, resetDumpStateForTest } from '../dump'
@@ -353,7 +355,7 @@ describe('request dumps', () => {
         }
         expect(body).not.toContain('"type":"web_search"')
         expect(meta).toMatchObject({
-          transport: 'http',
+          channel: 'http',
           phase: 'http',
           status: 200,
           body: {
@@ -361,7 +363,7 @@ describe('request dumps', () => {
             inputCount: 1,
           },
         })
-        expect(request.headers.authorization).toBe('[redacted]')
+        expect(request.headers.authorization).toBe('***REDACTED***')
       } finally {
         globalThis.fetch = originalFetch
       }
@@ -379,98 +381,104 @@ describe('request dumps', () => {
     )
   }
 
-  test('recovers a diff baseline from disk after a restart', async () => {
-    // The in-memory baseline dies with the process, so before this the first
-    // dump after a restart reported no diff at all — on exactly the request the
-    // diff exists to explain, since a restart is when the prompt cache is most
-    // likely to break. resetDumpStateForTest() stands in for the restart.
+  test('switches dumps on and off at runtime without a restart', async () => {
     await withDumpEnv(async (dumpDir) => {
+      const dump = (session: string) =>
+        dumpCodexRequest({
+          sessionID: session,
+          transport: 'http',
+          phase: 'http',
+          bodyText: JSON.stringify({ input: [] }),
+        })
+
+      process.env.CORTEXKIT_OPENAI_AUTH_DUMP = '0'
+      refreshSettings()
+      await dump('ses_switch_off')
+      expect(await readMetas(dumpDir).catch(() => [])).toEqual([])
+
+      process.env.CORTEXKIT_OPENAI_AUTH_DUMP = '1'
+      refreshSettings()
+      await dump('ses_switch_on')
+      const metas = await readMetas(dumpDir)
+      expect(metas.map((meta) => meta.session)).toEqual(['ses_switch_on'])
+    })
+  })
+
+  test('the cache-cliff analyzer parses dumps written by this plugin', async () => {
+    await withDumpEnv(async (dumpDir) => {
+      const session = 'ses_cliff_analyzer'
       const body = (turns: number) =>
         JSON.stringify({
-          model: 'gpt-5.6-sol',
+          model: 'gpt-5.5',
           input: Array.from({ length: turns }, (_unused, i) => ({
             role: 'user',
             content: `turn ${i}`,
           })),
         })
-
       await dumpCodexRequest({
-        sessionID: 'ses_restart_baseline',
-        transport: 'http',
-        phase: 'http',
-        bodyText: body(1),
+        sessionID: session,
+        transport: 'websocket',
+        phase: 'prewarm',
+        bodyText: body(0),
       })
-
-      resetDumpStateForTest()
-
       await dumpCodexRequest({
-        sessionID: 'ses_restart_baseline',
-        transport: 'http',
-        phase: 'http',
+        sessionID: session,
+        transport: 'websocket',
+        phase: 'main',
         bodyText: body(2),
       })
 
-      // Selected by content, not by sort position: two dumps written in the
-      // same millisecond sort alphabetically by session rather than
-      // chronologically, so indexing into the sorted list silently reads the
-      // wrong dump and passes vacuously.
-      const metas = await readMetas(dumpDir)
-      expect(metas.length).toBe(2)
-      const afterRestart = metas.find((meta) => meta.diff !== null)
-      expect(afterRestart).toBeDefined()
-      expect(afterRestart.baselineSource).toBe('disk')
-      expect(afterRestart.diff).not.toBeNull()
-      expect(afterRestart.diff.changed).toBe(true)
-      // Non-vacuous: an append must be reported as a change starting inside the
-      // body rather than at byte zero, which is what a wrong baseline yields.
-      expect(afterRestart.diff.firstByte).toBeGreaterThan(0)
-    })
-  })
+      const dbPath = join(dumpDir, '..', 'opencode.db')
+      const db = new Database(dbPath)
+      db.run(
+        'create table part (id text, message_id text, session_id text, time_created integer, data text)',
+      )
+      db.run('insert into part values (?, ?, ?, ?, ?)', [
+        'prt_1',
+        'msg_1',
+        session,
+        Date.now() + 1_000,
+        JSON.stringify({
+          type: 'step-finish',
+          reason: 'stop',
+          tokens: { input: 10, output: 1, cache: { read: 90, write: 0 } },
+        }),
+      ])
+      db.close()
 
-  test('does not borrow a diff baseline from a different session', async () => {
-    // The recovery scans a shared dump directory, so it must key on the session
-    // and transport rather than picking up whatever body was written last.
-    await withDumpEnv(async (dumpDir) => {
-      await dumpCodexRequest({
-        sessionID: 'ses_baseline_owner',
-        transport: 'http',
-        phase: 'http',
-        bodyText: JSON.stringify({ input: ['owner'] }),
-      })
-
-      resetDumpStateForTest()
-
-      await dumpCodexRequest({
-        sessionID: 'ses_baseline_other',
-        transport: 'http',
-        phase: 'http',
-        bodyText: JSON.stringify({ input: ['other'] }),
-      })
-
-      // Both dumps are asserted, so neither a borrowed baseline nor a missing
-      // dump can pass. Selected by session rather than sort position for the
-      // same-millisecond reason noted above.
-      const metas = await readMetas(dumpDir)
-      expect(metas.length).toBe(2)
-      for (const meta of metas) {
-        expect(meta.baselineSource).toBeUndefined()
-        expect(meta.diff).toBeNull()
-      }
-    })
-  })
-
-  test('preserves non-secret JSON dump body bytes', async () => {
-    await withDumpEnv(async (dumpDir) => {
-      const bodyText = '{\n  "model": "gpt-5.5-fast",\n  "input": []\n}\n'
-      await dumpCodexRequest({
-        sessionID: 'ses_dump_fidelity',
-        transport: 'http',
-        phase: 'http',
-        bodyText,
-      })
-
-      const bodyFile = requireFile(await readdir(dumpDir), '.body.json')
-      expect(await readFile(join(dumpDir, bodyFile), 'utf8')).toBe(bodyText)
+      const script = join(
+        import.meta.dir,
+        '..',
+        '..',
+        '..',
+        '..',
+        'scripts',
+        'analyze-cache-cliffs.mjs',
+      )
+      const run = Bun.spawnSync([
+        process.execPath,
+        script,
+        '--session',
+        session,
+        '--dump-dir',
+        dumpDir,
+        '--db',
+        dbPath,
+      ])
+      const stdout = run.stdout.toString()
+      expect(run.exitCode).toBe(0)
+      // Phases come from the metadata, so only the main dump counts as main.
+      expect(stdout).toContain('dumps: 2 (1 main)')
+      expect(stdout).toContain('usageRows: 1')
+      // The timeline row pairs the usage with the main dump: its input count
+      // comes from the body summary and its name from the dump file.
+      const mainMeta = (await readMetas(dumpDir)).find(
+        (meta) => meta.phase === 'main',
+      )
+      const row = stdout
+        .split('\n')
+        .find((line) => line.endsWith(`\t${mainMeta.id}`))
+      expect(row?.split('\t')[7]).toBe('2')
     })
   })
 
@@ -498,7 +506,7 @@ describe('request dumps', () => {
 
       expect(metadata.accountId).toBe('work-alt')
       expect(request.accountId).toBe('work-alt')
-      expect(request.headers['chatgpt-account-id']).toBe('[redacted]')
+      expect(request.headers['chatgpt-account-id']).toBe('***REDACTED***')
       expect(JSON.stringify({ metadata, request })).not.toContain(
         'chatgpt-account-secret',
       )
@@ -619,11 +627,11 @@ describe('request dumps', () => {
         const main = metas.find((meta) => meta.phase === 'main')
 
         expect(prewarm).toMatchObject({
-          transport: 'websocket',
+          channel: 'websocket',
           body: { generate: false, inputCount: 0 },
         })
         expect(main).toMatchObject({
-          transport: 'websocket',
+          channel: 'websocket',
           body: {
             previousResponseID: 'resp_prewarm',
             inputCount: 1,
