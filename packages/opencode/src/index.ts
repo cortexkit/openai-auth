@@ -2921,12 +2921,25 @@ export async function CodexAuthPlugin(
             await writeMachineSidebarState(quotaManager, store)
           },
           // On a migrated install every row is polled through the pool
-          // source, the same path its background poll takes.
+          // source, the same path its background poll takes, and every vault
+          // account through the vault.
           refreshAllQuota: async () => {
             if (await poolSource.active()) {
-              const results = await pollPoolRows()
+              const [results, vaultResults] = await Promise.all([
+                pollPoolRows(),
+                vault.pollStale(0),
+              ])
               await writeMachineSidebarState(quotaManager, lastRequestStorage)
-              return results
+              return [
+                ...results,
+                ...vaultResults.map((result) => ({
+                  account: result.id,
+                  ok: result.ok,
+                  ...(result.error !== undefined
+                    ? { error: result.error }
+                    : {}),
+                })),
+              ]
             }
             return refreshAllQuota(buildRefreshAllQuotaDeps())
           },
@@ -4105,6 +4118,9 @@ export async function CodexAuthPlugin(
                 await loadAccounts(getAccountPaths(getConfigPath())),
                 () => acquireBackgroundRefreshLock(getConfigPath()),
               )
+              // Vault accounts nobody sent on for a while: their quota lives
+              // in the vault roster, so the pool poll does not see them.
+              await vault.pollStale(4 * 60_000)
               if (polled.length > 0) {
                 await writeMachineSidebarState(quotaManager, lastRequestStorage)
               }
