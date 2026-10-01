@@ -506,7 +506,7 @@ describe('OpenCode 2 entry: the pool migration', () => {
       },
       { preconnect: () => {} },
     ) as typeof fetch
-    const { host } = await start(files, { fetch: usage })
+    const { host } = await start(files, { fetch: usage, poolMigration: true })
     let deadline = Date.now() + 15_000
     while (
       Date.now() < deadline &&

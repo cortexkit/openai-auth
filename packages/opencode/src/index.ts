@@ -726,7 +726,7 @@ export {
 // version to go back to) before any credential moves. The next release turns
 // this on; the version fence then waits for every running process to be on
 // it before migrating.
-const POOL_MIGRATION_ENABLED = false
+export const POOL_MIGRATION_ENABLED = false
 
 interface CodexAuthPluginOptions {
   /**

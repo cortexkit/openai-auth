@@ -23,6 +23,7 @@ import {
   ResetRedemptionError,
   type RunResetCreditDeps,
   runResetCreditRedemption,
+  type SavedResetPair,
   selectCreditToSpend,
 } from '../reset-credits.ts'
 
@@ -990,11 +991,15 @@ describe('atomic reset credit redemption', () => {
     })
   }
 
+  // These two seed a pair that records its ChatGPT account, as every pair
+  // minted now does; an older pair saved without one is bound to the account
+  // it is first sent under, which changes it.
   it('preserves the exact in-flight object after an ambiguous outcome', async () => {
-    const inFlight: ResetInFlight = {
+    const inFlight: SavedResetPair = {
       redeemRequestId: 'ambiguous-request',
       creditId: 'ambiguous-credit',
       startedAt: Date.parse('2026-07-17T11:59:00.000Z'),
+      chatgptAccountId: 'main-account-id',
     }
     await seedResetState('main', { inFlight })
     const deps = redemptionDeps({
@@ -1007,10 +1012,11 @@ describe('atomic reset credit redemption', () => {
   })
 
   it('preserves the exact in-flight object and skips cooldown on http_error', async () => {
-    const inFlight: ResetInFlight = {
+    const inFlight: SavedResetPair = {
       redeemRequestId: 'http-request',
       creditId: 'http-credit',
       startedAt: Date.parse('2026-07-17T11:59:00.000Z'),
+      chatgptAccountId: 'main-account-id',
     }
     await seedResetState('main', { inFlight })
     const deps = redemptionDeps({
@@ -1292,5 +1298,246 @@ describe('atomic reset credit redemption', () => {
       pending.resolve(Response.json({ code: 'reset' }))
     }
     await Promise.all([winner, loser])
+  })
+})
+
+// A saved (credit, request) pair belongs to the ChatGPT account it was minted
+// under; it must never be sent with another account's credentials, and a
+// pair the server refused must not lock the account out of new spends.
+describe('reset redemption bound to its ChatGPT account', () => {
+  const NOW = Date.parse('2026-07-17T12:00:00.000Z')
+  const YOUNG = Date.parse('2026-07-17T11:59:00.000Z')
+  const EXPIRED = Date.parse('2026-07-17T11:54:59.999Z')
+  const LATER = NOW + 6 * 60_000
+
+  function pair(
+    startedAt: number,
+    extra: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return {
+      redeemRequestId: 'saved-request',
+      creditId: 'saved-credit',
+      startedAt,
+      ...extra,
+    }
+  }
+
+  /** Redemption dependencies with row `main` signed in as `identity`. */
+  function depsAs(
+    identity: string,
+    options: Parameters<typeof redemptionDeps>[0] = {},
+  ) {
+    const deps = redemptionDeps(options)
+    deps.resolveTarget = async (accountKey) => ({
+      accountKey,
+      label: 'Main',
+      accessToken: `${identity}-token`,
+      chatgptAccountId: identity,
+    })
+    return deps
+  }
+
+  function inputAs(identity: string, retry: boolean) {
+    return { accountKey: 'main', expectedChatgptAccountId: identity, retry }
+  }
+
+  function recordingWire(
+    consume: () => Response | Promise<Response>,
+    posts: ReturnType<typeof requestBody>[],
+  ) {
+    return fetchStub(async (input, init) => {
+      if (!input.toString().endsWith('/consume')) return listResponse()
+      posts.push(requestBody(init))
+      return consume()
+    })
+  }
+
+  it('a new pair records the ChatGPT account it was minted under', async () => {
+    const posts: ReturnType<typeof requestBody>[] = []
+    const deps = depsAs('account-a', {
+      fetchImpl: recordingWire(() => new Response('{bad-json'), posts),
+    })
+
+    await runResetCreditRedemption(deps, inputAs('account-a', false))
+
+    expect((await persistedResetState())?.inFlight).toEqual({
+      redeemRequestId: 'uuid-new',
+      creditId: 'credit-1',
+      startedAt: NOW,
+      chatgptAccountId: 'account-a',
+    })
+  })
+
+  for (const [name, startedAt, retry] of [
+    ['Retry of a young pair', YOUNG, true],
+    ['Spend with a young pair', YOUNG, false],
+    ['Retry of an expired pair', EXPIRED, true],
+  ] as const) {
+    it(`${name} minted under another account sends nothing and keeps the record`, async () => {
+      const saved = pair(startedAt, { chatgptAccountId: 'account-a' })
+      await seedResetState('main', { inFlight: saved })
+      const posts: ReturnType<typeof requestBody>[] = []
+      // Had the pair been sent, this terminal reply would have cleared
+      // account-a's saved pair.
+      const deps = depsAs('account-b', {
+        fetchImpl: recordingWire(
+          () => Response.json({ code: 'no_credit' }),
+          posts,
+        ),
+      })
+
+      const refused = runResetCreditRedemption(
+        deps,
+        inputAs('account-b', retry),
+      )
+
+      await expect(refused).rejects.toMatchObject({
+        name: 'ResetRedemptionError',
+        kind: 'pair_identity_mismatch',
+      })
+      expect(posts).toEqual([])
+      expect(await persistedResetState()).toEqual({ inFlight: saved })
+    })
+  }
+
+  it('once the pair expires, Spend under the new account starts a fresh redemption', async () => {
+    await seedResetState('main', {
+      inFlight: pair(EXPIRED, { chatgptAccountId: 'account-a' }),
+    })
+    const posts: ReturnType<typeof requestBody>[] = []
+    const deps = depsAs('account-b', {
+      fetchImpl: recordingWire(() => Response.json({ code: 'reset' }), posts),
+    })
+
+    await runResetCreditRedemption(deps, inputAs('account-b', false))
+
+    expect(posts).toEqual([
+      { redeem_request_id: 'uuid-new', credit_id: 'credit-1' },
+    ])
+  })
+
+  it('a pair saved without an account is replayed once, then bound to the account it was sent under', async () => {
+    const legacy = pair(YOUNG)
+    await seedResetState('main', { inFlight: legacy })
+    const posts: ReturnType<typeof requestBody>[] = []
+    const deps = depsAs('account-a', {
+      fetchImpl: recordingWire(() => new Response('{bad-json'), posts),
+    })
+
+    await runResetCreditRedemption(deps, inputAs('account-a', true))
+
+    expect(posts).toEqual([
+      { redeem_request_id: 'saved-request', credit_id: 'saved-credit' },
+    ])
+    expect((await persistedResetState())?.inFlight).toEqual({
+      ...legacy,
+      chatgptAccountId: 'account-a',
+    })
+
+    const other = depsAs('account-b', {
+      fetchImpl: recordingWire(() => new Response('{bad-json'), posts),
+    })
+    await expect(
+      runResetCreditRedemption(other, inputAs('account-b', true)),
+    ).rejects.toMatchObject({ kind: 'pair_identity_mismatch' })
+    expect(posts).toHaveLength(1)
+  })
+
+  it('a pair the server refused with a 4xx expires instead of locking Spend', async () => {
+    await seedResetState('main', {
+      inFlight: pair(YOUNG, { chatgptAccountId: 'account-a' }),
+    })
+    const posts: ReturnType<typeof requestBody>[] = []
+    const refusing = depsAs('account-a', {
+      fetchImpl: recordingWire(
+        () => Response.json({ error: 'bad credit' }, { status: 400 }),
+        posts,
+      ),
+    })
+
+    const first = await runResetCreditRedemption(
+      refusing,
+      inputAs('account-a', false),
+    )
+    expect(first.outcome).toMatchObject({ kind: 'http_error', status: 400 })
+
+    const later = depsAs('account-a', {
+      now: () => LATER,
+      fetchImpl: recordingWire(() => Response.json({ code: 'reset' }), posts),
+    })
+    await runResetCreditRedemption(later, inputAs('account-a', false))
+
+    expect(posts).toEqual([
+      { redeem_request_id: 'saved-request', credit_id: 'saved-credit' },
+      { redeem_request_id: 'uuid-new', credit_id: 'credit-1' },
+    ])
+    expect((await persistedResetState())?.inFlight).toBeUndefined()
+  })
+
+  it('an expired refused pair is kept, and nothing spent, when the account is no longer exhausted', async () => {
+    const saved = pair(EXPIRED, {
+      chatgptAccountId: 'account-a',
+      rejectedStatus: 400,
+    })
+    await seedResetState('main', { inFlight: saved })
+    const posts: ReturnType<typeof requestBody>[] = []
+    const deps = depsAs('account-a', {
+      fetchImpl: recordingWire(() => Response.json({ code: 'reset' }), posts),
+      fetchUsage: async () => ({ primary: quotaWindow(10) }),
+    })
+
+    await expect(
+      runResetCreditRedemption(deps, inputAs('account-a', false)),
+    ).rejects.toMatchObject({ kind: 'not_exhausted' })
+    expect(posts).toEqual([])
+    expect(await persistedResetState()).toEqual({ inFlight: saved })
+  })
+
+  for (const [name, consume] of [
+    ['a 408', () => Response.json({}, { status: 408 })],
+    ['a 409', () => Response.json({}, { status: 409 })],
+    ['a 429', () => Response.json({}, { status: 429 })],
+    ['a 503', () => Response.json({}, { status: 503 })],
+    ['an unreadable reply', () => new Response('{bad-json')],
+  ] as const) {
+    it(`an expired pair last answered with ${name} still refuses a new spend`, async () => {
+      await seedResetState('main', {
+        inFlight: pair(YOUNG, { chatgptAccountId: 'account-a' }),
+      })
+      const posts: ReturnType<typeof requestBody>[] = []
+      await runResetCreditRedemption(
+        depsAs('account-a', { fetchImpl: recordingWire(consume, posts) }),
+        inputAs('account-a', false),
+      )
+
+      const later = depsAs('account-a', {
+        now: () => LATER,
+        fetchImpl: recordingWire(() => Response.json({ code: 'reset' }), posts),
+      })
+      await expect(
+        runResetCreditRedemption(later, inputAs('account-a', false)),
+      ).rejects.toMatchObject({ kind: 'expired_unreconciled' })
+      expect(posts).toHaveLength(1)
+    })
+  }
+
+  it('a later unknown outcome withdraws a refusal, so the pair locks again', async () => {
+    await seedResetState('main', {
+      inFlight: pair(YOUNG, {
+        chatgptAccountId: 'account-a',
+        rejectedStatus: 400,
+      }),
+    })
+    const posts: ReturnType<typeof requestBody>[] = []
+    await runResetCreditRedemption(
+      depsAs('account-a', {
+        fetchImpl: recordingWire(() => new Response('{bad-json'), posts),
+      }),
+      inputAs('account-a', true),
+    )
+
+    expect((await persistedResetState())?.inFlight).toEqual(
+      pair(YOUNG, { chatgptAccountId: 'account-a' }),
+    )
   })
 })

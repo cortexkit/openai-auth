@@ -215,6 +215,12 @@ export type KillswitchConfig = {
   main?: KillswitchThresholds
   accounts?: Record<string, KillswitchThresholds>
   /**
+   * In a `KILLSWITCH_FLOORS_SCHEMA` block, the floors of every account the
+   * block has no entry for, so an account added after the block was written
+   * is protected without anything writing floors for it.
+   */
+  defaults?: KillswitchThresholds
+  /**
    * `KILLSWITCH_FLOORS_SCHEMA` once the block holds explicit per-account
    * floors; see that constant for how the two formats differ.
    */
@@ -225,7 +231,8 @@ export type KillswitchConfig = {
  * Marks a killswitch block written in the shared command menu's vocabulary:
  * `accounts.<id>.<window>` is that account's minimum percent left for the
  * window, a window without a value has no floor, an account without an entry
- * has none at all, and there is no `main` block (the main account is row
+ * has the floors in `defaults` (none at all when the block has no
+ * `defaults`), and there is no `main` block (the main account is row
  * `main`). An unmarked block keeps the older meaning: an account without an
  * entry inherits `main`, a missing window falls back to the default, and
  * `5h`/`1w` alias `primary`/`secondary`.
@@ -1857,7 +1864,18 @@ export function getKillswitchThresholdsForAccount(
 ): { primary: number; secondary: number } {
   if (!storage?.killswitch) return DEFAULT_KILLSWITCH_THRESHOLDS
   if (storage.killswitch.schema === KILLSWITCH_FLOORS_SCHEMA) {
-    const own = storage.killswitch.accounts?.[accountId ?? 'main']
+    const { accounts, defaults } = storage.killswitch
+    const id = accountId ?? 'main'
+    // An account's own entry, even one naming only some windows, replaces
+    // the defaults whole: a window it leaves out has no floor.
+    const own =
+      isRecord(accounts) &&
+      Object.hasOwn(accounts, id) &&
+      isRecord(accounts[id])
+        ? accounts[id]
+        : isRecord(defaults)
+          ? defaults
+          : undefined
     return {
       primary: floorOf(own?.primary),
       secondary: floorOf(own?.secondary),

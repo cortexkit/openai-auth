@@ -292,6 +292,9 @@ describe('/openai on a migrated install', () => {
         main: { primary: 20, secondary: 30 },
         alpha: { primary: 40, secondary: 10 },
       },
+      // What the older block gave an account it did not name: `main`'s
+      // thresholds. A row added later is judged by these.
+      defaults: { primary: 20, secondary: 30 },
       schema: 'floors-v1',
     })
   })
@@ -307,12 +310,14 @@ describe('/openai on a migrated install', () => {
 
     expect(result.ok).toBe(true)
     // Creating the block gives every account it does not name the default
-    // floors; the floors set here stay exactly as set.
+    // floors, and keeps them as the block's defaults for rows added later;
+    // the floors set here stay exactly as set.
     expect(config().killswitch).toEqual({
       accounts: {
         alpha: { primary: 25 },
         main: { primary: 5, secondary: 10 },
       },
+      defaults: { primary: 5, secondary: 10 },
       schema: 'floors-v1',
     })
   })
@@ -332,6 +337,7 @@ describe('/openai on a migrated install', () => {
         main: { primary: 5, secondary: 10 },
         alpha: { primary: 5, secondary: 10 },
       },
+      defaults: { primary: 5, secondary: 10 },
       schema: 'floors-v1',
     })
   })
