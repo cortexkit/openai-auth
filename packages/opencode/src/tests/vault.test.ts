@@ -21,6 +21,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { MenuTerminal } from '@cortexkit/common-auth/auth-menu'
 import { readClaustrumEnrollmentToken } from '@cortexkit/common-auth/claustrum'
+import { quotaCodec } from '@cortexkit/common-auth/quota'
+import { openPoolStore } from '@cortexkit/common-auth/store'
 import {
   loadAccounts,
   mutateAccounts,
@@ -61,6 +63,7 @@ function wireWithExhaustedMain(): Wire {
       }),
   })
 }
+
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env'
 
 const ENROLLMENT_TOKEN = '01'.repeat(32)
@@ -165,11 +168,18 @@ function request(
 }
 
 async function setMode(mode: PoolMode) {
-  const config = readJson(files.configFile)
-  writeFileSync(
-    files.configFile,
-    JSON.stringify({ ...config, routing: { mode } }),
-  )
+  // Through the pool store's locked settings write: the plugin writes the
+  // same file in the background (a row's quota reading, for one), and a
+  // plain read-modify-write here could be overwritten by one of those that
+  // read the file before it, putting the old mode back.
+  await openPoolStore({
+    provider: 'openai',
+    configPath: files.configFile,
+    statePath: files.stateFile,
+    quota: quotaCodec,
+  }).updateSettings((settings) => {
+    settings.routing = { mode }
+  })
   // The request path re-reads the config only when its modification time
   // changes; a short pause makes sure the next request sees the new mode.
   await Bun.sleep(5)
@@ -281,6 +291,33 @@ describe('enrollment', () => {
     expect(vault.snapshot()?.rows.map((row) => row.credentialId)).toEqual([
       'oauth:openai:work',
     ])
+    vault.close()
+  })
+})
+
+describe('refresh', () => {
+  test('waits out a discovery already in flight and runs one that sees what changed since', async () => {
+    const running = await startDaemon({
+      'oauth:openai:vault': vaultLogin('chatgpt-vault'),
+    })
+    const vault = new OpenAiVault({
+      host: 'opencode',
+      stateDir,
+      connectionFile: () => running.connectionFile,
+      pollIntervalMs: 0,
+    })
+    // The poll's first roster discovery starts before this host is enrolled
+    // (so it finds no accounts) and is still in flight when the enrollment
+    // lands and refresh is called. Refresh must not hand back that empty
+    // result.
+    vault.start()
+    enroll()
+    await vault.refresh()
+
+    expect(vault.snapshot()?.rows.map((row) => row.credentialId)).toEqual([
+      'oauth:openai:vault',
+    ])
+    expect(vault.routes()).toHaveLength(1)
     vault.close()
   })
 })

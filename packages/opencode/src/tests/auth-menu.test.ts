@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { MenuTerminal } from '@cortexkit/common-auth/auth-menu'
+import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import {
   type AccountPaths,
   loadAccounts,
@@ -501,5 +502,111 @@ describe('OpenCode auth menu', () => {
     )
     expect(migratedOrphans).toBeDefined()
     expect(migratedOrphans?.repair).toBeUndefined()
+  })
+})
+
+// The doctor's restore repair writes OpenCode's slot. It must hold the
+// `main-refresh` lock the account-pool migration holds around its last slot
+// read and placeholder write, or the restore can land in between and be
+// erased by the placeholder.
+describe('the doctor restore writes the slot under main-refresh', () => {
+  const PLACEHOLDER = {
+    type: 'oauth',
+    access: '',
+    refresh: 'common-auth-placeholder:v1:openai',
+    expires: 0,
+  }
+
+  async function restoreSetup() {
+    const paths = tempPaths()
+    // A stored `main` row whose token differs from the slot's: the doctor
+    // offers to copy it back into the slot.
+    await seedStore(paths, [account('main', { accountId: 'chatgpt-main' })])
+    let slot: Record<string, unknown> = {
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: 1,
+    }
+    const writes: Array<{ at: number; body: unknown }> = []
+    const client = {
+      auth: {
+        set: async (request: { body: Record<string, unknown> }) => {
+          writes.push({ at: performance.now(), body: request.body })
+          slot = structuredClone(request.body)
+        },
+      },
+    } as unknown as CreateAuthMethodsOptions['client']
+    // The install is not migrated to the account pool yet, so the menu offers
+    // only the doctor: Enter runs it, then Down and Enter answer yes to its
+    // restore repair (the confirmation lists No first).
+    const scripted = scriptedTerminal([ENTER, DOWN, ENTER])
+    const methods = createAuthMethods({
+      client,
+      getAuth: async () => structuredClone(slot) as never,
+      getPaths: () => paths,
+      dependencies: {
+        terminal: scripted.terminal,
+        migrationBlockers: async () => [],
+      },
+    })
+    return {
+      paths,
+      writes,
+      setSlot: (value: Record<string, unknown>) => {
+        slot = value
+      },
+      run: () => oauthMethod(methods, 0).authorize({}),
+    }
+  }
+
+  test('waits for a held main-refresh lock before writing the slot', async () => {
+    const setup = await restoreSetup()
+    const held = await acquireRefreshFileLock({
+      name: 'main-refresh',
+      ttlMs: 60_000,
+      path: setup.paths.configPath,
+    })
+    if (!held) throw new Error('could not take main-refresh')
+    let releasedAt = 0
+    const releasing = (async () => {
+      await Bun.sleep(400)
+      releasedAt = performance.now()
+      await held.release()
+    })()
+
+    await expectMenuCompletionFailed(await setup.run())
+    await releasing
+
+    expect(setup.writes.map((write) => write.body)).toEqual([
+      {
+        type: 'oauth',
+        refresh: 'refresh-main',
+        access: 'access-main',
+        expires: expect.any(Number),
+      },
+    ])
+    expect(setup.writes[0]?.at).toBeGreaterThanOrEqual(releasedAt)
+  })
+
+  test('writes nothing when the slot became the placeholder while it waited', async () => {
+    const setup = await restoreSetup()
+    const held = await acquireRefreshFileLock({
+      name: 'main-refresh',
+      ttlMs: 60_000,
+      path: setup.paths.configPath,
+    })
+    if (!held) throw new Error('could not take main-refresh')
+    const releasing = (async () => {
+      await Bun.sleep(400)
+      // The migration, holding the lock, puts the placeholder in.
+      setup.setSlot({ ...PLACEHOLDER })
+      await held.release()
+    })()
+
+    await expectMenuCompletionFailed(await setup.run())
+    await releasing
+
+    expect(setup.writes).toEqual([])
   })
 })

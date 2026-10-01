@@ -854,6 +854,27 @@ function mergeConfigAndState(
   const refreshConfig = isRecord(configValue.refresh) ? configValue.refresh : {}
   const mainQuotaSource = mainState ?? quotaConfig
   const mainRefreshSource = mainState ?? refreshConfig
+  // The main slot's refresh lease and backoff. Legacy writers keep them in
+  // the state file (`state.main`) and strip them from the config. On an
+  // install whose accounts moved into the shared account pool, the plugin
+  // writes them through the pool store's settings write, which never touches
+  // the state file, so they land in the config's `refresh` object under
+  // their storage names. The config copy therefore wins when present: it is
+  // the only one a migrated install's refresh writes, and that refresh reads
+  // its own lease back to verify it. A lease is taken whole from one source,
+  // never assembled from fields of two writers.
+  const configLeaseHeld = refreshConfig.mainRefreshLeaseId !== undefined
+  const mainLease = configLeaseHeld
+    ? {
+        id: refreshConfig.mainRefreshLeaseId,
+        until: refreshConfig.mainRefreshLeaseUntil,
+        tokenHash: refreshConfig.mainRefreshLeaseTokenHash,
+      }
+    : {
+        id: mainRefreshSource.refreshLeaseId,
+        until: mainRefreshSource.refreshLeaseUntil,
+        tokenHash: mainRefreshSource.refreshLeaseTokenHash,
+      }
 
   const hasAccounts = Array.isArray(configValue.accounts)
   const accounts = hasAccounts
@@ -871,10 +892,12 @@ function mergeConfigAndState(
     ...configValue,
     refresh: objectWithDefinedEntries({
       ...refreshConfig,
-      mainLastRefreshError: mainRefreshSource.lastRefreshError,
-      mainRefreshLeaseId: mainRefreshSource.refreshLeaseId,
-      mainRefreshLeaseUntil: mainRefreshSource.refreshLeaseUntil,
-      mainRefreshLeaseTokenHash: mainRefreshSource.refreshLeaseTokenHash,
+      mainLastRefreshError:
+        refreshConfig.mainLastRefreshError ??
+        mainRefreshSource.lastRefreshError,
+      mainRefreshLeaseId: mainLease.id,
+      mainRefreshLeaseUntil: mainLease.until,
+      mainRefreshLeaseTokenHash: mainLease.tokenHash,
     }),
     quota: objectWithDefinedEntries({
       ...quotaConfig,
@@ -2338,6 +2361,17 @@ export class FallbackAccountManager {
     return loadAccounts(this.paths)
   }
 
+  /**
+   * The background saves `getUsableFallbackAccounts` queues (refresh errors
+   * it recorded, `lastUsed` merges), chained so they land in order.
+   */
+  private selectionBookkeeping: Promise<void> = Promise.resolve()
+
+  /** Resolves once every queued selection bookkeeping save has ended. */
+  selectionBookkeepingSettled(): Promise<void> {
+    return this.selectionBookkeeping
+  }
+
   async save(storage: AccountStorage, accountIds?: string[]) {
     await saveAccountState(storage, this.paths, {
       accounts: accountIds ?? true,
@@ -2462,17 +2496,21 @@ export class FallbackAccountManager {
 
     // Selection bookkeeping only: refreshAccount() has already persisted any
     // rotated tokens itself, so what remains here is recorded refresh/quota
-    // errors and lastUsed merges. Losing it delays a backoff stamp; failing the
-    // caller would abort a request that has not been sent yet, which is worse.
+    // errors and lastUsed merges. This runs on the request path, so the save
+    // is queued rather than awaited: waiting for the state file's lock
+    // behind another writer would hold up a request that has not been sent
+    // yet, for data whose loss only delays a backoff stamp. Saves run one
+    // after another, each with a copy of the storage as it is now.
     if (changed) {
-      try {
-        await this.save(storage)
-      } catch (error) {
-        logA.warn('fallback selection bookkeeping not persisted', {
-          pid: process.pid,
-          error: formatErrorMessage(error),
+      const snapshot = structuredClone(storage)
+      this.selectionBookkeeping = this.selectionBookkeeping
+        .then(() => this.save(snapshot))
+        .catch((error: unknown) => {
+          logA.warn('fallback selection bookkeeping not persisted', {
+            pid: process.pid,
+            error: formatErrorMessage(error),
+          })
         })
-      }
     }
     return usable
   }

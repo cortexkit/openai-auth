@@ -107,6 +107,13 @@ export interface PoolAccountSourceDeps {
     Pick<OpenPoolStoreOptions, 'lockOptions' | 'rowLockOptions' | 'hold'>
   >
   log?: Pick<ReturnType<typeof createLogger>, 'debug' | 'info' | 'warn'>
+  /**
+   * The ChatGPT accounts the Claustrum vault holds for this host. A row
+   * signing in as one of them is not this host's to use (one account has
+   * one owner, and the vault owns it): request routing skips it, and this
+   * source never refreshes it or polls its quota either.
+   */
+  vaultIdentities?: () => ReadonlySet<string>
 }
 
 type BackoffEntry = {
@@ -204,7 +211,17 @@ export class PoolAccountSource {
   private store: { configPath: string; store: PoolStore } | undefined
   private readonly refreshing = new Map<string, Promise<void>>()
   private readonly backoff = new Map<string, BackoffEntry>()
-  private readonly rotated = new Map<string, PoolRow['credential']>()
+  /**
+   * Credentials this process rotated, by row id, with the credential epoch
+   * of the row they were rotated from. A rotation keeps the epoch; a
+   * replacement (a re-login, another account) bumps it, so an entry whose
+   * epoch no longer matches the row's belongs to a credential the row no
+   * longer holds.
+   */
+  private readonly rotated = new Map<
+    string,
+    { credential: PoolRow['credential']; credentialEpoch: number | undefined }
+  >()
   private readonly pending = new Map<string, PendingObservation[]>()
   private readonly writes = new Map<string, Promise<void>>()
   private readonly marks = new Map<string, number>()
@@ -342,8 +359,15 @@ export class PoolAccountSource {
     const now = this.now()
     return rows.map((row) => {
       let next = row
-      const rotated = this.rotated.get(row.id)
-      if (rotated?.type === 'oauth' && row.credential?.type === 'oauth') {
+      const own = this.rotated.get(row.id)
+      const rotated = own?.credential
+      if (own && own.credentialEpoch !== row.credentialEpoch) {
+        // The row's credential was replaced since this process rotated it.
+        this.rotated.delete(row.id)
+      } else if (
+        rotated?.type === 'oauth' &&
+        row.credential?.type === 'oauth'
+      ) {
         const fileStamp = row.credential.lastRefreshedAt ?? 0
         const ownStamp = rotated.lastRefreshedAt ?? 0
         if (fileStamp >= ownStamp) this.rotated.delete(row.id)
@@ -391,10 +415,19 @@ export class PoolAccountSource {
    * at the first load, a row added since, a replaced credential, and every
    * row once the install turns migrated. Never waits.
    */
+  /** Whether the vault owns the account this row signs in as. */
+  private vaultOwned(row: Pick<PoolRow, 'identity'>): boolean {
+    return (
+      row.identity !== undefined &&
+      (this.deps.vaultIdentities?.().has(row.identity) ?? false)
+    )
+  }
+
   private pollUnseenRows(): void {
     if (this.disposed) return
     for (const row of this.snapshot.rows) {
-      if (!row.candidate || row.type !== 'oauth') continue
+      if (!row.candidate || row.type !== 'oauth' || this.vaultOwned(row))
+        continue
       const key = `${row.id}\u0000${row.credentialEpoch ?? 0}\u0000${row.identity ?? ''}`
       if (this.polled.has(key)) continue
       this.polled.add(key)
@@ -557,7 +590,7 @@ export class PoolAccountSource {
     const windowMs = refreshBeforeExpiryMs(storage)
     const waits: Promise<void>[] = []
     for (const row of rows) {
-      if (!row.candidate) continue
+      if (!row.candidate || this.vaultOwned(row)) continue
       const token = oauthAccess(row)
       if (!token) continue
       const left = (token.expires ?? 0) - now
@@ -621,6 +654,13 @@ export class PoolAccountSource {
     const paths = this.deps.paths()
     const before = this.snapshot.rows.find((row) => row.id === id)
     const refreshToken = before ? oauthAccess(before)?.refresh : undefined
+    // The epoch of the row the store actually refreshed, read under its
+    // locks. A rotation keeps it, so the rotated credential belongs to it.
+    let refreshedEpoch: number | undefined
+    const provider: ProviderRefresh = (credential, row) => {
+      refreshedEpoch = row.credentialEpoch
+      return this.deps.refreshProvider(credential, row)
+    }
     try {
       const outcome = await refreshPoolRow(
         {
@@ -632,18 +672,25 @@ export class PoolAccountSource {
             : {}),
         },
         id,
-        this.deps.refreshProvider,
+        provider,
       )
       if (outcome.status === 'rotated') {
         this.backoff.delete(id)
-        this.rotated.set(id, outcome.credential)
-        this.replaceRow(id, (row) => ({
-          ...row,
+        this.rotated.set(id, {
           credential: outcome.credential,
-          ...(outcome.identity !== undefined && row.identity === undefined
-            ? { identity: outcome.identity }
-            : {}),
-        }))
+          credentialEpoch: refreshedEpoch,
+        })
+        this.replaceRow(id, (row) =>
+          row.credentialEpoch !== refreshedEpoch
+            ? row
+            : {
+                ...row,
+                credential: outcome.credential,
+                ...(outcome.identity !== undefined && row.identity === undefined
+                  ? { identity: outcome.identity }
+                  : {}),
+              },
+        )
         return
       }
       this.recordRefreshFailure(id, refreshToken, new Error(outcome.reason))
@@ -762,7 +809,8 @@ export class PoolAccountSource {
     if (!view.active || this.disposed) return []
     const now = this.now()
     const targets = view.rows.filter((row) => {
-      if (!row.candidate || row.type !== 'oauth') return false
+      if (!row.candidate || row.type !== 'oauth' || this.vaultOwned(row))
+        return false
       if (options.ids && !options.ids.includes(row.id)) return false
       if (options.skipReadWithinMs === undefined) return true
       const readAt = quotaReadAt(row)

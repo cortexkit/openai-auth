@@ -117,6 +117,7 @@ import {
   migrateToPool,
   PoolTransferPendingError,
   poolTransferPendingInConfigFile,
+  reclaimExpiredPoolTransfer,
 } from './core/pool-migration'
 import { observationFromSnapshot } from './core/pool-quota'
 import {
@@ -1927,6 +1928,7 @@ export async function CodexAuthPlugin(
             }
             return observationFromSnapshot(snapshot, checkedAt, true)
           },
+          vaultIdentities: () => vault.identities(),
           log: createLogger('pool'),
         })
         poolAccountSource = poolSource
@@ -2236,6 +2238,15 @@ export async function CodexAuthPlugin(
                 await fileLock.release().catch(() => {})
                 throw error
               }
+
+              // A pending-transfer record left by a migration run that never
+              // finished would keep this refresh standing down for good; once
+              // it has expired, and dropping it cannot leave a second
+              // refresher of this token, it goes and the refresh proceeds.
+              await reclaimExpiredPoolTransfer(
+                getAccountPaths(getConfigPath()),
+                current.refresh,
+              ).catch(() => false)
 
               const refreshTokenHash = hashRefreshToken(current.refresh)
               const leaseId = crypto.randomUUID()
