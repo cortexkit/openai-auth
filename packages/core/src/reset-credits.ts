@@ -100,6 +100,7 @@ export interface RunResetCreditInput {
 export type ResetRedemptionErrorKind =
   | 'invalid_account_key'
   | 'identity_mismatch'
+  | 'pair_identity_mismatch'
   | 'cooldown_active'
   | 'expired_unreconciled'
   | 'retry_without_inflight'
@@ -142,8 +143,30 @@ export interface RunResetCreditResult {
   finalizeStateWriteFailed?: boolean
 }
 
+/**
+ * A saved redemption as this module reads and writes it: the pair the server
+ * dedupes on, plus what decides who may send it and when it may be dropped.
+ */
+export interface SavedResetPair extends ResetInFlight {
+  /**
+   * The ChatGPT account the pair was minted under. Only that account may send
+   * it. Absent on a pair saved before this was recorded; such a pair is sent
+   * once under the row's current account and bound to it from then on.
+   */
+  chatgptAccountId?: string
+  /**
+   * The status of the definite refusal (`isDefiniteRefusal`) the server gave
+   * the latest send of this pair. Any other answer removes it. Once the pair
+   * is past its five-minute window, a refused pair no longer blocks a new
+   * spend: the server answers a replay of a pair it consumed with
+   * `already_redeemed`, not a refusal, and the new spend still has to find
+   * the account exhausted, which it would not be had the pair reset it.
+   */
+  rejectedStatus?: number
+}
+
 interface ResetClaim {
-  inFlight: ResetInFlight
+  inFlight: SavedResetPair
   selectedCredit: ResetSelectedCredit
 }
 
@@ -217,7 +240,7 @@ function cloneResetState(
   }
 }
 
-function validInFlight(value: unknown): ResetInFlight | undefined {
+function validInFlight(value: unknown): SavedResetPair | undefined {
   if (
     !isRecord(value) ||
     typeof value.redeemRequestId !== 'string' ||
@@ -225,7 +248,12 @@ function validInFlight(value: unknown): ResetInFlight | undefined {
     typeof value.creditId !== 'string' ||
     value.creditId.length === 0 ||
     typeof value.startedAt !== 'number' ||
-    !Number.isFinite(value.startedAt)
+    !Number.isFinite(value.startedAt) ||
+    // An unreadable account is not the same as none: none lets the pair be
+    // sent once under the current account, so a damaged one is incomplete.
+    (value.chatgptAccountId !== undefined &&
+      (typeof value.chatgptAccountId !== 'string' ||
+        value.chatgptAccountId.length === 0))
   ) {
     return undefined
   }
@@ -233,6 +261,71 @@ function validInFlight(value: unknown): ResetInFlight | undefined {
     redeemRequestId: value.redeemRequestId,
     creditId: value.creditId,
     startedAt: value.startedAt,
+    ...(typeof value.chatgptAccountId === 'string'
+      ? { chatgptAccountId: value.chatgptAccountId }
+      : {}),
+    ...(isDefiniteRefusal(value.rejectedStatus)
+      ? { rejectedStatus: value.rejectedStatus }
+      : {}),
+  }
+}
+
+/**
+ * A consume status that says the server refused the request outright: a 4xx
+ * other than the ones that mean "not now" (408 timeout, 409 conflict, 425
+ * too early, 429 rate limited), after which the request may still go through.
+ */
+function isDefiniteRefusal(status: unknown): status is number {
+  return (
+    typeof status === 'number' &&
+    status >= 400 &&
+    status < 500 &&
+    status !== 408 &&
+    status !== 409 &&
+    status !== 425 &&
+    status !== 429
+  )
+}
+
+/** Whether the server refused this consume outright (`isDefiniteRefusal`). */
+export function isRefusedConsume(outcome: ResetConsumeOutcome): boolean {
+  return outcome.kind === 'http_error' && isDefiniteRefusal(outcome.status)
+}
+
+/**
+ * Whether a new spend under `chatgptAccountId` may replace `pair`, which is
+ * past its five-minute window: when the pair belongs to another account (it
+ * can never be sent from this row as it is signed in now), or when the server
+ * refused its latest send (see `SavedResetPair.rejectedStatus`). Any other
+ * expired pair has an unknown outcome and only Retry may settle it.
+ */
+function mayReplaceExpiredPair(
+  pair: SavedResetPair,
+  chatgptAccountId: string | undefined,
+): boolean {
+  return (
+    (pair.chatgptAccountId !== undefined &&
+      pair.chatgptAccountId !== chatgptAccountId) ||
+    pair.rejectedStatus !== undefined
+  )
+}
+
+/**
+ * Refuses to send `pair` under `chatgptAccountId` when it was minted under
+ * another ChatGPT account. A pair with no recorded account passes.
+ */
+function assertPairBelongsTo(
+  pair: SavedResetPair,
+  chatgptAccountId: string | undefined,
+): void {
+  if (
+    pair.chatgptAccountId !== undefined &&
+    pair.chatgptAccountId !== chatgptAccountId
+  ) {
+    throw new ResetRedemptionError(
+      'pair_identity_mismatch',
+      'the saved reset redemption was started under a different ChatGPT account',
+    )
   }
 }
 
@@ -355,10 +448,16 @@ async function resolveCorruptResetAttempt(
   return decision
 }
 
+/**
+ * Claims a credit for a new redemption on `accountKey` in one locked write,
+ * or returns the saved pair a new spend must replay or may not replace. A new
+ * pair records `chatgptAccountId`, the account it is minted under.
+ */
 export async function claimResetAttempt(
   deps: ResetStateDeps,
   accountKey: string,
   credits: readonly ResetCredit[],
+  chatgptAccountId?: string,
 ): Promise<ResetStateDecision> {
   if (!isSafeResetAccountKey(accountKey)) {
     return { kind: 'fresh', beforeState: undefined }
@@ -393,7 +492,7 @@ export async function claimResetAttempt(
       }
       return current
     }
-    if (inFlight) {
+    if (inFlight && !mayReplaceExpiredPair(inFlight, chatgptAccountId)) {
       decision = {
         kind: 'expired_unreconciled',
         beforeState,
@@ -410,10 +509,11 @@ export async function claimResetAttempt(
       decision = { kind: 'fresh', beforeState }
       return current
     }
-    const claimedInFlight = {
+    const claimedInFlight: SavedResetPair = {
       redeemRequestId: deps.randomUUID(),
       creditId: selectedCredit.id,
       startedAt: now,
+      ...(chatgptAccountId === undefined ? {} : { chatgptAccountId }),
     }
     const reset = resetStateMap(current)
     reset[accountKey] = {
@@ -431,14 +531,30 @@ export async function claimResetAttempt(
   return decision
 }
 
+/**
+ * Records the server's answer to one send of `completing`, sent under
+ * `sentAs`. A terminal answer clears the pair. Any other answer keeps it,
+ * binding a pair saved without an account to `sentAs` and noting whether the
+ * server refused it outright (`SavedResetPair.rejectedStatus`).
+ */
 export async function finalizeResetAttempt(
   deps: ResetStateDeps,
   accountKey: string,
-  completing: ResetInFlight,
+  completing: SavedResetPair,
   outcome: ResetConsumeOutcome,
+  sentAs?: string,
 ): Promise<void> {
   if (!isSafeResetAccountKey(accountKey)) return
-  if (!isTerminalConsumeKind(outcome.kind)) return
+  if (!isTerminalConsumeKind(outcome.kind)) {
+    await recordUnreconciledAnswer(
+      deps,
+      accountKey,
+      completing,
+      outcome,
+      sentAs,
+    )
+    return
+  }
   await deps.mutateAccountsFn((current) => {
     const state = resetStateForAccount(current, accountKey)
     const persisted = validInFlight(state?.inFlight)
@@ -458,6 +574,39 @@ export async function finalizeResetAttempt(
     } else {
       delete state.cooldownUntil
     }
+    return current
+  }, storePaths(deps))
+}
+
+async function recordUnreconciledAnswer(
+  deps: ResetStateDeps,
+  accountKey: string,
+  completing: SavedResetPair,
+  outcome: ResetConsumeOutcome,
+  sentAs: string | undefined,
+): Promise<void> {
+  const refusal = isRefusedConsume(outcome) ? outcome.status : undefined
+  const bind = completing.chatgptAccountId === undefined && sentAs !== undefined
+  // Most unknown outcomes change nothing; skip the write for those.
+  if (!bind && refusal === completing.rejectedStatus) return
+  await deps.mutateAccountsFn((current) => {
+    const state = resetStateForAccount(current, accountKey)
+    const persisted = validInFlight(state?.inFlight)
+    if (
+      !state ||
+      !persisted ||
+      persisted.redeemRequestId !== completing.redeemRequestId ||
+      persisted.creditId !== completing.creditId
+    ) {
+      return current
+    }
+    const next: SavedResetPair = { ...persisted }
+    if (next.chatgptAccountId === undefined && sentAs !== undefined) {
+      next.chatgptAccountId = sentAs
+    }
+    if (refusal === undefined) delete next.rejectedStatus
+    else next.rejectedStatus = refusal
+    state.inFlight = next
     return current
   }, storePaths(deps))
 }
@@ -706,6 +855,9 @@ function retrySafetyFor(outcome: ResetConsumeOutcome): string {
   if (outcome.kind === 'nothing_to_reset' || outcome.kind === 'no_credit') {
     return 'The server returned a terminal no-op. No cooldown was set; a new attempt starts fresh and remains gated by fresh preconditions.'
   }
+  if (isRefusedConsume(outcome)) {
+    return 'The server refused the request. A retry within five minutes reuses the same request and credit identifiers; after that, a new attempt starts fresh and remains gated by fresh preconditions.'
+  }
   return 'The outcome is uncertain. A retry within five minutes reuses the same request and credit identifiers; this does not prove the server did nothing.'
 }
 
@@ -726,8 +878,8 @@ export async function runResetCreditRedemption(
       'the resolved ChatGPT account identity changed before redemption',
     )
   }
-  const wireAccountId =
-    target.accountKey === 'main' ? undefined : target.chatgptAccountId
+  const identity = target.chatgptAccountId
+  const wireAccountId = target.accountKey === 'main' ? undefined : identity
 
   let initial = await inspectResetAttempt(deps, input.accountKey)
   if (initial.kind === 'corrupt') {
@@ -741,10 +893,15 @@ export async function runResetCreditRedemption(
   let claim: ResetClaim
   if (initial.kind === 'claim') {
     claim = initial.claim
-  } else if (initial.kind === 'expired_unreconciled') {
+  } else if (
+    initial.kind === 'expired_unreconciled' &&
+    (input.retry || !mayReplaceExpiredPair(initial.claim.inFlight, identity))
+  ) {
     if (!input.retry) throwExpiredUnreconciled()
     claim = initial.claim
   } else {
+    // A new attempt, which may replace an expired pair `claimResetAttempt`
+    // judges replaceable; a retry needs a saved pair.
     if (input.retry) {
       throw new ResetRedemptionError(
         'retry_without_inflight',
@@ -774,6 +931,7 @@ export async function runResetCreditRedemption(
       deps,
       input.accountKey,
       credits.credits,
+      identity,
     )
     if (claimed.kind === 'corrupt') {
       return localAmbiguousResult(target, claimed.beforeState)
@@ -791,6 +949,9 @@ export async function runResetCreditRedemption(
     claim = claimed.claim
   }
 
+  // Nothing is sent, and the saved pair is left as it is, when the pair
+  // belongs to another ChatGPT account than the row is signed in as now.
+  assertPairBelongsTo(claim.inFlight, identity)
   const outcome = await consumeResetCredit(
     deps.fetchImpl,
     target.accessToken,
@@ -800,7 +961,13 @@ export async function runResetCreditRedemption(
   )
   let finalizeStateWriteFailed = false
   try {
-    await finalizeResetAttempt(deps, input.accountKey, claim.inFlight, outcome)
+    await finalizeResetAttempt(
+      deps,
+      input.accountKey,
+      claim.inFlight,
+      outcome,
+      identity,
+    )
   } catch {
     finalizeStateWriteFailed = isTerminalConsumeKind(outcome.kind)
   }

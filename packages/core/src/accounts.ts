@@ -1846,7 +1846,9 @@ export function getKillswitchThresholdsForAccount(
     // An account's own entry, even one naming only some windows, replaces
     // the defaults whole: a window it leaves out has no floor.
     const own =
-      isRecord(accounts) && Object.hasOwn(accounts, id) && isRecord(accounts[id])
+      isRecord(accounts) &&
+      Object.hasOwn(accounts, id) &&
+      isRecord(accounts[id])
         ? accounts[id]
         : isRecord(defaults)
           ? defaults

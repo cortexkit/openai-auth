@@ -49,6 +49,7 @@ import type { RefreshAllQuotaResult } from './refresh-all-quota'
 import {
   countEligibleResetCredits,
   evaluateResetPrecondition,
+  isRefusedConsume,
   listResetCredits,
   ResetCreditError,
   ResetRedemptionError,
@@ -855,6 +856,8 @@ async function spendResetCredit(
     // and the attempt is a new spend, refuses. So with one saved, or for a
     // retry, nothing is previewed: the request goes to the account's current identity and
     // the coordinator decides from the saved state, even after a restart.
+    // The coordinator also refuses to send a pair minted under another
+    // ChatGPT account than this current one.
     const saved = (
       await deps.loadAccounts({
         configPath: deps.configPath,
@@ -1298,6 +1301,8 @@ function resetErrorPayload(
     const messages: Record<string, string> = {
       identity_mismatch:
         'The account identity changed before redemption. Reopen the reset account list.',
+      pair_identity_mismatch:
+        'Nothing was sent: the saved redemption was started while this account was signed in as a different ChatGPT account. Sign this account back in as that ChatGPT account and retry, or wait until five minutes after the saved redemption started and spend a new credit.',
       invalid_account_key:
         'The selected account key is reserved. Reopen the reset account list.',
       cooldown_active:
@@ -1438,10 +1443,13 @@ export async function renderResetCoordinatorResult(
     )
   }
   if (code === 'ambiguous' || code === 'http_error') {
+    const refused = isRefusedConsume(result.outcome)
+      ? ' The server refused the request; five minutes after the redemption started, "Spend a reset credit" starts a new one instead.'
+        : ''
     return resetResultPayload(
       accountKey,
       code,
-      `## Reset credit result\n\nAccount: **${result.target.label}** (\`${accountKey}\`)\n\nThe redemption outcome is unknown (\`${code}\`).\n\nRetry with "Retry the last redemption" on this account. A retry within five minutes reuses the same request and credit identifiers; this does not prove the server did nothing.`,
+      `## Reset credit result\n\nAccount: **${result.target.label}** (\`${accountKey}\`)\n\nThe redemption outcome is unknown (\`${code}\`).\n\nRetry with "Retry the last redemption" on this account. A retry within five minutes reuses the same request and credit identifiers; this does not prove the server did nothing.${refused}`,
       {
         retryGuidance: result.retrySafety,
         chatgptAccountId: boundChatgptAccountId,
