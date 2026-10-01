@@ -1534,50 +1534,116 @@ describe('reset redemption bound to its ChatGPT account', () => {
   // gone through, a new spend would redeem a second credit. So once any send
   // of the pair got an unknown outcome, the pair keeps locking Spend, in
   // whichever order the two answers are written.
+  async function refusalBesideUnknownOutcome(
+    first: 'refusal' | 'unknown outcome',
+    saved: Record<string, unknown> = {},
+  ) {
+    await seedResetState('main', {
+      inFlight: pair(YOUNG, { chatgptAccountId: 'account-a', ...saved }),
+    })
+    const posts: ReturnType<typeof requestBody>[] = []
+    const bothSent = Promise.withResolvers<void>()
+    const answerRefusal = Promise.withResolvers<void>()
+    const answerUnknown = Promise.withResolvers<void>()
+    const wire = (answer: Promise<void>, reply: () => Response) =>
+      recordingWire(async () => {
+        if (posts.length === 2) bothSent.resolve()
+        await bothSent.promise
+        await answer
+        return reply()
+      }, posts)
+    const refusal = runResetCreditRedemption(
+      depsAs('account-a', {
+        fetchImpl: wire(answerRefusal.promise, () =>
+          Response.json({ error: 'bad credit' }, { status: 400 }),
+        ),
+      }),
+      inputAs('account-a', true),
+    )
+    const unknown = runResetCreditRedemption(
+      depsAs('account-a', {
+        fetchImpl: wire(answerUnknown.promise, () => new Response('{bad-json')),
+      }),
+      inputAs('account-a', true),
+    )
+    if (first === 'refusal') {
+      answerRefusal.resolve()
+      await refusal
+      answerUnknown.resolve()
+      await unknown
+    } else {
+      answerUnknown.resolve()
+      await unknown
+      answerRefusal.resolve()
+      await refusal
+    }
+    return { refusal: await refusal, posts }
+  }
+
+  // The result of the refused send tells the user what the saved pair allows
+  // once its answer is written. When the unknown outcome of the other send was
+  // written first, the refusal is not recorded and the pair still locks Spend,
+  // so the result must not promise a new spend after five minutes. A pair
+  // already holding the same refusal from an earlier send takes a different
+  // path (nothing to write), and must be reported the same way.
+  for (const [name, saved] of [
+    ['a pair not refused before', {}],
+    ['a pair already refused with the same status', { rejectedStatus: 400 }],
+  ] as const) {
+    it(`a refusal written after a concurrent unknown outcome is not reported as refused (${name})`, async () => {
+      const { refusal } = await refusalBesideUnknownOutcome(
+        'unknown outcome',
+        saved,
+      )
+
+      expect(refusal.outcome).toMatchObject({ kind: 'http_error', status: 400 })
+      expect(refusal.refused).toBeUndefined()
+      expect(refusal.retrySafety).not.toContain('starts fresh')
+      expect(refusal.retrySafety).toContain('blocks a new attempt')
+      expect((await persistedResetState())?.inFlight).not.toHaveProperty(
+        'rejectedStatus',
+      )
+    })
+  }
+
+  it('a refusal written before a concurrent unknown outcome is reported as refused', async () => {
+    const { refusal } = await refusalBesideUnknownOutcome('refusal')
+
+    expect(refusal.refused).toBe(true)
+    expect(refusal.retrySafety).toContain('starts fresh')
+  })
+
+  it('a refusal whose state write fails is not reported as refused', async () => {
+    await seedResetState('main', {
+      inFlight: pair(YOUNG, { chatgptAccountId: 'account-a' }),
+    })
+    const posts: ReturnType<typeof requestBody>[] = []
+    const deps = depsAs('account-a', {
+      fetchImpl: recordingWire(
+        () => Response.json({ error: 'bad credit' }, { status: 400 }),
+        posts,
+      ),
+    })
+    deps.mutateAccountsFn = async () => {
+      throw new Error('state write failed')
+    }
+
+    const result = await runResetCreditRedemption(
+      deps,
+      inputAs('account-a', true),
+    )
+
+    expect(result.outcome).toMatchObject({ kind: 'http_error', status: 400 })
+    expect(result.refused).toBeUndefined()
+    expect(result.retrySafety).not.toContain('starts fresh')
+    expect((await persistedResetState())?.inFlight).not.toHaveProperty(
+      'rejectedStatus',
+    )
+  })
+
   for (const first of ['refusal', 'unknown outcome'] as const) {
     it(`a refusal and a concurrent unknown outcome of the same pair keep it locking Spend (the ${first} written first)`, async () => {
-      await seedResetState('main', {
-        inFlight: pair(YOUNG, { chatgptAccountId: 'account-a' }),
-      })
-      const posts: ReturnType<typeof requestBody>[] = []
-      const bothSent = Promise.withResolvers<void>()
-      const answerRefusal = Promise.withResolvers<void>()
-      const answerUnknown = Promise.withResolvers<void>()
-      const wire = (answer: Promise<void>, reply: () => Response) =>
-        recordingWire(async () => {
-          if (posts.length === 2) bothSent.resolve()
-          await bothSent.promise
-          await answer
-          return reply()
-        }, posts)
-      const refused = runResetCreditRedemption(
-        depsAs('account-a', {
-          fetchImpl: wire(answerRefusal.promise, () =>
-            Response.json({ error: 'bad credit' }, { status: 400 }),
-          ),
-        }),
-        inputAs('account-a', true),
-      )
-      const unknown = runResetCreditRedemption(
-        depsAs('account-a', {
-          fetchImpl: wire(
-            answerUnknown.promise,
-            () => new Response('{bad-json'),
-          ),
-        }),
-        inputAs('account-a', true),
-      )
-      if (first === 'refusal') {
-        answerRefusal.resolve()
-        await refused
-        answerUnknown.resolve()
-        await unknown
-      } else {
-        answerUnknown.resolve()
-        await unknown
-        answerRefusal.resolve()
-        await refused
-      }
+      const { posts } = await refusalBesideUnknownOutcome(first)
       expect(posts).toHaveLength(2)
 
       const later = depsAs('account-a', {
