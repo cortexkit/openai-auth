@@ -46,6 +46,7 @@ import type {
   OpenCode2AuthAdapter,
   OpenCode2AuthInstallation,
 } from '@cortexkit/common-auth/opencode2'
+import { OpenCode2AuthError } from '@cortexkit/common-auth/opencode2'
 import { isQuotaMap } from '@cortexkit/common-auth/quota'
 import type { RoutingRow } from '@cortexkit/common-auth/routing'
 import type { PoolRow } from '@cortexkit/common-auth/store'
@@ -104,6 +105,14 @@ export const DEFAULT_LIMIT_MARK_MS = 60_000
  * zero everywhere every row ties and the roster order alone decides.
  */
 const NOMINAL_REQUEST_BYTES = 1
+
+/**
+ * The message of the local refusal raised when the chosen account has nothing
+ * to send with. It is fixed text and names no account, provider or vault, so
+ * the error, which the host shows and logs, carries no detail of the pool.
+ */
+export const NO_ACCOUNT_REFUSAL =
+  'request refused: no account with a usable credential'
 
 /** Most sessions whose last agent-loop account is remembered. */
 const MAX_SESSION_ACCOUNTS = 1024
@@ -551,8 +560,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     )
     const mode: RoutingMode = storage?.routing?.mode ?? 'main-first'
     const primary = input.kind === 'primary'
-    // Vault accounts the vault refused to authorize for this request. Nothing
-    // was sent with them yet, so the choice runs again without them.
+    // Accounts that have nothing to send this request with: a pool row
+    // without a usable token (its refresh failed, or it was signed out), or a
+    // vault account the vault refused to authorize. Nothing was sent with
+    // them, so the choice runs again without them, as the OpenCode 1 request
+    // path moves on to the next account.
     const refused = new Set<string>()
     let accountId: string | undefined
     for (;;) {
@@ -565,9 +577,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           storage,
           input.sessionID,
           skip,
-          // A vault refusal may be temporary (the vault unreachable for a
-          // moment), so choosing again after one does not move the session's
-          // sticky pin.
+          // A missing token or a vault refusal may be temporary (a refresh
+          // that succeeds later, the vault unreachable for a moment), so
+          // choosing again after one does not move the session's sticky pin.
           primary && refused.size === 0,
         )
       }
@@ -581,15 +593,23 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         accountId = undefined
         break
       }
-      if (!vault || byId.get(accountId)?.row) break
-      const receipt = await vault.authorize(accountId)
-      if (receipt) {
-        receipts.set(receiptKey({ ...input, accountId }), receipt)
-        break
+      const row = byId.get(accountId)?.row
+      if (row) {
+        if (source.usableToken(row) !== undefined) break
+        log?.debug('pool row holds no usable token; choosing again', {
+          accountId,
+        })
+      } else {
+        if (!vault) break
+        const receipt = await vault.authorize(accountId)
+        if (receipt) {
+          receipts.set(receiptKey({ ...input, accountId }), receipt)
+          break
+        }
+        log?.debug('the vault refused to serve an account; choosing again', {
+          accountId,
+        })
       }
-      log?.debug('the vault refused to serve an account; choosing again', {
-        accountId,
-      })
       refused.add(accountId)
     }
     if (accountId !== undefined && primary)
@@ -609,17 +629,20 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     request: AccountRequest,
   ): Promise<AccountHeadersResult<OpenAIAttemptData>> => {
     const { accountId } = request
-    // Never throw here: a throw in the WebSocket handshake switches the
-    // session to HTTP for good. Removing the credential sends the request
-    // without one, which the provider refuses, rather than with the host's
-    // placeholder.
-    const none = {
-      headers: {
-        ...CODEX_CLIENT_HEADERS,
-        authorization: null,
-        'chatgpt-account-id': null,
-      },
-    }
+    // An account chosen a moment ago may have nothing to send with by now
+    // (its token cleared or expired since, or the vault refusing this send).
+    // The request is then refused here with the installer's own no-account
+    // refusal, the one it raises when no account is chosen at all, so the
+    // host stops before sending. It is never sent without a credential, nor
+    // with the host's placeholder.
+    const refuse = () =>
+      new OpenCode2AuthError({
+        kind: 'no-account',
+        providerID: OPENAI_PROVIDER_ID,
+        sessionID: request.sessionID,
+        requestKind: request.kind,
+        message: NO_ACCOUNT_REFUSAL,
+      })
     const row = source
       .peek()
       .rows.find((candidate) => candidate.id === accountId)
@@ -628,10 +651,13 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       const receipt = receipts.get(key) ?? (await vault.authorize(accountId))
       receipts.delete(key)
       if (!receipt) {
-        log?.warn('the vault refused to serve an account; sending without', {
-          accountId,
-        })
-        return none
+        log?.warn(
+          'the vault refused to serve an account; refusing the request',
+          {
+            accountId,
+          },
+        )
+        throw refuse()
       }
       return {
         headers: {
@@ -647,10 +673,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     }
     const token = row ? source.usableToken(row) : undefined
     if (!row || !token) {
-      log?.warn('pool row holds no usable token; sending without one', {
+      log?.warn('pool row holds no usable token; refusing the request', {
         accountId,
       })
-      return none
+      throw refuse()
     }
     const identity = row.identity ?? identityOfToken(token)
     return {
