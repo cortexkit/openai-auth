@@ -31,15 +31,14 @@ import { readFileSync } from 'node:fs'
 import { type QuotaObservation, quotaCodec } from '@cortexkit/common-auth/quota'
 import {
   type OpenPoolStoreOptions,
-  PoolOperationError,
-  type PoolLockSpec,
   openPoolStore,
+  type PoolLockSpec,
+  PoolOperationError,
   type PoolRow,
   type PoolStore,
   type PullRequest,
   type RemoveView,
 } from '@cortexkit/common-auth/store'
-import type { CommandContext } from '@cortexkit/openai-auth-core'
 import {
   type AccountPaths,
   POOL_MAIN_ROW_ID,
@@ -425,76 +424,6 @@ async function poolRosterIds(store: PoolStore): Promise<string[]> {
 }
 
 /**
- * The `accountPool` the account commands use (see `CommandContext`), over the
- * store at `paths`. `afterWrite` runs after every change, so a plugin process
- * can re-read the rows its requests are routed across.
- */
-export function commandAccountPool(deps: {
-  paths: () => AccountPaths
-  store: () => PoolStore
-  afterWrite?: () => unknown
-  rowWrites?: PoolRowWriteOptions
-}): NonNullable<CommandContext['accountPool']> {
-  const written = async <T>(result: T): Promise<T> => {
-    await deps.afterWrite?.()
-    return result
-  }
-  return {
-    rows: async () => {
-      const rows = await migratedPoolRows(deps.paths(), deps.store())
-      return rows?.map((row) => ({
-        id: row.id,
-        type: row.type,
-        enabled: row.enabled,
-        ...(row.label !== undefined ? { label: row.label } : {}),
-      }))
-    },
-    add: async (account) =>
-      written(
-        await addPoolAccount(deps.store(), {
-          id: account.id,
-          refresh: account.refresh,
-          ...(account.label !== undefined ? { label: account.label } : {}),
-          ...(account.access !== undefined ? { access: account.access } : {}),
-          ...(account.expires !== undefined
-            ? { expires: account.expires }
-            : {}),
-          ...(account.accountId !== undefined
-            ? { accountId: account.accountId }
-            : {}),
-        }),
-      ),
-    disable: async (id) =>
-      written(
-        await disablePoolAccount(
-          deps.store(),
-          deps.paths(),
-          id,
-          deps.rowWrites,
-        ),
-      ),
-    enable: async (id) =>
-      written(
-        await enablePoolAccount(deps.store(), deps.paths(), id, deps.rowWrites),
-      ),
-    remove: async (id) =>
-      written(
-        await removePoolAccount(deps.store(), deps.paths(), id, deps.rowWrites),
-      ),
-    reorder: async (first, second) =>
-      written(
-        await swapPoolAccounts(
-          deps.store(),
-          deps.paths(),
-          first,
-          second,
-          deps.rowWrites,
-        ),
-      ),
-  }
-}
-
-/**
  * The legacy lock a write of the roster order holds: `main-refresh` only.
  * The order names no single row and changes no row's credential, so it takes
  * no row's fallback refresh lock.
@@ -508,6 +437,18 @@ function legacyRosterOrderLocks(
     POOL_MAIN_ROW_ID,
     options.legacyLocks,
   ).filter((lock) => lock.name === MAIN_REFRESH_LOCK_NAME)
+}
+
+/**
+ * The legacy lock every settings write and every write of the `/openai`
+ * menu holds on a migrated install: `main-refresh`, which the older writers
+ * of the same config file take.
+ */
+export function poolSettingsLocks(
+  paths: AccountPaths,
+  options: PoolRowWriteOptions = {},
+): PoolLockSpec[] {
+  return legacyRosterOrderLocks(paths, options)
 }
 
 /**

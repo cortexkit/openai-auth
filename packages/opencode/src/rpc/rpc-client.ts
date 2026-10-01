@@ -1,6 +1,6 @@
 /**
  * The TUI's RPC client, on the shared RPC machinery, typed with this plugin's
- * command names.
+ * payloads.
  */
 import {
   createRpcClient as createCommonRpcClient,
@@ -23,7 +23,12 @@ export function createRpcClient(
   expectedPid?: number,
   onSelected?: (entry: PortFileEntry | null) => void,
 ): RpcClient {
-  // The server this client reaches only queues payloads built by this plugin,
-  // so every notification carries one of its command names.
-  return createCommonRpcClient(dir, expectedPid, onSelected) as RpcClient
+  // The server this client reaches only queues payloads built by this plugin
+  // (the `/openai` menu and its messages); the shared client is typed with
+  // the older dialog shape but passes bodies through unchanged.
+  return createCommonRpcClient(
+    dir,
+    expectedPid,
+    onSelected,
+  ) as unknown as RpcClient
 }

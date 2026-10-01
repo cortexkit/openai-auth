@@ -3,10 +3,11 @@
  * the same payloads. This file stays on disk as a re-export so the existing
  * build entry and every importer that names `rpc/protocol` keep working.
  */
-export type {
-  ApplyRequest,
-  ApplyResult,
-  CommandModalName,
-  OpenDialogPayload,
-  RpcNotification,
+export {
+  type ApplyRequest,
+  type ApplyResult,
+  isNotifyPayload,
+  type NotifyPayload,
+  type OpenDialogPayload,
+  type RpcNotification,
 } from '@cortexkit/openai-auth-core/tui-support'

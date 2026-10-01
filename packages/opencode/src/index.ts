@@ -8,10 +8,15 @@ import {
 } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
+import { parseApplyRequest } from '@cortexkit/common-auth/commands'
 import {
   adoptRpcServer,
   type RpcServerAdoption,
 } from '@cortexkit/common-auth/rpc'
+import {
+  type ResetTargetIdentity,
+  writeSettings,
+} from '@cortexkit/openai-auth-core'
 import {
   type AccountStorage,
   acquireRefreshFileLock,
@@ -21,6 +26,7 @@ import {
   CUSTODY_EXCLUDED,
   CUSTODY_REFUSE,
   CustodyTombstoneRefreshError,
+  cacheKeepSettings,
   claustrumMode,
   codexRefreshFn,
   errorMessage,
@@ -29,7 +35,6 @@ import {
   FALLBACK_REFRESH_LOCK_TTL_MS,
   type FallbackAccount,
   FallbackAccountManager,
-  fallbackRefreshLockName,
   formatRefreshBackoffMessage,
   getKillswitchThresholdsForAccount,
   hashRefreshToken,
@@ -72,18 +77,11 @@ import type {
 } from '@opencode-ai/plugin'
 import { createAuthMethods } from './auth/methods'
 import {
-  buildDialogPayload,
-  type CommandContext,
-  MODAL_COMMANDS,
-  OPENAI_ACCOUNT_COMMAND_NAME,
-  OPENAI_CACHEKEEP_COMMAND_NAME,
-  OPENAI_DUMP_COMMAND_NAME,
-  OPENAI_KILLSWITCH_COMMAND_NAME,
-  OPENAI_LOGGING_COMMAND_NAME,
-  OPENAI_QUOTA_COMMAND_NAME,
-  OPENAI_RESET_COMMAND_NAME,
-  OPENAI_ROUTING_COMMAND_NAME,
-  type ResetTargetIdentity,
+  applyOpenAiMenu,
+  menuText,
+  OPENAI_COMMAND_NAME,
+  type OpenCodeMenuContext,
+  openOpenAiMenu,
 } from './commands'
 import { getConfigDir, getConfigPath, getSettings } from './config'
 import { getAccountPaths, getAccountStatePath } from './core/account-paths'
@@ -119,7 +117,11 @@ import {
   releaseCustodyLoginLeaseAfterHostWrite,
 } from './core/custody-transition.ts'
 import { PoolAccountSource } from './core/pool-account-source'
-import { commandAccountPool } from './core/pool-accounts'
+import {
+  openAccountPool,
+  poolMigrated,
+  poolSettingsLocks,
+} from './core/pool-accounts'
 import {
   createPoolLifecycle,
   type PoolLifecycle,
@@ -156,6 +158,7 @@ import {
   type StickyBreakDecision,
   selectStickyCandidate,
 } from './core/sticky-routing'
+import { migrationFenceOpen } from './core/version-fence'
 import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
 import { createLogger, setLogLevel } from './logger'
 import { loadModelsDevCosts } from './model-costs'
@@ -165,11 +168,7 @@ import {
   isTuiConnected,
   pushNotification,
 } from './rpc/notifications'
-import type {
-  ApplyRequest,
-  ApplyResult,
-  CommandModalName,
-} from './rpc/protocol'
+import type { ApplyRequest, ApplyResult } from './rpc/protocol'
 import { resolveRpcDir } from './rpc/rpc-dir'
 import { RPC_SERVER_REGISTRY_KEY, startRpcServer } from './rpc/rpc-server'
 import {
@@ -668,6 +667,35 @@ function cleanAbort(): never {
   throw new Error(HANDLED_SENTINEL)
 }
 
+/**
+ * One write of the top-level settings the loader keeps (the main account's
+ * ChatGPT identity, the main-refresh lease and its backoff). On a migrated
+ * install it goes through the pool store's `updateSettings`, which writes
+ * neither the roster nor the state file; before the migration it is the
+ * legacy store's locked read-modify-write, as it always was.
+ *
+ * `holdsMainRefreshLock`: the caller already holds `main-refresh`, the lock a
+ * settings write otherwise takes alongside the store's own.
+ */
+async function writeLoaderSettings(
+  edit: (current: AccountStorage) => void,
+  options: { holdsMainRefreshLock?: boolean } = {},
+): Promise<void> {
+  const paths = getAccountPaths(getConfigPath())
+  if (poolMigrated(paths.configPath)) {
+    await writeSettings(
+      openAccountPool(paths),
+      options.holdsMainRefreshLock ? undefined : poolSettingsLocks(paths),
+      (settings) => edit(settings as unknown as AccountStorage),
+    )
+    return
+  }
+  await mutateAccounts((current) => {
+    edit(current)
+    return current
+  }, paths)
+}
+
 function jitterMs(baseMs: number) {
   return Math.floor(Math.random() * baseMs)
 }
@@ -719,8 +747,6 @@ interface CodexAuthPluginOptions {
     sleep?: (ms: number) => Promise<void>
     /** Test seam: observes a host-write observation deadline warning. */
     warn?: (message: string) => void
-    /** Test seam: observes the account lock around custody binding checks. */
-    withFallbackAccountLock?: CommandContext['withFallbackAccountLock']
     /** Test seam: replaces external OAuth I/O while preserving the hook callback. */
     authorize?: {
       browser?: () => Promise<{
@@ -1350,7 +1376,7 @@ export async function CodexAuthPlugin(
   // Command context holder — filled by the auth loader on first run.
   // command.execute.before reads this; if null (auth not loaded yet),
   // the command is rejected with a message.
-  let cmdCtx: CommandContext | null = null
+  let cmdCtx: OpenCodeMenuContext | null = null
   const hostAuth = input.client.auth as unknown as {
     all(): Promise<Record<string, unknown>>
     get(input: { path: { id: string } }): Promise<unknown>
@@ -1566,12 +1592,6 @@ export async function CodexAuthPlugin(
   let loaderGetAuth:
     | Parameters<NonNullable<NonNullable<Hooks['auth']>['loader']>>[0]
     | undefined
-  const custodyQuotaDepsForAuthMenu: Pick<
-    Parameters<typeof refreshAllQuota>[0],
-    | 'isFallbackRefreshInert'
-    | 'resolveFallbackAccess'
-    | 'reportCustodyAuthFailure'
-  > = {}
   const authMethods = createAuthMethods({
     client: input.client,
     getAuth: async () => loaderGetAuth?.(),
@@ -1588,7 +1608,6 @@ export async function CodexAuthPlugin(
             ),
           }
         : {}),
-      custodyQuotaDeps: custodyQuotaDepsForAuthMenu,
     },
     onMainSlotWritten: async () => {
       await poolLifecycle?.requestAdoption()
@@ -1985,10 +2004,9 @@ export async function CodexAuthPlugin(
             // Authoritative RMW: a stale saveAccounts here would union this
             // loader's snapshot back over disk and could resurrect a
             // concurrently-removed account (and its secrets in the state file).
-            await mutateAccounts((current) => {
+            await writeLoaderSettings((current) => {
               current.mainAccountId = liveAccountId
-              return current
-            }, getAccountPaths(getConfigPath()))
+            })
             storage.mainAccountId = liveAccountId
             invalidateRequestStorageCache()
           }
@@ -2137,10 +2155,9 @@ export async function CodexAuthPlugin(
                 servedMainAccountId &&
                 servedMainAccountId !== storage?.mainAccountId
               ) {
-                await mutateAccounts((current) => {
+                await writeLoaderSettings((current) => {
                   current.mainAccountId = servedMainAccountId
-                  return current
-                }, getAccountPaths(getConfigPath()))
+                })
                 if (storage) storage.mainAccountId = servedMainAccountId
                 custodyBootstrap.mainAccountId = servedMainAccountId
                 invalidateRequestStorageCache()
@@ -2254,11 +2271,6 @@ export async function CodexAuthPlugin(
             recordVersion: params.recordVersion,
           })
         }
-        Object.assign(custodyQuotaDepsForAuthMenu, {
-          isFallbackRefreshInert: isFallbackAccountRefreshInert,
-          resolveFallbackAccess: resolveAccountAccessForCustody,
-          reportCustodyAuthFailure: reportAuthFailureForCustody,
-        })
         function buildRefreshAllQuotaDeps(
           overrides: Partial<
             Pick<
@@ -2328,10 +2340,15 @@ export async function CodexAuthPlugin(
         // CacheKeepManager — prompt-cache warmer for idle main-agent sessions
         // -------------------------------------------------------------------
         const cacheKeepLogger = createLogger('cachekeep')
-        let cacheKeepEnabled = storage?.cachekeep?.enabled === true
-        let cacheKeepSubagents = storage?.cachekeep?.subagents === true
-        let cacheKeepSustain = storage?.cachekeep?.sustain === true
-        let cacheKeepWindow = getCacheKeepWindow(storage)
+        // Read under either name: a migrated install renames `cachekeep` to
+        // `cacheKeep` on its first settings write.
+        const storedCacheKeep = cacheKeepSettings(storage)
+        let cacheKeepEnabled = storedCacheKeep?.enabled === true
+        let cacheKeepSubagents = storedCacheKeep?.subagents === true
+        let cacheKeepSustain = storedCacheKeep?.sustain === true
+        let cacheKeepWindow = getCacheKeepWindow(
+          storage ? { ...storage, cachekeep: storedCacheKeep } : storage,
+        )
         let mainRefreshPromise:
           | Promise<{ access: string; refresh: string; expires: number }>
           | undefined
@@ -2371,14 +2388,15 @@ export async function CodexAuthPlugin(
         async function updateMainRefreshState(
           update: (storage: AccountStorage) => void,
         ) {
-          // Authoritative RMW under the store lock so persisting the main-refresh
-          // lease can never union a stale account list back over disk (which
-          // would resurrect a concurrently-removed account's secrets in state).
-          await mutateAccounts((current) => {
-            current.refresh = current.refresh ?? {}
-            update(current)
-            return current
-          }, getAccountPaths(getConfigPath()))
+          // Every caller holds `main-refresh` already, so the write must not
+          // take it again.
+          await writeLoaderSettings(
+            (current) => {
+              current.refresh = current.refresh ?? {}
+              update(current)
+            },
+            { holdsMainRefreshLock: true },
+          )
           invalidateRequestStorageCache()
         }
 
@@ -3159,74 +3177,6 @@ export async function CodexAuthPlugin(
         // Start the loopback RPC server so the TUI can drain notifications and
         // dispatch apply commands.
         // -------------------------------------------------------------------
-        const defaultWithFallbackAccountLock = async <T>(
-          accountId: string,
-          action: () => Promise<T>,
-        ): Promise<T> => {
-          const lock = await acquireRefreshFileLock({
-            name: fallbackRefreshLockName(accountId),
-            ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
-            path: getConfigPath(),
-            renew: true,
-          })
-          if (!lock) throw new Error('Fallback account lock unavailable')
-          try {
-            return await action()
-          } finally {
-            await lock.release()
-          }
-        }
-        const withFallbackAccountLock =
-          custodyOptions?.withFallbackAccountLock ??
-          defaultWithFallbackAccountLock
-        const checkUsableCustodyBinding = async (account: OAuthAccount) => {
-          const manifest = await readCustodyManifest()
-          if (!manifest.ok) {
-            return {
-              ready: false as const,
-              reason: 'manifest-unreadable' as const,
-            }
-          }
-          const handle = lookupManifestHandle(manifest, account.id)
-          if (!handle)
-            return { ready: false as const, reason: 'no-handle' as const }
-          const cache = custodyRuntime.getCache()
-          if (!cache) {
-            return { ready: false as const, reason: 'vault-cold' as const }
-          }
-          if (cache.isReauth(handle, custodyOptions?.now?.() ?? Date.now())) {
-            return { ready: false as const, reason: 'vault-reauth' as const }
-          }
-          if (cache.isBlocked(handle)) {
-            return { ready: false as const, reason: 'vault-cold' as const }
-          }
-          try {
-            const credential = await cache.get(handle, custodyMinTtlMs(storage))
-            const accountId = mainAccountIdFromServedCredential(
-              credential.payload.access,
-            )
-            if (
-              !accountId ||
-              (account.accountId && account.accountId !== accountId)
-            ) {
-              return {
-                ready: false as const,
-                reason: 'identity-mismatch' as const,
-              }
-            }
-            return { ready: true as const, accountId }
-          } catch {
-            return {
-              ready: false as const,
-              reason: cache.isReauth(
-                handle,
-                custodyOptions?.now?.() ?? Date.now(),
-              )
-                ? ('vault-reauth' as const)
-                : ('vault-cold' as const),
-            }
-          }
-        }
         activeFallbackManager?.stopBackgroundRefresh()
         activeFallbackManager = fallbackManager
         cmdCtx = {
@@ -3235,17 +3185,29 @@ export async function CodexAuthPlugin(
           packageVersion: PackageVersion,
           quotaManager,
           loadAccounts,
-          client: input.client as CommandContext['client'],
           beginAccountLogin,
-          withFallbackAccountLock,
-          checkUsableCustodyBinding,
-          accountPool: commandAccountPool({
-            paths: () => getAccountPaths(getConfigPath()),
-            store: () => poolSource.poolStore(),
-            // Re-read the pool after a change, so requests route across the
-            // changed rows at once and a newly added row gets its first poll.
-            afterWrite: () => poolSource.load(),
-          }),
+          store: () => poolSource.poolStore(),
+          // The menu needs the pool; until the install has migrated it shows
+          // only what holds the move back (the version fence's blockers).
+          migration: async () => {
+            if (await poolSource.active()) return { migrated: true }
+            const fence = await (
+              poolMigrationDeps.fence ??
+              (() => migrationFenceOpen({ currentVersion: PackageVersion }))
+            )()
+            return {
+              migrated: false,
+              blockers: fence.open
+                ? []
+                : fence.blockers.map((blocker) => ({
+                    pid: blocker.pid,
+                    version: blocker.version,
+                  })),
+            }
+          },
+          // Re-read the pool after a change, so requests route across the
+          // changed rows at once and a newly added row gets its first poll.
+          afterWrite: () => poolSource.load(),
           enterClaustrumMode: async () => {
             const current = await loadAccounts(getAccountPaths(getConfigPath()))
             const accountIds = (current?.accounts ?? [])
@@ -3476,20 +3438,11 @@ export async function CodexAuthPlugin(
                   secureDir: activeRpcDir.secureDir,
                   sweepRoot: activeRpcDir.sweepRoot,
                   drain: drainNotifications,
-                  apply: async (
-                    request: ApplyRequest,
-                  ): Promise<ApplyResult> => {
-                    const callCtx: CommandContext = {
-                      // biome-ignore lint/style/noNonNullAssertion: cmdCtx is set in the loader before RPC server starts, and command.execute.before has a null guard
-                      ...cmdCtx!,
-                      sessionId: request.sessionId,
-                    }
-                    const payload = await buildDialogPayload(
-                      request.command,
-                      request.arguments,
-                      callCtx,
-                    )
-                    return { text: payload.text, knobs: payload.knobs }
+                  apply: async (request: unknown): Promise<ApplyResult> => {
+                    const parsed = parseApplyRequest(request)
+                    if (!parsed) throw new Error('not an /openai apply request')
+                    // biome-ignore lint/style/noNonNullAssertion: cmdCtx is set in the loader before the RPC server starts
+                    return applyOpenAiMenu(cmdCtx!, parsed as ApplyRequest)
                   },
                 }),
             )
@@ -5353,44 +5306,10 @@ export async function CodexAuthPlugin(
       })
       config.command = {
         ...(config.command ?? {}),
-        [OPENAI_QUOTA_COMMAND_NAME]: {
-          template: OPENAI_QUOTA_COMMAND_NAME,
+        [OPENAI_COMMAND_NAME]: {
+          template: OPENAI_COMMAND_NAME,
           description:
-            'Show current OpenAI Codex OAuth quota usage for all accounts.',
-        },
-        [OPENAI_ACCOUNT_COMMAND_NAME]: {
-          template: OPENAI_ACCOUNT_COMMAND_NAME,
-          description:
-            'Manage OpenAI accounts — add, switch, remove, or reorder.',
-        },
-        [OPENAI_ROUTING_COMMAND_NAME]: {
-          template: OPENAI_ROUTING_COMMAND_NAME,
-          description:
-            'Show or change OpenAI account routing between main-first, fallback-first, and sticky-balanced.',
-        },
-        [OPENAI_KILLSWITCH_COMMAND_NAME]: {
-          template: OPENAI_KILLSWITCH_COMMAND_NAME,
-          description:
-            'Manage killswitch — hard-block requests when quota drops below per-account thresholds.',
-        },
-        [OPENAI_DUMP_COMMAND_NAME]: {
-          template: OPENAI_DUMP_COMMAND_NAME,
-          description:
-            'Show or toggle OpenAI Codex request dump capture for debugging.',
-        },
-        [OPENAI_LOGGING_COMMAND_NAME]: {
-          template: OPENAI_LOGGING_COMMAND_NAME,
-          description:
-            'Show or change the plugin log level (error, warn, info, debug, trace).',
-        },
-        [OPENAI_CACHEKEEP_COMMAND_NAME]: {
-          template: OPENAI_CACHEKEEP_COMMAND_NAME,
-          description:
-            'Keep Codex prompt cache alive during idle by shadow-replaying the last request.',
-        },
-        [OPENAI_RESET_COMMAND_NAME]: {
-          template: OPENAI_RESET_COMMAND_NAME,
-          description: 'Spend one reset credit on an exhausted Codex account.',
+            'OpenAI accounts: quota, routing, limits, cache keep-warm, diagnostics and reset credits.',
         },
       }
     },
@@ -5401,12 +5320,10 @@ export async function CodexAuthPlugin(
     }) => {
       createLogger('commands').info('command hook entered', {
         command: input.command,
-        arguments: input.arguments,
-        modal: MODAL_COMMANDS.includes(input.command as CommandModalName),
         hasCmdCtx: cmdCtx !== null,
         pid: process.pid,
       })
-      if (!MODAL_COMMANDS.includes(input.command as CommandModalName)) return
+      if (input.command !== OPENAI_COMMAND_NAME) return
       if (!cmdCtx) {
         createLogger('commands').warn('command rejected: context not loaded', {
           command: input.command,
@@ -5418,29 +5335,12 @@ export async function CodexAuthPlugin(
         )
         cleanAbort()
       }
-      const command = input.command as CommandModalName
-      // Build a PER-INVOCATION context that threads this request's session id and
-      // notifier. Mutating the shared cmdCtx would race across concurrent sessions:
-      // the detached add-flow snapshots ctx.sessionId only after an await, so a
-      // second session's modal command in that window could misroute the first
-      // session's OAuth feedback. A per-call copy is never mutated by another turn.
-      const callCtx: CommandContext = {
-        // biome-ignore lint/style/noNonNullAssertion: guarded above (cleanAbort throws when cmdCtx is null)
-        ...cmdCtx!,
-        sessionId: input.sessionID,
-        notify: (payload) => {
-          pushNotification(payload, input.sessionID)
-        },
-      }
-      const payload = await buildDialogPayload(
-        command,
-        input.arguments,
-        callCtx,
-      )
+      // biome-ignore lint/style/noNonNullAssertion: guarded above (cleanAbort throws when cmdCtx is null)
+      const payload = await openOpenAiMenu(cmdCtx!, input.sessionID)
       if (isTuiConnected(input.sessionID)) {
         pushNotification(payload, input.sessionID)
       } else {
-        await sendIgnoredMessage(input.sessionID, payload.text)
+        await sendIgnoredMessage(input.sessionID, menuText(payload.menu))
       }
       cleanAbort()
     },

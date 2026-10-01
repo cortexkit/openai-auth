@@ -18,7 +18,6 @@ import type {
   OpenAiMenuOptions,
   ResetCreditsDeps,
   ResetStepResult,
-  SessionSectionDeps,
   ApplyRequest as RootApplyRequest,
   ApplyResult as RootApplyResult,
   CacheKeepManager as RootCacheKeepManager,
@@ -26,6 +25,7 @@ import type {
   OpenDialogPayload as RootOpenDialogPayload,
   ResetTargetIdentity as RootResetTargetIdentity,
   RpcNotification as RootRpcNotification,
+  SessionSectionDeps,
 } from '../index.ts'
 import type {
   AccountBase,
@@ -54,9 +54,9 @@ import type {
   KillswitchConfig,
   KillswitchThresholds,
   Level,
+  NotifyPayload,
   OAuthAccount,
   OAuthQuotaSnapshot,
-  NotifyPayload,
   OpenDialogPayload,
   PendingOAuth,
   PkceCodes,

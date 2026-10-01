@@ -2080,7 +2080,10 @@ export function getKillswitchThresholdsForAccount(
   if (!storage?.killswitch) return DEFAULT_KILLSWITCH_THRESHOLDS
   if (storage.killswitch.schema === KILLSWITCH_FLOORS_SCHEMA) {
     const own = storage.killswitch.accounts?.[accountId ?? 'main']
-    return { primary: floorOf(own?.primary), secondary: floorOf(own?.secondary) }
+    return {
+      primary: floorOf(own?.primary),
+      secondary: floorOf(own?.secondary),
+    }
   }
   if (accountId && storage.killswitch.accounts?.[accountId]) {
     return normalizeKillswitchThresholds(storage.killswitch.accounts[accountId])

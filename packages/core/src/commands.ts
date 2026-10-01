@@ -604,10 +604,7 @@ export function claustrumSection(
 export interface ResetCreditsDeps {
   configPath: string
   statePath: string
-  quotaManager: Pick<
-    QuotaManager,
-    'isRateLimited' | 'getMain' | 'getFallback'
-  >
+  quotaManager: Pick<QuotaManager, 'isRateLimited' | 'getMain' | 'getFallback'>
   loadAccounts: typeof defaultLoadAccounts
   /** The writer of the reset state: `settingsMutateAccounts` on a migrated install. */
   mutateAccounts: typeof defaultMutateAccounts
@@ -692,7 +689,9 @@ async function spendResetCredit(
 }
 
 /** Reset credits: preview an account, spend a credit, retry a redemption. */
-export function resetCreditsSection(deps: ResetCreditsDeps): PluginExtraSection {
+export function resetCreditsSection(
+  deps: ResetCreditsDeps,
+): PluginExtraSection {
   return {
     id: 'reset',
     title: 'Reset credits',

@@ -54,9 +54,8 @@ import {
   type OAuthQuotaSnapshot,
   refreshBeforeExpiryMs,
 } from '@cortexkit/openai-auth-core/internal'
-
-import { identityOfToken } from './main-account.ts'
 import { observationFromSnapshot } from '@cortexkit/openai-auth-core/pool-quota'
+import { identityOfToken } from './main-account.ts'
 
 /**
  * Longest a request waits for a lock-free re-read of the pool files before

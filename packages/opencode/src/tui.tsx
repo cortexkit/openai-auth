@@ -17,7 +17,7 @@ import {
   Show,
 } from 'solid-js'
 import { createLogger } from './logger.js'
-import type { ApplyRequest, CommandModalName } from './rpc/protocol.js'
+import { type ApplyRequest, isNotifyPayload } from './rpc/protocol.js'
 import { createRpcClient } from './rpc/rpc-client.js'
 import { resolveRpcDir } from './rpc/rpc-dir.js'
 import {
@@ -54,13 +54,19 @@ const log = createLogger('rpc-tui')
 
 const ID = 'cortexkit.openai-auth'
 
+/** One drawer action as the RPC apply request carries it, with its session. */
 export function buildApplyRequest(
-  command: CommandModalName,
-  arguments_: string,
+  request: Omit<ApplyRequest, 'sessionId'>,
   sessionId?: string,
 ): ApplyRequest {
-  return { command, arguments: arguments_, sessionId }
+  return { ...request, ...(sessionId !== undefined ? { sessionId } : {}) }
 }
+
+/**
+ * How long the drawer waits for one action: a reset-credit redemption polls
+ * the provider and can take most of this.
+ */
+const MENU_APPLY_TIMEOUT_MS = 90_000
 
 // Read package metadata from the development source or either generated TUI
 // variant. Avoid a JSON import because package.json sits outside the declaration
@@ -539,77 +545,6 @@ function AccountBlock(props: {
   )
 }
 
-// --- Quota dialog content ---------------------------------------------------
-
-// Renders the same rich visualization as the sidebar (account blocks with
-// quota bars + pacing) so the modal matches the sidebar look.
-function QuotaDialogContent(props: {
-  api: TuiPluginApi
-  controller: SidebarController
-  sessionId: string | undefined
-}) {
-  const prefs = props.controller.prefs
-  const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
-  let lastUpdated = 0
-  async function refresh() {
-    const next = await readStateFromFile()
-    if (next.lastUpdated !== lastUpdated) {
-      lastUpdated = next.lastUpdated
-      setState(next)
-    }
-  }
-  createEffect(() => {
-    const timer = setInterval(refresh, prefs().pollMs)
-    onCleanup(() => clearInterval(timer))
-  })
-  setTimeout(refresh, 0)
-  const theme = () => props.api.theme.current
-  const enabledFallbacks = () =>
-    (state().fallbacks ?? []).filter((f) => f.enabled)
-  const activeId = () => resolveQuotaDialogActiveId(state(), props.sessionId)
-  const quotaLabelWidth = () => computeQuotaLabelWidth(renderedQuotas(state()))
-  return (
-    <box flexDirection='column' padding={2} width='100%' alignItems='center'>
-      <box flexDirection='column' width={58}>
-        <box width='100%' justifyContent='center' marginBottom={1}>
-          <text fg={theme().text}>
-            <b>Codex Quota</b>
-          </text>
-        </box>
-        <AccountBlock
-          theme={theme()}
-          appearance={prefs().appearance}
-          name='main'
-          quota={state().main?.quota ?? null}
-          killed={state().main?.killed ?? false}
-          active={activeId() === 'main'}
-          pacingEnabled={prefs().sections.pacing}
-          labelWidth={quotaLabelWidth()}
-          resetCredits={state().main?.resetCredits}
-        />
-        <Show when={prefs().sections.fallbackAccounts}>
-          <For each={enabledFallbacks()}>
-            {(fb) => (
-              <AccountBlock
-                theme={theme()}
-                appearance={prefs().appearance}
-                name={fb.label ?? fb.id}
-                quota={fb.quota}
-                killed={fb.killed}
-                active={activeId() === fb.id}
-                pacingEnabled={prefs().sections.pacing}
-                labelWidth={quotaLabelWidth()}
-                resetCredits={fb.resetCredits}
-                marginTop={1}
-              />
-            )}
-          </For>
-        </Show>
-      </box>
-    </box>
-  )
-}
-
 // --- State plumbing ---------------------------------------------------------
 
 export async function readStateFromFile(): Promise<SidebarState> {
@@ -1041,26 +976,16 @@ const tui: TuiPlugin = async (api) => {
         .then((messages) => {
           for (const message of [...messages].sort((a, b) => a.id - b.id)) {
             lastNotificationId = Math.max(lastNotificationId, message.id)
-            if (message.payload.command === 'openai-quota') {
-              api.ui.dialog.setSize('xlarge')
-              api.ui.dialog.replace(() => (
-                <QuotaDialogContent
-                  api={api}
-                  controller={controller}
-                  sessionId={sessionId}
-                />
-              ))
+            const payload = message.payload
+            if (isNotifyPayload(payload)) {
+              api.ui.toast({ message: payload.notify.message })
               continue
             }
-            openCommandDialog(
-              api,
-              message.payload,
-              (command, args) =>
-                rpcClient.apply(
-                  buildApplyRequest(command, args, sessionId),
-                  command === 'openai-reset' ? 90_000 : undefined,
-                ),
-              sessionId,
+            openCommandDialog(api, payload, (request) =>
+              rpcClient.apply(
+                buildApplyRequest(request, sessionId),
+                MENU_APPLY_TIMEOUT_MS,
+              ),
             )
           }
         })

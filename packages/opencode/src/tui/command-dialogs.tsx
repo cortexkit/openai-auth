@@ -1,1096 +1,393 @@
 /** @jsxImportSource @opentui/solid */
 
-import { errorMessage, openUrl } from '@cortexkit/openai-auth-core/tui-support'
+// The `/openai` drawer: one generic renderer for the shared command menu's
+// payload. The payload carries everything drawn here (sections with their
+// lines, items, facts and actions; each action's typed inputs with their
+// current values and its confirmation), so the drawer knows nothing about
+// any one section. After every apply it redraws from the refreshed menu the
+// result carries.
+
 import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import { createLogger } from '../logger'
-import type { OpenDialogPayload } from '../rpc/protocol.js'
-import {
-  type AccountQuota,
-  getCollapsedQuotaSummary,
-  getSidebarState,
-  resolveSessionSidebarRouting,
-  type SidebarState,
-} from '../sidebar-state.js'
+import type {
+  ApplyRequest,
+  ApplyResult,
+  OpenDialogPayload,
+} from '../rpc/protocol.js'
 
 const log = createLogger('rpc-tui')
 
-type ApplyFn = (
-  command: OpenDialogPayload['command'],
-  args: string,
-) => Promise<{ text: string; knobs: Record<string, unknown> }>
+type Menu = OpenDialogPayload['menu']
+type Section = Menu['sections'][number]
+type Item = Section['items'][number]
+type Action = Section['actions'][number]
+type Knob = Action['knobs'][number]
+type KnobValue = string | number | boolean | null
 
-export function buildCachekeepDialogOptions(payload: OpenDialogPayload) {
-  const enabled = payload.knobs.enabled === true
-  const subagents = payload.knobs.subagents === true
-  const sustain = payload.knobs.sustain === true
-  const running = payload.knobs.running === true
-  const tracked = Number(payload.knobs.tracked ?? 0)
-  const generatedAt = Number(payload.knobs.generatedAt ?? Date.now())
-  const lastWarmAt = Number(payload.knobs.lastWarmAt ?? 0)
-  const maxIdleWarmMs = Number(payload.knobs.maxIdleWarmMs ?? 60 * 60 * 1000)
-  const maxSubagentIdleMs = Number(
-    payload.knobs.maxSubagentIdleMs ?? 30 * 60 * 1000,
-  )
-  const windowKnob = payload.knobs.window as
-    | { startHour: number; endHour: number }
-    | undefined
-  const windowLabel = windowKnob
-    ? `${String(windowKnob.startHour).padStart(2, '0')}-${String(windowKnob.endHour).padStart(2, '0')}`
-    : 'always (no window)'
-  const lastWarm = lastWarmAt
-    ? `${Math.ceil((generatedAt - lastWarmAt) / 1000)}s ago`
-    : 'none yet'
-  const idleWindow = Math.round(maxIdleWarmMs / 60_000)
-  const subIdleWindow = Math.round(maxSubagentIdleMs / 60_000)
-  const statusParts = [
-    enabled ? '● Enabled' : '○ Disabled',
-    `timer ${running ? 'armed' : 'idle'}`,
-    `${tracked} tracked`,
-    `last warm ${lastWarm}`,
-    `window ${windowLabel}`,
-    `${idleWindow}m idle cap`,
-    `sustain ${sustain ? 'on' : 'off'}`,
-    `subagent idle ${subIdleWindow}m`,
-  ].filter((part) => part.length > 0)
+/** Sends one action to the plugin; the session id is added by the caller. */
+export type ApplyFn = (
+  request: Omit<ApplyRequest, 'sessionId'>,
+) => Promise<ApplyResult>
 
-  return [
-    {
-      title: statusParts.join(' | '),
-      value: 'status',
-      description: 'Current cachekeep state',
-    },
-    {
-      title: enabled ? 'Turn off' : 'Turn on',
-      value: enabled ? 'off' : 'on',
-      description: enabled
-        ? 'Stop capturing and warming prompt-cache prefixes'
-        : 'Persistently enable capture; the timer self-arms on request capture',
-    },
-    {
-      title: subagents ? 'Subagent warming: on' : 'Subagent warming: off',
-      value: subagents ? 'subagents off' : 'subagents on',
-      description: subagents
-        ? `Warm subagent sessions (${subIdleWindow}m idle cap). Disable to skip subagents.`
-        : `Skip subagent sessions. Enable to warm them too (${subIdleWindow}m idle cap).`,
-    },
-    {
-      title: sustain
-        ? 'Sustain main sessions: on'
-        : 'Sustain main sessions: off',
-      value: sustain ? 'sustain off' : 'sustain on',
-      description:
-        'main-only, idle-cap only; the configured clock window still applies.',
-    },
-    {
-      title: windowKnob ? `Warm window: ${windowLabel}` : 'Set warm window…',
-      value: 'set_window',
-      description: windowKnob
-        ? `Currently only warming between ${windowLabel} local hours — pick to change`
-        : 'Restrict capture + warm to a clock-hour window, e.g. 9-18 or 22-6',
-    },
-    {
-      title: 'Clear warm window',
-      value: 'clear_window',
-      description: windowKnob
-        ? 'Remove the clock-hour restriction — return to always-warm (within idle caps)'
-        : 'No clock-hour window is currently set',
-    },
-    {
-      title: 'Refresh status',
-      value: 'refresh',
-      description: 'Re-read cachekeep status',
-    },
-    {
-      title: 'Close',
-      value: 'close',
-      description: 'Close this dialog',
-    },
-  ]
-}
-
-type ResetAccountKnob = {
-  accountKey: string
-  label: string
-  usedPercent?: number
-  availableCount?: number
-  applicableAvailableCount?: number
-  eligible: boolean
-  reason?: string
-  selectedCreditId?: string
-  selectedCreditExpiresAt?: string
-}
-
-type ResetPreviewKnob = ResetAccountKnob & {
-  chatgptAccountId?: string
-  resetTime?: string
-}
-
-type ResetDialogOption = {
+export interface DrawerOption {
   title: string
   value: string
-  description: string
-  disabled?: boolean
+  description?: string
 }
 
-function resetAccountOptions(payload: OpenDialogPayload): ResetDialogOption[] {
-  const accounts = Array.isArray(payload.knobs.accounts)
-    ? (payload.knobs.accounts as ResetAccountKnob[])
-    : []
+const BACK = 'back'
+
+/** One option per section, in the order the menu gives them. */
+export function sectionListOptions(menu: Menu): DrawerOption[] {
+  return menu.sections.map((section) => ({
+    title: section.title,
+    value: `section:${section.id}`,
+    ...(section.lines[0] ? { description: section.lines[0] } : {}),
+  }))
+}
+
+function factLines(facts: Record<string, unknown> | undefined): string[] {
+  return Object.entries(facts ?? {}).map(
+    ([name, value]) =>
+      `${name}: ${typeof value === 'string' ? value : JSON.stringify(value)}`,
+  )
+}
+
+/**
+ * A section's rows: its read-only lines and facts first (selecting one does
+ * nothing), then its items, its own actions, and Back.
+ */
+export function sectionOptions(section: Section): DrawerOption[] {
   return [
-    ...accounts.map((account) => {
-      const used =
-        account.usedPercent === undefined
-          ? 'quota unavailable'
-          : `${account.usedPercent}%`
-      const counts = `${account.applicableAvailableCount === undefined ? '?' : account.applicableAvailableCount}/${account.availableCount ?? '?'}`
-      const status = account.eligible
-        ? 'eligible'
-        : (account.reason ?? 'unavailable')
-      const details = `${used} · ${counts}`
-      const shortDate =
-        account.selectedCreditExpiresAt?.slice(0, 10) ?? 'unknown'
-      return {
-        title: `${account.label} — ${status}`,
-        value: `account:${account.accountKey}`,
-        description: account.eligible
-          ? `${details} · exp ${shortDate}`
-          : details,
-      }
-    }),
-    {
-      title: 'Refresh',
-      value: 'refresh',
-      description: 'Re-check account quota and reset credits',
-    },
-    {
-      title: 'Close',
-      value: 'close',
-      description: 'Close this dialog',
-    },
+    ...[...section.lines, ...factLines(section.facts)].map((line, index) => ({
+      title: line,
+      value: `line:${index}`,
+    })),
+    ...section.items.map((item) => ({
+      title: item.label,
+      value: `item:${item.id}`,
+      ...(item.detail ? { description: item.detail } : {}),
+    })),
+    ...section.actions.map((action) => ({
+      title: action.label,
+      value: `action:${action.id}`,
+      ...(action.description ? { description: action.description } : {}),
+    })),
+    { title: 'Back', value: BACK },
   ]
 }
 
-function resetResultOptions(payload: OpenDialogPayload): ResetDialogOption[] {
-  const accountKey =
-    typeof payload.knobs.accountKey === 'string'
-      ? payload.knobs.accountKey
-      : undefined
-  const chatgptAccountId =
-    typeof payload.knobs.chatgptAccountId === 'string'
-      ? payload.knobs.chatgptAccountId
-      : undefined
-  const code = typeof payload.knobs.code === 'string' ? payload.knobs.code : ''
-  const retrySafe =
-    (code === 'ambiguous' ||
-      code === 'http_error' ||
-      code === 'expired_unreconciled' ||
-      payload.knobs.stateWriteFailed === true) &&
-    typeof payload.knobs.retryGuidance === 'string' &&
-    accountKey !== undefined &&
-    chatgptAccountId !== undefined
+/** An item's rows: its facts (read-only), its actions, and Back. */
+export function itemOptions(item: Item): DrawerOption[] {
   return [
-    {
-      title: payload.text,
-      value: 'result',
-      description: 'Command result',
-    },
-    ...(retrySafe
-      ? [
-          {
-            title: 'Retry',
-            value: 'retry',
-            description:
-              'Reuse the bound request and credit identifiers for this uncertain outcome',
-          },
-        ]
-      : []),
-    {
-      title: 'Refresh',
-      value: 'refresh',
-      description: 'Re-check account quota and reset credits',
-    },
-    {
-      title: 'Close',
-      value: 'close',
-      description: 'Close this dialog',
-    },
+    ...(item.detail ? [{ title: item.detail, value: 'line:detail' }] : []),
+    ...factLines(item.facts).map((line, index) => ({
+      title: line,
+      value: `line:${index}`,
+    })),
+    ...item.actions.map((action) => ({
+      title: action.label,
+      value: `action:${action.id}`,
+      ...(action.description ? { description: action.description } : {}),
+    })),
+    { title: 'Back', value: BACK },
   ]
 }
 
-function openResetDialog(
+/**
+ * The value a typed `number` or `text` input sends: empty is `null` (the
+ * action receives that as "leave unset"), a number input sends a number
+ * when the text parses as one and the text otherwise, so the plugin can say
+ * what is wrong with it.
+ */
+export function promptValue(knob: Knob, raw: string): KnobValue {
+  const text = raw.trim()
+  if (text === '') return null
+  if (knob.kind === 'number') {
+    const number = Number(text)
+    return Number.isFinite(number) ? number : text
+  }
+  return raw
+}
+
+function knobDefault(knob: Knob): string {
+  if (knob.kind === 'toggle') return knob.value ? 'on' : 'off'
+  return knob.value === undefined ? '' : String(knob.value)
+}
+
+export interface DrawerContext {
+  api: TuiPluginApi
+  apply: ApplyFn
+}
+
+/** Opens the drawer on a payload pushed by `/openai`. */
+export function openCommandDialog(
   api: TuiPluginApi,
   payload: OpenDialogPayload,
   apply: ApplyFn,
 ) {
-  let applyGeneration = 0
-  const render = (state: OpenDialogPayload) => {
-    const applyAndRender = (args: string) => {
-      const generation = ++applyGeneration
-      log.debug('reset dialog apply', { args, generation })
-      void apply('openai-reset', args)
-        .then((result) => {
-          log.debug('reset dialog apply result', {
-            generation,
-            currentGeneration: applyGeneration,
-            stage: result.knobs?.stage,
-            accountRows: Array.isArray(result.knobs?.accounts)
-              ? (result.knobs.accounts as unknown[]).length
-              : undefined,
-          })
-          if (generation !== applyGeneration) return
-          if (typeof result.knobs?.stage !== 'string') {
-            render({
-              command: 'openai-reset',
-              text: 'The reset request is still completing or returned no result. Choose Refresh to check the current state — do NOT re-confirm.',
-              knobs: { stage: 'result', code: 'unknown' },
-            })
-            return
-          }
-          render({
-            command: 'openai-reset',
-            text: result.text,
-            knobs: result.knobs,
-          })
-        })
-        .catch((error) => {
-          if (generation !== applyGeneration) return
-          log.warn('reset dialog apply rejected', {
-            error: errorMessage(error),
-          })
-          render({
-            command: 'openai-reset',
-            text: 'Command failed — the plugin could not complete the request; the plugin log has details.',
-            knobs: { stage: 'result', code: 'error' },
-          })
-        })
-    }
-    const stage = state.knobs.stage
-    log.debug('reset dialog render', {
-      stage,
-      accountRows: Array.isArray(state.knobs.accounts)
-        ? (state.knobs.accounts as unknown[]).length
-        : undefined,
-      knobKeys: Object.keys(state.knobs),
-    })
-    api.ui.dialog.setSize('xlarge')
+  showMenu({ api, apply }, payload.command, payload.menu)
+}
 
-    if (stage === 'confirm') {
-      const preview = state.knobs.preview as ResetPreviewKnob | undefined
-      const accountKey = preview?.accountKey
-      const chatgptAccountId = preview?.chatgptAccountId
-      const availableCount = preview?.availableCount ?? 'unknown'
-      const DialogConfirm = api.ui.DialogConfirm
+function showMenu(context: DrawerContext, command: string, menu: Menu) {
+  const { api } = context
+  // A menu with one section (the not-migrated notice) opens on it directly.
+  if (menu.sections.length === 1) {
+    const [only] = menu.sections
+    if (only) {
+      showSection(context, command, menu, only.id)
+      return
+    }
+  }
+  const DialogSelect = api.ui.DialogSelect<string>
+  api.ui.dialog.setSize('xlarge')
+  api.ui.dialog.replace(() => (
+    <DialogSelect
+      title={menu.title}
+      options={sectionListOptions(menu)}
+      onSelect={(option) => {
+        const id = String(option.value).slice('section:'.length)
+        showSection(context, command, menu, id)
+      }}
+    />
+  ))
+}
+
+function showSection(
+  context: DrawerContext,
+  command: string,
+  menu: Menu,
+  sectionId: string,
+) {
+  const { api } = context
+  const section = menu.sections.find((entry) => entry.id === sectionId)
+  if (!section) {
+    showMenu(context, command, menu)
+    return
+  }
+  const DialogSelect = api.ui.DialogSelect<string>
+  api.ui.dialog.setSize('xlarge')
+  api.ui.dialog.replace(() => (
+    <DialogSelect
+      title={section.title}
+      options={sectionOptions(section)}
+      onSelect={(option) => {
+        const value = String(option.value)
+        if (value === BACK) {
+          if (menu.sections.length === 1) api.ui.dialog.clear()
+          else showMenu(context, command, menu)
+          return
+        }
+        if (value.startsWith('item:')) {
+          showItem(context, command, menu, section, value.slice(5))
+          return
+        }
+        if (value.startsWith('action:')) {
+          const action = section.actions.find(
+            (entry) => entry.id === value.slice(7),
+          )
+          if (action)
+            void runAction(context, command, menu, section, undefined, action)
+        }
+      }}
+    />
+  ))
+}
+
+function showItem(
+  context: DrawerContext,
+  command: string,
+  menu: Menu,
+  section: Section,
+  itemId: string,
+) {
+  const { api } = context
+  const item = section.items.find((entry) => entry.id === itemId)
+  if (!item) {
+    showSection(context, command, menu, section.id)
+    return
+  }
+  const DialogSelect = api.ui.DialogSelect<string>
+  api.ui.dialog.setSize('xlarge')
+  api.ui.dialog.replace(() => (
+    <DialogSelect
+      title={`${section.title}: ${item.label}`}
+      options={itemOptions(item)}
+      onSelect={(option) => {
+        const value = String(option.value)
+        if (value === BACK) {
+          showSection(context, command, menu, section.id)
+          return
+        }
+        if (value.startsWith('action:')) {
+          const action = item.actions.find(
+            (entry) => entry.id === value.slice(7),
+          )
+          if (action)
+            void runAction(context, command, menu, section, item, action)
+        }
+      }}
+    />
+  ))
+}
+
+/** Asks for one input; resolves undefined when the user backs out. */
+function askKnob(
+  api: TuiPluginApi,
+  title: string,
+  knob: Knob,
+): Promise<KnobValue | undefined> {
+  return new Promise((resolve) => {
+    api.ui.dialog.setSize('xlarge')
+    if (knob.kind === 'choice' || knob.kind === 'toggle') {
+      const DialogSelect = api.ui.DialogSelect<string>
+      const options =
+        knob.kind === 'choice'
+          ? knob.choices.map((choice) => ({
+              title: choice.label,
+              value: choice.value,
+            }))
+          : [
+              { title: 'On', value: 'on' },
+              { title: 'Off', value: 'off' },
+            ]
       api.ui.dialog.replace(() => (
-        <DialogConfirm
-          title='Reset quota window'
-          message={`${state.text}\n\nThis SPENDS 1 of ${availableCount} reset credits — irreversible.\n\nChoose Reset to continue or Cancel to return.\n\nEnter = Cancel (host default). Press Tab then Enter to Reset.`}
-          onConfirm={() => {
-            if (!accountKey || !chatgptAccountId) return
-            applyAndRender(
-              `confirm ${encodeURIComponent(accountKey)} ${encodeURIComponent(chatgptAccountId)}`,
-            )
+        <DialogSelect
+          title={`${title}: ${knob.label}`}
+          current={knobDefault(knob)}
+          options={[...options, { title: 'Cancel', value: `\u0000cancel` }]}
+          onSelect={(option) => {
+            const value = String(option.value)
+            if (value === `\u0000cancel`) resolve(undefined)
+            else resolve(knob.kind === 'toggle' ? value === 'on' : value)
           }}
-          onCancel={() => applyAndRender('refresh')}
         />
       ))
       return
     }
-
-    const DialogSelect = api.ui.DialogSelect<string>
-    const options =
-      stage === 'result'
-        ? resetResultOptions(state)
-        : resetAccountOptions(state)
+    const DialogPrompt = api.ui.DialogPrompt
     api.ui.dialog.replace(() => (
-      <DialogSelect
-        title={
-          stage === 'result' ? 'OpenAI reset result' : 'OpenAI reset credits'
-        }
-        options={options}
-        onSelect={(option) => {
-          if (option.disabled) return
-          if (option.value === 'result') return
-          if (option.value === 'close') {
-            applyGeneration += 1
-            api.ui.dialog.clear()
-            return
-          }
-          if (option.value === 'refresh') {
-            applyAndRender('refresh')
-            return
-          }
-          if (option.value === 'retry') {
-            const accountKey = state.knobs.accountKey
-            const chatgptAccountId = state.knobs.chatgptAccountId
-            if (
-              typeof accountKey !== 'string' ||
-              typeof chatgptAccountId !== 'string'
-            ) {
-              return
-            }
-            applyAndRender(
-              `retry ${encodeURIComponent(accountKey)} ${encodeURIComponent(chatgptAccountId)}`,
-            )
-            return
-          }
-          if (!option.value.startsWith('account:')) return
-          const accountKey = option.value.slice('account:'.length)
-          applyAndRender(`select ${encodeURIComponent(accountKey)}`)
-        }}
+      <DialogPrompt
+        title={`${title}: ${knob.label}`}
+        placeholder={knob.kind === 'text' ? (knob.placeholder ?? '') : ''}
+        value={knobDefault(knob)}
+        onConfirm={(value: string) => resolve(promptValue(knob, value))}
+        onCancel={() => resolve(undefined)}
       />
     ))
-  }
-
-  render(payload)
+  })
 }
 
-function showText(api: TuiPluginApi, text: string) {
+function askConfirmation(
+  api: TuiPluginApi,
+  title: string,
+  message: string,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const DialogConfirm = api.ui.DialogConfirm
+    api.ui.dialog.setSize('xlarge')
+    api.ui.dialog.replace(() => (
+      <DialogConfirm
+        title={title}
+        message={message}
+        onConfirm={() => resolve(true)}
+        onCancel={() => resolve(false)}
+      />
+    ))
+  })
+}
+
+function showResult(api: TuiPluginApi, title: string, text: string) {
   api.ui.dialog.setSize('xlarge')
   api.ui.dialog.replace(() => (
     <box flexDirection='column' padding={1} width='100%'>
+      <text>{title}</text>
       <text>{text}</text>
     </box>
   ))
 }
 
-function showSetCachekeepWindowPrompt(
-  api: TuiPluginApi,
-  apply: ApplyFn,
-  state: OpenDialogPayload,
-  render: (state: OpenDialogPayload) => void,
+/**
+ * Collects an action's inputs, confirms it when it carries a confirmation,
+ * applies it and redraws the section from the refreshed menu. A long
+ * message (a sign-in URL, a reset result) is shown in full; a short one is a
+ * toast over the redrawn section.
+ */
+async function runAction(
+  context: DrawerContext,
+  command: string,
+  menu: Menu,
+  section: Section,
+  item: Item | undefined,
+  action: Action,
 ) {
-  const DialogPrompt = api.ui.DialogPrompt
-  const knobWindow = state.knobs.window as
-    | { startHour: number; endHour: number }
-    | undefined
-  const seed = knobWindow ? `${knobWindow.startHour}-${knobWindow.endHour}` : ''
-  api.ui.dialog.setSize('xlarge')
-  api.ui.dialog.replace(() => (
-    <DialogPrompt
-      title='Cachekeep warm window'
-      description={() => <text>{state.text}</text>}
-      placeholder='HH-HH (e.g. 9-18 or 22-6)'
-      value={seed}
-      onConfirm={(value: string) => {
-        const trimmed = value.trim()
-        if (!trimmed) {
-          render(state)
-          return
-        }
-        void apply('openai-cachekeep', trimmed).then((r) => {
-          api.ui.toast({ message: r.text })
-          render({
-            command: 'openai-cachekeep',
-            text: r.text,
-            knobs: r.knobs,
-          })
-        })
-      }}
-      onCancel={() => render(state)}
-    />
-  ))
-}
-
-export function openCommandDialog(
-  api: TuiPluginApi,
-  payload: OpenDialogPayload,
-  apply: ApplyFn,
-  sessionId?: string,
-) {
-  if (payload.command === 'openai-reset') {
-    openResetDialog(api, payload, apply)
-    return
-  }
-
-  if (payload.command === 'openai-routing') {
-    const current = (payload.knobs.mode as string) ?? 'main-first'
-    const DialogSelect = api.ui.DialogSelect<string>
-    api.ui.dialog.setSize('xlarge')
-    api.ui.dialog.replace(() => (
-      <DialogSelect
-        title='OpenAI routing'
-        current={current}
-        options={[
-          {
-            title: 'Main first',
-            value: 'main-first',
-            description: 'Use the main account until exhausted',
-          },
-          {
-            title: 'Fallback first',
-            value: 'fallback-first',
-            description: 'Prefer fallback accounts, preserve main',
-          },
-          {
-            title: 'Sticky balanced',
-            value: 'sticky-balanced',
-            description:
-              'Keep each session on one account while balancing new sessions',
-          },
-          {
-            title: "Reset this session's pin",
-            value: 'reset',
-            description:
-              'Unpin this session; the next request may still choose the same account',
-          },
-        ]}
-        onSelect={(option) => {
-          void apply('openai-routing', String(option.value)).then((r) => {
-            api.ui.toast({ message: r.text })
-            api.ui.dialog.clear()
-          })
-        }}
-      />
-    ))
-    return
-  }
-
-  if (payload.command === 'openai-dump') {
-    const enabled = payload.knobs.enabled === true
-    const DialogConfirm = api.ui.DialogConfirm
-    api.ui.dialog.setSize('xlarge')
-    api.ui.dialog.replace(() => (
-      <DialogConfirm
-        title='OpenAI request dump'
-        message={`${payload.text}\n\n${enabled ? 'Disable' : 'Enable'} request dump?`}
-        onConfirm={() => {
-          void apply('openai-dump', enabled ? 'off' : 'on').then((r) => {
-            api.ui.toast({ message: r.text })
-            api.ui.dialog.clear()
-          })
-        }}
-        onCancel={() => api.ui.dialog.clear()}
-      />
-    ))
-    return
-  }
-
-  if (payload.command === 'openai-killswitch') {
-    const config = (payload.knobs.config ?? {}) as {
-      enabled?: boolean
-      main?: Record<string, number>
-      accounts?: Record<string, Record<string, number>>
+  const { api, apply } = context
+  const back = () =>
+    item
+      ? showItem(context, command, menu, section, item.id)
+      : showSection(context, command, menu, section.id)
+  const values: Record<string, KnobValue> = {}
+  for (const knob of action.knobs) {
+    const value = await askKnob(api, action.label, knob)
+    if (value === undefined) {
+      back()
+      return
     }
-    const accountIds = (payload.knobs.accountIds as string[]) ?? []
-    const enabled = config.enabled === true
-    const readT = (t: Record<string, number> | undefined) => {
-      const fh = t?.primary ?? t?.['5h'] ?? 5
-      const sd = t?.secondary ?? t?.['1w'] ?? 10
-      return { fh, sd }
+    values[knob.id] = value
+  }
+  let confirmed = false
+  if (action.confirm) {
+    confirmed = await askConfirmation(api, action.label, action.confirm.message)
+    if (!confirmed) {
+      back()
+      return
     }
-    const mainT = readT(config.main)
-    const seedParts = [`main:${mainT.fh},${mainT.sd}`]
-    for (const id of accountIds) {
-      const t = readT(config.accounts?.[id] ?? config.main)
-      seedParts.push(`${id}:${t.fh},${t.sd}`)
-    }
-    const seed = seedParts.join(' ')
-
-    const openEdit = () => {
-      const DialogPrompt = api.ui.DialogPrompt
-      api.ui.dialog.setSize('xlarge')
-      api.ui.dialog.replace(() => (
-        <DialogPrompt
-          title='Killswitch thresholds'
-          description={() => <text>{payload.text}</text>}
-          placeholder='main:5,10 work-alt:5,10'
-          value={seed}
-          onConfirm={(value: string) => {
-            void apply('openai-killswitch', `set ${value.trim()}`).then((r) => {
-              api.ui.toast({ message: r.text })
-              api.ui.dialog.clear()
-            })
-          }}
-          onCancel={() => api.ui.dialog.clear()}
-        />
-      ))
-    }
-
-    const DialogSelect = api.ui.DialogSelect<string>
-    api.ui.dialog.setSize('xlarge')
-    api.ui.dialog.replace(() => (
-      <DialogSelect
-        title='OpenAI killswitch'
-        options={[
-          {
-            title: enabled ? 'Disable killswitch' : 'Enable killswitch',
-            value: enabled ? 'off' : 'on',
-            description: enabled
-              ? 'Stop hard-blocking on low quota'
-              : 'Hard-block requests when quota drops below thresholds',
-          },
-          {
-            title: 'Edit thresholds\u2026',
-            value: 'edit',
-            description: 'Set per-account primary,secondary cutoffs',
-          },
-        ]}
-        onSelect={(option) => {
-          if (option.value === 'edit') {
-            openEdit()
-            return
-          }
-          void apply('openai-killswitch', String(option.value)).then((r) => {
-            api.ui.toast({ message: r.text })
-            api.ui.dialog.clear()
-          })
-        }}
-      />
-    ))
-    return
   }
-
-  if (payload.command === 'openai-logging') {
-    const current = (payload.knobs.level as string) ?? 'info'
-    const levels = ['error', 'warn', 'info', 'debug', 'trace']
-    const DialogSelect = api.ui.DialogSelect<string>
-    api.ui.dialog.setSize('xlarge')
-    api.ui.dialog.replace(() => (
-      <DialogSelect
-        title='OpenAI logging'
-        current={current}
-        options={levels.map((level) => ({
-          title: level,
-          value: level,
-          description:
-            level === current
-              ? 'currently active'
-              : `Set log level to ${level}`,
-        }))}
-        onSelect={(option) => {
-          void apply('openai-logging', String(option.value)).then((r) => {
-            api.ui.toast({ message: r.text })
-            api.ui.dialog.clear()
-          })
-        }}
-      />
-    ))
-    return
+  const request: Omit<ApplyRequest, 'sessionId'> = {
+    command,
+    sectionId: section.id,
+    ...(item ? { itemId: item.id } : {}),
+    actionId: action.id,
+    values,
+    ...(confirmed ? { confirmed: true } : {}),
   }
-
-  if (payload.command === 'openai-cachekeep') {
-    const render = (state: OpenDialogPayload) => {
-      const options = buildCachekeepDialogOptions(state)
-      const DialogSelect = api.ui.DialogSelect<string>
-      api.ui.dialog.setSize('xlarge')
-      api.ui.dialog.replace(() => (
-        <DialogSelect
-          title='OpenAI cachekeep'
-          current='status'
-          options={options}
-          onSelect={(option) => {
-            if (option.value === 'close') {
-              api.ui.dialog.clear()
-              return
-            }
-            if (option.value === 'set_window') {
-              showSetCachekeepWindowPrompt(api, apply, state, render)
-              return
-            }
-            if (option.value === 'clear_window') {
-              // The option label is `clear_window`, but executeCachekeepCommand
-              // matches on `window clear` — forward the canonical form or the
-              // command falls through to the usage-text branch and the window
-              // is never cleared.
-              void apply('openai-cachekeep', 'window clear').then((r) => {
-                render({
-                  command: 'openai-cachekeep',
-                  text: r.text,
-                  knobs: r.knobs,
-                })
-              })
-              return
-            }
-            const args =
-              option.value === 'refresh' ? 'status' : String(option.value)
-            void apply('openai-cachekeep', args).then((r) => {
-              render({
-                command: 'openai-cachekeep',
-                text: r.text,
-                knobs: r.knobs,
-              })
-            })
-          }}
-        />
-      ))
-    }
-    render(payload)
-    return
-  }
-
-  if (payload.command === 'openai-account') {
-    openAccountDialog(api, apply, sessionId, payload)
-    return
-  }
-
-  // fallback for quota (display-only)
-  showText(api, payload.text)
-}
-
-// -- Accounts dialog ---------------------------------------------------------
-
-export function formatQuotaWindows(
-  quota: AccountQuota | null | undefined,
-): string {
-  const windowSummary = getCollapsedQuotaSummary(quota ?? null).text
-  if (windowSummary) return windowSummary
-  if (quota?.resetCreditsAvailable !== undefined) {
-    return `resets: ${quota.resetCreditsAvailable}`
-  }
-  return 'no quota data'
-}
-
-function osc52Copy(api: TuiPluginApi, text: string): boolean {
+  let result: ApplyResult
   try {
-    const renderer = api.renderer as unknown as
-      | {
-          copyToClipboardOSC52?: (t: string) => boolean
-        }
-      | null
-      | undefined
-    if (renderer && typeof renderer.copyToClipboardOSC52 === 'function') {
-      return renderer.copyToClipboardOSC52(text)
+    result = await apply(request)
+  } catch (error) {
+    log.warn('menu apply failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    api.ui.toast({ message: 'The action could not reach OpenAI auth.' })
+    back()
+    return
+  }
+  // The shared RPC client answers a failed call with a body of its own that
+  // carries no menu; redraw from the menu already shown then.
+  const next = result.menu ?? menu
+  if (result.needsConfirmation) {
+    const yes = await askConfirmation(api, action.label, result.text)
+    if (yes) {
+      const again = await apply({ ...request, confirmed: true })
+      finish(context, command, again.menu ?? next, section.id, again)
+      return
     }
-  } catch {
-    // best-effort
   }
-  return false
+  finish(context, command, next, section.id, result)
 }
 
-export function buildAccountDialogRows(
-  state: SidebarState,
-  sessionId?: string,
+function finish(
+  context: DrawerContext,
+  command: string,
+  menu: Menu,
+  sectionId: string,
+  result: ApplyResult,
 ) {
-  const activeId = resolveSessionSidebarRouting(state, sessionId).activeId
-  return [
-    {
-      title: `main${activeId === 'main' ? ' \u2022 active' : ''}`,
-      value: 'main',
-      description: formatQuotaWindows(state.main.quota),
-    },
-    ...state.fallbacks.map((fb) => ({
-      title: `${fb.label ?? fb.id}${activeId === fb.id ? ' \u2022 active' : ''}${!fb.enabled ? ' (disabled)' : ''}`,
-      value: fb.id,
-      description: formatQuotaWindows(fb.quota),
-    })),
-  ]
-}
-
-export function accountDialogModeOption(mode: unknown) {
-  const claustrum = mode === 'claustrum'
-  return {
-    title: claustrum ? 'Leave Claustrum' : 'Enter Claustrum',
-    value: claustrum ? '__local__' : '__claustrum__',
-    description: claustrum
-      ? 'Require fresh local logins before local refresh resumes'
-      : 'Verify every enabled account before custody takes over',
+  const { api } = context
+  if (result.text.includes('\n') || result.text.length > 120) {
+    showResult(api, result.ok ? 'Done' : 'Not done', result.text)
+    return
   }
-}
-
-export function buildFallbackAccountOptions(input: {
-  id: string
-  label?: string
-  enabled: boolean
-  index: number
-  count: number
-}) {
-  const name = input.label ?? input.id
-  const options: Array<{
-    title: string
-    value: string
-    description: string
-  }> = [
-    {
-      title: input.enabled ? 'Disable' : 'Enable',
-      value: input.enabled ? 'disable' : 'enable',
-      description: `${input.enabled ? 'Disable' : 'Enable'} ${name}`,
-    },
-    {
-      title: 'Remove',
-      value: 'remove',
-      description: `Remove ${name}`,
-    },
-  ]
-  if (input.index > 0) {
-    options.push({
-      title: 'Move up',
-      value: 'move_up',
-      description: 'Swap with the preceding fallback',
-    })
-  }
-  if (input.index < input.count - 1) {
-    options.push({
-      title: 'Move down',
-      value: 'move_down',
-      description: 'Swap with the following fallback',
-    })
-  }
-  options.push({
-    title: 'Back',
-    value: 'back',
-    description: 'Return to account list',
-  })
-  return options
-}
-
-function openAccountDialog(
-  api: TuiPluginApi,
-  apply: ApplyFn,
-  sessionId?: string,
-  payload?: OpenDialogPayload,
-) {
-  const DialogConfirm = api.ui.DialogConfirm
-  let claustrumMode = payload?.knobs.claustrumMode
-
-  function showL1() {
-    void getSidebarState().then((state) => {
-      const DialogSelectInner = api.ui.DialogSelect<string>
-      api.ui.dialog.setSize('xlarge')
-      api.ui.dialog.replace(() => (
-        <DialogSelectInner
-          title='OpenAI Accounts'
-          options={[
-            accountDialogModeOption(claustrumMode),
-            ...buildAccountDialogRows(state, sessionId),
-            {
-              title: 'Add account\u2026',
-              value: '__add__',
-              description: 'Sign in to a new OpenAI account',
-            },
-          ]}
-          onSelect={(option) => {
-            if (
-              option.value === '__claustrum__' ||
-              option.value === '__local__'
-            ) {
-              const args =
-                option.value === '__claustrum__' ? 'claustrum' : 'local'
-              void apply('openai-account', args).then((r) => {
-                api.ui.toast({ message: r.text })
-                claustrumMode = r.knobs.claustrumMode
-                showL1()
-              })
-              return
-            }
-            if (option.value === '__add__') {
-              showAddFlow()
-              return
-            }
-            // Main has no per-account actions: it is not removable or reorderable,
-            // regardless of whether the active session uses mode or sticky routing.
-            if (option.value === 'main') return
-            showL2Fallback(option.value)
-          }}
-        />
-      ))
-    })
-  }
-
-  function showL2Fallback(id: string) {
-    void getSidebarState().then((state) => {
-      const DialogSelectInner = api.ui.DialogSelect<string>
-      const fbIndex = state.fallbacks.findIndex((f) => f.id === id)
-      const fb = state.fallbacks[fbIndex]
-      if (!fb) {
-        showL1()
-        return
-      }
-      const options = buildFallbackAccountOptions({
-        id: fb.id,
-        label: fb.label,
-        enabled: fb.enabled,
-        index: fbIndex,
-        count: state.fallbacks.length,
-      })
-
-      api.ui.dialog.setSize('xlarge')
-      api.ui.dialog.replace(() => (
-        <DialogSelectInner
-          title={fb.label ?? fb.id}
-          options={options}
-          onSelect={(option) => {
-            if (option.value === 'remove') {
-              api.ui.dialog.setSize('xlarge')
-              api.ui.dialog.replace(() => (
-                <DialogConfirm
-                  title='Remove account'
-                  message={`Remove ${fb.label ?? fb.id}?`}
-                  onConfirm={() => {
-                    void apply('openai-account', `remove ${id}`).then((r) => {
-                      api.ui.toast({ message: r.text })
-                      showL1()
-                    })
-                  }}
-                  onCancel={() => showL2Fallback(id)}
-                />
-              ))
-              return
-            }
-            if (option.value === 'enable' || option.value === 'disable') {
-              void apply('openai-account', `${option.value} ${id}`).then(
-                (r) => {
-                  api.ui.toast({ message: r.text })
-                  showL1()
-                },
-              )
-              return
-            }
-            if (option.value === 'move_up') {
-              const neighbor = state.fallbacks[fbIndex - 1]
-              if (neighbor) {
-                void apply('openai-account', `order ${id} ${neighbor.id}`).then(
-                  (r) => {
-                    api.ui.toast({ message: r.text })
-                    showL1()
-                  },
-                )
-              }
-              return
-            }
-            if (option.value === 'move_down') {
-              const neighbor = state.fallbacks[fbIndex + 1]
-              if (neighbor) {
-                void apply('openai-account', `order ${id} ${neighbor.id}`).then(
-                  (r) => {
-                    api.ui.toast({ message: r.text })
-                    showL1()
-                  },
-                )
-              }
-              return
-            }
-            showL1()
-          }}
-        />
-      ))
-    })
-  }
-
-  // -- Add flow ---------------------------------------------------------------
-
-  function showAddFlow() {
-    const DialogSelectInner = api.ui.DialogSelect<string>
-    api.ui.dialog.setSize('xlarge')
-    api.ui.dialog.replace(() => (
-      <DialogSelectInner
-        title='Add account'
-        options={[
-          {
-            title: 'Browser sign-in (local)',
-            value: 'browser',
-            description: 'Opens a browser window for OAuth on this machine',
-          },
-          {
-            title: 'Device code (remote / no browser)',
-            value: 'device',
-            description: 'Enter a code on another device to authorize',
-          },
-          {
-            title: 'Back',
-            value: 'back',
-            description: 'Return to account list',
-          },
-        ]}
-        onSelect={(option) => {
-          if (option.value === 'browser') {
-            showLabelPrompt('browser')
-            return
-          }
-          if (option.value === 'device') {
-            showLabelPrompt('device')
-            return
-          }
-          showL1()
-        }}
-      />
-    ))
-  }
-
-  function showLabelPrompt(mode: 'browser' | 'device') {
-    const DialogPromptInner = api.ui.DialogPrompt
-    api.ui.dialog.setSize('xlarge')
-    api.ui.dialog.replace(() => (
-      <DialogPromptInner
-        title='Label (optional)'
-        description={() => (
-          <text>
-            Give this account a name (e.g. "work", "personal"). Leave empty to
-            auto-detect.
-          </text>
-        )}
-        placeholder='e.g. work'
-        value=''
-        onConfirm={(label: string) => {
-          if (mode === 'browser') {
-            startBrowserAdd(label.trim() || undefined)
-          } else {
-            startDeviceAdd(label.trim() || undefined)
-          }
-        }}
-        onCancel={() => showAddFlow()}
-      />
-    ))
-  }
-
-  function startBrowserAdd(label: string | undefined) {
-    const args = label ? `add ${label}` : 'add'
-    void apply('openai-account', args).then((r) => {
-      const url = r.knobs.url as string | undefined
-      const instructions = r.knobs.instructions as string | undefined
-
-      if (!url) {
-        api.ui.toast({ message: 'Failed to get auth URL', variant: 'warning' })
-        showL1()
-        return
-      }
-
-      // Auto-open the browser (best-effort)
-      try {
-        openUrl(url)
-      } catch {
-        // best-effort
-      }
-
-      showBrowserAuthScreen(url, instructions)
-    })
-  }
-
-  function showBrowserAuthScreen(
-    url: string,
-    _instructions: string | undefined,
-  ) {
-    const DialogSelectInner = api.ui.DialogSelect<string>
-    api.ui.dialog.setSize('xlarge')
-    api.ui.dialog.replace(() => (
-      <DialogSelectInner
-        title='Browser sign-in'
-        options={[
-          {
-            title: 'Copy auth URL',
-            value: 'copy_url',
-            description: url,
-          },
-          {
-            title: 'Open in browser',
-            value: 'open',
-            description: 'Try to open the URL in your browser',
-          },
-          {
-            title: "Done / I've authorized",
-            value: 'done',
-            description: 'Return to account list',
-          },
-          {
-            title: 'Cancel',
-            value: 'cancel',
-            description: 'Return to account list without adding',
-          },
-        ]}
-        skipFilter={true}
-        onSelect={(option) => {
-          if (option.value === 'copy_url') {
-            const ok = osc52Copy(api, url)
-            api.ui.toast({
-              message: ok
-                ? 'Auth URL copied'
-                : 'Copy unsupported — select the URL text manually',
-              variant: ok ? 'success' : 'warning',
-            })
-            return
-          }
-          if (option.value === 'open') {
-            try {
-              openUrl(url)
-            } catch {
-              // best-effort
-            }
-            return
-          }
-          showL1()
-        }}
-      />
-    ))
-  }
-
-  function startDeviceAdd(label: string | undefined) {
-    const args = label ? `add --headless ${label}` : 'add --headless'
-    void apply('openai-account', args).then((r) => {
-      const verificationUrl = r.knobs.verificationUrl as string | undefined
-      const userCode = r.knobs.userCode as string | undefined
-      const instructions = r.knobs.instructions as string | undefined
-
-      if (!verificationUrl) {
-        api.ui.toast({
-          message: 'Failed to get device code',
-          variant: 'warning',
-        })
-        showL1()
-        return
-      }
-
-      showDeviceCodeScreen(verificationUrl, userCode, instructions)
-    })
-  }
-
-  function showDeviceCodeScreen(
-    verificationUrl: string,
-    userCode: string | undefined,
-    _instructions: string | undefined,
-  ) {
-    const DialogSelectInner = api.ui.DialogSelect<string>
-    api.ui.dialog.setSize('xlarge')
-    api.ui.dialog.replace(() => (
-      <DialogSelectInner
-        title='Device code'
-        options={[
-          {
-            title: userCode ? `Copy code: ${userCode}` : 'Copy code',
-            value: 'copy_code',
-            description: 'Copy the user code to clipboard',
-          },
-          {
-            title: 'Copy URL',
-            value: 'copy_url',
-            description: verificationUrl,
-          },
-          {
-            title: "Done / I've authorized",
-            value: 'done',
-            description: 'Return to account list',
-          },
-          {
-            title: 'Cancel',
-            value: 'cancel',
-            description: 'Return to account list without adding',
-          },
-        ]}
-        skipFilter={true}
-        onSelect={(option) => {
-          if (option.value === 'copy_code' && userCode) {
-            const ok = osc52Copy(api, userCode)
-            api.ui.toast({
-              message: ok
-                ? 'Code copied'
-                : 'Copy unsupported — enter the code manually',
-              variant: ok ? 'success' : 'warning',
-            })
-            return
-          }
-          if (option.value === 'copy_url') {
-            const ok = osc52Copy(api, verificationUrl)
-            api.ui.toast({
-              message: ok
-                ? 'URL copied'
-                : 'Copy unsupported — enter the URL manually',
-              variant: ok ? 'success' : 'warning',
-            })
-            return
-          }
-          showL1()
-        }}
-      />
-    ))
-  }
-
-  void showL1()
+  api.ui.toast({ message: result.text })
+  showSection(context, command, menu, sectionId)
 }

@@ -33,6 +33,15 @@ import {
   type RoutingMode,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
+import {
+  observationFromSnapshot,
+  windowsFromQuotaMap,
+} from '@cortexkit/openai-auth-core/pool-quota'
+import {
+  FORMER_MAIN_ID,
+  POOL_QUOTA_UNKNOWN_RETRY_SECONDS,
+  type PoolBlock,
+} from '@cortexkit/openai-auth-core/pool-routing'
 import type {
   Api,
   AssistantMessage,
@@ -42,25 +51,15 @@ import type {
   Model,
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
-
 import { PiMainAccount } from './main-account.ts'
 import { getPiAccountPaths } from './paths.ts'
 import { piCommandAccountPool } from './pool-accounts.ts'
-import {
-  observationFromSnapshot,
-  windowsFromQuotaMap,
-} from '@cortexkit/openai-auth-core/pool-quota'
 import {
   type RouteAccount,
   type RouteAttempt,
   routablePoolRows,
   routePiRequest,
 } from './pool-request.ts'
-import {
-  FORMER_MAIN_ID,
-  POOL_QUOTA_UNKNOWN_RETRY_SECONDS,
-  type PoolBlock,
-} from '@cortexkit/openai-auth-core/pool-routing'
 import { PiPoolSource, settleWithinBudget } from './pool-source.ts'
 import { placePiStickyPin } from './routing.ts'
 
