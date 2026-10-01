@@ -50,6 +50,51 @@
 // for `main-refresh` can never be waiting on this run. `main-refresh` is
 // taken on its own again, after the row write, around the placeholder write.
 //
+// The whole plugin's file locks, outermost first. A code path that holds one
+// of them and waits for another always waits for one further down this list.
+// "Waited" means polled until a timeout (the store's own locks, this file's
+// `acquireLock`, `withMainRefreshLock`, the legacy `save` pair); "tried"
+// means one attempt that gives up at once when the lock is held.
+//  1. `pool-migration` at the config path: a migration or adoption run,
+//     held from start to end (waited). Only tried anywhere else.
+//  2. `bg-quota-refresh` at the config path: one background quota pass
+//     (`background-quota-refresh.ts`, tried), around the pool refreshes and
+//     polls or the legacy fallback refreshes and polls of that pass. Never
+//     held together with lock 1.
+//  3. The store's row lock, `row-<identity or id>` at the state path
+//     (waited, by the store: row writes, refresh, identity records).
+//  4. The store's provider-wide lock, `provider-openai` at the state path
+//     (waited, by the store, after the row lock: OAuth row writes, refresh).
+//  5. `main-refresh` at the config path. Waited when the store takes it as
+//     an extra lock (pool refresh, row writes, the `/openai` menu, settings
+//     writes: `legacyRefreshLocks`, `poolSettingsLocks` in
+//     `pool-accounts.ts`), here around the placeholder write
+//     (`finishTransfer`) and by the login's slot write
+//     (`withMainRefreshLock`, from `auth/methods.ts`). Tried by the slot refresh
+//     (`refreshMainWithLease` in `index.ts`).
+//  6. `fallback-refresh-<id>` at the config path. Waited as the store's
+//     extra lock after `main-refresh`; tried by the legacy fallback refresh
+//     (`FallbackAccountManager` in the core package).
+//  7. The quota-poll locks `opencode-main-quota-refresh` and
+//     `opencode-fallback-quota-refresh-<id>` at the config path (the core
+//     package's `QuotaManager`, tried; nothing of this plugin is taken while
+//     one is held).
+//  8. `save` at the config path, then `save` at the state path (waited): the
+//     store's own locks, which it takes last in every operation and releases
+//     before it calls a refresh's provider; the legacy `mutateAccounts`,
+//     `saveAccounts` and `saveAccountState` (the last takes the state one
+//     alone); and `updateConfig` below. Nothing is taken while they are held.
+// Leaf locks of their own files, never held while another lock is taken and
+// never taken while one of the above is held: `sidebar-write` at the sidebar
+// file, and the vault's `claustrum-roster` then `claustrum-roster-write` at
+// the vault roster file (both in `@cortexkit/common-auth`).
+//
+// One acquisition runs against this order, and only as a try: the slot
+// refresh holds `main-refresh` (5) and tries the run lock (1) in
+// `reclaimExpiredPoolTransfer`. A run that holds the run lock and waits for
+// `main-refresh` therefore never waits on a slot refresh that waits on it:
+// the try fails at once and the record is kept.
+//
 // Between reading the slot and the row write nothing legacy is held, so the
 // slot's token could be refreshed (and spent) in that gap. The pending
 // record closes it: the record is written first, then any active legacy
@@ -271,17 +316,14 @@ export type PoolTransferOutcome =
       rowId: string
       operation: 'add' | 'rotate' | 'replace' | 'resumed'
       /**
-       * `written`: the placeholder was written and read back. `overwritten`:
-       * something replaced it between the write and the readback (the next
-       * adoption run takes whatever landed). `already-present`: a resumed run
-       * found the placeholder in place. `slot-moved-on`: the slot changed to
-       * another value before the fence; it is left for the next adoption.
+       * `written`: the placeholder was written and read back.
+       * `already-present`: a resumed run found the placeholder in place.
+       * `slot-moved-on`: the slot changed to another value before the fence;
+       * it is left for the next adoption. (A placeholder replaced between its
+       * write and the readback ends the run as `retry`,
+       * `placeholder-overwritten`, not here.)
        */
-      placeholder:
-        | 'written'
-        | 'overwritten'
-        | 'already-present'
-        | 'slot-moved-on'
+      placeholder: 'written' | 'already-present' | 'slot-moved-on'
     }
   /**
    * An interrupted transfer's row holds neither its old credential nor the
@@ -299,6 +341,13 @@ export type PoolTransferOutcome =
         | 'verify-failed'
         | 'torn-read'
         | 'slot-changed'
+        /**
+         * Something replaced the placeholder between its write and the
+         * readback. The record and the shield stay, since the slot may hold
+         * the very token the row now holds; the next run reads the slot
+         * again and finishes the transfer from what it finds.
+         */
+        | 'placeholder-overwritten'
         | 'unsettled'
         | `store-${string}`
     }
@@ -619,6 +668,20 @@ export const PENDING_TRANSFER_TTL_MS = 10 * 60_000
  *   the pool refreshes no row, and older builds' background refresh skips
  *   the row the shield (`mainAccountId`, which stays up) names, so there the
  *   slot is the only refresher left and the record can go.
+ *
+ * When the record's row holds neither its credential from before the
+ * transfer nor the slot's (it was rotated since, the case `plan` calls
+ * ambiguous), the slot's token may already be spent: the transfer may have
+ * copied it into the row before the row was rotated. The record still goes,
+ * so the slot refresh can try the token, but the slot value is declined for
+ * adoption in the same write (`declinedSlotFingerprint`, as an `ambiguous`
+ * run leaves it). A refresh that renews the token changes the slot value and
+ * the renewed login is adopted as usual; a spent token fails to refresh,
+ * stays in the slot as it was, and never replaces the row.
+ *
+ * `slotAccess` is the access token the slot holds beside `refreshToken`; the
+ * declined value is that exact pair. Without it the record's own slot value
+ * is declined.
  */
 export async function reclaimExpiredPoolTransfer(
   paths: AccountPaths,
@@ -627,6 +690,7 @@ export async function reclaimExpiredPoolTransfer(
     now?: () => number
     legacyLocks?: Partial<LegacyLockOptions>
     log?: PoolMigrationLogger
+    slotAccess?: string
   } = {},
 ): Promise<boolean> {
   const now = options.now ?? Date.now
@@ -650,17 +714,37 @@ export async function reclaimExpiredPoolTransfer(
   if (!runLock) return false
   try {
     const config = await readConfig(paths.configPath)
-    if (readPoolMigrationBookkeeping(config).migratedAt !== undefined) {
-      const load = await openPoolStore({
-        provider: PROVIDER,
-        configPath: paths.configPath,
-        statePath: paths.statePath,
-        quota: quotaCodec,
-        now,
-      }).read()
-      if (load.status !== 'ready') return false
+    const migrated =
+      readPoolMigrationBookkeeping(config).migratedAt !== undefined
+    const load = await openPoolStore({
+      provider: PROVIDER,
+      configPath: paths.configPath,
+      statePath: paths.statePath,
+      quota: quotaCodec,
+      now,
+    }).read()
+    // A migrated install whose pool cannot be read keeps the record: which
+    // copy of the token the pool refreshes cannot be told.
+    if (migrated && load.status !== 'ready') return false
+    let declinedSlotFingerprint: string | undefined
+    if (load.status === 'ready') {
       const row = load.rows.find((r) => r.id === record.rowId && !r.invalid)
-      if (row?.fingerprint === record.credentialFingerprint) return false
+      const rowFingerprint = row?.fingerprint ?? null
+      if (migrated && row && rowFingerprint === record.credentialFingerprint)
+        return false
+      if (
+        row &&
+        rowFingerprint !== record.credentialFingerprint &&
+        rowFingerprint !== record.rowFingerprint
+      )
+        declinedSlotFingerprint =
+          options.slotAccess !== undefined
+            ? mainSlotFamilyFingerprint({
+                type: 'oauth',
+                access: options.slotAccess,
+                refresh: refreshToken,
+              })
+            : record.slotFingerprint
     }
     let dropped = false
     await updateConfig(
@@ -675,14 +759,21 @@ export async function reclaimExpiredPoolTransfer(
         const still = expired(current)
         if (!still || still.recordedAt !== record.recordedAt) return false
         const { pending: _dropped, ...rest } = book
-        writeBookkeeping(current, rest)
+        writeBookkeeping(
+          current,
+          declinedSlotFingerprint !== undefined
+            ? { ...rest, declinedSlotFingerprint }
+            : rest,
+        )
         dropped = true
         return true
       },
     )
     if (dropped)
       (options.log ?? createLogger('pool-migration')).warn(
-        'dropped an expired account-pool transfer record so the slot refresh can resume',
+        declinedSlotFingerprint !== undefined
+          ? 'dropped an expired account-pool transfer record whose row was rotated since; the slot login is not adopted unless its refresh renews it'
+          : 'dropped an expired account-pool transfer record so the slot refresh can resume',
         { rowId: record.rowId, recordedAt: record.recordedAt },
       )
     return dropped
@@ -1367,9 +1458,18 @@ async function finishUnderMainLock(
   await ctx.slot.set({ path: { id: PROVIDER }, body: { ...POOL_PLACEHOLDER } })
   await ctx.onStep('after-placeholder-write')
   const readback = await ctx.slot.get({ path: { id: PROVIDER } })
+  // Whatever replaced the placeholder may be the token just copied into the
+  // row (the host writing back its own earlier read of the file), and then
+  // the slot and the row hold one token again. Dropping the record and the
+  // shield here would leave two refreshers of it, so both stay and the run
+  // ends retryably. The next run's fence read above tells the cases apart:
+  // the same token gets the placeholder again, a new token of the same
+  // account restarts the transfer, and anything else has moved on.
+  if (!isPoolPlaceholder(readback))
+    return { status: 'retry', reason: 'placeholder-overwritten' }
   await writeFinished(ctx, mode)
   await ctx.onStep('after-record-clear')
-  return completed(isPoolPlaceholder(readback) ? 'written' : 'overwritten')
+  return completed('written')
 }
 
 async function executeTransfer(

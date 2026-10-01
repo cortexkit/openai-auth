@@ -676,7 +676,7 @@ describe('adoption of a later login in the slot', () => {
     })
   })
 
-  it('a login landing right after the placeholder write is reported and adopted next', async () => {
+  it('a login landing right after the placeholder write ends the run retryably; the next run ends the transfer and the one after adopts the login', async () => {
     await migrated()
     await h.setSlot(login('acct-new', 'r-new'))
     const outcome = await adoptHostSlotLogin(
@@ -687,11 +687,64 @@ describe('adoption of a later login in the slot', () => {
         },
       }),
     )
-    expect(outcome).toMatchObject({ placeholder: 'overwritten' })
+    expect(outcome).toEqual({
+      status: 'retry',
+      reason: 'placeholder-overwritten',
+    })
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'acct-new',
+      placeholder: 'slot-moved-on',
+    })
     expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
       status: 'completed',
       rowId: 'acct-late',
     })
+  })
+
+  it('a placeholder the host overwrites with the token just moved keeps the record and the shield, and the next run writes it again', async () => {
+    await migrated()
+    const relogin = login('acct-new', 'r-new')
+    await h.setSlot(relogin)
+    // The host writes back the very login the run just copied into the row
+    // (from its own earlier read of the file), so the slot and the row hold
+    // the same token again.
+    const outcome = await adoptHostSlotLogin(
+      h.deps({
+        onStep: async (step) => {
+          if (step === 'after-placeholder-write') await h.setSlot(relogin)
+        },
+      }),
+    )
+    expect(outcome).toEqual({
+      status: 'retry',
+      reason: 'placeholder-overwritten',
+    })
+    expect((await h.slotValue())?.refresh).toBe('r-new')
+    expect((await h.row('acct-new'))?.credential).toMatchObject({
+      refresh: 'r-new',
+    })
+    // Both copies stand, so older builds must keep skipping the row and this
+    // build's slot refresh must keep standing down for the token.
+    const config = await h.config()
+    expect(config.mainAccountId).toBe('acct-new')
+    expect(config[POOL_MIGRATION_KEY].pending).toMatchObject({
+      rowId: 'acct-new',
+    })
+    expect(poolTransferPendingInConfigFile(h.paths.configPath, 'r-new')).toBe(
+      true,
+    )
+
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'acct-new',
+      operation: 'resumed',
+      placeholder: 'written',
+    })
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+    const after = await h.config()
+    expect(after.mainAccountId).toBeUndefined()
+    expect(after[POOL_MIGRATION_KEY].pending).toBeUndefined()
   })
 })
 
@@ -1185,6 +1238,76 @@ describe('an expired pending-transfer record', () => {
     expect(poolTransferPendingInConfigFile(h.paths.configPath, 'r-new')).toBe(
       true,
     )
+  })
+
+  // The user signs in again as main's account; the adoption stops after the
+  // row write, and the pool then rotates row `main`, spending the token the
+  // slot still holds. Which copy is good can no longer be told from the
+  // files, so the slot value must never replace the row.
+  it('on a migrated install whose row was rotated since, dropping it declines the slot value, so a spent token never replaces the row', async () => {
+    await migrated()
+    const relogin = login('acct-main', 'r-relogin', 'relogin')
+    await h.setSlot(relogin)
+    await stopAt(adoptHostSlotLogin, 'after-row-write')
+    expect((await h.row('main'))?.credential).toMatchObject({
+      refresh: 'r-relogin',
+    })
+    await openStore().rotate('main', {
+      type: 'oauth',
+      access: jwt('acct-main', 'pool-rotated'),
+      refresh: 'r-pool-rotated',
+      expires: FAR,
+    })
+    await ageRecord(PENDING_TRANSFER_TTL_MS + 1)
+
+    expect(
+      await reclaimExpiredPoolTransfer(h.paths, 'r-relogin', {
+        slotAccess: relogin.access,
+      }),
+    ).toBe(true)
+    expect(
+      poolTransferPendingInConfigFile(h.paths.configPath, 'r-relogin'),
+    ).toBe(false)
+
+    // The slot refresh of the spent token fails and leaves the slot as it
+    // was; the next adoption leaves that value alone.
+    expect(await adoptHostSlotLogin(h.deps())).toEqual({
+      status: 'nothing-to-import',
+      slot: 'declined',
+    })
+    expect((await h.row('main'))?.credential).toMatchObject({
+      refresh: 'r-pool-rotated',
+    })
+  })
+
+  it('on a migrated install whose row was rotated before the transfer wrote it, a slot token the refresh renewed is adopted', async () => {
+    await migrated()
+    await h.setSlot(login('acct-main', 'r-relogin', 'relogin'))
+    await stopAt(adoptHostSlotLogin, 'after-record-write')
+    await openStore().rotate('main', {
+      type: 'oauth',
+      access: jwt('acct-main', 'pool-rotated'),
+      refresh: 'r-pool-rotated',
+      expires: FAR,
+    })
+    await ageRecord(PENDING_TRANSFER_TTL_MS + 1)
+    expect(
+      await reclaimExpiredPoolTransfer(h.paths, 'r-relogin', {
+        slotAccess: jwt('acct-main', 'relogin'),
+      }),
+    ).toBe(true)
+
+    // The slot token was never copied, so the slot refresh renews it; the
+    // renewed login is a new slot value and is adopted as usual.
+    await h.setSlot(login('acct-main', 'r-relogin-2', 'renewed'))
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'main',
+      placeholder: 'written',
+    })
+    expect((await h.row('main'))?.credential).toMatchObject({
+      refresh: 'r-relogin-2',
+    })
   })
 
   it('on a migrated install it is dropped when the row never received the token', async () => {
