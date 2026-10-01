@@ -3765,7 +3765,10 @@ describe('integration: active fallback routing', () => {
                   type: 'error',
                   error: {
                     type: 'usage_limit_reached',
-                    resets_in_seconds: 0.05,
+                    // Long enough that the marked request below always runs
+                    // inside the mark, even on a loaded machine; the wait
+                    // before the expiry check outlasts it.
+                    resets_in_seconds: 1,
                   },
                 }),
               )
@@ -3842,7 +3845,7 @@ describe('integration: active fallback routing', () => {
           expect(fallbackTwoSends).toBe(1)
           expect(replacementSends).toBe(1)
 
-          await Bun.sleep(100)
+          await Bun.sleep(1_100)
           await drainSidebarWrites()
           const expiredState = JSON.parse(readFileSync(sidebarFile, 'utf8'))
           expiredState.stickyAssignments = {
