@@ -67,6 +67,8 @@ async function start(
     /** Runs on the seeded files before setup. */
     prepare?: (files: PoolFiles) => void
     fetch?: typeof fetch
+    /** Runs the pool lifecycle (migration, then adoptions of slot logins). */
+    poolMigration?: boolean
   } = {},
 ) {
   const files = poolFiles()
@@ -93,6 +95,7 @@ async function start(
     fence: async () => ({ open: true }),
     heartbeat: false,
     fetch: options.fetch ?? usageOnly,
+    ...(options.poolMigration ? { poolMigration: true } : {}),
     vault: {
       stateDir,
       connectionFile: () => daemon.connectionFile,
@@ -124,7 +127,7 @@ async function start(
   // The vault writes the quota reading to the roster file, then loads the
   // file back into memory; routing sees the reading once that load is done.
   await Bun.sleep(100)
-  return { host, daemon }
+  return { host, daemon, files }
 }
 
 type Host = Awaited<ReturnType<typeof start>>['host']
@@ -252,5 +255,64 @@ describe('vault accounts on OpenCode 2', () => {
     )
     await Bun.sleep(100)
     expect(refreshed.some((token) => token.includes('B-refresh'))).toBe(false)
+  })
+
+  // The pool source polls every row once as soon as it first reads the pool.
+  // That first read must already know which accounts the vault holds, or the
+  // local copy of a vault account is polled with its own token at startup.
+  it('never polls the quota of a pool row signing in as an account the vault holds, from the first read on', async () => {
+    const polls: string[] = []
+    const recording = (async (input: unknown, init?: RequestInit) => {
+      if (String(input).includes('/wham/usage'))
+        polls.push(new Headers(init?.headers).get('authorization') ?? '')
+      return usageOnly(input as never, init)
+    }) as unknown as typeof fetch
+    await start(
+      'fallback-first',
+      [{ id: 'main' }, { id: 'B', identity: 'chatgpt-vault' }],
+      { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+      { fetch: recording },
+    )
+    await waitFor(
+      () => polls.includes('Bearer main-token'),
+      'the first quota poll of row main',
+    )
+    // Every row's first quota poll is fired at once, but each takes the pool
+    // store's lock in turn, so a second row's poll can come well after row
+    // main's; wait long enough for it to show.
+    await Bun.sleep(1_000)
+    expect(polls).not.toContain('Bearer B-token')
+  })
+
+  it('does not adopt a login in the host slot while the vault serves this host its accounts', async () => {
+    const login = {
+      type: 'oauth',
+      access: chatgptAccessToken('chatgpt-login'),
+      refresh: 'login-refresh',
+      expires: Date.now() + 3_600_000,
+    }
+    const { files } = await start(
+      'fallback-first',
+      [{ id: 'main' }],
+      { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+      {
+        poolMigration: true,
+        prepare: (seeded) =>
+          writeFileSync(
+            join(seeded.dir, 'auth.json'),
+            JSON.stringify({ openai: login }),
+          ),
+      },
+    )
+    // The lifecycle's first run (already migrated, then one adoption) starts
+    // with setup; an adoption would have replaced the slot login with the
+    // pool placeholder and added a row by now.
+    await Bun.sleep(300)
+    expect(
+      JSON.parse(readFileSync(join(files.dir, 'auth.json'), 'utf8')).openai,
+    ).toEqual(login)
+    expect(files.readConfig().accounts.map((account) => account.id)).toEqual([
+      'main',
+    ])
   })
 })

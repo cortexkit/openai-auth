@@ -1706,20 +1706,33 @@ export async function CodexAuthPlugin(
           logger: createLogger('heartbeat'),
         })
         await processHeartbeat
+        const auth = await getAuth()
+        if (auth.type === 'oauth') {
+          // The vault polls in the background whether or not this host is
+          // enrolled, so an enrollment finished in another process (`opencode
+          // auth login`) is picked up without a restart. Its first roster is
+          // read before the pool lifecycle starts and before the pool source
+          // first loads (further down): until a roster has been read the
+          // vault reports no accounts, so the first adoption would take a
+          // login in the slot while the vault serves this host, and the
+          // first load (which polls every row once) would poll a local row
+          // signing in as a vault account with that row's own token. Without
+          // an enrollment the read only checks for the token file.
+          const firstRoster = vault.refresh()
+          // Joins the roster read `refresh` just began rather than starting a
+          // second one, then re-reads the roster on its own timer.
+          vault.start()
+          await firstRoster
+        }
         // The account-pool migration waits for the heartbeat: it is how this
         // process shows up to another one's version fence. Never awaited
         // here, and it cannot throw.
         poolLifecycle?.start()
-        const auth = await getAuth()
         if (auth.type !== 'oauth') return {}
 
         // A tombstone the removed vault custody left in the slot is not a
         // credential: nothing is seeded or derived from it.
         const slotTombstoned = classifyMainAuthSlot(auth).kind === 'tombstone'
-        // The vault polls in the background whether or not this host is
-        // enrolled, so an enrollment finished in another process (`opencode
-        // auth login`) is picked up without a restart.
-        vault.start()
         const rpcDir = input.directory
           ? await resolveRpcDir(input.directory)
           : undefined

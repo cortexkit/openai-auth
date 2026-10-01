@@ -2,10 +2,16 @@
 // OpenAI driver, through `@cortexkit/common-auth/opencode2`.
 //
 // What setup wires, in order:
-// 1. The pool source (`core/pool-account-source.ts`) over the same config and
+// 1. This host's Claustrum vault connection (`OpenAiVault` in the core
+//    package, enrolled as `openai-auth-opencode`, the name OpenCode 1 uses),
+//    whose OpenAI accounts are routed beside the pool rows. Its first roster
+//    is read before anything below uses the pool: the pool then never polls
+//    or refreshes a local row signing in as a vault account, and the
+//    lifecycle adopts no login from the slot while the vault serves.
+// 2. The pool source (`core/pool-account-source.ts`) over the same config and
 //    state files OpenCode 1 uses: the pool is the one authority for accounts
 //    on both hosts.
-// 2. This process's heartbeat and, while the migration switch
+// 3. This process's heartbeat and, while the migration switch
 //    (`POOL_MIGRATION_ENABLED` in `../index.ts`, the one OpenCode 1 obeys)
 //    is on, the background pool migration (`core/pool-lifecycle.ts`), with
 //    OpenCode 1's `auth.json` as the login slot (`host-slot.ts`). An install
@@ -22,9 +28,6 @@
 //    request path can serve; OpenCode 2 keeps serving the ChatGPT login in
 //    its own credential table through its built-in OpenAI plugin, and no
 //    credential is read, copied or moved.
-// 3. This host's Claustrum vault connection (`OpenAiVault` in the core
-//    package, enrolled as `openai-auth-opencode`, the name OpenCode 1 uses),
-//    whose OpenAI accounts are routed beside the pool rows.
 // 4. The hooks recipe (`installOpenCode2Auth`) with openai-auth's adapter
 //    (`adapter.ts`): account choice, credential headers, request rewrites,
 //    quota, refusals.
@@ -175,9 +178,9 @@ export async function setupOpenAIAuth(
   // The vault serves nothing until this host is enrolled as
   // `openai-auth-opencode` (from OpenCode 1's `opencode auth login` menu).
   // Until then each poll only checks for the enrollment token file, so an
-  // enrollment another process finished is picked up. It is built before the
-  // pool source, whose first load already asks which accounts it holds, and
-  // started further down.
+  // enrollment another process finished is picked up. Its first roster is
+  // read before the pool source's first load and before the pool lifecycle
+  // starts (see below).
   const vault = new OpenAiVault({
     host: 'opencode',
     stateDir: options.vault?.stateDir ?? vaultStateDir(paths().statePath),
@@ -233,6 +236,23 @@ export async function setupOpenAIAuth(
     vaultIdentities: () => vault.identities(),
     log: createLogger('pool'),
   })
+
+  // The vault's first roster comes before the pool source's first load and
+  // the pool lifecycle's first run. Until a roster has been read the vault
+  // reports no accounts, so the first load would poll the quota of a local
+  // row signing in as a vault account with that row's own token (every row
+  // is polled once at the first load), and the first adoption would take a
+  // login in the slot while the vault serves this host. Without an
+  // enrollment the read only checks for the token file. The source has read
+  // no rows yet, so this first roster reserves no local row ids for vault
+  // routes (OpenCode 1's first roster does not either); the next poll moves a
+  // vault route whose id a local row holds.
+  const firstRoster = vault.refresh()
+  // Joins the roster read `refresh` just began rather than starting a second
+  // one, then re-reads the roster on its own timer.
+  vault.start()
+  await firstRoster
+
   await source.load()
 
   const heartbeat =
@@ -252,6 +272,10 @@ export async function setupOpenAIAuth(
         slot: options.slot ?? opencode1HostSlot(),
         version,
         ...(options.fence ? { fence: options.fence } : {}),
+        // While the vault serves this host its accounts, a login in the slot
+        // is not adopted (the request path refuses it instead), as on
+        // OpenCode 1.
+        runDeps: { vaultServes: () => vault.serves() },
         // A run may leave the pool holding a row this process has never
         // polled (or turn the install migrated); re-reading starts those
         // polls at once.
@@ -269,11 +293,10 @@ export async function setupOpenAIAuth(
     : undefined
   lifecycle?.start()
 
-  vault.start()
   const pollVault = () => {
     if (vault.enrolled()) void vault.pollStale(VAULT_STALE_AFTER_MS)
   }
-  void vault.refresh().then(pollVault)
+  pollVault()
   const vaultPoll = setInterval(pollVault, VAULT_POLL_INTERVAL_MS)
   vaultPoll.unref?.()
 
