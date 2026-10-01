@@ -2361,6 +2361,14 @@ export class FallbackAccountManager {
     return loadAccounts(this.paths)
   }
 
+  /** Queued selection bookkeeping saves (`getUsableFallbackAccounts`), in order. */
+  private selectionBookkeeping: Promise<void> = Promise.resolve()
+
+  /** Resolves once every queued selection bookkeeping save has ended. */
+  selectionBookkeepingSettled(): Promise<void> {
+    return this.selectionBookkeeping
+  }
+
   async save(storage: AccountStorage, accountIds?: string[]) {
     await saveAccountState(storage, this.paths, {
       accounts: accountIds ?? true,
@@ -2485,17 +2493,21 @@ export class FallbackAccountManager {
 
     // Selection bookkeeping only: refreshAccount() has already persisted any
     // rotated tokens itself, so what remains here is recorded refresh/quota
-    // errors and lastUsed merges. Losing it delays a backoff stamp; failing the
-    // caller would abort a request that has not been sent yet, which is worse.
+    // errors and lastUsed merges. This runs on the request path, so the save
+    // is queued rather than awaited: waiting for the state file's lock
+    // behind another writer would hold up a request that has not been sent
+    // yet, for data whose loss only delays a backoff stamp. Saves run one
+    // after another, each with a copy of the storage as it is now.
     if (changed) {
-      try {
-        await this.save(storage)
-      } catch (error) {
-        logA.warn('fallback selection bookkeeping not persisted', {
-          pid: process.pid,
-          error: formatErrorMessage(error),
+      const snapshot = structuredClone(storage)
+      this.selectionBookkeeping = this.selectionBookkeeping
+        .then(() => this.save(snapshot))
+        .catch((error: unknown) => {
+          logA.warn('fallback selection bookkeeping not persisted', {
+            pid: process.pid,
+            error: formatErrorMessage(error),
+          })
         })
-      }
     }
     return usable
   }

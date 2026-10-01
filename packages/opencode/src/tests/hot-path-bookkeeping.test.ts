@@ -18,6 +18,12 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
+import {
+  type AccountStorage,
+  FallbackAccountManager,
+  loadAccounts,
+  type OAuthAccount,
+} from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
 import { CodexAuthPlugin } from '../index.ts'
 import { flushForTest } from '../logger.ts'
@@ -341,6 +347,39 @@ describe('request path never waits on bookkeeping', () => {
     expect(labels.length).toBeGreaterThan(0)
     expect(new Set(labels).size).toBe(labels.length)
   }, 20_000)
+
+  it("legacy fallback selection after a refresh does not wait for the state file's save lock", async () => {
+    seedStore('fallback-first', ['fallback-1'])
+    const paths = { configPath: configFile, statePath: stateFile }
+    const storage = (await loadAccounts(paths)) as AccountStorage
+    const due = storage.accounts[0] as OAuthAccount
+    due.expires = Date.now() + 1_000
+    const manager = new FallbackAccountManager({
+      paths,
+      now: () => Date.now(),
+      fetchImpl: fetch,
+    })
+    // The refresh persists its own rotated token; right after it, another
+    // writer takes the state file's save lock. What is left for selection to
+    // save is bookkeeping, which must not hold up the request.
+    manager.refreshAccount = async (account) => {
+      await holdLock(stateFile, 'save')
+      return {
+        ...(account as OAuthAccount),
+        access: 'fallback-1-rotated',
+        expires: Date.now() + 3600_000,
+      }
+    }
+
+    const started = performance.now()
+    const usable = await manager.getUsableFallbackAccounts(storage)
+    const elapsedMs = performance.now() - started
+
+    expect(usable.map((account) => account.id)).toEqual(['fallback-1'])
+    expect(elapsedMs).toBeLessThan(HOT_PATH_BOUND_MS)
+    await releaseLocks()
+    await manager.selectionBookkeepingSettled()
+  }, 30_000)
 
   for (const mode of ['main-first', 'fallback-first', 'sticky-balanced']) {
     it(`${mode}: returns within the bound while the sidebar and store locks are held, and the bookkeeping lands after release`, async () => {
