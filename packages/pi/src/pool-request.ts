@@ -2,7 +2,7 @@
 //
 // The accounts are Pi's own login, routed as row `main`, and the rows of
 // Pi's account pool (`pool-source.ts`), the fallbacks; the decisions come
-// from `pool-routing.ts`. Sending stays with the caller (`index.ts`), which
+// from the core package's `pool-routing.ts`. Sending stays with the caller (`index.ts`), which
 // owns Pi's stream; it is passed in.
 //
 // The modes:
@@ -32,7 +32,7 @@ import {
   type RoutingMode,
 } from '@cortexkit/openai-auth-core/internal'
 
-import { windowsFromQuotaMap } from './pool-quota.ts'
+import { windowsFromQuotaMap } from '@cortexkit/openai-auth-core/pool-quota'
 import {
   admitSticky,
   FORMER_MAIN_ID,
@@ -44,7 +44,7 @@ import {
   type StickyRouteOptions,
   selectStickyRow,
   stickyBreak,
-} from './pool-routing.ts'
+} from '@cortexkit/openai-auth-core/pool-routing'
 import type { PiPinPlacement } from './routing.ts'
 
 /** One account a request may be sent with. */

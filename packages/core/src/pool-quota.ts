@@ -4,14 +4,11 @@
 // openai-auth reads quota as a fixed snapshot: a `primary` and a `secondary`
 // window plus the credit budget (`spendControl`). The pool stores a map of
 // labelled limits and a budget entry, and merges observations into it. Every
-// response header set and WebSocket rate-limit frame a Pi request produces is
-// turned into one observation here and recorded against the account that
-// served it; the killswitch, which still judges the two fixed windows, reads
-// the windows back out of the map.
-//
-// The same conversion as the OpenCode package's `core/pool-quota.ts`; the Pi
-// package keeps its own copy because it bundles everything it runs and never
-// imports the OpenCode package.
+// response header set and WebSocket rate-limit frame a pooled request produces
+// (on OpenCode once the install is migrated, on Pi always) is turned into one
+// observation here and recorded against the row that served it; the
+// killswitch, which still judges the two fixed windows, reads the windows back
+// out of the row's map.
 
 import {
   isQuotaMap,
@@ -21,10 +18,7 @@ import {
   projectQuota,
   type QuotaObservation,
 } from '@cortexkit/common-auth/quota'
-import type {
-  AccountQuotaWindow,
-  OAuthQuotaSnapshot,
-} from '@cortexkit/openai-auth-core/internal'
+import type { AccountQuotaWindow, OAuthQuotaSnapshot } from './accounts'
 
 /** The window labels openai-auth reads, as the pool map names them. */
 export const POOL_QUOTA_LABELS = ['primary', 'secondary'] as const

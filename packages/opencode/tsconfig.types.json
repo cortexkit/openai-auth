@@ -6,6 +6,12 @@
       "@cortexkit/openai-auth-core/internal": ["../core/dist/internal.d.ts"],
       "@cortexkit/openai-auth-core/tui-support": [
         "../core/dist/tui-support.d.ts"
+      ],
+      "@cortexkit/openai-auth-core/pool-quota": [
+        "../core/dist/pool-quota.d.ts"
+      ],
+      "@cortexkit/openai-auth-core/pool-routing": [
+        "../core/dist/pool-routing.d.ts"
       ]
     }
   }

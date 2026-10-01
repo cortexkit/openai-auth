@@ -56,7 +56,7 @@ import {
 } from '@cortexkit/openai-auth-core/internal'
 
 import { identityOfToken } from './main-account.ts'
-import { observationFromSnapshot } from './pool-quota.ts'
+import { observationFromSnapshot } from '@cortexkit/openai-auth-core/pool-quota'
 
 /**
  * Longest a request waits for a lock-free re-read of the pool files before

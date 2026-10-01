@@ -46,7 +46,10 @@ import type {
 import { PiMainAccount } from './main-account.ts'
 import { getPiAccountPaths } from './paths.ts'
 import { piCommandAccountPool } from './pool-accounts.ts'
-import { observationFromSnapshot, windowsFromQuotaMap } from './pool-quota.ts'
+import {
+  observationFromSnapshot,
+  windowsFromQuotaMap,
+} from '@cortexkit/openai-auth-core/pool-quota'
 import {
   type RouteAccount,
   type RouteAttempt,
@@ -57,7 +60,7 @@ import {
   FORMER_MAIN_ID,
   POOL_QUOTA_UNKNOWN_RETRY_SECONDS,
   type PoolBlock,
-} from './pool-routing.ts'
+} from '@cortexkit/openai-auth-core/pool-routing'
 import { PiPoolSource, settleWithinBudget } from './pool-source.ts'
 import { placePiStickyPin } from './routing.ts'
 

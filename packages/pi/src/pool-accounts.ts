@@ -27,7 +27,7 @@ import {
   mutateAccounts,
 } from '@cortexkit/openai-auth-core/internal'
 
-import { FORMER_MAIN_ID } from './pool-routing.ts'
+import { FORMER_MAIN_ID } from '@cortexkit/openai-auth-core/pool-routing'
 
 type CommandAccountPool = NonNullable<CommandContext['accountPool']>
 type PoolRowOutcome = Awaited<ReturnType<CommandAccountPool['disable']>>

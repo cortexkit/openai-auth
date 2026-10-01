@@ -29,7 +29,10 @@ import {
   parseJwtClaims,
 } from '@cortexkit/openai-auth-core/internal'
 
-import { observationFromSnapshot, windowsFromQuotaMap } from './pool-quota.ts'
+import {
+  observationFromSnapshot,
+  windowsFromQuotaMap,
+} from '@cortexkit/openai-auth-core/pool-quota'
 
 /** Minimum interval between two quota polls of Pi's login asked for by admission. */
 export const MAIN_PULL_RETRY_MS = 15_000

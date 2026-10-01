@@ -1,29 +1,34 @@
-// Routing decisions for a Pi request, made with the account pool's routing
-// library (`@cortexkit/common-auth/routing`).
-//
-// The routed rows are Pi's own `openai-codex` login, routed as row `main`
-// (see `main-account.ts`), and the rows of Pi's account pool, the fallbacks.
+// Routing decisions over the account pool, made with the pool's routing
+// library (`@cortexkit/common-auth/routing`). Both hosts route with this one
+// copy: OpenCode on a migrated install, Pi for every request (Pi's own login
+// is routed as row `main`).
 //
 // The library decides which rows may serve a request (admission) and in what
 // order (`routeOrdered`), routes sticky sessions (`routeSticky`: whether a
 // session's pin serves, moves or is served around, and where a session is
 // placed) and classifies when a sticky session must leave its row after a
 // response (`decideStickyBreak`). openai-auth supplies what the library
-// leaves to its caller: refresh backoff, killswitch verdicts, per-account
-// reserve percentages (the killswitch thresholds) and the session pin ledger.
+// leaves to its caller: rate-limit marks, refresh backoff, killswitch
+// verdicts, per-account reserve percentages (the killswitch thresholds),
+// reset credits and the session pin ledger.
 //
-// One openai-auth rule sits on top of the library's result here, because the
-// library has no input that expresses it: the last path. When admission
-// leaves no row, openai-auth still sends to an account it knows is exhausted
-// (a window at 100% or a spent credit budget) rather than deny the request
-// without asking the provider: the reading may be stale and the provider has
-// the final say. The library keeps that rule only for spent credit budgets,
-// and only while some row survives its first stage. Rows refused for UNKNOWN
-// quota never take the last path: unknown quota blocks.
+// Two openai-auth rules sit on top of the library's result here, because the
+// library has no input that expresses them:
 //
-// The OpenCode package's `core/pool-routing.ts` makes the same decisions; it
-// also has a no-replay gate, which Pi does not need: a Pi request is only
-// ever sent again after its first attempt failed before streaming anything.
+// - The last path. When admission leaves no row, openai-auth still sends to
+//   an account it knows is exhausted (a window at 100% or a spent credit
+//   budget) rather than deny the request without asking the provider: the
+//   reading may be stale and the provider has the final say. The library
+//   keeps that rule only for spent credit budgets, and only while some row
+//   survives its first stage. Rows refused for UNKNOWN quota never take the
+//   last path: unknown quota blocks.
+// - The no-replay gate. A request that cannot be sent twice goes to one
+//   account only, row `main`, and is never retried on another: a second send
+//   could repeat work the provider already did. The host decides what is
+//   replayable: OpenCode marks anything but a buffered POST to `/responses`
+//   as not replayable; Pi sends a request again only after its first attempt
+//   failed before streaming anything, so it leaves the flag unset and every
+//   request is replayable.
 
 import { type ProjectedQuota, projectQuota } from '@cortexkit/common-auth/quota'
 import {
@@ -41,7 +46,11 @@ import {
   type StickySelection,
 } from '@cortexkit/common-auth/routing'
 
-/** The id Pi's own login is routed under: first in main-first, last in fallback-first. */
+/**
+ * The main account's row: on OpenCode the row the migration moved the main
+ * account into, on Pi the id Pi's own login is routed under. First in
+ * main-first, last in fallback-first.
+ */
 export const FORMER_MAIN_ID = 'main'
 
 /**
@@ -130,14 +139,18 @@ function routeBlock(
 
 /**
  * The accounts to try, in order, for `main-first` and `fallback-first`.
- * `placement` puts row `main` (Pi's login) first or last.
+ * `placement` puts the former main row first or last; a non-replayable
+ * request always uses main-first and is sent to one account.
  */
 export function planOrdered(
   input: PoolRoutingInput & {
     placement: Extract<OrderedPlacement, 'main-first' | 'fallback-first'>
+    /** False sends the request to one account only (see the no-replay gate); unset means true. */
+    replayable?: boolean
   },
 ): OrderedPlan {
-  const placement = input.placement
+  const replayable = input.replayable !== false
+  const placement = replayable ? input.placement : 'main-first'
   const route = routeOrdered({
     rows: input.rows,
     placement,
@@ -163,6 +176,21 @@ export function planOrdered(
       .map((refusal) => refusal.id),
   )
   const lastPath = ids.filter((id) => confirmed.has(id))
+
+  if (!replayable) {
+    const hasMain = ids.includes(FORMER_MAIN_ID)
+    const target = hasMain ? FORMER_MAIN_ID : (route.order[0] ?? lastPath[0])
+    if (target !== undefined && route.order.includes(target))
+      return { kind: 'send', order: [target], lastPath: false }
+    if (target !== undefined && confirmed.has(target))
+      return { kind: 'send', order: [target], lastPath: true }
+    return {
+      kind: 'block',
+      block: hasMain
+        ? blockFor(FORMER_MAIN_ID, route.admission, input.killswitch)
+        : routeBlock(ids, route.admission, input.killswitch),
+    }
+  }
 
   if (route.order.length > 0)
     return { kind: 'send', order: route.order, lastPath: false }
