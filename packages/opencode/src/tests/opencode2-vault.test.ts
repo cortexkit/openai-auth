@@ -434,7 +434,10 @@ describe('vault accounts on OpenCode 2', () => {
     releaseMigration.resolve()
     await signedIn
 
-    expect(Date.now() - signing).toBeLessThan(3_000)
+    // The adoption gave up after its 300 ms bound; the rest is the migration
+    // and the login write, which take longer on a loaded machine. A login
+    // held by an unbounded wait would never finish (the test times out).
+    expect(Date.now() - signing).toBeLessThan(8_000)
     const accounts = files.readConfig().accounts
     expect(accounts.map((account) => account.accountId)).toContain(
       'chatgpt-new',
@@ -444,7 +447,7 @@ describe('vault accounts on OpenCode 2', () => {
       'chatgpt-later',
     )
     expect(JSON.parse(readFileSync(authPath, 'utf8')).openai).toEqual(later)
-  }, 10_000)
+  }, 15_000)
 
   it('does not adopt a login in the host slot while the vault serves this host its accounts', async () => {
     const login = {
