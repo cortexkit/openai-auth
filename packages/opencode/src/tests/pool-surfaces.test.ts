@@ -683,8 +683,10 @@ describe('cachekeep and reset credits on a migrated install', () => {
 // ---------------------------------------------------------------------------
 
 describe('the auth menu on a migrated install', () => {
+  type MenuAction = 'add-account' | 'delete-all' | 'check-quotas'
+
   function methods(
-    action: 'add-account' | 'delete-all',
+    action: MenuAction,
     loginAccount = login('menu-acct', 'chatgpt-menu'),
   ) {
     return createAuthMethods({
@@ -704,7 +706,7 @@ describe('the auth menu on a migrated install', () => {
     })
   }
 
-  async function runMenu(action: 'add-account' | 'delete-all') {
+  async function runMenu(action: MenuAction) {
     const log = spyOn(console, 'log').mockImplementation(() => {})
     try {
       const method = methods(action)[0]
@@ -726,6 +728,22 @@ describe('the auth menu on a migrated install', () => {
     ])
     expect(config().commonAuthPool.rows['menu-acct']).toBeDefined()
     expect(stateAccounts()['menu-acct']?.access).toBe('menu-acct-access')
+  })
+
+  it('check-quotas polls every pool row into the pool, refreshing nothing', async () => {
+    seedPool(files, [
+      { id: 'main', quota: quotaMap(10) },
+      { id: 'fallback-1', quota: quotaMap(10) },
+    ])
+    const wire = installWire({
+      usage: () => new Response(usageBody(66), { status: 200 }),
+    })
+    const output = await runMenu('check-quotas')
+    expect(output).toContain('main: quota refreshed')
+    expect(output).toContain('fallback-1: quota refreshed')
+    expect(poolPrimaryUsed('main')).toBe(66)
+    expect(poolPrimaryUsed('fallback-1')).toBe(66)
+    expect(wire.refreshTokens).toEqual([])
   })
 
   it('delete-all removes every row except main, and says so', async () => {
