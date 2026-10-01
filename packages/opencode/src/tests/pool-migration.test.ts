@@ -32,9 +32,11 @@ import {
   isPoolPlaceholder,
   LegacyMainRefreshInFlightError,
   migrateToPool,
+  PENDING_TRANSFER_TTL_MS,
   POOL_MIGRATION_KEY,
   POOL_PLACEHOLDER,
   poolTransferPendingInConfigFile,
+  reclaimExpiredPoolTransfer,
   refreshPoolRow,
 } from '../core/pool-migration.ts'
 import {
@@ -1087,6 +1089,111 @@ describe('the pending record and the slot refresh', () => {
     expect(outcome).toMatchObject({ status: 'completed', rowId: 'main' })
     expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main-rotated'])
     expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+  })
+})
+
+// A run that stops after writing its record (a crash, or a build with the
+// migration switched off taking over) leaves the record behind, and the slot
+// refresh stands down for the token it names. Past its expiry the slot
+// refresh may drop it, unless that would leave the token with two refreshers.
+describe('an expired pending-transfer record', () => {
+  class Stop extends Error {}
+
+  /** Runs `run` until `step`, where it stops for good, as after a crash. */
+  async function stopAt(
+    run: typeof migrateToPool | typeof adoptHostSlotLogin,
+    step: string,
+  ) {
+    await expect(
+      run(
+        h.deps({
+          onStep: async (current) => {
+            if (current === step) throw new Stop()
+          },
+        }),
+      ),
+    ).rejects.toBeInstanceOf(Stop)
+  }
+
+  async function ageRecord(ms: number) {
+    const config = await h.config()
+    config[POOL_MIGRATION_KEY].pending.recordedAt = Date.now() - ms
+    writeFileSync(h.paths.configPath, JSON.stringify(config))
+  }
+
+  it('a fresh record is kept and the slot refresh keeps standing down', async () => {
+    await seedLegacyInstall(h)
+    await stopAt(migrateToPool, 'after-record-write')
+    await ageRecord(PENDING_TRANSFER_TTL_MS - 60_000)
+    expect(await reclaimExpiredPoolTransfer(h.paths, 'r-main')).toBe(false)
+    expect(poolTransferPendingInConfigFile(h.paths.configPath, 'r-main')).toBe(
+      true,
+    )
+  })
+
+  it('an expired record of a stopped migration is dropped, and the next run starts over and completes', async () => {
+    await seedLegacyInstall(h)
+    // Stopped after the row write: before the migration is marked done the
+    // pool refreshes no row and the shield keeps older builds off it, so the
+    // slot is the only refresher left.
+    await stopAt(migrateToPool, 'after-row-write')
+    await ageRecord(PENDING_TRANSFER_TTL_MS + 1)
+    expect(await reclaimExpiredPoolTransfer(h.paths, 'r-main')).toBe(true)
+    expect(poolTransferPendingInConfigFile(h.paths.configPath, 'r-main')).toBe(
+      false,
+    )
+    expect((await h.config()).mainAccountId).toBe('acct-main')
+    // The slot refresh rotated the token meanwhile.
+    await h.setSlot(login('acct-main', 'r-main-2', 'rotated'))
+    expect(await migrateToPool(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'main',
+      placeholder: 'written',
+    })
+    expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main-2'])
+  })
+
+  it('is kept while a run holds the run lock', async () => {
+    await seedLegacyInstall(h)
+    await stopAt(migrateToPool, 'after-record-write')
+    await ageRecord(PENDING_TRANSFER_TTL_MS + 1)
+    const live = await acquireRefreshFileLock({
+      name: 'pool-migration',
+      ttlMs: 60_000,
+      path: h.paths.configPath,
+    })
+    try {
+      expect(await reclaimExpiredPoolTransfer(h.paths, 'r-main')).toBe(false)
+    } finally {
+      await live?.release()
+    }
+    expect(poolTransferPendingInConfigFile(h.paths.configPath, 'r-main')).toBe(
+      true,
+    )
+  })
+
+  it('on a migrated install it is kept once the row holds the token, which the pool then refreshes', async () => {
+    await migrated()
+    await h.setSlot(login('acct-new', 'r-new'))
+    await stopAt(adoptHostSlotLogin, 'after-row-write')
+    await ageRecord(PENDING_TRANSFER_TTL_MS + 1)
+    expect(await reclaimExpiredPoolTransfer(h.paths, 'r-new')).toBe(false)
+    expect(poolTransferPendingInConfigFile(h.paths.configPath, 'r-new')).toBe(
+      true,
+    )
+  })
+
+  it('on a migrated install it is dropped when the row never received the token', async () => {
+    await migrated()
+    await h.setSlot(login('acct-new', 'r-new'))
+    await stopAt(adoptHostSlotLogin, 'after-record-write')
+    await ageRecord(PENDING_TRANSFER_TTL_MS + 1)
+    expect(await reclaimExpiredPoolTransfer(h.paths, 'r-new')).toBe(true)
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'acct-new',
+      placeholder: 'written',
+    })
   })
 })
 

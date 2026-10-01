@@ -415,9 +415,12 @@ async function readConfig(path: string): Promise<Record<string, unknown>> {
   return value
 }
 
+/** What taking a legacy lock and writing the config under it need. */
+type LockContext = Pick<Context, 'paths' | 'now' | 'sleep' | 'locks'>
+
 /** Takes one file lock, polling while a live holder has it. */
 async function acquireLock(
-  ctx: Context,
+  ctx: LockContext,
   name: string,
   path: string,
   ttlMs: number,
@@ -487,7 +490,7 @@ export async function withMainRefreshLock<T>(
  * writer serialise on.
  */
 async function updateConfig(
-  ctx: Context,
+  ctx: LockContext,
   mutate: (config: Record<string, unknown>) => boolean | Promise<boolean>,
 ): Promise<void> {
   const ttlMs = ctx.locks.saveTtlMs
@@ -580,6 +583,107 @@ export class PoolTransferPendingError extends Error {
   constructor() {
     super('the account-pool migration is moving this token; not refreshing it')
     this.name = 'PoolTransferPendingError'
+  }
+}
+
+/**
+ * Age after which a pending-transfer record no longer keeps the slot refresh
+ * standing down by itself. A run finishes a transfer in well under a minute
+ * (every lock it waits for gives up after `LEGACY_LOCK_DEFAULTS.timeoutMs`),
+ * so a record this old belongs to a run that crashed or stopped and was
+ * never resumed: a downgrade to a build with the migration switched off, or
+ * a fence that keeps deferring. Without a limit, main's slot token would
+ * never be refreshed again while the slot still serves it.
+ */
+export const PENDING_TRANSFER_TTL_MS = 10 * 60_000
+
+/**
+ * Called by the slot refresh while it holds `main-refresh`, before it
+ * checks for a pending record covering `refreshToken`. Drops that record
+ * when it is older than `PENDING_TRANSFER_TTL_MS` and dropping it cannot
+ * leave two refreshers of the token, and answers whether it did. With the
+ * record gone the refresh goes ahead, and the next migration or adoption run
+ * starts over the way it does after a crash: with no record, it plans from
+ * the slot as it then stands.
+ *
+ * The record stays when:
+ * - a run is live (it holds the run lock, `POOL_MIGRATION_LOCK_NAME`, which
+ *   is only tried here, never waited for): that run owns the transfer;
+ * - the install is migrated and the record's row already holds the token:
+ *   the pool's own refresh of that row now owns it, and the slot refreshing
+ *   it too would spend one token twice. Before the migration is marked done
+ *   the pool refreshes no row, and older builds' background refresh skips
+ *   the row the shield (`mainAccountId`, which stays up) names, so there the
+ *   slot is the only refresher left and the record can go.
+ */
+export async function reclaimExpiredPoolTransfer(
+  paths: AccountPaths,
+  refreshToken: string,
+  options: {
+    now?: () => number
+    legacyLocks?: Partial<LegacyLockOptions>
+    log?: PoolMigrationLogger
+  } = {},
+): Promise<boolean> {
+  const now = options.now ?? Date.now
+  const expired = (config: Record<string, unknown>) => {
+    const record = readPoolMigrationBookkeeping(config).pending
+    return record &&
+      poolTransferPendingFor(config, refreshToken) &&
+      now() - record.recordedAt >= PENDING_TRANSFER_TTL_MS
+      ? record
+      : undefined
+  }
+  const record = expired(await readConfig(paths.configPath))
+  if (!record) return false
+  const locks = { ...LEGACY_LOCK_DEFAULTS, ...options.legacyLocks }
+  const runLock = await acquireRefreshFileLock({
+    name: POOL_MIGRATION_LOCK_NAME,
+    path: paths.configPath,
+    ttlMs: locks.mainRefreshTtlMs,
+    now,
+  })
+  if (!runLock) return false
+  try {
+    const config = await readConfig(paths.configPath)
+    if (readPoolMigrationBookkeeping(config).migratedAt !== undefined) {
+      const load = await openPoolStore({
+        provider: PROVIDER,
+        configPath: paths.configPath,
+        statePath: paths.statePath,
+        quota: quotaCodec,
+        now,
+      }).read()
+      if (load.status !== 'ready') return false
+      const row = load.rows.find((r) => r.id === record.rowId && !r.invalid)
+      if (row?.fingerprint === record.credentialFingerprint) return false
+    }
+    let dropped = false
+    await updateConfig(
+      {
+        paths,
+        now,
+        locks,
+        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      },
+      (current) => {
+        const book = readPoolMigrationBookkeeping(current)
+        const still = expired(current)
+        if (!still || still.recordedAt !== record.recordedAt) return false
+        const { pending: _dropped, ...rest } = book
+        writeBookkeeping(current, rest)
+        dropped = true
+        return true
+      },
+    )
+    if (dropped)
+      (options.log ?? createLogger('pool-migration')).warn(
+        'dropped an expired account-pool transfer record so the slot refresh can resume',
+        { rowId: record.rowId, recordedAt: record.recordedAt },
+      )
+    return dropped
+  } finally {
+    await runLock.release().catch(() => {})
   }
 }
 

@@ -9,15 +9,17 @@
 // `main-refresh` lock the refresh already holds.
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fingerprintOf } from '@cortexkit/common-auth/store'
 import {
   hashRefreshToken,
   loadAccounts,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks } from '@opencode-ai/plugin'
 import { getAccountPaths } from '../core/account-paths.ts'
+import { PENDING_TRANSFER_TTL_MS } from '../core/pool-migration.ts'
 import { CodexAuthPlugin } from '../index.ts'
 import { drainSidebarWrites } from '../sidebar-state.ts'
 import {
@@ -108,6 +110,61 @@ const expiredLogin: Slot = {
   refresh: 'later-login-refresh',
   expires: Date.now() - 1_000,
 }
+
+describe('slot refresh behind a pending-transfer record', () => {
+  function seedWithRecord(recordedAt: number) {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        routing: { mode: 'main-first' },
+        accounts: [],
+        openaiAuthPool: {
+          pending: {
+            rowId: 'main',
+            operation: 'add',
+            rowFingerprint: null,
+            slotFingerprint: 'slot-fingerprint-of-the-stopped-run',
+            credentialFingerprint: fingerprintOf({
+              type: 'oauth',
+              refresh: expiredLogin.refresh,
+            }),
+            carryLegacyMain: true,
+            recordedAt,
+          },
+        },
+      }),
+    )
+  }
+
+  it('a record left by a migration that stopped long ago no longer stops the refresh', async () => {
+    seedWithRecord(Date.now() - PENDING_TRANSFER_TTL_MS - 1)
+    const wire = installWire()
+    const fetchOverride = await loadFetch(() => expiredLogin)
+
+    await fetchOverride('https://api.openai.com/v1/responses', request())
+
+    expect(wire.refreshTokens).toEqual(['later-login-refresh'])
+    expect(wire.sends).toEqual(['Bearer refreshed-later-login-refresh'])
+    expect(
+      (readJson(configFile).openaiAuthPool as Record<string, unknown>).pending,
+    ).toBeUndefined()
+  })
+
+  it('a recent record keeps the refresh standing down', async () => {
+    seedWithRecord(Date.now())
+    const wire = installWire()
+    const fetchOverride = await loadFetch(() => expiredLogin)
+
+    await fetchOverride('https://api.openai.com/v1/responses', request())
+
+    expect(wire.refreshTokens).toEqual([])
+    expect(
+      (readJson(configFile).openaiAuthPool as Record<string, unknown>).pending,
+    ).toBeDefined()
+  })
+})
 
 describe('slot refresh on a migrated install', () => {
   it('refreshes a later login in the slot instead of reading its own lease as another holder', async () => {
