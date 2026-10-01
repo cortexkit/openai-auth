@@ -153,7 +153,8 @@ describe('OpenCode 2 entry: the migration switch', () => {
     // sits on its requests or replaces its login methods.
     expect(host.hooks).toEqual([])
     expect(host.methods).toEqual([])
-    // A migration run asks the version fence before anything else; none runs.
+    // A migration run checks the version fence before anything else, so a
+    // fence that is never asked means no migration ran.
     expect(await waitFor(() => fenceAsked, 1_000)).toBe(false)
     await stop()
     expect(fenceAsked).toBe(false)
@@ -187,7 +188,9 @@ describe('OpenCode 2 entry: copying the login OpenCode 2 held', () => {
       refresh: 'slot-refresh',
       expires: Date.now() + 3600_000,
     })
-    // The migration waits on the fence until the copy has looked at the pool.
+    // The migration is held at its version-fence check until the plugin has
+    // started copying OpenCode 2's login, so that copy starts while the pool
+    // does not hold the account yet.
     let open: () => void = () => {}
     const gate = new Promise<void>((resolve) => {
       open = resolve

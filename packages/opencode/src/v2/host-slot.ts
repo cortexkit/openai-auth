@@ -105,9 +105,9 @@ async function modeOf(path: string): Promise<number | undefined> {
 export function opencode1HostSlot(
   path: string = opencode1AuthPath(),
 ): HostSlotAdapter {
-  // What the latest `get` of each entry saw. The migration reads the slot
-  // through `get` (its fence) right before it writes; a write is allowed only
-  // while the entry still holds what that read saw. `all` does not count: the
+  // What the latest `get` of each entry saw. The migration decides to write
+  // the placeholder from a `get` it makes right before the write; the write
+  // is allowed only while the entry still holds what that read saw. `all` does not count: the
   // migration uses it only to tell a torn read from an empty file.
   const seen = new Map<string, string | undefined>()
   return {

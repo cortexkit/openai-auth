@@ -213,8 +213,9 @@ export async function setupOpenAIAuth(
           logger: createLogger('heartbeat'),
         })
 
-  // Only while the migration is switched on: with it off the install is
-  // already migrated here (see above), and OpenCode 1 adopts nothing either.
+  // Only while the migration is switched on. With it off, setup gets here
+  // only on an already migrated install, and no adoption of a later login in
+  // OpenCode 1's slot runs, as on OpenCode 1 with the switch off.
   const lifecycle = migrationEnabled
     ? createPoolLifecycle({
         paths,
@@ -338,10 +339,10 @@ export async function setupOpenAIAuth(
       typeof value.metadata?.accountID === 'string'
         ? value.metadata.accountID
         : identityOfToken(value.access)
-    // Only an account the pool does not hold yet, which the import origin
-    // checks against the pool as it stands after the migration: the pool may
-    // have rotated this login's tokens since, or the migration may have just
-    // moved a newer copy of the account into `main`.
+    // Stored only when no pool row holds this account yet, checked by
+    // `writeLoginToPool` after the migration has finished: the pool may have
+    // rotated this login's tokens since, or the migration may have just moved
+    // a newer copy of the account into row `main`.
     await storeLogin(
       {
         id: accountId ?? crypto.randomUUID(),
