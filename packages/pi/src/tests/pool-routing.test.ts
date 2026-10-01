@@ -29,7 +29,7 @@ import type {
   ExtensionCommandContext,
 } from '@earendil-works/pi-coding-agent'
 
-import { registerCommands } from '../commands.ts'
+import { createPiMenu, registerCommands } from '../commands.ts'
 import {
   clearPiStickyRouting,
   getPiStickyRouting,
@@ -493,8 +493,57 @@ describe('Pi requests on the account pool', () => {
   })
 })
 
-describe('Pi commands on the account pool', () => {
-  function commandsFor(runtime: PiOpenAIRuntime) {
+describe('Pi /openai on the account pool', () => {
+  test('lists the pool rows, and Pi login with its quota in a section of its own', async () => {
+    const runtime = makeRuntime()
+    await ready(runtime)
+
+    const { menu } = await createPiMenu(runtime.commandSupport()).open({
+      sessionId: 'session-1',
+      notify: () => {},
+    })
+
+    const accounts = menu.sections.find((section) => section.id === 'accounts')
+    expect(accounts?.items.map((item) => item.id)).toEqual(['alpha', 'beta'])
+    const login = menu.sections.find((section) => section.id === 'pi-login')
+    expect(login?.lines.join('\n')).toContain('primary: 10% used')
+    expect(JSON.stringify(menu)).not.toContain(MAIN_TOKEN)
+    expect(JSON.stringify(menu)).not.toContain(ALPHA_TOKEN)
+  })
+
+  test('a quota check polls Pi login and every pool row', async () => {
+    const runtime = makeRuntime()
+    await ready(runtime)
+    whamHandler = (call) =>
+      whamOk(
+        call.token === ALPHA_TOKEN ? 31 : call.token === BETA_TOKEN ? 52 : 7,
+      )
+
+    const result = await createPiMenu(runtime.commandSupport()).apply(
+      {
+        command: 'openai',
+        sectionId: 'quota',
+        actionId: 'check',
+        values: { account: '*' },
+      },
+      { notify: () => {} },
+    )
+
+    expect(result.ok).toBe(true)
+    const quota = result.menu.sections.find((section) => section.id === 'quota')
+    const detail = (id: string) =>
+      quota?.items.find((item) => item.id === id)?.detail
+    expect(detail('alpha')).toContain('primary 69% left')
+    expect(detail('beta')).toContain('primary 48% left')
+    const login = result.menu.sections.find(
+      (section) => section.id === 'pi-login',
+    )
+    expect(login?.lines.join('\n')).toContain('primary: 7% used')
+  })
+
+  test("the one registered command drives the menu with Pi's UI", async () => {
+    const runtime = makeRuntime()
+    await ready(runtime)
     const handlers = new Map<
       string,
       (args: string, ctx: ExtensionCommandContext) => Promise<void>
@@ -513,53 +562,33 @@ describe('Pi commands on the account pool', () => {
           handlers.set(name, registration.handler)
         },
       } as unknown as ExtensionAPI,
-      {
-        accountPaths: () => paths,
-        fetchImpl: fakeFetch,
-        pool: runtime.commandSupport(),
-      },
+      { pool: runtime.commandSupport() },
     )
-    return handlers
-  }
+    expect([...handlers.keys()]).toEqual(['openai'])
 
-  function ctx(notified: string[]): ExtensionCommandContext {
-    return {
-      ui: { notify: (message: string) => notified.push(message) },
-      sessionManager: { getSessionId: () => 'session-1' },
-      modelRegistry: {
-        getApiKeyForProvider: async () => MAIN_TOKEN,
+    // Routing, its mode action, then Fallback first; then back out twice.
+    const picks = ['Routing', 'Change mode', 'Fallback first']
+    const notified: string[] = []
+    await handlers.get('openai')?.('', {
+      ui: {
+        select: async (_title: string, options: string[]) => {
+          const next = picks.shift()
+          return next && options.find((option) => option.startsWith(next))
+        },
+        confirm: async () => true,
+        input: async () => undefined,
+        notify: (message: string) => notified.push(message),
       },
-    } as unknown as ExtensionCommandContext
-  }
+      sessionManager: { getSessionId: () => 'session-1' },
+      modelRegistry: { getApiKeyForProvider: async () => MAIN_TOKEN },
+    } as unknown as ExtensionCommandContext)
 
-  test('`openai-account` lists Pi login as main and the pool rows', async () => {
-    const runtime = makeRuntime()
-    const notified: string[] = []
-
-    await commandsFor(runtime).get('openai-account')?.('list', ctx(notified))
-
-    const text = notified.at(-1) ?? ''
-    expect(text).toContain('- `main` (oauth, main account)')
-    expect(text).toContain('- `alpha` (oauth)')
-    expect(text).toContain('- `beta` (oauth)')
-  })
-
-  test('`openai-quota` shows the quota of Pi login and every pool row', async () => {
-    const runtime = makeRuntime()
-    whamHandler = (call) =>
-      whamOk(
-        call.token === ALPHA_TOKEN ? 31 : call.token === BETA_TOKEN ? 52 : 7,
-      )
-    const notified: string[] = []
-
-    await commandsFor(runtime).get('openai-quota')?.('', ctx(notified))
-
-    const text = notified.at(-1) ?? ''
-    expect(text).toContain('### Main account')
-    expect(text).toContain('- primary: █░░░░░░░░░ 7% used')
-    expect(text).toContain('**alpha**')
-    expect(text).toContain('  - primary: 31% used')
-    expect(text).toContain('**beta**')
-    expect(text).toContain('  - primary: 52% used')
+    expect(notified).toContain('Routing mode set to Fallback first.')
+    const load = await store().readSettings()
+    expect(
+      load.status === 'ready'
+        ? (load.settings.routing as { mode?: string }).mode
+        : undefined,
+    ).toBe('fallback-first')
   })
 })

@@ -1,302 +1,133 @@
 /**
- * OpenCode's command surface.
+ * OpenCode's `/openai` command.
  *
- * The shared command bodies live in the core so both hosts run the same code.
- * What stays here are the four commands whose state belongs to this host's live
- * request loader — the cachekeep manager it owns and the settings it memoizes —
- * plus the wrappers that hand those bodies to the core's entry points. Going
- * through `buildDialogPayload` / `applyCommand` is what guarantees the
- * credential scrubbing runs on every payload, including these four.
+ * The menu itself is the core's (`createOpenAiMenu`, over the shared command
+ * menu); what stays here is what only this host has: the Cache section over
+ * the live loader's keep-warm manager, the Diagnostics section over its dump
+ * and logging settings, Claustrum mode, reset credits wired to this host's
+ * token resolution, and the not-migrated gate.
+ *
+ * Every payload comes out of the shared seam, which projects accounts field
+ * by field and scrubs credential-shaped names, so nothing here builds a
+ * payload of its own.
  */
-import {
-  type CommandContext,
-  applyCommand as coreApplyCommand,
-  buildDialogPayload as coreBuildDialogPayload,
-  type HostCommandBodies,
-} from '@cortexkit/openai-auth-core'
+import type { CommandMenuModel } from '@cortexkit/common-auth/commands'
+import type { PoolLockSpec, PoolStore } from '@cortexkit/common-auth/store'
 import {
   type ApplyRequest,
   type ApplyResult,
-  type CommandModalName,
-  DEFAULT_KILLSWITCH_THRESHOLDS,
-  type KillswitchConfig,
-  mutateAccounts,
+  type CacheKeepManager,
+  claustrumSection,
+  createOpenAiMenu,
+  type MenuMigrationState,
+  OPENAI_COMMAND_NAME,
   type OpenDialogPayload,
+  type ResetTargetIdentity,
+  resetCreditsSection,
+  sessionSection,
+  settingsMutateAccounts,
+  writeSettings,
+} from '@cortexkit/openai-auth-core'
+import {
+  type AccountPaths,
+  type beginAccountLogin,
+  type ClaustrumMode,
+  cacheKeepSettings,
+  claustrumMode,
+  type loadAccounts,
+  type OAuthAccount,
+  type QuotaManager,
+  type RefreshAllQuotaResult,
   setLogLevel,
 } from '@cortexkit/openai-auth-core/internal'
 import { getSettings, refreshSettings } from './config'
+import { poolRemovalRefusal, poolSettingsLocks } from './core/pool-accounts'
+import { legacyRefreshLocks } from './core/pool-migration'
 import { createLogger } from './logger'
+import { pushNotification } from './rpc/notifications'
 
-export {
-  type CommandContext,
-  MODAL_COMMANDS,
-  OPENAI_ACCOUNT_COMMAND_NAME,
-  OPENAI_CACHEKEEP_COMMAND_NAME,
-  OPENAI_DUMP_COMMAND_NAME,
-  OPENAI_KILLSWITCH_COMMAND_NAME,
-  OPENAI_LOGGING_COMMAND_NAME,
-  OPENAI_QUOTA_COMMAND_NAME,
-  OPENAI_RESET_COMMAND_NAME,
-  OPENAI_ROUTING_COMMAND_NAME,
-  scrubKnobs,
-} from '@cortexkit/openai-auth-core'
-export {
-  type ResetTargetIdentity,
-  renderResetCoordinatorResult,
-} from '@cortexkit/openai-auth-core/internal'
+export { OPENAI_COMMAND_NAME } from '@cortexkit/openai-auth-core'
 
 const log = createLogger('commands')
 
-/** The config/state pair a context describes, in the shape the store takes. */
-function storePaths(ctx: CommandContext) {
+/** What the `/openai` menu reads and changes in this process. */
+export interface OpenCodeMenuContext {
+  accountStoragePath: string
+  /** Runtime-state file that goes with `accountStoragePath`. */
+  accountStatePath: string
+  /** Host package version, sent as the version half of the OAuth `User-Agent`. */
+  packageVersion: string
+  quotaManager: QuotaManager
+  loadAccounts: typeof loadAccounts
+  /** The pool store the accounts live in. */
+  store: () => PoolStore
+  /** Whether the install is migrated, and what holds it back when not. */
+  migration: () => Promise<MenuMigrationState>
+  /** Starts an OAuth account-add flow; injected by the runtime boundary. */
+  beginAccountLogin?: typeof beginAccountLogin
+  /** Actively poll quota for every account. */
+  refreshAllQuota?: () => Promise<RefreshAllQuotaResult[]>
+  /** Refresh the sidebar-state file after a change. */
+  refreshSidebar?: () => Promise<void>
+  /** Re-read the pool so requests route across the changed rows at once. */
+  afterWrite?: () => unknown
+  cacheKeepManager?: CacheKeepManager | null
+  setCacheKeepEnabled?: (enabled: boolean) => void
+  setCacheKeepSubagents?: (enabled: boolean) => void
+  setCacheKeepSustain?: (enabled: boolean) => void
+  setCacheKeepWindow?: (
+    window: { startHour: number; endHour: number } | undefined,
+  ) => void
+  clearStickyRouting?: (sessionId: string) => Promise<boolean>
+  getStickyRouting?: (sessionId: string) => Promise<string | undefined>
+  resolveResetTarget?: (accountKey: string) => Promise<ResetTargetIdentity>
+  refreshResetTargetQuota?: (
+    accountKey: string,
+  ) => Promise<RefreshAllQuotaResult>
+  fetchImpl?: typeof fetch
+  now?: () => number
+  randomUUID?: () => string
+  /** Runs `action` holding row `accountId`'s fallback refresh lock. */
+  withFallbackAccountLock?: <T>(
+    accountId: string,
+    action: () => Promise<T>,
+  ) => Promise<T>
+  /**
+   * Under Claustrum mode, whether the vault serves a usable credential for
+   * the account, and which ChatGPT account it signs in as.
+   */
+  checkUsableCustodyBinding?: (
+    account: OAuthAccount,
+  ) => Promise<
+    { ready: true; accountId: string } | { ready: false; reason: string }
+  >
+  enterClaustrumMode?: () => Promise<{
+    status: 'completed' | 'incomplete' | 'aborted'
+    outcomes: Record<string, string>
+    reason?: string
+  }>
+  leaveClaustrumMode?: () => Promise<void>
+}
+
+function storePaths(ctx: OpenCodeMenuContext): AccountPaths {
   return {
     configPath: ctx.accountStoragePath,
     statePath: ctx.accountStatePath,
   }
 }
 
-async function executeKillswitchCommand(
-  args: string,
-  ctx: CommandContext,
-): Promise<OpenDialogPayload> {
-  const storage = (await ctx.loadAccounts(storePaths(ctx))) ?? {
-    version: 1 as const,
-    accounts: [],
-  }
-  const config: KillswitchConfig = storage.killswitch ?? {}
-  // On a migrated install the roster holds row `main` too. It is the main
-  // account, judged against `config.main`, so it is not listed (or set) as an
-  // account of its own.
-  const poolRows = await ctx.accountPool?.rows()
-  const accountIds = poolRows
-    ? poolRows
-        .filter((row) => row.enabled && row.id !== 'main')
-        .map((row) => row.id)
-    : (storage.accounts ?? [])
-        .filter((a) => a.enabled !== false)
-        .map((a) => a.id)
-
-  const tokens = args.trim().toLowerCase().split(/\s+/).filter(Boolean)
-
-  if (tokens.length === 0) {
-    // Status
-    const enabled = config.enabled === true
-    const lines = ['## Killswitch', '', `Status: **${enabled ? 'ON' : 'OFF'}**`]
-    if (enabled) {
-      lines.push('')
-      lines.push('| Account | primary threshold | secondary threshold |')
-      lines.push('| ------- | ------------ | ------------ |')
-      const mainT = config.main ?? {}
-      const fh =
-        mainT.primary ?? mainT['5h'] ?? DEFAULT_KILLSWITCH_THRESHOLDS.primary
-      const sd =
-        mainT.secondary ??
-        mainT['1w'] ??
-        DEFAULT_KILLSWITCH_THRESHOLDS.secondary
-      lines.push(`| main | ≥ ${fh}% | ≥ ${sd}% |`)
-      for (const id of accountIds) {
-        const t = config.accounts?.[id] ?? config.main ?? {}
-        const afh =
-          t.primary ?? t['5h'] ?? DEFAULT_KILLSWITCH_THRESHOLDS.primary
-        const asd =
-          t.secondary ?? t['1w'] ?? DEFAULT_KILLSWITCH_THRESHOLDS.secondary
-        lines.push(`| ${id} | ≥ ${afh}% | ≥ ${asd}% |`)
-      }
-    }
-    lines.push('')
-    lines.push(
-      'Commands: `/openai-killswitch on` | `/openai-killswitch off` | `/openai-killswitch set <acct>:<5h>,<1w> ...`',
-    )
-    return {
-      command: 'openai-killswitch',
-      text: lines.join('\n'),
-      knobs: { config, accountIds },
-    }
-  }
-
-  if (tokens[0] === 'on') {
-    const updated: KillswitchConfig = {
-      ...config,
-      enabled: true,
-      main: config.main ?? {
-        primary: DEFAULT_KILLSWITCH_THRESHOLDS.primary,
-        secondary: DEFAULT_KILLSWITCH_THRESHOLDS.secondary,
-      },
-    }
-    await mutateAccounts((current) => {
-      current.killswitch = updated
-      return current
-    }, storePaths(ctx))
-    log.info('killswitch enabled')
-    return {
-      command: 'openai-killswitch',
-      text: '## Killswitch Enabled',
-      knobs: { config: updated, accountIds },
-    }
-  }
-
-  if (tokens[0] === 'off') {
-    const updated: KillswitchConfig = { ...config, enabled: false }
-    await mutateAccounts((current) => {
-      current.killswitch = updated
-      return current
-    }, storePaths(ctx))
-    log.info('killswitch disabled')
-    return {
-      command: 'openai-killswitch',
-      text: '## Killswitch Disabled',
-      knobs: { config: updated, accountIds },
-    }
-  }
-
-  if (tokens[0] === 'set' && tokens.length > 1) {
-    const updated: KillswitchConfig = {
-      ...config,
-      enabled: true,
-      accounts: { ...(config.accounts ?? {}) },
-    }
-    for (let i = 1; i < tokens.length; i++) {
-      const match = tokens[i]?.match(/^([^:]+):(\d+),(\d+)$/)
-      if (!match) continue
-      const [, acct, fhStr, sdStr] = match as RegExpMatchArray &
-        [string, string, string, string]
-      const thresholds = {
-        primary: Number.parseInt(fhStr, 10),
-        secondary: Number.parseInt(sdStr, 10),
-      }
-      if (acct === 'main') {
-        updated.main = thresholds
-      } else if (acct === 'all') {
-        updated.main = thresholds
-        for (const id of accountIds) {
-          // biome-ignore lint/style/noNonNullAssertion: accounts initialized above in the same branch
-          updated.accounts![id] = thresholds
-        }
-      } else {
-        // biome-ignore lint/style/noNonNullAssertion: accounts initialized above in the same branch
-        updated.accounts![acct] = thresholds
-      }
-    }
-    await mutateAccounts((current) => {
-      current.killswitch = updated
-      return current
-    }, storePaths(ctx))
-    log.info('killswitch thresholds updated', { count: tokens.length - 1 })
-    return {
-      command: 'openai-killswitch',
-      text: '## Killswitch Updated',
-      knobs: { config: updated, accountIds },
-    }
-  }
-
-  return {
-    command: 'openai-killswitch',
-    text: 'Usage: `/openai-killswitch`, `/openai-killswitch on`, `/openai-killswitch off`, `/openai-killswitch set <acct>:<5h>,<1w> ...`',
-    knobs: { config, accountIds },
-  }
+async function currentClaustrumMode(
+  ctx: OpenCodeMenuContext,
+): Promise<ClaustrumMode> {
+  return claustrumMode(await ctx.loadAccounts(storePaths(ctx)))
 }
 
-async function executeDumpCommand(
-  args: string,
-  ctx: CommandContext,
-): Promise<OpenDialogPayload> {
-  const tokens = args.trim().toLowerCase().split(/\s+/).filter(Boolean)
-  const settings = getSettings()
-  const currentEnabled = settings.dump
-
-  if (tokens.length === 0) {
-    return {
-      command: 'openai-dump',
-      text: `## Request Dump\n\n- Enabled: ${currentEnabled ? 'ON' : 'OFF'}\n- Directory: ${settings.dumpDir}\n\nUsage: \`/openai-dump on\` or \`/openai-dump off\``,
-      knobs: { enabled: currentEnabled },
-    }
-  }
-
-  if (tokens[0] === 'on') {
-    // Persist the dump toggle via mutateAccounts (authoritative, no stale union).
-    await mutateAccounts((current) => {
-      current.dump = { ...(current.dump ?? {}), enabled: true }
-      return current
-    }, storePaths(ctx))
-    // The dump gates read memoized settings, so without this the running process
-    // keeps dumping nothing while the file says it is on.
-    const updated = refreshSettings()
-    log.info('request dump enabled')
-    return {
-      command: 'openai-dump',
-      text: `## Request Dump Enabled\n\nDump directory: ${updated.dumpDir}\n\nWarning: body dumps may contain prompt/session content. Turn this off after debugging.`,
-      knobs: { enabled: true },
-    }
-  }
-
-  if (tokens[0] === 'off') {
-    await mutateAccounts((current) => {
-      current.dump = { ...(current.dump ?? {}), enabled: false }
-      return current
-    }, storePaths(ctx))
-    refreshSettings()
-    log.info('request dump disabled')
-    return {
-      command: 'openai-dump',
-      text: '## Request Dump Disabled',
-      knobs: { enabled: false },
-    }
-  }
-
-  return {
-    command: 'openai-dump',
-    text: `Usage: \`/openai-dump\`, \`/openai-dump on\`, or \`/openai-dump off\`.`,
-    knobs: { enabled: currentEnabled },
-  }
+function hourLabel(window: { startHour: number; endHour: number }) {
+  return `${String(window.startHour).padStart(2, '0')}-${String(window.endHour).padStart(2, '0')}`
 }
 
-async function executeLoggingCommand(
-  args: string,
-  ctx: CommandContext,
-): Promise<OpenDialogPayload> {
-  const tokens = args.trim().toLowerCase().split(/\s+/).filter(Boolean)
-  const validLevels = ['error', 'warn', 'info', 'debug', 'trace']
-
-  if (tokens.length === 0) {
-    // Show current level — read from the module state by probing with a reset
-    // We report the level stored in the config
-    const storage = await ctx.loadAccounts(storePaths(ctx))
-    const level = (storage?.logging?.level as string | undefined) ?? 'info'
-    return {
-      command: 'openai-logging',
-      text: `## Logging\n\n- Level: \`${level}\`\n\nValid levels: ${validLevels.map((l) => `\`${l}\``).join(', ')}\n\nUsage: \`/openai-logging <level>\``,
-      knobs: { level },
-    }
-  }
-
-  const levelArg = tokens[0]
-  if (levelArg && validLevels.includes(levelArg)) {
-    const level = levelArg
-    // Call setLogLevel so the log-level change takes effect immediately without a restart.
-    setLogLevel(level as 'error' | 'warn' | 'info' | 'debug' | 'trace')
-
-    // Persist via mutateAccounts (authoritative, no stale union).
-    await mutateAccounts((current) => {
-      current.logging = { ...(current.logging ?? {}), level }
-      return current
-    }, storePaths(ctx))
-    log.info('log level changed', { level })
-
-    return {
-      command: 'openai-logging',
-      text: `## Logging Updated\n\nLevel set to \`${level}\`.`,
-      knobs: { level },
-    }
-  }
-
-  return {
-    command: 'openai-logging',
-    text: `## Invalid Level\n\nValid levels: ${validLevels.map((l) => `\`${l}\``).join(', ')}`,
-    knobs: { level: 'info' },
-  }
-}
-
-function parseCacheKeepWindowArg(
+/** Parses a clock-hour window `HH-HH`, such as `9-18` or `22-6`. */
+export function parseCacheKeepWindow(
   input: string,
 ):
   | { ok: true; startHour: number; endHour: number }
@@ -307,15 +138,7 @@ function parseCacheKeepWindowArg(
   }
   const startHour = Number(match[1])
   const endHour = Number(match[2])
-  if (
-    !Number.isInteger(startHour) ||
-    !Number.isInteger(endHour) ||
-    startHour < 0 ||
-    startHour > 23 ||
-    endHour < 0 ||
-    endHour > 23 ||
-    startHour === endHour
-  ) {
+  if (startHour > 23 || endHour > 23 || startHour === endHour) {
     return {
       ok: false,
       reason: 'hours must be integers 0-23 and start ≠ end',
@@ -324,337 +147,454 @@ function parseCacheKeepWindowArg(
   return { ok: true, startHour, endHour }
 }
 
-async function executeCachekeepCommand(
-  args: string,
-  ctx: CommandContext,
-): Promise<OpenDialogPayload> {
-  const mgr = ctx.cacheKeepManager
-  const tokens = args.trim().toLowerCase().split(/\s+/).filter(Boolean)
-  const storage = await ctx.loadAccounts(storePaths(ctx))
-  const enabled = storage?.cachekeep?.enabled === true
+const SUSTAIN_ON_TEXT =
+  'Sustain keeps main-agent sessions warming past the idle cap for this process. Clock windows still apply.\n\nBefore enabling sustain with Magic Context, set a non-expiring `cache_ttl` for models used by main sessions; elapsed-time cold-cache assumptions are no longer valid.'
 
-  if (tokens.length === 0 || tokens[0] === 'status') {
-    if (!mgr) {
-      return {
-        command: 'openai-cachekeep',
-        text: '## Cachekeep\n\nStatus: **not available** (manager not wired)',
-        knobs: {},
-      }
-    }
-    const status = mgr.status()
-    const liveWindow = status.window
-    const windowLabel = liveWindow
-      ? `${String(liveWindow.startHour).padStart(2, '0')}-${String(liveWindow.endHour).padStart(2, '0')}`
-      : 'always (no window)'
-    const lines: string[] = [
-      '## Cachekeep',
-      '',
-      `Status: **${enabled ? 'ON' : 'OFF'}**`,
-      `Timer: **${status.running ? 'armed' : 'idle'}**`,
-      `Subagent warming: **${storage?.cachekeep?.subagents === true ? 'ON' : 'OFF'}**`,
-      `Idle policy: **sustain ${status.sustain ? 'ON' : 'OFF'} (main only)**`,
-      `Window: **${windowLabel}**`,
-    ]
-    lines.push(`Tracked sessions: **${status.tracked}**`)
-    if (status.targets.length > 0) {
-      lines.push('')
-      for (const t of status.targets) {
-        const shortSess =
-          t.sessionKey.length > 12
-            ? `${t.sessionKey.slice(0, 12)}…`
-            : t.sessionKey
-        const expiresIn = Math.ceil(
-          (t.cacheExpiresAt - status.generatedAt) / 1000,
-        )
-        lines.push(
-          `- \`${shortSess}\` (${t.accountId ?? 'main'}) — expires in ${expiresIn}s` +
-            (t.lastWarmedAt
-              ? `, last warm ${Math.ceil((status.generatedAt - t.lastWarmedAt) / 1000)}s ago`
-              : '') +
-            (t.backoffUntil && t.backoffUntil > status.generatedAt
-              ? `, backoff ${Math.ceil((t.backoffUntil - status.generatedAt) / 1000)}s`
-              : ''),
-        )
-      }
-    }
-    lines.push('')
-    lines.push(
-      `TTL: ${Math.round(status.ttlMs / 1000)}s | Lead: ${Math.round(status.leadMs / 1000)}s | Max idle warm: ${Math.round(status.maxIdleWarmMs / 60_000)}min`,
-    )
-    lines.push('')
-    lines.push(
-      'Commands: `/openai-cachekeep on` | `/openai-cachekeep off` | `/openai-cachekeep sustain on` | `/openai-cachekeep sustain off` | `/openai-cachekeep HH-HH` | `/openai-cachekeep window clear` | `/openai-cachekeep subagents on` | `/openai-cachekeep subagents off` | `/openai-cachekeep`',
-    )
-    const lastWarmAt = Math.max(
-      0,
-      ...status.targets.map((target) => target.lastWarmedAt ?? 0),
-    )
-    return {
-      command: 'openai-cachekeep',
-      text: lines.join('\n'),
-      knobs: {
-        enabled,
-        subagents: storage?.cachekeep?.subagents === true,
-        sustain: status.sustain,
-        window: liveWindow,
-        running: status.running,
-        tracked: status.tracked,
-        lastWarmAt: lastWarmAt || undefined,
-        generatedAt: status.generatedAt,
-        maxIdleWarmMs: status.maxIdleWarmMs,
-        maxSubagentIdleMs: status.maxSubagentIdleMs,
-      },
-    }
-  }
-
-  if (tokens[0] === 'on') {
-    if (!mgr) {
-      return {
-        command: 'openai-cachekeep',
-        text: '## Cachekeep\n\nCannot start: manager not wired.',
-        knobs: {},
-      }
-    }
-    await mutateAccounts((current) => {
-      current.cachekeep = { ...(current.cachekeep ?? {}), enabled: true }
-      return current
-    }, storePaths(ctx))
-    log.info('cachekeep enabled')
-    ctx.setCacheKeepEnabled?.(true)
-    mgr.start()
-    const status = mgr.status()
-    const lastWarmAt = Math.max(
-      0,
-      ...status.targets.map((target) => target.lastWarmedAt ?? 0),
-    )
-    return {
-      command: 'openai-cachekeep',
-      text: `## Cachekeep Enabled\n\nTTL: ${Math.round(status.ttlMs / 1000)}s | Max idle warm ${Math.round(status.maxIdleWarmMs / 60_000)}min`,
-      knobs: {
-        enabled: true,
-        subagents: storage?.cachekeep?.subagents === true,
-        sustain: status.sustain,
-        window: status.window,
-        running: status.running,
-        tracked: status.tracked,
-        lastWarmAt: lastWarmAt || undefined,
-        generatedAt: status.generatedAt,
-        maxIdleWarmMs: status.maxIdleWarmMs,
-        maxSubagentIdleMs: status.maxSubagentIdleMs,
-      },
-    }
-  }
-
-  if (tokens[0] === 'off') {
-    await mutateAccounts((current) => {
-      current.cachekeep = { ...(current.cachekeep ?? {}), enabled: false }
-      return current
-    }, storePaths(ctx))
-    log.info('cachekeep disabled')
-    ctx.setCacheKeepEnabled?.(false)
-    mgr?.stop()
-    return {
-      command: 'openai-cachekeep',
-      text: '## Cachekeep Disabled',
-      knobs: {
-        enabled: false,
-        sustain: storage?.cachekeep?.sustain === true,
-        running: false,
-        tracked: 0,
-      },
-    }
-  }
-
-  if (tokens[0] === 'sustain') {
-    const sustainCmd = tokens[1]
-    if (tokens.length !== 2 || (sustainCmd !== 'on' && sustainCmd !== 'off')) {
-      return {
-        command: 'openai-cachekeep',
-        text: 'Usage: `/openai-cachekeep sustain on` | `/openai-cachekeep sustain off`',
-        knobs: {},
-      }
-    }
-    const value = sustainCmd === 'on'
-    await mutateAccounts((current) => {
-      current.cachekeep = {
-        ...(current.cachekeep ?? {}),
-        sustain: value,
-      }
-      return current
-    }, storePaths(ctx))
-    log.info(`cachekeep sustain ${value ? 'enabled' : 'disabled'}`)
-    ctx.setCacheKeepSustain?.(value)
-    const nextStatus = mgr?.status()
-    return {
-      command: 'openai-cachekeep',
-      text: value
-        ? '## Cachekeep Sustain Enabled\n\nSustain keeps main-agent sessions warming past the idle cap for this process. Clock windows still apply.\n\nBefore enabling sustain with Magic Context, set a non-expiring `cache_ttl` for models used by main sessions; elapsed-time cold-cache assumptions are no longer valid.'
-        : '## Cachekeep Sustain Disabled\n\nMain-agent sessions again stop warming at the configured idle cap.',
-      knobs: {
-        enabled,
-        subagents: storage?.cachekeep?.subagents === true,
-        sustain: value,
-        window: nextStatus?.window,
-        running: nextStatus?.running ?? false,
-        tracked: nextStatus?.tracked ?? 0,
-        generatedAt: nextStatus?.generatedAt ?? Date.now(),
-        maxIdleWarmMs: nextStatus?.maxIdleWarmMs ?? 60 * 60 * 1000,
-        maxSubagentIdleMs: nextStatus?.maxSubagentIdleMs ?? 30 * 60 * 1000,
-      },
-    }
-  }
-
-  if (tokens[0] === 'subagents') {
-    const subCmd = tokens[1] as string | undefined
-    if (!subCmd || (subCmd !== 'on' && subCmd !== 'off')) {
-      return {
-        command: 'openai-cachekeep',
-        text: 'Usage: `/openai-cachekeep subagents on` | `/openai-cachekeep subagents off`',
-        knobs: {},
-      }
-    }
-    const value = subCmd === 'on'
-    await mutateAccounts((current) => {
-      current.cachekeep = {
-        ...(current.cachekeep ?? {}),
-        subagents: value,
-      }
-      return current
-    }, storePaths(ctx))
-    log.info(
-      value
-        ? 'cachekeep subagent warming enabled'
-        : 'cachekeep subagent warming disabled',
-    )
-    ctx.setCacheKeepSubagents?.(value)
-    const nextStatus = mgr?.status()
-    return {
-      command: 'openai-cachekeep',
-      text: `## Cachekeep Subagent Warming\n\nSubagent warming: **${value ? 'ON' : 'OFF'}**`,
-      knobs: {
-        enabled,
-        subagents: value,
-        sustain: nextStatus?.sustain ?? storage?.cachekeep?.sustain === true,
-        window: nextStatus?.window,
-        running: nextStatus?.running ?? false,
-        tracked: nextStatus?.tracked ?? 0,
-        generatedAt: nextStatus?.generatedAt ?? Date.now(),
-        maxIdleWarmMs: nextStatus?.maxIdleWarmMs ?? 60 * 60 * 1000,
-        maxSubagentIdleMs: nextStatus?.maxSubagentIdleMs ?? 30 * 60 * 1000,
-      },
-    }
-  }
-
-  // `/openai-cachekeep window clear` (or `window off`) drops any persisted
-  // window so cachekeep returns to the legacy "always warm" behavior.
-  if (tokens[0] === 'window') {
-    const sub = tokens[1]
-    if (sub === 'clear' || sub === 'off') {
-      await mutateAccounts((current) => {
-        if (current.cachekeep) {
-          delete current.cachekeep.startHour
-          delete current.cachekeep.endHour
-        }
-        return current
-      }, storePaths(ctx))
-      ctx.setCacheKeepWindow?.(undefined)
-      log.info('cachekeep window cleared')
-      const nextStatus = mgr?.status()
-      return {
-        command: 'openai-cachekeep',
-        text: '## Cachekeep Window Cleared\n\nCachekeep will now warm on every tick (within idle caps).',
-        knobs: {
-          enabled,
-          subagents: storage?.cachekeep?.subagents === true,
-          sustain: nextStatus?.sustain ?? storage?.cachekeep?.sustain === true,
-          window: undefined,
-          running: nextStatus?.running ?? false,
-          tracked: nextStatus?.tracked ?? 0,
-          generatedAt: nextStatus?.generatedAt ?? Date.now(),
-          maxIdleWarmMs: nextStatus?.maxIdleWarmMs ?? 60 * 60 * 1000,
-          maxSubagentIdleMs: nextStatus?.maxSubagentIdleMs ?? 30 * 60 * 1000,
-        },
-      }
-    }
-    return {
-      command: 'openai-cachekeep',
-      text: 'Usage: `/openai-cachekeep window clear`',
-      knobs: {},
-    }
-  }
-
-  // Top-level `HH-HH` parses as a window set (e.g. `/openai-cachekeep 9-18`).
-  const hhToken = tokens[0]
-  if (hhToken && /^\d{1,2}-\d{1,2}$/.test(hhToken)) {
-    const parsed = parseCacheKeepWindowArg(hhToken)
-    if (!parsed.ok) {
-      return {
-        command: 'openai-cachekeep',
-        text: `## Cachekeep Window Invalid\n\n${parsed.reason}`,
-        knobs: {},
-      }
-    }
-    const { startHour, endHour } = parsed
-    await mutateAccounts((current) => {
-      current.cachekeep = {
-        ...(current.cachekeep ?? {}),
-        startHour,
-        endHour,
-      }
-      return current
-    }, storePaths(ctx))
-    ctx.setCacheKeepWindow?.({ startHour, endHour })
-    log.info('cachekeep window set', { startHour, endHour })
-    const nextStatus = mgr?.status()
-    const hhLabel = `${String(startHour).padStart(2, '0')}-${String(endHour).padStart(2, '0')}`
-    return {
-      command: 'openai-cachekeep',
-      text: `## Cachekeep Window Set\n\nWarming limited to **${hhLabel}** local hours.`,
-      knobs: {
-        enabled,
-        subagents: storage?.cachekeep?.subagents === true,
-        sustain: nextStatus?.sustain ?? storage?.cachekeep?.sustain === true,
-        window: { startHour, endHour },
-        running: nextStatus?.running ?? false,
-        tracked: nextStatus?.tracked ?? 0,
-        generatedAt: nextStatus?.generatedAt ?? Date.now(),
-        maxIdleWarmMs: nextStatus?.maxIdleWarmMs ?? 60 * 60 * 1000,
-        maxSubagentIdleMs: nextStatus?.maxSubagentIdleMs ?? 30 * 60 * 1000,
-      },
-    }
-  }
-
+/** The Cache section: prompt-cache keep-warm, over the live manager. */
+function cacheSection(ctx: OpenCodeMenuContext) {
+  const write = (edit: (cacheKeep: Record<string, unknown>) => void) =>
+    writeSettings(ctx.store(), poolSettingsLocks(storePaths(ctx)), (s) => {
+      const cacheKeep = { ...((s.cacheKeep as object | undefined) ?? {}) }
+      edit(cacheKeep as Record<string, unknown>)
+      s.cacheKeep = cacheKeep
+    })
   return {
-    command: 'openai-cachekeep',
-    text: 'Usage: `/openai-cachekeep`, `/openai-cachekeep on`, `/openai-cachekeep off`, `/openai-cachekeep sustain on`, `/openai-cachekeep sustain off`, `/openai-cachekeep HH-HH`, `/openai-cachekeep window clear`, `/openai-cachekeep subagents on`, `/openai-cachekeep subagents off`',
-    knobs: {},
+    title: 'Cache',
+    build: async () => {
+      const mgr = ctx.cacheKeepManager
+      if (!mgr)
+        return { lines: ['Cache keep-warm is not available in this process.'] }
+      const stored = cacheKeepSettings(await ctx.loadAccounts(storePaths(ctx)))
+      const enabled = stored?.enabled === true
+      const subagents = stored?.subagents === true
+      const status = mgr.status()
+      const windowLabel = status.window
+        ? hourLabel(status.window)
+        : 'always (no window)'
+      return {
+        lines: [
+          `Keep-warm: ${enabled ? 'on' : 'off'}, timer ${status.running ? 'armed' : 'idle'}, ${status.tracked} session(s) tracked.`,
+          `Subagent warming: ${subagents ? 'on' : 'off'}. Sustain (main sessions only): ${status.sustain ? 'on' : 'off'}. Window: ${windowLabel}.`,
+          `TTL ${Math.round(status.ttlMs / 1000)}s, lead ${Math.round(status.leadMs / 1000)}s, idle cap ${Math.round(status.maxIdleWarmMs / 60_000)}min (subagents ${Math.round(status.maxSubagentIdleMs / 60_000)}min).`,
+        ],
+        items: status.targets.map((target) => ({
+          id: target.sessionKey,
+          label:
+            target.sessionKey.length > 12
+              ? `${target.sessionKey.slice(0, 12)}…`
+              : target.sessionKey,
+          detail: [
+            target.accountId ?? 'main',
+            `expires in ${Math.ceil((target.cacheExpiresAt - status.generatedAt) / 1000)}s`,
+            ...(target.lastWarmedAt
+              ? [
+                  `last warm ${Math.ceil((status.generatedAt - target.lastWarmedAt) / 1000)}s ago`,
+                ]
+              : []),
+            ...(target.backoffUntil && target.backoffUntil > status.generatedAt
+              ? [
+                  `backoff ${Math.ceil((target.backoffUntil - status.generatedAt) / 1000)}s`,
+                ]
+              : []),
+          ].join(' · '),
+        })),
+        actions: [
+          {
+            id: 'enabled',
+            label: enabled ? 'Turn keep-warm off' : 'Turn keep-warm on',
+            knobs: [
+              {
+                kind: 'toggle' as const,
+                id: 'enabled',
+                label: 'Keep-warm',
+                value: !enabled,
+              },
+            ],
+            run: async ({ values }: { values: Record<string, unknown> }) => {
+              const on = values.enabled === true
+              await write((cacheKeep) => {
+                cacheKeep.enabled = on
+              })
+              ctx.setCacheKeepEnabled?.(on)
+              if (on) mgr.start()
+              else mgr.stop()
+              log.info(on ? 'cachekeep enabled' : 'cachekeep disabled')
+              return on
+                ? `Keep-warm is on. TTL ${Math.round(status.ttlMs / 1000)}s, idle cap ${Math.round(status.maxIdleWarmMs / 60_000)}min.`
+                : 'Keep-warm is off.'
+            },
+          },
+          {
+            id: 'subagents',
+            label: subagents
+              ? 'Stop warming subagent sessions'
+              : 'Warm subagent sessions too',
+            knobs: [
+              {
+                kind: 'toggle' as const,
+                id: 'subagents',
+                label: 'Subagent warming',
+                value: !subagents,
+              },
+            ],
+            run: async ({ values }: { values: Record<string, unknown> }) => {
+              const on = values.subagents === true
+              await write((cacheKeep) => {
+                cacheKeep.subagents = on
+              })
+              ctx.setCacheKeepSubagents?.(on)
+              return `Subagent warming is ${on ? 'on' : 'off'}.`
+            },
+          },
+          {
+            id: 'sustain',
+            label: status.sustain
+              ? 'Stop sustaining main sessions'
+              : 'Sustain main sessions past the idle cap',
+            knobs: [
+              {
+                kind: 'toggle' as const,
+                id: 'sustain',
+                label: 'Sustain',
+                value: !status.sustain,
+              },
+            ],
+            run: async ({ values }: { values: Record<string, unknown> }) => {
+              const on = values.sustain === true
+              await write((cacheKeep) => {
+                cacheKeep.sustain = on
+              })
+              ctx.setCacheKeepSustain?.(on)
+              return on
+                ? SUSTAIN_ON_TEXT
+                : 'Main-agent sessions again stop warming at the configured idle cap.'
+            },
+          },
+          {
+            id: 'window',
+            label: 'Set the warm window',
+            description:
+              'Warm only between these local hours, e.g. 9-18 or 22-6. Leave it empty to warm at any hour.',
+            knobs: [
+              {
+                kind: 'text' as const,
+                id: 'window',
+                label: 'Window (HH-HH)',
+                placeholder: '9-18',
+                ...(status.window ? { value: hourLabel(status.window) } : {}),
+              },
+            ],
+            run: async ({ values }: { values: Record<string, unknown> }) => {
+              const raw = values.window
+              if (typeof raw !== 'string' || raw.trim() === '') {
+                await write((cacheKeep) => {
+                  delete cacheKeep.startHour
+                  delete cacheKeep.endHour
+                })
+                ctx.setCacheKeepWindow?.(undefined)
+                return 'Warm window cleared: keep-warm warms at any hour (within idle caps).'
+              }
+              const parsed = parseCacheKeepWindow(raw)
+              if (!parsed.ok)
+                return { ok: false, text: `Invalid window: ${parsed.reason}` }
+              const { startHour, endHour } = parsed
+              await write((cacheKeep) => {
+                cacheKeep.startHour = startHour
+                cacheKeep.endHour = endHour
+              })
+              ctx.setCacheKeepWindow?.({ startHour, endHour })
+              return `Warming limited to ${hourLabel(parsed)} local hours.`
+            },
+          },
+        ],
+      }
+    },
   }
+}
+
+const LOG_LEVELS = ['error', 'warn', 'info', 'debug', 'trace'] as const
+
+/** The Diagnostics section: request dumps and the log level. */
+function diagnosticsSection(ctx: OpenCodeMenuContext) {
+  return {
+    title: 'Diagnostics',
+    build: async () => {
+      const settings = getSettings()
+      const storage = await ctx.loadAccounts(storePaths(ctx))
+      const level = storage?.logging?.level ?? 'info'
+      return {
+        lines: [
+          `Request dumps: ${settings.dump ? 'on' : 'off'}, written to ${settings.dumpDir}.`,
+          `Log level: ${level}.`,
+        ],
+        actions: [
+          {
+            id: 'dump',
+            label: settings.dump
+              ? 'Turn request dumps off'
+              : 'Turn request dumps on',
+            knobs: [
+              {
+                kind: 'toggle' as const,
+                id: 'enabled',
+                label: 'Request dumps',
+                value: !settings.dump,
+              },
+            ],
+            run: async ({ values }: { values: Record<string, unknown> }) => {
+              const on = values.enabled === true
+              await writeSettings(
+                ctx.store(),
+                poolSettingsLocks(storePaths(ctx)),
+                (s) => {
+                  s.dump = {
+                    ...((s.dump as object | undefined) ?? {}),
+                    enabled: on,
+                  }
+                },
+              )
+              // The dump gates read memoized settings; without this the running
+              // process keeps dumping nothing while the file says it is on.
+              const updated = refreshSettings()
+              log.info(on ? 'request dump enabled' : 'request dump disabled')
+              return on
+                ? `Request dumps are on, written to ${updated.dumpDir}.\n\nBody dumps may contain prompt and session content. Turn this off after debugging.`
+                : 'Request dumps are off.'
+            },
+          },
+          {
+            id: 'logging',
+            label: 'Set the log level',
+            knobs: [
+              {
+                kind: 'choice' as const,
+                id: 'level',
+                label: 'Level',
+                choices: LOG_LEVELS.map((value) => ({ value, label: value })),
+                value: (LOG_LEVELS as readonly string[]).includes(level)
+                  ? level
+                  : 'info',
+              },
+            ],
+            run: async ({ values }: { values: Record<string, unknown> }) => {
+              const next = String(values.level) as (typeof LOG_LEVELS)[number]
+              await writeSettings(
+                ctx.store(),
+                poolSettingsLocks(storePaths(ctx)),
+                (s) => {
+                  s.logging = {
+                    ...((s.logging as object | undefined) ?? {}),
+                    level: next,
+                  }
+                },
+              )
+              // Takes effect now, without a restart.
+              setLogLevel(next)
+              log.info('log level changed', { level: next })
+              return `Log level set to ${next}.`
+            },
+          },
+        ],
+      }
+    },
+  }
+}
+
+/** The accounts a reset credit can be spent on: `main`, then the enabled OAuth rows. */
+async function resetAccountKeys(ctx: OpenCodeMenuContext): Promise<string[]> {
+  const load = await ctx.store().read()
+  const rows = load.status === 'ready' ? load.rows : []
+  return [
+    ...new Set([
+      'main',
+      ...rows
+        .filter((row) => row.enabled && row.type === 'oauth')
+        .map((row) => row.id),
+    ]),
+  ]
 }
 
 /**
- * The four bodies this host owns, keyed by the command name that reaches them.
- *
- * Handed to the core on every entry so the dispatch stays in one place and the
- * scrubbing applies uniformly; Pi registers none of these and passes nothing.
+ * Enabling a row under Claustrum mode: the vault must serve a usable
+ * credential for the account first, checked and recorded under the row's
+ * fallback refresh lock (so no refresh of the row runs in between), and the
+ * row takes the ChatGPT account the vault signs in as. Outside Claustrum mode
+ * the row is enabled at once, with its own locks.
  */
-export const hostCommandBodies: HostCommandBodies = {
-  'openai-killswitch': executeKillswitchCommand,
-  'openai-dump': executeDumpCommand,
-  'openai-logging': executeLoggingCommand,
-  'openai-cachekeep': executeCachekeepCommand,
+async function enableUnderCustody(
+  ctx: OpenCodeMenuContext,
+  id: string,
+  enable: (extraLocks?: readonly PoolLockSpec[]) => Promise<{ id: string }>,
+): Promise<{ id: string }> {
+  if ((await currentClaustrumMode(ctx)) !== 'claustrum') return enable()
+  const check = ctx.checkUsableCustodyBinding
+  const withLock =
+    ctx.withFallbackAccountLock ??
+    (async <T>(_id: string, action: () => Promise<T>) => action())
+  // The row's fallback refresh lock is held around the whole check, so the
+  // writes inside take only `main-refresh`.
+  const locks = poolSettingsLocks(storePaths(ctx))
+  return withLock(id, async () => {
+    const store = ctx.store()
+    const load = await store.read()
+    const row =
+      load.status === 'ready'
+        ? load.rows.find((candidate) => candidate.id === id)
+        : undefined
+    if (row?.type !== 'oauth') return enable(locks)
+    const binding = check
+      ? await check({
+          id,
+          type: 'oauth',
+          refresh: '',
+          enabled: row.enabled,
+          addedAt: row.addedAt ?? 0,
+          lastUsed: 0,
+          ...(row.identity !== undefined ? { accountId: row.identity } : {}),
+        } as OAuthAccount)
+      : { ready: false as const, reason: 'unbound-under-claustrum' }
+    if (!binding.ready)
+      throw new Error(
+        `${id} remains disabled: ${binding.reason}. Resolve the custody binding, then try again.`,
+      )
+    if (row.identity !== binding.accountId)
+      await store.recordIdentity(id, binding.accountId, { extraLocks: locks })
+    return enable(locks)
+  })
 }
 
-export function buildDialogPayload(
-  command: CommandModalName,
-  args: string,
-  ctx: CommandContext,
+/** The `/openai` menu over this process's context. */
+export function createOpenCodeMenu(ctx: OpenCodeMenuContext) {
+  const paths = storePaths(ctx)
+  const extraLocks = poolSettingsLocks(paths)
+  const reset =
+    ctx.resolveResetTarget &&
+    ctx.refreshResetTargetQuota &&
+    ctx.fetchImpl &&
+    ctx.now &&
+    ctx.randomUUID
+      ? resetCreditsSection({
+          configPath: paths.configPath,
+          statePath: paths.statePath,
+          quotaManager: ctx.quotaManager,
+          loadAccounts: ctx.loadAccounts,
+          mutateAccounts: settingsMutateAccounts(ctx.store(), extraLocks),
+          resolveResetTarget: ctx.resolveResetTarget,
+          refreshResetTargetQuota: ctx.refreshResetTargetQuota,
+          fetchImpl: ctx.fetchImpl,
+          now: ctx.now,
+          randomUUID: ctx.randomUUID,
+          accountKeys: () => resetAccountKeys(ctx),
+        })
+      : undefined
+  const beginLogin = ctx.beginAccountLogin
+  return createOpenAiMenu({
+    store: ctx.store(),
+    extraLocks,
+    rowLocks: (id) => legacyRefreshLocks(paths, id),
+    enableRow: (id, enable) => enableUnderCustody(ctx, id, enable),
+    migration: ctx.migration,
+    ...(beginLogin
+      ? {
+          login: {
+            begin: (options) =>
+              beginLogin({ ...options, version: ctx.packageVersion }),
+            refusal: async () =>
+              (await currentClaustrumMode(ctx)) === 'claustrum'
+                ? 'Accounts cannot be added while Claustrum mode is active. Return to local mode first (Claustrum section).'
+                : undefined,
+            mainIdentity: async () => {
+              const load = await ctx.store().read()
+              if (load.status !== 'ready') return undefined
+              return load.rows.find((row) => row.id === 'main')?.identity
+            },
+          },
+        }
+      : {}),
+    protect: (id, view) => poolRemovalRefusal(id, view),
+    ...(ctx.refreshAllQuota
+      ? {
+          quotaCheck: async () => {
+            const results = (await ctx.refreshAllQuota?.()) ?? []
+            const failures = results.filter((result) => !result.ok)
+            if (failures.length > 0)
+              throw new Error(
+                failures
+                  .map((failure) =>
+                    failure.permanent
+                      ? `${failure.account}: sign-in no longer accepted — remove and add this account again`
+                      : `${failure.account}: fetch failed — check again to retry`,
+                  )
+                  .join('\n'),
+              )
+          },
+        }
+      : {}),
+    cache: cacheSection(ctx),
+    diagnostics: diagnosticsSection(ctx),
+    extras: [
+      ...(reset ? [reset] : []),
+      sessionSection({
+        ...(ctx.getStickyRouting ? { getPin: ctx.getStickyRouting } : {}),
+        ...(ctx.clearStickyRouting ? { clearPin: ctx.clearStickyRouting } : {}),
+      }),
+      claustrumSection({
+        mode: () => currentClaustrumMode(ctx),
+        ...(ctx.enterClaustrumMode ? { enter: ctx.enterClaustrumMode } : {}),
+        ...(ctx.leaveClaustrumMode ? { leave: ctx.leaveClaustrumMode } : {}),
+      }),
+    ],
+    afterApply: async () => {
+      await ctx.afterWrite?.()
+      await ctx.refreshSidebar?.().catch(() => {})
+    },
+  })
+}
+
+/** Messages from work a menu action left running, delivered to the session's TUI. */
+function sessionNotify(sessionId: string | undefined) {
+  return (message: string, kind: 'info' | 'warning' | 'error' = 'info') => {
+    log.info('menu notification', { sessionId, kind })
+    pushNotification(
+      { command: OPENAI_COMMAND_NAME, notify: { message, kind } },
+      sessionId,
+    )
+  }
+}
+
+/** Opens the `/openai` menu for one session. */
+export function openOpenAiMenu(
+  ctx: OpenCodeMenuContext,
+  sessionId: string | undefined,
 ): Promise<OpenDialogPayload> {
-  return coreBuildDialogPayload(command, args, ctx, hostCommandBodies)
+  return createOpenCodeMenu(ctx).open({
+    ...(sessionId !== undefined ? { sessionId } : {}),
+    notify: sessionNotify(sessionId),
+  })
 }
 
-export function applyCommand(
+/** Applies one action the TUI's drawer sent back. */
+export function applyOpenAiMenu(
+  ctx: OpenCodeMenuContext,
   request: ApplyRequest,
-  ctx: CommandContext,
 ): Promise<ApplyResult> {
-  return coreApplyCommand(request, ctx, hostCommandBodies)
+  return createOpenCodeMenu(ctx).apply(request, {
+    ...(request.sessionId !== undefined
+      ? { sessionId: request.sessionId }
+      : {}),
+    notify: sessionNotify(request.sessionId),
+  })
+}
+
+/** The menu as plain text, for a session with no TUI attached. */
+export function menuText(menu: CommandMenuModel): string {
+  const lines = [`## ${menu.title}`]
+  for (const section of menu.sections) {
+    lines.push('', `### ${section.title}`)
+    for (const line of section.lines) lines.push(line)
+    for (const item of section.items)
+      lines.push(`- ${item.label}${item.detail ? `: ${item.detail}` : ''}`)
+  }
+  lines.push('', 'Open the OpenCode TUI to change these settings.')
+  return lines.join('\n')
 }

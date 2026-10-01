@@ -209,7 +209,15 @@ export function isValidApiBaseURL(value: string | undefined) {
 // Storage types
 // ---------------------------------------------------------------------------
 
-export type RoutingMode = 'main-first' | 'fallback-first' | 'sticky-balanced'
+/**
+ * `ordered` is the shared command menu's name for plain roster order; it is
+ * written only from that menu, which needs a migrated install.
+ */
+export type RoutingMode =
+  | 'ordered'
+  | 'main-first'
+  | 'fallback-first'
+  | 'sticky-balanced'
 
 export type KillswitchThresholds = Partial<
   Record<QuotaWindowName | '5h' | '1w', number>
@@ -219,6 +227,35 @@ export type KillswitchConfig = {
   enabled?: boolean
   main?: KillswitchThresholds
   accounts?: Record<string, KillswitchThresholds>
+  /**
+   * `KILLSWITCH_FLOORS_SCHEMA` once the block holds explicit per-account
+   * floors; see that constant for how the two formats differ.
+   */
+  schema?: string
+}
+
+/**
+ * Marks a killswitch block written in the shared command menu's vocabulary:
+ * `accounts.<id>.<window>` is that account's minimum percent left for the
+ * window, a window without a value has no floor, an account without an entry
+ * has none at all, and there is no `main` block (the main account is row
+ * `main`). An unmarked block keeps the older meaning: an account without an
+ * entry inherits `main`, a missing window falls back to the default, and
+ * `5h`/`1w` alias `primary`/`secondary`.
+ */
+export const KILLSWITCH_FLOORS_SCHEMA = 'floors-v1'
+
+/** The cache keep-warm settings; see `cacheKeepSettings`. */
+export type CacheKeepSettings = {
+  enabled?: boolean
+  subagents?: boolean
+  sustain?: boolean
+  /** Clock-hour window start (0-23, inclusive) — keeps cachekeep idle warming
+   *  inside `[startHour, endHour)` local hours. Omit to warm unconditionally. */
+  startHour?: number
+  /** Clock-hour window end (0-23, exclusive) — must differ from startHour
+   *  to be honored; an unset or equal hour falls back to "always warm". */
+  endHour?: number
 }
 
 export interface ResetInFlight {
@@ -286,17 +323,9 @@ export type AccountStorage = {
   logging?: {
     level?: string
   }
-  cachekeep?: {
-    enabled?: boolean
-    subagents?: boolean
-    sustain?: boolean
-    /** Clock-hour window start (0-23, inclusive) — keeps cachekeep idle warming
-     *  inside `[startHour, endHour)` local hours. Omit to warm unconditionally. */
-    startHour?: number
-    /** Clock-hour window end (0-23, exclusive) — must differ from startHour
-     *  to be honored; an unset or equal hour falls back to "always warm". */
-    endHour?: number
-  }
+  /** The older name of `cacheKeep`; read only until a settings write renames it. */
+  cachekeep?: CacheKeepSettings
+  cacheKeep?: CacheKeepSettings
   /** Stable ChatGPT account identifier of the main account (extracted from OAuth token). */
   mainAccountId?: string
   claustrum?: {
@@ -760,6 +789,7 @@ function normalizeStorage(value: unknown): AccountStorage | null {
     killswitch: isRecord(value.killswitch) ? value.killswitch : undefined,
     logging: isRecord(value.logging) ? value.logging : undefined,
     cachekeep: isRecord(value.cachekeep) ? value.cachekeep : undefined,
+    cacheKeep: isRecord(value.cacheKeep) ? value.cacheKeep : undefined,
     mainAccountId:
       typeof value.mainAccountId === 'string' ? value.mainAccountId : undefined,
     claustrum: normalizeClaustrum(value.claustrum),
@@ -1142,6 +1172,7 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
     killswitch: storage.killswitch,
     logging: storage.logging,
     cachekeep: storage.cachekeep,
+    cacheKeep: storage.cacheKeep,
     mainAccountId: storage.mainAccountId,
     ...(storage.claustrum !== undefined
       ? {
@@ -2019,11 +2050,41 @@ function normalizeKillswitchThresholds(
   }
 }
 
+/**
+ * The cache keep-warm settings under either name. A migrated install renames
+ * `cachekeep` to `cacheKeep` on its first settings write; until then (and on
+ * an install that has not migrated) the older key is the one that exists.
+ */
+export function cacheKeepSettings(
+  storage: Pick<AccountStorage, 'cachekeep' | 'cacheKeep'> | null | undefined,
+): CacheKeepSettings | undefined {
+  return storage?.cacheKeep ?? storage?.cachekeep
+}
+
+/**
+ * A floor read from a block in the shared vocabulary: a missing or
+ * malformed value is no floor, which no remaining percentage falls below.
+ */
+function floorOf(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+/**
+ * The minimum percent left an account must keep in each window. `accountId`
+ * undefined is the main account (row `main` on a migrated install).
+ */
 export function getKillswitchThresholdsForAccount(
   storage: AccountStorage | null,
   accountId?: string,
 ): { primary: number; secondary: number } {
   if (!storage?.killswitch) return DEFAULT_KILLSWITCH_THRESHOLDS
+  if (storage.killswitch.schema === KILLSWITCH_FLOORS_SCHEMA) {
+    const own = storage.killswitch.accounts?.[accountId ?? 'main']
+    return {
+      primary: floorOf(own?.primary),
+      secondary: floorOf(own?.secondary),
+    }
+  }
   if (accountId && storage.killswitch.accounts?.[accountId]) {
     return normalizeKillswitchThresholds(storage.killswitch.accounts[accountId])
   }

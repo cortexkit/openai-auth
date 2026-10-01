@@ -12,10 +12,12 @@ import {
   stampVaultProvenance,
   type VaultProvenance,
 } from '@cortexkit/openai-auth-core/internal'
+import { applyOpenAiMenu } from '../commands.ts'
 import { getAccountPaths } from '../core/account-paths.ts'
 import type { OpenAICacheKeepManager as CacheKeepManager } from '../core/cachekeep.ts'
 import { CUSTODY_INERT_REASONS } from '../core/custody-state.ts'
 import {
+  __menuContextForTest,
   __resetBootQuotaSeedForTest,
   type ClaustrumCacheTransportLike,
   CodexAuthPlugin,
@@ -76,11 +78,13 @@ async function withCustodyLoader(
       url: string,
       configPath: string,
     ) => Promise<void> | void
+    respond: (authorization: string, url: string) => number
+    /** Seeds a migrated install (the account pool), which `/openai` opens on. */
+    migrated?: boolean
     withFallbackAccountLock?: <T>(
       accountId: string,
       action: () => Promise<T>,
     ) => Promise<T>
-    respond: (authorization: string, url: string) => number
   },
   run: (input: {
     fetchOverride: typeof globalThis.fetch
@@ -131,6 +135,12 @@ async function withCustodyLoader(
         mode: options.claustrumEnabled === false ? 'local' : 'claustrum',
       }),
       routing: options.routing,
+      ...(options.migrated
+        ? {
+            commonAuthPool: { schemaVersion: 1, rows: {} },
+            openaiAuthPool: { migratedAt: Date.now() - 60_000 },
+          }
+        : {}),
     }),
   )
   writeFileSync(manifestPath, JSON.stringify(manifest.value))
@@ -284,19 +294,26 @@ describe('custody request resolution', () => {
     await withCustodyLoader(
       {
         accounts: [account],
+        migrated: true,
         credential: {
           material: makeCustodyRequestJwt('served-account'),
           recordVersion: 1,
         },
         respond: () => 200,
       },
-      async ({ commandHook, configPath }) => {
-        await commandHook({
-          command: 'openai-account',
-          arguments: `enable ${account.id}`,
-          sessionID: 'binding-mismatch',
-        }).catch(() => {})
+      async ({ configPath }) => {
+        const ctx = __menuContextForTest()
+        if (!ctx) throw new Error('no /openai context loaded')
+        const result = await applyOpenAiMenu(ctx, {
+          command: 'openai',
+          sectionId: 'accounts',
+          itemId: account.id,
+          actionId: 'enable',
+          sessionId: 'binding-mismatch',
+        })
 
+        expect(result.ok).toBe(false)
+        expect(result.text).toContain('identity-mismatch')
         expect(CUSTODY_INERT_REASONS).toContain('identity-mismatch')
         expect(
           (await loadAccounts(getAccountPaths(configPath)))?.accounts[0],
@@ -315,6 +332,7 @@ describe('custody request resolution', () => {
     await withCustodyLoader(
       {
         accounts: [account],
+        migrated: true,
         credential: {
           material: makeCustodyRequestJwt('served-account'),
           recordVersion: 1,
@@ -333,13 +351,18 @@ describe('custody request resolution', () => {
           }
         },
       },
-      async ({ commandHook, configPath }) => {
-        await commandHook({
-          command: 'openai-account',
-          arguments: `enable ${account.id}`,
-          sessionID: 'binding-pending',
-        }).catch(() => {})
+      async ({ configPath }) => {
+        const ctx = __menuContextForTest()
+        if (!ctx) throw new Error('no /openai context loaded')
+        const result = await applyOpenAiMenu(ctx, {
+          command: 'openai',
+          sectionId: 'accounts',
+          itemId: account.id,
+          actionId: 'enable',
+          sessionId: 'binding-pending',
+        })
 
+        expect(result.ok).toBe(true)
         expect(lockHeld).toBe(false)
         expect(boundWhileLocked).toBe(true)
         expect(

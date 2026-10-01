@@ -11,7 +11,7 @@ import {
 } from '@cortexkit/common-auth/rpc'
 import { createLogger } from '../logger'
 import { isOpenaiRpcStateDir } from './port-file'
-import type { ApplyRequest, ApplyResult, RpcNotification } from './protocol'
+import type { ApplyResult, RpcNotification } from './protocol'
 
 export type { RpcServerHandle } from '@cortexkit/common-auth/rpc'
 
@@ -30,7 +30,8 @@ export interface RpcServerOptions {
   secureDir?: boolean
   sweepRoot?: string
   drain: (lastReceivedId: number, sessionId?: string) => RpcNotification[]
-  apply: (request: ApplyRequest) => Promise<ApplyResult>
+  /** Gets the parsed request body as it arrived; the handler checks its shape. */
+  apply: (request: unknown) => Promise<ApplyResult>
   // Bounds handler execution via the socket inactivity timer.
   timeoutMs?: number
   // Bounds request delivery only (requestTimeout/headersTimeout).
@@ -44,8 +45,16 @@ export function startRpcServer(
     ...options,
     isManagedDir: isOpenaiRpcStateDir,
     log,
-    // The shared server hands over the parsed request body as it arrived, the
-    // same body this plugin's handler has always received.
-    apply: (request) => options.apply(request as ApplyRequest),
+    // The shared server hands over the parsed request body as it arrived and
+    // returns the handler's result as it is; its own types name the older
+    // dialog shape.
+    drain: (lastReceivedId, sessionId) =>
+      options.drain(lastReceivedId, sessionId) as unknown as ReturnType<
+        Parameters<typeof startCommonRpcServer>[0]['drain']
+      >,
+    apply: async (request) =>
+      (await options.apply(request)) as unknown as Awaited<
+        ReturnType<Parameters<typeof startCommonRpcServer>[0]['apply']>
+      >,
   })
 }

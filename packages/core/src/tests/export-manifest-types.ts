@@ -10,13 +10,23 @@
  */
 
 import type {
-  CommandContext,
-  HostCommandBodies,
-  HostCommandBody,
+  AccountRules,
+  ClaustrumSectionDeps,
+  MenuLoginDeps,
+  MenuLoginFlow,
+  MenuMigrationState,
+  MigrationBlocker,
+  OpenAiMenuOptions,
+  ResetCreditsDeps,
+  ResetStepResult,
   ApplyRequest as RootApplyRequest,
   ApplyResult as RootApplyResult,
-  CommandModalName as RootCommandModalName,
+  CacheKeepManager as RootCacheKeepManager,
+  NotifyPayload as RootNotifyPayload,
   OpenDialogPayload as RootOpenDialogPayload,
+  ResetTargetIdentity as RootResetTargetIdentity,
+  RpcNotification as RootRpcNotification,
+  SessionSectionDeps,
 } from '../index.ts'
 import type {
   AccountBase,
@@ -36,7 +46,7 @@ import type {
   BeginAccountLoginOptions,
   BeginAccountLoginResult,
   CacheKeepManager,
-  CommandModalName,
+  CacheKeepSettings,
   DeviceAuthInit,
   FallbackAccount,
   IdTokenClaims,
@@ -45,6 +55,7 @@ import type {
   KillswitchConfig,
   KillswitchThresholds,
   Level,
+  NotifyPayload,
   OAuthAccount,
   OAuthQuotaSnapshot,
   OpenDialogPayload,
@@ -88,13 +99,23 @@ import type {
 } from '../internal.ts'
 
 type RootSurface = {
+  accountRules: AccountRules
   applyRequest: RootApplyRequest
   applyResult: RootApplyResult
-  commandContext: CommandContext
-  commandModalName: RootCommandModalName
-  hostCommandBodies: HostCommandBodies
-  hostCommandBody: HostCommandBody
+  cacheKeepManager: RootCacheKeepManager
+  claustrumSectionDeps: ClaustrumSectionDeps
+  menuLoginDeps: MenuLoginDeps
+  menuLoginFlow: MenuLoginFlow
+  menuMigrationState: MenuMigrationState
+  migrationBlocker: MigrationBlocker
+  notifyPayload: RootNotifyPayload
+  openAiMenuOptions: OpenAiMenuOptions
   openDialogPayload: RootOpenDialogPayload
+  resetCreditsDeps: ResetCreditsDeps
+  resetStepResult: ResetStepResult
+  resetTargetIdentity: RootResetTargetIdentity
+  rpcNotification: RootRpcNotification
+  sessionSectionDeps: SessionSectionDeps
 }
 
 type InternalSurface = {
@@ -115,7 +136,8 @@ type InternalSurface = {
   beginAccountLoginOptions: BeginAccountLoginOptions
   beginAccountLoginResult: BeginAccountLoginResult
   cacheKeepManager: CacheKeepManager
-  commandModalName: CommandModalName
+  cacheKeepSettings: CacheKeepSettings
+  notifyPayload: NotifyPayload
   deviceAuthInit: DeviceAuthInit
   fallbackAccount: FallbackAccount
   idTokenClaims: IdTokenClaims

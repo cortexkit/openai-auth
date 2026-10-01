@@ -14,7 +14,11 @@ import {
   pushNotification as pushCommonNotification,
   resetNotificationsForTest as resetCommonNotificationsForTest,
 } from '@cortexkit/common-auth/rpc'
-import type { OpenDialogPayload, RpcNotification } from './protocol'
+import type {
+  NotifyPayload,
+  OpenDialogPayload,
+  RpcNotification,
+} from './protocol'
 import { RPC_DIRECTORY_PREFIX } from './rpc-dir'
 
 const PROCESS_QUEUE_SCOPE: NotificationScope = {
@@ -24,23 +28,29 @@ const PROCESS_QUEUE_SCOPE: NotificationScope = {
 }
 
 export function pushNotification(
-  payload: OpenDialogPayload,
+  payload: OpenDialogPayload | NotifyPayload,
   sessionId?: string,
 ): void {
-  pushCommonNotification(PROCESS_QUEUE_SCOPE, payload, sessionId)
+  // The shared queue is typed with the older dialog shape but stores and
+  // serves the payload as it is given.
+  pushCommonNotification(
+    PROCESS_QUEUE_SCOPE,
+    payload as unknown as Parameters<typeof pushCommonNotification>[1],
+    sessionId,
+  )
 }
 
 export function drainNotifications(
   lastReceivedId = 0,
   sessionId?: string,
 ): RpcNotification[] {
-  // Only payloads built by this plugin are ever pushed, so each carries one of
-  // its command names.
+  // Only payloads built by this plugin are ever pushed: the `/openai` menu
+  // and its messages.
   return drainCommonNotifications(
     PROCESS_QUEUE_SCOPE,
     lastReceivedId,
     sessionId,
-  ) as RpcNotification[]
+  ) as unknown as RpcNotification[]
 }
 
 export function isTuiConnected(sessionId: string): boolean {

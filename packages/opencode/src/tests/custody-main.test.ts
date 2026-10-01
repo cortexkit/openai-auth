@@ -20,7 +20,11 @@ import {
   confirmMainAuthSlot,
   reconcileMainSlotBeforeHooks,
 } from '../core/custody-host-slot.ts'
-import { type ClaustrumCacheTransportLike, CodexAuthPlugin } from '../index.ts'
+import {
+  __menuContextForTest,
+  type ClaustrumCacheTransportLike,
+  CodexAuthPlugin,
+} from '../index.ts'
 import { getSidebarState } from '../sidebar-state.ts'
 import {
   CUSTODY_FIXTURE_NOW,
@@ -418,15 +422,10 @@ describe('main host slot', () => {
           close: () => {},
         },
       },
-      async ({ loader, executeCommand, configPath, authSetCalls }) => {
+      async ({ loader, configPath, authSetCalls }) => {
         await loader(async () => auth, {})
-        await expect(
-          executeCommand({
-            command: 'openai-account',
-            arguments: 'claustrum',
-            sessionID: 'session-1',
-          }),
-        ).rejects.toThrow('__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__')
+        // The /openai Claustrum section's enter action.
+        await __menuContextForTest()?.enterClaustrumMode?.()
         expect(
           (await loadAccounts(getAccountPaths(configPath)))?.claustrum?.mode,
         ).toBe('claustrum')
@@ -468,20 +467,15 @@ describe('main host slot', () => {
             close: () => {},
           },
         },
-        async ({ loader, executeCommand, configPath, authSetCalls }) => {
+        async ({ loader, configPath, authSetCalls }) => {
           const dataHome = join(dirname(configPath), 'data')
           const authPath = join(dataHome, 'opencode', 'auth.json')
           mkdirSync(dirname(authPath), { recursive: true })
           writeFileSync(authPath, JSON.stringify({ openai: auth }))
           process.env.XDG_DATA_HOME = dataHome
           await loader(async () => auth, {})
-          await expect(
-            executeCommand({
-              command: 'openai-account',
-              arguments: 'claustrum',
-              sessionID: 'session-1',
-            }),
-          ).rejects.toThrow('__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__')
+          // The /openai Claustrum section's enter action.
+          await __menuContextForTest()?.enterClaustrumMode?.()
           expect(authSetCalls()).toBe(1)
         },
       )
@@ -524,20 +518,15 @@ describe('main host slot', () => {
             close: () => {},
           },
         },
-        async ({ loader, executeCommand, configPath, authSetCalls }) => {
+        async ({ loader, configPath, authSetCalls }) => {
           const dataHome = join(dirname(configPath), 'data')
           const authPath = join(dataHome, 'opencode', 'auth.json')
           mkdirSync(dirname(authPath), { recursive: true })
           writeFileSync(authPath, '{not json')
           process.env.XDG_DATA_HOME = dataHome
           await loader(async () => auth, {})
-          await expect(
-            executeCommand({
-              command: 'openai-account',
-              arguments: 'claustrum',
-              sessionID: 'session-1',
-            }),
-          ).rejects.toThrow('__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__')
+          // The /openai Claustrum section's enter action.
+          await __menuContextForTest()?.enterClaustrumMode?.()
           expect(authSetCalls()).toBe(0)
         },
       )

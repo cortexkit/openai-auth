@@ -1,16 +1,22 @@
+// Pi's one `/openai` command: the same menu OpenCode opens (`createOpenAiMenu`
+// in the core), drawn with Pi's extension UI by the shared Pi renderer.
+//
+// The menu works on Pi's account pool. Pi's own `openai-codex` login is not a
+// row of it: it is routed as `main` and replaced through Pi's `/login`, so the
+// menu shows its quota in a section of its own and refuses to add that
+// account again as a row.
 import {
-  buildDialogPayload,
-  type CommandContext,
-  type CommandModalName,
-  OPENAI_ACCOUNT_COMMAND_NAME,
-  OPENAI_QUOTA_COMMAND_NAME,
-  OPENAI_ROUTING_COMMAND_NAME,
+  type CommandMenu,
+  runPiCommandMenu,
+} from '@cortexkit/common-auth/commands'
+import {
+  createOpenAiMenu,
+  OPENAI_COMMAND_NAME,
+  sessionSection,
 } from '@cortexkit/openai-auth-core'
 import {
-  type AccountPaths,
-  isOAuthAccount,
-  loadAccounts,
-  QuotaManager,
+  beginAccountLogin,
+  type OAuthQuotaSnapshot,
 } from '@cortexkit/openai-auth-core/internal'
 import type {
   ExtensionAPI,
@@ -18,140 +24,117 @@ import type {
 } from '@earendil-works/pi-coding-agent'
 
 import packageJson from '../package.json' with { type: 'json' }
-import { getPiAccountPaths } from './paths.ts'
 import { clearPiStickyRouting, getPiStickyRouting } from './routing.ts'
 import type { PiPoolCommands } from './runtime.ts'
 
 export type PiCommandDependencies = {
-  accountPaths?: () => AccountPaths
-  beginAccountLogin?: CommandContext['beginAccountLogin']
-  fetchImpl?: typeof fetch
-  loadAccounts?: typeof loadAccounts
-  now?: () => number
+  beginAccountLogin?: typeof beginAccountLogin
   packageVersion?: string
-  randomUUID?: () => string
-  /**
-   * The account pool the request path routes across. With it, the commands
-   * list the pool's rows (Pi's login as `main`) and show their quota once
-   * the pool is in use; without it, they work on the legacy account list.
-   */
+  /** The account pool the request path routes across; the menu works on it. */
   pool?: PiPoolCommands
 }
 
-const clientStub: CommandContext['client'] = {
-  auth: { set: async () => {} },
+function windowLine(
+  name: string,
+  window: { usedPercent: number; remainingPercent: number } | undefined,
+): string[] {
+  return window
+    ? [
+        `${name}: ${Math.round(window.usedPercent)}% used (${Math.round(window.remainingPercent)}% left)`,
+      ]
+    : []
 }
 
-async function createCommandContext(
-  ctx: ExtensionCommandContext,
-  dependencies: PiCommandDependencies,
-): Promise<CommandContext> {
-  const paths = (dependencies.accountPaths ?? getPiAccountPaths)()
-  const load = dependencies.loadAccounts ?? loadAccounts
-  const storage = await load(paths)
-  const quotaManager = new QuotaManager({
-    storage: null,
-    configPath: paths.configPath,
-    fetchImpl: dependencies.fetchImpl,
-    now: dependencies.now,
-  })
-  const pool = dependencies.pool
-  if (pool) {
-    // Pi's login is the `main` row: take the token Pi holds for it now, as a
-    // request would, so the commands list it and show its quota.
-    try {
-      pool.observeLogin(
-        await ctx.modelRegistry?.getApiKeyForProvider('openai-codex'),
-      )
-    } catch {
-      // No login: the commands list the pool's rows alone.
-    }
-  }
-  const poolActive = pool ? await pool.poolActive() : false
-  if (pool && poolActive) {
-    pool.seedQuota(quotaManager)
-  } else {
-    quotaManager.seedFallbacksFromAccounts(
-      (storage?.accounts ?? []).filter(isOAuthAccount),
-    )
-  }
-
+/** Pi's own login: its last quota reading. */
+function piLoginSection(quota: () => OAuthQuotaSnapshot | undefined) {
   return {
-    accountStoragePath: paths.configPath,
-    accountStatePath: paths.statePath,
-    packageVersion: dependencies.packageVersion ?? packageJson.version,
-    quotaManager,
-    loadAccounts: load,
-    client: clientStub,
-    sessionId: ctx.sessionManager.getSessionId(),
-    notify: (payload) => ctx.ui.notify(payload.text),
-    clearStickyRouting: async (sessionId) => clearPiStickyRouting(sessionId),
-    getStickyRouting: async (sessionId) => getPiStickyRouting(sessionId),
-    fetchImpl: dependencies.fetchImpl,
-    now: dependencies.now,
-    randomUUID: dependencies.randomUUID,
-    beginAccountLogin: dependencies.beginAccountLogin,
-    ...(pool
-      ? {
-          accountPool: pool.accountPool,
-          ...(poolActive
-            ? {
-                // `/openai-quota` polls every account, then reads the quota
-                // manager, so the manager is filled again after the polls.
-                refreshAllQuota: async () => {
-                  const results = await pool.refreshAllQuota()
-                  pool.seedQuota(quotaManager)
-                  return results
-                },
-              }
-            : {}),
-        }
-      : {}),
+    id: 'pi-login',
+    title: 'Pi login',
+    build: () => {
+      const snapshot = quota()
+      return {
+        lines: [
+          "The account Pi signs in with is routed as `main`. Pi's `/login` replaces it.",
+          ...(snapshot
+            ? [
+                ...windowLine('primary', snapshot.primary),
+                ...windowLine('secondary', snapshot.secondary),
+              ]
+            : ['No quota reading yet.']),
+        ],
+      }
+    },
   }
 }
 
-export async function buildPiDialogPayload(
-  command: CommandModalName,
-  args: string,
-  ctx: ExtensionCommandContext,
+/** The `/openai` menu over Pi's pool. */
+export function createPiMenu(
+  pool: PiPoolCommands,
   dependencies: PiCommandDependencies = {},
-) {
-  return buildDialogPayload(
-    command,
-    args,
-    await createCommandContext(ctx, dependencies),
-  )
+): CommandMenu {
+  const begin = dependencies.beginAccountLogin ?? beginAccountLogin
+  const version = dependencies.packageVersion ?? packageJson.version
+  return createOpenAiMenu({
+    store: pool.store(),
+    login: {
+      begin: (options) => begin({ ...options, version }),
+      mainIdentity: async () => pool.mainIdentity(),
+    },
+    quotaCheck: async () => {
+      const failures = (await pool.refreshAllQuota()).filter(
+        (result) => !result.ok,
+      )
+      if (failures.length > 0)
+        throw new Error(
+          failures
+            .map(
+              (failure) =>
+                `${failure.account}: ${failure.error ?? 'quota check failed'}`,
+            )
+            .join('\n'),
+        )
+    },
+    extras: [
+      piLoginSection(() => pool.mainQuota()),
+      sessionSection({
+        getPin: async (sessionId) => getPiStickyRouting(sessionId),
+        clearPin: async (sessionId) => clearPiStickyRouting(sessionId),
+      }),
+    ],
+    afterApply: () => pool.reload(),
+  })
 }
 
-async function runCommand(
-  command: CommandModalName,
-  args: string,
+async function runOpenAiCommand(
   ctx: ExtensionCommandContext,
   dependencies: PiCommandDependencies,
 ): Promise<void> {
-  const payload = await buildPiDialogPayload(command, args, ctx, dependencies)
-  ctx.ui.notify(payload.text)
+  const pool = dependencies.pool
+  if (!pool) {
+    ctx.ui.notify('The OpenAI account pool is not available.', 'error')
+    return
+  }
+  // Take the token Pi holds for its login now, as a request would, so the
+  // menu knows which account Pi signs in with.
+  try {
+    pool.observeLogin(
+      await ctx.modelRegistry?.getApiKeyForProvider('openai-codex'),
+    )
+  } catch {
+    // No login: the menu shows the pool's rows alone.
+  }
+  await runPiCommandMenu(createPiMenu(pool, dependencies), ctx.ui, {
+    sessionId: ctx.sessionManager.getSessionId(),
+  })
 }
 
 export function registerCommands(
   pi: ExtensionAPI,
   dependencies: PiCommandDependencies = {},
 ): void {
-  pi.registerCommand(OPENAI_ACCOUNT_COMMAND_NAME, {
-    description: 'List, add, remove, or reorder OpenAI fallback accounts',
-    handler: (args, ctx) =>
-      runCommand(OPENAI_ACCOUNT_COMMAND_NAME, args, ctx, dependencies),
-  })
-
-  pi.registerCommand(OPENAI_QUOTA_COMMAND_NAME, {
-    description: 'Show persisted OpenAI quota for fallback accounts',
-    handler: (args, ctx) =>
-      runCommand(OPENAI_QUOTA_COMMAND_NAME, args, ctx, dependencies),
-  })
-
-  pi.registerCommand(OPENAI_ROUTING_COMMAND_NAME, {
-    description: 'Show or change OpenAI account routing mode',
-    handler: (args, ctx) =>
-      runCommand(OPENAI_ROUTING_COMMAND_NAME, args, ctx, dependencies),
+  pi.registerCommand(OPENAI_COMMAND_NAME, {
+    description:
+      'OpenAI accounts: add and manage accounts, quota, routing and limits',
+    handler: (_args, ctx) => runOpenAiCommand(ctx, dependencies),
   })
 }

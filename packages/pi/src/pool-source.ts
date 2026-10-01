@@ -54,9 +54,8 @@ import {
   type OAuthQuotaSnapshot,
   refreshBeforeExpiryMs,
 } from '@cortexkit/openai-auth-core/internal'
-
+import { observationFromSnapshot } from '@cortexkit/openai-auth-core/pool-quota'
 import { identityOfToken } from './main-account.ts'
-import { observationFromSnapshot } from './pool-quota.ts'
 
 /**
  * Longest a request waits for a lock-free re-read of the pool files before
@@ -125,7 +124,7 @@ type PendingObservation = {
 
 type Snapshot = PiPoolView & { key: string | undefined; readAt: number }
 
-/** How one row's quota poll ended, for `/openai-quota`. */
+/** How one row's quota poll ended, for the `/openai` quota check. */
 export interface PoolPollResult {
   id: string
   ok: boolean
@@ -242,7 +241,7 @@ export class PiPoolSource {
   private readonly writes = new Map<string, Promise<void>>()
   private readonly lastPull = new Map<string, number>()
   private readonly polled = new Set<string>()
-  /** The latest full poll snapshot per row id, for `/openai-quota`. */
+  /** The latest full poll snapshot per row id, for the `/openai` quota check. */
   private readonly polledSnapshots = new Map<string, OAuthQuotaSnapshot>()
   private readonly pollOutcomes = new Map<string, PoolPollResult>()
   private disposed = false

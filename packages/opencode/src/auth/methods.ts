@@ -1,4 +1,24 @@
-import { execFileSync as defaultExecFileSync } from 'node:child_process'
+import {
+  type AccountMenuOptions,
+  type AuthorizeInputs,
+  type DoctorCheck,
+  doctorAction,
+  type LoginAccount,
+  type MenuLogin,
+  type MenuOutcome,
+  type MenuTerminal,
+  menuAuthorize,
+  menuCompletedResult,
+  openBrowserForMenu,
+  poolHasCredential,
+  runAccountMenu,
+  runMenu,
+} from '@cortexkit/common-auth/auth-menu'
+import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
+import {
+  type MigrationBlocker,
+  withAccountRules,
+} from '@cortexkit/openai-auth-core'
 import {
   base64UrlEncode,
   beginAccountLogin,
@@ -9,17 +29,10 @@ import {
   extractAccountId,
   flowCleanup,
   generatePKCE,
-  isOAuthAccount,
-  isPoolMainPlaceholder,
   loadAccounts,
   mutateAccounts,
-  type OAuthAccount,
-  QuotaManager,
-  type RefreshAllQuotaDeps,
-  type RefreshAllQuotaResult,
-  refreshAllQuota,
+  POOL_MAIN_ROW_ID,
   startOAuthServer,
-  upsertAccount,
   waitForOAuthCallback,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
@@ -31,53 +44,38 @@ import type {
 import { getConfigPath } from '../config'
 import { type AccountPaths, getAccountPaths } from '../core/account-paths'
 import {
-  addPoolAccount,
-  formatPoolDeleteAll,
   migratedPoolRows,
   openAccountPool,
-  pollPoolRowsOnce,
-  removeAllPoolAccountsExceptMain,
+  poolRemovalRefusal,
+  poolSettingsLocks,
 } from '../core/pool-accounts'
+import { legacyRefreshLocks } from '../core/pool-migration'
 import { observationFromSnapshot } from '../core/pool-quota'
+import { migrationFenceOpen } from '../core/version-fence'
 import { PackageVersion } from '../version'
-import {
-  type AuthDetails,
-  createAuthDoctorReport,
-  findStoredMainCredential,
-  formatAuthDoctorReport,
-  readStoreIds,
-} from './doctor'
-import { type AuthMenuAction, showAuthMenu } from './ui/auth-menu'
-import { confirm } from './ui/confirm'
+import { type AuthDetails, authDoctorChecks, readStoreIds } from './doctor'
 
 type AuthMethod = AuthHook['methods'][number]
 type BeginLogin = typeof beginAccountLogin
-type BrowserExec = (
-  file: string,
-  args: string[],
-  options: { stdio: 'ignore'; timeout: number },
-) => unknown
+
+export { menuCompletedResult, openBrowserForMenu }
 
 export interface AuthMethodDependencies {
   authorizeBrowser(): Promise<AuthOAuthResult>
   authorizeHeadless(): Promise<AuthOAuthResult>
   beginAccountLogin: BeginLogin
   loadAccounts: typeof loadAccounts
+  /** The legacy writer the doctor's repairs use on an install that has not migrated. */
   mutateAccounts: typeof mutateAccounts
-  refreshAllQuota: typeof refreshAllQuota
-  showAuthMenu: typeof showAuthMenu
-  confirm: typeof confirm
   readStoreIds: typeof readStoreIds
   openBrowser(url: string): boolean | undefined | Promise<boolean | undefined>
   now(): number
-  custodyQuotaDeps: Pick<
-    RefreshAllQuotaDeps,
-    | 'isFallbackRefreshInert'
-    | 'resolveFallbackAccess'
-    | 'reportCustodyAuthFailure'
-  >
   /** Opens the account pool's store (a migrated install's accounts). */
   openAccountPool: typeof openAccountPool
+  /** The processes holding the migration back (the version fence's blockers). */
+  migrationBlockers(): Promise<readonly MigrationBlocker[]>
+  /** The terminal the menu draws on; the process's own by default. */
+  terminal?: MenuTerminal
 }
 
 export interface CreateAuthMethodsOptions {
@@ -90,43 +88,14 @@ export interface CreateAuthMethodsOptions {
   dependencies?: Partial<AuthMethodDependencies>
   /**
    * Called, and awaited, after these methods write a credential into
-   * OpenCode's `openai` slot themselves. The plugin adopts it into the account
-   * pool there on a migrated install; a failure never fails the login.
+   * OpenCode's `openai` slot themselves (the doctor's restore repair). The
+   * plugin adopts it into the account pool there on a migrated install; a
+   * failure never fails the repair.
    */
   onMainSlotWritten?: () => Promise<void>
 }
 
-export function openBrowserForMenu(
-  url: string,
-  platform: NodeJS.Platform = process.platform,
-  execFileSync: BrowserExec = defaultExecFileSync,
-): boolean {
-  try {
-    if (platform === 'win32') {
-      execFileSync('cmd', ['/c', 'start', '', url], {
-        stdio: 'ignore',
-        timeout: 3000,
-      })
-    } else {
-      execFileSync(platform === 'darwin' ? 'open' : 'xdg-open', [url], {
-        stdio: 'ignore',
-        timeout: 3000,
-      })
-    }
-    return true
-  } catch {
-    return false
-  }
-}
-
-export function completedMenuResult(): AuthOAuthResult {
-  return {
-    url: '',
-    instructions: '',
-    method: 'auto',
-    callback: async () => ({ type: 'failed' }),
-  }
-}
+const MENU_TITLE = 'OpenAI accounts'
 
 async function authorizeBrowser(): Promise<AuthOAuthResult> {
   const { redirectUri } = await startOAuthServer()
@@ -182,13 +151,11 @@ async function authorizeHeadless(version: string): Promise<AuthOAuthResult> {
   }
 }
 
-function printLogin(flow: { url: string; instructions: string }) {
-  console.log('\nOpen this URL in your browser and complete sign-in:\n')
-  console.log(`${flow.url}\n`)
-  if (flow.instructions) console.log(`${flow.instructions}\n`)
-}
-
-/** Build the three OpenCode auth entries and keep CLI-only management inside the browser entry. */
+/**
+ * Build the three OpenCode auth entries. The browser entry opens the shared
+ * account menu when `opencode auth login` runs on a machine that already
+ * has a credential; the TUI and a first CLI login sign in as before.
+ */
 export function createAuthMethods({
   client,
   getAuth,
@@ -206,38 +173,50 @@ export function createAuthMethods({
     beginAccountLogin: dependencies?.beginAccountLogin ?? beginAccountLogin,
     loadAccounts: dependencies?.loadAccounts ?? loadAccounts,
     mutateAccounts: dependencies?.mutateAccounts ?? mutateAccounts,
-    refreshAllQuota: dependencies?.refreshAllQuota ?? refreshAllQuota,
-    showAuthMenu: dependencies?.showAuthMenu ?? showAuthMenu,
-    confirm: dependencies?.confirm ?? confirm,
     readStoreIds: dependencies?.readStoreIds ?? readStoreIds,
     openBrowser: dependencies?.openBrowser ?? openBrowserForMenu,
     now: dependencies?.now ?? Date.now,
-    custodyQuotaDeps: dependencies?.custodyQuotaDeps ?? {},
     openAccountPool: dependencies?.openAccountPool ?? openAccountPool,
+    migrationBlockers:
+      dependencies?.migrationBlockers ??
+      (async () => {
+        const fence = await migrationFenceOpen({
+          currentVersion: packageVersion,
+        })
+        return fence.open
+          ? []
+          : fence.blockers.map((blocker) => ({
+              pid: blocker.pid,
+              version: blocker.version,
+            }))
+      }),
+    ...(dependencies?.terminal ? { terminal: dependencies.terminal } : {}),
   }
-
-  /** Whether the install is migrated: its accounts are account-pool rows. */
-  const poolInstall = async (paths: AccountPaths): Promise<boolean> =>
-    (await migratedPoolRows(paths, deps.openAccountPool(paths))) !== undefined
 
   const readAuth = async (): Promise<AuthDetails> =>
     (await getAuth?.().catch(() => undefined)) ?? { type: 'missing' }
 
   /**
-   * Whether this machine is past its first sign-in.
+   * Whether this machine is past its first sign-in: OpenCode's slot holds a
+   * credential, or the account store does.
    *
    * A signed-in account is the thing that makes the menu meaningful, and it is
-   * usually the only account there is: fallbacks are stored separately and a
-   * normal store starts with none. Asking about the fallback roster instead
-   * would hide the menu from exactly the person who came to add their first
-   * one — and since the standalone command was removed, a headless machine
-   * would have no way to add it at all.
+   * usually the only account there is and need not be a roster row. Asking
+   * whether the roster is non-empty instead would hide the menu from exactly
+   * the person who came to add their first extra account, and a headless
+   * machine would have no way to add it at all.
    */
-  const hasSomethingToManage = async (): Promise<boolean> => {
+  const hasCredential = async (): Promise<boolean> => {
     if ((await readAuth()).type !== 'missing') return true
-    const storage = await deps.loadAccounts(getPaths())
+    const paths = getPaths()
+    const store = deps.openAccountPool(paths)
+    if ((await store.read()).status === 'ready') return poolHasCredential(store)
+    // An install that has not migrated keeps its credentials in the legacy
+    // account files, every stored account with its own.
+    const storage = await deps.loadAccounts(paths)
     return (storage?.accounts.length ?? 0) > 0
   }
+
   const setMainAuth = async (credential: {
     refresh: string
     access?: string
@@ -250,330 +229,151 @@ export function createAuthMethods({
     await onMainSlotWritten?.().catch(() => {})
   }
 
-  const runOwnedLogin = async () => {
-    const abort = new AbortController()
-    let flow = await deps.beginAccountLogin({
-      version: packageVersion,
-      signal: abort.signal,
-    })
-    // The rejection handler is attached before the opener runs because an
-    // immediate opener failure aborts this browser flow in the same turn.
-    void flow.completion.catch(() => {})
-    printLogin(flow)
-
-    let opened = false
-    try {
-      opened = (await deps.openBrowser(flow.url)) !== false
-    } catch {
-      opened = false
-    }
-    if (!opened) {
-      abort.abort()
-      console.log(
-        'Could not open a browser. Switching to device authorization.\n',
-      )
-      flow = await deps.beginAccountLogin({
+  /** The OAuth login the menu's add and re-authenticate actions run. */
+  const menuLogin = (store: PoolStore): MenuLogin => ({
+    begin: async ({ headless, signal }) => {
+      const flow = await deps.beginAccountLogin({
         version: packageVersion,
-        headless: true,
+        headless,
+        ...(signal ? { signal } : {}),
       })
-      printLogin(flow)
-    }
-    return flow.completion
-  }
-
-  const addAccount = async () => {
-    const storage = await deps.loadAccounts(getPaths())
-    if (claustrumMode(storage) === 'claustrum') {
-      console.log(
-        'That account cannot be added while Claustrum mode is active. Run `/openai-account local` first.',
-      )
-      return
-    }
-    const account = await runOwnedLogin()
-    const paths = getPaths()
-    if (await poolInstall(paths)) {
-      // A migrated install keeps every account as a pool row: the login
-      // becomes a row, or replaces the credential of the row holding it.
-      const added = await addPoolAccount(deps.openAccountPool(paths), account)
-      if (added.status === 'main-identity') {
-        console.log('That account is already the OpenCode main credential.')
-      } else if (added.status === 'replaced') {
-        console.log(`Updated the sign-in of account ${added.id}.`)
-      } else if (added.status === 'added-disabled') {
-        console.log(
-          `Added account ${added.id}, disabled: another enabled account is the same ChatGPT account.`,
-        )
-      } else {
-        console.log(`Added account ${added.id}.`)
-      }
-      return
-    }
-    let selfFallback = false
-    await deps.mutateAccounts((current) => {
-      if (
-        account.accountId &&
-        current.mainAccountId &&
-        account.accountId === current.mainAccountId
-      ) {
-        selfFallback = true
-        return current
-      }
-      upsertAccount(current.accounts, account as OAuthAccount)
-      return current
-    }, getPaths())
-    if (selfFallback) {
-      console.log('That account is already the OpenCode main credential.')
-      return
-    }
-    console.log(`Added fallback account ${account.id}.`)
-  }
-
-  const authCurrent = async () => {
-    const account = await runOwnedLogin()
-    await setMainAuth({
-      refresh: account.refresh,
-      access: account.access ?? '',
-      expires: account.expires ?? 0,
-    })
-    console.log('Updated the OpenCode main credential.')
-  }
-
-  const checkQuotas = async () => {
-    const paths = getPaths()
-    if (await poolInstall(paths)) {
-      // Every pool row is polled through the store with the token it holds;
-      // like the legacy check below, nothing is refreshed.
-      const results = await pollPoolRowsOnce(
-        paths,
-        async (request) => {
-          const credential = request.credential
-          if (credential.type !== 'oauth' || !credential.access)
-            throw new Error('No usable access token for quota check')
-          const snapshot = await whamUsageFn({
-            accessToken: credential.access,
-            fetchImpl,
-            now: deps.now,
-            ...(request.identity ? { accountId: request.identity } : {}),
-            accountKey: request.id,
-          })
-          return observationFromSnapshot(snapshot, deps.now(), true)
-        },
-        deps.openAccountPool,
-      )
-      printQuotaResults(
-        results.map((result) => ({
-          account: result.id,
-          ok: result.ok,
-          ...(result.error !== undefined ? { error: result.error } : {}),
-        })),
-      )
-      return
-    }
-    const storage = await deps.loadAccounts(paths)
-    const quotaManager = new QuotaManager({
-      storage,
-      configPath: paths.configPath,
-      fetchImpl,
-      now: deps.now,
-    })
-    // A quota check may update quota cache fields, but it must never rotate or
-    // persist credentials. The shared refresher still owns account iteration,
-    // normalization, and result reporting. Its `respectBackoff: false` bypasses
-    // quota backoff; the copied load view below removes refresh backoff for this
-    // one manual poll without clearing the persisted diagnosis.
-    const fallbackManager = {
-      refreshAccount: async (candidate: OAuthAccount) => candidate,
-    } as unknown as RefreshAllQuotaDeps['fallbackManager']
-    const noCredentialRefresh = async () => {
-      throw new Error('No usable main access token for quota check')
-    }
-
-    const loadForQuotaCheck: typeof loadAccounts = async (requestedPaths) => {
-      const current = await deps.loadAccounts(requestedPaths)
-      if (!current) return null
       return {
-        ...current,
-        accounts: current.accounts.map((candidate) =>
-          isOAuthAccount(candidate)
-            ? { ...candidate, lastRefreshError: undefined }
-            : { ...candidate },
-        ),
+        url: flow.url,
+        instructions: flow.instructions,
+        completion: flow.completion.then(async (account) => {
+          const load = await store.read()
+          const main =
+            load.status === 'ready'
+              ? load.rows.find((row) => row.id === POOL_MAIN_ROW_ID)?.identity
+              : undefined
+          if (account.accountId && main && account.accountId === main)
+            throw new Error(
+              'that account is already the OpenCode main credential',
+            )
+          const login: LoginAccount = {
+            id: account.id,
+            credential: {
+              type: 'oauth',
+              refresh: account.refresh,
+              ...(account.access !== undefined
+                ? { access: account.access }
+                : {}),
+              ...(account.expires !== undefined
+                ? { expires: account.expires }
+                : {}),
+            },
+            ...(account.accountId !== undefined
+              ? { identity: account.accountId }
+              : {}),
+            ...(account.label !== undefined ? { label: account.label } : {}),
+          }
+          return login
+        }),
       }
-    }
+    },
+    openBrowser: (url) => deps.openBrowser(url),
+  })
 
-    const results = await deps.refreshAllQuota({
-      getAuth: readAuth,
-      codexRefreshFn: noCredentialRefresh,
-      refreshMainWithLease: noCredentialRefresh,
-      fallbackManager,
-      quotaManager,
-      loadAccounts: loadForQuotaCheck,
-      writeSidebarState: async () => {},
-      client: {
-        auth: {
-          set: async () => {
-            throw new Error('Quota checks cannot write credentials')
-          },
-        },
-      },
+  /** One quota reading for a row, taken with the token it holds; nothing is refreshed. */
+  const pollQuota = async (row: PoolRow) => {
+    const credential = row.credential
+    if (credential?.type !== 'oauth' || !credential.access)
+      throw new Error('no usable access token for a quota check')
+    const snapshot = await whamUsageFn({
+      accessToken: credential.access,
       fetchImpl,
       now: deps.now,
-      paths,
-      storageMainAccountId: storage?.mainAccountId,
-      isOAuthAccountFn: isOAuthAccount,
-      whamFn: whamUsageFn,
-      respectBackoff: false,
-      readSidebarState: async () => ({ main: {}, fallbacks: [] }),
-      ...deps.custodyQuotaDeps,
+      ...(row.identity ? { accountId: row.identity } : {}),
+      accountKey: row.id,
     })
-    printQuotaResults(results)
+    return observationFromSnapshot(snapshot, deps.now(), true)
   }
 
-  const doctor = async () => {
-    const paths = getPaths()
-    const [storage, ids, auth] = await Promise.all([
-      deps.loadAccounts(paths),
-      deps.readStoreIds(paths),
-      readAuth(),
-    ])
-    const report = createAuthDoctorReport({
-      auth: auth.type === 'missing' ? undefined : auth,
-      storage,
-      orphanStateIds: ids.orphanStateIds,
-      now: deps.now(),
+  const doctorChecks = (migrated: boolean): DoctorCheck[] =>
+    authDoctorChecks({
+      paths: getPaths(),
+      migrated,
+      readAuth,
+      loadAccounts: deps.loadAccounts,
+      readStoreIds: deps.readStoreIds,
+      mutateAccounts: deps.mutateAccounts,
+      setMainAuth,
+      now: deps.now,
     })
-    console.log(formatAuthDoctorReport(report))
-    return report
+
+  /** The menu over the pool, the accounts as its rows. */
+  const accountMenuOptions = (
+    paths: AccountPaths,
+    store: PoolStore,
+  ): AccountMenuOptions => ({
+    title: MENU_TITLE,
+    // A re-login replaces the row's credential, and a row write holds the
+    // locks an older process refreshes that row under (`withAccountRules`).
+    store: withAccountRules(store, {
+      rowLocks: (id) => legacyRefreshLocks(paths, id),
+    }),
+    ...(deps.terminal ? { terminal: deps.terminal } : {}),
+    login: menuLogin(store),
+    // Row `main` (the account OpenCode signs in with) and a row the
+    // migration is still moving a login into are never removed, delete-all
+    // included.
+    protect: (id, view) => poolRemovalRefusal(id, view),
+    extraLocks: poolSettingsLocks(paths),
+    pollQuota,
+    doctor: doctorChecks(true),
+    custody: async () =>
+      claustrumMode(await deps.loadAccounts(paths)) === 'claustrum',
+    status: async () => {
+      const storage = await deps.loadAccounts(paths)
+      return [`Routing: ${storage?.routing?.mode ?? 'main-first'}`]
+    },
+  })
+
+  /**
+   * What `opencode auth login` shows before the install has migrated: why
+   * the accounts cannot be managed yet, and the doctor, whose repairs are
+   * this install's own.
+   */
+  const notMigratedMenu = async (): Promise<MenuOutcome> => {
+    const blockers = await deps.migrationBlockers()
+    return runMenu({
+      title: MENU_TITLE,
+      status: [
+        'Accounts move to the new account layout once every OpenCode process on this machine runs this version of OpenAI auth. Account management opens after the move.',
+        ...(blockers.length > 0
+          ? [
+              'These processes still hold the move back:',
+              ...blockers.map(
+                (blocker) =>
+                  `  ${blocker.pid === 'unknown' ? 'processes that could not be read' : `pid ${blocker.pid}`}: version ${blocker.version}`,
+              ),
+            ]
+          : []),
+      ],
+      actions: [doctorAction({ checks: doctorChecks(false) })],
+      ...(deps.terminal ? { terminal: deps.terminal } : {}),
+    })
   }
 
-  const applyRepairs = async () => {
-    const report = await doctor()
-    if (report.repairs.length === 0) {
-      console.log('No repairs are available.')
-      return
-    }
-    if (!(await deps.confirm('Apply the listed auth repairs?'))) {
-      console.log('Repairs cancelled.')
-      return
-    }
-
+  const openMenu = async (_inputs: AuthorizeInputs): Promise<MenuOutcome> => {
     const paths = getPaths()
-    for (const repair of report.repairs) {
-      if (repair.type === 'restore-main-credential') {
-        // Never copy a credential over the account-pool placeholder: main
-        // then lives in the pool row, and a second copy in the slot would be
-        // refreshed independently of it.
-        if (isPoolMainPlaceholder(await readAuth())) continue
-        const storage = await deps.loadAccounts(paths)
-        const account = findStoredMainCredential(storage)
-        if (!account) continue
-        await setMainAuth({
-          refresh: account.refresh,
-          access: account.access ?? '',
-          expires: account.expires ?? 0,
-        })
-        continue
-      }
-      if (repair.type === 'prune-orphan-state-ids') {
-        await deps.mutateAccounts((current) => current, paths)
-        continue
-      }
-      await deps.mutateAccounts((current) => {
-        const account = current.accounts.find(
-          (candidate): candidate is OAuthAccount =>
-            candidate.id === repair.accountId && isOAuthAccount(candidate),
-        )
-        if (account) account.lastRefreshError = undefined
-        return current
-      }, paths)
-    }
-    console.log(`Applied ${report.repairs.length} auth repair(s).`)
-  }
-
-  const deleteAllAccounts = async () => {
-    const paths = getPaths()
-    if (await poolInstall(paths)) {
-      // Row `main` holds the account OpenCode signs in with (its login slot
-      // holds only a placeholder pointing at it), so it stays.
-      if (
-        !(await deps.confirm(
-          'Delete every account except `main`, the one OpenCode signs in with?',
-        ))
-      ) {
-        console.log('Delete cancelled.')
-        return
-      }
-      const outcome = await removeAllPoolAccountsExceptMain(
-        deps.openAccountPool(paths),
-        paths,
-      )
-      console.log(formatPoolDeleteAll(outcome))
-      return
-    }
-    if (!(await deps.confirm('Delete all fallback accounts?'))) {
-      console.log('Delete cancelled.')
-      return
-    }
-    const allowDrop: string[] = []
-    await deps.mutateAccounts(
-      (current, context) => {
-        const removed = new Set(
-          [
-            ...(context?.rawRosterIds ?? []),
-            ...current.accounts.map((account) => account.id),
-          ].filter((accountId) => accountId !== 'main'),
-        )
-        allowDrop.splice(0, allowDrop.length, ...removed)
-        current.accounts = current.accounts.filter(
-          (account) => account.id === 'main',
-        )
-        return current
-      },
-      getPaths(),
-      { allowDrop },
-    )
-    console.log('Deleted all fallback accounts.')
-  }
-
-  const runMenuAction = async (action: AuthMenuAction) => {
-    switch (action) {
-      case 'add-account':
-        await addAccount()
-        break
-      case 'auth-current':
-        await authCurrent()
-        break
-      case 'check-quotas':
-        await checkQuotas()
-        break
-      case 'auth-doctor':
-        await doctor()
-        break
-      case 'apply-repairs':
-        await applyRepairs()
-        break
-      case 'delete-all':
-        await deleteAllAccounts()
-        break
-      case 'cancel':
-        break
-    }
+    const store = deps.openAccountPool(paths)
+    if ((await migratedPoolRows(paths, store)) === undefined)
+      return notMigratedMenu()
+    return runAccountMenu(accountMenuOptions(paths, store))
   }
 
   return [
     {
       label: 'ChatGPT Pro/Plus (browser)',
       type: 'oauth',
-      authorize: async (inputs?: Record<string, string>) => {
-        // `inputs` is only present when this runs from `opencode auth login`;
-        // the TUI never sends it, so the TUI always signs in as before.
-        if (inputs && (await hasSomethingToManage())) {
-          await runMenuAction(await deps.showAuthMenu())
-          return completedMenuResult()
-        }
-
-        return deps.authorizeBrowser()
-      },
+      // `inputs` is only present when this runs from `opencode auth login`;
+      // the TUI never sends it, so the TUI always signs in as before.
+      authorize: menuAuthorize<AuthOAuthResult>({
+        hasCredential,
+        openMenu,
+        login: () => deps.authorizeBrowser(),
+      }) as (inputs?: Record<string, string>) => Promise<AuthOAuthResult>,
     },
     {
       label: 'ChatGPT Pro/Plus (headless)',
@@ -585,14 +385,4 @@ export function createAuthMethods({
       type: 'api',
     },
   ]
-}
-
-function printQuotaResults(results: readonly RefreshAllQuotaResult[]) {
-  for (const result of results) {
-    console.log(
-      result.ok
-        ? `${result.account}: quota refreshed`
-        : `${result.account}: ${result.error ?? 'quota refresh failed'}`,
-    )
-  }
 }

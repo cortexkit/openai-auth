@@ -309,10 +309,16 @@ describe('dynamic quota TUI rows', () => {
     ).toContainEqual({ label: 'credits', value: '1 / 1 credit' })
   })
 
-  test('modal routing apply sends sessionId on its RPC request', () => {
-    expect(buildApplyRequest('openai-routing', 'reset', 'session-a')).toEqual({
-      command: 'openai-routing',
-      arguments: 'reset',
+  test('a drawer apply sends the sessionId on its RPC request', () => {
+    expect(
+      buildApplyRequest(
+        { command: 'openai', sectionId: 'session', actionId: 'clear-pin' },
+        'session-a',
+      ),
+    ).toEqual({
+      command: 'openai',
+      sectionId: 'session',
+      actionId: 'clear-pin',
       sessionId: 'session-a',
     })
   })

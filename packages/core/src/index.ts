@@ -1,32 +1,50 @@
 /**
- * The command seam.
+ * The command seam: the one `/openai` menu both hosts open.
  *
- * A host enters the shared commands only through `buildDialogPayload` or
- * `applyCommand`. The individual `execute*` bodies stay module-private on
- * purpose: both entry points scrub credential-shaped knobs out of the payload
- * before returning it, and a host that could call a body directly would be able
- * to skip that.
+ * Every payload the menu produces comes from the shared command menu's seam
+ * (`@cortexkit/common-auth/commands`), which projects accounts field by field
+ * and scrubs credential-shaped names; the one payload built here, the
+ * not-migrated notice, is scrubbed the same way (`scrubKnobs`).
  */
 export {
-  applyCommand,
-  buildDialogPayload,
-  type CommandContext,
-  type HostCommandBodies,
-  type HostCommandBody,
-  MODAL_COMMANDS,
-  OPENAI_ACCOUNT_COMMAND_NAME,
-  OPENAI_CACHEKEEP_COMMAND_NAME,
-  OPENAI_DUMP_COMMAND_NAME,
-  OPENAI_KILLSWITCH_COMMAND_NAME,
-  OPENAI_LOGGING_COMMAND_NAME,
-  OPENAI_QUOTA_COMMAND_NAME,
-  OPENAI_RESET_COMMAND_NAME,
-  OPENAI_ROUTING_COMMAND_NAME,
+  type AccountRules,
+  type CacheKeepManager,
+  type ClaustrumSectionDeps,
+  claustrumSection,
+  createOpenAiMenu,
+  FLOOR_LABELS,
+  killswitchInFloors,
+  killswitchWithDefaultFloors,
+  loginAddInput,
+  type MenuLoginDeps,
+  type MenuLoginFlow,
+  type MenuMigrationState,
+  MIGRATION_NOTICE_SECTION_ID,
+  type MigrationBlocker,
+  menuLogin,
+  migrateLegacySettings,
+  migrationNoticeMenu,
+  OPENAI_COMMAND_NAME,
+  OPENAI_MENU_TITLE,
+  type OpenAiMenuOptions,
+  ORDERED_VARIANTS,
+  type ResetCreditsDeps,
+  type ResetStepResult,
+  type ResetTargetIdentity,
+  resetCreditsSection,
+  type SessionSectionDeps,
   scrubKnobs,
+  sessionSection,
+  settingsMutateAccounts,
+  withAccountRules,
+  withSettingsMigration,
+  writeSettings,
 } from './commands'
-export type {
-  ApplyRequest,
-  ApplyResult,
-  CommandModalName,
-  OpenDialogPayload,
+export {
+  type ApplyRequest,
+  type ApplyResult,
+  isNotifyPayload,
+  type NotifyPayload,
+  type OpenDialogPayload,
+  type RpcNotification,
 } from './protocol'

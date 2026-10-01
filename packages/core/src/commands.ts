@@ -1,23 +1,48 @@
+/**
+ * The `/openai` command: one menu for accounts, quota, routing, limits, the
+ * cache, diagnostics and the provider extras, built on the shared command
+ * menu (`@cortexkit/common-auth/commands`). Both hosts build their menu with
+ * `createOpenAiMenu`; each supplies what only it has (OpenCode its cache
+ * keep-warm manager, dumps and Claustrum mode, Pi its own login and pool).
+ *
+ * The menu works on the account pool, so it needs a migrated install. Until
+ * then `/openai` shows only why (`migrationNoticeMenu`).
+ *
+ * Every settings write the menu makes goes through the pool store's
+ * `updateSettings`. On the way, `withSettingsMigration` moves settings this
+ * plugin wrote under an older name or meaning into the shared vocabulary.
+ */
 import {
-  type AccountPaths,
-  claustrumMode,
+  type AccountsSectionOptions,
+  type CommandApplyRequest,
+  type CommandApplyResult,
+  type CommandDialogPayload,
+  type CommandInvocation,
+  type CommandMenu,
+  type CommandMenuModel,
+  createCommandMenu,
+  type PluginExtraSection,
+  type PluginSection,
+  type SeamLogger,
+} from '@cortexkit/common-auth/commands'
+import type {
+  AddInput,
+  PoolLockSpec,
+  PoolStore,
+  RemoveOptions,
+} from '@cortexkit/common-auth/store'
+import {
+  type AccountStorage,
+  type ClaustrumMode,
+  DEFAULT_KILLSWITCH_THRESHOLDS,
   type loadAccounts as defaultLoadAccounts,
-  type FallbackAccount,
+  type mutateAccounts as defaultMutateAccounts,
+  getKillswitchThresholdsForAccount,
   isSafeResetAccountKey,
-  mutateAccounts,
-  type OAuthAccount,
-  type OAuthSpendControlReading,
-  type RoutingMode,
-  readConfigRosterIds,
+  KILLSWITCH_FLOORS_SCHEMA,
 } from './accounts'
 import { createLogger } from './logger'
-import { beginAccountLogin, upsertAccount } from './oauth'
-import type {
-  ApplyRequest,
-  ApplyResult,
-  CommandModalName,
-  OpenDialogPayload,
-} from './protocol'
+import type { IngestAccount } from './oauth'
 import { whamUsageFn } from './provider'
 import type { QuotaManager } from './quota-manager'
 import type { RefreshAllQuotaResult } from './refresh-all-quota'
@@ -34,42 +59,23 @@ import {
 } from './reset-credits'
 import { isRecord } from './util/record.ts'
 
-// ---------------------------------------------------------------------------
-// Command name constants
-// ---------------------------------------------------------------------------
+/** The one slash command, without the slash. */
+export const OPENAI_COMMAND_NAME = 'openai'
 
-export const OPENAI_QUOTA_COMMAND_NAME = 'openai-quota'
-export const OPENAI_ACCOUNT_COMMAND_NAME = 'openai-account'
-export const OPENAI_ROUTING_COMMAND_NAME = 'openai-routing'
-export const OPENAI_KILLSWITCH_COMMAND_NAME = 'openai-killswitch'
-export const OPENAI_DUMP_COMMAND_NAME = 'openai-dump'
-export const OPENAI_LOGGING_COMMAND_NAME = 'openai-logging'
-export const OPENAI_CACHEKEEP_COMMAND_NAME = 'openai-cachekeep'
-export const OPENAI_RESET_COMMAND_NAME = 'openai-reset'
+/** The menu's title, shown by both hosts. */
+export const OPENAI_MENU_TITLE = 'OpenAI accounts'
 
-export const MODAL_COMMANDS: CommandModalName[] = [
-  'openai-quota',
-  'openai-account',
-  'openai-routing',
-  'openai-killswitch',
-  'openai-dump',
-  'openai-logging',
-  'openai-cachekeep',
-  'openai-reset',
-]
+/** The row the main account lives in once the install is migrated. */
+const MAIN_ROW_ID = 'main'
 
-// ---------------------------------------------------------------------------
-// Dependency injection context
-// ---------------------------------------------------------------------------
+const log = createLogger('commands')
 
 /**
- * The prompt-cache manager, as the commands use it.
+ * The prompt-cache manager, as the Cache section uses it.
  *
- * Declared structurally rather than imported: the manager itself is tied to one
- * host's live request loader and stays there. Only the members reached through
- * this field appear here — a status snapshot, the two lifecycle calls the
- * cachekeep command makes, and the per-session drop the host performs when a
- * session ends.
+ * Declared structurally rather than imported: the manager itself is tied to
+ * one host's live request loader and stays there. Only the members the Cache
+ * section and the host's session cleanup reach appear here.
  */
 export interface CacheKeepManager {
   status(): {
@@ -95,126 +101,6 @@ export interface CacheKeepManager {
   remove(sessionKey: string): void
 }
 
-export interface CommandContext {
-  accountStoragePath: string
-  /**
-   * Runtime-state file that goes with `accountStoragePath`. Required, and
-   * resolved by the host: nothing here derives one path from the other.
-   */
-  accountStatePath: string
-  /** Host package version, sent as the version half of the OAuth `User-Agent`. */
-  packageVersion: string
-  quotaManager: QuotaManager
-  loadAccounts: typeof defaultLoadAccounts
-  client: {
-    auth: {
-      set: (input: {
-        path: { id: string }
-        body: {
-          type: string
-          access?: string
-          refresh: string
-          expires?: number
-        }
-      }) => Promise<unknown>
-    }
-  }
-  /** Session ID for pushNotification delivery. */
-  sessionId?: string
-  /** If set, pushNotification is wired up and can deliver feedback to the user. */
-  notify?: (payload: OpenDialogPayload) => void
-  /** Refresh the sidebar-state file so the TUI modal shows current data. */
-  refreshSidebar?: () => Promise<void>
-  /** Actively poll wham/usage for all accounts (main + fallbacks). */
-  refreshAllQuota?: () => Promise<RefreshAllQuotaResult[]>
-  /** Prompt-cache cachekeep manager. Set when the command is wired. */
-  cacheKeepManager?: CacheKeepManager | null
-  /** Updates the live loader's persisted-enabled cachekeep gate. */
-  setCacheKeepEnabled?: (enabled: boolean) => void
-  /** Updates the live loader's persisted-subagent cachekeep gate. */
-  setCacheKeepSubagents?: (enabled: boolean) => void
-  /** Updates the live loader's main-agent idle-cap bypass gate. */
-  setCacheKeepSustain?: (enabled: boolean) => void
-  /** Updates the live loader's clock-hour warm window. undefined = no window. */
-  setCacheKeepWindow?: (
-    window: { startHour: number; endHour: number } | undefined,
-  ) => void
-  /** Clears only the sticky account assignment for one OpenCode session. */
-  clearStickyRouting?: (sessionId: string) => Promise<boolean>
-  /** Resolves the current session's usable sticky account, if one exists. */
-  getStickyRouting?: (sessionId: string) => Promise<string | undefined>
-  resolveResetTarget?: (accountKey: string) => Promise<ResetTargetIdentity>
-  fetchImpl?: typeof fetch
-  now?: () => number
-  randomUUID?: () => string
-  /** Starts an OAuth account-add flow; injected by the runtime boundary. */
-  beginAccountLogin?: typeof beginAccountLogin
-  refreshResetTargetQuota?: (
-    accountKey: string,
-  ) => Promise<RefreshAllQuotaResult>
-  enterClaustrumMode?: () => Promise<{
-    status: 'completed' | 'incomplete' | 'aborted'
-    outcomes: Record<string, string>
-    reason?: string
-  }>
-  leaveClaustrumMode?: () => Promise<void>
-  withFallbackAccountLock?: <T>(
-    accountId: string,
-    action: () => Promise<T>,
-  ) => Promise<T>
-  checkUsableCustodyBinding?: (
-    account: OAuthAccount,
-  ) => Promise<
-    { ready: true; accountId: string } | { ready: false; reason: string }
-  >
-  /**
-   * The shared account pool, on a host that can move accounts into it. Its
-   * `rows()` resolves to undefined until the install is migrated, and the
-   * commands then work on the legacy account list as before.
-   */
-  accountPool?: CommandAccountPool
-}
-
-/** One pool row as the account commands see it: no credential fields. */
-export interface CommandPoolRow {
-  id: string
-  type: 'oauth' | 'api'
-  enabled: boolean
-  label?: string
-}
-
-/**
- * Account management on a migrated install, where every account (the one
- * OpenCode signs in with included, as row `main`) is a row of the account
- * pool. The host implements it over the pool store.
- */
-export interface CommandAccountPool {
-  /** The rows in roster order, or undefined when the install is not migrated. */
-  rows(): Promise<readonly CommandPoolRow[] | undefined>
-  /** Adds a new login as a row, or replaces the credential of the row holding that account. */
-  add(account: OAuthAccount): Promise<{
-    status: 'added' | 'added-disabled' | 'replaced' | 'main-identity'
-    id: string
-  }>
-  disable(id: string): Promise<CommandPoolRowOutcome>
-  /** Refused while another enabled row holds the same ChatGPT account. */
-  enable(id: string): Promise<CommandPoolRowOutcome>
-  /**
-   * Refused for row `main`, and for a row the pool migration is still moving
-   * a login into.
-   */
-  remove(id: string): Promise<CommandPoolRowOutcome>
-  /** Swaps two rows' positions in the roster order. */
-  reorder(first: string, second: string): Promise<boolean>
-}
-
-/** What enabling, disabling or removing one pool row came to. */
-export type CommandPoolRowOutcome =
-  | { status: 'done' }
-  | { status: 'not-found' }
-  /** The pool refused the change; `message` tells the user why. */
-  | { status: 'refused'; message: string }
-
 export interface ResetTargetIdentity {
   accountKey: string
   label: string
@@ -223,891 +109,913 @@ export interface ResetTargetIdentity {
   onAuthFailure?: (status: number) => Promise<void>
 }
 
-/**
- * A command body a host supplies for a command the core does not own.
- *
- * Four commands read state that only the OpenCode plugin process has — the
- * live request loader's gates and its memoized settings — so their bodies stay
- * in that host. They are still reached through the entry points below, so the
- * credential scrubbing runs on their payloads exactly as it does on ours.
- */
-export type HostCommandBody = (
-  args: string,
-  ctx: CommandContext,
-) => Promise<OpenDialogPayload>
-
-export type HostCommandBodies = Partial<
-  Record<CommandModalName, HostCommandBody>
->
-
-const log = createLogger('commands')
-
-/** The config/state pair a context describes, in the shape the store takes. */
-function storePaths(ctx: CommandContext): AccountPaths {
-  return {
-    configPath: ctx.accountStoragePath,
-    statePath: ctx.accountStatePath,
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Helpers
+// Settings vocabulary
 // ---------------------------------------------------------------------------
 
-function routingDescription(mode: RoutingMode) {
-  if (mode === 'fallback-first') {
-    return 'Try usable fallback accounts before the main account.'
-  }
-  if (mode === 'sticky-balanced') {
-    return 'Keep each session on its assigned account while balancing new sessions.'
-  }
-  return 'Try the main account first. Use fallback accounts only when required.'
-}
+type Settings = Record<string, unknown>
 
-// ---------------------------------------------------------------------------
-// Per-command execution functions
-// ---------------------------------------------------------------------------
-
-// Three missed polls at the 5-minute cadence. Below this, a stamp is just the
-// normal gap between refreshes and saying so would put an age on every line
-// permanently, which trains the reader to ignore it.
-const QUOTA_STALE_AFTER_MS = 15 * 60 * 1000
+/** Ids an object literal cannot hold as plain keys. */
+const PROTOTYPE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 
 /**
- * Render how old a quota reading is, or nothing while it is current.
+ * The killswitch block `block` (an older, unmarked one) rewritten as
+ * per-account floors in the shared vocabulary.
  *
- * Keyed on the reading's OWN timestamp rather than the poll's. A poll can
- * succeed while leaving an account untouched — that is exactly what happens
- * once an account's refresh backoff is armed and the poll skips it — so the
- * poll's clock would report freshness the numbers do not have. That gap is what
- * let one account's bars sit unchanged for 31 hours while the surface looked
- * healthy.
+ * Every account the block can apply to gets, per window, exactly the floor
+ * the older reader applied to it: its own thresholds when it had an entry,
+ * else the `main` thresholds, and the default for a window neither names.
+ * The main account (judged against `main`) becomes row `main`. Accounts the
+ * older reader covered implicitly are written explicitly, because in the new
+ * vocabulary an account without an entry has no floor. The same quota
+ * therefore blocks the same requests before and after.
  */
-function quotaAge(checkedAt: number | undefined, now: number): string {
-  if (typeof checkedAt !== 'number' || !Number.isFinite(checkedAt)) {
-    return ' (age unknown)'
+export function killswitchInFloors(
+  block: Record<string, unknown>,
+  rosterIds: readonly string[],
+): Settings {
+  // The older reader, run on the older block, is the definition of what the
+  // floors were; asking it keeps the mapping exact by construction.
+  const legacy = {
+    version: 1,
+    accounts: [],
+    killswitch: block,
+  } as unknown as AccountStorage
+  const named = isRecord(block.accounts) ? Object.keys(block.accounts) : []
+  const accounts: Record<string, { primary: number; secondary: number }> = {}
+  for (const id of new Set([MAIN_ROW_ID, ...rosterIds, ...named])) {
+    if (PROTOTYPE_KEYS.has(id)) continue
+    const floors = getKillswitchThresholdsForAccount(
+      legacy,
+      id === MAIN_ROW_ID ? undefined : id,
+    )
+    accounts[id] = { primary: floors.primary, secondary: floors.secondary }
   }
-  const ageMs = now - checkedAt
-  if (ageMs < QUOTA_STALE_AFTER_MS) return ''
-  const hours = Math.floor(ageMs / 3600_000)
-  if (hours >= 24) return ` (${Math.floor(hours / 24)}d old)`
-  if (hours >= 1) return ` (${hours}h old)`
-  return ` (${Math.floor(ageMs / 60_000)}m old)`
-}
-
-function formatSpendControlLine(
-  spendControl: OAuthSpendControlReading,
-  indent = '',
-): string {
-  const resets = spendControl.resetsAt
-    ? ` · resets ${spendControl.resetsAt}`
-    : ''
-  const amount = (value: number) => Math.round(value).toLocaleString('en-US')
-  const unit = spendControl.unit ?? 'unit'
-  const plural =
-    spendControl.limit === 1 || unit.endsWith('s') ? unit : `${unit}s`
-  return `${indent}- credits: ${Math.round(spendControl.usedPercent)}% used (${amount(spendControl.used)} / ${amount(spendControl.limit)} ${plural}, ${amount(spendControl.remaining)} remaining)${resets}`
-}
-
-async function executeQuotaCommand(
-  ctx: CommandContext,
-): Promise<OpenDialogPayload> {
-  const refreshResults = await ctx.refreshAllQuota?.()
-  const mainEntry = ctx.quotaManager.getMain()
-  const now = Date.now()
-  const lines: string[] = ['## OpenAI Quota', '']
-
-  if (mainEntry?.quota) {
-    const q = mainEntry.quota
-    lines.push('### Main account')
-    for (const key of ['primary', 'secondary'] as const) {
-      const w = q[key]
-      if (w) {
-        const pct = Math.round(w.usedPercent)
-        const bar =
-          '█'.repeat(Math.max(0, Math.min(Math.round(pct / 10), 10))) +
-          '░'.repeat(Math.max(0, 10 - Math.min(Math.round(pct / 10), 10)))
-        lines.push(
-          `- ${key}: ${bar} ${pct}% used (${Math.round(w.remainingPercent)}% remaining)${quotaAge(w.checkedAt ?? mainEntry.checkedAt, now)}`,
-        )
-      }
-    }
-    if (q.resetCreditsAvailable !== undefined) {
-      lines.push(`- resets: ${q.resetCreditsAvailable}`)
-    }
-    if (q.spendControl) {
-      lines.push(formatSpendControlLine(q.spendControl))
-    }
-  } else {
-    lines.push('No main quota snapshot available. Send a request first.')
-  }
-
-  const fallbacks = ctx.quotaManager.getAllFallbacks()
-  const fbEntries = [...fallbacks.entries()].filter(([, e]) => e)
-  if (fbEntries.length > 0) {
-    lines.push('')
-    lines.push('### Fallback accounts')
-    for (const [id, entry] of fbEntries) {
-      if (!entry?.quota) continue
-      lines.push(`**${id}**`)
-      for (const key of ['primary', 'secondary'] as const) {
-        const w = entry.quota[key]
-        if (w) {
-          const pct = Math.round(w.usedPercent)
-          lines.push(
-            `  - ${key}: ${pct}% used (${Math.round(w.remainingPercent)}% remaining)${quotaAge(w.checkedAt ?? entry.checkedAt, now)}`,
-          )
-        }
-      }
-      if (entry.quota.resetCreditsAvailable !== undefined) {
-        lines.push(`  - resets: ${entry.quota.resetCreditsAvailable}`)
-      }
-      if (entry.quota.spendControl) {
-        lines.push(formatSpendControlLine(entry.quota.spendControl, '  '))
-      }
-    }
-  }
-
-  if (refreshResults?.length) {
-    const failures = refreshResults.filter((r) => !r.ok)
-    if (failures.length > 0) {
-      lines.push('')
-      for (const f of failures) {
-        // Two different messages, because they need two different actions.
-        // Every failure used to read "fetch failed — Refresh to retry", which
-        // made a token the provider had permanently rejected look like a
-        // momentary blip and recommended a remedy that cannot work: refreshing
-        // never revives such a token, so an operator following that advice
-        // waits indefinitely instead of re-adding the account.
-        //
-        // The raw error stays hidden on purpose — it names internal endpoints
-        // and helps nobody here. What the operator needs is which of the two
-        // situations they are in.
-        lines.push(
-          f.permanent
-            ? `- ${f.account}: sign-in no longer accepted — remove and add this account again`
-            : `- ${f.account}: fetch failed — Refresh to retry`,
-        )
-      }
-    }
-  }
-
-  return { command: 'openai-quota', text: lines.join('\n'), knobs: {} }
+  const next: Settings = { ...block }
+  delete next.main
+  next.accounts = accounts
+  next.schema = KILLSWITCH_FLOORS_SCHEMA
+  return next
 }
 
 /**
- * Project a stored account down to the fields a dialog may see.
- *
- * Stored accounts carry live credentials (`access`, `refresh`, `apiKey`). Knobs
- * are returned across the loopback RPC boundary and JSON-serialized to the TUI,
- * so handing back raw account objects would publish those secrets to every RPC
- * client and into anything that logs an apply result. The dialogs only ever need
- * identity here — the account list is rendered from `text`, and the TUI reads
- * nothing from these entries but their count.
- *
- * Build the result field by field. A destructuring omit (`...rest`) would
- * silently republish any secret added to the account types later.
+ * A killswitch block created in the shared vocabulary, marked as such, with
+ * the default floors (`DEFAULT_KILLSWITCH_THRESHOLDS`) written for row
+ * `main` and every row in `rosterIds` the block does not name. Floors the
+ * block already holds are kept as they are.
  */
-function accountKnob(account: FallbackAccount) {
+export function killswitchWithDefaultFloors(
+  block: Record<string, unknown>,
+  rosterIds: readonly string[],
+): Settings {
+  const accounts: Record<string, unknown> = isRecord(block.accounts)
+    ? { ...block.accounts }
+    : {}
+  for (const id of new Set([MAIN_ROW_ID, ...rosterIds])) {
+    if (PROTOTYPE_KEYS.has(id) || Object.hasOwn(accounts, id)) continue
+    accounts[id] = {
+      primary: DEFAULT_KILLSWITCH_THRESHOLDS.primary,
+      secondary: DEFAULT_KILLSWITCH_THRESHOLDS.secondary,
+    }
+  }
+  return { ...block, accounts, schema: KILLSWITCH_FLOORS_SCHEMA }
+}
+
+/**
+ * Moves the settings this plugin wrote under an older name or meaning into
+ * the shared vocabulary, in place. True when anything changed.
+ *
+ * - `cachekeep` becomes `cacheKeep`; a value already under the new name wins.
+ * - An unmarked killswitch block becomes per-account floors
+ *   (`killswitchInFloors`) for the rows in `rosterIds`.
+ *
+ * `routing.mode` and `logging.level` already have the shared names.
+ */
+export function migrateLegacySettings(
+  settings: Settings,
+  rosterIds: readonly string[],
+): boolean {
+  let changed = false
+  if (isRecord(settings.cachekeep)) {
+    settings.cacheKeep = {
+      ...settings.cachekeep,
+      ...(isRecord(settings.cacheKeep) ? settings.cacheKeep : {}),
+    }
+    delete settings.cachekeep
+    changed = true
+  }
+  const killswitch = settings.killswitch
+  if (isRecord(killswitch) && killswitch.schema !== KILLSWITCH_FLOORS_SCHEMA) {
+    settings.killswitch = killswitchInFloors(killswitch, rosterIds)
+    changed = true
+  }
+  return changed
+}
+
+async function rosterIdsOf(store: PoolStore): Promise<string[]> {
+  const load = await store.read()
+  return load.status === 'ready' ? load.rows.map((row) => row.id) : []
+}
+
+/**
+ * The store with its settings seen, and written, in the shared vocabulary.
+ *
+ * `readSettings` returns the settings as `migrateLegacySettings` would leave
+ * them, without writing. `updateSettings` migrates the stored settings in
+ * the same locked write as the caller's change, before the caller sees them
+ * (so its edit applies to the new shape), and gives a killswitch block the
+ * caller created the default floors (`killswitchWithDefaultFloors`).
+ * Every other member is the store's own.
+ *
+ * The roster is read just before the locked write; a row added in between
+ * gets no killswitch floors from the migration.
+ */
+export function withSettingsMigration(store: PoolStore): PoolStore {
+  const readSettings: PoolStore['readSettings'] = async () => {
+    const read = await store.readSettings()
+    if (read.status === 'error') return read
+    const settings = structuredClone(read.settings)
+    migrateLegacySettings(settings, await rosterIdsOf(store))
+    return { ...read, settings }
+  }
+  const updateSettings: PoolStore['updateSettings'] = async (
+    mutator,
+    options,
+  ) => {
+    const ids = await rosterIdsOf(store)
+    return store.updateSettings(async (settings) => {
+      migrateLegacySettings(settings, ids)
+      const next = (await mutator(settings)) ?? settings
+      // Every block that existed was given `schema: KILLSWITCH_FLOORS_SCHEMA`
+      // above, so one without it was created by this write (turning the killswitch on, or setting a first
+      // floor). Every account it does not name gets the default floors, as
+      // turning the killswitch on always did, so enabling it protects every
+      // account rather than none.
+      if (
+        isRecord(next.killswitch) &&
+        next.killswitch.schema !== KILLSWITCH_FLOORS_SCHEMA
+      )
+        next.killswitch = killswitchWithDefaultFloors(next.killswitch, ids)
+      return next
+    }, options)
+  }
+  return new Proxy(store, {
+    get(target, property) {
+      if (property === 'readSettings') return readSettings
+      if (property === 'updateSettings') return updateSettings
+      const value: unknown = Reflect.get(target, property, target)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+}
+
+export interface AccountRules {
+  /**
+   * The legacy locks a write of row `id` holds besides the store's own: the
+   * locks an older openai-auth process holds while it refreshes that row.
+   * Taken by remove, enable, disable and replace (and by the replace a
+   * re-login becomes).
+   */
+  rowLocks?(id: string): readonly PoolLockSpec[]
+  /**
+   * Wraps enabling row `id`. `enable` does the store write with the given
+   * locks (the row's locks when none are given). The default enables at once.
+   */
+  enableRow?(
+    id: string,
+    enable: (extraLocks?: readonly PoolLockSpec[]) => Promise<{ id: string }>,
+  ): Promise<{ id: string }>
+}
+
+/**
+ * The store with openai-auth's rules for row writes:
+ *
+ * - remove, enable, disable and replace take `rowLocks(id)`;
+ * - an add of a login whose ChatGPT identity (or, failing that, whose id) an
+ *   OAuth row already holds replaces that row's credential instead of adding
+ *   a disabled duplicate: signing in again refreshes the account. A login of
+ *   the ChatGPT account in row `main` is refused; it is OpenCode's own
+ *   sign-in.
+ *
+ * Every other member is the store's own.
+ */
+export function withAccountRules(
+  store: PoolStore,
+  rules: AccountRules,
+): PoolStore {
+  const locksFor = (id: string, given?: readonly PoolLockSpec[]) =>
+    rules.rowLocks ? rules.rowLocks(id) : given
+  const withLocks = <T extends { extraLocks?: readonly PoolLockSpec[] }>(
+    id: string,
+    options: T | undefined,
+  ): T => {
+    const extraLocks = locksFor(id, options?.extraLocks)
+    return { ...(options ?? ({} as T)), ...(extraLocks ? { extraLocks } : {}) }
+  }
+  const replace: PoolStore['replace'] = (id, credential, identity, options) =>
+    store.replace(id, credential, identity, withLocks(id, options))
+  const add: PoolStore['add'] = async (input, options) => {
+    const load = await store.read()
+    const rows = load.status === 'ready' ? load.rows : []
+    const oauth = rows.filter((row) => row.type === 'oauth' && !row.invalid)
+    const sameAccount = input.identity
+      ? oauth.find((row) => row.identity === input.identity)
+      : undefined
+    if (sameAccount?.id === MAIN_ROW_ID)
+      throw new Error(
+        'that account is already your main account, so it was not added again',
+      )
+    const existing =
+      sameAccount ??
+      oauth.find((row) => row.id === input.id && row.id !== MAIN_ROW_ID)
+    if (!existing || input.credential.type !== 'oauth')
+      return store.add(input, options)
+    const replaced = await replace(
+      existing.id,
+      input.credential,
+      input.identity !== undefined ? { identity: input.identity } : {},
+      options?.extraLocks ? { extraLocks: options.extraLocks } : undefined,
+    )
+    log.info('account signed in again', { id: existing.id })
+    return {
+      id: replaced.id,
+      outcome: 'rotated',
+      credential: replaced.credential,
+    }
+  }
+  const enable: PoolStore['enable'] = (id, options) => {
+    const run = (extraLocks?: readonly PoolLockSpec[]) =>
+      store.enable(id, {
+        ...(options ?? {}),
+        ...((extraLocks ?? locksFor(id, options?.extraLocks))
+          ? { extraLocks: extraLocks ?? locksFor(id, options?.extraLocks) }
+          : {}),
+      })
+    return rules.enableRow ? rules.enableRow(id, run) : run()
+  }
+  const members: Partial<Record<keyof PoolStore, unknown>> = {
+    add,
+    replace,
+    enable,
+    disable: ((id, reason, options) =>
+      store.disable(
+        id,
+        reason,
+        withLocks(id, options),
+      )) as PoolStore['disable'],
+    remove: ((id, options) =>
+      store.remove(id, withLocks(id, options))) as PoolStore['remove'],
+  }
+  return new Proxy(store, {
+    get(target, property) {
+      if (Object.hasOwn(members, property))
+        return members[property as keyof PoolStore]
+      const value: unknown = Reflect.get(target, property, target)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+}
+
+/** One settings write through the store, in the shared vocabulary. */
+export async function writeSettings(
+  store: PoolStore,
+  extraLocks: readonly PoolLockSpec[] | undefined,
+  edit: (settings: Settings) => void,
+): Promise<void> {
+  await withSettingsMigration(store).updateSettings(
+    (settings) => {
+      edit(settings)
+      return undefined
+    },
+    extraLocks ? { extraLocks } : {},
+  )
+}
+
+/** The config keys the pool owns; a settings write never sets them. */
+const POOL_OWNED = ['version', 'accounts', 'commonAuthPool'] as const
+
+/**
+ * A `mutateAccounts` for code that edits only settings keys (the reset-credit
+ * coordinator), writing through the store's `updateSettings` instead of
+ * rewriting the account files. The mutator sees the settings with an empty
+ * account list; the pool-owned keys of its result are dropped, so it cannot
+ * change the roster.
+ */
+export function settingsMutateAccounts(
+  store: PoolStore,
+  extraLocks: readonly PoolLockSpec[] | undefined,
+): typeof defaultMutateAccounts {
+  return async (mutate) => {
+    let view: AccountStorage | undefined
+    await withSettingsMigration(store).updateSettings(
+      (settings) => {
+        const current = {
+          ...settings,
+          version: 1,
+          accounts: [],
+        } as unknown as AccountStorage
+        const next = mutate(current) ?? current
+        view = next
+        const out: Settings = { ...(next as unknown as Settings) }
+        for (const key of POOL_OWNED) delete out[key]
+        return out
+      },
+      extraLocks ? { extraLocks } : {},
+    )
+    if (!view) throw new Error('the settings write did not run')
+    return view
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The not-migrated notice
+// ---------------------------------------------------------------------------
+
+/** One live process, on an older version, that keeps the accounts from moving to the account pool. */
+export interface MigrationBlocker {
+  /** `'unknown'` when the directory of process heartbeats could not be read. */
+  pid: number | 'unknown'
+  version: string
+}
+
+export type MenuMigrationState =
+  | { migrated: true }
+  | { migrated: false; blockers: readonly MigrationBlocker[] }
+
+/** The id of the notice's one section. */
+export const MIGRATION_NOTICE_SECTION_ID = 'migration'
+
+/** What `/openai` shows on an install that has not migrated: one section. */
+export function migrationNoticeMenu(
+  blockers: readonly MigrationBlocker[],
+): CommandMenuModel {
+  const lines = [
+    'Accounts move to the new account layout once every OpenCode process on this machine runs this version of OpenAI auth. This menu works on that layout, so it opens after the move.',
+    blockers.length > 0
+      ? 'These processes still hold the move back:'
+      : 'No running process holds the move back.',
+  ]
+  const menu: CommandMenuModel = {
+    command: OPENAI_COMMAND_NAME,
+    title: OPENAI_MENU_TITLE,
+    sections: [
+      {
+        id: MIGRATION_NOTICE_SECTION_ID,
+        slot: 'extra',
+        title: 'Accounts are moving',
+        lines,
+        items: blockers.map((blocker, index) => ({
+          id: `blocker-${index}`,
+          label:
+            blocker.pid === 'unknown'
+              ? 'processes that could not be read'
+              : `pid ${blocker.pid}`,
+          detail: `version ${blocker.version}`,
+          actions: [],
+        })),
+        actions: [],
+      },
+    ],
+  }
+  return scrubMenu(menu)
+}
+
+/**
+ * Credential-shaped property names: names ending in `token`, `key` or
+ * `secret`, and the stored credential fields. The shared seam drops the same
+ * names from every payload it builds; this list covers the one payload built
+ * here, the notice.
+ */
+const CREDENTIAL_KEYS = new Set([
+  'access',
+  'refresh',
+  'apikey',
+  'authheader',
+  'password',
+  'credential',
+  'credentials',
+])
+
+function isCredentialKey(key: string) {
+  const normalized = key.toLowerCase().replace(/[-_]/g, '')
+  if (CREDENTIAL_KEYS.has(normalized)) return true
+  return (
+    normalized.endsWith('token') ||
+    normalized.endsWith('key') ||
+    normalized.endsWith('secret')
+  )
+}
+
+/**
+ * Strips credential-shaped fields from a value bound for the RPC boundary,
+ * recording the path of each one dropped in `found` (names only, never
+ * values). Recurses into nested objects and arrays.
+ */
+export function scrubKnobs(
+  value: unknown,
+  path: string,
+  found: string[],
+): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry, index) =>
+      scrubKnobs(entry, `${path}[${index}]`, found),
+    )
+  }
+  if (!isRecord(value)) return value
+  const result: Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (isCredentialKey(key)) {
+      found.push(`${path}.${key}`)
+      continue
+    }
+    result[key] = scrubKnobs(entry, `${path}.${key}`, found)
+  }
+  return result
+}
+
+function scrubMenu(menu: CommandMenuModel): CommandMenuModel {
+  const found: string[] = []
+  const scrubbed = scrubKnobs(menu, 'menu', found) as CommandMenuModel
+  if (found.length > 0)
+    log.warn('credential-shaped field stripped before RPC', { fields: found })
+  return scrubbed
+}
+
+// ---------------------------------------------------------------------------
+// Accounts: the login
+// ---------------------------------------------------------------------------
+
+/** A started OAuth login, as `beginAccountLogin` returns it. */
+export interface MenuLoginFlow {
+  url: string
+  instructions: string
+  completion: Promise<IngestAccount>
+}
+
+export interface MenuLoginDeps {
+  /** Starts a browser login, or a device-code login when `headless`. */
+  begin(options: { label?: string; headless: boolean }): Promise<MenuLoginFlow>
+  /** Why no account can be added now (Claustrum mode); undefined allows it. */
+  refusal?(): Promise<string | undefined>
+  /** The main account's ChatGPT identity; a login of that account is refused. */
+  mainIdentity?(): Promise<string | undefined>
+}
+
+/** The pool row a finished login becomes. */
+export function loginAddInput(account: IngestAccount): AddInput {
   return {
     id: account.id,
-    type: account.type ?? 'oauth',
-    enabled: account.enabled,
-    label: account.label,
+    credential: {
+      type: 'oauth',
+      refresh: account.refresh,
+      ...(account.access !== undefined ? { access: account.access } : {}),
+      ...(account.expires !== undefined ? { expires: account.expires } : {}),
+    },
+    ...(account.accountId !== undefined ? { identity: account.accountId } : {}),
+    ...(account.label !== undefined ? { label: account.label } : {}),
   }
 }
 
-/** `accountKnob` for a pool row, built field by field for the same reason. */
-function poolRowKnob(row: CommandPoolRow) {
+/** The Accounts section's add action, over this plugin's OAuth login. */
+export function menuLogin(
+  deps: MenuLoginDeps,
+): NonNullable<AccountsSectionOptions['login']> {
   return {
-    id: row.id,
-    type: row.type,
-    enabled: row.enabled,
-    label: row.label,
-  }
-}
-
-async function executeAccountCommand(
-  args: string,
-  ctx: CommandContext,
-): Promise<OpenDialogPayload> {
-  const tokens = args.trim().split(/\s+/).filter(Boolean)
-  log.info('account command parsed', { args, tokens })
-  const storage = (await ctx.loadAccounts(storePaths(ctx))) ?? {
-    version: 1 as const,
-    accounts: [],
-  }
-  const accounts = storage.accounts ?? []
-
-  if (tokens[0] === 'claustrum') {
-    log.info('claustrum mode requested', {
-      hasEnterFn: typeof ctx.enterClaustrumMode === 'function',
-      accounts: accounts.length,
-    })
-    if (!ctx.enterClaustrumMode) {
-      log.warn('claustrum refused: transition fn absent from command context')
-      return {
-        command: 'openai-account',
-        text: '## Claustrum Unavailable\n\nThe custody runtime is not ready. Try again after OpenAI auth finishes initializing.',
-        knobs: {
-          accounts: accounts.map(accountKnob),
-          claustrumMode: claustrumMode(storage),
-        },
-      }
-    }
-    log.info('claustrum transition starting', {})
-    let result: Awaited<ReturnType<NonNullable<typeof ctx.enterClaustrumMode>>>
-    try {
-      result = await ctx.enterClaustrumMode()
-    } catch (error) {
-      log.error('claustrum transition threw', {
-        error: error instanceof Error ? error.message : String(error),
+    label: 'Add account',
+    knobs: [
+      { kind: 'text', id: 'label', label: 'Label (optional)' },
+      {
+        kind: 'toggle',
+        id: 'headless',
+        label: 'Sign in with a device code (no browser on this machine)',
+        value: false,
+      },
+    ],
+    run: async (values) => {
+      const refusal = await deps.refusal?.()
+      if (refusal) return { status: 'cancelled', message: refusal }
+      const label =
+        typeof values.label === 'string' && values.label.trim().length > 0
+          ? values.label.trim()
+          : undefined
+      const headless = values.headless === true
+      const flow = await deps.begin({
+        ...(label !== undefined ? { label } : {}),
+        headless,
       })
-      throw error
-    }
-    log.info('claustrum transition finished', {
-      status: result.status,
-      reason: result.reason,
-      outcomes: result.outcomes,
-    })
-    const nextStorage = (await ctx.loadAccounts(storePaths(ctx))) ?? {
-      version: 1 as const,
-      accounts: [],
-    }
-    const rows = Object.entries(result.outcomes).map(
-      ([id, outcome]) => `- \`${id}\`: ${outcome}`,
-    )
-    return {
-      command: 'openai-account',
-      text: [
-        `## Claustrum ${result.status}`,
-        '',
-        'do not run a login in another OpenCode window during this transition',
-        '',
-        ...(rows.length > 0 ? rows : ['- No enabled OAuth accounts.']),
-        ...(result.reason ? ['', `Reason: ${result.reason}`] : []),
-      ].join('\n'),
-      knobs: {
-        accounts: nextStorage.accounts.map(accountKnob),
-        claustrumMode: claustrumMode(nextStorage),
-      },
-    }
-  }
-
-  if (tokens[0] === 'local') {
-    log.info('local mode requested', {
-      hasLeaveFn: typeof ctx.leaveClaustrumMode === 'function',
-    })
-    if (!ctx.leaveClaustrumMode) {
-      log.warn('local refused: transition fn absent from command context')
-      return {
-        command: 'openai-account',
-        text: '## Local Mode Unavailable\n\nThe custody runtime is not ready. Try again after OpenAI auth finishes initializing.',
-        knobs: {
-          accounts: accounts.map(accountKnob),
-          claustrumMode: claustrumMode(storage),
-        },
-      }
-    }
-    await ctx.leaveClaustrumMode()
-    const nextStorage = (await ctx.loadAccounts(storePaths(ctx))) ?? {
-      version: 1 as const,
-      accounts: [],
-    }
-    return {
-      command: 'openai-account',
-      text: '## Local Mode\n\nClaustrum mode is now local. Run a fresh `/login openai` for each account, then remove its binding with `ck auth` before it can refresh locally.',
-      knobs: {
-        accounts: nextStorage.accounts.map(accountKnob),
-        claustrumMode: claustrumMode(nextStorage),
-      },
-    }
-  }
-
-  const poolRows = await ctx.accountPool?.rows()
-  if (ctx.accountPool && poolRows) {
-    return executePoolAccountCommand(
-      tokens,
-      ctx,
-      ctx.accountPool,
-      poolRows,
-      claustrumMode(storage),
-    )
-  }
-
-  if ((tokens[0] === 'enable' || tokens[0] === 'disable') && tokens[1]) {
-    const targetId = tokens[1]
-    const enabled = tokens[0] === 'enable'
-    let refusal: string | undefined
-    let found = false
-    const withAccountLock =
-      ctx.withFallbackAccountLock ?? (async (_accountId, action) => action())
-    const next = await withAccountLock(targetId, async () => {
-      const current = await ctx.loadAccounts(storePaths(ctx))
-      const currentAccount = current?.accounts.find(
-        (account): account is OAuthAccount =>
-          account.id === targetId && account.type === 'oauth',
-      )
-      if (!currentAccount)
-        return current ?? { version: 1 as const, accounts: [] }
-      if (enabled && claustrumMode(current) === 'claustrum') {
-        const binding = ctx.checkUsableCustodyBinding
-          ? await ctx.checkUsableCustodyBinding(currentAccount)
-          : {
-              ready: false as const,
-              reason: 'unbound-under-claustrum' as const,
-            }
-        if (!binding.ready) {
-          refusal = binding.reason
-          return current
-        }
-        return mutateAccounts((latest) => {
-          const account = latest.accounts.find(
-            (candidate): candidate is OAuthAccount =>
-              candidate.id === targetId && candidate.type === 'oauth',
+      const message = headless
+        ? `Open this verification URL:\n\n${flow.url}\n\nThen enter the code: ${flow.instructions.match(/Enter code: (.+)/)?.[1] ?? flow.instructions}\n\nThe account is added when you finish.`
+        : `Open this URL and complete sign-in:\n\n${flow.url}\n\n${flow.instructions}\n\nThe account is added when you finish.`
+      const completion = flow.completion.then(async (account) => {
+        const main = await deps.mainIdentity?.()
+        if (account.accountId && main && account.accountId === main) {
+          // The internal id only: the ChatGPT identity is sensitive.
+          log.warn('account add rejected (main identity)', { id: account.id })
+          throw new Error(
+            'that account is already your main account, so it was not added again',
           )
-          if (!account) return latest
-          found = true
-          account.accountId = binding.accountId
-          account.enabled = true
-          return latest
-        }, storePaths(ctx))
-      }
-      return mutateAccounts((latest) => {
-        const account = latest.accounts.find(
-          (candidate) => candidate.id === targetId,
-        )
-        if (!account) return latest
-        found = true
-        account.enabled = enabled
-        return latest
-      }, storePaths(ctx))
-    })
-    const resolvedNext = next ?? { version: 1 as const, accounts: [] }
-    if (refusal) {
-      return {
-        command: 'openai-account',
-        text: `## Cannot Enable Account\n\n\`${targetId}\` remains disabled: ${refusal}. Resolve the custody binding, then try again.`,
-        knobs: {
-          accounts: resolvedNext.accounts.map(accountKnob),
-          claustrumMode: claustrumMode(resolvedNext),
-        },
-      }
-    }
-    if (!found) {
-      return {
-        command: 'openai-account',
-        text: `## Account Not Found\n\nNo account with id \`${targetId}\` exists.`,
-        knobs: {
-          accounts: resolvedNext.accounts.map(accountKnob),
-          claustrumMode: claustrumMode(resolvedNext),
-        },
-      }
-    }
-    return {
-      command: 'openai-account',
-      text: `## Account ${enabled ? 'Enabled' : 'Disabled'}\n\n\`${targetId}\` is ${enabled ? 'enabled' : 'disabled'}.`,
-      knobs: {
-        accounts: resolvedNext.accounts.map(accountKnob),
-        claustrumMode: claustrumMode(resolvedNext),
-      },
-    }
-  }
-
-  if (tokens.length === 0 || (tokens.length === 1 && tokens[0] === 'list')) {
-    // Show status
-    const lines = ['## OpenAI Accounts', '']
-    if (accounts.length === 0) {
-      lines.push(
-        'No accounts configured. Use `/login openai` to add your main account, or `/openai-account add` to add a fallback account.',
-      )
-    } else {
-      const mode: RoutingMode = storage.routing?.mode ?? 'main-first'
-      lines.push(
-        `Routing: \`${mode}\` (set with \`/openai-routing\`). Modes: main-first, fallback-first, or sticky-balanced. \`/openai-routing reset\` clears this session's pin.`,
-      )
-      lines.push('')
-      for (const a of accounts) {
-        const type = (a as { type?: string }).type ?? 'oauth'
-        lines.push(`- \`${a.id}\` (${type})`)
-      }
-    }
-    lines.push('')
-    lines.push(
-      `Claustrum mode: \`${claustrumMode(storage)}\`\n\nCommands: \`/openai-account claustrum\` | \`/openai-account local\` | \`/openai-account add [label]\` | \`/openai-account enable <id>\` | \`/openai-account disable <id>\` | \`/openai-account remove <id>\``,
-    )
-    return {
-      command: 'openai-account',
-      text: lines.join('\n'),
-      knobs: {
-        accounts: accounts.map(accountKnob),
-        claustrumMode: claustrumMode(storage),
-      },
-    }
-  }
-
-  if (tokens[0] === 'remove' && tokens[1]) {
-    const targetId = tokens[1]
-    // Structural edit: route through mutateAccounts so the deletion is written
-    // authoritatively. saveAccounts union-merges latest ∪ incoming by id, which
-    // would resurrect the removed account from the on-disk `latest` set.
-    //
-    // `allowDrop` is unconditional for the target id. For a healthy entry it
-    // is a no-op (the mutator splices, preservation already wouldn't fire for
-    // a loaded id). For a load-dropped entry the mutator's splice no-ops,
-    // but preservation would resurrect the raw entry — allowDrop suppresses
-    // it. Behaviour (disk state) is therefore race-free inside the lock.
-    //
-    // The user-facing message comes from two signals OR'd together:
-    //   - the mutator's splice (authoritative for healthy ids)
-    //   - a pre-read of the raw roster that the mutator's current.accounts
-    //     cannot see (load-dropped ids, which normalize rejected).
-    // The pre-read is purely diagnostic — its staleness can only change the
-    // message when another writer races us between read and lock, and the
-    // mutator signal covers exactly that case. It is NOT load-bearing for
-    // disk behaviour; that is `allowDrop`'s job now.
-    const rawRoster = await readConfigRosterIds(ctx.accountStoragePath)
-    const preReadSawIt = rawRoster ? rawRoster.has(targetId) : false
-
-    let mutatorSplicedIt = false
-    const next = await mutateAccounts(
-      (current) => {
-        const idx = current.accounts.findIndex((a) => a.id === targetId)
-        if (idx === -1) return current
-        current.accounts.splice(idx, 1)
-        mutatorSplicedIt = true
-        return current
-      },
-      storePaths(ctx),
-      { allowDrop: [targetId] },
-    )
-
-    const removed = mutatorSplicedIt || preReadSawIt
-
-    if (!removed) {
-      return {
-        command: 'openai-account',
-        text: `## Account Not Found\n\nNo account with id \`${targetId}\` exists.`,
-        knobs: { accounts: next.accounts.map(accountKnob) },
-      }
-    }
-
-    log.info('account removed', { id: targetId })
-    void ctx.refreshSidebar?.().catch(() => {})
-
-    return {
-      command: 'openai-account',
-      text: `## Account Removed\n\nRemoved account \`${targetId}\`.`,
-      knobs: { accounts: next.accounts.map(accountKnob) },
-    }
-  }
-
-  if (tokens[0] === 'order' && tokens.length >= 3) {
-    // Reorder: swap positions of two accounts. Structural edit — route through
-    // mutateAccounts. saveAccounts seeds its union map latest-first, so a
-    // reordered `incoming` array would be ignored and the swap silently lost.
-    let ok = false
-    const next = await mutateAccounts((current) => {
-      const a = current.accounts.findIndex((ac) => ac.id === tokens[1])
-      const b = current.accounts.findIndex((ac) => ac.id === tokens[2])
-      if (a === -1 || b === -1) return current
-      ok = true
-      // biome-ignore lint/style/noNonNullAssertion: a,b validated in-bounds by findIndex above
-      const tmp = current.accounts[a]!
-      // biome-ignore lint/style/noNonNullAssertion: a,b validated in-bounds by findIndex above
-      current.accounts[a] = current.accounts[b]!
-      current.accounts[b] = tmp
-      return current
-    }, storePaths(ctx))
-
-    if (!ok) {
-      return {
-        command: 'openai-account',
-        text: '## Invalid Order\n\nBoth account IDs must exist.',
-        knobs: { accounts: next.accounts.map(accountKnob) },
-      }
-    }
-    log.info('accounts reordered', { a: tokens[1], b: tokens[2] })
-    void ctx.refreshSidebar?.().catch(() => {})
-    return {
-      command: 'openai-account',
-      text: `## Accounts Reordered\n\nSwapped positions of \`${tokens[1]}\` and \`${tokens[2]}\`.`,
-      knobs: { accounts: next.accounts.map(accountKnob) },
-    }
-  }
-
-  if (tokens[0] === 'add') {
-    if (storage.claustrum?.mode === 'claustrum') {
-      return {
-        command: 'openai-account',
-        text: '## Add Failed\n\nThat account cannot be added while Claustrum mode is active. Run `/openai-account local` first.',
-        knobs: {},
-      }
-    }
-    const headless = tokens.includes('--headless')
-    const labelTokens = tokens.filter((t) => t !== 'add' && t !== '--headless')
-    const label = labelTokens.length > 0 ? labelTokens.join(' ') : undefined
-    const { url, instructions, completion } = await (
-      ctx.beginAccountLogin ?? beginAccountLogin
-    )({
-      label,
-      headless,
-      version: ctx.packageVersion,
-    })
-    const notify = ctx.notify
-    const sessionId = ctx.sessionId
-
-    // Detach completion: the dialog must show the URL before the 30-60s OAuth
-    // flow completes. command.execute.before calls cleanAbort right after the
-    // dialog is returned, so awaiting inline would deadlock — the URL would
-    // never reach the user.
-    completion
-      .then(async (account) => {
-        let rejection: 'claustrum mode' | 'main identity' | undefined
-        const withAccountLock =
-          ctx.withFallbackAccountLock ??
-          (async (_accountId, action) => action())
-        await withAccountLock(account.id, async () => {
-          const currentStorage = await ctx.loadAccounts(storePaths(ctx))
-          if (claustrumMode(currentStorage ?? {}) === 'claustrum') {
-            rejection = 'claustrum mode'
-            return
-          }
-          await mutateAccounts((current) => {
-            if (
-              account.accountId &&
-              current.mainAccountId &&
-              account.accountId === current.mainAccountId
-            ) {
-              rejection = 'main identity'
-              return current
-            }
-            upsertAccount(current.accounts, account as OAuthAccount)
-            return current
-          }, storePaths(ctx))
-        })
-
-        if (rejection) {
-          const msg =
-            rejection === 'claustrum mode'
-              ? 'That account cannot be added while Claustrum mode is active. Run `/openai-account local` first.'
-              : 'That account is already your main account — not added as a fallback.'
-          // Log the internal account id, never the ChatGPT stable id (a sensitive
-          // identity from the OAuth claims).
-          log.warn(`account add rejected (${rejection})`, {
-            id: account.id,
-            sessionId,
-          })
-          notify?.({
-            command: 'openai-account',
-            text: `## Add Failed\n\n${msg}`,
-            knobs: {},
-          })
-          return
         }
-
-        log.info('account added', {
-          id: account.id,
-          label: account.label,
-        })
-        ctx.refreshSidebar?.().catch(() => {})
-
-        notify?.({
-          command: 'openai-account',
-          text: `## Account Added\n\nAdded account \`${account.id}\`${account.label ? ` ("${account.label}")` : ''}.\n\nRun \`/openai-account\` to confirm.`,
-          knobs: {},
-        })
+        log.info('account added', { id: account.id })
+        return loginAddInput(account)
       })
-      .catch((err: unknown) => {
-        const message =
-          err instanceof Error ? err.message : String(err ?? 'unknown error')
-        log.warn('account add failed', { error: message, sessionId })
-        notify?.({
-          command: 'openai-account',
-          text: `## Add Failed\n\nAccount add failed: ${message}`,
-          knobs: {},
-        })
-      })
-
-    if (headless) {
-      const userCode =
-        instructions.match(/Enter code: (.+)/)?.[1] ?? instructions
-      return {
-        command: 'openai-account',
-        text: `## Device Code\n\n1. Open this verification URL:\n\n${url}\n\n2. Enter the code: **${userCode}**\n\n${instructions}\n\nThe account will be added automatically — run \`/openai-account\` to confirm.`,
-        knobs: { verificationUrl: url, userCode, instructions },
-      }
-    }
-
-    return {
-      command: 'openai-account',
-      text: `## Add OpenAI Account\n\nOpen this URL and complete sign-in:\n\n${url}\n\n${instructions}\n\nThe account will be added automatically — run \`/openai-account\` to confirm.`,
-      knobs: { url, instructions },
-    }
-  }
-
-  return {
-    command: 'openai-account',
-    text: '## Account Commands\n\n- `/openai-account claustrum` — enter Claustrum mode\n- `/openai-account local` — leave Claustrum mode\n- `/openai-account add [label]` — add a new account\n- `/openai-account enable <id>` — enable a fallback\n- `/openai-account disable <id>` — disable a fallback\n- `/openai-account remove <id>` — remove\n- `/openai-account order <a> <b>` — swap fallback positions\n\nRouting modes are `main-first`, `fallback-first`, and `sticky-balanced`. `/openai-routing reset` clears the current session pin.',
-    knobs: {
-      accounts: accounts.map(accountKnob),
-      claustrumMode: claustrumMode(storage),
+      return { status: 'pending', message, completion }
     },
   }
 }
 
-/**
- * `/openai-account` on a migrated install. Every account is a pool row: the
- * one OpenCode signs in with is row `main` and is listed as the main account,
- * the others follow in roster order. Adding writes a row, disabling goes
- * through the store, and row `main` cannot be removed.
- */
-async function executePoolAccountCommand(
-  tokens: readonly string[],
-  ctx: CommandContext,
-  pool: CommandAccountPool,
-  rows: readonly CommandPoolRow[],
-  mode: ReturnType<typeof claustrumMode>,
-): Promise<OpenDialogPayload> {
-  const payload = async (
-    text: string,
-    current?: readonly CommandPoolRow[],
-  ): Promise<OpenDialogPayload> => {
-    const listed = current ?? (await pool.rows()) ?? []
-    return {
-      command: 'openai-account',
-      text,
-      knobs: { accounts: listed.map(poolRowKnob), claustrumMode: mode },
-    }
-  }
-  const notFound = (id: string) =>
-    payload(`## Account Not Found\n\nNo account with id \`${id}\` exists.`)
+// ---------------------------------------------------------------------------
+// Provider extras
+// ---------------------------------------------------------------------------
 
-  if ((tokens[0] === 'enable' || tokens[0] === 'disable') && tokens[1]) {
-    const targetId = tokens[1]
-    const enabled = tokens[0] === 'enable'
-    const outcome = enabled
-      ? await pool.enable(targetId)
-      : await pool.disable(targetId)
-    if (outcome.status === 'not-found') return notFound(targetId)
-    if (outcome.status === 'refused') {
-      return payload(
-        `## Cannot ${enabled ? 'Enable' : 'Disable'} Account\n\n${outcome.message}`,
-      )
-    }
-    void ctx.refreshSidebar?.().catch(() => {})
-    return payload(
-      `## Account ${enabled ? 'Enabled' : 'Disabled'}\n\n\`${targetId}\` is ${enabled ? 'enabled' : 'disabled'}.`,
-    )
-  }
-
-  if (tokens.length === 0 || (tokens.length === 1 && tokens[0] === 'list')) {
-    const lines = ['## OpenAI Accounts', '']
-    if (rows.length === 0) {
-      lines.push(
-        'No accounts configured. Use `/login openai` to add your main account, or `/openai-account add` to add another account.',
-      )
-    } else {
-      const storage = await ctx.loadAccounts(storePaths(ctx))
-      const routing: RoutingMode = storage?.routing?.mode ?? 'main-first'
-      lines.push(
-        `Routing: \`${routing}\` (set with \`/openai-routing\`). Modes: main-first, fallback-first, or sticky-balanced. \`/openai-routing reset\` clears this session's pin.`,
-      )
-      lines.push('')
-      for (const row of rows) {
-        const notes = [
-          row.type,
-          ...(row.id === 'main' ? ['main account'] : []),
-          ...(row.enabled ? [] : ['disabled']),
-        ]
-        lines.push(`- \`${row.id}\` (${notes.join(', ')})`)
-      }
-    }
-    lines.push('')
-    lines.push(
-      `Claustrum mode: \`${mode}\`\n\nCommands: \`/openai-account add [label]\` | \`/openai-account enable <id>\` | \`/openai-account disable <id>\` | \`/openai-account remove <id>\` | \`/openai-account order <a> <b>\``,
-    )
-    return payload(lines.join('\n'), rows)
-  }
-
-  if (tokens[0] === 'remove' && tokens[1]) {
-    const targetId = tokens[1]
-    const outcome = await pool.remove(targetId)
-    if (outcome.status === 'refused') {
-      return payload(`## Cannot Remove Account\n\n${outcome.message}`)
-    }
-    if (outcome.status === 'not-found') return notFound(targetId)
-    log.info('account removed', { id: targetId })
-    void ctx.refreshSidebar?.().catch(() => {})
-    return payload(`## Account Removed\n\nRemoved account \`${targetId}\`.`)
-  }
-
-  if (tokens[0] === 'order' && tokens.length >= 3) {
-    const first = tokens[1] ?? ''
-    const second = tokens[2] ?? ''
-    if (!(await pool.reorder(first, second))) {
-      return payload('## Invalid Order\n\nBoth account IDs must exist.')
-    }
-    log.info('accounts reordered', { a: first, b: second })
-    void ctx.refreshSidebar?.().catch(() => {})
-    return payload(
-      `## Accounts Reordered\n\nSwapped positions of \`${first}\` and \`${second}\`.`,
-    )
-  }
-
-  if (tokens[0] === 'add') {
-    if (mode === 'claustrum') {
-      return {
-        command: 'openai-account',
-        text: '## Add Failed\n\nThat account cannot be added while Claustrum mode is active. Run `/openai-account local` first.',
-        knobs: {},
-      }
-    }
-    const headless = tokens.includes('--headless')
-    const labelTokens = tokens.filter((t) => t !== 'add' && t !== '--headless')
-    const label = labelTokens.length > 0 ? labelTokens.join(' ') : undefined
-    const { url, instructions, completion } = await (
-      ctx.beginAccountLogin ?? beginAccountLogin
-    )({
-      label,
-      headless,
-      version: ctx.packageVersion,
-    })
-    const notify = ctx.notify
-    const sessionId = ctx.sessionId
-    // Detached for the same reason as the legacy add: the dialog has to show
-    // the URL before the sign-in completes.
-    completion
-      .then(async (account) => {
-        const added = await pool.add(account as OAuthAccount)
-        if (added.status === 'main-identity') {
-          log.warn('account add rejected (main identity)', {
-            id: account.id,
-            sessionId,
-          })
-          notify?.({
-            command: 'openai-account',
-            text: '## Add Failed\n\nThat account is already your main account — not added again.',
-            knobs: {},
-          })
-          return
-        }
-        log.info('account added', { id: added.id, outcome: added.status })
-        ctx.refreshSidebar?.().catch(() => {})
-        const text =
-          added.status === 'replaced'
-            ? `## Account Updated\n\nAccount \`${added.id}\` already held this login's account; its sign-in was replaced.`
-            : added.status === 'added-disabled'
-              ? `## Account Added (Disabled)\n\nAdded account \`${added.id}\`, but another enabled account is the same ChatGPT account, so it was added disabled.`
-              : `## Account Added\n\nAdded account \`${added.id}\`${account.label ? ` ("${account.label}")` : ''}.\n\nRun \`/openai-account\` to confirm.`
-        notify?.({ command: 'openai-account', text, knobs: {} })
-      })
-      .catch((err: unknown) => {
-        const message =
-          err instanceof Error ? err.message : String(err ?? 'unknown error')
-        log.warn('account add failed', { error: message, sessionId })
-        notify?.({
-          command: 'openai-account',
-          text: `## Add Failed\n\nAccount add failed: ${message}`,
-          knobs: {},
-        })
-      })
-
-    if (headless) {
-      const userCode =
-        instructions.match(/Enter code: (.+)/)?.[1] ?? instructions
-      return {
-        command: 'openai-account',
-        text: `## Device Code\n\n1. Open this verification URL:\n\n${url}\n\n2. Enter the code: **${userCode}**\n\n${instructions}\n\nThe account will be added automatically — run \`/openai-account\` to confirm.`,
-        knobs: { verificationUrl: url, userCode, instructions },
-      }
-    }
-    return {
-      command: 'openai-account',
-      text: `## Add OpenAI Account\n\nOpen this URL and complete sign-in:\n\n${url}\n\n${instructions}\n\nThe account will be added automatically — run \`/openai-account\` to confirm.`,
-      knobs: { url, instructions },
-    }
-  }
-
-  return payload(
-    "## Account Commands\n\n- `/openai-account add [label]` — add a new account\n- `/openai-account enable <id>` — enable an account\n- `/openai-account disable <id>` — disable an account\n- `/openai-account remove <id>` — remove an account (not `main`)\n- `/openai-account order <a> <b>` — swap two accounts' positions\n\nRouting modes are `main-first`, `fallback-first`, and `sticky-balanced`. `/openai-routing reset` clears the current session pin.",
-    rows,
-  )
+export interface SessionSectionDeps {
+  /** The session's sticky pin, when sticky-balanced routing has one. */
+  getPin?(sessionId: string): Promise<string | undefined>
+  /** Clears the session's pin only; the account rows are not touched. */
+  clearPin?(sessionId: string): Promise<unknown>
 }
 
-async function executeRoutingCommand(
-  args: string,
-  ctx: CommandContext,
-): Promise<OpenDialogPayload> {
-  const tokens = args.trim().toLowerCase().split(/\s+/).filter(Boolean)
-  const storage = (await ctx.loadAccounts(storePaths(ctx))) ?? {
-    version: 1 as const,
-    accounts: [],
-  }
-  const currentMode: RoutingMode = storage.routing?.mode ?? 'main-first'
-
-  if (tokens.length === 1 && tokens[0] === 'reset') {
-    if (!ctx.sessionId) {
-      return {
-        command: 'openai-routing',
-        text: '## OpenAI Routing Reset\n\nNo current session is available, so no pin was changed.',
-        knobs: { mode: currentMode },
-      }
-    }
-    if (!ctx.clearStickyRouting) {
-      return {
-        command: 'openai-routing',
-        text: '## OpenAI Routing Reset\n\nThis runtime cannot clear the current session pin.',
-        knobs: { mode: currentMode },
-      }
-    }
-    await ctx.clearStickyRouting(ctx.sessionId)
-    log.info('routing session pin cleared')
-    return {
-      command: 'openai-routing',
-      text: "## OpenAI Routing Reset\n\nThis session's pin was cleared. The next request may choose the same account if it remains the best selection.",
-      knobs: { mode: currentMode },
-    }
-  }
-
-  if (
-    tokens.length === 1 &&
-    (tokens[0] === 'main-first' ||
-      tokens[0] === 'fallback-first' ||
-      tokens[0] === 'sticky-balanced')
-  ) {
-    const mode = tokens[0] as RoutingMode
-    // Scalar-field write MUST go through mutateAccounts (read-fresh under lock,
-    // authoritative rewrite). A stale saveAccounts here would union its stale
-    // account list back over disk and resurrect a concurrently-removed account
-    // — re-writing that account's secrets into the state file (credential leak).
-    await mutateAccounts((current) => {
-      current.routing = { ...(current.routing ?? {}), mode }
-      return current
-    }, storePaths(ctx))
-    log.info('routing mode changed', { mode })
-    return {
-      command: 'openai-routing',
-      text: `## OpenAI Routing Updated\n\nMode: \`${mode}\`\n- ${routingDescription(mode)}\n\nUsage: \`/openai-routing\`, \`/openai-routing main-first\`, \`/openai-routing fallback-first\`, or \`/openai-routing sticky-balanced\`.`,
-      knobs: { mode },
-    }
-  }
-
-  const stickyPin =
-    currentMode === 'sticky-balanced' && ctx.sessionId
-      ? await ctx.getStickyRouting?.(ctx.sessionId)
-      : undefined
-  const stickyPinDescription =
-    currentMode === 'sticky-balanced'
-      ? stickyPin
-        ? `\n- Session pin: \`${stickyPin}\`. Use \`/openai-routing reset\` to clear it.`
-        : '\n- Session pin: none yet. A request will choose one when a usable account is available.'
-      : ''
-
+/** This session's sticky routing pin, and clearing it. */
+export function sessionSection(deps: SessionSectionDeps): PluginExtraSection {
   return {
-    command: 'openai-routing',
-    text: `## OpenAI Routing\n\n- Mode: \`${currentMode}\`\n- ${routingDescription(currentMode)}${stickyPinDescription}\n\nUsage: \`/openai-routing\`, \`/openai-routing main-first\`, \`/openai-routing fallback-first\`, or \`/openai-routing sticky-balanced\`.`,
-    knobs: { mode: currentMode },
+    id: 'session',
+    title: 'This session',
+    build: async (invocation) => {
+      const sessionId = invocation.sessionId
+      if (!sessionId) return { lines: ['No current session.'] }
+      const pin = await deps.getPin?.(sessionId)
+      return {
+        lines: [
+          pin
+            ? `Sticky routing pins this session to ${pin}.`
+            : 'This session has no sticky routing pin.',
+        ],
+        actions: deps.clearPin
+          ? [
+              {
+                id: 'clear-pin',
+                label: "Clear this session's pin",
+                description:
+                  'The next request may still choose the same account.',
+                run: async ({ invocation: current }) => {
+                  if (!current.sessionId) return 'No current session.'
+                  await deps.clearPin?.(current.sessionId)
+                  log.info('routing session pin cleared')
+                  return "This session's pin was cleared. The next request may choose the same account if it remains the best selection."
+                },
+              },
+            ]
+          : [],
+      }
+    },
+  }
+}
+
+export interface ClaustrumSectionDeps {
+  mode(): Promise<ClaustrumMode>
+  enter?(): Promise<{
+    status: 'completed' | 'incomplete' | 'aborted'
+    outcomes: Record<string, string>
+    reason?: string
+  }>
+  leave?(): Promise<void>
+}
+
+/** Claustrum mode: accounts served from the vault, and back to local. */
+export function claustrumSection(
+  deps: ClaustrumSectionDeps,
+): PluginExtraSection {
+  return {
+    id: 'claustrum',
+    title: 'Claustrum',
+    build: async () => {
+      const mode = await deps.mode()
+      const unavailable =
+        'The custody runtime is not ready. Try again after OpenAI auth finishes initializing.'
+      return {
+        lines: [`Mode: ${mode}.`],
+        actions:
+          mode === 'local'
+            ? [
+                {
+                  id: 'enter',
+                  label: 'Enter Claustrum mode',
+                  description:
+                    'Do not run a login in another OpenCode window during the transition.',
+                  run: async () => {
+                    if (!deps.enter) return { ok: false, text: unavailable }
+                    const result = await deps.enter()
+                    log.info('claustrum transition finished', {
+                      status: result.status,
+                      reason: result.reason,
+                      outcomes: result.outcomes,
+                    })
+                    const rows = Object.entries(result.outcomes).map(
+                      ([id, outcome]) => `${id}: ${outcome}`,
+                    )
+                    return {
+                      ok: result.status === 'completed',
+                      text: [
+                        `Claustrum ${result.status}.`,
+                        ...(rows.length > 0
+                          ? rows
+                          : ['No enabled OAuth accounts.']),
+                        ...(result.reason ? [`Reason: ${result.reason}`] : []),
+                      ].join('\n'),
+                    }
+                  },
+                },
+              ]
+            : [
+                {
+                  id: 'leave',
+                  label: 'Return to local mode',
+                  run: async () => {
+                    if (!deps.leave) return { ok: false, text: unavailable }
+                    await deps.leave()
+                    return 'Claustrum mode is now local. Run a fresh `/login openai` for each account, then remove its binding with `ck auth` before it can refresh locally.'
+                  },
+                },
+              ],
+      }
+    },
+  }
+}
+
+export interface ResetCreditsDeps {
+  configPath: string
+  statePath: string
+  quotaManager: Pick<QuotaManager, 'isRateLimited' | 'getMain' | 'getFallback'>
+  loadAccounts: typeof defaultLoadAccounts
+  /** The writer of the reset state: `settingsMutateAccounts` on a migrated install. */
+  mutateAccounts: typeof defaultMutateAccounts
+  resolveResetTarget(accountKey: string): Promise<ResetTargetIdentity>
+  refreshResetTargetQuota(accountKey: string): Promise<RefreshAllQuotaResult>
+  fetchImpl: typeof fetch
+  now: () => number
+  randomUUID: () => string
+  /** The accounts a credit can be spent on, `main` first. */
+  accountKeys(): Promise<string[]>
+}
+
+/**
+ * Spends one reset credit on `accountKey`. A first attempt fetches a fresh
+ * preview and binds the redemption to the ChatGPT account it names; a retry,
+ * or any attempt while a redemption is saved as in flight, goes to the
+ * account's current identity and replays the saved identifiers.
+ */
+async function spendResetCredit(
+  deps: ResetCreditsDeps,
+  accountKey: string,
+  retry: boolean,
+): Promise<ResetStepResult> {
+  if (!isSafeResetAccountKey(accountKey))
+    return resetResultPayload(
+      accountKey,
+      'invalid_account_key',
+      'That account cannot take a reset credit.',
+    )
+  let expected: string | undefined
+  try {
+    // A redemption saved as in flight (its credit and request ids, under the
+    // `reset` key) is what keeps an unknown outcome from becoming a second
+    // spend: the coordinator replays exactly those ids (the server dedupes on
+    // the request id) or, once the pair is older than its five-minute window
+    // and the attempt is a new spend, refuses. So with one saved, or for a
+    // retry, nothing is previewed: the request goes to the account's current identity and
+    // the coordinator decides from the saved state, even after a restart.
+    const saved = (
+      await deps.loadAccounts({
+        configPath: deps.configPath,
+        statePath: deps.statePath,
+      })
+    )?.reset?.[accountKey]
+    if (retry || (saved && Object.hasOwn(saved, 'inFlight'))) {
+      expected = (await deps.resolveResetTarget(accountKey)).chatgptAccountId
+    } else {
+      const preview = await buildResetPreviewRow(accountKey, deps)
+      if (!preview.eligible)
+        return resetResultPayload(
+          accountKey,
+          'not_eligible',
+          renderResetConfirm(preview),
+        )
+      expected = preview.chatgptAccountId
+    }
+    if (!expected)
+      return resetResultPayload(
+        accountKey,
+        'not_eligible',
+        'Cannot reset: stable ChatGPT account identity unavailable.',
+      )
+    log.info('reset redemption decision', { accountKey, retry })
+    const result = await runResetCreditRedemption(
+      {
+        configPath: deps.configPath,
+        statePath: deps.statePath,
+        mutateAccountsFn: deps.mutateAccounts,
+        loadAccountsFn: deps.loadAccounts,
+        now: deps.now,
+        randomUUID: deps.randomUUID,
+        fetchImpl: deps.fetchImpl,
+        resolveTarget: deps.resolveResetTarget,
+        fetchUsage: (target) =>
+          whamUsageFn({
+            accessToken: target.accessToken,
+            fetchImpl: deps.fetchImpl,
+            now: deps.now,
+            accountId: target.chatgptAccountId,
+          }),
+        hasActiveRateLimitMark: (key) => deps.quotaManager.isRateLimited(key),
+      },
+      { accountKey, expectedChatgptAccountId: expected, retry },
+    )
+    log.info('reset redemption outcome', {
+      accountKey,
+      code: result.outcome.kind,
+    })
+    return renderResetCoordinatorResult(result, deps, expected)
+  } catch (error) {
+    const outcome = resetErrorPayload(accountKey, error, expected)
+    log.info('reset redemption outcome', { accountKey, code: outcome.code })
+    return outcome
+  }
+}
+
+/** Reset credits: preview an account, spend a credit, retry a redemption. */
+export function resetCreditsSection(
+  deps: ResetCreditsDeps,
+): PluginExtraSection {
+  return {
+    id: 'reset',
+    title: 'Reset credits',
+    build: async () => ({
+      lines: [
+        "A reset credit restores an exhausted account's quota. Preview fetches the account's current quota and credits.",
+      ],
+      items: (await deps.accountKeys()).map((accountKey) => ({
+        id: accountKey,
+        label: accountKey === MAIN_ROW_ID ? 'Main account' : accountKey,
+        actions: [
+          {
+            id: 'preview',
+            label: 'Preview',
+            run: async () => {
+              const row = await buildResetPreviewRow(accountKey, deps)
+              return {
+                ok: row.eligible,
+                text: `${resetRowDetail(row)}\n\n${renderResetConfirm(row)}`,
+              }
+            },
+          },
+          {
+            id: 'spend',
+            label: 'Spend a reset credit',
+            irreversible: true,
+            confirm:
+              'Spend one reset credit on this account? Its eligibility is checked again first, and nothing is spent when it is not eligible.',
+            run: async () => {
+              const { ok, text } = await spendResetCredit(
+                deps,
+                accountKey,
+                false,
+              )
+              return { ok, text }
+            },
+          },
+          {
+            id: 'retry',
+            label: 'Retry the last redemption',
+            irreversible: true,
+            confirm:
+              'Retry the last redemption? A retry within five minutes reuses the same request and credit identifiers.',
+            run: async () => {
+              const { ok, text } = await spendResetCredit(
+                deps,
+                accountKey,
+                true,
+              )
+              return { ok, text }
+            },
+          },
+        ],
+      })),
+    }),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The menu
+// ---------------------------------------------------------------------------
+
+export interface OpenAiMenuOptions {
+  store: PoolStore
+  /**
+   * The legacy locks the menu's writes that name no single row take (the
+   * roster order, settings, a new account).
+   */
+  extraLocks?: readonly PoolLockSpec[]
+  /** The legacy locks a write of one row takes; see `AccountRules`. */
+  rowLocks?: AccountRules['rowLocks']
+  /** Wraps enabling a row (OpenCode's Claustrum binding check). */
+  enableRow?: AccountRules['enableRow']
+  /** Whether the install is migrated; absent means it always is (Pi). */
+  migration?(): Promise<MenuMigrationState>
+  login?: MenuLoginDeps
+  /** Passed to every removal: refuses row `main` and a pending transfer's row. */
+  protect?: RemoveOptions['protect']
+  describeIdentity?: AccountsSectionOptions['describeIdentity']
+  /** The plugin's "check quota now"; without it the store pulls each row. */
+  quotaCheck?(
+    ids: readonly string[],
+    invocation: CommandInvocation,
+  ): Promise<void>
+  cache?: PluginSection
+  diagnostics?: PluginSection
+  extras?: readonly PluginExtraSection[]
+  /** Runs after every successful apply (the host re-reads its rows). */
+  afterApply?(): unknown
+  logger?: SeamLogger
+  now?: () => number
+}
+
+/** The routing modes this plugin routes besides `ordered` and sticky-balanced. */
+export const ORDERED_VARIANTS = [
+  { value: 'main-first', label: 'Main first' },
+  { value: 'fallback-first', label: 'Fallback first' },
+]
+
+/** The quota windows a killswitch floor can be set for. */
+export const FLOOR_LABELS = ['primary', 'secondary'] as const
+
+/**
+ * The `/openai` menu. On a migrated install it is the shared menu over the
+ * pool store (wrapped by `withSettingsMigration`); otherwise `open` returns
+ * the notice and `apply` changes nothing.
+ */
+export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
+  const menu = createCommandMenu({
+    command: OPENAI_COMMAND_NAME,
+    title: OPENAI_MENU_TITLE,
+    store: withSettingsMigration(
+      withAccountRules(options.store, {
+        ...(options.rowLocks ? { rowLocks: options.rowLocks } : {}),
+        ...(options.enableRow ? { enableRow: options.enableRow } : {}),
+      }),
+    ),
+    ...(options.extraLocks ? { extraLocks: options.extraLocks } : {}),
+    accounts: {
+      ...(options.login ? { login: menuLogin(options.login) } : {}),
+      ...(options.protect ? { protect: options.protect } : {}),
+      ...(options.describeIdentity
+        ? { describeIdentity: options.describeIdentity }
+        : {}),
+    },
+    quota: options.quotaCheck ? { check: options.quotaCheck } : {},
+    routing: { orderedVariants: ORDERED_VARIANTS, formerMainId: MAIN_ROW_ID },
+    limits: { labels: FLOOR_LABELS },
+    ...(options.cache ? { cache: options.cache } : {}),
+    ...(options.diagnostics ? { diagnostics: options.diagnostics } : {}),
+    ...(options.extras ? { extras: options.extras } : {}),
+    ...(options.logger ? { logger: options.logger } : {}),
+    ...(options.now ? { now: options.now } : {}),
+  })
+  // A copy of the caller's context taken before the first await, as the
+  // shared menu does: work left running reports through this copy even if
+  // the host rebinds its context object for another session meanwhile.
+  const own = (invocation: CommandInvocation): CommandInvocation => {
+    const { sessionId } = invocation
+    const notify = invocation.notify.bind(invocation)
+    return { ...(sessionId !== undefined ? { sessionId } : {}), notify }
+  }
+  return {
+    command: OPENAI_COMMAND_NAME,
+    async open(invocation): Promise<CommandDialogPayload> {
+      const context = own(invocation)
+      const state = await options.migration?.()
+      if (state && !state.migrated)
+        return {
+          command: OPENAI_COMMAND_NAME,
+          menu: migrationNoticeMenu(state.blockers),
+        }
+      return menu.open(context)
+    },
+    async apply(
+      request: CommandApplyRequest,
+      invocation: CommandInvocation,
+    ): Promise<CommandApplyResult> {
+      const context = own(invocation)
+      const state = await options.migration?.()
+      if (state && !state.migrated)
+        return {
+          command: OPENAI_COMMAND_NAME,
+          ok: false,
+          text: 'Nothing was changed: the accounts have not moved to the new layout yet.',
+          menu: migrationNoticeMenu(state.blockers),
+        }
+      const result = await menu.apply(request, context)
+      if (result.ok) await options.afterApply?.()
+      return result
+    },
   }
 }
 
@@ -1125,17 +1033,7 @@ type ResetPreviewRow = {
   selectedCreditExpiresAt?: string
 }
 
-type ResetCommandContext = CommandContext &
-  Required<
-    Pick<
-      CommandContext,
-      | 'resolveResetTarget'
-      | 'fetchImpl'
-      | 'now'
-      | 'randomUUID'
-      | 'refreshResetTargetQuota'
-    >
-  >
+type ResetCommandContext = ResetCreditsDeps
 
 function resetUsedPercent(snapshot: {
   primary?: { usedPercent: number }
@@ -1183,15 +1081,6 @@ function resetSnapshotIsHealthy(
   )
   if (windows.length === 0) return false
   return windows.every((window) => !resetWindowIsExhausted(window, now))
-}
-
-function decodeResetArg(value: string | undefined): string | undefined {
-  if (!value) return undefined
-  try {
-    return decodeURIComponent(value)
-  } catch {
-    return undefined
-  }
 }
 
 async function buildResetPreviewRow(
@@ -1261,32 +1150,20 @@ async function buildResetPreviewRow(
   }
 }
 
-function renderResetAccountList(rows: readonly ResetPreviewRow[]): string {
-  const lines = [
-    '## Reset credits',
-    '',
-    'Select an account to fetch a fresh confirmation preview:',
-    '',
-  ]
-  for (const row of rows) {
-    const usage =
-      row.usedPercent === undefined
-        ? 'quota unavailable'
-        : `${row.usedPercent}% used`
-    const credits =
-      row.availableCount === undefined
-        ? 'credits unavailable'
-        : `${row.applicableAvailableCount === undefined ? '?' : row.applicableAvailableCount}/${row.availableCount} applicable/available`
-    const status = row.eligible
-      ? `eligible · credit ${row.selectedCreditId} expires ${row.selectedCreditExpiresAt}`
-      : row.reason
-    lines.push(
-      `- **${row.label}** (\`${row.accountKey}\`) — ${usage}; ${credits}; ${status}`,
-    )
-  }
-  lines.push('')
-  lines.push('Command: `/openai-reset select <encodedAccountKey>`')
-  return lines.join('\n')
+/** One account's line in the reset section: usage, credits and eligibility. */
+function resetRowDetail(row: ResetPreviewRow): string {
+  const usage =
+    row.usedPercent === undefined
+      ? 'quota unavailable'
+      : `${row.usedPercent}% used`
+  const credits =
+    row.availableCount === undefined
+      ? 'credits unavailable'
+      : `${row.applicableAvailableCount === undefined ? '?' : row.applicableAvailableCount}/${row.availableCount} applicable/available`
+  const status = row.eligible
+    ? `eligible · credit ${row.selectedCreditId} expires ${row.selectedCreditExpiresAt}`
+    : row.reason
+  return `${usage}; ${credits}; ${status}`
 }
 
 function renderResetConfirm(row: ResetPreviewRow): string {
@@ -1307,25 +1184,39 @@ function renderResetConfirm(row: ResetPreviewRow): string {
     lines.push('')
   }
   if (row.eligible && row.chatgptAccountId) {
-    lines.push(
-      `Confirm: \`/openai-reset confirm ${encodeURIComponent(row.accountKey)} ${encodeURIComponent(row.chatgptAccountId)}\``,
-    )
+    lines.push('Eligible: choose "Spend a reset credit" to redeem one.')
   } else {
     lines.push(`Cannot reset: **${row.reason ?? 'not eligible'}**`)
   }
   return lines.join('\n')
 }
 
+/**
+ * What one reset step came to: the message for the user and the outcome
+ * code (a server outcome, a coordinator refusal or a local one), which the
+ * log and the tests read.
+ */
+export interface ResetStepResult {
+  ok: boolean
+  code: string
+  text: string
+}
+
+// `accountKey` and the extra details are what the old dialog carried; they
+// are logged rather than shown, so the message alone tells the user what
+// happened and the details stay out of the payload.
 function resetResultPayload(
   accountKey: string,
   code: string,
   text: string,
-  knobs: Record<string, unknown> = {},
-): OpenDialogPayload {
+  details: Record<string, unknown> = {},
+): ResetStepResult {
+  if (Object.keys(details).length > 0)
+    log.debug('reset step details', { accountKey, code, ...details })
   return {
-    command: OPENAI_RESET_COMMAND_NAME,
+    ok: code === 'reset' || code === 'already_redeemed',
+    code,
     text,
-    knobs: { stage: 'result', accountKey, code, ...knobs },
   }
 }
 
@@ -1333,7 +1224,7 @@ function resetErrorPayload(
   accountKey: string,
   error: unknown,
   boundChatgptAccountId?: string,
-): OpenDialogPayload {
+): ResetStepResult {
   if (error instanceof ResetRedemptionError) {
     const messages: Record<string, string> = {
       identity_mismatch:
@@ -1412,7 +1303,7 @@ export async function renderResetCoordinatorResult(
   result: RunResetCreditResult,
   ctx: ResetCommandContext,
   boundChatgptAccountId?: string,
-): Promise<OpenDialogPayload> {
+): Promise<ResetStepResult> {
   const { accountKey } = result.target
   const code = result.outcome.kind
   if (result.finalizeStateWriteFailed) {
@@ -1478,13 +1369,10 @@ export async function renderResetCoordinatorResult(
     )
   }
   if (code === 'ambiguous' || code === 'http_error') {
-    const retryCommand = boundChatgptAccountId
-      ? `/openai-reset retry ${encodeURIComponent(accountKey)} ${encodeURIComponent(boundChatgptAccountId)}`
-      : '/openai-reset'
     return resetResultPayload(
       accountKey,
       code,
-      `## Reset credit result\n\nAccount: **${result.target.label}** (\`${accountKey}\`)\n\nThe redemption outcome is unknown (\`${code}\`).\n\nRetry with \`${retryCommand}\`. A retry within five minutes reuses the same request and credit identifiers; this does not prove the server did nothing.`,
+      `## Reset credit result\n\nAccount: **${result.target.label}** (\`${accountKey}\`)\n\nThe redemption outcome is unknown (\`${code}\`).\n\nRetry with "Retry the last redemption" on this account. A retry within five minutes reuses the same request and credit identifiers; this does not prove the server did nothing.`,
       {
         retryGuidance: result.retrySafety,
         chatgptAccountId: boundChatgptAccountId,
@@ -1502,303 +1390,4 @@ export async function renderResetCoordinatorResult(
     code,
     `## Reset credit result\n\nAccount: **${result.target.label}** (\`${accountKey}\`)\n\nCode: \`${code}\`\n\n${meanings[code] ?? 'The server returned a no-op result. No reset was confirmed.'}`,
   )
-}
-
-async function executeResetCommand(
-  args: string,
-  ctx: CommandContext,
-): Promise<OpenDialogPayload> {
-  const missingDeps = [
-    ctx.resolveResetTarget ? undefined : 'resolveResetTarget',
-    ctx.fetchImpl ? undefined : 'fetchImpl',
-    ctx.now ? undefined : 'now',
-    ctx.randomUUID ? undefined : 'randomUUID',
-    ctx.refreshResetTargetQuota ? undefined : 'refreshResetTargetQuota',
-  ].filter((name): name is string => name !== undefined)
-  if (missingDeps.length > 0) {
-    log.warn('reset command dependencies unwired', { missingDeps })
-    return {
-      command: OPENAI_RESET_COMMAND_NAME,
-      text: '## Reset credit\n\nUnavailable: reset command runtime dependencies are not wired.',
-      knobs: {},
-    }
-  }
-  const resetCtx = ctx as ResetCommandContext
-
-  const tokens = args.trim().split(/\s+/).filter(Boolean)
-  const action = tokens[0]
-  if (!action || action === 'refresh') {
-    const storage = await ctx.loadAccounts(storePaths(ctx))
-    // A migrated install's roster holds the main account as row `main`,
-    // which `main` already covers, so it is listed once.
-    const accountKeys = [
-      ...new Set([
-        'main',
-        ...(storage?.accounts ?? [])
-          .filter(
-            (account) => account.enabled !== false && account.type === 'oauth',
-          )
-          .map((account) => account.id),
-      ]),
-    ]
-    log.debug('reset accounts stage requested', { accountKeys })
-    const accounts = await Promise.all(
-      accountKeys.map((accountKey) =>
-        buildResetPreviewRow(accountKey, resetCtx),
-      ),
-    )
-    log.debug('reset accounts stage built', {
-      rows: accounts.map((row) => ({
-        accountKey: row.accountKey,
-        eligible: row.eligible,
-        reason: row.reason,
-        usedPercent: row.usedPercent,
-        availableCount: row.availableCount,
-        applicableAvailableCount: row.applicableAvailableCount,
-      })),
-    })
-    return {
-      command: OPENAI_RESET_COMMAND_NAME,
-      text: renderResetAccountList(accounts),
-      knobs: { stage: 'accounts', accounts },
-    }
-  }
-
-  if (action === 'select') {
-    const accountKey = decodeResetArg(tokens[1])
-    if (
-      !accountKey ||
-      !isSafeResetAccountKey(accountKey) ||
-      tokens.length !== 2
-    ) {
-      return resetResultPayload(
-        '',
-        'invalid_command',
-        'Usage: `/openai-reset select <encodedAccountKey>`',
-      )
-    }
-    const preview = await buildResetPreviewRow(accountKey, resetCtx)
-    if (!preview.eligible) {
-      return resetResultPayload(
-        accountKey,
-        'not_eligible',
-        renderResetConfirm(preview),
-      )
-    }
-    return {
-      command: OPENAI_RESET_COMMAND_NAME,
-      text: renderResetConfirm(preview),
-      knobs: { stage: 'confirm', preview },
-    }
-  }
-
-  if (action === 'confirm' || action === 'retry') {
-    const accountKey = decodeResetArg(tokens[1])
-    const expectedChatgptAccountId = decodeResetArg(tokens[2])
-    if (
-      !accountKey ||
-      !isSafeResetAccountKey(accountKey) ||
-      !expectedChatgptAccountId ||
-      tokens.length !== 3
-    ) {
-      return resetResultPayload(
-        accountKey ?? '',
-        'invalid_command',
-        `Usage: \`/openai-reset ${action} <encodedAccountKey> <encodedChatgptAccountId>\``,
-      )
-    }
-    log.info('reset redemption decision', { accountKey, action })
-    log.debug('reset redemption identity binding', {
-      accountKey,
-      expectedChatgptAccountId,
-    })
-    try {
-      const result = await runResetCreditRedemption(
-        {
-          configPath: ctx.accountStoragePath,
-          statePath: ctx.accountStatePath,
-          mutateAccountsFn: mutateAccounts,
-          loadAccountsFn: ctx.loadAccounts,
-          now: resetCtx.now,
-          randomUUID: resetCtx.randomUUID,
-          fetchImpl: resetCtx.fetchImpl,
-          resolveTarget: resetCtx.resolveResetTarget,
-          fetchUsage: (target) =>
-            whamUsageFn({
-              accessToken: target.accessToken,
-              fetchImpl: resetCtx.fetchImpl,
-              now: resetCtx.now,
-              accountId: target.chatgptAccountId,
-            }),
-          hasActiveRateLimitMark: (key) => ctx.quotaManager.isRateLimited(key),
-        },
-        {
-          accountKey,
-          expectedChatgptAccountId,
-          retry: action === 'retry',
-        },
-      )
-      log.info('reset redemption outcome', {
-        accountKey,
-        code: result.outcome.kind,
-      })
-      return renderResetCoordinatorResult(
-        result,
-        resetCtx,
-        expectedChatgptAccountId,
-      )
-    } catch (error) {
-      const payload = resetErrorPayload(
-        accountKey,
-        error,
-        expectedChatgptAccountId,
-      )
-      log.info('reset redemption outcome', {
-        accountKey,
-        code: payload.knobs.code,
-      })
-      return payload
-    }
-  }
-
-  return resetResultPayload(
-    '',
-    'invalid_command',
-    'Usage: `/openai-reset` | `/openai-reset select <encodedAccountKey>` | `/openai-reset confirm <encodedAccountKey> <encodedChatgptAccountId>` | `/openai-reset retry <encodedAccountKey> <encodedChatgptAccountId>` | `/openai-reset refresh`',
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/**
- * Knob keys that must never cross the RPC boundary.
- *
- * These are the credential fields on the stored account types plus the generic
- * secret names. `authHeader` is included because an API-key account can carry a
- * full `Authorization` value in it.
- */
-const CREDENTIAL_KNOB_KEYS = new Set([
-  'access',
-  'refresh',
-  'apikey',
-  'authheader',
-  'password',
-  'secret',
-])
-
-function isCredentialKnobKey(key: string) {
-  const normalized = key.toLowerCase().replace(/[-_]/g, '')
-  if (CREDENTIAL_KNOB_KEYS.has(normalized)) return true
-  // No legitimate knob ends in "token"; a stored access/refresh token reaching a
-  // knob under any name is a leak regardless of what it is called.
-  return normalized.endsWith('token')
-}
-
-/**
- * Strip credential-shaped fields from a dialog payload's knobs.
- *
- * Knobs are returned across the loopback RPC and JSON-serialized to the TUI, so
- * a knob is a published surface. Individual commands project their own knobs
- * deliberately (see accountKnob), but this is the boundary backstop: a future
- * command that returns a stored object directly cannot leak credentials even if
- * the projection is forgotten, because nothing credential-shaped survives here.
- *
- * Scrub rather than throw. A rejected dialog is a visible outage for a live
- * command, while a scrubbed one keeps working with the leak removed; the warning
- * is what gets the projection fixed. Recurses into nested objects and arrays,
- * since the account list arrives as an array of records.
- */
-// Exported for direct testing: no command currently returns an unprojected knob,
-// so a test driven through buildDialogPayload would pass whether or not the
-// scrub runs. Testing the mechanism itself is what actually has teeth.
-export function scrubKnobs(
-  value: unknown,
-  path: string,
-  found: string[],
-): unknown {
-  if (Array.isArray(value)) {
-    return value.map((entry, index) =>
-      scrubKnobs(entry, `${path}[${index}]`, found),
-    )
-  }
-  if (!isRecord(value)) return value
-  const result: Record<string, unknown> = {}
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    if (isCredentialKnobKey(key)) {
-      found.push(`${path}.${key}`)
-      continue
-    }
-    result[key] = scrubKnobs(entry, `${path}.${key}`, found)
-  }
-  return result
-}
-
-export async function buildDialogPayload(
-  command: CommandModalName,
-  args: string,
-  ctx: CommandContext,
-  hostBodies: HostCommandBodies = {},
-): Promise<OpenDialogPayload> {
-  const payload = await buildDialogPayloadUnchecked(
-    command,
-    args,
-    ctx,
-    hostBodies,
-  )
-  const found: string[] = []
-  const knobs = scrubKnobs(payload.knobs, 'knobs', found) as Record<
-    string,
-    unknown
-  >
-  if (found.length > 0) {
-    // Names only — never the values, which are the credentials themselves.
-    log.warn('credential-shaped knob stripped before RPC', {
-      command,
-      fields: found,
-    })
-    return { ...payload, knobs }
-  }
-  return payload
-}
-
-async function buildDialogPayloadUnchecked(
-  command: CommandModalName,
-  args: string,
-  ctx: CommandContext,
-  hostBodies: HostCommandBodies,
-): Promise<OpenDialogPayload> {
-  switch (command) {
-    case 'openai-quota':
-      return executeQuotaCommand(ctx)
-    case 'openai-account':
-      return executeAccountCommand(args, ctx)
-    case 'openai-routing':
-      return executeRoutingCommand(args, ctx)
-    case 'openai-reset':
-      return executeResetCommand(args, ctx)
-    default: {
-      // Commands the core does not own. The host that registered them supplies
-      // the body; a host that did not register one cannot reach this line,
-      // because its command list never offers the name.
-      const hostBody = hostBodies[command]
-      if (!hostBody) throw new Error(`unhandled command: ${command}`)
-      return hostBody(args, ctx)
-    }
-  }
-}
-
-export async function applyCommand(
-  request: ApplyRequest,
-  ctx: CommandContext,
-  hostBodies: HostCommandBodies = {},
-): Promise<ApplyResult> {
-  const payload = await buildDialogPayload(
-    request.command,
-    request.arguments,
-    ctx,
-    hostBodies,
-  )
-  return { text: payload.text, knobs: payload.knobs }
 }

@@ -1,10 +1,15 @@
 import { readFile } from 'node:fs/promises'
+import type {
+  DoctorCheck,
+  DoctorFinding,
+} from '@cortexkit/common-auth/auth-menu'
 import {
   type AccountPaths,
   type AccountStorage,
   findPoolMainRow,
   isOAuthAccount,
   isPoolMainPlaceholder,
+  type mutateAccounts,
   NON_TRANSIENT_REFRESH_RETRY_DELAY_MS,
   type OAuthAccount,
   readConfigRosterIds,
@@ -216,6 +221,108 @@ export function createAuthDoctorReport(input: {
   }
 
   return { findings, repairs }
+}
+
+export interface AuthDoctorCheckDeps {
+  paths: AccountPaths
+  /**
+   * Whether the install is migrated. Its accounts are then pool rows the
+   * store alone writes, so the two repairs that rewrite the legacy account
+   * files are reported but not offered.
+   */
+  migrated: boolean
+  readAuth(): Promise<AuthDetails>
+  loadAccounts(paths: AccountPaths): Promise<AccountStorage | null>
+  readStoreIds(paths: AccountPaths): Promise<StoreIds>
+  /** The legacy writer; reached only on an install that has not migrated. */
+  mutateAccounts: typeof mutateAccounts
+  setMainAuth(credential: {
+    refresh: string
+    access?: string
+    expires?: number
+  }): Promise<void>
+  now(): number
+}
+
+/**
+ * The doctor as the shared auth menu runs it: one check that reads the slot
+ * and the account files and reports `createAuthDoctorReport`'s findings, each
+ * with its repair when one applies. A repair runs only when the operator
+ * picks it.
+ */
+export function authDoctorChecks(deps: AuthDoctorCheckDeps): DoctorCheck[] {
+  const repairFor = (repair: AuthRepair): DoctorFinding['repair'] => {
+    if (repair.type === 'restore-main-credential')
+      return {
+        label: "Copy the stored main credential back into OpenCode's slot",
+        apply: async () => {
+          // Never over the account-pool placeholder: main then lives in the
+          // pool row, and a second copy in the slot would be refreshed on its
+          // own.
+          if (isPoolMainPlaceholder(await deps.readAuth())) return
+          const account = findStoredMainCredential(
+            await deps.loadAccounts(deps.paths),
+          )
+          if (!account) return
+          await deps.setMainAuth({
+            refresh: account.refresh,
+            access: account.access ?? '',
+            expires: account.expires ?? 0,
+          })
+        },
+      }
+    if (deps.migrated) return undefined
+    if (repair.type === 'prune-orphan-state-ids')
+      return {
+        label: `Drop the state entries of ${repair.ids.join(', ')}`,
+        // The legacy writer keeps only roster ids in the state file.
+        apply: async () => {
+          await deps.mutateAccounts((current) => current, deps.paths)
+        },
+      }
+    return {
+      label: `Clear the refresh backoff of ${repair.accountId}`,
+      apply: async () => {
+        await deps.mutateAccounts((current) => {
+          const account = current.accounts.find(
+            (candidate): candidate is OAuthAccount =>
+              candidate.id === repair.accountId && isOAuthAccount(candidate),
+          )
+          if (account) account.lastRefreshError = undefined
+          return current
+        }, deps.paths)
+      },
+    }
+  }
+  return [
+    {
+      id: 'openai-auth',
+      run: async () => {
+        const [storage, ids, auth] = await Promise.all([
+          deps.loadAccounts(deps.paths),
+          deps.readStoreIds(deps.paths),
+          deps.readAuth(),
+        ])
+        const report = createAuthDoctorReport({
+          auth: auth.type === 'missing' ? undefined : auth,
+          storage,
+          orphanStateIds: ids.orphanStateIds,
+          now: deps.now(),
+        })
+        return report.findings.map((finding) => {
+          const repair = finding.repair ? repairFor(finding.repair) : undefined
+          return {
+            code: finding.code,
+            message: finding.message,
+            ...(finding.accountId !== undefined
+              ? { accountId: finding.accountId }
+              : {}),
+            ...(repair ? { repair } : {}),
+          }
+        })
+      },
+    },
+  ]
 }
 
 export function formatAuthDoctorReport(report: AuthDoctorReport): string {

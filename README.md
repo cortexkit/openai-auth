@@ -57,32 +57,32 @@ The account you log in with via `/login openai` is your **main** account, stored
 
 The plugin supports more than one ChatGPT account: a single **main** account (the one from `/login openai`, held in OpenCode's auth store) plus any number of **fallback** accounts (held in the plugin's own account store). When the main account hits a rate limit, traffic automatically rolls over to a healthy fallback for the rest of the limit window, then returns.
 
-- **Add a fallback** in the TUI with `/openai-account add [label]` (or through the menu's **Add account…** action, which supports both browser and headless OAuth flows).
-- **Remove** a fallback with `/openai-account remove <id>`.
+- **Add a fallback** from the Accounts section of [`/openai`](#the-openai-command) (browser or device-code sign-in), or from `opencode auth login`.
+- **Remove, disable or reorder** accounts from the same section.
 - Each account is identified by its stable ChatGPT account id, so the same account is never added twice.
 
 Which account serves is decided by [routing](#routing) mode. There is no manual active-account selector: `sticky-balanced` creates a session pin automatically, while the other modes follow their configured order. A request that a fallback can serve is buffered so the retry is safe, and selection skips accounts the [killswitch](#killswitch) has gated out.
 
 ### Routing
 
-`/openai-routing` controls how the main and fallback accounts are ordered:
+The Routing section of `/openai` controls how the main and fallback accounts are ordered:
 
 | Mode | Behavior |
 | --- | --- |
+| `ordered` | Try the accounts in roster order (set the order in the same section). |
 | `main-first` (default) | Send on the main account; on a `401`/`403`/`429`, transparently retry on the next usable fallback. |
 | `fallback-first` | Try usable fallback accounts first (preserving the main account's quota), and fall through to the main account only if no fallback can serve. |
 | `sticky-balanced` | For a cold session, choose the account with the lowest projected pressure against its usable quota. Keep that account pinned for the session. |
 
 `sticky-balanced` does not rebalance mid-session. A pin stays in place until fresh quota confirms exhaustion or the account has a permanent authentication failure (`401`/`403`). A transient failure, stale or unknown quota, and `429` without confirmed exhaustion retain the pin; there is no Retry-After hold. This avoids changing an account while a session's continuation and cache context still belong to the first account.
 
-Pins use a SHA-256 hash of the session id as their key in the machine-global sidebar state and expire after seven days. Cold placement excludes accounts with stale or unknown quota from weighted selection. If every account is excluded, it fails open to the configured mode order. Equal projected-pressure scores break deterministically by configured order, then account id; a shared pending-byte bridge makes simultaneous cold placements account for each other. Subagents receive independent pins, and a resumed subagent reuses its own pin. `/openai-routing reset` clears only the current session's pin, so the next placement may legitimately choose the same account again.
+Pins use a SHA-256 hash of the session id as their key in the machine-global sidebar state and expire after seven days. Cold placement excludes accounts with stale or unknown quota from weighted selection. If every account is excluded, it fails open to the configured mode order. Equal projected-pressure scores break deterministically by configured order, then account id; a shared pending-byte bridge makes simultaneous cold placements account for each other. Subagents receive independent pins, and a resumed subagent reuses its own pin. The **This session** section of `/openai` clears only the current session's pin, so the next placement may legitimately choose the same account again.
 
 ### Killswitch
 
-`/openai-killswitch` hard-blocks requests for an account once its quota drops below a threshold, instead of letting the request through and burning the last of a window:
+The killswitch hard-blocks requests for an account once its quota drops below a floor, instead of letting the request through and burning the last of a window. The Limits section of `/openai` turns it on or off and sets each account's floors: the minimum percent left in the 5-hour (`primary`) and weekly (`secondary`) windows. A window without a floor never blocks.
 
-- `/openai-killswitch on` / `off` — enable or disable hard-blocking.
-- `/openai-killswitch set <acct>:<5h>,<1w> ...` — set per-account 5-hour and weekly cutoff percentages (e.g. `main:5,10 work-alt:5,10`).
+Thresholds saved by earlier versions (a `main` block, `5h`/`1w` names, accounts inheriting `main` or the 5%/10% defaults) are rewritten as explicit per-account floors the first time `/openai` saves a setting, so the same quota blocks the same requests.
 
 ## Quota
 
@@ -91,16 +91,17 @@ Codex reports usage on **two rolling windows** — a 5-hour primary window and a
 - **HTTP/SSE** — `x-codex-*` response headers on every reply.
 - **WebSocket** — the in-band `codex.rate_limits` frame.
 
-`/openai-quota` shows the current 5h and weekly used-percent for every account. When you run it, it additionally polls the explicit usage endpoint for the main account **and every fallback** so even never-routed accounts show fresh numbers. Quota for the active account is also rendered in the OpenCode sidebar (used %, reset countdown, and a pacing estimate).
+The Quota section of `/openai` shows every account's windows and credit budget; **Check now** polls the usage endpoint for the main account **and every fallback** so even never-routed accounts show fresh numbers. Quota for the active account is also rendered in the OpenCode sidebar (used %, reset countdown, and a pacing estimate).
 
 ## Cache keep-warm
 
-`/openai-cachekeep` keeps the Codex prompt cache warm while a session is idle, so the next real turn after a gap hits the cache instead of paying a cold-start. Codex evicts a session's prompt cache after roughly five minutes of inactivity; keep-warm replays the latest real request as a tiny shadow request (it generates no stored turn — `store: false`) just before the cache would expire.
+The Cache section of `/openai` keeps the Codex prompt cache warm while a session is idle, so the next real turn after a gap hits the cache instead of paying a cold-start. Codex evicts a session's prompt cache after roughly five minutes of inactivity; keep-warm replays the latest real request as a tiny shadow request (it generates no stored turn — `store: false`) just before the cache would expire.
 
-- `/openai-cachekeep on` / `off` — enable or disable. The setting is **persisted**, so it stays on across restarts and applies to every session until you turn it off.
-- `/openai-cachekeep subagents on` / `off` — also keep subagent sessions warm (off by default). Useful when the same subagent is reused repeatedly. Subagent sessions warm only while recently active (a 30-minute idle cap, versus one hour for the main session).
-- `/openai-cachekeep sustain on` / `off` — bypass main-session idle pruning. It defaults to off, is main-agent-only, and does not change subagent limits.
-- `/openai-cachekeep` — show status: enabled state, subagent mode, tracked sessions, and last-warm cost.
+- **Keep-warm on/off** — the setting is **persisted** (`cacheKeep.enabled`), so it stays on across restarts and applies to every session until you turn it off.
+- **Subagent warming** — also keep subagent sessions warm (off by default). Useful when the same subagent is reused repeatedly. Subagent sessions warm only while recently active (a 30-minute idle cap, versus one hour for the main session).
+- **Sustain** — bypass main-session idle pruning. It defaults to off, is main-agent-only, and does not change subagent limits.
+- **Warm window** — warm only between local hours, such as `9-18` or `22-6`; empty warms at any hour.
+- The section lists the timer, the tracked sessions and the TTL.
 
 Keep-warm only ever runs for **main-agent** sessions unless subagent mode is on, and it never warms an account that is not serving that session. `sustain` is orthogonal to the clock window: the configured window still controls capture and warming. `sustain` bypasses only the main idle-pruning bound; the target-count, memory-byte, and LRU caps still apply. Subagent idle and warm-count limits remain unchanged.
 
@@ -129,54 +130,48 @@ The plugin writes a leveled, secret-redacting, size-rotating log:
 
 | Setting | Where | Default | Purpose |
 | --- | --- | --- | --- |
-| Log level | `/openai-logging` (TUI) or `OPENCODE_OPENAI_AUTH_LOG_LEVEL` | `info` | One of `error`, `warn`, `info`, `debug`, `trace`. `/openai-logging` changes it immediately without a restart and persists it. |
+| Log level | Diagnostics section of `/openai` (TUI) or `OPENCODE_OPENAI_AUTH_LOG_LEVEL` | `info` | One of `error`, `warn`, `info`, `debug`, `trace`. The menu changes it immediately without a restart and persists it. |
 | Log file | `OPENCODE_OPENAI_AUTH_LOG_FILE` | OS temp dir: `opencode-openai-auth.log` | Destination file. Rotates at 5 MB, keeping three older generations. |
 
 Token values and authorization/cookie headers are redacted from the log. Conversation/request bodies are never written to it (transport request dumps are a separate, explicit opt-in — see [`dump`](#configuration)).
 
-## Slash commands
+## The `/openai` command
 
-All commands open an interactive control surface in the TUI (a selectable dialog). Commands with listed arguments also accept those explicit argument forms.
+One command, `/openai`, opens one menu in the TUI. Its sections, in order:
 
-| Command | Arguments | Purpose |
-| --- | --- | --- |
-| `/openai-quota` | — | Show 5h + weekly quota for all accounts (polls the usage endpoint). |
-| `/openai-account` | `add [label]` · `remove <id>` · `order <a> <b>` | List and manage accounts; add runs OAuth, order swaps fallback positions. |
-| `/openai-routing` | `main-first` · `fallback-first` · `sticky-balanced` · `reset` | Set account preference order, enable sticky balanced routing, or clear the current session pin. |
-| `/openai-killswitch` | `on` · `off` · `set <acct>:<5h>,<1w> ...` | Hard-block accounts below per-window quota thresholds. |
-| `/openai-cachekeep` | `on` · `off` · `subagents on` · `subagents off` · `sustain on` · `sustain off` | Idle prompt-cache keep-warm; optional subagent mode and main-only idle-pruning bypass. |
-| `/openai-reset` | Modal only | Spend one applicable reset credit for an exhausted account after explicit confirmation. |
-| `/openai-logging` | `<level>` | Set log level (`error`/`warn`/`info`/`debug`/`trace`) live. |
-| `/openai-dump` | `on` · `off` | Toggle transport request dumps for cache debugging. |
+| Section | What it does |
+| --- | --- |
+| Accounts | List accounts; add one (browser or device-code sign-in), disable, enable, move or remove one. Row `main`, the account OpenCode signs in with, is never removed. |
+| Quota | Every account's windows and credit budget; **Check now** polls them. |
+| Routing | The routing mode and the roster order. |
+| Limits | The killswitch and each account's floors. |
+| Cache | Prompt-cache keep-warm, subagent warming, sustain and the warm window. |
+| Diagnostics | Request dumps and the log level. |
+| Reset credits | Preview an account, spend one reset credit after explicit confirmation, or retry the last redemption. |
+| This session | The session's sticky pin, and clearing it. |
+| Claustrum | Enter Claustrum mode, or return to local mode. |
 
-## Account management
+Settings the menu changes are saved through the account pool's store, under the names `routing.mode`, `killswitch.{enabled,accounts}`, `logging.level`, `cacheKeep.*` and `dump.enabled`. The menu needs the account pool: until every OpenCode process on the machine runs a version that understands it and the accounts have moved, `/openai` shows only that notice and the processes still holding the move back.
 
-Fallback accounts can be managed via slash commands or through the interactive TUI:
-
-```text
-/openai-account add [--headless] [label]   # add a fallback account via OAuth (browser or headless device code)
-/openai-account                            # list fallback accounts and open the account dialog
-/openai-account remove <id>                # remove a fallback account
-```
-
-You can also run `/openai-account` without arguments to open the interactive **OpenAI Accounts** dialog in the TUI, which supports adding accounts (including the device-code flow when no browser is available), reordering fallbacks, and removing fallback accounts. The main account is authenticated separately via `/login openai`.
+The eight earlier commands (`/openai-account`, `/openai-quota`, `/openai-routing`, `/openai-killswitch`, `/openai-cachekeep`, `/openai-dump`, `/openai-logging`, `/openai-reset`) are gone; their actions are sections of the menu.
 
 ### From a terminal, without a TUI session
 
-Once at least one account exists, `opencode auth login` offers an account menu for this provider:
+Once a credential exists (OpenCode's own or a stored account), `opencode auth login` offers an account menu for this provider:
 
 ```text
-Add account          add a fallback account (device code when no browser is available)
-Auth current         re-authenticate the main account in place
-Check quotas         refresh every account's quota now, ignoring backoff
-Auth doctor          report problems with the stored credentials
-Apply repairs        fix what the doctor found
-Delete all accounts  remove every fallback account
+Add account               add an account (device code when no browser is available)
+Re-authenticate           sign an account in again, replacing its credential
+Remove account            remove one account (not main)
+Enable or disable account
+Check quotas              poll every account's quota now
+Auth doctor               report problems with the stored credentials, and offer repairs
+Delete all accounts       remove every account except main
 ```
 
-This is the path for headless machines, where the slash commands are out of reach. The first login on a new machine goes straight to sign-in as usual; the menu appears only once there is something to manage.
+This is the path for headless machines, where `/openai` is out of reach. The first login on a new machine goes straight to sign-in as usual. Before the accounts have moved to the account pool, the menu shows only that notice and the doctor.
 
-One quirk worth knowing: the menu prints `Failed to authorize` when it returns, even when the action succeeded. The menu writes its own changes and deliberately reports nothing back as a sign-in, because a fallback account must not be filed as the main credential. Check the result with `/openai-account`.
+One quirk worth knowing: the menu prints `Failed to authorize` when it returns, even when the action succeeded. The menu writes its own changes and deliberately reports nothing back as a sign-in, because a fallback account must not be filed as the main credential. Check the result with `/openai`.
 
 ## Configuration
 
@@ -207,7 +202,7 @@ Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty.
 
 The `webSearch` setting and `CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH` have been removed, along with the `web_search` tool the plugin used to add to requests; a config file that still sets `webSearch` loads normally and the key is ignored.
 
-The same `openai-auth.json` file also holds the managed **account store** (accounts, routing, killswitch thresholds, quota cache, log level, and cache-keep state). Those keys are written by the slash commands — edit them through the commands rather than by hand. The plugin distinguishes the two: a settings-only file is never overwritten with account data, and account operations preserve your transport settings.
+The same `openai-auth.json` file also holds the managed **account store** (accounts, routing, killswitch thresholds, quota cache, log level, and cache-keep state). Those keys are written by `/openai` — change them there rather than by hand. The plugin distinguishes the two: a settings-only file is never overwritten with account data, and account operations preserve your transport settings.
 
 Example — opt into the WebSocket transport via the config file:
 

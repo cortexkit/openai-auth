@@ -7,6 +7,7 @@ import { CodexAuthPlugin } from '../index'
 import { resetNotificationsForTest } from '../rpc/notifications'
 import { discoverPortFile } from '../rpc/port-file'
 import { resolveRpcDir } from '../rpc/rpc-dir'
+import { quotaMap, seedPool } from './fixtures/pool-install'
 import { rpcServerRegistry } from './fixtures/rpc-registry'
 import { restoreEnv } from './setup-env'
 
@@ -77,6 +78,28 @@ async function writeAccountStore(path: string, accountId: string) {
   )
 }
 
+/** A migrated install whose one row is `accountId`, so `/openai` opens on it. */
+function writeMigratedStore(configFile: string, accountId: string) {
+  seedPool(
+    {
+      configFile,
+      stateFile: process.env.OPENCODE_OPENAI_AUTH_STATE_FILE ?? '',
+    },
+    [{ id: accountId, quota: quotaMap(10) }],
+  )
+}
+
+/** The account ids an apply result's refreshed menu lists. */
+function accountIds(result: {
+  menu?: { sections: Array<{ id: string; items: Array<{ id: string }> }> }
+}): string[] {
+  return (
+    result.menu?.sections
+      .find((section) => section.id === 'accounts')
+      ?.items.map((item) => item.id) ?? []
+  )
+}
+
 afterEach(() => {
   resetNotificationsForTest()
 })
@@ -104,17 +127,11 @@ describe('rpc-server', () => {
       await mkdir(projectB)
 
       process.env.OPENCODE_OPENAI_AUTH_FILE = join(root, 'project-a.json')
-      await writeAccountStore(
-        process.env.OPENCODE_OPENAI_AUTH_FILE,
-        'account-a',
-      )
+      writeMigratedStore(process.env.OPENCODE_OPENAI_AUTH_FILE, 'account-a')
       loaded.push(await loadProjectPlugin(projectA))
 
       process.env.OPENCODE_OPENAI_AUTH_FILE = join(root, 'project-b.json')
-      await writeAccountStore(
-        process.env.OPENCODE_OPENAI_AUTH_FILE,
-        'account-b',
-      )
+      writeMigratedStore(process.env.OPENCODE_OPENAI_AUTH_FILE, 'account-b')
       loaded.push(await loadProjectPlugin(projectB))
 
       const rpcA = await resolveRpcDir(projectA)
@@ -135,14 +152,16 @@ describe('rpc-server', () => {
             authorization: `Bearer ${portA?.token}`,
           },
           body: JSON.stringify({
-            command: 'openai-account',
-            arguments: '',
+            command: 'openai',
+            sectionId: 'routing',
+            actionId: 'mode',
+            values: { mode: 'fallback-first' },
             sessionId: 'session-a',
           }),
         },
       )
       expect(responseA.status).toBe(200)
-      expect((await responseA.json()).text).toContain('account-a')
+      expect(accountIds(await responseA.json())).toEqual(['account-a'])
 
       const responseB = await originalFetch(
         `http://127.0.0.1:${portB?.port}/rpc/apply`,
@@ -153,14 +172,16 @@ describe('rpc-server', () => {
             authorization: `Bearer ${portB?.token}`,
           },
           body: JSON.stringify({
-            command: 'openai-account',
-            arguments: '',
+            command: 'openai',
+            sectionId: 'routing',
+            actionId: 'mode',
+            values: { mode: 'fallback-first' },
             sessionId: 'session-b',
           }),
         },
       )
       expect(responseB.status).toBe(200)
-      expect((await responseB.json()).text).toContain('account-b')
+      expect(accountIds(await responseB.json())).toEqual(['account-b'])
     } finally {
       for (const plugin of loaded) await plugin.dispose?.()
       globalThis.fetch = originalFetch
