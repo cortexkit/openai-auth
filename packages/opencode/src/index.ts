@@ -1928,6 +1928,7 @@ export async function CodexAuthPlugin(
             }
             return observationFromSnapshot(snapshot, checkedAt, true)
           },
+          vaultIdentities: () => vault.identities(),
           log: createLogger('pool'),
         })
         poolAccountSource = poolSource

@@ -107,6 +107,13 @@ export interface PoolAccountSourceDeps {
     Pick<OpenPoolStoreOptions, 'lockOptions' | 'rowLockOptions' | 'hold'>
   >
   log?: Pick<ReturnType<typeof createLogger>, 'debug' | 'info' | 'warn'>
+  /**
+   * The ChatGPT accounts the Claustrum vault holds for this host. A row
+   * signing in as one of them is not this host's to use (one account has
+   * one owner, and the vault owns it): request routing skips it, and this
+   * source never refreshes it or polls its quota either.
+   */
+  vaultIdentities?: () => ReadonlySet<string>
 }
 
 type BackoffEntry = {
@@ -408,10 +415,19 @@ export class PoolAccountSource {
    * at the first load, a row added since, a replaced credential, and every
    * row once the install turns migrated. Never waits.
    */
+  /** Whether the vault owns the account this row signs in as. */
+  private vaultOwned(row: Pick<PoolRow, 'identity'>): boolean {
+    return (
+      row.identity !== undefined &&
+      (this.deps.vaultIdentities?.().has(row.identity) ?? false)
+    )
+  }
+
   private pollUnseenRows(): void {
     if (this.disposed) return
     for (const row of this.snapshot.rows) {
-      if (!row.candidate || row.type !== 'oauth') continue
+      if (!row.candidate || row.type !== 'oauth' || this.vaultOwned(row))
+        continue
       const key = `${row.id}\u0000${row.credentialEpoch ?? 0}\u0000${row.identity ?? ''}`
       if (this.polled.has(key)) continue
       this.polled.add(key)
@@ -574,7 +590,7 @@ export class PoolAccountSource {
     const windowMs = refreshBeforeExpiryMs(storage)
     const waits: Promise<void>[] = []
     for (const row of rows) {
-      if (!row.candidate) continue
+      if (!row.candidate || this.vaultOwned(row)) continue
       const token = oauthAccess(row)
       if (!token) continue
       const left = (token.expires ?? 0) - now
@@ -793,7 +809,8 @@ export class PoolAccountSource {
     if (!view.active || this.disposed) return []
     const now = this.now()
     const targets = view.rows.filter((row) => {
-      if (!row.candidate || row.type !== 'oauth') return false
+      if (!row.candidate || row.type !== 'oauth' || this.vaultOwned(row))
+        return false
       if (options.ids && !options.ids.includes(row.id)) return false
       if (options.skipReadWithinMs === undefined) return true
       const readAt = quotaReadAt(row)
