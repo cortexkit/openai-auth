@@ -1,11 +1,4 @@
-import type {
-  Api,
-  AssistantMessageEvent,
-  AssistantMessageEventStream,
-  Context,
-  Model,
-  SimpleStreamOptions,
-} from '@earendil-works/pi-ai'
+import type { Api, Model } from '@earendil-works/pi-ai'
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
 // Imported from `/compat` rather than the deep `/api/openai-codex-responses`
 // path. Pi's extension loader rewrites pi-ai specifiers so extensions share its
@@ -25,6 +18,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
 import { registerCommands } from './commands.ts'
 import { RawWebSocket } from './raw-ws-node.ts'
+import { PiOpenAIRuntime } from './runtime.ts'
 
 const BASE_URL = 'https://chatgpt.com/backend-api'
 
@@ -37,6 +31,15 @@ type WebSocketOptions =
 
 type GlobalWebSocketSlot = { WebSocket?: unknown }
 
+/**
+ * Receives every text frame of a Codex WebSocket with the headers the socket
+ * was opened with, so a `codex.rate_limits` frame is recorded against the
+ * account whose token opened it. Set by the extension.
+ */
+let webSocketObserver:
+  | ((headers: Record<string, string>, data: string) => void)
+  | undefined
+
 class PiRawCodexWebSocket extends RawWebSocket {
   constructor(url: string | URL, options?: WebSocketOptions) {
     const headers =
@@ -44,6 +47,13 @@ class PiRawCodexWebSocket extends RawWebSocket {
         ? (options.headers ?? {})
         : {}
     super(String(url), headers)
+    const observer = webSocketObserver
+    if (observer) {
+      this.addEventListener('message', (event) => {
+        const data = (event as { data?: unknown } | null)?.data
+        if (typeof data === 'string') observer(headers, data)
+      })
+    }
   }
 }
 
@@ -124,76 +134,45 @@ const OPENAI_CODEX_MODELS: CodexModel[] = [
   },
 ]
 
-function streamOpenAI(
-  model: Model<Api>,
-  context: Context,
-  options?: SimpleStreamOptions,
-): AssistantMessageEventStream {
-  const outer = createAssistantMessageEventStream()
-  const restoreWebSocket = installRawCodexWebSocket()
-  let inner: AssistantMessageEventStream
-  try {
-    inner = streamSimpleOpenAICodexResponses(
-      model as CodexModel,
-      context,
-      options,
-    )
-  } catch (error) {
-    restoreWebSocket()
-    throw error
-  }
-
-  void (async () => {
-    try {
-      for await (const event of inner as AsyncIterable<AssistantMessageEvent>) {
-        outer.push(event)
-      }
-      outer.end()
-    } catch (error) {
-      outer.push({
-        type: 'error',
-        reason: 'error',
-        error: {
-          role: 'assistant',
-          content: [],
-          api: model.api,
-          provider: model.provider,
-          model: model.id,
-          usage: {
-            input: 0,
-            output: 0,
-            cacheRead: 0,
-            cacheWrite: 0,
-            totalTokens: 0,
-            cost: {
-              input: 0,
-              output: 0,
-              cacheRead: 0,
-              cacheWrite: 0,
-              total: 0,
-            },
-          },
-          stopReason: 'error',
-          errorMessage: error instanceof Error ? error.message : String(error),
-          timestamp: Date.now(),
-        },
-      })
-      outer.end()
-    } finally {
-      restoreWebSocket()
-    }
-  })()
-
-  return outer
+/**
+ * Creates the request path for one loaded extension: requests are routed
+ * across Pi's own login and the account pool (see `runtime.ts`).
+ */
+export function createPiOpenAIRuntime(): PiOpenAIRuntime {
+  return new PiOpenAIRuntime({
+    streamSimple: (model, context, options) =>
+      streamSimpleOpenAICodexResponses(model as CodexModel, context, options),
+    createStream: createAssistantMessageEventStream,
+    installWebSocket: installRawCodexWebSocket,
+  })
 }
 
 export default function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
-  registerCommands(pi)
+  const runtime = createPiOpenAIRuntime()
+  webSocketObserver = (headers, data) =>
+    runtime.observeWebSocketMessage(headers, data)
+  registerCommands(pi, { pool: runtime.commandSupport() })
   pi.registerProvider('openai-codex', {
     name: 'OpenAI Codex (CortexKit OAuth)',
     baseUrl: BASE_URL,
     api: 'openai-codex-responses',
     models: OPENAI_CODEX_MODELS,
-    streamSimple: streamOpenAI,
+    streamSimple: (model: Model<Api>, context, options) =>
+      runtime.stream(model, context, options),
   })
+  // At session start, read the pool (which starts every row's first quota
+  // poll) and take Pi's login, which starts its first quota poll, so the
+  // first request finds readings instead of being refused for want of one.
+  if (typeof pi.on === 'function') {
+    pi.on('session_start', async (_event, ctx) => {
+      void runtime.start()
+      try {
+        runtime.main.observeToken(
+          await ctx.modelRegistry.getApiKeyForProvider('openai-codex'),
+        )
+      } catch {
+        // No login yet: the first request hands one over.
+      }
+    })
+  }
 }
