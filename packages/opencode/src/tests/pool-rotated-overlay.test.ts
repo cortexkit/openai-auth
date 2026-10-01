@@ -48,7 +48,7 @@ describe('the rotated-credential overlay', () => {
     // Another process replaces the row's credential with a new login: the
     // epoch goes up and the new credential carries no rotation stamp.
     const config = readJson(paths.configPath) as {
-      commonAuthPool: { rows: Record<string, { credentialEpoch: number }> }
+      commonAuthPool: { rows: { alpha: { credentialEpoch: number } } }
     }
     config.commonAuthPool.rows.alpha.credentialEpoch = 2
     writeFileSync(paths.configPath, JSON.stringify(config))

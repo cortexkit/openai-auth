@@ -167,6 +167,11 @@ export class OpenAiVault {
   readonly #pulls = new Map<string, Promise<unknown>>()
   #lastError: string | undefined
   #waiting: Promise<ClaustrumEnrollmentStatus> | undefined
+  /** The roster discovery this instance has in flight, if any. */
+  #discovery: Promise<VaultRosterFile | undefined> | undefined
+  #polling = false
+  #closed = false
+  #pollTimer: ReturnType<typeof setTimeout> | undefined
 
   constructor(options: OpenAiVaultOptions) {
     this.#options = options
@@ -185,9 +190,6 @@ export class OpenAiVault {
         ? { reservedRouteIds: options.reservedRouteIds }
         : {}),
       parseIdentity: vaultIdentityOf,
-      ...(options.pollIntervalMs !== undefined
-        ? { pollIntervalMs: options.pollIntervalMs }
-        : {}),
       ...(options.now ? { now: options.now } : {}),
       onRoster: () => {
         this.#lastError = undefined
@@ -243,13 +245,53 @@ export class OpenAiVault {
    * another process (`opencode auth login`) finished.
    */
   start(): void {
-    this.#consumer.start()
+    // The poll runs here rather than in the consumer (`ClaustrumConsumer.start`)
+    // so every discovery this instance starts goes through `#discover`,
+    // which `refresh` needs to tell a discovery already in flight from one
+    // that began after it was called.
+    if (this.#polling || this.#closed) return
+    this.#polling = true
+    const tick = async () => {
+      try {
+        await this.#discover()
+      } catch (error) {
+        if (!this.#closed) this.#fail('vault roster refresh failed', error)
+      }
+      if (this.#closed) return
+      const delay = this.#options.pollIntervalMs ?? 5_000
+      if (delay <= 0) return
+      this.#pollTimer = setTimeout(() => {
+        this.#pollTimer = undefined
+        void tick()
+      }, delay)
+      this.#pollTimer.unref?.()
+    }
+    void tick()
   }
 
-  /** Re-reads the accounts from the vault now. Never rejects. */
+  /**
+   * One roster discovery through the consumer, shared by every caller that
+   * arrives while it runs.
+   */
+  #discover(): Promise<VaultRosterFile | undefined> {
+    this.#discovery ??= this.#consumer.refresh().finally(() => {
+      this.#discovery = undefined
+    })
+    return this.#discovery
+  }
+
+  /**
+   * Re-reads the accounts from the vault now. Never rejects. It resolves only
+   * after a discovery that began after this call: one already in flight (the
+   * poll, or a refresh another caller started) may have read the enrollment
+   * and the vault before what this caller just changed, so it is waited out
+   * and a new one runs. Callers that arrive while that new one runs share it.
+   */
   async refresh(): Promise<VaultRosterFile | undefined> {
     try {
-      const roster = await this.#consumer.refresh()
+      const earlier = this.#discovery
+      if (earlier) await earlier.catch(() => undefined)
+      const roster = await this.#discover()
       this.#lastError = undefined
       return roster
     } catch (error) {
@@ -581,7 +623,7 @@ export class OpenAiVault {
   async disconnect(): Promise<void> {
     await rm(this.paths.tokenPath, { force: true })
     await rm(this.paths.statePath, { force: true })
-    await this.#consumer.refresh().catch(() => undefined)
+    await this.refresh()
     this.#lastError = undefined
     log.info('vault enrollment forgotten', { host: this.host })
   }
@@ -598,6 +640,9 @@ export class OpenAiVault {
   }
 
   close(): void {
+    this.#closed = true
+    if (this.#pollTimer) clearTimeout(this.#pollTimer)
+    this.#pollTimer = undefined
     this.#consumer.close()
   }
 }
