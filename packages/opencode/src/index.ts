@@ -13,6 +13,7 @@ import {
   adoptRpcServer,
   type RpcServerAdoption,
 } from '@cortexkit/common-auth/rpc'
+import { POOL_LOCK_DEFAULTS } from '@cortexkit/common-auth/store'
 import {
   type ResetTargetIdentity,
   writeSettings,
@@ -3212,12 +3213,20 @@ export async function CodexAuthPlugin(
           accountId: string,
           action: () => Promise<T>,
         ): Promise<T> => {
-          const lock = await acquireRefreshFileLock({
-            name: fallbackRefreshLockName(accountId),
-            ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
-            path: getConfigPath(),
-            renew: true,
-          })
+          // A refresh of the row may hold the lock for a moment; wait for it
+          // as long as a store write would before giving up.
+          const deadline = Date.now() + POOL_LOCK_DEFAULTS.timeoutMs
+          let lock: Awaited<ReturnType<typeof acquireRefreshFileLock>> = null
+          for (;;) {
+            lock = await acquireRefreshFileLock({
+              name: fallbackRefreshLockName(accountId),
+              ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+              path: getConfigPath(),
+              renew: true,
+            })
+            if (lock || Date.now() >= deadline) break
+            await new Promise((resolve) => setTimeout(resolve, 50))
+          }
           if (!lock) throw new Error('Fallback account lock unavailable')
           try {
             return await action()

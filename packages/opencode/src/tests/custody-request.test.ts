@@ -12,9 +12,12 @@ import {
   stampVaultProvenance,
   type VaultProvenance,
 } from '@cortexkit/openai-auth-core/internal'
+import { applyOpenAiMenu } from '../commands.ts'
 import { getAccountPaths } from '../core/account-paths.ts'
 import type { OpenAICacheKeepManager as CacheKeepManager } from '../core/cachekeep.ts'
+import { CUSTODY_INERT_REASONS } from '../core/custody-state.ts'
 import {
+  __menuContextForTest,
   __resetBootQuotaSeedForTest,
   type ClaustrumCacheTransportLike,
   CodexAuthPlugin,
@@ -76,6 +79,12 @@ async function withCustodyLoader(
       configPath: string,
     ) => Promise<void> | void
     respond: (authorization: string, url: string) => number
+    /** Seeds a migrated install (the account pool), which `/openai` opens on. */
+    migrated?: boolean
+    withFallbackAccountLock?: <T>(
+      accountId: string,
+      action: () => Promise<T>,
+    ) => Promise<T>
   },
   run: (input: {
     fetchOverride: typeof globalThis.fetch
@@ -126,6 +135,12 @@ async function withCustodyLoader(
         mode: options.claustrumEnabled === false ? 'local' : 'claustrum',
       }),
       routing: options.routing,
+      ...(options.migrated
+        ? {
+            commonAuthPool: { schemaVersion: 1, rows: {} },
+            openaiAuthPool: { migratedAt: Date.now() - 60_000 },
+          }
+        : {}),
     }),
   )
   writeFileSync(manifestPath, JSON.stringify(manifest.value))
@@ -192,6 +207,7 @@ async function withCustodyLoader(
         onRuntime: (value) => {
           runtime = value
         },
+        withFallbackAccountLock: options.withFallbackAccountLock,
       },
     },
   )
@@ -268,6 +284,95 @@ function codexRequest(sessionId?: string): [string, RequestInit] {
 describe('custody request resolution', () => {
   beforeEach(() => {
     __resetBootQuotaSeedForTest()
+  })
+
+  it('refuses enabling a bound row when the served custody identity differs', async () => {
+    const account = liveAccount('binding-mismatch', {
+      enabled: false,
+      accountId: 'row-account',
+    })
+    await withCustodyLoader(
+      {
+        accounts: [account],
+        migrated: true,
+        credential: {
+          material: makeCustodyRequestJwt('served-account'),
+          recordVersion: 1,
+        },
+        respond: () => 200,
+      },
+      async ({ configPath }) => {
+        const ctx = __menuContextForTest()
+        if (!ctx) throw new Error('no /openai context loaded')
+        const result = await applyOpenAiMenu(ctx, {
+          command: 'openai',
+          sectionId: 'accounts',
+          itemId: account.id,
+          actionId: 'enable',
+          sessionId: 'binding-mismatch',
+        })
+
+        expect(result.ok).toBe(false)
+        expect(result.text).toContain('identity-mismatch')
+        expect(CUSTODY_INERT_REASONS).toContain('identity-mismatch')
+        expect(
+          (await loadAccounts(getAccountPaths(configPath)))?.accounts[0],
+        ).toMatchObject({
+          accountId: 'row-account',
+          enabled: false,
+        })
+      },
+    )
+  })
+
+  it('binds a pending row under the account lock before enabling it', async () => {
+    const account = liveAccount('binding-pending', { enabled: false })
+    let lockHeld = false
+    let boundWhileLocked = false
+    await withCustodyLoader(
+      {
+        accounts: [account],
+        migrated: true,
+        credential: {
+          material: makeCustodyRequestJwt('served-account'),
+          recordVersion: 1,
+        },
+        respond: () => 200,
+        withFallbackAccountLock: async (_id, action) => {
+          lockHeld = true
+          try {
+            const result = await action()
+            boundWhileLocked =
+              (await loadAccounts(getAccountPaths()))?.accounts[0]
+                ?.accountId === 'served-account'
+            return result
+          } finally {
+            lockHeld = false
+          }
+        },
+      },
+      async ({ configPath }) => {
+        const ctx = __menuContextForTest()
+        if (!ctx) throw new Error('no /openai context loaded')
+        const result = await applyOpenAiMenu(ctx, {
+          command: 'openai',
+          sectionId: 'accounts',
+          itemId: account.id,
+          actionId: 'enable',
+          sessionId: 'binding-pending',
+        })
+
+        expect(result.ok).toBe(true)
+        expect(lockHeld).toBe(false)
+        expect(boundWhileLocked).toBe(true)
+        expect(
+          (await loadAccounts(getAccountPaths(configPath)))?.accounts[0],
+        ).toMatchObject({
+          accountId: 'served-account',
+          enabled: true,
+        })
+      },
+    )
   })
 
   it('uses the configured custody transport in the loader', async () => {
