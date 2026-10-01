@@ -72,6 +72,16 @@ export const OPENAI_PROVIDER_ID = 'openai'
  */
 export const DEFAULT_LIMIT_MARK_MS = 60_000
 
+/**
+ * The size every request counts for in sticky placement. OpenCode 2 hands
+ * the hooks no request body before the account is chosen, so each session
+ * counts the same: placement then weighs the number of sessions on a row
+ * against the row's spendable quota. It must be above zero: placement scores
+ * a row as (other sessions' bytes + this request's bytes) / weight, and with
+ * zero everywhere every row ties and the roster order alone decides.
+ */
+const NOMINAL_REQUEST_BYTES = 1
+
 /** Most sessions whose last agent-loop account is remembered. */
 const MAX_SESSION_ACCOUNTS = 1024
 
@@ -334,9 +344,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     persist: boolean,
   ): string | undefined => {
     const options: StickyRouteOptions = {
-      // OpenCode 2 hands the hooks no request body before the account is
-      // chosen, so sessions are weighed by quota alone.
-      requestBytes: 0,
+      requestBytes: NOMINAL_REQUEST_BYTES,
       reservePercent: (id) =>
         getKillswitchThresholdsForAccount(
           storage,
@@ -350,7 +358,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     const place = (exclude: readonly string[], keep: boolean) =>
       pins.place({
         sessionId,
-        requestBytes: 0,
+        requestBytes: NOMINAL_REQUEST_BYTES,
         validPinnedAccountIds: routing.rows
           .map((row) => row.id)
           .filter((id) => !sticky.excluded.has(id)),
