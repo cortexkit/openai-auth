@@ -260,7 +260,7 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
       )
     },
     websocket: {
-      message(socket, message) {
+      message(socket) {
         const { connection, identity, accountHeader } = socket.data
         const index = ++requests
         const rejected = takeReject(identity)
