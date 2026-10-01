@@ -15,7 +15,10 @@ import {
   runMenu,
 } from '@cortexkit/common-auth/auth-menu'
 import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
-import type { MigrationBlocker } from '@cortexkit/openai-auth-core'
+import {
+  type MigrationBlocker,
+  withAccountRules,
+} from '@cortexkit/openai-auth-core'
 import {
   base64UrlEncode,
   beginAccountLogin,
@@ -46,6 +49,7 @@ import {
   poolRemovalRefusal,
   poolSettingsLocks,
 } from '../core/pool-accounts'
+import { legacyRefreshLocks } from '../core/pool-migration'
 import { observationFromSnapshot } from '../core/pool-quota'
 import { migrationFenceOpen } from '../core/version-fence'
 import { PackageVersion } from '../version'
@@ -303,7 +307,11 @@ export function createAuthMethods({
     store: PoolStore,
   ): AccountMenuOptions => ({
     title: MENU_TITLE,
-    store,
+    // A re-login replaces the row's credential, and a row write holds the
+    // locks an older process refreshes that row under (`withAccountRules`).
+    store: withAccountRules(store, {
+      rowLocks: (id) => legacyRefreshLocks(paths, id),
+    }),
     ...(deps.terminal ? { terminal: deps.terminal } : {}),
     login: menuLogin(store),
     // Row `main` (the account OpenCode signs in with) and a row the

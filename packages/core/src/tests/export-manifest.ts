@@ -22,6 +22,7 @@ export const ROOT_VALUE_EXPORTS = [
   'createOpenAiMenu',
   'isNotifyPayload',
   'killswitchInFloors',
+  'killswitchWithDefaultFloors',
   'loginAddInput',
   'menuLogin',
   'migrateLegacySettings',
@@ -30,11 +31,13 @@ export const ROOT_VALUE_EXPORTS = [
   'scrubKnobs',
   'sessionSection',
   'settingsMutateAccounts',
+  'withAccountRules',
   'withSettingsMigration',
   'writeSettings',
 ] as const
 
 export const ROOT_TYPE_EXPORTS = [
+  'AccountRules',
   'ApplyRequest',
   'ApplyResult',
   'CacheKeepManager',

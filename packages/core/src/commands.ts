@@ -34,6 +34,7 @@ import type {
 import {
   type AccountStorage,
   type ClaustrumMode,
+  DEFAULT_KILLSWITCH_THRESHOLDS,
   type loadAccounts as defaultLoadAccounts,
   type mutateAccounts as defaultMutateAccounts,
   getKillswitchThresholdsForAccount,
@@ -158,6 +159,29 @@ export function killswitchInFloors(
 }
 
 /**
+ * A killswitch block created in the shared vocabulary, marked as such, with
+ * the default floors (`DEFAULT_KILLSWITCH_THRESHOLDS`) written for row
+ * `main` and every row in `rosterIds` the block does not name. Floors the
+ * block already holds are kept as they are.
+ */
+export function killswitchWithDefaultFloors(
+  block: Record<string, unknown>,
+  rosterIds: readonly string[],
+): Settings {
+  const accounts: Record<string, unknown> = isRecord(block.accounts)
+    ? { ...block.accounts }
+    : {}
+  for (const id of new Set([MAIN_ROW_ID, ...rosterIds])) {
+    if (PROTOTYPE_KEYS.has(id) || Object.hasOwn(accounts, id)) continue
+    accounts[id] = {
+      primary: DEFAULT_KILLSWITCH_THRESHOLDS.primary,
+      secondary: DEFAULT_KILLSWITCH_THRESHOLDS.secondary,
+    }
+  }
+  return { ...block, accounts, schema: KILLSWITCH_FLOORS_SCHEMA }
+}
+
+/**
  * Moves the settings this plugin wrote under an older name or meaning into
  * the shared vocabulary, in place. True when anything changed.
  *
@@ -199,8 +223,8 @@ async function rosterIdsOf(store: PoolStore): Promise<string[]> {
  * `readSettings` returns the settings as `migrateLegacySettings` would leave
  * them, without writing. `updateSettings` migrates the stored settings in
  * the same locked write as the caller's change, before the caller sees them
- * (so its edit applies to the new shape), and marks a killswitch block the
- * caller created as being in the new vocabulary.
+ * (so its edit applies to the new shape), and gives a killswitch block the
+ * caller created the default floors (`killswitchWithDefaultFloors`).
  * Every other member is the store's own.
  *
  * The roster is read just before the locked write; a row added in between
@@ -223,16 +247,15 @@ export function withSettingsMigration(store: PoolStore): PoolStore {
       migrateLegacySettings(settings, ids)
       const next = (await mutator(settings)) ?? settings
       // Any block that existed is marked by now, so an unmarked one was
-      // created by this write, in the shared vocabulary: it is marked as it
-      // is, without the older defaults.
+      // created by this write (turning the killswitch on, or setting a first
+      // floor). Every account it does not name gets the default floors, as
+      // turning the killswitch on always did, so enabling it protects every
+      // account rather than none.
       if (
         isRecord(next.killswitch) &&
         next.killswitch.schema !== KILLSWITCH_FLOORS_SCHEMA
       )
-        next.killswitch = {
-          ...next.killswitch,
-          schema: KILLSWITCH_FLOORS_SCHEMA,
-        }
+        next.killswitch = killswitchWithDefaultFloors(next.killswitch, ids)
       return next
     }, options)
   }
@@ -240,6 +263,112 @@ export function withSettingsMigration(store: PoolStore): PoolStore {
     get(target, property) {
       if (property === 'readSettings') return readSettings
       if (property === 'updateSettings') return updateSettings
+      const value: unknown = Reflect.get(target, property, target)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+}
+
+export interface AccountRules {
+  /**
+   * The legacy locks a write of row `id` holds besides the store's own: the
+   * locks an older openai-auth process holds while it refreshes that row.
+   * Taken by remove, enable, disable and replace (and by the replace a
+   * re-login becomes).
+   */
+  rowLocks?(id: string): readonly PoolLockSpec[]
+  /**
+   * Wraps enabling row `id`. `enable` does the store write with the given
+   * locks (the row's locks when none are given). The default enables at once.
+   */
+  enableRow?(
+    id: string,
+    enable: (extraLocks?: readonly PoolLockSpec[]) => Promise<{ id: string }>,
+  ): Promise<{ id: string }>
+}
+
+/**
+ * The store with openai-auth's rules for row writes:
+ *
+ * - remove, enable, disable and replace take `rowLocks(id)`;
+ * - an add of a login whose ChatGPT identity (or, failing that, whose id) an
+ *   OAuth row already holds replaces that row's credential instead of adding
+ *   a disabled duplicate: signing in again refreshes the account. The
+ *   account row `main` holds is refused; it is OpenCode's own sign-in.
+ *
+ * Every other member is the store's own.
+ */
+export function withAccountRules(
+  store: PoolStore,
+  rules: AccountRules,
+): PoolStore {
+  const locksFor = (id: string, given?: readonly PoolLockSpec[]) =>
+    rules.rowLocks ? rules.rowLocks(id) : given
+  const withLocks = <T extends { extraLocks?: readonly PoolLockSpec[] }>(
+    id: string,
+    options: T | undefined,
+  ): T => {
+    const extraLocks = locksFor(id, options?.extraLocks)
+    return { ...(options ?? ({} as T)), ...(extraLocks ? { extraLocks } : {}) }
+  }
+  const replace: PoolStore['replace'] = (id, credential, identity, options) =>
+    store.replace(id, credential, identity, withLocks(id, options))
+  const add: PoolStore['add'] = async (input, options) => {
+    const load = await store.read()
+    const rows = load.status === 'ready' ? load.rows : []
+    const oauth = rows.filter((row) => row.type === 'oauth' && !row.invalid)
+    const sameAccount = input.identity
+      ? oauth.find((row) => row.identity === input.identity)
+      : undefined
+    if (sameAccount?.id === MAIN_ROW_ID)
+      throw new Error(
+        'that account is already your main account, so it was not added again',
+      )
+    const existing =
+      sameAccount ??
+      oauth.find((row) => row.id === input.id && row.id !== MAIN_ROW_ID)
+    if (!existing || input.credential.type !== 'oauth')
+      return store.add(input, options)
+    const replaced = await replace(
+      existing.id,
+      input.credential,
+      input.identity !== undefined ? { identity: input.identity } : {},
+      options?.extraLocks ? { extraLocks: options.extraLocks } : undefined,
+    )
+    log.info('account signed in again', { id: existing.id })
+    return {
+      id: replaced.id,
+      outcome: 'rotated',
+      credential: replaced.credential,
+    }
+  }
+  const enable: PoolStore['enable'] = (id, options) => {
+    const run = (extraLocks?: readonly PoolLockSpec[]) =>
+      store.enable(id, {
+        ...(options ?? {}),
+        ...((extraLocks ?? locksFor(id, options?.extraLocks))
+          ? { extraLocks: extraLocks ?? locksFor(id, options?.extraLocks) }
+          : {}),
+      })
+    return rules.enableRow ? rules.enableRow(id, run) : run()
+  }
+  const members: Partial<Record<keyof PoolStore, unknown>> = {
+    add,
+    replace,
+    enable,
+    disable: ((id, reason, options) =>
+      store.disable(
+        id,
+        reason,
+        withLocks(id, options),
+      )) as PoolStore['disable'],
+    remove: ((id, options) =>
+      store.remove(id, withLocks(id, options))) as PoolStore['remove'],
+  }
+  return new Proxy(store, {
+    get(target, property) {
+      if (Object.hasOwn(members, property))
+        return members[property as keyof PoolStore]
       const value: unknown = Reflect.get(target, property, target)
       return typeof value === 'function' ? value.bind(target) : value
     },
@@ -628,16 +757,10 @@ export interface ResetCreditsDeps {
 }
 
 /**
- * The ChatGPT account each account's latest redemption in this process was
- * bound to, by config path and account key. The retry action replays that
- * attempt and must stay bound to the same ChatGPT account.
- */
-const boundRedemptions = new Map<string, string>()
-
-/**
  * Spends one reset credit on `accountKey`. A first attempt fetches a fresh
- * preview and binds the redemption to the ChatGPT account it names; a retry
- * replays the previous attempt's identifiers, bound to the same account.
+ * preview and binds the redemption to the ChatGPT account it names; a retry,
+ * or any attempt while a redemption is saved as in flight, goes to the
+ * account's current identity and replays the saved identifiers.
  */
 async function spendResetCredit(
   deps: ResetCreditsDeps,
@@ -650,20 +773,22 @@ async function spendResetCredit(
       'invalid_account_key',
       'That account cannot take a reset credit.',
     )
-  const bindingKey = `${deps.configPath}\u0000${accountKey}`
   let expected: string | undefined
   try {
-    if (retry) {
-      // A retry replays the previous attempt's request and credit ids, so it
-      // must go to the ChatGPT account that attempt was checked against, not
-      // to whatever the account signs in with now.
-      expected = boundRedemptions.get(bindingKey)
-      if (!expected)
-        return resetResultPayload(
-          accountKey,
-          'retry_without_binding',
-          'There is no redemption from this process to retry. Spend a reset credit to start one.',
-        )
+    // A redemption saved as in flight (its credit and request ids, under the
+    // `reset` key) is what keeps an unknown outcome from becoming a second
+    // spend: the coordinator replays exactly those ids (the server dedupes on
+    // the request id) or refuses. So with one saved, or for a retry, nothing
+    // is previewed: the request goes to the account's current identity and
+    // the coordinator decides from the saved state, even after a restart.
+    const saved = (
+      await deps.loadAccounts({
+        configPath: deps.configPath,
+        statePath: deps.statePath,
+      })
+    )?.reset?.[accountKey]
+    if (retry || (saved && Object.hasOwn(saved, 'inFlight'))) {
+      expected = (await deps.resolveResetTarget(accountKey)).chatgptAccountId
     } else {
       const preview = await buildResetPreviewRow(accountKey, deps)
       if (!preview.eligible)
@@ -680,7 +805,6 @@ async function spendResetCredit(
         'not_eligible',
         'Cannot reset: stable ChatGPT account identity unavailable.',
       )
-    if (!retry) boundRedemptions.set(bindingKey, expected)
     log.info('reset redemption decision', { accountKey, retry })
     const result = await runResetCreditRedemption(
       {
@@ -783,8 +907,15 @@ export function resetCreditsSection(
 
 export interface OpenAiMenuOptions {
   store: PoolStore
-  /** The legacy locks every store write the menu makes also takes. */
+  /**
+   * The legacy locks the menu's writes that name no single row take (the
+   * roster order, settings, a new account).
+   */
   extraLocks?: readonly PoolLockSpec[]
+  /** The legacy locks a write of one row takes; see `AccountRules`. */
+  rowLocks?: AccountRules['rowLocks']
+  /** Wraps enabling a row (OpenCode's Claustrum binding check). */
+  enableRow?: AccountRules['enableRow']
   /** Whether the install is migrated; absent means it always is (Pi). */
   migration?(): Promise<MenuMigrationState>
   login?: MenuLoginDeps
@@ -823,7 +954,12 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
   const menu = createCommandMenu({
     command: OPENAI_COMMAND_NAME,
     title: OPENAI_MENU_TITLE,
-    store: withSettingsMigration(options.store),
+    store: withSettingsMigration(
+      withAccountRules(options.store, {
+        ...(options.rowLocks ? { rowLocks: options.rowLocks } : {}),
+        ...(options.enableRow ? { enableRow: options.enableRow } : {}),
+      }),
+    ),
     ...(options.extraLocks ? { extraLocks: options.extraLocks } : {}),
     accounts: {
       ...(options.login ? { login: menuLogin(options.login) } : {}),

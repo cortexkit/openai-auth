@@ -7,12 +7,14 @@
  * not-migrated notice, is scrubbed the same way (`scrubKnobs`).
  */
 export {
+  type AccountRules,
   type CacheKeepManager,
   type ClaustrumSectionDeps,
   claustrumSection,
   createOpenAiMenu,
   FLOOR_LABELS,
   killswitchInFloors,
+  killswitchWithDefaultFloors,
   loginAddInput,
   type MenuLoginDeps,
   type MenuLoginFlow,
@@ -34,6 +36,7 @@ export {
   scrubKnobs,
   sessionSection,
   settingsMutateAccounts,
+  withAccountRules,
   withSettingsMigration,
   writeSettings,
 } from './commands'

@@ -23,6 +23,7 @@ import type {
 import {
   acquireRefreshFileLock,
   type CacheKeepManager,
+  fallbackRefreshLockName,
   type IngestAccount,
   loadAccounts,
   QuotaManager,
@@ -35,6 +36,7 @@ import {
   openOpenAiMenu,
 } from '../commands'
 import { getSettings, refreshSettings } from '../config'
+import { MAIN_REFRESH_LOCK_NAME } from '../core/custody-transition'
 import { openAccountPool } from '../core/pool-accounts'
 import { CodexAuthPlugin } from '../index'
 import { quotaMap, readJson, seedPool } from './fixtures/pool-install'
@@ -293,10 +295,146 @@ describe('/openai on a migrated install', () => {
     })
 
     expect(result.ok).toBe(true)
+    // Creating the block gives every account it does not name the default
+    // floors; the floors set here stay exactly as set.
     expect(config().killswitch).toEqual({
-      accounts: { alpha: { primary: 25 } },
+      accounts: {
+        alpha: { primary: 25 },
+        main: { primary: 5, secondary: 10 },
+      },
       schema: 'floors-v1',
     })
+  })
+
+  test('turning the killswitch on with no block protects every account with the default floors', async () => {
+    seed()
+    const result = await apply(context(), {
+      sectionId: 'limits',
+      actionId: 'killswitch',
+      values: { enabled: true },
+    })
+
+    expect(result.ok).toBe(true)
+    expect(config().killswitch).toEqual({
+      enabled: true,
+      accounts: {
+        main: { primary: 5, secondary: 10 },
+        alpha: { primary: 5, secondary: 10 },
+      },
+      schema: 'floors-v1',
+    })
+  })
+
+  test('signing in again to an account a row holds replaces its credential, adding no row', async () => {
+    seed()
+    notices.length = 0
+    const ctx = context({
+      beginAccountLogin: (async () => ({
+        url: 'https://auth.example/authorize',
+        instructions: '',
+        completion: Promise.resolve({
+          id: 'alpha-again',
+          type: 'oauth',
+          access: 'alpha-new-token',
+          refresh: 'alpha-new-refresh',
+          enabled: true,
+          addedAt: 1,
+          lastUsed: 1,
+          accountId: 'chatgpt-alpha',
+        } satisfies IngestAccount),
+      })) as unknown as OpenCodeMenuContext['beginAccountLogin'],
+    })
+
+    await apply(ctx, {
+      sectionId: 'accounts',
+      actionId: 'add',
+      values: { headless: false },
+    })
+    for (let i = 0; i < 200 && notices.length === 0; i++) await Bun.sleep(10)
+
+    expect(notices.at(-1)).toContain('its credential was updated')
+    const rows = config().accounts as Array<{ id: string; enabled: boolean }>
+    expect(rows.map((row) => [row.id, row.enabled])).toEqual([
+      ['main', true],
+      ['alpha', true],
+    ])
+    const state = readJson(files.stateFile).accounts as Record<
+      string,
+      { refresh?: string }
+    >
+    expect(state.alpha?.refresh).toBe('alpha-new-refresh')
+  })
+
+  // An older openai-auth process refreshes a roster row under the row's
+  // fallback refresh lock and the slot's token under `main-refresh`; a row
+  // write from the menu waits for either rather than land in the middle of
+  // a refresh.
+  for (const [actionId, lockLabel, lockName] of [
+    ['disable', 'fallback refresh', fallbackRefreshLockName('alpha')],
+    ['enable', 'fallback refresh', fallbackRefreshLockName('alpha')],
+    ['remove', 'fallback refresh', fallbackRefreshLockName('alpha')],
+    ['disable', 'main-refresh', MAIN_REFRESH_LOCK_NAME],
+    ['enable', 'main-refresh', MAIN_REFRESH_LOCK_NAME],
+    ['remove', 'main-refresh', MAIN_REFRESH_LOCK_NAME],
+  ] as const) {
+    test(`${actionId} waits for the legacy ${lockLabel} lock and completes once it is released`, async () => {
+      seedPool(files, [
+        { id: 'main', quota: quotaMap(10) },
+        { id: 'alpha', quota: quotaMap(10), enabled: actionId !== 'enable' },
+      ])
+      const before = readFileSync(files.configFile, 'utf8')
+      const lock = await acquireRefreshFileLock({
+        name: lockName,
+        ttlMs: 60_000,
+        path: files.configFile,
+      })
+      if (!lock) throw new Error('legacy lock not taken')
+      let settled = false
+      const pending = apply(context(), {
+        sectionId: 'accounts',
+        itemId: 'alpha',
+        actionId,
+        ...(actionId === 'remove' ? { confirmed: true } : {}),
+      }).finally(() => {
+        settled = true
+      })
+      try {
+        await Bun.sleep(400)
+        expect(settled).toBe(false)
+        expect(readFileSync(files.configFile, 'utf8')).toBe(before)
+      } finally {
+        await lock.release()
+      }
+
+      expect((await pending).ok).toBe(true)
+      const row = (
+        config().accounts as Array<{ id: string; enabled: boolean }>
+      ).find((candidate) => candidate.id === 'alpha')
+      if (actionId === 'remove') expect(row).toBeUndefined()
+      else expect(row?.enabled).toBe(actionId === 'enable')
+    })
+  }
+
+  test('the roster order waits for main-refresh only, not a row fallback refresh lock', async () => {
+    seed()
+    const lock = await acquireRefreshFileLock({
+      name: fallbackRefreshLockName('alpha'),
+      ttlMs: 60_000,
+      path: files.configFile,
+    })
+    try {
+      const result = await apply(context(), {
+        sectionId: 'routing',
+        actionId: 'order',
+        values: { order: 'alpha, main' },
+      })
+      expect(result.ok).toBe(true)
+      expect(
+        (config().accounts as Array<{ id: string }>).map((row) => row.id),
+      ).toEqual(['alpha', 'main'])
+    } finally {
+      await lock?.release()
+    }
   })
 
   test('row main cannot be removed, and disabling another row goes through the store', async () => {

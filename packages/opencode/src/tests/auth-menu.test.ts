@@ -375,6 +375,32 @@ describe('OpenCode auth menu', () => {
     expect(state.work?.refresh).toBe('refresh-work')
   })
 
+  test("Add account for an account a row holds replaces that row's credential", async () => {
+    const { paths, files } = poolFiles()
+    seedPool(files, [
+      { id: 'main', quota: quotaMap(10) },
+      { id: 'alpha', quota: quotaMap(10) },
+    ])
+    const { method } = menuMethods(paths, [ENTER], {
+      beginAccountLogin: (async () => ({
+        ...successfulFlow('again'),
+        completion: Promise.resolve(
+          account('again', { accountId: 'chatgpt-alpha' }),
+        ),
+      })) as never,
+    })
+
+    await expectMenuCompletionFailed(await method.authorize({}))
+
+    const rows = readJson(paths.configPath).accounts as Array<{ id: string }>
+    expect(rows.map((row) => row.id)).toEqual(['main', 'alpha'])
+    const state = readJson(paths.statePath).accounts as Record<
+      string,
+      { refresh?: string }
+    >
+    expect(state.alpha?.refresh).toBe('refresh-again')
+  })
+
   test("Add account refuses the main account's ChatGPT account", async () => {
     const { paths, files } = poolFiles()
     seedPool(files, [{ id: 'main', quota: quotaMap(10) }])

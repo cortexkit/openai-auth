@@ -12,7 +12,7 @@
  * payload of its own.
  */
 import type { CommandMenuModel } from '@cortexkit/common-auth/commands'
-import type { PoolStore } from '@cortexkit/common-auth/store'
+import type { PoolLockSpec, PoolStore } from '@cortexkit/common-auth/store'
 import {
   type ApplyRequest,
   type ApplyResult,
@@ -35,12 +35,14 @@ import {
   cacheKeepSettings,
   claustrumMode,
   type loadAccounts,
+  type OAuthAccount,
   type QuotaManager,
   type RefreshAllQuotaResult,
   setLogLevel,
 } from '@cortexkit/openai-auth-core/internal'
 import { getSettings, refreshSettings } from './config'
 import { poolRemovalRefusal, poolSettingsLocks } from './core/pool-accounts'
+import { legacyRefreshLocks } from './core/pool-migration'
 import { createLogger } from './logger'
 import { pushNotification } from './rpc/notifications'
 
@@ -85,6 +87,20 @@ export interface OpenCodeMenuContext {
   fetchImpl?: typeof fetch
   now?: () => number
   randomUUID?: () => string
+  /** Runs `action` holding row `accountId`'s fallback refresh lock. */
+  withFallbackAccountLock?: <T>(
+    accountId: string,
+    action: () => Promise<T>,
+  ) => Promise<T>
+  /**
+   * Under Claustrum mode, whether the vault serves a usable credential for
+   * the account, and which ChatGPT account it signs in as.
+   */
+  checkUsableCustodyBinding?: (
+    account: OAuthAccount,
+  ) => Promise<
+    { ready: true; accountId: string } | { ready: false; reason: string }
+  >
   enterClaustrumMode?: () => Promise<{
     status: 'completed' | 'incomplete' | 'aborted'
     outcomes: Record<string, string>
@@ -398,6 +414,55 @@ async function resetAccountKeys(ctx: OpenCodeMenuContext): Promise<string[]> {
   ]
 }
 
+/**
+ * Enabling a row under Claustrum mode: the vault must serve a usable
+ * credential for the account first, checked and recorded under the row's
+ * fallback refresh lock (so no refresh of the row runs in between), and the
+ * row takes the ChatGPT account the vault signs in as. Outside Claustrum mode
+ * the row is enabled at once, with its own locks.
+ */
+async function enableUnderCustody(
+  ctx: OpenCodeMenuContext,
+  id: string,
+  enable: (extraLocks?: readonly PoolLockSpec[]) => Promise<{ id: string }>,
+): Promise<{ id: string }> {
+  if ((await currentClaustrumMode(ctx)) !== 'claustrum') return enable()
+  const check = ctx.checkUsableCustodyBinding
+  const withLock =
+    ctx.withFallbackAccountLock ??
+    (async <T>(_id: string, action: () => Promise<T>) => action())
+  // The row's fallback refresh lock is held around the whole check, so the
+  // writes inside take only `main-refresh`.
+  const locks = poolSettingsLocks(storePaths(ctx))
+  return withLock(id, async () => {
+    const store = ctx.store()
+    const load = await store.read()
+    const row =
+      load.status === 'ready'
+        ? load.rows.find((candidate) => candidate.id === id)
+        : undefined
+    if (!row || row.type !== 'oauth') return enable(locks)
+    const binding = check
+      ? await check({
+          id,
+          type: 'oauth',
+          refresh: '',
+          enabled: row.enabled,
+          addedAt: row.addedAt ?? 0,
+          lastUsed: 0,
+          ...(row.identity !== undefined ? { accountId: row.identity } : {}),
+        } as OAuthAccount)
+      : { ready: false as const, reason: 'unbound-under-claustrum' }
+    if (!binding.ready)
+      throw new Error(
+        `${id} remains disabled: ${binding.reason}. Resolve the custody binding, then try again.`,
+      )
+    if (row.identity !== binding.accountId)
+      await store.recordIdentity(id, binding.accountId, { extraLocks: locks })
+    return enable(locks)
+  })
+}
+
 /** The `/openai` menu over this process's context. */
 export function createOpenCodeMenu(ctx: OpenCodeMenuContext) {
   const paths = storePaths(ctx)
@@ -426,6 +491,8 @@ export function createOpenCodeMenu(ctx: OpenCodeMenuContext) {
   return createOpenAiMenu({
     store: ctx.store(),
     extraLocks,
+    rowLocks: (id) => legacyRefreshLocks(paths, id),
+    enableRow: (id, enable) => enableUnderCustody(ctx, id, enable),
     migration: ctx.migration,
     ...(beginLogin
       ? {

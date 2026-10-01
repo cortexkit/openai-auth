@@ -35,6 +35,7 @@ import {
   FALLBACK_REFRESH_LOCK_TTL_MS,
   type FallbackAccount,
   FallbackAccountManager,
+  fallbackRefreshLockName,
   formatRefreshBackoffMessage,
   getKillswitchThresholdsForAccount,
   hashRefreshToken,
@@ -762,6 +763,8 @@ interface CodexAuthPluginOptions {
     sleep?: (ms: number) => Promise<void>
     /** Test seam: observes a host-write observation deadline warning. */
     warn?: (message: string) => void
+    /** Test seam: observes the account lock around custody binding checks. */
+    withFallbackAccountLock?: OpenCodeMenuContext['withFallbackAccountLock']
     /** Test seam: replaces external OAuth I/O while preserving the hook callback. */
     authorize?: {
       browser?: () => Promise<{
@@ -3205,6 +3208,74 @@ export async function CodexAuthPlugin(
         // Start the loopback RPC server so the TUI can drain notifications and
         // dispatch apply commands.
         // -------------------------------------------------------------------
+        const defaultWithFallbackAccountLock = async <T>(
+          accountId: string,
+          action: () => Promise<T>,
+        ): Promise<T> => {
+          const lock = await acquireRefreshFileLock({
+            name: fallbackRefreshLockName(accountId),
+            ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+            path: getConfigPath(),
+            renew: true,
+          })
+          if (!lock) throw new Error('Fallback account lock unavailable')
+          try {
+            return await action()
+          } finally {
+            await lock.release()
+          }
+        }
+        const withFallbackAccountLock =
+          custodyOptions?.withFallbackAccountLock ??
+          defaultWithFallbackAccountLock
+        const checkUsableCustodyBinding = async (account: OAuthAccount) => {
+          const manifest = await readCustodyManifest()
+          if (!manifest.ok) {
+            return {
+              ready: false as const,
+              reason: 'manifest-unreadable' as const,
+            }
+          }
+          const handle = lookupManifestHandle(manifest, account.id)
+          if (!handle)
+            return { ready: false as const, reason: 'no-handle' as const }
+          const cache = custodyRuntime.getCache()
+          if (!cache) {
+            return { ready: false as const, reason: 'vault-cold' as const }
+          }
+          if (cache.isReauth(handle, custodyOptions?.now?.() ?? Date.now())) {
+            return { ready: false as const, reason: 'vault-reauth' as const }
+          }
+          if (cache.isBlocked(handle)) {
+            return { ready: false as const, reason: 'vault-cold' as const }
+          }
+          try {
+            const credential = await cache.get(handle, custodyMinTtlMs(storage))
+            const accountId = mainAccountIdFromServedCredential(
+              credential.payload.access,
+            )
+            if (
+              !accountId ||
+              (account.accountId && account.accountId !== accountId)
+            ) {
+              return {
+                ready: false as const,
+                reason: 'identity-mismatch' as const,
+              }
+            }
+            return { ready: true as const, accountId }
+          } catch {
+            return {
+              ready: false as const,
+              reason: cache.isReauth(
+                handle,
+                custodyOptions?.now?.() ?? Date.now(),
+              )
+                ? ('vault-reauth' as const)
+                : ('vault-cold' as const),
+            }
+          }
+        }
         activeFallbackManager?.stopBackgroundRefresh()
         activeFallbackManager = fallbackManager
         const menuPaths = getAccountPaths(getConfigPath())
@@ -3215,6 +3286,8 @@ export async function CodexAuthPlugin(
           quotaManager,
           loadAccounts,
           beginAccountLogin,
+          withFallbackAccountLock,
+          checkUsableCustodyBinding,
           // The files this loader run serves, fixed now: the menu works on
           // them even if another project's run changes the environment.
           store: () => openAccountPool(menuPaths),

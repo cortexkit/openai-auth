@@ -10,6 +10,7 @@
  */
 
 import type {
+  AccountRules,
   ClaustrumSectionDeps,
   MenuLoginDeps,
   MenuLoginFlow,
@@ -98,6 +99,7 @@ import type {
 } from '../internal.ts'
 
 type RootSurface = {
+  accountRules: AccountRules
   applyRequest: RootApplyRequest
   applyResult: RootApplyResult
   cacheKeepManager: RootCacheKeepManager
