@@ -502,6 +502,27 @@ describe('what the handle-mode custody left behind', () => {
     ).toBe(true)
   })
 
+  test('a tombstone in the slot is taken like the pool placeholder: the pool and the vault serve', async () => {
+    await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
+    enroll()
+    seedPool(files, [{ id: 'main', quota: quotaMap(100) }])
+    const wire = wireWithExhaustedMain()
+    const tombstone = { ...PLACEHOLDER, refresh: 'claustrum-tombstone:v1:openai' }
+    await plugin(tombstone)
+    const loader = hooks?.auth?.loader
+    if (!loader) throw new Error('no loader')
+    const { fetch: send } = (await loader(
+      (async () => ({ ...tombstone })) as never,
+      {} as never,
+    )) as { fetch: typeof globalThis.fetch }
+
+    const response = await request(send)
+
+    expect(response.status).toBe(200)
+    // Only the pool path routes vault accounts.
+    expect(wire.sends).toEqual([`Bearer ${VAULT_ACCESS}`])
+  })
+
   test('a settings write drops the old custody mode from the config', async () => {
     seedPool(files, [{ id: 'main', quota: quotaMap(10) }], {
       claustrum: { mode: 'claustrum', rowHistory: ['gone'] },
