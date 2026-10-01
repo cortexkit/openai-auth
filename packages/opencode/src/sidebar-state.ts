@@ -103,17 +103,6 @@ export interface SidebarAccountState {
   killed: boolean
   enabled: boolean
   resetCredits?: number
-  custody?: SidebarAccountCustody
-}
-
-export type SidebarCustodyState = 'vault' | 'needsLogin' | 'local' | 'inert'
-
-export type SidebarCustodyReason = CustodyInertReason | 'corrupt'
-
-export interface SidebarAccountCustody {
-  state: SidebarCustodyState
-  reason?: SidebarCustodyReason
-  recordVersion?: number
 }
 
 export interface ActiveRoutingEntry {
@@ -158,7 +147,6 @@ export interface SidebarState {
     quota: AccountQuota | null
     /** ChatGPT identity of the main account this quota belongs to. */
     mainAccountId?: string
-    custody?: SidebarAccountCustody
     killed: boolean
     quotaBackedOff?: boolean
     quotaBackoffUntil?: number
@@ -194,11 +182,6 @@ import {
   type SidebarFile,
   type SidebarFileHooks,
 } from '@cortexkit/common-auth/sidebar-file'
-import {
-  CUSTODY_INERT_REASONS,
-  type CustodyInertReason,
-  type CustodyVerdict,
-} from './core/custody-state'
 import { createLogger } from './logger'
 
 const logSb = createLogger('sidebar')
@@ -240,49 +223,6 @@ function normalizeResetCredits(value: unknown): number | undefined {
 function resetCreditsField(value: unknown): { resetCredits?: number } {
   const credits = normalizeResetCredits(value)
   return credits !== undefined ? { resetCredits: credits } : {}
-}
-
-const CUSTODY_STATES = new Set<SidebarCustodyState>([
-  'vault',
-  'needsLogin',
-  'local',
-  'inert',
-])
-
-const CUSTODY_REASONS = new Set<SidebarCustodyReason>([
-  ...CUSTODY_INERT_REASONS,
-  'corrupt',
-])
-
-/**
- * Tolerant reader for the per-fallback `custody` projection. Unknown state
- * or reason values are dropped (NOT replaced with a default — a stale state
- * file with an experimental `vaultHealing` value must not silently render
- * as `local`, it must render as no-projection-at-all). Valid values round-
- * trip byte-identical. The output contains only `state` and `reason`.
- */
-function normalizeSidebarCustody(
-  value: unknown,
-): SidebarAccountCustody | undefined {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return undefined
-  }
-  const c = value as Record<string, unknown>
-  if (
-    typeof c.state !== 'string' ||
-    !CUSTODY_STATES.has(c.state as SidebarCustodyState)
-  ) {
-    return undefined
-  }
-  const state = c.state as SidebarCustodyState
-  const out: SidebarAccountCustody = { state }
-  if (
-    typeof c.reason === 'string' &&
-    CUSTODY_REASONS.has(c.reason as SidebarCustodyReason)
-  ) {
-    out.reason = c.reason as SidebarCustodyReason
-  }
-  return out
 }
 
 function normalizeActiveRouting(value: unknown): ActiveRoutingMap | undefined {
@@ -404,23 +344,6 @@ function importLegacySidebarState(file: string, legacyFile: string): void {
   }
 }
 
-export function projectCustodyForSidebar(
-  verdict: CustodyVerdict,
-): SidebarAccountCustody {
-  switch (verdict.kind) {
-    case 'LOCAL':
-      return { state: 'local' }
-    case 'VAULT':
-      return { state: 'vault' }
-    case 'INERT':
-      return { state: 'inert', reason: verdict.reason }
-    case 'NEEDS_LOGIN':
-      return verdict.reason === 'corrupt'
-        ? { state: 'needsLogin', reason: 'corrupt' }
-        : { state: 'needsLogin' }
-  }
-}
-
 export const DEFAULT_SIDEBAR_STATE: SidebarState = {
   main: { quota: null, killed: false },
   fallbacks: [],
@@ -460,10 +383,6 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
       ...(typeof m.mainAccountId === 'string'
         ? { mainAccountId: m.mainAccountId }
         : {}),
-      ...(() => {
-        const custody = normalizeSidebarCustody(m.custody)
-        return custody ? { custody } : {}
-      })(),
       // Preserve optional backoff fields if present
       ...(typeof m.quotaBackedOff === 'boolean'
         ? { quotaBackedOff: m.quotaBackedOff }
@@ -497,7 +416,6 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
             typeof (entry as Record<string, unknown>).id === 'string',
         )
         .map((e) => {
-          const custody = normalizeSidebarCustody(e.custody)
           return {
             id: e.id as string,
             label: typeof e.label === 'string' ? e.label : undefined,
@@ -508,7 +426,6 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
             killed: typeof e.killed === 'boolean' ? e.killed : false,
             enabled: typeof e.enabled === 'boolean' ? e.enabled : true,
             ...resetCreditsField(e.resetCredits),
-            ...(custody ? { custody } : {}),
           }
         })
     : []

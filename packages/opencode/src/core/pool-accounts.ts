@@ -43,7 +43,7 @@ import {
   type AccountPaths,
   POOL_MAIN_ROW_ID,
 } from '@cortexkit/openai-auth-core/internal'
-import { MAIN_REFRESH_LOCK_NAME } from './custody-transition'
+import { MAIN_REFRESH_LOCK_NAME } from './host-slot'
 import {
   type LegacyLockOptions,
   legacyRefreshLocks,

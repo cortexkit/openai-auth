@@ -22,10 +22,8 @@
     "packages/core": {
       "name": "@cortexkit/openai-auth-core",
       "version": "0.0.0",
-      "dependencies": {
-        "@cortexkit/claustrum-client": "^0.4.0",
-      },
       "devDependencies": {
+        "@cortexkit/claustrum-client": "0.5.0",
         "@cortexkit/common-auth": "0.2.9",
       },
     },
@@ -41,6 +39,7 @@
       },
       "devDependencies": {
         "@ai-sdk/openai": "3.0.88",
+        "@cortexkit/claustrum-client": "0.5.0",
         "@cortexkit/common-auth": "0.2.9",
         "@cortexkit/openai-auth-core": "workspace:*",
       },
@@ -52,6 +51,7 @@
       "name": "@cortexkit/pi-openai-auth",
       "version": "0.11.0",
       "devDependencies": {
+        "@cortexkit/claustrum-client": "0.5.0",
         "@cortexkit/common-auth": "0.2.9",
         "@cortexkit/openai-auth-core": "workspace:*",
       },
@@ -189,7 +189,7 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.5.14", "", { "os": "win32", "cpu": "x64" }, "sha512-oJWmBhoHsnhUKIke+0gXDX0mltJrWHA1UyHsrTlXwX0TL64ilVZAo+TYZm97baecV0esBdpzy3k96q+09JaZUQ=="],
 
-    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.4.0", "", { "dependencies": { "@cortexkit/subc-client": "^0.16.0" } }, "sha512-xjUXf/lB3T8R7oaOu9T1Obnn47bAdN5UbyaTpywyiY4wdvTbqHBnB3qX0KpDFTeZ7m35tRPDevcWvOzJIgUhMw=="],
+    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.5.0", "", { "dependencies": { "@cortexkit/subc-client": "^0.16.0" } }, "sha512-+mRG/h3YZufrEs1p12W+Y+NSnWIUiBcpppMTgFA5tAQ7t8WIWoMEmn0Mf7Cp8251SKChW8dN3xOZqEM7N6gyAg=="],
 
     "@cortexkit/common-auth": ["@cortexkit/common-auth@0.2.9", "", { "dependencies": { "jsonc-parser": "^3.3.1" }, "peerDependencies": { "@cortexkit/claustrum-client": ">=0.5.0", "@opencode/plugin": ">=2.0.21", "@opentui/core": ">=0.5.12", "@opentui/solid": ">=0.5.12", "solid-js": "1.9.12" }, "optionalPeers": ["@cortexkit/claustrum-client", "@opencode/plugin", "@opentui/core", "@opentui/solid", "solid-js"] }, "sha512-mj16SOimt3ue0DB9V1OqQCnsjUSakVDc99FthIAujsS21zkcDqBTZIPodkzY9W6RrVTxfIbXeMCwEDtW6E+8bQ=="],
 

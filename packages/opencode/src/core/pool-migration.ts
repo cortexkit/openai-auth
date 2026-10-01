@@ -86,7 +86,6 @@ import {
 import {
   type AccountPaths,
   type AccountStorage,
-  claustrumMode,
   extractAccountIdFromClaims,
   FALLBACK_REFRESH_LOCK_TTL_MS,
   fallbackRefreshLockName,
@@ -101,9 +100,9 @@ import { createLogger } from '../logger'
 import {
   asCompleteMainOauthSlot,
   confirmMainAuthSlot,
+  MAIN_REFRESH_LOCK_NAME,
   mainSlotFamilyFingerprint,
-} from './custody-host-slot.ts'
-import { MAIN_REFRESH_LOCK_NAME } from './custody-transition.ts'
+} from './host-slot.ts'
 import type {
   VersionFenceBlocker,
   VersionFenceResult,
@@ -117,8 +116,8 @@ export const POOL_PLACEHOLDER_REFRESH = 'common-auth-placeholder:v1:openai'
 /**
  * What the host slot holds once its credential lives in the pool. The empty
  * access token means nothing can ever be sent from it. It is deliberately not
- * the custody tombstone (`claustrum-tombstone:v1:`), which marks vault
- * custody and must never be confused with a completed migration.
+ * the tombstone the removed vault custody wrote (`claustrum-tombstone:v1:`),
+ * so a slot holding one is never taken for a completed migration.
  */
 export const POOL_PLACEHOLDER = Object.freeze({
   type: 'oauth' as const,
@@ -232,6 +231,13 @@ export interface PoolMigrationDeps {
     >
   >
   onStep?: (step: PoolMigrationStep) => void | Promise<void>
+  /**
+   * Whether the Claustrum vault serves this host's accounts. While it does,
+   * an adoption leaves a real login in the slot where it is: the request
+   * path refuses to serve it, and moving it into the pool would make it a
+   * second owner of accounts the vault owns.
+   */
+  vaultServes?: () => boolean
 }
 
 export type SlotNothingKind =
@@ -242,8 +248,8 @@ export type SlotNothingKind =
   | 'declined'
 
 export type PoolTransferOutcome =
-  /** Custody mode: the legacy store stays in charge; nothing was written. */
-  | { status: 'deferred-claustrum' }
+  /** Adoption under the vault (see `vaultServes`); nothing was written. */
+  | { status: 'vault-owns-accounts' }
   /**
    * An openai-auth process older than this one is running (see
    * `version-fence.ts`); nothing was written. The migration runs once they
@@ -347,6 +353,7 @@ type Context = {
   leaseWait: { timeoutMs: number; pollMs: number }
   store: PoolStore
   onStep: (step: PoolMigrationStep) => Promise<void>
+  vaultServes?: () => boolean
 }
 
 type HeldLock = { release(): Promise<void>; assertOwned(): Promise<void> }
@@ -372,6 +379,7 @@ function context(deps: PoolMigrationDeps): Context {
       deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     newId: deps.newId ?? (() => crypto.randomUUID()),
     log: deps.log ?? createLogger('pool-migration'),
+    ...(deps.vaultServes ? { vaultServes: deps.vaultServes } : {}),
     locks: { ...LEGACY_LOCK_DEFAULTS, ...deps.legacyLocks },
     leaseWait: deps.leaseWait ?? { timeoutMs: 4_000, pollMs: 50 },
     store: openPoolStore({
@@ -1238,6 +1246,7 @@ async function completeTransfer(
 }
 
 const deferredLogged = new Set<string>()
+const vaultSkipLogged = new Set<string>()
 
 /**
  * The processes that block the migration. A fence check that throws counts
@@ -1339,26 +1348,26 @@ async function run(
   }
 }
 
-/** The checks that end a run before any lock: custody mode and the marker. */
+/** The checks that end a run before any lock: the marker and the vault. */
 function gate(
   ctx: Context,
   mode: 'migrate' | 'adopt',
   config: Record<string, unknown>,
 ): PoolTransferOutcome | undefined {
-  if (claustrumMode(config as Pick<AccountStorage, 'claustrum'>) !== 'local') {
-    if (!deferredLogged.has(ctx.paths.configPath)) {
-      deferredLogged.add(ctx.paths.configPath)
-      ctx.log.info(
-        'account pool migration deferred: claustrum custody mode keeps the legacy store',
-      )
-    }
-    return { status: 'deferred-claustrum' }
-  }
   const book = readPoolMigrationBookkeeping(config)
   if (mode === 'migrate' && book.migratedAt !== undefined)
     return { status: 'already-migrated' }
   if (mode === 'adopt' && book.migratedAt === undefined)
     return { status: 'not-migrated' }
+  if (mode === 'adopt' && ctx.vaultServes?.()) {
+    if (!vaultSkipLogged.has(ctx.paths.configPath)) {
+      vaultSkipLogged.add(ctx.paths.configPath)
+      ctx.log.warn(
+        'a login in the OpenCode slot is not adopted: the Claustrum vault serves this host its accounts',
+      )
+    }
+    return { status: 'vault-owns-accounts' }
+  }
   return undefined
 }
 
@@ -1475,10 +1484,9 @@ export interface PoolMigrationFenceDeps {
 
 /**
  * One-time move of the host-slot credential into the pool row `main`
- * (fallback rows are already pool rows: same ids, same files). Local custody
- * mode only; under claustrum mode it writes nothing and logs once. It also
- * writes nothing while an older openai-auth process runs (`deferred`). A
- * re-run after completion does nothing.
+ * (fallback rows are already pool rows: same ids, same files). It writes
+ * nothing while an older openai-auth process runs (`deferred`). A re-run
+ * after completion does nothing.
  */
 export function migrateToPool(
   deps: PoolMigrationDeps & PoolMigrationFenceDeps,

@@ -201,9 +201,6 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
         log.warn('account pool migration will be tried again', { outcome })
       schedule(retryDelay())
     }
-    // `deferred-claustrum`: the install keeps its credentials in Claustrum
-    // custody, which stays on the legacy store, so there is nothing to retry
-    // (`pool-migration.ts` logs this once). A later process start looks again.
   }
 
   async function runAdoption(): Promise<void> {
@@ -239,7 +236,9 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
       // migration's own run adopts afterwards.
       return
     }
-    if (outcome.status !== 'deferred-claustrum') isMigrated = true
+    // Every other adoption outcome, `vault-owns-accounts` included, means
+    // the install is migrated.
+    isMigrated = true
     if (outcome.status === 'completed')
       log.info('host login adopted into the account pool', {
         rowId: outcome.rowId,

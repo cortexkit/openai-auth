@@ -17,6 +17,12 @@
 //   good; a pinned row whose quota is not known yet serves elsewhere for this
 //   request only. Requests that cannot be pinned (no session, not
 //   replayable) are routed main-first.
+//
+// The OpenAI accounts the Claustrum vault serves this host (`ctx.vault`) are
+// routed beside the pool rows, through the same admission and modes. A vault
+// account holds no token: each send asks the vault for one. A pool row
+// signing in as a ChatGPT account the vault holds is left out, so one account
+// has one owner.
 
 import { isQuotaMap } from '@cortexkit/common-auth/quota'
 import {
@@ -32,6 +38,7 @@ import {
   getKillswitchThresholdsForAccount,
   isKillswitchEnabled,
   isShieldedMainRow,
+  isTombstoned,
   killswitchPassesPolicy,
   type OAuthQuotaSnapshot,
   quotaSnapshotPassesPolicy,
@@ -75,8 +82,49 @@ export interface PoolBlockQuotas {
   fallbacks: Array<{ accountId: string; quota?: OAuthQuotaSnapshot }>
 }
 
+/** One account a request may be sent with: a pool row or a vault account. */
+export interface PoolTarget {
+  id: string
+  /** The ChatGPT account it signs in as, when known. */
+  identity?: string
+  /** Its quota map; undefined while no reading has arrived. */
+  quota?: unknown
+  /** `api-key` for a static key the vault serves; every pool row is `oauth`. */
+  kind: 'oauth' | 'api-key'
+  /** The pool row; absent for a vault account. */
+  row?: PoolRow
+}
+
+/** The vault accounts, as a request routes them (see `OpenAiVault`). */
+export interface PoolVaultRoutes {
+  /** The vault accounts that may route now. */
+  routes(): ReadonlyArray<{
+    id: string
+    kind: 'oauth' | 'api-key'
+    identity?: string
+    quota?: unknown
+  }>
+  /** Every ChatGPT account the vault holds for this host. */
+  identities(): ReadonlySet<string>
+  /**
+   * Sends on a vault account with the token the vault serves for this
+   * attempt; undefined when the vault refused before anything was sent.
+   */
+  send(
+    id: string,
+    dispatch: (
+      token: string,
+      attempt: { accountIdentity?: string },
+    ) => Promise<Response>,
+  ): Promise<Response | undefined>
+  /** Asks for a quota reading of a vault account admission refused for want of one. */
+  requestReading(id: string): void
+}
+
 export interface PoolRequestContext {
   source: PoolAccountSource
+  /** The vault accounts; absent while this host has none. */
+  vault?: PoolVaultRoutes
   /** The legacy settings this request reads (routing, killswitch, fallback statuses). */
   storage: AccountStorage | null
   mode: RoutingMode
@@ -85,10 +133,19 @@ export interface PoolRequestContext {
   body: string | undefined
   replayable: boolean
   now: () => number
-  /** Sends the request with one row's token; rejects on a transport failure or abort. */
-  send(row: PoolRow, token: string): Promise<Response>
-  /** Records the quota a response carried for the row that served it. */
-  recordQuota(response: Response, row: PoolRow, token: string): void
+  /** Sends the request with one account's token; rejects on a transport failure or abort. */
+  send(target: PoolTarget, token: string): Promise<Response>
+  /**
+   * Records the quota a response carried for the account that served it.
+   * `attempt` is the vault's receipt for a vault account: the reading is kept
+   * only while the account still signs in as the same ChatGPT account.
+   */
+  recordQuota(
+    response: Response,
+    target: PoolTarget,
+    token: string,
+    attempt?: { accountIdentity?: string },
+  ): void
   /** The session pin ledger: decides (and, when asked, records) a session's pin. */
   placePin(input: PoolPinPlacement): { accountId: string } | undefined
   /** A provider-shaped refusal for a request no account may serve. */
@@ -120,10 +177,15 @@ export function routableRows(
   rows: readonly PoolRow[],
   storage: AccountStorage | null,
   now: number,
+  vaultIdentities: ReadonlySet<string> = new Set(),
 ): PoolRow[] {
   return rows.filter((row) => {
     if (!row.candidate || row.type !== 'oauth') return false
     if (row.credential?.type !== 'oauth') return false
+    if (isTombstoned(row.credential)) return false
+    // The vault owns this ChatGPT account; its vault route serves it.
+    if (row.identity !== undefined && vaultIdentities.has(row.identity))
+      return false
     if (row.id === FORMER_MAIN_ID) return true
     if (isShieldedMainRow(storage, { accountId: row.identity })) return false
     return quotaSnapshotPassesPolicy(
@@ -134,51 +196,115 @@ export function routableRows(
   })
 }
 
+/** The accounts one request may be sent with now: the routable pool rows, then the vault's. */
+function currentTargets(ctx: PoolRequestContext): PoolTarget[] {
+  const vaultIdentities = ctx.vault?.identities() ?? new Set<string>()
+  const rows = routableRows(
+    ctx.source.peek().rows,
+    ctx.storage,
+    ctx.now(),
+    vaultIdentities,
+  )
+  return [
+    ...rows.map(
+      (row): PoolTarget => ({
+        id: row.id,
+        kind: 'oauth',
+        ...(row.identity !== undefined ? { identity: row.identity } : {}),
+        ...(row.quota !== undefined ? { quota: row.quota } : {}),
+        row,
+      }),
+    ),
+    ...(ctx.vault?.routes() ?? []).map(
+      (route): PoolTarget => ({
+        id: route.id,
+        kind: route.kind,
+        ...(route.identity !== undefined ? { identity: route.identity } : {}),
+        ...(route.quota !== undefined ? { quota: route.quota } : {}),
+      }),
+    ),
+  ]
+}
+
+function poolRowsOf(targets: readonly PoolTarget[]): PoolRow[] {
+  return targets.flatMap((target) => (target.row ? [target.row] : []))
+}
+
 function routingInput(
   ctx: PoolRequestContext,
-  rows: readonly PoolRow[],
+  targets: readonly PoolTarget[],
 ): PoolRoutingInput {
   const now = ctx.now()
   const killswitch = new Map<string, boolean>()
   if (isKillswitchEnabled(ctx.storage)) {
-    for (const row of rows) {
+    for (const target of targets) {
       killswitch.set(
-        row.id,
+        target.id,
         killswitchPassesPolicy(
-          windowsFromQuotaMap(row.quota),
+          windowsFromQuotaMap(target.quota),
           ctx.storage,
-          row.id === FORMER_MAIN_ID ? undefined : row.id,
+          target.id === FORMER_MAIN_ID ? undefined : target.id,
           now,
         ),
       )
     }
   }
-  const routingRows: RoutingRow[] = rows.map((row) => ({
-    id: row.id,
-    kind: 'oauth',
-    ...(isQuotaMap(row.quota) ? { quota: row.quota } : {}),
+  const routingRows: RoutingRow[] = targets.map((target) => ({
+    id: target.id,
+    kind: target.kind,
+    ...(isQuotaMap(target.quota) ? { quota: target.quota } : {}),
   }))
+  const rows = poolRowsOf(targets)
+  const vaultIds = new Set(
+    targets.filter((target) => !target.row).map((target) => target.id),
+  )
   return {
     rows: routingRows,
     now,
     rateLimitMarks: ctx.source.rateLimitMarks(rows),
     refreshBackoff: ctx.source.refreshBackoffFor(rows),
     killswitch,
-    requestPull: (id) => ctx.source.requestReading(id),
+    requestPull: (id) =>
+      vaultIds.has(id)
+        ? ctx.vault?.requestReading(id)
+        : ctx.source.requestReading(id),
   }
 }
 
-function blockQuotas(rows: readonly PoolRow[]): PoolBlockQuotas {
-  const main = rows.find((row) => row.id === FORMER_MAIN_ID)
+function blockQuotas(targets: readonly PoolTarget[]): PoolBlockQuotas {
+  const main = targets.find((target) => target.id === FORMER_MAIN_ID)
   return {
     main: main ? windowsFromQuotaMap(main.quota) : undefined,
-    fallbacks: rows
-      .filter((row) => row.id !== FORMER_MAIN_ID)
-      .map((row) => {
-        const quota = windowsFromQuotaMap(row.quota)
-        return { accountId: row.id, ...(quota ? { quota } : {}) }
+    fallbacks: targets
+      .filter((target) => target.id !== FORMER_MAIN_ID)
+      .map((target) => {
+        const quota = windowsFromQuotaMap(target.quota)
+        return { accountId: target.id, ...(quota ? { quota } : {}) }
       }),
   }
+}
+
+/**
+ * Sends the request with one account and records the quota its response
+ * carried. Undefined when the account had nothing to send with: a pool row
+ * without a usable token, or a vault account the vault refused to serve.
+ */
+async function sendTo(
+  ctx: PoolRequestContext,
+  target: PoolTarget,
+): Promise<Response | undefined> {
+  if (target.row) {
+    const token = ctx.source.usableToken(target.row)
+    if (!token) return undefined
+    const response = await ctx.send(target, token)
+    ctx.recordQuota(response, target, token)
+    return response
+  }
+  return ctx.vault?.send(target.id, async (token, attempt) => {
+    const response = await ctx.send(target, token)
+    ctx.recordQuota(response, target, token, attempt)
+    return response
+  })
 }
 
 /** Reads the current rows, readies their tokens, and routes one request. */
@@ -187,7 +313,7 @@ export async function servePoolRequest(
 ): Promise<PoolRequestResult> {
   await ctx.source.current()
   await ctx.source.prepareTokens(ctx.source.peek().rows, ctx.storage)
-  const rows = routableRows(ctx.source.peek().rows, ctx.storage, ctx.now())
+  const rows = currentTargets(ctx)
 
   if (
     ctx.mode === 'sticky-balanced' &&
@@ -203,7 +329,7 @@ export async function servePoolRequest(
 
 async function serveOrdered(
   ctx: PoolRequestContext,
-  rows: readonly PoolRow[],
+  rows: readonly PoolTarget[],
 ): Promise<PoolRequestResult> {
   const placement = orderedPlacement(ctx.mode)
   const plan = planOrdered({
@@ -238,11 +364,10 @@ async function serveOrdered(
   for (;;) {
     const id = nextOrderedAttempt(plan.order, attempts, retryStatuses)
     const row = id === undefined ? undefined : byId.get(id)
-    const token = row ? ctx.source.usableToken(row) : undefined
-    if (!row || !token) break
-    let response: Response
+    if (!row) break
+    let response: Response | undefined
     try {
-      response = await ctx.send(row, token)
+      response = await sendTo(ctx, row)
     } catch (error) {
       // A failed send may already have reached the provider (generated, or
       // billed), so it is never repeated on another account. The previous
@@ -256,7 +381,7 @@ async function serveOrdered(
       })
       return last
     }
-    ctx.recordQuota(response, row, token)
+    if (!response) break
     // Only the response returned keeps its body; an earlier one is dropped
     // once a later attempt has produced a replacement.
     last?.response.body?.cancel().catch(() => {})
@@ -272,7 +397,7 @@ async function serveOrdered(
 
 async function serveSticky(
   ctx: PoolRequestContext,
-  rows: readonly PoolRow[],
+  rows: readonly PoolTarget[],
   sessionId: string,
   body: string,
 ): Promise<PoolRequestResult | undefined> {
@@ -366,10 +491,9 @@ async function serveSticky(
   }
 
   let row = byId.get(id)
-  let token = row ? ctx.source.usableToken(row) : undefined
-  if (!row || !token) return undefined
-  let response = await ctx.send(row, token)
-  ctx.recordQuota(response, row, token)
+  if (!row) return undefined
+  let response = await sendTo(ctx, row)
+  if (!response) return undefined
 
   if (
     response.status === 401 ||
@@ -378,7 +502,7 @@ async function serveSticky(
   ) {
     // The response's own quota has just been recorded, so judge the break on
     // the rows as they are now.
-    const current = routableRows(ctx.source.peek().rows, ctx.storage, ctx.now())
+    const current = currentTargets(ctx)
     routing = routingInput(ctx, current)
     sticky = admitSticky(routing)
     place = placer(routing, sticky)
@@ -387,16 +511,14 @@ async function serveSticky(
       const from = id
       if (migrate(after.reason) && id !== from) {
         const replacement = current.find((candidate) => candidate.id === id)
-        const replacementToken = replacement
-          ? ctx.source.usableToken(replacement)
+        const replaced = replacement
+          ? await sendTo(ctx, replacement)
           : undefined
-        if (replacement && replacementToken) {
+        if (replacement && replaced) {
           const previous = response
-          response = await ctx.send(replacement, replacementToken)
+          response = replaced
           previous.body?.cancel().catch(() => {})
           row = replacement
-          token = replacementToken
-          ctx.recordQuota(response, row, token)
         } else {
           id = from
         }

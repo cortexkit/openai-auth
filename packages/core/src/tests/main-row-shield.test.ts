@@ -7,7 +7,6 @@ import {
   type AccountStorage,
   FallbackAccountManager,
   loadAccounts,
-  manifestRevision,
   type OAuthAccount,
   ShieldedMainRowRefreshError,
   saveAccounts,
@@ -68,16 +67,8 @@ async function seed(): Promise<void> {
 }
 
 function managerRecording(refreshed: string[], polled: string[]) {
-  const emptyManifest = '{"version":1,"providers":[]}'
   return new FallbackAccountManager({
     paths,
-    custody: {
-      readManifest: async () => ({
-        ok: true,
-        value: { version: 1, providers: [] },
-        revision: manifestRevision(emptyManifest),
-      }),
-    },
     refreshFn: async ({ refreshToken }) => {
       refreshed.push(refreshToken)
       return {
