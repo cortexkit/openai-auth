@@ -352,7 +352,7 @@ export async function removePoolAccount(
   }
 }
 
-/** What deleting every account of a migrated install came to. */
+/** The outcome of removing every account of a migrated install. */
 export interface PoolRemoveAllOutcome {
   /** The rows removed, in roster order. */
   removed: string[]
@@ -423,7 +423,6 @@ async function poolRosterIds(store: PoolStore): Promise<string[]> {
       : 'the account pool is not migrated yet',
   )
 }
-
 
 /**
  * The `accountPool` the account commands use (see `CommandContext`), over the
@@ -504,9 +503,11 @@ function legacyRosterOrderLocks(
   paths: AccountPaths,
   options: PoolRowWriteOptions,
 ): PoolLockSpec[] {
-  return legacyRefreshLocks(paths, POOL_MAIN_ROW_ID, options.legacyLocks).filter(
-    (lock) => lock.name === MAIN_REFRESH_LOCK_NAME,
-  )
+  return legacyRefreshLocks(
+    paths,
+    POOL_MAIN_ROW_ID,
+    options.legacyLocks,
+  ).filter((lock) => lock.name === MAIN_REFRESH_LOCK_NAME)
 }
 
 /**
@@ -546,4 +547,3 @@ export async function swapPoolAccounts(
     }
   }
 }
-

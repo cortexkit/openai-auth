@@ -10,10 +10,17 @@ import { join } from 'node:path'
 
 const CORE_DIR = join(import.meta.dir, '..', 'core')
 
-/** The migration module writes the roster on purpose: it creates the pool. */
+/**
+ * The migration module may write the roster: it turns the legacy roster into
+ * the account pool.
+ */
 const ROSTER_WRITER_MODULES = new Set(['pool-migration.ts'])
 
-/** The legacy roster writers of `@cortexkit/openai-auth-core`. */
+/**
+ * The functions of `@cortexkit/openai-auth-core` that rewrite the account
+ * roster from the legacy loader's view of it, bypassing the store's row
+ * locks, refusals and per-row pool entries.
+ */
 const LEGACY_WRITERS = ['mutateAccounts', 'saveAccounts']
 
 /** Source without comments, so prose naming a writer does not count. */
@@ -24,9 +31,7 @@ function code(source: string): string {
 /** Each legacy writer the source imports or refers to. */
 function legacyWriterUses(source: string): string[] {
   const body = code(source)
-  return LEGACY_WRITERS.filter((name) =>
-    new RegExp(`\\b${name}\\b`).test(body),
-  )
+  return LEGACY_WRITERS.filter((name) => new RegExp(`\\b${name}\\b`).test(body))
 }
 
 const poolModules = readdirSync(CORE_DIR)

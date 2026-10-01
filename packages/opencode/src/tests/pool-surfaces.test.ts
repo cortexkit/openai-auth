@@ -659,8 +659,9 @@ describe('/openai-account on a migrated install', () => {
     const raw = readJson(files.configFile) as {
       accounts: Array<Record<string, unknown>>
     }
-    // A field no reader knows: `store.reorder` moves the row as it is, where
-    // the legacy roster writer rebuilds every row from what it loaded.
+    // A field neither the store nor the legacy loader recognises:
+    // `store.reorder` moves the row as it is, while the legacy roster writer
+    // rebuilds each row from the fields it loaded.
     raw.accounts[1] = { ...raw.accounts[1], futureField: { kept: true } }
     // A row the store reads as invalid keeps its position; the legacy roster
     // writer could not load it and appended it after the others.
