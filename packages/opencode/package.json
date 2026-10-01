@@ -22,6 +22,10 @@
     "./tui-prefs": {
       "types": "./dist/tui-preferences.d.ts",
       "import": "./dist/tui-preferences.js"
+    },
+    "./server": {
+      "types": "./dist/v2/server.d.ts",
+      "import": "./dist/v2/server.js"
     }
   },
   "oc-plugin": [
@@ -39,7 +43,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --minify && bun run build:types && bun run build:tui",
+    "build": "rm -rf dist && bun build src/index.ts src/v2/server.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --external @opencode/plugin --minify && bun run build:types && bun run build:tui",
     "build:tui": "bun scripts/build-tui.ts",
     "build:types": "cd ../core && bun run build && cd ../opencode && tsdown --config tsdown.config.ts",
     "build:dev": "rm -rf dist && tsc -p tsconfig.build.json",
@@ -49,12 +53,19 @@
     "prepublishOnly": "bun run build"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": "*"
+    "@opencode-ai/plugin": "*",
+    "@opencode/plugin": ">=2.0.21"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@ai-sdk/openai": "3.0.88",
     "@cortexkit/common-auth": "0.2.9",
-    "@cortexkit/openai-auth-core": "workspace:*"
+    "@cortexkit/openai-auth-core": "workspace:*",
+    "@opencode/plugin": "2.0.21"
   },
   "dependencies": {
     "@opentui/core": ">=0.5.12",

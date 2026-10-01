@@ -22,3 +22,24 @@ jobs:
       - run: bun run test
       - run: bun run format:check
       - run: bun run lint
+  # Runs the plugin's OpenCode 2 entry, packed as a consumer installs it, in
+  # the real OpenCode 2 CLI (installed from npm at test time, pinned in the
+  # test) against a loopback mock of the Codex backend. It fails when a host
+  # release stops carrying the pool account to the wire, rerouting a refused
+  # request, recording quota, or storing logins in the pool.
+  opencode2-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "24"
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - name: OpenCode 2 end to end
+        env:
+          OPENAI_AUTH_OPENCODE2_E2E: "1"
+        working-directory: packages/opencode
+        run: bun test src/tests/opencode2-e2e.test.ts

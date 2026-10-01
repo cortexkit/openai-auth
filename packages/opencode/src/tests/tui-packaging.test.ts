@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
 
 // ---------------------------------------------------------------------------
@@ -224,13 +224,28 @@ describe('tui packaging (compiled ./tui entry shim)', () => {
         'Built plugin bundle is missing: dist/index.js (run `bun run build` first)',
       )
     }
-    if (statSync(bundle).size < 1_024) {
+    // The build splits code shared between entry points (the root and the
+    // OpenCode 2 `./server` entry, which carries the same OpenCode 1 plugin)
+    // into chunks, so the plugin's code is the root module together with every
+    // chunk it imports.
+    const seen = new Set<string>()
+    const collect = (file: string): string => {
+      if (seen.has(file)) return ''
+      seen.add(file)
+      const text = readFileSync(file, 'utf8')
+      let all = text
+      for (const match of text.matchAll(
+        /(?:from|import)\s*["'](\.{1,2}\/[^"']+)["']/g,
+      ))
+        all += collect(join(dirname(file), match[1] ?? ''))
+      return all
+    }
+    const source = collect(bundle)
+    if (source.length < 1_024) {
       throw new Error(
-        'Built plugin bundle is unexpectedly small: dist/index.js',
+        'Built plugin bundle is unexpectedly small: dist/index.js and its chunks',
       )
     }
-
-    const source = readFileSync(bundle, 'utf8')
     const registryCount = source.match(/__openaiAuthRpcServers/g)?.length ?? 0
     if (registryCount < 1) {
       throw new Error('Built plugin bundle is missing the RPC registry global')
