@@ -43,10 +43,6 @@ function fakeNow() {
   }
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
 const CODEX_URL = 'https://chatgpt.com/backend-api/codex/responses'
 const TTL_MS = 5 * 60 * 1000 // 5 min
 const LEAD_MS = 5 * 1000 // 5 s lead
