@@ -55,7 +55,11 @@ function toolType(tool: unknown) {
     : 'unknown'
 }
 
-/** What `scripts/analyze-cache-cliffs.mjs` reads about a Responses body. */
+/**
+ * The shape of a Responses body (model, input and tool counts and hashes,
+ * cache key) stored in each dump's metadata; `scripts/analyze-cache-cliffs.mjs`
+ * reads it to explain prompt-cache misses between requests.
+ */
 export function bodySummary(parsed: Record<string, unknown>) {
   const input = Array.isArray(parsed.input) ? parsed.input : []
   const tools = Array.isArray(parsed.tools) ? parsed.tools : []

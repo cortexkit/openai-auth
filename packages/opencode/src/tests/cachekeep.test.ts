@@ -1772,7 +1772,8 @@ describe('routedAccountForSession', () => {
       },
     }
     expect(routedAccountForSession(state, 'sess', now)).toBe('fb-1')
-    // Recorded under another mode: says nothing about the next request.
+    // A route recorded while another routing mode was set does not say
+    // where this session's next request goes, so it is no binding.
     expect(routedAccountForSession(state, 'earlier', now)).toBeUndefined()
     expect(routedAccountForSession(state, 'unrouted', now)).toBeUndefined()
   })
@@ -1815,7 +1816,8 @@ describe('CacheKeepManager active account', () => {
     await mgr.tick()
     expect(fetchImpl).not.toHaveBeenCalled()
     expect(mgr.status().tracked).toBe(0)
-    // Asked by the router's session id, not the cache key.
+    // The lookup uses the router's session id ('opencode-session'), not the
+    // target's cache key ('thread-1').
     expect(activeAccount).toHaveBeenCalledWith('opencode-session')
   })
 

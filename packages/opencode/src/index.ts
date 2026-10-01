@@ -2782,9 +2782,10 @@ export async function CodexAuthPlugin(
             }
           },
           codexResponsesUrl: codexApiEndpoint,
-          // A session the router has since moved to another account is not
-          // warmed on the account it left. Sticky pins this process placed but
-          // has not written yet count, as they do for routing.
+          // The account the session routes to now: a session moved to another
+          // account is not warmed on the one it left. This process's sticky
+          // pins that are not saved yet are applied, as the router applies
+          // them, so a warm follows the same account choice as a request.
           activeAccount: async (routingSessionId) =>
             routedAccountForSession(
               applyStickyPinOverlay(

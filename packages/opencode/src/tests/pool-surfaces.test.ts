@@ -829,8 +829,9 @@ describe('cachekeep and reset credits on a migrated install', () => {
       | undefined
     if (!manager) throw new Error('no cachekeep manager')
 
-    // Capture one session per account, make both due and warm them: the
-    // bearer each warm carries is the one the plugin resolved for its account.
+    // Track one session per account, move both cache expiries to now so the
+    // tick warms them, and check that each warm request carries the bearer
+    // the plugin resolved for that account.
     const body = JSON.stringify({ model: 'gpt-5.5', input: [] })
     for (const accountId of ['main', 'fallback-1']) {
       manager.track({

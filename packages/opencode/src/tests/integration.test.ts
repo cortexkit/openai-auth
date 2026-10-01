@@ -4381,7 +4381,8 @@ describe('integration: active fallback routing', () => {
       ).__openaiAuthCacheKeepManagers?.get(getConfigPath())
       if (!manager) throw new Error('missing cachekeep manager')
 
-      // Still pinned where it was served: the warm replays on that account.
+      // The session is still pinned to the account that served it
+      // (fallback-2), so the warm replays there.
       now += 5 * 60_000
       await manager.tick()
       expect(sends).toEqual([
@@ -4389,8 +4390,8 @@ describe('integration: active fallback routing', () => {
         'Bearer fallback-2-token',
       ])
 
-      // Another process re-pins the session; its cache on fallback-2 is no
-      // longer the one the session will use.
+      // Another process moves the session's pin to fallback-1, so the prompt
+      // cache on fallback-2 is no longer the one its next request will use.
       const state = JSON.parse(readFileSync(sidebarFile, 'utf8'))
       state.stickyAssignments[hashSidebarSessionId('moved-session')].accountId =
         'fallback-1'
