@@ -60,6 +60,19 @@ export const FORMER_MAIN_ID = 'main'
  */
 export const POOL_QUOTA_UNKNOWN_RETRY_SECONDS = 5
 
+/**
+ * Where an ordered routing mode puts the main row: `ordered` (the shared
+ * menu's name for plain roster order) keeps the roster order, `fallback-first`
+ * puts row `main` last, and anything else (`main-first`, or a value an older
+ * reader wrote) puts it first.
+ */
+export function orderedPlacement(
+  mode: string | undefined,
+): Extract<OrderedPlacement, 'roster' | 'main-first' | 'fallback-first'> {
+  if (mode === 'ordered') return 'roster'
+  return mode === 'fallback-first' ? 'fallback-first' : 'main-first'
+}
+
 export interface PoolRoutingInput {
   /** OAuth rows openai-auth can send with, in roster order. */
   rows: readonly RoutingRow[]

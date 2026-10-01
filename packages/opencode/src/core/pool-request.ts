@@ -42,6 +42,7 @@ import { windowsFromQuotaMap } from './pool-quota'
 import {
   admitSticky,
   FORMER_MAIN_ID,
+  orderedPlacement,
   type PoolBlock,
   type PoolRoutingInput,
   planOrdered,
@@ -204,14 +205,7 @@ async function serveOrdered(
   ctx: PoolRequestContext,
   rows: readonly PoolRow[],
 ): Promise<PoolRequestResult> {
-  const placement =
-    ctx.mode === 'fallback-first'
-      ? 'fallback-first'
-      : // `ordered` is plain roster order; anything else older readers
-        // knew routes the main account first.
-        ctx.mode === 'ordered'
-        ? 'roster'
-        : 'main-first'
+  const placement = orderedPlacement(ctx.mode)
   const plan = planOrdered({
     ...routingInput(ctx, rows),
     placement,

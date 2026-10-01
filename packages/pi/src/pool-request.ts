@@ -36,6 +36,7 @@ import { windowsFromQuotaMap } from '@cortexkit/openai-auth-core/pool-quota'
 import {
   admitSticky,
   FORMER_MAIN_ID,
+  orderedPlacement,
   type PoolBlock,
   type PoolRoutingInput,
   planOrdered,
@@ -174,14 +175,7 @@ async function routeOrdered<A extends RouteAttempt>(
   ctx: PiRouteContext<A>,
   accounts: readonly RouteAccount[],
 ): Promise<PiRouteResult<A>> {
-  const placement =
-    ctx.mode === 'fallback-first'
-      ? 'fallback-first'
-      : // `ordered` is plain roster order; anything else older readers
-        // knew routes the main account first.
-        ctx.mode === 'ordered'
-        ? 'roster'
-        : 'main-first'
+  const placement = orderedPlacement(ctx.mode)
   const plan = planOrdered({ ...routingInput(ctx, accounts), placement })
   if (plan.kind === 'block') {
     ctx.log?.debug('pool admission blocked the request', {
