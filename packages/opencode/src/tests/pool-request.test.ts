@@ -665,12 +665,11 @@ describe('exhaustion and the credit budget on a migrated install', () => {
     })
 
     it(`${mode}: when every account is exhausted the request still reaches the provider`, async () => {
+      // Both windows at 100%: admission refuses both rows, and the request
+      // still goes out on the last path rather than being denied unasked.
       seedPool(mode, [
         { id: 'main', quota: quotaMap(100) },
-        {
-          id: 'fallback-1',
-          quota: quotaMap(10, { budget: { reached: true } }),
-        },
+        { id: 'fallback-1', quota: quotaMap(100) },
       ])
       const wire = installWire({
         respond: () => new Response('{}', { status: 429 }),
@@ -681,6 +680,21 @@ describe('exhaustion and the credit budget on a migrated install', () => {
 
       expect(response.status).toBe(429)
       expect(wire.sends.length).toBeGreaterThan(0)
+    })
+
+    it(`${mode}: when every credit budget is spent the request still reaches the provider`, async () => {
+      const spent = () => quotaMap(10, { budget: { reached: true } })
+      seedPool(mode, [
+        { id: 'main', quota: spent() },
+        { id: 'fallback-1', quota: spent() },
+      ])
+      const wire = installWire()
+      const fetchOverride = await loadFetch()
+
+      const response = await fetchOverride(URL_RESPONSES, request('s-spent'))
+
+      expect(response.status).toBe(200)
+      expect(wire.sends).toHaveLength(1)
     })
   }
 })
