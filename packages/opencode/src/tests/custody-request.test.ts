@@ -14,7 +14,6 @@ import {
 } from '@cortexkit/openai-auth-core/internal'
 import { getAccountPaths } from '../core/account-paths.ts'
 import type { OpenAICacheKeepManager as CacheKeepManager } from '../core/cachekeep.ts'
-import { CUSTODY_INERT_REASONS } from '../core/custody-state.ts'
 import {
   __resetBootQuotaSeedForTest,
   type ClaustrumCacheTransportLike,
