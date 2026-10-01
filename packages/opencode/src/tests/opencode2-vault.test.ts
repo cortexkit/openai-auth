@@ -108,6 +108,9 @@ async function start(
       return false
     }
   }, 'the vault accounts and their quota')
+  // The vault re-reads the roster file into memory right after writing it;
+  // routing sees the reading once that read has finished.
+  await Bun.sleep(100)
   return { host, daemon }
 }
 
@@ -174,7 +177,12 @@ describe('vault accounts on OpenCode 2', () => {
     })
     const credential = daemon.credentials['oauth:openai:vault']
     if (credential) credential.refuse = 'credential_unavailable'
+    const gets = daemon.gets.length
     const served = await send(host, 200)
+    // The vault was asked for this send and refused it.
+    expect(daemon.gets.slice(gets)).toEqual([
+      expect.objectContaining({ credential_id: 'oauth:openai:vault' }),
+    ])
     expect(served.get('authorization')).toBe('Bearer main-token')
     expect(daemon.reports).toEqual([])
   })
