@@ -205,7 +205,13 @@ async function serveOrdered(
   rows: readonly PoolRow[],
 ): Promise<PoolRequestResult> {
   const placement =
-    ctx.mode === 'fallback-first' ? 'fallback-first' : 'main-first'
+    ctx.mode === 'fallback-first'
+      ? 'fallback-first'
+      : // `ordered` is plain roster order; anything else older readers
+        // knew routes the main account first.
+        ctx.mode === 'ordered'
+        ? 'roster'
+        : 'main-first'
   const plan = planOrdered({
     ...routingInput(ctx, rows),
     placement,

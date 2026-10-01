@@ -175,7 +175,13 @@ async function routeOrdered<A extends RouteAttempt>(
   accounts: readonly RouteAccount[],
 ): Promise<PiRouteResult<A>> {
   const placement =
-    ctx.mode === 'fallback-first' ? 'fallback-first' : 'main-first'
+    ctx.mode === 'fallback-first'
+      ? 'fallback-first'
+      : // `ordered` is plain roster order; anything else older readers
+        // knew routes the main account first.
+        ctx.mode === 'ordered'
+        ? 'roster'
+        : 'main-first'
   const plan = planOrdered({ ...routingInput(ctx, accounts), placement })
   if (plan.kind === 'block') {
     ctx.log?.debug('pool admission blocked the request', {

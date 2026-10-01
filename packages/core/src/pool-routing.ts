@@ -144,7 +144,8 @@ function routeBlock(
  */
 export function planOrdered(
   input: PoolRoutingInput & {
-    placement: Extract<OrderedPlacement, 'main-first' | 'fallback-first'>
+    /** `roster` keeps the roster order (the menu's `ordered` mode). */
+    placement: OrderedPlacement
     /** False sends the request to one account only (see the no-replay gate); unset means true. */
     replayable?: boolean
   },
