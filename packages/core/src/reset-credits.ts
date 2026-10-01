@@ -166,8 +166,20 @@ export interface SavedResetPair extends ResetInFlight {
    * spend: the server answers a replay of a pair it consumed with
    * `already_redeemed`, not a refusal, and the new spend still has to find
    * the account exhausted, which it would not be had the pair reset it.
+   *
+   * Not recorded for a send that ran alongside one whose outcome is unknown
+   * (see `unknownAnswers`): that other send may have gone through.
    */
   rejectedStatus?: number
+  /**
+   * How many sends of this pair got an answer that settles nothing (neither
+   * a terminal answer nor a definite refusal). Each such answer clears
+   * `rejectedStatus`. A refusal is recorded only when this count is still
+   * what it was when its send read the pair: a different count means another
+   * send of the same pair got an unknown outcome in the meantime, and the
+   * pair must keep locking Spend whichever answer is written last.
+   */
+  unknownAnswers?: number
 }
 
 interface ResetClaim {
@@ -271,6 +283,11 @@ function validInFlight(value: unknown): SavedResetPair | undefined {
       : {}),
     ...(isDefiniteRefusal(value.rejectedStatus)
       ? { rejectedStatus: value.rejectedStatus }
+      : {}),
+    ...(typeof value.unknownAnswers === 'number' &&
+    Number.isSafeInteger(value.unknownAnswers) &&
+    value.unknownAnswers > 0
+      ? { unknownAnswers: value.unknownAnswers }
       : {}),
   }
 }
@@ -592,8 +609,11 @@ async function recordUnreconciledAnswer(
 ): Promise<void> {
   const refusal = isRefusedConsume(outcome) ? outcome.status : undefined
   const bind = completing.chatgptAccountId === undefined && sentAs !== undefined
-  // Most unknown outcomes change nothing; skip the write for those.
-  if (!bind && refusal === completing.rejectedStatus) return
+  // A repeated refusal changes nothing. An unknown outcome is always written:
+  // `completing` is the pair as read before the send, and another send of it
+  // may have recorded a refusal since.
+  if (!bind && refusal !== undefined && refusal === completing.rejectedStatus)
+    return
   await deps.mutateAccountsFn((current) => {
     const state = resetStateForAccount(current, accountKey)
     const persisted = validInFlight(state?.inFlight)
@@ -609,8 +629,14 @@ async function recordUnreconciledAnswer(
     if (next.chatgptAccountId === undefined && sentAs !== undefined) {
       next.chatgptAccountId = sentAs
     }
-    if (refusal === undefined) delete next.rejectedStatus
-    else next.rejectedStatus = refusal
+    if (refusal === undefined) {
+      delete next.rejectedStatus
+      next.unknownAnswers = (persisted.unknownAnswers ?? 0) + 1
+    } else if (
+      (persisted.unknownAnswers ?? 0) === (completing.unknownAnswers ?? 0)
+    ) {
+      next.rejectedStatus = refusal
+    }
     state.inFlight = next
     return current
   }, storePaths(deps))
