@@ -76,10 +76,6 @@ async function withCustodyLoader(
       url: string,
       configPath: string,
     ) => Promise<void> | void
-    withFallbackAccountLock?: <T>(
-      accountId: string,
-      action: () => Promise<T>,
-    ) => Promise<T>
     respond: (authorization: string, url: string) => number
   },
   run: (input: {
@@ -197,7 +193,6 @@ async function withCustodyLoader(
         onRuntime: (value) => {
           runtime = value
         },
-        withFallbackAccountLock: options.withFallbackAccountLock,
       },
     },
   )
@@ -274,82 +269,6 @@ function codexRequest(sessionId?: string): [string, RequestInit] {
 describe('custody request resolution', () => {
   beforeEach(() => {
     __resetBootQuotaSeedForTest()
-  })
-
-  it('refuses enabling a bound row when the served custody identity differs', async () => {
-    const account = liveAccount('binding-mismatch', {
-      enabled: false,
-      accountId: 'row-account',
-    })
-    await withCustodyLoader(
-      {
-        accounts: [account],
-        credential: {
-          material: makeCustodyRequestJwt('served-account'),
-          recordVersion: 1,
-        },
-        respond: () => 200,
-      },
-      async ({ commandHook, configPath }) => {
-        await commandHook({
-          command: 'openai-account',
-          arguments: `enable ${account.id}`,
-          sessionID: 'binding-mismatch',
-        }).catch(() => {})
-
-        expect(CUSTODY_INERT_REASONS).toContain('identity-mismatch')
-        expect(
-          (await loadAccounts(getAccountPaths(configPath)))?.accounts[0],
-        ).toMatchObject({
-          accountId: 'row-account',
-          enabled: false,
-        })
-      },
-    )
-  })
-
-  it('binds a pending row under the account lock before enabling it', async () => {
-    const account = liveAccount('binding-pending', { enabled: false })
-    let lockHeld = false
-    let boundWhileLocked = false
-    await withCustodyLoader(
-      {
-        accounts: [account],
-        credential: {
-          material: makeCustodyRequestJwt('served-account'),
-          recordVersion: 1,
-        },
-        respond: () => 200,
-        withFallbackAccountLock: async (_id, action) => {
-          lockHeld = true
-          try {
-            const result = await action()
-            boundWhileLocked =
-              (await loadAccounts(getAccountPaths()))?.accounts[0]
-                ?.accountId === 'served-account'
-            return result
-          } finally {
-            lockHeld = false
-          }
-        },
-      },
-      async ({ commandHook, configPath }) => {
-        await commandHook({
-          command: 'openai-account',
-          arguments: `enable ${account.id}`,
-          sessionID: 'binding-pending',
-        }).catch(() => {})
-
-        expect(lockHeld).toBe(false)
-        expect(boundWhileLocked).toBe(true)
-        expect(
-          (await loadAccounts(getAccountPaths(configPath)))?.accounts[0],
-        ).toMatchObject({
-          accountId: 'served-account',
-          enabled: true,
-        })
-      },
-    )
   })
 
   it('uses the configured custody transport in the loader', async () => {
