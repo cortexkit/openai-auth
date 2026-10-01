@@ -4,7 +4,8 @@
 // The menu works on Pi's account pool. Pi's own `openai-codex` login is not a
 // row of it: it is routed as `main` and replaced through Pi's `/login`, so the
 // menu shows its quota in a section of its own and refuses to add that
-// account again as a row.
+// account again as a row. Its Vault section connects Pi to the Claustrum
+// vault, whose OpenAI accounts are then routed beside these.
 import {
   type CommandMenu,
   runPiCommandMenu,
@@ -13,6 +14,7 @@ import {
   createOpenAiMenu,
   OPENAI_COMMAND_NAME,
   sessionSection,
+  vaultSection,
 } from '@cortexkit/openai-auth-core'
 import {
   beginAccountLogin,
@@ -100,6 +102,7 @@ export function createPiMenu(
         getPin: async (sessionId) => getPiStickyRouting(sessionId),
         clearPin: async (sessionId) => clearPiStickyRouting(sessionId),
       }),
+      vaultSection({ vault: pool.vault }),
     ],
     afterApply: () => pool.reload(),
   })

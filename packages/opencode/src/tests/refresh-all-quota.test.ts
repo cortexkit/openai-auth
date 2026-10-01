@@ -4,13 +4,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   type AccountQuotaWindow,
-  CUSTODY_REFUSE,
   type FallbackAccount,
   hashRefreshToken,
   type OAuthQuotaSnapshot,
   QuotaManager,
   type RefreshAllQuotaDeps,
   refreshAllQuota,
+  TOMBSTONED_ACCOUNT_ERROR,
 } from '@cortexkit/openai-auth-core/internal'
 
 import { getAccountStoragePath } from '../core/account-paths'
@@ -553,10 +553,7 @@ describe('refreshAllQuota', () => {
     expect(deps.quotaManager.getMain()?.quota?.primary?.usedPercent).toBe(30)
   })
 
-  test('a tombstoned main uses the custody resolver without refreshing local auth', async () => {
-    const resolveMainAccess = mock(
-      async (): Promise<typeof CUSTODY_REFUSE> => CUSTODY_REFUSE,
-    )
+  test('a tombstone left in the slot by the removed vault custody is never refreshed or polled', async () => {
     const deps = makeDeps({
       getAuth: mock(async () => ({
         type: 'oauth' as const,
@@ -564,18 +561,14 @@ describe('refreshAllQuota', () => {
         refresh: 'claustrum-tombstone:v1:openai',
         expires: 0,
       })),
-      resolveMainAccess,
     })
 
     const results = await refreshAllQuota(deps, { accountKey: 'main' })
 
-    expect(resolveMainAccess).toHaveBeenCalledWith(
-      expect.objectContaining({ mainAccountId: 'chatgpt-main' }),
-    )
     expect(deps.refreshMainWithLease).not.toHaveBeenCalled()
     expect(deps.whamFn).not.toHaveBeenCalled()
     expect(results).toEqual([
-      { account: 'main', ok: false, error: 'custody refused' },
+      { account: 'main', ok: false, error: TOMBSTONED_ACCOUNT_ERROR },
     ])
   })
 

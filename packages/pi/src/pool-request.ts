@@ -15,6 +15,10 @@
 //   401/403 or an exhausting 429 on this request) loses the session for
 //   good; a pinned account whose quota is not known yet serves elsewhere for
 //   this request only. A request without a session id is routed main-first.
+//
+// The OpenAI accounts the Claustrum vault serves Pi are routed beside them
+// (`vault` accounts): they hold no token, the caller's `send` asks the vault
+// for one per attempt.
 
 import { isQuotaMap } from '@cortexkit/common-auth/quota'
 import {
@@ -27,6 +31,7 @@ import {
   getFallbackStatuses,
   getKillswitchThresholdsForAccount,
   isKillswitchEnabled,
+  isTombstoned,
   killswitchPassesPolicy,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
@@ -57,6 +62,15 @@ export interface RouteAccount {
   quota?: unknown
   /** The bearer to send with now, or undefined when it holds no usable one. */
   token: string | undefined
+  /** `api-key` for a static key the vault serves; Pi's own accounts are `oauth`. */
+  kind?: 'oauth' | 'api-key'
+  /** A vault account: no token here, the vault serves one per send. */
+  vault?: true
+}
+
+/** Whether an account has something to send with: a token, or the vault. */
+function sendable(account: RouteAccount | undefined): account is RouteAccount {
+  return account !== undefined && (account.vault === true || !!account.token)
 }
 
 /** What one attempt reports back: the HTTP status, when a response arrived. */
@@ -78,8 +92,11 @@ export interface PiRouteContext<A extends RouteAttempt> {
   refreshBackoff: (accounts: readonly RouteAccount[]) => Map<string, number>
   /** Asks for a quota poll of an account admission refused for want of a reading. */
   requestPull: (id: string) => void
-  /** Sends the request with one account's token. */
-  send(account: RouteAccount, token: string): Promise<A>
+  /**
+   * Sends the request with one account. Undefined when nothing was sent: the
+   * vault refused to serve a vault account.
+   */
+  send(account: RouteAccount): Promise<A | undefined>
   /** The session pin ledger: decides (and, when asked, records) a session's pin. */
   placePin(input: PiPinPlacement): { accountId: string } | undefined
   log?: { debug(message: string, meta?: Record<string, unknown>): void }
@@ -94,7 +111,9 @@ export type PiRouteResult<A> =
  * credential that pass the quota policy (`quota.minimumRemaining`,
  * `failClosedOnUnknownQuota`), as a fallback account always had to. A row
  * holding the same ChatGPT account as Pi's login is left out: that account
- * already serves as `main`, and is refreshed by Pi alone.
+ * already serves as `main`, and is refreshed by Pi alone. So is a row
+ * signing in as a ChatGPT account the vault holds (`vaultIdentities`): the
+ * vault owns it, and serves it through its own route.
  */
 export function routablePoolRows<
   R extends {
@@ -103,20 +122,24 @@ export function routablePoolRows<
     candidate: boolean
     identity?: string
     quota?: unknown
-    credential?: { type: 'oauth' | 'api' }
+    credential?: { type: 'oauth' | 'api'; refresh?: string }
   },
 >(
   rows: readonly R[],
   storage: AccountStorage | null,
   now: number,
   mainIdentity: string | undefined,
+  vaultIdentities: ReadonlySet<string> = new Set(),
 ): R[] {
   return rows.filter((row) => {
     if (!row.candidate || row.type !== 'oauth') return false
     if (row.credential?.type !== 'oauth') return false
+    if (isTombstoned(row.credential)) return false
     // Pi's login is routed as `main`; a pool row may not take its id.
     if (row.id === FORMER_MAIN_ID) return false
     if (mainIdentity && row.identity === mainIdentity) return false
+    if (row.identity !== undefined && vaultIdentities.has(row.identity))
+      return false
     return quotaSnapshotPassesPolicy(
       windowsFromQuotaMap(row.quota),
       storage,
@@ -146,7 +169,7 @@ function routingInput<A extends RouteAttempt>(
   }
   const rows: RoutingRow[] = accounts.map((account) => ({
     id: account.id,
-    kind: 'oauth',
+    kind: account.kind ?? 'oauth',
     ...(isQuotaMap(account.quota) ? { quota: account.quota } : {}),
   }))
   return {
@@ -197,9 +220,9 @@ async function routeOrdered<A extends RouteAttempt>(
   for (;;) {
     const id = nextOrderedAttempt(plan.order, attempts, retryStatuses)
     const account = id === undefined ? undefined : byId.get(id)
-    const token = account?.token
-    if (!account || !token) break
-    const attempt = await ctx.send(account, token)
+    if (!sendable(account)) break
+    const attempt = await ctx.send(account)
+    if (!attempt) break
     last = { attempt, accountId: account.id }
     attempts.push({
       id: account.id,
@@ -307,9 +330,9 @@ async function routeSticky<A extends RouteAttempt>(
   }
 
   let account = byId.get(id)
-  const token = account?.token
-  if (!account || !token) return undefined
-  let attempt = await ctx.send(account, token)
+  if (!sendable(account)) return undefined
+  let attempt = await ctx.send(account)
+  if (!attempt) return undefined
 
   if (
     attempt.status === 401 ||
@@ -327,9 +350,11 @@ async function routeSticky<A extends RouteAttempt>(
       const from = id
       if (migrate(after.reason) && id !== from) {
         const replacement = current.find((candidate) => candidate.id === id)
-        const replacementToken = replacement?.token
-        if (replacement && replacementToken) {
-          attempt = await ctx.send(replacement, replacementToken)
+        const replaced = sendable(replacement)
+          ? await ctx.send(replacement)
+          : undefined
+        if (replacement && replaced) {
+          attempt = replaced
           account = replacement
         } else {
           id = from

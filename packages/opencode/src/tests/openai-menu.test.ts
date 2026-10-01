@@ -26,6 +26,7 @@ import {
   fallbackRefreshLockName,
   type IngestAccount,
   loadAccounts,
+  OpenAiVault,
   QuotaManager,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Config, PluginInput } from '@opencode-ai/plugin'
@@ -36,7 +37,7 @@ import {
   openOpenAiMenu,
 } from '../commands'
 import { getSettings, refreshSettings } from '../config'
-import { MAIN_REFRESH_LOCK_NAME } from '../core/custody-transition'
+import { MAIN_REFRESH_LOCK_NAME } from '../core/host-slot'
 import { openAccountPool } from '../core/pool-accounts'
 import { CodexAuthPlugin } from '../index'
 import { setLogLevel } from '../logger'
@@ -92,6 +93,12 @@ function context(
     loadAccounts,
     store: () => openAccountPool(paths),
     migration: async () => ({ migrated: true }),
+    // Never connected here: its status reads files only.
+    vault: new OpenAiVault({
+      host: 'opencode',
+      stateDir: join(tmpDir, 'vault'),
+      pollIntervalMs: 0,
+    }),
     ...overrides,
   }
 }
@@ -172,7 +179,7 @@ describe('/openai on a migrated install', () => {
       'cache',
       'diagnostics',
       'session',
-      'claustrum',
+      'vault',
     ])
   })
 
@@ -557,27 +564,6 @@ describe('/openai on a migrated install', () => {
     ).toEqual(['main', 'alpha'])
   })
 
-  test('no account is added while Claustrum mode is active', async () => {
-    seed({ claustrum: { mode: 'claustrum' } })
-    let began = false
-    const ctx = context({
-      beginAccountLogin: (async () => {
-        began = true
-        throw new Error('not reached')
-      }) as unknown as OpenCodeMenuContext['beginAccountLogin'],
-    })
-
-    const result = await apply(ctx, {
-      sectionId: 'accounts',
-      actionId: 'add',
-      values: { headless: false },
-    })
-
-    expect(result.ok).toBe(false)
-    expect(result.text).toContain('Claustrum mode is active')
-    expect(began).toBe(false)
-  })
-
   test('a quota check reports a rejected sign-in as needing re-adding', async () => {
     seed()
     const ctx = context({
@@ -736,22 +722,15 @@ describe('/openai on a migrated install', () => {
     expect(cleared).toEqual(['session-a'])
   })
 
-  test('Claustrum mode is entered from its section', async () => {
+  test('the Vault section says this host is not connected and offers Connect', async () => {
     seed()
-    const ctx = context({
-      enterClaustrumMode: async () => ({
-        status: 'completed',
-        outcomes: { alpha: 'bound' },
-      }),
-    })
-
-    const result = await apply(ctx, {
-      sectionId: 'claustrum',
-      actionId: 'enter',
-    })
-
-    expect(result.ok).toBe(true)
-    expect(result.text).toContain('alpha: bound')
+    const vault = (await openOpenAiMenu(context(), 'session-a')).menu.sections.find(
+      (section) => section.id === 'vault',
+    )
+    expect(vault?.lines).toEqual([
+      'OpenCode (openai-auth-opencode): not connected to the Claustrum vault.',
+    ])
+    expect(vault?.actions.map((action) => action.id)).toEqual(['connect'])
   })
 
   test('an apply from the RPC carries its own session', async () => {
@@ -820,10 +799,6 @@ describe('legacy account writers', () => {
       'writeLoaderSettings: only on an install that has not migrated',
     'opencode/src/auth/doctor.ts':
       'repairs offered only on an install that has not migrated',
-    'opencode/src/core/custody-runtime.ts':
-      'Claustrum custody writes tombstone roster rows the store has no operation for',
-    'core/src/custody.ts':
-      'Claustrum custody binds identities on tombstone roster rows',
   }
 
   function sources(dir: string): string[] {

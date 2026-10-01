@@ -15,7 +15,7 @@ import {
   loadAccounts,
   mutateAccounts,
 } from '@cortexkit/openai-auth-core/internal'
-import { MAIN_REFRESH_LOCK_NAME } from '../../core/custody-transition.ts'
+import { MAIN_REFRESH_LOCK_NAME } from '../../core/host-slot.ts'
 import type { HostSlotAdapter } from '../../core/pool-migration.ts'
 
 const MAIN_REFRESH_LOCK_TTL_MS = 2 * 60_000
