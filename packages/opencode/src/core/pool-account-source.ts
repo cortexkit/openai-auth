@@ -806,10 +806,11 @@ export class PoolAccountSource {
   }
 
   /**
-   * The row behind an account key (`main` is row `main`) and its bearer, for
-   * a caller that reports a missing or disabled row itself (reset credits).
-   * Undefined when the pool does not serve this install; `row` is absent when
-   * no row has the id, `token` when the row holds no usable one.
+   * The row behind an account key (`main` is row `main`) and its bearer,
+   * refreshed through the pool when due. For a caller that words its own
+   * refusal for a missing or disabled row (the reset-credit command).
+   * Undefined when the install is not migrated; `row` is absent when no row
+   * has the id, `token` when the row holds no usable one.
    */
   async rowAccess(
     id: string,

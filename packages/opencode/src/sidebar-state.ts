@@ -1290,7 +1290,8 @@ export function setSidebarMachineState(
           activeRouting: latest.activeRouting,
           stickyAssignments,
           lastUpdated: Math.max(now, latest.lastUpdated + 1),
-          // Describes this snapshot's accounts only, never an earlier one's.
+          // Taken from the snapshot being written, never carried over from the
+          // file: it says where this snapshot's accounts came from.
           accountPool: machineState.accountPool === true ? true : undefined,
         }
       },

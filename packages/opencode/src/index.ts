@@ -700,7 +700,7 @@ interface CodexAuthPluginOptions {
     /** Overrides POOL_MIGRATION_ENABLED, so tests can run the migration. */
     enabled?: boolean
   }
-  /** Test seam: the timers of the background quota poller. */
+  /** Test seam: timer functions for the background quota poller, so a test can fire its tick. */
   backgroundQuota?: ConstructorParameters<typeof BackgroundQuotaRefresh>[0]
   issuer?: string
   codexApiEndpoint?: string
@@ -3242,7 +3242,8 @@ export async function CodexAuthPlugin(
           accountPool: commandAccountPool({
             paths: () => getAccountPaths(getConfigPath()),
             store: () => poolSource.poolStore(),
-            // Route on the changed rows at once, and poll a new row.
+            // Re-read the pool after a change, so requests route across the
+            // changed rows at once and a newly added row gets its first poll.
             afterWrite: () => poolSource.load(),
           }),
           enterClaustrumMode: async () => {

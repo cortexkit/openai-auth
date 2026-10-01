@@ -32,7 +32,7 @@ import {
 } from '@cortexkit/openai-auth-core/internal'
 import { readPoolMigrationBookkeeping } from './pool-migration'
 
-/** The `disabledReason` recorded when the user disables a row. */
+/** The `disabledReason` value the store records on a row the user disabled. */
 export const POOL_USER_DISABLED_REASON = 'disabled-by-user'
 
 /** The message shown when the user asks to remove row `main`. */
@@ -46,17 +46,23 @@ export interface PoolLogin {
   access?: string
   refresh: string
   expires?: number
-  /** The account's ChatGPT identity, when the token carries one. */
+  /** The account's ChatGPT identity, when the login's access token names one. */
   accountId?: string
 }
 
 export type PoolAddOutcome =
   | { status: 'added'; id: string }
-  /** The same account as an enabled row: kept on disk, disabled. */
+  /**
+   * Another enabled row is the same ChatGPT account under a different id: the
+   * store keeps the new row but disables it, so one account never serves twice.
+   */
   | { status: 'added-disabled'; id: string }
-  /** A row held this account (or this id); its credential was replaced. */
+  /**
+   * A row already held this ChatGPT account (or, with no identity to match,
+   * this id); that row's credential was replaced with the new login.
+   */
   | { status: 'replaced'; id: string }
-  /** Row `main` already holds this account. */
+  /** Row `main` (the account OpenCode signs in with) already holds this account. */
   | { status: 'main-identity'; id: string }
 
 export type PoolRemoveOutcome = 'removed' | 'not-found' | 'main-refused'
@@ -272,9 +278,9 @@ export async function removeAllPoolAccountsExceptMain(
 }
 
 /**
- * The account pool as the account commands use it (`CommandContext`), over
- * the store at `paths`. `afterWrite` runs after every change, so the caller
- * can re-read the rows it routes on.
+ * The `accountPool` the account commands use (see `CommandContext`), over the
+ * store at `paths`. `afterWrite` runs after every change, so a plugin process
+ * can re-read the rows its requests are routed across.
  */
 export function commandAccountPool(deps: {
   paths: () => AccountPaths

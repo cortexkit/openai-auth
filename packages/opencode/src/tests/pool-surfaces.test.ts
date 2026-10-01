@@ -71,7 +71,8 @@ beforeEach(() => {
   process.env.OPENCODE_CONFIG_DIR = configDir
   originalFetch = globalThis.fetch
   hooks = undefined
-  // Every test starts as a fresh process would: the boot quota seed runs.
+  // Every test starts as a fresh process would, so the one-time boot quota
+  // seed (a legacy quota poll at loader start) is allowed to run.
   __resetBootQuotaSeedForTest()
 })
 
@@ -204,7 +205,8 @@ describe('a migrated install refreshes and polls its rows only through the pool'
     const tick = timers.tick
     if (!tick) throw new Error('the background poller was not started')
 
-    // Another process holds the lease: this one polls nothing.
+    // Another process holds the bg-quota-refresh lease: this process's
+    // background pass polls no row.
     const lease = await acquireRefreshFileLock({
       name: 'bg-quota-refresh',
       ttlMs: 120_000,
@@ -504,7 +506,8 @@ describe('/openai-account on a migrated install', () => {
       'fallback-1',
       'new-acct',
     ])
-    // The store writes the row's pool entry with the roster row.
+    // `store.add` writes the row's pool entry along with its roster row; the
+    // legacy roster writer would leave the pool entry out.
     expect(config().commonAuthPool.rows['new-acct']).toBeDefined()
     expect(stateAccounts()['new-acct']?.access).toBe('new-acct-access')
   })
@@ -569,7 +572,8 @@ describe('/openai-account on a legacy install', () => {
       'remove main',
       commandContext(),
     )
-    // No row `main` on a legacy install: the legacy remove answers.
+    // A legacy install has no pool rows, so the legacy remove handles the
+    // request and finds no account `main` in its roster.
     expect(payload.text).toContain('Account Not Found')
   })
 })
