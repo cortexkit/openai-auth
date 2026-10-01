@@ -20,6 +20,7 @@ import {
   refreshBackoffActive,
   saveAccountState,
   saveAccounts,
+  tokenFingerprint,
 } from '@cortexkit/openai-auth-core/internal'
 import {
   classifyMainAuthSlot,
@@ -178,6 +179,35 @@ describe('migration', () => {
       type: 'api',
       key: 'unrelated',
     })
+  })
+
+  it('does not carry a legacy main quota read with another access token onto row main', async () => {
+    await seedLegacyInstall(h)
+    const state = await h.state()
+    state.main.quotaToken = tokenFingerprint(jwt('acct-before'))
+    writeFileSync(h.paths.statePath, JSON.stringify(state))
+    expect(await migrateToPool(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'main',
+    })
+    const main = await h.row('main')
+    expect(main?.quota).toBeUndefined()
+    expect(main?.needsFirstReading).toBe(true)
+    expect((await h.state()).accounts.main.quota).toBeUndefined()
+    // The backoff is keyed on its own refresh-token hash and still carried.
+    expect((await h.state()).accounts.main.lastRefreshError.tokenHash).toBe(
+      hashRefreshToken('r-main'),
+    )
+  })
+
+  it('carries a legacy main quota read with the access token row main now holds', async () => {
+    await seedLegacyInstall(h)
+    const state = await h.state()
+    state.main.quotaToken = tokenFingerprint(jwt('acct-main'))
+    writeFileSync(h.paths.statePath, JSON.stringify(state))
+    await migrateToPool(h.deps())
+    expect((await h.row('main'))?.needsFirstReading).toBe(false)
+    expect((await h.state()).accounts.main.quota.primary.usedPercent).toBe(40)
   })
 
   it('a re-run after completion does nothing', async () => {
@@ -514,6 +544,32 @@ describe('adoption of a later login in the slot', () => {
       status: 'completed',
       rowId: 'acct-other',
     })
+  })
+
+  it('a login adopted into a pool with no row main becomes row main', async () => {
+    await seedLegacyInstall(h)
+    const map = await h.slot.all()
+    delete map.openai
+    await Bun.write(h.authPath, JSON.stringify(map))
+    expect(await migrateToPool(h.deps())).toMatchObject({
+      status: 'nothing-to-import',
+    })
+    expect(await h.row('main')).toBeUndefined()
+
+    await h.setSlot(login('acct-later', 'r-later'))
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'main',
+      operation: 'add',
+      placeholder: 'written',
+    })
+    const main = await h.row('main')
+    expect(main?.identity).toBe('acct-later')
+    expect(main?.credential).toMatchObject({ refresh: 'r-later' })
+    // The legacy `state.main` belongs to whatever was main before the
+    // migration; an adoption never carries it.
+    expect(main?.quota).toBeUndefined()
+    expect((await h.state()).accounts.main.lastRefreshError).toBeUndefined()
   })
 
   it('a login landing after the fence read is caught by the read right before the placeholder write', async () => {

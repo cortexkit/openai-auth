@@ -95,6 +95,7 @@ import {
   type OAuthQuotaSnapshot,
   parseJwtClaims,
   saveAccountState,
+  tokenFingerprint,
 } from '@cortexkit/openai-auth-core/internal'
 import { createLogger } from '../logger'
 import {
@@ -731,9 +732,9 @@ function usableAsId(value: string): boolean {
 
 /**
  * Picks the row a slot credential goes to. The same refresh token wins first
- * (it already lives in that row: a rotate, never a second copy). Migration
- * then takes `main`, which pins, quota, killswitch, reset credits, cachekeep
- * and lock names all key on. Otherwise the wire identity picks an enabled
+ * (it already lives in that row: a rotate, never a second copy). Then a
+ * missing or empty `main` is filled, the row pins, quota, killswitch, reset
+ * credits, cachekeep and lock names all key on. Otherwise the wire identity picks an enabled
  * row (a re-login: replace), and failing that the login becomes a new row
  * named like the plugin's own logins name theirs (its identity, else a uuid).
  */
@@ -759,17 +760,20 @@ function resolveTarget(
       ...identity,
       carryLegacyMain: mode === 'migrate' && same.id === 'main',
     }
-  if (mode === 'migrate') {
-    const main = rows.find((row) => row.id === 'main')
-    if (!main || (!main.invalid && !main.credential))
-      return {
-        rowId: 'main',
-        operation: 'add',
-        rowFingerprint: null,
-        ...identity,
-        carryLegacyMain: true,
-      }
-  }
+  // Row `main` is filled whenever it is missing or holds no credential, by
+  // an adoption too: a migration that found no login in the slot leaves the
+  // pool without one, and the first login that lands in the slot afterwards
+  // is the account OpenCode signs in with. Only the migration carries the
+  // legacy `state.main` over; an adoption's login may be another account.
+  const main = rows.find((row) => row.id === 'main')
+  if (!main || (!main.invalid && !main.credential))
+    return {
+      rowId: 'main',
+      operation: 'add',
+      rowFingerprint: null,
+      ...identity,
+      carryLegacyMain: mode === 'migrate',
+    }
   if (slot.identity) {
     const holder = rows.find(
       (row) =>
@@ -988,7 +992,20 @@ export function observationsFromLegacySnapshot(
 async function carryLegacyMainState(ctx: Context, row: PoolRow): Promise<void> {
   const legacy = await loadAccounts(ctx.paths)
   if (!legacy) return
-  const snapshot = legacy.quota?.mainQuota
+  // The legacy quota manager records, beside main's quota, a fingerprint of
+  // the access token it was read with (`mainQuotaToken`), and refuses to
+  // reuse the reading for a different token: it may belong to an account
+  // that was signed in before. The same rule applies here, against the
+  // token the row now holds, so another login's quota is never attributed
+  // to this row. A reading with no fingerprint is carried, as the legacy
+  // manager would use it.
+  const recordedToken = legacy.quota?.mainQuotaToken
+  const rowAccess =
+    row.credential?.type === 'oauth' ? row.credential.access : undefined
+  const quotaIsRows =
+    !recordedToken ||
+    (rowAccess !== undefined && recordedToken === tokenFingerprint(rowAccess))
+  const snapshot = quotaIsRows ? legacy.quota?.mainQuota : undefined
   if (snapshot && row.credentialEpoch !== undefined) {
     const attribution = {
       credentialEpoch: row.credentialEpoch,
