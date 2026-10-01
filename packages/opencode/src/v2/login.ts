@@ -16,8 +16,17 @@
 //   ordered routing modes put first, as the migration does with the first
 //   OpenCode 1 login;
 // - anything else: a new row, named by its ChatGPT account id.
+//
+// A login OpenCode 2 already held when this plugin started is copied in by
+// other rules (`origin: 'import'`): only when no row holds its account or its
+// refresh token yet, and never over a row. The pool may have rotated that
+// account's tokens since, or the migration may have just moved a newer copy
+// of it into `main`; OpenCode 2's copy would then be the older credential.
 
-import type { PoolLoginMethod } from '@cortexkit/common-auth/opencode2'
+import {
+  isPlaceholderCredential,
+  type PoolLoginMethod,
+} from '@cortexkit/common-auth/opencode2'
 import type { PoolStore } from '@cortexkit/common-auth/store'
 import { withAccountRules } from '@cortexkit/openai-auth-core'
 import {
@@ -26,10 +35,14 @@ import {
   type BeginAccountLoginResult,
   extractAccountIdFromClaims,
   type IngestAccount,
+  isTombstoned,
   POOL_MAIN_ROW_ID,
   parseJwtClaims,
 } from '@cortexkit/openai-auth-core/internal'
-import { legacyRefreshLocks } from '../core/pool-migration'
+import {
+  legacyRefreshLocks,
+  POOL_PLACEHOLDER_REFRESH,
+} from '../core/pool-migration'
 
 /** A completed login, as `beginAccountLogin` resolves it. */
 export type PoolLoginResult = Pick<
@@ -73,7 +86,31 @@ export function chatgptLoginMethods(input: {
 
 export type PoolLoginOutcome = {
   id: string
-  operation: 'replaced' | 'added' | 'added-disabled'
+  /** `kept`: an imported login whose account the pool already holds. */
+  operation: 'replaced' | 'added' | 'added-disabled' | 'kept'
+}
+
+/**
+ * Whether an OAuth value is something left in a login slot that holds no
+ * credential: a common-auth placeholder (for any integration), OpenCode 1's
+ * pool placeholder, or a tombstone the removed vault custody wrote. None of
+ * them may ever become a pool row.
+ */
+export function isLeftoverCredential(value: {
+  access?: unknown
+  refresh?: unknown
+}): boolean {
+  const text = (secret: unknown) => (typeof secret === 'string' ? secret : '')
+  return (
+    // The predicate reads only the type and the two tokens.
+    isPlaceholderCredential({
+      type: 'oauth',
+      access: text(value.access),
+      refresh: text(value.refresh),
+    } as Parameters<typeof isPlaceholderCredential>[0]) ||
+    value.refresh === POOL_PLACEHOLDER_REFRESH ||
+    isTombstoned(value)
+  )
 }
 
 function identityOf(login: PoolLoginResult): string | undefined {
@@ -91,7 +128,12 @@ export async function writeLoginToPool(
   pool: PoolStore,
   paths: AccountPaths,
   login: PoolLoginResult,
+  options: { origin?: 'login' | 'import' } = {},
 ): Promise<PoolLoginOutcome> {
+  if (isLeftoverCredential(login))
+    throw new Error(
+      'the credential is not a ChatGPT login (a placeholder or a tombstone); it was not stored',
+    )
   const store = withAccountRules(pool, {
     rowLocks: (id) => legacyRefreshLocks(paths, id),
   })
@@ -108,6 +150,15 @@ export async function writeLoginToPool(
   }
   const identity = identityOf(login)
   const withIdentity = identity !== undefined ? { identity } : {}
+  if (options.origin === 'import') {
+    const held = load.rows.find(
+      (row) =>
+        (identity !== undefined && row.identity === identity) ||
+        (row.credential?.type === 'oauth' &&
+          row.credential.refresh === login.refresh),
+    )
+    if (held) return { id: held.id, operation: 'kept' }
+  }
   const oauth = load.rows.filter((row) => row.type === 'oauth' && !row.invalid)
   const holder = identity
     ? oauth.find((row) => row.identity === identity)
