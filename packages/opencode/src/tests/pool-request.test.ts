@@ -860,6 +860,99 @@ describe('sticky-balanced on a migrated install', () => {
     expect(pinOf(await sidebar(), 's-floor')).toBe('fallback-1')
   })
 
+  /** Writes a sidebar file pinning `sessionId` to row `accountId`. */
+  function presetPin(sessionId: string, accountId: string) {
+    const now = Date.now()
+    writeFileSync(
+      sidebarFile,
+      JSON.stringify({
+        main: { quota: null, killed: false },
+        fallbacks: [],
+        route: 'sticky-balanced',
+        lastUpdated: now,
+        stickyAssignments: {
+          [hashSidebarSessionId(sessionId)]: {
+            accountId,
+            assignedAt: now - 1_000,
+            lastSeenAt: now - 1_000,
+            inputBytes: 10,
+          },
+        },
+      }),
+    )
+  }
+
+  it('moves a pin off a row confirmed exhausted before sending, to a row that can serve', async () => {
+    seedPool('sticky-balanced', [
+      { id: 'main', quota: healthy() },
+      { id: 'fallback-1', quota: quotaMap(100) },
+    ])
+    presetPin('s-exhausted-pin', 'fallback-1')
+    const wire = installWire({
+      respond: () => new Response('{}', { status: 200 }),
+      usage: () => new Response('', { status: 503 }),
+    })
+    const fetchOverride = await loadFetch()
+
+    const response = await fetchOverride(
+      URL_RESPONSES,
+      request('s-exhausted-pin'),
+    )
+
+    expect(response.status).toBe(200)
+    expect(wire.sends).toEqual([bearer('main')])
+    expect(pinOf(await sidebar(), 's-exhausted-pin')).toBe('main')
+  })
+
+  it('sends to a pinned exhausted row when no other row can serve (the last path)', async () => {
+    // Row order would send an unpinned request to main first; the session's
+    // own row is the one still probed.
+    seedPool('sticky-balanced', [
+      { id: 'main', quota: quotaMap(100) },
+      { id: 'fallback-1', quota: quotaMap(100) },
+    ])
+    presetPin('s-last-pin', 'fallback-1')
+    const wire = installWire({
+      respond: () => new Response('{}', { status: 200 }),
+      usage: () => new Response('', { status: 503 }),
+    })
+    const fetchOverride = await loadFetch()
+
+    const response = await fetchOverride(URL_RESPONSES, request('s-last-pin'))
+
+    expect(response.status).toBe(200)
+    expect(wire.sends).toEqual([bearer('fallback-1')])
+    expect(pinOf(await sidebar(), 's-last-pin')).toBe('fallback-1')
+  })
+
+  it("places a new session by the quota above each account's own killswitch threshold", async () => {
+    // fallback-1 has more quota left (90% against 50%), but its own
+    // threshold reserves 85% of it, leaving main the larger usable share.
+    seedPool(
+      'sticky-balanced',
+      [
+        { id: 'main', quota: quotaMap(50) },
+        { id: 'fallback-1', quota: quotaMap(10) },
+      ],
+      {
+        killswitch: {
+          enabled: false,
+          accounts: { 'fallback-1': { primary: 85, secondary: 85 } },
+        },
+      },
+    )
+    const wire = installWire({
+      respond: () => new Response('{}', { status: 200 }),
+      usage: () => new Response('', { status: 503 }),
+    })
+    const fetchOverride = await loadFetch()
+
+    await fetchOverride(URL_RESPONSES, request('s-reserve'))
+
+    expect(wire.sends).toEqual([bearer('main')])
+    expect(pinOf(await sidebar(), 's-reserve')).toBe('main')
+  })
+
   it('a 429 without exhausting quota keeps the pin and the response', async () => {
     seedPool('sticky-balanced', [
       { id: 'main', quota: healthy() },
