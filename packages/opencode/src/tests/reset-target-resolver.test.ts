@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   type ResetCreditsDeps,
   resetCreditsSection,
+  settingsMutateAccounts,
 } from '@cortexkit/openai-auth-core'
 // Snapshot the REAL oauth module exports at load time (before any mock.module
 // runs). bun's mock.module leaks process-wide and mock.restore() does NOT undo
@@ -33,6 +34,7 @@ import {
   getAccountStatePath,
   getAccountStoragePath,
 } from '../core/account-paths'
+import { openAccountPool } from '../core/pool-accounts'
 import { buildResetRedemptionDeps, createResetTargetResolver } from '../index'
 import { resetNotificationsForTest } from '../rpc/notifications'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env.ts'
@@ -98,7 +100,12 @@ type ResetWireFixture = {
   throwOnPost?: boolean
   freshAfterPost?: boolean
   applicableAfterPost?: number
-  calls: Array<{ method: string; accountId: string; url: string }>
+  calls: Array<{
+    method: string
+    accountId: string
+    url: string
+    body?: string
+  }>
   targetRefreshes: string[]
   sidebarRefreshes: number
 }
@@ -151,7 +158,12 @@ function makeResetWire(fixture: ResetWireFixture): typeof globalThis.fetch {
     const method = init?.method ?? 'GET'
     const headers = new Headers(init?.headers)
     const accountId = headers.get('chatgpt-account-id') || 'chatgpt-main'
-    fixture.calls.push({ method, accountId, url })
+    fixture.calls.push({
+      method,
+      accountId,
+      url,
+      ...(typeof init?.body === 'string' ? { body: init.body } : {}),
+    })
     if (method === 'POST') {
       if (fixture.throwOnPost) throw new Error('connection lost')
       if (fixture.postStatus) {
@@ -238,7 +250,12 @@ async function makeResetHarness(
     statePath: getAccountStatePath(configPath),
     quotaManager,
     loadAccounts,
-    mutateAccounts,
+    // The reset state is written through the pool store's settings write,
+    // as on a migrated install, never by rewriting the account files.
+    mutateAccounts: settingsMutateAccounts(
+      openAccountPool(getAccountPaths(configPath)),
+      undefined,
+    ),
     accountKeys: async () => ['main', 'fallback-a'],
     resolveResetTarget,
     fetchImpl: makeResetWire(fixture),
@@ -749,9 +766,27 @@ describe('commands', () => {
 
     const noticeInvocation = { notify: () => {} }
 
-    async function resetSection(fixture: ResetWireFixture) {
-      await saveResetAccounts()
-      const { deps } = await makeResetHarness(configPath, now, fixture)
+    /**
+     * The reset section as one process builds it. `restart` leaves the files
+     * as an earlier process left them (no fresh accounts) and builds the
+     * section anew, with nothing carried over in memory.
+     */
+    async function resetSection(
+      fixture: ResetWireFixture,
+      options: { restart?: boolean; at?: number } = {},
+    ) {
+      if (!options.restart) {
+        await saveResetAccounts()
+        const init = await openAccountPool(
+          getAccountPaths(configPath),
+        ).initialize()
+        expect(init.status).toBe('initialized')
+      }
+      const { deps } = await makeResetHarness(
+        configPath,
+        options.at ?? now,
+        fixture,
+      )
       const content = await resetCreditsSection(deps).build(noticeInvocation)
       const run = (item: string, action: string) => {
         const found = content.items
@@ -817,15 +852,130 @@ describe('commands', () => {
       expect(fixture.calls.some((call) => call.method === 'POST')).toBe(false)
     })
 
-    test('/openai reset credits: a retry with no earlier redemption in this process sends nothing', async () => {
+    function text(outcome: string | { ok: boolean; text: string }) {
+      return typeof outcome === 'string' ? outcome : outcome.text
+    }
+
+    function postIds(fixture: ResetWireFixture) {
+      return fixture.calls
+        .filter((call) => call.method === 'POST')
+        .map((call) => {
+          const body = JSON.parse(call.body ?? '{}') as Record<string, unknown>
+          return [body.redeem_request_id, body.credit_id]
+        })
+    }
+
+    function savedReset(): Record<string, Record<string, unknown>> {
+      return (
+        (JSON.parse(readFileSync(configPath, 'utf8')).reset as
+          | Record<string, Record<string, unknown>>
+          | undefined) ?? {}
+      )
+    }
+
+    test('/openai reset credits: Retry with no redemption in flight sends nothing', async () => {
       const fixture = resetFixture()
       const { run } = await resetSection(fixture)
 
       const outcome = await run('main', 'retry')
 
-      const text = typeof outcome === 'string' ? outcome : outcome.text
-      expect(text).toContain('no redemption from this process to retry')
-      expect(fixture.calls).toEqual([])
+      expect(text(outcome)).toContain('no active reset redemption to retry')
+      expect(postIds(fixture)).toEqual([])
+    })
+
+    test('/openai reset credits: an unknown outcome, a restart, then Retry replays the same ids', async () => {
+      const first = resetFixture({ throwOnPost: true })
+      const { run } = await resetSection(first)
+      const stateBefore = readFileSync(statePath, 'utf8')
+
+      const ambiguous = await run('fallback-a', 'spend')
+
+      expect(text(ambiguous)).toContain('outcome is unknown')
+      const sent = postIds(first)
+      expect(sent).toHaveLength(1)
+      // The pair is saved through the store's settings write, in the config;
+      // the credential file is not rewritten.
+      expect(savedReset()['fallback-a']?.inFlight).toMatchObject({
+        redeemRequestId: sent[0]?.[0],
+        creditId: sent[0]?.[1],
+      })
+      expect(readFileSync(statePath, 'utf8')).toBe(stateBefore)
+
+      const second = resetFixture({ freshAfterPost: true })
+      const restarted = await resetSection(second, { restart: true })
+      const retried = await restarted.run('fallback-a', 'retry')
+
+      expect(postIds(second)).toEqual(sent)
+      expect(text(retried)).toContain('Code: `reset`')
+      expect(savedReset()['fallback-a']?.inFlight).toBeUndefined()
+    })
+
+    test('/openai reset credits: Spend while a pair is in flight replays it instead of spending again', async () => {
+      const first = resetFixture({ throwOnPost: true })
+      await (await resetSection(first)).run('fallback-a', 'spend')
+      const sent = postIds(first)
+
+      const second = resetFixture({ outcome: 'already_redeemed' })
+      const restarted = await resetSection(second, { restart: true })
+      await restarted.run('fallback-a', 'spend')
+
+      expect(postIds(second)).toEqual(sent)
+    })
+
+    test('/openai reset credits: Spend is refused while an expired pair is unreconciled, and Retry still replays it', async () => {
+      const first = resetFixture({ throwOnPost: true })
+      await (await resetSection(first)).run('fallback-a', 'spend')
+      const sent = postIds(first)
+      const later = now + 6 * 60_000
+
+      const refusedWire = resetFixture()
+      const refused = await (
+        await resetSection(refusedWire, { restart: true, at: later })
+      ).run('fallback-a', 'spend')
+
+      expect(text(refused)).toContain('outcome is unknown')
+      expect(text(refused)).toContain('expired_unreconciled')
+      expect(refusedWire.calls).toEqual([])
+
+      const retryWire = resetFixture({ outcome: 'already_redeemed' })
+      await (await resetSection(retryWire, { restart: true, at: later })).run(
+        'fallback-a',
+        'retry',
+      )
+      expect(postIds(retryWire)).toEqual(sent)
+    })
+
+    test('/openai reset credits: a restart between the redemption and its result is finished by Retry with the saved ids', async () => {
+      const fixture = resetFixture({ outcome: 'already_redeemed' })
+      await resetSection(fixture)
+      // What a process leaves when it stops after the server took the
+      // redemption but before it recorded the result.
+      await settingsMutateAccounts(
+        openAccountPool(getAccountPaths(configPath)),
+        undefined,
+      )((current) => {
+        current.reset = {
+          'fallback-a': {
+            inFlight: {
+              redeemRequestId: 'request-before-restart',
+              creditId: 'credit-chatgpt-fallback-a-1',
+              startedAt: now - 1_000,
+            },
+          },
+        }
+        return current
+      }, getAccountPaths(configPath))
+
+      const restarted = await resetSection(fixture, { restart: true })
+      const outcome = await restarted.run('fallback-a', 'retry')
+
+      expect(postIds(fixture)).toEqual([
+        ['request-before-restart', 'credit-chatgpt-fallback-a-1'],
+      ])
+      expect(text(outcome)).toContain('Code: `already_redeemed`')
+      const saved = savedReset()['fallback-a']
+      expect(saved?.inFlight).toBeUndefined()
+      expect(saved?.cooldownUntil).toBeGreaterThan(now)
     })
 
     test('ambiguous local renderer preserves no-request guidance without success or retry guarantees', async () => {
