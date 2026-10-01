@@ -39,6 +39,7 @@ import { getSettings, refreshSettings } from '../config'
 import { MAIN_REFRESH_LOCK_NAME } from '../core/custody-transition'
 import { openAccountPool } from '../core/pool-accounts'
 import { CodexAuthPlugin } from '../index'
+import { setLogLevel } from '../logger'
 import { quotaMap, readJson, seedPool } from './fixtures/pool-install'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env'
 
@@ -56,6 +57,9 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  // The Diagnostics action sets the process-wide log level; later test
+  // files read their log at the level they expect.
+  setLogLevel(undefined)
   process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
   process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
   refreshSettings()
