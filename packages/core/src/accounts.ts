@@ -1928,7 +1928,8 @@ export async function saveAccountState(
 // Fallback / quota policies
 // ---------------------------------------------------------------------------
 
-function getFallbackStatuses(storage: AccountStorage | null) {
+/** The response statuses that send a request on to the next account. */
+export function getFallbackStatuses(storage: AccountStorage | null) {
   return storage?.fallbackOn?.length ? storage.fallbackOn : DEFAULT_FALLBACK_ON
 }
 
@@ -2171,7 +2172,7 @@ function refreshEnabled(storage: AccountStorage | null) {
   return storage?.refresh?.enabled !== false
 }
 
-function refreshBeforeExpiryMs(storage: AccountStorage | null) {
+export function refreshBeforeExpiryMs(storage: AccountStorage | null) {
   return (storage?.refresh?.refreshBeforeExpiryMinutes ?? 240) * 60_000
 }
 
