@@ -415,7 +415,12 @@ export function commandAccountPool(deps: {
       ),
     disable: async (id) =>
       written(
-        await disablePoolAccount(deps.store(), deps.paths(), id, deps.rowWrites),
+        await disablePoolAccount(
+          deps.store(),
+          deps.paths(),
+          id,
+          deps.rowWrites,
+        ),
       ),
     enable: async (id) =>
       written(

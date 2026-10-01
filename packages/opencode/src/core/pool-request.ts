@@ -348,9 +348,10 @@ async function serveSticky(
   const pinned = routePinnedRow(routing, options, id)
   if (pinned.kind === 'none') return undefined
   if (pinned.kind === 'move') {
-    // Should the ledger find no other row after all, a pinned row that is
-    // only exhausted is still sent to (see `last-path`); a row the
-    // killswitch blocks never is.
+    // The pin ledger re-places the session with its own pending bytes. If it
+    // finds no other row after all, a pinned row that is only exhausted is
+    // still sent to (as on the `last-path` route); a row below its
+    // killswitch floor never is.
     if (!migrate(pinned.reason) && pinned.reason === 'killswitch')
       return undefined
   } else if (pinned.kind === 'detour') {

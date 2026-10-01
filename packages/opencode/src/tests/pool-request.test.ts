@@ -926,8 +926,9 @@ describe('sticky-balanced on a migrated install', () => {
   })
 
   it("places a new session by the quota above each account's own killswitch threshold", async () => {
-    // fallback-1 has more quota left (90% against 50%), but its own
-    // threshold reserves 85% of it, leaving main the larger usable share.
+    // fallback-1 has more quota left (90% against 50%), but placement counts
+    // only the quota above an account's killswitch threshold: 90 - 85 = 5
+    // for fallback-1 against 50 - 5 (the default threshold) = 45 for main.
     seedPool(
       'sticky-balanced',
       [
