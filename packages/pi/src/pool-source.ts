@@ -167,7 +167,10 @@ function fileKey(path: string): string {
   }
 }
 
-/** The key account state is partitioned by: the wire identity, else the row id. */
+/**
+ * The key pending quota observations are kept under: the row's recorded
+ * ChatGPT identity (its wire identity), else the row id.
+ */
 function accountKey(row: Pick<PoolRow, 'id' | 'identity'>): string {
   return row.identity ? `identity:${row.identity}` : `row:${row.id}`
 }
@@ -576,7 +579,11 @@ export class PiPoolSource {
     })
   }
 
-  /** The row whose current token `accessToken` is, for a WebSocket frame. */
+  /**
+   * The row `accessToken` belongs to, for a WebSocket frame: the row whose
+   * recorded ChatGPT identity matches the token's, or, when either identity
+   * is unknown, the row holding exactly this token.
+   */
   rowForToken(accessToken: string): PoolRow | undefined {
     const identity = identityOfToken(accessToken)
     return this.snapshot.rows.find((row) =>

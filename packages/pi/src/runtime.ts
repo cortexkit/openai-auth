@@ -62,10 +62,10 @@ import { PiPoolSource, settleWithinBudget } from './pool-source.ts'
 import { placePiStickyPin } from './routing.ts'
 
 /**
- * How long a request refused because Pi's login has no quota reading yet
- * waits for that login's first poll, which is already under way. The poll is
- * one HTTP call (no store lock), and without this wait the first request of
- * every Pi process would be refused.
+ * How long a request refused for want of a quota reading waits for the first
+ * quota poll of Pi's login (row `main`), which is already under way, before
+ * routing once more. The poll is one HTTP call (no store lock); without this
+ * wait the first request of every Pi process could be refused.
  */
 export const FIRST_READING_WAIT_MS = 5_000
 
@@ -83,7 +83,7 @@ type RefreshAllQuotaResults = Awaited<
 >
 
 export interface PiOpenAIRuntimeDeps {
-  /** pi-ai's Codex stream, which sends one attempt. */
+  /** Sends one attempt of a request: pi-ai's Codex stream. */
   streamSimple: StreamSimple
   /** Creates the stream handed back to Pi. */
   createStream: () => AssistantMessageEventStream
@@ -137,7 +137,7 @@ export function errorEvent(
   }
 }
 
-/** What Pi shows for a request no account may serve. */
+/** The error message Pi shows for a request no account may serve. */
 export function blockedMessage(block: PoolBlock): string {
   const reset =
     block.resetAtMs !== undefined
@@ -427,8 +427,9 @@ export class PiOpenAIRuntime {
     this.main.observeToken(options?.apiKey)
     const storage = await this.storage()
     await this.pool.current()
-    // Refreshes run in the background: a row whose token ran out sits out
-    // until its refresh lands, so no request waits on the store's locks.
+    // Token refreshes of pool rows run in the background, so no request waits
+    // on the pool store's locks; a row whose token ran out sits out until its
+    // refresh lands.
     void this.pool.refreshDueTokens(this.pool.peek().rows, storage)
     const mode: RoutingMode = storage?.routing?.mode ?? 'main-first'
     const run = () =>

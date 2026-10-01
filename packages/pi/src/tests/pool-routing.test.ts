@@ -312,12 +312,13 @@ describe('Pi requests on the account pool', () => {
       })
     }
     const runtime = makeRuntime()
-    // Every account's first reading lands before the first request, which is
-    // what starts the refresh.
+    // Every account's first quota reading lands before the first request;
+    // that request is what starts alpha's refresh.
     await ready(runtime)
     await setMode('fallback-first')
 
-    // The refresh is held, so this request is served without alpha.
+    // Alpha's refresh is held at the token endpoint, so this request is
+    // served by beta without waiting for it.
     const first = await send(runtime)
     expect(first[0]?.type).toBe('start')
     expect(codexTokens()).toEqual([BETA_TOKEN])
@@ -386,7 +387,7 @@ describe('Pi requests on the account pool', () => {
       }),
     )
 
-    // Routing reads the in-memory rows, which take the frame at once.
+    // Routing reads the in-memory rows, which take the frame's quota at once.
     const rows = runtime.pool.peek().rows
     const used = (id: string) =>
       projectQuota(
@@ -452,7 +453,7 @@ describe('Pi requests on the account pool', () => {
       blocked[0]?.type === 'error' ? blocked[0].error.errorMessage : '',
     ).toContain('No OpenAI account has a quota reading yet')
     expect(codexTokens()).toEqual([])
-    // The refusal itself started the first checks.
+    // Refusing the request asked for every account's first quota check.
     expect(calls.some((call) => call.url === WHAM_URL)).toBe(true)
 
     releaseWham()
