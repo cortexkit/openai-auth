@@ -199,8 +199,8 @@ async function rosterIdsOf(store: PoolStore): Promise<string[]> {
  * `readSettings` returns the settings as `migrateLegacySettings` would leave
  * them, without writing. `updateSettings` migrates the stored settings in
  * the same locked write as the caller's change, before the caller sees them
- * (so its edit applies to the new shape), and again after it (so a
- * killswitch block the caller created reads in the new vocabulary too).
+ * (so its edit applies to the new shape), and marks a killswitch block the
+ * caller created as being in the new vocabulary.
  * Every other member is the store's own.
  *
  * The roster is read just before the locked write; a row added in between
@@ -222,7 +222,17 @@ export function withSettingsMigration(store: PoolStore): PoolStore {
     return store.updateSettings(async (settings) => {
       migrateLegacySettings(settings, ids)
       const next = (await mutator(settings)) ?? settings
-      migrateLegacySettings(next, ids)
+      // Any block that existed is marked by now, so an unmarked one was
+      // created by this write, in the shared vocabulary: it is marked as it
+      // is, without the older defaults.
+      if (
+        isRecord(next.killswitch) &&
+        next.killswitch.schema !== KILLSWITCH_FLOORS_SCHEMA
+      )
+        next.killswitch = {
+          ...next.killswitch,
+          schema: KILLSWITCH_FLOORS_SCHEMA,
+        }
       return next
     }, options)
   }
