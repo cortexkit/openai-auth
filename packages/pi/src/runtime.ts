@@ -18,8 +18,7 @@
 // produced it.
 
 import { statSync } from 'node:fs'
-import type { PoolRow } from '@cortexkit/common-auth/store'
-import type { CommandContext } from '@cortexkit/openai-auth-core'
+import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
 import {
   type AccountPaths,
   type AccountStorage,
@@ -29,7 +28,8 @@ import {
   loadAccounts,
   normalizeQuotaHeaders,
   normalizeWsFrame,
-  type QuotaManager,
+  type OAuthQuotaSnapshot,
+  type RefreshAllQuotaResult,
   type RoutingMode,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
@@ -53,7 +53,6 @@ import type {
 } from '@earendil-works/pi-ai'
 import { PiMainAccount } from './main-account.ts'
 import { getPiAccountPaths } from './paths.ts'
-import { piCommandAccountPool } from './pool-accounts.ts'
 import {
   type RouteAccount,
   type RouteAttempt,
@@ -80,9 +79,7 @@ type StreamSimple = (
   options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream
 
-type RefreshAllQuotaResults = Awaited<
-  ReturnType<NonNullable<CommandContext['refreshAllQuota']>>
->
+type RefreshAllQuotaResults = RefreshAllQuotaResult[]
 
 export interface PiOpenAIRuntimeDeps {
   /** Sends one attempt of a request: pi-ai's Codex stream. */
@@ -518,25 +515,14 @@ export class PiOpenAIRuntime {
   // Commands
   // -------------------------------------------------------------------------
 
-  /** What `/openai-account` and `/openai-quota` read and change on the pool. */
+  /** What `/openai` reads and changes on the pool. */
   commandSupport(): PiPoolCommands {
     return {
       observeLogin: (token) => this.main.observeToken(token),
-      accountPool: piCommandAccountPool({
-        paths: this.paths,
-        store: () => this.pool.poolStore(),
-        poolRows: async () => {
-          const view = await this.pool.load()
-          return view.active ? view.rows : undefined
-        },
-        main: () => ({
-          present: this.main.currentToken() !== undefined,
-          identity: this.main.currentIdentity(),
-        }),
-        afterWrite: () => this.pool.load(),
-      }),
-      poolActive: async () => (await this.pool.load()).active,
-      seedQuota: (manager) => this.seedQuota(manager),
+      store: () => this.pool.poolStore(),
+      mainIdentity: () => this.main.currentIdentity(),
+      mainQuota: () => this.main.quotaSnapshot(),
+      reload: () => this.pool.load(),
       refreshAllQuota: async () => {
         const storage = await this.storage()
         const [main, rows] = await Promise.all([
@@ -560,57 +546,20 @@ export class PiOpenAIRuntime {
       },
     }
   }
-
-  /** Fills a command's quota manager with Pi's login and every pool row. */
-  private seedQuota(manager: QuotaManager): void {
-    const now = this.now()
-    const token = this.main.currentToken()
-    const mainQuota = this.main.quotaSnapshot()
-    if (token && mainQuota) {
-      manager.setMain(
-        token,
-        { quota: mainQuota, refreshAfter: now, checkedAt: now },
-        this.main.currentIdentity(),
-        true,
-      )
-    }
-    const view = this.pool.peek()
-    if (!view.active) return
-    for (const row of view.rows) {
-      if (row.type !== 'oauth') continue
-      const polled = this.pool.polledSnapshot(row.id)
-      const windows = windowsFromQuotaMap(row.quota)
-      if (!windows && !polled) continue
-      manager.setFallback(
-        row.id,
-        {
-          quota: {
-            ...(polled?.resetCreditsAvailable !== undefined
-              ? { resetCreditsAvailable: polled.resetCreditsAvailable }
-              : {}),
-            ...(polled?.spendControl
-              ? { spendControl: polled.spendControl }
-              : {}),
-            ...windows,
-          },
-          refreshAfter: now,
-          checkedAt: now,
-        },
-        undefined,
-        true,
-        row.identity,
-      )
-    }
-  }
 }
 
-/** The pool-backed parts of the Pi commands. */
+/** The pool-backed parts of the Pi `/openai` command. */
 export interface PiPoolCommands {
   /** Takes the token Pi holds for its login now, as a request would. */
   observeLogin: (token: string | undefined) => void
-  accountPool: NonNullable<CommandContext['accountPool']>
-  /** Whether the pool serves this install (the commands then show its rows). */
-  poolActive: () => Promise<boolean>
-  seedQuota: (manager: QuotaManager) => void
-  refreshAllQuota: NonNullable<CommandContext['refreshAllQuota']>
+  /** The store Pi's pool rows live in. */
+  store: () => PoolStore
+  /** The ChatGPT account Pi's own login signs in with, when known. */
+  mainIdentity: () => string | undefined
+  /** The last quota reading of Pi's own login, which is not a pool row. */
+  mainQuota: () => OAuthQuotaSnapshot | undefined
+  /** Re-reads the pool, so requests route across changed rows at once. */
+  reload: () => Promise<unknown>
+  /** Polls the quota of Pi's login and every pool row now. */
+  refreshAllQuota: () => Promise<RefreshAllQuotaResults>
 }
