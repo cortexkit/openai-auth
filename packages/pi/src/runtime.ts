@@ -4,7 +4,7 @@
 // Pi hands every `openai-codex` request to this extension with the access
 // token of Pi's own login. That login is routed as row `main`
 // (`main-account.ts`); the rows of Pi's account pool (`pool-source.ts`) are
-// the fallbacks. Each request is routed by the mode `/openai-routing` set
+// the fallbacks. Each request is routed by the mode the `/openai` menu set
 // (`pool-request.ts`) and sent through pi-ai's Codex stream with the chosen
 // account's token in place of Pi's: pi-ai derives the `chatgpt-account-id`
 // header from that token, so the token is the whole credential.
@@ -145,11 +145,11 @@ export function blockedMessage(block: PoolBlock): string {
     case 'quota-exhausted':
       return `Every OpenAI account has used up its quota.${reset}`
     case 'killswitch':
-      return 'Every OpenAI account is below its killswitch quota floor (see `/openai-routing`).'
+      return 'Every OpenAI account is below its killswitch quota floor (see the Limits section of `/openai`).'
     case 'mid-stream-rate-limit':
       return `Every OpenAI account is rate-limited.${reset}`
     case 'no-credential':
-      return 'No OpenAI account holds a usable sign-in. Sign in with `/login` or add an account with `/openai-account add`.'
+      return 'No OpenAI account holds a usable sign-in. Sign in with `/login` or add an account with `/openai`.'
   }
 }
 

@@ -2,7 +2,7 @@
 //
 // A session is pinned to the account it was placed on and keeps it while the
 // account can serve; the pins live in this process only, so a restarted Pi
-// places its sessions again. `/openai-routing` reads and clears them.
+// places its sessions again. The `/openai` menu reads and clears them.
 
 import {
   isPinValid,

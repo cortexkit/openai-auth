@@ -58,7 +58,7 @@ export function identityOfToken(token: string | undefined): string | undefined {
   return claims ? extractAccountIdFromClaims(claims) : undefined
 }
 
-/** How one quota poll of Pi's login ended, for `/openai-quota`. */
+/** How one quota poll of Pi's login ended, for the `/openai` quota check. */
 export interface MainPollResult {
   ok: boolean
   error?: string

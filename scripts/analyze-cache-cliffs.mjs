@@ -111,7 +111,8 @@ function loadDumps(root, sessionID) {
       metaPath,
       bodyPath,
       requestPath: meta.files?.request,
-      transport: meta.transport,
+      // `channel` since the shared dumper; `transport` in older dumps.
+      transport: meta.channel ?? meta.transport,
       phase: meta.phase,
       bodyBytes: meta.bodyBytes,
       bodyHash: meta.bodyHash,

@@ -19,8 +19,9 @@ import {
 import type { Hooks } from '@opencode-ai/plugin'
 import { createAuthMethods } from '../auth/methods'
 import { buildDialogPayload, type CommandContext } from '../commands'
-import { PoolAccountSource } from '../core/pool-account-source'
+import type { OpenAICacheKeepManager } from '../core/cachekeep'
 import { MAIN_REFRESH_LOCK_NAME } from '../core/custody-transition'
+import { PoolAccountSource } from '../core/pool-account-source'
 import { commandAccountPool, openAccountPool } from '../core/pool-accounts'
 import { buildPoolSidebarMachineState } from '../core/pool-sidebar'
 import {
@@ -816,7 +817,7 @@ describe('cachekeep and reset credits on a migrated install', () => {
       { id: 'main', quota: quotaMap(10) },
       { id: 'fallback-1', quota: quotaMap(10) },
     ])
-    installWire()
+    const wire = installWire()
     hooks = await loadPlugin({}, slot)
     const managers = (
       globalThis as {
@@ -824,17 +825,35 @@ describe('cachekeep and reset credits on a migrated install', () => {
       }
     ).__openaiAuthCacheKeepManagers
     const manager = [...(managers?.values() ?? [])].at(-1) as
-      | {
-          getMainToken: () => Promise<string>
-          refreshFallback: (id: string) => Promise<{ token: string }>
-        }
+      | OpenAICacheKeepManager
       | undefined
     if (!manager) throw new Error('no cachekeep manager')
 
-    expect(await manager.getMainToken()).toBe('main-token')
-    expect((await manager.refreshFallback('fallback-1')).token).toBe(
-      'fallback-1-token',
-    )
+    // Track one session per account, move both cache expiries to now so the
+    // tick warms them, and check that each warm request carries the bearer
+    // the plugin resolved for that account.
+    const body = JSON.stringify({ model: 'gpt-5.5', input: [] })
+    for (const accountId of ['main', 'fallback-1']) {
+      manager.track({
+        sessionKey: `warm-${accountId}`,
+        bodyText: body,
+        accountId,
+        meta: { replayHeaders: {} },
+      })
+    }
+    const targets = (
+      manager as unknown as {
+        targets: Map<string, { cacheExpiresAt: number }>
+      }
+    ).targets
+    for (const target of targets.values()) target.cacheExpiresAt = Date.now()
+    const before = wire.sends.length
+    await manager.tick()
+
+    const warms = wire.sends.slice(before)
+    expect(warms).toContain('Bearer main-token')
+    expect(warms).toContain('Bearer fallback-1-token')
+    expect(warms).not.toContain('Bearer slot-token')
   })
 
   it('/openai-reset previews main with row main token, never the slot', async () => {

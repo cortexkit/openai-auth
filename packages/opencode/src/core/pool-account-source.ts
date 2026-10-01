@@ -123,7 +123,7 @@ type PendingObservation = {
 
 type Snapshot = PoolView & { key: string | undefined; readAt: number }
 
-/** How one row's quota poll ended, for callers that report it (`/openai-quota`). */
+/** How one row's quota poll ended, for callers that report it (the `/openai` quota check). */
 export interface PoolPollResult {
   id: string
   ok: boolean

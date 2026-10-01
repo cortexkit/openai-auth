@@ -93,8 +93,10 @@ import {
 } from './core/background-quota-refresh'
 import {
   buildKeepwarmCapture,
-  CacheKeepManager,
+  createCacheKeepManager,
   getCacheKeepWindow,
+  type OpenAICacheKeepManager,
+  routedAccountForSession,
 } from './core/cachekeep'
 import {
   type CustodyBootstrap,
@@ -1385,7 +1387,7 @@ export async function CodexAuthPlugin(
       body: { type: 'oauth'; access: string; refresh: string; expires: number }
     }): Promise<unknown>
   }
-  const ownedCacheKeepManagers = new Map<string, CacheKeepManager>()
+  const ownedCacheKeepManagers = new Map<string, OpenAICacheKeepManager>()
   const ownedRpcServers = new Map<string, RpcServerAdoption>()
   let activeFallbackManager: FallbackAccountManager | undefined
   let sidebarStateFileForEvents: string | undefined
@@ -1715,7 +1717,7 @@ export async function CodexAuthPlugin(
       for (const websocketFetch of websocketFetches) websocketFetch.close()
       websocketFetches.length = 0
       const cacheKeepGlobal = globalThis as {
-        __openaiAuthCacheKeepManagers?: Map<string, CacheKeepManager>
+        __openaiAuthCacheKeepManagers?: Map<string, OpenAICacheKeepManager>
       }
       for (const [key, manager] of ownedCacheKeepManagers) {
         if (
@@ -2309,7 +2311,7 @@ export async function CodexAuthPlugin(
           }
         }
 
-        // A manual quota check on a migrated install (`/openai-quota`, the
+        // A manual quota check on a migrated install (the `/openai` menu's quota check, the
         // reset command's precondition): polls the named rows, or every row,
         // through the pool source, in the result shape the commands report.
         async function pollPoolRows(
@@ -2718,13 +2720,13 @@ export async function CodexAuthPlugin(
           }
         }
         const cacheKeepGlobal = globalThis as {
-          __openaiAuthCacheKeepManagers?: Map<string, CacheKeepManager>
+          __openaiAuthCacheKeepManagers?: Map<string, OpenAICacheKeepManager>
         }
         const cacheKeepManagers =
           cacheKeepGlobal.__openaiAuthCacheKeepManagers ?? new Map()
         cacheKeepGlobal.__openaiAuthCacheKeepManagers = cacheKeepManagers
         cacheKeepManagers.get(cacheKeepKey)?.stop()
-        const cacheKeepManager = new CacheKeepManager({
+        const cacheKeepManager = createCacheKeepManager({
           fetchImpl: fetch,
           getMainToken: async () => {
             // A migrated install's main account is the pool row `main`; the
@@ -2798,8 +2800,21 @@ export async function CodexAuthPlugin(
             }
           },
           codexResponsesUrl: codexApiEndpoint,
+          // The account the session routes to now: a session moved to another
+          // account is not warmed on the one it left. This process's sticky
+          // pins that are not saved yet are applied, as the router applies
+          // them, so a warm follows the same account choice as a request.
+          activeAccount: async (routingSessionId) =>
+            routedAccountForSession(
+              applyStickyPinOverlay(
+                await sidebarCache.read(),
+                stickyPinOverlay,
+              ),
+              routingSessionId,
+            ),
           logger: cacheKeepLogger,
           now: Date.now,
+          // Read on every call, so changes from the `/openai` Cache section apply live.
           getWindow: () => cacheKeepWindow,
           getSustain: () => cacheKeepSustain,
         })
@@ -3602,14 +3617,17 @@ export async function CodexAuthPlugin(
               accountId: keepwarmAccountKey,
             })
             if (keepwarmCapture) {
-              cacheKeepManager.track(
-                keepwarmCapture.sessionKey,
-                keepwarmCapture.bodyText,
-                keepwarmAccountKey,
-                accountId,
-                keepwarmCapture.replayHeaders,
-                keepwarmCapture.isSubagent,
-              )
+              cacheKeepManager.track({
+                sessionKey: keepwarmCapture.sessionKey,
+                bodyText: keepwarmCapture.bodyText,
+                accountId: keepwarmAccountKey,
+                isSubagent: keepwarmCapture.isSubagent,
+                meta: {
+                  replayHeaders: keepwarmCapture.replayHeaders,
+                  chatgptAccountId: accountId,
+                  routingSessionId: sessionID,
+                },
+              })
             }
             return stamp(await websocketFetch(url, requestInit))
           }
@@ -3622,14 +3640,17 @@ export async function CodexAuthPlugin(
           // Keepwarm capture: track every request body for idle
           // prompt-cache warming. Cheap — stores the already-serialized string.
           if (keepwarmCapture) {
-            cacheKeepManager.track(
-              keepwarmCapture.sessionKey,
-              keepwarmCapture.bodyText,
-              keepwarmAccountKey,
-              accountId,
-              keepwarmCapture.replayHeaders,
-              keepwarmCapture.isSubagent,
-            )
+            cacheKeepManager.track({
+              sessionKey: keepwarmCapture.sessionKey,
+              bodyText: keepwarmCapture.bodyText,
+              accountId: keepwarmAccountKey,
+              isSubagent: keepwarmCapture.isSubagent,
+              meta: {
+                replayHeaders: keepwarmCapture.replayHeaders,
+                chatgptAccountId: accountId,
+                routingSessionId: sessionID,
+              },
+            })
           }
 
           logT.debug('HTTP transport', {

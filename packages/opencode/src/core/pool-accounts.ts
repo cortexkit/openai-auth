@@ -1,5 +1,5 @@
-// Managing the accounts of a migrated install: what `/openai-account` and the
-// auth menu do once every account is a row of the account pool
+// Managing the accounts of a migrated install: the helpers the auth menu's doctor and the request
+// path use once every account is a row of the account pool
 // (`@cortexkit/common-auth/store`).
 //
 // - A new login becomes a row through `store.add`; a login of an account a row
