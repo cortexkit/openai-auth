@@ -133,9 +133,12 @@ const PROTOTYPE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
  * the older reader applied to it: its own thresholds when it had an entry,
  * else the `main` thresholds, and the default for a window neither names.
  * The main account (judged against `main`) becomes row `main`. Accounts the
- * older reader covered implicitly are written explicitly, because in the new
- * vocabulary an account without an entry has no floor. The same quota
- * therefore blocks the same requests before and after.
+ * older reader covered implicitly are written explicitly, and the floors it
+ * gave an account without an entry (the `main` thresholds) become the
+ * block's `defaults`, which the new reader applies to every account without
+ * an entry. A row added after this rewrite, or while it runs (the roster is
+ * read before the settings lock), is therefore judged as it was before. The
+ * same quota blocks the same requests before and after.
  */
 export function killswitchInFloors(
   block: Record<string, unknown>,
@@ -158,9 +161,13 @@ export function killswitchInFloors(
     )
     accounts[id] = { primary: floors.primary, secondary: floors.secondary }
   }
+  // With no account named, the older reader returns what it gave every
+  // account without an entry of its own.
+  const fallback = getKillswitchThresholdsForAccount(legacy, undefined)
   const next: Settings = { ...block }
   delete next.main
   next.accounts = accounts
+  next.defaults = { primary: fallback.primary, secondary: fallback.secondary }
   next.schema = KILLSWITCH_FLOORS_SCHEMA
   return next
 }
@@ -168,7 +175,8 @@ export function killswitchInFloors(
 /**
  * A killswitch block created in the shared vocabulary, marked as such, with
  * the default floors (`DEFAULT_KILLSWITCH_THRESHOLDS`) written for row
- * `main` and every row in `rosterIds` the block does not name. Floors the
+ * `main` and every row in `rosterIds` the block does not name, and as the
+ * block's `defaults` for any row added later. Floors (and defaults) the
  * block already holds are kept as they are.
  */
 export function killswitchWithDefaultFloors(
@@ -185,7 +193,13 @@ export function killswitchWithDefaultFloors(
       secondary: DEFAULT_KILLSWITCH_THRESHOLDS.secondary,
     }
   }
-  return { ...block, accounts, schema: KILLSWITCH_FLOORS_SCHEMA }
+  const defaults = isRecord(block.defaults)
+    ? block.defaults
+    : {
+        primary: DEFAULT_KILLSWITCH_THRESHOLDS.primary,
+        secondary: DEFAULT_KILLSWITCH_THRESHOLDS.secondary,
+      }
+  return { ...block, accounts, defaults, schema: KILLSWITCH_FLOORS_SCHEMA }
 }
 
 /**
@@ -235,7 +249,8 @@ async function rosterIdsOf(store: PoolStore): Promise<string[]> {
  * Every other member is the store's own.
  *
  * The roster is read just before the locked write; a row added in between
- * gets no killswitch floors from the migration.
+ * gets no entry of its own from the migration, and is judged by the block's
+ * `defaults` instead.
  */
 export function withSettingsMigration(store: PoolStore): PoolStore {
   const readSettings: PoolStore['readSettings'] = async () => {

@@ -1,6 +1,7 @@
 // The killswitch's older thresholds, rewritten once as the shared menu's
 // per-account floors, must block exactly the requests they blocked before.
 import { describe, expect, test } from 'bun:test'
+import type { PoolStore } from '@cortexkit/common-auth/store'
 import {
   type AccountStorage,
   getKillswitchThresholdsForAccount,
@@ -8,7 +9,12 @@ import {
   killswitchPassesPolicy,
   type OAuthQuotaSnapshot,
 } from '../accounts'
-import { killswitchInFloors, migrateLegacySettings } from '../commands'
+import {
+  killswitchInFloors,
+  killswitchWithDefaultFloors,
+  migrateLegacySettings,
+  withSettingsMigration,
+} from '../commands'
 
 const NOW = Date.parse('2026-10-01T12:00:00.000Z')
 const LATER = new Date(NOW + 3600_000).toISOString()
@@ -62,7 +68,113 @@ describe('killswitch floors', () => {
         beta: { primary: 5, secondary: 10 },
         gamma: { primary: 20, secondary: 30 },
       },
+      defaults: { primary: 20, secondary: 30 },
       schema: KILLSWITCH_FLOORS_SCHEMA,
+    })
+  })
+
+  // Every floor an account gets, read before the rewrite and after it, over
+  // a grid of quota readings that reaches both sides of every floor.
+  function expectSameVerdicts(
+    before: AccountStorage,
+    after: AccountStorage,
+    ids: readonly string[],
+  ) {
+    let blocked = 0
+    for (const id of ids) {
+      const key = id === 'main' ? undefined : id
+      for (let primary = 0; primary <= 100; primary += 5) {
+        for (let secondary = 0; secondary <= 100; secondary += 5) {
+          const reading = quota(primary, secondary)
+          const was = killswitchPassesPolicy(reading, before, key, NOW)
+          expect(killswitchPassesPolicy(reading, after, key, NOW)).toBe(was)
+          if (!was) blocked += 1
+        }
+      }
+      expect(getKillswitchThresholdsForAccount(after, key)).toEqual(
+        getKillswitchThresholdsForAccount(before, key),
+      )
+    }
+    expect(blocked).toBeGreaterThan(0)
+  }
+
+  test('a row added after the rewrite keeps the floors the older reader gave it', () => {
+    const settings: Record<string, unknown> = {
+      killswitch: structuredClone(OLDER),
+    }
+    migrateLegacySettings(settings, ROSTER)
+    const after = storage(settings.killswitch as Record<string, unknown>)
+
+    // `delta` was not in the roster the rewrite saw; the older reader judged
+    // it against `main`, and so must the rewritten block.
+    expectSameVerdicts(storage(OLDER), after, ['delta'])
+    expect(getKillswitchThresholdsForAccount(after, 'delta')).toEqual({
+      primary: 20,
+      secondary: 30,
+    })
+  })
+
+  test('a row added while the rewrite runs is protected', async () => {
+    // The roster is read before the locked settings write, so a row added in
+    // between is missing from the roster the rewrite sees.
+    const staleRoster = ['main', 'alpha']
+    let settings: Record<string, unknown> = {
+      killswitch: structuredClone(OLDER),
+    }
+    const store = {
+      read: async () => ({
+        status: 'ready',
+        rows: staleRoster.map((id) => ({ id })),
+      }),
+      readSettings: async () => ({ status: 'ready', settings }),
+      updateSettings: async (
+        mutator: (
+          current: Record<string, unknown>,
+        ) => Promise<Record<string, unknown> | undefined>,
+      ) => {
+        const current = structuredClone(settings)
+        settings = (await mutator(current)) ?? current
+        return { status: 'ready', settings }
+      },
+    } as unknown as PoolStore
+
+    await withSettingsMigration(store).updateSettings(() => undefined)
+
+    const after = storage(settings.killswitch as Record<string, unknown>)
+    expect(after.killswitch?.schema).toBe(KILLSWITCH_FLOORS_SCHEMA)
+    // `gamma` and `racer` were both added while the rewrite ran.
+    expectSameVerdicts(storage(OLDER), after, ['gamma', 'racer'])
+  })
+
+  test('a block created in the new vocabulary protects rows added later with the default floors', () => {
+    const created = storage(
+      killswitchWithDefaultFloors({ enabled: true }, ['main', 'alpha']),
+    )
+    expect(getKillswitchThresholdsForAccount(created, 'later')).toEqual({
+      primary: 5,
+      secondary: 10,
+    })
+    expect(killswitchPassesPolicy(quota(4, 90), created, 'later', NOW)).toBe(
+      false,
+    )
+  })
+
+  test("an account's own entry wins over the block's defaults, window by window", () => {
+    const marked = storage({
+      enabled: true,
+      accounts: { alpha: { primary: 25 } },
+      defaults: { primary: 50, secondary: 50 },
+      schema: KILLSWITCH_FLOORS_SCHEMA,
+    })
+    // alpha's entry names no secondary floor, so it has none; the defaults
+    // are for accounts without an entry at all.
+    expect(getKillswitchThresholdsForAccount(marked, 'alpha')).toEqual({
+      primary: 25,
+      secondary: 0,
+    })
+    expect(getKillswitchThresholdsForAccount(marked, 'gamma')).toEqual({
+      primary: 50,
+      secondary: 50,
     })
   })
 
