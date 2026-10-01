@@ -2,12 +2,25 @@
 // background: through its real loader, fetch override and auth methods,
 // against a legacy install on disk and a file-backed OpenCode login slot.
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { connectClaustrumScopedClient } from '@cortexkit/common-auth/claustrum'
+import { vaultPaths } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
+import {
+  startMockDaemon,
+  vaultLogin,
+} from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import type { PoolLifecycleDeps } from '../core/pool-lifecycle.ts'
 import {
+  adoptHostSlotLogin,
   type HostSlotAdapter,
   isPoolPlaceholder,
   POOL_MIGRATION_KEY,
@@ -344,6 +357,63 @@ describe('the migration after the loader starts', () => {
     expect(wire.refreshTokens).toEqual(['r-main'])
     expect(wire.sends).toEqual(['Bearer refreshed-access'])
     expect(isPoolPlaceholder(await slotValue())).toBe(true)
+  })
+})
+
+describe('adoption beside the Claustrum vault', () => {
+  // Until the vault has read its first roster it reports serving nothing, so
+  // an adoption run before then would take a slot login on a host the vault
+  // serves. The loader does not wait for the roster; the adoption does.
+  it("the first adoption waits for the vault's first roster, so it sees the vault serving", async () => {
+    const daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+    })
+    try {
+      const stateDir = join(dir, 'vault')
+      mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+      const { tokenPath } = vaultPaths(stateDir, 'opencode')
+      writeFileSync(
+        tokenPath,
+        JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+        { mode: 0o600 },
+      )
+      chmodSync(tokenPath, 0o600)
+      await seedLegacy()
+      installWire({ usage: true })
+      const seen: Array<boolean | undefined> = []
+      await loadPlugin(
+        {
+          adopt: async (deps) => {
+            seen.push(deps.vaultServes?.())
+            return adoptHostSlotLogin(deps)
+          },
+        },
+        {
+          vault: {
+            stateDir,
+            connectionFile: () => daemon.connectionFile,
+            // Opened a second late, so the roster read ends well after the
+            // migration reaches its adoption.
+            connectScoped: async () => {
+              await Bun.sleep(1_000)
+              return connectClaustrumScopedClient({
+                connectionFile: daemon.connectionFile,
+                projectRoot: dir,
+                storagePath: tokenPath,
+              })
+            },
+            pollIntervalMs: 0,
+          },
+        },
+      )
+      await waitFor(async () => seen.length > 0, 'the first adoption')
+      expect(seen[0]).toBe(true)
+    } finally {
+      await hooks?.dispose?.()
+      hooks = undefined
+      await daemon.stop()
+    }
   })
 })
 

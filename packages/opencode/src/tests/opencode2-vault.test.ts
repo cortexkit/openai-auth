@@ -257,8 +257,8 @@ describe('vault accounts on OpenCode 2', () => {
     expect(refreshed.some((token) => token.includes('B-refresh'))).toBe(false)
   })
 
-  // The pool source polls every row once as soon as it first reads the pool.
-  // That first read must already know which accounts the vault holds, or the
+  // The pool source polls every row once when it first reads the pool. Those
+  // polls must wait until the vault has read which accounts it holds, or the
   // local copy of a vault account is polled with its own token at startup.
   it('never polls the quota of a pool row signing in as an account the vault holds, from the first read on', async () => {
     const polls: string[] = []
@@ -283,6 +283,48 @@ describe('vault accounts on OpenCode 2', () => {
     await Bun.sleep(1_000)
     expect(polls).not.toContain('Bearer B-token')
   })
+
+  it('a vault daemon that never answers holds neither setup nor, past a bounded wait, a pool request', async () => {
+    const files = poolFiles()
+    seedPool(files, 'fallback-first', [{ id: 'main' }])
+    const stateDir = join(files.dir, 'vault')
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+    const { tokenPath } = vaultPaths(stateDir, 'opencode')
+    writeFileSync(
+      tokenPath,
+      JSON.stringify({ token: ENROLLMENT_TOKEN, token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    chmodSync(tokenPath, 0o600)
+    const host = fakeOpenCode2Host()
+    const starting = Date.now()
+    const stop = await setupOpenAIAuth(host.ctx, {
+      paths: files.paths,
+      slot: opencode1HostSlot(join(files.dir, 'auth.json')),
+      fence: async () => ({ open: true }),
+      heartbeat: false,
+      fetch: usageOnly,
+      vault: {
+        stateDir,
+        // The connection is never made, so the first roster read never ends.
+        connectScoped: () => new Promise(() => {}),
+        pollIntervalMs: 0,
+      },
+    })
+    cleanups.push(() => rmSync(files.dir, { recursive: true, force: true }))
+    cleanups.push(async () => {
+      await stop?.()
+    })
+    expect(Date.now() - starting).toBeLessThan(1_000)
+
+    const sending = Date.now()
+    const served = await send(host, 200)
+
+    expect(served.get('authorization')).toBe('Bearer main-token')
+    // The request's token step waited for the roster, but only for its bound.
+    expect(Date.now() - sending).toBeGreaterThanOrEqual(1_900)
+    expect(Date.now() - sending).toBeLessThan(4_000)
+  }, 10_000)
 
   it('does not adopt a login in the host slot while the vault serves this host its accounts', async () => {
     const login = {

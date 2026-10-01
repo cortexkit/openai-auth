@@ -22,8 +22,9 @@
 // - Unknown quota blocks admission (`@cortexkit/common-auth/routing`), so no
 //   row may stay without a reading: every row gets a quota poll as soon as
 //   this process sees it (at load, when it is added, and when the install
-//   turns migrated), and admission asks for another whenever it refuses a row
-//   for want of one.
+//   turns migrated; at startup only once the vault has read which accounts
+//   it holds), and admission asks for another whenever it refuses a row for
+//   want of one.
 //
 // State that belongs to an account (rate-limit marks, pending quota) is keyed
 // by the row's wire identity where the row records one, so a row that comes
@@ -81,6 +82,13 @@ export const POOL_PULL_RETRY_MS = 15_000
  */
 const LOCAL_REFRESH_RETRY_MS = 30_000
 
+/**
+ * Longest a request's token step waits for the vault's first roster (see
+ * `PoolAccountSourceDeps.vaultFirstRoster`) before it goes ahead with the
+ * vault accounts known so far.
+ */
+export const VAULT_FIRST_ROSTER_WAIT_MS = 2_000
+
 /** Observations kept per row to re-apply over a re-read the store write has not reached yet. */
 const PENDING_OBSERVATIONS_PER_ROW = 8
 const PENDING_OBSERVATION_MAX_AGE_MS = 30 * 60_000
@@ -114,6 +122,16 @@ export interface PoolAccountSourceDeps {
    * source never refreshes it or polls its quota either.
    */
   vaultIdentities?: () => ReadonlySet<string>
+  /**
+   * Settles (resolved or rejected) once the vault has read its first roster.
+   * Until then `vaultIdentities` is empty even for an account the vault
+   * holds, so the first-sight quota polls of new rows wait for it, and a
+   * token step waits for it at most `vaultFirstRosterWaitMs`. Nothing else
+   * waits for it. Absent: there is no vault roster to wait for.
+   */
+  vaultFirstRoster?: Promise<unknown>
+  /** Overrides `VAULT_FIRST_ROSTER_WAIT_MS` (tests). */
+  vaultFirstRosterWaitMs?: number
 }
 
 type BackoffEntry = {
@@ -230,11 +248,41 @@ export class PoolAccountSource {
   /** The latest poll outcome per row id, read back by `pollRows`. */
   private readonly pollOutcomes = new Map<string, PoolPollResult>()
   private disposed = false
+  /** Whether `deps.vaultFirstRoster` has settled (true when there is none). */
+  private vaultRosterSettled: boolean
+  /** Set once the first-sight polls are queued behind the vault's first roster. */
+  private pollsAwaitVault = false
 
   constructor(deps: PoolAccountSourceDeps) {
     this.deps = deps
     this.now = deps.now ?? Date.now
     this.log = deps.log ?? createLogger('pool')
+    this.vaultRosterSettled = deps.vaultFirstRoster === undefined
+    const settled = () => {
+      this.vaultRosterSettled = true
+    }
+    deps.vaultFirstRoster?.then(settled, settled)
+  }
+
+  /**
+   * Waits for the vault's first roster for at most `ms`, then returns either
+   * way. Never rejects.
+   */
+  private async awaitVaultRoster(ms: number): Promise<void> {
+    const first = this.deps.vaultFirstRoster
+    if (this.vaultRosterSettled || !first) return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    await Promise.race([
+      first.then(
+        () => undefined,
+        () => undefined,
+      ),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, ms)
+        timer.unref?.()
+      }),
+    ])
+    clearTimeout(timer)
   }
 
   // -------------------------------------------------------------------------
@@ -425,6 +473,18 @@ export class PoolAccountSource {
 
   private pollUnseenRows(): void {
     if (this.disposed) return
+    const first = this.deps.vaultFirstRoster
+    if (!this.vaultRosterSettled && first) {
+      // Which rows the vault owns is not known yet. These polls run in the
+      // background anyway, so they wait for the roster rather than poll a
+      // vault account's local row with that row's own token. One deferred
+      // pass covers every read until then: it polls the rows as they are.
+      if (this.pollsAwaitVault) return
+      this.pollsAwaitVault = true
+      const pollNow = () => this.pollUnseenRows()
+      void first.then(pollNow, pollNow)
+      return
+    }
     for (const row of this.snapshot.rows) {
       if (!row.candidate || row.type !== 'oauth' || this.vaultOwned(row))
         continue
@@ -586,6 +646,12 @@ export class PoolAccountSource {
     storage: AccountStorage | null,
     options: { waitForAll?: boolean } = {},
   ): Promise<void> {
+    // A row signing in as a vault account must not be refreshed, and before
+    // the vault's first roster no such account is known. Bounded, so a vault
+    // that never answers costs a request at most this wait.
+    await this.awaitVaultRoster(
+      this.deps.vaultFirstRosterWaitMs ?? VAULT_FIRST_ROSTER_WAIT_MS,
+    )
     const now = this.now()
     const windowMs = refreshBeforeExpiryMs(storage)
     const waits: Promise<void>[] = []
