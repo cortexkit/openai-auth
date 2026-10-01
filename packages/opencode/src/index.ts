@@ -721,12 +721,13 @@ export {
   parseJwtClaims,
 } from '@cortexkit/openai-auth-core/internal'
 
-// The account-pool migration ships switched off in the release that first
-// understands the migrated layout, so every install runs that release (a safe
-// version to go back to) before any credential moves. The next release turns
-// this on; the version fence then waits for every running process to be on
-// it before migrating.
-export const POOL_MIGRATION_ENABLED = false
+// Moves the main login from OpenCode's slot into the account pool. The version
+// fence holds the move until every running OpenCode process with this plugin
+// runs a version that understands the pool, so an older process never sees a
+// placeholder it would send. Going back to a version without pool support
+// after the move leaves main unusable there. Kept as a constant so tests and
+// the OpenCode 2 entry share one switch.
+export const POOL_MIGRATION_ENABLED = true
 
 interface CodexAuthPluginOptions {
   /**

@@ -144,6 +144,7 @@ describe('OpenCode 2 entry: the migration switch', () => {
     const before = readFileSync(authPath, 'utf8')
     let fenceAsked = false
     const { host, stop } = await start(files, {
+      poolMigration: false,
       fence: async () => {
         fenceAsked = true
         return { open: true }
@@ -167,6 +168,7 @@ describe('OpenCode 2 entry: the migration switch', () => {
     seedPool(files, 'main-first', [{ id: 'main' }])
     let fenceAsked = false
     const { host } = await start(files, {
+      poolMigration: false,
       fence: async () => {
         fenceAsked = true
         return { open: true }
