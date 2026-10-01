@@ -130,6 +130,8 @@ import {
   withoutPoolMainRow,
 } from './core/pool-main'
 import {
+  adoptHostSlotLogin,
+  migrateToPool,
   PoolTransferPendingError,
   poolTransferPendingInConfigFile,
 } from './core/pool-migration'
@@ -1328,6 +1330,25 @@ export async function CodexAuthPlugin(
           },
           version: PackageVersion,
           ...poolMigrationDeps,
+          // After a migration or an adoption run the pool may hold a row this
+          // process has never polled (or the install just turned migrated).
+          // Re-reading it now starts those first quota polls at once, so an
+          // account is not refused for unknown quota until a request happens
+          // to notice the change. Never awaited by the run.
+          migrate: async (deps) => {
+            const outcome = await (poolMigrationDeps.migrate ?? migrateToPool)(
+              deps,
+            )
+            void poolAccountSource?.load()
+            return outcome
+          },
+          adopt: async (deps) => {
+            const outcome = await (
+              poolMigrationDeps.adopt ?? adoptHostSlotLogin
+            )(deps)
+            void poolAccountSource?.load()
+            return outcome
+          },
         })
       : undefined
   // The runtime accepts this factory-owned bootstrap rather than opening a second connection.
@@ -4031,10 +4052,9 @@ export async function CodexAuthPlugin(
                 (candidate) => !excluded.has(candidate.accountId),
               )
               if (eligible.length === 0) return undefined
-              // Undefined when every candidate is killed by the killswitch.
-              // The caller translates the placed-pin absence into the shared
-              // `killswitchBlockedResponse`, the same shape the ordered modes
-              // produce.
+              // Undefined when the killswitch blocks every candidate. The
+              // caller then has no pin to send with and answers with the
+              // shared `killswitchBlockedResponse`, as the ordered modes do.
               return selectStickyCandidate({
                 candidates: eligible,
                 pendingBytes,

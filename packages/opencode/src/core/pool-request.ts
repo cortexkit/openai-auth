@@ -355,8 +355,9 @@ async function serveSticky(
     const before = stickyBreak(routing, sticky, id)
     if (before.action === 'migrate') migrate(before.reason)
   } else if (verdict === 'migrate') {
-    // With no replacement an exhausted pin is still sent (the provider has
-    // the final say, as for every last path); a killed one never is.
+    // When no other row can take the session, a pinned row that is only
+    // exhausted is still sent to (the reading may be stale and the provider
+    // has the final say); a row the killswitch blocks never is.
     if (!migrate('exhausted') && routing.killswitch.get(id) === false)
       return undefined
   } else {

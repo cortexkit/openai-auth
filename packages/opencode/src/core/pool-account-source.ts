@@ -69,10 +69,14 @@ import { observationFromSnapshot } from './pool-quota'
  */
 export const POOL_TOKEN_MIN_VALIDITY_MS = 60_000
 
-/** Shortest gap between two quota polls this process asks for one row. */
+/** Minimum interval between two quota-poll requests this process makes for the same row. */
 export const POOL_PULL_RETRY_MS = 15_000
 
-/** Retry delay after a refresh that failed for a local reason (a lock, a lease). */
+/**
+ * Retry delay after a refresh that failed without reaching the provider: a
+ * lock that did not come free in time, or an older process's lease on the
+ * same token.
+ */
 const LOCAL_REFRESH_RETRY_MS = 30_000
 
 /** Observations kept per row to re-apply over a re-read the store write has not reached yet. */
@@ -485,7 +489,7 @@ export class PoolAccountSource {
     this.marks.set(key, untilMs)
   }
 
-  /** Row id to mark expiry, for the rows given, as admission takes it. */
+  /** For each given row with a live rate-limit mark: row id to the mark's expiry time (ms). */
   rateLimitMarks(rows: readonly PoolRow[]): Map<string, number> {
     const out = new Map<string, number>()
     for (const row of rows) {

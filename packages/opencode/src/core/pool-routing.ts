@@ -19,8 +19,9 @@
 //   survives its first stage. Rows refused for UNKNOWN quota never take the
 //   last path: unknown quota blocks.
 // - The no-replay gate. A request that cannot be sent twice (anything but a
-//   buffered POST to `/responses`) goes to one account only, the main
-//   account as before, and is never retried on another.
+//   buffered POST to `/responses`) goes to one account only, row `main`
+//   (the main account, as on a legacy install), and is never retried on
+//   another: a second send could repeat work the provider already did.
 
 import { type ProjectedQuota, projectQuota } from '@cortexkit/common-auth/quota'
 import {
@@ -52,7 +53,11 @@ export interface PoolRoutingInput {
   now: number
   rateLimitMarks: ReadonlyMap<string, number>
   refreshBackoff: ReadonlyMap<string, number>
-  /** Killswitch verdict per row; only rows the killswitch fails are present as `false`. */
+  /**
+   * Killswitch verdict per row (the opt-in floor on remaining quota): `false`
+   * means the row is below its floor and must not be spent on; `true` or a
+   * missing row passes.
+   */
   killswitch: ReadonlyMap<string, boolean>
   /** Asks for a quota poll of a row admission refused for want of a reading. */
   requestPull: (id: string) => void
@@ -101,8 +106,10 @@ export function blockFor(
 /**
  * The block for a request no row can serve. A row waiting for its first
  * quota reading is named first: its poll is already under way, so the
- * shortest honest answer is to try again shortly. Otherwise the first row in
- * placement order speaks, as main's reason did before the pool.
+ * shortest honest answer is to try again shortly. Otherwise the reason is
+ * that of the first row in placement order, the account the request would
+ * have gone to (row `main` in main-first), as a legacy install reports
+ * main's reason.
  */
 function routeBlock(
   ids: readonly string[],

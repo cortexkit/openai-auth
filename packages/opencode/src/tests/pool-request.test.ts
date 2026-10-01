@@ -31,8 +31,10 @@ import {
   FLOOR_STATE_FILE,
 } from './setup-env.ts'
 
-// The bound hot-path-bookkeeping.test.ts holds requests to while locks are
-// held: far below any lock timeout, loose enough for a loaded machine.
+// How long a request may take while the store locks are held; the same bound
+// hot-path-bookkeeping.test.ts uses. Far below any lock timeout, so a request
+// that waits on a lock at all overruns it, and loose enough for a loaded
+// machine.
 const HOT_PATH_BOUND_MS = 1_000
 
 const PLACEHOLDER = {
@@ -1064,8 +1066,9 @@ describe('the migrated request path never waits on the store locks', () => {
         'the load-time quota polls',
       )
 
-      // The store's own locks, its provider-wide lock, every row lock, the
-      // legacy refresh locks a pool refresh also takes, and the sidebar lock.
+      // Hold every lock a pool write or refresh could take: the store's save
+      // locks, its provider-wide lock, every row lock, the legacy refresh
+      // locks a pool refresh also takes, and the sidebar lock.
       await holdLock(configFile, 'save')
       await holdLock(stateFile, 'save')
       await holdLock(stateFile, 'provider-openai')
