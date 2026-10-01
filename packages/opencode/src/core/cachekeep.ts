@@ -1,97 +1,57 @@
+/**
+ * OpenAI's half of prompt-cache keep-warm.
+ *
+ * The scheduling (targets, idle and size caps, the clock window, backoff,
+ * coalesced ticks) is the shared `CacheKeepManager` from
+ * `@cortexkit/common-auth/cachekeep`. What stays here is everything that knows
+ * about Codex: which request headers identify a session and must be replayed,
+ * how a captured Responses body becomes a warm request, the gpt-5.6 cache
+ * lifetime and subagent policy, how an account's bearer is resolved, and how
+ * usage is read back from a JSON or SSE response.
+ */
+import {
+  type CacheKeepAdapter,
+  type CacheKeepLogger,
+  CacheKeepManager,
+  type CacheKeepManagerOptions,
+  type CacheKeepProfile,
+  type CacheKeepWindow,
+  normalizeCacheKeepWindow,
+} from '@cortexkit/common-auth/cachekeep'
 import {
   type AccountStorage,
   normalizeQuotaHeaders,
 } from '@cortexkit/openai-auth-core/internal'
 import { sanitizeHttpFallbackInit } from '../codex-http'
+import {
+  hashSidebarSessionId,
+  STICKY_ASSIGNMENT_MAX_AGE_MS,
+  type SidebarState,
+} from '../sidebar-state'
+
+export {
+  CacheKeepManager,
+  type CacheKeepStatus,
+  type CacheKeepWindow,
+  isWithinCacheKeepWindow,
+} from '@cortexkit/common-auth/cachekeep'
 
 // ---------------------------------------------------------------------------
-// Types
+// Capture
 // ---------------------------------------------------------------------------
 
-export type CacheKeepWindow = {
-  startHour: number
-  endHour: number
-}
-
-export interface Target {
-  bodyText: string
-  accountId: string | undefined
-  chatgptAccountId?: string
-  route: 'main'
-  cacheExpiresAt: number
-  ttlMs: number
-  warmCount: number
-  lastRealRequestAt: number
-  lastWarmedAt?: number
-  backoffUntil?: number
+/** Plugin data stored with each target and handed back on every warm. */
+export interface OpenAICacheKeepMeta {
+  /** Cache-relevant request headers, replayed verbatim on the warm request. */
   replayHeaders: Record<string, string>
-  isSubagent?: boolean
-  // Captured from isGpt56Model(bodyText) at track() time. Cached on the target
-  // so pruneStale and the warm cap don't have to re-parse the body (and so a
-  // misconfig of TTL defaults can't silently flip 5.6-ness).
-  is56: boolean
-}
-
-export interface CacheKeepManagerOptions {
-  fetchImpl: typeof fetch
-  getMainToken: () => Promise<string>
-  refreshFallback: (accountId: string) => Promise<
-    | string
-    | {
-        token: string
-        onAuthFailure?: (status: number) => Promise<void>
-      }
-  >
-  codexResponsesUrl: string
-  logger: {
-    info: (msg: string, data?: unknown) => void
-    warn: (msg: string, data?: unknown) => void
-    debug: (msg: string, data?: unknown) => void
-    error: (msg: string, data?: unknown) => void
-  }
-  now: () => number
-  ttlMs?: number
-  leadMs?: number
-  maxDurationMs?: number
-  maxIdleWarmMs?: number
-  maxSubagentIdleMs?: number
-  tickIntervalMs?: number
-  maxTargets?: number
-  maxBytes?: number
-  /** Returns the configured clock-hour window; undefined means always warm. */
-  getWindow?: () => CacheKeepWindow | undefined
-  /** Returns whether main-agent targets bypass only the idle warm cap. */
-  getSustain?: () => boolean
-}
-
-type CacheKeepFallbackAccess =
-  | string
-  | {
-      token: string
-      onAuthFailure?: (status: number) => Promise<void>
-    }
-
-export interface CacheKeepStatus {
-  running: boolean
-  tracked: number
-  generatedAt: number
-  startedAt: number | null
-  maxIdleWarmMs: number
-  maxSubagentIdleMs: number
-  ttlMs: number
-  leadMs: number
-  sustain: boolean
-  window?: CacheKeepWindow
-  targets: Array<{
-    sessionKey: string
-    accountId: string | undefined
-    route: 'main'
-    cacheExpiresAt: number
-    lastRealRequestAt: number
-    lastWarmedAt?: number
-    backoffUntil?: number
-    bodyBytes: number
-  }>
+  /** The ChatGPT account id sent as `ChatGPT-Account-Id`; absent for none. */
+  chatgptAccountId?: string
+  /**
+   * The session id the router keyed this request's routing by. It can differ
+   * from the target's session key: the captured body is the prepared request,
+   * whose `session-id` header may already be the Codex thread id.
+   */
+  routingSessionId?: string
 }
 
 export interface KeepwarmCapture {
@@ -140,57 +100,29 @@ export function buildKeepwarmCapture(input: {
   return { sessionKey, bodyText: input.body, replayHeaders, isSubagent }
 }
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
+/** The persisted `cachekeep` clock window, or undefined for "always warm". */
 export function getCacheKeepWindow(
   storage: AccountStorage | null,
 ): CacheKeepWindow | undefined {
-  const startHour = Number(storage?.cachekeep?.startHour)
-  const endHour = Number(storage?.cachekeep?.endHour)
-  if (
-    !Number.isInteger(startHour) ||
-    !Number.isInteger(endHour) ||
-    startHour < 0 ||
-    startHour > 23 ||
-    endHour < 0 ||
-    endHour > 23 ||
-    startHour === endHour
-  ) {
-    return undefined
-  }
-  return { startHour, endHour }
+  return normalizeCacheKeepWindow(storage?.cachekeep)
 }
 
-export function isWithinCacheKeepWindow(
-  window: CacheKeepWindow | undefined,
-  now = new Date(),
-): boolean {
-  if (!window) return false
-  const hour = now.getHours()
-  if (window.startHour < window.endHour) {
-    return hour >= window.startHour && hour < window.endHour
-  }
-  // Overnight wrap (e.g. 22-6): hours are in window if at or after start, or before end.
-  return hour >= window.startHour || hour < window.endHour
-}
+// ---------------------------------------------------------------------------
+// Per-model profile
+// ---------------------------------------------------------------------------
 
-const DEFAULT_TTL_MS = 5 * 60 * 1000 // 5 min
 // gpt-5.6 prompts live on Codex's prompt cache for ~30 min, vs ~5 min for older
 // models, so per-target TTL is raised to 30 min to match — keeps the warm
 // cadence honest (warm just before the real 30-min eviction, not every 5 min).
 const GPT_5_6_TTL_MS = 30 * 60 * 1000 // 30 min
+// Subagent sessions are short-lived: two ~30-min warms give about an hour of
+// cache coverage without over-warming a one-off session.
+const GPT_5_6_SUBAGENT_MAX_WARMS = 2
 // Long idle bound for 5.6 subagents — gives the session room for both warms on
-// the happy path (~58 min) while still eventually reclaims a stuck target whose
-// warms never reach the 2-warm cap.
+// the happy path (~58 min) while still eventually reclaiming a stuck target
+// whose warms never reach the 2-warm cap. The default 30-min subagent bound
+// would reclaim it before its first warm.
 const GPT_5_6_SUBAGENT_MAX_IDLE_MS = 2 * GPT_5_6_TTL_MS + 15 * 60 * 1000
-const DEFAULT_MAX_IDLE_WARM_MS = 60 * 60 * 1000 // 1 h
-const DEFAULT_MAX_SUBAGENT_IDLE_MS = 30 * 60 * 1000 // 30 min
-const DEFAULT_TICK_INTERVAL_MS = 60 * 1000 // 60 s
-const DEFAULT_MAX_TARGETS = 32
-const DEFAULT_MAX_BYTES = 8 * 1024 * 1024 // 8 MiB total
-const BACKOFF_MS = 10 * 60 * 1000 // 10 min backoff after failure
 
 // Single source of truth for "is this body a gpt-5.6 request?". Exact-match
 // or `gpt-5.6-` prefix so a hypothetical sibling id (gpt-5.60, gpt-5.6x,
@@ -206,8 +138,31 @@ function isGpt56Model(bodyText: string): boolean {
   }
 }
 
+export function ttlForModel(bodyText: string, defaultTtlMs: number): number {
+  return isGpt56Model(bodyText) ? GPT_5_6_TTL_MS : defaultTtlMs
+}
+
+/**
+ * The per-target overrides for a captured request: gpt-5.6 gets its longer
+ * cache lifetime, and a gpt-5.6 subagent is retired after two warms with an
+ * idle bound long enough for both. Everything else keeps the manager's
+ * defaults.
+ */
+export function openaiCacheKeepProfile(input: {
+  bodyText: string
+  isSubagent: boolean
+}): CacheKeepProfile | undefined {
+  if (!isGpt56Model(input.bodyText)) return undefined
+  if (!input.isSubagent) return { ttlMs: GPT_5_6_TTL_MS }
+  return {
+    ttlMs: GPT_5_6_TTL_MS,
+    maxWarms: GPT_5_6_SUBAGENT_MAX_WARMS,
+    maxIdleMs: GPT_5_6_SUBAGENT_MAX_IDLE_MS,
+  }
+}
+
 // ---------------------------------------------------------------------------
-// buildKeepwarmBody
+// Replay body
 // ---------------------------------------------------------------------------
 
 export function buildKeepwarmBody(bodyText: string): string {
@@ -220,12 +175,8 @@ export function buildKeepwarmBody(bodyText: string): string {
   return JSON.stringify(clone)
 }
 
-export function ttlForModel(bodyText: string, defaultTtlMs: number): number {
-  return isGpt56Model(bodyText) ? GPT_5_6_TTL_MS : defaultTtlMs
-}
-
 // ---------------------------------------------------------------------------
-// extractKeepwarmUsage
+// Usage parsing
 // ---------------------------------------------------------------------------
 
 function emptyKeepwarmUsage(): {
@@ -316,340 +267,85 @@ function extractKeepwarmSseUsage(
 }
 
 // ---------------------------------------------------------------------------
-// CacheKeepManager
+// Session routing
 // ---------------------------------------------------------------------------
 
-export class CacheKeepManager {
-  private readonly targets = new Map<string, Target>()
-  private readonly fetchImpl: typeof fetch
-  private readonly getMainToken: () => Promise<string>
-  private readonly refreshFallback: (
-    accountId: string,
-  ) => Promise<CacheKeepFallbackAccess>
-  private readonly codexResponsesUrl: string
-  private readonly log: CacheKeepManagerOptions['logger']
-  private readonly now: () => number
-  private readonly ttlMs: number
-  private readonly leadMs: number
-  private readonly maxIdleWarmMs: number
-  private readonly maxSubagentIdleMs: number
-  private readonly tickIntervalMs: number
-  private readonly maxTargets: number
-  private readonly maxBytes: number
-  private readonly getWindow?: () => CacheKeepWindow | undefined
-  private readonly getSustain?: () => boolean
-
-  private timer: ReturnType<typeof setInterval> | null = null
-  private startedAt: number | null = null
-  private totalBytes = 0
-  private tickInFlight = false
-  private disposed = false
-  private abortController = new AbortController()
-
-  private logPayload(
-    fields: Record<string, unknown> = {},
-  ): Record<string, unknown> {
-    return { pid: process.pid, ...fields }
+/**
+ * The account a session is bound to now, read from sidebar state (with this
+ * process's unsaved sticky pins already applied by the caller), or undefined
+ * when the session has no binding.
+ *
+ * In sticky-balanced mode the binding is the session's pin: a session moved to
+ * another account (re-pinned, or its pin cleared and placed elsewhere) no
+ * longer uses the cache on the account that captured it. In the ordered modes
+ * the binding is the per-session route the request path records for the
+ * account that last served the session, and only while it was recorded under
+ * the current mode; a route from an earlier mode says nothing about where the
+ * next request goes.
+ */
+export function routedAccountForSession(
+  state: SidebarState,
+  sessionId: string | undefined,
+  now = Date.now(),
+): string | undefined {
+  if (!sessionId) return undefined
+  if (state.route === 'sticky-balanced') {
+    const assignment =
+      state.stickyAssignments?.[hashSidebarSessionId(sessionId)]
+    if (!assignment) return undefined
+    if (assignment.lastSeenAt < now - STICKY_ASSIGNMENT_MAX_AGE_MS)
+      return undefined
+    return assignment.accountId
   }
+  const entry = state.activeRouting?.[sessionId]
+  if (!entry || entry.route !== state.route) return undefined
+  return entry.activeId
+}
 
-  constructor(options: CacheKeepManagerOptions) {
-    this.fetchImpl = options.fetchImpl
-    this.getMainToken = options.getMainToken
-    this.refreshFallback = options.refreshFallback
-    this.codexResponsesUrl = options.codexResponsesUrl
-    this.log = options.logger
-    this.now = options.now
-    this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS
-    this.tickIntervalMs = options.tickIntervalMs ?? DEFAULT_TICK_INTERVAL_MS
-    this.leadMs = options.leadMs ?? this.tickIntervalMs + 15_000
-    const maxIdleWarmMs = options.maxIdleWarmMs ?? options.maxDurationMs
-    this.maxIdleWarmMs =
-      typeof maxIdleWarmMs === 'number' &&
-      Number.isFinite(maxIdleWarmMs) &&
-      maxIdleWarmMs > 0
-        ? maxIdleWarmMs
-        : DEFAULT_MAX_IDLE_WARM_MS
-    const maxSubagentIdleMs =
-      options.maxSubagentIdleMs ?? DEFAULT_MAX_SUBAGENT_IDLE_MS
-    this.maxSubagentIdleMs =
-      typeof maxSubagentIdleMs === 'number' &&
-      Number.isFinite(maxSubagentIdleMs) &&
-      maxSubagentIdleMs > 0
-        ? maxSubagentIdleMs
-        : DEFAULT_MAX_SUBAGENT_IDLE_MS
-    this.tickIntervalMs = options.tickIntervalMs ?? DEFAULT_TICK_INTERVAL_MS
-    this.maxTargets = options.maxTargets ?? DEFAULT_MAX_TARGETS
-    this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
-    this.getWindow = options.getWindow
-    this.getSustain = options.getSustain
-  }
+// ---------------------------------------------------------------------------
+// Adapter and manager
+// ---------------------------------------------------------------------------
 
-  // -- public API ------------------------------------------------------------
-
-  track(
-    sessionKey: string,
-    bodyText: string,
-    accountId: string | undefined,
-    chatgptAccountId?: string,
-    replayHeaders: Record<string, string> = {},
-    isSubagent = false,
-  ): void {
-    // Prune targets abandoned beyond the idle warm cap.
-    this.pruneStale()
-
-    const bodyBytes = bodyText.length
-    if (bodyBytes > this.maxBytes) {
-      this.log.debug(
-        'cachekeep track skipped (body exceeds maxBytes)',
-        this.logPayload({
-          sessionKey,
-          bodyBytes,
-          maxBytes: this.maxBytes,
-        }),
-      )
-      return
+type CacheKeepFallbackAccess =
+  | string
+  | {
+      token: string
+      onAuthFailure?: (status: number) => Promise<void>
     }
 
-    // Outside a configured clock window the manager doesn't capture or fire.
-    // Undefined window means "always warm" — the legacy behavior.
-    const window = this.getWindow?.()
-    if (window && !isWithinCacheKeepWindow(window, new Date(this.now()))) {
-      this.log.debug(
-        'cachekeep track skipped (outside window)',
-        this.logPayload({
-          sessionKey,
-          startHour: window.startHour,
-          endHour: window.endHour,
-        }),
-      )
-      return
-    }
+export interface OpenAICacheKeepAdapterOptions {
+  fetchImpl: typeof fetch
+  /** The main account's bearer; a throw (no token) backs the target off. */
+  getMainToken: () => Promise<string>
+  /**
+   * A fallback account's bearer by storage id. `onAuthFailure` reports a 401
+   * on a vault-served credential back to its custodian.
+   */
+  refreshFallback: (accountId: string) => Promise<CacheKeepFallbackAccess>
+  codexResponsesUrl: string
+  /**
+   * The account the target's session routes to now (see
+   * `routedAccountForSession`), or undefined when it has no binding.
+   */
+  activeAccount?: (
+    routingSessionId: string | undefined,
+  ) => string | undefined | Promise<string | undefined>
+  logger?: CacheKeepLogger
+}
 
-    // Replace existing entry for same session (delete+re-add so freshest body wins)
-    if (this.targets.has(sessionKey)) {
-      const old = this.targets.get(sessionKey)
-      if (old) this.totalBytes -= old.bodyText.length
-      this.targets.delete(sessionKey)
-    } else {
-      this.log.debug(
-        'cachekeep captured target',
-        this.logPayload({ sessionKey, accountId }),
-      )
-    }
+export function createOpenAICacheKeepAdapter(
+  options: OpenAICacheKeepAdapterOptions,
+): CacheKeepAdapter<OpenAICacheKeepMeta> {
+  const log = options.logger
+  const activeAccount = options.activeAccount
+  return {
+    buildBody: (target) => buildKeepwarmBody(target.bodyText),
 
-    // Enforce size cap before adding
-    while (
-      this.targets.size >= this.maxTargets ||
-      (this.totalBytes + bodyBytes > this.maxBytes && this.targets.size > 0)
-    ) {
-      let evictKey: string | undefined
-      let evictTouchedAt = Number.POSITIVE_INFINITY
-      for (const [key, target] of this.targets) {
-        const touchedAt = Math.max(
-          target.lastRealRequestAt,
-          target.lastWarmedAt ?? 0,
-        )
-        if (touchedAt < evictTouchedAt) {
-          evictKey = key
-          evictTouchedAt = touchedAt
-        }
-      }
-      if (evictKey === undefined) break
-      const old = this.targets.get(evictKey)
-      if (old) this.totalBytes -= old.bodyText.length
-      this.targets.delete(evictKey)
-    }
-
-    const ttlMs = ttlForModel(bodyText, this.ttlMs)
-    const target: Target = {
-      bodyText,
-      accountId: accountId || undefined,
-      chatgptAccountId,
-      route: 'main',
-      ttlMs,
-      cacheExpiresAt: this.now() + ttlMs,
-      warmCount: 0,
-      lastRealRequestAt: this.now(),
-      replayHeaders,
-      isSubagent,
-      is56: isGpt56Model(bodyText),
-    }
-    this.targets.set(sessionKey, target)
-    this.totalBytes += bodyBytes
-    this.start()
-  }
-
-  private isGpt56Subagent(target: Target): boolean {
-    return target.isSubagent === true && target.is56
-  }
-
-  private pruneStale(): void {
-    const now = this.now()
-    const mainStaleBound = now - this.maxIdleWarmMs
-    const subStaleBound = now - this.maxSubagentIdleMs
-    const gpt56SubStaleBound = now - GPT_5_6_SUBAGENT_MAX_IDLE_MS
-    for (const [key, target] of this.targets) {
-      // gpt-5.6 subagents are governed by the 2-warm cap on the happy path
-      // (~58 min), so the default 30-min subagent idle bound would reclaim
-      // them before the first warm. Use the longer 5.6-subagent bound so
-      // both warms can complete on a working session, while a stuck one
-      // (warms persistently failing → warmCount < 2 → cap never fires) is
-      // eventually reclaimed here.
-      let bound: number
-      let maxIdleMs: number
-      if (this.isGpt56Subagent(target)) {
-        bound = gpt56SubStaleBound
-        maxIdleMs = GPT_5_6_SUBAGENT_MAX_IDLE_MS
-      } else {
-        bound = target.isSubagent ? subStaleBound : mainStaleBound
-        maxIdleMs = target.isSubagent
-          ? this.maxSubagentIdleMs
-          : this.maxIdleWarmMs
-      }
-      if (
-        !(target.isSubagent !== true && this.getSustain?.() === true) &&
-        target.lastRealRequestAt < bound
-      ) {
-        this.log.debug(
-          'cachekeep pruned idle target',
-          this.logPayload({
-            sessionKey: key,
-            accountId: target.accountId ?? 'main',
-            lastRealRequestAt: target.lastRealRequestAt,
-            maxIdleWarmMs: maxIdleMs,
-          }),
-        )
-        this.totalBytes -= target.bodyText.length
-        this.targets.delete(key)
-      }
-    }
-  }
-
-  start(): void {
-    this.disposed = false
-    if (this.timer) return
-    this.startedAt = this.now()
-    this.log.debug(
-      'cachekeep started',
-      this.logPayload({
-        ttlMs: this.ttlMs,
-        leadMs: this.leadMs,
-        maxIdleWarmMs: this.maxIdleWarmMs,
-      }),
-    )
-
-    this.timer = setInterval(() => {
-      void this.tick().catch(() => {})
-    }, this.tickIntervalMs)
-    if ('unref' in this.timer) this.timer.unref()
-  }
-
-  stop(): void {
-    this.disposed = true
-    this.abortController.abort()
-    this.abortController = new AbortController()
-    if (this.timer) {
-      clearInterval(this.timer)
-      this.timer = null
-    }
-    this.startedAt = null
-    this.targets.clear()
-    this.totalBytes = 0
-    this.log.debug('cachekeep stopped', this.logPayload())
-  }
-
-  remove(sessionKey: string): void {
-    const old = this.targets.get(sessionKey)
-    if (old) {
-      this.totalBytes -= old.bodyText.length
-      this.targets.delete(sessionKey)
-      this.log.debug(
-        'cachekeep removed target',
-        this.logPayload({ sessionKey }),
-      )
-    }
-  }
-
-  status(): CacheKeepStatus {
-    const generatedAt = this.now()
-
-    const targets = Array.from(this.targets.entries()).map(
-      ([sessionKey, t]) => ({
-        sessionKey,
-        accountId: t.accountId,
-        route: t.route,
-        cacheExpiresAt: t.cacheExpiresAt,
-        lastRealRequestAt: t.lastRealRequestAt,
-        lastWarmedAt: t.lastWarmedAt,
-        backoffUntil: t.backoffUntil,
-        bodyBytes: t.bodyText.length,
-      }),
-    )
-
-    return {
-      running: this.timer != null,
-      tracked: this.targets.size,
-      generatedAt,
-      startedAt: this.startedAt,
-      maxIdleWarmMs: this.maxIdleWarmMs,
-      maxSubagentIdleMs: this.maxSubagentIdleMs,
-      ttlMs: this.ttlMs,
-      leadMs: this.leadMs,
-      sustain: this.getSustain?.() === true,
-      window: this.getWindow?.(),
-      targets,
-    }
-  }
-
-  // -- tick ------------------------------------------------------------------
-
-  async tick(): Promise<void> {
-    if (this.tickInFlight) return
-    this.tickInFlight = true
-    try {
-      this.pruneStale()
-      // Skip the fire loop when outside a configured clock window — captured
-      // targets stay in the map and will warm again when the window reopens.
-      const window = this.getWindow?.()
-      if (window && !isWithinCacheKeepWindow(window, new Date(this.now()))) {
-        return
-      }
-      const now = this.now()
-      const leadBound = now + this.leadMs
-
-      for (const [sessionKey, target] of this.targets) {
-        if (
-          target.backoffUntil &&
-          now >= target.backoffUntil &&
-          target.cacheExpiresAt <= leadBound
-        ) {
-          await this.prewarm(sessionKey, target)
-        }
-      }
-
-      for (const [sessionKey, target] of this.targets) {
-        // Skip if in backoff
-        if (target.backoffUntil && now < target.backoffUntil) continue
-
-        // Fire prewarm if within LEAD window
-        if (target.cacheExpiresAt <= leadBound) {
-          await this.prewarm(sessionKey, target)
-        }
-      }
-    } finally {
-      this.tickInFlight = false
-    }
-  }
-
-  // -- prewarm ---------------------------------------------------------------
-
-  private async prewarm(sessionKey: string, target: Target): Promise<void> {
-    // Resolve token
-    let accessToken: string
-    let onAuthFailure: ((status: number) => Promise<void>) | undefined
-    try {
+    async send({ target, body, signal }) {
+      let accessToken: string
+      let onAuthFailure: ((status: number) => Promise<void>) | undefined
       if (target.accountId && target.accountId !== 'main') {
-        const resolved = await this.refreshFallback(target.accountId)
+        const resolved = await options.refreshFallback(target.accountId)
         if (typeof resolved === 'string') {
           accessToken = resolved
         } else {
@@ -657,41 +353,25 @@ export class CacheKeepManager {
           onAuthFailure = resolved.onAuthFailure
         }
       } else {
-        accessToken = await this.getMainToken()
+        accessToken = await options.getMainToken()
       }
-    } catch (err) {
-      if (!this.disposed && this.targets.get(sessionKey) === target) {
-        target.backoffUntil = this.now() + BACKOFF_MS
+      // Stopped, or the warm timed out, while the token resolved: send nothing.
+      signal.throwIfAborted()
+
+      const headers: Record<string, string> = {
+        ...target.meta.replayHeaders,
+        authorization: `Bearer ${accessToken}`,
+        'content-type': 'application/json',
       }
-      this.log.debug(
-        'cachekeep skip (no token)',
-        this.logPayload({
-          sessionKey,
-          accountId: target.accountId ?? 'main',
-          error: err instanceof Error ? err.message : String(err),
-        }),
-      )
-      return
-    }
+      if (target.meta.chatgptAccountId) {
+        headers['ChatGPT-Account-Id'] = target.meta.chatgptAccountId
+      } else {
+        delete headers['ChatGPT-Account-Id']
+      }
 
-    if (this.disposed || this.targets.get(sessionKey) !== target) return
-
-    const headers: Record<string, string> = {
-      ...target.replayHeaders,
-      authorization: `Bearer ${accessToken}`,
-      'content-type': 'application/json',
-    }
-    if (target.chatgptAccountId) {
-      headers['ChatGPT-Account-Id'] = target.chatgptAccountId
-    } else {
-      delete headers['ChatGPT-Account-Id']
-    }
-
-    try {
-      const warmBody = buildKeepwarmBody(target.bodyText)
       let warmBodyShape: Record<string, unknown> | undefined
       try {
-        const parsed = JSON.parse(warmBody) as Record<string, unknown>
+        const parsed = JSON.parse(body) as Record<string, unknown>
         warmBodyShape = {
           warmBodyKeys: Object.keys(parsed),
           stream: parsed.stream,
@@ -704,113 +384,86 @@ export class CacheKeepManager {
       } catch {
         // Diagnostic logging must never block the warm.
       }
-      this.log.debug(
-        'cachekeep warm request',
-        this.logPayload({
-          ...warmBodyShape,
-          headerKeys: Object.keys(headers),
-          hasChatGptAccountId: 'ChatGPT-Account-Id' in headers,
+      log?.debug('cachekeep warm request', {
+        ...warmBodyShape,
+        headerKeys: Object.keys(headers),
+        hasChatGptAccountId: 'ChatGPT-Account-Id' in headers,
+      })
+
+      const response = await options.fetchImpl(
+        options.codexResponsesUrl,
+        sanitizeHttpFallbackInit({
+          method: 'POST',
+          headers,
+          body,
+          signal,
         }),
       )
-      const requestInit = sanitizeHttpFallbackInit({
-        method: 'POST',
-        headers,
-        body: warmBody,
-        signal: AbortSignal.any([
-          AbortSignal.timeout(30_000),
-          this.abortController.signal,
-        ]),
-      })
-      const response = await this.fetchImpl(this.codexResponsesUrl, requestInit)
+      if (response.status === 401) await onAuthFailure?.(response.status)
+      return response
+    },
 
-      // Read the response body for usage
-      let responseText = ''
-      try {
-        responseText = await response.text()
-      } catch {
-        // body already consumed or error
-      }
-
-      if (this.disposed || this.targets.get(sessionKey) !== target) return
-
-      if (!response.ok) {
-        target.backoffUntil = this.now() + BACKOFF_MS
-        if (response.status === 401) await onAuthFailure?.(response.status)
-        this.log.warn(
-          'cachekeep failed',
-          this.logPayload({
-            session: sessionKey,
-            accountId: target.accountId ?? 'main',
-            status: response.status,
-            error: `HTTP ${response.status}`,
-            responseBody: responseText.slice(0, 600),
-          }),
-        )
-        return
-      }
-
+    readUsage({ response, text }) {
       const contentType = response.headers.get('content-type') ?? ''
       const isSse =
         contentType.includes('text/event-stream') ||
-        /(^|\n)(data:|event:)/.test(responseText.slice(0, 200))
-      this.log.debug(
-        'cachekeep warm response',
-        this.logPayload({
-          status: response.status,
-          contentType,
-          bodyLen: responseText.length,
-          isSse,
-        }),
-      )
+        /(^|\n)(data:|event:)/.test(text.slice(0, 200))
+      log?.debug('cachekeep warm response', {
+        status: response.status,
+        contentType,
+        bodyLen: text.length,
+        isSse,
+      })
       const usage = isSse
-        ? extractKeepwarmSseUsage(responseText)
-        : extractKeepwarmUsage(responseText)
+        ? extractKeepwarmSseUsage(text)
+        : extractKeepwarmUsage(text)
       const quota = normalizeQuotaHeaders(response.headers)
-      const quotaPrimaryPct = quota.primary?.usedPercent ?? null
-      const quotaSecondaryPct = quota.secondary?.usedPercent ?? null
-
-      this.log.debug(
-        'cachekeep fired',
-        this.logPayload({
-          session: sessionKey,
-          accountId: target.accountId ?? 'main',
-          input_tokens: usage.input_tokens,
-          cached_tokens: usage.cached_tokens,
-          hit_rate: usage.hit_rate,
-          output_tokens: usage.output_tokens,
-          quota_primary_pct: quotaPrimaryPct,
-          quota_secondary_pct: quotaSecondaryPct,
-        }),
-      )
-
-      // Reset expiry on success — preserves the per-target TTL (e.g. 30 min for
-      // gpt-5.6 sessions whose prompt cache lives longer than the default 5 min).
-      target.cacheExpiresAt = this.now() + target.ttlMs
-      target.lastWarmedAt = this.now()
-      target.backoffUntil = undefined
-      target.warmCount += 1
-
-      // gpt-5.6 subagent cap: after 2 successful warms the target is done —
-      // subagent sessions are short-lived, and 2× ~30-min warms give ~1h of
-      // cache coverage without over-warming a one-off session.
-      if (this.isGpt56Subagent(target) && target.warmCount >= 2) {
-        if (this.targets.get(sessionKey) === target) {
-          this.totalBytes -= target.bodyText.length
-          this.targets.delete(sessionKey)
-        }
-        return
+      return {
+        ...usage,
+        quota_primary_pct: quota.primary?.usedPercent ?? null,
+        quota_secondary_pct: quota.secondary?.usedPercent ?? null,
       }
-    } catch (err) {
-      if (this.disposed || this.targets.get(sessionKey) !== target) return
-      target.backoffUntil = this.now() + BACKOFF_MS
-      this.log.warn(
-        'cachekeep failed',
-        this.logPayload({
-          session: sessionKey,
-          accountId: target.accountId ?? 'main',
-          error: err instanceof Error ? err.message : String(err),
-        }),
-      )
-    }
+    },
+
+    profile: openaiCacheKeepProfile,
+
+    ...(activeAccount
+      ? {
+          activeAccount: (_sessionKey, target) =>
+            activeAccount(target.meta.routingSessionId),
+        }
+      : {}),
   }
+}
+
+export type OpenAICacheKeepManager = CacheKeepManager<OpenAICacheKeepMeta>
+
+export type OpenAICacheKeepManagerOptions = OpenAICacheKeepAdapterOptions &
+  Omit<CacheKeepManagerOptions<OpenAICacheKeepMeta>, 'adapter' | 'logger'>
+
+/** A keep-warm manager with OpenAI's adapter and per-model profile. */
+export function createCacheKeepManager(
+  options: OpenAICacheKeepManagerOptions,
+): OpenAICacheKeepManager {
+  const {
+    fetchImpl,
+    getMainToken,
+    refreshFallback,
+    codexResponsesUrl,
+    activeAccount,
+    logger,
+    ...managerOptions
+  } = options
+  return new CacheKeepManager<OpenAICacheKeepMeta>({
+    ...managerOptions,
+    logger,
+    adapter: createOpenAICacheKeepAdapter({
+      fetchImpl,
+      getMainToken,
+      refreshFallback,
+      codexResponsesUrl,
+      activeAccount,
+      logger,
+    }),
+  })
 }

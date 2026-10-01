@@ -13,7 +13,7 @@ import {
   type VaultProvenance,
 } from '@cortexkit/openai-auth-core/internal'
 import { getAccountPaths } from '../core/account-paths.ts'
-import type { CacheKeepManager } from '../core/cachekeep.ts'
+import type { OpenAICacheKeepManager as CacheKeepManager } from '../core/cachekeep.ts'
 import { CUSTODY_INERT_REASONS } from '../core/custody-state.ts'
 import {
   __resetBootQuotaSeedForTest,
@@ -915,11 +915,12 @@ describe('custody request resolution', () => {
           respond: () => 200,
         },
         async ({ cacheKeepManager }) => {
-          cacheKeepManager.track(
-            'cachekeep-local',
-            JSON.stringify({ model: 'gpt-5.5', input: [] }),
-            fallback.id,
-          )
+          cacheKeepManager.track({
+            sessionKey: 'cachekeep-local',
+            bodyText: JSON.stringify({ model: 'gpt-5.5', input: [] }),
+            accountId: fallback.id,
+            meta: { replayHeaders: {} },
+          })
           const target = (
             cacheKeepManager as never as {
               targets: Map<string, { cacheExpiresAt: number }>
@@ -949,11 +950,12 @@ describe('custody request resolution', () => {
         respond: () => 200,
       },
       async ({ cacheKeepManager, authorizations }) => {
-        cacheKeepManager.track(
-          'cachekeep-vault',
-          JSON.stringify({ model: 'gpt-5.5', input: [] }),
-          fallback.id,
-        )
+        cacheKeepManager.track({
+          sessionKey: 'cachekeep-vault',
+          bodyText: JSON.stringify({ model: 'gpt-5.5', input: [] }),
+          accountId: fallback.id,
+          meta: { replayHeaders: {} },
+        })
         const target = (
           cacheKeepManager as never as {
             targets: Map<string, { cacheExpiresAt: number }>
@@ -981,11 +983,12 @@ describe('custody request resolution', () => {
           url.endsWith('/responses') ? 401 : 200,
       },
       async ({ cacheKeepManager, reports }) => {
-        cacheKeepManager.track(
-          'cachekeep-vault-401',
-          JSON.stringify({ model: 'gpt-5.5', input: [] }),
-          fallback.id,
-        )
+        cacheKeepManager.track({
+          sessionKey: 'cachekeep-vault-401',
+          bodyText: JSON.stringify({ model: 'gpt-5.5', input: [] }),
+          accountId: fallback.id,
+          meta: { replayHeaders: {} },
+        })
         const target = (
           cacheKeepManager as never as {
             targets: Map<string, { cacheExpiresAt: number }>
@@ -1014,11 +1017,12 @@ describe('custody request resolution', () => {
           url.endsWith('/responses') ? 401 : 200,
       },
       async ({ cacheKeepManager, reports }) => {
-        cacheKeepManager.track(
-          'cachekeep-local-401',
-          JSON.stringify({ model: 'gpt-5.5', input: [] }),
-          fallback.id,
-        )
+        cacheKeepManager.track({
+          sessionKey: 'cachekeep-local-401',
+          bodyText: JSON.stringify({ model: 'gpt-5.5', input: [] }),
+          accountId: fallback.id,
+          meta: { replayHeaders: {} },
+        })
         const target = (
           cacheKeepManager as never as {
             targets: Map<string, { cacheExpiresAt: number }>

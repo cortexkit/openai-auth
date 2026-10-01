@@ -4337,6 +4337,75 @@ describe('integration: active fallback routing', () => {
     }
   })
 
+  it('cachekeep drops a session the sticky router moved to another account instead of warming the old one', async () => {
+    const originalNow = Date.now
+    const originalFetch = globalThis.fetch
+    let now = originalNow()
+    // The manager reads the clock it was built with, so the override has to be
+    // in place before the loader runs.
+    Date.now = () => now
+    seedStickyBalancedAccounts()
+    const sends: string[] = []
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      if (!isResponsesSend(url)) return new Response('{}', { status: 500 })
+      sends.push(new Headers(init?.headers).get('authorization') ?? '')
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+
+    let hooks: Hooks | undefined
+    try {
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        now + 3600_000,
+        false,
+        false,
+        'acc-main',
+      )
+      hooks = loaded.hooks
+      await drainSidebarWrites()
+      seedStickyBalancedAccounts()
+      await runCommand(hooks, 'openai-cachekeep', 'on')
+      await loaded.fetchOverride(
+        'https://api.openai.com/v1/responses',
+        responseRequestInit({ 'x-session-affinity': 'moved-session' }),
+      )
+      await drainSidebarWrites()
+      expect(sends).toEqual(['Bearer fallback-2-token'])
+      const manager = (
+        globalThis as typeof globalThis & {
+          __openaiAuthCacheKeepManagers?: Map<
+            string,
+            { tick(): Promise<void>; status(): { tracked: number } }
+          >
+        }
+      ).__openaiAuthCacheKeepManagers?.get(getConfigPath())
+      if (!manager) throw new Error('missing cachekeep manager')
+
+      // Still pinned where it was served: the warm replays on that account.
+      now += 5 * 60_000
+      await manager.tick()
+      expect(sends).toEqual([
+        'Bearer fallback-2-token',
+        'Bearer fallback-2-token',
+      ])
+
+      // Another process re-pins the session; its cache on fallback-2 is no
+      // longer the one the session will use.
+      const state = JSON.parse(readFileSync(sidebarFile, 'utf8'))
+      state.stickyAssignments[hashSidebarSessionId('moved-session')].accountId =
+        'fallback-1'
+      writeFileSync(sidebarFile, JSON.stringify(state))
+      now += 5 * 60_000
+      await manager.tick()
+      expect(sends).toHaveLength(2)
+      expect(manager.status().tracked).toBe(0)
+    } finally {
+      Date.now = originalNow
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
   it('sticky-balanced does not pin sessionless or non-replayable requests', async () => {
     seedStickyBalancedAccounts()
     const originalFetch = globalThis.fetch

@@ -7,13 +7,20 @@ import { getConfigPath } from '../config'
 import {
   buildKeepwarmBody,
   buildKeepwarmCapture,
-  CacheKeepManager,
+  createCacheKeepManager,
   getCacheKeepWindow,
-  isWithinCacheKeepWindow,
+  openaiCacheKeepProfile,
+  routedAccountForSession,
   ttlForModel,
 } from '../core/cachekeep'
 import { CodexAuthPlugin } from '../index'
-import { drainSidebarWrites, getSidebarState } from '../sidebar-state'
+import {
+  DEFAULT_SIDEBAR_STATE,
+  drainSidebarWrites,
+  getSidebarState,
+  hashSidebarSessionId,
+  type SidebarState,
+} from '../sidebar-state'
 import { rpcServerRegistry } from './fixtures/rpc-registry'
 
 function fakeLogger() {
@@ -215,7 +222,7 @@ describe('CacheKeepManager.track', () => {
   })
 
   test('stores a target with correct fields', () => {
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -226,33 +233,22 @@ describe('CacheKeepManager.track', () => {
       leadMs: LEAD_MS,
     })
     const body = JSON.stringify({ input: 'test' })
-    mgr.track('sess-1', body, 'main')
+    mgr.track({
+      sessionKey: 'sess-1',
+      bodyText: body,
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
 
     const status = mgr.status()
     expect(status.tracked).toBe(1)
     expect(status.targets[0]!.sessionKey).toBe('sess-1')
     expect(status.targets[0]!.accountId).toBe('main')
-    expect(status.targets[0]!.route).toBe('main')
-  })
-
-  test('sets cacheExpiresAt to now + TTL_MS', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-    })
-    mgr.track('sess-1', JSON.stringify({ input: 'test' }), 'main')
-    const status = mgr.status()
-    expect(status.targets[0]!.cacheExpiresAt).toBe(clock.now() + TTL_MS)
   })
 
   test('gpt-5.6 body uses 30-min cacheExpiresAt; non-5.6 body keeps 5-min', () => {
     const longTtl = 30 * 60 * 1000
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -261,16 +257,18 @@ describe('CacheKeepManager.track', () => {
       now: clock.now,
       ttlMs: TTL_MS,
     })
-    mgr.track(
-      'sess-56',
-      JSON.stringify({ input: 'sol', model: 'gpt-5.6-sol' }),
-      'main',
-    )
-    mgr.track(
-      'sess-55',
-      JSON.stringify({ input: 'old', model: 'gpt-5.5' }),
-      'main',
-    )
+    mgr.track({
+      sessionKey: 'sess-56',
+      bodyText: JSON.stringify({ input: 'sol', model: 'gpt-5.6-sol' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
+    mgr.track({
+      sessionKey: 'sess-55',
+      bodyText: JSON.stringify({ input: 'old', model: 'gpt-5.5' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
     const status = mgr.status()
     const solTarget = status.targets.find((t) => t.sessionKey === 'sess-56')!
     const oldTarget = status.targets.find((t) => t.sessionKey === 'sess-55')!
@@ -278,12 +276,10 @@ describe('CacheKeepManager.track', () => {
     expect(oldTarget.cacheExpiresAt).toBe(clock.now() + TTL_MS)
   })
 
-  test('is56 flag is captured at track(): true for 5.6 body, false for 5.5/5.4/5.60', () => {
-    // The Target exposes is56 for pruneStale's 5.6-subagent bound and the
-    // 2-warm cap. With ttlMs inference this flag would silently misclassify
-    // if the default TTL ever matched GPT_5_6_TTL_MS — the explicit field is
-    // the only contract both code paths trust.
-    const mgr = new CacheKeepManager({
+  test('gpt-5.6 profile is captured at track(): 30-min TTL for 5.6 bodies, default for 5.5/5.4/5.60', () => {
+    // The profile is evaluated once at capture and kept on the target, so the
+    // TTL each target reports is what its warms will use.
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -292,483 +288,58 @@ describe('CacheKeepManager.track', () => {
       now: clock.now,
       ttlMs: TTL_MS,
     })
-    mgr.track(
-      'sol',
-      JSON.stringify({ input: 'sol', model: 'gpt-5.6-sol' }),
-      'main',
-    )
-    mgr.track(
-      'luna',
-      JSON.stringify({ input: 'l', model: 'gpt-5.6-luna' }),
-      'main',
-    )
-    mgr.track('bare', JSON.stringify({ input: 'b', model: 'gpt-5.6' }), 'main')
-    mgr.track('v55', JSON.stringify({ input: '55', model: 'gpt-5.5' }), 'main')
-    mgr.track(
-      'v54',
-      JSON.stringify({ input: '54', model: 'gpt-5.4-mini' }),
-      'main',
-    )
-    mgr.track(
-      'v560',
-      JSON.stringify({ input: '560', model: 'gpt-5.60' }),
-      'main',
-    )
-    mgr.track('malformed', '{not-json', 'main')
-
-    const targets = (
-      mgr as unknown as { targets: Map<string, { is56: boolean }> }
-    ).targets
-    expect(targets.get('sol')!.is56).toBe(true)
-    expect(targets.get('luna')!.is56).toBe(true)
-    expect(targets.get('bare')!.is56).toBe(true)
-    expect(targets.get('v55')!.is56).toBe(false)
-    expect(targets.get('v54')!.is56).toBe(false)
-    expect(targets.get('v560')!.is56).toBe(false)
-    expect(targets.get('malformed')!.is56).toBe(false)
-  })
-
-  test('replace-on-retrack: freshest body wins', async () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
+    mgr.track({
+      sessionKey: 'sol',
+      bodyText: JSON.stringify({ input: 'sol', model: 'gpt-5.6-sol' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
     })
-    const body1 = JSON.stringify({ input: 'first' })
-    const body2 = JSON.stringify({ input: 'second' })
-
-    mgr.track('sess-1', body1, 'main')
-    clock.advance(10_000)
-    mgr.track('sess-1', body2, 'main')
-    clock.advance(TTL_MS - LEAD_MS + 1000)
-    await mgr.tick()
-
-    const status = mgr.status()
-    expect(status.tracked).toBe(1)
-    const fetchCall = (fetchImpl as unknown as ReturnType<typeof mock>).mock
-      .calls[0] as unknown[]
-    const init = fetchCall[1] as RequestInit
-    expect(JSON.parse(init.body as string).input).toBe('second')
-  })
-
-  test('replace-on-retrack resets cacheExpiresAt', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
+    mgr.track({
+      sessionKey: 'luna',
+      bodyText: JSON.stringify({ input: 'l', model: 'gpt-5.6-luna' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
     })
-    mgr.track('sess-1', JSON.stringify({ input: 'first' }), 'main')
-    clock.advance(60_000)
-    mgr.track('sess-1', JSON.stringify({ input: 'second' }), 'main')
-
-    const status = mgr.status()
-    expect(status.targets[0]!.cacheExpiresAt).toBe(clock.now() + TTL_MS)
-  })
-
-  test('prunes targets past maxIdleWarmMs from last real request', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      maxIdleWarmMs: 60_000,
+    mgr.track({
+      sessionKey: 'bare',
+      bodyText: JSON.stringify({ input: 'b', model: 'gpt-5.6' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
     })
-    mgr.track('sess-1', JSON.stringify({ input: 'old' }), 'main')
-    clock.advance(60_001)
-    mgr.track('sess-2', JSON.stringify({ input: 'new' }), 'main')
-
-    const status = mgr.status()
-    expect(status.tracked).toBe(1)
-    expect(status.targets[0]!.sessionKey).toBe('sess-2')
-  })
-
-  test('sustain toggles main idle pruning at runtime without recreating the manager', () => {
-    let sustain = false
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      maxIdleWarmMs: 60_000,
-      getSustain: () => sustain,
+    mgr.track({
+      sessionKey: 'v55',
+      bodyText: JSON.stringify({ input: '55', model: 'gpt-5.5' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
+    mgr.track({
+      sessionKey: 'v54',
+      bodyText: JSON.stringify({ input: '54', model: 'gpt-5.4-mini' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
+    mgr.track({
+      sessionKey: 'v560',
+      bodyText: JSON.stringify({ input: '560', model: 'gpt-5.60' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
+    mgr.track({
+      sessionKey: 'malformed',
+      bodyText: '{not-json',
+      accountId: 'main',
+      meta: { replayHeaders: {} },
     })
 
-    mgr.track('pruned-while-off', JSON.stringify({ input: 'old' }), 'main')
-    clock.advance(60_001)
-    mgr.track('trigger-off', JSON.stringify({ input: 'new' }), 'main')
-    expect(mgr.status().targets.map((target) => target.sessionKey)).toEqual([
-      'trigger-off',
-    ])
-
-    sustain = true
-    mgr.track('kept-while-on', JSON.stringify({ input: 'kept' }), 'main')
-    clock.advance(60_001)
-    mgr.track('trigger-on', JSON.stringify({ input: 'newer' }), 'main')
-    expect(mgr.status().targets.map((target) => target.sessionKey)).toEqual([
-      'trigger-off',
-      'kept-while-on',
-      'trigger-on',
-    ])
-    expect(mgr.status().sustain).toBe(true)
-
-    sustain = false
-    clock.advance(60_001)
-    mgr.track('trigger-off-again', JSON.stringify({ input: 'latest' }), 'main')
-    expect(mgr.status().targets.map((target) => target.sessionKey)).toEqual([
-      'trigger-off-again',
-    ])
-    expect(mgr.status().sustain).toBe(false)
-  })
-
-  test('sustain bypasses idle pruning but leaves maxTargets and maxBytes eviction active', async () => {
-    const body = JSON.stringify({ input: 'x'.repeat(100) })
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      maxIdleWarmMs: 1,
-      maxTargets: 8,
-      maxBytes: body.length * 2 - 1,
-      getSustain: () => true,
-    })
-
-    mgr.track('sustained-old', body, 'main')
-    clock.advance(2)
-    await mgr.tick()
-    expect(mgr.status().targets.map((target) => target.sessionKey)).toEqual([
-      'sustained-old',
-    ])
-
-    mgr.track('newer', body, 'main')
-    expect(mgr.status().targets.map((target) => target.sessionKey)).toEqual([
-      'newer',
-    ])
-
-    const capped = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      maxIdleWarmMs: 1,
-      maxTargets: 1,
-      getSustain: () => true,
-    })
-
-    capped.track('sustained-old', JSON.stringify({ input: 'old' }), 'main')
-    clock.advance(2)
-    await capped.tick()
-    expect(capped.status().targets.map((target) => target.sessionKey)).toEqual([
-      'sustained-old',
-    ])
-
-    capped.track('newer', JSON.stringify({ input: 'new' }), 'main')
-    expect(capped.status().targets.map((target) => target.sessionKey)).toEqual([
-      'newer',
-    ])
-  })
-
-  test('sustain leaves the configured clock window in control of capture and warming', async () => {
-    let window: { startHour: number; endHour: number } | undefined
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-      getSustain: () => true,
-      getWindow: () => window,
-    })
-    const outsideHour = new Date(clock.now()).getHours()
-    window = undefined
-    mgr.track(
-      'captured-before-window',
-      JSON.stringify({ input: 'old' }),
-      'main',
-    )
-    window = {
-      startHour: (outsideHour + 1) % 24,
-      endHour: (outsideHour + 2) % 24,
-    }
-
-    mgr.track('blocked-by-window', JSON.stringify({ input: 'new' }), 'main')
-    expect(mgr.status().targets.map((target) => target.sessionKey)).toEqual([
-      'captured-before-window',
-    ])
-
-    clock.advance(TTL_MS - LEAD_MS + 1)
-    await mgr.tick()
-    expect(fetchImpl).not.toHaveBeenCalled()
-  })
-
-  test('caps Map size at default maxTargets (32)', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      maxTargets: 3,
-    })
-    for (let i = 0; i < 5; i++) {
-      clock.advance(1) // different insertion order
-      mgr.track(`sess-${i}`, JSON.stringify({ input: `msg-${i}` }), 'main')
-    }
-    const status = mgr.status()
-    expect(status.tracked).toBeLessThanOrEqual(3)
-  })
-
-  test('caps total bytes at default maxBytes', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      maxBytes: 200,
-    })
-    const bigBody = JSON.stringify({ input: 'x'.repeat(300) })
-    mgr.track('sess-1', bigBody, 'main')
-    // Should evict due to size
-    const status = mgr.status()
-    expect(status.tracked).toBe(0)
-  })
-
-  test('rejects an oversized body without evicting existing targets', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      maxBytes: 200,
-    })
-    mgr.track('sess-1', JSON.stringify({ input: 'small' }), 'main')
-    mgr.track(
-      'sess-oversize',
-      JSON.stringify({ input: 'x'.repeat(300) }),
-      'main',
-    )
-
-    const status = mgr.status()
-    expect(status.tracked).toBe(1)
-    expect(status.targets[0]!.sessionKey).toBe('sess-1')
-  })
-
-  test('sustain leaves least-recently-used eviction active', async () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-      maxIdleWarmMs: 1,
-      maxTargets: 2,
-      getSustain: () => true,
-    })
-    mgr.track(
-      'main',
-      JSON.stringify({ input: 'main', model: 'gpt-5.5' }),
-      'main',
-    )
-    clock.advance(1000)
-    mgr.track(
-      'ephemeral',
-      JSON.stringify({ input: 'ephemeral', model: 'gpt-5.5' }),
-      'main',
-    )
-    clock.advance(TTL_MS - LEAD_MS - 1000)
-
-    await mgr.tick()
-    mgr.track(
-      'new-ephemeral',
-      JSON.stringify({ input: 'new', model: 'gpt-5.5' }),
-      'main',
-    )
-
-    const sessions = mgr.status().targets.map((target) => target.sessionKey)
-    expect(sessions).toContain('main')
-    expect(sessions).toContain('new-ephemeral')
-    expect(sessions).not.toContain('ephemeral')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// CacheKeepManager — subagent pruneStale
-// ---------------------------------------------------------------------------
-describe('CacheKeepManager subagent pruneStale', () => {
-  let log: ReturnType<typeof fakeLogger>
-  let getMainToken: ReturnType<typeof mock>
-  let refreshFallback: ReturnType<typeof mock>
-  let fetchImpl: typeof fetch
-  let clock: ReturnType<typeof fakeNow>
-
-  beforeEach(() => {
-    log = fakeLogger()
-    getMainToken = mock(async () => 'main-token')
-    refreshFallback = mock(async () => 'fallback-token')
-    fetchImpl = mock(async () => new Response('{}')) as unknown as typeof fetch
-    clock = fakeNow()
-  })
-
-  test('subagent target pruned at 31min (past 30min cap)', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      maxIdleWarmMs: 60 * 60 * 1000, // 1h main
-      maxSubagentIdleMs: 30 * 60 * 1000, // 30min subagent
-      getSustain: () => true,
-    })
-    mgr.track(
-      'sub-sess',
-      JSON.stringify({ input: 'subagent-turn' }),
-      'main',
-      undefined,
-      {},
-      true, // isSubagent
-    )
-    clock.advance(31 * 60 * 1000) // 31 min
-    mgr.track('main-sess', JSON.stringify({ input: 'main-turn' }), 'main')
-    const status = mgr.status()
-    expect(status.tracked).toBe(1)
-    expect(status.targets[0]!.sessionKey).toBe('main-sess')
-  })
-
-  test('subagent target survives at 29min (within 30min cap)', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      maxIdleWarmMs: 60 * 60 * 1000,
-      maxSubagentIdleMs: 30 * 60 * 1000,
-    })
-    mgr.track(
-      'sub-sess',
-      JSON.stringify({ input: 'subagent-turn' }),
-      'main',
-      undefined,
-      {},
-      true,
-    )
-    clock.advance(29 * 60 * 1000) // 29 min — still alive
-    mgr.track('main-sess', JSON.stringify({ input: 'main-turn' }), 'main')
-    const status = mgr.status()
-    expect(status.tracked).toBe(2)
-  })
-
-  test('main target survives at 31min (within 1h cap)', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      maxIdleWarmMs: 60 * 60 * 1000,
-      maxSubagentIdleMs: 30 * 60 * 1000,
-    })
-    mgr.track('main-sess', JSON.stringify({ input: 'main-turn' }), 'main')
-    clock.advance(31 * 60 * 1000) // 31 min — still within 1h
-    mgr.track('other-sess', JSON.stringify({ input: 'other' }), 'main')
-    const status = mgr.status()
-    expect(status.tracked).toBe(2)
-    expect(status.targets.map((t) => t.sessionKey)).toContain('main-sess')
-  })
-
-  test('main target pruned past 1h', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      maxIdleWarmMs: 60 * 60 * 1000,
-      maxSubagentIdleMs: 30 * 60 * 1000,
-    })
-    mgr.track('main-sess', JSON.stringify({ input: 'main-turn' }), 'main')
-    clock.advance(61 * 60 * 1000) // 61 min — past 1h cap
-    mgr.track('other-sess', JSON.stringify({ input: 'other' }), 'main')
-    const status = mgr.status()
-    expect(status.tracked).toBe(1)
-    expect(status.targets[0]!.sessionKey).toBe('other-sess')
-  })
-
-  test('re-captures a subagent target after it was pruned', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      maxSubagentIdleMs: 30 * 60 * 1000,
-    })
-    mgr.track(
-      'sub-sess',
-      JSON.stringify({ input: 'old' }),
-      'main',
-      undefined,
-      {},
-      true,
-    )
-    clock.advance(31 * 60 * 1000) // past 30min cap
-    mgr.track('other', JSON.stringify({ input: 'other' }), 'main')
-    expect(mgr.status().tracked).toBe(1)
-
-    // Re-capture same subagent session
-    mgr.track(
-      'sub-sess',
-      JSON.stringify({ input: 'new' }),
-      'main',
-      undefined,
-      {},
-      true,
-    )
-    expect(mgr.status().tracked).toBe(2)
-    expect(
-      mgr.status().targets.find((t) => t.sessionKey === 'sub-sess')!
-        .lastRealRequestAt,
-    ).toBe(clock.now())
+    const ttl = (key: string) =>
+      mgr.status().targets.find((t) => t.sessionKey === key)!.ttlMs
+    expect(ttl('sol')).toBe(30 * 60 * 1000)
+    expect(ttl('luna')).toBe(30 * 60 * 1000)
+    expect(ttl('bare')).toBe(30 * 60 * 1000)
+    expect(ttl('v55')).toBe(TTL_MS)
+    expect(ttl('v54')).toBe(TTL_MS)
+    expect(ttl('v560')).toBe(TTL_MS)
+    expect(ttl('malformed')).toBe(TTL_MS)
   })
 })
 
@@ -923,7 +494,7 @@ describe('CacheKeepManager tick/prewarm', () => {
   })
 
   test('fallback warm resolves token by storage id but sends real ChatGPT account id header', async () => {
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -933,13 +504,15 @@ describe('CacheKeepManager tick/prewarm', () => {
       ttlMs: TTL_MS,
       leadMs: LEAD_MS,
     })
-    mgr.track(
-      'sess-fallback',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'work-alt',
-      '8c97f046-7e21-409b-9829-0488897e475b',
-      { 'ChatGPT-Account-Id': 'stale-storage-id' },
-    )
+    mgr.track({
+      sessionKey: 'sess-fallback',
+      bodyText: JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
+      accountId: 'work-alt',
+      meta: {
+        replayHeaders: { 'ChatGPT-Account-Id': 'stale-storage-id' },
+        chatgptAccountId: '8c97f046-7e21-409b-9829-0488897e475b',
+      },
+    })
 
     clock.advance(TTL_MS - LEAD_MS + 1000)
     await mgr.tick()
@@ -954,7 +527,7 @@ describe('CacheKeepManager tick/prewarm', () => {
   })
 
   test('subagent warm sends the real ChatGPT account id header', async () => {
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -964,14 +537,16 @@ describe('CacheKeepManager tick/prewarm', () => {
       ttlMs: TTL_MS,
       leadMs: LEAD_MS,
     })
-    mgr.track(
-      'sub-sess',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'work-alt',
-      'real-chatgpt-account-id',
-      { 'ChatGPT-Account-Id': 'stale-storage-id' },
-      true,
-    )
+    mgr.track({
+      sessionKey: 'sub-sess',
+      bodyText: JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
+      accountId: 'work-alt',
+      isSubagent: true,
+      meta: {
+        replayHeaders: { 'ChatGPT-Account-Id': 'stale-storage-id' },
+        chatgptAccountId: 'real-chatgpt-account-id',
+      },
+    })
 
     clock.advance(TTL_MS - LEAD_MS + 1000)
     await mgr.tick()
@@ -986,7 +561,7 @@ describe('CacheKeepManager tick/prewarm', () => {
   })
 
   test('main warm uses real ChatGPT account id when present and omits stale replay header when absent', async () => {
-    const withAccount = new CacheKeepManager({
+    const withAccount = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -996,12 +571,12 @@ describe('CacheKeepManager tick/prewarm', () => {
       ttlMs: TTL_MS,
       leadMs: LEAD_MS,
     })
-    withAccount.track(
-      'sess-main-account',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-      'main-chatgpt-id',
-    )
+    withAccount.track({
+      sessionKey: 'sess-main-account',
+      bodyText: JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
+      accountId: 'main',
+      meta: { replayHeaders: {}, chatgptAccountId: 'main-chatgpt-id' },
+    })
     clock.advance(TTL_MS - LEAD_MS + 1000)
     await withAccount.tick()
     let fetchCall = (fetchImpl as unknown as ReturnType<typeof mock>).mock
@@ -1014,7 +589,7 @@ describe('CacheKeepManager tick/prewarm', () => {
     fetchImpl = mock(
       async () => new Response(JSON.stringify({ usage: {} })),
     ) as unknown as typeof fetch
-    const withoutAccount = new CacheKeepManager({
+    const withoutAccount = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -1024,13 +599,15 @@ describe('CacheKeepManager tick/prewarm', () => {
       ttlMs: TTL_MS,
       leadMs: LEAD_MS,
     })
-    withoutAccount.track(
-      'sess-main-no-account',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-      undefined,
-      { 'ChatGPT-Account-Id': 'stale-main' },
-    )
+    withoutAccount.track({
+      sessionKey: 'sess-main-no-account',
+      bodyText: JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
+      accountId: 'main',
+      meta: {
+        replayHeaders: { 'ChatGPT-Account-Id': 'stale-main' },
+        chatgptAccountId: undefined,
+      },
+    })
     clock.advance(TTL_MS - LEAD_MS + 1000)
     await withoutAccount.tick()
     fetchCall = (fetchImpl as unknown as ReturnType<typeof mock>).mock
@@ -1039,506 +616,9 @@ describe('CacheKeepManager tick/prewarm', () => {
     expect(new Headers(init.headers).get('ChatGPT-Account-Id')).toBeNull()
   })
 
-  test('idle cap prunes targets even when active backoff would otherwise skip pruning', async () => {
-    fetchImpl = mock(
-      async () => new Response('{}', { status: 500 }),
-    ) as unknown as typeof fetch
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: 100,
-      leadMs: 90,
-      maxIdleWarmMs: 1000,
-    })
-    mgr.track(
-      'sess-backoff',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-    clock.advance(20)
-    await mgr.tick()
-    expect(mgr.status().targets[0]!.backoffUntil).toBeDefined()
-
-    clock.advance(1001)
-    await mgr.tick()
-
-    expect(mgr.status().tracked).toBe(0)
-  })
-
-  test('idle cap prunes expired-backoff targets before retrying warm', async () => {
-    let calls = 0
-    fetchImpl = mock(async () => {
-      calls++
-      return new Response('{}', { status: calls === 1 ? 500 : 200 })
-    }) as unknown as typeof fetch
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: 100,
-      leadMs: 90,
-      maxIdleWarmMs: 1000,
-    })
-    mgr.track(
-      'sess-backoff',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-    clock.advance(20)
-    await mgr.tick()
-    expect(fetchImpl).toHaveBeenCalledTimes(1)
-
-    clock.advance(10 * 60 * 1000 + 1)
-    await mgr.tick()
-
-    expect(fetchImpl).toHaveBeenCalledTimes(1)
-    expect(mgr.status().tracked).toBe(0)
-  })
-
-  test('track self-arms an unstarted manager and the timer fires a due target', async () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: 100,
-      leadMs: 90,
-      tickIntervalMs: 5,
-    })
-
-    try {
-      mgr.track(
-        'sess-self-arm',
-        JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-        'main',
-      )
-      expect(mgr.status().running).toBe(true)
-
-      clock.advance(20)
-      await delay(20)
-
-      expect(fetchImpl).toHaveBeenCalledTimes(1)
-    } finally {
-      mgr.stop()
-    }
-  })
-
-  test('a reconstructed unstarted manager arms itself when it captures', async () => {
-    const first = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: 100,
-      leadMs: 90,
-      tickIntervalMs: 5,
-    })
-    first.start()
-    first.stop()
-
-    const second = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: 100,
-      leadMs: 90,
-      tickIntervalMs: 5,
-    })
-
-    try {
-      second.track(
-        'sess-after-reload',
-        JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-        'main',
-      )
-      expect(second.status().running).toBe(true)
-
-      clock.advance(20)
-      await delay(20)
-
-      expect(fetchImpl).toHaveBeenCalledTimes(1)
-    } finally {
-      second.stop()
-    }
-  })
-
-  test('track-driven start is idempotent and does not bump startedAt', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-      tickIntervalMs: 60_000,
-    })
-
-    try {
-      mgr.track(
-        'sess-1',
-        JSON.stringify({ input: 'first', model: 'gpt-5.5' }),
-        'main',
-      )
-      const startedAt = mgr.status().startedAt
-      expect(mgr.status().running).toBe(true)
-
-      clock.advance(60_000)
-      mgr.track(
-        'sess-2',
-        JSON.stringify({ input: 'second', model: 'gpt-5.5' }),
-        'main',
-      )
-
-      expect(mgr.status().startedAt).toBe(startedAt)
-    } finally {
-      mgr.stop()
-    }
-  })
-
-  test('status running reflects the actual timer presence', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-    })
-
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-    expect(mgr.status().running).toBe(true)
-
-    mgr.stop()
-    expect(mgr.status().running).toBe(false)
-  })
-
-  test('fires prewarm only within LEAD window of cacheExpiresAt', async () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-    })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-
-    // Advance to just before LEAD window (cacheExpiresAt - LEAD_MS - 1)
-    // cacheExpiresAt = now + TTL_MS = now + 300000
-    // LEAD window = [cacheExpiresAt - LEAD_MS, cacheExpiresAt] = [now + 295000, now + 300000]
-    clock.advance(TTL_MS - LEAD_MS - 1000) // 294000 ms → not yet in window
-    await mgr.tick()
-    expect(fetchImpl).not.toHaveBeenCalled()
-
-    // Advance into LEAD window
-    clock.advance(2000) // 296000 ms → inside window
-    await mgr.tick()
-    expect(fetchImpl).toHaveBeenCalledTimes(1)
-  })
-
-  test('backoff suppresses prewarm after failure', async () => {
-    const failFetch = mock(async () => {
-      throw new Error('network error')
-    }) as unknown as typeof fetch
-    const mgr = new CacheKeepManager({
-      fetchImpl: failFetch,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-    })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-
-    // Advance into LEAD window
-    clock.advance(TTL_MS - LEAD_MS + 1000)
-    await mgr.tick() // This will fail → sets backoff
-    expect(failFetch).toHaveBeenCalledTimes(1)
-
-    // Advance a bit (but still within LEAD window and within backoff)
-    clock.advance(1000)
-    await mgr.tick()
-    // Should NOT fire again (backoff active)
-    expect(failFetch).toHaveBeenCalledTimes(1)
-  })
-
-  test('prewarm fires again after backoff expires', async () => {
-    let calls = 0
-    const flakyFetch = mock(async () => {
-      calls++
-      if (calls === 1) throw new Error('fail')
-      return new Response(JSON.stringify({ usage: {} }))
-    }) as unknown as typeof fetch
-    const mgr = new CacheKeepManager({
-      fetchImpl: flakyFetch,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-    })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-
-    // First tick → failure
-    clock.advance(TTL_MS - LEAD_MS + 1000)
-    await mgr.tick()
-    expect(calls).toBe(1)
-
-    // Advance past backoff (10 min)
-    clock.advance(10 * 60 * 1000 + 1000)
-    await mgr.tick()
-    expect(calls).toBe(2)
-  })
-
-  test('does not reenter tick while a previous prewarm is still in flight', async () => {
-    let resolveFetch!: (response: Response) => void
-    const slowFetch = mock(
-      () =>
-        new Promise<Response>((resolve) => {
-          resolveFetch = resolve
-        }),
-    ) as unknown as typeof fetch
-    const mgr = new CacheKeepManager({
-      fetchImpl: slowFetch,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-    })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-    clock.advance(TTL_MS - LEAD_MS + 1000)
-
-    const firstTick = mgr.tick()
-    await Promise.resolve()
-    const secondTick = mgr.tick()
-    await Promise.resolve()
-
-    expect(slowFetch).toHaveBeenCalledTimes(1)
-    resolveFetch(new Response(JSON.stringify({ usage: {} })))
-    await Promise.all([firstTick, secondTick])
-  })
-
-  test('sets backoff for malformed captured bodies and continues warming other targets', async () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-    })
-    mgr.track('bad', '{not-json', 'main')
-    mgr.track(
-      'good',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-    clock.advance(TTL_MS - LEAD_MS + 1000)
-
-    await mgr.tick()
-
-    const status = mgr.status()
-    expect(fetchImpl).toHaveBeenCalledTimes(1)
-    expect(
-      status.targets.find((target) => target.sessionKey === 'bad')!
-        .backoffUntil,
-    ).toBe(clock.now() + 10 * 60 * 1000)
-    expect(
-      status.targets.find((target) => target.sessionKey === 'good')!
-        .lastWarmedAt,
-    ).toBe(clock.now())
-  })
-
-  test('stays armed across an idle tick and later warms a captured request', async () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-    })
-    mgr.start()
-
-    await mgr.tick()
-    expect(mgr.status().running).toBe(true)
-
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-    clock.advance(TTL_MS - LEAD_MS + 1000)
-    await mgr.tick()
-
-    expect(fetchImpl).toHaveBeenCalledTimes(1)
-    expect(mgr.status().running).toBe(true)
-  })
-
-  test('tick prunes expired targets without disarming cachekeep', async () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-      maxIdleWarmMs: 60_000,
-    })
-    mgr.start()
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-
-    clock.advance(60_001)
-    await mgr.tick()
-    const status = mgr.status()
-    expect(status.tracked).toBe(0)
-    expect(status.running).toBe(true)
-  })
-
-  test('per-target idle cap prunes old captures while cachekeep stays enabled', async () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      maxIdleWarmMs: 1000,
-    })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-
-    expect(mgr.status().running).toBe(true)
-    clock.advance(1001)
-    await mgr.tick()
-    expect(mgr.status().running).toBe(true)
-    expect(mgr.status().tracked).toBe(0)
-  })
-
-  test('a real request after the idle cap resumes warming', async () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: 100,
-      leadMs: 90,
-      maxIdleWarmMs: 1000,
-    })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'old', model: 'gpt-5.5' }),
-      'main',
-    )
-    clock.advance(1001)
-    await mgr.tick()
-    expect(mgr.status().tracked).toBe(0)
-
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'new', model: 'gpt-5.5' }),
-      'main',
-    )
-    clock.advance(20)
-    await mgr.tick()
-
-    expect(fetchImpl).toHaveBeenCalledTimes(1)
-  })
-
-  test('on success: resets cacheExpiresAt and lastWarmedAt', async () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-    })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-
-    const originalExpiry = clock.now() + TTL_MS
-    clock.advance(TTL_MS - LEAD_MS + 1000)
-    await mgr.tick()
-
-    const status = mgr.status()
-    expect(status.targets[0]!.cacheExpiresAt).toBe(clock.now() + TTL_MS)
-    // cacheExpiresAt should be reset (greater than original)
-    expect(status.targets[0]!.cacheExpiresAt).toBeGreaterThan(originalExpiry)
-    expect(status.targets[0]!.lastWarmedAt).toBe(clock.now())
-  })
-
   test('gpt-5.6 session: post-warm reset uses per-target 30-min TTL (not 5-min)', async () => {
     const longTtl = 30 * 60 * 1000
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -1548,11 +628,12 @@ describe('CacheKeepManager tick/prewarm', () => {
       ttlMs: TTL_MS, // constructor default
       leadMs: LEAD_MS,
     })
-    mgr.track(
-      'sess-56',
-      JSON.stringify({ input: 'sol', model: 'gpt-5.6-sol' }),
-      'main',
-    )
+    mgr.track({
+      sessionKey: 'sess-56',
+      bodyText: JSON.stringify({ input: 'sol', model: 'gpt-5.6-sol' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
 
     // Sanity: initial expiry is now + 30 min, not now + 5 min
     const initialExpiry = mgr.status().targets[0]!.cacheExpiresAt
@@ -1572,7 +653,7 @@ describe('CacheKeepManager tick/prewarm', () => {
 
   test('gpt-5.6 subagent warms exactly twice then is dropped from the map', async () => {
     const longTtl = 30 * 60 * 1000
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -1584,14 +665,16 @@ describe('CacheKeepManager tick/prewarm', () => {
       maxSubagentIdleMs: 60 * 60 * 1000, // large so the idle prune doesn't fire first
       getSustain: () => true,
     })
-    mgr.track(
-      'sub-56',
-      JSON.stringify({ input: 'subagent-turn', model: 'gpt-5.6-sol' }),
-      'main',
-      undefined,
-      {},
-      true, // isSubagent
-    )
+    mgr.track({
+      sessionKey: 'sub-56',
+      bodyText: JSON.stringify({
+        input: 'subagent-turn',
+        model: 'gpt-5.6-sol',
+      }),
+      accountId: 'main',
+      isSubagent: true,
+      meta: { replayHeaders: {} },
+    })
 
     // Lead window 1 → warm #1
     clock.advance(longTtl - LEAD_MS + 1000)
@@ -1613,7 +696,7 @@ describe('CacheKeepManager tick/prewarm', () => {
 
   test('gpt-5.6 subagent is NOT idle-pruned before its 2 warms (cap governs)', async () => {
     const longTtl = 30 * 60 * 1000
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -1625,14 +708,16 @@ describe('CacheKeepManager tick/prewarm', () => {
       maxSubagentIdleMs: 30 * 60 * 1000, // same as TTL — would prune pre-change
       getSustain: () => true,
     })
-    mgr.track(
-      'sub-56',
-      JSON.stringify({ input: 'subagent-turn', model: 'gpt-5.6-sol' }),
-      'main',
-      undefined,
-      {},
-      true,
-    )
+    mgr.track({
+      sessionKey: 'sub-56',
+      bodyText: JSON.stringify({
+        input: 'subagent-turn',
+        model: 'gpt-5.6-sol',
+      }),
+      accountId: 'main',
+      isSubagent: true,
+      meta: { replayHeaders: {}, chatgptAccountId: undefined },
+    })
 
     // Advance past maxSubagentIdleMs (30 min) — pre-change the idle prune would
     // kill the target here, before it can warm even once. Post-change the
@@ -1655,7 +740,7 @@ describe('CacheKeepManager tick/prewarm', () => {
     fetchImpl = mock(
       async () => new Response('fail', { status: 500 }),
     ) as unknown as typeof fetch
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -1667,26 +752,33 @@ describe('CacheKeepManager tick/prewarm', () => {
       maxSubagentIdleMs: 30 * 60 * 1000,
       getSustain: () => true,
     })
-    mgr.track(
-      'sub-56-stuck',
-      JSON.stringify({ input: 'subagent-turn', model: 'gpt-5.6-sol' }),
-      'main',
-      undefined,
-      {},
-      true,
-    )
+    mgr.track({
+      sessionKey: 'sub-56-stuck',
+      bodyText: JSON.stringify({
+        input: 'subagent-turn',
+        model: 'gpt-5.6-sol',
+      }),
+      accountId: 'main',
+      isSubagent: true,
+      meta: { replayHeaders: {}, chatgptAccountId: undefined },
+    })
 
     // Advance past the long 5.6 subagent idle bound (2 * 30min TTL + 15min ≈ 75min).
     clock.advance(76 * 60 * 1000)
     // Track another session so pruneStale runs (called inside track()).
-    mgr.track('trigger', JSON.stringify({ input: 'trigger' }), 'main')
+    mgr.track({
+      sessionKey: 'trigger',
+      bodyText: JSON.stringify({ input: 'trigger' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
 
     expect(mgr.status().tracked).toBe(1)
     expect(mgr.status().targets[0]!.sessionKey).toBe('trigger')
   })
 
   test('non-5.6 subagent is still idle-pruned at maxSubagentIdleMs (unchanged)', async () => {
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -1697,18 +789,22 @@ describe('CacheKeepManager tick/prewarm', () => {
       leadMs: LEAD_MS,
       maxSubagentIdleMs: 30 * 60 * 1000,
     })
-    mgr.track(
-      'sub-55',
-      JSON.stringify({ input: 'subagent-turn', model: 'gpt-5.5' }),
-      'main',
-      undefined,
-      {},
-      true,
-    )
+    mgr.track({
+      sessionKey: 'sub-55',
+      bodyText: JSON.stringify({ input: 'subagent-turn', model: 'gpt-5.5' }),
+      accountId: 'main',
+      isSubagent: true,
+      meta: { replayHeaders: {}, chatgptAccountId: undefined },
+    })
 
     clock.advance(31 * 60 * 1000) // past 30-min subagent cap
     // Track another session so pruneStale runs (it's called inside track())
-    mgr.track('other', JSON.stringify({ input: 'other' }), 'main')
+    mgr.track({
+      sessionKey: 'other',
+      bodyText: JSON.stringify({ input: 'other' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
 
     // Sub-55 should be pruned; only the 'other' target remains
     expect(mgr.status().tracked).toBe(1)
@@ -1717,7 +813,7 @@ describe('CacheKeepManager tick/prewarm', () => {
 
   test('gpt-5.6 main target is unchanged (not dropped after 2 warms)', async () => {
     const longTtl = 30 * 60 * 1000
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -1728,11 +824,12 @@ describe('CacheKeepManager tick/prewarm', () => {
       leadMs: LEAD_MS,
       maxIdleWarmMs: 60 * 60 * 1000,
     })
-    mgr.track(
-      'main-56',
-      JSON.stringify({ input: 'main-turn', model: 'gpt-5.6-sol' }),
-      'main',
-    )
+    mgr.track({
+      sessionKey: 'main-56',
+      bodyText: JSON.stringify({ input: 'main-turn', model: 'gpt-5.6-sol' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
 
     // 2 lead windows → 2 warms
     clock.advance(longTtl - LEAD_MS + 1000)
@@ -1748,7 +845,7 @@ describe('CacheKeepManager tick/prewarm', () => {
 
   test('warmCount resets when track() re-captures the same subagent session', async () => {
     const longTtl = 30 * 60 * 1000
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -1763,7 +860,13 @@ describe('CacheKeepManager tick/prewarm', () => {
       input: 'subagent-turn',
       model: 'gpt-5.6-sol',
     })
-    mgr.track('sub-56', body, 'main', undefined, {}, true)
+    mgr.track({
+      sessionKey: 'sub-56',
+      bodyText: body,
+      accountId: 'main',
+      isSubagent: true,
+      meta: { replayHeaders: {}, chatgptAccountId: undefined },
+    })
 
     // First warm
     clock.advance(longTtl - LEAD_MS + 1000)
@@ -1771,7 +874,13 @@ describe('CacheKeepManager tick/prewarm', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1)
 
     // Re-capture the same session — warmCount resets to 0, fresh lifecycle
-    mgr.track('sub-56', body, 'main', undefined, {}, true)
+    mgr.track({
+      sessionKey: 'sub-56',
+      bodyText: body,
+      accountId: 'main',
+      isSubagent: true,
+      meta: { replayHeaders: {}, chatgptAccountId: undefined },
+    })
 
     // Next warm
     clock.advance(longTtl - LEAD_MS + 1000)
@@ -1782,7 +891,7 @@ describe('CacheKeepManager tick/prewarm', () => {
   })
 
   test('logs cost from mock usage', async () => {
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -1792,11 +901,12 @@ describe('CacheKeepManager tick/prewarm', () => {
       ttlMs: TTL_MS,
       leadMs: LEAD_MS,
     })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
+    mgr.track({
+      sessionKey: 'sess-1',
+      bodyText: JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
 
     clock.advance(TTL_MS - LEAD_MS + 1000)
     await mgr.tick()
@@ -1827,7 +937,7 @@ describe('CacheKeepManager tick/prewarm', () => {
           }),
         ),
     ) as unknown as typeof fetch
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -1837,11 +947,12 @@ describe('CacheKeepManager tick/prewarm', () => {
       ttlMs: TTL_MS,
       leadMs: LEAD_MS,
     })
-    mgr.track(
-      'sess-prompt-tokens',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
+    mgr.track({
+      sessionKey: 'sess-prompt-tokens',
+      bodyText: JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
 
     clock.advance(TTL_MS - LEAD_MS + 1000)
     await mgr.tick()
@@ -1858,7 +969,7 @@ describe('CacheKeepManager tick/prewarm', () => {
   })
 
   test('sends cache-relevant captured headers on warm requests', async () => {
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -1868,19 +979,21 @@ describe('CacheKeepManager tick/prewarm', () => {
       ttlMs: TTL_MS,
       leadMs: LEAD_MS,
     })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-      undefined,
-      {
-        'session-id': 'sess-1',
-        'user-agent': 'codex-test',
-        version: '0.144.0',
-        'x-codex-beta-features': 'terminal_resize_reflow',
-        'x-codex-turn-metadata': '{"turn_id":"turn-1"}',
+    mgr.track({
+      sessionKey: 'sess-1',
+      bodyText: JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
+      accountId: 'main',
+      meta: {
+        replayHeaders: {
+          'session-id': 'sess-1',
+          'user-agent': 'codex-test',
+          version: '0.144.0',
+          'x-codex-beta-features': 'terminal_resize_reflow',
+          'x-codex-turn-metadata': '{"turn_id":"turn-1"}',
+        },
+        chatgptAccountId: undefined,
       },
-    )
+    })
 
     clock.advance(TTL_MS - LEAD_MS + 1000)
     await mgr.tick()
@@ -1898,43 +1011,6 @@ describe('CacheKeepManager tick/prewarm', () => {
       'x-codex-beta-features': 'terminal_resize_reflow',
       'x-codex-turn-metadata': '{"turn_id":"turn-1"}',
     })
-  })
-
-  test('backs off on non-2xx responses without resetting expiry', async () => {
-    const failFetch = mock(
-      async () => new Response('bad', { status: 500 }),
-    ) as unknown as typeof fetch
-    const mgr = new CacheKeepManager({
-      fetchImpl: failFetch,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-    })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-    const originalExpiry = mgr.status().targets[0]!.cacheExpiresAt
-    clock.advance(TTL_MS - LEAD_MS + 1000)
-
-    await mgr.tick()
-
-    const status = mgr.status()
-    expect(status.targets[0]!.cacheExpiresAt).toBe(originalExpiry)
-    expect(status.targets[0]!.backoffUntil).toBe(clock.now() + 10 * 60 * 1000)
-    expect(log.warn).toHaveBeenCalledWith(
-      'cachekeep failed',
-      expect.objectContaining({
-        status: 500,
-        responseBody: 'bad',
-        pid: process.pid,
-      }),
-    )
   })
 
   test('parses SSE response.completed usage and logs cache hit metrics', async () => {
@@ -1959,7 +1035,7 @@ describe('CacheKeepManager tick/prewarm', () => {
           headers: { 'content-type': 'text/event-stream' },
         }),
     ) as unknown as typeof fetch
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl: sseFetch,
       getMainToken,
       refreshFallback,
@@ -1969,11 +1045,16 @@ describe('CacheKeepManager tick/prewarm', () => {
       ttlMs: TTL_MS,
       leadMs: LEAD_MS,
     })
-    mgr.track(
-      'sess-sse',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5', stream: true }),
-      'main',
-    )
+    mgr.track({
+      sessionKey: 'sess-sse',
+      bodyText: JSON.stringify({
+        input: 'test',
+        model: 'gpt-5.5',
+        stream: true,
+      }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
     clock.advance(TTL_MS - LEAD_MS + 1000)
 
     await mgr.tick()
@@ -1981,7 +1062,6 @@ describe('CacheKeepManager tick/prewarm', () => {
     expect(log.debug).toHaveBeenCalledWith(
       'cachekeep fired',
       expect.objectContaining({
-        pid: process.pid,
         input_tokens: 100,
         output_tokens: 1,
         cached_tokens: 75,
@@ -2013,7 +1093,7 @@ describe('CacheKeepManager tick/prewarm', () => {
           headers: { 'content-type': 'text/event-stream' },
         }),
     ) as unknown as typeof fetch
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl: sseFetch,
       getMainToken,
       refreshFallback,
@@ -2023,11 +1103,16 @@ describe('CacheKeepManager tick/prewarm', () => {
       ttlMs: TTL_MS,
       leadMs: LEAD_MS,
     })
-    mgr.track(
-      'sess-sse-event-line',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5', stream: true }),
-      'main',
-    )
+    mgr.track({
+      sessionKey: 'sess-sse-event-line',
+      bodyText: JSON.stringify({
+        input: 'test',
+        model: 'gpt-5.5',
+        stream: true,
+      }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
     clock.advance(TTL_MS - LEAD_MS + 1000)
 
     await mgr.tick()
@@ -2064,7 +1149,7 @@ describe('CacheKeepManager tick/prewarm', () => {
           headers: { 'content-type': 'application/json' },
         }),
     ) as unknown as typeof fetch
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl: sseFetch,
       getMainToken,
       refreshFallback,
@@ -2074,11 +1159,16 @@ describe('CacheKeepManager tick/prewarm', () => {
       ttlMs: TTL_MS,
       leadMs: LEAD_MS,
     })
-    mgr.track(
-      'sess-sse-sniff',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5', stream: true }),
-      'main',
-    )
+    mgr.track({
+      sessionKey: 'sess-sse-sniff',
+      bodyText: JSON.stringify({
+        input: 'test',
+        model: 'gpt-5.5',
+        stream: true,
+      }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
     clock.advance(TTL_MS - LEAD_MS + 1000)
 
     await mgr.tick()
@@ -2086,7 +1176,6 @@ describe('CacheKeepManager tick/prewarm', () => {
     expect(log.debug).toHaveBeenCalledWith(
       'cachekeep warm response',
       expect.objectContaining({
-        pid: process.pid,
         status: 200,
         contentType: 'application/json',
         bodyLen: sseBody.length,
@@ -2113,7 +1202,7 @@ describe('CacheKeepManager tick/prewarm', () => {
           },
         ),
     ) as unknown as typeof fetch
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl: sseFetch,
       getMainToken,
       refreshFallback,
@@ -2123,11 +1212,16 @@ describe('CacheKeepManager tick/prewarm', () => {
       ttlMs: TTL_MS,
       leadMs: LEAD_MS,
     })
-    mgr.track(
-      'sess-sse-no-usage',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5', stream: true }),
-      'main',
-    )
+    mgr.track({
+      sessionKey: 'sess-sse-no-usage',
+      bodyText: JSON.stringify({
+        input: 'test',
+        model: 'gpt-5.5',
+        stream: true,
+      }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
     clock.advance(TTL_MS - LEAD_MS + 1000)
 
     await mgr.tick()
@@ -2141,122 +1235,6 @@ describe('CacheKeepManager tick/prewarm', () => {
         hit_rate: null,
       }),
     )
-  })
-
-  test('prewarm drains the response body without canceling a locked body', async () => {
-    const cancelFetch = mock(async () => {
-      return new Response(JSON.stringify({ usage: {} }), {
-        headers: { 'content-type': 'application/json' },
-      })
-    }) as unknown as typeof fetch
-
-    // Override to return a response with cancel
-    const mgr = new CacheKeepManager({
-      fetchImpl: cancelFetch,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-    })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-
-    clock.advance(TTL_MS - LEAD_MS + 1000)
-    await mgr.tick()
-
-    // The body.cancel() is called in prewarm — verify the response was consumed
-    expect(cancelFetch).toHaveBeenCalled()
-  })
-})
-
-describe('CacheKeepManager status', () => {
-  test('does not expose captured body text', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl: mock(
-        async () => new Response('{}'),
-      ) as unknown as typeof fetch,
-      getMainToken: mock(async () => 'main-token'),
-      refreshFallback: mock(async () => 'fallback-token'),
-      codexResponsesUrl: CODEX_URL,
-      logger: fakeLogger(),
-      now: fakeNow().now,
-    })
-    mgr.track('sess-1', JSON.stringify({ input: 'secret prompt' }), 'main')
-
-    const target = mgr.status().targets[0] as Record<string, unknown>
-    expect(target.bodyText).toBeUndefined()
-    expect(target.bodyBytes).toBeGreaterThan(0)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// CacheKeepManager — start/stop
-// ---------------------------------------------------------------------------
-describe('CacheKeepManager start/stop', () => {
-  let log: ReturnType<typeof fakeLogger>
-  let getMainToken: ReturnType<typeof mock>
-  let refreshFallback: ReturnType<typeof mock>
-  let fetchImpl: typeof fetch
-  let clock: ReturnType<typeof fakeNow>
-
-  beforeEach(() => {
-    log = fakeLogger()
-    getMainToken = mock(async () => 'main-token')
-    refreshFallback = mock(async () => 'fallback-token')
-    fetchImpl = mock(async () => new Response('{}')) as unknown as typeof fetch
-    clock = fakeNow()
-  })
-
-  test('start sets running flag', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-    })
-    mgr.start()
-    expect(mgr.status().running).toBe(true)
-  })
-
-  test('stop clears targets and timer', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-    })
-    mgr.start()
-    mgr.track('sess-1', JSON.stringify({ input: 'test' }), 'main')
-    mgr.stop()
-
-    const status = mgr.status()
-    expect(status.running).toBe(false)
-    expect(status.tracked).toBe(0)
-  })
-
-  test('status shows max idle warm time', () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      maxIdleWarmMs: 60 * 60 * 1000,
-    })
-    mgr.start()
-    const status = mgr.status()
-    expect(status.maxIdleWarmMs).toBe(60 * 60 * 1000)
   })
 })
 
@@ -2281,7 +1259,7 @@ describe('CacheKeepManager token resolution', () => {
   })
 
   test('uses getMainToken for main account', async () => {
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -2291,11 +1269,12 @@ describe('CacheKeepManager token resolution', () => {
       ttlMs: TTL_MS,
       leadMs: LEAD_MS,
     })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
+    mgr.track({
+      sessionKey: 'sess-1',
+      bodyText: JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
 
     clock.advance(TTL_MS - LEAD_MS + 1000)
     await mgr.tick()
@@ -2310,7 +1289,7 @@ describe('CacheKeepManager token resolution', () => {
   })
 
   test('uses refreshFallback for non-main accountId', async () => {
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -2320,11 +1299,12 @@ describe('CacheKeepManager token resolution', () => {
       ttlMs: TTL_MS,
       leadMs: LEAD_MS,
     })
-    mgr.track(
-      'sess-2',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'acct-1',
-    )
+    mgr.track({
+      sessionKey: 'sess-2',
+      bodyText: JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
+      accountId: 'acct-1',
+      meta: { replayHeaders: {} },
+    })
 
     clock.advance(TTL_MS - LEAD_MS + 1000)
     await mgr.tick()
@@ -2342,7 +1322,7 @@ describe('CacheKeepManager token resolution', () => {
     getMainToken = mock(async () => {
       throw new Error('no token')
     })
-    const mgr = new CacheKeepManager({
+    const mgr = createCacheKeepManager({
       fetchImpl,
       getMainToken,
       refreshFallback,
@@ -2352,11 +1332,12 @@ describe('CacheKeepManager token resolution', () => {
       ttlMs: TTL_MS,
       leadMs: LEAD_MS,
     })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
+    mgr.track({
+      sessionKey: 'sess-1',
+      bodyText: JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
+      accountId: 'main',
+      meta: { replayHeaders: {} },
+    })
 
     clock.advance(TTL_MS - LEAD_MS + 1000)
     await mgr.tick()
@@ -2365,53 +1346,6 @@ describe('CacheKeepManager token resolution', () => {
     expect(fetchImpl).not.toHaveBeenCalled()
     // backoffUntil should be set
     expect(mgr.status().targets[0]!.backoffUntil).toBeDefined()
-  })
-
-  test('stop/dispose aborts in-flight warm and prevents mutating removed targets', async () => {
-    let resolveFetch!: (response: Response) => void
-    let fetchCalled!: () => void
-    const fetchCalledPromise = new Promise<void>((resolve) => {
-      fetchCalled = resolve
-    })
-    const slowFetch = mock(
-      () =>
-        new Promise<Response>((res) => {
-          resolveFetch = res
-          fetchCalled()
-        }),
-    ) as unknown as typeof fetch
-
-    const mgr = new CacheKeepManager({
-      fetchImpl: slowFetch,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-    })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-
-    clock.advance(TTL_MS - LEAD_MS + 1000)
-    const tickPromise = mgr.tick()
-
-    // Wait for fetch to be called
-    await fetchCalledPromise
-
-    // Stop the manager while tick is in flight
-    mgr.stop()
-
-    // Resolve the fetch
-    resolveFetch(new Response('{}'))
-    await tickPromise
-
-    // The target was removed, so status targets should be empty
-    expect(mgr.status().tracked).toBe(0)
   })
 
   test('session.deleted event removes target by threadID and prevents further warm fires', async () => {
@@ -2794,224 +1728,145 @@ describe('getCacheKeepWindow', () => {
   })
 })
 
-describe('isWithinCacheKeepWindow', () => {
-  // Build a Date in local time so getHours() is stable across TZ tests.
-  const at = (h: number) => {
-    const d = new Date(2024, 5, 15, h, 0, 0, 0) // 2024-06-15 HH:00:00 local
-    return d
-  }
-
-  test('returns false for undefined window', () => {
-    expect(isWithinCacheKeepWindow(undefined, at(3))).toBe(false)
+// ---------------------------------------------------------------------------
+// Session routing: which account a warm may use
+// ---------------------------------------------------------------------------
+describe('routedAccountForSession', () => {
+  const now = 1700000000000
+  const pinned = (accountId: string, lastSeenAt = now): SidebarState => ({
+    ...DEFAULT_SIDEBAR_STATE,
+    route: 'sticky-balanced',
+    stickyAssignments: {
+      [hashSidebarSessionId('sess')]: {
+        accountId,
+        assignedAt: lastSeenAt,
+        lastSeenAt,
+        inputBytes: 1,
+      },
+    },
   })
 
-  test('same-day window (9-18): inside hours', () => {
-    const win = { startHour: 9, endHour: 18 }
-    expect(isWithinCacheKeepWindow(win, at(9))).toBe(true)
-    expect(isWithinCacheKeepWindow(win, at(12))).toBe(true)
-    expect(isWithinCacheKeepWindow(win, at(17))).toBe(true)
+  test('sticky-balanced: the session pin is the routed account', () => {
+    expect(routedAccountForSession(pinned('fb-2'), 'sess', now)).toBe('fb-2')
   })
 
-  test('same-day window (9-18): outside hours', () => {
-    const win = { startHour: 9, endHour: 18 }
-    expect(isWithinCacheKeepWindow(win, at(8))).toBe(false)
-    expect(isWithinCacheKeepWindow(win, at(18))).toBe(false)
-    expect(isWithinCacheKeepWindow(win, at(23))).toBe(false)
+  test('sticky-balanced: no pin, a stale pin or no session id is no binding', () => {
+    expect(
+      routedAccountForSession(pinned('fb-2'), 'other', now),
+    ).toBeUndefined()
+    expect(
+      routedAccountForSession(
+        pinned('fb-2', now - 8 * 24 * 60 * 60 * 1000),
+        'sess',
+        now,
+      ),
+    ).toBeUndefined()
+    expect(
+      routedAccountForSession(pinned('fb-2'), undefined, now),
+    ).toBeUndefined()
   })
 
-  test('overnight wrap (22-6): inside hours', () => {
-    const win = { startHour: 22, endHour: 6 }
-    expect(isWithinCacheKeepWindow(win, at(23))).toBe(true)
-    expect(isWithinCacheKeepWindow(win, at(0))).toBe(true)
-    expect(isWithinCacheKeepWindow(win, at(5))).toBe(true)
-  })
-
-  test('overnight wrap (22-6): outside hours', () => {
-    const win = { startHour: 22, endHour: 6 }
-    expect(isWithinCacheKeepWindow(win, at(12))).toBe(false)
-    expect(isWithinCacheKeepWindow(win, at(9))).toBe(false)
-    expect(isWithinCacheKeepWindow(win, at(6))).toBe(false)
-    expect(isWithinCacheKeepWindow(win, at(21))).toBe(false)
+  test('ordered modes: the route recorded for the session under the current mode', () => {
+    const state: SidebarState = {
+      ...DEFAULT_SIDEBAR_STATE,
+      route: 'fallback-first',
+      activeRouting: {
+        sess: { activeId: 'fb-1', route: 'fallback-first', updatedAt: now },
+        earlier: { activeId: 'main', route: 'main-first', updatedAt: now },
+      },
+    }
+    expect(routedAccountForSession(state, 'sess', now)).toBe('fb-1')
+    // Recorded under another mode: says nothing about the next request.
+    expect(routedAccountForSession(state, 'earlier', now)).toBeUndefined()
+    expect(routedAccountForSession(state, 'unrouted', now)).toBeUndefined()
   })
 })
 
-// ---------------------------------------------------------------------------
-// CacheKeepManager window gating
-// ---------------------------------------------------------------------------
+describe('CacheKeepManager active account', () => {
+  const body = JSON.stringify({ input: 'test', model: 'gpt-5.5' })
 
-describe('CacheKeepManager window gating', () => {
-  let log: ReturnType<typeof fakeLogger>
-  let getMainToken: ReturnType<typeof mock>
-  let refreshFallback: ReturnType<typeof mock>
-  let fetchImpl: typeof fetch
-  let clock: ReturnType<typeof fakeNow>
-
-  beforeEach(() => {
-    log = fakeLogger()
-    getMainToken = mock(async () => 'main-token')
-    refreshFallback = mock(async () => 'fallback-token')
-    fetchImpl = mock(async () => new Response('{}')) as unknown as typeof fetch
-    clock = fakeNow()
-  })
-
-  // Pick a window that is guaranteed to exclude `now`'s local hour regardless
-  // of CI timezone — it sits 6 hours ahead of the current hour and never wraps
-  // back to include it.
-  const excludedWindowFor = (now: Date) => {
-    const currentHour = now.getHours()
-    const nextHour = (currentHour + 1) % 24
-    const endHour = (nextHour + 5) % 24
-    // (nextHour + 5) % 24 cannot equal nextHour (5 mod 24 != 0), so the
-    // validator accepts it; it covers exactly the 5 hours after `nextHour`.
-    return { startHour: nextHour, endHour }
+  function setup(active: (routingSessionId: string | undefined) => unknown) {
+    const clock = fakeNow()
+    const fetchImpl = mock(
+      async () => new Response('{}'),
+    ) as unknown as typeof fetch
+    const activeAccount = mock(active as never) as unknown as (
+      routingSessionId: string | undefined,
+    ) => string | undefined
+    const mgr = createCacheKeepManager({
+      fetchImpl,
+      getMainToken: async () => 'main-token',
+      refreshFallback: async (id) => `${id}-token`,
+      codexResponsesUrl: CODEX_URL,
+      activeAccount,
+      logger: fakeLogger(),
+      now: clock.now,
+      ttlMs: TTL_MS,
+      leadMs: LEAD_MS,
+    })
+    mgr.track({
+      sessionKey: 'thread-1',
+      bodyText: body,
+      accountId: 'fb-2',
+      meta: { replayHeaders: {}, routingSessionId: 'opencode-session' },
+    })
+    clock.advance(TTL_MS - LEAD_MS + 1000)
+    return { mgr, fetchImpl, activeAccount }
   }
 
-  // A single-hour window that always covers `now`'s local hour.
-  const includedWindowFor = (now: Date) => {
-    const currentHour = now.getHours()
-    const nextHour = (currentHour + 1) % 24
-    return { startHour: currentHour, endHour: nextHour }
-  }
-
-  // Use the manager's own injected `now()` so the window math agrees with what
-  // the Manager sees — fakeNow's timestamp may map to a different local hour
-  // than the real wall clock.
-  const managerNow = () => new Date(clock.now())
-
-  test('without getWindow: behavior is identical to the pre-window manager (unchanged legacy path)', async () => {
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-      // no getWindow — must behave exactly like today.
-    })
-    mgr.track(
-      'legacy-sess',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-    expect(mgr.status().tracked).toBe(1)
-    expect(mgr.status().window).toBeUndefined()
-
-    clock.advance(TTL_MS - LEAD_MS + 1000)
-    await mgr.tick()
-    expect(fetchImpl).toHaveBeenCalledTimes(1)
-  })
-
-  test('with excluded getWindow: track() captures nothing and tick() does not fire', async () => {
-    const window = excludedWindowFor(managerNow())
-    expect(isWithinCacheKeepWindow(window, managerNow())).toBe(false)
-
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-      getWindow: () => window,
-    })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-    expect(mgr.status().tracked).toBe(0)
-    expect(mgr.status().window).toEqual(window)
-
-    clock.advance(TTL_MS - LEAD_MS + 1000)
-    await mgr.tick()
-    expect(fetchImpl).not.toHaveBeenCalled()
-  })
-
-  test('with included getWindow: track() captures and tick() fires normally', async () => {
-    const window = includedWindowFor(managerNow())
-    expect(isWithinCacheKeepWindow(window, managerNow())).toBe(true)
-
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-      getWindow: () => window,
-    })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'test', model: 'gpt-5.5' }),
-      'main',
-    )
-    expect(mgr.status().tracked).toBe(1)
-    expect(mgr.status().window).toEqual(window)
-
-    clock.advance(TTL_MS - LEAD_MS + 1000)
-    await mgr.tick()
-    expect(fetchImpl).toHaveBeenCalledTimes(1)
-  })
-
-  test('tick() before any capture with excluded window: no targets created, fetch not called', async () => {
-    const window = excludedWindowFor(managerNow())
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-      getWindow: () => window,
-    })
+  test('a session now routed to another account is not warmed on the old one', async () => {
+    const { mgr, fetchImpl, activeAccount } = setup(() => 'fb-1')
     await mgr.tick()
     expect(fetchImpl).not.toHaveBeenCalled()
     expect(mgr.status().tracked).toBe(0)
+    // Asked by the router's session id, not the cache key.
+    expect(activeAccount).toHaveBeenCalledWith('opencode-session')
   })
 
-  test('changing getWindow at runtime affects only subsequent track/tick calls (existing targets survive outside-window)', async () => {
-    const included = includedWindowFor(managerNow())
-    const excluded = excludedWindowFor(managerNow())
-    let currentWindow = included
-
-    const mgr = new CacheKeepManager({
-      fetchImpl,
-      getMainToken,
-      refreshFallback,
-      codexResponsesUrl: CODEX_URL,
-      logger: log,
-      now: clock.now,
-      ttlMs: TTL_MS,
-      leadMs: LEAD_MS,
-      getWindow: () => currentWindow,
-    })
-    mgr.track(
-      'sess-1',
-      JSON.stringify({ input: 'in', model: 'gpt-5.5' }),
-      'main',
-    )
-    expect(mgr.status().tracked).toBe(1)
-
-    // Flip to excluded — existing target stays in the map, but tick() must
-    // skip the fire loop until we flip back.
-    currentWindow = excluded
-    clock.advance(TTL_MS - LEAD_MS + 1000)
-    await mgr.tick()
-    expect(fetchImpl).not.toHaveBeenCalled()
-    expect(mgr.status().tracked).toBe(1)
-
-    // Flip back to included and tick again — prewarm fires.
-    currentWindow = included
-    clock.advance(1000)
+  test('a session still routed to the captured account is warmed there', async () => {
+    const { mgr, fetchImpl } = setup(() => 'fb-2')
     await mgr.tick()
     expect(fetchImpl).toHaveBeenCalledTimes(1)
+    const init = (fetchImpl as unknown as ReturnType<typeof mock>).mock
+      .calls[0]![1] as RequestInit
+    expect(new Headers(init.headers).get('authorization')).toBe(
+      'Bearer fb-2-token',
+    )
+  })
+
+  test('a session with no routing binding keeps the captured account', async () => {
+    const { mgr, fetchImpl } = setup(() => undefined)
+    await mgr.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(mgr.status().tracked).toBe(1)
+  })
+})
+
+describe('openaiCacheKeepProfile', () => {
+  const body56 = JSON.stringify({ model: 'gpt-5.6-sol', input: [] })
+
+  test('gpt-5.6 main session: 30-min TTL, no warm cap', () => {
+    expect(
+      openaiCacheKeepProfile({ bodyText: body56, isSubagent: false }),
+    ).toEqual({ ttlMs: 30 * 60 * 1000 })
+  })
+
+  test('gpt-5.6 subagent: two warms and a 75-min idle bound', () => {
+    expect(
+      openaiCacheKeepProfile({ bodyText: body56, isSubagent: true }),
+    ).toEqual({
+      ttlMs: 30 * 60 * 1000,
+      maxWarms: 2,
+      maxIdleMs: 75 * 60 * 1000,
+    })
+  })
+
+  test('other models keep the manager defaults', () => {
+    expect(
+      openaiCacheKeepProfile({
+        bodyText: JSON.stringify({ model: 'gpt-5.5' }),
+        isSubagent: true,
+      }),
+    ).toBeUndefined()
   })
 })
