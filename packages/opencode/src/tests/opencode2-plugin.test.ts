@@ -8,6 +8,7 @@ import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   isPlaceholderCredential,
+  OpenCode2AuthError,
   placeholderSecret,
 } from '@cortexkit/common-auth/opencode2'
 import type { Credential } from '@opencode/plugin'
@@ -15,9 +16,9 @@ import { POOL_PLACEHOLDER } from '../core/pool-migration'
 import {
   createOpenAIAdapter,
   inspectCodexEvent,
+  NO_ACCOUNT_REFUSAL,
   quotaFromCodexHeaders,
 } from '../v2/adapter'
-import { CODEX_CLIENT_HEADERS } from '../v2/codex-wire'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { applyCodexModelRules } from '../v2/models'
 import { SessionPins } from '../v2/pins'
@@ -660,7 +661,7 @@ describe('OpenCode 2 adapter: event rules', () => {
     )
   })
 
-  it('sends a row without a usable token with no credential rather than the placeholder', async () => {
+  it('refuses a row without a usable token locally rather than sending it without a credential or with the placeholder', async () => {
     const row = {
       id: 'main',
       type: 'oauth' as const,
@@ -675,19 +676,21 @@ describe('OpenCode 2 adapter: event rules', () => {
       storage: async () => null,
       pins: new SessionPins(),
     })
-    const result = await openai.adapter.accountHeaders({
-      ...scope(),
-      providerID: 'openai',
-      modelID: 'gpt-5.5',
-      accountId: 'main',
-    })
-    // The client identity still goes out; no credential and no attempt value.
-    expect(result).toEqual({
-      headers: {
-        ...CODEX_CLIENT_HEADERS,
-        authorization: null,
-        'chatgpt-account-id': null,
-      },
-    })
+    // The installer's no-account refusal: the host stops before sending, so
+    // nothing reaches the provider without the row's credential.
+    const error = await Promise.resolve(
+      openai.adapter.accountHeaders({
+        ...scope(),
+        providerID: 'openai',
+        modelID: 'gpt-5.5',
+        accountId: 'main',
+      }),
+    ).then(
+      () => undefined,
+      (reason: unknown) => reason,
+    )
+    expect(error).toBeInstanceOf(OpenCode2AuthError)
+    expect((error as OpenCode2AuthError).kind).toBe('no-account')
+    expect((error as OpenCode2AuthError).message).toBe(NO_ACCOUNT_REFUSAL)
   })
 })
