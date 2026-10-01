@@ -21,7 +21,10 @@ import {
   saveAccountState,
   saveAccounts,
 } from '@cortexkit/openai-auth-core/internal'
-import { classifyMainAuthSlot, MAIN_REFRESH_LOCK_NAME } from '../core/host-slot.ts'
+import {
+  classifyMainAuthSlot,
+  MAIN_REFRESH_LOCK_NAME,
+} from '../core/host-slot.ts'
 import {
   adoptHostSlotLogin,
   type HostSlotAdapter,
@@ -247,7 +250,10 @@ describe('the Claustrum vault', () => {
     await h.setSlot(login('acct-new', 'r-new'))
     const before = await h.bytes()
     const warned: string[] = []
-    const log = { info: () => {}, warn: (message: string) => warned.push(message) }
+    const log = {
+      info: () => {},
+      warn: (message: string) => warned.push(message),
+    }
     expect(
       await adoptHostSlotLogin({ ...h.deps({ log }), vaultServes: () => true }),
     ).toEqual({ status: 'vault-owns-accounts' })

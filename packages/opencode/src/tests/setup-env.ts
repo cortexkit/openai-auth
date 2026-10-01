@@ -271,10 +271,7 @@ assertFloor(
   'OPENCODE_OPENAI_AUTH_MODELS_CACHE',
   envPath('OPENCODE_OPENAI_AUTH_MODELS_CACHE'),
 )
-assertFloor(
-  'CLAUSTRUM_SUBC_CONNECTION',
-  envPath('CLAUSTRUM_SUBC_CONNECTION'),
-)
+assertFloor('CLAUSTRUM_SUBC_CONNECTION', envPath('CLAUSTRUM_SUBC_CONNECTION'))
 for (const name of Object.keys(FLOOR_ROOTS)) {
   assertFloor(name, envPath(name))
 }

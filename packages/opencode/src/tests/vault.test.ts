@@ -220,7 +220,9 @@ const ENTER = '\r'
 
 describe('enrollment', () => {
   test('Connect in `opencode auth login` proposes this host, tells the operator the ck commands, and stores the token owner-only', async () => {
-    const running = await startDaemon({ 'oauth:openai:work': vaultLogin('chatgpt-work') })
+    const running = await startDaemon({
+      'oauth:openai:work': vaultLogin('chatgpt-work'),
+    })
     seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
     const vault = new OpenAiVault({
       host: 'opencode',
@@ -259,13 +261,13 @@ describe('enrollment', () => {
     ])
     const printed = scripted.written()
     expect(printed).toContain('Connect to the Claustrum vault')
-    expect(printed).toContain(
-      'ck auth enroll approve --request-id request-1',
-    )
+    expect(printed).toContain('ck auth enroll approve --request-id request-1')
     expect(printed).toContain(
       'ck auth grant --principal enrolled:openai-auth-opencode --selector-kind category --selector openai-native --operation read',
     )
-    expect(printed).toContain('Connected: the vault approved openai-auth-opencode')
+    expect(printed).toContain(
+      'Connected: the vault approved openai-auth-opencode',
+    )
     const { tokenPath } = vaultPaths(stateDir, 'opencode')
     expect(statSync(tokenPath).mode & 0o777).toBe(0o600)
     expect(statSync(stateDir).mode & 0o777).toBe(0o700)
@@ -328,7 +330,10 @@ describe('routing', () => {
     const unauthorized = globalThis.fetch
     globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
       const bearer = new Headers(init?.headers).get('authorization')
-      if (String(url).includes('/responses') && bearer === `Bearer ${VAULT_ACCESS}`) {
+      if (
+        String(url).includes('/responses') &&
+        bearer === `Bearer ${VAULT_ACCESS}`
+      ) {
         wire.sends.push(bearer)
         return new Response('{}', { status: 401 })
       }
@@ -461,7 +466,10 @@ describe('what the handle-mode custody left behind', () => {
     }
     writeFileSync(files.stateFile, JSON.stringify(state))
     const wire = installWire()
-    const tombstone = { ...PLACEHOLDER, refresh: 'claustrum-tombstone:v1:openai' }
+    const tombstone = {
+      ...PLACEHOLDER,
+      refresh: 'claustrum-tombstone:v1:openai',
+    }
     await plugin(tombstone)
     const send = await fetchOverride()
 
@@ -507,7 +515,10 @@ describe('what the handle-mode custody left behind', () => {
     enroll()
     seedPool(files, [{ id: 'main', quota: quotaMap(100) }])
     const wire = wireWithExhaustedMain()
-    const tombstone = { ...PLACEHOLDER, refresh: 'claustrum-tombstone:v1:openai' }
+    const tombstone = {
+      ...PLACEHOLDER,
+      refresh: 'claustrum-tombstone:v1:openai',
+    }
     await plugin(tombstone)
     const loader = hooks?.auth?.loader
     if (!loader) throw new Error('no loader')

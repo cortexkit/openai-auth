@@ -369,9 +369,7 @@ export function createAuthMethods({
     label: 'Connect to the Claustrum vault',
     hint: 'serve OpenAI accounts held in the vault',
     run: async (context) => {
-      context.print(
-        `Asking the Claustrum vault to enroll ${target.name}…`,
-      )
+      context.print(`Asking the Claustrum vault to enroll ${target.name}…`)
       let shown: string | undefined
       const status = await target.waitForApproval({
         ...deps.vaultWait,

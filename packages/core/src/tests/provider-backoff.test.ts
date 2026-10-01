@@ -106,9 +106,7 @@ describe('codexRefreshFn token validation', () => {
     const start = source.indexOf('export async function codexRefreshFn')
     const end = source.indexOf('export async function whamUsageFn')
     const fn = source.slice(start, end)
-    const refusal = fn.indexOf(
-      'assertNotTombstoneRefresh(input.refreshToken)',
-    )
+    const refusal = fn.indexOf('assertNotTombstoneRefresh(input.refreshToken)')
     const firstTransport = Math.min(
       ...['new URL', 'URLSearchParams', 'await', 'input.fetchImpl']
         .map((token) => fn.indexOf(token))

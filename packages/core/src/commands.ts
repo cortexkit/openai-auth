@@ -743,7 +743,7 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
                 id: 'disconnect',
                 label: 'Disconnect',
                 description:
-                  'Forgets this host\'s vault token; its vault accounts stop routing at once. Revoke the enrollment itself with `ck auth enroll revoke`.',
+                  "Forgets this host's vault token; its vault accounts stop routing at once. Revoke the enrollment itself with `ck auth enroll revoke`.",
                 confirm:
                   'Disconnect from the vault? Connecting again needs a new approval with `ck`.',
                 run: async () => {

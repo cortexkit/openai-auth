@@ -1,6 +1,5 @@
 import {
   type AccountPaths,
-  type AccountStorage,
   type FallbackAccountManager,
   findPoolMainRow,
   type isOAuthAccount,

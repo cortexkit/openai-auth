@@ -209,7 +209,9 @@ describe('Pi and the Claustrum vault', () => {
       'ck auth enroll approve --request-id request-1',
     )
     for (let i = 0; i < 200 && notices.length === 0; i++) await Bun.sleep(10)
-    expect(notices.at(-1)).toContain('Connected: the vault approved openai-auth-pi')
+    expect(notices.at(-1)).toContain(
+      'Connected: the vault approved openai-auth-pi',
+    )
     expect(daemon.proposals.map((proposal) => proposal.name)).toEqual([
       'openai-auth-pi',
     ])

@@ -724,9 +724,9 @@ describe('/openai on a migrated install', () => {
 
   test('the Vault section says this host is not connected and offers Connect', async () => {
     seed()
-    const vault = (await openOpenAiMenu(context(), 'session-a')).menu.sections.find(
-      (section) => section.id === 'vault',
-    )
+    const vault = (
+      await openOpenAiMenu(context(), 'session-a')
+    ).menu.sections.find((section) => section.id === 'vault')
     expect(vault?.lines).toEqual([
       'OpenCode (openai-auth-opencode): not connected to the Claustrum vault.',
     ])

@@ -350,12 +350,10 @@ export class OpenAiVault {
       complete,
     )
     if (!observation) return Promise.resolve()
-    return this.#consumer
-      .recordQuota(routeId, observation, attempt)
-      .then(
-        () => {},
-        (error: unknown) => this.#fail('vault quota write failed', error),
-      )
+    return this.#consumer.recordQuota(routeId, observation, attempt).then(
+      () => {},
+      (error: unknown) => this.#fail('vault quota write failed', error),
+    )
   }
 
   /** Takes one quota reading for a vault account through the usage endpoint. */
@@ -412,9 +410,9 @@ export class OpenAiVault {
   }
 
   /** Readings for the routable vault accounts whose last one is older than `maxAgeMs`. */
-  async pollStale(maxAgeMs: number): Promise<
-    Array<{ id: string; ok: boolean; error?: string }>
-  > {
+  async pollStale(
+    maxAgeMs: number,
+  ): Promise<Array<{ id: string; ok: boolean; error?: string }>> {
     const now = (this.#options.now ?? Date.now)()
     const results: Array<{ id: string; ok: boolean; error?: string }> = []
     for (const route of this.routes()) {
@@ -482,7 +480,10 @@ export class OpenAiVault {
       if (current.state === 'denied' || current.state === 'blocked')
         await manager.resetTerminal()
       const status = await manager.reconcile()
-      log.info('vault enrollment step', { host: this.host, state: status.state })
+      log.info('vault enrollment step', {
+        host: this.host,
+        state: status.state,
+      })
       if (status.state === 'approved') {
         this.#lastError = undefined
         await this.refresh()
