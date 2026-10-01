@@ -148,11 +148,18 @@ export type VaultAccess = Pick<
 
 /**
  * What one send went out with, carried as the attempt's `data`: the pool
- * row's token (a quota reading is recorded only with the token it was taken
- * under), or the vault's receipt for that send.
+ * row's token and credential epoch, or the vault's receipt for that send. A
+ * quota reading that arrives with the send's response is recorded only while
+ * the row still holds that credential: the epoch changes when the row's
+ * credential is replaced (a new login, possibly of another account), and the
+ * pool drops a reading whose token is not the row's own.
  */
 export type OpenAIAttemptData =
-  | { readonly kind: 'pool'; readonly token: string }
+  | {
+      readonly kind: 'pool'
+      readonly token: string
+      readonly credentialEpoch: number | undefined
+    }
   | {
       readonly kind: 'vault'
       readonly routeId: string
@@ -652,7 +659,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         authorization: `Bearer ${token}`,
         'chatgpt-account-id': identity ?? null,
       },
-      attempt: { kind: 'pool', token },
+      attempt: { kind: 'pool', token, credentialEpoch: row.credentialEpoch },
     }
   }
 
@@ -728,14 +735,25 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       )
       return
     }
-    // The pool drops a reading whose token is not the row's own any more.
-    if (data?.kind === 'pool')
-      source.recordSnapshot(
+    if (data?.kind !== 'pool') return
+    // A reading that arrives after the row's credential was replaced
+    // describes the credential the send went out with, not the row's.
+    const row = source
+      .peek()
+      .rows.find((candidate) => candidate.id === accountId)
+    if (row?.credentialEpoch !== data.credentialEpoch) {
+      log?.debug('quota reading dropped: the row holds another credential', {
         accountId,
-        reading.snapshot,
-        data.token,
-        reading.complete,
-      )
+      })
+      return
+    }
+    // The pool drops a reading whose token is not the row's own any more.
+    source.recordSnapshot(
+      accountId,
+      reading.snapshot,
+      data.token,
+      reading.complete,
+    )
   }
 
   const markLimited = (
