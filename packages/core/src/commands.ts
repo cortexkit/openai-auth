@@ -60,6 +60,7 @@ import {
 import { isRecord } from './util/record.ts'
 import {
   type OpenAiVault,
+  type VaultWaitOptions,
   vaultApprovalInstructions,
   vaultConnectOutcome,
   vaultEnrollmentLine,
@@ -671,6 +672,8 @@ export interface VaultSectionDeps {
   >
   /** Runs after a change to which vault accounts route (the host re-reads them). */
   changed?(): unknown
+  /** How Connect polls for the operator's approval (tests shorten it). */
+  wait?: VaultWaitOptions
 }
 
 /**
@@ -765,7 +768,7 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
                   // The approval happens outside this menu; keep polling for
                   // it and report the outcome to the session that asked.
                   void vault
-                    .waitForApproval()
+                    .waitForApproval(deps.wait)
                     .then(async (final) => {
                       await deps.changed?.()
                       const outcome = vaultConnectOutcome(vault, final)

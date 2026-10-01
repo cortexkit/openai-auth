@@ -19,6 +19,7 @@ import {
 import {
   beginAccountLogin,
   type OAuthQuotaSnapshot,
+  type VaultWaitOptions,
 } from '@cortexkit/openai-auth-core/internal'
 import type {
   ExtensionAPI,
@@ -34,6 +35,8 @@ export type PiCommandDependencies = {
   packageVersion?: string
   /** The account pool the request path routes across; the menu works on it. */
   pool?: PiPoolCommands
+  /** How the Vault section's Connect polls for the approval (tests shorten it). */
+  vaultWait?: VaultWaitOptions
 }
 
 function windowLine(
@@ -102,7 +105,10 @@ export function createPiMenu(
         getPin: async (sessionId) => getPiStickyRouting(sessionId),
         clearPin: async (sessionId) => clearPiStickyRouting(sessionId),
       }),
-      vaultSection({ vault: pool.vault }),
+      vaultSection({
+        vault: pool.vault,
+        ...(dependencies.vaultWait ? { wait: dependencies.vaultWait } : {}),
+      }),
     ],
     afterApply: () => pool.reload(),
   })
