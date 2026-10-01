@@ -54,7 +54,8 @@ import {
   poolRemovalRefusal,
   poolSettingsLocks,
 } from '../core/pool-accounts'
-import { legacyRefreshLocks } from '../core/pool-migration'
+import { isPoolMainPlaceholder } from '../core/pool-main'
+import { legacyRefreshLocks, withMainRefreshLock } from '../core/pool-migration'
 import { observationFromSnapshot } from '../core/pool-quota'
 import { migrationFenceOpen } from '../core/version-fence'
 import { PackageVersion } from '../version'
@@ -234,16 +235,29 @@ export function createAuthMethods({
     return (storage?.accounts.length ?? 0) > 0
   }
 
+  // Writes OpenCode's `openai` slot under `main-refresh`, the lock every slot
+  // writer of this plugin holds, so this write cannot land between the
+  // account-pool migration's last slot read and its placeholder write. The
+  // slot is read again under the lock: if the migration put the placeholder
+  // in meanwhile, main lives in the pool row and nothing is written. The
+  // lock is released before `onMainSlotWritten`, whose adoption takes it.
   const setMainAuth = async (credential: {
     refresh: string
     access?: string
     expires?: number
   }) => {
-    await client.auth.set({
-      path: { id: 'openai' },
-      body: { type: 'oauth', ...credential },
-    } as never)
-    await onMainSlotWritten?.().catch(() => {})
+    const written = await withMainRefreshLock(
+      getPaths().configPath,
+      async () => {
+        if (isPoolMainPlaceholder(await readAuth())) return false
+        await client.auth.set({
+          path: { id: 'openai' },
+          body: { type: 'oauth', ...credential },
+        } as never)
+        return true
+      },
+    )
+    if (written) await onMainSlotWritten?.().catch(() => {})
   }
 
   /** The OAuth login the menu's add and re-authenticate actions run. */

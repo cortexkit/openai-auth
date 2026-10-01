@@ -155,9 +155,7 @@ describe('slot refresh on a migrated install', () => {
     const backoff = (await loadAccounts(getAccountPaths(configFile)))?.refresh
       ?.mainLastRefreshError
     expect(backoff).toBeDefined()
-    expect(backoff?.tokenHash).toBe(
-      hashRefreshToken(expiredLogin.refresh),
-    )
+    expect(backoff?.tokenHash).toBe(hashRefreshToken(expiredLogin.refresh))
 
     // The second request is inside the backoff: no new refresh is sent.
     await fetchOverride('https://api.openai.com/v1/responses', request())

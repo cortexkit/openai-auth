@@ -516,9 +516,10 @@ describe('adoption of a later login in the slot', () => {
     })
   })
 
-  it('declared: a login landing between the fence and the placeholder write is overwritten', async () => {
+  it('a login landing after the fence read is caught by the read right before the placeholder write', async () => {
     await migrated()
     await h.setSlot(login('acct-new', 'r-new'))
+    const writesBefore = await h.placeholderWrites()
     const outcome = await adoptHostSlotLogin(
       h.deps({
         onStep: async (step) => {
@@ -527,16 +528,28 @@ describe('adoption of a later login in the slot', () => {
         },
       }),
     )
-    // Declared race (the host slot has no compare-and-replace): the
-    // placeholder overwrites the late login in the slot, the earlier login is
-    // in the pool, and the late login is lost until the user logs in again.
-    expect(outcome).toMatchObject({
+    // The late login stays in the slot; the run ends retryably with its
+    // record kept, and nothing is overwritten.
+    expect(outcome).toEqual({ status: 'retry', reason: 'slot-changed' })
+    expect((await h.slotValue())?.refresh).toBe('r-late')
+    expect(await h.placeholderWrites()).toBe(writesBefore)
+    expect((await h.config())[POOL_MIGRATION_KEY].pending).toMatchObject({
+      rowId: 'acct-new',
+    })
+    // The next run finds the slot moved on and ends the earlier transfer
+    // without touching it; the one after adopts the late login.
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
       status: 'completed',
       rowId: 'acct-new',
+      placeholder: 'slot-moved-on',
+    })
+    expect((await h.slotValue())?.refresh).toBe('r-late')
+    expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+      status: 'completed',
+      rowId: 'acct-late',
       placeholder: 'written',
     })
-    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
-    expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main', 'r-new'])
+    expect(await poolTokens(h)).toEqual(['r-fb1', 'r-late', 'r-main', 'r-new'])
   })
 
   it('waits for an older build refreshing the target row under its fallback lock, then adopts', async () => {

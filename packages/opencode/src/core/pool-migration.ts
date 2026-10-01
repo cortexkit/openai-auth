@@ -297,6 +297,7 @@ export type PoolTransferOutcome =
         | 'lock-contention'
         | 'verify-failed'
         | 'torn-read'
+        | 'slot-changed'
         | 'unsettled'
         | `store-${string}`
     }
@@ -436,6 +437,46 @@ async function acquireLock(
     if (performance.now() - started >= ctx.locks.timeoutMs)
       throw new LegacyLockContention(name)
     await ctx.sleep(ctx.locks.retryMs)
+  }
+}
+
+/**
+ * Runs `write` holding the legacy `main-refresh` lock at the config path.
+ * Every writer of OpenCode's `openai` slot in this plugin holds that lock:
+ * the slot refresh (`refreshMainWithLease` in `index.ts`), the placeholder
+ * write below (`finishTransfer`) and the auth doctor's restore repair. So
+ * none of them can land between another one's last read of the slot and
+ * its write. A held lock is waited for up to the legacy lock timeout; then
+ * this throws without running `write`. `write` must not take the lock
+ * again: it is a plain file lock, not re-entrant.
+ */
+export async function withMainRefreshLock<T>(
+  configPath: string,
+  write: () => Promise<T>,
+  options: Partial<LegacyLockOptions> = {},
+): Promise<T> {
+  const locks = { ...LEGACY_LOCK_DEFAULTS, ...options }
+  const started = performance.now()
+  for (;;) {
+    const lock = await acquireRefreshFileLock({
+      name: MAIN_REFRESH_LOCK_NAME,
+      path: configPath,
+      ttlMs: locks.mainRefreshTtlMs,
+      renew: locks.renew,
+      ...(locks.renewIntervalMs !== undefined
+        ? { renewIntervalMs: locks.renewIntervalMs }
+        : {}),
+    })
+    if (lock) {
+      try {
+        return await write()
+      } finally {
+        await lock.release().catch(() => {})
+      }
+    }
+    if (performance.now() - started >= locks.timeoutMs)
+      throw new LegacyLockContention(MAIN_REFRESH_LOCK_NAME)
+    await new Promise((resolve) => setTimeout(resolve, locks.retryMs))
   }
 }
 
@@ -1080,9 +1121,13 @@ async function writeRecord(
 
 /**
  * Puts the placeholder into the slot through the fence: the slot must still
- * hold exactly the (access, refresh) pair the record names. OpenCode's slot
- * has no compare-and-replace, so a login landing between the fence read and
- * the write is overwritten; that window is declared, not closed.
+ * hold exactly the (access, refresh) pair the record names, read again
+ * right before the write. OpenCode's slot has no compare-and-replace, so a
+ * login the host itself writes (its own `/login`, which takes no lock of
+ * ours) between that last read and the write is still overwritten; that
+ * window, the time one slot read and one slot write take, is declared, not
+ * closed. The plugin's own slot writers all hold `main-refresh` and so
+ * cannot land in it.
  *
  * It runs under the legacy `main-refresh` lock, taken here on its own after
  * the row write (never before the store's row lock: see the lock-order note
@@ -1180,6 +1225,20 @@ async function finishUnderMainLock(
   // the shield goes. A crash in between leaves exactly that, and the next
   // run finds the placeholder and drops the shield.
   await ctx.onStep('before-placeholder-write')
+  // The fence read above can take a while (a confirmed read may sleep
+  // between two reads), so the slot is read once more immediately before
+  // the write. Every slot writer of this plugin holds `main-refresh`, which
+  // this run holds, so only the host's own login can land here. Any change
+  // ends the run retryably with the record kept: the next run's fence read
+  // sees the new value and leaves it in the slot.
+  const last = await ctx.slot.get({ path: { id: PROVIDER } })
+  const lastView =
+    last === undefined || last === null ? undefined : viewOf(last)
+  if (
+    lastView?.kind !== 'real' ||
+    lastView.fingerprint !== record.slotFingerprint
+  )
+    return { status: 'retry', reason: 'slot-changed' }
   await ctx.slot.set({ path: { id: PROVIDER }, body: { ...POOL_PLACEHOLDER } })
   await ctx.onStep('after-placeholder-write')
   const readback = await ctx.slot.get({ path: { id: PROVIDER } })
