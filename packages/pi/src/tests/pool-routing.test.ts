@@ -312,9 +312,9 @@ describe('Pi requests on the account pool', () => {
       })
     }
     const runtime = makeRuntime()
-    await runtime.start()
-    runtime.main.observeToken(MAIN_TOKEN)
-    await runtime.main.pending()
+    // Every account's first reading lands before the first request, which is
+    // what starts the refresh.
+    await ready(runtime)
     await setMode('fallback-first')
 
     // The refresh is held, so this request is served without alpha.
