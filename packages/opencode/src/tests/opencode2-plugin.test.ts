@@ -429,7 +429,7 @@ describe('OpenCode 2 entry: logins', () => {
         refresh: 'host-refresh',
         expires: Date.now() + 3600_000,
         metadata: { accountID: 'chatgpt-host' },
-      } as Credential.Value,
+      } as unknown as Credential.Value,
     })
     await stop()
     const row = files
@@ -630,9 +630,10 @@ describe('OpenCode 2 adapter: event rules', () => {
       now,
     )
     expect(quota?.quota?.complete).toBe(true)
-    expect(
-      (quota?.quota?.snapshot.primary as { usedPercent: number }).usedPercent,
-    ).toBe(12)
+    const primary = quota?.quota?.snapshot.primary as
+      | { usedPercent: number }
+      | undefined
+    expect(primary?.usedPercent).toBe(12)
     expect(quotaFromCodexHeaders(new Headers({ 'x-other': '1' }))).toBe(
       undefined,
     )
