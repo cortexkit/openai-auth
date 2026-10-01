@@ -22,6 +22,7 @@
 // core): each attempt on one sends with the token the vault serves for it.
 
 import { statSync } from 'node:fs'
+import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
 import {
   type AccountPaths,
@@ -179,13 +180,15 @@ export class PiOpenAIRuntime {
   readonly vault: OpenAiVault
   private readonly deps: PiOpenAIRuntimeDeps
   /**
-   * The vault account (and the account the vault served it for) behind each
-   * recent vault token, newest last, so a rate-limit frame arriving on a
-   * WebSocket opened with one is recorded against that account.
+   * The vault account behind each recent vault token, with the receipt the
+   * vault served the token under, newest last, so a rate-limit frame
+   * arriving on a WebSocket opened with one is recorded against that
+   * account. The vault keeps a reading only while the account still holds
+   * the receipt's credential and ChatGPT account.
    */
   private readonly vaultTokens = new Map<
     string,
-    { id: string; accountIdentity?: string }
+    { id: string; receipt: QuotaReceipt }
   >()
   private readonly now: () => number
   private readonly paths: () => AccountPaths
@@ -380,7 +383,7 @@ export class PiOpenAIRuntime {
 
   private rememberVaultToken(
     token: string,
-    entry: { id: string; accountIdentity?: string },
+    entry: { id: string; receipt: QuotaReceipt },
   ): void {
     this.vaultTokens.delete(token)
     this.vaultTokens.set(token, entry)
@@ -405,7 +408,12 @@ export class PiOpenAIRuntime {
     const complete = isCompleteQuotaHeaderFrame(parsed)
     const vaultEntry = this.vaultTokens.get(token)
     if (vaultEntry?.id === accountId)
-      void this.vault.recordSnapshot(accountId, snapshot, complete, vaultEntry)
+      void this.vault.recordSnapshot(
+        accountId,
+        snapshot,
+        complete,
+        vaultEntry.receipt,
+      )
     else if (accountId === FORMER_MAIN_ID)
       this.main.record(snapshot, token, complete)
     else this.pool.recordSnapshot(accountId, snapshot, token, complete)
@@ -421,7 +429,12 @@ export class PiOpenAIRuntime {
     if (this.main.record(snapshot, token, true)) return
     const vaultEntry = this.vaultTokens.get(token)
     if (vaultEntry) {
-      void this.vault.recordSnapshot(vaultEntry.id, snapshot, true, vaultEntry)
+      void this.vault.recordSnapshot(
+        vaultEntry.id,
+        snapshot,
+        true,
+        vaultEntry.receipt,
+      )
       return
     }
     const row = this.pool.rowForToken(token)
@@ -610,11 +623,19 @@ export class PiOpenAIRuntime {
     const response = await this.vault.send(
       accountId,
       async (token, attempt) => {
+        // Only the receipt's attribution fields are kept, never the token.
         this.rememberVaultToken(token, {
           id: accountId,
-          ...(attempt.accountIdentity !== undefined
-            ? { accountIdentity: attempt.accountIdentity }
-            : {}),
+          receipt: {
+            credentialId: attempt.credentialId,
+            accountIdentitySource: attempt.accountIdentitySource,
+            ...(attempt.accountIdentity !== undefined
+              ? { accountIdentity: attempt.accountIdentity }
+              : {}),
+            ...(attempt.expectedAccountIdentity !== undefined
+              ? { expectedAccountIdentity: attempt.expectedAccountIdentity }
+              : {}),
+          },
         })
         // An attempt the vault retries is dropped unread: it ended without
         // streaming, so nothing of it reached Pi.

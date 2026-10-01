@@ -715,10 +715,18 @@ describe('CacheKeepManager tick/prewarm', () => {
       meta: { replayHeaders: {}, chatgptAccountId: undefined },
     })
 
-    // Advance past maxSubagentIdleMs (30 min) — pre-change the idle prune would
-    // kill the target here, before it can warm even once. Post-change the
-    // 2-warm cap governs instead, so the target survives and gets its first warm.
-    clock.advance(31 * 60 * 1000)
+    // The first warm is due inside the lead window, just before the cache
+    // expires. A warm is never sent after the expiry (that would rebuild a
+    // cold cache), so the clock stops short of it instead of jumping past.
+    clock.advance(longTtl - LEAD_MS / 2)
+    await mgr.tick()
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+
+    // Now past maxSubagentIdleMs (30 min) with no new real request: the
+    // default subagent idle bound would prune the target here, before its
+    // second warm. The gpt-5.6 subagent profile's longer bound and its
+    // 2-warm cap govern instead, so the target survives.
+    clock.advance(2 * 60 * 1000)
     await mgr.tick()
 
     expect(mgr.status().tracked).toBe(1)

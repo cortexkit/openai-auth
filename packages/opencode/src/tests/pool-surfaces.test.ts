@@ -358,9 +358,10 @@ describe('cachekeep and reset credits on a migrated install', () => {
       | undefined
     if (!manager) throw new Error('no cachekeep manager')
 
-    // Track one session per account, move both cache expiries to now so the
-    // tick warms them, and check that each warm request carries the bearer
-    // the plugin resolved for that account.
+    // Track one session per account, move both cache expiries to just ahead
+    // of now (inside the warm's lead window; a cache already expired is
+    // retired, never warmed) so the tick warms them, and check that each warm
+    // request carries the bearer the plugin resolved for that account.
     const body = JSON.stringify({ model: 'gpt-5.5', input: [] })
     for (const accountId of ['main', 'fallback-1']) {
       manager.track({
@@ -375,7 +376,8 @@ describe('cachekeep and reset credits on a migrated install', () => {
         targets: Map<string, { cacheExpiresAt: number }>
       }
     ).targets
-    for (const target of targets.values()) target.cacheExpiresAt = Date.now()
+    for (const target of targets.values())
+      target.cacheExpiresAt = Date.now() + 1_000
     const before = wire.sends.length
     await manager.tick()
 

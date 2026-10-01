@@ -24,6 +24,7 @@
 // signing in as a ChatGPT account the vault holds is left out, so one account
 // has one owner.
 
+import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import { isQuotaMap } from '@cortexkit/common-auth/quota'
 import {
   nextOrderedAttempt,
@@ -112,10 +113,7 @@ export interface PoolVaultRoutes {
    */
   send(
     id: string,
-    dispatch: (
-      token: string,
-      attempt: { accountIdentity?: string },
-    ) => Promise<Response>,
+    dispatch: (token: string, attempt: QuotaReceipt) => Promise<Response>,
   ): Promise<Response | undefined>
   /** Asks for a quota reading of a vault account admission refused for want of one. */
   requestReading(id: string): void
@@ -144,7 +142,7 @@ export interface PoolRequestContext {
     response: Response,
     target: PoolTarget,
     token: string,
-    attempt?: { accountIdentity?: string },
+    attempt?: QuotaReceipt,
   ): void
   /** The session pin ledger: decides (and, when asked, records) a session's pin. */
   placePin(input: PoolPinPlacement): { accountId: string } | undefined

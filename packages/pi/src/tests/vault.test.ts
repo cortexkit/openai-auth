@@ -13,6 +13,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readClaustrumEnrollmentToken } from '@cortexkit/common-auth/claustrum'
+import { projectQuota } from '@cortexkit/common-auth/quota'
 import {
   type AccountPaths,
   mutateAccounts,
@@ -282,6 +283,136 @@ describe('Pi and the Claustrum vault', () => {
     ])
     expect(codexTokens).toEqual([chatgptAccessToken('chatgpt-b')])
     target.close()
+  })
+
+  test('the Vault section says when the vault listed records it could not read', async () => {
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: {
+        'oauth:openai:work': vaultLogin('chatgpt-work'),
+        // A record with no state is skipped as unusable, which makes the
+        // whole list incomplete.
+        'oauth:openai:broken': { ...vaultLogin('chatgpt-broken'), state: '' },
+      },
+    })
+    enroll()
+    const target = vault()
+    await target.refresh()
+    const vaultLines = async () => {
+      const { menu } = await createPiMenu(
+        runtimeWith(target).commandSupport(),
+      ).open({ notify: () => {} })
+      return (
+        menu.sections.find((section) => section.id === 'vault')?.lines ?? []
+      ).join('\n')
+    }
+
+    expect(target.snapshot()?.complete).toBe(false)
+    expect(await vaultLines()).toContain(
+      'accounts it did not list are kept as they were',
+    )
+    expect(target.routes()).toHaveLength(1)
+
+    // Once the vault lists every record usably, the note goes.
+    daemon.credentials['oauth:openai:broken'] = vaultLogin('chatgpt-broken')
+    await target.refresh()
+    expect(target.snapshot()?.complete).toBe(true)
+    expect(await vaultLines()).not.toContain('could not read')
+    target.close()
+  })
+
+  test('Connect names the vault it could not reach', async () => {
+    daemon = await startMockDaemon({ directory: dir, credentials: {} })
+    const unreachable = new OpenAiVault({
+      host: 'pi',
+      stateDir,
+      connectionFile: () => join(dir, 'no-vault-here.json'),
+      pollIntervalMs: 0,
+      fetchImpl: () => fakeFetch,
+    })
+    const menu = createPiMenu(runtimeWith(unreachable).commandSupport())
+
+    const result = await menu.apply(
+      { command: 'openai', sectionId: 'vault', actionId: 'connect' },
+      { notify: () => {} },
+    )
+
+    // The menu shows a generic line for an error it cannot vouch for; this
+    // one is written for the user, so its text and code reach them.
+    expect(result).toMatchObject({ ok: false, code: 'vault-unreachable' })
+    expect(result.text).toContain('Could not reach the Claustrum vault')
+    expect(result.text).toContain('Is the vault running?')
+    unreachable.close()
+  })
+
+  describe('a rate-limit frame on a socket opened with a vault token', () => {
+    const frame = JSON.stringify({
+      type: 'codex.rate_limits',
+      rate_limits: {
+        primary: { used_percent: 77, window_minutes: 300 },
+        secondary: { used_percent: 5, window_minutes: 10_080 },
+      },
+    })
+    const primaryUsed = (target: OpenAiVault) =>
+      target
+        .routes()
+        .map(
+          (route) =>
+            projectQuota(route.quota).limits.find(
+              (limit) => limit.label === 'primary' && limit.kind === 'reading',
+            )?.usedPercent,
+        )
+
+    async function served(): Promise<{
+      target: OpenAiVault
+      runtime: PiOpenAIRuntime
+    }> {
+      daemon = await startMockDaemon({
+        directory: dir,
+        credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+      })
+      enroll()
+      const target = vault()
+      const runtime = runtimeWith(target)
+      await target.refresh()
+      await target.pollStale(0)
+      await send(runtime)
+      expect(codexTokens).toEqual([VAULT_ACCESS])
+      expect(primaryUsed(target)).toEqual([10])
+      return { target, runtime }
+    }
+
+    test('is recorded on the vault account with the receipt the token was served under', async () => {
+      const { target, runtime } = await served()
+
+      runtime.observeWebSocketMessage(
+        { Authorization: `Bearer ${VAULT_ACCESS}` },
+        frame,
+      )
+
+      for (let i = 0; i < 200 && primaryUsed(target)[0] !== 77; i++)
+        await Bun.sleep(5)
+      expect(primaryUsed(target)).toEqual([77])
+      target.close()
+    })
+
+    test('is dropped once the vault credential signs in as another account', async () => {
+      const { target, runtime } = await served()
+      // The vault now serves the same credential for a different ChatGPT
+      // account: a frame from the socket the old account's token opened
+      // describes the old account and must not land on the new one.
+      daemon.credentials['oauth:openai:vault'] = vaultLogin('chatgpt-other')
+      await target.refresh()
+
+      runtime.observeWebSocketMessage(
+        { Authorization: `Bearer ${VAULT_ACCESS}` },
+        frame,
+      )
+
+      await Bun.sleep(50)
+      expect(primaryUsed(target)).not.toContain(77)
+      target.close()
+    })
   })
 
   test('a 401 on a vault account is reported to the vault with the version it was served', async () => {

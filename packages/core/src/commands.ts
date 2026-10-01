@@ -20,6 +20,7 @@ import {
   type CommandDialogPayload,
   type CommandInvocation,
   type CommandMenu,
+  CommandError,
   type CommandMenuModel,
   createCommandMenu,
   type PluginExtraSection,
@@ -74,6 +75,16 @@ export const OPENAI_MENU_TITLE = 'OpenAI accounts'
 
 /** The row the main account lives in once the install is migrated. */
 const MAIN_ROW_ID = 'main'
+
+/**
+ * Why a login of the main account's ChatGPT account is not added as a row:
+ * row `main` already holds that account (it is the host's own sign-in), so a
+ * second row would be the same account twice. Thrown
+ * as a `CommandError` so the menu shows it: the menu shows only a generic
+ * line for any other thrown error.
+ */
+const MAIN_ACCOUNT_REFUSAL =
+  'that account is already your main account, so it was not added again'
 
 const log = createLogger('commands')
 
@@ -336,9 +347,7 @@ export function withAccountRules(
       ? oauth.find((row) => row.identity === input.identity)
       : undefined
     if (sameAccount?.id === MAIN_ROW_ID)
-      throw new Error(
-        'that account is already your main account, so it was not added again',
-      )
+      throw new CommandError('main-account', MAIN_ACCOUNT_REFUSAL)
     const existing =
       sameAccount ??
       oauth.find((row) => row.id === input.id && row.id !== MAIN_ROW_ID)
@@ -613,9 +622,7 @@ export function menuLogin(
         if (account.accountId && main && account.accountId === main) {
           // The internal id only: the ChatGPT identity is sensitive.
           log.warn('account add rejected (main identity)', { id: account.id })
-          throw new Error(
-            'that account is already your main account, so it was not added again',
-          )
+          throw new CommandError('main-account', MAIN_ACCOUNT_REFUSAL)
         }
         log.info('account added', { id: account.id })
         return loginAddInput(account)
@@ -716,6 +723,13 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
                 status.accounts.length === 0
                   ? 'The vault serves no OpenAI account to this host yet.'
                   : `The vault serves ${status.accounts.length} OpenAI account${status.accounts.length === 1 ? '' : 's'}; ${routing} can route now.`,
+              ]
+            : []),
+          // A list with records this host could not read removes nothing:
+          // an account it did not list is kept as it was.
+          ...(connected && vault.snapshot()?.complete === false
+            ? [
+                "The vault's last list had records this host could not read; accounts it did not list are kept as they were until a complete list arrives.",
               ]
             : []),
           ...(status.lastError ? [`Last error: ${status.lastError}`] : []),

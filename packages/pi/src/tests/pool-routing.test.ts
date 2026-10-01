@@ -493,6 +493,63 @@ describe('Pi requests on the account pool', () => {
   })
 })
 
+describe('a Pi pool row whose replace stopped between its two writes', () => {
+  test('is completed by its first poll, which reads with the new login', async () => {
+    const BETA_NEW_TOKEN = jwt('acct-beta-new')
+    // A replace that wrote the new login's credential (state file) and died
+    // before the config write that records its account and epoch.
+    const crashing = openPoolStore({
+      provider: 'openai',
+      configPath: paths.configPath,
+      statePath: paths.statePath,
+      quota: quotaCodec,
+      onStep: (step, { operation }) => {
+        if (operation === 'replace' && step === 'before-config-write')
+          throw new Error('crash between the writes')
+      },
+    })
+    await expect(
+      crashing.replace(
+        'beta',
+        {
+          type: 'oauth',
+          access: BETA_NEW_TOKEN,
+          refresh: 'refresh-beta-new',
+          expires: Date.now() + 10 * 24 * HOUR_MS,
+        },
+        { identity: 'acct-beta-new' },
+      ),
+    ).rejects.toThrow()
+    const beta = async () => {
+      const load = await store().read()
+      return load.status === 'ready'
+        ? load.rows.find((row) => row.id === 'beta')
+        : undefined
+    }
+    expect(await beta()).toMatchObject({ torn: true, candidate: false })
+
+    // A torn row is never a candidate, so only its own poll makes it whole:
+    // the pull completes the replace from the stamp beside the credential,
+    // then polls with the new login.
+    const runtime = makeRuntime()
+    await ready(runtime)
+
+    const completed = await beta()
+    expect(completed).toMatchObject({
+      candidate: true,
+      credentialEpoch: 2,
+      identity: 'acct-beta-new',
+      needsFirstReading: false,
+    })
+    expect(completed?.torn).toBeUndefined()
+    const polledWith = calls
+      .filter((call) => call.url === WHAM_URL)
+      .map((call) => call.token)
+    expect(polledWith).toContain(BETA_NEW_TOKEN)
+    expect(polledWith).not.toContain(BETA_TOKEN)
+  })
+})
+
 describe('Pi /openai on the account pool', () => {
   test('lists the pool rows, and Pi login with its quota in a section of its own', async () => {
     const runtime = makeRuntime()
@@ -539,6 +596,31 @@ describe('Pi /openai on the account pool', () => {
       (section) => section.id === 'pi-login',
     )
     expect(login?.lines.join('\n')).toContain('primary: 7% used')
+  })
+
+  test('a failed quota check names the account that failed', async () => {
+    const runtime = makeRuntime()
+    await ready(runtime)
+    whamHandler = (call) =>
+      call.token === BETA_TOKEN
+        ? new Response('{}', { status: 500 })
+        : whamOk(10)
+
+    const result = await createPiMenu(runtime.commandSupport()).apply(
+      {
+        command: 'openai',
+        sectionId: 'quota',
+        actionId: 'check',
+        values: { account: '*' },
+      },
+      { notify: () => {} },
+    )
+
+    // The menu shows only a generic line for an error it cannot vouch for;
+    // this failure is written for the user, so its text and code reach them.
+    expect(result).toMatchObject({ ok: false, code: 'quota-check-failed' })
+    expect(result.text).toContain('beta: ')
+    expect(result.text).not.toContain('alpha')
   })
 
   test("the one registered command drives the menu with Pi's UI", async () => {

@@ -86,9 +86,13 @@ function stepsFrom(first: string, last: string): Set<string> {
  * downgrade to one after the crash, which is unsupported. Crash rows in this
  * window assert exactly that double refresh for the pre-tolerant build, and
  * that the fence is shut while it runs.
+ *
+ * The store's `add` writes the state file (the credential) first and the
+ * config (the roster row) second, and a credential no roster row names is
+ * loaded by no reader. So the window opens once the config write lands.
  */
 const PRE_TOLERANT_DOUBLE = stepsFrom(
-  'store:add:after-state-write',
+  'store:add:after-config-write',
   'before-placeholder-write',
 )
 
