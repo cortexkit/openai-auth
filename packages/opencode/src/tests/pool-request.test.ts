@@ -12,6 +12,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
+import { quotaCodec } from '@cortexkit/common-auth/quota'
+import { openPoolStore } from '@cortexkit/common-auth/store'
 import { fallbackRefreshLockName } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
 import { POOL_QUOTA_UNKNOWN_RETRY_SECONDS } from '../core/pool-routing.ts'
@@ -1201,4 +1203,81 @@ describe('the migrated request path never waits on the store locks', () => {
       )
     }, 30_000)
   }
+})
+
+describe('a row whose replace stopped between its two writes', () => {
+  it('is completed by its first poll, takes its first reading with the new login, and serves it', async () => {
+    seedPool('fallback-first', [
+      { id: 'main', quota: healthy() },
+      { id: 'fallback-1', quota: healthy() },
+    ])
+    // A replace that wrote the new login's credential (state file) and died
+    // before the config write that records its account and epoch.
+    const crashing = openPoolStore({
+      provider: 'openai',
+      configPath: configFile,
+      statePath: stateFile,
+      quota: quotaCodec,
+      onStep: (step, { operation }) => {
+        if (operation === 'replace' && step === 'before-config-write')
+          throw new Error('crash between the writes')
+      },
+    })
+    await expect(
+      crashing.replace(
+        'fallback-1',
+        {
+          type: 'oauth',
+          access: 'fallback-1-new-token',
+          refresh: 'fallback-1-new-refresh',
+          expires: Date.now() + 24 * HOUR,
+        },
+        { identity: 'chatgpt-fallback-1-new' },
+      ),
+    ).rejects.toThrow()
+    const reader = openPoolStore({
+      provider: 'openai',
+      configPath: configFile,
+      statePath: stateFile,
+      quota: quotaCodec,
+    })
+    const tornRow = async () => {
+      const load = await reader.read()
+      return load.status === 'ready'
+        ? load.rows.find((row) => row.id === 'fallback-1')
+        : undefined
+    }
+    expect(await tornRow()).toMatchObject({ torn: true, candidate: false })
+
+    // Loading the plugin polls the torn row (it is never a candidate, so
+    // only its own poll heals it): the pull first completes the replace from
+    // the stamp beside the credential, then polls with the new login, and
+    // that first reading is the new account's.
+    const wire = installWire()
+    const fetchOverride = await loadFetch()
+    let completed = await tornRow()
+    for (
+      const deadline = Date.now() + 10_000;
+      (completed?.torn || completed?.needsFirstReading) &&
+      Date.now() < deadline;
+      completed = await tornRow()
+    )
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(completed).toMatchObject({
+      candidate: true,
+      credentialEpoch: 2,
+      identity: 'chatgpt-fallback-1-new',
+    })
+    expect(completed?.torn).toBeUndefined()
+
+    // fallback-first tries fallback-1 first: it serves with the new login.
+    // The credential the replace retired never reaches the wire.
+    const response = await fetchOverride(URL_RESPONSES, request('torn'))
+    expect(response.status).toBe(200)
+    expect(wire.sends).toEqual(['Bearer fallback-1-new-token'])
+    expect(wire.polls).toContain('Bearer fallback-1-new-token')
+    expect([...wire.sends, ...wire.polls]).not.toContain(
+      'Bearer fallback-1-token',
+    )
+  }, 30_000)
 })

@@ -4,7 +4,7 @@
 // the slot fence and its declared race, and refreshing a pool row while
 // older builds may refresh the same token.
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
@@ -511,6 +511,57 @@ describe('adoption of a later login in the slot', () => {
     expect(main?.credential).toMatchObject({
       access: jwt('acct-main', 'fresh-access'),
     })
+  })
+
+  it('a rotation whose row learned another account after the transfer read it is refused, writes nothing and is retried', async () => {
+    await migrated()
+    // Row `main` with no recorded account, so the transfer passes the slot's
+    // account to the rotation.
+    const unrecorded = await h.config()
+    for (const account of unrecorded.accounts as Array<Record<string, unknown>>)
+      if (account.id === 'main') delete account.accountId
+    writeFileSync(h.paths.configPath, JSON.stringify(unrecorded, null, 2))
+    expect((await h.row('main'))?.identity).toBeUndefined()
+    await h.setSlot(login('acct-main', 'r-main', 'fresh-access'))
+
+    // Another writer records a different account on the row after the
+    // transfer read it and before the rotation's own locked re-read.
+    let raced = false
+    const outcome = await adoptHostSlotLogin(
+      h.deps({
+        store: {
+          onLockEvent: (event) => {
+            if (raced || event.type !== 'acquired') return
+            if (!event.name.startsWith('row-')) return
+            raced = true
+            const config = JSON.parse(
+              readFileSync(h.paths.configPath, 'utf8'),
+            ) as { accounts: Array<Record<string, unknown>> }
+            for (const account of config.accounts)
+              if (account.id === 'main') account.accountId = 'acct-other'
+            writeFileSync(h.paths.configPath, JSON.stringify(config, null, 2))
+          },
+        },
+      }),
+    )
+
+    expect(raced).toBe(true)
+    // The store never records a second account on the row. Recording the
+    // first one moved the row's lock key (an unrecorded row is locked by its
+    // id, a recorded one by its account), so the store refuses at its locked
+    // re-read before comparing the accounts. Either refusal writes nothing,
+    // and the run ends retryably (the next run reads the row again) instead
+    // of failing.
+    expect(outcome).toEqual({
+      status: 'retry',
+      reason: 'store-row-key-changed',
+    })
+    const main = await h.row('main')
+    expect(main?.identity).toBe('acct-other')
+    expect(main?.credential).not.toMatchObject({
+      access: jwt('acct-main', 'fresh-access'),
+    })
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(false)
   })
 
   it('a re-login with a different token replaces the row and bumps its credential epoch', async () => {

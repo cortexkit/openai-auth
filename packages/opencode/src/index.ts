@@ -4282,14 +4282,16 @@ export async function CodexAuthPlugin(
                   served.headers,
                 ) as Record<string, unknown>
                 const complete = isCompleteQuotaHeaderFrame(served.headers)
-                // A vault account's quota lives in the vault roster.
+                // A vault account's quota lives in the vault roster, and is
+                // kept only with the receipt the response was served under.
                 if (!target.row) {
-                  void vault.recordSnapshot(
-                    target.id,
-                    snapshot,
-                    complete,
-                    attempt,
-                  )
+                  if (attempt)
+                    void vault.recordSnapshot(
+                      target.id,
+                      snapshot,
+                      complete,
+                      attempt,
+                    )
                   return
                 }
                 pushQuota(

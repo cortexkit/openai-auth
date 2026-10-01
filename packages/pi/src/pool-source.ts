@@ -458,7 +458,13 @@ export class PiPoolSource {
   private pollUnseenRows(): void {
     if (this.disposed) return
     for (const row of this.snapshot.rows) {
-      if (!row.candidate || row.type !== 'oauth') continue
+      // An enabled OAuth row torn by a replace that stopped between its two
+      // writes is never a candidate until a store write completes it. The
+      // poll's pull is such a write (it completes the row before reading the
+      // credential), so it is polled too; the store's own `load()` would fire
+      // the same pull, but this source reads with `read()`.
+      const torn = row.torn === true && row.enabled
+      if (!(row.candidate || torn) || row.type !== 'oauth') continue
       const key = `${row.id}\u0000${row.credentialEpoch ?? 0}\u0000${row.identity ?? ''}`
       if (this.polled.has(key)) continue
       this.polled.add(key)

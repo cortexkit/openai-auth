@@ -37,10 +37,12 @@ import {
   connectClaustrumScopedClient,
   enrollmentName,
   hostEnrollmentPaths,
+  type QuotaReceipt,
   readClaustrumEnrollmentStatus,
   type VaultRosterFile,
   type VaultRosterRow,
 } from '@cortexkit/common-auth/claustrum'
+import { CommandError } from '@cortexkit/common-auth/commands'
 import { projectQuota, type QuotaMap } from '@cortexkit/common-auth/quota'
 import { createLogger } from './logger'
 import { extractAccountIdFromClaims, parseJwtClaims } from './oauth'
@@ -425,14 +427,18 @@ export class OpenAiVault {
 
   /**
    * Records a quota snapshot (response headers, a WebSocket rate-limit frame,
-   * a usage poll) for a vault account, fenced on the account the attempt was
-   * served for. Runs in the background; a failure is logged.
+   * a usage poll) for a vault account. `receipt` is what the send that
+   * produced the reading was served with (its credential id and the account
+   * it was bound to, and how that account was known); the reading is kept
+   * only while the route still holds that credential and account, so a
+   * reading taken before the vault replaced the account is dropped. Runs in
+   * the background; a failure is logged.
    */
   recordSnapshot(
     routeId: string,
     snapshot: unknown,
     complete: boolean,
-    attempt?: Pick<ClaustrumScopedAttempt, 'accountIdentity'>,
+    receipt: QuotaReceipt,
   ): Promise<void> {
     const observation = observationFromSnapshot(
       snapshot,
@@ -440,7 +446,7 @@ export class OpenAiVault {
       complete,
     )
     if (!observation) return Promise.resolve()
-    return this.#consumer.recordQuota(routeId, observation, attempt).then(
+    return this.#consumer.recordQuota(routeId, observation, receipt).then(
       () => {},
       (error: unknown) => this.#fail('vault quota write failed', error),
     )
@@ -557,7 +563,10 @@ export class OpenAiVault {
    */
   async connectStep(): Promise<ClaustrumEnrollmentStatus> {
     const client = await this.#connectEnrollment().catch((error: unknown) => {
-      throw new Error(
+      // A CommandError, so the `/openai` menu's Connect shows this message
+      // (the menu shows a generic line for any other thrown error).
+      throw new CommandError(
+        'vault-unreachable',
         `Could not reach the Claustrum vault (${this.#connectionFile()}): ${errorMessage(error)}. Is the vault running?`,
       )
     })

@@ -228,6 +228,22 @@ function readMigratedAt(configPath: string): number | undefined {
   }
 }
 
+/**
+ * Whether a row gets its first quota poll: a candidate OAuth row, or an
+ * enabled OAuth row marked `torn`. A row is torn when a credential replace
+ * wrote the new credential to the state file and stopped before its config
+ * write (the new account and epoch); the store then never offers it for
+ * routing (`candidate` is false) until its next write on the row records
+ * what the state file says. A quota poll is such a write: the store's pull
+ * completes the row before it reads the credential to poll with, so polling
+ * a torn row is what makes it routable again. The store's own `load()` would
+ * fire that pull, but this source reads with `read()`, which fires nothing.
+ */
+function pollable(row: PoolRow): boolean {
+  if (row.type !== 'oauth') return false
+  return row.candidate || (row.torn === true && row.enabled)
+}
+
 /** The key account state is partitioned by: the wire identity, else the row id. */
 function accountKey(row: Pick<PoolRow, 'id' | 'identity'>): string {
   return row.identity ? `identity:${row.identity}` : `row:${row.id}`
@@ -522,8 +538,7 @@ export class PoolAccountSource {
       return
     }
     for (const row of this.snapshot.rows) {
-      if (!row.candidate || row.type !== 'oauth' || this.vaultOwned(row))
-        continue
+      if (!pollable(row) || this.vaultOwned(row)) continue
       const key = `${row.id}\u0000${row.credentialEpoch ?? 0}\u0000${row.identity ?? ''}`
       if (this.polled.has(key)) continue
       this.polled.add(key)

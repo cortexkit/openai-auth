@@ -11,7 +11,10 @@
  * by field and scrubs credential-shaped names, so nothing here builds a
  * payload of its own.
  */
-import type { CommandMenuModel } from '@cortexkit/common-auth/commands'
+import {
+  CommandError,
+  type CommandMenuModel,
+} from '@cortexkit/common-auth/commands'
 import type { PoolStore } from '@cortexkit/common-auth/store'
 import {
   type ApplyRequest,
@@ -437,8 +440,11 @@ export function createOpenCodeMenu(ctx: OpenCodeMenuContext) {
           quotaCheck: async () => {
             const results = (await ctx.refreshAllQuota?.()) ?? []
             const failures = results.filter((result) => !result.ok)
+            // A CommandError, so the menu shows which accounts failed and
+            // what to do (it shows a generic line for any other error).
             if (failures.length > 0)
-              throw new Error(
+              throw new CommandError(
+                'quota-check-failed',
                 failures
                   .map((failure) =>
                     failure.permanent

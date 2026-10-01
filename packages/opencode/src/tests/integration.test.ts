@@ -4283,8 +4283,10 @@ describe('integration: active fallback routing', () => {
       if (!manager) throw new Error('missing cachekeep manager')
 
       // The session is still pinned to the account that served it
-      // (fallback-2), so the warm replays there.
-      now += 5 * 60_000
+      // (fallback-2), so the warm replays there. Four minutes is inside the
+      // warm's lead window but before the five-minute cache expires: a
+      // target is never warmed after its cache has expired.
+      now += 4 * 60_000
       await manager.tick()
       expect(sends).toEqual([
         'Bearer fallback-2-token',
@@ -4293,11 +4295,13 @@ describe('integration: active fallback routing', () => {
 
       // Another process moves the session's pin to fallback-1, so the prompt
       // cache on fallback-2 is no longer the one its next request will use.
+      // The warm above kept the cache alive, so the target is still live
+      // here and is dropped for the move, not for an expired cache.
       const state = JSON.parse(readFileSync(sidebarFile, 'utf8'))
       state.stickyAssignments[hashSidebarSessionId('moved-session')].accountId =
         'fallback-1'
       writeFileSync(sidebarFile, JSON.stringify(state))
-      now += 5 * 60_000
+      now += 4 * 60_000
       await manager.tick()
       expect(sends).toHaveLength(2)
       expect(manager.status().tracked).toBe(0)
@@ -5167,7 +5171,6 @@ describe('integration: active fallback routing', () => {
         responseRequestInit({ 'session-id': 'main-session' }),
       )
 
-      now += 60 * 60_000 + 1
       await cacheKeep('sustain on')
       const manager = (
         globalThis as typeof globalThis & {
@@ -5182,7 +5185,16 @@ describe('integration: active fallback routing', () => {
       ).__openaiAuthCacheKeepManagers?.get(getConfigPath())
       if (!manager) throw new Error('missing cachekeep manager')
 
-      await manager.tick()
+      // Past the one-hour main idle bound with no new real request. A target
+      // retires once its cache expires, so the clock moves in four-minute
+      // ticks (inside the five-minute cache, within the warm's lead window)
+      // and each warm keeps the cache alive; only the idle bound is left to
+      // prune it, and sustain lifts that bound for main sessions.
+      const idleBoundPassed = now + 60 * 60_000 + 1
+      while (now < idleBoundPassed) {
+        now = Math.min(now + 4 * 60_000, idleBoundPassed)
+        await manager.tick()
+      }
       expect(manager.status()).toMatchObject({ tracked: 1, sustain: true })
     } finally {
       Date.now = originalNow
@@ -7288,7 +7300,9 @@ describe('integration: active fallback routing', () => {
             request,
           )
           await response.text()
-          now += 30 * 60_000
+          // gpt-5.6 caches live 30 minutes; the warm is due inside the lead
+          // window before that, and is never sent once the cache expired.
+          now += 29 * 60_000
           const manager = (
             globalThis as typeof globalThis & {
               __openaiAuthCacheKeepManagers?: Map<

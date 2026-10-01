@@ -7,6 +7,7 @@
 // account again as a row. Its Vault section connects Pi to the Claustrum
 // vault, whose OpenAI accounts are then routed beside these.
 import {
+  CommandError,
   type CommandMenu,
   runPiCommandMenu,
 } from '@cortexkit/common-auth/commands'
@@ -89,8 +90,11 @@ export function createPiMenu(
       const failures = (await pool.refreshAllQuota()).filter(
         (result) => !result.ok,
       )
+      // A CommandError, so the menu shows which accounts failed and why (it
+      // shows a generic line for any other error); the text is still redacted.
       if (failures.length > 0)
-        throw new Error(
+        throw new CommandError(
+          'quota-check-failed',
           failures
             .map(
               (failure) =>
