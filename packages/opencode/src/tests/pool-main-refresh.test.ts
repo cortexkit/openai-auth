@@ -80,6 +80,11 @@ type Slot = { type: 'oauth'; access: string; refresh: string; expires: number }
 async function loadFetch(slot: () => Slot) {
   hooks = await CodexAuthPlugin(mockPluginInput(), {
     experimentalWebSockets: false,
+    // These tests drive the slot refresh on its own. A background migration
+    // run would hold the run lock, and a live run owns any pending record
+    // (see `reclaimExpiredPoolTransfer`), so the refresh would rightly stand
+    // down for it; the migration's own handling is covered elsewhere.
+    poolMigration: { enabled: false },
   })
   const loader = hooks.auth?.loader
   if (!loader) throw new Error('No auth loader')

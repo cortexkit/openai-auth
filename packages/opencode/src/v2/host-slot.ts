@@ -31,8 +31,8 @@ import {
   stat,
   writeFile,
 } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname } from 'node:path'
+import { opencodeAuthPath } from '../core/host-slot'
 import type { HostSlotAdapter } from '../core/pool-migration'
 
 /**
@@ -54,8 +54,7 @@ export const NO_OPENCODE1_LOGINS = '(no OpenCode 1 logins on this machine)'
 export function opencode1AuthPath(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const dataHome = env.XDG_DATA_HOME || join(homedir(), '.local', 'share')
-  return join(dataHome, 'opencode', 'auth.json')
+  return opencodeAuthPath(env)
 }
 
 async function readAuthMap(

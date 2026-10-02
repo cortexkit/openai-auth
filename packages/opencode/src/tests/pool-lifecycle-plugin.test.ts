@@ -63,9 +63,14 @@ beforeEach(() => {
   // A state home of its own: no other plugin process is visible to the
   // version fence, and this one's heartbeat lands here.
   process.env.XDG_STATE_HOME = join(dir, 'state')
+  // OpenCode 1's data directory, where the plugin reads the login slot.
+  process.env.XDG_DATA_HOME = join(dir, 'data')
+  mkdirSync(join(dir, 'data', 'opencode'), { recursive: true })
   process.env.NODE_ENV = 'test'
   __resetProcessHeartbeatForTest()
-  slot = fileSlot(join(dir, 'auth.json'))
+  // OpenCode 1's own reads and writes of the slot, for the test to use and
+  // for the plugin client's `auth.set`.
+  slot = fileSlot(join(dir, 'data', 'opencode', 'auth.json'))
   originalFetch = globalThis.fetch
   hooks = undefined
 })
@@ -80,6 +85,7 @@ afterEach(async () => {
   process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
   restoreEnv('OPENCODE_CONFIG_DIR')
   restoreEnv('XDG_STATE_HOME')
+  restoreEnv('XDG_DATA_HOME')
   delete process.env.NODE_ENV
 })
 
@@ -178,14 +184,43 @@ type PoolOptions = Partial<
   Pick<PoolLifecycleDeps, 'fence' | 'migrate' | 'adopt' | 'runDeps' | 'log'>
 > & { enabled?: boolean }
 
+/**
+ * OpenCode 1's plugin client `auth`, shaped exactly as its generated SDK
+ * class: it has no way to read a login, only these five methods, and it
+ * reports a request's result as `{ data }` or `{ error }` instead of
+ * throwing. `set` writes the file the way OpenCode 1's server does.
+ */
+function opencode1SdkAuth() {
+  const envelope = (data: unknown) => ({
+    data,
+    request: new Request('http://opencode.internal/auth'),
+    response: new Response(null, { status: 200 }),
+  })
+  class Auth {
+    async remove() {
+      return envelope(true)
+    }
+    async start() {
+      return envelope({})
+    }
+    async callback() {
+      return envelope(true)
+    }
+    async authenticate() {
+      return envelope({})
+    }
+    async set(options: { path: { id: string }; body: unknown }) {
+      await slot.set(options)
+      return envelope(true)
+    }
+  }
+  return new Auth()
+}
+
 function pluginInput(): PluginInput {
   return {
     client: {
-      auth: {
-        get: slot.get,
-        set: slot.set,
-        all: slot.all,
-      },
+      auth: opencode1SdkAuth(),
       session: { promptAsync: async () => {} },
     } as unknown as PluginInput['client'],
     project: { id: 'test', name: 'test' } as unknown as PluginInput['project'],
@@ -357,6 +392,72 @@ describe('the migration after the loader starts', () => {
     expect(wire.refreshTokens).toEqual(['r-main'])
     expect(wire.sends).toEqual(['Bearer refreshed-access'])
     expect(isPoolPlaceholder(await slotValue())).toBe(true)
+  })
+})
+
+describe("on OpenCode 1's plugin client", () => {
+  it('migrates through a client that can only write the slot', async () => {
+    const auth = opencode1SdkAuth()
+    // The client the plugin gets: the five methods of OpenCode 1's SDK, and
+    // nothing that reads a login.
+    expect(
+      Object.getOwnPropertyNames(Object.getPrototypeOf(auth))
+        .filter((name) => name !== 'constructor')
+        .sort(),
+    ).toEqual(['authenticate', 'callback', 'remove', 'set', 'start'])
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        mainAccountId: 'acct-main',
+      }),
+    )
+    await setSlot(login('acct-main', 'r-main'))
+    installWire({ usage: true })
+    await loadPlugin({ enabled: undefined })
+    await waitFor(
+      async () => readJson(configFile)[POOL_MIGRATION_KEY]?.migratedAt > 0,
+      'the migration marker',
+    )
+    expect(isPoolPlaceholder(await slotValue())).toBe(true)
+    const config = readJson(configFile)
+    expect(config.commonAuthPool).toBeDefined()
+    expect('mainAccountId' in config).toBe(false)
+    expect(readJson(stateFile).accounts.main).toMatchObject({
+      access: jwt('acct-main'),
+      refresh: 'r-main',
+    })
+  })
+
+  it('says why it runs without the migration when the client cannot write the slot', async () => {
+    await seedLegacy()
+    installWire()
+    const warnings: Array<{ message: string; data: unknown }> = []
+    const input = pluginInput()
+    ;(input.client as unknown as { auth: unknown }).auth = {}
+    hooks = await CodexAuthPlugin(input, {
+      experimentalWebSockets: false,
+      poolMigration: {
+        enabled: true,
+        log: {
+          info: () => {},
+          warn: (message: string, data?: unknown) => {
+            warnings.push({ message, data })
+          },
+        },
+      },
+    })
+    expect(warnings).toEqual([
+      {
+        message: 'account pool migration is off for this OpenCode client',
+        data: {
+          reason:
+            'the OpenCode client has no auth.set to write its login slot with',
+        },
+      },
+    ])
   })
 })
 
