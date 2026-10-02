@@ -1985,6 +1985,23 @@ export async function migrateIfNeeded(
 ) {
   const path = paths.configPath
   const statePath = paths.statePath
+  // Every OpenCode session start runs this, and nearly always there is
+  // nothing to do. Find that out without the lock: writes replace the file by
+  // rename, so a lock-free read sees a whole file, and an account store never
+  // stops being one. Waiting for the lock only to learn that would let a busy
+  // host (a saturated event loop, other writers) fail the session start on a
+  // timeout. A read that fails falls through to the locked path, which
+  // reports it.
+  if (!existingToken) return
+  try {
+    const current = await readJsonIfPresent(path)
+    if (
+      current.exists &&
+      isRecord(current.value) &&
+      isAccountStore(current.value)
+    )
+      return
+  } catch {}
   const lock = await acquireSaveAccountsLock(path)
   try {
     const stateLock = await acquireSaveAccountsLock(statePath)

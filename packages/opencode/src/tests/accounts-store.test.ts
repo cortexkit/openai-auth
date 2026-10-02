@@ -775,6 +775,40 @@ describe('account store migration locking', () => {
     expect(readFileSync(cfgPath, 'utf8')).toBe(firstConfig)
     expect(readFileSync(statePath, 'utf8')).toBe(firstState)
   })
+
+  it('returns at once on an already migrated store while another writer holds the lock', async () => {
+    // Every session start calls this. On a migrated store it must not wait
+    // for the save lock: a held lock, or an event loop too busy to retry in
+    // time, used to fail the whole session start after 15 s.
+    const { migrateIfNeeded } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
+    const token = {
+      type: 'oauth' as const,
+      access: 'first-access',
+      refresh: 'first-refresh',
+      expires: Date.now() + 3600_000,
+    }
+    await migrateIfNeeded(token, getAccountPaths(cfgPath))
+    const firstConfig = readFileSync(cfgPath, 'utf8')
+
+    const lock = await acquireRefreshFileLock({
+      name: 'save',
+      ttlMs: 10_000,
+      path: cfgPath,
+    })
+    expect(lock).not.toBeNull()
+    try {
+      const settled = await Promise.race([
+        migrateIfNeeded(token, getAccountPaths(cfgPath)).then(() => 'done'),
+        wait(1_000).then(() => 'waited on the lock'),
+      ])
+      expect(settled).toBe('done')
+    } finally {
+      await lock?.release()
+    }
+    expect(readFileSync(cfgPath, 'utf8')).toBe(firstConfig)
+  })
 })
 
 describe('removed fallback refresh guard', () => {
