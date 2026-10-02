@@ -91,7 +91,11 @@ import {
   type OpenAICacheKeepManager,
   routedAccountForSession,
 } from './core/cachekeep'
-import { classifyMainAuthSlot, MAIN_REFRESH_LOCK_NAME } from './core/host-slot'
+import {
+  classifyMainAuthSlot,
+  MAIN_REFRESH_LOCK_NAME,
+  opencode1SlotForClient,
+} from './core/host-slot'
 import {
   PoolAccountSource,
   settlesWithin,
@@ -1375,14 +1379,11 @@ export async function CodexAuthPlugin(
   // command.execute.before reads this; if null (auth not loaded yet),
   // the command is rejected with a message.
   let cmdCtx: OpenCodeMenuContext | null = null
-  const hostAuth = input.client.auth as unknown as {
-    all(): Promise<Record<string, unknown>>
-    get(input: { path: { id: string } }): Promise<unknown>
-    set(input: {
-      path: { id: string }
-      body: { type: 'oauth'; access: string; refresh: string; expires: number }
-    }): Promise<unknown>
-  }
+  // OpenCode's `openai` login slot, for the account-pool migration, the
+  // adoption of later logins and the wait for a login's write. OpenCode 1's
+  // plugin client can write the slot but not read it, so it is read from
+  // OpenCode's `auth.json` (`core/host-slot.ts`).
+  const hostSlot = opencode1SlotForClient(input.client)
   const ownedCacheKeepManagers = new Map<string, OpenAICacheKeepManager>()
   const ownedRpcServers = new Map<string, RpcServerAdoption>()
   let activeFallbackManager: FallbackAccountManager | undefined
@@ -1437,22 +1438,23 @@ export async function CodexAuthPlugin(
   // The account pool as the request path's source of accounts once the
   // install is migrated; the loader installs one per run.
   let poolAccountSource: PoolAccountSource | undefined
-  // Background account-pool migration and adoption of later host-slot
-  // logins. Needs the host slot's full adapter (get, set and all); a client
-  // without it (some embedders and tests) runs without the pool migration.
+  // Background account-pool migration, and adoption into the pool of logins
+  // that land in OpenCode's slot after it. A client that cannot write the
+  // slot runs without both and logs why: a migration that is off without a
+  // word is indistinguishable from one that ran.
   const { enabled: poolMigrationEnabled, ...poolMigrationDeps } =
     options.poolMigration ?? {}
+  const poolMigrationOn = poolMigrationEnabled ?? POOL_MIGRATION_ENABLED
+  if (poolMigrationOn && 'reason' in hostSlot)
+    (poolMigrationDeps.log ?? createLogger('pool')).warn(
+      'account pool migration is off for this OpenCode client',
+      { reason: hostSlot.reason },
+    )
   const poolLifecycle: PoolLifecycle | undefined =
-    (poolMigrationEnabled ?? POOL_MIGRATION_ENABLED) &&
-    typeof (hostAuth as Partial<typeof hostAuth>).get === 'function' &&
-    typeof (hostAuth as Partial<typeof hostAuth>).all === 'function'
+    poolMigrationOn && 'slot' in hostSlot
       ? createPoolLifecycle({
           paths: () => getAccountPaths(getConfigPath()),
-          slot: {
-            get: (request) => hostAuth.get(request),
-            set: (request) => hostAuth.set(request as never),
-            all: () => hostAuth.all(),
-          },
+          slot: hostSlot.slot,
           version: PackageVersion,
           ...poolMigrationDeps,
           // While the vault serves this host its accounts, a login in the slot
@@ -1586,11 +1588,11 @@ export async function CodexAuthPlugin(
       }
     }
   async function watchHostWrite(refresh: string): Promise<void> {
-    if (!poolLifecycle) return
+    if (!poolLifecycle || !('slot' in hostSlot)) return
     const sleep = options.login?.sleep ?? ((ms: number) => Bun.sleep(ms))
     for (let waited = 0; waited < 5_000; waited += 100) {
       try {
-        const auth = await hostAuth.get({ path: { id: 'openai' } })
+        const auth = await hostSlot.slot.get({ path: { id: 'openai' } })
         if (isRecord(auth) && auth.refresh === refresh) {
           await poolLifecycle.requestAdoption()
           return
