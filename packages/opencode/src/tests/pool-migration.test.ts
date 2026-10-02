@@ -8,7 +8,11 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
-import { openPoolStore, rowLockKey } from '@cortexkit/common-auth/store'
+import {
+  openPoolStore,
+  POOL_KEY,
+  rowLockKey,
+} from '@cortexkit/common-auth/store'
 import {
   buildRefreshOperationError,
   codexRefreshFn,
@@ -516,11 +520,22 @@ describe('adoption of a later login in the slot', () => {
   it('a rotation whose row learned another account after the transfer read it is refused, writes nothing and is retried', async () => {
     await migrated()
     // Row `main` with no recorded account, so the transfer passes the slot's
-    // account to the rotation.
+    // account to the rotation. The account is removed from the config and
+    // from the credential's stamp: a stamp naming it would otherwise show the
+    // row with that account (the store treats it as a config write still to
+    // come), as on a row written before stamps carried an account.
     const unrecorded = await h.config()
     for (const account of unrecorded.accounts as Array<Record<string, unknown>>)
       if (account.id === 'main') delete account.accountId
     writeFileSync(h.paths.configPath, JSON.stringify(unrecorded, null, 2))
+    const state = JSON.parse(readFileSync(h.paths.statePath, 'utf8')) as {
+      accounts: Record<
+        string,
+        Record<string, { binding?: { identity?: string } }>
+      >
+    }
+    delete state.accounts.main?.[POOL_KEY]?.binding?.identity
+    writeFileSync(h.paths.statePath, JSON.stringify(state, null, 2))
     expect((await h.row('main'))?.identity).toBeUndefined()
     await h.setSlot(login('acct-main', 'r-main', 'fresh-access'))
 
