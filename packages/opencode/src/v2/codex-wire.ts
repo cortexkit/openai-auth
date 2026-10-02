@@ -39,11 +39,18 @@ const MAX_PINNED_SESSIONS = 1024
  * The models OpenCode 2's own OpenAI driver already carries an effort change
  * for: it records the change in the session's history, sends it as a
  * `configuration_update` item and keeps the request-level effort at the
- * session's first value, on HTTP and WebSocket alike. This is the rule its
- * Responses protocol applies on 2.0.21 (`supportsEffortUpdates` there: a
- * model id ending in `gpt-6-astra`, `gpt-6-sol` or `gpt-6-luna`, unless the
- * model's own settings say otherwise). The rewrite leaves these models to
- * the host, so the two never both act on one request.
+ * session's first value, on HTTP and WebSocket alike (`supportsEffortUpdates`
+ * in its Responses protocol: on 2.0.21 a model id ending in `gpt-6-astra`,
+ * `gpt-6-sol` or `gpt-6-luna`, unless the model's own settings say
+ * otherwise). The rewrite leaves these models to the host, so the two never
+ * both act on one request.
+ *
+ * OpenCode 2.0.22 also carries `gpt-6.1-sol` itself, measured with the real
+ * host: the request-level effort stays pinned, the turn whose effort changed
+ * carries one update item and stays chained. `gpt-6.1-sol` is still left out
+ * of this list so a 2.0.21 host keeps getting the rewrite; on 2.0.22 the
+ * rewrite then has nothing to do, because the host's request already carries
+ * the pinned effort and the update sits right before the user message.
  */
 const HOST_EFFORT_UPDATE_MODEL = /(?:^|\/)gpt-6-(?:astra|sol|luna)$/i
 
@@ -65,8 +72,8 @@ export type WireForm = 'http' | 'ws'
  * OpenCode 1's mid-conversation effort rule (`applyMidConversationEffort`),
  * for the models where a `configuration_update` item is known to change
  * effort (`MID_CONVERSATION_EFFORT_MODELS`) and the host does not carry the
- * change itself (`HOST_EFFORT_UPDATE_MODEL`); on 2.0.21 that leaves
- * `gpt-6.1-sol`.
+ * change itself (`HOST_EFFORT_UPDATE_MODEL`): `gpt-6.1-sol`, which only
+ * 2.0.21 needs it for.
  *
  * The backend keys its prompt cache on the request-level
  * `reasoning.effort`, so a session that changes effort part-way would have
@@ -94,9 +101,9 @@ export type WireForm = 'http' | 'ws'
  *   inserted update among them, so the item goes only on a frame whose
  *   input holds a user message (a new turn, or a full resend); a frame that
  *   carries only tool output keeps the pinned request-level effort and
- *   relies on the update already in the server's history. When the user
- *   changes effort the host itself sends that turn as a full frame (its
- *   request changed); the frame keeps the pinned effort, so the server
+ *   relies on the update already in the server's history. On 2.0.21, when
+ *   the user changes effort the host itself sends that turn as a full frame
+ *   (its request changed); the frame keeps the pinned effort, so the server
  *   reads the replayed conversation from its cache, and the following
  *   turns go out incremental again.
  *

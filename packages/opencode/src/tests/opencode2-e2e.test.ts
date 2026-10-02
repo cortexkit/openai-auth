@@ -40,7 +40,7 @@ import { installPackedPlugin, PACKAGE_NAME } from './fixtures/opencode2-pack'
 
 const ENABLED = process.env.OPENAI_AUTH_OPENCODE2_E2E === '1'
 const REUSE_CLI_DIR = process.env.OPENAI_AUTH_OPENCODE2_E2E_CLI_DIR
-export const OPENCODE_CLI_VERSION = '2.0.21'
+export const OPENCODE_CLI_VERSION = '2.0.22'
 const PLACEHOLDER = placeholderSecret('openai')
 const PASSWORD = 'openai-auth-e2e-loopback-only'
 const HOUR = 3600_000
@@ -759,23 +759,19 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       const [first, second, change, after] = samplesOn(result, 'ws').map(bodyOf)
       for (const body of [first, second, change, after])
         expect(body?.reasoning?.effort).toBe('low')
-      // The host sends the turn whose effort changed in full (its own request
-      // changed); the rewrite adds the update right before the new user
-      // message and changes nothing else.
+      // OpenCode 2.0.22 carries this model's effort change itself: the turn
+      // whose effort changed stays chained and carries one update right
+      // before the new user message, and nothing else.
       expect(second?.previous_response_id).toBeDefined()
-      expect(change?.previous_response_id).toBeUndefined()
-      const changeInput = change?.input ?? []
-      expect(changeInput.at(-2)).toEqual(EFFORT_UPDATE_HIGH)
-      expect(changeInput.at(-1)?.role).toBe('user')
-      expect(
-        changeInput.filter((item) => item.type === 'configuration_update'),
-      ).toHaveLength(1)
-      // The next turn is incremental again: chained, with only the update
-      // and the new user message.
+      expect(change?.previous_response_id).toBeDefined()
+      expect(change?.input).toHaveLength(2)
+      expect(change?.input[0]).toEqual(EFFORT_UPDATE_HIGH)
+      expect(change?.input[1]?.role).toBe('user')
+      // The update is in the server's history now, so the next turn is just
+      // the new user message on the same chain.
       expect(after?.previous_response_id).toBeDefined()
-      expect(after?.input).toHaveLength(2)
-      expect(after?.input[0]).toEqual(EFFORT_UPDATE_HIGH)
-      expect(after?.input[1]?.role).toBe('user')
+      expect(after?.input).toHaveLength(1)
+      expect(after?.input[0]?.role).toBe('user')
     })
   }, 240_000)
 

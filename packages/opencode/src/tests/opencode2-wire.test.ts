@@ -6,7 +6,10 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 import { rmSync } from 'node:fs'
 import { join } from 'node:path'
-import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
+import {
+  ATTEMPT_HEADER,
+  placeholderSecret,
+} from '@cortexkit/common-auth/opencode2'
 import { CODEX_USER_AGENT, CODEX_VERSION } from '../index'
 import {
   CODEX_CLIENT_HEADERS,
@@ -355,7 +358,18 @@ describe('through the OpenCode 2 entry', () => {
       expect(headers['user-agent']).toBe(CODEX_USER_AGENT)
       expect(headers['User-Agent']).toBe(undefined)
     }
-    expect(seen[1]).toEqual(seen[0] as Record<string, string>)
+    // The library marks each request with its attempt (and strips the mark
+    // before anything is sent); every other header is the same on every
+    // request, so the host keeps one WebSocket for the session.
+    const withoutMark = (headers: Record<string, string>) => {
+      const { [ATTEMPT_HEADER]: mark, ...rest } = headers
+      expect(mark).toBeString()
+      return rest
+    }
+    expect(withoutMark(seen[1] as Record<string, string>)).toEqual(
+      withoutMark(seen[0] as Record<string, string>),
+    )
+    expect(seen[1]?.[ATTEMPT_HEADER]).not.toBe(seen[0]?.[ATTEMPT_HEADER])
   })
 
   it('rewrites WebSocket frames and HTTP bodies through the hooks', async () => {

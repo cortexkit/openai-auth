@@ -69,6 +69,11 @@ function createMockPluginInput(): PluginInput {
 async function loadFetchOverride(experimentalWebSockets = false) {
   const hooks = await CodexAuthPlugin(createMockPluginInput(), {
     experimentalWebSockets,
+    // These tests hold the store's locks to prove the request path never
+    // waits on them, on an install that has not moved to the account pool.
+    // A background pool migration would take the same locks and move the
+    // store under the test.
+    poolMigration: { enabled: false },
   })
   const authHook = hooks.auth
   if (!authHook?.loader) throw new Error('No auth loader')
