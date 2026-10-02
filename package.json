@@ -15,7 +15,7 @@
     "types": "bun run typecheck",
     "format": "biome check --write --unsafe .",
     "format:check": "biome format .",
-    "lint": "biome lint .",
+    "lint": "biome check .",
     "pack:opencode:dry": "cd packages/opencode && bun pm pack --dry-run",
     "pack:pi:dry": "cd packages/pi && bun pm pack --dry-run",
     "prepublishOnly": "bun run build",

@@ -19,8 +19,8 @@ import type {
   OAuthQuotaSnapshot,
 } from './accounts.ts'
 import { buildQuotaOperationError, quotaBackoffActive } from './backoff.ts'
-import { isTombstoned } from './tombstone.ts'
 import { PRIMARY, type ProviderQuotaFn, SECONDARY } from './provider.ts'
+import { isTombstoned } from './tombstone.ts'
 
 export type { ProviderQuotaFn }
 
