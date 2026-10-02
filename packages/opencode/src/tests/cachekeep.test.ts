@@ -162,16 +162,39 @@ describe('ttlForModel', () => {
     expect(ttlForModel(body, defaultTtl)).toBe(longTtl)
   })
 
-  test('returns default for gpt-5.60 body (substring match would false-positive)', () => {
-    // Hypothetical sibling id whose digits also contain "5.6" must not pick up
-    // the gpt-5.6 cache TTL.
-    const body = JSON.stringify({ model: 'gpt-5.60' })
-    expect(ttlForModel(body, defaultTtl)).toBe(defaultTtl)
+  test('returns 30min for the models after gpt-5.6', () => {
+    // OpenAI's 30-minute guarantee covers gpt-5.6 and every later model.
+    for (const model of [
+      'gpt-6-astra',
+      'gpt-6-sol',
+      'gpt-6-luna',
+      'gpt-6.1-sol',
+      'gpt-7',
+    ]) {
+      const body = JSON.stringify({ model })
+      expect(ttlForModel(body, defaultTtl)).toBe(longTtl)
+    }
   })
 
-  test('returns default for gpt-5.6x body (substring match would false-positive)', () => {
-    const body = JSON.stringify({ model: 'gpt-5.6x' })
-    expect(ttlForModel(body, defaultTtl)).toBe(defaultTtl)
+  test('compares the version as numbers, not text', () => {
+    // Minor versions compare as numbers: 5.60 and 5.10 are both later than
+    // 5.6, while 5.5 is earlier.
+    expect(ttlForModel(JSON.stringify({ model: 'gpt-5.60' }), defaultTtl)).toBe(
+      longTtl,
+    )
+    expect(
+      ttlForModel(JSON.stringify({ model: 'gpt-5.10-mini' }), defaultTtl),
+    ).toBe(longTtl)
+    expect(ttlForModel(JSON.stringify({ model: 'gpt-5.5' }), defaultTtl)).toBe(
+      defaultTtl,
+    )
+  })
+
+  test('returns default for an id whose version does not end at a dash', () => {
+    for (const model of ['gpt-5.6x', 'gpt-6x-sol', 'legacy-gpt-5.6']) {
+      const body = JSON.stringify({ model })
+      expect(ttlForModel(body, defaultTtl)).toBe(defaultTtl)
+    }
   })
 
   test('returns default for gpt-5.5 body', () => {
@@ -272,7 +295,7 @@ describe('CacheKeepManager.track', () => {
     expect(oldTarget.cacheExpiresAt).toBe(clock.now() + TTL_MS)
   })
 
-  test('gpt-5.6 profile is captured at track(): 30-min TTL for 5.6 bodies, default for 5.5/5.4/5.60', () => {
+  test('the 30-min profile is captured at track(): gpt-5.6 and later get it, 5.5 and 5.4 keep the default', () => {
     // The profile is evaluated once at capture and kept on the target, so the
     // TTL each target reports is what its warms will use.
     const mgr = createCacheKeepManager({
@@ -315,8 +338,8 @@ describe('CacheKeepManager.track', () => {
       meta: { replayHeaders: {} },
     })
     mgr.track({
-      sessionKey: 'v560',
-      bodyText: JSON.stringify({ input: '560', model: 'gpt-5.60' }),
+      sessionKey: 'v6',
+      bodyText: JSON.stringify({ input: '6', model: 'gpt-6-astra' }),
       accountId: 'main',
       meta: { replayHeaders: {} },
     })
@@ -334,7 +357,7 @@ describe('CacheKeepManager.track', () => {
     expect(ttl('bare')).toBe(30 * 60 * 1000)
     expect(ttl('v55')).toBe(TTL_MS)
     expect(ttl('v54')).toBe(TTL_MS)
-    expect(ttl('v560')).toBe(TTL_MS)
+    expect(ttl('v6')).toBe(30 * 60 * 1000)
     expect(ttl('malformed')).toBe(TTL_MS)
   })
 })

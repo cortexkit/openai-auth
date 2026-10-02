@@ -25,8 +25,8 @@ import {
 import { sanitizeHttpFallbackInit } from '../codex-http'
 import {
   hashSidebarSessionId,
-  STICKY_ASSIGNMENT_MAX_AGE_MS,
   type SidebarState,
+  STICKY_ASSIGNMENT_MAX_AGE_MS,
 } from '../sidebar-state'
 
 export {
@@ -111,53 +111,68 @@ export function getCacheKeepWindow(
 // Per-model profile
 // ---------------------------------------------------------------------------
 
-// gpt-5.6 prompts live on Codex's prompt cache for ~30 min, vs ~5 min for older
-// models, so per-target TTL is raised to 30 min to match — keeps the warm
-// cadence honest (warm just before the real 30-min eviction, not every 5 min).
-const GPT_5_6_TTL_MS = 30 * 60 * 1000 // 30 min
+// OpenAI guarantees a cached prompt for 30 minutes on gpt-5.6 and later models
+// and for 5 minutes on older ones. It often keeps one longer, but that is best
+// effort, so a warm is timed against the guarantee: just before 30 minutes on
+// these models instead of every 5.
+const THIRTY_MIN_CACHE_TTL_MS = 30 * 60 * 1000
 // Subagent sessions are short-lived: two ~30-min warms give about an hour of
 // cache coverage without over-warming a one-off session.
-const GPT_5_6_SUBAGENT_MAX_WARMS = 2
-// Long idle bound for 5.6 subagents — gives the session room for both warms on
-// the happy path (~58 min) while still eventually reclaiming a stuck target
-// whose warms never reach the 2-warm cap. The default 30-min subagent bound
-// would reclaim it before its first warm.
-const GPT_5_6_SUBAGENT_MAX_IDLE_MS = 2 * GPT_5_6_TTL_MS + 15 * 60 * 1000
+const THIRTY_MIN_CACHE_SUBAGENT_MAX_WARMS = 2
+// Idle bound for a subagent on these models: room for both warms on the happy
+// path (~58 min) while still eventually reclaiming a stuck target whose warms
+// never reach the 2-warm cap. The default 30-min subagent bound would reclaim
+// it before its first warm.
+const THIRTY_MIN_CACHE_SUBAGENT_MAX_IDLE_MS =
+  2 * THIRTY_MIN_CACHE_TTL_MS + 15 * 60 * 1000
 
-// Single source of truth for "is this body a gpt-5.6 request?". Exact-match
-// or `gpt-5.6-` prefix so a hypothetical sibling id (gpt-5.60, gpt-5.6x,
-// legacy-gpt-5.6-revival) doesn't pick up the long-TTL treatment.
-function isGpt56Model(bodyText: string): boolean {
+// The model's version, read as numbers from the start of its id
+// (`gpt-6-astra` is 6.0, `gpt-6.1-sol` is 6.1). It must be followed by the end
+// of the id or a dash, so an id like `gpt-5.6x` or `legacy-gpt-5.6` doesn't
+// count.
+const MODEL_VERSION = /^gpt-(\d+)(?:\.(\d+))?(?:-|$)/
+
+/**
+ * Whether the request body asks a model whose cached prompt OpenAI guarantees
+ * for 30 minutes: gpt-5.6 and every later model.
+ */
+function is30MinCacheSupportedModel(bodyText: string): boolean {
   try {
     const parsed = JSON.parse(bodyText) as Record<string, unknown>
     const model = parsed.model
     if (typeof model !== 'string') return false
-    return model === 'gpt-5.6' || model.startsWith('gpt-5.6-')
+    const match = MODEL_VERSION.exec(model)
+    if (!match) return false
+    const major = Number(match[1])
+    const minor = match[2] === undefined ? 0 : Number(match[2])
+    return major > 5 || (major === 5 && minor >= 6)
   } catch {
     return false
   }
 }
 
 export function ttlForModel(bodyText: string, defaultTtlMs: number): number {
-  return isGpt56Model(bodyText) ? GPT_5_6_TTL_MS : defaultTtlMs
+  return is30MinCacheSupportedModel(bodyText)
+    ? THIRTY_MIN_CACHE_TTL_MS
+    : defaultTtlMs
 }
 
 /**
- * The per-target overrides for a captured request: gpt-5.6 gets its longer
- * cache lifetime, and a gpt-5.6 subagent is retired after two warms with an
- * idle bound long enough for both. Everything else keeps the manager's
- * defaults.
+ * The per-target overrides for a captured request: a model with the 30-minute
+ * cache guarantee gets that lifetime, and a subagent on one is retired after
+ * two warms with an idle bound long enough for both. Everything else keeps
+ * the manager's defaults.
  */
 export function openaiCacheKeepProfile(input: {
   bodyText: string
   isSubagent: boolean
 }): CacheKeepProfile | undefined {
-  if (!isGpt56Model(input.bodyText)) return undefined
-  if (!input.isSubagent) return { ttlMs: GPT_5_6_TTL_MS }
+  if (!is30MinCacheSupportedModel(input.bodyText)) return undefined
+  if (!input.isSubagent) return { ttlMs: THIRTY_MIN_CACHE_TTL_MS }
   return {
-    ttlMs: GPT_5_6_TTL_MS,
-    maxWarms: GPT_5_6_SUBAGENT_MAX_WARMS,
-    maxIdleMs: GPT_5_6_SUBAGENT_MAX_IDLE_MS,
+    ttlMs: THIRTY_MIN_CACHE_TTL_MS,
+    maxWarms: THIRTY_MIN_CACHE_SUBAGENT_MAX_WARMS,
+    maxIdleMs: THIRTY_MIN_CACHE_SUBAGENT_MAX_IDLE_MS,
   }
 }
 
