@@ -1077,15 +1077,27 @@ function applyMidConversationEffort(
     // No user turn can carry a new instruction; leave the host's effort alone.
     return
   }
+  // Anchors only ever grow, because a new one is the latest user message and
+  // an older anchor that moved fails its fingerprint first. Should that ever
+  // not hold, start over from this request's effort rather than fail the
+  // request or send two updates side by side, which the API refuses.
+  if (
+    updates.some(
+      (update, i) => i > 0 && update.anchor <= (updates[i - 1]?.anchor ?? -1),
+    )
+  ) {
+    metadata.pinnedEffort = effort
+    metadata.effortUpdates = []
+    return
+  }
   parsed.reasoning = { ...reasoning, effort: metadata.pinnedEffort }
-  // Descending insertion preserves host-relative indices. Distinct user-message
-  // anchors leave a message between updates, as required by the Responses API.
+  // Anchors are indices into the host's input. Inserting from the highest
+  // anchor down keeps the lower ones valid. Each update goes in front of a
+  // different user message, so that message always separates it from the
+  // next update: the API refuses two updates side by side.
   for (let i = updates.length - 1; i >= 0; i--) {
     const update = updates[i]
     if (!update) continue
-    const previous = updates[i - 1]
-    if (previous && previous.anchor >= update.anchor)
-      throw new Error('Effort update anchors must be distinct and increasing')
     input.splice(update.anchor, 0, {
       type: 'configuration_update',
       reasoning: { effort: update.effort },
