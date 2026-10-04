@@ -2958,6 +2958,192 @@ describe('integration: active fallback routing', () => {
     return sent
   }
 
+  async function captureEffortHistory(
+    requests: Array<{ effort: string; input: unknown[]; agent?: string }>,
+  ) {
+    seedEmptyAccountStorage()
+    const originalFetch = globalThis.fetch
+    const sent: Array<{ input: unknown[]; reasoning: { effort: string } }> = []
+    const headers: Headers[] = []
+    let hooks: Hooks | undefined
+    try {
+      globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+        if (
+          String(url).includes('/responses') &&
+          typeof init?.body === 'string'
+        ) {
+          sent.push(JSON.parse(init.body))
+          headers.push(new Headers(init.headers))
+        }
+        return new Response('{}', { status: 200 })
+      }) as typeof globalThis.fetch
+      const loaded = await loadFetchOverride(
+        createMockPluginInput(),
+        Date.now() + 3600_000,
+      )
+      hooks = loaded.hooks
+      for (const request of requests) {
+        const requestHeaders: Record<string, string> = {
+          'content-type': 'application/json',
+          'session-id': 'effort-history',
+        }
+        if (request.agent) {
+          await hooks['chat.headers']?.(
+            {
+              agent: request.agent,
+              sessionID: 'effort-history',
+              model: { providerID: 'openai' },
+            } as Parameters<NonNullable<Hooks['chat.headers']>>[0],
+            { headers: requestHeaders },
+          )
+          expect(requestHeaders['x-openai-auth-agent']).toBe(request.agent)
+        }
+        await loaded.fetchOverride('https://api.openai.com/v1/responses', {
+          method: 'POST',
+          headers: requestHeaders,
+          body: JSON.stringify({
+            model: 'gpt-6.1-sol',
+            reasoning: { effort: request.effort },
+            input: request.input,
+          }),
+        })
+      }
+    } finally {
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+    return { sent, headers }
+  }
+
+  const effortUser = (text: string) => ({ role: 'user', content: text })
+  const effortTool = (id: number) => ({
+    type: 'function_call_output',
+    call_id: `call_${id}`,
+    output: 'ok',
+  })
+
+  test('hidden agents never pin or update the conversation effort', async () => {
+    const one = effortUser('one')
+    const { sent, headers } = await captureEffortHistory([
+      { agent: 'title', effort: 'low', input: [one] },
+      { agent: 'build', effort: 'medium', input: [one] },
+      { agent: 'build', effort: 'medium', input: [one, effortTool(1)] },
+      { agent: 'compaction', effort: 'low', input: [one] },
+      { agent: 'summary', effort: 'low', input: [one] },
+      {
+        agent: 'build',
+        effort: 'medium',
+        input: [one, effortTool(1), effortTool(2)],
+      },
+    ])
+    expect(sent.map((body) => body.reasoning.effort)).toEqual([
+      'low',
+      'medium',
+      'medium',
+      'low',
+      'low',
+      'medium',
+    ])
+    expect(
+      sent.every(
+        (body) => !JSON.stringify(body.input).includes('configuration_update'),
+      ),
+    ).toBe(true)
+    expect(headers.every((header) => !header.has('x-openai-auth-agent'))).toBe(
+      true,
+    )
+  })
+
+  test('effort updates preserve strict prefixes through tool loops and later turns', async () => {
+    const input: unknown[] = []
+    const requests: Array<{ effort: string; input: unknown[] }> = []
+    for (const [turn, effort] of [
+      'medium',
+      'medium',
+      'high',
+      'high',
+      'low',
+      'medium',
+    ].entries()) {
+      input.push(effortUser(`turn ${turn}`))
+      requests.push({ effort, input: [...input] })
+      input.push(effortTool(turn))
+      requests.push({ effort, input: [...input] })
+    }
+    const { sent, headers } = await captureEffortHistory(requests)
+    const turnIDs = headers.map(
+      (header) =>
+        JSON.parse(header.get('x-codex-turn-metadata') ?? '{}').turn_id,
+    )
+    for (let i = 0; i < turnIDs.length; i += 2) {
+      expect(turnIDs[i]).toBeDefined()
+      expect(turnIDs[i + 1]).toBe(turnIDs[i])
+      if (i > 0) expect(turnIDs[i]).not.toBe(turnIDs[i - 1])
+    }
+    for (let i = 1; i < sent.length; i++) {
+      const previous = sent[i - 1]!.input
+      expect(sent[i]!.input.length).toBeGreaterThan(previous.length)
+      expect(sent[i]!.input.slice(0, previous.length)).toEqual(previous)
+      expect(sent[i]!.reasoning.effort).toBe('medium')
+    }
+    const final = sent.at(-1)!.input as Array<Record<string, unknown>>
+    expect(
+      final
+        .filter((item) => item.type === 'configuration_update')
+        .map((item) => item.reasoning),
+    ).toEqual([{ effort: 'high' }, { effort: 'low' }, { effort: 'medium' }])
+    for (const [i, item] of final.entries()) {
+      if (item.type !== 'configuration_update') continue
+      expect(final[i + 1]?.role).toBe('user')
+      expect(final[i - 1]?.type).not.toBe('configuration_update')
+    }
+    expect(final[4]).toEqual({
+      type: 'configuration_update',
+      reasoning: { effort: 'high' },
+    })
+    expect(final[5]).toEqual(effortUser('turn 2'))
+  })
+
+  test.each(['shorter', 'different'])(
+    'effort history re-pins after a %s input rewrite',
+    async (rewrite) => {
+      const one = effortUser('one')
+      const two = effortUser('two')
+      const rewritten =
+        rewrite === 'shorter'
+          ? [one]
+          : [one, effortTool(1), effortUser('replacement')]
+      const { sent } = await captureEffortHistory([
+        { effort: 'medium', input: [one] },
+        { effort: 'high', input: [one, effortTool(1), two] },
+        { effort: 'low', input: rewritten },
+        { effort: 'low', input: [...rewritten, effortTool(2)] },
+      ])
+      expect(sent[1]!.input).toHaveLength(4)
+      expect(sent[2]!.reasoning.effort).toBe('low')
+      expect(sent[2]!.input).toEqual(rewritten)
+      expect(sent[3]!.reasoning.effort).toBe('low')
+      expect(sent[3]!.input).toEqual([...rewritten, effortTool(2)])
+    },
+  )
+
+  test('same-turn effort edits replace an update and undo only that update', async () => {
+    const one = effortUser('one')
+    const two = effortUser('two')
+    const { sent } = await captureEffortHistory([
+      { effort: 'medium', input: [one] },
+      { effort: 'high', input: [one, two] },
+      { effort: 'low', input: [one, two] },
+      { effort: 'medium', input: [one, two] },
+    ])
+    expect(sent[2]!.input).toEqual([
+      one,
+      { type: 'configuration_update', reasoning: { effort: 'low' } },
+      two,
+    ])
+    expect(sent[3]!.input).toEqual([one, two])
+  })
+
   test('astra carries a mid-session effort change as a configuration_update', async () => {
     const sent = await captureEffortChange('gpt-6-astra', ['low', 'xhigh'])
     expect(sent).toHaveLength(2)
