@@ -27,7 +27,6 @@ export const CODEX_CLIENT_HEADERS: Readonly<Record<string, string>> = {
   version: CODEX_VERSION,
   'user-agent': CODEX_USER_AGENT,
   originator: 'codex_exec',
-  'x-codex-beta-features': 'terminal_resize_reflow',
 }
 
 /** The header OpenCode 1 sends on an HTTP request in the Lite shape. */

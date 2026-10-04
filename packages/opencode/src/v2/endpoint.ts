@@ -39,7 +39,7 @@ export async function registerCodexRequestRules(
         loggedCustom = true
         log.info('keeping the custom OpenAI baseURL for account pool requests')
       }
-      draft.headers['session-id'] = draft.sessionID
+      draft.headers['session-id'] ??= draft.sessionID
     },
     { providerID: 'openai' },
   )

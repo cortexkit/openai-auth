@@ -709,16 +709,14 @@ describe('Codex destination independent of the host credential', () => {
     await host.fire('model.request', draft)
     expect(draft.baseURL).toBe('https://chatgpt.com/backend-api/codex')
     expect(draft.headers['session-id']).toBe('ses_endpoint')
-    expect(draft.headers['x-codex-beta-features']).toBe(
-      'terminal_resize_reflow',
-    )
     const custom = {
       ...scope('ses_custom'),
       baseURL: 'https://proxy.example/v1',
-      headers: {},
+      headers: { 'session-id': 'host-derived-session' },
     }
     await host.fire('model.request', custom)
     expect(custom.baseURL).toBe('https://proxy.example/v1')
+    expect(custom.headers['session-id']).toBe('host-derived-session')
   })
 
   it('uses the configured Codex base and leaves API-key destinations unchanged', () => {

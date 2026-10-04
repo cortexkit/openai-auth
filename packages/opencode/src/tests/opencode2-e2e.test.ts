@@ -526,8 +526,7 @@ function expectCodexClient(headers: Record<string, string>) {
   expect(headers.version).toBe(CODEX_VERSION)
   expect(headers['user-agent']).toBe(CODEX_USER_AGENT)
   expect(headers.originator).toBe('codex_exec')
-  expect(headers['x-codex-beta-features']).toBe('terminal_resize_reflow')
-  expect(headers['session-id']).toStartWith('ses_')
+  expect(headers['session-id']).toBeTruthy()
 }
 
 const usedOn = (result: ScenarioResult, row: string) =>
