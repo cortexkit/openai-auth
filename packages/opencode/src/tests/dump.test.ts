@@ -139,6 +139,17 @@ describe('request dumps', () => {
     )
 
     expect(loaded.fetch).toBeUndefined()
+    const output = { headers: {} as Record<string, string> }
+    await hooks['chat.headers']?.(
+      {
+        agent: 'build',
+        sessionID: 'api-key-session',
+        model: { providerID: 'openai' },
+      } as Parameters<NonNullable<(typeof hooks)['chat.headers']>>[0],
+      output,
+    )
+    expect(output.headers['x-openai-auth-agent']).toBeUndefined()
+    await hooks.dispose?.()
   })
 
   test('drops cached Codex session metadata when OpenCode deletes a session', async () => {
@@ -335,6 +346,7 @@ describe('request dumps', () => {
           headers: {
             'content-type': 'application/json',
             'x-session-affinity': 'ses_dump_http',
+            'x-openai-auth-agent': 'build',
           },
           body: JSON.stringify(toolRequestBody()),
         })
@@ -364,6 +376,11 @@ describe('request dumps', () => {
           },
         })
         expect(request.headers.authorization).toBe('***REDACTED***')
+        for (const file of files) {
+          expect(await readFile(join(dumpDir, file), 'utf8')).not.toContain(
+            'x-openai-auth-agent',
+          )
+        }
       } finally {
         globalThis.fetch = originalFetch
       }
@@ -589,6 +606,153 @@ describe('request dumps', () => {
     })
   })
 
+  test('agent tags are stripped on HTTP fallback and requests without session metadata', async () => {
+    await withDumpEnv(async () => {
+      const originalFetch = globalThis.fetch
+      const outgoing: Headers[] = []
+      globalThis.fetch = Object.assign(
+        async (_url: RequestInfo | URL, init?: RequestInit) => {
+          outgoing.push(new Headers(init?.headers))
+          return new Response('{}')
+        },
+        { preconnect: () => {} },
+      )
+      let hooks: Awaited<ReturnType<typeof CodexAuthPlugin>> | undefined
+      try {
+        hooks = await CodexAuthPlugin(pluginInput(), {
+          experimentalWebSockets: true,
+        })
+        const fetch = await pluginFetch(hooks)
+        for (const session of ['fallback-title', undefined]) {
+          const response = await fetch('https://api.openai.com/v1/responses', {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'x-openai-auth-agent': 'title',
+              'x-opencode-title': 'true',
+              ...(session ? { 'session-id': session } : {}),
+            },
+            body: JSON.stringify(toolRequestBody()),
+          })
+          await response.text()
+        }
+        expect(outgoing).toHaveLength(2)
+        expect(
+          outgoing.every((headers) => !headers.has('x-openai-auth-agent')),
+        ).toBe(true)
+      } finally {
+        await hooks?.dispose?.()
+        globalThis.fetch = originalFetch
+      }
+    })
+  })
+
+  test('WebSocket effort history keeps full-turn prefixes and incremental tool frames', async () => {
+    await withDumpEnv(async (dumpDir) => {
+      const originalFetch = globalThis.fetch
+      const originalWebSocket = globalThis.WebSocket
+      FakeWebSocket.frames = []
+      FakeWebSocket.upgrades = []
+      globalThis.fetch = Object.assign(async () => new Response('{}'), {
+        preconnect: () => {},
+      })
+      globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket
+      let hooks: Awaited<ReturnType<typeof CodexAuthPlugin>> | undefined
+      try {
+        hooks = await CodexAuthPlugin(pluginInput(), {
+          experimentalWebSockets: true,
+        })
+        const fetch = await pluginFetch(hooks)
+        const input: unknown[] = []
+        for (const [turn, effort] of [
+          'medium',
+          'medium',
+          'high',
+          'high',
+        ].entries()) {
+          input.push({ role: 'user', content: `turn ${turn}` })
+          for (let step = 0; step < 2; step++) {
+            if (step)
+              input.push({
+                type: 'function_call_output',
+                call_id: `call_${turn}`,
+                output: 'ok',
+              })
+            const response = await fetch(
+              'https://api.openai.com/v1/responses',
+              {
+                method: 'POST',
+                headers: {
+                  'content-type': 'application/json',
+                  'session-id': 'effort-ws',
+                  'x-openai-auth-agent': 'build',
+                },
+                body: JSON.stringify({
+                  ...toolRequestBody(),
+                  model: 'gpt-6.1-sol',
+                  reasoning: { effort },
+                  input,
+                }),
+              },
+            )
+            await response.text()
+          }
+        }
+        const frames = FakeWebSocket.frames.filter(
+          (frame) => frame.generate !== false,
+        )
+        expect(frames).toHaveLength(8)
+        for (const frame of frames) {
+          expect(frame.previous_response_id).toBeDefined()
+          expect(frame.reasoning).toEqual({ effort: 'medium' })
+        }
+        // A fresh user turn first sends an input with no prior messages, then
+        // replays the full input. Keeping configuration updates at their original
+        // positions lets the replay reuse the previously cached prefix.
+        expect(
+          frames.map((frame) => (frame.input as unknown[]).length),
+        ).toEqual([1, 1, 3, 1, 6, 1, 8, 1])
+        const fullTurns = frames.filter((_frame, index) => index % 2 === 0)
+        for (let i = 1; i < fullTurns.length; i++) {
+          const previous = fullTurns[i - 1]!.input as unknown[]
+          expect(
+            (fullTurns[i]!.input as unknown[]).slice(0, previous.length),
+          ).toEqual(previous)
+        }
+        expect((frames[4]!.input as unknown[]).slice(-2)).toEqual([
+          { type: 'configuration_update', reasoning: { effort: 'high' } },
+          { type: 'message', role: 'user', content: 'turn 2' },
+        ])
+        for (const [i, frame] of frames.entries()) {
+          if (i % 2 === 0) continue
+          expect(frame.previous_response_id).toBe('resp_main')
+          expect(frame.input).toEqual([
+            {
+              type: 'function_call_output',
+              call_id: `call_${Math.floor(i / 2)}`,
+              output: 'ok',
+            },
+          ])
+        }
+        expect(FakeWebSocket.upgrades.length).toBeGreaterThan(0)
+        expect(
+          FakeWebSocket.upgrades.every(
+            (headers) => !headers.has('x-openai-auth-agent'),
+          ),
+        ).toBe(true)
+        for (const file of await readdir(dumpDir)) {
+          expect(await readFile(join(dumpDir, file), 'utf8')).not.toContain(
+            'x-openai-auth-agent',
+          )
+        }
+      } finally {
+        await hooks?.dispose?.()
+        globalThis.fetch = originalFetch
+        globalThis.WebSocket = originalWebSocket
+      }
+    })
+  })
+
   test('dumps final WebSocket prewarm and main bodies when enabled', async () => {
     await withDumpEnv(async (dumpDir) => {
       const originalFetch = globalThis.fetch
@@ -730,11 +894,17 @@ function requireFile(files: string[], suffix: string) {
 class FakeWebSocket {
   static OPEN = 1
   static CLOSED = 3
+  static frames: Array<Record<string, unknown>> = []
+  static upgrades: Headers[] = []
 
   readyState = 0
   private readonly listeners = new Map<string, Set<(event: unknown) => void>>()
 
-  constructor(readonly url: string) {
+  constructor(
+    readonly url: string,
+    options?: { headers?: HeadersInit },
+  ) {
+    FakeWebSocket.upgrades.push(new Headers(options?.headers))
     queueMicrotask(() => {
       this.readyState = FakeWebSocket.OPEN
       this.emit('open', {})
@@ -763,6 +933,7 @@ class FakeWebSocket {
 
   send(data: string) {
     const parsed = JSON.parse(data) as Record<string, unknown>
+    FakeWebSocket.frames.push(parsed)
     this.emit('message', {
       data: JSON.stringify({
         type: 'response.completed',

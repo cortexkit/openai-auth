@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import {
   mkdirSync,
   readFileSync,
@@ -811,6 +812,7 @@ interface CodexSessionMetadata {
    * request-level value. See `applyMidConversationEffort`.
    */
   pinnedEffort?: string
+  effortUpdates?: Array<{ anchor: number; fingerprint: string; effort: string }>
 }
 
 interface PersistedCodexSessions {
@@ -944,7 +946,9 @@ function updateHttpTurnMetadata(
   } else if (!metadata.turnStartedAt) {
     metadata.turnStartedAt = Date.now()
   }
-  if (input) metadata.input = input
+  // Copy the host input before effort updates are inserted, so the next tool
+  // request compares against host history and does not start a false user turn.
+  if (input) metadata.input = input.slice()
 }
 
 function prepareCodexRequest(input: {
@@ -956,6 +960,10 @@ function prepareCodexRequest(input: {
   responsesLite: boolean
   dumpSessionID?: string
 }): PreparedCodexRequest {
+  // Read and remove the internal agent header before any early return, so it
+  // cannot reach outgoing headers, cachekeep captures or request dumps.
+  const agent = input.headers.get(OPENAI_AGENT_HEADER)
+  input.headers.delete(OPENAI_AGENT_HEADER)
   if (!input.metadata) return { init: input.init }
   const body = parseJsonObject(input.init?.body)
   if (!input.websocket) updateHttpTurnMetadata(input.metadata, body)
@@ -1011,7 +1019,7 @@ function prepareCodexRequest(input: {
   parsed.parallel_tool_calls ??= true
   if (Array.isArray(parsed.tools))
     parsed.tools = parsed.tools.map(normalizeCodexTool)
-  applyMidConversationEffort(parsed, input.metadata)
+  applyMidConversationEffort(parsed, input.metadata, agent)
   if (useResponsesLite) rewriteResponsesLiteBody(parsed)
   const clientMetadata: Record<string, unknown> = {
     ...(typeof parsed.client_metadata === 'object' &&
@@ -1254,51 +1262,84 @@ export const MID_CONVERSATION_EFFORT_MODELS: ReadonlySet<string> = new Set([
   'gpt-6.1-sol',
 ])
 
+// OpenCode's built-in definitions (packages/opencode/src/agent/agent.ts in the
+// OpenCode repository) mark title, compaction and summary as hidden helpers,
+// not the conversation's agent loop. chat.headers supplies the
+// host's agent name; missing tags retain compatibility with other fetch callers.
+const OPENAI_AGENT_HEADER = 'x-openai-auth-agent'
+const HIDDEN_EFFORT_AGENTS = new Set(['title', 'compaction', 'summary'])
+
 /**
- * Change reasoning effort mid-session without disturbing the replayed prefix.
- *
- * Sending a different request-level `reasoning.effort` works, and is what the
- * host does on its own. The cost is that the effort is part of what the backend
- * keys its prefix cache on, so raising effort on turn 20 asks it to re-read the
- * whole conversation. Pinning the request-level value to whatever the session
- * opened with, and carrying the change as a `configuration_update` item
- * instead, leaves the prefix byte-identical.
- *
- * The item is re-asserted on every request rather than written into history:
- * the host owns the history and will not replay an item this plugin injected,
- * so an update recorded once would be gone by the next turn. Re-asserting also
- * places it immediately before the final entry — the new user message — which
- * is past the cached prefix, and makes two updates landing adjacent impossible.
- * The API rejects adjacent updates.
- *
- * The response keeps reporting the request-level effort rather than the updated
- * one, so usage records will show the pinned value. That is the documented
- * behaviour, not a bug to chase.
+ * Keep the request-level effort fixed for prefix caching. The host does not
+ * replay injected items, so remember each change at its original user message
+ * and rebuild the same prefix before the WebSocket pool trims continuations.
+ * Fingerprints detect compaction/revert at an anchor; a rewritten conversation
+ * starts a new pin rather than replaying instructions into unrelated history.
+ * Usage still reports the pinned request-level effort, not the effective one.
  */
 function applyMidConversationEffort(
   parsed: Record<string, unknown>,
   metadata: CodexSessionMetadata,
+  agent: string | null,
 ) {
+  if (agent !== null && HIDDEN_EFFORT_AGENTS.has(agent)) return
   const model = typeof parsed.model === 'string' ? parsed.model : ''
   if (!MID_CONVERSATION_EFFORT_MODELS.has(model)) return
   const reasoning = isRecord(parsed.reasoning) ? parsed.reasoning : undefined
   const effort =
     typeof reasoning?.effort === 'string' ? reasoning.effort : undefined
   if (!effort) return
-  if (metadata.pinnedEffort === undefined) {
+  const input = Array.isArray(parsed.input) ? parsed.input : undefined
+  metadata.effortUpdates ??= []
+  const updates = metadata.effortUpdates
+  const fingerprint = (item: unknown) =>
+    createHash('sha256')
+      .update(stableStringify(item))
+      .digest('hex')
+      .slice(0, 16)
+  if (
+    metadata.pinnedEffort === undefined ||
+    updates.some(
+      (update) =>
+        !input ||
+        !isMessageWithRole(input[update.anchor], 'user') ||
+        fingerprint(input[update.anchor]) !== update.fingerprint,
+    )
+  ) {
     metadata.pinnedEffort = effort
+    metadata.effortUpdates = []
     return
   }
-  if (effort === metadata.pinnedEffort) return
-  const input = Array.isArray(parsed.input) ? parsed.input : undefined
-  // With nothing to sit in front of, an update would be the whole request; let
-  // the request-level value stand rather than send a bare instruction.
   if (!input || input.length === 0) return
+  const anchor = input.findLastIndex((item) => isMessageWithRole(item, 'user'))
+  const latest = updates.at(-1)
+  const effective = latest?.effort ?? metadata.pinnedEffort
+  if (anchor >= 0 && effort !== effective) {
+    if (latest?.anchor === anchor) {
+      const before = updates.at(-2)?.effort ?? metadata.pinnedEffort
+      if (effort === before) updates.pop()
+      else latest.effort = effort
+    } else {
+      updates.push({ anchor, fingerprint: fingerprint(input[anchor]), effort })
+    }
+  } else if (anchor < 0 && effort !== effective) {
+    // No user turn can carry a new instruction; leave the host's effort alone.
+    return
+  }
   parsed.reasoning = { ...reasoning, effort: metadata.pinnedEffort }
-  input.splice(input.length - 1, 0, {
-    type: 'configuration_update',
-    reasoning: { effort },
-  })
+  // Descending insertion preserves host-relative indices. Distinct user-message
+  // anchors leave a message between updates, as required by the Responses API.
+  for (let i = updates.length - 1; i >= 0; i--) {
+    const update = updates[i]
+    if (!update) continue
+    const previous = updates[i - 1]
+    if (previous && previous.anchor >= update.anchor)
+      throw new Error('Effort update anchors must be distinct and increasing')
+    input.splice(update.anchor, 0, {
+      type: 'configuration_update',
+      reasoning: { effort: update.effort },
+    })
+  }
 }
 
 // Responses Lite trades capabilities for Codex's compact request shape. It is
@@ -1371,6 +1412,7 @@ export async function CodexAuthPlugin(
   const codexSessions = loadCodexSessions()
   const persistCodexSessions = () => saveCodexSessions(codexSessions)
   let websocketFetchInstalled = false
+  let codexFetchInstalled = false
   const websocketFetches: Array<
     ReturnType<typeof OpenAIWebSocketPool.createWebSocketFetch>
   > = []
@@ -4346,6 +4388,7 @@ export async function CodexAuthPlugin(
         // Fetch override that selects the active account, refreshes if
         // needed, sends the transformed Codex request, and records quota.
         // -------------------------------------------------------------------
+        codexFetchInstalled = true
         return {
           apiKey: OAUTH_DUMMY_KEY,
           async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
@@ -4365,7 +4408,10 @@ export async function CodexAuthPlugin(
               expires?: number
             } = await getAuth()
             const myGeneration = ++mainIdentityGeneration
-            if (currentAuth.type !== 'oauth') return fetch(requestInput, init)
+            if (currentAuth.type !== 'oauth') {
+              requestHeaders.delete(OPENAI_AGENT_HEADER)
+              return fetch(requestInput, { ...init, headers: requestHeaders })
+            }
             init = await materializeRequestInit(requestInput, init)
             // A migrated install whose slot holds the pool placeholder (or the
             // tombstone the removed vault custody left, which says the same:
@@ -4867,6 +4913,9 @@ export async function CodexAuthPlugin(
       output.headers['User-Agent'] =
         `${buildUserAgent(PackageVersion)} (${os.platform()} ${os.release()}; ${os.arch()})`
       output.headers['session-id'] = input.sessionID
+      // Only our Codex fetch removes the agent header; API-key requests use the
+      // host's fetch instead and must never receive this internal header.
+      if (codexFetchInstalled) output.headers[OPENAI_AGENT_HEADER] = input.agent
       // Temporary fetch-layer hack: title generation currently shares the conversation
       // session ID, so the OpenAI plugin marks it for HTTP fallback until transport
       // context can be passed directly instead of smuggled through headers.
