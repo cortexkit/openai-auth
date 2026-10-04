@@ -19,6 +19,7 @@ import {
   NO_ACCOUNT_REFUSAL,
   quotaFromCodexHeaders,
 } from '../v2/adapter'
+import { applyCodexBaseURL } from '../v2/endpoint'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { applyCodexModelRules } from '../v2/models'
 import { SessionPins } from '../v2/pins'
@@ -692,5 +693,62 @@ describe('OpenCode 2 adapter: event rules', () => {
     expect(error).toBeInstanceOf(OpenCode2AuthError)
     expect((error as OpenCode2AuthError).kind).toBe('no-account')
     expect((error as OpenCode2AuthError).message).toBe(NO_ACCOUNT_REFUSAL)
+  })
+})
+
+describe('Codex destination independent of the host credential', () => {
+  it('rewrites the default origin in the pool model.request hook', async () => {
+    const { host } = await startPool('main-first', [
+      { id: 'main', identity: 'acct-A', usedPercent: 5 },
+    ])
+    const draft = {
+      ...scope('ses_endpoint'),
+      baseURL: 'https://api.openai.com/v1',
+      headers: {} as Record<string, string>,
+    }
+    await host.fire('model.request', draft)
+    expect(draft.baseURL).toBe('https://chatgpt.com/backend-api/codex')
+    expect(draft.headers['session-id']).toBe('ses_endpoint')
+    expect(draft.headers['x-codex-beta-features']).toBe(
+      'terminal_resize_reflow',
+    )
+    const custom = {
+      ...scope('ses_custom'),
+      baseURL: 'https://proxy.example/v1',
+      headers: {},
+    }
+    await host.fire('model.request', custom)
+    expect(custom.baseURL).toBe('https://proxy.example/v1')
+  })
+
+  it('uses the configured Codex base and leaves API-key destinations unchanged', () => {
+    const oauth = { baseURL: 'https://api.openai.com/v1' }
+    applyCodexBaseURL(oauth, 'oauth', 'https://codex.example/custom/responses')
+    expect(oauth.baseURL).toBe('https://codex.example/custom')
+    const key = { baseURL: 'https://api.openai.com/v1' }
+    applyCodexBaseURL(key, 'api-key', 'https://codex.example/responses')
+    expect(key.baseURL).toBe('https://api.openai.com/v1')
+    const custom = { baseURL: 'https://api.openai.com.example/v1' }
+    expect(
+      applyCodexBaseURL(custom, 'oauth', 'https://codex.example/responses'),
+    ).toBe(true)
+    expect(custom.baseURL).toBe('https://api.openai.com.example/v1')
+  })
+
+  it('removes maxTokens from pool context and compaction without a host login', async () => {
+    const { host } = await startPool('main-first', [
+      { id: 'main', identity: 'acct-A', usedPercent: 5 },
+    ])
+    for (const hook of ['context', 'compaction']) {
+      const draft = {
+        ...scope('ses_options'),
+        options: { maxTokens: 1024, temperature: 0.5 } as {
+          maxTokens?: number
+          temperature: number
+        },
+      }
+      await host.fire(hook, draft)
+      expect(draft.options).toEqual({ temperature: 0.5 })
+    }
   })
 })

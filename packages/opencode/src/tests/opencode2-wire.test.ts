@@ -336,6 +336,7 @@ describe('through the OpenCode 2 entry', () => {
       version: CODEX_VERSION,
       'user-agent': CODEX_USER_AGENT,
       originator: 'codex_exec',
+      'x-codex-beta-features': 'terminal_resize_reflow',
     })
     const host = await start()
     const seen: Array<Record<string, string>> = []
