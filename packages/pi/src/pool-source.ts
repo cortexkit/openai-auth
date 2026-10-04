@@ -678,6 +678,23 @@ export class PiPoolSource {
         }))
         return
       }
+      if (outcome.status === 'identity-contradicted') {
+        // The provider handed back a different account's tokens. The store has
+        // already kept them on the row and disabled it, so this row stops
+        // serving here too; backing off would only retry a row that is off.
+        // The identities stay out of the log: they are ChatGPT account ids.
+        this.backoff.delete(id)
+        this.replaceRow(id, (row) => ({
+          ...row,
+          enabled: false,
+          candidate: false,
+        }))
+        this.log.warn(
+          'pool row disabled: its refresh returned a different account',
+          { rowId: id },
+        )
+        return
+      }
       this.recordRefreshFailure(id, refreshToken, new Error(outcome.reason))
     } catch (error) {
       this.recordRefreshFailure(id, refreshToken, error)

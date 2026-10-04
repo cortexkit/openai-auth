@@ -30,6 +30,7 @@ import type {
 } from '@earendil-works/pi-coding-agent'
 
 import { createPiMenu, registerCommands } from '../commands.ts'
+import { PiPoolSource } from '../pool-source.ts'
 import {
   clearPiStickyRouting,
   getPiStickyRouting,
@@ -672,5 +673,36 @@ describe('Pi /openai on the account pool', () => {
         ? (load.settings.routing as { mode?: string }).mode
         : undefined,
     ).toBe('fallback-first')
+  })
+})
+
+describe('a Pi pool refresh that returns another account', () => {
+  // The store keeps the new tokens on the row and disables it (the spent
+  // refresh token makes dropping them lose the login); the source must stop
+  // serving the row at once rather than back off and retry it.
+  test('takes the row out of routing in this process and on disk', async () => {
+    await addRow('gamma', jwt('acct-gamma'), 'acct-gamma', Date.now() + 60_000)
+    const source = new PiPoolSource({
+      paths: () => paths,
+      refreshProvider: async () => ({
+        access: jwt('acct-other', 'b'),
+        refresh: 'refresh-gamma-rotated',
+        expires: Date.now() + HOUR_MS,
+        identity: 'acct-other',
+      }),
+      pullQuota: async () => {
+        throw new Error('no quota poll in this test')
+      },
+    })
+    const view = await source.load()
+    await source.refreshDueTokens(view.rows, null)
+    const gamma = source.peek().rows.find((row) => row.id === 'gamma')
+    expect(gamma?.candidate).toBe(false)
+    expect(gamma?.enabled).toBe(false)
+    const reread = (await source.load()).rows.find((row) => row.id === 'gamma')
+    expect(reread?.candidate).toBe(false)
+    expect(reread?.identity).toBe('acct-gamma')
+    source.dispose()
+    await source.settled()
   })
 })
