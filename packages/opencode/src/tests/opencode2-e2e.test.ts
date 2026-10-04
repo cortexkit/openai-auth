@@ -26,6 +26,7 @@ import {
   startMockDaemon,
   vaultLogin,
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
+import { POOL_PLACEHOLDER } from '../core/pool-migration'
 import { CODEX_USER_AGENT, CODEX_VERSION } from '../index'
 import {
   MOCK_ACCOUNTS,
@@ -57,6 +58,7 @@ let cli = ''
 let serverPlugin = ''
 let loginPlugin = ''
 let vaultPlugin = ''
+let upgradePlugin = ''
 
 /** The vault account's record version, which a 401 must be reported with. */
 const VAULT_RECORD_VERSION = 7
@@ -223,6 +225,7 @@ async function runCli(
 }
 
 interface ScenarioResult {
+  readonly destinations: string[]
   readonly wire: WireRecord[]
   /** Agent-loop requests and frames as sent, with their headers. */
   readonly samples: WireSample[]
@@ -246,6 +249,7 @@ interface ScenarioResult {
 
 async function runScenario(input: {
   transport: Transport
+  upgrade?: 'default' | 'custom'
   accounts: MockAccount[]
   turns: Turn[]
   plugin?: string
@@ -269,6 +273,15 @@ async function runScenario(input: {
   }
   const configDir = join(isolated.XDG_CONFIG_HOME, 'opencode')
   seedPool(configDir, input.accounts, input.mode)
+  if (input.upgrade) {
+    const dataDir = join(isolated.XDG_DATA_HOME, 'opencode')
+    mkdirSync(dataDir, { recursive: true })
+    writeFileSync(
+      join(dataDir, 'auth.json'),
+      JSON.stringify({ openai: POOL_PLACEHOLDER }),
+    )
+    env.OPENAI_AUTH_E2E_DESTINATIONS = join(root, 'destinations.jsonl')
+  }
   let daemon: MockDaemon | undefined
   let rosterPath = ''
   if (input.vault) {
@@ -299,14 +312,18 @@ async function runScenario(input: {
     join(configDir, 'opencode.json'),
     JSON.stringify(
       {
-        plugins: [input.plugin ?? serverPlugin],
+        plugins: [
+          input.upgrade ? upgradePlugin : (input.plugin ?? serverPlugin),
+        ],
         providers: {
           openai: {
             // The host's own credential for the provider is the placeholder,
             // as it is after a login through the plugin.
             settings: {
-              baseURL: `${mock.url}/v1`,
-              apiKey: PLACEHOLDER,
+              ...(input.upgrade === 'default'
+                ? {}
+                : { baseURL: `${mock.url}/v1` }),
+              ...(input.upgrade ? {} : { apiKey: PLACEHOLDER }),
               transport: input.transport,
             },
             models: {
@@ -433,7 +450,15 @@ async function runScenario(input: {
   try {
     pluginLog = readFileSync(isolated.OPENCODE_OPENAI_AUTH_LOG_FILE, 'utf8')
   } catch {}
+  const destinations =
+    input.upgrade && existsSync(env.OPENAI_AUTH_E2E_DESTINATIONS!)
+      ? readFileSync(env.OPENAI_AUTH_E2E_DESTINATIONS!, 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as string)
+      : []
   const diagnostics = [
+    `destinations: ${JSON.stringify(destinations)}`,
     `vault reports: ${JSON.stringify(daemon?.reports ?? [])}`,
     `wire: ${JSON.stringify(mock.records)}`,
     `samples: ${JSON.stringify(mock.samples)}`,
@@ -444,6 +469,7 @@ async function runScenario(input: {
   ].join('\n')
   rmSync(root, { recursive: true, force: true })
   return {
+    destinations,
     wire: [...mock.records],
     samples: [...mock.samples],
     vaultReports: [...(daemon?.reports ?? [])],
@@ -500,6 +526,7 @@ function expectCodexClient(headers: Record<string, string>) {
   expect(headers.version).toBe(CODEX_VERSION)
   expect(headers['user-agent']).toBe(CODEX_USER_AGENT)
   expect(headers.originator).toBe('codex_exec')
+  expect(headers['session-id']).toBeTruthy()
 }
 
 const usedOn = (result: ScenarioResult, row: string) =>
@@ -565,6 +592,31 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       join(serverPlugin, 'index.js'),
       `export { default } from '${PACKAGE_NAME}/server'\n`,
     )
+    // Observe the destination chosen by the real driver before redirecting
+    // Codex traffic to loopback. Platform traffic is recorded and refused.
+    upgradePlugin = join(consumer, 'upgrade-plugin')
+    mkdirSync(upgradePlugin, { recursive: true })
+    writeFileSync(
+      join(upgradePlugin, 'index.js'),
+      [
+        `import plugin from '${PACKAGE_NAME}/server'`,
+        "import { appendFileSync } from 'node:fs'",
+        'export default { ...plugin, async setup(ctx) {',
+        '  const dispose = await plugin.setup(ctx)',
+        "  const wire = await ctx.session.hook('http.request', (draft) => {",
+        '    const url = new URL(draft.request.url)',
+        '    appendFileSync(process.env.OPENAI_AUTH_E2E_DESTINATIONS, JSON.stringify(url.href) + "\\n")',
+        "    if (url.origin === 'https://api.openai.com') throw new Error('platform API request refused by mock')",
+        "    if (url.origin === 'https://chatgpt.com') {",
+        "      if (!url.pathname.startsWith('/backend-api/codex/')) throw new Error('not a Codex path')",
+        '      draft.request = new Request(process.env.OPENAI_AUTH_E2E_MOCK_URL + url.pathname + url.search, draft.request)',
+        '    }',
+        "  }, { providerID: 'openai' })",
+        '  return async () => { await wire.dispose(); await dispose?.() }',
+        '} }',
+        '',
+      ].join('\n'),
+    )
     // The same entry with its ChatGPT login replaced by one that completes at
     // once as account C: the real OAuth flow needs auth.openai.com.
     const c = MOCK_ACCOUNTS.C
@@ -616,6 +668,46 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
   afterAll(() => {
     if (scratch) rmSync(scratch, { recursive: true, force: true })
   })
+
+  test('first run after OpenCode 1 upgrade reaches Codex without a provider baseURL', async () => {
+    const result = await runScenario({
+      transport: 'http',
+      upgrade: 'default',
+      accounts: ['A'],
+      turns: [{}],
+    })
+    verify(result, () => {
+      expect(result.destinations.length).toBeGreaterThan(0)
+      expect(
+        result.destinations.every((url) =>
+          url.startsWith('https://chatgpt.com/backend-api/codex/'),
+        ),
+      ).toBe(true)
+      expect(result.exits).toEqual([0])
+      expect(result.stdout.join('')).toContain('MOCK-HTTP-REPLY')
+      expectOnlyPoolAccountsOnWire(result)
+    })
+  }, 180_000)
+
+  test('first run after OpenCode 1 upgrade keeps a custom provider baseURL', async () => {
+    const result = await runScenario({
+      transport: 'http',
+      upgrade: 'custom',
+      accounts: ['A'],
+      turns: [{}],
+    })
+    verify(result, () => {
+      expect(result.destinations.length).toBeGreaterThan(0)
+      expect(
+        result.destinations.every((url) =>
+          /^http:\/\/127\.0\.0\.1:\d+\/v1\//.test(url),
+        ),
+      ).toBe(true)
+      expect(result.exits).toEqual([0])
+      expect(result.stdout.join('')).toContain('MOCK-HTTP-REPLY')
+      expectOnlyPoolAccountsOnWire(result)
+    })
+  }, 180_000)
 
   test('http: a sticky session stays on its account, and its quota lands on that row', async () => {
     const result = await runScenario({
