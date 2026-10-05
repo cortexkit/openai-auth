@@ -20,6 +20,7 @@ const sections = [
   'resolutions',
 ]
 const offenders = []
+let manifests = 0
 
 function outside(path) {
   const resolved = resolve(path)
@@ -84,6 +85,7 @@ function walk(dir) {
     const path = join(dir, entry.name)
     if (entry.isDirectory()) walk(path)
     else if (entry.name === 'package.json') {
+      manifests += 1
       const manifest = JSON.parse(readFileSync(path, 'utf8'))
       for (const section of sections)
         inspectTree(manifest[section], path, section, dirname(path))
@@ -110,6 +112,12 @@ try {
 } catch (error) {
   if (error.code !== 'ENOENT') throw error
 }
+// A scan that read nothing would pass vacuously (a wrong root, a renamed
+// layout), so an empty census is a failure of the check itself.
+if (manifests === 0) {
+  console.error(`no package.json found under ${root}; nothing was checked`)
+  process.exit(2)
+}
 if (offenders.length) {
   for (const item of offenders)
     console.error(
@@ -117,4 +125,6 @@ if (offenders.length) {
     )
   process.exit(1)
 }
-console.log('local dependencies stay within repository')
+console.log(
+  `local dependencies stay within repository (${manifests} package.json checked)`,
+)

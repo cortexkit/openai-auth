@@ -41,6 +41,17 @@ function lock(root: string, coreSpec: string, rootSpec?: string) {
 }
 
 describe('local dependency build gate', () => {
+  it('fails as unchecked when it finds no package.json', () => {
+    const root = mkdtempSync(join(tmpdir(), 'local-deps-empty-'))
+    try {
+      const result = check(root)
+      expect(result.status).toBe(2)
+      expect(result.stderr).toContain('nothing was checked')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('rejects file dependencies outside the repository and names the offender', () => {
     fixture((root) => {
       manifest(root, { sibling: 'file:../sibling' })
