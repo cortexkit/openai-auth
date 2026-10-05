@@ -446,10 +446,12 @@ describe('MUST 1 — refresh-file-lock: atomic steal elects a single owner', () 
 })
 
 // ---------------------------------------------------------------------------
-// Refresh-file-lock: fencing-token eviction marker
+// MUST 1 (R2) — refresh-file-lock: fencing-token eviction marker
+//
+// Two tests ported from the verified sibling (anthropic-auth 6ffba4b):
 //
 //   (a) Deterministic seam test: two contenders (A and C) coordinated via the
-//       onStep hook reproduce marker theft — C renames the FRESH marker
+//       onStep hook reproduce the 3rd interleaving — C renames the FRESH marker
 //       that A (the mkdir-winner) created. The four ownsEvictionMarker() fence
 //       checks in the critical section must detect the theft and elect exactly
 //       one winner.
