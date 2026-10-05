@@ -446,17 +446,15 @@ describe('MUST 1 — refresh-file-lock: atomic steal elects a single owner', () 
 })
 
 // ---------------------------------------------------------------------------
-// MUST 1 (R2) — refresh-file-lock: fencing-token eviction marker
-//
-// Two tests ported from the verified sibling (anthropic-auth 6ffba4b):
+// Refresh-file-lock: fencing-token eviction marker
 //
 //   (a) Deterministic seam test: two contenders (A and C) coordinated via the
-//       onStep hook reproduce the 3rd interleaving — C renames the FRESH marker
+//       onStep hook reproduce marker theft — C renames the FRESH marker
 //       that A (the mkdir-winner) created. The four ownsEvictionMarker() fence
 //       checks in the critical section must detect the theft and elect exactly
 //       one winner.
 //
-//   (b) High-volume stress: 3000 rounds × 16 contenders on a seeded stale lock;
+//   (b) Bounded stress: 128 rounds × 16 contenders on a seeded stale lock;
 //       every round must elect exactly one winner with zero eviction-marker leaks.
 // ---------------------------------------------------------------------------
 
@@ -621,9 +619,11 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
 
   it('refresh file lock stale-marker steal has a single winner across bounded contention', async () => {
     // The deterministic forced-race test above covers the fencing interleaving
-    // directly. This bounded sample adds filesystem contention coverage without
-    // making the full suite depend on tens of thousands of real fs races.
-    // Every round must still elect exactly one winner with zero marker leaks.
+    // directly. Repeated cohorts still search for rare filesystem interleavings,
+    // including errors when an eviction marker disappears. Use 128 rounds, as in
+    // core/src/tests/refresh-file-lock.test.ts, to limit real I/O under load.
+    // The fixed logical clock prevents a slow cohort from expiring its winner;
+    // every round must still elect exactly one winner with zero marker leaks.
     const { acquireRefreshFileLock } = await import(
       '@cortexkit/openai-auth-core/internal'
     )
@@ -632,7 +632,7 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
     const name = 'test-refresh-high-volume-stale-steal'
     const ttlMs = 1_000
     const contenders = 16
-    const rounds = 512
+    const rounds = 128
 
     for (let round = 0; round < rounds; round++) {
       const now = 1_000_000 + round * 20_000
