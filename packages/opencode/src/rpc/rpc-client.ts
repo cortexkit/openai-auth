@@ -5,10 +5,10 @@
 import {
   createRpcClient as createCommonRpcClient,
   type PortFileEntry,
-} from '@cortexkit/common-auth/rpc'
+} from '@cortexkit/common-auth/rpc/client'
 import type { ApplyRequest, ApplyResult, RpcNotification } from './protocol'
 
-export { DEFAULT_RPC_TIMEOUT_MS } from '@cortexkit/common-auth/rpc'
+export { DEFAULT_RPC_TIMEOUT_MS } from '@cortexkit/common-auth/rpc/client'
 
 export interface RpcClient {
   pending: (
