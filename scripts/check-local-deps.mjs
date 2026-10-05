@@ -1,4 +1,9 @@
 #!/usr/bin/env bun
+// Refuses any dependency that resolves outside this repository, in every
+// package.json and in bun.lock. A dependency on a sibling checkout builds
+// locally from whatever happens to be on disk there, and fails or silently
+// differs everywhere else (CI, other machines, a release build).
+// Usage: bun scripts/check-local-deps.mjs [repo-root]
 import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve, sep } from 'node:path'
 
@@ -23,6 +28,9 @@ function outside(path) {
 function inspect(spec, file, field, name, base) {
   if (typeof spec !== 'string' || spec.startsWith('workspace:')) return
   let local
+  // Only these forms are filesystem paths. Registry ranges, `npm:` aliases,
+  // `user/repo` shorthand and git URLs also contain `/` but never point at a
+  // local directory.
   if (/^(file|link|portal):/.test(spec))
     local = spec.slice(spec.indexOf(':') + 1)
   else if (
@@ -43,6 +51,9 @@ function inspectTree(value, file, field, base) {
     else inspectTree(spec, file, field, base)
   }
 }
+// bun.lock is JSON with trailing commas, which JSON.parse rejects. Drop a
+// comma that only whitespace separates from a closing `}` or `]`, outside
+// strings.
 function stripTrailingCommas(text) {
   let output = ''
   let inString = false
@@ -84,7 +95,10 @@ const lock = join(root, 'bun.lock')
 try {
   const contents = readFileSync(lock, 'utf8')
   const json = JSON.parse(stripTrailingCommas(contents))
-  // Resolved package entries mirror workspace specs but omit their protocol, so workspaces are authoritative.
+  // Each `workspaces` entry copies a package.json's dependency specs, which
+  // are relative to that package's directory (the entry's key, "" for the
+  // root). The `packages` section repeats the same resolutions without their
+  // protocol, so the workspace entries are the ones to check.
   for (const [workspace, manifest] of Object.entries(json.workspaces ?? {})) {
     const base = resolve(root, workspace)
     for (const section of sections) {
