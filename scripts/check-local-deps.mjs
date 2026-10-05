@@ -29,7 +29,7 @@ function inspect(spec, file, field, name, base) {
     spec.startsWith('/') ||
     spec.startsWith('./') ||
     spec.startsWith('../') ||
-    (!spec.startsWith('@') && spec.includes('/') && !/^[\d^~*<>=]/.test(spec))
+    spec.startsWith('~/')
   )
     local = spec
   else return
@@ -42,6 +42,30 @@ function inspectTree(value, file, field, base) {
     if (typeof spec === 'string') inspect(spec, file, field, name, base)
     else inspectTree(spec, file, field, base)
   }
+}
+function stripTrailingCommas(text) {
+  let output = ''
+  let inString = false
+  let escaped = false
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    if (inString) {
+      output += char
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+    if (char === '"') {
+      inString = true
+      output += char
+    } else if (char === ',') {
+      let next = index + 1
+      while (/\s/.test(text[next] ?? '')) next += 1
+      if (text[next] !== '}' && text[next] !== ']') output += char
+    } else output += char
+  }
+  return output
 }
 function walk(dir) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -59,8 +83,15 @@ walk(root)
 const lock = join(root, 'bun.lock')
 try {
   const contents = readFileSync(lock, 'utf8')
-  for (const match of contents.matchAll(/"((?:file|link|portal):[^"]+)"/g)) {
-    inspect(match[1], lock, 'bun.lock', match[1], root)
+  const json = JSON.parse(stripTrailingCommas(contents))
+  // Resolved package entries mirror workspace specs but omit their protocol, so workspaces are authoritative.
+  for (const [workspace, manifest] of Object.entries(json.workspaces ?? {})) {
+    const base = resolve(root, workspace)
+    for (const section of sections) {
+      const field = `workspaces[${workspace}].${section}`
+      for (const [name, spec] of Object.entries(manifest[section] ?? {}))
+        inspect(spec, lock, field, name, base)
+    }
   }
 } catch (error) {
   if (error.code !== 'ENOENT') throw error

@@ -11,7 +11,7 @@ const checker = join(
 function fixture(run: (root: string) => void) {
   const root = mkdtempSync(join(tmpdir(), 'local-deps-'))
   try {
-    mkdirSync(join(root, 'packages/x'), { recursive: true })
+    mkdirSync(join(root, 'packages/core'), { recursive: true })
     run(root)
   } finally {
     rmSync(root, { recursive: true, force: true })
@@ -26,6 +26,19 @@ function manifest(root: string, deps: object) {
     JSON.stringify({ dependencies: deps }),
   )
 }
+function lock(root: string, coreSpec: string, rootSpec?: string) {
+  writeFileSync(
+    join(root, 'bun.lock'),
+    `{
+      "lockfileVersion": 1,
+      "workspaces": {
+        "": { "dependencies": { "root-dep": "${rootSpec ?? '1.0.0'}", }, },
+        "packages/core": { "dependencies": { "@cortexkit/common-auth": "${coreSpec}", }, },
+      },
+      "packages": { "@cortexkit/common-auth": ["@cortexkit/common-auth@../../x.tgz", {}], },
+    }`,
+  )
+}
 
 describe('local dependency build gate', () => {
   it('rejects file dependencies outside the repository and names the offender', () => {
@@ -38,25 +51,51 @@ describe('local dependency build gate', () => {
     })
   })
 
-  it('allows local file and workspace dependencies', () => {
+  it('allows local file, workspace, registry, and git dependency specs', () => {
     fixture((root) => {
-      manifest(root, { x: 'file:./packages/x', workspace: 'workspace:*' })
+      manifest(root, {
+        x: 'file:./packages/core',
+        workspace: 'workspace:*',
+        repository: 'user/repo',
+        npmAlias: 'npm:@scope/pkg@1',
+        gitRepository: 'git+https://example.com/repo.git',
+      })
       const result = check(root)
       expect(result.status).toBe(0)
     })
   })
 
-  it('checks bun.lock local protocols against repository root', () => {
+  it('resolves lockfile file specs from their workspace directories', () => {
     fixture((root) => {
       manifest(root, {})
-      writeFileSync(
-        join(root, 'bun.lock'),
-        JSON.stringify({ packages: { external: 'file:../sibling' } }),
-      )
+      lock(root, 'file:../../x.tgz')
+      const result = check(root)
+      expect(result.status).toBe(0)
+    })
+  })
+
+  it('rejects out-of-root lockfile specs and names the package workspace', () => {
+    fixture((root) => {
+      manifest(root, {})
+      lock(root, 'file:../../../outside.tgz')
       const result = check(root)
       expect(result.status).toBe(1)
-      expect(result.stderr).toContain('bun.lock')
-      expect(result.stderr).toContain('file:../sibling')
+      expect(result.stderr).toContain('workspaces[packages/core].dependencies')
+      expect(result.stderr).toContain(
+        '@cortexkit/common-auth file:../../../outside.tgz',
+      )
+    })
+  })
+
+  it('rejects a root workspace lockfile dependency outside the repository', () => {
+    fixture((root) => {
+      manifest(root, {})
+      lock(root, '1.0.0', 'file:../sibling')
+      const result = check(root)
+      expect(result.status).toBe(1)
+      expect(result.stderr).toContain(
+        'workspaces[].dependencies root-dep file:../sibling',
+      )
     })
   })
 })
