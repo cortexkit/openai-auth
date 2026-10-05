@@ -312,7 +312,7 @@ Install dependencies:
 bun install
 ```
 
-Run checks:
+Run checks (the build refuses dependencies that resolve outside the repository):
 
 ```bash
 bun run typecheck
