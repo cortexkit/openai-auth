@@ -5,7 +5,7 @@
 // drive the plugin's real fetch override (as integration.test.ts does) and the
 // loader lifecycle against that layout.
 
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import {
   existsSync,
   mkdtempSync,
@@ -38,6 +38,7 @@ import {
   type SidebarState,
 } from '../sidebar-state.ts'
 import { PackageVersion } from '../version.ts'
+import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,
@@ -65,6 +66,8 @@ let configFile: string
 let sidebarFile: string
 let originalFetch: typeof globalThis.fetch
 let hooks: Hooks | undefined
+const scope = createRequestTestScope()
+const it = scope.it
 
 beforeEach(() => {
   configDir = mkdtempSync(join(tmpdir(), 'oai-pool-main-'))
@@ -84,16 +87,19 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
-  globalThis.fetch = originalFetch
-  await hooks?.dispose?.()
-  await drainSidebarWrites()
-  process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-  process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = FLOOR_SIDEBAR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-  restoreEnv('OPENCODE_CONFIG_DIR')
-  restoreEnv('XDG_STATE_HOME')
-  delete process.env.NODE_ENV
+  await scope.teardown(async () => {
+    await hooks?.dispose?.()
+    globalThis.fetch = originalFetch
+    await drainSidebarWrites()
+    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+      FLOOR_SIDEBAR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+    restoreEnv('OPENCODE_CONFIG_DIR')
+    restoreEnv('XDG_STATE_HOME')
+    delete process.env.NODE_ENV
+  })
 })
 
 function mockPluginInput(): PluginInput {
@@ -212,7 +218,7 @@ async function loadFetch(getAuth: () => Promise<SlotValue>) {
     | ((url: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
     | undefined
   if (!fetchOverride) throw new Error('No fetch in loader result')
-  return fetchOverride
+  return scope.wrap(fetchOverride)
 }
 
 function request(headers: Record<string, string> = {}): RequestInit {

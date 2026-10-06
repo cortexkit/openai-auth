@@ -7,7 +7,7 @@
 // declined-account interlock, one owner per ChatGPT account, the host-slot
 // guard, and what an install still holds from the removed handle-mode
 // custody.
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import {
   chmodSync,
   mkdirSync,
@@ -69,6 +69,7 @@ function wireWithExhaustedMain(): Wire {
   })
 }
 
+import { createRequestTestScope } from './request-test-scope.ts'
 import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env'
 
 const ENROLLMENT_TOKEN = '01'.repeat(32)
@@ -80,6 +81,8 @@ let stateDir: string
 let daemon: MockDaemon | undefined
 let hooks: Hooks | undefined
 let originalFetch: typeof globalThis.fetch
+const scope = createRequestTestScope()
+const test = scope.it
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'openai-vault-'))
@@ -94,14 +97,16 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
-  await hooks?.dispose?.()
-  hooks = undefined
-  await daemon?.stop()
-  daemon = undefined
-  globalThis.fetch = originalFetch
-  process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-  process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-  rmSync(dir, { recursive: true, force: true })
+  await scope.teardown(async () => {
+    await hooks?.dispose?.()
+    hooks = undefined
+    await daemon?.stop()
+    daemon = undefined
+    globalThis.fetch = originalFetch
+    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+    rmSync(dir, { recursive: true, force: true })
+  })
 })
 
 async function startDaemon(credentials: Record<string, MockCredential> = {}) {
@@ -159,7 +164,7 @@ function request(
   fetchImpl: typeof globalThis.fetch,
   sessionId?: string,
 ): Promise<Response> {
-  return fetchImpl('https://api.openai.com/v1/responses', {
+  return scope.wrap(fetchImpl)('https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',

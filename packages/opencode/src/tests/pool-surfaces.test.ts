@@ -3,7 +3,7 @@
 // cachekeep, reset credits and the auth menu. Each reads and writes the
 // account pool's rows, never the legacy main slot plus fallback list.
 
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -36,6 +36,7 @@ import {
   usageBody,
   waitFor,
 } from './fixtures/pool-install'
+import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,
@@ -50,6 +51,8 @@ let paths: AccountPaths
 let sidebarFile: string
 let originalFetch: typeof globalThis.fetch
 let hooks: Hooks | undefined
+const scope = createRequestTestScope()
+const it = scope.it
 
 beforeEach(() => {
   configDir = mkdtempSync(join(tmpdir(), 'oai-pool-surfaces-'))
@@ -73,19 +76,22 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
-  globalThis.fetch = originalFetch
-  await hooks?.dispose?.()
-  await drainSidebarWrites()
-  // Background pool writes may still be landing; let them finish before the
-  // directory goes away.
-  await sleep(50)
-  process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-  process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = FLOOR_SIDEBAR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-  restoreEnv('OPENCODE_CONFIG_DIR')
-  delete process.env.NODE_ENV
-  rmSync(configDir, { recursive: true, force: true })
+  await scope.teardown(async () => {
+    await hooks?.dispose?.()
+    globalThis.fetch = originalFetch
+    await drainSidebarWrites()
+    // Background pool writes may still be landing; let them finish before the
+    // directory goes away.
+    await sleep(50)
+    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+      FLOOR_SIDEBAR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+    restoreEnv('OPENCODE_CONFIG_DIR')
+    delete process.env.NODE_ENV
+    rmSync(configDir, { recursive: true, force: true })
+  })
 })
 
 /** Background poller timers whose tick the test fires by hand. */
