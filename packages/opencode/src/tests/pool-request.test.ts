@@ -61,6 +61,73 @@ const scope = createRequestTestScope()
 const it = scope.it
 const releasePolls: Array<() => void> = []
 
+type Phase = { name: string; offsetMs: number; durationMs?: number }
+let phaseClock:
+  | { step<T>(name: string, run: () => T): T; report(reason: string): void }
+  | undefined
+
+// Retain nested phases so a stuck request identifies its last wire or sidebar
+// operation, not just the outer fetch. Ordinary successful tests stay silent.
+function phaseIt(name: string, body: () => Promise<void>) {
+  return scope.it(name, async () => {
+    const started = performance.now()
+    const phases: Phase[] = []
+    const clock = {
+      step<T>(step: string, run: () => T): T {
+        const start = performance.now()
+        const phase: Phase = { name: step, offsetMs: start - started }
+        phases.push(phase)
+        const finish = () => {
+          phase.durationMs = performance.now() - start
+        }
+        try {
+          const result = run()
+          if (result instanceof Promise) return result.finally(finish) as T
+          finish()
+          return result
+        } catch (error) {
+          finish()
+          throw error
+        }
+      },
+      report(reason: string) {
+        const elapsedMs = performance.now() - started
+        console.error(
+          JSON.stringify({
+            test: name,
+            reason,
+            elapsedMs,
+            phases: phases.map((phase) => ({
+              ...phase,
+              durationMs: phase.durationMs ?? elapsedMs - phase.offsetMs,
+              inFlight: phase.durationMs === undefined,
+            })),
+          }),
+        )
+      },
+    }
+    phaseClock = clock
+    const deadline = setTimeout(
+      () => clock.report('body exceeded 5000 ms'),
+      5_000,
+    )
+    try {
+      await body()
+      if (performance.now() - started >= 5_000)
+        clock.report('slow body completed')
+    } catch (error) {
+      clock.report('body failed')
+      throw error
+    } finally {
+      clearTimeout(deadline)
+    }
+  })
+}
+
+function phase<T>(name: string, run: () => T): T {
+  return phaseClock ? phaseClock.step(name, run) : run()
+}
+
 beforeEach(() => {
   configDir = mkdtempSync(join(tmpdir(), 'oai-pool-request-'))
   configFile = join(configDir, 'openai-auth.json')
@@ -74,27 +141,31 @@ beforeEach(() => {
   process.env.OPENCODE_CONFIG_DIR = configDir
   originalFetch = globalThis.fetch
   hooks = undefined
+  phaseClock = undefined
 })
 
 afterEach(async () => {
   for (const lock of heldLocks.splice(0)) await lock.release()
   for (const release of releasePolls.splice(0)) release()
-  await scope.teardown(async () => {
-    await hooks?.dispose?.()
-    globalThis.fetch = originalFetch
-    await drainSidebarWrites()
-    // Background pool writes may still be landing; give them a moment so they
-    // never write into the next test's files.
-    await new Promise((resolve) => setTimeout(resolve, 50))
-    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
-      FLOOR_SIDEBAR_STATE_FILE
-    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    restoreEnv('OPENCODE_CONFIG_DIR')
-    delete process.env.NODE_ENV
-    rmSync(configDir, { recursive: true, force: true })
-  })
+  await scope.teardown(
+    async () => {
+      await hooks?.dispose?.()
+      globalThis.fetch = originalFetch
+      await drainSidebarWrites()
+      // Startup pool pulls are not tracked by the request scope. Keep a short
+      // grace period for their writes before removing this test's files.
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+      process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+        FLOOR_SIDEBAR_STATE_FILE
+      process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+      restoreEnv('OPENCODE_CONFIG_DIR')
+      delete process.env.NODE_ENV
+      rmSync(configDir, { recursive: true, force: true })
+    },
+    () => phaseClock?.report('request scope teardown: body still in flight'),
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -328,10 +399,12 @@ function installWire(
         : new Response(usageBody(10), { status: 200 })
     }
     if (target.includes('/responses')) {
-      wire.sends.push(bearer)
-      return options.respond
-        ? options.respond(bearer)
-        : new Response('{}', { status: 200, headers: quotaHeaders(42) })
+      return phase(`wire send ${wire.sends.length + 1}: ${bearer}`, () => {
+        wire.sends.push(bearer)
+        return options.respond
+          ? options.respond(bearer)
+          : new Response('{}', { status: 200, headers: quotaHeaders(42) })
+      })
     }
     return new Response('unavailable', { status: 503 })
   }) as unknown as typeof globalThis.fetch
@@ -361,20 +434,27 @@ type FetchOverride = (
 async function loadFetch(
   experimentalWebSockets = false,
 ): Promise<FetchOverride> {
-  hooks = await CodexAuthPlugin(mockPluginInput(), { experimentalWebSockets })
+  hooks = await phase('plugin initialization', () =>
+    CodexAuthPlugin(mockPluginInput(), { experimentalWebSockets }),
+  )
   const authHook = hooks.auth
   if (!authHook?.loader) throw new Error('No auth loader')
-  const loaded = await authHook.loader(
-    (async () => ({ ...PLACEHOLDER })) as never,
-    { id: 'openai', label: 'OpenAI', models: [] } as unknown as Parameters<
-      NonNullable<(typeof authHook)['loader']>
-    >[1],
+  const loaded = await phase('auth loader', () =>
+    authHook.loader!(
+      (async () => ({ ...PLACEHOLDER })) as never,
+      { id: 'openai', label: 'OpenAI', models: [] } as unknown as Parameters<
+        NonNullable<(typeof authHook)['loader']>
+      >[1],
+    ),
   )
   const fetchOverride = (loaded as Record<string, unknown>).fetch as
     | FetchOverride
     | undefined
   if (!fetchOverride) throw new Error('No fetch in loader result')
-  return scope.wrap(fetchOverride)
+  let call = 0
+  return scope.wrap((url, init) =>
+    phase(`fetchOverride ${++call}`, () => fetchOverride(url, init)),
+  )
 }
 
 const URL_RESPONSES = 'https://api.openai.com/v1/responses'
@@ -394,8 +474,10 @@ function request(sessionId?: string): RequestInit {
 }
 
 async function sidebar(): Promise<SidebarState> {
-  await drainSidebarWrites()
-  return normalizeSidebarState(JSON.parse(readFileSync(sidebarFile, 'utf8')))
+  return phase('sidebar read (including drainSidebarWrites)', async () => {
+    await drainSidebarWrites()
+    return normalizeSidebarState(JSON.parse(readFileSync(sidebarFile, 'utf8')))
+  })
 }
 
 function pinOf(state: SidebarState, sessionId: string) {
@@ -725,6 +807,7 @@ describe('exhaustion and the credit budget on a migrated install', () => {
 // ---------------------------------------------------------------------------
 
 describe('the killswitch on a migrated install', () => {
+  const it = phaseIt
   const killswitch = { killswitch: { enabled: true } }
 
   for (const mode of MODES) {
@@ -773,6 +856,7 @@ describe('the killswitch on a migrated install', () => {
 // ---------------------------------------------------------------------------
 
 describe('sticky-balanced on a migrated install', () => {
+  const it = phaseIt
   it('drains a timed-out sticky body before restoring fetch, naming its owner', async () => {
     seedPool(
       'sticky-balanced',
