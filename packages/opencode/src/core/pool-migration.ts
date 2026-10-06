@@ -1574,7 +1574,7 @@ async function run(
       reason: error instanceof Error ? error.message : String(error),
     }
   }
-  const early = gate(ctx, mode, config)
+  const early = await gate(ctx, mode, config)
   if (early) {
     if (early.status === 'already-migrated' && 'mainAccountId' in config)
       await repairShield(ctx)
@@ -1642,18 +1642,21 @@ async function run(
  * The checks that end a run before any lock: the migration marker (already
  * migrated, or not yet for an adoption) and, for an adoption, the vault.
  */
-function gate(
+async function gate(
   ctx: Context,
   mode: 'migrate' | 'adopt',
   config: Record<string, unknown>,
-): PoolTransferOutcome | undefined {
+): Promise<PoolTransferOutcome | undefined> {
   const book = readPoolMigrationBookkeeping(config)
   if (mode === 'migrate' && book.migratedAt !== undefined)
     return { status: 'already-migrated' }
   if (mode === 'adopt' && book.migratedAt === undefined)
     return { status: 'not-migrated' }
   if (mode === 'adopt' && ctx.vaultServes?.()) {
-    if (!vaultSkipLogged.has(ctx.paths.configPath)) {
+    if (
+      !vaultSkipLogged.has(ctx.paths.configPath) &&
+      (await readSlot(ctx)).kind === 'real'
+    ) {
       vaultSkipLogged.add(ctx.paths.configPath)
       ctx.log.warn(
         'a login in the OpenCode slot is not adopted: the Claustrum vault serves this host its accounts',
@@ -1671,7 +1674,7 @@ async function runLocked(
   let idHint: string | undefined
   for (let attempt = 0; attempt < 4; attempt++) {
     const config = await readConfig(ctx.paths.configPath)
-    const early = gate(ctx, mode, config)
+    const early = await gate(ctx, mode, config)
     if (early) {
       if (early.status === 'already-migrated') await repairShield(ctx)
       return early
