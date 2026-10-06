@@ -446,6 +446,7 @@ export interface ChildRun {
   steps: string[]
   outcome?: Json
   output: string
+  stderr: string
 }
 
 /** Runs one migration or adoption in a separate process (see the child). */
@@ -455,14 +456,19 @@ export function runChild(task: ChildTask): Promise<ChildRun> {
     env: process.env,
   })
   let out = ''
+  let stderr = ''
   child.stdout.on('data', (chunk: Buffer) => {
     out += chunk.toString()
   })
   child.stderr.on('data', (chunk: Buffer) => {
+    stderr += chunk.toString()
     out += chunk.toString()
   })
-  return new Promise((resolve) => {
-    child.on('exit', (code) => {
+  return new Promise((resolve, reject) => {
+    child.on('error', reject)
+    // Exit can precede the last pipe data. Close guarantees the child's error
+    // stack and final migration step are collected before assertions run.
+    child.on('close', (code) => {
       const lines = out.split('\n')
       const steps = lines
         .filter((line) => line.startsWith('step:'))
@@ -473,6 +479,7 @@ export function runChild(task: ChildTask): Promise<ChildRun> {
         code,
         steps,
         output: out,
+        stderr,
         ...(outcomeLine
           ? { outcome: JSON.parse(outcomeLine.slice('outcome:'.length)) }
           : {}),

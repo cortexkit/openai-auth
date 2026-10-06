@@ -3,9 +3,10 @@
 // (through openai-auth's real legacy functions), adoption of later logins,
 // the slot fence and its declared race, and refreshing a pool row while
 // older builds may refresh the same token.
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn } from 'bun:test'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import * as commonFs from '@cortexkit/common-auth/fs'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
 import {
@@ -61,11 +62,15 @@ import {
   seedLegacyInstall,
 } from './fixtures/pool-migration-harness.ts'
 
+import { createRequestTestScope } from './request-test-scope'
+
+const scope = createRequestTestScope()
+const it = scope.it
 let h: Harness
 beforeEach(() => {
   h = harness()
 })
-afterEach(() => h.cleanup())
+afterEach(async () => scope.teardown(async () => h.cleanup()))
 
 function deferred<T = void>() {
   let resolve!: (value: T) => void
@@ -75,13 +80,16 @@ function deferred<T = void>() {
   return { promise, resolve }
 }
 
-function openStore() {
+function openStore(
+  onLockEvent?: Parameters<typeof openPoolStore>[0]['onLockEvent'],
+) {
   return openPoolStore({
     provider: 'openai',
     configPath: h.paths.configPath,
     statePath: h.paths.statePath,
     quota: quotaCodec,
     lockOptions: { timeoutMs: 5_000 },
+    onLockEvent,
   })
 }
 
@@ -325,8 +333,23 @@ describe('older builds running at the same time', () => {
       }),
     })
     await locked.promise
+    const contended = deferred()
+    const acquire = commonFs.acquireRefreshFileLock
+    const lockSpy = spyOn(
+      commonFs,
+      'acquireRefreshFileLock',
+    ).mockImplementation(async (options) => {
+      const result = await acquire(options)
+      if (options.name === MAIN_REFRESH_LOCK_NAME && result === null)
+        contended.resolve()
+      return result
+    })
     const migration = migrateToPool(h.deps())
-    await Bun.sleep(300)
+    try {
+      await contended.promise
+    } finally {
+      lockSpy.mockRestore()
+    }
     proceed.resolve()
     await legacy
     expect(await migration).toMatchObject({ status: 'completed' })
@@ -352,8 +375,11 @@ describe('older builds running at the same time', () => {
     await seedLegacyInstall(h)
     await leaseSlotToken('older-build')
     let rowWhileLeased: unknown = 'not checked'
+    const initialized = Promise.withResolvers<void>()
     const released = (async () => {
-      await Bun.sleep(200)
+      // The store cannot expose rows until migration writes its pool key.
+      // Observe that step instead of guessing how long initialization takes.
+      await initialized.promise
       rowWhileLeased = await h.row('main')
       // The older build's refresh ends and clears its lease, as
       // `refreshMainWithLease` does in its `finally`.
@@ -367,7 +393,12 @@ describe('older builds running at the same time', () => {
       }, h.paths)
     })()
     const outcome = await migrateToPool(
-      h.deps({ leaseWait: { timeoutMs: 5_000, pollMs: 20 } }),
+      h.deps({
+        leaseWait: { timeoutMs: 5_000, pollMs: 20 },
+        onStep: async (step) => {
+          if (step === 'after-pool-key-write') initialized.resolve()
+        },
+      }),
     )
     await released
     expect(rowWhileLeased).toBeUndefined()
@@ -688,12 +719,25 @@ describe('adoption of a later login in the slot', () => {
       path: h.paths.configPath,
     })
     let rowWhileHeld: unknown
+    const contended = deferred()
     const released = (async () => {
-      await Bun.sleep(300)
+      await contended.promise
       rowWhileHeld = (await h.row('main'))?.credential
       await held?.release()
     })()
-    const outcome = await adoptHostSlotLogin(h.deps())
+    const outcome = await adoptHostSlotLogin(
+      h.deps({
+        store: {
+          onLockEvent: (event) => {
+            if (
+              event.type === 'contended' &&
+              event.name === fallbackRefreshLockName('main')
+            )
+              contended.resolve()
+          },
+        },
+      }),
+    )
     await released
     expect(rowWhileHeld).toMatchObject({ access: jwt('acct-main') })
     expect(outcome).toMatchObject({
@@ -859,13 +903,26 @@ describe('a slot that changes while the row write waits for its legacy lock', ()
     await h.setSlot(login('acct-main', 'r-main-2'))
     const held = await holdRowLock('main')
     let rowWhileHeld: unknown
+    const contended = deferred()
     const change = (async () => {
-      await Bun.sleep(300)
+      await contended.promise
       rowWhileHeld = (await h.row('main'))?.credential
       await h.setSlot(login('acct-main', 'r-main-3', 'third'))
       await held?.release()
     })()
-    const outcome = await adoptHostSlotLogin(h.deps())
+    const outcome = await adoptHostSlotLogin(
+      h.deps({
+        store: {
+          onLockEvent: (event) => {
+            if (
+              event.type === 'contended' &&
+              event.name === fallbackRefreshLockName('main')
+            )
+              contended.resolve()
+          },
+        },
+      }),
+    )
     await change
     // Nothing was written to the row while its legacy lock was held.
     expect(rowWhileHeld).toMatchObject({ refresh: 'r-main' })
@@ -889,14 +946,27 @@ describe('a slot that changes while the row write waits for its legacy lock', ()
     // An older build holds the fb1 row's fallback refresh lock throughout,
     // as it does while it refreshes that row.
     const fb1Held = await holdRowLock('fb1')
+    const contended = deferred()
     const change = (async () => {
-      await Bun.sleep(300)
+      await contended.promise
       await h.setSlot(login('acct-fb1', 'r-fb1-2'))
       await mainHeld?.release()
     })()
     // The main row's write waited out its lock and landed; the slot had
     // moved on to another account's login, which is left for the next run.
-    const outcome = await adoptHostSlotLogin(h.deps())
+    const outcome = await adoptHostSlotLogin(
+      h.deps({
+        store: {
+          onLockEvent: (event) => {
+            if (
+              event.type === 'contended' &&
+              event.name === fallbackRefreshLockName('main')
+            )
+              contended.resolve()
+          },
+        },
+      }),
+    )
     await change
     expect(outcome).toMatchObject({
       status: 'completed',
@@ -1131,9 +1201,18 @@ describe('lock order of a transfer', () => {
       path: h.paths.statePath,
     })
     expect(poolRowLock).not.toBeNull()
-    const running = migrateToPool(h.deps())
-    // Long enough for the run to reach the row write and wait there.
-    await Bun.sleep(400)
+    const contended = deferred()
+    const running = migrateToPool(
+      h.deps({
+        store: {
+          onLockEvent: (event) => {
+            if (event.type === 'contended' && event.name.startsWith('row-'))
+              contended.resolve()
+          },
+        },
+      }),
+    )
+    await contended.promise
     const free: Record<string, boolean> = {}
     for (const name of [
       MAIN_REFRESH_LOCK_NAME,
@@ -1504,15 +1583,19 @@ describe('refreshing a pool row while older builds run', () => {
       })
       let calledWhileHeld: boolean | undefined
       let called = false
+      const contended = deferred()
       const released = (async () => {
-        await Bun.sleep(300)
+        await contended.promise
         calledWhileHeld = called
         await held?.release()
       })()
       const outcome = await refreshPoolRow(
         {
           paths: h.paths,
-          store: openStore(),
+          store: openStore((event) => {
+            if (event.type === 'contended' && event.name === name())
+              contended.resolve()
+          }),
           legacyLocks: { timeoutMs: 5_000 },
         },
         rowId,

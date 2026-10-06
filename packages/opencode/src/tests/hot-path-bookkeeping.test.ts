@@ -191,6 +191,7 @@ describe('request path never waits on bookkeeping', () => {
   const heldLocks: Array<{ release(): Promise<void> }> = []
 
   beforeEach(() => {
+    scope.capturePluginWork()
     configDir = mkdtempSync(join(tmpdir(), 'oai-hot-path-'))
     configFile = join(configDir, 'openai-auth.json')
     stateFile = join(configDir, 'openai-auth-state.json')
@@ -496,8 +497,10 @@ describe('request path never waits on bookkeeping', () => {
         )
         expect(response.status).toBe(200)
         await response.text()
-        // Let the failed write settle and any rejection be reported.
-        await new Promise((resolve) => setTimeout(resolve, 200))
+        await drainSidebarWrites()
+        // Node reports unhandled rejections on the next event-loop turn, after
+        // the sidebar promises have settled; no wall-clock grace is needed.
+        await new Promise<void>((resolve) => setImmediate(resolve))
       })
     } finally {
       process.off('unhandledRejection', onUnhandled)

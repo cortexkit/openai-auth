@@ -58,7 +58,22 @@ let originalFetch: typeof globalThis.fetch
 let hooks: Hooks | undefined
 const heldLocks: Array<{ release(): Promise<void> }> = []
 const scope = createRequestTestScope()
-const it = scope.it
+const it = (
+  name: string,
+  body: () => unknown | Promise<unknown>,
+  timeout?: number,
+) =>
+  scope.it(
+    name,
+    async () => {
+      try {
+        await body()
+      } finally {
+        for (const release of releasePolls.splice(0)) release()
+      }
+    },
+    timeout,
+  )
 const releasePolls: Array<() => void> = []
 
 type Phase = { name: string; offsetMs: number; durationMs?: number }
@@ -129,6 +144,7 @@ function phase<T>(name: string, run: () => T): T {
 }
 
 beforeEach(() => {
+  scope.capturePluginWork()
   configDir = mkdtempSync(join(tmpdir(), 'oai-pool-request-'))
   configFile = join(configDir, 'openai-auth.json')
   stateFile = join(configDir, 'openai-auth-state.json')
@@ -152,9 +168,6 @@ afterEach(async () => {
       await hooks?.dispose?.()
       globalThis.fetch = originalFetch
       await drainSidebarWrites()
-      // Startup pool pulls are not tracked by the request scope. Keep a short
-      // grace period for their writes before removing this test's files.
-      await new Promise((resolve) => setTimeout(resolve, 50))
       process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
       process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
       process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
