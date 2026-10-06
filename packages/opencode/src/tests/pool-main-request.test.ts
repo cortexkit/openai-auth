@@ -38,6 +38,7 @@ import {
   type SidebarState,
 } from '../sidebar-state.ts'
 import { PackageVersion } from '../version.ts'
+import { createFailurePhaseClock } from './failure-phase-clock.ts'
 import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
@@ -68,8 +69,12 @@ let originalFetch: typeof globalThis.fetch
 let hooks: Hooks | undefined
 const scope = createRequestTestScope()
 const it = scope.it
+const clock = createFailurePhaseClock()
+const phaseIt = (name: string, body: () => Promise<void>) =>
+  scope.it(name, () => clock.run(name, body))
 
 beforeEach(() => {
+  scope.capturePluginWork()
   configDir = mkdtempSync(join(tmpdir(), 'oai-pool-main-'))
   configFile = join(configDir, 'openai-auth.json')
   sidebarFile = join(configDir, 'sidebar-state.json')
@@ -203,22 +208,31 @@ function installWire(
 }
 
 async function loadFetch(getAuth: () => Promise<SlotValue>) {
-  hooks = await CodexAuthPlugin(mockPluginInput(), {
-    experimentalWebSockets: false,
-  })
+  hooks = await clock.phase('plugin initialization', () =>
+    CodexAuthPlugin(mockPluginInput(), {
+      experimentalWebSockets: false,
+    }),
+  )
   const authHook = hooks.auth
   if (!authHook?.loader) throw new Error('No auth loader')
-  const loaded = await authHook.loader(
-    getAuth as never,
-    { id: 'openai', label: 'OpenAI', models: [] } as unknown as Parameters<
-      NonNullable<(typeof authHook)['loader']>
-    >[1],
+  const loader = authHook.loader
+  const loaded = await clock.phase('auth loader', () =>
+    loader(
+      getAuth as never,
+      { id: 'openai', label: 'OpenAI', models: [] } as unknown as Parameters<
+        NonNullable<(typeof authHook)['loader']>
+      >[1],
+    ),
   )
   const fetchOverride = (loaded as Record<string, unknown>).fetch as
     | ((url: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
     | undefined
   if (!fetchOverride) throw new Error('No fetch in loader result')
-  return scope.wrap(fetchOverride)
+  return scope.wrap((...args: Parameters<typeof fetchOverride>) =>
+    clock.phase('request refresh lock, token refresh and send', () =>
+      fetchOverride(...args),
+    ),
+  )
 }
 
 function request(headers: Record<string, string> = {}): RequestInit {
@@ -431,7 +445,13 @@ describe('main refresh re-reads the slot once it holds the lock', () => {
   // from then on, so only a read made while holding the lock can see `after`.
   function slotChangingUnderLock(before: SlotValue, after: SlotValue) {
     const lockFile = `${configFile}.main-refresh.lock`
-    return async () => ({ ...(existsSync(lockFile) ? after : before) })
+    return async () =>
+      clock.phase(
+        existsSync(lockFile)
+          ? 'slot read under refresh lock'
+          : 'slot read before refresh lock',
+        () => ({ ...(existsSync(lockFile) ? after : before) }),
+      )
   }
 
   const expiredR1: SlotValue = {
@@ -441,27 +461,30 @@ describe('main refresh re-reads the slot once it holds the lock', () => {
     expires: Date.now() - 1_000,
   }
 
-  it('refreshes the token present after the lock, not the one read before it', async () => {
-    seedStore('main-first', [])
-    const wire = installWire()
-    const fetchOverride = await loadFetch(
-      slotChangingUnderLock(expiredR1, {
-        type: 'oauth',
-        access: 'main-R2-access',
-        refresh: 'main-R2',
-        expires: Date.now() - 1_000,
-      }),
-    )
+  phaseIt(
+    'refreshes the token present after the lock, not the one read before it',
+    async () => {
+      seedStore('main-first', [])
+      const wire = installWire()
+      const fetchOverride = await loadFetch(
+        slotChangingUnderLock(expiredR1, {
+          type: 'oauth',
+          access: 'main-R2-access',
+          refresh: 'main-R2',
+          expires: Date.now() - 1_000,
+        }),
+      )
 
-    const response = await fetchOverride(
-      'https://api.openai.com/v1/responses',
-      request(),
-    )
+      const response = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        request(),
+      )
 
-    expect(response.status).toBe(200)
-    expect(wire.refreshTokens).toEqual(['main-R2'])
-    expect(wire.sends).toEqual(['Bearer refreshed-access'])
-  })
+      expect(response.status).toBe(200)
+      expect(wire.refreshTokens).toEqual(['main-R2'])
+      expect(wire.sends).toEqual(['Bearer refreshed-access'])
+    },
+  )
 
   it('uses a token another process already rotated without refreshing again', async () => {
     seedStore('main-first', [])

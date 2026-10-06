@@ -295,7 +295,10 @@ describe('the shield lasts until the placeholder is in the slot', () => {
       mode: 'migrate',
       exitAtName: 'after-placeholder-write',
     })
-    expect(child.code).toBe(CRASH_EXIT_CODE)
+    expect(
+      child.code,
+      `child steps: ${JSON.stringify(child.steps)}\nchild stderr:\n${child.stderr}\nchild output:\n${child.output}`,
+    ).toBe(CRASH_EXIT_CODE)
     expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
     const crashed = await h.config()
     expect(crashed.mainAccountId).toBe('acct-main')

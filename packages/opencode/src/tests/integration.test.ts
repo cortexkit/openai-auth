@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import {
   mkdirSync,
   mkdtempSync,
@@ -42,6 +42,7 @@ import {
   resolveSessionSidebarRouting,
   type SidebarState,
 } from '../sidebar-state.ts'
+import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,
@@ -50,6 +51,14 @@ import {
   FLOOR_SIDEBAR_STATE_FILE,
   FLOOR_STATE_FILE,
 } from './setup-env.ts'
+
+const scope = createRequestTestScope()
+const it = scope.it
+const test = scope.it
+beforeEach(() => scope.capturePluginWork())
+afterEach(async () => {
+  await scope.teardown(async () => {})
+})
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -243,7 +252,8 @@ describe('integration: migration', () => {
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = stateFile
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    await scope.teardown(async () => {})
     // Restore to the floor (not delete) so any in-flight write resolves to a
     // temp path rather than the operator's live default.
     process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
@@ -349,6 +359,7 @@ describe('integration: HTTP quota push', () => {
   })
 
   afterEach(async () => {
+    await scope.teardown(async () => {})
     // Drain any in-flight sidebar writes BEFORE restoring the env floor so
     // no late write can re-resolve getSidebarStateFile() to the live default.
     await drainSidebarWrites()
@@ -455,7 +466,7 @@ describe('integration: HTTP quota push', () => {
         if (!fetchOverride) throw new Error('No fetch in loader result')
 
         // Drive a request through the gate pipeline
-        const response = await fetchOverride(
+        const response = await scope.wrap(fetchOverride)(
           'https://api.openai.com/v1/responses',
           {
             method: 'POST',
@@ -489,6 +500,7 @@ describe('integration: HTTP quota push', () => {
       } finally {
         pollRelease.resolve()
         await __bootQuotaSeedPromiseForTest()
+        await scope.settlePluginWork()
         globalThis.fetch = originalFetch
         await hooks?.dispose?.()
       }
@@ -544,7 +556,7 @@ describe('integration: HTTP quota push', () => {
           'session-id': sessionId,
         })
         if (parentId) headers.set('x-parent-session-id', parentId)
-        const response = await fetchOverride(
+        const response = await scope.wrap(fetchOverride)(
           'https://api.openai.com/v1/responses',
           {
             method: 'POST',
@@ -590,6 +602,7 @@ describe('integration: HTTP quota push', () => {
       mkdirSync(sidebarFile)
       await serve('unwritable-child', 'unwritable-parent')
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -606,7 +619,12 @@ describe('integration: HTTP quota push', () => {
     // First response carries a real primary window — seeds the cache.
     let respondWithRealWindow = true
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () => {
+    const pollRelease = Promise.withResolvers<void>()
+    globalThis.fetch = (async (url: unknown) => {
+      if (String(url).includes('/wham/usage')) {
+        await pollRelease.promise
+        return new Response('{}', { status: 200 })
+      }
       const headers = new Headers(
         respondWithRealWindow
           ? {
@@ -663,7 +681,11 @@ describe('integration: HTTP quota push', () => {
         }),
       })
 
-      const seed = await fetchOverride(
+      // The startup poll reports unknown quota. Finish its cache write before
+      // seeding the response-header window that this test intends to exercise.
+      pollRelease.resolve()
+      await __bootQuotaSeedPromiseForTest()
+      const seed = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         request(),
       )
@@ -674,7 +696,7 @@ describe('integration: HTTP quota push', () => {
       )
 
       respondWithRealWindow = false
-      const retired = await fetchOverride(
+      const retired = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         request(),
       )
@@ -687,6 +709,8 @@ describe('integration: HTTP quota push', () => {
       expect(sidebar.main.quota?.primary).toBeUndefined()
       expect(sidebar.main.quota?.secondary).toBeUndefined()
     } finally {
+      pollRelease.resolve()
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -702,7 +726,12 @@ describe('integration: HTTP quota push', () => {
 
     let respondWithRealWindow = true
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () => {
+    const pollRelease = Promise.withResolvers<void>()
+    globalThis.fetch = (async (url: unknown) => {
+      if (String(url).includes('/wham/usage')) {
+        await pollRelease.promise
+        return new Response('{}', { status: 200 })
+      }
       const headers = new Headers(
         respondWithRealWindow
           ? {
@@ -753,7 +782,11 @@ describe('integration: HTTP quota push', () => {
         }),
       })
 
-      const seed = await fetchOverride(
+      // The startup poll reports unknown quota. Finish its cache write before
+      // seeding the response-header window that this test intends to exercise.
+      pollRelease.resolve()
+      await __bootQuotaSeedPromiseForTest()
+      const seed = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         request(),
       )
@@ -764,7 +797,7 @@ describe('integration: HTTP quota push', () => {
       )
 
       respondWithRealWindow = false
-      const nonQuota = await fetchOverride(
+      const nonQuota = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         request(),
       )
@@ -778,6 +811,8 @@ describe('integration: HTTP quota push', () => {
       ) as SidebarState
       expect(sidebar.main.quota?.primary?.usedPercent).toBe(42)
     } finally {
+      pollRelease.resolve()
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -812,6 +847,7 @@ describe('integration: killswitch enforcement', () => {
   })
 
   afterEach(async () => {
+    await scope.teardown(async () => {})
     await drainSidebarWrites()
     process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
@@ -874,7 +910,7 @@ describe('integration: killswitch enforcement', () => {
       init?: RequestInit,
     ) => Promise<Response>
     if (!fetchOverride) throw new Error('No fetch in loader result')
-    return fetchOverride
+    return scope.wrap(fetchOverride)
   }
 
   const REQ_INIT: RequestInit = {
@@ -913,7 +949,7 @@ describe('integration: killswitch enforcement', () => {
 
       // First request: quota is unknown, so it passes the gate, hits upstream,
       // and the 95%-used headers push low quota into the manager.
-      const first = await fetchOverride(
+      const first = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         REQ_INIT,
       )
@@ -922,7 +958,7 @@ describe('integration: killswitch enforcement', () => {
       expect(mock.calls()).toBe(1)
 
       // Second request: cached quota is now below threshold → hard block.
-      const second = await fetchOverride(
+      const second = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         REQ_INIT,
       )
@@ -937,6 +973,7 @@ describe('integration: killswitch enforcement', () => {
       // The blocked request did NOT reach upstream — no extra spend.
       expect(mock.calls()).toBe(1)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -998,7 +1035,10 @@ describe('integration: killswitch enforcement', () => {
 
       let refusal: unknown
       try {
-        await fetchOverride('https://api.openai.com/v1/responses', REQ_INIT)
+        await scope.wrap(fetchOverride)(
+          'https://api.openai.com/v1/responses',
+          REQ_INIT,
+        )
       } catch (error) {
         refusal = error
       }
@@ -1008,6 +1048,7 @@ describe('integration: killswitch enforcement', () => {
       // answers for a bug that is ours.
       expect(upstreamCalls).toBe(0)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -1034,7 +1075,7 @@ describe('integration: killswitch enforcement', () => {
       })
       const fetchOverride = await loaderFetch(hooks)
 
-      const first = await fetchOverride(
+      const first = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         REQ_INIT,
       )
@@ -1042,7 +1083,7 @@ describe('integration: killswitch enforcement', () => {
       await first.body?.cancel()
 
       // Even with quota at 1% remaining, a disabled killswitch never blocks.
-      const second = await fetchOverride(
+      const second = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         REQ_INIT,
       )
@@ -1050,6 +1091,7 @@ describe('integration: killswitch enforcement', () => {
       await second.body?.cancel()
       expect(mock.calls()).toBe(2)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -1104,7 +1146,7 @@ describe('integration: killswitch enforcement', () => {
 
       // Request 1: unknown quota → passes, hits upstream, pushes low quota bound
       // to the first token.
-      const first = await fetchOverride(
+      const first = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         REQ_INIT,
       )
@@ -1114,7 +1156,7 @@ describe('integration: killswitch enforcement', () => {
 
       // Request 2: getAuth now returns a NEW token. A token-bound read would miss
       // and fail open; the identity-bound policy peek still sees the kill.
-      const second = await fetchOverride(
+      const second = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         REQ_INIT,
       )
@@ -1123,6 +1165,7 @@ describe('integration: killswitch enforcement', () => {
       // Still no extra spend despite the token change.
       expect(mock.calls()).toBe(1)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -1176,7 +1219,7 @@ describe('integration: killswitch enforcement', () => {
       ) => Promise<Response>
 
       // Req 1 (account A): unknown quota → passes; A's 95%-used headers kill it.
-      const first = await fetchOverride(
+      const first = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         REQ_INIT,
       )
@@ -1184,7 +1227,7 @@ describe('integration: killswitch enforcement', () => {
       await first.body?.cancel()
 
       // Req 2 (still A): now blocked (A is killed).
-      const secondA = await fetchOverride(
+      const secondA = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         REQ_INIT,
       )
@@ -1193,13 +1236,14 @@ describe('integration: killswitch enforcement', () => {
 
       // Switch to account B and request again: B has unknown quota → passes.
       account = 'B'
-      const firstB = await fetchOverride(
+      const firstB = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         REQ_INIT,
       )
       expect(firstB.status).toBe(200)
       await firstB.body?.cancel()
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -1239,7 +1283,7 @@ describe('integration: killswitch enforcement', () => {
       const fetchOverride = await loaderFetch(hooks)
 
       // First request pushes low main quota.
-      const first = await fetchOverride(
+      const first = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         REQ_INIT,
       )
@@ -1248,7 +1292,7 @@ describe('integration: killswitch enforcement', () => {
 
       // Second request: main is killswitch-blocked, but the healthy fallback
       // serves a 200 (not a 429).
-      const second = await fetchOverride(
+      const second = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         REQ_INIT,
       )
@@ -1257,6 +1301,7 @@ describe('integration: killswitch enforcement', () => {
       // Two upstream calls served by the fallback path (main never spent on req 2).
       expect(mock.calls()).toBeGreaterThanOrEqual(2)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -1345,14 +1390,14 @@ describe('integration: killswitch enforcement', () => {
         init?: RequestInit,
       ) => Promise<Response>
 
-      const firstPromise = fetchOverride(
+      const firstPromise = scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         init(),
       )
       await sawAPromise
 
       account = 'B'
-      const second = await fetchOverride(
+      const second = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         init(),
       )
@@ -1364,7 +1409,7 @@ describe('integration: killswitch enforcement', () => {
       expect(first.status).toBe(200)
       await first.body?.cancel()
 
-      const third = await fetchOverride(
+      const third = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         init(),
       )
@@ -1372,6 +1417,7 @@ describe('integration: killswitch enforcement', () => {
       await third.body?.cancel()
       expect(seenAuth).toEqual(['Bearer access-A', 'Bearer access-B'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -1462,14 +1508,14 @@ describe('integration: killswitch enforcement', () => {
         init?: RequestInit,
       ) => Promise<Response>
 
-      const firstPromise = fetchOverride(
+      const firstPromise = scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         init(),
       )
       await refreshStarted
 
       account = 'B'
-      const second = await fetchOverride(
+      const second = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         init(),
       )
@@ -1490,7 +1536,7 @@ describe('integration: killswitch enforcement', () => {
       expect(first.status).toBe(200)
       await first.body?.cancel()
 
-      const third = await fetchOverride(
+      const third = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         init(),
       )
@@ -1498,6 +1544,7 @@ describe('integration: killswitch enforcement', () => {
       await third.body?.cancel()
       expect(seenAuth).toEqual(['Bearer access-B', 'Bearer refreshed-A'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -1515,14 +1562,19 @@ describe('integration: killswitch enforcement', () => {
     )
 
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async () =>
-      new Response('{}', {
+    globalThis.fetch = (async (url: unknown) => {
+      // Only turn responses carry quota; a startup usage poll must not reset
+      // the quota that the WebSocket will publish for the new account.
+      if (!String(url).includes('/responses'))
+        return new Response('', { status: 503 })
+      return new Response('{}', {
         status: 200,
         headers: {
           'x-codex-primary-used-percent': '10',
           'x-codex-secondary-used-percent': '10',
         },
-      })) as unknown as typeof globalThis.fetch
+      })
+    }) as unknown as typeof globalThis.fetch
 
     let wsSends = 0
     let hooks: Hooks | undefined
@@ -1583,7 +1635,8 @@ describe('integration: killswitch enforcement', () => {
             body: JSON.stringify({ model: 'gpt-5.5', input: [], stream }),
           })
 
-          const seedA = await fetchOverride(
+          await __bootQuotaSeedPromiseForTest()
+          const seedA = await scope.wrap(fetchOverride)(
             'https://api.openai.com/v1/responses',
             request(false),
           )
@@ -1591,7 +1644,7 @@ describe('integration: killswitch enforcement', () => {
           await seedA.body?.cancel()
 
           account = 'B'
-          const pushedB = await fetchOverride(
+          const pushedB = await scope.wrap(fetchOverride)(
             'https://api.openai.com/v1/responses',
             request(true),
           )
@@ -1602,7 +1655,7 @@ describe('integration: killswitch enforcement', () => {
             (s) => s.main.quota?.primary?.usedPercent === 95,
           )
 
-          const blockedB = await fetchOverride(
+          const blockedB = await scope.wrap(fetchOverride)(
             'https://api.openai.com/v1/responses',
             request(true),
           )
@@ -1610,6 +1663,7 @@ describe('integration: killswitch enforcement', () => {
           await blockedB.body?.cancel()
           expect(wsSends).toBe(1)
         } finally {
+          await scope.settlePluginWork()
           globalThis.fetch = originalFetch
           await hooks?.dispose?.()
         }
@@ -1721,7 +1775,7 @@ describe('integration: killswitch enforcement', () => {
           // makes OpenCode's outer retry loop re-issue the request (a normal
           // close would end the turn silently with no reroute). The mark is
           // set as a side effect before the body errors.
-          const first = await fetchOverride(
+          const first = await scope.wrap(fetchOverride)(
             'https://api.openai.com/v1/responses',
             wsRequest,
           )
@@ -1740,7 +1794,7 @@ describe('integration: killswitch enforcement', () => {
           // Request 2 models OpenCode's retry-driven re-issue: main is now
           // marked rate-limited from request 1's in-band signal, so the fetch
           // override must reroute to the fallback WITHOUT re-sending to main.
-          const second = await fetchOverride(
+          const second = await scope.wrap(fetchOverride)(
             'https://api.openai.com/v1/responses',
             wsRequest,
           )
@@ -1750,6 +1804,7 @@ describe('integration: killswitch enforcement', () => {
           expect(mainSends).toBe(1)
           expect(fallbackSends).toBe(1)
         } finally {
+          await scope.settlePluginWork()
           globalThis.fetch = originalFetch
           await hooks?.dispose?.()
         }
@@ -1848,7 +1903,7 @@ describe('integration: killswitch enforcement', () => {
             body: JSON.stringify({ model: 'gpt-5.5', input: [], stream: true }),
           }
 
-          const first = await fetchOverride(
+          const first = await scope.wrap(fetchOverride)(
             'https://api.openai.com/v1/responses',
             wsRequest,
           )
@@ -1857,7 +1912,7 @@ describe('integration: killswitch enforcement', () => {
             isRetryable: true,
           })
 
-          const second = await fetchOverride(
+          const second = await scope.wrap(fetchOverride)(
             'https://api.openai.com/v1/responses',
             wsRequest,
           )
@@ -1867,6 +1922,7 @@ describe('integration: killswitch enforcement', () => {
           expect(mainSends).toBe(1)
           expect(fallbackSends).toBe(1)
         } finally {
+          await scope.settlePluginWork()
           globalThis.fetch = originalFetch
           await hooks?.dispose?.()
         }
@@ -1979,7 +2035,7 @@ describe('integration: killswitch enforcement', () => {
           // mid-stream rate_limit_reached_type. The response is served (200 at
           // upgrade) but reading the body rejects with a retryable stream
           // error, which sets the mark and drives OpenCode's re-issue.
-          const first = await fetchOverride(
+          const first = await scope.wrap(fetchOverride)(
             'https://api.openai.com/v1/responses',
             wsRequest,
           )
@@ -1989,7 +2045,7 @@ describe('integration: killswitch enforcement', () => {
           // Request 2: the fallback is now marked rate-limited from request
           // 1's in-band signal, so usableFallbackCandidates excludes it and
           // routing falls through to main WITHOUT re-trying the fallback.
-          const second = await fetchOverride(
+          const second = await scope.wrap(fetchOverride)(
             'https://api.openai.com/v1/responses',
             wsRequest,
           )
@@ -1999,6 +2055,7 @@ describe('integration: killswitch enforcement', () => {
           expect(fallbackSends).toBe(1)
           expect(mainSends).toBe(1)
         } finally {
+          await scope.settlePluginWork()
           globalThis.fetch = originalFetch
           await hooks?.dispose?.()
         }
@@ -2104,7 +2161,7 @@ describe('integration: killswitch enforcement', () => {
           // Request 1: main's stream hits mid-stream rate_limit_reached_type.
           // Reading the body rejects with the retryable stream error (the
           // reissue trigger) and sets the mark as a side effect.
-          const first = await fetchOverride(
+          const first = await scope.wrap(fetchOverride)(
             'https://api.openai.com/v1/responses',
             wsRequest,
           )
@@ -2115,7 +2172,7 @@ describe('integration: killswitch enforcement', () => {
           // signal. The killswitch itself is enabled but fails open on
           // main's unknown quota — the reroute must still fire from the
           // mid-stream mark alone, proving the OR (not AND) semantics.
-          const second = await fetchOverride(
+          const second = await scope.wrap(fetchOverride)(
             'https://api.openai.com/v1/responses',
             wsRequest,
           )
@@ -2125,6 +2182,7 @@ describe('integration: killswitch enforcement', () => {
           expect(mainSends).toBe(1)
           expect(fallbackSends).toBe(1)
         } finally {
+          await scope.settlePluginWork()
           globalThis.fetch = originalFetch
           await hooks?.dispose?.()
         }
@@ -2206,7 +2264,7 @@ describe('integration: killswitch enforcement', () => {
           // Request 1: main hits mid-stream rate_limit_reached_type; no
           // fallback exists to reroute to. Reading the body rejects with the
           // retryable stream error and sets the mark for the re-issue.
-          const first = await fetchOverride(
+          const first = await scope.wrap(fetchOverride)(
             'https://api.openai.com/v1/responses',
             wsRequest,
           )
@@ -2215,7 +2273,7 @@ describe('integration: killswitch enforcement', () => {
 
           // Request 2: main is marked rate-limited and there is no fallback
           // to reroute to, so this hits the hard-block path.
-          const second = await fetchOverride(
+          const second = await scope.wrap(fetchOverride)(
             'https://api.openai.com/v1/responses',
             wsRequest,
           )
@@ -2227,6 +2285,7 @@ describe('integration: killswitch enforcement', () => {
 
           expect(mainSends).toBe(1)
         } finally {
+          await scope.settlePluginWork()
           globalThis.fetch = originalFetch
           await hooks?.dispose?.()
         }
@@ -2261,6 +2320,7 @@ describe('integration: WS quota push', () => {
   })
 
   afterEach(async () => {
+    await scope.teardown(async () => {})
     await drainSidebarWrites()
     process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
@@ -2393,7 +2453,7 @@ describe('integration: WS quota push', () => {
           )
           const fetchOverride = (loaderResult as Record<string, unknown>)
             .fetch as (url: string, init?: RequestInit) => Promise<Response>
-          const responsePromise = fetchOverride(
+          const responsePromise = scope.wrap(fetchOverride)(
             'https://api.openai.com/v1/responses',
             {
               method: 'POST',
@@ -2452,6 +2512,7 @@ describe('integration: WS quota push', () => {
               ?.resetCredits,
           ).toBe(2)
         } finally {
+          await scope.settlePluginWork()
           globalThis.fetch = originalFetch
           await hooks?.dispose?.()
         }
@@ -2578,6 +2639,7 @@ describe('integration: 429 → reactive fallback', () => {
   })
 
   afterEach(async () => {
+    await scope.teardown(async () => {})
     await drainSidebarWrites()
     process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
@@ -2678,7 +2740,7 @@ describe('integration: 429 → reactive fallback', () => {
         | undefined
       if (!fetchOverride) throw new Error('No fetch in loader result')
 
-      const response = await fetchOverride(
+      const response = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         {
           method: 'POST',
@@ -2699,6 +2761,7 @@ describe('integration: 429 → reactive fallback', () => {
 
       await hooks?.dispose?.()
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
     }
   })
@@ -2730,6 +2793,7 @@ describe('integration: active fallback routing', () => {
   })
 
   afterEach(async () => {
+    await scope.teardown(async () => {})
     await drainSidebarWrites()
     process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
@@ -2774,7 +2838,7 @@ describe('integration: active fallback routing', () => {
       | ((url: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
       | undefined
     if (!fetchOverride) throw new Error('No fetch in loader result')
-    return { hooks, fetchOverride }
+    return { hooks, fetchOverride: scope.wrap(fetchOverride) }
   }
 
   /**
@@ -2929,6 +2993,7 @@ describe('integration: active fallback routing', () => {
         responsesLiteRequestInit(model, sessionID, options),
       )
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -2968,12 +3033,16 @@ describe('integration: active fallback routing', () => {
             instructions: 'Be concise',
             reasoning: { effort, summary: 'auto' },
             input: [
-              { role: 'user', content: [{ type: 'input_text', text: 'one' }] },
+              {
+                role: 'user',
+                content: [{ type: 'input_text', text: 'one' }],
+              },
             ],
           }),
         })
       }
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -3031,6 +3100,7 @@ describe('integration: active fallback routing', () => {
         })
       }
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -3245,6 +3315,7 @@ describe('integration: active fallback routing', () => {
         }),
       })
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -3535,6 +3606,7 @@ describe('integration: active fallback routing', () => {
           ?.wireAccountId,
       ).toBe('acc-fallback-1')
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -3575,6 +3647,7 @@ describe('integration: active fallback routing', () => {
       })
       expect(line).not.toContain(sessionId)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       setLogLevel(undefined)
       await hooks?.dispose?.()
@@ -3662,6 +3735,7 @@ describe('integration: active fallback routing', () => {
         }),
       )
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       setLogLevel(undefined)
       await hooks?.dispose?.()
@@ -3702,6 +3776,7 @@ describe('integration: active fallback routing', () => {
       expect(text).not.toContain('sticky routing: placed session pin')
       expect(text).not.toContain('sticky routing: migrated session pin')
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       setLogLevel(undefined)
       await hooks?.dispose?.()
@@ -3749,6 +3824,7 @@ describe('integration: active fallback routing', () => {
           .stickyAssignments?.[retainedHash]?.accountId,
       ).toBe('fallback-1')
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -3880,6 +3956,7 @@ describe('integration: active fallback routing', () => {
         'Bearer fallback-2-token',
       ])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -3921,6 +3998,7 @@ describe('integration: active fallback routing', () => {
 
       expect(second?.inputBytes).toBeGreaterThan(first?.inputBytes ?? 0)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -3968,6 +4046,7 @@ describe('integration: active fallback routing', () => {
           ?.accountId,
       ).toBe('fallback-1')
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4160,6 +4239,7 @@ describe('integration: active fallback routing', () => {
           ?.accountId,
       ).toBe('fallback-1')
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4214,6 +4294,7 @@ describe('integration: active fallback routing', () => {
         'Bearer fallback-1-token',
       ])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4285,6 +4366,7 @@ describe('integration: active fallback routing', () => {
           ?.accountId,
       ).not.toBe('fallback-2')
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4331,6 +4413,7 @@ describe('integration: active fallback routing', () => {
           ?.accountId,
       ).toBe('fallback-2')
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4350,6 +4433,10 @@ describe('integration: active fallback routing', () => {
     const originalLevel = process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL
     process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = 'debug'
     globalThis.fetch = (async (url: unknown, init?: unknown) => {
+      // Preserve the deliberately stale quota; successful unknown startup
+      // readings would change the routing state this test is exercising.
+      if (!String(url).includes('/responses'))
+        return new Response('', { status: 503 })
       if (String(url).includes('responses')) {
         // Record the turn's own send only: the loader also issues an authorized,
         // unawaited quota refresh at init, so recording every authorized fetch
@@ -4371,6 +4458,7 @@ describe('integration: active fallback routing', () => {
         'acc-main',
       )
       hooks = loaded.hooks
+      await __bootQuotaSeedPromiseForTest()
       await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'x-session-affinity': 'stale-session' }),
@@ -4387,6 +4475,7 @@ describe('integration: active fallback routing', () => {
       } else {
         process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = originalLevel
       }
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4441,6 +4530,7 @@ describe('integration: active fallback routing', () => {
         status.targets.map((target) => target.accountId ?? 'main'),
       ).toEqual(['fallback-2'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4515,6 +4605,7 @@ describe('integration: active fallback routing', () => {
       expect(manager.status().tracked).toBe(0)
     } finally {
       Date.now = originalNow
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4558,6 +4649,7 @@ describe('integration: active fallback routing', () => {
       )
       expect(sidebar.stickyAssignments).toBeUndefined()
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4616,6 +4708,7 @@ describe('integration: active fallback routing', () => {
           ?.accountId,
       ).toBe('main')
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4661,6 +4754,7 @@ describe('integration: active fallback routing', () => {
         sidebar.activeRouting?.['child-session']?.activeId,
       )
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4715,6 +4809,7 @@ describe('integration: active fallback routing', () => {
         sidebar.stickyAssignments?.[hashSidebarSessionId('parent-no-pin')],
       ).toBeUndefined()
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4792,6 +4887,7 @@ describe('integration: active fallback routing', () => {
       expect(sidebar.activeId).toBe('main')
       expect(sidebar.route).toBe('main-first')
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4834,6 +4930,7 @@ describe('integration: active fallback routing', () => {
         route: 'fallback-first',
       })
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4874,6 +4971,7 @@ describe('integration: active fallback routing', () => {
         route: 'fallback-first',
       })
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4922,6 +5020,7 @@ describe('integration: active fallback routing', () => {
       expect(wireMethod).toBe('POST')
       expect(JSON.parse(String(wireBody)).model).toBe('gpt-5.5')
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -4963,6 +5062,7 @@ describe('integration: active fallback routing', () => {
       expect(wireHeaders.get('authorization')).toBe('Bearer main-stale-token')
       expect(wireHeaders.has('x-api-key')).toBe(false)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5014,6 +5114,7 @@ describe('integration: active fallback routing', () => {
       ])
       expect(authSetCalls).toEqual([])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5087,7 +5188,7 @@ describe('integration: active fallback routing', () => {
         | undefined
       if (!fetchOverride) throw new Error('No fetch in loader result')
 
-      const response = await fetchOverride(
+      const response = await scope.wrap(fetchOverride)(
         'https://api.openai.com/v1/responses',
         requestInit(),
       )
@@ -5097,6 +5198,7 @@ describe('integration: active fallback routing', () => {
       expect(seen).toEqual(['Bearer main-rotated-token'])
     } finally {
       await heldLock.release()
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5174,8 +5276,14 @@ describe('integration: active fallback routing', () => {
       if (!fetchOverride) throw new Error('No fetch in loader result')
 
       const [first, second] = await Promise.all([
-        fetchOverride('https://api.openai.com/v1/responses', requestInit()),
-        fetchOverride('https://api.openai.com/v1/responses', requestInit()),
+        scope.wrap(fetchOverride)(
+          'https://api.openai.com/v1/responses',
+          requestInit(),
+        ),
+        scope.wrap(fetchOverride)(
+          'https://api.openai.com/v1/responses',
+          requestInit(),
+        ),
       ])
 
       expect(first.status).toBe(200)
@@ -5195,6 +5303,7 @@ describe('integration: active fallback routing', () => {
       expect(releasedLock).not.toBeNull()
       await releasedLock?.release()
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5252,6 +5361,7 @@ describe('integration: active fallback routing', () => {
       expect(releasedLock).not.toBeNull()
       await releasedLock?.release()
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5300,6 +5410,7 @@ describe('integration: active fallback routing', () => {
         status.targets.map((target) => target.accountId ?? 'main'),
       ).toEqual(['fallback-1'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5349,6 +5460,7 @@ describe('integration: active fallback routing', () => {
       expect(status.running).toBe(true)
       expect(status.tracked).toBe(1)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await secondHooks?.dispose?.()
       await firstHooks?.dispose?.()
@@ -5406,6 +5518,7 @@ describe('integration: active fallback routing', () => {
       expect(manager.status()).toMatchObject({ tracked: 1, sustain: true })
     } finally {
       Date.now = originalNow
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5510,6 +5623,7 @@ describe('integration: active fallback routing', () => {
           ?.usedPercent,
       ).toBe(63)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5583,6 +5697,7 @@ describe('integration: active fallback routing', () => {
       expect(elapsedMs).toBeLessThan(2_000)
     } finally {
       await held?.release()
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5625,6 +5740,7 @@ describe('integration: active fallback routing', () => {
       expect(response.status).toBe(200)
       expect(seenAuth).toEqual(['Bearer client-alt-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5685,6 +5801,7 @@ describe('integration: active fallback routing', () => {
       expect(response.status).toBe(200)
       expect(seenAuth).toEqual(['Bearer client-alt-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5727,6 +5844,7 @@ describe('integration: active fallback routing', () => {
       expect(response.status).toBe(200)
       expect(seenAuth).toEqual(['Bearer work-alt-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5763,6 +5881,7 @@ describe('integration: active fallback routing', () => {
       expect(response.status).toBe(200)
       expect(seenAuth).toEqual(['Bearer main-stale-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5799,6 +5918,7 @@ describe('integration: active fallback routing', () => {
 
       expect(seenAuth).toEqual(['Bearer work-alt-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5841,6 +5961,7 @@ describe('integration: active fallback routing', () => {
 
       expect(seenAuth).toEqual(['Bearer client-alt-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5879,6 +6000,7 @@ describe('integration: active fallback routing', () => {
 
       expect(seenAuth).toEqual(['Bearer client-alt-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5934,6 +6056,7 @@ describe('integration: active fallback routing', () => {
 
       expect(seenAuth).toEqual(['Bearer work-alt-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -5979,6 +6102,7 @@ describe('integration: active fallback routing', () => {
         'Bearer main-stale-token',
       ])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6018,6 +6142,7 @@ describe('integration: active fallback routing', () => {
       expect(response.status).toBe(200)
       expect(seenAuth).toEqual(['Bearer client-alt-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6061,6 +6186,7 @@ describe('integration: active fallback routing', () => {
       expect(response.status).toBe(200)
       expect(seenAuth).toEqual(['Bearer main-stale-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6101,6 +6227,7 @@ describe('integration: active fallback routing', () => {
       expect(response.status).toBe(200)
       expect(seenAuth).toEqual(['Bearer work-alt-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6139,6 +6266,7 @@ describe('integration: active fallback routing', () => {
       expect(response.status).toBe(200)
       expect(seenAuth).toEqual(['Bearer main-stale-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6184,6 +6312,7 @@ describe('integration: active fallback routing', () => {
       expect(response.status).toBe(200)
       expect(seenAuth).toEqual(['Bearer main-stale-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6221,6 +6350,7 @@ describe('integration: active fallback routing', () => {
 
       expect(seenAuth).toEqual(['Bearer work-alt-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6263,6 +6393,7 @@ describe('integration: active fallback routing', () => {
       expect(response.status).toBe(200)
       expect(seenAuth).toEqual(['Bearer work-alt-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6307,6 +6438,7 @@ describe('integration: active fallback routing', () => {
       expect(response.status).toBe(200)
       expect(seenAuth).toEqual(['Bearer main-stale-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6360,6 +6492,7 @@ describe('integration: active fallback routing', () => {
       expect(seenAuth).toEqual(['Bearer fallback-refreshed-token'])
       expect(authSetCalls).toEqual([])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6402,6 +6535,7 @@ describe('integration: active fallback routing', () => {
       expect(response.status).toBe(200)
       expect(seenAuth).toEqual(['Bearer fallback-stale-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6448,6 +6582,7 @@ describe('integration: active fallback routing', () => {
         'Bearer main-stale-token',
       ])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6495,6 +6630,7 @@ describe('integration: active fallback routing', () => {
       expect((caught as Error).message).toBe('ECONNRESET')
       expect(seenAuth).toEqual(['Bearer fallback-access-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6534,6 +6670,7 @@ describe('integration: active fallback routing', () => {
       expect((caught as DOMException).name).toBe('AbortError')
       expect(seenAuth).toEqual(['Bearer fallback-access-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6586,6 +6723,7 @@ describe('integration: active fallback routing', () => {
       )
       expect(cacheKeepStatus().tracked).toBe(1)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6641,6 +6779,7 @@ describe('integration: active fallback routing', () => {
       )
       expect(cacheKeepStatus().tracked).toBe(0)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6683,6 +6822,7 @@ describe('integration: active fallback routing', () => {
         { authorization: 'Bearer main-stale-token', accountId: null },
       ])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6742,6 +6882,7 @@ describe('integration: active fallback routing', () => {
       expect(seenAuth).toEqual(['Bearer main-refreshed-token'])
       expect(authSetCalls.length).toBe(1)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6812,6 +6953,7 @@ describe('integration: active fallback routing', () => {
         'Bearer fallback-primary-token',
       ])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6890,6 +7032,7 @@ describe('integration: active fallback routing', () => {
         'Bearer main-stale-token',
       ])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -6952,6 +7095,7 @@ describe('integration: active fallback routing', () => {
       expect(quota?.primary?.usedPercent).toBe(20)
       expect(quota?.secondary).toBeUndefined()
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -7016,6 +7160,7 @@ describe('integration: active fallback routing', () => {
         'Bearer main-stale-token',
       ])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -7083,6 +7228,7 @@ describe('integration: active fallback routing', () => {
         'Bearer fallback-throw-token',
       ])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -7119,6 +7265,7 @@ describe('integration: active fallback routing', () => {
       expect(caught).toBeInstanceOf(DOMException)
       expect((caught as DOMException).name).toBe('AbortError')
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -7187,6 +7334,7 @@ describe('integration: active fallback routing', () => {
       expect(response.status).toBe(200)
       await response.body?.cancel()
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await httpHooks?.dispose?.()
     }
@@ -7224,6 +7372,7 @@ describe('integration: active fallback routing', () => {
           expect(response.status).toBe(200)
           await response.text()
         } finally {
+          await scope.settlePluginWork()
           globalThis.fetch = originalFetch
           await wsHooks?.dispose?.()
         }
@@ -7316,6 +7465,7 @@ describe('integration: active fallback routing', () => {
         }),
       })
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -7525,6 +7675,7 @@ describe('integration: active fallback routing', () => {
       )
     } finally {
       Date.now = originalNow
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -7612,6 +7763,7 @@ describe('integration: active fallback routing', () => {
       expect(authSetCalls).toBe(3)
       expect(seenAuth).toEqual(['Bearer main-refreshed-token'])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -7686,6 +7838,7 @@ describe('integration: active fallback routing', () => {
       expect(authSetCalls).toBe(3)
       expect(seenAuth).toEqual([])
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -7771,6 +7924,7 @@ describe('integration: active fallback routing', () => {
         sidebar.fallbacks.find((a) => a.id === 'fallback-1')?.quota?.secondary,
       ).toBeUndefined()
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -7944,6 +8098,7 @@ describe('integration: active fallback routing', () => {
       // The blocked request did NOT reach upstream.
       expect(fetchCalls).toBe(setupCalls)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -8066,6 +8221,7 @@ describe('integration: active fallback routing', () => {
           ?.accountId,
       ).toBe('fallback-1')
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -8188,6 +8344,7 @@ describe('integration: active fallback routing', () => {
       // that the killed account is NOT picked.
       expect(seenAuth[1]).not.toBe(`Bearer ${pinnedId}-token`)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -8240,6 +8397,7 @@ describe('integration: active fallback routing', () => {
       expect(seenAuth).toHaveLength(1)
       expect(seenAuth[0]).toMatch(/Bearer fallback-[12]-token/)
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -8328,6 +8486,7 @@ describe('integration: active fallback routing', () => {
       //   fallback-2.
       expect(seenAuth[0]).toBe('Bearer fallback-2-token')
     } finally {
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       await hooks?.dispose?.()
     }
@@ -8360,6 +8519,7 @@ describe('integration: no real config read', () => {
   })
 
   afterEach(async () => {
+    await scope.teardown(async () => {})
     await drainSidebarWrites()
     process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
@@ -8479,7 +8639,8 @@ describe('integration: models cost-zeroing', () => {
     resetModelCostsForTest()
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    await scope.teardown(async () => {})
     // Restore path envs to floor (not delete) — keeps in-flight writes away from live defaults.
     process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
     process.env.OPENCODE_OPENAI_AUTH_MODELS_CACHE = FLOOR_MODELS_CACHE
