@@ -7,7 +7,7 @@
 // These tests drive the plugin's real fetch override against that layout in
 // all three routing modes, the way integration.test.ts drives a legacy one.
 
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -25,6 +25,7 @@ import {
   normalizeSidebarState,
   type SidebarState,
 } from '../sidebar-state.ts'
+import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,
@@ -56,6 +57,9 @@ let sidebarFile: string
 let originalFetch: typeof globalThis.fetch
 let hooks: Hooks | undefined
 const heldLocks: Array<{ release(): Promise<void> }> = []
+const scope = createRequestTestScope()
+const it = scope.it
+const releasePolls: Array<() => void> = []
 
 beforeEach(() => {
   configDir = mkdtempSync(join(tmpdir(), 'oai-pool-request-'))
@@ -74,19 +78,23 @@ beforeEach(() => {
 
 afterEach(async () => {
   for (const lock of heldLocks.splice(0)) await lock.release()
-  globalThis.fetch = originalFetch
-  await hooks?.dispose?.()
-  await drainSidebarWrites()
-  // Background pool writes may still be landing; give them a moment so they
-  // never write into the next test's files.
-  await new Promise((resolve) => setTimeout(resolve, 50))
-  process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-  process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = FLOOR_SIDEBAR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-  restoreEnv('OPENCODE_CONFIG_DIR')
-  delete process.env.NODE_ENV
-  rmSync(configDir, { recursive: true, force: true })
+  for (const release of releasePolls.splice(0)) release()
+  await scope.teardown(async () => {
+    await hooks?.dispose?.()
+    globalThis.fetch = originalFetch
+    await drainSidebarWrites()
+    // Background pool writes may still be landing; give them a moment so they
+    // never write into the next test's files.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+      FLOOR_SIDEBAR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+    restoreEnv('OPENCODE_CONFIG_DIR')
+    delete process.env.NODE_ENV
+    rmSync(configDir, { recursive: true, force: true })
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -280,6 +288,14 @@ interface Wire {
   refreshTokens: string[]
 }
 
+// Unknown-quota fixtures hold polls only until teardown, rather than leaving
+// immortal promises behind when an assertion or a test timeout ends the body.
+function heldUsagePoll() {
+  const gate = Promise.withResolvers<Response>()
+  releasePolls.push(() => gate.resolve(new Response('', { status: 503 })))
+  return () => gate.promise
+}
+
 /** Replace the network. Model requests answer `respond`; quota polls `usage`. */
 function installWire(
   options: {
@@ -358,7 +374,7 @@ async function loadFetch(
     | FetchOverride
     | undefined
   if (!fetchOverride) throw new Error('No fetch in loader result')
-  return fetchOverride
+  return scope.wrap(fetchOverride)
 }
 
 const URL_RESPONSES = 'https://api.openai.com/v1/responses'
@@ -460,6 +476,7 @@ describe('unknown quota on a migrated install', () => {
       const gate = new Promise<void>((resolve) => {
         release = resolve
       })
+      releasePolls.push(release)
       const wire = installWire({
         usage: async () => {
           await gate
@@ -505,7 +522,7 @@ describe('unknown quota on a migrated install', () => {
       { id: 'main' },
       { id: 'fallback-1', quota: healthy() },
     ])
-    const wire = installWire({ usage: () => new Promise(() => {}) })
+    const wire = installWire({ usage: heldUsagePoll() })
     const fetchOverride = await loadFetch()
 
     const response = await fetchOverride(URL_RESPONSES, request())
@@ -537,7 +554,7 @@ describe('unknown quota on a migrated install', () => {
         },
       }),
     )
-    const wire = installWire({ usage: () => new Promise(() => {}) })
+    const wire = installWire({ usage: heldUsagePoll() })
     const fetchOverride = await loadFetch()
 
     const response = await fetchOverride(URL_RESPONSES, request('s-detour'))
@@ -551,7 +568,7 @@ describe('unknown quota on a migrated install', () => {
     // Same placeholder slot and rows, but never migrated: the legacy path
     // serves main from row `main` without any quota reading.
     seedLegacy('main-first', ['main', 'fallback-1'])
-    const wire = installWire({ usage: () => new Promise(() => {}) })
+    const wire = installWire({ usage: heldUsagePoll() })
     const fetchOverride = await loadFetch()
 
     const response = await fetchOverride(URL_RESPONSES, request())
@@ -756,6 +773,79 @@ describe('the killswitch on a migrated install', () => {
 // ---------------------------------------------------------------------------
 
 describe('sticky-balanced on a migrated install', () => {
+  it('drains a timed-out sticky body before restoring fetch, naming its owner', async () => {
+    seedPool(
+      'sticky-balanced',
+      [
+        { id: 'main', quota: healthy() },
+        { id: 'fallback-1', quota: healthy() },
+      ],
+      { killswitch: { enabled: true } },
+    )
+    let used = 42
+    const wire = installWire({
+      respond: (b) =>
+        new Response('{}', {
+          status: 200,
+          headers: quotaHeaders(b === bearer('main') ? used : 42),
+        }),
+      usage: () => new Response('', { status: 503 }),
+    })
+    const wireFetch = globalThis.fetch
+    const fetchOverride = await loadFetch()
+    const interrupted = createRequestTestScope()
+    const entered = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    const draining = Promise.withResolvers<void>()
+    const owner =
+      'moves a pin off a row that falls below the killswitch threshold'
+    let bodyError: unknown
+    const body = interrupted
+      .run(owner, async () => {
+        await fetchOverride(URL_RESPONSES, request('s-timeout'))
+        used = 98
+        await fetchOverride(URL_RESPONSES, request('s-timeout'))
+        entered.resolve()
+        await resume.promise
+        await fetchOverride(URL_RESPONSES, request('s-timeout'))
+      })
+      .catch((error: unknown) => {
+        bodyError = error
+      })
+    await entered.promise
+    // Model Bun starting afterEach while the timed-out callback is suspended.
+    // The barrier fixes the ordering without relying on machine load or timers.
+    const teardown = interrupted
+      .teardown(
+        async () => {
+          globalThis.fetch = originalFetch
+        },
+        () => draining.resolve(),
+      )
+      .catch((error: unknown) => error)
+    try {
+      await draining.promise
+      resume.resolve()
+      await body
+      const error = await teardown
+      expect(bodyError).toBeUndefined()
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).message).toBe(
+        `Request work outlived test: ${owner}`,
+      )
+      expect(wire.sends).toEqual([
+        bearer('main'),
+        bearer('main'),
+        bearer('fallback-1'),
+      ])
+    } finally {
+      resume.resolve()
+      await body
+      await teardown
+      globalThis.fetch = wireFetch
+    }
+  })
+
   it('keeps a session on its row across requests', async () => {
     seedPool('sticky-balanced', [
       { id: 'main', quota: healthy() },

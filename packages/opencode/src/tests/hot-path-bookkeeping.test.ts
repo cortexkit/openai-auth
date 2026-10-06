@@ -7,7 +7,7 @@
  * pushed quota and sticky pin are written in the background and land once the
  * file can be written again, without another request having to come along.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import {
   mkdirSync,
   mkdtempSync,
@@ -33,6 +33,7 @@ import {
   normalizeSidebarState,
   type SidebarState,
 } from '../sidebar-state.ts'
+import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,
@@ -45,6 +46,8 @@ import {
 // hold on a loaded machine: a request that waits on the lock at all overruns
 // it by an order of magnitude.
 const HOT_PATH_BOUND_MS = 1_000
+const scope = createRequestTestScope()
+const it = scope.it
 
 type FetchOverride = (
   url: RequestInfo | URL,
@@ -94,7 +97,7 @@ async function loadFetchOverride(experimentalWebSockets = false) {
     | FetchOverride
     | undefined
   if (!fetchOverride) throw new Error('No fetch in loader result')
-  return { hooks, fetchOverride }
+  return { hooks, fetchOverride: scope.wrap(fetchOverride) }
 }
 
 function responseRequestInit(sessionId: string): RequestInit {
@@ -205,17 +208,19 @@ describe('request path never waits on bookkeeping', () => {
 
   afterEach(async () => {
     for (const lock of heldLocks.splice(0)) await lock.release()
-    globalThis.fetch = originalFetch
-    await hooks?.dispose?.()
-    await drainSidebarWrites()
-    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
-      FLOOR_SIDEBAR_STATE_FILE
-    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    restoreEnv('OPENCODE_CONFIG_DIR')
-    delete process.env.NODE_ENV
-    rmSync(configDir, { recursive: true, force: true })
+    await scope.teardown(async () => {
+      await hooks?.dispose?.()
+      globalThis.fetch = originalFetch
+      await drainSidebarWrites()
+      process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+      process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+        FLOOR_SIDEBAR_STATE_FILE
+      process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+      restoreEnv('OPENCODE_CONFIG_DIR')
+      delete process.env.NODE_ENV
+      rmSync(configDir, { recursive: true, force: true })
+    })
   })
 
   // Every provider call answers 200 with a quota header, so the served

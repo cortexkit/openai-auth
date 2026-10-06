@@ -1,7 +1,7 @@
 // The plugin running the account-pool migration and later adoptions in the
 // background: through its real loader, fetch override and auth methods,
 // against a legacy install on disk and a file-backed OpenCode login slot.
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import {
   chmodSync,
   mkdirSync,
@@ -30,6 +30,7 @@ import { __resetProcessHeartbeatForTest } from '../core/process-heartbeat.ts'
 import { CodexAuthPlugin } from '../index.ts'
 import { drainSidebarWrites } from '../sidebar-state.ts'
 import { FAR, fileSlot, jwt, login } from './fixtures/pool-migration-harness.ts'
+import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
   FLOOR_AUTH_FILE,
@@ -47,6 +48,9 @@ let stateFile: string
 let slot: HostSlotAdapter
 let originalFetch: typeof globalThis.fetch
 let hooks: Hooks | undefined
+const scope = createRequestTestScope()
+const it = scope.it
+const releaseMigrations: Array<() => void> = []
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'oai-pool-lifecycle-'))
@@ -76,17 +80,21 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
-  globalThis.fetch = originalFetch
-  await hooks?.dispose?.()
-  await drainSidebarWrites()
-  process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-  process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = FLOOR_SIDEBAR_STATE_FILE
-  process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-  restoreEnv('OPENCODE_CONFIG_DIR')
-  restoreEnv('XDG_STATE_HOME')
-  restoreEnv('XDG_DATA_HOME')
-  delete process.env.NODE_ENV
+  for (const release of releaseMigrations.splice(0)) release()
+  await scope.teardown(async () => {
+    await hooks?.dispose?.()
+    globalThis.fetch = originalFetch
+    await drainSidebarWrites()
+    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+      FLOOR_SIDEBAR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+    restoreEnv('OPENCODE_CONFIG_DIR')
+    restoreEnv('XDG_STATE_HOME')
+    restoreEnv('XDG_DATA_HOME')
+    delete process.env.NODE_ENV
+  })
 })
 
 function deferred<T = void>() {
@@ -236,6 +244,7 @@ function pluginInput(): PluginInput {
 function parkAt(step: PoolMigrationStep) {
   const reached = deferred()
   const release = deferred()
+  releaseMigrations.push(() => release.resolve())
   let parked = false
   return {
     reached: reached.promise,
@@ -272,7 +281,7 @@ async function loadPlugin(poolMigration: PoolOptions = {}, extra = {}) {
     init?: RequestInit,
   ) => Promise<Response>
   if (!fetchOverride) throw new Error('No fetch in loader result')
-  return { fetchOverride, methods: authHook.methods }
+  return { fetchOverride: scope.wrap(fetchOverride), methods: authHook.methods }
 }
 
 function send(
