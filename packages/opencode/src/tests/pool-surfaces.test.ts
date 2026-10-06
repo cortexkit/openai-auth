@@ -3,20 +3,23 @@
 // cachekeep, reset credits and the auth menu. Each reads and writes the
 // account pool's rows, never the legacy main slot plus fallback list.
 
-import { afterEach, beforeEach, describe, expect } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
+import * as poolStores from '@cortexkit/common-auth/store'
 import {
   type AccountPaths,
   loadAccounts,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks } from '@opencode-ai/plugin'
+import { BackgroundQuotaRefresh } from '../core/background-quota-refresh'
 import type { OpenAICacheKeepManager } from '../core/cachekeep'
 import { PoolAccountSource } from '../core/pool-account-source'
 import { buildPoolSidebarMachineState } from '../core/pool-sidebar'
 import {
+  __bootQuotaSeedPromiseForTest,
   __resetBootQuotaSeedForTest,
   createResetTargetResolver,
 } from '../index.ts'
@@ -32,7 +35,6 @@ import {
   quotaMap,
   readJson,
   seedPool,
-  sleep,
   usageBody,
   waitFor,
 } from './fixtures/pool-install'
@@ -52,7 +54,23 @@ let sidebarFile: string
 let originalFetch: typeof globalThis.fetch
 let hooks: Hooks | undefined
 const scope = createRequestTestScope()
-const it = scope.it
+const sources = new Set<PoolAccountSource>()
+const backgroundRuns = new Set<Promise<void>>()
+const restores: Array<() => void> = []
+
+async function settleSurfaceWork() {
+  await __bootQuotaSeedPromiseForTest()
+  for (const source of sources) await source.poolStore().pullsSettled()
+  await Promise.all([...backgroundRuns])
+  for (const source of sources) await source.poolStore().pullsSettled()
+  await drainSidebarWrites()
+}
+
+const it = (name: string, body: () => void | Promise<void>) =>
+  scope.it(name, async () => {
+    await body()
+    await settleSurfaceWork()
+  })
 
 beforeEach(() => {
   configDir = mkdtempSync(join(tmpdir(), 'oai-pool-surfaces-'))
@@ -73,16 +91,47 @@ beforeEach(() => {
   // Every test starts as a fresh process would, so the one-time boot quota
   // seed (a legacy quota poll at loader start) is allowed to run.
   __resetBootQuotaSeedForTest()
+  sources.clear()
+  backgroundRuns.clear()
+  const load = PoolAccountSource.prototype.load
+  const loadSpy = spyOn(PoolAccountSource.prototype, 'load').mockImplementation(
+    function (this: PoolAccountSource) {
+      sources.add(this)
+      return load.call(this)
+    },
+  )
+  const start = BackgroundQuotaRefresh.prototype.start
+  const startSpy = spyOn(
+    BackgroundQuotaRefresh.prototype,
+    'start',
+  ).mockImplementation(function (this: BackgroundQuotaRefresh, run, onError) {
+    start.call(
+      this,
+      scope.wrap(async () => {
+        const promise = run()
+        backgroundRuns.add(promise)
+        try {
+          await promise
+        } finally {
+          backgroundRuns.delete(promise)
+        }
+      }),
+      onError,
+    )
+  })
+  restores.push(
+    () => loadSpy.mockRestore(),
+    () => startSpy.mockRestore(),
+  )
 })
 
 afterEach(async () => {
   await scope.teardown(async () => {
+    await settleSurfaceWork()
     await hooks?.dispose?.()
+    for (const restore of restores.splice(0)) restore()
     globalThis.fetch = originalFetch
     await drainSidebarWrites()
-    // Background pool writes may still be landing; let them finish before the
-    // directory goes away.
-    await sleep(50)
     process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
     process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
@@ -175,7 +224,7 @@ describe('a migrated install refreshes and polls its rows only through the pool'
       () => (wire.polls.length >= 2 ? true : undefined),
       'the first pool polls',
     )
-    await sleep(750)
+    await settleSurfaceWork()
 
     // The pool polled each row once, at load; nothing refreshed a token.
     expect([...wire.polls].sort()).toEqual([
@@ -186,6 +235,53 @@ describe('a migrated install refreshes and polls its rows only through the pool'
   })
 
   it('polls under the bg-quota-refresh lease, refreshing due tokens through the pool', async () => {
+    // Hold a prior plugin's startup quota request before it calls fetch.
+    // Its pending request must finish before global fetch is replaced below;
+    // otherwise Bearer prior-token is recorded as a third poll by the new wire.
+    // This reproduces a supported mechanism, not a proven historical cause.
+    seedPool(files, [{ id: 'prior', quota: quotaMap(10) }])
+    installWire({ usage: () => new Response('', { status: 503 }) })
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const open = poolStores.openPoolStore
+    const storeSpy = spyOn(poolStores, 'openPoolStore').mockImplementation(
+      (options) =>
+        open({
+          ...options,
+          hold: async (step) => {
+            if (step === 'pull-before-request') {
+              entered.resolve()
+              await release.promise
+            }
+          },
+        }),
+    )
+    let prior: Hooks | undefined
+    try {
+      prior = await loadPlugin({ backgroundQuota: manualTimers().options })
+      await entered.promise
+    } finally {
+      storeSpy.mockRestore()
+    }
+    const priorSource = [...sources].at(-1)
+    if (!priorSource) throw new Error('prior pool source missing')
+    const previous = createRequestTestScope()
+    const owner = 'prior loader with a gated first quota pull'
+    const draining = previous.run(owner, settleSurfaceWork)
+    // Give the scope's callback one event-loop turn to start waiting for the
+    // held quota request. If that wait is removed, the callback finishes and
+    // teardown replaces the fixture before the prior request is released.
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    const boundaryError = await previous
+      .teardown(
+        async () => {
+          await prior?.dispose?.()
+        },
+        () => release.resolve(),
+      )
+      .catch((error: unknown) => error)
+    await draining
+
     const stale = Date.now() - HOUR
     seedPool(files, [
       { id: 'main', quota: quotaMap(10, stale) },
@@ -197,13 +293,15 @@ describe('a migrated install refreshes and polls its rows only through the pool'
     ])
     let usage = () => new Response('', { status: 503 })
     const wire = installWire({ usage: () => usage() })
+    release.resolve()
     const timers = manualTimers()
     hooks = await loadPlugin({ backgroundQuota: timers.options })
     await waitFor(
       () => (wire.polls.length >= 2 ? true : undefined),
       'the first pool polls',
     )
-    await sleep(100)
+    await priorSource.poolStore().pullsSettled()
+    await settleSurfaceWork()
     const tick = timers.tick
     if (!tick) throw new Error('the background poller was not started')
 
@@ -215,11 +313,17 @@ describe('a migrated install refreshes and polls its rows only through the pool'
       path: files.configFile,
     })
     if (!lease) throw new Error('lease not taken')
-    tick()
-    await sleep(750)
-    expect(wire.polls).toHaveLength(2)
-    expect(wire.refreshTokens).toEqual([])
-    await lease.release()
+    try {
+      tick()
+      await settleSurfaceWork()
+      expect(wire.polls).toHaveLength(2)
+      expect(wire.refreshTokens).toEqual([])
+      expect((boundaryError as Error).message).toBe(
+        `Request work outlived test: ${owner}`,
+      )
+    } finally {
+      await lease.release()
+    }
 
     // With the lease free, the pass refreshes the due token and polls both
     // stale rows, and the readings land in the pool's quota maps.
@@ -232,6 +336,7 @@ describe('a migrated install refreshes and polls its rows only through the pool'
           : undefined,
       'both rows polled into the pool',
     )
+    await settleSurfaceWork()
     expect(wire.refreshTokens).toEqual(['fallback-1-refresh'])
     expect(wire.polls.slice(2).sort()).toEqual([
       'Bearer main-token',
