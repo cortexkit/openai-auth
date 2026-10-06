@@ -60,6 +60,7 @@ import { observationFromSnapshot } from '../core/pool-quota'
 import { migrationFenceOpen } from '../core/version-fence'
 import { PackageVersion } from '../version'
 import { type AuthDetails, authDoctorChecks, readStoreIds } from './doctor'
+import { runVaultAccountMenu } from './vault-account-menu'
 
 type AuthMethod = AuthHook['methods'][number]
 type BeginLogin = typeof beginAccountLogin
@@ -107,7 +108,15 @@ export interface CreateAuthMethodsOptions {
    */
   vault?: Pick<
     OpenAiVault,
-    'host' | 'name' | 'status' | 'waitForApproval' | 'routes' | 'snapshot'
+    | 'host'
+    | 'name'
+    | 'status'
+    | 'waitForApproval'
+    | 'routes'
+    | 'snapshot'
+    | 'identities'
+    | 'refresh'
+    | 'pollQuota'
   >
 }
 
@@ -436,7 +445,8 @@ export function createAuthMethods({
     const store = deps.openAccountPool(paths)
     if ((await migratedPoolRows(paths, store)) === undefined)
       return notMigratedMenu()
-    return runAccountMenu(accountMenuOptions(paths, store))
+    const options = accountMenuOptions(paths, store)
+    return vault ? runVaultAccountMenu(options, vault) : runAccountMenu(options)
   }
 
   return [

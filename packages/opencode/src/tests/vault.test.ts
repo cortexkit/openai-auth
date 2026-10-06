@@ -314,6 +314,136 @@ describe('enrollment', () => {
   })
 })
 
+describe('auth account menu with vault accounts', () => {
+  async function menu(keys: string[], vault: OpenAiVault) {
+    const scripted = scriptedTerminal(keys)
+    const methods = createAuthMethods({
+      client: { auth: { set: async () => {} } } as never,
+      getAuth: async () => ({ ...PLACEHOLDER }),
+      getPaths: () => ({
+        configPath: files.configFile,
+        statePath: files.stateFile,
+      }),
+      vault,
+      dependencies: {
+        terminal: scripted.terminal,
+        migrationBlockers: async () => [],
+      },
+    })
+    await (
+      methods[0] as {
+        authorize: (inputs: Record<string, string>) => Promise<unknown>
+      }
+    ).authorize({})
+    return scripted.written()
+  }
+
+  async function setup() {
+    const running = await startDaemon({
+      'oauth:openai:main': vaultLogin('chatgpt-main'),
+      'oauth:openai:ufuk': vaultLogin('chatgpt-ufuk'),
+      'oauth:openai:work': vaultLogin('chatgpt-work'),
+    })
+    seedPool(files, [{ id: 'main' }, { id: 'ufuk' }, { id: 'local' }])
+    enroll()
+    const vault = new OpenAiVault({
+      host: 'opencode',
+      stateDir,
+      connectionFile: () => running.connectionFile,
+      pollIntervalMs: 0,
+    })
+    await vault.refresh()
+    const ufuk = vault
+      .snapshot()
+      ?.rows.find((row) => row.accountIdentity === 'chatgpt-ufuk')
+    if (!ufuk) throw new Error('missing vault ufuk account')
+    await vault.decline(ufuk.routeId)
+    return { vault, running }
+  }
+
+  test('auth menu header lists vault accounts and marks shadowed local rows', async () => {
+    const { vault } = await setup()
+    try {
+      const printed = await menu(['\u001b'], vault)
+      for (const row of vault.snapshot()?.rows ?? []) {
+        expect(printed).toContain(
+          `Vault ${row.label}: ${row.enabled ? 'enabled' : 'declined'}`,
+        )
+      }
+      expect(printed).toContain(
+        'main: main, enabled, set aside (the vault serves this account)',
+      )
+      expect(printed).toContain(
+        'ufuk: ufuk, enabled, set aside (the vault serves this account)',
+      )
+      expect(printed).toContain('local: local, enabled')
+    } finally {
+      vault.close()
+    }
+  })
+
+  test('auth menu Check quotas polls vault accounts into roster and skips shadowed locals', async () => {
+    const wire = installWire({
+      usage: () => new Response(usageBody(37), { status: 200 }),
+    })
+    const { vault, running } = await setup()
+    try {
+      const gets = running.gets.length
+      const beforeConfig = readJson(files.configFile)
+      const beforeState = readFileSync(files.stateFile, 'utf8')
+      const printed = await menu([...Array(4).fill(DOWN), ENTER], vault)
+      expect(wire.polls.sort()).toEqual(
+        [
+          'Bearer local-token',
+          `Bearer ${chatgptAccessToken('chatgpt-main')}`,
+          `Bearer ${chatgptAccessToken('chatgpt-work')}`,
+        ].sort(),
+      )
+      expect(running.gets.length - gets).toBe(2)
+      for (const row of vault.snapshot()?.rows ?? []) {
+        expect(printed).toContain(`Vault ${row.label}:`)
+        if (row.enabled) {
+          expect(row.quota?.limits).toContainEqual(
+            expect.objectContaining({ usedPercent: 37 }),
+          )
+        } else expect(row.quota).toBeUndefined()
+      }
+      expect(printed).toContain('63% left')
+      expect(printed).toContain(
+        'quota check skipped: account is not enabled and active',
+      )
+      expect(readJson(files.configFile).accounts).toEqual(beforeConfig.accounts)
+      expect(readFileSync(files.stateFile, 'utf8')).toBe(beforeState)
+      expect(wire.refreshTokens).toEqual([])
+    } finally {
+      vault.close()
+    }
+  })
+
+  test('auth menu Check quotas reports an unreachable vault without crashing', async () => {
+    installWire()
+    const { vault, running } = await setup()
+    try {
+      await running.stop()
+      daemon = undefined
+      rmSync(running.connectionFile)
+      vault.close()
+      const offline = new OpenAiVault({
+        host: 'opencode',
+        stateDir,
+        connectionFile: () => running.connectionFile,
+        pollIntervalMs: 0,
+      })
+      const printed = await menu([...Array(4).fill(DOWN), ENTER], offline)
+      offline.close()
+      expect(printed).toContain('Claustrum vault unreachable:')
+      expect(printed).toContain('local: local, enabled')
+    } finally {
+      vault.close()
+    }
+  })
+})
+
 describe('refresh', () => {
   test('waits out a discovery already in flight and runs one that sees what changed since', async () => {
     const running = await startDaemon({
