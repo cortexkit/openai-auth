@@ -342,9 +342,15 @@ const DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS = 60_000
 const HANDLED_SENTINEL = '__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__'
 
 let bootQuotaSeedStarted = false
+let bootQuotaSeedPromise: Promise<unknown> | undefined
+
+export function __bootQuotaSeedPromiseForTest(): Promise<unknown> | undefined {
+  return bootQuotaSeedPromise
+}
 
 export function __resetBootQuotaSeedForTest(): void {
   bootQuotaSeedStarted = false
+  bootQuotaSeedPromise = undefined
 }
 
 const logModels = createLogger('models')
@@ -4216,7 +4222,7 @@ export async function CodexAuthPlugin(
           // above already polls every pool row, and the legacy seed would
           // refresh and poll the same rows a second way.
           if (!(await poolSource.active())) {
-            void refreshAllQuota(
+            bootQuotaSeedPromise = refreshAllQuota(
               buildRefreshAllQuotaDeps({ respectBackoff: true }),
             ).catch((error) =>
               logQ.warn('boot quota seed failed', {
@@ -4224,6 +4230,8 @@ export async function CodexAuthPlugin(
                 error: errorMessage(error),
               }),
             )
+          } else {
+            bootQuotaSeedPromise = Promise.resolve()
           }
         }
 

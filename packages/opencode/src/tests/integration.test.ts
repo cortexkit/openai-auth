@@ -20,7 +20,9 @@ import { getConfigPath } from '../config.ts'
 import { getAccountPaths } from '../core/account-paths'
 import { QUOTA_STALENESS_MS } from '../core/sticky-routing.ts'
 import {
+  __bootQuotaSeedPromiseForTest,
   __menuContextForTest,
+  __resetBootQuotaSeedForTest,
   AuthPersistError,
   CodexAuthPlugin,
   EMPTY_BEARER_MESSAGE,
@@ -331,6 +333,7 @@ describe('integration: HTTP quota push', () => {
   const refreshToken = 'sk-test-refresh-456'
 
   beforeEach(() => {
+    __resetBootQuotaSeedForTest()
     configDir = tempDir('oai-int-http-quota-')
     configFile = join(configDir, 'openai-auth.json')
     stateFile = join(configDir, 'openai-auth-state.json')
@@ -362,116 +365,135 @@ describe('integration: HTTP quota push', () => {
     delete process.env.NODE_ENV
   })
 
-  it('pushes main quota from x-codex-* headers into sidebar state', async () => {
-    // Seed account store so migration is a no-op and loadAccounts succeeds
-    const store = {
-      version: 1,
-      main: { type: 'opencode', provider: 'openai' },
-      accounts: [],
-    }
-    writeFileSync(configFile, JSON.stringify(store))
-
-    // The turn's request answers 200 with x-codex-* headers. Everything else
-    // the loader sends on its own (the startup quota poll of main, token
-    // exchanges) answers 500: a poll answered with the turn's body would
-    // read as a quota with no windows and, landing after the push, replace
-    // the pushed one in the sidebar. The startup poll is held until the push
-    // has been written, the order in which that overwrite showed up under
-    // suite load, so the test always covers it.
-    const originalFetch = globalThis.fetch
-    const pollRelease = Promise.withResolvers<void>()
-    const pollAnswered = Promise.withResolvers<void>()
-    globalThis.fetch = (async (url: unknown, _init?: unknown) => {
-      if (!isResponsesSend(url)) {
-        await pollRelease.promise
-        pollAnswered.resolve()
-        return new Response('unavailable', { status: 500 })
+  for (const seed of ['issued', 'already started'] as const) {
+    it(`pushes main quota from x-codex-* headers into sidebar state (${seed})`, async () => {
+      // Seed account store so migration is a no-op and loadAccounts succeeds
+      const store = {
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
       }
-      return new Response('{"choices":[{"delta":{"content":"hello"}}]}', {
-        status: 200,
-        headers: {
-          'content-type': 'text/event-stream',
-          'x-codex-primary-used-percent': '42',
-          'x-codex-primary-window-minutes': '300',
-          'x-codex-primary-reset-at': '1781729038',
-          'x-codex-secondary-used-percent': '15',
-          'x-codex-secondary-window-minutes': '10080',
-          'x-codex-secondary-reset-at': '1781766665',
-        },
-      })
-    }) as unknown as typeof globalThis.fetch
+      writeFileSync(configFile, JSON.stringify(store))
 
-    let hooks: Hooks | undefined
-    try {
-      const input = createMockPluginInput()
-      hooks = await CodexAuthPlugin(input, {
-        experimentalWebSockets: false,
-      })
+      // A failed startup quota poll must not replace quota pushed by the turn.
+      // Hold its answer until after the push, and also exercise a second loader:
+      // the once-per-process seed guard legitimately prevents another poll.
+      const originalFetch = globalThis.fetch
+      const pollRelease = Promise.withResolvers<void>()
+      const pollStarted = Promise.withResolvers<void>()
+      let pollCalls = 0
+      globalThis.fetch = (async (url: unknown, _init?: unknown) => {
+        if (!isResponsesSend(url)) {
+          expect(String(url)).toContain('/wham/usage')
+          pollCalls++
+          pollStarted.resolve()
+          await pollRelease.promise
+          return new Response('unavailable', { status: 500 })
+        }
+        return new Response('{"choices":[{"delta":{"content":"hello"}}]}', {
+          status: 200,
+          headers: {
+            'content-type': 'text/event-stream',
+            'x-codex-primary-used-percent': '42',
+            'x-codex-primary-window-minutes': '300',
+            'x-codex-primary-reset-at': '1781729038',
+            'x-codex-secondary-used-percent': '15',
+            'x-codex-secondary-window-minutes': '10080',
+            'x-codex-secondary-reset-at': '1781766665',
+          },
+        })
+      }) as unknown as typeof globalThis.fetch
 
-      // Get the auth loader
-      const authHook = hooks.auth
-      if (!authHook?.loader) throw new Error('No auth loader')
+      let hooks: Hooks | undefined
+      try {
+        const input = createMockPluginInput()
+        hooks = await CodexAuthPlugin(input, {
+          experimentalWebSockets: false,
+        })
 
-      // Call the loader with a mock getAuth
-      const loaderResult = await authHook.loader(
-        async () => ({
-          type: 'oauth' as const,
-          provider: 'openai',
-          access: accessToken,
-          refresh: refreshToken,
-          expires: Date.now() + 3600_000,
-        }),
-        {
-          id: 'openai',
-          label: 'OpenAI',
-          models: [],
-        } as unknown as Parameters<NonNullable<(typeof authHook)['loader']>>[1],
-      )
+        // Get the auth loader
+        const authHook = hooks.auth
+        if (!authHook?.loader) throw new Error('No auth loader')
 
-      expect(loaderResult).toBeDefined()
-      const fetchOverride = (loaderResult as Record<string, unknown>).fetch as
-        | ((url: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
-        | undefined
-      if (!fetchOverride) throw new Error('No fetch in loader result')
+        // Call the loader with a mock getAuth
+        const load = () =>
+          authHook.loader!(
+            async () => ({
+              type: 'oauth' as const,
+              provider: 'openai',
+              access: accessToken,
+              refresh: refreshToken,
+              expires: Date.now() + 3600_000,
+            }),
+            {
+              id: 'openai',
+              label: 'OpenAI',
+              models: [],
+            } as unknown as Parameters<
+              NonNullable<(typeof authHook)['loader']>
+            >[1],
+          )
 
-      // Drive a request through the gate pipeline
-      const response = await fetchOverride(
-        'https://api.openai.com/v1/responses',
-        {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            model: 'gpt-5.5',
-            messages: [{ role: 'user', content: 'hi' }],
-          }),
-        },
-      )
+        expect(__bootQuotaSeedPromiseForTest()).toBeUndefined()
+        let loaderResult = await load()
+        const bootSeed = __bootQuotaSeedPromiseForTest()
+        expect(bootSeed).toBeDefined()
+        await pollStarted.promise
+        expect(pollCalls).toBe(1)
+        if (seed === 'already started') {
+          loaderResult = await load()
+          // Identity proves this loader reused the seed rather than scheduling
+          // another asynchronous poll that a fetch count could miss.
+          expect(__bootQuotaSeedPromiseForTest()).toBe(bootSeed)
+          expect(pollCalls).toBe(1)
+        }
 
-      expect(response.status).toBe(200)
-      // Don't consume the body — we only care about the side-effect (quota push)
-      await response.body?.cancel()
+        expect(loaderResult).toBeDefined()
+        const fetchOverride = (loaderResult as Record<string, unknown>).fetch as
+          | ((url: RequestInfo | URL, init?: RequestInit) => Promise<Response>)
+          | undefined
+        if (!fetchOverride) throw new Error('No fetch in loader result')
 
-      // The push is written by the background sidebar writer; wait for its
-      // queue to empty. Then let the startup poll answer, give its result
-      // time to be handled, and wait for the writer again before reading.
-      await drainSidebarWrites()
-      pollRelease.resolve()
-      await pollAnswered.promise
-      await new Promise((resolve) => setTimeout(resolve, 50))
-      await drainSidebarWrites()
-      const sidebar = await waitForSidebarState(
-        sidebarFile,
-        (s) =>
-          s.main.quota?.primary?.usedPercent === 42 &&
-          s.main.quota?.secondary?.usedPercent === 15,
-      )
-      expect(sidebar.main.quota?.primary?.usedPercent).toBe(42)
-      expect(sidebar.main.quota?.secondary?.usedPercent).toBe(15)
-    } finally {
-      globalThis.fetch = originalFetch
-      await hooks?.dispose?.()
-    }
-  })
+        // Drive a request through the gate pipeline
+        const response = await fetchOverride(
+          'https://api.openai.com/v1/responses',
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              model: 'gpt-5.5',
+              messages: [{ role: 'user', content: 'hi' }],
+            }),
+          },
+        )
+
+        expect(response.status).toBe(200)
+        // Don't consume the body — we only care about the side-effect (quota push)
+        await response.body?.cancel()
+
+        // Finish the push before answering the poll, then await all poll handling
+        // before checking that its late failure left the pushed quota intact.
+        await drainSidebarWrites()
+        pollRelease.resolve()
+        await bootSeed
+        expect(pollCalls).toBe(1)
+        await drainSidebarWrites()
+        const sidebar = await waitForSidebarState(
+          sidebarFile,
+          (s) =>
+            s.main.quota?.primary?.usedPercent === 42 &&
+            s.main.quota?.secondary?.usedPercent === 15,
+        )
+        expect(sidebar.main.quota?.primary?.usedPercent).toBe(42)
+        expect(sidebar.main.quota?.secondary?.usedPercent).toBe(15)
+      } finally {
+        pollRelease.resolve()
+        await __bootQuotaSeedPromiseForTest()
+        globalThis.fetch = originalFetch
+        await hooks?.dispose?.()
+      }
+    })
+  }
 
   it('records served routing for child and parent sessions', async () => {
     writeFileSync(
