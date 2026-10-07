@@ -77,6 +77,7 @@ import {
   adoptHostSlotLogin,
   type HostSlotAdapter,
   migrateToPool,
+  poolPlaceholderWithoutMain,
 } from '../core/pool-migration'
 import { observationFromSnapshot } from '../core/pool-quota'
 import { startProcessHeartbeat } from '../core/process-heartbeat'
@@ -278,11 +279,17 @@ export async function setupOpenAIAuth(
   // OpenCode 1's slot runs, as on OpenCode 1 with the switch off.
   const fence =
     options.fence ?? (() => migrationFenceOpen({ currentVersion: version }))
+  const migrationSlot = options.slot ?? opencode1HostSlot()
+  const slotPlaceholderWithoutMain = async () =>
+    poolPlaceholderWithoutMain(
+      paths(),
+      await migrationSlot.get({ path: { id: 'openai' } }),
+    )
   let migrationRefused = false
   const lifecycle = migrationEnabled
     ? createPoolLifecycle({
         paths,
-        slot: options.slot ?? opencode1HostSlot(),
+        slot: migrationSlot,
         version,
         fence,
         // While the vault serves this host its accounts, a login in the slot
@@ -333,6 +340,7 @@ export async function setupOpenAIAuth(
   const pins = new SessionPins()
   const openai = createOpenAIAdapter({
     source,
+    slotPlaceholderWithoutMain,
     storage: () => loadAccounts(paths()),
     pins,
     vault,
@@ -413,8 +421,7 @@ export async function setupOpenAIAuth(
     // OpenCode 2 imported a migrated `auth.json`) and tombstones of the
     // removed vault custody hold no credential.
     if (isLeftoverCredential(value)) {
-      const storage = await loadAccounts(paths())
-      if (!storage?.accounts.some((account) => account.id === 'main')) {
+      if (await slotPlaceholderWithoutMain()) {
         if (lifecycle) lifecycle.noticePlaceholderWithoutMain()
         else log.warn(POOL_LOGIN_REQUIRED_MESSAGE)
       }

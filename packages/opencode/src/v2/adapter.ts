@@ -178,6 +178,8 @@ export type OpenAIAttemptData =
 
 export interface OpenAIAdapterDeps {
   source: PoolAccess
+  /** The migration's exact foreign-placeholder predicate, read without locks. */
+  slotPlaceholderWithoutMain?: () => Promise<boolean>
   /** The settings a request reads (routing mode, killswitch, quota policy). */
   storage: () => Promise<AccountStorage | null>
   pins: SessionPins
@@ -554,7 +556,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       })
     }
     if (!view.active) {
-      if (!storage?.accounts.length) refuseMissingLogin()
+      if (await deps.slotPlaceholderWithoutMain?.()) refuseMissingLogin()
       log?.warn(
         'the account pool does not serve requests yet; refusing the request',
         { kind: input.kind },
@@ -628,8 +630,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     // OpenCode 1, but only after routing has had a chance to serve other rows.
     if (
       accountId === undefined &&
-      !view.rows.some((row) => row.id === 'main') &&
-      targets.length === 0
+      targets.length === 0 &&
+      (await deps.slotPlaceholderWithoutMain?.())
     )
       refuseMissingLogin()
     if (accountId !== undefined && primary)

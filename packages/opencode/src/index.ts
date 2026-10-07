@@ -126,6 +126,7 @@ import {
   adoptHostSlotLogin,
   migrateToPool,
   PoolTransferPendingError,
+  poolPlaceholderWithoutMain,
   poolTransferPendingInConfigFile,
   reclaimExpiredPoolTransfer,
 } from './core/pool-migration'
@@ -1862,8 +1863,10 @@ export async function CodexAuthPlugin(
         })
 
         if (
-          isPoolMainPlaceholder(auth) &&
-          !storage?.accounts.some((account) => account.id === 'main')
+          await poolPlaceholderWithoutMain(
+            getAccountPaths(getConfigPath()),
+            auth,
+          )
         ) {
           if (poolLifecycle) poolLifecycle.noticePlaceholderWithoutMain()
           else if (!missingPoolMainLogged) {
@@ -4321,6 +4324,12 @@ export async function CodexAuthPlugin(
           const mainRow = poolSource
             .peek()
             .rows.find((row) => row.id === 'main')
+          const loginRequired =
+            !mainRow &&
+            (await poolPlaceholderWithoutMain(
+              getAccountPaths(getConfigPath()),
+              await getAuth(),
+            ))
           if (generation === mainIdentityGeneration) {
             currentMainIdentity = mainRow?.identity
           }
@@ -4390,7 +4399,7 @@ export async function CodexAuthPlugin(
               if (block.reason === 'no-credential') {
                 // Routing has already tried every row that could serve, so
                 // a missing main must not prevent a healthy fallback send.
-                if (!mainRow) throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)
+                if (loginRequired) throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)
                 return new Response(null, { status: 401 })
               }
               return killswitchBlockedResponse(
@@ -4916,8 +4925,11 @@ export async function CodexAuthPlugin(
             if (
               mainInPool &&
               mainUnavailable &&
-              !findPoolMainRow(reqStorage) &&
-              !fallbackServed
+              !fallbackServed &&
+              (await poolPlaceholderWithoutMain(
+                getAccountPaths(getConfigPath()),
+                await getAuth(),
+              ))
             )
               throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)
 

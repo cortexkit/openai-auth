@@ -17,7 +17,9 @@ import {
   isPoolPlaceholder,
   migrateToPool,
   POOL_MIGRATION_KEY,
+  POOL_PLACEHOLDER,
   type PoolTransferOutcome,
+  poolPlaceholderWithoutMain,
 } from '../core/pool-migration.ts'
 import { migrationFenceOpen, rpcStateRoot } from '../core/version-fence.ts'
 import { writePortFile } from '../rpc/port-file.ts'
@@ -60,7 +62,8 @@ const recorded = await (async () => {
   try {
     await seedLegacyInstall(probe)
     const run = await runChild({ dir: probe.dir, mode: 'migrate' })
-    if (run.code !== 0) throw new Error(`probe run failed:\n${run.output}`)
+    if (run.code !== 0 || run.outcome?.status !== 'completed')
+      throw new Error(`probe run did not complete:\n${run.output}`)
     return run.steps
   } finally {
     probe.cleanup()
@@ -156,7 +159,7 @@ describe('a crash at every step of the migration', () => {
         mode: 'migrate',
         exitAtIndex: index,
       })
-      expect(child.code).toBe(CRASH_EXIT_CODE)
+      expect(child.code, child.output).toBe(CRASH_EXIT_CODE)
       expect(child.steps.at(-1)).toBe(step)
 
       // An older build still loads every fallback with its credential.
@@ -288,6 +291,65 @@ describe('the carry-over of the legacy main state', () => {
 })
 
 describe('the shield lasts until the placeholder is in the slot', () => {
+  for (const step of [
+    'after-record-write',
+    'before-placeholder-write',
+    'after-placeholder-write',
+    'after-record-clear',
+  ] as const) {
+    it(`an own migration at ${step} cannot be refused as a foreign placeholder`, async () => {
+      // Every crash row starts in a new directory with a real slot login.
+      // The child has no competing writer; older builds are run only after
+      // it exits. Before the placeholder write there is no placeholder to
+      // refuse. Afterwards the already-verified row is durable, and until
+      // completion its pending record is durable as well.
+      await seedLegacyInstall(h)
+      expect(isPoolPlaceholder(await h.slotValue())).toBe(false)
+      const child = await runChild({
+        dir: h.dir,
+        mode: 'migrate',
+        exitAtName: step,
+      })
+      expect(child.code, child.output).toBe(CRASH_EXIT_CODE)
+      expect(child.steps.at(-1)).toBe(step)
+      const placeholderWritten =
+        step === 'after-placeholder-write' || step === 'after-record-clear'
+      expect(isPoolPlaceholder(await h.slotValue())).toBe(placeholderWritten)
+      const config = await h.config()
+      if (step === 'after-record-clear') {
+        expect(config[POOL_MIGRATION_KEY].pending).toBeUndefined()
+        expect(config[POOL_MIGRATION_KEY].migratedAt).toBeNumber()
+      } else {
+        expect(config[POOL_MIGRATION_KEY].pending.rowId).toBe('main')
+        expect(config.mainAccountId).toBe('acct-main')
+      }
+      const main = await h.row('main')
+      if (step === 'after-record-write') {
+        expect(main).toBeUndefined()
+        // Even if a reader already saw the newer placeholder, the pending
+        // record alone keeps the store from being mistaken for another setup.
+        expect(
+          await poolPlaceholderWithoutMain(h.paths, POOL_PLACEHOLDER),
+        ).toBe(false)
+      } else
+        expect(main?.credential).toMatchObject({
+          type: 'oauth',
+          refresh: 'r-main',
+        })
+
+      const before = await h.bytes()
+      expect(
+        await poolPlaceholderWithoutMain(h.paths, await h.slotValue()),
+      ).toBe(false)
+      expect(await h.bytes()).toEqual(before)
+      const outcome = await settle(() =>
+        migrateToPool(h.deps({ ...SHORT_LOCKS })),
+      )
+      expect(['completed', 'already-migrated']).toContain(outcome.status)
+      expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main'])
+    }, 30_000)
+  }
+
   it('a crash between the placeholder write and the shield drop: a tolerant build serves main from row main with no double refresh, and a re-run drops the shield', async () => {
     await seedLegacyInstall(h)
     const child = await runChild({

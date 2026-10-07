@@ -91,6 +91,59 @@ async function startPool(
 }
 
 describe('OpenCode 2 separate account store', () => {
+  it('a real slot login behind a closed version fence keeps the generic refusal', async () => {
+    const files = poolFiles()
+    writeFileSync(
+      files.configPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      }),
+    )
+    writeFileSync(
+      join(files.dir, 'auth.json'),
+      JSON.stringify({
+        openai: {
+          type: 'oauth',
+          access: 'real-slot-access',
+          refresh: 'real-slot-refresh',
+          expires: Date.now() + 3600_000,
+        },
+      }),
+    )
+    const before = readFileSync(files.configPath, 'utf8')
+    const { host, stop } = await start(files, {
+      activeCredential: {
+        type: 'oauth',
+        methodID: 'chatgpt-browser',
+        access: PLACEHOLDER,
+        refresh: PLACEHOLDER,
+        expires: 0,
+      } as unknown as Credential.Value,
+      fence: async () => ({
+        open: false,
+        blockers: [{ pid: 123, version: '0.11.0', detail: 'older heartbeat' }],
+      }),
+    })
+    for (const request of [() => httpRequest(host), () => wsHandshake(host)]) {
+      const error = await request().then(
+        () => undefined,
+        (reason: unknown) => reason,
+      )
+      expect(error).toBeInstanceOf(OpenCode2AuthError)
+      expect((error as OpenCode2AuthError).kind).toBe('no-account')
+      expect((error as OpenCode2AuthError).message).toBe(
+        'openai primary request refused (no-account)',
+      )
+      expect((error as OpenCode2AuthError).message).not.toBe(
+        LOGIN_REQUIRED_MESSAGE,
+      )
+    }
+    await stop()
+    expect(readFileSync(files.configPath, 'utf8')).toBe(before)
+  })
+
   it('main-first still serves another pool row when main is missing', async () => {
     const files = poolFiles()
     seedPool(files, 'main-first', [{ id: 'fb' }])

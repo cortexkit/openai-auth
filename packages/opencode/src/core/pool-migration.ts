@@ -888,6 +888,41 @@ async function readSlot(ctx: Context): Promise<SlotView> {
 }
 
 /**
+ * Whether a freshly read host slot is a placeholder without this store's
+ * main row or pending transfer. The request paths use the migration's exact
+ * predicate, not an empty legacy roster: that roster can be empty while a
+ * real login waits in the slot for the version fence to open.
+ *
+ * Read the store after the slot. Our own placeholder is written only after
+ * the row and pending record are durable, so an older store snapshot must
+ * not be combined with that newer slot value to declare the login missing.
+ * This only reads files; it neither takes a store lock nor starts a migration.
+ */
+export async function poolPlaceholderWithoutMain(
+  paths: AccountPaths,
+  slot: unknown,
+): Promise<boolean> {
+  if (!isPoolPlaceholder(slot)) return false
+  const config = await readConfig(paths.configPath)
+  const load = await openPoolStore({
+    provider: PROVIDER,
+    configPath: paths.configPath,
+    statePath: paths.statePath,
+    quota: quotaCodec,
+  }).read()
+  if (load.status === 'error') return false
+  const hasMain =
+    load.status === 'ready'
+      ? load.rows.some((row) => row.id === 'main')
+      : load.roster.some((row) => isRecord(row) && row.id === 'main')
+  return placeholderWithoutMain(
+    { kind: 'placeholder' },
+    hasMain,
+    readPoolMigrationBookkeeping(config),
+  )
+}
+
+/**
  * The slot view, after waiting out an active legacy main-refresh lease on
  * the slot's own refresh token, exactly as the plugin's `refreshMainWithLease`
  * does before it refreshes: a lease is active while `refreshLeaseUntil` lies
