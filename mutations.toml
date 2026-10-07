@@ -1,5 +1,5 @@
-# Mutation proofs replayed by the pinned ck-mutate runner (cortexkit/commons,
-# crate cortexkit-mutate; the revision is CK_MUTATE_REV in
+# Mutation proofs replayed by the pinned ckdev-mutate runner (cortexkit/commons,
+# crate cortexkit-mutate; the revision is CKDEV_MUTATE_REV in
 # .github/workflows/ci.yml).
 #
 # Each row is one deliberate break of production code and the named Bun test

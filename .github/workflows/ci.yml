@@ -22,10 +22,10 @@ permissions:
   contents: read
 
 env:
-  # The ck-mutate runner that replays mutations.toml (cortexkit/commons, crate
-  # cortexkit-mutate 0.7.0), pinned so a runner change never alters CI
+  # The ckdev-mutate runner that replays mutations.toml (cortexkit/commons,
+  # crate cortexkit-mutate 0.8.0), pinned so a runner change never alters CI
   # unannounced.
-  CK_MUTATE_REV: 7d08e73722fa3e79bbcc2607753978ab768f1c6b
+  CKDEV_MUTATE_REV: 46cc166b0df2edcfd14b3eb54ed6eeac588fed69
 
 jobs:
   check:
@@ -98,16 +98,16 @@ jobs:
       - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         id: mutate-cache
         with:
-          path: ~/.cargo/bin/ck-mutate
-          key: ${{ runner.os }}-${{ runner.arch }}-ck-mutate-${{ env.CK_MUTATE_REV }}
+          path: ~/.cargo/bin/ckdev-mutate
+          key: ${{ runner.os }}-${{ runner.arch }}-ckdev-mutate-${{ env.CKDEV_MUTATE_REV }}
       - name: Install pinned mutation runner
         if: steps.mutate-cache.outputs.cache-hit != 'true'
-        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
-      - run: ck-mutate check
+        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CKDEV_MUTATE_REV" cortexkit-mutate
+      - run: ckdev-mutate check
       - name: Replay proofs selected by the PR diff
         run: |
           mkdir -p mutations-report
-          ck-mutate run --diff origin/main --report mutations-report/diff.json
+          ckdev-mutate run --diff origin/main --report mutations-report/diff.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
@@ -129,16 +129,16 @@ jobs:
       - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         id: mutate-cache
         with:
-          path: ~/.cargo/bin/ck-mutate
-          key: ${{ runner.os }}-${{ runner.arch }}-ck-mutate-${{ env.CK_MUTATE_REV }}
+          path: ~/.cargo/bin/ckdev-mutate
+          key: ${{ runner.os }}-${{ runner.arch }}-ckdev-mutate-${{ env.CKDEV_MUTATE_REV }}
       - name: Install pinned mutation runner
         if: steps.mutate-cache.outputs.cache-hit != 'true'
-        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
-      - run: ck-mutate check
+        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CKDEV_MUTATE_REV" cortexkit-mutate
+      - run: ckdev-mutate check
       - name: Replay the full catalogue
         run: |
           mkdir -p mutations-report
-          ck-mutate run --all ${BROAD:+--broad} --report mutations-report/all.json
+          ckdev-mutate run --all ${BROAD:+--broad} --report mutations-report/all.json
         env:
           BROAD: ${{ github.event_name != 'push' && 'true' || '' }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
