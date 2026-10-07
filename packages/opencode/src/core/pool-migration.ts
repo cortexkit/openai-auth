@@ -308,7 +308,11 @@ export type PoolTransferOutcome =
     }
   /** Migration already recorded as done; nothing was imported. */
   | { status: 'already-migrated' }
-  /** The shared slot belongs to another store; no migration writes are safe. */
+  /**
+   * The slot holds the placeholder but this store has no `main` row and no
+   * transfer of its own in progress: another store sharing this login slot
+   * moved the login. Nothing is written.
+   */
   | { status: 'refused'; reason: 'placeholder-without-main' }
   /** Adoption asked for before the migration ran. */
   | { status: 'not-migrated' }
@@ -1694,8 +1698,9 @@ async function gate(
 ): Promise<PoolTransferOutcome | undefined> {
   const book = readPoolMigrationBookkeeping(config)
   if (mode === 'migrate' && book.migratedAt !== undefined) {
-    // A previous build may have marked a separate, empty store migrated
-    // against another setup's placeholder. Report it without rewriting it.
+    // Older builds marked a store migrated even when the placeholder in the
+    // slot came from another store and no login was moved into this one.
+    // Report that state as refused, and leave the store as it is.
     const load = await ctx.store.read()
     if (
       load.status === 'ready' &&

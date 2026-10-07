@@ -89,7 +89,10 @@ export interface PoolLifecycle {
    * does nothing.
    */
   noticeRealSlot(refreshToken: string): void
-  /** Logs the shared-placeholder/separate-store condition once at startup. */
+  /**
+   * Logs once that OpenCode's login slot holds this plugin's placeholder while
+   * this store has no `main` row: the login was moved into some other store.
+   */
   noticePlaceholderWithoutMain(): void
   /** Stops the timer; a run already under way finishes on its own. */
   dispose(): void
@@ -200,8 +203,9 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
     }
     if (outcome.status === 'refused') {
       noticePlaceholderWithoutMain()
-      // A login or a changed store path can resolve this. Stay unmigrated,
-      // but check again at the quiet adoption interval, without WARN spam.
+      // Signing in for this setup, or pointing it at the store that holds the
+      // login, resolves the refusal. Stay unmigrated and check again at the
+      // quiet adoption interval, without repeating the warning.
       schedule(jitter(POOL_RETRY_MAX_MS))
       return
     }
@@ -285,8 +289,9 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
       // starts the next one, since its slot read may already be behind.
       pendingAdoption = undefined
       if (!stopped) {
-        // A login also unblocks a migration refused against a foreign
-        // placeholder; adoption alone cannot initialize an unmigrated store.
+        // A new login in the slot also lets a refused migration proceed: it
+        // moves that login into this store as `main`. Adoption only works on
+        // a store that has already migrated, so run the migration here.
         if (isMigrated) await runAdoption()
         else await runMigration()
       }

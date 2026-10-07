@@ -178,7 +178,11 @@ export type OpenAIAttemptData =
 
 export interface OpenAIAdapterDeps {
   source: PoolAccess
-  /** The migration's exact foreign-placeholder predicate, read without locks. */
+  /**
+   * True when OpenCode's login slot holds the placeholder while this store has
+   * no `main` row and no transfer of its own in progress, so another store
+   * holds the login. The migration's own check, read without locks.
+   */
   slotPlaceholderWithoutMain?: () => Promise<boolean>
   /** The settings a request reads (routing mode, killswitch, quota policy). */
   storage: () => Promise<AccountStorage | null>
@@ -625,9 +629,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       }
       refused.add(accountId)
     }
-    // The installer otherwise replaces an empty choice with its generic
-    // no-account error. Give a separate setup the same fixed instructions as
-    // OpenCode 1, but only after routing has had a chance to serve other rows.
+    // No row could serve and the login lives in another store. Without this,
+    // the installer turns an empty choice into its generic no-account error;
+    // give the same sign-in instructions OpenCode 1 gives instead. Only after
+    // routing found no row, so a setup with other accounts still uses them.
     if (
       accountId === undefined &&
       targets.length === 0 &&

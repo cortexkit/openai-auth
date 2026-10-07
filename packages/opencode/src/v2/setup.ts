@@ -369,9 +369,10 @@ export async function setupOpenAIAuth(
       !isLeftoverCredential(login) &&
       (await fence()).open
     ) {
-      // A foreign placeholder alone cannot initialize this store. A real
-      // login for this setup can: store it first, then let migration finish
-      // from the main row, without touching the other setup's shared slot.
+      // The migration was refused because the placeholder in the login slot
+      // came from another store. A real login made for this setup can start
+      // this store: write it as `main` first, then let the migration finish
+      // from that row, leaving the shared slot as the other store left it.
       await source.poolStore().initialize()
       return
     }

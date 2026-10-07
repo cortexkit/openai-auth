@@ -303,7 +303,8 @@ test_count_pattern = "Ran {count} test"
 expect_red = ["^commands\\sreset\\scommand\\ssafety\\sflow\\s\\/openai\\sreset\\scredits:\\sSpend\\sis\\srefused\\swhile\\san\\sexpired\\spair\\sis\\sunreconciled,\\sand\\sRetry\\sstill\\sreplays\\sit$"]
 expect_message = "\"url\": \"https://chatgpt.com/backend-api/wham/rate-limit-reset-credits\""
 
-# A shared host placeholder is not proof that this store holds a login.
+# Two setups can share OpenCode's login slot with separate account stores. The
+# placeholder one store leaves in the slot is not a login for the other.
 [[control]]
 id = "pool-foreign-placeholder-cannot-migrate-empty-store"
 guards = "a shared placeholder cannot initialize or mark migrated a separate store with no main row"
