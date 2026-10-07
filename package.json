@@ -27,7 +27,7 @@
     "@cortexkit/openai-auth-core": "workspace:*",
     "@earendil-works/pi-ai": "1.0.1",
     "@earendil-works/pi-coding-agent": "1.0.1",
-    "@earendil-works/pi-tui": "1.0.1",
+    "@earendil-works/pi-tui": "1.0.2",
     "@opencode-ai/plugin": "1.18.34",
     "@tsconfig/bun": "1.0.11",
     "@types/bun": "1.4.2",
