@@ -1,0 +1,782 @@
+# Mutation proofs replayed by the pinned ck-mutate runner (cortexkit/commons,
+# crate cortexkit-mutate; the revision is CK_MUTATE_REV in
+# .github/workflows/ci.yml).
+#
+# Each row is one deliberate break of production code and the named Bun test
+# that must go red for it. The runner first runs each named test on the
+# unmutated tree (it must pass), applies the break, runs the test again (it
+# must fail), and restores the exact bytes. A row earns its place by guarding
+# a silent, costly failure: a credential lost or leaked, a reset credit spent
+# twice, output replayed, a crash that loses an account, a wire contract.
+#
+# Command rows run from the repository root, without a shell:
+#   bun test --cwd <package> ./<test file> -t <expect_red>
+# Bun's -t is a JavaScript regular expression over the test's full name, which
+# is the describe names and the test name joined by single spaces (not " > ",
+# as the console output prints them). The runner forbids whitespace in an
+# expected id, so each id is the full name anchored with ^ and $, spaces
+# written as \s and regex metacharacters escaped. "Ran {count} test" is Bun's
+# executed-test summary ("Ran 1 test across 1 file."); a filter that matches
+# no test prints no such line and the row errors instead of passing.
+#
+# No row needs a build: every guarding test imports the TypeScript sources
+# directly (the core package's exports point at src/), so a mutant takes effect
+# without rebuilding dist/.
+
+# The no-replay gate (packages/opencode/src/ws.ts). Once a turn has streamed
+# anything OpenCode shows or acts on (text, reasoning, a finished tool call), a
+# cut turn must not be sent again: a replay duplicates text, re-runs tools and
+# bills twice. Only an unfinished function call or an empty reasoning item
+# leaves a turn retryable. Envelope frames (codex.* and response.created) carry
+# transport metadata that OpenCode never displays, so they are not output.
+
+[[control]]
+id = "ws-output-frame-sets-emitted-output"
+guards = "a frame the reader sees marks the turn as having emitted output, so a cut after it is not retried"
+file = "packages/opencode/src/ws.ts"
+old = "      emittedOutput = true\n      recordEmittedCallFrame"
+new = "      emittedOutput = false\n      recordEmittedCallFrame"
+test_file = "packages/opencode/src/tests/ws-pool.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/ws-pool.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^transport\\sclose\\sprovenance\\sa\\sclose\\safter\\soutput\\ssays\\swhy\\sit\\swas\\snot\\sretried$"]
+expect_message = "Received: \"WebSocket closed before response.completed (code 1006"
+
+[[control]]
+id = "ws-cut-after-output-is-terminal"
+guards = "a turn cut after a message item opened ends without a retry"
+file = "packages/opencode/src/ws.ts"
+old = "    if (outcome === 'other') {\n      // Say why"
+new = "    if (false) {\n      // Say why"
+test_file = "packages/opencode/src/tests/ws-tool-call-recovery.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/ws-tool-call-recovery.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^websocket\\sfailure\\safter\\sfunction\\scalls\\sonly\\s\\(real\\sAI\\sSDK\\sparser\\)\\sa\\sclose\\safter\\sa\\smessage\\sitem\\sopened\\sends\\sthe\\sturn\\swithout\\sretry$"]
+expect_message = "Received: \"WebSocket closed before response.completed (code 1012"
+
+[[control]]
+id = "ws-unfinished-call-stays-retryable"
+guards = "a turn cut while its only function call is still streaming stays retryable (nothing ran)"
+file = "packages/opencode/src/ws.ts"
+old = "        state.addedItemIds.add(item.id)\n        return"
+new = "        state.addedItemIds.add(item.id)\n        break"
+test_file = "packages/opencode/src/tests/ws-tool-call-recovery.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/ws-tool-call-recovery.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^websocket\\sfailure\\safter\\sfunction\\scalls\\sonly\\s\\(real\\sAI\\sSDK\\sparser\\)\\sa\\sclose\\swhile\\sthe\\sonly\\scall\\sis\\sstill\\sstreaming\\sfails\\sretryably\\sand\\sruns\\snothing$"]
+expect_message = "error: The response ended early after part of it had already been shown"
+
+[[control]]
+id = "ws-empty-reasoning-stays-retryable"
+guards = "a turn cut after only a reasoning item with no text stays retryable (nothing was shown)"
+file = "packages/opencode/src/ws.ts"
+old = "        state.reasoningItemIds.add(item.id)\n        return"
+new = "        state.reasoningItemIds.add(item.id)\n        break"
+test_file = "packages/opencode/src/tests/ws-tool-call-recovery.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/ws-tool-call-recovery.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^websocket\\sfailure\\safter\\sreasoning\\swithout\\stext\\s\\(real\\sAI\\sSDK\\sparser\\)\\sa\\sclose\\safter\\sonly\\san\\sopened\\sreasoning\\sitem\\sfails\\sretryably$"]
+expect_message = "error: The response ended early after part of it had already been shown"
+
+[[control]]
+id = "ws-codex-envelope-is-not-output"
+guards = "the codex.* transport envelope frame does not set emittedOutput, so it alone does not bar a retry"
+file = "packages/opencode/src/ws.ts"
+old = "    type.startsWith('codex.')\n"
+new = "    type.startsWith('codex.never.')\n"
+test_file = "packages/opencode/src/tests/ws-pool.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/ws-pool.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^transport\\sclose\\sprovenance\\sthe\\stransport\\senvelope\\sframe\\salone\\sdoes\\snot\\sbar\\sa\\sretry$"]
+expect_message = "error: The response ended early after part of it had already been shown"
+
+[[control]]
+id = "ws-response-created-is-not-output"
+guards = "a response.created lifecycle frame does not set emittedOutput, so a socket error after it stays retryable"
+file = "packages/opencode/src/ws.ts"
+old = "    type === 'response.created' ||\n    type === 'response.in_progress'"
+new = "    type === 'response.created.never' ||\n    type === 'response.in_progress'"
+test_file = "packages/opencode/src/tests/ws-pool.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/ws-pool.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^createWebSocketFetch\\skeeps\\sa\\ssocket\\serror\\safter\\sa\\slifecycle\\sframe\\sbut\\sbefore\\soutput\\sretryable$"]
+expect_message = "error: The response ended early after part of it had already been shown"
+
+# Non-retryable messages are fixed text. OpenCode's retry policy also matches
+# error text against retryable patterns, and a match overrides the
+# non-retryable flag, so provider or peer wording ("Rate limit reached",
+# "503") must never be interpolated. CortexKit's worker supervisor
+# (prefrontal) auto-resumes a session that ends with
+# TERMINAL_AFTER_OUTPUT_MESSAGE, matching it exactly.
+
+[[control]]
+id = "ws-terminal-message-carries-no-provider-text"
+guards = "the after-output transport failure surfaces only TERMINAL_AFTER_OUTPUT_MESSAGE, without the failure's own text"
+file = "packages/opencode/src/ws.ts"
+old = "      const message = TERMINAL_AFTER_OUTPUT_MESSAGE\n"
+new = "      const message = `${TERMINAL_AFTER_OUTPUT_MESSAGE} (${error.message})`\n"
+test_file = "packages/opencode/src/tests/ws-pool.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/ws-pool.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^transport\\sclose\\sprovenance\\sa\\sclose\\safter\\soutput\\ssays\\swhy\\sit\\swas\\snot\\sretried$"]
+expect_message = "records what ended it. (WebSocket closed before response.completed"
+
+[[control]]
+id = "ws-protocol-error-after-output-carries-no-provider-text"
+guards = "a wrapped provider error after output surfaces only the fixed terminal message"
+file = "packages/opencode/src/ws.ts"
+old = "        new Error(TERMINAL_AFTER_OUTPUT_MESSAGE, { cause: error }),"
+new = "        new Error(`${TERMINAL_AFTER_OUTPUT_MESSAGE} ${wrappedError.message}`, { cause: error }),"
+test_file = "packages/opencode/src/tests/ws-tool-call-recovery.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/ws-tool-call-recovery.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^wrapped\\sprotocol\\serror\\safter\\soutput\\s\\(real\\sAI\\sSDK\\sparser\\)\\safter\\sstreamed\\stext\\sit\\ssurfaces\\sonly\\sthe\\sfixed\\sterminal\\smessage$"]
+expect_message = "/Received: \"The response ended early[^\"]*records what ended it\\. \\S/"
+
+[[control]]
+id = "ws-oversized-message-carries-no-peer-reason"
+guards = "a 1009 size refusal surfaces only OVERSIZED_FRAME_MESSAGE, without the peer's close reason"
+file = "packages/opencode/src/ws.ts"
+old = "        ? OVERSIZED_FRAME_MESSAGE\n"
+new = "        ? `${OVERSIZED_FRAME_MESSAGE} (${event.reason})`\n"
+test_file = "packages/opencode/src/tests/ws-tool-call-recovery.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/ws-tool-call-recovery.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^websocket\\sfailure\\safter\\sfunction\\scalls\\sonly\\s\\(real\\sAI\\sSDK\\sparser\\)\\sa\\ssize\\srefusal\\swhile\\sthe\\sonly\\scall\\sis\\sstill\\sstreaming\\ssurfaces\\sonly\\sthe\\sfixed\\smessage$"]
+expect_message = "records the size. (Rate limit reached"
+
+[[control]]
+id = "ws-terminal-message-wording-is-exact"
+guards = "TERMINAL_AFTER_OUTPUT_MESSAGE keeps the exact wording prefrontal matches"
+file = "packages/opencode/src/ws.ts"
+old = "'The response ended early after part of it had already been shown."
+new = "'The response ended early after part of it was already shown."
+test_file = "packages/opencode/src/tests/ws-pool.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/ws-pool.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^transport\\sclose\\sprovenance\\sthe\\safter-output\\smessage\\skeeps\\sthe\\sexact\\swording\\sprefrontal\\smatches$"]
+expect_message = "Received: \"The response ended early after part of it was already shown."
+
+# Reset credits (packages/core/src/reset-credits.ts and the reset command in
+# packages/core/src/commands.ts). A credit is claimed once under the store
+# lock; the saved (credit_id, redeem_request_id) pair is replayed, never
+# re-minted, until a terminal answer clears it; a pair is bound to the ChatGPT
+# account it was minted under. A break here spends a second credit.
+
+[[control]]
+id = "reset-young-pair-is-replayed-not-reminted"
+guards = "a confirm that finds a saved pair younger than its TTL replays it rather than refusing or minting another"
+file = "packages/core/src/reset-credits.ts"
+old = "if (inFlight && isYoungerThanInFlightTtl(inFlight, now)) {\n      decision = {"
+new = "if (false) {\n      decision = {"
+test_file = "packages/core/src/tests/reset-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/reset-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^atomic\\sreset\\scredit\\sredemption\\sreuses\\sone\\srequest\\sand\\scredit\\sacross\\sgenuinely\\soverlapping\\sconfirms$"]
+expect_message = "the previous reset attempt outcome is unknown"
+
+[[control]]
+id = "reset-claim-is-written-under-the-lock"
+guards = "the claimed pair is persisted in the same locked write that selects it, so two claimants share one"
+file = "packages/core/src/reset-credits.ts"
+old = "    reset[accountKey] = {\n      ...state,\n      inFlight: claimedInFlight,\n    }\n"
+new = ""
+test_file = "packages/core/src/tests/reset-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/reset-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^atomic\\sreset\\scredit\\sredemption\\satomically\\sreuses\\sone\\sclaim\\sacross\\stwo\\sdirect\\sclaimants$"]
+expect_message = "\"redeemRequestId\": \"direct-uuid-1\""
+
+[[control]]
+id = "reset-retry-sends-the-persisted-ids"
+guards = "a retry sends the persisted redeem_request_id, never a new one"
+file = "packages/core/src/reset-credits.ts"
+old = "    claim.inFlight.redeemRequestId,\n  )"
+new = "    deps.randomUUID(),\n  )"
+test_file = "packages/core/src/tests/reset-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/reset-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^atomic\\sreset\\scredit\\sredemption\\sretries\\san\\sexpired\\sunreconciled\\spair\\swith\\sits\\sexact\\spersisted\\sidentifiers$"]
+expect_message = "\"redeem_request_id\": \"uuid-new\""
+
+[[control]]
+id = "reset-pair-is-bound-to-its-chatgpt-account"
+guards = "a pair minted under another ChatGPT account is never sent"
+file = "packages/core/src/reset-credits.ts"
+old = "  assertPairBelongsTo(claim.inFlight, identity)\n"
+new = "  void identity\n"
+test_file = "packages/core/src/tests/reset-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/reset-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^reset\\sredemption\\sbound\\sto\\sits\\sChatGPT\\saccount\\sRetry\\sof\\sa\\syoung\\spair\\sminted\\sunder\\sanother\\saccount\\ssends\\snothing\\sand\\skeeps\\sthe\\srecord$"]
+expect_message = "Received promise that resolved"
+
+[[control]]
+id = "reset-only-terminal-answers-clear-the-pair"
+guards = "an ambiguous consume answer keeps the saved pair; only a terminal answer clears it"
+file = "packages/core/src/reset-credits.ts"
+old = "  if (!isTerminalConsumeKind(outcome.kind)) {"
+new = "  if (false) {"
+test_file = "packages/core/src/tests/reset-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/reset-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^atomic\\sreset\\scredit\\sredemption\\spreserves\\sthe\\sin-flight\\spair\\safter\\san\\sambiguous\\soutcome,\\scounting\\sthe\\sunknown\\sanswer$"]
+expect_message = "-   \"inFlight\": {"
+
+[[control]]
+id = "reset-not-now-status-keeps-the-pair-locked"
+guards = "a 408 (the request may still land) is not a definite refusal, so an expired pair still blocks a new spend"
+file = "packages/core/src/reset-credits.ts"
+old = "    status !== 408 &&\n"
+new = ""
+test_file = "packages/core/src/tests/reset-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/reset-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^reset\\sredemption\\sbound\\sto\\sits\\sChatGPT\\saccount\\san\\sexpired\\spair\\slast\\sanswered\\swith\\sa\\s408\\sstill\\srefuses\\sa\\snew\\sspend$"]
+expect_message = "Received promise that resolved"
+
+[[control]]
+id = "reset-spend-sets-a-cooldown"
+guards = "a reset answer starts the spend cooldown that blocks an immediate second redemption"
+file = "packages/core/src/reset-credits.ts"
+old = "      state.cooldownUntil = now + RESET_COOLDOWN_MS\n"
+new = "      delete state.cooldownUntil\n"
+test_file = "packages/core/src/tests/reset-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/reset-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^atomic\\sreset\\scredit\\sredemption\\sreset\\sclears\\sin-flight\\sstate\\sand\\sapplies\\sonly\\sa\\sspend\\scooldown$"]
+expect_message = "-   \"cooldownUntil\":"
+
+[[control]]
+id = "reset-identity-is-checked-before-spending"
+guards = "a redemption whose resolved ChatGPT account changed since the preview sends nothing"
+file = "packages/core/src/reset-credits.ts"
+old = "  if (target.chatgptAccountId !== input.expectedChatgptAccountId) {"
+new = "  if (false) {"
+test_file = "packages/opencode/src/tests/reset-target-resolver.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/reset-target-resolver.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^commands\\sreset\\scoordinator\\suses\\sthe\\sfreshly\\sresolved\\sidentity\\sfor\\smain\\sand\\sthe\\sselected\\sfallback\\sonly$"]
+expect_message = "Received promise that resolved"
+
+[[control]]
+id = "reset-command-spend-defers-to-a-saved-pair"
+guards = "Spend with a saved pair goes to the coordinator's replay rules instead of a fresh preview"
+file = "packages/core/src/commands.ts"
+old = "    if (retry || (saved && Object.hasOwn(saved, 'inFlight'))) {"
+new = "    if (retry) {"
+test_file = "packages/opencode/src/tests/reset-target-resolver.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/reset-target-resolver.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^commands\\sreset\\scommand\\ssafety\\sflow\\s\\/openai\\sreset\\scredits:\\sSpend\\sis\\srefused\\swhile\\san\\sexpired\\spair\\sis\\sunreconciled,\\sand\\sRetry\\sstill\\sreplays\\sit$"]
+expect_message = "\"url\": \"https://chatgpt.com/backend-api/wham/rate-limit-reset-credits\""
+
+# Pool migration (packages/opencode/src/core/pool-migration.ts and
+# version-fence.ts). The pool row is written and verified before OpenCode's
+# slot is replaced; the placeholder is written before the shield
+# (mainAccountId) drops; nothing moves while an older process runs.
+
+[[control]]
+id = "migration-record-is-written-before-the-row"
+guards = "the pending-transfer record lands before the row write, so the slot refresh stands down for that token"
+file = "packages/opencode/src/core/pool-migration.ts"
+old = "  if (step.fresh) {\n    await writeRecord(ctx, record)"
+new = "  if (false) {\n    await writeRecord(ctx, record)"
+test_file = "packages/opencode/src/tests/pool-migration.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-migration.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^the\\spending\\srecord\\sand\\sthe\\sslot\\srefresh\\snames\\sthe\\stoken\\sbeing\\smoved,\\sand\\sonly\\sthat\\stoken$"]
+expect_message = "expect(during).toEqual([true, false])"
+
+[[control]]
+id = "migration-verifies-the-row-before-the-slot"
+guards = "a row write that did not land as written stops the transfer before the slot is touched"
+file = "packages/opencode/src/core/pool-migration.ts"
+old = "  return row?.fingerprint === record.credentialFingerprint ? row : undefined"
+new = "  return row"
+test_file = "packages/opencode/src/tests/pool-migration.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-migration.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^verification\\sof\\sthe\\srow\\swrite\\sa\\srow\\swrite\\sthat\\slands\\swrong\\sstops\\sthe\\stransfer\\sbefore\\sthe\\sslot\\sis\\stouched$"]
+expect_message = "+   \"placeholder\": \"written\","
+
+[[control]]
+id = "migration-shield-outlives-the-placeholder-write"
+guards = "the shield drops only after the placeholder is in the slot, so a crash between them leaves no double refresher"
+file = "packages/opencode/src/core/pool-migration.ts"
+old = "  await ctx.onStep('before-placeholder-write')\n"
+new = "  await writeFinished(ctx, mode)\n  await ctx.onStep('before-placeholder-write')\n"
+test_file = "packages/opencode/src/tests/pool-migration-crash.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-migration-crash.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^a\\scrash\\sat\\severy\\sstep\\sof\\sthe\\smigration\\scrash\\sat\\sstep\\s15\\s\\(before-placeholder-write\\):\\sboth\\sbuilds\\skeep\\severy\\saccount\\sand\\sa\\sre-run\\scompletes$"]
+expect_message = "expect(tolerant.refreshedTwice).toEqual([])"
+
+[[control]]
+id = "migration-placeholder-readback-is-checked"
+guards = "a placeholder the host overwrote keeps the record and the shield"
+file = "packages/opencode/src/core/pool-migration.ts"
+old = "  if (!isPoolPlaceholder(readback))\n"
+new = "  if (false)\n"
+test_file = "packages/opencode/src/tests/pool-migration.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-migration.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^adoption\\sof\\sa\\slater\\slogin\\sin\\sthe\\sslot\\sa\\splaceholder\\sthe\\shost\\soverwrites\\swith\\sthe\\stoken\\sjust\\smoved\\skeeps\\sthe\\srecord\\sand\\sthe\\sshield,\\sand\\sthe\\snext\\srun\\swrites\\sit\\sagain$"]
+expect_message = "-   \"reason\": \"placeholder-overwritten\","
+
+[[control]]
+id = "migration-waits-for-older-processes"
+guards = "while an older plugin version runs, the migration writes nothing"
+file = "packages/opencode/src/core/pool-migration.ts"
+old = "    return result.open ? [] : result.blockers"
+new = "    return []"
+test_file = "packages/opencode/src/tests/pool-migration.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-migration.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^the\\sversion\\sfence\\swhile\\san\\solder\\sversion\\sruns,\\sthe\\smigration\\swrites\\snothing\\sand\\snames\\sit$"]
+expect_message = "-   \"reason\": \"older-version-running\","
+
+[[control]]
+id = "migration-failing-fence-counts-as-shut"
+guards = "a version fence check that throws keeps the migration deferred"
+file = "packages/opencode/src/core/pool-migration.ts"
+old = "  } catch (error) {\n    return [\n      {\n        pid: 'unknown',"
+new = "  } catch (error) {\n    if (error || !error) return []\n    return [\n      {\n        pid: 'unknown',"
+test_file = "packages/opencode/src/tests/pool-migration.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-migration.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^the\\sversion\\sfence\\sa\\sfence\\sthat\\sfails\\skeeps\\sthe\\smigration\\sdeferred$"]
+expect_message = "-   \"reason\": \"older-version-running\","
+
+[[control]]
+id = "version-fence-blocks-an-older-heartbeat"
+guards = "a live heartbeat of an older version shuts the fence"
+file = "packages/opencode/src/core/version-fence.ts"
+old = "    if (order === undefined || order < 0)\n"
+new = "    if (order === undefined)\n"
+test_file = "packages/opencode/src/tests/version-fence.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/version-fence.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^the\\sversion\\sfence\\sis\\sshut\\sby\\sa\\slive\\sheartbeat\\sof\\san\\solder\\sversion$"]
+expect_message = "+   \"open\": true,"
+
+# Tombstones and placeholders are never refreshed, sent or stored as logins.
+
+[[control]]
+id = "tombstone-is-never-refreshed"
+guards = "codexRefreshFn refuses a tombstone refresh token before any transport"
+file = "packages/core/src/provider.ts"
+old = "  assertNotTombstoneRefresh(input.refreshToken)\n  const response"
+new = "  void input.refreshToken\n  const response"
+test_file = "packages/core/src/tests/provider-backoff.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/provider-backoff.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^codexRefreshFn\\stoken\\svalidation\\srefuses\\sany\\stombstone\\sleft\\sby\\sthe\\sremoved\\svault\\scustody\\sbefore\\stouching\\stransport$"]
+expect_message = "Expected constructor: TombstoneRefreshError"
+
+[[control]]
+id = "opencode2-pool-placeholder-is-not-a-login"
+guards = "OpenCode 1's pool placeholder carried into OpenCode 2 is never copied into the pool"
+file = "packages/opencode/src/v2/login.ts"
+old = "    value.refresh === POOL_PLACEHOLDER_REFRESH ||\n"
+new = ""
+test_file = "packages/opencode/src/tests/opencode2-audit-fixes.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-audit-fixes.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sentry:\\scopying\\sthe\\slogin\\sOpenCode\\s2\\sheld\\snever\\scopies\\sOpenCode\\s1's\\spool\\splaceholder\\scarried\\sinto\\sOpenCode\\s2$"]
+expect_message = "expect(files.readConfig().accounts.map((account) => account.id)).toEqual(["
+
+[[control]]
+id = "opencode2-tombstone-is-not-a-login"
+guards = "a tombstone is refused as a login"
+file = "packages/opencode/src/v2/login.ts"
+old = "    isTombstoned(value)\n"
+new = "    false\n"
+test_file = "packages/opencode/src/tests/opencode2-audit-fixes.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-audit-fixes.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sentry:\\scopying\\sthe\\slogin\\sOpenCode\\s2\\sheld\\srefuses\\sto\\sstore\\sa\\stombstone\\sas\\sa\\slogin$"]
+expect_message = "Received promise that resolved"
+
+[[control]]
+id = "opencode2-tokenless-row-never-sends"
+guards = "OpenCode 2 refuses locally when the chosen row has no usable token, instead of sending an empty bearer"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "    if (!row || !token) {\n      log?.warn('pool row holds no usable token; refusing the request'"
+new = "    if (!row) {\n      log?.warn('pool row holds no usable token; refusing the request'"
+test_file = "packages/opencode/src/tests/opencode2-no-unauthorized-send.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-no-unauthorized-send.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\snever\\ssends\\swithout\\sthe\\saccount\\scredential\\srefuses\\slocally\\swhen\\sthe\\schosen\\srow\\sloses\\sits\\stoken\\sbetween\\sthe\\schoice\\sand\\sits\\sheaders$"]
+expect_message = "Expected constructor: [class OpenCode2AuthError"
+
+[[control]]
+id = "opencode1-empty-bearer-never-sends"
+guards = "OpenCode 1 refuses locally to send a request with an empty access token"
+file = "packages/opencode/src/index.ts"
+old = "          if (!accessToken.trim()) {\n            logT.warn('refusing to send a request with no access token'"
+new = "          if (false) {\n            logT.warn('refusing to send a request with no access token'"
+test_file = "packages/opencode/src/tests/integration.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/integration.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^integration:\\skillswitch\\senforcement\\srefuses\\sto\\ssend\\swhen\\sthe\\saccess\\stoken\\sis\\sempty,\\sand\\sdoes\\snot\\sreach\\supstream$"]
+expect_message = "expect((refusal as Error | undefined)?.message).toBe(EMPTY_BEARER_MESSAGE)"
+
+# The Claustrum vault (packages/core/src/vault.ts and the request paths). The
+# vault holds OpenAI credentials and refreshes them itself; this plugin asks it
+# for a token on each send and reports a 401 only for a credential it served.
+
+[[control]]
+id = "vault-reports-only-a-401"
+guards = "only a 401 on a vault-served send is reported to the vault, against that send's record version"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "      if (data?.kind !== 'vault' || outcome.status !== 401) return"
+new = "      if (data?.kind !== 'vault' || outcome.status < 400) return"
+test_file = "packages/opencode/src/tests/opencode2-vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^vault\\saccounts\\son\\sOpenCode\\s2\\ssends\\swith\\sthe\\stoken\\sthe\\svault\\sserves,\\sand\\sreports\\sa\\s401\\sagainst\\sthat\\ssend\\srecord\\sversion\\sonly$"]
+expect_message = "\"reporter_source\": \"direct\""
+
+[[control]]
+id = "vault-static-api-keys-are-not-admitted"
+guards = "a static apikey:openai credential in the vault is never listed, read, routed or reported"
+file = "packages/core/src/vault.ts"
+old = "  apiKeys: false,"
+new = "  apiKeys: true,"
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^routing\\sa\\sstatic\\sOpenAI\\sAPI\\skey\\sin\\sthe\\svault\\sis\\snever\\slisted,\\sread,\\srouted\\sor\\sreported$"]
+expect_message = "+   \"apikey:openai:platform\","
+
+[[control]]
+id = "vault-refuses-a-real-slot-login"
+guards = "a real login in OpenCode's slot fails closed while the vault serves this host"
+file = "packages/core/src/vault.ts"
+old = "    if (this.serves())\n      assertHostSlotMatchesMode"
+new = "    if (false)\n      assertHostSlotMatchesMode"
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^the\\shost\\sslot\\sa\\sreal\\slogin\\sin\\sthe\\sslot\\sis\\srefused\\swhile\\sthe\\svault\\sserves\\sthis\\shost\\sits\\saccounts$"]
+expect_message = "Received promise that resolved"
+
+[[control]]
+id = "vault-blocks-slot-login-adoption"
+guards = "while the vault serves this host, a login in the slot is not adopted into the pool"
+file = "packages/opencode/src/core/pool-migration.ts"
+old = "  if (mode === 'adopt' && ctx.vaultServes?.()) {"
+new = "  if (false) {"
+test_file = "packages/opencode/src/tests/pool-migration.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-migration.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^the\\sClaustrum\\svault\\swhile\\sthe\\svault\\sserves\\sthis\\shost,\\sa\\slogin\\sin\\sthe\\sslot\\sis\\snot\\sadopted\\sand\\snothing\\sis\\swritten$"]
+expect_message = "-   \"status\": \"vault-owns-accounts\","
+
+# Credentials never cross the RPC boundary or reach a log or dump.
+# Token redaction and the dump file modes (0600/0700) belong to
+# @cortexkit/common-auth and are proven there; what this repository owns is
+# the identity keys it adds and the notice payload it scrubs itself.
+
+[[control]]
+id = "rpc-notice-drops-credential-fields"
+guards = "scrubKnobs drops credential-shaped fields from a payload bound for the RPC boundary"
+file = "packages/core/src/commands.ts"
+old = "    if (isCredentialKey(key)) {\n      found.push"
+new = "    if (false) {\n      found.push"
+test_file = "packages/core/src/tests/scrub-knobs.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/scrub-knobs.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^scrubKnobs\\sdrops\\scredential-shaped\\sfields\\sat\\sany\\sdepth\\sand\\srecords\\sonly\\stheir\\spaths$"]
+expect_message = "+   \"access\": \"access-secret\","
+
+[[control]]
+id = "log-redacts-the-chatgpt-account-id"
+guards = "log lines redact the ChatGPT account id"
+file = "packages/core/src/logger.ts"
+old = "    normalizedKey === 'chatgptaccountid' ||\n"
+new = ""
+test_file = "packages/core/src/tests/logger-identity.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/logger-identity.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^openai\\sidentity\\sredaction\\sredact\\sapplies\\sthe\\ssame\\sidentity\\skeys\\soutside\\sthe\\slog\\sfile$"]
+expect_message = "\"chatgptAccountId\": \"chatgpt-acc-456\","
+
+[[control]]
+id = "dump-redacts-the-chatgpt-account-id"
+guards = "request dumps never expose the ChatGPT account id"
+file = "packages/opencode/src/dump.ts"
+old = "  'chatgpt-account-id',\n  'email',"
+new = "  'email',"
+test_file = "packages/opencode/src/tests/dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^request\\sdumps\\srecords\\sthe\\sinternal\\sserving\\saccount\\swithout\\sexposing\\sa\\sChatGPT\\saccount\\sid$"]
+expect_message = "Received: \"chatgpt-account-secret\""
+
+# Token merge: a lastRefreshedAt more than five minutes ahead of the clock is
+# not trusted (a skewed clock would otherwise win every later merge and pin an
+# expired token), and one within the tolerance still is.
+
+[[control]]
+id = "token-merge-ignores-a-far-future-stamp"
+guards = "a lastRefreshedAt far in the future cannot keep an expired token over a newer refresh"
+file = "packages/core/src/accounts.ts"
+old = "  return stamp > now + FUTURE_REFRESH_STAMP_TOLERANCE_MS ? 0 : stamp"
+new = "  return stamp"
+test_file = "packages/opencode/src/tests/accounts-runtime-state.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/accounts-runtime-state.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^account\\sruntime\\sstate\\smerge\\sdoes\\snot\\slet\\sa\\sfuture\\slastRefreshedAt\\skeep\\san\\sexpired\\stoken\\sover\\sa\\snewer\\srefresh$"]
+expect_message = "Received: \"old-access-token\""
+
+[[control]]
+id = "token-merge-trusts-small-clock-skew"
+guards = "a stamp slightly ahead of the clock still wins, so a stale save cannot roll back a rotated refresh token"
+file = "packages/core/src/accounts.ts"
+old = "const FUTURE_REFRESH_STAMP_TOLERANCE_MS = 5 * 60_000"
+new = "const FUTURE_REFRESH_STAMP_TOLERANCE_MS = 0"
+test_file = "packages/opencode/src/tests/accounts-runtime-state.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/accounts-runtime-state.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^account\\sruntime\\sstate\\smerge\\strusts\\sa\\sstamp\\sslightly\\sahead\\sof\\sthe\\sclock,\\sso\\sa\\sstale\\ssave\\scannot\\sroll\\sback\\sa\\srotated\\stoken$"]
+expect_message = "Received: \"stale-refresh-token\""
+
+# Mid-conversation reasoning effort. Changing the request-level effort between
+# turns discards the Codex prompt cache, so it stays pinned to the session's
+# first agent request. A change rides as a configuration_update item in front
+# of the user turn that made it, at a fixed position so later turns extend the
+# same prefix. Title and compaction requests never set the baseline.
+
+[[control]]
+id = "effort-hidden-agents-never-pin"
+guards = "title, compaction and summary requests never pin or update the conversation effort (OpenCode 1)"
+file = "packages/opencode/src/index.ts"
+old = "  if (agent !== null && HIDDEN_EFFORT_AGENTS.has(agent)) return\n"
+new = ""
+test_file = "packages/opencode/src/tests/integration.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/integration.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^integration:\\sactive\\sfallback\\srouting\\shidden\\sagents\\snever\\spin\\sor\\supdate\\sthe\\sconversation\\seffort$"]
+expect_message = "expect(sent.map((body) => body.reasoning.effort)).toEqual(["
+
+[[control]]
+id = "effort-request-level-stays-pinned"
+guards = "the request-level reasoning.effort stays at the pinned value after a change (OpenCode 1)"
+file = "packages/opencode/src/index.ts"
+old = "  parsed.reasoning = { ...reasoning, effort: metadata.pinnedEffort }"
+new = "  parsed.reasoning = { ...reasoning, effort }"
+test_file = "packages/opencode/src/tests/integration.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/integration.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^integration:\\sactive\\sfallback\\srouting\\sgpt-6-sol\\scarries\\sa\\smid-session\\seffort\\schange\\sas\\sa\\sconfiguration_update$"]
+expect_message = "Received: \"xhigh\""
+
+[[control]]
+id = "effort-update-anchors-at-its-user-turn"
+guards = "each configuration_update sits in front of the user message whose turn changed effort (OpenCode 1)"
+file = "packages/opencode/src/index.ts"
+old = "    input.splice(update.anchor, 0, {"
+new = "    input.splice(0, 0, {"
+test_file = "packages/opencode/src/tests/integration.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/integration.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^integration:\\sactive\\sfallback\\srouting\\ssame-turn\\seffort\\sedits\\sreplace\\san\\supdate\\sand\\sundo\\sonly\\sthat\\supdate$"]
+expect_message = "expect(sent[2]!.input).toEqual(["
+
+[[control]]
+id = "effort-only-agent-requests-pin-opencode2"
+guards = "only the agent loop's requests set or change the pinned effort (OpenCode 2)"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = "    if (scope.kind !== 'primary') return false\n"
+new = ""
+test_file = "packages/opencode/src/tests/opencode2-wire.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-wire.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^mid-conversation\\seffort\\son\\sWebSocket\\sframes\\sleaves\\sframes\\sof\\sother\\smodels,\\sother\\srequest\\skinds\\sand\\san\\sunchanged\\seffort\\salone$"]
+expect_message = "Expected: undefined"
+
+[[control]]
+id = "effort-update-anchors-at-the-turn-opencode2"
+guards = "the configuration_update goes in front of the turn's last user message (OpenCode 2)"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = "      input.splice(at, 0, {"
+new = "      input.splice(0, 0, {"
+test_file = "packages/opencode/src/tests/opencode2-wire.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-wire.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^mid-conversation\\seffort\\sand\\sResponses\\sLite\\son\\sHTTP\\scarries\\sthe\\supdate\\son\\severy\\srequest\\safter\\sa\\schange,\\sbefore\\sthe\\sturn\\suser\\smessage$"]
+expect_message = "\"type\": \"configuration_update\","
+
+# The request path: a failing sidebar or quota bookkeeping write, made while a
+# request is being served, never throws into that request and never wedges
+# later writes.
+
+[[control]]
+id = "bookkeeping-failure-never-rejects"
+guards = "a failed sidebar bookkeeping write is retried in the background, never surfaced as a rejection"
+file = "packages/opencode/src/sidebar-state.ts"
+old = "      (error: unknown) => {\n        if (generation.get(key) !== ownGeneration) return\n        const fields"
+new = "      (error: unknown) => {\n        throw error\n        if (generation.get(key) !== ownGeneration) return\n        const fields"
+test_file = "packages/opencode/src/tests/hot-path-bookkeeping.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/hot-path-bookkeeping.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^request\\spath\\snever\\swaits\\son\\sbookkeeping\\sa\\sWebSocket\\squota\\spush\\swhose\\ssidebar\\swrite\\sfails\\sraises\\sno\\sunhandled\\srejection$"]
+expect_message = "# Unhandled error between tests"
+
+[[control]]
+id = "sidebar-write-chain-survives-a-failure"
+guards = "one failed sidebar write does not poison the write chain, so the request's pin lands once writes work"
+file = "packages/opencode/src/sidebar-state.ts"
+old = "  sidebarWriteChain = result.catch(() => {})"
+new = "  sidebarWriteChain = result"
+test_file = "packages/opencode/src/tests/hot-path-bookkeeping.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/hot-path-bookkeeping.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^request\\spath\\snever\\swaits\\son\\sbookkeeping\\sa\\ssticky-balanced\\srequest\\sreaches\\sthe\\swire\\swhen\\sthe\\ssidebar\\swrite\\sfails,\\sand\\sits\\spin\\slands\\sonce\\swrites\\swork\\sagain$"]
+expect_message = "EEXIST: file already exists"
+
+# Build gates that scan for a violation must be seen to fail on a planted one.
+
+[[control]]
+id = "local-deps-gate-rejects-an-outside-path"
+guards = "check-local-deps.mjs fails on a file: dependency outside the repository"
+file = "scripts/check-local-deps.mjs"
+old = "  if (outside(resolve(base, local)))\n"
+new = "  if (false)\n"
+test_file = "packages/opencode/src/tests/check-local-deps.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/check-local-deps.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^local\\sdependency\\sbuild\\sgate\\srejects\\sfile\\sdependencies\\soutside\\sthe\\srepository\\sand\\snames\\sthe\\soffender$"]
+expect_message = "/Expected: 1\\s+Received: 0/"
+
+[[control]]
+id = "local-deps-gate-fails-when-it-checks-nothing"
+guards = "check-local-deps.mjs fails as unchecked when it finds no package.json, instead of passing vacuously"
+file = "scripts/check-local-deps.mjs"
+old = "if (manifests === 0) {"
+new = "if (false) {"
+test_file = "packages/opencode/src/tests/check-local-deps.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/check-local-deps.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^local\\sdependency\\sbuild\\sgate\\sfails\\sas\\sunchecked\\swhen\\sit\\sfinds\\sno\\spackage\\.json$"]
+expect_message = "/Expected: 2\\s+Received: 0/"
+
+[[control]]
+id = "installed-ranges-gate-rejects-a-drifted-version"
+guards = "check-installed-ranges.mjs fails when an installed version is outside its declared range"
+file = "scripts/check-installed-ranges.mjs"
+old = "      } else if (!Bun.semver.satisfies(version, range)) {"
+new = "      } else if (false) {"
+test_file = "packages/opencode/src/tests/check-installed-ranges.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/check-installed-ranges.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^installed\\srange\\sbuild\\sgate\\srefuses\\san\\sinstalled\\sversion\\soutside\\sthe\\sdeclared\\srange\\sand\\snames\\sit$"]
+expect_message = "/Expected: 1\\s+Received: 0/"
+
+# Admission: the killswitch blocks an account below its floor, unknown quota
+# fails closed, and when every account is exhausted the request still reaches
+# the provider on the last path.
+
+[[control]]
+id = "killswitch-blocks-below-the-floor"
+guards = "an account below its killswitch floor is never spent on"
+file = "packages/core/src/accounts.ts"
+old = "    if (window.remainingPercent < thresholds[key]) return false\n  }\n  return true\n}\n\nexport function killswitchRetryAfterSeconds"
+new = "    if (false) return false\n  }\n  return true\n}\n\nexport function killswitchRetryAfterSeconds"
+test_file = "packages/opencode/src/tests/pool-request.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-request.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^the\\skillswitch\\son\\sa\\smigrated\\sinstall\\smain-first:\\san\\saccount\\sbelow\\sits\\sthreshold\\sis\\snever\\sspent\\son$"]
+expect_message = "+   \"Bearer main-token\","
+
+[[control]]
+id = "unknown-quota-fails-closed"
+guards = "with failClosedOnUnknownQuota a fallback with no quota reading is not used"
+file = "packages/core/src/accounts.ts"
+old = "  if (!quotaEnabled(storage)) return true\n  if (!quota) return !failClosedOnUnknownQuota(storage)"
+new = "  if (!quotaEnabled(storage)) return true\n  if (!quota) return true"
+test_file = "packages/opencode/src/tests/fallback-select.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/fallback-select.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^fallback\\sselection\\sfail-closed:\\sunknown-quota\\sfallback\\sis\\sexcluded\\swhen\\sfailClosedOnUnknownQuota=true$"]
+expect_message = "expect(usable.length).toBe(0)"
+
+[[control]]
+id = "unknown-quota-never-takes-the-last-path"
+guards = "a row refused for unknown quota is not sent on the exhausted-account last path"
+file = "packages/core/src/pool-routing.ts"
+old = "  return refusal.reason === 'exhausted' || refusal.reason === 'budget-spent'"
+new = "  return true"
+test_file = "packages/pi/src/tests/pool-routing.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/pool-routing.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^Pi\\srequests\\son\\sthe\\saccount\\spool\\sunknown\\squota\\sblocks\\suntil\\sthe\\sfirst\\squota\\scheck\\slands$"]
+expect_message = "Expected length: 1"
+
+[[control]]
+id = "exhausted-pool-keeps-the-last-path"
+guards = "when every account is exhausted the request still reaches the provider, which has the final say"
+file = "packages/core/src/pool-routing.ts"
+old = "  if (lastPath.length > 0)\n    return { kind: 'send', order: lastPath, lastPath: true }"
+new = "  if (false)\n    return { kind: 'send', order: lastPath, lastPath: true }"
+test_file = "packages/opencode/src/tests/pool-request.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-request.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^exhaustion\\sand\\sthe\\scredit\\sbudget\\son\\sa\\smigrated\\sinstall\\smain-first:\\swhen\\severy\\saccount\\sis\\sexhausted\\sthe\\srequest\\sstill\\sreaches\\sthe\\sprovider$"]
+expect_message = "expect(wire.sends.length).toBeGreaterThan(0)"

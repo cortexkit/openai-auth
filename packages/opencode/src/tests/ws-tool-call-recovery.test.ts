@@ -6,7 +6,11 @@ import { describe, expect, test } from 'bun:test'
 import { createOpenAI } from '@ai-sdk/openai'
 import { APICallError } from 'ai'
 import { ResponseStreamError } from '../response-stream-error'
-import { streamResponsesWebSocket, TERMINAL_AFTER_OUTPUT_MESSAGE } from '../ws'
+import {
+  OVERSIZED_FRAME_MESSAGE,
+  streamResponsesWebSocket,
+  TERMINAL_AFTER_OUTPUT_MESSAGE,
+} from '../ws'
 
 type Part = { type: string } & Record<string, unknown>
 type Frame = Record<string, unknown>
@@ -235,6 +239,22 @@ describe('websocket failure after function calls only (real AI SDK parser)', () 
     expect(ofType('tool-call')).toHaveLength(0)
     expect(error).toBeInstanceOf(ResponseStreamError)
     expect(error).toMatchObject({ isRetryable: true })
+  })
+
+  // OpenCode's retry policy overrides a non-retryable flag when the message
+  // matches its retryable patterns, so the server's close reason (here one
+  // that reads as a rate limit and a 503) must not reach the surfaced message.
+  test('a size refusal while the only call is still streaming surfaces only the fixed message', async () => {
+    const { error, ofType } = await run({
+      frames: [created, callAdded(1), callDelta(1, '{"path":')],
+      failure: (socket) =>
+        socket.peerClose(1009, 'Rate limit reached: frame of 503 KB'),
+    })
+
+    expect(ofType('tool-call')).toHaveLength(0)
+    expect(error).toBeInstanceOf(ResponseStreamError)
+    expect(error).toMatchObject({ isRetryable: false })
+    expect((error as Error).message).toBe(OVERSIZED_FRAME_MESSAGE)
   })
 
   test('a close after one call finished completes with that call and no error', async () => {

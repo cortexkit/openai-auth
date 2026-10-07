@@ -2752,6 +2752,15 @@ describe('transport close provenance', () => {
     }
   })
 
+  // prefrontal, CortexKit's worker supervisor, auto-resumes a worker session
+  // that ends with this exact text, so a change to its wording must be made
+  // there in the same release.
+  test('the after-output message keeps the exact wording prefrontal matches', () => {
+    expect(TERMINAL_AFTER_OUTPUT_MESSAGE).toBe(
+      'The response ended early after part of it had already been shown. It was not sent again, because repeating it would duplicate that output and re-run any tools it had started. The transport log records what ended it.',
+    )
+  })
+
   test('a close before any output stays retryable and unsuffixed', async () => {
     await withFakeWebSocket(
       ({ close }) => ({
