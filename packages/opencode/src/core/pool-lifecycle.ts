@@ -24,6 +24,7 @@
 
 import type { AccountPaths } from '@cortexkit/openai-auth-core/internal'
 import { createLogger } from '../logger'
+import { POOL_LOGIN_REQUIRED_MESSAGE } from './pool-main.ts'
 import {
   adoptHostSlotLogin,
   type HostSlotAdapter,
@@ -88,6 +89,8 @@ export interface PoolLifecycle {
    * does nothing.
    */
   noticeRealSlot(refreshToken: string): void
+  /** Logs the shared-placeholder/separate-store condition once at startup. */
+  noticePlaceholderWithoutMain(): void
   /** Stops the timer; a run already under way finishes on its own. */
   dispose(): void
   /** Resolves once no run is waiting or running (tests). */
@@ -134,6 +137,15 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
   let lastNoticedRefresh: string | undefined
   // Logged once per set of blocking processes, not on every retry.
   let lastAdoptionBlockers: string | undefined
+  let missingMainLogged = false
+
+  function noticePlaceholderWithoutMain(): void {
+    if (missingMainLogged) return
+    missingMainLogged = true
+    log.warn(POOL_LOGIN_REQUIRED_MESSAGE, {
+      reason: 'placeholder-without-main',
+    })
+  }
 
   const runDeps = (): PoolMigrationDeps => ({
     paths: deps.paths(),
@@ -184,6 +196,13 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
         error: error instanceof Error ? error.message : String(error),
       })
       schedule(retryDelay())
+      return
+    }
+    if (outcome.status === 'refused') {
+      noticePlaceholderWithoutMain()
+      // A login or a changed store path can resolve this. Stay unmigrated,
+      // but check again at the quiet adoption interval, without WARN spam.
+      schedule(jitter(POOL_RETRY_MAX_MS))
       return
     }
     if (marksMigrated(outcome)) {
@@ -265,7 +284,12 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
       // Taken off before the run starts: a request made while it runs
       // starts the next one, since its slot read may already be behind.
       pendingAdoption = undefined
-      if (!stopped) await runAdoption()
+      if (!stopped) {
+        // A login also unblocks a migration refused against a foreign
+        // placeholder; adoption alone cannot initialize an unmigrated store.
+        if (isMigrated) await runAdoption()
+        else await runMigration()
+      }
     })
     pendingAdoption = run
     return run
@@ -278,6 +302,7 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
       void enqueue(runMigration)
     },
     requestAdoption,
+    noticePlaceholderWithoutMain,
     noticeRealSlot(refreshToken) {
       if (!isMigrated || stopped || refreshToken === lastNoticedRefresh) return
       lastNoticedRefresh = refreshToken

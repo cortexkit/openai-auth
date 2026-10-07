@@ -8,6 +8,7 @@
 import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   statSync,
@@ -25,12 +26,16 @@ import {
   isPoolMainPlaceholder,
   POOL_MAIN_PLACEHOLDER_REFRESH,
 } from '../core/pool-main.ts'
-import { POOL_PLACEHOLDER_REFRESH } from '../core/pool-migration.ts'
+import {
+  migrateToPool,
+  POOL_PLACEHOLDER_REFRESH,
+} from '../core/pool-migration.ts'
 import {
   __resetProcessHeartbeatForTest,
   processHeartbeatPath,
 } from '../core/process-heartbeat.ts'
 import { CodexAuthPlugin, createResetTargetResolver } from '../index.ts'
+import { flushForTest } from '../logger.ts'
 import {
   drainSidebarWrites,
   hashSidebarSessionId,
@@ -39,6 +44,11 @@ import {
 } from '../sidebar-state.ts'
 import { PackageVersion } from '../version.ts'
 import { createFailurePhaseClock } from './failure-phase-clock.ts'
+import {
+  harness,
+  jwt,
+  seedLegacyInstall,
+} from './fixtures/pool-migration-harness.ts'
 import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
@@ -54,6 +64,9 @@ const PLACEHOLDER = {
   refresh: 'common-auth-placeholder:v1:openai',
   expires: 0,
 }
+
+const LOGIN_REQUIRED_MESSAGE =
+  'This setup has no OpenAI login in its account store. Sign in for this setup with opencode auth login, or point OPENCODE_OPENAI_AUTH_FILE and OPENCODE_OPENAI_AUTH_STATE_FILE at the store that holds the login.'
 
 type SlotValue = {
   type: 'oauth'
@@ -103,6 +116,7 @@ afterEach(async () => {
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
     restoreEnv('OPENCODE_CONFIG_DIR')
     restoreEnv('XDG_STATE_HOME')
+    restoreEnv('XDG_DATA_HOME')
     delete process.env.NODE_ENV
   })
 })
@@ -149,6 +163,16 @@ function seedStore(
       refresh: { refreshBeforeExpiryMinutes: 5 },
       accounts,
     }),
+  )
+}
+
+function seedSharedPlaceholder() {
+  process.env.XDG_DATA_HOME = join(configDir, 'data')
+  const dataDir = join(configDir, 'data', 'opencode')
+  mkdirSync(dataDir, { recursive: true })
+  writeFileSync(
+    join(dataDir, 'auth.json'),
+    JSON.stringify({ openai: PLACEHOLDER }),
   )
 }
 
@@ -276,6 +300,103 @@ describe('placeholder recognition', () => {
 })
 
 describe('request path with the main account in the pool', () => {
+  it('a wrongly migrated empty store refuses locally with sign-in instructions', async () => {
+    seedSharedPlaceholder()
+    // The separate setup's config after it wrongly adopted the operator's
+    // placeholder, with no login moved into its own account store.
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        commonAuthPool: { schemaVersion: 1, rows: {} },
+        routing: { mode: 'main-first' },
+        openaiAuthPool: { migratedAt: 1_791_000_000_000 },
+      }),
+    )
+    writeFileSync(
+      process.env.OPENCODE_OPENAI_AUTH_STATE_FILE as string,
+      '{"version":1,"accounts":{}}',
+    )
+    const wire = installWire()
+    const fetchOverride = await loadFetch(async () => ({ ...PLACEHOLDER }))
+    await expect(
+      fetchOverride('https://api.openai.com/v1/responses', request()),
+    ).rejects.toThrow(LOGIN_REQUIRED_MESSAGE)
+    expect(wire.sends).toEqual([])
+    expect(wire.refreshTokens).toEqual([])
+    flushForTest()
+    const warnings = readFileSync(
+      process.env.OPENCODE_OPENAI_AUTH_LOG_FILE as string,
+      'utf8',
+    )
+      .split('\n')
+      .filter((line) => line.includes(LOGIN_REQUIRED_MESSAGE))
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('WARN')
+  })
+
+  it('an unmigrated empty store with a foreign placeholder refuses locally', async () => {
+    seedSharedPlaceholder()
+    seedStore('main-first', [])
+    const wire = installWire()
+    const fetchOverride = await loadFetch(async () => ({ ...PLACEHOLDER }))
+    await expect(
+      fetchOverride('https://api.openai.com/v1/responses', request()),
+    ).rejects.toThrow(LOGIN_REQUIRED_MESSAGE)
+    expect(wire.sends).toEqual([])
+    expect(wire.refreshTokens).toEqual([])
+  })
+
+  it('an interrupted own migration still serves main after writing the placeholder', async () => {
+    const h = harness()
+    try {
+      await seedLegacyInstall(h)
+      const config = await h.config()
+      config.routing = { mode: 'main-first' }
+      writeFileSync(h.paths.configPath, JSON.stringify(config))
+      const crash = new Error('interrupted after placeholder write')
+      await expect(
+        migrateToPool(
+          h.deps({
+            onStep: (step) => {
+              if (step === 'after-placeholder-write') throw crash
+            },
+          }),
+        ),
+      ).rejects.toThrow(crash.message)
+      const interrupted = await h.config()
+      expect(interrupted.openaiAuthPool.migratedAt).toBeUndefined()
+      expect(interrupted.openaiAuthPool.pending.rowId).toBe('main')
+      expect(interrupted.mainAccountId).toBe('acct-main')
+      const mainToken = (await h.slot.all()).openai
+      expect(mainToken).toEqual(PLACEHOLDER)
+      const bytes = await h.bytes()
+      writeFileSync(configFile, bytes.config as string)
+      writeFileSync(
+        process.env.OPENCODE_OPENAI_AUTH_STATE_FILE as string,
+        bytes.state as string,
+      )
+      const wire = installWire()
+      const fetchOverride = await loadFetch(async () => ({ ...PLACEHOLDER }))
+      const response = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        request(),
+      )
+      expect(response.status).toBe(200)
+      expect(wire.sends).toEqual([`Bearer ${jwt('acct-main')}`])
+      expectPlaceholderNeverRefreshed(wire)
+      expect(await migrateToPool(h.deps())).toMatchObject({
+        status: 'completed',
+        rowId: 'main',
+        operation: 'resumed',
+      })
+    } finally {
+      h.cleanup()
+    }
+  })
+
   it('main-first sends with row main and attributes its quota to main', async () => {
     seedStore('main-first', [row('main'), row('fallback-1')])
     const wire = installWire()

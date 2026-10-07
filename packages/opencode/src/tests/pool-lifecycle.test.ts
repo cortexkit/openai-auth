@@ -17,6 +17,7 @@ import {
   isPoolPlaceholder,
   migrateToPool,
   POOL_MIGRATION_KEY,
+  POOL_PLACEHOLDER,
 } from '../core/pool-migration.ts'
 import {
   migrationFenceOpen,
@@ -138,6 +139,52 @@ const deferrals = (sink: ReturnType<typeof logSink>) =>
   )
 
 describe('the migration in the background', () => {
+  it('a shared placeholder cannot migrate an empty separate store', async () => {
+    writeFileSync(
+      h.paths.configPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      }),
+    )
+    writeFileSync(h.paths.statePath, '{"version":1,"accounts":{}}')
+    await h.setSlot(POOL_PLACEHOLDER)
+    const before = await h.bytes()
+    const outcomes: unknown[] = []
+    const { lifecycle, timers, sink } = create({
+      migrate: async (deps) => {
+        const outcome = await migrateToPool(deps)
+        outcomes.push(outcome)
+        return outcome
+      },
+    })
+    lifecycle.start()
+    await lifecycle.idle()
+    expect(lifecycle.migrated()).toBe(false)
+    expect(await h.bytes()).toEqual(before)
+    expect(outcomes).toEqual([
+      { status: 'refused', reason: 'placeholder-without-main' },
+    ])
+    expect(sink.warn).toHaveLength(1)
+    expect(sink.warn[0]?.message).toContain('opencode auth login')
+    expect(sink.warn[0]?.message).toContain('OPENCODE_OPENAI_AUTH_FILE')
+    expect(sink.warn[0]?.message).toContain('OPENCODE_OPENAI_AUTH_STATE_FILE')
+    timers.fire()
+    await lifecycle.idle()
+    expect(await h.bytes()).toEqual(before)
+    expect(sink.warn).toHaveLength(1)
+
+    // Signing in for this setup must unblock the refused migration, without
+    // needing a restart or waiting for its next background timer.
+    await h.setSlot(login('acct-separate', 'r-separate'))
+    await lifecycle.requestAdoption()
+    expect(lifecycle.migrated()).toBe(true)
+    expect((await h.row('main'))?.credential).toMatchObject({
+      refresh: 'r-separate',
+    })
+  })
+
   it('start runs the migration without being awaited, and completes it', async () => {
     await seedLegacyInstall(h)
     const { lifecycle, timers } = create()
@@ -152,6 +199,26 @@ describe('the migration in the background', () => {
     expect(lifecycle.migrated()).toBe(true)
     // Once migrated, the timer only keeps the adoption check going.
     expect(timers.delays()).toEqual([POOL_RETRY_MAX_MS])
+  })
+
+  it('an initialized empty pool still cannot claim a shared placeholder', async () => {
+    writeFileSync(
+      h.paths.configPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        commonAuthPool: { schemaVersion: 1, rows: {} },
+      }),
+    )
+    writeFileSync(h.paths.statePath, '{"version":1,"accounts":{}}')
+    await h.setSlot(POOL_PLACEHOLDER)
+    const before = await h.bytes()
+    const { lifecycle } = create()
+    lifecycle.start()
+    await lifecycle.idle()
+    expect(lifecycle.migrated()).toBe(false)
+    expect(await h.bytes()).toEqual(before)
   })
 
   for (const [what, blocker] of [

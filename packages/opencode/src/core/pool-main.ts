@@ -24,6 +24,15 @@ export {
 } from '@cortexkit/openai-auth-core/internal'
 
 /**
+ * A placeholder belongs to the shared host slot, not to a particular store.
+ * Refuse locally when this setup has no login to serve. Keep this text fixed:
+ * OpenCode's retry policy also matches messages, so interpolated labels or
+ * provider errors can turn a sign-in instruction into a retry loop.
+ */
+export const POOL_LOGIN_REQUIRED_MESSAGE =
+  'This setup has no OpenAI login in its account store. Sign in for this setup with opencode auth login, or point OPENCODE_OPENAI_AUTH_FILE and OPENCODE_OPENAI_AUTH_STATE_FILE at the store that holds the login.'
+
+/**
  * The main slot turned out to hold the pool placeholder, so there is no slot
  * token to refresh: the main account is served from the pool row `main`.
  */

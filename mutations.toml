@@ -303,6 +303,33 @@ test_count_pattern = "Ran {count} test"
 expect_red = ["^commands\\sreset\\scommand\\ssafety\\sflow\\s\\/openai\\sreset\\scredits:\\sSpend\\sis\\srefused\\swhile\\san\\sexpired\\spair\\sis\\sunreconciled,\\sand\\sRetry\\sstill\\sreplays\\sit$"]
 expect_message = "\"url\": \"https://chatgpt.com/backend-api/wham/rate-limit-reset-credits\""
 
+# A shared host placeholder is not proof that this store holds a login.
+[[control]]
+id = "pool-foreign-placeholder-cannot-migrate-empty-store"
+guards = "a shared placeholder cannot initialize or mark migrated a separate store with no main row"
+file = "packages/opencode/src/core/pool-migration.ts"
+old = "  return slot.kind === 'placeholder' && !hasMain && !book.pending"
+new = "  return false // NON-VACUITY BREAK: accept a foreign placeholder"
+test_file = "packages/opencode/src/tests/pool-lifecycle.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-lifecycle.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^the\\smigration\\sin\\sthe\\sbackground\\sa\\sshared\\splaceholder\\scannot\\smigrate\\san\\sempty\\sseparate\\sstore$"]
+expect_message = "Received: true"
+
+[[control]]
+id = "pool-missing-login-refuses-with-actionable-message"
+guards = "a wrongly migrated empty store refuses locally with fixed sign-in or store-path instructions, rather than a credentialless request or synthetic Unauthorized"
+file = "packages/opencode/src/index.ts"
+old = "                if (!mainRow) throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)"
+new = "                if (false) throw new Error(POOL_LOGIN_REQUIRED_MESSAGE) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/pool-main-request.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-main-request.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^request\\spath\\swith\\sthe\\smain\\saccount\\sin\\sthe\\spool\\sa\\swrongly\\smigrated\\sempty\\sstore\\srefuses\\slocally\\swith\\ssign-in\\sinstructions$"]
+expect_message = "Expected promise that rejects"
+
 # Pool migration (packages/opencode/src/core/pool-migration.ts and
 # version-fence.ts). The pool row is written and verified before OpenCode's
 # slot is replaced; the placeholder is written before the shield

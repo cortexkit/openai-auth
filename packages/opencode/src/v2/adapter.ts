@@ -65,6 +65,7 @@ import {
   resolveMidStreamRateLimitResetAt,
 } from '@cortexkit/openai-auth-core/internal'
 import type { PoolAccountSource } from '../core/pool-account-source'
+import { POOL_LOGIN_REQUIRED_MESSAGE } from '../core/pool-main'
 import { windowsFromQuotaMap } from '../core/pool-quota'
 import { routableRows } from '../core/pool-request'
 import {
@@ -543,7 +544,17 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   ): Promise<string | undefined> => {
     const storage = await deps.storage()
     const view = await source.current()
+    const refuseMissingLogin = () => {
+      throw new OpenCode2AuthError({
+        kind: 'no-account',
+        providerID: OPENAI_PROVIDER_ID,
+        sessionID: input.sessionID,
+        requestKind: input.kind,
+        message: POOL_LOGIN_REQUIRED_MESSAGE,
+      })
+    }
     if (!view.active) {
+      if (!storage?.accounts.length) refuseMissingLogin()
       log?.warn(
         'the account pool does not serve requests yet; refusing the request',
         { kind: input.kind },
@@ -612,6 +623,15 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       }
       refused.add(accountId)
     }
+    // The installer otherwise replaces an empty choice with its generic
+    // no-account error. Give a separate setup the same fixed instructions as
+    // OpenCode 1, but only after routing has had a chance to serve other rows.
+    if (
+      accountId === undefined &&
+      !view.rows.some((row) => row.id === 'main') &&
+      targets.length === 0
+    )
+      refuseMissingLogin()
     if (accountId !== undefined && primary)
       rememberSessionAccount(input.sessionID, accountId)
     log?.debug('pool account chosen', {

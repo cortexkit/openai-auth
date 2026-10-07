@@ -37,6 +37,8 @@ import {
 } from './fixtures/opencode2-host'
 
 const PLACEHOLDER = placeholderSecret('openai')
+const LOGIN_REQUIRED_MESSAGE =
+  'This setup has no OpenAI login in its account store. Sign in for this setup with opencode auth login, or point OPENCODE_OPENAI_AUTH_FILE and OPENCODE_OPENAI_AUTH_STATE_FILE at the store that holds the login.'
 const offline: typeof fetch = Object.assign(
   async () => {
     throw new Error('offline in tests')
@@ -87,6 +89,55 @@ async function startPool(
   seedPool(files, mode, rows)
   return { files, ...(await start(files, options)) }
 }
+
+describe('OpenCode 2 separate account store', () => {
+  it('main-first still serves another pool row when main is missing', async () => {
+    const files = poolFiles()
+    seedPool(files, 'main-first', [{ id: 'fb' }])
+    writeFileSync(
+      join(files.dir, 'auth.json'),
+      JSON.stringify({ openai: POOL_PLACEHOLDER }),
+    )
+    const { host } = await start(files)
+    const request = await httpRequest(host)
+    expect(request.headers.get('authorization')).toBe('Bearer fb-token')
+  })
+
+  for (const migrated of [false, true]) {
+    it(`refuses an empty ${migrated ? 'wrongly migrated' : 'unmigrated'} store with a shared placeholder`, async () => {
+      const files = poolFiles()
+      seedPool(files, 'main-first', [])
+      if (!migrated) {
+        writeFileSync(
+          files.configPath,
+          JSON.stringify({
+            version: 1,
+            main: { type: 'opencode', provider: 'openai' },
+            accounts: [],
+          }),
+        )
+      }
+      writeFileSync(
+        join(files.dir, 'auth.json'),
+        JSON.stringify({ openai: POOL_PLACEHOLDER }),
+      )
+      const before = readFileSync(files.configPath, 'utf8')
+      const { host, stop } = await start(files, {
+        activeCredential: {
+          type: 'oauth',
+          methodID: 'chatgpt-browser',
+          access: PLACEHOLDER,
+          refresh: PLACEHOLDER,
+          expires: 0,
+        } as unknown as Credential.Value,
+      })
+      await expect(httpRequest(host)).rejects.toThrow(LOGIN_REQUIRED_MESSAGE)
+      await expect(wsHandshake(host)).rejects.toThrow(LOGIN_REQUIRED_MESSAGE)
+      await stop()
+      expect(readFileSync(files.configPath, 'utf8')).toBe(before)
+    })
+  }
+})
 
 async function modelRequest(
   host: Host,
@@ -419,6 +470,35 @@ describe('OpenCode 2 entry: logins', () => {
       .readConfig()
       .accounts.find((account) => account.id === 'main')
     expect(main?.accountId).toBe('chatgpt-first')
+  })
+
+  it('signing in for a separate setup unblocks its refused migration', async () => {
+    const files = poolFiles()
+    writeFileSync(
+      files.configPath,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+      }),
+    )
+    writeFileSync(
+      join(files.dir, 'auth.json'),
+      JSON.stringify({ openai: POOL_PLACEHOLDER }),
+    )
+    const { host } = await start(files, {
+      beginLogin: login('chatgpt-separate'),
+    })
+    await signIn(host)
+    expect(files.readConfig().openaiAuthPool?.migratedAt).toBeNumber()
+    expect(files.readState().accounts.main?.refresh).toBe(
+      'chatgpt-separate-new-refresh',
+    )
+    expect(
+      JSON.parse(readFileSync(join(files.dir, 'auth.json'), 'utf8')),
+    ).toEqual({
+      openai: POOL_PLACEHOLDER,
+    })
   })
 
   it('leaves an account the pool already holds alone when OpenCode 2 still has an older login of it', async () => {
