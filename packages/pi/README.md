@@ -8,6 +8,8 @@ This package is part of the CortexKit OpenAI Auth monorepo, which supports both 
 
 ## Install
 
+Requires Pi 1.0.1 or newer.
+
 Install with Pi's package manager:
 
 ```bash

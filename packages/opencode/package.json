@@ -66,12 +66,12 @@
     "@cortexkit/claustrum-client": "^0.6.2",
     "@cortexkit/common-auth": "^0.11.0",
     "@cortexkit/openai-auth-core": "workspace:*",
-    "@opencode/plugin": "2.0.21"
+    "@opencode/plugin": "2.0.22"
   },
   "dependencies": {
-    "@opentui/core": ">=0.5.12",
-    "@opentui/solid": ">=0.5.12",
-    "ai": "^7.0.116",
+    "@opentui/core": ">=0.5.14",
+    "@opentui/solid": ">=0.5.14",
+    "ai": "^7.0.127",
     "jsonc-parser": "^3.3.1",
     "solid-js": "1.9.12"
   }

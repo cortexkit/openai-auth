@@ -43,8 +43,8 @@
     "@cortexkit/openai-auth-core": "workspace:*"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.80.10",
-    "@earendil-works/pi-coding-agent": ">=0.80.10",
-    "@earendil-works/pi-tui": ">=0.80.10"
+    "@earendil-works/pi-ai": ">=1.0.1",
+    "@earendil-works/pi-coding-agent": ">=1.0.1",
+    "@earendil-works/pi-tui": ">=1.0.1"
   }
 }
