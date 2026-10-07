@@ -9,6 +9,7 @@
 import type { OAuthQuotaSnapshot } from './accounts.ts'
 import { parseRetryAfter } from './backoff.ts'
 import { createLogger } from './logger.ts'
+import { normalizeWham } from './quota-normalize.ts'
 import { assertNotTombstoneRefresh } from './tombstone.ts'
 import { errorMessage } from './util/error.ts'
 
@@ -192,7 +193,6 @@ export async function whamUsageFn(input: {
         retryAfter,
       }) as ProviderHttpError
     }
-    const { normalizeWham } = await import('./quota-normalize.ts')
     const snapshot = normalizeWham(await res.json())
     logger.debug('wham usage fetch succeeded', {
       pid: process.pid,
