@@ -69,7 +69,7 @@
     "@opencode/plugin": "2.0.21"
   },
   "dependencies": {
-    "@opentui/core": ">=0.5.12",
+    "@opentui/core": ">=0.5.14",
     "@opentui/solid": ">=0.5.12",
     "ai": "^7.0.116",
     "jsonc-parser": "^3.3.1",
