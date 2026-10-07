@@ -1375,6 +1375,60 @@ describe('reset redemption bound to its ChatGPT account', () => {
     })
   })
 
+  // The claim, not the answer to the send, binds the pair to its account. A
+  // process that stops between the claim and the answer (a crash, a killed
+  // terminal) leaves the claim behind, and it must already say whose it is:
+  // otherwise another account signed in on the row later would send the
+  // same (credit_id, redeem_request_id) pair as its own.
+  it('the claim alone records the account, so a pair left by a stopped send is never sent for another account', async () => {
+    const reachedWire = deferred<void>()
+    const answer = deferred<Response>()
+    const sentByA: ReturnType<typeof requestBody>[] = []
+    const first = runResetCreditRedemption(
+      depsAs('account-a', {
+        fetchImpl: recordingWire(() => {
+          reachedWire.resolve()
+          return answer.promise
+        }, sentByA),
+      }),
+      inputAs('account-a', false),
+    )
+    // Account A's consume is on the wire and unanswered: what is saved now
+    // is what the claim wrote, as a process stopped here would leave it.
+    await reachedWire.promise
+    const claimed = {
+      redeemRequestId: 'uuid-new',
+      creditId: 'credit-1',
+      startedAt: NOW,
+      chatgptAccountId: 'account-a',
+    }
+    expect(await persistedResetState()).toEqual({ inFlight: claimed })
+
+    const sentByB: ReturnType<typeof requestBody>[] = []
+    const refused = runResetCreditRedemption(
+      depsAs('account-b', {
+        fetchImpl: recordingWire(
+          () => Response.json({ code: 'no_credit' }),
+          sentByB,
+        ),
+      }),
+      inputAs('account-b', true),
+    )
+    await expect(refused).rejects.toMatchObject({
+      name: 'ResetRedemptionError',
+      kind: 'pair_identity_mismatch',
+    })
+    expect(sentByB).toEqual([])
+    expect(await persistedResetState()).toEqual({ inFlight: claimed })
+
+    // Let account A's send finish, so nothing is left running.
+    answer.resolve(new Response('{bad-json'))
+    await first
+    expect(sentByA).toEqual([
+      { redeem_request_id: 'uuid-new', credit_id: 'credit-1' },
+    ])
+  })
+
   for (const [name, startedAt, retry] of [
     ['Retry of a young pair', YOUNG, true],
     ['Spend with a young pair', YOUNG, false],

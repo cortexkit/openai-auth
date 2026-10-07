@@ -226,6 +226,19 @@ expect_red = ["^reset\\sredemption\\sbound\\sto\\sits\\sChatGPT\\saccount\\sRetr
 expect_message = "Received promise that resolved"
 
 [[control]]
+id = "reset-claim-binds-the-pair-to-its-account"
+guards = "the claim itself records the ChatGPT account, so a pair left by a send that never finished is not sent for another account"
+file = "packages/core/src/reset-credits.ts"
+old = "      startedAt: now,\n      ...(chatgptAccountId === undefined ? {} : { chatgptAccountId }),\n"
+new = "      startedAt: now,\n"
+test_file = "packages/core/src/tests/reset-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/reset-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^reset\\sredemption\\sbound\\sto\\sits\\sChatGPT\\saccount\\sthe\\sclaim\\salone\\srecords\\sthe\\saccount,\\sso\\sa\\spair\\sleft\\sby\\sa\\sstopped\\ssend\\sis\\snever\\ssent\\sfor\\sanother\\saccount$"]
+expect_message = "-     \"chatgptAccountId\": \"account-a\","
+
+[[control]]
 id = "reset-only-terminal-answers-clear-the-pair"
 guards = "an ambiguous consume answer keeps the saved pair; only a terminal answer clears it"
 file = "packages/core/src/reset-credits.ts"
@@ -453,6 +466,19 @@ test_count_pattern = "Ran {count} test"
 expect_red = ["^integration:\\skillswitch\\senforcement\\srefuses\\sto\\ssend\\swhen\\sthe\\saccess\\stoken\\sis\\sempty,\\sand\\sdoes\\snot\\sreach\\supstream$"]
 expect_message = "expect((refusal as Error | undefined)?.message).toBe(EMPTY_BEARER_MESSAGE)"
 
+[[control]]
+id = "opencode1-blank-token-row-is-passed-over"
+guards = "on the OpenCode 1 pool path a row whose access token is blank is not chosen; the next account serves"
+file = "packages/opencode/src/core/pool-account-source.ts"
+old = "    if (!token?.access.trim()) return undefined\n"
+new = "    if (!token) return undefined\n"
+test_file = "packages/opencode/src/tests/pool-request.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-request.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^a\\smigrated\\sinstall\\sserves\\srequests\\sfrom\\sthe\\saccount\\spool\\sa\\srow\\swhose\\saccess\\stoken\\sis\\sblank\\sis\\spassed\\sover\\sfor\\sthe\\snext\\saccount$"]
+expect_message = "Refusing to send a request with no access token"
+
 # The Claustrum vault (packages/core/src/vault.ts and the request paths). The
 # vault holds OpenAI credentials and refreshes them itself; this plugin asks it
 # for a token on each send and reports a 401 only for a credential it served.
@@ -469,6 +495,19 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-v
 test_count_pattern = "Ran {count} test"
 expect_red = ["^vault\\saccounts\\son\\sOpenCode\\s2\\ssends\\swith\\sthe\\stoken\\sthe\\svault\\sserves,\\sand\\sreports\\sa\\s401\\sagainst\\sthat\\ssend\\srecord\\sversion\\sonly$"]
 expect_message = "\"reporter_source\": \"direct\""
+
+[[control]]
+id = "vault-never-hears-a-pool-401"
+guards = "a 401 on a local pool account is never reported to the vault; only a vault-served send is"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "      if (data?.kind !== 'vault' || outcome.status !== 401) return"
+new = "      if (outcome.status !== 401) return"
+test_file = "packages/opencode/src/tests/opencode2-vault-report.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-vault-report.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^vault\\sfailure\\sreports\\son\\sOpenCode\\s2\\sa\\s401\\son\\sa\\slocal\\spool\\saccount\\sreports\\snothing\\sto\\sthe\\svault;\\sa\\s401\\son\\sa\\svault\\saccount\\sreports\\sonce,\\swith\\sthe\\sserved\\srecord\\sversion$"]
+expect_message = "\"receipt\": undefined,"
 
 [[control]]
 id = "vault-static-api-keys-are-not-admitted"
@@ -725,9 +764,11 @@ test_count_pattern = "Ran {count} test"
 expect_red = ["^installed\\srange\\sbuild\\sgate\\srefuses\\san\\sinstalled\\sversion\\soutside\\sthe\\sdeclared\\srange\\sand\\snames\\sit$"]
 expect_message = "/Expected: 1\\s+Received: 0/"
 
-# Admission: the killswitch blocks an account below its floor, unknown quota
-# fails closed, and when every account is exhausted the request still reaches
-# the provider on the last path.
+# Admission: the killswitch blocks an account below its floor (and, with
+# failClosedOnUnknownQuota, one whose quota it cannot read), and unknown quota
+# fails closed. When every account looks exhausted, the request is still sent
+# to one of them as a last resort, since a reading may be stale and the
+# provider has the final say, but never to an account the killswitch blocks.
 
 [[control]]
 id = "killswitch-blocks-below-the-floor"
@@ -756,6 +797,19 @@ expect_red = ["^fallback\\sselection\\sfail-closed:\\sunknown-quota\\sfallback\\
 expect_message = "expect(usable.length).toBe(0)"
 
 [[control]]
+id = "killswitch-unknown-quota-fails-closed"
+guards = "with failClosedOnUnknownQuota the killswitch blocks an account whose quota it cannot read"
+file = "packages/core/src/accounts.ts"
+old = "  if (!isKillswitchEnabled(storage)) return true\n  if (!quota) return !failClosedOnUnknownQuota(storage)"
+new = "  if (!isKillswitchEnabled(storage)) return true\n  if (!quota) return true"
+test_file = "packages/opencode/src/tests/integration.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/integration.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^integration:\\skillswitch\\senforcement\\swith\\sfailClosedOnUnknownQuota,\\sblocks\\smain\\swhile\\sits\\squota\\sis\\sunknown,\\swithout\\sspending$"]
+expect_message = "/Expected: 429\\s+Received: 200/"
+
+[[control]]
 id = "unknown-quota-never-takes-the-last-path"
 guards = "a row refused for unknown quota is not sent on the exhausted-account last path"
 file = "packages/core/src/pool-routing.ts"
@@ -780,3 +834,16 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-reques
 test_count_pattern = "Ran {count} test"
 expect_red = ["^exhaustion\\sand\\sthe\\scredit\\sbudget\\son\\sa\\smigrated\\sinstall\\smain-first:\\swhen\\severy\\saccount\\sis\\sexhausted\\sthe\\srequest\\sstill\\sreaches\\sthe\\sprovider$"]
 expect_message = "expect(wire.sends.length).toBeGreaterThan(0)"
+
+[[control]]
+id = "killswitch-blocked-never-takes-the-last-path"
+guards = "an exhausted account below its killswitch floor is not sent on the last path"
+file = "packages/core/src/pool-routing.ts"
+old = "          isConfirmedExhaustion(refusal) &&\n          input.killswitch.get(refusal.id) !== false,\n"
+new = "          isConfirmedExhaustion(refusal),\n"
+test_file = "packages/opencode/src/tests/pool-request.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-request.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^the\\skillswitch\\son\\sa\\smigrated\\sinstall\\smain-first:\\severy\\saccount\\sexhausted\\sand\\sbelow\\sits\\sthreshold\\sis\\snever\\ssent\\son\\sthe\\slast\\spath$"]
+expect_message = "/Expected: 429\\s+Received: 200/"

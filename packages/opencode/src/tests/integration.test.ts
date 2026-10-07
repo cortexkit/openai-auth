@@ -979,6 +979,56 @@ describe('integration: killswitch enforcement', () => {
     }
   })
 
+  // The killswitch is a floor on remaining quota. With
+  // failClosedOnUnknownQuota on, a quota it cannot read is treated as below
+  // the floor: main is not spent on until a reading shows it above.
+  it('with failClosedOnUnknownQuota, blocks main while its quota is unknown, without spending', async () => {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: [],
+        quota: { failClosedOnUnknownQuota: true },
+        killswitch: {
+          enabled: true,
+          main: { primary: 50, secondary: 50 },
+        },
+      }),
+    )
+
+    const originalFetch = globalThis.fetch
+    let upstreamCalls = 0
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      // Every quota poll fails, so main's quota stays unknown.
+      if (!isResponsesSend(input)) return new Response('', { status: 503 })
+      upstreamCalls += 1
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof globalThis.fetch
+    let hooks: Hooks | undefined
+    try {
+      hooks = await CodexAuthPlugin(createMockPluginInput(), {
+        experimentalWebSockets: false,
+      })
+      const fetchOverride = await loaderFetch(hooks)
+
+      const blocked = await scope.wrap(fetchOverride)(
+        'https://api.openai.com/v1/responses',
+        REQ_INIT,
+      )
+      expect(blocked.status).toBe(429)
+      const body = (await blocked.json()) as {
+        error?: { message?: string }
+      }
+      expect(body.error?.message).toContain('Killswitch')
+      expect(upstreamCalls).toBe(0)
+    } finally {
+      await scope.settlePluginWork()
+      globalThis.fetch = originalFetch
+      await hooks?.dispose?.()
+    }
+  })
+
   // A defect that empties the access token used to reach the wire as `Bearer `
   // and come back as a provider 401, which sends whoever debugs it to the
   // provider's status page instead of to the plugin. The refusal is local, and

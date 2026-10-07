@@ -231,6 +231,8 @@ type RowSeed = {
   id: string
   quota?: ReturnType<typeof quotaMap>
   expires?: number
+  /** The row's access token; `<id>-token` when absent. */
+  access?: string
 }
 
 /** Writes a migrated install: roster, pool entries, credentials in the state file. */
@@ -279,7 +281,7 @@ function seedPool(
         rows.map((row) => [
           row.id,
           {
-            access: `${row.id}-token`,
+            access: row.access ?? `${row.id}-token`,
             refresh: `${row.id}-refresh`,
             expires: row.expires ?? Date.now() + 24 * HOUR,
           },
@@ -554,6 +556,23 @@ describe('a migrated install serves requests from the account pool', () => {
     expect(wire.sends).toEqual(['Bearer refreshed-access'])
     const state = JSON.parse(readFileSync(stateFile, 'utf8'))
     expect(state.accounts.main.refresh).toBe('refreshed-refresh')
+  })
+
+  // A row whose access token is blank has nothing to send with, even though
+  // its expiry is still ahead. It is not chosen: the request goes to the next
+  // account rather than out with an empty bearer.
+  it('a row whose access token is blank is passed over for the next account', async () => {
+    seedPool('main-first', [
+      { id: 'main', quota: healthy(), access: '   ' },
+      { id: 'fallback-1', quota: healthy() },
+    ])
+    const wire = installWire()
+    const fetchOverride = await loadFetch()
+
+    const response = await fetchOverride(URL_RESPONSES, request())
+
+    expect(response.status).toBe(200)
+    expect(wire.sends).toEqual([bearer('fallback-1')])
   })
 })
 
@@ -859,6 +878,31 @@ describe('the killswitch on a migrated install', () => {
       expect(response.status).toBe(429)
       expect(await response.text()).toContain('Killswitch')
       expect(Number(response.headers.get('retry-after'))).toBeGreaterThan(0)
+      expect(wire.sends).toEqual([])
+    })
+
+    // When every account looks exhausted, the request is still sent to one of
+    // them as a last resort, because a quota reading may be stale and the
+    // provider has the final say. The killswitch is different: it is a minimum
+    // remaining quota the operator set, below which an account must not be
+    // spent on, so an account that is both exhausted and below it is never the
+    // last resort.
+    it(`${mode}: every account exhausted and below its threshold is never sent on the last path`, async () => {
+      seedPool(
+        mode,
+        [
+          { id: 'main', quota: quotaMap(100) },
+          { id: 'fallback-1', quota: quotaMap(100) },
+        ],
+        killswitch,
+      )
+      const wire = installWire()
+      const fetchOverride = await loadFetch()
+
+      const response = await fetchOverride(URL_RESPONSES, request('s-ks-last'))
+
+      expect(response.status).toBe(429)
+      expect(await response.text()).toContain('Killswitch')
       expect(wire.sends).toEqual([])
     })
   }
