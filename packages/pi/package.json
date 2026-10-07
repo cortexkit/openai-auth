@@ -39,7 +39,7 @@
   },
   "devDependencies": {
     "@cortexkit/claustrum-client": "^0.6.2",
-    "@cortexkit/common-auth": "^0.11.0",
+    "@cortexkit/common-auth": "^0.11.2",
     "@cortexkit/openai-auth-core": "workspace:*"
   },
   "peerDependencies": {
