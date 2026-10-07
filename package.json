@@ -25,7 +25,7 @@
   "devDependencies": {
     "@biomejs/biome": "2.5.15",
     "@cortexkit/openai-auth-core": "workspace:*",
-    "@earendil-works/pi-ai": "1.0.1",
+    "@earendil-works/pi-ai": "1.0.2",
     "@earendil-works/pi-coding-agent": "1.0.1",
     "@earendil-works/pi-tui": "1.0.1",
     "@opencode-ai/plugin": "1.18.34",
