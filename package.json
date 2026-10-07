@@ -23,7 +23,7 @@
     "check:local-deps": "bun scripts/check-local-deps.mjs"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.14",
+    "@biomejs/biome": "2.5.15",
     "@cortexkit/openai-auth-core": "workspace:*",
     "@earendil-works/pi-ai": "0.87.1",
     "@earendil-works/pi-coding-agent": "0.87.1",
