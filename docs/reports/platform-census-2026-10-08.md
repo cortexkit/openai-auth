@@ -1,0 +1,269 @@
+# openai-auth platform census — 2026-10-08
+
+## Headline
+
+**15 finding groups: 14 runtime/security/host-environment groups and one source-build/development group.** These are not 15 unconditional OS failures: several are conditional on the filesystem, proxy, terminal, runtime version or installation layout, and several also affect macOS under the same conditions.
+
+- **Linux, published plugin/extension:** no unconditional Linux-only installation blocker found. The first likely headless setup obstacle is browser/loopback OAuth; device authorization is available. **Linux, building this checkout on the runner:** the first observed blocker is declaration generation: `tsdown` selects its `unrun` config loader under Node 22.22.1, but `unrun` is not installed (finding 15).
+- **Windows:** the first hard functional blocker found is **Claustrum enrollment's POSIX permission contract**, for an installation using vault accounts (finding 2). A local-pool-only install has no demonstrated unconditional loader blocker. Its browser opener also has an unquoted `cmd /c start` URL risk, before token storage (finding 11); the printed URL/device flow can work around that.
+
+This is a documentation-only census. No compatibility shim, runtime fix, test change, manifest change or lockfile change was made.
+
+## Scope and evidence
+
+Audited checkout: `da5b176e687bab3f2d6baaefdd20f696a2783b18`. Hosts: OpenCode 1, OpenCode 2 and Pi. The module runs inside those hosts, not as a stand-alone daemon. OpenCode 2 uses the pool/vault but does not yet expose all OpenCode 1 UI features; that host-version limitation is not an OS regression (`README.md:82`).
+
+The audit includes the **installed implementations actually imported/bundled by this checkout**, not hypothetical upstream fixes:
+
+| Citation prefix | Exact installed implementation root |
+| --- | --- |
+| `CA` | `packages/core/node_modules/@cortexkit/common-auth` — 0.11.4 |
+| `CC` | `packages/core/node_modules/@cortexkit/claustrum-client` — 0.6.2 |
+| `SC` | `node_modules/.bun/@cortexkit+claustrum-client@0.6.2/node_modules/@cortexkit/subc-client` — resolves to 0.16.1 |
+| `OT` | `packages/opencode/node_modules/@opentui/core` — 0.5.14 |
+| `TD` | `node_modules/tsdown` — 0.23.0 |
+
+For example, `CA:dist/fs/atomic-write.js:15` means that exact dependency file and line, not a source file in this repository. Source citations are repository-relative. Dependencies are cited separately because fixes there must reach the published/bundled plugin; changing an unused local copy would accomplish nothing.
+
+**Code read** means inspected implementation plus the relevant OS API semantics, not an OS execution. **Linux run** means an actual foreground shell command with `runon: 'linux'` on `ck-motor`. That runner has Bun **1.4.2** and Node **22.22.1**. The local macOS worktree has Bun **1.4.2** and Node **24.16.0**. No Windows runner was available; every Windows outcome below is a code-read inference, with uncertainty called out where important. No real provider credential, browser authorization, enterprise proxy or Claustrum production daemon was used.
+
+Severity: **high** blocks a configured authentication path or risks credential disclosure/integrity; **medium** loses important functionality or can strand an upgrade; **low** loses convenience, preferences, diagnostic output or cache continuity. “Refuses” is an operation failing closed, not necessarily the host process crashing. “No-op” includes deliberately swallowed persistence failures. “Works” is always scoped to the stated conditions.
+
+## Runtime findings
+
+### 1. `0600`/`0700` do not implement owner-only access on Windows
+
+**Locations:** `CA:dist/fs/atomic-write.js:5`, `:10`, `:15`; `CA:dist/fs/refresh-file-lock.js:91`, `:108`, `:167`; `CA:dist/rpc/port-file.js:71`, `:76`, `:84`, `:87`; `packages/opencode/src/core/process-heartbeat.ts:62–73`; `CA:dist/sidebar-file/sidebar-file.js:112–116`; `CA:dist/dump/index.js:144`, `:375–377`; `CA:dist/logger/engine.js:12–18`, `:115`; `packages/opencode/src/v2/host-slot.ts:124–129`. Core credential writes reach the atomic writer at `packages/core/src/accounts.ts:1346–1347`, `:1743`.
+
+- **Linux: works** on normal local POSIX filesystems. Modes and `chmod` restrict real UID/GID access, subject to ACLs, ownership and mount policy. The atomic writer does not make an existing parent private; its file is still `0600`.
+- **Windows: degraded security; some chmod operations are effectively no-op for privacy.** Node's mode/chmod support principally maps the writable/read-only attribute; it cannot grant “read/write only this user” through POSIX owner/group bits. A successfully written `0600` file is not proof of an owner-only DACL. Default profile ACLs may protect a normal install, but explicit shared paths, inherited ACLs and insecure temp roots are not remediated. Unsupported chmod implementations can instead reject the write; swallowing varies by caller.
+- **Evidence:** code read. Linux Node smoke verified an actual credential-shaped atomic file has mode `0600`; relevant Bun tests exercised real filesystem writes. There was no Windows ACL run.
+- **Severity:** **high** for account/config/state secrets and the RPC bearer token; **medium** for sensitive prompt dumps; low for heartbeat metadata. This is not a claim that every Windows user's profile is public.
+- **Fix shape:** a shared private-file/private-directory abstraction using POSIX ownership/modes on Unix and a current-user SID/DACL policy on Windows. Validate the resulting security property, not chmod's return value. Propagate an actionable failure when secret storage cannot be secured. Do not simply disable permission checks to make enrollment pass.
+
+### 2. Windows Claustrum enrollment cannot satisfy the secret-file checks
+
+**Locations:** `packages/core/src/vault.ts:93–106`, `:208–224`; `CA:dist/claustrum/enrollment.js:179–189`, `:200–212`, `:274–278`, `:315–344`, `:384–389`, `:585–599`; `CC:dist/enrollment.js:23–28`, `:43–61`; `CC:dist/ancestor-permissions.js:22–28`.
+
+- **Linux: works** with current-user-owned, owner-only regular files and safe ancestors. Unsafe files **refuse** intentionally. OpenCode and Pi enrollment passed in real Linux tests using a mock vault transport and real token files.
+- **Windows: refuses** vault setup/use under the ordinary Node/Windows permission model. The reader unconditionally rejects `metadata.mode & 0o077`, which synthetic Windows writable-file modes do not clear merely because creation requested `0600`. Common-auth skips the UID check when `geteuid` is absent and skips its ancestor traversal, but **does not skip the mode check**. The token writer in claustrum-client still applies `acceptsAncestor`: writable Windows directory modes plus absent effective UID/GID fail that policy. Thus both pending-state rereads and approved-token publication/use have incompatible checks. `O_NOFOLLOW` is also a Unix-oriented assumption, not a demonstrated Windows reparse-point defense.
+- **Evidence:** code read for Windows; actual Linux enrollment tests. No assertion that Windows lacks Node filesystem APIs generally, and no assertion that the missing `geteuid` call itself crashes—the optional calls are guarded.
+- **Severity:** **high / hard vault-feature blocker** across OpenCode 1, OpenCode 2 and Pi. It does not prevent a non-vault local account pool from loading. Because the vault returns the approved token once, a failure at publication can be more consequential than a harmless retry.
+- **Fix shape:** implement Windows secret-handle security, owner SID/ACL checks and reparse-point handling in common-auth and claustrum-client together. Use the same policy for state, token creation and token reads. Keep the fail-closed property and test the once-only approval/publication boundary on Windows.
+
+**Important distinction:** the Subc **connection file** has a separate explicit Windows permission bypass (`SC:src/connection-file.ts:72–80`). That bypass is not applied to these enrollment files; successful daemon discovery does not prove enrollment will work. The old handle-file reader also demands exact `0600` (`CC:dist/handles.js:185–190`), but current routing here uses scoped enrollment, not the retired handle-mode path. It is not counted as a second active authentication blocker.
+
+### 3. Linux group-writable homes on NSS/LDAP accounts can be refused
+
+**Locations:** `CA:dist/claustrum/enrollment.js:224–267`, `:274–307`; `CC:dist/ancestor-permissions.js:22–42`; `CC:dist/enrollment.js:13–34`.
+
+- **Linux: works** for normal `0755`/`0700` ancestors and for a group-writable ancestor whose user-private group is provable from local `/etc/passwd` and `/etc/group`. **Refuses** a non-sticky group-writable ancestor when the user/group is NSS-only, those files are absent/malformed, or they cannot prove exclusivity. This is relevant to centrally managed Linux workstations and shared home layouts. Sticky `/tmp` is exempt; group write alone is not always forbidden.
+- **Windows: refuses** for the independent policy mismatch in finding 2; `/etc` databases are not a Windows group-membership mechanism.
+- **Evidence:** code read. The green Linux enrollment suite proves a supported layout, not an NSS account or every home permission policy. macOS directory-service identities can hit the same conservative refusal; this is not uniquely a Linux bug.
+- **Severity:** **high** for affected vault users, otherwise none. The code is intentionally conservative, so this should not be “fixed” by trusting every group-writable home.
+- **Fix shape:** either document/remediate ancestors to remove group/world write, or add a trusted OS/NSS membership proof with conservative failure behavior. Windows needs an ACL policy instead of Unix account-file parsing.
+
+### 4. Atomic replacement has no application-level Windows sharing recovery
+
+**Locations:** `CA:dist/fs/atomic-write.js:10–26`; `packages/core/src/accounts.ts:1346–1347`, `:1743`; `packages/opencode/src/core/pool-migration.ts:627–633`; `packages/opencode/src/v2/host-slot.ts:122–132`; `packages/opencode/src/core/process-heartbeat.ts:68–76`, `:99–109`; `CA:dist/rpc/port-file.js:84–108`; `packages/opencode/src/index.ts:908–926`; `CA:dist/logger/engine.js:20–37`; `CA:dist/tui-prefs/tui-preferences.js:57–64`, `packages/opencode/src/tui-preferences.ts:251–262`.
+
+- **Linux: works** for same-filesystem replacement, including an existing destination open for reading. Readers of the old inode can finish. Real Node smoke replaced a file while an old read descriptor remained open. Permission/read-only/mount failures can still reject on Linux, as on macOS.
+- **Windows: works** when the destination and directories permit delete/replace sharing; **degraded/refuses/no-op** when another process, editor, scanner, backup agent or host holds an incompatible handle. Windows replacement is supported by Node/libuv: **“rename always fails if the file exists” is false**. The gap is that these call sites have no bounded application retry for sharing/access failures. Port-file creation retries only `ENOENT`, not sharing errors.
+- **Observed caller consequences:** credential/config writes reject; pool migration is retried in the background (`packages/opencode/src/core/pool-lifecycle.ts:7–23`); the OpenCode 2 placeholder write rejects; RPC publication closes its server on failure (`CA:dist/rpc/rpc-server.js:280–289`) and OpenCode 1 swallows that startup failure (`packages/opencode/src/index.ts:3212–3215`); heartbeat failure warns but leaves no heartbeat; session continuity save and preference writes silently no-op; log rotation failure is swallowed. A missing heartbeat plus a live port file shuts the version fence as “unknown/older”; if neither file was published, another process has no record to fence on (`packages/opencode/src/core/version-fence.ts:194–237`).
+- **Evidence:** code read for Windows, real Linux Node replacement check and Bun persistence/RPC/heartbeat tests. No Windows sharing-violation reproduction.
+- **Severity:** **high** for token rotation durability or migration; **medium** for RPC and migration visibility; low for preferences/log rotation/cache continuity.
+- **Fix shape:** one shared secure atomic-replace primitive with bounded, classified Windows sharing retries, handles closed before replacement, and explicit outcomes. Preserve the old complete file on failure; **do not unlink the target first**. Test a real incompatible Windows handle, not merely mock `rename` as successful. Consider how migration visibility remains safe when heartbeat publication fails.
+
+### 5. The lease lock is portable in principle, but its failure paths assume POSIX-like filesystem behavior
+
+**Locations:** `CA:dist/fs/refresh-file-lock.js:85–130`, `:135–149`, `:166–208`, `:258–355`, `:373–438`, `:472–490`; `CA:dist/fs/with-lock.js:21–47`; `packages/core/src/accounts.ts:1190–1238`; `packages/opencode/src/core/pool-migration.ts:554`, `:589`, `:779`.
+
+- **Linux: works** on local filesystems providing exclusive create, atomic rename and ordinary directory semantics. The real Bun test elected exactly one owner in **128 stale-lock contention rounds**. Network/cloud/FUSE mounts can still violate assumptions or expose different errors; that is not a proven local-Linux failure.
+- **Windows: expected to work** on local NTFS for ordinary `wx`/exclusive creation, but **degraded/refuses** under sharing violations during renewal, marker rename or removal. Initial acquisition classifies `EEXIST`/`EISDIR` as contention. Stale eviction-marker recovery handles only `ENOENT` at its rename; other errors propagate. Renewal errors can be swallowed/retried while the old lease remains verifiable, then ownership expires. Best-effort release/removal can leave a lease behind until its TTL. These cases must be validated on Windows rather than declaring `O_EXCL` itself unsupported.
+- **Evidence:** dependency code read; real Linux contention and Node acquisition/contention/release checks. Legacy directory-owner reads and unusual Windows errno mappings have **not** been exercised on Windows, so no unconditional legacy-lock crash is asserted.
+- **Severity:** **high** if refresh serialization cannot be established; **medium** for temporary refusal/contention after a failed release. Refreshing without the lock is not an acceptable fallback.
+- **Fix shape:** Windows contention/sharing-error tests, bounded retries without weakening ownership fencing, and supported-filesystem documentation. Retain lease ownership assertions and TTL recovery. Normalize only errors demonstrated to mean a lost race.
+
+**`link` census:** this installed `@cortexkit/common-auth/fs` implementation uses **exclusive file creation (`wx`, i.e. `O_EXCL`)**, a JSON owner/expiry record, `.evicting` directories and temp-file rename for renewal. It **does not use `link()` or POSIX advisory `flock`**. Do not prescribe an NTFS hardlink shim for code that never invokes hardlinks. `COPYFILE_EXCL` in sidebar import is a separate primitive, not the lease lock.
+
+### 6. Path conventions are XDG/home-based; Claustrum discovery is not fully `homedir()`-based
+
+**Locations:** `packages/opencode/src/core/account-paths.ts:27–42`, `:90–100`; `packages/opencode/src/config.ts:59–85`; `packages/opencode/src/tui-preferences.ts:17–23`; `packages/opencode/src/core/host-slot.ts:189–195`; `packages/opencode/src/core/process-heartbeat.ts:29–31`; `packages/opencode/src/rpc/rpc-dir.ts:23–49`; `packages/pi/src/paths.ts:10–26`; `CC:dist/detect.js:12–66`.
+
+- **Linux: works** with ordinary XDG/home layouts. Explicit env overrides permit other locations. A mismatched server/TUI environment or host data path can make configuration disappear or RPC/vault discovery **no-op/refuse**.
+- **Windows: works** with home-relative dot-directories if both the host and plugin use that contract; **degraded/no-op/refuses** if operators or a distribution place files only in `%APPDATA%`/`%LOCALAPPDATA%` while these resolvers still look in dot-directories. Lack of an APPDATA branch is **not by itself proof of a wrong OpenCode path**. The OpenCode 1 adapter deliberately follows OpenCode 1's XDG data contract, on every OS; it must not be unilaterally redirected to APPDATA. OpenCode 2 holds its own login in its database; `v2/host-slot.ts` reads the OpenCode **1** `auth.json` for migration, not an invented OpenCode 2 auth file.
+- **Specific vault risk:** discovery's home tier uses **`process.env.HOME`**, not `os.homedir()`/`USERPROFILE`. With HOME absent, it checks runtime, a per-user temp filename and an unambiguous temp glob; its final absent marker uses `userInfo().homedir`. A real file existing only in the OS-reported home is not searched as a home tier. Multiple matching temp files deliberately prevent choosing one. The Windows username-token fallback and unique-temp glob are already implemented; Windows discovery is not inherently impossible.
+- **Evidence:** code read; real Linux path/RPC/host-slot tests. The installed host itself was not run on Windows to certify the host/plugin path contract.
+- **Severity:** **medium**, or high when credentials exist solely at an undiscovered location. No universal Linux/Windows installation refusal follows from these paths.
+- **Fix shape:** publish and test one host-aligned OS path contract, with explicit overrides and upgrade/migration rules. Keep both RPC halves and the version fence on the same state root. Align Claustrum discovery with the producer's Windows/home rules before changing fallback order. Use an explicit connection-file override as the current workaround; do not guess between other users' files.
+
+### 7. Path identity is not filesystem identity
+
+**Locations:** `packages/opencode/src/core/account-paths.ts:44–88`; `packages/opencode/src/rpc/rpc-dir.ts:16–20`, `:29–38`; `CA:dist/rpc/port-file.js:32–34`; `packages/opencode/src/tui-preferences.ts:223–230`; `CA:dist/tui-prefs/watcher.js:5–14`, `:32–35`.
+
+- **Linux: works** for ordinary case-sensitive local paths. **Degraded / potentially unsafe** for casefold-enabled or case-insensitive mounts: the account-path guard only lowercases on darwin/win32, and before files exist, differently cased basenames may refer to the same eventual file without comparing equal. Existing symlinks are considered through realpath, but hardlinks/bind mounts are explicitly outside that defense.
+- **Windows: works** for the account config/state guard on ordinary case-insensitive paths. **Degraded/no-op** if RPC server and TUI hash different spellings of the same project (case, slash form, drive spelling or symlink/junction aliases): the hash consumes the raw project string, not canonical filesystem identity. They discover different directories. Conversely, case-sensitive Windows directories can be **refused** unnecessarily because the account guard always lowercases. The same raw-project alias issue can occur on macOS; this is not newly introduced on Windows.
+- **Evidence:** code read; Linux tests passed the ordinary path guard and simulated darwin/win32 case comparisons. A simulated platform parameter does not test NTFS/APFS/casefold behavior.
+- **Severity:** **high** for a config/state collision that can overwrite credentials; **medium** for inaccessible RPC/menu commands; low for duplicated preference writer/watcher registries.
+- **Fix shape:** shared canonical identity rules, real filesystem identity when available, and explicit handling of non-existent path components/volume case policy. Pass the same canonical project identity across both processes. Do not lowercase every Linux path, since distinct case-sensitive files must remain distinct. Test Linux casefold mounts, Windows case-sensitive directories, aliases and junctions.
+
+### 8. Fixed temp names assume a private temp root, which Linux often does not provide
+
+**Locations:** `packages/opencode/src/logger.ts:37–41`; `packages/opencode/src/config.ts:131–135`; `packages/opencode/src/sidebar-state.ts:198–202`, `:338–343`; `CA:dist/logger/engine.js:99–119`; `CA:dist/dump/index.js:375–377`; `CC:dist/detect.js:40–47`.
+
+- **Linux: degraded/no-op** on a multi-user default `/tmp`: the first user's `0600` fixed-name log and `0700` dump directory can prevent another user from writing. The logger discards its buffer on append failure; dump creation/remediation fails best-effort. Predictable paths also deserve symlink/ownership review; appending follows a planted symlink rather than proving private-file identity. Legacy sidebar import may fail or read someone else's old, readable pin state. This is metadata/state contamination, not evidence that sidebar state contains OAuth tokens.
+- **Windows: usually works** with the per-user TEMP directory, but **degraded** with a shared/custom temp root and has the ACL limitations in finding 1. macOS usually supplies a per-user `$TMPDIR`, but can also be configured to share one.
+- **Evidence:** code read. The Linux runner's actual `tmpdir()` was **`/motor-home/tmp`**, not `/tmp`; green tests there do not certify multi-user `/tmp` isolation.
+- **Severity:** **medium** for lost observability and exposed prompt dumps/insecure paths; low for lost legacy pins. Not a primary auth-loader blocker.
+- **Fix shape:** persistent per-user state/cache directories or a privately created per-user temp directory, explicit owner/symlink checks for existing paths, and secure creation before writing. Preserve Windows ACL handling. Keep the current refusal to choose among ambiguous Claustrum temp records.
+
+### 9. Raw WebSockets bypass proxy environment settings; the native proxy path is limited
+
+**Locations:** `packages/opencode/src/ws.ts:217–239`; `packages/opencode/src/raw-ws.ts:10–14`; `packages/opencode/src/raw-ws-node.ts:116–119`, `:164–167`; `packages/opencode/src/raw-ws-bun.ts:166–174`; `packages/pi/src/raw-ws-node.ts:143–146`; `packages/pi/src/index.ts:43–49`, `:63–68`; `packages/opencode/src/util/proxy-env.ts:1–39`.
+
+- **Linux: works** with direct connectivity; **degraded/refuses transport** on proxy-only networks when using raw WS. OpenCode uses HTTP by default: WebSockets and its raw client are both opt-in (`packages/opencode/src/config.ts:127–128`); Pi installs the raw Node client for its Codex sockets. Those clients connect directly to the target and implement no HTTP CONNECT/SOCKS tunnel.
+- **Windows: same conditional failure**, especially relevant on managed corporate networks. Native Bun WS receives an explicit proxy option; native Node WS is not passed this plugin's selected proxy. Node may have separately configured runtime proxy support, but the plugin does not establish it. The custom matcher supports upper/lowercase env names, `*` and domain suffixes, not `NO_PROXY` host:port/CIDR entries or `ALL_PROXY`; a loopback/custom relay configured that way may be proxied unexpectedly.
+- **Evidence:** code read; Linux proxy matcher tests and raw socket tests passed, but did not traverse a real proxy. This limitation also exists on macOS. It is **not** an OS-specific TLS/socket API absence.
+- **Severity:** **high** for a proxy-only Pi install whose selected transport cannot reach Codex; **medium** for optional OpenCode WS (HTTP fallback may preserve requests). Actual fallback behavior must be checked for the host/provider in use.
+- **Fix shape:** a shared explicit network policy for HTTP/native/raw transports, CONNECT support with correct TLS/SNI and proxy credentials, and a documented equivalent on Node. Add end-to-end proxy/bypass tests. Never leak the local RPC bearer to a proxy: its raw loopback client intentionally bypasses proxies (`CA:dist/rpc/rpc-client.js:63–82`).
+
+### 10. Raw TLS delegates trust entirely to the host runtime
+
+**Locations:** `packages/opencode/src/raw-ws-node.ts:165–166`; `packages/opencode/src/raw-ws-bun.ts:173`; `packages/pi/src/raw-ws-node.ts:144–145`; `packages/core/src/oauth.ts:178–197`, `:552–579`; `packages/opencode/src/model-costs.ts:159–165`.
+
+- **Linux: works** for public roots the runtime trusts; **refuses transport** if a private/enterprise root is installed only in the OS store and is not included by that Node/Bun configuration.
+- **Windows: same conditional refusal** when the host runtime does not consume the Windows trust store, despite a browser trusting the endpoint. Bun and Node trust-store behavior/options need separate qualification. macOS Keychain trust likewise does not prove raw Node TLS trust.
+- **Evidence:** code read. The clients provide hostname/SNI and leave verification enabled; no hard-coded macOS Keychain path or unconditional `rejectUnauthorized: false` was found. No real TLS interception test was run. The Linux raw tests primarily exercise loopback plain TCP or mocked Bun sockets, not a Windows/system-root TLS handshake.
+- **Severity:** **high** on required enterprise endpoints, otherwise none. Failure emits socket errors / transport refusal, not a demonstrated process crash. OAuth HTTPS has the same host-runtime trust dependency.
+- **Fix shape:** document supported Node/Bun versions and CA configuration, provide a secure shared custom-CA path if needed, and test private-root TLS on each host/OS. Preserve verification; disabling it is not a compatibility fix.
+
+### 11. Browser opening is best-effort, and Windows passes URLs through `cmd` grammar
+
+**Locations:** `packages/core/src/util/open-url.ts:14–29`; `CA:dist/auth-menu/login.js:3–20`, `:40–62`; `packages/opencode/src/auth/methods.ts:203`, `:273–315`; `packages/core/src/oauth.ts:154–172`; `packages/opencode/src/tests/browser-opener.test.ts:5–14`.
+
+- **Linux: works** with a functioning `xdg-open` and desktop session; **degraded/no-op** when the executable/browser/session is missing or the opener exceeds three seconds. The utility suppresses errors. The current shared CLI menu returns false on launch failure, aborts browser flow and starts device authorization; the URL remains printed. The OpenCode main-login method also offers an explicit headless method. Pi's shared command menu displays a URL/headless choice rather than relying on this utility (`packages/core/src/commands.ts:602–619`).
+- **Windows: expected to launch** through `cmd /c start`, but **degraded/no-op** for full OAuth URLs containing `&` when the URL is not shell-quoted. Both implementations pass `['/c', 'start', '', url]` without quoting the URL; launching `cmd` with `execFileSync` does not stop `cmd` interpreting metacharacters. Normal OAuth authorize URLs have multiple `&` parameters. The empty argument handles the `start` title convention, not URL quoting. Child quoting behavior must be confirmed for Bun as well as Node on real Windows. An opener may report success despite an unusable browser page; automatic headless fallback occurs only when it reports failure.
+- **Evidence:** code read. The Linux test mocks `execFileSync` and uses a URL with **no query metacharacters**. Its green Windows branch is not evidence of a working Windows browser login. `openUrl` is exported compatibility functionality; the active OpenCode CLI menu uses common-auth's independent opener, so fixing only the core helper would leave the menu unchanged.
+- **Severity:** **medium**, first-login convenience/flow failure; **high** for an unattended setup that cannot choose a fallback. This is not an unconditional plugin install failure.
+- **Fix shape:** a vetted cross-platform opener or correctly escaped Windows mechanism (prefer avoiding `cmd` grammar), consistent error reporting, and real Windows tests with the actual multi-parameter OAuth URL. Retain manual URL and device authorization paths.
+
+### 12. OAuth advertises `localhost:1455` but listens only on IPv4
+
+**Locations:** `packages/core/src/oauth.ts:340–350`, `:445–451`, `:484–505`, `:791–819`; `packages/opencode/src/auth/methods.ts:125–132`, `:156–177`; `CA:dist/auth-menu/login.js:42`, `:55–60`.
+
+- **Linux: works** when the browser reaches IPv4 localhost and port 1455 is free. **Refuses/times out** with an IPv6-only localhost resolution/policy, an occupied port, or a browser on another machine (common SSH/headless setup without forwarding). Actual Linux probe: advertised `http://localhost:1455/auth/callback`; IPv4 **connected**; `::1` **ECONNREFUSED**. A modern browser's IPv4 fallback may hide the family mismatch.
+- **Windows: same IPv6/browser-location risk; refuses** if port 1455 is occupied or falls under an excluded/reserved port policy. Firewall/security products can also prevent local callback delivery. These are conditional environment failures, not proof that all Windows localhost binds fail.
+- **Evidence:** code read and real Linux address-family probe; core tests exercised callbacks, concurrency, cancellation, timeout and recovery after a failed bind. Provider token responses were mocked. No Windows firewall/reserved-port run.
+- **Severity:** **high** for the browser auth path, normally recoverable via device flow. A bind rejection happens before shared `runMenuLogin` reaches its opener-failure fallback, so that fallback does not cover every browser-server startup error.
+- **Fix shape:** serve the registered localhost URI over both loopback families where supported, retain loopback-only binding, classify bind errors and offer device flow immediately. **Do not replace the registered redirect URI with `127.0.0.1` or an arbitrary port**: OpenAI expects the exact localhost:1455 callback string. Document remote-host forwarding/headless behavior.
+
+### 13. Shutdown correctness depends on host disposal, not portable signal-driven flushing
+
+**Locations:** `packages/opencode/src/logger.ts:49–53`; `CA:dist/logger/engine.js:92–126`; `packages/opencode/src/index.ts:1742–1774`; `packages/opencode/src/v2/setup.ts:454–473`; `packages/opencode/src/core/process-heartbeat.ts:114–125`; `CA:dist/auth-menu/select.js:90–110`, `:144–152`.
+
+- **Linux: works** on orderly host disposal/natural exit. **Degraded** on a default terminating signal or SIGKILL: the `exit` listener alone does not establish a flush-before-signal-exit guarantee, async persistence is not awaited by it, and lease/port/heartbeat cleanup may be skipped. The shared raw-mode selector catches SIGINT/SIGTERM and typed Ctrl-C while active, but it is not a plugin-wide shutdown coordinator. This is also true on macOS.
+- **Windows: works** on orderly host disposal; **degraded** on console close or externally forced termination. Node's emulated programmatic SIGTERM termination is not a deliverable Unix SIGTERM handler contract. A raw-mode Ctrl-C byte can be handled, but it does not cover process termination. Buffered log lines and queued state can be lost; stale artifacts must be recovered on next use.
+- **Evidence:** code read; Linux disposal tests passed. No end-to-end signal/console-close durability test was run, and no host crash is attributed to the plugin here.
+- **Severity:** low for final diagnostic lines, **medium** for stale UI/heartbeat artifacts or unpersisted queued state. Locks use expiry rather than requiring a signal cleanup handler to release safely.
+- **Fix shape:** use each host's documented shutdown/dispose lifecycle to drain persistence and flush logs explicitly; treat external termination as a crash and make recovery sound. Do not install process-global signal handlers that terminate or commandeer the embedding host. Validate console close/crash recovery on Windows.
+
+### 14. OpenCode's TUI depends on native OpenTUI assets and an FFI-capable runtime
+
+**Locations:** `packages/opencode/package.json:72–76`; `packages/opencode/src/tui/entry.mjs:8–35`; `OT:package.json:15–17`, `:81–89`; `OT:chunk-node-80p7e6t6.js:216–245`, `:8080–8097`, `:13751–13756`.
+
+- **Linux: works** on supported x64/arm64 Bun targets, with published glibc/musl variants. **Refuses/crashes TUI initialization** when the native asset is missing, the architecture/libc is unsupported, or the Node host cannot supply `node:ffi`. A real Node 22.22.1 probe imported OpenTUI successfully, then **renderer creation** failed with `Failed to initialize OpenTUI render library: OpenTUI native FFI is not available for this runtime yet`. Import success alone would have missed the limitation.
+- **Windows: supported assets exist** for x64/arm64; this is not a missing-Windows-binary finding. **Refuses/crashes TUI initialization** under the same unsupported-Node/FFI or missing-asset conditions. OpenTUI's package declares Node `>=26.4.0` and Bun `>=1.3.0`; normal platform/architecture installation must include the appropriate optional asset.
+- **Evidence:** installed dependency code read plus actual Linux Node renderer probe. Windows native rendering and Linux musl were not executed. The OpenCode host may supply/share its own OpenTUI runtime registry instead of this copy; therefore this is a host qualification requirement, not a guaranteed failure of every OpenCode install. Pi's TUI is supplied by Pi and is not this OpenTUI path.
+- **Severity:** **high** for a TUI host below the runtime floor; no demonstrated impact on the headless auth core/server. Also affects macOS on an unsupported Node version.
+- **Fix shape:** declare and qualify the host/runtime/native-asset requirements, consume the host's supported registry, and verify real rendering on Linux glibc/musl and Windows. Do not promise “any Node” merely because the TypeScript bundle imports successfully.
+
+## Source-build/development finding (not published runtime)
+
+### 15. The successful macOS build does not certify the Linux/Windows build environment
+
+**Locations:** `packages/opencode/package.json:46–49`; `packages/pi/package.json:33–34`; `packages/core/package.json:30`; `package.json:36–37`; `TD:package.json:47–56`, `:83–85`; `TD:dist/options-Bo13C9lJ.mjs:561–579`, `:605–607`; `scripts/dev.ts:32`, `:47–69`, `:72–80`.
+
+- **Linux: build refuses** on this runner, after core TypeScript compilation and OpenCode JS bundling, at `tsdown` declaration generation: `Failed to import module "unrun". Please ensure it is installed.` Bun 1.4.2 and Node 22.22.1 were present. `bun install --frozen-lockfile` subsequently checked **481 installs / 583 packages, no changes**, so there was no dependency repair justifying an identical build rerun. The local prepared macOS build succeeded with Node 24.16.0. `tsdown` auto-selects native loading only when its runtime capability/support test passes; otherwise it selects optional, absent `unrun`. This is **runtime-version/config-loader selection**, not evidence that Linux cannot compile TypeScript.
+- **Windows: code-read build risk** under the same unsupported loader selection. Bun scripts use `rm -rf`, which Bun's script shell supports; it is **not** by itself a Windows Bun-build blocker. Running those strings in ordinary cmd via another package runner would fail without a Unix-compatible shell. The local `dev` workflow also creates a file symlink; Windows may **refuse** that without Developer Mode/symlink privilege. Native npm/Node install of the already published JS does not run these development scripts.
+- **Evidence:** actual Linux build failure and lock-preserving install; code read for Windows. No source fix was made. This is separate from the Node FFI runtime requirement in finding 14.
+- **Severity:** **high** for rebuilding/publishing from the observed runner; **low/none** for consuming an already published package. Medium for Windows contributors using the symlink dev workflow.
+- **Fix shape:** make the config-loader dependency/runtime deterministic (supported pinned Node/Bun invocation or an explicit installed loader), then rerun the full build. Document Bun as the script runner or replace shell-specific commands with portable Node filesystem operations if other runners are supported. Use an explicit Windows-friendly dev-link strategy/privilege requirement.
+
+## Resolved path inventory
+
+`home` below is Node/Bun `os.homedir()`, not a repository file named `os.homedir`. The brief's missing-path warning does not identify a missing source module: the intended API is imported from **`node:os`** in `packages/opencode/src/core/account-paths.ts:2`, `packages/pi/src/paths.ts:1` and the other resolvers cited above.
+
+| Data | Linux resolution | Windows resolution actually in this module | Assessment |
+| --- | --- | --- | --- |
+| OpenCode plugin account config | `OPENCODE_OPENAI_AUTH_FILE`, else `OPENCODE_CONFIG_DIR/openai-auth.json`, else `${XDG_CONFIG_HOME || home/.config}/opencode/openai-auth.json` | Same rules using platform `path.join`; normally `home\\.config\\opencode\\openai-auth.json` | Works with host-aligned layout; no APPDATA branch. |
+| OpenCode account state | Explicit `OPENCODE_OPENAI_AUTH_STATE_FILE`, else sibling `openai-auth-state.json` for standard config basename, else `${configPath}.state.json` | Same, with a case-insensitive alias guard | `packages/core/src/paths.ts:29–32`; guard can refuse a colliding override. |
+| OpenCode 1 host `auth.json` | `${XDG_DATA_HOME || home/.local/share}/opencode/auth.json` | Same XDG/home data contract, **not an assumed APPDATA path** | `packages/opencode/src/core/host-slot.ts:189–195`. OpenCode 1 writes via `client.auth.set`; OpenCode 2's migration adapter reads/replaces this OpenCode 1 file. Tests pin this contract; no Windows host execution. |
+| OpenCode 2 own login | Host database/API, not an auth.json path owned by this plugin | Host database/API | `packages/opencode/src/v2/host-slot.ts:3–10`; do not move the wrong store. |
+| TUI preferences | Explicit `OPENCODE_TUI_PREFERENCES_FILE`, else `OPENCODE_CONFIG_DIR`, else XDG/home config, `tui-preferences.jsonc` | Same | Optional tolerant read; failures fall back to defaults. |
+| Sidebar state | Override `OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE`, else `${XDG_STATE_HOME || home/.local/state}/cortexkit/openai-auth/sidebar-state.json` | Same | Old `tmpdir()/opencode-openai-auth/sidebar-state.json` copied once with `COPYFILE_EXCL`, failure ignored. |
+| RPC port files | Override RPC directory anchored to project, else `${XDG_STATE_HOME || home/.local/state}/cortexkit/openai-auth/rpc/openai-auth-<16-hex-project-hash>/port-<pid>.json` | Same | Relative overrides use project directory, not arbitrary process cwd; override disables secureDir remediation and managed sweep. |
+| Process heartbeat/fence | State home as above, `cortexkit/openai-auth/processes/<pid>.json`; fence also reads the managed RPC root | Same | No recurring process timestamp refresh: this is a process-presence/version record written at startup. Liveness comes from PID, not age. |
+| Model cost catalog | Explicit `OPENCODE_OPENAI_AUTH_MODELS_CACHE`, then `OPENCODE_MODELS_PATH`, then `${XDG_CACHE_HOME || home/.cache}/opencode/models.json` | Same explicit overrides, then XDG cache, then **LOCALAPPDATA**, then home `.cache` | Already Windows-aware (`packages/opencode/src/model-costs.ts:125–137`); missing cache may fetch models.dev or return no prices, not crash. |
+| Pi account config/state | `PI_AGENT_DIR` or `home/.pi/agent`; per-file `PI_OPENAI_AUTH_FILE` / `PI_OPENAI_AUTH_STATE_FILE` overrides | Same under the Windows home/profile | Matches Pi's dot-directory convention; not automatically an APPDATA store. Pi's login is taken from the host registry, not read from its auth file here (`packages/pi/src/index.ts:167–173`). |
+| Vault host enrollment/roster | `dirname(accountStatePath)/openai-auth-vault/{opencode,pi}-enrollment.json`, corresponding `*-enrollment-state.json`, and `*-roster.json` | Same path selection; Windows permission policy then fails as in finding 2 | Host enrollments are separate. Changing state path changes where its vault files live. |
+| Claustrum connection file | Explicit function/path, `SUBC_CONNECTION_FILE`, `CLAUSTRUM_SUBC_CONNECTION`, else discovery: XDG_RUNTIME_DIR, **HOME** `.local/share/cortexkit/run/subc-connection.json`, `tmpdir()/subc-<uid>.connection.json`, unambiguous temp glob | Same explicit/runtime/HOME tiers; temp token uses sanitized USER/USERNAME/HOME/USERPROFILE when getuid is absent | No APPDATA discovery tier. Numeric UID is not blindly used on Windows; unique-temp discovery already exists. See finding 6. |
+| Log and request dumps | Log override or fixed `tmpdir()/opencode-openai-auth.log`; dump override/settings or fixed `tmpdir()/opencode-openai-auth-dumps` | OS TEMP equivalents, same fixed basenames | Multi-user/shared-temp and ACL concerns, finding 8. Dumps default disabled. |
+
+`os.homedir()` handles Linux passwd/HOME and Windows USERPROFILE conventions through the runtime; `tmpdir()` handles its OS env/default rules. Neither means “macOS only.” However, the **scope/isolation** of those roots is not guaranteed, and late env changes need not change Bun's cached home (the test floor explicitly notes that at `packages/opencode/src/tests/setup-env.ts:76`). Explicit overrides are literal paths—there is no generic shell-style `~` expansion here.
+
+## Platform features and equivalents / checked non-findings
+
+| Feature relied upon | Linux equivalent and behavior | Windows equivalent and behavior | Audit conclusion |
+| --- | --- | --- | --- |
+| POSIX private modes, UID/GID | Unix file modes, effective UID/GID, optional ACLs | User SID/NTFS DACL, file attributes; getuid/geteuid/getgid/getegid unavailable | Needs real Windows security implementation, findings 1–3. Optional identity calls do not themselves crash. |
+| Same-directory atomic rename | rename replaces directory entry; open readers retain old inode | MoveFileEx/replace semantics through libuv; incompatible handle sharing can prevent replacement | Not universally unsupported; missing recovery, finding 4. |
+| Exclusive create / lease | `O_CREAT|O_EXCL`; owner JSON, expiry, eviction directory | `CREATE_NEW`/exclusive create through Node/Bun; NTFS directory operations | Portable primitive; qualify Windows failure/recovery paths, finding 5. No `link`/flock dependency in the active lease. |
+| Loopback HTTP RPC | `node:http` listen on ephemeral port at 127.0.0.1; raw `node:net` client | Winsock loopback TCP, same APIs | Real Linux RPC tests passed. No Unix socket/named-pipe requirement here. Local security software is an environment dependency. |
+| PID liveness | `process.kill(pid, 0)`, ESRCH dead / EPERM still alive | Node/libuv Windows process query for signal **0**; not a delivered termination signal | **No unconditional Windows PID-probe failure found.** Shared RPC validates positive safe PID/name/body correspondence (`CA:dist/rpc/port-file.js:9–21`, `:47–58`). Other errors count dead; unqualified Bun/permission errors need real Windows tests. |
+| Version fence | Live process record plus semantic version comparison | Same, using Windows PID query | Not macOS-specific. Unreadable state fails closed; missing publication weakens visibility; dead PID files ignored; PID reuse can falsely fence on either OS because `startedAt` is not compared to OS process creation time. Findings 4/13 cover publication/cleanup. |
+| Process “heartbeat” | Startup JSON and dispose removal | Same | Not a Unix heartbeat signal. Timers/`unref()` for polls/leases work on both Node/Bun platforms; filesystem writes are the weak point. |
+| Raw WS framing | Node net/tls or Bun.connect | Same TCP/TLS APIs on Windows | CRLF upgrade protocol, byte frames, masking and Bun partial-write queue are not OS newline conversion. Proxy/trust concerns in 9/10. |
+| OAuth callback | Fixed loopback TCP port and registered localhost URI | Winsock bind, hostname resolution and possible excluded ports | Actual Linux IPv4-only listener confirmed; finding 12. No privileged port requirement (1455 > 1024). |
+| Browser opener | `xdg-open` instead of macOS `open` | `cmd /c start`, empty title argument | Both implementations have branches already; not an unconditional macOS command invocation. Finding 11 identifies actual gaps. |
+| Vault transport | Subc client uses TCP endpoints from its connection file | Same TCP protocol, not Unix-domain sockets | `SC:src/socket.ts:115–130`; a Windows named-pipe shim is not called for by this implementation. Permission/discovery are the problem, not TCP. |
+| Terminal raw mode / cancellation | POSIX TTY/raw-mode, ANSI, Ctrl-C bytes, SIGINT/SIGTERM | Node/Bun console raw mode, VT sequences, Ctrl-C console/input semantics | A non-TTY or failed raw-mode operation refuses/cancels selection; no silent claim of interactive availability. Signals are not portable teardown, finding 13. |
+| Native TUI library | `libopentui.so`, glibc/musl x64/arm64 variants | `opentui.dll`, x64/arm64 variants | Both exist; runtime FFI/asset qualification required, finding 14. macOS uses `libopentui.dylib`. |
+| Preferences watch | inotify via `fs.watch`, plus 1-second metadata poll | ReadDirectoryChangesW via `fs.watch`, same fallback poll | Native watch failure closes watcher but poll continues (`CA:dist/tui-prefs/watcher.js:106–134`). Degraded latency, not a permanent Windows no-op. |
+| JSON/text line endings | LF writer; JSON accepts LF and CRLF whitespace | Same UTF-8 file bytes; Node/Bun do not apply C stdio text-mode translation | No CRLF-breaking JSON or protocol path found. SSE parsers split `/\r?\n/` (`packages/opencode/src/ws.ts:785`, `packages/opencode/src/core/cachekeep.ts:268`); WS/RPC explicitly use HTTP CRLF. Unix passwd/group parsers are strict; CRLF in those files can fail proof, not a Windows credentials format. |
+| Case sensitivity | Usually case-sensitive; exceptions include casefold/CIFS mounts | Usually case-insensitive; per-directory case-sensitive NTFS exists | Not safe to equate OS with volume case policy, finding 7. Source import/default filenames showed no case-only mismatch needing a shim. |
+| Home/temp/path APIs | `node:os`, `node:path`, XDG env | Same APIs with profile/TEMP/drive separators | See path inventory; no literal POSIX slash concatenation was found in the active host filesystem resolvers. URL paths intentionally use `/`. |
+| Shell-outs | Only active runtime opener calls `xdg-open`; no ps/sysctl/which dependency found in module runtime | Runtime opener calls cmd; no ps/sysctl/which fallback needed | Source dev/build/benchmark scripts do spawn tools, separately scoped in finding 15. Host/provider internals outside this repository are not certified by this search. |
+
+## Linux execution record and limits
+
+All commands below ran **in this task worktree** on the Linux runner using `runon: 'linux'`, not in the parent's checkout. No source/test mutation was made.
+
+| Command / probe | Version and result | What it establishes / does not establish |
+| --- | --- | --- |
+| `bun --version && node --version && uname -s` | Bun 1.4.2; Node v22.22.1; Linux | Remote runner really available. |
+| In `packages/opencode`: `bun test ./src/tests/rpc-server.test.ts ./src/tests/rpc-dir.test.ts ./src/tests/version-fence.test.ts ./src/tests/browser-opener.test.ts ./src/tests/account-paths.test.ts ./src/tests/opencode1-host-slot.test.ts ./src/tests/raw-ws.test.ts ./src/tests/proxy-env.test.ts ./src/tests/vault.test.ts` | Bun 1.4.2; **101 passed, 0 failed; 280 expectations; 9 files** | Real Linux filesystem/loopback/disposal/enrollment behavior, plus mocked/synthetic platform/network cases. Not Windows execution, browser launch, enterprise proxy, real provider OAuth or production vault. |
+| In `packages/core`: `bun test ./src/tests/oauth.test.ts ./src/tests/refresh-file-lock.test.ts` | Bun 1.4.2; **50 passed, 0 failed; 241 expectations; 2 files** | Real callback server and exclusive-create stale-lock contention. Provider token replies mocked. |
+| In `packages/pi`: `bun test ./src/tests/vault.test.ts ./src/tests/paths.test.ts ./src/tests/index.test.ts` | Bun 1.4.2; **14 passed, 0 failed; 47 expectations; 2 files** | Pi enrollment/routing and registration. There is no `paths.test.ts` at this base; the reported two files are vault and index. Pi path resolver was read, not falsely counted as a third executed test file. |
+| In `packages/core`: `node --input-type=module` inline filesystem/loopback probe | Node v22.22.1; **6 checks passed** | Actual CA atomic file mode 0600; replacement with an old reader open; lease acquired; competing lease denied; current PID signal-0 query succeeds; Node native WS preserves the supplied fixture Authorization header during a real loopback upgrade. Temp fixtures removed in finally. |
+| Root `bun --eval` importing `packages/core/src/oauth.ts`, connecting to both 127.0.0.1 and ::1 at 1455 | Bun 1.4.2; **2 checks passed**; IPv4 connected; IPv6 ECONNREFUSED | Confirms advertised localhost redirect vs actual IPv4-only listener. Does not assert that all browsers fail IPv4 fallback. |
+| Root `node --input-type=module` importing OT and calling `createCliRenderer` | Node v22.22.1; **1 check passed**, expected renderer refusal captured | Reached native FFI backend: `Failed to initialize OpenTUI render library: OpenTUI native FFI is not available for this runtime yet`. This is not a successful TUI rendering test. |
+| Root `bun run build` | Bun 1.4.2; range check **24 deps** and local-deps check **4 manifests** passed; core tsc and JS bundle (**266 modules**) ran; **failed** at tsdown 0.23.0: absent `unrun` | Observed source-build blocker, not a published runtime test. |
+| Root `bun install --frozen-lockfile` after that build | Bun 1.4.2; **481 installs / 583 packages checked, no changes** | Frozen install did not add the optional missing loader. No manifest/lockfile alteration was made, and an identical failing build was not rerun. |
+
+**Disproved exploratory assumptions:** two initial Node WS probes expected the object-shaped options to throw or omit headers; both assertions failed. The actual loopback upgrade proved the fixture Authorization header is preserved on Node 22.22.1. Accordingly, this report does **not** claim native Node WS authentication is broken. An initial OT import-only probe also did not fail; only invoking renderer creation reached the unsupported FFI backend. These negative investigative results are recorded to prevent turning plausible API concerns into invented platform bugs.
+
+No full test suite, full typecheck, real host UI session, Windows execution, real TLS/proxy integration, forced-termination durability or casefold-mounted-filesystem test was performed. The report-only change needs no TypeScript implementation gate; the focused executions above support the census rather than claim total platform certification. The prepared local `bun install --frozen-lockfile` and `bun run build` succeeded before the task; only the runtime versions, not a new local build pass, were independently recorded here.
+
+## What blocks each installation first
+
+### Linux
+
+1. **Published package in a supported Bun/Node host, normal local filesystem and direct network:** **no unconditional Linux-only blocker found**. The Linux tests passed **165 tests** across core, OpenCode and Pi, with the narrower evidence limits above.
+2. **Building from this checkout on the provided Linux runner:** the first observed hard stop is **OpenCode declaration generation (`tsdown` → missing `unrun`)**, after core compilation/JS bundling. Make the config loader/runtime deterministic before claiming a Linux source-build pass.
+3. **Headless/SSH published install:** default browser OAuth is the first likely obstacle; use the exposed device flow. A non-TTY interactive menu can refuse independently of OS. With a required proxy, raw WS is the next network blocker; with a vault and unsuitable/NSS group-writable ancestors, enrollment can be the first vault blocker. A Node 22 TUI host also reaches the native FFI floor before it can render.
+
+### Windows
+
+1. **Vault-backed installation:** **Claustrum enrollment's mode/ancestor checks are the first hard functional blocker**, even if the daemon's connection file is found and TCP works. Implement the Windows SID/DACL secret-file policy in both shared layers; do not bypass the security invariant.
+2. **Local-pool-only published install:** **no demonstrated unconditional loader blocker**. The earliest likely visible setup failure is `cmd /c start` handling of the multi-parameter OAuth URL; manual URL/device authorization can avoid it. Secure credential/RPC storage still needs an explicit ACL contract, and atomic replacement/lease recovery need real Windows sharing tests before the fleet's support claim is defensible.
+3. **Unsupported Node TUI or source/dev workflow:** FFI runtime/asset qualification, config-loader determinism and symlink privilege can stop those paths before authentication. These must not be confused with a claim that Windows cannot run the TypeScript auth core.
