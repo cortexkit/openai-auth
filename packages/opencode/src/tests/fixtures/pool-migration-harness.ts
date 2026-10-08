@@ -450,6 +450,7 @@ export interface ChildRun {
   outcome?: Json
   output: string
   stderr: string
+  locks: LockTiming[]
 }
 
 export interface ChildObserver {
@@ -457,6 +458,7 @@ export interface ChildObserver {
   step(name: string): void
   locks(timings: LockTiming[]): void
   registerCleanup?(stop: () => void): void
+  beforeDeadLockExpiry?(child: ChildRun): void
 }
 
 /** Runs one migration or adoption in a separate process (see the child). */
@@ -521,25 +523,50 @@ export function runChild(
     child.on('error', reject)
     // Exit can precede the last pipe data. Close guarantees the child's error
     // stack and final migration step are collected before assertions run.
-    child.on('close', (code) => {
-      reached?.()
-      exited?.()
-      closed?.()
-      const lines = out.split('\n')
-      const steps = lines
-        .filter((line) => line.startsWith('step:'))
-        .map((line) => line.slice('step:'.length))
-      const outcomeLine = lines.find((line) => line.startsWith('outcome:'))
-      resolve({
-        pid: child.pid,
-        code,
-        steps,
-        output: out,
-        stderr,
-        ...(outcomeLine
-          ? { outcome: JSON.parse(outcomeLine.slice('outcome:'.length)) }
-          : {}),
-      })
+    child.on('close', async (code) => {
+      try {
+        reached?.()
+        exited?.()
+        closed?.()
+        const lines = out.split('\n')
+        const steps = lines
+          .filter((line) => line.startsWith('step:'))
+          .map((line) => line.slice('step:'.length))
+        const outcomeLine = lines.find((line) => line.startsWith('outcome:'))
+        const lockLine = lines
+          .filter((line) => line.startsWith('lock-clock:'))
+          .at(-1)
+        const result: ChildRun = {
+          pid: child.pid,
+          code,
+          steps,
+          output: out,
+          stderr,
+          locks: lockLine
+            ? JSON.parse(lockLine.slice('lock-clock:'.length))
+            : [],
+          ...(outcomeLine
+            ? { outcome: JSON.parse(outcomeLine.slice('outcome:'.length)) }
+            : {}),
+        }
+        if (
+          code === CRASH_EXIT_CODE &&
+          (task.exitAtIndex !== undefined || task.exitAtName !== undefined)
+        ) {
+          observer?.beforeDeadLockExpiry?.(result)
+          const expired = observer?.start('expire confirmed-dead child locks')
+          const { expireDeadChildLocks } = await import(
+            './pool-migration-lock-clock.ts'
+          )
+          // Only this child writes an isolated crash fixture. Close confirms it
+          // cannot renew again; matching owner IDs protect any successor lease.
+          expireDeadChildLocks(result, result.locks)
+          expired?.()
+        }
+        resolve(result)
+      } catch (error) {
+        reject(error)
+      }
     })
   })
 }

@@ -15,14 +15,17 @@ import {
 } from './pool-migration-harness.ts'
 
 const task = JSON.parse(process.argv[2] ?? '{}') as ChildTask
-const locks = task.traceLocks
-  ? (await import('./pool-migration-lock-clock.ts')).observeMigrationLocks()
-  : undefined
+const locks =
+  task.traceLocks ||
+  task.exitAtIndex !== undefined ||
+  task.exitAtName !== undefined
+    ? (await import('./pool-migration-lock-clock.ts')).observeMigrationLocks()
+    : undefined
 const sendLocks = () => {
   if (locks) console.log(`lock-clock:${JSON.stringify(locks.snapshot())}`)
 }
 // These records stay in the parent's captured pipe unless it reports a failure.
-const lockDeadline = locks ? setInterval(sendLocks, 5_000) : undefined
+const lockDeadline = task.traceLocks ? setInterval(sendLocks, 5_000) : undefined
 let index = 0
 const reach = (name: string) => {
   const hit =

@@ -4,7 +4,7 @@
 // slot write), and the survivor checks what an older build and a newer build
 // can still do before re-running the migration to completion.
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { mkdirSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
@@ -157,6 +157,7 @@ describe('a crash at every step of the migration', () => {
       steps: [],
       output: '',
       stderr: '',
+      locks: [],
     }
     const timings: LockTiming[] = [
       {
@@ -228,6 +229,42 @@ describe('a crash at every step of the migration', () => {
     ])
   })
 
+  it('a crash at step 1 expires its dead lease and a fresh renewal marker', async () => {
+    await seedLegacyInstall(h)
+    let deadPath = ''
+    const child = await runChild(
+      { dir: h.dir, mode: 'migrate', exitAtIndex: 1 },
+      {
+        start: () => () => {},
+        step: () => {},
+        locks: () => {},
+        beforeDeadLockExpiry: (exited) => {
+          const held = exited.locks.find(
+            (entry) => entry.name === 'pool-migration',
+          )
+          expect(held?.ownerId).toBeDefined()
+          if (!held) throw new Error('crash child did not report its held lock')
+          deadPath = held.path
+          expect(readLease(deadPath)?.ownerId).toBe(held.ownerId)
+          // Put the confirmed-dead child's marker in the fresh state a crash
+          // during renewal can leave, without relying on timer scheduling.
+          mkdirSync(`${deadPath}.evicting`, { recursive: true })
+          writeFileSync(
+            `${deadPath}.evicting/owner.json`,
+            JSON.stringify({ ownerId: 'dead-renewal' }),
+          )
+          const fresh = new Date()
+          utimesSync(`${deadPath}.evicting`, fresh, fresh)
+          expect(readEvictionMarker(deadPath)?.remainingMs).toBeGreaterThan(0)
+        },
+      },
+    )
+    expect(child.code, child.output).toBe(CRASH_EXIT_CODE)
+    expect(child.steps.at(-1)).toBe('store:initialize:after-config-write')
+    expect(readLease(deadPath)?.expiresAt).toBe(0)
+    expect(statSync(`${deadPath}.evicting`).mtimeMs).toBe(0)
+  }, 30_000)
+
   for (const [index, step] of recorded.entries()) {
     it(`crash at step ${index} (${step}): both builds keep every account and a re-run completes`, async () => {
       const traced = index === 16
@@ -285,29 +322,29 @@ describe('a crash at every step of the migration', () => {
                 registerCleanup: (stop) => {
                   stopChild = stop
                 },
+                beforeDeadLockExpiry: (child) => {
+                  // Capture residual leases before the harness expires them.
+                  for (const entry of child.locks) {
+                    const lease = readLease(entry.path)
+                    if (lease && lease.ownerId === entry.ownerId)
+                      deadLeases.push({
+                        path: entry.path,
+                        ownerId: lease.ownerId,
+                        remainingMs: lease.expiresAt - Date.now(),
+                      })
+                  }
+                  for (const path of new Set(
+                    child.locks.map((entry) => entry.path),
+                  )) {
+                    const marker = readEvictionMarker(path)
+                    if (marker) deadMarkers.push({ path, ...marker })
+                  }
+                },
               }
             : undefined,
         )
         expect(child.code, child.output).toBe(CRASH_EXIT_CODE)
         expect(child.steps.at(-1)).toBe(step)
-        // Only a confirmed exit identifies these remaining leases as dead.
-        for (const entry of childLocks) {
-          const lease = readLease(entry.path)
-          if (lease && lease.ownerId === entry.ownerId)
-            deadLeases.push({
-              path: entry.path,
-              ownerId: lease.ownerId,
-              remainingMs: lease.expiresAt - Date.now(),
-            })
-        }
-        for (const path of new Set(childLocks.map((entry) => entry.path))) {
-          const marker = readEvictionMarker(path)
-          if (marker) deadMarkers.push({ path, ...marker })
-        }
-        if (traced)
-          clock.phase('expire confirmed-dead child locks', () =>
-            expireDeadChildLocks(child, childLocks),
-          )
 
         // An older build still loads every fallback with its credential.
         const legacy = await clock.phase('older build load', () =>
