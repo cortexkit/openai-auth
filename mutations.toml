@@ -8,6 +8,80 @@
 # must fail), and restores the exact bytes. A row earns its place by guarding
 # a silent, costly failure: a credential lost or leaked, a reset credit spent
 # twice, output replayed, a crash that loses an account, a wire contract.
+
+# Send-time eligibility and vault admission on the migrated request paths.
+
+[[control]]
+id = "pool-send-rechecks-current-eligibility"
+guards = "a row disabled or identity-contradicted after selection cannot supply a bearer on either OpenCode host"
+file = "packages/opencode/src/core/pool-account-source.ts"
+old = "      !current?.enabled ||\n      !current.candidate ||"
+new = "      !current ||"
+test_file = "packages/opencode/src/tests/request-vault-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/request-vault-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^send-time\\spool\\seligibility\\sOpenCode\\s1\\spasses\\sover\\sa\\sfallback\\sdisabled\\swhile\\smain\\swas\\ssending$", "^send-time\\spool\\seligibility\\sOpenCode\\s2\\srefuses\\sheaders\\sfor\\sa\\snewly\\sdisabled\\schosen\\srow$", "^send-time\\spool\\seligibility\\sOpenCode\\s2\\srefuses\\sheaders\\safter\\sa\\srefresh\\scontradicts\\sthe\\schosen\\sidentity$"]
+
+[[control]]
+id = "opencode1-vault-ws-limit-mark"
+guards = "a vault account exhausted mid-stream is not chosen on the next request"
+file = "packages/opencode/src/index.ts"
+old = "                  vaultMarks.set("
+new = "                  new Map<string, number>().set("
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s1\\svault\\sstream\\sadmission\\sa\\svault\\sWebSocket\\slimit\\ssignal\\ssends\\sthe\\snext\\srequest\\sto\\sa\\shealthy\\saccount$"]
+
+[[control]]
+id = "opencode1-vault-ws-quota-receipt"
+guards = "vault quota frames reach the receipt-fenced roster and a floor crossing changes the next admission"
+file = "packages/opencode/src/index.ts"
+old = "                  void vault.recordSnapshot(served.id, s, true, served.receipt)"
+new = "                  void Promise.resolve()"
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s1\\svault\\sstream\\sadmission\\sa\\svault\\sWebSocket\\squota\\ssignal\\ssends\\sthe\\snext\\srequest\\sto\\sa\\shealthy\\saccount$"]
+
+[[control]]
+id = "opencode1-vault-minimum-remaining"
+guards = "OpenCode 1 applies quota.minimumRemaining to vault accounts as to fallback pool rows"
+file = "packages/opencode/src/core/pool-request.ts"
+old = "        quotaSnapshotPassesPolicy(\n          windowsFromQuotaMap(route.quota),\n          ctx.storage,\n          ctx.now(),\n        ),"
+new = "        true,"
+test_file = "packages/opencode/src/tests/request-vault-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/request-vault-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^vault\\squota\\sfloor\\sOpenCode\\s1\\sapplies\\sminimumRemaining\\sto\\svault\\sroutes$"]
+
+[[control]]
+id = "opencode2-vault-minimum-remaining"
+guards = "OpenCode 2 applies quota.minimumRemaining to vault accounts as to fallback pool rows"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "        quotaSnapshotPassesPolicy(\n          windowsFromQuotaMap(route.quota),\n          storage,\n          at,\n        ),"
+new = "        true,"
+test_file = "packages/opencode/src/tests/request-vault-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/request-vault-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^vault\\squota\\sfloor\\sOpenCode\\s2\\sapplies\\sminimumRemaining\\sto\\svault\\sroutes$"]
+
+[[control]]
+id = "opencode1-local-credential-refusal-body"
+guards = "local credential refusals retain status 401 and distinct fixed terminal explanations instead of an empty provider-shaped rejection"
+file = "packages/opencode/src/index.ts"
+old = "                  LOCAL_CREDENTIAL_REFUSALS[\n                    cause === 'vault-refused'\n                      ? cause\n                      : missingTombstoneMain\n                        ? 'missing-main'\n                        : (cause ?? 'unusable')\n                  ],"
+new = "                  null,"
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^migrated\\scredential\\srefusal\\smessages\\san\\sunusable\\spool\\scredential\\sreturns\\sa\\sfixed\\sexplanatory\\slocal\\s401$", "^migrated\\scredential\\srefusal\\smessages\\sa\\svault\\srefusal\\sreturns\\sa\\sdistinct\\sfixed\\sexplanatory\\slocal\\s401$", "^migrated\\scredential\\srefusal\\smessages\\sno\\seligible\\saccounts\\sreturns\\sits\\sown\\sfixed\\sexplanatory\\slocal\\s401$", "^migrated\\scredential\\srefusal\\smessages\\sa\\scustody\\stombstone\\swithout\\smain\\sreturns\\sa\\sdistinct\\sexplanatory\\slocal\\s401$"]
 #
 # Command rows run from the repository root, without a shell:
 #   bun test --cwd <package> ./<test file> -t <expect_red>

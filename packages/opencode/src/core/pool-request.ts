@@ -117,6 +117,26 @@ export interface PoolVaultRoutes {
   ): Promise<Response | undefined>
   /** Asks for a quota reading of a vault account admission refused for want of one. */
   requestReading(id: string): void
+  /** Live WebSocket rate-limit marks for vault accounts. */
+  rateLimitMarks?(): ReadonlyMap<string, number>
+}
+
+export type NoCredentialCause =
+  | 'no-accounts'
+  | 'unusable'
+  | 'vault-refused'
+  | 'missing-main'
+
+// Fixed text: the host also decides retries by matching the error message.
+export const LOCAL_CREDENTIAL_REFUSALS: Record<NoCredentialCause, string> = {
+  'missing-main':
+    'Request refused locally: this setup has no main login in its account store. Sign in with opencode auth login.',
+  'no-accounts':
+    'Request refused locally: no eligible account is configured. Sign in with opencode auth login.',
+  unusable:
+    'Request refused locally: no usable account credential. Sign in with opencode auth login.',
+  'vault-refused':
+    'Request refused locally: the credential vault did not authorize an account. Check the vault and its host enrollment.',
 }
 
 export interface PoolRequestContext {
@@ -132,7 +152,11 @@ export interface PoolRequestContext {
   replayable: boolean
   now: () => number
   /** Sends the request with one account's token; rejects on a transport failure or abort. */
-  send(target: PoolTarget, token: string): Promise<Response>
+  send(
+    target: PoolTarget,
+    token: string,
+    attempt?: QuotaReceipt,
+  ): Promise<Response>
   /**
    * Records the quota a response carried for the account that served it.
    * `attempt` is the vault's receipt for a vault account: the reading is kept
@@ -147,7 +171,11 @@ export interface PoolRequestContext {
   /** The session pin ledger: decides (and, when asked, records) a session's pin. */
   placePin(input: PoolPinPlacement): { accountId: string } | undefined
   /** A provider-shaped refusal for a request no account may serve. */
-  blocked(block: PoolBlock, quotas: PoolBlockQuotas): Response
+  blocked(
+    block: PoolBlock,
+    quotas: PoolBlockQuotas,
+    cause?: NoCredentialCause,
+  ): Response
   /** Reset credits an account holds, for sticky placement's tie-break. */
   resetCredits(id: string): number | undefined
   /** Whether this send failure is the caller aborting the request. */
@@ -178,7 +206,7 @@ export function routableRows(
   vaultIdentities: ReadonlySet<string> = new Set(),
 ): PoolRow[] {
   return rows.filter((row) => {
-    if (!row.candidate || row.type !== 'oauth') return false
+    if (!row.enabled || !row.candidate || row.type !== 'oauth') return false
     if (row.credential?.type !== 'oauth') return false
     if (isTombstoned(row.credential)) return false
     // The vault owns this ChatGPT account; its vault route serves it.
@@ -213,14 +241,22 @@ function currentTargets(ctx: PoolRequestContext): PoolTarget[] {
         row,
       }),
     ),
-    ...(ctx.vault?.routes() ?? []).map(
-      (route): PoolTarget => ({
-        id: route.id,
-        kind: route.kind,
-        ...(route.identity !== undefined ? { identity: route.identity } : {}),
-        ...(route.quota !== undefined ? { quota: route.quota } : {}),
-      }),
-    ),
+    ...(ctx.vault?.routes() ?? [])
+      .filter((route) =>
+        quotaSnapshotPassesPolicy(
+          windowsFromQuotaMap(route.quota),
+          ctx.storage,
+          ctx.now(),
+        ),
+      )
+      .map(
+        (route): PoolTarget => ({
+          id: route.id,
+          kind: route.kind,
+          ...(route.identity !== undefined ? { identity: route.identity } : {}),
+          ...(route.quota !== undefined ? { quota: route.quota } : {}),
+        }),
+      ),
   ]
 }
 
@@ -256,10 +292,14 @@ function routingInput(
   const vaultIds = new Set(
     targets.filter((target) => !target.row).map((target) => target.id),
   )
+  const rateLimitMarks = ctx.source.rateLimitMarks(rows)
+  for (const [id, until] of ctx.vault?.rateLimitMarks?.() ?? []) {
+    if (vaultIds.has(id) && until > now) rateLimitMarks.set(id, until)
+  }
   return {
     rows: routingRows,
     now,
-    rateLimitMarks: ctx.source.rateLimitMarks(rows),
+    rateLimitMarks,
     refreshBackoff: ctx.source.refreshBackoffFor(rows),
     killswitch,
     requestPull: (id) =>
@@ -299,7 +339,7 @@ async function sendTo(
     return response
   }
   return ctx.vault?.send(target.id, async (token, attempt) => {
-    const response = await ctx.send(target, token)
+    const response = await ctx.send(target, token, attempt)
     ctx.recordQuota(response, target, token, attempt)
     return response
   })
@@ -341,7 +381,11 @@ async function serveOrdered(
       reason: plan.block.reason,
     })
     return {
-      response: ctx.blocked(plan.block, blockQuotas(rows)),
+      response: ctx.blocked(
+        plan.block,
+        blockQuotas(rows),
+        rows.length === 0 ? 'no-accounts' : 'unusable',
+      ),
       servedId: FORMER_MAIN_ID,
     }
   }
@@ -363,6 +407,7 @@ async function serveOrdered(
   // so the next account in the order is tried as if this one were not there.
   const unsent = new Set<string>()
   let last: PoolRequestResult | undefined
+  let vaultRefused = false
   for (;;) {
     const id = nextOrderedAttempt(
       plan.order.filter((candidate) => !unsent.has(candidate)),
@@ -388,6 +433,7 @@ async function serveOrdered(
       return last
     }
     if (!response) {
+      if (!row.row) vaultRefused = true
       unsent.add(row.id)
       continue
     }
@@ -399,7 +445,11 @@ async function serveOrdered(
   }
   if (last) return last
   return {
-    response: ctx.blocked({ reason: 'no-credential' }, blockQuotas(rows)),
+    response: ctx.blocked(
+      { reason: 'no-credential' },
+      blockQuotas(rows),
+      vaultRefused ? 'vault-refused' : 'unusable',
+    ),
     servedId: FORMER_MAIN_ID,
   }
 }

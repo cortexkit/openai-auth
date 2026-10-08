@@ -7,7 +7,7 @@
 // declined-account interlock, one owner per ChatGPT account, the host-slot
 // guard, and what an install still holds from the removed handle-mode
 // custody.
-import { afterEach, beforeEach, describe, expect } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn } from 'bun:test'
 import {
   chmodSync,
   mkdirSync,
@@ -134,12 +134,16 @@ function enroll(host: 'opencode' | 'pi' = 'opencode') {
 }
 
 /** The plugin on a migrated install, its vault pointed at the mock daemon. */
-async function plugin(slot: Record<string, unknown> = { ...PLACEHOLDER }) {
+async function plugin(
+  slot: Record<string, unknown> = { ...PLACEHOLDER },
+  options: Parameters<typeof loadPlugin>[0] = {},
+) {
   const running = daemon
   if (!running) throw new Error('start the daemon first')
   hooks = await clock.phase('plugin and auth loader', () =>
     loadPlugin(
       {
+        ...options,
         vault: {
           stateDir,
           connectionFile: () => running.connectionFile,
@@ -158,6 +162,320 @@ async function plugin(slot: Record<string, unknown> = { ...PLACEHOLDER }) {
   return { hooks, vault }
 }
 
+describe('OpenCode 1 vault stream admission', () => {
+  for (const signal of ['limit', 'quota'] as const) {
+    test(`a vault WebSocket ${signal} signal sends the next request to a healthy account`, async () => {
+      await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
+      enroll()
+      seedPool(files, [{ id: 'main', quota: quotaMap(10) }], {
+        routing: { mode: 'fallback-first' },
+        killswitch: {
+          enabled: true,
+          schema: 'floors-v1',
+          defaults: { primary: 20 },
+        },
+      })
+      installWire()
+      const sent: string[] = []
+      const server = Bun.serve<{ bearer: string }>({
+        port: 0,
+        fetch(req, server) {
+          if (
+            server.upgrade(req, {
+              data: { bearer: req.headers.get('authorization') ?? '' },
+            })
+          )
+            return
+          return new Response('websocket required', { status: 400 })
+        },
+        websocket: {
+          message(ws, message) {
+            const body = JSON.parse(String(message))
+            if (body.generate === false) {
+              ws.send(
+                JSON.stringify({
+                  type: 'response.completed',
+                  response: { id: 'prewarm' },
+                }),
+              )
+              return
+            }
+            sent.push(ws.data.bearer)
+            if (ws.data.bearer === `Bearer ${VAULT_ACCESS}`) {
+              ws.send(
+                JSON.stringify(
+                  signal === 'limit'
+                    ? {
+                        type: 'response.failed',
+                        response: {
+                          id: 'limited',
+                          failed: { rate_limit_reached_type: 'primary' },
+                        },
+                      }
+                    : {
+                        type: 'codex.rate_limits',
+                        rate_limits: {
+                          primary: {
+                            used_percent: 90,
+                            window_minutes: 300,
+                            reset_at: Math.floor((Date.now() + HOUR) / 1000),
+                          },
+                          secondary: null,
+                        },
+                      },
+                ),
+              )
+              if (signal === 'limit') return
+            }
+            ws.send(
+              JSON.stringify({
+                type: 'response.completed',
+                response: { id: 'completed' },
+              }),
+            )
+          },
+        },
+      })
+      try {
+        const { vault } = await plugin(
+          { ...PLACEHOLDER },
+          {
+            experimentalWebSockets: true,
+            codexApiEndpoint: new URL('/responses', server.url).href,
+          },
+        )
+        const writes: Promise<void>[] = []
+        const record = vault.recordSnapshot.bind(vault)
+        const spy = spyOn(vault, 'recordSnapshot').mockImplementation(
+          (...args) => {
+            const write = record(...args)
+            writes.push(write)
+            return write
+          },
+        )
+        const loaded = (await hooks!.auth!.loader!(
+          (async () => ({ ...PLACEHOLDER })) as never,
+          {} as never,
+        )) as { fetch: typeof fetch }
+        const first = await request(loaded.fetch, 'vault-stream', true)
+        if (signal === 'limit') await expect(first.text()).rejects.toThrow()
+        else {
+          await first.text()
+          // Wait for the receipt-bound roster write, not for a quota poll.
+          await Promise.all(writes)
+        }
+        const second = await request(loaded.fetch, 'vault-stream', true)
+        await second.text().catch(() => {})
+        expect(sent).toEqual([`Bearer ${VAULT_ACCESS}`, 'Bearer main-token'])
+        spy.mockRestore()
+      } finally {
+        await hooks?.dispose?.()
+        hooks = undefined
+        await server.stop(true)
+      }
+    })
+  }
+
+  test('a vault WebSocket reading keeps its served receipt across a roster replacement', async () => {
+    const running = await startDaemon({
+      'oauth:openai:vault': vaultLogin('chatgpt-vault'),
+    })
+    enroll()
+    seedPool(files, [{ id: 'main', quota: quotaMap(10) }], {
+      routing: { mode: 'fallback-first' },
+    })
+    installWire()
+    const stream = Promise.withResolvers<{ send(message: string): unknown }>()
+    const server = Bun.serve({
+      port: 0,
+      fetch(req, server) {
+        if (server.upgrade(req)) return
+        return new Response('websocket required', { status: 400 })
+      },
+      websocket: {
+        message(ws, message) {
+          if (JSON.parse(String(message)).generate === false) {
+            ws.send(
+              JSON.stringify({
+                type: 'response.completed',
+                response: { id: 'prewarm' },
+              }),
+            )
+            return
+          }
+          ws.send(
+            JSON.stringify({
+              type: 'response.created',
+              response: { id: 'old-login' },
+            }),
+          )
+          stream.resolve(ws)
+        },
+      },
+    })
+    try {
+      const { vault } = await plugin(
+        { ...PLACEHOLDER },
+        {
+          experimentalWebSockets: true,
+          codexApiEndpoint: new URL('/responses', server.url).href,
+        },
+      )
+      const writes: Promise<void>[] = []
+      const record = vault.recordSnapshot.bind(vault)
+      const spy = spyOn(vault, 'recordSnapshot').mockImplementation(
+        (...args) => {
+          const write = record(...args)
+          writes.push(write)
+          return write
+        },
+      )
+      const response = await request(
+        await fetchOverride(),
+        'receipt-fence',
+        true,
+      )
+      const socket = await stream.promise
+      running.credentials['oauth:openai:vault'] = vaultLogin(
+        'chatgpt-replacement',
+        { record_version: 2 },
+      )
+      await vault.refresh()
+      await vault.pollStale(0)
+      spy.mockClear()
+      writes.length = 0
+      socket.send(
+        JSON.stringify({
+          type: 'codex.rate_limits',
+          rate_limits: {
+            primary: { used_percent: 90, window_minutes: 300 },
+            secondary: null,
+          },
+        }),
+      )
+      socket.send(
+        JSON.stringify({
+          type: 'response.completed',
+          response: { id: 'old-login' },
+        }),
+      )
+      await response.text()
+      await Promise.all(writes)
+      expect(spy).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(Object),
+        true,
+        expect.objectContaining({ accountIdentity: 'chatgpt-vault' }),
+      )
+      expect(vault.routes()[0]?.identity).toBe('chatgpt-replacement')
+      expect(vault.routes()[0]?.quota?.limits).toContainEqual(
+        expect.objectContaining({ usedPercent: 10 }),
+      )
+      spy.mockRestore()
+    } finally {
+      await hooks?.dispose?.()
+      hooks = undefined
+      await server.stop(true)
+    }
+  })
+})
+
+describe('migrated credential refusal messages', () => {
+  function terminal(message: string) {
+    // OpenCode 1 v1.18.30 session/retry.ts: a message match can override the status.
+    const patterns = [
+      /429|500|502|503|504|524/i,
+      /rate increased too quickly|rate limit|rate-limit|rate_limit|too many requests/i,
+      /overloaded|service unavailable|service_unavailable|service-unavailable|internal error|internal_error|internal server error|server error|server_error|server-error|provider returned error|provider_returned_error|provider-returned-error/i,
+      /terminated|fetch failed|failed to fetch|network[-_\s]error|upstream connect|connection error|connection refused|connection lost|socket connection was closed|socket hang up|reset before headers|getaddrinfo|enotfound|eai_again|econnrefused|econnreset|etimedout/i,
+      /^timeout$|\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\b/i,
+      /try your request again|retry your request|resource exhausted|resource_exhausted/i,
+      /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
+    ]
+    expect(patterns.some((pattern) => pattern.test(message))).toBe(false)
+  }
+
+  test('an unusable pool credential returns a fixed explanatory local 401', async () => {
+    await startDaemon()
+    seedPool(files, [
+      { id: 'main', expires: Date.now() - HOUR, quota: quotaMap(10) },
+    ])
+    // Use an explicit refresh refusal without changing any request timeout.
+    const network = installWire()
+    const send = globalThis.fetch
+    globalThis.fetch = (async (url, init) =>
+      String(url).includes('/oauth/token')
+        ? new Response('{}', { status: 400 })
+        : send(url, init)) as typeof fetch
+    await plugin()
+    const response = await request(await fetchOverride())
+    expect(response.status).toBe(401)
+    const message = await response.text()
+    expect(message).toBe(
+      'Request refused locally: no usable account credential. Sign in with opencode auth login.',
+    )
+    terminal(message)
+    expect(network.sends).toEqual([])
+  })
+
+  test('a vault refusal returns a distinct fixed explanatory local 401', async () => {
+    await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
+    enroll()
+    seedPool(files, [{ id: 'main', enabled: false, quota: quotaMap(10) }])
+    const wire = installWire()
+    await plugin()
+    const send = await fetchOverride()
+    await daemon!.stop()
+    daemon = undefined
+    const response = await request(send)
+    expect(response.status).toBe(401)
+    const message = await response.text()
+    expect(message).toBe(
+      'Request refused locally: the credential vault did not authorize an account. Check the vault and its host enrollment.',
+    )
+    terminal(message)
+    expect(wire.sends).toEqual([])
+  })
+
+  test('no eligible accounts returns its own fixed explanatory local 401', async () => {
+    await startDaemon()
+    seedPool(files, [{ id: 'main', enabled: false, quota: quotaMap(10) }])
+    const wire = installWire()
+    await plugin()
+    const response = await request(await fetchOverride())
+    expect(response.status).toBe(401)
+    const message = await response.text()
+    expect(message).toBe(
+      'Request refused locally: no eligible account is configured. Sign in with opencode auth login.',
+    )
+    terminal(message)
+    expect(wire.sends).toEqual([])
+  })
+
+  test('a custody tombstone without main returns a distinct explanatory local 401', async () => {
+    await startDaemon()
+    seedPool(files, [])
+    const wire = installWire()
+    const tombstone = {
+      ...PLACEHOLDER,
+      refresh: 'claustrum-tombstone:v1:openai',
+    }
+    await plugin(tombstone)
+    const loaded = (await hooks!.auth!.loader!(
+      (async () => ({ ...tombstone })) as never,
+      {} as never,
+    )) as { fetch: typeof fetch }
+    const response = await request(loaded.fetch)
+    expect(response.status).toBe(401)
+    const message = await response.text()
+    expect(message).toBe(
+      'Request refused locally: this setup has no main login in its account store. Sign in with opencode auth login.',
+    )
+    terminal(message)
+    expect(wire.sends).toEqual([])
+  })
+})
+
 async function fetchOverride(): Promise<typeof globalThis.fetch> {
   const loader = hooks?.auth?.loader
   if (!loader) throw new Error('no loader')
@@ -172,6 +490,7 @@ async function fetchOverride(): Promise<typeof globalThis.fetch> {
 function request(
   fetchImpl: typeof globalThis.fetch,
   sessionId?: string,
+  stream?: boolean,
 ): Promise<Response> {
   return scope.wrap(fetchImpl)('https://api.openai.com/v1/responses', {
     method: 'POST',
@@ -181,6 +500,7 @@ function request(
     },
     body: JSON.stringify({
       model: 'gpt-5.5',
+      ...(stream ? { stream: true } : {}),
       input: [{ role: 'user', content: 'hi' }],
     }),
   })

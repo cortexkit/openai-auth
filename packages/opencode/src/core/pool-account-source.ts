@@ -748,9 +748,21 @@ export class PoolAccountSource {
     )
   }
 
-  /** The bearer to send for a row, or undefined when it holds no unexpired token. */
+  /** The current row's bearer; an old selection never authorizes a disabled or replaced login. */
   usableToken(row: PoolRow, now = this.now()): string | undefined {
-    const token = oauthAccess(row)
+    const current = this.snapshot.rows.find(
+      (candidate) => candidate.id === row.id,
+    )
+    if (
+      !current?.enabled ||
+      !current.candidate ||
+      current.type !== 'oauth' ||
+      current.identity !== row.identity ||
+      current.credentialEpoch !== row.credentialEpoch ||
+      this.vaultOwned(current)
+    )
+      return undefined
+    const token = oauthAccess(current)
     if (!token?.access.trim()) return undefined
     if (typeof token.expires !== 'number' || token.expires <= now)
       return undefined

@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   mkdirSync,
   readFileSync,
@@ -9,6 +9,7 @@ import {
 } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
+import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import { parseApplyRequest } from '@cortexkit/common-auth/commands'
 import {
   adoptRpcServer,
@@ -130,8 +131,9 @@ import {
   poolTransferPendingInConfigFile,
   reclaimExpiredPoolTransfer,
 } from './core/pool-migration'
-import { observationFromSnapshot } from './core/pool-quota'
+import { observationFromSnapshot, windowsFromQuotaMap } from './core/pool-quota'
 import {
+  LOCAL_CREDENTIAL_REFUSALS,
   type PoolBlockQuotas,
   type PoolPinPlacement,
   servePoolRequest,
@@ -2789,9 +2791,12 @@ export async function CodexAuthPlugin(
           explicitResetAt?: number,
         ): number {
           const quota =
-            accountKey === 'main'
+            windowsFromQuotaMap(
+              vault.routes().find((route) => route.id === accountKey)?.quota,
+            ) ??
+            (accountKey === 'main'
               ? quotaManager.peekMainForPolicy()?.quota
-              : quotaManager.peekFallbackForPolicy(accountKey)?.quota
+              : quotaManager.peekFallbackForPolicy(accountKey)?.quota)
           return resolveMidStreamRateLimitResetAt(
             quota,
             window,
@@ -2801,6 +2806,17 @@ export async function CodexAuthPlugin(
           )
         }
 
+        // A stream outlives its fetch promise. Give each vault send a private
+        // attribution key so simultaneous sends (even on the same route) keep
+        // their own receipt until the body finishes or is cancelled. The WS
+        // pool strips this internal header before the wire; socket reuse still
+        // keys on the ChatGPT identity, not on this key.
+        const vaultStreams = new Map<
+          string,
+          { id: string; receipt: QuotaReceipt }
+        >()
+        const vaultMarks = new Map<string, number>()
+
         const websocketFetch = options.experimentalWebSockets
           ? OpenAIWebSocketPool.createWebSocketFetch({
               httpFetch: fetch,
@@ -2809,6 +2825,13 @@ export async function CodexAuthPlugin(
               // pool and threaded here so the frame is attributed to the
               // connection's own account, not the shared mutable globals.
               onQuota: (s, accessToken, accountId, servedChatgptAccountId) => {
+                const served = accountId
+                  ? vaultStreams.get(accountId)
+                  : undefined
+                if (served) {
+                  void vault.recordSnapshot(served.id, s, true, served.receipt)
+                  return
+                }
                 const isMainBucket = !accountId || accountId === 'main'
                 pushQuota(
                   s,
@@ -2832,14 +2855,22 @@ export async function CodexAuthPlugin(
                     { pid: process.pid, window },
                   )
                 }
-                const accountKey = accountId ?? 'main'
+                const served = accountId
+                  ? vaultStreams.get(accountId)
+                  : undefined
+                const accountKey = served?.id ?? accountId ?? 'main'
                 const resetAt = midStreamRateLimitResetAt(
                   accountKey,
                   window,
                   explicitResetAt,
                 )
                 quotaManager.markRateLimited(accountKey, resetAt)
-                poolSource.markRateLimited(accountKey, resetAt)
+                if (served) {
+                  vaultMarks.set(
+                    accountKey,
+                    Math.max(vaultMarks.get(accountKey) ?? 0, resetAt),
+                  )
+                } else poolSource.markRateLimited(accountKey, resetAt)
                 logQ.debug('mid-stream rate limit mark', {
                   pid: process.pid,
                   accountId: accountKey,
@@ -3188,6 +3219,7 @@ export async function CodexAuthPlugin(
           accessToken: string,
           accountId?: string,
           keepwarmAccountKey: string = 'main',
+          vaultReceipt?: QuotaReceipt,
         ): Promise<Response> {
           // Nothing may leave here without a credential. An empty token is
           // always a local defect, but on the wire it becomes `Bearer ` and
@@ -3302,7 +3334,54 @@ export async function CodexAuthPlugin(
                 },
               })
             }
-            return websocketFetch(url, requestInit)
+            if (!vaultReceipt) return websocketFetch(url, requestInit)
+            const key = `vault-stream:${randomUUID()}`
+            vaultStreams.set(key, {
+              id: keepwarmAccountKey,
+              receipt: vaultReceipt,
+            })
+            const scopedHeaders = new Headers(requestInit?.headers)
+            scopedHeaders.set(OpenAIWebSocketPool.QUOTA_ACCOUNT_HEADER, key)
+            const release = () => vaultStreams.delete(key)
+            try {
+              const response = await websocketFetch(url, {
+                ...requestInit,
+                headers: scopedHeaders,
+              })
+              if (!response.body) {
+                release()
+                return response
+              }
+              const reader = response.body.getReader()
+              return new Response(
+                new ReadableStream<Uint8Array>({
+                  async pull(controller) {
+                    try {
+                      const chunk = await reader.read()
+                      if (chunk.done) {
+                        release()
+                        controller.close()
+                      } else controller.enqueue(chunk.value)
+                    } catch (error) {
+                      release()
+                      controller.error(error)
+                    }
+                  },
+                  cancel(reason) {
+                    release()
+                    return reader.cancel(reason)
+                  },
+                }),
+                {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers,
+                },
+              )
+            } catch (error) {
+              release()
+              throw error
+            }
           }
           const finalInit =
             OpenAIWebSocketPool.withoutInternalHeaders(requestInit)
@@ -4357,11 +4436,14 @@ export async function CodexAuthPlugin(
           const mainRow = poolSource
             .peek()
             .rows.find((row) => row.id === 'main')
+          const slot = !mainRow ? await getAuth() : undefined
+          const missingTombstoneMain =
+            !mainRow && slot?.type === 'oauth' && isTombstoned(slot)
           const loginRequired =
             !mainRow &&
             (await poolPlaceholderWithoutMain(
               getAccountPaths(getConfigPath()),
-              await getAuth(),
+              slot,
             ))
           if (generation === mainIdentityGeneration) {
             currentMainIdentity = mainRow?.identity
@@ -4380,6 +4462,12 @@ export async function CodexAuthPlugin(
                         ...(init?.signal ? { signal: init.signal } : {}),
                       }),
                     requestReading: (id) => vault.requestReading(id),
+                    rateLimitMarks: () => {
+                      for (const [id, until] of vaultMarks) {
+                        if (until <= Date.now()) vaultMarks.delete(id)
+                      }
+                      return vaultMarks
+                    },
                   },
                 }
               : {}),
@@ -4389,13 +4477,14 @@ export async function CodexAuthPlugin(
             body: typeof init?.body === 'string' ? init.body : undefined,
             replayable: isReplayableRequest(requestInput, init),
             now: Date.now,
-            send: (target, token) =>
+            send: (target, token, attempt) =>
               sendWithAccessToken(
                 requestInput,
                 init,
                 token,
                 target.identity,
                 target.id,
+                attempt,
               ),
             recordQuota: (served, target, token, attempt) => {
               try {
@@ -4428,12 +4517,25 @@ export async function CodexAuthPlugin(
             },
             placePin: (placement) =>
               placeStickyPin({ ...placement, sidebarSnapshot }),
-            blocked: (block, quotas) => {
+            blocked: (block, quotas, cause) => {
               if (block.reason === 'no-credential') {
                 // Routing has already tried every row that could serve, so
                 // a missing main must not prevent a healthy fallback send.
-                if (loginRequired) throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)
-                return new Response(null, { status: 401 })
+                if (loginRequired && cause !== 'vault-refused')
+                  throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)
+                return new Response(
+                  LOCAL_CREDENTIAL_REFUSALS[
+                    cause === 'vault-refused'
+                      ? cause
+                      : missingTombstoneMain
+                        ? 'missing-main'
+                        : (cause ?? 'unusable')
+                  ],
+                  {
+                    status: 401,
+                    headers: { 'content-type': 'text/plain; charset=utf-8' },
+                  },
+                )
               }
               return killswitchBlockedResponse(
                 reqStorage,

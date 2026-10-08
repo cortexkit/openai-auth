@@ -61,6 +61,7 @@ import {
   normalizeWsFrame,
   type OpenAiVault,
   parseJwtClaims,
+  quotaSnapshotPassesPolicy,
   type RoutingMode,
   resolveMidStreamRateLimitResetAt,
 } from '@cortexkit/openai-auth-core/internal'
@@ -388,7 +389,13 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       vault?.identities() ?? new Set<string>(),
     )
     const routes = (vault?.routes() ?? []).filter(
-      (route) => route.kind === 'oauth',
+      (route) =>
+        route.kind === 'oauth' &&
+        quotaSnapshotPassesPolicy(
+          windowsFromQuotaMap(route.quota),
+          storage,
+          at,
+        ),
     )
     return [
       ...rows.map(
