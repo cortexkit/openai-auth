@@ -508,8 +508,9 @@ export function runChild(
       if (task.exitAtIndex === stepIndex || task.exitAtName === name) {
         reached?.()
         exited = observer.start('child exit after crash step')
-        // Pipe delivery can follow exit under load; don't leave a phantom
-        // unfinished exit phase when the OS already reported the exit.
+        // Under load the child's exit can be reported before its last stdout
+        // line arrives. If it already exited, close the exit phase now so the
+        // phase clock does not show it as still running.
         if (didExit) exited()
       }
       stepIndex++
@@ -558,8 +559,11 @@ export function runChild(
           const { expireDeadChildLocks } = await import(
             './pool-migration-lock-clock.ts'
           )
-          // Only this child writes an isolated crash fixture. Close confirms it
-          // cannot renew again; matching owner IDs protect any successor lease.
+          // The child crashed on purpose and its pipes have closed, so it can
+          // no longer renew the locks it held. Expire them now instead of
+          // waiting out their leases and five-second renewal markers. Only
+          // locks still recorded under this child's owner id are touched, so
+          // a lock someone else has taken since is left alone.
           expireDeadChildLocks(result, result.locks)
           expired?.()
         }

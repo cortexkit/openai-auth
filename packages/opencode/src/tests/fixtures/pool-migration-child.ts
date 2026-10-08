@@ -24,7 +24,9 @@ const locks =
 const sendLocks = () => {
   if (locks) console.log(`lock-clock:${JSON.stringify(locks.snapshot())}`)
 }
-// These records stay in the parent's captured pipe unless it reports a failure.
+// With tracing on, print the lock timings every five seconds as well. The
+// parent captures this output and shows it only when the test fails or
+// overruns, so passing runs stay quiet.
 const lockDeadline = task.traceLocks ? setInterval(sendLocks, 5_000) : undefined
 let index = 0
 const reach = (name: string) => {

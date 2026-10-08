@@ -3,9 +3,11 @@ import { readFileSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import type * as fileLocks from '@cortexkit/common-auth/fs'
 import { type ChildRun, CRASH_EXIT_CODE } from './pool-migration-harness.ts'
 
-// Observe the defining module, not just its barrel: store and legacy readers
-// import the same lock through different entry points. The spy delegates every
-// call unchanged and is restored before another test can use the module.
+// Spy on `acquireRefreshFileLock` in the file that defines it, not on the
+// `@cortexkit/common-auth/fs` re-export: the store and the legacy readers reach
+// the function through different import paths, and only the defining module is
+// shared by all of them. The spy passes every call through unchanged and is
+// restored before another test can use the module.
 const lockModule = (await import(
   new URL(
     'refresh-file-lock.js',
@@ -26,8 +28,9 @@ export function readEvictionMarker(path: string): EvictionMarker | undefined {
     } catch {
       // A crash may interrupt the mkdir before its owner file is written.
     }
-    // The file-lock implementation fences renewal and stale-lock eviction
-    // with a marker whose independent lifetime is five seconds.
+    // While renewing or evicting a stale lock, the file-lock code holds an
+    // `.evicting` marker that blocks other contenders for five seconds from
+    // its creation, independently of the lease. Report how much is left.
     return { ownerId, remainingMs: mtimeMs + 5_000 - Date.now() }
   } catch {
     return undefined
