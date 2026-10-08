@@ -875,3 +875,17 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-reques
 test_count_pattern = "Ran {count} test"
 expect_red = ["^the\\skillswitch\\son\\sa\\smigrated\\sinstall\\smain-first:\\severy\\saccount\\sexhausted\\sand\\sbelow\\sits\\sthreshold\\sis\\snever\\ssent\\son\\sthe\\slast\\spath$"]
 expect_message = "/Expected: 429\\s+Received: 200/"
+
+# A project's disposal releases its lease, not another project's consumer.
+[[control]]
+id = "opencode-vault-close-only-on-last-release"
+guards = "disposing one project leaves another project's vault request serving, and the last release closes its connection"
+file = "packages/opencode/src/core/shared-vault.ts"
+old = "      if (owned.holders.size !== 0) return"
+new = "      // NON-VACUITY BREAK: close on the first release, ignoring other holders."
+test_file = "packages/opencode/src/tests/shared-vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/shared-vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^one\\shost\\svault\\sper\\sprocess\\sdisposing\\sone\\sholder\\sleaves\\sthe\\sother\\sserving\\suntil\\sthe\\slast\\srelease$"]
+expect_message = 'Received: "Bearer main-token"'
