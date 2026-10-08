@@ -17,6 +17,17 @@ export interface CanonicalInput {
 // detached snapshot avoids sorting/copying/stringifying unchanged items, but
 // still checks every value (identity, length and ids alone are not sufficient).
 function sameJson(snapshot: unknown, value: unknown): boolean {
+  if (typeof snapshot === 'function' || typeof value === 'function')
+    return false
+  // A serialization hook can hide function-valued keys from its detached
+  // snapshot. Keep objects and arrays with their own hook off the fast path.
+  if (
+    value !== null &&
+    typeof value === 'object' &&
+    Object.hasOwn(value, 'toJSON') &&
+    typeof (value as { toJSON?: unknown }).toJSON === 'function'
+  )
+    return false
   if (snapshot === value) return true
   if (Array.isArray(snapshot)) {
     return (
@@ -39,7 +50,9 @@ function sameJson(snapshot: unknown, value: unknown): boolean {
   return (
     keys.length === Object.keys(right).length &&
     keys.every(
-      (key) => Object.hasOwn(right, key) && sameJson(left[key], right[key]),
+      (key) =>
+        Object.prototype.propertyIsEnumerable.call(right, key) &&
+        sameJson(left[key], right[key]),
     )
   )
 }

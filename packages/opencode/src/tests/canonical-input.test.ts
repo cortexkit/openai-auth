@@ -32,6 +32,33 @@ function legacyPrefix(prefix: unknown[], input: unknown[]) {
 }
 
 describe('canonical input', () => {
+  test('does not match non-enumerable properties in place of enumerable keys', () => {
+    const prior = canonicalInput([{ a: 1 }])
+    const value = Object.defineProperty({ b: 2 }, 'a', { value: 1 })
+    const next = canonicalInput([value], prior)
+    expect(next.texts).toEqual(['{"b":2}'])
+    expect(canonicalPrefixLength(prior, next)).toBeUndefined()
+  })
+
+  test('recomputes items with own toJSON functions', () => {
+    // stableStringify copies enumerable properties, so this non-enumerable
+    // hook does not change its output. It must still disable snapshot reuse:
+    // function-bearing values are outside the parsed-JSON fast path.
+    const value = Object.defineProperty({ a: 1 }, 'toJSON', {
+      value: () => ({ a: 2 }),
+    })
+    const prior = canonicalInput([value])
+    const next = canonicalInput([value], prior)
+    expect(next.texts).toEqual(['{"a":1}'])
+    expect(next.snapshots[0]).not.toBe(prior.snapshots[0])
+    const enumerableHook = { a: 1, toJSON: () => ({ a: 3 }) }
+    const hookedPrior = canonicalInput([enumerableHook])
+    enumerableHook.toJSON = () => ({ a: 4 })
+    expect(canonicalInput([enumerableHook], hookedPrior).texts).toEqual([
+      '{"a":4}',
+    ])
+  })
+
   test('matches the original exact comparison on varied histories', () => {
     const prior = history()
     const cached = canonicalInput(prior)

@@ -261,7 +261,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     }
     pool.set(key, entry)
     const sourceBody = normalizeResponseBody(body)
-    const comparison = requestComparison(entry, sourceBody)
+    let comparison: RequestComparison | undefined
 
     if (entry.fallback) {
       return httpFetch(
@@ -279,6 +279,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     entry.busy = true
     entry.lastUsedAt = Date.now()
     try {
+      comparison = requestComparison(entry, sourceBody)
       const sourceHeaders = OpenAIWebSocket.normalizeHeaders(wsInit?.headers)
 
       // Capture the per-request account identity at send time so that any
@@ -321,19 +322,13 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         init?.signal,
       )
       if (shouldPrewarm(entry, sourceBody, comparison)) {
-        await prewarm(
-          entry,
-          sourceBody,
-          idleTimeout,
-          {
-            signal: init?.signal ?? undefined,
-            sessionID: dumpSessionID,
-            url: options?.url ?? url,
-            headers: wsInit?.headers,
-            onRateLimitReached: requestOnRateLimitReached,
-          },
-          comparison,
-        )
+        await prewarm(entry, sourceBody, idleTimeout, {
+          signal: init?.signal ?? undefined,
+          sessionID: dumpSessionID,
+          url: options?.url ?? url,
+          headers: wsInit?.headers,
+          onRateLimitReached: requestOnRateLimitReached,
+        })
       }
       let resolveFirstEvent: (
         event: boolean | OpenAIWebSocket.WrappedError,
@@ -695,7 +690,6 @@ async function prewarm(
     headers?: HeadersInit
     onRateLimitReached?: (window: string, resetAt?: number) => void
   },
-  comparison: RequestComparison,
 ) {
   if (!entry.socket || !Array.isArray(body.input) || body.input.length === 0)
     return
@@ -731,7 +725,7 @@ async function prewarm(
       // never inherits the prior turn's finalized set.
       updateContinuation(entry, request, event, finalizedCallIds, false, {
         input: canonicalInput([]),
-        signature: comparison.signature,
+        signature: bodySignature(request),
         priorInputs: new Map(),
       })
     },

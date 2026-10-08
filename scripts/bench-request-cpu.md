@@ -53,7 +53,7 @@ and wall means can reach tens of milliseconds under concurrent load.
   significant. Changed/new items use the original `stableStringify`; comparisons
   use the full canonical strings, never a hash. Even an in-place edit cannot
   alter the saved snapshot and silently reuse an obsolete representation.
-- `packages/opencode/src/util/canonical-input.ts:47`: retain canonical item
+- `packages/opencode/src/util/canonical-input.ts:60`: retain canonical item
   strings and snapshots for at most 512 items and 2,097,152 canonical characters
   per history (at most 4 MiB of UTF-16 string data, plus bounded snapshot/node
   overhead). Over-limit requests remain exact but their extra representation is
@@ -64,19 +64,20 @@ and wall means can reach tens of milliseconds under concurrent load.
   instructions are inserted. Rewrites/compaction replace the snapshot; session
   deletion (`index.ts:1760`) removes it with the metadata. It is not persisted:
   the session file still stores only the thread id.
-- `packages/opencode/src/ws-pool.ts:1037`: compute the current full input and
+- `packages/opencode/src/ws-pool.ts:1031`: compute the current full input and
   tools/settings signature once, then thread that comparison through prewarm,
   continuation, turn selection, completion, and post-attempt HTTP fallback.
   A request-local map also prevents repeat canonicalization of uncached prior
   histories, including the turn state's array copy of the continuation input.
-- `packages/opencode/src/ws-pool.ts:886`: continuation owns its canonical
+- `packages/opencode/src/ws-pool.ts:880`: continuation owns its canonical
   history alongside the prior body; turn state owns its canonical history
   alongside `turnInput`. They normally share the same representation. A prewarm
-  stores an empty input and reuses the already-computed settings signature.
+  stores an empty input and computes the settings signature of its actual
+  ordered request, since ordering can drop source keys such as `constructor`.
   Clearing/replacing continuation drops that reference. The turn cache survives
   reconnects **because the existing turn history does**, preventing false fresh
   turns on full replay. Removing, idle-pruning or closing pool entries drops
-  both histories and caches (`ws-pool.ts:502-529`).
+  both histories and caches (`ws-pool.ts:497-524`).
 - `packages/opencode/src/dump.ts:112`: accept a body-text producer and evaluate
   it only after the per-request enabled check. Both WS call sites pass the exact
   old `JSON.stringify` expression lazily. Enabled dump content and invocation
@@ -106,3 +107,56 @@ not just the dumper's callback API. The cache mutation
 `canonical-input-validates-earlier-edits` removes value validation before reuse.
 Each has a named assertion in `mutations.toml`. Existing transport/integration
 assertions were not changed or renamed.
+
+## Correctness review follow-up
+
+The same benchmark was rerun after restoring four corner-case contracts. The
+following numbers use the identical methodology above, in median ms/request:
+
+| Real function / path | 50 items | 200 items | 400 items |
+| --- | ---: | ---: | ---: |
+| `stableStringify`, one complete history | 0.214 | 0.883 | 2.324 |
+| HTTP `updateHttpTurnMetadata` | 0.032 | 0.160 | 0.344 |
+| **HTTP `prepareCodexRequest` TOTAL** | **0.296** | **1.390** | **2.209** |
+| WS `bodySignature` | 0.026 | 0.030 | 0.030 |
+| WS `requestComparison` | 0.047 | 0.135 | 0.294 |
+| WS `shouldPrewarm` | 0.002 | 0.003 | 0.005 |
+| WS `withContinuation` | 0.003 | 0.004 | 0.006 |
+| WS `applyTurnId` | 0.003 | 0.006 | 0.005 |
+| WS `updateContinuation` | 0.001 | 0.003 | 0.003 |
+| WS disabled main dump | 0.002 | 0.004 | 0.003 |
+| **WS TOTAL** | **0.188** | **0.640** | **1.300** |
+
+No performance regression is apparent relative to the first optimized run;
+wall measurements continue to vary with load. Prewarm now computes its own
+small signature, but that is a separate request and not a steady-state tool-loop
+cost. The necessary exact comparison remains much cheaper than serializing the
+history repeatedly.
+
+The additional assertions and their deliberate reverse controls are:
+
+1. `createWebSocketFetch > prewarm continuation uses the actual ordered request signature`
+   checks that a source body with its own `constructor: 0` does not chain to
+   the differently ordered prewarm body, while an ordinary request still chains.
+   `ws-prewarm-signature-describes-sent-body` substitutes the source signature.
+2. `request dumps > Responses Lite removes image details without mutating host items`
+   checks copy-on-write deletion and sharing of unaffected paths.
+   `request dumps > Responses Lite image histories keep HTTP turns below and above the cache cap`
+   checks the emitted body and stable turn ids at 2 and 513 host items.
+   `responses-lite-image-details-copy-on-write` deletes from the original image.
+   This intentionally corrects the old in-place mutation: the host history is
+   now the turn baseline at all sizes, as the existing HTTP baseline comment
+   intended, instead of rotating Lite turns only when retention was exceeded.
+3. `createWebSocketFetch > canonicalization failures return an errored response instead of rejecting fetch`
+   injects a throwing real canonicalizer binding and verifies that fetch resolves
+   with the normal SSE response whose reader surfaces `ResponseStreamError`.
+   `ws-canonicalization-inside-error-boundary` moves preparation outside `try`.
+4. `canonical input > does not match non-enumerable properties in place of enumerable keys`
+   covers a cached `{a:1}` against an enumerable `b` and non-enumerable `a`.
+   `canonical input > recomputes items with own toJSON functions`
+   covers both non-enumerable and changing enumerable serialization hooks.
+   `canonical-input-requires-enumerable-keys` and
+   `canonical-input-recomputes-serialization-hooks` independently undo those
+   guards, so each condition has its own named red assertion.
+
+The existing assertions and the original three mutation controls are unchanged.

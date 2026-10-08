@@ -19,9 +19,109 @@ import {
   resetSettingsForTest,
 } from '../config'
 import { dumpCodexRequest, resetDumpStateForTest } from '../dump'
-import { CodexAuthPlugin } from '../index'
+import { CodexAuthPlugin, rewriteResponsesLiteBody } from '../index'
 
 describe('request dumps', () => {
+  test('Responses Lite removes image details without mutating host items', () => {
+    const image = {
+      type: 'input_image',
+      image_url: 'data:image/png;base64,AA==',
+      detail: 'high',
+    }
+    const text = { type: 'input_text', text: 'inspect' }
+    const message = { role: 'user', content: [text, image] }
+    const reasoning = { type: 'reasoning', summary: [] }
+    const input = [message, reasoning]
+    const parsed: Record<string, unknown> = { input }
+    rewriteResponsesLiteBody(parsed)
+    expect(image.detail).toBe('high')
+    expect(input[0]).toBe(message)
+    const sent = parsed.input as Array<Record<string, any>>
+    expect(sent[1]).not.toBe(message)
+    expect(sent[1]!.content[1]).not.toBe(image)
+    expect(sent[1]!.content[1]).not.toHaveProperty('detail')
+    expect(sent[1]!.content[0]).toBe(text)
+    expect(sent[2]).toBe(reasoning)
+  })
+
+  test('Responses Lite image histories keep HTTP turns below and above the cache cap', async () => {
+    await withDumpEnv(async () => {
+      process.env.CORTEXKIT_OPENAI_AUTH_DUMP = '0'
+      resetSettingsForTest()
+      const originalFetch = globalThis.fetch
+      const turns: string[] = []
+      const bodies: Array<Record<string, unknown>> = []
+      globalThis.fetch = Object.assign(
+        async (_url: RequestInfo | URL, init?: RequestInit) => {
+          turns.push(
+            JSON.parse(new Headers(init?.headers).get('x-codex-turn-metadata')!)
+              .turn_id,
+          )
+          bodies.push(JSON.parse(String(init?.body)))
+          return new Response('ok')
+        },
+        { preconnect: () => {} },
+      )
+      try {
+        const hooks = await CodexAuthPlugin(pluginInput(), {
+          experimentalWebSockets: false,
+          responsesLite: true,
+        })
+        const fetch = await pluginFetch(hooks)
+        try {
+          for (const count of [2, 513]) {
+            const input = [
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'input_image',
+                    image_url: 'data:image/png;base64,AA==',
+                    detail: 'high',
+                  },
+                ],
+              },
+              ...Array.from({ length: count - 1 }, (_, i) => ({
+                type: 'function_call_output',
+                call_id: `call_${i}`,
+                output: 'ok',
+              })),
+            ]
+            for (const history of [
+              input,
+              [
+                ...input,
+                {
+                  type: 'function_call_output',
+                  call_id: 'last',
+                  output: 'next',
+                },
+              ],
+            ]) {
+              await fetch('https://api.openai.com/v1/responses', {
+                method: 'POST',
+                headers: { 'x-session-affinity': `lite-images-${count}` },
+                body: JSON.stringify({
+                  ...toolRequestBody(),
+                  model: 'gpt-6-astra',
+                  input: history,
+                }),
+              })
+            }
+            expect(turns.at(-1)).toBe(turns.at(-2))
+          }
+          expect(bodies).toHaveLength(4)
+          for (const sent of bodies)
+            expect(JSON.stringify(sent.input)).not.toContain('"detail"')
+        } finally {
+          await hooks.dispose?.()
+        }
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+  })
+
   test('does not serialize lazy bodies when dumps are disabled', async () => {
     await withDumpEnv(async () => {
       process.env.CORTEXKIT_OPENAI_AUTH_DUMP = '0'

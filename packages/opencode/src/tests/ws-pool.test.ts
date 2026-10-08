@@ -1,9 +1,10 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 import { APICallError } from 'ai'
 import { resetSettingsForTest } from '../config'
 import { DUMP_SESSION_HEADER } from '../dump'
 import { EMPTY_BEARER_MESSAGE } from '../index'
 import { ResponseStreamError } from '../response-stream-error'
+import * as canonicalModule from '../util/canonical-input'
 import {
   connectResponsesWebSocket,
   OVERSIZED_FRAME_MESSAGE,
@@ -152,6 +153,74 @@ describe('orderCodexBody', () => {
 })
 
 describe('createWebSocketFetch', () => {
+  test('prewarm continuation uses the actual ordered request signature', async () => {
+    const sent: Array<Record<string, unknown>> = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send(data) {
+          const frame = JSON.parse(data)
+          sent.push(frame)
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: 'prewarm-or-main' },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const fetch = createWebSocketFetch()
+        try {
+          for (const ownConstructor of [true, false]) {
+            const response = await fetch('https://example.test/responses', {
+              ...streamRequest({
+                input: [{ role: 'user', content: 'hello' }],
+                ...(ownConstructor ? { constructor: 0 } : {}),
+              }),
+              headers: { 'session-id': `prewarm-signature-${ownConstructor}` },
+            })
+            await response.text()
+            expect(sent.at(-2)!.generate).toBe(false)
+            expect(Object.hasOwn(sent.at(-2)!, 'constructor')).toBe(false)
+            if (ownConstructor)
+              expect(sent.at(-1)!.previous_response_id).toBeUndefined()
+            else
+              expect(sent.at(-1)!.previous_response_id).toBe('prewarm-or-main')
+          }
+        } finally {
+          fetch.close()
+        }
+      },
+    )
+  })
+
+  test('canonicalization failures return an errored response instead of rejecting fetch', async () => {
+    const canonicalizer = spyOn(
+      canonicalModule,
+      'canonicalInput',
+    ).mockImplementation(() => {
+      throw new Error('injected canonicalization failure')
+    })
+    const fetch = createWebSocketFetch()
+    try {
+      const response = await fetch(
+        'https://example.test/responses',
+        streamRequest({ input: [{ role: 'user', content: 'hello' }] }),
+      )
+      expect(canonicalizer).toHaveBeenCalledTimes(1)
+      expect(response.status).toBe(200)
+      expect(response.headers.get('content-type')).toBe('text/event-stream')
+      const failure = await response.text().catch((error: unknown) => error)
+      expect(failure).toBeInstanceOf(ResponseStreamError)
+      expect(failure).toMatchObject({
+        message: 'injected canonicalization failure',
+      })
+    } finally {
+      canonicalizer.mockRestore()
+      fetch.close()
+    }
+  })
+
   test('disabled dumps serialize only the wire frames', async () => {
     const originalDump = process.env.CORTEXKIT_OPENAI_AUTH_DUMP
     process.env.CORTEXKIT_OPENAI_AUTH_DUMP = '0'

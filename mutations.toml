@@ -930,3 +930,70 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/canonical-i
 test_count_pattern = "Ran {count} test"
 expect_red = ["^canonical\\sinput\\srejects\\sa\\sstale\\scanonical\\sitem\\safter\\san\\searlier\\sin-place\\sedit$"]
 expect_message = "rewritten earlier message"
+
+# Preserve corner-case transport and canonicalization contracts while reusing
+# serialized histories. Each control undoes one reviewed correctness repair.
+[[control]]
+id = "ws-prewarm-signature-describes-sent-body"
+guards = "prewarm continuation stores the signature of the actual ordered request, not the source body"
+file = "packages/opencode/src/ws-pool.ts"
+old = "signature: bodySignature(request),"
+new = "signature: bodySignature(body), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/ws-pool.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/ws-pool.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^createWebSocketFetch\\sprewarm\\scontinuation\\suses\\sthe\\sactual\\sordered\\srequest\\ssignature$"]
+expect_message = "Received: \"prewarm-or-main\""
+
+[[control]]
+id = "responses-lite-image-details-copy-on-write"
+guards = "removing wire-only image detail preserves the host history used as the HTTP turn baseline"
+file = "packages/opencode/src/index.ts"
+old = "      if (next === value) next = { ...value }\n      delete next[key]"
+new = "      // NON-VACUITY BREAK: delete from the shared host item\n      delete next[key]"
+test_file = "packages/opencode/src/tests/dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^request\\sdumps\\sResponses\\sLite\\sremoves\\simage\\sdetails\\swithout\\smutating\\shost\\sitems$"]
+expect_message = "Received: undefined"
+
+[[control]]
+id = "ws-canonicalization-inside-error-boundary"
+guards = "canonicalization exceptions take the stream failure path rather than rejecting fetch"
+file = "packages/opencode/src/ws-pool.ts"
+old = "    try {\n      comparison = requestComparison(entry, sourceBody)\n      const sourceHeaders"
+new = "    comparison = requestComparison(entry, sourceBody) // NON-VACUITY BREAK\n    try {\n      const sourceHeaders"
+test_file = "packages/opencode/src/tests/ws-pool.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/ws-pool.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^createWebSocketFetch\\scanonicalization\\sfailures\\sreturn\\san\\serrored\\sresponse\\sinstead\\sof\\srejecting\\sfetch$"]
+expect_message = "error: injected canonicalization failure"
+
+[[control]]
+id = "canonical-input-requires-enumerable-keys"
+guards = "a non-enumerable own property cannot stand in for the serialized snapshot's enumerable key"
+file = "packages/opencode/src/util/canonical-input.ts"
+old = "Object.prototype.propertyIsEnumerable.call(right, key)"
+new = "Object.hasOwn(right, key) /* NON-VACUITY BREAK */"
+test_file = "packages/opencode/src/tests/canonical-input.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/canonical-input.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^canonical\\sinput\\sdoes\\snot\\smatch\\snon-enumerable\\sproperties\\sin\\splace\\sof\\senumerable\\skeys$"]
+expect_message = "Received"
+
+[[control]]
+id = "canonical-input-recomputes-serialization-hooks"
+guards = "function-bearing items with their own toJSON never reuse a detached JSON snapshot"
+file = "packages/opencode/src/util/canonical-input.ts"
+old = "Object.hasOwn(value, 'toJSON') &&"
+new = "false && // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/canonical-input.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/canonical-input.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^canonical\\sinput\\srecomputes\\sitems\\swith\\sown\\stoJSON\\sfunctions$"]
+expect_message = "Expected: not"

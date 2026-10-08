@@ -1254,15 +1254,33 @@ export function resolveSidebarSessionId(headers: Headers): string | undefined {
     undefined
   )
 }
-function stripResponsesLiteImageDetails(value: unknown) {
+// The HTTP turn baseline shares host items with the parsed body. Copy only
+// changed paths so removing wire-only image details cannot rewrite that baseline.
+function stripResponsesLiteImageDetails(value: unknown): unknown {
   if (Array.isArray(value)) {
-    for (const item of value) stripResponsesLiteImageDetails(item)
-    return
+    let next = value
+    for (let index = 0; index < value.length; index++) {
+      const nested = stripResponsesLiteImageDetails(value[index])
+      if (nested === value[index]) continue
+      if (next === value) next = value.slice()
+      next[index] = nested
+    }
+    return next
   }
-  if (!isRecord(value)) return
-  if (value.type === 'input_image') delete value.detail
-  for (const nested of Object.values(value))
-    stripResponsesLiteImageDetails(nested)
+  if (!isRecord(value)) return value
+  let next = value
+  for (const key of Object.keys(value)) {
+    if (value.type === 'input_image' && key === 'detail') {
+      if (next === value) next = { ...value }
+      delete next[key]
+      continue
+    }
+    const nested = stripResponsesLiteImageDetails(value[key])
+    if (nested === value[key]) continue
+    if (next === value) next = { ...value }
+    next[key] = nested
+  }
+  return next
 }
 
 // Models where a `configuration_update` item is both accepted and shown to change
@@ -1384,8 +1402,9 @@ export function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
   parsed.reasoning = reasoning
   parsed.parallel_tool_calls = false
 
-  const input = Array.isArray(parsed.input) ? parsed.input : []
-  stripResponsesLiteImageDetails(input)
+  const input = stripResponsesLiteImageDetails(
+    Array.isArray(parsed.input) ? parsed.input : [],
+  ) as unknown[]
   const tools = Array.isArray(parsed.tools)
     ? parsed.tools.filter(
         (tool) => !(isRecord(tool) && tool.type === 'web_search'),
