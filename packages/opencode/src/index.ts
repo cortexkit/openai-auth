@@ -48,7 +48,7 @@ import {
   normalizeQuotaHeaders,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
-  OpenAiVault,
+  type OpenAiVault,
   parseJwtClaims,
   type QuotaEntry,
   QuotaManager,
@@ -142,6 +142,7 @@ import {
   type ProcessHeartbeatHandle,
   startProcessHeartbeat,
 } from './core/process-heartbeat'
+import { acquireOpenCodeVault } from './core/shared-vault'
 import {
   decideStickyBreak,
   type StickyBreakDecision,
@@ -1460,39 +1461,42 @@ export async function CodexAuthPlugin(
   // Background writer for the sidebar updates requests make (routing display,
   // pushed quota, sticky pins); the loader installs one per run.
   let sidebarBookkeeping: SidebarBookkeepingQueue | undefined
-  // This host's connection to the Claustrum vault (`vault.ts` in the core
-  // package). Its accounts are routed only on a migrated install, beside the
-  // pool rows; it is closed on dispose.
-  const vault = new OpenAiVault({
-    host: 'opencode',
-    stateDir:
-      options.vault?.stateDir ??
-      vaultStateDir(getAccountPaths(getConfigPath()).statePath),
-    ...(input.directory ? { projectRoot: input.directory } : {}),
-    reservedRouteIds: () =>
-      poolAccountSource?.peek().rows.map((row) => row.id) ?? [],
-    ...(options.vault?.connectionFile
-      ? { connectionFile: options.vault.connectionFile }
-      : {}),
-    ...(options.vault?.connectScoped
-      ? { connectScoped: options.vault.connectScoped }
-      : {}),
-    ...(options.vault?.connectEnrollment
-      ? { connectEnrollment: options.vault.connectEnrollment }
-      : {}),
-    ...(options.vault?.pollIntervalMs !== undefined
-      ? { pollIntervalMs: options.vault.pollIntervalMs }
-      : {}),
-    fetchImpl: () => fetch,
-  })
-  // Settles once the vault's first roster read has (successfully or not), or
-  // at once when the loader does not start the vault. Until then the vault
-  // reports no accounts, so a local row signing in as a vault account looks
-  // like this host's own: the pool source's first-sight quota polls and the
-  // lifecycle's adoptions wait for it in the background, and a request's
-  // token step waits for it for a bounded time (`PoolAccountSource`).
-  const vaultFirstRoster = Promise.withResolvers<void>()
-  let vaultFirstRosterStarted = false
+  // Each project holds a lease on the host's consumer; only its last
+  // holder closes it. Pool sources all read this process's configured store.
+  const vaultLease = acquireOpenCodeVault(
+    {
+      host: 'opencode',
+      stateDir:
+        options.vault?.stateDir ??
+        vaultStateDir(getAccountPaths(getConfigPath()).statePath),
+      ...(input.directory ? { projectRoot: input.directory } : {}),
+      reservedRouteIds: () =>
+        poolAccountSource?.peek().rows.map((row) => row.id) ?? [],
+      ...(options.vault?.connectionFile
+        ? { connectionFile: options.vault.connectionFile }
+        : {}),
+      ...(options.vault?.connectScoped
+        ? { connectScoped: options.vault.connectScoped }
+        : {}),
+      ...(options.vault?.connectEnrollment
+        ? { connectEnrollment: options.vault.connectEnrollment }
+        : {}),
+      ...(options.vault?.pollIntervalMs !== undefined
+        ? { pollIntervalMs: options.vault.pollIntervalMs }
+        : {}),
+      fetchImpl: () => fetch,
+    },
+    getAccountPaths(getConfigPath()),
+  )
+  const vault = vaultLease.vault
+  // All holders wait for the same first discovery before treating a local
+  // row as host-owned. Setup and the loader never wait for that read.
+  const vaultFirstRoster = vaultLease.firstRoster
+  const vaultNotUsed = Promise.withResolvers<void>()
+  const vaultReadyForAdoption = Promise.race([
+    vaultFirstRoster,
+    vaultNotUsed.promise,
+  ])
   const vaultRosterWaitMs =
     options.vault?.firstRosterWaitMs ?? VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS
   // This instance's entry in the per-process heartbeat directory, written by
@@ -1545,10 +1549,7 @@ export async function CodexAuthPlugin(
           // retryable, so the lifecycle stays free and tries again later.
           adopt: async (deps) => {
             if (
-              !(await settlesWithin(
-                vaultFirstRoster.promise,
-                vaultRosterWaitMs,
-              ))
+              !(await settlesWithin(vaultReadyForAdoption, vaultRosterWaitMs))
             )
               return { status: 'retry', reason: 'vault-roster-pending' }
             const outcome = await (
@@ -1697,11 +1698,11 @@ export async function CodexAuthPlugin(
 
   return {
     async dispose() {
+      vaultLease.release()
       poolLifecycle?.dispose()
       poolAccountSource?.dispose()
       backgroundQuotaRefresh.stop()
       sidebarBookkeeping?.stop()
-      vault.close()
       activeFallbackManager?.stopBackgroundRefresh()
       activeFallbackManager = undefined
       for (const websocketFetch of websocketFetches) websocketFetch.close()
@@ -1811,8 +1812,9 @@ export async function CodexAuthPlugin(
         poolLifecycle?.start()
         const auth = await getAuth()
         if (auth.type !== 'oauth') {
-          // The vault is not started, so there is no roster to wait for.
-          vaultFirstRoster.resolve()
+          // This loader does not use the vault. Let its adoption proceed,
+          // without settling another holder's pending first discovery.
+          vaultNotUsed.resolve()
           return {}
         }
 
@@ -1823,14 +1825,7 @@ export async function CodexAuthPlugin(
         // enrolled, so an enrollment finished in another process (`opencode
         // auth login`) is picked up without a restart. Nothing here waits for
         // its first roster read; `vaultFirstRoster` reports when it settles.
-        if (!vaultFirstRosterStarted) {
-          vaultFirstRosterStarted = true
-          const settled = () => vaultFirstRoster.resolve()
-          vault.refresh().then(settled, settled)
-        }
-        // Joins the roster read `refresh` just began rather than starting a
-        // second one, then re-reads the roster on its own timer.
-        vault.start()
+        vaultLease.start()
         const rpcDir = input.directory
           ? await resolveRpcDir(input.directory)
           : undefined
@@ -2055,7 +2050,7 @@ export async function CodexAuthPlugin(
             return observationFromSnapshot(snapshot, checkedAt, true)
           },
           vaultIdentities: () => vault.identities(),
-          vaultFirstRoster: vaultFirstRoster.promise,
+          vaultFirstRoster,
           vaultFirstRosterBackgroundWaitMs: vaultRosterWaitMs,
           log: createLogger('pool'),
         })
@@ -4265,9 +4260,6 @@ export async function CodexAuthPlugin(
                 await loadAccounts(getAccountPaths(getConfigPath())),
                 () => acquireBackgroundRefreshLock(getConfigPath()),
               )
-              // Vault accounts nobody sent on for a while: their quota lives
-              // in the vault roster, so the pool poll does not see them.
-              await vault.pollStale(4 * 60_000)
               if (polled.length > 0) {
                 await writeMachineSidebarState(quotaManager, lastRequestStorage)
               }

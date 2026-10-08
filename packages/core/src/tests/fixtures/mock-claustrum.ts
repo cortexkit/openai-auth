@@ -89,6 +89,8 @@ export interface MockDaemon {
   proposals: Array<{ name?: string; hash?: string }>
   polls: number
   lists: number
+  /** Live transport connections, for consumer lifecycle assertions. */
+  readonly connections: number
   onReport?: (report: MockReport) => void
   approve(requestId: string, token?: string, generation?: number): void
   deny(requestId: string): void
@@ -130,6 +132,9 @@ export async function startMockDaemon(input: {
     proposals: [],
     polls: 0,
     lists: 0,
+    get connections() {
+      return sockets.size
+    },
     approve(requestId, token = 'ab'.repeat(32), generation = 1) {
       const entry = enrollments.get(requestId)
       if (!entry) throw new Error(`unknown request ${requestId}`)

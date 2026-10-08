@@ -53,7 +53,6 @@ import {
   extractAccountId,
   extractAccountIdFromClaims,
   loadAccounts,
-  OpenAiVault,
   type OpenAiVaultOptions,
   parseJwtClaims,
   vaultStateDir,
@@ -81,6 +80,7 @@ import {
 } from '../core/pool-migration'
 import { observationFromSnapshot } from '../core/pool-quota'
 import { startProcessHeartbeat } from '../core/process-heartbeat'
+import { acquireOpenCodeVault } from '../core/shared-vault'
 import { migrationFenceOpen } from '../core/version-fence'
 import { POOL_MIGRATION_ENABLED } from '../index'
 import { createLogger } from '../logger'
@@ -111,15 +111,6 @@ function identityOfToken(token: string): string | undefined {
 
 /** Longest a shutdown waits for queued quota writes before it lets go. */
 const SETTLE_ON_DISPOSE_MS = 5_000
-
-/**
- * How often the vault accounts are checked for a stale quota reading, and
- * how old a reading may be before a new one is taken; the values OpenCode
- * 1's background refresh uses. A vault account's quota lives in the vault
- * roster, so the pool's own polls do not cover it.
- */
-const VAULT_POLL_INTERVAL_MS = 60_000
-const VAULT_STALE_AFTER_MS = 4 * 60_000
 
 /** Test and embedding seams; every field has a production default. */
 export interface OpenAIAuthV2Options {
@@ -204,27 +195,31 @@ export async function setupOpenAIAuth(
   // pool source's first-sight quota polls and the lifecycle's adoptions wait
   // for it in the background, and a request's token step waits for it for a
   // bounded time (`PoolAccountSource`). Setup itself never waits for it.
-  const vaultFirstRoster = Promise.withResolvers<void>()
   const vaultRosterWaitMs =
     options.vault?.firstRosterWaitMs ?? VAULT_FIRST_ROSTER_BACKGROUND_WAIT_MS
-  const vault = new OpenAiVault({
-    host: 'opencode',
-    stateDir: options.vault?.stateDir ?? vaultStateDir(paths().statePath),
-    reservedRouteIds: () => source.peek().rows.map((row) => row.id),
-    ...(options.vault?.connectionFile
-      ? { connectionFile: options.vault.connectionFile }
-      : {}),
-    ...(options.vault?.connectScoped
-      ? { connectScoped: options.vault.connectScoped }
-      : {}),
-    ...(options.vault?.connectEnrollment
-      ? { connectEnrollment: options.vault.connectEnrollment }
-      : {}),
-    ...(options.vault?.pollIntervalMs !== undefined
-      ? { pollIntervalMs: options.vault.pollIntervalMs }
-      : {}),
-    fetchImpl: () => fetchImpl,
-  })
+  const vaultLease = acquireOpenCodeVault(
+    {
+      host: 'opencode',
+      stateDir: options.vault?.stateDir ?? vaultStateDir(paths().statePath),
+      reservedRouteIds: () => source.peek().rows.map((row) => row.id),
+      ...(options.vault?.connectionFile
+        ? { connectionFile: options.vault.connectionFile }
+        : {}),
+      ...(options.vault?.connectScoped
+        ? { connectScoped: options.vault.connectScoped }
+        : {}),
+      ...(options.vault?.connectEnrollment
+        ? { connectEnrollment: options.vault.connectEnrollment }
+        : {}),
+      ...(options.vault?.pollIntervalMs !== undefined
+        ? { pollIntervalMs: options.vault.pollIntervalMs }
+        : {}),
+      fetchImpl: () => fetchImpl,
+    },
+    paths(),
+  )
+  const vault = vaultLease.vault
+  const vaultFirstRoster = vaultLease.firstRoster
 
   const source = new PoolAccountSource({
     paths,
@@ -260,7 +255,7 @@ export async function setupOpenAIAuth(
     // source neither refreshes that row's token nor polls quota with it
     // (request routing already skips it). OpenCode 1 wires the same set.
     vaultIdentities: () => vault.identities(),
-    vaultFirstRoster: vaultFirstRoster.promise,
+    vaultFirstRoster,
     vaultFirstRosterBackgroundWaitMs: vaultRosterWaitMs,
     log: createLogger('pool'),
   })
@@ -311,9 +306,7 @@ export async function setupOpenAIAuth(
         // so the lifecycle (and a login waiting for it to go idle) is never
         // held, and the next scheduled run tries again.
         adopt: async (deps) => {
-          if (
-            !(await settlesWithin(vaultFirstRoster.promise, vaultRosterWaitMs))
-          )
+          if (!(await settlesWithin(vaultFirstRoster, vaultRosterWaitMs)))
             return { status: 'retry', reason: 'vault-roster-pending' }
           const outcome = await adoptHostSlotLogin(deps)
           void source.load()
@@ -323,19 +316,7 @@ export async function setupOpenAIAuth(
     : undefined
   lifecycle?.start()
 
-  const pollVault = () => {
-    if (vault.enrolled()) void vault.pollStale(VAULT_STALE_AFTER_MS)
-  }
-  // `refresh` never rejects. Started before `start`, whose first poll then
-  // joins this roster read instead of running a second one.
-  const firstRoster = vault.refresh()
-  vault.start()
-  void firstRoster.then(() => {
-    vaultFirstRoster.resolve()
-    pollVault()
-  })
-  const vaultPoll = setInterval(pollVault, VAULT_POLL_INTERVAL_MS)
-  vaultPoll.unref?.()
+  vaultLease.start()
 
   const pins = new SessionPins()
   const openai = createOpenAIAdapter({
@@ -471,7 +452,6 @@ export async function setupOpenAIAuth(
 
   return async () => {
     abort.abort()
-    clearInterval(vaultPoll)
     lifecycle?.dispose()
     await Promise.allSettled([
       installation.dispose(),
@@ -489,8 +469,8 @@ export async function setupOpenAIAuth(
         setTimeout(resolve, SETTLE_ON_DISPOSE_MS).unref?.(),
       ),
     ])
+    vaultLease.release()
     source.dispose()
-    vault.close()
     await heartbeat?.release()
   }
 }
