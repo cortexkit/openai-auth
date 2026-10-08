@@ -4,7 +4,9 @@
 // slot write), and the survivor checks what an older build and a newer build
 // can still do before re-running the migration to completion.
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { mkdirSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore } from '@cortexkit/common-auth/store'
 import {
@@ -23,6 +25,7 @@ import {
 } from '../core/pool-migration.ts'
 import { migrationFenceOpen, rpcStateRoot } from '../core/version-fence.ts'
 import { writePortFile } from '../rpc/port-file.ts'
+import { createFailurePhaseClock } from './failure-phase-clock.ts'
 import {
   CRASH_EXIT_CODE,
   FAR,
@@ -38,12 +41,24 @@ import {
   seedLegacyInstall,
   T0,
 } from './fixtures/pool-migration-harness.ts'
+import {
+  expireDeadChildLocks,
+  type LockTiming,
+  observeMigrationLocks,
+  readEvictionMarker,
+  readLease,
+} from './fixtures/pool-migration-lock-clock.ts'
 
 let h: Harness
+let cleanupClock: (() => void) | undefined
 beforeEach(() => {
   h = harness()
 })
-afterEach(() => h.cleanup())
+afterEach(() => {
+  cleanupClock?.()
+  cleanupClock = undefined
+  h.cleanup()
+})
 
 /** Runs until the outcome is no longer a retry (a crashed child's leases expire). */
 async function settle(
@@ -121,6 +136,68 @@ async function fenceWithPreTolerantBuildRunning(
 }
 
 describe('a crash at every step of the migration', () => {
+  it('expires only confirmed-dead child locks and their renewal markers', async () => {
+    const dead = `${h.paths.configPath}.pool-migration.lock`
+    const replaced = `${h.paths.configPath}.main-refresh.lock`
+    for (const [path, ownerId] of [
+      [dead, 'dead-holder'],
+      [replaced, 'successor'],
+    ] as const) {
+      writeFileSync(path, JSON.stringify({ ownerId, expiresAt: FAR }))
+      mkdirSync(`${path}.evicting`)
+      writeFileSync(
+        `${path}.evicting/owner.json`,
+        JSON.stringify({ ownerId: `${ownerId}-marker` }),
+      )
+    }
+    const replacementMtime = statSync(`${replaced}.evicting`).mtimeMs
+    const child = {
+      pid: undefined,
+      code: CRASH_EXIT_CODE,
+      steps: [],
+      output: '',
+      stderr: '',
+    }
+    const timings: LockTiming[] = [
+      {
+        path: dead,
+        name: 'pool-migration',
+        ownerId: 'dead-holder',
+        offsetMs: 0,
+        attempts: 1,
+        contended: false,
+      },
+      {
+        path: replaced,
+        name: 'main-refresh',
+        ownerId: 'previous-holder',
+        offsetMs: 0,
+        attempts: 1,
+        contended: false,
+      },
+    ]
+    expect(() =>
+      expireDeadChildLocks({ ...child, code: null }, timings),
+    ).toThrow('cannot expire locks before the expected crash exit')
+    expect(readLease(dead)).toEqual({ ownerId: 'dead-holder', expiresAt: FAR })
+    expireDeadChildLocks(child, timings)
+    expect(readLease(dead)).toEqual({ ownerId: 'dead-holder', expiresAt: 0 })
+    expect(statSync(`${dead}.evicting`).mtimeMs).toBe(0)
+    expect(readLease(replaced)).toEqual({
+      ownerId: 'successor',
+      expiresAt: FAR,
+    })
+    expect(statSync(`${replaced}.evicting`).mtimeMs).toBe(replacementMtime)
+    const lock = await acquireRefreshFileLock({
+      path: h.paths.configPath,
+      name: 'pool-migration',
+      ttlMs: 10_000,
+    })
+    expect(lock).not.toBeNull()
+    await lock?.assertOwned()
+    await lock?.release()
+  })
+
   it('walks every store write, every module write and both slot-write sides', () => {
     expect(recorded).toEqual(
       expect.arrayContaining([
@@ -153,87 +230,195 @@ describe('a crash at every step of the migration', () => {
 
   for (const [index, step] of recorded.entries()) {
     it(`crash at step ${index} (${step}): both builds keep every account and a re-run completes`, async () => {
-      await seedLegacyInstall(h)
-      const child = await runChild({
-        dir: h.dir,
-        mode: 'migrate',
-        exitAtIndex: index,
-      })
-      expect(child.code, child.output).toBe(CRASH_EXIT_CODE)
-      expect(child.steps.at(-1)).toBe(step)
-
-      // An older build still loads every fallback with its credential.
-      const legacy = await loadAccounts(h.paths)
-      expect(legacy).not.toBeNull()
-      const byId = new Map(legacy?.accounts.map((a) => [a.id, a]))
-      expect(byId.get('fb1')).toMatchObject({ refresh: 'r-fb1' })
-      expect(byId.get('key1')).toMatchObject({ apiKey: 'sk-key1' })
-      // A pre-tolerant build refreshes main's token twice only inside
-      // PRE_TOLERANT_DOUBLE, and there the fence is shut while it runs.
-      const preTolerant = await refreshAsOlderBuild(h, 'pre-tolerant')
-      expect(preTolerant.submitted).toContain('r-main')
-      if (PRE_TOLERANT_DOUBLE.has(step)) {
-        expect(preTolerant.refreshedTwice).toEqual(['r-main'])
-        expect(await fenceWithPreTolerantBuildRunning(child.pid)).toMatchObject(
+      const traced = index === 16
+      let stopChild: (() => void) | undefined
+      let locks: ReturnType<typeof observeMigrationLocks> | undefined
+      let childLocks: LockTiming[] = []
+      const childSteps: string[] = []
+      const deadLeases: Array<{
+        path: string
+        ownerId: string
+        remainingMs: number
+      }> = []
+      const deadMarkers: Array<{
+        path: string
+        ownerId?: string
+        remainingMs: number
+      }> = []
+      const clock = createFailurePhaseClock(() => ({
+        childSteps,
+        childLocks,
+        deadLeases,
+        deadMarkers,
+        locks: locks?.snapshot().map((entry) => ({
+          ...entry,
+          waitedForDeadHolderLease:
+            entry.contended &&
+            (entry.holderRemainingMs ?? 0) > 0 &&
+            deadLeases.some((lease) => lease.ownerId === entry.holder?.ownerId),
+          waitedForDeadHolderMarker:
+            entry.contended &&
+            (entry.marker?.remainingMs ?? 0) > 0 &&
+            deadMarkers.some(
+              (marker) =>
+                marker.path === entry.path &&
+                marker.ownerId === entry.marker?.ownerId,
+            ),
+        })),
+      }))
+      const run = async () => {
+        await clock.phase('seed legacy install', () => seedLegacyInstall(h))
+        const child = await runChild(
           {
+            dir: h.dir,
+            mode: 'migrate',
+            exitAtIndex: index,
+            ...(traced ? { traceLocks: true } : {}),
+          },
+          traced
+            ? {
+                start: clock.start,
+                step: (name) => childSteps.push(name),
+                locks: (timings) => {
+                  childLocks = timings
+                },
+                registerCleanup: (stop) => {
+                  stopChild = stop
+                },
+              }
+            : undefined,
+        )
+        expect(child.code, child.output).toBe(CRASH_EXIT_CODE)
+        expect(child.steps.at(-1)).toBe(step)
+        // Only a confirmed exit identifies these remaining leases as dead.
+        for (const entry of childLocks) {
+          const lease = readLease(entry.path)
+          if (lease && lease.ownerId === entry.ownerId)
+            deadLeases.push({
+              path: entry.path,
+              ownerId: lease.ownerId,
+              remainingMs: lease.expiresAt - Date.now(),
+            })
+        }
+        for (const path of new Set(childLocks.map((entry) => entry.path))) {
+          const marker = readEvictionMarker(path)
+          if (marker) deadMarkers.push({ path, ...marker })
+        }
+        if (traced)
+          clock.phase('expire confirmed-dead child locks', () =>
+            expireDeadChildLocks(child, childLocks),
+          )
+
+        // An older build still loads every fallback with its credential.
+        const legacy = await clock.phase('older build load', () =>
+          loadAccounts(h.paths),
+        )
+        expect(legacy).not.toBeNull()
+        const byId = new Map(legacy?.accounts.map((a) => [a.id, a]))
+        expect(byId.get('fb1')).toMatchObject({ refresh: 'r-fb1' })
+        expect(byId.get('key1')).toMatchObject({ apiKey: 'sk-key1' })
+        // A pre-tolerant build refreshes main's token twice only inside
+        // PRE_TOLERANT_DOUBLE, and there the fence is shut while it runs.
+        const preTolerant = await clock.phase(
+          'older build pre-tolerant refresh',
+          () => refreshAsOlderBuild(h, 'pre-tolerant'),
+        )
+        expect(preTolerant.submitted).toContain('r-main')
+        if (PRE_TOLERANT_DOUBLE.has(step)) {
+          expect(preTolerant.refreshedTwice).toEqual(['r-main'])
+          expect(
+            await fenceWithPreTolerantBuildRunning(child.pid),
+          ).toMatchObject({
             open: false,
             blockers: [{ pid: process.pid, version: 'unknown' }],
-          },
+          })
+        } else {
+          expect(preTolerant.refreshedTwice).toEqual([])
+        }
+        // A tolerant build (the current core, which is what runs beside a
+        // migration once the fence is open) never refreshes a token twice:
+        // the shield stays up until the placeholder is in the slot, and from
+        // then on it serves main from row `main`.
+        const tolerant = await clock.phase('older build tolerant refresh', () =>
+          refreshAsOlderBuild(h, 'tolerant'),
         )
-      } else {
-        expect(preTolerant.refreshedTwice).toEqual([])
-      }
-      // A tolerant build (the current core, which is what runs beside a
-      // migration once the fence is open) never refreshes a token twice:
-      // the shield stays up until the placeholder is in the slot, and from
-      // then on it serves main from row `main`.
-      const tolerant = await refreshAsOlderBuild(h, 'tolerant')
-      expect(tolerant.submitted).toContain('r-main')
-      expect(tolerant.refreshedTwice).toEqual([])
-      expect(tolerant.mainServedFrom).toBe(
-        isPoolPlaceholder(await h.slotValue()) ? 'row main' : 'slot',
-      )
-
-      // A newer build can read the pool (or sees a legacy roster it will
-      // migrate), no two rows share a token, and main's token is reachable.
-      const load = await openPoolStore({
-        provider: 'openai',
-        configPath: h.paths.configPath,
-        statePath: h.paths.statePath,
-        quota: quotaCodec,
-      }).read()
-      expect(load.status).not.toBe('error')
-      if (load.status === 'ready') {
-        const tokens = await poolTokens(h)
-        expect(new Set(tokens).size).toBe(tokens.length)
-        const slot = await h.slotValue()
-        expect(tokens.includes('r-main') || slot?.refresh === 'r-main').toBe(
-          true,
+        expect(tolerant.submitted).toContain('r-main')
+        expect(tolerant.refreshedTwice).toEqual([])
+        expect(tolerant.mainServedFrom).toBe(
+          isPoolPlaceholder(await h.slotValue()) ? 'row main' : 'slot',
         )
-      } else {
-        expect((await h.slotValue())?.refresh).toBe('r-main')
-      }
 
-      // The re-run completes.
-      const outcome = await settle(() =>
-        migrateToPool(h.deps({ ...SHORT_LOCKS })),
+        // A newer build can read the pool (or sees a legacy roster it will
+        // migrate), no two rows share a token, and main's token is reachable.
+        const load = await clock.phase('newer build read', () =>
+          openPoolStore({
+            provider: 'openai',
+            configPath: h.paths.configPath,
+            statePath: h.paths.statePath,
+            quota: quotaCodec,
+          }).read(),
+        )
+        expect(load.status).not.toBe('error')
+        if (load.status === 'ready') {
+          const tokens = await poolTokens(h)
+          expect(new Set(tokens).size).toBe(tokens.length)
+          const slot = await h.slotValue()
+          expect(tokens.includes('r-main') || slot?.refresh === 'r-main').toBe(
+            true,
+          )
+        } else {
+          expect((await h.slotValue())?.refresh).toBe('r-main')
+        }
+
+        // The re-run completes.
+        const outcome = await clock.phase('migration re-run', () =>
+          settle(() => migrateToPool(h.deps({ ...SHORT_LOCKS }))),
+        )
+        expect(['completed', 'already-migrated']).toContain(outcome.status)
+        expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+        expect(await h.placeholderWrites()).toBe(1)
+        expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main'])
+        const main = await h.row('main')
+        expect(main).toMatchObject({ identity: 'acct-main', candidate: true })
+        expect(main?.quota).toBeDefined()
+        const config = await h.config()
+        expect(config.mainAccountId).toBeUndefined()
+        expect(config[POOL_MIGRATION_KEY].pending).toBeUndefined()
+        expect(config[POOL_MIGRATION_KEY].migratedAt).toBeNumber()
+        expect(config.routing).toEqual({ mode: 'fallback-first' })
+        expect(config.webSockets).toBe(true)
+        for (const build of ['pre-tolerant', 'tolerant'] as const)
+          expect(
+            (
+              await clock.phase(`completed older build ${build} refresh`, () =>
+                refreshAsOlderBuild(h, build),
+              )
+            ).refreshedTwice,
+          ).toEqual([])
+        expect(await legacyUsableFallbackIds(h)).toEqual(['fb1', 'main'])
+      }
+      if (!traced) return run()
+      locks = observeMigrationLocks()
+      let finished = false
+      // Bun's timeout rejects the test, not its still-running async body. Keep
+      // reporting later phases and restore the observer in teardown as well.
+      const deadline = setInterval(
+        () => clock.report('body still running past 10000 ms'),
+        10_000,
       )
-      expect(['completed', 'already-migrated']).toContain(outcome.status)
-      expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
-      expect(await h.placeholderWrites()).toBe(1)
-      expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main'])
-      const main = await h.row('main')
-      expect(main).toMatchObject({ identity: 'acct-main', candidate: true })
-      expect(main?.quota).toBeDefined()
-      const config = await h.config()
-      expect(config.mainAccountId).toBeUndefined()
-      expect(config[POOL_MIGRATION_KEY].pending).toBeUndefined()
-      expect(config[POOL_MIGRATION_KEY].migratedAt).toBeNumber()
-      expect(config.routing).toEqual({ mode: 'fallback-first' })
-      expect(config.webSockets).toBe(true)
-      for (const build of ['pre-tolerant', 'tolerant'] as const)
-        expect((await refreshAsOlderBuild(h, build)).refreshedTwice).toEqual([])
-      expect(await legacyUsableFallbackIds(h)).toEqual(['fb1', 'main'])
+      cleanupClock = () => {
+        if (!finished) clock.report('test teardown before body completed')
+        stopChild?.()
+        clearInterval(deadline)
+        locks?.restore()
+      }
+      try {
+        await clock.run(`crash at step ${index} (${step})`, run)
+      } finally {
+        finished = true
+        cleanupClock?.()
+        cleanupClock = undefined
+      }
     }, 30_000)
   }
 })

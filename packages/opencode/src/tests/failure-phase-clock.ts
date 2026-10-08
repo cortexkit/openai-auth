@@ -1,9 +1,15 @@
 type Phase = { name: string; offsetMs: number; durationMs?: number }
 
 /** Print phase durations and unfinished steps only on failures or overruns. */
-export function createFailurePhaseClock() {
+export function createFailurePhaseClock(
+  details?: () => Record<string, unknown>,
+) {
   let current:
-    | { step<T>(name: string, run: () => T): T; report(reason: string): void }
+    | {
+        start(name: string): () => void
+        step<T>(name: string, run: () => T): T
+        report(reason: string): void
+      }
     | undefined
 
   function phase<T>(name: string, run: () => T): T {
@@ -14,13 +20,16 @@ export function createFailurePhaseClock() {
     const started = performance.now()
     const phases: Phase[] = []
     const clock = {
-      step<T>(step: string, action: () => T): T {
+      start(step: string) {
         const start = performance.now()
         const entry: Phase = { name: step, offsetMs: start - started }
         phases.push(entry)
-        const finish = () => {
-          entry.durationMs = performance.now() - start
+        return () => {
+          entry.durationMs ??= performance.now() - start
         }
+      },
+      step<T>(step: string, action: () => T): T {
+        const finish = clock.start(step)
         try {
           const result = action()
           if (result instanceof Promise) return result.finally(finish) as T
@@ -38,6 +47,7 @@ export function createFailurePhaseClock() {
             test: name,
             reason,
             elapsedMs,
+            ...details?.(),
             phases: phases.map((entry) => ({
               ...entry,
               durationMs: entry.durationMs ?? elapsedMs - entry.offsetMs,
@@ -65,5 +75,10 @@ export function createFailurePhaseClock() {
     }
   }
 
-  return { run, phase, report: (reason: string) => current?.report(reason) }
+  return {
+    run,
+    phase,
+    start: (name: string) => current?.start(name) ?? (() => {}),
+    report: (reason: string) => current?.report(reason),
+  }
 }

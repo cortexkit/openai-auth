@@ -15,12 +15,23 @@ import {
 } from './pool-migration-harness.ts'
 
 const task = JSON.parse(process.argv[2] ?? '{}') as ChildTask
+const locks = task.traceLocks
+  ? (await import('./pool-migration-lock-clock.ts')).observeMigrationLocks()
+  : undefined
+const sendLocks = () => {
+  if (locks) console.log(`lock-clock:${JSON.stringify(locks.snapshot())}`)
+}
+// These records stay in the parent's captured pipe unless it reports a failure.
+const lockDeadline = locks ? setInterval(sendLocks, 5_000) : undefined
 let index = 0
 const reach = (name: string) => {
-  console.log(`step:${name}`)
   const hit =
     task.exitAtIndex === index ||
     (task.exitAtName !== undefined && task.exitAtName === name)
+  // A full snapshot at every write would add substantial serialization work
+  // under the very CPU contention these clocks are meant to observe.
+  if (hit) sendLocks()
+  console.log(`step:${name}`)
   index++
   if (hit) process.exit(CRASH_EXIT_CODE)
 }
@@ -48,8 +59,13 @@ try {
       ? await migrateToPool(deps)
       : await adoptHostSlotLogin(deps)
   console.log(`outcome:${JSON.stringify(outcome)}`)
+  sendLocks()
   process.exit(0)
 } catch (error) {
+  sendLocks()
   console.log(`failed:${error instanceof Error ? error.stack : String(error)}`)
   process.exit(1)
+} finally {
+  clearInterval(lockDeadline)
+  locks?.restore()
 }

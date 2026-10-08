@@ -32,6 +32,7 @@ import {
 } from '../../core/pool-migration.ts'
 import { legacyRefreshMain } from './legacy-main-refresh.ts'
 import { preTolerantRefreshDueAccounts } from './pool-migration-legacy-refresh.ts'
+import type { LockTiming } from './pool-migration-lock-clock.ts'
 
 /** A version fence with no older process running. */
 export const OPEN_FENCE = async () => ({ open: true as const })
@@ -438,6 +439,8 @@ export interface ChildTask {
   exitAtIndex?: number
   /** Exit at the first step with this name. */
   exitAtName?: string
+  /** Send lock timings to the parent without printing on passing tests. */
+  traceLocks?: boolean
 }
 
 export interface ChildRun {
@@ -449,16 +452,66 @@ export interface ChildRun {
   stderr: string
 }
 
+export interface ChildObserver {
+  start(name: string): () => void
+  step(name: string): void
+  locks(timings: LockTiming[]): void
+  registerCleanup?(stop: () => void): void
+}
+
 /** Runs one migration or adoption in a separate process (see the child). */
-export function runChild(task: ChildTask): Promise<ChildRun> {
+export function runChild(
+  task: ChildTask,
+  observer?: ChildObserver,
+): Promise<ChildRun> {
+  const spawned = observer?.start('child spawn')
   const child = spawn(process.execPath, [childScript, JSON.stringify(task)], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: process.env,
   })
+  let reached: (() => void) | undefined
+  let exited: (() => void) | undefined
+  let closed: (() => void) | undefined
+  let didExit = false
+  observer?.registerCleanup?.(() => {
+    if (!didExit) child.kill('SIGKILL')
+  })
+  child.on('spawn', () => {
+    spawned?.()
+    reached = observer?.start('child time to crash step')
+  })
+  child.on('exit', () => {
+    didExit = true
+    reached?.()
+    exited?.()
+    closed = observer?.start('child pipes close')
+  })
   let out = ''
   let stderr = ''
+  let buffered = ''
+  let stepIndex = 0
   child.stdout.on('data', (chunk: Buffer) => {
-    out += chunk.toString()
+    const text = chunk.toString()
+    out += text
+    if (!observer) return
+    buffered += text
+    const lines = buffered.split('\n')
+    buffered = lines.pop() ?? ''
+    for (const line of lines) {
+      if (line.startsWith('lock-clock:'))
+        observer.locks(JSON.parse(line.slice('lock-clock:'.length)))
+      if (!line.startsWith('step:')) continue
+      const name = line.slice('step:'.length)
+      observer.step(name)
+      if (task.exitAtIndex === stepIndex || task.exitAtName === name) {
+        reached?.()
+        exited = observer.start('child exit after crash step')
+        // Pipe delivery can follow exit under load; don't leave a phantom
+        // unfinished exit phase when the OS already reported the exit.
+        if (didExit) exited()
+      }
+      stepIndex++
+    }
   })
   child.stderr.on('data', (chunk: Buffer) => {
     stderr += chunk.toString()
@@ -469,6 +522,9 @@ export function runChild(task: ChildTask): Promise<ChildRun> {
     // Exit can precede the last pipe data. Close guarantees the child's error
     // stack and final migration step are collected before assertions run.
     child.on('close', (code) => {
+      reached?.()
+      exited?.()
+      closed?.()
       const lines = out.split('\n')
       const steps = lines
         .filter((line) => line.startsWith('step:'))
