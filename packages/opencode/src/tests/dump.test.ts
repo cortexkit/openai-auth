@@ -22,6 +22,68 @@ import { dumpCodexRequest, resetDumpStateForTest } from '../dump'
 import { CodexAuthPlugin } from '../index'
 
 describe('request dumps', () => {
+  test('does not serialize lazy bodies when dumps are disabled', async () => {
+    await withDumpEnv(async () => {
+      process.env.CORTEXKIT_OPENAI_AUTH_DUMP = '0'
+      resetSettingsForTest()
+      let serialized = 0
+      for (const phase of ['prewarm', 'main'] as const) {
+        await dumpCodexRequest({
+          sessionID: 'disabled-lazy',
+          transport: 'websocket',
+          phase,
+          bodyText: () => {
+            serialized++
+            return JSON.stringify(toolRequestBody())
+          },
+        })
+      }
+      expect(serialized).toBe(0)
+    })
+  })
+
+  test('lazy enabled dumps preserve body bytes and prewarm main order', async () => {
+    await withDumpEnv(async (dumpDir) => {
+      const payload = {
+        model: 'gpt-5.5',
+        input: [{ role: 'user', content: 'hello' }],
+        tools: [{ name: 'read', type: 'function' }],
+        extra: 'last',
+      }
+      const text = JSON.stringify(payload)
+      const order: string[] = []
+      for (const phase of ['prewarm', 'main'] as const) {
+        await dumpCodexRequest({
+          sessionID: 'eager',
+          transport: 'websocket',
+          phase,
+          bodyText: text,
+        })
+        await dumpCodexRequest({
+          sessionID: 'lazy',
+          transport: 'websocket',
+          phase,
+          bodyText: () => {
+            order.push(phase)
+            return JSON.stringify(payload)
+          },
+        })
+      }
+      expect(order).toEqual(['prewarm', 'main'])
+      const files = (await readdir(dumpDir))
+        .filter((name) => name.endsWith('.body.json'))
+        .sort()
+      expect(files).toHaveLength(4)
+      const bodies = await Promise.all(
+        files.map((name) => readFile(join(dumpDir, name), 'utf8')),
+      )
+      expect(bodies[1]).toBe(bodies[0])
+      expect(bodies[2]).toBe(bodies[0])
+      expect(bodies[3]).toBe(bodies[0])
+      expect(bodies[0]).toContain('"model":"gpt-5.5","input":')
+    })
+  })
+
   test('resolves configured Codex endpoint with env-over-config precedence', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'openai-auth-endpoint-test-'))
     const configPath = join(dir, 'openai-auth.json')
@@ -322,6 +384,60 @@ describe('request dumps', () => {
         expect(turnIDs[1]).toBe(turnIDs[0])
         expect(turnIDs[2]).not.toBe(turnIDs[0])
         expect(turnIDs.every((id) => id[14] === '7')).toBe(true)
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+  })
+
+  test('HTTP cached decisions still detect edits compaction and rewrites', async () => {
+    await withDumpEnv(async () => {
+      process.env.CORTEXKIT_OPENAI_AUTH_DUMP = '0'
+      resetSettingsForTest()
+      const originalFetch = globalThis.fetch
+      const ids: string[] = []
+      globalThis.fetch = Object.assign(
+        async (_url: RequestInfo | URL, init?: RequestInit) => {
+          ids.push(
+            JSON.parse(new Headers(init?.headers).get('x-codex-turn-metadata')!)
+              .turn_id,
+          )
+          return new Response('ok')
+        },
+        { preconnect: () => {} },
+      )
+      try {
+        const hooks = await CodexAuthPlugin(pluginInput(), {
+          experimentalWebSockets: false,
+        })
+        const fetch = await pluginFetch(hooks)
+        const user = { type: 'message', role: 'user', content: 'one' }
+        const output = {
+          type: 'function_call_output',
+          call_id: 'c',
+          output: 'ok',
+        }
+        const cases = [
+          [user],
+          [user, output],
+          [{ ...user, content: 'edited' }, output],
+          [output],
+          [output],
+          [{ ...user, content: 'rewritten' }],
+        ]
+        for (const input of cases) {
+          await fetch('https://api.openai.com/v1/responses', {
+            method: 'POST',
+            headers: { 'x-session-affinity': 'cached-http' },
+            body: JSON.stringify({ ...toolRequestBody(), input }),
+          })
+        }
+        expect(ids[1]).toBe(ids[0])
+        expect(ids[2]).not.toBe(ids[1])
+        expect(ids[3]).not.toBe(ids[2])
+        expect(ids[4]).toBe(ids[3])
+        expect(ids[5]).not.toBe(ids[4])
+        await hooks.dispose?.()
       } finally {
         globalThis.fetch = originalFetch
       }

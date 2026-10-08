@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { APICallError } from 'ai'
+import { resetSettingsForTest } from '../config'
 import { DUMP_SESSION_HEADER } from '../dump'
 import { EMPTY_BEARER_MESSAGE } from '../index'
 import { ResponseStreamError } from '../response-stream-error'
@@ -151,6 +152,126 @@ describe('orderCodexBody', () => {
 })
 
 describe('createWebSocketFetch', () => {
+  test('disabled dumps serialize only the wire frames', async () => {
+    const originalDump = process.env.CORTEXKIT_OPENAI_AUTH_DUMP
+    process.env.CORTEXKIT_OPENAI_AUTH_DUMP = '0'
+    resetSettingsForTest()
+    const request = streamRequest({ input: [{ role: 'user', content: 'hi' }] })
+    const stringify = JSON.stringify
+    let dumpSerializations = 0
+    let wireSerializations = 0
+    JSON.stringify = ((value: unknown, ...args: unknown[]) => {
+      if (value && typeof value === 'object' && 'input' in value) {
+        if ('type' in value && value.type === 'response.create')
+          wireSerializations++
+        else dumpSerializations++
+      }
+      return Reflect.apply(stringify, JSON, [value, ...args])
+    }) as typeof JSON.stringify
+    try {
+      await withFakeWebSocket(
+        ({ message }) => ({
+          send(data) {
+            const frame = JSON.parse(data)
+            message(
+              stringify({
+                type: 'response.completed',
+                response: { id: frame.generate === false ? 'prewarm' : 'main' },
+              }),
+            )
+          },
+        }),
+        async () => {
+          const fetch = createWebSocketFetch()
+          try {
+            await (
+              await fetch('https://example.test/responses', request)
+            ).text()
+          } finally {
+            fetch.close()
+          }
+        },
+      )
+      expect(wireSerializations).toBe(2)
+      expect(dumpSerializations).toBe(0)
+    } finally {
+      JSON.stringify = stringify
+      if (originalDump === undefined)
+        delete process.env.CORTEXKIT_OPENAI_AUTH_DUMP
+      else process.env.CORTEXKIT_OPENAI_AUTH_DUMP = originalDump
+      resetSettingsForTest()
+    }
+  })
+
+  test('cached WS decisions preserve append edits tool order compaction and prewarm', async () => {
+    const sent: Array<Record<string, unknown>> = []
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send(data) {
+          const frame = JSON.parse(data)
+          sent.push(frame)
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: `response_${sent.length}` },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const fetch = createWebSocketFetch()
+        const user = { type: 'message', role: 'user', content: 'one' }
+        const out = { type: 'function_call_output', call_id: 'c', output: 'ok' }
+        const tools = [
+          { type: 'function', name: 'a' },
+          { type: 'function', name: 'b' },
+        ]
+        const send = async (input: unknown[], list = tools) => {
+          const response = await fetch(
+            'https://example.test/responses',
+            streamRequest({ ...body(input), tools: list }),
+          )
+          await response.text()
+          return sent.at(-1)!
+        }
+        try {
+          const first = await send([user])
+          expect(sent[0]!.generate).toBe(false)
+          expect(first.previous_response_id).toBe('response_1')
+          const appended = await send([user, out])
+          expect(appended.previous_response_id).toBe('response_2')
+          expect(appended.input).toEqual([out])
+          expect(turnID(appended)).toBe(turnID(first))
+          const reordered = await send(
+            [user, out, { ...out, output: 'next' }],
+            [...tools].reverse(),
+          )
+          expect(reordered.previous_response_id).toBeUndefined()
+          expect(reordered.input).toHaveLength(3)
+          expect(turnID(reordered)).not.toBe(turnID(appended))
+          const edited = await send(
+            [{ ...user, content: 'edited' }, out],
+            [...tools].reverse(),
+          )
+          expect(sent.at(-2)!.generate).toBe(false)
+          expect(edited.previous_response_id).toBe(
+            `response_${sent.length - 1}`,
+          )
+          expect(edited.input).toHaveLength(2)
+          expect(turnID(edited)).not.toBe(turnID(reordered))
+          const compacted = await send([{ ...user, content: 'summary' }])
+          expect(sent.at(-2)!.generate).toBe(false)
+          expect(compacted.input).toHaveLength(1)
+          const continued = await send([{ ...user, content: 'summary' }, out])
+          expect(continued.input).toEqual([out])
+          expect(turnID(continued)).toBe(turnID(compacted))
+        } finally {
+          fetch.close()
+        }
+      },
+    )
+  })
+
   test('attributes quota by the internal account key and threads the served ChatGPT id', async () => {
     const quotaCalls: Array<{
       accessToken: string

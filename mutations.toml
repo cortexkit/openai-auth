@@ -889,3 +889,44 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/shared-vaul
 test_count_pattern = "Ran {count} test"
 expect_red = ["^one\\shost\\svault\\sper\\sprocess\\sdisposing\\sone\\sholder\\sleaves\\sthe\\sother\\sserving\\suntil\\sthe\\slast\\srelease$"]
 expect_message = 'Received: "Bearer main-token"'
+
+# Per-request CPU guards. Disabled dumps must not serialize replay histories,
+# and canonical-item reuse must validate all values, not just an index or id.
+[[control]]
+id = "ws-disabled-main-dump-is-lazy"
+guards = "disabled main dumps do not serialize the response body before the enabled check"
+file = "packages/opencode/src/ws-pool.ts"
+old = "bodyText: () => JSON.stringify(requestBody),"
+new = "bodyText: JSON.stringify(requestBody), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/ws-pool.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/ws-pool.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^createWebSocketFetch\\sdisabled\\sdumps\\sserialize\\sonly\\sthe\\swire\\sframes$"]
+expect_message = "Received: 1"
+
+[[control]]
+id = "ws-disabled-prewarm-dump-is-lazy"
+guards = "disabled prewarm dumps do not serialize the response body before the enabled check"
+file = "packages/opencode/src/ws-pool.ts"
+old = "bodyText: () => JSON.stringify(request),"
+new = "bodyText: JSON.stringify(request), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/ws-pool.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/ws-pool.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^createWebSocketFetch\\sdisabled\\sdumps\\sserialize\\sonly\\sthe\\swire\\sframes$"]
+expect_message = "Received: 1"
+
+[[control]]
+id = "canonical-input-validates-earlier-edits"
+guards = "a cached canonical item is never reused after an earlier item changes in place"
+file = "packages/opencode/src/util/canonical-input.ts"
+old = "oldText !== undefined && sameJson(prior?.snapshots[index], input[index])"
+new = "oldText !== undefined // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/canonical-input.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/canonical-input.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^canonical\\sinput\\srejects\\sa\\sstale\\scanonical\\sitem\\safter\\san\\searlier\\sin-place\\sedit$"]
+expect_message = "rewritten earlier message"

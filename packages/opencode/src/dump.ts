@@ -113,7 +113,7 @@ export async function dumpCodexRequest(input: {
   sessionID?: string | null
   transport: DumpTransport
   phase: DumpPhase
-  bodyText: string
+  bodyText: string | (() => string)
   accountId?: string
   url?: string
   method?: string
@@ -122,12 +122,16 @@ export async function dumpCodexRequest(input: {
   error?: string
 }): Promise<void> {
   // The dump setting is read per request, so toggling it applies at once.
-  dumper.setEnabled(getSettings().dump === true)
+  const enabled = getSettings().dump === true
+  dumper.setEnabled(enabled)
+  if (!enabled) return
+  const bodyText =
+    typeof input.bodyText === 'function' ? input.bodyText() : input.bodyText
   await dumper.dump({
     session: input.sessionID,
     channel: input.transport,
     phase: input.phase,
-    bodyText: input.bodyText,
+    bodyText,
     accountId: input.accountId,
     url: input.url,
     method: input.method,

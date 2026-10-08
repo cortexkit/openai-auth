@@ -189,6 +189,12 @@ import {
   settleWithinBudget,
   upsertSidebarActiveRouting,
 } from './sidebar-state'
+import {
+  type CanonicalInput,
+  canonicalInput,
+  canonicalPrefixLength,
+  retainedInput,
+} from './util/canonical-input'
 import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
 import { PackageVersion } from './version'
@@ -815,6 +821,7 @@ interface CodexSessionMetadata {
   windowID: string
   turnStartedAt?: number
   input?: unknown[]
+  canonicalInput?: CanonicalInput
   /**
    * The `reasoning.effort` this session opened with. Held so a later change can
    * be carried as a `configuration_update` item instead of as a different
@@ -925,18 +932,14 @@ function isMessageWithRole(item: unknown, role: string) {
   )
 }
 
-function hasInputPrefix(prefix: unknown[], input: unknown[]) {
-  if (prefix.length > input.length) return false
-  for (let index = 0; index < prefix.length; index++) {
-    if (stableStringify(prefix[index]) !== stableStringify(input[index]))
-      return false
-  }
-  return true
-}
-
-function startsHttpUserTurn(metadata: CodexSessionMetadata, input: unknown[]) {
+function startsHttpUserTurn(
+  metadata: CodexSessionMetadata,
+  input: unknown[],
+  canonical: CanonicalInput,
+) {
   if (!metadata.input) return input.length > 0
-  if (!hasInputPrefix(metadata.input, input)) return true
+  const prior = metadata.canonicalInput ?? canonicalInput(metadata.input)
+  if (canonicalPrefixLength(prior, canonical) === undefined) return true
   const suffix = input.slice(metadata.input.length)
   return suffix.some(
     (item) =>
@@ -949,7 +952,14 @@ function updateHttpTurnMetadata(
   body: Record<string, unknown> | undefined,
 ) {
   const input = Array.isArray(body?.input) ? body.input : undefined
-  if (input && (startsHttpUserTurn(metadata, input) || !metadata.turnID)) {
+  const canonical = input
+    ? canonicalInput(input, metadata.canonicalInput)
+    : undefined
+  if (
+    input &&
+    canonical &&
+    (startsHttpUserTurn(metadata, input, canonical) || !metadata.turnID)
+  ) {
     metadata.turnID = uuidV7()
     metadata.turnStartedAt = Date.now()
   } else if (!metadata.turnStartedAt) {
@@ -957,7 +967,10 @@ function updateHttpTurnMetadata(
   }
   // Copy the host input before effort updates are inserted, so the next tool
   // request compares against host history and does not start a false user turn.
-  if (input) metadata.input = input.slice()
+  if (input && canonical) {
+    metadata.input = input.slice()
+    metadata.canonicalInput = retainedInput(canonical)
+  }
 }
 
 function prepareCodexRequest(input: {
