@@ -1254,8 +1254,10 @@ export function resolveSidebarSessionId(headers: Headers): string | undefined {
     undefined
   )
 }
-// The HTTP turn baseline shares host items with the parsed body. Copy only
-// changed paths so removing wire-only image details cannot rewrite that baseline.
+// The input saved to detect the next HTTP user turn (`metadata.input`) holds
+// the same item objects as this request body. Copy only the paths that change,
+// so removing image details from what is sent leaves that saved history as the
+// host sent it; otherwise every later request would look like a new turn.
 function stripResponsesLiteImageDetails(value: unknown): unknown {
   if (Array.isArray(value)) {
     let next = value

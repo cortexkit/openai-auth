@@ -1,7 +1,9 @@
 import { stableStringify } from './stable-json'
 
-// Only retain one bounded history per owner. Larger requests still compare
-// exactly, but do not leave an extra serialized history resident between sends.
+// The canonical texts of a request's input are kept until the next request
+// (once per HTTP session or WebSocket pool entry) only below these sizes.
+// Larger inputs are still compared exactly; their texts are just rebuilt
+// instead of being held in memory between sends.
 const MAX_CACHED_ITEMS = 512
 const MAX_CACHED_CHARS = 2 * 1024 * 1024
 

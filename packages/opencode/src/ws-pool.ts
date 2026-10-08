@@ -1049,8 +1049,10 @@ function requestComparison(
 function priorCanonical(comparison: RequestComparison, input: unknown[]) {
   let canonical = comparison.priorInputs.get(input)
   if (!canonical) {
-    // Turn state keeps an array copy, while continuation keeps the full body.
-    // They can share a representation even when the retention cap was exceeded.
+    // The turn's saved input is a copy of the array, and the continuation saves
+    // the whole body, so the same items can sit in two different arrays. Reuse
+    // the canonical texts of any array holding exactly the same item objects,
+    // even when the history was too large to keep its texts between requests.
     for (const [prior, represented] of comparison.priorInputs) {
       if (
         prior.length === input.length &&
@@ -1183,7 +1185,9 @@ function hasContinuationPrefix(
   prior: ContinuationState,
   comparison: RequestComparison,
 ) {
-  // Continuation requires growth; unlike turn detection, equal lengths replay.
+  // Chaining onto the previous response needs at least one new input item: an
+  // input no longer than the previous one is sent in full, without
+  // previous_response_id. (Turn detection, by contrast, accepts equal length.)
   if (prior.input.length >= comparison.input.texts.length) return false
   return (
     canonicalPrefixLength(
