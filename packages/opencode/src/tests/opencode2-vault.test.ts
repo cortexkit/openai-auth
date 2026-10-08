@@ -22,6 +22,7 @@ import {
   startMockDaemon,
   vaultLogin,
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
+import { isPoolPlaceholder } from '../core/pool-migration'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { setupOpenAIAuth } from '../v2/setup'
 import {
@@ -449,14 +450,14 @@ describe('vault accounts on OpenCode 2', () => {
     expect(JSON.parse(readFileSync(authPath, 'utf8')).openai).toEqual(later)
   }, 15_000)
 
-  it('does not adopt a login in the host slot while the vault serves this host its accounts', async () => {
+  it('adopts a slot login while the vault serves, but routes that account through the vault only', async () => {
     const login = {
       type: 'oauth',
-      access: chatgptAccessToken('chatgpt-login'),
+      access: chatgptAccessToken('chatgpt-vault', 'local-login'),
       refresh: 'login-refresh',
       expires: Date.now() + 3_600_000,
     }
-    const { files } = await start(
+    const { files, host, daemon } = await start(
       'fallback-first',
       [{ id: 'main' }],
       { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
@@ -469,15 +470,21 @@ describe('vault accounts on OpenCode 2', () => {
           ),
       },
     )
-    // The lifecycle's first run (already migrated, then one adoption) starts
-    // with setup; an adoption would have replaced the slot login with the
-    // pool placeholder and added a row by now.
+    // The lifecycle restores the placeholder without Disconnect, but the
+    // local copy cannot serve as a second owner of the vault's account.
     await Bun.sleep(300)
     expect(
-      JSON.parse(readFileSync(join(files.dir, 'auth.json'), 'utf8')).openai,
-    ).toEqual(login)
-    expect(files.readConfig().accounts.map((account) => account.id)).toEqual([
-      'main',
-    ])
+      isPoolPlaceholder(
+        JSON.parse(readFileSync(join(files.dir, 'auth.json'), 'utf8')).openai,
+      ),
+    ).toBe(true)
+    expect(files.readConfig().accounts.map((account) => account.id)).toContain(
+      'chatgpt-vault',
+    )
+    const gets = daemon.gets.length
+    const served = await send(host, 200)
+    expect(served.get('authorization')).toBe(`Bearer ${VAULT_ACCESS}`)
+    expect(served.get('authorization')).not.toBe(`Bearer ${login.access}`)
+    expect(daemon.gets.length).toBeGreaterThan(gets)
   })
 })

@@ -31,8 +31,11 @@ import {
   stat,
   writeFile,
 } from 'node:fs/promises'
-import { dirname } from 'node:path'
-import { opencodeAuthPath } from '../core/host-slot'
+import { dirname, resolve } from 'node:path'
+import { HostSlotChangedError, opencodeAuthPath } from '../core/host-slot'
+
+export { HostSlotChangedError } from '../core/host-slot'
+
 import type { HostSlotAdapter } from '../core/pool-migration'
 
 /**
@@ -75,16 +78,6 @@ async function readAuthMap(
   return parsed as Record<string, unknown>
 }
 
-/** Thrown by a slot write whose login changed after the read it was decided on. */
-export class HostSlotChangedError extends Error {
-  constructor() {
-    super(
-      "OpenCode 1's openai login changed after the account-pool migration read it; nothing was written, and the migration tries again later",
-    )
-    this.name = 'HostSlotChangedError'
-  }
-}
-
 /** A comparable form of one entry; `undefined` for an absent one. */
 function entryKey(value: unknown): string | undefined {
   return value === undefined ? undefined : JSON.stringify(value)
@@ -110,6 +103,7 @@ export function opencode1HostSlot(
   // migration uses it only to tell a torn read from an empty file.
   const seen = new Map<string, string | undefined>()
   return {
+    path: resolve(path),
     async get(input) {
       const value = (await readAuthMap(path))?.[input.path.id]
       seen.set(input.path.id, entryKey(value))

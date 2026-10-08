@@ -259,8 +259,9 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
       // migration's own run adopts afterwards.
       return
     }
-    // Every other adoption outcome, `vault-owns-accounts` included, means
-    // the install is migrated.
+    if (outcome.status === 'slot-read-only') return
+    // Adoption also restores the placeholder while vault accounts serve;
+    // their identities are set aside by the account source, not by this run.
     isMigrated = true
     if (outcome.status === 'completed')
       log.info('host login adopted into the account pool', {

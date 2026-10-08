@@ -564,17 +564,17 @@ expect_red = ["^the\\shost\\sslot\\sa\\sreal\\slogin\\sin\\sthe\\sslot\\sis\\sre
 expect_message = "Received promise that resolved"
 
 [[control]]
-id = "vault-blocks-slot-login-adoption"
-guards = "while the vault serves this host, a login in the slot is not adopted into the pool"
+id = "vault-slot-login-recovers-without-disconnect"
+guards = "adoption restores the placeholder while the vault serves, and vault identities stay out of local routing and refresh"
 file = "packages/opencode/src/core/pool-migration.ts"
-old = "  if (mode === 'adopt' && ctx.vaultServes?.()) {"
-new = "  if (false) {"
-test_file = "packages/opencode/src/tests/pool-migration.test.ts"
+old = "  const book = readPoolMigrationBookkeeping(config)\n  if (book.pending) return undefined"
+new = "  const book = readPoolMigrationBookkeeping(config)\n  if (mode === 'adopt' && !book.pending && ctx.vaultServes?.()) return { status: 'vault-owns-accounts' } // NON-VACUITY BREAK\n  if (book.pending) return undefined"
+test_file = "packages/opencode/src/tests/pool-slot-audit.test.ts"
 runner = "command"
-command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-migration.test.ts", "-t", "{test}"]
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-slot-audit.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ["^the\\sClaustrum\\svault\\swhile\\sthe\\svault\\sserves\\sthis\\shost,\\sa\\slogin\\sin\\sthe\\sslot\\sis\\snot\\sadopted\\sand\\snothing\\sis\\swritten$"]
-expect_message = "-   \"status\": \"vault-owns-accounts\","
+expect_red = ["^login\\sslot\\saudit\\sthe\\slifecycle\\srestores\\sthe\\splaceholder\\swhile\\sthe\\svault\\sserves$"]
+expect_message = "Received: false"
 
 # Credentials never cross the RPC boundary or reach a log or dump.
 # Token redaction and the dump file modes (0600/0700) belong to
@@ -997,3 +997,108 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/canonical-i
 test_count_pattern = "Ran {count} test"
 expect_red = ["^canonical\\sinput\\srecomputes\\sitems\\swith\\sown\\stoJSON\\sfunctions$"]
 expect_message = "Expected: not"
+
+# Shared host-slot custody, environment overrides and interrupted adoption.
+[[control]]
+id = "pool-transfer-lock-follows-auth-json"
+guards = "separate config roots sharing auth.json cannot concurrently copy its single-use login"
+file = "packages/opencode/src/core/pool-migration.ts"
+old = "      'pool-slot-transfer',\n      ctx.slot.path ?? opencodeAuthPath(),"
+new = "      'pool-slot-transfer',\n      ctx.paths.configPath, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/pool-slot-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-slot-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^login\\sslot\\saudit\\stwo\\sconfig\\sroots\\ssharing\\sauth\\.json\\shave\\sonly\\sone\\srefresh-token\\sowner$"]
+expect_message = "Received: \"completed\""
+
+[[control]]
+id = "pool-transfer-refuses-foreign-placeholder"
+guards = "a pending transfer seeing another store's placeholder removes its copy instead of completing custody"
+file = "packages/opencode/src/core/pool-migration.ts"
+old = "    if (current.origin !== placeholderOrigin(ctx))"
+new = "    if (false) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/pool-slot-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-slot-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^login\\sslot\\saudit\\sa\\sforeign\\splaceholder\\scannot\\scomplete\\san\\sinterrupted\\stransfer$"]
+expect_message = "Received: \"completed\""
+
+[[control]]
+id = "pool-env-auth-is-read-only"
+guards = "an environment login never moves into the pool or overwrites a different login on disk"
+file = "packages/opencode/src/core/host-slot.ts"
+old = "    JSON.parse(env.OPENCODE_AUTH_CONTENT)\n    return true"
+new = "    JSON.parse(env.OPENCODE_AUTH_CONTENT)\n    return false // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/pool-slot-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-slot-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^login\\sslot\\saudit\\senvironment-backed\\sauth\\snever\\smigrates\\sor\\soverwrites\\sa\\sdisk\\slogin$"]
+expect_message = "disk-refresh"
+
+[[control]]
+id = "pool-api-slot-is-not-oauth-to-import"
+guards = "a leftover OpenCode 1 platform API key cannot prevent the OAuth migration marker and OpenCode 2 login"
+file = "packages/opencode/src/core/host-slot.ts"
+old = "    return { kind: 'api' }"
+new = "    return { kind: 'indeterminate' } // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/pool-slot-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-slot-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^login\\sslot\\saudit\\san\\sAPI-key\\sslot\\sdoes\\snot\\sblock\\sthe\\sOAuth\\spool\\smigration$"]
+expect_message = "host-slot-indeterminate"
+
+[[control]]
+id = "pool-opencode1-placeholder-prewrite-fence"
+guards = "the OpenCode 1 adapter refuses a placeholder when a newer login is visible immediately before dispatch"
+file = "packages/opencode/src/core/host-slot.ts"
+old = "        isPoolPlaceholder(input.body) &&"
+new = "        false && // NON-VACUITY BREAK\n        isPoolPlaceholder(input.body) &&"
+test_file = "packages/opencode/src/tests/pool-slot-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-slot-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^login\\sslot\\saudit\\sthe\\sOpenCode\\s1\\swriter\\srefuses\\sa\\slogin\\schanged\\ssince\\sits\\sfence\\sread$"]
+expect_message = "Expected promise that rejects"
+
+[[control]]
+id = "pool-pending-adoption-outlives-vault-transition"
+guards = "a vault connection cannot strand a pending slot transfer and its shield"
+file = "packages/opencode/src/core/pool-migration.ts"
+old = "  const book = readPoolMigrationBookkeeping(config)\n  if (book.pending) return undefined"
+new = "  const book = readPoolMigrationBookkeeping(config)\n  if (mode === 'adopt' && book.pending && ctx.vaultServes?.()) return { status: 'vault-owns-accounts' } // NON-VACUITY BREAK\n  if (book.pending) return undefined"
+test_file = "packages/opencode/src/tests/pool-slot-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-slot-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^login\\sslot\\saudit\\san\\sinterrupted\\sadoption\\sresumes\\swhen\\sthe\\svault\\sstarts\\sserving$"]
+expect_message = "vault-owns-accounts"
+
+[[control]]
+id = "pool-downgrade-warning-names-empty-bearer"
+guards = "the migration docs warn that a pre-1.0 build sends the placeholder's empty bearer"
+file = "README.md"
+old = "Downgrading after the account-pool migration is unsupported."
+new = "NON-VACUITY BREAK: downgrade warning removed."
+test_file = "packages/opencode/src/tests/pool-slot-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-slot-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^login\\sslot\\saudit\\sthe\\sdowngrade\\swarning\\sexplains\\sthe\\sempty\\sbearer$"]
+expect_message = "Expected to contain: \"Downgrading after the account-pool migration is unsupported\""
+
+[[control]]
+id = "pool-transfer-readback-belongs-to-store"
+guards = "a foreign placeholder replacing our write before readback cannot complete custody or keep a duplicate refresh token"
+file = "packages/opencode/src/core/pool-migration.ts"
+old = "  if (isRecord(readback) && readback.accountId !== placeholderOrigin(ctx))"
+new = "  if (false) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/pool-slot-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-slot-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^login\\sslot\\saudit\\sa\\sforeign\\splaceholder\\sin\\sreadback\\scannot\\scomplete\\scustody$"]
+expect_message = "Received: \"completed\""

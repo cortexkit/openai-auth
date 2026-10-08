@@ -371,7 +371,10 @@ describe('request path with the main account in the pool', () => {
       expect(interrupted.openaiAuthPool.pending.rowId).toBe('main')
       expect(interrupted.mainAccountId).toBe('acct-main')
       const mainToken = (await h.slot.all()).openai
-      expect(mainToken).toEqual(PLACEHOLDER)
+      expect(mainToken).toMatchObject(PLACEHOLDER)
+      expect((mainToken as { accountId: string }).accountId).toMatch(
+        /^openai-auth-pool:[a-f0-9]{64}$/,
+      )
       const bytes = await h.bytes()
       writeFileSync(configFile, bytes.config as string)
       writeFileSync(

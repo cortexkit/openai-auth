@@ -9,9 +9,9 @@
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { isTombstoned } from '@cortexkit/openai-auth-core/internal'
-import type { HostSlotAdapter } from './pool-migration.ts'
+import { type HostSlotAdapter, isPoolPlaceholder } from './pool-migration.ts'
 
 const MAIN_PROVIDER = 'openai'
 const SLOT_ABSENT_CONFIRMATION_MS = 250
@@ -28,6 +28,7 @@ export type MainOauthSlot = {
   access?: string
   refresh?: string
   expires?: number
+  accountId?: string
 }
 
 /** A fingerprint of the slot's token pair, so a later read can tell it is the same login. */
@@ -57,13 +58,15 @@ export function mainSlotFamilyFingerprint(
  *   told apart by the caller);
  * - `tombstone`: the value the removed vault custody left in the slot;
  * - `slot-absent`: confirmed missing;
- * - `indeterminate`: not an OAuth value, or a missing read that could not be
- *   confirmed.
+ * - `api`: a platform API key, not a ChatGPT OAuth login to import;
+ * - `indeterminate`: an unrecognized value, or a missing read that could not
+ *   be confirmed.
  */
 export type MainAuthSlot =
   | { kind: 'real'; oauth: MainOauthSlot }
   | { kind: 'tombstone'; oauth: MainOauthSlot }
   | { kind: 'slot-absent' }
+  | { kind: 'api' }
   | { kind: 'indeterminate' }
 
 type HostAuthClient = {
@@ -88,6 +91,9 @@ function asOauthSlot(value: unknown): MainOauthSlot | undefined {
     ...(typeof candidate.expires === 'number'
       ? { expires: candidate.expires }
       : {}),
+    ...(typeof candidate.accountId === 'string'
+      ? { accountId: candidate.accountId }
+      : {}),
   }
 }
 
@@ -107,6 +113,12 @@ export function asCompleteMainOauthSlot(
 }
 
 export function classifyMainAuthSlot(value: unknown): MainAuthSlot {
+  if (
+    isPlainRecord(value) &&
+    value.type === 'api' &&
+    typeof value.key === 'string'
+  )
+    return { kind: 'api' }
   const oauth = asOauthSlot(value)
   if (!oauth) return { kind: 'indeterminate' }
   return isTombstoned(oauth)
@@ -261,6 +273,27 @@ export type OpencodeAuthSet = (input: {
   body: unknown
 }) => Promise<unknown>
 
+/** A valid environment override is read-only: OpenCode writes only the file. */
+export function opencodeAuthIsEnvBacked(env: NodeJS.ProcessEnv): boolean {
+  if (!env.OPENCODE_AUTH_CONTENT) return false
+  try {
+    JSON.parse(env.OPENCODE_AUTH_CONTENT)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** A host login changed after the read on which the placeholder was decided. */
+export class HostSlotChangedError extends Error {
+  constructor() {
+    super(
+      'OpenCode openai login changed after the account-pool migration read it; nothing was written',
+    )
+    this.name = 'HostSlotChangedError'
+  }
+}
+
 /**
  * OpenCode 1's login slot for a plugin running inside OpenCode 1: reads
  * `auth.json` itself (see `readOpencodeAuthMap`), writes through OpenCode 1's
@@ -273,14 +306,33 @@ export function opencode1ClientSlot(options: {
 }): HostSlotAdapter {
   const env = options.env ?? process.env
   const path = options.path ?? opencodeAuthPath(env)
+  const seen = new Map<string, string | undefined>()
   return {
+    path: resolve(path),
+    migrationDisabledReason: () =>
+      opencodeAuthIsEnvBacked(env)
+        ? 'OPENCODE_AUTH_CONTENT supplies the login; the environment-backed slot is read-only'
+        : undefined,
     async get(input) {
-      return (await readOpencodeAuthMap(path, env))[input.path.id]
+      const value = (await readOpencodeAuthMap(path, env))[input.path.id]
+      seen.set(input.path.id, JSON.stringify(value))
+      return value
     },
     async all() {
       return readOpencodeAuthMap(path, env)
     },
     async set(input) {
+      if (opencodeAuthIsEnvBacked(env))
+        throw new Error('OPENCODE_AUTH_CONTENT supplies a read-only login slot')
+      // The SDK has no compare-and-set. Refuse changes visible before dispatch;
+      // OpenCode's server can still race between its own file read and write.
+      const current = (await readOpencodeAuthMap(path, env))[input.path.id]
+      if (
+        isPoolPlaceholder(input.body) &&
+        (!seen.has(input.path.id) ||
+          seen.get(input.path.id) !== JSON.stringify(current))
+      )
+        throw new HostSlotChangedError()
       const result = await options.set(input)
       // The generated client reports a refused request in its result
       // (`{ error, response }`) instead of throwing; a write that did not

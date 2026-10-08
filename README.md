@@ -211,7 +211,11 @@ and let it read your OpenAI accounts with:
   ck auth grant --principal enrolled:openai-auth-opencode --selector-kind category --selector openai-native --operation read
 ```
 
-The token the vault then issues is kept owner-only in `openai-auth-vault/` next to the account state file. The vault accounts route through the same routing modes and limits as your own; each request fetches its token from the vault, and a token the provider rejects is reported back to the vault. An account you also signed in to here is served by the vault only (one account, one owner). While the vault serves accounts, a login written into OpenCode's own `openai` slot is refused rather than served beside them: remove it, or disconnect.
+The token the vault then issues is kept owner-only in `openai-auth-vault/` next to the account state file. The vault accounts route through the same routing modes and limits as your own; each request fetches its token from the vault, and a token the provider rejects is reported back to the vault. An account you also signed in to here is served by the vault only (one account, one owner). A later login written into OpenCode's own `openai` slot is adopted into the pool in the background and the placeholder is restored, even while the vault serves accounts. A local copy of a vault-owned account is set aside: it is neither routed nor refreshed locally. If a stray slot login temporarily blocks requests, let adoption finish or sign in again; Disconnect is not required. Do not delete the slot value as a repair: OpenCode 1 needs its OAuth placeholder to install the plugin's fetch.
+
+Downgrading after the account-pool migration is unsupported. The migration replaces OpenCode's login with an OAuth placeholder whose access token is empty; a pre-1.0 build that does not understand the placeholder would send an empty bearer instead of reading the account pool. Keep the pool-aware build, or sign in afresh in a separate store before using an older build.
+
+When `OPENCODE_AUTH_CONTENT` supplies OpenCode 1's login, the slot is read-only for migration and adoption. The plugin leaves the environment login and `auth.json` untouched and continues using the login as before; unset the override to migrate the disk login.
 
 Static OpenAI API keys held in the vault (`apikey:openai`) are not used: they are never listed, read or routed. Every request this plugin sends goes to the ChatGPT Codex endpoint, which takes ChatGPT logins, not platform API keys, so only the vault's OpenAI logins serve.
 
