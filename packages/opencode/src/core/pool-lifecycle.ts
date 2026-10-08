@@ -261,8 +261,11 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
       return
     }
     if (outcome.status === 'slot-read-only') return
-    // Adoption also restores the placeholder while vault accounts serve;
-    // their identities are set aside by the account source, not by this run.
+    // Every other outcome means the install is migrated. Adoption runs even
+    // while the vault serves accounts, because the account source skips a
+    // pool row for an account the vault also holds (neither routed nor
+    // refreshed locally) and OpenCode 1 installs the plugin's fetch only when
+    // its `openai` slot holds an OAuth value such as the placeholder.
     isMigrated = true
     if (outcome.status === 'completed')
       log.info('host login adopted into the account pool', {

@@ -214,7 +214,13 @@ export const LEGACY_MAIN_REFRESH_LOCK_TTL_MS = 2 * 60_000
  */
 export const POOL_MIGRATION_LOCK_NAME = 'pool-migration'
 
-/** A prerelease transfer whose bare placeholder cannot prove sole custody. */
+/**
+ * The disabled reason given to a row whose transfer was interrupted while the
+ * slot held an untagged placeholder. Builds before this one wrote the
+ * placeholder without the tag naming the store (config root) that wrote it,
+ * so such an unfinished transfer cannot show which store owns the
+ * credential: this store, or another store sharing the same `auth.json`.
+ */
 export const POOL_UNTAGGED_TRANSFER_DISABLED_REASON =
   'slot-transfer-origin-unknown'
 export const POOL_UNTAGGED_TRANSFER_REMEDY =
@@ -294,9 +300,13 @@ export interface PoolMigrationDeps {
   >
   onStep?: (step: PoolMigrationStep) => void | Promise<void>
   /**
-   * Whether the Claustrum vault serves this host's accounts. Adoption still
-   * restores the placeholder; the account source sets aside any pool row
-   * whose identity the vault owns, without routing or refreshing it.
+   * Whether the Claustrum vault serves this host's accounts. The built-in
+   * adopter does not change course on it: a pool row for an account the
+   * vault also holds is skipped by the account source (`pool-account-source.ts`),
+   * which neither routes nor refreshes it locally, so adoption can safely
+   * move a slot login into the pool and put the placeholder back. The
+   * placeholder has to be back: OpenCode 1 installs the plugin's fetch only
+   * when its `openai` slot holds an OAuth value.
    */
   vaultServes?: () => boolean
 }
@@ -311,7 +321,12 @@ export type SlotNothingKind =
 
 export type PoolTransferOutcome =
   | { status: 'slot-read-only'; reason: string }
-  /** Legacy/custom adoption outcome; the built-in adopter now restores the slot even while vault accounts serve. */
+  /**
+   * The adoption left the slot alone because the vault serves this host's
+   * accounts. The built-in adopter (`adoptHostSlotLogin`) no longer returns
+   * this; it can still come from a custom adopter passed to the background
+   * runner (`adopt` in `pool-lifecycle.ts`).
+   */
   | { status: 'vault-owns-accounts' }
   /**
    * An openai-auth process older than this one is running (see
@@ -326,12 +341,24 @@ export type PoolTransferOutcome =
   /** Migration already recorded as done; nothing was imported. */
   | { status: 'already-migrated' }
   /**
-   * The slot holds the placeholder but this store has no `main` row and no
-   * transfer of its own in progress: another store sharing this login slot
-   * moved the login (`placeholder-without-main`, nothing written). An
-   * unfinished prerelease transfer with an untagged placeholder instead
-   * preserves its copy disabled (`placeholder-origin-unknown`); its record
-   * is cleared without assuming custody.
+   * The slot holds the placeholder, but it was not this store that moved the
+   * login out of the slot. The transfer record below is the pending-transfer
+   * record in this store's config, written before a transfer touches a row.
+   * - `placeholder-without-main`: another store sharing this login slot
+   *   moved the login, so the login is that store's. Either this store has
+   *   no `main` row and no transfer record, and nothing is written; or this
+   *   store's own transfer was under way and found the placeholder tagged
+   *   with another config root, and only the copy that transfer had put into
+   *   a row is removed (the other store holds the login now) and the record
+   *   cleared.
+   * - `placeholder-origin-unknown`: this store has a transfer record, but
+   *   the placeholder is untagged (it has no `accountId` naming the config
+   *   root that wrote it; builds before this one wrote it that way). The
+   *   row copy may be this store's only copy of the credential, so it is not
+   *   deleted; another store may own the login, so the row is disabled
+   *   rather than routed or refreshed. The record is cleared so that a later
+   *   background run does not find it and disable the row again after
+   *   someone has re-enabled it.
    */
   | {
       status: 'refused'
@@ -1421,23 +1448,34 @@ async function writeRecord(
 }
 
 /**
- * Puts the placeholder into the slot through the fence: the slot must still
- * hold exactly the (access, refresh) pair the record names. Both adapters
- * re-read immediately before dispatch/rename and refuse a visible change.
- * OpenCode 1's server still reads and writes the whole file without a lock
- * shared with us: a host login landing after the adapter's last read but
- * before the server's write can be lost, undetectably if overwritten. On
- * OpenCode 2 the corresponding residual window is the adapter's last file
- * read through its atomic rename. Readback detects only writes that survive
- * our write, not ones erased by it; no API returns the erased prior value.
- * The plugin's same-config writers hold `main-refresh` and cannot race it.
+ * Puts the placeholder into the slot through the fence. The fence is the
+ * check that the slot still holds the login being moved: exactly the
+ * (access, refresh) pair the transfer record names. The slot has no
+ * compare-and-replace write, so each adapter re-reads the slot just before
+ * it writes and refuses (`HostSlotChangedError`) when the login has changed:
+ * OpenCode 1's adapter (`opencode1ClientSlot`) right before it sends the
+ * write to OpenCode 1's server, OpenCode 2's adapter (`v2/host-slot.ts`)
+ * right before it renames the new `auth.json` into place.
+ *
+ * A small window stays open. Under OpenCode 1 the server reads and rewrites
+ * the whole file without any lock this plugin shares, so a login OpenCode
+ * writes after the adapter's last read and before the server's write can be
+ * lost, and nothing here can see that. Under OpenCode 2 the window is the
+ * time between the adapter's last read and its rename. The read-back after
+ * the write catches only a login written after the placeholder (it is still
+ * there to see), not one the placeholder overwrote: no API returns the value
+ * a write replaced. The plugin's own slot writers for this config root all
+ * hold `main-refresh` and so cannot land in that window.
  *
  * It runs under the legacy `main-refresh` lock, taken here on its own after
- * the row write (never before the store's row lock: see the lock-order note
- * at the top of this file). Every slot refresh takes that lock and re-reads
- * the slot under it, so while it is held nobody can start refreshing the
- * token this fence reads, and once the placeholder is in a refresh that
- * starts later finds nothing to refresh.
+ * the row write. Lock order (the full list is at the top of this file): the
+ * run's transfer locks, then the store's row and provider locks, then
+ * `main-refresh` and the fallback locks, then the `save` locks; the row
+ * write has released its locks before this takes `main-refresh`, so it never
+ * holds `main-refresh` while waiting for a row lock. Every slot refresh takes
+ * that lock and re-reads the slot under it, so while it is held nobody can
+ * start refreshing the token this fence reads, and once the placeholder is in
+ * a refresh that starts later finds nothing to refresh.
  */
 async function finishTransfer(
   ctx: Context,
@@ -1638,9 +1676,13 @@ async function completeTransfer(
   }
   const result = await finishTransfer(ctx, mode, record, operation)
   if (result.status === 'untagged-placeholder') {
-    // Unreleased builds wrote no origin. The copy may be this store's only
-    // credential, or a competing store may own it. Keep it, but do not route
-    // or refresh it without an explicit re-login or sole-owner confirmation.
+    // The slot holds an untagged placeholder: one without the `accountId`
+    // tag naming the config root that wrote it, as builds before this one
+    // wrote it. So nothing shows whether this store or another store sharing
+    // the slot moved the login. The row copy may be this store's only copy
+    // of the credential, so it is kept; another store may own the login, so
+    // the row is disabled and is neither routed nor refreshed until someone
+    // signs in again or re-enables it as the only store using this slot.
     await ctx.store.disable(
       record.rowId,
       POOL_UNTAGGED_TRANSFER_DISABLED_REASON,
@@ -1652,9 +1694,14 @@ async function completeTransfer(
         },
       },
     )
-    // Finish only the storage bookkeeping, not custody of this credential.
-    // Dropping the pending record lets an operator explicitly re-enable it
-    // without a later background tick disabling it again.
+    // Write the end-of-transfer bookkeeping without this store taking custody
+    // of the credential: the row stays disabled. That write clears the
+    // pending transfer record (the entry in this store's config that names
+    // this transfer), drops the shield `mainAccountId` and marks the store
+    // migrated. Clearing the record matters because every background run
+    // resumes a pending transfer; with the record left in place, a later run
+    // would reach this point again and disable the row that someone has
+    // since re-enabled.
     await writeFinished(ctx, mode)
     const key = `${ctx.paths.configPath}\0${record.rowId}`
     if (!untaggedLogged.has(key)) {
@@ -1667,8 +1714,14 @@ async function completeTransfer(
     return { status: 'refused', reason: 'placeholder-origin-unknown' }
   }
   if (result.status !== 'foreign-placeholder') return result
-  // Another store won custody. Remove only this transfer's exact copy, after
-  // releasing main-refresh, so removal takes row -> legacy locks as usual.
+  // The placeholder is tagged with another config root: another store sharing
+  // this slot finished moving the login, so the login is that store's. Remove
+  // the copy this transfer put into this store's row, and only if the row
+  // still holds exactly that copy, so this store does not route or refresh a
+  // second copy of the other store's token. `finishTransfer` has released
+  // `main-refresh` by now; the removal takes the row lock first and
+  // `main-refresh` after it, the order every lock holder follows (see the top
+  // of this file), which holding `main-refresh` here would break.
   await ctx.store.remove(record.rowId, {
     extraLocks: legacyRefreshLocks(ctx.paths, record.rowId, ctx.locks),
     protect: (_id, view) =>
@@ -1686,8 +1739,10 @@ const readOnlyLogged = new Set<string>()
 const untaggedLogged = new Set<string>()
 
 function placeholderOrigin(ctx: Context): string {
-  // accountId is an allowed OpenCode OAuth field and survives its schema
-  // decoder; an unknown extension field would be stripped by the host.
+  // The tag naming the config root that wrote the placeholder: a hash of its
+  // config path. It is stored in the OAuth `accountId` field because
+  // OpenCode's auth schema keeps that field and drops unknown ones, so a tag
+  // in a field of its own would not survive OpenCode's write.
   return `openai-auth-pool:${createHash('sha256').update(resolve(ctx.paths.configPath)).digest('hex')}`
 }
 
@@ -1771,8 +1826,12 @@ async function run(
   let runLock: HeldLock | undefined
   let slotLock: HeldLock | undefined
   try {
-    // Shared slot first, config run lock second, then row/provider/legacy/save.
-    // No refresh takes this outer lock, so it cannot invert the row order.
+    // Locks are taken in this order: `pool-slot-transfer` at the shared
+    // auth.json, then the run lock (`POOL_MIGRATION_LOCK_NAME`) at the config
+    // path, then, during the run, the store's row and provider locks, the
+    // legacy `main-refresh` and fallback locks, and the `save` locks. No
+    // token refresh takes `pool-slot-transfer`, so a refresh holding a row
+    // lock never waits for it and the two cannot deadlock.
     slotLock = await acquireLock(
       ctx,
       'pool-slot-transfer',
@@ -1815,8 +1874,13 @@ async function run(
 }
 
 /**
- * The checks that end a run before any lock: the migration marker. A pending
- * transfer always reaches the planner, regardless of marker or vault state.
+ * The checks that end a run before any lock, on the migration marker
+ * (`migratedAt` in the bookkeeping): a migration finds the store already
+ * migrated, or an adoption finds it not migrated yet. A pending transfer
+ * record skips these checks and goes straight to the planner, and nothing
+ * here looks at the vault: an interrupted transfer must be finished or
+ * rolled back whatever state the install is in now, or the slot and a row
+ * could be left sharing one token.
  */
 async function gate(
   ctx: Context,
@@ -1845,9 +1909,11 @@ async function gate(
   }
   if (mode === 'adopt' && book.migratedAt === undefined)
     return { status: 'not-migrated' }
-  // Vault custody is enforced by the account source's identity filter, not
-  // by leaving a real login in the slot. Adoption restores the placeholder
-  // that lets OpenCode install its fetch; vault-owned rows remain set aside.
+  // The vault is not checked. A pool row for an account the vault also holds
+  // is skipped by the account source (neither routed nor refreshed locally),
+  // so adoption can safely move a slot login into the pool and put the
+  // placeholder back, and it must: OpenCode 1 installs the plugin's fetch
+  // only when its `openai` slot holds an OAuth value.
   return undefined
 }
 

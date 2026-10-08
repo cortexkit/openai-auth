@@ -117,7 +117,11 @@ export interface PoolVaultRoutes {
   ): Promise<Response | undefined>
   /** Asks for a quota reading of a vault account admission refused for want of one. */
   requestReading(id: string): void
-  /** Live WebSocket rate-limit marks for vault accounts. */
+  /**
+   * Vault account id to the time (ms) until which that account counts as
+   * rate-limited, from rate-limit signals a WebSocket stream received
+   * mid-response. Routing treats the account as rate-limited until then.
+   */
   rateLimitMarks?(): ReadonlyMap<string, number>
 }
 
@@ -127,7 +131,9 @@ export type NoCredentialCause =
   | 'vault-refused'
   | 'missing-main'
 
-// Fixed text: the host also decides retries by matching the error message.
+// Keep these texts unchanged: OpenCode decides whether to retry a failed
+// request by matching the error message, so a reworded message could change
+// whether it retries.
 export const LOCAL_CREDENTIAL_REFUSALS: Record<NoCredentialCause, string> = {
   'missing-main':
     'Request refused locally: this setup has no main login in its account store. Sign in with opencode auth login.',

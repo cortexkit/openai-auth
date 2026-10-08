@@ -2806,11 +2806,17 @@ export async function CodexAuthPlugin(
           )
         }
 
-        // A stream outlives its fetch promise. Give each vault send a private
-        // attribution key so simultaneous sends (even on the same route) keep
-        // their own receipt until the body finishes or is cancelled. The WS
-        // pool strips this internal header before the wire; socket reuse still
-        // keys on the ChatGPT identity, not on this key.
+        // Quota and rate-limit frames for a vault account arrive on the
+        // WebSocket while the response body streams, after the fetch call has
+        // returned. So each vault send gets a unique key, passed to the
+        // WebSocket pool in its quota-account header and mapped here to the
+        // vault account and its quota receipt (which credential and account
+        // the vault served this send with, so a quota reading is recorded
+        // against the right one) until the body finishes or is cancelled. Two
+        // sends at once, even on the same account, therefore never share a
+        // receipt. The pool
+        // removes the header before the request goes out, and still reuses
+        // sockets by ChatGPT account, not by this key.
         const vaultStreams = new Map<
           string,
           { id: string; receipt: QuotaReceipt }

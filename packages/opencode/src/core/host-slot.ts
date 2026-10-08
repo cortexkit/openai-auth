@@ -54,9 +54,15 @@ export function mainSlotFamilyFingerprint(
 }
 
 /**
- * - `real`: an OAuth value that is not a tombstone (the pool placeholder is
- *   told apart by the caller);
- * - `tombstone`: the value the removed vault custody left in the slot;
+ * The pool placeholder is not a kind here: `classifyMainAuthSlot` reports it
+ * as `real`, so callers recognise it with `isPoolPlaceholder` before they
+ * classify a slot value.
+ * - `real`: an OAuth value that is not a tombstone;
+ * - `tombstone`: the value the removed vault custody mode ("handle mode")
+ *   wrote into the slot when it moved the account into the Claustrum vault:
+ *   an OAuth-shaped value with an empty access token and a fixed
+ *   `claustrum-tombstone:` refresh token (see `tombstone.ts` in the core
+ *   package). It is never a credential;
  * - `slot-absent`: confirmed missing;
  * - `api`: a platform API key, not a ChatGPT OAuth login to import;
  * - `indeterminate`: an unrecognized value, or a missing read that could not
@@ -273,7 +279,12 @@ export type OpencodeAuthSet = (input: {
   body: unknown
 }) => Promise<unknown>
 
-/** A valid environment override is read-only: OpenCode writes only the file. */
+/**
+ * Whether `OPENCODE_AUTH_CONTENT` is set to valid JSON. OpenCode 1 then
+ * reads its logins from that variable instead of `auth.json`, but writes only
+ * to the file, so a write to the slot would not change what OpenCode reads:
+ * the slot is read-only for migration and adoption.
+ */
 export function opencodeAuthIsEnvBacked(env: NodeJS.ProcessEnv): boolean {
   if (!env.OPENCODE_AUTH_CONTENT) return false
   try {
@@ -284,7 +295,11 @@ export function opencodeAuthIsEnvBacked(env: NodeJS.ProcessEnv): boolean {
   }
 }
 
-/** A host login changed after the read on which the placeholder was decided. */
+/**
+ * Thrown by a slot adapter asked to write the placeholder when the slot no
+ * longer holds the login the migration last read and based that write on.
+ * Nothing is written; the migration plans again on a later run.
+ */
 export class HostSlotChangedError extends Error {
   constructor() {
     super(
@@ -324,8 +339,11 @@ export function opencode1ClientSlot(options: {
     async set(input) {
       if (opencodeAuthIsEnvBacked(env))
         throw new Error('OPENCODE_AUTH_CONTENT supplies a read-only login slot')
-      // The SDK has no compare-and-set. Refuse changes visible before dispatch;
-      // OpenCode's server can still race between its own file read and write.
+      // OpenCode's client has no compare-and-set write. Before writing the
+      // placeholder, read the slot again and refuse if it differs from the
+      // value `get` last returned, which the migration based the write on.
+      // A login OpenCode's server writes between its own read and write of
+      // the file can still be lost; nothing here can see that.
       const current = (await readOpencodeAuthMap(path, env))[input.path.id]
       if (
         isPoolPlaceholder(input.body) &&

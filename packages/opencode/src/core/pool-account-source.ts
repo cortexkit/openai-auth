@@ -748,7 +748,13 @@ export class PoolAccountSource {
     )
   }
 
-  /** The current row's bearer; an old selection never authorizes a disabled or replaced login. */
+  /**
+   * The bearer to send for `row`, or undefined when it holds no unexpired
+   * token. The row is looked up again in the current snapshot, so a row
+   * chosen from an older snapshot never sends a login that has since been
+   * disabled, replaced (another identity or credential epoch), or found to
+   * belong to an account the vault holds.
+   */
   usableToken(row: PoolRow, now = this.now()): string | undefined {
     const current = this.snapshot.rows.find(
       (candidate) => candidate.id === row.id,
