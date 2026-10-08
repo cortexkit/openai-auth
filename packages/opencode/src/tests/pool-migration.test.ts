@@ -277,7 +277,7 @@ describe('migration', () => {
 })
 
 describe('the Claustrum vault', () => {
-  it('a placeholder slot with a connected vault does not warn, but a later real login does', async () => {
+  it('a placeholder and a later login with a connected vault recover without warning', async () => {
     await migrated()
     const warned: string[] = []
     const log = {
@@ -286,14 +286,15 @@ describe('the Claustrum vault', () => {
     }
     const deps = { ...h.deps({ log }), vaultServes: () => true }
     expect(await adoptHostSlotLogin(deps)).toEqual({
-      status: 'vault-owns-accounts',
+      status: 'nothing-to-import',
+      slot: 'placeholder',
     })
-    expect(warned).toEqual([])
     await h.setSlot(login('acct-new', 'r-new'))
-    expect(await adoptHostSlotLogin(deps)).toEqual({
-      status: 'vault-owns-accounts',
+    expect(await adoptHostSlotLogin(deps)).toMatchObject({
+      status: 'completed',
     })
-    expect(warned).toHaveLength(1)
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+    expect(warned).toEqual([])
   })
 
   it('a config still naming the custody mode of older versions migrates like any other', async () => {
@@ -310,10 +311,9 @@ describe('the Claustrum vault', () => {
     expect(await poolTokens(h)).toEqual(['r-fb1', 'r-main'])
   })
 
-  it('while the vault serves this host, a login in the slot is not adopted and nothing is written', async () => {
+  it('while the vault serves this host, adoption restores the placeholder without disconnecting', async () => {
     await migrated()
     await h.setSlot(login('acct-new', 'r-new'))
-    const before = await h.bytes()
     const warned: string[] = []
     const log = {
       info: () => {},
@@ -321,13 +321,10 @@ describe('the Claustrum vault', () => {
     }
     expect(
       await adoptHostSlotLogin({ ...h.deps({ log }), vaultServes: () => true }),
-    ).toEqual({ status: 'vault-owns-accounts' })
-    expect(await h.bytes()).toEqual(before)
-    expect(warned).toHaveLength(1)
-    // Without the vault the same login is adopted.
-    expect(await adoptHostSlotLogin(h.deps({ log }))).toMatchObject({
-      status: 'completed',
-    })
+    ).toMatchObject({ status: 'completed', rowId: 'acct-new' })
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+    expect(await poolTokens(h)).toContain('r-new')
+    expect(warned).toEqual([])
   })
 })
 

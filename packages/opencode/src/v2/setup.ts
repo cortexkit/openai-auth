@@ -287,9 +287,8 @@ export async function setupOpenAIAuth(
         slot: migrationSlot,
         version,
         fence,
-        // While the vault serves this host its accounts, a login in the slot
-        // is not adopted (the request path refuses it instead), as on
-        // OpenCode 1.
+        // Adoption restores the host placeholder even with vault accounts;
+        // the source excludes pool identities owned by the vault.
         runDeps: { vaultServes: () => vault.serves() },
         // A run may leave the pool holding a row this process has never
         // polled (or turn the install migrated); re-reading starts those

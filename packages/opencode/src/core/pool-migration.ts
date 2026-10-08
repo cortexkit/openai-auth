@@ -45,8 +45,9 @@
 // then the provider-wide lock, then the legacy `main-refresh` and fallback
 // locks. A transfer's row write takes the same locks in the same order: the
 // legacy locks go to the store as `extraLocks`, never held before it. So a
-// run holds only its own run lock (`POOL_MIGRATION_LOCK_NAME`, which no
-// refresh takes) while the store waits for a row lock, and a refresh waiting
+// run holds only its transfer locks (the shared auth.json lock and
+// `POOL_MIGRATION_LOCK_NAME`, neither waited for by refresh) while the store
+// waits for a row lock, and a refresh waiting
 // for `main-refresh` can never be waiting on this run. `main-refresh` is
 // taken on its own again, after the row write, around the placeholder write.
 //
@@ -55,6 +56,8 @@
 // "Waited" means polled until a timeout (the store's own locks, this file's
 // `acquireLock`, `withMainRefreshLock`, the legacy `save` pair); "tried"
 // means one attempt that gives up at once when the lock is held.
+//  0. `pool-slot-transfer` at auth.json: a migration or adoption run, held
+//     from start to end across config roots. No refresh path takes it.
 //  1. `pool-migration` at the config path: a migration or adoption run,
 //     held from start to end (waited). Only tried anywhere else.
 //  2. `bg-quota-refresh` at the config path: one background quota pass
@@ -109,8 +112,10 @@
 // adoption, and the placeholder fence below restarts a transfer whose slot
 // moved on to a new token of the same account.
 
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
+import { resolve } from 'node:path'
 import {
   acquireRefreshFileLock,
   writeJsonAtomic,
@@ -146,8 +151,10 @@ import { createLogger } from '../logger'
 import {
   asCompleteMainOauthSlot,
   confirmMainAuthSlot,
+  HostSlotChangedError,
   MAIN_REFRESH_LOCK_NAME,
   mainSlotFamilyFingerprint,
+  opencodeAuthPath,
 } from './host-slot.ts'
 import type {
   VersionFenceBlocker,
@@ -200,15 +207,24 @@ export const LEGACY_MAIN_REFRESH_LOCK_TTL_MS = 2 * 60_000
 /**
  * The file lock (at the config path) one migration or adoption run holds from
  * start to end, so two plugin processes never interleave their transfers. It
- * is always the first lock a run takes and no refresh path ever takes it, so
- * it cannot join a lock-order cycle. Its lease is the `main-refresh` lease
- * (`LegacyLockOptions.mainRefreshTtlMs`): a crashed run blocks the next one for
- * the same bounded time.
+ * is always taken after the shared auth.json transfer lock and before row
+ * locks; no refresh path ever waits for either transfer lock. Its lease is
+ * the `main-refresh` lease (`LegacyLockOptions.mainRefreshTtlMs`): a crashed
+ * run blocks the next one for the same bounded time.
  */
 export const POOL_MIGRATION_LOCK_NAME = 'pool-migration'
 
+/** A prerelease transfer whose bare placeholder cannot prove sole custody. */
+export const POOL_UNTAGGED_TRANSFER_DISABLED_REASON =
+  'slot-transfer-origin-unknown'
+export const POOL_UNTAGGED_TRANSFER_REMEDY =
+  'Sign in again with `opencode auth login`, or re-enable the row only if this config root is the only one using that auth.json.'
+
 /** The host login slot, shaped like the plugin's `client.auth`. */
 export interface HostSlotAdapter {
+  /** The shared auth.json path, independent of a plugin's config root. */
+  path?: string
+  migrationDisabledReason?: () => string | undefined
   get(input: { path: { id: string } }): Promise<unknown>
   set(input: { path: { id: string }; body: unknown }): Promise<unknown>
   all(): Promise<Record<string, unknown>>
@@ -278,15 +294,15 @@ export interface PoolMigrationDeps {
   >
   onStep?: (step: PoolMigrationStep) => void | Promise<void>
   /**
-   * Whether the Claustrum vault serves this host's accounts. While it does,
-   * an adoption leaves a real login in the slot where it is: the request
-   * path refuses to serve it, and moving it into the pool would make it a
-   * second owner of accounts the vault owns.
+   * Whether the Claustrum vault serves this host's accounts. Adoption still
+   * restores the placeholder; the account source sets aside any pool row
+   * whose identity the vault owns, without routing or refreshing it.
    */
   vaultServes?: () => boolean
 }
 
 export type SlotNothingKind =
+  | 'api'
   | 'placeholder'
   | 'empty'
   | 'tombstone'
@@ -294,7 +310,8 @@ export type SlotNothingKind =
   | 'declined'
 
 export type PoolTransferOutcome =
-  /** An adoption while the vault serves this host its accounts (see `vaultServes`); nothing was written. */
+  | { status: 'slot-read-only'; reason: string }
+  /** Legacy/custom adoption outcome; the built-in adopter now restores the slot even while vault accounts serve. */
   | { status: 'vault-owns-accounts' }
   /**
    * An openai-auth process older than this one is running (see
@@ -311,9 +328,15 @@ export type PoolTransferOutcome =
   /**
    * The slot holds the placeholder but this store has no `main` row and no
    * transfer of its own in progress: another store sharing this login slot
-   * moved the login. Nothing is written.
+   * moved the login (`placeholder-without-main`, nothing written). An
+   * unfinished prerelease transfer with an untagged placeholder instead
+   * preserves its copy disabled (`placeholder-origin-unknown`); its record
+   * is cleared without assuming custody.
    */
-  | { status: 'refused'; reason: 'placeholder-without-main' }
+  | {
+      status: 'refused'
+      reason: 'placeholder-without-main' | 'placeholder-origin-unknown'
+    }
   /** Adoption asked for before the migration ran. */
   | { status: 'not-migrated' }
   | { status: 'nothing-to-import'; slot: SlotNothingKind }
@@ -377,7 +400,8 @@ type SlotView =
       credentialFingerprint: string
       identity?: string
     }
-  | { kind: Exclude<SlotNothingKind, 'declined'> }
+  | { kind: 'placeholder'; origin?: string }
+  | { kind: Exclude<SlotNothingKind, 'declined' | 'placeholder'> }
   | { kind: 'indeterminate' }
 
 function placeholderWithoutMain(
@@ -863,7 +887,13 @@ function realView(credential: SlotCredential): SlotView {
 
 /** Classifies a single slot value that is known to exist. */
 function viewOf(value: unknown): SlotView {
-  if (isPoolPlaceholder(value)) return { kind: 'placeholder' }
+  if (isPoolPlaceholder(value))
+    return {
+      kind: 'placeholder',
+      ...(isRecord(value) && typeof value.accountId === 'string'
+        ? { origin: value.accountId }
+        : {}),
+    }
   const complete = asCompleteMainOauthSlot(value)
   if (!complete?.refresh.trim()) return { kind: 'empty' }
   return realView(complete)
@@ -1392,13 +1422,15 @@ async function writeRecord(
 
 /**
  * Puts the placeholder into the slot through the fence: the slot must still
- * hold exactly the (access, refresh) pair the record names, read again
- * right before the write. OpenCode's slot has no compare-and-replace, so a
- * login the host itself writes (its own `/login`, which takes no lock of
- * ours) between that last read and the write is still overwritten; that
- * window, the time one slot read and one slot write take, is declared, not
- * closed. The plugin's own slot writers all hold `main-refresh` and so
- * cannot land in it.
+ * hold exactly the (access, refresh) pair the record names. Both adapters
+ * re-read immediately before dispatch/rename and refuse a visible change.
+ * OpenCode 1's server still reads and writes the whole file without a lock
+ * shared with us: a host login landing after the adapter's last read but
+ * before the server's write can be lost, undetectably if overwritten. On
+ * OpenCode 2 the corresponding residual window is the adapter's last file
+ * read through its atomic rename. Readback detects only writes that survive
+ * our write, not ones erased by it; no API returns the erased prior value.
+ * The plugin's same-config writers hold `main-refresh` and cannot race it.
  *
  * It runs under the legacy `main-refresh` lock, taken here on its own after
  * the row write (never before the store's row lock: see the lock-order note
@@ -1412,7 +1444,7 @@ async function finishTransfer(
   mode: 'migrate' | 'adopt',
   record: PendingTransfer,
   operation: 'add' | 'rotate' | 'replace' | 'resumed',
-): Promise<RunStep> {
+): Promise<FinishStep> {
   const mainLock = await acquireLock(
     ctx,
     MAIN_REFRESH_LOCK_NAME,
@@ -1428,13 +1460,17 @@ async function finishTransfer(
 
 /** A run's next move: an outcome, or plan again from the top. */
 type RunStep = PoolTransferOutcome | { status: 'restart' }
+type FinishStep =
+  | RunStep
+  | { status: 'foreign-placeholder' }
+  | { status: 'untagged-placeholder' }
 
 async function finishUnderMainLock(
   ctx: Context,
   mode: 'migrate' | 'adopt',
   record: PendingTransfer,
   operation: 'add' | 'rotate' | 'replace' | 'resumed',
-): Promise<RunStep> {
+): Promise<FinishStep> {
   const completed = (
     placeholder: Extract<
       PoolTransferOutcome,
@@ -1458,6 +1494,9 @@ async function finishUnderMainLock(
   if (current.kind === 'indeterminate')
     return { status: 'retry', reason: 'host-slot-indeterminate' }
   if (current.kind === 'placeholder') {
+    if (current.origin === undefined) return { status: 'untagged-placeholder' }
+    if (current.origin !== placeholderOrigin(ctx))
+      return { status: 'foreign-placeholder' }
     await writeFinished(ctx, mode)
     await ctx.onStep('after-record-clear')
     return completed('already-present')
@@ -1510,7 +1549,19 @@ async function finishUnderMainLock(
     lastView.fingerprint !== record.slotFingerprint
   )
     return { status: 'retry', reason: 'slot-changed' }
-  await ctx.slot.set({ path: { id: PROVIDER }, body: { ...POOL_PLACEHOLDER } })
+  try {
+    await ctx.slot.set({
+      path: { id: PROVIDER },
+      body: {
+        ...POOL_PLACEHOLDER,
+        accountId: placeholderOrigin(ctx),
+      },
+    })
+  } catch (error) {
+    if (error instanceof HostSlotChangedError)
+      return { status: 'retry', reason: 'slot-changed' }
+    throw error
+  }
   await ctx.onStep('after-placeholder-write')
   const readback = await ctx.slot.get({ path: { id: PROVIDER } })
   // Whatever replaced the placeholder may be the token just copied into the
@@ -1522,6 +1573,10 @@ async function finishUnderMainLock(
   // account restarts the transfer, and anything else has moved on.
   if (!isPoolPlaceholder(readback))
     return { status: 'retry', reason: 'placeholder-overwritten' }
+  if (isRecord(readback) && readback.accountId === undefined)
+    return { status: 'untagged-placeholder' }
+  if (isRecord(readback) && readback.accountId !== placeholderOrigin(ctx))
+    return { status: 'foreign-placeholder' }
   await writeFinished(ctx, mode)
   await ctx.onStep('after-record-clear')
   return completed('written')
@@ -1581,11 +1636,60 @@ async function completeTransfer(
     await carryLegacyMainState(ctx, row)
     await ctx.onStep('after-carry-over')
   }
-  return finishTransfer(ctx, mode, record, operation)
+  const result = await finishTransfer(ctx, mode, record, operation)
+  if (result.status === 'untagged-placeholder') {
+    // Unreleased builds wrote no origin. The copy may be this store's only
+    // credential, or a competing store may own it. Keep it, but do not route
+    // or refresh it without an explicit re-login or sole-owner confirmation.
+    await ctx.store.disable(
+      record.rowId,
+      POOL_UNTAGGED_TRANSFER_DISABLED_REASON,
+      {
+        extraLocks: legacyRefreshLocks(ctx.paths, record.rowId, ctx.locks),
+        attribution: {
+          credentialEpoch: row.credentialEpoch as number,
+          ...(row.identity !== undefined ? { identity: row.identity } : {}),
+        },
+      },
+    )
+    // Finish only the storage bookkeeping, not custody of this credential.
+    // Dropping the pending record lets an operator explicitly re-enable it
+    // without a later background tick disabling it again.
+    await writeFinished(ctx, mode)
+    const key = `${ctx.paths.configPath}\0${record.rowId}`
+    if (!untaggedLogged.has(key)) {
+      untaggedLogged.add(key)
+      ctx.log.warn(
+        `Interrupted account transfer has an untagged placeholder; its credential was preserved disabled. ${POOL_UNTAGGED_TRANSFER_REMEDY}`,
+        { rowId: record.rowId },
+      )
+    }
+    return { status: 'refused', reason: 'placeholder-origin-unknown' }
+  }
+  if (result.status !== 'foreign-placeholder') return result
+  // Another store won custody. Remove only this transfer's exact copy, after
+  // releasing main-refresh, so removal takes row -> legacy locks as usual.
+  await ctx.store.remove(record.rowId, {
+    extraLocks: legacyRefreshLocks(ctx.paths, record.rowId, ctx.locks),
+    protect: (_id, view) =>
+      view.row?.fingerprint !== record.credentialFingerprint
+        ? 'the transfer row changed before rollback'
+        : undefined,
+  })
+  await clearRecord(ctx)
+  await repairShield(ctx)
+  return { status: 'refused', reason: 'placeholder-without-main' }
 }
 
 const deferredLogged = new Set<string>()
-const vaultSkipLogged = new Set<string>()
+const readOnlyLogged = new Set<string>()
+const untaggedLogged = new Set<string>()
+
+function placeholderOrigin(ctx: Context): string {
+  // accountId is an allowed OpenCode OAuth field and survives its schema
+  // decoder; an unknown extension field would be stripped by the host.
+  return `openai-auth-pool:${createHash('sha256').update(resolve(ctx.paths.configPath)).digest('hex')}`
+}
 
 /**
  * The processes that block the migration. A fence check that throws counts
@@ -1614,6 +1718,18 @@ async function run(
   fence?: () => Promise<VersionFenceResult>,
 ): Promise<PoolTransferOutcome> {
   const ctx = context(deps)
+  const disabled = ctx.slot.migrationDisabledReason?.()
+  if (disabled) {
+    const key = ctx.slot.path ?? opencodeAuthPath()
+    if (!readOnlyLogged.has(key)) {
+      readOnlyLogged.add(key)
+      ctx.log.info(
+        'account pool migration is off: the host login slot is read-only',
+        { reason: disabled },
+      )
+    }
+    return { status: 'slot-read-only', reason: disabled }
+  }
   let config: Record<string, unknown>
   try {
     config = await readConfig(ctx.paths.configPath)
@@ -1652,8 +1768,17 @@ async function run(
     }
   }
 
-  let runLock: HeldLock
+  let runLock: HeldLock | undefined
+  let slotLock: HeldLock | undefined
   try {
+    // Shared slot first, config run lock second, then row/provider/legacy/save.
+    // No refresh takes this outer lock, so it cannot invert the row order.
+    slotLock = await acquireLock(
+      ctx,
+      'pool-slot-transfer',
+      ctx.slot.path ?? opencodeAuthPath(),
+      ctx.locks.mainRefreshTtlMs,
+    )
     runLock = await acquireLock(
       ctx,
       POOL_MIGRATION_LOCK_NAME,
@@ -1661,6 +1786,7 @@ async function run(
       ctx.locks.mainRefreshTtlMs,
     )
   } catch (error) {
+    await slotLock?.release().catch(() => {})
     if (error instanceof LegacyLockContention)
       return { status: 'retry', reason: 'lock-contention' }
     throw error
@@ -1683,13 +1809,14 @@ async function run(
       }
     throw error
   } finally {
-    await runLock.release().catch(() => {})
+    await runLock?.release().catch(() => {})
+    await slotLock?.release().catch(() => {})
   }
 }
 
 /**
- * The checks that end a run before any lock: the migration marker (already
- * migrated, or not yet for an adoption) and, for an adoption, the vault.
+ * The checks that end a run before any lock: the migration marker. A pending
+ * transfer always reaches the planner, regardless of marker or vault state.
  */
 async function gate(
   ctx: Context,
@@ -1697,6 +1824,7 @@ async function gate(
   config: Record<string, unknown>,
 ): Promise<PoolTransferOutcome | undefined> {
   const book = readPoolMigrationBookkeeping(config)
+  if (book.pending) return undefined
   if (mode === 'migrate' && book.migratedAt !== undefined) {
     // Older builds marked a store migrated even when the placeholder in the
     // slot came from another store and no login was moved into this one.
@@ -1717,18 +1845,9 @@ async function gate(
   }
   if (mode === 'adopt' && book.migratedAt === undefined)
     return { status: 'not-migrated' }
-  if (mode === 'adopt' && ctx.vaultServes?.()) {
-    if (
-      !vaultSkipLogged.has(ctx.paths.configPath) &&
-      (await readSlot(ctx)).kind === 'real'
-    ) {
-      vaultSkipLogged.add(ctx.paths.configPath)
-      ctx.log.warn(
-        'a login in the OpenCode slot is not adopted: the Claustrum vault serves this host its accounts',
-      )
-    }
-    return { status: 'vault-owns-accounts' }
-  }
+  // Vault custody is enforced by the account source's identity filter, not
+  // by leaving a real login in the slot. Adoption restores the placeholder
+  // that lets OpenCode install its fetch; vault-owned rows remain set aside.
   return undefined
 }
 

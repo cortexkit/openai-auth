@@ -101,6 +101,7 @@ async function writeJson(path: string, value: unknown): Promise<void> {
 export function fileSlot(authPath: string): HostSlotAdapter {
   const logPath = `${authPath}.writes`
   return {
+    path: authPath,
     async get(input) {
       const map = (await readJson(authPath)) ?? {}
       return map[input.path.id]

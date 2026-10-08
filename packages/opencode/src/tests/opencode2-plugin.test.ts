@@ -650,9 +650,9 @@ describe('OpenCode 2 entry: the pool migration', () => {
       await Bun.sleep(50)
     expect(files.readConfig().openaiAuthPool?.migratedAt).toBeNumber()
     expect(files.readState().accounts.main?.refresh).toBe('slot-refresh')
-    expect(JSON.parse(readFileSync(authPath, 'utf8')).openai).toEqual(
-      POOL_PLACEHOLDER,
-    )
+    const placeholder = JSON.parse(readFileSync(authPath, 'utf8')).openai
+    expect(placeholder).toMatchObject(POOL_PLACEHOLDER)
+    expect(placeholder.accountId).toMatch(/^openai-auth-pool:[a-f0-9]{64}$/)
     // The migrated row serves; its token goes on the wire, the slot's
     // placeholder never does.
     deadline = Date.now() + 15_000
