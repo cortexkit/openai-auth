@@ -3,6 +3,8 @@ import type {
   DoctorCheck,
   DoctorFinding,
 } from '@cortexkit/common-auth/auth-menu'
+import { quotaCodec } from '@cortexkit/common-auth/quota'
+import { openPoolStore } from '@cortexkit/common-auth/store'
 import {
   type AccountPaths,
   type AccountStorage,
@@ -16,6 +18,10 @@ import {
   readConfigRosterIds,
   refreshBackoffActive,
 } from '@cortexkit/openai-auth-core/internal'
+import {
+  POOL_UNTAGGED_TRANSFER_DISABLED_REASON,
+  POOL_UNTAGGED_TRANSFER_REMEDY,
+} from '../core/pool-migration'
 
 export interface AuthDetails {
   type: string
@@ -36,6 +42,7 @@ export type AuthDoctorFindingCode =
   | 'tombstoned-host-slot'
   | 'tombstoned-account'
   | 'retired-custody-mode'
+  | 'slot-transfer-origin-unknown'
 
 export type AuthRepair =
   | { type: 'restore-main-credential' }
@@ -368,6 +375,23 @@ export function authDoctorChecks(deps: AuthDoctorCheckDeps): DoctorCheck[] {
           retiredCustodyMode,
           now: deps.now(),
         })
+        const pool = await openPoolStore({
+          provider: 'openai',
+          quota: quotaCodec,
+          configPath: deps.paths.configPath,
+          statePath: deps.paths.statePath,
+        }).read()
+        if (pool.status === 'ready') {
+          for (const row of pool.rows) {
+            if (row.disabledReason !== POOL_UNTAGGED_TRANSFER_DISABLED_REASON)
+              continue
+            report.findings.push({
+              code: 'slot-transfer-origin-unknown',
+              accountId: row.id,
+              message: `Account ${row.id} was preserved disabled after an interrupted transfer with an untagged placeholder; sole ownership could not be established. ${POOL_UNTAGGED_TRANSFER_REMEDY}`,
+            })
+          }
+        }
         return report.findings.map((finding) => {
           const repair = finding.repair ? repairFor(finding.repair) : undefined
           return {

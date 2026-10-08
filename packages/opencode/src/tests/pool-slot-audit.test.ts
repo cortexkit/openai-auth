@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { readFile } from 'node:fs/promises'
+import { quotaCodec } from '@cortexkit/common-auth/quota'
+import { openPoolStore } from '@cortexkit/common-auth/store'
+import {
+  loadAccounts,
+  mutateAccounts,
+} from '@cortexkit/openai-auth-core/internal'
+import { authDoctorChecks, readStoreIds } from '../auth/doctor'
 import { opencode1ClientSlot } from '../core/host-slot'
 import { PoolAccountSource } from '../core/pool-account-source'
 import { createPoolLifecycle } from '../core/pool-lifecycle'
@@ -8,6 +15,7 @@ import {
   isPoolPlaceholder,
   migrateToPool,
   POOL_PLACEHOLDER,
+  POOL_UNTAGGED_TRANSFER_DISABLED_REASON,
 } from '../core/pool-migration'
 import { routableRows } from '../core/pool-request'
 import { opencode1HostSlot } from '../v2/host-slot'
@@ -114,6 +122,74 @@ describe('login slot audit', () => {
     expect(outcome.status).toBe('refused')
     expect(await poolTokens(a)).not.toContain('r-main')
     expect(await a.slotValue()).toEqual(foreign)
+  })
+
+  test('an unfinished bare placeholder preserves its credential disabled and gives the doctor remedy', async () => {
+    const h = fresh()
+    await seedLegacyInstall(h)
+    await expect(
+      migrateToPool(
+        h.deps({
+          onStep: (step) => {
+            if (step === 'after-placeholder-write')
+              throw new Error('interrupted prerelease transfer')
+          },
+        }),
+      ),
+    ).rejects.toThrow('interrupted prerelease transfer')
+    await h.setSlot(POOL_PLACEHOLDER)
+    const warned: string[] = []
+    const deps = h.deps({
+      log: { info: () => {}, warn: (message) => warned.push(message) },
+    })
+    const outcome = await migrateToPool(deps)
+    const row = await h.row('main')
+    expect(
+      row?.credential?.type === 'oauth' ? row.credential.refresh : undefined,
+    ).toBe('r-main')
+    expect(row?.enabled).toBe(false)
+    expect(row?.disabledReason).toBe(POOL_UNTAGGED_TRANSFER_DISABLED_REASON)
+    expect(outcome).toEqual({
+      status: 'refused',
+      reason: 'placeholder-origin-unknown',
+    })
+    expect((await h.config()).openaiAuthPool.pending).toBeUndefined()
+    await migrateToPool(deps)
+    expect(warned).toHaveLength(1)
+    expect(warned[0]).toContain('opencode auth login')
+    const store = openPoolStore({
+      provider: 'openai',
+      ...h.paths,
+      quota: quotaCodec,
+    })
+    await store.disable('fb1', 'user-disabled')
+    const checks = authDoctorChecks({
+      paths: h.paths,
+      migrated: true,
+      readAuth: async () => ({ ...POOL_PLACEHOLDER }),
+      loadAccounts,
+      readStoreIds,
+      mutateAccounts,
+      setMainAuth: async () => {},
+      now: Date.now,
+    })
+    const findings = await checks[0]?.run()
+    const ambiguous = findings?.filter(
+      (finding) => finding.code === 'slot-transfer-origin-unknown',
+    )
+    expect(ambiguous).toHaveLength(1)
+    expect(ambiguous?.[0]?.accountId).toBe('main')
+    expect(ambiguous?.[0]?.message).toContain('opencode auth login')
+    expect(ambiguous?.[0]?.message).toContain('only one using that auth.json')
+    // Sole-owner confirmation is explicit: a later tick must not undo it.
+    await store.enable('main')
+    expect(await migrateToPool(deps)).toEqual({ status: 'already-migrated' })
+    expect((await h.row('main'))?.enabled).toBe(true)
+    expect(
+      (await checks[0]?.run())?.some(
+        (finding) => finding.code === 'slot-transfer-origin-unknown',
+      ),
+    ).toBe(false)
   })
 
   test('environment-backed auth never migrates or overwrites a disk login', async () => {

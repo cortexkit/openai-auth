@@ -27,6 +27,7 @@ import {
   POOL_MAIN_PLACEHOLDER_REFRESH,
 } from '../core/pool-main.ts'
 import {
+  adoptHostSlotLogin,
   migrateToPool,
   POOL_PLACEHOLDER_REFRESH,
 } from '../core/pool-migration.ts'
@@ -47,6 +48,7 @@ import { createFailurePhaseClock } from './failure-phase-clock.ts'
 import {
   harness,
   jwt,
+  login,
   seedLegacyInstall,
 } from './fixtures/pool-migration-harness.ts'
 import { createRequestTestScope } from './request-test-scope.ts'
@@ -347,6 +349,53 @@ describe('request path with the main account in the pool', () => {
     ).rejects.toThrow(LOGIN_REQUIRED_MESSAGE)
     expect(wire.sends).toEqual([])
     expect(wire.refreshTokens).toEqual([])
+  })
+
+  it('a completed base migration with an untagged placeholder still serves main and adopts later logins', async () => {
+    const h = harness()
+    try {
+      await seedLegacyInstall(h)
+      const config = await h.config()
+      config.routing = { mode: 'main-first' }
+      writeFileSync(h.paths.configPath, JSON.stringify(config))
+      await migrateToPool(h.deps())
+      await h.setSlot(PLACEHOLDER)
+      expect(await migrateToPool(h.deps())).toEqual({
+        status: 'already-migrated',
+      })
+      expect(await adoptHostSlotLogin(h.deps())).toEqual({
+        status: 'nothing-to-import',
+        slot: 'placeholder',
+      })
+      expect((await h.row('main'))?.enabled).toBe(true)
+      expect((await h.row('main'))?.disabledReason).toBeUndefined()
+      const bytes = await h.bytes()
+      writeFileSync(configFile, bytes.config as string)
+      writeFileSync(
+        process.env.OPENCODE_OPENAI_AUTH_STATE_FILE as string,
+        bytes.state as string,
+      )
+      const wire = installWire()
+      const fetchOverride = await loadFetch(async () => ({ ...PLACEHOLDER }))
+      const response = await fetchOverride(
+        'https://api.openai.com/v1/responses',
+        request(),
+      )
+      expect(response.status).toBe(200)
+      expect(wire.sends).toEqual([`Bearer ${jwt('acct-main')}`])
+      expectPlaceholderNeverRefreshed(wire)
+      await h.setSlot(login('acct-main', 'signed-in-again'))
+      expect(await adoptHostSlotLogin(h.deps())).toMatchObject({
+        status: 'completed',
+        rowId: 'main',
+      })
+      expect((await h.row('main'))?.enabled).toBe(true)
+      expect((await h.row('main'))?.credential).toMatchObject({
+        refresh: 'signed-in-again',
+      })
+    } finally {
+      h.cleanup()
+    }
   })
 
   it('an interrupted own migration still serves main after writing the placeholder', async () => {

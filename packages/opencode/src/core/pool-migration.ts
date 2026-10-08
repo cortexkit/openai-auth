@@ -214,6 +214,12 @@ export const LEGACY_MAIN_REFRESH_LOCK_TTL_MS = 2 * 60_000
  */
 export const POOL_MIGRATION_LOCK_NAME = 'pool-migration'
 
+/** A prerelease transfer whose bare placeholder cannot prove sole custody. */
+export const POOL_UNTAGGED_TRANSFER_DISABLED_REASON =
+  'slot-transfer-origin-unknown'
+export const POOL_UNTAGGED_TRANSFER_REMEDY =
+  'Sign in again with `opencode auth login`, or re-enable the row only if this config root is the only one using that auth.json.'
+
 /** The host login slot, shaped like the plugin's `client.auth`. */
 export interface HostSlotAdapter {
   /** The shared auth.json path, independent of a plugin's config root. */
@@ -322,9 +328,15 @@ export type PoolTransferOutcome =
   /**
    * The slot holds the placeholder but this store has no `main` row and no
    * transfer of its own in progress: another store sharing this login slot
-   * moved the login. Nothing is written.
+   * moved the login (`placeholder-without-main`, nothing written). An
+   * unfinished prerelease transfer with an untagged placeholder instead
+   * preserves its copy disabled (`placeholder-origin-unknown`); its record
+   * is cleared without assuming custody.
    */
-  | { status: 'refused'; reason: 'placeholder-without-main' }
+  | {
+      status: 'refused'
+      reason: 'placeholder-without-main' | 'placeholder-origin-unknown'
+    }
   /** Adoption asked for before the migration ran. */
   | { status: 'not-migrated' }
   | { status: 'nothing-to-import'; slot: SlotNothingKind }
@@ -1448,7 +1460,10 @@ async function finishTransfer(
 
 /** A run's next move: an outcome, or plan again from the top. */
 type RunStep = PoolTransferOutcome | { status: 'restart' }
-type FinishStep = RunStep | { status: 'foreign-placeholder' }
+type FinishStep =
+  | RunStep
+  | { status: 'foreign-placeholder' }
+  | { status: 'untagged-placeholder' }
 
 async function finishUnderMainLock(
   ctx: Context,
@@ -1479,6 +1494,7 @@ async function finishUnderMainLock(
   if (current.kind === 'indeterminate')
     return { status: 'retry', reason: 'host-slot-indeterminate' }
   if (current.kind === 'placeholder') {
+    if (current.origin === undefined) return { status: 'untagged-placeholder' }
     if (current.origin !== placeholderOrigin(ctx))
       return { status: 'foreign-placeholder' }
     await writeFinished(ctx, mode)
@@ -1557,6 +1573,8 @@ async function finishUnderMainLock(
   // account restarts the transfer, and anything else has moved on.
   if (!isPoolPlaceholder(readback))
     return { status: 'retry', reason: 'placeholder-overwritten' }
+  if (isRecord(readback) && readback.accountId === undefined)
+    return { status: 'untagged-placeholder' }
   if (isRecord(readback) && readback.accountId !== placeholderOrigin(ctx))
     return { status: 'foreign-placeholder' }
   await writeFinished(ctx, mode)
@@ -1619,6 +1637,35 @@ async function completeTransfer(
     await ctx.onStep('after-carry-over')
   }
   const result = await finishTransfer(ctx, mode, record, operation)
+  if (result.status === 'untagged-placeholder') {
+    // Unreleased builds wrote no origin. The copy may be this store's only
+    // credential, or a competing store may own it. Keep it, but do not route
+    // or refresh it without an explicit re-login or sole-owner confirmation.
+    await ctx.store.disable(
+      record.rowId,
+      POOL_UNTAGGED_TRANSFER_DISABLED_REASON,
+      {
+        extraLocks: legacyRefreshLocks(ctx.paths, record.rowId, ctx.locks),
+        attribution: {
+          credentialEpoch: row.credentialEpoch as number,
+          ...(row.identity !== undefined ? { identity: row.identity } : {}),
+        },
+      },
+    )
+    // Finish only the storage bookkeeping, not custody of this credential.
+    // Dropping the pending record lets an operator explicitly re-enable it
+    // without a later background tick disabling it again.
+    await writeFinished(ctx, mode)
+    const key = `${ctx.paths.configPath}\0${record.rowId}`
+    if (!untaggedLogged.has(key)) {
+      untaggedLogged.add(key)
+      ctx.log.warn(
+        `Interrupted account transfer has an untagged placeholder; its credential was preserved disabled. ${POOL_UNTAGGED_TRANSFER_REMEDY}`,
+        { rowId: record.rowId },
+      )
+    }
+    return { status: 'refused', reason: 'placeholder-origin-unknown' }
+  }
   if (result.status !== 'foreign-placeholder') return result
   // Another store won custody. Remove only this transfer's exact copy, after
   // releasing main-refresh, so removal takes row -> legacy locks as usual.
@@ -1636,6 +1683,7 @@ async function completeTransfer(
 
 const deferredLogged = new Set<string>()
 const readOnlyLogged = new Set<string>()
+const untaggedLogged = new Set<string>()
 
 function placeholderOrigin(ctx: Context): string {
   // accountId is an allowed OpenCode OAuth field and survives its schema

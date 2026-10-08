@@ -202,7 +202,8 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
       return
     }
     if (outcome.status === 'refused') {
-      noticePlaceholderWithoutMain()
+      if (outcome.reason === 'placeholder-without-main')
+        noticePlaceholderWithoutMain()
       // Signing in for this setup, or pointing it at the store that holds the
       // login, resolves the refusal. Stay unmigrated and check again at the
       // quiet adoption interval, without repeating the warning.

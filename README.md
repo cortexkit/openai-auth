@@ -217,6 +217,8 @@ Downgrading after the account-pool migration is unsupported. The migration repla
 
 When `OPENCODE_AUTH_CONTENT` supplies OpenCode 1's login, the slot is read-only for migration and adoption. The plugin leaves the environment login and `auth.json` untouched and continues using the login as before; unset the override to migrate the disk login.
 
+Development installs that interrupted a transfer on an unreleased build may have an untagged placeholder with an unfinished transfer record. Its credential is preserved disabled, rather than deleted or assumed to belong to this store. The auth doctor lists the row: sign in again with `opencode auth login`, or re-enable it only if this config root is the only one using that `auth.json`. Already completed development migrations with an untagged placeholder keep working unchanged, including later login adoption.
+
 Static OpenAI API keys held in the vault (`apikey:openai`) are not used: they are never listed, read or routed. Every request this plugin sends goes to the ChatGPT Codex endpoint, which takes ChatGPT logins, not platform API keys, so only the vault's OpenAI logins serve.
 
 An install that used the vault custody of earlier versions may still hold its tombstones (in accounts, or in OpenCode's slot) and the `claustrum.mode` setting. They are never sent; the auth doctor lists them, with the remedy: connect the vault, or sign in to the account again.

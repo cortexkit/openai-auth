@@ -1102,3 +1102,42 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-slot-a
 test_count_pattern = "Ran {count} test"
 expect_red = ["^login\\sslot\\saudit\\sa\\sforeign\\splaceholder\\sin\\sreadback\\scannot\\scomplete\\scustody$"]
 expect_message = "Received: \"completed\""
+
+[[control]]
+id = "pool-untagged-pending-copy-is-preserved-disabled"
+guards = "a prerelease pending transfer with no placeholder origin cannot delete its possibly sole credential"
+file = "packages/opencode/src/core/pool-migration.ts"
+old = "    if (current.origin === undefined) return { status: 'untagged-placeholder' }"
+new = "    if (false) return { status: 'untagged-placeholder' } // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/pool-slot-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-slot-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^login\\sslot\\saudit\\san\\sunfinished\\sbare\\splaceholder\\spreserves\\sits\\scredential\\sdisabled\\sand\\sgives\\sthe\\sdoctor\\sremedy$"]
+expect_message = "Received: undefined"
+
+[[control]]
+id = "pool-untagged-disabled-copy-is-listed-by-doctor"
+guards = "the doctor names only the ambiguous disabled row and gives sign-in or explicit sole-owner re-enable remedies"
+file = "packages/opencode/src/auth/doctor.ts"
+old = "            if (row.disabledReason !== POOL_UNTAGGED_TRANSFER_DISABLED_REASON)"
+new = "            if (true) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/pool-slot-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-slot-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^login\\sslot\\saudit\\san\\sunfinished\\sbare\\splaceholder\\spreserves\\sits\\scredential\\sdisabled\\sand\\sgives\\sthe\\sdoctor\\sremedy$"]
+expect_message = "Received length: 0"
+
+[[control]]
+id = "pool-completed-bare-placeholder-still-serves"
+guards = "an already completed prerelease migration with a bare placeholder is never disabled and keeps serving main and adopting logins"
+file = "packages/opencode/src/core/pool-migration.ts"
+old = "  if (mode === 'migrate' && book.migratedAt !== undefined) {"
+new = "  if (mode === 'migrate' && book.migratedAt !== undefined) {\n    const value = await ctx.slot.get({ path: { id: PROVIDER } })\n    if (isPoolPlaceholder(value) && isRecord(value) && value.accountId === undefined) await ctx.store.disable('main', POOL_UNTAGGED_TRANSFER_DISABLED_REASON) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/pool-main-request.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-main-request.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^request\\spath\\swith\\sthe\\smain\\saccount\\sin\\sthe\\spool\\sa\\scompleted\\sbase\\smigration\\swith\\san\\suntagged\\splaceholder\\sstill\\sserves\\smain\\sand\\sadopts\\slater\\slogins$"]
+expect_message = "Received: false"
