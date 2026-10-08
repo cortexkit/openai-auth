@@ -23,9 +23,9 @@ permissions:
 
 env:
   # The ckdev-mutate runner that replays mutations.toml (cortexkit/commons,
-  # crate cortexkit-mutate 0.8.0), pinned so a runner change never alters CI
+  # crate cortexkit-mutate 0.9.5), pinned so a runner change never alters CI
   # unannounced.
-  CKDEV_MUTATE_REV: 46cc166b0df2edcfd14b3eb54ed6eeac588fed69
+  CKDEV_MUTATE_REV: 73c7e66145e131eadffdd874c82d93548868b668
 
 jobs:
   check:
