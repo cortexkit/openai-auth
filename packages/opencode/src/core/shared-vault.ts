@@ -18,7 +18,9 @@ type Entry = {
   quotaPoll?: ReturnType<typeof setInterval>
 }
 
-// Both OpenCode entries may be bundled/loaded separately in one process.
+// OpenCode 1 (`index.ts`) and OpenCode 2 (`v2/setup.ts`) are separate bundle
+// entries, and one process can load either of them once per project. The
+// registry lives on a process-wide symbol so every copy finds the same entries.
 const registryKey = Symbol.for('@cortexkit/openai-auth/opencode-vaults')
 const processState = globalThis as typeof globalThis & {
   [registryKey]?: Map<string, Entry>
@@ -26,7 +28,12 @@ const processState = globalThis as typeof globalThis & {
 const entries = processState[registryKey] ?? new Map<string, Entry>()
 processState[registryKey] = entries
 
-/** A plugin owns a lease, not the host's consumer or either of its pollers. */
+/**
+ * Gives one plugin instance (one project) a reference to the vault consumer
+ * this process shares for the host's vault state. The instance releases only
+ * its own reference: the consumer, its roster poll and its quota poll keep
+ * running while any other project still holds one.
+ */
 export function acquireOpenCodeVault(
   options: OpenAiVaultOptions,
   poolPaths: AccountPaths,
@@ -55,8 +62,9 @@ export function acquireOpenCodeVault(
       connectionFile: () => connectionFile,
       // ClaustrumClient uses projectRoot only as identity.project_root metadata; scoped authorization uses the enrollment token.
       ...(!isolated ? { projectRoot: stateDir } : {}),
-      // Holders use the same store; consult only live sources, including one
-      // already loaded while another project's loader is still starting.
+      // Every holder of this entry reads the same pool store (the store paths
+      // are part of the key), so a route id any current holder has loaded is
+      // reserved. A released holder is no longer in the set and is never asked.
       reservedRouteIds: () =>
         new Set([...holders].flatMap((live) => [...live.reservedRouteIds()])),
     })

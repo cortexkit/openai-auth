@@ -1461,8 +1461,11 @@ export async function CodexAuthPlugin(
   // Background writer for the sidebar updates requests make (routing display,
   // pushed quota, sticky pins); the loader installs one per run.
   let sidebarBookkeeping: SidebarBookkeepingQueue | undefined
-  // Each project holds a lease on the host's consumer; only its last
-  // holder closes it. Pool sources all read this process's configured store.
+  // The vault state belongs to the host, not the project, so every project
+  // this process loads shares one vault consumer (`core/shared-vault.ts`).
+  // This instance holds a reference and releases it on dispose; the consumer
+  // closes when the last project releases. All of them route over the same
+  // pool store, the one `getConfigPath()` names for this process.
   const vaultLease = acquireOpenCodeVault(
     {
       host: 'opencode',
@@ -1489,8 +1492,11 @@ export async function CodexAuthPlugin(
     getAccountPaths(getConfigPath()),
   )
   const vault = vaultLease.vault
-  // All holders wait for the same first discovery before treating a local
-  // row as host-owned. Setup and the loader never wait for that read.
+  // Until the vault's first account list arrives, a local pool row signed in
+  // as an account the vault holds looks like this host's own and could be
+  // served or adopted twice. Login adoption and first-sight quota polls wait
+  // for that shared first read (bounded); plugin setup and the loader never
+  // do, so OpenCode's startup does not depend on the vault.
   const vaultFirstRoster = vaultLease.firstRoster
   const vaultNotUsed = Promise.withResolvers<void>()
   const vaultReadyForAdoption = Promise.race([
@@ -1812,8 +1818,9 @@ export async function CodexAuthPlugin(
         poolLifecycle?.start()
         const auth = await getAuth()
         if (auth.type !== 'oauth') {
-          // This loader does not use the vault. Let its adoption proceed,
-          // without settling another holder's pending first discovery.
+          // No OAuth login, so this instance never starts the vault. Release
+          // its own login-adoption wait; the shared first read stays pending
+          // for the other projects that do use the vault.
           vaultNotUsed.resolve()
           return {}
         }
