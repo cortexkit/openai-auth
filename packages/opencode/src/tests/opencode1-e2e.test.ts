@@ -3,13 +3,14 @@
 // through a `file://` URL, over an install that has not moved into the
 // account pool yet, and checks that the move happens on OpenCode 1's own
 // plugin client: the login in OpenCode 1's `auth.json` lands in pool row
-// `main`, the slot is left the placeholder, and a request afterwards is
-// served from the row.
+// `main`, its `auth.json` entry holds the pool placeholder instead of real
+// credentials, and a request afterwards is served from the row.
 //
 // It needs the build (`bun run build`) and the binary, so it runs only with
 // OPENAI_AUTH_OPENCODE1_E2E=1 (its own CI job, after the build). The binary is
-// installed from npm at the pinned version unless
-// OPENAI_AUTH_OPENCODE1_E2E_BIN names one already on disk.
+// supplied by the locked fixture's platform package, without lifecycle scripts.
+// Install both hosts locally from the repository root with this one command:
+// for host in opencode1 opencode2; do npm ci --ignore-scripts --prefix packages/opencode/src/tests/fixtures/$host-host || exit; done
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
@@ -32,6 +33,7 @@ import {
 } from '@cortexkit/openai-auth-core/internal'
 import { authDoctorChecks, readStoreIds } from '../auth/doctor'
 import { isPoolPlaceholder, POOL_MIGRATION_KEY } from '../core/pool-migration'
+import { hostBinary } from './fixtures/opencode-host'
 import {
   MOCK_ACCOUNTS,
   type MockCodex,
@@ -40,7 +42,6 @@ import {
 } from './fixtures/opencode2-mock-codex'
 
 const ENABLED = process.env.OPENAI_AUTH_OPENCODE1_E2E === '1'
-const BINARY = process.env.OPENAI_AUTH_OPENCODE1_E2E_BIN
 export const OPENCODE1_VERSION = '1.18.30'
 const HOUR = 3600_000
 // The login OpenCode 1 holds before the move: the mock backend's account V,
@@ -393,29 +394,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 1 (real host)', () => {
     if (!existsSync(BUILT_PLUGIN))
       throw new Error(`no plugin build at ${BUILT_PLUGIN}; run bun run build`)
     scratch = mkdtempSync(join(tmpdir(), 'oai-oc1-cli-'))
-    if (BINARY) {
-      binary = BINARY
-    } else {
-      writeFileSync(join(scratch, 'package.json'), '{"private":true}\n')
-      // npm, not bun: the package installs its platform binary from a
-      // lifecycle script, which bun does not run for untrusted packages.
-      const install = spawnSync(
-        'npm',
-        [
-          'install',
-          '--no-audit',
-          '--no-fund',
-          '--no-save',
-          `opencode-ai@${OPENCODE1_VERSION}`,
-        ],
-        { cwd: scratch, encoding: 'utf8' },
-      )
-      if (install.status !== 0)
-        throw new Error(
-          `opencode-ai install failed:\n${install.stdout}\n${install.stderr}`,
-        )
-      binary = join(scratch, 'node_modules', '.bin', 'opencode')
-    }
+    binary = hostBinary(1)
     const version = spawnSync(binary, ['--version'], {
       encoding: 'utf8',
     }).stdout.trim()

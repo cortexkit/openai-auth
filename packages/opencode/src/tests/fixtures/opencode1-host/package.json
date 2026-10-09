@@ -1,0 +1,8 @@
+{
+  "name": "openai-auth-opencode1-host-fixture",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "opencode-ai": "1.18.30"
+  }
+}

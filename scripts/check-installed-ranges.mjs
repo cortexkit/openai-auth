@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 // Refuses to build when an installed dependency does not satisfy the range its
-// workspace declares.
+// package declares, including the separately installed real-host fixtures.
 //
 // `bun install --frozen-lockfile` does not check this. It only asks whether a
 // package.json implies changes to the lockfile; it never checks the lockfile
@@ -27,18 +27,27 @@ function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf8'))
 }
 
-function workspaceDirs() {
+function packageDirs() {
   const dirs = [root]
-  const packages = join(root, 'packages')
-  for (const name of readdirSync(packages)) {
-    if (existsSync(join(packages, name, 'package.json')))
-      dirs.push(join(packages, name))
+  function walk(parent) {
+    for (const entry of readdirSync(parent, { withFileTypes: true })) {
+      if (
+        !entry.isDirectory() ||
+        entry.name === 'node_modules' ||
+        entry.name === '.git'
+      )
+        continue
+      const dir = join(parent, entry.name)
+      if (existsSync(join(dir, 'package.json'))) dirs.push(dir)
+      walk(dir)
+    }
   }
+  walk(join(root, 'packages'))
   return dirs
 }
 
 // Node's own lookup: the nearest node_modules/<name> walking up from the
-// workspace. Reading package.json directly avoids `exports` maps that do not
+// package. Reading package.json directly avoids `exports` maps that do not
 // expose it.
 function installedVersion(fromDir, name) {
   let dir = fromDir
@@ -53,7 +62,7 @@ function installedVersion(fromDir, name) {
 
 const problems = []
 let checked = 0
-for (const dir of workspaceDirs()) {
+for (const dir of packageDirs()) {
   const manifest = readJson(join(dir, 'package.json'))
   const label = manifest.name ?? dir
   for (const section of SECTIONS) {
