@@ -34,14 +34,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
       - run: bun install --frozen-lockfile
+      - name: Install locked OpenCode host fixtures without lifecycle scripts
+        run: |
+          for host in opencode1 opencode2; do
+            npm ci --ignore-scripts --prefix packages/opencode/src/tests/fixtures/$host-host || exit
+          done
       - run: bun run types
       - run: bun run build
       - run: bun run test
       - run: bun run format:check
       - run: bun run lint
   # Runs the plugin's OpenCode 2 entry, packed as a consumer installs it, in
-  # the real OpenCode 2 CLI (installed from npm at test time, pinned in the
-  # test) against a loopback mock of the Codex backend. It fails when a host
+  # the real OpenCode 2 CLI (pinned in its locked fixture) against a loopback
+  # mock of the Codex backend. It fails when a host
   # release stops carrying the pool account to the wire, rerouting a refused
   # request, recording quota, or storing logins in the pool.
   opencode2-e2e:
@@ -54,6 +59,11 @@ jobs:
           node-version: "24"
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
       - run: bun install --frozen-lockfile
+      - name: Install locked OpenCode host fixtures without lifecycle scripts
+        run: |
+          for host in opencode1 opencode2; do
+            npm ci --ignore-scripts --prefix packages/opencode/src/tests/fixtures/$host-host || exit
+          done
       - run: bun run build
       - name: OpenCode 2 end to end
         env:
@@ -61,7 +71,7 @@ jobs:
         working-directory: packages/opencode
         run: bun test src/tests/opencode2-e2e.test.ts
   # Runs the plugin's OpenCode 1 entry, from this checkout's build, in the
-  # real OpenCode 1 binary (`opencode-ai` from npm, pinned in the test) over
+  # real OpenCode 1 binary (`opencode-ai`, pinned in its locked fixture) over
   # an install that has not moved into the account pool. It fails when the
   # move does not happen on OpenCode 1's own plugin client, or when the
   # request after it is not served from the pool.
@@ -75,6 +85,11 @@ jobs:
           node-version: "24"
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
       - run: bun install --frozen-lockfile
+      - name: Install locked OpenCode host fixtures without lifecycle scripts
+        run: |
+          for host in opencode1 opencode2; do
+            npm ci --ignore-scripts --prefix packages/opencode/src/tests/fixtures/$host-host || exit
+          done
       - run: bun run build
       - name: OpenCode 1 end to end
         env:
@@ -95,6 +110,11 @@ jobs:
           fetch-depth: 0
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
       - run: bun install --frozen-lockfile
+      - name: Install locked OpenCode host fixtures without lifecycle scripts
+        run: |
+          for host in opencode1 opencode2; do
+            npm ci --ignore-scripts --prefix packages/opencode/src/tests/fixtures/$host-host || exit
+          done
       - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         id: mutate-cache
         with:
@@ -126,6 +146,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
       - run: bun install --frozen-lockfile
+      - name: Install locked OpenCode host fixtures without lifecycle scripts
+        run: |
+          for host in opencode1 opencode2; do
+            npm ci --ignore-scripts --prefix packages/opencode/src/tests/fixtures/$host-host || exit
+          done
       - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         id: mutate-cache
         with:

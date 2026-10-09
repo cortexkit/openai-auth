@@ -1,10 +1,11 @@
 // openai-auth on the real OpenCode 2 host: runs `@opencode/cli` against a
 // loopback mock of the Codex backend with two pool accounts, the plugin
 // loaded from the packed package's `./server` entry, and checks what reached
-// the wire and what landed in the pool. It installs the CLI from npm, so it
-// runs only with OPENAI_AUTH_OPENCODE2_E2E=1 (its own CI job, after the
-// build). OPENAI_AUTH_OPENCODE2_E2E_CLI_DIR may name a directory that already
-// holds the pinned CLI install, to skip the install while iterating.
+// the wire and what landed in the pool. It runs only with
+// OPENAI_AUTH_OPENCODE2_E2E=1 (its own CI job, after the build). The binary is
+// supplied by the locked fixture's platform package, without lifecycle scripts.
+// Install both hosts locally from the repository root with this one command:
+// for host in opencode1 opencode2; do npm ci --ignore-scripts --prefix packages/opencode/src/tests/fixtures/$host-host || exit; done
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
@@ -28,6 +29,7 @@ import {
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import { POOL_PLACEHOLDER } from '../core/pool-migration'
 import { CODEX_USER_AGENT, CODEX_VERSION } from '../index'
+import { hostBinary } from './fixtures/opencode-host'
 import {
   MOCK_ACCOUNTS,
   type MockAccount,
@@ -40,7 +42,6 @@ import {
 import { installPackedPlugin, PACKAGE_NAME } from './fixtures/opencode2-pack'
 
 const ENABLED = process.env.OPENAI_AUTH_OPENCODE2_E2E === '1'
-const REUSE_CLI_DIR = process.env.OPENAI_AUTH_OPENCODE2_E2E_CLI_DIR
 export const OPENCODE_CLI_VERSION = '2.0.22'
 const PLACEHOLDER = placeholderSecret('openai')
 const PASSWORD = 'openai-auth-e2e-loopback-only'
@@ -552,30 +553,7 @@ function expectOnlyPoolAccountsOnWire(result: ScenarioResult) {
 describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
   beforeAll(async () => {
     scratch = mkdtempSync(join(tmpdir(), 'oai-oc2-cli-'))
-    const cliDir = REUSE_CLI_DIR ?? join(scratch, 'cli')
-    if (!REUSE_CLI_DIR) {
-      mkdirSync(cliDir, { recursive: true })
-      writeFileSync(join(cliDir, 'package.json'), '{"private":true}\n')
-      // npm, not bun: the CLI package installs its platform binary from a
-      // lifecycle script, which bun does not run for untrusted packages.
-      const install = spawnSync(
-        'npm',
-        [
-          'install',
-          '--no-audit',
-          '--no-fund',
-          '--no-save',
-          `@opencode/cli@${OPENCODE_CLI_VERSION}`,
-        ],
-        { cwd: cliDir, encoding: 'utf8' },
-      )
-      if (install.status !== 0)
-        throw new Error(
-          `CLI install failed:\n${install.stdout}\n${install.stderr}`,
-        )
-    }
-    cli = join(cliDir, 'node_modules', '.bin', 'opencode2')
-    if (!existsSync(cli)) throw new Error(`no opencode2 binary at ${cli}`)
+    cli = hostBinary(2)
     const version = spawnSync(cli, ['--version'], {
       encoding: 'utf8',
     }).stdout.trim()
