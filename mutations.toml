@@ -1436,3 +1436,42 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/check-installed-ranges.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^installed\srange\sbuild\sgate\sskips\sa\snested\shost\sfixture\sthat\sis\snot\sinstalled,\sso\sa\sbuild\sneeds\sno\sfixtures$']
+
+
+# OpenCode 2 ownership is determined from the credential prepared for the send.
+
+[[control]]
+id = "opencode2-placeholder-ownership-gate"
+guards = "a migrated pool leaves an API-key request untouched when the prepared bearer is not the pool placeholder"
+file = "packages/opencode/src/v2/setup.ts"
+old = """    gateOnPlaceholder: {
+      credential: (headers) => {
+        const authorization = headers.get('authorization')
+        return authorization?.startsWith('Bearer ')
+          ? authorization.slice('Bearer '.length)
+          : undefined
+      },
+    },"""
+new = "    // NON-VACUITY BREAK: remove the shared placeholder equality gate."
+test_file = "packages/opencode/src/tests/opencode2-active-connection.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-active-connection.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sactive\\sconnection\\sgate\\sleaves\\san\\sactive\\sAPI\\skey\\suntouched\\sand\\srecords\\sno\\spool\\sfeedback$"]
+
+[[control]]
+id = "opencode2-request-bound-credential"
+guards = "switching connections changes the next prepared request's ownership instead of reusing a placeholder decision"
+file = "packages/opencode/src/v2/setup.ts"
+old = """        const authorization = headers.get('authorization')
+        return authorization?.startsWith('Bearer ')
+          ? authorization.slice('Bearer '.length)
+          : undefined"""
+new = """        // NON-VACUITY BREAK: treat every prepared credential as the pool placeholder.
+        void headers
+        return 'common-auth-placeholder.openai'"""
+test_file = "packages/opencode/src/tests/opencode2-active-connection.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-active-connection.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sactive\\sconnection\\sgate\\sswitches\\sfrom\\sthe\\splaceholder\\sto\\san\\sAPI\\skey\\sand\\sback\\son\\sthe\\snext\\srequest$"]

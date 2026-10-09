@@ -97,7 +97,9 @@ async function expectUntouched(host: Host, token: string) {
   expect(model).toEqual(modelBefore)
   const { request, original } = await http(host, token)
   expect(request).toBe(original)
-  expect(request.headers.get('authorization')).toBe(`Bearer ${token}`)
+  expect(request.headers.get('authorization')).toBe(
+    token ? `Bearer ${token}` : 'Bearer',
+  )
   expect(await request.clone().text()).toBe(await original.clone().text())
   const response = quotaResponse()
   const reply = { ...scope(), request, response }
@@ -151,6 +153,9 @@ describe('OpenCode 2 active connection gate', () => {
     })
     const rows = structuredClone(files.readConfig().commonAuthPool.rows)
     const state = files.readState()
+    expect(
+      (await http(host, 'sk-user-key')).request.headers.get('authorization'),
+    ).toBe('Bearer sk-user-key')
     await expectUntouched(host, 'sk-user-key')
     await stop()
     expect(files.readConfig().commonAuthPool.rows).toEqual(rows)
@@ -185,7 +190,9 @@ describe('OpenCode 2 active connection gate', () => {
         ...scope(),
         headers: { authorization: `Bearer ${PLACEHOLDER}` },
         url: 'wss://api.openai.com/v1/responses',
-        request: new Request('https://api.openai.com/v1/responses'),
+        request: new Request('https://api.openai.com/v1/responses', {
+          headers: { authorization: `Bearer ${PLACEHOLDER}` },
+        }),
       }
       const error = await host.fire(name, draft).then(
         () => {

@@ -328,6 +328,14 @@ export async function setupOpenAIAuth(
     log,
   })
   const installation = await installOpenCode2Auth(ctx, openai.adapter, {
+    gateOnPlaceholder: {
+      credential: (headers) => {
+        const authorization = headers.get('authorization')
+        return authorization?.startsWith('Bearer ')
+          ? authorization.slice('Bearer '.length)
+          : undefined
+      },
+    },
     logger: {
       warn: (message, data) => log.warn(message, { data }),
     },
