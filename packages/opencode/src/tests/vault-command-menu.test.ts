@@ -143,7 +143,7 @@ describe('vault command menu', () => {
           'utf8',
         ),
       )
-      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.11.7')
+      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.11.8')
     }
   })
   test('accounts name the vault owner and exclude set-aside locals from routing count', async () => {

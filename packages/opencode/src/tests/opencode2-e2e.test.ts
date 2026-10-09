@@ -255,8 +255,10 @@ async function runScenario(input: {
   turns: Turn[]
   plugin?: string
   login?: boolean
-  /** A real key connection imported into the host instead of the pool placeholder. */
+  /** The API key the host prepares instead of the account pool's placeholder bearer. */
   apiKey?: string
+  /** Omit the pool bearer to show that importing legacy auth.json does not activate pool routing. */
+  preparePoolCredential?: boolean
   mode?: 'sticky-balanced' | 'fallback-first'
   /** The model every turn uses; `gpt-5.5` by default. */
   model?: string
@@ -276,26 +278,13 @@ async function runScenario(input: {
   }
   const configDir = join(isolated.XDG_CONFIG_HOME, 'opencode')
   seedPool(configDir, input.accounts, input.mode)
-  // OpenCode 2 imports legacy auth.json into its active connection table.
-  // Provider settings alone supply a driver key, not an active pool login.
-  const dataDir = join(isolated.XDG_DATA_HOME, 'opencode')
-  mkdirSync(dataDir, { recursive: true })
-  writeFileSync(
-    join(dataDir, 'auth.json'),
-    JSON.stringify({
-      openai: input.apiKey
-        ? { type: 'api', key: input.apiKey }
-        : input.upgrade
-          ? POOL_PLACEHOLDER
-          : {
-              type: 'oauth',
-              access: PLACEHOLDER,
-              refresh: PLACEHOLDER,
-              expires: Date.now() + 24 * HOUR,
-            },
-    }),
-  )
   if (input.upgrade) {
+    const dataDir = join(isolated.XDG_DATA_HOME, 'opencode')
+    mkdirSync(dataDir, { recursive: true })
+    writeFileSync(
+      join(dataDir, 'auth.json'),
+      JSON.stringify({ openai: POOL_PLACEHOLDER }),
+    )
     env.OPENAI_AUTH_E2E_DESTINATIONS = join(root, 'destinations.jsonl')
   }
   let daemon: MockDaemon | undefined
@@ -334,6 +323,11 @@ async function runScenario(input: {
         providers: {
           openai: {
             settings: {
+              // Prepare exactly the credential selected for this scenario.
+              // An old auth.json alone must not activate pool routing.
+              ...(input.preparePoolCredential === false
+                ? {}
+                : { apiKey: input.apiKey ?? PLACEHOLDER }),
               ...(input.upgrade === 'default'
                 ? {}
                 : { baseURL: `${mock.url}/v1` }),
@@ -388,7 +382,7 @@ async function runScenario(input: {
           '--server',
           serverURL,
           '--method',
-          'chatgpt-browser',
+          'openai-auth-pool-browser',
         ],
         project,
         env,
@@ -659,7 +653,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     if (scratch) rmSync(scratch, { recursive: true, force: true })
   })
 
-  test('http: an active API key bypasses a migrated pool without attribution', async () => {
+  test('http: a prepared API key bypasses a migrated pool without attribution', async () => {
     const key = 'sk-opencode2-user-key'
     const result = await runScenario({
       transport: 'http',
@@ -685,7 +679,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     })
   }, 180_000)
 
-  test('first run after OpenCode 1 upgrade reaches Codex without a provider baseURL', async () => {
+  test('a selected pool placeholder after OpenCode 1 upgrade reaches Codex without a provider baseURL', async () => {
     const result = await runScenario({
       transport: 'http',
       upgrade: 'default',
@@ -705,7 +699,28 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     })
   }, 180_000)
 
-  test('first run after OpenCode 1 upgrade keeps a custom provider baseURL', async () => {
+  test('an imported OpenCode 1 placeholder alone does not activate pool routing', async () => {
+    const result = await runScenario({
+      transport: 'http',
+      upgrade: 'custom',
+      accounts: ['A'],
+      preparePoolCredential: false,
+      turns: [{}],
+    })
+    verify(result, () => {
+      expect(result.exits).toEqual([0])
+      const sent = samplesOn(result, 'http')
+      expect(sent.length).toBe(1)
+      expect(sent[0]?.headers['chatgpt-account-id']).toBeUndefined()
+      expect(sent[0]?.headers.originator).toBeUndefined()
+      expect(
+        primaries(result.wire).every((record) => record.identity === 'none'),
+      ).toBe(true)
+      expect(usedOn(result, 'main')).toBe(5)
+    })
+  }, 180_000)
+
+  test('a selected pool placeholder after OpenCode 1 upgrade keeps a custom provider baseURL', async () => {
     const result = await runScenario({
       transport: 'http',
       upgrade: 'custom',

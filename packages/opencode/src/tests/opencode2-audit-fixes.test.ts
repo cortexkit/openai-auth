@@ -16,6 +16,7 @@ import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore } from '@cortexkit/common-auth/store'
 import type { Credential } from '@opencode/plugin'
+import { POOL_LOGIN_REQUIRED_MESSAGE } from '../core/pool-main'
 import { POOL_PLACEHOLDER } from '../core/pool-migration'
 import { NO_OPENCODE1_LOGINS, opencode1HostSlot } from '../v2/host-slot'
 import { writeLoginToPool } from '../v2/login'
@@ -133,7 +134,7 @@ async function waitFor(check: () => boolean, ms: number): Promise<boolean> {
 }
 
 describe('OpenCode 2 entry: the migration switch', () => {
-  it('leaves an unmigrated install alone while the switch is off: no migration, no hooks, no login methods', async () => {
+  it('leaves an unmigrated install alone while the switch is off but refuses a cached pool placeholder', async () => {
     const slot = {
       type: 'oauth',
       access: jwt('chatgpt-main'),
@@ -150,9 +151,22 @@ describe('OpenCode 2 entry: the migration switch', () => {
         return { open: true }
       },
     })
-    // OpenCode 2's own ChatGPT login keeps serving: nothing of this plugin
-    // sits on its requests or replaces its login methods.
-    expect(host.hooks).toEqual([])
+    // The host's real credential remains untouched; the only request the
+    // disabled pool may handle is a local refusal of its cached placeholder.
+    const original = new Request('https://api.openai.com/v1/responses', {
+      headers: { authorization: 'Bearer real-host-token' },
+    })
+    const stock = { ...scope(), request: original }
+    await host.fire('http.request', stock)
+    expect(stock.request).toBe(original)
+    await expect(httpRequest(host)).rejects.toThrow(POOL_LOGIN_REQUIRED_MESSAGE)
+    await expect(
+      host.fire('experimental.ws.handshake', {
+        ...scope(),
+        url: 'wss://api.openai.com/v1/responses',
+        headers: { authorization: `Bearer ${PLACEHOLDER}` },
+      }),
+    ).rejects.toThrow(POOL_LOGIN_REQUIRED_MESSAGE)
     expect(host.methods).toEqual([])
     // A migration run checks the version fence before anything else, so a
     // fence that is never asked means no migration ran.

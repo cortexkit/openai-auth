@@ -7,7 +7,8 @@ export function codexBaseURL(endpoint: string): string {
 export function codexRequestURL(url: string, endpoint: string): string {
   const original = new URL(url)
   if (
-    original.hostname !== 'api.openai.com' ||
+    (original.origin !== 'https://api.openai.com' &&
+      original.origin !== 'wss://api.openai.com') ||
     !/\/responses\/?$/.test(original.pathname)
   )
     return url

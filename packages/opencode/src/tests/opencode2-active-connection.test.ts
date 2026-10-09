@@ -1,15 +1,18 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 import { rmSync } from 'node:fs'
 import {
+  isPlaceholderCredential,
   OpenCode2AuthError,
   placeholderCredential,
   placeholderSecret,
 } from '@cortexkit/common-auth/opencode2'
 import type { Credential } from '@opencode/plugin'
+import { POOL_BROWSER_METHOD } from '../v2/login'
 import { setupOpenAIAuth } from '../v2/setup'
 import {
   fakeOpenCode2Host,
   poolFiles,
+  type RegisteredMethod,
   scope,
   seedPool,
 } from './fixtures/opencode2-host'
@@ -18,7 +21,7 @@ const PLACEHOLDER = placeholderSecret('openai')
 const poolCredential = () =>
   placeholderCredential({
     integrationID: 'openai',
-    methodID: 'chatgpt-browser',
+    methodID: POOL_BROWSER_METHOD,
     now: Date.now(),
   })
 const cleanups: Array<() => Promise<void>> = []
@@ -26,10 +29,14 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
 })
 
-async function start(credential: Credential.Value, rows = [{ id: 'main' }]) {
+async function start(
+  credential: Credential.Value,
+  rows = [{ id: 'main' }],
+  methods: RegisteredMethod[] = [],
+) {
   const files = poolFiles()
   seedPool(files, 'main-first', rows)
-  const host = fakeOpenCode2Host({ activeCredential: credential })
+  const host = fakeOpenCode2Host({ activeCredential: credential, methods })
   const dispose = await setupOpenAIAuth(host.ctx, {
     paths: files.paths,
     heartbeat: false,
@@ -83,8 +90,13 @@ async function http(host: Host, token: string) {
     }),
   }
   const original = draft.request
+  const before = {
+    url: original.url,
+    headers: Object.fromEntries(original.headers),
+    body: await original.clone().text(),
+  }
   await host.fire('http.request', draft)
-  return { request: draft.request, original }
+  return { request: draft.request, original, before }
 }
 
 async function expectUntouched(host: Host, token: string) {
@@ -95,12 +107,16 @@ async function expectUntouched(host: Host, token: string) {
   const modelBefore = structuredClone(model)
   await host.fire('model.request', model)
   expect(model).toEqual(modelBefore)
-  const { request, original } = await http(host, token)
+  const { request, original, before } = await http(host, token)
   expect(request).toBe(original)
   expect(request.headers.get('authorization')).toBe(
     token ? `Bearer ${token}` : 'Bearer',
   )
-  expect(await request.clone().text()).toBe(await original.clone().text())
+  expect({
+    url: request.url,
+    headers: Object.fromEntries(request.headers),
+    body: await request.clone().text(),
+  }).toEqual(before)
   const response = quotaResponse()
   const reply = { ...scope(), request, response }
   await host.fire('http.response', reply)
@@ -248,7 +264,11 @@ describe('OpenCode 2 active connection gate', () => {
 
   it('copies a real host login without activating the pool', async () => {
     const credential: Credential.OAuth = {
-      ...poolCredential(),
+      ...placeholderCredential({
+        integrationID: 'openai',
+        methodID: 'chatgpt-browser',
+        now: Date.now(),
+      }),
       type: 'oauth',
       access: 'host-token',
       refresh: 'host-refresh',
@@ -264,6 +284,58 @@ describe('OpenCode 2 active connection gate', () => {
         (row) => row.refresh === 'host-refresh',
       ),
     ).toBe(true)
+  })
+
+  it('keeps a built-in ChatGPT login real when the host refreshes it', async () => {
+    const credential: Credential.OAuth = {
+      ...placeholderCredential({
+        integrationID: 'openai',
+        methodID: 'chatgpt-browser',
+        now: Date.now(),
+      }),
+      access: 'builtin-host-token',
+      refresh: 'builtin-host-refresh',
+      metadata: { accountID: 'builtin-account' },
+    }
+    const refreshedCredential: Credential.OAuth = {
+      ...credential,
+      access: 'builtin-refreshed-token',
+      refresh: 'builtin-refreshed-refresh',
+      expires: Date.now() + 86400000,
+    }
+    const builtin: RegisteredMethod = {
+      integrationID: 'openai',
+      method: {
+        id: 'chatgpt-browser',
+        type: 'oauth',
+        label: 'ChatGPT Pro/Plus (browser)',
+      },
+      authorize: async () => ({
+        url: 'https://auth.openai.test',
+        instructions: 'host login',
+        mode: 'auto',
+        callback: Promise.resolve(credential),
+      }),
+      refresh: async () => refreshedCredential,
+    }
+    const authorization = await builtin.authorize(undefined)
+    if (typeof authorization.callback === 'function')
+      throw new Error('unexpected code flow')
+    const { host, stop } = await start(
+      await authorization.callback,
+      [{ id: 'main' }],
+      [builtin],
+    )
+    await expectUntouched(host, 'builtin-host-token')
+    const refreshed = await host.refreshActiveCredential()
+    expect(refreshed).toEqual(refreshedCredential)
+    expect(isPlaceholderCredential(refreshed)).toBe(false)
+    expect(
+      host.methods.find((entry) => entry.method.id === 'chatgpt-browser'),
+    ).toBe(builtin)
+    await expectUntouched(host, 'builtin-refreshed-token')
+    await stop()
+    expect(host.getActiveCredential()).toEqual(refreshed)
   })
 
   it('uses the prepared request credential rather than the current active connection', async () => {

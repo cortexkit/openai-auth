@@ -468,7 +468,7 @@ describe('OpenCode 2 entry: logins', () => {
       }),
     })) as OpenAIAuthV2Options['beginLogin']
 
-  async function signIn(host: Host, methodID = 'chatgpt-browser') {
+  async function signIn(host: Host, methodID = 'openai-auth-pool-browser') {
     const method = host.methods.find(
       (entry) =>
         entry.integrationID === 'openai' && entry.method.id === methodID,
@@ -479,13 +479,17 @@ describe('OpenCode 2 entry: logins', () => {
     return (await authorization.callback) as Credential.OAuth
   }
 
-  it('registers both ChatGPT logins on integration openai', async () => {
+  it('registers distinct pool login methods and labels on integration openai', async () => {
     const { host } = await startPool('main-first', [{ id: 'main' }])
     expect(
       host.methods.map((entry) => [entry.integrationID, entry.method.id]),
     ).toEqual([
-      ['openai', 'chatgpt-browser'],
-      ['openai', 'chatgpt-headless'],
+      ['openai', 'openai-auth-pool-browser'],
+      ['openai', 'openai-auth-pool-headless'],
+    ])
+    expect(host.methods.map((entry) => entry.method.label)).toEqual([
+      'ChatGPT (openai-auth pool, browser)',
+      'ChatGPT (openai-auth pool, headless)',
     ])
   })
 
@@ -493,7 +497,7 @@ describe('OpenCode 2 entry: logins', () => {
     const { host, files } = await startPool('main-first', [{ id: 'main' }], {
       beginLogin: login('chatgpt-new'),
     })
-    const credential = await signIn(host, 'chatgpt-headless')
+    const credential = await signIn(host, 'openai-auth-pool-headless')
     expect(isPlaceholderCredential(credential, 'openai')).toBe(true)
     expect(credential.access).not.toContain('chatgpt-new')
     const accounts = files.readConfig().accounts
@@ -880,6 +884,12 @@ describe('Codex destination after transport ownership', () => {
   })
 
   it('uses the configured Codex base and preserves custom transport destinations', () => {
+    expect(
+      codexRequestURL(
+        'https://api.openai.com:8443/v1/responses',
+        'https://codex.example/responses',
+      ),
+    ).toBe('https://api.openai.com:8443/v1/responses')
     expect(
       codexRequestURL(
         'https://api.openai.com/v1/responses?trace=1',

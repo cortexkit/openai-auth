@@ -1388,7 +1388,7 @@ expect_red = ['^vault\scommand\smenu\sa\shost-wide\scheck\spolls\seach\svault\sa
 id = "menu-common-auth-release"
 guards = "the shared menu requires the published common-auth replacement-slot release"
 file = "packages/core/package.json"
-old = '"@cortexkit/common-auth": "^0.11.7"'
+old = '"@cortexkit/common-auth": "^0.11.8"'
 new = '"@cortexkit/common-auth": "^0.11.4"'
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
@@ -1438,7 +1438,8 @@ test_count_pattern = "Ran {count} test"
 expect_red = ['^installed\srange\sbuild\sgate\sskips\sa\snested\shost\sfixture\sthat\sis\snot\sinstalled,\sso\sa\sbuild\sneeds\sno\sfixtures$']
 
 
-# OpenCode 2 ownership is determined from the credential prepared for the send.
+# OpenCode 2: the pool handles a send only when the host-prepared bearer is its
+# placeholder; requests using other credentials pass through unchanged.
 
 [[control]]
 id = "opencode2-placeholder-ownership-gate"
@@ -1475,3 +1476,34 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-active-connection.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ["^OpenCode\\s2\\sactive\\sconnection\\sgate\\sswitches\\sfrom\\sthe\\splaceholder\\sto\\san\\sAPI\\skey\\sand\\sback\\son\\sthe\\snext\\srequest$"]
+
+
+[[control]]
+id = "opencode2-pool-login-preserves-builtin-refresh"
+guards = "registering pool logins must not replace the host's ChatGPT method or turn its background refresh into a pool placeholder"
+file = "packages/opencode/src/v2/login.ts"
+old = """export const POOL_BROWSER_METHOD = 'openai-auth-pool-browser'
+export const POOL_HEADLESS_METHOD = 'openai-auth-pool-headless'"""
+new = """// NON-VACUITY BREAK: overwrite the host's built-in ChatGPT methods.
+export const POOL_BROWSER_METHOD = 'chatgpt-browser'
+export const POOL_HEADLESS_METHOD = 'chatgpt-headless'"""
+test_file = "packages/opencode/src/tests/opencode2-active-connection.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-active-connection.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sactive\\sconnection\\sgate\\skeeps\\sa\\sbuilt-in\\sChatGPT\\slogin\\sreal\\swhen\\sthe\\shost\\srefreshes\\sit$"]
+
+
+[[control]]
+id = "opencode2-disabled-pool-refuses-placeholder"
+guards = "even when migration is disabled, a cached pool placeholder is refused locally while real credentials bypass the plugin"
+file = "packages/opencode/src/v2/setup.ts"
+old = "    return () => installation.dispose()"
+new = """    // NON-VACUITY BREAK: remove the disabled store's local placeholder refusal.
+    await installation.dispose()
+    return async () => {}"""
+test_file = "packages/opencode/src/tests/opencode2-audit-fixes.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-audit-fixes.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sentry:\\sthe\\smigration\\sswitch\\sleaves\\san\\sunmigrated\\sinstall\\salone\\swhile\\sthe\\sswitch\\sis\\soff\\sbut\\srefuses\\sa\\scached\\spool\\splaceholder$"]

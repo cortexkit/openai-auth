@@ -432,9 +432,10 @@ describe('vault accounts on OpenCode 2', () => {
     const method = host.methods.find(
       (entry) =>
         entry.integrationID === 'openai' &&
-        entry.method.id === 'chatgpt-browser',
+        entry.method.id === 'openai-auth-pool-browser',
     )
-    if (!method) throw new Error('no chatgpt-browser method registered')
+    if (!method)
+      throw new Error('no openai-auth-pool-browser method registered')
     const signing = Date.now()
     const authorization = await method.authorize({})
     const signedIn = authorization.callback

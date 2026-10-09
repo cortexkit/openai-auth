@@ -3,8 +3,9 @@
 // OpenCode 2's built-in OpenAI plugin offers two ChatGPT logins on
 // integration `openai` (methods `chatgpt-browser` and `chatgpt-headless`) and
 // stores the result in its own credential table. openai-auth registers its
-// own methods under the same ids, so they replace the built-in ones: the login
-// runs openai-auth's own OAuth flows (`beginAccountLogin`, the same browser
+// pool methods alongside them under plugin-scoped ids, leaving the built-in
+// methods and their refresh handlers intact. A pool login runs openai-auth's
+// own OAuth flows (`beginAccountLogin`, the same browser
 // and device flows OpenCode 1 uses), the account lands in the pool, and
 // OpenCode 2 keeps only a placeholder (`registerOpenCode2AuthMethods`).
 //
@@ -54,9 +55,9 @@ export type BeginLogin = (
   options: BeginAccountLoginOptions,
 ) => Promise<BeginAccountLoginResult>
 
-/** The method ids OpenCode 2's built-in OpenAI plugin uses for ChatGPT logins. */
-export const CHATGPT_BROWSER_METHOD = 'chatgpt-browser'
-export const CHATGPT_HEADLESS_METHOD = 'chatgpt-headless'
+/** Pool methods never replace the host's own ChatGPT login or refresh handlers. */
+export const POOL_BROWSER_METHOD = 'openai-auth-pool-browser'
+export const POOL_HEADLESS_METHOD = 'openai-auth-pool-headless'
 
 export function chatgptLoginMethods(input: {
   beginLogin: BeginLogin
@@ -79,8 +80,8 @@ export function chatgptLoginMethods(input: {
     },
   })
   return [
-    method(CHATGPT_BROWSER_METHOD, 'ChatGPT Pro/Plus (browser)', false),
-    method(CHATGPT_HEADLESS_METHOD, 'ChatGPT Pro/Plus (headless)', true),
+    method(POOL_BROWSER_METHOD, 'ChatGPT (openai-auth pool, browser)', false),
+    method(POOL_HEADLESS_METHOD, 'ChatGPT (openai-auth pool, headless)', true),
   ]
 }
 
