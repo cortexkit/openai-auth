@@ -635,6 +635,41 @@ describe('enrollment', () => {
 })
 
 describe('auth account menu with vault accounts', () => {
+  test('reset preview spend and retry refuse shadowed live and expired local credentials without refreshing or sending', async () => {
+    await startDaemon({
+      'oauth:openai:main': vaultLogin('chatgpt-main'),
+      'oauth:openai:ufuk': vaultLogin('chatgpt-ufuk'),
+    })
+    seedPool(files, [
+      { id: 'main', expires: Date.now() - 1 },
+      { id: 'ufuk', expires: Date.now() + 3600_000 },
+    ])
+    enroll()
+    const wire = installWire()
+    const { vault } = await plugin()
+    const polls = wire.polls.length
+    const state = readFileSync(files.stateFile, 'utf8')
+    for (const id of ['main', 'ufuk']) {
+      for (const actionId of ['preview', 'spend', 'retry']) {
+        const result = await applyOpenAiMenu(__menuContextForTest()!, {
+          command: 'openai',
+          sectionId: 'reset',
+          itemId: id,
+          actionId,
+          confirmed: true,
+        })
+        expect(result.ok).toBe(false)
+        expect(result.text).toMatch(
+          /no usable access token|token is unavailable/,
+        )
+      }
+    }
+    expect(wire.refreshTokens).toEqual([])
+    expect(wire.polls.length).toBe(polls)
+    expect(readFileSync(files.stateFile, 'utf8')).toBe(state)
+    vault.close()
+  })
+
   async function menu(keys: string[], vault: OpenAiVault) {
     const scripted = scriptedTerminal(keys)
     const methods = createAuthMethods({

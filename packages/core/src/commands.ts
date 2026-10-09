@@ -66,6 +66,8 @@ import {
   vaultConnectOutcome,
   vaultEnrollmentLine,
 } from './vault'
+import type { MenuVault } from './vault-account-menu'
+import { createVaultCommandMenu } from './vault-command-menu'
 
 /** The one slash command, without the slash. */
 export const OPENAI_COMMAND_NAME = 'openai'
@@ -997,6 +999,9 @@ export function resetCreditsSection(
 
 export interface OpenAiMenuOptions {
   store: PoolStore
+  vault?: MenuVault
+  /** Set when quotaCheck polls vault accounts too, to avoid polling them twice. */
+  quotaCheckIncludesVault?: boolean
   /**
    * The legacy locks the menu's writes that name no single row take (the
    * roster order, settings, a new account).
@@ -1039,7 +1044,7 @@ export const FLOOR_LABELS = ['primary', 'secondary'] as const
  * the notice and `apply` changes nothing.
  */
 export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
-  const menu = createCommandMenu({
+  const menuOptions = {
     command: OPENAI_COMMAND_NAME,
     title: OPENAI_MENU_TITLE,
     store: withSettingsMigration(
@@ -1063,7 +1068,14 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
     ...(options.extras ? { extras: options.extras } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
     ...(options.now ? { now: options.now } : {}),
-  })
+  }
+  const menu = options.vault
+    ? createVaultCommandMenu(
+        menuOptions,
+        options.vault,
+        options.quotaCheckIncludesVault,
+      )
+    : createCommandMenu(menuOptions)
   // A copy of the caller's context taken before the first await, as the
   // shared menu does: work left running reports through this copy even if
   // the host rebinds its context object for another session meanwhile.

@@ -166,6 +166,7 @@ export const INTERNAL_VALUE_EXPORTS = [
   'resetWindowIsExhausted',
   'resolveMidStreamRateLimitResetAt',
   'runResetCreditRedemption',
+  'runVaultAccountMenu',
   'saveAccountState',
   'saveAccounts',
   'selectCreditToSpend',

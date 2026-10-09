@@ -185,6 +185,66 @@ function enroll() {
 }
 
 describe('Pi and the Claustrum vault', () => {
+  test('the shared Accounts Quota and Limits slots include vault accounts and set aside their local copy', async () => {
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:work': vaultLogin('chatgpt-work') },
+    })
+    enroll()
+    const target = vault()
+    const runtime = runtimeWith(target)
+    try {
+      await target.refresh()
+      const support = runtime.commandSupport()
+      await support.store().add({
+        id: 'local',
+        identity: 'chatgpt-work',
+        credential: {
+          type: 'oauth',
+          access: 'local-token',
+          refresh: 'local-refresh',
+          expires: Date.now() + 3600_000,
+        },
+      })
+      await target.pollStale(0)
+      const command = createPiMenu(support)
+      const { menu } = await command.open({ notify() {} })
+      const route = target.routes()[0]!.id
+      expect(menu.sections.slice(0, 4).map((section) => section.id)).toEqual([
+        'accounts',
+        'quota',
+        'routing',
+        'limits',
+      ])
+      for (const id of ['accounts', 'quota', 'limits']) {
+        const section = menu.sections.find((section) => section.id === id)!
+        expect(section.items.map((item) => item.id)).toEqual(['local', route])
+        expect(section.items[0]!.detail).toContain('set aside')
+      }
+      const applied = await command.apply(
+        {
+          command: 'openai',
+          sectionId: 'limits',
+          itemId: route,
+          actionId: 'floors',
+          values: { primary: 22, secondary: 11 },
+        },
+        { notify() {} },
+      )
+      expect(applied.ok).toBe(true)
+      expect(
+        applied.menu.sections
+          .find((section) => section.id === 'limits')
+          ?.items.find((item) => item.id === route)?.detail,
+      ).toBe('floors: primary 22%, secondary 11%')
+      expect(menu.sections.some((section) => section.id === 'reset')).toBe(
+        false,
+      )
+    } finally {
+      target.close()
+    }
+  })
+
   test("Connect in the Vault section enrolls Pi under its own name and stores Pi's token owner-only", async () => {
     daemon = await startMockDaemon({
       directory: dir,

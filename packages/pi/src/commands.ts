@@ -82,6 +82,8 @@ export function createPiMenu(
   const version = dependencies.packageVersion ?? packageJson.version
   return createOpenAiMenu({
     store: pool.store(),
+    vault: pool.vault,
+    quotaCheckIncludesVault: true,
     login: {
       begin: (options) => begin({ ...options, version }),
       mainIdentity: async () => pool.mainIdentity(),

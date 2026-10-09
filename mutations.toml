@@ -1215,3 +1215,150 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-main-r
 test_count_pattern = "Ran {count} test"
 expect_red = ["^request\\spath\\swith\\sthe\\smain\\saccount\\sin\\sthe\\spool\\sa\\scompleted\\sbase\\smigration\\swith\\san\\suntagged\\splaceholder\\sstill\\sserves\\smain\\sand\\sadopts\\slater\\slogins$"]
 expect_message = "Received: false"
+
+# The command and auth login menus share the vault's account identities and
+# active route ids, so a local copy of a vault-owned account stays set aside.
+
+[[control]]
+id = "menu-vault-ownership"
+guards = "shadowed locals do not count as routes and identify the vault account that serves them"
+file = "packages/core/src/vault-account-menu.ts"
+old = "  return row.identity !== undefined && view.identities.has(row.identity)"
+new = "  return false // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\saccounts\sname\sthe\svault\sowner\sand\sexclude\sset-aside\slocals\sfrom\srouting\scount$']
+
+[[control]]
+id = "menu-vault-roster"
+guards = "Quota lists vault accounts beside the same local rows as Accounts"
+file = "packages/core/src/vault-command-menu.ts"
+old = "            ...(includeVaultRows ? view.status.accounts : []).map("
+new = "            ...(false ? view.status.accounts : []).map( // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\squota\slists\sthe\ssame\saccounts\sand\sdates\sstale\sreadings\sin\sboth\ssections$']
+
+[[control]]
+id = "menu-quota-age"
+guards = "a reading older than fifteen minutes cannot appear as current"
+file = "packages/core/src/vault-account-menu.ts"
+old = "  if (age <= 15 * 60_000) return undefined"
+new = "  if (true) return undefined // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\sa\sreading\solder\sthan\sfifteen\sminutes\sis\snever\sdisplayed\sas\scurrent$']
+
+[[control]]
+id = "menu-local-id-name"
+guards = "an unlabelled row uses its roster id instead of its raw ChatGPT identity"
+file = "packages/core/src/vault-command-menu.ts"
+old = "            ...load.rows.map((row) => ({ ...row, label: row.label ?? row.id })),"
+new = "            ...load.rows.map((row) => ({ ...row, label: row.label ?? row.identity ?? row.id })), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\san\sunlabelled\slocal\sis\snamed\sby\sits\sroster\sid\swhen\sconnected$']
+
+[[control]]
+id = "menu-vault-quota-poll"
+guards = "quota checks of vault accounts go through vault.pollQuota rather than local credentials"
+file = "packages/core/src/vault-command-menu.ts"
+old = "                    const result = await vault.pollQuota(id)"
+new = "                    const result = { ok: true } // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\squota\schecks\suse\svault\spolls\sand\snever\sselect\sset-aside\slocal\scredentials$']
+
+[[control]]
+id = "menu-vault-floor-route-key"
+guards = "a vault floor action writes the vault route id that request admission reads, not main's floors"
+file = "packages/core/src/vault-command-menu.ts"
+old = "          ...(itemId ? { itemId } : {}),"
+new = "          ...(itemId ? { itemId: 'main' } : {}), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\svault\sfloors\suse\sthe\srequest\sroute\skey\sand\sleave\scredentials\suntouched$']
+
+[[control]]
+id = "menu-reset-set-aside-label"
+guards = "reset lists only local rows and marks a vault-owned local credential as set aside"
+file = "packages/core/src/vault-command-menu.ts"
+old = "                    label: aside ? `${item.label} · ${aside}` : item.label,"
+new = "                    label: item.label, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\sreset\slabels\sset-aside\slocals\swithout\sadmitting\svault\saccounts$']
+
+[[control]]
+id = "menu-no-vault-output"
+guards = "an unenrolled vault leaves the rendered local-only command byte-identical"
+file = "packages/core/src/vault-account-menu.ts"
+old = "  return view.status.enrollment.state === 'approved'"
+new = "  return true // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\sdisconnected\soutput\sis\sbyte-identical\sto\sthe\slocal-only\smenu$']
+
+[[control]]
+id = "menu-pi-vault-slots"
+guards = "Pi supplies the vault to the shared replacement slots as well as the Vault extra"
+file = "packages/pi/src/commands.ts"
+old = "    store: pool.store(),\n    vault: pool.vault,"
+new = "    store: pool.store(),\n    vault: undefined, // NON-VACUITY BREAK"
+test_file = "packages/pi/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sand\sthe\sClaustrum\svault\sthe\sshared\sAccounts\sQuota\sand\sLimits\sslots\sinclude\svault\saccounts\sand\sset\saside\stheir\slocal\scopy$']
+
+[[control]]
+id = "menu-local-management-roster"
+guards = "local move actions never include synthetic vault routes in a real store reorder"
+file = "packages/core/src/vault-command-menu.ts"
+old = "    store: menuStore(options.store, vault, false),"
+new = "    store: menuStore(options.store, vault, true), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\san\sunshadowed\slocal\skeeps\sits\smanagement\sactions\sand\scounts\sbeside\svault\saccounts$']
+
+[[control]]
+id = "menu-host-wide-quota-once"
+guards = "a host check that already polls the vault does not poll its accounts a second time"
+file = "packages/core/src/vault-command-menu.ts"
+old = "                      quotaCheckIncludesVault\n"
+new = "                      false // NON-VACUITY BREAK\n"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\sa\shost-wide\scheck\spolls\seach\svault\saccount\sonly\sonce\sbeside\sunshadowed\slocals$']
+
+[[control]]
+id = "menu-common-auth-release"
+guards = "the shared menu requires the published common-auth replacement-slot release"
+file = "packages/core/package.json"
+old = '"@cortexkit/common-auth": "^0.11.7"'
+new = '"@cortexkit/common-auth": "^0.11.4"'
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\sall\sthree\spackages\srequire\sthe\spublished\sreplacement-slot\srelease$']

@@ -418,6 +418,9 @@ export function createOpenCodeMenu(ctx: OpenCodeMenuContext) {
   const beginLogin = ctx.beginAccountLogin
   return createOpenAiMenu({
     store: ctx.store(),
+    ...(ctx.vault ? { vault: ctx.vault } : {}),
+    quotaCheckIncludesVault: true,
+    ...(ctx.now ? { now: ctx.now } : {}),
     extraLocks,
     rowLocks: (id) => legacyRefreshLocks(paths, id),
     migration: ctx.migration,
