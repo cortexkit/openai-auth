@@ -22,6 +22,11 @@ import {
   type SidebarState,
 } from '../sidebar-state'
 import { rpcServerRegistry } from './fixtures/rpc-registry'
+import { createRequestTestScope } from './request-test-scope'
+
+const pluginScope = createRequestTestScope()
+beforeEach(() => pluginScope.capturePluginWork())
+afterEach(() => pluginScope.teardown(async () => {}))
 
 function fakeLogger() {
   return {
@@ -1398,18 +1403,20 @@ describe('CacheKeepManager token resolution', () => {
         )
       }
 
-      const plugin = await CodexAuthPlugin({
-        client: {
-          auth: { set: async () => {} },
-          session: { promptAsync: async () => {} },
-        } as any,
-        project: { id: 'test' } as any,
-        directory: '',
-        worktree: '/some/worktree',
-        experimental_workspace: { register: () => {} },
-        serverUrl: new URL('http://localhost:0'),
-        $: {} as any,
-      })
+      const plugin = pluginScope.ownPlugin(
+        await CodexAuthPlugin({
+          client: {
+            auth: { set: async () => {} },
+            session: { promptAsync: async () => {} },
+          } as any,
+          project: { id: 'test' } as any,
+          directory: '',
+          worktree: '/some/worktree',
+          experimental_workspace: { register: () => {} },
+          serverUrl: new URL('http://localhost:0'),
+          $: {} as any,
+        }),
+      )
 
       const loaderResult = await plugin.auth?.loader?.(
         async () => ({
@@ -1479,7 +1486,9 @@ describe('CacheKeepManager token resolution', () => {
       await mgr.tick()
       expect(mockFetch).not.toHaveBeenCalled()
     } finally {
-      globalThis.fetch = originalFetch
+      await pluginScope.teardown(async () => {
+        globalThis.fetch = originalFetch
+      })
     }
   })
 })
@@ -1500,18 +1509,20 @@ describe('RPC server dispose', () => {
     process.env.OPENCODE_OPENAI_AUTH_RPC_DIR = tempDir
 
     try {
-      const plugin = await CodexAuthPlugin({
-        client: {
-          auth: { set: async () => {} },
-          session: { promptAsync: async () => {} },
-        } as any,
-        project: { id: 'test' } as any,
-        directory: '/some/project/dir',
-        worktree: '/some/worktree',
-        experimental_workspace: { register: () => {} },
-        serverUrl: new URL('http://localhost:0'),
-        $: {} as any,
-      })
+      const plugin = pluginScope.ownPlugin(
+        await CodexAuthPlugin({
+          client: {
+            auth: { set: async () => {} },
+            session: { promptAsync: async () => {} },
+          } as any,
+          project: { id: 'test' } as any,
+          directory: '/some/project/dir',
+          worktree: '/some/worktree',
+          experimental_workspace: { register: () => {} },
+          serverUrl: new URL('http://localhost:0'),
+          $: {} as any,
+        }),
+      )
 
       const loaderResult = await plugin.auth?.loader?.(
         async () => ({
@@ -1537,7 +1548,9 @@ describe('RPC server dispose', () => {
       expect(loaderResult?.dispose).toBeUndefined()
       await plugin.dispose?.()
     } finally {
-      process.env.OPENCODE_OPENAI_AUTH_RPC_DIR = originalRpcDir
+      await pluginScope.teardown(async () => {
+        process.env.OPENCODE_OPENAI_AUTH_RPC_DIR = originalRpcDir
+      })
     }
   })
 
@@ -1546,18 +1559,20 @@ describe('RPC server dispose', () => {
     process.env.OPENCODE_OPENAI_AUTH_RPC_DIR = tempDir
 
     try {
-      const plugin = await CodexAuthPlugin({
-        client: {
-          auth: { set: async () => {} },
-          session: { promptAsync: async () => {} },
-        } as any,
-        project: { id: 'test' } as any,
-        directory: '/some/project/dir',
-        worktree: '/some/worktree',
-        experimental_workspace: { register: () => {} },
-        serverUrl: new URL('http://localhost:0'),
-        $: {} as any,
-      })
+      const plugin = pluginScope.ownPlugin(
+        await CodexAuthPlugin({
+          client: {
+            auth: { set: async () => {} },
+            session: { promptAsync: async () => {} },
+          } as any,
+          project: { id: 'test' } as any,
+          directory: '/some/project/dir',
+          worktree: '/some/worktree',
+          experimental_workspace: { register: () => {} },
+          serverUrl: new URL('http://localhost:0'),
+          $: {} as any,
+        }),
+      )
 
       await plugin.auth?.loader?.(
         async () => ({
@@ -1590,7 +1605,9 @@ describe('RPC server dispose', () => {
       ).toBe(false)
       expect(rpcServerRegistry()?.size ?? 0).toBe(0)
     } finally {
-      process.env.OPENCODE_OPENAI_AUTH_RPC_DIR = originalRpcDir
+      await pluginScope.teardown(async () => {
+        process.env.OPENCODE_OPENAI_AUTH_RPC_DIR = originalRpcDir
+      })
     }
   })
 })
@@ -1606,18 +1623,20 @@ describe('Header stripping', () => {
     }) as any
 
     try {
-      const plugin = await CodexAuthPlugin({
-        client: {
-          auth: { set: async () => {} },
-          session: { promptAsync: async () => {} },
-        } as any,
-        project: { id: 'test' } as any,
-        directory: '',
-        worktree: '/some/worktree',
-        experimental_workspace: { register: () => {} },
-        serverUrl: new URL('http://localhost:0'),
-        $: {} as any,
-      })
+      const plugin = pluginScope.ownPlugin(
+        await CodexAuthPlugin({
+          client: {
+            auth: { set: async () => {} },
+            session: { promptAsync: async () => {} },
+          } as any,
+          project: { id: 'test' } as any,
+          directory: '',
+          worktree: '/some/worktree',
+          experimental_workspace: { register: () => {} },
+          serverUrl: new URL('http://localhost:0'),
+          $: {} as any,
+        }),
+      )
 
       const loaderResult = await plugin.auth?.loader?.(
         async () => ({
@@ -1676,7 +1695,9 @@ describe('Header stripping', () => {
       expect(lastFetchHeaders?.has('api-key')).toBe(false)
       expect(lastFetchHeaders?.get('authorization')).toBe('Bearer access-token')
     } finally {
-      globalThis.fetch = originalFetch
+      await pluginScope.teardown(async () => {
+        globalThis.fetch = originalFetch
+      })
     }
   })
 })

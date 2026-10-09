@@ -60,7 +60,6 @@ import {
   quotaMap,
   readJson,
   seedPool,
-  sleep,
   usageBody,
   type Wire,
   waitFor,
@@ -101,7 +100,7 @@ const phaseIt = (name: string, body: () => Promise<void>) =>
   scope.it(name, () => clock.run(name, body))
 
 beforeEach(() => {
-  scope.capturePluginWork()
+  scope.capturePluginWork({ vaultPolls: true })
   dir = mkdtempSync(join(tmpdir(), 'openai-vault-'))
   files = {
     configFile: join(dir, 'openai-auth.json'),
@@ -1007,28 +1006,69 @@ describe('auth account menu with vault accounts', () => {
     ])
     enroll()
     const wire = installWire()
-    const { vault } = await plugin()
-    const polls = wire.polls.length
-    const state = readFileSync(files.stateFile, 'utf8')
-    for (const id of ['main', 'ufuk']) {
-      for (const actionId of ['preview', 'spend', 'retry']) {
-        const result = await applyOpenAiMenu(__menuContextForTest()!, {
-          command: 'openai',
-          sectionId: 'reset',
-          itemId: id,
-          actionId,
-          confirmed: true,
-        })
-        expect(result.ok).toBe(false)
-        expect(result.text).toMatch(
-          /no usable access token|token is unavailable/,
-        )
+    const held = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const startupFinished = Promise.withResolvers<void>()
+    const pollQuota = OpenAiVault.prototype.pollQuota
+    let calls = 0
+    // The lease's startup quota pass has polled one vault route and is about
+    // to poll the second. Hold that poll until loader setup finishes.
+    const pollSpy = spyOn(
+      OpenAiVault.prototype,
+      'pollQuota',
+    ).mockImplementation(async function (this: OpenAiVault, routeId) {
+      if (++calls !== 2) return pollQuota.call(this, routeId)
+      held.resolve()
+      await release.promise
+      try {
+        return await pollQuota.call(this, routeId)
+      } finally {
+        startupFinished.resolve()
       }
+    })
+    try {
+      hooks = await loadPlugin({
+        vault: {
+          stateDir,
+          connectionFile: () => daemon!.connectionFile,
+          pollIntervalMs: 0,
+        },
+      })
+      await held.promise
+      const vault = __menuContextForTest()!.vault!
+      await vault.refresh()
+      await vault.pollStale(0)
+      setImmediate(() => release.resolve())
+      // Reset refusal is not a test of the lease's automatic startup quota pass.
+      // Drain it before recording the no-network baseline, not after actions.
+      await scope.settlePluginWork()
+      const polls = wire.polls.length
+      const state = readFileSync(files.stateFile, 'utf8')
+      for (const id of ['main', 'ufuk']) {
+        for (const actionId of ['preview', 'spend', 'retry']) {
+          const result = await applyOpenAiMenu(__menuContextForTest()!, {
+            command: 'openai',
+            sectionId: 'reset',
+            itemId: id,
+            actionId,
+            confirmed: true,
+          })
+          expect(result.ok).toBe(false)
+          expect(result.text).toMatch(
+            /no usable access token|token is unavailable/,
+          )
+        }
+      }
+      await startupFinished.promise
+      expect(wire.refreshTokens).toEqual([])
+      expect(wire.polls.length).toBe(polls)
+      expect(readFileSync(files.stateFile, 'utf8')).toBe(state)
+      vault.close()
+    } finally {
+      release.resolve()
+      await scope.settlePluginWork()
+      pollSpy.mockRestore()
     }
-    expect(wire.refreshTokens).toEqual([])
-    expect(wire.polls.length).toBe(polls)
-    expect(readFileSync(files.stateFile, 'utf8')).toBe(state)
-    vault.close()
   })
 
   async function menu(keys: string[], vault: OpenAiVault) {
@@ -1328,22 +1368,54 @@ describe('routing', () => {
     const running = await startDaemon({
       'oauth:openai:alpha': vaultLogin('chatgpt-alpha'),
     })
+    const priorDir = join(dir, 'prior-loader')
+    mkdirSync(priorDir)
+    process.env.OPENCODE_OPENAI_AUTH_FILE = join(priorDir, 'auth.json')
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = join(priorDir, 'state.json')
+    writeFileSync(
+      process.env.OPENCODE_OPENAI_AUTH_FILE,
+      JSON.stringify({ version: 1, accounts: [] }),
+    )
+    const retry = Promise.withResolvers<() => void>()
+    const priorScope = createRequestTestScope()
+    const prior = priorScope.ownPlugin(
+      await loadPlugin({
+        vault: { stateDir: join(priorDir, 'vault'), pollIntervalMs: 0 },
+        poolMigration: {
+          fence: async () => ({ open: true }),
+          migrate: async () => ({ status: 'retry', reason: 'lock-contention' }),
+          timers: {
+            set: (run) => {
+              retry.resolve(run)
+              return run
+            },
+            clear: () => {},
+          },
+        },
+      }),
+    )
+    const retryPrior = await retry.promise
+    await scope.settlePluginWork()
+    // A loader left alive by another fixture follows the next fixture's paths
+    // on its migration retry. Stop it before changing either paths or fetch.
+    await priorScope.teardown(async () => {})
+    process.env.OPENCODE_OPENAI_AUTH_FILE = files.configFile
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = files.stateFile
+    const roster = Promise.withResolvers<void>()
     enroll()
     seedPool(files, [
       { id: 'main', quota: quotaMap(10) },
       { id: 'alpha', quota: quotaMap(5) },
     ])
     const wire = installWire()
-    // The vault's connection opens 150 ms late, so its first roster read ends
-    // well after the loader's first pool read. A pool source whose first
-    // polls do not wait for the roster then polls row alpha on every run,
-    // instead of only on runs where its pool read happens to come first.
+    // Keep this loader's roster pending while the saved predecessor retry fires.
+    // A disposed predecessor must ignore even a callback queued before disposal.
     hooks = await loadPlugin({
       vault: {
         stateDir,
         connectionFile: () => running.connectionFile,
         connectScoped: async () => {
-          await sleep(150)
+          await roster.promise
           return connectClaustrumScopedClient({
             connectionFile: running.connectionFile,
             projectRoot: dir,
@@ -1354,6 +1426,10 @@ describe('routing', () => {
       },
     })
 
+    retryPrior()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    await scope.settlePluginWork()
+    roster.resolve()
     await waitFor(
       () => (wire.polls.includes('Bearer main-token') ? true : undefined),
       'the first quota poll of row main',
@@ -1361,6 +1437,7 @@ describe('routing', () => {
     // Row main reaching the wire does not prove another row's queued pull
     // finished. Drain the actual stores before asserting alpha was not polled.
     await scope.settlePluginWork()
+    await prior.dispose?.()
     expect(wire.polls).not.toContain('Bearer alpha-token')
   })
 

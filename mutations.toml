@@ -2,7 +2,8 @@
 # crate cortexkit-mutate; the revision is CKDEV_MUTATE_REV in
 # .github/workflows/ci.yml).
 #
-# Each row is one deliberate break of production code and the named Bun test
+# Each row is one deliberate break of production code or fixture isolation
+# and the named Bun test
 # that must go red for it. The runner first runs each named test on the
 # unmutated tree (it must pass), applies the break, runs the test again (it
 # must fail), and restores the exact bytes. A row earns its place by guarding
@@ -1484,3 +1485,43 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/check-installed-ranges.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^installed\srange\sbuild\sgate\sskips\sa\snested\shost\sfixture\sthat\sis\snot\sinstalled,\sso\sa\sbuild\sneeds\sno\sfixtures$']
+
+# A plugin's migration retry reads the current auth-file paths, and its first
+# vault roster starts a quota poll without awaiting it. Dispose plugins and
+# drain those reads and polls before the next test replaces paths or fetch.
+
+[[control]]
+id = "request-scope-disposes-owned-plugins"
+guards = "a predecessor loader cannot poll a later fixture's pool through its migration retry"
+file = "packages/opencode/src/tests/request-test-scope.ts"
+old = "    for (const plugin of plugins) await plugin.dispose?.()"
+new = "    // NON-VACUITY BREAK: leave the predecessor's lifecycle running."
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^routing\sa\spool\srow\ssigning\sin\sas\san\saccount\sthe\svault\sholds\sis\snot\spolled\sat\sstartup$']
+
+[[control]]
+id = "request-scope-drains-vault-startup-polls"
+guards = "the lease's automatic vault quota pass finishes before the reset refusal test records its no-network baseline"
+file = "packages/opencode/src/tests/request-test-scope.ts"
+old = "        return ownWork(pollStale.call(this, maxAgeMs))"
+new = "        return pollStale.call(this, maxAgeMs) // NON-VACUITY BREAK: do not own the automatic quota pass."
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\sreset\spreview\sspend\sand\sretry\srefuse\sshadowed\slive\sand\sexpired\slocal\scredentials\swithout\srefreshing\sor\ssending$']
+
+[[control]]
+id = "request-scope-drains-started-source-reads"
+guards = "a lifecycle's source read is owned before it has submitted quota pulls to the store"
+file = "packages/opencode/src/tests/request-test-scope.ts"
+old = "      return ownWork(load.call(this))"
+new = "      return load.call(this) // NON-VACUITY BREAK: drain only already-submitted pulls."
+test_file = "packages/opencode/src/tests/request-test-scope.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/request-test-scope.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^drains\sa\sstarted\ssource\sread\sbefore\sthe\snext\swire,\snaming\sits\sowner$']

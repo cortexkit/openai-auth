@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import * as poolStores from '@cortexkit/common-auth/store'
 import type { Hooks } from '@opencode-ai/plugin'
 import { BackgroundQuotaRefresh } from '../core/background-quota-refresh'
+import { PoolAccountSource } from '../core/pool-account-source'
 import {
   installWire,
   loadPlugin,
@@ -109,6 +110,70 @@ it('drains a prior loader first-sight pull before the next wire, naming its owne
   release()
   await body
   for (const store of stores) await store.pullsSettled()
+  expect(nextWire?.polls).toEqual([])
+  expect(priorWire.polls).toEqual(['Bearer prior-token'])
+  expect((error as Error)?.message).toBe(`Request work outlived test: ${owner}`)
+})
+
+it('drains a started source read before the next wire, naming its owner', async () => {
+  seedPool(
+    {
+      configFile: join(dir, 'openai-auth.json'),
+      stateFile: join(dir, 'openai-auth-state.json'),
+    },
+    [{ id: 'prior', quota: quotaMap(10) }],
+  )
+  const priorWire = installWire()
+  const entered = Promise.withResolvers<void>()
+  const gate = Promise.withResolvers<void>()
+  release = () => gate.resolve()
+  const open = poolStores.openPoolStore
+  const storeSpy = spyOn(poolStores, 'openPoolStore').mockImplementation(
+    (options) => {
+      const store = open(options)
+      const read = store.read
+      store.read = async () => {
+        entered.resolve()
+        await gate.promise
+        return read()
+      }
+      return store
+    },
+  )
+  restores.push(() => storeSpy.mockRestore())
+  const source = new PoolAccountSource({
+    paths: () => ({
+      configPath: join(dir, 'openai-auth.json'),
+      statePath: join(dir, 'openai-auth-state.json'),
+    }),
+    refreshProvider: async () => {
+      throw new Error('no token refresh expected')
+    },
+    pullQuota: async (request) => {
+      await globalThis.fetch('https://chatgpt.com/backend-api/wham/usage', {
+        headers: { authorization: `Bearer ${request.id}-token` },
+      })
+      return undefined
+    },
+  })
+  const owner = 'prior lifecycle with a started source read'
+  let load: ReturnType<typeof source.load> | undefined
+  const body = scope.run(owner, async () => {
+    load = source.load()
+  })
+  await entered.promise
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  let nextWire: ReturnType<typeof installWire> | undefined
+  const error = await scope
+    .teardown(async () => {
+      nextWire = installWire()
+    }, release)
+    .catch((caught: unknown) => caught)
+  release()
+  await load
+  await body
+  await source.poolStore().pullsSettled()
+  source.dispose()
   expect(nextWire?.polls).toEqual([])
   expect(priorWire.polls).toEqual(['Bearer prior-token'])
   expect((error as Error)?.message).toBe(`Request work outlived test: ${owner}`)

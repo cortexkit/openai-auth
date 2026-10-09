@@ -1,4 +1,6 @@
 import { it as bunIt, spyOn } from 'bun:test'
+import { OpenAiVault } from '@cortexkit/openai-auth-core/internal'
+import type { Hooks } from '@opencode-ai/plugin'
 import { BackgroundQuotaRefresh } from '../core/background-quota-refresh'
 import { PoolAccountSource } from '../core/pool-account-source'
 import { __bootQuotaSeedPromiseForTest } from '../index.ts'
@@ -11,21 +13,22 @@ export function createRequestTestScope() {
   const pending = new Map<Promise<unknown>, string>()
   const requests = new Set<Promise<unknown>>()
   let owner = 'unowned request'
+  const plugins = new Set<Hooks>()
   const sources = new Set<PoolAccountSource>()
   const backgroundRuns = new Set<Promise<void>>()
   const restores: Array<() => void> = []
 
-  // PoolAccountSource.load and BackgroundQuotaRefresh.start are shared across
-  // suites. Install their spies only while this fixture owns them, rather than
+  // Source reads, vault quota passes and background refreshes can outlive the
+  // loader. Install their spies only while this fixture owns them, rather than
   // replacing another suite's spies at import time. Loading stays non-blocking.
-  function capturePluginWork() {
+  function capturePluginWork(options: { vaultPolls?: boolean } = {}) {
     const load = PoolAccountSource.prototype.load
     const loadSpy = spyOn(
       PoolAccountSource.prototype,
       'load',
     ).mockImplementation(function (this: PoolAccountSource) {
       sources.add(this)
-      return load.call(this)
+      return ownWork(load.call(this))
     })
     const start = BackgroundQuotaRefresh.prototype.start
     const startSpy = spyOn(
@@ -46,6 +49,18 @@ export function createRequestTestScope() {
         onError,
       )
     })
+    // Opt in so suites with their own vault-polling spy are not affected.
+    if (options.vaultPolls) {
+      // pollIntervalMs: 0 stops roster ticks, not the lease's first quota pass.
+      const pollStale = OpenAiVault.prototype.pollStale
+      const vaultPollSpy = spyOn(
+        OpenAiVault.prototype,
+        'pollStale',
+      ).mockImplementation(function (this: OpenAiVault, maxAgeMs) {
+        return ownWork(pollStale.call(this, maxAgeMs))
+      })
+      restores.push(() => vaultPollSpy.mockRestore())
+    }
     restores.push(
       () => loadSpy.mockRestore(),
       () => startSpy.mockRestore(),
@@ -88,16 +103,25 @@ export function createRequestTestScope() {
     return bunIt(name, () => run(name, body), timeout)
   }
 
+  // Background work is allowed to be active at teardown. Drain it, but only
+  // report outliving test bodies or explicit requests as timeout leaks.
+  function ownWork<T>(promise: Promise<T>): Promise<T> {
+    requests.add(promise)
+    void promise.then(
+      () => requests.delete(promise),
+      () => requests.delete(promise),
+    )
+    return promise
+  }
+
   function wrap<T extends unknown[], R>(fn: (...args: T) => Promise<R>) {
-    return (...args: T) => {
-      const promise = track(fn(...args))
-      requests.add(promise)
-      void promise.then(
-        () => requests.delete(promise),
-        () => requests.delete(promise),
-      )
-      return promise
-    }
+    return (...args: T) => ownWork(track(fn(...args)))
+  }
+
+  /** Keep the plugin's timers inside the fixture that created them. */
+  function ownPlugin<T extends Hooks>(hooks: T): T {
+    plugins.add(hooks)
+    return hooks
   }
 
   async function teardown(
@@ -109,6 +133,8 @@ export function createRequestTestScope() {
     // Keep the fixture installed until the entire callback finishes: draining
     // only its current request lets the callback issue its next send too late.
     while (pending.size) await Promise.allSettled([...pending.keys()])
+    for (const plugin of plugins) await plugin.dispose?.()
+    plugins.clear()
     await settlePluginWork()
     await cleanup()
     for (const restore of restores.splice(0)) restore()
@@ -139,6 +165,7 @@ export function createRequestTestScope() {
     run,
     wrap,
     teardown,
+    ownPlugin,
     capturePluginWork,
     settlePluginWork,
   }
