@@ -1422,3 +1422,17 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/request-test-scope.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ["^drains\\san\\soutliving\\stest\\sbody\\sbefore\\sfixture\\scleanup,\\snaming\\sits\\sowner$"]
+
+# A build must not need the real-host test fixtures installed: a nested,
+# non-workspace package is checked only once it has its own node_modules.
+[[control]]
+id = "installed-ranges-skips-uninstalled-fixture"
+guards = "an uninstalled nested test fixture does not fail the build's installed-range gate"
+file = "scripts/check-installed-ranges.mjs"
+old = "        if (workspace || existsSync(join(dir, 'node_modules'))) dirs.push(dir)"
+new = "        dirs.push(dir) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/check-installed-ranges.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/check-installed-ranges.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^installed\srange\sbuild\sgate\sskips\sa\snested\shost\sfixture\sthat\sis\snot\sinstalled,\sso\sa\sbuild\sneeds\sno\sfixtures$']

@@ -18,7 +18,12 @@ const checker = join(
   '../../../../scripts/check-installed-ranges.mjs',
 )
 
-function check(declared: string, installed: string, nested = false) {
+function check(
+  declared: string,
+  installed: string,
+  nested = false,
+  fixtureInstalled = true,
+) {
   const root = mkdtempSync(join(tmpdir(), 'installed-ranges-'))
   try {
     mkdirSync(join(root, 'scripts'))
@@ -34,7 +39,9 @@ function check(declared: string, installed: string, nested = false) {
           'opencode1-host',
         )
       : root
-    mkdirSync(join(from, 'node_modules', 'left-pad'), { recursive: true })
+    mkdirSync(from, { recursive: true })
+    if (fixtureInstalled)
+      mkdirSync(join(from, 'node_modules', 'left-pad'), { recursive: true })
     copyFileSync(checker, join(root, 'scripts', 'check-installed-ranges.mjs'))
     if (nested) writeFileSync(join(root, 'package.json'), '{"private":true}')
     writeFileSync(
@@ -44,10 +51,11 @@ function check(declared: string, installed: string, nested = false) {
         dependencies: { 'left-pad': declared },
       }),
     )
-    writeFileSync(
-      join(from, 'node_modules', 'left-pad', 'package.json'),
-      JSON.stringify({ name: 'left-pad', version: installed }),
-    )
+    if (fixtureInstalled)
+      writeFileSync(
+        join(from, 'node_modules', 'left-pad', 'package.json'),
+        JSON.stringify({ name: 'left-pad', version: installed }),
+      )
     return spawnSync(
       'bun',
       [join(root, 'scripts', 'check-installed-ranges.mjs')],
@@ -88,6 +96,14 @@ describe('installed range build gate', () => {
     expect(result.status).toBe(0)
     expect(result.stdout).toContain(
       'installed ranges ok (1 dependencies checked)',
+    )
+  })
+
+  it('skips a nested host fixture that is not installed, so a build needs no fixtures', () => {
+    const result = check('2.0.0', '2.0.0', true, false)
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain(
+      'installed ranges ok (0 dependencies checked)',
     )
   })
 })

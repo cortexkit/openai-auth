@@ -27,8 +27,16 @@ function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf8'))
 }
 
+// Workspace packages (direct children of packages/) are bundled into the
+// build, so they are always checked. A package nested deeper, such as a test
+// fixture installed on its own, is not bundled: it is checked only once it has
+// its own node_modules, so a build never needs the fixtures installed, while an
+// installed fixture at the wrong version is still refused. Requiring its own
+// node_modules also keeps the lookup from resolving a package hoisted at the
+// root instead of the fixture's pinned copy.
 function packageDirs() {
   const dirs = [root]
+  const packages = join(root, 'packages')
   function walk(parent) {
     for (const entry of readdirSync(parent, { withFileTypes: true })) {
       if (
@@ -38,11 +46,14 @@ function packageDirs() {
       )
         continue
       const dir = join(parent, entry.name)
-      if (existsSync(join(dir, 'package.json'))) dirs.push(dir)
+      if (existsSync(join(dir, 'package.json'))) {
+        const workspace = parent === packages
+        if (workspace || existsSync(join(dir, 'node_modules'))) dirs.push(dir)
+      }
       walk(dir)
     }
   }
-  walk(join(root, 'packages'))
+  walk(packages)
   return dirs
 }
 
