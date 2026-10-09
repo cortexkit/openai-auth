@@ -36,11 +36,6 @@
 // 5. The ChatGPT logins (`login.ts`), writing into the pool; OpenCode 2's
 //    credential table only ever receives a placeholder.
 // 6. The model rules (`models.ts`).
-// 7. A ChatGPT login OpenCode 2 already held before this plugin ran is copied
-//    into the pool only when the pool does not hold that account yet. The copy
-//    does not change the host's selected login method or refresh handler.
-//    The check runs after migration against the migrated pool, so it never
-//    overwrites a newer login the migration just put into row `main`.
 
 import {
   installOpenCode2Auth,
@@ -54,10 +49,8 @@ import {
   beginAccountLogin,
   codexRefreshFn,
   extractAccountId,
-  extractAccountIdFromClaims,
   loadAccounts,
   type OpenAiVaultOptions,
-  parseJwtClaims,
   vaultStateDir,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
@@ -109,11 +102,6 @@ import { SessionPins } from './pins'
  * own id, since OpenCode 1 reads the `./server` entry as well.
  */
 export const OPENAI_AUTH_PLUGIN_ID = 'cortexkit-openai-auth'
-
-function identityOfToken(token: string): string | undefined {
-  const claims = token ? parseJwtClaims(token) : undefined
-  return claims ? extractAccountIdFromClaims(claims) : undefined
-}
 
 /** Longest a shutdown waits for queued quota writes before it lets go. */
 const SETTLE_ON_DISPOSE_MS = 5_000
@@ -399,22 +387,12 @@ export async function setupOpenAIAuth(
     )
   }
 
-  const storeLogin = async (
-    login: PoolLoginResult,
-    origin: 'login' | 'import' = 'login',
-  ) => {
+  const storeLogin = async (login: PoolLoginResult) => {
     await ensureMigrated(login)
-    const outcome = await writeLoginToPool(source.poolStore(), paths(), login, {
-      origin,
-    })
+    const outcome = await writeLoginToPool(source.poolStore(), paths(), login)
     if (!poolMigrated(paths().configPath)) await lifecycle?.requestAdoption()
     await source.load()
-    log.info(
-      outcome.operation === 'kept'
-        ? 'the account pool already holds the ChatGPT login OpenCode 2 held'
-        : 'ChatGPT login stored in the account pool',
-      outcome,
-    )
+    log.info('ChatGPT login stored in the account pool', outcome)
   }
 
   const methods = await registerOpenCode2AuthMethods(ctx, {
@@ -427,49 +405,6 @@ export async function setupOpenAIAuth(
     label: 'ChatGPT (openai-auth account pool)',
   })
   const models = await registerCodexModelRules(ctx)
-
-  // Copy a pre-existing host login into the pool without selecting the pool
-  // connection. The host's own login and refresh methods stay in charge of it.
-  const importHostLogin = async () => {
-    const connection =
-      await ctx.integration.connection.active(OPENAI_PROVIDER_ID)
-    if (!connection) return
-    const value = await ctx.integration.connection.resolve(connection)
-    if (value?.type !== 'oauth' || !value.refresh) return
-    // Placeholders (this plugin's own, or OpenCode 1's carried over when
-    // OpenCode 2 imported a migrated `auth.json`) and tombstones of the
-    // removed vault custody hold no credential.
-    if (isLeftoverCredential(value)) {
-      if (await slotPlaceholderWithoutMain()) {
-        if (lifecycle) lifecycle.noticePlaceholderWithoutMain()
-        else log.warn(POOL_LOGIN_REQUIRED_MESSAGE)
-      }
-      return
-    }
-    const accountId =
-      typeof value.metadata?.accountID === 'string'
-        ? value.metadata.accountID
-        : identityOfToken(value.access)
-    // Stored only when no pool row holds this account yet, checked by
-    // `writeLoginToPool` after the migration has finished: the pool may have
-    // rotated this login's tokens since, or the migration may have just moved
-    // a newer copy of the account into row `main`.
-    await storeLogin(
-      {
-        id: accountId ?? crypto.randomUUID(),
-        refresh: value.refresh,
-        ...(value.access ? { access: value.access } : {}),
-        ...(value.expires ? { expires: value.expires } : {}),
-        ...(accountId ? { accountId } : {}),
-      },
-      'import',
-    )
-  }
-  const imported = importHostLogin().catch((error: unknown) => {
-    log.warn('the ChatGPT login OpenCode 2 holds was not copied to the pool', {
-      error: error instanceof Error ? error.message : String(error),
-    })
-  })
 
   // A deleted session's pin and remembered account go with it.
   const abort = new AbortController()
@@ -494,7 +429,6 @@ export async function setupOpenAIAuth(
       installation.dispose(),
       methods.dispose(),
       models.dispose(),
-      imported,
     ])
     // Quota readings taken from responses are written to the pool files in
     // the background; wait a bounded time for those writes so a clean

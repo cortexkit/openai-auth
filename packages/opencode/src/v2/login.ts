@@ -18,11 +18,9 @@
 //   OpenCode 1 login;
 // - anything else: a new row, named by its ChatGPT account id.
 //
-// A login OpenCode 2 already held when this plugin started is copied in by
-// other rules (`origin: 'import'`): only when no row holds its account or its
-// refresh token yet, and never over a row. The pool may have rotated that
-// account's tokens since, or the migration may have just moved a newer copy
-// of it into `main`; OpenCode 2's copy would then be the older credential.
+// The host's existing ChatGPT login is never copied into the pool: OpenAI
+// refresh tokens are single-use, so the host and pool must not refresh the
+// same token family. Choosing a pool login runs a separate OAuth flow.
 
 import {
   isPlaceholderCredential,

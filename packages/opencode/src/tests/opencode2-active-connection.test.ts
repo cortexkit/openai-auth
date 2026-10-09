@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test'
-import { rmSync } from 'node:fs'
+import { readFileSync, rmSync } from 'node:fs'
 import {
   isPlaceholderCredential,
   OpenCode2AuthError,
@@ -36,6 +36,10 @@ async function start(
 ) {
   const files = poolFiles()
   seedPool(files, 'main-first', rows)
+  const before = {
+    config: readFileSync(files.configPath, 'utf8'),
+    state: readFileSync(files.statePath, 'utf8'),
+  }
   const host = fakeOpenCode2Host({ activeCredential: credential, methods })
   const dispose = await setupOpenAIAuth(host.ctx, {
     paths: files.paths,
@@ -63,7 +67,7 @@ async function start(
     await stop()
     rmSync(files.dir, { recursive: true, force: true })
   })
-  return { host, files, stop }
+  return { host, files, stop, before }
 }
 
 type Host = ReturnType<typeof fakeOpenCode2Host>
@@ -262,7 +266,7 @@ describe('OpenCode 2 active connection gate', () => {
     await expectUntouched(host, 'sk-env-key')
   })
 
-  it('copies a real host login without activating the pool', async () => {
+  it('never reads or copies a pre-existing host ChatGPT login into the pool', async () => {
     const credential: Credential.OAuth = {
       ...placeholderCredential({
         integrationID: 'openai',
@@ -275,15 +279,35 @@ describe('OpenCode 2 active connection gate', () => {
       expires: Date.now() + 86400000,
       metadata: { accountID: 'host-account' },
     }
-    const { host, files, stop } = await start(credential)
+    const builtin: RegisteredMethod = {
+      integrationID: 'openai',
+      method: {
+        id: 'chatgpt-browser',
+        type: 'oauth',
+        label: 'ChatGPT Pro/Plus (browser)',
+      },
+      authorize: async () => ({
+        url: 'https://auth.openai.test',
+        instructions: 'host login',
+        mode: 'auto',
+        callback: Promise.resolve(credential),
+      }),
+      refresh: async (value) => value,
+    }
+    const { host, files, stop, before } = await start(
+      credential,
+      [{ id: 'main' }],
+      [builtin],
+    )
     await expectUntouched(host, 'host-token')
     await stop()
-    expect(host.getActiveCredential()).toEqual(credential)
+    expect(readFileSync(files.configPath, 'utf8')).toBe(before.config)
+    expect(readFileSync(files.statePath, 'utf8')).toBe(before.state)
+    expect(host.connectionReads).toEqual({ active: 0, resolve: 0 })
+    expect(host.getActiveCredential()).toBe(credential)
     expect(
-      Object.values(files.readState().accounts).some(
-        (row) => row.refresh === 'host-refresh',
-      ),
-    ).toBe(true)
+      host.methods.find((entry) => entry.method.id === 'chatgpt-browser'),
+    ).toBe(builtin)
   })
 
   it('keeps a built-in ChatGPT login real when the host refreshes it', async () => {

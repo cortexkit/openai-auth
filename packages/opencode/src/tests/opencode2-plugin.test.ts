@@ -589,27 +589,25 @@ describe('OpenCode 2 entry: logins', () => {
     ])
   })
 
-  it('copies a ChatGPT login OpenCode 2 already held into the pool', async () => {
+  it('never copies a ChatGPT login OpenCode 2 already holds into the pool', async () => {
     const files = poolFiles()
     seedPool(files, 'main-first', [{ id: 'main' }])
-    const { stop } = await start(files, {
-      activeCredential: {
-        type: 'oauth',
-        methodID: 'chatgpt-browser',
-        access: 'host-access',
-        refresh: 'host-refresh',
-        expires: Date.now() + 3600_000,
-        metadata: { accountID: 'chatgpt-host' },
-      } as unknown as Credential.Value,
-    })
+    const beforeConfig = readFileSync(files.configPath, 'utf8')
+    const beforeState = readFileSync(files.statePath, 'utf8')
+    const credential = {
+      type: 'oauth',
+      methodID: 'chatgpt-browser',
+      access: 'host-access',
+      refresh: 'host-refresh',
+      expires: Date.now() + 3600_000,
+      metadata: { accountID: 'chatgpt-host' },
+    } as unknown as Credential.Value
+    const { host, stop } = await start(files, { activeCredential: credential })
     await stop()
-    const row = files
-      .readConfig()
-      .accounts.find((account) => account.accountId === 'chatgpt-host')
-    expect(row).toBeDefined()
-    expect(files.readState().accounts[row?.id ?? '']?.refresh).toBe(
-      'host-refresh',
-    )
+    expect(readFileSync(files.configPath, 'utf8')).toBe(beforeConfig)
+    expect(readFileSync(files.statePath, 'utf8')).toBe(beforeState)
+    expect(host.connectionReads).toEqual({ active: 0, resolve: 0 })
+    expect(host.getActiveCredential()).toBe(credential)
   })
 })
 

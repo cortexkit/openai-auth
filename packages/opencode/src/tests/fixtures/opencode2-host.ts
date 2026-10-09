@@ -41,6 +41,7 @@ export function fakeOpenCode2Host(
   } = {},
 ) {
   let activeCredential = options.activeCredential
+  const connectionReads = { active: 0, resolve: 0 }
   const hooks: Hook[] = []
   const methods: RegisteredMethod[] = [...(options.methods ?? [])]
   const modelTransforms: Array<(editor: unknown) => void> = []
@@ -109,8 +110,14 @@ export function fakeOpenCode2Host(
         return registration()
       },
       connection: {
-        active: async () => (activeCredential ? { id: 'conn_1' } : undefined),
-        resolve: async () => activeCredential,
+        active: async () => {
+          connectionReads.active++
+          return activeCredential ? { id: 'conn_1' } : undefined
+        },
+        resolve: async () => {
+          connectionReads.resolve++
+          return activeCredential
+        },
         status: async () => {},
       },
     },
@@ -125,6 +132,7 @@ export function fakeOpenCode2Host(
     ctx: ctx as never,
     hooks,
     methods,
+    connectionReads,
     /** Simulates a user selecting another connection without restarting the host. */
     setActiveCredential(value: Credential.Value | undefined) {
       activeCredential = value
