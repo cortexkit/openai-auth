@@ -1000,7 +1000,10 @@ export function resetCreditsSection(
 export interface OpenAiMenuOptions {
   store: PoolStore
   vault?: MenuVault
-  /** Set when quotaCheck polls vault accounts too, to avoid polling them twice. */
+  /**
+   * Set when the host's `quotaCheck` already polls the vault accounts, so the
+   * menu's quota check does not poll them a second time.
+   */
   quotaCheckIncludesVault?: boolean
   /**
    * The legacy locks the menu's writes that name no single row take (the

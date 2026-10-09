@@ -24,7 +24,12 @@ export function isVaultMenuConnected(view: VaultMenuView): boolean {
   return view.status.enrollment.state === 'approved'
 }
 
-/** Read the vault identities and active routes used by request routing, including cold and declined owners. */
+/**
+ * Read the vault's account identities and active routes, as request routing
+ * reads them. The identities include accounts the vault holds but will not
+ * serve right now (cold: no usable credential; declined: switched off by the
+ * operator), so their local copies still count as vault-owned.
+ */
 export async function readVaultMenu(vault: MenuVault): Promise<VaultMenuView> {
   return {
     status: await vault.status(),
@@ -37,7 +42,11 @@ export function vaultAccountName(row: VaultRosterRow): string {
   return row.label || row.email || row.routeId
 }
 
-/** Ownership includes declined and cold accounts, just as request routing does. */
+/**
+ * Whether the vault owns this local row's ChatGPT account. An account the vault
+ * holds but will not serve right now (cold or declined) still owns it, as in
+ * request routing, so the local copy never serves in its place.
+ */
 export function isVaultShadowed(
   row: Pick<PoolRow, 'identity'>,
   view: VaultMenuView,

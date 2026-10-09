@@ -1216,8 +1216,9 @@ test_count_pattern = "Ran {count} test"
 expect_red = ["^request\\spath\\swith\\sthe\\smain\\saccount\\sin\\sthe\\spool\\sa\\scompleted\\sbase\\smigration\\swith\\san\\suntagged\\splaceholder\\sstill\\sserves\\smain\\sand\\sadopts\\slater\\slogins$"]
 expect_message = "Received: false"
 
-# The command and auth login menus share the vault's account identities and
-# active route ids, so a local copy of a vault-owned account stays set aside.
+# The command and auth login menus decide which accounts the vault owns from the
+# vault's account identities and active route ids. A local account signed in to
+# a vault-owned ChatGPT account is shown as set aside: requests use the vault copy.
 
 [[control]]
 id = "menu-vault-ownership"

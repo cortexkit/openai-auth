@@ -70,8 +70,9 @@ function forwardAction(
  * Show the id from the local account list when its label is missing, without
  * writing that display name back to the account files. Vault accounts are
  * display-only entries because their credentials belong to the vault. Their
- * quota reserve floors remain plugin settings, indexed by the same account
- * route id the request router uses to look up those floors.
+ * killswitch floors (the minimum quota left before the account stops being
+ * used) are plugin settings under `killswitch.accounts`, keyed by the vault
+ * route id, which is the key the request path reads them by.
  */
 export function menuStore(
   store: PoolStore,
