@@ -501,9 +501,16 @@ export class OpenAiVault {
    */
   requestReading(routeId: string): void {
     if (this.#pulls.has(routeId)) return
-    const pull = this.pollQuota(routeId).finally(() => {
-      this.#pulls.delete(routeId)
-    })
+    const pull = this.pollQuota(routeId)
+      .catch((error: unknown) => {
+        log.warn('vault quota poll failed', {
+          routeId,
+          error: errorMessage(error),
+        })
+      })
+      .finally(() => {
+        this.#pulls.delete(routeId)
+      })
     this.#pulls.set(routeId, pull)
   }
 

@@ -12,6 +12,25 @@
 # Send-time eligibility and vault admission on the migrated request paths.
 
 [[control]]
+id = "vault-request-reading-contains-poll-rejection"
+guards = "a rejected background quota poll is warned about without an unhandled rejection and releases its in-flight dedupe"
+file = "packages/core/src/vault.ts"
+old = """    const pull = this.pollQuota(routeId)
+      .catch((error: unknown) => {
+        log.warn('vault quota poll failed', {
+          routeId,
+          error: errorMessage(error),
+        })
+      })
+      .finally(() => {"""
+new = """    const pull = this.pollQuota(routeId).finally(() => {"""
+test_file = "packages/core/src/tests/vault-request-reading.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-request-reading.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^vault\\srequestReading\\sreports\\srejected\\squota\\spolls\\swithout\\san\\sunhandled\\srejection\\sand\\sreleases\\sdeduplication$"]
+
+[[control]]
 id = "pool-send-rechecks-current-eligibility"
 guards = "a row disabled or identity-contradicted after selection cannot supply a bearer on either OpenCode host"
 file = "packages/opencode/src/core/pool-account-source.ts"
