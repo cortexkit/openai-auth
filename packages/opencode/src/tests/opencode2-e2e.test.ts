@@ -255,6 +255,10 @@ async function runScenario(input: {
   turns: Turn[]
   plugin?: string
   login?: boolean
+  /** The API key the host prepares instead of the account pool's placeholder bearer. */
+  apiKey?: string
+  /** Omit the pool bearer to show that importing legacy auth.json does not activate pool routing. */
+  preparePoolCredential?: boolean
   mode?: 'sticky-balanced' | 'fallback-first'
   /** The model every turn uses; `gpt-5.5` by default. */
   model?: string
@@ -318,13 +322,15 @@ async function runScenario(input: {
         ],
         providers: {
           openai: {
-            // The host's own credential for the provider is the placeholder,
-            // as it is after a login through the plugin.
             settings: {
+              // Prepare exactly the credential selected for this scenario.
+              // An old auth.json alone must not activate pool routing.
+              ...(input.preparePoolCredential === false
+                ? {}
+                : { apiKey: input.apiKey ?? PLACEHOLDER }),
               ...(input.upgrade === 'default'
                 ? {}
                 : { baseURL: `${mock.url}/v1` }),
-              ...(input.upgrade ? {} : { apiKey: PLACEHOLDER }),
               transport: input.transport,
             },
             models: {
@@ -376,7 +382,7 @@ async function runScenario(input: {
           '--server',
           serverURL,
           '--method',
-          'chatgpt-browser',
+          'openai-auth-pool-browser',
         ],
         project,
         env,
@@ -647,7 +653,33 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     if (scratch) rmSync(scratch, { recursive: true, force: true })
   })
 
-  test('first run after OpenCode 1 upgrade reaches Codex without a provider baseURL', async () => {
+  test('http: a prepared API key bypasses a migrated pool without attribution', async () => {
+    const key = 'sk-opencode2-user-key'
+    const result = await runScenario({
+      transport: 'http',
+      accounts: ['A', 'B'],
+      apiKey: key,
+      turns: [{}],
+    })
+    verify(result, () => {
+      expect(result.exits).toEqual([0])
+      expect(result.stdout.join('')).toContain('MOCK-HTTP-REPLY')
+      const sent = samplesOn(result, 'http')
+      expect(sent.length).toBe(1)
+      expect(sent[0]?.headers.authorization).toBe(`Bearer ${key}`)
+      expect(sent[0]?.headers['chatgpt-account-id']).toBeUndefined()
+      expect(sent[0]?.headers.originator).toBeUndefined()
+      expect(
+        primaries(result.wire).every((record) => record.identity === 'none'),
+      ).toBe(true)
+      expect(usedOn(result, 'main')).toBe(5)
+      expect(usedOn(result, 'B')).toBe(40)
+      expect(result.state.accounts.main?.refresh).toBe('refresh-A')
+      expect(result.state.accounts.B?.refresh).toBe('refresh-B')
+    })
+  }, 180_000)
+
+  test('a selected pool placeholder after OpenCode 1 upgrade reaches Codex without a provider baseURL', async () => {
     const result = await runScenario({
       transport: 'http',
       upgrade: 'default',
@@ -667,7 +699,28 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     })
   }, 180_000)
 
-  test('first run after OpenCode 1 upgrade keeps a custom provider baseURL', async () => {
+  test('an imported OpenCode 1 placeholder alone does not activate pool routing', async () => {
+    const result = await runScenario({
+      transport: 'http',
+      upgrade: 'custom',
+      accounts: ['A'],
+      preparePoolCredential: false,
+      turns: [{}],
+    })
+    verify(result, () => {
+      expect(result.exits).toEqual([0])
+      const sent = samplesOn(result, 'http')
+      expect(sent.length).toBe(1)
+      expect(sent[0]?.headers['chatgpt-account-id']).toBeUndefined()
+      expect(sent[0]?.headers.originator).toBeUndefined()
+      expect(
+        primaries(result.wire).every((record) => record.identity === 'none'),
+      ).toBe(true)
+      expect(usedOn(result, 'main')).toBe(5)
+    })
+  }, 180_000)
+
+  test('a selected pool placeholder after OpenCode 1 upgrade keeps a custom provider baseURL', async () => {
     const result = await runScenario({
       transport: 'http',
       upgrade: 'custom',

@@ -225,9 +225,13 @@ export async function rewriteCodexHttpRequest(
   if (!/\/responses\/?$/.test(new URL(request.url).pathname)) return undefined
   const body = parseObject(await request.clone().text())
   if (!body) return undefined
+  // Codex does not accept output caps. Remove them only after the transport
+  // has established that this request belongs to the account pool.
+  const capped = 'max_output_tokens' in body
+  delete body.max_output_tokens
   const effortChanged = effort.apply(body, scope, 'http')
   const liteApplied = lite && responsesLiteHttpBody(body)
-  if (!effortChanged && !liteApplied) return undefined
+  if (!capped && !effortChanged && !liteApplied) return undefined
   const headers = new Headers(request.headers)
   headers.delete('content-length')
   if (liteApplied) headers.set(RESPONSES_LITE_HEADER, 'true')
@@ -242,5 +246,8 @@ export function rewriteCodexFrame(
 ): string | undefined {
   const body = parseObject(frame)
   if (body?.type !== 'response.create') return undefined
-  return effort.apply(body, scope, 'ws') ? JSON.stringify(body) : undefined
+  const capped = 'max_output_tokens' in body
+  delete body.max_output_tokens
+  const changed = effort.apply(body, scope, 'ws')
+  return capped || changed ? JSON.stringify(body) : undefined
 }

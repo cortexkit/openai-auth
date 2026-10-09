@@ -86,6 +86,7 @@ import {
   rewriteCodexFrame,
   rewriteCodexHttpRequest,
 } from './codex-wire'
+import { codexRequestURL } from './endpoint'
 import type { SessionPins } from './pins'
 
 /** The provider (and integration) OpenCode 2 serves ChatGPT logins under. */
@@ -192,6 +193,8 @@ export interface OpenAIAdapterDeps {
   vault?: VaultAccess
   /** Whether the Responses Lite shape is on (the `responsesLite` setting). */
   responsesLite?: () => boolean
+  /** The configured Codex destination, applied only after transport ownership. */
+  codexEndpoint?: () => string
   now?: () => number
   log?: OpenAIAdapterLogger
 }
@@ -696,6 +699,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       return {
         headers: {
           ...CODEX_CLIENT_HEADERS,
+          'session-id': request.sessionID,
           authorization: `Bearer ${receipt.accessToken}`,
           'chatgpt-account-id':
             receipt.accountIdentity ??
@@ -716,6 +720,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     return {
       headers: {
         ...CODEX_CLIENT_HEADERS,
+        'session-id': request.sessionID,
         authorization: `Bearer ${token}`,
         'chatgpt-account-id': identity ?? null,
       },
@@ -727,13 +732,24 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     providerID: OPENAI_PROVIDER_ID,
     chooseAccount,
     accountHeaders,
-    rewriteRequest: ({ request, sessionID, kind }) =>
-      rewriteCodexHttpRequest(
-        request,
-        { sessionID, kind },
-        effort,
-        deps.responsesLite?.() ?? false,
-      ),
+    async rewriteRequest({ request, sessionID, kind }) {
+      const url = deps.codexEndpoint
+        ? codexRequestURL(request.url, deps.codexEndpoint())
+        : request.url
+      const routed = url === request.url ? request : new Request(url, request)
+      return (
+        (await rewriteCodexHttpRequest(
+          routed,
+          { sessionID, kind },
+          effort,
+          deps.responsesLite?.() ?? false,
+        )) ?? routed
+      )
+    },
+    rewriteHandshakeURL: ({ url }) =>
+      deps.codexEndpoint
+        ? codexRequestURL(url, deps.codexEndpoint())
+        : undefined,
     rewriteWebSocketFrame: ({ frame, sessionID, kind }) =>
       rewriteCodexFrame(frame, { sessionID, kind }, effort),
     quotaFromHeaders: (headers) => quotaFromCodexHeaders(headers),

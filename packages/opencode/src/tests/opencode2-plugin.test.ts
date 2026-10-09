@@ -19,7 +19,7 @@ import {
   NO_ACCOUNT_REFUSAL,
   quotaFromCodexHeaders,
 } from '../v2/adapter'
-import { applyCodexBaseURL } from '../v2/endpoint'
+import { codexRequestURL } from '../v2/endpoint'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { applyCodexModelRules } from '../v2/models'
 import { SessionPins } from '../v2/pins'
@@ -192,7 +192,7 @@ describe('OpenCode 2 separate account store', () => {
   }
 })
 
-async function modelRequest(
+async function poolRequestHeaders(
   host: Host,
   sessionID = 'ses_1',
   kind: RequestKind = 'primary',
@@ -205,7 +205,8 @@ async function modelRequest(
     } as Record<string, string>,
   }
   await host.fire('model.request', draft)
-  return draft.headers
+  const request = await httpRequest(host, sessionID, kind)
+  return Object.fromEntries(request.headers)
 }
 
 async function httpRequest(
@@ -280,12 +281,12 @@ const bearer = (headers: Record<string, string>) =>
   )?.[1]
 
 describe('OpenCode 2 entry: the chosen row on the wire', () => {
-  it('carries the chosen row bearer and chatgpt-account-id on every hook, never the placeholder', async () => {
+  it('carries the chosen row bearer and chatgpt-account-id on both transports, never the placeholder', async () => {
     const { host } = await startPool('main-first', [
       { id: 'main' },
       { id: 'fb' },
     ])
-    const headers = await modelRequest(host)
+    const headers = await poolRequestHeaders(host)
     expect(bearer(headers)).toBe('Bearer main-token')
     expect(headers['chatgpt-account-id']).toBe('chatgpt-main')
 
@@ -309,19 +310,25 @@ describe('OpenCode 2 entry: the chosen row on the wire', () => {
       { id: 'a', usedPercent: 10 },
       { id: 'b', usedPercent: 90 },
     ])
-    expect(bearer(await modelRequest(host, 'ses_1'))).toBe('Bearer a-token')
+    expect(bearer(await poolRequestHeaders(host, 'ses_1'))).toBe(
+      'Bearer a-token',
+    )
     // Row b now has far more room: a new session goes there, but ses_1 keeps
     // its pin on a while a can serve, and its title follows it.
     seedPool(files, 'sticky-balanced', [
       { id: 'a', usedPercent: 80 },
       { id: 'b', usedPercent: 5 },
     ])
-    expect(bearer(await modelRequest(host, 'ses_2'))).toBe('Bearer b-token')
-    expect(bearer(await modelRequest(host, 'ses_1'))).toBe('Bearer a-token')
-    expect(bearer(await modelRequest(host, 'ses_1', 'title'))).toBe(
+    expect(bearer(await poolRequestHeaders(host, 'ses_2'))).toBe(
+      'Bearer b-token',
+    )
+    expect(bearer(await poolRequestHeaders(host, 'ses_1'))).toBe(
       'Bearer a-token',
     )
-    expect(bearer(await modelRequest(host, 'ses_2', 'title'))).toBe(
+    expect(bearer(await poolRequestHeaders(host, 'ses_1', 'title'))).toBe(
+      'Bearer a-token',
+    )
+    expect(bearer(await poolRequestHeaders(host, 'ses_2', 'title'))).toBe(
       'Bearer b-token',
     )
   })
@@ -333,7 +340,7 @@ describe('OpenCode 2 entry: refusals', () => {
       { id: 'main' },
       { id: 'fb' },
     ])
-    await modelRequest(host)
+    await poolRequestHeaders(host)
     const request = await httpRequest(host)
     expect(request.headers.get('authorization')).toBe('Bearer main-token')
     await httpResponse(
@@ -350,9 +357,11 @@ describe('OpenCode 2 entry: refusals', () => {
       status: 429,
     })
     expect(decision).toEqual({ retry: true, delay: 0 })
-    expect(bearer(await modelRequest(host))).toBe('Bearer fb-token')
+    expect(bearer(await poolRequestHeaders(host))).toBe('Bearer fb-token')
     // The refused row stays marked: a new session goes to fb as well.
-    expect(bearer(await modelRequest(host, 'ses_2'))).toBe('Bearer fb-token')
+    expect(bearer(await poolRequestHeaders(host, 'ses_2'))).toBe(
+      'Bearer fb-token',
+    )
   })
 
   it('moves a WebSocket rate-limit refusal before output, and never retries one after output', async () => {
@@ -360,7 +369,7 @@ describe('OpenCode 2 entry: refusals', () => {
       { id: 'a', usedPercent: 10 },
       { id: 'b', usedPercent: 50 },
     ])
-    expect(bearer(await modelRequest(host))).toBe('Bearer a-token')
+    expect(bearer(await poolRequestHeaders(host))).toBe('Bearer a-token')
     await wsHandshake(host)
     await wsReceive(host, { type: 'response.created', response: {} })
     await wsReceive(host, {
@@ -370,7 +379,7 @@ describe('OpenCode 2 entry: refusals', () => {
     expect(
       await retry(host, { type: 'stream', message: 'rate limit' }),
     ).toEqual({ retry: true, delay: 0 })
-    expect(bearer(await modelRequest(host))).toBe('Bearer b-token')
+    expect(bearer(await poolRequestHeaders(host))).toBe('Bearer b-token')
     await wsHandshake(host)
     await wsReceive(host, { type: 'response.output_text.delta', delta: 'hi' })
     await wsReceive(host, {
@@ -395,7 +404,7 @@ describe('OpenCode 2 entry: quota', () => {
       { id: 'main', usedPercent: 10 },
       { id: 'fb', usedPercent: 10 },
     ])
-    await modelRequest(host, 'ses_1')
+    await poolRequestHeaders(host, 'ses_1')
     const request = await httpRequest(host, 'ses_1')
     await httpResponse(
       host,
@@ -408,7 +417,7 @@ describe('OpenCode 2 entry: quota', () => {
       }),
     )
     // A second session goes to fb once main is refused.
-    await modelRequest(host, 'ses_2')
+    await poolRequestHeaders(host, 'ses_2')
     await wsHandshake(host, 'ses_2')
     await wsReceive(
       host,
@@ -416,7 +425,9 @@ describe('OpenCode 2 entry: quota', () => {
       'ses_2',
     )
     await retry(host, { type: 'x', message: 'x' }, { retry: false }, 'ses_2')
-    expect(bearer(await modelRequest(host, 'ses_2'))).toBe('Bearer fb-token')
+    expect(bearer(await poolRequestHeaders(host, 'ses_2'))).toBe(
+      'Bearer fb-token',
+    )
     await wsHandshake(host, 'ses_2')
     await wsReceive(
       host,
@@ -457,7 +468,7 @@ describe('OpenCode 2 entry: logins', () => {
       }),
     })) as OpenAIAuthV2Options['beginLogin']
 
-  async function signIn(host: Host, methodID = 'chatgpt-browser') {
+  async function signIn(host: Host, methodID = 'openai-auth-pool-browser') {
     const method = host.methods.find(
       (entry) =>
         entry.integrationID === 'openai' && entry.method.id === methodID,
@@ -468,13 +479,17 @@ describe('OpenCode 2 entry: logins', () => {
     return (await authorization.callback) as Credential.OAuth
   }
 
-  it('registers both ChatGPT logins on integration openai', async () => {
+  it('registers distinct pool login methods and labels on integration openai', async () => {
     const { host } = await startPool('main-first', [{ id: 'main' }])
     expect(
       host.methods.map((entry) => [entry.integrationID, entry.method.id]),
     ).toEqual([
-      ['openai', 'chatgpt-browser'],
-      ['openai', 'chatgpt-headless'],
+      ['openai', 'openai-auth-pool-browser'],
+      ['openai', 'openai-auth-pool-headless'],
+    ])
+    expect(host.methods.map((entry) => entry.method.label)).toEqual([
+      'ChatGPT (openai-auth pool, browser)',
+      'ChatGPT (openai-auth pool, headless)',
     ])
   })
 
@@ -482,7 +497,7 @@ describe('OpenCode 2 entry: logins', () => {
     const { host, files } = await startPool('main-first', [{ id: 'main' }], {
       beginLogin: login('chatgpt-new'),
     })
-    const credential = await signIn(host, 'chatgpt-headless')
+    const credential = await signIn(host, 'openai-auth-pool-headless')
     expect(isPlaceholderCredential(credential, 'openai')).toBe(true)
     expect(credential.access).not.toContain('chatgpt-new')
     const accounts = files.readConfig().accounts
@@ -497,7 +512,7 @@ describe('OpenCode 2 entry: logins', () => {
       'chatgpt-new-new-refresh',
     )
     // The new row serves at once.
-    await modelRequest(host, 'ses_x')
+    await poolRequestHeaders(host, 'ses_x')
   })
 
   it("replaces the credential of the row that already holds the login's account, main included", async () => {
@@ -574,27 +589,25 @@ describe('OpenCode 2 entry: logins', () => {
     ])
   })
 
-  it('copies a ChatGPT login OpenCode 2 already held into the pool', async () => {
+  it('never copies a ChatGPT login OpenCode 2 already holds into the pool', async () => {
     const files = poolFiles()
     seedPool(files, 'main-first', [{ id: 'main' }])
-    const { stop } = await start(files, {
-      activeCredential: {
-        type: 'oauth',
-        methodID: 'chatgpt-browser',
-        access: 'host-access',
-        refresh: 'host-refresh',
-        expires: Date.now() + 3600_000,
-        metadata: { accountID: 'chatgpt-host' },
-      } as unknown as Credential.Value,
-    })
+    const beforeConfig = readFileSync(files.configPath, 'utf8')
+    const beforeState = readFileSync(files.statePath, 'utf8')
+    const credential = {
+      type: 'oauth',
+      methodID: 'chatgpt-browser',
+      access: 'host-access',
+      refresh: 'host-refresh',
+      expires: Date.now() + 3600_000,
+      metadata: { accountID: 'chatgpt-host' },
+    } as unknown as Credential.Value
+    const { host, stop } = await start(files, { activeCredential: credential })
     await stop()
-    const row = files
-      .readConfig()
-      .accounts.find((account) => account.accountId === 'chatgpt-host')
-    expect(row).toBeDefined()
-    expect(files.readState().accounts[row?.id ?? '']?.refresh).toBe(
-      'host-refresh',
-    )
+    expect(readFileSync(files.configPath, 'utf8')).toBe(beforeConfig)
+    expect(readFileSync(files.statePath, 'utf8')).toBe(beforeState)
+    expect(host.connectionReads).toEqual({ active: 0, resolve: 0 })
+    expect(host.getActiveCredential()).toBe(credential)
   })
 })
 
@@ -659,7 +672,7 @@ describe('OpenCode 2 entry: the pool migration', () => {
     const request = await (async () => {
       for (;;) {
         try {
-          await modelRequest(host)
+          await poolRequestHeaders(host)
           return await httpRequest(host)
         } catch (error) {
           if (Date.now() > deadline) throw error
@@ -829,57 +842,107 @@ describe('OpenCode 2 adapter: event rules', () => {
   })
 })
 
-describe('Codex destination independent of the host credential', () => {
-  it('rewrites the default origin in the pool model.request hook', async () => {
+describe('Codex destination after transport ownership', () => {
+  it('rewrites the default origin only on owned HTTP and WebSocket sends', async () => {
     const { host } = await startPool('main-first', [
       { id: 'main', identity: 'acct-A', usedPercent: 5 },
     ])
-    const draft = {
+    const model = {
       ...scope('ses_endpoint'),
       baseURL: 'https://api.openai.com/v1',
-      headers: {} as Record<string, string>,
+      headers: {},
     }
-    await host.fire('model.request', draft)
-    expect(draft.baseURL).toBe('https://chatgpt.com/backend-api/codex')
-    expect(draft.headers['session-id']).toBe('ses_endpoint')
-    const custom = {
-      ...scope('ses_custom'),
-      baseURL: 'https://proxy.example/v1',
-      headers: { 'session-id': 'host-derived-session' },
+    await host.fire('model.request', model)
+    expect(model.baseURL).toBe('https://api.openai.com/v1')
+    expect(model.headers).toEqual({})
+    const draft = {
+      ...scope('ses_endpoint'),
+      request: new Request('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${PLACEHOLDER}` },
+        body: '{}',
+      }),
     }
-    await host.fire('model.request', custom)
-    expect(custom.baseURL).toBe('https://proxy.example/v1')
-    expect(custom.headers['session-id']).toBe('host-derived-session')
+    await host.fire('http.request', draft)
+    expect(draft.request.url).toBe(
+      'https://chatgpt.com/backend-api/codex/responses',
+    )
+    expect(draft.request.headers.get('session-id')).toBe('ses_endpoint')
+    const handshake = {
+      ...scope('ses_endpoint'),
+      url: 'wss://api.openai.com/v1/responses',
+      headers: { authorization: `Bearer ${PLACEHOLDER}` } as Record<
+        string,
+        string
+      >,
+    }
+    await host.fire('experimental.ws.handshake', handshake)
+    expect(handshake.url).toBe('wss://chatgpt.com/backend-api/codex/responses')
+    expect(handshake.headers['session-id']).toBe('ses_endpoint')
   })
 
-  it('uses the configured Codex base and leaves API-key destinations unchanged', () => {
-    const oauth = { baseURL: 'https://api.openai.com/v1' }
-    applyCodexBaseURL(oauth, 'oauth', 'https://codex.example/custom/responses')
-    expect(oauth.baseURL).toBe('https://codex.example/custom')
-    const key = { baseURL: 'https://api.openai.com/v1' }
-    applyCodexBaseURL(key, 'api-key', 'https://codex.example/responses')
-    expect(key.baseURL).toBe('https://api.openai.com/v1')
-    const custom = { baseURL: 'https://api.openai.com.example/v1' }
+  it('uses the configured Codex base and preserves custom transport destinations', () => {
     expect(
-      applyCodexBaseURL(custom, 'oauth', 'https://codex.example/responses'),
-    ).toBe(true)
-    expect(custom.baseURL).toBe('https://api.openai.com.example/v1')
+      codexRequestURL(
+        'https://api.openai.com:8443/v1/responses',
+        'https://codex.example/responses',
+      ),
+    ).toBe('https://api.openai.com:8443/v1/responses')
+    expect(
+      codexRequestURL(
+        'https://api.openai.com/v1/responses?trace=1',
+        'https://codex.example/custom/responses',
+      ),
+    ).toBe('https://codex.example/custom/responses?trace=1')
+    expect(
+      codexRequestURL(
+        'wss://api.openai.com/v1/responses',
+        'http://codex.example/custom/responses',
+      ),
+    ).toBe('ws://codex.example/custom/responses')
+    expect(
+      codexRequestURL(
+        'https://api.openai.com.example/v1/responses',
+        'https://codex.example/responses',
+      ),
+    ).toBe('https://api.openai.com.example/v1/responses')
   })
 
-  it('removes maxTokens from pool context and compaction without a host login', async () => {
+  it('keeps context options unchanged and removes output caps only from owned sends', async () => {
     const { host } = await startPool('main-first', [
       { id: 'main', identity: 'acct-A', usedPercent: 5 },
     ])
     for (const hook of ['context', 'compaction']) {
       const draft = {
         ...scope('ses_options'),
-        options: { maxTokens: 1024, temperature: 0.5 } as {
-          maxTokens?: number
-          temperature: number
-        },
+        options: { maxTokens: 1024, temperature: 0.5 },
       }
       await host.fire(hook, draft)
-      expect(draft.options).toEqual({ temperature: 0.5 })
+      expect(draft.options).toEqual({ maxTokens: 1024, temperature: 0.5 })
     }
+    const http = {
+      ...scope('ses_options'),
+      request: new Request('http://codex.test/v1/responses', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${PLACEHOLDER}` },
+        body: JSON.stringify({ max_output_tokens: 1024, temperature: 0.5 }),
+      }),
+    }
+    await host.fire('http.request', http)
+    expect(await http.request.json()).toEqual({ temperature: 0.5 })
+    await wsHandshake(host, 'ses_options')
+    const ws = {
+      ...scope('ses_options'),
+      frame: JSON.stringify({
+        type: 'response.create',
+        max_output_tokens: 1024,
+        temperature: 0.5,
+      }),
+    }
+    await host.fire('experimental.ws.send', ws)
+    expect(JSON.parse(ws.frame)).toEqual({
+      type: 'response.create',
+      temperature: 0.5,
+    })
   })
 })

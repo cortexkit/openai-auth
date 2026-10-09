@@ -342,12 +342,13 @@ describe('through the OpenCode 2 entry', () => {
     for (let turn = 0; turn < 2; turn++) {
       const draft = {
         ...draftScope(),
+        url: 'wss://codex.test/v1/responses',
         headers: {
           authorization: `Bearer ${PLACEHOLDER}`,
           'User-Agent': 'opencode/latest/2.0.21/cli',
         } as Record<string, string>,
       }
-      await host.fire('model.request', draft)
+      await host.fire('experimental.ws.handshake', draft)
       seen.push(draft.headers)
     }
     for (const headers of seen) {
@@ -358,22 +359,19 @@ describe('through the OpenCode 2 entry', () => {
       expect(headers['user-agent']).toBe(CODEX_USER_AGENT)
       expect(headers['User-Agent']).toBe(undefined)
     }
-    // The library marks each request with its attempt (and strips the mark
-    // before anything is sent); every other header is the same on every
-    // request, so the host keeps one WebSocket for the session.
-    const withoutMark = (headers: Record<string, string>) => {
-      const { [ATTEMPT_HEADER]: mark, ...rest } = headers
-      expect(mark).toBeString()
-      return rest
-    }
-    expect(withoutMark(seen[1] as Record<string, string>)).toEqual(
-      withoutMark(seen[0] as Record<string, string>),
-    )
-    expect(seen[1]?.[ATTEMPT_HEADER]).not.toBe(seen[0]?.[ATTEMPT_HEADER])
+    // Account choice happens at the transport, so no attempt mark needs to
+    // travel in the model headers. Stable headers let the host reuse a socket.
+    expect(seen[0]?.[ATTEMPT_HEADER]).toBeUndefined()
+    expect(seen[1]).toEqual(seen[0])
   })
 
   it('rewrites WebSocket frames and HTTP bodies through the hooks', async () => {
     const host = await start()
+    await host.fire('experimental.ws.handshake', {
+      ...draftScope(),
+      url: 'wss://codex.test/v1/responses',
+      headers: { authorization: `Bearer ${PLACEHOLDER}` },
+    })
     const send = async (text: string) => {
       const draft = { ...draftScope(), frame: text }
       await host.fire('experimental.ws.send', draft)
@@ -396,6 +394,7 @@ describe('through the OpenCode 2 entry', () => {
       ...draftScope(),
       request: httpBody('high', [user('one'), assistant('a'), user('three')]),
     }
+    draft.request.headers.set('authorization', `Bearer ${PLACEHOLDER}`)
     await host.fire('http.request', draft)
     const body = await draft.request.json()
     expect(body.reasoning.effort).toBe('low')

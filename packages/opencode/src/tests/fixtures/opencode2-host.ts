@@ -35,10 +35,15 @@ export type FakeModel = {
 }
 
 export function fakeOpenCode2Host(
-  options: { activeCredential?: Credential.Value } = {},
+  options: {
+    activeCredential?: Credential.Value
+    methods?: RegisteredMethod[]
+  } = {},
 ) {
+  let activeCredential = options.activeCredential
+  const connectionReads = { active: 0, resolve: 0 }
   const hooks: Hook[] = []
-  const methods: RegisteredMethod[] = []
+  const methods: RegisteredMethod[] = [...(options.methods ?? [])]
   const modelTransforms: Array<(editor: unknown) => void> = []
   const pending: Array<{ type: string; data: unknown }> = []
   let wake: (() => void) | undefined
@@ -105,9 +110,14 @@ export function fakeOpenCode2Host(
         return registration()
       },
       connection: {
-        active: async () =>
-          options.activeCredential ? { id: 'conn_1' } : undefined,
-        resolve: async () => options.activeCredential,
+        active: async () => {
+          connectionReads.active++
+          return activeCredential ? { id: 'conn_1' } : undefined
+        },
+        resolve: async () => {
+          connectionReads.resolve++
+          return activeCredential
+        },
         status: async () => {},
       },
     },
@@ -122,6 +132,27 @@ export function fakeOpenCode2Host(
     ctx: ctx as never,
     hooks,
     methods,
+    connectionReads,
+    /** Simulates a user selecting another connection without restarting the host. */
+    setActiveCredential(value: Credential.Value | undefined) {
+      activeCredential = value
+    },
+    getActiveCredential: () => activeCredential,
+    /** Refreshes through the registered method the host credential belongs to. */
+    async refreshActiveCredential() {
+      if (activeCredential?.type !== 'oauth')
+        throw new Error('not an OAuth connection')
+      const credential = activeCredential
+      const method = methods.find(
+        (entry) =>
+          entry.integrationID === 'openai' &&
+          entry.method.id === credential.methodID,
+      )
+      if (!method?.refresh)
+        throw new Error('no refresh handler for active connection')
+      activeCredential = await method.refresh(credential)
+      return activeCredential
+    },
     /** Runs the registered model transforms over `models`, editing them in place. */
     transformModels(models: FakeModel[]) {
       const editor = {

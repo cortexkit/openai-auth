@@ -1,7 +1,8 @@
-// The OpenCode 2 entry's handling of the account-pool migration and of the
-// credentials it finds: the migration switch, the copy of a login OpenCode 2
-// already held, leftovers that are not credentials, the writes to OpenCode
-// 1's `auth.json`, and which credential a quota reading belongs to.
+// These tests keep each credential under one refresh owner: OpenCode 2's
+// existing login stays with the host, while the OpenCode 1 migration moves
+// its login into the pool. Placeholder and tombstone markers are rejected as
+// new logins, slot writes preserve concurrent changes, and quota readings
+// are attributed only to the credential that served the request.
 
 import { afterEach, describe, expect, it } from 'bun:test'
 import {
@@ -16,6 +17,7 @@ import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore } from '@cortexkit/common-auth/store'
 import type { Credential } from '@opencode/plugin'
+import { POOL_LOGIN_REQUIRED_MESSAGE } from '../core/pool-main'
 import { POOL_PLACEHOLDER } from '../core/pool-migration'
 import { NO_OPENCODE1_LOGINS, opencode1HostSlot } from '../v2/host-slot'
 import { writeLoginToPool } from '../v2/login'
@@ -72,7 +74,7 @@ async function start(
   return { host, stop }
 }
 
-async function modelRequest(host: Host, sessionID = 'ses_1') {
+async function poolRequestHeaders(host: Host, sessionID = 'ses_1') {
   const draft = {
     ...scope(sessionID),
     headers: { Authorization: `Bearer ${PLACEHOLDER}` } as Record<
@@ -81,7 +83,7 @@ async function modelRequest(host: Host, sessionID = 'ses_1') {
     >,
   }
   await host.fire('model.request', draft)
-  return draft.headers
+  return Object.fromEntries((await httpRequest(host, sessionID)).headers)
 }
 
 async function httpRequest(host: Host, sessionID = 'ses_1') {
@@ -133,7 +135,7 @@ async function waitFor(check: () => boolean, ms: number): Promise<boolean> {
 }
 
 describe('OpenCode 2 entry: the migration switch', () => {
-  it('leaves an unmigrated install alone while the switch is off: no migration, no hooks, no login methods', async () => {
+  it('leaves an unmigrated install alone while the switch is off but refuses a cached pool placeholder', async () => {
     const slot = {
       type: 'oauth',
       access: jwt('chatgpt-main'),
@@ -150,9 +152,22 @@ describe('OpenCode 2 entry: the migration switch', () => {
         return { open: true }
       },
     })
-    // OpenCode 2's own ChatGPT login keeps serving: nothing of this plugin
-    // sits on its requests or replaces its login methods.
-    expect(host.hooks).toEqual([])
+    // The host's real credential remains untouched; the only request the
+    // disabled pool may handle is a local refusal of its cached placeholder.
+    const original = new Request('https://api.openai.com/v1/responses', {
+      headers: { authorization: 'Bearer real-host-token' },
+    })
+    const stock = { ...scope(), request: original }
+    await host.fire('http.request', stock)
+    expect(stock.request).toBe(original)
+    await expect(httpRequest(host)).rejects.toThrow(POOL_LOGIN_REQUIRED_MESSAGE)
+    await expect(
+      host.fire('experimental.ws.handshake', {
+        ...scope(),
+        url: 'wss://api.openai.com/v1/responses',
+        headers: { authorization: `Bearer ${PLACEHOLDER}` },
+      }),
+    ).rejects.toThrow(POOL_LOGIN_REQUIRED_MESSAGE)
     expect(host.methods).toEqual([])
     // A migration run checks the version fence before anything else, so a
     // fence that is never asked means no migration ran.
@@ -174,7 +189,7 @@ describe('OpenCode 2 entry: the migration switch', () => {
         return { open: true }
       },
     })
-    const headers = await modelRequest(host)
+    const headers = await poolRequestHeaders(host)
     expect(headers.authorization ?? headers.Authorization).toBe(
       'Bearer main-token',
     )
@@ -182,24 +197,26 @@ describe('OpenCode 2 entry: the migration switch', () => {
   })
 })
 
-describe('OpenCode 2 entry: copying the login OpenCode 2 held', () => {
-  it('does not copy an older OpenCode 2 login of the account the migration just moved into main', async () => {
+describe('OpenCode 2 entry: host logins and pool credential validation', () => {
+  it("migrates only OpenCode 1's slot while leaving OpenCode 2's login alone", async () => {
     const { files } = unmigratedInstall({
       type: 'oauth',
       access: jwt('chatgpt-main', 'slot'),
       refresh: 'slot-refresh',
       expires: Date.now() + 3600_000,
     })
-    // The migration is held at its version-fence check until the plugin has
-    // started copying OpenCode 2's login, so that copy starts while the pool
-    // does not hold the account yet.
+    // Pause the separate OpenCode 1 migration to verify that setup never
+    // reads OpenCode 2's active login, even before the pool exists.
+    let migrationStarted = false
     let open: () => void = () => {}
     const gate = new Promise<void>((resolve) => {
       open = resolve
     })
-    const { stop } = await start(files, {
+    const { host, stop } = await start(files, {
       poolMigration: true,
       fence: async () => {
+        migrationStarted = true
+
         await gate
         return { open: true }
       },
@@ -212,7 +229,8 @@ describe('OpenCode 2 entry: copying the login OpenCode 2 held', () => {
         metadata: { accountID: 'chatgpt-main' },
       } as unknown as Credential.Value,
     })
-    await Bun.sleep(50)
+    expect(await waitFor(() => migrationStarted, 1_000)).toBe(true)
+    expect(host.connectionReads).toEqual({ active: 0, resolve: 0 })
     open()
     expect(
       await waitFor(
@@ -246,16 +264,22 @@ describe('OpenCode 2 entry: copying the login OpenCode 2 held', () => {
     expect(JSON.stringify(files.readState())).not.toContain(TOMBSTONE_REFRESH)
   })
 
-  it("never copies OpenCode 1's pool placeholder carried into OpenCode 2", async () => {
+  it("refuses to store OpenCode 1's pool placeholder as a login", async () => {
     const files = poolFiles()
     seedPool(files, 'main-first', [{ id: 'fb' }])
-    const { stop } = await start(files, {
-      activeCredential: {
-        ...POOL_PLACEHOLDER,
-        methodID: 'chatgpt-browser',
-      } as unknown as Credential.Value,
+    cleanups.push(() => rmSync(files.dir, { recursive: true, force: true }))
+    const pool = openPoolStore({
+      provider: 'openai',
+      configPath: files.configPath,
+      statePath: files.statePath,
+      quota: quotaCodec,
     })
-    await stop()
+    await expect(
+      writeLoginToPool(pool, files.paths(), {
+        id: 'x',
+        ...POOL_PLACEHOLDER,
+      }),
+    ).rejects.toThrow('not a ChatGPT login')
     expect(files.readConfig().accounts.map((account) => account.id)).toEqual([
       'fb',
     ])
@@ -365,7 +389,7 @@ describe('OpenCode 2 entry: quota attribution', () => {
       { id: 'main', access: jwt('chatgpt-main', 'one') },
     ])
     const { host, stop } = await start(files)
-    await modelRequest(host, 'ses_1')
+    await poolRequestHeaders(host, 'ses_1')
     const request = await httpRequest(host, 'ses_1')
     expect(request.headers.get('authorization')).toBe(
       `Bearer ${jwt('chatgpt-main', 'one')}`,
@@ -388,7 +412,7 @@ describe('OpenCode 2 entry: quota attribution', () => {
     }
     writeFileSync(files.statePath, JSON.stringify(state))
     // Another request reads the replaced row.
-    await modelRequest(host, 'ses_2')
+    await poolRequestHeaders(host, 'ses_2')
     // The first request's response, with quota, arrives only now.
     await httpResponse(
       host,

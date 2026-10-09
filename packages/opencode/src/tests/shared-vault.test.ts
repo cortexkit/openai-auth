@@ -12,6 +12,7 @@ import {
   connectClaustrumEnrollmentClient,
   connectClaustrumScopedClient,
 } from '@cortexkit/common-auth/claustrum'
+import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import { OpenAiVault, vaultPaths } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks } from '@opencode-ai/plugin'
 import {
@@ -384,7 +385,7 @@ describe('one host vault per process', () => {
     expect(daemon.lists).toBe(1)
     await stops[0]?.()
     const draftScope = requestScope('ses_shared', 'primary')
-    const headers = { authorization: `Bearer ${PLACEHOLDER.access}` }
+    const headers = { authorization: `Bearer ${placeholderSecret('openai')}` }
     await hosts[1]!.fire('model.request', { ...draftScope, headers })
     const draft = {
       ...draftScope,

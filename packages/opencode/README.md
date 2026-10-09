@@ -22,7 +22,9 @@ Restart OpenCode after changing plugin config, then authenticate:
 
 ## OpenCode 2
 
-On OpenCode 2 (`@opencode/cli`, tested on 2.0.21) list the same package under `plugins`; OpenCode 2 loads its `./server` entry. OpenCode 2's own OpenAI driver sends the requests, and the plugin chooses the account from the shared account pool and sets its credential through OpenCode 2's session hooks. Logins (`opencode auth login openai`) go into the pool; OpenCode 2 keeps only a placeholder. The `/openai` menu, the sidebar, keep-warm and OpenCode 1's Codex request shaping are not available there yet. See the [repository README](https://github.com/cortexkit/openai-auth#opencode-2) for the details.
+On OpenCode 2 (`@opencode/cli`, tested on 2.0.22) list the same package under `plugins`; OpenCode 2 loads its `./server` entry. OpenCode 2's own OpenAI driver sends the requests, and the plugin chooses the account from the shared account pool and sets its credential through OpenCode 2's session hooks. Logins (`opencode auth login openai`) go into the pool; OpenCode 2 keeps only a placeholder. The `/openai` menu, the sidebar, keep-warm and OpenCode 1's Codex request shaping are not available there yet. See the [repository README](https://github.com/cortexkit/openai-auth#opencode-2) for the details.
+
+Choose **ChatGPT (openai-auth pool, browser)** or **ChatGPT (openai-auth pool, headless)** in `opencode auth login openai` to use the pool. The plugin serves a request only when the host-prepared Authorization bearer equals its pool placeholder exactly. API keys, environment keys and OpenCode's own ChatGPT logins pass through unchanged, without pool quota or attribution; switching connections takes effect on the next request. A placeholder with no usable pool account is refused locally, never sent upstream. Existing host ChatGPT logins are never copied into the pool: choose a pool login to obtain a separate OAuth token family, leaving the host's login and refresh methods intact.
 
 ## Features
 

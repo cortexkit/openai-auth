@@ -586,7 +586,7 @@ expect_message = "Expected constructor: TombstoneRefreshError"
 
 [[control]]
 id = "opencode2-pool-placeholder-is-not-a-login"
-guards = "OpenCode 1's pool placeholder carried into OpenCode 2 is never copied into the pool"
+guards = "OpenCode 1's pool placeholder cannot be stored as a new pool login"
 file = "packages/opencode/src/v2/login.ts"
 old = "    value.refresh === POOL_PLACEHOLDER_REFRESH ||\n"
 new = ""
@@ -594,8 +594,8 @@ test_file = "packages/opencode/src/tests/opencode2-audit-fixes.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-audit-fixes.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ["^OpenCode\\s2\\sentry:\\scopying\\sthe\\slogin\\sOpenCode\\s2\\sheld\\snever\\scopies\\sOpenCode\\s1's\\spool\\splaceholder\\scarried\\sinto\\sOpenCode\\s2$"]
-expect_message = "expect(files.readConfig().accounts.map((account) => account.id)).toEqual(["
+expect_red = ["^OpenCode\\s2\\sentry:\\shost\\slogins\\sand\\spool\\scredential\\svalidation\\srefuses\\sto\\sstore\\sOpenCode\\s1's\\spool\\splaceholder\\sas\\sa\\slogin$"]
+expect_message = "Received promise that resolved"
 
 [[control]]
 id = "opencode2-tombstone-is-not-a-login"
@@ -607,7 +607,7 @@ test_file = "packages/opencode/src/tests/opencode2-audit-fixes.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-audit-fixes.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ["^OpenCode\\s2\\sentry:\\scopying\\sthe\\slogin\\sOpenCode\\s2\\sheld\\srefuses\\sto\\sstore\\sa\\stombstone\\sas\\sa\\slogin$"]
+expect_red = ["^OpenCode\\s2\\sentry:\\shost\\slogins\\sand\\spool\\scredential\\svalidation\\srefuses\\sto\\sstore\\sa\\stombstone\\sas\\sa\\slogin$"]
 expect_message = "Received promise that resolved"
 
 [[control]]
@@ -1437,7 +1437,7 @@ expect_red = ['^vault\scommand\smenu\sa\shost-wide\scheck\spolls\seach\svault\sa
 id = "menu-common-auth-release"
 guards = "the shared menu requires the published common-auth replacement-slot release"
 file = "packages/core/package.json"
-old = '"@cortexkit/common-auth": "^0.11.7"'
+old = '"@cortexkit/common-auth": "^0.11.8"'
 new = '"@cortexkit/common-auth": "^0.11.4"'
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
@@ -1525,3 +1525,101 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/request-test-scope.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^drains\sa\sstarted\ssource\sread\sbefore\sthe\snext\swire,\snaming\sits\sowner$']
+
+# OpenCode 2: the pool handles a send only when the host-prepared bearer is its
+# placeholder; requests using other credentials pass through unchanged.
+
+[[control]]
+id = "opencode2-placeholder-ownership-gate"
+guards = "a migrated pool leaves an API-key request untouched when the prepared bearer is not the pool placeholder"
+file = "packages/opencode/src/v2/setup.ts"
+old = """    gateOnPlaceholder: {
+      credential: (headers) => {
+        const authorization = headers.get('authorization')
+        return authorization?.startsWith('Bearer ')
+          ? authorization.slice('Bearer '.length)
+          : undefined
+      },
+    },"""
+new = "    // NON-VACUITY BREAK: remove the shared placeholder equality gate."
+test_file = "packages/opencode/src/tests/opencode2-active-connection.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-active-connection.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sactive\\sconnection\\sgate\\sleaves\\san\\sactive\\sAPI\\skey\\suntouched\\sand\\srecords\\sno\\spool\\sfeedback$"]
+
+[[control]]
+id = "opencode2-request-bound-credential"
+guards = "switching connections changes the next prepared request's ownership instead of reusing a placeholder decision"
+file = "packages/opencode/src/v2/setup.ts"
+old = """        const authorization = headers.get('authorization')
+        return authorization?.startsWith('Bearer ')
+          ? authorization.slice('Bearer '.length)
+          : undefined"""
+new = """        // NON-VACUITY BREAK: treat every prepared credential as the pool placeholder.
+        void headers
+        return 'common-auth-placeholder.openai'"""
+test_file = "packages/opencode/src/tests/opencode2-active-connection.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-active-connection.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sactive\\sconnection\\sgate\\sswitches\\sfrom\\sthe\\splaceholder\\sto\\san\\sAPI\\skey\\sand\\sback\\son\\sthe\\snext\\srequest$"]
+
+
+[[control]]
+id = "opencode2-pool-login-preserves-builtin-refresh"
+guards = "registering pool logins must not replace the host's ChatGPT method or turn its background refresh into a pool placeholder"
+file = "packages/opencode/src/v2/login.ts"
+old = """export const POOL_BROWSER_METHOD = 'openai-auth-pool-browser'
+export const POOL_HEADLESS_METHOD = 'openai-auth-pool-headless'"""
+new = """// NON-VACUITY BREAK: overwrite the host's built-in ChatGPT methods.
+export const POOL_BROWSER_METHOD = 'chatgpt-browser'
+export const POOL_HEADLESS_METHOD = 'chatgpt-headless'"""
+test_file = "packages/opencode/src/tests/opencode2-active-connection.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-active-connection.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sactive\\sconnection\\sgate\\skeeps\\sa\\sbuilt-in\\sChatGPT\\slogin\\sreal\\swhen\\sthe\\shost\\srefreshes\\sit$"]
+
+
+[[control]]
+id = "opencode2-disabled-pool-refuses-placeholder"
+guards = "even when migration is disabled, a cached pool placeholder is refused locally while real credentials bypass the plugin"
+file = "packages/opencode/src/v2/setup.ts"
+old = "    return () => installation.dispose()"
+new = """    // NON-VACUITY BREAK: remove the disabled store's local placeholder refusal.
+    await installation.dispose()
+    return async () => {}"""
+test_file = "packages/opencode/src/tests/opencode2-audit-fixes.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-audit-fixes.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sentry:\\sthe\\smigration\\sswitch\\sleaves\\san\\sunmigrated\\sinstall\\salone\\swhile\\sthe\\sswitch\\sis\\soff\\sbut\\srefuses\\sa\\scached\\spool\\splaceholder$"]
+
+
+[[control]]
+id = "opencode2-host-refresh-family-not-imported"
+guards = "the host and pool must never become competing refresh owners of a pre-existing host ChatGPT token family"
+file = "packages/opencode/src/v2/setup.ts"
+old = "  const models = await registerCodexModelRules(ctx)"
+new = """  const models = await registerCodexModelRules(ctx)
+  // NON-VACUITY BREAK: restore automatic import of the host's live OAuth family.
+  const connection = await ctx.integration.connection.active(OPENAI_PROVIDER_ID)
+  const value = connection ? await ctx.integration.connection.resolve(connection) : undefined
+  if (value?.type === 'oauth' && value.refresh && !isLeftoverCredential(value)) {
+    const accountId = typeof value.metadata?.accountID === 'string'
+      ? value.metadata.accountID : crypto.randomUUID()
+    await writeLoginToPool(source.poolStore(), paths(), {
+      id: accountId,
+      accountId,
+      access: value.access,
+      refresh: value.refresh,
+      expires: value.expires,
+    }, { origin: 'import' })
+    await source.load()
+  }"""
+test_file = "packages/opencode/src/tests/opencode2-active-connection.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-active-connection.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sactive\\sconnection\\sgate\\snever\\sreads\\sor\\scopies\\sa\\spre-existing\\shost\\sChatGPT\\slogin\\sinto\\sthe\\spool$"]
