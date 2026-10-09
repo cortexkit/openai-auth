@@ -4,7 +4,7 @@
 // receipt carried as the attempt's value, and a 401 on that send reported to
 // the vault against the exact record version it used.
 
-import { afterEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import {
   chmodSync,
   mkdirSync,
@@ -35,14 +35,22 @@ import {
   seedPool,
 } from './fixtures/opencode2-host'
 import { usageBody } from './fixtures/pool-install'
+import { createRequestTestScope } from './request-test-scope.ts'
 
 const PLACEHOLDER = placeholderSecret('openai')
 const VAULT_ACCESS = chatgptAccessToken('chatgpt-vault')
 const ENROLLMENT_TOKEN = '01'.repeat(32)
 
 const cleanups: Array<() => Promise<void> | void> = []
+const requestScope = createRequestTestScope()
+const it = requestScope.it
+
+beforeEach(() => requestScope.capturePluginWork())
+
 afterEach(async () => {
-  for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+  await requestScope.teardown(async () => {
+    for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+  })
 })
 
 /** Quota polls answer for every bearer; anything else is offline. */

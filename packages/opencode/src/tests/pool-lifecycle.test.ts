@@ -2,7 +2,7 @@
 // adoptions (`core/pool-lifecycle.ts`), against a real legacy install on disk,
 // the file-backed host slot and the real version fence over a temporary state
 // home. Timers are fake: each test fires the retry timer itself.
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -31,6 +31,7 @@ import {
   poolTokens,
   seedLegacyInstall,
 } from './fixtures/pool-migration-harness.ts'
+import { createRequestTestScope } from './request-test-scope.ts'
 
 const VERSION = '1.0.0'
 const OLDER_PID = 424_242
@@ -39,17 +40,22 @@ let h: Harness
 let stateHome: string
 let alive: Set<number>
 let lifecycle: PoolLifecycle | undefined
+const scope = createRequestTestScope()
+const it = scope.it
 
 beforeEach(() => {
+  scope.capturePluginWork()
   h = harness()
   stateHome = mkdtempSync(join(tmpdir(), 'pool-lifecycle-state-'))
   alive = new Set()
   lifecycle = undefined
 })
-afterEach(() => {
-  lifecycle?.dispose()
-  h.cleanup()
-  rmSync(stateHome, { recursive: true, force: true })
+afterEach(async () => {
+  await scope.teardown(async () => {
+    lifecycle?.dispose()
+    h.cleanup()
+    rmSync(stateHome, { recursive: true, force: true })
+  })
 })
 
 /** Timers the test fires by hand; `delays` lists what is pending. */

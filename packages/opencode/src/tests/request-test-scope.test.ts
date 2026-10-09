@@ -158,3 +158,28 @@ it('drains a started background run before the next wire, naming its owner', asy
   expect(priorWire.polls).toEqual(['Bearer prior-background-token'])
   expect((error as Error)?.message).toBe(`Request work outlived test: ${owner}`)
 })
+
+it('drains an outliving test body before fixture cleanup, naming its owner', async () => {
+  const pendingScope = createRequestTestScope()
+  const owner = 'timed-out login adoption'
+  const entered = Promise.withResolvers<void>()
+  const gate = Promise.withResolvers<void>()
+  const order: string[] = []
+  const body = pendingScope.run(owner, async () => {
+    entered.resolve()
+    await gate.promise
+    order.push('adoption finished')
+  })
+  await entered.promise
+  setTimeout(() => gate.resolve(), 25)
+
+  const error = await pendingScope
+    .teardown(async () => {
+      order.push('fixture cleanup')
+    })
+    .catch((caught: unknown) => caught)
+  await body
+
+  expect(order).toEqual(['adoption finished', 'fixture cleanup'])
+  expect((error as Error)?.message).toBe(`Request work outlived test: ${owner}`)
+})

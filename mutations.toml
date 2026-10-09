@@ -1407,3 +1407,18 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^vault\scommand\smenu\sunlabelled\srows\suse\stheir\sids\seven\swithout\sa\svault\sobject$']
+
+
+# Test bodies that exceed Bun's timeout still run. The scope must drain an
+# outstanding body before restoring a shared fixture for the next test.
+[[control]]
+id = "request-test-scope-drains-outliving-test-body"
+guards = "fixture cleanup waits for an outliving test callback and reports its owner"
+file = "packages/opencode/src/tests/request-test-scope.ts"
+old = "    while (pending.size) await Promise.allSettled([...pending.keys()])"
+new = "    await Promise.resolve()"
+test_file = "packages/opencode/src/tests/request-test-scope.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/request-test-scope.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^drains\\san\\soutliving\\stest\\sbody\\sbefore\\sfixture\\scleanup,\\snaming\\sits\\sowner$"]
