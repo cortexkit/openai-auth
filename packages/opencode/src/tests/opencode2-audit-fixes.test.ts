@@ -72,7 +72,7 @@ async function start(
   return { host, stop }
 }
 
-async function modelRequest(host: Host, sessionID = 'ses_1') {
+async function poolRequestHeaders(host: Host, sessionID = 'ses_1') {
   const draft = {
     ...scope(sessionID),
     headers: { Authorization: `Bearer ${PLACEHOLDER}` } as Record<
@@ -81,7 +81,7 @@ async function modelRequest(host: Host, sessionID = 'ses_1') {
     >,
   }
   await host.fire('model.request', draft)
-  return draft.headers
+  return Object.fromEntries((await httpRequest(host, sessionID)).headers)
 }
 
 async function httpRequest(host: Host, sessionID = 'ses_1') {
@@ -174,7 +174,7 @@ describe('OpenCode 2 entry: the migration switch', () => {
         return { open: true }
       },
     })
-    const headers = await modelRequest(host)
+    const headers = await poolRequestHeaders(host)
     expect(headers.authorization ?? headers.Authorization).toBe(
       'Bearer main-token',
     )
@@ -365,7 +365,7 @@ describe('OpenCode 2 entry: quota attribution', () => {
       { id: 'main', access: jwt('chatgpt-main', 'one') },
     ])
     const { host, stop } = await start(files)
-    await modelRequest(host, 'ses_1')
+    await poolRequestHeaders(host, 'ses_1')
     const request = await httpRequest(host, 'ses_1')
     expect(request.headers.get('authorization')).toBe(
       `Bearer ${jwt('chatgpt-main', 'one')}`,
@@ -388,7 +388,7 @@ describe('OpenCode 2 entry: quota attribution', () => {
     }
     writeFileSync(files.statePath, JSON.stringify(state))
     // Another request reads the replaced row.
-    await modelRequest(host, 'ses_2')
+    await poolRequestHeaders(host, 'ses_2')
     // The first request's response, with quota, arrives only now.
     await httpResponse(
       host,

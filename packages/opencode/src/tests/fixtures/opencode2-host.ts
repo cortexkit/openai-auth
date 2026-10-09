@@ -37,6 +37,7 @@ export type FakeModel = {
 export function fakeOpenCode2Host(
   options: { activeCredential?: Credential.Value } = {},
 ) {
+  let activeCredential = options.activeCredential
   const hooks: Hook[] = []
   const methods: RegisteredMethod[] = []
   const modelTransforms: Array<(editor: unknown) => void> = []
@@ -105,9 +106,8 @@ export function fakeOpenCode2Host(
         return registration()
       },
       connection: {
-        active: async () =>
-          options.activeCredential ? { id: 'conn_1' } : undefined,
-        resolve: async () => options.activeCredential,
+        active: async () => (activeCredential ? { id: 'conn_1' } : undefined),
+        resolve: async () => activeCredential,
         status: async () => {},
       },
     },
@@ -122,6 +122,11 @@ export function fakeOpenCode2Host(
     ctx: ctx as never,
     hooks,
     methods,
+    /** Simulates a user selecting another connection without restarting the host. */
+    setActiveCredential(value: Credential.Value | undefined) {
+      activeCredential = value
+    },
+    getActiveCredential: () => activeCredential,
     /** Runs the registered model transforms over `models`, editing them in place. */
     transformModels(models: FakeModel[]) {
       const editor = {

@@ -86,7 +86,6 @@ import { POOL_MIGRATION_ENABLED } from '../index'
 import { createLogger } from '../logger'
 import { PackageVersion } from '../version'
 import { createOpenAIAdapter, OPENAI_PROVIDER_ID } from './adapter'
-import { registerCodexRequestRules } from './endpoint'
 import { opencode1HostSlot } from './host-slot'
 import {
   type BeginLogin,
@@ -325,6 +324,7 @@ export async function setupOpenAIAuth(
     pins,
     vault,
     responsesLite: () => getSettings().responsesLite,
+    codexEndpoint: () => getSettings().codexApiEndpoint,
     log,
   })
   const installation = await installOpenCode2Auth(ctx, openai.adapter, {
@@ -333,11 +333,6 @@ export async function setupOpenAIAuth(
     },
   })
   openai.attach(installation)
-  const requests = await registerCodexRequestRules(
-    ctx,
-    () => getSettings().codexApiEndpoint,
-    log,
-  )
 
   /** Waits for a migration run when the install has not migrated yet. */
   const ensureMigrated = async (login: PoolLoginResult) => {
@@ -456,7 +451,6 @@ export async function setupOpenAIAuth(
       installation.dispose(),
       methods.dispose(),
       models.dispose(),
-      requests.dispose(),
       imported,
     ])
     // Quota readings taken from responses are written to the pool files in
