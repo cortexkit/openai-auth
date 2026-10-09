@@ -2575,6 +2575,7 @@ export async function CodexAuthPlugin(
         cacheKeepManagers.get(cacheKeepKey)?.stop()
         const cacheKeepManager = createCacheKeepManager({
           fetchImpl: fetch,
+          vault,
           getMainToken: async () => {
             // A migrated install's main account is the pool row `main`; the
             // slot is never read for it.

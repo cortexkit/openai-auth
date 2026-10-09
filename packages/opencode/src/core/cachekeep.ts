@@ -21,6 +21,7 @@ import {
 import {
   type AccountStorage,
   normalizeQuotaHeaders,
+  type OpenAiVault,
 } from '@cortexkit/openai-auth-core/internal'
 import { sanitizeHttpFallbackInit } from '../codex-http'
 import {
@@ -333,10 +334,12 @@ export interface OpenAICacheKeepAdapterOptions {
   /** The main account's bearer; a throw (no token) backs the target off. */
   getMainToken: () => Promise<string>
   /**
-   * A fallback account's bearer by storage id. `onAuthFailure` reports a 401
-   * on a vault-served credential back to its custodian.
+   * Resolve the local fallback row identified by `accountId` to a bearer for
+   * this replay. `onAuthFailure` handles a 401 on that resolved credential.
    */
   refreshFallback: (accountId: string) => Promise<CacheKeepFallbackAccess>
+  /** Vault routes authorize every replay through the custodian's send path. */
+  vault?: Pick<OpenAiVault, 'owns' | 'send'>
   codexResponsesUrl: string
   /**
    * The account the target's session routes to now (see
@@ -357,6 +360,65 @@ export function createOpenAICacheKeepAdapter(
     buildBody: (target) => buildKeepwarmBody(target.bodyText),
 
     async send({ target, body, signal }) {
+      const dispatch = async (accessToken: string) => {
+        // Stopped, or the warm timed out, while the token resolved: send nothing.
+        signal.throwIfAborted()
+
+        const headers: Record<string, string> = {
+          ...target.meta.replayHeaders,
+          authorization: `Bearer ${accessToken}`,
+          'content-type': 'application/json',
+        }
+        if (target.meta.chatgptAccountId) {
+          headers['ChatGPT-Account-Id'] = target.meta.chatgptAccountId
+        } else {
+          delete headers['ChatGPT-Account-Id']
+        }
+
+        let warmBodyShape: Record<string, unknown> | undefined
+        try {
+          const parsed = JSON.parse(body) as Record<string, unknown>
+          warmBodyShape = {
+            warmBodyKeys: Object.keys(parsed),
+            stream: parsed.stream,
+            max_output_tokens: parsed.max_output_tokens,
+            store: parsed.store,
+            has_stream_options: 'stream_options' in parsed,
+            has_max_tokens: 'max_tokens' in parsed,
+            model: parsed.model,
+          }
+        } catch {
+          // Diagnostic logging must never block the warm.
+        }
+        log?.debug('cachekeep warm request', {
+          ...warmBodyShape,
+          headerKeys: Object.keys(headers),
+          hasChatGptAccountId: 'ChatGPT-Account-Id' in headers,
+        })
+
+        return options.fetchImpl(
+          options.codexResponsesUrl,
+          sanitizeHttpFallbackInit({
+            method: 'POST',
+            headers,
+            body,
+            signal,
+          }),
+        )
+      }
+
+      if (target.accountId && options.vault?.owns(target.accountId)) {
+        // The vault owns both the per-attempt authorization and 401 reporting;
+        // a refusal before dispatch must not be reported as a provider failure.
+        const response = await options.vault.send(target.accountId, dispatch, {
+          site: 'cachekeep',
+          signal,
+        })
+        if (!response)
+          throw new Error(`vault refused warm for ${target.accountId}`)
+        return response
+      }
+
       let accessToken: string
       let onAuthFailure: ((status: number) => Promise<void>) | undefined
       if (target.accountId && target.accountId !== 'main') {
@@ -370,50 +432,7 @@ export function createOpenAICacheKeepAdapter(
       } else {
         accessToken = await options.getMainToken()
       }
-      // Stopped, or the warm timed out, while the token resolved: send nothing.
-      signal.throwIfAborted()
-
-      const headers: Record<string, string> = {
-        ...target.meta.replayHeaders,
-        authorization: `Bearer ${accessToken}`,
-        'content-type': 'application/json',
-      }
-      if (target.meta.chatgptAccountId) {
-        headers['ChatGPT-Account-Id'] = target.meta.chatgptAccountId
-      } else {
-        delete headers['ChatGPT-Account-Id']
-      }
-
-      let warmBodyShape: Record<string, unknown> | undefined
-      try {
-        const parsed = JSON.parse(body) as Record<string, unknown>
-        warmBodyShape = {
-          warmBodyKeys: Object.keys(parsed),
-          stream: parsed.stream,
-          max_output_tokens: parsed.max_output_tokens,
-          store: parsed.store,
-          has_stream_options: 'stream_options' in parsed,
-          has_max_tokens: 'max_tokens' in parsed,
-          model: parsed.model,
-        }
-      } catch {
-        // Diagnostic logging must never block the warm.
-      }
-      log?.debug('cachekeep warm request', {
-        ...warmBodyShape,
-        headerKeys: Object.keys(headers),
-        hasChatGptAccountId: 'ChatGPT-Account-Id' in headers,
-      })
-
-      const response = await options.fetchImpl(
-        options.codexResponsesUrl,
-        sanitizeHttpFallbackInit({
-          method: 'POST',
-          headers,
-          body,
-          signal,
-        }),
-      )
+      const response = await dispatch(accessToken)
       if (response.status === 401) await onAuthFailure?.(response.status)
       return response
     },
@@ -464,6 +483,7 @@ export function createCacheKeepManager(
     fetchImpl,
     getMainToken,
     refreshFallback,
+    vault,
     codexResponsesUrl,
     activeAccount,
     logger,
@@ -476,6 +496,7 @@ export function createCacheKeepManager(
       fetchImpl,
       getMainToken,
       refreshFallback,
+      vault,
       codexResponsesUrl,
       activeAccount,
       logger,

@@ -43,7 +43,14 @@ import {
 import { authDoctorChecks, readStoreIds } from '../auth/doctor'
 import { createAuthMethods } from '../auth/methods'
 import { applyOpenAiMenu } from '../commands'
+import type { OpenAICacheKeepManager } from '../core/cachekeep'
 import { __menuContextForTest } from '../index.ts'
+import {
+  DEFAULT_SIDEBAR_STATE,
+  getSidebarState,
+  hashSidebarSessionId,
+  setSidebarState,
+} from '../sidebar-state'
 import {
   HOUR,
   installWire,
@@ -71,7 +78,11 @@ function wireWithExhaustedMain(): Wire {
 
 import { createFailurePhaseClock } from './failure-phase-clock.ts'
 import { createRequestTestScope } from './request-test-scope.ts'
-import { FLOOR_AUTH_FILE, FLOOR_STATE_FILE } from './setup-env'
+import {
+  FLOOR_AUTH_FILE,
+  FLOOR_SIDEBAR_STATE_FILE,
+  FLOOR_STATE_FILE,
+} from './setup-env'
 
 const ENROLLMENT_TOKEN = '01'.repeat(32)
 const VAULT_ACCESS = chatgptAccessToken('chatgpt-vault')
@@ -82,6 +93,7 @@ let stateDir: string
 let daemon: MockDaemon | undefined
 let hooks: Hooks | undefined
 let originalFetch: typeof globalThis.fetch
+let stopWarmCodex: (() => Promise<void>) | undefined
 const scope = createRequestTestScope()
 const test = scope.it
 const clock = createFailurePhaseClock()
@@ -107,9 +119,13 @@ afterEach(async () => {
     hooks = undefined
     await daemon?.stop()
     daemon = undefined
+    await stopWarmCodex?.()
+    stopWarmCodex = undefined
     globalThis.fetch = originalFetch
     process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+      FLOOR_SIDEBAR_STATE_FILE
     rmSync(dir, { recursive: true, force: true })
   })
 })
@@ -523,6 +539,351 @@ async function setMode(mode: PoolMode) {
   // changes; a short pause makes sure the next request sees the new mode.
   await Bun.sleep(5)
 }
+
+describe('vault cachekeep', () => {
+  async function trackedWarm(recordVersion = 7, local = false) {
+    const sidebarFile = join(dir, 'sidebar.json')
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = sidebarFile
+    writeFileSync(sidebarFile, JSON.stringify(DEFAULT_SIDEBAR_STATE))
+    const running = await startDaemon({
+      'oauth:openai:vault': vaultLogin('chatgpt-vault', {
+        record_version: recordVersion,
+      }),
+    })
+    enroll()
+    seedPool(files, [{ id: 'main', quota: quotaMap(local ? 10 : 100) }], {
+      routing: { mode: local ? 'main-first' : 'sticky-balanced' },
+      cachekeep: { enabled: true },
+    })
+    const wire = local ? installWire() : wireWithExhaustedMain()
+    const network = globalThis.fetch
+    const sends: Array<{ headers: Headers; body: Record<string, unknown> }> = []
+    let status = 200
+    let onSend: (() => void) | undefined
+    const codex = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        sends.push({ headers: req.headers, body: await req.json() })
+        onSend?.()
+        return new Response('{}', { status })
+      },
+    })
+    stopWarmCodex = async () => {
+      await codex.stop(true)
+    }
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) =>
+      String(url).startsWith(codex.url.origin)
+        ? originalFetch(url as string, init)
+        : network(url as string, init)) as typeof globalThis.fetch
+    const { vault } = await plugin(PLACEHOLDER, {
+      codexApiEndpoint: new URL('/responses', codex.url).href,
+    })
+    const send = await fetchOverride()
+    const routeId = local ? 'main' : vault.routes()[0]?.id
+    if (!routeId) throw new Error('no route for warm')
+    const pinSession = () =>
+      setSidebarState({
+        ...DEFAULT_SIDEBAR_STATE,
+        route: 'sticky-balanced',
+        stickyAssignments: {
+          [hashSidebarSessionId('vault-warm')]: {
+            accountId: routeId,
+            wireAccountId: 'chatgpt-vault',
+            assignedAt: Date.now(),
+            lastSeenAt: Date.now(),
+            inputBytes: 0,
+          },
+        },
+      })
+    if (!local) await pinSession()
+    const manager = __menuContextForTest()?.cacheKeepManager as
+      | OpenAICacheKeepManager
+      | undefined
+    if (!manager) throw new Error('no cachekeep manager')
+    const body = {
+      model: 'gpt-5.6',
+      input: [{ role: 'user', content: 'hi' }],
+      store: true,
+      stream: false,
+      prompt_cache_key: 'vault-warm',
+    }
+    const response = await scope.wrap(send)(
+      'https://api.openai.com/v1/responses',
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-session-id': 'vault-warm',
+        },
+        body: JSON.stringify(body),
+      },
+    )
+    await response.text()
+    expect(response.status).toBe(200)
+    if (!local) {
+      await scope.settlePluginWork()
+      // Establish the persisted binding after request bookkeeping, so these
+      // tests exercise keep-warm independently of sidebar pin persistence.
+      await pinSession()
+      expect(
+        (await getSidebarState()).stickyAssignments?.[
+          hashSidebarSessionId('vault-warm')
+        ]?.accountId,
+      ).toBe(routeId)
+    }
+    expect(manager.status().targets).toHaveLength(1)
+    expect(manager.status().targets[0]?.accountId).toBe(routeId)
+    const target = (
+      manager as unknown as {
+        targets: Map<string, { cacheExpiresAt: number; ttlMs: number }>
+      }
+    ).targets
+      .values()
+      .next().value
+    if (!target) throw new Error('turn was not tracked')
+    expect(target.ttlMs).toBe(30 * 60 * 1000)
+    const makeDue = () => {
+      // Keep the real captured target and pin; only advance its deadline into
+      // the lead window so the test need not wait thirty minutes.
+      target.cacheExpiresAt = Date.now() + 1_000
+    }
+    return {
+      running,
+      vault,
+      manager,
+      wire,
+      sends,
+      routeId,
+      makeDue,
+      setStatus: (next: number) => {
+        status = next
+      },
+      onSend: (next: () => void) => {
+        onSend = next
+      },
+    }
+  }
+
+  test('a pinned vault warm authorizes each replay and reaches Codex with the served token', async () => {
+    const { running, manager, sends, makeDue } = await trackedWarm()
+    const gets = running.gets.length
+    makeDue()
+    await manager.tick()
+    expect(sends).toHaveLength(2)
+    expect(running.gets.length - gets).toBe(1)
+    expect(sends[1]?.headers.get('authorization')).toBe(
+      `Bearer ${VAULT_ACCESS}`,
+    )
+    expect(sends[1]?.headers.get('session-id')).toBe(
+      sends[0]?.headers.get('session-id'),
+    )
+    expect(sends[1]?.headers.get('chatgpt-account-id')).toBe('chatgpt-vault')
+    expect(sends[1]?.body).toEqual({ ...sends[0]?.body, store: false })
+    expect(manager.status().targets[0]?.lastWarmedAt).toBeNumber()
+
+    const newer = chatgptAccessToken('chatgpt-vault', 'new-warm')
+    running.credentials['oauth:openai:vault'] = vaultLogin('chatgpt-vault', {
+      payload: JSON.stringify({ access_token: newer }),
+      record_version: 8,
+    })
+    makeDue()
+    await manager.tick()
+    expect(sends).toHaveLength(3)
+    expect(running.gets.length - gets).toBe(2)
+    expect(sends[2]?.headers.get('authorization')).toBe(`Bearer ${newer}`)
+    expect(running.reports).toEqual([])
+  })
+
+  for (const refusal of [
+    'cold',
+    'declined',
+    'refused',
+    'unreachable',
+  ] as const) {
+    test(`a ${refusal} vault warm backs off without a provider report`, async () => {
+      const { running, vault, manager, sends, makeDue, routeId } =
+        await trackedWarm()
+      if (refusal === 'cold') {
+        running.credentials['oauth:openai:vault']!.state = 'needs_reauth'
+        await vault.refresh()
+      } else if (refusal === 'declined') {
+        if (!routeId) throw new Error('no vault route')
+        await vault.decline(routeId)
+      } else if (refusal === 'refused') {
+        running.credentials['oauth:openai:vault']!.refuse =
+          'credential_unavailable'
+      } else {
+        await running.stop()
+      }
+      const gets = running.gets.length
+      makeDue()
+      await manager.tick()
+      expect(sends).toHaveLength(1)
+      expect(running.reports).toEqual([])
+      const target = manager.status().targets[0]
+      expect(target?.lastWarmedAt).toBeUndefined()
+      expect(target?.backoffUntil).toBeGreaterThan(Date.now())
+      if (refusal === 'cold' || refusal === 'declined')
+        expect(running.gets.length).toBe(gets)
+      const backedOffGets = running.gets.length
+      await manager.tick()
+      expect(running.gets.length).toBe(backedOffGets)
+      expect(sends).toHaveLength(1)
+    })
+  }
+
+  test('a warm 401 reports the served record version once and backs off', async () => {
+    const { running, manager, sends, makeDue, setStatus } = await trackedWarm(7)
+    const gets = running.gets.length
+    setStatus(401)
+    makeDue()
+    await manager.tick()
+    expect(sends).toHaveLength(2)
+    expect(running.reports).toEqual([
+      {
+        credential_id: 'oauth:openai:vault',
+        enrollment_token: ENROLLMENT_TOKEN,
+        provider_status: 401,
+        record_version: 7,
+        reporter_source: 'direct',
+      },
+    ])
+    expect(running.gets.length - gets).toBe(2)
+    expect(manager.status().targets[0]?.backoffUntil).toBeGreaterThan(
+      Date.now(),
+    )
+  })
+
+  test('a refused newer credential reports only the version actually served to the warm', async () => {
+    const { running, manager, sends, makeDue, setStatus, onSend } =
+      await trackedWarm(7)
+    onSend(() => {
+      running.credentials['oauth:openai:vault'] = vaultLogin('chatgpt-vault', {
+        record_version: 8,
+        refuse: 'credential_unavailable',
+      })
+    })
+    setStatus(401)
+    makeDue()
+    await manager.tick()
+    expect(sends).toHaveLength(2)
+    expect(running.reports.map((report) => report.record_version)).toEqual([7])
+    expect(manager.status().targets[0]?.backoffUntil).toBeGreaterThan(
+      Date.now(),
+    )
+  })
+
+  for (const status of [403, 429, 500]) {
+    test(`a vault warm ${status} backs off without a provider report`, async () => {
+      const { running, manager, sends, makeDue, setStatus } =
+        await trackedWarm()
+      const gets = running.gets.length
+      setStatus(status)
+      makeDue()
+      await manager.tick()
+      expect(sends).toHaveLength(2)
+      expect(running.gets.length - gets).toBe(1)
+      expect(running.reports).toEqual([])
+      expect(manager.status().targets[0]?.backoffUntil).toBeGreaterThan(
+        Date.now(),
+      )
+    })
+  }
+
+  test('a warm 401 retries a newer served version and reports only the final credential', async () => {
+    const { running, manager, sends, makeDue, setStatus, onSend } =
+      await trackedWarm(7)
+    const gets = running.gets.length
+    const newer = chatgptAccessToken('chatgpt-vault', 'retry-warm')
+    onSend(() => {
+      running.credentials['oauth:openai:vault'] = vaultLogin('chatgpt-vault', {
+        payload: JSON.stringify({ access_token: newer }),
+        record_version: 8,
+      })
+    })
+    setStatus(401)
+    makeDue()
+    await manager.tick()
+    expect(sends).toHaveLength(3)
+    expect(running.gets.length - gets).toBe(2)
+    expect(sends[1]?.headers.get('authorization')).toBe(
+      `Bearer ${VAULT_ACCESS}`,
+    )
+    expect(sends[2]?.headers.get('authorization')).toBe(`Bearer ${newer}`)
+    expect(sends[2]?.body).toEqual(sends[1]?.body)
+    expect(sends[2]?.headers.get('session-id')).toBe(
+      sends[1]?.headers.get('session-id'),
+    )
+    expect(running.reports.map((report) => report.record_version)).toEqual([8])
+    expect(manager.status().targets[0]?.backoffUntil).toBeGreaterThan(
+      Date.now(),
+    )
+  })
+
+  test('a warm 401 recovered by a newer served version sends no failure report', async () => {
+    const { running, manager, sends, makeDue, setStatus, onSend } =
+      await trackedWarm(7)
+    setStatus(401)
+    onSend(() => {
+      if (sends.length === 3) setStatus(200)
+      running.credentials['oauth:openai:vault'] = vaultLogin('chatgpt-vault', {
+        record_version: 8,
+      })
+    })
+    makeDue()
+    await manager.tick()
+    expect(sends).toHaveLength(3)
+    expect(running.reports).toEqual([])
+    expect(manager.status().targets[0]?.lastWarmedAt).toBeNumber()
+    expect(manager.status().targets[0]?.backoffUntil).toBeUndefined()
+  })
+
+  test('a moved vault pin drops the target without authorizing a warm', async () => {
+    const { running, manager, sends, makeDue } = await trackedWarm()
+    const gets = running.gets.length
+    await scope.settlePluginWork()
+    const state = await getSidebarState()
+    const hash = hashSidebarSessionId('vault-warm')
+    const pin = state.stickyAssignments?.[hash]
+    if (!pin) throw new Error('no sticky pin')
+    await setSidebarState({
+      ...state,
+      stickyAssignments: {
+        ...state.stickyAssignments,
+        [hash]: { ...pin, accountId: 'main' },
+      },
+    })
+    await Bun.sleep(5)
+    makeDue()
+    await manager.tick()
+    expect(manager.status().tracked).toBe(0)
+    expect(sends).toHaveLength(1)
+    expect(running.gets.length).toBe(gets)
+    expect(running.reports).toEqual([])
+  })
+
+  test('a local pool warm keeps its bearer and never reports its 401 to the vault', async () => {
+    const { running, manager, sends, makeDue, setStatus, wire } =
+      await trackedWarm(7, true)
+    const gets = running.gets.length
+    makeDue()
+    await manager.tick()
+    expect(sends).toHaveLength(2)
+    expect(sends[1]?.headers.get('authorization')).toBe('Bearer main-token')
+    expect(sends[1]?.headers.get('chatgpt-account-id')).toBe('chatgpt-main')
+    expect(sends[1]?.body).toEqual({ ...sends[0]?.body, store: false })
+    setStatus(401)
+    makeDue()
+    await manager.tick()
+    expect(sends).toHaveLength(3)
+    expect(running.gets.length).toBe(gets)
+    expect(running.reports).toEqual([])
+    expect(wire.refreshTokens).toEqual([])
+    expect(manager.status().targets[0]?.backoffUntil).toBeGreaterThan(
+      Date.now(),
+    )
+  })
+})
 
 /** A terminal that types `keys` into the menu and records what it prints. */
 function scriptedTerminal(keys: string[]) {

@@ -12,6 +12,54 @@
 # Send-time eligibility and vault admission on the migrated request paths.
 
 [[control]]
+id = "cachekeep-vault-send-wiring"
+guards = "a captured vault route authorizes every warm through the vault rather than searching local pool tokens"
+file = "packages/opencode/src/index.ts"
+old = "          fetchImpl: fetch,\n          vault,"
+new = "          fetchImpl: fetch,\n          // NON-VACUITY BREAK: omit vault custody from keep-warm."
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scachekeep\sa\spinned\svault\swarm\sauthorizes\seach\sreplay\sand\sreaches\sCodex\swith\sthe\sserved\stoken$']
+
+[[control]]
+id = "cachekeep-vault-refusal-backoff"
+guards = "a vault refusal is a failed warm with backoff rather than a fabricated success"
+file = "packages/opencode/src/core/cachekeep.ts"
+old = "        if (!response)\n          throw new Error(`vault refused warm for ${target.accountId}`)"
+new = "        if (!response) return new Response('{}', { status: 200 }) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scachekeep\sa\srefused\svault\swarm\sbacks\soff\swithout\sa\sprovider\sreport$']
+
+[[control]]
+id = "cachekeep-vault-401-custody"
+guards = "a warm provider 401 reaches the vault send path for version-fenced reporting"
+file = "packages/opencode/src/core/cachekeep.ts"
+old = "        const response = await options.vault.send(target.accountId, dispatch, {"
+new = "        const response = await options.vault.send(target.accountId, async (token) => new Response((await dispatch(token)).body, { status: 200 }), { // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scachekeep\sa\swarm\s401\sreports\sthe\sserved\srecord\sversion\sonce\sand\sbacks\soff$']
+
+[[control]]
+id = "cachekeep-vault-local-isolation"
+guards = "local pool warms use their own bearer and never send or report through vault custody"
+file = "packages/opencode/src/core/cachekeep.ts"
+old = "      if (target.accountId && options.vault?.owns(target.accountId)) {"
+new = "      if (target.accountId && options.vault) { // NON-VACUITY BREAK: treat a local row as vault-owned."
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scachekeep\sa\slocal\spool\swarm\skeeps\sits\sbearer\sand\snever\sreports\sits\s401\sto\sthe\svault$']
+
+[[control]]
 id = "vault-request-reading-contains-poll-rejection"
 guards = "a rejected background quota poll is warned about without an unhandled rejection and releases its in-flight dedupe"
 file = "packages/core/src/vault.ts"
