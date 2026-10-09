@@ -1789,11 +1789,13 @@ export async function CodexAuthPlugin(
       if (sidebarStateFileForEvents) {
         const accounts = (await loadAccounts(getAccountPaths(getConfigPath())))
           ?.accounts
+        // OpenCode discards event-hook promises. The writer already logs a
+        // failure; keep deletion cleanup running without rejecting the hook.
         await removeSidebarActiveRouting(
           info.id,
           accounts,
           sidebarStateFileForEvents,
-        )
+        ).catch(() => {})
       }
       for (const websocketFetch of websocketFetches)
         websocketFetch.remove(info.id)

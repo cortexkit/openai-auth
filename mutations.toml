@@ -800,6 +800,19 @@ expect_message = "\"type\": \"configuration_update\","
 # later writes.
 
 [[control]]
+id = "session-deletion-sidebar-rejection-contained"
+guards = "OpenCode discards event hook promises, so a real expired sidebar lease must not reject the session-deletion hook"
+file = "packages/opencode/src/index.ts"
+old = "          sidebarStateFileForEvents,\n        ).catch(() => {})"
+new = "          sidebarStateFileForEvents,\n        ) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/sidebar-write-rejection.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-write-rejection.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^session\\sdeletion\\scontains\\sa\\sreal\\sexpired\\ssidebar\\slease\\swithout\\san\\sunhandled\\srejection$"]
+expect_message = "LockOwnershipError"
+
+[[control]]
 id = "bookkeeping-failure-never-rejects"
 guards = "a failed sidebar bookkeeping write is retried in the background, never surfaced as a rejection"
 file = "packages/opencode/src/sidebar-state.ts"
