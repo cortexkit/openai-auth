@@ -67,7 +67,7 @@ import {
   vaultEnrollmentLine,
 } from './vault'
 import type { MenuVault } from './vault-account-menu'
-import { createVaultCommandMenu } from './vault-command-menu'
+import { createVaultCommandMenu, menuStore } from './vault-command-menu'
 
 /** The one slash command, without the slash. */
 export const OPENAI_COMMAND_NAME = 'openai'
@@ -1047,10 +1047,12 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
   const menuOptions = {
     command: OPENAI_COMMAND_NAME,
     title: OPENAI_MENU_TITLE,
-    store: withSettingsMigration(
-      withAccountRules(options.store, {
-        ...(options.rowLocks ? { rowLocks: options.rowLocks } : {}),
-      }),
+    store: menuStore(
+      withSettingsMigration(
+        withAccountRules(options.store, {
+          ...(options.rowLocks ? { rowLocks: options.rowLocks } : {}),
+        }),
+      ),
     ),
     ...(options.extraLocks ? { extraLocks: options.extraLocks } : {}),
     accounts: {

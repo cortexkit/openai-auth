@@ -67,13 +67,15 @@ function forwardAction(
 }
 
 /**
- * Add vault rows only to returned read data, never to the local account files.
- * Writes use the underlying store. A vault row's only built-in write sets its
- * quota reserve floors under the route id that request admission reads.
+ * Show the id from the local account list when its label is missing, without
+ * writing that display name back to the account files. Vault accounts are
+ * display-only entries because their credentials belong to the vault. Their
+ * quota reserve floors remain plugin settings, indexed by the same account
+ * route id the request router uses to look up those floors.
  */
-function menuStore(
+export function menuStore(
   store: PoolStore,
-  vault: MenuVault,
+  vault?: MenuVault,
   includeVaultRows = true,
 ): PoolStore {
   return new Proxy(store, {
@@ -82,10 +84,18 @@ function menuStore(
         return async () => {
           const load = await target.read()
           if (load.status !== 'ready') return load
+          const named = {
+            ...load,
+            rows: load.rows.map((row) => ({
+              ...row,
+              label: row.label ?? row.id,
+            })),
+          }
+          if (!vault) return named
           const view = await readVaultMenu(vault)
-          if (!isVaultMenuConnected(view)) return load
+          if (!isVaultMenuConnected(view)) return named
           const rows: PoolRow[] = [
-            ...load.rows.map((row) => ({ ...row, label: row.label ?? row.id })),
+            ...named.rows,
             ...(includeVaultRows ? view.status.accounts : []).map(
               (row): PoolRow => ({
                 id: row.routeId,
@@ -105,7 +115,7 @@ function menuStore(
       if (key === 'readSettings')
         return async () => {
           const read = await target.readSettings()
-          if (read.status === 'error') return read
+          if (read.status === 'error' || !vault) return read
           const view = await readVaultMenu(vault)
           const killswitch = record(read.settings.killswitch)
           if (!isVaultMenuConnected(view) || !read.settings.killswitch)

@@ -1259,8 +1259,8 @@ expect_red = ['^vault\scommand\smenu\sa\sreading\solder\sthan\sfifteen\sminutes\
 id = "menu-local-id-name"
 guards = "an unlabelled row uses its roster id instead of its raw ChatGPT identity"
 file = "packages/core/src/vault-command-menu.ts"
-old = "            ...load.rows.map((row) => ({ ...row, label: row.label ?? row.id })),"
-new = "            ...load.rows.map((row) => ({ ...row, label: row.label ?? row.identity ?? row.id })), // NON-VACUITY BREAK"
+old = "              label: row.label ?? row.id,"
+new = "              label: row.label ?? row.identity ?? row.id, // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
@@ -1305,7 +1305,7 @@ expect_red = ['^vault\scommand\smenu\sreset\slabels\sset-aside\slocals\swithout\
 
 [[control]]
 id = "menu-no-vault-output"
-guards = "an unenrolled vault leaves the rendered local-only command byte-identical"
+guards = "an unenrolled vault leaves rendered local-only output byte-identical apart from unlabelled row names"
 file = "packages/core/src/vault-account-menu.ts"
 old = "  return view.status.enrollment.state === 'approved'"
 new = "  return true // NON-VACUITY BREAK"
@@ -1313,7 +1313,7 @@ test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^vault\scommand\smenu\sdisconnected\soutput\sis\sbyte-identical\sto\sthe\slocal-only\smenu$']
+expect_red = ['^vault\scommand\smenu\sdisconnected\soutput\sis\sbyte-identical\sapart\sfrom\sunlabelled\srow\snames$']
 
 [[control]]
 id = "menu-pi-vault-slots"
@@ -1362,3 +1362,15 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^vault\scommand\smenu\sall\sthree\spackages\srequire\sthe\spublished\sreplacement-slot\srelease$']
+
+[[control]]
+id = "menu-unlabelled-without-vault"
+guards = "a menu without any vault object still names unlabelled local rows by roster id"
+file = "packages/core/src/vault-command-menu.ts"
+old = "          if (!vault) return named"
+new = "          if (!vault) return load // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\sunlabelled\srows\suse\stheir\sids\seven\swithout\sa\svault\sobject$']

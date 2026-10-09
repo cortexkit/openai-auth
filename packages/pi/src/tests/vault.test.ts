@@ -185,6 +185,40 @@ function enroll() {
 }
 
 describe('Pi and the Claustrum vault', () => {
+  test('a disconnected menu names an unlabelled local row by id and keeps its identity detail', async () => {
+    const target = vault()
+    const runtime = runtimeWith(target)
+    try {
+      await runtime
+        .commandSupport()
+        .store()
+        .add({
+          id: 'local',
+          identity: 'chatgpt-work',
+          credential: {
+            type: 'oauth',
+            access: 'local-token',
+            refresh: 'local-refresh',
+            expires: Date.now() + 3600_000,
+          },
+        })
+      const { menu } = await createPiMenu(runtime.commandSupport()).open({
+        notify() {},
+      })
+      for (const id of ['accounts', 'quota', 'limits']) {
+        expect(
+          menu.sections.find((section) => section.id === id)?.items[0]?.label,
+        ).toBe('local')
+      }
+      expect(
+        menu.sections.find((section) => section.id === 'accounts')?.items[0]
+          ?.detail,
+      ).toContain('chatgpt-work')
+    } finally {
+      target.close()
+    }
+  })
+
   test('the shared Accounts Quota and Limits slots include vault accounts and set aside their local copy', async () => {
     daemon = await startMockDaemon({
       directory: dir,

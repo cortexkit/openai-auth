@@ -258,7 +258,7 @@ describe('vault command menu', () => {
       'set aside (served by vault beatricelau0414@gmail.com)',
     )
   })
-  test('disconnected output is byte-identical to the local-only menu', async () => {
+  test('disconnected output is byte-identical apart from unlabelled row names', async () => {
     const ctx = context(false)
     const rendered = menuText(
       (await createOpenCodeMenu(ctx).open(invocation)).menu,
@@ -267,12 +267,12 @@ describe('vault command menu', () => {
 
 ### Accounts
 2 account(s), 2 enabled.
-- chatgpt-main: OAuth · enabled · chatgpt-main · primary 93% left
+- main: OAuth · enabled · chatgpt-main · primary 93% left
 - ufuk: OAuth · enabled · chatgpt-ufuk · primary 15% left
 
 ### Quota
 Scope: all.
-- chatgpt-main: primary 93% left
+- main: primary 93% left
 - ufuk: primary 15% left
 
 ### Routing
@@ -282,7 +282,7 @@ Roster order: main, ufuk.
 ### Limits
 Killswitch: off.
 With the killswitch on, an account whose quota falls below one of its floors is not used.
-- chatgpt-main: no floors
+- main: no floors
 - ufuk: no floors
 
 ### Cache
@@ -304,6 +304,24 @@ No current session.
 OpenCode (openai-auth-opencode): not connected to the Claustrum vault.
 
 Open the OpenCode TUI to change these settings.`)
+  })
+  test('unlabelled rows use their ids even without a vault object', async () => {
+    const ctx = context(false)
+    delete ctx.vault
+    const config = readFileSync(files.configFile, 'utf8')
+    const state = readFileSync(files.stateFile, 'utf8')
+    const menu = (await createOpenCodeMenu(ctx).open(invocation)).menu
+    for (const id of ['accounts', 'quota', 'limits']) {
+      expect(
+        menu.sections.find((section) => section.id === id)?.items[0]?.label,
+      ).toBe('main')
+    }
+    expect(
+      menu.sections.find((section) => section.id === 'accounts')?.items[0]
+        ?.detail,
+    ).toBe('OAuth · enabled · chatgpt-main · primary 93% left')
+    expect(readFileSync(files.configFile, 'utf8')).toBe(config)
+    expect(readFileSync(files.stateFile, 'utf8')).toBe(state)
   })
   test('slot ids and order are unchanged when replacements are active', async () => {
     expect((await sections()).map((section) => section.id)).toEqual(
