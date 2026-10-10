@@ -1839,3 +1839,29 @@ command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/pool-routing.test
 test_count_pattern = "Ran {count} test"
 expect_red = ['^Pi\s/openai\son\sthe\saccount\spool\sa\sper-account\squota\scheck\spolls\sonly\sthe\schosen\spool\srow$']
 expect_message = "expect(received).toEqual(expected)"
+
+[[control]]
+id = "dialog-item-context-not-options"
+guards = "an item's facts and detail are context rather than selectable text rows"
+file = "packages/opencode/src/tui/command-dialogs.tsx"
+old = "  return [\n    ...item.actions.map((action) => ({"
+new = "  return [\n    ...factLines(item.facts).map((title) => ({ title, value: 'line:fact' })), // NON-VACUITY BREAK: offer read-only facts.\n    ...item.actions.map((action) => ({"
+test_file = "packages/opencode/src/tests/command-drawer.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\s/openai\sdrawer\sno\sdialog\soption\sis\san\sinert\stext\srow$']
+expect_message = "expect(received).toEqual(expected)"
+
+[[control]]
+id = "sidebar-window-formatter"
+guards = "expanded sidebar rows format each window's own reading, just like the dialog footer"
+file = "packages/opencode/src/tui.tsx"
+old = "limits: projection.limits.filter((limit) => limit.label === row.key),"
+new = "limits: projection.limits.filter((limit) => limit.label !== row.key), // NON-VACUITY BREAK: format the other window."
+test_file = "packages/opencode/src/tests/tui-quota-render.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/tui-quota-render.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^dynamic\squota\sTUI\srows\ssidebar\squota\stext\smatches\sthe\sshared\scompact\sformatter$']
+expect_message = "expect(received).toEqual(expected)"

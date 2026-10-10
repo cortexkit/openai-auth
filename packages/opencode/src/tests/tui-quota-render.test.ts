@@ -63,6 +63,16 @@ describe('dynamic quota TUI rows', () => {
     expect(
       buildQuotaRowsForDisplay(quota, now, false).map((row) => row.text),
     ).toEqual(quotaTextParts(projection, { now, form: 'compact' }).slice(0, 2))
+    expect(
+      buildQuotaRowsForDisplay(quota, now, false).map((row) => [
+        row.key,
+        row.label,
+        row.text,
+      ]),
+    ).toEqual([
+      ['primary', '5h', '5h 58% left'],
+      ['secondary', '7d', '7d 90% left'],
+    ])
   })
 
   function projectQuotaRow(row: {
