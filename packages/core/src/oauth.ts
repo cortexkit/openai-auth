@@ -1,4 +1,8 @@
-import { createServer } from 'node:http'
+import {
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from 'node:http'
 import { setTimeout as sleep } from 'node:timers/promises'
 
 // ---------------------------------------------------------------------------
@@ -311,7 +315,9 @@ export interface PendingOAuth {
   reject: (error: Error) => void
 }
 
-let oauthServer: ReturnType<typeof createServer> | undefined
+type OAuthServer = ReturnType<typeof createServer>
+
+let oauthServers: OAuthServer[] = []
 let serverStarting:
   | Promise<{
       port: number
@@ -325,6 +331,31 @@ let serverStarting:
  * each callback is routed to the correct flow via the state query param.
  */
 const pendingFlows = new Map<string, PendingOAuth>()
+
+function listenOAuthServer(server: OAuthServer, host: '127.0.0.1' | '::1') {
+  return new Promise<void>((resolve, reject) => {
+    const onError = (error: NodeJS.ErrnoException) => {
+      server.off('listening', onListening)
+      reject(error)
+    }
+    const onListening = () => {
+      server.off('error', onError)
+      resolve()
+    }
+    server.once('error', onError)
+    server.once('listening', onListening)
+    server.listen(OAUTH_PORT, host)
+  })
+}
+
+function closeOAuthServer(server: OAuthServer) {
+  server.close(() => {})
+  server.closeIdleConnections?.()
+  const closeConnections = setTimeout(() => {
+    server.closeAllConnections?.()
+  }, 25)
+  closeConnections.unref?.()
+}
 
 function flowCount(): number {
   return pendingFlows.size
@@ -341,20 +372,16 @@ export async function startOAuthServer(): Promise<{
   port: number
   redirectUri: string
 }> {
-  // MUST be `localhost`, not `127.0.0.1`. This exact string is sent as the
-  // OAuth `redirect_uri` (both in the authorize URL and the token exchange) and
-  // OpenAI matches it EXACTLY against the redirect URI registered for the Codex
-  // client (`http://localhost:1455/auth/callback`). Using 127.0.0.1 yields
-  // `authorize_hydra_invalid_request`. The HTTP server still binds to 127.0.0.1
-  // below — the browser resolves localhost to it — so do not "standardize" this.
+  // OpenAI requires this exact registered redirect URI, even though the
+  // listener accepts connections on both IPv4 and IPv6 loopback addresses.
   const redirectUri = `http://localhost:${OAUTH_PORT}/auth/callback`
-  if (oauthServer) {
+  if (oauthServers.length > 0) {
     return { port: OAUTH_PORT, redirectUri }
   }
   if (serverStarting) return serverStarting
 
   serverStarting = (async () => {
-    const server = createServer((req, res) => {
+    const handler = (req: IncomingMessage, res: ServerResponse) => {
       const url = new URL(req.url || '/', `http://127.0.0.1:${OAUTH_PORT}`)
 
       if (url.pathname === '/auth/callback') {
@@ -440,18 +467,26 @@ export async function startOAuthServer(): Promise<{
 
       res.writeHead(404)
       res.end('Not found')
-    })
+    }
 
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject)
-      server.listen(OAUTH_PORT, '127.0.0.1', () => {
-        server.off('error', reject)
-        resolve()
-      })
-    })
+    const ipv4Server = createServer(handler)
+    await listenOAuthServer(ipv4Server, '127.0.0.1')
 
-    // Assign only after listen succeeds so a failed bind can be retried cleanly.
-    oauthServer = server
+    const listeners = [ipv4Server]
+    const ipv6Server = createServer(handler)
+    try {
+      await listenOAuthServer(ipv6Server, '::1')
+      listeners.push(ipv6Server)
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'EADDRNOTAVAIL' && code !== 'EAFNOSUPPORT') {
+        closeOAuthServer(ipv4Server)
+        throw error
+      }
+    }
+
+    // Publish listeners only after required IPv4 and any available IPv6 bind.
+    oauthServers = listeners
 
     return { port: OAUTH_PORT, redirectUri }
   })()
@@ -464,16 +499,9 @@ export async function startOAuthServer(): Promise<{
 }
 
 export function stopOAuthServer() {
-  if (oauthServer) {
-    const server = oauthServer
-    oauthServer = undefined
-    server.close(() => {})
-    server.closeIdleConnections?.()
-    const closeConnections = setTimeout(() => {
-      server.closeAllConnections?.()
-    }, 25)
-    closeConnections.unref?.()
-  }
+  const servers = oauthServers
+  oauthServers = []
+  for (const server of servers) closeOAuthServer(server)
 }
 
 export function resetOAuthStateForTest() {

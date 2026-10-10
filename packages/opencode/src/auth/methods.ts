@@ -11,7 +11,6 @@ import {
   type MenuTerminal,
   menuAuthorize,
   menuCompletedResult,
-  openBrowserForMenu,
   poolHasCredential,
   runAccountMenu,
   runMenu,
@@ -34,6 +33,7 @@ import {
   loadAccounts,
   mutateAccounts,
   type OpenAiVault,
+  openUrl,
   POOL_MAIN_ROW_ID,
   startOAuthServer,
   type VaultWaitOptions,
@@ -72,7 +72,9 @@ import { runVaultAccountMenu } from './vault-account-menu'
 type AuthMethod = AuthHook['methods'][number]
 type BeginLogin = typeof beginAccountLogin
 
-export { menuCompletedResult, openBrowserForMenu }
+export { menuCompletedResult }
+
+export const openBrowserForMenu = openUrl
 
 export interface AuthMethodDependencies {
   authorizeBrowser(): Promise<AuthOAuthResult>
