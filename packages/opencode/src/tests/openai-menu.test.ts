@@ -269,9 +269,9 @@ describe('/openai on a migrated install', () => {
     const limits = (await openOpenAiMenu(ctx, 'session-a')).menu.sections.find(
       (section) => section.id === 'limits',
     )
-    expect(limits?.items.map((item) => [item.id, item.detail])).toEqual([
-      ['main', 'floors: primary 20%, secondary 30%'],
-      ['alpha', 'floors: primary 40%, secondary 10%'],
+    expect(limits?.items.map((item) => [item.id, item.status])).toEqual([
+      ['main', '5h ≥20% · secondary ≥30%'],
+      ['alpha', '5h ≥40% · secondary ≥10%'],
     ])
     // Reading changes nothing on disk.
     expect((config().killswitch as Record<string, unknown>).main).toEqual({
@@ -716,9 +716,7 @@ describe('/openai on a migrated install', () => {
     const session = (await openOpenAiMenu(ctx, 'session-a')).menu.sections.find(
       (section) => section.id === 'session',
     )
-    expect(session?.lines).toEqual([
-      'Sticky routing pins this session to alpha.',
-    ])
+    expect(session?.lines).toEqual(['Pinned to alpha'])
 
     const result = await apply(ctx, {
       sectionId: 'session',
@@ -734,6 +732,7 @@ describe('/openai on a migrated install', () => {
       await openOpenAiMenu(context(), 'session-a')
     ).menu.sections.find((section) => section.id === 'vault')
     expect(vault?.lines).toEqual([
+      'Not connected',
       'OpenCode (openai-auth-opencode): not connected to the Claustrum vault.',
     ])
     expect(vault?.actions.map((action) => action.id)).toEqual(['connect'])

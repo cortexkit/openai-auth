@@ -10,6 +10,7 @@ import {
   type SectionContent,
   type StoreSectionSlot,
 } from '@cortexkit/common-auth/commands'
+import { formatQuota, projectQuota } from '@cortexkit/common-auth/quota'
 import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
 import {
   type AccountStorage,
@@ -19,7 +20,6 @@ import { isRecord } from './util/record'
 import {
   isVaultMenuConnected,
   type MenuVault,
-  quotaReadingAge,
   readVaultMenu,
   setAsideDetail,
   VAULT_MODE_LOCAL_NOTE,
@@ -43,6 +43,8 @@ function forwardAction(
   return {
     id: action.id,
     label: action.label,
+    ...(action.description ? { description: action.description } : {}),
+    ...(action.group ? { group: action.group } : {}),
     knobs: action.knobs,
     ...confirmation,
     run: async ({ values, invocation }) => {
@@ -185,18 +187,78 @@ export function createVaultCommandMenu(
       view.status.accounts.map((row) => [row.routeId, row]),
     )
     const now = (options.now ?? Date.now)()
+    const checkQuota = (id?: string): ActionDefinition => ({
+      id: 'check',
+      label: id ? 'Check this account' : 'Check now',
+      group: 'Actions',
+      run: async () => {
+        // Re-read the routes before polling so a disabled account is not checked.
+        const current = await readVaultMenu(vault)
+        const ids = [...current.routes].filter(
+          (routeId) => !id || routeId === id,
+        )
+        if (id && ids.length === 0)
+          throw new CommandError(
+            'unavailable',
+            'This vault account cannot be checked right now.',
+          )
+        for (const routeId of ids) {
+          const result = await vault.pollQuota(routeId)
+          if (!result.ok)
+            throw new CommandError(
+              'quota-check-failed',
+              `${routeId}: ${result.error ?? 'vault unavailable'}`,
+            )
+        }
+        return `Checked quota for ${ids.length} account${ids.length === 1 ? '' : 's'}.`
+      },
+    })
+    if (slot === 'quota') {
+      const quotaText = (
+        row: (typeof view.status.accounts)[number],
+        form: 'compact' | 'full',
+      ) =>
+        formatQuota(projectQuota(row.quota, options.quota?.scope), {
+          now,
+          form,
+        })
+      return {
+        lines: view.status.accounts
+          .filter((row) => !view.routes.has(row.routeId))
+          .map(
+            (row) =>
+              `${vaultAccountName(row)} (${row.enabled ? row.state : 'disabled'}): ${quotaText(row, 'compact')}`,
+          ),
+        items: view.status.accounts
+          .filter((row) => view.routes.has(row.routeId))
+          .map((row) => ({
+            id: row.routeId,
+            label: vaultAccountName(row),
+            group: 'Accounts',
+            status: quotaText(row, 'compact'),
+            detail: quotaText(row, 'full'),
+            actions: [checkQuota(row.routeId)],
+          })),
+        actions: view.routes.size > 0 ? [checkQuota()] : [],
+      }
+    }
     const items = section.items.map((item: MenuItem) => {
       const remote = vaultById.get(item.id)
-      const age =
-        slot !== 'limits' ? quotaReadingAge(remote?.quota, now) : undefined
       const detail =
         remote && slot === 'accounts'
-          ? `Vault · ${remote.credentialType === 'oauth' ? 'login' : 'API key'} · ${remote.state} · ${remote.enabled ? 'enabled' : 'declined'} · ${model.sections.find((section) => section.id === 'quota')?.items.find((quota) => quota.id === item.id)?.detail}`
+          ? `Vault · ${remote.credentialType === 'oauth' ? 'login' : 'API key'} · ${remote.state} · ${remote.enabled ? 'enabled' : 'declined'}`
           : item.detail
       return {
         id: item.id,
         label: item.label,
-        detail: [detail, age].filter(Boolean).join(' · '),
+        detail,
+        group: item.group,
+        status:
+          remote && slot === 'accounts'
+            ? remote.enabled
+              ? remote.state
+              : 'disabled'
+            : item.status,
         ...(item.facts ? { facts: item.facts } : {}),
         // A vault account is managed in the vault; only its killswitch
         // floors (Limits) are this plugin's settings.
@@ -208,57 +270,16 @@ export function createVaultCommandMenu(
               ),
       }
     })
-    const candidates = view.status.accounts
-      .filter((row) => view.routes.has(row.routeId))
-      .map((row) => ({ value: row.routeId, label: vaultAccountName(row) }))
-    const actions =
-      slot === 'quota'
-        ? candidates.length === 0
-          ? []
-          : [
-              {
-                id: 'check',
-                label: 'Check now',
-                knobs: [
-                  {
-                    kind: 'choice' as const,
-                    id: 'account',
-                    label: 'Account',
-                    choices: [
-                      { value: '*', label: 'All accounts' },
-                      ...candidates,
-                    ],
-                    value: '*',
-                  },
-                ],
-                run: async ({
-                  values,
-                }: Parameters<ActionDefinition['run']>[0]) => {
-                  // Only vault accounts are polled, through the vault; no
-                  // local credential is asked for a reading.
-                  const current = await readVaultMenu(vault)
-                  const selected = String(values.account)
-                  const vaultIds = [...current.routes].filter(
-                    (id) => selected === '*' || selected === id,
-                  )
-                  for (const id of vaultIds) {
-                    const result = await vault.pollQuota(id)
-                    if (!result.ok)
-                      throw new CommandError(
-                        'quota-check-failed',
-                        `${id}: ${result.error ?? 'vault unavailable'}`,
-                      )
-                  }
-                  return `Checked quota for ${vaultIds.length} account(s).`
-                },
-              },
-            ]
-        : section.actions.map((action) => forwardAction(source, slot, action))
+    const actions = section.actions.map((action) =>
+      forwardAction(source, slot, action),
+    )
     return {
       lines:
         slot === 'accounts'
           ? [
-              `${view.routes.size} vault account(s) can route. ${VAULT_MODE_LOCAL_NOTE}`,
+              `${view.status.accounts.length} vault account${view.status.accounts.length === 1 ? '' : 's'}`,
+              `${view.routes.size} can route`,
+              VAULT_MODE_LOCAL_NOTE,
             ]
           : section.lines,
       items,

@@ -66,7 +66,7 @@ import {
   vaultConnectOutcome,
   vaultEnrollmentLine,
 } from './vault'
-import type { MenuVault } from './vault-account-menu'
+import { type MenuVault, vaultAccountName } from './vault-account-menu'
 import { createVaultCommandMenu, menuStore } from './vault-command-menu'
 
 /** The one slash command, without the slash. */
@@ -653,14 +653,10 @@ export function sessionSection(deps: SessionSectionDeps): PluginExtraSection {
     title: 'This session',
     build: async (invocation) => {
       const sessionId = invocation.sessionId
-      if (!sessionId) return { lines: ['No current session.'] }
+      if (!sessionId) return { lines: ['No current session'] }
       const pin = await deps.getPin?.(sessionId)
       return {
-        lines: [
-          pin
-            ? `Sticky routing pins this session to ${pin}.`
-            : 'This session has no sticky routing pin.',
-        ],
+        lines: [pin ? `Pinned to ${pin}` : 'No sticky pin'],
         actions: deps.clearPin
           ? [
               {
@@ -719,6 +715,11 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
       const routing = vault.routes().length
       return {
         lines: [
+          connected
+            ? `Connected · ${status.accounts.length} account${status.accounts.length === 1 ? '' : 's'}`
+            : status.enrollment.state === 'idle'
+              ? 'Not connected'
+              : `Enrollment ${status.enrollment.state}`,
           vaultEnrollmentLine(status.host, status.name, status.enrollment),
           ...vaultApprovalInstructions(status.name, status.enrollment),
           ...(connected
@@ -739,7 +740,9 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
         ],
         items: status.accounts.map((row) => ({
           id: row.routeId,
-          label: row.label,
+          label: vaultAccountName(row),
+          group: 'Accounts',
+          status: row.enabled ? row.state : 'disabled',
           detail: [
             row.credentialType === 'api_key' ? 'API key' : 'login',
             row.state === 'active' ? 'active' : `vault state ${row.state}`,
@@ -755,7 +758,7 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
                   run: async () => {
                     await vault.decline(row.routeId)
                     await deps.changed?.()
-                    return `${row.label} is disabled on this host.`
+                    return `${vaultAccountName(row)} is disabled on this host.`
                   },
                 }
               : {
@@ -764,7 +767,7 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
                   run: async () => {
                     await vault.accept(row.routeId)
                     await deps.changed?.()
-                    return `${row.label} is enabled on this host.`
+                    return `${vaultAccountName(row)} is enabled on this host.`
                   },
                 },
           ],
@@ -940,16 +943,17 @@ export function resetCreditsSection(
     id: 'reset',
     title: 'Reset credits',
     build: async () => ({
-      lines: [
-        "A reset credit restores an exhausted account's quota. Preview fetches the account's current quota and credits.",
-      ],
+      lines: ['Restore exhausted quota'],
       items: (await deps.accountKeys()).map((accountKey) => ({
         id: accountKey,
+        group: 'Accounts',
         label: accountKey === MAIN_ROW_ID ? 'Main account' : accountKey,
         actions: [
           {
             id: 'preview',
             label: 'Preview',
+            description:
+              "Fetch the account's current quota and reset credits before spending a credit.",
             run: async () => {
               const row = await buildResetPreviewRow(accountKey, deps)
               return {

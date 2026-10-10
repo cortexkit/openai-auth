@@ -1681,9 +1681,9 @@ describe('formatWindowLabel', () => {
     expect(formatWindowLabel(minutes, 'primary')).toBe(expected)
   })
 
-  test('preserves historical labels for snapshots without window lengths', () => {
-    expect(formatWindowLabel(undefined, 'primary')).toBe('5h')
-    expect(formatWindowLabel(undefined, 'secondary')).toBe('7d')
+  test('uses the shared label fallback for snapshots without window lengths', () => {
+    expect(formatWindowLabel(undefined, 'primary')).toBe('primary')
+    expect(formatWindowLabel(undefined, 'secondary')).toBe('secondary')
   })
 })
 
@@ -1696,7 +1696,7 @@ describe('getCollapsedQuotaSummary', () => {
         windowMinutes: 10_080,
       },
     })
-    expect(summary.text).toBe('7d: 20%')
+    expect(summary.text).toBe('7d 80% left')
   })
 
   test('renders both present windows from their lengths', () => {
@@ -1712,7 +1712,7 @@ describe('getCollapsedQuotaSummary', () => {
         windowMinutes: 10_080,
       },
     })
-    expect(summary.text).toBe('5h: 3% 7d: 20%')
+    expect(summary.text).toBe('5h 97% left · 7d 80% left')
   })
 
   test('returns no text and no rows when no windows are present', () => {
@@ -1721,7 +1721,7 @@ describe('getCollapsedQuotaSummary', () => {
     expect(getPresentQuotaWindows({})).toEqual([])
   })
 
-  test('old snapshots retain their historical labels and pacing rulers', () => {
+  test('old snapshots use shared labels while retaining historical pacing rulers', () => {
     const rows = getPresentQuotaWindows({
       primary: { usedPercent: 20, remainingPercent: 80 },
       secondary: { usedPercent: 30, remainingPercent: 70 },
@@ -1729,12 +1729,12 @@ describe('getCollapsedQuotaSummary', () => {
     expect(rows).toHaveLength(2)
     expect(rows[0]).toMatchObject({
       key: 'primary',
-      label: '5h',
+      label: 'primary',
       windowMs: FIVE_HOUR_MS,
     })
     expect(rows[1]).toMatchObject({
       key: 'secondary',
-      label: '7d',
+      label: 'secondary',
       windowMs: SEVEN_DAY_MS,
     })
   })

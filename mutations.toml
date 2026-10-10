@@ -1324,14 +1324,14 @@ test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^vault\scommand\smenu\squota\slists\sthe\ssame\saccounts\sand\sdates\sstale\sreadings\sin\sboth\ssections$']
+expect_red = ['^vault\scommand\smenu\squota\slists\sthe\ssame\saccounts\sand\sdates\sstale\sreadings\sin\sQuota$']
 
 [[control]]
 id = "menu-quota-age"
 guards = "a reading older than fifteen minutes cannot appear as current"
-file = "packages/core/src/vault-account-menu.ts"
-old = "  if (age <= 15 * 60_000) return undefined"
-new = "  if (true) return undefined // NON-VACUITY BREAK"
+file = "packages/core/src/vault-command-menu.ts"
+old = "    const now = (options.now ?? Date.now)()"
+new = "    const now = 0 // NON-VACUITY BREAK: stale readings appear current."
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
@@ -1354,8 +1354,8 @@ expect_red = ['^vault\scommand\smenu\sunlabelled\srows\suse\stheir\sids\seven\sw
 id = "menu-vault-quota-poll"
 guards = "quota checks of vault accounts go through vault.pollQuota rather than local credentials"
 file = "packages/core/src/vault-command-menu.ts"
-old = "                    const result = await vault.pollQuota(id)"
-new = "                    const result = { ok: true } // NON-VACUITY BREAK"
+old = "          const result = await vault.pollQuota(routeId)"
+new = "          const result = { ok: true } // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
@@ -1426,8 +1426,8 @@ expect_red = ['^vault\scommand\smenu\sin\svault\smode\sno\slocal\srow\sis\sliste
 id = "menu-vault-mode-no-local-quota-check"
 guards = "Check now in vault mode polls the vault accounts only and never runs the host's local quota check"
 file = "packages/core/src/vault-command-menu.ts"
-old = "                  const selected = String(values.account)\n"
-new = "                  const selected = String(values.account)\n                  await options.quota?.check?.([], { notify() {} }) // NON-VACUITY BREAK\n"
+old = "        const current = await readVaultMenu(vault)\n"
+new = "        const current = await readVaultMenu(vault)\n        await options.quota?.check?.([], { notify() {} }) // NON-VACUITY BREAK\n"
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
@@ -1760,3 +1760,82 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ["^vault\\saccounts\\son\\sOpenCode\\s2\\sin\\svault\\smode\\sleaves\\sa\\sslot\\slogin\\swhere\\sit\\sis,\\sunused\\sand\\snot\\sadopted,\\sthe\\slocal\\sfiles\\sbyte-identical,\\sand\\sroutes\\sthe\\svault\\sonly$"]
+
+# OpenCode renders only actionable options; quota wording comes from the shared formatter.
+[[control]]
+id = "dialog-no-inert-options"
+guards = "action-less items are header text and never selectable options"
+file = "packages/opencode/src/tui/command-dialogs.tsx"
+old = "item.actions.length > 0"
+new = "item.actions.length >= 0 /* NON-VACUITY BREAK: offer inert items. */"
+test_file = "packages/opencode/src/tests/command-drawer.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\s/openai\sdrawer\sno\sdialog\soption\sis\san\sinert\stext\srow$']
+expect_message = "expect(received).toEqual(expected)"
+
+[[control]]
+id = "dialog-group-category"
+guards = "group headers and section summaries are categories, not options"
+file = "packages/opencode/src/tui/command-dialogs.tsx"
+old = "...(item.group ? { category: item.group } : {}),"
+new = "// NON-VACUITY BREAK: omit item group headers."
+test_file = "packages/opencode/src/tests/command-drawer.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\s/openai\sdrawer\sgroup\sheaders\smap\sto\scategory\sabove\sactionable\srows$']
+expect_message = "expect(received).toEqual(expected)"
+
+[[control]]
+id = "dialog-status-footer"
+guards = "item status is drawn as the option footer"
+file = "packages/opencode/src/tui/command-dialogs.tsx"
+old = "...(item.status ? { footer: item.status } : {}),"
+new = "// NON-VACUITY BREAK: omit item status."
+test_file = "packages/opencode/src/tests/command-drawer.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\s/openai\sdrawer\sitem\sstatus\smaps\sto\sfooter$']
+expect_message = "Expected path:"
+
+[[control]]
+id = "dialog-shared-quota"
+guards = "vault quota rows use shared compact status and full detail, and check only their own account"
+file = "packages/core/src/vault-command-menu.ts"
+old = "projectQuota(row.quota, options.quota?.scope)"
+new = "projectQuota(undefined, options.quota?.scope) /* NON-VACUITY BREAK: discard the account reading. */"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\sdialog\squota\stext\smatches\sthe\sshared\sformatter\sand\seach\srow\schecks\sonly\sits\saccount$']
+expect_message = "expect(received).toBe(expected)"
+
+[[control]]
+id = "sidebar-shared-quota"
+guards = "sidebar row and collapsed figures match shared compact percent-left text"
+file = "packages/opencode/src/sidebar-state.ts"
+old = "usedPercent: window.usedPercent,"
+new = "usedPercent: 100 - window.usedPercent, // NON-VACUITY BREAK: reverse usage and quota left."
+test_file = "packages/opencode/src/tests/tui-quota-render.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/tui-quota-render.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^dynamic\squota\sTUI\srows\ssidebar\squota\stext\smatches\sthe\sshared\scompact\sformatter$']
+expect_message = "expect(received).toBe(expected)"
+
+[[control]]
+id = "pi-per-account-quota"
+guards = "selecting one pool account checks only that account, not Pi login or another row"
+file = "packages/pi/src/commands.ts"
+old = "if (ids.length === 1) {"
+new = "if (false) { // NON-VACUITY BREAK: poll every account for a single-row action."
+test_file = "packages/pi/src/tests/pool-routing.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/pool-routing.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\s/openai\son\sthe\saccount\spool\sa\sper-account\squota\scheck\spolls\sonly\sthe\schosen\spool\srow$']
+expect_message = "expect(received).toEqual(expected)"

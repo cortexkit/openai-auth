@@ -17,7 +17,7 @@ type Captured =
   | {
       kind: 'select'
       title: string
-      options: Array<{ title: string; value: string }>
+      options: Array<{ title: string; value: string; category?: string }>
       onSelect: (option: { value: string }) => void
     }
   | {
@@ -95,12 +95,14 @@ const MENU: CommandMenuModel = {
       id: 'accounts',
       slot: 'accounts',
       title: 'Accounts',
-      lines: ['2 account(s), 2 enabled.'],
+      lines: ['2 accounts, 2 enabled'],
       items: [
         {
           id: 'alpha',
           label: 'alpha',
           detail: 'OAuth · enabled',
+          group: 'Accounts',
+          status: 'enabled',
           actions: [
             {
               id: 'remove',
@@ -117,16 +119,20 @@ const MENU: CommandMenuModel = {
       id: 'limits',
       slot: 'limits',
       title: 'Limits',
-      lines: ['Killswitch: off.'],
+      lines: ['Killswitch off'],
       items: [
         {
           id: 'alpha',
           label: 'alpha',
-          facts: { primary: '42% used' },
+          group: 'Floors · killswitch off',
+          status: '5h ≥5%',
+          detail: 'Minimum quota left',
+          facts: { primary: '5% left' },
           actions: [
             {
               id: 'floors',
               label: 'Set floors',
+              group: 'Actions',
               knobs: [
                 { kind: 'number', id: 'primary', label: 'primary', value: 5 },
               ],
@@ -138,6 +144,7 @@ const MENU: CommandMenuModel = {
         {
           id: 'killswitch',
           label: 'Turn killswitch on',
+          group: 'Actions',
           knobs: [
             { kind: 'toggle', id: 'enabled', label: 'Killswitch', value: true },
           ],
@@ -184,7 +191,7 @@ function recordingApply(text = 'Done.') {
 }
 
 describe('the /openai drawer', () => {
-  test('lists every section, then a section’s lines, items, actions and Back', () => {
+  test('lists every section, then only actionable items, actions and Back', () => {
     expect(sectionListOptions(MENU).map((option) => option.title)).toEqual([
       'Accounts',
       'Limits',
@@ -192,14 +199,88 @@ describe('the /openai drawer', () => {
     ])
     const [, limits] = MENU.sections
     expect(sectionOptions(limits!).map((option) => option.value)).toEqual([
-      'line:0',
       'item:alpha',
       'action:killswitch',
       'back',
     ])
     expect(
       itemOptions(limits!.items[0]!).map((option) => option.title),
-    ).toEqual(['primary: 42% used', 'Set floors', 'Back'])
+    ).toEqual(['Set floors', 'Back'])
+  })
+
+  test('no dialog option is an inert text row', () => {
+    const section = {
+      ...MENU.sections[1]!,
+      facts: { note: 'Read-only section fact' },
+      items: [
+        {
+          id: 'readonly',
+          label: 'Read-only account',
+          status: 'disabled',
+          actions: [],
+        },
+        ...MENU.sections[1]!.items,
+      ],
+    }
+    expect(sectionOptions(section).map((option) => option.value)).toEqual([
+      'item:alpha',
+      'action:killswitch',
+      'back',
+    ])
+    expect(
+      itemOptions(section.items[1]!).map((option) => option.value),
+    ).toEqual(['action:floors', 'back'])
+    for (const option of [
+      ...sectionOptions(section),
+      ...itemOptions(section.items[1]!),
+    ]) {
+      expect(option).not.toHaveProperty('disabled')
+    }
+    expect(sectionOptions(section)[0]).toHaveProperty(
+      'category',
+      'Killswitch off\nnote: Read-only section fact\nRead-only account · disabled\nFloors · killswitch off',
+    )
+    expect(itemOptions(section.items[1]!)[0]?.description).toContain(
+      'Minimum quota left',
+    )
+    expect(itemOptions(section.items[1]!)[0]?.description).toContain(
+      'primary: 5% left',
+    )
+  })
+
+  test('group headers map to category above actionable rows', () => {
+    const section = MENU.sections[1]!
+    expect(sectionOptions(section)).toEqual([
+      expect.objectContaining({
+        value: 'item:alpha',
+        category: 'Killswitch off\nFloors · killswitch off',
+      }),
+      expect.objectContaining({
+        value: 'action:killswitch',
+        category: 'Actions',
+      }),
+      { title: 'Back', value: 'back' },
+    ])
+    expect(itemOptions(section.items[0]!)[0]).toHaveProperty(
+      'category',
+      'Actions',
+    )
+    expect(sectionListOptions(MENU)[1]?.description).toBe('Killswitch off')
+    const grouped = sectionOptions({
+      ...section,
+      items: [...section.items, { ...section.items[0]!, id: 'beta' }],
+    })
+    expect(grouped.slice(0, 2).map((option) => option.category)).toEqual([
+      'Killswitch off\nFloors · killswitch off',
+      'Killswitch off\nFloors · killswitch off',
+    ])
+  })
+
+  test('item status maps to footer', () => {
+    expect(sectionOptions(MENU.sections[0]!)[0]).toHaveProperty(
+      'footer',
+      'enabled',
+    )
   })
 
   test('a section action collects its toggle and applies it', async () => {
@@ -325,10 +406,9 @@ describe('the /openai drawer', () => {
     )
     expect(
       current?.kind === 'select' ? current.options.map((o) => o.title) : [],
-    ).toEqual([
-      'Accounts move once every process runs this version.',
-      'pid 42',
-      'Back',
-    ])
+    ).toEqual(['Back'])
+    expect(current?.kind === 'select' ? current.options[0]?.category : '').toBe(
+      'Accounts move once every process runs this version.\npid 42',
+    )
   })
 })

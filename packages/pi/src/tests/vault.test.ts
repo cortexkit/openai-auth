@@ -270,8 +270,8 @@ describe('Pi and the Claustrum vault', () => {
       expect(
         applied.menu.sections
           .find((section) => section.id === 'limits')
-          ?.items.find((item) => item.id === route)?.detail,
-      ).toBe('floors: primary 22%, secondary 11%')
+          ?.items.find((item) => item.id === route)?.status,
+      ).toBe('primary ≥22% · secondary ≥11%')
       expect(menu.sections.some((section) => section.id === 'reset')).toBe(
         false,
       )

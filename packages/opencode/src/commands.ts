@@ -139,8 +139,7 @@ function cacheSection(ctx: OpenCodeMenuContext) {
     title: 'Cache',
     build: async () => {
       const mgr = ctx.cacheKeepManager
-      if (!mgr)
-        return { lines: ['Cache keep-warm is not available in this process.'] }
+      if (!mgr) return { lines: ['Keep-warm unavailable'] }
       const stored = cacheKeepSettings(await ctx.loadAccounts(storePaths(ctx)))
       const enabled = stored?.enabled === true
       const subagents = stored?.subagents === true
@@ -150,16 +149,15 @@ function cacheSection(ctx: OpenCodeMenuContext) {
         : 'always (no window)'
       return {
         lines: [
-          `Keep-warm: ${enabled ? 'on' : 'off'}, timer ${status.running ? 'armed' : 'idle'}, ${status.tracked} session(s) tracked.`,
-          `Subagent warming: ${subagents ? 'on' : 'off'}. Sustain (main sessions only): ${status.sustain ? 'on' : 'off'}. Window: ${windowLabel}.`,
-          `TTL ${Math.round(status.ttlMs / 1000)}s, lead ${Math.round(status.leadMs / 1000)}s, idle cap ${Math.round(status.maxIdleWarmMs / 60_000)}min (subagents ${Math.round(status.maxSubagentIdleMs / 60_000)}min).`,
+          `Keep-warm ${enabled ? 'on' : 'off'} · ${status.tracked === 0 ? 'no sessions' : `${status.tracked} session${status.tracked === 1 ? '' : 's'}`}`,
+          `Timer ${status.running ? 'armed' : 'idle'} · subagents ${subagents ? 'on' : 'off'} · sustain ${status.sustain ? 'on' : 'off'}`,
+          `Window ${windowLabel}`,
+          `TTL ${Math.round(status.ttlMs / 1000)}s · lead ${Math.round(status.leadMs / 1000)}s · idle cap ${Math.round(status.maxIdleWarmMs / 60_000)}min (subagents ${Math.round(status.maxSubagentIdleMs / 60_000)}min)`,
         ],
         items: status.targets.map((target) => ({
           id: target.sessionKey,
-          label:
-            target.sessionKey.length > 12
-              ? `${target.sessionKey.slice(0, 12)}…`
-              : target.sessionKey,
+          label: target.sessionKey,
+          group: 'Sessions',
           detail: [
             target.accountId ?? 'main',
             `expires in ${Math.ceil((target.cacheExpiresAt - status.generatedAt) / 1000)}s`,
@@ -301,8 +299,9 @@ function diagnosticsSection(ctx: OpenCodeMenuContext) {
       const level = storage?.logging?.level ?? 'info'
       return {
         lines: [
-          `Request dumps: ${settings.dump ? 'on' : 'off'}, written to ${settings.dumpDir}.`,
-          `Log level: ${level}.`,
+          `Dumps ${settings.dump ? 'on' : 'off'}`,
+          `Dump directory: ${settings.dumpDir}`,
+          `Log level: ${level}`,
         ],
         actions: [
           {
@@ -439,7 +438,13 @@ export function createOpenCodeMenu(ctx: OpenCodeMenuContext) {
     protect: (id, view) => poolRemovalRefusal(id, view),
     ...(ctx.refreshAllQuota
       ? {
-          quotaCheck: async () => {
+          quotaCheck: async (ids) => {
+            if (ids.length === 1) {
+              const store = ctx.store()
+              for (const id of ids) await store.requestReading(id)
+              await store.pullsSettled()
+              return
+            }
             const results = (await ctx.refreshAllQuota?.()) ?? []
             const failures = results.filter((result) => !result.ok)
             // A CommandError, so the menu shows which accounts failed and
@@ -518,8 +523,10 @@ export function menuText(menu: CommandMenuModel): string {
   for (const section of menu.sections) {
     lines.push('', `### ${section.title}`)
     for (const line of section.lines) lines.push(line)
-    for (const item of section.items)
-      lines.push(`- ${item.label}${item.detail ? `: ${item.detail}` : ''}`)
+    for (const item of section.items) {
+      const detail = item.detail ?? item.status
+      lines.push(`- ${item.label}${detail ? `: ${detail}` : ''}`)
+    }
   }
   lines.push('', 'Open the OpenCode TUI to change these settings.')
   return lines.join('\n')

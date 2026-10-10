@@ -1,11 +1,15 @@
 import {
   type AccountMenuOptions,
   accountMenuActions,
-  quotaLines,
   runMenu,
 } from '@cortexkit/common-auth/auth-menu'
 import type { VaultRosterRow } from '@cortexkit/common-auth/claustrum'
-import { isQuotaMap, projectQuota } from '@cortexkit/common-auth/quota'
+import {
+  formatQuota,
+  isQuotaMap,
+  projectQuota,
+  quotaTextParts,
+} from '@cortexkit/common-auth/quota'
 import type { PoolRow } from '@cortexkit/common-auth/store'
 import type { OpenAiVault, VaultStatus } from './vault'
 
@@ -39,7 +43,7 @@ export async function readVaultMenu(vault: MenuVault): Promise<VaultMenuView> {
 }
 
 export function vaultAccountName(row: VaultRosterRow): string {
-  return row.label || row.email || row.routeId
+  return row.email || row.label || row.routeId
 }
 
 /**
@@ -65,31 +69,12 @@ export function setAsideDetail(
     : SET_ASIDE
 }
 
-/** Use the oldest quota window reading so a newer window cannot make an older one appear current. */
-export function quotaReadingAge(
-  quota: unknown,
-  now: number,
-): string | undefined {
-  if (!isQuotaMap(quota)) return undefined
-  const readings = projectQuota(quota).limits.filter(
-    (limit) => limit.kind === 'reading',
+function datedQuotaLines(row: PoolRow, now: number): string[] {
+  const projection = projectQuota(isQuotaMap(row.quota) ? row.quota : undefined)
+  const parts = quotaTextParts(projection, { now })
+  return (parts.length > 0 ? parts : [formatQuota(projection, { now })]).map(
+    (line) => `  ${line}`,
   )
-  if (readings.length === 0) return undefined
-  const age = now - Math.min(...readings.map((limit) => limit.checkedAt))
-  if (age <= 15 * 60_000) return undefined
-  const minutes = Math.floor(age / 60_000)
-  const elapsed =
-    minutes >= 1440
-      ? `${Math.floor(minutes / 1440)}d`
-      : minutes >= 60
-        ? `${Math.floor(minutes / 60)}h`
-        : `${minutes}m`
-  return `quota read ${elapsed} ago`
-}
-
-function datedQuotaLines(row: PoolRow): string[] {
-  const age = quotaReadingAge(row.quota, Date.now())
-  return [...quotaLines(row), ...(age ? [`  ${age}`] : [])]
 }
 
 const SET_ASIDE = 'set aside (this host uses only its vault accounts)'
@@ -166,7 +151,10 @@ export async function runVaultAccountMenu(
             after.status === 'ready'
               ? after.rows.find((item) => item.id === row.id)
               : undefined
-          for (const line of datedQuotaLines(current ?? row))
+          for (const line of datedQuotaLines(
+            current ?? row,
+            (options.now ?? Date.now)(),
+          ))
             context.print(line)
         }
       }
@@ -189,9 +177,12 @@ export async function runVaultAccountMenu(
         const current = vault
           .snapshot()
           ?.rows.find((item) => item.routeId === row.routeId)
-        for (const line of datedQuotaLines({
-          quota: current?.quota,
-        } as PoolRow))
+        for (const line of datedQuotaLines(
+          {
+            quota: current?.quota,
+          } as PoolRow,
+          (options.now ?? Date.now)(),
+        ))
           context.print(line)
       }
       const after = await vault.status()

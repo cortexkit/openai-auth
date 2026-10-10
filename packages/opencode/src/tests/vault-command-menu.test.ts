@@ -4,7 +4,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { VaultRosterRow } from '@cortexkit/common-auth/claustrum'
 import type { CommandInvocation } from '@cortexkit/common-auth/commands'
-import type { QuotaMap } from '@cortexkit/common-auth/quota'
+import {
+  formatQuota,
+  projectQuota,
+  type QuotaMap,
+} from '@cortexkit/common-auth/quota'
 import {
   loadAccounts,
   type OpenAiVault,
@@ -17,7 +21,12 @@ import {
 } from '../commands'
 import { getSettings } from '../config'
 import { openAccountPool } from '../core/pool-accounts'
-import { quotaMap, readJson, seedPool } from './fixtures/pool-install'
+import { sectionOptions } from '../tui/command-dialogs'
+import {
+  quotaMap as fixtureQuotaMap,
+  readJson,
+  seedPool,
+} from './fixtures/pool-install'
 
 const now = Date.UTC(2026, 9, 9, 16, 9)
 const invocation: CommandInvocation = { notify() {} }
@@ -25,6 +34,12 @@ let dir: string
 let files: { configFile: string; stateFile: string }
 let polls: string[]
 let roster: VaultRosterRow[]
+
+function quotaMap(used: number, checkedAt: number) {
+  const quota = fixtureQuotaMap(used, checkedAt)
+  quota.limits[0]!.resetsAt = new Date(now + 2 * 60 * 60_000).toISOString()
+  return quota
+}
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'vault-command-menu-'))
@@ -135,6 +150,49 @@ async function sections(connected = true) {
 }
 
 describe('vault command menu', () => {
+  test('dialog quota text matches the shared formatter and each row checks only its account', async () => {
+    roster[0]!.email = 'known@example.com'
+    const quota = (await sections()).find((section) => section.id === 'quota')!
+    expect(quota.items.map((item) => item.id)).toEqual(
+      roster.map((row) => row.routeId),
+    )
+    for (const row of roster) {
+      const item = quota.items.find((item) => item.id === row.routeId)!
+      expect(item.label).toBe(row.email || row.label)
+      expect(item.group).toBe('Accounts')
+      expect(item.status).toBe(
+        formatQuota(projectQuota(row.quota), { now, form: 'compact' }),
+      )
+      expect(item.detail).toBe(formatQuota(projectQuota(row.quota), { now }))
+      expect(
+        sectionOptions(quota).find(
+          (option) => option.value === `item:${row.routeId}`,
+        ),
+      ).toEqual(
+        expect.objectContaining({
+          category: 'Accounts',
+          footer: item.status,
+          description: item.detail,
+        }),
+      )
+      expect(item.actions.map((action) => action.label)).toEqual([
+        'Check this account',
+      ])
+    }
+    const result = await createOpenCodeMenu(context()).apply(
+      {
+        command: 'openai',
+        sectionId: 'quota',
+        itemId: roster[0]!.routeId,
+        actionId: 'check',
+        values: {},
+      },
+      invocation,
+    )
+    expect(result.ok).toBe(true)
+    expect(polls).toEqual([roster[0]!.routeId])
+    expect(quota.actions[0]?.knobs).toEqual([])
+  })
   test('all three packages require the published replacement-slot release', () => {
     for (const name of ['core', 'opencode', 'pi']) {
       const manifest = JSON.parse(
@@ -143,7 +201,7 @@ describe('vault command menu', () => {
           'utf8',
         ),
       )
-      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.11.8')
+      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.13.0')
     }
   })
   // Vault mode is exclusive: while connected, the vault's accounts are the
@@ -153,7 +211,9 @@ describe('vault command menu', () => {
       (section) => section.id === 'accounts',
     )!
     expect(accounts.lines).toEqual([
-      '3 vault account(s) can route. Local accounts are not used while this host is connected to the vault.',
+      '3 vault accounts',
+      '3 can route',
+      'Local accounts are not used while this host is connected to the vault.',
     ])
     expect(accounts.items.map((item) => item.id)).toEqual(
       roster.map((row) => row.routeId),
@@ -162,17 +222,20 @@ describe('vault command menu', () => {
       accounts.items.find((item) => item.id === roster[2]!.routeId)?.detail,
     ).toContain('active · enabled')
   })
-  test('quota lists the same accounts and dates stale readings in both sections', async () => {
+  test('quota lists the same accounts and dates stale readings in Quota', async () => {
     const menu = await sections()
     const accounts = menu.find((section) => section.id === 'accounts')!
     const quota = menu.find((section) => section.id === 'quota')!
     expect(quota.items.map((item) => item.id)).toEqual(
       roster.map((row) => row.routeId),
     )
-    for (const section of [accounts, quota]) {
+    expect(accounts.items.map((item) => item.id)).toEqual(
+      quota.items.map((item) => item.id),
+    )
+    for (const section of [quota]) {
       expect(
         section.items.find((item) => item.id === roster[0]!.routeId)?.detail,
-      ).toContain('quota read 3d ago')
+      ).toContain('checked 3d ago')
       expect(
         section.items.find((item) => item.id === roster[1]!.routeId)?.detail,
       ).not.toContain('ago')
@@ -182,7 +245,7 @@ describe('vault command menu', () => {
     const quota = (await sections()).find((section) => section.id === 'quota')!
     expect(
       quota.items.find((item) => item.id === roster[0]!.routeId)?.detail,
-    ).toContain('quota read 3d ago')
+    ).toContain('checked 3d ago')
   })
   test('in vault mode no local row is listed in Accounts, Quota or Limits', async () => {
     const menu = await sections()
@@ -202,11 +265,19 @@ describe('vault command menu', () => {
       (section) => section.id === 'accounts',
     )!
     expect(accounts.lines).toEqual([
-      '1 vault account(s) can route. Local accounts are not used while this host is connected to the vault.',
+      '3 vault accounts',
+      '1 can route',
+      'Local accounts are not used while this host is connected to the vault.',
     ])
     expect(accounts.items.map((item) => item.id)).toEqual(
       roster.map((row) => row.routeId),
     )
+    const quota = (await sections()).find((section) => section.id === 'quota')!
+    expect(quota.items.map((item) => item.id)).toEqual([roster[2]!.routeId])
+    expect(quota.lines).toEqual([
+      `${roster[0]!.label} (needs_login): ${formatQuota(projectQuota(roster[0]!.quota), { now, form: 'compact' })}`,
+      `${roster[1]!.label} (disabled): ${formatQuota(projectQuota(roster[1]!.quota), { now, form: 'compact' })}`,
+    ])
   })
   test('quota checks use vault polls and never select set-aside local credentials', async () => {
     const result = await createOpenCodeMenu(context()).apply(
@@ -244,8 +315,8 @@ describe('vault command menu', () => {
     expect(
       result.menu.sections
         .find((section) => section.id === 'limits')
-        ?.items.find((item) => item.id === roster[0]!.routeId)?.detail,
-    ).toBe('floors: primary 25%, secondary 10%')
+        ?.items.find((item) => item.id === roster[0]!.routeId)?.status,
+    ).toBe('5h ≥25% · secondary ≥10%')
     expect(readFileSync(files.stateFile, 'utf8')).toBe(before)
   })
   test('reset labels set-aside locals without admitting vault accounts', async () => {
@@ -268,41 +339,41 @@ describe('vault command menu', () => {
     expect(rendered).toBe(`## OpenAI accounts
 
 ### Accounts
-2 account(s), 2 enabled.
-- main: OAuth · enabled · chatgpt-main · primary 93% left
-- ufuk: OAuth · enabled · chatgpt-ufuk · primary 15% left
+2 accounts, 2 enabled
+- main: OAuth · chatgpt-main
+- ufuk: OAuth · chatgpt-ufuk
 
 ### Quota
-Scope: all.
-- main: primary 93% left
-- ufuk: primary 15% left
+- main: 5h 93% left, resets 2h · checked 3d ago
+- ufuk: 5h 15% left, resets 2h
 
 ### Routing
-Mode: Main first.
-Roster order: main, ufuk.
+Mode: Main first
+Roster order: main, ufuk
 
 ### Limits
-Killswitch: off.
-With the killswitch on, an account whose quota falls below one of its floors is not used.
+Killswitch off
 - main: no floors
 - ufuk: no floors
 
 ### Cache
-Cache keep-warm is not available in this process.
+Keep-warm unavailable
 
 ### Diagnostics
-Request dumps: off, written to ${getSettings().dumpDir}.
-Log level: info.
+Dumps off
+Dump directory: ${getSettings().dumpDir}
+Log level: info
 
 ### Reset credits
-A reset credit restores an exhausted account's quota. Preview fetches the account's current quota and credits.
+Restore exhausted quota
 - Main account
 - ufuk
 
 ### This session
-No current session.
+No current session
 
 ### Vault
+Not connected
 OpenCode (openai-auth-opencode): not connected to the Claustrum vault.
 
 Open the OpenCode TUI to change these settings.`)
@@ -321,7 +392,7 @@ Open the OpenCode TUI to change these settings.`)
     expect(
       menu.sections.find((section) => section.id === 'accounts')?.items[0]
         ?.detail,
-    ).toBe('OAuth · enabled · chatgpt-main · primary 93% left')
+    ).toBe('OAuth · chatgpt-main')
     expect(readFileSync(files.configFile, 'utf8')).toBe(config)
     expect(readFileSync(files.stateFile, 'utf8')).toBe(state)
   })
@@ -336,15 +407,19 @@ Open the OpenCode TUI to change these settings.`)
     const accounts = menu.find((section) => section.id === 'accounts')!
     expect(accounts.items.map((item) => item.id)).not.toContain('ufuk')
     expect(accounts.lines).toEqual([
-      '2 vault account(s) can route. Local accounts are not used while this host is connected to the vault.',
+      '2 vault accounts',
+      '2 can route',
+      'Local accounts are not used while this host is connected to the vault.',
     ])
     const check = menu
       .find((section) => section.id === 'quota')
       ?.actions.find((action) => action.id === 'check')
-    const choices = (
-      check?.knobs?.[0] as { choices?: Array<{ value: string }> } | undefined
-    )?.choices?.map((choice) => choice.value)
-    expect(choices).toEqual(['*', ...roster.map((row) => row.routeId)])
+    expect(check?.knobs).toEqual([])
+    expect(
+      menu
+        .find((section) => section.id === 'quota')
+        ?.items.map((item) => item.id),
+    ).toEqual(roster.map((row) => row.routeId))
   })
   test("Check now in vault mode polls each vault account once and never runs the host's local quota check", async () => {
     roster = roster.filter((row) => row.accountIdentity !== 'chatgpt-ufuk')
@@ -382,7 +457,7 @@ Open the OpenCode TUI to change these settings.`)
     const quota = (await sections()).find((section) => section.id === 'quota')!
     expect(
       quota.items.find((item) => item.id === roster[0]!.routeId)?.detail,
-    ).toContain('quota read 3d ago')
+    ).toContain('checked 3d ago')
     const reading = roster[0]!.quota!.limits[0]!
     if (reading.kind !== 'reading') throw new Error('fixture has no reading')
     reading.checkedAt = now - 15 * 60_000
@@ -396,6 +471,6 @@ Open the OpenCode TUI to change these settings.`)
     const older = (await sections()).find((section) => section.id === 'quota')!
     expect(
       older.items.find((item) => item.id === roster[0]!.routeId)?.detail,
-    ).toContain('quota read 15m ago')
+    ).toContain('checked 15m ago')
   })
 })

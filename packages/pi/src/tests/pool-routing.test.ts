@@ -564,7 +564,7 @@ describe('Pi /openai on the account pool', () => {
     const accounts = menu.sections.find((section) => section.id === 'accounts')
     expect(accounts?.items.map((item) => item.id)).toEqual(['alpha', 'beta'])
     const login = menu.sections.find((section) => section.id === 'pi-login')
-    expect(login?.lines.join('\n')).toContain('primary: 10% used')
+    expect(login?.lines.join('\n')).toContain('5h 90% left')
     expect(JSON.stringify(menu)).not.toContain(MAIN_TOKEN)
     expect(JSON.stringify(menu)).not.toContain(ALPHA_TOKEN)
   })
@@ -591,12 +591,32 @@ describe('Pi /openai on the account pool', () => {
     const quota = result.menu.sections.find((section) => section.id === 'quota')
     const detail = (id: string) =>
       quota?.items.find((item) => item.id === id)?.detail
-    expect(detail('alpha')).toContain('primary 69% left')
-    expect(detail('beta')).toContain('primary 48% left')
+    expect(detail('alpha')).toContain('5h 69% left')
+    expect(detail('beta')).toContain('5h 48% left')
     const login = result.menu.sections.find(
       (section) => section.id === 'pi-login',
     )
-    expect(login?.lines.join('\n')).toContain('primary: 7% used')
+    expect(login?.lines.join('\n')).toContain('5h 93% left')
+  })
+
+  test('a per-account quota check polls only the chosen pool row', async () => {
+    const runtime = makeRuntime()
+    await ready(runtime)
+    calls.length = 0
+    const result = await createPiMenu(runtime.commandSupport()).apply(
+      {
+        command: 'openai',
+        sectionId: 'quota',
+        itemId: 'alpha',
+        actionId: 'check',
+        values: {},
+      },
+      { notify() {} },
+    )
+    expect(result.ok).toBe(true)
+    expect(
+      calls.filter((call) => call.url === WHAM_URL).map((call) => call.token),
+    ).toEqual([ALPHA_TOKEN])
   })
 
   test('a failed quota check names the account that failed', async () => {

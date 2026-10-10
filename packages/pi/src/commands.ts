@@ -13,6 +13,11 @@ import {
   runPiCommandMenu,
 } from '@cortexkit/common-auth/commands'
 import {
+  formatQuota,
+  projectQuota,
+  quotaTextParts,
+} from '@cortexkit/common-auth/quota'
+import {
   createOpenAiMenu,
   OPENAI_COMMAND_NAME,
   sessionSection,
@@ -46,17 +51,6 @@ export type PiCommandDependencies = {
   afterApply?: () => void
 }
 
-function windowLine(
-  name: string,
-  window: { usedPercent: number; remainingPercent: number } | undefined,
-): string[] {
-  return window
-    ? [
-        `${name}: ${Math.round(window.usedPercent)}% used (${Math.round(window.remainingPercent)}% left)`,
-      ]
-    : []
-}
-
 /** Pi's own login: its last quota reading. */
 function piLoginSection(quota: () => OAuthQuotaSnapshot | undefined) {
   return {
@@ -64,15 +58,37 @@ function piLoginSection(quota: () => OAuthQuotaSnapshot | undefined) {
     title: 'Pi login',
     build: () => {
       const snapshot = quota()
+      const now = Date.now()
+      const projection = projectQuota({
+        limits: (['primary', 'secondary'] as const).flatMap((label) => {
+          const window = snapshot?.[label]
+          return window
+            ? [
+                {
+                  ...window,
+                  kind: 'reading' as const,
+                  scope: 'all',
+                  label,
+                  checkedAt: window.checkedAt ?? now,
+                },
+              ]
+            : []
+        }),
+        ...(snapshot?.spendControl
+          ? {
+              budget: {
+                ...snapshot.spendControl,
+                kind: 'reading' as const,
+                checkedAt: now,
+              },
+            }
+          : {}),
+      })
+      const parts = quotaTextParts(projection, { now })
       return {
         lines: [
-          "The account Pi signs in with is routed as `main`. Pi's `/login` replaces it.",
-          ...(snapshot
-            ? [
-                ...windowLine('primary', snapshot.primary),
-                ...windowLine('secondary', snapshot.secondary),
-              ]
-            : ['No quota reading yet.']),
+          'Managed by Pi /login',
+          ...(parts.length > 0 ? parts : [formatQuota(projection, { now })]),
         ],
       }
     },
@@ -93,7 +109,13 @@ export function createPiMenu(
       begin: (options) => begin({ ...options, version }),
       mainIdentity: async () => pool.mainIdentity(),
     },
-    quotaCheck: async () => {
+    quotaCheck: async (ids) => {
+      if (ids.length === 1) {
+        const store = pool.store()
+        for (const id of ids) await store.requestReading(id)
+        await store.pullsSettled()
+        return
+      }
       const failures = (await pool.refreshAllQuota()).filter(
         (result) => !result.ok,
       )

@@ -7,7 +7,10 @@
 // any one section. After every apply it redraws from the refreshed menu the
 // result carries.
 
-import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
+import type {
+  TuiDialogSelectOption,
+  TuiPluginApi,
+} from '@opencode-ai/plugin/tui'
 import { createLogger } from '../logger'
 import type {
   ApplyRequest,
@@ -29,11 +32,10 @@ export type ApplyFn = (
   request: Omit<ApplyRequest, 'sessionId'>,
 ) => Promise<ApplyResult>
 
-export interface DrawerOption {
-  title: string
-  value: string
-  description?: string
-}
+export type DrawerOption = Omit<
+  TuiDialogSelectOption<string>,
+  'disabled' | 'onSelect'
+>
 
 const BACK = 'back'
 
@@ -53,42 +55,71 @@ function factLines(facts: Record<string, unknown> | undefined): string[] {
   )
 }
 
-/**
- * A section's rows: its read-only lines and facts first (selecting one does
- * nothing), then its items, its own actions, and Back.
- */
+/** Read-only text is a category header; every option navigates or runs an action. */
 export function sectionOptions(section: Section): DrawerOption[] {
-  return [
-    ...[...section.lines, ...factLines(section.facts)].map((line, index) => ({
-      title: line,
-      value: `line:${index}`,
-    })),
-    ...section.items.map((item) => ({
-      title: item.label,
-      value: `item:${item.id}`,
-      ...(item.detail ? { description: item.detail } : {}),
-    })),
+  const header = [
+    ...section.lines,
+    ...factLines(section.facts),
+    ...section.items
+      .filter((item) => item.actions.length === 0)
+      .map((item) =>
+        [
+          item.group,
+          [item.label, item.status].filter(Boolean).join(' · '),
+          item.detail,
+          ...factLines(item.facts),
+        ]
+          .filter(Boolean)
+          .join('\n'),
+      ),
+  ]
+  const options: DrawerOption[] = [
+    ...section.items
+      .filter((item) => item.actions.length > 0)
+      .map((item) => ({
+        title: item.label,
+        value: `item:${item.id}`,
+        ...(item.detail ? { description: item.detail } : {}),
+        ...(item.group ? { category: item.group } : {}),
+        ...(item.status ? { footer: item.status } : {}),
+      })),
     ...section.actions.map((action) => ({
       title: action.label,
       value: `action:${action.id}`,
       ...(action.description ? { description: action.description } : {}),
+      ...(action.group ? { category: action.group } : {}),
     })),
     { title: 'Back', value: BACK },
   ]
+  const first = options[0]
+  if (first && header.length > 0) {
+    const category = first.category
+    const text = [...header, category].filter(Boolean).join('\n')
+    for (const option of options) {
+      if (option.category !== category) break
+      option.category = text
+    }
+  }
+  return options
 }
 
-/** An item's rows: its facts (read-only), its actions, and Back. */
+/** Item context is secondary text, never an option that cannot be acted on. */
 export function itemOptions(item: Item): DrawerOption[] {
+  const detail = [item.detail, ...factLines(item.facts)]
+    .filter(Boolean)
+    .join(' · ')
   return [
-    ...(item.detail ? [{ title: item.detail, value: 'line:detail' }] : []),
-    ...factLines(item.facts).map((line, index) => ({
-      title: line,
-      value: `line:${index}`,
-    })),
     ...item.actions.map((action) => ({
       title: action.label,
       value: `action:${action.id}`,
-      ...(action.description ? { description: action.description } : {}),
+      ...(detail || action.description
+        ? {
+            description: [detail, action.description]
+              .filter(Boolean)
+              .join(' · '),
+          }
+        : {}),
+      ...(action.group ? { category: action.group } : {}),
     })),
     { title: 'Back', value: BACK },
   ]

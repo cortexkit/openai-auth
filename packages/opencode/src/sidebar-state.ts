@@ -1,3 +1,10 @@
+import {
+  formatQuota,
+  type ProjectedQuota,
+  projectQuota,
+  quotaWindowName,
+} from '@cortexkit/common-auth/quota'
+
 export interface QuotaWindow {
   usedPercent: number
   remainingPercent: number
@@ -36,28 +43,12 @@ const LEGACY_WINDOW_MINUTES: Record<QuotaWindowKey, number> = {
   secondary: 10_080,
 }
 
-function compactUnit(value: number): string {
-  return Number.isInteger(value)
-    ? String(value)
-    : String(Math.round(value * 10) / 10)
-}
-
-// Derives a short human label ("5h", "1d", "7d") from a window length in
-// minutes. Snapshots written before dynamic windows carry no length, so retain
-// their historical primary=5h and secondary=7d meanings.
+// Use the same window names as the dialog, including its fallback for unknown lengths.
 export function formatWindowLabel(
   windowMinutes: number | undefined,
   fallbackKey: QuotaWindowKey,
 ): string {
-  const minutes =
-    windowMinutes !== undefined &&
-    Number.isFinite(windowMinutes) &&
-    windowMinutes > 0
-      ? windowMinutes
-      : LEGACY_WINDOW_MINUTES[fallbackKey]
-  if (minutes < 60) return `${compactUnit(minutes)}m`
-  if (minutes < 1_440) return `${compactUnit(minutes / 60)}h`
-  return `${compactUnit(minutes / 1_440)}d`
+  return quotaWindowName({ scope: 'all', label: fallbackKey, windowMinutes })
 }
 
 export interface PresentQuotaWindow {
@@ -86,7 +77,7 @@ export function getPresentQuotaWindows(
         : LEGACY_WINDOW_MINUTES[key]
     rows.push({
       key,
-      label: formatWindowLabel(windowMinutes, key),
+      label: formatWindowLabel(configuredMinutes, key),
       window,
       windowMs: windowMinutes * 60_000,
     })
@@ -2036,26 +2027,59 @@ export function resolveActiveAccount(state: SidebarState): {
   }
 }
 
-export function getCollapsedQuotaSummary(quota: AccountQuota | null): {
+/** Keep provider window lengths and per-window reading times when projecting old sidebar snapshots. */
+export function sidebarQuotaProjection(
+  quota: AccountQuota | null,
+  now = Date.now(),
+): ProjectedQuota | undefined {
+  if (!quota) return undefined
+  return projectQuota({
+    limits: QUOTA_WINDOW_KEYS.flatMap((label) => {
+      const window = quota[label]
+      return window
+        ? [
+            {
+              kind: 'reading' as const,
+              scope: 'all',
+              label,
+              usedPercent: window.usedPercent,
+              checkedAt: window.checkedAt ?? quota.checkedAt ?? now,
+              windowMinutes: window.windowMinutes,
+              resetsAt: window.resetsAt,
+            },
+          ]
+        : []
+    }),
+    ...(quota.spendControl
+      ? {
+          budget: {
+            ...quota.spendControl,
+            kind: 'reading' as const,
+            checkedAt: quota.checkedAt ?? now,
+          },
+        }
+      : {}),
+  })
+}
+
+export function getCollapsedQuotaSummary(
+  quota: AccountQuota | null,
+  now = Date.now(),
+): {
   primaryUsedPercent: number | null
   secondaryUsedPercent: number | null
   text: string | null
 } {
   const primaryUsedPercent = quota?.primary?.usedPercent ?? null
   const secondaryUsedPercent = quota?.secondary?.usedPercent ?? null
-  const rows = getPresentQuotaWindows(quota)
+  const projection = sidebarQuotaProjection(quota, now)
   return {
     primaryUsedPercent,
     secondaryUsedPercent,
     text:
-      rows.length === 0
+      !projection || (projection.limits.length === 0 && !projection.budget)
         ? null
-        : rows
-            .map(
-              ({ label, window }) =>
-                `${label}: ${Math.round(window.usedPercent)}%`,
-            )
-            .join(' '),
+        : formatQuota(projection, { now, form: 'compact' }),
   }
 }
 

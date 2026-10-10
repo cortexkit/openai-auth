@@ -3,6 +3,7 @@
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { formatQuota, quotaTextParts } from '@cortexkit/common-auth/quota'
 import type {
   TuiPlugin,
   TuiPluginApi,
@@ -34,6 +35,7 @@ import {
   resolveSessionStickyAccount,
   type SidebarState,
   type SpendControlReading,
+  sidebarQuotaProjection,
 } from './sidebar-state.js'
 import { openCommandDialog } from './tui/command-dialogs.js'
 import {
@@ -251,6 +253,7 @@ export interface QuotaDisplayRow {
   key: 'primary' | 'secondary' | 'spendControl'
   label: string
   labelWidth: number
+  text: string
   window: QuotaWindow
   pacing: QuotaPacing | null
 }
@@ -322,11 +325,20 @@ export function buildQuotaRowsForDisplay(
   pacingEnabled: boolean,
   labelWidth?: number,
 ): QuotaDisplayRow[] {
+  const projection = sidebarQuotaProjection(quota, now)
   const rows: Array<Omit<QuotaDisplayRow, 'labelWidth'>> =
     getPresentQuotaWindows(quota).map((row) => ({
       key: row.key,
       label: row.label,
       window: row.window,
+      text: formatQuota(
+        projection && {
+          ...projection,
+          budget: undefined,
+          limits: projection.limits.filter((limit) => limit.label === row.key),
+        },
+        { now, form: 'compact', staleAfterMs: Number.POSITIVE_INFINITY },
+      ),
       pacing:
         pacingEnabled && row.windowMs !== null
           ? computeQuotaPacing(row.window, row.windowMs, now)
@@ -337,6 +349,11 @@ export function buildQuotaRowsForDisplay(
     rows.push({
       key: 'spendControl',
       label: SPEND_CONTROL_LABEL,
+      text: formatQuota(projection && { ...projection, limits: [] }, {
+        now,
+        form: 'compact',
+        staleAfterMs: Number.POSITIVE_INFINITY,
+      }),
       window: {
         usedPercent: spendControl.usedPercent,
         remainingPercent: spendControl.remainingPercent,
@@ -347,6 +364,14 @@ export function buildQuotaRowsForDisplay(
   }
   const width =
     labelWidth ?? Math.max(3, ...rows.map((row) => row.label.length + 1))
+  const parts = quotaTextParts(projection, {
+    now,
+    form: 'compact',
+    staleAfterMs: Number.POSITIVE_INFINITY,
+  })
+  rows.sort(
+    (left, right) => parts.indexOf(left.text) - parts.indexOf(right.text),
+  )
   return rows.map((row) => ({ ...row, labelWidth: width }))
 }
 
@@ -400,8 +425,8 @@ export function getAccountMetadataRows(
   return rows
 }
 
-// Quota window row: muted label left, tone-colored bar + percentage right,
-// with an optional muted reset suffix. When pacing data is present, the bar
+// Quota window row: muted label left, tone-colored usage bar and shared quota text.
+// When pacing data is present, the bar
 // gains a pace segment and an off-pace window adds a muted subline with the
 // reserve/deficit delta and the projected runout.
 function QuotaRow(props: {
@@ -409,11 +434,11 @@ function QuotaRow(props: {
   appearance: AppearancePrefs
   label: string
   labelWidth: number
+  text: string
   window: { usedPercent: number; resetsAt?: string } | undefined
   pacing: QuotaPacing | null
 }) {
   const used = () => props.window?.usedPercent ?? 0
-  const reset = () => formatResetIn(props.window?.resetsAt)
   const paceLine = () => {
     const pacing = props.pacing
     if (!pacing || pacing.state === 'on-pace') return null
@@ -435,9 +460,7 @@ function QuotaRow(props: {
         </box>
       }
     >
-      {/* Left group (label · bar · pct) stays left-aligned in fixed columns so
-          bars and percentages line up across rows; the reset time is pushed to
-          the right edge so reset times align in their own right column. */}
+      {/* Bars show usage; the adjacent figure shows quota left, as in the dialog. */}
       <box width='100%' flexDirection='row' justifyContent='space-between'>
         <box flexDirection='row'>
           <text fg={props.theme.textMuted}>
@@ -453,12 +476,9 @@ function QuotaRow(props: {
           <text
             fg={toneColor(props.theme, usageTone(used(), props.appearance))}
           >
-            {` ${String(Math.round(used())).padStart(3)}%`}
+            {` ${props.text.slice(props.label.length + 1)}`}
           </text>
         </box>
-        <Show when={reset()}>
-          <text fg={props.theme.textMuted}>{reset()}</text>
-        </Show>
       </box>
       <Show when={paceLine()}>
         <box width='100%' flexDirection='row'>
@@ -528,6 +548,7 @@ function AccountBlock(props: {
                 appearance={props.appearance}
                 label={row.label}
                 labelWidth={row.labelWidth}
+                text={row.text}
                 window={row.window}
                 pacing={row.pacing}
               />
@@ -535,6 +556,14 @@ function AccountBlock(props: {
           </For>
         </Show>
       </Show>
+      <For
+        each={quotaTextParts(sidebarQuotaProjection(props.quota, Date.now()), {
+          now: Date.now(),
+          form: 'compact',
+        }).filter((part) => part.startsWith('checked '))}
+      >
+        {(age) => <text fg={props.theme.textMuted}>{age}</text>}
+      </For>
       <For
         each={getAccountMetadataRows(
           props.resetCredits,

@@ -1,5 +1,14 @@
 import { describe, expect, test } from 'bun:test'
-import { hashSidebarSessionId, type SidebarState } from '../sidebar-state.ts'
+import {
+  formatQuota,
+  projectQuota,
+  quotaTextParts,
+} from '@cortexkit/common-auth/quota'
+import {
+  getCollapsedQuotaSummary,
+  hashSidebarSessionId,
+  type SidebarState,
+} from '../sidebar-state.ts'
 import {
   buildApplyRequest,
   buildQuotaRowsForDisplay,
@@ -14,12 +23,54 @@ import {
 describe('dynamic quota TUI rows', () => {
   const now = Date.UTC(2026, 6, 16, 12, 0, 0)
 
+  test('sidebar quota text matches the shared compact formatter', () => {
+    const checkedAt = now - 3 * 60 * 60_000
+    const quota = {
+      checkedAt,
+      primary: { usedPercent: 42, remainingPercent: 58, windowMinutes: 300 },
+      secondary: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        windowMinutes: 10080,
+      },
+    }
+    const projection = projectQuota({
+      limits: [
+        {
+          kind: 'reading',
+          scope: 'all',
+          label: 'primary',
+          usedPercent: 42,
+          windowMinutes: 300,
+          checkedAt,
+        },
+        {
+          kind: 'reading',
+          scope: 'all',
+          label: 'secondary',
+          usedPercent: 10,
+          windowMinutes: 10080,
+          checkedAt,
+        },
+      ],
+    })
+    expect(formatQuota(projection, { now, form: 'compact' })).toBe(
+      '5h 58% left · 7d 90% left · checked 3h ago',
+    )
+    expect(getCollapsedQuotaSummary(quota, now).text).toBe(
+      formatQuota(projection, { now, form: 'compact' }),
+    )
+    expect(
+      buildQuotaRowsForDisplay(quota, now, false).map((row) => row.text),
+    ).toEqual(quotaTextParts(projection, { now, form: 'compact' }).slice(0, 2))
+  })
+
   function projectQuotaRow(row: {
     label: string
     labelWidth: number
-    window: { usedPercent: number }
+    text: string
   }): string {
-    return `${row.label.padEnd(row.labelWidth)}▓▓▓▓▓▓▓▓ ${String(Math.round(row.window.usedPercent)).padStart(3)}%`
+    return `${row.label.padEnd(row.labelWidth)}▓▓▓▓▓▓▓▓ ${row.text.slice(row.label.length + 1)}`
   }
 
   const twoWindows = {
@@ -162,12 +213,12 @@ describe('dynamic quota TUI rows', () => {
       buildQuotaRowsForDisplay(twoWindows, now, false, labelWidth).map(
         projectQuotaRow,
       ),
-    ).toEqual(['5h ▓▓▓▓▓▓▓▓   0%', '7d ▓▓▓▓▓▓▓▓  51%'])
+    ).toEqual(['5h ▓▓▓▓▓▓▓▓ 100% left', '7d ▓▓▓▓▓▓▓▓ 49% left'])
     expect(
       buildQuotaRowsForDisplay(fallback, now, false, labelWidth).map(
         projectQuotaRow,
       ),
-    ).toEqual(['5h ▓▓▓▓▓▓▓▓  12%'])
+    ).toEqual(['5h ▓▓▓▓▓▓▓▓ 88% left'])
   })
 
   // The width is only as correct as the set it measures, and the set is built
@@ -197,15 +248,15 @@ describe('dynamic quota TUI rows', () => {
       buildQuotaRowsForDisplay(twoWindows, now, false, labelWidth).map(
         projectQuotaRow,
       ),
-    ).toEqual(['5h      ▓▓▓▓▓▓▓▓   0%', '7d      ▓▓▓▓▓▓▓▓  51%'])
+    ).toEqual(['5h      ▓▓▓▓▓▓▓▓ 100% left', '7d      ▓▓▓▓▓▓▓▓ 49% left'])
     expect(
       buildQuotaRowsForDisplay(withSpendControl, now, false, labelWidth).map(
         projectQuotaRow,
       ),
     ).toEqual([
-      '5h      ▓▓▓▓▓▓▓▓   0%',
-      '7d      ▓▓▓▓▓▓▓▓  51%',
-      'credits ▓▓▓▓▓▓▓▓  20%',
+      '5h      ▓▓▓▓▓▓▓▓ 100% left',
+      '7d      ▓▓▓▓▓▓▓▓ 49% left',
+      'credits ▓▓▓▓▓▓▓▓ 80% left',
     ])
   })
 
@@ -226,7 +277,7 @@ describe('dynamic quota TUI rows', () => {
     expect(isQuotaLoaded({})).toBe(true)
   })
 
-  test('a lengthless old window retains its historical label and pacing', () => {
+  test('a lengthless old window uses the shared label and retains historical pacing', () => {
     const rows = buildQuotaRowsForDisplay(
       {
         primary: {
@@ -238,7 +289,7 @@ describe('dynamic quota TUI rows', () => {
       now,
       true,
     )
-    expect(rows[0]?.label).toBe('5h')
+    expect(rows[0]?.label).toBe('primary')
     expect(rows[0]?.pacing).not.toBeNull()
   })
 
