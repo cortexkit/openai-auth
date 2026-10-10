@@ -1042,7 +1042,9 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/shared-vault.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ["^one\\shost\\svault\\sper\\sprocess\\sdisposing\\sone\\sholder\\sleaves\\sthe\\sother\\sserving\\suntil\\sthe\\slast\\srelease$"]
-expect_message = 'Received: "Bearer main-token"'
+# In vault mode a closed vault connection has no local fallback, so the
+# surviving project's request is refused instead of served.
+expect_message = 'Received: 401'
 
 # Per-request CPU guards. Disabled dumps must not serialize replay histories,
 # and canonical-item reuse must validate all values, not just an index or id.
