@@ -351,7 +351,7 @@ bun run dev:clean
 [`mutations.toml`](mutations.toml) lists deliberate breaks of production code, each with the named test that must fail when it is applied, so a guard cannot quietly stop guarding. `ckdev-mutate` replays them: it runs each named test on the clean tree, applies the break, requires the test to fail for the recorded reason, and restores the file. A row is for a silent, costly failure (a credential lost or leaked, a reset credit spent twice, output replayed, an account lost in a crash, a wire contract), not for style. Run it from a clean tree; CI replays the rows a pull request touches, the full catalogue on main, and the full catalogue with `--broad` nightly.
 
 ```bash
-cargo install --locked --git https://github.com/cortexkit/commons --rev 73c7e66145e131eadffdd874c82d93548868b668 cortexkit-mutate
+cargo install --locked --git https://github.com/cortexkit/commons --rev 0c99c7e16d8ae22b6e114136b6b7b68be6f1394e cortexkit-mutate
 ckdev-mutate run --all
 ```
 
