@@ -30,6 +30,31 @@ const RESERVED_ACCOUNT_ID_ERROR =
 // in user-agent.test.ts.
 const TEST_VERSION = '9.9.9'
 
+async function canBindIPv6Loopback(): Promise<boolean> {
+  const probe = createServer()
+  return new Promise((resolve, reject) => {
+    const onError = (error: NodeJS.ErrnoException) => {
+      if (error.code === 'EADDRNOTAVAIL' || error.code === 'EAFNOSUPPORT') {
+        resolve(false)
+      } else {
+        reject(error)
+      }
+    }
+    probe.once('error', onError)
+    probe.listen(0, '::1', () => {
+      probe.off('error', onError)
+      probe.close((error) => (error ? reject(error) : resolve(true)))
+    })
+  })
+}
+
+const ipv6LoopbackAvailable = await canBindIPv6Loopback()
+if (!ipv6LoopbackAvailable) {
+  console.info(
+    'Skipping IPv6 OAuth callback test: IPv6 loopback is unavailable',
+  )
+}
+
 describe('User-Agent', () => {
   test('is the product name and the version the host supplied', () => {
     expect(buildUserAgent('1.2.3')).toBe('cortexkit-opencode-openai-auth/1.2.3')
@@ -57,20 +82,27 @@ function makeAccount(
   }
 }
 
-async function expectOAuthPortClosed() {
+async function expectOAuthPortClosed(host = '127.0.0.1') {
   const deadline = Date.now() + 1000
   while (Date.now() < deadline) {
     const closed = await new Promise<boolean>((resolve) => {
       const probe = createServer()
       probe.once('error', () => resolve(false))
-      probe.listen(OAUTH_PORT, () => {
+      probe.listen(OAUTH_PORT, host, () => {
         probe.close(() => resolve(true))
       })
     })
     if (closed) return
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
-  throw new Error(`OAuth port ${OAUTH_PORT} was still accepting listeners`)
+  throw new Error(
+    `OAuth port ${OAUTH_PORT} was still accepting listeners on ${host}`,
+  )
+}
+
+async function expectOAuthListenersClosed() {
+  await expectOAuthPortClosed('127.0.0.1')
+  if (ipv6LoopbackAvailable) await expectOAuthPortClosed('::1')
 }
 
 describe('upsertAccount', () => {
@@ -528,6 +560,25 @@ describe('OAuth server concurrency (C1/C2)', () => {
     await expect(p2).resolves.toBeDefined()
   })
 
+  test.skipIf(!ipv6LoopbackAvailable)(
+    'IPv6 loopback callback completes login and cleanup closes both listeners',
+    async () => {
+      const { redirectUri } = await startOAuthServer()
+      expect(redirectUri).toBe(`http://localhost:${OAUTH_PORT}/auth/callback`)
+
+      const pending = waitForOAuthCallback(
+        { verifier: 'ipv6-verifier', challenge: 'ipv6-challenge' },
+        'ipv6-state',
+      )
+      const callback = await fetch(
+        `http://[::1]:${OAUTH_PORT}/auth/callback?code=ipv6-code&state=ipv6-state`,
+      )
+      expect(callback.status).toBe(200)
+      await expect(pending).resolves.toBeDefined()
+      await expectOAuthListenersClosed()
+    },
+  )
+
   test('concurrent startOAuthServer callers share one listen attempt', async () => {
     const [first, second] = await Promise.all([
       startOAuthServer(),
@@ -696,7 +747,7 @@ describe('OAuth server concurrency (C1/C2)', () => {
     expect(pendingResult).toEqual(expect.any(Error))
     expect(pendingResult.message).toBe('Login cancelled')
 
-    await expectOAuthPortClosed()
+    await expectOAuthListenersClosed()
   })
 
   test('unknown-state callback with no pending flows stops the idle server', async () => {
@@ -707,7 +758,7 @@ describe('OAuth server concurrency (C1/C2)', () => {
     )
     expect(response.status).toBe(400)
 
-    await expectOAuthPortClosed()
+    await expectOAuthListenersClosed()
   })
 
   test('timeout cleans up the last pending flow and stops the server', async () => {
@@ -719,7 +770,7 @@ describe('OAuth server concurrency (C1/C2)', () => {
     )
 
     await expect(pending).rejects.toThrow('OAuth callback timeout')
-    await expectOAuthPortClosed()
+    await expectOAuthListenersClosed()
   })
 })
 
@@ -940,7 +991,7 @@ describe('Browser OAuth abort cleanup (Fix 4)', () => {
     controller.abort()
 
     await expect(promise).rejects.toThrow('Login cancelled')
-    await expectOAuthPortClosed()
+    await expectOAuthListenersClosed()
   })
 })
 
