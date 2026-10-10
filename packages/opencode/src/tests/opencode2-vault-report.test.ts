@@ -121,9 +121,10 @@ describe('vault failure reports on OpenCode 2', () => {
       receipt: ClaustrumScopedAttempt | undefined
       status: number
     }> = []
-    // main-first serves the pool row `main`; fallback-first puts it last, so
-    // the vault account serves.
+    // Before this host connects to the vault, main-first serves the pool row
+    // `main`. Once connected (vault mode), only the vault account serves.
     let mode: 'main-first' | 'fallback-first' = 'main-first'
+    let enrolled = false
     const openai = createOpenAIAdapter({
       source: poolSource,
       storage: async (): Promise<AccountStorage> => ({
@@ -142,6 +143,8 @@ describe('vault failure reports on OpenCode 2', () => {
           },
         ],
         identities: () => new Set<string>(['chatgpt-vault']),
+        enrolled: () => enrolled,
+        snapshot: () => undefined,
         authorize: async () => receipt(),
         reportFailure: async (served, status) => {
           reports.push({ receipt: served, status })
@@ -161,6 +164,7 @@ describe('vault failure reports on OpenCode 2', () => {
     expect(reports).toEqual([])
 
     mode = 'fallback-first'
+    enrolled = true
     const vault = await send(host, 401)
     expect(vault.get('authorization')).toBe('Bearer vault-token')
     expect(reports).toEqual([

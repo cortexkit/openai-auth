@@ -154,6 +154,14 @@ export interface PoolAccountSourceDeps {
    */
   vaultIdentities?: () => ReadonlySet<string>
   /**
+   * True while this host is in vault mode (enrolled with the Claustrum
+   * vault). Every row is then set aside, whatever account it signs in as:
+   * this source refreshes no token, polls no quota and offers no bearer, so
+   * the files stay exactly as they are until the host disconnects. Read on
+   * every use, so a disconnect restores local work at once.
+   */
+  vaultMode?: () => boolean
+  /**
    * Settles (resolved or rejected) once the vault has read its first roster.
    * Until then `vaultIdentities` is empty even for an account the vault
    * holds, so the first-sight quota polls of new rows wait for it (at most
@@ -502,8 +510,12 @@ export class PoolAccountSource {
    * at the first load, a row added since, a replaced credential, and every
    * row once the install turns migrated. Never waits.
    */
-  /** Whether the vault owns the account this row signs in as. */
+  /**
+   * Whether this row is not this host's to use: the host is in vault mode,
+   * or the vault owns the account the row signs in as.
+   */
   private vaultOwned(row: Pick<PoolRow, 'identity'>): boolean {
+    if (this.deps.vaultMode?.()) return true
     return (
       row.identity !== undefined &&
       (this.deps.vaultIdentities?.().has(row.identity) ?? false)
@@ -513,7 +525,7 @@ export class PoolAccountSource {
   private pollUnseenRows(): void {
     if (this.disposed) return
     const first = this.deps.vaultFirstRoster
-    if (!this.vaultRosterSettled && first) {
+    if (!this.vaultRosterSettled && first && !this.deps.vaultMode?.()) {
       // Which rows the vault owns is not known yet. These polls run in the
       // background anyway, so they wait for the roster (for a bounded time)
       // rather than poll a vault account's local row with that row's own
@@ -552,7 +564,7 @@ export class PoolAccountSource {
    * want of a reading, so it must never wait and must stay cheap.
    */
   requestReading(id: string, force = false): void {
-    if (this.disposed) return
+    if (this.disposed || this.deps.vaultMode?.()) return
     const now = this.now()
     const last = this.lastPull.get(id)
     if (
@@ -622,7 +634,8 @@ export class PoolAccountSource {
     accessToken: string,
     complete: boolean,
   ): void {
-    if (!this.snapshot.active || this.disposed) return
+    if (!this.snapshot.active || this.disposed || this.deps.vaultMode?.())
+      return
     const row = this.snapshot.rows.find((r) => r.id === rowId)
     if (row?.type !== 'oauth') return
     // The token must be the row's own: its wire identity matches the row's
@@ -699,10 +712,12 @@ export class PoolAccountSource {
   ): Promise<void> {
     // A row signing in as a vault account must not be refreshed, and before
     // the vault's first roster no such account is known. Bounded, so a vault
-    // that never answers costs a request at most this wait.
-    await this.awaitVaultRoster(
-      this.deps.vaultFirstRosterWaitMs ?? VAULT_FIRST_ROSTER_WAIT_MS,
-    )
+    // that never answers costs a request at most this wait. In vault mode
+    // every row is set aside already, so there is nothing to wait for.
+    if (!this.deps.vaultMode?.())
+      await this.awaitVaultRoster(
+        this.deps.vaultFirstRosterWaitMs ?? VAULT_FIRST_ROSTER_WAIT_MS,
+      )
     const now = this.now()
     const windowMs = refreshBeforeExpiryMs(storage)
     const waits: Promise<void>[] = []

@@ -18,11 +18,13 @@
 //   request only. Requests that cannot be pinned (no session, not
 //   replayable) are routed main-first.
 //
-// The OpenAI accounts the Claustrum vault serves this host (`ctx.vault`) are
-// routed beside the pool rows, through the same admission and modes. A vault
-// account holds no token: each send asks the vault for one. A pool row
-// signing in as a ChatGPT account the vault holds is left out, so one account
-// has one owner.
+// The OpenAI accounts the Claustrum vault serves this host (`ctx.vault`)
+// replace the pool rows while this host is in vault mode (enrolled with the
+// vault): the request is routed over the vault's accounts alone, through the
+// same admission and modes, and no pool row is read, refreshed or sent with.
+// A vault account holds no token: each send asks the vault for one. When no
+// vault account can serve, the request is refused locally; it never falls
+// back to a local row.
 
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import { isQuotaMap } from '@cortexkit/common-auth/quota'
@@ -44,6 +46,8 @@ import {
   type OAuthQuotaSnapshot,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
+  VAULT_MODE_REFUSALS,
+  type VaultModeRefusal,
 } from '@cortexkit/openai-auth-core/internal'
 import type { PoolAccountSource } from './pool-account-source'
 import { windowsFromQuotaMap } from './pool-quota'
@@ -96,7 +100,11 @@ export interface PoolTarget {
   row?: PoolRow
 }
 
-/** The vault accounts, as a request routes them (see `OpenAiVault`). */
+/**
+ * The vault accounts, as a request routes them (see `OpenAiVault`). Present
+ * exactly while this host is in vault mode; the request then routes over
+ * these accounts and nothing else.
+ */
 export interface PoolVaultRoutes {
   /** The vault accounts that may route now. */
   routes(): ReadonlyArray<{
@@ -105,8 +113,16 @@ export interface PoolVaultRoutes {
     identity?: string
     quota?: unknown
   }>
-  /** Every ChatGPT account the vault holds for this host. */
-  identities(): ReadonlySet<string>
+  /**
+   * Waits for the vault's first account list in this process, for a bounded
+   * time, and returns either way. Never rejects.
+   */
+  awaitRoster(): Promise<void>
+  /**
+   * Why no vault account could be tried: the vault has not listed its
+   * accounts (unreachable), or it lists none that may serve (empty).
+   */
+  noRouteCause(): 'vault-unreachable' | 'vault-empty'
   /**
    * Sends on a vault account with the token the vault serves for this
    * attempt; undefined when the vault refused before anything was sent.
@@ -128,12 +144,12 @@ export interface PoolVaultRoutes {
 export type NoCredentialCause =
   | 'no-accounts'
   | 'unusable'
-  | 'vault-refused'
   | 'missing-main'
+  | VaultModeRefusal
 
 // Keep these texts unchanged: OpenCode decides whether to retry a failed
 // request by matching the error message, so a reworded message could change
-// whether it retries.
+// whether it retries. The vault-mode texts are shared with the other hosts.
 export const LOCAL_CREDENTIAL_REFUSALS: Record<NoCredentialCause, string> = {
   'missing-main':
     'Request refused locally: this setup has no main login in its account store. Sign in with opencode auth login.',
@@ -141,13 +157,19 @@ export const LOCAL_CREDENTIAL_REFUSALS: Record<NoCredentialCause, string> = {
     'Request refused locally: no eligible account is configured. Sign in with opencode auth login.',
   unusable:
     'Request refused locally: no usable account credential. Sign in with opencode auth login.',
-  'vault-refused':
-    'Request refused locally: the credential vault did not authorize an account. Check the vault and its host enrollment.',
+  ...VAULT_MODE_REFUSALS,
+}
+
+/** Whether a refusal cause is one of vault mode's. */
+export function isVaultModeRefusal(
+  cause: NoCredentialCause | undefined,
+): cause is VaultModeRefusal {
+  return cause !== undefined && cause in VAULT_MODE_REFUSALS
 }
 
 export interface PoolRequestContext {
   source: PoolAccountSource
-  /** The vault accounts; absent while this host has none. */
+  /** The vault accounts; present exactly while this host is in vault mode. */
   vault?: PoolVaultRoutes
   /** The legacy settings this request reads (routing, killswitch, fallback statuses). */
   storage: AccountStorage | null
@@ -203,7 +225,8 @@ export interface PoolRequestResult {
  * (`quota.minimumRemaining`, `failClosedOnUnknownQuota`) and must not be the
  * shielded copy of a main credential still in the slot, exactly as a fallback
  * had to. API-key rows are left out: the request path has never sent with
- * one.
+ * one. Outside vault mode `vaultIdentities` is empty; callers in vault mode
+ * route no pool row at all.
  */
 export function routableRows(
   rows: readonly PoolRow[],
@@ -228,15 +251,16 @@ export function routableRows(
   })
 }
 
-/** The accounts one request may be sent with now: the routable pool rows, then the vault's. */
+/**
+ * The accounts one request may be sent with now. In vault mode these are the
+ * vault's accounts alone, and the pool rows are not even read; otherwise the
+ * routable pool rows.
+ */
 function currentTargets(ctx: PoolRequestContext): PoolTarget[] {
-  const vaultIdentities = ctx.vault?.identities() ?? new Set<string>()
-  const rows = routableRows(
-    ctx.source.peek().rows,
-    ctx.storage,
-    ctx.now(),
-    vaultIdentities,
-  )
+  const vault = ctx.vault
+  const rows = vault
+    ? []
+    : routableRows(ctx.source.peek().rows, ctx.storage, ctx.now())
   return [
     ...rows.map(
       (row): PoolTarget => ({
@@ -247,7 +271,7 @@ function currentTargets(ctx: PoolRequestContext): PoolTarget[] {
         row,
       }),
     ),
-    ...(ctx.vault?.routes() ?? [])
+    ...(vault?.routes() ?? [])
       .filter((route) =>
         quotaSnapshotPassesPolicy(
           windowsFromQuotaMap(route.quota),
@@ -355,8 +379,14 @@ async function sendTo(
 export async function servePoolRequest(
   ctx: PoolRequestContext,
 ): Promise<PoolRequestResult> {
-  await ctx.source.current()
-  await ctx.source.prepareTokens(ctx.source.peek().rows, ctx.storage)
+  if (ctx.vault) {
+    // Vault mode: no pool row is read or refreshed. Before the vault's first
+    // account list there is nothing to route, so that is waited for (bounded).
+    await ctx.vault.awaitRoster()
+  } else {
+    await ctx.source.current()
+    await ctx.source.prepareTokens(ctx.source.peek().rows, ctx.storage)
+  }
   const rows = currentTargets(ctx)
 
   if (
@@ -390,7 +420,13 @@ async function serveOrdered(
       response: ctx.blocked(
         plan.block,
         blockQuotas(rows),
-        rows.length === 0 ? 'no-accounts' : 'unusable',
+        ctx.vault
+          ? rows.length === 0
+            ? ctx.vault.noRouteCause()
+            : 'vault-empty'
+          : rows.length === 0
+            ? 'no-accounts'
+            : 'unusable',
       ),
       servedId: FORMER_MAIN_ID,
     }
@@ -454,7 +490,7 @@ async function serveOrdered(
     response: ctx.blocked(
       { reason: 'no-credential' },
       blockQuotas(rows),
-      vaultRefused ? 'vault-refused' : 'unusable',
+      vaultRefused ? 'vault-refused' : ctx.vault ? 'vault-empty' : 'unusable',
     ),
     servedId: FORMER_MAIN_ID,
   }

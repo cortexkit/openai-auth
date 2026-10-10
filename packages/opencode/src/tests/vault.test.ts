@@ -2,10 +2,11 @@
 // a socket to a mock daemon (`mock-claustrum.ts` in the core tests), the
 // plugin loaded on a migrated install, and a fake network for OpenAI.
 //
-// Enrollment through `opencode auth login`, vault accounts routed beside the
-// pool rows in each routing mode, a served 401 reported to the vault, the
-// declined-account interlock, one owner per ChatGPT account, the host-slot
-// guard, and what an install still holds from the removed handle-mode
+// Enrollment through `opencode auth login`, vault mode (only the vault's
+// accounts serve, in each routing mode; no local account is used, refreshed,
+// polled or warmed, and the local files stay as they are), a served 401
+// reported to the vault, the declined-account interlock, the vault-mode
+// sidebar, and what an install still holds from the removed handle-mode
 // custody.
 import { afterEach, beforeEach, describe, expect, spyOn } from 'bun:test'
 import {
@@ -30,6 +31,7 @@ import {
   loadAccounts,
   mutateAccounts,
   OpenAiVault,
+  VAULT_MODE_REFUSALS,
   vaultPaths,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks } from '@opencode-ai/plugin'
@@ -44,11 +46,13 @@ import { authDoctorChecks, readStoreIds } from '../auth/doctor'
 import { createAuthMethods } from '../auth/methods'
 import { applyOpenAiMenu } from '../commands'
 import type { OpenAICacheKeepManager } from '../core/cachekeep'
+import { PoolAccountSource } from '../core/pool-account-source'
 import { __menuContextForTest } from '../index.ts'
 import {
   DEFAULT_SIDEBAR_STATE,
   getSidebarState,
   hashSidebarSessionId,
+  resolveSessionSidebarRouting,
   setSidebarState,
 } from '../sidebar-state'
 import {
@@ -62,7 +66,6 @@ import {
   seedPool,
   usageBody,
   type Wire,
-  waitFor,
 } from './fixtures/pool-install'
 
 /** The network, with the main row's quota polls reading it exhausted. */
@@ -179,8 +182,13 @@ async function plugin(
 
 describe('OpenCode 1 vault stream admission', () => {
   for (const signal of ['limit', 'quota'] as const) {
+    // In vault mode the healthy account is the other vault account; the
+    // local row `main` never serves.
     test(`a vault WebSocket ${signal} signal sends the next request to a healthy account`, async () => {
-      await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
+      await startDaemon({
+        'oauth:openai:vault': vaultLogin('chatgpt-vault'),
+        'oauth:openai:other': vaultLogin('chatgpt-other'),
+      })
       enroll()
       seedPool(files, [{ id: 'main', quota: quotaMap(10) }], {
         routing: { mode: 'fallback-first' },
@@ -216,7 +224,8 @@ describe('OpenCode 1 vault stream admission', () => {
               return
             }
             sent.push(ws.data.bearer)
-            if (ws.data.bearer === `Bearer ${VAULT_ACCESS}`) {
+            // The first account asked gets the signal.
+            if (ws.data.bearer === sent[0]) {
               ws.send(
                 JSON.stringify(
                   signal === 'limit'
@@ -281,7 +290,14 @@ describe('OpenCode 1 vault stream admission', () => {
         }
         const second = await request(loaded.fetch, 'vault-stream', true)
         await second.text().catch(() => {})
-        expect(sent).toEqual([`Bearer ${VAULT_ACCESS}`, 'Bearer main-token'])
+        const vaultBearers: Array<string | undefined> = [
+          `Bearer ${VAULT_ACCESS}`,
+          `Bearer ${chatgptAccessToken('chatgpt-other')}`,
+        ]
+        expect(sent).toHaveLength(2)
+        expect(vaultBearers).toContain(sent[0])
+        expect(vaultBearers).toContain(sent[1])
+        expect(sent[1]).not.toBe(sent[0])
         spy.mockRestore()
       } finally {
         await hooks?.dispose?.()
@@ -445,9 +461,7 @@ describe('migrated credential refusal messages', () => {
     const response = await request(send)
     expect(response.status).toBe(401)
     const message = await response.text()
-    expect(message).toBe(
-      'Request refused locally: the credential vault did not authorize an account. Check the vault and its host enrollment.',
-    )
+    expect(message).toBe(VAULT_MODE_REFUSALS['vault-refused'])
     terminal(message)
     expect(wire.sends).toEqual([])
   })
@@ -549,7 +563,9 @@ describe('vault cachekeep', () => {
         record_version: recordVersion,
       }),
     })
-    enroll()
+    // A local warm is captured before this host connects to the vault: in
+    // vault mode no local account serves, so none is captured.
+    if (!local) enroll()
     seedPool(files, [{ id: 'main', quota: quotaMap(local ? 10 : 100) }], {
       routing: { mode: local ? 'main-first' : 'sticky-balanced' },
       cachekeep: { enabled: true },
@@ -882,6 +898,31 @@ describe('vault cachekeep', () => {
       Date.now(),
     )
   })
+
+  test('in vault mode a local target captured before connecting is never warmed: nothing is sent or refreshed', async () => {
+    const { running, manager, sends, makeDue, wire } = await trackedWarm(
+      7,
+      true,
+    )
+    enroll()
+    const gets = running.gets.length
+    // No local token is even looked up for the warm.
+    const access = spyOn(PoolAccountSource.prototype, 'accessFor')
+    makeDue()
+    try {
+      await manager.tick()
+      expect(access).not.toHaveBeenCalled()
+    } finally {
+      access.mockRestore()
+    }
+    expect(sends).toHaveLength(1)
+    expect(wire.refreshTokens).toEqual([])
+    expect(running.gets.length).toBe(gets)
+    expect(running.reports).toEqual([])
+    expect(manager.status().targets[0]?.backoffUntil).toBeGreaterThan(
+      Date.now(),
+    )
+  })
 })
 
 /** A terminal that types `keys` into the menu and records what it prints. */
@@ -926,6 +967,8 @@ function scriptedTerminal(keys: string[]) {
 }
 
 const DOWN = '\u001b[B'
+const LOCAL_NOTE =
+  'Local accounts are not used while this host is connected to the vault.'
 const ENTER = '\r'
 
 describe('enrollment', () => {
@@ -1117,7 +1160,7 @@ describe('auth account menu with vault accounts', () => {
     return { vault, running }
   }
 
-  test('auth menu header lists vault accounts and marks shadowed local rows', async () => {
+  test('auth menu header in vault mode lists only vault accounts, with no local row', async () => {
     const { vault } = await setup()
     try {
       const printed = await menu(['\u001b'], vault)
@@ -1126,19 +1169,17 @@ describe('auth account menu with vault accounts', () => {
           `Vault ${row.label}: ${row.enabled ? 'enabled' : 'declined'}`,
         )
       }
-      expect(printed).toContain(
-        'main: main, enabled, set aside (the vault serves this account)',
-      )
-      expect(printed).toContain(
-        'ufuk: ufuk, enabled, set aside (the vault serves this account)',
-      )
-      expect(printed).toContain('local: local, enabled')
+      expect(printed).toContain(LOCAL_NOTE)
+      expect(printed).not.toContain('main: main')
+      expect(printed).not.toContain('ufuk: ufuk')
+      expect(printed).not.toContain('local: local')
+      expect(printed).not.toContain('set aside')
     } finally {
       vault.close()
     }
   })
 
-  test('auth menu Check quotas polls vault accounts into roster and skips shadowed locals', async () => {
+  test('auth menu Check quotas in vault mode polls only vault accounts and no local row', async () => {
     const wire = installWire({
       usage: () => new Response(usageBody(37), { status: 200 }),
     })
@@ -1150,11 +1191,11 @@ describe('auth account menu with vault accounts', () => {
       const printed = await menu([...Array(4).fill(DOWN), ENTER], vault)
       expect(wire.polls.sort()).toEqual(
         [
-          'Bearer local-token',
           `Bearer ${chatgptAccessToken('chatgpt-main')}`,
           `Bearer ${chatgptAccessToken('chatgpt-work')}`,
         ].sort(),
       )
+      expect(printed).not.toContain('local: local')
       expect(running.gets.length - gets).toBe(2)
       for (const row of vault.snapshot()?.rows ?? []) {
         expect(printed).toContain(`Vault ${row.label}:`)
@@ -1193,7 +1234,9 @@ describe('auth account menu with vault accounts', () => {
       const printed = await menu([...Array(4).fill(DOWN), ENTER], offline)
       offline.close()
       expect(printed).toContain('Claustrum vault unreachable:')
-      expect(printed).toContain('local: local, enabled')
+      // Still vault mode: the local rows are neither listed nor polled.
+      expect(printed).toContain(LOCAL_NOTE)
+      expect(printed).not.toContain('local: local')
     } finally {
       vault.close()
     }
@@ -1288,9 +1331,9 @@ describe('routing', () => {
 
     await request(send)
 
-    // The vault account was tried first and answered 401 (fallback-first
-    // then tries main, whose answer the request returns).
-    expect(wire.sends[0]).toBe(`Bearer ${VAULT_ACCESS}`)
+    // The vault account answered 401. In vault mode no local row is tried
+    // after it, so its answer is the request's.
+    expect(wire.sends).toEqual([`Bearer ${VAULT_ACCESS}`])
     expect(running.reports).toEqual([
       {
         credential_id: 'oauth:openai:vault',
@@ -1308,7 +1351,7 @@ describe('routing', () => {
     expect(wire.sends.slice(sent)).not.toContain(`Bearer ${VAULT_ACCESS}`)
   })
 
-  test('a vault account disabled in the Vault section never routes, and is never read from the vault', async () => {
+  test('a vault account disabled in the Vault section never routes, and is never read from the vault; no local row serves in its place', async () => {
     await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
     enroll()
     seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
@@ -1332,8 +1375,9 @@ describe('routing', () => {
     const send = await fetchOverride()
     const gets = daemon?.gets.length ?? 0
     const response = await request(send)
-    expect(response.status).toBe(200)
-    expect(wire.sends).toEqual(['Bearer main-token'])
+    expect(response.status).toBe(401)
+    expect(await response.text()).toBe(VAULT_MODE_REFUSALS['vault-empty'])
+    expect(wire.sends).toEqual([])
     expect(daemon?.gets.length).toBe(gets)
     // Still listed, and disabled.
     expect(vault.snapshot()?.rows.map((row) => row.enabled)).toEqual([false])
@@ -1361,10 +1405,10 @@ describe('routing', () => {
     expect(wire.sends).not.toContain('Bearer alpha-token')
   })
 
-  // The pool source polls every row once when it first reads the pool. Those
-  // polls must wait until the vault has read which accounts it holds, or the
-  // local copy of a vault account is polled with its own token at startup.
-  test('a pool row signing in as an account the vault holds is not polled at startup', async () => {
+  // The pool source polls every row once when it first reads the pool. In
+  // vault mode it polls none, not even while the vault's first account list
+  // is still on its way.
+  test('in vault mode no pool row is polled at startup, whether or not the vault holds its account', async () => {
     const running = await startDaemon({
       'oauth:openai:alpha': vaultLogin('chatgpt-alpha'),
     })
@@ -1430,21 +1474,20 @@ describe('routing', () => {
     await new Promise<void>((resolve) => setImmediate(resolve))
     await scope.settlePluginWork()
     roster.resolve()
-    await waitFor(
-      () => (wire.polls.includes('Bearer main-token') ? true : undefined),
-      'the first quota poll of row main',
-    )
-    // Row main reaching the wire does not prove another row's queued pull
-    // finished. Drain the actual stores before asserting alpha was not polled.
+    await __menuContextForTest()?.vault?.firstRoster()
     await scope.settlePluginWork()
     await prior.dispose?.()
     expect(wire.polls).not.toContain('Bearer alpha-token')
+    expect(wire.polls).not.toContain('Bearer main-token')
   })
 
-  test('a vault daemon that never answers holds neither the loader nor, past a bounded wait, a pool request', async () => {
+  test('a vault daemon that never answers holds neither the loader nor, past a bounded wait, a request, which is refused with nothing sent or refreshed', async () => {
     await startDaemon({ 'oauth:openai:alpha': vaultLogin('chatgpt-alpha') })
     enroll()
-    seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+    // The local main row's token has run out: a local refresh would show.
+    seedPool(files, [
+      { id: 'main', quota: quotaMap(10), expires: Date.now() - HOUR },
+    ])
     const wire = installWire()
     const loading = Date.now()
     hooks = await loadPlugin({
@@ -1461,9 +1504,14 @@ describe('routing', () => {
     const sending = Date.now()
     const response = await request(send)
 
-    expect(response.status).toBe(200)
-    expect(wire.sends).toEqual(['Bearer main-token'])
-    // The request's token step waited for the roster, but only up to
+    expect(response.status).toBe(401)
+    expect(await response.text()).toBe(VAULT_MODE_REFUSALS['vault-unreachable'])
+    expect(wire.sends).toEqual([])
+    // Only this test's local row is checked: a loader another test left
+    // running may still poll its own accounts through the shared fetch.
+    expect(wire.refreshTokens).not.toContain('main-refresh')
+    expect(wire.polls).not.toContain('Bearer main-token')
+    // The request waited for the vault's first account list, but only up to
     // VAULT_FIRST_ROSTER_WAIT_MS (2 s).
     expect(Date.now() - sending).toBeGreaterThanOrEqual(1_900)
     expect(Date.now() - sending).toBeLessThan(4_000)
@@ -1520,7 +1568,7 @@ describe('routing', () => {
     },
   )
 
-  test('in an ordered mode, a vault account the vault will not serve passes the request to the next account', async () => {
+  test('in vault mode a vault account the vault will not serve is not replaced by a local row: the request is refused', async () => {
     const running = await startDaemon({
       'oauth:openai:vault': vaultLogin('chatgpt-vault'),
     })
@@ -1539,11 +1587,12 @@ describe('routing', () => {
 
     const response = await request(send)
 
-    expect(response.status).toBe(200)
+    expect(response.status).toBe(401)
+    expect(await response.text()).toBe(VAULT_MODE_REFUSALS['vault-refused'])
     expect(running.gets.slice(gets).map((get) => get.credential_id)).toContain(
       'oauth:openai:vault',
     )
-    expect(wire.sends).toEqual(['Bearer main-token'])
+    expect(wire.sends).toEqual([])
   })
 
   test('in an ordered mode, a refused vault account passes the request to another vault account', async () => {
@@ -1573,8 +1622,109 @@ describe('routing', () => {
   })
 })
 
+describe('vault mode', () => {
+  test('a vault-mode session makes no local refresh or poll, serves only from the vault, and leaves the local files byte-identical', async () => {
+    await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
+    enroll()
+    // Two local rows the vault does not hold, both with run-out tokens: a
+    // local refresh or poll would show on the wire. Fallback-first would put
+    // `spare` first if it could route.
+    seedPool(
+      files,
+      [
+        { id: 'main', quota: quotaMap(10), expires: Date.now() - HOUR },
+        { id: 'spare', quota: quotaMap(5), expires: Date.now() - HOUR },
+      ],
+      { routing: { mode: 'fallback-first' } },
+    )
+    const config = readFileSync(files.configFile, 'utf8')
+    const state = readFileSync(files.stateFile, 'utf8')
+    const wire = installWire()
+    await plugin()
+    const send = await fetchOverride()
+
+    for (const session of ['vault-mode', undefined, 'vault-mode']) {
+      const response = await request(send, session)
+      expect(response.status).toBe(200)
+    }
+    const ctx = __menuContextForTest()
+    if (!ctx) throw new Error('no menu context')
+    const checked = await applyOpenAiMenu(ctx, {
+      command: 'openai',
+      sectionId: 'quota',
+      actionId: 'check',
+      values: { account: '*' },
+    })
+    expect(checked.ok).toBe(true)
+    await scope.settlePluginWork()
+
+    expect(wire.sends).toEqual(Array(3).fill(`Bearer ${VAULT_ACCESS}`))
+    expect(wire.refreshTokens).toEqual([])
+    // The quota check polled the vault account, and no local row.
+    expect(wire.polls).toContain(`Bearer ${VAULT_ACCESS}`)
+    expect(wire.polls).not.toContain('Bearer main-token')
+    expect(wire.polls).not.toContain('Bearer spare-token')
+    expect(readFileSync(files.configFile, 'utf8')).toBe(config)
+    expect(readFileSync(files.stateFile, 'utf8')).toBe(state)
+  })
+
+  test('the sidebar file in vault mode lists the vault accounts and no local row, with the serving one active', async () => {
+    const sidebarFile = join(dir, 'sidebar.json')
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = sidebarFile
+    await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
+    enroll()
+    seedPool(files, [
+      { id: 'main', quota: quotaMap(10) },
+      { id: 'spare', quota: quotaMap(5) },
+    ])
+    installWire()
+    const { vault } = await plugin()
+    const send = await fetchOverride()
+    expect((await request(send, 'sidebar-session')).status).toBe(200)
+    await scope.settlePluginWork()
+    const route = vault.routes()[0]
+    const row = vault.snapshot()?.rows[0]
+    if (!route || !row) throw new Error('no vault account')
+
+    const stateNow = await getSidebarState(sidebarFile)
+
+    expect(stateNow.vaultAccounts?.map((account) => account.id)).toEqual([
+      route.id,
+    ])
+    expect(stateNow.vaultAccounts?.[0]?.label).toBe(row.email || row.label)
+    expect(stateNow.vaultAccounts?.[0]?.quota).not.toBeNull()
+    // The fields an older sidebar reads carry no local account.
+    expect(stateNow.fallbacks).toEqual([])
+    expect(stateNow.main.quota).toBeNull()
+    expect(stateNow.main.mainAccountId).toBeUndefined()
+    expect(JSON.stringify(stateNow)).not.toContain('chatgpt-spare')
+    expect(
+      resolveSessionSidebarRouting(stateNow, 'sidebar-session').activeId,
+    ).toBe(route.id)
+  })
+
+  test('disconnecting from the vault restores local routing at once', async () => {
+    await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
+    enroll()
+    seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+    const wire = installWire()
+    const { vault } = await plugin()
+    const send = await fetchOverride()
+    await request(send)
+    expect(wire.sends).toEqual([`Bearer ${VAULT_ACCESS}`])
+
+    await vault.disconnect()
+    const response = await request(send)
+
+    expect(response.status).toBe(200)
+    expect(wire.sends).toEqual([`Bearer ${VAULT_ACCESS}`, 'Bearer main-token'])
+  })
+})
+
 describe('the host slot', () => {
-  test('a real login in the slot is refused while the vault serves this host its accounts', async () => {
+  // OpenCode's slot is not a candidate in vault mode: a real login there is
+  // neither sent with, refreshed nor allowed to refuse the request.
+  test('in vault mode a real login in the slot is ignored and the vault serves', async () => {
     await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
     enroll()
     seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
@@ -1593,10 +1743,11 @@ describe('the host slot', () => {
       {} as never,
     )) as { fetch: typeof globalThis.fetch }
 
-    await expect(request(send)).rejects.toThrow(
-      'refusing to serve until one is removed',
-    )
-    expect(wire.sends).toEqual([])
+    const response = await request(send)
+
+    expect(response.status).toBe(200)
+    expect(wire.sends).toEqual([`Bearer ${VAULT_ACCESS}`])
+    expect(wire.refreshTokens).toEqual([])
   })
 })
 
@@ -1685,9 +1836,7 @@ describe('what the handle-mode custody left behind', () => {
     const response = await request(send)
 
     expect(response.status).toBe(200)
-    // Vault accounts are routed only by the request path of a migrated
-    // install (the pool path); the path for a real login in the slot never
-    // sends with them.
+    // In vault mode only the vault's accounts serve.
     expect(wire.sends).toEqual([`Bearer ${VAULT_ACCESS}`])
   })
 

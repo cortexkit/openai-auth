@@ -182,6 +182,8 @@ describe('OpenCode 2 never sends without the account credential', () => {
       vault: {
         routes: () => [],
         identities: () => new Set<string>(),
+        enrolled: () => true,
+        snapshot: () => undefined,
         authorize: async () => undefined,
         reportFailure: async () => {},
         recordSnapshot: async () => {},

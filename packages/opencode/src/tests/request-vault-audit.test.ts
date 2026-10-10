@@ -154,7 +154,8 @@ describe('vault quota floor', () => {
         { id: 'low', kind: 'oauth', quota: quotaMap(90) },
         { id: 'healthy', kind: 'oauth', quota: quotaMap(10) },
       ],
-      identities: () => new Set(),
+      awaitRoster: async () => {},
+      noRouteCause: () => 'vault-empty',
       requestReading: () => {},
       send: async (id, dispatch) => dispatch(id, {} as never),
     }
@@ -176,6 +177,8 @@ describe('vault quota floor', () => {
           { id: 'healthy', kind: 'oauth', quota: quotaMap(10) },
         ],
         identities: () => new Set(),
+        enrolled: () => true,
+        snapshot: () => undefined,
         requestReading: () => {},
         authorize: async (id: string) => ({ accessToken: id }),
         recordSnapshot: async () => {},

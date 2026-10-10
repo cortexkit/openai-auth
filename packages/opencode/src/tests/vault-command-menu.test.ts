@@ -146,20 +146,17 @@ describe('vault command menu', () => {
       expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.11.8')
     }
   })
-  test('accounts name the vault owner and exclude set-aside locals from routing count', async () => {
+  // Vault mode is exclusive: while connected, the vault's accounts are the
+  // only ones listed, and no local row appears, set aside or otherwise.
+  test('in vault mode accounts list only the vault accounts', async () => {
     const accounts = (await sections()).find(
       (section) => section.id === 'accounts',
     )!
-    expect(accounts.lines.join('\n')).toContain(
-      '3 account(s) can route, 2 local row(s) set aside.',
-    )
-    expect(accounts.items.map((item) => item.id)).toEqual([
-      'main',
-      'ufuk',
-      ...roster.map((row) => row.routeId),
+    expect(accounts.lines).toEqual([
+      '3 vault account(s) can route. Local accounts are not used while this host is connected to the vault.',
     ])
-    expect(accounts.items.find((item) => item.id === 'main')?.detail).toContain(
-      'set aside (served by vault beatricelau0414@gmail.com)',
+    expect(accounts.items.map((item) => item.id)).toEqual(
+      roster.map((row) => row.routeId),
     )
     expect(
       accounts.items.find((item) => item.id === roster[2]!.routeId)?.detail,
@@ -169,46 +166,46 @@ describe('vault command menu', () => {
     const menu = await sections()
     const accounts = menu.find((section) => section.id === 'accounts')!
     const quota = menu.find((section) => section.id === 'quota')!
-    expect(quota.items.map((item) => item.id)).toEqual([
-      'main',
-      'ufuk',
-      ...roster.map((row) => row.routeId),
-    ])
+    expect(quota.items.map((item) => item.id)).toEqual(
+      roster.map((row) => row.routeId),
+    )
     for (const section of [accounts, quota]) {
-      expect(
-        section.items.find((item) => item.id === 'main')?.detail,
-      ).toContain('quota read 3d ago')
       expect(
         section.items.find((item) => item.id === roster[0]!.routeId)?.detail,
       ).toContain('quota read 3d ago')
       expect(
-        section.items.find((item) => item.id === 'ufuk')?.detail,
+        section.items.find((item) => item.id === roster[1]!.routeId)?.detail,
       ).not.toContain('ago')
     }
   })
   test('a reading older than fifteen minutes is never displayed as current', async () => {
     const quota = (await sections()).find((section) => section.id === 'quota')!
-    expect(quota.items.find((item) => item.id === 'main')?.detail).toContain(
-      'quota read 3d ago',
-    )
-  })
-  test('an unlabelled local is named by its roster id when connected', async () => {
     expect(
-      (await sections()).find((section) => section.id === 'accounts')?.items[0]
-        ?.label,
-    ).toBe('main')
+      quota.items.find((item) => item.id === roster[0]!.routeId)?.detail,
+    ).toContain('quota read 3d ago')
   })
-  test('cold and declined vault accounts still shadow locals but are not counted', async () => {
+  test('in vault mode no local row is listed in Accounts, Quota or Limits', async () => {
+    const menu = await sections()
+    for (const id of ['accounts', 'quota', 'limits']) {
+      const ids = menu
+        .find((section) => section.id === id)
+        ?.items.map((item) => item.id)
+      expect(ids).toEqual(roster.map((row) => row.routeId))
+      expect(ids).not.toContain('main')
+      expect(ids).not.toContain('ufuk')
+    }
+  })
+  test('cold and declined vault accounts are listed but not counted as routable', async () => {
     roster[0]!.state = 'needs_login'
     roster[1]!.enabled = false
     const accounts = (await sections()).find(
       (section) => section.id === 'accounts',
     )!
-    expect(accounts.lines.join('\n')).toContain(
-      '1 account(s) can route, 2 local row(s) set aside.',
-    )
-    expect(accounts.items.find((item) => item.id === 'ufuk')?.detail).toContain(
-      'served by vault gmail',
+    expect(accounts.lines).toEqual([
+      '1 vault account(s) can route. Local accounts are not used while this host is connected to the vault.',
+    ])
+    expect(accounts.items.map((item) => item.id)).toEqual(
+      roster.map((row) => row.routeId),
     )
   })
   test('quota checks use vault polls and never select set-aside local credentials', async () => {
@@ -252,10 +249,15 @@ describe('vault command menu', () => {
     expect(readFileSync(files.stateFile, 'utf8')).toBe(before)
   })
   test('reset labels set-aside locals without admitting vault accounts', async () => {
+    roster = roster.filter((row) => row.accountIdentity !== 'chatgpt-ufuk')
     const reset = (await sections()).find((section) => section.id === 'reset')!
     expect(reset.items.map((item) => item.id)).toEqual(['main', 'ufuk'])
     expect(reset.items[0]?.label).toContain(
       'set aside (served by vault beatricelau0414@gmail.com)',
+    )
+    // In vault mode a local row the vault does not hold is set aside too.
+    expect(reset.items[1]?.label).toContain(
+      'set aside (this host uses only its vault accounts)',
     )
   })
   test('disconnected output is byte-identical apart from unlabelled row names', async () => {
@@ -328,48 +330,32 @@ Open the OpenCode TUI to change these settings.`)
       (await sections(false)).map((section) => section.id),
     )
   })
-  test('an unshadowed local keeps its management actions and counts beside vault accounts', async () => {
+  test('in vault mode a local row the vault does not hold is neither listed, counted nor offered for a quota check', async () => {
     roster = roster.filter((row) => row.accountIdentity !== 'chatgpt-ufuk')
-    const accounts = (await sections()).find(
-      (section) => section.id === 'accounts',
-    )!
-    const local = accounts.items.find((item) => item.id === 'ufuk')!
+    const menu = await sections()
+    const accounts = menu.find((section) => section.id === 'accounts')!
+    expect(accounts.items.map((item) => item.id)).not.toContain('ufuk')
     expect(accounts.lines).toEqual([
-      '3 account(s) can route, 1 local row(s) set aside.',
+      '2 vault account(s) can route. Local accounts are not used while this host is connected to the vault.',
     ])
-    expect(local.label).toBe('ufuk')
-    expect(local.detail).toBe(
-      'OAuth · enabled · chatgpt-ufuk · primary 15% left',
-    )
-    expect(local.actions.map((action) => action.id)).toEqual([
-      'disable',
-      'move',
-      'remove',
-    ])
-    const result = await createOpenCodeMenu(context()).apply(
-      {
-        command: 'openai',
-        sectionId: 'accounts',
-        itemId: 'ufuk',
-        actionId: 'move',
-        values: { position: '1' },
-      },
-      invocation,
-    )
-    expect(result.ok).toBe(true)
-    expect(
-      (readJson(files.configFile).accounts as Array<{ id: string }>).map(
-        (row) => row.id,
-      ),
-    ).toEqual(['ufuk', 'main'])
+    const check = menu
+      .find((section) => section.id === 'quota')
+      ?.actions.find((action) => action.id === 'check')
+    const choices = (
+      check?.knobs?.[0] as { choices?: Array<{ value: string }> } | undefined
+    )?.choices?.map((choice) => choice.value)
+    expect(choices).toEqual(['*', ...roster.map((row) => row.routeId)])
   })
-  test('a host-wide check polls each vault account only once beside unshadowed locals', async () => {
+  test("Check now in vault mode polls each vault account once and never runs the host's local quota check", async () => {
     roster = roster.filter((row) => row.accountIdentity !== 'chatgpt-ufuk')
     const ctx = context()
+    let localChecks = 0
     ctx.refreshAllQuota = async () => {
-      for (const row of roster) await ctx.vault!.pollQuota(row.routeId)
+      localChecks++
       return []
     }
+    const config = readFileSync(files.configFile, 'utf8')
+    const state = readFileSync(files.stateFile, 'utf8')
     const result = await createOpenCodeMenu(ctx).apply(
       {
         command: 'openai',
@@ -381,6 +367,9 @@ Open the OpenCode TUI to change these settings.`)
     )
     expect(result.ok).toBe(true)
     expect(polls).toEqual(roster.map((row) => row.routeId))
+    expect(localChecks).toBe(0)
+    expect(readFileSync(files.configFile, 'utf8')).toBe(config)
+    expect(readFileSync(files.stateFile, 'utf8')).toBe(state)
   })
   test('stale age includes the oldest reading even when another window is fresh', async () => {
     roster[0]!.quota!.limits.push({

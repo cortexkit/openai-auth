@@ -18,11 +18,11 @@ import {
 import { isRecord } from './util/record'
 import {
   isVaultMenuConnected,
-  isVaultShadowed,
   type MenuVault,
   quotaReadingAge,
   readVaultMenu,
   setAsideDetail,
+  VAULT_MODE_LOCAL_NOTE,
   vaultAccountName,
 } from './vault-account-menu'
 
@@ -74,11 +74,7 @@ function forwardAction(
  * used) are plugin settings under `killswitch.accounts`, keyed by the vault
  * route id, which is the key the request path reads them by.
  */
-export function menuStore(
-  store: PoolStore,
-  vault?: MenuVault,
-  includeVaultRows = true,
-): PoolStore {
+export function menuStore(store: PoolStore, vault?: MenuVault): PoolStore {
   return new Proxy(store, {
     get(target, key) {
       if (key === 'read')
@@ -95,9 +91,10 @@ export function menuStore(
           if (!vault) return named
           const view = await readVaultMenu(vault)
           if (!isVaultMenuConnected(view)) return named
+          // Connected (vault mode): the vault's accounts replace the local
+          // rows; only they serve this host.
           const rows: PoolRow[] = [
-            ...named.rows,
-            ...(includeVaultRows ? view.status.accounts : []).map(
+            ...view.status.accounts.map(
               (row): PoolRow => ({
                 id: row.routeId,
                 label: vaultAccountName(row),
@@ -145,7 +142,6 @@ export function menuStore(
 export function createVaultCommandMenu(
   options: CommandMenuOptions & { store: PoolStore },
   vault: MenuVault,
-  quotaCheckIncludesVault = false,
 ): CommandMenu {
   const localMenu = createCommandMenu(options)
   const projection = createCommandMenu({
@@ -159,46 +155,40 @@ export function createVaultCommandMenu(
     ...(options.extraLocks ? { extraLocks: options.extraLocks } : {}),
     ...(options.now ? { now: options.now } : {}),
   })
-  // Account management must use only the real roster: move/reorder cannot name a vault route.
-  const localActions = createCommandMenu({
-    command: options.command,
-    title: options.title,
-    store: menuStore(options.store, vault, false),
-    accounts: options.accounts,
-    ...(options.extraLocks ? { extraLocks: options.extraLocks } : {}),
-  })
   const build = async (
     slot: StoreSectionSlot,
     invocation: CommandInvocation,
   ): Promise<SectionContent> => {
     const view = await readVaultMenu(vault)
+    // Connected means vault mode: the projection lists the vault's accounts
+    // alone, and no local row is shown, set aside or polled.
     const connected = isVaultMenuConnected(view)
     const source = connected ? projection : localMenu
     const model = (await source.open(invocation)).menu
-    const localAccounts =
-      slot === 'accounts' && connected
-        ? (await localActions.open(invocation)).menu.sections.find(
-            (section) => section.id === 'accounts',
-          )?.items
-        : undefined
     const section = model.sections.find((section) => section.id === slot)
     if (!section)
       throw new CommandError('unavailable', 'The account menu is unavailable.')
-    const load = await options.store.read()
-    const rows = load.status === 'ready' ? load.rows : []
-    const byId = new Map(rows.map((row) => [row.id, row]))
+    if (!connected)
+      return {
+        lines: section.lines,
+        items: section.items.map((item: MenuItem) => ({
+          ...item,
+          actions: item.actions.map((action) =>
+            forwardAction(source, slot, action, item.id),
+          ),
+        })),
+        actions: section.actions.map((action) =>
+          forwardAction(source, slot, action),
+        ),
+      }
     const vaultById = new Map(
       view.status.accounts.map((row) => [row.routeId, row]),
     )
     const now = (options.now ?? Date.now)()
     const items = section.items.map((item: MenuItem) => {
-      const local = byId.get(item.id)
       const remote = vaultById.get(item.id)
-      const aside = connected && local ? setAsideDetail(local, view) : undefined
       const age =
-        connected && slot !== 'limits'
-          ? quotaReadingAge(local?.quota ?? remote?.quota, now)
-          : undefined
+        slot !== 'limits' ? quotaReadingAge(remote?.quota, now) : undefined
       const detail =
         remote && slot === 'accounts'
           ? `Vault · ${remote.credentialType === 'oauth' ? 'login' : 'API key'} · ${remote.state} · ${remote.enabled ? 'enabled' : 'declined'} · ${model.sections.find((section) => section.id === 'quota')?.items.find((quota) => quota.id === item.id)?.detail}`
@@ -206,47 +196,21 @@ export function createVaultCommandMenu(
       return {
         id: item.id,
         label: item.label,
-        detail: [detail, aside, age].filter(Boolean).join(' · '),
+        detail: [detail, age].filter(Boolean).join(' · '),
         ...(item.facts ? { facts: item.facts } : {}),
+        // A vault account is managed in the vault; only its killswitch
+        // floors (Limits) are this plugin's settings.
         actions:
-          (remote && slot !== 'limits') || (aside && slot === 'limits')
+          remote && slot !== 'limits'
             ? []
-            : (
-                localAccounts?.find((local) => local.id === item.id)?.actions ??
-                item.actions
-              ).map((action) =>
-                forwardAction(
-                  localAccounts ? localActions : source,
-                  slot,
-                  action,
-                  item.id,
-                ),
+            : item.actions.map((action) =>
+                forwardAction(source, slot, action, item.id),
               ),
       }
     })
-    if (!connected)
-      return {
-        lines: section.lines,
-        items,
-        actions: section.actions.map((action) =>
-          forwardAction(source, slot, action),
-        ),
-      }
-    const shadowed = rows.filter((row) => isVaultShadowed(row, view)).length
-    const canRoute =
-      view.routes.size +
-      rows.filter(
-        (row) =>
-          row.candidate && row.type === 'oauth' && !isVaultShadowed(row, view),
-      ).length
-    const candidates = [
-      ...rows
-        .filter((row) => row.candidate && !isVaultShadowed(row, view))
-        .map((row) => ({ value: row.id, label: row.label ?? row.id })),
-      ...view.status.accounts
-        .filter((row) => view.routes.has(row.routeId))
-        .map((row) => ({ value: row.routeId, label: vaultAccountName(row) })),
-    ]
+    const candidates = view.status.accounts
+      .filter((row) => view.routes.has(row.routeId))
+      .map((row) => ({ value: row.routeId, label: vaultAccountName(row) }))
     const actions =
       slot === 'quota'
         ? candidates.length === 0
@@ -269,41 +233,15 @@ export function createVaultCommandMenu(
                 ],
                 run: async ({
                   values,
-                  invocation,
                 }: Parameters<ActionDefinition['run']>[0]) => {
-                  // Resolve ownership again at apply time, before asking any local credential for a reading.
+                  // Only vault accounts are polled, through the vault; no
+                  // local credential is asked for a reading.
                   const current = await readVaultMenu(vault)
-                  const latest = await options.store.read()
                   const selected = String(values.account)
-                  const localIds = (
-                    latest.status === 'ready' ? latest.rows : []
-                  )
-                    .filter(
-                      (row) =>
-                        row.candidate &&
-                        !isVaultShadowed(row, current) &&
-                        (selected === '*' || selected === row.id),
-                    )
-                    .map((row) => row.id)
-                  if (localIds.length > 0) {
-                    if (options.quota?.check)
-                      await options.quota.check(localIds, invocation)
-                    else {
-                      for (const id of localIds)
-                        options.store.requestReading(id)
-                      await options.store.pullsSettled()
-                    }
-                  }
                   const vaultIds = [...current.routes].filter(
                     (id) => selected === '*' || selected === id,
                   )
                   for (const id of vaultIds) {
-                    if (
-                      localIds.length > 0 &&
-                      options.quota?.check &&
-                      quotaCheckIncludesVault
-                    )
-                      continue
                     const result = await vault.pollQuota(id)
                     if (!result.ok)
                       throw new CommandError(
@@ -311,16 +249,16 @@ export function createVaultCommandMenu(
                         `${id}: ${result.error ?? 'vault unavailable'}`,
                       )
                   }
-                  return `Checked quota for ${localIds.length + vaultIds.length} account(s).`
+                  return `Checked quota for ${vaultIds.length} account(s).`
                 },
               },
             ]
         : section.actions.map((action) => forwardAction(source, slot, action))
     return {
       lines:
-        slot === 'accounts' && load.status === 'ready'
+        slot === 'accounts'
           ? [
-              `${canRoute} account(s) can route, ${shadowed} local row(s) set aside.`,
+              `${view.routes.size} vault account(s) can route. ${VAULT_MODE_LOCAL_NOTE}`,
             ]
           : section.lines,
       items,

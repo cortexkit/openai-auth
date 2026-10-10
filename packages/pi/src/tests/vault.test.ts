@@ -219,7 +219,9 @@ describe('Pi and the Claustrum vault', () => {
     }
   })
 
-  test('the shared Accounts Quota and Limits slots include vault accounts and set aside their local copy', async () => {
+  // Vault mode is exclusive: the vault's accounts replace the local rows in
+  // the menu, so the local copy of a vault account is not listed at all.
+  test('in vault mode the shared Accounts Quota and Limits slots list only the vault accounts', async () => {
     daemon = await startMockDaemon({
       directory: dir,
       credentials: { 'oauth:openai:work': vaultLogin('chatgpt-work') },
@@ -252,8 +254,7 @@ describe('Pi and the Claustrum vault', () => {
       ])
       for (const id of ['accounts', 'quota', 'limits']) {
         const section = menu.sections.find((section) => section.id === id)!
-        expect(section.items.map((item) => item.id)).toEqual(['local', route])
-        expect(section.items[0]!.detail).toContain('set aside')
+        expect(section.items.map((item) => item.id)).toEqual([route])
       }
       const applied = await command.apply(
         {

@@ -24,13 +24,14 @@
 // rate-limit mark on the row first, so the next `chooseAccount` routes
 // around it.
 //
-// The OpenAI accounts the Claustrum vault serves this host are routed beside
-// the pool rows, through the same admission and modes, by OpenCode 1's rules
-// (`core/pool-request.ts`): a pool row signing in as a ChatGPT account the
-// vault holds is left out, and only ChatGPT logins are admitted, never API
-// keys. A vault account holds no token: when routing picks one, the vault is
-// asked to authorize that one send, and a refusal moves the request to the
-// next account before anything is sent. The receipt (served token and record
+// While this host is enrolled with the Claustrum vault (vault mode), the
+// OpenAI accounts the vault serves it are the only accounts routed, through
+// the same admission and modes, by OpenCode 1's rules (`core/pool-request.ts`):
+// no pool row is read, refreshed or sent with, and only ChatGPT logins are
+// admitted, never API keys. A vault account holds no token: when routing
+// picks one, the vault is asked to authorize that one send, and a refusal
+// moves the request to the next vault account before anything is sent; with
+// none left the request is refused locally with a fixed vault-mode message. The receipt (served token and record
 // version) becomes the attempt's `data`, never a header, and a 401 on that
 // attempt is reported to the vault against that record version.
 
@@ -64,6 +65,9 @@ import {
   quotaSnapshotPassesPolicy,
   type RoutingMode,
   resolveMidStreamRateLimitResetAt,
+  VAULT_MODE_REFUSALS,
+  type VaultModeRefusal,
+  vaultModeNoRouteCause,
 } from '@cortexkit/openai-auth-core/internal'
 import type { PoolAccountSource } from '../core/pool-account-source'
 import { POOL_LOGIN_REQUIRED_MESSAGE } from '../core/pool-main'
@@ -152,6 +156,8 @@ export type VaultAccess = Pick<
   OpenAiVault,
   | 'routes'
   | 'identities'
+  | 'enrolled'
+  | 'snapshot'
   | 'authorize'
   | 'reportFailure'
   | 'recordSnapshot'
@@ -189,8 +195,17 @@ export interface OpenAIAdapterDeps {
   /** The settings a request reads (routing mode, killswitch, quota policy). */
   storage: () => Promise<AccountStorage | null>
   pins: SessionPins
-  /** This host's vault accounts; absent when none are routed. */
+  /**
+   * This host's vault accounts. While it is enrolled (vault mode) they are
+   * the only accounts a request may use: no pool row is read, refreshed or
+   * sent with, and a request no vault account can serve is refused.
+   */
   vault?: VaultAccess
+  /**
+   * Waits, bounded, for the vault's first account list in this process; a
+   * vault-mode request waits for it before choosing. Never rejects.
+   */
+  awaitVaultRoster?: () => Promise<void>
   /** Whether the Responses Lite shape is on (the `responsesLite` setting). */
   responsesLite?: () => boolean
   /** The configured Codex destination, applied only after transport ownership. */
@@ -379,18 +394,22 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
 
   /**
    * The accounts one request may be sent with now: the routable pool rows,
-   * then the vault's ChatGPT logins.
+   * then the vault's ChatGPT logins. In vault mode the vault's logins alone;
+   * the pool rows are not read.
    */
   const currentTargets = (
     storage: AccountStorage | null,
     at: number,
+    vaultMode: boolean,
   ): Target[] => {
-    const rows = routableRows(
-      source.peek().rows,
-      storage,
-      at,
-      vault?.identities() ?? new Set<string>(),
-    )
+    const rows = vaultMode
+      ? []
+      : routableRows(
+          source.peek().rows,
+          storage,
+          at,
+          vault?.identities() ?? new Set<string>(),
+        )
     const routes = (vault?.routes() ?? []).filter(
       (route) =>
         route.kind === 'oauth' &&
@@ -559,7 +578,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     input: ChooseAccountInput,
   ): Promise<string | undefined> => {
     const storage = await deps.storage()
-    const view = await source.current()
+    // Vault mode: only the vault's accounts serve this host.
+    const vaultMode = vault?.enrolled() === true
     const refuseMissingLogin = () => {
       throw new OpenCode2AuthError({
         kind: 'no-account',
@@ -569,17 +589,22 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         message: POOL_LOGIN_REQUIRED_MESSAGE,
       })
     }
-    if (!view.active) {
-      if (await deps.slotPlaceholderWithoutMain?.()) refuseMissingLogin()
-      log?.warn(
-        'the account pool does not serve requests yet; refusing the request',
-        { kind: input.kind },
-      )
-      return undefined
+    if (vaultMode) {
+      await deps.awaitVaultRoster?.()
+    } else {
+      const view = await source.current()
+      if (!view.active) {
+        if (await deps.slotPlaceholderWithoutMain?.()) refuseMissingLogin()
+        log?.warn(
+          'the account pool does not serve requests yet; refusing the request',
+          { kind: input.kind },
+        )
+        return undefined
+      }
+      await source.prepareTokens(source.peek().rows, storage)
     }
-    await source.prepareTokens(source.peek().rows, storage)
     const at = now()
-    const targets = currentTargets(storage, at)
+    const targets = currentTargets(storage, at, vaultMode)
     const byId = new Map(targets.map((target) => [target.id, target]))
     const routing = routingInput(targets, storage, at)
     const excluded = new Set<string>(
@@ -645,10 +670,37 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     // routing found no row, so a setup with other accounts still uses them.
     if (
       accountId === undefined &&
+      !vaultMode &&
       targets.length === 0 &&
       (await deps.slotPlaceholderWithoutMain?.())
     )
       refuseMissingLogin()
+    // Vault mode never falls back to a local account. When no vault account
+    // could be tried, or the vault refused every one it was asked for, the
+    // request is refused here with a fixed text naming the cause and the
+    // remedy. An admission refusal (quota) keeps the installer's own.
+    if (
+      accountId === undefined &&
+      vaultMode &&
+      vault &&
+      (targets.length === 0 || refused.size > 0)
+    ) {
+      const cause: VaultModeRefusal =
+        refused.size > 0 ? 'vault-refused' : vaultModeNoRouteCause(vault)
+      log?.warn(
+        'vault mode: no vault account can serve; refusing the request',
+        {
+          cause,
+        },
+      )
+      throw new OpenCode2AuthError({
+        kind: 'no-account',
+        providerID: OPENAI_PROVIDER_ID,
+        sessionID: input.sessionID,
+        requestKind: input.kind,
+        message: VAULT_MODE_REFUSALS[cause],
+      })
+    }
     if (accountId !== undefined && primary)
       rememberSessionAccount(input.sessionID, accountId)
     log?.debug('pool account chosen', {
@@ -680,9 +732,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         requestKind: request.kind,
         message: NO_ACCOUNT_REFUSAL,
       })
-    const row = source
-      .peek()
-      .rows.find((candidate) => candidate.id === accountId)
+    // In vault mode no pool row is sent with, so only the vault is asked.
+    const row =
+      vault?.enrolled() === true
+        ? undefined
+        : source.peek().rows.find((candidate) => candidate.id === accountId)
     if (!row && vault) {
       const key = receiptKey(request)
       const receipt = receipts.get(key) ?? (await vault.authorize(accountId))

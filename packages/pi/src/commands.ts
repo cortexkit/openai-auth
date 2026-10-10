@@ -5,7 +5,8 @@
 // row of it: it is routed as `main` and replaced through Pi's `/login`, so the
 // menu shows its quota in a section of its own and refuses to add that
 // account again as a row. Its Vault section connects Pi to the Claustrum
-// vault, whose OpenAI accounts are then routed beside these.
+// vault; while connected (vault mode) the vault's OpenAI accounts are the only
+// ones routed, and Pi's login and the pool are left untouched.
 import {
   CommandError,
   type CommandMenu,
@@ -38,6 +39,11 @@ export type PiCommandDependencies = {
   pool?: PiPoolCommands
   /** How the Vault section's Connect polls for the approval (tests shorten it). */
   vaultWait?: VaultWaitOptions
+  /**
+   * Runs after every change the menu applies, for example a Connect or a
+   * Disconnect in the Vault section (the extension re-registers its models).
+   */
+  afterApply?: () => void
 }
 
 function windowLine(
@@ -83,7 +89,6 @@ export function createPiMenu(
   return createOpenAiMenu({
     store: pool.store(),
     vault: pool.vault,
-    quotaCheckIncludesVault: true,
     login: {
       begin: (options) => begin({ ...options, version }),
       mainIdentity: async () => pool.mainIdentity(),
@@ -116,7 +121,10 @@ export function createPiMenu(
         ...(dependencies.vaultWait ? { wait: dependencies.vaultWait } : {}),
       }),
     ],
-    afterApply: () => pool.reload(),
+    afterApply: () => {
+      dependencies.afterApply?.()
+      return pool.reload()
+    },
   })
 }
 
@@ -130,13 +138,16 @@ async function runOpenAiCommand(
     return
   }
   // Take the token Pi holds for its login now, as a request would, so the
-  // menu knows which account Pi signs in with.
-  try {
-    pool.observeLogin(
-      await ctx.modelRegistry?.getApiKeyForProvider('openai-codex'),
-    )
-  } catch {
-    // No login: the menu shows the pool's rows alone.
+  // menu knows which account Pi signs in with. Not in vault mode: asking Pi
+  // for the key makes Pi refresh and store an expired login.
+  if (!pool.vaultMode()) {
+    try {
+      pool.observeLogin(
+        await ctx.modelRegistry?.getApiKeyForProvider('openai-codex'),
+      )
+    } catch {
+      // No login: the menu shows the pool's rows alone.
+    }
   }
   await runPiCommandMenu(createPiMenu(pool, dependencies), ctx.ui, {
     sessionId: ctx.sessionManager.getSessionId(),

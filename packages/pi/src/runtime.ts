@@ -17,9 +17,12 @@
 // every `codex.rate_limits` WebSocket frame, against the account whose token
 // produced it.
 //
-// Once Pi is connected to the Claustrum vault (`/openai` > Vault), the OpenAI
-// accounts the vault serves it are routed beside these (`vault.ts` in the
-// core): each attempt on one sends with the token the vault serves for it.
+// Once Pi is connected to the Claustrum vault (`/openai` > Vault), Pi is in
+// vault mode: the OpenAI accounts the vault serves it are the only accounts
+// routed (`vault.ts` in the core), and each attempt on one sends with the
+// token the vault serves for it. Pi's own login and the pool rows are then
+// neither used, refreshed, polled nor written; a request no vault account can
+// serve is refused with a fixed message. Disconnecting restores them.
 
 import { statSync } from 'node:fs'
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
@@ -37,6 +40,10 @@ import {
   OpenAiVault,
   type RefreshAllQuotaResult,
   type RoutingMode,
+  VAULT_MODE_REFUSALS,
+  VAULT_REQUEST_ROSTER_WAIT_MS,
+  type VaultModeRefusal,
+  vaultModeNoRouteCause,
   vaultStateDir,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
@@ -225,6 +232,9 @@ export class PiOpenAIRuntime {
       ...(deps.readBudgetMs !== undefined
         ? { readBudgetMs: deps.readBudgetMs }
         : {}),
+      // In vault mode the pool is set aside: nothing in it is refreshed,
+      // polled or written. Read on every use, so a disconnect restores it.
+      vaultMode: () => this.vaultMode(),
       refreshProvider: async (credential) => {
         const tokens = await codexRefreshFn({
           refreshToken: credential.refresh,
@@ -263,6 +273,14 @@ export class PiOpenAIRuntime {
         fetchImpl,
         now: this.now,
       })
+  }
+
+  /**
+   * Whether Pi is in vault mode: connected to the Claustrum vault, so only
+   * the vault's accounts serve and nothing local is used or touched.
+   */
+  vaultMode(): boolean {
+    return this.vault.enrolled()
   }
 
   /**
@@ -320,11 +338,33 @@ export class PiOpenAIRuntime {
 
   /**
    * The accounts one request may be sent with: Pi's login, then the pool
-   * rows, then the vault's accounts. A login or row signing in as a ChatGPT
-   * account the vault holds is left out: the vault owns that account.
+   * rows, then the vault's accounts. In vault mode the vault's accounts
+   * alone: neither Pi's login nor a pool row is read.
    */
   private accounts(storage: AccountStorage | null): RouteAccount[] {
     const out: RouteAccount[] = []
+    if (!this.vaultMode()) this.localAccounts(storage, out)
+    for (const route of this.vault.routes()) {
+      out.push({
+        id: route.id,
+        token: undefined,
+        kind: route.kind,
+        vault: true,
+        ...(route.identity ? { identity: route.identity } : {}),
+        ...(route.quota !== undefined ? { quota: route.quota } : {}),
+      })
+    }
+    return out
+  }
+
+  /**
+   * Pi's login and the routable pool rows, outside vault mode. A login or
+   * row signing in as a ChatGPT account the vault holds is left out.
+   */
+  private localAccounts(
+    storage: AccountStorage | null,
+    out: RouteAccount[],
+  ): void {
     const mainToken = this.main.currentToken()
     const mainIdentity = this.main.currentIdentity()
     const vaultIdentities = this.vault.identities()
@@ -358,17 +398,6 @@ export class PiOpenAIRuntime {
         })
       }
     }
-    for (const route of this.vault.routes()) {
-      out.push({
-        id: route.id,
-        token: undefined,
-        kind: route.kind,
-        vault: true,
-        ...(route.identity ? { identity: route.identity } : {}),
-        ...(route.quota !== undefined ? { quota: route.quota } : {}),
-      })
-    }
-    return out
   }
 
   private poolRowById(id: string): PoolRow | undefined {
@@ -426,7 +455,8 @@ export class PiOpenAIRuntime {
    * names the account.
    */
   recordRateLimitFrame(token: string, snapshot: Record<string, unknown>): void {
-    if (this.main.record(snapshot, token, true)) return
+    // A vault token first: in vault mode it may sign in as the same ChatGPT
+    // account as Pi's own login, and the reading is the vault account's.
     const vaultEntry = this.vaultTokens.get(token)
     if (vaultEntry) {
       void this.vault.recordSnapshot(
@@ -437,6 +467,7 @@ export class PiOpenAIRuntime {
       )
       return
     }
+    if (this.main.record(snapshot, token, true)) return
     const row = this.pool.rowForToken(token)
     if (row) this.pool.recordSnapshot(row.id, snapshot, token, true)
   }
@@ -482,7 +513,14 @@ export class PiOpenAIRuntime {
       try {
         const attempt = await this.route(model, context, options)
         if (attempt.kind === 'blocked') {
-          outer.push(errorEvent(model, blockedMessage(attempt.block)))
+          outer.push(
+            errorEvent(
+              model,
+              attempt.refusal
+                ? VAULT_MODE_REFUSALS[attempt.refusal]
+                : blockedMessage(attempt.block),
+            ),
+          )
           return
         }
         if (attempt.head) outer.push(attempt.head)
@@ -513,19 +551,38 @@ export class PiOpenAIRuntime {
     context: Context,
     options: SimpleStreamOptions | undefined,
   ): Promise<
-    ({ kind: 'sent' } & StreamAttempt) | { kind: 'blocked'; block: PoolBlock }
+    | ({ kind: 'sent' } & StreamAttempt)
+    | { kind: 'blocked'; block: PoolBlock; refusal?: VaultModeRefusal }
   > {
-    this.main.observeToken(options?.apiKey)
+    const vaultMode = this.vaultMode()
     const storage = await this.storage()
-    await this.pool.current()
-    // Token refreshes of pool rows run in the background, so no request waits
-    // on the pool store's locks; a row whose token ran out sits out until its
-    // refresh lands.
-    void this.pool.refreshDueTokens(this.pool.peek().rows, storage)
+    if (vaultMode) {
+      // Vault mode: Pi's login (the key Pi hands over) and the pool are not
+      // used. Before the vault's first account list there is nothing to
+      // route, so that is waited for, for a bounded time.
+      await settleWithinBudget(
+        this.vault.firstRoster().then(() => true),
+        VAULT_REQUEST_ROSTER_WAIT_MS,
+        () => false,
+      )
+    } else {
+      this.main.observeToken(options?.apiKey)
+      await this.pool.current()
+      // Token refreshes of pool rows run in the background, so no request
+      // waits on the pool store's locks; a row whose token ran out sits out
+      // until its refresh lands.
+      void this.pool.refreshDueTokens(this.pool.peek().rows, storage)
+    }
     const mode: RoutingMode = storage?.routing?.mode ?? 'main-first'
+    let vaultRefused = false
+    let candidates = 0
     const run = () =>
       routePiRequest<StreamAttempt>({
-        accounts: () => this.accounts(storage),
+        accounts: () => {
+          const accounts = this.accounts(storage)
+          candidates = accounts.length
+          return accounts
+        },
         storage,
         mode,
         sessionId: options?.sessionId,
@@ -540,14 +597,23 @@ export class PiOpenAIRuntime {
         requestPull: (id) => this.requestPull(id),
         send: (account) =>
           account.vault
-            ? this.vaultAttempt(model, context, options, account.id)
+            ? this.vaultAttempt(model, context, options, account.id).then(
+                (attempt) => {
+                  if (!attempt) vaultRefused = true
+                  return attempt
+                },
+              )
             : account.token
               ? this.attempt(model, context, options, account.id, account.token)
               : Promise.resolve(undefined),
         placePin: placePiStickyPin,
       })
     let result = await run()
-    if (result.kind === 'blocked' && result.block.reason === 'quota-unknown') {
+    if (
+      result.kind === 'blocked' &&
+      result.block.reason === 'quota-unknown' &&
+      !vaultMode
+    ) {
       const pending = this.main.pending()
       if (pending) {
         await settleWithinBudget(
@@ -558,7 +624,21 @@ export class PiOpenAIRuntime {
         result = await run()
       }
     }
-    if (result.kind === 'blocked') return result
+    if (result.kind === 'blocked') {
+      // Vault mode never falls back to a local account: a request no vault
+      // account could take is refused with a fixed text naming the cause.
+      // An admission refusal on quota keeps its own message.
+      if (vaultMode && (candidates === 0 || vaultRefused))
+        return {
+          ...result,
+          refusal: vaultRefused
+            ? 'vault-refused'
+            : vaultModeNoRouteCause(this.vault),
+        }
+      if (vaultMode && result.block.reason === 'no-credential')
+        return { ...result, refusal: 'vault-empty' }
+      return result
+    }
     return { kind: 'sent', ...result.attempt }
   }
 
@@ -654,13 +734,25 @@ export class PiOpenAIRuntime {
   /** What `/openai` reads and changes on the pool. */
   commandSupport(): PiPoolCommands {
     return {
-      observeLogin: (token) => this.main.observeToken(token),
+      vaultMode: () => this.vaultMode(),
+      // In vault mode Pi's login is not used, so it is not taken (taking a
+      // new login starts a quota poll with it).
+      observeLogin: (token) => {
+        if (!this.vaultMode()) this.main.observeToken(token)
+      },
       store: () => this.pool.poolStore(),
       mainIdentity: () => this.main.currentIdentity(),
       mainQuota: () => this.main.quotaSnapshot(),
       reload: () => this.pool.load(),
       vault: this.vault,
       refreshAllQuota: async () => {
+        // Vault mode polls the vault's accounts alone.
+        if (this.vaultMode())
+          return (await this.vault.pollStale(0)).map((row) => ({
+            account: row.id,
+            ok: row.ok,
+            ...(row.error ? { error: row.error } : {}),
+          }))
         const storage = await this.storage()
         const [main, rows, vaultRows] = await Promise.all([
           this.main.currentToken() ? this.main.pollNow() : undefined,
@@ -688,6 +780,11 @@ export class PiOpenAIRuntime {
 
 /** The pool-backed parts of the Pi `/openai` command. */
 export interface PiPoolCommands {
+  /**
+   * Whether Pi is in vault mode. Pi's own login is then not read: asking Pi
+   * for its key would make Pi refresh and store that login.
+   */
+  vaultMode: () => boolean
   /** Takes the token Pi holds for its login now, as a request would. */
   observeLogin: (token: string | undefined) => void
   /** The store Pi's pool rows live in. */

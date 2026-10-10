@@ -282,7 +282,16 @@ function quotaRowLabels(quota: AccountQuota | null): string[] {
 export function renderedQuotas(state: {
   main?: { quota?: AccountQuota | null } | null
   fallbacks?: ReadonlyArray<{ enabled?: boolean; quota?: AccountQuota | null }>
+  vaultAccounts?: ReadonlyArray<{
+    enabled?: boolean
+    quota?: AccountQuota | null
+  }>
 }): ReadonlyArray<AccountQuota | null | undefined> {
+  // In vault mode only the vault accounts are rendered.
+  if (state.vaultAccounts !== undefined)
+    return state.vaultAccounts
+      .filter((account) => account.enabled)
+      .map((account) => account.quota)
   return [
     state.main?.quota ?? null,
     ...(state.fallbacks ?? [])
@@ -699,8 +708,15 @@ function QuotaSidebar(props: {
   const theme = () => props.api.theme.current
   const enabledFallbacks = () =>
     (state().fallbacks ?? []).filter((f) => f.enabled)
+  // Vault mode: the host uses only the vault's accounts, which the file lists
+  // in `vaultAccounts`; main and the local fallbacks are not shown.
+  const vaultMode = () => state().vaultAccounts !== undefined
+  const enabledVaultAccounts = () =>
+    (state().vaultAccounts ?? []).filter((account) => account.enabled)
   const hasData = () =>
-    state().main?.quota != null || enabledFallbacks().length > 0
+    vaultMode()
+      ? enabledVaultAccounts().length > 0
+      : state().main?.quota != null || enabledFallbacks().length > 0
 
   const headerLabel = () => {
     const name = prefs().header.label
@@ -839,34 +855,56 @@ function QuotaSidebar(props: {
           {/* Quota */}
           <Show when={prefs().sections.quota}>
             <SectionHeader theme={theme()} title='Quota' />
-            <AccountBlock
-              theme={theme()}
-              appearance={prefs().appearance}
-              name='main'
-              quota={state().main?.quota ?? null}
-              killed={state().main?.killed ?? false}
-              active={sessionRouting().activeId === 'main'}
-              pacingEnabled={prefs().sections.pacing}
-              labelWidth={quotaLabelWidth()}
-              resetCredits={state().main?.resetCredits}
-            />
-            <Show when={prefs().sections.fallbackAccounts}>
-              <For each={enabledFallbacks()}>
-                {(fb) => (
-                  <AccountBlock
-                    theme={theme()}
-                    appearance={prefs().appearance}
-                    name={fb.label ?? fb.id}
-                    quota={fb.quota}
-                    killed={fb.killed}
-                    active={sessionRouting().activeId === fb.id}
-                    pacingEnabled={prefs().sections.pacing}
-                    labelWidth={quotaLabelWidth()}
-                    resetCredits={fb.resetCredits}
-                    marginTop={1}
-                  />
-                )}
-              </For>
+            <Show
+              when={!vaultMode()}
+              fallback={
+                <For each={enabledVaultAccounts()}>
+                  {(account, index) => (
+                    <AccountBlock
+                      theme={theme()}
+                      appearance={prefs().appearance}
+                      name={account.label ?? account.id}
+                      quota={account.quota}
+                      killed={account.killed}
+                      active={sessionRouting().activeId === account.id}
+                      pacingEnabled={prefs().sections.pacing}
+                      labelWidth={quotaLabelWidth()}
+                      resetCredits={account.resetCredits}
+                      marginTop={index() === 0 ? 0 : 1}
+                    />
+                  )}
+                </For>
+              }
+            >
+              <AccountBlock
+                theme={theme()}
+                appearance={prefs().appearance}
+                name='main'
+                quota={state().main?.quota ?? null}
+                killed={state().main?.killed ?? false}
+                active={sessionRouting().activeId === 'main'}
+                pacingEnabled={prefs().sections.pacing}
+                labelWidth={quotaLabelWidth()}
+                resetCredits={state().main?.resetCredits}
+              />
+              <Show when={prefs().sections.fallbackAccounts}>
+                <For each={enabledFallbacks()}>
+                  {(fb) => (
+                    <AccountBlock
+                      theme={theme()}
+                      appearance={prefs().appearance}
+                      name={fb.label ?? fb.id}
+                      quota={fb.quota}
+                      killed={fb.killed}
+                      active={sessionRouting().activeId === fb.id}
+                      pacingEnabled={prefs().sections.pacing}
+                      labelWidth={quotaLabelWidth()}
+                      resetCredits={fb.resetCredits}
+                      marginTop={1}
+                    />
+                  )}
+                </For>
+              </Show>
             </Show>
           </Show>
         </Show>

@@ -9,9 +9,10 @@
  * request path: the operator approves the request with `ck`, and the token the
  * vault then hands out lives owner-only in this host's vault directory.
  *
- * Once enrolled, every OpenAI credential the vault lets this host read becomes
- * a routing row beside the local pool rows (`routes()`), and goes through the
- * same admission and routing. A vault row never holds a token: each send asks
+ * Once enrolled (vault mode), the OpenAI credentials the vault lets this host
+ * read are the only accounts the host routes (`routes()`): no local pool row,
+ * login slot or native login is used, refreshed or polled until the host
+ * disconnects. A vault row never holds a token: each send asks
  * the vault for one (`send`), deliberately without a cache, so a revoked
  * enrollment or a changed record takes effect on the next request. A 401 on a
  * served credential is reported to the vault with the exact record version
@@ -106,6 +107,45 @@ export function vaultPaths(stateDir: string, host: VaultHost): VaultPaths {
   }
 }
 
+/**
+ * Longest a request waits for the vault's first account list in vault mode
+ * before it is refused (the vault is then treated as unreachable).
+ */
+export const VAULT_REQUEST_ROSTER_WAIT_MS = 2_000
+
+/** Why a request was refused in vault mode, where only vault accounts may serve. */
+export type VaultModeRefusal =
+  | 'vault-unreachable'
+  | 'vault-empty'
+  | 'vault-refused'
+
+/**
+ * The fixed texts of a vault-mode refusal, shared by every host. Hosts decide
+ * whether to retry a failed request by matching its error message (OpenCode's
+ * retry patterns look for words such as "rate limit", "timeout" or
+ * "connection refused"), so these never carry an account id or any word that
+ * would make the refusal look temporary.
+ */
+export const VAULT_MODE_REFUSALS: Record<VaultModeRefusal, string> = {
+  'vault-unreachable':
+    'Request refused locally: this host is connected to the credential vault, which could not be reached, and local accounts are not used while it is connected. Start the vault and connect accounts in it, or disconnect this host from the vault.',
+  'vault-empty':
+    'Request refused locally: this host is connected to the credential vault, which serves it no usable OpenAI account, and local accounts are not used while it is connected. Connect accounts in the vault, or disconnect this host from the vault.',
+  'vault-refused':
+    'Request refused locally: the credential vault did not authorize an account, and local accounts are not used while this host is connected to it. Check the accounts in the vault, or disconnect this host from the vault.',
+}
+
+/**
+ * The refusal for a vault-mode request that found no vault account to try:
+ * unreachable while the vault has not listed its accounts in this process,
+ * else empty.
+ */
+export function vaultModeNoRouteCause(
+  vault: Pick<OpenAiVault, 'snapshot'>,
+): Exclude<VaultModeRefusal, 'vault-refused'> {
+  return vault.snapshot() === undefined ? 'vault-unreachable' : 'vault-empty'
+}
+
 /** The ChatGPT account a served access token signs in as, read from its claims. */
 export function vaultIdentityOf(accessToken: string): string | undefined {
   const claims = parseJwtClaims(accessToken)
@@ -173,6 +213,8 @@ export class OpenAiVault {
   #discovery: Promise<VaultRosterFile | undefined> | undefined
   #polling = false
   #closed = false
+  /** Settles once this instance's first roster discovery has, either way. */
+  readonly #firstRoster = Promise.withResolvers<void>()
   #pollTimer: ReturnType<typeof setTimeout> | undefined
 
   constructor(options: OpenAiVaultOptions) {
@@ -236,7 +278,11 @@ export class OpenAiVault {
     log.warn(message, { host: this.host, error: this.#lastError })
   }
 
-  /** Whether this host holds an enrollment token. */
+  /**
+   * Whether this host holds an enrollment token: vault mode. In vault mode
+   * only the vault's accounts serve this host, and no local account is used,
+   * refreshed or polled; disconnecting (deleting the token) ends it.
+   */
   enrolled(): boolean {
     return existsSync(this.paths.tokenPath)
   }
@@ -278,8 +324,19 @@ export class OpenAiVault {
   #discover(): Promise<VaultRosterFile | undefined> {
     this.#discovery ??= this.#consumer.refresh().finally(() => {
       this.#discovery = undefined
+      this.#firstRoster.resolve()
     })
     return this.#discovery
+  }
+
+  /**
+   * Resolves once this instance's first roster discovery has ended, whether
+   * it read the vault or failed, or once the instance is closed. Never
+   * rejects. A vault-mode request waits for it, bounded by
+   * `VAULT_REQUEST_ROSTER_WAIT_MS`.
+   */
+  firstRoster(): Promise<void> {
+    return this.#firstRoster.promise
   }
 
   /**
@@ -312,9 +369,10 @@ export class OpenAiVault {
   }
 
   /**
-   * The ChatGPT accounts the vault holds for this host. A local row signing
-   * in as one of them is skipped: one account has one owner, and the vault
-   * owns it even while it is declined or waiting for a new login there.
+   * The ChatGPT accounts the vault holds for this host, declined and cold
+   * ones included. Empty unless this host is enrolled; while it is, no local
+   * row is used at all (vault mode), so this only names which vault account
+   * a set-aside local row belongs to.
    */
   identities(): ReadonlySet<string> {
     if (!this.enrolled()) return new Set()
@@ -657,6 +715,7 @@ export class OpenAiVault {
 
   close(): void {
     this.#closed = true
+    this.#firstRoster.resolve()
     if (this.#pollTimer) clearTimeout(this.#pollTimer)
     this.#pollTimer = undefined
     this.#consumer.close()

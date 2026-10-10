@@ -108,6 +108,13 @@ export interface PiPoolSourceDeps {
     info(message: string, meta?: Record<string, unknown>): void
     warn(message: string, meta?: Record<string, unknown>): void
   }
+  /**
+   * True while Pi is in vault mode (connected to the Claustrum vault). The
+   * pool is then set aside: no row is refreshed, polled, offered a bearer or
+   * written, and a legacy config is not converted, so the files stay exactly
+   * as they are until Pi disconnects. Read on every use.
+   */
+  vaultMode?: () => boolean
 }
 
 type BackoffEntry = {
@@ -352,8 +359,9 @@ export class PiPoolSource {
       // every account from routing.
       return this.snapshot
     }
-    if (load.status === 'pending-migration') this.initialize(paths)
-    else if (load.status === 'error') {
+    if (load.status === 'pending-migration') {
+      if (!this.setAside()) this.initialize(paths)
+    } else if (load.status === 'error') {
       this.log.warn('account pool is unreadable', {
         file: load.file,
         reason: load.reason,
@@ -456,7 +464,7 @@ export class PiPoolSource {
    * waits.
    */
   private pollUnseenRows(): void {
-    if (this.disposed) return
+    if (this.disposed || this.setAside()) return
     for (const row of this.snapshot.rows) {
       // An enabled OAuth row torn by a replace that stopped between its two
       // writes is never a candidate until a store write completes it. The
@@ -478,7 +486,7 @@ export class PiPoolSource {
    * it refuses for want of a reading, so it never waits.
    */
   requestReading(id: string, force = false): void {
-    if (this.disposed) return
+    if (this.disposed || this.setAside()) return
     const now = this.now()
     const last = this.lastPull.get(id)
     if (
@@ -548,7 +556,7 @@ export class PiPoolSource {
     accessToken: string,
     complete: boolean,
   ): void {
-    if (!this.snapshot.active || this.disposed) return
+    if (!this.snapshot.active || this.disposed || this.setAside()) return
     const row = this.snapshot.rows.find((r) => r.id === rowId)
     if (row?.type !== 'oauth') return
     // The token must be the row's own: its wire identity matches the row's
@@ -612,6 +620,7 @@ export class PiPoolSource {
     rows: readonly PoolRow[],
     storage: AccountStorage | null,
   ): Promise<void> {
+    if (this.setAside()) return Promise.resolve()
     const now = this.now()
     const windowMs = refreshBeforeExpiryMs(storage)
     const runs: Promise<void>[] = []
@@ -641,6 +650,7 @@ export class PiPoolSource {
 
   /** The bearer to send for a row, or undefined when it holds no unexpired token. */
   usableToken(row: PoolRow, now = this.now()): string | undefined {
+    if (this.setAside()) return undefined
     const token = oauthAccess(row)
     if (!token?.access.trim()) return undefined
     if (typeof token.expires !== 'number' || token.expires <= now)
@@ -779,6 +789,7 @@ export class PiPoolSource {
    * poll has ended. Due tokens are refreshed first.
    */
   async pollRows(storage: AccountStorage | null): Promise<PoolPollResult[]> {
+    if (this.setAside()) return []
     const view = await this.load()
     if (!view.active || this.disposed) return []
     const targets = view.rows.filter(
@@ -804,6 +815,11 @@ export class PiPoolSource {
   // -------------------------------------------------------------------------
   // Lifecycle
   // -------------------------------------------------------------------------
+
+  /** Whether Pi is in vault mode, which sets the whole pool aside. */
+  private setAside(): boolean {
+    return this.deps.vaultMode?.() === true
+  }
 
   /** Stops new polls and writes; ones already started finish on their own. */
   dispose(): void {

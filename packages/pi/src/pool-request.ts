@@ -16,9 +16,9 @@
 //   good; a pinned account whose quota is not known yet serves elsewhere for
 //   this request only. A request without a session id is routed main-first.
 //
-// The OpenAI accounts the Claustrum vault serves Pi are routed beside them
-// (`vault` accounts): they hold no token, the caller's `send` asks the vault
-// for one per attempt.
+// While Pi is connected to the Claustrum vault (vault mode) the caller hands
+// in the vault's accounts alone (`vault` accounts): they hold no token, the
+// caller's `send` asks the vault for one per attempt.
 
 import { isQuotaMap } from '@cortexkit/common-auth/quota'
 import {

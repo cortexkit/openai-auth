@@ -18,7 +18,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
 import { registerCommands } from './commands.ts'
 import { RawWebSocket } from './raw-ws-node.ts'
-import { PiOpenAIRuntime } from './runtime.ts'
+import { errorEvent, PiOpenAIRuntime } from './runtime.ts'
 
 const BASE_URL = 'https://chatgpt.com/backend-api'
 
@@ -135,6 +135,94 @@ const OPENAI_CODEX_MODELS: CodexModel[] = [
 ]
 
 /**
+ * The provider Pi's models are registered under in vault mode (Pi connected
+ * to the Claustrum vault). Pi resolves a provider's auth from its stored
+ * credential before it calls the provider's stream, and for a stored OAuth
+ * login that means refreshing and storing it when it is close to expiry; with
+ * no stored login the models are not offered at all. Pi's own
+ * `openai-codex` login must not be touched in vault mode, so the models move
+ * to this provider, whose only auth is `VAULT_PLACEHOLDER_KEY`, and
+ * `openai-codex` keeps no model to select.
+ */
+export const VAULT_PROVIDER_ID = 'openai-codex-vault'
+
+/**
+ * The static key Pi resolves for `VAULT_PROVIDER_ID`. It is never sent: each
+ * attempt authenticates with the token the vault serves for it.
+ */
+export const VAULT_PLACEHOLDER_KEY = 'openai-auth-vault-mode-not-a-credential'
+
+/** The message for a vault-provider request made after Pi disconnected. */
+export const VAULT_PROVIDER_DISCONNECTED_MESSAGE = `Pi is not connected to the credential vault, so the ${VAULT_PROVIDER_ID} models cannot be used. Choose an openai-codex model, or connect Pi to the vault in /openai.`
+
+/** How often the extension checks whether Pi entered or left vault mode. */
+const PROVIDER_SYNC_INTERVAL_MS = 5_000
+
+type ProviderRegistrar = Pick<ExtensionAPI, 'registerProvider'> &
+  Partial<Pick<ExtensionAPI, 'unregisterProvider'>>
+
+/**
+ * Registers this extension's providers for the mode Pi is in now, and
+ * re-registers them when the mode changed since the last call: outside vault
+ * mode the models live under `openai-codex`, in vault mode under
+ * `VAULT_PROVIDER_ID`. Returns the function to call again after a possible
+ * change (a Connect or Disconnect, a new session, a request).
+ */
+export function createProviderSync(
+  pi: ProviderRegistrar,
+  runtime: PiOpenAIRuntime,
+): () => void {
+  let registeredVaultMode: boolean | undefined
+  const base = {
+    baseUrl: BASE_URL,
+    api: 'openai-codex-responses' as const,
+  }
+  return () => {
+    const vaultMode = runtime.vaultMode()
+    if (registeredVaultMode === vaultMode) return
+    const first = registeredVaultMode === undefined
+    registeredVaultMode = vaultMode
+    if (vaultMode) {
+      // No model is left under `openai-codex`, so Pi never resolves (and
+      // refreshes) its own login for one of this extension's requests.
+      pi.registerProvider('openai-codex', {
+        ...base,
+        name: 'OpenAI Codex (CortexKit OAuth)',
+        models: [],
+        streamSimple: (model: Model<Api>, context, options) =>
+          runtime.stream(model, context, options),
+      })
+      pi.registerProvider(VAULT_PROVIDER_ID, {
+        ...base,
+        name: 'OpenAI Codex (CortexKit vault)',
+        apiKey: VAULT_PLACEHOLDER_KEY,
+        models: OPENAI_CODEX_MODELS,
+        streamSimple: (model: Model<Api>, context, options) => {
+          if (!runtime.vaultMode()) {
+            const stream = createAssistantMessageEventStream()
+            stream.push(errorEvent(model, VAULT_PROVIDER_DISCONNECTED_MESSAGE))
+            stream.end()
+            return stream
+          }
+          // The placeholder key is dropped here; it is never sent.
+          const { apiKey: _placeholder, ...rest } = options ?? {}
+          return runtime.stream(model, context, rest)
+        },
+      })
+      return
+    }
+    if (!first) pi.unregisterProvider?.(VAULT_PROVIDER_ID)
+    pi.registerProvider('openai-codex', {
+      ...base,
+      name: 'OpenAI Codex (CortexKit OAuth)',
+      models: OPENAI_CODEX_MODELS,
+      streamSimple: (model: Model<Api>, context, options) =>
+        runtime.stream(model, context, options),
+    })
+  }
+}
+
+/**
  * Creates the request path for one loaded extension: requests are routed
  * across Pi's own login and the account pool (see `runtime.ts`).
  */
@@ -151,21 +239,26 @@ export default function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
   const runtime = createPiOpenAIRuntime()
   webSocketObserver = (headers, data) =>
     runtime.observeWebSocketMessage(headers, data)
-  registerCommands(pi, { pool: runtime.commandSupport() })
-  pi.registerProvider('openai-codex', {
-    name: 'OpenAI Codex (CortexKit OAuth)',
-    baseUrl: BASE_URL,
-    api: 'openai-codex-responses',
-    models: OPENAI_CODEX_MODELS,
-    streamSimple: (model: Model<Api>, context, options) =>
-      runtime.stream(model, context, options),
+  const syncProviders = createProviderSync(pi, runtime)
+  registerCommands(pi, {
+    pool: runtime.commandSupport(),
+    afterApply: syncProviders,
   })
+  syncProviders()
+  // A Connect approved later (its wait runs in the background) or a
+  // Disconnect made from another Pi process changes the mode without a menu
+  // change here, so the mode is also checked every few seconds.
+  setInterval(syncProviders, PROVIDER_SYNC_INTERVAL_MS).unref?.()
   // At session start, read the pool (which starts every row's first quota
   // poll) and take Pi's login, which starts its first quota poll, so the
   // first request finds readings instead of being refused for want of one.
+  // In vault mode Pi's login is not asked for: asking Pi for the key makes
+  // Pi refresh and store an expired login.
   if (typeof pi.on === 'function') {
     pi.on('session_start', async (_event, ctx) => {
       void runtime.start()
+      syncProviders()
+      if (runtime.vaultMode()) return
       try {
         runtime.main.observeToken(
           await ctx.modelRegistry.getApiKeyForProvider('openai-codex'),

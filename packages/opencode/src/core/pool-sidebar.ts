@@ -7,7 +7,11 @@
 // roster order as a fallback entry. Quota comes from each row's pool quota
 // map. `accountPool: true` is the one field added, and a reader that does not
 // know it ignores it.
+//
+// In vault mode the file lists the vault accounts instead, in the additive
+// `vaultAccounts` field, and the old fields list no local account.
 
+import type { VaultRosterRow } from '@cortexkit/common-auth/claustrum'
 import { isQuotaMap, projectQuota } from '@cortexkit/common-auth/quota'
 import type { PoolRow } from '@cortexkit/common-auth/store'
 import {
@@ -72,6 +76,38 @@ export function sidebarQuotaFromPoolMap(
     ...(resetCredits !== undefined
       ? { resetCreditsAvailable: resetCredits }
       : {}),
+  }
+}
+
+/**
+ * The machine part of the sidebar state in vault mode: the vault accounts that
+ * serve this host instead of its local accounts. The old fields stay in the
+ * file for an older TUI, but carry no local account: `main` has no quota and
+ * `fallbacks` is empty. Each vault account is named by its email when the
+ * vault knows it, else by its vault label; one the vault will not serve now
+ * (not in `routable`) is written disabled.
+ */
+export function buildVaultSidebarMachineState(
+  rows: readonly VaultRosterRow[],
+  routable: ReadonlySet<string>,
+  store: Pick<AccountStorage, 'routing'> | null | undefined,
+  now: number,
+): SidebarMachineState {
+  return {
+    main: { quota: null, killed: false },
+    fallbacks: [],
+    vaultAccounts: rows.map((row) => ({
+      id: row.routeId,
+      label: row.email || row.label || row.routeId,
+      ...(row.accountIdentity !== undefined
+        ? { accountId: row.accountIdentity }
+        : {}),
+      quota: sidebarQuotaFromPoolMap(row.quota),
+      killed: false,
+      enabled: routable.has(row.routeId),
+    })),
+    route: store?.routing?.mode ?? 'main-first',
+    lastUpdated: now,
   }
 }
 

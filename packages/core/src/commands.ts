@@ -1001,11 +1001,6 @@ export interface OpenAiMenuOptions {
   store: PoolStore
   vault?: MenuVault
   /**
-   * Set when the host's `quotaCheck` already polls the vault accounts, so the
-   * menu's quota check does not poll them a second time.
-   */
-  quotaCheckIncludesVault?: boolean
-  /**
    * The legacy locks the menu's writes that name no single row take (the
    * roster order, settings, a new account).
    */
@@ -1075,11 +1070,7 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
     ...(options.now ? { now: options.now } : {}),
   }
   const menu = options.vault
-    ? createVaultCommandMenu(
-        menuOptions,
-        options.vault,
-        options.quotaCheckIncludesVault,
-      )
+    ? createVaultCommandMenu(menuOptions, options.vault)
     : createCommandMenu(menuOptions)
   // A copy of the caller's context taken before the first await, as the
   // shared menu does: work left running reports through this copy even if

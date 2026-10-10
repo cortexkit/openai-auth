@@ -338,8 +338,12 @@ export interface OpenAICacheKeepAdapterOptions {
    * this replay. `onAuthFailure` handles a 401 on that resolved credential.
    */
   refreshFallback: (accountId: string) => Promise<CacheKeepFallbackAccess>
-  /** Vault routes authorize every replay through the custodian's send path. */
-  vault?: Pick<OpenAiVault, 'owns' | 'send'>
+  /**
+   * Vault routes authorize every replay through the custodian's send path.
+   * While this host is in vault mode (`enrolled`), a target on a local
+   * account is never warmed: no local token is read or refreshed for it.
+   */
+  vault?: Pick<OpenAiVault, 'owns' | 'send' | 'enrolled'>
   codexResponsesUrl: string
   /**
    * The account the target's session routes to now (see
@@ -418,6 +422,14 @@ export function createOpenAICacheKeepAdapter(
           throw new Error(`vault refused warm for ${target.accountId}`)
         return response
       }
+
+      // A target captured on a local account before this host connected to
+      // the vault: vault mode warms no local account. The throw backs the
+      // target off like any failed warm; nothing was sent.
+      if (options.vault?.enrolled())
+        throw new Error(
+          'local accounts are not warmed while this host is connected to the vault',
+        )
 
       let accessToken: string
       let onAuthFailure: ((status: number) => Promise<void>) | undefined

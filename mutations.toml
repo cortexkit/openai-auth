@@ -107,8 +107,8 @@ expect_red = ["^OpenCode\\s1\\svault\\sstream\\sadmission\\sa\\svault\\sWebSocke
 id = "opencode1-vault-ws-quota-receipt"
 guards = "vault quota frames reach the receipt-fenced roster and a floor crossing changes the next admission"
 file = "packages/opencode/src/index.ts"
-old = "                  void vault.recordSnapshot(served.id, s, true, served.receipt)"
-new = "                  void Promise.resolve()"
+old = "                  void vault\n                    .recordSnapshot(served.id, s, true, served.receipt)\n                    .then(queueVaultSidebarWrite)"
+new = "                  void Promise.resolve() // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
@@ -143,7 +143,7 @@ expect_red = ["^vault\\squota\\sfloor\\sOpenCode\\s2\\sapplies\\sminimumRemainin
 id = "opencode1-local-credential-refusal-body"
 guards = "local credential refusals retain status 401 and distinct fixed terminal explanations instead of an empty provider-shaped rejection"
 file = "packages/opencode/src/index.ts"
-old = "                  LOCAL_CREDENTIAL_REFUSALS[\n                    cause === 'vault-refused'\n                      ? cause\n                      : missingTombstoneMain\n                        ? 'missing-main'\n                        : (cause ?? 'unusable')\n                  ],"
+old = "                  LOCAL_CREDENTIAL_REFUSALS[\n                    isVaultModeRefusal(cause)\n                      ? cause\n                      : missingTombstoneMain\n                        ? 'missing-main'\n                        : (cause ?? 'unusable')\n                  ],"
 new = "                  null,"
 test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
@@ -464,7 +464,7 @@ expect_message = "Received: true"
 id = "pool-missing-login-refuses-with-actionable-message"
 guards = "a wrongly migrated empty store refuses locally with fixed sign-in or store-path instructions, rather than a credentialless request or synthetic Unauthorized"
 file = "packages/opencode/src/index.ts"
-old = "                if (loginRequired && cause !== 'vault-refused')\n                  throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)"
+old = "                if (loginRequired && !isVaultModeRefusal(cause))\n                  throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)"
 new = "                if (false) // NON-VACUITY BREAK\n                  throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)"
 test_file = "packages/opencode/src/tests/pool-main-request.test.ts"
 runner = "command"
@@ -693,17 +693,16 @@ expect_red = ["^routing\\sa\\sstatic\\sOpenAI\\sAPI\\skey\\sin\\sthe\\svault\\si
 expect_message = "+   \"apikey:openai:platform\","
 
 [[control]]
-id = "vault-refuses-a-real-slot-login"
-guards = "a real login in OpenCode's slot fails closed while the vault serves this host"
-file = "packages/core/src/vault.ts"
-old = "    if (this.serves())\n      assertHostSlotMatchesMode"
-new = "    if (false)\n      assertHostSlotMatchesMode"
+id = "vault-mode-ignores-a-real-slot-login"
+guards = "in vault mode a real login in OpenCode's slot is not used: the request is served from the vault before the slot is read"
+file = "packages/opencode/src/index.ts"
+old = "            if (vault.enrolled()) {\n              init = await materializeRequestInit(requestInput, init)"
+new = "            if (false) { // NON-VACUITY BREAK: read the slot in vault mode.\n              init = await materializeRequestInit(requestInput, init)"
 test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ["^the\\shost\\sslot\\sa\\sreal\\slogin\\sin\\sthe\\sslot\\sis\\srefused\\swhile\\sthe\\svault\\sserves\\sthis\\shost\\sits\\saccounts$"]
-expect_message = "Received promise that resolved"
+expect_red = ["^the\\shost\\sslot\\sin\\svault\\smode\\sa\\sreal\\slogin\\sin\\sthe\\sslot\\sis\\signored\\sand\\sthe\\svault\\sserves$"]
 
 [[control]]
 id = "vault-slot-login-recovers-without-disconnect"
@@ -1303,22 +1302,22 @@ expect_message = "Received: false"
 
 [[control]]
 id = "menu-vault-ownership"
-guards = "shadowed locals do not count as routes and identify the vault account that serves them"
+guards = "in vault mode every local row is labelled set aside, naming the vault account that serves its ChatGPT account when there is one"
 file = "packages/core/src/vault-account-menu.ts"
-old = "  return row.identity !== undefined && view.identities.has(row.identity)"
-new = "  return false // NON-VACUITY BREAK"
+old = "  if (!isVaultMenuConnected(view)) return undefined"
+new = "  return undefined // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^vault\scommand\smenu\saccounts\sname\sthe\svault\sowner\sand\sexclude\sset-aside\slocals\sfrom\srouting\scount$']
+expect_red = ['^vault\scommand\smenu\sreset\slabels\sset-aside\slocals\swithout\sadmitting\svault\saccounts$']
 
 [[control]]
 id = "menu-vault-roster"
-guards = "Quota lists vault accounts beside the same local rows as Accounts"
+guards = "in vault mode Quota lists the same vault accounts as Accounts"
 file = "packages/core/src/vault-command-menu.ts"
-old = "            ...(includeVaultRows ? view.status.accounts : []).map("
-new = "            ...(false ? view.status.accounts : []).map( // NON-VACUITY BREAK"
+old = "            ...view.status.accounts.map("
+new = "            ...[].map( // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
@@ -1347,7 +1346,7 @@ test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^vault\scommand\smenu\san\sunlabelled\slocal\sis\snamed\sby\sits\sroster\sid\swhen\sconnected$']
+expect_red = ['^vault\scommand\smenu\sunlabelled\srows\suse\stheir\sids\seven\swithout\sa\svault\sobject$']
 
 [[control]]
 id = "menu-vault-quota-poll"
@@ -1407,31 +1406,31 @@ test_file = "packages/pi/src/tests/vault.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^Pi\sand\sthe\sClaustrum\svault\sthe\sshared\sAccounts\sQuota\sand\sLimits\sslots\sinclude\svault\saccounts\sand\sset\saside\stheir\slocal\scopy$']
+expect_red = ['^Pi\sand\sthe\sClaustrum\svault\sin\svault\smode\sthe\sshared\sAccounts\sQuota\sand\sLimits\sslots\slist\sonly\sthe\svault\saccounts$']
 
 [[control]]
-id = "menu-local-management-roster"
-guards = "local move actions never include synthetic vault routes in a real store reorder"
+id = "menu-vault-mode-no-local-rows"
+guards = "in vault mode Accounts, Quota and Limits list no local row, only the vault accounts"
 file = "packages/core/src/vault-command-menu.ts"
-old = "    store: menuStore(options.store, vault, false),"
-new = "    store: menuStore(options.store, vault, true), // NON-VACUITY BREAK"
+old = "          const rows: PoolRow[] = [\n"
+new = "          const rows: PoolRow[] = [\n            ...named.rows, // NON-VACUITY BREAK\n"
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^vault\scommand\smenu\san\sunshadowed\slocal\skeeps\sits\smanagement\sactions\sand\scounts\sbeside\svault\saccounts$']
+expect_red = ['^vault\scommand\smenu\sin\svault\smode\sno\slocal\srow\sis\slisted\sin\sAccounts,\sQuota\sor\sLimits$']
 
 [[control]]
-id = "menu-host-wide-quota-once"
-guards = "a host check that already polls the vault does not poll its accounts a second time"
+id = "menu-vault-mode-no-local-quota-check"
+guards = "Check now in vault mode polls the vault accounts only and never runs the host's local quota check"
 file = "packages/core/src/vault-command-menu.ts"
-old = "                      quotaCheckIncludesVault\n"
-new = "                      false // NON-VACUITY BREAK\n"
+old = "                  const selected = String(values.account)\n"
+new = "                  const selected = String(values.account)\n                  await options.quota?.check?.([], { notify() {} }) // NON-VACUITY BREAK\n"
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^vault\scommand\smenu\sa\shost-wide\scheck\spolls\seach\svault\saccount\sonly\sonce\sbeside\sunshadowed\slocals$']
+expect_red = ["^vault\\scommand\\smenu\\sCheck\\snow\\sin\\svault\\smode\\spolls\\seach\\svault\\saccount\\sonce\\sand\\snever\\sruns\\sthe\\shost's\\slocal\\squota\\scheck$"]
 
 [[control]]
 id = "menu-common-auth-release"
@@ -1500,7 +1499,7 @@ test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^routing\sa\spool\srow\ssigning\sin\sas\san\saccount\sthe\svault\sholds\sis\snot\spolled\sat\sstartup$']
+expect_red = ['^routing\sin\svault\smode\sno\spool\srow\sis\spolled\sat\sstartup,\swhether\sor\snot\sthe\svault\sholds\sits\saccount$']
 
 [[control]]
 id = "request-scope-drains-vault-startup-polls"
@@ -1623,3 +1622,91 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-active-connection.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ["^OpenCode\\s2\\sactive\\sconnection\\sgate\\snever\\sreads\\sor\\scopies\\sa\\spre-existing\\shost\\sChatGPT\\slogin\\sinto\\sthe\\spool$"]
+
+
+# Vault mode is exclusive: while a host is enrolled with the vault, only the
+# vault's accounts are candidates, and no local row is refreshed or polled.
+
+[[control]]
+id = "vault-mode-routes-no-local-row"
+guards = "in vault mode a local pool row the vault does not hold is never a routing candidate, so a request never falls back to a local account"
+file = "packages/opencode/src/core/pool-request.ts"
+old = "  const rows = vault\n    ? []\n    : routableRows(ctx.source.peek().rows, ctx.storage, ctx.now())"
+new = "  const rows = routableRows(ctx.source.peek().rows, ctx.storage, ctx.now()) // NON-VACUITY BREAK: route local rows beside the vault."
+test_file = "packages/opencode/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\srequest\spath\sin\svault\smode\san\sunshadowed\slocal\srow\snever\sroutes\sin\svault\smode:\sonly\svault\saccounts\sare\scandidates$']
+
+[[control]]
+id = "vault-mode-sets-every-pool-row-aside"
+guards = "in vault mode the pool source refreshes no local token and polls no local quota, so the local account files stay byte-identical"
+file = "packages/opencode/src/core/pool-account-source.ts"
+old = "    if (this.deps.vaultMode?.()) return true\n"
+new = "    // NON-VACUITY BREAK: vault mode no longer sets the pool rows aside.\n"
+test_file = "packages/opencode/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\spool\ssource\sin\svault\smode\srefreshes,\spolls\sand\soffers\sa\sbearer\sfor\sno\srow,\sand\sleaves\sthe\sfiles\sbyte-identical;\sleaving\svault\smode\srestores\sall\sthree$']
+
+[[control]]
+id = "vault-mode-warms-no-local-target"
+guards = "in vault mode a keep-warm target captured on a local account before connecting is never warmed: no local token is read, refreshed or sent"
+file = "packages/opencode/src/core/cachekeep.ts"
+old = "      if (options.vault?.enrolled())\n        throw new Error("
+new = "      if (false) // NON-VACUITY BREAK: warm local targets in vault mode.\n        throw new Error("
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^vault\\scachekeep\\sin\\svault\\smode\\sa\\slocal\\starget\\scaptured\\sbefore\\sconnecting\\sis\\snever\\swarmed:\\snothing\\sis\\ssent\\sor\\srefreshed$"]
+
+[[control]]
+id = "vault-mode-sidebar-lists-vault-accounts"
+guards = "in vault mode the sidebar file lists the vault accounts in vaultAccounts and no local row in the fields an older TUI reads"
+file = "packages/opencode/src/index.ts"
+old = "          if (vault.enrolled()) {\n            await setSidebarMachineState("
+new = "          if (false) { // NON-VACUITY BREAK: write the local rows in vault mode.\n            await setSidebarMachineState("
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^vault\\smode\\sthe\\ssidebar\\sfile\\sin\\svault\\smode\\slists\\sthe\\svault\\saccounts\\sand\\sno\\slocal\\srow,\\swith\\sthe\\sserving\\sone\\sactive$"]
+
+[[control]]
+id = "opencode2-vault-mode-routes-no-local-row"
+guards = "on OpenCode 2 in vault mode no pool row is a routing candidate, also one the vault does not hold"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "    const rows = vaultMode\n      ? []\n      : routableRows("
+new = "    const rows = false // NON-VACUITY BREAK: route pool rows beside the vault.\n      ? []\n      : routableRows("
+test_file = "packages/opencode/src/tests/opencode2-vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^vault\\saccounts\\son\\sOpenCode\\s2\\snever\\sroutes\\sa\\spool\\srow\\sthe\\svault\\sdoes\\snot\\shold,\\sand\\sleaves\\sthe\\spool\\sfiles\\sbyte-identical$"]
+
+[[control]]
+id = "pi-vault-mode-leaves-the-native-login-untouched"
+guards = "on Pi in vault mode the models move to a provider whose key is a placeholder, so Pi never refreshes or stores its own expired login"
+file = "packages/pi/src/index.ts"
+old = "    if (vaultMode) {\n      // No model is left under `openai-codex`"
+new = "    if (false) { // NON-VACUITY BREAK: keep the models under openai-codex.\n      // No model is left under `openai-codex`"
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^Pi's\\sreal\\smodel\\sruntime\\sin\\svault\\smode\\sa\\srequest\\swith\\san\\sexpired\\snative\\slogin\\sleaves\\sPi's\\sauth\\sfile\\sbyte-identical\\sand\\sserves\\sfrom\\sthe\\svault$"]
+
+[[control]]
+id = "pi-vault-mode-sets-the-pool-aside"
+guards = "on Pi in vault mode no pool row is refreshed, polled or written, so the pool files stay byte-identical"
+file = "packages/pi/src/pool-source.ts"
+old = "    return this.deps.vaultMode?.() === true"
+new = "    return false // NON-VACUITY BREAK: keep using the pool in vault mode."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^Pi\\sin\\svault\\smode\\sneither\\sPi's\\slogin\\snor\\sa\\spool\\srow\\sthe\\svault\\sdoes\\snot\\shold\\sis\\ssent\\swith,\\srefreshed\\sor\\spolled,\\sand\\sthe\\spool\\sfiles\\sstay\\sbyte-identical$"]

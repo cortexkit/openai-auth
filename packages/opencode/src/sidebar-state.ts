@@ -170,6 +170,16 @@ export interface SidebarState {
    * other rows in roster order. Absent on any other install.
    */
   accountPool?: boolean
+  /**
+   * Present while the host is in vault mode (enrolled with the Claustrum
+   * vault): the vault accounts that serve instead of the local accounts, in
+   * the vault's order. `main` then carries no account and `fallbacks` is
+   * empty, so a reader that does not know this field shows no local account.
+   * Each entry's `label` is the account's email when the vault knows it,
+   * else the vault's label; `enabled` is false for an account the vault will
+   * not serve now (declined, or waiting for a new login there).
+   */
+  vaultAccounts?: SidebarAccountState[]
 }
 
 import { createHash } from 'node:crypto'
@@ -405,30 +415,11 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
   // fallbacks — must be an array; keep entries that are objects with a string
   // id, and normalize each entry's inner fields so the TUI never reads a
   // wrong-typed value (e.g. a string `enabled`) off a malformed file.
-  const rawFallbacks = r.fallbacks
-  const fallbacks: SidebarAccountState[] = Array.isArray(rawFallbacks)
-    ? rawFallbacks
-        .filter(
-          (entry): entry is Record<string, unknown> =>
-            entry !== null &&
-            typeof entry === 'object' &&
-            !Array.isArray(entry) &&
-            typeof (entry as Record<string, unknown>).id === 'string',
-        )
-        .map((e) => {
-          return {
-            id: e.id as string,
-            label: typeof e.label === 'string' ? e.label : undefined,
-            ...(typeof e.accountId === 'string'
-              ? { accountId: e.accountId }
-              : {}),
-            quota: ('quota' in e ? e.quota : null) as AccountQuota | null,
-            killed: typeof e.killed === 'boolean' ? e.killed : false,
-            enabled: typeof e.enabled === 'boolean' ? e.enabled : true,
-            ...resetCreditsField(e.resetCredits),
-          }
-        })
-    : []
+  const fallbacks = normalizeAccountList(r.fallbacks)
+  // The vault accounts, kept only when the file carries the list.
+  const vaultAccounts = Array.isArray(r.vaultAccounts)
+    ? normalizeAccountList(r.vaultAccounts)
+    : undefined
 
   // activeId — string or undefined
   const activeId = typeof r.activeId === 'string' ? r.activeId : undefined
@@ -456,7 +447,43 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
     ...(planType !== undefined ? { planType } : {}),
     ...(credits !== undefined ? { credits } : {}),
     ...(r.accountPool === true ? { accountPool: true } : {}),
+    ...(vaultAccounts !== undefined ? { vaultAccounts } : {}),
   }
+}
+
+/**
+ * An account list (`fallbacks`, `vaultAccounts`) as read from the file: the
+ * entries that are objects with a string id, each field of the right type.
+ */
+function normalizeAccountList(raw: unknown): SidebarAccountState[] {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .filter(
+      (entry): entry is Record<string, unknown> =>
+        entry !== null &&
+        typeof entry === 'object' &&
+        !Array.isArray(entry) &&
+        typeof (entry as Record<string, unknown>).id === 'string',
+    )
+    .map((e) => ({
+      id: e.id as string,
+      label: typeof e.label === 'string' ? e.label : undefined,
+      ...(typeof e.accountId === 'string' ? { accountId: e.accountId } : {}),
+      quota: ('quota' in e ? e.quota : null) as AccountQuota | null,
+      killed: typeof e.killed === 'boolean' ? e.killed : false,
+      enabled: typeof e.enabled === 'boolean' ? e.enabled : true,
+      ...resetCreditsField(e.resetCredits),
+    }))
+}
+
+/**
+ * The accounts a routing entry or session pin may name: the fallbacks, and
+ * in vault mode the vault accounts.
+ */
+function routingAccountsOf(
+  state: Pick<SidebarState, 'fallbacks' | 'vaultAccounts'>,
+): SidebarAccountState[] {
+  return [...state.fallbacks, ...(state.vaultAccounts ?? [])]
 }
 
 export async function getSidebarState(
@@ -580,7 +607,7 @@ export function resolveSessionStickyAccount(
       ? undefined
       : 'main'
   }
-  const fallback = state.fallbacks?.find(
+  const fallback = routingAccountsOf(state).find(
     (account) => account.id === assignment.accountId,
   )
   if (
@@ -603,13 +630,14 @@ export function resolveSessionSidebarRouting(
     return { activeId: state.activeId ?? 'main', route: state.route }
   }
   const own = sessionId ? state.activeRouting?.[sessionId] : undefined
+  const accounts = routingAccountsOf(state)
   const ownQuota =
     own?.activeId === 'main'
       ? state.main.quota
-      : state.fallbacks.find((account) => account.id === own?.activeId)?.quota
+      : accounts.find((account) => account.id === own?.activeId)?.quota
   if (
     own &&
-    isUsableRoutingEntry(own, state.fallbacks, now) &&
+    isUsableRoutingEntry(own, accounts, now) &&
     !isQuotaExhausted(ownQuota, now)
   ) {
     return { activeId: own.activeId, route: own.route }
@@ -620,15 +648,20 @@ export function resolveSessionSidebarRouting(
     return { activeId: stickyAccountId, route: state.route }
   }
 
-  const enabledFallbacks = state.fallbacks.filter(
-    (account) => account.enabled && !account.killed,
-  )
+  // In vault mode there is no main: the first vault account that can serve
+  // is shown as the one a new request would most likely use.
+  const vaultMode = state.vaultAccounts !== undefined
+  const enabledFallbacks = (
+    vaultMode ? (state.vaultAccounts ?? []) : state.fallbacks
+  ).filter((account) => account.enabled && !account.killed)
   const fallback =
     enabledFallbacks.find((account) => !isQuotaExhausted(account.quota, now)) ??
     enabledFallbacks[0]
   return {
     activeId:
-      state.route === 'fallback-first' && fallback ? fallback.id : 'main',
+      (vaultMode || state.route === 'fallback-first') && fallback
+        ? fallback.id
+        : 'main',
     route: state.route,
   }
 }
@@ -955,7 +988,13 @@ function writeMergedSidebarState(
 
 export type SidebarMachineState = Pick<
   SidebarState,
-  'main' | 'fallbacks' | 'planType' | 'credits' | 'lastUpdated' | 'accountPool'
+  | 'main'
+  | 'fallbacks'
+  | 'planType'
+  | 'credits'
+  | 'lastUpdated'
+  | 'accountPool'
+  | 'vaultAccounts'
 > & { route: string }
 
 // The freshest signal across every timestamp a snapshot carries: either window
@@ -1162,7 +1201,7 @@ export function setSidebarMachineState(
         const now = Date.now()
         const stickyAssignments = pruneStickyAssignments(
           latest.stickyAssignments,
-          usableRoutingAccountIds(machineState.fallbacks),
+          usableRoutingAccountIds(routingAccountsOf(machineState)),
           now,
         )
         return {
@@ -1210,6 +1249,9 @@ export function setSidebarMachineState(
           // Taken from the snapshot being written, never carried over from the
           // file: it says where this snapshot's accounts came from.
           accountPool: machineState.accountPool === true ? true : undefined,
+          // Likewise taken from the snapshot: present only in vault mode, so
+          // a snapshot written after a disconnect drops the vault accounts.
+          vaultAccounts: machineState.vaultAccounts,
         }
       },
       hooks,
@@ -1959,6 +2001,20 @@ export function resolveActiveAccount(state: SidebarState): {
   killed: boolean
 } {
   const activeId = state.activeId
+  if (state.vaultAccounts !== undefined) {
+    // Vault mode: the active account is a vault account; there is no main.
+    const enabled = state.vaultAccounts.filter((account) => account.enabled)
+    const vaultAccount =
+      enabled.find((account) => account.id === activeId) ?? enabled[0]
+    return vaultAccount
+      ? {
+          id: vaultAccount.id,
+          name: vaultAccount.label ?? vaultAccount.id,
+          quota: vaultAccount.quota,
+          killed: vaultAccount.killed,
+        }
+      : { id: 'vault', name: 'vault', quota: null, killed: false }
+  }
   if (activeId && activeId !== 'main') {
     const fallback = state.fallbacks.find(
       (account) => account.enabled && account.id === activeId,

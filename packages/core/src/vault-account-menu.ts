@@ -43,28 +43,26 @@ export function vaultAccountName(row: VaultRosterRow): string {
 }
 
 /**
- * Whether the vault owns this local row's ChatGPT account. An account the vault
- * holds but will not serve right now (cold or declined) still owns it, as in
- * request routing, so the local copy never serves in its place.
+ * Why a local row is set aside (not used, refreshed or polled), or undefined
+ * when it is not. In vault mode (the host is connected to the vault) every
+ * local row is, whatever account it signs in as, since only the vault's
+ * accounts serve; outside it none is. A row signing in as an account the
+ * vault holds names the vault account that serves it.
  */
-export function isVaultShadowed(
-  row: Pick<PoolRow, 'identity'>,
-  view: VaultMenuView,
-): boolean {
-  return row.identity !== undefined && view.identities.has(row.identity)
-}
-
 export function setAsideDetail(
   row: Pick<PoolRow, 'identity'>,
   view: VaultMenuView,
 ): string | undefined {
-  if (!isVaultShadowed(row, view)) return undefined
-  const owner = view.status.accounts.find(
-    (account) => account.accountIdentity === row.identity,
-  )
+  if (!isVaultMenuConnected(view)) return undefined
+  const owner =
+    row.identity === undefined
+      ? undefined
+      : view.status.accounts.find(
+          (account) => account.accountIdentity === row.identity,
+        )
   return owner
     ? `set aside (served by vault ${vaultAccountName(owner)})`
-    : 'set aside (the vault serves this account)'
+    : SET_ASIDE
 }
 
 /** Use the oldest quota window reading so a newer window cannot make an older one appear current. */
@@ -94,9 +92,13 @@ function datedQuotaLines(row: PoolRow): string[] {
   return [...quotaLines(row), ...(age ? [`  ${age}`] : [])]
 }
 
-const SET_ASIDE = 'set aside (the vault serves this account)'
+const SET_ASIDE = 'set aside (this host uses only its vault accounts)'
 
-function localLine(row: PoolRow, view: VaultMenuView): string {
+/** Shown in place of the local accounts while the host is in vault mode. */
+export const VAULT_MODE_LOCAL_NOTE =
+  'Local accounts are not used while this host is connected to the vault.'
+
+function localLine(row: PoolRow): string {
   const parts = [
     ...(row.label ? [row.label] : []),
     row.invalid
@@ -104,12 +106,15 @@ function localLine(row: PoolRow, view: VaultMenuView): string {
       : row.enabled
         ? 'enabled'
         : `disabled${row.disabledReason ? `: ${row.disabledReason}` : ''}`,
-    ...(isVaultShadowed(row, view) ? [SET_ASIDE] : []),
   ]
   return `${row.id}: ${parts.join(', ')}`
 }
 
-/** Retain local add/remove and enable/disable actions; list vault accounts and check their quota through the vault. */
+/**
+ * Retain local add/remove and enable/disable actions; list vault accounts and
+ * check their quota through the vault. In vault mode the local accounts are
+ * neither listed nor polled: only the vault's accounts serve.
+ */
 export async function runVaultAccountMenu(
   options: AccountMenuOptions,
   vault: MenuVault,
@@ -117,20 +122,26 @@ export async function runVaultAccountMenu(
   await vault.refresh()
   const view = await readVaultMenu(vault)
   const { status } = view
-  const load = await options.store.read()
+  // In vault mode the local store is not read for the listing.
+  const load = isVaultMenuConnected(view)
+    ? undefined
+    : await options.store.read()
   const actions = await accountMenuActions(options)
   const quotaAction = actions.find((action) => action.id === 'check-quotas')
   if (quotaAction) {
     quotaAction.run = async (context) => {
       await vault.refresh()
       const currentView = await readVaultMenu(vault)
-      const before = await options.store.read()
-      if (before.status !== 'ready') {
+      const before = isVaultMenuConnected(currentView)
+        ? undefined
+        : await options.store.read()
+      if (!before) {
+        context.print(VAULT_MODE_LOCAL_NOTE)
+      } else if (before.status !== 'ready') {
         context.print('The local account store could not be read.')
       } else {
         for (const row of before.rows) {
-          context.print(localLine(row, currentView))
-          if (isVaultShadowed(row, currentView)) continue
+          context.print(localLine(row))
           try {
             if (options.pollQuota && row.credentialEpoch !== undefined) {
               const observation = await options.pollQuota(row)
@@ -200,9 +211,11 @@ export async function runVaultAccountMenu(
         (row) =>
           `Vault ${vaultAccountName(row)}: ${row.enabled ? `enabled (${row.state})` : 'declined'}`,
       ),
-      ...(load.status === 'ready'
-        ? load.rows.map((row) => localLine(row, view))
-        : ['The local account store could not be read.']),
+      ...(!load
+        ? [VAULT_MODE_LOCAL_NOTE]
+        : load.status === 'ready'
+          ? load.rows.map((row) => localLine(row))
+          : ['The local account store could not be read.']),
     ],
     actions,
     ...(options.terminal ? { terminal: options.terminal } : {}),
