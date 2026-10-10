@@ -204,7 +204,7 @@ describe('vault command menu', () => {
           'utf8',
         ),
       )
-      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.14.0')
+      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.14.1')
     }
   })
   // Vault mode is exclusive: while connected, the vault's accounts are the
