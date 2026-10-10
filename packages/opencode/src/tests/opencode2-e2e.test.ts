@@ -254,7 +254,7 @@ async function runScenario(input: {
   accounts: MockAccount[]
   turns: Turn[]
   plugin?: string
-  login?: boolean
+  login?: boolean | 'vault'
   /** The API key the host prepares instead of the account pool's placeholder bearer. */
   apiKey?: string
   /** Omit the pool bearer to show that importing legacy auth.json does not activate pool routing. */
@@ -382,7 +382,9 @@ async function runScenario(input: {
           '--server',
           serverURL,
           '--method',
-          'openai-auth-pool-browser',
+          input.login === 'vault'
+            ? 'openai-auth-vault'
+            : 'openai-auth-pool-browser',
         ],
         project,
         env,
@@ -465,6 +467,7 @@ async function runScenario(input: {
           .map((line) => JSON.parse(line) as string)
       : []
   const diagnostics = [
+    `exported credential: ${exported}`,
     `destinations: ${JSON.stringify(destinations)}`,
     `vault reports: ${JSON.stringify(daemon?.reports ?? [])}`,
     `wire: ${JSON.stringify(mock.records)}`,
@@ -985,6 +988,38 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       expect(result.exported).not.toContain(MOCK_ACCOUNTS.C.token)
       expect(result.exported).not.toContain('refresh-C')
       expectOnlyPoolAccountsOnWire(result)
+    })
+  }, 180_000)
+
+  test('vault activation leaves the host only a placeholder without creating a local account', async () => {
+    const result = await runScenario({
+      transport: 'http',
+      accounts: [],
+      turns: [],
+      plugin: vaultPlugin,
+      vault: true,
+      login: 'vault',
+      preparePoolCredential: false,
+    })
+    verify(result, () => {
+      expect(result.exits).toEqual([0])
+      expect(result.config.commonAuthPool.rows).toEqual({})
+      expect(result.state.accounts ?? {}).toEqual({})
+      expect(result.exported).toContain(PLACEHOLDER)
+      expect(result.exported).toContain('openai-auth-vault')
+      const secrets = [
+        ...result.exported.matchAll(/"(?:access|refresh)"\s*:\s*"([^"]*)"/g),
+      ].map((match) => match[1])
+      expect(secrets).toEqual([
+        'common-auth-placeholder.openai',
+        'common-auth-placeholder.openai',
+      ])
+      for (const account of Object.values(MOCK_ACCOUNTS))
+        expect(result.exported).not.toContain(account.token)
+      expect(result.exported).not.toContain('refresh-')
+      expect(result.wire.filter((record) => record.identity !== 'V')).toEqual(
+        [],
+      )
     })
   }, 180_000)
 })

@@ -93,6 +93,7 @@ import {
   chatgptLoginMethods,
   isLeftoverCredential,
   type PoolLoginResult,
+  vaultLoginMethod,
   writeLoginToPool,
 } from './login'
 import { registerCodexModelRules } from './models'
@@ -418,6 +419,7 @@ export async function setupOpenAIAuth(
     }),
     onLogin: (login) => storeLogin(login),
     label: 'ChatGPT (openai-auth account pool)',
+    vault: vaultLoginMethod(vault),
   })
   const models = await registerCodexModelRules(ctx)
 

@@ -45,13 +45,15 @@ Log in with OpenCode's normal auth command and pick the `openai` provider:
 /login openai
 ```
 
-Three methods are offered:
+The local login methods are:
 
 - **ChatGPT Pro/Plus (browser)** — opens the OpenAI authorization page and completes the login through a local callback. Use this on a machine with a browser.
 - **ChatGPT Pro/Plus (headless)** — device-code flow for remote or headless machines: you're shown a code to enter at the OpenAI device page from any browser.
 - **Manually enter API Key** — falls back to a standard pay-as-you-go OpenAI API key (no OAuth, normal billing).
 
-The account you log in with via `/login openai` is your **main** account, stored and refreshed by OpenCode's own auth store. Additional **fallback** accounts are managed separately (see [Multiple accounts](#multiple-accounts)).
+An enrolled host also offers **ChatGPT accounts in the vault** in `/login openai` and `opencode auth login`. It needs no browser or ChatGPT sign-in and creates no local account: OpenCode stores only the plugin's non-routable placeholder so requests can use the vault. On OpenCode 1, activation requires an empty `openai` slot in `auth.json`; any existing record, malformed JSON or unreadable file is refused without changing it. A missing file on a fresh install is allowed. Enrollment is checked again when activation completes; invalid or unreadable enrollment is refused.
+
+The account you sign in to with a local ChatGPT method is your **main** account, stored and refreshed by OpenCode's own auth store until migration into the shared pool. Additional **fallback** accounts are managed separately (see [Multiple accounts](#multiple-accounts)). Vault activation does not create a main account.
 
 ## OpenCode 2
 
@@ -80,6 +82,8 @@ How it differs from OpenCode 1:
 - **Models**: the same allow and deny lists and context caps as on OpenCode 1.
 
 Not on OpenCode 2 yet: the `/openai` menu and the sidebar (account management works from OpenCode 1, or `opencode auth login` there), cache keep-warm, request dumps, reset credits, cost zeroing, and Codex request shaping such as turn-metadata headers, `thread-id` and `x-codex-*` headers, and tool normalisation. Only requests using the selected pool placeholder are served from the pool and vault; other OpenAI credentials remain under the host's control.
+
+For an enrolled vault-only host, choose **ChatGPT accounts in the vault**, or run `opencode2 auth login openai --method openai-auth-vault` (use your OpenCode 2 executable's name). This activates vault routing without OAuth or a pool account. The host's credential row holds only the placeholder, under the vault method's ID. An unenrolled host is refused with a fixed message; enrollment uses the same `openai-auth-opencode` name and files as OpenCode 1.
 
 ## Multiple accounts
 

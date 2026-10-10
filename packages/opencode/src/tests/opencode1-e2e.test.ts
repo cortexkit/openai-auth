@@ -30,9 +30,20 @@ import { pathToFileURL } from 'node:url'
 import {
   loadAccounts,
   mutateAccounts,
+  vaultPaths,
+  vaultStateDir,
 } from '@cortexkit/openai-auth-core/internal'
+import {
+  startMockDaemon,
+  vaultLogin,
+} from '../../../core/src/tests/fixtures/mock-claustrum'
 import { authDoctorChecks, readStoreIds } from '../auth/doctor'
-import { isPoolPlaceholder, POOL_MIGRATION_KEY } from '../core/pool-migration'
+import { VAULT_LOGIN_LABEL } from '../auth/methods'
+import {
+  isPoolPlaceholder,
+  POOL_MIGRATION_KEY,
+  POOL_PLACEHOLDER,
+} from '../core/pool-migration'
 import { hostBinary } from './fixtures/opencode-host'
 import {
   MOCK_ACCOUNTS,
@@ -102,7 +113,7 @@ function isolatedEnv(root: string) {
  * its quota polls) to the mock instead. The build is imported only after
  * that, so nothing in it can hold the unredirected `fetch`.
  */
-function writePluginEntry(dir: string, mockURL: string): string {
+function writePluginEntry(dir: string, mockURL: string, vault = false): string {
   mkdirSync(dir, { recursive: true })
   const entry = join(dir, 'openai-auth-e2e.js')
   writeFileSync(
@@ -117,7 +128,9 @@ function writePluginEntry(dir: string, mockURL: string): string {
       '  return realFetch(input instanceof Request ? new Request(target, input) : target, init)',
       '}, realFetch)',
       `const plugin = await import(${JSON.stringify(pathToFileURL(BUILT_PLUGIN).href)})`,
-      'export default plugin.default',
+      vault
+        ? 'export default { ...plugin.default, server: (input) => plugin.CodexAuthPlugin(input, { vault: { connectionFile: () => process.env.OPENAI_AUTH_E2E_CLAUSTRUM, pollIntervalMs: 0 } }) }'
+        : 'export default plugin.default',
       '',
     ].join('\n'),
   )
@@ -208,7 +221,7 @@ interface ScenarioResult {
   readonly diagnostics: string
 }
 
-async function runScenario(): Promise<ScenarioResult> {
+async function runScenario(vaultActivation = false): Promise<ScenarioResult> {
   const root = mkdtempSync(join(tmpdir(), 'oai-oc1-e2e-'))
   const project = join(root, 'project')
   mkdirSync(project, { recursive: true })
@@ -220,13 +233,35 @@ async function runScenario(): Promise<ScenarioResult> {
   const configFile = join(configDir, 'openai-auth.json')
   const stateFile = join(configDir, 'openai-auth-state.json')
   const authFile = join(dataDir, 'auth.json')
-  seedLegacyInstall(configDir, dataDir)
+  const daemon = vaultActivation
+    ? await startMockDaemon({
+        directory: root,
+        credentials: { 'oauth:openai:work': vaultLogin(ACCOUNT.id) },
+      })
+    : undefined
+  let rosterPath = ''
+  if (daemon) {
+    Object.assign(env, { OPENAI_AUTH_E2E_CLAUSTRUM: daemon.connectionFile })
+    mkdirSync(configDir, { recursive: true })
+    mkdirSync(dataDir, { recursive: true })
+    writeFileSync(authFile, '{}\n', { mode: 0o600 })
+    const paths = vaultPaths(vaultStateDir(stateFile), 'opencode')
+    rosterPath = paths.rosterPath
+    mkdirSync(join(paths.tokenPath, '..'), { recursive: true, mode: 0o700 })
+    writeFileSync(
+      paths.tokenPath,
+      JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
+  } else seedLegacyInstall(configDir, dataDir)
   writeFileSync(
     join(configDir, 'opencode.json'),
     JSON.stringify(
       {
         $schema: 'https://opencode.ai/config.json',
-        plugin: [writePluginEntry(join(root, 'plugin'), mock.url)],
+        plugin: [
+          writePluginEntry(join(root, 'plugin'), mock.url, vaultActivation),
+        ],
         autoupdate: false,
         share: 'disabled',
       },
@@ -234,6 +269,35 @@ async function runScenario(): Promise<ScenarioResult> {
       2,
     ),
   )
+
+  if (vaultActivation) {
+    const login = Bun.spawn(
+      [
+        binary,
+        'auth',
+        'login',
+        '--provider',
+        'openai',
+        '--method',
+        VAULT_LOGIN_LABEL,
+      ],
+      { cwd: project, env, stdout: 'pipe', stderr: 'pipe' },
+    )
+    const timer = setTimeout(() => login.kill('SIGKILL'), 180_000)
+    const output = await Promise.all([
+      new Response(login.stdout).text(),
+      new Response(login.stderr).text(),
+      login.exited,
+    ])
+    clearTimeout(timer)
+    if (login.exitCode !== 0 || !isPoolPlaceholder(readJson(authFile).openai)) {
+      await daemon?.stop()
+      await mock.stop()
+      throw new Error(
+        `vault login did not activate OpenCode 1: ${output.join('\n')}`,
+      )
+    }
+  }
 
   const port = await freePort()
   const serverURL = `http://127.0.0.1:${port}`
@@ -275,19 +339,25 @@ async function runScenario(): Promise<ScenarioResult> {
     )
     // Listing the providers starts the `openai` provider, whose auth loader
     // starts the migration in the background.
-    await waitFor(
-      () =>
-        readJson(configFile)[POOL_MIGRATION_KEY]?.migratedAt > 0 &&
-        isPoolPlaceholder(readJson(authFile).openai),
-      'the migration to finish',
-      server,
-    )
+    if (!vaultActivation)
+      await waitFor(
+        () =>
+          readJson(configFile)[POOL_MIGRATION_KEY]?.migratedAt > 0 &&
+          isPoolPlaceholder(readJson(authFile).openai),
+        'the migration to finish',
+        server,
+      )
     // A migrated install refuses an account until its first quota reading
     // is in; the migration starts that poll itself.
     await waitFor(
       () =>
-        readJson(configFile).commonAuthPool?.rows?.main?.quota !== undefined,
-      "row main's first quota reading",
+        vaultActivation
+          ? readJson(rosterPath).rows?.some(
+              (row: { quota?: unknown }) => row.quota,
+            )
+          : readJson(configFile).commonAuthPool?.rows?.main?.quota !==
+            undefined,
+      "the serving account's first quota reading",
       server,
     )
     wireBeforeRun = [...mock.records]
@@ -326,6 +396,7 @@ async function runScenario(): Promise<ScenarioResult> {
     clearTimeout(timer)
     await serverOutput
     await mock.stop()
+    await daemon?.stop()
   }
 
   const config = readJson(configFile)
@@ -441,6 +512,28 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 1 (real host)', () => {
       }
 
       expect(result.doctorFindings).toEqual([])
+    })
+  }, 240_000)
+
+  test('vault login activates an empty host slot and requests route only to the vault', async () => {
+    const result = await runScenario(true)
+    verify(result, () => {
+      expect(isPoolPlaceholder(result.slot)).toBe(true)
+      expect(result.slot).toEqual(POOL_PLACEHOLDER)
+      expect(result.config.commonAuthPool?.rows ?? {}).toEqual({})
+      expect(result.state.accounts ?? {}).toEqual({})
+      expect(result.runExit).toBe(0)
+      const primaries = result.wire.filter(
+        (record) => record.action === 'request' && record.kind === 'primary',
+      )
+      expect(primaries.length).toBeGreaterThan(0)
+      for (const record of primaries) {
+        expect(record.identity).toBe('V')
+        expect(record.accountHeader).toBe(ACCOUNT.id)
+      }
+      expect(result.wire.filter((record) => record.identity !== 'V')).toEqual(
+        [],
+      )
     })
   }, 240_000)
 })

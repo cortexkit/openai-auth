@@ -479,17 +479,19 @@ describe('OpenCode 2 entry: logins', () => {
     return (await authorization.callback) as Credential.OAuth
   }
 
-  it('registers distinct pool login methods and labels on integration openai', async () => {
+  it('registers distinct pool and vault login methods and labels on integration openai', async () => {
     const { host } = await startPool('main-first', [{ id: 'main' }])
     expect(
       host.methods.map((entry) => [entry.integrationID, entry.method.id]),
     ).toEqual([
       ['openai', 'openai-auth-pool-browser'],
       ['openai', 'openai-auth-pool-headless'],
+      ['openai', 'openai-auth-vault'],
     ])
     expect(host.methods.map((entry) => entry.method.label)).toEqual([
       'ChatGPT (openai-auth pool, browser)',
       'ChatGPT (openai-auth pool, headless)',
+      'ChatGPT accounts in the vault',
     ])
   })
 

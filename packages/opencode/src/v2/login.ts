@@ -22,9 +22,11 @@
 // refresh tokens are single-use, so the host and pool must not refresh the
 // same token family. Choosing a pool login runs a separate OAuth flow.
 
+import { enrollmentAuthority } from '@cortexkit/common-auth/claustrum'
 import {
   isPlaceholderCredential,
   type PoolLoginMethod,
+  type VaultActivationMethod,
 } from '@cortexkit/common-auth/opencode2'
 import type { PoolStore } from '@cortexkit/common-auth/store'
 import { withAccountRules } from '@cortexkit/openai-auth-core'
@@ -35,6 +37,7 @@ import {
   extractAccountIdFromClaims,
   type IngestAccount,
   isTombstoned,
+  type OpenAiVault,
   POOL_MAIN_ROW_ID,
   parseJwtClaims,
 } from '@cortexkit/openai-auth-core/internal'
@@ -56,6 +59,25 @@ export type BeginLogin = (
 /** Pool methods never replace the host's own ChatGPT login or refresh handlers. */
 export const POOL_BROWSER_METHOD = 'openai-auth-pool-browser'
 export const POOL_HEADLESS_METHOD = 'openai-auth-pool-headless'
+export const VAULT_METHOD = 'openai-auth-vault'
+export const VAULT_ACTIVATION_REFUSAL =
+  'Vault login requires this OpenCode host to be enrolled in the Claustrum vault. Connect to the vault or disconnect this host before trying again.'
+
+export function vaultLoginMethod(
+  vault: Pick<OpenAiVault, 'paths' | 'name'>,
+): VaultActivationMethod {
+  return {
+    method: {
+      id: VAULT_METHOD,
+      type: 'oauth',
+      label: 'ChatGPT accounts in the vault',
+    },
+    async activate() {
+      if ((await enrollmentAuthority(vault.paths, vault.name)) !== 'vault')
+        throw new Error(VAULT_ACTIVATION_REFUSAL)
+    },
+  }
+}
 
 export function chatgptLoginMethods(input: {
   beginLogin: BeginLogin
