@@ -398,56 +398,63 @@ describe('request path with the main account in the pool', () => {
     }
   })
 
-  it('an interrupted own migration still serves main after writing the placeholder', async () => {
-    const h = harness()
-    try {
-      await seedLegacyInstall(h)
-      const config = await h.config()
-      config.routing = { mode: 'main-first' }
-      writeFileSync(h.paths.configPath, JSON.stringify(config))
-      const crash = new Error('interrupted after placeholder write')
-      await expect(
-        migrateToPool(
-          h.deps({
-            onStep: (step) => {
-              if (step === 'after-placeholder-write') throw crash
-            },
-          }),
-        ),
-      ).rejects.toThrow(crash.message)
-      const interrupted = await h.config()
-      expect(interrupted.openaiAuthPool.migratedAt).toBeUndefined()
-      expect(interrupted.openaiAuthPool.pending.rowId).toBe('main')
-      expect(interrupted.mainAccountId).toBe('acct-main')
-      const mainToken = (await h.slot.all()).openai
-      expect(mainToken).toMatchObject(PLACEHOLDER)
-      expect((mainToken as { accountId: string }).accountId).toMatch(
-        /^openai-auth-pool:[a-f0-9]{64}$/,
-      )
-      const bytes = await h.bytes()
-      writeFileSync(configFile, bytes.config as string)
-      writeFileSync(
-        process.env.OPENCODE_OPENAI_AUTH_STATE_FILE as string,
-        bytes.state as string,
-      )
-      const wire = installWire()
-      const fetchOverride = await loadFetch(async () => ({ ...PLACEHOLDER }))
-      const response = await fetchOverride(
-        'https://api.openai.com/v1/responses',
-        request(),
-      )
-      expect(response.status).toBe(200)
-      expect(wire.sends).toEqual([`Bearer ${jwt('acct-main')}`])
-      expectPlaceholderNeverRefreshed(wire)
-      expect(await migrateToPool(h.deps())).toMatchObject({
-        status: 'completed',
-        rowId: 'main',
-        operation: 'resumed',
-      })
-    } finally {
-      h.cleanup()
-    }
-  })
+  phaseIt(
+    'an interrupted own migration still serves main after writing the placeholder',
+    async () => {
+      const h = harness()
+      try {
+        await clock.phase('seed', () => seedLegacyInstall(h))
+        const config = await h.config()
+        config.routing = { mode: 'main-first' }
+        writeFileSync(h.paths.configPath, JSON.stringify(config))
+        const crash = new Error('interrupted after placeholder write')
+        await clock.phase('interrupted migration', () =>
+          expect(
+            migrateToPool(
+              h.deps({
+                onStep: (step) => {
+                  if (step === 'after-placeholder-write') throw crash
+                },
+              }),
+            ),
+          ).rejects.toThrow(crash.message),
+        )
+        const interrupted = await h.config()
+        expect(interrupted.openaiAuthPool.migratedAt).toBeUndefined()
+        expect(interrupted.openaiAuthPool.pending.rowId).toBe('main')
+        expect(interrupted.mainAccountId).toBe('acct-main')
+        const mainToken = (await h.slot.all()).openai
+        expect(mainToken).toMatchObject(PLACEHOLDER)
+        expect((mainToken as { accountId: string }).accountId).toMatch(
+          /^openai-auth-pool:[a-f0-9]{64}$/,
+        )
+        const bytes = await h.bytes()
+        writeFileSync(configFile, bytes.config as string)
+        writeFileSync(
+          process.env.OPENCODE_OPENAI_AUTH_STATE_FILE as string,
+          bytes.state as string,
+        )
+        const wire = installWire()
+        const fetchOverride = await loadFetch(async () => ({ ...PLACEHOLDER }))
+        const response = await clock.phase('request', () =>
+          fetchOverride('https://api.openai.com/v1/responses', request()),
+        )
+        expect(response.status).toBe(200)
+        expect(wire.sends).toEqual([`Bearer ${jwt('acct-main')}`])
+        expectPlaceholderNeverRefreshed(wire)
+        expect(
+          await clock.phase('resume', () => migrateToPool(h.deps())),
+        ).toMatchObject({
+          status: 'completed',
+          rowId: 'main',
+          operation: 'resumed',
+        })
+      } finally {
+        h.cleanup()
+        await clock.phase('drain', () => scope.settlePluginWork())
+      }
+    },
+  )
 
   it('main-first sends with row main and attributes its quota to main', async () => {
     seedStore('main-first', [row('main'), row('fallback-1')])
