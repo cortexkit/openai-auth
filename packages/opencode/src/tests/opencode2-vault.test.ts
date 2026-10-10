@@ -32,6 +32,7 @@ import {
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import { PoolAccountSource } from '../core/pool-account-source'
 import { opencode1HostSlot } from '../v2/host-slot'
+import { VAULT_METHOD } from '../v2/login'
 import { setupOpenAIAuth } from '../v2/setup'
 import {
   fakeOpenCode2Host,
@@ -148,6 +149,34 @@ async function start(
 }
 
 type Host = Awaited<ReturnType<typeof start>>['host']
+
+it('vault activation is registered and returns only the host placeholder without a pool write', async () => {
+  const { host, files } = await start('main-first', [], {})
+  const before = [files.paths().configPath, files.paths().statePath].map(
+    (path) => readFileSync(path),
+  )
+  const method = host.methods.find((entry) => entry.method.id === VAULT_METHOD)
+  if (!method) throw new Error('missing vault activation method')
+  const flow = await method.authorize({})
+  expect(flow.url).toBe('')
+  expect(flow.mode).toBe('auto')
+  if (typeof flow.callback === 'function')
+    throw new Error('vault callback must be automatic')
+  const credential = await flow.callback
+  expect(credential as unknown).toEqual({
+    type: 'oauth',
+    methodID: 'openai-auth-vault',
+    access: 'common-auth-placeholder.openai',
+    refresh: 'common-auth-placeholder.openai',
+    expires: expect.any(Number),
+    metadata: { commonAuthPlaceholder: true },
+  })
+  expect(
+    [files.paths().configPath, files.paths().statePath].map((path) =>
+      readFileSync(path),
+    ),
+  ).toEqual(before)
+})
 
 /** Asserts the host's request is refused locally in vault mode for `cause`. */
 async function expectVaultRefusal(host: Host, cause: VaultModeRefusal) {

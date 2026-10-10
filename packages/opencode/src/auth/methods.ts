@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises'
 import {
   type AccountMenuOptions,
   type AuthorizeInputs,
@@ -15,6 +16,7 @@ import {
   runAccountMenu,
   runMenu,
 } from '@cortexkit/common-auth/auth-menu'
+import { enrollmentAuthority } from '@cortexkit/common-auth/claustrum'
 import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
 import {
   type MigrationBlocker,
@@ -48,6 +50,7 @@ import type {
 } from '@opencode-ai/plugin'
 import { getConfigPath } from '../config'
 import { type AccountPaths, getAccountPaths } from '../core/account-paths'
+import { opencodeAuthPath } from '../core/host-slot'
 import {
   migratedPoolRows,
   openAccountPool,
@@ -55,7 +58,11 @@ import {
   poolSettingsLocks,
 } from '../core/pool-accounts'
 import { isPoolMainPlaceholder } from '../core/pool-main'
-import { legacyRefreshLocks, withMainRefreshLock } from '../core/pool-migration'
+import {
+  legacyRefreshLocks,
+  POOL_PLACEHOLDER,
+  withMainRefreshLock,
+} from '../core/pool-migration'
 import { observationFromSnapshot } from '../core/pool-quota'
 import { migrationFenceOpen } from '../core/version-fence'
 import { PackageVersion } from '../version'
@@ -110,6 +117,8 @@ export interface CreateAuthMethodsOptions {
     OpenAiVault,
     | 'host'
     | 'name'
+    | 'paths'
+    | 'enrolled'
     | 'status'
     | 'waitForApproval'
     | 'routes'
@@ -121,6 +130,13 @@ export interface CreateAuthMethodsOptions {
 }
 
 const MENU_TITLE = 'OpenAI accounts'
+export const VAULT_LOGIN_LABEL = 'ChatGPT accounts in the vault'
+/**
+ * Shown while the vault login runs. OpenCode 1's failed callback carries no
+ * message of its own, so this text also explains why the login can fail.
+ */
+export const VAULT_LOGIN_INSTRUCTIONS =
+  'Uses the ChatGPT accounts in the Claustrum vault, with no sign-in. This works only while this host is connected to the vault and OpenCode has no OpenAI login stored; otherwise it fails and changes nothing.'
 
 async function authorizeBrowser(): Promise<AuthOAuthResult> {
   const { redirectUri } = await startOAuthServer()
@@ -177,7 +193,7 @@ async function authorizeHeadless(version: string): Promise<AuthOAuthResult> {
 }
 
 /**
- * Build the three OpenCode auth entries. The browser entry opens the shared
+ * Build OpenCode's auth entries. The browser entry opens the shared
  * account menu when `opencode auth login` runs on a machine that already
  * has a credential; the TUI and a first CLI login sign in as before.
  */
@@ -470,5 +486,46 @@ export function createAuthMethods({
       label: 'Manually enter API Key',
       type: 'api',
     },
+    ...(vault?.enrolled()
+      ? [
+          {
+            label: VAULT_LOGIN_LABEL,
+            type: 'oauth' as const,
+            authorize: async (): Promise<AuthOAuthResult> => ({
+              url: '',
+              instructions: VAULT_LOGIN_INSTRUCTIONS,
+              method: 'auto',
+              callback: async () => {
+                if (
+                  (await enrollmentAuthority(vault.paths, vault.name)) !==
+                  'vault'
+                )
+                  return { type: 'failed' }
+                // The host client cannot read logins. Inspect the disk record
+                // without filtering invalid entries or treating read errors as
+                // an empty slot: even an unrecognised login must be preserved.
+                try {
+                  const map: unknown = JSON.parse(
+                    await readFile(opencodeAuthPath(), 'utf8'),
+                  )
+                  if (
+                    !map ||
+                    typeof map !== 'object' ||
+                    Array.isArray(map) ||
+                    Object.hasOwn(map, 'openai')
+                  )
+                    return { type: 'failed' }
+                } catch (error) {
+                  // A fresh install can have no auth file yet. All other
+                  // failures are unsafe to interpret as an absent login.
+                  if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+                    return { type: 'failed' }
+                }
+                return { ...POOL_PLACEHOLDER, type: 'success' }
+              },
+            }),
+          },
+        ]
+      : []),
   ]
 }

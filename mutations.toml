@@ -1865,3 +1865,148 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/tui-quota-r
 test_count_pattern = "Ran {count} test"
 expect_red = ['^dynamic\squota\sTUI\srows\ssidebar\squota\stext\smatches\sthe\sshared\scompact\sformatter$']
 expect_message = "expect(received).toEqual(expected)"
+
+# Vault-only activation must not need an OAuth login or replace a host login.
+
+[[control]]
+id = "vault-login-oc1-offer"
+guards = "an unenrolled OpenCode 1 host is not offered vault activation"
+file = "packages/opencode/src/auth/methods.ts"
+old = "...(vault?.enrolled()"
+new = "...(vault /* NON-VACUITY BREAK: offer activation without enrollment */"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\snot\senrolled\shides\sthe\smethod\sand\srefuses\sa\spreviously\soffered\scallback$']
+expect_message = "Received: true"
+
+[[control]]
+id = "vault-login-oc1-authority"
+guards = "OpenCode 1 rechecks authority before returning a placeholder"
+file = "packages/opencode/src/auth/methods.ts"
+old = "(await enrollmentAuthority(vault.paths, vault.name)) !==\n                  'vault'"
+new = "false /* NON-VACUITY BREAK: bypass activation authority */"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\snot\senrolled\shides\sthe\smethod\sand\srefuses\sa\spreviously\soffered\scallback$']
+expect_message = '"type": "success"'
+
+[[control]]
+id = "vault-login-oc1-unreadable-enrollment"
+guards = "unreadable enrollment is not mistaken for vault authority on OpenCode 1"
+file = "packages/opencode/src/auth/methods.ts"
+old = "(await enrollmentAuthority(vault.paths, vault.name)) !==\n                  'vault'"
+new = "(await enrollmentAuthority(vault.paths, vault.name)) === 'local' /* NON-VACUITY BREAK */"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\sunreadable\senrollment\srefuses\sactivation\swithout\stouching\sfiles$']
+expect_message = '"type": "success"'
+
+[[control]]
+id = "vault-login-oc1-existing-slot"
+guards = "even an invalid openai record prevents OpenCode 1 activation"
+file = "packages/opencode/src/auth/methods.ts"
+old = "Object.hasOwn(map, 'openai')"
+new = "false /* NON-VACUITY BREAK: ignore an existing host record */"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\sexisting\sor\smalformed\sinvalid\srecord\srefuses\sand\spreserves\sauth\sbytes$']
+expect_message = '"type": "success"'
+
+[[control]]
+id = "vault-login-oc1-malformed-file"
+guards = "malformed auth JSON is refused rather than treated as an empty slot"
+file = "packages/opencode/src/auth/methods.ts"
+old = "if ((error as NodeJS.ErrnoException).code !== 'ENOENT')"
+new = "if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== 'ENOENT') // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\sexisting\sor\smalformed\smalformed\sJSON\srefuses\sand\spreserves\sauth\sbytes$']
+expect_message = '"type": "success"'
+
+[[control]]
+id = "vault-login-oc1-non-object-file"
+guards = "a JSON array cannot authorize an empty OpenCode 1 slot"
+file = "packages/opencode/src/auth/methods.ts"
+old = "Array.isArray(map) ||"
+new = "false /* NON-VACUITY BREAK: accept arrays */ ||"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\sexisting\sor\smalformed\snon-object\sJSON\srefuses\sand\spreserves\sauth\sbytes$']
+expect_message = '"type": "success"'
+
+[[control]]
+id = "vault-login-oc1-unreadable-file"
+guards = "an auth path that cannot be read is refused on OpenCode 1"
+file = "packages/opencode/src/auth/methods.ts"
+old = "if ((error as NodeJS.ErrnoException).code !== 'ENOENT')"
+new = "if ((error as NodeJS.ErrnoException).code !== 'EISDIR') // NON-VACUITY BREAK: ignore a failed disk read"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\sunreadable\sauth\sfile\srefuses\swithout\stouching\spool\sfiles$']
+expect_message = '"type": "success"'
+
+[[control]]
+id = "vault-login-oc1-placeholder"
+guards = "OpenCode 1 activation uses the exact migration placeholder"
+file = "packages/opencode/src/auth/methods.ts"
+old = "return { ...POOL_PLACEHOLDER, type: 'success' }"
+new = "return { ...POOL_PLACEHOLDER, type: 'success', refresh: 'wrong-placeholder' } // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s1\svault\sactivation\senrolled\sempty\sslot\sreturns\sonly\sthe\splaceholder\swithout\stouching\spool\sfiles$']
+expect_message = "wrong-placeholder"
+
+[[control]]
+id = "vault-login-oc2-authority"
+guards = "OpenCode 2 activation refuses an unenrolled host before any placeholder is issued"
+file = "packages/opencode/src/v2/login.ts"
+old = "if ((await enrollmentAuthority(vault.paths, vault.name)) !== 'vault')"
+new = "if (false) // NON-VACUITY BREAK: bypass activation authority"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\svault\sactivation\snot\senrolled\sactivation\srefuses\swith\sfixed\scredential-free\stext$']
+expect_message = "VAULT_ACTIVATION_REFUSAL"
+
+[[control]]
+id = "vault-login-oc2-unreadable-enrollment"
+guards = "unreadable enrollment is not mistaken for vault authority on OpenCode 2"
+file = "packages/opencode/src/v2/login.ts"
+old = "if ((await enrollmentAuthority(vault.paths, vault.name)) !== 'vault')"
+new = "if ((await enrollmentAuthority(vault.paths, vault.name)) === 'local') // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-login.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-login.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\svault\sactivation\sunreadable\senrollment\sactivation\srefuses\swith\sfixed\scredential-free\stext$']
+expect_message = "VAULT_ACTIVATION_REFUSAL"
+
+[[control]]
+id = "vault-login-oc2-registration"
+guards = "OpenCode 2 setup registers vault activation independently of pool OAuth logins"
+file = "packages/opencode/src/v2/setup.ts"
+old = "    vault: vaultLoginMethod(vault),\n"
+new = "    // NON-VACUITY BREAK: omit the vault activation method\n"
+test_file = "packages/opencode/src/tests/opencode2-vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sactivation\sis\sregistered\sand\sreturns\sonly\sthe\shost\splaceholder\swithout\sa\spool\swrite$']
+expect_message = "missing vault activation method"

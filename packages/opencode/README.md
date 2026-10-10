@@ -20,11 +20,15 @@ Restart OpenCode after changing plugin config, then authenticate:
 /login openai
 ```
 
+If this OpenCode host is already enrolled in the Claustrum vault, choose **ChatGPT accounts in the vault** instead of signing in to ChatGPT. This no-browser activation creates no local account and gives OpenCode only a non-routable placeholder. OpenCode 1 refuses to replace any existing `openai` record in `auth.json`, and refuses malformed or unreadable files without changing them; a missing file is allowed on a fresh install. Enrollment is checked again before activation completes.
+
 ## OpenCode 2
 
 On OpenCode 2 (`@opencode/cli`, tested on 2.0.22) list the same package under `plugins`; OpenCode 2 loads its `./server` entry. OpenCode 2's own OpenAI driver sends the requests, and the plugin chooses the account from the shared account pool and sets its credential through OpenCode 2's session hooks. Logins (`opencode auth login openai`) go into the pool; OpenCode 2 keeps only a placeholder. The `/openai` menu, the sidebar, keep-warm and OpenCode 1's Codex request shaping are not available there yet. See the [repository README](https://github.com/cortexkit/openai-auth#opencode-2) for the details.
 
 Choose **ChatGPT (openai-auth pool, browser)** or **ChatGPT (openai-auth pool, headless)** in `opencode auth login openai` to use the pool. The plugin serves a request only when the host-prepared Authorization bearer equals its pool placeholder exactly. API keys, environment keys and OpenCode's own ChatGPT logins pass through unchanged, without pool quota or attribution; switching connections takes effect on the next request. A placeholder with no usable pool account is refused locally, never sent upstream. Existing host ChatGPT logins are never copied into the pool: choose a pool login to obtain a separate OAuth token family, leaving the host's login and refresh methods intact.
+
+For vault-only use on OpenCode 2, choose **ChatGPT accounts in the vault**, or run `opencode2 auth login openai --method openai-auth-vault` (substitute the name of your OpenCode 2 executable). Activation requires enrollment under `openai-auth-opencode`, shared with OpenCode 1, performs no OAuth and writes no account to the pool. The host receives only the placeholder under this method's ID.
 
 ## Features
 
