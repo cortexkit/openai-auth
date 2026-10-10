@@ -372,8 +372,12 @@ export async function startOAuthServer(): Promise<{
   port: number
   redirectUri: string
 }> {
-  // OpenAI requires this exact registered redirect URI, even though the
-  // listener accepts connections on both IPv4 and IPv6 loopback addresses.
+  // MUST be `localhost`, not `127.0.0.1` or `[::1]`. This exact string is sent
+  // as the OAuth `redirect_uri` (in the authorize URL and the token exchange),
+  // and OpenAI matches it exactly against the URI registered for the Codex
+  // client; any other host fails with `authorize_hydra_invalid_request`. The
+  // listeners below bind both loopback addresses so whichever one the browser
+  // resolves `localhost` to reaches the callback.
   const redirectUri = `http://localhost:${OAUTH_PORT}/auth/callback`
   if (oauthServers.length > 0) {
     return { port: OAUTH_PORT, redirectUri }
