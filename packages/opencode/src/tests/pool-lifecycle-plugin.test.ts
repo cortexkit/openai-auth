@@ -4,31 +4,32 @@
 import { afterEach, beforeEach, describe, expect, spyOn } from 'bun:test'
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { connectClaustrumScopedClient } from '@cortexkit/common-auth/claustrum'
 import { vaultPaths } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
 import {
+  chatgptAccessToken,
   startMockDaemon,
   vaultLogin,
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import type { PoolLifecycleDeps } from '../core/pool-lifecycle.ts'
 import * as poolMigrationSteps from '../core/pool-migration.ts'
 import {
-  adoptHostSlotLogin,
   type HostSlotAdapter,
   isPoolPlaceholder,
   POOL_MIGRATION_KEY,
   type PoolMigrationStep,
 } from '../core/pool-migration.ts'
 import { __resetProcessHeartbeatForTest } from '../core/process-heartbeat.ts'
-import { CodexAuthPlugin } from '../index.ts'
+import { __menuContextForTest, CodexAuthPlugin } from '../index.ts'
 import { drainSidebarWrites } from '../sidebar-state.ts'
 import { FAR, fileSlot, jwt, login } from './fixtures/pool-migration-harness.ts'
 import { createRequestTestScope } from './request-test-scope.ts'
@@ -191,7 +192,10 @@ function installWire(options: { usage?: boolean } = {}): Wire {
 }
 
 type PoolOptions = Partial<
-  Pick<PoolLifecycleDeps, 'fence' | 'migrate' | 'adopt' | 'runDeps' | 'log'>
+  Pick<
+    PoolLifecycleDeps,
+    'fence' | 'migrate' | 'adopt' | 'runDeps' | 'log' | 'timers'
+  >
 > & { enabled?: boolean }
 
 /**
@@ -485,76 +489,14 @@ describe("on OpenCode 1's plugin client", () => {
   })
 })
 
-describe('adoption beside the Claustrum vault', () => {
-  // Until the vault has read its first roster it reports serving nothing, so
-  // an adoption run before then would take a slot login on a host the vault
-  // serves. The loader does not wait for the roster; the adoption does.
-  it("the first adoption waits for the vault's first roster, so it sees the vault serving", async () => {
-    const daemon = await startMockDaemon({
-      directory: dir,
-      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
-    })
-    try {
-      const stateDir = join(dir, 'vault')
-      mkdirSync(stateDir, { recursive: true, mode: 0o700 })
-      const { tokenPath } = vaultPaths(stateDir, 'opencode')
-      writeFileSync(
-        tokenPath,
-        JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
-        { mode: 0o600 },
-      )
-      chmodSync(tokenPath, 0o600)
-      await seedLegacy()
-      installWire({ usage: true })
-      const seen: Array<boolean | undefined> = []
-      const connectionEntered = deferred()
-      const connectionRelease = deferred()
-      releaseMigrations.push(() => connectionRelease.resolve())
-      await loadPlugin(
-        {
-          adopt: async (deps) => {
-            seen.push(deps.vaultServes?.())
-            return adoptHostSlotLogin(deps)
-          },
-        },
-        {
-          vault: {
-            stateDir,
-            connectionFile: () => daemon.connectionFile,
-            // Hold roster discovery until the loader has returned. Adoption
-            // must not use an empty vault roster just because loading is done.
-            connectScoped: async () => {
-              connectionEntered.resolve()
-              await connectionRelease.promise
-              return connectClaustrumScopedClient({
-                connectionFile: daemon.connectionFile,
-                projectRoot: dir,
-                storagePath: tokenPath,
-              })
-            },
-            pollIntervalMs: 0,
-          },
-        },
-      )
-      await connectionEntered.promise
-      expect(seen).toEqual([])
-      connectionRelease.resolve()
-      await waitFor(async () => seen.length > 0, 'the first adoption')
-      expect(seen[0]).toBe(true)
-    } finally {
-      await hooks?.dispose?.()
-      hooks = undefined
-      await daemon.stop()
-    }
-  })
-})
+// Vault mode (this host enrolled with the Claustrum vault) writes no local
+// account file: neither the migration nor an adoption of a slot login runs,
+// and the slot login is not used. Both run once the host disconnects.
+describe('the pool lifecycle in vault mode', () => {
+  const VAULT_BEARER = `Bearer ${chatgptAccessToken('chatgpt-vault')}`
 
-describe('adoption beside a vault that never answers', () => {
-  // The adoption waits for the vault's first roster only for a bounded time.
-  // Past it the run adopts nothing and ends retryable, so the lifecycle is
-  // free again and its next scheduled run tries once more.
-  it('gives up after its bound without adopting, and ends retryable', async () => {
-    const stateDir = join(dir, 'vault')
+  /** An approved enrollment, as Connect leaves it; returns the token path. */
+  function enroll(stateDir: string): string {
     mkdirSync(stateDir, { recursive: true, mode: 0o700 })
     const { tokenPath } = vaultPaths(stateDir, 'opencode')
     writeFileSync(
@@ -563,48 +505,153 @@ describe('adoption beside a vault that never answers', () => {
       { mode: 0o600 },
     )
     chmodSync(tokenPath, 0o600)
-    await seedLegacy()
-    installWire({ usage: true })
-    let adopted = 0
-    const warnings: Array<{ message: string; data: unknown }> = []
-    await loadPlugin(
-      {
-        adopt: async (deps) => {
-          adopted++
-          return adoptHostSlotLogin(deps)
-        },
-        log: {
-          info: () => {},
-          warn: (message: string, data?: unknown) => {
-            warnings.push({ message, data })
+    return tokenPath
+  }
+
+  /** Timers the test fires by hand. */
+  function fakeTimers() {
+    const pending = new Map<number, () => void>()
+    let next = 0
+    return {
+      set(run: () => void) {
+        pending.set(++next, run)
+        return next
+      },
+      clear(handle: unknown) {
+        pending.delete(handle as number)
+      },
+      fire() {
+        const due = [...pending.values()]
+        pending.clear()
+        for (const run of due) run()
+      },
+    }
+  }
+
+  /** The local account files and OpenCode's slot file, byte for byte. */
+  const localFiles = () =>
+    [configFile, stateFile, join(dir, 'data', 'opencode', 'auth.json')].map(
+      (path) => (existsSync(path) ? readFileSync(path, 'utf8') : null),
+    )
+
+  async function readyVault() {
+    const vault = __menuContextForTest()?.vault
+    if (!vault) throw new Error('the loader built no vault')
+    await vault.refresh()
+    await vault.pollStale(0)
+  }
+
+  it('a never-migrated install is served from the vault without migrating, and migrates once the host disconnects', async () => {
+    const daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+    })
+    try {
+      const stateDir = join(dir, 'vault')
+      const tokenPath = enroll(stateDir)
+      await seedLegacy()
+      const before = localFiles()
+      const wire = installWire({ usage: true })
+      const timers = fakeTimers()
+      const { fetchOverride } = await loadPlugin(
+        { timers },
+        {
+          vault: {
+            stateDir,
+            connectionFile: () => daemon.connectionFile,
+            pollIntervalMs: 0,
           },
         },
-      },
-      {
-        vault: {
-          stateDir,
-          // The connection is never made, so the first roster read never ends.
-          connectScoped: () => new Promise(() => {}),
-          pollIntervalMs: 0,
-          firstRosterWaitMs: 300,
+      )
+      await readyVault()
+
+      const response = await send(fetchOverride)
+      timers.fire()
+      await scope.settlePluginWork()
+
+      expect(response.status).toBe(200)
+      // The vault served; the login in the slot was neither sent nor
+      // refreshed, and nothing was migrated or written.
+      expect(wire.sends).toEqual([VAULT_BEARER])
+      expect(wire.refreshTokens).toEqual([])
+      expect(localFiles()).toEqual(before)
+      expect(readJson(configFile)[POOL_MIGRATION_KEY]).toBeUndefined()
+
+      // Disconnect: the next lifecycle check migrates the install.
+      rmSync(tokenPath)
+      timers.fire()
+      await waitFor(
+        async () => isPoolPlaceholder(await slotValue()),
+        'the migration after disconnect',
+      )
+      expect(readJson(configFile)[POOL_MIGRATION_KEY]?.migratedAt).toBeNumber()
+    } finally {
+      await hooks?.dispose?.()
+      hooks = undefined
+      await daemon.stop()
+    }
+  })
+
+  it('a slot login landing in vault mode is neither used nor adopted, the local files stay byte-identical, and it is adopted after disconnect', async () => {
+    const daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+    })
+    try {
+      const stateDir = join(dir, 'vault')
+      await seedLegacy()
+      const wire = installWire({ usage: true })
+      const timers = fakeTimers()
+      const { fetchOverride } = await loadPlugin(
+        { timers },
+        {
+          vault: {
+            stateDir,
+            connectionFile: () => daemon.connectionFile,
+            pollIntervalMs: 0,
+          },
         },
-      },
-    )
-    await waitFor(
-      async () =>
-        warnings.some(
-          (warning) =>
-            warning.message === 'host login adoption will be tried again',
-        ),
-      'the adoption to end retryable',
-    )
-    expect(
-      warnings.find(
-        (warning) =>
-          warning.message === 'host login adoption will be tried again',
-      )?.data,
-    ).toEqual({ outcome: { status: 'retry', reason: 'vault-roster-pending' } })
-    expect(adopted).toBe(0)
+      )
+      await waitFor(
+        async () => isPoolPlaceholder(await slotValue()),
+        'the migration',
+      )
+      await scope.settlePluginWork()
+      const tokenPath = enroll(stateDir)
+      await readyVault()
+      // A new login lands in OpenCode's slot (`opencode auth login`).
+      await setSlot(login('acct-new', 'r-new'))
+      await scope.settlePluginWork()
+      const before = localFiles()
+
+      // A request, and the lifecycle's own adoption tick.
+      const response = await send(fetchOverride)
+      timers.fire()
+      await scope.settlePluginWork()
+
+      expect(response.status).toBe(200)
+      expect(wire.sends).toEqual([VAULT_BEARER])
+      expect(localFiles()).toEqual(before)
+      expect(Object.keys(readJson(stateFile).accounts)).not.toContain(
+        'acct-new',
+      )
+
+      // Disconnect: a request finds the real login in the slot, serves it,
+      // and adopts it into the pool.
+      rmSync(tokenPath)
+      const after = await send(fetchOverride)
+      expect(after.status).toBe(200)
+      expect(wire.sends.at(-1)).toBe(`Bearer ${jwt('acct-new')}`)
+      await waitFor(
+        async () => isPoolPlaceholder(await slotValue()),
+        'the adoption after disconnect',
+      )
+      expect(Object.keys(readJson(stateFile).accounts)).toContain('acct-new')
+    } finally {
+      await hooks?.dispose?.()
+      hooks = undefined
+      await daemon.stop()
+    }
   })
 })
 

@@ -16,6 +16,13 @@
 //   plugin's own auth methods, and (through `noticeRealSlot`) when a request
 //   finds a real credential in the slot of a migrated install.
 //
+// - While `paused` reports true (the host is in vault mode: enrolled with the
+//   Claustrum vault), neither runs: the slot and the account files are left
+//   exactly as they are. The timer keeps checking every minute (jittered),
+//   so once the host disconnects the migration or adoption runs then; a
+//   request that finds a real login in the slot afterwards asks for one at
+//   once.
+//
 // Every run goes through one queue, so a migration and an adoption never run
 // at once in this process, and an adoption asked for while one is already
 // waiting or running joins it instead of starting another. Across processes
@@ -72,6 +79,11 @@ export interface PoolLifecycleDeps {
   random?: () => number
   /** Passed through to every migration and adoption run (tests). */
   runDeps?: Partial<PoolMigrationDeps>
+  /**
+   * True while no migration or adoption may run: the host is in vault mode,
+   * which writes no local account file. Read before every run.
+   */
+  paused?: () => boolean
 }
 
 export interface PoolLifecycle {
@@ -190,7 +202,19 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
   // Up to a fifth shorter, so processes started together drift apart.
   const jitter = (ms: number) => Math.round(ms * (1 - 0.2 * random()))
 
+  /**
+   * True, and the next check scheduled, while runs are paused. The check
+   * keeps the short base delay (no backoff), so a disconnect is noticed
+   * within about a minute.
+   */
+  function pausedNow(): boolean {
+    if (!deps.paused?.()) return false
+    schedule(jitter(POOL_RETRY_BASE_MS))
+    return true
+  }
+
   async function runMigration(): Promise<void> {
+    if (pausedNow()) return
     let outcome: PoolTransferOutcome
     try {
       outcome = await migrate({ ...runDeps(), fence })
@@ -228,6 +252,7 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
   }
 
   async function runAdoption(): Promise<void> {
+    if (pausedNow()) return
     let outcome: PoolTransferOutcome
     try {
       // Adoption copies a slot token into the pool the same way migration
@@ -261,11 +286,7 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
       return
     }
     if (outcome.status === 'slot-read-only') return
-    // Every other outcome means the install is migrated. Adoption runs even
-    // while the vault serves accounts, because the account source skips a
-    // pool row for an account the vault also holds (neither routed nor
-    // refreshed locally) and OpenCode 1 installs the plugin's fetch only when
-    // its `openai` slot holds an OAuth value such as the placeholder.
+    // Every other outcome means the install is migrated.
     isMigrated = true
     if (outcome.status === 'completed')
       log.info('host login adopted into the account pool', {

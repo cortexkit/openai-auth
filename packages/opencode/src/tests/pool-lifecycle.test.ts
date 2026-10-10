@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   createPoolLifecycle,
+  POOL_RETRY_BASE_MS,
   POOL_RETRY_MAX_MS,
   type PoolLifecycle,
   type PoolLifecycleDeps,
@@ -328,16 +329,17 @@ describe('the migration in the background', () => {
   })
 })
 
-describe('adopting later logins', () => {
-  async function migratedLifecycle(extra: Partial<PoolLifecycleDeps> = {}) {
-    await seedLegacyInstall(h)
-    const created = create(extra)
-    created.lifecycle.start()
-    await created.lifecycle.idle()
-    expect(created.lifecycle.migrated()).toBe(true)
-    return created
-  }
+/** A lifecycle on a legacy install that has just migrated. */
+async function migratedLifecycle(extra: Partial<PoolLifecycleDeps> = {}) {
+  await seedLegacyInstall(h)
+  const created = create(extra)
+  created.lifecycle.start()
+  await created.lifecycle.idle()
+  expect(created.lifecycle.migrated()).toBe(true)
+  return created
+}
 
+describe('adopting later logins', () => {
   it('a new login of the main account goes to row main, and the placeholder is back', async () => {
     const { lifecycle } = await migratedLifecycle()
     await h.setSlot(login('acct-main', 'r-main-2', 'relogin'))
@@ -439,6 +441,60 @@ describe('adopting later logins', () => {
     expect((await h.row('main'))?.credential).toMatchObject({
       refresh: 'r-main-host',
     })
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+  })
+})
+
+// Vault mode (the host enrolled with the Claustrum vault) writes no local
+// account file: while `paused` says so, neither the migration nor an
+// adoption runs, and both run once the host disconnects.
+describe('in vault mode', () => {
+  it('a slot login landing in vault mode is not adopted: the slot and the account files stay byte-identical; after disconnect it is', async () => {
+    let vaultMode = false
+    const { lifecycle, timers } = await migratedLifecycle({
+      paused: () => vaultMode,
+    })
+    vaultMode = true
+    await h.setSlot(login('acct-new', 'r-new'))
+    const before = await h.bytes()
+    // Every trigger: a login through the plugin, a request's notice, and the
+    // timer.
+    await lifecycle.requestAdoption()
+    lifecycle.noticeRealSlot('r-new')
+    await lifecycle.idle()
+    timers.fire()
+    await lifecycle.idle()
+    expect(await h.bytes()).toEqual(before)
+    expect(await h.row('acct-new')).toBeUndefined()
+    // The pause is checked again every minute, without backing off.
+    expect(timers.delays()).toEqual([POOL_RETRY_BASE_MS])
+
+    vaultMode = false
+    timers.fire()
+    await lifecycle.idle()
+    expect((await h.row('acct-new'))?.credential).toMatchObject({
+      refresh: 'r-new',
+    })
+    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
+  })
+
+  it('a never-migrated install does not migrate in vault mode; after disconnect it does', async () => {
+    await seedLegacyInstall(h)
+    const before = await h.bytes()
+    let vaultMode = true
+    const { lifecycle, timers } = create({ paused: () => vaultMode })
+    lifecycle.start()
+    await lifecycle.idle()
+    await lifecycle.requestAdoption()
+    timers.fire()
+    await lifecycle.idle()
+    expect(lifecycle.migrated()).toBe(false)
+    expect(await h.bytes()).toEqual(before)
+
+    vaultMode = false
+    timers.fire()
+    await lifecycle.idle()
+    expect(lifecycle.migrated()).toBe(true)
     expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
   })
 })

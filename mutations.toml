@@ -1710,3 +1710,51 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ["^Pi\\sin\\svault\\smode\\sneither\\sPi's\\slogin\\snor\\sa\\spool\\srow\\sthe\\svault\\sdoes\\snot\\shold\\sis\\ssent\\swith,\\srefreshed\\sor\\spolled,\\sand\\sthe\\spool\\sfiles\\sstay\\sbyte-identical$"]
+
+[[control]]
+id = "vault-mode-pauses-the-pool-lifecycle"
+guards = "while paused (vault mode) the pool lifecycle runs no adoption: a slot login stays in the slot and the account files stay byte-identical"
+file = "packages/opencode/src/core/pool-lifecycle.ts"
+old = "    if (!deps.paused?.()) return false\n"
+new = "    return false // NON-VACUITY BREAK: run while paused.\n"
+test_file = "packages/opencode/src/tests/pool-lifecycle.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-lifecycle.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^in\\svault\\smode\\sa\\sslot\\slogin\\slanding\\sin\\svault\\smode\\sis\\snot\\sadopted:\\sthe\\sslot\\sand\\sthe\\saccount\\sfiles\\sstay\\sbyte-identical;\\safter\\sdisconnect\\sit\\sis$"]
+
+[[control]]
+id = "opencode1-vault-mode-wires-the-lifecycle-pause"
+guards = "OpenCode 1 pauses its pool lifecycle in vault mode, so a never-migrated install is not migrated while the vault serves it"
+file = "packages/opencode/src/index.ts"
+old = "          paused: () => vault.enrolled(),"
+new = "          paused: () => false, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/pool-lifecycle-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-lifecycle-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^the\\spool\\slifecycle\\sin\\svault\\smode\\sa\\snever-migrated\\sinstall\\sis\\sserved\\sfrom\\sthe\\svault\\swithout\\smigrating,\\sand\\smigrates\\sonce\\sthe\\shost\\sdisconnects$"]
+
+[[control]]
+id = "opencode1-vault-mode-loader-writes-nothing"
+guards = "OpenCode 1's loader seeds and updates no account file in vault mode"
+file = "packages/opencode/src/index.ts"
+old = "        const loaderVaultMode = vault.enrolled()"
+new = "        const loaderVaultMode = false // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/pool-lifecycle-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-lifecycle-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^the\\spool\\slifecycle\\sin\\svault\\smode\\sa\\snever-migrated\\sinstall\\sis\\sserved\\sfrom\\sthe\\svault\\swithout\\smigrating,\\sand\\smigrates\\sonce\\sthe\\shost\\sdisconnects$"]
+
+[[control]]
+id = "opencode2-vault-mode-wires-the-lifecycle-pause"
+guards = "OpenCode 2 pauses its pool lifecycle in vault mode, so a login in the slot is neither adopted nor the placeholder written"
+file = "packages/opencode/src/v2/setup.ts"
+old = "        paused: () => vault.enrolled(),"
+new = "        paused: () => false, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^vault\\saccounts\\son\\sOpenCode\\s2\\sin\\svault\\smode\\sleaves\\sa\\sslot\\slogin\\swhere\\sit\\sis,\\sunused\\sand\\snot\\sadopted,\\sthe\\slocal\\sfiles\\sbyte-identical,\\sand\\sroutes\\sthe\\svault\\sonly$"]

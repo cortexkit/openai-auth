@@ -31,7 +31,6 @@ import {
   vaultLogin,
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import { PoolAccountSource } from '../core/pool-account-source'
-import { isPoolPlaceholder } from '../core/pool-migration'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { setupOpenAIAuth } from '../v2/setup'
 import {
@@ -410,11 +409,11 @@ describe('vault accounts on OpenCode 2', () => {
     expect(Date.now() - sending).toBeLessThan(4_000)
   }, 10_000)
 
-  // A login on an install that has not migrated yet waits for the pool
-  // lifecycle to go idle, and the lifecycle's adoption waits for the vault's
-  // first roster. With a daemon that never answers, that adoption must give
-  // up after its bound without adopting, so the login still completes.
-  it('a vault daemon that never answers holds no login on an unmigrated install, and nothing is adopted', async () => {
+  // In vault mode the migration does not run (it writes the local files). An
+  // install that has not migrated is still served from the vault, which
+  // needs no pool row; a login through the plugin cannot be stored in the
+  // pool, so it is refused at once, saying why, and nothing on disk changes.
+  it('in vault mode a never-migrated install is served from the vault, a login on it is refused with the reason, and nothing is migrated, stored or adopted', async () => {
     const files = poolFiles()
     writeFileSync(
       files.configPath,
@@ -437,41 +436,27 @@ describe('vault accounts on OpenCode 2', () => {
         },
       }),
     )
+    const daemon = await startMockDaemon({
+      directory: files.dir,
+      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+    })
+    cleanups.push(() => daemon.stop())
     const stateDir = join(files.dir, 'vault')
     mkdirSync(stateDir, { recursive: true, mode: 0o700 })
-    const { tokenPath } = vaultPaths(stateDir, 'opencode')
+    const { tokenPath, rosterPath } = vaultPaths(stateDir, 'opencode')
     writeFileSync(
       tokenPath,
       JSON.stringify({ token: ENROLLMENT_TOKEN, token_generation: 1 }),
       { mode: 0o600 },
     )
     chmodSync(tokenPath, 0o600)
-    // The migration waits at its version fence until the login is under
-    // way. Once the install is migrated, the next fence read (the
-    // adoption's) finds a later login in the slot, which an adoption that
-    // did not wait for the vault would take into the pool.
-    const later = {
-      type: 'oauth',
-      access: chatgptAccessToken('chatgpt-later'),
-      refresh: 'later-refresh',
-      expires: Date.now() + 3_600_000,
-    }
-    const releaseMigration = Promise.withResolvers<void>()
-    let laterWritten = false
-    const fence = async () => {
-      if (files.readConfig().openaiAuthPool?.migratedAt === undefined) {
-        await releaseMigration.promise
-      } else if (!laterWritten) {
-        laterWritten = true
-        writeFileSync(authPath, JSON.stringify({ openai: later }))
-      }
-      return { open: true as const }
-    }
+    const config = readFileSync(files.configPath, 'utf8')
+    const auth = readFileSync(authPath, 'utf8')
     const host = fakeOpenCode2Host()
     const stop = await setupOpenAIAuth(host.ctx, {
       paths: files.paths,
       slot: opencode1HostSlot(authPath),
-      fence,
+      fence: async () => ({ open: true as const }),
       heartbeat: false,
       fetch: usageOnly,
       poolMigration: true,
@@ -492,16 +477,29 @@ describe('vault accounts on OpenCode 2', () => {
       })) as never,
       vault: {
         stateDir,
-        // The connection is never made, so the first roster read never ends.
-        connectScoped: () => new Promise(() => {}),
+        connectionFile: () => daemon.connectionFile,
         pollIntervalMs: 0,
-        firstRosterWaitMs: 300,
       },
     })
     cleanups.push(() => rmSync(files.dir, { recursive: true, force: true }))
     cleanups.push(async () => {
       await stop?.()
     })
+
+    // The vault account gets its first quota reading in the background.
+    await waitFor(() => {
+      try {
+        const roster = JSON.parse(readFileSync(rosterPath, 'utf8')) as {
+          rows: Array<{ quota?: unknown }>
+        }
+        return roster.rows.some((row) => row.quota)
+      } catch {
+        return false
+      }
+    }, 'the vault account and its quota')
+    await Bun.sleep(100)
+    const served = await send(host, 200)
+    expect(served.get('authorization')).toBe(`Bearer ${VAULT_ACCESS}`)
 
     const method = host.methods.find(
       (entry) =>
@@ -510,30 +508,17 @@ describe('vault accounts on OpenCode 2', () => {
     )
     if (!method)
       throw new Error('no openai-auth-pool-browser method registered')
-    const signing = Date.now()
     const authorization = await method.authorize({})
-    const signedIn = authorization.callback
-    // Long enough for the login to reach its wait for the migration.
+    await expect(authorization.callback).rejects.toThrow(
+      'connected to the credential vault',
+    )
     await Bun.sleep(100)
-    releaseMigration.resolve()
-    await signedIn
 
-    // The adoption gave up after its 300 ms bound; the rest is the migration
-    // and the login write, which take longer on a loaded machine. A login
-    // held by an unbounded wait would never finish (the test times out).
-    expect(Date.now() - signing).toBeLessThan(8_000)
-    const accounts = files.readConfig().accounts
-    expect(accounts.map((account) => account.accountId)).toContain(
-      'chatgpt-new',
-    )
-    expect(laterWritten).toBe(true)
-    expect(accounts.map((account) => account.accountId)).not.toContain(
-      'chatgpt-later',
-    )
-    expect(JSON.parse(readFileSync(authPath, 'utf8')).openai).toEqual(later)
-  }, 15_000)
+    expect(readFileSync(files.configPath, 'utf8')).toBe(config)
+    expect(readFileSync(authPath, 'utf8')).toBe(auth)
+  })
 
-  it('adopts a slot login while the vault serves, but routes that account through the vault only', async () => {
+  it('in vault mode leaves a slot login where it is, unused and not adopted, the local files byte-identical, and routes the vault only', async () => {
     const login = {
       type: 'oauth',
       access: chatgptAccessToken('chatgpt-vault', 'local-login'),
@@ -553,21 +538,23 @@ describe('vault accounts on OpenCode 2', () => {
           ),
       },
     )
-    // The lifecycle restores the placeholder without Disconnect, but the
-    // local copy cannot serve as a second owner of the vault's account.
-    await Bun.sleep(300)
-    expect(
-      isPoolPlaceholder(
-        JSON.parse(readFileSync(join(files.dir, 'auth.json'), 'utf8')).openai,
-      ),
-    ).toBe(true)
-    expect(files.readConfig().accounts.map((account) => account.id)).toContain(
-      'chatgpt-vault',
+    const authPath = join(files.dir, 'auth.json')
+    const before = [files.configPath, files.statePath, authPath].map((path) =>
+      readFileSync(path, 'utf8'),
     )
+    // Long enough for an adoption to have run, had vault mode allowed one.
+    await Bun.sleep(300)
     const gets = daemon.gets.length
     const served = await send(host, 200)
     expect(served.get('authorization')).toBe(`Bearer ${VAULT_ACCESS}`)
     expect(served.get('authorization')).not.toBe(`Bearer ${login.access}`)
     expect(daemon.gets.length).toBeGreaterThan(gets)
+    await Bun.sleep(100)
+    expect(
+      [files.configPath, files.statePath, authPath].map((path) =>
+        readFileSync(path, 'utf8'),
+      ),
+    ).toEqual(before)
+    expect(JSON.parse(readFileSync(authPath, 'utf8')).openai).toEqual(login)
   })
 })

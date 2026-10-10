@@ -1572,12 +1572,16 @@ export async function CodexAuthPlugin(
           slot: hostSlot.slot,
           version: PackageVersion,
           ...poolMigrationDeps,
-          // While the vault serves this host its accounts, a login in the slot
-          // is not adopted (the request path refuses it instead).
+          // Each run is told whether the vault serves this host its accounts
+          // (`PoolMigrationDeps.vaultServes`).
           runDeps: {
             vaultServes: () => vault.serves(),
             ...poolMigrationDeps.runDeps,
           },
+          // In vault mode neither the migration nor an adoption runs: a login
+          // in the slot stays there, unused, and the local files stay as they
+          // are until the host disconnects.
+          paused: () => vault.enrolled(),
           // After a migration or an adoption run the pool may hold a row this
           // process has never polled (or the install just turned migrated).
           // Re-reading it now starts those first quota polls at once, so an
@@ -1882,8 +1886,13 @@ export async function CodexAuthPlugin(
           : undefined
         const cacheKeepKey = rpcDir?.dir ?? getConfigPath()
 
+        // In vault mode (this host enrolled with the Claustrum vault) no local
+        // account file is written, so the two loader-time writes below wait
+        // until the host disconnects.
+        const loaderVaultMode = vault.enrolled()
+
         // Migration: seed the multi-account store from the existing token (idempotent)
-        if (!slotTombstoned) {
+        if (!slotTombstoned && !loaderVaultMode) {
           await migrateIfNeeded(
             {
               type: 'oauth',
@@ -1988,7 +1997,7 @@ export async function CodexAuthPlugin(
         // (migrateIfNeeded only sets it once on first run). The CLI add path
         // rejects against the persisted value — acceptable because the plugin
         // refreshes it here each time the auth loader runs.
-        if (storage && auth.access && !slotTombstoned) {
+        if (storage && auth.access && !slotTombstoned && !loaderVaultMode) {
           const liveAccountId = extractAccountId({
             id_token: '',
             access_token: auth.access,

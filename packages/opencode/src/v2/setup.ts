@@ -325,9 +325,11 @@ export async function setupOpenAIAuth(
         slot: migrationSlot,
         version,
         fence,
-        // Adoption restores the host placeholder even with vault accounts;
-        // the source excludes pool identities owned by the vault.
         runDeps: { vaultServes: () => vault.serves() },
+        // In vault mode neither the migration nor an adoption runs: a login
+        // in OpenCode 1's slot stays there, unused, and the local files stay
+        // as they are until the host disconnects.
+        paused: () => vault.enrolled(),
         // A run may leave the pool holding a row this process has never
         // polled (or turn the install migrated); re-reading starts those
         // polls at once.
@@ -375,6 +377,12 @@ export async function setupOpenAIAuth(
   /** Waits for a migration run when the install has not migrated yet. */
   const ensureMigrated = async (login: PoolLoginResult) => {
     if (poolMigrated(paths().configPath)) return
+    // The migration does not run in vault mode (it writes the local files),
+    // so it is not waited for.
+    if (vault.enrolled())
+      throw new Error(
+        'This host is connected to the credential vault, which serves its OpenAI accounts, so the local accounts are not moved to the shared account pool and the login was not stored. Disconnect this host from the vault to add a local login.',
+      )
     await lifecycle?.idle()
     if (poolMigrated(paths().configPath)) return
     if (
