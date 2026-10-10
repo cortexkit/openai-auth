@@ -1,5 +1,5 @@
 import { Database } from 'bun:sqlite'
-import { describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import {
   mkdtemp,
   readdir,
@@ -20,8 +20,78 @@ import {
 } from '../config'
 import { dumpCodexRequest, resetDumpStateForTest } from '../dump'
 import { CodexAuthPlugin, rewriteResponsesLiteBody } from '../index'
+import { createRequestTestScope } from './request-test-scope'
+
+const scope = createRequestTestScope()
+const test = scope.it
+const plugins = new Set<Awaited<ReturnType<typeof CodexAuthPlugin>>>()
+
+beforeEach(() => scope.capturePluginWork())
+afterEach(async () => {
+  await scope.teardown(async () => {
+    plugins.clear()
+  })
+})
+
+async function disposePluginWork() {
+  // Loader timers resolve account paths and fetch lazily. Stop them and drain
+  // submitted work while the network and paths still belong to this fixture.
+  for (const hooks of plugins) await hooks.dispose?.()
+  await scope.settlePluginWork()
+}
 
 describe('request dumps', () => {
+  test('disposes every dump loader before restoring the shared network and account paths', async () => {
+    const originalFetch = globalThis.fetch
+    const originalConfigFile = process.env.OPENCODE_OPENAI_AUTH_FILE
+    const timers = new Set<ReturnType<typeof setInterval>>()
+    const stopped: Array<{
+      fetch: typeof globalThis.fetch
+      config: string | undefined
+    }> = []
+    const fixtureFetch = Object.assign(
+      async () => new Response('unavailable', { status: 503 }),
+      { preconnect: () => {} },
+    ) as typeof globalThis.fetch
+    let fixtureConfig: string | undefined
+    try {
+      await withDumpEnv(async () => {
+        globalThis.fetch = fixtureFetch
+        fixtureConfig = process.env.OPENCODE_OPENAI_AUTH_FILE
+        for (let index = 0; index < 2; index++) {
+          const hooks = await dumpPlugin({
+            experimentalWebSockets: false,
+            backgroundQuota: {
+              setIntervalFn: () => {
+                const timer = {} as ReturnType<typeof setInterval>
+                timers.add(timer)
+                return timer
+              },
+              clearIntervalFn: (timer) => {
+                timers.delete(timer)
+                stopped.push({
+                  fetch: globalThis.fetch,
+                  config: process.env.OPENCODE_OPENAI_AUTH_FILE,
+                })
+              },
+            },
+          })
+          await pluginFetch(hooks)
+        }
+        expect(timers.size).toBe(2)
+      })
+      expect(timers.size).toBe(0)
+      expect(stopped).toEqual([
+        { fetch: fixtureFetch, config: fixtureConfig },
+        { fetch: fixtureFetch, config: fixtureConfig },
+      ])
+      expect(process.env.OPENCODE_OPENAI_AUTH_FILE).toBe(originalConfigFile)
+    } finally {
+      await disposePluginWork()
+      globalThis.fetch = originalFetch
+    }
+  })
+
   test('Responses Lite removes image details without mutating host items', () => {
     const image = {
       type: 'input_image',
@@ -63,7 +133,7 @@ describe('request dumps', () => {
         { preconnect: () => {} },
       )
       try {
-        const hooks = await CodexAuthPlugin(pluginInput(), {
+        const hooks = await dumpPlugin({
           experimentalWebSockets: false,
           responsesLite: true,
         })
@@ -117,6 +187,7 @@ describe('request dumps', () => {
           await hooks.dispose?.()
         }
       } finally {
+        await disposePluginWork()
         globalThis.fetch = originalFetch
       }
     })
@@ -240,7 +311,7 @@ describe('request dumps', () => {
       { preconnect: () => {} },
     )
     try {
-      const hooks = await CodexAuthPlugin(pluginInput(), {
+      const hooks = await dumpPlugin({
         experimentalWebSockets: false,
       })
       const fetch = await pluginFetch(hooks)
@@ -263,6 +334,7 @@ describe('request dumps', () => {
         )?.some((tool) => tool.type === 'web_search') ?? false,
       ).toBe(false)
     } finally {
+      await disposePluginWork()
       globalThis.fetch = originalFetch
       restoreEnv('CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT', originalEndpoint)
       restoreEnv('OPENCODE_OPENAI_AUTH_FILE', originalConfigFile)
@@ -289,7 +361,7 @@ describe('request dumps', () => {
   })
 
   test('does not install the Codex/WebSocket fetch for manual API-key auth', async () => {
-    const hooks = await CodexAuthPlugin(pluginInput(), {
+    const hooks = await dumpPlugin({
       experimentalWebSockets: true,
     })
     const auth = hooks.auth
@@ -327,7 +399,7 @@ describe('request dumps', () => {
         { preconnect: () => {} },
       )
       try {
-        const hooks = await CodexAuthPlugin(pluginInput(), {
+        const hooks = await dumpPlugin({
           experimentalWebSockets: false,
         })
         const fetch = await pluginFetch(hooks)
@@ -358,6 +430,7 @@ describe('request dumps', () => {
         expect(promptCacheKeys).toHaveLength(2)
         expect(promptCacheKeys[1]).not.toBe(promptCacheKeys[0])
       } finally {
+        await disposePluginWork()
         globalThis.fetch = originalFetch
       }
     })
@@ -376,7 +449,7 @@ describe('request dumps', () => {
         { preconnect: () => {} },
       )
       try {
-        const firstHooks = await CodexAuthPlugin(pluginInput(), {
+        const firstHooks = await dumpPlugin({
           experimentalWebSockets: false,
         })
         const firstFetch = await pluginFetch(firstHooks)
@@ -390,7 +463,7 @@ describe('request dumps', () => {
         })
         await firstHooks.dispose?.()
 
-        const secondHooks = await CodexAuthPlugin(pluginInput(), {
+        const secondHooks = await dumpPlugin({
           experimentalWebSockets: false,
         })
         const secondFetch = await pluginFetch(secondHooks)
@@ -406,6 +479,7 @@ describe('request dumps', () => {
         expect(promptCacheKeys).toHaveLength(2)
         expect(promptCacheKeys[1]).toBe(promptCacheKeys[0])
       } finally {
+        await disposePluginWork()
         globalThis.fetch = originalFetch
       }
     })
@@ -426,7 +500,7 @@ describe('request dumps', () => {
         { preconnect: () => {} },
       )
       try {
-        const hooks = await CodexAuthPlugin(pluginInput(), {
+        const hooks = await dumpPlugin({
           experimentalWebSockets: false,
         })
         const fetch = await pluginFetch(hooks)
@@ -485,6 +559,7 @@ describe('request dumps', () => {
         expect(turnIDs[2]).not.toBe(turnIDs[0])
         expect(turnIDs.every((id) => id[14] === '7')).toBe(true)
       } finally {
+        await disposePluginWork()
         globalThis.fetch = originalFetch
       }
     })
@@ -507,7 +582,7 @@ describe('request dumps', () => {
         { preconnect: () => {} },
       )
       try {
-        const hooks = await CodexAuthPlugin(pluginInput(), {
+        const hooks = await dumpPlugin({
           experimentalWebSockets: false,
         })
         const fetch = await pluginFetch(hooks)
@@ -539,6 +614,7 @@ describe('request dumps', () => {
         expect(ids[5]).not.toBe(ids[4])
         await hooks.dispose?.()
       } finally {
+        await disposePluginWork()
         globalThis.fetch = originalFetch
       }
     })
@@ -552,7 +628,7 @@ describe('request dumps', () => {
         { preconnect: () => {} },
       )
       try {
-        const hooks = await CodexAuthPlugin(pluginInput(), {
+        const hooks = await dumpPlugin({
           experimentalWebSockets: false,
         })
         const fetch = await pluginFetch(hooks)
@@ -598,6 +674,7 @@ describe('request dumps', () => {
           )
         }
       } finally {
+        await disposePluginWork()
         globalThis.fetch = originalFetch
       }
     })
@@ -835,7 +912,7 @@ describe('request dumps', () => {
       )
       let hooks: Awaited<ReturnType<typeof CodexAuthPlugin>> | undefined
       try {
-        hooks = await CodexAuthPlugin(pluginInput(), {
+        hooks = await dumpPlugin({
           experimentalWebSockets: true,
         })
         const fetch = await pluginFetch(hooks)
@@ -858,6 +935,7 @@ describe('request dumps', () => {
         ).toBe(true)
       } finally {
         await hooks?.dispose?.()
+        await disposePluginWork()
         globalThis.fetch = originalFetch
       }
     })
@@ -875,7 +953,7 @@ describe('request dumps', () => {
       globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket
       let hooks: Awaited<ReturnType<typeof CodexAuthPlugin>> | undefined
       try {
-        hooks = await CodexAuthPlugin(pluginInput(), {
+        hooks = await dumpPlugin({
           experimentalWebSockets: true,
         })
         const fetch = await pluginFetch(hooks)
@@ -963,6 +1041,7 @@ describe('request dumps', () => {
         }
       } finally {
         await hooks?.dispose?.()
+        await disposePluginWork()
         globalThis.fetch = originalFetch
         globalThis.WebSocket = originalWebSocket
       }
@@ -981,7 +1060,7 @@ describe('request dumps', () => {
       )
       globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket
       try {
-        const hooks = await CodexAuthPlugin(pluginInput(), {
+        const hooks = await dumpPlugin({
           experimentalWebSockets: true,
         })
         const fetch = await pluginFetch(hooks)
@@ -1018,6 +1097,7 @@ describe('request dumps', () => {
           },
         })
       } finally {
+        await disposePluginWork()
         globalThis.fetch = originalFetch
         globalThis.WebSocket = originalWebSocket
       }
@@ -1035,6 +1115,12 @@ function pluginInput() {
   } as unknown as PluginInput
 }
 
+async function dumpPlugin(options: Parameters<typeof CodexAuthPlugin>[1]) {
+  const hooks = scope.ownPlugin(await CodexAuthPlugin(pluginInput(), options))
+  plugins.add(hooks)
+  return hooks
+}
+
 async function pluginFetch(hooks: Awaited<ReturnType<typeof CodexAuthPlugin>>) {
   const auth = hooks.auth
   if (!auth?.loader) throw new Error('missing auth loader')
@@ -1048,7 +1134,10 @@ async function pluginFetch(hooks: Awaited<ReturnType<typeof CodexAuthPlugin>>) {
     {} as Parameters<NonNullable<typeof auth.loader>>[1],
   )
   if (!loaded.fetch) throw new Error('missing fetch')
-  return loaded.fetch
+  return scope.wrap(
+    async (url: RequestInfo | URL, init?: RequestInit): Promise<Response> =>
+      loaded.fetch!(url, init),
+  )
 }
 
 function toolRequestBody() {
@@ -1083,6 +1172,7 @@ async function withDumpEnv(run: (dumpDir: string) => Promise<void>) {
   try {
     await run(dumpDir)
   } finally {
+    await disposePluginWork()
     restoreEnv('CORTEXKIT_OPENAI_AUTH_DUMP', originalDump)
     restoreEnv('OPENCODE_OPENAI_AUTH_DUMP_DIR', originalDumpDir)
     restoreEnv('OPENCODE_OPENAI_AUTH_FILE', originalConfigFile)

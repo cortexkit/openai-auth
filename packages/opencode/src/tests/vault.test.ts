@@ -1597,6 +1597,16 @@ describe('routing', () => {
     seedPool(files, [
       { id: 'main', quota: quotaMap(10), expires: Date.now() - HOUR },
     ])
+    // Other fixtures also seed a row named main. Unique credentials attribute
+    // every forbidden poll or refresh to this fixture, even on the shared fetch.
+    const localAccess = `never-answer-${dir}-token`
+    const localRefresh = `never-answer-${dir}-refresh`
+    const localState = readJson(files.stateFile) as {
+      accounts: Record<string, { access: string; refresh: string }>
+    }
+    localState.accounts.main!.access = localAccess
+    localState.accounts.main!.refresh = localRefresh
+    writeFileSync(files.stateFile, JSON.stringify(localState))
     const wire = installWire()
     const loading = Date.now()
     hooks = await loadPlugin({
@@ -1616,10 +1626,8 @@ describe('routing', () => {
     expect(response.status).toBe(401)
     expect(await response.text()).toBe(VAULT_MODE_REFUSALS['vault-unreachable'])
     expect(wire.sends).toEqual([])
-    // Only this test's local row is checked: a loader another test left
-    // running may still poll its own accounts through the shared fetch.
-    expect(wire.refreshTokens).not.toContain('main-refresh')
-    expect(wire.polls).not.toContain('Bearer main-token')
+    expect(wire.refreshTokens).not.toContain(localRefresh)
+    expect(wire.polls).not.toContain(`Bearer ${localAccess}`)
     // The request waited for the vault's first account list, but only up to
     // VAULT_FIRST_ROSTER_WAIT_MS (2 s).
     expect(Date.now() - sending).toBeGreaterThanOrEqual(1_900)
