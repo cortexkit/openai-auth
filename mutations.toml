@@ -2240,3 +2240,16 @@ command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/startup-order.tes
 test_count_pattern = "Ran {count} test"
 expect_red = ['^Pi\s1\.0\.4\sstartup\sswaps\sthe\senrolled\sslot\sbefore\sauth\sresolution\sand\sthe\sfirst\srequest$']
 expect_message = "toBeGreaterThan"
+
+[[control]]
+id = "pi-vault-slot-follows-coding-agent-dir"
+guards = "Pi vault mode swaps the login in Pi's configured auth file without changing the plugin account directory"
+file = "packages/pi/src/vault-slot.ts"
+old = "    authPath: join(getAgentDir(), 'auth.json'),"
+new = "    authPath: join(process.env.PI_AGENT_DIR ?? getAgentDir(), 'auth.json'), // NON-VACUITY BREAK: let the plugin-only directory override Pi's auth file."
+test_file = "packages/pi/src/tests/startup-order.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/startup-order.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\s1\.0\.4\sstartup\sswaps\sthe\senrolled\sslot\sbefore\sauth\sresolution\sand\sthe\sfirst\srequest$']
+expect_message = "expect(hostEntry.key).toBe(VAULT_PLACEHOLDER_KEY)"

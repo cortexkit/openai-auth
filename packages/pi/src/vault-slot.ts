@@ -1,7 +1,7 @@
 import { join } from 'node:path'
 import { openPiSlot, type PiSlot } from '@cortexkit/common-auth/pi-slot'
 import { vaultStateDir } from '@cortexkit/openai-auth-core/internal'
-import { getPiConfigDir } from './paths.ts'
+import { getAgentDir } from '@earendil-works/pi-coding-agent'
 
 /**
  * Pi reads this non-secret API-key placeholder from auth.json while the vault
@@ -17,7 +17,7 @@ export const VAULT_SLOT_CONFLICT =
 
 export function openVaultSlot(statePath: string): PiSlot {
   return openPiSlot({
-    authPath: join(getPiConfigDir(), 'auth.json'),
+    authPath: join(getAgentDir(), 'auth.json'),
     provider: 'openai-codex',
     stashPath: join(vaultStateDir(statePath), 'pi-openai-codex-login.json'),
     placeholderKey: VAULT_PLACEHOLDER_KEY,

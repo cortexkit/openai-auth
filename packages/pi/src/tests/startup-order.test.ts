@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test'
+import { spawnSync } from 'node:child_process'
 import {
   mkdirSync,
   mkdtempSync,
@@ -28,10 +29,47 @@ type ComposingRuntime = { composeProvider(id: string): Provider | undefined }
 // The SDK constructs its own ModelRuntime and loads the extension through Pi's
 // real loader. These observers delegate unchanged; they only record the order.
 test('Pi 1.0.4 startup swaps the enrolled slot before auth resolution and the first request', async () => {
+  if (process.env.PI_STARTUP_ORDER_CHILD !== '1') {
+    const homeDir = mkdtempSync(join(tmpdir(), 'pi-vault-startup-home-'))
+    try {
+      const child = spawnSync(
+        process.execPath,
+        [
+          'test',
+          './src/tests/startup-order.test.ts',
+          '-t',
+          'Pi 1.0.4 startup swaps the enrolled slot before auth resolution and the first request',
+        ],
+        {
+          cwd: join(import.meta.dir, '../..'),
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            HOME: homeDir,
+            PI_STARTUP_ORDER_CHILD: '1',
+          },
+        },
+      )
+      if (child.error) throw child.error
+      if (child.status !== 0) {
+        throw new Error(`${child.stdout}\n${child.stderr}`)
+      }
+    } finally {
+      rmSync(homeDir, { recursive: true, force: true })
+    }
+    return
+  }
+
   const dir = mkdtempSync(join(tmpdir(), 'pi-vault-startup-order-'))
-  const authPath = join(dir, 'auth.json')
+  const homeDir = process.env.HOME!
+  const piAgentDir = join(homeDir, 'x')
+  const pluginAgentDir = join(dir, 'plugin-agent')
+  const authPath = join(piAgentDir, 'auth.json')
+  const pluginAuthPath = join(pluginAgentDir, 'auth.json')
   const events: string[] = []
   const observedEnv = [
+    'HOME',
+    'PI_CODING_AGENT_DIR',
     'PI_AGENT_DIR',
     'PI_OPENAI_AUTH_FILE',
     'PI_OPENAI_AUTH_STATE_FILE',
@@ -62,14 +100,21 @@ test('Pi 1.0.4 startup swaps the enrolled slot before auth resolution and the fi
   })
   let refreshes = 0
   const codexTokens: string[] = []
+  const pluginAuthBefore = JSON.stringify({
+    'openai-codex': { type: 'api_key', key: 'plugin-account-store' },
+  })
   const slotType = () =>
     JSON.parse(readFileSync(authPath, 'utf8'))['openai-codex'].type as string
   try {
-    process.env.PI_AGENT_DIR = dir
+    process.env.HOME = homeDir
+    process.env.PI_CODING_AGENT_DIR = '~/x'
+    process.env.PI_AGENT_DIR = pluginAgentDir
     process.env.PI_OPENAI_AUTH_FILE = join(dir, 'pool.json')
     process.env.PI_OPENAI_AUTH_STATE_FILE = join(dir, 'pool-state.json')
     process.env.PI_OFFLINE = '1'
     process.env.CLAUSTRUM_SUBC_CONNECTION = daemon.connectionFile
+    mkdirSync(piAgentDir, { recursive: true })
+    mkdirSync(pluginAgentDir, { recursive: true })
     writeFileSync(
       authPath,
       JSON.stringify({
@@ -82,6 +127,7 @@ test('Pi 1.0.4 startup swaps the enrolled slot before auth resolution and the fi
       }),
       { mode: 0o600 },
     )
+    writeFileSync(pluginAuthPath, pluginAuthBefore, { mode: 0o600 })
     const stateDir = vaultStateDir(process.env.PI_OPENAI_AUTH_STATE_FILE)
     mkdirSync(stateDir, { mode: 0o700 })
     writeFileSync(
@@ -90,15 +136,15 @@ test('Pi 1.0.4 startup swaps the enrolled slot before auth resolution and the fi
       { mode: 0o600 },
     )
     writeFileSync(
-      join(dir, 'settings.json'),
+      join(piAgentDir, 'settings.json'),
       JSON.stringify({
         defaultProvider: 'openai-codex',
         defaultModel: 'gpt-5.4',
       }),
     )
-    mkdirSync(join(dir, 'extensions'))
+    mkdirSync(join(piAgentDir, 'extensions'))
     writeFileSync(
-      join(dir, 'extensions', 'observe.ts'),
+      join(piAgentDir, 'extensions', 'observe.ts'),
       `import plugin from ${JSON.stringify(join(import.meta.dir, '..', 'index.ts'))};
 export default async function(pi) {
   const events = globalThis[Symbol.for('openai-auth.tests.pi-startup-order')];
@@ -180,7 +226,7 @@ export default async function(pi) {
     }) as typeof fetch
     const created = await createAgentSession({
       cwd: dir,
-      agentDir: dir,
+      agentDir: piAgentDir,
       sessionManager: SessionManager.inMemory(dir),
       noTools: 'all',
     })
@@ -188,6 +234,10 @@ export default async function(pi) {
     expect(created.extensionsResult.errors).toEqual([])
     await session.bindExtensions({})
     expect(runtime).toBeDefined()
+    const hostEntry = JSON.parse(readFileSync(authPath, 'utf8'))['openai-codex']
+    expect(hostEntry.key).toBe(VAULT_PLACEHOLDER_KEY)
+    expect(hostEntry.type).toBe('api_key')
+    expect(readFileSync(pluginAuthPath, 'utf8')).toBe(pluginAuthBefore)
     // Load the vault accounts' remaining-usage readings with vault tokens,
     // not Pi auth. Otherwise a request can refuse for missing quota data,
     // independently of the authentication ordering measured here.

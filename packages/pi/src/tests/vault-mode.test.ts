@@ -467,10 +467,12 @@ describe("Pi's real model runtime in vault mode", () => {
 describe('Pi vault slot lifecycle', () => {
   test('the vault slot uses Pi auth.json independently of pool file overrides', async () => {
     const previousAgentDir = process.env.PI_AGENT_DIR
+    const previousCodingAgentDir = process.env.PI_CODING_AGENT_DIR
     const previousPoolFile = process.env.PI_OPENAI_AUTH_FILE
     try {
       const agentDir = join(dir, 'agent')
-      process.env.PI_AGENT_DIR = agentDir
+      process.env.PI_AGENT_DIR = join(dir, 'plugin-agent')
+      process.env.PI_CODING_AGENT_DIR = agentDir
       process.env.PI_OPENAI_AUTH_FILE = join(dir, 'different-pool.json')
       mkdirSync(agentDir, { mode: 0o700 })
       const authPath = join(agentDir, 'auth.json')
@@ -491,6 +493,9 @@ describe('Pi vault slot lifecycle', () => {
     } finally {
       if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR
       else process.env.PI_AGENT_DIR = previousAgentDir
+      if (previousCodingAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR
+      else process.env.PI_CODING_AGENT_DIR = previousCodingAgentDir
       if (previousPoolFile === undefined) delete process.env.PI_OPENAI_AUTH_FILE
       else process.env.PI_OPENAI_AUTH_FILE = previousPoolFile
     }
