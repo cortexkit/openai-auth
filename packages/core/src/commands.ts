@@ -366,6 +366,7 @@ export function withAccountRules(
       id: replaced.id,
       outcome: 'rotated',
       credential: replaced.credential,
+      credentialEpoch: replaced.credentialEpoch,
     }
   }
   const enable: PoolStore['enable'] = (id, options) =>
