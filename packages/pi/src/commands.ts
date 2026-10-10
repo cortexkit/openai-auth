@@ -6,7 +6,7 @@
 // menu shows its quota in a section of its own and refuses to add that
 // account again as a row. Its Vault section connects Pi to the Claustrum
 // vault; while connected (vault mode) the vault's OpenAI accounts are the only
-// ones routed, and Pi's login and the pool are left untouched.
+// ones routed. Pi's login is stashed until disconnect; the pool is untouched.
 import {
   CommandError,
   type CommandMenu,
@@ -36,6 +36,7 @@ import type {
 import packageJson from '../package.json' with { type: 'json' }
 import { clearPiStickyRouting, getPiStickyRouting } from './routing.ts'
 import type { PiPoolCommands } from './runtime.ts'
+import { VAULT_SLOT_CONFLICT } from './vault-slot.ts'
 
 export type PiCommandDependencies = {
   beginAccountLogin?: typeof beginAccountLogin
@@ -46,9 +47,10 @@ export type PiCommandDependencies = {
   vaultWait?: VaultWaitOptions
   /**
    * Runs after every change the menu applies, for example a Connect or a
-   * Disconnect in the Vault section (the extension re-registers its models).
+   * Disconnect in the Vault section (Pi reloads its auth snapshot).
    */
-  afterApply?: () => void
+  afterApply?: () => unknown
+  onContext?: (ctx: ExtensionCommandContext) => void
 }
 
 /** Pi's own login: its last quota reading. */
@@ -102,6 +104,11 @@ export function createPiMenu(
 ): CommandMenu {
   const begin = dependencies.beginAccountLogin ?? beginAccountLogin
   const version = dependencies.packageVersion ?? packageJson.version
+  const vaultMenu = vaultSection({
+    vault: pool.vault,
+    changed: dependencies.afterApply,
+    ...(dependencies.vaultWait ? { wait: dependencies.vaultWait } : {}),
+  })
   return createOpenAiMenu({
     store: pool.store(),
     vault: pool.vault,
@@ -138,13 +145,33 @@ export function createPiMenu(
         getPin: async (sessionId) => getPiStickyRouting(sessionId),
         clearPin: async (sessionId) => clearPiStickyRouting(sessionId),
       }),
-      vaultSection({
-        vault: pool.vault,
-        ...(dependencies.vaultWait ? { wait: dependencies.vaultWait } : {}),
-      }),
+      {
+        ...vaultMenu,
+        build: async (invocation) => {
+          const view = await vaultMenu.build(invocation)
+          return {
+            ...view,
+            actions: view.actions?.map((action) =>
+              action.id === 'disconnect' && pool.disconnectVault
+                ? {
+                    ...action,
+                    run: async () => {
+                      const result = await pool.disconnectVault?.()
+                      await dependencies.afterApply?.()
+                      return [
+                        `Disconnected: ${pool.vault.name} no longer reads from the vault. Run \`ck auth enroll revoke --name ${pool.vault.name}\` to revoke it in the vault too.`,
+                        ...(result === 'conflict' ? [VAULT_SLOT_CONFLICT] : []),
+                      ].join('\n')
+                    },
+                  }
+                : action,
+            ),
+          }
+        },
+      },
     ],
-    afterApply: () => {
-      dependencies.afterApply?.()
+    afterApply: async () => {
+      await dependencies.afterApply?.()
       return pool.reload()
     },
   })
@@ -159,6 +186,9 @@ async function runOpenAiCommand(
     ctx.ui.notify('The OpenAI account pool is not available.', 'error')
     return
   }
+  dependencies.onContext?.(ctx)
+  if (dependencies.afterApply) await dependencies.afterApply()
+  else await pool.syncVaultSlot?.(() => ctx.modelRegistry.refresh())
   // Take the token Pi holds for its login now, as a request would, so the
   // menu knows which account Pi signs in with. Not in vault mode: asking Pi
   // for the key makes Pi refresh and store an expired login.

@@ -48,13 +48,13 @@ describe('Pi OpenAI auth extension', () => {
     expect(unaliasable).toEqual([])
   })
 
-  it('registers the OpenAI Codex provider and its supported models', () => {
+  it('registers the OpenAI Codex provider and its supported models', async () => {
     const registrations: Array<{
       id: string
       provider: RegisteredProvider
     }> = []
 
-    cortexKitPiOpenAIAuth({
+    await cortexKitPiOpenAIAuth({
       registerCommand() {},
       registerProvider(id: string, provider: RegisteredProvider) {
         registrations.push({ id, provider })
@@ -74,10 +74,10 @@ describe('Pi OpenAI auth extension', () => {
     ])
   })
 
-  it('registers exactly the one /openai command', () => {
+  it('registers exactly the one /openai command', async () => {
     const commandNames: string[] = []
 
-    cortexKitPiOpenAIAuth({
+    await cortexKitPiOpenAIAuth({
       registerCommand(name: string) {
         commandNames.push(name)
       },

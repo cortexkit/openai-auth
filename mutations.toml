@@ -1412,15 +1412,15 @@ expect_red = ["^vault\\scommand\\smenu\\sCheck\\snow\\sin\\svault\\smode\\spolls
 
 [[control]]
 id = "menu-common-auth-release"
-guards = "the shared menu requires the published common-auth replacement-slot release"
+guards = "all packages require the published common-auth release containing Pi-slot and replacement-slot menus"
 file = "packages/core/package.json"
-old = '"@cortexkit/common-auth": "^0.13.0"'
+old = '"@cortexkit/common-auth": "^0.14.0"'
 new = '"@cortexkit/common-auth": "^0.11.4"'
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^vault\scommand\smenu\sall\sthree\spackages\srequire\sthe\spublished\sreplacement-slot\srelease$']
+expect_red = ['^vault\scommand\smenu\sall\sthree\spackages\srequire\sthe\spublished\sPi-slot\srelease$']
 
 [[control]]
 id = "menu-unlabelled-without-vault"
@@ -1666,16 +1666,17 @@ test_count_pattern = "Ran {count} test"
 expect_red = ["^vault\\saccounts\\son\\sOpenCode\\s2\\snever\\sroutes\\sa\\spool\\srow\\sthe\\svault\\sdoes\\snot\\shold,\\sand\\sleaves\\sthe\\spool\\sfiles\\sbyte-identical$"]
 
 [[control]]
-id = "pi-vault-mode-leaves-the-native-login-untouched"
-guards = "on Pi in vault mode the models move to a provider whose key is a placeholder, so Pi never refreshes or stores its own expired login"
-file = "packages/pi/src/index.ts"
-old = "    if (vaultMode) {\n      // No model is left under `openai-codex`"
-new = "    if (false) { // NON-VACUITY BREAK: keep the models under openai-codex.\n      // No model is left under `openai-codex`"
+id = "pi-vault-slot-enter-before-reload"
+guards = "the expired Pi login is stashed and replaced before Pi can resolve or refresh it"
+file = "packages/pi/src/runtime.ts"
+old = "        if (mode) await this.vaultSlot().enterVault()"
+new = "        if (mode) await Promise.resolve() // NON-VACUITY BREAK: leave Pi's OAuth login in the slot."
 test_file = "packages/pi/src/tests/vault-mode.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ["^Pi's\\sreal\\smodel\\sruntime\\sin\\svault\\smode\\sa\\srequest\\swith\\san\\sexpired\\snative\\slogin\\sleaves\\sPi's\\sauth\\sfile\\sbyte-identical\\sand\\sserves\\sfrom\\sthe\\svault$"]
+expect_red = ['^Pi\x27s\sreal\smodel\sruntime\sin\svault\smode\san\sexpired\sPi\slogin\sis\sstashed\sbefore\sreload\sand\srequests\suse\sopenai-codex\swithout\srefresh$']
+expect_message = '"type": "api_key"'
 
 [[control]]
 id = "pi-vault-mode-sets-the-pool-aside"
@@ -2132,3 +2133,110 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.
 test_count_pattern = "Ran {count} test"
 expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\san\senrolled\sterminal\swith\sno\slocal\scredential\sor\smigrated\spool\snever\sopens\slocal\slogin\sor\sdoctor$']
 expect_message = "Expected: 0"
+
+
+[[control]]
+id = "pi-vault-slot-reloads-auth"
+guards = "Pi reloads the placeholder instead of resolving a stale OAuth snapshot"
+file = "packages/pi/src/runtime.ts"
+old = "        await refresh()"
+new = "        await Promise.resolve() // NON-VACUITY BREAK: retain Pi's old auth snapshot."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\x27s\sreal\smodel\sruntime\sin\svault\smode\san\sexpired\sPi\slogin\sis\sstashed\sbefore\sreload\sand\srequests\suse\sopenai-codex\swithout\srefresh$']
+expect_message = "expect(reloads).toBe(1)"
+
+[[control]]
+id = "pi-vault-slot-awaits-reload"
+guards = "vault entry does not return control to Pi before its auth reload completes"
+file = "packages/pi/src/runtime.ts"
+old = "        await refresh()"
+new = "        void refresh() // NON-VACUITY BREAK: let Pi run before the reload finishes."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\sapproval\safter\sstartup\sswaps\sthe\slogin\sand\sawaits\sPi\sreload\sbefore\sreturning$']
+expect_message = "expect(finished).toBe(false)"
+
+[[control]]
+id = "pi-vault-slot-restores-before-disconnect"
+guards = "disconnect restores the saved entry before enrollment is removed"
+file = "packages/pi/src/runtime.ts"
+old = "      const result = await this.vaultSlot().exitVault()"
+new = "      const result = 'nothing-to-do' as const // NON-VACUITY BREAK: delete enrollment before restoring Pi's login."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\sdisconnect\srestores\sthe\soriginal\sPi\sentry\sbyte-identical\sbefore\sremoving\senrollment$']
+expect_message = "expect(result.ok).toBe(true)"
+
+[[control]]
+id = "pi-vault-slot-reports-conflict"
+guards = "disconnect reports a foreign login conflict while retaining both logins and completing disconnection"
+file = "packages/pi/src/commands.ts"
+old = "...(result === 'conflict' ? [VAULT_SLOT_CONFLICT] : [])"
+new = "...(false ? [VAULT_SLOT_CONFLICT] : []) // NON-VACUITY BREAK: hide the retained original login."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\sa\sforeign\sPi\slogin\smakes\sdisconnect\sreport\sa\sconflict\sand\soverwrite\sneither\slogin$']
+expect_message = "expect(result.text).toContain(VAULT_SLOT_CONFLICT)"
+
+[[control]]
+id = "pi-vault-slot-refuses-stale-resolved-credential"
+guards = "vault streams refuse a non-placeholder credential locally even when the vault could serve"
+file = "packages/pi/src/runtime.ts"
+old = "    if (this.vaultMode() && options?.apiKey !== VAULT_PLACEHOLDER_KEY) {"
+new = "    if (false) { // NON-VACUITY BREAK: accept Pi's stale local credential."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\sa\snon-placeholder\sresolved\scredential\srefuses\slocally\seven\swith\sa\shealthy\svault$']
+expect_message = "expect(errorOf(events)).toBe(VAULT_SLOT_REFUSAL)"
+
+[[control]]
+id = "pi-vault-provider-id-is-identical"
+guards = "local and vault registration use the same openai-codex provider without an alias"
+file = "packages/pi/src/index.ts"
+old = "  pi.registerProvider('openai-codex', {"
+new = "  pi.registerProvider('openai-codex-alternate', { // NON-VACUITY BREAK: change the provider id."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\sonly\sopenai-codex\sis\sregistered\sin\slocal\sand\svault\smode$']
+expect_message = "expect(registrations).toEqual(['openai-codex', 'openai-codex'])"
+
+
+[[control]]
+id = "pi-vault-provider-enables-placeholder-resolver"
+guards = "Pi's OAuth-only Codex provider can resolve the stored vault api_key placeholder"
+file = "packages/pi/src/index.ts"
+old = "    ...(runtime.vaultMode() ? { apiKey: VAULT_PLACEHOLDER_KEY } : {}),"
+new = "    ...{}, // NON-VACUITY BREAK: leave Pi's provider OAuth-only in vault mode."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\x27s\sreal\smodel\sruntime\sin\svault\smode\san\sexpired\sPi\slogin\sis\sstashed\sbefore\sreload\sand\srequests\suse\sopenai-codex\swithout\srefresh$']
+expect_message = "expect(available.length).toBeGreaterThan(0)"
+
+
+[[control]]
+id = "pi-vault-slot-startup-awaits-swap"
+guards = "an already-enrolled host completes the slot swap inside Pi's earliest extension factory before returning control"
+file = "packages/pi/src/index.ts"
+old = "  await syncSlot().catch(() => {})"
+new = "  void syncSlot().catch(() => {}) // NON-VACUITY BREAK: return from the extension before the swap."
+test_file = "packages/pi/src/tests/startup-order.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/startup-order.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\s1\.0\.4\sstartup\sswaps\sthe\senrolled\sslot\sbefore\sauth\sresolution\sand\sthe\sfirst\srequest$']
+expect_message = "toBeGreaterThan"

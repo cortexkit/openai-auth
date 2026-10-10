@@ -26,6 +26,7 @@
 
 import { statSync } from 'node:fs'
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
+import type { PiSlot } from '@cortexkit/common-auth/pi-slot'
 import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
 import {
   type AccountPaths,
@@ -72,6 +73,11 @@ import {
 } from './pool-request.ts'
 import { PiPoolSource, settleWithinBudget } from './pool-source.ts'
 import { placePiStickyPin } from './routing.ts'
+import {
+  openVaultSlot,
+  VAULT_PLACEHOLDER_KEY,
+  VAULT_SLOT_REFUSAL,
+} from './vault-slot.ts'
 
 /**
  * How long a request refused for want of a quota reading waits for the first
@@ -107,6 +113,8 @@ export interface PiOpenAIRuntimeDeps {
   readBudgetMs?: number
   /** Replaces Pi's connection to the Claustrum vault (tests); by default its files live next to the account files. */
   vault?: OpenAiVault
+  /** Replaces the disk slot for isolated host-runtime tests. */
+  slot?: PiSlot
 }
 
 /** How many vault tokens are remembered, so a WebSocket frame finds its account. */
@@ -199,6 +207,10 @@ export class PiOpenAIRuntime {
   >()
   private readonly now: () => number
   private readonly paths: () => AccountPaths
+  private slot: PiSlot | undefined
+  private slotVaultMode: boolean | undefined
+  private slotNeedsRefresh = false
+  private slotQueue: Promise<unknown> = Promise.resolve()
   private storageCache:
     | { key: string; storage: AccountStorage | null }
     | undefined
@@ -281,6 +293,55 @@ export class PiOpenAIRuntime {
    */
   vaultMode(): boolean {
     return this.vault.enrolled()
+  }
+
+  private vaultSlot(): PiSlot {
+    this.slot ??= this.deps.slot ?? openVaultSlot(this.paths().statePath)
+    return this.slot
+  }
+
+  private withSlot<T>(run: () => Promise<T>): Promise<T> {
+    const pending = this.slotQueue.then(run)
+    // A failed reload must not prevent a later session from retrying it.
+    this.slotQueue = pending.catch(() => {})
+    return pending
+  }
+
+  /**
+   * Stash Pi's original login and install the placeholder before reloading
+   * auth, so Pi cannot refresh the local login after approval outside the menu.
+   */
+  syncVaultSlot(refresh?: () => unknown): Promise<void> {
+    return this.withSlot(async () => {
+      const mode = this.vaultMode()
+      if (mode !== this.slotVaultMode) {
+        if (mode) await this.vaultSlot().enterVault()
+        else if (this.slotVaultMode) {
+          await this.vaultSlot().exitVault()
+          this.slotNeedsRefresh = true
+        }
+        this.slotVaultMode = mode
+        this.slotNeedsRefresh = mode || this.slotNeedsRefresh
+      }
+      if (this.slotNeedsRefresh && refresh) {
+        await refresh()
+        this.slotNeedsRefresh = false
+      }
+    })
+  }
+
+  /**
+   * Restore Pi's stashed login before forgetting this host's vault enrollment.
+   * If Pi's slot changed, keep the new login and the original stash instead.
+   */
+  disconnectVault(): Promise<'restored' | 'conflict' | 'nothing-to-do'> {
+    return this.withSlot(async () => {
+      const result = await this.vaultSlot().exitVault()
+      await this.vault.disconnect()
+      this.slotVaultMode = false
+      this.slotNeedsRefresh = true
+      return result
+    })
   }
 
   /**
@@ -508,6 +569,11 @@ export class PiOpenAIRuntime {
     options?: SimpleStreamOptions,
   ): AssistantMessageEventStream {
     const outer = this.deps.createStream()
+    if (this.vaultMode() && options?.apiKey !== VAULT_PLACEHOLDER_KEY) {
+      outer.push(errorEvent(model, VAULT_SLOT_REFUSAL))
+      outer.end()
+      return outer
+    }
     const restoreWebSocket = this.deps.installWebSocket?.() ?? (() => {})
     void (async () => {
       try {
@@ -735,6 +801,8 @@ export class PiOpenAIRuntime {
   commandSupport(): PiPoolCommands {
     return {
       vaultMode: () => this.vaultMode(),
+      syncVaultSlot: (refresh) => this.syncVaultSlot(refresh),
+      disconnectVault: () => this.disconnectVault(),
       // In vault mode Pi's login is not used, so it is not taken (taking a
       // new login starts a quota poll with it).
       observeLogin: (token) => {
@@ -780,6 +848,8 @@ export class PiOpenAIRuntime {
 
 /** The pool-backed parts of the Pi `/openai` command. */
 export interface PiPoolCommands {
+  syncVaultSlot?: (refresh?: () => unknown) => Promise<void>
+  disconnectVault?: () => Promise<'restored' | 'conflict' | 'nothing-to-do'>
   /**
    * Whether Pi is in vault mode. Pi's own login is then not read: asking Pi
    * for its key would make Pi refresh and store that login.

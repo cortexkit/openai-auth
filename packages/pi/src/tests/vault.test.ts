@@ -39,6 +39,7 @@ import {
 import { createPiMenu } from '../commands.ts'
 import { clearPiStickyRouting } from '../routing.ts'
 import { PiOpenAIRuntime } from '../runtime.ts'
+import { VAULT_PLACEHOLDER_KEY } from '../vault-slot.ts'
 
 const CODEX_URL = 'https://chatgpt.com/backend-api/codex/responses'
 const WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage'
@@ -160,6 +161,7 @@ async function send(
   const stream = runtime.stream(MODEL, CONTEXT, {
     transport: 'sse',
     fetch: fakeFetch,
+    apiKey: VAULT_PLACEHOLDER_KEY,
     ...(sessionId ? { sessionId } : {}),
   })
   for await (const event of stream as AsyncIterable<AssistantMessageEvent>)
@@ -223,6 +225,9 @@ describe('Pi and the Claustrum vault', () => {
           .find((section) => section.id === 'routing')!
           .actions.map((action) => action.id),
       ).toEqual(['mode', 'order'])
+      // Finish quota writes started in local mode before measuring whether
+      // vault-mode menu actions leave the pool files unchanged.
+      await support.store().pullsSettled()
       enroll()
       await target.refresh()
       const before = [paths.configPath, paths.statePath].map((path) =>
