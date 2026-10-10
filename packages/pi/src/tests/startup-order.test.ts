@@ -52,7 +52,16 @@ test('Pi 1.0.4 startup swaps the enrolled slot before auth resolution and the fi
       )
       if (child.error) throw child.error
       if (child.status !== 0) {
-        throw new Error(`${child.stdout}\n${child.stderr}`)
+        // Forward the child's failure but not its run summary. A second
+        // "Ran N test" line would make this run's own count ambiguous to
+        // tools that read it, such as the mutation runner.
+        const summary =
+          /^\s*(Ran \d+ tests? across|\d+ (pass|fail|skip)$|\d+ expect\(\) calls)/
+        const output = `${child.stdout}\n${child.stderr}`
+          .split('\n')
+          .filter((line) => !summary.test(line))
+          .join('\n')
+        throw new Error(output)
       }
     } finally {
       rmSync(homeDir, { recursive: true, force: true })
