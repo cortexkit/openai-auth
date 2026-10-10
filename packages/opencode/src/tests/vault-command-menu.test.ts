@@ -134,6 +134,9 @@ function context(connected = true): OpenCodeMenuContext {
         statePath: files.stateFile,
       }),
     migration: async () => ({ migrated: true }),
+    beginAccountLogin: async () => {
+      throw new Error('OAuth was not requested')
+    },
     vault: vault(connected),
     now: () => now,
     resolveResetTarget: async () => {
@@ -213,7 +216,7 @@ describe('vault command menu', () => {
     expect(accounts.lines).toEqual([
       '3 vault accounts',
       '3 can route',
-      'Local accounts are not used while this host is connected to the vault.',
+      'Accounts are managed in the vault with ck. Disconnect to use local accounts.',
     ])
     expect(accounts.items.map((item) => item.id)).toEqual(
       roster.map((row) => row.routeId),
@@ -267,7 +270,7 @@ describe('vault command menu', () => {
     expect(accounts.lines).toEqual([
       '3 vault accounts',
       '1 can route',
-      'Local accounts are not used while this host is connected to the vault.',
+      'Accounts are managed in the vault with ck. Disconnect to use local accounts.',
     ])
     expect(accounts.items.map((item) => item.id)).toEqual(
       roster.map((row) => row.routeId),
@@ -319,17 +322,112 @@ describe('vault command menu', () => {
     ).toBe('5h ≥25% · secondary ≥10%')
     expect(readFileSync(files.stateFile, 'utf8')).toBe(before)
   })
-  test('reset labels set-aside locals without admitting vault accounts', async () => {
-    roster = roster.filter((row) => row.accountIdentity !== 'chatgpt-ufuk')
+  test('reset offers no local credential actions in vault mode', async () => {
     const reset = (await sections()).find((section) => section.id === 'reset')!
-    expect(reset.items.map((item) => item.id)).toEqual(['main', 'ufuk'])
-    expect(reset.items[0]?.label).toContain(
-      'set aside (served by vault beatricelau0414@gmail.com)',
+    expect(reset.items).toEqual([])
+    expect(reset.actions).toEqual([])
+    expect(reset.lines).toEqual([
+      'Accounts are managed in the vault with ck. Disconnect to use local accounts.',
+    ])
+  })
+  test('vault mode hides local-writing dialog actions and disconnect restores them unchanged', async () => {
+    const ctx = context()
+    const command = createOpenCodeMenu(ctx)
+    const connected = (await command.open(invocation)).menu
+    const accounts = connected.sections.find(
+      (section) => section.id === 'accounts',
+    )!
+    expect(accounts.actions.map((action) => action.id)).toEqual([])
+    expect(accounts.items.every((item) => item.actions.length === 0)).toBe(true)
+    expect(
+      connected.sections
+        .find((section) => section.id === 'routing')!
+        .actions.map((action) => action.id),
+    ).toEqual(['mode'])
+    expect(
+      connected.sections
+        .find((section) => section.id === 'limits')!
+        .items[0]!.actions.map((action) => action.id),
+    ).toContain('floors')
+    expect(
+      connected.sections
+        .find((section) => section.id === 'vault')!
+        .actions.map((action) => action.id),
+    ).toEqual(['disconnect'])
+    ctx.vault = vault(false)
+    const disconnected = (await createOpenCodeMenu(ctx).open(invocation)).menu
+    const localCtx = { ...ctx }
+    delete localCtx.vault
+    const local = (await createOpenCodeMenu(localCtx).open(invocation)).menu
+    expect(
+      disconnected.sections.filter((section) => section.id !== 'vault'),
+    ).toEqual(local.sections.filter((section) => section.id !== 'vault'))
+    expect(
+      disconnected.sections
+        .find((section) => section.id === 'accounts')!
+        .actions.map((action) => action.id),
+    ).toEqual(['add'])
+    expect(
+      disconnected.sections
+        .find((section) => section.id === 'routing')!
+        .actions.map((action) => action.id),
+    ).toEqual(['mode', 'order'])
+  })
+  test('stale local dialog writes in vault mode refuse with a fixed message and byte-identical pool files', async () => {
+    const ctx = context(false)
+    let connected = false
+    const localVault = ctx.vault!
+    const remoteVault = vault()
+    ctx.vault = new Proxy(localVault, {
+      get: (_target, key) =>
+        Reflect.get(connected ? remoteVault : localVault, key),
+    })
+    let logins = 0
+    ctx.beginAccountLogin = async () => {
+      logins++
+      throw new Error('OAuth must not start in vault mode')
+    }
+    const command = createOpenCodeMenu(ctx)
+    expect(
+      (await command.open(invocation)).menu.sections[0]!.actions[0]!.id,
+    ).toBe('add')
+    connected = true
+    const before = [files.configFile, files.stateFile].map((file) =>
+      readFileSync(file),
     )
-    // In vault mode a local row the vault does not hold is set aside too.
-    expect(reset.items[1]?.label).toContain(
-      'set aside (this host uses only its vault accounts)',
-    )
+    for (const request of [
+      { sectionId: 'accounts', actionId: 'add' },
+      ...['disable', 'enable', 'move', 'remove'].map((actionId) => ({
+        sectionId: 'accounts',
+        itemId: 'ufuk',
+        actionId,
+      })),
+      {
+        sectionId: 'routing',
+        actionId: 'order',
+        values: { order: 'ufuk, main' },
+      },
+      ...['preview', 'spend', 'retry'].map((actionId) => ({
+        sectionId: 'reset',
+        itemId: 'ufuk',
+        actionId,
+      })),
+      { sectionId: 'limits', itemId: 'ufuk', actionId: 'floors' },
+    ]) {
+      const result = await command.apply(
+        { command: 'openai', confirmed: true, ...request },
+        invocation,
+      )
+      expect(result.ok).toBe(false)
+      expect(result.code).toBe('vault-local-action')
+      expect(result.text).toBe(
+        'Nothing was changed: accounts are managed in the vault with ck. Disconnect to use local accounts.',
+      )
+      expect(
+        [files.configFile, files.stateFile].map((file) => readFileSync(file)),
+      ).toEqual(before)
+    }
+    expect(logins).toBe(0)
   })
   test('disconnected output is byte-identical apart from unlabelled row names', async () => {
     const ctx = context(false)
@@ -409,7 +507,7 @@ Open the OpenCode TUI to change these settings.`)
     expect(accounts.lines).toEqual([
       '2 vault accounts',
       '2 can route',
-      'Local accounts are not used while this host is connected to the vault.',
+      'Accounts are managed in the vault with ck. Disconnect to use local accounts.',
     ])
     const check = menu
       .find((section) => section.id === 'quota')

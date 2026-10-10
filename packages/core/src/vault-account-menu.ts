@@ -81,7 +81,11 @@ const SET_ASIDE = 'set aside (this host uses only its vault accounts)'
 
 /** Shown in place of the local accounts while the host is in vault mode. */
 export const VAULT_MODE_LOCAL_NOTE =
-  'Local accounts are not used while this host is connected to the vault.'
+  'Accounts are managed in the vault with ck. Disconnect to use local accounts.'
+
+/** Message refusing a local account action selected before vault enrollment. */
+export const VAULT_LOCAL_ACTION_REFUSAL =
+  'Nothing was changed: accounts are managed in the vault with ck. Disconnect to use local accounts.'
 
 function localLine(row: PoolRow): string {
   const parts = [
@@ -96,9 +100,9 @@ function localLine(row: PoolRow): string {
 }
 
 /**
- * Retain local add/remove and enable/disable actions; list vault accounts and
- * check their quota through the vault. In vault mode the local accounts are
- * neither listed nor polled: only the vault's accounts serve.
+ * List and poll only vault accounts while enrolled. Local account management
+ * returns after disconnecting; an action selected before enrollment is refused
+ * before it can start a login, inspect credentials or repair the local store.
  */
 export async function runVaultAccountMenu(
   options: AccountMenuOptions,
@@ -111,7 +115,28 @@ export async function runVaultAccountMenu(
   const load = isVaultMenuConnected(view)
     ? undefined
     : await options.store.read()
-  const actions = await accountMenuActions(options)
+  const localActions = await accountMenuActions(options)
+  const vaultActionIds = new Set([
+    'check-quotas',
+    ...(options.extraActions ?? []).map((action) => action.id),
+  ])
+  const actions = localActions
+    .filter(
+      (action) => !isVaultMenuConnected(view) || vaultActionIds.has(action.id),
+    )
+    .map((action) => ({
+      ...action,
+      run: async (context: Parameters<typeof action.run>[0]) => {
+        if (
+          !vaultActionIds.has(action.id) &&
+          isVaultMenuConnected(await readVaultMenu(vault))
+        ) {
+          context.print(VAULT_LOCAL_ACTION_REFUSAL)
+          return
+        }
+        await action.run(context)
+      },
+    }))
   const quotaAction = actions.find((action) => action.id === 'check-quotas')
   if (quotaAction) {
     quotaAction.run = async (context) => {

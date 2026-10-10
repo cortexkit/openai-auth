@@ -250,6 +250,11 @@ export function createAuthMethods({
    * machine would have no way to add it at all.
    */
   const hasCredential = async (): Promise<boolean> => {
+    if (
+      vault &&
+      (await enrollmentAuthority(vault.paths, vault.name)) === 'vault'
+    )
+      return true
     if ((await readAuth()).type !== 'missing') return true
     const paths = getPaths()
     const store = deps.openAccountPool(paths)
@@ -378,6 +383,11 @@ export function createAuthMethods({
     pollQuota,
     doctor: doctorChecks(true),
     status: async () => {
+      const enrollment = await vault?.status()
+      if (vault && enrollment?.enrollment.state === 'approved')
+        return [
+          vaultEnrollmentLine(vault.host, vault.name, enrollment.enrollment),
+        ]
       const storage = await deps.loadAccounts(paths)
       return [
         `Routing: ${storage?.routing?.mode ?? 'main-first'}`,
@@ -459,6 +469,11 @@ export function createAuthMethods({
   const openMenu = async (_inputs: AuthorizeInputs): Promise<MenuOutcome> => {
     const paths = getPaths()
     const store = deps.openAccountPool(paths)
+    if (
+      vault &&
+      (await enrollmentAuthority(vault.paths, vault.name)) === 'vault'
+    )
+      return runVaultAccountMenu(accountMenuOptions(paths, store), vault)
     if ((await migratedPoolRows(paths, store)) === undefined)
       return notMigratedMenu()
     const options = accountMenuOptions(paths, store)

@@ -6,6 +6,7 @@ import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -185,6 +186,89 @@ function enroll() {
 }
 
 describe('Pi and the Claustrum vault', () => {
+  test('vault mode hides local-writing Pi dialog actions and a stale add refuses without changing pool bytes', async () => {
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:work': vaultLogin('chatgpt-work') },
+    })
+    const target = vault()
+    const runtime = runtimeWith(target)
+    let logins = 0
+    try {
+      const support = runtime.commandSupport()
+      for (const id of ['local', 'spare'])
+        await support.store().add({
+          id,
+          credential: {
+            type: 'oauth',
+            access: `${id}-access`,
+            refresh: `${id}-refresh`,
+            expires: Date.now() + 3600_000,
+          },
+        })
+      const command = createPiMenu(support, {
+        beginAccountLogin: async () => {
+          logins++
+          throw new Error('OAuth must not start in vault mode')
+        },
+      })
+      const local = (await command.open({ notify() {} })).menu.sections
+      expect(
+        local
+          .find((section) => section.id === 'accounts')!
+          .actions.map((action) => action.id),
+      ).toEqual(['add'])
+      expect(
+        local
+          .find((section) => section.id === 'routing')!
+          .actions.map((action) => action.id),
+      ).toEqual(['mode', 'order'])
+      enroll()
+      await target.refresh()
+      const before = [paths.configPath, paths.statePath].map((path) =>
+        readFileSync(path),
+      )
+      const connected = (await command.open({ notify() {} })).menu.sections
+      const accounts = connected.find((section) => section.id === 'accounts')!
+      expect(accounts.actions).toEqual([])
+      expect(accounts.items.every((item) => item.actions.length === 0)).toBe(
+        true,
+      )
+      expect(accounts.lines).toContain(
+        'Accounts are managed in the vault with ck. Disconnect to use local accounts.',
+      )
+      expect(
+        connected
+          .find((section) => section.id === 'routing')!
+          .actions.map((action) => action.id),
+      ).toEqual(['mode'])
+      expect(
+        connected
+          .find((section) => section.id === 'vault')!
+          .actions.map((action) => action.id),
+      ).toEqual(['disconnect'])
+      const result = await command.apply(
+        { command: 'openai', sectionId: 'accounts', actionId: 'add' },
+        { notify() {} },
+      )
+      expect(result.ok).toBe(false)
+      expect(result.text).toBe(
+        'Nothing was changed: accounts are managed in the vault with ck. Disconnect to use local accounts.',
+      )
+      expect(logins).toBe(0)
+      expect(
+        [paths.configPath, paths.statePath].map((path) => readFileSync(path)),
+      ).toEqual(before)
+      await target.disconnect()
+      const disconnected = (await command.open({ notify() {} })).menu.sections
+      for (const id of ['accounts', 'routing'])
+        expect(disconnected.find((section) => section.id === id)).toEqual(
+          local.find((section) => section.id === id),
+        )
+    } finally {
+      target.close()
+    }
+  })
   test('a disconnected menu names an unlabelled local row by id and keeps its identity detail', async () => {
     const target = vault()
     const runtime = runtimeWith(target)

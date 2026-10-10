@@ -1298,21 +1298,8 @@ test_count_pattern = "Ran {count} test"
 expect_red = ["^request\\spath\\swith\\sthe\\smain\\saccount\\sin\\sthe\\spool\\sa\\scompleted\\sbase\\smigration\\swith\\san\\suntagged\\splaceholder\\sstill\\sserves\\smain\\sand\\sadopts\\slater\\slogins$"]
 expect_message = "Received: false"
 
-# The command and auth login menus decide which accounts the vault owns from the
-# vault's account identities and active route ids. A local account signed in to
-# a vault-owned ChatGPT account is shown as set aside: requests use the vault copy.
-
-[[control]]
-id = "menu-vault-ownership"
-guards = "in vault mode every local row is labelled set aside, naming the vault account that serves its ChatGPT account when there is one"
-file = "packages/core/src/vault-account-menu.ts"
-old = "  if (!isVaultMenuConnected(view)) return undefined"
-new = "  return undefined // NON-VACUITY BREAK"
-test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
-runner = "command"
-command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
-test_count_pattern = "Ran {count} test"
-expect_red = ['^vault\scommand\smenu\sreset\slabels\sset-aside\slocals\swithout\sadmitting\svault\saccounts$']
+# Vault menu projections list vault accounts only. Local reset-credit actions
+# are hidden while connected instead of labelled unavailable.
 
 [[control]]
 id = "menu-vault-roster"
@@ -1374,17 +1361,6 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-comma
 test_count_pattern = "Ran {count} test"
 expect_red = ['^vault\scommand\smenu\svault\sfloors\suse\sthe\srequest\sroute\skey\sand\sleave\scredentials\suntouched$']
 
-[[control]]
-id = "menu-reset-set-aside-label"
-guards = "reset lists only local rows and marks a vault-owned local credential as set aside"
-file = "packages/core/src/vault-command-menu.ts"
-old = "                    label: aside ? `${item.label} · ${aside}` : item.label,"
-new = "                    label: item.label, // NON-VACUITY BREAK"
-test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
-runner = "command"
-command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
-test_count_pattern = "Ran {count} test"
-expect_red = ['^vault\scommand\smenu\sreset\slabels\sset-aside\slocals\swithout\sadmitting\svault\saccounts$']
 
 [[control]]
 id = "menu-no-vault-output"
@@ -2010,3 +1986,149 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-v
 test_count_pattern = "Ran {count} test"
 expect_red = ['^vault\sactivation\sis\sregistered\sand\sreturns\sonly\sthe\shost\splaceholder\swithout\sa\spool\swrite$']
 expect_message = "missing vault activation method"
+
+# Vault enrollment is exclusive: local account management must disappear from
+# the rendered menus, and a choice captured before enrollment must refuse.
+
+[[control]]
+id = "menu-vault-accounts-no-add"
+guards = "OpenCode never offers the local OAuth add action while enrolled and restores the original menu after disconnect"
+file = "packages/core/src/vault-command-menu.ts"
+old = "          slot === 'limits' || (slot === 'routing' && action.id === 'mode'),"
+new = "          slot === 'accounts' || slot === 'limits' || (slot === 'routing' && action.id === 'mode'), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\svault\smode\shides\slocal-writing\sdialog\sactions\sand\sdisconnect\srestores\sthem\sunchanged$']
+expect_message = '"add"'
+
+[[control]]
+id = "menu-vault-accounts-no-row-writes"
+guards = "the vault Accounts projection offers no local enable disable move or remove action"
+file = "packages/core/src/vault-command-menu.ts"
+old = "          remote && slot !== 'limits'"
+new = "          false // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\svault\smode\shides\slocal-writing\sdialog\sactions\sand\sdisconnect\srestores\sthem\sunchanged$']
+expect_message = "Received: false"
+
+[[control]]
+id = "menu-vault-routing-no-reorder"
+guards = "vault mode retains routing mode settings but never offers a local roster reorder"
+file = "packages/core/src/vault-command-menu.ts"
+old = "          slot === 'limits' || (slot === 'routing' && action.id === 'mode'),"
+new = "          slot === 'limits' || slot === 'routing', // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\svault\smode\shides\slocal-writing\sdialog\sactions\sand\sdisconnect\srestores\sthem\sunchanged$']
+expect_message = '"order"'
+
+[[control]]
+id = "menu-vault-reset-no-local-actions"
+guards = "reset preview spend and retry do not offer or inspect local credentials while enrolled"
+file = "packages/core/src/vault-command-menu.ts"
+old = "              if (isVaultMenuConnected(view))"
+new = "              if (false) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\sreset\soffers\sno\slocal\scredential\sactions\sin\svault\smode$']
+expect_message = '"preview"'
+
+[[control]]
+id = "menu-vault-stale-local-apply"
+guards = "a stale local dialog action receives the fixed vault refusal before OAuth or any account file write"
+file = "packages/core/src/vault-command-menu.ts"
+old = "        menu === connectedMenu &&"
+new = "        false && // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\scommand\smenu\sstale\slocal\sdialog\swrites\sin\svault\smode\srefuse\swith\sa\sfixed\smessage\sand\sbyte-identical\spool\sfiles$']
+expect_message = '"vault-local-action"'
+
+[[control]]
+id = "menu-vault-terminal-no-local-actions"
+guards = "the auth login terminal never offers local add reauth remove toggle doctor repairs or delete-all while enrolled"
+file = "packages/core/src/vault-account-menu.ts"
+old = "      (action) => !isVaultMenuConnected(view) || vaultActionIds.has(action.id),"
+new = "      (action) => true, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\svault\smode\shides\slocal-writing\sterminal\sactions\sand\sdisconnect\srestores\sthem\sunchanged$']
+expect_message = "Add account"
+
+[[control]]
+id = "menu-vault-terminal-stale-local-apply"
+guards = "an add selected in the terminal before enrollment is refused before starting OAuth or writing the pool"
+file = "packages/core/src/vault-account-menu.ts"
+old = "          !vaultActionIds.has(action.id) &&"
+new = "          false && // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\sa\sterminal\sadd\sselected\sbefore\senrollment\srefuses\swithout\schanging\spool\sbytes$']
+expect_message = "Nothing was changed: accounts are managed in the vault with ck. Disconnect to use local accounts."
+
+[[control]]
+id = "menu-pi-vault-accounts-no-add"
+guards = "Pi hides local account writes and refuses a stale add with byte-identical files then restores the menu after disconnect"
+file = "packages/core/src/vault-command-menu.ts"
+old = "          slot === 'limits' || (slot === 'routing' && action.id === 'mode'),"
+new = "          slot === 'accounts' || slot === 'limits' || (slot === 'routing' && action.id === 'mode'), // NON-VACUITY BREAK"
+test_file = "packages/pi/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sand\sthe\sClaustrum\svault\svault\smode\shides\slocal-writing\sPi\sdialog\sactions\sand\sa\sstale\sadd\srefuses\swithout\schanging\spool\sbytes$']
+expect_message = '"add"'
+
+[[control]]
+id = "menu-vault-terminal-no-local-login-fallback"
+guards = "vault enrollment opens the terminal account menu without probing or signing into a local credential"
+file = "packages/opencode/src/auth/methods.ts"
+old = "  const hasCredential = async (): Promise<boolean> => {\n    if (\n      vault &&\n      (await enrollmentAuthority(vault.paths, vault.name)) === 'vault'\n    )\n      return true"
+new = "  const hasCredential = async (): Promise<boolean> => {\n    // NON-VACUITY BREAK: ignore vault enrollment."
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\san\senrolled\sterminal\swith\sno\slocal\scredential\sor\smigrated\spool\snever\sopens\slocal\slogin\sor\sdoctor$']
+expect_message = "local login must not start"
+
+[[control]]
+id = "menu-vault-terminal-no-premigration-doctor"
+guards = "an enrolled host opens the vault menu rather than the local pre-migration doctor"
+file = "packages/opencode/src/auth/methods.ts"
+old = "    if (\n      vault &&\n      (await enrollmentAuthority(vault.paths, vault.name)) === 'vault'\n    )\n      return runVaultAccountMenu(accountMenuOptions(paths, store), vault)"
+new = "    // NON-VACUITY BREAK: fall through to the local migration menu."
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\san\senrolled\sterminal\swith\sno\slocal\scredential\sor\smigrated\spool\snever\sopens\slocal\slogin\sor\sdoctor$']
+expect_message = "Accounts are managed in the vault with ck. Disconnect to use local accounts."
+
+[[control]]
+id = "menu-vault-terminal-no-local-status-read"
+guards = "the connected terminal status does not inspect legacy local accounts"
+file = "packages/opencode/src/auth/methods.ts"
+old = "      if (vault && enrollment?.enrollment.state === 'approved')"
+new = "      if (false) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\san\senrolled\sterminal\swith\sno\slocal\scredential\sor\smigrated\spool\snever\sopens\slocal\slogin\sor\sdoctor$']
+expect_message = "Expected: 0"

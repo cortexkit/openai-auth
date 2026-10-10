@@ -926,14 +926,16 @@ describe('vault cachekeep', () => {
 })
 
 /** A terminal that types `keys` into the menu and records what it prints. */
-function scriptedTerminal(keys: string[]) {
+function scriptedTerminal(keys: string[], beforeKey?: (key: string) => void) {
   const queue = [...keys]
   let listener: ((data: string) => void) | undefined
   let written = ''
   const feed = () => {
     setTimeout(() => {
       if (!listener || queue.length === 0) return
-      listener(queue.shift() as string)
+      const key = queue.shift() as string
+      beforeKey?.(key)
+      listener(key)
       feed()
     }, 5)
   }
@@ -968,7 +970,7 @@ function scriptedTerminal(keys: string[]) {
 
 const DOWN = '\u001b[B'
 const LOCAL_NOTE =
-  'Local accounts are not used while this host is connected to the vault.'
+  'Accounts are managed in the vault with ck. Disconnect to use local accounts.'
 const ENTER = '\r'
 
 describe('enrollment', () => {
@@ -1098,7 +1100,7 @@ describe('auth account menu with vault accounts', () => {
           })
           expect(result.ok).toBe(false)
           expect(result.text).toMatch(
-            /no usable access token|token is unavailable/,
+            /Nothing was changed: accounts are managed in the vault with ck/,
           )
         }
       }
@@ -1114,8 +1116,12 @@ describe('auth account menu with vault accounts', () => {
     }
   })
 
-  async function menu(keys: string[], vault: OpenAiVault) {
-    const scripted = scriptedTerminal(keys)
+  async function menu(
+    keys: string[],
+    vault: OpenAiVault,
+    beforeKey?: (key: string) => void,
+  ) {
+    const scripted = scriptedTerminal(keys, beforeKey)
     const methods = createAuthMethods({
       client: { auth: { set: async () => {} } } as never,
       getAuth: async () => ({ ...PLACEHOLDER }),
@@ -1127,6 +1133,9 @@ describe('auth account menu with vault accounts', () => {
       dependencies: {
         terminal: scripted.terminal,
         migrationBlockers: async () => [],
+        beginAccountLogin: async () => {
+          throw new Error('OAuth must not start in vault mode')
+        },
       },
     })
     await (
@@ -1178,6 +1187,106 @@ describe('auth account menu with vault accounts', () => {
       vault.close()
     }
   })
+  test('vault mode hides local-writing terminal actions and disconnect restores them unchanged', async () => {
+    const { vault } = await setup()
+    const localLabels = [
+      'Add account',
+      'Re-authenticate account',
+      'Remove account',
+      'Enable or disable account',
+      'Auth doctor',
+      'Delete all accounts',
+    ]
+    try {
+      const before = [files.configFile, files.stateFile].map((file) =>
+        readFileSync(file),
+      )
+      const connected = await menu(['\u001b'], vault)
+      for (const label of localLabels) expect(connected).not.toContain(label)
+      expect(connected).not.toContain('Apply repairs')
+      expect(connected).toContain('Check quotas')
+      expect(connected).toContain('Connect to the Claustrum vault')
+      expect(connected).toContain(LOCAL_NOTE)
+      expect(
+        [files.configFile, files.stateFile].map((file) => readFileSync(file)),
+      ).toEqual(before)
+      await vault.disconnect()
+      const disconnected = await menu(['\u001b'], vault)
+      for (const label of localLabels) expect(disconnected).toContain(label)
+    } finally {
+      vault.close()
+    }
+  })
+  test('an enrolled terminal with no local credential or migrated pool never opens local login or doctor', async () => {
+    const { vault } = await setup()
+    try {
+      writeFileSync(
+        files.configFile,
+        JSON.stringify({ version: 1, accounts: [] }),
+      )
+      const before = [files.configFile, files.stateFile].map((file) =>
+        readFileSync(file),
+      )
+      const scripted = scriptedTerminal(['\u001b'])
+      let localReads = 0
+      const methods = createAuthMethods({
+        client: { auth: { set: async () => {} } } as never,
+        getAuth: async () => {
+          localReads++
+          return { type: 'missing' }
+        },
+        getPaths: () => ({
+          configPath: files.configFile,
+          statePath: files.stateFile,
+        }),
+        vault,
+        dependencies: {
+          terminal: scripted.terminal,
+          loadAccounts: async () => {
+            localReads++
+            return null
+          },
+          authorizeBrowser: async () => {
+            throw new Error('local login must not start')
+          },
+          migrationBlockers: async () => [],
+        },
+      })
+      await (
+        methods[0] as {
+          authorize: (inputs: Record<string, string>) => Promise<unknown>
+        }
+      ).authorize({})
+      expect(scripted.written()).toContain(LOCAL_NOTE)
+      expect(scripted.written()).toContain('Check quotas')
+      expect(scripted.written()).not.toContain('Auth doctor')
+      expect(localReads).toBe(0)
+      expect(
+        [files.configFile, files.stateFile].map((file) => readFileSync(file)),
+      ).toEqual(before)
+    } finally {
+      vault.close()
+    }
+  })
+  test('a terminal add selected before enrollment refuses without changing pool bytes', async () => {
+    const { vault } = await setup()
+    try {
+      await vault.disconnect()
+      const before = [files.configFile, files.stateFile].map((file) =>
+        readFileSync(file),
+      )
+      const printed = await menu([ENTER], vault, () => enroll())
+      expect(printed).toContain(
+        'Nothing was changed: accounts are managed in the vault with ck. Disconnect to use local accounts.',
+      )
+      expect(printed).not.toContain('OAuth must not start')
+      expect(
+        [files.configFile, files.stateFile].map((file) => readFileSync(file)),
+      ).toEqual(before)
+    } finally {
+      vault.close()
+    }
+  })
 
   test('auth menu Check quotas in vault mode polls only vault accounts and no local row', async () => {
     const wire = installWire({
@@ -1188,7 +1297,7 @@ describe('auth account menu with vault accounts', () => {
       const gets = running.gets.length
       const beforeConfig = readJson(files.configFile)
       const beforeState = readFileSync(files.stateFile, 'utf8')
-      const printed = await menu([...Array(4).fill(DOWN), ENTER], vault)
+      const printed = await menu([ENTER], vault)
       expect(wire.polls.sort()).toEqual(
         [
           `Bearer ${chatgptAccessToken('chatgpt-main')}`,
@@ -1231,7 +1340,7 @@ describe('auth account menu with vault accounts', () => {
         connectionFile: () => running.connectionFile,
         pollIntervalMs: 0,
       })
-      const printed = await menu([...Array(4).fill(DOWN), ENTER], offline)
+      const printed = await menu([ENTER], offline)
       offline.close()
       expect(printed).toContain('Claustrum vault unreachable:')
       // Still vault mode: the local rows are neither listed nor polled.

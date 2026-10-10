@@ -21,7 +21,7 @@ import {
   isVaultMenuConnected,
   type MenuVault,
   readVaultMenu,
-  setAsideDetail,
+  VAULT_LOCAL_ACTION_REFUSAL,
   VAULT_MODE_LOCAL_NOTE,
   vaultAccountName,
 } from './vault-account-menu'
@@ -270,9 +270,14 @@ export function createVaultCommandMenu(
               ),
       }
     })
-    const actions = section.actions.map((action) =>
-      forwardAction(source, slot, action),
-    )
+    // Only plugin settings may be forwarded. Account management and roster
+    // ordering belong to the vault, not to this host's dormant local pool.
+    const actions = section.actions
+      .filter(
+        (action) =>
+          slot === 'limits' || (slot === 'routing' && action.id === 'mode'),
+      )
+      .map((action) => forwardAction(source, slot, action))
     return {
       lines:
         slot === 'accounts'
@@ -290,6 +295,7 @@ export function createVaultCommandMenu(
     ...options,
     accounts: undefined,
     quota: undefined,
+    routing: undefined,
     limits: undefined,
     replace: {
       accounts: {
@@ -299,6 +305,10 @@ export function createVaultCommandMenu(
       quota: {
         title: 'Quota',
         build: (invocation) => build('quota', invocation),
+      },
+      routing: {
+        title: 'Routing',
+        build: (invocation) => build('routing', invocation),
       },
       limits: {
         title: 'Limits',
@@ -311,23 +321,12 @@ export function createVaultCommandMenu(
         : {
             ...section,
             build: async (invocation) => {
-              const content = await section.build(invocation)
               const view = await readVaultMenu(vault)
-              const load = await options.store.read()
-              return {
-                ...content,
-                items: content.items?.map((item) => {
-                  const row =
-                    load.status === 'ready'
-                      ? load.rows.find((row) => row.id === item.id)
-                      : undefined
-                  const aside = row ? setAsideDetail(row, view) : undefined
-                  return {
-                    ...item,
-                    label: aside ? `${item.label} · ${aside}` : item.label,
-                  }
-                }),
-              }
+              // Reset credits use local credentials; even a preview can
+              // refresh a token or write a quota reading to the local pool.
+              if (isVaultMenuConnected(view))
+                return { lines: [VAULT_MODE_LOCAL_NOTE] }
+              return section.build(invocation)
             },
           },
     ),
@@ -340,7 +339,26 @@ export function createVaultCommandMenu(
   return {
     command: options.command,
     open: async (invocation) => (await current()).open(invocation),
-    apply: async (request, invocation) =>
-      (await current()).apply(request, invocation),
+    apply: async (request, invocation) => {
+      const menu = await current()
+      if (
+        menu === connectedMenu &&
+        (request.sectionId === 'accounts' ||
+          (request.sectionId === 'routing' && request.actionId === 'order') ||
+          request.sectionId === 'reset' ||
+          (request.sectionId === 'limits' &&
+            request.itemId !== undefined &&
+            !(await readVaultMenu(vault)).status.accounts.some(
+              (row) => row.routeId === request.itemId,
+            )))
+      )
+        return {
+          ...(await menu.open(invocation)),
+          ok: false,
+          code: 'vault-local-action',
+          text: VAULT_LOCAL_ACTION_REFUSAL,
+        }
+      return menu.apply(request, invocation)
+    },
   }
 }
