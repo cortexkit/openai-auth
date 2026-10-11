@@ -102,7 +102,10 @@ export interface PiPoolSourceDeps {
   pullRetryMs?: number
   /** Pass-through store options (tests). */
   store?: Partial<
-    Pick<OpenPoolStoreOptions, 'lockOptions' | 'rowLockOptions' | 'hold'>
+    Pick<
+      OpenPoolStoreOptions,
+      'lockOptions' | 'rowLockOptions' | 'hold' | 'onStep'
+    >
   >
   log?: {
     info(message: string, meta?: Record<string, unknown>): void
@@ -115,6 +118,8 @@ export interface PiPoolSourceDeps {
    * as they are until Pi disconnects. Read on every use.
    */
   vaultMode?: () => boolean
+  /** Re-read whether the vault is connected before writing queued local observations. */
+  vaultAuthority?: () => Promise<'local' | 'vault' | 'unreadable'>
 }
 
 type BackoffEntry = {
@@ -328,6 +333,22 @@ export class PiPoolSource {
       },
       logger: this.log,
       ...this.deps.store,
+      onStep: async (step, info) => {
+        await this.deps.store?.onStep?.(step, info)
+        // Enrollment can change while an operation waits for locks or the
+        // provider, so check again before writing local account data.
+        // Explicit menu settings also describe vault accounts and remain writable.
+        if (
+          info.operation !== 'updateSettings' &&
+          step.startsWith('before-') &&
+          (this.deps.vaultAuthority
+            ? (await this.deps.vaultAuthority()) !== 'local'
+            : this.setAside())
+        )
+          throw new Error(
+            'Local account writes are disabled while connected to the vault.',
+          )
+      },
     })
     this.store = { configPath: paths.configPath, store }
     return store
@@ -579,7 +600,16 @@ export class PiPoolSource {
     const store = this.storeFor(this.deps.paths())
     const previous = this.writes.get(row.id) ?? Promise.resolve()
     const write = previous
-      .then(() => store.recordQuota(row.id, attribution, observation))
+      .then(async () => {
+        if (
+          this.disposed ||
+          (this.deps.vaultAuthority
+            ? (await this.deps.vaultAuthority()) !== 'local'
+            : this.setAside())
+        )
+          return
+        return store.recordQuota(row.id, attribution, observation)
+      })
       .catch((error: unknown) => {
         this.log.warn('pool quota not recorded', {
           rowId: row.id,
@@ -675,7 +705,9 @@ export class PiPoolSource {
       const outcome = await this.storeFor(this.deps.paths()).refresh(
         id,
         this.deps.refreshProvider,
+        { refuse: () => (this.setAside() ? 'vault-mode' : undefined) },
       )
+      if (this.setAside()) return
       if (outcome.status === 'rotated') {
         this.backoff.delete(id)
         this.rotated.set(id, outcome.credential)

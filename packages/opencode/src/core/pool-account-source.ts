@@ -143,7 +143,10 @@ export interface PoolAccountSourceDeps {
   legacyLocks?: Partial<LegacyLockOptions>
   /** Pass-through store options (tests). */
   store?: Partial<
-    Pick<OpenPoolStoreOptions, 'lockOptions' | 'rowLockOptions' | 'hold'>
+    Pick<
+      OpenPoolStoreOptions,
+      'lockOptions' | 'rowLockOptions' | 'hold' | 'onStep'
+    >
   >
   log?: Pick<ReturnType<typeof createLogger>, 'debug' | 'info' | 'warn'>
   /**
@@ -395,6 +398,20 @@ export class PoolAccountSource {
       },
       logger: this.log,
       ...this.deps.store,
+      onStep: async (step, info) => {
+        await this.deps.store?.onStep?.(step, info)
+        // Enrollment can change while an operation waits for locks or the
+        // provider, so check again before writing local account data.
+        if (
+          info.operation !== 'updateSettings' &&
+          step.startsWith('before-') &&
+          this.deps.vaultAuthority &&
+          (await this.deps.vaultAuthority()) !== 'local'
+        )
+          throw new Error(
+            'Local account writes are disabled while connected to the vault.',
+          )
+      },
     })
     this.store = { configPath: paths.configPath, store }
     return store

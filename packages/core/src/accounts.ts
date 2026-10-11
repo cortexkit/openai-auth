@@ -385,6 +385,8 @@ export type AccountManagerOptions = {
    * this keeps the per-account background refresh off those rows.
    */
   backgroundRefreshPaused?: () => boolean | Promise<boolean>
+  /** Rechecked under the store lock before deferred local persistence. */
+  canWrite?: () => boolean
 }
 
 export type RefreshAccountOptions = {
@@ -1264,6 +1266,7 @@ function stateFromStorage(storage: AccountStorage): AccountRuntimeState {
 export async function saveAccounts(
   storage: AccountStorage,
   paths: AccountPaths,
+  canWrite: (() => boolean) | undefined = undefined,
 ) {
   const path = paths.configPath
   // Serialize concurrent read-modify-write to prevent lost updates when
@@ -1343,7 +1346,9 @@ export async function saveAccounts(
           ...additions,
         ],
       }
+      if (canWrite && !canWrite()) return
       await writeJsonAtomic(path, nextConfig)
+      if (canWrite && !canWrite()) return
       await writeJsonAtomic(statePath, stateFromStorage(merged))
     } finally {
       await stateLock.release()
@@ -1534,7 +1539,7 @@ export async function mutateAccounts(
     context?: MutateAccountsContext,
   ) => AccountStorage | undefined,
   paths: AccountPaths,
-  options: { allowDrop?: readonly string[] } = {},
+  options: { allowDrop?: readonly string[]; canWrite?: () => boolean } = {},
 ): Promise<AccountStorage> {
   const path = paths.configPath
   const statePath = paths.statePath
@@ -1610,7 +1615,9 @@ export async function mutateAccounts(
           ...additions,
         ],
       }
+      if (options.canWrite && !options.canWrite()) return current
       await writeJsonAtomic(path, nextConfig)
+      if (options.canWrite && !options.canWrite()) return current
       await writeJsonAtomic(statePath, stateFromStorage(next))
       // Log the actual written roster (nextConfig.accounts), not the
       // mutator's output (next.accounts). next.accounts omits preserved
@@ -1687,6 +1694,7 @@ export async function saveAccountState(
     mainRefresh: true,
     accounts: true,
   },
+  canWrite?: () => boolean,
 ) {
   const statePath = paths.statePath
   // Serialize concurrent read-modify-write on the state file to prevent lost
@@ -1740,6 +1748,7 @@ export async function saveAccountState(
       }
     }
 
+    if (canWrite && !canWrite()) return
     await writeJsonAtomic(statePath, pruneUndefined(next))
   } finally {
     await lock.release()
@@ -2390,9 +2399,14 @@ export class FallbackAccountManager {
   }
 
   async save(storage: AccountStorage, accountIds?: string[]) {
-    await saveAccountState(storage, this.paths, {
-      accounts: accountIds ?? true,
-    })
+    await saveAccountState(
+      storage,
+      this.paths,
+      {
+        accounts: accountIds ?? true,
+      },
+      this.options.canWrite,
+    )
   }
 
   startBackgroundRefresh() {

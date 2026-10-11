@@ -876,7 +876,10 @@ function usableRoutingAccountIds(
 // state file, as it always has, so drainSidebarWrites waits for all of them.
 let sidebarWriteChain: Promise<void> = Promise.resolve()
 
-type SidebarMergeHooks = Pick<SidebarFileHooks, 'beforeRecheck'>
+type SidebarMergeHooks = Pick<SidebarFileHooks, 'beforeRecheck'> & {
+  /** Whether this snapshot may still be written; checked again after lock waits. */
+  canWrite?: () => boolean
+}
 
 function enqueueSidebarWrite(operation: () => Promise<void>): Promise<void> {
   const result = sidebarWriteChain.then(operation)
@@ -968,12 +971,26 @@ function writeMergedSidebarState(
   hooks?: SidebarMergeHooks,
 ): Promise<void> {
   // Every state reaches disk normalized, as each write has always been.
+  const refused = Symbol('sidebar authority changed')
   return logWriteFailure(
     file,
-    sidebarFileFor(file).update((latest) => {
-      const next = merge(latest)
-      return next === undefined ? undefined : normalizeSidebarState(next)
-    }, hooks),
+    sidebarFileFor(file)
+      .update(
+        (latest) => {
+          if (hooks?.canWrite && !hooks.canWrite()) return undefined
+          const next = merge(latest)
+          return next === undefined ? undefined : normalizeSidebarState(next)
+        },
+        {
+          beforeRecheck: async (...args) => {
+            await hooks?.beforeRecheck?.(...args)
+            if (hooks?.canWrite && !hooks.canWrite()) throw refused
+          },
+        },
+      )
+      .catch((error: unknown) => {
+        if (error !== refused) throw error
+      }),
   )
 }
 
@@ -1294,14 +1311,19 @@ export function upsertSidebarActiveRouting(
 export function setSidebarLegacyRouting(
   input: ActiveRoutingEntry,
   file = getSidebarStateFile(),
+  hooks?: SidebarMergeHooks,
 ): Promise<void> {
   return enqueueSidebarWrite(async () => {
-    await writeMergedSidebarState(file, (latest) => ({
-      ...latest,
-      activeId: input.activeId,
-      route: input.route,
-      lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
-    }))
+    await writeMergedSidebarState(
+      file,
+      (latest) => ({
+        ...latest,
+        activeId: input.activeId,
+        route: input.route,
+        lastUpdated: Math.max(Date.now(), latest.lastUpdated + 1),
+      }),
+      hooks,
+    )
   })
 }
 
