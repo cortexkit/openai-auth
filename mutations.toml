@@ -2493,3 +2493,17 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\sa\sstale\sterminal\sConnect\schoice\snever\sdisconnects\sa\snewly\senrolled\shost$']
+
+# Windows browser opener: launched without waiting, so a slow cold PowerShell
+# start is never killed before the browser opens (verified on real Windows).
+[[control]]
+id = "opener-windows-does-not-wait"
+guards = "the Windows opener launches PowerShell unreferenced without a synchronous wait"
+file = "packages/core/src/util/open-url.ts"
+old = "      child.unref()"
+new = "      void child // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/browser-opener.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/browser-opener.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^browser\sopener\suses\sa\sshell-free\sPowerShell\scommand\sfor\sa\scomplete\sOAuth\sURL\son\sWindows$']
