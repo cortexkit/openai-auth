@@ -95,7 +95,9 @@ export function redactCredentialFrame(
   frame: string,
   credential?: string,
 ): string {
-  // Match escaped error keys and type values, not Unicode escapes in model deltas.
+  // Parse only frames that can be an error envelope: any frame containing the
+  // word, or one that spells the error key or type with Unicode escapes.
+  // Ordinary deltas, including escaped non-ASCII text, skip the parse.
   if (
     !frame.includes('error') &&
     (!frame.includes('\\u00') ||
