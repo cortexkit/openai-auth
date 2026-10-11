@@ -1378,7 +1378,7 @@ expect_red = ['^vault\scommand\smenu\sdisconnected\soutput\sis\sbyte-identical\s
 id = "menu-pi-vault-slots"
 guards = "Pi supplies the vault to the shared replacement slots as well as the Vault extra"
 file = "packages/pi/src/commands.ts"
-old = "    store: pool.store(),\n    vault: pool.vault,"
+old = "    store: pool.store(),\n    vault: menuVault,"
 new = "    store: pool.store(),\n    vault: undefined, // NON-VACUITY BREAK"
 test_file = "packages/pi/src/tests/vault.test.ts"
 runner = "command"
@@ -1669,8 +1669,8 @@ expect_red = ["^vault\\saccounts\\son\\sOpenCode\\s2\\snever\\sroutes\\sa\\spool
 id = "pi-vault-slot-enter-before-reload"
 guards = "the expired Pi login is stashed and replaced before Pi can resolve or refresh it"
 file = "packages/pi/src/runtime.ts"
-old = "        if (mode) await this.vaultSlot().enterVault()"
-new = "        if (mode) await Promise.resolve() // NON-VACUITY BREAK: leave Pi's OAuth login in the slot."
+old = "    if (mode) await this.vaultSlot().enterVault()"
+new = "    if (mode) await Promise.resolve() // NON-VACUITY BREAK: leave Pi's OAuth login in the slot."
 test_file = "packages/pi/src/tests/vault-mode.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
@@ -2165,8 +2165,8 @@ expect_message = "expect(finished).toBe(false)"
 id = "pi-vault-slot-restores-before-disconnect"
 guards = "disconnect restores the saved entry before enrollment is removed"
 file = "packages/pi/src/runtime.ts"
-old = "      const result = await this.vaultSlot().exitVault()"
-new = "      const result = 'nothing-to-do' as const // NON-VACUITY BREAK: delete enrollment before restoring Pi's login."
+old = "        const result = await this.vaultSlot().exitVault()"
+new = "        const result = 'nothing-to-do' as const // NON-VACUITY BREAK: delete enrollment before restoring Pi's login."
 test_file = "packages/pi/src/tests/vault-mode.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
@@ -2191,8 +2191,8 @@ expect_message = "expect(result.text).toContain(VAULT_SLOT_CONFLICT)"
 id = "pi-vault-slot-refuses-stale-resolved-credential"
 guards = "vault streams refuse a non-placeholder credential locally even when the vault could serve"
 file = "packages/pi/src/runtime.ts"
-old = "    if (this.vaultMode() && options?.apiKey !== VAULT_PLACEHOLDER_KEY) {"
-new = "    if (false) { // NON-VACUITY BREAK: accept Pi's stale local credential."
+old = "          (await this.readAuthority()) !== 'local' &&\n          options?.apiKey !== VAULT_PLACEHOLDER_KEY"
+new = "          false // NON-VACUITY BREAK: accept Pi's stale local credential."
 test_file = "packages/pi/src/tests/vault-mode.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
@@ -2253,3 +2253,83 @@ command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/startup-order.tes
 test_count_pattern = "Ran {count} test"
 expect_red = ['^Pi\s1\.0\.4\sstartup\sswaps\sthe\senrolled\sslot\sbefore\sauth\sresolution\sand\sthe\sfirst\srequest$']
 expect_message = "expect(hostEntry.key).toBe(VAULT_PLACEHOLDER_KEY)"
+
+# Pi enrollment races: mode is re-read at local side-effect boundaries, and
+# slot moves are reconciled against the authority after competing operations.
+[[control]]
+id = "pi-approval-during-request-storage"
+guards = "approval during a request settings read prevents observing Pi's native token"
+file = "packages/pi/src/runtime.ts"
+old = "    const storage = await this.storage()\n    const vaultMode = (await this.readAuthority()) !== 'local'"
+new = "    const vaultMode = (await this.readAuthority()) !== 'local'\n    const storage = await this.storage() // NON-VACUITY BREAK: retain pre-read enrollment mode."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sin\svault\smode\sapproval\sduring\srequest\sstorage\sread\snever\spolls\sthe\snative\slogin$']
+expect_message = "expect(runtime.main.currentToken()).toBeUndefined()"
+
+[[control]]
+id = "pi-approval-during-quota-storage"
+guards = "approval during quota settings read selects vault-only polling"
+file = "packages/pi/src/runtime.ts"
+old = "        // Vault mode polls the vault's accounts alone.\n        if ((await this.readAuthority()) !== 'local')"
+new = "        // NON-VACUITY BREAK: use the mode from before the storage await.\n        if (this.vaultMode())"
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sin\svault\smode\sapproval\sduring\srefresh-all\sstorage\sread\snever\spolls\sthe\snative\slogin$']
+expect_message = "expect(results).toEqual([])"
+
+[[control]]
+id = "pi-native-quota-send-authority"
+guards = "a previously scheduled native quota poll checks enrollment immediately before sending"
+file = "packages/pi/src/runtime.ts"
+old = "        if ((await this.readAuthority()) !== 'local')\n          throw new Error('Pi login quota polling is disabled while enrolled')"
+new = "        // NON-VACUITY BREAK: send with the retained Pi token after approval."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sin\svault\smode\sa\snative\squota\spoll\squeued\sbefore\sapproval\srefuses\sto\ssend\sin\svault\smode$']
+expect_message = "expect(result.ok).toBe(false)"
+
+[[control]]
+id = "pi-disconnect-failure-reconciles-slot"
+guards = "a failed enrollment removal moves the restored Pi login back aside"
+file = "packages/pi/src/runtime.ts"
+old = "      } finally {\n        await this.reconcileSlot()\n      }"
+new = "      } finally {\n        await this.readAuthority() // NON-VACUITY BREAK: leave the restored login active while enrolled.\n      }"
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\sdisconnect\sfailure\sbefore\senrollment\sremoval\sre-stashes\sthe\srestored\slogin$']
+expect_message = "toBe(VAULT_PLACEHOLDER_KEY)"
+
+[[control]]
+id = "pi-disconnect-failure-reloads-auth"
+guards = "a disconnect that removed enrollment but failed later still reloads restored Pi auth"
+file = "packages/pi/src/commands.ts"
+old = "                  await dependencies.afterApply?.()"
+new = "                  await Promise.resolve() // NON-VACUITY BREAK: keep Pi's placeholder snapshot after failed disconnect."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\sdisconnect\sfailure\safter\senrollment\sremoval\skeeps\sthe\soriginal\slogin\sand\sreloads\sPi$']
+expect_message = "expect(reloads).toBe(2)"
+
+[[control]]
+id = "pi-competing-slot-move-authority"
+guards = "a second runtime that restores during approval re-enters custody and preserves the original login"
+file = "packages/pi/src/runtime.ts"
+old = "    if (currentMode !== mode) {"
+new = "    if (false) { // NON-VACUITY BREAK: ignore enrollment changed during the locked slot move."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\sa\ssecond\sruntime\srestoring\sduring\sapproval\spreserves\sthe\soriginal\slogin\sexactly\sonce$']
+expect_message = "toBe(VAULT_PLACEHOLDER_KEY)"

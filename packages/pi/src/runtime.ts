@@ -25,7 +25,10 @@
 // serve is refused with a fixed message. Disconnecting restores them.
 
 import { statSync } from 'node:fs'
-import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
+import {
+  enrollmentAuthority,
+  type QuotaReceipt,
+} from '@cortexkit/common-auth/claustrum'
 import type { PiSlot } from '@cortexkit/common-auth/pi-slot'
 import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
 import {
@@ -209,6 +212,7 @@ export class PiOpenAIRuntime {
   private readonly paths: () => AccountPaths
   private slot: PiSlot | undefined
   private slotVaultMode: boolean | undefined
+  private authority: 'unknown' | 'local' | 'vault' | 'unreadable' = 'unknown'
   private slotNeedsRefresh = false
   private slotQueue: Promise<unknown> = Promise.resolve()
   private storageCache:
@@ -226,6 +230,8 @@ export class PiOpenAIRuntime {
     this.main = new PiMainAccount({
       now: this.now,
       poll: async (token, identity) => {
+        if ((await this.readAuthority()) !== 'local')
+          throw new Error('Pi login quota polling is disabled while enrolled')
         const snapshot = await whamUsageFn({
           accessToken: token,
           fetchImpl: fetchImpl(),
@@ -248,6 +254,8 @@ export class PiOpenAIRuntime {
       // polled or written. Read on every use, so a disconnect restores it.
       vaultMode: () => this.vaultMode(),
       refreshProvider: async (credential) => {
+        if ((await this.readAuthority()) !== 'local')
+          throw new Error('Local token refresh is disabled while enrolled')
         const tokens = await codexRefreshFn({
           refreshToken: credential.refresh,
           fetchImpl: fetchImpl(),
@@ -261,6 +269,8 @@ export class PiOpenAIRuntime {
         return { ...tokens, ...(identity ? { identity } : {}) }
       },
       pullQuota: async (request) => {
+        if ((await this.readAuthority()) !== 'local')
+          throw new Error('Local quota polling is disabled while enrolled')
         const credential = request.credential
         if (credential.type !== 'oauth' || !credential.access)
           throw new Error('the row holds no access token to poll with')
@@ -288,11 +298,20 @@ export class PiOpenAIRuntime {
   }
 
   /**
-   * Whether Pi is in vault mode: connected to the Claustrum vault, so only
-   * the vault's accounts serve and nothing local is used or touched.
+   * Conservative mode hint for synchronous hooks. Unknown or unreadable
+   * enrollment blocks local work; asynchronous boundaries read authority anew.
    */
   vaultMode(): boolean {
-    return this.vault.enrolled()
+    return this.authority !== 'local'
+  }
+
+  async readAuthority(): Promise<'local' | 'vault' | 'unreadable'> {
+    const authority = await enrollmentAuthority(
+      this.vault.paths,
+      this.vault.name,
+    )
+    this.authority = authority
+    return authority
   }
 
   private vaultSlot(): PiSlot {
@@ -313,16 +332,7 @@ export class PiOpenAIRuntime {
    */
   syncVaultSlot(refresh?: () => unknown): Promise<void> {
     return this.withSlot(async () => {
-      const mode = this.vaultMode()
-      if (mode !== this.slotVaultMode) {
-        if (mode) await this.vaultSlot().enterVault()
-        else if (this.slotVaultMode) {
-          await this.vaultSlot().exitVault()
-          this.slotNeedsRefresh = true
-        }
-        this.slotVaultMode = mode
-        this.slotNeedsRefresh = mode || this.slotNeedsRefresh
-      }
+      await this.reconcileSlot()
       if (this.slotNeedsRefresh && refresh) {
         await refresh()
         this.slotNeedsRefresh = false
@@ -336,12 +346,37 @@ export class PiOpenAIRuntime {
    */
   disconnectVault(): Promise<'restored' | 'conflict' | 'nothing-to-do'> {
     return this.withSlot(async () => {
-      const result = await this.vaultSlot().exitVault()
-      await this.vault.disconnect()
-      this.slotVaultMode = false
-      this.slotNeedsRefresh = true
-      return result
+      try {
+        const result = await this.vaultSlot().exitVault()
+        this.slotNeedsRefresh = true
+        await this.vault.disconnect()
+        return result
+      } finally {
+        await this.reconcileSlot()
+      }
     })
+  }
+
+  private async reconcileSlot(): Promise<void> {
+    const mode = (await this.readAuthority()) !== 'local'
+    const before = await this.vaultSlot().inspect()
+    if (mode) await this.vaultSlot().enterVault()
+    else await this.vaultSlot().exitVault()
+    this.slotNeedsRefresh =
+      (mode && before.slot !== 'placeholder') ||
+      (!mode && before.slot === 'placeholder') ||
+      (this.slotVaultMode !== undefined && mode !== this.slotVaultMode) ||
+      this.slotNeedsRefresh
+    this.slotVaultMode = mode
+    // Another process can change enrollment while the slot helper waits for
+    // its auth.json lock. Reconcile that change after the locked move finishes.
+    const currentMode = (await this.readAuthority()) !== 'local'
+    if (currentMode !== mode) {
+      if (currentMode) await this.vaultSlot().enterVault()
+      else await this.vaultSlot().exitVault()
+      this.slotVaultMode = currentMode
+      this.slotNeedsRefresh = true
+    }
   }
 
   /**
@@ -349,7 +384,8 @@ export class PiOpenAIRuntime {
    * starts the vault's background poll of Pi's vault accounts. Never
    * rejects.
    */
-  start(): Promise<void> {
+  async start(): Promise<void> {
+    await this.readAuthority()
     this.vault.start()
     return this.pool.load().then(
       () => {},
@@ -569,14 +605,16 @@ export class PiOpenAIRuntime {
     options?: SimpleStreamOptions,
   ): AssistantMessageEventStream {
     const outer = this.deps.createStream()
-    if (this.vaultMode() && options?.apiKey !== VAULT_PLACEHOLDER_KEY) {
-      outer.push(errorEvent(model, VAULT_SLOT_REFUSAL))
-      outer.end()
-      return outer
-    }
     const restoreWebSocket = this.deps.installWebSocket?.() ?? (() => {})
     void (async () => {
       try {
+        if (
+          (await this.readAuthority()) !== 'local' &&
+          options?.apiKey !== VAULT_PLACEHOLDER_KEY
+        ) {
+          outer.push(errorEvent(model, VAULT_SLOT_REFUSAL))
+          return
+        }
         const attempt = await this.route(model, context, options)
         if (attempt.kind === 'blocked') {
           outer.push(
@@ -620,8 +658,8 @@ export class PiOpenAIRuntime {
     | ({ kind: 'sent' } & StreamAttempt)
     | { kind: 'blocked'; block: PoolBlock; refusal?: VaultModeRefusal }
   > {
-    const vaultMode = this.vaultMode()
     const storage = await this.storage()
+    const vaultMode = (await this.readAuthority()) !== 'local'
     if (vaultMode) {
       // Vault mode: Pi's login (the key Pi hands over) and the pool are not
       // used. Before the vault's first account list there is nothing to
@@ -801,12 +839,14 @@ export class PiOpenAIRuntime {
   commandSupport(): PiPoolCommands {
     return {
       vaultMode: () => this.vaultMode(),
+      readAuthority: () => this.readAuthority(),
       syncVaultSlot: (refresh) => this.syncVaultSlot(refresh),
       disconnectVault: () => this.disconnectVault(),
       // In vault mode Pi's login is not used, so it is not taken (taking a
       // new login starts a quota poll with it).
-      observeLogin: (token) => {
-        if (!this.vaultMode()) this.main.observeToken(token)
+      observeLogin: async (token) => {
+        if ((await this.readAuthority()) === 'local')
+          this.main.observeToken(token)
       },
       store: () => this.pool.poolStore(),
       mainIdentity: () => this.main.currentIdentity(),
@@ -814,14 +854,15 @@ export class PiOpenAIRuntime {
       reload: () => this.pool.load(),
       vault: this.vault,
       refreshAllQuota: async () => {
+        const storage =
+          (await this.readAuthority()) === 'local' ? await this.storage() : null
         // Vault mode polls the vault's accounts alone.
-        if (this.vaultMode())
+        if ((await this.readAuthority()) !== 'local')
           return (await this.vault.pollStale(0)).map((row) => ({
             account: row.id,
             ok: row.ok,
             ...(row.error ? { error: row.error } : {}),
           }))
-        const storage = await this.storage()
         const [main, rows, vaultRows] = await Promise.all([
           this.main.currentToken() ? this.main.pollNow() : undefined,
           this.pool.pollRows(storage),
@@ -848,6 +889,7 @@ export class PiOpenAIRuntime {
 
 /** The pool-backed parts of the Pi `/openai` command. */
 export interface PiPoolCommands {
+  readAuthority: () => Promise<'local' | 'vault' | 'unreadable'>
   syncVaultSlot?: (refresh?: () => unknown) => Promise<void>
   disconnectVault?: () => Promise<'restored' | 'conflict' | 'nothing-to-do'>
   /**
@@ -856,7 +898,7 @@ export interface PiPoolCommands {
    */
   vaultMode: () => boolean
   /** Takes the token Pi holds for its login now, as a request would. */
-  observeLogin: (token: string | undefined) => void
+  observeLogin: (token: string | undefined) => Promise<void>
   /** The store Pi's pool rows live in. */
   store: () => PoolStore
   /** The ChatGPT account Pi's own login signs in with, when known. */
