@@ -315,11 +315,9 @@ describe('Pi and the Claustrum vault', () => {
       directory: dir,
       credentials: { 'oauth:openai:work': vaultLogin('chatgpt-work') },
     })
-    enroll()
     const target = vault()
     const runtime = runtimeWith(target)
     try {
-      await target.refresh()
       const support = runtime.commandSupport()
       await support.store().add({
         id: 'local',
@@ -331,6 +329,8 @@ describe('Pi and the Claustrum vault', () => {
           expires: Date.now() + 3600_000,
         },
       })
+      enroll()
+      await target.refresh()
       await target.pollStale(0)
       const command = createPiMenu(support)
       const { menu } = await command.open({ notify() {} })

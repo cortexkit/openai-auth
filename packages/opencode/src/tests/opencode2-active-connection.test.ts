@@ -383,3 +383,61 @@ describe('OpenCode 2 active connection gate', () => {
     }
   })
 })
+
+it('redacts owned HTTP WebSocket and retry errors without touching foreign connections', async () => {
+  const { host } = await start(poolCredential())
+  const message =
+    'Invalid API key: main-token twice main-token; Bearer another-secret; eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0.signature'
+  const { request } = await http(host, PLACEHOLDER)
+  expect(request.headers.get('authorization')).toBe('Bearer main-token')
+  const reply = {
+    ...scope(),
+    request,
+    response: Response.json({ error: { message } }, { status: 401 }),
+  }
+  await host.fire('http.response', reply)
+  const body = await reply.response.text()
+  expect(body).toContain('Invalid API key: [credential] twice [credential]')
+  expect(body).not.toContain('main-token')
+  expect(body).not.toContain('another-secret')
+  expect(body).not.toContain('eyJ')
+  await host.fire('experimental.ws.handshake', {
+    ...scope(),
+    url: 'wss://api.openai.com/v1/responses',
+    headers: { authorization: `Bearer ${PLACEHOLDER}` },
+  })
+  const received = {
+    ...scope(),
+    frame: JSON.stringify({ type: 'error', message }),
+  }
+  await host.fire('experimental.ws.receive', received)
+  expect(received.frame).not.toContain('main-token')
+  const retry = {
+    ...scope(),
+    attempt: 1,
+    error: { type: 'api', message },
+    decision: { retry: false },
+  }
+  await host.fire('retry', retry)
+  expect(retry.error.message).not.toContain('main-token')
+  await host.fire('experimental.ws.handshake', {
+    ...scope(),
+    url: 'wss://api.openai.com/v1/responses',
+    headers: { authorization: 'Bearer foreign-token' },
+  })
+  received.frame = JSON.stringify({ type: 'error', message })
+  await host.fire('experimental.ws.receive', received)
+  expect(received.frame).toContain(message)
+  retry.error.message = message
+  await host.fire('retry', retry)
+  expect(retry.error.message).toBe(message)
+  const foreign = await http(host, 'foreign-token')
+  const original = Response.json({ error: { message } }, { status: 401 })
+  const foreignReply = {
+    ...scope(),
+    request: foreign.request,
+    response: original,
+  }
+  await host.fire('http.response', foreignReply)
+  expect(foreignReply.response).toBe(original)
+})

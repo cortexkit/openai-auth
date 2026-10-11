@@ -41,6 +41,7 @@ import {
   OpenAiVault,
   type RefreshAllQuotaResult,
   type RoutingMode,
+  redactCredentialText,
   VAULT_MODE_REFUSALS,
   VAULT_REQUEST_ROSTER_WAIT_MS,
   type VaultModeRefusal,
@@ -249,6 +250,7 @@ export class PiOpenAIRuntime {
       // In vault mode the pool is set aside: nothing in it is refreshed,
       // polled or written. Read on every use, so a disconnect restores it.
       vaultMode: () => this.vaultMode(),
+      vaultAuthority: () => this.readAuthority(),
       refreshProvider: async (credential) => {
         if ((await this.readAuthority()) !== 'local')
           throw new Error('Local token refresh is disabled while enrolled')
@@ -638,7 +640,10 @@ export class PiOpenAIRuntime {
         outer.push(
           errorEvent(
             model,
-            error instanceof Error ? error.message : String(error),
+            redactCredentialText(
+              error instanceof Error ? error.message : String(error),
+              options?.apiKey,
+            ),
           ),
         )
       } finally {
@@ -773,14 +778,40 @@ export class PiOpenAIRuntime {
       return {
         head: errorEvent(
           model,
-          error instanceof Error ? error.message : String(error),
+          redactCredentialText(
+            error instanceof Error ? error.message : String(error),
+            token,
+          ),
         ),
         rest: undefined,
       }
     }
-    const iterator = (inner as AsyncIterable<AssistantMessageEvent>)[
-      Symbol.asyncIterator
-    ]()
+    const iterator = (async function* () {
+      try {
+        for await (const event of inner) {
+          yield event.type === 'error'
+            ? {
+                ...event,
+                error: {
+                  ...event.error,
+                  errorMessage: redactCredentialText(
+                    event.error.errorMessage ?? '',
+                    token,
+                  ),
+                },
+              }
+            : event
+        }
+      } catch (error) {
+        yield errorEvent(
+          model,
+          redactCredentialText(
+            error instanceof Error ? error.message : String(error),
+            token,
+          ),
+        )
+      }
+    })()
     const first = await iterator.next()
     const head = first.done ? undefined : first.value
     return {

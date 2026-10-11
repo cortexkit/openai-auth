@@ -14,7 +14,7 @@ The contract used for this review is:
 6. Tokens must not appear in log lines, emitted error messages or interprocess menu payloads.
 7. Detached background work must not produce an unhandled promise rejection.
 
-**Hold the release against the stated acceptance criteria.** Five reproducible discrepancies remain: an OpenCode 1 enrollment race sends a local credential, OpenCode 1 cannot establish its vault request path with a corrupt unused local store, Pi rewrites its native login file on enrollment, Pi commits a queued local quota observation after enrollment, and Pi exposes an upstream error that echoes the bearer. The Pi login-file rewrite is an intentional existing design, not a newly introduced regression: accepting it requires an explicit exception to the byte-identical-file criterion, not silently calling that criterion satisfied.
+**Historical review verdict: hold the candidate pending four fixes and one design decision.** The four confirmed implementation findings below are now addressed by normal regression tests (see the resolution section). Finding 3 is **accepted design, approved by the release owner**: Ufuk chose the same Pi provider names, so enrollment moves the native entry aside and installs a non-secret placeholder to prevent Pi refreshing it before the plugin runs. Byte-identical restoration and conflict-safe preservation, not byte identity while enrolled, are its guarantees.
 
 Reviewed candidate: `3b2b4b97f0a047d4e0dfdd02b5f37e17250860af` (provided `origin/main`, before review-only additions). No product code, manifests, lockfiles, generated assets or existing test expectations were changed. Added tests assert the requested contract and **are intentionally red on the candidate**. All credentials in fixtures and excerpts are synthetic. Severity below distinguishes security/isolation violations from availability and specification discrepancies.
 
@@ -46,7 +46,7 @@ The findings do not require a live account, vault daemon or external service. Th
 - **Severity:** High (vault/local credential isolation). **Hold:** Yes.
 - **Locations:** `packages/opencode/src/index.ts:4695`, `:4727`, `:4752`, `:5133`; the common send primitive at `:3303` has no enrollment check. The `vault.assertHostSlot(currentAuth)` guard at `:4752` rejects use of a native credential when vault custody serves, but runs only on installs already migrated to the local account pool.
 - **Exact sequence:** Start a legacy/unmigrated install with migration disabled and an unexpired native OAuth login. Complete a local request first (positive control: exactly `Bearer review-local-access` reaches the fake provider). On the next request the initial authority read returns local. While `getAuth()` resolves, an enrollment token is written. The request then continues through the native main path and sends that same local bearer even though enrollment now exists. This represents another process enrolling the host across the await; the fixture places that event directly in the auth lookup to avoid timing-dependent sleeps.
-- **Test:** `packages/opencode/src/tests/review-1.0/opencode1-authority.test.ts`, `OpenCode1 enrollment during host auth lookup prevents a local model send`.
+- **Test:** `packages/opencode/src/tests/opencode1-authority.test.ts`, `OpenCode1 enrollment during host auth lookup prevents a local model send`.
 - **Captured red output:**
 
 ```text
@@ -79,10 +79,10 @@ Reading routing settings is not itself counted as local credential routing. The 
 
 ### 3. Pi enrollment intentionally replaces its native login in auth.json
 
-- **Severity:** Medium (explicit contract/design discrepancy; reversible credential movement, not demonstrated credential loss). **Hold:** Yes until fixed or the release owner explicitly permits the reversible replacement of Pi's native auth.json entry.
+- **Disposition:** accepted design, approved by the release owner. The same provider names require reversible replacement; no product change is requested for this behavior.
 - **Locations:** `packages/pi/src/index.ts:206`, `:215`; `packages/pi/src/runtime.ts:355-375`; `packages/pi/src/vault-slot.ts:18-24`; `packages/pi/node_modules/@cortexkit/common-auth/dist/pi-slot/slot.js:335-362`.
 - **Exact sequence:** Set `PI_AGENT_DIR` to a temporary Pi agent directory. Write `auth.json` with an expired native `openai-codex` OAuth entry and an unrelated provider entry. Enroll the host (`authority() === 'vault'`), construct the runtime with the production `openVaultSlot`, then call `syncVaultSlot()` (as startup/session synchronization does). The helper stashes the original entry and replaces its value with the non-secret API-key placeholder. The unrelated entry is preserved, but the native login file is not byte-identical while connected.
-- **Test:** `packages/pi/src/tests/review-1.0/pi-isolation.test.ts`, `Pi vault synchronization keeps native auth.json byte-identical while enrolled`.
+- **Review-only test removed:** `Pi vault synchronization keeps native auth.json byte-identical while enrolled` asserted the rejected contract. Existing `vault-mode.test.ts` regressions “disconnect restores the original Pi entry byte-identical before removing enrollment” and “a foreign Pi login makes disconnect report a conflict and overwrite neither login” are the approved guarantees.
 - **Captured red output:**
 
 ```text
@@ -221,12 +221,44 @@ Caveats and non-findings:
 - Only installed common-auth 0.14.1 and Pi 1.0.4 behavior was reviewed. No outbound network, live Claustrum, real OAuth ceremony or real user credentials were used. The core, OpenCode and Pi package manifests still name 0.11.0; the requested prospective 1.0.0 review did not edit release metadata.
 - No new mutation controls or root mutation registry changes were requested or made. The five new tests fail against untouched product code. Existing tests were not renamed/reversed to match a different contract.
 
-## Release follow-up
+## Resolution
 
-1. Recheck enrollment immediately before every physical local OpenCode 1 send/refresh and reroute or decline safely if mode changed across an await.
-2. Make the OpenCode 1 vault request/refusal path available despite broken unused local storage, without rewriting that storage.
-3. Resolve the Pi native-slot contract explicitly: preserve the necessary protection against Pi refreshing its login before the plugin stream while either avoiding the file swap or approving a documented reversible-swap exception.
-4. Fence deferred local pool persistence at commit time when enrollment changes.
-5. Scrub credentials from Pi-generated **and forwarded** error events, including the currently used token, and rerun the real-transport echo test.
+- OpenCode 1 re-reads authority after host auth lookup and at the common physical-send boundary; a local attempt crossed by enrollment takes the vault route or its fixed refusal.
+- Non-local OpenCode 1 loaders and requests treat local account storage as optional settings, ignoring parse failures rather than requiring repair. Valid settings still control routing and cache warming; local credentials never become candidates. The malformed-file regression asserts fixed refusal, no send, and unchanged bytes.
+- Pi's queued quota observations recheck the fail-closed mode guard before persistence. The deferred-write audit also fences both hosts' pool commits after provider/lock waits, legacy OpenCode settings and refresh persistence, and local sidebar commits. Each boundary has a regression with a positive reached-commit control.
+- Shared credential redaction masks the exact attempt bearer plus credential-shaped strings in Pi generated/forwarded errors, OpenCode 1 HTTP/stream/transport errors, and owned OpenCode 2 HTTP/WebSocket/retry errors. Foreign OpenCode 2 connections remain unchanged. No timeout or retry policy is changed.
+- Pi regressions now live in `packages/pi/src/tests/request-isolation.test.ts`; OpenCode 1 regressions live beside its normal request tests. The original red captures above remain historical evidence, not the current suite result.
+- Finding 3 is accepted design, approved by the release owner; its byte-identical disconnect restore and conflict tests remain unchanged.
 
-All five should be resolved or explicitly accepted against the intended behaviors before declaring 1.0.0 ready. This is a report-only delivery; the candidate implementation remains unchanged.
+The verification record above describes the original review candidate. Fix verification and cross-version mutation results are recorded in the delivery commit and accompanying delivery record.
+
+## Fix verification
+
+All executable gates ran offline on Linux. Bun was `1.4.2 (744846f84)`, TypeScript `7.0.2`, Biome `2.5.15`; full suites used eight vCPUs. The runner supplied the locked OpenCode 1 `1.18.30` and OpenCode 2 `2.0.22` host fixtures. Both E2E opt-ins were enabled: two real OpenCode 1 cases and sixteen real OpenCode 2 cases ran, with no skipped tests.
+
+| Gate | Result |
+| --- | --- |
+| `bun run types` | Passed the three package typechecks. |
+| `bun run lint` | Passed, 243 files, no fixes. |
+| `bun run build` | Passed all three packages, 26 installed ranges, six package manifests, types and 134 TUI files. |
+| Core suite | 176 passed, zero failed, 15 files. |
+| OpenCode suite including both real hosts | A built full run passed all 1,514 tests across 84 files. The final full recheck passed 1,513 and encountered the transient vault quota-admission failure below; that exact real-host case then passed unchanged in isolation. |
+| Pi suite | Final run: 68 passed, zero failed, six files, 294 assertions. |
+| `ckdev-mutate check` | All 187 catalogue anchors and exact test names verified; runner `0.9.8` on Linux (`0.10.0` also checked locally). |
+
+The final OpenCode 2 real-host vault/401 case briefly refused the first two turns with `quota-unknown` / `no-account`; no model send occurred. The isolated rerun passed all twelve assertions with no source, fixture, timeout or retry-policy change. This is retained as a suite-stability observation, not hidden by changing an expectation. The full run had otherwise passed every OpenCode test, including the remaining seventeen real-host cases.
+
+The Pi vault-menu fixture now seeds its local row **before** enrollment, because the store's new commit fence correctly rejects seeding through runtime account APIs while enrolled. Its menu, quota-floor apply and exclusive-account expectations are unchanged. The rejected native-file byte-identity review test was removed as explicitly approved; restoration and conflict tests were not changed.
+
+### Mutation replay
+
+Each control below was **CAUGHT** under both Bun `1.3.14 (0d9b296a)` and `1.4.2 (744846f84)` by `ckdev-mutate run --only <id> --allow-dirty`. Each selected baseline ran one test and passed; each mutant failed only that named test. Seven other OpenCode tests or eight other Pi tests were filtered out, so this is a focused proof, not a broad catalogue replay.
+
+| Control | Exact test that went red |
+| --- | --- |
+| `opencode1-local-dispatch-authority` | `OpenCode1 enrollment during request body await prevents physical local dispatch` |
+| `opencode1-vault-unused-corrupt-store` | `OpenCode1 vault loader declines locally even when the unused local account file is malformed` |
+| `pi-quota-enrollment-commit` | `Pi deferred recordQuota refuses persistence when enrollment lands at commit` |
+| `pi-transport-error-bearer-redaction` | `Pi request error does not expose the bearer echoed by the transport` |
+
+Manual replays also recorded the safe staging/restore sequence. Live implementation files were staged first and the unstaged diff was empty. During the breaks, `git diff --stat` showed respectively: `index.ts` one insertion/one deletion; `index.ts` one insertion; `pool-source.ts` one insertion/one deletion; `runtime.ts` one insertion/four deletions. Each file was restored with `git checkout -- <path> && touch <path>` and the unstaged diff was empty again. No break remains in production code. Bun 1.3.14's Linux archive was fetched locally and transferred for offline execution; the temporary payload was removed and no manifest or lockfile changed.
