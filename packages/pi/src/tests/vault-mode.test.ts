@@ -612,6 +612,83 @@ describe("Pi's real model runtime in vault mode", () => {
 })
 
 describe('Pi vault slot lifecycle', () => {
+  test('steady local and vault sync ticks take no Pi auth locks', async () => {
+    const locks = await import(
+      new URL(
+        './lock.js',
+        import.meta.resolve('@cortexkit/common-auth/pi-slot'),
+      ).href
+    )
+    const acquire = spyOn(locks, 'acquirePiLock')
+    const authPath = join(dir, 'auth.json')
+    const count = () =>
+      acquire.mock.calls.filter((args) => args[0] === authPath).length
+    writeNativeLogin()
+    const target = vault()
+    const runtime = runtimeWith(target)
+    try {
+      await runtime.syncVaultSlot()
+      expect(count()).toBeGreaterThan(0)
+      acquire.mockClear()
+      for (let tick = 0; tick < 10; tick++) await runtime.syncVaultSlot()
+      expect(count()).toBe(0)
+      enroll()
+      await runtime.syncVaultSlot()
+      expect(count()).toBeGreaterThan(0)
+      acquire.mockClear()
+      for (let tick = 0; tick < 10; tick++) await runtime.syncVaultSlot()
+      expect(count()).toBe(0)
+    } finally {
+      acquire.mockRestore()
+      target.close()
+    }
+  })
+
+  test('explicit slot sync and recovery after failure take Pi auth locks', async () => {
+    const locks = await import(
+      new URL(
+        './lock.js',
+        import.meta.resolve('@cortexkit/common-auth/pi-slot'),
+      ).href
+    )
+    const acquire = spyOn(locks, 'acquirePiLock')
+    const authPath = join(dir, 'auth.json')
+    const count = () =>
+      acquire.mock.calls.filter((args) => args[0] === authPath).length
+    const slot = openPiSlot({
+      authPath,
+      stashPath: join(stateDir, 'pi-openai-codex-login.json'),
+      provider: 'openai-codex',
+      placeholderKey: VAULT_PLACEHOLDER_KEY,
+    })
+    writeNativeLogin()
+    const target = vault()
+    const runtime = runtimeWith(target, slot)
+    const inspect = spyOn(slot, 'inspect')
+    try {
+      await runtime.syncVaultSlot()
+      acquire.mockClear()
+      await runtime.syncVaultSlot(undefined, true)
+      expect(count()).toBeGreaterThan(0)
+      inspect.mockRejectedValueOnce(new Error('slot inspection failed'))
+      await expect(runtime.syncVaultSlot(undefined, true)).rejects.toThrow(
+        'slot inspection failed',
+      )
+      acquire.mockClear()
+      await runtime.syncVaultSlot()
+      expect(count()).toBeGreaterThan(0)
+      acquire.mockClear()
+      await runtime.syncVaultSlot()
+      expect(count()).toBe(0)
+      await runtime.disconnectVault()
+      expect(count()).toBeGreaterThan(0)
+    } finally {
+      inspect.mockRestore()
+      acquire.mockRestore()
+      target.close()
+    }
+  })
+
   test('disconnect failure between token and ceremony removal keeps vault authority', async () => {
     writeNativeLogin()
     enroll()

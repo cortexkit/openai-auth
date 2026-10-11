@@ -175,7 +175,7 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
     runtime.observeWebSocketMessage(headers, data)
   let refresh: (() => unknown) | undefined
   let notify: ((message: string, level: 'error') => void) | undefined
-  const syncSlot = () =>
+  const syncSlot = (explicit = true) =>
     runtime.syncVaultSlot(
       refresh
         ? async () => {
@@ -183,9 +183,10 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
             await refresh?.()
           }
         : undefined,
+      explicit,
     )
   const syncInBackground = () => {
-    void syncSlot().catch(() => {
+    void syncSlot(false).catch(() => {
       notify?.(
         'Pi could not load the vault login slot. Reopen the session or disconnect in /openai.',
         'error',

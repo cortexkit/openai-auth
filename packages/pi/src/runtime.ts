@@ -322,7 +322,9 @@ export class PiOpenAIRuntime {
   private withSlot<T>(run: () => Promise<T>): Promise<T> {
     const pending = this.slotQueue.then(run)
     // A failed reload must not prevent a later session from retrying it.
-    this.slotQueue = pending.catch(() => {})
+    this.slotQueue = pending.catch(() => {
+      this.slotVaultMode = undefined
+    })
     return pending
   }
 
@@ -330,9 +332,9 @@ export class PiOpenAIRuntime {
    * Stash Pi's original login and install the placeholder before reloading
    * auth, so Pi cannot refresh the local login after approval outside the menu.
    */
-  syncVaultSlot(refresh?: () => unknown): Promise<void> {
+  syncVaultSlot(refresh?: () => unknown, explicit = false): Promise<void> {
     return this.withSlot(async () => {
-      await this.reconcileSlot()
+      await this.reconcileSlot(explicit)
       if (this.slotNeedsRefresh && refresh) {
         await refresh()
         this.slotNeedsRefresh = false
@@ -346,6 +348,7 @@ export class PiOpenAIRuntime {
    */
   disconnectVault(): Promise<'restored' | 'conflict' | 'nothing-to-do'> {
     return this.withSlot(async () => {
+      this.slotVaultMode = undefined
       try {
         const result = await this.vaultSlot().exitVault()
         this.slotNeedsRefresh = true
@@ -357,26 +360,30 @@ export class PiOpenAIRuntime {
     })
   }
 
-  private async reconcileSlot(): Promise<void> {
+  private async reconcileSlot(explicit = false): Promise<void> {
     const mode = (await this.readAuthority()) !== 'local'
+    // Background ticks only read enrollment. An explicit sync or an unknown
+    // slot state must reconcile under the helper's lock even in the same mode.
+    if (mode === this.slotVaultMode && !explicit) return
+    const previousMode = this.slotVaultMode
+    this.slotVaultMode = undefined
     const before = await this.vaultSlot().inspect()
     if (mode) await this.vaultSlot().enterVault()
     else await this.vaultSlot().exitVault()
     this.slotNeedsRefresh =
       (mode && before.slot !== 'placeholder') ||
       (!mode && before.slot === 'placeholder') ||
-      (this.slotVaultMode !== undefined && mode !== this.slotVaultMode) ||
+      (previousMode !== undefined && mode !== previousMode) ||
       this.slotNeedsRefresh
-    this.slotVaultMode = mode
     // Another process can change enrollment while the slot helper waits for
     // its auth.json lock. Reconcile that change after the locked move finishes.
     const currentMode = (await this.readAuthority()) !== 'local'
     if (currentMode !== mode) {
       if (currentMode) await this.vaultSlot().enterVault()
       else await this.vaultSlot().exitVault()
-      this.slotVaultMode = currentMode
       this.slotNeedsRefresh = true
     }
+    this.slotVaultMode = currentMode
   }
 
   /**
@@ -840,7 +847,8 @@ export class PiOpenAIRuntime {
     return {
       vaultMode: () => this.vaultMode(),
       readAuthority: () => this.readAuthority(),
-      syncVaultSlot: (refresh) => this.syncVaultSlot(refresh),
+      syncVaultSlot: (refresh, explicit) =>
+        this.syncVaultSlot(refresh, explicit),
       disconnectVault: () => this.disconnectVault(),
       // In vault mode Pi's login is not used, so it is not taken (taking a
       // new login starts a quota poll with it).
@@ -890,7 +898,7 @@ export class PiOpenAIRuntime {
 /** The pool-backed parts of the Pi `/openai` command. */
 export interface PiPoolCommands {
   readAuthority: () => Promise<'local' | 'vault' | 'unreadable'>
-  syncVaultSlot?: (refresh?: () => unknown) => Promise<void>
+  syncVaultSlot?: (refresh?: () => unknown, explicit?: boolean) => Promise<void>
   disconnectVault?: () => Promise<'restored' | 'conflict' | 'nothing-to-do'>
   /**
    * Whether Pi is in vault mode. Pi's own login is then not read: asking Pi

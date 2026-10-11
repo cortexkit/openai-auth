@@ -264,7 +264,7 @@ async function runOpenAiCommand(
   }
   dependencies.onContext?.(ctx)
   if (dependencies.afterApply) await dependencies.afterApply()
-  else await pool.syncVaultSlot?.(() => ctx.modelRegistry.refresh())
+  else await pool.syncVaultSlot?.(() => ctx.modelRegistry.refresh(), true)
   // Take the token Pi holds for its login now, as a request would, so the
   // menu knows which account Pi signs in with. Not in vault mode: asking Pi
   // for the key makes Pi refresh and store an expired login.

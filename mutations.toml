@@ -2333,3 +2333,29 @@ command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.t
 test_count_pattern = "Ran {count} test"
 expect_red = ['^Pi\svault\sslot\slifecycle\sa\ssecond\sruntime\srestoring\sduring\sapproval\spreserves\sthe\soriginal\slogin\sexactly\sonce$']
 expect_message = "toBe(VAULT_PLACEHOLDER_KEY)"
+
+[[control]]
+id = "pi-steady-slot-sync-lock-free"
+guards = "steady local and vault background sync reads authority without acquiring Pi auth locks"
+file = "packages/pi/src/runtime.ts"
+old = "    if (mode === this.slotVaultMode && !explicit) return"
+new = "    // NON-VACUITY BREAK: lock auth.json on every background tick."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\ssteady\slocal\sand\svault\ssync\sticks\stake\sno\sPi\sauth\slocks$']
+expect_message = "expect(count()).toBe(0)"
+
+[[control]]
+id = "pi-explicit-slot-sync-bypasses-fast-path"
+guards = "explicit session and menu sync requests reconcile the Pi slot even when authority has not changed"
+file = "packages/pi/src/runtime.ts"
+old = "    if (mode === this.slotVaultMode && !explicit) return"
+new = "    if (mode === this.slotVaultMode) return // NON-VACUITY BREAK: ignore an explicit slot reconciliation."
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\sexplicit\sslot\ssync\sand\srecovery\safter\sfailure\stake\sPi\sauth\slocks$']
+expect_message = "expect(count()).toBeGreaterThan(0)"
