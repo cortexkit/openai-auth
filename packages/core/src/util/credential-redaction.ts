@@ -1,6 +1,11 @@
 import { redactStrings } from '../logger'
 import { errorMessage } from './error'
 
+const escapedErrorField =
+  /"(?:e|\\u0065)(?:r|\\u0072){2}(?:o|\\u006f)(?:r|\\u0072)"\s*:/i
+const escapedErrorType =
+  /"(?:t|\\u0074)(?:y|\\u0079)(?:p|\\u0070)(?:e|\\u0065)"\s*:\s*"(?:e|\\u0065)(?:r|\\u0072){2}(?:o|\\u006f)(?:r|\\u0072)"/i
+
 /** A request bearer may have no recognizable token shape, so mask its exact value too. */
 export function redactCredentialText(
   text: string,
@@ -11,6 +16,30 @@ export function redactCredentialText(
     '***REDACTED***',
     '[credential]',
   )
+}
+
+/** Decode JSON string values before matching credentials hidden by Unicode escapes. */
+function redactCredentialJsonText(
+  text: string,
+  value: unknown,
+  credential?: string,
+): string {
+  let changed = false
+  function scrub(value: unknown): unknown {
+    if (typeof value === 'string') {
+      const redacted = redactCredentialText(value, credential)
+      if (redacted !== value) changed = true
+      return redacted
+    }
+    if (Array.isArray(value)) return value.map(scrub)
+    if (value && typeof value === 'object')
+      return Object.fromEntries(
+        Object.entries(value).map(([key, item]) => [key, scrub(item)]),
+      )
+    return value
+  }
+  const redacted = scrub(value)
+  return changed ? JSON.stringify(redacted) : text
 }
 
 /** Mask upstream diagnostics while preserving error types used for aborts and quota routing. */
@@ -66,16 +95,22 @@ export function redactCredentialFrame(
   frame: string,
   credential?: string,
 ): string {
-  // Codex error envelopes name an error field or type; ordinary deltas need no parse.
-  if (!frame.includes('"error"')) return frame
+  // Match escaped error keys and type values, not Unicode escapes in model deltas.
+  if (
+    !frame.includes('error') &&
+    (!frame.includes('\\u00') ||
+      (!escapedErrorField.test(frame) && !escapedErrorType.test(frame)))
+  )
+    return frame
+  let value: ReturnType<typeof JSON.parse>
   try {
-    const value = JSON.parse(frame)
-    if (value?.type === 'error' || value?.error || value?.response?.error) {
-      return redactCredentialText(frame, credential)
-    }
+    value = JSON.parse(frame)
   } catch {
     // Non-JSON frames are not provider error envelopes.
+    return frame
   }
+  if (value?.type === 'error' || value?.error || value?.response?.error)
+    return redactCredentialJsonText(frame, value, credential)
   return frame
 }
 
@@ -90,11 +125,23 @@ export async function redactCredentialResponse(
     headers: new Headers(response.headers),
   }
   if (!response.ok) {
+    for (const [name, value] of response.headers) {
+      try {
+        init.headers.set(name, redactCredentialText(value, credential))
+      } catch {
+        // An unrepresentable diagnostic is safer to omit than to forward verbatim.
+        init.headers.delete(name)
+      }
+    }
     init.headers.delete('content-length')
-    return new Response(
-      redactCredentialText(await response.text(), credential),
-      init,
-    )
+    const body = await response.text()
+    let value: unknown
+    try {
+      value = JSON.parse(body)
+    } catch {
+      return new Response(redactCredentialText(body, credential), init)
+    }
+    return new Response(redactCredentialJsonText(body, value, credential), init)
   }
   if (
     !response.body ||
@@ -141,8 +188,14 @@ export async function redactCredentialResponse(
           controller.error(redactCredentialError(error, credential))
         }
       },
-      cancel(reason) {
-        return reader.cancel(reason)
+      async cancel(reason) {
+        try {
+          await reader.cancel(reason)
+        } catch (error) {
+          throw redactCredentialError(error, credential)
+        } finally {
+          reader.releaseLock()
+        }
       },
     }),
     init,

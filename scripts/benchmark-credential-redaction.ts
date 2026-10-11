@@ -6,20 +6,21 @@ const rounds = 60
 const warmups = 10
 const credential = 'opaque-benchmark-credential'
 const encoder = new TextEncoder()
-type Variant = 'completed' | 'failed'
+type Variant = 'completed' | 'failed' | 'escaped-completed'
 type Mode = 'raw' | 'wrapped'
 
 function chunksFor(variant: Variant): Uint8Array[] {
   const chunks: Uint8Array[] = []
   const fragments: string[] = []
-  for (let index = 0; index < events - 1; index++) {
-    const delta = [
-      'The ',
-      'implementation ',
-      'preserves ',
-      'streaming ',
-      'output.\n',
-    ][index % 5]
+  const deltas = variant === 'escaped-completed' ? 2_000 : events - 1
+  const status = variant === 'failed' ? 'failed' : 'completed'
+  for (let index = 0; index < deltas; index++) {
+    const delta =
+      variant === 'escaped-completed'
+        ? '你好🙂'
+        : ['The ', 'implementation ', 'preserves ', 'streaming ', 'output.\n'][
+            index % 5
+          ]
     if (delta === undefined) throw new Error('Missing delta fragment')
     fragments.push(delta)
     chunks.push(
@@ -31,7 +32,11 @@ function chunksFor(variant: Variant): Uint8Array[] {
           output_index: 0,
           content_index: 0,
           delta,
-        })}\n\n`,
+        }).replace(
+          /[\u007f-\uffff]/g,
+          (character) =>
+            `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`,
+        )}\n\n`,
       ),
     )
   }
@@ -39,13 +44,13 @@ function chunksFor(variant: Variant): Uint8Array[] {
     id: 'resp_codex_benchmark',
     object: 'response',
     model: 'gpt-5.4',
-    status: variant,
+    status,
     output: [
       {
         id: 'msg_codex_benchmark',
         type: 'message',
         role: 'assistant',
-        status: variant,
+        status,
         content: [
           { type: 'output_text', text: fragments.join(''), annotations: [] },
         ],
@@ -59,7 +64,7 @@ function chunksFor(variant: Variant): Uint8Array[] {
   }
   chunks.push(
     encoder.encode(
-      `event: response.${variant}\ndata: ${JSON.stringify({ type: `response.${variant}`, sequence_number: events - 1, response })}\n\n`,
+      `event: response.${status}\ndata: ${JSON.stringify({ type: `response.${status}`, sequence_number: deltas, response })}\n\n`,
     ),
   )
   return chunks
@@ -103,8 +108,10 @@ async function consume(chunks: Uint8Array[], mode: Mode) {
     bytes += result.value.byteLength
   }
   const totalMs = performance.now() - start
-  if (latencyMs.length !== events)
-    throw new Error(`Expected ${events} chunks, read ${latencyMs.length}`)
+  if (latencyMs.length !== chunks.length)
+    throw new Error(
+      `Expected ${chunks.length} chunks, read ${latencyMs.length}`,
+    )
   return { totalMs, latencyMs, bytes }
 }
 
@@ -136,7 +143,7 @@ async function parseCount(chunks: Uint8Array[]) {
 }
 
 const results = []
-for (const variant of ['completed', 'failed'] as const) {
+for (const variant of ['completed', 'failed', 'escaped-completed'] as const) {
   const chunks = chunksFor(variant)
   const sourceBytes = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0)
   const totals: Record<Mode, number[]> = { raw: [], wrapped: [] }
@@ -165,7 +172,7 @@ for (const variant of ['completed', 'failed'] as const) {
     if (!pair.raw || !pair.wrapped)
       throw new Error('Missing paired measurement')
     addedTotal.push(pair.wrapped.totalMs - pair.raw.totalMs)
-    for (let index = 0; index < events; index++) {
+    for (let index = 0; index < chunks.length; index++) {
       const raw = pair.raw.latencyMs[index]
       const wrapped = pair.wrapped.latencyMs[index]
       if (raw === undefined || wrapped === undefined)
@@ -175,7 +182,8 @@ for (const variant of ['completed', 'failed'] as const) {
   }
   results.push({
     variant,
-    events,
+    events: chunks.length,
+    deltas: chunks.length - 1,
     source_bytes: sourceBytes,
     rounds,
     warmups,

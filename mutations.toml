@@ -2568,12 +2568,60 @@ expect_red = ['^Pi\srequest\serror\sdoes\snot\sexpose\sthe\sbearer\sechoed\sby\s
 
 [[control]]
 id = "codex-sse-delta-no-json-parse"
-guards = "ordinary Codex delta frames do not pay for JSON parsing on the streaming request path"
+guards = "ordinary and Unicode-escaped Codex delta frames do not pay for JSON parsing on the streaming request path"
 file = "packages/core/src/util/credential-redaction.ts"
-old = "  if (!frame.includes('\"error\"')) return frame"
-new = "  // NON-VACUITY BREAK: parse every ordinary Codex delta."
+old = "    !frame.includes('error') &&"
+new = "    false && // NON-VACUITY BREAK: parse every ordinary Codex delta."
 test_file = "packages/core/src/tests/credential-redaction.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^ordinary\sdelta\sframes\sbypass\sJSON\sparsing\sentirely$']
+expect_red = ['^ordinary\sdelta\sframes\sbypass\sJSON\sparsing\sentirely$', '^escaped\sUnicode\sdelta\sframes\sbypass\sJSON\sparsing\sand\sremain\sbyte-identical$']
+
+[[control]]
+id = "credential-non-ok-header-redaction"
+guards = "provider error headers cannot retain exact account credentials or JWT-shaped diagnostics"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "        init.headers.set(name, redactCredentialText(value, credential))"
+new = "        init.headers.set(name, value) // NON-VACUITY BREAK: forward echoed header credentials."
+test_file = "packages/core/src/tests/credential-redaction.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^non-ok\sresponse\sheaders\sredact\sexact\scredentials\sand\sJWTs\swhile\spreserving\sretry\smetadata$']
+
+[[control]]
+id = "credential-sse-cancel-rejection-redaction"
+guards = "stream cancellation rejects with scrubbed diagnostics while forwarding the caller reason and releasing the reader"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "          throw redactCredentialError(error, credential)"
+new = "          throw error // NON-VACUITY BREAK: expose the cancellation rejection."
+test_file = "packages/core/src/tests/credential-redaction.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^SSE\scancellation\srejection\sredacts\scredentials\swithout\schanging\sthe\sreason\sand\sreleases\sthe\sreader$']
+
+[[control]]
+id = "credential-sse-escaped-error-redaction"
+guards = "legal JSON escaping of error keys and type values cannot bypass SSE credential scrubbing"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "      (!escapedErrorField.test(frame) && !escapedErrorType.test(frame)))"
+new = "      true) // NON-VACUITY BREAK: ignore escaped error envelopes."
+test_file = "packages/core/src/tests/credential-redaction.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^escaped\sJSON\serror\skeys\sredact\sexact\scredentials\sand\sJWTs\sthrough\sthe\sSSE\swrapper$']
+
+[[control]]
+id = "credential-decoded-json-value-redaction"
+guards = "Unicode-escaped credentials in HTTP and SSE error string values cannot reappear after JSON decoding"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  return changed ? JSON.stringify(redacted) : text"
+new = "  return redactCredentialText(text, credential) // NON-VACUITY BREAK: match only the encoded JSON text."
+test_file = "packages/core/src/tests/credential-redaction.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^failed\sHTTP\sJSON\sbodies\sredact\sdecoded\scredential\sJWT\sand\sBearer\svalues\swithout\schanging\sclassification$', '^SSE\serror\sframes\sredact\sdecoded\scredential\sJWT\sand\sBearer\svalues\swithout\schanging\sclassification$']
