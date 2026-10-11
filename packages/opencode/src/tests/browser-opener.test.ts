@@ -19,7 +19,7 @@ const noSyncOnWindows = () => {
   throw new Error('Windows must not wait on a synchronous opener')
 }
 
-function mockSpawn(pid: number | undefined = 4242) {
+function mockSpawn(pid: number | undefined) {
   const events: string[] = []
   const calls: unknown[][] = []
   const spawn = (file: string, args: string[], options: unknown) => {
@@ -35,7 +35,7 @@ function mockSpawn(pid: number | undefined = 4242) {
 
 describe('browser opener', () => {
   test('uses a shell-free PowerShell command for a complete OAuth URL on Windows', () => {
-    const { spawn, calls, events } = mockSpawn()
+    const { spawn, calls, events } = mockSpawn(4242)
 
     expect(openUrl(oauthAuthorizeUrl, 'win32', noSyncOnWindows, spawn)).toBe(
       true,
@@ -68,7 +68,7 @@ describe('browser opener', () => {
 
   test('preserves quotes, percent escapes, ampersands, and spaces in URLs', () => {
     const url = `${oauthAuthorizeUrl}&note=it's 100% ready`
-    const { spawn, calls } = mockSpawn()
+    const { spawn, calls } = mockSpawn(4242)
 
     expect(openBrowserForMenu(url, 'win32', noSyncOnWindows, spawn)).toBe(true)
 
