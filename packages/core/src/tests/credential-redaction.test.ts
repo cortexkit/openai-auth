@@ -1,6 +1,7 @@
-import { expect, test } from 'bun:test'
+import { expect, spyOn, test } from 'bun:test'
 import {
   redactCredentialError,
+  redactCredentialFrame,
   redactCredentialResponse,
   redactCredentialText,
 } from '../util/credential-redaction'
@@ -81,3 +82,59 @@ test('credential scrubbing preserves typed quota errors and native aborts', () =
   expect(abort.name).toBe('AbortError')
   expect(abort.message).toBe('[credential]')
 })
+
+test('successful SSE output is byte-identical across arbitrary UTF-8 chunk boundaries', async () => {
+  const source = new TextEncoder().encode(
+    ': keepalive\r\n\r\n' +
+      'event: response.output_text.delta\r\ndata: {"type":"response.output_text.delta","delta":"café 🙂\\n"}\r\n\r\n' +
+      'event: response.completed\ndata:  {"type":"response.completed","response":{"status":"completed","error":null}}\n\n',
+  )
+  const response = await redactCredentialResponse(
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (let index = 0; index < source.byteLength; index += 7)
+            controller.enqueue(source.slice(index, index + 7))
+          controller.close()
+        },
+      }),
+      { headers: { 'content-type': 'text/event-stream' } },
+    ),
+    'opaque-secret',
+  )
+  expect(new Uint8Array(await response.arrayBuffer())).toEqual(source)
+})
+
+test('a non-error frame containing the literal word error is unchanged', () => {
+  const frame =
+    '{"type":"response.output_text.delta","delta":"error","response_id":"opaque-secret"}'
+  expect(redactCredentialFrame(frame, 'opaque-secret')).toBe(frame)
+})
+
+test('ordinary delta frames bypass JSON parsing entirely', () => {
+  const parse = spyOn(JSON, 'parse')
+  try {
+    const frame =
+      '{"type":"response.output_text.delta","delta":"ordinary text"}'
+    expect(redactCredentialFrame(frame, 'opaque-secret')).toBe(frame)
+    expect(parse).not.toHaveBeenCalled()
+  } finally {
+    parse.mockRestore()
+  }
+})
+
+for (const envelope of ['typed', 'top-level', 'response-failed'] as const) {
+  test(`${envelope} error frame still redacts the exact attempt credential`, () => {
+    const payload = { message: 'echo opaque-secret twice opaque-secret' }
+    const frame = JSON.stringify(
+      envelope === 'typed'
+        ? { type: 'error', ...payload }
+        : envelope === 'top-level'
+          ? { error: payload }
+          : { type: 'response.failed', response: { error: payload } },
+    )
+    const scrubbed = redactCredentialFrame(frame, 'opaque-secret')
+    expect(scrubbed).toContain('echo [credential] twice [credential]')
+    expect(scrubbed).not.toContain('opaque-secret')
+  })
+}

@@ -66,6 +66,8 @@ export function redactCredentialFrame(
   frame: string,
   credential?: string,
 ): string {
+  // Codex error envelopes name an error field or type; ordinary deltas need no parse.
+  if (!frame.includes('"error"')) return frame
   try {
     const value = JSON.parse(frame)
     if (value?.type === 'error' || value?.error || value?.response?.error) {

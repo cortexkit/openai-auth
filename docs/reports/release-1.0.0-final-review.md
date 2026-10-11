@@ -262,3 +262,38 @@ Each control below was **CAUGHT** under both Bun `1.3.14 (0d9b296a)` and `1.4.2 
 | `pi-transport-error-bearer-redaction` | `Pi request error does not expose the bearer echoed by the transport` |
 
 Manual replays also recorded the safe staging/restore sequence. Live implementation files were staged first and the unstaged diff was empty. During the breaks, `git diff --stat` showed respectively: `index.ts` one insertion/one deletion; `index.ts` one insertion; `pool-source.ts` one insertion/one deletion; `runtime.ts` one insertion/four deletions. Each file was restored with `git checkout -- <path> && touch <path>` and the unstaged diff was empty again. No break remains in production code. Bun 1.3.14's Linux archive was fetched locally and transferred for offline execution; the temporary payload was removed and no manifest or lockfile changed.
+
+## Streaming hot-path revision
+
+`redactCredentialFrame` now returns immediately when the raw frame does not contain `"error"`. Ordinary delta events therefore require no JSON parse. Candidate envelopes still take the existing parse and exact-credential/token-pattern redaction path; a normal model-text delta whose literal text is `error` is parsed but not rewritten. Byte-level regression coverage also preserves a successful SSE stream across split UTF-8 bytes, mixed line endings, heartbeat comments and data-line whitespace.
+
+### Before/after measurement
+
+Reproducer: `bun scripts/benchmark-credential-redaction.ts before` with the prefilter temporarily removed, then the same command with `after` after restoring it. Both measurements ran on the offline Linux runner with two vCPUs and Bun `1.4.2`. The script constructs a realistic 2,000-event Codex stream: 1,999 `response.output_text.delta` events, followed by either `response.completed` (including full output text and `error: null`) or a terminal `response.failed` carrying an echoed synthetic credential. Payloads are pre-encoded outside the timed region: 397,523 successful-stream bytes and 397,586 failed-stream bytes.
+
+Each variant had ten warmup pairs and sixty measured raw/wrapped pairs, with execution order alternating. Every source chunk contains one SSE event. Source chunks are delivered by an unpaced pull-driven in-memory stream, so this measures CPU and stream-bookkeeping overhead rather than network/model latency. Per-chunk latency is elapsed time from source enqueue to consumer read, with 120,000 chunk observations per mode/variant. Added times are paired wrapper-minus-raw samples, not differences between independent medians. Parse counters run separately, outside timing.
+
+| Phase / terminal event | JSON parses / wrapped stream | Raw total ms, median / p95 | Wrapped total ms, median / p95 | Added total ms, median / p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Before / completed | 2,000 | 0.321 / 0.417 | 2.391 / 4.147 | 2.064 / 3.716 |
+| After / completed | 1 | 0.317 / 0.391 | 1.855 / 2.993 | 1.521 / 2.604 |
+| Before / failed | 2,000 | 0.318 / 0.402 | 2.343 / 2.636 | 2.020 / 2.316 |
+| After / failed | 1 | 0.315 / 0.392 | 1.730 / 1.979 | 1.408 / 1.624 |
+
+| Phase / terminal event | Raw chunk latency µs, median / p95 | Wrapped chunk latency µs, median / p95 | Added chunk latency µs, median / p95 |
+| --- | ---: | ---: | ---: |
+| Before / completed | 0.070 / 0.100 | 1.984 / 3.697 | 1.913 / 3.597 |
+| After / completed | 0.070 / 0.090 | 1.522 / 2.805 | 1.443 / 2.715 |
+| Before / failed | 0.070 / 0.081 | 1.934 / 3.216 | 1.863 / 3.135 |
+| After / failed | 0.070 / 0.081 | 1.413 / 2.475 | 1.343 / 2.385 |
+
+The successful stream still parses its completed frame because its legitimate `error: null` field passes the cheap filter; none of its 1,999 delta frames is parsed. Median added whole-stream time decreased by approximately 26% for completion and 30% for failure. **The wrapper is not free:** it still adds a measured median 1.521 ms per successful 2,000-event stream (p95 2.604 ms), plus median 1.443 µs/p95 2.715 µs of paired per-chunk latency. UTF-8 decoding/re-encoding, SSE boundary/line scanning and the extra stream/promise layer remain unchanged. These synthetic CPU-bound measurements do not claim production-network percentile latency or establish a performance threshold.
+
+A focused non-vacuity control temporarily removed the prefilter after staging the live implementation: `git diff --stat` was empty before, showed one insertion/one deletion in `packages/core/src/util/credential-redaction.ts` during the break, and was empty after `git checkout -- <path> && touch <path>`. Only `ordinary delta frames bypass JSON parsing entirely` failed (one parse instead of zero; nine other tests filtered out). The `codex-sse-delta-no-json-parse` row in `mutations.toml` records the exact prefilter removal and the named test that must fail.
+
+### Revision verification
+
+- Linux eight-vCPU run: all three package typechecks passed with TypeScript 7.0.2; the benchmark script also passed a separate strict `tsc --noEmit` check. Biome 2.5.15 checked 244 files with no fixes, and all three packages built.
+- OpenCode full suite with both real-host E2E opt-ins enabled: **1,514 passed, zero failed, zero skipped**, 84 files and 6,013 assertions. All two OpenCode 1 and sixteen OpenCode 2 real-host cases ran; this revision's full run was green, including the previously intermittent vault/401 case.
+- Core credential-redaction regressions: ten passed, 22 assertions. Pi request-isolation regressions: nine passed, 29 assertions.
+- `ckdev-mutate check` passed all 188 catalogue rows. The original four controls and `codex-sse-delta-no-json-parse` were all **CAUGHT** on Linux under both Bun 1.3.14 and 1.4.2, each with a passing selected baseline and only its named mutant failure. The transferred Bun archive was removed; no dependency manifest or lockfile changed.
