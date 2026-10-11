@@ -48,6 +48,7 @@ import {
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import { createPiMenu } from '../commands.ts'
 import { registerPiProvider } from '../index.ts'
+import { PiPoolSource } from '../pool-source.ts'
 import { clearPiStickyRouting } from '../routing.ts'
 import { PiOpenAIRuntime } from '../runtime.ts'
 import {
@@ -445,6 +446,58 @@ describe('Pi in vault mode', () => {
       expect(refreshes).toBe(0)
       expect(poolFiles()).toEqual(before)
     } finally {
+      target.close()
+    }
+  })
+
+  test('the pool source sets local work aside before invoking its providers', async () => {
+    await addExpiredLocalRow()
+    await openPoolStore({
+      provider: 'openai',
+      configPath: paths.configPath,
+      statePath: paths.statePath,
+      quota: quotaCodec,
+    }).add({
+      id: 'valid-local',
+      credential: {
+        type: 'oauth',
+        access: 'valid-local-bearer',
+        refresh: 'valid-local-refresh',
+        expires: Date.now() + 3_600_000,
+      },
+    })
+    const before = poolFiles()
+    enroll()
+    const target = vault()
+    let providerCalls = 0
+    // PiOpenAIRuntime also checks enrollment inside refresh and quota callbacks.
+    // Plain callbacks prove the pool source refuses before invoking either one.
+    const source = new PiPoolSource({
+      paths: () => paths,
+      vaultMode: () => target.enrolled(),
+      vaultAuthority: () => target.authority(),
+      refreshProvider: async () => {
+        providerCalls++
+        throw new Error('local refresh must not start')
+      },
+      pullQuota: async () => {
+        providerCalls++
+        throw new Error('local quota must not start')
+      },
+    })
+    try {
+      const view = await source.load()
+      const row = view.rows.find((row) => row.id === 'valid-local')
+      if (!row) throw new Error('missing local row')
+      expect(source.usableToken(row)).toBeUndefined()
+      await source.refreshDueTokens(view.rows, null)
+      expect(await source.pollRows(null)).toEqual([])
+      await source.settled()
+      expect(providerCalls).toBe(0)
+      expect(poolFiles()).toEqual(before)
+    } finally {
+      source.dispose()
+      await source.settled()
       target.close()
     }
   })

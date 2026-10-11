@@ -157,6 +157,39 @@ describe('vault enrollment audit', () => {
     ).toEqual(['disconnect'])
   })
 
+  test('an enrolled warm refuses before resolving any local token', async () => {
+    enroll()
+    let resolutions = 0
+    let sends = 0
+    const localToken = async () => {
+      resolutions++
+      return 'local-bearer'
+    }
+    // Token lookup here has no enrollment check of its own: the warm adapter
+    // must refuse before calling it, not just block the eventual network send.
+    const adapter = createOpenAICacheKeepAdapter({
+      vault,
+      codexResponsesUrl: 'https://codex.test/responses',
+      fetchImpl: (async () => {
+        sends++
+        return new Response('{}')
+      }) as unknown as typeof fetch,
+      getMainToken: localToken,
+      refreshFallback: localToken,
+    })
+    for (const accountId of ['main', 'spare']) {
+      await expect(
+        adapter.send({
+          target: { accountId, meta: { replayHeaders: {} } } as never,
+          body: '{}',
+          signal: new AbortController().signal,
+        }),
+      ).rejects.toThrow('local accounts are not warmed')
+    }
+    expect(resolutions).toBe(0)
+    expect(sends).toBe(0)
+  })
+
   test('enrollment during a local warm token await prevents dispatch', async () => {
     let sends = 0
     const getAuth = async () => {

@@ -1635,11 +1635,11 @@ guards = "in vault mode a keep-warm target captured on a local account before co
 file = "packages/opencode/src/core/cachekeep.ts"
 old = "      if (options.vault && (await options.vault.authority()) !== 'local')\n        throw new Error(\n          'local accounts are not warmed while this host is connected to the vault',\n        )\n\n      let accessToken: string"
 new = "      if (false) // NON-VACUITY BREAK: warm local targets in vault mode.\n        throw new Error(\n          'local accounts are not warmed while this host is connected to the vault',\n        )\n\n      let accessToken: string"
-test_file = "packages/opencode/src/tests/vault.test.ts"
+test_file = "packages/opencode/src/tests/vault-enrollment-audit.test.ts"
 runner = "command"
-command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-enrollment-audit.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ["^vault\\scachekeep\\sin\\svault\\smode\\sa\\slocal\\starget\\scaptured\\sbefore\\sconnecting\\sis\\snever\\swarmed:\\snothing\\sis\\ssent\\sor\\srefreshed$"]
+expect_red = ['^vault\senrollment\saudit\san\senrolled\swarm\srefuses\sbefore\sresolving\sany\slocal\stoken$']
 
 [[control]]
 id = "vault-mode-sidebar-lists-vault-accounts"
@@ -1688,7 +1688,7 @@ test_file = "packages/pi/src/tests/vault-mode.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ["^Pi\\sin\\svault\\smode\\sneither\\sPi's\\slogin\\snor\\sa\\spool\\srow\\sthe\\svault\\sdoes\\snot\\shold\\sis\\ssent\\swith,\\srefreshed\\sor\\spolled,\\sand\\sthe\\spool\\sfiles\\sstay\\sbyte-identical$"]
+expect_red = ['^Pi\sin\svault\smode\sthe\spool\ssource\ssets\slocal\swork\saside\sbefore\sinvoking\sits\sproviders$']
 
 [[control]]
 id = "vault-mode-pauses-the-pool-lifecycle"
@@ -1724,7 +1724,7 @@ test_file = "packages/opencode/src/tests/pool-lifecycle-plugin.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-lifecycle-plugin.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ["^the\\spool\\slifecycle\\sin\\svault\\smode\\sa\\snever-migrated\\sinstall\\sis\\sserved\\sfrom\\sthe\\svault\\swithout\\smigrating,\\sand\\smigrates\\sonce\\sthe\\shost\\sdisconnects$"]
+expect_red = ['^the\spool\slifecycle\sin\svault\smode\san\senrolled\sfirst-run\sloader\sleaves\sabsent\saccount\sfiles\sabsent$']
 
 [[control]]
 id = "opencode2-vault-mode-wires-the-lifecycle-pause"
@@ -2079,8 +2079,8 @@ test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\sa\sterminal\sadd\sselected\sbefore\senrollment\srefuses\swithout\schanging\spool\sbytes$']
-expect_message = "Nothing was changed: accounts are managed in the vault with ck. Disconnect to use local accounts."
+expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\sthe\sshared\sterminal\srefuses\sa\sstale\sadd\sbefore\sinvoking\sits\slogin\sprovider$']
+expect_message = "expect(logins).toBe(0)"
 
 [[control]]
 id = "menu-pi-vault-accounts-no-add"
@@ -2106,7 +2106,7 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\san\senrolled\sterminal\swith\sno\slocal\scredential\sor\smigrated\spool\snever\sopens\slocal\slogin\sor\sdoctor$']
-expect_message = "local login must not start"
+expect_message = "Nothing was changed: accounts are managed in the vault with ck. Disconnect to use local accounts."
 
 [[control]]
 id = "menu-vault-terminal-no-premigration-doctor"
@@ -2274,7 +2274,7 @@ id = "pi-approval-during-quota-storage"
 guards = "approval during quota settings read selects vault-only polling"
 file = "packages/pi/src/runtime.ts"
 old = "        // Vault mode polls the vault's accounts alone.\n        if ((await this.readAuthority()) !== 'local')"
-new = "        // NON-VACUITY BREAK: use the mode from before the storage await.\n        if (this.vaultMode())"
+new = "        // NON-VACUITY BREAK: skip the post-storage authority branch.\n        if (false)"
 test_file = "packages/pi/src/tests/vault-mode.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]

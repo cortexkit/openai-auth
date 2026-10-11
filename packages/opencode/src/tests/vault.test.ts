@@ -31,6 +31,7 @@ import {
   loadAccounts,
   mutateAccounts,
   OpenAiVault,
+  runVaultAccountMenu,
   VAULT_MODE_REFUSALS,
   vaultPaths,
 } from '@cortexkit/openai-auth-core/internal'
@@ -1329,6 +1330,48 @@ describe('auth account menu with vault accounts', () => {
     }
   })
 
+  test('the shared terminal refuses a stale add before invoking its login provider', async () => {
+    const { vault } = await setup()
+    try {
+      await vault.disconnect()
+      const before = [files.configFile, files.stateFile].map((file) =>
+        readFileSync(file),
+      )
+      const scripted = scriptedTerminal([ENTER], () => enroll())
+      let logins = 0
+      // OpenCode's login callback also checks enrollment. Use a plain callback
+      // so this test proves the shared menu itself refuses before starting OAuth.
+      await runVaultAccountMenu(
+        {
+          title: 'OpenAI accounts',
+          store: openPoolStore({
+            provider: 'openai',
+            quota: quotaCodec,
+            configPath: files.configFile,
+            statePath: files.stateFile,
+          }),
+          terminal: scripted.terminal,
+          login: {
+            begin: async () => {
+              logins++
+              throw new Error('OAuth must not start in vault mode')
+            },
+          },
+        },
+        vault,
+      )
+      expect(logins).toBe(0)
+      expect(scripted.written()).toContain(
+        'Nothing was changed: accounts are managed in the vault with ck. Disconnect to use local accounts.',
+      )
+      expect(
+        [files.configFile, files.stateFile].map((file) => readFileSync(file)),
+      ).toEqual(before)
+    } finally {
+      vault.close()
+    }
+  })
+
   test('auth menu Check quotas in vault mode polls only vault accounts and no local row', async () => {
     const wire = installWire({
       usage: () => new Response(usageBody(37), { status: 200 }),
@@ -1896,14 +1939,20 @@ describe('the host slot', () => {
     await plugin(login)
     const loader = hooks?.auth?.loader
     if (!loader) throw new Error('no loader')
+    let slotReads = 0
     const { fetch: send } = (await loader(
-      (async () => ({ ...login })) as never,
+      (async () => {
+        slotReads++
+        return { ...login }
+      }) as never,
       {} as never,
     )) as { fetch: typeof globalThis.fetch }
+    slotReads = 0
 
     const response = await request(send)
 
     expect(response.status).toBe(200)
+    expect(slotReads).toBe(0)
     expect(wire.sends).toEqual([`Bearer ${VAULT_ACCESS}`])
     expect(wire.refreshTokens).toEqual([])
   })

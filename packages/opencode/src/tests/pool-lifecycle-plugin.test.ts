@@ -541,6 +541,20 @@ describe('the pool lifecycle in vault mode', () => {
     await vault.pollStale(0)
   }
 
+  it('an enrolled first-run loader leaves absent account files absent', async () => {
+    const stateDir = join(dir, 'vault')
+    enroll(stateDir)
+    await setSlot(login('acct-main', 'r-main'))
+    const before = localFiles()
+    expect(before.slice(0, 2)).toEqual([null, null])
+    // Disable background account migration so only the auth loader can seed files.
+    await loadPlugin(
+      { enabled: false },
+      { vault: { stateDir, pollIntervalMs: 0 } },
+    )
+    expect(localFiles()).toEqual(before)
+  })
+
   it('a never-migrated install is served from the vault without migrating, and migrates once the host disconnects', async () => {
     const daemon = await startMockDaemon({
       directory: dir,
