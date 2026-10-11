@@ -2375,3 +2375,15 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode\s2\sentry:\slogins\ssetup\sreleases\sits\svault\slease\swhen\sloading\sthe\ssource\sthrows$']
+
+[[control]]
+id = "audit-vault-menu-action-intent"
+guards = "a stale Connect choice never becomes Disconnect after enrollment completes"
+file = "packages/opencode/src/auth/methods.ts"
+old = "        if (mode !== 'local') {\n          context.print("
+new = "        if (mode !== 'local') {\n          await target.disconnect() // NON-VACUITY BREAK: reverse a stale Connect choice.\n          context.print("
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\sa\sstale\sterminal\sConnect\schoice\snever\sdisconnects\sa\snewly\senrolled\shost$']

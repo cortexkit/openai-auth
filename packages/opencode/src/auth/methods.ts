@@ -416,46 +416,55 @@ export function createAuthMethods({
   })
 
   /**
-   * Enrolls this host with the Claustrum vault: proposes it, tells the
-   * operator the `ck` commands that approve it, and waits for the approval.
-   * Interrupting the wait loses nothing: the request stays on disk, and
-   * Connect resumes it.
+   * Connect proposes enrollment and waits for approval; Disconnect forgets it.
+   * A choice made before enrollment changes must not silently become the
+   * opposite action. Interrupted approval waits keep the request on disk.
    */
   const connectVaultAction = (
     target: NonNullable<CreateAuthMethodsOptions['vault']>,
-  ): MenuAction => ({
-    id: 'vault-connect',
-    label: target.enrolled()
-      ? 'Disconnect from the Claustrum vault'
-      : 'Connect to the Claustrum vault',
-    hint: 'serve OpenAI accounts held in the vault',
-    run: async (context) => {
-      if ((await target.authority()) !== 'local') {
-        await target.disconnect()
-        context.print('Disconnected from the Claustrum vault.')
-        return
-      }
-      context.print(`Asking the Claustrum vault to enroll ${target.name}…`)
-      let shown: string | undefined
-      const status = await target.waitForApproval({
-        ...deps.vaultWait,
-        onPending: (pending) => {
-          const key =
-            pending.state === 'pending'
-              ? (pending.requestId ?? pending.retryCode ?? '')
-              : pending.state
-          if (key === shown) return
-          shown = key
-          for (const line of vaultApprovalInstructions(target.name, pending))
-            context.print(line)
+  ): MenuAction => {
+    const disconnect = target.enrolled()
+    return {
+      id: disconnect ? 'vault-disconnect' : 'vault-connect',
+      label: disconnect
+        ? 'Disconnect from the Claustrum vault'
+        : 'Connect to the Claustrum vault',
+      hint: 'serve OpenAI accounts held in the vault',
+      run: async (context) => {
+        const mode = await target.authority()
+        if (disconnect) {
+          if (mode !== 'local') await target.disconnect()
+          context.print('Disconnected from the Claustrum vault.')
+          return
+        }
+        if (mode !== 'local') {
           context.print(
-            'Waiting for the approval… (stop with Ctrl-C; Connect picks the request up again)',
+            'Nothing was changed: this host is already connected or its enrollment is unreadable. Reopen the menu to disconnect.',
           )
-        },
-      })
-      context.print(vaultConnectOutcome(target, status).text)
-    },
-  })
+          return
+        }
+        context.print(`Asking the Claustrum vault to enroll ${target.name}…`)
+        let shown: string | undefined
+        const status = await target.waitForApproval({
+          ...deps.vaultWait,
+          onPending: (pending) => {
+            const key =
+              pending.state === 'pending'
+                ? (pending.requestId ?? pending.retryCode ?? '')
+                : pending.state
+            if (key === shown) return
+            shown = key
+            for (const line of vaultApprovalInstructions(target.name, pending))
+              context.print(line)
+            context.print(
+              'Waiting for the approval… (stop with Ctrl-C; Connect picks the request up again)',
+            )
+          },
+        })
+        context.print(vaultConnectOutcome(target, status).text)
+      },
+    }
+  }
 
   /**
    * What `opencode auth login` shows before the install has migrated: why

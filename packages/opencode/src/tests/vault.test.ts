@@ -1211,6 +1211,23 @@ describe('auth account menu with vault accounts', () => {
       vault.close()
     }
   })
+  test('a stale terminal Connect choice never disconnects a newly enrolled host', async () => {
+    const { vault } = await setup()
+    try {
+      await vault.disconnect()
+      const printed = await menu(
+        [...Array(6).fill(DOWN), ENTER],
+        vault,
+        (key) => {
+          if (key === ENTER) enroll()
+        },
+      )
+      expect(printed).toContain('Reopen the menu to disconnect')
+      expect(await vault.authority()).toBe('vault')
+    } finally {
+      vault.close()
+    }
+  })
   test('vault mode hides local-writing terminal actions and disconnect restores them unchanged', async () => {
     const { vault } = await setup()
     const localLabels = [
