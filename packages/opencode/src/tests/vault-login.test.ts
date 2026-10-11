@@ -109,6 +109,7 @@ describe('OpenCode 1 vault activation', () => {
   test('not enrolled hides the method and refuses a previously offered callback', async () => {
     const flow = await authorization()
     rmSync(vault.paths.tokenPath)
+    await vault.authority()
     const before = snapshot()
     expect(methods().some((entry) => entry.label === VAULT_LOGIN_LABEL)).toBe(
       false,

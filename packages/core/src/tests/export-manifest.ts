@@ -167,6 +167,7 @@ export const INTERNAL_VALUE_EXPORTS = [
   'resolveMidStreamRateLimitResetAt',
   'runResetCreditRedemption',
   'runVaultAccountMenu',
+  'VAULT_LOCAL_ACTION_REFUSAL',
   'saveAccountState',
   'saveAccounts',
   'selectCreditToSpend',

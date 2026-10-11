@@ -3,15 +3,17 @@
 // runs the real setup over real pool files and drives the hooks the way
 // OpenCode 2 fires them.
 
-import { afterEach, describe, expect, it } from 'bun:test'
-import { readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { afterEach, describe, expect, it, spyOn } from 'bun:test'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   isPlaceholderCredential,
   OpenCode2AuthError,
   placeholderSecret,
 } from '@cortexkit/common-auth/opencode2'
+import { OpenAiVault, vaultPaths } from '@cortexkit/openai-auth-core/internal'
 import type { Credential } from '@opencode/plugin'
+import { PoolAccountSource } from '../core/pool-account-source'
 import { POOL_PLACEHOLDER } from '../core/pool-migration'
 import {
   createOpenAIAdapter,
@@ -451,6 +453,26 @@ describe('OpenCode 2 entry: quota', () => {
 })
 
 describe('OpenCode 2 entry: logins', () => {
+  it('setup releases its vault lease when loading the source throws', async () => {
+    const files = poolFiles()
+    const close = spyOn(OpenAiVault.prototype, 'close')
+    const load = spyOn(
+      PoolAccountSource.prototype,
+      'load',
+    ).mockRejectedValueOnce(new Error('source load failed'))
+    try {
+      await expect(
+        start(files, {
+          vault: { stateDir: join(files.dir, 'vault'), pollIntervalMs: 0 },
+        }),
+      ).rejects.toThrow('source load failed')
+      expect(close).toHaveBeenCalledTimes(1)
+    } finally {
+      load.mockRestore()
+      close.mockRestore()
+      rmSync(files.dir, { recursive: true, force: true })
+    }
+  })
   const login = (accountId: string, token = `${accountId}-new`) =>
     (async () => ({
       url: 'https://auth.test/authorize',
@@ -478,6 +500,75 @@ describe('OpenCode 2 entry: logins', () => {
     expect(authorization.mode).toBe('auto')
     return (await authorization.callback) as Credential.OAuth
   }
+
+  it('a migrated pool refuses an ordinary login completed after enrollment without changing pool bytes', async () => {
+    const files = poolFiles()
+    seedPool(files, 'main-first', [{ id: 'main' }])
+    const stateDir = join(files.dir, 'vault')
+    mkdirSync(stateDir, { mode: 0o700 })
+    const pending =
+      Promise.withResolvers<
+        Awaited<ReturnType<NonNullable<OpenAIAuthV2Options['beginLogin']>>>
+      >()
+    const started = Promise.withResolvers<void>()
+    const { host } = await start(files, {
+      vault: { stateDir, pollIntervalMs: 0 },
+      beginLogin: () => {
+        started.resolve()
+        return pending.promise
+      },
+    })
+    const before = [files.configPath, files.statePath].map((path) =>
+      readFileSync(path),
+    )
+    const method = host.methods.find(
+      (entry) => entry.method.id === 'openai-auth-pool-browser',
+    )!
+    const authorization = method.authorize({})
+    await started.promise
+    writeFileSync(
+      vaultPaths(stateDir, 'opencode').tokenPath,
+      JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    pending.resolve(await login('chatgpt-new')!({} as never))
+    await expect((await authorization).callback).rejects.toThrow(
+      'connected to the credential vault',
+    )
+    expect(
+      [files.configPath, files.statePath].map((path) => readFileSync(path)),
+    ).toEqual(before)
+  })
+
+  it('an enrolled migrated host refuses ordinary authorization before OAuth starts', async () => {
+    const files = poolFiles()
+    seedPool(files, 'main-first', [{ id: 'main' }])
+    const stateDir = join(files.dir, 'vault')
+    mkdirSync(stateDir, { mode: 0o700 })
+    writeFileSync(
+      vaultPaths(stateDir, 'opencode').tokenPath,
+      JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    let logins = 0
+    const { host } = await start(files, {
+      vault: { stateDir, pollIntervalMs: 0 },
+      beginLogin: async () => {
+        logins++
+        throw new Error('local OAuth started')
+      },
+    })
+    const before = [files.configPath, files.statePath].map((path) =>
+      readFileSync(path),
+    )
+    await expect(signIn(host)).rejects.toThrow(
+      'connected to the credential vault',
+    )
+    expect(logins).toBe(0)
+    expect(
+      [files.configPath, files.statePath].map((path) => readFileSync(path)),
+    ).toEqual(before)
+  })
 
   it('registers distinct pool and vault login methods and labels on integration openai', async () => {
     const { host } = await startPool('main-first', [{ id: 'main' }])

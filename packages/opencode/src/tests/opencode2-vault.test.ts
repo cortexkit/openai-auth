@@ -537,8 +537,7 @@ describe('vault accounts on OpenCode 2', () => {
     )
     if (!method)
       throw new Error('no openai-auth-pool-browser method registered')
-    const authorization = await method.authorize({})
-    await expect(authorization.callback).rejects.toThrow(
+    await expect(method.authorize({})).rejects.toThrow(
       'connected to the credential vault',
     )
     await Bun.sleep(100)

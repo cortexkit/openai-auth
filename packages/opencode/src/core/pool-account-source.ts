@@ -161,6 +161,8 @@ export interface PoolAccountSourceDeps {
    * every use, so a disconnect restores local work at once.
    */
   vaultMode?: () => boolean
+  /** Read enrollment before local refreshes, quota polls or writes; vaultMode blocks synchronous callbacks until that read completes. */
+  vaultAuthority?: () => Promise<'vault' | 'local' | 'unreadable'>
   /**
    * Settles (resolved or rejected) once the vault has read its first roster.
    * Until then `vaultIdentities` is empty even for an account the vault
@@ -360,6 +362,7 @@ export class PoolAccountSource {
 
   /** Reads the rows now (the loader's first read, and tests). */
   async load(): Promise<PoolView> {
+    await this.deps.vaultAuthority?.()
     const snapshot = await this.startRead(this.filesKey())
     return { active: snapshot.active, rows: snapshot.rows }
   }
@@ -580,6 +583,13 @@ export class PoolAccountSource {
   private async pull(
     request: PullRequest,
   ): Promise<QuotaObservation | undefined> {
+    if (
+      this.deps.vaultAuthority &&
+      (await this.deps.vaultAuthority()) !== 'local'
+    )
+      throw new Error(
+        'local accounts are not polled while this host is connected to the vault',
+      )
     let observation: QuotaObservation | undefined
     try {
       observation = await this.deps.pullQuota(request)
@@ -658,7 +668,14 @@ export class PoolAccountSource {
     const store = this.storeFor(this.deps.paths())
     const previous = this.writes.get(row.id) ?? Promise.resolve()
     const write = previous
-      .then(() => store.recordQuota(row.id, attribution, observation))
+      .then(async () => {
+        if (
+          this.deps.vaultAuthority &&
+          (await this.deps.vaultAuthority()) !== 'local'
+        )
+          return
+        return store.recordQuota(row.id, attribution, observation)
+      })
       .catch((error: unknown) => {
         this.log.warn('pool quota not recorded', {
           rowId: row.id,
@@ -710,6 +727,11 @@ export class PoolAccountSource {
     storage: AccountStorage | null,
     options: { waitForAll?: boolean } = {},
   ): Promise<void> {
+    if (
+      this.deps.vaultAuthority &&
+      (await this.deps.vaultAuthority()) !== 'local'
+    )
+      return
     // A row signing in as a vault account must not be refreshed, and before
     // the vault's first roster no such account is known. Bounded, so a vault
     // that never answers costs a request at most this wait. In vault mode
@@ -801,6 +823,11 @@ export class PoolAccountSource {
   }
 
   private async runRefresh(id: string): Promise<void> {
+    if (
+      this.deps.vaultAuthority &&
+      (await this.deps.vaultAuthority()) !== 'local'
+    )
+      return
     const paths = this.deps.paths()
     const before = this.snapshot.rows.find((row) => row.id === id)
     const refreshToken = before ? oauthAccess(before)?.refresh : undefined

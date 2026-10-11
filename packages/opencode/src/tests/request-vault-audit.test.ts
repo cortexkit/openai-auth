@@ -178,6 +178,7 @@ describe('vault quota floor', () => {
         ],
         identities: () => new Set(),
         enrolled: () => true,
+        authority: async () => 'vault',
         snapshot: () => undefined,
         requestReading: () => {},
         authorize: async (id: string) => ({ accessToken: id }),

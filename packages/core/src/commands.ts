@@ -682,6 +682,7 @@ export interface VaultSectionDeps {
   vault: Pick<
     OpenAiVault,
     | 'name'
+    | 'authority'
     | 'status'
     | 'connectStep'
     | 'waitForApproval'
@@ -711,7 +712,7 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
     title: 'Vault',
     build: async () => {
       const status = await vault.status()
-      const connected = status.enrollment.state === 'approved'
+      const connected = (await vault.authority()) !== 'local'
       const routing = vault.routes().length
       return {
         lines: [
@@ -1089,7 +1090,10 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
     command: OPENAI_COMMAND_NAME,
     async open(invocation): Promise<CommandDialogPayload> {
       const context = own(invocation)
-      const state = await options.migration?.()
+      const state =
+        options.vault && (await options.vault.authority()) !== 'local'
+          ? undefined
+          : await options.migration?.()
       if (state && !state.migrated)
         return {
           command: OPENAI_COMMAND_NAME,
@@ -1102,7 +1106,10 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
       invocation: CommandInvocation,
     ): Promise<CommandApplyResult> {
       const context = own(invocation)
-      const state = await options.migration?.()
+      const state =
+        options.vault && (await options.vault.authority()) !== 'local'
+          ? undefined
+          : await options.migration?.()
       if (state && !state.migrated)
         return {
           command: OPENAI_COMMAND_NAME,

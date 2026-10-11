@@ -313,6 +313,7 @@ export class PiOpenAIRuntime {
    */
   syncVaultSlot(refresh?: () => unknown): Promise<void> {
     return this.withSlot(async () => {
+      await this.vault.authority()
       const mode = this.vaultMode()
       if (mode !== this.slotVaultMode) {
         if (mode) await this.vaultSlot().enterVault()
@@ -349,7 +350,8 @@ export class PiOpenAIRuntime {
    * starts the vault's background poll of Pi's vault accounts. Never
    * rejects.
    */
-  start(): Promise<void> {
+  async start(): Promise<void> {
+    await this.vault.authority()
     this.vault.start()
     return this.pool.load().then(
       () => {},
@@ -569,11 +571,6 @@ export class PiOpenAIRuntime {
     options?: SimpleStreamOptions,
   ): AssistantMessageEventStream {
     const outer = this.deps.createStream()
-    if (this.vaultMode() && options?.apiKey !== VAULT_PLACEHOLDER_KEY) {
-      outer.push(errorEvent(model, VAULT_SLOT_REFUSAL))
-      outer.end()
-      return outer
-    }
     const restoreWebSocket = this.deps.installWebSocket?.() ?? (() => {})
     void (async () => {
       try {
@@ -620,7 +617,9 @@ export class PiOpenAIRuntime {
     | ({ kind: 'sent' } & StreamAttempt)
     | { kind: 'blocked'; block: PoolBlock; refusal?: VaultModeRefusal }
   > {
-    const vaultMode = this.vaultMode()
+    const vaultMode = (await this.vault.authority()) !== 'local'
+    if (vaultMode && options?.apiKey !== VAULT_PLACEHOLDER_KEY)
+      throw new Error(VAULT_SLOT_REFUSAL)
     const storage = await this.storage()
     if (vaultMode) {
       // Vault mode: Pi's login (the key Pi hands over) and the pool are not

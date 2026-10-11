@@ -63,6 +63,15 @@ export const VAULT_METHOD = 'openai-auth-vault'
 export const VAULT_ACTIVATION_REFUSAL =
   'Vault login requires this OpenCode host to be enrolled in the Claustrum vault. Connect to the vault or disconnect this host before trying again.'
 
+export async function assertLocalPoolLogin(
+  vault: Pick<OpenAiVault, 'authority'>,
+): Promise<void> {
+  if ((await vault.authority()) !== 'local')
+    throw new Error(
+      'This host is connected to the credential vault or its enrollment is unreadable; the login was not stored. Disconnect this host from the vault to add a local login.',
+    )
+}
+
 export function vaultLoginMethod(
   vault: Pick<OpenAiVault, 'paths' | 'name'>,
 ): VaultActivationMethod {
@@ -82,6 +91,7 @@ export function vaultLoginMethod(
 export function chatgptLoginMethods(input: {
   beginLogin: BeginLogin
   version: string
+  vault?: Pick<OpenAiVault, 'authority'>
 }): PoolLoginMethod<PoolLoginResult>[] {
   const method = (
     id: string,
@@ -90,6 +100,7 @@ export function chatgptLoginMethods(input: {
   ): PoolLoginMethod<PoolLoginResult> => ({
     method: { id, type: 'oauth', label },
     async authorize() {
+      if (input.vault) await assertLocalPoolLogin(input.vault)
       const flow = await input.beginLogin({ version: input.version, headless })
       return {
         url: flow.url,
@@ -149,8 +160,12 @@ export async function writeLoginToPool(
   pool: PoolStore,
   paths: AccountPaths,
   login: PoolLoginResult,
-  options: { origin?: 'login' | 'import' } = {},
+  options: {
+    origin?: 'login' | 'import'
+    vault?: Pick<OpenAiVault, 'authority'>
+  } = {},
 ): Promise<PoolLoginOutcome> {
+  if (options.vault) await assertLocalPoolLogin(options.vault)
   if (isLeftoverCredential(login))
     throw new Error(
       'the credential is not a ChatGPT login (a placeholder or a tombstone); it was not stored',
@@ -170,6 +185,7 @@ export async function writeLoginToPool(
     ...(login.expires !== undefined ? { expires: login.expires } : {}),
   }
   const identity = identityOf(login)
+  if (options.vault) await assertLocalPoolLogin(options.vault)
   const withIdentity = identity !== undefined ? { identity } : {}
   if (options.origin === 'import') {
     const held = load.rows.find(

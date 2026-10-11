@@ -67,7 +67,10 @@ import { observationFromSnapshot } from '../core/pool-quota'
 import { migrationFenceOpen } from '../core/version-fence'
 import { PackageVersion } from '../version'
 import { type AuthDetails, authDoctorChecks, readStoreIds } from './doctor'
-import { runVaultAccountMenu } from './vault-account-menu'
+import {
+  runVaultAccountMenu,
+  VAULT_LOCAL_ACTION_REFUSAL,
+} from './vault-account-menu'
 
 type AuthMethod = AuthHook['methods'][number]
 type BeginLogin = typeof beginAccountLogin
@@ -121,6 +124,8 @@ export interface CreateAuthMethodsOptions {
     | 'name'
     | 'paths'
     | 'enrolled'
+    | 'authority'
+    | 'disconnect'
     | 'status'
     | 'waitForApproval'
     | 'routes'
@@ -252,11 +257,7 @@ export function createAuthMethods({
    * machine would have no way to add it at all.
    */
   const hasCredential = async (): Promise<boolean> => {
-    if (
-      vault &&
-      (await enrollmentAuthority(vault.paths, vault.name)) === 'vault'
-    )
-      return true
+    if (vault && (await vault.authority()) !== 'local') return true
     if ((await readAuth()).type !== 'missing') return true
     const paths = getPaths()
     const store = deps.openAccountPool(paths)
@@ -281,6 +282,7 @@ export function createAuthMethods({
     const written = await withMainRefreshLock(
       getPaths().configPath,
       async () => {
+        if (vault && (await vault.authority()) !== 'local') return false
         if (isPoolMainPlaceholder(await readAuth())) return false
         await client.auth.set({
           path: { id: 'openai' },
@@ -295,6 +297,8 @@ export function createAuthMethods({
   /** The OAuth login the menu's add and re-authenticate actions run. */
   const menuLogin = (store: PoolStore): MenuLogin => ({
     begin: async ({ headless, signal }) => {
+      if (vault && (await vault.authority()) !== 'local')
+        throw new Error(VAULT_LOCAL_ACTION_REFUSAL)
       const flow = await deps.beginAccountLogin({
         version: packageVersion,
         headless,
@@ -304,6 +308,8 @@ export function createAuthMethods({
         url: flow.url,
         instructions: flow.instructions,
         completion: flow.completion.then(async (account) => {
+          if (vault && (await vault.authority()) !== 'local')
+            throw new Error(VAULT_LOCAL_ACTION_REFUSAL)
           const load = await store.read()
           const main =
             load.status === 'ready'
@@ -339,6 +345,8 @@ export function createAuthMethods({
 
   /** One quota reading for a row, taken with the token it holds; nothing is refreshed. */
   const pollQuota = async (row: PoolRow) => {
+    if (vault && (await vault.authority()) !== 'local')
+      throw new Error(VAULT_LOCAL_ACTION_REFUSAL)
     const credential = row.credential
     if (credential?.type !== 'oauth' || !credential.access)
       throw new Error('no usable access token for a quota check')
@@ -386,7 +394,7 @@ export function createAuthMethods({
     doctor: doctorChecks(true),
     status: async () => {
       const enrollment = await vault?.status()
-      if (vault && enrollment?.enrollment.state === 'approved')
+      if (vault && (await vault.authority()) !== 'local' && enrollment)
         return [
           vaultEnrollmentLine(vault.host, vault.name, enrollment.enrollment),
         ]
@@ -417,9 +425,16 @@ export function createAuthMethods({
     target: NonNullable<CreateAuthMethodsOptions['vault']>,
   ): MenuAction => ({
     id: 'vault-connect',
-    label: 'Connect to the Claustrum vault',
+    label: target.enrolled()
+      ? 'Disconnect from the Claustrum vault'
+      : 'Connect to the Claustrum vault',
     hint: 'serve OpenAI accounts held in the vault',
     run: async (context) => {
+      if ((await target.authority()) !== 'local') {
+        await target.disconnect()
+        context.print('Disconnected from the Claustrum vault.')
+        return
+      }
       context.print(`Asking the Claustrum vault to enroll ${target.name}…`)
       let shown: string | undefined
       const status = await target.waitForApproval({
@@ -471,16 +486,30 @@ export function createAuthMethods({
   const openMenu = async (_inputs: AuthorizeInputs): Promise<MenuOutcome> => {
     const paths = getPaths()
     const store = deps.openAccountPool(paths)
-    if (
-      vault &&
-      (await enrollmentAuthority(vault.paths, vault.name)) === 'vault'
-    )
+    if (vault && (await vault.authority()) !== 'local')
       return runVaultAccountMenu(accountMenuOptions(paths, store), vault)
     if ((await migratedPoolRows(paths, store)) === undefined)
       return notMigratedMenu()
     const options = accountMenuOptions(paths, store)
     return vault ? runVaultAccountMenu(options, vault) : runAccountMenu(options)
   }
+
+  const localAuthorization =
+    (authorize: () => Promise<AuthOAuthResult>) => async () => {
+      if (vault && (await vault.authority()) !== 'local')
+        throw new Error(VAULT_LOCAL_ACTION_REFUSAL)
+      const flow = await authorize()
+      if (flow.method !== 'auto') return flow
+      return {
+        ...flow,
+        callback: async () => {
+          const result = await flow.callback()
+          if (vault && (await vault.authority()) !== 'local')
+            return { type: 'failed' as const }
+          return result
+        },
+      }
+    }
 
   return [
     {
@@ -491,13 +520,13 @@ export function createAuthMethods({
       authorize: menuAuthorize<AuthOAuthResult>({
         hasCredential,
         openMenu,
-        login: () => deps.authorizeBrowser(),
+        login: localAuthorization(() => deps.authorizeBrowser()),
       }) as (inputs?: Record<string, string>) => Promise<AuthOAuthResult>,
     },
     {
       label: 'ChatGPT Pro/Plus (headless)',
       type: 'oauth',
-      authorize: deps.authorizeHeadless,
+      authorize: localAuthorization(() => deps.authorizeHeadless()),
     },
     {
       label: 'Manually enter API Key',

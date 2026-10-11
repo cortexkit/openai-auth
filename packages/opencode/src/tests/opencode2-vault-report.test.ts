@@ -144,6 +144,7 @@ describe('vault failure reports on OpenCode 2', () => {
         ],
         identities: () => new Set<string>(['chatgpt-vault']),
         enrolled: () => enrolled,
+        authority: async () => (enrolled ? 'vault' : 'local'),
         snapshot: () => undefined,
         authorize: async () => receipt(),
         reportFailure: async (served, status) => {

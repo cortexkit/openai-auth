@@ -79,6 +79,7 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
 function vault(connected = true): OpenAiVault {
   return {
+    authority: async () => (connected ? 'vault' : 'local'),
     status: async () => ({
       host: 'opencode',
       name: 'openai-auth-opencode',

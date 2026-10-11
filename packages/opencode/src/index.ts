@@ -1534,6 +1534,7 @@ export async function CodexAuthPlugin(
     getAccountPaths(getConfigPath()),
   )
   const vault = vaultLease.vault
+  await vault.authority()
   // Until the vault's first account list arrives, a local pool row signed in
   // as an account the vault holds looks like this host's own and could be
   // served or adopted twice. Login adoption and first-sight quota polls wait
@@ -1581,7 +1582,7 @@ export async function CodexAuthPlugin(
           // In vault mode neither the migration nor an adoption runs: a login
           // in the slot stays there, unused, and the local files stay as they
           // are until the host disconnects.
-          paused: () => vault.enrolled(),
+          paused: async () => (await vault.authority()) !== 'local',
           // After a migration or an adoption run the pool may hold a row this
           // process has never polled (or the install just turned migrated).
           // Re-reading it now starts those first quota polls at once, so an
@@ -1854,6 +1855,7 @@ export async function CodexAuthPlugin(
     auth: {
       provider: 'openai',
       async loader(getAuth) {
+        await vault.authority()
         loaderGetAuth = getAuth
         processHeartbeat ??= startProcessHeartbeat({
           version: PackageVersion,
@@ -2112,6 +2114,7 @@ export async function CodexAuthPlugin(
           vaultIdentities: () => vault.identities(),
           // In vault mode no pool row is refreshed, polled or sent with.
           vaultMode: () => vault.enrolled(),
+          vaultAuthority: () => vault.authority(),
           vaultFirstRoster,
           vaultFirstRosterBackgroundWaitMs: vaultRosterWaitMs,
           log: createLogger('pool'),
@@ -2596,6 +2599,10 @@ export async function CodexAuthPlugin(
           fetchImpl: fetch,
           vault,
           getMainToken: async () => {
+            if ((await vault.authority()) !== 'local')
+              throw new Error(
+                'local accounts are not warmed while this host is connected to the vault',
+              )
             // A migrated install's main account is the pool row `main`; the
             // slot is never read for it.
             if (await poolSource.active()) {
@@ -2604,6 +2611,10 @@ export async function CodexAuthPlugin(
               return access.token
             }
             const auth = await getAuth()
+            if ((await vault.authority()) !== 'local')
+              throw new Error(
+                'local accounts are not warmed while this host is connected to the vault',
+              )
             // Main lives in the pool row; the placeholder is never refreshed.
             if (isPoolMainPlaceholder(auth)) {
               return (await pooledMainTokens()).access
@@ -2621,6 +2632,10 @@ export async function CodexAuthPlugin(
             return auth.access
           },
           refreshFallback: async (accountId: string) => {
+            if ((await vault.authority()) !== 'local')
+              throw new Error(
+                'local accounts are not warmed while this host is connected to the vault',
+              )
             if (await poolSource.active()) {
               // The warmed request recorded the pool row that served it.
               const access = await poolRowAccess(accountId)
@@ -3190,6 +3205,7 @@ export async function CodexAuthPlugin(
           // account through the vault. In vault mode only the vault accounts
           // are polled.
           refreshAllQuota: async () => {
+            await vault.authority()
             if (vault.enrolled()) {
               const vaultResults = await vault.pollStale(0)
               await writeMachineSidebarState(quotaManager, lastRequestStorage)
@@ -3219,6 +3235,7 @@ export async function CodexAuthPlugin(
             return refreshAllQuota(buildRefreshAllQuotaDeps())
           },
           refreshResetTargetQuota: async (accountKey) => {
+            await vault.authority()
             if (vault.enrolled())
               return {
                 account: accountKey,
@@ -4450,6 +4467,7 @@ export async function CodexAuthPlugin(
 
         backgroundQuotaRefresh.start(
           async () => {
+            await vault.authority()
             // Vault mode polls no local account. The vault's own accounts are
             // polled by the shared vault consumer; the sidebar is rewritten
             // so it shows their latest quota.
@@ -4674,6 +4692,7 @@ export async function CodexAuthPlugin(
         return {
           apiKey: OAUTH_DUMMY_KEY,
           async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
+            const authority = await vault.authority()
             const requestHeaders = effectiveRequestHeaders(requestInput, init)
             const sidebarSessionId = resolveSidebarSessionId(requestHeaders)
             const sidebarParentSessionId =
@@ -4687,7 +4706,7 @@ export async function CodexAuthPlugin(
             // and any legacy fallback are not read for routing, refreshed or
             // sent with, whether or not the install has migrated; a request
             // no vault account can serve is refused locally.
-            if (vault.enrolled()) {
+            if (authority !== 'local') {
               init = await materializeRequestInit(requestInput, init)
               return servePooled(
                 requestInput,

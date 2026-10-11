@@ -11,21 +11,32 @@ import {
   quotaTextParts,
 } from '@cortexkit/common-auth/quota'
 import type { PoolRow } from '@cortexkit/common-auth/store'
-import type { OpenAiVault, VaultStatus } from './vault'
+import {
+  type OpenAiVault,
+  VAULT_REQUEST_ROSTER_WAIT_MS,
+  type VaultStatus,
+} from './vault'
 
 export type MenuVault = Pick<
   OpenAiVault,
-  'refresh' | 'status' | 'identities' | 'routes' | 'pollQuota' | 'snapshot'
+  | 'authority'
+  | 'refresh'
+  | 'status'
+  | 'identities'
+  | 'routes'
+  | 'pollQuota'
+  | 'snapshot'
 >
 
 export interface VaultMenuView {
+  authority: 'vault' | 'local' | 'unreadable'
   status: VaultStatus
   identities: ReadonlySet<string>
   routes: ReadonlySet<string>
 }
 
 export function isVaultMenuConnected(view: VaultMenuView): boolean {
-  return view.status.enrollment.state === 'approved'
+  return view.authority !== 'local'
 }
 
 /**
@@ -36,9 +47,39 @@ export function isVaultMenuConnected(view: VaultMenuView): boolean {
  */
 export async function readVaultMenu(vault: MenuVault): Promise<VaultMenuView> {
   return {
+    authority: await vault.authority(),
     status: await vault.status(),
     identities: vault.identities(),
     routes: new Set(vault.routes().map((route) => route.id)),
+  }
+}
+
+/** Stop waiting for the vault's account list so Disconnect remains accessible even if discovery hangs. */
+export async function refreshVaultMenu(
+  vault: MenuVault,
+): Promise<string | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      Promise.resolve()
+        .then(() => vault.refresh())
+        .then(
+          () => undefined,
+          (error: unknown) =>
+            error instanceof Error ? error.message : String(error),
+        ),
+      new Promise<string>((resolve) => {
+        timer = setTimeout(
+          () =>
+            resolve(
+              'Vault roster refresh did not finish within the roster wait budget.',
+            ),
+          VAULT_REQUEST_ROSTER_WAIT_MS,
+        )
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
   }
 }
 
@@ -108,7 +149,7 @@ export async function runVaultAccountMenu(
   options: AccountMenuOptions,
   vault: MenuVault,
 ) {
-  await vault.refresh()
+  const refreshError = await refreshVaultMenu(vault)
   const view = await readVaultMenu(vault)
   const { status } = view
   // In vault mode the local store is not read for the listing.
@@ -134,13 +175,14 @@ export async function runVaultAccountMenu(
           context.print(VAULT_LOCAL_ACTION_REFUSAL)
           return
         }
+        await vault.authority()
         await action.run(context)
       },
     }))
   const quotaAction = actions.find((action) => action.id === 'check-quotas')
   if (quotaAction) {
     quotaAction.run = async (context) => {
-      await vault.refresh()
+      await refreshVaultMenu(vault)
       const currentView = await readVaultMenu(vault)
       const before = isVaultMenuConnected(currentView)
         ? undefined
@@ -220,6 +262,7 @@ export async function runVaultAccountMenu(
     subtitle: 'Select an account action',
     status: [
       ...((await options.status?.()) ?? []),
+      ...(refreshError ? [`Last error: ${refreshError}`] : []),
       ...(status.lastError
         ? [`Claustrum vault unreachable: ${status.lastError}`]
         : []),
