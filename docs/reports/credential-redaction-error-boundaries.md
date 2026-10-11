@@ -147,9 +147,12 @@ ran on the Linux runner with 8 vCPUs, Bun 1.4.2:
   produced two non-error `await` hints.
 - Comment review examined all five changed files and flagged no unclear comments.
 
-`ckdev-mutate` 0.10.0 verified catalogue anchors and exact test names. Each row
-below was replayed individually with `ckdev-mutate run --only <id> --allow-dirty`
-on **both Bun 1.3.14 and 1.4.2**, with a passing baseline and result **CAUGHT**:
+The mutation tool `ckdev-mutate` 0.10.0 reads deliberate source replacements
+and regression-test names from `mutations.toml`. Its `check` command verified
+that each replacement matched the current source and each named test existed.
+Each control below was replayed individually with
+`ckdev-mutate run --only <id> --allow-dirty` on **both Bun 1.3.14 and 1.4.2**,
+with a passing baseline and result **CAUGHT**:
 
 | Control | Bun 1.3.14 | Bun 1.4.2 |
 | --- | --- | --- |
@@ -159,8 +162,10 @@ on **both Bun 1.3.14 and 1.4.2**, with a passing baseline and result **CAUGHT**:
 | credential-decoded-json-value-redaction | CAUGHT | CAUGHT |
 | codex-sse-delta-no-json-parse | CAUGHT | CAUGHT |
 
-Catalogue replays run locally because the runner mutates and restores the
-worktree. These are targeted catches, not a broad mutation audit. Separate
+For each replay, `ckdev-mutate` runs the named baseline tests, temporarily
+applies the listed source replacement, runs the tests again, and restores the
+source. This tool runs locally because it edits the local worktree. These are
+targeted catches, not a broad mutation audit. Separate
 Linux mutation probes confirmed the named regressions: unchanged headers,
 unscrubbed cancellation rejection, missed escaped keys, text-only JSON matching
 (each HTTP/SSE assertion separately), forced Unicode-delta parsing, and mutable
