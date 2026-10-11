@@ -1187,6 +1187,47 @@ describe('auth account menu with vault accounts', () => {
       vault.close()
     }
   })
+  test('unreadable enrollment keeps the auth menu vault-only with Disconnect and no local polling', async () => {
+    const { vault } = await setup()
+    try {
+      writeFileSync(vault.paths.statePath, '{broken', { mode: 0o600 })
+      const before = [files.configFile, files.stateFile].map((file) =>
+        readFileSync(file),
+      )
+      const wire = installWire()
+      const printed = await menu(['\u001b'], vault)
+      expect(printed).not.toContain('Add account')
+      expect(printed).not.toContain('Auth doctor')
+      expect(printed).not.toContain('local: local')
+      expect(printed).toContain('Disconnect')
+      await menu([ENTER], vault)
+      expect(wire.refreshTokens).toEqual([])
+      for (const id of ['main', 'ufuk', 'local'])
+        expect(wire.polls).not.toContain(`Bearer ${id}-token`)
+      expect(
+        [files.configFile, files.stateFile].map((file) => readFileSync(file)),
+      ).toEqual(before)
+    } finally {
+      vault.close()
+    }
+  })
+  test('a stale terminal Connect choice never disconnects a newly enrolled host', async () => {
+    const { vault } = await setup()
+    try {
+      await vault.disconnect()
+      const printed = await menu(
+        [...Array(6).fill(DOWN), ENTER],
+        vault,
+        (key) => {
+          if (key === ENTER) enroll()
+        },
+      )
+      expect(printed).toContain('Reopen the menu to disconnect')
+      expect(await vault.authority()).toBe('vault')
+    } finally {
+      vault.close()
+    }
+  })
   test('vault mode hides local-writing terminal actions and disconnect restores them unchanged', async () => {
     const { vault } = await setup()
     const localLabels = [
@@ -1205,7 +1246,7 @@ describe('auth account menu with vault accounts', () => {
       for (const label of localLabels) expect(connected).not.toContain(label)
       expect(connected).not.toContain('Apply repairs')
       expect(connected).toContain('Check quotas')
-      expect(connected).toContain('Connect to the Claustrum vault')
+      expect(connected).toContain('Disconnect from the Claustrum vault')
       expect(connected).toContain(LOCAL_NOTE)
       expect(
         [files.configFile, files.stateFile].map((file) => readFileSync(file)),

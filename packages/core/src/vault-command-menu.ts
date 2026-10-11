@@ -21,6 +21,7 @@ import {
   isVaultMenuConnected,
   type MenuVault,
   readVaultMenu,
+  refreshVaultMenu,
   VAULT_LOCAL_ACTION_REFUSAL,
   VAULT_MODE_LOCAL_NOTE,
   vaultAccountName,
@@ -332,20 +333,37 @@ export function createVaultCommandMenu(
     ),
   })
   const current = async () => {
-    if (!isVaultMenuConnected(await readVaultMenu(vault))) return localMenu
-    await vault.refresh()
-    return connectedMenu
+    if (!isVaultMenuConnected(await readVaultMenu(vault)))
+      return { menu: localMenu, error: undefined }
+    const error = await refreshVaultMenu(vault)
+    return { menu: connectedMenu, error }
+  }
+  const open = async (
+    state: Awaited<ReturnType<typeof current>>,
+    invocation: CommandInvocation,
+  ) => {
+    const payload = await state.menu.open(invocation)
+    if (state.error) {
+      const section = payload.menu.sections.find(
+        (section) => section.id === 'vault',
+      )
+      section?.lines.push(`Last error: ${state.error}`)
+    }
+    return payload
   }
   return {
     command: options.command,
-    open: async (invocation) => (await current()).open(invocation),
+    open: async (invocation) => open(await current(), invocation),
     apply: async (request, invocation) => {
-      const menu = await current()
+      const state = await current()
+      const { menu } = state
       if (
         menu === connectedMenu &&
         (request.sectionId === 'accounts' ||
           (request.sectionId === 'routing' && request.actionId === 'order') ||
           request.sectionId === 'reset' ||
+          (request.sectionId === 'quota' &&
+            (await readVaultMenu(vault)).routes.size === 0) ||
           (request.sectionId === 'limits' &&
             request.itemId !== undefined &&
             !(await readVaultMenu(vault)).status.accounts.some(
@@ -353,7 +371,7 @@ export function createVaultCommandMenu(
             )))
       )
         return {
-          ...(await menu.open(invocation)),
+          ...(await open(state, invocation)),
           ok: false,
           code: 'vault-local-action',
           text: VAULT_LOCAL_ACTION_REFUSAL,

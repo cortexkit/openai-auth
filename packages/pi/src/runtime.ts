@@ -25,10 +25,7 @@
 // serve is refused with a fixed message. Disconnecting restores them.
 
 import { statSync } from 'node:fs'
-import {
-  enrollmentAuthority,
-  type QuotaReceipt,
-} from '@cortexkit/common-auth/claustrum'
+import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import type { PiSlot } from '@cortexkit/common-auth/pi-slot'
 import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
 import {
@@ -212,7 +209,6 @@ export class PiOpenAIRuntime {
   private readonly paths: () => AccountPaths
   private slot: PiSlot | undefined
   private slotVaultMode: boolean | undefined
-  private authority: 'unknown' | 'local' | 'vault' | 'unreadable' = 'unknown'
   private slotNeedsRefresh = false
   private slotQueue: Promise<unknown> = Promise.resolve()
   private storageCache:
@@ -302,16 +298,12 @@ export class PiOpenAIRuntime {
    * enrollment blocks local work; asynchronous boundaries read authority anew.
    */
   vaultMode(): boolean {
-    return this.authority !== 'local'
+    return this.vault.enrolled()
   }
 
-  async readAuthority(): Promise<'local' | 'vault' | 'unreadable'> {
-    const authority = await enrollmentAuthority(
-      this.vault.paths,
-      this.vault.name,
-    )
-    this.authority = authority
-    return authority
+  /** A fresh read of enrollment, through the vault so Pi and OpenCode share one rule and one cache. */
+  readAuthority(): Promise<'local' | 'vault' | 'unreadable'> {
+    return this.vault.authority()
   }
 
   private vaultSlot(): PiSlot {

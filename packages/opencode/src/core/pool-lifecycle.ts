@@ -83,7 +83,7 @@ export interface PoolLifecycleDeps {
    * True while no migration or adoption may run: the host is in vault mode,
    * which writes no local account file. Read before every run.
    */
-  paused?: () => boolean
+  paused?: () => boolean | Promise<boolean>
 }
 
 export interface PoolLifecycle {
@@ -207,14 +207,14 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
    * keeps the short base delay (no backoff), so a disconnect is noticed
    * within about a minute.
    */
-  function pausedNow(): boolean {
-    if (!deps.paused?.()) return false
+  async function pausedNow(): Promise<boolean> {
+    if (!(await deps.paused?.())) return false
     schedule(jitter(POOL_RETRY_BASE_MS))
     return true
   }
 
   async function runMigration(): Promise<void> {
-    if (pausedNow()) return
+    if (await pausedNow()) return
     let outcome: PoolTransferOutcome
     try {
       outcome = await migrate({ ...runDeps(), fence })
@@ -252,7 +252,7 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
   }
 
   async function runAdoption(): Promise<void> {
-    if (pausedNow()) return
+    if (await pausedNow()) return
     let outcome: PoolTransferOutcome
     try {
       // Adoption copies a slot token into the pool the same way migration

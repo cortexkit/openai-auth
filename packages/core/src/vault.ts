@@ -19,7 +19,7 @@
  * that send used; nothing else is reported. Vault quota lives in the roster
  * file next to the token, not in the account store.
  */
-import { existsSync } from 'node:fs'
+import { statSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { resolveClaustrumConnectionPath } from '@cortexkit/claustrum-client'
@@ -36,6 +36,7 @@ import {
   type ClaustrumScopedClient,
   connectClaustrumEnrollmentClient,
   connectClaustrumScopedClient,
+  enrollmentAuthority,
   enrollmentName,
   hostEnrollmentPaths,
   type QuotaReceipt,
@@ -216,6 +217,8 @@ export class OpenAiVault {
   /** Settles once this instance's first roster discovery has, either way. */
   readonly #firstRoster = Promise.withResolvers<void>()
   #pollTimer: ReturnType<typeof setTimeout> | undefined
+  #authority: 'vault' | 'local' | 'unreadable' | 'unknown' = 'unknown'
+  #authorityKey: string | undefined
 
   constructor(options: OpenAiVaultOptions) {
     this.#options = options
@@ -227,8 +230,7 @@ export class OpenAiVault {
       tokenPath: this.paths.tokenPath,
       family: VAULT_FAMILY,
       connect: () => this.#connectScoped(),
-      // The consumer lists and serves vault accounts only while this host
-      // holds an enrollment token; without one it serves nothing.
+      // Unknown or unreadable enrollment must never enable local credentials.
       isCustodyActive: () => this.enrolled(),
       ...(options.reservedRouteIds
         ? { reservedRouteIds: options.reservedRouteIds }
@@ -278,19 +280,48 @@ export class OpenAiVault {
     log.warn(message, { host: this.host, error: this.#lastError })
   }
 
-  /**
-   * Whether this host holds an enrollment token: vault mode. In vault mode
-   * only the vault's accounts serve this host, and no local account is used,
-   * refreshed or polled; disconnecting (deleting the token) ends it.
-   */
-  enrolled(): boolean {
-    return existsSync(this.paths.tokenPath)
+  #enrollmentKey(): string {
+    return [this.paths.tokenPath, this.paths.statePath]
+      .map((path) => {
+        try {
+          const stat = statSync(path)
+          return `${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`
+        } catch {
+          return '?'
+        }
+      })
+      .join('|')
+  }
+
+  /** Read enrollment files before a request, menu action or background pass, using common-auth's mode rules. */
+  async authority(): Promise<'vault' | 'local' | 'unreadable'> {
+    const key = this.#enrollmentKey()
+    const mode = await enrollmentAuthority(this.paths, this.name)
+    if (key === this.#enrollmentKey()) {
+      this.#authority = mode
+      this.#authorityKey = key
+      return mode
+    }
+    return 'unreadable'
   }
 
   /**
-   * Starts polling the vault for this host's accounts. Cheap while the host
-   * is not enrolled (one file check per poll), and it notices an enrollment
-   * another process (`opencode auth login`) finished.
+   * Callbacks that cannot await use the last authority value only while the
+   * enrollment files are unchanged. Before the first read, or after a change,
+   * local token refreshes, quota polls and account writes are blocked.
+   * Requests and menus await authority() instead of trusting the cached value.
+   */
+  enrolled(): boolean {
+    return (
+      this.#authorityKey !== this.#enrollmentKey() ||
+      this.#authority !== 'local'
+    )
+  }
+
+  /**
+   * Polls enrollment files and the vault's accounts. With local authority the
+   * consumer sends no vault request. A new enrollment completed by another
+   * process is detected on the next poll.
    */
   start(): void {
     // The poll runs here rather than in the consumer (`ClaustrumConsumer.start`)
@@ -301,6 +332,7 @@ export class OpenAiVault {
     this.#polling = true
     const tick = async () => {
       try {
+        await this.authority()
         await this.#discover()
       } catch (error) {
         if (!this.#closed) this.#fail('vault roster refresh failed', error)
@@ -348,6 +380,7 @@ export class OpenAiVault {
    */
   async refresh(): Promise<VaultRosterFile | undefined> {
     try {
+      await this.authority()
       const earlier = this.#discovery
       if (earlier) await earlier.catch(() => undefined)
       const roster = await this.#discover()
@@ -598,6 +631,7 @@ export class OpenAiVault {
   }
 
   async status(): Promise<VaultStatus> {
+    await this.authority()
     let enrollment: ClaustrumEnrollmentStatus
     try {
       enrollment = await readClaustrumEnrollmentStatus(this.paths, this.name)
@@ -697,7 +731,7 @@ export class OpenAiVault {
   async disconnect(): Promise<void> {
     await rm(this.paths.tokenPath, { force: true })
     await rm(this.paths.statePath, { force: true })
-    await this.refresh()
+    await this.authority()
     this.#lastError = undefined
     log.info('vault enrollment forgotten', { host: this.host })
   }

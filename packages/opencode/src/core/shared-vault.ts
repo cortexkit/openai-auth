@@ -85,17 +85,17 @@ export function acquireOpenCodeVault(
     start() {
       if (released || owned.started) return
       owned.started = true
-      const pollQuota = () => {
-        if (owned.holders.size && owned.vault.enrolled())
-          void owned.vault.pollStale(QUOTA_STALE_AFTER_MS)
+      const pollQuota = async () => {
+        if (owned.holders.size && (await owned.vault.authority()) !== 'local')
+          await owned.vault.pollStale(QUOTA_STALE_AFTER_MS)
       }
-      // Start joins this first read; later holders must not call refresh,
-      // which deliberately starts a new discovery after an in-flight one.
-      const first = owned.vault.refresh()
+      // Start owns the first read; later holders join its completion rather
+      // than refreshing, which would deliberately start another discovery.
       owned.vault.start()
+      const first = owned.vault.firstRoster()
       void first.finally(() => {
         owned.firstRoster.resolve()
-        pollQuota()
+        void pollQuota()
       })
       owned.quotaPoll = setInterval(pollQuota, QUOTA_POLL_INTERVAL_MS)
       owned.quotaPoll.unref?.()

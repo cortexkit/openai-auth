@@ -696,7 +696,7 @@ expect_message = "+   \"apikey:openai:platform\","
 id = "vault-mode-ignores-a-real-slot-login"
 guards = "in vault mode a real login in OpenCode's slot is not used: the request is served from the vault before the slot is read"
 file = "packages/opencode/src/index.ts"
-old = "            if (vault.enrolled()) {\n              init = await materializeRequestInit(requestInput, init)"
+old = "            if (authority !== 'local') {\n              init = await materializeRequestInit(requestInput, init)"
 new = "            if (false) { // NON-VACUITY BREAK: read the slot in vault mode.\n              init = await materializeRequestInit(requestInput, init)"
 test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
@@ -1366,7 +1366,7 @@ expect_red = ['^vault\scommand\smenu\svault\sfloors\suse\sthe\srequest\sroute\sk
 id = "menu-no-vault-output"
 guards = "an unenrolled vault leaves rendered local-only output byte-identical apart from unlabelled row names"
 file = "packages/core/src/vault-account-menu.ts"
-old = "  return view.status.enrollment.state === 'approved'"
+old = "  return view.authority !== 'local'"
 new = "  return true // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
@@ -1633,8 +1633,8 @@ expect_red = ['^the\spool\ssource\sin\svault\smode\srefreshes,\spolls\sand\soffe
 id = "vault-mode-warms-no-local-target"
 guards = "in vault mode a keep-warm target captured on a local account before connecting is never warmed: no local token is read, refreshed or sent"
 file = "packages/opencode/src/core/cachekeep.ts"
-old = "      if (options.vault?.enrolled())\n        throw new Error("
-new = "      if (false) // NON-VACUITY BREAK: warm local targets in vault mode.\n        throw new Error("
+old = "      if (options.vault && (await options.vault.authority()) !== 'local')\n        throw new Error(\n          'local accounts are not warmed while this host is connected to the vault',\n        )\n\n      let accessToken: string"
+new = "      if (false) // NON-VACUITY BREAK: warm local targets in vault mode.\n        throw new Error(\n          'local accounts are not warmed while this host is connected to the vault',\n        )\n\n      let accessToken: string"
 test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
@@ -1694,7 +1694,7 @@ expect_red = ["^Pi\\sin\\svault\\smode\\sneither\\sPi's\\slogin\\snor\\sa\\spool
 id = "vault-mode-pauses-the-pool-lifecycle"
 guards = "while paused (vault mode) the pool lifecycle runs no adoption: a slot login stays in the slot and the account files stay byte-identical"
 file = "packages/opencode/src/core/pool-lifecycle.ts"
-old = "    if (!deps.paused?.()) return false\n"
+old = "    if (!(await deps.paused?.())) return false\n"
 new = "    return false // NON-VACUITY BREAK: run while paused.\n"
 test_file = "packages/opencode/src/tests/pool-lifecycle.test.ts"
 runner = "command"
@@ -1706,7 +1706,7 @@ expect_red = ["^in\\svault\\smode\\sa\\sslot\\slogin\\slanding\\sin\\svault\\smo
 id = "opencode1-vault-mode-wires-the-lifecycle-pause"
 guards = "OpenCode 1 pauses its pool lifecycle in vault mode, so a never-migrated install is not migrated while the vault serves it"
 file = "packages/opencode/src/index.ts"
-old = "          paused: () => vault.enrolled(),"
+old = "          paused: async () => (await vault.authority()) !== 'local',"
 new = "          paused: () => false, // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/pool-lifecycle-plugin.test.ts"
 runner = "command"
@@ -1730,7 +1730,7 @@ expect_red = ["^the\\spool\\slifecycle\\sin\\svault\\smode\\sa\\snever-migrated\
 id = "opencode2-vault-mode-wires-the-lifecycle-pause"
 guards = "OpenCode 2 pauses its pool lifecycle in vault mode, so a login in the slot is neither adopted nor the placeholder written"
 file = "packages/opencode/src/v2/setup.ts"
-old = "        paused: () => vault.enrolled(),"
+old = "        paused: async () => (await vault.authority()) !== 'local',"
 new = "        paused: () => false, // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/opencode2-vault.test.ts"
 runner = "command"
@@ -2099,7 +2099,7 @@ expect_message = '"add"'
 id = "menu-vault-terminal-no-local-login-fallback"
 guards = "vault enrollment opens the terminal account menu without probing or signing into a local credential"
 file = "packages/opencode/src/auth/methods.ts"
-old = "  const hasCredential = async (): Promise<boolean> => {\n    if (\n      vault &&\n      (await enrollmentAuthority(vault.paths, vault.name)) === 'vault'\n    )\n      return true"
+old = "  const hasCredential = async (): Promise<boolean> => {\n    if (vault && (await vault.authority()) !== 'local') return true"
 new = "  const hasCredential = async (): Promise<boolean> => {\n    // NON-VACUITY BREAK: ignore vault enrollment."
 test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
@@ -2112,7 +2112,7 @@ expect_message = "local login must not start"
 id = "menu-vault-terminal-no-premigration-doctor"
 guards = "an enrolled host opens the vault menu rather than the local pre-migration doctor"
 file = "packages/opencode/src/auth/methods.ts"
-old = "    if (\n      vault &&\n      (await enrollmentAuthority(vault.paths, vault.name)) === 'vault'\n    )\n      return runVaultAccountMenu(accountMenuOptions(paths, store), vault)"
+old = "    if (vault && (await vault.authority()) !== 'local')\n      return runVaultAccountMenu(accountMenuOptions(paths, store), vault)"
 new = "    // NON-VACUITY BREAK: fall through to the local migration menu."
 test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
@@ -2125,7 +2125,7 @@ expect_message = "Accounts are managed in the vault with ck. Disconnect to use l
 id = "menu-vault-terminal-no-local-status-read"
 guards = "the connected terminal status does not inspect legacy local accounts"
 file = "packages/opencode/src/auth/methods.ts"
-old = "      if (vault && enrollment?.enrollment.state === 'approved')"
+old = "      if (vault && (await vault.authority()) !== 'local' && enrollment)"
 new = "      if (false) // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
@@ -2359,3 +2359,137 @@ command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.t
 test_count_pattern = "Ran {count} test"
 expect_red = ['^Pi\svault\sslot\slifecycle\sexplicit\sslot\ssync\sand\srecovery\safter\sfailure\stake\sPi\sauth\slocks$']
 expect_message = "expect(count()).toBeGreaterThan(0)"
+
+# Enrollment authority, send-time enrollment changes and recoverable vault menus.
+
+[[control]]
+id = "audit-enrolled-pool-login"
+guards = "ordinary OAuth authorization and completion cannot write a migrated local pool while enrolled"
+file = "packages/opencode/src/v2/login.ts"
+old = "  if ((await vault.authority()) !== 'local')"
+new = "  if (false) // NON-VACUITY BREAK: authorize and store local logins while enrolled."
+test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sentry:\slogins\sa\smigrated\spool\srefuses\san\sordinary\slogin\scompleted\safter\senrollment\swithout\schanging\spool\sbytes$']
+
+[[control]]
+id = "audit-unreadable-dialog-mode"
+guards = "unreadable enrollment never shows or applies local dialog account actions"
+file = "packages/core/src/vault-account-menu.ts"
+old = "  return view.authority !== 'local'"
+new = "  return view.status.enrollment.state === 'approved' // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-enrollment-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-enrollment-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\senrollment\saudit\sunreadable\senrollment\shides\slocal\sdialog\sactions\sand\srefuses\sstale\swrites\sand\spolls$']
+
+[[control]]
+id = "audit-unreadable-auth-menu-mode"
+guards = "the terminal auth menu stays vault-only and offers Disconnect when enrollment state is unreadable"
+file = "packages/core/src/vault-account-menu.ts"
+old = "  return view.authority !== 'local'"
+new = "  return view.status.enrollment.state === 'approved' // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\sunreadable\senrollment\skeeps\sthe\sauth\smenu\svault-only\swith\sDisconnect\sand\sno\slocal\spolling$']
+
+[[control]]
+id = "audit-authority-cache"
+guards = "cached synchronous guards only allow locals after a fresh authoritative read of unchanged files"
+file = "packages/core/src/vault.ts"
+old = "    const mode = await enrollmentAuthority(this.paths, this.name)"
+new = "    const mode = 'local' as const // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-enrollment-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-enrollment-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\senrollment\saudit\sthe\ssynchronous\smode\sguard\sstays\sclosed\suntil\sauthority\sreads\sunchanged\senrollment\sfiles$']
+
+[[control]]
+id = "audit-warm-enrollment-race"
+guards = "a local bearer resolved after enrollment is never dispatched by keep-warm"
+file = "packages/opencode/src/core/cachekeep.ts"
+old = "      // Enrollment can finish during token resolution; do not dispatch the\n      // resolved local bearer after authority has switched away from local.\n      if (options.vault && (await options.vault.authority()) !== 'local')"
+new = "      if (false) // NON-VACUITY BREAK: send the local bearer after enrollment."
+test_file = "packages/opencode/src/tests/vault-enrollment-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-enrollment-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\senrollment\saudit\senrollment\sduring\sa\slocal\swarm\stoken\sawait\sprevents\sdispatch$']
+
+[[control]]
+id = "audit-vault-menu-hang"
+guards = "Disconnect remains reachable when account discovery never resolves"
+file = "packages/core/src/vault-account-menu.ts"
+old = "          VAULT_REQUEST_ROSTER_WAIT_MS,"
+new = "          VAULT_REQUEST_ROSTER_WAIT_MS * 10, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-enrollment-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-enrollment-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\senrollment\saudit\sa\shung\sroster\srefresh\sleaves\sDisconnect\sreachable\swithin\sthe\sroster\swait\sbudget$']
+
+[[control]]
+id = "audit-vault-menu-rejection"
+guards = "a rejected menu discovery renders its error instead of rejecting the dialog"
+file = "packages/core/src/vault-account-menu.ts"
+old = "            error instanceof Error ? error.message : String(error),"
+new = "            Promise.reject(error), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-enrollment-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-enrollment-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\senrollment\saudit\sa\srejected\sroster\srefresh\srenders\san\serror\sand\sleaves\sDisconnect\sreachable$']
+
+[[control]]
+id = "audit-vault-before-migration"
+guards = "local migration notices cannot hide the vault menu or Disconnect"
+file = "packages/core/src/commands.ts"
+old = "    async open(invocation): Promise<CommandDialogPayload> {\n      const context = own(invocation)\n      const state =\n        options.vault && (await options.vault.authority()) !== 'local'\n          ? undefined\n          : await options.migration?.()"
+new = "    async open(invocation): Promise<CommandDialogPayload> {\n      const context = own(invocation)\n      const state = await options.migration?.() // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-enrollment-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-enrollment-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\senrollment\saudit\svault\sdialog\sbypasses\san\sunmigrated\slocal\sinstall$']
+
+[[control]]
+id = "audit-vault-admission-cause"
+guards = "a nonempty vault blocked by quota admission is not called empty"
+file = "packages/opencode/src/core/pool-request.ts"
+old = "            ? ctx.vault.noRouteCause()\n            : undefined"
+new = "            ? ctx.vault.noRouteCause()\n            : 'vault-empty' // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\srequest\spath\sin\svault\smode\svault\squota\sadmission\sis\snot\smisreported\sas\san\sempty\sroster$']
+
+[[control]]
+id = "audit-setup-vault-lease"
+guards = "setup failure after acquiring the shared vault does not retain a holder"
+file = "packages/opencode/src/v2/setup.ts"
+old = "      if (!setupComplete) vaultLease.release()"
+new = "      if (!setupComplete) void 0 // NON-VACUITY BREAK: leak the setup holder."
+test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sentry:\slogins\ssetup\sreleases\sits\svault\slease\swhen\sloading\sthe\ssource\sthrows$']
+
+[[control]]
+id = "audit-vault-menu-action-intent"
+guards = "a stale Connect choice never becomes Disconnect after enrollment completes"
+file = "packages/opencode/src/auth/methods.ts"
+old = "        if (mode !== 'local') {\n          context.print("
+new = "        if (mode !== 'local') {\n          await target.disconnect() // NON-VACUITY BREAK: reverse a stale Connect choice.\n          context.print("
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^auth\saccount\smenu\swith\svault\saccounts\sa\sstale\sterminal\sConnect\schoice\snever\sdisconnects\sa\snewly\senrolled\shost$']

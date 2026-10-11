@@ -423,7 +423,7 @@ async function serveOrdered(
         ctx.vault
           ? rows.length === 0
             ? ctx.vault.noRouteCause()
-            : 'vault-empty'
+            : undefined
           : rows.length === 0
             ? 'no-accounts'
             : 'unusable',

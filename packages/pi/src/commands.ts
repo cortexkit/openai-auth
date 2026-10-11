@@ -109,34 +109,11 @@ export function createPiMenu(
     changed: dependencies.afterApply,
     ...(dependencies.vaultWait ? { wait: dependencies.vaultWait } : {}),
   })
-  // The shared account menu uses an approved status to select its no-local
-  // view. Pi keeps that view even if approved enrollment loses its token or
-  // becomes unreadable; the Vault section below still shows the real status.
-  const menuVault: NonNullable<
-    Parameters<typeof createOpenAiMenu>[0]['vault']
-  > = {
-    status: async () => {
-      const status = await pool.vault.status()
-      return pool.vaultMode()
-        ? {
-            ...status,
-            enrollment: {
-              state: 'approved' as const,
-              proposedName: pool.vault.name,
-              tokenGeneration: 0,
-            },
-          }
-        : status
-    },
-    refresh: () => pool.vault.refresh(),
-    identities: () => pool.vault.identities(),
-    routes: () => pool.vault.routes(),
-    snapshot: () => pool.vault.snapshot(),
-    pollQuota: (id) => pool.vault.pollQuota(id),
-  }
   const menu = createOpenAiMenu({
     store: pool.store(),
-    vault: menuVault,
+    // The shared menu reads the vault's own enrollment authority, so an
+    // unreadable or token-less enrollment still gets the vault-only view.
+    vault: pool.vault,
     login: {
       begin: (options) => begin({ ...options, version }),
       mainIdentity: async () => pool.mainIdentity(),

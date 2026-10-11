@@ -10,7 +10,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { VaultRosterRow } from '@cortexkit/common-auth/claustrum'
 import type { QuotaMap } from '@cortexkit/common-auth/quota'
-import type { AccountPaths } from '@cortexkit/openai-auth-core/internal'
+import type {
+  AccountPaths,
+  AccountStorage,
+} from '@cortexkit/openai-auth-core/internal'
 import { PoolAccountSource } from '../core/pool-account-source'
 import {
   type NoCredentialCause,
@@ -59,7 +62,10 @@ describe('the request path in vault mode', () => {
    * given no vault-mode switch, so only the request path's own rule keeps
    * the rows out.
    */
-  async function serve(vault: PoolVaultRoutes) {
+  async function serve(
+    vault: PoolVaultRoutes,
+    storage: AccountStorage | null = null,
+  ) {
     seedPool({ configFile: paths.configPath, stateFile: paths.statePath }, [
       { id: 'main', quota: quotaMap(10) },
       { id: 'spare', quota: quotaMap(5) },
@@ -77,7 +83,7 @@ describe('the request path in vault mode', () => {
     const ctx: PoolRequestContext = {
       source,
       vault,
-      storage: null,
+      storage,
       mode: 'fallback-first',
       sessionId: undefined,
       body: '{}',
@@ -135,6 +141,22 @@ describe('the request path in vault mode', () => {
       expect(causes).toEqual([cause])
     })
   }
+  it('vault quota admission is not misreported as an empty roster', async () => {
+    const { sent, causes } = await serve(
+      vaultWith([{ id: 'vault:work', kind: 'oauth', quota: quotaMap(90) }]),
+      {
+        version: 1,
+        accounts: [],
+        killswitch: {
+          enabled: true,
+          schema: 'floors-v1',
+          defaults: { primary: 25, secondary: 0 },
+        },
+      },
+    )
+    expect(sent).toEqual([])
+    expect(causes).toEqual([undefined])
+  })
 })
 
 describe('the pool source in vault mode', () => {

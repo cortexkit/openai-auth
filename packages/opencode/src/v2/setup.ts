@@ -89,6 +89,7 @@ import {
 } from './adapter'
 import { opencode1HostSlot } from './host-slot'
 import {
+  assertLocalPoolLogin,
   type BeginLogin,
   chatgptLoginMethods,
   isLeftoverCredential,
@@ -220,8 +221,8 @@ export async function setupOpenAIAuth(
 
   // The vault serves nothing until this host is enrolled as
   // `openai-auth-opencode` (from OpenCode 1's `opencode auth login` menu).
-  // Until then each poll only checks for the enrollment token file, so an
-  // enrollment another process finished is picked up. It is built before the
+  // Each poll reads the shared enrollment authority, so an enrollment
+  // completed by another process is picked up. It is built before the
   // pool source, whose first load already asks which accounts it holds, and
   // started further down.
   //
@@ -255,6 +256,13 @@ export async function setupOpenAIAuth(
     paths(),
   )
   const vault = vaultLease.vault
+  let setupComplete = false
+  using _leaseRollback = {
+    [Symbol.dispose]() {
+      if (!setupComplete) vaultLease.release()
+    },
+  }
+  await vault.authority()
   const vaultFirstRoster = vaultLease.firstRoster
 
   const source = new PoolAccountSource({
@@ -294,6 +302,7 @@ export async function setupOpenAIAuth(
     // In vault mode (this host enrolled with the vault) no pool row is
     // refreshed, polled or sent with; disconnecting restores them.
     vaultMode: () => vault.enrolled(),
+    vaultAuthority: () => vault.authority(),
     vaultFirstRoster,
     vaultFirstRosterBackgroundWaitMs: vaultRosterWaitMs,
     log: createLogger('pool'),
@@ -330,7 +339,7 @@ export async function setupOpenAIAuth(
         // In vault mode neither the migration nor an adoption runs: a login
         // in OpenCode 1's slot stays there, unused, and the local files stay
         // as they are until the host disconnects.
-        paused: () => vault.enrolled(),
+        paused: async () => (await vault.authority()) !== 'local',
         // A run may leave the pool holding a row this process has never
         // polled (or turn the install migrated); re-reading starts those
         // polls at once.
@@ -377,13 +386,8 @@ export async function setupOpenAIAuth(
 
   /** Waits for a migration run when the install has not migrated yet. */
   const ensureMigrated = async (login: PoolLoginResult) => {
+    await assertLocalPoolLogin(vault)
     if (poolMigrated(paths().configPath)) return
-    // The migration does not run in vault mode (it writes the local files),
-    // so it is not waited for.
-    if (vault.enrolled())
-      throw new Error(
-        'This host is connected to the credential vault, which serves its OpenAI accounts, so the local accounts are not moved to the shared account pool and the login was not stored. Disconnect this host from the vault to add a local login.',
-      )
     await lifecycle?.idle()
     if (poolMigrated(paths().configPath)) return
     if (
@@ -405,7 +409,9 @@ export async function setupOpenAIAuth(
 
   const storeLogin = async (login: PoolLoginResult) => {
     await ensureMigrated(login)
-    const outcome = await writeLoginToPool(source.poolStore(), paths(), login)
+    const outcome = await writeLoginToPool(source.poolStore(), paths(), login, {
+      vault,
+    })
     if (!poolMigrated(paths().configPath)) await lifecycle?.requestAdoption()
     await source.load()
     log.info('ChatGPT login stored in the account pool', outcome)
@@ -416,6 +422,7 @@ export async function setupOpenAIAuth(
     methods: chatgptLoginMethods({
       beginLogin: options.beginLogin ?? beginAccountLogin,
       version,
+      vault,
     }),
     onLogin: (login) => storeLogin(login),
     label: 'ChatGPT (openai-auth account pool)',
@@ -439,6 +446,7 @@ export async function setupOpenAIAuth(
     }
   })()
 
+  setupComplete = true
   return async () => {
     abort.abort()
     lifecycle?.dispose()

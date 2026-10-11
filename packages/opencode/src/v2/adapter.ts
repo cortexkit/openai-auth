@@ -157,6 +157,7 @@ export type VaultAccess = Pick<
   | 'routes'
   | 'identities'
   | 'enrolled'
+  | 'authority'
   | 'snapshot'
   | 'authorize'
   | 'reportFailure'
@@ -577,9 +578,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   const chooseAccount = async (
     input: ChooseAccountInput,
   ): Promise<string | undefined> => {
+    const modeAuthority = await vault?.authority()
     const storage = await deps.storage()
     // Vault mode: only the vault's accounts serve this host.
-    const vaultMode = vault?.enrolled() === true
+    const vaultMode = modeAuthority !== undefined && modeAuthority !== 'local'
     const refuseMissingLogin = () => {
       throw new OpenCode2AuthError({
         kind: 'no-account',
@@ -734,7 +736,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       })
     // In vault mode no pool row is sent with, so only the vault is asked.
     const row =
-      vault?.enrolled() === true
+      vault && (await vault.authority()) !== 'local'
         ? undefined
         : source.peek().rows.find((candidate) => candidate.id === accountId)
     if (!row && vault) {

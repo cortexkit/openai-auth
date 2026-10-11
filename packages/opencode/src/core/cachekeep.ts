@@ -339,11 +339,11 @@ export interface OpenAICacheKeepAdapterOptions {
    */
   refreshFallback: (accountId: string) => Promise<CacheKeepFallbackAccess>
   /**
-   * Vault routes authorize every replay through the custodian's send path.
-   * While this host is in vault mode (`enrolled`), a target on a local
-   * account is never warmed: no local token is read or refreshed for it.
+   * Replays on vault accounts obtain a bearer through the vault's send path.
+   * While enrolled, a replay captured on a local account sends nothing and
+   * does not read or refresh that account's token.
    */
-  vault?: Pick<OpenAiVault, 'owns' | 'send' | 'enrolled'>
+  vault?: Pick<OpenAiVault, 'owns' | 'send' | 'authority'>
   codexResponsesUrl: string
   /**
    * The account the target's session routes to now (see
@@ -426,7 +426,7 @@ export function createOpenAICacheKeepAdapter(
       // A target captured on a local account before this host connected to
       // the vault: vault mode warms no local account. The throw backs the
       // target off like any failed warm; nothing was sent.
-      if (options.vault?.enrolled())
+      if (options.vault && (await options.vault.authority()) !== 'local')
         throw new Error(
           'local accounts are not warmed while this host is connected to the vault',
         )
@@ -444,6 +444,12 @@ export function createOpenAICacheKeepAdapter(
       } else {
         accessToken = await options.getMainToken()
       }
+      // Enrollment can finish during token resolution; do not dispatch the
+      // resolved local bearer after authority has switched away from local.
+      if (options.vault && (await options.vault.authority()) !== 'local')
+        throw new Error(
+          'local accounts are not warmed while this host is connected to the vault',
+        )
       const response = await dispatch(accessToken)
       if (response.status === 401) await onAuthFailure?.(response.status)
       return response
