@@ -135,8 +135,10 @@ function redactDiagnosticBody(body: string, credential?: string): string {
 const diagnosticLimit = 16_384
 const responseBodyLimit = 64 * 1024
 
-// The host retries API errors when their responseBody mentions rate limits, server or transport failures,
-// even if isRetryable is false. Preserve those matches when bounding OpenCode 1.18.30 diagnostics.
+// OpenCode 1's session retry policy (session/retry.ts) matches these patterns
+// against an API error's responseBody and retries on a match, even when
+// isRetryable is false. A body cut down to the size limit must still contain
+// any marker the original had, or a retryable failure would stop retrying.
 const retryBodyPatterns = [
   /429|500|502|503|504|524/i,
   /rate increased too quickly|rate limit|rate-limit|rate_limit|too many requests/i,
