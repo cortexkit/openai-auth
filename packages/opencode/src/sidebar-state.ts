@@ -1197,6 +1197,9 @@ export function setSidebarMachineState(
           latest.fallbacks.map((account) => [account.id, account]),
         )
         const vaultMode = machineState.vaultAccounts !== undefined
+        // A same-identity merge combines the freshest of each window across the
+        // two sides; a differing or unknown identity whole-picks the fresher
+        // snapshot so windows from two accounts are never combined.
         const mainSameIdentity = sameAccountIdentity(
           machineState.main.mainAccountId,
           latest.main.mainAccountId,
