@@ -166,6 +166,96 @@ test('Pi request error does not expose the bearer echoed by the transport', asyn
   expect(JSON.stringify(events)).not.toContain(token)
 })
 
+for (const contentType of [undefined, 'text/plain']) {
+  test(`Pi runtime parses and scrubs SSE errors with ${contentType ?? 'missing'} content-type`, async () => {
+    const token = chatgptAccessToken('stream-secret')
+    const jwt = chatgptAccessToken('unrelated-secret')
+    const message = `Stream refused key ${token}; ${jwt}`
+    let sends = 0
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch() {
+        sends++
+        const bytes = new TextEncoder().encode(
+          `data: ${JSON.stringify({ type: 'error', message })}\n\n`,
+        )
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (let index = 0; index < bytes.length; index += 7)
+                controller.enqueue(bytes.slice(index, index + 7))
+              controller.close()
+            },
+          }),
+          { headers: contentType ? { 'content-type': contentType } : {} },
+        )
+      },
+    })
+    const fakeFetch = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input instanceof Request ? input.url : input)
+        if (url.includes('/wham/usage'))
+          return Response.json({
+            rate_limit: {
+              primary_window: {
+                used_percent: 10,
+                limit_window_seconds: 18000,
+                reset_at: Math.floor(Date.now() / 1000) + 7200,
+              },
+            },
+          })
+        const response = await fetch(input, init)
+        expect(response.headers.get('content-type')).toBe(contentType ?? null)
+        return response
+      },
+      { preconnect() {} },
+    ) as typeof fetch
+    const localModel = { ...model, baseUrl: server.url.toString() }
+    const options = {
+      apiKey: token,
+      fetch: fakeFetch,
+      transport: 'sse' as const,
+    }
+    try {
+      const rawEvents = []
+      for await (const event of streamSimple(
+        localModel,
+        { messages: [] },
+        options,
+      ))
+        rawEvents.push(event)
+      expect(JSON.stringify(rawEvents)).toContain(message)
+      const runtime = new PiOpenAIRuntime({
+        vault,
+        paths: () => ({
+          configPath: join(dir, 'pool.json'),
+          statePath: join(dir, 'pool-state.json'),
+        }),
+        createStream: createAssistantMessageEventStream,
+        fetchImpl: fakeFetch,
+        streamSimple,
+      })
+      const events = []
+      for await (const event of runtime.stream(
+        localModel,
+        { messages: [] },
+        options,
+      ))
+        events.push(event)
+      expect(sends).toBe(2)
+      expect(events.some((event) => event.type === 'error')).toBe(true)
+      expect(JSON.stringify(events)).toContain(
+        'Stream refused key [credential]; [credential]',
+      )
+      expect(JSON.stringify(events)).not.toContain(token)
+      expect(JSON.stringify(events)).not.toContain(jwt)
+    } finally {
+      await server.stop(true)
+    }
+  })
+}
+
 for (const operation of [
   'initialize',
   'recordIdentity',

@@ -2553,7 +2553,7 @@ expect_red = ['^Pi\sdeferred\srecordQuota\srefuses\spersistence\swhen\senrollmen
 
 [[control]]
 id = "pi-transport-error-bearer-redaction"
-guards = "a real provider HTTP error that echoes its JWT bearer cannot expose it in a forwarded Pi error event"
+guards = "provider error events on transports without an HTTP response wrapper cannot expose an opaque attempt credential to Pi"
 file = "packages/pi/src/runtime.ts"
 old = """                  errorMessage: redactCredentialText(
                     event.error.errorMessage ?? '',
@@ -2564,7 +2564,7 @@ test_file = "packages/pi/src/tests/request-isolation.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/request-isolation.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^Pi\srequest\serror\sdoes\snot\sexpose\sthe\sbearer\sechoed\sby\sthe\stransport$']
+expect_red = ['^Pi\slate-event\serror\smasks\severy\soccurrence\sof\san\sopaque\sattempt\scredential$']
 
 [[control]]
 id = "codex-sse-delta-no-json-parse"
@@ -2625,3 +2625,74 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^failed\sHTTP\sJSON\sbodies\sredact\sdecoded\scredential\sJWT\sand\sBearer\svalues\swithout\schanging\sclassification$', '^SSE\serror\sframes\sredact\sdecoded\scredential\sJWT\sand\sBearer\svalues\swithout\schanging\sclassification$']
+
+# Streaming error redaction follows the caller's SSE contract, not provider headers.
+[[control]]
+id = "credential-sse-missing-content-type"
+guards = "a missing provider content-type cannot bypass caller-declared SSE error redaction"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  if (!response.body || mode === 'http') return response"
+new = "  if (!response.body || mode === 'http' || !response.headers.has('content-type')) return response // NON-VACUITY BREAK: trust missing provider metadata."
+test_file = "packages/core/src/tests/credential-redaction.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^explicit\sSSE\smode\sscrubs\scredentials\swith\smissing\scontent-type$']
+
+[[control]]
+id = "credential-sse-plain-content-type"
+guards = "a text/plain provider content-type cannot bypass caller-declared SSE error redaction"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  if (!response.body || mode === 'http') return response"
+new = "  if (!response.body || mode === 'http' || response.headers.get('content-type') === 'text/plain') return response // NON-VACUITY BREAK: trust mislabelled provider metadata."
+test_file = "packages/core/src/tests/credential-redaction.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^explicit\sSSE\smode\sscrubs\scredentials\swith\stext/plain\scontent-type$']
+
+[[control]]
+id = "opencode1-caller-sse-mode"
+guards = "OpenCode1 declares SSE mode for model sends even without provider content-type"
+file = "packages/opencode/src/index.ts"
+old = """              response,
+              accessToken,
+              'event-stream',"""
+new = """              response,
+              accessToken,
+              'http', // NON-VACUITY BREAK: omit the model stream contract."""
+test_file = "packages/opencode/src/tests/opencode1-authority.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode1-authority.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode1\sstreaming\ssends\sscrub\serrors\swith\smissing\scontent-type$']
+
+[[control]]
+id = "opencode2-caller-sse-mode"
+guards = "OpenCode2 declares SSE mode before the native driver parses model errors"
+file = "packages/opencode/src/v2/setup.ts"
+old = """          input.request.headers.get('authorization')?.replace(/^Bearer /, ''),
+          'event-stream',"""
+new = """          input.request.headers.get('authorization')?.replace(/^Bearer /, ''),
+          'http', // NON-VACUITY BREAK: omit the native model stream contract."""
+test_file = "packages/opencode/src/tests/opencode2-wire.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-wire.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^through\sthe\sOpenCode\s2\sentry\sscrubs\sstreaming\serrors\swith\smissing\scontent-type\sthrough\sthe\sresponse\shook$']
+
+[[control]]
+id = "pi-caller-sse-mode"
+guards = "Pi scrubs raw SSE errors before pi-ai copies echoed credentials into shared partial messages"
+file = "packages/pi/src/runtime.ts"
+old = """              await send(input, init),
+              token,
+              'event-stream',"""
+new = """              await send(input, init),
+              token,
+              'http', // NON-VACUITY BREAK: omit the Pi model stream contract."""
+test_file = "packages/pi/src/tests/request-isolation.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/request-isolation.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sruntime\sparses\sand\sscrubs\sSSE\serrors\swith\smissing\scontent-type$']

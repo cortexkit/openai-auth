@@ -221,7 +221,10 @@ interface ScenarioResult {
   readonly diagnostics: string
 }
 
-async function runScenario(vaultActivation = false): Promise<ScenarioResult> {
+async function runScenario(
+  vaultActivation = false,
+  reject?: 'stream-error-missing-type' | 'stream-error-plain-type',
+): Promise<ScenarioResult> {
   const root = mkdtempSync(join(tmpdir(), 'oai-oc1-e2e-'))
   const project = join(root, 'project')
   mkdirSync(project, { recursive: true })
@@ -361,6 +364,7 @@ async function runScenario(vaultActivation = false): Promise<ScenarioResult> {
       server,
     )
     wireBeforeRun = [...mock.records]
+    if (reject) mock.reject('V', reject)
     const child = Bun.spawn(
       [
         binary,
@@ -461,6 +465,24 @@ function verify(result: ScenarioResult, assertions: () => void) {
 }
 
 describe.skipIf(!ENABLED)('openai-auth on OpenCode 1 (real host)', () => {
+  for (const mode of [
+    'stream-error-missing-type',
+    'stream-error-plain-type',
+  ] as const) {
+    test(`parses ${mode} as a streamed provider error`, async () => {
+      const result = await runScenario(false, mode)
+      verify(result, () => {
+        expect(result.wire.some((record) => record.rejected === mode)).toBe(
+          true,
+        )
+        expect(result.runStdout).toContain('Stream refused key')
+        expect(result.runStdout).toContain(
+          'Stream refused key [credential]; [credential]',
+        )
+        expect(result.runStdout).not.toContain(ACCOUNT.token)
+      })
+    }, 180_000)
+  }
   beforeAll(() => {
     if (!existsSync(BUILT_PLUGIN))
       throw new Error(`no plugin build at ${BUILT_PLUGIN}; run bun run build`)

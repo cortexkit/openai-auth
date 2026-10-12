@@ -11,6 +11,61 @@ const echoedCredentials = [
   'eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0.signature',
 ]
 
+for (const contentType of [undefined, 'text/plain']) {
+  test(`explicit SSE mode scrubs credentials with ${contentType ?? 'missing'} content-type`, async () => {
+    const token = echoedCredentials[0]!
+    const jwt = echoedCredentials[1]!
+    const bytes = new TextEncoder().encode(
+      `data: ${JSON.stringify({ type: 'error', code: 'invalid_api_key', message: `Stream refused key ${token}; ${jwt}` })}\r\n\r\n`,
+    )
+    const response = await redactCredentialResponse(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            for (let index = 0; index < bytes.length; index += 7)
+              controller.enqueue(bytes.slice(index, index + 7))
+            controller.close()
+          },
+        }),
+        {
+          headers: contentType
+            ? {
+                'content-type': contentType,
+                'content-length': String(bytes.length),
+              }
+            : { 'content-length': String(bytes.length) },
+        },
+      ),
+      token,
+      'event-stream',
+    )
+    expect(await response.text()).toBe(
+      'data: {"type":"error","code":"invalid_api_key","message":"Stream refused key [credential]; [credential]"}\r\n\r\n',
+    )
+    expect(response.status).toBe(200)
+    expect(response.headers.get('content-type')).toBe(contentType ?? null)
+    expect(response.headers.has('content-length')).toBe(false)
+  })
+}
+
+test('HTTP mode leaves successful bodies untouched regardless of content-type', async () => {
+  for (const contentType of [undefined, 'text/plain', 'text/event-stream']) {
+    const source = new Response(new ReadableStream<Uint8Array>(), {
+      headers: contentType ? { 'content-type': contentType } : {},
+    })
+    expect(await redactCredentialResponse(source, 'opaque-secret')).toBe(source)
+    expect(
+      await redactCredentialResponse(source, 'opaque-secret', 'http'),
+    ).toBe(source)
+    expect(source.body!.locked).toBe(false)
+    await source.body!.cancel()
+  }
+  const empty = new Response(null)
+  expect(
+    await redactCredentialResponse(empty, 'opaque-secret', 'event-stream'),
+  ).toBe(empty)
+})
+
 function escapedJsonValue(value: string): string {
   return value
     .split('')
@@ -67,6 +122,7 @@ test('SSE error frames redact decoded credential JWT and Bearer values without c
         { headers: { 'content-type': 'text/event-stream' } },
       ),
       token,
+      'event-stream',
     )
     expect(JSON.parse((await response.text()).slice(6).trim())).toEqual({
       type: 'response.failed',
@@ -126,7 +182,11 @@ test('SSE cancellation rejection redacts credentials without changing the reason
       }),
       { headers: { 'content-type': 'text/event-stream' } },
     )
-    const response = await redactCredentialResponse(source, token)
+    const response = await redactCredentialResponse(
+      source,
+      token,
+      'event-stream',
+    )
     expect(source.body!.locked).toBe(true)
     await expect(response.body!.cancel(reason)).rejects.toThrow(
       'Cancel rejected [credential]; [credential]',
@@ -191,6 +251,7 @@ test('escaped JSON error keys redact exact credentials and JWTs through the SSE 
           { headers: { 'content-type': 'text/event-stream' } },
         ),
         token,
+        'event-stream',
       )
       const result = await response.text()
       expect(result).toContain('Rejected [credential]; [credential]')
@@ -240,6 +301,7 @@ test('streamed errors redact split bearer chunks without rewriting normal model 
   const response = await redactCredentialResponse(
     new Response(stream, { headers: { 'content-type': 'text/event-stream' } }),
     token,
+    'event-stream',
   )
   expect(await response.text()).toBe(
     normal + failed.replace(token, '[credential]'),
@@ -258,6 +320,7 @@ test('stream transport failures do not retain an opaque bearer in the host error
       { headers: { 'content-type': 'text/event-stream' } },
     ),
     token,
+    'event-stream',
   )
   await expect(response.text()).rejects.toThrow('transport [credential]')
 })
@@ -290,22 +353,27 @@ test('successful SSE output is byte-identical across arbitrary UTF-8 chunk bound
       'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"\\u4f60\\u597d \\ud83d\\ude42 opaque-secret"}\n\n' +
       `data: {"type":"response.output_text.delta","delta":"${escapedJsonValue('opaque-secret')}"}\n\n` +
       `data: {"type":"response.function_call_arguments.delta","delta":"${escapedJsonValue('{"error":"opaque-secret"}')}"}\n\n` +
+      `data: {"type":"response.output_text.delta","delta":"${echoedCredentials[1]}"}\n\n` +
       'event: response.completed\ndata:  {"type":"response.completed","response":{"status":"completed","error":null}}\n\n',
   )
-  const response = await redactCredentialResponse(
-    new Response(
-      new ReadableStream<Uint8Array>({
-        start(controller) {
-          for (let index = 0; index < source.byteLength; index += 7)
-            controller.enqueue(source.slice(index, index + 7))
-          controller.close()
-        },
-      }),
-      { headers: { 'content-type': 'text/event-stream' } },
-    ),
-    'opaque-secret',
-  )
-  expect(new Uint8Array(await response.arrayBuffer())).toEqual(source)
+  for (const contentType of [undefined, 'text/plain', 'text/event-stream']) {
+    const response = await redactCredentialResponse(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            for (let index = 0; index < source.byteLength; index += 7)
+              controller.enqueue(source.slice(index, index + 7))
+            controller.close()
+          },
+        }),
+        { headers: contentType ? { 'content-type': contentType } : {} },
+      ),
+      'opaque-secret',
+      'event-stream',
+    )
+    expect(response.headers.get('content-type')).toBe(contentType ?? null)
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(source)
+  }
 })
 
 test('a non-error frame containing the literal word error is unchanged', () => {

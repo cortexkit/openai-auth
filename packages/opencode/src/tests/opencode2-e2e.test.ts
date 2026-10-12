@@ -233,6 +233,7 @@ interface ScenarioResult {
   /** What the mock vault was told: one entry per 401 report. */
   readonly vaultReports: MockDaemon['reports']
   readonly stdout: string[]
+  readonly retries: unknown[]
   readonly exits: Array<number | null>
   readonly config: {
     accounts: Array<{ id: string; accountId?: string }>
@@ -275,6 +276,7 @@ async function runScenario(input: {
     ...isolated,
     // Read by the vault plugin entry, which sends its quota polls to the mock.
     OPENAI_AUTH_E2E_MOCK_URL: mock.url,
+    OPENAI_AUTH_E2E_RETRIES: join(root, 'retries.jsonl'),
   }
   const configDir = join(isolated.XDG_CONFIG_HOME, 'opencode')
   seedPool(configDir, input.accounts, input.mode)
@@ -466,6 +468,12 @@ async function runScenario(input: {
           .split('\n')
           .map((line) => JSON.parse(line) as string)
       : []
+  const retries = existsSync(env.OPENAI_AUTH_E2E_RETRIES!)
+    ? readFileSync(env.OPENAI_AUTH_E2E_RETRIES!, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+    : []
   const diagnostics = [
     `exported credential: ${exported}`,
     `destinations: ${JSON.stringify(destinations)}`,
@@ -473,6 +481,7 @@ async function runScenario(input: {
     `wire: ${JSON.stringify(mock.records)}`,
     `samples: ${JSON.stringify(mock.samples)}`,
     `stdout: ${JSON.stringify(stdout)}`,
+    `retries: ${JSON.stringify(retries)}`,
     ...clientLog,
     `--- plugin log (tail) ---\n${pluginLog.slice(-6000)}`,
     `--- host log (tail) ---\n${serverLog.join('').slice(-6000)}`,
@@ -484,6 +493,7 @@ async function runScenario(input: {
     samples: [...mock.samples],
     vaultReports: [...(daemon?.reports ?? [])],
     stdout,
+    retries,
     exits,
     config,
     state,
@@ -577,7 +587,18 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     mkdirSync(serverPlugin, { recursive: true })
     writeFileSync(
       join(serverPlugin, 'index.js'),
-      `export { default } from '${PACKAGE_NAME}/server'\n`,
+      [
+        `import plugin from '${PACKAGE_NAME}/server'`,
+        "import { appendFileSync } from 'node:fs'",
+        'export default { ...plugin, async setup(ctx) {',
+        '  const dispose = await plugin.setup(ctx)',
+        "  const retry = await ctx.session.hook('retry', (draft) => {",
+        '    appendFileSync(process.env.OPENAI_AUTH_E2E_RETRIES, JSON.stringify(draft.error) + "\\n")',
+        "  }, { providerID: 'openai' })",
+        '  return async () => { await retry.dispose(); await dispose?.() }',
+        '} }',
+        '',
+      ].join('\n'),
     )
     // Observe the destination chosen by the real driver before redirecting
     // Codex traffic to loopback. Platform traffic is recorded and refused.
@@ -819,6 +840,34 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       expect(result.stdout[0]).toContain('-B')
     })
   }, 180_000)
+
+  for (const mode of [
+    'stream-error-missing-type',
+    'stream-error-plain-type',
+  ] as const) {
+    test(`http: parses ${mode} as a streamed provider error`, async () => {
+      const result = await runScenario({
+        transport: 'http',
+        accounts: ['A'],
+        turns: [{ reject: { account: 'A', mode } }],
+      })
+      verify(result, () => {
+        expect(
+          primaries(result.wire).some((record) => record.rejected === mode),
+        ).toBe(true)
+        expect(JSON.stringify(result.retries)).toContain('Stream refused key')
+        expect(JSON.stringify(result.retries)).toContain(
+          'Stream refused key [credential]; [credential]',
+        )
+        expect(JSON.stringify(result.retries)).not.toContain(
+          MOCK_ACCOUNTS.A.token,
+        )
+        expect(JSON.stringify(result.retries)).not.toContain(
+          MOCK_ACCOUNTS.V.token,
+        )
+      })
+    }, 180_000)
+  }
 
   test('http: every request carries the Codex client identity', async () => {
     const result = await runScenario({

@@ -116,10 +116,11 @@ export function redactCredentialFrame(
   return frame
 }
 
-/** Scrub HTTP errors and streamed error events without buffering successful output. */
+/** Scrub HTTP errors and caller-declared SSE errors without buffering successful output. */
 export async function redactCredentialResponse(
   response: Response,
   credential?: string,
+  mode: 'event-stream' | 'http' = 'http',
 ): Promise<Response> {
   const init = {
     status: response.status,
@@ -145,11 +146,8 @@ export async function redactCredentialResponse(
     }
     return new Response(redactCredentialJsonText(body, value, credential), init)
   }
-  if (
-    !response.body ||
-    !response.headers.get('content-type')?.includes('text/event-stream')
-  )
-    return response
+  // Hosts parse model streams as SSE even when a provider omits or mislabels the header.
+  if (!response.body || mode === 'http') return response
   init.headers.delete('content-length')
   const reader = response.body.getReader()
   const decoder = new TextDecoder()

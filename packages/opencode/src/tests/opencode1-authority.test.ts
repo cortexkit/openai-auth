@@ -132,6 +132,40 @@ const auth = () => ({
   expires: Date.now() + 3600_000,
 })
 
+for (const contentType of [undefined, 'text/plain']) {
+  test(`OpenCode1 streaming sends scrub errors with ${contentType ?? 'missing'} content-type`, async () => {
+    const token = auth().access
+    const jwt = 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0.signature'
+    modelReply = () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode(
+                `data: {"type":"error","message":"Stream refused key ${token}; ${jwt}"}\n\n`,
+              ),
+            )
+            controller.close()
+          },
+        }),
+        { headers: contentType ? { 'content-type': contentType } : {} },
+      )
+    const loader = await plugin()
+    const loaded = (await loader(async () => auth(), {
+      id: 'openai',
+      models: {},
+    } as never)) as { fetch: typeof fetch }
+    const response = await loaded.fetch('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      body: JSON.stringify({ model: 'gpt-5.4', input: [], stream: true }),
+    })
+    expect(wire).toEqual([`Bearer ${token}`])
+    expect(await response.text()).toBe(
+      'data: {"type":"error","message":"Stream refused key [credential]; [credential]"}\n\n',
+    )
+  })
+}
+
 test('OpenCode1 enrollment during host auth lookup prevents a local model send', async () => {
   let armed = false
   const loader = await plugin()

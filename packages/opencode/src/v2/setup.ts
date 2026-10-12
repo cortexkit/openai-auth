@@ -269,6 +269,7 @@ async function installPoolHooks<Q, A>(
         return redactCredentialResponse(
           response,
           input.request.headers.get('authorization')?.replace(/^Bearer /, ''),
+          'event-stream',
         )
       },
     },

@@ -3481,6 +3481,7 @@ export async function CodexAuthPlugin(
                 return await redactCredentialResponse(
                   await websocketFetch(url, requestInit),
                   accessToken,
+                  'event-stream',
                 )
               } catch (error) {
                 throw redactCredentialError(error, accessToken)
@@ -3533,6 +3534,7 @@ export async function CodexAuthPlugin(
                   },
                 ),
                 accessToken,
+                'event-stream',
               )
             } catch (error) {
               release()
@@ -3546,6 +3548,7 @@ export async function CodexAuthPlugin(
               return await redactCredentialResponse(
                 await fetch(url, finalInit),
                 accessToken,
+                'event-stream',
               )
             } catch (error) {
               throw redactCredentialError(error, accessToken)
@@ -3586,7 +3589,11 @@ export async function CodexAuthPlugin(
               headers: finalInit.headers,
               status: response.status,
             })
-            return await redactCredentialResponse(response, accessToken)
+            return await redactCredentialResponse(
+              response,
+              accessToken,
+              'event-stream',
+            )
           } catch (error) {
             await dumpCodexRequest({
               sessionID,

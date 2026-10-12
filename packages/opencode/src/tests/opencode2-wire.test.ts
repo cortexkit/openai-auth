@@ -331,6 +331,41 @@ describe('through the OpenCode 2 entry', () => {
     model: { providerID: 'openai', id: 'gpt-6.1-sol' },
   })
 
+  for (const contentType of [undefined, 'text/plain']) {
+    it(`scrubs streaming errors with ${contentType ?? 'missing'} content-type through the response hook`, async () => {
+      const host = await start()
+      const draft = { ...draftScope(), request: httpBody('low', [user('one')]) }
+      draft.request.headers.set('authorization', `Bearer ${PLACEHOLDER}`)
+      await host.fire('http.request', draft)
+      const token = draft.request.headers
+        .get('authorization')!
+        .slice('Bearer '.length)
+      expect(token).toBe('main-token')
+      const jwt = 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0.signature'
+      const received = {
+        ...draftScope(),
+        request: draft.request,
+        response: new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                new TextEncoder().encode(
+                  `data: {"type":"error","message":"Stream refused key ${token}; ${jwt}"}\n\n`,
+                ),
+              )
+              controller.close()
+            },
+          }),
+          { headers: contentType ? { 'content-type': contentType } : {} },
+        ),
+      }
+      await host.fire('http.response', received)
+      expect(await received.response.text()).toBe(
+        'data: {"type":"error","message":"Stream refused key [credential]; [credential]"}\n\n',
+      )
+    })
+  }
+
   it('sends the Codex client identity with the credential, the same on every request', async () => {
     expect(CODEX_CLIENT_HEADERS).toEqual({
       version: CODEX_VERSION,

@@ -21,7 +21,11 @@ export type MockAccount = keyof typeof MOCK_ACCOUNTS
 export type Identity = MockAccount | 'none'
 
 /** How the next agent-loop request of an account is refused. */
-export type RejectMode = 'usage-limit' | 'unauthorized'
+export type RejectMode =
+  | 'usage-limit'
+  | 'unauthorized'
+  | 'stream-error-missing-type'
+  | 'stream-error-plain-type'
 
 export interface WireRecord {
   readonly transport: 'http' | 'ws'
@@ -313,6 +317,36 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
             },
           },
           { status: 401 },
+        )
+      }
+      if (rejected?.startsWith('stream-error-')) {
+        const token = request.headers
+          .get('authorization')
+          ?.replace(/^Bearer /, '')
+        const bytes = new TextEncoder().encode(
+          toSSE([
+            {
+              type: 'error',
+              sequence_number: 0,
+              code: 'invalid_api_key',
+              message: `Stream refused key ${token}; ${MOCK_ACCOUNTS.V.token}`,
+            },
+          ]),
+        )
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (let index = 0; index < bytes.length; index += 7)
+                controller.enqueue(bytes.slice(index, index + 7))
+              controller.close()
+            },
+          }),
+          {
+            headers:
+              rejected === 'stream-error-plain-type'
+                ? { 'content-type': 'text/plain' }
+                : {},
+          },
         )
       }
       return new Response(

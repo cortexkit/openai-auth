@@ -41,6 +41,7 @@ import {
   OpenAiVault,
   type RefreshAllQuotaResult,
   type RoutingMode,
+  redactCredentialResponse,
   redactCredentialText,
   VAULT_MODE_REFUSALS,
   VAULT_REQUEST_ROSTER_WAIT_MS,
@@ -765,9 +766,20 @@ export class PiOpenAIRuntime {
     let status: number | undefined
     let inner: AssistantMessageEventStream
     try {
+      const send = options?.fetch ?? globalThis.fetch
       inner = this.deps.streamSimple(model, context, {
         ...options,
         apiKey: token,
+        // Scrub before pi-ai parses errors into its shared partial message objects.
+        fetch: Object.assign(
+          async (input: RequestInfo | URL, init?: RequestInit) =>
+            redactCredentialResponse(
+              await send(input, init),
+              token,
+              'event-stream',
+            ),
+          send,
+        ),
         onResponse: async (response, responseModel) => {
           status = response.status
           this.recordHeaders(accountId, token, response.headers)

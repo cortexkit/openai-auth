@@ -92,7 +92,7 @@ async function consume(chunks: Uint8Array[], mode: Mode) {
   )
   const response =
     mode === 'wrapped'
-      ? await redactCredentialResponse(source, credential)
+      ? await redactCredentialResponse(source, credential, 'event-stream')
       : source
   if (!response.body) throw new Error('Missing benchmark response body')
   const reader = response.body.getReader()
