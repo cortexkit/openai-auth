@@ -16,6 +16,7 @@ import {
   type OAuthAccount,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
+import { APICallError } from 'ai'
 import { getConfigPath } from '../config.ts'
 import { getAccountPaths } from '../core/account-paths'
 import { QUOTA_STALENESS_MS } from '../core/sticky-routing.ts'
@@ -33,7 +34,6 @@ import {
 } from '../index.ts'
 import { flushForTest, setLogLevel } from '../logger.ts'
 import { resetModelCostsForTest } from '../model-costs.ts'
-import { ResponseStreamError } from '../response-stream-error'
 import {
   drainSidebarWrites,
   getSidebarStateFile,
@@ -1836,7 +1836,12 @@ describe('integration: killswitch enforcement', () => {
           } catch (err) {
             firstError = err
           }
-          expect(firstError).toBeInstanceOf(ResponseStreamError)
+          expect(APICallError.isInstance(firstError)).toBe(true)
+          expect(firstError).toMatchObject({
+            name: 'ProviderResponseStreamError',
+            isRetryable: true,
+          })
+          expect(Object.getPrototypeOf(firstError)).toBe(Error.prototype)
           expect((firstError as { isRetryable?: boolean }).isRetryable).toBe(
             true,
           )
@@ -2090,7 +2095,10 @@ describe('integration: killswitch enforcement', () => {
             wsRequest,
           )
           expect(first.status).toBe(200)
-          await expect(first.text()).rejects.toBeInstanceOf(ResponseStreamError)
+          await expect(first.text()).rejects.toMatchObject({
+            name: 'ProviderResponseStreamError',
+            isRetryable: true,
+          })
 
           // Request 2: the fallback is now marked rate-limited from request
           // 1's in-band signal, so usableFallbackCandidates excludes it and
@@ -2216,7 +2224,10 @@ describe('integration: killswitch enforcement', () => {
             wsRequest,
           )
           expect(first.status).toBe(200)
-          await expect(first.text()).rejects.toBeInstanceOf(ResponseStreamError)
+          await expect(first.text()).rejects.toMatchObject({
+            name: 'ProviderResponseStreamError',
+            isRetryable: true,
+          })
 
           // Request 2: main is marked rate-limited from request 1's in-band
           // signal. The killswitch itself is enabled but fails open on
@@ -2319,7 +2330,10 @@ describe('integration: killswitch enforcement', () => {
             wsRequest,
           )
           expect(first.status).toBe(200)
-          await expect(first.text()).rejects.toBeInstanceOf(ResponseStreamError)
+          await expect(first.text()).rejects.toMatchObject({
+            name: 'ProviderResponseStreamError',
+            isRetryable: true,
+          })
 
           // Request 2: main is marked rate-limited and there is no fallback
           // to reroute to, so this hits the hard-block path.
@@ -6716,8 +6730,8 @@ describe('integration: active fallback routing', () => {
       } catch (error) {
         caught = error
       }
-      expect(caught).toBeInstanceOf(DOMException)
-      expect((caught as DOMException).name).toBe('AbortError')
+      expect(caught).toBeInstanceOf(Error)
+      expect((caught as Error).name).toBe('AbortError')
       expect(seenAuth).toEqual(['Bearer fallback-access-token'])
     } finally {
       await scope.settlePluginWork()
@@ -7312,8 +7326,8 @@ describe('integration: active fallback routing', () => {
       } catch (error) {
         caught = error
       }
-      expect(caught).toBeInstanceOf(DOMException)
-      expect((caught as DOMException).name).toBe('AbortError')
+      expect(caught).toBeInstanceOf(Error)
+      expect((caught as Error).name).toBe('AbortError')
     } finally {
       await scope.settlePluginWork()
       globalThis.fetch = originalFetch

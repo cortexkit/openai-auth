@@ -18,7 +18,7 @@ import { fallbackRefreshLockName } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
 import { POOL_QUOTA_UNKNOWN_RETRY_SECONDS } from '../core/pool-routing.ts'
 import { CodexAuthPlugin } from '../index.ts'
-import { ResponseStreamError } from '../response-stream-error.ts'
+
 import {
   drainSidebarWrites,
   hashSidebarSessionId,
@@ -1322,7 +1322,10 @@ describe('a mid-stream rate limit on a migrated install', () => {
         }
         const first = await fetchOverride(URL_RESPONSES, wsRequest)
         expect(first.status).toBe(200)
-        await expect(first.text()).rejects.toBeInstanceOf(ResponseStreamError)
+        await expect(first.text()).rejects.toMatchObject({
+          name: 'ProviderResponseStreamError',
+          isRetryable: true,
+        })
 
         const second = await fetchOverride(URL_RESPONSES, wsRequest)
         expect(second.status).toBe(200)

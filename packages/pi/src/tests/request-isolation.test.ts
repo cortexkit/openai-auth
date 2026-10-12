@@ -212,6 +212,7 @@ for (const contentType of [undefined, 'text/plain']) {
       { preconnect() {} },
     ) as typeof fetch
     const localModel = { ...model, baseUrl: server.url.toString() }
+    let beforeParsing: string | undefined
     const options = {
       apiKey: token,
       fetch: fakeFetch,
@@ -226,6 +227,7 @@ for (const contentType of [undefined, 'text/plain']) {
       ))
         rawEvents.push(event)
       expect(JSON.stringify(rawEvents)).toContain(message)
+      beforeParsing = undefined
       const runtime = new PiOpenAIRuntime({
         vault,
         paths: () => ({
@@ -234,7 +236,20 @@ for (const contentType of [undefined, 'text/plain']) {
         }),
         createStream: createAssistantMessageEventStream,
         fetchImpl: fakeFetch,
-        streamSimple,
+        streamSimple: (model, context, supplied) => {
+          const send = supplied?.fetch ?? fakeFetch
+          return streamSimple(model, context, {
+            ...supplied,
+            fetch: Object.assign(
+              async (input: RequestInfo | URL, init?: RequestInit) => {
+                const response = await send(input, init)
+                beforeParsing = await response.clone().text()
+                return response
+              },
+              send,
+            ),
+          })
+        },
       })
       const events = []
       for await (const event of runtime.stream(
@@ -244,6 +259,9 @@ for (const contentType of [undefined, 'text/plain']) {
       ))
         events.push(event)
       expect(sends).toBe(2)
+      expect(beforeParsing).toBeDefined()
+      expect(beforeParsing).not.toContain(token)
+      expect(beforeParsing).not.toContain(jwt)
       expect(events.some((event) => event.type === 'error')).toBe(true)
       expect(JSON.stringify(events)).toContain(
         'Stream refused key [credential]; [credential]',
@@ -447,3 +465,146 @@ for (const stage of ['synchronous', 'late-event'] as const) {
     expect(output).not.toContain('other-key')
   })
 }
+
+test('Pi fetch rejection is scrubbed without a start event', async () => {
+  const token = chatgptAccessToken('fetch-failure')
+  const fakeFetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      if (String(input).includes('/wham/usage'))
+        return Response.json({
+          rate_limit: {
+            primary_window: {
+              used_percent: 10,
+              limit_window_seconds: 18000,
+              reset_at: Math.floor(Date.now() / 1000) + 7200,
+            },
+          },
+        })
+      throw new Error(`Transport refused ${token}`)
+    },
+    { preconnect() {} },
+  ) as typeof fetch
+  const runtime = new PiOpenAIRuntime({
+    vault,
+    paths: () => ({
+      configPath: join(dir, 'pool.json'),
+      statePath: join(dir, 'pool-state.json'),
+    }),
+    createStream: createAssistantMessageEventStream,
+    fetchImpl: fakeFetch,
+    streamSimple,
+  })
+  const events = []
+  for await (const event of runtime.stream(
+    model,
+    { messages: [] },
+    { apiKey: token, fetch: fakeFetch, transport: 'sse' },
+  ))
+    events.push(event)
+  expect(events.some((event) => event.type === 'start')).toBe(false)
+  expect(events.some((event) => event.type === 'error')).toBe(true)
+  expect(JSON.stringify(events)).not.toContain(token)
+  expect(JSON.stringify(events)).toContain('Transport refused [credential]')
+})
+
+test('Pi late transport errors scrub the shared partial retained by start events', async () => {
+  const token = 'opaque-shared-partial-secret'
+  const runtime = new PiOpenAIRuntime({
+    vault,
+    paths: () => ({
+      configPath: join(dir, 'pool.json'),
+      statePath: join(dir, 'pool-state.json'),
+    }),
+    createStream: createAssistantMessageEventStream,
+    fetchImpl: Object.assign(
+      async () =>
+        Response.json({
+          rate_limit: {
+            primary_window: {
+              used_percent: 10,
+              limit_window_seconds: 18000,
+              reset_at: Math.floor(Date.now() / 1000) + 7200,
+            },
+          },
+        }),
+      { preconnect() {} },
+    ) as typeof fetch,
+    streamSimple: () => {
+      const stream = createAssistantMessageEventStream()
+      const failed = errorEvent(model, '')
+      if (failed.type !== 'error') throw new Error('Expected assistant error')
+      stream.push({ type: 'start', partial: failed.error })
+      queueMicrotask(() => {
+        failed.error.errorMessage = `Late transport ${token}`
+        stream.push(failed)
+        stream.end()
+      })
+      return stream
+    },
+  })
+  const events = []
+  for await (const event of runtime.stream(
+    model,
+    { messages: [] },
+    { apiKey: token },
+  ))
+    events.push(event)
+  expect(events.some((event) => event.type === 'start')).toBe(true)
+  expect(events.some((event) => event.type === 'error')).toBe(true)
+  expect(JSON.stringify(events)).not.toContain(token)
+  expect(JSON.stringify(events)).toContain('Late transport [credential]')
+})
+
+test('Pi fetch throws are owned before pi-ai reads diagnostic getters', async () => {
+  const token = chatgptAccessToken('fetch-proxy')
+  let traps = 0
+  let sends = 0
+  const diagnostic = new Proxy(new Error(`Refused ${token}`), {
+    getPrototypeOf() {
+      traps++
+      return Error.prototype
+    },
+    get(target, key) {
+      traps++
+      return Reflect.get(target, key)
+    },
+  })
+  const fakeFetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      if (String(input).includes('/wham/usage'))
+        return Response.json({
+          rate_limit: {
+            primary_window: {
+              used_percent: 10,
+              limit_window_seconds: 18000,
+              reset_at: Math.floor(Date.now() / 1000) + 7200,
+            },
+          },
+        })
+      sends++
+      throw diagnostic
+    },
+    { preconnect() {} },
+  ) as typeof fetch
+  const runtime = new PiOpenAIRuntime({
+    vault,
+    paths: () => ({
+      configPath: join(dir, 'pool.json'),
+      statePath: join(dir, 'pool-state.json'),
+    }),
+    createStream: createAssistantMessageEventStream,
+    fetchImpl: fakeFetch,
+    streamSimple,
+  })
+  const events = []
+  for await (const event of runtime.stream(
+    model,
+    { messages: [] },
+    { apiKey: token, fetch: fakeFetch, transport: 'sse' },
+  ))
+    events.push(event)
+  expect(sends).toBeGreaterThan(0)
+  expect(events.some((event) => event.type === 'error')).toBe(true)
+  expect(traps).toBe(0)
+  expect(JSON.stringify(events)).not.toContain(token)
+})

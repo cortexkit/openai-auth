@@ -2555,11 +2555,11 @@ expect_red = ['^Pi\sdeferred\srecordQuota\srefuses\spersistence\swhen\senrollmen
 id = "pi-transport-error-bearer-redaction"
 guards = "provider error events on transports without an HTTP response wrapper cannot expose an opaque attempt credential to Pi"
 file = "packages/pi/src/runtime.ts"
-old = """                  errorMessage: redactCredentialText(
-                    event.error.errorMessage ?? '',
-                    token,
-                  ),"""
-new = "                  errorMessage: event.error.errorMessage, // NON-VACUITY BREAK: forward the provider's echoed bearer."
+old = """            event.error.errorMessage = redactCredentialText(
+              event.error.errorMessage ?? '',
+              token,
+            )"""
+new = """            void event.error.errorMessage // NON-VACUITY BREAK: forward the provider's echoed bearer."""
 test_file = "packages/pi/src/tests/request-isolation.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/request-isolation.test.ts", "-t", "{test}"]
@@ -2618,8 +2618,8 @@ expect_red = ['^escaped\sJSON\serror\skeys\sredact\sexact\scredentials\sand\sJWT
 id = "credential-decoded-json-value-redaction"
 guards = "Unicode-escaped credentials in HTTP and SSE error string values cannot reappear after JSON decoding"
 file = "packages/core/src/util/credential-redaction.ts"
-old = "  return changed ? JSON.stringify(redacted) : text"
-new = "  return redactCredentialText(text, credential) // NON-VACUITY BREAK: match only the encoded JSON text."
+old = "      if (hex) return String.fromCharCode(Number.parseInt(hex, 16))"
+new = "      if (hex) return sequence // NON-VACUITY BREAK: leave Unicode credentials encoded."
 test_file = "packages/core/src/tests/credential-redaction.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
@@ -2631,8 +2631,8 @@ expect_red = ['^failed\sHTTP\sJSON\sbodies\sredact\sdecoded\scredential\sJWT\san
 id = "credential-sse-missing-content-type"
 guards = "a missing provider content-type cannot bypass caller-declared SSE error redaction"
 file = "packages/core/src/util/credential-redaction.ts"
-old = "  if (!response.body || mode === 'http') return response"
-new = "  if (!response.body || mode === 'http' || !response.headers.has('content-type')) return response // NON-VACUITY BREAK: trust missing provider metadata."
+old = "    if (!bodyStream || mode === 'http') return response"
+new = "    if (!bodyStream || mode === 'http' || !headers.has('content-type')) return response // NON-VACUITY BREAK: trust missing provider metadata."
 test_file = "packages/core/src/tests/credential-redaction.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
@@ -2643,8 +2643,8 @@ expect_red = ['^explicit\sSSE\smode\sscrubs\scredentials\swith\smissing\scontent
 id = "credential-sse-plain-content-type"
 guards = "a text/plain provider content-type cannot bypass caller-declared SSE error redaction"
 file = "packages/core/src/util/credential-redaction.ts"
-old = "  if (!response.body || mode === 'http') return response"
-new = "  if (!response.body || mode === 'http' || response.headers.get('content-type') === 'text/plain') return response // NON-VACUITY BREAK: trust mislabelled provider metadata."
+old = "    if (!bodyStream || mode === 'http') return response"
+new = "    if (!bodyStream || mode === 'http' || headers.get('content-type') === 'text/plain') return response // NON-VACUITY BREAK: trust mislabelled provider metadata."
 test_file = "packages/core/src/tests/credential-redaction.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/core", "./src/tests/credential-redaction.test.ts", "-t", "{test}"]
@@ -2685,14 +2685,328 @@ expect_red = ['^through\sthe\sOpenCode\s2\sentry\sscrubs\sstreaming\serrors\swit
 id = "pi-caller-sse-mode"
 guards = "Pi scrubs raw SSE errors before pi-ai copies echoed credentials into shared partial messages"
 file = "packages/pi/src/runtime.ts"
-old = """              await send(input, init),
-              token,
-              'event-stream',"""
-new = """              await send(input, init),
-              token,
-              'http', // NON-VACUITY BREAK: omit the Pi model stream contract."""
+old = """                await send(input, init),
+                token,
+                'event-stream',"""
+new = """                await send(input, init),
+                token,
+                'http', // NON-VACUITY BREAK: omit the Pi model stream contract."""
 test_file = "packages/pi/src/tests/request-isolation.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/request-isolation.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^Pi\sruntime\sparses\sand\sscrubs\sSSE\serrors\swith\smissing\scontent-type$']
+
+# Credential diagnostics: lexical scans, safe object projection, and unchanged stream bytes.
+[[control]]
+id = "credential-audit-duplicate-keys"
+guards = "discarded duplicate JSON strings cannot leak from SSE error frames"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "    return redactCredentialJsonText(frame, credential)"
+new = "    return redactCredentialText(JSON.stringify(value), credential) === JSON.stringify(value) ? frame : redactCredentialJsonText(frame, credential) // NON-VACUITY BREAK: trust only surviving JSON values."
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit duplicate keys cannot conceal credentials in HTTP or SSE errors$']
+
+[[control]]
+id = "credential-audit-escaped-text"
+guards = "raw diagnostics have an independent escape-decoded credential scan"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  const decoded = decodeEscapes(raw)"
+new = "  const decoded = raw // NON-VACUITY BREAK: skip the decoded diagnostic scan."
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit raw and escape-decoded diagnostics are scanned independently$']
+
+[[control]]
+id = "credential-audit-header-names"
+guards = "diagnostic header names cannot carry the attempt credential"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "        if (redactCredentialText(name, credential?.toLowerCase()) !== name) {"
+new = "        if (false && redactCredentialText(name, credential?.toLowerCase()) !== name) { // NON-VACUITY BREAK: keep secret header names."
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit non-ok header names cannot contain credentials$']
+
+[[control]]
+id = "credential-audit-proxy-projection"
+guards = "proxies in thrown prototype chains cannot run traps during projection"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "    if (types.isProxy(prototype)) return false"
+new = "    if (false && types.isProxy(prototype)) return false // NON-VACUITY BREAK: inspect caller proxies."
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit proxied Error prototype does not execute traps$']
+
+[[control]]
+id = "credential-audit-leading-bom"
+guards = "BOM bytes in successful streams remain identical"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "        bom +\n        event"
+new = "        '' + // NON-VACUITY BREAK: omit the original leading BOM.\n        event"
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit BOM success bytes stay identical at start and inside stream under every header$']
+
+[[control]]
+id = "credential-audit-response-getters"
+guards = "Response subclass getters cannot execute at the credential boundary"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "    const status = responseStatus.call(response) as number"
+new = "    const status = response.status // NON-VACUITY BREAK: execute subclass status accessors."
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit Response subclasses and reused bodies do not run getters or leak$']
+
+[[control]]
+id = "credential-audit-http-read-rejection"
+guards = "a failed read of an eagerly consumed non-ok body cannot escape raw"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  } catch (error) {\n    throw redactCredentialError(error, credential)\n  }\n}"
+new = "  } catch (error) {\n    throw error // NON-VACUITY BREAK: expose the body-read rejection.\n  }\n}"
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit non-ok body read rejections are scrubbed$']
+
+[[control]]
+id = "credential-audit-pi-shared-partial"
+guards = "late provider errors cannot leak through earlier shared Pi partials"
+file = "packages/pi/src/runtime.ts"
+old = """          if (event.type === 'error') {
+            // pi-ai reuses this message in earlier start/delta events; a clone leaves those aliases raw.
+            event.error.errorMessage = redactCredentialText(
+              event.error.errorMessage ?? '',
+              token,
+            )
+          }
+          yield event"""
+new = "          yield event.type === 'error' ? { ...event, error: { ...event.error, errorMessage: redactCredentialText(event.error.errorMessage ?? '', token) } } : event // NON-VACUITY BREAK: leave the error text raw on earlier shared partials."
+test_file = "packages/pi/src/tests/request-isolation.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/pi/src/tests/request-isolation.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi late transport errors scrub the shared partial retained by start events$']
+
+[[control]]
+id = "credential-audit-sdk-retry-brand"
+guards = "owned Errors preserve AI SDK recognition and retry classification without prototypes"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "    if (ownData(error, key) === true)"
+new = "    if (false && ownData(error, key) === true) // NON-VACUITY BREAK: drop the SDK error brand."
+test_file = "packages/opencode/src/tests/credential-projection.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/opencode/src/tests/credential-projection.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^owned projection preserves SDK retry brands, retry-after, and usage-limit classification$']
+
+[[control]]
+id = "credential-audit-projected-abort"
+guards = "an owned AbortError stops reactive fallback instead of returning the primary error response"
+file = "packages/opencode/src/index.ts"
+old = """              if (
+                (error instanceof Error || error instanceof DOMException) &&
+                error.name === 'AbortError'
+              ) {
+                throw error
+              }
+              if ((init?.signal as AbortSignal | undefined | null)?.aborted) {
+                throw error
+              }
+              logA.debug('reactive fallback candidate threw; stopping', {"""
+new = """              if (
+                (error instanceof DOMException) && // NON-VACUITY BREAK: ignore projected native aborts.
+                error.name === 'AbortError'
+              ) {
+                throw error
+              }
+              if ((init?.signal as AbortSignal | undefined | null)?.aborted) {
+                throw error
+              }
+              logA.debug('reactive fallback candidate threw; stopping', {"""
+test_file = "packages/opencode/src/tests/integration.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/integration.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^integration: active fallback routing propagates caller aborts from reactive fallback attempts$']
+
+[[control]]
+id = "credential-audit-inherited-accessor"
+guards = "inherited error messages and names are never evaluated during projection"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  let name = ownData(error, 'name')"
+new = "  let name = safeObject(error) ? (error as { name?: unknown }).name : undefined // NON-VACUITY BREAK: read inherited caller accessors."
+test_file = "packages/core/src/tests/credential-redaction-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^audit inherited Error accessors and Symbol-keyed messages are not retained or executed$']
+
+[[control]]
+id = "credential-audit-wrapped-known-token"
+guards = "whitespace wrapping cannot leave a known credential suffix after Bearer prefix masking"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  const masked = maskKnownCredential(text, credential)"
+new = "  const masked = credential ? text.split(credential).join('[credential]') : text // NON-VACUITY BREAK: ignore wrapped known credentials."
+test_file = "packages/core/src/tests/credential-redaction-second-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-second-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^known credentials wrapped across whitespace are removed completely from error text$']
+
+[[control]]
+id = "credential-audit-numeric-lexemes"
+guards = "JSON numbers are never rounded or normalized when scrubbing an unrelated string"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "function redactCredentialJsonText(text: string, credential?: string): string {"
+new = "function redactCredentialJsonText(text: string, credential?: string): string {\n  text = JSON.stringify(JSON.parse(text)) // NON-VACUITY BREAK: normalize numeric source lexemes."
+test_file = "packages/core/src/tests/credential-redaction-second-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-second-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^JSON diagnostic rewrites preserve unrelated numeric literal spelling exactly$']
+
+[[control]]
+id = "credential-audit-numeric-secret"
+guards = "numeric-looking credentials cannot escape unquoted JSON diagnostic values"
+file = "packages/core/src/util/credential-redaction.ts"
+old = '''    /"(?:\\.|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null/g,'''
+new = '''    /"(?:\\.|[^"\\])*"/g, // NON-VACUITY BREAK: skip numeric credential literals.'''
+test_file = "packages/core/src/tests/credential-redaction-second-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-second-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^numeric-looking credentials become JSON strings without rounding other numbers$']
+
+[[control]]
+id = "credential-audit-request-id"
+guards = "the owned projection retains a scrubbed provider support request id"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  if (typeof requestId === 'string')"
+new = "  if (false && typeof requestId === 'string') // NON-VACUITY BREAK: discard the support request id."
+test_file = "packages/core/src/tests/credential-redaction-second-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-second-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^owned error projection preserves scrubbed provider request ids from headers and body$']
+
+[[control]]
+id = "credential-audit-host-body"
+guards = "the actual host parser still sees the provider's context overflow body"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  if (typeof body === 'string')"
+new = "  if (false && typeof body === 'string') // NON-VACUITY BREAK: drop the host classification body."
+test_file = "packages/opencode/src/tests/credential-host-policy.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/opencode/src/tests/credential-host-policy.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^real OpenCode 1 policy projection preserves context overflow code$']
+
+[[control]]
+id = "credential-audit-host-ms-header"
+guards = "the actual host delay retains retry-after-ms precedence over seconds"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "    for (const key of ['retry-after-ms', 'retry-after']) {"
+new = "    for (const key of ['retry-after']) { // NON-VACUITY BREAK: drop the millisecond retry hint."
+test_file = "packages/opencode/src/tests/credential-host-policy.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/opencode/src/tests/credential-host-policy.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^real OpenCode 1 policy projection preserves 429 millisecond header precedence$']
+
+[[control]]
+id = "credential-audit-host-header-presence"
+guards = "the actual host backoff distinguishes empty headers from absent headers"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  if (headers && typeof headers === 'object') {"
+new = "  if (headers && typeof headers === 'object' && Object.keys(headers).length) { // NON-VACUITY BREAK: lose empty header presence."
+test_file = "packages/opencode/src/tests/credential-host-policy.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/opencode/src/tests/credential-host-policy.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^real OpenCode 1 policy projection preserves 429 empty headers uncapped$']
+
+[[control]]
+id = "credential-audit-host-late-retry"
+guards = "a body retry marker past the size cap survives in compact classification data"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  const markers = retryBodyPatterns.flatMap(\n    (pattern) => pattern.exec(safe)?.[0] ?? [],\n  )"
+new = "  const markers: string[] = [] // NON-VACUITY BREAK: lose retry facts beyond the retained body cap."
+test_file = "packages/opencode/src/tests/credential-host-policy.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/opencode/src/tests/credential-host-policy.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^real OpenCode 1 policy projection preserves oversized late retry marker$']
+
+[[control]]
+id = "credential-audit-sse-scalars"
+guards = "rebuilt error frames cannot retain Boolean or null values equal to the known credential"
+file = "packages/core/src/util/credential-redaction.ts"
+old = '''    /"(?:\\.|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null/g,'''
+new = '''    /"(?:\\.|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/g, // NON-VACUITY BREAK: copy Boolean and null credential values.'''
+test_file = "packages/core/src/tests/credential-redaction-second-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-second-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^rebuilt SSE errors never retain credential-equal scalar retry metadata$']
+
+[[control]]
+id = "credential-audit-warm-response"
+guards = "vault warm response diagnostics are scrubbed before the shared manager retains them"
+file = "packages/opencode/src/core/cachekeep.ts"
+old = "          return await redactCredentialResponse(\n            response,\n            accessToken,\n            'event-stream',\n          )"
+new = "          return response // NON-VACUITY BREAK: expose the warm error body to manager logging."
+test_file = "packages/opencode/src/tests/cachekeep-credential.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/opencode/src/tests/cachekeep-credential.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^keep-warm vault http diagnostics scrub the exact warm credential before logging$']
+
+[[control]]
+id = "credential-audit-warm-throw"
+guards = "local warm transport errors are scrubbed with their resolved attempt token"
+file = "packages/opencode/src/core/cachekeep.ts"
+old = "          throw redactCredentialError(error, accessToken)"
+new = "          throw error // NON-VACUITY BREAK: expose warm fetch rejection diagnostics."
+test_file = "packages/opencode/src/tests/cachekeep-credential.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/opencode/src/tests/cachekeep-credential.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^keep-warm local throw diagnostics scrub the exact warm credential before logging$']
+
+[[control]]
+id = "credential-audit-numeric-alias"
+guards = "exponent and decimal scalar aliases of a numeric credential are masked without rounding ids"
+file = "packages/core/src/util/credential-redaction.ts"
+old = "  const numericCredential = credential ? canonicalNumber(credential) : undefined"
+new = "  const numericCredential = undefined // NON-VACUITY BREAK: ignore mathematically equal numeric spellings."
+test_file = "packages/core/src/tests/credential-redaction-second-audit.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/core/src/tests/credential-redaction-second-audit.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^numeric scalar aliases are scrubbed without rounding or masking unrelated numeric ids$']
+
+[[control]]
+id = "credential-audit-pi-fetch-owned"
+guards = "pi-ai never reads caller getters on an unprojected fetch rejection"
+file = "packages/pi/src/runtime.ts"
+old = "              throw redactCredentialError(error, token)"
+new = "              throw error // NON-VACUITY BREAK: allow pi-ai to inspect raw fetch exceptions."
+test_file = "packages/pi/src/tests/request-isolation.test.ts"
+runner = "command"
+command = ["bun", "test", "packages/pi/src/tests/request-isolation.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi fetch throws are owned before pi-ai reads diagnostic getters$']

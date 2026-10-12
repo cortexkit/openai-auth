@@ -325,7 +325,7 @@ test('stream transport failures do not retain an opaque bearer in the host error
   await expect(response.text()).rejects.toThrow('transport [credential]')
 })
 
-test('credential scrubbing preserves typed quota errors and native aborts', () => {
+test('credential scrubbing projects quota diagnostics and native abort names into owned Errors', () => {
   class QuotaError extends Error {
     resetAt = 123
     detail = { message: 'opaque-secret' }
@@ -334,14 +334,16 @@ test('credential scrubbing preserves typed quota errors and native aborts', () =
     new QuotaError('blocked opaque-secret'),
     'opaque-secret',
   )
-  expect(quota).toBeInstanceOf(QuotaError)
-  expect((quota as QuotaError).resetAt).toBe(123)
-  expect((quota as QuotaError).detail.message).toBe('[credential]')
+  expect(Object.getPrototypeOf(quota)).toBe(Error.prototype)
+  expect(quota).not.toBeInstanceOf(QuotaError)
+  expect(Object.hasOwn(quota, 'resetAt')).toBe(false)
+  expect(Object.hasOwn(quota, 'detail')).toBe(false)
+  expect(quota.message).toBe('blocked [credential]')
   const abort = redactCredentialError(
     new DOMException('opaque-secret', 'AbortError'),
     'opaque-secret',
   )
-  expect(abort).toBeInstanceOf(DOMException)
+  expect(Object.getPrototypeOf(abort)).toBe(Error.prototype)
   expect(abort.name).toBe('AbortError')
   expect(abort.message).toBe('[credential]')
 })

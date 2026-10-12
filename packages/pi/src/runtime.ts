@@ -41,6 +41,7 @@ import {
   OpenAiVault,
   type RefreshAllQuotaResult,
   type RoutingMode,
+  redactCredentialError,
   redactCredentialResponse,
   redactCredentialText,
   VAULT_MODE_REFUSALS,
@@ -641,10 +642,7 @@ export class PiOpenAIRuntime {
         outer.push(
           errorEvent(
             model,
-            redactCredentialText(
-              error instanceof Error ? error.message : String(error),
-              options?.apiKey,
-            ),
+            redactCredentialError(error, options?.apiKey).message,
           ),
         )
       } finally {
@@ -772,12 +770,18 @@ export class PiOpenAIRuntime {
         apiKey: token,
         // Scrub before pi-ai parses errors into its shared partial message objects.
         fetch: Object.assign(
-          async (input: RequestInfo | URL, init?: RequestInit) =>
-            redactCredentialResponse(
-              await send(input, init),
-              token,
-              'event-stream',
-            ),
+          async (input: RequestInfo | URL, init?: RequestInit) => {
+            try {
+              return await redactCredentialResponse(
+                await send(input, init),
+                token,
+                'event-stream',
+              )
+            } catch (error) {
+              // pi-ai can inspect a fetch rejection before emitting its shared partial error.
+              throw redactCredentialError(error, token)
+            }
+          },
           send,
         ),
         onResponse: async (response, responseModel) => {
@@ -788,40 +792,24 @@ export class PiOpenAIRuntime {
       })
     } catch (error) {
       return {
-        head: errorEvent(
-          model,
-          redactCredentialText(
-            error instanceof Error ? error.message : String(error),
-            token,
-          ),
-        ),
+        head: errorEvent(model, redactCredentialError(error, token).message),
         rest: undefined,
       }
     }
     const iterator = (async function* () {
       try {
         for await (const event of inner) {
-          yield event.type === 'error'
-            ? {
-                ...event,
-                error: {
-                  ...event.error,
-                  errorMessage: redactCredentialText(
-                    event.error.errorMessage ?? '',
-                    token,
-                  ),
-                },
-              }
-            : event
+          if (event.type === 'error') {
+            // pi-ai reuses this message in earlier start/delta events; a clone leaves those aliases raw.
+            event.error.errorMessage = redactCredentialText(
+              event.error.errorMessage ?? '',
+              token,
+            )
+          }
+          yield event
         }
       } catch (error) {
-        yield errorEvent(
-          model,
-          redactCredentialText(
-            error instanceof Error ? error.message : String(error),
-            token,
-          ),
-        )
+        yield errorEvent(model, redactCredentialError(error, token).message)
       }
     })()
     const first = await iterator.next()

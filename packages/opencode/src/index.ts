@@ -4386,7 +4386,7 @@ export async function CodexAuthPlugin(
               // stop routing: the failed send may already have generated or
               // billed, so trying another account could duplicate the request.
               if (
-                error instanceof DOMException &&
+                (error instanceof Error || error instanceof DOMException) &&
                 error.name === 'AbortError'
               ) {
                 throw error
@@ -4461,7 +4461,7 @@ export async function CodexAuthPlugin(
               )
             } catch (error) {
               if (
-                error instanceof DOMException &&
+                (error instanceof Error || error instanceof DOMException) &&
                 error.name === 'AbortError'
               ) {
                 throw error
@@ -4746,7 +4746,8 @@ export async function CodexAuthPlugin(
                   : quotaManager.peekFallbackForPolicy(id)?.quota,
               ),
             isAbort: (error) =>
-              (error instanceof DOMException && error.name === 'AbortError') ||
+              ((error instanceof Error || error instanceof DOMException) &&
+                error.name === 'AbortError') ||
               Boolean(
                 (init?.signal as AbortSignal | undefined | null)?.aborted,
               ),

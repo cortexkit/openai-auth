@@ -22,6 +22,8 @@ import {
   type AccountStorage,
   normalizeQuotaHeaders,
   type OpenAiVault,
+  redactCredentialError,
+  redactCredentialResponse,
 } from '@cortexkit/openai-auth-core/internal'
 import { sanitizeHttpFallbackInit } from '../codex-http'
 import {
@@ -400,15 +402,25 @@ export function createOpenAICacheKeepAdapter(
           hasChatGptAccountId: 'ChatGPT-Account-Id' in headers,
         })
 
-        return options.fetchImpl(
-          options.codexResponsesUrl,
-          sanitizeHttpFallbackInit({
-            method: 'POST',
-            headers,
-            body,
-            signal,
-          }),
-        )
+        try {
+          const response = await options.fetchImpl(
+            options.codexResponsesUrl,
+            sanitizeHttpFallbackInit({
+              method: 'POST',
+              headers,
+              body,
+              signal,
+            }),
+          )
+          // The shared manager reads and logs diagnostics after this attempt's token leaves scope.
+          return await redactCredentialResponse(
+            response,
+            accessToken,
+            'event-stream',
+          )
+        } catch (error) {
+          throw redactCredentialError(error, accessToken)
+        }
       }
 
       if (target.accountId && options.vault?.owns(target.accountId)) {
