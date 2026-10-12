@@ -1654,6 +1654,18 @@ test_count_pattern = "Ran {count} test"
 expect_red = ["^vault\\smode\\sthe\\ssidebar\\sfile\\sin\\svault\\smode\\slists\\sthe\\svault\\saccounts\\sand\\sno\\slocal\\srow,\\swith\\sthe\\sserving\\sone\\sactive$"]
 
 [[control]]
+id = "vault-sidebar-write-clears-local-main-state"
+guards = "a vault-mode sidebar snapshot replaces stale local main quota and identity instead of applying local quota freshness merging"
+file = "packages/opencode/src/sidebar-state.ts"
+old = "        const vaultMode = machineState.vaultAccounts !== undefined"
+new = "        const vaultMode = false // NON-VACUITY BREAK: merge persisted local account state into vault mode."
+test_file = "packages/opencode/src/tests/sidebar-state.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-state.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^vault\\smachine\\swrites\\sclear\\spersisted\\slocal\\smain\\sidentity\\sand\\squota$"]
+
+[[control]]
 id = "opencode2-vault-mode-routes-no-local-row"
 guards = "on OpenCode 2 in vault mode no pool row is a routing candidate, also one the vault does not hold"
 file = "packages/opencode/src/v2/adapter.ts"

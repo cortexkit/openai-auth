@@ -2813,6 +2813,45 @@ test('routing writers prune disabled and killed sticky assignments', async () =>
   )
 })
 
+test('vault machine writes clear persisted local main identity and quota', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-vault-machine-'))
+  const file = join(tempDir, 'sidebar-state.json')
+  const now = Date.now()
+  await setSidebarState(
+    make({
+      main: {
+        ...main(quota(25, now)),
+        mainAccountId: 'local-chatgpt-id',
+      },
+      fallbacks: [
+        fb({
+          id: 'local-fallback',
+          accountId: 'local-fallback-chatgpt-id',
+          quota: quota(30, now),
+        }),
+      ],
+    }),
+    file,
+  )
+
+  await setSidebarMachineState(
+    {
+      main: main(null),
+      fallbacks: [],
+      vaultAccounts: [],
+      route: 'main-first',
+      lastUpdated: now + 1,
+    },
+    file,
+  )
+  await drainSidebarWrites()
+
+  const written = normalizeSidebarState(JSON.parse(readFileSync(file, 'utf8')))
+  expect(written.main.quota).toBeNull()
+  expect(written.main.mainAccountId).toBeUndefined()
+  expect(written.fallbacks).toEqual([])
+})
+
 test('machine writes cannot clobber fresher main and fallback quota from disk', async () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'oai-sb-quota-fresh-'))
   const file = join(tempDir, 'sidebar-state.json')

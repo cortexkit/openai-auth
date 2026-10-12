@@ -1196,9 +1196,7 @@ export function setSidebarMachineState(
         const latestFallbacks = new Map(
           latest.fallbacks.map((account) => [account.id, account]),
         )
-        // A same-identity merge combines the freshest of each window across the
-        // two sides; a differing or unknown identity whole-picks the fresher
-        // snapshot so windows from two accounts are never combined.
+        const vaultMode = machineState.vaultAccounts !== undefined
         const mainSameIdentity = sameAccountIdentity(
           machineState.main.mainAccountId,
           latest.main.mainAccountId,
@@ -1215,41 +1213,47 @@ export function setSidebarMachineState(
         return {
           ...latest,
           ...machineState,
-          main: {
-            ...machineState.main,
-            quota: mergedMainQuota,
-            // On a whole-pick the identity follows the winning snapshot, so a
-            // reader never pairs one account's id with another account's quota
-            // (a re-login race would otherwise resurrect the stale-account bug).
-            // On a same-identity merge both sides already agree, so the incoming
-            // id is the shared one.
-            mainAccountId: mainSameIdentity
-              ? machineState.main.mainAccountId
-              : mergedMainQuota === latest.main.quota &&
-                  mergedMainQuota !== machineState.main.quota
-                ? latest.main.mainAccountId
-                : machineState.main.mainAccountId,
-          },
-          fallbacks: machineState.fallbacks.map((account) => {
-            const existing = latestFallbacks.get(account.id)
-            const fallbackSameIdentity = sameAccountIdentity(
-              account.accountId,
-              existing?.accountId,
-            )
-            const mergedQuota = fallbackSameIdentity
-              ? mergeQuotaByWindow(account.quota, existing?.quota ?? null)
-              : freshestQuota(account.quota, existing?.quota ?? null)
-            return {
-              ...account,
-              quota: mergedQuota,
-              accountId: fallbackSameIdentity
-                ? account.accountId
-                : mergedQuota === existing?.quota &&
-                    mergedQuota !== account.quota
-                  ? existing?.accountId
-                  : account.accountId,
-            }
-          }),
+          // Vault snapshots replace local account fields; local snapshots merge
+          // quota windows so concurrent refreshes do not discard fresher readings.
+          main: vaultMode
+            ? machineState.main
+            : {
+                ...machineState.main,
+                quota: mergedMainQuota,
+                // On a whole-pick the identity follows the winning snapshot, so a
+                // reader never pairs one account's id with another account's quota
+                // (a re-login race would otherwise resurrect the stale-account bug).
+                // On a same-identity merge both sides already agree, so the incoming
+                // id is the shared one.
+                mainAccountId: mainSameIdentity
+                  ? machineState.main.mainAccountId
+                  : mergedMainQuota === latest.main.quota &&
+                      mergedMainQuota !== machineState.main.quota
+                    ? latest.main.mainAccountId
+                    : machineState.main.mainAccountId,
+              },
+          fallbacks: vaultMode
+            ? machineState.fallbacks
+            : machineState.fallbacks.map((account) => {
+                const existing = latestFallbacks.get(account.id)
+                const fallbackSameIdentity = sameAccountIdentity(
+                  account.accountId,
+                  existing?.accountId,
+                )
+                const mergedQuota = fallbackSameIdentity
+                  ? mergeQuotaByWindow(account.quota, existing?.quota ?? null)
+                  : freshestQuota(account.quota, existing?.quota ?? null)
+                return {
+                  ...account,
+                  quota: mergedQuota,
+                  accountId: fallbackSameIdentity
+                    ? account.accountId
+                    : mergedQuota === existing?.quota &&
+                        mergedQuota !== account.quota
+                      ? existing?.accountId
+                      : account.accountId,
+                }
+              }),
           activeId: latest.activeId,
           activeRouting: latest.activeRouting,
           stickyAssignments,
