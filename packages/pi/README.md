@@ -13,7 +13,7 @@ Requires Pi 1.0.1 or newer.
 Install with Pi's package manager:
 
 ```bash
-pi install npm:@cortexkit/pi-openai-auth@1.0.0
+pi install npm:@cortexkit/pi-openai-auth@1.0.1
 ```
 
 For an unpinned install:
