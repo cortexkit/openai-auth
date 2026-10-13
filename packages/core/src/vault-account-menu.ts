@@ -87,29 +87,6 @@ export function vaultAccountName(row: VaultRosterRow): string {
   return row.email || row.label || row.routeId
 }
 
-/**
- * Why a local row is set aside (not used, refreshed or polled), or undefined
- * when it is not. In vault mode (the host is connected to the vault) every
- * local row is, whatever account it signs in as, since only the vault's
- * accounts serve; outside it none is. A row signing in as an account the
- * vault holds names the vault account that serves it.
- */
-export function setAsideDetail(
-  row: Pick<PoolRow, 'identity'>,
-  view: VaultMenuView,
-): string | undefined {
-  if (!isVaultMenuConnected(view)) return undefined
-  const owner =
-    row.identity === undefined
-      ? undefined
-      : view.status.accounts.find(
-          (account) => account.accountIdentity === row.identity,
-        )
-  return owner
-    ? `set aside (served by vault ${vaultAccountName(owner)})`
-    : SET_ASIDE
-}
-
 function datedQuotaLines(row: PoolRow, now: number): string[] {
   const projection = projectQuota(isQuotaMap(row.quota) ? row.quota : undefined)
   const parts = quotaTextParts(projection, { now })
@@ -117,8 +94,6 @@ function datedQuotaLines(row: PoolRow, now: number): string[] {
     (line) => `  ${line}`,
   )
 }
-
-const SET_ASIDE = 'set aside (this host uses only its vault accounts)'
 
 /** Shown in place of the local accounts while the host is in vault mode. */
 export const VAULT_MODE_LOCAL_NOTE =

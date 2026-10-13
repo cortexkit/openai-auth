@@ -30,7 +30,7 @@
 // OpenCode; this one has no migration bookkeeping and no legacy refresh locks,
 // because no Pi build before this one refreshed or routed pool accounts.
 
-import { readFileSync, statSync } from 'node:fs'
+import { statSync } from 'node:fs'
 import {
   mergeQuotaObservation,
   type QuotaObservation,
@@ -199,30 +199,6 @@ export function oauthAccess(row: PoolRow):
     access: credential.access ?? '',
     expires: credential.expires,
     refresh: credential.refresh,
-  }
-}
-
-/**
- * Whether the config at `configPath` is the pool's format already. A config
- * that does not exist counts: the store writes the pool format from scratch.
- */
-export function poolFormat(configPath: string): boolean {
-  let raw: string
-  try {
-    raw = readFileSync(configPath, 'utf8')
-  } catch {
-    return true
-  }
-  try {
-    const parsed: unknown = JSON.parse(raw)
-    return Boolean(
-      parsed &&
-        typeof parsed === 'object' &&
-        !Array.isArray(parsed) &&
-        'commonAuthPool' in parsed,
-    )
-  } catch {
-    return false
   }
 }
 
