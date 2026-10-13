@@ -124,9 +124,9 @@ core; net change includes their single shared implementation.
 | Package | Lines removed | Lines added | Net reduction |
 | --- | ---: | ---: | ---: |
 | Core | 39 | 417 | -378 (shared implementation and tests added) |
-| OpenCode | 649 | 282 | 367 |
+| OpenCode | 652 | 359 | 293 |
 | Pi | 258 | 36 | 222 |
-| Total | 946 | 735 | 211 |
+| Total | 949 | 812 | 137 |
 
 Excluding test files and `export-manifest.ts`, runtime-source net reduction is
 524 lines after the stability follow-up below. No packaging or dependency
@@ -354,7 +354,7 @@ exact names remain valid. The timeout control was run manually to verify that
 only the RPC test failed; it is not a permanent delay or a claim that a filtered
 CI run observes downstream tests.
 
-### Verification boundary and authorized stop
+### Earlier partial verification boundary
 
 Types passed for all three packages (TypeScript 7.0.2), lint passed for 257 files
 (Biome 2.5.15). Tests for pool shutdown, active-credential/vault fixtures and
@@ -386,8 +386,8 @@ repair to the shared-vault fixture. The review had agreed to stop at the next
 unrelated failure after fixing RPC teardown, rather than expanding this repair
 indefinitely. This delivery is
 a coherent source/teardown repair with captured evidence, **not** a claim that
-the complete suite is now stable. The remaining shared-vault timeout needs a
-separate investigation before claiming six clean full runs.
+the complete suite was stable at that point. The remaining shared-vault timeout
+was the subject of the subsequent diagnosis and final paired comparison below.
 
 ### External evidence hashes
 
@@ -426,3 +426,142 @@ same external archival step.
 | `repaired-final-02.log.gz` | `0309bb0e7fff1caf11a0e126fba848fe8dcbdc9fb0469709b9a03694536fa5d4` |
 | `post-rpc-full-runs.log.gz` | `b6f7db990aab66ebdf227e272f355f2267ce45a08bd85524b319731882f15757` |
 | `assertions.md` | `f3df1fb2a9a73517df2e28bb1fffff3d3a9eccefe977d62d9f3fd360b2d9d6ed` |
+
+## Final review: shared-vault readiness and paired result
+
+### What the remaining timeout was waiting on
+
+The earlier failure had no failed consumer-identity assertion: Bun ended the
+callback after five seconds while its async work was still pending. The captured
+block names `OpenCode 2 setups on different pool stores do not share a consumer`
+and includes the scope's owner report; the immediately preceding same-store
+test passed in 3,465.13 ms. The private evidence file
+`.evidence/shared-vault-prior-assertion.txt` records that preceding result, the
+scope error and the Bun timeout; it is staged locally for external archival
+rather than published in Git (SHA-256 below).
+
+Observational start/close/poll traces were added temporarily, then removed.
+Both an eight-test file run and a full-suite run reached the target case. They
+showed two distinct consumer objects created for the two pool stores, both live
+until normal cleanup, no calls from unknown earlier instances, and closing only
+after readiness completed. The evidence does **not** show the earlier
+post-disposal source-loading bug recurring here.
+
+Instead, `ready()` performed work rather than merely waiting: after observing
+one roster row, it called `pollStale(0)` on every consumer. Zero age treats even a
+fresh quota reading as stale. The case calls `ready()` after the first setup,
+after the second setup, and once more: **five forced quota passes**, in addition
+to the two startup freshness checks. These passes authorize, fetch usage and
+write/reload the shared roster, although the case's actual contract is consumer
+separation and exactly two discovery calls. In the full trace the second
+consumer's parallel forced passes took about 26.6 ms, compared with about
+1.2–1.5 ms for the first, consistent with the extra shared-file work.
+
+The original slow run did not contain stage timings, so its exact stalled await
+cannot be reconstructed. The reached traces and deterministic control establish
+the unnecessary readiness work and its removal; they do not prove that an old
+lease was closing during acquisition. Production consumer registry keys,
+reference counting, discovery and quota scheduling were left unchanged.
+
+`ready()` now observes one row **with quota in each consumer's live snapshot**.
+Startup owns the first quota pass. The helper does not trigger fresh quota
+writes on every readiness check. No existing consumer-isolation, list-count,
+connection-count or request assertion changed, and neither the Bun deadline nor
+`waitFor`'s deadline was raised.
+
+Two deterministic regressions protect both requirements: observing a warm
+consumer must start no new quota work, and a cold consumer must not be called
+ready before its live quota reading arrives:
+
+- Restoring a forced `pollStale(0)` after the observer made only
+  `one host vault per process > readiness of a warm consumer starts no extra quota pass`
+  fail: one pass became three after two checks. The other nine tests passed.
+- Removing the live-quota predicate made only
+  `one host vault per process > readiness waits for quota in the live consumer snapshot`
+  fail while its startup usage request was held behind a promise. The warm
+  no-extra-pass control passed. No sleep or elapsed-time expectation decides
+  this control.
+
+Both temporary changes deliberately violated those requirements and were marked
+`NON-VACUITY BREAK`, applied after staging the live file
+and confirming an empty diff, and restored with checkout/touch. The first diff
+had two inserted lines; the second had one insertion and one deletion. Both
+post-restore diffs were empty. The restored ten-test file passed, types passed
+for all three packages, lint checked 257 files, and all **229** mutation anchors
+and exact test names passed `ckdev-mutate check`.
+
+### Six final alternating pairs
+
+Base: `47a7fae77bca2a89e835be4c940ec584352c25c9`.
+Final code candidate: `407eb97cc61c91cdac2698408215eedbe5913205`.
+The candidate was immutable throughout this measurement; later report edits do
+not change its code. The sequence was base 1, candidate 1, base 2, candidate 2,
+base 3, candidate 3, base 4, candidate 4, base 5, candidate 5, base 6, candidate 6.
+Every run
+used `linux,8c`, Bun 1.4.2, and the same install/build/full-test command shown
+above. All twelve frozen installs and builds passed, including declarations and
+TUI generation. Package and lockfile contents were unchanged.
+
+| Pair | Base test passes / failures | Base time | Candidate test passes / failures | Candidate time |
+| --- | --- | --- | --- | --- |
+| 1 | 1529 / 0 | 97.61 s | 1535 / 0 | 92.49 s |
+| 2 | 1529 / 0 | 76.86 s | 1535 / 0 | 107.59 s |
+| 3 | 1529 / 0 | 94.58 s | 1535 / 0 | 76.83 s |
+| 4 | 1529 / 0 | 75.41 s | 1534 / 1 | 137.55 s |
+| 5 | 1529 / 0 | 83.81 s | 1535 / 0 | 71.46 s |
+| 6 | 1529 / 0 | 105.22 s | 1535 / 0 | 82.55 s |
+
+Base discovered 1,555 tests in 88 files; candidate discovered 1,561 tests in 89
+files. Each skipped the same 26 tests. The six extra candidate tests are the
+added shutdown/readiness regressions. The case that checks separate vault
+clients for different pool stores, and both new readiness controls, passed in
+every candidate run.
+
+**The final candidate is still worse by the agreed observed failure criterion:**
+base had zero failing runs out of six, candidate had one. In candidate run 4,
+`routing > a served 401 is reported with the exact record version, and the account goes cold`
+timed out at 5,010.86 ms under Bun's unchanged five-second limit. Its existing
+scope drained and named the callback; no later test failed. The preceding
+sticky-balanced routing test passed in 3,333.40 ms. This was not a shared-vault
+readiness or consumer-identity failure.
+
+The complete block is `final-review-assertion.txt`; the complete run is
+`final-review-candidate-04.log`. Neither was retried. No further source or test
+fix was added after the paired measurement. The outcome is reported as a failed
+merge/stability criterion, not explained away as noise or claimed to be a clean
+six-run proof. Investigation of that remaining routing timeout is outside this
+completed measurement.
+
+### New private evidence for archival
+
+New outputs are currently under ignored `.evidence/` in the worker checkout,
+not in Git. They are listed in `.evidence/SHA256SUMS.final-review`, SHA-256
+`7303e55e1f6c5e2aaf7daddcb9aeb3174c47318a69cab57c9f0cad2d8dcd6606`.
+The reviewer can copy those files to
+`~/.local/state/cortexkit/evidence/openai-auth/dead-code-stability-2026-10/`,
+preserving the earlier `SHA256SUMS` manifest. The new manifest has a distinct
+name to avoid overwriting it. Before archival, the same filenames can be read
+from the worker's `.evidence/` directory.
+
+| New evidence file | SHA-256 |
+| --- | --- |
+| `shared-vault-prior-assertion.txt` | `fc53a640490649a999e4b18cb7eb50e4222893e236d1a4f483b41cd8b4ddfe34` |
+| `shared-vault-alone-trace.log` | `3cacf1da34c330afe76d517aeda6bdd71dad57fc9fd0f8d6e7f0e7bfceb74e96` |
+| `shared-vault-full-trace.log` | `443b4c5e84033f4a801410bfa82800150c647fe0d61f2d55315bb70637407f95` |
+| `shared-vault-timeline.txt` | `00a9983859d558cc2c80f71abbb2a16fc79844c93fc3929a05845bd4dd3e9099` |
+| `shared-vault-extra-poll-red.log` | `c05ca23220f9abcd21a97e82eec3f1b22e5147cc1421a6b02f50ec6dd493df27` |
+| `shared-vault-live-quota-red.log` | `7bdd35b21383bd845afdc29440c895d5439a793c8f7d9d4a17273a34cd4e1ae1` |
+| `final-review-base-01.log` | `ecd34a4fb6b9c7bc304e2c2b4261cec66269359bd39f0f3ba954ad7c3fe9f4f2` |
+| `final-review-base-02.log` | `e28d76682d3a8aef373366d3cd161c0c8e2037e1ef2d88e8a45fa9aa549bc42b` |
+| `final-review-base-03.log` | `43ba6ffb2f587d30f92a3396e8d5dc44a611fda6bed9b74746adb1c286a4388c` |
+| `final-review-base-04.log` | `aa8d955c4bc49fddf67e0bcc490dbbe3af81629561b8624a5105c91ba7563019` |
+| `final-review-base-05.log` | `55c1c02039fa299fbdc4eccee99313b32233501297e04c5504c2d7c4474163db` |
+| `final-review-base-06.log` | `29a37456358149dfacc30b37a8e8eaa4d9a3e57b81060b33c89fb2015e78e0d0` |
+| `final-review-candidate-01.log` | `55705792dbf3e4aae544c96f775370c486f13eb7a5c86a5faafbf17ebb6727bd` |
+| `final-review-candidate-02.log` | `a3f3d7ded02f1e3f503b0f63da9d97c6376c93e7e467359763b10dc7dab26af5` |
+| `final-review-candidate-03.log` | `772d1507cb8ff2e1773634254a364581cacdf15024370f5a7c204476445b6f4b` |
+| `final-review-candidate-04.log` | `2d608a94b110e18d14b6d0ce1025abaec866a343f315a39432b285b5cbc06ca6` |
+| `final-review-candidate-05.log` | `774ac55a4fb904a35b372c658acd9d1f4de4d1270d166fc61fb9abdc3929fd27` |
+| `final-review-candidate-06.log` | `ba9ca2ca807ea0bc8cde7b994fd146fc96e26d4474e733838581d9d173a6b170` |
+| `final-review-summary.json` | `52df61830d14a977d62d385ac05a9f9f93ad7142ff0b1f4ae757f528c2620cb4` |
+| `final-review-assertion.txt` | `d3a47bfefd7a6d1d6ff92b76e42079b11b4c80ab56db4370ab4fa3a119cee09b` |
