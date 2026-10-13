@@ -3098,3 +3098,29 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-lifecycle.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^the\smigration\sin\sthe\sbackground\sdoes\snot\sstart\sfollow-up\sadoption\safter\sdisposal\sduring\smigration$']
+
+# Readiness observes startup; it must not force fresh quota writes on every check.
+[[control]]
+id = "shared-vault-ready-does-not-repoll"
+guards = "a warm consumer readiness check performs no extra quota pass"
+file = "packages/opencode/src/tests/shared-vault.test.ts"
+old = "    'first roster and quota',\n  )\n}"
+new = "    'first roster and quota',\n  )\n  // NON-VACUITY BREAK: readiness forces another quota pass.\n  await Promise.all([...vaults].map((vault) => vault.pollStale(0)))\n}"
+test_file = "packages/opencode/src/tests/shared-vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/shared-vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^one\shost\svault\sper\sprocess\sreadiness\sof\sa\swarm\sconsumer\sstarts\sno\sextra\squota\spass$']
+
+# Seeing the credential roster is not enough: admission needs its live quota.
+[[control]]
+id = "shared-vault-ready-waits-for-live-quota"
+guards = "readiness stays pending while the startup quota reading is blocked"
+file = "packages/opencode/src/tests/shared-vault.test.ts"
+old = "        return rows?.length === 1 && rows[0]?.quota !== undefined"
+new = "        return rows?.length === 1 // NON-VACUITY BREAK: admit readiness before quota."
+test_file = "packages/opencode/src/tests/shared-vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/shared-vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^one\shost\svault\sper\sprocess\sreadiness\swaits\sfor\squota\sin\sthe\slive\sconsumer\ssnapshot$']
