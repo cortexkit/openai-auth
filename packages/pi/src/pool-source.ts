@@ -30,12 +30,7 @@
 // OpenCode; this one has no migration bookkeeping and no legacy refresh locks,
 // because no Pi build before this one refreshed or routed pool accounts.
 
-import { statSync } from 'node:fs'
-import {
-  mergeQuotaObservation,
-  type QuotaObservation,
-  quotaCodec,
-} from '@cortexkit/common-auth/quota'
+import { type QuotaObservation, quotaCodec } from '@cortexkit/common-auth/quota'
 import {
   type OpenPoolStoreOptions,
   openPoolStore,
@@ -48,11 +43,18 @@ import {
 import {
   type AccountPaths,
   type AccountStorage,
-  buildRefreshOperationError,
+  applyPendingPoolObservations,
+  type PoolRefreshBackoff as BackoffEntry,
+  poolFileKey as fileKey,
   hashRefreshToken,
-  isTransientRefreshError,
+  mergePoolObservation,
+  nextPoolRefreshBackoff,
   type OAuthQuotaSnapshot,
+  poolOAuthAccess as oauthAccess,
+  type PoolPendingObservation as PendingObservation,
+  poolRefreshBackoffFor,
   refreshBeforeExpiryMs,
+  rememberPoolObservation,
 } from '@cortexkit/openai-auth-core/internal'
 import { observationFromSnapshot } from '@cortexkit/openai-auth-core/pool-quota'
 import { identityOfToken } from './main-account.ts'
@@ -67,16 +69,6 @@ export const POOL_READ_BUDGET_MS = 500
 
 /** Minimum interval between two quota-poll requests this process makes for the same row. */
 export const POOL_PULL_RETRY_MS = 15_000
-
-/**
- * Retry delay after a refresh that failed without reaching the provider, such
- * as a lock that did not come free in time.
- */
-const LOCAL_REFRESH_RETRY_MS = 30_000
-
-/** Observations kept per row to re-apply over a re-read the store write has not reached yet. */
-const PENDING_OBSERVATIONS_PER_ROW = 8
-const PENDING_OBSERVATION_MAX_AGE_MS = 30 * 60_000
 
 /** One quota poll of a row: the full snapshot, for display, and its observation. */
 export interface RowPoll {
@@ -122,18 +114,6 @@ export interface PiPoolSourceDeps {
   vaultAuthority?: () => Promise<'local' | 'vault' | 'unreadable'>
 }
 
-type BackoffEntry = {
-  nextRetryAt: number
-  tokenHash: string
-  retryCount: number
-}
-
-type PendingObservation = {
-  credentialEpoch: number | undefined
-  identity: string | undefined
-  observation: QuotaObservation
-}
-
 type Snapshot = PiPoolView & { key: string | undefined; readAt: number }
 
 /** How one row's quota poll ended, for the `/openai` quota check. */
@@ -167,39 +147,6 @@ export function settleWithinBudget<T>(
       },
     )
   })
-}
-
-function fileKey(path: string): string {
-  try {
-    const stat = statSync(path)
-    return `${stat.ino}:${stat.size}:${stat.mtimeMs}`
-  } catch {
-    return '-'
-  }
-}
-
-/**
- * The key pending quota observations are kept under: the row's recorded
- * ChatGPT identity (its wire identity), else the row id.
- */
-function accountKey(row: Pick<PoolRow, 'id' | 'identity'>): string {
-  return row.identity ? `identity:${row.identity}` : `row:${row.id}`
-}
-
-export function oauthAccess(row: PoolRow):
-  | {
-      access: string
-      expires: number | undefined
-      refresh: string
-    }
-  | undefined {
-  const credential = row.credential
-  if (credential?.type !== 'oauth') return undefined
-  return {
-    access: credential.access ?? '',
-    expires: credential.expires,
-    refresh: credential.refresh,
-  }
 }
 
 const noopLog: NonNullable<PiPoolSourceDeps['log']> = {
@@ -418,28 +365,8 @@ export class PiPoolSource {
         if (fileStamp >= ownStamp) this.rotated.delete(row.id)
         else next = { ...next, credential: rotated }
       }
-      const pending = (this.pending.get(accountKey(row)) ?? []).filter(
-        (entry) =>
-          now - entry.observation.checkedAt <= PENDING_OBSERVATION_MAX_AGE_MS,
-      )
-      for (const entry of pending) {
-        if (
-          entry.credentialEpoch !== row.credentialEpoch ||
-          entry.identity !== row.identity
-        )
-          continue
-        next = { ...next, quota: this.merged(next.quota, entry.observation) }
-      }
-      return next
+      return applyPendingPoolObservations(next, this.pending, now)
     })
-  }
-
-  private merged(stored: unknown, observation: QuotaObservation): unknown {
-    try {
-      return mergeQuotaObservation(stored, observation)
-    } catch {
-      return stored
-    }
   }
 
   private replaceRow(id: string, update: (row: PoolRow) => PoolRow): void {
@@ -524,19 +451,10 @@ export class PiPoolSource {
   }
 
   private applyObservation(row: PoolRow, observation: QuotaObservation): void {
-    const key = accountKey(row)
-    const list = [
-      ...(this.pending.get(key) ?? []),
-      {
-        credentialEpoch: row.credentialEpoch,
-        identity: row.identity,
-        observation,
-      },
-    ].slice(-PENDING_OBSERVATIONS_PER_ROW)
-    this.pending.set(key, list)
+    rememberPoolObservation(this.pending, row, observation)
     this.replaceRow(row.id, (current) => ({
       ...current,
-      quota: this.merged(current.quota, observation),
+      quota: mergePoolObservation(current.quota, observation),
       needsFirstReading: false,
     }))
   }
@@ -729,62 +647,22 @@ export class PiPoolSource {
       error: error instanceof Error ? error.message : String(error),
     })
     if (!refreshToken) return
-    const now = this.now()
-    const tokenHash = hashRefreshToken(refreshToken)
-    const previous = this.backoff.get(id)
-    // A provider answer (an HTTP status) or a network failure backs off the
-    // way the legacy refresher does. Anything else is local (a lock that did
-    // not come free) and is retried soon: a day-long backoff would strand a
-    // healthy account.
-    const fromProvider =
-      typeof (error as { status?: unknown } | null)?.status === 'number' ||
-      isTransientRefreshError(error)
-    if (fromProvider) {
-      const built = buildRefreshOperationError({
-        error,
-        now,
+    this.backoff.set(
+      id,
+      nextPoolRefreshBackoff(
         refreshToken,
-        ...(previous
-          ? {
-              previous: {
-                message: '',
-                checkedAt: now,
-                nextRetryAt: previous.nextRetryAt,
-                retryCount: previous.retryCount,
-                tokenHash: previous.tokenHash,
-              },
-            }
-          : {}),
-      })
-      this.backoff.set(id, {
-        nextRetryAt: built.nextRetryAt,
-        tokenHash,
-        retryCount: built.retryCount,
-      })
-    } else {
-      this.backoff.set(id, {
-        nextRetryAt: now + LOCAL_REFRESH_RETRY_MS,
-        tokenHash,
-        retryCount: previous?.tokenHash === tokenHash ? previous.retryCount : 0,
-      })
-    }
+        error,
+        this.now(),
+        this.backoff.get(id),
+      ),
+    )
   }
 
   /** Row id to the time a failed refresh may be retried, for rows with no usable token. */
   refreshBackoffFor(rows: readonly PoolRow[]): Map<string, number> {
-    const now = this.now()
-    const out = new Map<string, number>()
-    for (const row of rows) {
-      if (this.usableToken(row, now)) continue
-      const own = this.backoff.get(row.id)
-      out.set(
-        row.id,
-        own && own.nextRetryAt > now
-          ? own.nextRetryAt
-          : now + LOCAL_REFRESH_RETRY_MS,
-      )
-    }
-    return out
+    return poolRefreshBackoffFor(rows, this.backoff, this.now(), (row, now) =>
+      this.usableToken(row, now),
+    )
   }
 
   // -------------------------------------------------------------------------

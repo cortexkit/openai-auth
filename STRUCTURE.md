@@ -99,12 +99,13 @@
   - `packages/opencode/src/core/background-quota-refresh.ts` — `BackgroundQuotaRefresh` (periodic jittered poller for idle account quota with cross-process lease lock)
   - `packages/opencode/src/core/sticky-routing.ts` — cold-session candidate selection, sustainable window weighting, and sticky-break classification
   - `packages/opencode/src/core/cachekeep.ts` — `CacheKeepManager` (idle prompt-cache warmer with model-aware TTLs, subagent 2-warm limits, clock windows, idle pruning, and main-only sustain)
+  - `packages/opencode/src/core/pool-accounts.ts` — store access and migration protection/settings-lock callbacks for the common-auth account menu; no duplicate row CRUD or report renderer
   - `packages/opencode/src/core/pool-request.ts` — one request on a migrated install, routed over the pool rows and the vault's accounts
   - `packages/opencode/src/core/host-slot.ts` — reading OpenCode's `openai` slot (real login, tombstone, confirmed absent) and the `main-refresh` lock name
 
 **`packages/core/src/`:**
 - Purpose: Private shared core (`@cortexkit/openai-auth-core`, never published; each host bundles it). Holds the account store, OAuth flow, reset-credit state machine, quota bookkeeping, logger, and shared slash-command bodies. Reads no env vars and resolves no host paths — every store entry point takes an `AccountPaths` (`{ configPath, statePath }`) the host resolves.
-- Contains: `accounts.ts`, `atomic-write.ts`, `backoff.ts`, `commands.ts`, `index.ts` (command seam), `internal.ts` (host support), `logger.ts`, `oauth.ts`, `paths.ts`, `protocol.ts`, `provider.ts`, `quota-manager.ts`, `quota-normalize.ts`, `refresh-all-quota.ts`, `refresh-file-lock.ts`, `reset-credits.ts`, `tombstone.ts`, `vault.ts`, `util/`.
+- Contains: `accounts.ts`, `backoff.ts`, `commands.ts`, `index.ts` (command seam), `internal.ts` (host support), `logger.ts`, `oauth.ts`, `paths.ts`, `pool-source-state.ts`, `pool-session-pins.ts`, `pool-routing.ts`, `pool-quota.ts`, `protocol.ts`, `provider.ts`, `quota-manager.ts`, `quota-normalize.ts`, `refresh-all-quota.ts`, `reset-credits.ts`, `tombstone.ts`, `vault.ts`, `util/`.
 - Key files:
   - `packages/core/src/index.ts` — command seam (`buildDialogPayload`, `applyCommand`; the only way to run a command body so knob scrubbing cannot be bypassed)
   - `packages/core/src/internal.ts` — host support (store, OAuth, quota, logger, protocol re-exports; importing from here is visibly reaching past the seam)
@@ -112,6 +113,9 @@
   - `packages/core/src/protocol.ts` — command/RPC wire types (`OpenDialogPayload`, `ApplyRequest`, `ApplyResult`)
   - `packages/core/src/paths.ts` — shared file names (`ACCOUNT_FILE_NAME`, `ACCOUNT_STATE_FILE_NAME`) and `deriveStatePath`
   - `packages/core/src/provider.ts` — Codex-specific injection seam (`codexRefreshFn`, `whamUsageFn`)
+  - `packages/core/src/pool-source-state.ts` — shared credential projection, pending observation replay and refresh backoff; host readers retain their lifecycle and write authority
+  - `packages/core/src/pool-session-pins.ts` — shared sticky placement policy with host-owned pin persistence and eviction
+  - `packages/core/src/pool-routing.ts` — admission/routing policy over common-auth, including shared per-row killswitch verdicts
   - `packages/core/src/vault.ts` — `OpenAiVault`: one host's OpenAI accounts in the Claustrum vault over `@cortexkit/common-auth/claustrum` (routing rows, per-send authorization, quota, decline/accept, enrollment, disconnect, host-slot guard)
   - `packages/core/src/tombstone.ts` — recognising the tombstones the removed handle-mode custody left (never sent, never refreshed)
 
@@ -186,7 +190,7 @@
 - `packages/opencode/src/prompt-context.ts` — assistant model/variant resolver for synthetic command replies.
 - `packages/core/src/provider.ts` — Codex injection seam (`codexRefreshFn`, `whamUsageFn`).
 - `packages/core/src/backoff.ts` — retry/backoff math.
-- `packages/core/src/refresh-file-lock.ts` — generation-fenced single-writer eviction-marker lock.
+- `@cortexkit/common-auth/fs` — atomic JSON writes and generation-fenced refresh locks, used through the private core's internal exports.
 - `packages/opencode/src/codex-http.ts` — HTTP fallback sanitization for WebSocket downgrades.
 - `packages/opencode/src/ws-pool.ts` — per-account WebSocket pool with continuation chaining, refusal cleanup, and HTTP relay fallback for oversized frames (1009).
 - `packages/opencode/src/ws.ts` — low-level WS connect/stream, response lifecycle logging, and oversized frame classification.

@@ -45,6 +45,12 @@ import {
   type StickyRoute,
   type StickySelection,
 } from '@cortexkit/common-auth/routing'
+import {
+  type AccountStorage,
+  isKillswitchEnabled,
+  killswitchPassesPolicy,
+} from './accounts'
+import { windowsFromQuotaMap } from './pool-quota'
 
 /**
  * The main account's row: on OpenCode the row the migration moved the main
@@ -52,6 +58,29 @@ import {
  * main-first, last in fallback-first.
  */
 export const FORMER_MAIN_ID = 'main'
+
+/** Per-row verdicts for the opt-in remaining-quota floor, shared by both hosts. */
+export function poolKillswitchVerdicts(
+  accounts: readonly { id: string; quota?: unknown }[],
+  storage: AccountStorage | null,
+  now: number,
+): Map<string, boolean> {
+  const verdicts = new Map<string, boolean>()
+  if (isKillswitchEnabled(storage)) {
+    for (const account of accounts) {
+      verdicts.set(
+        account.id,
+        killswitchPassesPolicy(
+          windowsFromQuotaMap(account.quota),
+          storage,
+          account.id === FORMER_MAIN_ID ? undefined : account.id,
+          now,
+        ),
+      )
+    }
+  }
+  return verdicts
+}
 
 /**
  * Retry-After for a request refused because no account has a quota reading

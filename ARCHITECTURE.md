@@ -25,16 +25,22 @@
 
 **Accounts and fallback storage:**
 - Purpose: Atomic, multi-account JSON store with file locks, retry/backoff state, killswitch config, routing mode, persisted quota, log level, and dump/cachekeep toggles.
-- Location: `packages/core/src/accounts.ts`, `packages/core/src/atomic-write.ts`, `packages/core/src/refresh-file-lock.ts`, `packages/core/src/paths.ts` (shared file names + `deriveStatePath`), plus the host path resolver `packages/opencode/src/core/account-paths.ts`
+- Location: `packages/core/src/accounts.ts`, `@cortexkit/common-auth/fs` (atomic writes and refresh locks), `packages/core/src/paths.ts` (shared file names + `deriveStatePath`), plus the host path resolver `packages/opencode/src/core/account-paths.ts`
 - Contains: `deriveStatePath` in `account-paths.ts` (derives `${configPath}.state.json` when custom config paths are used, preventing distinct account files from sharing one state document, with `accountPathsCollide` detecting aliases), `loadAccounts`/`migrateIfNeeded` (serialized under the shared save lock to coordinate concurrent migrations and mutations), `mutateAccounts` (authoritative read-modify-write for structural mutations and scalar writes, preserving load-dropped raw entries on disk with an `allowDrop` option for intentional caller removals, preventing concurrent union-merge resurrection of deleted accounts/secrets), `saveAccounts` (test seeding only), `saveAccountState` (updates state secrets, gated by config roster to prevent resurrection of deleted account secrets), `FallbackAccountManager` (background refresh, `getUsableFallbackAccounts`, fire-and-forget `markUsed` telemetry; a row holding a tombstone from the removed handle-mode custody is never refreshed or selected), every config writer dropping the removed custody's `claustrum` settings, `OAuthAccount`/`CorruptOAuthAccount`/`ApiKeyAccount` types, single-writer eviction-marker file lock with separated acquire window, lock TTL, and generation-fenced renewal and release (distinguishes holder contention from event-loop starvation in timeout errors, verifies owner and marker identity to avoid deleting or extending a successor's lock, and recreates missing parent directories automatically on `ENOENT`), atomic JSON write (temp + rename, mode `0o600`).
 - Depends on: `core/oauth.ts` (`extractAccountId`), `core/tombstone.ts` (tombstone recognition), `core/provider.ts` (`ProviderQuotaFn`), `core/backoff.ts`.
 - Used by: Plugin loader, `/openai-account`/`/openai-routing`/`/openai-killswitch` commands, every quota push.
+
+**Shared pool mechanics:**
+- Location: `packages/core/src/pool-source-state.ts`, `pool-session-pins.ts`, `pool-routing.ts`, and `pool-quota.ts`.
+- Both host pool readers use one copy of OAuth credential projection, file freshness keys, bounded pending quota observations and provider-versus-local refresh backoff. Hosts retain their snapshots, token usability rules, vault authority checks and store-write lifecycle.
+- Both request adapters use `poolKillswitchVerdicts` for per-account remaining-quota floor decisions. OpenCode 2 and Pi use `placeStickyPin` with host-owned ledgers: OpenCode keeps its LRU bound, Pi its process-local map.
+- Account add/enable/disable/remove/reorder and terminal rendering belong to `@cortexkit/common-auth/auth-menu` and the pool store. OpenCode's `core/pool-accounts.ts` retains only store access, migration detection, removal protection and legacy settings-lock hooks. OpenCode's `auth/doctor.ts` still detects account/login faults and supplies repair actions to the shared menu, but no longer formats a second terminal report. The vault menu does not mix a local-account listing into a connected vault view.
 
 **Quota cache and policy:**
 - Purpose: In-memory cache of main + per-fallback quota snapshots, dedup of inflight fetches, refresh-after math, backoff gating, and mid-stream rate-limit marks.
 - Location: `packages/core/src/quota-manager.ts`, `packages/core/src/refresh-all-quota.ts`, plus `packages/opencode/src/core/background-quota-refresh.ts` and `packages/opencode/src/core/sticky-routing.ts`
 - Contains: `QuotaManager` class with `getMain`/`setMain`/`getFallback`/`setFallback`/`seedFallbacksFromAccounts`/`isBackedOff`/`isFallbackBackedOff`, rate limit marking (`markRateLimited`, `isRateLimited`, `rateLimitedUntil`), stable-identity policy peeks (`peekMainForPolicy`, `peekFallbackForPolicy`) to prevent token refreshes from invalidating cached quota, token-fingerprint helpers, `refreshAllQuota` orchestration (treats quota endpoint 401s as token refresh triggers, skips poll attempts for accounts with armed non-transient refresh backoff by marking them permanent failures, never polls with a tombstone, and displays quota readings with their own age when older than 15 minutes), `BackgroundQuotaRefresh` (unref'd 5-minute jittered poll with 4-minute freshness gating and auto-renewed `bg-quota-refresh` file lease lock), and `sticky-routing.ts` candidate selection and break classification (`selectStickyCandidate`, `decideStickyBreak`, `sustainableWindowWeight`). The credit budget is a third pressure axis on its own monthly reset clock: `spendControlExhaustedResetAt` in `sidebar-state.ts` is the single shared exhaustion signal that admission, cold placement, and warm-pin migration all read, judged by the provider's authoritative `reached` boolean and failing open on a stale or missing reset. `getPresentQuotaWindows`/`exhaustedQuotaResetAt`/`isQuotaExhausted` in `sidebar-state.ts` back the killswitch and admission checks. Mid-stream rate-limit reset resolution (`resolveMidStreamRateLimitResetAt`) prefers explicit provider resets (e.g. from admission-time errors or HTTP/WS 429 upgrade frames) over cached named-window resets or bounded defaults. Policies drop cached window snapshots when their reset timestamps are in the past.
-- Depends on: `core/accounts.ts` types, `core/provider.ts` (`ProviderQuotaFn` injection), `core/refresh-file-lock.ts`, `sidebar-state.ts`.
+- Depends on: `core/accounts.ts` types, `core/provider.ts` (`ProviderQuotaFn` injection), `@cortexkit/common-auth/fs`, `sidebar-state.ts`.
 - Used by: Plugin loader (push updates and background poller), `refresh-all-quota.ts` (active polling for `/openai-quota`).
 
 **Backoff and retry policy:**
@@ -42,7 +48,7 @@
 - Location: `packages/core/src/backoff.ts`
 - Contains: `isTransientRefreshError`, `isTransientQuotaError`, `buildRefreshOperationError`, `buildQuotaOperationError`, `hashRefreshToken`, `refreshBackoffActive`, `quotaBackoffActive`, `parseRetryAfter`.
 - Depends on: `node:crypto`.
-- Used by: `accounts.ts`, `quota-manager.ts`, `refresh-file-lock.ts`, plugin loader (`refreshMainWithLease`).
+- Used by: `accounts.ts`, `quota-manager.ts`, the shared pool-source state primitives, plugin loader (`refreshMainWithLease`).
 
 **OAuth flow:**
 - Purpose: PKCE generation, OAuth authorize-URL building, local callback HTTP server, device-code flow, JWT/account-id extraction, fallback-account onboarding.
@@ -154,7 +160,7 @@
 3. `waitForOAuthCallback` (browser) or `beginDeviceAuth` + `completeDeviceAuth` (headless) completes the flow.
 4. `migrateIfNeeded` seeds the multi-account store on first run, serializing operations under the shared save lock to coordinate concurrent migrations and mutations — `packages/core/src/accounts.ts`.
 5. `auth.loader` constructs `QuotaManager`, `FallbackAccountManager`, and (if any fallback accounts) starts `fallbackManager.startBackgroundRefresh()`.
-6. Each refresh runs through `codexRefreshFn` with file-lock + lease concurrency — `core/refresh-file-lock.ts`, `index.ts` `refreshMainWithLease`. Refreshed token persistence retries up to 3 times to prevent transient file locks or API write errors from invalidating sessions.
+6. Each refresh runs through `codexRefreshFn` with file-lock + lease concurrency — `@cortexkit/common-auth/fs`, `index.ts` `refreshMainWithLease`. Refreshed token persistence retries up to 3 times to prevent transient file locks or API write errors from invalidating sessions.
 
 **Routing and request flow (per request):**
 
@@ -218,7 +224,7 @@ Server-side deduplication of a repeated `redeem_request_id` is verified live (20
 - Pattern: Factory; accepts `PluginInput` + `CodexAuthPluginOptions`; wires the auth loader, the WebSocket pool, the RPC server, the host's `OpenAiVault`, and the per-loader `CacheKeepManager` set.
 
 **`FallbackAccountManager`:**
- - Purpose: Owns the in-memory fallback state, background refresh, and `getUsableFallbackAccounts` (killswitch + routing aware; tombstoned rows are skipped).
+  - Purpose: Owns the pre-pool fallback state, background refresh, and `getUsableFallbackAccounts` (killswitch + routing aware; tombstoned rows are skipped). Still used when the pool source is inactive; its background refresh is paused once the pool or vault serves.
  - Location: `packages/core/src/accounts.ts`
 - Pattern: Constructor-injected `refreshFn` (`codexRefreshFn`) and `quotaManager`; background timer with on-demand `markUsed` to refresh before the next request.
 

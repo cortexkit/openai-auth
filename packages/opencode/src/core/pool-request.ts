@@ -39,10 +39,8 @@ import {
   type AccountStorage,
   getFallbackStatuses,
   getKillswitchThresholdsForAccount,
-  isKillswitchEnabled,
   isShieldedMainRow,
   isTombstoned,
-  killswitchPassesPolicy,
   type OAuthQuotaSnapshot,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
@@ -58,6 +56,7 @@ import {
   type PoolBlock,
   type PoolRoutingInput,
   planOrdered,
+  poolKillswitchVerdicts,
   routePinnedRow,
   type StickyAdmission,
   type StickyRouteOptions,
@@ -299,20 +298,7 @@ function routingInput(
   targets: readonly PoolTarget[],
 ): PoolRoutingInput {
   const now = ctx.now()
-  const killswitch = new Map<string, boolean>()
-  if (isKillswitchEnabled(ctx.storage)) {
-    for (const target of targets) {
-      killswitch.set(
-        target.id,
-        killswitchPassesPolicy(
-          windowsFromQuotaMap(target.quota),
-          ctx.storage,
-          target.id === FORMER_MAIN_ID ? undefined : target.id,
-          now,
-        ),
-      )
-    }
-  }
+  const killswitch = poolKillswitchVerdicts(targets, ctx.storage, now)
   const routingRows: RoutingRow[] = targets.map((target) => ({
     id: target.id,
     kind: target.kind,

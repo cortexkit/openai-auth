@@ -3022,3 +3022,16 @@ runner = "command"
 command = ["bun", "test", "packages/pi/src/tests/request-isolation.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^Pi fetch throws are owned before pi-ai reads diagnostic getters$']
+
+# Shared pool readers must not replay an in-memory reading after credential replacement.
+[[control]]
+id = "pool-pending-reading-credential-epoch"
+guards = "pending quota belongs to the credential epoch that observed it, not its replacement"
+file = "packages/core/src/pool-source-state.ts"
+old = "      entry.credentialEpoch !== row.credentialEpoch ||"
+new = "      false || // NON-VACUITY BREAK: replay a reading from a replaced credential."
+test_file = "packages/core/src/tests/pool-source-state.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/pool-source-state.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^shared\spool\ssource\sstate\sdoes\snot\sreplay\sa\sreading\sonto\sa\sreplaced\scredential\sepoch$']
