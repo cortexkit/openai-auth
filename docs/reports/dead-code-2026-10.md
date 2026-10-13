@@ -99,4 +99,89 @@ do not target the deleted helpers;
 validate the entire catalogue with `ckdev-mutate check` after extraction and
 re-anchor any moved target if validation identifies one.
 
-Verification results and per-package line counts are recorded after the edits.
+## Outcome
+
+The deletion commit removes the orphaned menu helpers; the extraction commit
+moves shared reader state into `pool-source-state.ts`, pin placement into
+`pool-session-pins.ts`, and request floor verdicts into `pool-routing.ts`.
+Migration of 0.11.x config/state and the OpenCode login slot, legacy refresh-lock
+coordination, placeholder/tombstone recognition, the version fence and the test
+accessors listed above all remain. No baseline behavior test was removed or weakened.
+Six direct shared-state tests were added. The export manifest gained the shared
+values/types only.
+
+All 223 existing deliberate source replacements in `mutations.toml` still match
+their intended source text (the anchors) and name existing tests;
+none targeted a deleted or moved statement, so no removal/re-anchor was needed.
+A 224th control guards the extracted pending-reading credential-epoch check.
+
+### Line counts against the baseline
+
+`git diff b1e9a4c --numstat -- packages` counts physical lines, including comments
+and the added test/manifest entries. Gross removals include host copies moved to
+core; net change includes their single shared implementation.
+
+| Package | Lines removed | Lines added | Net reduction |
+| --- | ---: | ---: | ---: |
+| Core | 39 | 417 | -378 (shared implementation and tests added) |
+| OpenCode | 609 | 39 | 570 |
+| Pi | 258 | 36 | 222 |
+| Total | 906 | 492 | 414 |
+
+Excluding the 126 new test lines and 12 new manifest lines, runtime-source net
+reduction is 552 lines. No packaging or dependency manifest/lockfile changed.
+
+### Gates
+
+All build/test/lint commands ran on the Linux build server with eight vCPUs
+(`linux,8c`). The fresh npm install additionally enabled network access
+(`linux,8c,net`). Versions: Bun 1.4.2, TypeScript 7.0.2, Biome 2.5.15,
+ckdev-mutate 0.12.0, Node 24.21.0, npm 11.19.0.
+
+- `bun run build`: passed all three packages, declarations and TUI build
+  (134 generated TUI files); installed-range gate checked 26 dependencies and
+  local-dependency gate checked six manifests.
+- `bun run types`: passed all three package TypeScript checks.
+- `bun run lint`: passed, 256 files checked.
+- `bun run test`: core 231 passed in 18 files; OpenCode 1,529 passed, 26 skipped
+  in 88 files (including packaging tests); Pi 74 passed in six files. Zero
+  failures. The opt-in real-host tests were then enabled separately.
+- `OPENAI_AUTH_OPENCODE1_E2E=1 OPENAI_AUTH_OPENCODE2_E2E=1 bun test
+  packages/opencode/src/tests/opencode1-e2e.test.ts
+  packages/opencode/src/tests/opencode2-e2e.test.ts`: 22 passed, zero failures.
+- `ckdev-mutate check`: all 224 catalogue anchors and exact test names passed.
+- Fresh consumer: `npm pack --ignore-scripts` for both host packages, followed
+  by `npm install --ignore-scripts --no-audit --no-fund <both tarballs>` into
+  an empty project (253 packages installed). Plain Node with no inherited
+  `NODE_PATH`/`NODE_OPTIONS` imported OpenCode root/server and Pi root: three
+  imports passed. npm warned that the latest allowed `@opentui/core` requires
+  Node >=26.4.0; imports still passed on Node 24.21.0. TUI runtime packaging is
+  additionally covered by the existing suite.
+- The AFT static inspector after extraction was partial: its graph of callers
+  for this worktree was unavailable, so dead-code/duplicate analysis could not
+  complete. Its local host diagnostics did not recognize the newly exported core
+  members. Remote build/types and exact export-manifest tests passed; these
+  compiler/test gates are authoritative, not that inconsistent analyzer view.
+
+### Non-vacuity of the moved epoch guard
+
+The live files were staged and `git diff --stat` was empty. Replacing the
+credential-epoch predicate in `packages/core/src/pool-source-state.ts` with
+`false || // NON-VACUITY BREAK` produced one file changed, one insertion and one
+deletion. Running the six direct shared-state tests failed only
+`shared pool source state > does not replay a reading onto a replaced credential epoch`.
+The five other tests passed (the last checks retry times only for rows lacking
+a bearer that the host can send a request with):
+
+- `projects OAuth credentials and leaves absent credentials empty`
+- `bounds the queue and reapplies readings before persistence catches up`
+- `does not replay a reading onto another identity or after its lifetime`
+- `distinguishes provider backoff from a short local lock retry`
+- `reports backoff only for rows the host cannot currently send with`
+
+The first test was initially named "projects OAuth credentials and does not invent
+API-key access"; it was renamed to describe its actual absent-credential assertion,
+not a claim to test API-key credentials. No test name from the baseline commit changed.
+`git checkout -- packages/core/src/pool-source-state.ts && touch
+packages/core/src/pool-source-state.ts` restored the file; `git diff --stat` was
+empty again. The restored six-test run passed with zero failures.
