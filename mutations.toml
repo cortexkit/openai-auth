@@ -3023,7 +3023,9 @@ command = ["bun", "test", "packages/pi/src/tests/request-isolation.test.ts", "-t
 test_count_pattern = "Ran {count} test"
 expect_red = ['^Pi fetch throws are owned before pi-ai reads diagnostic getters$']
 
-# Shared pool readers must not replay an in-memory reading after credential replacement.
+# A quota reading held in memory while its store write is pending must not be
+# applied to the account after its credential is replaced: it measured the old
+# login, not the new one.
 [[control]]
 id = "pool-pending-reading-credential-epoch"
 guards = "pending quota belongs to the credential epoch that observed it, not its replacement"

@@ -1,4 +1,6 @@
-// Shared placement policy; the host owns the pin map and its eviction policy.
+// Which account a new session is pinned to, shared by OpenCode 2 and Pi. Each
+// of them stores the pins itself: OpenCode 2 keeps a bounded least-recently-used
+// map, while Pi keeps an unbounded map that lives only as long as the process.
 
 import {
   isPinValid,

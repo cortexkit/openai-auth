@@ -154,7 +154,12 @@ export function nextPoolRefreshBackoff(
   }
 }
 
-/** Retry times for rows without a usable token; token usability stays host-specific. */
+/**
+ * When each account that has no sendable access token may try refreshing again.
+ * The caller decides whether a token is sendable, because OpenCode and Pi check
+ * different things first: OpenCode re-reads the row and refuses one the vault
+ * now serves, while Pi refuses every local row while it is in vault mode.
+ */
 export function poolRefreshBackoffFor(
   rows: readonly PoolRow[],
   backoff: ReadonlyMap<string, PoolRefreshBackoff>,

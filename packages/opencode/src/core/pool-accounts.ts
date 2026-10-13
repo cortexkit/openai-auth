@@ -1,6 +1,9 @@
-// OpenCode's pool access and migration protection hooks for the shared menu.
-// The common-auth menu owns row mutations; these callbacks retain the legacy
-// locks and refuse removal of main or a pending slot-transfer destination.
+// How OpenCode opens its account pool, and the protections the shared account
+// menu applies to it. The menu itself adds, removes and reorders accounts. These
+// callbacks also take the refresh locks that pre-pool plugin versions use, so an
+// old process still running during an upgrade can't refresh a token at the same
+// time. They refuse to remove the main account, or an account that is still
+// receiving OpenCode's own login while it is moved into the pool.
 import { readFileSync } from 'node:fs'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
 import {

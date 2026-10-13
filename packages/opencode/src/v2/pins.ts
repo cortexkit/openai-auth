@@ -47,7 +47,11 @@ export class SessionPins {
     }
   }
 
-  /** Placement policy is shared; this ledger alone enforces the host's LRU bound. */
+  /**
+   * Which account a new session gets comes from the shared placement policy.
+   * This ledger only limits how many session pins OpenCode 2 keeps, evicting the
+   * least recently used past that limit.
+   */
   place(placement: StickyPinPlacement): { accountId: string } | undefined {
     return placeStickyPin(this.pins, placement, (sessionId, pin) =>
       this.set(sessionId, pin),

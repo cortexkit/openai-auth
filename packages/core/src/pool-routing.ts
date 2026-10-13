@@ -59,7 +59,10 @@ import { windowsFromQuotaMap } from './pool-quota'
  */
 export const FORMER_MAIN_ID = 'main'
 
-/** Per-row verdicts for the opt-in remaining-quota floor, shared by both hosts. */
+/**
+ * Per-account verdicts for the killswitch: the opt-in minimum share of quota
+ * that must remain before an account is used. OpenCode and Pi both route with it.
+ */
 export function poolKillswitchVerdicts(
   accounts: readonly { id: string; quota?: unknown }[],
   storage: AccountStorage | null,
