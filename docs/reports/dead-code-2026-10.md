@@ -124,14 +124,15 @@ core; net change includes their single shared implementation.
 | Package | Lines removed | Lines added | Net reduction |
 | --- | ---: | ---: | ---: |
 | Core | 39 | 417 | -378 (shared implementation and tests added) |
-| OpenCode | 609 | 39 | 570 |
+| OpenCode | 649 | 282 | 367 |
 | Pi | 258 | 36 | 222 |
-| Total | 906 | 492 | 414 |
+| Total | 946 | 735 | 211 |
 
-Excluding the 126 new test lines and 12 new manifest lines, runtime-source net
-reduction is 552 lines. No packaging or dependency manifest/lockfile changed.
+Excluding test files and `export-manifest.ts`, runtime-source net reduction is
+524 lines after the stability follow-up below. No packaging or dependency
+manifest/lockfile changed.
 
-### Gates
+### Initial single-run gates
 
 All build/test/lint commands ran on the Linux build server with eight vCPUs
 (`linux,8c`). The fresh npm install additionally enabled network access
@@ -185,3 +186,243 @@ not a claim to test API-key credentials. No test name from the baseline commit c
 `git checkout -- packages/core/src/pool-source-state.ts && touch
 packages/core/src/pool-source-state.ts` restored the file; `git diff --stat` was
 empty again. The restored six-test run passed with zero failures.
+
+## Stability follow-up
+
+The original single green suite did not establish order independence. Review
+found intermittent full-suite failures, so the follow-up first measured the
+exact reviewed trees without changing source, assertions or deadlines.
+
+### Paired measurement
+
+Base: `47a7fae77bca2a89e835be4c940ec584352c25c9`.
+Candidate: `efe09c1a99d04d8f0374534eb928fad422cb6d0a` (the cleanup merged on
+that base, plus the reviewer's comment-only changes). These Git commits were
+checked out only in the isolated worker checkout, leaving the operator's main
+checkout untouched. The worker's task branch was restored afterward.
+
+Each run used Linux with eight vCPUs, Bun 1.4.2, no additional environment, and
+this command from the repository root:
+
+```sh
+bun install --frozen-lockfile && bun run build && cd packages/opencode && bun test
+```
+
+Order was base 1, candidate 1, base 2, candidate 2, through pair 6. Every
+install/build passed. Complete output and the assertion/predecessor dump are
+kept outside Git at
+`~/.local/state/cortexkit/evidence/openai-auth/dead-code-stability-2026-10/`.
+The adjacent `SHA256SUMS` manifest identifies the archived bytes; the evidence
+hash table below cites the files used in this report. The preceding test is
+retained with each assertion block to expose cross-test state leaks.
+
+| Pair | Base pass / fail | Base test time | Candidate pass / fail | Candidate test time |
+| --- | --- | --- | --- | --- |
+| 1 | 1529 / 0 | 84.75 s | 1528 / 1 | 114.84 s |
+| 2 | 1527 / 2, plus one between-test error | 141.37 s | 1526 / 3 | 159.57 s |
+| 3 | 1529 / 0 | 136.06 s | 1529 / 0 | 80.71 s |
+| 4 | 1529 / 0 | 91.77 s | 1528 / 1 | 100.19 s |
+| 5 | 1529 / 0 | 82.78 s | 1529 / 0 | 100.36 s |
+| 6 | 1529 / 0 | 82.58 s | 1529 / 0 | 91.25 s |
+
+Every run discovered 1,555 tests in 88 files and skipped the same 26 tests.
+The complete outputs are stored losslessly as `.log.gz` archives (use
+`gzip -dc <file.log.gz>` to read them). Evidence directories are ignored, and
+the unpublished commit `ae05b73849d5c981db4a572dd53699726c4dc8cc`, which added
+archives and an assertion dump, was replaced with report/ignore changes only.
+Those evidence files are never added in the rewritten task branch's history.
+Base had one failing run in six; candidate had three. No BackgroundQuotaRefresh
+assertion failed in these twelve runs. Three preliminary candidate-only runs
+were clean, but are not included in this paired measurement.
+
+Base's captured faults were a migration-completion race (`migratedAt` was still
+undefined after waiting only for the placeholder) and a vault-mode source test
+that exceeded Bun's unchanged five-second test limit. These are demonstrated
+pre-existing failures, not evidence that every candidate-only failure was
+pre-existing.
+
+### Product bug: a stopped host could still reload its accounts
+
+The strongest candidate failure was the setup-failure test: its one-shot
+`PoolAccountSource.load` rejection was consumed, but the setup under test
+resolved. The preceding HTTP/WebSocket quota test had already stopped its host.
+Temporary diagnostics recorded a construction stack per source and the caller
+of every load/dispose. An ordered 28-test host run recorded **11 loads after
+disposal from nine different source instances**. Their callers were the
+migration and adoption callbacks in `v2/setup.ts`, not the new core helpers.
+The full diagnostic is `diagnostic-ordered-01.log.gz` in the external evidence
+store (SHA-256 below).
+That diagnostic run's one-shot spy was consumed by its intended source; the
+post-disposal loads themselves, plus the controlled regression below, establish
+the leak without pretending that this run reproduced the exact spy collision.
+
+The old shutdown sequence stopped the lifecycle's timer but did not join its
+running migration/adoption. Those callbacks launched `void source.load()` after
+finishing, including after the source had been disposed. The source's drain
+joined quota writes, polls and refreshes, but omitted an in-flight read. An older
+host could therefore reload files and consume process-wide test spies while a
+later host was starting. This is a real product ownership bug, not just a test
+failure: host cleanup returned while its account work was still active.
+
+The lifecycle/setup shutdown logic and source dispose/drain logic were not
+changed by the extraction. The extracted functions remain synchronous, the maps
+remain source-instance fields, and `poolFileKey` performs stat calls only when
+called by a host reader; it has no module-level stat or shared cache. There is
+no demonstrated changed lock/await boundary in the fold. The evidence supports
+a pre-existing disposal hole exposed by timing, not a new shared mutable map.
+
+The repair addresses host shutdown and source disposal:
+
+- Migration/adoption reloads belong to the lifecycle promise instead of being
+  fire-and-forget, and a closing host schedules no late reload.
+- Shutdown stops future work first and joins the lifecycle and cached in-flight
+  source read as well as quota work. `SETTLE_ON_DISPOSE_MS` in `v2/setup.ts`
+  still limits shutdown to five seconds so a stuck provider cannot hold exit.
+  It clears the shutdown timer when the drain finishes.
+- A stopped lifecycle does not start a new adoption after a pending migration,
+  authority check or version fence finishes. Already-entered transfers retain
+  their existing locks and migration protocol.
+- Disposed sources start no new reads or authority checks, and a read completing
+  after disposal cannot publish a fresh snapshot or queue another first poll.
+
+A controlled held-adoption test failed on the old implementation: cleanup had
+already returned before the adoption was released. No deadline was changed.
+The new lifecycle, read-drain and adoption-drain tests also have isolated red
+controls, listed below.
+
+### Fixture ownership and readiness
+
+Two OpenCode 2 fixtures registered `stop` before file removal but executed
+cleanups in reverse, so account files were deleted before their host stopped.
+Removal is registered before stop, so reverse cleanup awaits host shutdown
+before deleting its files. The active-connection fixture now gives
+its fake slot an isolated path; otherwise its adoption locks used the real
+fallback slot path shared by other fixtures. Assertions about credentials,
+feedback and migration remain unchanged.
+
+The vault fixture waited for a quota-containing **file**, then slept 100 ms.
+The consumer publishes that file before reloading its own routing snapshot;
+under load, a file could look ready while admission still saw unknown quota and
+correctly produced generic `no-account`. The fixture now borrows a read-only
+lease to the same host consumer, waits for the same credential/quota property
+in its live snapshot, and releases that lease. It does not start a second
+consumer, send a probe request, retry a failed send, or increase the existing
+five-second readiness deadline. All original refusal/authorization assertions
+stay intact. Waiting for the live roster replaces the file-based readiness
+proxy without relaxing those assertions.
+
+### Captured RPC timeout cascade
+
+An intermediate full validation then captured a different failure:
+`rpc-server > keeps RPC ports discoverable and applies with each project captured context`
+timed out at 5,000 ms. Its async callback continued with process-wide fetch and
+timer overrides; later SDK tests got the wrong response, followed by a chain of
+keep-warm failures. The complete output is
+`repaired-attempt-03.log.gz` in the external evidence store (SHA-256 below).
+
+The follow-up scope included this additional teardown leak, without changing
+RPC assertions or deadlines. RPC tests now use the existing
+request-test scope to join their callbacks and loader work before the next test
+starts; their finally blocks drain loader work before restoring global fetch,
+timers or paths. A loader that fails during fixture construction is disposed.
+No RPC assertions, names or deadlines changed.
+
+A deliberate 5,100 ms callback delay, marked `NON-VACUITY BREAK` to identify the
+temporary behavior break, exceeded Bun's
+unchanged 5,000 ms limit. Only the RPC owner failed; all eleven other RPC,
+request-scope and SDK tests passed. The teardown error named the RPC test whose
+callback exceeded the deadline.
+`rpc-timeout-red.log.gz` in that store (SHA-256 below) retains
+the complete output. The delay was removed before any commit.
+
+### Red controls and restoration
+
+Each control staged the live files, confirmed an empty `git diff --stat`, applied
+the marked break, captured a non-empty diff, ran the tests, and restored the
+specific file with `git checkout -- <path> && touch <path>`; touching invalidates
+mtime-based source caches after restoration. Every post-restore diff was empty.
+
+| Break | Exact failed test | Other controls |
+| --- | --- | --- |
+| Remove the lifecycle join from host cleanup | `OpenCode 2 entry: logins > cleanup joins a running adoption before releasing its source` | Both direct source-disposal tests passed |
+| Omit the source's read from its drain and completion predicate | `pool source disposal > settled joins a read that exceeded the request budget` | Adoption drain and disposed-source read prohibition passed |
+| Keep the lifecycle scheduling flag live after disposal | `the migration in the background > does not start follow-up adoption after disposal during migration` | Adoption drain and both source-disposal tests passed |
+| Force the RPC callback beyond its unchanged deadline | `rpc-server > keeps RPC ports discoverable and applies with each project captured context` | Five other RPC tests, four scope tests and both SDK parser tests passed |
+
+The three source controls are in `mutations.toml`; all 227 catalogue anchors and
+exact names remain valid. The timeout control was run manually to verify that
+only the RPC test failed; it is not a permanent delay or a claim that a filtered
+CI run observes downstream tests.
+
+### Verification boundary and authorized stop
+
+Types passed for all three packages (TypeScript 7.0.2), lint passed for 257 files
+(Biome 2.5.15). Tests for pool shutdown, active-credential/vault fixtures and
+migration contracts passed: 70 tests in five files, plus 12 RPC/scope/SDK tests
+in three files. Final restored-control runs passed four source/lifecycle tests
+and the same twelve RPC/scope/SDK tests. Scoped diagnostics covered all five
+requested source/test files with zero errors or warnings; the callgraph portion
+of the inspector remained unavailable. Build, declarations, TUI and
+packaging checks ran during the full validations. Dependencies and lockfiles
+remain unchanged.
+
+Six consecutive clean full runs were the agreed validation target for this
+intermittent issue. That target is **not achieved**. After the RPC repair,
+full candidate run 1 passed **1,533 tests**, with 26 skips and no failures, in
+89.86 s. Run 2 passed 1,532 tests and had exactly one failure:
+
+`one host vault per process > OpenCode 2 setups on different pool stores do not share a consumer`
+
+This checks that OpenCode 2 setups using different account files have separate
+vault network clients and state, rather than accidentally sharing one client.
+
+It exceeded the unchanged five-second test limit at 5,703.02 ms. Its existing
+request-test scope drained and named the owner; no later test failed. The
+immediately preceding same-store sharing test passed in 3,465.13 ms. Full logs
+are `repaired-final-01.log.gz` and `repaired-final-02.log.gz` in the external
+evidence store (SHA-256 below).
+The validation stopped on this failure, without retrying it or broadening the
+repair to the shared-vault fixture. The review had agreed to stop at the next
+unrelated failure after fixing RPC teardown, rather than expanding this repair
+indefinitely. This delivery is
+a coherent source/teardown repair with captured evidence, **not** a claim that
+the complete suite is now stable. The remaining shared-vault timeout needs a
+separate investigation before claiming six clean full runs.
+
+### External evidence hashes
+
+All filenames below are relative to
+`~/.local/state/cortexkit/evidence/openai-auth/dead-code-stability-2026-10/`;
+`SHA256SUMS` is the manifest in that directory. The hashes were calculated from
+the original worker copies, which the reviewer confirmed were copied
+byte-for-byte. Neither the archives nor `assertions.md` belongs in this public
+repository. New follow-up evidence is kept under ignored `.evidence/` for the
+same external archival step.
+
+| File | SHA-256 |
+| --- | --- |
+| `base-01.log.gz` | `0b4a62dc51089a2871afa105269dc86b8959e5f8ea8cdb513744585658cfba5d` |
+| `base-02.log.gz` | `39301b56deb753dea4e72141fde6b6ecd389b918ca2b7dfcda4590aac6e58001` |
+| `base-03.log.gz` | `f94162abaa4e89fcc91efc2c7c4ed9e7510655ac1ead6d7e5674b6d7558078c6` |
+| `base-04.log.gz` | `79993a944542f0fe55b1f6dbf1e8f81a682f034f5a6713fe1ff25095db6f7886` |
+| `base-05.log.gz` | `b25ddeaf388cfb2ed4876f0ce3918ef03d09bca59aa96da3ff3d9c007316a17c` |
+| `base-06.log.gz` | `bac0eed84b1f27a8071b38ed891fe45778f91839e4436b868b49747d54fca4fd` |
+| `candidate-01.log.gz` | `8f3d1c116dcdab1bfe5d24ce8e9997984495cae5734b60241c4d0ad7fb45fc2c` |
+| `candidate-02.log.gz` | `3be898b3bfa6eec12abc4cc0ea2cc30afd372dfc37bdc9db271793fc0c3285b8` |
+| `candidate-03.log.gz` | `d6b1314d7c341fd4991b0df10cf9f8866e0e7d454180693177406c70c5616f48` |
+| `candidate-04.log.gz` | `701f1b08bd7f1e9590135d9a46b451d4391d2d16a5ad2b6a0504a610e67a733a` |
+| `candidate-05.log.gz` | `3b144f4951bb66734d717fa7c96f3ec18f84d641e0d0bc9d16f52d98fba19c20` |
+| `candidate-06.log.gz` | `d4685be0c9b2d44f44a9d9fdfd9337e2a234c9141b05136228d73a5da1f6cd1e` |
+| `diagnostic-ordered-01.log.gz` | `c5dee7924e105d25d4c914c3f3e9c1cacc93068cc8659fc8c485063f923b1eb1` |
+| `diagnostic-shutdown-01.log.gz` | `82e9c67f802369e15034ce49ddb4acfa313bd86d4f911b410fc4e9090161ce94` |
+| `adoption-join-red.log.gz` | `bdbb1b21f9bd8041f24d133f6c110761eaeda5b234fea41561a13b6985aadeec` |
+| `read-join-red.log.gz` | `a6a72f0b896720c74545f162a3b1356c787dbe92f49a5b8c3ead4e2aeeef2849` |
+| `lifecycle-phase-red.log.gz` | `94754ed317eb4afa3d21f811fc00405a00b692727400a2861b1a5a3a1b5cf8e2` |
+| `rpc-timeout-red.log.gz` | `5fd69180f2e4c809066a69f257476670be6e14c5cb8613daf6b543509c3a58c7` |
+| `repaired-attempt-01.log.gz` | `45d94a80fd20c6840c45d498f5387b1cb7ce716bcf5538f57941ea5ae1e1f6d4` |
+| `repaired-attempt-02.log.gz` | `87973048d4424e7c3e64f9a6d37a382ba70e1b1b3ce4f8046a42ff3593de5fb8` |
+| `repaired-attempt-03.log.gz` | `4dff519b72eb227671e25e959a967079eebbeef64d11655dee5711c4863e79f4` |
+| `repaired-final-01.log.gz` | `9147c8ede82df08ebbc46256ddb1852008f95e1077027fc4dfca457e26c6c2ef` |
+| `repaired-final-02.log.gz` | `0309bb0e7fff1caf11a0e126fba848fe8dcbdc9fb0469709b9a03694536fa5d4` |
+| `post-rpc-full-runs.log.gz` | `b6f7db990aab66ebdf227e272f355f2267ce45a08bd85524b319731882f15757` |
+| `assertions.md` | `f3df1fb2a9a73517df2e28bb1fffff3d3a9eccefe977d62d9f3fd360b2d9d6ed` |
