@@ -412,25 +412,7 @@ async function runScenario(input: {
         ...(index > 0 ? ['--continue'] : []),
         `Turn ${index + 1}: say hello.`,
       ]
-      let result = await runCli(args, project, env)
-      // The first session starts the plugin's background quota reading. A
-      // quota on disk can precede routing readiness, and vault authority does
-      // not fall back to the local pool. Retry the `no-account` refusal only
-      // until a primary request reaches the mock; provider failures stay fatal.
-      const deadline = Date.now() + 30_000
-      while (
-        input.vault &&
-        index === 0 &&
-        result.exit !== 0 &&
-        result.stdout.includes('openai primary request refused (no-account)') &&
-        primaries(mock.records).length === 0 &&
-        Date.now() < deadline
-      ) {
-        clientLog.push(
-          `--- vault startup admission ---\n${result.stdout}\n${result.stderr}`,
-        )
-        result = await runCli(args, project, env)
-      }
+      const result = await runCli(args, project, env)
       exits.push(result.exit)
       stdout.push(result.stdout)
       clientLog.push(`--- turn ${index + 1} stderr ---\n${result.stderr}`)

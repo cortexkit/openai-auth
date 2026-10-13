@@ -82,6 +82,7 @@ import {
   routePinnedRow,
   type StickyRouteOptions,
   selectStickyRow,
+  waitForFirstQuotaReading,
 } from '../core/pool-routing'
 import { isNonEmittingFrame, parseRateLimitSignal } from '../ws'
 import {
@@ -605,8 +606,20 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       }
       await source.prepareTokens(source.peek().rows, storage)
     }
-    const at = now()
-    const targets = currentTargets(storage, at, vaultMode)
+    let at = now()
+    let targets = currentTargets(storage, at, vaultMode)
+    const firstReading = waitForFirstQuotaReading(
+      routingInput(
+        targets.filter((target) => target.id !== input.rerouteFrom?.accountId),
+        storage,
+        at,
+      ),
+    )
+    if (firstReading) {
+      await firstReading
+      at = now()
+      targets = currentTargets(storage, at, vaultMode)
+    }
     const byId = new Map(targets.map((target) => [target.id, target]))
     const routing = routingInput(targets, storage, at)
     const excluded = new Set<string>(

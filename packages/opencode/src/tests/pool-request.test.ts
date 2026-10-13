@@ -7,7 +7,7 @@
 // These tests drive the plugin's real fetch override against that layout in
 // all three routing modes, the way integration.test.ts drives a legacy one.
 
-import { afterEach, beforeEach, describe, expect } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -16,6 +16,7 @@ import { quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore } from '@cortexkit/common-auth/store'
 import { fallbackRefreshLockName } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
+import { PoolAccountSource } from '../core/pool-account-source'
 import { POOL_QUOTA_UNKNOWN_RETRY_SECONDS } from '../core/pool-routing.ts'
 import { CodexAuthPlugin } from '../index.ts'
 
@@ -582,6 +583,53 @@ describe('a migrated install serves requests from the account pool', () => {
 
 describe('unknown quota on a migrated install', () => {
   for (const mode of MODES) {
+    it(`${mode}: the original request serves after its in-flight first reading, without a host retry`, async () => {
+      seedPool(mode, [{ id: 'main' }])
+      const gate = Promise.withResolvers<void>()
+      releasePolls.push(() => gate.resolve())
+      const wire = installWire({
+        usage: async () => {
+          await gate.promise
+          return new Response(usageBody(10), { status: 200 })
+        },
+      })
+      const fetchOverride = await loadFetch()
+      const asked = Promise.withResolvers<void>()
+      const original = PoolAccountSource.prototype.requestReading
+      const spy = spyOn(
+        PoolAccountSource.prototype,
+        'requestReading',
+      ).mockImplementation(function (
+        this: PoolAccountSource,
+        id: string,
+        force?: boolean,
+      ) {
+        const pending = original.call(this, id, force)
+        asked.resolve()
+        return pending
+      })
+      try {
+        let finished = false
+        const serving = fetchOverride(URL_RESPONSES, request('s-first')).then(
+          (response) => {
+            finished = true
+            return response
+          },
+        )
+        await asked.promise
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        expect(finished).toBe(false)
+        gate.resolve()
+        const response = await serving
+        expect(response.status).toBe(200)
+        expect(wire.sends).toEqual([bearer('main')])
+        expect(wire.polls).toEqual([bearer('main')])
+      } finally {
+        gate.resolve()
+        spy.mockRestore()
+      }
+    })
+
     it(`${mode}: blocks until the first quota poll, which the load starts`, async () => {
       seedPool(mode, [{ id: 'main' }, { id: 'fallback-1' }])
       // Hold every quota poll until released, so the first request finds no

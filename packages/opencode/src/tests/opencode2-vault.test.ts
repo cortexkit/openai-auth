@@ -86,6 +86,8 @@ async function start(
     /** Runs on the seeded files before setup. */
     prepare?: (files: PoolFiles) => void
     fetch?: typeof fetch
+    /** Leave the first quota poll pending so the request path must await it. */
+    waitForQuota?: boolean
     /** Runs the pool lifecycle (migration, then adoptions of slot logins). */
     poolMigration?: boolean
   } = {},
@@ -143,12 +145,13 @@ async function start(
     files.paths(),
   )
   try {
-    await waitFor(() => {
-      const rows = observer.vault.snapshot()?.rows ?? []
-      return routable.every((id) =>
-        rows.some((row) => row.credentialId === id && row.quota),
-      )
-    }, 'the live vault accounts and their quota')
+    if (options.waitForQuota !== false)
+      await waitFor(() => {
+        const rows = observer.vault.snapshot()?.rows ?? []
+        return routable.every((id) =>
+          rows.some((row) => row.credentialId === id && row.quota),
+        )
+      }, 'the live vault accounts and their quota')
   } finally {
     observer.release()
   }
@@ -240,6 +243,55 @@ async function send(host: Host, status: number) {
 }
 
 describe('vault accounts on OpenCode 2', () => {
+  it('the original request joins a pending first vault quota poll and serves without a retry', async () => {
+    const started = Promise.withResolvers<void>()
+    const gate = Promise.withResolvers<void>()
+    let polls = 0
+    const { host } = await start(
+      'fallback-first',
+      [{ id: 'main' }],
+      {
+        'oauth:openai:vault': vaultLogin('chatgpt-vault', {
+          record_version: 7,
+        }),
+      },
+      {
+        waitForQuota: false,
+        fetch: (async (...args: Parameters<typeof fetch>) => {
+          polls++
+          started.resolve()
+          await gate.promise
+          return usageOnly(...args)
+        }) as typeof fetch,
+      },
+    )
+    try {
+      await started.promise
+      let finished = false
+      const serving = send(host, 200).then(
+        (headers) => {
+          finished = true
+          return { headers }
+        },
+        (error: unknown) => {
+          finished = true
+          return { error }
+        },
+      )
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(finished).toBe(false)
+      gate.resolve()
+      const result = await serving
+      expect('headers' in result).toBe(true)
+      if ('headers' in result) {
+        expect(result.headers.get('chatgpt-account-id')).toBe('chatgpt-vault')
+      }
+      expect(polls).toBe(1)
+    } finally {
+      gate.resolve()
+    }
+  })
+
   it('sends with the token the vault serves, and reports a 401 against that send record version only', async () => {
     const { host, daemon } = await start('fallback-first', [{ id: 'main' }], {
       'oauth:openai:vault': vaultLogin('chatgpt-vault', {

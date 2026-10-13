@@ -49,6 +49,7 @@ import { projectQuota, type QuotaMap } from '@cortexkit/common-auth/quota'
 import { createLogger } from './logger'
 import { extractAccountIdFromClaims, parseJwtClaims } from './oauth'
 import { observationFromSnapshot } from './pool-quota'
+import type { QuotaReadingRequest } from './pool-routing'
 import { whamUsageFn } from './provider'
 import { errorMessage } from './util/error'
 
@@ -208,6 +209,10 @@ export class OpenAiVault {
   readonly #options: OpenAiVaultOptions
   readonly #consumer: ClaustrumConsumer
   readonly #pulls = new Map<string, Promise<unknown>>()
+  readonly #quotaPolls = new Map<
+    string,
+    Promise<{ ok: boolean; error?: string }>
+  >()
   #lastError: string | undefined
   #waiting: Promise<ClaustrumEnrollmentStatus> | undefined
   /** The roster discovery this instance has in flight, if any. */
@@ -543,8 +548,18 @@ export class OpenAiVault {
     )
   }
 
-  /** Takes one quota reading for a vault account through the usage endpoint. */
-  async pollQuota(routeId: string): Promise<{ ok: boolean; error?: string }> {
+  /** Joins an existing quota poll, or starts one through the usage endpoint. */
+  pollQuota(routeId: string): Promise<{ ok: boolean; error?: string }> {
+    const pending = this.#quotaPolls.get(routeId)
+    if (pending) return pending
+    const pull = this.#pollQuota(routeId).finally(() => {
+      this.#quotaPolls.delete(routeId)
+    })
+    this.#quotaPolls.set(routeId, pull)
+    return pull
+  }
+
+  async #pollQuota(routeId: string): Promise<{ ok: boolean; error?: string }> {
     let failure: string | undefined
     const fetchImpl = this.#options.fetchImpl?.() ?? globalThis.fetch
     const response = await this.send(
@@ -590,8 +605,9 @@ export class OpenAiVault {
    * because it has no reading yet. At most one reading per account is in
    * flight.
    */
-  requestReading(routeId: string): void {
-    if (this.#pulls.has(routeId)) return
+  requestReading(routeId: string): ReturnType<QuotaReadingRequest> {
+    const pending = this.#pulls.get(routeId)
+    if (pending) return pending
     const pull = this.pollQuota(routeId)
       .catch((error: unknown) => {
         log.warn('vault quota poll failed', {
@@ -603,6 +619,7 @@ export class OpenAiVault {
         this.#pulls.delete(routeId)
       })
     this.#pulls.set(routeId, pull)
+    return pull
   }
 
   /** Readings for the routable vault accounts whose last one is older than `maxAgeMs`. */

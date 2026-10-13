@@ -992,6 +992,19 @@ expect_red = ["^integration:\\skillswitch\\senforcement\\swith\\sfailClosedOnUnk
 expect_message = "/Expected: 429\\s+Received: 200/"
 
 [[control]]
+id = "admission-awaits-first-quota-reading"
+guards = "unknown quota waits for the pending first reading before admission is decided on fresh data"
+file = "packages/core/src/pool-routing.ts"
+old = "    Promise.all(pulls),"
+new = "    Promise.resolve(), // NON-VACUITY BREAK: stop waiting for the first quota reading."
+test_file = "packages/core/src/tests/pool-first-reading.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/pool-first-reading.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^first\\squota\\sreading\\sadmission\\sunknown\\squota\\swaits\\sfor\\san\\sin-flight\\sfirst\\sreading\\sand\\sserves\\swith\\sits\\sresult$"]
+expect_message = "/Expected: false\\s+Received: true/"
+
+[[control]]
 id = "unknown-quota-never-takes-the-last-path"
 guards = "a row refused for unknown quota is not sent on the exhausted-account last path"
 file = "packages/core/src/pool-routing.ts"

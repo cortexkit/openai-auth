@@ -138,17 +138,17 @@ export class PiMainAccount {
   /**
    * Asks for a quota poll, at most once per `MAIN_PULL_RETRY_MS` unless
    * `force`. Admission calls this for every refusal for want of a reading, so
-   * it never waits.
+   * callers may join the returned poll for their first reading.
    */
-  requestReading(force = false): void {
+  requestReading(force = false): Promise<MainPollResult> | undefined {
     const now = this.now()
     if (
       !force &&
       this.lastPull !== undefined &&
       now - this.lastPull < (this.deps.pullRetryMs ?? MAIN_PULL_RETRY_MS)
     )
-      return
-    void this.pollNow()
+      return this.inflight
+    return this.pollNow()
   }
 
   /** The poll under way, if any, so a caller may wait a bounded time for it. */

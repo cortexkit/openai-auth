@@ -51,6 +51,7 @@ import {
   killswitchPassesPolicy,
 } from './accounts'
 import { windowsFromQuotaMap } from './pool-quota'
+import { VAULT_REQUEST_ROSTER_WAIT_MS } from './vault'
 
 /**
  * The main account's row: on OpenCode the row the migration moved the main
@@ -105,6 +106,11 @@ export function orderedPlacement(
   return mode === 'fallback-first' ? 'fallback-first' : 'main-first'
 }
 
+/** Existing callbacks may return a promise for an in-progress quota poll. */
+export type QuotaReadingRequest =
+  | ((id: string) => void)
+  | ((id: string) => Promise<unknown> | undefined)
+
 export interface PoolRoutingInput {
   /** OAuth rows openai-auth can send with, in roster order. */
   rows: readonly RoutingRow[]
@@ -118,7 +124,56 @@ export interface PoolRoutingInput {
    */
   killswitch: ReadonlyMap<string, boolean>
   /** Asks for a quota poll of a row admission refused for want of a reading. */
-  requestPull: (id: string) => void
+  requestPull: QuotaReadingRequest
+}
+
+/**
+ * Gives an otherwise eligible account's first quota poll the same bounded
+ * startup budget as roster discovery. Callers must reread their source after
+ * the wait: completing a poll is not proof that it produced usable quota.
+ * Present readings, including stale ones, stay on the normal admission path.
+ */
+export function waitForFirstQuotaReading(
+  input: PoolRoutingInput,
+  waitMs = VAULT_REQUEST_ROSTER_WAIT_MS,
+): Promise<void> | undefined {
+  const rows = input.rows.filter(
+    (row) =>
+      row.kind === 'oauth' &&
+      input.killswitch.get(row.id) !== false &&
+      projectQuota(row.quota).limits.length === 0,
+  )
+  if (rows.length === 0) return undefined
+  const current = admit({
+    rows: input.rows,
+    now: input.now,
+    rateLimitMarks: input.rateLimitMarks,
+    refreshBackoff: input.refreshBackoff,
+    requestPull: () => {},
+  })
+  if (current.admitted.some((row) => input.killswitch.get(row.id) !== false))
+    return undefined
+  const pulls: Promise<unknown>[] = []
+  admit({
+    rows,
+    now: input.now,
+    rateLimitMarks: input.rateLimitMarks,
+    refreshBackoff: input.refreshBackoff,
+    requestPull: (id) => {
+      const pending = input.requestPull(id)
+      if (pending) pulls.push(pending.catch(() => {}))
+    },
+  })
+  if (pulls.length === 0) return undefined
+  let timer: ReturnType<typeof setTimeout>
+  return Promise.race([
+    Promise.all(pulls),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, waitMs)
+    }),
+  ])
+    .then(() => {})
+    .finally(() => clearTimeout(timer))
 }
 
 export type PoolBlockReason =

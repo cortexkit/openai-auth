@@ -465,6 +465,35 @@ describe('Pi requests on the account pool', () => {
     expect(codexTokens()).toEqual([MAIN_TOKEN])
   })
 
+  test('the original request serves after a pending first reading without a second request', async () => {
+    const gate = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    whamHandler = async () => {
+      started.resolve()
+      await gate.promise
+      return whamOk()
+    }
+    const runtime = makeRuntime()
+    await setMode('main-first')
+    try {
+      let finished = false
+      const serving = send(runtime).then((events) => {
+        finished = true
+        return events
+      })
+      await started.promise
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(finished).toBe(false)
+      expect(codexTokens()).toEqual([])
+      gate.resolve()
+      const events = await serving
+      expect(events[0]?.type).toBe('start')
+      expect(codexTokens()).toEqual([MAIN_TOKEN])
+    } finally {
+      gate.resolve()
+    }
+  })
+
   test('every account gets a quota check as soon as it is seen, before any request', async () => {
     const runtime = makeRuntime()
 

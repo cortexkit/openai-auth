@@ -261,6 +261,10 @@ export class PoolAccountSource {
   private readonly writes = new Map<string, Promise<void>>()
   private readonly marks = new Map<string, number>()
   private readonly lastPull = new Map<string, number>()
+  private readonly quotaPulls = new Map<
+    string,
+    Promise<QuotaObservation | undefined>
+  >()
   private readonly polled = new Set<string>()
   /** The latest poll outcome per row id, read back by `pollRows`. */
   private readonly pollOutcomes = new Map<string, PoolPollResult>()
@@ -340,7 +344,7 @@ export class PoolAccountSource {
       statePath: paths.statePath,
       quota: quotaCodec,
       now: this.now,
-      pull: (request) => this.pull(request),
+      pull: (request) => this.coalescedPull(request),
       onPullFailure: (rowId, error) => {
         this.pollOutcomes.set(rowId, {
           id: rowId,
@@ -520,9 +524,10 @@ export class PoolAccountSource {
   /**
    * Asks the store for a quota poll of one row, at most once per
    * `POOL_PULL_RETRY_MS`. Admission calls this for every row it refuses for
-   * want of a reading, so it must never wait and must stay cheap.
+   * want of a reading. The returned promise lets first-reading admission join
+   * the store's pending polls without blocking callers that do not await it.
    */
-  requestReading(id: string, force = false): void {
+  requestReading(id: string, force = false): Promise<void> | undefined {
     if (this.disposed || this.deps.vaultMode?.()) return
     const now = this.now()
     const last = this.lastPull.get(id)
@@ -531,9 +536,27 @@ export class PoolAccountSource {
       last !== undefined &&
       now - last < (this.deps.pullRetryMs ?? POOL_PULL_RETRY_MS)
     )
-      return
+      return this.storeFor(this.deps.paths()).pullsSettled()
     this.lastPull.set(id, now)
-    this.storeFor(this.deps.paths()).requestReading(id)
+    const store = this.storeFor(this.deps.paths())
+    store.requestReading(id)
+    return store.pullsSettled()
+  }
+
+  private coalescedPull(
+    request: PullRequest,
+  ): Promise<QuotaObservation | undefined> {
+    const key = JSON.stringify([
+      this.deps.paths().configPath,
+      request.id,
+      request.credentialEpoch,
+      request.identity,
+    ])
+    const pending = this.quotaPulls.get(key)
+    if (pending) return pending
+    const pull = this.pull(request).finally(() => this.quotaPulls.delete(key))
+    this.quotaPulls.set(key, pull)
+    return pull
   }
 
   private async pull(
