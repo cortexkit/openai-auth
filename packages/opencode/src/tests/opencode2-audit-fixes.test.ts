@@ -69,8 +69,9 @@ async function start(
     stopped = true
     await cleanup?.()
   }
-  cleanups.push(stop)
+  // Cleanup runs in reverse: drain the host before removing its account files.
   cleanups.push(() => rmSync(files.dir, { recursive: true, force: true }))
+  cleanups.push(stop)
   return { host, stop }
 }
 

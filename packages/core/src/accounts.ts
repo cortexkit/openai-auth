@@ -2234,12 +2234,6 @@ function recordQuotaRefreshError(
   }
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function _clampPercent(value: number) {
-  if (!Number.isFinite(value)) return 0
-  return Math.max(0, Math.min(100, Math.round(value)))
-}
-
 function cachedQuotaWindowStillRelevant(
   window: AccountQuotaWindow | undefined,
   now: number,
@@ -2318,14 +2312,6 @@ export function fallbackRefreshLockName(accountId: string): string {
 }
 const FALLBACK_REFRESH_JOIN_WAIT_MS = 10_000
 const FALLBACK_REFRESH_JOIN_POLL_MS = 100
-
-// ---------------------------------------------------------------------------
-// FallbackAccountManager
-// ---------------------------------------------------------------------------
-
-const _setRefreshLockRenewalTimeout = globalThis.setTimeout.bind(globalThis)
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-const _clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
 
 export class FallbackAccountManager {
   private readonly now: () => number

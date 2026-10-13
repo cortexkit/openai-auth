@@ -30,11 +30,10 @@ import {
   type AccountStorage,
   getFallbackStatuses,
   getKillswitchThresholdsForAccount,
-  isKillswitchEnabled,
   isTombstoned,
-  killswitchPassesPolicy,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
+  type StickyPinPlacement,
 } from '@cortexkit/openai-auth-core/internal'
 
 import { windowsFromQuotaMap } from '@cortexkit/openai-auth-core/pool-quota'
@@ -45,13 +44,13 @@ import {
   type PoolBlock,
   type PoolRoutingInput,
   planOrdered,
+  poolKillswitchVerdicts,
   routePinnedRow,
   type StickyAdmission,
   type StickyRouteOptions,
   selectStickyRow,
   stickyBreak,
 } from '@cortexkit/openai-auth-core/pool-routing'
-import type { PiPinPlacement } from './routing.ts'
 
 /** One account a request may be sent with. */
 export interface RouteAccount {
@@ -98,7 +97,7 @@ export interface PiRouteContext<A extends RouteAttempt> {
    */
   send(account: RouteAccount): Promise<A | undefined>
   /** The session pin ledger: decides (and, when asked, records) a session's pin. */
-  placePin(input: PiPinPlacement): { accountId: string } | undefined
+  placePin(input: StickyPinPlacement): { accountId: string } | undefined
   log?: { debug(message: string, meta?: Record<string, unknown>): void }
 }
 
@@ -153,20 +152,7 @@ function routingInput<A extends RouteAttempt>(
   accounts: readonly RouteAccount[],
 ): PoolRoutingInput {
   const now = ctx.now()
-  const killswitch = new Map<string, boolean>()
-  if (isKillswitchEnabled(ctx.storage)) {
-    for (const account of accounts) {
-      killswitch.set(
-        account.id,
-        killswitchPassesPolicy(
-          windowsFromQuotaMap(account.quota),
-          ctx.storage,
-          account.id === FORMER_MAIN_ID ? undefined : account.id,
-          now,
-        ),
-      )
-    }
-  }
+  const killswitch = poolKillswitchVerdicts(accounts, ctx.storage, now)
   const rows: RoutingRow[] = accounts.map((account) => ({
     id: account.id,
     kind: account.kind ?? 'oauth',

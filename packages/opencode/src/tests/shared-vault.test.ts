@@ -50,6 +50,7 @@ let vaults: Set<OpenAiVault>
 let vaultPolls: Set<Promise<unknown>>
 let wire: ReturnType<typeof installWire>
 let originalFetch: typeof fetch
+let quotaPasses: number
 
 beforeEach(async () => {
   await flushForTest()
@@ -84,9 +85,11 @@ beforeEach(async () => {
   wire = installWire()
   vaults = new Set()
   vaultPolls = new Set()
+  quotaPasses = 0
   const pollStale = OpenAiVault.prototype.pollStale
   const pollSpy = spyOn(OpenAiVault.prototype, 'pollStale').mockImplementation(
     function (this: OpenAiVault, maxAgeMs) {
+      quotaPasses++
       const poll = pollStale.call(this, maxAgeMs)
       vaultPolls.add(poll)
       void poll.then(
@@ -149,15 +152,19 @@ async function plugin(
 }
 
 async function ready() {
+  // Startup owns the first quota pass. Repeated readiness checks must only
+  // observe its live result, not force more writes to the shared roster file.
   await waitFor(
     () =>
       vaults.size > 0 &&
-      [...vaults].every((vault) => vault.snapshot()?.rows.length === 1)
+      [...vaults].every((vault) => {
+        const rows = vault.snapshot()?.rows
+        return rows?.length === 1 && rows[0]?.quota !== undefined
+      })
         ? true
         : undefined,
-    'first roster',
+    'first roster and quota',
   )
-  await Promise.all([...vaults].map((vault) => vault.pollStale(0)))
 }
 
 async function send(fetchImpl: typeof fetch) {
@@ -172,6 +179,73 @@ async function send(fetchImpl: typeof fetch) {
 }
 
 describe('one host vault per process', () => {
+  test('readiness of a warm consumer starts no extra quota pass', async () => {
+    await plugin()
+    await waitFor(
+      () =>
+        [...vaults].every(
+          (vault) => vault.snapshot()?.rows[0]?.quota !== undefined,
+        )
+          ? true
+          : undefined,
+      'startup quota',
+    )
+    await Promise.all([...vaultPolls])
+    expect(quotaPasses).toBeGreaterThan(0)
+    const before = quotaPasses
+    await ready()
+    await ready()
+    expect(quotaPasses).toBe(before)
+  })
+
+  test('readiness waits for quota in the live consumer snapshot', async () => {
+    const entered = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    const fetchImpl = globalThis.fetch
+    const gatedFetch = (async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input)
+      if (url.includes('/wham/usage')) {
+        entered.resolve()
+        await resume.promise
+      }
+      return fetchImpl(input, init)
+    }) as typeof fetch
+    const lease = acquireOpenCodeVault(
+      {
+        host: 'opencode',
+        stateDir,
+        connectionFile: () => daemon.connectionFile,
+        pollIntervalMs: 0,
+        fetchImpl: () => gatedFetch,
+      },
+      {
+        configPath: process.env.OPENCODE_OPENAI_AUTH_FILE!,
+        statePath: process.env.OPENCODE_OPENAI_AUTH_STATE_FILE!,
+      },
+    )
+    cleanups.push(() => lease.release())
+    lease.start()
+    let waiting: Promise<void> | undefined
+    try {
+      await entered.promise
+      expect(lease.vault.snapshot()?.rows).toHaveLength(1)
+      expect(lease.vault.snapshot()?.rows[0]?.quota).toBeUndefined()
+      let returned = false
+      waiting = ready().then(() => {
+        returned = true
+      })
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(returned).toBe(false)
+      resume.resolve()
+      await waiting
+      expect(lease.vault.snapshot()?.rows[0]?.quota).toBeDefined()
+    } finally {
+      resume.resolve()
+      await waiting
+      await Promise.allSettled([...vaultPolls])
+    }
+  })
+
   test('two projects share one roster poll stream', async () => {
     // Drive only the vault's roster timers: wall-clock sleeps would count
     // extra polls if a busy host took longer than one interval to load a project.

@@ -31,6 +31,7 @@ import {
   vaultLogin,
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import { PoolAccountSource } from '../core/pool-account-source'
+import { acquireOpenCodeVault } from '../core/shared-vault'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { VAULT_METHOD } from '../v2/login'
 import { setupOpenAIAuth } from '../v2/setup'
@@ -99,7 +100,7 @@ async function start(
   // An approved enrollment, as Connect leaves it.
   const stateDir = join(files.dir, 'vault')
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
-  const { tokenPath, rosterPath } = vaultPaths(stateDir, 'opencode')
+  const { tokenPath } = vaultPaths(stateDir, 'opencode')
   writeFileSync(
     tokenPath,
     JSON.stringify({ token: ENROLLMENT_TOKEN, token_generation: 1 }),
@@ -130,21 +131,27 @@ async function start(
   const routable = Object.keys(credentials).filter(
     (id) => credentials[id]?.type !== 'api_key',
   )
-  await waitFor(() => {
-    try {
-      const roster = JSON.parse(readFileSync(rosterPath, 'utf8')) as {
-        rows: Array<{ credentialId: string; quota?: unknown }>
-      }
+  // OpenAiVault publishes quota to disk before reloading its live roster.
+  // Wait for that roster to contain the reading instead of sleeping a fixed time.
+  const observer = acquireOpenCodeVault(
+    {
+      host: 'opencode',
+      stateDir,
+      connectionFile: () => daemon.connectionFile,
+      pollIntervalMs: 0,
+    },
+    files.paths(),
+  )
+  try {
+    await waitFor(() => {
+      const rows = observer.vault.snapshot()?.rows ?? []
       return routable.every((id) =>
-        roster.rows.some((row) => row.credentialId === id && row.quota),
+        rows.some((row) => row.credentialId === id && row.quota),
       )
-    } catch {
-      return false
-    }
-  }, 'the vault accounts and their quota')
-  // The vault writes the quota reading to the roster file, then loads the
-  // file back into memory; routing sees the reading once that load is done.
-  await Bun.sleep(100)
+    }, 'the live vault accounts and their quota')
+  } finally {
+    observer.release()
+  }
   return { host, daemon, files, tokenPath }
 }
 

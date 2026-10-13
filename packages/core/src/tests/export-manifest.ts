@@ -58,6 +58,15 @@ export const ROOT_TYPE_EXPORTS = [
 
 /** `@cortexkit/openai-auth-core/internal` — host support past the seam. */
 export const INTERNAL_VALUE_EXPORTS = [
+  'applyPendingPoolObservations',
+  'mergePoolObservation',
+  'nextPoolRefreshBackoff',
+  'placeStickyPin',
+  'poolAccountKey',
+  'poolFileKey',
+  'poolOAuthAccess',
+  'poolRefreshBackoffFor',
+  'rememberPoolObservation',
   'ACCOUNT_FILE_NAME',
   'ACCOUNT_STATE_FILE_NAME',
   'AccountRemovedDuringRefreshError',
@@ -208,6 +217,9 @@ export const INTERNAL_VALUE_EXPORTS = [
 ] as const
 
 export const INTERNAL_TYPE_EXPORTS = [
+  'PoolPendingObservation',
+  'PoolRefreshBackoff',
+  'StickyPinPlacement',
   'AccountBase',
   'AccountManagerOptions',
   'AccountOperationError',

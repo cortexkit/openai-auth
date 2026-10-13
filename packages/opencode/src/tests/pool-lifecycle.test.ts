@@ -146,6 +146,29 @@ const deferrals = (sink: ReturnType<typeof logSink>) =>
   )
 
 describe('the migration in the background', () => {
+  it('does not start follow-up adoption after disposal during migration', async () => {
+    const entered = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    let adoptions = 0
+    const { lifecycle } = create({
+      migrate: async () => {
+        entered.resolve()
+        await resume.promise
+        return { status: 'already-migrated' }
+      },
+      adopt: async () => {
+        adoptions++
+        return { status: 'nothing-to-import', slot: 'slot-absent' }
+      },
+    })
+    lifecycle.start()
+    await entered.promise
+    lifecycle.dispose()
+    resume.resolve()
+    await lifecycle.idle()
+    expect(adoptions).toBe(0)
+  })
+
   it('a shared placeholder cannot migrate an empty separate store', async () => {
     writeFileSync(
       h.paths.configPath,

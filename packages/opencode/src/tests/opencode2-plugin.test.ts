@@ -77,8 +77,9 @@ async function start(
     stopped = true
     await cleanup?.()
   }
-  cleanups.push(stop)
+  // Cleanup runs in reverse: drain the host before removing its account files.
   cleanups.push(() => rmSync(files.dir, { recursive: true, force: true }))
+  cleanups.push(stop)
   return { host, stop }
 }
 
@@ -453,6 +454,46 @@ describe('OpenCode 2 entry: quota', () => {
 })
 
 describe('OpenCode 2 entry: logins', () => {
+  it('cleanup joins a running adoption before releasing its source', async () => {
+    const entered = Promise.withResolvers<void>()
+    const resume = Promise.withResolvers<void>()
+    const drained = Promise.withResolvers<void>()
+    const realSettled = PoolAccountSource.prototype.settled
+    const settled = spyOn(
+      PoolAccountSource.prototype,
+      'settled',
+    ).mockImplementation(async function (this: PoolAccountSource) {
+      await realSettled.call(this)
+      drained.resolve()
+    })
+    let stopping: Promise<void> | undefined
+    try {
+      const { stop } = await startPool('main-first', [{ id: 'main' }], {
+        fence: async () => {
+          entered.resolve()
+          await resume.promise
+          return { open: true }
+        },
+      })
+      await entered.promise
+      let returned = false
+      stopping = stop().then(() => {
+        returned = true
+      })
+      await drained.promise
+      // Let cleanup's ready promises finish while the version fence stays blocked.
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(returned).toBe(false)
+      resume.resolve()
+      await stopping
+      expect(returned).toBe(true)
+    } finally {
+      resume.resolve()
+      await stopping
+      settled.mockRestore()
+    }
+  })
+
   it('setup releases its vault lease when loading the source throws', async () => {
     const files = poolFiles()
     const close = spyOn(OpenAiVault.prototype, 'close')

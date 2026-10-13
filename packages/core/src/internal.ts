@@ -27,6 +27,8 @@ export {
 export * from './logger'
 export * from './oauth'
 export * from './paths'
+export * from './pool-session-pins'
+export * from './pool-source-state'
 export * from './protocol'
 export * from './provider'
 export * from './quota-manager'

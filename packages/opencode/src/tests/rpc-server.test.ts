@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect } from 'bun:test'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -9,7 +9,12 @@ import { discoverPortFile } from '../rpc/port-file'
 import { resolveRpcDir } from '../rpc/rpc-dir'
 import { quotaMap, seedPool } from './fixtures/pool-install'
 import { rpcServerRegistry } from './fixtures/rpc-registry'
+import { createRequestTestScope } from './request-test-scope'
 import { restoreEnv } from './setup-env'
+
+const scope = createRequestTestScope()
+const test = scope.it
+beforeEach(() => scope.capturePluginWork({ vaultPolls: true }))
 
 function makePluginInput(directory: string): PluginInput {
   return {
@@ -30,8 +35,13 @@ async function loadProjectPlugin(directory: string) {
   const plugin = await CodexAuthPlugin(makePluginInput(directory), {
     experimentalWebSockets: false,
   })
-  await loadAuthPlugin(plugin)
-  return plugin
+  try {
+    await loadAuthPlugin(plugin)
+    return plugin
+  } catch (error) {
+    await plugin.dispose?.()
+    throw error
+  }
 }
 
 async function loadAuthPlugin(
@@ -100,8 +110,12 @@ function accountIds(result: {
   )
 }
 
-afterEach(() => {
-  resetNotificationsForTest()
+afterEach(async () => {
+  // Bun can time out a callback while it still owns process-wide overrides.
+  // Keep the next test out until that callback and its loader work are done.
+  await scope.teardown(async () => {
+    resetNotificationsForTest()
+  })
 })
 
 describe('rpc-server', () => {
@@ -184,6 +198,7 @@ describe('rpc-server', () => {
       expect(accountIds(await responseB.json())).toEqual(['account-b'])
     } finally {
       for (const plugin of loaded) await plugin.dispose?.()
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       restoreEnv('XDG_STATE_HOME', originalStateHome)
       restoreEnv('OPENCODE_OPENAI_AUTH_FILE', originalConfigFile)
@@ -246,6 +261,7 @@ describe('rpc-server', () => {
       }
     } finally {
       for (const plugin of loaded) await plugin.dispose?.()
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       restoreEnv('XDG_STATE_HOME', originalStateHome)
       restoreEnv('OPENCODE_OPENAI_AUTH_FILE', originalConfigFile)
@@ -302,6 +318,7 @@ describe('rpc-server', () => {
     } finally {
       await second?.dispose?.()
       await first?.dispose?.()
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       restoreEnv('XDG_STATE_HOME', originalStateHome)
       restoreEnv('OPENCODE_OPENAI_AUTH_FILE', originalConfigFile)
@@ -366,6 +383,7 @@ describe('rpc-server', () => {
       }
     } finally {
       await plugin?.dispose?.()
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       restoreEnv('XDG_STATE_HOME', originalStateHome)
       restoreEnv('OPENCODE_OPENAI_AUTH_FILE', originalConfigFile)
@@ -451,6 +469,7 @@ describe('rpc-server', () => {
       expect(pluginTimers.every((timer) => !timer.active)).toBe(true)
     } finally {
       await plugin?.dispose?.()
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       globalThis.setInterval = originalSetInterval
       globalThis.clearInterval = originalClearInterval
@@ -559,6 +578,7 @@ describe('rpc-server', () => {
       expect(responseAuthorizations).toEqual(['Bearer access-token'])
     } finally {
       await plugin?.dispose?.()
+      await scope.settlePluginWork()
       globalThis.fetch = originalFetch
       restoreEnv('XDG_STATE_HOME', originalStateHome)
       restoreEnv('OPENCODE_OPENAI_AUTH_FILE', originalConfigFile)

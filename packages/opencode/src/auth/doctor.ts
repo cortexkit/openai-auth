@@ -407,16 +407,3 @@ export function authDoctorChecks(deps: AuthDoctorCheckDeps): DoctorCheck[] {
     },
   ]
 }
-
-export function formatAuthDoctorReport(report: AuthDoctorReport): string {
-  const lines = ['OpenAI auth doctor']
-  if (report.findings.length === 0) {
-    lines.push('No problems found.')
-    return lines.join('\n')
-  }
-  for (const finding of report.findings) {
-    const repair = finding.repair ? ' (repair available)' : ''
-    lines.push(`- ${finding.message}${repair}`)
-  }
-  return lines.join('\n')
-}

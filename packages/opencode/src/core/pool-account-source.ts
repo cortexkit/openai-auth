@@ -30,10 +30,9 @@
 // by the row's wire identity where the row records one, so a row that comes
 // to hold a different account never inherits the old account's state.
 
-import { readFileSync, statSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import {
   isQuotaMap,
-  mergeQuotaObservation,
   projectQuota,
   type QuotaObservation,
   quotaCodec,
@@ -49,13 +48,21 @@ import {
 import {
   type AccountPaths,
   type AccountStorage,
-  buildRefreshOperationError,
+  poolAccountKey as accountKey,
+  applyPendingPoolObservations,
+  type PoolRefreshBackoff as BackoffEntry,
   extractAccountIdFromClaims,
+  poolFileKey as fileKey,
   hashRefreshToken,
-  isTransientRefreshError,
+  mergePoolObservation,
+  nextPoolRefreshBackoff,
+  poolOAuthAccess as oauthAccess,
+  type PoolPendingObservation as PendingObservation,
   parseJwtClaims,
+  poolRefreshBackoffFor,
   refreshBackoffActive,
   refreshBeforeExpiryMs,
+  rememberPoolObservation,
 } from '@cortexkit/openai-auth-core/internal'
 import { createLogger } from '../logger'
 import { HOT_PATH_READ_BUDGET_MS, settleWithinBudget } from '../sidebar-state'
@@ -74,13 +81,6 @@ export const POOL_TOKEN_MIN_VALIDITY_MS = 60_000
 
 /** Minimum interval between two quota-poll requests this process makes for the same row. */
 export const POOL_PULL_RETRY_MS = 15_000
-
-/**
- * Retry delay after a refresh that failed without reaching the provider: a
- * lock that did not come free in time, or an older process's lease on the
- * same token.
- */
-const LOCAL_REFRESH_RETRY_MS = 30_000
 
 /**
  * Longest a request's token step waits for the vault's first roster (see
@@ -119,10 +119,6 @@ export async function settlesWithin(
   clearTimeout(timer)
   return settled
 }
-
-/** Observations kept per row to re-apply over a re-read the store write has not reached yet. */
-const PENDING_OBSERVATIONS_PER_ROW = 8
-const PENDING_OBSERVATION_MAX_AGE_MS = 30 * 60_000
 
 export interface PoolView {
   /** True when the install is migrated and the pool loaded; the pool serves requests. */
@@ -181,18 +177,6 @@ export interface PoolAccountSourceDeps {
   vaultFirstRosterBackgroundWaitMs?: number
 }
 
-type BackoffEntry = {
-  nextRetryAt: number
-  tokenHash: string
-  retryCount: number
-}
-
-type PendingObservation = {
-  credentialEpoch: number | undefined
-  identity: string | undefined
-  observation: QuotaObservation
-}
-
 type Snapshot = PoolView & { key: string | undefined; readAt: number }
 
 /** How one row's quota poll ended, for callers that report it (the `/openai` quota check). */
@@ -218,15 +202,6 @@ function identityOfToken(access: string | undefined): string | undefined {
   if (!access) return undefined
   const claims = parseJwtClaims(access)
   return claims ? extractAccountIdFromClaims(claims) : undefined
-}
-
-function fileKey(path: string): string {
-  try {
-    const stat = statSync(path)
-    return `${stat.ino}:${stat.size}:${stat.mtimeMs}`
-  } catch {
-    return '-'
-  }
 }
 
 function readMigratedAt(configPath: string): number | undefined {
@@ -255,27 +230,6 @@ function readMigratedAt(configPath: string): number | undefined {
 function pollable(row: PoolRow): boolean {
   if (row.type !== 'oauth') return false
   return row.candidate || (row.torn === true && row.enabled)
-}
-
-/** The key account state is partitioned by: the wire identity, else the row id. */
-function accountKey(row: Pick<PoolRow, 'id' | 'identity'>): string {
-  return row.identity ? `identity:${row.identity}` : `row:${row.id}`
-}
-
-export function oauthAccess(row: PoolRow):
-  | {
-      access: string
-      expires: number | undefined
-      refresh: string
-    }
-  | undefined {
-  const credential = row.credential
-  if (credential?.type !== 'oauth') return undefined
-  return {
-    access: credential.access ?? '',
-    expires: credential.expires,
-    refresh: credential.refresh,
-  }
 }
 
 export class PoolAccountSource {
@@ -352,6 +306,7 @@ export class PoolAccountSource {
    * at most the hot-path read budget.
    */
   async current(): Promise<PoolView> {
+    if (this.disposed) return this.peek()
     const key = this.filesKey()
     if (this.snapshot.key === key) return this.peek()
     const read = this.startRead(key)
@@ -365,7 +320,9 @@ export class PoolAccountSource {
 
   /** Reads the rows now (the loader's first read, and tests). */
   async load(): Promise<PoolView> {
+    if (this.disposed) return this.peek()
     await this.deps.vaultAuthority?.()
+    if (this.disposed) return this.peek()
     const snapshot = await this.startRead(this.filesKey())
     return { active: snapshot.active, rows: snapshot.rows }
   }
@@ -418,6 +375,7 @@ export class PoolAccountSource {
   }
 
   private startRead(key: string): Promise<Snapshot> {
+    if (this.disposed) return Promise.resolve(this.snapshot)
     if (this.inflightRead?.key === key) return this.inflightRead.promise
     const readAt = this.now()
     const promise = this.read(key, readAt)
@@ -454,6 +412,7 @@ export class PoolAccountSource {
       // every account from routing.
       return this.snapshot
     }
+    if (this.disposed) return this.snapshot
     const wasActive = this.snapshot.active
     if (readAt >= this.snapshot.readAt) {
       this.snapshot = { ...next, rows: this.withLocalState(next.rows) }
@@ -488,28 +447,8 @@ export class PoolAccountSource {
         if (fileStamp >= ownStamp) this.rotated.delete(row.id)
         else next = { ...next, credential: rotated }
       }
-      const pending = (this.pending.get(accountKey(row)) ?? []).filter(
-        (entry) =>
-          now - entry.observation.checkedAt <= PENDING_OBSERVATION_MAX_AGE_MS,
-      )
-      for (const entry of pending) {
-        if (
-          entry.credentialEpoch !== row.credentialEpoch ||
-          entry.identity !== row.identity
-        )
-          continue
-        next = { ...next, quota: this.merged(next.quota, entry.observation) }
-      }
-      return next
+      return applyPendingPoolObservations(next, this.pending, now)
     })
-  }
-
-  private merged(stored: unknown, observation: QuotaObservation): unknown {
-    try {
-      return mergeQuotaObservation(stored, observation)
-    } catch {
-      return stored
-    }
   }
 
   private replaceRow(id: string, update: (row: PoolRow) => PoolRow): void {
@@ -632,19 +571,10 @@ export class PoolAccountSource {
   }
 
   private applyObservation(row: PoolRow, observation: QuotaObservation): void {
-    const key = accountKey(row)
-    const list = [
-      ...(this.pending.get(key) ?? []),
-      {
-        credentialEpoch: row.credentialEpoch,
-        identity: row.identity,
-        observation,
-      },
-    ].slice(-PENDING_OBSERVATIONS_PER_ROW)
-    this.pending.set(key, list)
+    rememberPoolObservation(this.pending, row, observation)
     this.replaceRow(row.id, (current) => ({
       ...current,
-      quota: this.merged(current.quota, observation),
+      quota: mergePoolObservation(current.quota, observation),
       needsFirstReading: false,
     }))
   }
@@ -920,62 +850,22 @@ export class PoolAccountSource {
       error: error instanceof Error ? error.message : String(error),
     })
     if (!refreshToken) return
-    const now = this.now()
-    const tokenHash = hashRefreshToken(refreshToken)
-    const previous = this.backoff.get(id)
-    // A provider answer (an HTTP status) or a network failure backs off the
-    // way the legacy refresher does. Anything else is local (a lock that did
-    // not come free, an older process's lease on the token) and is retried
-    // soon: a day-long backoff would strand a healthy account.
-    const fromProvider =
-      typeof (error as { status?: unknown } | null)?.status === 'number' ||
-      isTransientRefreshError(error)
-    if (fromProvider) {
-      const built = buildRefreshOperationError({
-        error,
-        now,
+    this.backoff.set(
+      id,
+      nextPoolRefreshBackoff(
         refreshToken,
-        ...(previous
-          ? {
-              previous: {
-                message: '',
-                checkedAt: now,
-                nextRetryAt: previous.nextRetryAt,
-                retryCount: previous.retryCount,
-                tokenHash: previous.tokenHash,
-              },
-            }
-          : {}),
-      })
-      this.backoff.set(id, {
-        nextRetryAt: built.nextRetryAt,
-        tokenHash,
-        retryCount: built.retryCount,
-      })
-    } else {
-      this.backoff.set(id, {
-        nextRetryAt: now + LOCAL_REFRESH_RETRY_MS,
-        tokenHash,
-        retryCount: previous?.tokenHash === tokenHash ? previous.retryCount : 0,
-      })
-    }
+        error,
+        this.now(),
+        this.backoff.get(id),
+      ),
+    )
   }
 
   /** Row id to the time a failed refresh may be retried, for rows with no usable token. */
   refreshBackoffFor(rows: readonly PoolRow[]): Map<string, number> {
-    const now = this.now()
-    const out = new Map<string, number>()
-    for (const row of rows) {
-      if (this.usableToken(row, now)) continue
-      const own = this.backoff.get(row.id)
-      out.set(
-        row.id,
-        own && own.nextRetryAt > now
-          ? own.nextRetryAt
-          : now + LOCAL_REFRESH_RETRY_MS,
-      )
-    }
-    return out
+    return poolRefreshBackoffFor(rows, this.backoff, this.now(), (row, now) =>
+      this.usableToken(row, now),
+    )
   }
 
   // -------------------------------------------------------------------------
@@ -1110,13 +1000,22 @@ export class PoolAccountSource {
     this.disposed = true
   }
 
-  /** Resolves once every queued quota write, poll and refresh has settled (tests). */
+  /** Joins the cached in-flight read, quota writes, polls and refreshes. */
   async settled(): Promise<void> {
     for (;;) {
-      const pending = [...this.writes.values(), ...this.refreshing.values()]
+      const pending = [
+        ...this.writes.values(),
+        ...this.refreshing.values(),
+        ...(this.inflightRead ? [this.inflightRead.promise] : []),
+      ]
       await Promise.allSettled(pending)
       await this.store?.store.pullsSettled()
-      if (this.writes.size === 0 && this.refreshing.size === 0) return
+      if (
+        this.writes.size === 0 &&
+        this.refreshing.size === 0 &&
+        !this.inflightRead
+      )
+        return
     }
   }
 }

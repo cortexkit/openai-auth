@@ -383,6 +383,7 @@ export async function setupOpenAIAuth(
   )
   const vault = vaultLease.vault
   let setupComplete = false
+  let closing = false
   using _leaseRollback = {
     [Symbol.dispose]() {
       if (!setupComplete) vaultLease.release()
@@ -472,7 +473,7 @@ export async function setupOpenAIAuth(
         migrate: async (deps) => {
           const outcome = await migrateToPool(deps)
           migrationRefused = outcome.status === 'refused'
-          void source.load()
+          if (!closing) await source.load()
           return outcome
         },
         // `vaultServes` is false until the vault's first roster read has
@@ -481,10 +482,12 @@ export async function setupOpenAIAuth(
         // so the lifecycle (and a login waiting for it to go idle) is never
         // held, and the next scheduled run tries again.
         adopt: async (deps) => {
+          if (closing) return { status: 'retry', reason: 'unsettled' }
           if (!(await settlesWithin(vaultFirstRoster, vaultRosterWaitMs)))
             return { status: 'retry', reason: 'vault-roster-pending' }
+          if (closing) return { status: 'retry', reason: 'unsettled' }
           const outcome = await adoptHostSlotLogin(deps)
-          void source.load()
+          if (!closing) await source.load()
           return outcome
         },
       })
@@ -574,24 +577,31 @@ export async function setupOpenAIAuth(
 
   setupComplete = true
   return async () => {
+    closing = true
     abort.abort()
     lifecycle?.dispose()
+    source.dispose()
     await Promise.allSettled([
       installation.dispose(),
       methods.dispose(),
       models.dispose(),
     ])
-    // Quota readings taken from responses are written to the pool files in
-    // the background; wait a bounded time for those writes so a clean
-    // shutdown does not lose them.
-    await Promise.race([
-      source.settled(),
-      new Promise((resolve) =>
-        setTimeout(resolve, SETTLE_ON_DISPOSE_MS).unref?.(),
-      ),
-    ])
-    vaultLease.release()
-    source.dispose()
-    await heartbeat?.release()
+    // Join account-pool transfers and reads after stopping new slot adoptions.
+    // Their reloads must finish before releasing this host's state. Preserve
+    // the five-second shutdown limit for an unresponsive provider or login slot.
+    let settleTimer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        Promise.all([lifecycle?.idle(), source.settled()]),
+        new Promise<void>((resolve) => {
+          settleTimer = setTimeout(resolve, SETTLE_ON_DISPOSE_MS)
+          settleTimer.unref?.()
+        }),
+      ])
+    } finally {
+      clearTimeout(settleTimer)
+      vaultLease.release()
+      await heartbeat?.release()
+    }
   }
 }
