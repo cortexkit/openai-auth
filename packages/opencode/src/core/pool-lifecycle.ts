@@ -214,7 +214,9 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
   }
 
   async function runMigration(): Promise<void> {
-    if (await pausedNow()) return
+    // Authority checks can finish after disposal. Do not start a transfer or
+    // its follow-up adoption after the lifecycle has stopped scheduling work.
+    if (stopped || (await pausedNow()) || stopped) return
     let outcome: PoolTransferOutcome
     try {
       outcome = await migrate({ ...runDeps(), fence })
@@ -252,7 +254,7 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
   }
 
   async function runAdoption(): Promise<void> {
-    if (await pausedNow()) return
+    if (stopped || (await pausedNow()) || stopped) return
     let outcome: PoolTransferOutcome
     try {
       // Adoption copies a slot token into the pool the same way migration
@@ -261,6 +263,8 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
       // between the copy and the placeholder. Until it exits, the login is
       // served from the slot as before.
       const gate = await fence()
+      // The fence may have been pending when disposal stopped the lifecycle.
+      if (stopped) return
       if (!gate.open) {
         const key = JSON.stringify(gate.blockers)
         if (key !== lastAdoptionBlockers) {

@@ -3035,3 +3035,66 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/core", "./src/tests/pool-source-state.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^shared\spool\ssource\sstate\sdoes\snot\sreplay\sa\sreading\sonto\sa\sreplaced\scredential\sepoch$']
+
+# Cleanup must finish the adoption it stopped scheduling before releasing host state.
+[[control]]
+id = "opencode2-disposal-joins-adoption"
+guards = "a running adoption and its pool reload cannot outlive host cleanup"
+file = "packages/opencode/src/v2/setup.ts"
+old = "        Promise.all([lifecycle?.idle(), source.settled()]),"
+new = "        Promise.all([Promise.resolve(), source.settled()]), // NON-VACUITY BREAK: abandon adoption."
+test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sentry:\slogins\scleanup\sjoins\sa\srunning\sadoption\sbefore\sreleasing\sits\ssource$']
+
+# A bounded request may leave its read running; cleanup still has to join it.
+[[control]]
+id = "pool-source-disposal-joins-read"
+guards = "a source read that exceeded the request budget still belongs to its source"
+file = "packages/opencode/src/core/pool-account-source.ts"
+old = """  async settled(): Promise<void> {
+    for (;;) {
+      const pending = [
+        ...this.writes.values(),
+        ...this.refreshing.values(),
+        ...(this.inflightRead ? [this.inflightRead.promise] : []),
+      ]
+      await Promise.allSettled(pending)
+      await this.store?.store.pullsSettled()
+      if (
+        this.writes.size === 0 &&
+        this.refreshing.size === 0 &&
+        !this.inflightRead
+      )
+        return
+    }
+  }"""
+new = """  async settled(): Promise<void> {
+    // NON-VACUITY BREAK: forget a started source read.
+    for (;;) {
+      const pending = [...this.writes.values(), ...this.refreshing.values()]
+      await Promise.allSettled(pending)
+      await this.store?.store.pullsSettled()
+      if (this.writes.size === 0 && this.refreshing.size === 0) return
+    }
+  }"""
+test_file = "packages/opencode/src/tests/pool-source-disposal.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-source-disposal.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^pool\ssource\sdisposal\ssettled\sjoins\sa\sread\sthat\sexceeded\sthe\srequest\sbudget$']
+
+# Finishing a migration after shutdown must not start a new adoption phase.
+[[control]]
+id = "pool-lifecycle-disposal-stops-next-phase"
+guards = "a stopped lifecycle cannot start adoption when an in-flight migration finishes"
+file = "packages/opencode/src/core/pool-lifecycle.ts"
+old = "      stopped = true"
+new = "      stopped = false // NON-VACUITY BREAK: keep scheduling phases after disposal."
+test_file = "packages/opencode/src/tests/pool-lifecycle.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-lifecycle.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\smigration\sin\sthe\sbackground\sdoes\snot\sstart\sfollow-up\sadoption\safter\sdisposal\sduring\smigration$']

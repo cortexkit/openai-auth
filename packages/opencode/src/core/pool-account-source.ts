@@ -306,6 +306,7 @@ export class PoolAccountSource {
    * at most the hot-path read budget.
    */
   async current(): Promise<PoolView> {
+    if (this.disposed) return this.peek()
     const key = this.filesKey()
     if (this.snapshot.key === key) return this.peek()
     const read = this.startRead(key)
@@ -319,7 +320,9 @@ export class PoolAccountSource {
 
   /** Reads the rows now (the loader's first read, and tests). */
   async load(): Promise<PoolView> {
+    if (this.disposed) return this.peek()
     await this.deps.vaultAuthority?.()
+    if (this.disposed) return this.peek()
     const snapshot = await this.startRead(this.filesKey())
     return { active: snapshot.active, rows: snapshot.rows }
   }
@@ -372,6 +375,7 @@ export class PoolAccountSource {
   }
 
   private startRead(key: string): Promise<Snapshot> {
+    if (this.disposed) return Promise.resolve(this.snapshot)
     if (this.inflightRead?.key === key) return this.inflightRead.promise
     const readAt = this.now()
     const promise = this.read(key, readAt)
@@ -408,6 +412,7 @@ export class PoolAccountSource {
       // every account from routing.
       return this.snapshot
     }
+    if (this.disposed) return this.snapshot
     const wasActive = this.snapshot.active
     if (readAt >= this.snapshot.readAt) {
       this.snapshot = { ...next, rows: this.withLocalState(next.rows) }
@@ -995,13 +1000,22 @@ export class PoolAccountSource {
     this.disposed = true
   }
 
-  /** Resolves once every queued quota write, poll and refresh has settled (tests). */
+  /** Joins the cached in-flight read, quota writes, polls and refreshes. */
   async settled(): Promise<void> {
     for (;;) {
-      const pending = [...this.writes.values(), ...this.refreshing.values()]
+      const pending = [
+        ...this.writes.values(),
+        ...this.refreshing.values(),
+        ...(this.inflightRead ? [this.inflightRead.promise] : []),
+      ]
       await Promise.allSettled(pending)
       await this.store?.store.pullsSettled()
-      if (this.writes.size === 0 && this.refreshing.size === 0) return
+      if (
+        this.writes.size === 0 &&
+        this.refreshing.size === 0 &&
+        !this.inflightRead
+      )
+        return
     }
   }
 }

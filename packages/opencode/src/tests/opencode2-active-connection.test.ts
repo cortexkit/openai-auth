@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 import { readFileSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
 import {
   isPlaceholderCredential,
   OpenCode2AuthError,
@@ -46,6 +47,7 @@ async function start(
     heartbeat: false,
     fence: async () => ({ open: true }),
     slot: {
+      path: join(files.dir, 'auth.json'),
       all: async () => ({}),
       get: async () => undefined,
       set: async () => {},
