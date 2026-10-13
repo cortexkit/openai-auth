@@ -51,7 +51,6 @@ import {
   killswitchPassesPolicy,
 } from './accounts'
 import { windowsFromQuotaMap } from './pool-quota'
-import { VAULT_REQUEST_ROSTER_WAIT_MS } from './vault'
 
 /**
  * The main account's row: on OpenCode the row the migration moved the main
@@ -94,6 +93,12 @@ export function poolKillswitchVerdicts(
 export const POOL_QUOTA_UNKNOWN_RETRY_SECONDS = 5
 
 /**
+ * A first usage reading is one HTTP call and can take several seconds under
+ * load. A short wait beats refusing the user's first request.
+ */
+export const FIRST_QUOTA_READING_WAIT_MS = 5_000
+
+/**
  * Where an ordered routing mode puts the main row: `ordered` (the shared
  * menu's name for plain roster order) keeps the roster order, `fallback-first`
  * puts row `main` last, and anything else (`main-first`, or a value an older
@@ -128,14 +133,14 @@ export interface PoolRoutingInput {
 }
 
 /**
- * Gives an otherwise eligible account's first quota poll the same bounded
- * startup budget as roster discovery. Callers must reread their source after
- * the wait: completing a poll is not proof that it produced usable quota.
+ * Gives an otherwise eligible account's first quota poll a bounded startup
+ * budget. Callers must reread their source after the wait: completing a poll
+ * is not proof that it produced usable quota.
  * Present readings, including stale ones, stay on the normal admission path.
  */
 export function waitForFirstQuotaReading(
   input: PoolRoutingInput,
-  waitMs = VAULT_REQUEST_ROSTER_WAIT_MS,
+  waitMs = FIRST_QUOTA_READING_WAIT_MS,
 ): Promise<void> | undefined {
   const rows = input.rows.filter(
     (row) =>

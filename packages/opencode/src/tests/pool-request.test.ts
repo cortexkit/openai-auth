@@ -676,7 +676,7 @@ describe('unknown quota on a migrated install', () => {
       const served = await fetchOverride(URL_RESPONSES, request('s-unknown'))
       expect(served.status).toBe(200)
       expect(wire.sends).toHaveLength(1)
-    })
+    }, 8_000)
   }
 
   it('a row whose reading is unknown is skipped while another serves', async () => {

@@ -53,6 +53,7 @@ import {
 } from '@cortexkit/openai-auth-core/internal'
 import { observationFromSnapshot } from '@cortexkit/openai-auth-core/pool-quota'
 import {
+  FIRST_QUOTA_READING_WAIT_MS,
   FORMER_MAIN_ID,
   POOL_QUOTA_UNKNOWN_RETRY_SECONDS,
   type PoolBlock,
@@ -84,10 +85,9 @@ import {
 } from './vault-slot.ts'
 
 /**
- * The shared admission budget for an account's missing first quota reading,
- * matching the bounded wait for the vault's first roster.
+ * The shared admission budget for an account's missing first usage reading.
  */
-export const FIRST_READING_WAIT_MS = VAULT_REQUEST_ROSTER_WAIT_MS
+export const FIRST_READING_WAIT_MS = FIRST_QUOTA_READING_WAIT_MS
 
 /** Longest a request waits for a lock-free re-read of the account settings. */
 const STORAGE_READ_BUDGET_MS = 500

@@ -36,7 +36,7 @@ import {
   getPiStickyRouting,
   setPiStickyRouting,
 } from '../routing.ts'
-import { PiOpenAIRuntime } from '../runtime.ts'
+import { FIRST_READING_WAIT_MS, PiOpenAIRuntime } from '../runtime.ts'
 
 const CODEX_URL = 'https://chatgpt.com/backend-api/codex/responses'
 const WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage'
@@ -166,7 +166,9 @@ async function setMode(mode: RoutingMode): Promise<void> {
   }, paths)
 }
 
-function makeRuntime(firstReadingWaitMs = 2_000): PiOpenAIRuntime {
+function makeRuntime(
+  firstReadingWaitMs = FIRST_READING_WAIT_MS,
+): PiOpenAIRuntime {
   return new PiOpenAIRuntime({
     streamSimple,
     createStream: createAssistantMessageEventStream,

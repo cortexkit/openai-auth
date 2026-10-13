@@ -5,7 +5,6 @@ import {
   planOrdered,
   waitForFirstQuotaReading,
 } from '../pool-routing'
-import { VAULT_REQUEST_ROSTER_WAIT_MS } from '../vault'
 
 const quota = (checkedAt = Date.now()): QuotaMap => ({
   limits: [
@@ -84,14 +83,12 @@ describe('first quota reading admission', () => {
     const routing = input(() => new Promise<void>(() => {}))
     const start = Date.now()
     await waitForFirstQuotaReading(routing)
-    expect(Date.now() - start).toBeGreaterThanOrEqual(
-      VAULT_REQUEST_ROSTER_WAIT_MS - 100,
-    )
+    expect(Date.now() - start).toBeGreaterThanOrEqual(4_900)
     expect(plan(routing)).toEqual({
       kind: 'block',
       block: { reason: 'quota-unknown' },
     })
-  }, 5_000)
+  }, 8_000)
 
   test('an unreadable first reading still refuses without trusting pull completion', async () => {
     const failed = Promise.reject(new Error('unreadable'))

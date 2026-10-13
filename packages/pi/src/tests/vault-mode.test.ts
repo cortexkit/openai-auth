@@ -50,7 +50,7 @@ import { createPiMenu } from '../commands.ts'
 import { registerPiProvider } from '../index.ts'
 import { PiPoolSource } from '../pool-source.ts'
 import { clearPiStickyRouting } from '../routing.ts'
-import { PiOpenAIRuntime } from '../runtime.ts'
+import { FIRST_READING_WAIT_MS, PiOpenAIRuntime } from '../runtime.ts'
 import {
   openVaultSlot,
   VAULT_PLACEHOLDER_KEY,
@@ -185,7 +185,7 @@ function runtimeWith(target: OpenAiVault, slot?: PiSlot): PiOpenAIRuntime {
     fetchImpl: fakeFetch,
     // Long enough for the first quota poll of Pi's login once local routing
     // is back, so a local request is not refused for want of a reading.
-    firstReadingWaitMs: 2_000,
+    firstReadingWaitMs: FIRST_READING_WAIT_MS,
     vault: target,
     slot:
       slot ??
