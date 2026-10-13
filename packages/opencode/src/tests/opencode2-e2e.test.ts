@@ -290,7 +290,6 @@ async function runScenario(input: {
     env.OPENAI_AUTH_E2E_DESTINATIONS = join(root, 'destinations.jsonl')
   }
   let daemon: MockDaemon | undefined
-  let rosterPath = ''
   if (input.vault) {
     daemon = await startMockDaemon({
       directory: root,
@@ -306,7 +305,6 @@ async function runScenario(input: {
       vaultStateDir(join(configDir, 'openai-auth-state.json')),
       'opencode',
     )
-    rosterPath = paths.rosterPath
     mkdirSync(join(paths.tokenPath, '..'), { recursive: true, mode: 0o700 })
     writeFileSync(
       paths.tokenPath,
@@ -401,40 +399,38 @@ async function runScenario(input: {
       exported = dump.stdout
       clientLog.push(`--- export ---\n${dump.stdout}\n${dump.stderr}`)
     }
-    // The host starts the plugin with the first session. The plugin then
-    // reads the vault's roster and takes a quota reading of its account in
-    // the background; routing admits the account once it has one.
-    const vaultReady = async () => {
-      const deadline = Date.now() + 30_000
-      const ready = () => {
-        try {
-          return JSON.parse(readFileSync(rosterPath, 'utf8')).rows.some(
-            (row: { quota?: unknown }) => row.quota,
-          )
-        } catch {
-          return false
-        }
-      }
-      while (!ready() && Date.now() < deadline) await Bun.sleep(100)
-    }
     for (const [index, turn] of input.turns.entries()) {
-      if (input.vault && index === 1) await vaultReady()
       if (turn.reject) mock.reject(turn.reject.account, turn.reject.mode)
-      const result = await runCli(
-        [
-          'run',
-          '--server',
-          serverURL,
-          '--format',
-          'json',
-          '--model',
-          `openai/${model}${turn.variant ? `#${turn.variant}` : ''}`,
-          ...(index > 0 ? ['--continue'] : []),
-          `Turn ${index + 1}: say hello.`,
-        ],
-        project,
-        env,
-      )
+      const args = [
+        'run',
+        '--server',
+        serverURL,
+        '--format',
+        'json',
+        '--model',
+        `openai/${model}${turn.variant ? `#${turn.variant}` : ''}`,
+        ...(index > 0 ? ['--continue'] : []),
+        `Turn ${index + 1}: say hello.`,
+      ]
+      let result = await runCli(args, project, env)
+      // The first session starts the plugin's background quota reading. A
+      // quota on disk can precede routing readiness, and vault authority does
+      // not fall back to the local pool. Retry the `no-account` refusal only
+      // until a primary request reaches the mock; provider failures stay fatal.
+      const deadline = Date.now() + 30_000
+      while (
+        input.vault &&
+        index === 0 &&
+        result.exit !== 0 &&
+        result.stdout.includes('openai primary request refused (no-account)') &&
+        primaries(mock.records).length === 0 &&
+        Date.now() < deadline
+      ) {
+        clientLog.push(
+          `--- vault startup admission ---\n${result.stdout}\n${result.stderr}`,
+        )
+        result = await runCli(args, project, env)
+      }
       exits.push(result.exit)
       stdout.push(result.stdout)
       clientLog.push(`--- turn ${index + 1} stderr ---\n${result.stderr}`)
@@ -995,17 +991,13 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       mode: 'fallback-first',
       plugin: vaultPlugin,
       vault: true,
-      // The first turn starts the plugin. It goes to the vault account only if
-      // the account's first quota reading lands before the turn is routed;
-      // otherwise the pool row serves it.
       turns: [{}, {}, { reject: { account: 'V', mode: 'unauthorized' } }],
     })
     verify(result, () => {
       expect(result.exits.slice(0, 2)).toEqual([0, 0])
       expectOnlyPoolAccountsOnWire(result)
       const served = pick(primaries(result.wire), 'identity', 'rejected')
-      expect(['A:', 'V:']).toContain(served[0] ?? '')
-      expect(served.slice(1)).toEqual(['V:', 'V:unauthorized'])
+      expect(served).toEqual(['V:', 'V:', 'V:unauthorized'])
       expect(result.stdout[1]).toContain('-V')
       expect(result.vaultReports).toEqual([
         expect.objectContaining({
