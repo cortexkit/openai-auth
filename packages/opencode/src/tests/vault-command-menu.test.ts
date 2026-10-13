@@ -56,7 +56,7 @@ beforeEach(() => {
     state: 'active',
     label:
       id === 'main'
-        ? 'beatricelau0414@gmail.com'
+        ? 'vault-user@example.com'
         : id === 'ufuk'
           ? 'gmail'
           : 'live',

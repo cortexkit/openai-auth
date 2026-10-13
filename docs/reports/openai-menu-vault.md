@@ -38,7 +38,7 @@ Before replacing the production menu, the new tests produced these failures agai
 | Cold/declined ownership | Expected to contain `1 account(s) can route, 2 local row(s) set aside.`; received `2 account(s), 2 enabled.` |
 | Vault quota polls | Expected the three vault route ids in the poll log; received `[]` |
 | Vault floor edit | Expected `result.ok` to be `true`; received `false` (vault route action unavailable) |
-| Reset label | Expected to contain `set aside (served by vault beatricelau0414@gmail.com)`; received `Main account` |
+| Reset label | Expected to contain `set aside (served by vault vault-user@example.com)`; received `Main account` |
 
 Additional controlled regressions produced these assertions:
 
@@ -75,17 +75,17 @@ Fixture: two shadowed local rows and three active vault accounts, including one 
 
 ### Accounts
 3 account(s) can route, 2 local row(s) set aside.
-- main: OAuth · enabled · chatgpt-main · primary 93% left · set aside (served by vault beatricelau0414@gmail.com) · quota read 3d ago
+- main: OAuth · enabled · chatgpt-main · primary 93% left · set aside (served by vault vault-user@example.com) · quota read 3d ago
 - ufuk: OAuth · enabled · chatgpt-ufuk · primary 15% left · set aside (served by vault gmail)
-- beatricelau0414@gmail.com: Vault · login · active · enabled · primary 93% left · quota read 3d ago
+- vault-user@example.com: Vault · login · active · enabled · primary 93% left · quota read 3d ago
 - gmail: Vault · login · active · enabled · primary 15% left
 - live: Vault · login · active · enabled · primary 15% left
 
 ### Quota
 Scope: all.
-- main: primary 93% left · set aside (served by vault beatricelau0414@gmail.com) · quota read 3d ago
+- main: primary 93% left · set aside (served by vault vault-user@example.com) · quota read 3d ago
 - ufuk: primary 15% left · set aside (served by vault gmail)
-- beatricelau0414@gmail.com: primary 93% left · quota read 3d ago
+- vault-user@example.com: primary 93% left · quota read 3d ago
 - gmail: primary 15% left
 - live: primary 15% left
 
@@ -96,9 +96,9 @@ Roster order: main, ufuk.
 ### Limits
 Killswitch: off.
 With the killswitch on, an account whose quota falls below one of its floors is not used.
-- main: no floors · set aside (served by vault beatricelau0414@gmail.com)
+- main: no floors · set aside (served by vault vault-user@example.com)
 - ufuk: no floors · set aside (served by vault gmail)
-- beatricelau0414@gmail.com: no floors
+- vault-user@example.com: no floors
 - gmail: no floors
 - live: no floors
 
@@ -111,7 +111,7 @@ Log level: info.
 
 ### Reset credits
 A reset credit restores an exhausted account's quota. Preview fetches the account's current quota and credits.
-- Main account · set aside (served by vault beatricelau0414@gmail.com)
+- Main account · set aside (served by vault vault-user@example.com)
 - ufuk · set aside (served by vault gmail)
 
 ### This session
@@ -120,7 +120,7 @@ No current session.
 ### Vault
 OpenCode (openai-auth-opencode): connected to the Claustrum vault.
 The vault serves 3 OpenAI accounts; 3 can route now.
-- beatricelau0414@gmail.com: login, active, enabled
+- vault-user@example.com: login, active, enabled
 - gmail: login, active, enabled
 - live: login, active, enabled
 
