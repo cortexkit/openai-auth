@@ -71,7 +71,13 @@ test('refused Windows log writes cannot escape callers and warn only once at shu
     import { mock } from 'bun:test';
     Object.defineProperty(process, 'platform', { value: 'win32' });
     let refusals = 0;
+    // Each write attempt is refused at its first private-files call: the
+    // parent-folder check, or the owner-only create when that check passes.
     mock.module('@cortexkit/private-files', () => ({
+      async verifySafeParent(path) {
+        refusals++;
+        return { ok: false, reason: 'writable-by-others', path };
+      },
       async createOwnerOnly() {
         refusals++;
         throw Object.assign(new Error('refused'), { code: 'EACCES' });
