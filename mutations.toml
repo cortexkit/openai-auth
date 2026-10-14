@@ -1531,16 +1531,16 @@ expect_red = ["^vault\\scommand\\smenu\\sCheck\\snow\\sin\\svault\\smode\\spolls
 
 [[control]]
 id = "menu-common-auth-release"
-guards = "all packages require the published common-auth release containing Pi-slot and replacement-slot menus"
+guards = "all packages require the Windows private-file common-auth release, which also retains Pi-slot and replacement-slot menus"
 file = "packages/core/package.json"
-old = '"@cortexkit/common-auth": "^0.14.2"'
-new = '"@cortexkit/common-auth": "^0.11.4"'
+old = '"@cortexkit/common-auth": "^0.15.0"'
+new = '"@cortexkit/common-auth": "^0.14.2"'
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^vault\scommand\smenu\sall\sthree\spackages\srequire\sthe\spublished\sPi-slot\srelease$']
+expect_red = ['^vault\scommand\smenu\sall\sthree\spackages\srequire\sthe\sWindows\sprivate-file\srelease$']
 
 [[control]]
 id = "menu-unlabelled-without-vault"

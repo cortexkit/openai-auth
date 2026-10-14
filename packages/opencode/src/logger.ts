@@ -37,7 +37,9 @@ const LEVELS: readonly Level[] = ['error', 'warn', 'info', 'debug', 'trace']
 export function getLogFile(): string {
   return (
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE ??
-    join(tmpdir(), 'opencode-openai-auth.log')
+    (process.platform === 'win32'
+      ? join(tmpdir(), 'opencode-openai-auth', 'opencode-openai-auth.log')
+      : join(tmpdir(), 'opencode-openai-auth.log'))
   )
 }
 
@@ -49,5 +51,19 @@ export function getEnvLogLevel(): Level | undefined {
 initLogger({ file: getLogFile, level: getEnvLogLevel })
 
 // Under `bun test` the buffer is drained explicitly by the tests that assert on
-// it, and registering a process-wide exit handler per test file is noise.
-if (process.env.NODE_ENV !== 'test') process.on('exit', flushLogs)
+// it, and registering process-wide shutdown handlers per test file is noise.
+if (process.env.NODE_ENV !== 'test') {
+  // Windows drains through async private-file IO, which cannot finish in `exit`.
+  // Run once so closing the sink does not repeatedly re-arm `beforeExit`.
+  process.once('beforeExit', async () => {
+    try {
+      await flushLogs()
+    } catch {
+      process.emitWarning(
+        'OpenAI auth could not flush its log file at shutdown',
+      )
+    }
+  })
+  // POSIX flushing is synchronous, so explicit process.exit() can still drain it.
+  if (process.platform !== 'win32') process.on('exit', () => flushLogs())
+}

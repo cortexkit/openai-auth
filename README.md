@@ -163,7 +163,7 @@ The plugin writes a leveled, secret-redacting, size-rotating log:
 | Setting | Where | Default | Purpose |
 | --- | --- | --- | --- |
 | Log level | Diagnostics section of `/openai` (TUI) or `OPENCODE_OPENAI_AUTH_LOG_LEVEL` | `info` | One of `error`, `warn`, `info`, `debug`, `trace`. The menu changes it immediately without a restart and persists it. |
-| Log file | `OPENCODE_OPENAI_AUTH_LOG_FILE` | OS temp dir: `opencode-openai-auth.log` | Destination file. Rotates at 5 MB, keeping three older generations. |
+| Log file | `OPENCODE_OPENAI_AUTH_LOG_FILE` | OS temp dir: `opencode-openai-auth.log` (Windows: `opencode-openai-auth/opencode-openai-auth.log` inside the temp dir) | Destination file. Rotates at 5 MB, keeping three older generations. On Windows, a custom path must be in a folder only that user can access. Refused writes drop log lines, not requests or commands; shutdown warns at most once. |
 
 Token values and authorization/cookie headers are redacted from the log. Conversation/request bodies are never written to it (transport request dumps are a separate, explicit opt-in — see [`dump`](#configuration)).
 

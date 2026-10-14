@@ -70,7 +70,7 @@ describe('packed package on plain Node', () => {
     expect(result.stdout.trim()).toBe('function')
   })
 
-  test('the bundles import nothing but Node built-ins and their own chunks', () => {
+  test('the bundles import only Node built-ins, private-files and their own chunks', () => {
     const dist = join(packageDir, 'dist')
     const files = [
       ...readdirSync(dist).filter((name) => name.endsWith('.js')),
@@ -91,6 +91,6 @@ describe('packed package on plain Node', () => {
         if (!specifier.startsWith('node:')) bare.add(specifier)
       }
     }
-    expect([...bare]).toEqual([])
+    expect([...bare]).toEqual(['@cortexkit/private-files'])
   })
 })

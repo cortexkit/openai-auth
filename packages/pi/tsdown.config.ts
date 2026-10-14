@@ -10,6 +10,7 @@ export default defineConfig({
     emitDtsOnly: true,
   },
   deps: {
+    neverBundle: ['@cortexkit/private-files'],
     dts: {
       alwaysBundle: ['@cortexkit/openai-auth-core'],
     },

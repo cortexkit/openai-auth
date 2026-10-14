@@ -197,7 +197,7 @@ describe('vault command menu', () => {
     expect(polls).toEqual([roster[0]!.routeId])
     expect(quota.actions[0]?.knobs).toEqual([])
   })
-  test('all three packages require the published Pi-slot release', () => {
+  test('all three packages require the Windows private-file release', () => {
     for (const name of ['core', 'opencode', 'pi']) {
       const manifest = JSON.parse(
         readFileSync(
@@ -205,7 +205,10 @@ describe('vault command menu', () => {
           'utf8',
         ),
       )
-      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.14.2')
+      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.15.0')
+      expect(manifest.devDependencies['@cortexkit/claustrum-client']).toBe(
+        '^0.9.0',
+      )
     }
   })
   // Vault mode is exclusive: while connected, the vault's accounts are the
