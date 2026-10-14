@@ -43,7 +43,7 @@
     "@cortexkit/openai-auth-core": "workspace:*"
   },
   "dependencies": {
-    "@cortexkit/private-files": "^0.1.0"
+    "@cortexkit/private-files": "^0.2.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=1.0.1",

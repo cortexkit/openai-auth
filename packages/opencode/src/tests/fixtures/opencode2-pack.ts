@@ -1,11 +1,10 @@
 // Packs `@cortexkit/opencode-openai-auth` from its current build output and
-// installs the tarball into a scratch consumer directory, the way npm lays a
-// package out (`node_modules/<name>` from the tarball's `package/` folder).
-// No dependency is installed beside it: the server and root bundles inline
-// everything they import, which is what the packaging test checks.
+// installs it into a scratch npm consumer with its runtime dependencies.
+// Native private-file IO stays external to the bundles, so extracting just
+// the host's tarball would not reproduce a working consumer installation.
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -21,7 +20,45 @@ function run(command: string, args: string[], cwd: string): string {
   return result.stdout
 }
 
-/** The consumer directory; its `node_modules` holds only this package. */
+export function installPackedPackages(
+  sources: string[],
+  root = mkdtempSync(join(tmpdir(), 'oai-pack-')),
+): string {
+  const packs = join(root, 'packs')
+  mkdirSync(packs, { recursive: true })
+  const tarballs = sources.map((source) => {
+    // Packing must not rebuild; it packs the build under test.
+    const packed = JSON.parse(
+      run(
+        'npm',
+        ['pack', '--pack-destination', packs, '--ignore-scripts', '--json'],
+        source,
+      ),
+    ) as { filename: string }[]
+    if (packed.length !== 1 || !packed[0]?.filename)
+      throw new Error(`npm pack returned no single tarball for ${source}`)
+    return join(packs, packed[0].filename)
+  })
+  const consumer = join(root, 'consumer')
+  mkdirSync(consumer)
+  writeFileSync(join(consumer, 'package.json'), '{"private":true}')
+  run(
+    'npm',
+    [
+      'install',
+      '--ignore-scripts',
+      '--no-audit',
+      '--no-fund',
+      // Host peers are supplied by OpenCode or Pi, not by these bundles.
+      '--legacy-peer-deps',
+      ...tarballs,
+    ],
+    consumer,
+  )
+  return consumer
+}
+
+/** Installs the built plugin and its runtime dependencies into an empty consumer. */
 export function installPackedPlugin(
   root = mkdtempSync(join(tmpdir(), 'oai-pack-')),
 ): { consumer: string; packageDir: string } {
@@ -29,23 +66,7 @@ export function installPackedPlugin(
     throw new Error(
       'packages/opencode/dist/v2/server.js is missing: run `bun run build` first',
     )
-  const packs = join(root, 'packs')
-  mkdirSync(packs, { recursive: true })
-  // --ignore-scripts: packing must not rebuild; it packs the build under test.
-  run(
-    'bun',
-    ['pm', 'pack', '--destination', packs, '--ignore-scripts', '--quiet'],
-    PACKAGE_DIR,
-  )
-  const tarball = readdirSync(packs).find((name) => name.endsWith('.tgz'))
-  if (!tarball) throw new Error(`bun pm pack wrote no tarball into ${packs}`)
-  const consumer = join(root, 'consumer')
+  const consumer = installPackedPackages([PACKAGE_DIR], root)
   const packageDir = join(consumer, 'node_modules', ...PACKAGE_NAME.split('/'))
-  mkdirSync(packageDir, { recursive: true })
-  run(
-    'tar',
-    ['-xzf', join(packs, tarball), '-C', packageDir, '--strip-components=1'],
-    root,
-  )
   return { consumer, packageDir }
 }

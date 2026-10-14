@@ -69,7 +69,7 @@
     "@opencode/plugin": "2.0.22"
   },
   "dependencies": {
-    "@cortexkit/private-files": "^0.1.0",
+    "@cortexkit/private-files": "^0.2.1",
     "@opentui/core": ">=0.5.14",
     "@opentui/solid": ">=0.5.14",
     "ai": "^7.0.127",

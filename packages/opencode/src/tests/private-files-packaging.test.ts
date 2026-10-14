@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test'
-import { readdirSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { readdirSync, readFileSync, rmSync } from 'node:fs'
+import { dirname, join, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { installPackedPackages } from './fixtures/opencode2-pack'
 
 const packages = join(import.meta.dir, '../../../..', 'packages')
 const externalImport = /import\s*\(\s*['"]@cortexkit\/private-files['"]\s*\)/
@@ -37,7 +40,7 @@ describe('private-files packaging boundary', () => {
       const manifest = JSON.parse(
         readFileSync(join(root, 'package.json'), 'utf8'),
       )
-      expect(manifest.dependencies['@cortexkit/private-files']).toBe('^0.1.0')
+      expect(manifest.dependencies['@cortexkit/private-files']).toBe('^0.2.1')
       assertExternalTree(join(root, 'dist'))
     })
   }
@@ -48,4 +51,55 @@ describe('private-files packaging boundary', () => {
       )
     })
   }
+
+  test('npm-packed hosts share one private-files 0.2.x dependency without an inlined loader', () => {
+    const consumer = installPackedPackages(
+      ['opencode', 'pi'].map((host) => join(packages, host)),
+    )
+    try {
+      const tree = spawnSync(
+        process.execPath,
+        [join(packages, '../scripts/check-private-files-tree.mjs'), consumer],
+        { encoding: 'utf8' },
+      )
+      expect(tree.status).toBe(0)
+      expect(tree.stderr).toBe('')
+      expect(tree.stdout).toContain('1 physical copy: 0.2.')
+      const privateFiles = join(
+        consumer,
+        'node_modules',
+        '@cortexkit',
+        'private-files',
+      )
+      for (const host of ['opencode', 'pi']) {
+        const root = join(
+          consumer,
+          'node_modules',
+          '@cortexkit',
+          `${host}-openai-auth`,
+        )
+        const probe = spawnSync(
+          'node',
+          [
+            '--input-type=module',
+            '--eval',
+            "console.log(import.meta.resolve('@cortexkit/private-files')); await import('@cortexkit/private-files')",
+          ],
+          {
+            cwd: root,
+            encoding: 'utf8',
+            env: { PATH: process.env.PATH ?? '' },
+          },
+        )
+        expect(probe.status).toBe(0)
+        expect(probe.stderr).toBe('')
+        expect(fileURLToPath(probe.stdout.trim())).toStartWith(
+          `${privateFiles}${sep}`,
+        )
+        assertExternalTree(join(root, 'dist'))
+      }
+    } finally {
+      rmSync(dirname(consumer), { recursive: true, force: true })
+    }
+  }, 120_000)
 })
