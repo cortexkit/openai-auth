@@ -67,6 +67,7 @@ import {
   seedPool,
   usageBody,
   type Wire,
+  waitFor,
 } from './fixtures/pool-install'
 
 /** The network, with the main row's quota polls reading it exhausted. */
@@ -156,6 +157,7 @@ function enroll(host: 'opencode' | 'pi' = 'opencode') {
 async function plugin(
   slot: Record<string, unknown> = { ...PLACEHOLDER },
   options: Parameters<typeof loadPlugin>[0] = {},
+  pollIntervalMs = 0,
 ) {
   const running = daemon
   if (!running) throw new Error('start the daemon first')
@@ -166,7 +168,7 @@ async function plugin(
         vault: {
           stateDir,
           connectionFile: () => running.connectionFile,
-          pollIntervalMs: 0,
+          pollIntervalMs,
         },
       },
       slot,
@@ -1464,6 +1466,92 @@ describe('refresh', () => {
 })
 
 describe('routing', () => {
+  test('an approval between requests switches from the local row to the vault without a poll', async () => {
+    const running = await startDaemon({
+      'oauth:openai:vault': vaultLogin('chatgpt-vault'),
+    })
+    seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+    const wire = installWire()
+    await plugin()
+    const send = await fetchOverride()
+
+    expect((await request(send)).status).toBe(200)
+    expect(wire.sends).toEqual(['Bearer main-token'])
+    const stateBeforeEnrollment = readFileSync(files.stateFile)
+    const configBeforeEnrollment = readFileSync(files.configFile)
+    const listsBeforeEnrollment = running.lists
+    const pollsBeforeEnrollment = wire.polls.length
+    const refreshesBeforeEnrollment = wire.refreshTokens.length
+
+    enroll()
+    expect((await request(send)).status).toBe(200)
+
+    expect(wire.sends).toEqual(['Bearer main-token', `Bearer ${VAULT_ACCESS}`])
+    expect(wire.polls.slice(pollsBeforeEnrollment)).not.toContain(
+      'Bearer main-token',
+    )
+    expect(wire.refreshTokens.slice(refreshesBeforeEnrollment)).not.toContain(
+      'main-refresh',
+    )
+    expect(readFileSync(files.stateFile)).toEqual(stateBeforeEnrollment)
+    expect(readFileSync(files.configFile)).toEqual(configBeforeEnrollment)
+    expect(running.lists - listsBeforeEnrollment).toBe(1)
+    expect(running.gets.length).toBeGreaterThan(0)
+    expect(
+      running.gets.every(
+        (get) =>
+          get.credential_id === 'oauth:openai:vault' &&
+          get.enrollment_token === ENROLLMENT_TOKEN,
+      ),
+    ).toBe(true)
+  })
+
+  test('an approval observed by a poll serves the next request from the vault', async () => {
+    const running = await startDaemon({
+      'oauth:openai:vault': vaultLogin('chatgpt-vault'),
+    })
+    seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+    const wire = installWire()
+    const { vault } = await plugin({ ...PLACEHOLDER }, {}, 1_000)
+    const send = await fetchOverride()
+
+    expect((await request(send)).status).toBe(200)
+    expect(wire.sends).toEqual(['Bearer main-token'])
+    const stateBeforeEnrollment = readFileSync(files.stateFile)
+    const configBeforeEnrollment = readFileSync(files.configFile)
+    const listsBeforeEnrollment = running.lists
+    const pollsBeforeEnrollment = wire.polls.length
+    const refreshesBeforeEnrollment = wire.refreshTokens.length
+
+    enroll()
+    await waitFor(
+      () => (vault.routes().length > 0 ? true : undefined),
+      'the poll to discover the approved vault account',
+    )
+    expect(running.lists - listsBeforeEnrollment).toBe(1)
+
+    expect((await request(send)).status).toBe(200)
+
+    expect(wire.sends).toEqual(['Bearer main-token', `Bearer ${VAULT_ACCESS}`])
+    expect(wire.polls.slice(pollsBeforeEnrollment)).not.toContain(
+      'Bearer main-token',
+    )
+    expect(wire.refreshTokens.slice(refreshesBeforeEnrollment)).not.toContain(
+      'main-refresh',
+    )
+    expect(readFileSync(files.stateFile)).toEqual(stateBeforeEnrollment)
+    expect(readFileSync(files.configFile)).toEqual(configBeforeEnrollment)
+    expect(running.lists - listsBeforeEnrollment).toBe(1)
+    expect(running.gets.length).toBeGreaterThan(0)
+    expect(
+      running.gets.every(
+        (get) =>
+          get.credential_id === 'oauth:openai:vault' &&
+          get.enrollment_token === ENROLLMENT_TOKEN,
+      ),
+    ).toBe(true)
+  })
+
   async function vaultServesBesideAnExhaustedMain(): Promise<Wire> {
     await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
     enroll()

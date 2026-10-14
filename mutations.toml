@@ -2617,6 +2617,38 @@ test_count_pattern = "Ran {count} test"
 expect_red = ['^vault\senrollment\saudit\sthe\ssynchronous\smode\sguard\sstays\sclosed\suntil\sauthority\sreads\sunchanged\senrollment\sfiles$']
 
 [[control]]
+id = "vault-request-roster-after-enrollment"
+guards = "a request after external approval starts a vault roster discovery even after the startup first-roster promise settled under local authority"
+file = "packages/core/src/vault.ts"
+old = """    const discovery = this.#discovery ?? this.#discover()
+    await discovery.catch((error: unknown) => {
+      this.#fail('vault roster refresh failed', error)
+    })"""
+new = """    const discovery = this.#firstRoster.promise.then(() => undefined) // NON-VACUITY BREAK: reuse the stale first-roster promise.
+    await discovery.catch((error: unknown) => {
+      this.#fail('vault roster refresh failed', error)
+    })"""
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^routing\san\sapproval\sbetween\srequests\sswitches\sfrom\sthe\slocal\srow\sto\sthe\svault\swithout\sa\spoll$']
+
+[[control]]
+id = "vault-request-reads-fresh-authority"
+guards = "a request immediately after enrollment reads fresh authority rather than a cached local hint"
+file = "packages/core/src/vault.ts"
+old = "const mode = await enrollmentAuthority(this.paths, this.name)"
+new = "const mode = this.#authority === 'unknown' ? await enrollmentAuthority(this.paths, this.name) : this.#authority // NON-VACUITY BREAK: reuse cached enrollment authority."
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^routing\san\sapproval\sbetween\srequests\sswitches\sfrom\sthe\slocal\srow\sto\sthe\svault\swithout\sa\spoll$']
+
+[[control]]
 id = "audit-warm-enrollment-race"
 guards = "a local bearer resolved after enrollment is never dispatched by keep-warm"
 file = "packages/opencode/src/core/cachekeep.ts"

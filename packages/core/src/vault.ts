@@ -377,6 +377,26 @@ export class OpenAiVault {
   }
 
   /**
+   * Readies a current vault roster before request routing. The startup
+   * discovery may have settled while this host was local, so firstRoster()
+   * alone cannot tell a vault-mode request that it has a roster to use.
+   */
+  async awaitRequestRoster(): Promise<void> {
+    if (this.snapshot()) return
+    if ((await this.authority()) !== 'vault') return
+
+    const inFlight = this.#discovery
+    if (inFlight) await inFlight.catch(() => undefined)
+
+    if (this.snapshot() || (await this.authority()) !== 'vault') return
+
+    const discovery = this.#discovery ?? this.#discover()
+    await discovery.catch((error: unknown) => {
+      this.#fail('vault roster refresh failed', error)
+    })
+  }
+
+  /**
    * Re-reads the accounts from the vault now. Never rejects. It resolves only
    * after a discovery that began after this call: one already in flight (the
    * poll, or a refresh another caller started) may have read the enrollment

@@ -667,7 +667,7 @@ export class PiOpenAIRuntime {
       // used. Before the vault's first account list there is nothing to
       // route, so that is waited for, for a bounded time.
       await settleWithinBudget(
-        this.vault.firstRoster().then(() => true),
+        this.vault.awaitRequestRoster().then(() => true),
         VAULT_REQUEST_ROSTER_WAIT_MS,
         () => false,
       )

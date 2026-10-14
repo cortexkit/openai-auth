@@ -504,7 +504,10 @@ export async function setupOpenAIAuth(
     pins,
     vault,
     awaitVaultRoster: async () => {
-      await settlesWithin(vaultFirstRoster, VAULT_FIRST_ROSTER_WAIT_MS)
+      await settlesWithin(
+        vault.awaitRequestRoster(),
+        VAULT_FIRST_ROSTER_WAIT_MS,
+      )
     },
     responsesLite: () => getSettings().responsesLite,
     codexEndpoint: () => getSettings().codexApiEndpoint,

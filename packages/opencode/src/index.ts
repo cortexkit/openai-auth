@@ -4649,7 +4649,7 @@ export async function CodexAuthPlugin(
                     routes: () => vault.routes(),
                     awaitRoster: async () => {
                       await settlesWithin(
-                        vaultFirstRoster,
+                        vault.awaitRequestRoster(),
                         VAULT_FIRST_ROSTER_WAIT_MS,
                       )
                     },
