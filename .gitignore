@@ -42,4 +42,3 @@ temp/
 
 # Local test stdout and diagnostic traces; never publish verification data.
 .evidence/
-docs/reports/dead-code-stability-2026-10/

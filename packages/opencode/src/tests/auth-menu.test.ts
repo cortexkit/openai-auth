@@ -291,7 +291,7 @@ describe('OpenCode auth menu', () => {
     const baseline = readFileSync(
       fileURLToPath(
         new URL(
-          '../../../../docs/baselines/opencode-auth-menu.v1.18.30.txt',
+          './fixtures/baselines/opencode-auth-menu.v1.18.30.txt',
           import.meta.url,
         ),
       ),

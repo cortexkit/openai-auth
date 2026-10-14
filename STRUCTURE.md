@@ -78,8 +78,7 @@
 │   ├── release.sh                 # Tag-driven release driver
 │   ├── wait-release.sh            # Poll for the GitHub release to appear
 │   └── version-sync.mjs           # Sync package versions and README install pins
-├── docs/                          # Checked-in baselines for regression comparison
-│   └── baselines/                 # env-reads / packaging / test-counts / auth-menu captures
+├── docs/                          # Public documentation only (currently empty)
 ├── .github/                       # Issue templates + release workflow
 ├── biome.json                     # Formatter/linter config
 ├── lefthook.yml                   # Pre-commit biome check
