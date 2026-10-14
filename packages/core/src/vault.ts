@@ -39,7 +39,6 @@ import {
   enrollmentAuthority,
   enrollmentName,
   hostEnrollmentPaths,
-  mutateVaultRoster,
   type QuotaReceipt,
   readClaustrumEnrollmentStatus,
   readVaultRoster,
@@ -47,11 +46,7 @@ import {
   type VaultRosterRow,
 } from '@cortexkit/common-auth/claustrum'
 import { CommandError } from '@cortexkit/common-auth/commands'
-import {
-  mergeQuotaObservation,
-  projectQuota,
-  type QuotaMap,
-} from '@cortexkit/common-auth/quota'
+import { projectQuota, type QuotaMap } from '@cortexkit/common-auth/quota'
 import { normalizeInsulaCodexQuota } from './insula-quota'
 import { createLogger } from './logger'
 import { extractAccountIdFromClaims, parseJwtClaims } from './oauth'
@@ -611,22 +606,11 @@ export class OpenAiVault {
           true,
         )
         if (!observation) return { ok: false, error: 'unusable insula reading' }
-        // Insula reports quota for an account, so no credential fetch is needed.
-        // Check the account again under the roster lock to avoid writing this
-        // reading to a row another process has replaced since the cache lookup.
-        const kept = await mutateVaultRoster(
-          this.paths.rosterPath,
-          (roster) => {
-            const current = roster?.rows.find(
-              (entry) => entry.routeId === routeId,
-            )
-            if (!current || current.accountIdentity !== row.accountIdentity)
-              return { result: false }
-            current.quota = mergeQuotaObservation(current.quota, observation)
-            return { next: roster, result: true }
-          },
+        const kept = await this.#consumer.recordAccountQuota(
+          routeId,
+          row.accountIdentity,
+          observation,
         )
-        await this.refresh()
         return kept
           ? { ok: true }
           : { ok: false, error: 'vault account changed' }

@@ -3443,3 +3443,16 @@ command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-insula-qu
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^vault\sinsula\squota\smissing\ssource\sfalls\sback\sto\swham$']
+
+[[control]]
+id = "insula-vault-hit-no-discovery"
+guards = "three current insula matches reload the persisted roster without per-account vault discovery"
+file = "packages/core/src/vault.ts"
+old = "        const kept = await this.#consumer.recordAccountQuota("
+new = "        await this.refresh() // NON-VACUITY BREAK\n        const kept = await this.#consumer.recordAccountQuota("
+test_file = "packages/core/src/tests/vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sinsula\squota\sthree\smatched\saccounts\sadd\sno\sdiscovery\sto\sa\sbackground\stick$']

@@ -3,10 +3,11 @@
 ## Candidate and installation
 
 Qualified insula-backed vault quota against the common-auth **0.16.0** candidate
-built from **cd7075f**. The candidate tarball's SHA-256 is:
+built from **ad11836**, installed from
+`cortexkit-common-auth-0.16.0-2315d0f.tgz`. The candidate tarball's SHA-256 is:
 
 ```text
-b06dde590221c6972a3f22bdefc3b4a3d79510471adc186c365dd4f1cee2bc30
+50755b5ed900f02373e6577cfa063efbd8e78944a517e72aef3cc21864032df7
 ```
 
 The earlier common-auth 0.16.0 candidate built from d11d6af had SHA-256
@@ -20,7 +21,8 @@ All three packages were installed from a worktree-local `file:` tarball for
 qualification. Replacing the contents at the same filename and running
 `bun install --force` still reused Bun's old tarball cache; a byte-identical copy
 named `cortexkit-common-auth-0.16.0-cd7075f.tgz` forced a fresh installation.
-The installed `insula.js` was inspected on both Mac and Linux and contained
+The final candidate also has a unique filename, ending in `2315d0f.tgz`, and adds
+`recordAccountQuota` for discovery-free quota writes. The installed `insula.js` was inspected on both Mac and Linux and contained
 `import { SubcClient } from '@cortexkit/subc-client'`, not the old dynamic import.
 
 The tarballs were staged only to let remote jobs install them; none is committed.
@@ -42,12 +44,13 @@ manifest values while running the verified unpublished candidate.
   `pollQuota` also refreshes it before a route lookup; common-auth shares and
   throttles attempts across consumers. A defined route match bypasses both
   credential acquisition and wham for that account. Misses use the existing poll.
-- Background observations merge under the roster lock, fenced by the persisted
-  provider account identity. This also supports identities learned from earlier
-  sends and retained when inventory later omits them. Refreshing the consumer
-  afterward reloads the committed quota through its existing roster-discovery
-  path; this can perform an additional `list_scoped`, but never `get_scoped` just
-  to consume an insula hit.
+- Background observations use `consumer.recordAccountQuota`, which merges under
+  the roster lock only while the row still has that exact known provider account
+  identity, then reloads the consumer's in-memory roster with a file read. It
+  never discovers or binds an account. The locked identity check prevents a
+  reading for the old account from being written to a row that another process
+  has replaced, and supports identities retained when inventory later omits them,
+  without an extra `list_scoped` or `get_scoped` call.
 - When a request is refused because its account's quota is unknown, its one-shot
   reading uses the insula cache keyed by the account asserted in the vault's
   credential authorization receipt.
@@ -66,6 +69,23 @@ The existing manifest assertion and its mutation anchor advance from `^0.15.0`
 to `^0.16.0`; the newer release still includes the Windows private-file safety
 floor, rather than deleting or reversing that safety assertion.
 
+## Three-account background traffic regression
+
+The three-account test drives the metadata-plus-quota workflow from the base/main
+branch at `cdda71fa8c61abf06d4ba9514e5ef1fa82054b75`: one
+ordinary roster refresh, followed by `pollStale(0)`. All three accounts have current
+insula entries. The pass makes **exactly one `list_scoped` call**, matching main's
+single normal discovery, rather than the previous four calls. It also makes zero
+credential gets, zero wham calls and one insula read, and all three normalized
+windows are immediately visible through `routes()`.
+
+The traffic mutation inserts `await this.refresh()` before every account-quota
+write, deliberately restoring per-account discovery. It fails the
+named test with **expected 1, received 4** while the admission-cache-miss control
+stays green. The quota write still uses the account-identity comparison under the
+roster lock; the common-auth helper performs the same post-write file reread as
+its receipt-based `recordQuota` path.
+
 ## Gates
 
 Build server: Bun **1.4.2**, TypeScript **7.0.2**, Biome **2.5.15**.
@@ -75,11 +95,11 @@ Build server: Bun **1.4.2**, TypeScript **7.0.2**, Biome **2.5.15**.
 | `bun run build` | Passed: core declarations; OpenCode 284 bundled modules, 13 declaration outputs and 136 TUI source files; Pi 129 bundled modules and one declaration bundle. Installed ranges checked 28 dependencies. |
 | `bun run types` | Passed: all three package `tsc` invocations, exit 0. |
 | `bun run lint` | Passed: 265 files, no fixes. |
-| `ckdev-mutate check --strict` | Passed: 233 verified rows, zero unverified. Used CI-pinned revision `9d6b663dac487bb982c7bfd18a96eee2292164ad`, runner 0.12.1. |
-| Core `bun run test` | Passed: 261 tests across 21 files. |
+| `ckdev-mutate check --strict` | Passed: 234 verified source anchors and discovered test-name selections, zero unverified rows. Used CI-pinned revision `9d6b663dac487bb982c7bfd18a96eee2292164ad`, runner 0.12.1. |
+| Core `bun run test` | Passed: 262 tests across 21 files. |
 | OpenCode `bun run test` | Passed: 1547 pass, 26 skip, zero fail; 1573 tests across 91 files. |
 | Pi `bun run test` | Passed: 75 tests across six files. |
-| Restored quota controls plus request-reading regression | Passed: 23 tests across three core files after all three mutation restores. |
+| Restored quota controls plus request-reading regression | Passed: 24 tests across three core files after the traffic mutation restore. |
 | Existing no-lazy-chunks guard | Passed unchanged; its planted-import detector test also passed. |
 | Existing Node packed-package root/server identity contract | Passed unchanged: `./server carries the same OpenCode 1 plugin and id as the root`. |
 | Scoped editor diagnostics | No errors/warnings in all five changed core source/test files; dead-code, unused-export, duplicate, cycle and complexity analysis was unavailable. |
@@ -95,7 +115,11 @@ One full OpenCode attempt on the replacement candidate had two unrelated timing
 failures: `two concurrent ticks against a real lock file refresh only once` and
 `adding an account shows the sign-in URL and adds the row when the login finishes`.
 The complete OpenCode suite was rerun without changing either test or its
-implementation and passed all 1547 enabled tests; Pi then passed too.
+implementation and passed all 1547 enabled tests; Pi then passed too. All 1547
+OpenCode tests also passed on the final ad11836 candidate. On that final candidate,
+Pi's `missing-token enrollment disables local work and retains menu Disconnect`
+test exceeded its default five-second timeout once; the entire Pi suite then
+passed all 75 tests without changing source or tests.
 
 The build server's preinstalled mutation runner was 0.12.0 and rejected `--strict`.
 The pinned 0.12.1 runner was installed privately under `target/qualification-tools`
@@ -114,8 +138,12 @@ restore. Only the expected guard failed in each selected run:
 | `insula-codex-raw-used-percent` | `insula codex normalization raw usage beats the saved-reset published zero`: expected 100, received 0 | `every reading time equals fetchedAt` | `insula-quota.ts`: one insertion / one deletion; then empty |
 | `insula-vault-skip-wham-on-hit` | `vault insula quota current hit skips wham only for its matched account`: unexpected wham call for account-a | `admission cache miss polls wham without calling insula` | `vault.ts`: one insertion / one deletion; then empty |
 | `insula-vault-miss-falls-back` | `vault insula quota missing source falls back to wham`: expected account-a wham call, received none | `standalone never opens insula` | `vault.ts`: one insertion; then empty |
+| `insula-vault-hit-no-discovery` | `vault insula quota three matched accounts add no discovery to a background tick`: expected one list call, received four | `admission cache miss polls wham without calling insula` | `vault.ts`: one insertion; then empty |
 
-All three rows are in `mutations.toml`; each red run had one fail and one pass.
+All four rows are in `mutations.toml`; each red run had one fail and one pass.
+The original three proofs preceded the traffic revision; their raw-usage,
+skip-on-hit and fallback branches remain unchanged. The traffic proof was run on
+the final ad11836 candidate.
 
 ## Distribution comparison
 
@@ -133,14 +161,14 @@ subsequent comment-only clarifications can change declaration hashes.
 
 | Main shared JavaScript chunks | Qualified shared JavaScript chunks |
 | --- | --- |
-| `index-0vdathce.js` | `index-ct43xnyk.js` |
-| `index-f59xft9b.js` | `index-ty3xysa3.js` |
+| `index-0vdathce.js` | `index-h2jvp6fc.js` |
+| `index-f59xft9b.js` | `index-wc54vqkk.js` |
 | `index-jrv6axgh.js` | `index-414hqxwj.js` |
-| `index-4yzma699.js` | `index-7tfqyeaz.js` |
-| `index-9r138e3r.js` | `index-2mba88hf.js` |
-| `index-ynvr4s58.js` | `index-hgc2j0ae.js` |
-| `index-na9hkb07.js` | `index-bkqrr2y3.js` |
-| `index-6nwk3e3x.js` | `index-smzepkn5.js` |
+| `index-4yzma699.js` | `index-qyfp10qh.js` |
+| `index-9r138e3r.js` | `index-2fkrr4yq.js` |
+| `index-ynvr4s58.js` | `index-7z5cehje.js` |
+| `index-na9hkb07.js` | `index-zddd51d5.js` |
+| `index-6nwk3e3x.js` | `index-e0z3f580.js` |
 | `index-h6pr89yz.js` | `index-h6pr89yz.js` |
 
 Identical non-hashed OpenCode files before and after:
@@ -159,10 +187,10 @@ rpc/rpc-dir.js             rpc/rpc-dir.d.ts
 
 | Main shared declarations | Qualified shared declarations |
 | --- | --- |
-| `pool-lifecycle-DXTdn7wx.d.ts` | `pool-lifecycle-eQ35q2zG.d.ts` |
-| `port-file-BzYIKbas.d.ts` | `port-file-ByQ21L0O.d.ts` |
-| `protocol-B2neTlvm.d.ts` | `protocol-B6tpR6ez.d.ts` |
-| `sidebar-state-BU_39nl2.d.ts` | `sidebar-state-B1Sepd6X.d.ts` |
+| `pool-lifecycle-DXTdn7wx.d.ts` | `pool-lifecycle-Dl-2emhB.d.ts` |
+| `port-file-BzYIKbas.d.ts` | `port-file-BZFbpg7O.d.ts` |
+| `protocol-B2neTlvm.d.ts` | `protocol-DMKfYaiQ.d.ts` |
+| `sidebar-state-BU_39nl2.d.ts` | `sidebar-state-yFbobVyw.d.ts` |
 
 **Pi** has exactly `index.js` and `index.d.ts` before and after, no chunk.
 **Core** builds declarations only, not JavaScript. Its before/after list is below;
@@ -199,7 +227,7 @@ the plugin's own `dist` directory; they add no late-loaded plugin chunk.
 The final bundle inspection printed:
 
 ```text
-{"package":"opencode","jsFiles":17,"inlinedSubcClient":["index-ct43xnyk.js"],"relativeDynamicImportFiles":0,"externalSubcClientReference":false}
+{"package":"opencode","jsFiles":17,"inlinedSubcClient":["index-h2jvp6fc.js"],"relativeDynamicImportFiles":0,"externalSubcClientReference":false}
 {"package":"pi","jsFiles":1,"inlinedSubcClient":["index.js"],"relativeDynamicImportFiles":0,"externalSubcClientReference":false}
 {"package":"core","jsFiles":0,"declarations":28}
 ```
@@ -226,12 +254,12 @@ prints the built normalizer's result. It does not instantiate `OpenAiVault`,
 enroll, authorize, refresh credentials, call wham, write quota or change vault
 state. Token and roster SHA-256 digests before and after were equal.
 
-Output with common-auth 0.16.0 built from cd7075f:
+Output with common-auth 0.16.0 built from source commit ad11836:
 
 ```text
-{"routeId":"vault:chatgpt:openai~ffdbede18a","account":"291f5165-0a65-4635-b437-5174415ed928","matchedCurrentEntry":true,"normalized":{"primary":{"usedPercent":65,"remainingPercent":35,"checkedAt":1791994260968,"resetsAt":"2026-10-20T04:58:25Z","windowMinutes":10080},"resetCreditsAvailable":1,"spendControlCleared":true}}
-{"routeId":"vault:chatgpt:openai:gmail~c34efc52ac","account":"7b66addd-4602-408f-84f3-dbcbb8e8fd88","matchedCurrentEntry":true,"normalized":{"primary":{"usedPercent":58,"remainingPercent":42,"checkedAt":1791994287536,"resetsAt":"2026-10-20T04:58:44Z","windowMinutes":10080},"resetCreditsAvailable":1,"spendControlCleared":true}}
-{"routeId":"vault:chatgpt:openai:live~244c9c1338","account":"bafd1ac7-846c-4aee-a425-3d8b195eff95","matchedCurrentEntry":true,"normalized":{"primary":{"usedPercent":90,"remainingPercent":10,"checkedAt":1791994287237,"resetsAt":"2026-10-20T04:59:33Z","windowMinutes":10080},"resetCreditsAvailable":0,"spendControlCleared":true}}
+{"routeId":"vault:chatgpt:openai~ffdbede18a","account":"291f5165-0a65-4635-b437-5174415ed928","matchedCurrentEntry":true,"normalized":{"primary":{"usedPercent":66,"remainingPercent":34,"checkedAt":1791995714662,"resetsAt":"2026-10-20T04:58:25Z","windowMinutes":10080},"resetCreditsAvailable":1,"spendControlCleared":true}}
+{"routeId":"vault:chatgpt:openai:gmail~c34efc52ac","account":"7b66addd-4602-408f-84f3-dbcbb8e8fd88","matchedCurrentEntry":true,"normalized":{"primary":{"usedPercent":59,"remainingPercent":41,"checkedAt":1791995700658,"resetsAt":"2026-10-20T04:58:44Z","windowMinutes":10080},"resetCreditsAvailable":1,"spendControlCleared":true}}
+{"routeId":"vault:chatgpt:openai:live~244c9c1338","account":"bafd1ac7-846c-4aee-a425-3d8b195eff95","matchedCurrentEntry":true,"normalized":{"primary":{"usedPercent":90,"remainingPercent":10,"checkedAt":1791995700619,"resetsAt":"2026-10-20T04:59:33Z","windowMinutes":10080},"resetCreditsAvailable":0,"spendControlCleared":true}}
 Read-only check: enrollment token and roster bytes unchanged; usage.get called once.
 ```
 

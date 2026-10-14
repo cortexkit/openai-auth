@@ -97,6 +97,34 @@ function route(vault: OpenAiVault, identity = 'account-a') {
 }
 
 describe('vault insula quota', () => {
+  test('three matched accounts add no discovery to a background tick', async () => {
+    const env = await setup()
+    env.daemon.credentials.c = vaultLogin('account-c')
+    await env.vault.refresh()
+    env.daemon.insula = {
+      reply: {
+        result: ['account-a', 'account-b', 'account-c'].map((account) =>
+          current(env.now, account),
+        ),
+      },
+    }
+    const listsBefore = env.daemon.lists
+    // A metadata tick already discovers the roster once. Its quota pass must
+    // consume cached readings without adding per-account inventory requests.
+    await env.vault.refresh()
+    expect(await env.vault.pollStale(0)).toHaveLength(3)
+    expect(env.daemon.lists - listsBefore).toBe(1)
+    expect(env.daemon.gets).toEqual([])
+    expect(env.wham).toEqual([])
+    expect(env.daemon.insulaReads).toBe(1)
+    for (const row of env.vault.routes()) {
+      expect(windowsFromQuotaMap(row.quota)?.primary).toMatchObject({
+        usedPercent: 100,
+        checkedAt: env.now - 60_000,
+      })
+    }
+  })
+
   test('current hit skips wham only for its matched account', async () => {
     const env = await setup()
     env.daemon.insula = { reply: { result: [current(env.now)] } }
