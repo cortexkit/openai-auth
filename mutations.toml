@@ -1341,7 +1341,7 @@ expect_message = "vault-owns-accounts"
 [[control]]
 id = "pool-downgrade-warning-names-empty-bearer"
 guards = "the migration docs warn that a pre-1.0 build sends the placeholder's empty bearer"
-file = "README.md"
+file = "docs/accounts-and-routing.md"
 old = "Downgrading after the account-pool migration is unsupported."
 new = "NON-VACUITY BREAK: downgrade warning removed."
 test_file = "packages/opencode/src/tests/pool-slot-audit.test.ts"
