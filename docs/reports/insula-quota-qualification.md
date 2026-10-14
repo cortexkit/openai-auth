@@ -79,12 +79,14 @@ single normal discovery, rather than the previous four calls. It also makes zero
 credential gets, zero wham calls and one insula read, and all three normalized
 windows are immediately visible through `routes()`.
 
-The traffic mutation inserts `await this.refresh()` before every account-quota
-write, deliberately restoring per-account discovery. It fails the
-named test with **expected 1, received 4** while the admission-cache-miss control
-stays green. The quota write still uses the account-identity comparison under the
-roster lock; the common-auth helper performs the same post-write file reread as
-its receipt-based `recordQuota` path.
+To prove the background-traffic test detects the old behavior, the
+`insula-vault-hit-no-discovery` mutation deliberately inserts `await this.refresh()`
+before every account-quota write. Each added refresh discovers the vault's account
+list again instead of only reloading the persisted roster. The test rejects those
+extra calls with **expected 1, received 4** `list_scoped` requests, while the
+admission-cache-miss control stays green. The quota write still uses the
+account-identity comparison under the roster lock; the common-auth helper performs
+the same post-write file reread as its receipt-based `recordQuota` path.
 
 ## Gates
 
@@ -95,7 +97,7 @@ Build server: Bun **1.4.2**, TypeScript **7.0.2**, Biome **2.5.15**.
 | `bun run build` | Passed: core declarations; OpenCode 284 bundled modules, 13 declaration outputs and 136 TUI source files; Pi 129 bundled modules and one declaration bundle. Installed ranges checked 28 dependencies. |
 | `bun run types` | Passed: all three package `tsc` invocations, exit 0. |
 | `bun run lint` | Passed: 265 files, no fixes. |
-| `ckdev-mutate check --strict` | Passed: 234 verified source anchors and discovered test-name selections, zero unverified rows. Used CI-pinned revision `9d6b663dac487bb982c7bfd18a96eee2292164ad`, runner 0.12.1. |
+| `ckdev-mutate check --strict` | Passed: 234 verified source anchors and discovered test-name selections, zero unverified rows. Used ckdev-mutate 0.12.1 from the `cortexkit-mutate` crate in `cortexkit/commons`, built from commit `9d6b663dac487bb982c7bfd18a96eee2292164ad`. CI pins that source revision so catalogue checks and mutation replay use the same runner implementation. |
 | Core `bun run test` | Passed: 262 tests across 21 files. |
 | OpenCode `bun run test` | Passed: 1547 pass, 26 skip, zero fail; 1573 tests across 91 files. |
 | Pi `bun run test` | Passed: 75 tests across six files. |
@@ -111,7 +113,9 @@ reach the registry. A subsequent run without a same-job build had missing-artifa
 failures; remote `dist` output is not retained between jobs. Final suite commands
 built before testing in the same job.
 
-One full OpenCode attempt on the replacement candidate had two unrelated timing
+One full OpenCode suite run used the shared auth library from
+`cortexkit/common-auth` commit `cd7075f`: the static-import candidate that replaced
+the earlier `d11d6af` dynamic-import candidate. That run had two unrelated timing
 failures: `two concurrent ticks against a real lock file refresh only once` and
 `adding an account shows the sign-in URL and adds the row when the login finishes`.
 The complete OpenCode suite was rerun without changing either test or its
@@ -224,7 +228,13 @@ code is available at startup, but construction opens no insula connection:
 Existing unrelated dynamic imports of external packages do not load files from
 the plugin's own `dist` directory; they add no late-loaded plugin chunk.
 
-The final bundle inspection printed:
+The final inspection examined the OpenCode and Pi JavaScript bundles in
+`packages/opencode/dist` and `packages/pi/dist`, built with the common-auth
+candidate from source commit `ad11836`. It checked that subc-client was included
+in those bundles, not left as an external dependency, and that no relative
+dynamic import could load a plugin chunk later. It also counted the output files
+in `packages/core/dist` to confirm the core build emitted type declarations but
+no JavaScript. Results:
 
 ```text
 {"package":"opencode","jsFiles":17,"inlinedSubcClient":["index-h2jvp6fc.js"],"relativeDynamicImportFiles":0,"externalSubcClientReference":false}
@@ -234,9 +244,11 @@ The final bundle inspection printed:
 
 ## Read-only Mac qualification
 
-The core's normal build is declaration-only. For this inspection, compiled just
-the core normalizer into a temporary runtime module, then loaded it from the
-committed script:
+The normal build of `packages/core` emits only `.d.ts` files describing TypeScript
+types, not executable JavaScript. The read-only Mac inspection script needs
+runnable quota-normalization code, so `packages/core/src/insula-quota.ts` was
+compiled separately into a temporary JavaScript module. The committed inspection
+script then loaded that module:
 
 ```sh
 bun build packages/core/src/insula-quota.ts \
@@ -254,7 +266,11 @@ prints the built normalizer's result. It does not instantiate `OpenAiVault`,
 enroll, authorize, refresh credentials, call wham, write quota or change vault
 state. Token and roster SHA-256 digests before and after were equal.
 
-Output with common-auth 0.16.0 built from source commit ad11836:
+The following output used common-auth, the shared authentication library used by
+openai-auth, at version 0.16.0 built from `cortexkit/common-auth` source commit
+`ad11836`. This is the candidate being qualified for publication, not a released
+registry dependency; the output demonstrates that its insula transport matches
+the real vault accounts and that openai-auth normalizes their quota readings:
 
 ```text
 {"routeId":"vault:chatgpt:openai~ffdbede18a","account":"291f5165-0a65-4635-b437-5174415ed928","matchedCurrentEntry":true,"normalized":{"primary":{"usedPercent":66,"remainingPercent":34,"checkedAt":1791995714662,"resetsAt":"2026-10-20T04:58:25Z","windowMinutes":10080},"resetCreditsAvailable":1,"spendControlCleared":true}}
