@@ -205,7 +205,7 @@ describe('vault command menu', () => {
           'utf8',
         ),
       )
-      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.15.0')
+      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.16.0')
       expect(manifest.devDependencies['@cortexkit/claustrum-client']).toBe(
         '^0.9.0',
       )

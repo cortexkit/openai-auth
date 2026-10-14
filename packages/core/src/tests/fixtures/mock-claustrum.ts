@@ -89,6 +89,9 @@ export interface MockDaemon {
   proposals: Array<{ name?: string; hash?: string }>
   polls: number
   lists: number
+  insula?: { reply?: unknown; refusal?: string; hung?: boolean }
+  insulaOpens: number
+  insulaReads: number
   /** Live transport connections, for consumer lifecycle assertions. */
   readonly connections: number
   onReport?: (report: MockReport) => void
@@ -132,6 +135,8 @@ export async function startMockDaemon(input: {
     proposals: [],
     polls: 0,
     lists: 0,
+    insulaOpens: 0,
+    insulaReads: 0,
     get connections() {
       return sockets.size
     },
@@ -277,6 +282,7 @@ export async function startMockDaemon(input: {
     let buffer = Buffer.alloc(0)
     let phase: 'hello' | 'auth' | 'frames' = 'hello'
     let routeChannel: number | undefined
+    let insulaRoute = false
 
     socket.on('data', (chunk) => {
       buffer = Buffer.concat([
@@ -330,10 +336,29 @@ export async function startMockDaemon(input: {
         const request = JSON.parse(body.toString('utf8')) as {
           method?: string
           op?: string
+          target?: Wire
           params?: Wire
         }
         if (header.channel === 0) {
-          if (request.op === 'route.open') routeChannel = 7
+          if (request.op === 'route.open') {
+            insulaRoute = request.target?.module_id === 'insula'
+            if (insulaRoute) {
+              state.insulaOpens++
+              if (!state.insula || state.insula.refusal) {
+                writeResponse(
+                  socket,
+                  header,
+                  {
+                    code: state.insula?.refusal ?? 'unknown_module',
+                    message: 'mock insula refused',
+                  },
+                  subc.FrameType.Error,
+                )
+                continue
+              }
+            }
+            routeChannel = 7
+          }
           writeResponse(socket, header, { route_channel: 7, route_epoch: 1 })
           continue
         }
@@ -344,6 +369,12 @@ export async function startMockDaemon(input: {
             { code: 'unknown_channel' },
             subc.FrameType.Error,
           )
+          continue
+        }
+        if (insulaRoute && request.method === 'usage.get') {
+          state.insulaReads++
+          if (!state.insula?.hung)
+            writeResponse(socket, header, state.insula?.reply ?? { result: [] })
           continue
         }
         writeResponse(

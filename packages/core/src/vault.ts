@@ -39,13 +39,20 @@ import {
   enrollmentAuthority,
   enrollmentName,
   hostEnrollmentPaths,
+  mutateVaultRoster,
   type QuotaReceipt,
   readClaustrumEnrollmentStatus,
+  readVaultRoster,
   type VaultRosterFile,
   type VaultRosterRow,
 } from '@cortexkit/common-auth/claustrum'
 import { CommandError } from '@cortexkit/common-auth/commands'
-import { projectQuota, type QuotaMap } from '@cortexkit/common-auth/quota'
+import {
+  mergeQuotaObservation,
+  projectQuota,
+  type QuotaMap,
+} from '@cortexkit/common-auth/quota'
+import { normalizeInsulaCodexQuota } from './insula-quota'
 import { createLogger } from './logger'
 import { extractAccountIdFromClaims, parseJwtClaims } from './oauth'
 import { observationFromSnapshot } from './pool-quota'
@@ -207,7 +214,9 @@ export class OpenAiVault {
   readonly name: string
   readonly paths: VaultPaths
   readonly #options: OpenAiVaultOptions
-  readonly #consumer: ClaustrumConsumer
+  readonly #consumer: ClaustrumConsumer<
+    NonNullable<ReturnType<typeof normalizeInsulaCodexQuota>>
+  >
   readonly #pulls = new Map<string, Promise<unknown>>()
   readonly #quotaPolls = new Map<
     string,
@@ -241,6 +250,7 @@ export class OpenAiVault {
         ? { reservedRouteIds: options.reservedRouteIds }
         : {}),
       parseIdentity: vaultIdentityOf,
+      insula: { provider: 'codex', normalize: normalizeInsulaCodexQuota },
       ...(options.now ? { now: options.now } : {}),
       onRoster: () => {
         this.#lastError = undefined
@@ -339,6 +349,7 @@ export class OpenAiVault {
       try {
         await this.authority()
         await this.#discover()
+        await this.#consumer.refreshInsulaQuota()
       } catch (error) {
         if (!this.#closed) this.#fail('vault roster refresh failed', error)
       }
@@ -568,24 +579,78 @@ export class OpenAiVault {
     )
   }
 
-  /** Joins an existing quota poll, or starts one through the usage endpoint. */
-  pollQuota(routeId: string): Promise<{ ok: boolean; error?: string }> {
+  /** Joins a quota poll; current insula quota for the same account replaces a background ChatGPT wham/usage request. */
+  pollQuota(
+    routeId: string,
+    background = true,
+  ): Promise<{ ok: boolean; error?: string }> {
     const pending = this.#quotaPolls.get(routeId)
     if (pending) return pending
-    const pull = this.#pollQuota(routeId).finally(() => {
+    const pull = this.#pollQuota(routeId, background).finally(() => {
       this.#quotaPolls.delete(routeId)
     })
     this.#quotaPolls.set(routeId, pull)
     return pull
   }
 
-  async #pollQuota(routeId: string): Promise<{ ok: boolean; error?: string }> {
+  async #pollQuota(
+    routeId: string,
+    background: boolean,
+  ): Promise<{ ok: boolean; error?: string }> {
+    if (background) {
+      await this.authority()
+      await this.#consumer.refreshInsulaQuota()
+      const row = (await readVaultRoster(this.paths.rosterPath))?.rows.find(
+        (row) => row.routeId === routeId,
+      )
+      const cached = await this.#consumer.cachedInsulaQuotaForRoute(routeId)
+      if (cached !== undefined && row?.accountIdentity) {
+        const observation = observationFromSnapshot(
+          cached,
+          cached.primary.checkedAt,
+          true,
+        )
+        if (!observation) return { ok: false, error: 'unusable insula reading' }
+        // Insula reports quota for an account, so no credential fetch is needed.
+        // Check the account again under the roster lock to avoid writing this
+        // reading to a row another process has replaced since the cache lookup.
+        const kept = await mutateVaultRoster(
+          this.paths.rosterPath,
+          (roster) => {
+            const current = roster?.rows.find(
+              (entry) => entry.routeId === routeId,
+            )
+            if (!current || current.accountIdentity !== row.accountIdentity)
+              return { result: false }
+            current.quota = mergeQuotaObservation(current.quota, observation)
+            return { next: roster, result: true }
+          },
+        )
+        await this.refresh()
+        return kept
+          ? { ok: true }
+          : { ok: false, error: 'vault account changed' }
+      }
+    }
     let failure: string | undefined
     const fetchImpl = this.#options.fetchImpl?.() ?? globalThis.fetch
     const response = await this.send(
       routeId,
       async (token, attempt) => {
         try {
+          const cached = background
+            ? undefined
+            : await this.#consumer.cachedInsulaQuota(attempt)
+          if (cached !== undefined) {
+            const observation = observationFromSnapshot(
+              cached,
+              cached.primary.checkedAt,
+              true,
+            )
+            if (!observation) throw new Error('unusable insula reading')
+            await this.#consumer.recordQuota(routeId, observation, attempt)
+            return new Response(null, { status: 200 })
+          }
           const snapshot = await whamUsageFn({
             accessToken: token,
             fetchImpl,
@@ -628,7 +693,7 @@ export class OpenAiVault {
   requestReading(routeId: string): ReturnType<QuotaReadingRequest> {
     const pending = this.#pulls.get(routeId)
     if (pending) return pending
-    const pull = this.pollQuota(routeId)
+    const pull = this.pollQuota(routeId, false)
       .catch((error: unknown) => {
         log.warn('vault quota poll failed', {
           routeId,
