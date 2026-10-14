@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { readdirSync, readFileSync, rmSync } from 'node:fs'
+import { readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { dirname, join, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { installPackedPackages } from './fixtures/opencode2-pack'
@@ -93,8 +93,10 @@ describe('private-files packaging boundary', () => {
         )
         expect(probe.status).toBe(0)
         expect(probe.stderr).toBe('')
+        // Node resolves through symlinks (macOS /var is /private/var), so
+        // compare against the real path of the installed package.
         expect(fileURLToPath(probe.stdout.trim())).toStartWith(
-          `${privateFiles}${sep}`,
+          `${realpathSync(privateFiles)}${sep}`,
         )
         assertExternalTree(join(root, 'dist'))
       }
