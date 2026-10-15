@@ -5,7 +5,7 @@
 
 import { afterEach, describe, expect, it, spyOn } from 'bun:test'
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import {
   isPlaceholderCredential,
   OpenCode2AuthError,
@@ -332,6 +332,130 @@ describe('OpenCode 2 entry: the chosen row on the wire', () => {
       'Bearer a-token',
     )
     expect(bearer(await poolRequestHeaders(host, 'ses_2', 'title'))).toBe(
+      'Bearer b-token',
+    )
+  })
+})
+
+describe('OpenCode 2 shared session pins', () => {
+  const rows = [
+    { id: 'a', usedPercent: 10 },
+    { id: 'b', usedPercent: 10 },
+  ]
+
+  it('one location spreads two cold sessions across equal rows', async () => {
+    const { host } = await startPool('sticky-balanced', rows)
+    const first = bearer(await poolRequestHeaders(host, 'ses_1'))
+    const second = bearer(await poolRequestHeaders(host, 'ses_2'))
+    expect(first).toBe('Bearer a-token')
+    expect(second).toBe('Bearer b-token')
+  })
+
+  it('two locations spread cold sessions across equal rows', async () => {
+    const files = poolFiles()
+    seedPool(files, 'sticky-balanced', rows)
+    const one = await start(files)
+    const two = await start(files)
+    const first = bearer(await poolRequestHeaders(one.host, 'ses_1'))
+    const second = bearer(await poolRequestHeaders(two.host, 'ses_2'))
+    expect(first).toBe('Bearer a-token')
+    expect(second).toBe('Bearer b-token')
+  })
+
+  it('relative and absolute paths to the same store share pins', async () => {
+    const files = poolFiles()
+    seedPool(files, 'sticky-balanced', rows)
+    const one = await start(files)
+    const two = await start(files, {
+      paths: () => ({
+        configPath: relative(process.cwd(), files.configPath),
+        statePath: relative(process.cwd(), files.statePath),
+      }),
+    })
+    expect(bearer(await poolRequestHeaders(one.host, 'ses_1'))).toBe(
+      'Bearer a-token',
+    )
+    expect(bearer(await poolRequestHeaders(two.host, 'ses_2'))).toBe(
+      'Bearer b-token',
+    )
+  })
+
+  for (const different of ['configPath', 'statePath', 'both'] as const) {
+    it(`does not share pins across stores differing in ${different}`, async () => {
+      const files = poolFiles()
+      const other = poolFiles()
+      seedPool(files, 'sticky-balanced', rows)
+      seedPool(other, 'sticky-balanced', rows)
+      const one = await start(files)
+      const two = await start(other, {
+        paths: () => ({
+          configPath:
+            different === 'statePath' ? files.configPath : other.configPath,
+          statePath:
+            different === 'configPath' ? files.statePath : other.statePath,
+        }),
+      })
+      expect(bearer(await poolRequestHeaders(one.host, 'ses_1'))).toBe(
+        'Bearer a-token',
+      )
+      expect(bearer(await poolRequestHeaders(two.host, 'ses_2'))).toBe(
+        'Bearer a-token',
+      )
+    })
+  }
+
+  it('keeps a pin after its location and then every location disposes', async () => {
+    const files = poolFiles()
+    seedPool(files, 'sticky-balanced', [
+      { id: 'a', usedPercent: 10 },
+      { id: 'b', usedPercent: 90 },
+    ])
+    const one = await start(files)
+    const two = await start(files)
+    expect(bearer(await poolRequestHeaders(one.host, 'ses_live'))).toBe(
+      'Bearer a-token',
+    )
+    await one.stop()
+    seedPool(files, 'sticky-balanced', [
+      { id: 'a', usedPercent: 80 },
+      { id: 'b', usedPercent: 5 },
+    ])
+    expect(bearer(await poolRequestHeaders(two.host, 'ses_live'))).toBe(
+      'Bearer a-token',
+    )
+    await two.stop()
+    const three = await start(files)
+    expect(bearer(await poolRequestHeaders(three.host, 'ses_new'))).toBe(
+      'Bearer b-token',
+    )
+    expect(bearer(await poolRequestHeaders(three.host, 'ses_live'))).toBe(
+      'Bearer a-token',
+    )
+  })
+
+  it('session deletion in one location forgets the pin in every location', async () => {
+    const files = poolFiles()
+    seedPool(files, 'sticky-balanced', [
+      { id: 'a', usedPercent: 10 },
+      { id: 'b', usedPercent: 90 },
+    ])
+    const one = await start(files)
+    const two = await start(files)
+    expect(bearer(await poolRequestHeaders(one.host, 'ses_deleted'))).toBe(
+      'Bearer a-token',
+    )
+    expect(bearer(await poolRequestHeaders(two.host, 'ses_deleted'))).toBe(
+      'Bearer a-token',
+    )
+    seedPool(files, 'sticky-balanced', [
+      { id: 'a', usedPercent: 80 },
+      { id: 'b', usedPercent: 5 },
+    ])
+    await one.host.publish('session.deleted', { sessionID: 'ses_deleted' })
+    expect(bearer(await poolRequestHeaders(two.host, 'ses_deleted'))).toBe(
+      'Bearer b-token',
+    )
+    expect(bearer(await poolRequestHeaders(one.host, 'ses_deleted'))).toBe(
       'Bearer b-token',
     )
   })

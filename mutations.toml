@@ -10,6 +10,37 @@
 # a silent, costly failure: a credential lost or leaked, a reset credit spent
 # twice, output replayed, a crash that loses an account, a wire contract.
 
+# OpenCode 2 locations share pending placement bytes only within one account store.
+
+[[control]]
+id = "opencode2-shared-session-pins"
+guards = "cold sessions in different locations see the same pending-byte ledger"
+file = "packages/opencode/src/v2/setup.ts"
+old = "  const pins = acquireSessionPins(paths())"
+new = "  const pins = new (await import('./pins')).SessionPins() // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sshared\ssession\spins\stwo\slocations\sspread\scold\ssessions\sacross\sequal\srows$']
+
+[[control]]
+id = "opencode2-session-pins-store-isolation"
+guards = "different account stores never share session pins or pending placement bytes"
+file = "packages/opencode/src/v2/shared-pins.ts"
+old = """  const key = JSON.stringify([
+    resolve(paths.configPath),
+    resolve(paths.statePath),
+  ])"""
+new = "  const key = 'all-stores' // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sshared\ssession\spins\sdoes\snot\sshare\spins\sacross\sstores\sdiffering\sin\sboth$']
+
 # Send-time eligibility and vault admission on the migrated request paths.
 
 [[control]]

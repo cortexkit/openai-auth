@@ -105,7 +105,7 @@ import {
   writeLoginToPool,
 } from './login'
 import { registerCodexModelRules } from './models'
-import { SessionPins } from './pins'
+import { acquireSessionPins } from './shared-pins'
 
 /**
  * The plugin id both hosts list this plugin under: the OpenCode 1 plugin's
@@ -496,7 +496,7 @@ export async function setupOpenAIAuth(
 
   vaultLease.start()
 
-  const pins = new SessionPins()
+  const pins = acquireSessionPins(paths())
   const openai = createOpenAIAdapter({
     source,
     slotPlaceholderWithoutMain,
