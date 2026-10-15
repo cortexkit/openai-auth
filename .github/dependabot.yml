@@ -11,6 +11,11 @@ updates:
       # recovery tests prove how that version reads our stream, so it moves
       # when the supported OpenCode release moves, not when a new one exists.
       - dependency-name: "@ai-sdk/openai"
+      # The TUI runs on the host's single Solid runtime, and common-auth and
+      # OpenTUI declare that exact solid-js version as a peer. A newer copy here
+      # splits common-auth into separate installed copies, so it moves only
+      # when OpenCode's runtime moves.
+      - dependency-name: "solid-js"
 
   - package-ecosystem: "github-actions"
     directory: "/"
