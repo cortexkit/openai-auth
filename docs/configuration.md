@@ -79,6 +79,8 @@ The Pi provider catalog includes `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini` and `gpt-5
 
 ## Manual install
 
+Use `npx @cortexkit/opencode-openai-auth setup` for the guided install. The steps below are the manual fallback.
+
 ### OpenCode 1
 
 Add the plugin to your OpenCode configuration (`~/.config/opencode/opencode.json`):

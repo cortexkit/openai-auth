@@ -13,6 +13,45 @@
 # Send-time eligibility and vault admission on the migrated request paths.
 
 [[control]]
+id = "setup-vault-mode-guard"
+guards = "vault setup leaves local credentials untouched and local setup refuses an enrolled host"
+file = "packages/opencode/src/setup.ts"
+old = "      await assertLocal(host)\n    },"
+new = "      // NON-VACUITY BREAK: permit local registration of an enrolled host.\n    },"
+test_file = "packages/opencode/src/tests/setup.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^setup\svault\smode\spreserves\severy\slocal\scredential\sbyte\sand\srefuses\slocal\ssign-in$']
+
+[[control]]
+id = "setup-opencode-enrollment-path"
+guards = "setup enrolls OpenCode beside its overridden account state file where the running plugin reads"
+file = "packages/opencode/src/setup.ts"
+old = "stateDir: vaultStateDir(getAccountPaths().statePath),"
+new = "stateDir: vaultStateDir(getAccountPaths().configPath), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/setup.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^setup\sopencode\senrollment\sis\swritten\sexactly\swhere\sthe\srunning\splugin\sreads\sit$']
+
+[[control]]
+id = "setup-pi-enrollment-path"
+guards = "setup enrolls Pi beside its overridden account state file where the running plugin reads"
+file = "packages/opencode/src/setup.ts"
+old = "stateDir: vaultStateDir(getPiAccountPaths().statePath),"
+new = "stateDir: vaultStateDir(getPiAccountPaths().configPath), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/setup.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^setup\spi\senrollment\sis\swritten\sexactly\swhere\sthe\srunning\splugin\sreads\sit$']
+
+[[control]]
 id = "cachekeep-vault-send-wiring"
 guards = "a captured vault route authorizes every warm through the vault rather than searching local pool tokens"
 file = "packages/opencode/src/index.ts"

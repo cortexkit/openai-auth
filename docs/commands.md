@@ -1,5 +1,20 @@
 # Commands
 
+## Setup
+
+Run `npx @cortexkit/opencode-openai-auth setup` with OpenCode and Pi stopped. It detects installed hosts, registers the matching package, and offers Claustrum enrollment or local sign-in.
+
+| Flag | What it does |
+| --- | --- |
+| `--yes` | Select all detected hosts without prompts; local sign-in remains interactive and vault enrollment needs `--claustrum`. |
+| `--dry-run` | Print the registration and enrollment plan without changing files or signing in. |
+| `--claustrum` | Connect detected hosts to the Claustrum vault. |
+| `--no-claustrum` | Use local credentials instead of the vault; enrolled hosts refuse this mode. |
+| `--login` | Force local sign-in rather than offering the vault. Pi uses its own `/login openai-codex`. |
+| `--opencode=1\|2\|both` | Select which OpenCode generation to register when detection is ambiguous. |
+
+Existing accounts migrate when the plugin first starts, not during setup. [Manual install](configuration.md#manual-install) remains available as a fallback.
+
 ## The `/openai` command
 
 On OpenCode 1, one command, `/openai`, opens one menu in the TUI. Its sections, in order:

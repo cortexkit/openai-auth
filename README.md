@@ -24,7 +24,7 @@ OpenCode and Pi can already sign in to ChatGPT. This plugin adds:
 npx @cortexkit/opencode-openai-auth setup
 ```
 
-It finds OpenCode and Pi, registers the plugin, and connects the vault or signs you in.
+The setup command detects OpenCode and Pi, registers the plugin, and offers a connection to the optional Claustrum vault or local sign-in.
 
 Then start OpenCode and run `/openai`.
 
