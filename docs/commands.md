@@ -2,7 +2,7 @@
 
 ## Setup
 
-Run `npx @cortexkit/opencode-openai-auth setup` with OpenCode and Pi stopped. It detects installed hosts, registers the matching package, and offers Claustrum enrollment or local sign-in.
+Run `npx @cortexkit/opencode-openai-auth setup` with OpenCode and Pi stopped. It detects OpenCode and Pi installations, registers the matching package, and offers a [Claustrum vault connection](vault.md#connecting-a-host) or local sign-in.
 
 | Flag | What it does |
 | --- | --- |
@@ -15,27 +15,27 @@ Run `npx @cortexkit/opencode-openai-auth setup` with OpenCode and Pi stopped. It
 
 Existing accounts migrate when the plugin first starts, not during setup. [Manual install](configuration.md#manual-install) remains available as a fallback.
 
-For OpenCode 2, setup leaves sign-in to OpenCode 2's own `auth login openai` command and prints the executable and pool-login methods to choose. That login stores the account in the pool and makes it OpenCode 2's active connection. `--opencode=both` signs in to OpenCode 1 during setup and also prints the OpenCode 2 step.
+For OpenCode 2, setup prints the detected OpenCode 2 login command and names its browser and headless pool-login methods. Run that command to store the account in the shared [account pool](accounts-and-routing.md#the-account-pool) and make it OpenCode 2's active connection. `--opencode=both` signs in to OpenCode 1 during setup and also prints the OpenCode 2 step.
 
 ## The `/openai` command
 
-On OpenCode 1, one command, `/openai`, opens one menu in the TUI. Its sections, in order:
+On OpenCode 1, the plugin's `/openai` slash command opens its menu in the terminal UI. Its sections, in order:
 
 | Section | What it does |
 | --- | --- |
 | Accounts | List accounts; add one (browser or device-code sign-in), disable, enable, move or remove one. Row `main`, the account OpenCode signs in with, is never removed. |
 | Quota | Every account's windows and credit budget; **Check now** polls them. |
 | Routing | The routing mode and the roster order. |
-| Limits | The killswitch and each account's floors. |
+| Limits | Block requests below each account's minimum remaining quota ([killswitch floors](accounts-and-routing.md#killswitch)). |
 | Cache | Prompt-cache keep-warm, subagent warming, sustain and the warm window. |
 | Diagnostics | Request dumps and the log level. |
 | Reset credits | Preview an account, spend one reset credit after explicit confirmation, or retry the last redemption. |
-| This session | The session's sticky pin, and clearing it. |
-| Vault | Whether this host is connected to the Claustrum vault, the OpenAI accounts the vault serves it, and the last error. **Connect** asks the vault to enroll this host; **Disconnect** forgets its token. Each vault account can be disabled (it stays listed and is never sent from this host) or enabled again. |
+| This session | The account assigned to this session (its pin), and clearing that assignment. |
+| Vault | This OpenCode's vault connection, available accounts and last error. **Connect** requests the vault owner's approval; **Disconnect** removes OpenCode's vault token. Accounts can be disabled for OpenCode without deleting them from the vault. |
 
 What each section controls is described in [Accounts and routing](accounts-and-routing.md), [Cache keep-warm](cache-keep-warm.md), [Troubleshooting](troubleshooting.md) and [Claustrum vault](vault.md).
 
-Settings the menu changes are saved through the account pool's store, under the names `routing.mode`, `killswitch.{enabled,accounts}`, `logging.level`, `cacheKeep.*` and `dump.enabled`. The menu needs the account pool: until every OpenCode process on the machine runs a version that understands it and the accounts have moved, `/openai` shows only that notice and the processes still holding the move back.
+The menu saves settings in the account pool, under `routing.mode`, `killswitch.{enabled,accounts}`, `logging.level`, `cacheKeep.*` and `dump.enabled`. It opens after the main login is transferred from OpenCode 1's `auth.json` into the shared pool. To avoid leaving a process that still reads only `auth.json`, the transfer waits for every running OpenCode process to use this plugin version or newer. Until it finishes, `/openai` shows **Accounts are moving** and lists any blocking processes.
 
 The eight earlier commands (`/openai-account`, `/openai-quota`, `/openai-routing`, `/openai-killswitch`, `/openai-cachekeep`, `/openai-dump`, `/openai-logging`, `/openai-reset`) are gone; their actions are sections of the menu.
 
@@ -43,7 +43,7 @@ The menu and the sidebar are not available on [OpenCode 2](opencode-2.md) yet.
 
 ## From a terminal, without a TUI session
 
-Once a credential exists (OpenCode's own or a stored account), `opencode auth login` offers an account menu for this provider:
+On OpenCode 1, once a credential exists (OpenCode's own or a stored account), `opencode auth login` offers this provider's account menu:
 
 ```text
 Add account               add an account (device code when no browser is available)
@@ -56,11 +56,11 @@ Connect to the Claustrum vault   serve OpenAI accounts held in the vault
 Delete all accounts       remove every account except main
 ```
 
-While the host is connected to the vault, the menu lists the vault's accounts and offers only **Check quotas** and **Disconnect from the Claustrum vault**; local account management returns after disconnecting.
+While OpenCode 1 is connected to the vault, this account menu lists vault accounts and offers only **Check quotas** and **Disconnect from the Claustrum vault**. Local account management returns after OpenCode disconnects.
 
-This is the path for headless machines, where `/openai` is out of reach. The first login on a new machine goes straight to sign-in as usual. Before the accounts have moved to the account pool, the menu shows only that notice and the doctor. Connecting to the vault prints the `ck auth enroll approve` and `ck auth grant` commands to run, and waits for the approval (see [Claustrum vault](vault.md#connecting-a-host)).
+Use this menu on headless machines without the `/openai` terminal UI. The first login on a new machine goes straight to sign-in. Until [account-pool migration](accounts-and-routing.md#the-account-pool) finishes, the menu shows migration status and **Auth doctor** checks instead of account management. Connecting to the vault prints the approval and account-access commands to run (see [Claustrum vault](vault.md#connecting-a-host)).
 
-The menu prints `Failed to authorize` when it returns, even when the action succeeded. The menu writes its own changes and deliberately reports nothing back as a sign-in, because a fallback account must not be filed as the main credential. Check the result with `/openai`.
+OpenCode prints `Failed to authorize` when returning from the `opencode auth login` account menu, even when a change succeeded. The menu saves the change itself and tells OpenCode that no login happened, so OpenCode does not record a fallback as its main login. Open `/openai` to see the saved change.
 
 ## Pi
 
@@ -71,9 +71,9 @@ The Pi extension registers one command, `openai`, which opens a menu:
 | Accounts | Add a fallback account through OAuth; disable, enable, move or remove one. |
 | Quota | Check every account's quota now. |
 | Routing | `ordered`, `main-first`, `fallback-first` or `sticky-balanced`, and the roster order. |
-| Limits | The killswitch and each account's floors. |
+| Limits | Block requests below each account's minimum remaining quota ([killswitch floors](accounts-and-routing.md#killswitch)). |
 | Pi login | The quota of the account you signed in to Pi with, routed as `main`. |
-| This session | Clear the session's pin. |
+| This session | Clear this Pi session's account assignment (pin). |
 | Vault | Connect Pi to the Claustrum vault; disable or enable each vault account on Pi alone. See [Claustrum vault](vault.md). |
 
-Pi's own login uses Pi's normal flow, `/login openai-codex`.
+Sign in to Pi itself with `/login openai-codex`; this is separate from adding fallback accounts in the plugin menu.

@@ -1,6 +1,6 @@
 # @cortexkit/opencode-openai-auth
 
-The OpenCode package of [CortexKit OpenAI Auth](https://github.com/cortexkit/openai-auth). It lets OpenCode 1 and 2 use a ChatGPT Plus or Pro subscription through the OpenAI Codex backend, with several accounts and sticky routing, usage limits per account, prompt-cache keep-warm and optional Claustrum vault integration. The Pi package is [`@cortexkit/pi-openai-auth`](https://www.npmjs.com/package/@cortexkit/pi-openai-auth).
+The OpenCode package of [CortexKit OpenAI Auth](https://github.com/cortexkit/openai-auth). It lets OpenCode 1 and 2 use a ChatGPT Plus or Pro subscription through the OpenAI Codex backend, with several accounts and sticky routing (keeping each session on one account), usage limits per account, prompt-cache keep-warm on OpenCode 1 (keeping idle sessions' prompts cached), and optional Claustrum vault integration. The Pi package is [`@cortexkit/pi-openai-auth`](https://www.npmjs.com/package/@cortexkit/pi-openai-auth).
 
 > This plugin is not affiliated with or endorsed by OpenAI. Using a subscription this way may be against OpenAI's terms, and OpenAI may limit or suspend accounts. You use it at your own risk; the authors accept no responsibility for any action the provider takes.
 

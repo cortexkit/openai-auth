@@ -2,48 +2,50 @@
 
 ## Multiple accounts
 
-The plugin supports more than one ChatGPT account: a single **main** account plus any number of **fallback** accounts. When the account serving a request hits a rate limit, traffic rolls over to a healthy fallback for the rest of the limit window, then returns.
+The plugin supports a **main** ChatGPT account plus **fallback** accounts to use when the chosen account cannot serve a request. The [routing mode](#routing) decides when to switch accounts.
 
-On OpenCode, the main account is the one you sign in to with a local ChatGPT method of `/login openai` (see [Configuration](configuration.md#signing-in-on-opencode-1)). On Pi, it is the login you signed in to Pi with (see [Pi](#pi)).
+On [OpenCode 1](configuration.md#signing-in-on-opencode-1), your initial ChatGPT login becomes `main`. On [OpenCode 2](opencode-2.md#signing-in), use the plugin's pool-login methods. On Pi, `main` is Pi's own login (see [Pi](#pi)).
 
-- **Add a fallback** from the Accounts section of [`/openai`](commands.md#the-openai-command) (browser or device-code sign-in), or from `opencode auth login`.
+- **Add a fallback** from the Accounts section of the plugin's [`/openai` slash command](commands.md#the-openai-command) (browser or device-code sign-in), or from `opencode auth login`.
 - **Remove, disable or reorder** accounts from the same section. Row `main` is never removed.
 - Each account is identified by its stable ChatGPT account id, so the same account is never added twice.
 
-Which account serves is decided by the [routing mode](#routing). There is no manual active-account selector: `sticky-balanced` creates a session pin automatically, while the other modes follow their configured order. A request that a fallback can serve is buffered so the retry is safe, and selection skips accounts the [killswitch](#killswitch) has gated out.
+There is no manual active-account selector: `sticky-balanced` assigns each session to one account (a **pin**), while other modes follow their configured order. OpenCode 1 buffers eligible request bodies so a refused attempt can replay the same input on a fallback without losing the body or duplicating output. If the connection fails without a provider response, it does not switch accounts: the provider may already have processed the request. Selection skips accounts blocked by the [killswitch quota guard](#killswitch).
 
-While a host is connected to the [Claustrum vault](vault.md), the vault's accounts take the place of all of these, under the same routing modes and limits.
+When OpenCode or Pi is connected to the [Claustrum vault](vault.md), the vault's accounts replace its local accounts, under the same routing modes and limits.
 
 ## The account pool
 
 On OpenCode, every local ChatGPT account and its credential live in one shared on-disk store, the account pool, in `~/.config/opencode/openai-auth.json` and its state file. OpenCode 1 and OpenCode 2 use the same files.
 
-An install from before the pool keeps its main login in OpenCode 1's own login store (`~/.local/share/opencode/auth.json`). The plugin moves it into the pool as row `main`, and replaces OpenCode's login with an OAuth placeholder whose access token is empty. The move waits until no older openai-auth process is running; until every OpenCode process on the machine runs a version that understands the pool and the accounts have moved, `/openai` shows only that notice and the processes still holding the move back. A ChatGPT login written into OpenCode's `openai` slot later is adopted into the pool the same way.
+An install from before the pool keeps its main login in OpenCode 1's login store (`~/.local/share/opencode/auth.json`). The plugin moves it into pool row `main` and replaces OpenCode's login with a **placeholder**: a non-secret login record with an empty access token. The plugin recognizes this marker and reads the real credentials from the pool instead.
+
+Moving the main login waits until every running OpenCode process uses this plugin version or newer, so every process understands the pool. Until migration finishes, `/openai` shows an **Accounts are moving** notice and lists any processes blocking it. A ChatGPT login written into OpenCode's `openai` slot later is adopted into the pool the same way.
 
 Downgrading after the account-pool migration is unsupported. A pre-1.0 build that does not understand the placeholder would send an empty bearer instead of reading the account pool. Keep the pool-aware build, or sign in afresh in a separate store before using an older build.
 
 When `OPENCODE_AUTH_CONTENT` supplies OpenCode 1's login, the slot is read-only for migration and adoption. The plugin leaves the environment login and `auth.json` untouched and keeps using the login as before; unset the override to migrate the login on disk.
 
-Development installs that ran an unreleased build may hold an untagged placeholder, left by an interrupted move of the login from OpenCode's slot into the account pool, together with the unfinished record of that move. Placeholders written by released builds carry a tag recording which config root wrote them; an untagged one cannot show whether this store or another store sharing `auth.json` moved the login. Its credential is therefore kept but disabled, rather than deleted or assumed to belong to this store. The auth doctor lists the row: sign in again with `opencode auth login`, or re-enable it only if this config root is the only one using that `auth.json`. Development migrations that already completed with an untagged placeholder keep working unchanged, including later login adoption.
+An interrupted migration in an unreleased development build may leave an untagged placeholder and an unfinished transfer record. Released builds tag placeholders with their configuration directory; without that tag, the plugin cannot tell which store sharing `auth.json` owns the login, so it keeps the credential but disables the row. **Auth doctor**, the credential checks and repairs in `opencode auth login`, lists it: sign in again, or re-enable it only if this configuration directory is the only one using that `auth.json`. If an unreleased build already finished moving the main login, its pool accounts remain usable and later slot logins can still be imported.
 
 How the pool behaves in vault mode is described in [Claustrum vault](vault.md#vault-mode).
 
 ## Routing
 
-The Routing section of `/openai` sets the routing mode and the roster order:
+The Routing section of `/openai` sets the routing mode and account order:
 
 | Mode | Behavior |
 | --- | --- |
 | `ordered` | Try the accounts in roster order (set the order in the same section). |
 | `main-first` (default) | Send on the main account; on a `401`, `403` or `429`, retry on the next usable fallback. |
 | `fallback-first` | Try usable fallback accounts first (preserving the main account's quota), and fall through to the main account only if no fallback can serve. |
-| `sticky-balanced` | For a cold session, choose the account with the lowest projected pressure against its usable quota, and keep that account pinned for the session. |
+| `sticky-balanced` | For a session with no pin, choose the account with the lowest projected pressure: estimated request load relative to available quota capacity. Keep that assignment. |
 
 ### Sticky-balanced
 
-`sticky-balanced` does not rebalance mid-session. A pin stays in place until fresh quota confirms exhaustion or the account has a permanent authentication failure (`401`/`403`). A transient failure, stale or unknown quota, and a `429` without confirmed exhaustion keep the pin; there is no Retry-After hold. This avoids changing accounts while a session's continuation and cache context still belong to the first account.
+`sticky-balanced` does not rebalance just to even out usage. Confirmed quota exhaustion, a [killswitch block](#killswitch), or a permanent authentication failure (`401`/`403`) can move the pin. Transient failures and stale or unknown quota keep the pin. A `429` without confirmed exhaustion is returned to OpenCode; the next request stays on the same account, without a timed pause imposed by the plugin. This keeps the session's continuation and prompt cache on their original account.
 
-Pins are keyed by a SHA-256 hash of the session id in the machine-global sidebar state, and expire after seven days. Cold placement excludes accounts with stale (older than 15 minutes) or unknown quota from weighted selection. If no account is left for weighted selection, placement fails open: it picks an account with applicable reset credits first, then follows configured order, then account id. When the killswitch is on, accounts below their floors are excluded from both weighted selection and the fail-open branch; if the killswitch excludes every account, the request is blocked rather than sent. Equal projected-pressure scores break by configured order, then account id; a shared pending-byte bridge makes simultaneous cold placements account for each other.
+Pins are saved under hashed session ids in the machine-wide sidebar state and expire after seven days. For a **cold session** (one with no pin), the score compares request size plus pending input bytes against capacity estimated from quota left, [reserved floors](#killswitch), reset timing and credit budget. Accounts with quota older than 15 minutes or unknown quota are excluded from this scoring. If no account can be scored, selection prefers accounts with usable [rate-limit reset credits](#reset-credits), then configured order, then account id. Accounts below their floors remain excluded even in that fallback; if none can serve, the request is blocked. Equal pressure scores break by configured order, then account id; simultaneous new placements count toward each other's estimated demand.
 
 Subagents receive independent pins, and a resumed subagent reuses its own pin. The **This session** section of `/openai` clears only the current session's pin, so the next placement may choose the same account again.
 
@@ -71,6 +73,6 @@ The Reset credits section of `/openai` previews an account, spends one rate-limi
 On Pi, every request goes out with one account's token, chosen by the routing mode:
 
 - `main-first` tries your Pi login first, then the fallbacks in order; `fallback-first` tries the fallbacks first and your Pi login last. When an account answers with a rate-limit or authentication error before anything was streamed, the next one is tried.
-- `sticky-balanced` keeps each Pi session on one account, spreading sessions by remaining quota, and moves a session for good only when its account is confirmed exhausted.
+- `sticky-balanced` keeps each Pi session on one account, spreading new sessions by remaining quota; confirmed exhaustion causes a lasting account switch.
 
 Your Pi login stays where Pi keeps it: Pi refreshes it, and the extension only uses the token Pi hands it. Fallback accounts live in the extension's own store (`openai-auth.json` in Pi's agent directory, `~/.pi/agent` unless `PI_AGENT_DIR` says otherwise, or the file `PI_OPENAI_AUTH_FILE` names) and are refreshed there. A fallback that is the same ChatGPT account as your Pi login is never used twice. An account is used only once its quota is known: each account's quota is checked as soon as the extension sees it, and quota from every response keeps it current. A store written by an earlier version is converted to the account-pool format the first time it is read, keeping its accounts.

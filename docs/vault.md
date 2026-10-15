@@ -1,12 +1,12 @@
 # Claustrum vault
 
-[Claustrum](https://github.com/cortexkit/claustrum) is CortexKit's local credential vault. It keeps your logins and refreshes them in one place, so no plugin holds a refresh token. The OpenAI accounts held in the vault can serve OpenCode and Pi in place of your own accounts.
+[Claustrum](https://github.com/cortexkit/claustrum) is CortexKit's local credential vault. It keeps your logins and refreshes them in one place, so no plugin holds a refresh token. The OpenAI accounts held in the vault can serve OpenCode and Pi instead of separately stored local logins.
 
 ## Connecting a host
 
-Each host enrolls under its own name, `openai-auth-opencode` for OpenCode and `openai-auth-pi` for Pi, so either can be revoked alone. OpenCode 1 and OpenCode 2 share the `openai-auth-opencode` enrollment and its files.
+Each application enrolls under its own name, `openai-auth-opencode` for OpenCode and `openai-auth-pi` for Pi, so either can be revoked alone. OpenCode versions 1 and 2 share the `openai-auth-opencode` enrollment and its files.
 
-**Connect** (in the `opencode auth login` menu, the Vault section of `/openai`, or the Vault section of Pi's `openai` command) proposes the enrollment and tells you what to run:
+**Connect** (in `opencode auth login`, the Vault section of the plugin's [`/openai` slash-command menu](commands.md#the-openai-command), or Pi's `openai` menu) sends an enrollment request for the vault owner to approve with the vault's [`ck` command-line tool](https://github.com/cortexkit/claustrum). It prints the approval and account-access commands:
 
 ```text
 Enrollment request <id> for openai-auth-opencode is waiting for approval. Approve it with:
@@ -15,41 +15,41 @@ and let it read your OpenAI accounts with:
   ck auth grant --principal enrolled:openai-auth-opencode --selector-kind category --selector openai-native --operation read
 ```
 
-Pi shows the same commands with `openai-auth-pi`, and tells you when the approval lands.
+Pi's commands identify its separate enrollment, `openai-auth-pi`, instead of OpenCode's. Pi reports when the vault owner approves its request.
 
-The token the vault then issues is kept owner-only in `openai-auth-vault/` next to the account state file. **Disconnect** forgets it.
+After approval, the vault issues a token authorizing OpenCode or Pi to use the vault, not a ChatGPT login. It is stored owner-only in `openai-auth-vault/` next to the account state file. **Disconnect** removes the local token and enrollment-state file, not the vault's accounts or approved enrollment. OpenCode 1 and 2 share this connection, so disconnecting OpenCode affects both; disconnecting Pi affects only Pi.
 
-The Vault section of `/openai` shows whether this host is connected, the OpenAI accounts the vault serves it, and the last error. Each vault account can be disabled (it stays listed and is never sent from this host) or enabled again; on Pi, disabling applies to Pi alone.
+The Vault section of `/openai` shows OpenCode's connection, available OpenAI accounts and last error. Disabling an account prevents OpenCode from using it without deleting it from the vault; Pi's menu controls Pi separately.
 
 ## Activating an enrolled OpenCode host
 
-An enrolled host also offers **ChatGPT accounts in the vault** in `/login openai` and `opencode auth login`. It needs no browser or ChatGPT sign-in and creates no local account: OpenCode stores only the plugin's non-routable placeholder, so requests can use the vault.
+After enrollment, choose **ChatGPT accounts in the vault** in `/login openai` or `opencode auth login` to use logins already held by the vault. This opens no browser and creates no local ChatGPT account. OpenCode stores only a **placeholder**, a non-secret login marker that enables the plugin's vault routing rather than supplying a real ChatGPT token.
 
-On OpenCode 1, activation requires an empty `openai` slot in `auth.json`; any existing record, malformed JSON or unreadable file is refused without changing it. A missing file on a fresh install is allowed. Enrollment is checked again when activation completes; invalid or unreadable enrollment is refused. Vault activation does not create a main account.
+On OpenCode 1 (the 1.x series), activation requires an empty `openai` entry in `auth.json` (its login slot). Any existing record, malformed JSON or unreadable file is refused without changing it; a missing file on a fresh install is allowed. Enrollment is checked again when activation completes.
 
 For OpenCode 2, see [OpenCode 2](opencode-2.md#vault-only-hosts).
 
 ## Vault mode
 
-While the host holds a vault token (vault mode), the vault's accounts are the only ones used:
+While OpenCode or Pi holds a vault token (**vault mode**), its requests use only vault accounts:
 
 - They route through the same [routing modes and limits](accounts-and-routing.md) as local accounts.
 - Each request fetches its token from the vault, and a token the provider rejects is reported back to the vault.
 - No local account (a pool row, OpenCode's slot login, Pi's own login) is sent with, refreshed, polled or warmed, and the local pool files are left exactly as they are.
-- The sidebar, `/openai` and the `opencode auth login` menu list the vault accounts only.
-- A request no vault account can serve (the vault is unreachable, or serves no usable account) is refused locally, naming the cause and the remedy: connect accounts in the vault, or disconnect this host from the vault.
+- On OpenCode 1, the sidebar, `/openai` and the `opencode auth login` menu list vault accounts only.
+- A request no vault account can serve is refused locally. The request error explains the cause and remedy: make accounts available in the vault, or disconnect the affected OpenCode or Pi installation.
 
-Disconnect ends vault mode: the local accounts serve again at once, with nothing to migrate.
+Disconnecting OpenCode makes its local pool eligible again; disconnecting Pi restores its local login and fallbacks. OpenCode may still need to transfer its old slot login into the pool, as described below.
 
 ### OpenCode's login slot in vault mode
 
-In vault mode a login written into OpenCode's own `openai` slot stays there, unused, and nothing moves into the [account pool](accounts-and-routing.md#the-account-pool): neither the move of an install that has not migrated yet nor the adoption of a later login runs. Once the host disconnects, the slot login is adopted into the pool (on the next request, or within about a minute) and an unmigrated install migrates. An install that has not migrated is still served from the vault in vault mode; a login through OpenCode 2's own sign-in on such an install is refused until the host disconnects.
+In OpenCode's vault mode, real logins in OpenCode 1's `openai` slot stay unused. Neither the initial main login nor later replacements are transferred from that slot into the [account pool](accounts-and-routing.md#the-account-pool). After OpenCode disconnects, the slot login moves into the pool on the next request or a periodic check, within about a minute. Use the vault login method while connected; [OpenCode 2's browser and headless pool logins](opencode-2.md#signing-in) refuse to add local credentials until OpenCode disconnects.
 
-Do not delete the slot value as a repair: OpenCode 1 needs its OAuth placeholder to install the plugin's fetch.
+Do not delete OpenCode 1's placeholder as a repair: OpenCode 1 installs the plugin's request handler (its custom `fetch`) only for a provider with an OAuth login. The placeholder supplies that login record without a real token.
 
 ### Pi in vault mode
 
-On Pi, use `openai-codex/<model>` in both local and vault mode. Before Pi reloads auth, the plugin saves Pi's original `auth.json` login in an owner-only stash under its vault state directory and puts a non-secret placeholder in Pi's `auth.json`, so Pi cannot refresh that login while the vault serves. Disconnect restores the original entry before forgetting Pi's vault token. If another Pi login was added while connected, disconnect reports a conflict and keeps both that login and the stashed original without overwriting either.
+On Pi, use `openai-codex/<model>` in both local and vault mode. Before Pi reloads auth, the plugin saves Pi's original `auth.json` login in an owner-only stash under its vault state directory and puts a non-secret placeholder in Pi's `auth.json`, so Pi cannot refresh that login while the vault serves. Disconnecting Pi restores the original entry before removing Pi's vault token. If another Pi login was added while connected, disconnect reports a conflict and keeps both that login and the stashed original without overwriting either.
 
 ## API keys in the vault
 
@@ -57,4 +57,4 @@ Static OpenAI API keys held in the vault (`apikey:openai`) are not used: they ar
 
 ## Leftovers from earlier versions
 
-An install that used the vault custody of earlier versions may still hold its tombstones (in accounts, or in OpenCode's slot) and the `claustrum.mode` setting. They are never sent; the auth doctor lists them, with the remedy: connect the vault, or sign in to the account again.
+Earlier vault integrations replaced local credentials with **tombstones**, non-secret markers that are not usable logins. These can remain in account rows or OpenCode's slot, along with an old `claustrum.mode` setting; they are never sent or refreshed. **Auth doctor**, the credential diagnostics in `opencode auth login`, lists them and suggests connecting OpenCode to the vault or signing in again.

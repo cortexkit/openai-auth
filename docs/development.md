@@ -52,13 +52,13 @@ bun run dev:clean
 
 ## Analyzing cache cliffs
 
-With [request dumps](troubleshooting.md#request-dumps) turned on, analyze the cache cliffs of a dumped OpenCode session:
+To inspect a **cache cliff**, a sudden drop in prompt-cache reuse between turns, enable [request dumps](troubleshooting.md#request-dumps) and run:
 
 ```sh
 bun run analyze:cache -- --session ses_... --no-timeline
 ```
 
-For raw consecutive request-body comparisons, include wire context:
+To print previous and current request-body text around the first differing byte, add `--wire-context` with the number of surrounding bytes:
 
 ```sh
 bun run analyze:cache -- --session ses_... --no-timeline --wire-context 180
@@ -74,4 +74,4 @@ ckdev-mutate check --strict
 ckdev-mutate run --all
 ```
 
-The revision matches `CKDEV_MUTATE_REV` in `.github/workflows/ci.yml`.
+The `--rev` value above is CI's pinned `ckdev-mutate` source revision, stored as `CKDEV_MUTATE_REV` in `.github/workflows/ci.yml`, so local and CI checks use the same runner.

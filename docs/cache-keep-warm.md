@@ -1,33 +1,33 @@
 # Cache keep-warm
 
-Keep-warm is available on OpenCode 1. It is not on [OpenCode 2](opencode-2.md) or Pi yet.
+Keep-warm is available on OpenCode 1 (the 1.x series). It is not on [OpenCode 2](opencode-2.md) or Pi yet.
 
-The Cache section of [`/openai`](commands.md#the-openai-command) keeps the Codex prompt cache warm while a session is idle, so the next real turn after a gap hits the cache instead of paying for a cold start. Codex evicts a session's prompt cache after roughly five minutes of inactivity; keep-warm replays the latest real request as a tiny shadow request (it stores no turn: `store: false`) just before the cache would expire.
+The Cache section of the plugin's [`/openai` slash-command menu](commands.md#the-openai-command) keeps an idle session's prompt cached so its next turn can reuse it. Keep-warm replays the latest real request just before the cache expires, with `store: false` so the replay stores no turn. The cache lifetime is 30 minutes for GPT-5.6 and later, and five minutes by default for other models.
 
 ## Settings
 
 - **Keep-warm on/off.** The setting is saved (`cacheKeep.enabled`), so it stays on across restarts and applies to every session until you turn it off.
-- **Subagent warming.** Also keep subagent sessions warm (off by default). Useful when the same subagent is reused repeatedly. Subagent sessions warm only while recently active: a 30-minute idle cap, against one hour for the main session.
-- **Sustain.** Bypass main-session idle pruning. It defaults to off, applies to main-agent sessions only, and does not change subagent limits.
+- **Subagent warming.** Also warm subagent sessions (off by default), subject to the idle and replay limits below.
+- **Sustain.** Keep main-session warming past its one-hour idle cap. It defaults to off and does not change subagent limits.
 - **Warm window.** Warm only between local hours, such as `9-18` or `22-6`; empty warms at any hour.
 
-The section also lists the timer, the tracked sessions and the TTL.
+The Cache section also shows its timer, tracked sessions and prompt-cache lifetime (TTL).
 
 ## Which sessions are warmed
 
-Keep-warm only runs for main-agent sessions unless subagent warming is on, and it never warms an account that is not serving that session.
+Keep-warm only runs for main-agent sessions unless subagent warming is on, and it uses the account serving that session. A main session stops warming after one hour without a real request, unless sustain is on. Subagents have a 30-minute idle cap; on GPT-5.6 and later they instead have a 75-minute idle cap and a limit of two successful warms per captured request. Reaching a cap discards the saved request and stops warming, not the session itself; a later real request can start tracking again.
 
-`sustain` is independent of the warm window: the configured window still controls capture and warming. `sustain` bypasses only the main idle-pruning bound; the target-count, memory-byte and LRU caps still apply. Subagent idle and warm-count limits remain unchanged.
+`sustain` still obeys the warm window and limits on the number and total bytes of saved requests. When storage is full, the least recently used requests are discarded. Subagent idle and successful-warm-count limits remain unchanged.
 
-`sustain` deliberately does not use the sibling `anthropic-auth` plugin's `always` term. In that plugin, `always` means ignore the clock schedule; here, `sustain` means bypass main idle pruning. They control different things.
+In `anthropic-auth`, CortexKit's sister plugin for Claude, the `always` keep-warm option ignores the clock schedule. Here, `sustain` means keep warming a main session past its idle cap; it does not ignore the schedule.
 
 ## Cost
 
-A GPT-5.6 session needs about two warms per hour, roughly 1K output tokens per hour at about a 99.4% cache hit rate. Other models need about twelve warms per hour, which is the more expensive case.
+Longer-lived caches need fewer warm requests: GPT-5.6 and later use a 30-minute prompt-cache lifetime, versus the five-minute default for other models. Warm requests still consume tokens and quota.
 
 ## Sustain prerequisite: Magic Context
 
-Before enabling sustain for a main-session model, update `~/.config/cortexkit/magic-context.jsonc` with Magic Context's supported schema. Keep the existing per-model entries and set only the models used by sustained main sessions to `"never"`:
+If you use Magic Context, a prompt-rewriting plugin, set `cache_ttl` to `"never"` for each sustained main-session model in `~/.config/cortexkit/magic-context.jsonc`. Keep the existing per-model entries; for example:
 
 ```jsonc
 {
@@ -38,4 +38,4 @@ Before enabling sustain for a main-session model, update `~/.config/cortexkit/ma
 }
 ```
 
-Magic Context does not run in subagent sessions, so no subagent exception is needed. The setting is required because keeping a cache alive indefinitely breaks an elapsed-time heuristic in Magic Context, which assumes an old cache is cold and therefore safe to change for free.
+Magic Context uses cache age to decide when it can rewrite a prompt without invalidating still-cached input. Sustained warming keeps that input cached, so `"never"` disables the assumption that age alone means it has expired. Magic Context does not run in subagent sessions, so no subagent exception is needed.

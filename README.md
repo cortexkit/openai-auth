@@ -6,11 +6,11 @@ CortexKit OpenAI Auth lets [OpenCode](https://opencode.ai) (versions 1 and 2) an
 
 OpenCode and Pi can already sign in to ChatGPT. This plugin adds:
 
-- Several ChatGPT accounts, with sticky routing that keeps each session on its own account and moves it only when that account is truly exhausted.
+- Several ChatGPT accounts, with sticky routing that keeps each session on one account instead of rebalancing every turn.
 - Prompt-cache keep-warm, so an idle session's next turn still hits the cache.
 - Optional [Claustrum](https://github.com/cortexkit/claustrum) vault integration: Claustrum is CortexKit's local credential vault, which keeps the logins and refreshes them in one place so no plugin holds a refresh token.
-- Usage limits per account, with a killswitch that blocks an account before it runs out.
-- The `/openai` menu and a sidebar showing the usage left on each account.
+- Usage limits per account, with a killswitch that blocks requests below a chosen minimum remaining quota.
+- The plugin's `/openai` slash-command menu and a sidebar showing the usage left on each account.
 - Rate-limit reset credits, previewed and spent from the menu.
 - A WebSocket transport, with plain HTTP as the default and fallback.
 
@@ -32,7 +32,7 @@ Then start OpenCode and run `/openai`.
 
 - [Configuration](docs/configuration.md): settings, environment variables and manual install.
 - [Accounts and routing](docs/accounts-and-routing.md): multiple accounts, routing modes, quota and the killswitch.
-- [Claustrum vault](docs/vault.md): what the vault is, connecting a host, and vault mode.
+- [Claustrum vault](docs/vault.md): what the vault is, connecting OpenCode or Pi, and vault mode.
 - [Commands](docs/commands.md): the `/openai` menu, the `opencode auth login` menu and the Pi command.
 - [Cache keep-warm](docs/cache-keep-warm.md): keeping idle sessions' prompt cache warm.
 - [OpenCode 2](docs/opencode-2.md): install and differences from OpenCode 1.

@@ -32,7 +32,7 @@ Config file: `~/.config/opencode/openai-auth.json`. The directory follows `OPENC
 | WebSocket transport | `webSockets` | `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS` | `false` | Use the Codex Responses WebSocket transport instead of plain HTTP. See [Transports](transports.md). |
 | Hand-rolled WebSocket client | `rawWebSocket` | `CORTEXKIT_OPENAI_AUTH_RAW_WS` | `false` | When WebSockets are enabled, use the hand-rolled raw TCP/TLS client that surfaces Codex-style incremental streaming. Bun uses `Bun.connect`; Node and OpenCode Desktop use `node:net`/`node:tls`. |
 | Responses Lite | `responsesLite` | `CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE` | `false` | Send requests for the models Codex marks for Responses Lite (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` and `gpt-6.1-sol`) in Codex's Responses Lite shape, the wire format the Codex CLI itself uses for these models. |
-| Request dumps | `dump` | `CORTEXKIT_OPENAI_AUTH_DUMP` | `false` | Write final Codex request bodies and redacted request metadata for cache debugging. Bodies may contain prompt and session content. The config field also accepts `{ "enabled": true }`, the form the `/openai` menu saves. See [Troubleshooting](troubleshooting.md#request-dumps). |
+| Request dumps | `dump` | `CORTEXKIT_OPENAI_AUTH_DUMP` | `false` | Write final Codex request bodies and redacted request metadata for cache debugging. Bodies may contain prompt and session content. The config field also accepts `{ "enabled": true }`, the form the plugin's [`/openai` slash-command menu](commands.md#the-openai-command) saves. See [Troubleshooting](troubleshooting.md#request-dumps). |
 | Dump directory | `dumpDir` | `OPENCODE_OPENAI_AUTH_DUMP_DIR` | OS temp dir: `opencode-openai-auth-dumps` | Destination for `.body.json`, `.meta.json` and `.request.json` dump files. |
 | Codex endpoint | `codexApiEndpoint` | `CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT` | `https://chatgpt.com/backend-api/codex/responses` | Send rewritten Codex requests to a compatible proxy or relay instead of ChatGPT's backend endpoint. |
 
@@ -69,7 +69,7 @@ CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT=http://127.0.0.1:8899/v1/responses opencode
 
 ## The account store
 
-The same `openai-auth.json` file, with its state file, also holds the managed account store: accounts, routing, killswitch thresholds, quota cache, log level and cache keep-warm state. Those keys are written by `/openai`; change them there rather than by hand. The plugin keeps the two kinds of content apart: a settings-only file is never overwritten with account data, and account operations preserve your transport settings. The store is described in [Accounts and routing](accounts-and-routing.md#the-account-pool).
+The account store combines `openai-auth.json` with its companion state file (`openai-auth-state.json` by default; see `OPENCODE_OPENAI_AUTH_STATE_FILE` above). Together they hold accounts, routing, [killswitch quota floors](accounts-and-routing.md#killswitch), quota cache, log level and cache keep-warm state. Change these through `/openai` rather than by hand: account operations preserve transport settings, and a settings-only file is never overwritten with account data. See [Accounts and routing](accounts-and-routing.md#the-account-pool).
 
 ## Pi
 
@@ -117,7 +117,7 @@ The local login methods are:
 - **ChatGPT Pro/Plus (headless)**: device-code flow for remote or headless machines. You are shown a code to enter at the OpenAI device page from any browser.
 - **Manually enter API Key**: falls back to a standard pay-as-you-go OpenAI API key (no OAuth, normal billing).
 
-An enrolled host also offers **ChatGPT accounts in the vault**; see [Claustrum vault](vault.md#activating-an-enrolled-opencode-host).
+After the vault owner approves OpenCode's [enrollment request](vault.md#connecting-a-host), OpenCode also offers **ChatGPT accounts in the vault**; see [vault activation](vault.md#activating-an-enrolled-opencode-host).
 
 The account you sign in to with a local ChatGPT method is your **main** account. It is held in OpenCode's own auth store until it moves into the shared [account pool](accounts-and-routing.md#the-account-pool). Additional **fallback** accounts are managed separately (see [Multiple accounts](accounts-and-routing.md#multiple-accounts)).
 
