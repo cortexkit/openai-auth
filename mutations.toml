@@ -3456,3 +3456,42 @@ command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-insula-qu
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^vault\sinsula\squota\sthree\smatched\saccounts\sadd\sno\sdiscovery\sto\sa\sbackground\stick$']
+
+[[control]]
+id = "subc-single-copy-installed-tree"
+guards = "a second physical subc-client instance cannot pass the installed-tree check"
+file = "scripts/check-private-files-tree.mjs"
+old = "  requireSubc &&"
+new = "  false && // NON-VACUITY BREAK\n  requireSubc &&"
+test_file = "packages/opencode/src/tests/vault-client-packaging.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-client-packaging.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-client-packaging.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sclient\spackaging\srejects\sa\ssecond\ssubc-client\scopy\sat\sthe\ssame\sversion$']
+
+[[control]]
+id = "opencode-subc-client-external"
+guards = "the OpenCode bundle imports its single installed subc-client instead of embedding another client implementation"
+file = "packages/opencode/package.json"
+old = "--external @cortexkit/subc-client --minify && bun run build:types"
+new = "--minify && : 'NON-VACUITY BREAK' && bun run build:types"
+test_file = "packages/opencode/src/tests/vault-client-packaging.test.ts"
+runner = "command"
+command = ["bash", "-c", "bun run --cwd packages/opencode build && bun test --cwd packages/opencode ./src/tests/vault-client-packaging.test.ts -t \"$1\"", "mutation", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-client-packaging.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sclient\spackaging\sopencode\simports\svault\sclients\sfrom\sruntime\sdependencies$']
+
+[[control]]
+id = "pi-subc-client-external"
+guards = "the Pi bundle imports its single installed subc-client instead of embedding another client implementation"
+file = "packages/pi/package.json"
+old = "--external @cortexkit/subc-client --minify && bun run build:types"
+new = "--minify && : 'NON-VACUITY BREAK' && bun run build:types"
+test_file = "packages/opencode/src/tests/vault-client-packaging.test.ts"
+runner = "command"
+command = ["bash", "-c", "bun run --cwd packages/pi build && bun test --cwd packages/opencode ./src/tests/vault-client-packaging.test.ts -t \"$1\"", "mutation", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-client-packaging.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sclient\spackaging\spi\simports\svault\sclients\sfrom\sruntime\sdependencies$']

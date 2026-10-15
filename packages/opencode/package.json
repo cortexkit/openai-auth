@@ -43,7 +43,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts src/v2/server.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --external @opencode/plugin --external @cortexkit/private-files --minify && bun run build:types && bun run build:tui",
+    "build": "rm -rf dist && bun build src/index.ts src/v2/server.ts src/sidebar-state.ts src/tui-preferences.ts src/rpc/rpc-client.ts src/rpc/port-file.ts src/rpc/protocol.ts src/rpc/rpc-dir.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --external @opencode/plugin --external @cortexkit/private-files --external @cortexkit/claustrum-client --external @cortexkit/subc-client --minify && bun run build:types && bun run build:tui",
     "build:tui": "bun scripts/build-tui.ts",
     "build:types": "cd ../core && bun run build && cd ../opencode && tsdown --config tsdown.config.ts --config-loader native",
     "build:dev": "rm -rf dist && tsc -p tsconfig.build.json",
@@ -63,13 +63,14 @@
   },
   "devDependencies": {
     "@ai-sdk/openai": "3.0.88",
-    "@cortexkit/claustrum-client": "^0.9.0",
     "@cortexkit/common-auth": "^0.16.0",
     "@cortexkit/openai-auth-core": "workspace:*",
     "@opencode/plugin": "2.0.22"
   },
   "dependencies": {
+    "@cortexkit/claustrum-client": "^0.9.0",
     "@cortexkit/private-files": "^0.2.1",
+    "@cortexkit/subc-client": "^0.16.0",
     "@opentui/core": ">=0.5.14",
     "@opentui/solid": ">=0.5.14",
     "ai": "^7.0.127",

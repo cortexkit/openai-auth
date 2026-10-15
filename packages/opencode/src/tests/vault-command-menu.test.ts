@@ -206,9 +206,11 @@ describe('vault command menu', () => {
         ),
       )
       expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.16.0')
-      expect(manifest.devDependencies['@cortexkit/claustrum-client']).toBe(
-        '^0.9.0',
-      )
+      expect(
+        (manifest.dependencies ?? manifest.devDependencies)[
+          '@cortexkit/claustrum-client'
+        ],
+      ).toBe('^0.9.0')
     }
   })
   // Vault mode is exclusive: while connected, the vault's accounts are the

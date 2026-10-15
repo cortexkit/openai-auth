@@ -4,8 +4,10 @@ import { basename, join, resolve } from 'node:path'
 
 const root = resolve(process.argv[2] ?? join(import.meta.dir, '..'))
 const requireStore = process.argv.includes('--require-store')
+const requireSubc = process.argv.includes('--require-subc')
 const copies = new Map()
 const stores = new Map()
+const subc = new Map()
 
 function installed(directory) {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -14,12 +16,17 @@ function installed(directory) {
     const path = join(directory, entry.name)
     if (
       basename(directory) === '@cortexkit' &&
-      (entry.name === 'private-files' || entry.name === 'store')
+      ['private-files', 'store', 'subc-client'].includes(entry.name)
     ) {
       const manifest = JSON.parse(
         readFileSync(join(path, 'package.json'), 'utf8'),
       )
-      const found = entry.name === 'private-files' ? copies : stores
+      const found =
+        entry.name === 'private-files'
+          ? copies
+          : entry.name === 'store'
+            ? stores
+            : subc
       found.set(realpathSync(path), manifest.version)
     }
     installed(path)
@@ -54,6 +61,21 @@ if (
   console.error([...stores.entries()])
   process.exit(1)
 }
+if (
+  requireSubc &&
+  (subc.size !== 1 ||
+    !Bun.semver.satisfies([...subc.values()][0] ?? '', '^0.16.0'))
+) {
+  console.error(
+    'Expected exactly one physical @cortexkit/subc-client at 0.16.x',
+  )
+  console.error([...subc.entries()])
+  process.exit(1)
+}
 console.log(
   `private-files tree ok (${copies.size} physical copy: ${[...copies.values()]}; ${stores.size} store copies: ${[...stores.values()]})`,
 )
+if (requireSubc)
+  console.log(
+    `subc-client tree ok (${subc.size} physical copy: ${[...subc.values()]})`,
+  )

@@ -31,7 +31,9 @@
       "name": "@cortexkit/opencode-openai-auth",
       "version": "1.0.3",
       "dependencies": {
+        "@cortexkit/claustrum-client": "^0.9.0",
         "@cortexkit/private-files": "^0.2.1",
+        "@cortexkit/subc-client": "^0.16.0",
         "@opentui/core": ">=0.5.14",
         "@opentui/solid": ">=0.5.14",
         "ai": "^7.0.127",
@@ -40,7 +42,6 @@
       },
       "devDependencies": {
         "@ai-sdk/openai": "3.0.88",
-        "@cortexkit/claustrum-client": "^0.9.0",
         "@cortexkit/common-auth": "^0.16.0",
         "@cortexkit/openai-auth-core": "workspace:*",
         "@opencode/plugin": "2.0.22",
@@ -57,10 +58,11 @@
       "name": "@cortexkit/pi-openai-auth",
       "version": "1.0.3",
       "dependencies": {
+        "@cortexkit/claustrum-client": "^0.9.0",
         "@cortexkit/private-files": "^0.2.1",
+        "@cortexkit/subc-client": "^0.16.0",
       },
       "devDependencies": {
-        "@cortexkit/claustrum-client": "^0.9.0",
         "@cortexkit/common-auth": "^0.16.0",
         "@cortexkit/openai-auth-core": "workspace:*",
       },
