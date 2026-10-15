@@ -31,6 +31,8 @@ bun run format:check
 
 Inspect package contents before publishing:
 
+The Node bundles keep `jsonc-parser` as a declared runtime dependency: its UMD entry uses relative `require` calls that Bun's bundler leaves unresolved when inlined. The packed-package tests check the external dependency allowlist and load the installed package with plain Node.
+
 ```bash
 bun run pack:opencode:dry
 bun run pack:pi:dry
