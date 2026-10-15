@@ -16,6 +16,10 @@ updates:
       # splits common-auth into separate installed copies, so it moves only
       # when OpenCode's runtime moves.
       - dependency-name: "solid-js"
+      # claustrum-client depends on its own subc-client range, and both must
+      # share one installed copy, so subc-client moves only together with
+      # claustrum-client and common-auth.
+      - dependency-name: "@cortexkit/subc-client"
 
   - package-ecosystem: "github-actions"
     directory: "/"
