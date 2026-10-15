@@ -3495,3 +3495,16 @@ command = ["bash", "-c", "bun run --cwd packages/pi build && bun test --cwd pack
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-client-packaging.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^vault\sclient\spackaging\spi\simports\svault\sclients\sfrom\sruntime\sdependencies$']
+
+[[control]]
+id = "installed-tree-follows-store-links"
+guards = "a second copy reached through a link into Bun's store still counts, so ignoring unlinked store entries cannot hide a real duplicate"
+file = "scripts/check-private-files-tree.mjs"
+old = "  if (!isDirectory(real) || visitedPackages.has(real)) return"
+new = "  if (!isDirectory(real) || visitedPackages.has(real) || real !== resolve(path)) return // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-client-packaging.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-client-packaging.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-client-packaging.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sclient\spackaging\scounts\sa\ssecond\scopy\sreached\sthrough\sthe\sBun\sstore$']

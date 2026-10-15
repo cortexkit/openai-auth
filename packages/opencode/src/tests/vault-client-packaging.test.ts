@@ -113,6 +113,39 @@ describe('vault client packaging', () => {
     )
   })
 
+  test('ignores old versions Bun keeps in its store that nothing links to', () => {
+    const { dir } = tree()
+    // Bun keeps every version it installed under node_modules/.bun; a long-lived
+    // checkout holds old ones that no package reaches.
+    install(
+      join(dir, 'node_modules', '.bun', '@cortexkit+common-auth@0.15.0'),
+      'common-auth',
+      '0.15.0',
+    )
+    const result = check(dir)
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain(
+      'common-auth tree ok (1 physical copy: 0.16.0)',
+    )
+  })
+
+  test('counts a second copy reached through the Bun store', () => {
+    const { dir } = tree()
+    const stored = install(
+      join(dir, 'node_modules', '.bun', '@cortexkit+common-auth@0.15.0'),
+      'common-auth',
+      '0.15.0',
+    )
+    const aliases = join(dir, 'consumer', 'node_modules', '@cortexkit')
+    mkdirSync(aliases, { recursive: true })
+    symlinkSync(stored, join(aliases, 'common-auth'), 'dir')
+    const result = check(dir)
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain(
+      'Expected exactly one physical @cortexkit/common-auth, found 2',
+    )
+  })
+
   test('rejects a second subc-client copy at the same version', () => {
     const { dir } = tree()
     install(join(dir, 'consumer'), 'subc-client', '0.16.1')
