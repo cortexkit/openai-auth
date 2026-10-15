@@ -3500,8 +3500,8 @@ expect_red = ['^vault\sclient\spackaging\spi\simports\svault\sclients\sfrom\srun
 id = "vault-reset-credits-carry"
 guards = "wham reset credits survive conversion and persist in the shared vault roster"
 file = "packages/core/src/pool-quota.ts"
-old = "  const counters = finite(snapshot.resetCreditsAvailable)"
-new = "  const counters = false && finite(snapshot.resetCreditsAvailable) // NON-VACUITY BREAK"
+old = "    typeof credits === 'number' && Number.isSafeInteger(credits) && credits >= 0"
+new = "    false && typeof credits === 'number' && Number.isSafeInteger(credits) && credits >= 0 // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/vault-reset-credits.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-reset-credits.test.ts", "-t", "{test}"]
@@ -3510,11 +3510,24 @@ test_count_pattern = "Ran {count} test"
 expect_red = ['^vault\sreset\scredits\swham\sreading\sreaches\sboth\sprocesses\ssidebar\sfiles$']
 
 [[control]]
+id = "quota-reset-credits-valid-count"
+guards = "an invalid reset count cannot invalidate otherwise usable quota windows"
+file = "packages/core/src/pool-quota.ts"
+old = "    typeof credits === 'number' && Number.isSafeInteger(credits) && credits >= 0"
+new = "    typeof credits === 'number' && Number.isFinite(credits) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/pool-quota.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-quota.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/pool-quota.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^pool\squota\sconversion\skeeps\swindow\sreadings\swhen\sthe\sreset\scount\sis\snot\sa\snon-negative\ssafe\sinteger$']
+
+[[control]]
 id = "vault-reset-credits-newest-wins"
 guards = "a cached insula count uses its producer time rather than overwriting a newer count at receipt time"
 file = "packages/core/src/pool-quota.ts"
-old = "    ? { resetCredits: { value: snapshot.resetCreditsAvailable, checkedAt } }"
-new = "    ? { resetCredits: { value: snapshot.resetCreditsAvailable, checkedAt: Date.now() /* NON-VACUITY BREAK */ } }"
+old = "      ? { resetCredits: { value: credits, checkedAt } }"
+new = "      ? { resetCredits: { value: credits, checkedAt: Date.now() /* NON-VACUITY BREAK */ } }"
 test_file = "packages/opencode/src/tests/vault-reset-credits.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-reset-credits.test.ts", "-t", "{test}"]

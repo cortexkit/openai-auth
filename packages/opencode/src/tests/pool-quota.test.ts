@@ -23,10 +23,46 @@ describe('pool quota conversion', () => {
       '3',
       Number.NaN,
       Number.POSITIVE_INFINITY,
+      1.5,
+      -1,
+      Number.MAX_SAFE_INTEGER + 1,
     ]) {
       expect(
         observationFromSnapshot({ resetCreditsAvailable: value }, 1_000, false),
       ).toBeUndefined()
+    }
+  })
+
+  it('keeps window readings when the reset count is not a non-negative safe integer', () => {
+    for (const value of [1.5, -1, Number.MAX_SAFE_INTEGER + 1]) {
+      const quota = mergeQuotaObservation(
+        undefined,
+        observationFromSnapshot(
+          {
+            primary: { usedPercent: 40, resetsAt: reset, windowMinutes: 300 },
+            secondary: { usedPercent: 70, windowMinutes: 10_080 },
+            resetCreditsAvailable: value,
+          },
+          1_000,
+          false,
+        ),
+      )
+      expect(windowsFromQuotaMap(quota)).toEqual({
+        primary: {
+          usedPercent: 40,
+          remainingPercent: 60,
+          resetsAt: reset,
+          windowMinutes: 300,
+          checkedAt: 1_000,
+        },
+        secondary: {
+          usedPercent: 70,
+          remainingPercent: 30,
+          windowMinutes: 10_080,
+          checkedAt: 1_000,
+        },
+      })
+      expect(quota.counters).toBeUndefined()
     }
   })
 
