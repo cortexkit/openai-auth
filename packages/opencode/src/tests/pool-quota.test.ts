@@ -8,6 +8,28 @@ import {
 const reset = '2030-01-01T00:00:00.000Z'
 
 describe('pool quota conversion', () => {
+  it('carries a counter-only reading including zero and ignores invalid counts', () => {
+    for (const value of [0, 3]) {
+      expect(
+        observationFromSnapshot({ resetCreditsAvailable: value }, 1_000, false),
+      ).toEqual({
+        checkedAt: 1_000,
+        counters: { resetCredits: { value, checkedAt: 1_000 } },
+      })
+    }
+    for (const value of [
+      undefined,
+      null,
+      '3',
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+    ]) {
+      expect(
+        observationFromSnapshot({ resetCreditsAvailable: value }, 1_000, false),
+      ).toBeUndefined()
+    }
+  })
+
   it('turns both windows and the credit budget into one observation', () => {
     expect(
       observationFromSnapshot(
