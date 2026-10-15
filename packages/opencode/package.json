@@ -65,7 +65,7 @@
     "@ai-sdk/openai": "3.0.88",
     "@cortexkit/common-auth": "^0.16.0",
     "@cortexkit/openai-auth-core": "workspace:*",
-    "@opencode/plugin": "2.0.26"
+    "@opencode/plugin": "2.0.27"
   },
   "dependencies": {
     "@cortexkit/claustrum-client": "^0.9.0",
