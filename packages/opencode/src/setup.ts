@@ -1,3 +1,4 @@
+import { basename } from 'node:path'
 import { resolveClaustrumConnectionPath } from '@cortexkit/claustrum-client'
 import {
   enrollmentAuthority,
@@ -6,8 +7,10 @@ import {
 import {
   assertHostsStopped,
   createProcessFence,
+  findExecutableOnPath,
   type ProcessFence,
   type SetupHost,
+  type SetupIO,
   type SetupPlugin,
 } from '@cortexkit/common-auth/setup'
 import {
@@ -28,6 +31,7 @@ interface SetupDependencies {
   beginLogin?: typeof beginAccountLogin
   openBrowser?: typeof openUrl
   fence?: ProcessFence
+  io?: SetupIO
   print?: (message: string) => void
 }
 
@@ -86,12 +90,25 @@ export function createSetupPlugin(deps: SetupDependencies = {}): SetupPlugin {
       }
       await assertLocal(host)
     },
-    async signInLocal(host) {
+    async signInLocal(host, context) {
       await assertLocal(host)
       if (host === 'pi') {
         print('Start Pi and run /login openai-codex to sign in with Pi itself.')
         return
       }
+      if (context.opencodeGeneration !== '1') {
+        const executable = basename(
+          findExecutableOnPath('opencode2', deps.io) ??
+            findExecutableOnPath('opencode', deps.io) ??
+            'opencode',
+        )
+        // OpenCode 2 activates the pool through a connection in its own database;
+        // writing OpenCode 1's login file cannot create that connection.
+        print(
+          `In OpenCode 2, run ${executable} auth login openai and choose "ChatGPT (openai-auth pool, browser)" or "ChatGPT (openai-auth pool, headless)" to sign in to the account pool and activate it.`,
+        )
+      }
+      if (context.opencodeGeneration === '2') return
       if (opencodeAuthIsEnvBacked(process.env)) {
         throw new Error(
           'Unset OPENCODE_AUTH_CONTENT before local setup sign-in.',

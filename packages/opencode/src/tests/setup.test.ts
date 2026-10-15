@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -28,6 +29,7 @@ let savedEnv: NodeJS.ProcessEnv
 let output: string
 let io: SetupIO
 const stopped = { listRunningHosts: async () => [] }
+const localContext = { opencodeGeneration: '1', mode: 'local' } as const
 const account = {
   id: 'login-account',
   type: 'oauth' as const,
@@ -58,6 +60,7 @@ function plugin() {
     beginLogin,
     openBrowser: () => true,
     fence: stopped,
+    io,
     print: (text) => {
       output += `${text}\n`
     },
@@ -187,6 +190,60 @@ describe('setup', () => {
     ])
   })
 
+  for (const executable of ['opencode', 'opencode2']) {
+    test(`OpenCode 2 setup uses ${executable} without local OAuth or slot writes`, async () => {
+      const path = join(root, 'bin', executable)
+      seed(path, '')
+      chmodSync(path, 0o755)
+      await runSetup(plugin(), ['--yes', '--login', '--opencode=2'], io)
+      expect(beginLogin).not.toHaveBeenCalled()
+      expect(existsSync(authPath())).toBe(false)
+      expect(existsSync(getAccountPaths().configPath)).toBe(false)
+      expect(existsSync(getAccountPaths().statePath)).toBe(false)
+      expect(output).toContain(`${executable} auth login openai`)
+      expect(output).toContain('"ChatGPT (openai-auth pool, browser)"')
+      expect(output).toContain('"ChatGPT (openai-auth pool, headless)"')
+      expect(output).toContain('sign in to the account pool and activate it')
+    })
+  }
+
+  test('OpenCode 2 setup leaves an existing OpenCode 1 login byte-identical', async () => {
+    seed(authPath(), 'unreadable as a login: do not parse or rewrite\n')
+    const before = readFileSync(authPath())
+    await plugin().signInLocal('opencode', {
+      opencodeGeneration: '2',
+      mode: 'local',
+    })
+    expect(readFileSync(authPath())).toEqual(before)
+    expect(beginLogin).not.toHaveBeenCalled()
+    expect(output).toContain('auth login openai')
+  })
+
+  test('both generations retain OpenCode 1 sign-in and print the OpenCode 2 pool-login step', async () => {
+    for (const executable of ['opencode', 'opencode2']) {
+      const path = join(root, 'bin', executable)
+      seed(path, '')
+      chmodSync(path, 0o755)
+    }
+    const setup = plugin()
+    await runSetup(setup, ['--yes', '--login', '--opencode=both'], io)
+    expect(beginLogin).toHaveBeenCalledTimes(1)
+    expect(JSON.parse(readFileSync(authPath(), 'utf8')).openai).toEqual({
+      type: 'oauth',
+      access: account.access,
+      refresh: account.refresh,
+      expires: account.expires,
+      accountId: account.accountId,
+    })
+    expect(output).toContain('opencode2 auth login openai')
+    expect(output).toContain('"ChatGPT (openai-auth pool, browser)"')
+    expect(output).toContain('"ChatGPT (openai-auth pool, headless)"')
+    output = ''
+    await runSetup(setup, ['--yes', '--login', '--opencode=both'], io)
+    expect(beginLogin).toHaveBeenCalledTimes(1)
+    expect(output).toContain('opencode2 auth login openai')
+  })
+
   test('vault mode preserves every local credential byte and refuses local sign-in', async () => {
     const files = [
       authPath(),
@@ -220,10 +277,12 @@ describe('setup', () => {
     await runSetup(setup, ['--yes', '--claustrum', '--opencode=1'], io)
     expect(files.map((path) => readFileSync(path))).toEqual(before)
     expect(beginLogin).not.toHaveBeenCalled()
-    await expect(setup.beforeRegister!('opencode', 'local')).rejects.toThrow(
+    await expect(
+      setup.beforeRegister!('opencode', 'local', localContext),
+    ).rejects.toThrow('enrolled')
+    await expect(setup.signInLocal('opencode', localContext)).rejects.toThrow(
       'enrolled',
     )
-    await expect(setup.signInLocal('opencode')).rejects.toThrow('enrolled')
     expect(files.map((path) => readFileSync(path))).toEqual(before)
   })
 
@@ -311,7 +370,7 @@ describe('setup', () => {
     const path = join(root, 'pi', 'auth.json')
     seed(path, '{"openai-codex":{"refresh":"keep"}}\n')
     const before = readFileSync(path)
-    await plugin().signInLocal('pi')
+    await plugin().signInLocal('pi', localContext)
     expect(output).toContain('/login openai-codex')
     expect(readFileSync(path)).toEqual(before)
     expect(beginLogin).not.toHaveBeenCalled()
@@ -328,7 +387,7 @@ describe('setup', () => {
       print: (text) => {
         output += text
       },
-    }).signInLocal('opencode')
+    }).signInLocal('opencode', localContext)
     expect(beginLogin.mock.calls.map(([options]) => options.headless)).toEqual([
       false,
       true,
@@ -361,7 +420,9 @@ describe('setup', () => {
       fence: stopped,
       print: () => {},
     })
-    await expect(setup.signInLocal('opencode')).rejects.toThrow('enrolled')
+    await expect(setup.signInLocal('opencode', localContext)).rejects.toThrow(
+      'enrolled',
+    )
     expect(existsSync(authPath())).toBe(false)
   })
 

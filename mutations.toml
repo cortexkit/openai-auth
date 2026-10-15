@@ -13,6 +13,19 @@
 # Send-time eligibility and vault admission on the migrated request paths.
 
 [[control]]
+id = "setup-opencode2-defers-local-login"
+guards = "OpenCode 2 setup leaves OAuth and the active pool login to OpenCode 2 instead of writing OpenCode 1's auth slot"
+file = "packages/opencode/src/setup.ts"
+old = "      if (context.opencodeGeneration === '2') return"
+new = "      // NON-VACUITY BREAK: let OpenCode 2 setup write the OpenCode 1 slot."
+test_file = "packages/opencode/src/tests/setup.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^setup\sOpenCode\s2\ssetup\suses\sopencode2\swithout\slocal\sOAuth\sor\sslot\swrites$']
+
+[[control]]
 id = "setup-vault-mode-guard"
 guards = "vault setup leaves local credentials untouched and local setup refuses an enrolled host"
 file = "packages/opencode/src/setup.ts"
@@ -1572,7 +1585,7 @@ expect_red = ["^vault\\scommand\\smenu\\sCheck\\snow\\sin\\svault\\smode\\spolls
 id = "menu-common-auth-release"
 guards = "all packages require the Windows private-file common-auth release, which also retains Pi-slot and replacement-slot menus"
 file = "packages/core/package.json"
-old = '"@cortexkit/common-auth": "^0.16.0"'
+old = '"@cortexkit/common-auth": "^0.17.0"'
 new = '"@cortexkit/common-auth": "^0.14.2"'
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"

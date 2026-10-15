@@ -15,6 +15,8 @@ Run `npx @cortexkit/opencode-openai-auth setup` with OpenCode and Pi stopped. It
 
 Existing accounts migrate when the plugin first starts, not during setup. [Manual install](configuration.md#manual-install) remains available as a fallback.
 
+For OpenCode 2, setup leaves sign-in to OpenCode 2's own `auth login openai` command and prints the executable and pool-login methods to choose. That login stores the account in the pool and makes it OpenCode 2's active connection. `--opencode=both` signs in to OpenCode 1 during setup and also prints the OpenCode 2 step.
+
 ## The `/openai` command
 
 On OpenCode 1, one command, `/openai`, opens one menu in the TUI. Its sections, in order:
