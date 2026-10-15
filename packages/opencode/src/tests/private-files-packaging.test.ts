@@ -6,6 +6,10 @@ import { fileURLToPath } from 'node:url'
 import { installPackedPackages } from './fixtures/opencode2-pack'
 
 const packages = join(import.meta.dir, '../../../..', 'packages')
+const installedTreeCheck = join(
+  packages,
+  '../scripts/check-private-files-tree.mjs',
+)
 const externalImport = /import\s*\(\s*['"]@cortexkit\/private-files['"]\s*\)/
 // These strings belong to private-files' native loader, not common-auth's wrapper.
 const loaderSignatures = [
@@ -57,11 +61,9 @@ describe('private-files packaging boundary', () => {
       ['opencode', 'pi'].map((host) => join(packages, host)),
     )
     try {
-      const tree = spawnSync(
-        process.execPath,
-        [join(packages, '../scripts/check-private-files-tree.mjs'), consumer],
-        { encoding: 'utf8' },
-      )
+      const tree = spawnSync(process.execPath, [installedTreeCheck, consumer], {
+        encoding: 'utf8',
+      })
       expect(tree.status).toBe(0)
       expect(tree.stderr).toBe('')
       expect(tree.stdout).toContain('1 physical copy: 0.2.')

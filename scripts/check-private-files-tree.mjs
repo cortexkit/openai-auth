@@ -5,9 +5,11 @@ import { basename, join, resolve } from 'node:path'
 const root = resolve(process.argv[2] ?? join(import.meta.dir, '..'))
 const requireStore = process.argv.includes('--require-store')
 const requireSubc = process.argv.includes('--require-subc')
+const requireCommonAuth = process.argv.includes('--require-common-auth')
 const copies = new Map()
 const stores = new Map()
 const subc = new Map()
+const commonAuth = new Map()
 
 function installed(directory) {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -16,7 +18,9 @@ function installed(directory) {
     const path = join(directory, entry.name)
     if (
       basename(directory) === '@cortexkit' &&
-      ['private-files', 'store', 'subc-client'].includes(entry.name)
+      ['private-files', 'store', 'subc-client', 'common-auth'].includes(
+        entry.name,
+      )
     ) {
       const manifest = JSON.parse(
         readFileSync(join(path, 'package.json'), 'utf8'),
@@ -26,7 +30,9 @@ function installed(directory) {
           ? copies
           : entry.name === 'store'
             ? stores
-            : subc
+            : entry.name === 'subc-client'
+              ? subc
+              : commonAuth
       found.set(realpathSync(path), manifest.version)
     }
     installed(path)
@@ -72,8 +78,18 @@ if (
   console.error([...subc.entries()])
   process.exit(1)
 }
+if ((requireCommonAuth && commonAuth.size !== 1) || commonAuth.size > 1) {
+  console.error(
+    `${requireCommonAuth ? 'Expected exactly one' : 'Expected at most one'} physical @cortexkit/common-auth, found ${commonAuth.size}`,
+  )
+  console.error([...commonAuth.entries()])
+  process.exit(1)
+}
 console.log(
   `private-files tree ok (${copies.size} physical copy: ${[...copies.values()]}; ${stores.size} store copies: ${[...stores.values()]})`,
+)
+console.log(
+  `common-auth tree ok (${commonAuth.size} physical copy: ${[...commonAuth.values()]})`,
 )
 if (requireSubc)
   console.log(

@@ -35,13 +35,16 @@ function tree() {
   temporary.push(dir)
   install(dir, 'private-files', '0.2.1')
   const client = install(dir, 'subc-client', '0.16.1')
+  install(dir, 'common-auth', '0.16.0')
   return { dir, client }
 }
 
 function check(dir: string) {
-  return spawnSync(process.execPath, [script, dir, '--require-subc'], {
-    encoding: 'utf8',
-  })
+  return spawnSync(
+    process.execPath,
+    [script, dir, '--require-subc', '--require-common-auth'],
+    { encoding: 'utf8' },
+  )
 }
 
 describe('vault client packaging', () => {
@@ -94,6 +97,19 @@ describe('vault client packaging', () => {
     )
     expect(result.stdout).toContain(
       'private-files tree ok (1 physical copy: 0.2.1',
+    )
+    expect(result.stdout).toContain(
+      'common-auth tree ok (1 physical copy: 0.16.0)',
+    )
+  })
+
+  test('rejects a second common-auth copy at the same version', () => {
+    const { dir } = tree()
+    install(join(dir, 'consumer'), 'common-auth', '0.16.0')
+    const result = check(dir)
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain(
+      'Expected exactly one physical @cortexkit/common-auth, found 2',
     )
   })
 
