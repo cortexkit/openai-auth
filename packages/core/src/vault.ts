@@ -57,6 +57,14 @@ import { errorMessage } from './util/error'
 
 const log = createLogger('vault')
 
+type VaultQuotaSource = 'insula' | 'fallback'
+type VaultQuotaSourceReason =
+  | 'account-changed'
+  | 'insula-not-configured'
+  | 'insula-unusable'
+  | 'no-insula-reading'
+  | null
+
 /** The plugin part of each host's enrollment name (`openai-auth-opencode`, `openai-auth-pi`). */
 export const VAULT_PLUGIN_NAME = 'openai-auth'
 
@@ -217,6 +225,8 @@ export class OpenAiVault {
     string,
     Promise<{ ok: boolean; error?: string }>
   >()
+  readonly #lastQuotaSource = new Map<string, VaultQuotaSource>()
+  #consumerHasInsula: boolean | undefined
   #lastError: string | undefined
   #waiting: Promise<ClaustrumEnrollmentStatus> | undefined
   /** The roster discovery this instance has in flight, if any. */
@@ -275,7 +285,24 @@ export class OpenAiVault {
     return (
       this.#options.connectScoped?.() ??
       connectClaustrumScopedClient(this.#clientOptions())
-    )
+    ).then((client) => {
+      this.#consumerHasInsula = client.insula !== undefined
+      return client
+    })
+  }
+
+  #logQuotaSource(
+    routeId: string,
+    source: VaultQuotaSource,
+    reason: VaultQuotaSourceReason,
+  ): void {
+    if (this.#lastQuotaSource.get(routeId) === source) return
+    this.#lastQuotaSource.set(routeId, source)
+    log.info('vault background quota source changed', {
+      routeId,
+      source,
+      reason,
+    })
   }
 
   #connectEnrollment(): Promise<ClaustrumEnrollmentConnection> {
@@ -605,16 +632,29 @@ export class OpenAiVault {
           cached.primary.checkedAt,
           true,
         )
-        if (!observation) return { ok: false, error: 'unusable insula reading' }
+        if (!observation) {
+          this.#logQuotaSource(routeId, 'fallback', 'insula-unusable')
+          return { ok: false, error: 'unusable insula reading' }
+        }
         const kept = await this.#consumer.recordAccountQuota(
           routeId,
           row.accountIdentity,
           observation,
         )
-        return kept
-          ? { ok: true }
-          : { ok: false, error: 'vault account changed' }
+        if (kept) {
+          this.#logQuotaSource(routeId, 'insula', null)
+          return { ok: true }
+        }
+        this.#logQuotaSource(routeId, 'fallback', 'account-changed')
+        return { ok: false, error: 'vault account changed' }
       }
+      this.#logQuotaSource(
+        routeId,
+        'fallback',
+        this.#consumerHasInsula === false
+          ? 'insula-not-configured'
+          : 'no-insula-reading',
+      )
     }
     let failure: string | undefined
     const fetchImpl = this.#options.fetchImpl?.() ?? globalThis.fetch

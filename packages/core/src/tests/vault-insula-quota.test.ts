@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mutateVaultRoster } from '@cortexkit/common-auth/claustrum'
+
+import { flushForTest, initLogger, resetLoggerForTest } from '../logger'
 import { windowsFromQuotaMap } from '../pool-quota'
 import { OpenAiVault } from '../vault'
 import {
@@ -21,7 +24,9 @@ async function setup(enroll = true) {
   const daemon = await startMockDaemon({
     directory: dir,
     credentials: {
-      a: vaultLogin('account-a'),
+      a: vaultLogin('account-a', {
+        wire: { email: 'account-a@example.com' },
+      }),
       b: vaultLogin('account-b'),
     },
   })
@@ -65,6 +70,7 @@ async function setup(enroll = true) {
     await vault.refresh()
   }
   return {
+    dir,
     vault,
     daemon,
     wham,
@@ -144,6 +150,65 @@ describe('vault insula quota', () => {
     expect(env.wham).toEqual(['account-b'])
     expect(env.daemon.insulaReads).toBe(1)
     expect(env.daemon.insulaOpens).toBe(1)
+  })
+
+  test('background quota source logs only changes and never exposes account identity', async () => {
+    const env = await setup()
+    const id = route(env.vault)
+    const requestId = route(env.vault, 'account-b')
+    const logFile = join(env.dir, 'vault.log')
+    resetLoggerForTest()
+    initLogger({ file: logFile, level: 'info' })
+    const readLog = async () => {
+      await flushForTest()
+      return existsSync(logFile) ? readFileSync(logFile, 'utf8') : ''
+    }
+    try {
+      env.daemon.insula = {
+        reply: {
+          result: [current(env.now), current(env.now, 'account-b')],
+        },
+      }
+      expect(await env.vault.pollQuota(id)).toEqual({ ok: true })
+      const firstLog = await readLog()
+      const sourceLines = () =>
+        readLog().then((text) =>
+          text
+            .split('\n')
+            .filter((line) =>
+              line.includes('vault background quota source changed'),
+            ),
+        )
+      const firstTransitions = await sourceLines()
+      expect(firstTransitions).toHaveLength(1)
+      expect(firstTransitions[0]).toContain(`"routeId":"${id}"`)
+      expect(firstTransitions[0]).toContain('"source":"insula"')
+      expect(firstTransitions[0]).toContain('"reason":null')
+
+      expect(await env.vault.pollQuota(id)).toEqual({ ok: true })
+      expect(await readLog()).toBe(firstLog)
+
+      // This request-time poll may use the Insula cache, but source transitions
+      // are tracked only by background polls, not by admission-time reads.
+      expect(await env.vault.pollQuota(requestId, false)).toEqual({ ok: true })
+      expect(await readLog()).toBe(firstLog)
+
+      env.advance(60_000)
+      env.daemon.insula = { refusal: 'module_warming' }
+      expect(await env.vault.pollQuota(id)).toEqual({ ok: true })
+      const fallbackLog = await readLog()
+      const fallbackTransitions = await sourceLines()
+      expect(fallbackTransitions).toHaveLength(2)
+      expect(fallbackTransitions[1]).toContain('"source":"fallback"')
+      expect(fallbackTransitions[1]).toContain('"reason":"no-insula-reading"')
+
+      expect(await env.vault.pollQuota(id)).toEqual({ ok: true })
+      expect(await readLog()).toBe(fallbackLog)
+      expect(fallbackLog).not.toContain('account-a')
+      expect(fallbackLog).not.toContain('account-a@example.com')
+    } finally {
+      resetLoggerForTest()
+    }
   })
 
   test.each([
