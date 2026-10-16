@@ -96,25 +96,29 @@ export function buildVaultSidebarMachineState(
   return {
     main: { quota: null, killed: false },
     fallbacks: [],
-    vaultAccounts: rows.map((row) => ({
-      id: row.routeId,
-      label: row.email || row.label || row.routeId,
-      ...(row.accountIdentity !== undefined
-        ? { accountId: row.accountIdentity }
-        : {}),
-      quota: sidebarQuotaFromPoolMap(row.quota),
-      killed: false,
-      enabled: routable.has(row.routeId),
-    })),
+    vaultAccounts: rows.map((row) => {
+      const credits = row.quota?.counters?.resetCredits?.value
+      return {
+        id: row.routeId,
+        label: row.email || row.label || row.routeId,
+        ...(row.accountIdentity !== undefined
+          ? { accountId: row.accountIdentity }
+          : {}),
+        quota: sidebarQuotaFromPoolMap(row.quota, credits),
+        killed: false,
+        enabled: routable.has(row.routeId),
+        ...(credits !== undefined ? { resetCredits: credits } : {}),
+      }
+    }),
     route: store?.routing?.mode ?? 'main-first',
     lastUpdated: now,
   }
 }
 
 /**
- * The machine part of the sidebar state for a migrated install. `rows` are
+ * The machine part of the sidebar state for an install using the account pool. `rows` are
  * the pool's rows in roster order; `resetCreditsFor` supplies the reset-credit
- * count last read for a row id (the pool's quota map does not carry it).
+ * count last read by this process for a row id, independently of persisted quota.
  */
 export function buildPoolSidebarMachineState(
   rows: readonly PoolRow[],

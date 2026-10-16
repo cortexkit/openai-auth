@@ -424,6 +424,22 @@ describe('the sidebar of a migrated install', () => {
     expect(state.route).toBe('sticky-balanced')
     expect(state.main.mainAccountId).toBe('chatgpt-main')
     expect(state.main.resetCredits).toBe(2)
+    expect(state.main.quota?.resetCreditsAvailable).toBe(2)
+    expect(state.fallbacks[0]?.resetCredits).toBeUndefined()
+    const persistedCounters = buildPoolSidebarMachineState(
+      rows.map((row) => ({
+        ...row,
+        quota: {
+          ...row.quota,
+          limits: row.quota?.limits ?? [],
+          counters: { resetCredits: { value: 99, checkedAt: 900 } },
+        },
+      })),
+      { routing: { mode: 'sticky-balanced' } },
+      1_000,
+      (id) => (id === 'main' ? 2 : undefined),
+    )
+    expect(JSON.stringify(persistedCounters)).toBe(JSON.stringify(state))
     expect(state.main.quota?.primary?.usedPercent).toBe(20)
     expect(state.fallbacks).toHaveLength(1)
     expect(state.fallbacks[0]).toMatchObject({

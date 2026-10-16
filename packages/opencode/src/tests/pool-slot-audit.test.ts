@@ -343,7 +343,7 @@ describe('login slot audit', () => {
 
   test('the downgrade warning explains the empty bearer', async () => {
     const readme = await readFile(
-      new URL('../../../../README.md', import.meta.url),
+      new URL('../../../../docs/accounts-and-routing.md', import.meta.url),
       'utf8',
     )
     expect(readme).toContain(

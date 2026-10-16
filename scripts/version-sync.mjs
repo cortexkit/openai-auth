@@ -20,12 +20,16 @@ const packageJsonPaths = [
   join(root, 'packages', 'pi', 'package.json'),
 ]
 const versionTsPath = join(root, 'packages', 'opencode', 'src', 'version.ts')
-// READMEs show pinned install lines. They are rewritten here so the pin moves
-// with every release; left to hand edits, all three sat at 0.1.0 until 0.9.0.
+// The documentation shows pinned install lines. They are rewritten here so the
+// pin moves with every release; left to hand edits, the README pins sat at
+// 0.1.0 until 0.9.0. The package READMEs carry no pin today but stay listed so
+// a pin added there later is kept current too.
 const readmePaths = [
   join(root, 'README.md'),
   join(root, 'packages', 'opencode', 'README.md'),
   join(root, 'packages', 'pi', 'README.md'),
+  join(root, 'docs', 'configuration.md'),
+  join(root, 'docs', 'opencode-2.md'),
 ]
 const PINNED_INSTALL_RE =
   /(@cortexkit\/(?:opencode|pi)-openai-auth)@\d+\.\d+\.\d+(?:-[\w.]+)?/g
