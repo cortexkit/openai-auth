@@ -38,6 +38,7 @@ import {
   sidebarQuotaProjection,
 } from './sidebar-state.js'
 import { openCommandDialog } from './tui/command-dialogs.js'
+import { setupTui } from './tui/v2.js'
 import {
   type AppearancePrefs,
   computeEffectiveOrder,
@@ -1064,8 +1065,9 @@ const tui: TuiPlugin = async (api) => {
   }
 }
 
-const plugin: TuiPluginModule & { id: string } = {
+const plugin: TuiPluginModule & { id: string; setup: typeof setupTui } = {
   id: ID,
+  setup: setupTui,
   tui,
 }
 

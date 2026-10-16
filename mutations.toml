@@ -3669,3 +3669,29 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-reset
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-reset-credits.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^vault\sreset\scredits\swham\sreading\sreaches\sboth\sprocesses\ssidebar\sfiles$']
+
+[[control]]
+id = "opencode2-tui-poll-cleanup"
+guards = "a replaced OpenCode 2 TUI mount stops its poll timer while the new mount keeps polling"
+file = "packages/opencode/src/tui/v2.tsx"
+old = "      clearInterval(timer)"
+new = "      // NON-VACUITY BREAK: leave the old mount's interval running."
+test_file = "packages/opencode/src/tests/opencode2-e2e.test.ts"
+runner = "command"
+command = ["bash", "-c", "bun run --cwd packages/opencode build && OPENAI_AUTH_OPENCODE2_E2E=1 bun test --cwd packages/opencode ./src/tests/opencode2-e2e.test.ts -t \"$1\"", "mutation", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-e2e.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^openai-auth\son\sOpenCode\s2\s\(real\shost\)\sP0:\spacked\scommand,\sdialog\sand\ssidebar\smount\son\sthe\slocked\shost$']
+
+[[control]]
+id = "opencode2-tui-default-invisible"
+guards = "the OpenCode 2 transport contributes no sidebar UI unless a sidebar owner opts in"
+file = "packages/opencode/src/tui/v2.tsx"
+old = "    options.sidebarText === undefined"
+new = "    false /* NON-VACUITY BREAK: mount without a sidebar owner. */"
+test_file = "packages/opencode/src/tests/opencode2-tui-transport.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-tui-transport.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-tui-transport.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\stransport\sstays\sinvisible\swithout\sa\smenu\sor\ssidebar\sowner$']

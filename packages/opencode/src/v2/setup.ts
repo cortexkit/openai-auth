@@ -94,6 +94,7 @@ import {
   OPENAI_PROVIDER_ID,
   type OpenAIAdapterLogger,
 } from './adapter'
+import { type ControlPlaneMenu, installControlPlane } from './control-plane'
 import { opencode1HostSlot } from './host-slot'
 import {
   assertLocalPoolLogin,
@@ -118,6 +119,8 @@ const SETTLE_ON_DISPOSE_MS = 5_000
 
 /** Test and embedding seams; every field has a production default. */
 export interface OpenAIAuthV2Options {
+  /** Optional menu callbacks; absent until the menu is enabled. */
+  controlPlane?: ControlPlaneMenu
   /** The account config and state files; read on every use. */
   paths?: () => AccountPaths
   /** OpenCode 1's login slot the migration reads; its `auth.json` by default. */
@@ -157,7 +160,8 @@ export interface OpenAIAuthV2Options {
 type SetupContext = Pick<
   Plugin.Context,
   'session' | 'event' | 'integration' | 'model'
->
+> &
+  Partial<Pick<Plugin.Context, 'command' | 'location'>>
 
 async function installPoolHooks<Q, A>(
   ctx: SetupContext,
@@ -561,6 +565,21 @@ export async function setupOpenAIAuth(
     vault: vaultLoginMethod(vault),
   })
   const models = await registerCodexModelRules(ctx)
+  if (options.controlPlane && (!ctx.command || !ctx.location))
+    throw new Error(
+      'OpenCode 2 control plane requires command and location APIs',
+    )
+  const controlPlane =
+    options.controlPlane && ctx.command && ctx.location
+      ? await installControlPlane(
+          {
+            session: ctx.session,
+            command: ctx.command,
+            location: ctx.location,
+          },
+          options.controlPlane,
+        )
+      : undefined
 
   // A deleted session's pin and remembered account go with it.
   const abort = new AbortController()
@@ -582,6 +601,7 @@ export async function setupOpenAIAuth(
   return async () => {
     closing = true
     abort.abort()
+    await controlPlane?.()
     lifecycle?.dispose()
     source.dispose()
     await Promise.allSettled([

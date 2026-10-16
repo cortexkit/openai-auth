@@ -44,4 +44,4 @@ On OpenCode 2, models show OpenCode's own prices, even when you use the plugin's
 
 ## Not on OpenCode 2 yet
 
-These features are not implemented on OpenCode 2 yet: the plugin's [`/openai` slash-command menu](commands.md#the-openai-command), the sidebar, [cache keep-warm](cache-keep-warm.md), [request dumps](troubleshooting.md#request-dumps), [reset credits](accounts-and-routing.md#reset-credits), zeroing displayed model costs, and OpenCode 1's extra conversation headers and Codex-specific tool formatting. Manage accounts from OpenCode 1's `/openai` or `opencode auth login` menu instead.
+These features are not implemented on OpenCode 2 yet: the plugin's [`/openai` slash-command menu](commands.md#the-openai-command), the sidebar, [cache keep-warm](cache-keep-warm.md), [request dumps](troubleshooting.md#request-dumps), [reset credits](accounts-and-routing.md#reset-credits), and OpenCode 1's extra conversation headers and Codex-specific tool formatting. Manage accounts from OpenCode 1's `/openai` or `opencode auth login` menu instead.

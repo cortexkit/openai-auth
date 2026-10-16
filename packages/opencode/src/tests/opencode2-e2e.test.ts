@@ -30,6 +30,7 @@ import {
 import { POOL_PLACEHOLDER } from '../core/pool-migration'
 import { CODEX_USER_AGENT, CODEX_VERSION } from '../index'
 import { hostBinary } from './fixtures/opencode-host'
+import { controlPlaneProbe } from './fixtures/opencode2-control-plane'
 import {
   MOCK_ACCOUNTS,
   type MockAccount,
@@ -60,6 +61,7 @@ let serverPlugin = ''
 let loginPlugin = ''
 let vaultPlugin = ''
 let upgradePlugin = ''
+let packedConsumer = ''
 
 /** The vault account's record version, which a 401 must be reported with. */
 const VAULT_RECORD_VERSION = 7
@@ -577,6 +579,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     // The plugin as a consumer gets it: the packed package, imported through
     // its `./server` export.
     const { consumer } = installPackedPlugin(join(scratch, 'pack'))
+    packedConsumer = consumer
     serverPlugin = join(consumer, 'server-plugin')
     mkdirSync(serverPlugin, { recursive: true })
     writeFileSync(
@@ -670,6 +673,106 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
   afterAll(() => {
     if (scratch) rmSync(scratch, { recursive: true, force: true })
   })
+
+  test('P0: packed command, dialog and sidebar mount on the locked host', async () => {
+    const root = join(scratch, 'control-plane')
+    mkdirSync(root)
+    const env = isolatedEnv(root)
+    seedPool(join(env.XDG_CONFIG_HOME, 'opencode'), [])
+    const result = await controlPlaneProbe({
+      cli,
+      consumer: packedConsumer,
+      root,
+      env,
+    })
+    expect(result.trace).toContain('"server"')
+    expect(result.trace).not.toContain('"failure"')
+    expect(result.trace).toContain('"event":"done"')
+    const events = result.trace
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+    const rows = (event: string) =>
+      events.filter((entry) => entry.event === event)
+    // Require both visible terminal text and a component render event, rather
+    // than treating a successful slot registration as proof of rendering.
+    const outcome =
+      result.output.includes('OpenAI P0 sidebar component') &&
+      rows('render').length > 0
+        ? 'a'
+        : 'c'
+    expect(outcome).toBe('a')
+    expect(rows('commands').map((row) => row.count)).toEqual([1, 1, 1, 1])
+    expect(rows('location-count').map((row) => [row.stage, row.count])).toEqual(
+      [
+        ['both-set-up', 1],
+        ['both-set-up', 1],
+        ['location-reloaded', 1],
+        ['location-reloaded', 1],
+      ],
+    )
+    expect(rows('server').length).toBeGreaterThanOrEqual(3)
+    expect(rows('slot').map((row) => row.slots)).toEqual([1, 0, 1])
+    expect(
+      rows('slot')
+        .filter((row) => row.slots === 1)
+        .map((row) => [row.anchor, row.numericOrder]),
+    ).toEqual([
+      ['sidebar.content', false],
+      ['sidebar.content', false],
+    ])
+    expect(rows('dialog').map((row) => [row.phase, row.dialogs])).toEqual([
+      [1, 1],
+      [2, 1],
+      [3, 1],
+      [4, 1],
+    ])
+    for (let phase = 1; phase <= 4; phase++)
+      expect(result.output).toContain(`OpenAI P0 connection ${phase}`)
+    const sessions = rows('sessions')[0]
+    expect([...new Set(rows('render').map((row) => row.sessionId))]).toEqual([
+      sessions.a,
+      sessions.b,
+      sessions.c,
+    ])
+    expect(rows('apply').map((row) => row.request.sessionId)).toEqual([
+      sessions.a,
+      sessions.b,
+      sessions.c,
+      sessions.c,
+    ])
+    expect(rows('apply').map((row) => row.directory)).toEqual([
+      join(root, 'project'),
+      join(root, 'project'),
+      join(root, 'other-project'),
+      join(root, 'other-project'),
+    ])
+    expect(
+      rows('result').map((row) => [
+        row.result.ok,
+        row.result.text,
+        row.slots,
+        row.dialogs,
+      ]),
+    ).toEqual(
+      Array.from({ length: 4 }, () => [false, 'P0: nothing was changed', 1, 0]),
+    )
+    const theme = rows('theme')[0]
+    expect(theme.before).not.toBe(theme.after)
+    const reloaded = events.findIndex((row) => row.event === 'reload')
+    expect(rows('tick').some((row) => row.generation === 1)).toBe(true)
+    expect(
+      events
+        .slice(reloaded + 1)
+        .filter((row) => row.event === 'tick')
+        .map((row) => row.generation),
+    ).not.toContain(1)
+    expect(
+      events
+        .slice(reloaded + 1)
+        .some((row) => row.event === 'tick' && row.generation === 2),
+    ).toBe(true)
+  }, 60_000)
 
   test('http: a prepared API key bypasses a migrated pool without attribution', async () => {
     const key = 'sk-opencode2-user-key'
