@@ -39,7 +39,7 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^OpenCode\s2\sshared\ssession\spins\sdoes\snot\sshare\spins\sacross\sstores\sdiffering\sin\sboth$']
+expect_red = ['^OpenCode\s2\sshared\ssession\spins\sgives\seach\saccount\sstore\sits\sown\sledger\sand\sone\sledger\sper\sstore$']
 
 # Send-time eligibility and vault admission on the migrated request paths.
 

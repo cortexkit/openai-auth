@@ -26,6 +26,7 @@ import { opencode1HostSlot } from '../v2/host-slot'
 import { applyCodexModelRules } from '../v2/models'
 import { SessionPins } from '../v2/pins'
 import { type OpenAIAuthV2Options, setupOpenAIAuth } from '../v2/setup'
+import { acquireSessionPins } from '../v2/shared-pins'
 import {
   type FakeModel,
   fakeOpenCode2Host,
@@ -338,6 +339,25 @@ describe('OpenCode 2 entry: the chosen row on the wire', () => {
 })
 
 describe('OpenCode 2 shared session pins', () => {
+  it('gives each account store its own ledger and one ledger per store', () => {
+    const files = poolFiles()
+    const other = poolFiles()
+    const ledger = acquireSessionPins(files)
+    expect(
+      acquireSessionPins({
+        configPath: relative(process.cwd(), files.configPath),
+        statePath: relative(process.cwd(), files.statePath),
+      }),
+    ).toBe(ledger)
+    expect(acquireSessionPins(other)).not.toBe(ledger)
+    expect(
+      acquireSessionPins({
+        configPath: files.configPath,
+        statePath: other.statePath,
+      }),
+    ).not.toBe(ledger)
+  })
+
   const rows = [
     { id: 'a', usedPercent: 10 },
     { id: 'b', usedPercent: 10 },
