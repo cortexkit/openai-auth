@@ -177,19 +177,35 @@ function seedPool(
   )
 }
 
+// The host serves its web shell at `/` with 200 before its background service
+// is ready, and answers every other route 503 service_starting until then. Only
+// the authenticated `/api/info` reports readiness: 200 ready, 503 still
+// starting or stopping, 500 failed (@opencode/cli 2.0.22, server process).
 async function waitForServer(url: string, child: Bun.Subprocess) {
   const deadline = Date.now() + 60_000
+  const authorization = `Basic ${btoa(`opencode:${PASSWORD}`)}`
+  let last = 'no response'
   while (Date.now() < deadline) {
     if (child.exitCode !== null)
       throw new Error(`host exited early with ${child.exitCode}`)
     try {
-      await fetch(url, { signal: AbortSignal.timeout(1000) })
-      return
-    } catch {
-      await Bun.sleep(250)
+      const response = await fetch(`${url}/api/info`, {
+        headers: { authorization },
+        signal: AbortSignal.timeout(1000),
+      })
+      await response.body?.cancel()
+      if (response.status === 200) return
+      if (response.status !== 503)
+        throw new Error(`host readiness answered ${response.status}`)
+      last = 'service starting'
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('host readiness'))
+        throw error
+      last = error instanceof Error ? error.message : String(error)
     }
+    await Bun.sleep(250)
   }
-  throw new Error(`host at ${url} did not start`)
+  throw new Error(`host at ${url} did not become ready (${last})`)
 }
 
 async function collect(
