@@ -13,7 +13,11 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { ClaustrumEnrollmentConnection } from '@cortexkit/common-auth/claustrum'
-import { runSetup, type SetupIO } from '@cortexkit/common-auth/setup'
+import {
+  runSetup,
+  type SetupCallbackContext,
+  type SetupIO,
+} from '@cortexkit/common-auth/setup'
 import {
   type beginAccountLogin,
   OpenAiVault,
@@ -29,7 +33,7 @@ let savedEnv: NodeJS.ProcessEnv
 let output: string
 let io: SetupIO
 const stopped = { listRunningHosts: async () => [] }
-const localContext = { opencodeGeneration: '1', mode: 'local' } as const
+let localContext: SetupCallbackContext
 const account = {
   id: 'login-account',
   type: 'oauth' as const,
@@ -74,6 +78,12 @@ function authPath() {
 beforeEach(() => {
   savedEnv = { ...process.env }
   root = mkdtempSync(join(tmpdir(), 'openai-setup-'))
+  localContext = {
+    opencodeGeneration: '1',
+    mode: 'local',
+    hosts: ['opencode'],
+    piAgentDir: join(root, 'pi'),
+  }
   const config = join(root, 'config', 'opencode')
   mkdirSync(config, { recursive: true })
   Object.assign(process.env, {
@@ -211,8 +221,8 @@ describe('setup', () => {
     seed(authPath(), 'unreadable as a login: do not parse or rewrite\n')
     const before = readFileSync(authPath())
     await plugin().signInLocal('opencode', {
+      ...localContext,
       opencodeGeneration: '2',
-      mode: 'local',
     })
     expect(readFileSync(authPath())).toEqual(before)
     expect(beginLogin).not.toHaveBeenCalled()

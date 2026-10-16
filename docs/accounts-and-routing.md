@@ -18,7 +18,7 @@ When OpenCode or Pi is connected to the [Claustrum vault](vault.md), the vault's
 
 On OpenCode, every local ChatGPT account and its credential live in one shared on-disk store, the account pool, in `~/.config/opencode/openai-auth.json` and its state file. OpenCode 1 and OpenCode 2 use the same files.
 
-An install from before the pool keeps its main login in OpenCode 1's login store (`~/.local/share/opencode/auth.json`). The plugin moves it into pool row `main` and replaces OpenCode's login with a **placeholder**: a non-secret login record with an empty access token. The plugin recognizes this marker and reads the real credentials from the pool instead.
+An install from before the pool keeps its main login in OpenCode 1's login store (`~/.local/share/opencode/auth.json`). The plugin moves it into pool row `main` and replaces OpenCode's login with a **placeholder**: a non-secret login record with an empty access token and a fixed refresh-token marker. The plugin recognizes this placeholder record and reads the real credentials from the pool instead.
 
 Moving the main login waits until every running OpenCode process uses this plugin version or newer, so every process understands the pool. Until migration finishes, `/openai` shows an **Accounts are moving** notice and lists any processes blocking it. A ChatGPT login written into OpenCode's `openai` slot later is adopted into the pool the same way.
 
@@ -26,7 +26,7 @@ Downgrading after the account-pool migration is unsupported. A pre-1.0 build tha
 
 When `OPENCODE_AUTH_CONTENT` supplies OpenCode 1's login, the slot is read-only for migration and adoption. The plugin leaves the environment login and `auth.json` untouched and keeps using the login as before; unset the override to migrate the login on disk.
 
-An interrupted migration in an unreleased development build may leave an untagged placeholder and an unfinished transfer record. Released builds tag placeholders with their configuration directory; without that tag, the plugin cannot tell which store sharing `auth.json` owns the login, so it keeps the credential but disables the row. **Auth doctor**, the credential checks and repairs in `opencode auth login`, lists it: sign in again, or re-enable it only if this configuration directory is the only one using that `auth.json`. If an unreleased build already finished moving the main login, its pool accounts remain usable and later slot logins can still be imported.
+An interrupted migration in an unreleased development build may leave an untagged placeholder and an unfinished transfer record. Released builds tag placeholders with their configuration directory; without that tag, the plugin cannot tell which store sharing `auth.json` owns the login, so it keeps the credential but disables the row. **Auth doctor**, the credential checks and repairs in `opencode auth login`, lists the disabled account row: sign in again, or re-enable the row only if this configuration directory is the only one using that `auth.json`. If an unreleased build already finished moving the main login, its pool accounts remain usable and later slot logins can still be imported.
 
 How the pool behaves in vault mode is described in [Claustrum vault](vault.md#vault-mode).
 
@@ -72,7 +72,7 @@ The Reset credits section of `/openai` previews an account, spends one rate-limi
 
 ## Pi
 
-On Pi, every request goes out with one account's token, chosen by the routing mode:
+On Pi, every request goes out with one account's token, chosen by the [routing mode](#routing):
 
 - `main-first` tries your Pi login first, then the fallbacks in order; `fallback-first` tries the fallbacks first and your Pi login last. When an account answers with a rate-limit or authentication error before anything was streamed, the next one is tried.
 - `sticky-balanced` keeps each Pi session on one account, spreading new sessions by remaining quota; confirmed exhaustion causes a lasting account switch.

@@ -19,7 +19,7 @@ Keep-warm only runs for main-agent sessions unless subagent warming is on, and i
 
 `sustain` still obeys the warm window and limits on the number and total bytes of saved requests. When storage is full, the least recently used requests are discarded. Subagent idle and successful-warm-count limits remain unchanged.
 
-In `anthropic-auth`, CortexKit's sister plugin for Claude, the `always` keep-warm option ignores the clock schedule. Here, `sustain` means keep warming a main session past its idle cap; it does not ignore the schedule.
+In `anthropic-auth`, CortexKit's sister plugin for Claude, the `always` keep-warm option allows warming outside the configured warm window. Here, `sustain` means keep warming a main session past its idle cap; it still respects the configured warm window.
 
 ## Cost
 

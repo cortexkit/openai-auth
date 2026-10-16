@@ -26,7 +26,7 @@ Wait for GitHub Actions:
 
 It polls the workflow every 5 seconds for up to 900 seconds (`--max-wait <seconds>` or `MAX_WAIT_SECONDS` changes the limit) and exits 0 on success, 1 on failure and 2 on timeout.
 
-The release workflow runs checks, publishes both packages to npm with provenance (npm Trusted Publishing / OIDC), and creates the GitHub release. The publish job skips any package version that is already on npm.
+The release workflow runs checks, publishes both packages to npm with provenance (npm Trusted Publishing / OIDC), and creates the GitHub release. The publish job skips publishing a package when its version is already on npm.
 
 > [!NOTE]
 > npm Trusted Publishing can only be configured after a package already exists on npm, so the **first** version of a package must be published manually (`npm publish --access public` from its directory under `packages/`). Configure OIDC trusted publishing for the package afterward; later tagged releases then publish through the workflow.
