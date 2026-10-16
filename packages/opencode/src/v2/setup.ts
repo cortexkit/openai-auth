@@ -105,6 +105,7 @@ import {
   vaultLoginMethod,
   writeLoginToPool,
 } from './login'
+import { createReadOnlyControlPlane } from './menu'
 import { registerCodexModelRules } from './models'
 import { acquireSessionPins } from './shared-pins'
 
@@ -119,7 +120,7 @@ const SETTLE_ON_DISPOSE_MS = 5_000
 
 /** Test and embedding seams; every field has a production default. */
 export interface OpenAIAuthV2Options {
-  /** Optional menu callbacks; absent until the menu is enabled. */
+  /** Overrides the production read-only menu for transport fixtures. */
   controlPlane?: ControlPlaneMenu
   /** The account config and state files; read on every use. */
   paths?: () => AccountPaths
@@ -570,14 +571,41 @@ export async function setupOpenAIAuth(
       'OpenCode 2 control plane requires command and location APIs',
     )
   const controlPlane =
-    options.controlPlane && ctx.command && ctx.location
+    ctx.command && ctx.location
       ? await installControlPlane(
           {
             session: ctx.session,
             command: ctx.command,
             location: ctx.location,
           },
-          options.controlPlane,
+          options.controlPlane ??
+            createReadOnlyControlPlane({
+              accountStoragePath: paths().configPath,
+              accountStatePath: paths().statePath,
+              packageVersion: version,
+              loadAccounts,
+              store: () => source.poolStore(),
+              migration: async () => {
+                if (poolMigrated(paths().configPath)) return { migrated: true }
+                const state = await fence()
+                return {
+                  migrated: false,
+                  blockers: state.open ? [] : state.blockers,
+                }
+              },
+              beginAccountLogin: options.beginLogin ?? beginAccountLogin,
+              refreshAllQuota: async () =>
+                (await source.pollRows(await loadAccounts(paths()))).map(
+                  (row) => ({ ...row, account: row.id }),
+                ),
+              getStickyRouting: async (sessionId) => pins.get(sessionId),
+              clearStickyRouting: async (sessionId) => {
+                const existed = pins.get(sessionId) !== undefined
+                pins.forget(sessionId)
+                return existed
+              },
+              vault,
+            }),
         )
       : undefined
 

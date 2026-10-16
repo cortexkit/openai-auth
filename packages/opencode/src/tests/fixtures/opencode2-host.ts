@@ -38,10 +38,17 @@ export function fakeOpenCode2Host(
   options: {
     activeCredential?: Credential.Value
     methods?: RegisteredMethod[]
+    directory?: string
+    sessions?: Map<string, string>
   } = {},
 ) {
   let activeCredential = options.activeCredential
   const connectionReads = { active: 0, resolve: 0 }
+  const commands: Array<{
+    name: string
+    execute(input: { sessionID: string }): Promise<void>
+  }> = []
+  const turns: unknown[] = []
   const hooks: Hook[] = []
   const methods: RegisteredMethod[] = [...(options.methods ?? [])]
   const modelTransforms: Array<(editor: unknown) => void> = []
@@ -51,7 +58,40 @@ export function fakeOpenCode2Host(
     dispose: async () => onDispose(),
   })
   const ctx = {
+    ...(options.directory
+      ? {
+          location: { directory: options.directory },
+          command: {
+            transform: async (callback: (editor: unknown) => void) => {
+              const added: typeof commands = []
+              callback({
+                add: (command: (typeof commands)[number]) => {
+                  commands.push(command)
+                  added.push(command)
+                },
+              })
+              return registration(() => {
+                for (const command of added) {
+                  const index = commands.indexOf(command)
+                  if (index >= 0) commands.splice(index, 1)
+                }
+              })
+            },
+          },
+        }
+      : {}),
     session: {
+      get: async ({ sessionID }: { sessionID: string }) => ({
+        location: {
+          directory: options.sessions?.get(sessionID) ?? options.directory,
+        },
+      }),
+      prompt: async (input: unknown) => {
+        turns.push(input)
+      },
+      synthetic: async (input: unknown) => {
+        turns.push(input)
+      },
       hook: async (
         name: string,
         callback: (draft: never) => unknown,
@@ -133,6 +173,8 @@ export function fakeOpenCode2Host(
     hooks,
     methods,
     connectionReads,
+    commands,
+    turns,
     /** Simulates a user selecting another connection without restarting the host. */
     setActiveCredential(value: Credential.Value | undefined) {
       activeCredential = value

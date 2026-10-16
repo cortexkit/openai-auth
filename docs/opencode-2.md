@@ -42,6 +42,10 @@ To use only the [Claustrum vault](vault.md), enroll OpenCode first, then choose 
 
 On OpenCode 2, models show OpenCode's own prices, even when you use the plugin's ChatGPT accounts (on OpenCode 1 they show as free), and Pro reasoning models are not hidden. OpenCode 2's model-list hook can't tell which credential is in use when it runs, so changing costs there would also change them for an OpenAI API key.
 
+## The `/openai` menu
+
+On OpenCode 2, [`/openai`](commands.md#the-openai-command) shows the same sections as on OpenCode 1: Accounts, Quota, Routing, Limits, This session and Vault. For now it is **view-only**: choosing an action changes nothing and says so. Cache, Diagnostics and Reset credits show "Not available on OpenCode 2 yet." Opening the menu never signs you in, checks quota, starts a model turn or writes anything. To change accounts or settings, use OpenCode 1's `/openai` or `opencode auth login`.
+
 ## Not on OpenCode 2 yet
 
-These features are not implemented on OpenCode 2 yet: the plugin's [`/openai` slash-command menu](commands.md#the-openai-command), the sidebar, [cache keep-warm](cache-keep-warm.md), [request dumps](troubleshooting.md#request-dumps), [reset credits](accounts-and-routing.md#reset-credits), and OpenCode 1's extra conversation headers and Codex-specific tool formatting. Manage accounts from OpenCode 1's `/openai` or `opencode auth login` menu instead.
+The menu's account and routing controls, the sidebar, [cache keep-warm](cache-keep-warm.md), [request dumps](troubleshooting.md#request-dumps), diagnostics actions, [reset-credit preview and redemption](accounts-and-routing.md#reset-credits), OpenCode 1's extra conversation headers and Codex-specific tool formatting are not implemented on OpenCode 2 yet.

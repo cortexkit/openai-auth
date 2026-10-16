@@ -8,6 +8,7 @@ import {
 } from '../rpc/protocol'
 import { createRpcClient } from '../rpc/rpc-client'
 import { resolveRpcDir } from '../rpc/rpc-dir'
+import { openReadOnlyDialog } from './v2-dialog'
 
 export interface TuiTransportOptions {
   /** Only the test fixture supplies content until the sidebar is implemented. */
@@ -31,6 +32,10 @@ export async function setupTui(
   processState[KEY] ??= { lastIds: new Map() }
   const state = processState[KEY]
   state.mount?.dispose()
+  const openDialog: NonNullable<TuiTransportOptions['openDialog']> =
+    options.openDialog ??
+    ((payload, apply) =>
+      openReadOnlyDialog(context.ui.dialog, payload, apply, () => !disposed))
   let disposed = false
   let inFlight = false
   let dialogOpen = false
@@ -45,7 +50,7 @@ export async function setupTui(
         })
 
   const poll = async () => {
-    if (disposed || inFlight) return
+    if (disposed || inFlight || dialogOpen) return
     const route = context.ui.router.current()
     if (route.type !== 'session') return
     const sessionId = route.sessionID
@@ -82,16 +87,14 @@ export async function setupTui(
             message: message.payload.notify.message,
             sessionID: sessionId,
           })
-        else if (options.openDialog) {
+        else {
           dialogOpen = true
-          void options
-            .openDialog(message.payload, (request) => {
-              if (disposed) throw new Error('The OpenAI dialog was closed')
-              return rpc.apply({ ...request, sessionId }, 90_000)
-            })
-            .finally(() => {
-              dialogOpen = false
-            })
+          await openDialog(message.payload, (request) => {
+            if (disposed) throw new Error('The OpenAI dialog was closed')
+            return rpc.apply({ ...request, sessionId }, 90_000)
+          }).finally(() => {
+            dialogOpen = false
+          })
         }
       }
     } catch {
@@ -100,13 +103,9 @@ export async function setupTui(
       inFlight = false
     }
   }
-  // Without a dialog owner nothing can consume the queue, so a mount that only
-  // shows a sidebar (or nothing, as in production today) does no polling.
-  const timer = options.openDialog
-    ? setInterval(() => {
-        void poll()
-      }, 500)
-    : undefined
+  const timer = setInterval(() => {
+    void poll()
+  }, 500)
   const mount: Mount = {
     dispose() {
       if (disposed) return
@@ -118,6 +117,6 @@ export async function setupTui(
     },
   }
   state.mount = mount
-  if (options.openDialog) void poll()
+  void poll()
   return () => mount.dispose()
 }

@@ -3,7 +3,10 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { VaultRosterRow } from '@cortexkit/common-auth/claustrum'
-import type { CommandInvocation } from '@cortexkit/common-auth/commands'
+import type {
+  CommandApplyRequest,
+  CommandInvocation,
+} from '@cortexkit/common-auth/commands'
 import {
   formatQuota,
   projectQuota,
@@ -577,4 +580,70 @@ Open the OpenCode TUI to change these settings.`)
       older.items.find((item) => item.id === roster[0]!.routeId)?.detail,
     ).toContain('checked 15m ago')
   })
+})
+
+test('OpenCode 2 vault read-only projection preserves wave-one data and reset precedence without polling', async () => {
+  const ctx = context(true)
+  const before = [
+    readFileSync(files.configFile, 'utf8'),
+    readFileSync(files.stateFile, 'utf8'),
+  ]
+  const expected = await createOpenCodeMenu(ctx).open({
+    ...invocation,
+    sessionId: 'session-a',
+  })
+  let refreshes = 0
+  ctx.vault!.refresh = async () => {
+    refreshes++
+  }
+  const menu = createOpenCodeMenu({
+    ...ctx,
+    readOnly: true,
+    unavailableSections: ['cache', 'diagnostics', 'reset'],
+  })
+  const actual = await menu.open({ ...invocation, sessionId: 'session-a' })
+  expect(actual.menu.sections.map((s) => s.id)).toEqual(
+    expected.menu.sections.map((s) => s.id),
+  )
+  for (const section of expected.menu.sections) {
+    const got = actual.menu.sections.find((s) => s.id === section.id)!
+    if (section.id === 'reset') expect(got).toEqual(section)
+    else if (['cache', 'diagnostics'].includes(section.id))
+      expect(got).toEqual({
+        ...section,
+        lines: ['Not available on OpenCode 2 yet.'],
+        items: [],
+        actions: [],
+      })
+    else expect(got).toEqual(section)
+    const requests = [
+      { sectionId: section.id },
+      ...section.actions.map((action) => ({
+        sectionId: section.id,
+        actionId: action.id,
+      })),
+      ...section.items.flatMap((item) =>
+        item.actions.map((action) => ({
+          sectionId: section.id,
+          itemId: item.id,
+          actionId: action.id,
+        })),
+      ),
+    ]
+    for (const request of requests)
+      expect(
+        (
+          await menu.apply(
+            { command: 'openai', ...request } as CommandApplyRequest,
+            invocation,
+          )
+        ).ok,
+      ).toBe(false)
+  }
+  expect(refreshes).toBe(0)
+  expect(polls).toEqual([])
+  expect([
+    readFileSync(files.configFile, 'utf8'),
+    readFileSync(files.stateFile, 'utf8'),
+  ]).toEqual(before)
 })

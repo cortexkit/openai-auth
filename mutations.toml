@@ -3695,3 +3695,42 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-t
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-tui-transport.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode\s2\stransport\sstays\sinvisible\swithout\sa\smenu\sor\ssidebar\sowner$']
+
+[[control]]
+id = "opencode2-later-wave-section-refusal"
+guards = "unsupported sections refuse even a section-only RPC apply before the engine can report success"
+file = "packages/core/src/commands.ts"
+old = "  const unavailable = new Set(options.unavailableSections)"
+new = "  const unavailable = new Set<string>() // NON-VACUITY BREAK: expose later-wave actions."
+test_file = "packages/opencode/src/tests/opencode2-menu.test.ts"
+runner = "command"
+command = ["bash", "-c", "bun run --cwd packages/core build && bun test --cwd packages/opencode ./src/tests/opencode2-menu.test.ts -t \"$1\"", "mutation", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sunavailable\ssections\srefuse\ssection-only\sapplies\seven\swithout\sthe\sread-only\sgate$']
+
+[[control]]
+id = "opencode2-no-tui-no-write"
+guards = "a headless command never starts a model turn, writes conversation messages or spends"
+file = "packages/opencode/src/v2/control-plane.ts"
+old = "      if (!owner || !isTuiConnected(input.sessionID)) return"
+new = "      if (!owner) return\n      await api.prompt({ sessionID: input.sessionID, text: 'NON-VACUITY BREAK' })"
+test_file = "packages/opencode/src/tests/opencode2-command.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-command.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-command.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sno-TUI\sexecution\smakes\sno\swrites\sor\smodel\sturns\sand\sspends\snothing$']
+
+[[control]]
+id = "opencode2-knob-credential-scrubbing"
+guards = "nested RPC knob data never carries credential-shaped fields"
+file = "packages/core/src/commands.ts"
+old = "    if (isCredentialKey(key)) {"
+new = "    if (false && isCredentialKey(key)) { // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-menu.test.ts"
+runner = "command"
+command = ["bash", "-c", "bun run --cwd packages/core build && bun test --cwd packages/opencode ./src/tests/opencode2-menu.test.ts -t \"$1\"", "mutation", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sknob\sscrubbing\sremoves\scredential-shaped\sfields\srecursively$']

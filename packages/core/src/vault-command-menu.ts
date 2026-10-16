@@ -145,6 +145,10 @@ export function menuStore(store: PoolStore, vault?: MenuVault): PoolStore {
 export function createVaultCommandMenu(
   options: CommandMenuOptions & { store: PoolStore },
   vault: MenuVault,
+  reads: {
+    refresh?: boolean
+    refuseApply?: { code: string; text: string }
+  } = {},
 ): CommandMenu {
   const localMenu = createCommandMenu(options)
   const projection = createCommandMenu({
@@ -335,7 +339,8 @@ export function createVaultCommandMenu(
   const current = async () => {
     if (!isVaultMenuConnected(await readVaultMenu(vault)))
       return { menu: localMenu, error: undefined }
-    const error = await refreshVaultMenu(vault)
+    const error =
+      reads.refresh === false ? undefined : await refreshVaultMenu(vault)
     return { menu: connectedMenu, error }
   }
   const open = async (
@@ -375,6 +380,12 @@ export function createVaultCommandMenu(
           ok: false,
           code: 'vault-local-action',
           text: VAULT_LOCAL_ACTION_REFUSAL,
+        }
+      if (reads.refuseApply)
+        return {
+          ...(await open(state, invocation)),
+          ok: false,
+          ...reads.refuseApply,
         }
       return menu.apply(request, invocation)
     },

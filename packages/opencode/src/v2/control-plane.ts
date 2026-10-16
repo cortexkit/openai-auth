@@ -9,7 +9,7 @@ import type { ApplyResult, OpenDialogPayload } from '../rpc/protocol'
 import { resolveRpcDir } from '../rpc/rpc-dir'
 import { RPC_SERVER_REGISTRY_KEY, startRpcServer } from '../rpc/rpc-server'
 
-/** Server-owned menu callbacks; registering the real menu is a separate opt-in. */
+/** Server-owned menu callbacks shared by command dispatch and loopback RPC. */
 export interface ControlPlaneMenu {
   open(sessionId: string): Promise<OpenDialogPayload>
   apply(request: unknown): Promise<ApplyResult>
@@ -18,10 +18,16 @@ export interface ControlPlaneMenu {
 type Context = Pick<Plugin.Context, 'command' | 'location' | 'session'>
 type Location = {
   menu: ControlPlaneMenu
+  session: Context['session']
   registration?: { dispose(): Promise<void> }
 }
 type Registry = {
   locations: Map<string, Location>
+  command?: {
+    name: string
+    description: string
+    execute(input: { sessionID: string }): Promise<void>
+  }
 }
 const KEY = Symbol.for('cortexkit.openai-auth.v2.commands')
 
@@ -38,32 +44,40 @@ export async function installControlPlane(
 ) {
   const state = registry()
   const directory = ctx.location.directory
-  const location: Location = { menu }
+  const location: Location = { menu, session: ctx.session }
   const rpcDir = await resolveRpcDir(directory)
   const rpc = await adoptRpcServer(RPC_SERVER_REGISTRY_KEY, rpcDir.dir, () =>
     startRpcServer({
       ...rpcDir,
       drain: drainNotifications,
-      apply: (request) => menu.apply(request),
+      apply: (request) => {
+        const owner = state.locations.get(directory)
+        if (!owner) throw new Error('The OpenAI menu location was closed')
+        return owner.menu.apply(request)
+      },
     }),
   )
   const previous = state.locations.get(directory)
   state.locations.set(directory, location)
   await previous?.registration?.dispose()
+  state.command ??= {
+    name: 'openai',
+    description: 'OpenAI account menu',
+    async execute(input) {
+      // Any live location can read the host's process-wide session service.
+      const api = state.locations.values().next().value?.session
+      if (!api) return
+      const session = await api.get({ sessionID: input.sessionID })
+      const owner = state.locations.get(session.location.directory)
+      if (!owner || !isTuiConnected(input.sessionID)) return
+      const payload = await owner.menu.open(input.sessionID)
+      pushNotification(payload, input.sessionID)
+    },
+  }
+  const command = state.command
   try {
     location.registration = await ctx.command.transform((editor) => {
-      editor.add({
-        name: 'openai',
-        description: 'OpenAI account menu',
-        async execute(input) {
-          // Session identity, not the first setup's directory, selects the owner.
-          const session = await ctx.session.get({ sessionID: input.sessionID })
-          const owner = state.locations.get(session.location.directory)
-          if (!owner || !isTuiConnected(input.sessionID)) return
-          const payload = await owner.menu.open(input.sessionID)
-          pushNotification(payload, input.sessionID)
-        },
-      })
+      editor.add(command)
     })
   } catch (error) {
     if (state.locations.get(directory) === location)
