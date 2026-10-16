@@ -77,15 +77,15 @@
 │   ├── measure-store-contention.mjs # Account-store lock contention benchmark under load
 │   ├── release.sh                 # Tag-driven release driver
 │   ├── wait-release.sh            # Poll for the GitHub release to appear
-│   └── version-sync.mjs           # Sync package versions and README install pins
-├── docs/                          # Public documentation only (currently empty)
+│   └── version-sync.mjs           # Sync package versions and documented install pins
+├── docs/                          # User documentation pages, linked from README.md
 ├── .github/                       # Issue templates + release workflow
 ├── biome.json                     # Formatter/linter config
 ├── lefthook.yml                   # Pre-commit biome check
 ├── mise.toml                      # Tooling versions
 ├── package.json                   # Workspace root (bun workspaces)
 ├── bun.lock
-└── README.md                      # User-facing documentation
+└── README.md                      # Short landing page; details live in docs/
 ```
 
 ## Directory Purposes

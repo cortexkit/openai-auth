@@ -6,7 +6,13 @@
 
 import { afterAll, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+} from 'node:fs'
 import { dirname, join } from 'node:path'
 import { installPackedPlugin, PACKAGE_NAME } from './fixtures/opencode2-pack'
 
@@ -26,6 +32,35 @@ function node(source: string) {
 }
 
 describe('packed package on plain Node', () => {
+  test('npx setup dry run names the fresh profile config folder without writing it', () => {
+    const home = join(consumer, 'profile')
+    const config = join(home, '.config', 'opencode')
+    mkdirSync(config, { recursive: true })
+    const result = spawnSync(
+      'npx',
+      ['--no-install', 'opencode-openai-auth', 'setup', '--dry-run', '--yes'],
+      {
+        cwd: consumer,
+        encoding: 'utf8',
+        env: {
+          PATH: process.env.PATH ?? '',
+          HOME: home,
+          npm_config_update_notifier: 'false',
+        },
+        timeout: 30_000,
+      },
+    )
+    expect(result.stderr).toBe('')
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain(config)
+    expect(result.stdout).toContain(join(config, 'opencode.jsonc'))
+    expect(result.stdout).toContain('Dry run: no registrations')
+    expect(readdirSync(config)).toEqual([])
+    expect(
+      existsSync(join(home, '.local', 'share', 'opencode', 'auth.json')),
+    ).toBe(false)
+  })
+
   test('the consumer has no @cortexkit/common-auth to fall back on', () => {
     expect(
       existsSync(join(consumer, 'node_modules', '@cortexkit', 'common-auth')),
@@ -70,7 +105,7 @@ describe('packed package on plain Node', () => {
     expect(result.stdout.trim()).toBe('function')
   })
 
-  test('the bundles import only Node built-ins, declared vault clients, private-files and their own chunks', () => {
+  test('the bundles import only Node built-ins, declared runtime dependencies and their own chunks', () => {
     const dist = join(packageDir, 'dist')
     const files = [
       ...readdirSync(dist).filter((name) => name.endsWith('.js')),
@@ -95,6 +130,7 @@ describe('packed package on plain Node', () => {
       '@cortexkit/claustrum-client',
       '@cortexkit/private-files',
       '@cortexkit/subc-client',
+      'jsonc-parser',
     ])
   })
 })

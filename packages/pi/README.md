@@ -1,53 +1,19 @@
 # @cortexkit/pi-openai-auth
 
-Pi package for CortexKit OpenAI Codex OAuth support. It overrides Pi's built-in `openai-codex` provider with a CortexKit provider extension backed by Pi's OpenAI Codex Responses transport and OAuth primitives.
+The Pi package of [CortexKit OpenAI Auth](https://github.com/cortexkit/openai-auth). It overrides Pi's built-in `openai-codex` provider so Pi can use a ChatGPT Plus or Pro subscription through the OpenAI Codex backend, with several accounts and sticky routing, usage limits per account and optional Claustrum vault integration. The OpenCode package is [`@cortexkit/opencode-openai-auth`](https://www.npmjs.com/package/@cortexkit/opencode-openai-auth).
 
-The Pi provider catalog includes `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.3-codex-spark`.
-
-This package is part of the CortexKit OpenAI Auth monorepo, which supports both OpenCode (`@cortexkit/opencode-openai-auth`) and Pi (`@cortexkit/pi-openai-auth`).
+> This plugin is not affiliated with or endorsed by OpenAI. Using a subscription this way may be against OpenAI's terms, and OpenAI may limit or suspend accounts. You use it at your own risk; the authors accept no responsibility for any action the provider takes.
 
 ## Install
 
-Requires Pi 1.0.1 or newer.
+Requires Pi 1.0.1 or newer. See [Install](https://github.com/cortexkit/openai-auth#install) in the repository README; installing with Pi's own package manager is described in [Configuration](https://github.com/cortexkit/openai-auth/blob/main/docs/configuration.md#installing-on-pi).
 
-Install with Pi's package manager:
+## Documentation
 
-```bash
-pi install npm:@cortexkit/pi-openai-auth@1.0.3
-```
-
-For an unpinned install:
-
-```bash
-pi install npm:@cortexkit/pi-openai-auth
-```
-
-To try it for one run without changing Pi settings:
-
-```bash
-pi -e npm:@cortexkit/pi-openai-auth
-```
-
-Restart Pi after installing, then authenticate through Pi's normal login flow:
-
-```text
-/login openai-codex
-```
-
-## Commands
-
-The extension registers one command in Pi, `openai`, which opens a menu: Accounts (add a fallback account via OAuth, disable, enable, move or remove one), Quota (check now), Routing (`ordered`, `main-first`, `fallback-first`, `sticky-balanced`, and the roster order), Limits (the killswitch and per-account floors), Pi login (the quota of the account you signed in to Pi with, routed as `main`), This session (clear the session's pin) and Vault.
-
-The Vault section connects Pi to a [Claustrum](https://github.com/cortexkit/claustrum) vault: Connect proposes the enrollment `openai-auth-pi` and shows the `ck auth enroll approve --request-id <id>` and `ck auth grant --principal enrolled:openai-auth-pi --selector-kind category --selector openai-native --operation read` commands to run; Pi tells you when the approval lands. While Pi is connected (vault mode), the OpenAI accounts the vault serves it are the only ones routed, each request fetching its token from the vault; Pi's own login and the pool are neither used, refreshed nor polled. The provider and model names stay the same: use `openai-codex/<model>` in either mode. Before Pi reloads auth, the plugin saves Pi's original login in an owner-only stash under its vault state directory and puts a non-secret placeholder in Pi's `auth.json`, so Pi cannot refresh that login while the vault serves. Disconnect restores the original entry and forgets Pi's vault token. If a new Pi login was added while connected, disconnect reports a conflict and keeps both the new login and the stashed original without overwriting either. Each vault account can be disabled or enabled on Pi alone.
-
-## How requests are routed
-
-Every request goes out with one account's token, chosen by the routing mode:
-
-- `main-first` tries your Pi login first, then the fallbacks in order; `fallback-first` tries the fallbacks first and your Pi login last. When an account answers with a rate-limit or auth error before anything was streamed, the next one is tried.
-- `sticky-balanced` keeps each Pi session on one account, spreading sessions by remaining quota, and moves a session for good only when its account is confirmed exhausted.
-
-Your Pi login stays where Pi keeps it: Pi refreshes it and the extension only uses the token Pi hands it. Fallback accounts live in the extension's own store (`openai-auth.json` in Pi's agent directory, `~/.pi/agent` unless `PI_AGENT_DIR` says otherwise, or the file `PI_OPENAI_AUTH_FILE` names), are refreshed there, and a fallback that is the same ChatGPT account as your Pi login is never used twice. An account is used only once its quota is known: each account's quota is checked as soon as the extension sees it, and quota from every response keeps it current. A store written by an earlier version is converted to the account-pool format the first time it is read, keeping its accounts.
+- [Configuration](https://github.com/cortexkit/openai-auth/blob/main/docs/configuration.md#pi)
+- [Accounts and routing](https://github.com/cortexkit/openai-auth/blob/main/docs/accounts-and-routing.md#pi)
+- [Commands](https://github.com/cortexkit/openai-auth/blob/main/docs/commands.md#pi)
+- [Claustrum vault](https://github.com/cortexkit/openai-auth/blob/main/docs/vault.md#pi-in-vault-mode)
 
 ## License
 

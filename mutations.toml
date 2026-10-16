@@ -44,6 +44,58 @@ expect_red = ['^OpenCode\s2\sshared\ssession\spins\sdoes\snot\sshare\spins\sacro
 # Send-time eligibility and vault admission on the migrated request paths.
 
 [[control]]
+id = "setup-opencode2-defers-local-login"
+guards = "OpenCode 2 setup leaves OAuth and the active pool login to OpenCode 2 instead of writing OpenCode 1's auth slot"
+file = "packages/opencode/src/setup.ts"
+old = "      if (context.opencodeGeneration === '2') return"
+new = "      // NON-VACUITY BREAK: let OpenCode 2 setup write the OpenCode 1 slot."
+test_file = "packages/opencode/src/tests/setup.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^setup\sOpenCode\s2\ssetup\suses\sopencode2\swithout\slocal\sOAuth\sor\sslot\swrites$']
+
+[[control]]
+id = "setup-vault-mode-guard"
+guards = "vault setup leaves local credentials untouched and local setup refuses an enrolled host"
+file = "packages/opencode/src/setup.ts"
+old = "      await assertLocal(host)\n    },"
+new = "      // NON-VACUITY BREAK: permit local registration of an enrolled host.\n    },"
+test_file = "packages/opencode/src/tests/setup.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^setup\svault\smode\spreserves\severy\slocal\scredential\sbyte\sand\srefuses\slocal\ssign-in$']
+
+[[control]]
+id = "setup-opencode-enrollment-path"
+guards = "setup enrolls OpenCode beside its overridden account state file where the running plugin reads"
+file = "packages/opencode/src/setup.ts"
+old = "stateDir: vaultStateDir(getAccountPaths().statePath),"
+new = "stateDir: vaultStateDir(getAccountPaths().configPath), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/setup.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^setup\sopencode\senrollment\sis\swritten\sexactly\swhere\sthe\srunning\splugin\sreads\sit$']
+
+[[control]]
+id = "setup-pi-enrollment-path"
+guards = "setup enrolls Pi beside its overridden account state file where the running plugin reads"
+file = "packages/opencode/src/setup.ts"
+old = "stateDir: vaultStateDir(getPiAccountPaths().statePath),"
+new = "stateDir: vaultStateDir(getPiAccountPaths().configPath), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/setup.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^setup\spi\senrollment\sis\swritten\sexactly\swhere\sthe\srunning\splugin\sreads\sit$']
+
+[[control]]
 id = "cachekeep-vault-send-wiring"
 guards = "a captured vault route authorizes every warm through the vault rather than searching local pool tokens"
 file = "packages/opencode/src/index.ts"
@@ -1372,7 +1424,7 @@ expect_message = "vault-owns-accounts"
 [[control]]
 id = "pool-downgrade-warning-names-empty-bearer"
 guards = "the migration docs warn that a pre-1.0 build sends the placeholder's empty bearer"
-file = "README.md"
+file = "docs/accounts-and-routing.md"
 old = "Downgrading after the account-pool migration is unsupported."
 new = "NON-VACUITY BREAK: downgrade warning removed."
 test_file = "packages/opencode/src/tests/pool-slot-audit.test.ts"
