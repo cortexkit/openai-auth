@@ -62,15 +62,37 @@ import {
   seedLegacyInstall,
 } from './fixtures/pool-migration-harness.ts'
 
+import { createPoolTransferClock } from './fixtures/pool-transfer-clock.ts'
 import { createRequestTestScope } from './request-test-scope'
 
 const scope = createRequestTestScope()
-const it = scope.it
+const clock = createPoolTransferClock()
+const it = (name: string, body: () => unknown, timeout?: number) =>
+  scope.it(
+    name,
+    () =>
+      clock.run(name, async () => {
+        await body()
+      }),
+    timeout,
+  )
 let h: Harness
 beforeEach(() => {
   h = harness()
+  clock.capture(h.dir)
+  const deps = h.deps
+  h.deps = (extra) => clock.deps(deps(extra))
 })
-afterEach(async () => scope.teardown(async () => h.cleanup()))
+afterEach(async () => {
+  try {
+    await scope.teardown(
+      async () => h.cleanup(),
+      () => clock.report('test work still running'),
+    )
+  } finally {
+    clock.restore()
+  }
+})
 
 function deferred<T = void>() {
   let resolve!: (value: T) => void

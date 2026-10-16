@@ -32,6 +32,7 @@ import { __resetProcessHeartbeatForTest } from '../core/process-heartbeat.ts'
 import { __menuContextForTest, CodexAuthPlugin } from '../index.ts'
 import { drainSidebarWrites } from '../sidebar-state.ts'
 import { FAR, fileSlot, jwt, login } from './fixtures/pool-migration-harness.ts'
+import { createPoolTransferClock } from './fixtures/pool-transfer-clock.ts'
 import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
@@ -51,12 +52,22 @@ let slot: HostSlotAdapter
 let originalFetch: typeof globalThis.fetch
 let hooks: Hooks | undefined
 const scope = createRequestTestScope()
-const it = scope.it
+const clock = createPoolTransferClock()
+const it = (name: string, body: () => unknown, timeout?: number) =>
+  scope.it(
+    name,
+    () =>
+      clock.run(name, async () => {
+        await body()
+      }),
+    timeout,
+  )
 const releaseMigrations: Array<() => void> = []
 
 beforeEach(() => {
   scope.capturePluginWork()
   dir = mkdtempSync(join(tmpdir(), 'oai-pool-lifecycle-'))
+  clock.capture(dir)
   configFile = join(dir, 'openai-auth.json')
   stateFile = join(dir, 'openai-auth-state.json')
   process.env.OPENCODE_OPENAI_AUTH_FILE = configFile
@@ -84,20 +95,27 @@ beforeEach(() => {
 
 afterEach(async () => {
   for (const release of releaseMigrations.splice(0)) release()
-  await scope.teardown(async () => {
-    await hooks?.dispose?.()
-    globalThis.fetch = originalFetch
-    await drainSidebarWrites()
-    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
-      FLOOR_SIDEBAR_STATE_FILE
-    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    restoreEnv('OPENCODE_CONFIG_DIR')
-    restoreEnv('XDG_STATE_HOME')
-    restoreEnv('XDG_DATA_HOME')
-    delete process.env.NODE_ENV
-  })
+  try {
+    await scope.teardown(
+      async () => {
+        await hooks?.dispose?.()
+        globalThis.fetch = originalFetch
+        await drainSidebarWrites()
+        process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+        process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+        process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+          FLOOR_SIDEBAR_STATE_FILE
+        process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+        restoreEnv('OPENCODE_CONFIG_DIR')
+        restoreEnv('XDG_STATE_HOME')
+        restoreEnv('XDG_DATA_HOME')
+        delete process.env.NODE_ENV
+      },
+      () => clock.report('test work still running'),
+    )
+  } finally {
+    clock.restore()
+  }
 })
 
 function deferred<T = void>() {
@@ -114,14 +132,19 @@ const setSlot = (value: unknown) =>
   slot.set({ path: { id: 'openai' }, body: value })
 
 async function waitFor(check: () => Promise<boolean>, what: string) {
-  // Shorter than the default five-second test timeout, so a condition that
-  // never holds fails with its own name rather than a bare timeout.
-  const deadline = Date.now() + 4_000
-  while (Date.now() < deadline) {
-    if (await check()) return
-    await Bun.sleep(25)
+  const finish = clock.start(`poll: ${what}`)
+  try {
+    // Shorter than the default five-second test timeout, so a condition that
+    // never holds fails with its own name rather than a bare timeout.
+    const deadline = Date.now() + 4_000
+    while (Date.now() < deadline) {
+      if (await check()) return
+      await Bun.sleep(25)
+    }
+    throw new Error(`timed out waiting for ${what}`)
+  } finally {
+    finish()
   }
-  throw new Error(`timed out waiting for ${what}`)
 }
 
 /** A legacy install: main in the slot, no fallbacks, no routing mode. */
@@ -271,7 +294,7 @@ async function loadPlugin(poolMigration: PoolOptions = {}, extra = {}) {
     experimentalWebSockets: false,
     poolMigration: {
       log: quietLog,
-      ...poolMigration,
+      ...clock.deps(poolMigration),
       enabled: 'enabled' in poolMigration ? poolMigration.enabled : true,
     },
     ...extra,
