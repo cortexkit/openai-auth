@@ -3539,3 +3539,16 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-clien
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-client-packaging.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^vault\sclient\spackaging\scounts\sa\ssecond\scopy\sreached\sthrough\sthe\sBun\sstore$']
+
+[[control]]
+id = "gpt-6-1-sol-gets-codex-500k-context"
+guards = "gpt-6.1-sol keeps Codex's 500k default context instead of the 272k surcharge cap its subscription use does not pay"
+file = "packages/opencode/src/index.ts"
+old = "    return { context: 500_000, input: 372_000, output: 128_000 }"
+new = "    return { context: 372_000, input: 244_000, output: 128_000 } // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/model-filter.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/model-filter.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/model-filter.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['500k\scontext\sCodex\suses\sby\sdefault$']

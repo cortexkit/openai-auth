@@ -291,16 +291,23 @@ export function codexOAuthModelLimit(
   // applies to everything else. Checking the model family is the wrong test -
   // it is the rate card's named list.
   //
-  // gpt-6.1-sol is held here too. Its published pricing, read 2026-09-29 at
-  // developers.openai.com/api/docs/models/gpt-6.1-sol, charges 2x input and
-  // 1.5x output on the full request above 272K input tokens, and nothing names
-  // it in a Codex exception. (The rate card itself could not be fetched that
-  // day; re-check it before raising this.)
+  // gpt-6.1-sol gets Codex's own 500k default context (raised from 272k
+  // around 2026-10-12), and on a subscription it pays no surcharge for the
+  // input above 272K. OpenAI's "ChatGPT Work and Codex" help article
+  // (help.openai.com/en/articles/20001275, read 2026-10-16 from its search
+  // index because the page answered 403): "There's no additional long-context
+  // surcharge for GPT-6.1 Sol usage covered by your subscription's included
+  // allowance." Purchased credits and the platform API keep the surcharge
+  // (developers.openai.com/api/docs/models/gpt-6.1-sol: 2x input and 1.5x
+  // output on the full request above 272K), so a `codexApiEndpoint` override
+  // pointed at a differently billed surface is the operator's to re-check, as
+  // for gpt-6-astra. `input` is the window minus the 128k output reserve.
+  if (modelId.includes('gpt-6.1-sol'))
+    return { context: 500_000, input: 372_000, output: 128_000 }
   if (
     modelId.includes('gpt-5.6') ||
     modelId.includes('gpt-6-sol') ||
-    modelId.includes('gpt-6-luna') ||
-    modelId.includes('gpt-6.1-sol')
+    modelId.includes('gpt-6-luna')
   )
     return { context: 372_000, input: 244_000, output: 128_000 }
   return undefined
