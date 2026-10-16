@@ -8,7 +8,7 @@ OpenCode 2 loads the plugin from the package's `./server` entry. OpenCode 1 also
 
 ```json
 {
-  "plugins": ["@cortexkit/opencode-openai-auth@1.0.3"]
+  "plugins": ["@cortexkit/opencode-openai-auth@1.0.4"]
 }
 ```
 
