@@ -38,6 +38,10 @@ To use only the [Claustrum vault](vault.md), enroll OpenCode first, then choose 
 - **Responses Lite** (`responsesLite: true`) applies to HTTP requests for the Lite models. Over the WebSocket the standard request shape is sent: the Lite shape moves `tools` and `instructions` into the input, which would put the server's view of the conversation out of step with OpenCode 2's own continuation.
 - **Models**: the same allow and deny lists and context caps as on OpenCode 1.
 
+## Model costs
+
+On OpenCode 2, models show OpenCode's own prices, even when you use the plugin's ChatGPT accounts (on OpenCode 1 they show as free), and Pro reasoning models are not hidden. OpenCode 2's model-list hook can't tell which credential is in use when it runs, so changing costs there would also change them for an OpenAI API key.
+
 ## Not on OpenCode 2 yet
 
 These features are not implemented on OpenCode 2 yet: the plugin's [`/openai` slash-command menu](commands.md#the-openai-command), the sidebar, [cache keep-warm](cache-keep-warm.md), [request dumps](troubleshooting.md#request-dumps), [reset credits](accounts-and-routing.md#reset-credits), zeroing displayed model costs, and OpenCode 1's extra conversation headers and Codex-specific tool formatting. Manage accounts from OpenCode 1's `/openai` or `opencode auth login` menu instead.
