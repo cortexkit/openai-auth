@@ -617,11 +617,15 @@ describe('the pool lifecycle in vault mode', () => {
       // Disconnect: the next lifecycle check migrates the install.
       rmSync(tokenPath)
       timers.fire()
+      // Migration writes the slot placeholder before its last config write
+      // stamps migratedAt, so wait for that last write, not the placeholder.
       await waitFor(
-        async () => isPoolPlaceholder(await slotValue()),
+        async () =>
+          typeof readJson(configFile)[POOL_MIGRATION_KEY]?.migratedAt ===
+          'number',
         'the migration after disconnect',
       )
-      expect(readJson(configFile)[POOL_MIGRATION_KEY]?.migratedAt).toBeNumber()
+      expect(isPoolPlaceholder(await slotValue())).toBe(true)
     } finally {
       await hooks?.dispose?.()
       hooks = undefined
