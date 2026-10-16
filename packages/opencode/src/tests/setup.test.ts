@@ -336,7 +336,7 @@ describe('setup', () => {
         connectionFile: join(root, 'connection.json'),
         handshakeTimeoutMs: 2000,
       })
-      // This is the running host's path, not a path computed from SetupPlugin.
+      // Construct the running host's vault state path independently of SetupPlugin.
       const runtime = new OpenAiVault({
         host,
         stateDir: join(

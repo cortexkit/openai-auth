@@ -72,7 +72,7 @@ The Pi extension registers one command, `openai`, which opens a menu:
 | Quota | Check every account's quota now. |
 | Routing | `ordered`, `main-first`, `fallback-first` or `sticky-balanced`, and the roster order. |
 | Limits | Block requests below each account's minimum remaining quota ([killswitch floors](accounts-and-routing.md#killswitch)). |
-| Pi login | The quota of the account you signed in to Pi with, routed as `main`. |
+| Pi login | The quota of the account you signed in to Pi with. Routing treats this account as `main`. |
 | This session | Clear this Pi session's account assignment (pin). |
 | Vault | Connect Pi to the Claustrum vault; disable or enable each vault account on Pi alone. See [Claustrum vault](vault.md). |
 

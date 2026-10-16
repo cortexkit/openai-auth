@@ -100,8 +100,8 @@ export function observationFromSnapshot(
     else if (complete) coverage.push({ label })
   }
   const budget = budgetFor(snapshot)
-  // A missing count says nothing about the balance; only an explicit reading
-  // can replace it, even when the snapshot covers every quota window.
+  // A missing reset-credit count says nothing about the saved balance; only an
+  // explicit count can replace it, even when the snapshot covers every quota window.
   const credits = snapshot.resetCreditsAvailable
   const counters =
     typeof credits === 'number' && Number.isSafeInteger(credits) && credits >= 0

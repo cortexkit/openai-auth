@@ -157,8 +157,9 @@ export function createSetupPlugin(deps: SetupDependencies = {}): SetupPlugin {
       const account = await login.completion
       await assertHostsStopped(fence)
       await assertLocal(host)
-      // The existing slot adapter preserves other providers and refuses a changed
-      // slot. First plugin startup migrates this login to the pool's main row.
+      // The OpenCode 1 login adapter preserves other providers and refuses to
+      // overwrite a changed OpenAI login. First plugin startup moves this login
+      // to the pool's main row.
       await slot.set({
         ...input,
         body: {

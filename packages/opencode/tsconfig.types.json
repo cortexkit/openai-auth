@@ -14,5 +14,11 @@
         "../core/dist/pool-routing.d.ts"
       ]
     }
-  }
+  },
+  "exclude": [
+    "src/tests/**",
+    "src/tui-compiled/**",
+    "src/bin.ts",
+    "src/setup.ts"
+  ]
 }

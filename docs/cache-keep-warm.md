@@ -9,7 +9,7 @@ The Cache section of the plugin's [`/openai` slash-command menu](commands.md#the
 - **Keep-warm on/off.** The setting is saved (`cacheKeep.enabled`), so it stays on across restarts and applies to every session until you turn it off.
 - **Subagent warming.** Also warm subagent sessions (off by default), subject to the idle and replay limits below.
 - **Sustain.** Keep main-session warming past its one-hour idle cap. It defaults to off and does not change subagent limits.
-- **Warm window.** Warm only between local hours, such as `9-18` or `22-6`; empty warms at any hour.
+- **Warm window.** Warm only between hours in the host machine's local time, such as `9-18` or `22-6`; leaving the setting empty allows warming at any hour.
 
 The Cache section also shows its timer, tracked sessions and prompt-cache lifetime (TTL).
 

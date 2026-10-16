@@ -27,7 +27,7 @@ After enrollment, choose **ChatGPT accounts in the vault** in `/login openai` or
 
 On OpenCode 1 (the 1.x series), activation requires an empty `openai` entry in `auth.json` (its login slot). Any existing record, malformed JSON or unreadable file is refused without changing it; a missing file on a fresh install is allowed. Enrollment is checked again when activation completes.
 
-For OpenCode 2, see [OpenCode 2](opencode-2.md#vault-only-hosts).
+For OpenCode 2's vault activation command and login method, see [Vault-only hosts](opencode-2.md#vault-only-hosts).
 
 ## Vault mode
 

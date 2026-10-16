@@ -116,7 +116,7 @@ export function buildVaultSidebarMachineState(
 }
 
 /**
- * The machine part of the sidebar state for a migrated install. `rows` are
+ * The machine part of the sidebar state for an install using the account pool. `rows` are
  * the pool's rows in roster order; `resetCreditsFor` supplies the reset-credit
  * count last read by this process for a row id, independently of persisted quota.
  */

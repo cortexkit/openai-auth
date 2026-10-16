@@ -135,7 +135,7 @@ For an unpinned install:
 pi install npm:@cortexkit/pi-openai-auth
 ```
 
-To try it for one run without changing Pi settings:
+To try the Pi extension for one run without changing Pi settings:
 
 ```bash
 pi -e npm:@cortexkit/pi-openai-auth
