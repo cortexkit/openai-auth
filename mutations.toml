@@ -4156,7 +4156,7 @@ expect_message = "Received value must be a string: null"
 
 [[control]]
 id = "opencode2-handshake-keeps-host-session"
-guards = "HTTP thread session-id rewriting never reaches the WebSocket handshake, whose stable host id permits socket reuse"
+guards = "WebSocket handshakes share the HTTP thread cache identity while keeping headers stable across turns"
 file = "packages/opencode/src/v2/setup.ts"
 old = "            if (name === 'experimental.ws.send') {"
 new = "            if (handshake) handshake.headers = { ...handshake.headers, 'session-id': 'wrong-thread-id' } // NON-VACUITY BREAK\n            if (name === 'experimental.ws.send') {"
@@ -4165,5 +4165,19 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ["^OpenCode\\s2\\sHTTP\\sshape\\skeeps\\sthe\\shandshake\\shost\\ssession\\sid\\swhile\\sHTTP\\suses\\sthe\\sthread\\sid\\sand\\sresponse\\sattribution\\ssurvives$"]
+expect_red = ["^OpenCode\\s2\\sHTTP\\sshape\\sshares\\sHTTP\\sand\\sWebSocket\\sthread\\scache\\sidentity\\swhile\\sresponse\\sattribution\\ssurvives$"]
 expect_message = "wrong-thread-id"
+
+[[control]]
+id = "opencode2-websocket-shares-http-cache-key"
+guards = "owned response.create frames use the HTTP thread cache key, never the host session id, so fallback keeps the cached prefix"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = "  body.prompt_cache_key = threadID"
+new = "  body.prompt_cache_key = scope.sessionID // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-http-shape.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sHTTP\\sshape\\sshares\\sHTTP\\sand\\sWebSocket\\sthread\\scache\\sidentity\\swhile\\sresponse\\sattribution\\ssurvives$"]
+expect_message = "ses_1"

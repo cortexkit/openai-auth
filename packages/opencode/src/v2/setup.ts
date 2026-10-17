@@ -96,6 +96,7 @@ import {
   OPENAI_PROVIDER_ID,
   type OpenAIAdapterLogger,
 } from './adapter'
+import { CodexHttpState } from './codex-wire'
 import { type ControlPlaneMenu, installControlPlane } from './control-plane'
 import { opencode1HostSlot } from './host-slot'
 import {
@@ -182,6 +183,7 @@ async function installPoolHooks<Q, A>(
   ctx: SetupContext,
   adapter: OpenCode2AuthAdapter<Q, A>,
   log: Pick<OpenAIAdapterLogger, 'warn'>,
+  codex = new CodexHttpState(),
 ) {
   const dumps = new RequestDumps(log)
   // installOpenCode2Auth supplies an Attempt to the rewrite callbacks before it
@@ -239,6 +241,13 @@ async function installPoolHooks<Q, A>(
             }
             if (request && owned && observation.attempt)
               await dumps.captureHttp(request.request, observation.attempt)
+            if (handshake && owned && observation.attempt) {
+              // A stable thread id lets WebSocket and HTTP fallback share the
+              // same cache without changing the host's socket key between turns.
+              handshake.headers['session-id'] = codex.get(
+                handshake.sessionID,
+              ).threadID
+            }
             if (name === 'experimental.ws.send') {
               const sent = draft as SessionHooks['experimental.ws.send']
               const socket = sockets.get(`${sent.sessionID}:${sent.kind}`)
@@ -578,8 +587,9 @@ export async function setupOpenAIAuth(
   }
   // Disk publication must not hold up the host's location-ready lifecycle.
   void sidebar.publish()
+  const codex = options.codex ?? new CodexHttpState()
   const openai = createOpenAIAdapter({
-    codex: options.codex,
+    codex,
     onRoute: sidebar.route,
     source,
     slotPlaceholderWithoutMain,
@@ -596,7 +606,7 @@ export async function setupOpenAIAuth(
     codexEndpoint: () => getSettings().codexApiEndpoint,
     log,
   })
-  const installation = await installPoolHooks(ctx, openai.adapter, log)
+  const installation = await installPoolHooks(ctx, openai.adapter, log, codex)
   openai.attach(installation)
 
   /** Waits for a migration run when the install has not migrated yet. */

@@ -1,6 +1,6 @@
 // HTTP uses prepareCodexRequest, as OpenCode 1 does. WebSocket handshakes keep
-// the stable version, user-agent and originator headers: the host keys socket
-// reuse by handshake headers, so adding changing turn metadata opens a socket.
+// the stable version, user-agent, originator and thread session-id headers: the
+// host keys socket reuse by handshake headers, so turn metadata stays HTTP-only.
 
 import {
   CODEX_USER_AGENT,
@@ -27,7 +27,7 @@ function processInstallationID(): string {
   return registry[INSTALLATION_KEY]
 }
 
-/** User turns, title, compaction and generate requests share the host session's metadata. */
+/** HTTP requests and WebSocket cache keys share each host session's thread identity. */
 export class CodexHttpState {
   readonly sessions = new Map<string, CodexSessionMetadata>()
   readonly installationID: string
@@ -282,7 +282,7 @@ export async function rewriteCodexHttpRequest(
   return new Request(request, { headers, body: prepared.init?.body })
 }
 
-/** The WebSocket frame rewrite: the effort rule. Undefined keeps the frame. */
+/** WebSocket sends share HTTP's cache key and apply effort once; no Lite rewrite. */
 export function rewriteCodexFrame(
   frame: string,
   scope: CodexRewriteScope,
@@ -292,6 +292,9 @@ export function rewriteCodexFrame(
   if (body?.type !== 'response.create') return undefined
   const capped = 'max_output_tokens' in body
   delete body.max_output_tokens
+  const threadID = effort.http.get(scope.sessionID).threadID
+  const cacheChanged = body.prompt_cache_key !== threadID
+  body.prompt_cache_key = threadID
   const changed = effort.apply(body, scope, 'ws')
-  return capped || changed ? JSON.stringify(body) : undefined
+  return capped || cacheChanged || changed ? JSON.stringify(body) : undefined
 }

@@ -13,6 +13,7 @@ import {
 import { CODEX_USER_AGENT, CODEX_VERSION } from '../index'
 import {
   CODEX_CLIENT_HEADERS,
+  CodexHttpState,
   MidConversationEffort,
   RESPONSES_LITE_HEADER,
   rewriteCodexFrame,
@@ -30,6 +31,17 @@ import {
 
 const PLACEHOLDER = placeholderSecret('openai')
 const SESSION = { sessionID: 'ses_1', kind: 'primary' }
+const THREAD = '00000000-0000-7000-8000-000000000001'
+
+function testEffort() {
+  const state = new CodexHttpState()
+  state.sessions.set(SESSION.sessionID, {
+    threadID: THREAD,
+    turnID: 'turn',
+    windowID: `${THREAD}:0`,
+  })
+  return new MidConversationEffort(state)
+}
 
 const user = (text: string) => ({
   type: 'message',
@@ -65,6 +77,7 @@ function frame(
     instructions: 'be brief',
     tools: [{ type: 'function', name: 'x' }],
     reasoning: { effort, summary: 'auto' },
+    prompt_cache_key: THREAD,
     ...extra,
   })
 }
@@ -90,7 +103,7 @@ function httpBody(
 
 describe('mid-conversation effort on WebSocket frames', () => {
   it('pins the first effort, then adds the update before the new user message of an incremental frame and changes nothing else', () => {
-    const effort = new MidConversationEffort()
+    const effort = testEffort()
     expect(
       rewriteCodexFrame(frame('low', [user('one')]), SESSION, effort),
     ).toBe(undefined)
@@ -110,7 +123,7 @@ describe('mid-conversation effort on WebSocket frames', () => {
   })
 
   it('keeps the pinned effort on a tool-output frame without adding the update again', () => {
-    const effort = new MidConversationEffort()
+    const effort = testEffort()
     rewriteCodexFrame(frame('low', [user('one')]), SESSION, effort)
     const toolStep = frame('high', [output], { previous_response_id: 'resp_2' })
     expect(
@@ -122,7 +135,7 @@ describe('mid-conversation effort on WebSocket frames', () => {
   })
 
   it('puts the update before the last user message of a full frame', () => {
-    const effort = new MidConversationEffort()
+    const effort = testEffort()
     rewriteCodexFrame(frame('low', [user('one')]), SESSION, effort)
     const full = frame('high', [
       user('one'),
@@ -144,7 +157,7 @@ describe('mid-conversation effort on WebSocket frames', () => {
   })
 
   it('never places an update right after another one', () => {
-    const effort = new MidConversationEffort()
+    const effort = testEffort()
     rewriteCodexFrame(frame('low', [user('one')]), SESSION, effort)
     const already = frame('high', [update('xhigh'), user('two')])
     expect(
@@ -153,7 +166,7 @@ describe('mid-conversation effort on WebSocket frames', () => {
   })
 
   it('leaves frames of other models, other request kinds and an unchanged effort alone', () => {
-    const effort = new MidConversationEffort()
+    const effort = testEffort()
     rewriteCodexFrame(frame('low', [user('one')]), SESSION, effort)
     expect(
       rewriteCodexFrame(frame('low', [user('two')]), SESSION, effort),
@@ -174,32 +187,38 @@ describe('mid-conversation effort on WebSocket frames', () => {
           effort,
         ),
       ).toBe(undefined)
-    // A title request neither pins nor is rewritten.
+    // A title request with its thread cache key neither pins nor changes effort.
     const title = { sessionID: 'ses_2', kind: 'title' }
-    expect(rewriteCodexFrame(frame('low', [user('t')]), title, effort)).toBe(
-      undefined,
-    )
-    expect(rewriteCodexFrame(frame('high', [user('t')]), title, effort)).toBe(
-      undefined,
-    )
+    const titleKey = {
+      prompt_cache_key: effort.http.get(title.sessionID).threadID,
+    }
+    expect(
+      rewriteCodexFrame(frame('low', [user('t')], titleKey), title, effort),
+    ).toBe(undefined)
+    expect(
+      rewriteCodexFrame(frame('high', [user('t')], titleKey), title, effort),
+    ).toBe(undefined)
     expect(
       rewriteCodexFrame(frame('high', [user('one')]), SESSION, effort),
     ).not.toBe(undefined)
   })
 
   it('starts over for a forgotten session', () => {
-    const effort = new MidConversationEffort()
+    const effort = testEffort()
     rewriteCodexFrame(frame('low', [user('one')]), SESSION, effort)
     effort.forget(SESSION.sessionID)
-    expect(
-      rewriteCodexFrame(frame('high', [user('two')]), SESSION, effort),
-    ).toBe(undefined)
+    const restarted = JSON.parse(
+      rewriteCodexFrame(frame('high', [user('two')]), SESSION, effort)!,
+    )
+    expect(restarted.reasoning.effort).toBe('high')
+    expect(restarted.input).toEqual([user('two')])
+    expect(restarted.prompt_cache_key).not.toBe(THREAD)
   })
 })
 
 describe('mid-conversation effort and Responses Lite on HTTP', () => {
   it('carries the update on every request after a change, before the turn user message', async () => {
-    const effort = new MidConversationEffort()
+    const effort = testEffort()
     const first = await rewriteCodexHttpRequest(
       httpBody('low', [user('one')]),
       SESSION,
@@ -252,7 +271,7 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
         model: 'gpt-5.6-luna',
         parallel_tool_calls: true,
       })
-    const effort = new MidConversationEffort()
+    const effort = testEffort()
     const standard = await rewriteCodexHttpRequest(
       request(),
       SESSION,
@@ -294,7 +313,7 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
   })
 
   it('leaves requests to other endpoints alone', async () => {
-    const effort = new MidConversationEffort()
+    const effort = testEffort()
     const other = new Request('https://codex.test/v1/models', {
       method: 'POST',
       body: JSON.stringify({ model: 'gpt-5.6-luna' }),
@@ -418,9 +437,10 @@ describe('through the OpenCode 2 entry', () => {
       await host.fire('experimental.ws.send', draft)
       return draft.frame
     }
-    expect(await send(frame('low', [user('one')]))).toBe(
-      frame('low', [user('one')]),
-    )
+    expect(JSON.parse(await send(frame('low', [user('one')])))).toEqual({
+      ...JSON.parse(frame('low', [user('one')])),
+      prompt_cache_key: expect.stringMatching(/^[\da-f-]{36}$/),
+    })
     expect(
       JSON.parse(
         await send(frame('high', [user('two')], { previous_response_id: 'r' })),

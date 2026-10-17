@@ -174,7 +174,7 @@ describe('OpenCode 2 HTTP shape', () => {
     ])
   })
 
-  it('keeps the handshake host session id while HTTP uses the thread id and response attribution survives', async () => {
+  it('shares HTTP and WebSocket thread cache identity while response attribution survives', async () => {
     const host = await start(true)
     const handshake = {
       ...scope(),
@@ -184,14 +184,34 @@ describe('OpenCode 2 HTTP shape', () => {
       } as Record<string, string>,
     }
     await host.fire('experimental.ws.handshake', handshake)
-    expect(handshake.headers['session-id']).toBe('ses_1')
+    expect(handshake.headers['session-id']).toMatch(/^[\da-f-]{36}$/)
+    expect(handshake.headers['session-id']).not.toBe('ses_1')
     expect(handshake.headers['thread-id']).toBeUndefined()
     expect(handshake.headers['x-codex-turn-metadata']).toBeUndefined()
+    const frame = {
+      ...scope(),
+      frame: JSON.stringify({
+        type: 'response.create',
+        model: 'gpt-5.5',
+        input: [user('one')],
+        prompt_cache_key: 'ses_1',
+      }),
+    }
+    await host.fire('experimental.ws.send', frame)
+    expect(JSON.parse(frame.frame).prompt_cache_key).toBe(
+      handshake.headers['session-id'],
+    )
     const emitted = await send(host, { model: 'gpt-5.5', input: [user('one')] })
     expect(emitted.headers.get('session-id')).toBe(
       emitted.headers.get('thread-id'),
     )
     expect(emitted.headers.get('session-id')).not.toBe('ses_1')
+    expect(emitted.headers.get('session-id')).toBe(
+      handshake.headers['session-id']!,
+    )
+    expect((await emitted.clone().json()).prompt_cache_key).toBe(
+      JSON.parse(frame.frame).prompt_cache_key,
+    )
     const received = {
       ...scope(),
       request: emitted,
@@ -212,8 +232,10 @@ describe('OpenCode 2 HTTP shape', () => {
     const records = readdirSync(dumpDir).filter((name) =>
       name.endsWith('.meta.json'),
     )
-    expect(records).toHaveLength(1)
-    const meta = JSON.parse(readFileSync(join(dumpDir, records[0]!), 'utf8'))
+    expect(records).toHaveLength(2)
+    const meta = records
+      .map((name) => JSON.parse(readFileSync(join(dumpDir, name), 'utf8')))
+      .find((record) => record.channel === 'http')
     expect(meta.session).toBe('ses_1')
     expect(meta.status).toBe(200)
     const again = {
@@ -225,6 +247,19 @@ describe('OpenCode 2 HTTP shape', () => {
     }
     await host.fire('experimental.ws.handshake', again)
     expect(again.headers).toEqual(handshake.headers)
+    const nextFrame = {
+      ...scope(),
+      frame: JSON.stringify({
+        type: 'response.create',
+        input: [user('two')],
+        previous_response_id: 'r1',
+        prompt_cache_key: 'ses_1',
+      }),
+    }
+    await host.fire('experimental.ws.send', nextFrame)
+    expect(JSON.parse(nextFrame.frame).prompt_cache_key).toBe(
+      handshake.headers['session-id'],
+    )
     await host.stop?.()
     expect(
       host.files

@@ -1160,7 +1160,9 @@ describe('Codex destination after transport ownership', () => {
     }
     await host.fire('experimental.ws.handshake', handshake)
     expect(handshake.url).toBe('wss://chatgpt.com/backend-api/codex/responses')
-    expect(handshake.headers['session-id']).toBe('ses_endpoint')
+    expect(handshake.headers['session-id']).toBe(
+      draft.request.headers.get('thread-id')!,
+    )
   })
 
   it('uses the configured Codex base and preserves custom transport destinations', () => {
@@ -1234,6 +1236,7 @@ describe('Codex destination after transport ownership', () => {
     expect(JSON.parse(ws.frame)).toEqual({
       type: 'response.create',
       temperature: 0.5,
+      prompt_cache_key: threadID,
     })
   })
 })

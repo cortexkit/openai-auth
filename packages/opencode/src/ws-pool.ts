@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { isRecord } from '@cortexkit/openai-auth-core/internal'
+import { orderCodexBody } from './codex-body'
 import { sanitizeHttpFallbackInit } from './codex-http'
 import { DUMP_SESSION_HEADER, dumpCodexRequest, dumpDiagnostic } from './dump'
 import { ResponseStreamError } from './response-stream-error'
@@ -1202,8 +1203,5 @@ export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(
   }
 }
 
-export * as OpenAIWebSocketPool from './ws-pool'
-
-import { orderCodexBody } from './codex-body'
-
 export { CODEX_BODY_KEY_ORDER, orderCodexBody } from './codex-body'
+export * as OpenAIWebSocketPool from './ws-pool'
