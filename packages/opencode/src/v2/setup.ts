@@ -96,6 +96,7 @@ import {
   OPENAI_PROVIDER_ID,
   type OpenAIAdapterLogger,
 } from './adapter'
+import { acquireCodexSessions } from './codex-sessions'
 import { CodexHttpState } from './codex-wire'
 import { type ControlPlaneMenu, installControlPlane } from './control-plane'
 import { opencode1HostSlot } from './host-slot'
@@ -587,7 +588,11 @@ export async function setupOpenAIAuth(
   }
   // Disk publication must not hold up the host's location-ready lifecycle.
   void sidebar.publish()
-  const codex = options.codex ?? new CodexHttpState()
+  // Thread ids are saved per host session so the prompt cache key survives a
+  // server restart; every location in this process shares the one map.
+  const codex =
+    options.codex ??
+    new CodexHttpState(undefined, undefined, acquireCodexSessions())
   const openai = createOpenAIAdapter({
     codex,
     onRoute: sidebar.route,
@@ -728,6 +733,10 @@ export async function setupOpenAIAuth(
       methods.dispose(),
       models.dispose(),
     ])
+    // Finish saving the sessions this location created or deleted, so a
+    // restart right after still finds their thread ids. A save that cannot get
+    // the session file's lock gives up after its own bounded wait.
+    await codex.store?.settled()
     // Join account-pool transfers and reads after stopping new slot adoptions.
     // Their reloads must finish before releasing this host's state. Preserve
     // the five-second shutdown limit for an unresponsive provider or login slot.

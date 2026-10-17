@@ -1,11 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import {
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  statSync,
-  writeFileSync,
-} from 'node:fs'
+import { statSync } from 'node:fs'
 import os from 'node:os'
 import { join } from 'node:path'
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
@@ -79,6 +73,7 @@ import {
   OPENAI_AGENT_HEADER,
   prepareCodexRequest,
 } from './codex-request'
+import { loadCodexSessions, saveCodexSessions } from './codex-sessions'
 import {
   applyOpenAiMenu,
   menuText,
@@ -819,11 +814,6 @@ interface CodexAuthPluginOptions {
   }
 }
 
-interface PersistedCodexSessions {
-  version?: number
-  sessions?: Record<string, { threadID?: unknown }>
-}
-
 // Real Codex mints the session/thread id (which becomes prompt_cache_key,
 // session-id, thread-id, x-client-request-id, window_id) as a UUIDv7 — a
 // time-ordered id whose first 48 bits are the unix-ms timestamp. crypto.randomUUID()
@@ -850,48 +840,6 @@ function getCodexSessionMetadata(
 
 function codexSessionStatePath() {
   return join(getConfigDir(), 'openai-auth-sessions.json')
-}
-
-function loadCodexSessions(): Map<string, CodexSessionMetadata> {
-  const sessions = new Map<string, CodexSessionMetadata>()
-  try {
-    const parsed = JSON.parse(
-      readFileSync(codexSessionStatePath(), 'utf8'),
-    ) as PersistedCodexSessions
-    if (!isRecord(parsed.sessions)) return sessions
-    for (const [sessionID, state] of Object.entries(parsed.sessions)) {
-      if (!isRecord(state) || typeof state.threadID !== 'string') continue
-      sessions.set(sessionID, {
-        threadID: state.threadID,
-        turnID: uuidV7(),
-        windowID: `${state.threadID}:0`,
-      })
-    }
-  } catch {
-    // Missing or malformed state should not break auth.
-  }
-  return sessions
-}
-
-function saveCodexSessions(sessions: Map<string, CodexSessionMetadata>): void {
-  const path = codexSessionStatePath()
-  const tmp = `${path}.tmp-${process.pid}`
-  try {
-    mkdirSync(getConfigDir(), { recursive: true })
-    const payload: PersistedCodexSessions = {
-      version: 1,
-      sessions: Object.fromEntries(
-        [...sessions.entries()].map(([sessionID, state]) => [
-          sessionID,
-          { threadID: state.threadID },
-        ]),
-      ),
-    }
-    writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
-    renameSync(tmp, path)
-  } catch {
-    // State persistence only improves cache continuity; never fail a request.
-  }
 }
 
 export function findCachekeepFallbackAccount(
@@ -1266,8 +1214,9 @@ export async function CodexAuthPlugin(
   const codexApiEndpoint =
     options.codexApiEndpoint ?? getSettings().codexApiEndpoint
   const installationID = crypto.randomUUID()
-  const codexSessions = loadCodexSessions()
-  const persistCodexSessions = () => saveCodexSessions(codexSessions)
+  const codexSessions = loadCodexSessions(codexSessionStatePath())
+  const persistCodexSessions = () =>
+    saveCodexSessions(codexSessionStatePath(), codexSessions)
   let websocketFetchInstalled = false
   let codexFetchInstalled = false
   const websocketFetches: Array<
