@@ -733,17 +733,19 @@ export async function setupOpenAIAuth(
       methods.dispose(),
       models.dispose(),
     ])
-    // Finish saving the sessions this location created or deleted, so a
-    // restart right after still finds their thread ids. A save that cannot get
-    // the session file's lock gives up after its own bounded wait.
-    await codex.store?.settled()
     // Join account-pool transfers and reads after stopping new slot adoptions.
-    // Their reloads must finish before releasing this host's state. Preserve
-    // the five-second shutdown limit for an unresponsive provider or login slot.
+    // Their reloads must finish before releasing this host's state. Also finish
+    // saving the sessions this location created or deleted, so a restart right
+    // after still finds their thread ids. Preserve the five-second shutdown
+    // limit for an unresponsive provider, login slot or session-file lock.
     let settleTimer: ReturnType<typeof setTimeout> | undefined
     try {
       await Promise.race([
-        Promise.all([lifecycle?.idle(), source.settled()]),
+        Promise.all([
+          lifecycle?.idle(),
+          source.settled(),
+          codex.store?.settled(),
+        ]),
         new Promise<void>((resolve) => {
           settleTimer = setTimeout(resolve, SETTLE_ON_DISPOSE_MS)
           settleTimer.unref?.()
