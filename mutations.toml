@@ -5238,3 +5238,25 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "opencode2-active-account-store-isolation"
+guards = "different account stores never share a session-account registry, so one store's sessions are never followed or warmed with another store's accounts"
+file = "packages/opencode/src/v2/session-accounts.ts"
+old = """
+  const key = JSON.stringify([
+    resolve(paths.configPath),
+    resolve(paths.statePath),
+  ])"""
+new = "  const key = 'all-stores' // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\ssession-account\sregistry\sgives\seach\saccount\sstore\sits\sown\sregistry\sand\sone\sregistry\sper\sstore$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
