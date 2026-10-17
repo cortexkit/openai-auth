@@ -44,6 +44,7 @@ async function start(
   const host = fakeOpenCode2Host({ activeCredential: credential, methods })
   const dispose = await setupOpenAIAuth(host.ctx, {
     paths: files.paths,
+    sidebarStateFile: join(files.dir, 'sidebar.json'),
     heartbeat: false,
     fence: async () => ({ open: true }),
     slot: {

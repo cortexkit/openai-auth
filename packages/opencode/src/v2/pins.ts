@@ -2,8 +2,8 @@
 //
 // A session is pinned to the pool row it was placed on and keeps it while the
 // row can serve. On OpenCode 1 the pins live in the sidebar file, which the
-// OpenCode 1 TUI reads; OpenCode 2 has no such sidebar yet, so the pins live
-// in memory and a restarted server places its sessions again (the pool rows,
+// OpenCode 1 TUI reads. OpenCode 2 projects its pins there for display, but keeps
+// routing authority in memory: a restarted server places its sessions again (the pool rows,
 // their quota and their rate-limit marks are what carry over).
 
 import type { StickyPin } from '@cortexkit/common-auth/routing'
@@ -17,6 +17,9 @@ export const MAX_SESSION_PINS = 1024
 
 export class SessionPins {
   private readonly pins = new Map<string, StickyPin>()
+  private readonly listeners = new Set<
+    (sessionId: string, pin?: StickyPin) => void
+  >()
   private readonly limit: number
 
   constructor(limit = MAX_SESSION_PINS) {
@@ -29,6 +32,20 @@ export class SessionPins {
 
   forget(sessionId: string): void {
     this.pins.delete(sessionId)
+    for (const listener of this.listeners) listener(sessionId)
+  }
+
+  subscribe(
+    listener: (sessionId: string, pin?: StickyPin) => void,
+  ): () => void {
+    this.listeners.add(listener)
+    return () => {
+      this.listeners.delete(listener)
+    }
+  }
+
+  snapshot(): ReadonlyMap<string, StickyPin> {
+    return new Map(this.pins)
   }
 
   get size(): number {
@@ -40,10 +57,11 @@ export class SessionPins {
     // oldest session is the one dropped when the bound is reached.
     this.pins.delete(sessionId)
     this.pins.set(sessionId, pin)
+    for (const listener of this.listeners) listener(sessionId, pin)
     while (this.pins.size > this.limit) {
       const oldest = this.pins.keys().next().value
       if (oldest === undefined) break
-      this.pins.delete(oldest)
+      this.forget(oldest)
     }
   }
 

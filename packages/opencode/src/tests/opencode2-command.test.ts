@@ -53,6 +53,7 @@ async function location(
   const blockers = [{ pid: 42, version: 'old', detail: 'fixture' }]
   const dispose = await setupOpenAIAuth(host.ctx, {
     paths: files.paths,
+    sidebarStateFile: join(files.dir, 'sidebar.json'),
     heartbeat: false,
     poolMigration,
     fence: async () => ({ open: false, blockers }),

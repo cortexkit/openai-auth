@@ -571,6 +571,7 @@ async function setupLocation(f: ReturnType<typeof fixture>, directory: string) {
   const host = fakeOpenCode2Host({ directory })
   const dispose = await setupOpenAIAuth(host.ctx, {
     paths: f.files.paths,
+    sidebarStateFile: join(f.files.dir, 'sidebar.json'),
     heartbeat: false,
     poolMigration: false,
     beginLogin: f.context.beginAccountLogin,

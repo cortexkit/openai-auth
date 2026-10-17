@@ -439,6 +439,7 @@ describe('one host vault per process', () => {
     for (const host of hosts) {
       const stop = await setupOpenAIAuth(host.ctx, {
         paths,
+        sidebarStateFile: join(dir, 'sidebar.json'),
         heartbeat: false,
         fetch: (async () =>
           new Response(usageBody(10))) as unknown as typeof fetch,
@@ -497,6 +498,7 @@ describe('one host vault per process', () => {
       )
       const stop = await setupOpenAIAuth(fakeOpenCode2Host().ctx, {
         paths: () => ({ configPath, statePath }),
+        sidebarStateFile: join(dir, `${name}-sidebar.json`),
         heartbeat: false,
         fetch: (async () =>
           new Response(usageBody(10))) as unknown as typeof fetch,

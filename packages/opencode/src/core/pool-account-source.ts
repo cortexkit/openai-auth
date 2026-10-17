@@ -233,6 +233,7 @@ function pollable(row: PoolRow): boolean {
 }
 
 export class PoolAccountSource {
+  private readonly listeners = new Set<() => void>()
   private readonly deps: PoolAccountSourceDeps
   private readonly now: () => number
   private readonly log: NonNullable<PoolAccountSourceDeps['log']>
@@ -302,6 +303,28 @@ export class PoolAccountSource {
   /** The rows as last read; never touches the disk. */
   peek(): PoolView {
     return { active: this.snapshot.active, rows: this.snapshot.rows }
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener)
+    return () => {
+      this.listeners.delete(listener)
+    }
+  }
+
+  /** Read a display snapshot without starting first-sight quota polls or refreshing tokens. */
+  async sidebarView(): Promise<PoolView> {
+    const paths = this.deps.paths()
+    if (readMigratedAt(paths.configPath) === undefined)
+      return { active: false, rows: [] }
+    const load = await this.storeFor(paths).read()
+    return load.status === 'ready'
+      ? { active: true, rows: this.withLocalState(load.rows) }
+      : { active: false, rows: [] }
+  }
+
+  private changed(): void {
+    for (const listener of this.listeners) listener()
   }
 
   /**
@@ -420,6 +443,7 @@ export class PoolAccountSource {
     const wasActive = this.snapshot.active
     if (readAt >= this.snapshot.readAt) {
       this.snapshot = { ...next, rows: this.withLocalState(next.rows) }
+      this.changed()
     }
     if (this.snapshot.active) {
       if (!wasActive) this.log.info('account pool serves requests')
@@ -462,6 +486,7 @@ export class PoolAccountSource {
         row.id === id ? update(row) : row,
       ),
     }
+    this.changed()
   }
 
   // -------------------------------------------------------------------------

@@ -3799,3 +3799,55 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-c
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode 2 rejects all non-control engine rows in local mode$']
+
+[[control]]
+id = "opencode2-sidebar-merge-owner"
+guards = "v2 publication retains other writers' routing and freshest quota windows"
+file = "packages/opencode/src/v2/sidebar-publisher.ts"
+old = "        await setSidebarMachineState(machine, this.file, { canWrite })"
+new = "        await import('../sidebar-state').then(({ setSidebarState }) => setSidebarState({ ...machine, activeId: undefined }, this.file)) // NON-VACUITY BREAK: overwrite other producers."
+test_file = "packages/opencode/src/tests/opencode2-sidebar-publisher.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 publisher: OpenCode 1 and two locations retain independent quota windows and routes$']
+
+[[control]]
+id = "opencode2-sidebar-single-publisher"
+guards = "two locations on one file share one passive publication observer"
+file = "packages/opencode/src/v2/sidebar-publisher.ts"
+old = "  let publisher = publishers.get(key)"
+new = "  let publisher = undefined as SidebarPublisher | undefined // NON-VACUITY BREAK: allocate per location."
+test_file = "packages/opencode/src/tests/opencode2-sidebar-publisher.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 publisher: one observer per file survives a location disposal$']
+
+[[control]]
+id = "opencode2-sidebar-vault-authority"
+guards = "enrollment publishes exclusive vault state without polling local accounts"
+file = "packages/opencode/src/v2/sidebar-publisher.ts"
+old = "        const vaultMode = authority !== 'local'"
+new = "        const vaultMode = false // NON-VACUITY BREAK: ignore enrollment when projecting state."
+test_file = "packages/opencode/src/tests/opencode2-sidebar-publisher.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 publisher: real enrollment and disconnect publish exclusive vault state without local polling$']
+
+[[control]]
+id = "opencode2-sidebar-forget-session"
+guards = "clearing a pin removes only that session's projected route and assignment"
+file = "packages/opencode/src/v2/sidebar-publisher.ts"
+old = "        const accounts = machine.vaultAccounts ?? machine.fallbacks"
+new = "        const accounts = machine.vaultAccounts ?? machine.fallbacks\n        if (routing.accountId === undefined) return // NON-VACUITY BREAK: leave cleared pins visible."
+test_file = "packages/opencode/src/tests/opencode2-sidebar-publisher.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 publisher: pin clear preserves two other sessions and subagent routing$']

@@ -108,6 +108,7 @@ import {
 import { createControlPlaneMenu } from './menu'
 import { registerCodexModelRules } from './models'
 import { acquireSessionPins } from './shared-pins'
+import { acquireSidebarPublisher } from './sidebar-publisher'
 
 /**
  * The plugin id both hosts list this plugin under: the OpenCode 1 plugin's
@@ -120,6 +121,8 @@ const SETTLE_ON_DISPOSE_MS = 5_000
 
 /** Test and embedding seams; every field has a production default. */
 export interface OpenAIAuthV2Options {
+  /** Binds this location's sidebar output; defaults to the shared sidebar state file. */
+  sidebarStateFile?: string
   /** Overrides the production menu for transport fixtures. */
   controlPlane?: ControlPlaneMenu
   /** The account config and state files; read on every use. */
@@ -502,7 +505,19 @@ export async function setupOpenAIAuth(
   vaultLease.start()
 
   const pins = acquireSessionPins(paths())
+  const sidebar = acquireSidebarPublisher(
+    { paths: paths(), source, pins, vault },
+    options.sidebarStateFile,
+  )
+  using _sidebarRollback = {
+    [Symbol.dispose]() {
+      if (!setupComplete) void sidebar.release()
+    },
+  }
+  // Disk publication must not hold up the host's location-ready lifecycle.
+  void sidebar.publish()
   const openai = createOpenAIAdapter({
+    onRoute: sidebar.route,
     source,
     slotPlaceholderWithoutMain,
     storage: () => loadAccounts(paths()),
@@ -599,6 +614,8 @@ export async function setupOpenAIAuth(
                   (row) => ({ ...row, account: row.id }),
                 ),
               getStickyRouting: async (sessionId) => pins.get(sessionId),
+              afterWrite: () => source.load(),
+              refreshSidebar: () => sidebar.publish(),
               clearStickyRouting: async (sessionId) => {
                 const existed = pins.get(sessionId) !== undefined
                 pins.forget(sessionId)
@@ -632,6 +649,7 @@ export async function setupOpenAIAuth(
     await controlPlane?.()
     lifecycle?.dispose()
     source.dispose()
+    await sidebar.release()
     await Promise.allSettled([
       installation.dispose(),
       methods.dispose(),

@@ -312,6 +312,7 @@ describe('through the OpenCode 2 entry', () => {
     const host = fakeOpenCode2Host()
     const stop = await setupOpenAIAuth(host.ctx, {
       paths: files.paths,
+      sidebarStateFile: join(files.dir, 'sidebar.json'),
       slot: opencode1HostSlot(join(files.dir, 'auth.json')),
       fence: async () => ({ open: true }),
       heartbeat: false,

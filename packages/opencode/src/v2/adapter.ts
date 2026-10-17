@@ -187,6 +187,8 @@ export type OpenAIAttemptData =
     }
 
 export interface OpenAIAdapterDeps {
+  /** Projects a primary request's actual route without affecting account choice. */
+  onRoute?: (sessionId: string, accountId: string, route: string) => void
   source: PoolAccess
   /**
    * True when OpenCode's login slot holds the placeholder while this store has
@@ -716,8 +718,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         message: VAULT_MODE_REFUSALS[cause],
       })
     }
-    if (accountId !== undefined && primary)
+    if (accountId !== undefined && primary) {
       rememberSessionAccount(input.sessionID, accountId)
+      deps.onRoute?.(input.sessionID, accountId, mode)
+    }
     log?.debug('pool account chosen', {
       kind: input.kind,
       accountId,

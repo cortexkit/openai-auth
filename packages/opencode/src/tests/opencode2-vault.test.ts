@@ -112,6 +112,7 @@ async function start(
   const host = fakeOpenCode2Host()
   const stop = await setupOpenAIAuth(host.ctx, {
     paths: files.paths,
+    sidebarStateFile: join(files.dir, 'sidebar.json'),
     slot: opencode1HostSlot(join(files.dir, 'auth.json')),
     fence: async () => ({ open: true }),
     heartbeat: false,
@@ -471,6 +472,7 @@ describe('vault accounts on OpenCode 2', () => {
     const starting = Date.now()
     const stop = await setupOpenAIAuth(host.ctx, {
       paths: files.paths,
+      sidebarStateFile: join(files.dir, 'sidebar.json'),
       slot: opencode1HostSlot(join(files.dir, 'auth.json')),
       fence: async () => ({ open: true }),
       heartbeat: false,
@@ -543,6 +545,7 @@ describe('vault accounts on OpenCode 2', () => {
     const host = fakeOpenCode2Host()
     const stop = await setupOpenAIAuth(host.ctx, {
       paths: files.paths,
+      sidebarStateFile: join(files.dir, 'sidebar.json'),
       slot: opencode1HostSlot(authPath),
       fence: async () => ({ open: true as const }),
       heartbeat: false,
