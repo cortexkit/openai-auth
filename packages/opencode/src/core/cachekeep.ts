@@ -376,20 +376,8 @@ export interface CacheKeepCredentialCheck {
   identity: string | undefined
 }
 
-export interface OpenAICacheKeepAdapterOptions {
+export interface OpenAICacheKeepAdapterBaseOptions {
   fetchImpl: typeof fetch
-  /** The main account's bearer; a throw (no token) backs the target off. */
-  getMainToken: (
-    target: CacheKeepTargetView<OpenAICacheKeepMeta>,
-  ) => Promise<CacheKeepFallbackAccess>
-  /**
-   * Resolve the local fallback row identified by `accountId` to a bearer for
-   * this replay. `onAuthFailure` handles a 401 on that resolved credential.
-   */
-  refreshFallback: (
-    accountId: string,
-    target: CacheKeepTargetView<OpenAICacheKeepMeta>,
-  ) => Promise<CacheKeepFallbackAccess>
   /**
    * Called with each warm's fresh credential just before the warm is sent.
    * A throw sends nothing and backs the target off, unless the callback has
@@ -409,10 +397,37 @@ export interface OpenAICacheKeepAdapterOptions {
    */
   activeAccount?: (
     routingSessionId: string | undefined,
-    target: CacheKeepTargetView<OpenAICacheKeepMeta>,
   ) => string | undefined | Promise<string | undefined>
   logger?: CacheKeepLogger
 }
+
+/**
+ * Where a local-mode warm gets its bearer: either OpenCode 1's pair, split by
+ * main account and fallback row, or one resolver that is given the whole
+ * target (OpenCode 2, whose targets carry the store that served them).
+ */
+export type CacheKeepLocalCredentialOptions =
+  | {
+      /** The main account's bearer; a throw (no token) backs the target off. */
+      getMainToken: () => Promise<string>
+      /**
+       * Resolve the local fallback row identified by `accountId` to a bearer for
+       * this replay. `onAuthFailure` handles a 401 on that resolved credential.
+       */
+      refreshFallback: (accountId: string) => Promise<CacheKeepFallbackAccess>
+      resolveLocal?: never
+    }
+  | {
+      getMainToken?: never
+      refreshFallback?: never
+      /** The bearer for the target's own account; a throw backs it off. */
+      resolveLocal: (
+        target: CacheKeepTargetView<OpenAICacheKeepMeta>,
+      ) => Promise<CacheKeepFallbackAccess>
+    }
+
+export type OpenAICacheKeepAdapterOptions = OpenAICacheKeepAdapterBaseOptions &
+  CacheKeepLocalCredentialOptions
 
 function identityOfToken(token: string): string | undefined {
   const claims = parseJwtClaims(token)
@@ -519,10 +534,11 @@ export function createOpenAICacheKeepAdapter(
       let accessToken: string
       let identity: string | undefined
       let onAuthFailure: ((status: number) => Promise<void>) | undefined
-      const resolved =
-        target.accountId && target.accountId !== 'main'
-          ? await options.refreshFallback(target.accountId, target)
-          : await options.getMainToken(target)
+      const resolved = options.resolveLocal
+        ? await options.resolveLocal(target)
+        : target.accountId && target.accountId !== 'main'
+          ? await options.refreshFallback(target.accountId)
+          : await options.getMainToken()
       if (typeof resolved === 'string') {
         accessToken = resolved
       } else {
@@ -568,7 +584,7 @@ export function createOpenAICacheKeepAdapter(
     ...(activeAccount
       ? {
           activeAccount: (_sessionKey, target) =>
-            activeAccount(target.meta.routingSessionId, target),
+            activeAccount(target.meta.routingSessionId),
         }
       : {}),
   }
@@ -585,8 +601,9 @@ export function createCacheKeepManager(
 ): OpenAICacheKeepManager {
   const {
     fetchImpl,
-    getMainToken,
-    refreshFallback,
+    getMainToken: _getMainToken,
+    refreshFallback: _refreshFallback,
+    resolveLocal: _resolveLocal,
     vault,
     codexResponsesUrl,
     activeAccount,
@@ -594,13 +611,19 @@ export function createCacheKeepManager(
     logger,
     ...managerOptions
   } = options
+  const local: CacheKeepLocalCredentialOptions =
+    options.resolveLocal !== undefined
+      ? { resolveLocal: options.resolveLocal }
+      : {
+          getMainToken: options.getMainToken,
+          refreshFallback: options.refreshFallback,
+        }
   return new CacheKeepManager<OpenAICacheKeepMeta>({
     ...managerOptions,
     logger,
     adapter: createOpenAICacheKeepAdapter({
       fetchImpl,
-      getMainToken,
-      refreshFallback,
+      ...local,
       vault,
       codexResponsesUrl,
       activeAccount,

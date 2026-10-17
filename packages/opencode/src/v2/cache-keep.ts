@@ -201,16 +201,17 @@ function createEntry(setup: CacheKeepManagerSetup): Entry {
     manager.remove(sessionKey)
     live()?.log?.debug(`cachekeep dropped target (${reason})`, { sessionKey })
   }
-  const localAccess = async (
-    accountId: string,
-    target: { meta: OpenAICacheKeepMeta },
-  ) => {
+  const localAccess = async (target: {
+    accountId: string | undefined
+    meta: OpenAICacheKeepMeta
+  }) => {
     // A target captured through the vault never reads a local token, even
     // when a pool row has the same id.
     if (target.meta.credentialMode !== 'local')
       throw new Error(
         'a target captured in vault mode is not warmed with a local credential',
       )
+    const accountId = target.accountId ?? 'main'
     const location = need()
     const access = await location.source.accessFor(
       accountId,
@@ -237,8 +238,7 @@ function createEntry(setup: CacheKeepManagerSetup): Entry {
     },
     getWindow: () => live()?.settings().window,
     getSustain: () => live()?.settings().sustain === true,
-    getMainToken: (target) => localAccess('main', target),
-    refreshFallback: (accountId, target) => localAccess(accountId, target),
+    resolveLocal: localAccess,
     vault: {
       owns: (routeId) => live()?.vault.owns(routeId) === true,
       authority: () => need().vault.authority(),
@@ -250,26 +250,34 @@ function createEntry(setup: CacheKeepManagerSetup): Entry {
         return location.vault.send(routeId, dispatch, options)
       },
     },
-    // Asked before every warm. Settings turned off since the capture, and a
-    // session with no recorded account, drop the target. Another account
-    // than the captured one drops it inside the manager.
-    activeAccount: (sessionID, target) => {
+    // Asked before every warm, with the host session id the target is keyed
+    // by. Settings turned off since the capture, and a session with no
+    // recorded account, drop the target. Another account than the captured
+    // one drops it inside the manager.
+    activeAccount: (sessionID) => {
+      // Every capture records its session; a target without one is never
+      // warmed on the captured account alone.
+      if (sessionID === undefined) throw new Error('target has no session')
       const location = live()
       const settings = location?.settings()
       if (!location || !settings?.enabled) {
-        drop(target.sessionKey, 'keep-warm is off')
+        drop(sessionID, 'keep-warm is off')
         return undefined
       }
-      if (target.isSubagent && !settings.subagents) {
-        drop(target.sessionKey, 'subagent warming is off')
+      if (
+        !settings.subagents &&
+        manager
+          .status()
+          .targets.some(
+            (target) => target.sessionKey === sessionID && target.isSubagent,
+          )
+      ) {
+        drop(sessionID, 'subagent warming is off')
         return undefined
       }
-      const active =
-        sessionID === undefined
-          ? undefined
-          : location.accounts.activeAccount(sessionID)
+      const active = location.accounts.activeAccount(sessionID)
       if (active === undefined) {
-        drop(target.sessionKey, 'no account recorded for the session')
+        drop(sessionID, 'no account recorded for the session')
         return undefined
       }
       return active
