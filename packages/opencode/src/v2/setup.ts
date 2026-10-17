@@ -150,9 +150,10 @@ export interface OpenAIAuthV2Options {
   /** Overrides the production menu for transport fixtures. */
   controlPlane?: ControlPlaneMenu
   /**
-   * The keep-warm manager's timer and the limit its last release waits for
-   * a warm in flight. Used only by the location that builds the store's
-   * manager; production uses the global timers and `CACHE_KEEP_JOIN_MS`.
+   * Test overrides for the keep-warm manager: its interval timer, and how
+   * long the last location's release waits for a warm request in flight.
+   * Only the location that builds the store's manager applies them;
+   * production uses the global timers and `CACHE_KEEP_JOIN_MS`.
    */
   cacheKeep?: Pick<
     CacheKeepManagerSetup,

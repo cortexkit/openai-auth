@@ -53,8 +53,9 @@ import type { OpenAIAttemptData } from './adapter'
 import type { ActiveAccounts } from './session-accounts'
 
 /**
- * The longest the last release waits for a warm in flight, matching the
- * five-second limit setup's shutdown already keeps.
+ * How long the last location to release keep-warm waits for a warm request
+ * still in flight. It equals the five-second limit setup's shutdown already
+ * keeps for its other background work.
  */
 export const CACHE_KEEP_JOIN_MS = 5_000
 
@@ -251,9 +252,10 @@ function createEntry(setup: CacheKeepManagerSetup): Entry {
       },
     },
     // Asked before every warm, with the host session id the target is keyed
-    // by. Settings turned off since the capture, and a session with no
-    // recorded account, drop the target. Another account than the captured
-    // one drops it inside the manager.
+    // by. The target is dropped, unsent, when keep-warm (or subagent warming,
+    // for a subagent) was turned off after its capture, or when the session
+    // has no recorded account. When the recorded account differs from the
+    // captured one, the manager itself drops the target.
     activeAccount: (sessionID) => {
       // Every capture records its session; a target without one is never
       // warmed on the captured account alone.
