@@ -4139,3 +4139,31 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-d
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode 2 ordinary dump write failure warns once without changing response$']
+
+[[control]]
+id = "opencode2-http-always-shapes-owned"
+guards = "owned HTTP requests get Codex metadata and body defaults even when effort, Lite and output caps change nothing"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = "  const headers = new Headers(request.headers)\n"
+new = "  if (!lite && body && !('reasoning' in body) && !('max_output_tokens' in body)) return undefined // NON-VACUITY BREAK\n  const headers = new Headers(request.headers)\n"
+test_file = "packages/opencode/src/tests/opencode2-http-shape.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sHTTP\\sshape\\salways\\sshapes\\san\\sowned\\srequest\\swithout\\seffort,\\sLite\\sor\\soutput-cap\\schanges$"]
+expect_message = "Received value must be a string: null"
+
+[[control]]
+id = "opencode2-handshake-keeps-host-session"
+guards = "HTTP thread session-id rewriting never reaches the WebSocket handshake, whose stable host id permits socket reuse"
+file = "packages/opencode/src/v2/setup.ts"
+old = "            if (name === 'experimental.ws.send') {"
+new = "            if (handshake) handshake.headers = { ...handshake.headers, 'session-id': 'wrong-thread-id' } // NON-VACUITY BREAK\n            if (name === 'experimental.ws.send') {"
+test_file = "packages/opencode/src/tests/opencode2-http-shape.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\sHTTP\\sshape\\skeeps\\sthe\\shandshake\\shost\\ssession\\sid\\swhile\\sHTTP\\suses\\sthe\\sthread\\sid\\sand\\sresponse\\sattribution\\ssurvives$"]
+expect_message = "wrong-thread-id"

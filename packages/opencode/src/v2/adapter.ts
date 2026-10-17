@@ -87,6 +87,7 @@ import {
 import { isNonEmittingFrame, parseRateLimitSignal } from '../ws'
 import {
   CODEX_CLIENT_HEADERS,
+  type CodexHttpState,
   MidConversationEffort,
   rewriteCodexFrame,
   rewriteCodexHttpRequest,
@@ -187,6 +188,7 @@ export type OpenAIAttemptData =
     }
 
 export interface OpenAIAdapterDeps {
+  codex?: CodexHttpState
   /** Projects a primary request's actual route without affecting account choice. */
   onRoute?: (sessionId: string, accountId: string, route: string) => void
   source: PoolAccess
@@ -372,7 +374,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   const now = deps.now ?? Date.now
   const log = deps.log
   const vault = deps.vault
-  const effort = new MidConversationEffort()
+  const effort = new MidConversationEffort(deps.codex)
   // Vault receipts authorized while choosing an account, kept until the
   // installer's `accountHeaders` call for the same session, request kind and
   // account (it follows `chooseAccount` at once) takes them.

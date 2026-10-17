@@ -200,14 +200,13 @@ describe('mid-conversation effort on WebSocket frames', () => {
 describe('mid-conversation effort and Responses Lite on HTTP', () => {
   it('carries the update on every request after a change, before the turn user message', async () => {
     const effort = new MidConversationEffort()
-    expect(
-      await rewriteCodexHttpRequest(
-        httpBody('low', [user('one')]),
-        SESSION,
-        effort,
-        false,
-      ),
-    ).toBe(undefined)
+    const first = await rewriteCodexHttpRequest(
+      httpBody('low', [user('one')]),
+      SESSION,
+      effort,
+      false,
+    )
+    expect((await first!.json()).reasoning.effort).toBe('low')
     const turn = await rewriteCodexHttpRequest(
       httpBody('high', [user('one'), assistant('a'), user('two')]),
       SESSION,
@@ -254,9 +253,13 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
         parallel_tool_calls: true,
       })
     const effort = new MidConversationEffort()
-    expect(
-      await rewriteCodexHttpRequest(request(), SESSION, effort, false),
-    ).toBe(undefined)
+    const standard = await rewriteCodexHttpRequest(
+      request(),
+      SESSION,
+      effort,
+      false,
+    )
+    expect(standard?.headers.get(RESPONSES_LITE_HEADER)).toBeNull()
     const lite = await rewriteCodexHttpRequest(request(), SESSION, effort, true)
     expect(lite?.headers.get(RESPONSES_LITE_HEADER)).toBe('true')
     const body = await lite?.json()
@@ -268,7 +271,7 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
       {
         type: 'additional_tools',
         role: 'developer',
-        tools: [{ type: 'function', name: 'x' }],
+        tools: [{ type: 'function', name: 'x', strict: false }],
       },
       {
         type: 'message',
@@ -278,14 +281,16 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
       user('one'),
     ])
     // A model not marked Lite keeps the standard shape.
-    expect(
-      await rewriteCodexHttpRequest(
-        httpBody('low', [user('one')], { model: 'gpt-5.5' }),
-        SESSION,
-        effort,
-        true,
-      ),
-    ).toBe(undefined)
+    const nonLite = await rewriteCodexHttpRequest(
+      httpBody('low', [user('one')], { model: 'gpt-5.5' }),
+      SESSION,
+      effort,
+      true,
+    )
+    expect(nonLite?.headers.get(RESPONSES_LITE_HEADER)).toBeNull()
+    expect((await nonLite!.json()).tools).toEqual([
+      { type: 'function', name: 'x', strict: false },
+    ])
   })
 
   it('leaves requests to other endpoints alone', async () => {

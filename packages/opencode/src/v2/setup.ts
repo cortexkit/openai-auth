@@ -124,6 +124,8 @@ const SETTLE_ON_DISPOSE_MS = 5_000
 
 /** Test and embedding seams; every field has a production default. */
 export interface OpenAIAuthV2Options {
+  /** Overrides HTTP identity and clock sources for deterministic wire fixtures. */
+  codex?: import('./codex-wire').CodexHttpState
   /** Binds this location's sidebar output; defaults to the shared sidebar state file. */
   sidebarStateFile?: string
   /**
@@ -227,6 +229,13 @@ async function installPoolHooks<Q, A>(
               if (owned && !(error instanceof OpenCode2AuthError))
                 throw redactCredentialError(error)
               throw error
+            }
+            if (request && owned && observation.attempt) {
+              // accountHeaders runs after the HTTP rewrite and restores the host
+              // session id. Keep the same Request object: installOpenCode2Auth
+              // uses its identity to attribute responses to the account attempt.
+              const threadID = request.request.headers.get('thread-id')
+              if (threadID) request.request.headers.set('session-id', threadID)
             }
             if (request && owned && observation.attempt)
               await dumps.captureHttp(request.request, observation.attempt)
@@ -570,6 +579,7 @@ export async function setupOpenAIAuth(
   // Disk publication must not hold up the host's location-ready lifecycle.
   void sidebar.publish()
   const openai = createOpenAIAdapter({
+    codex: options.codex,
     onRoute: sidebar.route,
     source,
     slotPlaceholderWithoutMain,

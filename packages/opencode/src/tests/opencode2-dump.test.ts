@@ -209,7 +209,9 @@ for (const status of [200, 400, 503]) {
       },
     })
     expect(record!.request.error).toBeUndefined()
-    expect(record!.body.tools).toEqual(JSON.parse(f.body).tools)
+    expect(record!.body.tools).toEqual([
+      { ...JSON.parse(f.body).tools[0], strict: false },
+    ])
     expect(record!.body.model).toBe('gpt-5.5')
     expect(statSync(f.dir).mode & 0o777).toBe(0o700)
     for (const name of readdirSync(f.dir))
@@ -415,7 +417,17 @@ test('OpenCode 2 dumps the rewritten body actually emitted over HTTP', async () 
     }),
   })
   const emitted = await draft.request.clone().json()
-  expect(emitted).toEqual({ model: 'gpt-5.5', input: [] })
+  const threadID = draft.request.headers.get('thread-id')
+  expect(emitted).toEqual({
+    model: 'gpt-5.5',
+    input: [],
+    parallel_tool_calls: true,
+    prompt_cache_key: threadID,
+    client_metadata: {
+      'x-codex-installation-id': expect.any(String),
+      'x-codex-window-id': `${threadID}:0`,
+    },
+  })
   await (await f.response(draft)).text()
   expect(f.records()).toHaveLength(1)
   expect(f.records()[0]!.body).toEqual(emitted)
