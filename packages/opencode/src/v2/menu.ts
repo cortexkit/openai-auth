@@ -29,6 +29,10 @@ function allowed(request: {
       return !item && request.actionId === 'clear-pin'
     case 'diagnostics':
       return !item && ['logging', 'dump'].includes(request.actionId)
+    case 'reset':
+      // Spend and retry still need `confirmed: true`, which the shared menu
+      // checks before it runs either one; preview spends nothing.
+      return item && ['preview', 'spend', 'retry'].includes(request.actionId)
     default:
       return false
   }
@@ -41,7 +45,7 @@ export function createControlPlaneMenu(
   const controls: OpenCodeMenuContext = {
     ...context,
     allowAction: allowed,
-    unavailableSections: ['cache', 'reset'],
+    unavailableSections: ['cache'],
   }
   return {
     open: (sessionId) => openOpenAiMenu(controls, sessionId),

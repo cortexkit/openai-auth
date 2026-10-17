@@ -14,7 +14,7 @@ test('OpenCode 2 docs offer log level changes and request dumps with their warni
   expect(menu).toContain('prompt and session content')
   expect(menu).toContain('Turn them off after debugging.')
   expect(menu).not.toContain('Turning request dumps on is not available yet.')
-  expect(menu).toContain('Cache and Reset credits show')
+  expect(menu).toContain('Cache shows')
   expect(menu).not.toContain('Cache, Diagnostics and Reset credits')
   expect(unavailable).not.toContain('request dumps')
   expect(unavailable).not.toContain('diagnostics actions')
@@ -22,7 +22,6 @@ test('OpenCode 2 docs offer log level changes and request dumps with their warni
     'vault enrollment and per-host account controls',
   )
   expect(unavailable).toContain('cache keep-warm')
-  expect(unavailable).toContain('reset-credit preview and redemption')
   for (const passage of [menu, unavailable])
     expect(passage).not.toMatch(
       /\.ts\b|allowed\(|unavailableSections|hook|test/,
@@ -55,5 +54,41 @@ test('OpenCode 2 docs describe the HTTP request shape as available and WebSocket
     for (const sentence of passage?.split(/(?<=\.)\s/) ?? [])
       if (sentence.includes('WebSocket'))
         expect(sentence).not.toMatch(/header|tool formatting|tool definitions/)
+  }
+})
+
+test('OpenCode 2 docs offer reset-credit preview and confirmed redemption, and no longer list them as unavailable', () => {
+  const doc = readFileSync(
+    new URL('../../../../docs/opencode-2.md', import.meta.url),
+    'utf8',
+  )
+  const menu = doc.split('## The `/openai` menu')[1]?.split('## Sidebar')[0]
+  const unavailable = doc.split('## Not on OpenCode 2 yet')[1]
+  const vault = menu
+    ?.split('\n')
+    .find((line) => line.startsWith('While connected to the'))
+  expect(menu).toContain('Diagnostics, Reset credits, This session and Vault')
+  expect(menu).toContain(
+    "preview an account's [reset credits](accounts-and-routing.md#reset-credits), spend one or retry the last redemption",
+  )
+  expect(menu).toContain('and spends nothing')
+  expect(menu).toContain('spent only after you confirm it')
+  expect(vault).toContain('Reset credits works only with local accounts')
+  expect(vault).toContain('Cache shows "Not available on OpenCode 2 yet."')
+  expect(unavailable).not.toMatch(/reset.credit|redemption/i)
+  // Vault enrollment, per-host vault account controls and keep-warm are
+  // still listed as not on OpenCode 2.
+  expect(unavailable).toContain(
+    'vault enrollment and per-host account controls',
+  )
+  expect(unavailable).toContain('cache keep-warm')
+  for (const passage of [menu, unavailable]) {
+    expect(passage).not.toMatch(
+      /\.ts\b|\.json\b|allowed\(|unavailableSections|hook|test/,
+    )
+    // No sentence may call reset credits unavailable on OpenCode 2.
+    for (const sentence of passage?.split(/(?<=\.)\s/) ?? [])
+      if (/reset credit/i.test(sentence))
+        expect(sentence).not.toMatch(/not available|not implemented/i)
   }
 })

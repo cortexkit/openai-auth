@@ -4263,8 +4263,8 @@ expect_red = ['^OpenCode 2 rejects all non-control engine rows in local mode$']
 id = "opencode2-diagnostics-visible"
 guards = "Diagnostics exposes the shared section once log level changes are available"
 file = "packages/opencode/src/v2/menu.ts"
-old = "    unavailableSections: ['cache', 'reset'],"
-new = "    unavailableSections: ['cache', 'diagnostics', 'reset'], // NON-VACUITY BREAK"
+old = "    unavailableSections: ['cache'],"
+new = "    unavailableSections: ['cache', 'diagnostics'], // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
@@ -4528,3 +4528,120 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-r
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credits.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode 2 reset quota re-check and quota view omits the applicable count when the last poll carried none, and never shows the available count in its place$']
+
+[[control]]
+id = "opencode2-reset-preview-capability"
+guards = "OpenCode 2 admits Preview on one reset-credit account"
+file = "packages/opencode/src/v2/menu.ts"
+old = "      return item && ['preview', 'spend', 'retry'].includes(request.actionId)"
+new = "      return item && ['spend', 'retry'].includes(request.actionId) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\smenu\sPreview\sshows\sthe\sbalance\sand\seligibility\sof\san\sexhausted\saccount\sand\sspends\snothing$']
+
+[[control]]
+id = "opencode2-reset-spend-capability"
+guards = "OpenCode 2 admits a confirmed Spend on one reset-credit account"
+file = "packages/opencode/src/v2/menu.ts"
+old = "      return item && ['preview', 'spend', 'retry'].includes(request.actionId)"
+new = "      return item && ['preview', 'retry'].includes(request.actionId) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\sredemption\sa\sconfirmed\sSpend\sredeems\son\sthe\schosen\saccount,\sverifies\sthe\swindow\sand\sreports\sthe\sremaining\scredits$']
+
+[[control]]
+id = "opencode2-reset-retry-capability"
+guards = "OpenCode 2 admits a confirmed Retry on one reset-credit account"
+file = "packages/opencode/src/v2/menu.ts"
+old = "      return item && ['preview', 'spend', 'retry'].includes(request.actionId)"
+new = "      return item && ['preview', 'spend'].includes(request.actionId) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\sredemption\san\sunknown\soutcome\skeeps\sits\spair,\sand\sRetry\sand\sSpend\sreplay\sthe\ssame\sids$']
+
+[[control]]
+id = "opencode2-reset-item-actions-only"
+guards = "OpenCode 2 refuses every reset request but Preview, Spend and Retry on one account, including one without an account"
+file = "packages/opencode/src/v2/menu.ts"
+old = "      return item && ['preview', 'spend', 'retry'].includes(request.actionId)"
+new = "      return ['preview', 'spend', 'retry', 'unknown', 'redeem', ''].includes(request.actionId) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\smenu\sreset\srequests\sother\sthan\sPreview,\sSpend\sand\sRetry\son\sone\saccount\sare\srefused$']
+
+[[control]]
+id = "opencode2-reset-visible"
+guards = "OpenCode 2 shows the Reset credits section with its accounts and actions once its actions are admitted"
+file = "packages/opencode/src/v2/menu.ts"
+old = "    unavailableSections: ['cache'],"
+new = "    unavailableSections: ['cache', 'reset'], // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\smenu\sopening\s/openai\slists\smain\sand\seach\senabled\saccount\swith\sPreview,\sSpend\sand\sRetry,\sand\sspends\snothing$']
+
+[[control]]
+id = "opencode2-reset-unconfirmed-never-spends"
+guards = "an OpenCode 2 Spend or Retry applied without confirmed: true never reaches the redemption"
+file = "packages/opencode/src/v2/menu.ts"
+old = "        ...(request.confirmed === true ? { confirmed: true } : {}),"
+new = "        confirmed: true, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\smenu\sSpend\sand\sRetry\swithout\sconfirmation\snever\sreach\sthe\sredemption$']
+
+[[control]]
+id = "opencode2-reset-preview-spends-nothing"
+guards = "Preview of a reset-credit account on OpenCode 2 spends nothing"
+file = "packages/core/src/commands.ts"
+old = "              const row = await buildResetPreviewRow(accountKey, deps)"
+new = "              await spendResetCredit(deps, accountKey, false) // NON-VACUITY BREAK\n              const row = await buildResetPreviewRow(accountKey, deps)"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\smenu\sPreview\sshows\sthe\sbalance\sand\seligibility\sof\san\sexhausted\saccount\sand\sspends\snothing$']
+
+[[control]]
+id = "opencode2-reset-open-spends-nothing"
+guards = "opening /openai on OpenCode 2 spends no reset credit"
+file = "packages/core/src/commands.ts"
+old = "      items: (await deps.accountKeys()).map((accountKey) => ({"
+new = "      items: (await Promise.all((await deps.accountKeys()).map(async (key) => (await spendResetCredit(deps, key, false), key)))).map((accountKey) => ({ // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\smenu\sopening\s/openai\slists\smain\sand\seach\senabled\saccount\swith\sPreview,\sSpend\sand\sRetry,\sand\sspends\snothing$']
+
+[[control]]
+id = "opencode2-vault-reset-refusal"
+guards = "in vault mode OpenCode 2 refuses reset actions with the vault refusal, not as unavailable"
+file = "packages/core/src/vault-command-menu.ts"
+old = "          request.sectionId === 'reset' ||"
+new = "          false || // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sreset\scredits\sin\svault\smode\sReset\scredits\sshows\sthe\svault\snote,\sand\severy\saction\sis\srefused\swithout\sreading\sa\scredential$']
