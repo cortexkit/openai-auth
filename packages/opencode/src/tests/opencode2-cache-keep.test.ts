@@ -541,6 +541,18 @@ describe('OpenCode 2 keep-warm credentials', () => {
     expect(fake.state.accessReads).toBe(0)
   })
 
+  test('a local capture is never warmed with a vault receipt, even for a vault route with the same id', async () => {
+    const fake = served()
+    const { lease, clock } = acquire(fake.location)
+    await lease.capture(captured('ses'))
+    fake.state.authority = 'vault'
+    fake.state.owned.add('A')
+    fake.state.receiptIdentity.set('A', 'chatgpt-A')
+    await advance(lease, clock, 4 * MINUTE)
+    expect(fake.sent).toHaveLength(0)
+    expect(lease.manager.status().targets[0]!.failures).toBe(1)
+  })
+
   for (const owned of [false, true]) {
     test(`after disconnecting, a vault capture sends nothing and backs off (route ${owned ? 'still' : 'no longer'} listed); a local capture warms`, async () => {
       const fake = served()
