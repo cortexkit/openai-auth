@@ -54,6 +54,7 @@ import { observationFromSnapshot } from './pool-quota'
 import type { QuotaReadingRequest } from './pool-routing'
 import { whamUsageFn } from './provider'
 import { errorMessage } from './util/error'
+import { VAULT_EMPTY_ACCESS_HINT } from './vault-messages'
 
 const log = createLogger('vault')
 
@@ -943,7 +944,7 @@ export function vaultConnectOutcome(
       const accounts = vault.snapshot()?.rows.length ?? 0
       return {
         ok: true,
-        text: `Connected: the vault approved ${vault.name}. It serves ${accounts} OpenAI account${accounts === 1 ? '' : 's'} to this host${accounts === 0 ? ' (grant it the openai-native category with `ck auth grant` to add some)' : ''}.`,
+        text: `Connected: the vault approved ${vault.name}. It serves ${accounts} OpenAI account${accounts === 1 ? '' : 's'} to this host${accounts === 0 ? `. ${VAULT_EMPTY_ACCESS_HINT}` : '.'}`,
       }
     }
     case 'denied':

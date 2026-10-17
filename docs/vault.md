@@ -15,6 +15,8 @@ and let it read your OpenAI accounts with:
   ck auth grant --principal enrolled:openai-auth-opencode --selector-kind category --selector openai-native --operation read
 ```
 
+The grant reaches only vault logins that carry the `openai-native` category, for both `openai-auth-opencode` and `openai-auth-pi`. Check the CATEGORIES column with `ck auth status`, and add the category to each ChatGPT login that lacks it with `ck auth set-category <credential-id> --add openai-native`.
+
 Pi's commands identify its separate enrollment, `openai-auth-pi`, instead of OpenCode's. Pi reports when the vault owner approves its request.
 
 After approval, the vault issues a token authorizing OpenCode or Pi to use the vault, not a ChatGPT login. It is stored owner-only in `openai-auth-vault/` next to the account state file. **Disconnect** removes the local token and enrollment-state file, not the vault's accounts or approved enrollment. OpenCode 1 and 2 share this connection, so disconnecting OpenCode affects both; disconnecting Pi affects only Pi.

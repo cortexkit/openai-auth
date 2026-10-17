@@ -72,6 +72,7 @@ import {
   vaultAccountName,
 } from './vault-account-menu'
 import { createVaultCommandMenu, menuStore } from './vault-command-menu'
+import { VAULT_EMPTY_ACCESS_HINT } from './vault-messages'
 
 /** The one slash command, without the slash. */
 export const OPENAI_COMMAND_NAME = 'openai'
@@ -741,7 +742,7 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
           ...(connected
             ? [
                 status.accounts.length === 0
-                  ? 'The vault serves no OpenAI account to this host yet.'
+                  ? VAULT_EMPTY_ACCESS_HINT
                   : `The vault serves ${status.accounts.length} OpenAI account${status.accounts.length === 1 ? '' : 's'}; ${routing} can route now.`,
               ]
             : []),
