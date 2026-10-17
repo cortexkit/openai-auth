@@ -281,6 +281,7 @@ export type PoolSeedRow = {
 }
 
 export type RoutingModeSeed =
+  | 'ordered'
   | 'main-first'
   | 'fallback-first'
   | 'sticky-balanced'

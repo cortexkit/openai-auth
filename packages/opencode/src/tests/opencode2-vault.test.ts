@@ -95,6 +95,7 @@ async function start(
     waitForQuota?: boolean
     /** Runs the pool lifecycle (migration, then adoptions of slot logins). */
     poolMigration?: boolean
+    reverseVaultRoster?: boolean
   } = {},
 ) {
   const files = poolFiles()
@@ -158,6 +159,19 @@ async function start(
           rows.some((row) => row.credentialId === id && row.quota),
         )
       }, 'the live vault accounts and their quota')
+    if (options.reverseVaultRoster) {
+      // Vault discovery sorts credentials by name; reverse the live roster
+      // so main-first must move the default account rather than inherit first place.
+      const routes = observer.vault.routes.bind(observer.vault)
+      const ordered = spyOn(observer.vault, 'routes').mockImplementation(() =>
+        routes().reverse(),
+      )
+      cleanups.push(() => ordered.mockRestore())
+      expect(observer.vault.routes().map((row) => row.credentialId)).toEqual([
+        'chatgpt:openai:work',
+        'chatgpt:openai',
+      ])
+    }
   } finally {
     observer.release()
   }
@@ -316,6 +330,37 @@ describe('vault accounts on OpenCode 2', () => {
       'private-vault@example.test',
     ])
       expect(text).not.toContain(secret)
+  })
+
+  it('main-first places the default vault account first and fallback-first places it last', async () => {
+    for (const mode of ['main-first', 'fallback-first'] as const) {
+      const credentials = {
+        'chatgpt:openai': vaultLogin('chatgpt-default'),
+        'chatgpt:openai:work': vaultLogin('chatgpt-work'),
+      }
+      const { host } = await start(mode, [{ id: 'main' }], credentials, {
+        reverseVaultRoster: mode === 'main-first',
+      })
+      const headers = await send(host, 200)
+      expect(headers.get('authorization')).toBe(
+        `Bearer ${chatgptAccessToken(mode === 'main-first' ? 'chatgpt-default' : 'chatgpt-work')}`,
+      )
+      expect(headers.get('chatgpt-account-id')).toBe(
+        mode === 'main-first' ? 'chatgpt-default' : 'chatgpt-work',
+      )
+    }
+  })
+
+  it('alias-only vault placements keep Ordered order and never serve the local main', async () => {
+    for (const mode of ['ordered', 'main-first', 'fallback-first'] as const) {
+      const { host } = await start(mode, [{ id: 'main' }], {
+        'chatgpt:openai:work': vaultLogin('chatgpt-work'),
+        'chatgpt:openai:home': vaultLogin('chatgpt-home'),
+      })
+      expect((await send(host, 200)).get('authorization')).toBe(
+        `Bearer ${chatgptAccessToken('chatgpt-home')}`,
+      )
+    }
   })
 
   it('the original request joins a pending first vault quota poll and serves without a retry', async () => {

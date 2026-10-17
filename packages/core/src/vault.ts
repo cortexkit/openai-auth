@@ -168,6 +168,8 @@ export function vaultIdentityOf(accessToken: string): string | undefined {
 /** One vault account as routing sees it. */
 export interface VaultRoute {
   id: string
+  /** The vault credential name, distinct from its stable routing id. */
+  credentialId?: string
   kind: 'oauth' | 'api-key'
   /** The ChatGPT account it signs in as, when the vault knows it. */
   identity?: string
@@ -485,6 +487,7 @@ export class OpenAiVault {
       const identity = rows.get(routing.id)?.accountIdentity
       return {
         id: routing.id,
+        credentialId: rows.get(routing.id)?.credentialId,
         kind: routing.kind === 'api-key' ? 'api-key' : 'oauth',
         ...(identity !== undefined ? { identity } : {}),
         ...(routing.quota !== undefined ? { quota: routing.quota } : {}),

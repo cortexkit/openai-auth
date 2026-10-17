@@ -23,7 +23,7 @@
 //   survives its first stage. Rows refused for UNKNOWN quota never take the
 //   last path: unknown quota blocks.
 // - The no-replay gate. A request that cannot be sent twice goes to one
-//   account only, row `main`, and is never retried on another: a second send
+//   account only (main when present), and is never retried on another: a second send
 //   could repeat work the provider already did. The host decides what is
 //   replayable: OpenCode marks anything but a buffered POST to `/responses`
 //   as not replayable; Pi sends a request again only after its first attempt
@@ -53,11 +53,28 @@ import {
 import { windowsFromQuotaMap } from './pool-quota'
 
 /**
- * The main account's row: on OpenCode the row the migration moved the main
- * account into, on Pi the id Pi's own login is routed under. First in
- * main-first, last in fallback-first.
+ * The local main account's row: OpenCode keeps its initial login in pool row
+ * `main`; Pi routes its own login under the same id. Ordered routing tries
+ * this row first in main-first mode, last in fallback-first mode.
  */
 export const FORMER_MAIN_ID = 'main'
+
+/**
+ * Only the vault credential named exactly `chatgpt:openai` plays main. Route
+ * ids may include a vault-generated suffix, so use the credential name rather
+ * than guessing from the route id. Null means no main, never a local row.
+ */
+export function vaultMainRouteId(
+  routes: readonly { id: string; credentialId?: string }[],
+): string | null {
+  return (
+    routes.find(
+      (route) =>
+        route.id.startsWith('vault:') &&
+        route.credentialId === 'chatgpt:openai',
+    )?.id ?? null
+  )
+}
 
 /**
  * Per-account verdicts for the killswitch: the opt-in minimum share of quota
@@ -99,10 +116,9 @@ export const POOL_QUOTA_UNKNOWN_RETRY_SECONDS = 5
 export const FIRST_QUOTA_READING_WAIT_MS = 5_000
 
 /**
- * Where an ordered routing mode puts the main row: `ordered` (the shared
- * menu's name for plain roster order) keeps the roster order, `fallback-first`
- * puts row `main` last, and anything else (`main-first`, or a value an older
- * reader wrote) puts it first.
+ * Translate a configured mode to account try order. `ordered` keeps roster
+ * order; `fallback-first` puts main last. `main-first` and missing or
+ * unrecognized values put main first.
  */
 export function orderedPlacement(
   mode: string | undefined,
@@ -244,23 +260,27 @@ function routeBlock(
 
 /**
  * The accounts to try, in order, for the ordered modes. `placement` keeps
- * the roster order (`roster`) or puts row `main` first or last; a request
- * that cannot be replayed always goes to row `main` alone.
+ * the roster order (`roster`) or puts the main account first or last; a request
+ * that cannot be replayed goes to main alone when present.
  */
 export function planOrdered(
   input: PoolRoutingInput & {
     /** `roster` keeps the roster order (the menu's `ordered` mode). */
     placement: OrderedPlacement
+    /** Local callers omit this to use row `main`; vault callers pass vaultMainRouteId, including null when absent. */
+    mainId?: string | null
     /** False sends the request to one account only (see the no-replay gate); unset means true. */
     replayable?: boolean
   },
 ): OrderedPlan {
   const replayable = input.replayable !== false
+  const mainId =
+    input.mainId === undefined ? FORMER_MAIN_ID : (input.mainId ?? '')
   const placement = replayable ? input.placement : 'main-first'
   const route = routeOrdered({
     rows: input.rows,
     placement,
-    formerMainId: FORMER_MAIN_ID,
+    formerMainId: mainId,
     killswitch: input.killswitch,
     rateLimitMarks: input.rateLimitMarks,
     refreshBackoff: input.refreshBackoff,
@@ -270,7 +290,7 @@ export function planOrdered(
   const ids = orderForPlacement(
     input.rows.map((row) => row.id),
     placement,
-    FORMER_MAIN_ID,
+    mainId,
   )
   const confirmed = new Set(
     route.admission.refused
@@ -284,8 +304,8 @@ export function planOrdered(
   const lastPath = ids.filter((id) => confirmed.has(id))
 
   if (!replayable) {
-    const hasMain = ids.includes(FORMER_MAIN_ID)
-    const target = hasMain ? FORMER_MAIN_ID : (route.order[0] ?? lastPath[0])
+    const hasMain = ids.includes(mainId)
+    const target = hasMain ? mainId : (route.order[0] ?? lastPath[0])
     if (target !== undefined && route.order.includes(target))
       return { kind: 'send', order: [target], lastPath: false }
     if (target !== undefined && confirmed.has(target))
@@ -293,7 +313,7 @@ export function planOrdered(
     return {
       kind: 'block',
       block: hasMain
-        ? blockFor(FORMER_MAIN_ID, route.admission, input.killswitch)
+        ? blockFor(mainId, route.admission, input.killswitch)
         : routeBlock(ids, route.admission, input.killswitch),
     }
   }

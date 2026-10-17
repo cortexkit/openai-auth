@@ -65,6 +65,8 @@ describe('the request path in vault mode', () => {
   async function serve(
     vault: PoolVaultRoutes,
     storage: AccountStorage | null = null,
+    mode: PoolRequestContext['mode'] = 'fallback-first',
+    status = 200,
   ) {
     seedPool({ configFile: paths.configPath, stateFile: paths.statePath }, [
       { id: 'main', quota: quotaMap(10) },
@@ -84,14 +86,14 @@ describe('the request path in vault mode', () => {
       source,
       vault,
       storage,
-      mode: 'fallback-first',
+      mode,
       sessionId: undefined,
       body: '{}',
       replayable: true,
       now: Date.now,
       send: async (target, token) => {
         sent.push(`${target.id}:${token}`)
-        return new Response('ok')
+        return new Response('ok', { status })
       },
       recordQuota: () => {},
       placePin: () => undefined,
@@ -124,6 +126,46 @@ describe('the request path in vault mode', () => {
       requestReading: () => {},
     }
   }
+
+  it('main-first places the default vault account first and fallback-first places it last', async () => {
+    const main = {
+      id: 'vault:chatgpt:openai~default',
+      credentialId: 'chatgpt:openai',
+      kind: 'oauth' as const,
+      quota: quotaMap(10),
+    }
+    const alias = {
+      id: 'vault:chatgpt:openai:work~alias',
+      credentialId: 'chatgpt:openai:work',
+      kind: 'oauth' as const,
+      quota: quotaMap(10),
+    }
+    const first = await serve(vaultWith([alias, main]), null, 'main-first')
+    expect(first.result.servedId).toBe(main.id)
+    expect(first.sent).toEqual([`${main.id}:vault-token-${main.id}`])
+    const last = await serve(
+      vaultWith([main, alias]),
+      null,
+      'fallback-first',
+      429,
+    )
+    expect(last.sent).toEqual([
+      `${alias.id}:vault-token-${alias.id}`,
+      `${main.id}:vault-token-${main.id}`,
+    ])
+    expect(last.result.servedId).toBe(main.id)
+  })
+
+  it('alias-only vault placements keep Ordered order and never serve the local main', async () => {
+    const routes = [
+      'vault:chatgpt:openai:work',
+      'vault:chatgpt:openai:home',
+    ].map((id) => ({ id, kind: 'oauth' as const, quota: quotaMap(10) }))
+    for (const mode of ['ordered', 'main-first', 'fallback-first'] as const) {
+      const { sent } = await serve(vaultWith(routes), null, mode, 429)
+      expect(sent).toEqual(routes.map(({ id }) => `${id}:vault-token-${id}`))
+    }
+  })
 
   it('an unshadowed local row never routes in vault mode: only vault accounts are candidates', async () => {
     const { result, sent } = await serve(
@@ -244,6 +286,61 @@ describe('the sidebar file in vault mode', () => {
       ...extra,
     }
   }
+
+  it('predicts the default vault placement for new sessions and preserves route ids through the state file', async () => {
+    const file = join(dir, 'sidebar.json')
+    const rows = [
+      row('work'),
+      row('default', { credentialId: 'chatgpt:openai' }),
+      row('home'),
+    ]
+    for (const mode of [
+      'main-first',
+      'fallback-first',
+      'ordered',
+      'sticky-balanced',
+    ] as const) {
+      await setSidebarMachineState(
+        buildVaultSidebarMachineState(
+          rows,
+          new Set(rows.map((entry) => entry.routeId)),
+          { routing: { mode } },
+          Date.now(),
+        ),
+        file,
+      )
+      const state = await getSidebarState(file)
+      const expected = mode === 'main-first' ? 'vault:default' : 'vault:work'
+      expect(resolveSessionSidebarRouting(state, 'new-session').activeId).toBe(
+        expected,
+      )
+      expect(resolveSessionSidebarRouting(state).activeId).toBe(expected)
+      expect(resolveActiveAccount(state).id).toBe(expected)
+      expect(
+        resolveSessionSidebarRouting({ ...state, activeId: 'vault:home' })
+          .activeId,
+      ).toBe('vault:home')
+      expect(state.vaultAccounts?.map((entry) => entry.id)).toEqual(
+        rows.map((entry) => entry.routeId),
+      )
+    }
+    for (const mode of ['main-first', 'fallback-first'] as const) {
+      const aliases = [row('work'), row('home')]
+      const state = {
+        ...DEFAULT_SIDEBAR_STATE,
+        ...buildVaultSidebarMachineState(
+          aliases,
+          new Set(aliases.map((entry) => entry.routeId)),
+          { routing: { mode } },
+          Date.now(),
+        ),
+      }
+      expect(resolveSessionSidebarRouting(state, 'new-session').activeId).toBe(
+        'vault:work',
+      )
+      expect(resolveActiveAccount(state).id).toBe('vault:work')
+    }
+  })
 
   it('lists the vault accounts by email, else vault label, with no local account in the fields an older reader shows', async () => {
     const file = join(dir, 'sidebar.json')

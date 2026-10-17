@@ -62,6 +62,7 @@ import {
   type StickyRouteOptions,
   selectStickyRow,
   stickyBreak,
+  vaultMainRouteId,
   waitForFirstQuotaReading,
 } from './pool-routing'
 
@@ -109,6 +110,7 @@ export interface PoolVaultRoutes {
   /** The vault accounts that may route now. */
   routes(): ReadonlyArray<{
     id: string
+    credentialId?: string
     kind: 'oauth' | 'api-key'
     identity?: string
     quota?: unknown
@@ -407,6 +409,11 @@ async function serveOrdered(
   const plan = planOrdered({
     ...routingInput(ctx, rows),
     placement,
+    mainId: ctx.vault
+      ? ctx.mode === 'sticky-balanced'
+        ? null
+        : vaultMainRouteId(ctx.vault.routes())
+      : undefined,
     replayable: ctx.replayable,
   })
   if (plan.kind === 'block') {

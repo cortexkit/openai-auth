@@ -4,6 +4,11 @@ import {
   projectQuota,
   quotaWindowName,
 } from '@cortexkit/common-auth/quota'
+import { orderForPlacement } from '@cortexkit/common-auth/routing'
+import {
+  orderedPlacement,
+  vaultMainRouteId,
+} from '@cortexkit/openai-auth-core/pool-routing'
 
 export interface QuotaWindow {
   usedPercent: number
@@ -87,6 +92,8 @@ export function getPresentQuotaWindows(
 
 export interface SidebarAccountState {
   id: string
+  /** Vault credential name, used only to identify its default OpenAI account. */
+  credentialId?: string
   label: string | undefined
   /** ChatGPT identity of the account this quota belongs to. */
   accountId?: string
@@ -458,6 +465,9 @@ function normalizeAccountList(raw: unknown): SidebarAccountState[] {
     )
     .map((e) => ({
       id: e.id as string,
+      ...(typeof e.credentialId === 'string'
+        ? { credentialId: e.credentialId }
+        : {}),
       label: typeof e.label === 'string' ? e.label : undefined,
       ...(typeof e.accountId === 'string' ? { accountId: e.accountId } : {}),
       quota: ('quota' in e ? e.quota : null) as AccountQuota | null,
@@ -618,7 +628,14 @@ export function resolveSessionSidebarRouting(
   now = Date.now(),
 ): { activeId: string; route: string } {
   if (!sessionId) {
-    return { activeId: state.activeId ?? 'main', route: state.route }
+    if (state.vaultAccounts === undefined)
+      return { activeId: state.activeId ?? 'main', route: state.route }
+    const active = state.vaultAccounts.find(
+      (account) =>
+        account.id === state.activeId && account.enabled && !account.killed,
+    )
+    if (active && !isQuotaExhausted(active.quota, now))
+      return { activeId: active.id, route: state.route }
   }
   const own = sessionId ? state.activeRouting?.[sessionId] : undefined
   const accounts = routingAccountsOf(state)
@@ -639,11 +656,11 @@ export function resolveSessionSidebarRouting(
     return { activeId: stickyAccountId, route: state.route }
   }
 
-  // In vault mode there is no main: the first vault account that can serve
-  // is shown as the one a new request would most likely use.
+  // A session with no recorded route shows the first usable account in the
+  // configured routing mode, including the vault default's first/last role.
   const vaultMode = state.vaultAccounts !== undefined
   const enabledFallbacks = (
-    vaultMode ? (state.vaultAccounts ?? []) : state.fallbacks
+    vaultMode ? vaultAccountsInPlacementOrder(state) : state.fallbacks
   ).filter((account) => account.enabled && !account.killed)
   const fallback =
     enabledFallbacks.find((account) => !isQuotaExhausted(account.quota, now)) ??
@@ -655,6 +672,23 @@ export function resolveSessionSidebarRouting(
         : 'main',
     route: state.route,
   }
+}
+
+function vaultAccountsInPlacementOrder(
+  state: SidebarState,
+): SidebarAccountState[] {
+  const accounts = state.vaultAccounts ?? []
+  const byId = new Map(accounts.map((account) => [account.id, account]))
+  return orderForPlacement(
+    accounts.map((account) => account.id),
+    state.route === 'sticky-balanced'
+      ? 'roster'
+      : orderedPlacement(state.route),
+    vaultMainRouteId(accounts) ?? '',
+  ).flatMap((id) => {
+    const account = byId.get(id)
+    return account ? [account] : []
+  })
 }
 
 export function pruneActiveRouting(
@@ -2022,8 +2056,11 @@ export function resolveActiveAccount(state: SidebarState): {
 } {
   const activeId = state.activeId
   if (state.vaultAccounts !== undefined) {
-    // Vault mode: the active account is a vault account; there is no main.
-    const enabled = state.vaultAccounts.filter((account) => account.enabled)
+    // Choose by the configured first/last placement, but keep the vault route
+    // id so the active account still matches its quota and session records.
+    const enabled = vaultAccountsInPlacementOrder(state).filter(
+      (account) => account.enabled,
+    )
     const vaultAccount =
       enabled.find((account) => account.id === activeId) ?? enabled[0]
     return vaultAccount

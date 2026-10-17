@@ -157,6 +157,92 @@ async function sections(connected = true) {
 }
 
 describe('vault command menu', () => {
+  test('Routing shows the default vault account placement without renaming any route', async () => {
+    roster[1]!.credentialId = 'chatgpt:openai'
+    const menu = createOpenCodeMenu(context())
+    for (const mode of ['main-first', 'fallback-first', 'ordered'] as const) {
+      expect(
+        (
+          await menu.apply(
+            {
+              command: 'openai',
+              sectionId: 'routing',
+              actionId: 'mode',
+              values: { mode },
+            },
+            invocation,
+          )
+        ).ok,
+      ).toBe(true)
+      const routing = (await menu.open(invocation)).menu.sections.find(
+        (section) => section.id === 'routing',
+      )!
+      expect(routing.lines).toContain(
+        'Roster order: vault:chatgpt-main, vault:chatgpt-ufuk, vault:chatgpt-live',
+      )
+      if (mode !== 'ordered')
+        expect(routing.lines).toContain(
+          mode === 'main-first'
+            ? 'Tried in order: vault:chatgpt-ufuk, vault:chatgpt-main, vault:chatgpt-live'
+            : 'Tried in order: vault:chatgpt-main, vault:chatgpt-live, vault:chatgpt-ufuk',
+        )
+      expect(routing.lines).not.toContain(
+        'No default vault account, so this mode orders like Ordered',
+      )
+      const v2 = await createOpenCodeMenu({
+        ...context(),
+        readOnly: true,
+      }).open(invocation)
+      expect(
+        v2.menu.sections.find((section) => section.id === 'routing')!.lines,
+      ).toEqual(routing.lines)
+    }
+  })
+
+  test('Routing explains alias-only placement modes but not Ordered or sticky-balanced', async () => {
+    const menu = createOpenCodeMenu(context())
+    for (const mode of [
+      'main-first',
+      'fallback-first',
+      'ordered',
+      'sticky-balanced',
+    ] as const) {
+      await menu.apply(
+        {
+          command: 'openai',
+          sectionId: 'routing',
+          actionId: 'mode',
+          values: { mode },
+        },
+        invocation,
+      )
+      const routing = (await menu.open(invocation)).menu.sections.find(
+        (section) => section.id === 'routing',
+      )!
+      expect(
+        routing.lines.includes(
+          'No default vault account, so this mode orders like Ordered',
+        ),
+      ).toBe(mode === 'main-first' || mode === 'fallback-first')
+      expect(
+        routing.lines.some((line) => line.startsWith('Tried in order:')),
+      ).toBe(false)
+      const v2 = await createOpenCodeMenu({
+        ...context(),
+        readOnly: true,
+      }).open(invocation)
+      expect(
+        v2.menu.sections.find((section) => section.id === 'routing')!.lines,
+      ).toEqual(routing.lines)
+    }
+    expect(
+      (await sections(false)).find((section) => section.id === 'routing')!
+        .lines,
+    ).not.toContain(
+      'No default vault account, so this mode orders like Ordered',
+    )
+  })
+
   test('dialog quota text matches the shared formatter and each row checks only its account', async () => {
     roster[0]!.email = 'known@example.com'
     const quota = (await sections()).find((section) => section.id === 'quota')!

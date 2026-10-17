@@ -41,6 +41,8 @@ The Routing section of `/openai` sets the routing mode and account order:
 | `fallback-first` | Try usable fallback accounts first (preserving the main account's quota), and fall through to the main account only if no fallback can serve. |
 | `sticky-balanced` | For a session with no pin, choose the account with the lowest projected pressure: estimated request load relative to available quota capacity. Keep that assignment. |
 
+In vault mode, **main** means the vault's default OpenAI account: the credential named exactly `chatgpt:openai`, without an alias suffix. **Main first** tries that account first; **Fallback first** tries it last. No local login is used. If the vault has only aliased accounts, both modes use roster order like **Ordered**, and Routing explains that there is no default vault account. Sticky balanced is unchanged. Account order is managed in the vault while connected.
+
 ### Sticky-balanced
 
 `sticky-balanced` does not rebalance just to even out usage. Confirmed quota exhaustion, a [killswitch block](#killswitch), or a permanent authentication failure (`401`/`403`) can move the pin. Transient failures and stale or unknown quota keep the pin. A `429` without confirmed exhaustion is returned to OpenCode; the next request stays on the same account, without a timed pause imposed by the plugin. This keeps the session's continuation and prompt cache on their original account.
@@ -74,7 +76,7 @@ The Reset credits section of `/openai` previews an account, spends one rate-limi
 
 On Pi, every request goes out with one account's token, chosen by the [routing mode](#routing):
 
-- `main-first` tries your Pi login first, then the fallbacks in order; `fallback-first` tries the fallbacks first and your Pi login last. When an account answers with a rate-limit or authentication error before anything was streamed, the next account in the routing order is tried.
+- In local mode, `main-first` tries your Pi login first, then the fallbacks in order; `fallback-first` tries the fallbacks first and your Pi login last. In vault mode, main is the vault's default OpenAI account instead. When an account answers with a rate-limit or authentication error before anything was streamed, the next account in the routing order is tried.
 - `sticky-balanced` keeps each Pi session on one account, spreading new sessions by remaining quota; confirmed exhaustion causes a lasting account switch.
 
 Your Pi login stays where Pi keeps it: Pi refreshes it, and the extension only uses the token Pi hands it. Fallback accounts live in the extension's own store (`openai-auth.json` in Pi's agent directory, `~/.pi/agent` unless `PI_AGENT_DIR` says otherwise, or the file `PI_OPENAI_AUTH_FILE` names) and are refreshed there. A fallback that is the same ChatGPT account as your Pi login is skipped, so retrying a request cannot try that account twice. An account is used only once its quota is known: each account's quota is checked as soon as the extension sees it, and quota from every response keeps it current. A store written by an earlier version is converted to the account-pool format the first time it is read, keeping its accounts.

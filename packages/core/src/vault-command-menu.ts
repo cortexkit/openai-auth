@@ -16,6 +16,7 @@ import {
   type AccountStorage,
   getKillswitchThresholdsForAccount,
 } from './accounts'
+import { vaultMainRouteId } from './pool-routing'
 import { isRecord } from './util/record'
 import {
   isVaultMenuConnected,
@@ -151,17 +152,18 @@ export function createVaultCommandMenu(
   } = {},
 ): CommandMenu {
   const localMenu = createCommandMenu(options)
-  const projection = createCommandMenu({
-    command: options.command,
-    title: options.title,
-    store: menuStore(options.store, vault),
-    accounts: options.accounts,
-    quota: options.quota,
-    limits: options.limits,
-    routing: options.routing,
-    ...(options.extraLocks ? { extraLocks: options.extraLocks } : {}),
-    ...(options.now ? { now: options.now } : {}),
-  })
+  const projection = (mainId: string | null) =>
+    createCommandMenu({
+      command: options.command,
+      title: options.title,
+      store: menuStore(options.store, vault),
+      accounts: options.accounts,
+      quota: options.quota,
+      limits: options.limits,
+      routing: { ...options.routing, formerMainId: mainId ?? '' },
+      ...(options.extraLocks ? { extraLocks: options.extraLocks } : {}),
+      ...(options.now ? { now: options.now } : {}),
+    })
   const build = async (
     slot: StoreSectionSlot,
     invocation: CommandInvocation,
@@ -170,7 +172,13 @@ export function createVaultCommandMenu(
     // Connected means vault mode: the projection lists the vault's accounts
     // alone, and no local row is shown, set aside or polled.
     const connected = isVaultMenuConnected(view)
-    const source = connected ? projection : localMenu
+    const mainId = vaultMainRouteId(
+      view.status.accounts.map((row) => ({
+        id: row.routeId,
+        credentialId: row.credentialId,
+      })),
+    )
+    const source = connected ? projection(mainId) : localMenu
     const model = (await source.open(invocation)).menu
     const section = model.sections.find((section) => section.id === slot)
     if (!section)
@@ -283,6 +291,14 @@ export function createVaultCommandMenu(
           slot === 'limits' || (slot === 'routing' && action.id === 'mode'),
       )
       .map((action) => forwardAction(source, slot, action))
+    const mode = section.actions
+      .find((action) => action.id === 'mode')
+      ?.knobs.find((knob) => knob.id === 'mode')
+    const noDefault =
+      slot === 'routing' &&
+      mainId === null &&
+      mode?.kind === 'choice' &&
+      (mode.value === 'main-first' || mode.value === 'fallback-first')
     return {
       lines:
         slot === 'accounts'
@@ -291,7 +307,12 @@ export function createVaultCommandMenu(
               `${view.routes.size} can route`,
               VAULT_MODE_LOCAL_NOTE,
             ]
-          : section.lines,
+          : [
+              ...section.lines,
+              ...(noDefault
+                ? ['No default vault account, so this mode orders like Ordered']
+                : []),
+            ],
       items,
       actions,
     }

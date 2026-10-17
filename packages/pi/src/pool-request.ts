@@ -84,6 +84,8 @@ export interface PiRouteContext<A extends RouteAttempt> {
   /** The settings this request reads (killswitch, fallback statuses). */
   storage: AccountStorage | null
   mode: RoutingMode
+  /** Unset uses Pi's local main; null means the vault has no default account. */
+  mainId?: string | null
   sessionId: string | undefined
   /** The request's size, which sticky placement weighs sessions by. */
   requestBytes: number
@@ -196,7 +198,11 @@ async function routeOrdered<A extends RouteAttempt>(
   accounts: readonly RouteAccount[],
 ): Promise<PiRouteResult<A>> {
   const placement = orderedPlacement(ctx.mode)
-  const plan = planOrdered({ ...routingInput(ctx, accounts), placement })
+  const plan = planOrdered({
+    ...routingInput(ctx, accounts),
+    placement,
+    mainId: ctx.mainId,
+  })
   if (plan.kind === 'block') {
     ctx.log?.debug('pool admission blocked the request', {
       reason: plan.block.reason,

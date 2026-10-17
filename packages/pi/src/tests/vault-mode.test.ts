@@ -288,6 +288,85 @@ function poolFiles(): string[] {
 }
 
 describe('Pi in vault mode', () => {
+  for (const mode of ['main-first', 'fallback-first'] as const) {
+    test(`${mode} places the default vault account as main`, async () => {
+      const credentials = {
+        'chatgpt:openai': vaultLogin('chatgpt-default'),
+        'chatgpt:openai:work': vaultLogin('chatgpt-work'),
+      }
+      daemon = await startMockDaemon({
+        directory: dir,
+        credentials,
+      })
+      enroll()
+      await setMode(mode)
+      const target = vault()
+      const runtime = runtimeWith(target)
+      try {
+        await target.refresh()
+        // Discovery sorts credentials by name; put the default second so
+        // main-first must actually change the routing order.
+        const routes = target.routes.bind(target)
+        const ordered =
+          mode === 'main-first'
+            ? spyOn(target, 'routes').mockImplementation(() =>
+                routes().reverse(),
+              )
+            : undefined
+        try {
+          expect(target.routes().map((row) => row.credentialId)).toEqual(
+            mode === 'main-first'
+              ? ['chatgpt:openai:work', 'chatgpt:openai']
+              : ['chatgpt:openai', 'chatgpt:openai:work'],
+          )
+          expect(errorOf(await send(runtime))).toBeUndefined()
+          expect(codexTokens).toEqual([
+            chatgptAccessToken(
+              mode === 'main-first' ? 'chatgpt-default' : 'chatgpt-work',
+            ),
+          ])
+        } finally {
+          ordered?.mockRestore()
+        }
+      } finally {
+        target.close()
+      }
+    })
+  }
+
+  test('alias-only vault placements keep Ordered order and never serve the local main', async () => {
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: {
+        'chatgpt:openai:work': vaultLogin('chatgpt-work'),
+        'chatgpt:openai:home': vaultLogin('chatgpt-home'),
+      },
+    })
+    enroll()
+    const target = vault()
+    const runtime = runtimeWith(target)
+    try {
+      await target.refresh()
+      for (const mode of ['ordered', 'main-first', 'fallback-first'] as const) {
+        await setMode(mode)
+        expect(errorOf(await send(runtime))).toBeUndefined()
+        const routing = (
+          await createPiMenu(runtime.commandSupport()).open({ notify() {} })
+        ).menu.sections.find((section) => section.id === 'routing')!
+        expect(
+          routing.lines.includes(
+            'No default vault account, so this mode orders like Ordered',
+          ),
+        ).toBe(mode !== 'ordered')
+      }
+      expect(codexTokens).toEqual(
+        Array(3).fill(chatgptAccessToken('chatgpt-home')),
+      )
+    } finally {
+      target.close()
+    }
+  })
+
   test('unknown authority blocks synchronous local observation until a fresh read', async () => {
     const target = vault()
     const runtime = runtimeWith(target)

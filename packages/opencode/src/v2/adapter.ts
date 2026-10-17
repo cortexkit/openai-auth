@@ -82,6 +82,7 @@ import {
   routePinnedRow,
   type StickyRouteOptions,
   selectStickyRow,
+  vaultMainRouteId,
   waitForFirstQuotaReading,
 } from '../core/pool-routing'
 import { isNonEmittingFrame, parseRateLimitSignal } from '../ws'
@@ -496,8 +497,13 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     mode: RoutingMode | string,
     excluded: ReadonlySet<string>,
     follow: string | undefined,
+    mainId: string | null | undefined,
   ): string | undefined => {
-    const plan = planOrdered({ ...routing, placement: orderedPlacement(mode) })
+    const plan = planOrdered({
+      ...routing,
+      placement: orderedPlacement(mode),
+      mainId,
+    })
     if (plan.kind === 'block') {
       log?.debug('pool admission refused the request', {
         reason: plan.block.reason,
@@ -657,6 +663,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         mode,
         skip,
         primary ? undefined : sessionAccounts.get(input.sessionID),
+        vaultMode
+          ? mode === 'sticky-balanced'
+            ? null
+            : vaultMainRouteId(vault?.routes() ?? [])
+          : undefined,
       )
       if (accountId === undefined || refused.has(accountId)) {
         accountId = undefined

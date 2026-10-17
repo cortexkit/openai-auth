@@ -100,6 +100,7 @@ export function buildVaultSidebarMachineState(
       const credits = row.quota?.counters?.resetCredits?.value
       return {
         id: row.routeId,
+        credentialId: row.credentialId,
         label: row.email || row.label || row.routeId,
         ...(row.accountIdentity !== undefined
           ? { accountId: row.accountIdentity }

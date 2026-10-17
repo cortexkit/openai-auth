@@ -58,6 +58,7 @@ import {
   POOL_QUOTA_UNKNOWN_RETRY_SECONDS,
   type PoolBlock,
   type PoolRoutingInput,
+  vaultMainRouteId,
 } from '@cortexkit/openai-auth-core/pool-routing'
 import type {
   Api,
@@ -691,6 +692,7 @@ export class PiOpenAIRuntime {
         },
         storage,
         mode,
+        mainId: vaultMode ? vaultMainRouteId(this.vault.routes()) : undefined,
         sessionId: options?.sessionId,
         requestBytes: Buffer.byteLength(JSON.stringify(context), 'utf8'),
         now: this.now,

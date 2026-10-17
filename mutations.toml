@@ -10,6 +10,74 @@
 # a silent, costly failure: a credential lost or leaked, a reset credit spent
 # twice, output replayed, a crash that loses an account, a wire contract.
 
+# On every host, Main first tries the vault's chatgpt:openai credential first
+# and Fallback first tries it last. Local rows cannot fill that role in vault mode.
+
+[[control]]
+id = "vault-default-main-mapping"
+guards = "only the exact default OpenAI vault credential plays main without changing its route id"
+file = "packages/core/src/pool-routing.ts"
+old = "route.credentialId === 'chatgpt:openai',"
+new = "route.credentialId === 'chatgpt:openai:missing', // NON-VACUITY BREAK"
+test_file = "packages/core/src/tests/pool-routing-placement.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/pool-routing-placement.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/pool-routing-placement.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^ordered routing placement vault main mapping uses only the exact default credential and preserves its route id$']
+
+[[control]]
+id = "vault-main-never-maps-local-row"
+guards = "a local row never becomes main in vault mode even if it is named like the default credential"
+file = "packages/core/src/pool-routing.ts"
+old = "route.id.startsWith('vault:') &&"
+new = "true && // NON-VACUITY BREAK: allow a local row to play vault main."
+test_file = "packages/core/src/tests/pool-routing-placement.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/pool-routing-placement.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/pool-routing-placement.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^ordered routing placement vault main mapping never assigns a local row the main role$']
+
+[[control]]
+id = "opencode1-vault-default-main-wiring"
+guards = "OpenCode 1 applies the default vault main mapping on its ordered request path"
+file = "packages/opencode/src/core/pool-request.ts"
+old = "vaultMainRouteId(ctx.vault.routes())"
+new = "null /* NON-VACUITY BREAK: leave the default vault account in roster order. */"
+test_file = "packages/opencode/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the request path in vault mode main-first places the default vault account first and fallback-first places it last$']
+
+[[control]]
+id = "opencode2-vault-default-main-wiring"
+guards = "OpenCode 2 applies the default vault main mapping before authorizing an ordered attempt"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "vaultMainRouteId(vault?.routes() ?? [])"
+new = "null /* NON-VACUITY BREAK: leave the default vault account in roster order. */"
+test_file = "packages/opencode/src/tests/opencode2-vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault accounts on OpenCode 2 main-first places the default vault account first and fallback-first places it last$']
+
+[[control]]
+id = "pi-vault-default-main-wiring"
+guards = "Pi applies the default vault main mapping instead of using its own login as main"
+file = "packages/pi/src/runtime.ts"
+old = "vaultMainRouteId(this.vault.routes())"
+new = "null /* NON-VACUITY BREAK: leave the default vault account in roster order. */"
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi in vault mode main-first places the default vault account as main$']
+
 # OpenCode 2 locations share pending placement bytes only within one account store.
 
 [[control]]
