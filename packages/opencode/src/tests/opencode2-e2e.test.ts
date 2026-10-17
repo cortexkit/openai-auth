@@ -14,6 +14,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
@@ -743,11 +744,13 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       sessions.c,
       sessions.c,
     ])
-    expect(rows('apply').map((row) => row.directory)).toEqual([
-      join(root, 'project'),
-      join(root, 'project'),
-      join(root, 'other-project'),
-      join(root, 'other-project'),
+    // OpenCode may report a location by its resolved path (on macOS the temp
+    // folder /var is a link to /private/var), so compare resolved paths.
+    expect(rows('apply').map((row) => realpathSync(row.directory))).toEqual([
+      realpathSync(join(root, 'project')),
+      realpathSync(join(root, 'project')),
+      realpathSync(join(root, 'other-project')),
+      realpathSync(join(root, 'other-project')),
     ])
     expect(
       rows('result').map((row) => [
