@@ -809,6 +809,12 @@ describe('ordered routing on a migrated install', () => {
 // ---------------------------------------------------------------------------
 
 describe('exhaustion and the credit budget on a migrated install', () => {
+  // The pool source polls every row when it first loads. A poll answering a
+  // healthy reading is newer than the seeded one and would replace it before
+  // the request, depending on timing, so these polls fail and the seeded
+  // readings stand.
+  const failedPolls = () => new Response('', { status: 503 })
+
   for (const mode of MODES) {
     it(`${mode}: an exhausted account is skipped while another can serve`, async () => {
       // fallback-first puts main last; exhaust the account its mode tries first.
@@ -821,7 +827,7 @@ describe('exhaustion and the credit budget on a migrated install', () => {
           quota: first === 'fallback-1' ? quotaMap(100) : healthy(),
         },
       ])
-      const wire = installWire()
+      const wire = installWire({ usage: failedPolls })
       const fetchOverride = await loadFetch()
 
       const response = await fetchOverride(URL_RESPONSES, request('s-exh'))
@@ -838,7 +844,7 @@ describe('exhaustion and the credit budget on a migrated install', () => {
         { id: 'main', quota: first === 'main' ? spent : healthy() },
         { id: 'fallback-1', quota: first === 'fallback-1' ? spent : healthy() },
       ])
-      const wire = installWire()
+      const wire = installWire({ usage: failedPolls })
       const fetchOverride = await loadFetch()
 
       const response = await fetchOverride(URL_RESPONSES, request('s-budget'))
