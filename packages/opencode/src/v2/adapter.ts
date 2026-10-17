@@ -542,10 +542,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           storage,
           id === FORMER_MAIN_ID ? undefined : id,
         ),
-      // The reset credits each account's saved quota reading records. They
-      // only decide which account takes a new session when no account has a
-      // fresh quota reading to weigh, as on OpenCode 1. Reading them touches
-      // no token and asks the vault for nothing.
+      // The reset credits each account's saved quota reading records. As on
+      // OpenCode 1, they only matter when no account has a fresh reading with
+      // room above its reserve to weigh: the session then goes to the first
+      // account in roster order holding at least one credit, else the first
+      // account. Reading them touches no token and asks the vault for nothing.
       resetCredits: (id) => resetCreditsOfQuota(quotaById.get(id)),
     }
     const sticky = admitSticky(routing)

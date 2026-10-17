@@ -1,10 +1,12 @@
 // Sticky-balanced placement on OpenCode 2 uses the reset credits each
-// account's saved quota reading records, the way OpenCode 1 does: when no
-// account has a fresh reading to weigh, a new session goes to the first
-// account in roster order that holds at least one credit, else to the first
-// account. Credits never reorder accounts that do have fresh readings.
-// Pool rows keep their balance in `row.quota`, vault accounts in
-// `route.quota`, both at `counters.resetCredits.value`.
+// account's saved quota reading records, the way OpenCode 1 does. Credits
+// play no part while any account has a fresh reading with room to weigh: the
+// weighing alone places the session, and credits never reorder it. Only when
+// no account can be weighed (every reading stale or out of room) does the
+// fallback run, and there a new session goes to the first account in roster
+// order holding at least one credit, else to the first account. Pool rows
+// keep their balance in `row.quota`, vault accounts in `route.quota`, both at
+// `counters.resetCredits.value`.
 //
 // The adapter runs behind the real installer on a fake OpenCode 2 host, over
 // a stand-in pool source and vault that record every token and authorize
