@@ -2185,7 +2185,9 @@ export async function CodexAuthPlugin(
             fallbackManager,
             quotaManager,
             loadAccounts,
-            writeSidebarState: writeMachineSidebarState,
+            // The sidebar write reads the current store itself, so the store a
+            // quota refresh passes is not needed.
+            writeSidebarState: (qm) => writeMachineSidebarState(qm),
             client: input.client as Parameters<
               typeof refreshAllQuota
             >[0]['client'],
@@ -2831,7 +2833,6 @@ export async function CodexAuthPlugin(
           sidebarBookkeepingQueue.enqueue('machine-state', 'quota', () =>
             writeMachineSidebarState(
               quotaManager,
-              lastRequestStorage,
               fallbackPush ? undefined : resolvedMainIdentity,
             ),
           )
@@ -2881,7 +2882,7 @@ export async function CodexAuthPlugin(
         function queueVaultSidebarWrite() {
           if (!vault.enrolled()) return
           sidebarBookkeepingQueue.enqueue('machine-state', 'quota', () =>
-            writeMachineSidebarState(quotaManager, lastRequestStorage),
+            writeMachineSidebarState(quotaManager),
           )
         }
 
@@ -2970,7 +2971,6 @@ export async function CodexAuthPlugin(
 
         async function writeMachineSidebarState(
           qm: QuotaManager,
-          _store: Awaited<ReturnType<typeof loadAccounts>>,
           mainAccountIdentity?: string,
         ) {
           const currentStorage = loadCurrentStorageForDisplay()
@@ -3229,8 +3229,11 @@ export async function CodexAuthPlugin(
               sessionId,
             ),
           refreshSidebar: async () => {
-            const store = await loadAccounts(getAccountPaths(getConfigPath()))
-            await writeMachineSidebarState(quotaManager, store)
+            // A command just changed the store, possibly within the same
+            // mtime tick, so drop the cached snapshot and let the writer read
+            // the store from disk.
+            invalidateRequestStorageCache()
+            await writeMachineSidebarState(quotaManager)
           },
           // On a migrated install every row is polled through the pool
           // source, the same path its background poll takes, and every vault
@@ -3240,7 +3243,7 @@ export async function CodexAuthPlugin(
             await vault.authority()
             if (vault.enrolled()) {
               const vaultResults = await vault.pollStale(0)
-              await writeMachineSidebarState(quotaManager, lastRequestStorage)
+              await writeMachineSidebarState(quotaManager)
               return vaultResults.map((result) => ({
                 account: result.id,
                 ok: result.ok,
@@ -3252,7 +3255,7 @@ export async function CodexAuthPlugin(
                 pollPoolRows(),
                 vault.pollStale(0),
               ])
-              await writeMachineSidebarState(quotaManager, lastRequestStorage)
+              await writeMachineSidebarState(quotaManager)
               return [
                 ...results,
                 ...vaultResults.map((result) => ({
@@ -4506,13 +4509,13 @@ export async function CodexAuthPlugin(
           bootQuotaSeedStarted = true
 
           // Immediate: show persisted quota so the sidebar isn't blank
-          void writeMachineSidebarState(quotaManager, storage).catch(() => {})
+          void writeMachineSidebarState(quotaManager).catch(() => {})
           // In vault mode the sidebar lists the vault's accounts, which are
           // known once the vault's first account list has been read.
           void vaultFirstRoster
             .then(() =>
               vault.enrolled()
-                ? writeMachineSidebarState(quotaManager, lastRequestStorage)
+                ? writeMachineSidebarState(quotaManager)
                 : undefined,
             )
             .catch(() => {})
@@ -4543,7 +4546,7 @@ export async function CodexAuthPlugin(
             // polled by the shared vault consumer; the sidebar is rewritten
             // so it shows their latest quota.
             if (vault.enrolled()) {
-              await writeMachineSidebarState(quotaManager, lastRequestStorage)
+              await writeMachineSidebarState(quotaManager)
               return
             }
             // A migrated install refreshes and polls its pool rows through
@@ -4557,7 +4560,7 @@ export async function CodexAuthPlugin(
                 () => acquireBackgroundRefreshLock(getConfigPath()),
               )
               if (polled.length > 0) {
-                await writeMachineSidebarState(quotaManager, lastRequestStorage)
+                await writeMachineSidebarState(quotaManager)
               }
               const failures = polled.filter((result) => !result.ok)
               if (failures.length > 0) {
