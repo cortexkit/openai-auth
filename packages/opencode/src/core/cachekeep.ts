@@ -15,13 +15,16 @@ import {
   CacheKeepManager,
   type CacheKeepManagerOptions,
   type CacheKeepProfile,
+  type CacheKeepTargetView,
   type CacheKeepWindow,
   normalizeCacheKeepWindow,
 } from '@cortexkit/common-auth/cachekeep'
 import {
   type AccountStorage,
+  extractAccountIdFromClaims,
   normalizeQuotaHeaders,
   type OpenAiVault,
+  parseJwtClaims,
   redactCredentialError,
   redactCredentialResponse,
 } from '@cortexkit/openai-auth-core/internal'
@@ -55,7 +58,35 @@ export interface OpenAICacheKeepMeta {
    * whose `session-id` header may already be the Codex thread id.
    */
   routingSessionId?: string
+  /**
+   * Where the warm is sent. Absent means the manager's `codexResponsesUrl`.
+   * OpenCode 2 sets it to the URL its captured request went to.
+   */
+  url?: string
+  /**
+   * Which store served the captured request: a local pool row or the vault.
+   * Set by OpenCode 2, whose `verifyCredential` refuses a warm whose fresh
+   * credential comes from the other store.
+   */
+  credentialMode?: 'local' | 'vault'
 }
+
+/**
+ * The size bounds of a keep-warm manager: the most sessions tracked at once
+ * and the most captured body bytes (UTF-8) held across them.
+ *
+ * `@cortexkit/common-auth/cachekeep` does not export its defaults, so these
+ * equal them as read from the installed package, version 0.19.0:
+ * `DEFAULT_MAX_TARGETS = 32` and `DEFAULT_MAX_BYTES = 8 * 1024 * 1024` in
+ * `node_modules/@cortexkit/common-auth/dist/cachekeep/manager.js`. A test
+ * checks that a manager built without caps still evicts at these bounds.
+ * OpenCode 2 passes them to its manager explicitly; OpenCode 1 relies on the
+ * package defaults.
+ */
+export const CACHE_KEEP_CAPS: Readonly<{
+  maxTargets: number
+  maxBytes: number
+}> = Object.freeze({ maxTargets: 32, maxBytes: 8 * 1024 * 1024 })
 
 export interface KeepwarmCapture {
   sessionKey: string
@@ -328,18 +359,43 @@ type CacheKeepFallbackAccess =
   | string
   | {
       token: string
+      /**
+       * The ChatGPT account the token signs in as, when the caller knows it;
+       * otherwise it is read from the token. Only `verifyCredential` uses it.
+       */
+      identity?: string
       onAuthFailure?: (status: number) => Promise<void>
     }
+
+/** What `verifyCredential` is shown of a warm's fresh credential. */
+export interface CacheKeepCredentialCheck {
+  target: CacheKeepTargetView<OpenAICacheKeepMeta>
+  /** Which store the credential came from. */
+  mode: 'local' | 'vault'
+  /** The ChatGPT account the credential signs in as, when known. */
+  identity: string | undefined
+}
 
 export interface OpenAICacheKeepAdapterOptions {
   fetchImpl: typeof fetch
   /** The main account's bearer; a throw (no token) backs the target off. */
-  getMainToken: () => Promise<string>
+  getMainToken: (
+    target: CacheKeepTargetView<OpenAICacheKeepMeta>,
+  ) => Promise<CacheKeepFallbackAccess>
   /**
    * Resolve the local fallback row identified by `accountId` to a bearer for
    * this replay. `onAuthFailure` handles a 401 on that resolved credential.
    */
-  refreshFallback: (accountId: string) => Promise<CacheKeepFallbackAccess>
+  refreshFallback: (
+    accountId: string,
+    target: CacheKeepTargetView<OpenAICacheKeepMeta>,
+  ) => Promise<CacheKeepFallbackAccess>
+  /**
+   * Called with each warm's fresh credential just before the warm is sent.
+   * A throw sends nothing and backs the target off, unless the callback has
+   * removed the target from the manager, which drops it without a warning.
+   */
+  verifyCredential?: (check: CacheKeepCredentialCheck) => void | Promise<void>
   /**
    * Replays on vault accounts obtain a bearer through the vault's send path.
    * While enrolled, a replay captured on a local account sends nothing and
@@ -353,8 +409,14 @@ export interface OpenAICacheKeepAdapterOptions {
    */
   activeAccount?: (
     routingSessionId: string | undefined,
+    target: CacheKeepTargetView<OpenAICacheKeepMeta>,
   ) => string | undefined | Promise<string | undefined>
   logger?: CacheKeepLogger
+}
+
+function identityOfToken(token: string): string | undefined {
+  const claims = parseJwtClaims(token)
+  return claims ? extractAccountIdFromClaims(claims) : undefined
 }
 
 export function createOpenAICacheKeepAdapter(
@@ -366,9 +428,19 @@ export function createOpenAICacheKeepAdapter(
     buildBody: (target) => buildKeepwarmBody(target.bodyText),
 
     async send({ target, body, signal }) {
-      const dispatch = async (accessToken: string) => {
+      const dispatch = async (
+        accessToken: string,
+        mode: CacheKeepCredentialCheck['mode'],
+        identity: string | undefined,
+      ) => {
         // Stopped, or the warm timed out, while the token resolved: send nothing.
         signal.throwIfAborted()
+        if (options.verifyCredential)
+          await options.verifyCredential({
+            target,
+            mode,
+            identity: identity ?? identityOfToken(accessToken),
+          })
 
         const headers: Record<string, string> = {
           ...target.meta.replayHeaders,
@@ -404,7 +476,7 @@ export function createOpenAICacheKeepAdapter(
 
         try {
           const response = await options.fetchImpl(
-            options.codexResponsesUrl,
+            target.meta.url ?? options.codexResponsesUrl,
             sanitizeHttpFallbackInit({
               method: 'POST',
               headers,
@@ -426,10 +498,11 @@ export function createOpenAICacheKeepAdapter(
       if (target.accountId && options.vault?.owns(target.accountId)) {
         // The vault owns both the per-attempt authorization and 401 reporting;
         // a refusal before dispatch must not be reported as a provider failure.
-        const response = await options.vault.send(target.accountId, dispatch, {
-          site: 'cachekeep',
-          signal,
-        })
+        const response = await options.vault.send(
+          target.accountId,
+          (token, attempt) => dispatch(token, 'vault', attempt.accountIdentity),
+          { site: 'cachekeep', signal },
+        )
         if (!response)
           throw new Error(`vault refused warm for ${target.accountId}`)
         return response
@@ -444,17 +517,18 @@ export function createOpenAICacheKeepAdapter(
         )
 
       let accessToken: string
+      let identity: string | undefined
       let onAuthFailure: ((status: number) => Promise<void>) | undefined
-      if (target.accountId && target.accountId !== 'main') {
-        const resolved = await options.refreshFallback(target.accountId)
-        if (typeof resolved === 'string') {
-          accessToken = resolved
-        } else {
-          accessToken = resolved.token
-          onAuthFailure = resolved.onAuthFailure
-        }
+      const resolved =
+        target.accountId && target.accountId !== 'main'
+          ? await options.refreshFallback(target.accountId, target)
+          : await options.getMainToken(target)
+      if (typeof resolved === 'string') {
+        accessToken = resolved
       } else {
-        accessToken = await options.getMainToken()
+        accessToken = resolved.token
+        identity = resolved.identity
+        onAuthFailure = resolved.onAuthFailure
       }
       // Enrollment can finish during token resolution; do not dispatch the
       // resolved local bearer after authority has switched away from local.
@@ -462,7 +536,7 @@ export function createOpenAICacheKeepAdapter(
         throw new Error(
           'local accounts are not warmed while this host is connected to the vault',
         )
-      const response = await dispatch(accessToken)
+      const response = await dispatch(accessToken, 'local', identity)
       if (response.status === 401) await onAuthFailure?.(response.status)
       return response
     },
@@ -494,7 +568,7 @@ export function createOpenAICacheKeepAdapter(
     ...(activeAccount
       ? {
           activeAccount: (_sessionKey, target) =>
-            activeAccount(target.meta.routingSessionId),
+            activeAccount(target.meta.routingSessionId, target),
         }
       : {}),
   }
@@ -516,6 +590,7 @@ export function createCacheKeepManager(
     vault,
     codexResponsesUrl,
     activeAccount,
+    verifyCredential,
     logger,
     ...managerOptions
   } = options
@@ -529,6 +604,7 @@ export function createCacheKeepManager(
       vault,
       codexResponsesUrl,
       activeAccount,
+      verifyCredential,
       logger,
     }),
   })

@@ -95,6 +95,12 @@ import {
   OPENAI_PROVIDER_ID,
   type OpenAIAdapterLogger,
 } from './adapter'
+import {
+  acquireCacheKeep,
+  type CacheKeepCaptureInput,
+  type CacheKeepManagerSetup,
+  cacheKeepSettingsOf,
+} from './cache-keep'
 import { acquireCodexSessions } from './codex-sessions'
 import { CodexHttpState } from './codex-wire'
 import { type ControlPlaneMenu, installControlPlane } from './control-plane'
@@ -143,6 +149,15 @@ export interface OpenAIAuthV2Options {
   sidebarObservationIntervalMs?: number
   /** Overrides the production menu for transport fixtures. */
   controlPlane?: ControlPlaneMenu
+  /**
+   * The keep-warm manager's timer and the limit its last release waits for
+   * a warm in flight. Used only by the location that builds the store's
+   * manager; production uses the global timers and `CACHE_KEEP_JOIN_MS`.
+   */
+  cacheKeep?: Pick<
+    CacheKeepManagerSetup,
+    'setIntervalImpl' | 'clearIntervalImpl' | 'joinTimeoutMs'
+  >
   /** The account config and state files; read on every use. */
   paths?: () => AccountPaths
   /** OpenCode 1's login slot the migration reads; its `auth.json` by default. */
@@ -195,6 +210,14 @@ async function installPoolHooks<Q, A>(
   adapter: OpenCode2AuthAdapter<Q, A>,
   log: Pick<OpenAIAdapterLogger, 'warn'>,
   codex = new CodexHttpState(),
+  // Sees every owned request in its final form, with its account attempt.
+  // Keep-warm captures agent-loop requests here.
+  onOwnedRequest?: (input: {
+    sessionID: string
+    kind: string
+    request: Request
+    attempt: Attempt<A>
+  }) => Promise<void>,
 ) {
   const dumps = new RequestDumps(log)
   // installOpenCode2Auth supplies an Attempt to the rewrite callbacks before it
@@ -252,6 +275,13 @@ async function installPoolHooks<Q, A>(
             }
             if (request && owned && observation.attempt)
               await dumps.captureHttp(request.request, observation.attempt)
+            if (request && owned && observation.attempt)
+              await onOwnedRequest?.({
+                sessionID: request.sessionID,
+                kind: request.kind,
+                request: request.request,
+                attempt: observation.attempt,
+              })
             if (handshake && owned && observation.attempt) {
               // A stable thread id lets WebSocket and HTTP fallback share the
               // same cache without changing the host's socket key between turns.
@@ -605,6 +635,34 @@ export async function setupOpenAIAuth(
   const codex =
     options.codex ??
     new CodexHttpState(undefined, undefined, acquireCodexSessions())
+  const sessionAccounts = acquireSessionAccounts(paths())
+  // One keep-warm manager per process and account store; this location lends
+  // it its own pool source, vault, settings and request capture.
+  const cacheKeepSettings = cacheKeepSettingsOf(storage)
+  const cacheKeep = acquireCacheKeep(
+    paths(),
+    {
+      source,
+      storage: () => loadAccounts(paths()),
+      vault,
+      accounts: sessionAccounts,
+      settings: () => cacheKeepSettings,
+      parentOf: async (sessionID) =>
+        (await ctx.session.get({ sessionID }))?.parentID ?? undefined,
+      fetch: fetchImpl,
+      log: createLogger('cachekeep'),
+    },
+    {
+      now,
+      codexResponsesUrl: getSettings().codexApiEndpoint,
+      ...options.cacheKeep,
+    },
+  )
+  using _cacheKeepRollback = {
+    [Symbol.dispose]() {
+      if (!setupComplete) void cacheKeep.release()
+    },
+  }
   const openai = createOpenAIAdapter({
     codex,
     onRoute: sidebar.route,
@@ -612,7 +670,7 @@ export async function setupOpenAIAuth(
     slotPlaceholderWithoutMain,
     storage: () => loadAccounts(paths()),
     pins,
-    sessionAccounts: acquireSessionAccounts(paths()),
+    sessionAccounts,
     vault,
     awaitVaultRoster: async () => {
       await settlesWithin(
@@ -625,7 +683,13 @@ export async function setupOpenAIAuth(
     now,
     log,
   })
-  const installation = await installPoolHooks(ctx, openai.adapter, log, codex)
+  const installation = await installPoolHooks(
+    ctx,
+    openai.adapter,
+    log,
+    codex,
+    (input: CacheKeepCaptureInput) => cacheKeep.capture(input),
+  )
   openai.attach(installation)
 
   /** Waits for a migration run when the install has not migrated yet. */
@@ -730,13 +794,16 @@ export async function setupOpenAIAuth(
         )
       : undefined
 
-  // A deleted session's pin and remembered account go with it.
+  // A deleted session's pin, remembered account and keep-warm target go with
+  // it.
   const abort = new AbortController()
   void (async () => {
     try {
       for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
-        if (event.type === 'session.deleted')
+        if (event.type === 'session.deleted') {
           openai.forgetSession(event.data.sessionID)
+          cacheKeep.forget(event.data.sessionID)
+        }
       }
     } catch (error) {
       if (!abort.signal.aborted)
@@ -750,6 +817,10 @@ export async function setupOpenAIAuth(
   return async () => {
     closing = true
     abort.abort()
+    // Drop this location's hold first, so no warm reads the pool source or
+    // vault released below. The last hold stops the manager at once; its
+    // warm in flight is joined within the shutdown limit below.
+    const cacheKeepReleased = cacheKeep.release()
     await controlPlane?.()
     lifecycle?.dispose()
     source.dispose()
@@ -771,6 +842,7 @@ export async function setupOpenAIAuth(
           lifecycle?.idle(),
           source.settled(),
           codex.store?.settled(),
+          cacheKeepReleased,
         ]),
         new Promise<void>((resolve) => {
           settleTimer = setTimeout(resolve, SETTLE_ON_DISPOSE_MS)
