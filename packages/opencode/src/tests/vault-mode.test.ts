@@ -342,7 +342,7 @@ describe('the sidebar file in vault mode', () => {
     }
   })
 
-  it('lists the vault accounts by email, else vault label, with no local account in the fields an older reader shows', async () => {
+  it('lists the vault accounts by safe label with no local account in the fields an older reader shows', async () => {
     const file = join(dir, 'sidebar.json')
     // What the file held before vault mode: local accounts.
     await setSidebarState(
@@ -376,7 +376,7 @@ describe('the sidebar file in vault mode', () => {
         [
           row('work', { email: 'work@example.com' }),
           row('home'),
-          row('cold', { state: 'needs_login' }),
+          row('cold', { state: 'needs_reauth' }),
         ],
         new Set(['vault:work', 'vault:home']),
         { routing: { mode: 'sticky-balanced' } },
@@ -397,9 +397,9 @@ describe('the sidebar file in vault mode', () => {
         account.enabled,
       ]),
     ).toEqual([
-      ['vault:work', 'work@example.com', true],
+      ['vault:work', 'work login', true],
       ['vault:home', 'home login', true],
-      ['vault:cold', 'cold login', false],
+      ['vault:cold', 'cold login', true],
     ])
     expect(state.vaultAccounts?.[0]?.quota).not.toBeNull()
     expect(state.fallbacks).toEqual([])
@@ -453,8 +453,8 @@ describe('the TUI sidebar in vault mode', () => {
       },
     } as SidebarState
 
-    // Only the enabled vault account is rendered; main's leftover quota is not.
-    expect(renderedQuotas(state)).toEqual([quota])
+    // Every vault account is rendered; main's leftover quota is not.
+    expect(renderedQuotas(state)).toEqual([quota, null])
     const routing = resolveSessionSidebarRouting(state, 'session')
     expect(routing.activeId).toBe('vault:work')
     expect(

@@ -38,7 +38,7 @@ While OpenCode or Pi holds a vault token (**vault mode**), its requests use only
 - They route through the same [routing modes and limits](accounts-and-routing.md) as local accounts.
 - Each request fetches its token from the vault, and a token the provider rejects is reported back to the vault.
 - No local account (a pool row, OpenCode's slot login, Pi's own login) is sent with, refreshed, polled or warmed, and the local pool files are left exactly as they are.
-- On OpenCode 1, the sidebar, `/openai` and the `opencode auth login` menu list vault accounts only.
+- The OpenCode sidebar lists vault accounts only, including accounts that need sign-in or are unavailable. It keeps their last quota reading and shows your `/openai` on/off choice separately from the vault's state. A **blocked** account is below its configured quota floor and will not route. On OpenCode 1, `/openai` and the `opencode auth login` menu also list vault accounts only.
 - A request no vault account can serve is refused locally. The request error explains the cause and remedy: make accounts available in the vault, or disconnect the affected OpenCode or Pi installation.
 
 In vault mode, "main" in the **Main first** and **Fallback first** routing modes means the vault's default OpenAI account, `chatgpt:openai`; see [routing](accounts-and-routing.md#routing).

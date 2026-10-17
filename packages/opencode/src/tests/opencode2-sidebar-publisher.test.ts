@@ -246,6 +246,7 @@ test('OpenCode 2 publisher: routing floor killswitch and successful apply publis
   const state = await getSidebarState(f.file)
   expect(state.route).toBe('fallback-first')
   expect(state.fallbacks.map((row) => row.id)).toEqual(['alpha'])
+  expect(state.fallbacks[0]?.killed).toBe(true)
   expect(f.calls.every((url) => url.includes('/wham/usage'))).toBe(true)
   expect(refresh).not.toHaveBeenCalled()
 })
@@ -308,6 +309,22 @@ test('OpenCode 2 publisher: real enrollment and disconnect publish exclusive vau
       (await getSidebarState(f.file)).main.quota?.primary?.usedPercent === 10,
   )
   const fetches = f.calls.length
+  const pins = acquireSessionPins(f.files.paths())
+  pins.place({
+    sessionId: 'old-local-main',
+    requestBytes: 1,
+    validPinnedAccountIds: ['main'],
+    excludeAccountIds: [],
+    quotaCheckedAtByAccount: {},
+    wireAccountIdByAccount: {},
+    persist: true,
+    select: () => ({ accountId: 'main', source: 'weighted' }),
+  })
+  await until(
+    async () =>
+      (await getSidebarState(f.file)).activeRouting?.['old-local-main']
+        ?.activeId === 'main',
+  )
   const poll = spyOn(PoolAccountSource.prototype, 'requestReading')
   const refresh = spyOn(PoolAccountSource.prototype, 'prepareTokens')
   cleanups.push(() => {
@@ -330,6 +347,13 @@ test('OpenCode 2 publisher: real enrollment and disconnect publish exclusive vau
   expect(enrolled.main.quota).toBeNull()
   expect(enrolled.main.mainAccountId).toBeUndefined()
   expect(enrolled.fallbacks).toEqual([])
+  expect(enrolled.activeRouting?.['old-local-main']).toBeUndefined()
+  expect(
+    Object.values(enrolled.stickyAssignments ?? {}).map((pin) => pin.accountId),
+  ).not.toContain('main')
+  expect(
+    resolveSessionSidebarRouting(enrolled, 'old-local-main').activeId,
+  ).toBe('vault')
   expect(f.calls.length).toBe(fetches)
   expect(poll).not.toHaveBeenCalled()
   expect(refresh).not.toHaveBeenCalled()

@@ -14,6 +14,97 @@
 # and Fallback first tries it last. Local rows cannot fill that role in vault mode.
 
 [[control]]
+id = "sidebar-vault-host-toggle"
+guards = "vault availability does not overwrite the user's host toggle"
+file = "packages/opencode/src/core/pool-sidebar.ts"
+old = "enabled: row.enabled,"
+new = "enabled: routable.has(row.routeId), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/sidebar-guards.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^sidebar\sguards\sretain\sunavailable\svault\saccounts\sseparately\sfrom\sthe\shost\stoggle$']
+
+[[control]]
+id = "sidebar-vault-all-visible"
+guards = "every vault account contributes to the rendered quota list even when turned off"
+file = "packages/opencode/src/tui.tsx"
+old = "return state.vaultAccounts.map((account) => account.quota)"
+new = "return state.vaultAccounts.filter((account) => account.enabled).map((account) => account.quota) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/sidebar-guards.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^sidebar\sguards\sretain\sunavailable\svault\saccounts\sseparately\sfrom\sthe\shost\stoggle$']
+
+[[control]]
+id = "sidebar-pool-main-killswitch"
+guards = "the local main sidebar uses the routing killswitch verdict"
+file = "packages/opencode/src/core/pool-sidebar.ts"
+old = "killed: verdicts.get(POOL_MAIN_ROW_ID) === false,"
+new = "killed: false, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/sidebar-guards.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^sidebar\sguards\spool\sand\svault\skilled\sflags\smatch\srouting\sverdicts$']
+
+[[control]]
+id = "sidebar-pool-fallback-killswitch"
+guards = "the local fallback sidebar uses the routing killswitch verdict"
+file = "packages/opencode/src/core/pool-sidebar.ts"
+old = "killed: verdicts.get(row.id) === false,"
+new = "killed: false, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/sidebar-guards.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^sidebar\sguards\spool\sand\svault\skilled\sflags\smatch\srouting\sverdicts$']
+
+[[control]]
+id = "sidebar-vault-killswitch"
+guards = "the vault sidebar uses the routing killswitch verdict"
+file = "packages/opencode/src/core/pool-sidebar.ts"
+old = "killed: verdicts.get(row.routeId) === false,"
+new = "killed: false, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/sidebar-guards.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^sidebar\sguards\spool\sand\svault\skilled\sflags\smatch\srouting\sverdicts$']
+
+[[control]]
+id = "sidebar-legacy-killswitch"
+guards = "the pre-migration main sidebar uses the routing killswitch policy"
+file = "packages/opencode/src/index.ts"
+old = "killed: !killswitchPassesPolicy(mainQuota, store, undefined, now),"
+new = "killed: false, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/sidebar-guards.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^sidebar\sguards\slegacy\skilled\sflags\suse\sthe\srouting\spolicy$']
+
+[[control]]
+id = "sidebar-vault-prunes-local-records"
+guards = "every locked vault write removes old local session records without dropping vault pins"
+file = "packages/opencode/src/sidebar-state.ts"
+old = "if (next.vaultAccounts !== undefined) {"
+new = "if (false) { // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/sidebar-guards.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/sidebar-guards.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^sidebar\sguards\svault\swrites\sprune\slocal\srecords\sand\spreserve\sunavailable\svault\spins$']
+
+[[control]]
 id = "vault-default-main-mapping"
 guards = "only the exact default OpenAI vault credential plays main without changing its route id"
 file = "packages/core/src/pool-routing.ts"

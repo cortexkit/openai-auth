@@ -18,12 +18,20 @@ import {
   type AccountStorage,
   POOL_MAIN_ROW_ID,
 } from '@cortexkit/openai-auth-core/internal'
+import { poolKillswitchVerdicts } from '@cortexkit/openai-auth-core/pool-routing'
 import type {
   AccountQuota,
+  SidebarAccountState,
   SidebarMachineState,
   SpendControlReading,
 } from '../sidebar-state'
 import { windowsFromQuotaMap } from './pool-quota'
+
+const VAULT_STATES = new Map<string, SidebarAccountState['vaultState']>([
+  ['needs_reauth', 'needs sign-in'],
+  ['retired', 'turned off in vault'],
+  ['corrupt', 'unavailable'],
+])
 
 function finite(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value)
@@ -80,34 +88,51 @@ export function sidebarQuotaFromPoolMap(
 }
 
 /**
- * The machine part of the sidebar state in vault mode: the vault accounts that
+ * The sidebar's account snapshot in vault mode: the vault accounts that
  * serve this host instead of its local accounts. The old fields stay in the
  * file for an older TUI, but carry no local account: `main` has no quota and
- * `fallbacks` is empty. Each vault account is named by its email when the
- * vault knows it, else by its vault label; one the vault will not serve now
- * (not in `routable`) is written disabled.
+ * `fallbacks` is empty. The host toggle is separate from vault availability,
+ * so an account the vault cannot serve stays visible with its last reading.
  */
 export function buildVaultSidebarMachineState(
   rows: readonly VaultRosterRow[],
   routable: ReadonlySet<string>,
-  store: Pick<AccountStorage, 'routing'> | null | undefined,
+  store:
+    | Pick<AccountStorage, 'routing' | 'killswitch' | 'quota'>
+    | null
+    | undefined,
   now: number,
 ): SidebarMachineState {
+  const verdicts = poolKillswitchVerdicts(
+    rows.map((row) => ({ id: row.routeId, quota: row.quota })),
+    { version: 1, accounts: [], ...store },
+    now,
+  )
   return {
     main: { quota: null, killed: false },
     fallbacks: [],
-    vaultAccounts: rows.map((row) => {
+    vaultAccounts: rows.map((row, index) => {
       const credits = row.quota?.counters?.resetCredits?.value
       return {
         id: row.routeId,
         credentialId: row.credentialId,
-        label: row.email || row.label || row.routeId,
+        label:
+          row.label && !row.label.includes('@')
+            ? row.label
+            : `Vault account ${index + 1}`,
         ...(row.accountIdentity !== undefined
           ? { accountId: row.accountIdentity }
           : {}),
         quota: sidebarQuotaFromPoolMap(row.quota, credits),
-        killed: false,
-        enabled: routable.has(row.routeId),
+        killed: verdicts.get(row.routeId) === false,
+        enabled: row.enabled,
+        routable: routable.has(row.routeId),
+        ...(row.state !== 'active' ||
+        row.stale ||
+        row.unclaimed ||
+        (row.enabled && !routable.has(row.routeId))
+          ? { vaultState: VAULT_STATES.get(row.state) ?? 'unavailable' }
+          : {}),
         ...(credits !== undefined ? { resetCredits: credits } : {}),
       }
     }),
@@ -123,17 +148,25 @@ export function buildVaultSidebarMachineState(
  */
 export function buildPoolSidebarMachineState(
   rows: readonly PoolRow[],
-  store: Pick<AccountStorage, 'routing'> | null | undefined,
+  store:
+    | Pick<AccountStorage, 'routing' | 'killswitch' | 'quota'>
+    | null
+    | undefined,
   now: number,
   resetCreditsFor: (id: string) => number | undefined = () => undefined,
 ): SidebarMachineState & { accountPool: true } {
+  const verdicts = poolKillswitchVerdicts(
+    rows,
+    { version: 1, accounts: [], ...store },
+    now,
+  )
   const main = rows.find((row) => row.id === POOL_MAIN_ROW_ID)
   const mainCredits = main ? resetCreditsFor(main.id) : undefined
   return {
     main: {
       quota: main ? sidebarQuotaFromPoolMap(main.quota, mainCredits) : null,
       ...(main?.identity !== undefined ? { mainAccountId: main.identity } : {}),
-      killed: false,
+      killed: verdicts.get(POOL_MAIN_ROW_ID) === false,
       ...(mainCredits !== undefined ? { resetCredits: mainCredits } : {}),
     },
     fallbacks: rows
@@ -145,7 +178,7 @@ export function buildPoolSidebarMachineState(
           label: row.label,
           ...(row.identity !== undefined ? { accountId: row.identity } : {}),
           quota: sidebarQuotaFromPoolMap(row.quota, credits),
-          killed: false,
+          killed: verdicts.get(row.id) === false,
           enabled: true,
           ...(credits !== undefined ? { resetCredits: credits } : {}),
         }

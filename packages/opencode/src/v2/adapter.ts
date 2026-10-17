@@ -56,8 +56,6 @@ import {
   extractAccountIdFromClaims,
   getKillswitchThresholdsForAccount,
   isCompleteQuotaHeaderFrame,
-  isKillswitchEnabled,
-  killswitchPassesPolicy,
   normalizeQuotaHeaders,
   normalizeWsFrame,
   type OpenAiVault,
@@ -79,6 +77,7 @@ import {
   orderedPlacement,
   type PoolRoutingInput,
   planOrdered,
+  poolKillswitchVerdicts,
   routePinnedRow,
   type StickyRouteOptions,
   selectStickyRow,
@@ -448,20 +447,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     storage: AccountStorage | null,
     at: number,
   ): PoolRoutingInput => {
-    const killswitch = new Map<string, boolean>()
-    if (isKillswitchEnabled(storage)) {
-      for (const target of targets) {
-        killswitch.set(
-          target.id,
-          killswitchPassesPolicy(
-            windowsFromQuotaMap(target.quota),
-            storage,
-            target.id === FORMER_MAIN_ID ? undefined : target.id,
-            at,
-          ),
-        )
-      }
-    }
+    const killswitch = poolKillswitchVerdicts(targets, storage, at)
     const routingRows: RoutingRow[] = targets.map((target) => ({
       id: target.id,
       kind: 'oauth',

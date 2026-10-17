@@ -8261,14 +8261,21 @@ describe('integration: active fallback routing', () => {
         responseRequestInit({ 'x-session-affinity': 'pin-migrate-session' }),
       )
       await drainSidebarWrites()
-      const initialPin = normalizeSidebarState(
+      const belowFloor = normalizeSidebarState(
         JSON.parse(readFileSync(sidebarFile, 'utf8')),
-      ).stickyAssignments?.[hashSidebarSessionId('pin-migrate-session')]
-        ?.accountId
-      expect(initialPin).toBe('fallback-2')
+      )
+      expect(
+        belowFloor.fallbacks.find((account) => account.id === 'fallback-2')
+          ?.killed,
+      ).toBe(true)
+      expect(
+        Object.values(belowFloor.stickyAssignments ?? {}).some(
+          (pin) => pin.accountId === 'fallback-2',
+        ),
+      ).toBe(false)
 
       // Second request: kill filter excludes fallback-2 (memory has below-floor
-      // quota). The pin migrates to fallback-1.
+      // quota). With the killed pin pruned, the session repins to fallback-1.
       const next = await loaded.fetchOverride(
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'x-session-affinity': 'pin-migrate-session' }),

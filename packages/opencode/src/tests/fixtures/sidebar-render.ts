@@ -74,7 +74,7 @@ const initial: SidebarState = vaultMode
       fallbacks: [],
       vaultAccounts: [
         {
-          id: 'vault-one',
+          id: 'vault:one',
           label: 'Vault One',
           enabled: true,
           quota,
@@ -82,13 +82,17 @@ const initial: SidebarState = vaultMode
           resetCredits: credits,
         },
         {
-          id: 'other',
+          id: 'vault:two',
           label: 'Vault Two',
           enabled: true,
           quota,
           killed: false,
         },
       ],
+      activeId: 'vault:one',
+      activeRouting: {
+        second: { activeId: 'vault:two', route: 'sticky', updatedAt: now },
+      },
     }
   : local
 let sequence = now
@@ -245,6 +249,29 @@ try {
   assert.match(frame(), /7d ███████░░░ 30% left/)
   assert.match(frame(), /resets\s+3/)
   if (vaultMode) assert.doesNotMatch(frame(), /main|Spare/)
+  if (vaultMode) {
+    publish({
+      ...initial,
+      vaultAccounts: initial.vaultAccounts?.map((account, index) => ({
+        ...account,
+        enabled: index !== 0,
+        routable: false,
+        vaultState: index === 0 ? 'needs sign-in' : 'unavailable',
+        killed: index === 1,
+      })),
+    })
+    await tick()
+    parity()
+    assert.match(frame(), /Vault One/)
+    assert.match(frame(), /needs sign-in/)
+    assert.match(frame(), /off in \/openai/)
+    assert.match(frame(), /Vault Two\s+blocked/)
+    assert.match(frame(), /unavailable/)
+    assert.match(frame(), /Killswitch\s+Vault Two blocked/)
+    assert.doesNotMatch(frame(), /main|Spare/)
+    publish(initial)
+    await tick()
+  }
   const darkSpans = view.captureSpans()
   setTheme(light)
   await view.renderOnce()
@@ -292,7 +319,7 @@ try {
           vaultAccounts: initial.vaultAccounts?.map((account) => ({
             ...account,
             quota: nextQuota,
-            resetCredits: account.id === 'vault-one' ? 8 : undefined,
+            resetCredits: account.id === 'vault:one' ? 8 : undefined,
           })),
         }
       : {

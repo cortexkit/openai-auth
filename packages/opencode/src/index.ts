@@ -1181,7 +1181,7 @@ export function buildSidebarMachineState(
       ...(typeof mainAccountIdentity === 'string'
         ? { mainAccountId: mainAccountIdentity }
         : {}),
-      killed: false,
+      killed: !killswitchPassesPolicy(mainQuota, store, undefined, now),
       ...(mainQuota?.resetCreditsAvailable !== undefined
         ? { resetCredits: mainQuota.resetCreditsAvailable }
         : {}),
@@ -1213,7 +1213,12 @@ export function buildSidebarMachineState(
                 ),
               }
             : null,
-          killed: false,
+          killed: !killswitchPassesPolicy(
+            fallbackQuota,
+            store,
+            account.id,
+            now,
+          ),
           enabled: true,
           ...(fallbackQuota?.resetCreditsAvailable !== undefined
             ? { resetCredits: fallbackQuota.resetCreditsAvailable }

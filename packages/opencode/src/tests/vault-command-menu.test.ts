@@ -357,7 +357,7 @@ describe('vault command menu', () => {
     }
   })
   test('cold and declined vault accounts are listed but not counted as routable', async () => {
-    roster[0]!.state = 'needs_login'
+    roster[0]!.state = 'needs_reauth'
     roster[1]!.enabled = false
     const accounts = (await sections()).find(
       (section) => section.id === 'accounts',
@@ -373,7 +373,7 @@ describe('vault command menu', () => {
     const quota = (await sections()).find((section) => section.id === 'quota')!
     expect(quota.items.map((item) => item.id)).toEqual([roster[2]!.routeId])
     expect(quota.lines).toEqual([
-      `${roster[0]!.label} (needs_login): ${formatQuota(projectQuota(roster[0]!.quota), { now, form: 'compact' })}`,
+      `${roster[0]!.label} (needs_reauth): ${formatQuota(projectQuota(roster[0]!.quota), { now, form: 'compact' })}`,
       `${roster[1]!.label} (disabled): ${formatQuota(projectQuota(roster[1]!.quota), { now, form: 'compact' })}`,
     ])
   })

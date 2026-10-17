@@ -100,6 +100,9 @@ export interface SidebarAccountState {
   quota: AccountQuota | null
   killed: boolean
   enabled: boolean
+  /** Whether the vault can serve this row now; `enabled` is the /openai toggle. */
+  routable?: boolean
+  vaultState?: 'needs sign-in' | 'turned off in vault' | 'unavailable'
   resetCredits?: number
 }
 
@@ -169,13 +172,12 @@ export interface SidebarState {
    */
   accountPool?: boolean
   /**
-   * Present while the host is in vault mode (enrolled with the Claustrum
-   * vault): the vault accounts that serve instead of the local accounts, in
+   * Present while the host uses the credential vault instead of local logins:
+   * the vault accounts that serve instead of the local accounts, in
    * the vault's order. `main` then carries no account and `fallbacks` is
    * empty, so a reader that does not know this field shows no local account.
-   * Each entry's `label` is the account's email when the vault knows it,
-   * else the vault's label; `enabled` is false for an account the vault will
-   * not serve now (declined, or waiting for a new login there).
+   * `enabled` is the host's own toggle, while `routable` and `vaultState`
+   * describe vault availability independently. Labels never use vault emails.
    */
   vaultAccounts?: SidebarAccountState[]
 }
@@ -473,6 +475,12 @@ function normalizeAccountList(raw: unknown): SidebarAccountState[] {
       quota: ('quota' in e ? e.quota : null) as AccountQuota | null,
       killed: typeof e.killed === 'boolean' ? e.killed : false,
       enabled: typeof e.enabled === 'boolean' ? e.enabled : true,
+      ...(typeof e.routable === 'boolean' ? { routable: e.routable } : {}),
+      ...(['needs sign-in', 'turned off in vault', 'unavailable'].includes(
+        e.vaultState as string,
+      )
+        ? { vaultState: e.vaultState as SidebarAccountState['vaultState'] }
+        : {}),
       ...resetCreditsField(e.resetCredits),
     }))
 }
@@ -505,6 +513,7 @@ export type SidebarRoutingAccount = {
   id: string
   enabled?: boolean
   killed?: boolean
+  routable?: boolean
 }
 
 export function isUsableRoutingEntry(
@@ -521,6 +530,7 @@ export function isUsableRoutingEntry(
     accounts.some(
       (account) =>
         account.enabled !== false &&
+        account.routable !== false &&
         account.killed !== true &&
         account.id === entry.activeId,
     )
@@ -603,7 +613,7 @@ export function resolveSessionStickyAccount(
   ) {
     return undefined
   }
-  if (assignment.accountId === 'main') {
+  if (assignment.accountId === 'main' && state.vaultAccounts === undefined) {
     return state.main?.killed || isQuotaExhausted(state.main?.quota, now)
       ? undefined
       : 'main'
@@ -614,6 +624,7 @@ export function resolveSessionStickyAccount(
   if (
     !fallback ||
     fallback.enabled === false ||
+    fallback.routable === false ||
     fallback.killed === true ||
     isQuotaExhausted(fallback.quota, now)
   ) {
@@ -632,7 +643,10 @@ export function resolveSessionSidebarRouting(
       return { activeId: state.activeId ?? 'main', route: state.route }
     const active = state.vaultAccounts.find(
       (account) =>
-        account.id === state.activeId && account.enabled && !account.killed,
+        account.id === state.activeId &&
+        account.enabled &&
+        account.routable !== false &&
+        !account.killed,
     )
     if (active && !isQuotaExhausted(active.quota, now))
       return { activeId: active.id, route: state.route }
@@ -645,6 +659,7 @@ export function resolveSessionSidebarRouting(
       : accounts.find((account) => account.id === own?.activeId)?.quota
   if (
     own &&
+    (state.vaultAccounts === undefined || own.activeId.startsWith('vault:')) &&
     isUsableRoutingEntry(own, accounts, now) &&
     !isQuotaExhausted(ownQuota, now)
   ) {
@@ -661,13 +676,17 @@ export function resolveSessionSidebarRouting(
   const vaultMode = state.vaultAccounts !== undefined
   const enabledFallbacks = (
     vaultMode ? vaultAccountsInPlacementOrder(state) : state.fallbacks
-  ).filter((account) => account.enabled && !account.killed)
+  ).filter(
+    (account) =>
+      account.enabled && account.routable !== false && !account.killed,
+  )
   const fallback =
     enabledFallbacks.find((account) => !isQuotaExhausted(account.quota, now)) ??
     enabledFallbacks[0]
   return {
-    activeId:
-      (vaultMode || state.route === 'fallback-first') && fallback
+    activeId: vaultMode
+      ? (fallback?.id ?? 'vault')
+      : state.route === 'fallback-first' && fallback
         ? fallback.id
         : 'main',
     route: state.route,
@@ -1013,7 +1032,31 @@ function writeMergedSidebarState(
         (latest) => {
           if (hooks?.canWrite && !hooks.canWrite()) return undefined
           const next = merge(latest)
-          return next === undefined ? undefined : normalizeSidebarState(next)
+          if (next === undefined) return undefined
+          // A mode switch must not leave local session records in a vault-only
+          // file. This runs inside the file lock for every writer, including
+          // late request bookkeeping. Vault pins survive temporary unavailability,
+          // but quota-blocked pins are pruned just as they are in local mode.
+          if (next.vaultAccounts !== undefined) {
+            next.activeId = next.activeId?.startsWith('vault:')
+              ? next.activeId
+              : undefined
+            next.activeRouting = Object.fromEntries(
+              Object.entries(next.activeRouting ?? {}).filter(([, entry]) =>
+                entry.activeId.startsWith('vault:'),
+              ),
+            )
+            next.stickyAssignments = Object.fromEntries(
+              Object.entries(next.stickyAssignments ?? {}).filter(
+                ([, pin]) =>
+                  pin.accountId.startsWith('vault:') &&
+                  !next.vaultAccounts?.some(
+                    (account) => account.id === pin.accountId && account.killed,
+                  ),
+              ),
+            )
+          }
+          return normalizeSidebarState(next)
         },
         {
           beforeRecheck: async (...args) => {
@@ -1244,7 +1287,9 @@ export function setSidebarMachineState(
         const now = Date.now()
         const stickyAssignments = pruneStickyAssignments(
           latest.stickyAssignments,
-          usableRoutingAccountIds(routingAccountsOf(machineState)),
+          vaultMode
+            ? undefined
+            : usableRoutingAccountIds(routingAccountsOf(machineState)),
           now,
         )
         return {
@@ -1332,7 +1377,9 @@ export function upsertSidebarActiveRouting(
         )
         const stickyAssignments = pruneStickyAssignments(
           latest.stickyAssignments,
-          usableRoutingAccountIds(accounts),
+          latest.vaultAccounts !== undefined
+            ? undefined
+            : usableRoutingAccountIds(accounts),
           Date.now(),
         )
         return {
@@ -1387,7 +1434,9 @@ export function removeSidebarActiveRouting(
         )
         const stickyAssignments = pruneStickyAssignments(
           latest.stickyAssignments,
-          usableRoutingAccountIds(accounts),
+          latest.vaultAccounts !== undefined
+            ? undefined
+            : usableRoutingAccountIds(accounts),
           now,
           hashSidebarSessionId(sessionId),
         )
@@ -1649,7 +1698,7 @@ export function persistSidebarStickyAssignment(
       const now = Date.now()
       const stickyAssignments = pruneStickyAssignments(
         latest.stickyAssignments,
-        validPinnedAccountIds,
+        latest.vaultAccounts !== undefined ? undefined : validPinnedAccountIds,
         now,
       )
       const current = stickyAssignments?.[sessionHash]
@@ -2059,7 +2108,7 @@ export function resolveActiveAccount(state: SidebarState): {
     // Choose by the configured first/last placement, but keep the vault route
     // id so the active account still matches its quota and session records.
     const enabled = vaultAccountsInPlacementOrder(state).filter(
-      (account) => account.enabled,
+      (account) => account.enabled && account.routable !== false,
     )
     const vaultAccount =
       enabled.find((account) => account.id === activeId) ?? enabled[0]

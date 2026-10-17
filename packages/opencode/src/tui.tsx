@@ -309,9 +309,7 @@ export function renderedQuotas(state: {
 }): ReadonlyArray<AccountQuota | null | undefined> {
   // In vault mode only the vault accounts are rendered.
   if (state.vaultAccounts !== undefined)
-    return state.vaultAccounts
-      .filter((account) => account.enabled)
-      .map((account) => account.quota)
+    return state.vaultAccounts.map((account) => account.quota)
   return [
     state.main?.quota ?? null,
     ...(state.fallbacks ?? [])
@@ -544,6 +542,8 @@ function AccountBlock(props: {
   name: string
   quota: AccountQuota | null
   killed: boolean
+  vaultState?: string
+  hostDisabled?: boolean
   active: boolean
   pacingEnabled: boolean
   labelWidth: number
@@ -571,6 +571,12 @@ function AccountBlock(props: {
           <b>{statusWord()}</b>
         </text>
       </box>
+      <Show when={props.vaultState}>
+        <text fg={props.theme.warning}>{props.vaultState}</text>
+      </Show>
+      <Show when={props.hostDisabled}>
+        <text fg={props.theme.textMuted}>off in /openai</text>
+      </Show>
       <Show
         when={isQuotaLoaded(props.quota)}
         fallback={<text fg={props.theme.textMuted}>{'checking\u2026'}</text>}
@@ -799,11 +805,10 @@ function QuotaSidebar(props: {
   // Vault mode: the host uses only the vault's accounts, which the file lists
   // in `vaultAccounts`; main and the local fallbacks are not shown.
   const vaultMode = () => state().vaultAccounts !== undefined
-  const enabledVaultAccounts = () =>
-    (state().vaultAccounts ?? []).filter((account) => account.enabled)
+  const vaultAccounts = () => state().vaultAccounts ?? []
   const hasData = () =>
     vaultMode()
-      ? enabledVaultAccounts().length > 0
+      ? vaultAccounts().length > 0
       : state().main?.quota != null || enabledFallbacks().length > 0
 
   const headerLabel = () => {
@@ -847,8 +852,8 @@ function QuotaSidebar(props: {
   }
   const killedNames = () =>
     [
-      state().main?.killed ? 'main' : '',
-      ...enabledFallbacks()
+      !vaultMode() && state().main?.killed ? 'main' : '',
+      ...(vaultMode() ? vaultAccounts() : enabledFallbacks())
         .filter((f) => f.killed)
         .map((f) => f.label ?? f.id),
     ].filter(Boolean)
@@ -946,7 +951,7 @@ function QuotaSidebar(props: {
             <Show
               when={!vaultMode()}
               fallback={
-                <For each={enabledVaultAccounts()}>
+                <For each={vaultAccounts()}>
                   {(account, index) => (
                     <AccountBlock
                       theme={theme()}
@@ -954,6 +959,8 @@ function QuotaSidebar(props: {
                       name={account.label ?? account.id}
                       quota={account.quota}
                       killed={account.killed}
+                      vaultState={account.vaultState}
+                      hostDisabled={!account.enabled}
                       active={sessionRouting().activeId === account.id}
                       pacingEnabled={prefs().sections.pacing}
                       labelWidth={quotaLabelWidth()}
