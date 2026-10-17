@@ -471,9 +471,14 @@ for (const ending of [
       expect(f.writes).toEqual([])
       expect(f.bytes()).toEqual(before)
       if (ending === 'main' || ending === 'enroll')
-        expect(message).toMatchObject({
+        expect(message).toEqual({
+          command: 'openai',
           notify: {
-            code: ending === 'main' ? 'main-account' : 'vault-local-action',
+            message:
+              ending === 'main'
+                ? 'Adding the account failed: that account is already your main account, so it was not added again'
+                : 'Adding the account failed: Nothing was changed: accounts are managed in the vault with ck. Disconnect to use local accounts.',
+            kind: 'error',
           },
         })
     } else {

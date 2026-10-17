@@ -44,11 +44,9 @@ On OpenCode 2, models show OpenCode's own prices, even when you use the plugin's
 
 ## The `/openai` menu
 
-On OpenCode 2, [`/openai`](commands.md#the-openai-command) shows the same sections as on OpenCode 1: Accounts, Quota, Routing, Limits, This session and Vault. It supports adding accounts through browser or headless sign-in, enabling and disabling accounts, confirmed removal, account order, routing mode, quota checks, quota floors, the killswitch and clearing the current session's pin. The main account and accounts receiving a login transfer cannot be removed. Menu sign-in adds a pool account without replacing `main`; use `opencode auth login` to replace the main login.
+On OpenCode 2, [`/openai`](commands.md#the-openai-command) shows the same sections as on OpenCode 1: Accounts, Quota, Routing, Limits, This session and Vault. From it you can add accounts (browser or headless sign-in), turn accounts on and off, remove them after confirming, set their order and the routing mode, check quota, set quota floors and the killswitch, and clear the current session's account pin. The main account can't be removed; to replace the main login, use `opencode auth login`.
 
-While connected to the vault, the menu shows only vault accounts. Quota checks, routing mode, floors, the killswitch and clear-pin remain available; local account changes and ordering refuse. Vault connect, disconnect and per-host account controls are not available here yet. A local sign-in still in progress when the host enrolls in the vault inserts nothing. After disconnecting, local account controls work again.
-
-Cache, Diagnostics and Reset credits show "Not available on OpenCode 2 yet." Opening the menu never signs you in, checks quota, starts a model turn or writes anything. Actions run on the server, not in the TUI; cancelled input and unconfirmed removal change nothing. Locations using the same account files share settings and session pins without a restart.
+While connected to the [vault](vault.md), the menu shows only vault accounts, and local account changes are refused. Quota checks, routing, floors, the killswitch and clearing a pin still work. Cache, Diagnostics and Reset credits show "Not available on OpenCode 2 yet."
 
 ## Not on OpenCode 2 yet
 

@@ -631,7 +631,7 @@ export function menuLogin(
         if (vault && (await vault.authority()) !== 'local')
           throw new CommandError(
             'vault-local-action',
-            `[vault-local-action] ${VAULT_LOCAL_ACTION_REFUSAL}`,
+            VAULT_LOCAL_ACTION_REFUSAL,
           )
         const main = await deps.mainIdentity?.()
         if (
@@ -640,10 +640,7 @@ export function menuLogin(
         ) {
           // The internal id only: the ChatGPT identity is sensitive.
           log.warn('account add rejected (main identity)', { id: account.id })
-          throw new CommandError(
-            'main-account',
-            `[main-account] ${MAIN_ACCOUNT_REFUSAL}`,
-          )
+          throw new CommandError('main-account', MAIN_ACCOUNT_REFUSAL)
         }
         log.info('account added', { id: account.id })
         return loginAddInput(account)

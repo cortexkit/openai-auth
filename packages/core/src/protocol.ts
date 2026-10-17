@@ -19,7 +19,7 @@ export type OpenDialogPayload = CommandDialogPayload
  */
 export interface NotifyPayload {
   command: string
-  notify: { message: string; kind: NotifyKind; code?: string }
+  notify: { message: string; kind: NotifyKind }
 }
 
 export interface RpcNotification {

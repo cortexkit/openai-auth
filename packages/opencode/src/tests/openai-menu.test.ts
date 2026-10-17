@@ -570,6 +570,45 @@ describe('/openai on a migrated install', () => {
     ).toEqual(['main', 'alpha'])
   })
 
+  test('OpenCode 1 late-login refusal keeps its original text without bracket markers', async () => {
+    seed()
+    const before = readFileSync(files.configFile, 'utf8')
+    let notify!: (message: string) => void
+    const notification = new Promise<string>((resolve) => {
+      notify = resolve
+    })
+    const ctx = context({
+      beginAccountLogin: async () => ({
+        url: 'https://auth.example/authorize',
+        instructions: '',
+        completion: Promise.resolve({
+          id: 'again',
+          type: 'oauth',
+          refresh: 'again-refresh',
+          enabled: true,
+          addedAt: 1,
+          lastUsed: 1,
+          accountId: 'chatgpt-main',
+        } satisfies IngestAccount),
+      }),
+    })
+
+    expect(
+      (
+        await createOpenCodeMenu(ctx).apply(
+          { command: 'openai', sectionId: 'accounts', actionId: 'add' },
+          { sessionId: 'session-a', notify },
+        )
+      ).ok,
+    ).toBe(true)
+    const message = await notification
+    expect(message).toBe(
+      'Adding the account failed: that account is already your main account, so it was not added again',
+    )
+    expect(message).not.toMatch(/\[(?:main-account|vault-local-action)\]/)
+    expect(readFileSync(files.configFile, 'utf8')).toBe(before)
+  })
+
   test('a quota check reports a rejected sign-in as needing re-adding', async () => {
     seed()
     const ctx = context({
