@@ -33,6 +33,7 @@ async function fixture(
   connectionFile?: () => string,
   twoLocations = true,
   accounts = ['main', 'alpha', 'beta'],
+  observation: { intervalMs?: number } = { intervalMs: 250 },
 ) {
   const sources = new Set<PoolAccountSource>()
   const originalSubscribe = PoolAccountSource.prototype.subscribe
@@ -70,6 +71,7 @@ async function fixture(
     const dispose = await setupOpenAIAuth(host.ctx, {
       paths: files.paths,
       sidebarStateFile: file,
+      sidebarObservationIntervalMs: observation.intervalMs,
       heartbeat: false,
       poolMigration: false,
       fetch: fetchImpl,
@@ -246,6 +248,18 @@ test('OpenCode 2 publisher: routing floor killswitch and successful apply publis
   expect(state.fallbacks.map((row) => row.id)).toEqual(['alpha'])
   expect(f.calls.every((url) => url.includes('/wham/usage'))).toBe(true)
   expect(refresh).not.toHaveBeenCalled()
+})
+
+test('OpenCode 2 publisher: production observer defaults to two seconds', async () => {
+  const intervals = spyOn(globalThis, 'setInterval')
+  cleanups.push(() => intervals.mockRestore())
+  await fixture(undefined, false, ['main'], {})
+  expect(
+    intervals.mock.calls.filter(([, delay]) => delay === 2_000),
+  ).toHaveLength(1)
+  expect(
+    intervals.mock.calls.filter(([, delay]) => delay === 250),
+  ).toHaveLength(0)
 })
 
 test('OpenCode 2 publisher: one observer per file survives a location disposal', async () => {

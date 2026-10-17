@@ -123,6 +123,12 @@ const SETTLE_ON_DISPOSE_MS = 5_000
 export interface OpenAIAuthV2Options {
   /** Binds this location's sidebar output; defaults to the shared sidebar state file. */
   sidebarStateFile?: string
+  /**
+   * Test-only interval in milliseconds for checking settings/enrollment file
+   * metadata and cached vault rosters. Tests can shorten the 2,000 ms default
+   * to observe changes quickly.
+   */
+  sidebarObservationIntervalMs?: number
   /** Overrides the production menu for transport fixtures. */
   controlPlane?: ControlPlaneMenu
   /** The account config and state files; read on every use. */
@@ -508,6 +514,7 @@ export async function setupOpenAIAuth(
   const sidebar = acquireSidebarPublisher(
     { paths: paths(), source, pins, vault },
     options.sidebarStateFile,
+    options.sidebarObservationIntervalMs,
   )
   using _sidebarRollback = {
     [Symbol.dispose]() {

@@ -75,7 +75,10 @@ class SidebarPublisher {
   private chain = Promise.resolve()
   private timer?: ReturnType<typeof setInterval>
 
-  constructor(private readonly file: string) {}
+  constructor(
+    private readonly file: string,
+    private readonly observationIntervalMs: number,
+  ) {}
 
   add(producer: Producer): () => void {
     this.producers.add(producer)
@@ -122,7 +125,7 @@ class SidebarPublisher {
           void this.publish(owner)
         }
       }
-    }, 250)
+    }, this.observationIntervalMs)
     this.timer.unref?.()
     return () => {
       unsubscribe()
@@ -240,11 +243,12 @@ processState[registryKey] = publishers
 export function acquireSidebarPublisher(
   producer: Producer,
   file = getSidebarStateFile(),
+  observationIntervalMs = 2_000,
 ) {
   const key = resolve(file)
   let publisher = publishers.get(key)
   if (!publisher) {
-    publisher = new SidebarPublisher(key)
+    publisher = new SidebarPublisher(key, observationIntervalMs)
     publishers.set(key, publisher)
   }
   const owner = publisher

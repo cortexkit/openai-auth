@@ -3851,3 +3851,16 @@ command = ["bun", "test", "--cwd", "packages/opencode", "src/tests/opencode2-sid
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode 2 publisher: pin clear preserves two other sessions and subagent routing$']
+
+[[control]]
+id = "opencode2-sidebar-idle-observation-interval"
+guards = "passive sidebar observation defaults to two seconds instead of four idle scans per second"
+file = "packages/opencode/src/v2/sidebar-publisher.ts"
+old = "  observationIntervalMs = 2_000,"
+new = "  observationIntervalMs = 250, // NON-VACUITY BREAK: restore frequent idle file scans."
+test_file = "packages/opencode/src/tests/opencode2-sidebar-publisher.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar-publisher.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 publisher: production observer defaults to two seconds$']
