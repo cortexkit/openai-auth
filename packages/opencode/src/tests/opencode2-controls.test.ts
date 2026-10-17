@@ -12,6 +12,7 @@ import {
 } from '@cortexkit/openai-auth-core/internal'
 import { createOpenCodeMenu, type OpenCodeMenuContext } from '../commands'
 import { openAccountPool } from '../core/pool-accounts'
+import { setLogLevel } from '../logger'
 import {
   drainNotifications,
   resetNotificationsForTest,
@@ -34,6 +35,7 @@ const cleanups: Array<() => unknown> = []
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
   resetNotificationsForTest()
+  setLogLevel(undefined)
   for (const root of roots.splice(0))
     rmSync(root, { recursive: true, force: true })
 })
@@ -280,6 +282,12 @@ const rows = [
     values: { enabled: true },
   },
   { name: 'clear-pin', sectionId: 'session', actionId: 'clear-pin' },
+  {
+    name: 'logging',
+    sectionId: 'diagnostics',
+    actionId: 'logging',
+    values: { level: 'debug' },
+  },
 ] as const
 
 for (const enrolled of [false, true]) {
@@ -326,7 +334,7 @@ for (const enrolled of [false, true]) {
         )
       if (
         !enrolled ||
-        ['quota', 'limits', 'session'].includes(row.sectionId) ||
+        ['quota', 'limits', 'session', 'diagnostics'].includes(row.sectionId) ||
         row.name === 'mode'
       )
         expect(got.ok).toBe(true)
@@ -544,7 +552,11 @@ for (const enrolled of [false, true]) {
           'window',
           'primary',
           'secondary',
-        ].map((actionId) => ({ sectionId, actionId })),
+        ]
+          .filter(
+            (actionId) => sectionId !== 'diagnostics' || actionId !== 'logging',
+          )
+          .map((actionId) => ({ sectionId, actionId })),
       ),
       { sectionId: 'accounts', actionId: 'future-action' },
       { sectionId: 'future-section', actionId: 'enable' },
@@ -566,6 +578,43 @@ for (const enrolled of [false, true]) {
     expect(f.bytes()).toEqual(before)
   })
 }
+
+for (const enrolled of [false, true]) {
+  test(`OpenCode 2 diagnostics exposes the shared log controls in ${enrolled ? 'vault' : 'local'} mode`, async () => {
+    const f = fixture(enrolled)
+    const expected = await createOpenCodeMenu(f.context).open(invocation)
+    const actual = await f.menu().open('S')
+    const diagnostics = actual.menu.sections.find((s) => s.id === 'diagnostics')
+    expect(diagnostics).toEqual(
+      expected.menu.sections.find((s) => s.id === 'diagnostics'),
+    )
+    expect(diagnostics?.actions.map((action) => action.id)).toEqual([
+      'dump',
+      'logging',
+    ])
+  })
+}
+
+test('OpenCode 2 diagnostics refuses item actions and request dumps', async () => {
+  const f = fixture()
+  const before = f.bytes()
+  for (const actionId of ['logging', 'dump', 'unknown']) {
+    for (const itemId of [undefined, '', 'main', 'missing']) {
+      if (actionId === 'logging' && itemId === undefined) continue
+      const result = await f.menu().apply({
+        sectionId: 'diagnostics',
+        actionId,
+        ...(itemId !== undefined ? { itemId } : {}),
+        values: { level: 'trace', enabled: true },
+        confirmed: true,
+      })
+      expect(result.ok).toBe(false)
+      expect(result.text).toBe('Not available on OpenCode 2 yet.')
+    }
+  }
+  expect(f.writes).toEqual([])
+  expect(f.bytes()).toEqual(before)
+})
 
 async function setupLocation(f: ReturnType<typeof fixture>, directory: string) {
   const host = fakeOpenCode2Host({ directory })

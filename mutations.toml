@@ -3960,3 +3960,82 @@ command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/index.test.ts", "
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/index.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^Pi\sOpenAI\sauth\sextension\sowns\sinspect\slock-compromised\sat\sstartup,\ssession\sstart\sand\sa\sbackground\stick$']
+
+
+[[control]]
+id = "opencode2-diagnostics-logging-capability"
+guards = "Diagnostics can set the log level through the server capability fence"
+file = "packages/opencode/src/v2/menu.ts"
+old = "      return !item && request.actionId === 'logging'"
+new = "      return false // NON-VACUITY BREAK: refuse supported log level changes."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 controls matrix local logging$']
+
+[[control]]
+id = "opencode2-diagnostics-no-item-actions"
+guards = "Diagnostics refuses logging with any item id, including an empty one"
+file = "packages/opencode/src/v2/menu.ts"
+old = "      return !item && request.actionId === 'logging'"
+new = "      return request.actionId === 'logging' // NON-VACUITY BREAK: accept item actions."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 diagnostics refuses item actions and request dumps$']
+
+[[control]]
+id = "opencode2-diagnostics-dumps-still-refuse"
+guards = "showing Diagnostics does not enable request dumps"
+file = "packages/opencode/src/v2/menu.ts"
+old = "      return !item && request.actionId === 'logging'"
+new = "      return !item && ['logging', 'dump'].includes(request.actionId) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 diagnostics refuses item actions and request dumps$']
+
+[[control]]
+id = "opencode2-other-menu-requests-still-refuse"
+guards = "the new Diagnostics capability does not admit cache, reset, vault enrollment or unknown requests"
+file = "packages/opencode/src/v2/menu.ts"
+old = "    default:\n      return false"
+new = "    default:\n      return true // NON-VACUITY BREAK: admit unlisted requests."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 rejects all non-control engine rows in local mode$']
+
+[[control]]
+id = "opencode2-diagnostics-visible"
+guards = "Diagnostics exposes the shared section once log level changes are available"
+file = "packages/opencode/src/v2/menu.ts"
+old = "    unavailableSections: ['cache', 'reset'],"
+new = "    unavailableSections: ['cache', 'diagnostics', 'reset'], // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 diagnostics exposes the shared log controls in local mode$']
+
+[[control]]
+id = "opencode2-persisted-log-level-precedence"
+guards = "a stored log level overrides the environment floor after server startup"
+file = "packages/opencode/src/v2/setup.ts"
+old = "    setLogLevel(storedLevel as Parameters<typeof setLogLevel>[0])"
+new = "    void storedLevel // NON-VACUITY BREAK: keep the environment floor instead of the saved choice."
+test_file = "packages/opencode/src/tests/opencode2-logging.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-logging.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-logging.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 log precedence matches OpenCode 1: stored over conflicting env$']

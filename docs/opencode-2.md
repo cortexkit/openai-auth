@@ -44,9 +44,9 @@ On OpenCode 2, models show OpenCode's own prices, even when you use the plugin's
 
 ## The `/openai` menu
 
-On OpenCode 2, [`/openai`](commands.md#the-openai-command) shows the same sections as on OpenCode 1: Accounts, Quota, Routing, Limits, This session and Vault. From it you can add accounts (browser or headless sign-in), turn accounts on and off, remove them after confirming, set their order and the routing mode, check quota, set quota floors and the killswitch, and clear the current session's account pin. The main account can't be removed; to replace the main login, use `opencode auth login`.
+On OpenCode 2, [`/openai`](commands.md#the-openai-command) shows the same sections as on OpenCode 1: Accounts, Quota, Routing, Limits, Diagnostics, This session and Vault. From it you can add accounts (browser or headless sign-in), turn accounts on and off, remove them after confirming, set their order and the routing mode, check quota, set quota floors and the killswitch, set the log level in Diagnostics, and clear the current session's account pin. The log level takes effect immediately and is saved for the next start. Turning request dumps on is not available yet. The main account can't be removed; to replace the main login, use `opencode auth login`.
 
-While connected to the [vault](vault.md), the menu shows only vault accounts, and local account changes are refused. Quota checks, routing, floors, the killswitch and clearing a pin still work. Cache, Diagnostics and Reset credits show "Not available on OpenCode 2 yet."
+While connected to the [vault](vault.md), the menu shows only vault accounts, and local account changes are refused. Quota checks, routing, floors, the killswitch, log level changes and clearing a pin still work. Cache and Reset credits show "Not available on OpenCode 2 yet."
 
 ## Sidebar
 
@@ -56,4 +56,4 @@ One difference: OpenCode 2 always places the sidebar after its own panels, so th
 
 ## Not on OpenCode 2 yet
 
-The menu's vault enrollment and per-host account controls, [cache keep-warm](cache-keep-warm.md), [request dumps](troubleshooting.md#request-dumps), diagnostics actions, [reset-credit preview and redemption](accounts-and-routing.md#reset-credits), OpenCode 1's extra conversation headers and Codex-specific tool formatting are not implemented on OpenCode 2 yet.
+The menu's vault enrollment and per-host account controls, [cache keep-warm](cache-keep-warm.md), [request dumps](troubleshooting.md#request-dumps), [reset-credit preview and redemption](accounts-and-routing.md#reset-credits), OpenCode 1's extra conversation headers and Codex-specific tool formatting are not implemented on OpenCode 2 yet.

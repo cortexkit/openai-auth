@@ -5,7 +5,7 @@ import {
 } from '../commands'
 import type { ControlPlaneMenu } from './control-plane'
 
-/** Only the account and routing controls supported by this host may run. */
+/** Only the menu actions supported by this host may run. */
 function allowed(request: {
   sectionId: string
   actionId: string
@@ -27,6 +27,8 @@ function allowed(request: {
         : request.actionId === 'killswitch'
     case 'session':
       return !item && request.actionId === 'clear-pin'
+    case 'diagnostics':
+      return !item && request.actionId === 'logging'
     default:
       return false
   }
@@ -39,7 +41,7 @@ export function createControlPlaneMenu(
   const controls: OpenCodeMenuContext = {
     ...context,
     allowAction: allowed,
-    unavailableSections: ['cache', 'diagnostics', 'reset'],
+    unavailableSections: ['cache', 'reset'],
   }
   return {
     open: (sessionId) => openOpenAiMenu(controls, sessionId),

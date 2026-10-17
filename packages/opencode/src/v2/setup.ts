@@ -87,7 +87,7 @@ import { startProcessHeartbeat } from '../core/process-heartbeat'
 import { acquireOpenCodeVault } from '../core/shared-vault'
 import { migrationFenceOpen } from '../core/version-fence'
 import { POOL_MIGRATION_ENABLED } from '../index'
-import { createLogger } from '../logger'
+import { createLogger, setLogLevel } from '../logger'
 import { PackageVersion } from '../version'
 import {
   createOpenAIAdapter,
@@ -328,6 +328,13 @@ export async function setupOpenAIAuth(
   const log = createLogger('opencode2')
   const logQ = createLogger('quota')
   const paths = options.paths ?? (() => getAccountPaths(getConfigPath()))
+  // The logger starts with the environment floor. A saved choice overrides it,
+  // just as it does on OpenCode 1, before setup writes any diagnostic lines.
+  const storage = await loadAccounts(paths())
+  const storedLevel = storage?.logging?.level
+  if (storedLevel && typeof storedLevel === 'string') {
+    setLogLevel(storedLevel as Parameters<typeof setLogLevel>[0])
+  }
   const fetchImpl = options.fetch ?? fetch
   const version = options.version ?? PackageVersion
   const migrationEnabled = options.poolMigration ?? POOL_MIGRATION_ENABLED
