@@ -58,7 +58,11 @@ const isModelOrToolItem = (item: unknown) =>
       item.type !== 'message' &&
       item.type !== 'configuration_update'))
 
-/** Two user messages count as equal for the resend test exactly when these are equal. */
+/**
+ * The fingerprint `FrameTurnState` records for a user message. Two user
+ * messages count as equal when deciding whether a full frame is a resend
+ * exactly when their fingerprints are equal.
+ */
 export function userMessageFingerprint(item: unknown): string {
   return createHash('sha256').update(JSON.stringify(item)).digest('hex')
 }
