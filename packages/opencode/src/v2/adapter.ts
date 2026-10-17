@@ -94,6 +94,7 @@ import {
 } from './codex-wire'
 import { codexRequestURL } from './endpoint'
 import type { SessionPins } from './pins'
+import { SessionAccounts } from './session-accounts'
 
 /** The provider (and integration) OpenCode 2 serves ChatGPT logins under. */
 export const OPENAI_PROVIDER_ID = 'openai'
@@ -122,9 +123,6 @@ const NOMINAL_REQUEST_BYTES = 1
  */
 export const NO_ACCOUNT_REFUSAL =
   'request refused: no account with a usable credential'
-
-/** Most sessions whose last agent-loop account is remembered. */
-const MAX_SESSION_ACCOUNTS = 1024
 
 /** One quota reading, as the OpenCode 1 request path records it. */
 export interface CodexQuotaReading {
@@ -204,6 +202,12 @@ export interface OpenAIAdapterDeps {
   storage: () => Promise<AccountStorage | null>
   pins: SessionPins
   /**
+   * Where each session's latest agent-loop account is recorded. Setup passes
+   * the process-wide registry for the account store, so every location reads
+   * and writes the same map; without it the adapter keeps a private one.
+   */
+  sessionAccounts?: SessionAccounts
+  /**
    * This host's vault accounts. While it is enrolled (vault mode) they are
    * the only accounts a request may use: no pool row is read, refreshed or
    * sent with, and a request no vault account can serve is refused.
@@ -233,6 +237,11 @@ export interface OpenAIAdapter {
   ): void
   /** Drops a session's pin and remembered account. */
   forgetSession(sessionId: string): void
+  /**
+   * The account of the session's latest agent-loop request, read from the
+   * session-account registry without changing it.
+   */
+  activeAccount(sessionId: string): string | undefined
 }
 
 /** One account a request may go to: a pool row or a vault account. */
@@ -403,17 +412,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   const vaultMarks = new Map<string, number>()
   // The row each session's latest agent-loop request went to, which its
   // title, compaction and generate requests follow in the ordered modes.
-  const sessionAccounts = new Map<string, string>()
-
-  const rememberSessionAccount = (sessionId: string, accountId: string) => {
-    sessionAccounts.delete(sessionId)
-    sessionAccounts.set(sessionId, accountId)
-    while (sessionAccounts.size > MAX_SESSION_ACCOUNTS) {
-      const oldest = sessionAccounts.keys().next().value
-      if (oldest === undefined) break
-      sessionAccounts.delete(oldest)
-    }
-  }
+  const sessionAccounts = deps.sessionAccounts ?? new SessionAccounts()
 
   /**
    * The accounts one request may be sent with now: the routable pool rows,
@@ -672,7 +671,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         routing,
         mode,
         skip,
-        primary ? undefined : sessionAccounts.get(input.sessionID),
+        primary ? undefined : sessionAccounts.activeAccount(input.sessionID),
         vaultMode
           ? mode === 'sticky-balanced'
             ? null
@@ -740,7 +739,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       })
     }
     if (accountId !== undefined && primary) {
-      rememberSessionAccount(input.sessionID, accountId)
+      sessionAccounts.record(input.sessionID, accountId)
       deps.onRoute?.(input.sessionID, accountId, mode)
     }
     log?.debug('pool account chosen', {
@@ -973,8 +972,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     },
     forgetSession(sessionId) {
       pins.forget(sessionId)
-      sessionAccounts.delete(sessionId)
+      sessionAccounts.forget(sessionId)
       effort.forget(sessionId)
     },
+    activeAccount: (sessionId) => sessionAccounts.activeAccount(sessionId),
   }
 }

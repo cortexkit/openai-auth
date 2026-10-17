@@ -116,6 +116,7 @@ import {
   createPoolResetDeps,
   ResetCreditCounts,
 } from './reset-credits'
+import { acquireSessionAccounts } from './session-accounts'
 import { acquireSessionPins } from './shared-pins'
 import { acquireSidebarPublisher } from './sidebar-publisher'
 
@@ -611,6 +612,7 @@ export async function setupOpenAIAuth(
     slotPlaceholderWithoutMain,
     storage: () => loadAccounts(paths()),
     pins,
+    sessionAccounts: acquireSessionAccounts(paths()),
     vault,
     awaitVaultRoster: async () => {
       await settlesWithin(

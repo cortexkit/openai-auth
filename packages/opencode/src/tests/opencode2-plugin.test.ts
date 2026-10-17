@@ -25,6 +25,11 @@ import { codexRequestURL } from '../v2/endpoint'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { applyCodexModelRules } from '../v2/models'
 import { SessionPins } from '../v2/pins'
+import {
+  acquireSessionAccounts,
+  MAX_SESSION_ACCOUNTS,
+  SessionAccounts,
+} from '../v2/session-accounts'
 import { type OpenAIAuthV2Options, setupOpenAIAuth } from '../v2/setup'
 import { acquireSessionPins } from '../v2/shared-pins'
 import {
@@ -33,6 +38,7 @@ import {
   type PoolFiles,
   type PoolSeedRow,
   poolFiles,
+  quotaMap,
   type RequestKind,
   type RoutingModeSeed,
   scope,
@@ -479,6 +485,175 @@ describe('OpenCode 2 shared session pins', () => {
     expect(bearer(await poolRequestHeaders(one.host, 'ses_deleted'))).toBe(
       'Bearer b-token',
     )
+  })
+})
+
+describe('OpenCode 2 session-account registry', () => {
+  const ordered = [{ id: 'main' }, { id: 'fb' }]
+
+  it('remembers each session account until the cap, then evicts the least recently recorded', () => {
+    const accounts = new SessionAccounts(2)
+    accounts.record('ses_1', 'a')
+    accounts.record('ses_2', 'b')
+    // Recording again makes ses_1 the most recent; reading does not count.
+    accounts.record('ses_1', 'c')
+    expect(accounts.activeAccount('ses_2')).toBe('b')
+    accounts.record('ses_3', 'd')
+    expect(accounts.activeAccount('ses_2')).toBeUndefined()
+    expect(accounts.activeAccount('ses_1')).toBe('c')
+    expect(accounts.activeAccount('ses_3')).toBe('d')
+    expect(accounts.size).toBe(2)
+    accounts.forget('ses_1')
+    expect(accounts.activeAccount('ses_1')).toBeUndefined()
+    expect(accounts.size).toBe(1)
+  })
+
+  it(`holds ${MAX_SESSION_ACCOUNTS} sessions by default`, () => {
+    expect(MAX_SESSION_ACCOUNTS).toBe(1024)
+    const accounts = new SessionAccounts()
+    for (let index = 0; index <= MAX_SESSION_ACCOUNTS; index++)
+      accounts.record(`ses_${index}`, 'a')
+    expect(accounts.size).toBe(MAX_SESSION_ACCOUNTS)
+    expect(accounts.activeAccount('ses_0')).toBeUndefined()
+    expect(accounts.activeAccount('ses_1')).toBe('a')
+  })
+
+  it("adapters sharing a registry read one another's choices and deletions through activeAccount", async () => {
+    const row = {
+      id: 'main',
+      type: 'oauth',
+      enabled: true,
+      candidate: true,
+      hasEntry: true,
+      needsFirstReading: false,
+      credentialEpoch: 1,
+      identity: 'chatgpt-main',
+      credential: {
+        type: 'oauth',
+        access: 'main-token',
+        refresh: 'main-refresh',
+        expires: Date.now() + 3_600_000,
+      },
+      quota: quotaMap(10),
+    }
+    const view = { active: true, rows: [row] }
+    const source = {
+      current: async () => view,
+      peek: () => view,
+      prepareTokens: async () => {},
+      usableToken: () => 'main-token',
+      rateLimitMarks: () => new Map(),
+      refreshBackoffFor: () => new Map(),
+      requestReading: () => {},
+    } as never
+    const registry = new SessionAccounts()
+    const adapter = () =>
+      createOpenAIAdapter({
+        source,
+        storage: async () => null,
+        pins: new SessionPins(),
+        sessionAccounts: registry,
+      })
+    const one = adapter()
+    const two = adapter()
+    expect(
+      await one.adapter.chooseAccount({
+        ...scope('ses_1'),
+        providerID: 'openai',
+        modelID: 'gpt-5.5',
+      } as never),
+    ).toBe('main')
+    expect(two.activeAccount('ses_1')).toBe('main')
+    expect(registry.activeAccount('ses_1')).toBe('main')
+    two.forgetSession('ses_1')
+    expect(one.activeAccount('ses_1')).toBeUndefined()
+  })
+
+  it('gives each account store its own registry and one registry per store', () => {
+    const files = poolFiles()
+    const other = poolFiles()
+    const registry = acquireSessionAccounts(files)
+    expect(
+      acquireSessionAccounts({
+        configPath: relative(process.cwd(), files.configPath),
+        statePath: relative(process.cwd(), files.statePath),
+      }),
+    ).toBe(registry)
+    expect(acquireSessionAccounts(other)).not.toBe(registry)
+  })
+
+  for (const mode of [
+    'ordered',
+    'main-first',
+    'fallback-first',
+    'sticky-balanced',
+  ] as const) {
+    it(`records every agent-loop choice in ${mode} mode`, async () => {
+      const { host, files } = await startPool(mode, ordered)
+      const chosen = bearer(await poolRequestHeaders(host, 'ses_1'))
+      expect(chosen).toMatch(/^Bearer (main|fb)-token$/)
+      expect(acquireSessionAccounts(files).activeAccount('ses_1')).toBe(
+        chosen?.replace(/^Bearer (.*)-token$/, '$1'),
+      )
+      // A title request follows the session's account; it records nothing.
+      await poolRequestHeaders(host, 'ses_title_only', 'title')
+      expect(
+        acquireSessionAccounts(files).activeAccount('ses_title_only'),
+      ).toBeUndefined()
+    })
+  }
+
+  it("every location's title request follows the account another location recorded", async () => {
+    const files = poolFiles()
+    seedPool(files, 'main-first', ordered)
+    const one = await start(files)
+    const two = await start(files)
+    expect(bearer(await poolRequestHeaders(one.host, 'ses_1'))).toBe(
+      'Bearer main-token',
+    )
+    // Fallback first now puts fb at the head of the order; the title still
+    // follows main, the account the session's agent loop is on.
+    seedPool(files, 'fallback-first', ordered)
+    expect(bearer(await poolRequestHeaders(two.host, 'ses_1', 'title'))).toBe(
+      'Bearer main-token',
+    )
+    expect(bearer(await poolRequestHeaders(two.host, 'ses_2', 'title'))).toBe(
+      'Bearer fb-token',
+    )
+  })
+
+  it("still resolves a session's account after its location reloads", async () => {
+    const files = poolFiles()
+    seedPool(files, 'main-first', ordered)
+    const one = await start(files)
+    expect(bearer(await poolRequestHeaders(one.host, 'ses_1'))).toBe(
+      'Bearer main-token',
+    )
+    await one.stop()
+    seedPool(files, 'fallback-first', ordered)
+    const reloaded = await start(files)
+    expect(acquireSessionAccounts(files).activeAccount('ses_1')).toBe('main')
+    expect(
+      bearer(await poolRequestHeaders(reloaded.host, 'ses_1', 'compaction')),
+    ).toBe('Bearer main-token')
+  })
+
+  it('a session deleted in one location loses its account in every location', async () => {
+    const files = poolFiles()
+    seedPool(files, 'main-first', ordered)
+    const one = await start(files)
+    const two = await start(files)
+    expect(bearer(await poolRequestHeaders(one.host, 'ses_deleted'))).toBe(
+      'Bearer main-token',
+    )
+    seedPool(files, 'fallback-first', ordered)
+    await one.host.publish('session.deleted', { sessionID: 'ses_deleted' })
+    expect(
+      acquireSessionAccounts(files).activeAccount('ses_deleted'),
+    ).toBeUndefined()
+    expect(
+      bearer(await poolRequestHeaders(two.host, 'ses_deleted', 'title')),
+    ).toBe('Bearer fb-token')
   })
 })
 
