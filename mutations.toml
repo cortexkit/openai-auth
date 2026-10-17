@@ -5166,3 +5166,75 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "opencode2-active-account-records-primary"
+guards = "chooseAccount records every agent-loop choice, in every routing mode, in the session-account registry that title, compaction and generate requests follow and keep-warm reads as activeAccount"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "      sessionAccounts.record(input.sessionID, accountId)"
+new = "      // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\ssession-account\sregistry\srecords\severy\sagent-loop\schoice\sin\sordered\smode$', '^OpenCode\s2\ssession-account\sregistry\srecords\severy\sagent-loop\schoice\sin\smain-first\smode$', '^OpenCode\s2\ssession-account\sregistry\srecords\severy\sagent-loop\schoice\sin\sfallback-first\smode$', '^OpenCode\s2\ssession-account\sregistry\srecords\severy\sagent-loop\schoice\sin\ssticky-balanced\smode$', '''^OpenCode\s2\ssession-account\sregistry\severy\slocation's\stitle\srequest\sfollows\sthe\saccount\sanother\slocation\srecorded$''', '''^OpenCode\s2\ssession-account\sregistry\sstill\sresolves\sa\ssession's\saccount\safter\sits\slocation\sreloads$''', '''^OpenCode\s2\ssession-account\sregistry\sadapters\ssharing\sa\sregistry\sread\sone\sanother's\schoices\sand\sdeletions\sthrough\sactiveAccount$''']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-active-account-shared-per-store"
+guards = "every OpenCode 2 location's adapter uses the one process-wide session-account registry for its account store, so a session's account survives a location reload and is the same in every location"
+file = "packages/opencode/src/v2/setup.ts"
+old = "    sessionAccounts: acquireSessionAccounts(paths()),"
+new = "    // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\ssession-account\sregistry\srecords\severy\sagent-loop\schoice\sin\sordered\smode$', '^OpenCode\s2\ssession-account\sregistry\srecords\severy\sagent-loop\schoice\sin\smain-first\smode$', '^OpenCode\s2\ssession-account\sregistry\srecords\severy\sagent-loop\schoice\sin\sfallback-first\smode$', '^OpenCode\s2\ssession-account\sregistry\srecords\severy\sagent-loop\schoice\sin\ssticky-balanced\smode$', '''^OpenCode\s2\ssession-account\sregistry\severy\slocation's\stitle\srequest\sfollows\sthe\saccount\sanother\slocation\srecorded$''', '''^OpenCode\s2\ssession-account\sregistry\sstill\sresolves\sa\ssession's\saccount\safter\sits\slocation\sreloads$''']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-active-account-forgotten-on-delete"
+guards = "a host session.deleted drops the session's entry from the shared session-account registry, so no location follows or warms the deleted session's account"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "      sessionAccounts.forget(sessionId)"
+new = "      // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\ssession-account\sregistry\sa\ssession\sdeleted\sin\sone\slocation\sloses\sits\saccount\sin\severy\slocation$', '''^OpenCode\s2\ssession-account\sregistry\sadapters\ssharing\sa\sregistry\sread\sone\sanother's\schoices\sand\sdeletions\sthrough\sactiveAccount$''']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-active-account-cap"
+guards = "the session-account registry stays bounded by MAX_SESSION_ACCOUNTS, evicting the session recorded longest ago"
+file = "packages/opencode/src/v2/session-accounts.ts"
+old = "    while (this.accounts.size > this.limit) {"
+new = "    while (false) { // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-plugin.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\ssession-account\sregistry\sremembers\seach\ssession\saccount\suntil\sthe\scap,\sthen\sevicts\sthe\sleast\srecently\srecorded$', '^OpenCode\s2\ssession-account\sregistry\sholds\s1024\ssessions\sby\sdefault$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+

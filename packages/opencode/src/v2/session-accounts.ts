@@ -8,8 +8,8 @@
 // location's adapter reads and writes the same map, and a location's reload
 // or disposal loses nothing.
 
+import { resolve } from 'node:path'
 import type { AccountPaths } from '@cortexkit/openai-auth-core/internal'
-import { accountStoreKey } from './shared-pins'
 
 /** Most sessions whose current account is remembered. */
 export const MAX_SESSION_ACCOUNTS = 1024
@@ -74,7 +74,12 @@ processState[registryKey] = entries
  * bounded by MAX_SESSION_ACCOUNTS.
  */
 export function acquireSessionAccounts(paths: AccountPaths): SessionAccounts {
-  const key = accountStoreKey(paths)
+  // Relative and absolute paths to the same store give the same key, as for
+  // the session pins.
+  const key = JSON.stringify([
+    resolve(paths.configPath),
+    resolve(paths.statePath),
+  ])
   let accounts = entries.get(key)
   if (!accounts) {
     accounts = new SessionAccounts()

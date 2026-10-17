@@ -11,16 +11,11 @@ const processState = globalThis as typeof globalThis & {
 const entries = processState[registryKey] ?? new Map<string, SessionPins>()
 processState[registryKey] = entries
 
-/**
- * One key per account store: relative and absolute paths to the same config
- * and state files give the same key.
- */
-export function accountStoreKey(paths: AccountPaths): string {
-  return JSON.stringify([resolve(paths.configPath), resolve(paths.statePath)])
-}
-
 export function acquireSessionPins(paths: AccountPaths): SessionPins {
-  const key = accountStoreKey(paths)
+  const key = JSON.stringify([
+    resolve(paths.configPath),
+    resolve(paths.statePath),
+  ])
   let pins = entries.get(key)
   if (!pins) {
     pins = new SessionPins()
