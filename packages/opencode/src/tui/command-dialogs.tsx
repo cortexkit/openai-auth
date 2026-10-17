@@ -55,9 +55,8 @@ function factLines(facts: Record<string, unknown> | undefined): string[] {
   )
 }
 
-/** Read-only text is a category header; every option navigates or runs an action. */
-export function sectionOptions(section: Section): DrawerOption[] {
-  const header = [
+export function sectionText(section: Section): string {
+  return [
     ...section.lines,
     ...factLines(section.facts),
     ...section.items
@@ -73,6 +72,18 @@ export function sectionOptions(section: Section): DrawerOption[] {
           .join('\n'),
       ),
   ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+// DialogSelect counts each category as one row, but measures the title's text.
+// Keep section context outside the list so multiline text cannot hide actions.
+export function sectionTitle(section: Section): string {
+  return [section.title, sectionText(section)].filter(Boolean).join('\n')
+}
+
+/** Every option navigates or runs an action; read-only context is in the title. */
+export function sectionOptions(section: Section): DrawerOption[] {
   const options: DrawerOption[] = [
     ...section.items
       .filter((item) => item.actions.length > 0)
@@ -91,15 +102,6 @@ export function sectionOptions(section: Section): DrawerOption[] {
     })),
     { title: 'Back', value: BACK },
   ]
-  const first = options[0]
-  if (first && header.length > 0) {
-    const category = first.category
-    const text = [...header, category].filter(Boolean).join('\n')
-    for (const option of options) {
-      if (option.category !== category) break
-      option.category = text
-    }
-  }
   return options
 }
 
@@ -200,7 +202,7 @@ function showSection(
   api.ui.dialog.setSize('xlarge')
   api.ui.dialog.replace(() => (
     <DialogSelect
-      title={section.title}
+      title={sectionTitle(section)}
       options={sectionOptions(section)}
       onSelect={(option) => {
         const value = String(option.value)
