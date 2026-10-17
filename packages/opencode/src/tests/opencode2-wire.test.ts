@@ -101,35 +101,75 @@ function httpBody(
   })
 }
 
+/**
+ * A shaped frame without the fields OpenCode 1's WebSocket builder adds or
+ * normalizes (`client_metadata`, `parallel_tool_calls`, `tools`), so an effort
+ * test compares only what the effort rule may change.
+ */
+function effortView(text: string | undefined) {
+  const {
+    client_metadata: _metadata,
+    parallel_tool_calls: _parallel,
+    tools: _tools,
+    ...rest
+  } = JSON.parse(text ?? 'null')
+  return rest
+}
+
+/**
+ * What the effort rule changed in a frame: undefined when the frame went out
+ * with the effort and input the host gave it, else the effort and input sent.
+ */
+function effortEdit(
+  text: string,
+  scope: typeof SESSION,
+  effort: MidConversationEffort,
+) {
+  const host = JSON.parse(text)
+  const sent = JSON.parse(rewriteCodexFrame(text, scope, effort) ?? 'null')
+  return JSON.stringify([sent.reasoning, sent.input]) ===
+    JSON.stringify([host.reasoning, host.input])
+    ? undefined
+    : { reasoning: sent.reasoning, input: sent.input }
+}
+
 describe('mid-conversation effort on WebSocket frames', () => {
   it('pins the first effort, then adds the update before the new user message of an incremental frame and changes nothing else', () => {
     const effort = testEffort()
-    expect(
-      rewriteCodexFrame(frame('low', [user('one')]), SESSION, effort),
-    ).toBe(undefined)
+    const first = frame('low', [user('one')])
+    expect(effortEdit(first, SESSION, effort)).toBe(undefined)
     const incremental = frame('high', [user('two')], {
       previous_response_id: 'resp_1',
     })
-    const rewritten = JSON.parse(
-      rewriteCodexFrame(incremental, SESSION, effort) ?? 'null',
-    )
-    expect(rewritten).toEqual({
-      ...JSON.parse(incremental),
+    const rewritten = rewriteCodexFrame(incremental, SESSION, effort)
+    const { tools: _tools, ...host } = JSON.parse(incremental)
+    expect(effortView(rewritten)).toEqual({
+      ...host,
       reasoning: { effort: 'low', summary: 'auto' },
       input: [update('high'), user('two')],
     })
-    // The field order the host sent is kept.
-    expect(Object.keys(rewritten)).toEqual(Object.keys(JSON.parse(incremental)))
+    // Codex's field order, as OpenCode 1 sends it.
+    expect(Object.keys(JSON.parse(rewritten ?? 'null'))).toEqual([
+      'type',
+      'model',
+      'instructions',
+      'previous_response_id',
+      'input',
+      'tools',
+      'parallel_tool_calls',
+      'reasoning',
+      'prompt_cache_key',
+      'client_metadata',
+    ])
   })
 
   it('keeps the pinned effort on a tool-output frame without adding the update again', () => {
     const effort = testEffort()
     rewriteCodexFrame(frame('low', [user('one')]), SESSION, effort)
     const toolStep = frame('high', [output], { previous_response_id: 'resp_2' })
-    expect(
-      JSON.parse(rewriteCodexFrame(toolStep, SESSION, effort) ?? 'null'),
-    ).toEqual({
-      ...JSON.parse(toolStep),
+    const { tools: _tools, ...host } = JSON.parse(toolStep)
+    expect(effortView(rewriteCodexFrame(toolStep, SESSION, effort))).toEqual({
+      ...host,
       reasoning: { effort: 'low', summary: 'auto' },
     })
   })
@@ -168,11 +208,11 @@ describe('mid-conversation effort on WebSocket frames', () => {
   it('leaves frames of other models, other request kinds and an unchanged effort alone', () => {
     const effort = testEffort()
     rewriteCodexFrame(frame('low', [user('one')]), SESSION, effort)
+    expect(effortEdit(frame('low', [user('two')]), SESSION, effort)).toBe(
+      undefined,
+    )
     expect(
-      rewriteCodexFrame(frame('low', [user('two')]), SESSION, effort),
-    ).toBe(undefined)
-    expect(
-      rewriteCodexFrame(
+      effortEdit(
         frame('high', [user('two')], { model: 'gpt-5.5' }),
         SESSION,
         effort,
@@ -181,26 +221,17 @@ describe('mid-conversation effort on WebSocket frames', () => {
     // OpenCode 2 carries an effort change for the gpt-6 models itself.
     for (const model of ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'])
       expect(
-        rewriteCodexFrame(
-          frame('high', [user('two')], { model }),
-          SESSION,
-          effort,
-        ),
+        effortEdit(frame('high', [user('two')], { model }), SESSION, effort),
       ).toBe(undefined)
-    // A title request with its thread cache key neither pins nor changes effort.
+    // A title request neither pins nor changes effort.
     const title = { sessionID: 'ses_2', kind: 'title' }
-    const titleKey = {
-      prompt_cache_key: effort.http.get(title.sessionID).threadID,
-    }
-    expect(
-      rewriteCodexFrame(frame('low', [user('t')], titleKey), title, effort),
-    ).toBe(undefined)
-    expect(
-      rewriteCodexFrame(frame('high', [user('t')], titleKey), title, effort),
-    ).toBe(undefined)
-    expect(
-      rewriteCodexFrame(frame('high', [user('one')]), SESSION, effort),
-    ).not.toBe(undefined)
+    expect(effortEdit(frame('low', [user('t')]), title, effort)).toBe(undefined)
+    expect(effortEdit(frame('high', [user('t')]), title, effort)).toBe(
+      undefined,
+    )
+    expect(effortEdit(frame('high', [user('one')]), SESSION, effort)).not.toBe(
+      undefined,
+    )
   })
 
   it('starts over for a forgotten session', () => {
@@ -437,10 +468,17 @@ describe('through the OpenCode 2 entry', () => {
       await host.fire('experimental.ws.send', draft)
       return draft.frame
     }
-    expect(JSON.parse(await send(frame('low', [user('one')])))).toEqual({
-      ...JSON.parse(frame('low', [user('one')])),
+    const first = JSON.parse(await send(frame('low', [user('one')])))
+    const { tools: _tools, ...hostBody } = JSON.parse(
+      frame('low', [user('one')]),
+    )
+    expect(effortView(JSON.stringify(first))).toEqual({
+      ...hostBody,
       prompt_cache_key: expect.stringMatching(/^[\da-f-]{36}$/),
     })
+    expect(first.client_metadata['x-codex-window-id']).toBe(
+      `${first.prompt_cache_key}:0`,
+    )
     expect(
       JSON.parse(
         await send(frame('high', [user('two')], { previous_response_id: 'r' })),

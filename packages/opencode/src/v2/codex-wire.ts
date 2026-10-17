@@ -1,6 +1,8 @@
-// HTTP uses prepareCodexRequest, as OpenCode 1 does. WebSocket handshakes keep
-// the stable version, user-agent, originator and thread session-id headers: the
-// host keys socket reuse by handshake headers, so turn metadata stays HTTP-only.
+// HTTP requests and WebSocket `response.create` frames both go through
+// prepareCodexRequest, as on OpenCode 1. WebSocket handshakes keep the stable
+// version, user-agent, originator and thread session-id headers: the host keys
+// socket reuse by handshake headers, so a frame's turn metadata travels in the
+// frame's `client_metadata`, never in a handshake header.
 
 import {
   CODEX_USER_AGENT,
@@ -16,7 +18,11 @@ import {
 } from '../index'
 import { uuidV7 } from '../util/uuid-v7'
 import type { CodexSessionStore } from './codex-sessions'
-import { type FrameTurn, FrameTurnState } from './frame-turn'
+import {
+  type FrameTurn,
+  FrameTurnState,
+  frameRequestMetadata,
+} from './frame-turn'
 
 const INSTALLATION_KEY = Symbol.for(
   '@cortexkit/openai-auth/opencode2/codex-installation',
@@ -331,7 +337,49 @@ export async function rewriteCodexHttpRequest(
   return new Request(request, { headers, body: prepared.init?.body })
 }
 
-/** WebSocket sends share HTTP's cache key and apply effort once; no Lite rewrite. */
+/**
+ * Whether a frame's `input` as sent is the host's `input`, compared parsed:
+ * unchanged, or with only the mid-conversation effort rule's edit, one
+ * `configuration_update` item inserted right before a user message.
+ *
+ * The host chains each next frame from its own copy of the conversation, as
+ * it was before any plugin edit, so any other change to `input` would leave
+ * the server holding a conversation the host's next incremental frame no
+ * longer lines up with.
+ */
+export function frameInputKept(host: unknown, sent: unknown): boolean {
+  if (JSON.stringify(host) === JSON.stringify(sent)) return true
+  if (
+    !Array.isArray(host) ||
+    !Array.isArray(sent) ||
+    sent.length !== host.length + 1
+  )
+    return false
+  const at = sent.findIndex(
+    (item, index) => JSON.stringify(item) !== JSON.stringify(host[index]),
+  )
+  return (
+    at >= 0 &&
+    isConfigurationUpdate(sent[at]) &&
+    isUserMessage(sent[at + 1]) &&
+    JSON.stringify(sent.slice(at + 1)) === JSON.stringify(host.slice(at))
+  )
+}
+
+/**
+ * Shapes one owned `response.create` frame with OpenCode 1's WebSocket request
+ * builder (`prepareCodexRequest` with `websocket: true`): the thread cache
+ * key, `parallel_tool_calls`, Codex tool shapes, the Codex `client_metadata`
+ * (installation, window, turn metadata, send time) and Codex's body key
+ * order, with output caps removed. The turn metadata carries the frame turn
+ * (see `frame-turn.ts`), never the HTTP turn, and shaping never writes the
+ * session's HTTP turn state.
+ *
+ * `input` keeps the host's items. The one exception is the effort rule
+ * (`MidConversationEffort`), which may insert its `configuration_update`
+ * item; if anything else changed `input`, the host's `input` goes out
+ * instead. No Lite rewrite: see `responsesLiteHttpBody`.
+ */
 export function rewriteCodexFrame(
   frame: string,
   scope: CodexRewriteScope,
@@ -341,12 +389,34 @@ export function rewriteCodexFrame(
   if (body?.type !== 'response.create') return undefined
   // The turn rule reads the frame as the host built it, before the effort
   // rule below may insert its item.
-  effort.http.advanceFrame(scope.sessionID, body)
-  const capped = 'max_output_tokens' in body
+  const turn = effort.http.advanceFrame(scope.sessionID, body)
+  const session = effort.http.get(scope.sessionID)
+  // Codex does not accept output caps.
   delete body.max_output_tokens
-  const threadID = effort.http.get(scope.sessionID).threadID
-  const cacheChanged = body.prompt_cache_key !== threadID
-  body.prompt_cache_key = threadID
-  const changed = effort.apply(body, scope, 'ws')
-  return capped || cacheChanged || changed ? JSON.stringify(body) : undefined
+  const prepared = prepareCodexRequest({
+    rewriteLite: () => {},
+    init: { body: JSON.stringify(body) },
+    // The socket's handshake headers were fixed when it opened, and the host
+    // reuses a socket only while they stay the same. The builder's header
+    // edits go to this unused set; the frame's turn metadata travels in its
+    // client_metadata.
+    headers: new Headers(),
+    metadata: frameRequestMetadata(session, turn),
+    installationID: effort.http.installationID,
+    runtime: effort.http.runtime,
+    websocket: true,
+    responsesLite: false,
+    applyEffort: (parsed) => {
+      effort.apply(parsed, scope, 'ws')
+    },
+  })
+  const sent = parseObject(String(prepared.init?.body))
+  if (!sent) return undefined
+  // `body` is still the host's frame: the builder parsed its own copy.
+  if (!frameInputKept(body.input, sent.input)) {
+    if ('input' in body) sent.input = body.input
+    else delete sent.input
+    return JSON.stringify(sent)
+  }
+  return String(prepared.init?.body)
 }

@@ -4415,8 +4415,8 @@ expect_message = "wrong-thread-id"
 id = "opencode2-websocket-shares-http-cache-key"
 guards = "owned response.create frames use the HTTP thread cache key, never the host session id, so fallback keeps the cached prefix"
 file = "packages/opencode/src/v2/codex-wire.ts"
-old = "  body.prompt_cache_key = threadID"
-new = "  body.prompt_cache_key = scope.sessionID // NON-VACUITY BREAK"
+old = "    metadata: frameRequestMetadata(session, turn),"
+new = "    metadata: frameRequestMetadata({ ...session, threadID: scope.sessionID }, turn), // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/opencode2-http-shape.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
@@ -4924,10 +4924,10 @@ id = "opencode2-frame-turn-rule-runs-on-sent-frames"
 guards = "every owned response.create frame the host sends runs the frame turn rule, so the session's frame turn follows its WebSocket turns"
 file = "packages/opencode/src/v2/codex-wire.ts"
 old = """
-  effort.http.advanceFrame(scope.sessionID, body)
+  const turn = effort.http.advanceFrame(scope.sessionID, body)
 """
 new = """
-  // NON-VACUITY BREAK
+  const turn = effort.http.frameTurns.get(scope.sessionID) ?? { turnID: '', turnStartedAt: 0 } // NON-VACUITY BREAK
 """
 edits = []
 test_file = "packages/opencode/src/tests/opencode2-frame-turn.test.ts"
@@ -5044,3 +5044,125 @@ command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-access-gu
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-access-guidance.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^vault access guidance without a grant, the connect outcome and the menu give the exact grant command$']
+
+[[control]]
+id = "opencode2-frame-input-guard"
+guards = "an owned WebSocket frame never goes out with an input other than the host's, except for the effort rule's one configuration_update item: if a shaping step changed input in any other way, the host's input is sent"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = "  if (!frameInputKept(body.input, sent.input)) {"
+new = "  if (false) { // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-shape.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-shape.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-shape.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['''^WebSocket\sframe\sshaping\ssends\sthe\shost's\sinput\swhen\sa\sshaping\sstep\schanges\sit\sbeyond\sthe\seffort\srule$''']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-input-guard-allows-only-the-update-item"
+guards = "the WebSocket input guard accepts one inserted item only when it is a configuration_update, so no other inserted item reaches the server"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = """
+    isConfigurationUpdate(sent[at]) &&
+"""
+new = """
+    // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-shape.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-shape.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-shape.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^frameInputKept\srefuses\sa\sdropped,\sreordered\sor\sedited\sitem,\san\supdate\snot\sbefore\sa\suser\smessage,\sand\sany\sother\sinserted\sitem$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-input-guard-update-before-user"
+guards = "the WebSocket input guard accepts an inserted configuration_update only right before a user message, where the effort rule puts it"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = """
+    isUserMessage(sent[at + 1]) &&
+"""
+new = """
+    // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-shape.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-shape.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-shape.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^frameInputKept\srefuses\sa\sdropped,\sreordered\sor\sedited\sitem,\san\supdate\snot\sbefore\sa\suser\smessage,\sand\sany\sother\sinserted\sitem$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-shaped-as-websocket"
+guards = "owned WebSocket frames are shaped by OpenCode 1's WebSocket builder (turn metadata and send time in client_metadata), not its HTTP one"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = "    websocket: true,"
+new = "    websocket: false, // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-shape.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-shape.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-shape.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['''^WebSocket\sframe\sshaping\sshapes\severy\sframe\sof\sa\stool\sstep,\scompaction,\srefusal\sand\sfailover\sbyte\sfor\sbyte\sas\sOpenCode\s1's\sWebSocket\sbuilder\sdoes$''', '^WebSocket\sframe\sshaping\skeeps\sturn_started_at_unix_ms\sat\sthe\sfirst\sframe\sof\sits\sturn\sacross\sa\stool\scontinuation\sand\sa\sfailover\sresend\swhile\sthe\ssend\stime\smoves$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-carries-frame-turn"
+guards = "a shaped WebSocket frame's turn metadata carries the frame turn, never the session's HTTP turn, and shaping never writes the HTTP turn state"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = "    metadata: frameRequestMetadata(session, turn),"
+new = "    metadata: session, // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-shape.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-shape.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-shape.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['''^WebSocket\sframe\sshaping\sshapes\severy\sframe\sof\sa\stool\sstep,\scompaction,\srefusal\sand\sfailover\sbyte\sfor\sbyte\sas\sOpenCode\s1's\sWebSocket\sbuilder\sdoes$''', '^WebSocket\sframe\sshaping\skeeps\sturn_started_at_unix_ms\sat\sthe\sfirst\sframe\sof\sits\sturn\sacross\sa\stool\scontinuation\sand\sa\sfailover\sresend\swhile\sthe\ssend\stime\smoves$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-frame-removes-output-cap"
+guards = "owned WebSocket frames go out without the output cap Codex refuses, as OpenCode 1 sends them"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = """
+  // Codex does not accept output caps.
+  delete body.max_output_tokens
+"""
+new = """
+  // Codex does not accept output caps.
+  // NON-VACUITY BREAK
+"""
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-frame-shape.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-shape.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-shape.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['''^WebSocket\sframe\sshaping\sshapes\severy\sframe\sof\sa\stool\sstep,\scompaction,\srefusal\sand\sfailover\sbyte\sfor\sbyte\sas\sOpenCode\s1's\sWebSocket\sbuilder\sdoes$''', '^WebSocket\sframe\sshaping\sin\sthe\sOpenCode\s2\splugin\sshapes\sowned\sframes\sand\sleaves\sthe\shandshake\sheaders\sas\sthey\swere$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+

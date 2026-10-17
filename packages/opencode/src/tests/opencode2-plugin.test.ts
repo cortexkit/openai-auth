@@ -1233,10 +1233,19 @@ describe('Codex destination after transport ownership', () => {
       }),
     }
     await host.fire('experimental.ws.send', ws)
+    // The frame is shaped as OpenCode 1 shapes a WebSocket request: the
+    // context option stays, the cap goes.
     expect(JSON.parse(ws.frame)).toEqual({
       type: 'response.create',
       temperature: 0.5,
+      parallel_tool_calls: true,
       prompt_cache_key: threadID,
+      client_metadata: {
+        'x-codex-installation-id': expect.any(String),
+        'x-codex-window-id': `${threadID}:0`,
+        'x-codex-turn-metadata': expect.any(String),
+        'x-codex-ws-stream-request-start-ms': expect.stringMatching(/^\d+$/),
+      },
     })
   })
 })
