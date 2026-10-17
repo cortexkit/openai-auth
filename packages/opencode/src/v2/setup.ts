@@ -37,7 +37,9 @@
 //    credential table only ever receives a placeholder.
 // 6. The model rules (`models.ts`).
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import {
+  type Attempt,
   installOpenCode2Auth,
   type OpenCode2AuthAdapter,
   OpenCode2AuthError,
@@ -107,6 +109,7 @@ import {
 } from './login'
 import { createControlPlaneMenu } from './menu'
 import { registerCodexModelRules } from './models'
+import { RequestDumps } from './request-dumps'
 import { acquireSessionPins } from './shared-pins'
 import { acquireSidebarPublisher } from './sidebar-publisher'
 
@@ -178,10 +181,15 @@ async function installPoolHooks<Q, A>(
   adapter: OpenCode2AuthAdapter<Q, A>,
   log: Pick<OpenAIAdapterLogger, 'warn'>,
 ) {
+  const dumps = new RequestDumps(log)
+  // installOpenCode2Auth supplies an Attempt to the rewrite callbacks before it
+  // constructs the final Request. Async-local storage carries that handle to
+  // this hook's final snapshot without sharing a latest attempt across requests.
+  const observing = new AsyncLocalStorage<{ attempt?: Attempt<A> }>()
   // Receive/retry hooks have no request object to identify the send they answer.
   // They answer the last handshake or send for this session, so remember its
   // bearer. A send using another integration's login is not ours to rewrite.
-  const sockets = new Map<string, string>()
+  const sockets = new Map<string, { bearer: string; attempt: Attempt<A> }>()
   const latest = new Map<string, string>()
   const forget = (sessionID: string) => {
     latest.delete(sessionID)
@@ -210,12 +218,22 @@ async function installPoolHooks<Q, A>(
             const owned =
               prepared?.get('authorization') ===
               `Bearer ${placeholderSecret(adapter.providerID)}`
+            const observation: { attempt?: Attempt<A> } = {}
+            if (handshake)
+              sockets.delete(`${handshake.sessionID}:${handshake.kind}`)
             try {
-              await callback(draft)
+              await observing.run(observation, () => callback(draft))
             } catch (error) {
               if (owned && !(error instanceof OpenCode2AuthError))
                 throw redactCredentialError(error)
               throw error
+            }
+            if (request && owned && observation.attempt)
+              await dumps.captureHttp(request.request, observation.attempt)
+            if (name === 'experimental.ws.send') {
+              const sent = draft as SessionHooks['experimental.ws.send']
+              const socket = sockets.get(`${sent.sessionID}:${sent.kind}`)
+              if (socket) await dumps.frame(sent.frame, socket.attempt)
             }
             if (request || handshake) {
               const scope = request ?? handshake
@@ -233,7 +251,8 @@ async function installPoolHooks<Q, A>(
               else latest.delete(scope.sessionID)
               if (handshake) {
                 const key = `${handshake.sessionID}:${handshake.kind}`
-                if (owned && bearer) sockets.set(key, bearer)
+                if (owned && bearer && observation.attempt)
+                  sockets.set(key, { bearer, attempt: observation.attempt })
                 else sockets.delete(key)
               }
               if (latest.size > 512) {
@@ -246,11 +265,14 @@ async function installPoolHooks<Q, A>(
               }
             } else if (name === 'experimental.ws.receive') {
               const received = draft as SessionHooks['experimental.ws.receive']
-              const token = sockets.get(
+              const socket = sockets.get(
                 `${received.sessionID}:${received.kind}`,
               )
-              if (token)
-                received.frame = redactCredentialFrame(received.frame, token)
+              if (socket)
+                received.frame = redactCredentialFrame(
+                  received.frame,
+                  socket.bearer,
+                )
             } else if (name === 'retry') {
               const retry = draft as SessionHooks['retry']
               const token = latest.get(retry.sessionID)
@@ -277,7 +299,22 @@ async function installPoolHooks<Q, A>(
     context,
     {
       ...adapter,
+      rewriteRequest: async (input) => {
+        const observation = observing.getStore()
+        if (observation) observation.attempt = input.attempt
+        return adapter.rewriteRequest?.(input)
+      },
+      rewriteHandshakeURL: (input) => {
+        const observation = observing.getStore()
+        if (observation) observation.attempt = input.attempt
+        return adapter.rewriteHandshakeURL?.(input)
+      },
+      onAttemptEnd: async (attempt, outcome) => {
+        await dumps.end(attempt, outcome)
+        await adapter.onAttemptEnd?.(attempt, outcome)
+      },
       rewriteResponse: async (input) => {
+        await dumps.response(input.request, input.response.status)
         const response =
           (await adapter.rewriteResponse?.(input)) ?? input.response
         return redactCredentialResponse(
@@ -308,6 +345,8 @@ async function installPoolHooks<Q, A>(
       latest.clear()
       sockets.clear()
       await dispose()
+      await dumps.settle()
+      dumps.clear()
     },
   }
 }

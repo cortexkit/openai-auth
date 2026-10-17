@@ -19,7 +19,7 @@ export const DUMP_SESSION_HEADER = 'x-cortexkit-openai-auth-dump-session'
 type DumpHeaders = ConstructorParameters<typeof Headers>[0]
 
 type DumpTransport = 'http' | 'websocket'
-type DumpPhase = 'http' | 'prewarm' | 'main'
+type DumpPhase = 'http' | 'prewarm' | 'main' | 'observed'
 
 /**
  * Keys redacted wherever they appear in a dump, on top of the shared

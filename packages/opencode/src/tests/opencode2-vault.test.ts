@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, spyOn } from 'bun:test'
 import {
   chmodSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -30,8 +31,11 @@ import {
   startMockDaemon,
   vaultLogin,
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
+import { resetSettingsForTest } from '../config'
 import { PoolAccountSource } from '../core/pool-account-source'
 import { acquireOpenCodeVault } from '../core/shared-vault'
+import { resetDumpStateForTest } from '../dump'
+import { flushForTest } from '../logger'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { VAULT_METHOD } from '../v2/login'
 import { setupOpenAIAuth } from '../v2/setup'
@@ -46,6 +50,7 @@ import {
 } from './fixtures/opencode2-host'
 import { usageBody } from './fixtures/pool-install'
 import { createRequestTestScope } from './request-test-scope.ts'
+import { restoreEnv } from './setup-env'
 
 const PLACEHOLDER = placeholderSecret('openai')
 const VAULT_ACCESS = chatgptAccessToken('chatgpt-vault')
@@ -244,6 +249,75 @@ async function send(host: Host, status: number) {
 }
 
 describe('vault accounts on OpenCode 2', () => {
+  it('dumps the internal vault route key without vault credentials or personal identifiers', async () => {
+    const keys = [
+      'CORTEXKIT_OPENAI_AUTH_DUMP',
+      'OPENCODE_OPENAI_AUTH_DUMP_DIR',
+      'OPENCODE_OPENAI_AUTH_FILE',
+      'OPENCODE_OPENAI_AUTH_LOG_FILE',
+    ]
+    const previous = keys.map((key) => process.env[key])
+    cleanups.push(() => {
+      for (const [index, key] of keys.entries()) {
+        restoreEnv(key, previous[index])
+      }
+      resetSettingsForTest()
+      resetDumpStateForTest()
+    })
+    const { host, daemon, files } = await start(
+      'main-first',
+      [{ id: 'main' }],
+      {
+        'oauth:openai:vault': vaultLogin('chatgpt-vault', {
+          wire: { email: 'private-vault@example.test' },
+        }),
+      },
+      {
+        prepare: (files) => {
+          process.env.CORTEXKIT_OPENAI_AUTH_DUMP = '1'
+          process.env.OPENCODE_OPENAI_AUTH_DUMP_DIR = join(files.dir, 'dumps')
+          process.env.OPENCODE_OPENAI_AUTH_FILE = files.configPath
+          process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = join(
+            files.dir,
+            'dump.log',
+          )
+          resetSettingsForTest()
+          resetDumpStateForTest()
+        },
+      },
+    )
+    const lease = acquireOpenCodeVault(
+      {
+        host: 'opencode',
+        stateDir: join(files.dir, 'vault'),
+        connectionFile: () => daemon.connectionFile,
+        pollIntervalMs: 0,
+      },
+      files.paths(),
+    )
+    const key = lease.vault.routes()[0]!.id
+    lease.release()
+    await send(host, 200)
+    const dir = join(files.dir, 'dumps')
+    const names = readdirSync(dir)
+    const metas = names.filter((name) => name.endsWith('.meta.json'))
+    expect(metas).toHaveLength(1)
+    expect(
+      JSON.parse(readFileSync(join(dir, metas[0]!), 'utf8')).accountId,
+    ).toBe(key)
+    await flushForTest()
+    const text =
+      names.map((name) => readFileSync(join(dir, name), 'utf8')).join('\n') +
+      readFileSync(join(files.dir, 'dump.log'), 'utf8')
+    for (const secret of [
+      VAULT_ACCESS,
+      ENROLLMENT_TOKEN,
+      'chatgpt-vault',
+      'private-vault@example.test',
+    ])
+      expect(text).not.toContain(secret)
+  })
+
   it('the original request joins a pending first vault quota poll and serves without a retry', async () => {
     const started = Promise.withResolvers<void>()
     const gate = Promise.withResolvers<void>()

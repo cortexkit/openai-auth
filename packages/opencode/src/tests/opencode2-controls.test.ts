@@ -11,6 +11,7 @@ import {
   type OpenAiVault,
 } from '@cortexkit/openai-auth-core/internal'
 import { createOpenCodeMenu, type OpenCodeMenuContext } from '../commands'
+import { refreshSettings, resetSettingsForTest } from '../config'
 import { openAccountPool } from '../core/pool-accounts'
 import { setLogLevel } from '../logger'
 import {
@@ -29,6 +30,7 @@ import {
   scope,
   seedPool,
 } from './fixtures/opencode2-host'
+import { restoreEnv, unsetEnv } from './setup-env'
 
 const roots: string[] = []
 const cleanups: Array<() => unknown> = []
@@ -287,6 +289,12 @@ const rows = [
     sectionId: 'diagnostics',
     actionId: 'logging',
     values: { level: 'debug' },
+  },
+  {
+    name: 'dump',
+    sectionId: 'diagnostics',
+    actionId: 'dump',
+    values: { enabled: true },
   },
 ] as const
 
@@ -554,7 +562,9 @@ for (const enrolled of [false, true]) {
           'secondary',
         ]
           .filter(
-            (actionId) => sectionId !== 'diagnostics' || actionId !== 'logging',
+            (actionId) =>
+              sectionId !== 'diagnostics' ||
+              !['logging', 'dump'].includes(actionId),
           )
           .map((actionId) => ({ sectionId, actionId })),
       ),
@@ -600,7 +610,8 @@ test('OpenCode 2 diagnostics refuses item actions and request dumps', async () =
   const before = f.bytes()
   for (const actionId of ['logging', 'dump', 'unknown']) {
     for (const itemId of [undefined, '', 'main', 'missing']) {
-      if (actionId === 'logging' && itemId === undefined) continue
+      if (['logging', 'dump'].includes(actionId) && itemId === undefined)
+        continue
       const result = await f.menu().apply({
         sectionId: 'diagnostics',
         actionId,
@@ -614,6 +625,50 @@ test('OpenCode 2 diagnostics refuses item actions and request dumps', async () =
   }
   expect(f.writes).toEqual([])
   expect(f.bytes()).toEqual(before)
+})
+
+test('OpenCode 2 dump toggle persists and displays its warning in local and vault menus', async () => {
+  const previous = process.env.OPENCODE_OPENAI_AUTH_FILE
+  const dump = process.env.CORTEXKIT_OPENAI_AUTH_DUMP
+  unsetEnv('CORTEXKIT_OPENAI_AUTH_DUMP')
+  try {
+    for (const enrolled of [false, true]) {
+      const f = fixture(enrolled)
+      process.env.OPENCODE_OPENAI_AUTH_FILE = f.files.configPath
+      resetSettingsForTest()
+      const on = await f.menu().apply({
+        sectionId: 'diagnostics',
+        actionId: 'dump',
+        values: { enabled: true },
+      })
+      expect(on.ok).toBe(true)
+      expect(on.text).toContain(
+        'Body dumps may contain prompt and session content. Turn this off after debugging.',
+      )
+      expect(refreshSettings().dump).toBe(true)
+      expect(
+        JSON.parse(readFileSync(f.files.configPath, 'utf8')).dump.enabled,
+      ).toBe(true)
+      const opened = await f.menu().open('S')
+      expect(
+        opened.menu.sections
+          .find((section) => section.id === 'diagnostics')
+          ?.actions.find((action) => action.id === 'dump')?.label,
+      ).toBe('Turn request dumps off')
+      const off = await f.menu().apply({
+        sectionId: 'diagnostics',
+        actionId: 'dump',
+        values: { enabled: false },
+      })
+      expect(off.ok).toBe(true)
+      expect(off.text).toBe('Request dumps are off.')
+      expect(refreshSettings().dump).toBe(false)
+    }
+  } finally {
+    restoreEnv('OPENCODE_OPENAI_AUTH_FILE', previous)
+    restoreEnv('CORTEXKIT_OPENAI_AUTH_DUMP', dump)
+    resetSettingsForTest()
+  }
 })
 
 async function setupLocation(f: ReturnType<typeof fixture>, directory: string) {

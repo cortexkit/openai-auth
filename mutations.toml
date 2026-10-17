@@ -3980,8 +3980,8 @@ expect_red = ['^Pi\sOpenAI\sauth\sextension\sowns\sinspect\slock-compromised\sat
 id = "opencode2-diagnostics-logging-capability"
 guards = "Diagnostics can set the log level through the server capability fence"
 file = "packages/opencode/src/v2/menu.ts"
-old = "      return !item && request.actionId === 'logging'"
-new = "      return false // NON-VACUITY BREAK: refuse supported log level changes."
+old = "      return !item && ['logging', 'dump'].includes(request.actionId)"
+new = "      return !item && request.actionId === 'dump' // NON-VACUITY BREAK: refuse supported log level changes."
 test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
@@ -3993,8 +3993,8 @@ expect_red = ['^OpenCode 2 controls matrix local logging$']
 id = "opencode2-diagnostics-no-item-actions"
 guards = "Diagnostics refuses logging with any item id, including an empty one"
 file = "packages/opencode/src/v2/menu.ts"
-old = "      return !item && request.actionId === 'logging'"
-new = "      return request.actionId === 'logging' // NON-VACUITY BREAK: accept item actions."
+old = "      return !item && ['logging', 'dump'].includes(request.actionId)"
+new = "      return ['logging', 'dump'].includes(request.actionId) // NON-VACUITY BREAK: accept item actions."
 test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
@@ -4002,18 +4002,6 @@ list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode 2 diagnostics refuses item actions and request dumps$']
 
-[[control]]
-id = "opencode2-diagnostics-dumps-still-refuse"
-guards = "showing Diagnostics does not enable request dumps"
-file = "packages/opencode/src/v2/menu.ts"
-old = "      return !item && request.actionId === 'logging'"
-new = "      return !item && ['logging', 'dump'].includes(request.actionId) // NON-VACUITY BREAK"
-test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
-runner = "command"
-command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
-list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
-test_count_pattern = "Ran {count} test"
-expect_red = ['^OpenCode 2 diagnostics refuses item actions and request dumps$']
 
 [[control]]
 id = "opencode2-other-menu-requests-still-refuse"
@@ -4053,3 +4041,101 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-l
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-logging.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode 2 log precedence matches OpenCode 1: stored over conflicting env$']
+
+[[control]]
+id = "opencode2-diagnostics-dump-capability"
+guards = "Diagnostics admits the request dump toggle without an item id"
+file = "packages/opencode/src/v2/menu.ts"
+old = "      return !item && ['logging', 'dump'].includes(request.actionId)"
+new = "      return !item && request.actionId === 'logging' // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 dump toggle persists and displays its warning in local and vault menus$']
+
+[[control]]
+id = "opencode2-dump-non-owned-http"
+guards = "non-owned HTTP requests must not emit diagnostic records"
+file = "packages/opencode/src/v2/setup.ts"
+old = """            if (request && owned && observation.attempt)
+              await dumps.captureHttp(request.request, observation.attempt)"""
+new = """            if (request && owned && observation.attempt)
+              await dumps.captureHttp(request.request, observation.attempt)
+            if (request && !owned) { // NON-VACUITY BREAK: dump an unowned send.
+              const attempt = { ...request, accountId: 'unowned', attemptId: 'unowned', transport: 'http' as const, data: undefined }
+              await dumps.captureHttp(request.request, attempt)
+              await dumps.response(request.request, 200)
+            }"""
+test_file = "packages/opencode/src/tests/opencode2-dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 non-owned HTTP requests write no dump and stay unchanged$']
+
+[[control]]
+id = "opencode2-dump-no-inbound-websocket"
+guards = "only outbound WebSocket frames are observed, never inbound frames"
+file = "packages/opencode/src/v2/setup.ts"
+old = "            if (name === 'experimental.ws.send') {"
+new = "            if (name === 'experimental.ws.receive') { // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 observes only owned outbound WebSocket frames after rewriting$']
+
+[[control]]
+id = "opencode2-dump-one-per-attempt"
+guards = "a response closes the request snapshot before later attempt-end errors"
+file = "packages/opencode/src/v2/request-dumps.ts"
+old = "    const input = this.take(request)"
+new = "    const input = this.pending.get(request)?.input // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 dumps final merged HTTP request once at status 200$']
+
+[[control]]
+id = "opencode2-dump-private-failure-contained"
+guards = "security write failures warn once and do not change the response"
+file = "packages/opencode/src/v2/request-dumps.ts"
+old = "      this.log.warn('request dump failed')"
+new = "      throw new Error('NON-VACUITY BREAK')"
+test_file = "packages/opencode/src/tests/opencode2-dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 private dump write failure warns once without changing response$']
+
+[[control]]
+id = "opencode2-dump-bearer-redaction"
+guards = "dump redaction is not bypassed by using a raw bearer as the account label"
+file = "packages/opencode/src/dump.ts"
+old = "    accountId: input.accountId,"
+new = "    accountId: new Headers(input.headers).get('authorization')?.replace(/^Bearer /, '') ?? input.accountId, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 dumps final merged HTTP request once at status 200$']
+
+[[control]]
+id = "opencode2-dump-ordinary-failure-warning"
+guards = "ordinary write failures emit exactly one dumper warning without changing the response"
+file = "packages/opencode/src/dump.ts"
+old = "    logger: log,"
+new = "    logger: { ...log, warn: () => {} }, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 ordinary dump write failure warns once without changing response$']

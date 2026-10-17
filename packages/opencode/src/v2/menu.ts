@@ -28,7 +28,7 @@ function allowed(request: {
     case 'session':
       return !item && request.actionId === 'clear-pin'
     case 'diagnostics':
-      return !item && request.actionId === 'logging'
+      return !item && ['logging', 'dump'].includes(request.actionId)
     default:
       return false
   }
