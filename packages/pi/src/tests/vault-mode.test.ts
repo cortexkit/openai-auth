@@ -57,6 +57,9 @@ import {
   VAULT_SLOT_CONFLICT,
   VAULT_SLOT_REFUSAL,
 } from '../vault-slot.ts'
+import { isolatePiAgentDir } from './test-isolation.ts'
+
+isolatePiAgentDir()
 
 const CODEX_URL = 'https://chatgpt.com/backend-api/codex/responses'
 const WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage'

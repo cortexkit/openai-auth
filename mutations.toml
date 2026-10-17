@@ -10,6 +10,19 @@
 # a silent, costly failure: a credential lost or leaked, a reset credit spent
 # twice, output replayed, a crash that loses an account, a wire contract.
 
+[[control]]
+id = "pi-test-native-auth-isolation"
+guards = "Pi tests resolve native auth only inside a temporary agent directory, never the developer login"
+file = "packages/pi/src/tests/test-isolation.ts"
+old = "    process.env.PI_CODING_AGENT_DIR = dir"
+new = "    delete process.env.PI_CODING_AGENT_DIR // NON-VACUITY BREAK"
+test_file = "packages/pi/src/tests/test-isolation.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/test-isolation.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/test-isolation.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^native Pi auth resolves inside the current test temp directory, never the real home$']
+
 # On every host, Main first tries the vault's chatgpt:openai credential first
 # and Fallback first tries it last. Local rows cannot fill that role in vault mode.
 
