@@ -393,9 +393,17 @@ for (const failure of ['ordinary', 'private'] as const) {
     await flushForTest()
     const logs = readFileSync(f.log, 'utf8')
     expect(logs.match(/request dump failed/g)).toHaveLength(1)
-    expect(logs.split('\n').filter((line) => /\bwarn\b/i.test(line))).toEqual([
-      expect.stringContaining('request dump failed'),
-    ])
+    // The plugin's startup quota poll runs in the background and may log its
+    // own warnings (the fixture answers it with 503); those are about quota,
+    // not this request. Every other warning must be the one dump failure.
+    expect(
+      logs
+        .split('\n')
+        .filter(
+          (line) =>
+            /\bwarn\b/i.test(line) && !/\bWARN \[(quota|pool)\]/.test(line),
+        ),
+    ).toEqual([expect.stringContaining('request dump failed')])
     for (const secret of [
       'dump-private-token',
       'private-cookie',
