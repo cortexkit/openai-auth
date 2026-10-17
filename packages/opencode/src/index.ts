@@ -3,7 +3,6 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
-  type Stats,
   statSync,
   writeFileSync,
 } from 'node:fs'
@@ -96,6 +95,7 @@ import {
   type OpenAICacheKeepManager,
   routedAccountForSession,
 } from './core/cachekeep'
+import { createCurrentStorageReader } from './core/current-storage'
 import {
   classifyMainAuthSlot,
   MAIN_REFRESH_LOCK_NAME,
@@ -1963,70 +1963,50 @@ export async function CodexAuthPlugin(
           }
         }
 
-        let requestStorageCache:
-          | {
-              path: string
-              mtimeMs: number
-              size: number
-              storage: Awaited<ReturnType<typeof loadAccounts>>
-            }
-          | undefined
-
         // The newest store snapshot this loader has read. It is the answer when
-        // a request's read overruns its budget, and what background sidebar
-        // writes describe, so neither has to read the store again.
+        // a request's read overruns its budget, and the fallback if a display
+        // write cannot read the current config.
         let lastRequestStorage = storage
 
-        // The store read on the request path. An unchanged config file costs
-        // one stat. A changed one is read without any lock (loadAccounts only
-        // reads), waiting at most HOT_PATH_READ_BUDGET_MS before going ahead
-        // with the last snapshot; the read then finishes in the background and
-        // serves the next request. A read failure still fails local requests;
-        // vault requests can use the last settings snapshot without local files.
+        // Request routing and sidebar projections share this stat-gated read.
+        // A loader can be idle while another process changes routing, so a
+        // machine-state write must not rely on its last request's snapshot.
+        const currentStorageReader = createCurrentStorageReader({
+          path: getConfigPath,
+          stat: (path) => {
+            try {
+              const stat = statSync(path)
+              return { mtimeMs: stat.mtimeMs, size: stat.size }
+            } catch {
+              return undefined
+            }
+          },
+          read: (path) => loadAccounts(getAccountPaths(path)),
+          fallback: async (error) => {
+            if ((await vault.authority()) !== 'local') return lastRequestStorage
+            throw error
+          },
+          onRead: (next) => {
+            lastRequestStorage = next
+          },
+        })
+
+        function loadCurrentStorageForDisplay() {
+          return currentStorageReader.read()
+        }
+
+        // Request reads wait only for the hot-path budget. A changed config is
+        // read in the background and serves the next request if it is slow.
         async function loadRequestAccounts() {
-          const path = getConfigPath()
-          let stat: Stats | undefined
-          try {
-            stat = statSync(path)
-          } catch {
-            stat = undefined
-          }
-          if (
-            stat &&
-            requestStorageCache?.path === path &&
-            requestStorageCache.mtimeMs === stat.mtimeMs &&
-            requestStorageCache.size === stat.size
-          ) {
-            return requestStorageCache.storage
-          }
-          if (!stat) requestStorageCache = undefined
-          const read = loadAccounts(getAccountPaths(path))
-            .catch(async (error) => {
-              if ((await vault.authority()) !== 'local')
-                return lastRequestStorage
-              throw error
-            })
-            .then((next) => {
-              if (stat) {
-                requestStorageCache = {
-                  path,
-                  mtimeMs: stat.mtimeMs,
-                  size: stat.size,
-                  storage: next,
-                }
-              }
-              lastRequestStorage = next
-              return next
-            })
           return settleWithinBudget(
-            read,
+            Promise.resolve(loadCurrentStorageForDisplay()),
             HOT_PATH_READ_BUDGET_MS,
             () => lastRequestStorage,
           )
         }
 
         function invalidateRequestStorageCache() {
-          requestStorageCache = undefined
+          currentStorageReader.invalidate()
         }
 
         // Derive the main account's stable ChatGPT identity from the live
@@ -2848,19 +2828,13 @@ export async function CodexAuthPlugin(
             completeSnapshot,
           )
           const fallbackPush = Boolean(accountId && accountId !== 'main')
-          sidebarBookkeepingQueue.enqueue('machine-state', 'quota', () => {
-            // The sidebar state is built when this queued write starts (and
-            // again on a retry), from the in-memory quota cache and the
-            // newest account-store snapshot at that moment.
-            const latestStorage = lastRequestStorage
-            return writeMachineSidebarState(
+          sidebarBookkeepingQueue.enqueue('machine-state', 'quota', () =>
+            writeMachineSidebarState(
               quotaManager,
-              latestStorage,
-              fallbackPush
-                ? latestStorage?.mainAccountId
-                : resolvedMainIdentity,
-            )
-          })
+              lastRequestStorage,
+              fallbackPush ? undefined : resolvedMainIdentity,
+            ),
+          )
         }
 
         // The pure resolver prefers an admission error's explicit reset and
@@ -2996,9 +2970,16 @@ export async function CodexAuthPlugin(
 
         async function writeMachineSidebarState(
           qm: QuotaManager,
-          store: Awaited<ReturnType<typeof loadAccounts>>,
-          mainAccountIdentity = store?.mainAccountId,
+          _store: Awaited<ReturnType<typeof loadAccounts>>,
+          mainAccountIdentity?: string,
         ) {
+          const currentStorage = loadCurrentStorageForDisplay()
+          const store =
+            currentStorage instanceof Promise
+              ? await currentStorage.catch(() => lastRequestStorage)
+              : currentStorage
+          const displayMainAccountIdentity =
+            mainAccountIdentity ?? store?.mainAccountId
           // Vault mode: the sidebar lists the vault accounts that serve this
           // host, with the quota the vault roster holds for each. No local
           // account is read for it.
@@ -3040,7 +3021,7 @@ export async function CodexAuthPlugin(
               qm,
               store,
               Date.now(),
-              mainAccountIdentity,
+              displayMainAccountIdentity,
             ),
             boundSidebarFile,
             { canWrite: () => !vault.enrolled() },

@@ -1136,6 +1136,36 @@ test_count_pattern = "Ran {count} test"
 expect_red = ["^request\\spath\\snever\\swaits\\son\\sbookkeeping\\sa\\ssticky-balanced\\srequest\\sreaches\\sthe\\swire\\swhen\\sthe\\ssidebar\\swrite\\sfails,\\sand\\sits\\spin\\slands\\sonce\\swrites\\swork\\sagain$"]
 expect_message = "EEXIST: file already exists"
 
+[[control]]
+id = "opencode1-sidebar-writer-uses-current-config"
+guards = "an idle OpenCode 1 loader writes the routing mode changed on disk with its quota reading"
+file = "packages/opencode/src/index.ts"
+old = """          const currentStorage = loadCurrentStorageForDisplay()
+          const store =
+            currentStorage instanceof Promise
+              ? await currentStorage.catch(() => lastRequestStorage)
+              : currentStorage"""
+new = "          const store = lastRequestStorage // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/shared-vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/shared-vault.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/shared-vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^one\\shost\\svault\\sper\\sprocess\\san\\sidle\\sOpenCode\\s1\\sloader\\spublishes\\sthe\\scurrent\\sroute\\swith\\sa\\squota\\sreading$']
+
+[[control]]
+id = "opencode1-stale-account-read-cannot-replace-newer"
+guards = "a storage read that began before a config change cannot publish after its newer read"
+file = "packages/opencode/src/core/current-storage.ts"
+old = "          if (generation > publishedGeneration) {"
+new = "          if (true) { // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/current-storage.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/current-storage.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/current-storage.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^an\\solder\\sconfig-and-state\\sread\\sthat\\sfinishes\\slast\\scannot\\sreplace\\sthe\\snewer\\ssnapshot$']
+
 # Build gates that scan for a violation must be seen to fail on a planted one.
 
 [[control]]

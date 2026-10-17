@@ -22,8 +22,9 @@ import {
   vaultLogin,
 } from '../../../core/src/tests/fixtures/mock-claustrum'
 import { acquireOpenCodeVault } from '../core/shared-vault'
-import { CodexAuthPlugin } from '../index'
+import { __menuContextForTest, CodexAuthPlugin } from '../index'
 import { flushForTest } from '../logger'
+import { getSidebarState } from '../sidebar-state'
 import { setupOpenAIAuth } from '../v2/setup'
 import {
   fakeOpenCode2Host,
@@ -38,7 +39,12 @@ import {
   waitFor,
 } from './fixtures/pool-install'
 import { createRequestTestScope } from './request-test-scope'
-import { FLOOR_AUTH_FILE, FLOOR_LOG_FILE, FLOOR_STATE_FILE } from './setup-env'
+import {
+  FLOOR_AUTH_FILE,
+  FLOOR_LOG_FILE,
+  FLOOR_SIDEBAR_STATE_FILE,
+  FLOOR_STATE_FILE,
+} from './setup-env'
 
 const scope = createRequestTestScope()
 const test = scope.it
@@ -63,6 +69,10 @@ beforeEach(async () => {
     'openai-auth-state.json',
   )
   process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = join(dir, 'test.log')
+  process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = join(
+    dir,
+    'sidebar-state.json',
+  )
   seedPool(
     {
       configFile: process.env.OPENCODE_OPENAI_AUTH_FILE,
@@ -120,6 +130,8 @@ afterEach(async () => {
     process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
     process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+      FLOOR_SIDEBAR_STATE_FILE
     rmSync(dir, { recursive: true, force: true })
   })
 })
@@ -244,6 +256,38 @@ describe('one host vault per process', () => {
       await waiting
       await Promise.allSettled([...vaultPolls])
     }
+  })
+
+  test('an idle OpenCode 1 loader publishes the current route with a quota reading', async () => {
+    const sidebarFile = process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE
+    const configFile = process.env.OPENCODE_OPENAI_AUTH_FILE
+    if (!sidebarFile || !configFile) throw new Error('test paths are missing')
+
+    await plugin()
+    await plugin()
+    await ready()
+    const menu = __menuContextForTest()
+    if (!menu?.refreshSidebar || !menu.refreshAllQuota)
+      throw new Error('sidebar refresh is unavailable')
+    await menu.refreshSidebar()
+    const before = await getSidebarState(sidebarFile)
+    expect(before.route).toBe('fallback-first')
+
+    const pollsBefore = wire.polls.length
+    const sendsBefore = wire.sends.length
+    const config = JSON.parse(readFileSync(configFile, 'utf8')) as {
+      routing: { mode: string }
+    }
+    config.routing.mode = 'main-first'
+    writeFileSync(configFile, JSON.stringify(config))
+
+    await menu.refreshAllQuota()
+
+    const after = await getSidebarState(sidebarFile)
+    expect(wire.polls.length).toBeGreaterThan(pollsBefore)
+    expect(wire.sends).toHaveLength(sendsBefore)
+    expect(after.route).toBe('main-first')
+    expect(after.vaultAccounts?.[0]?.quota?.primary?.usedPercent).toBe(10)
   })
 
   test('two projects share one roster poll stream', async () => {
