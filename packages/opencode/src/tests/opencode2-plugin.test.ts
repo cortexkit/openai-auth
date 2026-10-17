@@ -1146,7 +1146,10 @@ describe('Codex destination after transport ownership', () => {
     expect(draft.request.url).toBe(
       'https://chatgpt.com/backend-api/codex/responses',
     )
-    expect(draft.request.headers.get('session-id')).toBe('ses_endpoint')
+    expect(draft.request.headers.get('session-id')).toBe(
+      draft.request.headers.get('thread-id'),
+    )
+    expect(draft.request.headers.get('session-id')).toMatch(/^[\da-f-]{36}$/)
     const handshake = {
       ...scope('ses_endpoint'),
       url: 'wss://api.openai.com/v1/responses',
@@ -1157,7 +1160,9 @@ describe('Codex destination after transport ownership', () => {
     }
     await host.fire('experimental.ws.handshake', handshake)
     expect(handshake.url).toBe('wss://chatgpt.com/backend-api/codex/responses')
-    expect(handshake.headers['session-id']).toBe('ses_endpoint')
+    expect(handshake.headers['session-id']).toBe(
+      draft.request.headers.get('thread-id')!,
+    )
   })
 
   it('uses the configured Codex base and preserves custom transport destinations', () => {
@@ -1208,7 +1213,16 @@ describe('Codex destination after transport ownership', () => {
       }),
     }
     await host.fire('http.request', http)
-    expect(await http.request.json()).toEqual({ temperature: 0.5 })
+    const threadID = http.request.headers.get('thread-id')
+    expect(await http.request.json()).toEqual({
+      temperature: 0.5,
+      parallel_tool_calls: true,
+      prompt_cache_key: threadID,
+      client_metadata: {
+        'x-codex-installation-id': expect.any(String),
+        'x-codex-window-id': `${threadID}:0`,
+      },
+    })
     await wsHandshake(host, 'ses_options')
     const ws = {
       ...scope('ses_options'),
@@ -1222,6 +1236,7 @@ describe('Codex destination after transport ownership', () => {
     expect(JSON.parse(ws.frame)).toEqual({
       type: 'response.create',
       temperature: 0.5,
+      prompt_cache_key: threadID,
     })
   })
 })

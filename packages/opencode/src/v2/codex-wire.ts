@@ -1,26 +1,54 @@
-// What openai-auth changes in the requests OpenCode 2's own OpenAI driver
-// sends, so they match what it sends from OpenCode 1 (`prepareCodexRequest`
-// in `src/index.ts`):
-//
-// - the Codex client identity (`version`, `user-agent`, `originator`), sent
-//   as header edits with the account headers. They never change within a
-//   session: the host keys a session's WebSocket on its handshake headers,
-//   so a header that changed between requests would open a new socket and
-//   resend the whole conversation;
-// - a mid-conversation reasoning-effort change carried as a
-//   `configuration_update` item while the request-level effort stays at the
-//   session's first value (`MidConversationEffort`), on HTTP bodies and on
-//   WebSocket frames;
-// - the Responses Lite body for the models marked Lite, on HTTP only
-//   (`responsesLiteHttpBody`; why not on WebSocket is explained there).
+// HTTP uses prepareCodexRequest, as OpenCode 1 does. WebSocket handshakes keep
+// the stable version, user-agent, originator and thread session-id headers: the
+// host keys socket reuse by handshake headers, so turn metadata stays HTTP-only.
 
 import {
   CODEX_USER_AGENT,
   CODEX_VERSION,
-  MID_CONVERSATION_EFFORT_MODELS,
+  type CodexRequestRuntime,
+  type CodexSessionMetadata,
+  prepareCodexRequest,
   RESPONSES_LITE_MODELS,
+} from '../codex-request'
+import {
+  MID_CONVERSATION_EFFORT_MODELS,
   rewriteResponsesLiteBody,
 } from '../index'
+import { uuidV7 } from '../util/uuid-v7'
+
+const INSTALLATION_KEY = Symbol.for(
+  '@cortexkit/openai-auth/opencode2/codex-installation',
+)
+function processInstallationID(): string {
+  const registry = globalThis as typeof globalThis & {
+    [INSTALLATION_KEY]?: string
+  }
+  registry[INSTALLATION_KEY] ??= crypto.randomUUID()
+  return registry[INSTALLATION_KEY]
+}
+
+/** HTTP requests and WebSocket cache keys share each host session's thread identity. */
+export class CodexHttpState {
+  readonly sessions = new Map<string, CodexSessionMetadata>()
+  readonly installationID: string
+  constructor(
+    readonly runtime?: CodexRequestRuntime,
+    installationID?: string,
+  ) {
+    this.installationID = installationID ?? processInstallationID()
+  }
+
+  get(sessionID: string): CodexSessionMetadata {
+    let metadata = this.sessions.get(sessionID)
+    if (!metadata) {
+      const uuid = this.runtime?.uuid ?? uuidV7
+      const threadID = uuid()
+      metadata = { threadID, turnID: uuid(), windowID: `${threadID}:0` }
+      this.sessions.set(sessionID, metadata)
+    }
+    return metadata
+  }
+}
 
 /** The Codex client identity, sent with every request of the provider. */
 export const CODEX_CLIENT_HEADERS: Readonly<Record<string, string>> = {
@@ -113,6 +141,7 @@ export type WireForm = 'http' | 'ws'
  */
 export class MidConversationEffort {
   readonly #pinned = new Map<string, string>()
+  constructor(readonly http = new CodexHttpState()) {}
 
   /**
    * Applies the rule to one parsed body in place. Returns whether the body
@@ -163,6 +192,7 @@ export class MidConversationEffort {
 
   forget(sessionID: string): void {
     this.#pinned.delete(sessionID)
+    this.http.sessions.delete(sessionID)
   }
 
   #pin(sessionID: string, effort: string) {
@@ -211,34 +241,48 @@ export interface CodexRewriteScope {
 }
 
 /**
- * The HTTP rewrite: the effort rule, then the Lite shape when `lite` is on.
- * Returns the request to send, or undefined to send the host's own.
+ * Shape every Responses HTTP request routed through the pool placeholder.
+ * Capture the host's input before effort and Lite inject or replace items, so
+ * a later tool continuation compares against host history, not injected items.
  */
 export async function rewriteCodexHttpRequest(
   request: Request,
   scope: CodexRewriteScope,
   effort: MidConversationEffort,
   lite: boolean,
+  state: CodexHttpState = effort.http,
 ): Promise<Request | undefined> {
-  if (request.method.toUpperCase() !== 'POST' || request.body === null)
-    return undefined
+  if (request.method.toUpperCase() !== 'POST') return undefined
   if (!/\/responses\/?$/.test(new URL(request.url).pathname)) return undefined
-  const body = parseObject(await request.clone().text())
-  if (!body) return undefined
+  const text = await request.clone().text()
+  const body = parseObject(text)
   // Codex does not accept output caps. Remove them only after the transport
   // has established that this request belongs to the account pool.
-  const capped = 'max_output_tokens' in body
-  delete body.max_output_tokens
-  const effortChanged = effort.apply(body, scope, 'http')
-  const liteApplied = lite && responsesLiteHttpBody(body)
-  if (!capped && !effortChanged && !liteApplied) return undefined
+  if (body) delete body.max_output_tokens
   const headers = new Headers(request.headers)
-  headers.delete('content-length')
-  if (liteApplied) headers.set(RESPONSES_LITE_HEADER, 'true')
-  return new Request(request, { headers, body: JSON.stringify(body) })
+  const prepared = prepareCodexRequest({
+    rewriteLite: rewriteResponsesLiteBody,
+    init: {
+      body: body
+        ? JSON.stringify(body)
+        : request.body === null
+          ? undefined
+          : text,
+    },
+    headers,
+    metadata: state.get(scope.sessionID),
+    installationID: state.installationID,
+    runtime: state.runtime,
+    websocket: false,
+    responsesLite: lite,
+    applyEffort: (parsed) => {
+      effort.apply(parsed, scope, 'http')
+    },
+  })
+  return new Request(request, { headers, body: prepared.init?.body })
 }
 
-/** The WebSocket frame rewrite: the effort rule. Undefined keeps the frame. */
+/** WebSocket sends share HTTP's cache key and apply effort once; no Lite rewrite. */
 export function rewriteCodexFrame(
   frame: string,
   scope: CodexRewriteScope,
@@ -248,6 +292,9 @@ export function rewriteCodexFrame(
   if (body?.type !== 'response.create') return undefined
   const capped = 'max_output_tokens' in body
   delete body.max_output_tokens
+  const threadID = effort.http.get(scope.sessionID).threadID
+  const cacheChanged = body.prompt_cache_key !== threadID
+  body.prompt_cache_key = threadID
   const changed = effort.apply(body, scope, 'ws')
-  return capped || changed ? JSON.stringify(body) : undefined
+  return capped || cacheChanged || changed ? JSON.stringify(body) : undefined
 }

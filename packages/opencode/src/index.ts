@@ -74,6 +74,12 @@ import type {
 } from '@opencode-ai/plugin'
 import { createAuthMethods } from './auth/methods'
 import {
+  type CodexSessionMetadata,
+  isMessageWithRole,
+  OPENAI_AGENT_HEADER,
+  prepareCodexRequest,
+} from './codex-request'
+import {
   applyOpenAiMenu,
   menuText,
   OPENAI_COMMAND_NAME,
@@ -159,7 +165,14 @@ import {
   selectStickyCandidate,
 } from './core/sticky-routing'
 import { migrationFenceOpen } from './core/version-fence'
-import { DUMP_SESSION_HEADER, dumpCodexRequest } from './dump'
+import { dumpCodexRequest } from './dump'
+
+export {
+  CODEX_USER_AGENT,
+  CODEX_VERSION,
+  RESPONSES_LITE_MODELS,
+} from './codex-request'
+
 import { createLogger, setLogLevel } from './logger'
 import { loadModelsDevCosts } from './model-costs'
 import { resolvePromptContext } from './prompt-context'
@@ -199,16 +212,10 @@ import {
   settleWithinBudget,
   upsertSidebarActiveRouting,
 } from './sidebar-state'
-import {
-  type CanonicalInput,
-  canonicalInput,
-  canonicalPrefixLength,
-  retainedInput,
-} from './util/canonical-input'
 import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
 import { PackageVersion } from './version'
-import { OpenAIWebSocketPool, orderCodexBody } from './ws-pool'
+import { OpenAIWebSocketPool } from './ws-pool'
 
 export const ALLOWED_MODELS = new Set([
   'gpt-5.5',
@@ -324,35 +331,7 @@ export function codexOAuthModelLimit(
  */
 export const EMPTY_BEARER_MESSAGE =
   'Refusing to send a request with no access token. This is a defect in the plugin, not a problem with the provider or the account; the transport log names the account and the path that produced it.'
-// Exact models currently marked `use_responses_lite` in Codex's catalog. Read
-// from the backend's own model list rather than assumed:
-//   GET /backend-api/codex/models?client_version=<v>
-// reports `use_responses_lite` per model, and every gpt-6 variant is marked true.
-export const RESPONSES_LITE_MODELS: ReadonlySet<string> = new Set([
-  'gpt-5.6-sol',
-  'gpt-5.6-terra',
-  'gpt-5.6-luna',
-  'gpt-6-astra',
-  'gpt-6-sol',
-  'gpt-6-luna',
-  'gpt-6.1-sol',
-])
 const OAUTH_DUMMY_KEY = 'opencode-oauth-dummy-key'
-const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
-// gpt-6.1-sol requires Codex client >= 0.159.0: the backend's model catalog
-// lists it from 0.159.0 and a request answers 400 ("not supported when using
-// Codex with a ChatGPT account") at 0.158.0, measured 2026-09-29. Its catalog
-// `minimal_client_version` says 0.153.0, which is wrong, so the catalog listing
-// and a real request are the evidence, not that field. gpt-6-sol and gpt-6-luna
-// need 0.155.0 and gpt-6-astra 0.153.0. Verified at 0.159.0 that gpt-6.1-sol,
-// the three gpt-6 models, gpt-5.5 and the three 5.6 variants all complete, so
-// one version serves the whole range. gpt-5.4, gpt-5.4-mini and
-// gpt-5.3-codex-spark answer 400 at every version ("not supported when using
-// Codex with a ChatGPT account") - a backend retirement, not something this
-// version causes.
-export const CODEX_VERSION = '0.159.0'
-export const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
-const CODEX_SANDBOX = 'seccomp'
 export const getMainRefreshLockName = () => MAIN_REFRESH_LOCK_NAME
 export const MAIN_REFRESH_LOCK_TTL_MS = 2 * 60_000
 export const MAIN_REFRESH_LEASE_TTL_MS = 90_000
@@ -840,43 +819,9 @@ interface CodexAuthPluginOptions {
   }
 }
 
-interface CodexSessionMetadata {
-  threadID: string
-  turnID: string
-  windowID: string
-  turnStartedAt?: number
-  input?: unknown[]
-  canonicalInput?: CanonicalInput
-  /**
-   * The `reasoning.effort` this session opened with. Held so a later change can
-   * be carried as a `configuration_update` item instead of as a different
-   * request-level value. See `applyMidConversationEffort`.
-   */
-  pinnedEffort?: string
-  effortUpdates?: Array<{ anchor: number; fingerprint: string; effort: string }>
-}
-
 interface PersistedCodexSessions {
   version?: number
   sessions?: Record<string, { threadID?: unknown }>
-}
-
-interface PreparedCodexRequest {
-  init: RequestInit | undefined
-}
-
-function parseJsonObject(input: unknown) {
-  if (typeof input !== 'string') return undefined
-  try {
-    const parsed = JSON.parse(input)
-    return typeof parsed === 'object' &&
-      parsed !== null &&
-      !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : undefined
-  } catch {
-    return undefined
-  }
 }
 
 // Real Codex mints the session/thread id (which becomes prompt_cache_key,
@@ -946,148 +891,6 @@ function saveCodexSessions(sessions: Map<string, CodexSessionMetadata>): void {
     renameSync(tmp, path)
   } catch {
     // State persistence only improves cache continuity; never fail a request.
-  }
-}
-
-function isMessageWithRole(item: unknown, role: string) {
-  return (
-    isRecord(item) &&
-    (item.type === 'message' || 'role' in item) &&
-    item.role === role
-  )
-}
-
-function startsHttpUserTurn(
-  metadata: CodexSessionMetadata,
-  input: unknown[],
-  canonical: CanonicalInput,
-) {
-  if (!metadata.input) return input.length > 0
-  const prior = metadata.canonicalInput ?? canonicalInput(metadata.input)
-  if (canonicalPrefixLength(prior, canonical) === undefined) return true
-  const suffix = input.slice(metadata.input.length)
-  return suffix.some(
-    (item) =>
-      isMessageWithRole(item, 'user') || isMessageWithRole(item, 'developer'),
-  )
-}
-
-function updateHttpTurnMetadata(
-  metadata: CodexSessionMetadata,
-  body: Record<string, unknown> | undefined,
-) {
-  const input = Array.isArray(body?.input) ? body.input : undefined
-  const canonical = input
-    ? canonicalInput(input, metadata.canonicalInput)
-    : undefined
-  if (
-    input &&
-    canonical &&
-    (startsHttpUserTurn(metadata, input, canonical) || !metadata.turnID)
-  ) {
-    metadata.turnID = uuidV7()
-    metadata.turnStartedAt = Date.now()
-  } else if (!metadata.turnStartedAt) {
-    metadata.turnStartedAt = Date.now()
-  }
-  // Copy the host input before effort updates are inserted, so the next tool
-  // request compares against host history and does not start a false user turn.
-  if (input && canonical) {
-    metadata.input = input.slice()
-    metadata.canonicalInput = retainedInput(canonical)
-  }
-}
-
-function prepareCodexRequest(input: {
-  init: RequestInit | undefined
-  headers: Headers
-  metadata: CodexSessionMetadata | undefined
-  installationID: string
-  websocket: boolean
-  responsesLite: boolean
-  dumpSessionID?: string
-}): PreparedCodexRequest {
-  // Read and remove the internal agent header before any early return, so it
-  // cannot reach outgoing headers, cachekeep captures or request dumps.
-  const agent = input.headers.get(OPENAI_AGENT_HEADER)
-  input.headers.delete(OPENAI_AGENT_HEADER)
-  if (!input.metadata) return { init: input.init }
-  const body = parseJsonObject(input.init?.body)
-  if (!input.websocket) updateHttpTurnMetadata(input.metadata, body)
-  else if (!input.metadata.turnStartedAt)
-    input.metadata.turnStartedAt = Date.now()
-  if (!input.metadata.turnStartedAt) input.metadata.turnStartedAt = Date.now()
-  // Base turn-metadata. HTTP sends full replay bodies, so we detect fresh user turns from append-only
-  // input growth above. The WebSocket path still overrides turn_id/turn_started_at in ws-pool.ts
-  // after continuation trimming/prewarm selection.
-  // Codex turn-metadata schema (exact field set + order; no request_id/originator):
-  // { session_id, thread_id, thread_source, turn_id, sandbox, turn_started_at_unix_ms, request_kind, window_id }
-  const turnMetadata = JSON.stringify({
-    session_id: input.metadata.threadID,
-    thread_id: input.metadata.threadID,
-    thread_source: 'user',
-    turn_id: input.metadata.turnID,
-    sandbox: CODEX_SANDBOX,
-    turn_started_at_unix_ms: input.metadata.turnStartedAt,
-    request_kind: 'turn',
-    window_id: input.metadata.windowID,
-  })
-  input.headers.set('originator', 'codex_exec')
-  if (input.websocket) {
-    // Codex's WebSocket upgrade carries neither Accept nor Content-Type.
-    input.headers.delete('accept')
-    input.headers.delete('content-type')
-  } else {
-    input.headers.set('accept', 'text/event-stream')
-  }
-  input.headers.set('session-id', input.metadata.threadID)
-  input.headers.delete('x-session-id')
-  input.headers.delete('x-session-affinity')
-  input.headers.set('thread-id', input.metadata.threadID)
-  input.headers.set('x-codex-window-id', input.metadata.windowID)
-  // Codex uses the session/thread UUID as x-client-request-id (not a fresh per-request id).
-  input.headers.set('x-client-request-id', input.metadata.threadID)
-  input.headers.set('x-codex-beta-features', CODEX_BETA_FEATURES)
-  input.headers.set('x-codex-turn-metadata', turnMetadata)
-  input.headers.set('user-agent', CODEX_USER_AGENT)
-  input.headers.set('version', CODEX_VERSION)
-  if (input.dumpSessionID)
-    input.headers.set(DUMP_SESSION_HEADER, input.dumpSessionID)
-
-  const parsed = body
-  if (!parsed) return { init: input.init }
-  const useResponsesLite =
-    input.responsesLite &&
-    typeof parsed.model === 'string' &&
-    RESPONSES_LITE_MODELS.has(parsed.model)
-  if (useResponsesLite && !input.websocket)
-    input.headers.set('x-openai-internal-codex-responses-lite', 'true')
-  parsed.prompt_cache_key = input.metadata.threadID
-  parsed.parallel_tool_calls ??= true
-  if (Array.isArray(parsed.tools))
-    parsed.tools = parsed.tools.map(normalizeCodexTool)
-  applyMidConversationEffort(parsed, input.metadata, agent)
-  if (useResponsesLite) rewriteResponsesLiteBody(parsed)
-  const clientMetadata: Record<string, unknown> = {
-    ...(typeof parsed.client_metadata === 'object' &&
-    parsed.client_metadata !== null
-      ? parsed.client_metadata
-      : {}),
-    'x-codex-installation-id': input.installationID,
-    'x-codex-window-id': input.metadata.windowID,
-  }
-  if (input.websocket) {
-    clientMetadata['x-codex-turn-metadata'] = turnMetadata
-    clientMetadata['x-codex-ws-stream-request-start-ms'] = String(Date.now())
-    if (useResponsesLite)
-      clientMetadata.ws_request_header_x_openai_internal_codex_responses_lite =
-        'true'
-  }
-  parsed.client_metadata = clientMetadata
-  input.headers.delete('content-length')
-  input.headers.delete('Content-Length')
-  return {
-    init: { ...input.init, body: JSON.stringify(orderCodexBody(parsed)) },
   }
 }
 
@@ -1284,36 +1087,6 @@ export function resolveSidebarSessionId(headers: Headers): string | undefined {
     undefined
   )
 }
-// The input saved to detect the next HTTP user turn (`metadata.input`) holds
-// the same item objects as this request body. Copy only the paths that change,
-// so removing image details from what is sent leaves that saved history as the
-// host sent it; otherwise every later request would look like a new turn.
-function stripResponsesLiteImageDetails(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    let next = value
-    for (let index = 0; index < value.length; index++) {
-      const nested = stripResponsesLiteImageDetails(value[index])
-      if (nested === value[index]) continue
-      if (next === value) next = value.slice()
-      next[index] = nested
-    }
-    return next
-  }
-  if (!isRecord(value)) return value
-  let next = value
-  for (const key of Object.keys(value)) {
-    if (value.type === 'input_image' && key === 'detail') {
-      if (next === value) next = { ...value }
-      delete next[key]
-      continue
-    }
-    const nested = stripResponsesLiteImageDetails(value[key])
-    if (nested === value[key]) continue
-    if (next === value) next = { ...value }
-    next[key] = nested
-  }
-  return next
-}
 
 // Models where a `configuration_update` item is both accepted and shown to change
 // effort. Accepted is not enough: a silently ignored item also completes with 200,
@@ -1338,7 +1111,6 @@ export const MID_CONVERSATION_EFFORT_MODELS: ReadonlySet<string> = new Set([
 // OpenCode repository) mark title, compaction and summary as hidden helpers,
 // not the conversation's agent loop. chat.headers supplies the
 // host's agent name; missing tags retain compatibility with other fetch callers.
-const OPENAI_AGENT_HEADER = 'x-openai-auth-agent'
 const HIDDEN_EFFORT_AGENTS = new Set(['title', 'compaction', 'summary'])
 
 /**
@@ -1426,14 +1198,41 @@ function applyMidConversationEffort(
   }
 }
 
-// Responses Lite trades capabilities for Codex's compact request shape. It is
-// opt-in because it disables parallel tool calls and excludes hosted tools.
+// Copy only changed paths: saved host history must retain image details for
+// the next request's turn comparison, even when Lite strips them on the wire.
+function stripResponsesLiteImageDetails(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    let next = value
+    for (let index = 0; index < value.length; index++) {
+      const nested = stripResponsesLiteImageDetails(value[index])
+      if (nested === value[index]) continue
+      if (next === value) next = value.slice()
+      next[index] = nested
+    }
+    return next
+  }
+  if (!isRecord(value)) return value
+  let next = value
+  for (const key of Object.keys(value)) {
+    if (value.type === 'input_image' && key === 'detail') {
+      if (next === value) next = { ...value }
+      delete next[key]
+      continue
+    }
+    const nested = stripResponsesLiteImageDetails(value[key])
+    if (nested === value[key]) continue
+    if (next === value) next = { ...value }
+    next[key] = nested
+  }
+  return next
+}
+
+// Lite is opt-in because it disables parallel calls and excludes hosted tools.
 export function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
   const reasoning = isRecord(parsed.reasoning) ? { ...parsed.reasoning } : {}
   reasoning.context = 'all_turns'
   parsed.reasoning = reasoning
   parsed.parallel_tool_calls = false
-
   const input = stripResponsesLiteImageDetails(
     Array.isArray(parsed.input) ? parsed.input : [],
   ) as unknown[]
@@ -1458,33 +1257,6 @@ export function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
   parsed.input = [...prefix, ...input]
   delete parsed.tools
   delete parsed.instructions
-}
-
-// Match Codex's function-tool shape: drop the JSON-Schema `$schema` dialect marker
-// (Codex omits it) and mark function tools `strict: false` as Codex does.
-function normalizeCodexTool(tool: unknown) {
-  if (!isRecord(tool)) return tool
-  if (tool.type !== 'function') return tool
-  const parameters =
-    isRecord(tool.parameters) && '$schema' in tool.parameters
-      ? (() => {
-          const { $schema: _schema, ...rest } = tool.parameters as Record<
-            string,
-            unknown
-          >
-          return rest
-        })()
-      : tool.parameters
-  // Codex function-tool key order: type, name, description, strict, parameters (+ any extras).
-  const { type, name, description, strict, parameters: _p, ...extra } = tool
-  return {
-    type,
-    name,
-    description,
-    strict: strict ?? false,
-    parameters,
-    ...extra,
-  }
 }
 
 export async function CodexAuthPlugin(
@@ -3420,6 +3192,8 @@ export async function CodexAuthPlugin(
               ? new URL(codexApiEndpoint)
               : parsed
           const prepared = prepareCodexRequest({
+            rewriteLite: rewriteResponsesLiteBody,
+            applyEffort: applyMidConversationEffort,
             init: {
               ...init,
               headers,
