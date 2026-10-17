@@ -16,6 +16,7 @@ import { setupOpenAIAuth } from '../v2/setup'
 import {
   fakeOpenCode2Host,
   poolFiles,
+  type RequestKind,
   scope,
   seedPool,
 } from './fixtures/opencode2-host'
@@ -336,203 +337,268 @@ const HEADER_ALLOWLIST: Record<string, string> = {
     'Both hosts supply the JSON media type before the plugin runs.',
 }
 
+type OracleStep = { kind: RequestKind; input: unknown[] }
+type TurnMetadata = Record<string, unknown> & { turn_id: string }
+
+/**
+ * Sends `sequence` for one session through OpenCode 1's real fetch, then
+ * through OpenCode 2's `http.request` hook, and requires the two to emit the
+ * same bytes for every request: every header (the turn metadata among them)
+ * and the body. Returns each host's parsed `x-codex-turn-metadata`, in order.
+ *
+ * Ids and times are deterministic: random bytes restart from the same counter
+ * for each host, and the clock reads `stepMs * i` past a fixed instant while
+ * step `i` is sent. With `stepMs` above zero a turn's `turn_started_at_unix_ms`
+ * names the step that started it, so the comparison also shows which request
+ * began each turn.
+ */
+async function runOracle(
+  lite: boolean,
+  capped: boolean,
+  sequence: readonly OracleStep[],
+  stepMs = 0,
+): Promise<{ opencode1: TurnMetadata[]; opencode2: TurnMetadata[] }> {
+  const work = createRequestTestScope()
+  work.capturePluginWork()
+  const files = poolFiles()
+  cleanups.push(() => rmSync(files.dir, { recursive: true, force: true }))
+  const env = {
+    OPENCODE_CONFIG_DIR: files.dir,
+    OPENCODE_OPENAI_AUTH_FILE: files.configPath,
+    OPENCODE_OPENAI_AUTH_STATE_FILE: files.statePath,
+    OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE: join(files.dir, 'sidebar.json'),
+    CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE: lite ? '1' : '0',
+    CORTEXKIT_OPENAI_AUTH_DUMP: '0',
+  }
+  for (const [key, value] of Object.entries(env)) {
+    const previous = process.env[key]
+    process.env[key] = value
+    cleanups.push(() => restoreEnv(key, previous))
+  }
+  resetSettingsForTest()
+  cleanups.push(resetSettingsForTest)
+  const start = 1_900_000_000_000
+  let now = start
+  const clock = spyOn(Date, 'now').mockImplementation(() => now)
+  const installationID = '00000000-0000-4000-8000-000000000001'
+  const installation = spyOn(crypto, 'randomUUID').mockReturnValue(
+    installationID,
+  )
+  let counter = 0
+  const random = spyOn(crypto, 'getRandomValues').mockImplementation(
+    <T extends ArrayBufferView | null>(array: T): T => {
+      if (!array) throw new Error('missing random buffer')
+      new Uint8Array(array.buffer, array.byteOffset, array.byteLength).fill(
+        ++counter,
+      )
+      return array
+    },
+  )
+  cleanups.push(() => {
+    random.mockRestore()
+    installation.mockRestore()
+    clock.mockRestore()
+  })
+  seedPool(files, 'main-first', [{ id: 'main' }])
+  const sent: Array<{ headers: Headers; body: string }> = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = Object.assign(
+    async (url: RequestInfo | URL, init?: RequestInit) => {
+      if (String(url).includes('/responses'))
+        sent.push({
+          headers: new Headers(init?.headers),
+          body: String(init?.body),
+        })
+      return new Response('{}', { status: 200 })
+    },
+    { preconnect: () => {} },
+  ) as typeof fetch
+  cleanups.push(() => {
+    globalThis.fetch = originalFetch
+  })
+  cleanups.push(async () => {
+    await work.teardown(async () => {})
+  })
+  const hooks = work.ownPlugin(
+    await CodexAuthPlugin(
+      {
+        client: {
+          auth: { set: async () => {} },
+          session: { promptAsync: async () => {} },
+        },
+        project: { id: 'oracle', name: 'oracle' },
+        directory: files.dir,
+        worktree: files.dir,
+        experimental_workspace: { register: () => {} },
+        serverUrl: new URL('http://localhost:0'),
+        $: {},
+      } as unknown as PluginInput,
+      { experimentalWebSockets: false, responsesLite: lite },
+    ),
+  )
+  const loaded = await hooks.auth!.loader!(
+    async () => ({
+      type: 'oauth',
+      access: 'main-token',
+      refresh: 'main-refresh',
+      expires: Date.now() + 3_600_000,
+      accountId: 'chatgpt-main',
+    }),
+    { id: 'openai', models: {} } as never,
+  )
+  const fetchOne = (loaded as { fetch: typeof fetch }).fetch
+  const host = fakeOpenCode2Host()
+  const stop = await setupOpenAIAuth(host.ctx, {
+    paths: files.paths,
+    heartbeat: false,
+    sidebarStateFile: join(files.dir, 'sidebar2.json'),
+    codex: new CodexHttpState({ now: Date.now, uuid: uuidV7 }, installationID),
+    fetch: originalFetch,
+    vault: {
+      stateDir: join(files.dir, 'vault2'),
+      connectionFile: () => join(files.dir, 'no-vault'),
+      pollIntervalMs: 0,
+    },
+  })
+  cleanups.push(async () => {
+    await stop?.()
+  })
+  const bodies = sequence.map((step) => ({
+    stream: true,
+    input: step.input,
+    model: 'gpt-6.1-sol',
+    instructions: 'Be brief',
+    tools: [
+      {
+        name: 'read',
+        type: 'function',
+        parameters: { $schema: 'dialect', type: 'object' },
+      },
+      { type: 'custom', name: 'third-party', format: { type: 'text' } },
+    ],
+    reasoning: { effort: 'low' },
+    client_metadata: { extra: 'preserved' },
+    ...(capped ? { max_output_tokens: 1024 } : {}),
+  }))
+  // OpenCode 1 tells the request kinds apart only by the agent header
+  // `chat.headers` sets; OpenCode 2 also passes the kind in the hook scope.
+  const agentOf = (kind: RequestKind) => (kind === 'primary' ? 'build' : kind)
+  counter = 0
+  for (let i = 0; i < sequence.length; i++) {
+    now = start + stepMs * i
+    const source = request(bodies[i]!)
+    source.headers.set('x-openai-auth-agent', agentOf(sequence[i]!.kind))
+    await work.wrap(fetchOne)(source.url, {
+      method: source.method,
+      headers: source.headers,
+      body: await source.text(),
+    })
+  }
+  expect(sent).toHaveLength(sequence.length)
+  counter = 0
+  const opencode2: TurnMetadata[] = []
+  for (let i = 0; i < sequence.length; i++) {
+    now = start + stepMs * i
+    const draft = {
+      ...scope('ses_1', sequence[i]!.kind),
+      request: request(bodies[i]!),
+    }
+    draft.request.headers.set('x-openai-auth-agent', agentOf(sequence[i]!.kind))
+    await host.fire('http.request', draft)
+    const expected = sent[i]!
+    const actualHeaders = draft.request.headers
+    for (const name of new Set([
+      ...expected.headers.keys(),
+      ...actualHeaders.keys(),
+    ])) {
+      expect(ORACLE_HEADERS.has(name) || name in HEADER_ALLOWLIST).toBe(true)
+      expect({ [name]: actualHeaders.get(name) }).toEqual({
+        [name]: expected.headers.get(name),
+      })
+    }
+    expect(actualHeaders.get('authorization')).toBe('Bearer main-token')
+    expect(actualHeaders.get('chatgpt-account-id')).toBe('chatgpt-main')
+    const expectedBody = JSON.parse(expected.body)
+    if (capped) delete expectedBody.max_output_tokens
+    expect(await draft.request.text()).toBe(
+      capped ? JSON.stringify(expectedBody) : expected.body,
+    )
+    opencode2.push(JSON.parse(actualHeaders.get('x-codex-turn-metadata')!))
+  }
+  return {
+    opencode1: sent.map((entry) =>
+      JSON.parse(entry.headers.get('x-codex-turn-metadata')!),
+    ),
+    opencode2,
+  }
+}
+
+const generated = [user('generate task')]
+const tool = [
+  ...generated,
+  { type: 'function_call', name: 'read', call_id: 'c', arguments: '{}' },
+  { type: 'function_call_output', call_id: 'c', output: 'ok' },
+]
+
 for (const lite of [false, true]) {
   for (const capped of [false, true]) {
     it(`S6 oracle matches final OpenCode 1 bytes (Lite=${lite}, cap=${capped})`, async () => {
-      const work = createRequestTestScope()
-      work.capturePluginWork()
-      const files = poolFiles()
-      cleanups.push(() => rmSync(files.dir, { recursive: true, force: true }))
-      const env = {
-        OPENCODE_CONFIG_DIR: files.dir,
-        OPENCODE_OPENAI_AUTH_FILE: files.configPath,
-        OPENCODE_OPENAI_AUTH_STATE_FILE: files.statePath,
-        OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE: join(
-          files.dir,
-          'sidebar.json',
-        ),
-        CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE: lite ? '1' : '0',
-        CORTEXKIT_OPENAI_AUTH_DUMP: '0',
-      }
-      for (const [key, value] of Object.entries(env)) {
-        const previous = process.env[key]
-        process.env[key] = value
-        cleanups.push(() => restoreEnv(key, previous))
-      }
-      resetSettingsForTest()
-      cleanups.push(resetSettingsForTest)
-      const clock = spyOn(Date, 'now').mockReturnValue(1_900_000_000_000)
-      const installationID = '00000000-0000-4000-8000-000000000001'
-      const installation = spyOn(crypto, 'randomUUID').mockReturnValue(
-        installationID,
-      )
-      let counter = 0
-      const random = spyOn(crypto, 'getRandomValues').mockImplementation(
-        <T extends ArrayBufferView | null>(array: T): T => {
-          if (!array) throw new Error('missing random buffer')
-          new Uint8Array(array.buffer, array.byteOffset, array.byteLength).fill(
-            ++counter,
-          )
-          return array
-        },
-      )
-      cleanups.push(() => {
-        random.mockRestore()
-        installation.mockRestore()
-        clock.mockRestore()
-      })
-      seedPool(files, 'main-first', [{ id: 'main' }])
-      const sent: Array<{ headers: Headers; body: string }> = []
-      const originalFetch = globalThis.fetch
-      globalThis.fetch = Object.assign(
-        async (url: RequestInfo | URL, init?: RequestInit) => {
-          if (String(url).includes('/responses'))
-            sent.push({
-              headers: new Headers(init?.headers),
-              body: String(init?.body),
-            })
-          return new Response('{}', { status: 200 })
-        },
-        { preconnect: () => {} },
-      ) as typeof fetch
-      cleanups.push(() => {
-        globalThis.fetch = originalFetch
-      })
-      cleanups.push(async () => {
-        await work.teardown(async () => {})
-      })
-      const hooks = work.ownPlugin(
-        await CodexAuthPlugin(
-          {
-            client: {
-              auth: { set: async () => {} },
-              session: { promptAsync: async () => {} },
-            },
-            project: { id: 'oracle', name: 'oracle' },
-            directory: files.dir,
-            worktree: files.dir,
-            experimental_workspace: { register: () => {} },
-            serverUrl: new URL('http://localhost:0'),
-            $: {},
-          } as unknown as PluginInput,
-          { experimentalWebSockets: false, responsesLite: lite },
-        ),
-      )
-      const loaded = await hooks.auth!.loader!(
-        async () => ({
-          type: 'oauth',
-          access: 'main-token',
-          refresh: 'main-refresh',
-          expires: Date.now() + 3_600_000,
-          accountId: 'chatgpt-main',
-        }),
-        { id: 'openai', models: {} } as never,
-      )
-      const fetchOne = (loaded as { fetch: typeof fetch }).fetch
-      const host = fakeOpenCode2Host()
-      const stop = await setupOpenAIAuth(host.ctx, {
-        paths: files.paths,
-        heartbeat: false,
-        sidebarStateFile: join(files.dir, 'sidebar2.json'),
-        codex: new CodexHttpState(
-          { now: Date.now, uuid: uuidV7 },
-          installationID,
-        ),
-        fetch: originalFetch,
-        vault: {
-          stateDir: join(files.dir, 'vault2'),
-          connectionFile: () => join(files.dir, 'no-vault'),
-          pollIntervalMs: 0,
-        },
-      })
-      cleanups.push(async () => {
-        await stop?.()
-      })
-      const first = [user('one')]
-      const generated = [user('generate task')]
-      const tool = [
-        ...generated,
-        { type: 'function_call', name: 'read', call_id: 'c', arguments: '{}' },
-        { type: 'function_call_output', call_id: 'c', output: 'ok' },
-      ]
-      const sequence = [
-        { kind: 'primary', input: first },
+      const { opencode2 } = await runOracle(lite, capped, [
+        { kind: 'primary', input: [user('one')] },
         { kind: 'title', input: [user('name this session')] },
         { kind: 'compaction', input: [user('summarize this session')] },
         { kind: 'generate', input: generated },
         { kind: 'primary', input: tool },
         { kind: 'primary', input: [...tool, user('two')] },
-      ] as const
-      const bodies = sequence.map((step) => ({
-        stream: true,
-        input: step.input,
-        model: 'gpt-6.1-sol',
-        instructions: 'Be brief',
-        tools: [
-          {
-            name: 'read',
-            type: 'function',
-            parameters: { $schema: 'dialect', type: 'object' },
-          },
-          { type: 'custom', name: 'third-party', format: { type: 'text' } },
-        ],
-        reasoning: { effort: 'low' },
-        client_metadata: { extra: 'preserved' },
-        ...(capped ? { max_output_tokens: 1024 } : {}),
-      }))
-      counter = 0
-      for (let i = 0; i < sequence.length; i++) {
-        const source = request(bodies[i]!)
-        source.headers.set(
-          'x-openai-auth-agent',
-          sequence[i]!.kind === 'primary' ? 'build' : sequence[i]!.kind,
-        )
-        await work.wrap(fetchOne)(source.url, {
-          method: source.method,
-          headers: source.headers,
-          body: await source.text(),
-        })
-      }
-      expect(sent).toHaveLength(6)
-      counter = 0
-      const turns: string[] = []
-      for (let i = 0; i < sequence.length; i++) {
-        const draft = {
-          ...scope('ses_1', sequence[i]!.kind),
-          request: request(bodies[i]!),
-        }
-        draft.request.headers.set(
-          'x-openai-auth-agent',
-          sequence[i]!.kind === 'primary' ? 'build' : sequence[i]!.kind,
-        )
-        await host.fire('http.request', draft)
-        const expected = sent[i]!
-        const actualHeaders = draft.request.headers
-        for (const name of new Set([
-          ...expected.headers.keys(),
-          ...actualHeaders.keys(),
-        ])) {
-          expect(ORACLE_HEADERS.has(name) || name in HEADER_ALLOWLIST).toBe(
-            true,
-          )
-          expect({ [name]: actualHeaders.get(name) }).toEqual({
-            [name]: expected.headers.get(name),
-          })
-        }
-        expect(actualHeaders.get('authorization')).toBe('Bearer main-token')
-        expect(actualHeaders.get('chatgpt-account-id')).toBe('chatgpt-main')
-        const expectedBody = JSON.parse(expected.body)
-        if (capped) delete expectedBody.max_output_tokens
-        expect(await draft.request.text()).toBe(
-          capped ? JSON.stringify(expectedBody) : expected.body,
-        )
-        turns.push(
-          JSON.parse(actualHeaders.get('x-codex-turn-metadata')!).turn_id,
-        )
-      }
+      ])
+      const turns = opencode2.map((metadata) => metadata.turn_id)
       expect(new Set(turns.slice(0, 4)).size).toBe(4)
       expect(turns[4]).toBe(turns[3])
       expect(turns[5]).not.toBe(turns[4])
+    })
+
+    // The sequence above sends title and compaction only before generate,
+    // whose input then becomes the history the next agent-loop request is
+    // compared with. So whatever title or compaction leave in the session's
+    // turn state is overwritten before any agent-loop request reads it. Here
+    // an agent-loop request follows each of them, and the first two are tool
+    // steps that, alone, would stay in the turn they continue.
+    it(`agent-loop turn state after title, compaction and generate matches OpenCode 1 (Lite=${lite}, cap=${capped})`, async () => {
+      const call = (id: string) => [
+        { type: 'function_call', name: 'read', call_id: id, arguments: '{}' },
+        { type: 'function_call_output', call_id: id, output: 'ok' },
+      ]
+      const first = [user('one')]
+      const step = [...first, ...call('c1')]
+      const next = [...step, ...call('c2')]
+      const sequence: OracleStep[] = [
+        { kind: 'primary', input: first },
+        { kind: 'title', input: [user('name this session')] },
+        { kind: 'primary', input: step },
+        { kind: 'compaction', input: [user('summarize this session')] },
+        { kind: 'primary', input: next },
+        { kind: 'generate', input: [...next, user('keep warm')] },
+      ]
+      const { opencode1, opencode2 } = await runOracle(
+        lite,
+        capped,
+        sequence,
+        1000,
+      )
+      const primary = (metadata: TurnMetadata[]) =>
+        metadata.filter((_, i) => sequence[i]!.kind === 'primary')
+      expect(primary(opencode2)).toEqual(primary(opencode1))
+      expect(opencode2).toEqual(opencode1)
+      // What OpenCode 1 does, and so what OpenCode 2 must do: every request
+      // kind of a session shares one turn state, and a title or compaction
+      // request, whose input is not the conversation, becomes the history
+      // the next request is compared with. The tool steps after them
+      // therefore start new turns.
+      const turns = opencode1.map((metadata) => metadata.turn_id)
+      expect(new Set(turns).size).toBe(6)
+      expect(
+        opencode1.map((metadata) => metadata.turn_started_at_unix_ms),
+      ).toEqual(sequence.map((_, i) => 1_900_000_000_000 + 1000 * i))
     })
   }
 }

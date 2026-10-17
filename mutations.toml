@@ -4425,6 +4425,27 @@ test_count_pattern = "Ran {count} test"
 expect_red = ["^OpenCode\\s2\\sHTTP\\sshape\\sshares\\sHTTP\\sand\\sWebSocket\\sthread\\scache\\sidentity\\swhile\\sresponse\\sattribution\\ssurvives$"]
 expect_message = "ses_1"
 
+# OpenCode 1 runs every request kind of a session through one Codex turn state,
+# so a title or compaction request changes what the next agent-loop request is
+# compared with. Keeping them out of that state is the change this row makes.
+# The older byte comparison in the same file ("S6 oracle matches final
+# OpenCode 1 bytes") stays green under it: its sequence sends generate after
+# title and compaction, and generate overwrites what they left before any
+# agent-loop request reads it.
+[[control]]
+id = "opencode2-http-helper-kinds-share-turn-state"
+guards = "title and compaction requests update the session's HTTP turn state exactly as OpenCode 1 does, so later agent-loop turn ids and turn metadata keep OpenCode 1's bytes"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = "    metadata: state.get(scope.sessionID),\n"
+new = "    metadata: scope.kind === 'title' || scope.kind === 'compaction' ? { ...state.get(scope.sessionID) } : state.get(scope.sessionID), // NON-VACUITY BREAK\n"
+test_file = "packages/opencode/src/tests/opencode2-http-shape.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-http-shape.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^agent-loop\\sturn\\sstate\\safter\\stitle,\\scompaction\\sand\\sgenerate\\smatches\\sOpenCode\\s1\\s\\(Lite=false,\\scap=false\\)$"]
+expect_message = "\"turn_started_at_unix_ms\":1900000002000"
+
 [[control]]
 id = "opencode2-sessions-own-file"
 guards = "OpenCode 2 saves Codex thread ids to its own session file and never writes OpenCode 1's openai-auth-sessions.json"
