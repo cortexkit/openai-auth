@@ -56,9 +56,10 @@ export interface CodexSessionStoreOptions {
 export class CodexSessionStore {
   readonly sessions: Map<string, CodexSessionMetadata>
   /**
-   * Each session's WebSocket frame turn, beside its Codex metadata and
-   * shared the same way by every location in the process. Kept in memory
-   * only: it is never written to the file.
+   * Each session's WebSocket frame turn, kept next to its Codex metadata.
+   * Every location in this process gets this same store, so they all share
+   * one frame turn per session. It lives in memory only and is never written
+   * to the session file at `path`.
    */
   readonly frameTurns = new FrameTurnState()
   /** Sessions this process created since its last successful save. */

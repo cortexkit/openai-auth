@@ -38,9 +38,10 @@ function processInstallationID(): string {
 export class CodexHttpState {
   readonly sessions: Map<string, CodexSessionMetadata>
   /**
-   * Each session's WebSocket frame turn (`frame-turn.ts`): the store's
-   * process-wide state with a store, this object's own without one. Only
-   * WebSocket frames move it; HTTP requests of every kind leave it alone.
+   * Each session's WebSocket frame turn (see `frame-turn.ts`). With a store
+   * this is the store's process-wide state; without a store it is this
+   * object's own. Only WebSocket frames update it; HTTP requests of every
+   * kind leave it alone.
    */
   readonly frameTurns: FrameTurnState
   readonly installationID: string
