@@ -296,11 +296,14 @@ async function installPoolHooks<Q, A>(
               const socket = sockets.get(
                 `${received.sessionID}:${received.kind}`,
               )
-              if (socket)
+              if (socket) {
+                // Only an owned socket's frames move the frame turn state.
+                codex.frameReceived(received.sessionID, received.frame)
                 received.frame = redactCredentialFrame(
                   received.frame,
                   socket.bearer,
                 )
+              }
             } else if (name === 'retry') {
               const retry = draft as SessionHooks['retry']
               const token = latest.get(retry.sessionID)

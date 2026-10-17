@@ -16,6 +16,7 @@ import {
 } from '../index'
 import { uuidV7 } from '../util/uuid-v7'
 import type { CodexSessionStore } from './codex-sessions'
+import { type FrameTurn, FrameTurnState } from './frame-turn'
 
 const INSTALLATION_KEY = Symbol.for(
   '@cortexkit/openai-auth/opencode2/codex-installation',
@@ -36,6 +37,12 @@ function processInstallationID(): string {
  */
 export class CodexHttpState {
   readonly sessions: Map<string, CodexSessionMetadata>
+  /**
+   * Each session's WebSocket frame turn (`frame-turn.ts`): the store's
+   * process-wide state with a store, this object's own without one. Only
+   * WebSocket frames move it; HTTP requests of every kind leave it alone.
+   */
+  readonly frameTurns: FrameTurnState
   readonly installationID: string
   constructor(
     readonly runtime?: CodexRequestRuntime,
@@ -44,6 +51,7 @@ export class CodexHttpState {
   ) {
     this.installationID = installationID ?? processInstallationID()
     this.sessions = store?.sessions ?? new Map()
+    this.frameTurns = store?.frameTurns ?? new FrameTurnState()
   }
 
   get(sessionID: string): CodexSessionMetadata {
@@ -58,10 +66,35 @@ export class CodexHttpState {
     return metadata
   }
 
+  /**
+   * Applies the frame turn rule to one `response.create` frame the host is
+   * about to send, as the host built it, and returns the frame's turn.
+   */
+  advanceFrame(sessionID: string, frame: Record<string, unknown>): FrameTurn {
+    return this.frameTurns.advance(sessionID, frame, this.runtime)
+  }
+
+  /**
+   * Reads one WebSocket frame the server sent on an owned socket. A
+   * `response.completed` marks the session's last sent frame as completed,
+   * so resending that same full frame afterwards starts a new turn instead
+   * of counting as a resend. Every other frame changes nothing.
+   */
+  frameReceived(sessionID: string, frame: string): void {
+    // Most received frames are deltas; skip parsing those (a completed
+    // frame repeats the whole response and can be large).
+    if (!frame.includes('response.completed')) return
+    if (parseObject(frame)?.type === 'response.completed')
+      this.frameTurns.completed(sessionID)
+  }
+
   /** Drops a deleted host session; a later request with its id starts a new thread. */
   forget(sessionID: string): void {
     if (this.store) this.store.delete(sessionID)
-    else this.sessions.delete(sessionID)
+    else {
+      this.sessions.delete(sessionID)
+      this.frameTurns.forget(sessionID)
+    }
   }
 }
 
@@ -305,6 +338,9 @@ export function rewriteCodexFrame(
 ): string | undefined {
   const body = parseObject(frame)
   if (body?.type !== 'response.create') return undefined
+  // The turn rule reads the frame as the host built it, before the effort
+  // rule below may insert its item.
+  effort.http.advanceFrame(scope.sessionID, body)
   const capped = 'max_output_tokens' in body
   delete body.max_output_tokens
   const threadID = effort.http.get(scope.sessionID).threadID

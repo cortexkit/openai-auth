@@ -99,8 +99,17 @@ export class FrameTurnState {
     readonly maxSessions = MAX_FRAME_TURN_SESSIONS,
   ) {}
 
-  /** Applies the rule to one frame about to be sent and returns its turn. */
-  advance(sessionID: string, frame: Record<string, unknown>): FrameTurn {
+  /**
+   * Applies the rule to one frame about to be sent and returns its turn.
+   * `runtime` mints a new turn's id and start time; it defaults to the one
+   * given to the constructor, so a process-wide instance can serve callers
+   * that each bring their own clock.
+   */
+  advance(
+    sessionID: string,
+    frame: Record<string, unknown>,
+    runtime: CodexRequestRuntime | undefined = this.runtime,
+  ): FrameTurn {
     const prior = this.#sessions.get(sessionID)
     const input = Array.isArray(frame.input) ? frame.input : []
     const users = input.filter(isUserMessage)
@@ -135,8 +144,8 @@ export class FrameTurnState {
     const turn =
       startsTurn || !prior
         ? {
-            turnID: (this.runtime?.uuid ?? uuidV7)(),
-            turnStartedAt: (this.runtime?.now ?? Date.now)(),
+            turnID: (runtime?.uuid ?? uuidV7)(),
+            turnStartedAt: (runtime?.now ?? Date.now)(),
           }
         : { turnID: prior.turnID, turnStartedAt: prior.turnStartedAt }
     this.#set(sessionID, {
