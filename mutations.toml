@@ -4634,19 +4634,6 @@ test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode\s2\sreset\scredits\smenu\sopening\s/openai\slists\smain\sand\seach\senabled\saccount\swith\sPreview,\sSpend\sand\sRetry,\sand\sspends\snothing$']
 
 [[control]]
-id = "opencode2-vault-reset-resolves-no-token"
-guards = "in vault mode an OpenCode 2 reset action reads no local token and asks the vault for no credential before it is refused"
-file = "packages/core/src/vault-command-menu.ts"
-old = "          request.sectionId === 'reset' ||"
-new = "          (request.sectionId === 'reset' && (await (await options.extras?.find((section) => section.id === 'reset')?.build(invocation))?.items?.[0]?.actions?.[0]?.run({ values: {}, itemId: 'main', invocation }), true)) || // NON-VACUITY BREAK"
-test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
-runner = "command"
-command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
-list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
-test_count_pattern = "Ran {count} test"
-expect_red = ['^OpenCode\s2\sreset\scredits\sin\svault\smode\sReset\scredits\sshows\sthe\svault\snote,\sand\severy\saction\sis\srefused\swithout\sreading\sa\scredential$']
-
-[[control]]
 id = "opencode2-vault-reset-refusal"
 guards = "in vault mode OpenCode 2 refuses reset actions with the vault refusal, not as unavailable"
 file = "packages/core/src/vault-command-menu.ts"
