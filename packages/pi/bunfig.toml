@@ -1,0 +1,5 @@
+[test]
+# Point Pi's own agent directory at a throwaway folder before any test file
+# loads, so a test that forgets `isolatePiAgentDir()` still can't reach the
+# developer's real ~/.pi/agent/auth.json.
+preload = ["./src/tests/setup-env.ts"]
