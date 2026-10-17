@@ -537,10 +537,10 @@ async function readConfig(path: string): Promise<Record<string, unknown>> {
 
 /**
  * The part of a run's context that `acquireLock` and `updateConfig` use:
- * the file paths, the clock, the sleep between lock attempts and the lock
+ * the file paths, the sleep between lock attempts and the lock
  * timings. Code outside a run builds just this much to write the config.
  */
-type LockContext = Pick<Context, 'paths' | 'now' | 'sleep' | 'locks'>
+type LockContext = Pick<Context, 'paths' | 'sleep' | 'locks'>
 
 /** Takes one file lock, polling while a live holder has it. */
 async function acquireLock(
@@ -555,7 +555,6 @@ async function acquireLock(
       name,
       path,
       ttlMs,
-      now: ctx.now,
       renew: ctx.locks.renew,
       ...(ctx.locks.renewIntervalMs !== undefined
         ? { renewIntervalMs: ctx.locks.renewIntervalMs }
@@ -780,7 +779,6 @@ export async function reclaimExpiredPoolTransfer(
     name: POOL_MIGRATION_LOCK_NAME,
     path: paths.configPath,
     ttlMs: locks.mainRefreshTtlMs,
-    now,
   })
   if (!runLock) return false
   try {
@@ -821,7 +819,6 @@ export async function reclaimExpiredPoolTransfer(
     await updateConfig(
       {
         paths,
-        now,
         locks,
         sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
       },

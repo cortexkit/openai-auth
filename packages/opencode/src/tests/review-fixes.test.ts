@@ -96,7 +96,6 @@ describe('#1 refresh-file-lock: stale-lock steal guard', () => {
       name: 'guard-test',
       ttlMs: 5_000,
       path: lockPath,
-      now: Date.now,
     })
 
     // Must return null — the fresh lock must not be stolen.
@@ -127,7 +126,6 @@ describe('#1 refresh-file-lock: stale-lock steal guard', () => {
       name: 'same-owner-test',
       ttlMs: 5_000,
       path: lockPath,
-      now: Date.now,
     })
 
     // Should have successfully stolen the stale lock.
@@ -419,13 +417,11 @@ describe('MUST 1 — refresh-file-lock: atomic steal elects a single owner', () 
         name: 'steal-race',
         ttlMs: 5_000,
         path: lockPath,
-        now: Date.now,
       }),
       acquireRefreshFileLock({
         name: 'steal-race',
         ttlMs: 5_000,
         path: lockPath,
-        now: Date.now,
       }),
     ])
 
@@ -480,12 +476,7 @@ describe('MUST 1 — refresh-file-lock: atomic steal elects a single owner', () 
 // ---------------------------------------------------------------------------
 
 // Seed a stale lock + stale eviction-marker directory (back-dated past EVICT_TTL).
-async function seedStaleRefreshLock(
-  lockPath: string,
-  name: string,
-  now: number,
-  ttlMs: number,
-) {
+async function seedStaleRefreshLock(lockPath: string, name: string) {
   const { mkdir, rm, utimes, writeFile } = await import('node:fs/promises')
   const lockFile = `${lockPath}.${name}.lock`
   const evictPath = `${lockFile}.evicting`
@@ -493,12 +484,11 @@ async function seedStaleRefreshLock(
   await rm(evictPath, { recursive: true, force: true })
   await writeFile(
     lockFile,
-    `${JSON.stringify({ ownerId: 'stale-owner', expiresAt: now - ttlMs })}\n`,
+    `${JSON.stringify({ ownerId: 'stale-owner', expiresAt: 0 })}\n`,
     'utf8',
   )
   await mkdir(evictPath)
-  const staleTime = new Date(now - 10_000)
-  await utimes(evictPath, staleTime, staleTime)
+  await utimes(evictPath, 0, 0)
   return { lockFile, evictPath }
 }
 
@@ -549,9 +539,8 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
 
     const lockPath = join(dir, 'openai-auth.json')
     const name = 'test-refresh-forced-stale-steal'
-    const now = 100_000
     const ttlMs = 1_000
-    await seedStaleRefreshLock(lockPath, name, now, ttlMs)
+    await seedStaleRefreshLock(lockPath, name)
 
     const cSawStaleMarker = deferred()
     const releaseCFromStaleMarker = deferred()
@@ -566,7 +555,6 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
       name,
       ttlMs,
       path: lockPath,
-      now: () => now,
       onStep: async (step) => {
         if (step === 'stale-marker-stat') {
           cSawStaleMarker.resolve()
@@ -589,7 +577,6 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
       name,
       ttlMs,
       path: lockPath,
-      now: () => now,
       onStep: (step) => {
         if (step === 'eviction-marker-acquired') {
           aAcquiredMarker.resolve()
@@ -639,12 +626,11 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
   })
 
   it('refresh file lock stale-marker steal has a single winner across bounded contention', async () => {
-    // The deterministic forced-race test above covers the fencing interleaving
-    // directly. Repeated cohorts still search for rare filesystem interleavings,
-    // including errors when an eviction marker disappears. Use 128 rounds, as in
-    // core/src/tests/refresh-file-lock.test.ts, to limit real I/O under load.
-    // The fixed logical clock prevents a slow cohort from expiring its winner;
-    // every round must still elect exactly one winner with zero marker leaks.
+    // Concurrent contenders can rename or remove an eviction marker while
+    // another contender is using it. Repeated cohorts probe those filesystem
+    // interleavings; 128 rounds bound the real I/O under load.
+    // Every round starts with explicitly expired records and must still elect
+    // exactly one winner with zero marker leaks.
     const { acquireRefreshFileLock } = await import(
       '@cortexkit/openai-auth-core/internal'
     )
@@ -656,8 +642,7 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
     const rounds = 128
 
     for (let round = 0; round < rounds; round++) {
-      const now = 1_000_000 + round * 20_000
-      await seedStaleRefreshLock(lockPath, name, now, ttlMs)
+      await seedStaleRefreshLock(lockPath, name)
 
       const locks = await Promise.all(
         Array.from({ length: contenders }, () =>
@@ -665,7 +650,6 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
             name,
             ttlMs,
             path: lockPath,
-            now: () => now,
           }),
         ),
       )

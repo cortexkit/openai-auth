@@ -89,7 +89,6 @@ async function refreshAccountNow(
     name: fallbackRefreshLockName((latestAccount ?? account).id),
     ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
     path: deps.paths.configPath,
-    now: deps.now,
     renew: true,
   })
   if (!fileLock)

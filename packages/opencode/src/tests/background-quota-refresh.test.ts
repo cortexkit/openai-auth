@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -340,13 +340,12 @@ describe('BackgroundQuotaRefresh', () => {
   test('the lock TTL outlasts a slow multi-account refresh', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'oai-bg-ttl-'))
     const configPath = join(dir, 'config.json')
+    const lockPath = `${configPath}.${BACKGROUND_QUOTA_REFRESH_LOCK_NAME}.lock`
     try {
-      let nowMs = 1_000_000
       const opts = {
         name: BACKGROUND_QUOTA_REFRESH_LOCK_NAME,
         ttlMs: BACKGROUND_QUOTA_REFRESH_LOCK_TTL_MS,
         path: configPath,
-        now: () => nowMs,
       }
 
       // The first acquirer holds the lock for the whole (slow) refresh.
@@ -355,7 +354,11 @@ describe('BackgroundQuotaRefresh', () => {
 
       // A serial pass over many accounts can run 35s; a contender arriving then
       // must still be locked out rather than start a concurrent refresh.
-      nowMs += 35_000
+      const lease = JSON.parse(readFileSync(lockPath, 'utf8'))
+      writeFileSync(
+        lockPath,
+        JSON.stringify({ ...lease, expiresAt: lease.expiresAt - 35_000 }),
+      )
       const contender = await acquireRefreshFileLock(opts)
       expect(contender).toBeNull()
 
@@ -374,45 +377,42 @@ describe('BackgroundQuotaRefresh', () => {
     const dir = mkdtempSync(join(tmpdir(), 'oai-bg-renew-'))
     const configPath = join(dir, 'config.json')
     try {
-      let nowMs = 1_000_000
-      // A small real-time renewal interval so ticks fire quickly while the mock
-      // clock simulates a refresh longer than the TTL.
-      const lockOpts = { now: () => nowMs, renewIntervalMs: 5 }
+      // Shorten the lease, not the clock: renewal must protect a refresh whose
+      // real elapsed time exceeds the original lease's lifetime.
+      const lockOpts = { ttlMs: 1_000, renewIntervalMs: 5 }
 
       const holder = await acquireBackgroundRefreshLock(configPath, lockOpts)
       expect(holder).not.toBeNull()
 
-      // Simulate a 125s refresh (past the 120s TTL) in steps smaller than the
-      // TTL, letting a real renewal tick fire between steps so the lock never
-      // appears expired to the renewal guard. Each renewal re-arms the TTL.
-      for (let elapsed = 0; elapsed < 125_000; elapsed += 25_000) {
-        nowMs += 25_000
-        await new Promise((resolve) => setTimeout(resolve, 30))
-      }
+      const lockPath = `${configPath}.${BACKGROUND_QUOTA_REFRESH_LOCK_NAME}.lock`
+      const originalLease = JSON.parse(readFileSync(lockPath, 'utf8'))
+      await new Promise((resolve) => setTimeout(resolve, 1_250))
+      expect(Date.now()).toBeGreaterThan(originalLease.expiresAt)
+      const renewedLease = JSON.parse(readFileSync(lockPath, 'utf8'))
+      expect(renewedLease.ownerId).toBe(originalLease.ownerId)
+      expect(renewedLease.expiresAt).toBeGreaterThan(originalLease.expiresAt)
 
-      // At simulated 125s — 5s past the TTL — a contender must still be locked
-      // out, because renewal kept the lock alive for the whole run.
+      // The initial lease is now expired, but renewal must keep contenders out.
       const contender = await acquireBackgroundRefreshLock(configPath, lockOpts)
       expect(contender).toBeNull()
 
       await holder?.release()
 
-      // Discriminator: without renewal the same elapsed time expires the lock at
-      // the TTL, so a contender acquires it (a concurrent refresh would start).
-      let bareNowMs = 2_000_000
+      // Without renewal an explicitly expired lease admits another refresher.
       const bareAcquire = () =>
         acquireRefreshFileLock({
           name: BACKGROUND_QUOTA_REFRESH_LOCK_NAME,
           ttlMs: BACKGROUND_QUOTA_REFRESH_LOCK_TTL_MS,
           path: configPath,
-          now: () => bareNowMs,
         })
       const bareHolder = await bareAcquire()
       expect(bareHolder).not.toBeNull()
-      bareNowMs += 125_000
+      const bareLease = JSON.parse(readFileSync(lockPath, 'utf8'))
+      writeFileSync(lockPath, JSON.stringify({ ...bareLease, expiresAt: 0 }))
       const bareContender = await bareAcquire()
       expect(bareContender).not.toBeNull()
       await bareContender?.release()
+      await bareHolder?.release()
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
