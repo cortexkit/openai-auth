@@ -17,6 +17,7 @@ import type {
   ApplyResult,
   OpenDialogPayload,
 } from '../rpc/protocol.js'
+import { factLines, sectionTitle } from './section-text'
 
 const log = createLogger('rpc-tui')
 
@@ -46,40 +47,6 @@ export function sectionListOptions(menu: Menu): DrawerOption[] {
     value: `section:${section.id}`,
     ...(section.lines[0] ? { description: section.lines[0] } : {}),
   }))
-}
-
-function factLines(facts: Record<string, unknown> | undefined): string[] {
-  return Object.entries(facts ?? {}).map(
-    ([name, value]) =>
-      `${name}: ${typeof value === 'string' ? value : JSON.stringify(value)}`,
-  )
-}
-
-export function sectionText(section: Section): string {
-  return [
-    ...section.lines,
-    ...factLines(section.facts),
-    ...section.items
-      .filter((item) => item.actions.length === 0)
-      .map((item) =>
-        [
-          item.group,
-          [item.label, item.status].filter(Boolean).join(' · '),
-          item.detail,
-          ...factLines(item.facts),
-        ]
-          .filter(Boolean)
-          .join('\n'),
-      ),
-  ]
-    .filter(Boolean)
-    .join('\n')
-}
-
-// DialogSelect counts each category as one row, but measures the title's text.
-// Keep section context outside the list so multiline text cannot hide actions.
-export function sectionTitle(section: Section): string {
-  return [section.title, sectionText(section)].filter(Boolean).join('\n')
 }
 
 /** Every option navigates or runs an action; read-only context is in the title. */

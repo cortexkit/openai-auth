@@ -4,7 +4,7 @@ import type {
   ApplyResult,
   OpenDialogPayload,
 } from '../rpc/protocol'
-import { sectionText, sectionTitle } from './command-dialogs'
+import { sectionText, sectionTitle } from './section-text'
 
 // Native selects count one row per option, including its inline description.
 function inlineDescription(...parts: Array<string | undefined>): string {
