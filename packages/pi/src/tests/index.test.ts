@@ -1,8 +1,10 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it, spyOn } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { type PiSlot, PiSlotError } from '@cortexkit/common-auth/pi-slot'
 
 import cortexKitPiOpenAIAuth, { installRawCodexWebSocket } from '../index.ts'
+import { PiOpenAIRuntime } from '../runtime.ts'
 
 type RegisteredProvider = {
   models: Array<{ id: string }>
@@ -10,6 +12,82 @@ type RegisteredProvider = {
 }
 
 describe('Pi OpenAI auth extension', () => {
+  for (const operation of ['inspect', 'enterVault', 'exitVault'] as const) {
+    it(`owns ${operation} lock-compromised at startup, session start and a background tick`, async () => {
+      const failure = new PiSlotError('lock-compromised')
+      const slot: PiSlot = {
+        inspect: async () => ({ slot: 'original', stash: 'missing' }),
+        enterVault: async () => {},
+        exitVault: async () => 'nothing-to-do',
+      }
+      const reject = spyOn(slot, operation).mockRejectedValue(failure)
+      const slots = spyOn(
+        PiOpenAIRuntime.prototype as unknown as { vaultSlot(): PiSlot },
+        'vaultSlot',
+      ).mockReturnValue(slot)
+      const authority = spyOn(
+        PiOpenAIRuntime.prototype,
+        'readAuthority',
+      ).mockResolvedValue(operation === 'enterVault' ? 'vault' : 'local')
+      const start = spyOn(
+        PiOpenAIRuntime.prototype,
+        'start',
+      ).mockResolvedValue()
+      let tick!: () => void
+      const interval = spyOn(globalThis, 'setInterval').mockImplementation(((
+        run: () => void,
+      ) => {
+        tick = run
+        return { unref() {} }
+      }) as unknown as typeof setInterval)
+      let session!: (event: unknown, ctx: unknown) => Promise<void>
+      const warnings: string[] = []
+      const unhandled: unknown[] = []
+      const onUnhandled = (error: unknown) => {
+        unhandled.push(error)
+      }
+      process.on('unhandledRejection', onUnhandled)
+      try {
+        await cortexKitPiOpenAIAuth({
+          registerCommand() {},
+          registerProvider() {},
+          on(name: string, handler: typeof session) {
+            if (name === 'session_start') session = handler
+          },
+        } as never)
+        expect(reject).toHaveBeenCalledTimes(1)
+        await session(
+          {},
+          {
+            modelRegistry: { refresh() {} },
+            ui: {
+              notify(message: string) {
+                warnings.push(message)
+              },
+            },
+          },
+        )
+        expect(reject).toHaveBeenCalledTimes(2)
+        tick()
+        // Cross the rejection-notification turn, not a fixed wall-clock delay.
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        expect(reject).toHaveBeenCalledTimes(3)
+        expect(warnings).toEqual([
+          'Pi could not load the vault login slot. Reopen the session or disconnect in /openai.',
+          'Pi could not load the vault login slot. Reopen the session or disconnect in /openai.',
+        ])
+        expect(unhandled).toEqual([])
+      } finally {
+        process.off('unhandledRejection', onUnhandled)
+        interval.mockRestore()
+        start.mockRestore()
+        authority.mockRestore()
+        slots.mockRestore()
+        reject.mockRestore()
+      }
+    })
+  }
+
   it("imports pi-ai only through specifiers pi's extension loader can alias", () => {
     // Pi rewrites pi-ai specifiers so extensions share its SDK instance, and its
     // alias table covers only these four. A specifier outside the table still

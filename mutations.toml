@@ -3890,3 +3890,73 @@ command = ["sh", "-c", "bun run --cwd packages/opencode build:tui && bun test --
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/opencode2-sidebar.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode 2 compiled sidebar renders local parity, live preferences and cleanup$']
+
+# Authority/menu fixtures avoid durable stash/restore writes; Pi vault slot
+# lifecycle tests verify those writes against the real auth and stash files.
+[[control]]
+id = "pi-authority-menu-volatile-slot"
+guards = "malformed enrollment authority/menu tests do not acquire a real Pi auth lock or durably rewrite a login"
+file = "packages/pi/src/tests/vault-mode.test.ts"
+old = "      const runtime = runtimeWith(target, volatileSlot())"
+new = "      const runtime = runtimeWith(target) // NON-VACUITY BREAK"
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sin\svault\smode\sunreadable\senrollment\sdisables\slocal\swork\sand\sretains\smenu\sDisconnect$']
+
+[[control]]
+id = "pi-slot-compromise-propagates"
+guards = "an overdue slot lease is rejected to the sync caller without publishing the stash or silently succeeding"
+file = "packages/pi/src/runtime.ts"
+old = "      await this.reconcileSlot(explicit)"
+new = "      await this.reconcileSlot(explicit).catch(() => {}) // NON-VACUITY BREAK"
+test_file = "packages/pi/src/tests/vault-mode.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/vault-mode.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\svault\sslot\slifecycle\sa\spaused\sstash\spublication\sexpires\sthe\slease\sand\sthe\sawaited\ssync\sowns\slock-compromised$']
+
+[[control]]
+id = "pi-background-slot-rejection-owned"
+guards = "a background slot rejection is caught and reported through a stable credential-free warning"
+file = "packages/pi/src/index.ts"
+old = """    void syncSlot(false).catch(() => {
+      notify?.(
+        'Pi could not load the vault login slot. Reopen the session or disconnect in /openai.',
+        'error',
+      )
+    })"""
+new = "    void syncSlot(false) // NON-VACUITY BREAK"
+test_file = "packages/pi/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/index.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/index.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sOpenAI\sauth\sextension\sowns\sinspect\slock-compromised\sat\sstartup,\ssession\sstart\sand\sa\sbackground\stick$']
+
+[[control]]
+id = "pi-background-slot-report-does-not-reject"
+guards = "the detached background rejection handler does not itself create an unhandled rejection after reporting"
+file = "packages/pi/src/index.ts"
+old = """    void syncSlot(false).catch(() => {
+      notify?.(
+        'Pi could not load the vault login slot. Reopen the session or disconnect in /openai.',
+        'error',
+      )
+    })"""
+new = """    void syncSlot(false).catch(() => {
+      notify?.(
+        'Pi could not load the vault login slot. Reopen the session or disconnect in /openai.',
+        'error',
+      )
+      throw new Error('NON-VACUITY BREAK')
+    })"""
+test_file = "packages/pi/src/tests/index.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/index.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/index.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\sOpenAI\sauth\sextension\sowns\sinspect\slock-compromised\sat\sstartup,\ssession\sstart\sand\sa\sbackground\stick$']
