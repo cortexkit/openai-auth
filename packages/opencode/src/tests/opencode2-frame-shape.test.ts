@@ -1,9 +1,12 @@
 // WebSocket frame shaping on OpenCode 2 (`rewriteCodexFrame` in
-// `v2/codex-wire.ts`): every owned `response.create` frame goes out as OpenCode
-// 1's WebSocket request builder shapes it, with the frame turn in its turn
-// metadata, while its `input` stays the host's (the effort rule's one
-// `configuration_update` item aside) and the socket's handshake headers stay
-// as they were.
+// `v2/codex-wire.ts`). A frame is the plugin's to shape when its socket was
+// opened with the pool placeholder credential; frames of API-key sessions are
+// left alone. Every such `response.create` frame goes out as OpenCode 1's
+// WebSocket request builder shapes it, with the frame turn in its turn
+// metadata. Its `input` stays the host's, except that the mid-conversation
+// effort rule may insert one `configuration_update` item before the turn's
+// user message. Shaping a frame never changes the headers the socket was
+// opened with.
 
 import { afterEach, describe, expect, it } from 'bun:test'
 import { rmSync } from 'node:fs'
