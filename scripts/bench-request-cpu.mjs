@@ -9,6 +9,10 @@ const dir = new URL('../packages/opencode/src/', import.meta.url)
 const baseline = process.argv.includes('--baseline')
 const base = '20ecc8aba6d75cf17cae3c7c4b1ce93e57dc698d'
 const copies = ['index', 'ws-pool', 'dump']
+// The HTTP request helpers lived in index.ts at the baseline and now live in
+// codex-request.ts; the copy keeps the name 'index' either way.
+const sourceFile = (name) =>
+  name === 'index' && !baseline ? 'codex-request' : name
 try {
   for (const name of copies) {
     const source = baseline
@@ -17,7 +21,7 @@ try {
           ['show', `${base}:packages/opencode/src/${name}.ts`],
           { encoding: 'utf8' },
         )
-      : await readFile(new URL(`${name}.ts`, dir), 'utf8')
+      : await readFile(new URL(`${sourceFile(name)}.ts`, dir), 'utf8')
     const names =
       name === 'dump'
         ? 'dumpCodexRequest'
@@ -162,6 +166,8 @@ try {
           installationID: 'bench',
           websocket: false,
           responsesLite: false,
+          // Required by the current helper, ignored by the baseline; Lite is off.
+          rewriteLite: () => {},
         }),
     )
     await measure('WS bodySignature', setupWs, ({ body }) =>
