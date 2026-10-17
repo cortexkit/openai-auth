@@ -5260,3 +5260,147 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "opencode2-cache-keep-identity-check"
+guards = "a keep-warm warm on OpenCode 2 is sent only while the fresh credential still signs in as the captured ChatGPT account; another login under the same pool row or vault route sends nothing and drops the target"
+file = "packages/opencode/src/v2/cache-keep.ts"
+old = "      if (identity !== target.meta.chatgptAccountId) {"
+new = "      if (false) { // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\skeep\-warm\scredentials\sanother\slogin\sunder\sthe\ssame\srow\ssends\snothing\sand\sdrops\sthe\starget$', '^OpenCode\s2\skeep\-warm\scredentials\sa\svault\sreceipt\sfor\sanother\slogin\ssends\snothing\sand\sdrops\sthe\starget$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-cache-keep-cross-mode-credential"
+guards = "a keep-warm warm on OpenCode 2 never sends with a credential from the other store than the one that served its capture, even when a vault route and a pool row share an id"
+file = "packages/opencode/src/v2/cache-keep.ts"
+old = "      if (target.meta.credentialMode !== mode)"
+new = "      if (false) // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\skeep\-warm\scredentials\sa\slocal\scapture\sis\snever\swarmed\swith\sa\svault\sreceipt,\seven\sfor\sa\svault\sroute\swith\sthe\ssame\sid$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-cache-keep-vault-capture-reads-no-pool-token"
+guards = "after disconnecting from the vault, a keep-warm target captured through the vault reads no local pool token and backs off; only the next local capture warms"
+file = "packages/opencode/src/v2/cache-keep.ts"
+old = "    if (target.meta.credentialMode !== 'local')"
+new = "    if (false) // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\skeep\-warm\scredentials\safter\sdisconnecting,\sa\svault\scapture\ssends\snothing\sand\sbacks\soff\s\(route\sno\slonger\slisted\);\sa\slocal\scapture\swarms$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-cache-keep-vault-warm-needs-vault-authority"
+guards = "a keep-warm warm through the vault reads the enrollment authority afresh and asks the vault for no receipt once the host has disconnected"
+file = "packages/opencode/src/v2/cache-keep.ts"
+old = "        if ((await location.vault.authority()) !== 'vault') return undefined"
+new = "        // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\skeep\-warm\scredentials\safter\sdisconnecting,\sa\svault\scapture\ssends\snothing\sand\sbacks\soff\s\(route\sstill\slisted\);\sa\slocal\scapture\swarms$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-cache-keep-holder-count"
+guards = "the process-wide OpenCode 2 keep-warm manager is holder-counted: releasing one location keeps the manager, its one timer and its targets warming through the remaining location; only the last release stops it"
+file = "packages/opencode/src/v2/cache-keep.ts"
+old = "      if (owned.holders.length > 0) return"
+new = "      // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\skeep\-warm\sholders\stwo\slocations\sshare\sone\smanager\sand\sone\stimer;\sthe\ssurvivor\swarms\safter\sthe\sother\sis\sreleased$', '^OpenCode\s2\skeep\-warm\sin\ssetup\stwo\slocations\shold\sone\smanager\swith\sone\stimer;\sdisposing\sone\sleaves\sthe\sother\swarming$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-cache-keep-caps-passed"
+guards = "the OpenCode 2 keep-warm manager is built with the cap constants exported from core/cachekeep.ts, not left to the package defaults"
+file = "packages/opencode/src/v2/cache-keep.ts"
+old = "    ...CACHE_KEEP_CAPS,"
+new = "    // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\skeep\-warm\scaps\sthe\sOpenCode\s2\smanager\sis\sbuilt\swith\sthe\sexported\scaps$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-cache-keep-caps-match-package"
+guards = "CACHE_KEEP_CAPS equals the target and byte bounds the installed @cortexkit/common-auth cachekeep manager applies by default"
+file = "packages/opencode/src/core/cachekeep.ts"
+old = "Object.freeze({ maxTargets: 32, maxBytes: 8 * 1024 * 1024 })"
+new = "Object.freeze({ maxTargets: 33, maxBytes: 8 * 1024 * 1024 }) // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\skeep\-warm\scaps\sCACHE_KEEP_CAPS\sequal\sthe\sinstalled\scommon\-auth\sdefaults$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+
+[[control]]
+id = "opencode2-cache-keep-active-account-required"
+guards = "an OpenCode 2 keep-warm target whose session has no entry in the session-account registry sends nothing and is dropped until the session's next real capture"
+file = "packages/opencode/src/v2/cache-keep.ts"
+old = "      if (active === undefined) {"
+new = "      if (false) { // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\skeep\-warm\sactive\saccount\sa\ssession\swith\sno\srecorded\saccount\ssends\snothing\suntil\sits\snext\scapture,\sthen\swarms$']
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+

@@ -443,18 +443,23 @@ export function createOpenAICacheKeepAdapter(
     buildBody: (target) => buildKeepwarmBody(target.bodyText),
 
     async send({ target, body, signal }) {
+      // `vaultAttempt` is the vault's receipt when the vault sends (it calls
+      // this with the served token and the receipt); a local send passes the
+      // row's known identity instead.
       const dispatch = async (
         accessToken: string,
-        mode: CacheKeepCredentialCheck['mode'],
-        identity: string | undefined,
+        vaultAttempt?: { accountIdentity?: string },
+        localIdentity?: string,
       ) => {
         // Stopped, or the warm timed out, while the token resolved: send nothing.
         signal.throwIfAborted()
         if (options.verifyCredential)
           await options.verifyCredential({
             target,
-            mode,
-            identity: identity ?? identityOfToken(accessToken),
+            mode: vaultAttempt ? 'vault' : 'local',
+            identity:
+              (vaultAttempt ? vaultAttempt.accountIdentity : localIdentity) ??
+              identityOfToken(accessToken),
           })
 
         const headers: Record<string, string> = {
@@ -513,11 +518,10 @@ export function createOpenAICacheKeepAdapter(
       if (target.accountId && options.vault?.owns(target.accountId)) {
         // The vault owns both the per-attempt authorization and 401 reporting;
         // a refusal before dispatch must not be reported as a provider failure.
-        const response = await options.vault.send(
-          target.accountId,
-          (token, attempt) => dispatch(token, 'vault', attempt.accountIdentity),
-          { site: 'cachekeep', signal },
-        )
+        const response = await options.vault.send(target.accountId, dispatch, {
+          site: 'cachekeep',
+          signal,
+        })
         if (!response)
           throw new Error(`vault refused warm for ${target.accountId}`)
         return response
@@ -552,7 +556,7 @@ export function createOpenAICacheKeepAdapter(
         throw new Error(
           'local accounts are not warmed while this host is connected to the vault',
         )
-      const response = await dispatch(accessToken, 'local', identity)
+      const response = await dispatch(accessToken, undefined, identity)
       if (response.status === 401) await onAuthFailure?.(response.status)
       return response
     },

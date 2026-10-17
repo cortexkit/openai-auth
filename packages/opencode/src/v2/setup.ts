@@ -635,7 +635,6 @@ export async function setupOpenAIAuth(
   const codex =
     options.codex ??
     new CodexHttpState(undefined, undefined, acquireCodexSessions())
-  const sessionAccounts = acquireSessionAccounts(paths())
   // One keep-warm manager per process and account store; this location lends
   // it its own pool source, vault, settings and request capture.
   const cacheKeepSettings = cacheKeepSettingsOf(storage)
@@ -645,7 +644,8 @@ export async function setupOpenAIAuth(
       source,
       storage: () => loadAccounts(paths()),
       vault,
-      accounts: sessionAccounts,
+      // The same process-wide registry the adapter below records into.
+      accounts: acquireSessionAccounts(paths()),
       settings: () => cacheKeepSettings,
       parentOf: async (sessionID) =>
         (await ctx.session.get({ sessionID }))?.parentID ?? undefined,
@@ -670,7 +670,7 @@ export async function setupOpenAIAuth(
     slotPlaceholderWithoutMain,
     storage: () => loadAccounts(paths()),
     pins,
-    sessionAccounts,
+    sessionAccounts: acquireSessionAccounts(paths()),
     vault,
     awaitVaultRoster: async () => {
       await settlesWithin(
