@@ -15,7 +15,7 @@ and let it read your OpenAI accounts with:
   ck auth grant --principal enrolled:openai-auth-opencode --selector-kind category --selector openai-native --operation read
 ```
 
-The grant reaches only vault logins that carry the `openai-native` category, for both `openai-auth-opencode` and `openai-auth-pi`. Check the CATEGORIES column with `ck auth status`, and add the category to each ChatGPT login that lacks it with `ck auth set-category <credential-id> --add openai-native`.
+The grant reaches only vault logins that carry the `openai-native` category, for both `openai-auth-opencode` and `openai-auth-pi`. Check the CATEGORIES column with `ck auth status`. A login added before the vault assigned categories shows none; `ck auth reclassify --from-registry` fills every empty category set from the vault's defaults, without removing any category. To add the category to one login, run `ck auth set-category <credential-id> --add openai-native`.
 
 Pi's commands identify its separate enrollment, `openai-auth-pi`, instead of OpenCode's. Pi reports when the vault owner approves its request.
 
