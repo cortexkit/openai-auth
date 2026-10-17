@@ -246,6 +246,21 @@ interface Target {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
+/**
+ * The reset-credit balance a pool row's or vault account's quota map holds
+ * (`counters.resetCredits.value`), kept only when it is a finite number, as
+ * OpenCode 1 reads its own saved balance. An explicit 0 stays 0; a missing or
+ * malformed count is undefined.
+ */
+export function resetCreditsOfQuota(quota: unknown): number | undefined {
+  const counters = isRecord(quota) ? quota.counters : undefined
+  const resetCredits = isRecord(counters) ? counters.resetCredits : undefined
+  const credits = isRecord(resetCredits) ? resetCredits.value : undefined
+  return typeof credits === 'number' && Number.isFinite(credits)
+    ? credits
+    : undefined
+}
+
 function parseJson(text: string): unknown {
   try {
     return JSON.parse(text)
@@ -517,6 +532,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     excluded: ReadonlySet<string>,
     persist: boolean,
   ): string | undefined => {
+    const quotaById = new Map(
+      targets.map((target) => [target.id, target.quota]),
+    )
     const options: StickyRouteOptions = {
       requestBytes: NOMINAL_REQUEST_BYTES,
       reservePercent: (id) =>
@@ -524,10 +542,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           storage,
           id === FORMER_MAIN_ID ? undefined : id,
         ),
-      // OpenCode 1 breaks placement ties by the reset credits an account
-      // holds, which only its in-memory quota cache records; nothing here
-      // records them, so ties fall to the roster order.
-      resetCredits: () => undefined,
+      // The reset credits each account's saved quota reading records. They
+      // only decide which account takes a new session when no account has a
+      // fresh quota reading to weigh, as on OpenCode 1. Reading them touches
+      // no token and asks the vault for nothing.
+      resetCredits: (id) => resetCreditsOfQuota(quotaById.get(id)),
     }
     const sticky = admitSticky(routing)
     const place = (exclude: readonly string[], keep: boolean) =>

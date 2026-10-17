@@ -4463,3 +4463,42 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-s
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-sessions.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ["^OpenCode\\s2\\ssession\\sstore\\sa\\ssession\\sid\\sreused\\safter\\sdeletion\\sgets\\sa\\snew\\sthread\\sid$"]
+
+[[control]]
+id = "opencode2-sticky-reset-credits-from-quota"
+guards = "OpenCode 2 sticky placement prefers an account holding reset credits when no account has a fresh reading, reading pool rows and vault routes from their quota map as OpenCode 1 does"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "      resetCredits: (id) => resetCreditsOfQuota(quotaById.get(id)),"
+new = "      resetCredits: () => undefined, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-credit-routing.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credit-routing.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credit-routing.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 sticky placement by reset credits an empty-weight placement: 0 vs positive prefers the positive balance$', '^OpenCode 2 sticky placement by reset credits an empty-weight placement: missing vs positive prefers the positive balance$', '^OpenCode 2 sticky placement by reset credits reads a vault account balance from its route quota$', '^OpenCode 2 sticky placement by reset credits scoring asks no token or vault authorization for disabled or ineligible accounts$']
+
+[[control]]
+id = "opencode2-sticky-scoring-no-pool-token"
+guards = "OpenCode 2 sticky scoring asks no pool row for a token, so a disabled row is never asked for one"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "      resetCredits: (id) => resetCreditsOfQuota(quotaById.get(id)),"
+new = "      resetCredits: (id) => { for (const row of source.peek().rows) source.usableToken(row); return resetCreditsOfQuota(quotaById.get(id)) }, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-credit-routing.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credit-routing.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credit-routing.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 sticky placement by reset credits scoring asks no token or vault authorization for disabled or ineligible accounts$']
+
+[[control]]
+id = "opencode2-sticky-scoring-no-vault-authorize"
+guards = "OpenCode 2 sticky scoring asks the vault to authorize nothing, so an ineligible vault account is never authorized"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "      resetCredits: (id) => resetCreditsOfQuota(quotaById.get(id)),"
+new = "      resetCredits: (id) => { for (const route of vault?.routes() ?? []) void vault?.authorize(route.id); return resetCreditsOfQuota(quotaById.get(id)) }, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-reset-credit-routing.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credit-routing.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credit-routing.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 sticky placement by reset credits reads a vault account balance from its route quota$', '^OpenCode 2 sticky placement by reset credits scoring asks no token or vault authorization for disabled or ineligible accounts$']
