@@ -28,7 +28,7 @@ test('OpenCode 2 docs offer log level changes and request dumps with their warni
     )
 })
 
-test('OpenCode 2 docs describe the HTTP request shape as available and WebSocket rewriting as not yet', () => {
+test('OpenCode 2 docs describe the HTTP and WebSocket request shapes as available', () => {
   const doc = readFileSync(
     new URL('../../../../docs/opencode-2.md', import.meta.url),
     'utf8',
@@ -36,24 +36,31 @@ test('OpenCode 2 docs describe the HTTP request shape as available and WebSocket
   const differences = doc
     .split('## How it differs from OpenCode 1')[1]
     ?.split('## Model costs')[0]
-  const shape = differences
-    ?.split('\n')
-    .find((line) => line.startsWith('- **Codex request shape over HTTP.**'))
+  const lines = differences?.split('\n') ?? []
+  const shape = lines.find((line) =>
+    line.startsWith('- **Codex request shape over HTTP.**'),
+  )
+  const socket = lines.find((line) =>
+    line.startsWith('- **Codex request shape over the WebSocket.**'),
+  )
   const unavailable = doc.split('## Not on OpenCode 2 yet')[1]
   expect(shape).toContain('conversation headers and tool formatting')
   expect(shape).toContain('after a server restart')
-  expect(unavailable).toContain('WebSocket request rewriting')
+  expect(socket).toContain("OpenCode 1's WebSocket request shape")
+  expect(socket).toContain('A tool step stays in its turn')
+  expect(socket).toContain('exactly as OpenCode 2 built it')
+  expect(socket).toContain('one WebSocket per account')
+  expect(unavailable).not.toContain('WebSocket')
   expect(unavailable).not.toContain('conversation headers')
   expect(unavailable).not.toContain('tool formatting')
-  for (const passage of [shape, unavailable]) {
+  for (const passage of [shape, socket, unavailable]) {
     expect(passage).not.toMatch(
       /\.ts\b|\.json\b|allowed\(|unavailableSections|hook|test/,
     )
-    // Only HTTP requests are reshaped; no sentence may promise the new
-    // headers or tool formatting on the WebSocket.
+    // A WebSocket's connection is opened as before; no sentence may promise
+    // new headers on it.
     for (const sentence of passage?.split(/(?<=\.)\s/) ?? [])
-      if (sentence.includes('WebSocket'))
-        expect(sentence).not.toMatch(/header|tool formatting|tool definitions/)
+      if (sentence.includes('WebSocket')) expect(sentence).not.toMatch(/header/)
   }
 })
 
