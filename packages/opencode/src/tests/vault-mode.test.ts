@@ -342,7 +342,7 @@ describe('the sidebar file in vault mode', () => {
     }
   })
 
-  it('lists the vault accounts by safe label with no local account in the fields an older reader shows', async () => {
+  it('lists the vault accounts by email, else vault label, with no local account in the fields an older reader shows', async () => {
     const file = join(dir, 'sidebar.json')
     // What the file held before vault mode: local accounts.
     await setSidebarState(
@@ -397,7 +397,7 @@ describe('the sidebar file in vault mode', () => {
         account.enabled,
       ]),
     ).toEqual([
-      ['vault:work', 'work login', true],
+      ['vault:work', 'work@example.com', true],
       ['vault:home', 'home login', true],
       ['vault:cold', 'cold login', true],
     ])

@@ -177,7 +177,8 @@ export interface SidebarState {
    * the vault's order. `main` then carries no account and `fallbacks` is
    * empty, so a reader that does not know this field shows no local account.
    * `enabled` is the host's own toggle, while `routable` and `vaultState`
-   * describe vault availability independently. Labels never use vault emails.
+   * describe vault availability independently. Each entry's `label` is the
+   * account's email when the vault knows it, else the vault's label.
    */
   vaultAccounts?: SidebarAccountState[]
 }

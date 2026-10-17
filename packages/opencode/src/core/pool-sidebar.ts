@@ -91,8 +91,10 @@ export function sidebarQuotaFromPoolMap(
  * The sidebar's account snapshot in vault mode: the vault accounts that
  * serve this host instead of its local accounts. The old fields stay in the
  * file for an older TUI, but carry no local account: `main` has no quota and
- * `fallbacks` is empty. The host toggle is separate from vault availability,
- * so an account the vault cannot serve stays visible with its last reading.
+ * `fallbacks` is empty. Each vault account is named by its email when the
+ * vault knows it, else by its vault label. The host toggle is separate from
+ * vault availability, so an account the vault cannot serve stays visible with
+ * its last reading.
  */
 export function buildVaultSidebarMachineState(
   rows: readonly VaultRosterRow[],
@@ -111,15 +113,12 @@ export function buildVaultSidebarMachineState(
   return {
     main: { quota: null, killed: false },
     fallbacks: [],
-    vaultAccounts: rows.map((row, index) => {
+    vaultAccounts: rows.map((row) => {
       const credits = row.quota?.counters?.resetCredits?.value
       return {
         id: row.routeId,
         credentialId: row.credentialId,
-        label:
-          row.label && !row.label.includes('@')
-            ? row.label
-            : `Vault account ${index + 1}`,
+        label: row.email || row.label || row.routeId,
         ...(row.accountIdentity !== undefined
           ? { accountId: row.accountIdentity }
           : {}),

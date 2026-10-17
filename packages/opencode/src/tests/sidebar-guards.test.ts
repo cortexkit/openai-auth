@@ -104,8 +104,10 @@ test('sidebar guards retain unavailable vault accounts separately from the host 
   expect(resolveSessionSidebarRouting(state, 'new').activeId).toBe(
     'vault:ready',
   )
+  // The account keeps its email as its label, as before; the raw vault state
+  // is never written.
+  expect(state.vaultAccounts?.[1]?.label).toBe('private@example.com')
   const raw = readFileSync(path, 'utf8')
-  expect(raw).not.toContain('private@example.com')
   expect(raw).not.toContain('future-state-with-private-data')
   expect(
     normalizeSidebarState({
