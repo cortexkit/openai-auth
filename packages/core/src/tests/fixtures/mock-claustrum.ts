@@ -90,6 +90,12 @@ export interface MockDaemon {
   polls: number
   lists: number
   insula?: { reply?: unknown; refusal?: string; hung?: boolean }
+  /**
+   * The caller's grants, sent in each list reply as `grants` and
+   * `grant_tuples` the way a current vault does. Undefined omits both, as a
+   * vault from before they existed does. Each tuple is one grant.
+   */
+  grants?: Array<{ selector_kind: string; selector: string; operation: string }>
   insulaOpens: number
   insulaReads: number
   /** Live transport connections, for consumer lifecycle assertions. */
@@ -111,6 +117,7 @@ export async function startMockDaemon(input: {
   credentials?: Record<string, MockCredential>
   category?: string
   refreshAdapter?: string
+  grants?: MockDaemon['grants']
 }): Promise<MockDaemon> {
   const category = input.category ?? 'openai-native'
   const adapter = input.refreshAdapter ?? 'openai'
@@ -137,6 +144,7 @@ export async function startMockDaemon(input: {
     lists: 0,
     insulaOpens: 0,
     insulaReads: 0,
+    ...(input.grants !== undefined && { grants: input.grants }),
     get connections() {
       return sockets.size
     },
@@ -174,7 +182,8 @@ export async function startMockDaemon(input: {
       }
       return row
     })
-    // The view covers what the caller can see, never record versions.
+    // The view covers what the caller can see, never record versions. A vault
+    // that reports grants covers them too, so a new grant moves the view.
     const view = createHash('sha256')
       .update(
         JSON.stringify(
@@ -190,8 +199,18 @@ export async function startMockDaemon(input: {
           ),
         ),
       )
+      .update(state.grants === undefined ? '' : JSON.stringify(state.grants))
       .digest('hex')
-    return { result: { credentials: rows, view } }
+    return {
+      result: {
+        credentials: rows,
+        view,
+        ...(state.grants !== undefined && {
+          grants: state.grants.length,
+          grant_tuples: state.grants,
+        }),
+      },
+    }
   }
 
   function handle(method: string | undefined, params: Wire): Wire {

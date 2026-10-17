@@ -53,6 +53,8 @@ While connected to the [vault](vault.md), the menu shows only vault accounts, an
 
 OpenCode 2 shows the same quota sidebar as OpenCode 1: each account's quota bars, figures and time until reset, the account and route the current session uses, health and killswitch status, and saved reset credits. In vault mode it shows only vault accounts. Click its title to collapse or expand it.
 
+Collapsed, the sidebar keeps one line per account it shows, in the order requests try them: the account name, then its remaining quota such as `5h 38% · 7d 59% left`, then a status dot (a red ⊘ when the killswitch blocks the account). The account serving the current session is drawn in its usage color and the others dimmed; an account whose last reading is old is dimmed too. A name too long for the sidebar ends in `…`, so the quota figures always show in full. An account without a reading yet shows `—`. Both OpenCode 1 and OpenCode 2 draw it this way.
+
 Vault accounts stay listed even when they cannot serve a request, with their last quota reading and a short reason such as **needs sign-in**, **turned off in vault** or **unavailable**. **Off in /openai** is your own toggle, shown separately from the vault's state. **Blocked** means the account is below its configured quota floor. Switching to vault mode removes old local session records from the sidebar; vault pins still follow the usual routing rules.
 
 One difference: OpenCode 2 always places the sidebar after its own panels, so the position preference (`priority` and `forceToTop` in `tui-preferences.jsonc`) has no effect there.

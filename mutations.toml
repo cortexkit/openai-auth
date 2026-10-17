@@ -421,7 +421,7 @@ expect_red = ["^vault\\squota\\sfloor\\sOpenCode\\s2\\sapplies\\sminimumRemainin
 id = "opencode1-local-credential-refusal-body"
 guards = "local credential refusals retain status 401 and distinct fixed terminal explanations instead of an empty provider-shaped rejection"
 file = "packages/opencode/src/index.ts"
-old = "                  LOCAL_CREDENTIAL_REFUSALS[\n                    isVaultModeRefusal(cause)\n                      ? cause\n                      : missingTombstoneMain\n                        ? 'missing-main'\n                        : (cause ?? 'unusable')\n                  ],"
+old = "                  isVaultModeRefusal(cause)\n                    ? vaultModeRefusalText(cause, vault.name)\n                    : LOCAL_CREDENTIAL_REFUSALS[\n                        missingTombstoneMain\n                          ? 'missing-main'\n                          : (cause ?? 'unusable')\n                      ],"
 new = "                  null,"
 test_file = "packages/opencode/src/tests/vault.test.ts"
 runner = "command"
@@ -1831,7 +1831,7 @@ expect_red = ["^vault\\scommand\\smenu\\sCheck\\snow\\sin\\svault\\smode\\spolls
 id = "menu-common-auth-release"
 guards = "all packages require the common-auth release whose file leases always use wall time"
 file = "packages/core/package.json"
-old = '"@cortexkit/common-auth": "^0.18.0"'
+old = '"@cortexkit/common-auth": "^0.19.0"'
 new = '"@cortexkit/common-auth": "^0.14.2"'
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
@@ -4666,3 +4666,64 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-r
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode\s2\sreset\scredits\sin\svault\smode\sReset\scredits\sshows\sthe\svault\snote,\sand\severy\saction\sis\srefused\swithout\sreading\sa\scredential$']
+
+# The collapsed sidebar draws one line per account the sidebar shows, not
+# only the session's account. The frame test renders the compiled TUI on
+# OpenCode 1 and OpenCode 2, so the command rebuilds it from the mutated source.
+[[control]]
+id = "collapsed-sidebar-one-line-per-account"
+guards = "the collapsed sidebar lists every shown account, not only the one serving the session"
+file = "packages/opencode/src/tui.tsx"
+old = "        <Index each={collapsedLines()}>"
+new = "        <Index each={collapsedLines().filter((line) => line.active)}> {/* NON-VACUITY BREAK */}"
+test_file = "packages/opencode/src/tests/tui-quota-render.test.ts"
+runner = "command"
+command = ["sh", "-c", "bun run --cwd packages/opencode build:tui && bun test --cwd packages/opencode src/tests/tui-quota-render.test.ts -t \"$1\"", "sidebar-mutation", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/tui-quota-render.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^collapsed sidebar frame on OpenCode 1 and OpenCode 2 renders one line per account with whole quota text in a 42-column frame$']
+
+# Each collapsed line uses the shared narrow quota text, short enough that the
+# quota is never cut in a narrow sidebar.
+[[control]]
+id = "collapsed-sidebar-narrow-quota-text"
+guards = "collapsed sidebar lines carry the shared narrow quota text, not the longer compact form"
+file = "packages/opencode/src/sidebar-state.ts"
+old = "      text: reading ? formatQuota(reading, { now, form: 'narrow' }) : null,"
+new = "      text: reading ? formatQuota(reading, { now, form: 'compact' }) : null, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/tui-quota-render.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/tui-quota-render.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/tui-quota-render.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^collapsed sidebar: one line per account lists main and every enabled fallback in placement order, the session account active$']
+
+# An empty vault that reports this host's grants tells "no grant" (the fix is
+# `ck auth grant`) from "a grant that reaches no login" (the fix is
+# `ck auth reclassify --from-registry`). The request refusal and the Vault
+# section each make that split.
+[[control]]
+id = "vault-empty-refusal-no-grant-branch"
+guards = "a vault-mode request refused for want of any grant gives the grant command, not the reclassify fix"
+file = "packages/core/src/vault.ts"
+old = "      return reach.grants === 0 ? 'vault-no-grant' : 'vault-grant-unreached'"
+new = "      return 'vault-grant-unreached' // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault accounts on OpenCode 2 an empty vault with no grant for this host refuses with the exact grant command$']
+
+[[control]]
+id = "vault-empty-hint-no-grant-branch"
+guards = "the Vault section and Connect outcome for a host with no grant give the grant command, not the reclassify fix"
+file = "packages/core/src/vault-messages.ts"
+old = "  if (reach.grants === 0)"
+new = "  if (false) // NON-VACUITY BREAK"
+test_file = "packages/core/src/tests/vault-access-guidance.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-access-guidance.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-access-guidance.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault access guidance without a grant, the connect outcome and the menu give the exact grant command$']

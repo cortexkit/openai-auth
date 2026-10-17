@@ -201,6 +201,7 @@ export const INTERNAL_VALUE_EXPORTS = [
   'TombstoneRefreshError',
   'VAULT_FAMILY',
   'VAULT_MODE_REFUSALS',
+  'VAULT_MODE_REFUSAL_CAUSES',
   'VAULT_PLUGIN_NAME',
   'VAULT_REQUEST_ROSTER_WAIT_MS',
   'assertNotTombstoneRefresh',
@@ -212,6 +213,7 @@ export const INTERNAL_VALUE_EXPORTS = [
   'vaultEnrollmentName',
   'vaultIdentityOf',
   'vaultModeNoRouteCause',
+  'vaultModeRefusalText',
   'vaultPaths',
   'vaultStateDir',
 ] as const

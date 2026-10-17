@@ -44,6 +44,7 @@ import {
   type OAuthQuotaSnapshot,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
+  VAULT_MODE_REFUSAL_CAUSES,
   VAULT_MODE_REFUSALS,
   type VaultModeRefusal,
 } from '@cortexkit/openai-auth-core/internal'
@@ -124,7 +125,7 @@ export interface PoolVaultRoutes {
    * Why no vault account could be tried: the vault has not listed its
    * accounts (unreachable), or it lists none that may serve (empty).
    */
-  noRouteCause(): 'vault-unreachable' | 'vault-empty'
+  noRouteCause(): Exclude<VaultModeRefusal, 'vault-refused'>
   /**
    * Sends on a vault account with the token the vault serves for this
    * attempt; undefined when the vault refused before anything was sent.
@@ -151,8 +152,13 @@ export type NoCredentialCause =
 
 // Keep these texts unchanged: OpenCode decides whether to retry a failed
 // request by matching the error message, so a reworded message could change
-// whether it retries. The vault-mode texts are shared with the other hosts.
-export const LOCAL_CREDENTIAL_REFUSALS: Record<NoCredentialCause, string> = {
+// whether it retries. The vault-mode texts are shared with the other hosts;
+// `vault-no-grant` names this host's enrollment, so it is built by
+// `vaultModeRefusalText` instead of being listed here.
+export const LOCAL_CREDENTIAL_REFUSALS: Record<
+  Exclude<NoCredentialCause, 'vault-no-grant'>,
+  string
+> = {
   'missing-main':
     'Request refused locally: this setup has no main login in its account store. Sign in with opencode auth login.',
   'no-accounts':
@@ -166,7 +172,10 @@ export const LOCAL_CREDENTIAL_REFUSALS: Record<NoCredentialCause, string> = {
 export function isVaultModeRefusal(
   cause: NoCredentialCause | undefined,
 ): cause is VaultModeRefusal {
-  return cause !== undefined && cause in VAULT_MODE_REFUSALS
+  return (
+    cause !== undefined &&
+    (VAULT_MODE_REFUSAL_CAUSES as readonly string[]).includes(cause)
+  )
 }
 
 export interface PoolRequestContext {

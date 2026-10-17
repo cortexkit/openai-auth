@@ -42,6 +42,7 @@ import {
   type QuotaReceipt,
   readClaustrumEnrollmentStatus,
   readVaultRoster,
+  type VaultGrantReach,
   type VaultRosterFile,
   type VaultRosterRow,
 } from '@cortexkit/common-auth/claustrum'
@@ -54,7 +55,11 @@ import { observationFromSnapshot } from './pool-quota'
 import type { QuotaReadingRequest } from './pool-routing'
 import { whamUsageFn } from './provider'
 import { errorMessage } from './util/error'
-import { VAULT_EMPTY_ACCESS_HINT } from './vault-messages'
+import {
+  VAULT_RECLASSIFY_COMMAND,
+  vaultEmptyAccessHint,
+  vaultGrantCommand,
+} from './vault-messages'
 
 const log = createLogger('vault')
 
@@ -126,37 +131,81 @@ export function vaultPaths(stateDir: string, host: VaultHost): VaultPaths {
  */
 export const VAULT_REQUEST_ROSTER_WAIT_MS = 2_000
 
-/** Why a request was refused in vault mode, where only vault accounts may serve. */
+/**
+ * Why a request was refused in vault mode, where only vault accounts may
+ * serve. `vault-no-grant` and `vault-grant-unreached` split `vault-empty`
+ * when the vault reports this host's grants and lists no account at all:
+ * no grant exists, or the grant matches no login.
+ */
 export type VaultModeRefusal =
   | 'vault-unreachable'
   | 'vault-empty'
+  | 'vault-no-grant'
+  | 'vault-grant-unreached'
   | 'vault-refused'
+
+/** Every vault-mode refusal cause, for telling them from a host's own causes. */
+export const VAULT_MODE_REFUSAL_CAUSES: readonly VaultModeRefusal[] = [
+  'vault-unreachable',
+  'vault-empty',
+  'vault-no-grant',
+  'vault-grant-unreached',
+  'vault-refused',
+]
 
 /**
  * The fixed texts of a vault-mode refusal, shared by every host. Hosts decide
  * whether to retry a failed request by matching its error message (OpenCode's
  * retry patterns look for words such as "rate limit", "timeout" or
  * "connection refused"), so these never carry an account id or any word that
- * would make the refusal look temporary.
+ * would make the refusal look temporary. `vault-no-grant` is missing here
+ * because its text names the host's enrollment; see `vaultModeRefusalText`.
  */
-export const VAULT_MODE_REFUSALS: Record<VaultModeRefusal, string> = {
+export const VAULT_MODE_REFUSALS: Record<
+  Exclude<VaultModeRefusal, 'vault-no-grant'>,
+  string
+> = {
   'vault-unreachable':
     'Request refused locally: this host is connected to the credential vault, which could not be reached, and local accounts are not used while it is connected. Start the vault and connect accounts in it, or disconnect this host from the vault.',
   'vault-empty':
     'Request refused locally: this host is connected to the credential vault, which serves it no usable OpenAI account, and local accounts are not used while it is connected. Connect accounts in the vault, or disconnect this host from the vault.',
+  'vault-grant-unreached': `Request refused locally: this host is connected to the credential vault, whose grant for it reaches no ChatGPT login, and local accounts are not used while it is connected. Logins without the openai-native category are not reached: run ${VAULT_RECLASSIFY_COMMAND} to fill empty category sets, then check the CATEGORIES column with ck auth status. Or disconnect this host from the vault.`,
   'vault-refused':
     'Request refused locally: the credential vault did not authorize an account, and local accounts are not used while this host is connected to it. Check the accounts in the vault, or disconnect this host from the vault.',
 }
 
 /**
+ * The refusal text for a cause. Only `vault-no-grant` depends on the host: it
+ * prints the grant command for this host's enrollment name (`vault.name`).
+ * Like every refusal it carries no account label or id.
+ */
+export function vaultModeRefusalText(
+  cause: VaultModeRefusal,
+  name: string,
+): string {
+  if (cause !== 'vault-no-grant') return VAULT_MODE_REFUSALS[cause]
+  return `Request refused locally: this host is connected to the credential vault, which has no grant letting it read OpenAI accounts, and local accounts are not used while it is connected. Disconnect this host from the vault, or grant it access with: ${vaultGrantCommand(name)}`
+}
+
+/**
  * The refusal for a vault-mode request that found no vault account to try:
- * unreachable while the vault has not listed its accounts in this process,
- * else empty.
+ * unreachable while the vault has not listed its accounts in this process.
+ * When the vault lists no account at all and reports this host's grants, the
+ * cause is named exactly (no grant, or a grant that reaches no login); a
+ * vault that does not report grants, or a list whose accounts are all
+ * declined or unusable, is empty.
  */
 export function vaultModeNoRouteCause(
-  vault: Pick<OpenAiVault, 'snapshot'>,
+  vault: Pick<OpenAiVault, 'snapshot' | 'grantReach'>,
 ): Exclude<VaultModeRefusal, 'vault-refused'> {
-  return vault.snapshot() === undefined ? 'vault-unreachable' : 'vault-empty'
+  const roster = vault.snapshot()
+  if (roster === undefined) return 'vault-unreachable'
+  if (roster.rows.length === 0) {
+    const reach = vault.grantReach()
+    if (reach !== undefined)
+      return reach.grants === 0 ? 'vault-no-grant' : 'vault-grant-unreached'
+  }
+  return 'vault-empty'
 }
 
 /** The ChatGPT account a served access token signs in as, read from its claims. */
@@ -455,6 +504,15 @@ export class OpenAiVault {
 
   snapshot(): VaultRosterFile | undefined {
     return this.#consumer.snapshot()
+  }
+
+  /**
+   * What the vault says this host is granted, from the latest list, without
+   * any I/O. Undefined is unknown (a vault that does not report grants, or
+   * nothing listed yet), never zero grants.
+   */
+  grantReach(): VaultGrantReach | undefined {
+    return this.#consumer.grantReach()
   }
 
   /** Whether the vault serves this host any account (whatever its state). */
@@ -939,7 +997,7 @@ export function vaultEnrollmentLine(
 
 /** The outcome of a finished (or abandoned) wait, for the operator. */
 export function vaultConnectOutcome(
-  vault: Pick<OpenAiVault, 'name' | 'routes' | 'snapshot'>,
+  vault: Pick<OpenAiVault, 'name' | 'routes' | 'snapshot' | 'grantReach'>,
   status: ClaustrumEnrollmentStatus,
 ): { ok: boolean; text: string } {
   switch (status.state) {
@@ -947,7 +1005,7 @@ export function vaultConnectOutcome(
       const accounts = vault.snapshot()?.rows.length ?? 0
       return {
         ok: true,
-        text: `Connected: the vault approved ${vault.name}. It serves ${accounts} OpenAI account${accounts === 1 ? '' : 's'} to this host${accounts === 0 ? `. ${VAULT_EMPTY_ACCESS_HINT}` : '.'}`,
+        text: `Connected: the vault approved ${vault.name}. It serves ${accounts} OpenAI account${accounts === 1 ? '' : 's'} to this host${accounts === 0 ? `. ${vaultEmptyAccessHint(vault.name, vault.grantReach())}` : '.'}`,
       }
     }
     case 'denied':

@@ -152,6 +152,8 @@ describe('vault failure reports on OpenCode 2', () => {
         },
         recordSnapshot: async () => {},
         requestReading: () => {},
+        grantReach: () => undefined,
+        name: 'openai-auth-opencode',
       },
     })
     const host = fakeOpenCode2Host()
