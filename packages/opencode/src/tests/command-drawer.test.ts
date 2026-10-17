@@ -2,6 +2,7 @@
 // stand-in for the TUI api captures what each dialog is given, so the tests
 // can pick options and type values the way a user would.
 import { describe, expect, test } from 'bun:test'
+import { join } from 'node:path'
 import type { CommandMenuModel } from '@cortexkit/common-auth/commands'
 import type { TuiPluginApi } from '@opencode-ai/plugin/tui'
 import type { ApplyRequest, ApplyResult } from '../rpc/protocol.js'
@@ -236,10 +237,17 @@ describe('the /openai drawer', () => {
     ]) {
       expect(option).not.toHaveProperty('disabled')
     }
-    expect(sectionOptions(section)[0]).toHaveProperty(
-      'category',
-      'Killswitch off\nnote: Read-only section fact\nRead-only account · disabled\nFloors · killswitch off',
+    const h = harness()
+    openCommandDialog(
+      h.api,
+      { command: 'openai', menu: { ...MENU, sections: [section] } },
+      recordingApply().apply,
     )
+    const current = h.current()
+    expect(current?.kind === 'select' ? current.title : '').toBe(
+      'Limits\nKillswitch off\nnote: Read-only section fact\nRead-only account · disabled',
+    )
+    expect(sectionOptions(section)[0]?.category).toBe('Floors · killswitch off')
     expect(itemOptions(section.items[1]!)[0]?.description).toContain(
       'Minimum quota left',
     )
@@ -253,7 +261,7 @@ describe('the /openai drawer', () => {
     expect(sectionOptions(section)).toEqual([
       expect.objectContaining({
         value: 'item:alpha',
-        category: 'Killswitch off\nFloors · killswitch off',
+        category: 'Floors · killswitch off',
       }),
       expect.objectContaining({
         value: 'action:killswitch',
@@ -271,8 +279,8 @@ describe('the /openai drawer', () => {
       items: [...section.items, { ...section.items[0]!, id: 'beta' }],
     })
     expect(grouped.slice(0, 2).map((option) => option.category)).toEqual([
-      'Killswitch off\nFloors · killswitch off',
-      'Killswitch off\nFloors · killswitch off',
+      'Floors · killswitch off',
+      'Floors · killswitch off',
     ])
   })
 
@@ -304,7 +312,9 @@ describe('the /openai drawer', () => {
     expect(h.toasts).toEqual(['Killswitch on.'])
     // The drawer redraws the section from the refreshed menu.
     const current = h.current()
-    expect(current?.kind === 'select' ? current.title : '').toBe('Limits')
+    expect(current?.kind === 'select' ? current.title : '').toBe(
+      'Limits\nKillswitch off',
+    )
   })
 
   test('a choice input sends the chosen value', async () => {
@@ -402,13 +412,62 @@ describe('the /openai drawer', () => {
 
     const current = h.current()
     expect(current?.kind === 'select' ? current.title : '').toBe(
-      'Accounts are moving',
+      'Accounts are moving\nAccounts move once every process runs this version.\npid 42',
     )
     expect(
       current?.kind === 'select' ? current.options.map((o) => o.title) : [],
     ).toEqual(['Back'])
-    expect(current?.kind === 'select' ? current.options[0]?.category : '').toBe(
-      'Accounts move once every process runs this version.\npid 42',
+    expect(
+      current?.kind === 'select' ? current.options[0]?.category : '',
+    ).toBeUndefined()
+  })
+
+  test('renders every Diagnostics action and Back below multiline section context', async () => {
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        '--conditions=browser',
+        '--preload',
+        '@opentui/solid/preload',
+        'src/tests/fixtures/command-dialogs-render.tsx',
+      ],
+      {
+        cwd: join(import.meta.dir, '..', '..'),
+        stdout: 'pipe',
+        stderr: 'pipe',
+      },
     )
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: '' })
+    expect(stdout).toContain('command-dialogs-render passed')
+  })
+
+  test('renders OpenCode 2 sections and actions without multiline description clipping', async () => {
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        '--conditions=browser',
+        '--preload',
+        '@opentui/solid/preload',
+        'src/tests/fixtures/command-dialogs-render.tsx',
+        'v2',
+      ],
+      {
+        cwd: join(import.meta.dir, '..', '..'),
+        stdout: 'pipe',
+        stderr: 'pipe',
+      },
+    )
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: '' })
+    expect(stdout).toContain('command-dialogs-render v2 passed')
   })
 })

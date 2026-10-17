@@ -2208,7 +2208,7 @@ expect_message = "expect(received).toEqual(expected)"
 
 [[control]]
 id = "dialog-group-category"
-guards = "group headers and section summaries are categories, not options"
+guards = "group headers are categories, not options"
 file = "packages/opencode/src/tui/command-dialogs.tsx"
 old = "...(item.group ? { category: item.group } : {}),"
 new = "// NON-VACUITY BREAK: omit item group headers."
@@ -2219,6 +2219,47 @@ list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode
 test_count_pattern = "Ran {count} test"
 expect_red = ['^the\s/openai\sdrawer\sgroup\sheaders\smap\sto\scategory\sabove\sactionable\srows$']
 expect_message = "expect(received).toEqual(expected)"
+
+[[control]]
+id = "dialog-multiline-section-header"
+guards = "multiline section context cannot hide Diagnostics actions or Back below the host's list height"
+file = "packages/opencode/src/tui/command-dialogs.tsx"
+old = "  return options\n}"
+new = """
+  // NON-VACUITY BREAK: restore the joined multiline category header.
+  const first = options[0]
+  if (first) {
+    const category = first.category
+    const text = [sectionTitle(section).split('\\n').slice(1).join('\\n'), category].filter(Boolean).join('\\n')
+    for (const option of options) {
+      if (option.category !== category) break
+      option.category = text
+    }
+  }
+  return options
+}
+"""
+test_file = "packages/opencode/src/tests/command-drawer.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\s/openai\sdrawer\srenders\severy\sDiagnostics\saction\sand\sBack\sbelow\smultiline\ssection\scontext$']
+expect_message = "Diagnostics hides Set the log level"
+
+[[control]]
+id = "dialog-v2-multiline-description"
+guards = "OpenCode 2's section descriptions cannot consume the rows reserved for later options"
+file = "packages/opencode/src/tui/v2-dialog.ts"
+old = "description: inlineDescription(...section.lines),"
+new = "description: section.lines.join('\\n'), // NON-VACUITY BREAK: add uncounted description rows."
+test_file = "packages/opencode/src/tests/command-drawer.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/command-drawer.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\s/openai\sdrawer\srenders\sOpenCode\s2\ssections\sand\sactions\swithout\smultiline\sdescription\sclipping$']
+expect_message = "OpenCode 2 menu hides Reset credits"
 
 [[control]]
 id = "dialog-status-footer"

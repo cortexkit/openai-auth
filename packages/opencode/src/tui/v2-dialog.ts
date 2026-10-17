@@ -4,6 +4,12 @@ import type {
   ApplyResult,
   OpenDialogPayload,
 } from '../rpc/protocol'
+import { sectionText, sectionTitle } from './section-text'
+
+// Native selects count one row per option, including its inline description.
+function inlineDescription(...parts: Array<string | undefined>): string {
+  return parts.filter(Boolean).join(' · ').replace(/\r?\n/g, ' · ')
+}
 
 /** Native dialogs display the shared payload; only the server can apply an action. */
 export async function openControlDialog(
@@ -19,7 +25,7 @@ export async function openControlDialog(
       options: payload.menu.sections.map((section) => ({
         title: section.title,
         value: section.id,
-        description: section.lines.join('\n'),
+        description: inlineDescription(...section.lines),
       })),
     })
     if (!active() || sectionId === undefined) return
@@ -28,28 +34,30 @@ export async function openControlDialog(
     )
     if (!section) return
     const choices = [
-      ...section.items.map((item) => ({
-        title: item.label,
-        description: [item.status, item.detail].filter(Boolean).join('\n'),
-        value: { itemId: item.id, actions: item.actions },
-      })),
+      ...section.items
+        .filter((item) => item.actions.length > 0)
+        .map((item) => ({
+          title: item.label,
+          description: inlineDescription(item.status, item.detail),
+          value: { itemId: item.id, actions: item.actions },
+        })),
       ...section.actions.map((action) => ({
         title: action.label,
-        description: action.description,
+        description: inlineDescription(action.description),
         value: { itemId: undefined, actions: [action] },
       })),
     ]
     if (choices.length === 0) {
       await dialog.alert({
         title: section.title,
-        message: section.lines.join('\n'),
+        message: sectionText(section),
       })
       continue
     }
     const choice = await dialog.select<
       (typeof choices)[number]['value'] | undefined
     >({
-      title: section.title,
+      title: sectionTitle(section),
       options: [...choices, { title: 'Back', value: undefined }],
     })
     if (!active()) return
