@@ -4502,3 +4502,29 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-r
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credit-routing.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode 2 sticky placement by reset credits reads a vault account balance from its route quota$', '^OpenCode 2 sticky placement by reset credits scoring asks no token or vault authorization for disabled or ineligible accounts$']
+
+[[control]]
+id = "opencode2-reset-pool-miss-no-host-login"
+guards = "OpenCode 2 reset resolution refuses an account the pool does not hold and never falls back to a login in host credential storage, as OpenCode 1's resolver does"
+file = "packages/opencode/src/v2/reset-credits.ts"
+old = "    if (!access?.row)\n      throw new ResetTargetResolutionError(\n"
+new = "    if (!access?.row) { const host = (await (await import('./host-slot')).opencode1HostSlot().get({ path: { id: 'openai' } })) as { access?: string } | undefined; if (host?.access) return { accountKey, label: 'Main account', accessToken: host.access } } // NON-VACUITY BREAK\n    if (!access?.row)\n      throw new ResetTargetResolutionError(\n"
+test_file = "packages/opencode/src/tests/opencode2-reset-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credits.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 reset target resolver over the pool a pool miss resolves no host login, even when OpenCode 1 holds one$']
+
+[[control]]
+id = "opencode2-reset-applicable-not-available"
+guards = "OpenCode 2's reset result never shows the available reset-credit count as the applicable one when the last poll carried no applicable count"
+file = "packages/opencode/src/v2/reset-credits.ts"
+old = "    const applicable = snapshot.resetCreditsApplicable\n"
+new = "    const applicable = snapshot.resetCreditsApplicable ?? (snapshot as { resetCreditsAvailable?: number }).resetCreditsAvailable // NON-VACUITY BREAK\n"
+test_file = "packages/opencode/src/tests/opencode2-reset-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credits.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 reset quota re-check and quota view omits the applicable count when the last poll carried none, and never shows the available count in its place$']

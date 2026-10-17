@@ -62,7 +62,13 @@ export interface OpenCodeMenuContext {
   accountStatePath: string
   /** Host package version, sent as the version half of the OAuth `User-Agent`. */
   packageVersion: string
-  quotaManager?: QuotaManager
+  /**
+   * Each account's saved quota windows and applicable reset-credit count, and
+   * whether it is rate limited now: what the Reset credits section judges
+   * eligibility and reports a redemption with. OpenCode 2 backs it with its
+   * account pool instead of a `QuotaManager`.
+   */
+  quotaManager?: Pick<QuotaManager, 'isRateLimited' | 'getMain' | 'getFallback'>
   loadAccounts: typeof loadAccounts
   /** The pool store the accounts live in. */
   store: () => PoolStore
