@@ -50,7 +50,7 @@ While connected to the [vault](vault.md), the menu shows only vault accounts, an
 
 ## Sidebar
 
-OpenCode 2 shows the same quota sidebar as OpenCode 1: each account's quota bars and figures, the account and route the current session uses, health and killswitch status, and saved reset credits. In vault mode it shows only vault accounts. Click its title to collapse or expand it.
+OpenCode 2 shows the same quota sidebar as OpenCode 1: each account's quota bars, figures and time until reset, the account and route the current session uses, health and killswitch status, and saved reset credits. In vault mode it shows only vault accounts. Click its title to collapse or expand it.
 
 One difference: OpenCode 2 always places the sidebar after its own panels, so the position preference (`priority` and `forceToTop` in `tui-preferences.jsonc`) has no effect there.
 

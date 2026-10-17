@@ -2061,6 +2061,20 @@ expect_red = ['^dynamic\squota\sTUI\srows\ssidebar\squota\stext\smatches\sthe\ss
 expect_message = "expect(received).toBe(expected)"
 
 [[control]]
+id = "sidebar-reset-column"
+guards = "sidebar quota rows retain shared future reset timing for local and vault readings"
+file = "packages/opencode/src/tui.tsx"
+old = "        resetText:\n          reset?.resetIn ?? (reset?.resetSinceReading ? 'reset' : undefined),\n        pacing:"
+new = "        resetText: undefined, // NON-VACUITY BREAK: drop reset timing from sidebar rows.\n        pacing:"
+test_file = "packages/opencode/src/tests/tui-quota-render.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/tui-quota-render.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/tui-quota-render.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^dynamic\squota\sTUI\srows\ssidebar\squota\srows\sshow\sthe\sshared\sreset\stiming\sfor\slocal\sand\svault\saccounts$']
+expect_message = "expect(received).toEqual(expected)"
+
+[[control]]
 id = "pi-per-account-quota"
 guards = "selecting one pool account checks only that account, not Pi login or another row"
 file = "packages/pi/src/commands.ts"

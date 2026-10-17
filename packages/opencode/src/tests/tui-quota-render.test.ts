@@ -4,6 +4,7 @@ import {
   projectQuota,
   quotaTextParts,
 } from '@cortexkit/common-auth/quota'
+import { sidebarQuotaFromPoolMap } from '../core/pool-sidebar.ts'
 import {
   getCollapsedQuotaSummary,
   hashSidebarSessionId,
@@ -22,6 +23,99 @@ import {
 
 describe('dynamic quota TUI rows', () => {
   const now = Date.UTC(2026, 6, 16, 12, 0, 0)
+
+  test('sidebar quota rows show the shared reset timing for local and vault accounts', () => {
+    const checkedAt = now - 3 * 60 * 60_000
+    const primaryReset = new Date(
+      now + 2 * 60 * 60_000 + 29 * 60_000 + 59_999,
+    ).toISOString()
+    const secondaryReset = new Date(
+      now + 4 * 60 * 60_000 + 30 * 60_000 + 59_999,
+    ).toISOString()
+    const localQuota = {
+      checkedAt,
+      primary: {
+        usedPercent: 42,
+        remainingPercent: 58,
+        windowMinutes: 300,
+        resetsAt: primaryReset,
+      },
+      secondary: {
+        usedPercent: 10,
+        remainingPercent: 90,
+        windowMinutes: 10_080,
+        resetsAt: secondaryReset,
+      },
+    }
+    const vaultQuota = sidebarQuotaFromPoolMap({
+      limits: [
+        {
+          scope: 'all',
+          label: 'primary',
+          kind: 'reading',
+          checkedAt,
+          usedPercent: 42,
+          windowMinutes: 300,
+          resetsAt: primaryReset,
+        },
+        {
+          scope: 'all',
+          label: 'secondary',
+          kind: 'reading',
+          checkedAt,
+          usedPercent: 10,
+          windowMinutes: 10_080,
+          resetsAt: secondaryReset,
+        },
+      ],
+    })
+
+    const expected = [
+      ['5h', '2h29m'],
+      ['7d', '4h30m'],
+    ]
+    for (const quota of [localQuota, vaultQuota]) {
+      expect(
+        buildQuotaRowsForDisplay(quota, now, false).map((row) => [
+          row.label,
+          row.resetText,
+        ]),
+      ).toEqual(expected)
+    }
+  })
+
+  test('sidebar reset rows omit missing times and mark resets since the reading', () => {
+    const checkedAt = now - 3 * 60 * 60_000
+    const rowsWithoutReset = buildQuotaRowsForDisplay(
+      {
+        checkedAt,
+        primary: {
+          usedPercent: 42,
+          remainingPercent: 58,
+          windowMinutes: 300,
+        },
+      },
+      now,
+      false,
+    )
+    const rowsAfterReset = buildQuotaRowsForDisplay(
+      {
+        checkedAt,
+        primary: {
+          usedPercent: 42,
+          remainingPercent: 58,
+          windowMinutes: 300,
+          resetsAt: new Date(now - 30_000).toISOString(),
+        },
+      },
+      now,
+      false,
+    )
+
+    expect(rowsWithoutReset[0]?.resetText).toBeUndefined()
+    expect(rowsAfterReset[0]?.resetText).toBe('reset')
+    expect(rowsAfterReset[0]?.resetText).not.toContain('resets in')
+  })
 
   test('sidebar quota text matches the shared compact formatter', () => {
     const checkedAt = now - 3 * 60 * 60_000

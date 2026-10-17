@@ -3,7 +3,11 @@
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { formatQuota, quotaTextParts } from '@cortexkit/common-auth/quota'
+import {
+  formatQuota,
+  quotaTextParts,
+  quotaWindowParts,
+} from '@cortexkit/common-auth/quota'
 import type { Plugin } from '@opencode/plugin/tui'
 import type {
   TuiPlugin,
@@ -266,6 +270,7 @@ export interface QuotaDisplayRow {
   label: string
   labelWidth: number
   text: string
+  resetText?: string
   window: QuotaWindow
   pacing: QuotaPacing | null
 }
@@ -339,33 +344,50 @@ export function buildQuotaRowsForDisplay(
 ): QuotaDisplayRow[] {
   const projection = sidebarQuotaProjection(quota, now)
   const rows: Array<Omit<QuotaDisplayRow, 'labelWidth'>> =
-    getPresentQuotaWindows(quota).map((row) => ({
-      key: row.key,
-      label: row.label,
-      window: row.window,
-      text: formatQuota(
-        projection && {
-          ...projection,
-          budget: undefined,
-          limits: projection.limits.filter((limit) => limit.label === row.key),
-        },
-        { now, form: 'compact', staleAfterMs: Number.POSITIVE_INFINITY },
-      ),
-      pacing:
-        pacingEnabled && row.windowMs !== null
-          ? computeQuotaPacing(row.window, row.windowMs, now)
-          : null,
-    }))
+    getPresentQuotaWindows(quota).map((row) => {
+      const rowProjection = projection && {
+        ...projection,
+        budget: undefined,
+        limits: projection.limits.filter((limit) => limit.label === row.key),
+      }
+      const reset = quotaWindowParts(rowProjection, {
+        now,
+        staleAfterMs: Number.POSITIVE_INFINITY,
+      }).windows[0]
+      return {
+        key: row.key,
+        label: row.label,
+        window: row.window,
+        text: formatQuota(rowProjection, {
+          now,
+          form: 'compact',
+          staleAfterMs: Number.POSITIVE_INFINITY,
+        }),
+        resetText:
+          reset?.resetIn ?? (reset?.resetSinceReading ? 'reset' : undefined),
+        pacing:
+          pacingEnabled && row.windowMs !== null
+            ? computeQuotaPacing(row.window, row.windowMs, now)
+            : null,
+      }
+    })
   const spendControl = quota?.spendControl
   if (spendControl) {
+    const rowProjection = projection && { ...projection, limits: [] }
+    const reset = quotaWindowParts(rowProjection, {
+      now,
+      staleAfterMs: Number.POSITIVE_INFINITY,
+    }).windows[0]
     rows.push({
       key: 'spendControl',
       label: SPEND_CONTROL_LABEL,
-      text: formatQuota(projection && { ...projection, limits: [] }, {
+      text: formatQuota(rowProjection, {
         now,
         form: 'compact',
         staleAfterMs: Number.POSITIVE_INFINITY,
       }),
+      resetText:
+        reset?.resetIn ?? (reset?.resetSinceReading ? 'reset' : undefined),
       window: {
         usedPercent: spendControl.usedPercent,
         remainingPercent: spendControl.remainingPercent,
@@ -447,6 +469,7 @@ function QuotaRow(props: {
   label: string
   labelWidth: number
   text: string
+  resetText?: string
   window: { usedPercent: number; resetsAt?: string } | undefined
   pacing: QuotaPacing | null
 }) {
@@ -491,6 +514,9 @@ function QuotaRow(props: {
             {` ${props.text.slice(props.label.length + 1)}`}
           </text>
         </box>
+        <Show when={props.resetText}>
+          <text fg={props.theme.textMuted}>{props.resetText}</text>
+        </Show>
       </box>
       <Show when={paceLine()}>
         <box width='100%' flexDirection='row'>
@@ -561,6 +587,7 @@ function AccountBlock(props: {
                 label={row.label}
                 labelWidth={row.labelWidth}
                 text={row.text}
+                resetText={row.resetText}
                 window={row.window}
                 pacing={row.pacing}
               />
