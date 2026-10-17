@@ -1151,7 +1151,7 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/shared-vault.test.ts", "-t", "{test}"]
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/shared-vault.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^one\\shost\\svault\\sper\\sprocess\\san\\sidle\\sOpenCode\\s1\\sloader\\spublishes\\sthe\\scurrent\\sroute\\swith\\sa\\squota\\sreading$']
+expect_red = ["^one host vault per process an idle OpenCode 1 loader publishes the current route with a quota reading$"]
 
 [[control]]
 id = "opencode1-stale-account-read-cannot-replace-newer"
@@ -1164,7 +1164,7 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/current-storage.test.ts", "-t", "{test}"]
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/current-storage.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^an\\solder\\sconfig-and-state\\sread\\sthat\\sfinishes\\slast\\scannot\\sreplace\\sthe\\snewer\\ssnapshot$']
+expect_red = ["^an older config-and-state read that finishes last cannot replace the newer snapshot$"]
 
 # Build gates that scan for a violation must be seen to fail on a planted one.
 
