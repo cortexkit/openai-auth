@@ -4370,3 +4370,42 @@ list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode
 test_count_pattern = "Ran {count} test"
 expect_red = ["^OpenCode\\s2\\sHTTP\\sshape\\sshares\\sHTTP\\sand\\sWebSocket\\sthread\\scache\\sidentity\\swhile\\sresponse\\sattribution\\ssurvives$"]
 expect_message = "ses_1"
+
+[[control]]
+id = "opencode2-sessions-own-file"
+guards = "OpenCode 2 saves Codex thread ids to its own session file and never writes OpenCode 1's openai-auth-sessions.json"
+file = "packages/opencode/src/v2/codex-sessions.ts"
+old = "  'openai-auth-sessions-opencode2.json'"
+new = "  'openai-auth-sessions.json' // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-sessions.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-sessions.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-sessions.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\ssessions\\sacross\\slocations\\sand\\srestarts\\sOpenCode\\s2\\sprocesses\\sleave\\sOpenCode\\s1\\ssessions\\sunchanged\\sand\\skeep\\severy\\sthread\\sid$"]
+
+[[control]]
+id = "opencode2-sessions-stale-save-no-resurrect"
+guards = "an OpenCode 2 save writes only the sessions its process created or deleted, so a stale process cannot resurrect a deleted session"
+file = "packages/opencode/src/v2/codex-sessions.ts"
+old = "      for (const id of deleted) threads.delete(id)\n"
+new = "      for (const [id, loaded] of this.sessions) threads.set(id, loaded.threadID) // NON-VACUITY BREAK\n      for (const id of deleted) threads.delete(id)\n"
+test_file = "packages/opencode/src/tests/opencode2-sessions.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-sessions.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-sessions.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\ssession\\sstore\\sa\\sstale\\swriter\\sdoes\\snot\\sresurrect\\sa\\ssession\\sanother\\sprocess\\sdeleted$"]
+
+[[control]]
+id = "opencode2-sessions-reused-id-new-thread"
+guards = "a host session id reused after its deletion gets a new Codex thread id"
+file = "packages/opencode/src/v2/codex-sessions.ts"
+old = "    this.sessions.delete(sessionID)\n"
+new = "    // NON-VACUITY BREAK: the deleted session's thread stays in the map\n"
+test_file = "packages/opencode/src/tests/opencode2-sessions.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-sessions.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-sessions.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode\\s2\\ssession\\sstore\\sa\\ssession\\sid\\sreused\\safter\\sdeletion\\sgets\\sa\\snew\\sthread\\sid$"]

@@ -15,6 +15,7 @@ import {
   rewriteResponsesLiteBody,
 } from '../index'
 import { uuidV7 } from '../util/uuid-v7'
+import type { CodexSessionStore } from './codex-sessions'
 
 const INSTALLATION_KEY = Symbol.for(
   '@cortexkit/openai-auth/opencode2/codex-installation',
@@ -27,26 +28,40 @@ function processInstallationID(): string {
   return registry[INSTALLATION_KEY]
 }
 
-/** HTTP requests and WebSocket cache keys share each host session's thread identity. */
+/**
+ * HTTP requests and WebSocket cache keys share each host session's thread
+ * identity. With a store, sessions are the store's process-wide map and new
+ * or deleted sessions are saved to its file; without one they live only in
+ * this object.
+ */
 export class CodexHttpState {
-  readonly sessions = new Map<string, CodexSessionMetadata>()
+  readonly sessions: Map<string, CodexSessionMetadata>
   readonly installationID: string
   constructor(
     readonly runtime?: CodexRequestRuntime,
     installationID?: string,
+    readonly store?: CodexSessionStore,
   ) {
     this.installationID = installationID ?? processInstallationID()
+    this.sessions = store?.sessions ?? new Map()
   }
 
   get(sessionID: string): CodexSessionMetadata {
+    const uuid = this.runtime?.uuid ?? uuidV7
+    if (this.store) return this.store.get(sessionID, uuid)
     let metadata = this.sessions.get(sessionID)
     if (!metadata) {
-      const uuid = this.runtime?.uuid ?? uuidV7
       const threadID = uuid()
       metadata = { threadID, turnID: uuid(), windowID: `${threadID}:0` }
       this.sessions.set(sessionID, metadata)
     }
     return metadata
+  }
+
+  /** Drops a deleted host session; a later request with its id starts a new thread. */
+  forget(sessionID: string): void {
+    if (this.store) this.store.delete(sessionID)
+    else this.sessions.delete(sessionID)
   }
 }
 
@@ -192,7 +207,7 @@ export class MidConversationEffort {
 
   forget(sessionID: string): void {
     this.#pinned.delete(sessionID)
-    this.http.sessions.delete(sessionID)
+    this.http.forget(sessionID)
   }
 
   #pin(sessionID: string, effort: string) {
