@@ -1,5 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import type { Plugin } from '@opencode/plugin/tui'
+import type { JSX } from 'solid-js'
 import {
   type ApplyRequest,
   type ApplyResult,
@@ -11,8 +12,12 @@ import { resolveRpcDir } from '../rpc/rpc-dir'
 import { openControlDialog } from './v2-dialog'
 
 export interface TuiTransportOptions {
-  /** Only the test fixture supplies content until the sidebar is implemented. */
+  /** Test-only label for proving that the host can render a sidebar component. */
   sidebarText?: string
+  sidebar?: {
+    render(input: { sessionID: string }): JSX.Element
+    dispose(): void
+  }
   openDialog?: (
     payload: OpenDialogPayload,
     apply: (request: Omit<ApplyRequest, 'sessionId'>) => Promise<ApplyResult>,
@@ -43,7 +48,12 @@ export async function setupTui(
   let client: ReturnType<typeof createRpcClient> | undefined
   const unmount =
     options.sidebarText === undefined
-      ? undefined
+      ? options.sidebar
+        ? context.ui.slot({
+            append: 'sidebar.content',
+            render: options.sidebar.render,
+          })
+        : undefined
       : context.ui.slot({
           append: 'sidebar.content',
           render: () => <text>{options.sidebarText}</text>,
@@ -112,6 +122,7 @@ export async function setupTui(
       disposed = true
       clearInterval(timer)
       unmount?.()
+      options.sidebar?.dispose()
       if (dialogOpen) context.ui.dialog.clear()
       if (state.mount === mount) state.mount = undefined
     },

@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { formatQuota, quotaTextParts } from '@cortexkit/common-auth/quota'
+import type { Plugin } from '@opencode/plugin/tui'
 import type {
   TuiPlugin,
   TuiPluginApi,
@@ -38,7 +39,7 @@ import {
   sidebarQuotaProjection,
 } from './sidebar-state.js'
 import { openCommandDialog } from './tui/command-dialogs.js'
-import { setupTui } from './tui/v2.js'
+import { setupTui, type TuiTransportOptions } from './tui/v2.js'
 import {
   type AppearancePrefs,
   computeEffectiveOrder,
@@ -96,7 +97,17 @@ const PLUGIN_VERSION: string = (() => {
 const SINGLE_BORDER = { type: 'single' } as any
 
 type Tone = 'ok' | 'warn' | 'err' | 'muted' | 'accent' | 'text'
-type ThemeCurrent = TuiPluginApi['theme']['current']
+type ThemeCurrent = Pick<
+  TuiPluginApi['theme']['current'],
+  | 'text'
+  | 'textMuted'
+  | 'accent'
+  | 'background'
+  | 'borderActive'
+  | 'success'
+  | 'warning'
+  | 'error'
+>
 type ThemeColor = ThemeCurrent['text']
 
 // Tone -> theme token. Theme tokens only — never hardcoded colors. Fallbacks
@@ -630,6 +641,7 @@ interface SidebarController {
   prefs: () => OpenaiAuthTuiPrefs
   collapsed: () => boolean
   toggleCollapsed: () => void
+  dispose: () => void
 }
 
 // The TUI may unmount and remount sidebar_content when the user switches
@@ -652,14 +664,13 @@ function createSidebarController(
   let lastPersistedCollapsed: boolean | null = initialPrefs.collapsed
   let lastApplied = JSON.stringify(initialPrefs)
 
-  // The watcher lives for the plugin/process lifetime — it is intentionally
-  // never disposed. Collapse guard mirrors the race-fix in toggleCollapsed:
-  // lastPersistedCollapsed is advanced only once our own write lands, so
-  // watcher echoes of the previous persisted value are rejected by the
-  // `!==` check and cannot revert a user click.
-  watchTuiPreferences(() => {
+  let disposed = false
+  // Remember the last value written to disk, not an unpersisted click. A watcher
+  // echo of the previous disk value must not undo a click whose write is pending.
+  const unwatch = watchTuiPreferences(() => {
     void (async () => {
       const next = resolveOpenaiAuthPrefs(await readTuiPreferencesFile())
+      if (disposed) return
       const serialized = JSON.stringify(next)
       if (serialized === lastApplied) return
       lastApplied = serialized
@@ -687,11 +698,27 @@ function createSidebarController(
     }
   }
 
-  return { prefs, collapsed, toggleCollapsed }
+  return {
+    prefs,
+    collapsed,
+    toggleCollapsed,
+    dispose() {
+      disposed = true
+      unwatch()
+    },
+  }
 }
 
 function QuotaSidebar(props: {
-  api: TuiPluginApi
+  api: {
+    theme: { readonly current: ThemeCurrent }
+    event: {
+      on(
+        type: 'session.updated' | 'message.updated',
+        listener: () => void,
+      ): () => void
+    }
+  }
   controller: SidebarController
   sessionId: string
 }) {
@@ -700,10 +727,12 @@ function QuotaSidebar(props: {
   const [state, setState] = createSignal<SidebarState>(DEFAULT_SIDEBAR_STATE)
   let lastUpdated = 0
   let debounce: ReturnType<typeof setTimeout> | null = null
+  let disposed = false
 
   async function refresh() {
+    if (disposed) return
     const next = await readStateFromFile()
-    if (next.lastUpdated !== lastUpdated) {
+    if (!disposed && next.lastUpdated !== lastUpdated) {
       lastUpdated = next.lastUpdated
       setState(next)
     }
@@ -728,9 +757,11 @@ function QuotaSidebar(props: {
     props.api.event.on('session.updated', scheduleRefresh),
     props.api.event.on('message.updated', scheduleRefresh),
   ]
-  setTimeout(refresh, 300)
+  const initialRefresh = setTimeout(refresh, 300)
 
   onCleanup(() => {
+    disposed = true
+    clearTimeout(initialRefresh)
     if (debounce) clearTimeout(debounce)
     for (const u of unsubs) u()
   })
@@ -1065,9 +1096,48 @@ const tui: TuiPlugin = async (api) => {
   }
 }
 
-const plugin: TuiPluginModule & { id: string; setup: typeof setupTui } = {
+async function setup(
+  context: Plugin.Context,
+  options: TuiTransportOptions = {},
+) {
+  if (options.sidebarText !== undefined || options.sidebar)
+    return setupTui(context, options)
+  const root = await readTuiPreferencesFile()
+  const controller = createSidebarController(resolveOpenaiAuthPrefs(root))
+  const api = {
+    theme: {
+      get current() {
+        return context.theme
+      },
+    },
+    event: {
+      on: (type: 'session.updated' | 'message.updated', listener: () => void) =>
+        context.data.on(
+          type === 'session.updated'
+            ? 'session.metadata.updated'
+            : 'session.usage.updated',
+          listener,
+        ),
+    },
+  }
+  return setupTui(context, {
+    ...options,
+    sidebar: {
+      render: (input) => (
+        <QuotaSidebar
+          api={api}
+          controller={controller}
+          sessionId={input.sessionID}
+        />
+      ),
+      dispose: controller.dispose,
+    },
+  })
+}
+
+const plugin: TuiPluginModule & { id: string; setup: typeof setup } = {
   id: ID,
-  setup: setupTui,
+  setup,
   tui,
 }
 

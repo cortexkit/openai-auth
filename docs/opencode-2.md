@@ -48,6 +48,12 @@ On OpenCode 2, [`/openai`](commands.md#the-openai-command) shows the same sectio
 
 While connected to the [vault](vault.md), the menu shows only vault accounts, and local account changes are refused. Quota checks, routing, floors, the killswitch and clearing a pin still work. Cache, Diagnostics and Reset credits show "Not available on OpenCode 2 yet."
 
+## Sidebar
+
+OpenCode 2 shows the same quota sidebar as OpenCode 1: each account's quota bars and figures, the account and route the current session uses, health and killswitch status, and saved reset credits. In vault mode it shows only vault accounts. Click its title to collapse or expand it.
+
+One difference: OpenCode 2 always places the sidebar after its own panels, so the position preference (`priority` and `forceToTop` in `tui-preferences.jsonc`) has no effect there.
+
 ## Not on OpenCode 2 yet
 
-The menu's vault enrollment and per-host account controls, the sidebar, [cache keep-warm](cache-keep-warm.md), [request dumps](troubleshooting.md#request-dumps), diagnostics actions, [reset-credit preview and redemption](accounts-and-routing.md#reset-credits), OpenCode 1's extra conversation headers and Codex-specific tool formatting are not implemented on OpenCode 2 yet.
+The menu's vault enrollment and per-host account controls, [cache keep-warm](cache-keep-warm.md), [request dumps](troubleshooting.md#request-dumps), diagnostics actions, [reset-credit preview and redemption](accounts-and-routing.md#reset-credits), OpenCode 1's extra conversation headers and Codex-specific tool formatting are not implemented on OpenCode 2 yet.

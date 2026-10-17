@@ -678,7 +678,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     const root = join(scratch, 'control-plane')
     mkdirSync(root)
     const env = isolatedEnv(root)
-    seedPool(join(env.XDG_CONFIG_HOME, 'opencode'), [])
+    seedPool(join(env.XDG_CONFIG_HOME, 'opencode'), ['A', 'B'])
     const result = await controlPlaneProbe({
       cli,
       consumer: packedConsumer,
@@ -694,14 +694,16 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       .map((line) => JSON.parse(line))
     const rows = (event: string) =>
       events.filter((entry) => entry.event === event)
-    // Require both visible terminal text and a component render event, rather
-    // than treating a successful slot registration as proof of rendering.
+    // Require visible server-published quotas and a component render event;
+    // registering a slot or rendering placeholder text alone is not enough.
     const outcome =
-      result.output.includes('OpenAI P0 sidebar component') &&
+      result.output.includes('95% left') &&
+      result.output.includes('60% left') &&
       rows('render').length > 0
         ? 'a'
         : 'c'
     expect(outcome).toBe('a')
+    expect(result.output).not.toContain('OpenAI P0 sidebar component')
     expect(rows('commands').map((row) => row.count)).toEqual([1, 1, 1, 1])
     expect(rows('location-count').map((row) => [row.stage, row.count])).toEqual(
       [

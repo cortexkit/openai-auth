@@ -71,7 +71,6 @@ export default { id: plugin.id, async setup(ctx) {
     }, ms)
     try {
       return await plugin.setup(observed, {
-        sidebarText: 'OpenAI P0 sidebar component',
         async openDialog(payload, apply) {
           try {
             dialogs++; record('dialog', { phase, dialogs, title: payload.menu.title })
