@@ -116,25 +116,28 @@ function effortView(text: string | undefined) {
   return rest
 }
 
-/** Whether a frame went out with the effort and input the host gave it. */
-function effortUntouched(
+/**
+ * What the effort rule changed in a frame: undefined when the frame went out
+ * with the effort and input the host gave it, else the effort and input sent.
+ */
+function effortEdit(
   text: string,
   scope: typeof SESSION,
   effort: MidConversationEffort,
 ) {
   const host = JSON.parse(text)
   const sent = JSON.parse(rewriteCodexFrame(text, scope, effort) ?? 'null')
-  return (
-    JSON.stringify([sent.reasoning, sent.input]) ===
+  return JSON.stringify([sent.reasoning, sent.input]) ===
     JSON.stringify([host.reasoning, host.input])
-  )
+    ? undefined
+    : { reasoning: sent.reasoning, input: sent.input }
 }
 
 describe('mid-conversation effort on WebSocket frames', () => {
   it('pins the first effort, then adds the update before the new user message of an incremental frame and changes nothing else', () => {
     const effort = testEffort()
     const first = frame('low', [user('one')])
-    expect(effortUntouched(first, SESSION, effort)).toBe(true)
+    expect(effortEdit(first, SESSION, effort)).toBe(undefined)
     const incremental = frame('high', [user('two')], {
       previous_response_id: 'resp_1',
     })
@@ -205,33 +208,29 @@ describe('mid-conversation effort on WebSocket frames', () => {
   it('leaves frames of other models, other request kinds and an unchanged effort alone', () => {
     const effort = testEffort()
     rewriteCodexFrame(frame('low', [user('one')]), SESSION, effort)
-    expect(effortUntouched(frame('low', [user('two')]), SESSION, effort)).toBe(
-      true,
+    expect(effortEdit(frame('low', [user('two')]), SESSION, effort)).toBe(
+      undefined,
     )
     expect(
-      effortUntouched(
+      effortEdit(
         frame('high', [user('two')], { model: 'gpt-5.5' }),
         SESSION,
         effort,
       ),
-    ).toBe(true)
+    ).toBe(undefined)
     // OpenCode 2 carries an effort change for the gpt-6 models itself.
     for (const model of ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'])
       expect(
-        effortUntouched(
-          frame('high', [user('two')], { model }),
-          SESSION,
-          effort,
-        ),
-      ).toBe(true)
+        effortEdit(frame('high', [user('two')], { model }), SESSION, effort),
+      ).toBe(undefined)
     // A title request neither pins nor changes effort.
     const title = { sessionID: 'ses_2', kind: 'title' }
-    expect(effortUntouched(frame('low', [user('t')]), title, effort)).toBe(true)
-    expect(effortUntouched(frame('high', [user('t')]), title, effort)).toBe(
-      true,
+    expect(effortEdit(frame('low', [user('t')]), title, effort)).toBe(undefined)
+    expect(effortEdit(frame('high', [user('t')]), title, effort)).toBe(
+      undefined,
     )
-    expect(effortUntouched(frame('high', [user('one')]), SESSION, effort)).toBe(
-      false,
+    expect(effortEdit(frame('high', [user('one')]), SESSION, effort)).not.toBe(
+      undefined,
     )
   })
 
