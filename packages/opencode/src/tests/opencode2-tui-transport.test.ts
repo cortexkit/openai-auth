@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test'
 import type { Plugin } from '@opencode/plugin/tui'
 import type { OpenDialogPayload } from '../rpc/protocol'
 import { setupTui } from '../tui/v2'
-import { openReadOnlyDialog } from '../tui/v2-dialog'
+import { openControlDialog } from '../tui/v2-dialog'
 
 test('OpenCode 2 transport stays invisible without a menu or sidebar owner', async () => {
   let slots = 0
@@ -68,7 +68,7 @@ test('OpenCode 2 native menu cancel and back never apply', async () => {
       return undefined
     },
   } as unknown as Plugin.Context['ui']['dialog']
-  await openReadOnlyDialog(dialog, payload, async () => {
+  await openControlDialog(dialog, payload, async () => {
     applies++
     throw new Error('must not apply')
   })
@@ -92,7 +92,7 @@ test('OpenCode 2 native menu shows unavailable text and apply errors', async () 
       alerts.push(input.message)
     },
   } as unknown as Plugin.Context['ui']['dialog']
-  await openReadOnlyDialog(dialog, payload, async () => {
+  await openControlDialog(dialog, payload, async () => {
     applies++
     throw new Error('Exact apply error')
   })
@@ -101,4 +101,100 @@ test('OpenCode 2 native menu shows unavailable text and apply errors', async () 
     'Not available on OpenCode 2 yet.',
     'Exact apply error',
   ])
+})
+
+for (const cancel of [false, true]) {
+  test(`OpenCode 2 native menu collects typed knobs and ${cancel ? 'cancels' : 'confirms'} removal`, async () => {
+    const menu = structuredClone(payload)
+    menu.menu.sections[0]!.actions = [
+      {
+        id: 'remove',
+        label: 'Remove',
+        confirm: { message: 'Delete credential?', irreversible: true },
+        knobs: [
+          { kind: 'text', id: 'label', label: 'Label', value: 'old' },
+          { kind: 'number', id: 'primary', label: 'Floor', value: 20 },
+          { kind: 'toggle', id: 'headless', label: 'Headless', value: false },
+          {
+            kind: 'choice',
+            id: 'mode',
+            label: 'Mode',
+            choices: [{ value: 'ordered', label: 'Ordered' }],
+            value: 'ordered',
+          },
+        ],
+      },
+    ]
+    let step = 0
+    const prompts: string[] = []
+    const confirmations: string[] = []
+    const requests: unknown[] = []
+    const dialog = {
+      async select(input: { options: Array<{ value: unknown }> }) {
+        step++
+        if (step === 1) return 'accounts'
+        if (step === 2) return input.options[0]!.value
+        if (step === 3) return true
+        if (step === 4) return 'ordered'
+        return undefined
+      },
+      async prompt(input: { title: string; value?: string }) {
+        prompts.push(`${input.title}: ${input.value}`)
+        return input.title === 'Label' ? 'Work' : '35'
+      },
+      async confirm(input: { message: string }) {
+        confirmations.push(input.message)
+        return !cancel
+      },
+      async alert() {},
+    } as unknown as Plugin.Context['ui']['dialog']
+    await openControlDialog(dialog, menu, async (request) => {
+      requests.push(request)
+      return { ...menu, ok: true, text: 'Done' }
+    })
+    expect(prompts).toEqual(['Label: old', 'Floor: 20'])
+    expect(confirmations).toEqual(['Delete credential?'])
+    expect(requests).toEqual(
+      cancel
+        ? []
+        : [
+            {
+              command: 'openai',
+              sectionId: 'accounts',
+              actionId: 'remove',
+              values: {
+                label: 'Work',
+                primary: 35,
+                headless: true,
+                mode: 'ordered',
+              },
+              confirmed: true,
+            },
+          ],
+    )
+  })
+}
+
+test('OpenCode 2 native menu cancels a knob without applying', async () => {
+  const menu = structuredClone(payload)
+  menu.menu.sections[0]!.actions[0]!.knobs = [
+    { kind: 'text', id: 'label', label: 'Label' },
+  ]
+  let step = 0
+  let applies = 0
+  const dialog = {
+    async select(input: { options: Array<{ value: unknown }> }) {
+      if (++step === 1) return 'accounts'
+      if (step === 2) return input.options[0]!.value
+      return undefined
+    },
+    async prompt() {
+      return undefined
+    },
+  } as unknown as Plugin.Context['ui']['dialog']
+  await openControlDialog(dialog, menu, async () => {
+    applies++
+    throw new Error('must not apply')
+  })
+  expect(applies).toBe(0)
 })

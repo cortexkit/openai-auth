@@ -3734,3 +3734,68 @@ command = ["bash", "-c", "bun run --cwd packages/core build && bun test --cwd pa
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-menu.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode\s2\sknob\sscrubbing\sremoves\scredential-shaped\sfields\srecursively$']
+
+[[control]]
+id = "opencode2-main-removal-refusal"
+guards = "the menu cannot remove the host main login"
+file = "packages/opencode/src/core/pool-accounts.ts"
+old = "  if (id === POOL_MAIN_ROW_ID) return POOL_MAIN_REMOVAL_REFUSED"
+new = "  if (false && id === POOL_MAIN_ROW_ID) return POOL_MAIN_REMOVAL_REFUSED // NON-VACUITY BREAK: allow main removal."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 removal refuses main$']
+
+[[control]]
+id = "opencode2-pending-transfer-removal-refusal"
+guards = "the menu cannot remove a row receiving the host login transfer"
+file = "packages/opencode/src/core/pool-accounts.ts"
+old = "  if (pending?.rowId === id) return poolTransferRemovalRefused(id)"
+new = "  if (false && pending?.rowId === id) return poolTransferRemovalRefused(id) // NON-VACUITY BREAK: allow transfer-row removal."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 removal refuses pending$']
+
+[[control]]
+id = "opencode2-captured-vault-local-action-refusal"
+guards = "a locally rendered action reports vault authority after enrollment"
+file = "packages/core/src/vault-command-menu.ts"
+old = "        (request.sectionId === 'accounts' ||"
+new = "        (false || // NON-VACUITY BREAK: lose the captured local-account refusal."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 stale authority refuses captured local action and resumes after unenroll$']
+
+[[control]]
+id = "opencode2-delayed-vault-local-action-refusal"
+guards = "a locally begun login cannot insert after enrollment and notifies its initiating session"
+file = "packages/core/src/commands.ts"
+old = "        if (vault && (await vault.authority()) !== 'local')"
+new = "        if (false && vault && (await vault.authority()) !== 'local') // NON-VACUITY BREAK: insert after vault enrollment."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 menu login completion enroll$']
+
+[[control]]
+id = "opencode2-vault-controls-capability-fence"
+guards = "vault enrollment actions remain unavailable even though the engine exposes them"
+file = "packages/opencode/src/v2/menu.ts"
+old = "    allowAction: allowed,"
+new = "    allowAction: () => true, // NON-VACUITY BREAK: permit vault enrollment."
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 rejects all non-control engine rows in local mode$']

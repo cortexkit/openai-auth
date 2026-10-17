@@ -105,7 +105,7 @@ import {
   vaultLoginMethod,
   writeLoginToPool,
 } from './login'
-import { createReadOnlyControlPlane } from './menu'
+import { createControlPlaneMenu } from './menu'
 import { registerCodexModelRules } from './models'
 import { acquireSessionPins } from './shared-pins'
 
@@ -120,7 +120,7 @@ const SETTLE_ON_DISPOSE_MS = 5_000
 
 /** Test and embedding seams; every field has a production default. */
 export interface OpenAIAuthV2Options {
-  /** Overrides the production read-only menu for transport fixtures. */
+  /** Overrides the production menu for transport fixtures. */
   controlPlane?: ControlPlaneMenu
   /** The account config and state files; read on every use. */
   paths?: () => AccountPaths
@@ -579,7 +579,7 @@ export async function setupOpenAIAuth(
             location: ctx.location,
           },
           options.controlPlane ??
-            createReadOnlyControlPlane({
+            createControlPlaneMenu({
               accountStoragePath: paths().configPath,
               accountStatePath: paths().statePath,
               packageVersion: version,

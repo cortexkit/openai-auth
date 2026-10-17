@@ -92,7 +92,7 @@ test('OpenCode 2 command routes one shared definition to isolated directories an
   expect(a.host.commands).toHaveLength(1)
   expect(b.host.commands).toHaveLength(1)
   expect(a.host.commands[0]).toBe(b.host.commands[0])
-  const before = [a.bytes(), b.bytes()]
+  const before = [a.bytes(), b.bytes()] as const
   const clientA = createRpcClient(
     (await resolveRpcDir(a.root)).dir,
     process.pid,
@@ -116,7 +116,7 @@ test('OpenCode 2 command routes one shared definition to isolated directories an
     sessionId: 'a',
     values: { mode: 'fallback-first' },
   })
-  expect(result.ok).toBe(false)
+  expect(result.ok).toBe(true)
   expect(JSON.stringify(result.menu)).toContain('account-a')
   await a.dispose()
   expect(a.host.commands).toHaveLength(0)
@@ -132,7 +132,8 @@ test('OpenCode 2 command routes one shared definition to isolated directories an
   } as ApplyRequest)
   expect(applied.ok).toBe(false)
   expect(JSON.stringify(applied.menu)).toContain('account-b')
-  expect([a.bytes(), b.bytes()]).toEqual(before)
+  expect(a.bytes()).not.toEqual(before[0])
+  expect(b.bytes()).toEqual(before[1])
   expect(a.effects()).toEqual({ fetches: 0, logins: 0, turns: 0 })
   expect(b.effects()).toEqual({ fetches: 0, logins: 0, turns: 0 })
 })

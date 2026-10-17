@@ -5,30 +5,70 @@ import {
 } from '../commands'
 import type { ControlPlaneMenu } from './control-plane'
 
-/** OpenCode's normal menu, with createOpenAiMenu refusing every apply. */
-export function createReadOnlyControlPlane(
+/** Only the account and routing controls supported by this host may run. */
+function allowed(request: {
+  sectionId: string
+  actionId: string
+  itemId?: string
+}) {
+  const item = request.itemId !== undefined
+  switch (request.sectionId) {
+    case 'accounts':
+      return item
+        ? ['enable', 'disable', 'remove', 'move'].includes(request.actionId)
+        : request.actionId === 'add'
+    case 'routing':
+      return !item && ['order', 'mode'].includes(request.actionId)
+    case 'quota':
+      return request.actionId === 'check'
+    case 'limits':
+      return item
+        ? request.actionId === 'floors'
+        : request.actionId === 'killswitch'
+    case 'session':
+      return !item && request.actionId === 'clear-pin'
+    default:
+      return false
+  }
+}
+
+/** OpenCode's shared menu with a server-side capability fence. */
+export function createControlPlaneMenu(
   context: OpenCodeMenuContext,
 ): ControlPlaneMenu {
-  const readOnly: OpenCodeMenuContext = {
+  const controls: OpenCodeMenuContext = {
     ...context,
-    readOnly: true,
+    allowAction: allowed,
     unavailableSections: ['cache', 'diagnostics', 'reset'],
   }
   return {
-    open: (sessionId) => openOpenAiMenu(readOnly, sessionId),
+    open: (sessionId) => openOpenAiMenu(controls, sessionId),
     apply: (input) => {
       const request =
         input !== null && typeof input === 'object'
           ? (input as Record<string, unknown>)
           : {}
-      // User-supplied action values are unnecessary when every apply is refused.
-      // Pass only the session, section, item and action identifiers to the menu;
-      // arbitrary RPC fields must not be echoed into its response.
-      return applyOpenAiMenu(readOnly, {
+      // Copy only primitive knob values. The engine validates them against the
+      // selected action and ignores unknown names; no arbitrary RPC object is echoed.
+      const values =
+        request.values &&
+        typeof request.values === 'object' &&
+        !Array.isArray(request.values)
+          ? Object.fromEntries(
+              Object.entries(request.values).filter(
+                ([, value]) =>
+                  value === null ||
+                  ['string', 'number', 'boolean'].includes(typeof value),
+              ),
+            )
+          : undefined
+      return applyOpenAiMenu(controls, {
         command: 'openai',
         sectionId:
           typeof request.sectionId === 'string' ? request.sectionId : '',
         actionId: typeof request.actionId === 'string' ? request.actionId : '',
+        ...(values ? { values } : {}),
+        ...(request.confirmed === true ? { confirmed: true } : {}),
         ...(typeof request.itemId === 'string'
           ? { itemId: request.itemId }
           : {}),

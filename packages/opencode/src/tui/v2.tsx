@@ -8,7 +8,7 @@ import {
 } from '../rpc/protocol'
 import { createRpcClient } from '../rpc/rpc-client'
 import { resolveRpcDir } from '../rpc/rpc-dir'
-import { openReadOnlyDialog } from './v2-dialog'
+import { openControlDialog } from './v2-dialog'
 
 export interface TuiTransportOptions {
   /** Only the test fixture supplies content until the sidebar is implemented. */
@@ -35,7 +35,7 @@ export async function setupTui(
   const openDialog: NonNullable<TuiTransportOptions['openDialog']> =
     options.openDialog ??
     ((payload, apply) =>
-      openReadOnlyDialog(context.ui.dialog, payload, apply, () => !disposed))
+      openControlDialog(context.ui.dialog, payload, apply, () => !disposed))
   let disposed = false
   let inFlight = false
   let dialogOpen = false

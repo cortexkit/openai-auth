@@ -55,6 +55,7 @@ const log = createLogger('commands')
 /** What the `/openai` menu reads and changes in this process. */
 export interface OpenCodeMenuContext {
   readOnly?: boolean
+  allowAction?: OpenAiMenuOptions['allowAction']
   unavailableSections?: OpenAiMenuOptions['unavailableSections']
   accountStoragePath: string
   /** Runtime-state file that goes with `accountStoragePath`. */
@@ -422,6 +423,7 @@ export function createOpenCodeMenu(ctx: OpenCodeMenuContext) {
   return createOpenAiMenu({
     store: ctx.store(),
     ...(ctx.readOnly ? { readOnly: true } : {}),
+    ...(ctx.allowAction ? { allowAction: ctx.allowAction } : {}),
     ...(ctx.unavailableSections
       ? { unavailableSections: ctx.unavailableSections }
       : {}),
@@ -494,8 +496,23 @@ export function createOpenCodeMenu(ctx: OpenCodeMenuContext) {
 function sessionNotify(sessionId: string | undefined) {
   return (message: string, kind: 'info' | 'warning' | 'error' = 'info') => {
     log.info('menu notification', { sessionId, kind })
+    // The shared engine's late-login channel carries text only. These stable
+    // refusal markers preserve the engine code across our RPC notification.
+    const refusal =
+      /^Adding the account failed: \[(vault-local-action|main-account)\] /.exec(
+        message,
+      )
     pushNotification(
-      { command: OPENAI_COMMAND_NAME, notify: { message, kind } },
+      {
+        command: OPENAI_COMMAND_NAME,
+        notify: {
+          message: refusal
+            ? message.replace(refusal[0], 'Adding the account failed: ')
+            : message,
+          kind,
+          ...(refusal ? { code: refusal[1] } : {}),
+        },
+      },
       sessionId,
     )
   }
