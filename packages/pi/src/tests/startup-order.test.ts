@@ -22,6 +22,9 @@ import {
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import { PiOpenAIRuntime } from '../runtime.ts'
 import { VAULT_PLACEHOLDER_KEY } from '../vault-slot.ts'
+import { isolatePiAgentDir } from './test-isolation.ts'
+
+isolatePiAgentDir()
 
 type Provider = NonNullable<ReturnType<ModelRuntime['getProvider']>>
 type ComposingRuntime = { composeProvider(id: string): Provider | undefined }

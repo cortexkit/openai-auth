@@ -40,6 +40,9 @@ import { createPiMenu } from '../commands.ts'
 import { clearPiStickyRouting } from '../routing.ts'
 import { PiOpenAIRuntime } from '../runtime.ts'
 import { VAULT_PLACEHOLDER_KEY } from '../vault-slot.ts'
+import { isolatePiAgentDir } from './test-isolation.ts'
+
+isolatePiAgentDir()
 
 const CODEX_URL = 'https://chatgpt.com/backend-api/codex/responses'
 const WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage'

@@ -5,6 +5,9 @@ import { type PiSlot, PiSlotError } from '@cortexkit/common-auth/pi-slot'
 
 import cortexKitPiOpenAIAuth, { installRawCodexWebSocket } from '../index.ts'
 import { PiOpenAIRuntime } from '../runtime.ts'
+import { isolatePiAgentDir } from './test-isolation.ts'
+
+isolatePiAgentDir()
 
 type RegisteredProvider = {
   models: Array<{ id: string }>

@@ -26,6 +26,9 @@ import { getAgentDir } from '@earendil-works/pi-coding-agent'
 import { chatgptAccessToken } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import { PiPoolSource } from '../pool-source.ts'
 import { errorEvent, PiOpenAIRuntime } from '../runtime.ts'
+import { isolatePiAgentDir } from './test-isolation.ts'
+
+isolatePiAgentDir()
 
 let dir: string
 let vault: OpenAiVault

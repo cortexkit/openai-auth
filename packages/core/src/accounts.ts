@@ -2852,7 +2852,6 @@ export class FallbackAccountManager {
       name: fallbackRefreshLockName(sourceAccount.id),
       ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
       path: this.paths.configPath,
-      now: this.now,
       renew: true,
     })
     if (!fileLock) {

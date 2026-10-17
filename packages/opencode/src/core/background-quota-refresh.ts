@@ -37,13 +37,13 @@ export type BackgroundLockAcquirer = () => Promise<BackgroundLockHandle | null>
  * Acquire the cross-process lock that serializes the background refresh.
  * `renew` re-arms the TTL on an interval until release(), so a serial pass that
  * outlasts the TTL (a fleet of accounts each costing a token refresh plus a
- * wham fetch) never lets the lock expire mid-run — an expiry would let a second
- * process start a concurrent refresh. Overrides exist so tests can drive the
- * renewal with a mock clock and a fast interval.
+ * quota fetch) never lets the lock expire mid-run — an expiry would let a second
+ * process start a concurrent refresh. Tests can shorten the TTL and renewal
+ * interval while still exercising real elapsed time.
  */
 export function acquireBackgroundRefreshLock(
   configPath: string,
-  overrides?: { now?: () => number; renewIntervalMs?: number },
+  overrides?: { ttlMs?: number; renewIntervalMs?: number },
 ): Promise<BackgroundLockHandle | null> {
   return acquireRefreshFileLock({
     name: BACKGROUND_QUOTA_REFRESH_LOCK_NAME,
