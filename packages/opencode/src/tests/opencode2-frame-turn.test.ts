@@ -63,7 +63,7 @@ function runtime(prefix = 'turn') {
 const SESSION = 'ses_1'
 
 describe('WebSocket frame turn rule', () => {
-  it('gives the P1 sequence turns 1,1,2,3,4,4,5 and keeps each turn start', () => {
+  it('gives turns 1,1,2,3,4,4,5 across a tool step, compaction, a refused turn and a failover resend, keeping each turn start', () => {
     const { clock, runtime: rt } = runtime()
     const turns = new FrameTurnState(rt)
     const sent: Array<{ turnID: string; turnStartedAt: number }> = []
