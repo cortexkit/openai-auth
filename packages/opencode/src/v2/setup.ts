@@ -38,6 +38,7 @@
 // 6. The model rules (`models.ts`).
 
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { randomUUID } from 'node:crypto'
 import {
   type Attempt,
   installOpenCode2Auth,
@@ -60,7 +61,6 @@ import {
   redactCredentialResponse,
   redactCredentialText,
   vaultStateDir,
-  whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Plugin } from '@opencode/plugin'
 import type { SessionHooks } from '@opencode/plugin/promise/session'
@@ -84,7 +84,6 @@ import {
   migrateToPool,
   poolPlaceholderWithoutMain,
 } from '../core/pool-migration'
-import { observationFromSnapshot } from '../core/pool-quota'
 import { startProcessHeartbeat } from '../core/process-heartbeat'
 import { acquireOpenCodeVault } from '../core/shared-vault'
 import { migrationFenceOpen } from '../core/version-fence'
@@ -112,6 +111,11 @@ import {
 import { createControlPlaneMenu } from './menu'
 import { registerCodexModelRules } from './models'
 import { RequestDumps } from './request-dumps'
+import {
+  createPoolQuotaPull,
+  createPoolResetDeps,
+  ResetCreditCounts,
+} from './reset-credits'
 import { acquireSessionPins } from './shared-pins'
 import { acquireSidebarPublisher } from './sidebar-publisher'
 
@@ -146,6 +150,11 @@ export interface OpenAIAuthV2Options {
   version?: string
   /** Used for token refreshes and quota polls. */
   fetch?: typeof fetch
+  /**
+   * The clock for token refreshes, quota polls and the readings they record,
+   * rate-limit marks, and reset credits; `Date.now` by default.
+   */
+  now?: () => number
   /** Starts one ChatGPT login (`beginAccountLogin`). */
   beginLogin?: BeginLogin
   /** The migration's version fence; `migrationFenceOpen` for `version` by default. */
@@ -394,6 +403,7 @@ export async function setupOpenAIAuth(
     setLogLevel(storedLevel as Parameters<typeof setLogLevel>[0])
   }
   const fetchImpl = options.fetch ?? fetch
+  const now = options.now ?? Date.now
   const version = options.version ?? PackageVersion
   const migrationEnabled = options.poolMigration ?? POOL_MIGRATION_ENABLED
 
@@ -471,13 +481,14 @@ export async function setupOpenAIAuth(
   await vault.authority()
   const vaultFirstRoster = vaultLease.firstRoster
 
+  const resetCounts = new ResetCreditCounts()
   const source = new PoolAccountSource({
     paths,
     refreshProvider: async (credential) => {
       const tokens = await codexRefreshFn({
         refreshToken: credential.refresh,
         fetchImpl,
-        now: Date.now,
+        now,
       })
       const identity = extractAccountId({
         id_token: '',
@@ -486,20 +497,17 @@ export async function setupOpenAIAuth(
       })
       return { ...tokens, ...(identity ? { identity } : {}) }
     },
-    pullQuota: async (request) => {
-      const credential = request.credential
-      if (credential.type !== 'oauth' || !credential.access)
-        throw new Error('the row holds no access token to poll with')
-      const snapshot = await whamUsageFn({
-        accessToken: credential.access,
-        fetchImpl,
-        now: Date.now,
-        ...(request.identity ? { accountId: request.identity } : {}),
-        accountKey: request.id,
-        logger: logQ,
-      })
-      return observationFromSnapshot(snapshot, Date.now(), true)
-    },
+    // Each usage poll's windows and available reset-credit count go into
+    // the row's quota map (what routing reads). The poll's applicable count,
+    // which the reset result reports and the map has no field for, goes
+    // into `resetCounts`.
+    pullQuota: createPoolQuotaPull({
+      fetchImpl,
+      now,
+      counts: resetCounts,
+      logger: logQ,
+    }),
+    now,
     // One ChatGPT account has one owner. A local pool row signing in as an
     // account the vault holds for this host belongs to the vault, so this
     // source neither refreshes that row's token nor polls quota with it
@@ -609,6 +617,7 @@ export async function setupOpenAIAuth(
     },
     responsesLite: () => getSettings().responsesLite,
     codexEndpoint: () => getSettings().codexApiEndpoint,
+    now,
     log,
   })
   const installation = await installPoolHooks(ctx, openai.adapter, log, codex)
@@ -673,6 +682,18 @@ export async function setupOpenAIAuth(
           },
           options.controlPlane ??
             createControlPlaneMenu({
+              // Reset credits over the pool: a missing row is refused, and
+              // no host login is read in its place.
+              ...createPoolResetDeps({
+                source,
+                storage: () => loadAccounts(paths()),
+                counts: resetCounts,
+                now,
+                authority: () => vault.authority(),
+              }),
+              fetchImpl,
+              now,
+              randomUUID,
               accountStoragePath: paths().configPath,
               accountStatePath: paths().statePath,
               packageVersion: version,

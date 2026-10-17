@@ -445,7 +445,7 @@ export interface PoolResetAccess {
 }
 
 /** The reset target for a pool row, or the refusal the legacy resolver gives. */
-function poolResetTarget(
+export function poolResetTarget(
   accountKey: string,
   pooled: PoolResetAccess,
 ): ResetTargetIdentity {
