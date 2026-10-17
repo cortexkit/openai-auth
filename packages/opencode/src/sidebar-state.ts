@@ -1,5 +1,6 @@
 import {
   formatQuota,
+  isQuotaStale,
   type ProjectedQuota,
   projectQuota,
   quotaWindowName,
@@ -701,9 +702,7 @@ function vaultAccountsInPlacementOrder(
   const byId = new Map(accounts.map((account) => [account.id, account]))
   return orderForPlacement(
     accounts.map((account) => account.id),
-    state.route === 'sticky-balanced'
-      ? 'roster'
-      : orderedPlacement(state.route),
+    placementOf(state),
     vaultMainRouteId(accounts) ?? '',
   ).flatMap((id) => {
     const account = byId.get(id)
@@ -2197,6 +2196,143 @@ export function getCollapsedQuotaSummary(
         ? null
         : formatQuota(projection, { now, form: 'compact' }),
   }
+}
+
+/** One account's line in the collapsed sidebar. */
+export interface CollapsedAccountLine {
+  id: string
+  name: string
+  killed: boolean
+  /** Whether this account serves the session the sidebar is drawn for. */
+  active: boolean
+  /**
+   * Whether the reading is old enough that the longer quota texts would say
+   * how long ago it was checked. The narrow text leaves that out, so the
+   * whole line is drawn dim instead.
+   */
+  stale: boolean
+  /** The narrow quota text (`5h 38% · 7d 59% left`), or null with no reading. */
+  text: string | null
+}
+
+function placementOf(state: SidebarState) {
+  return state.route === 'sticky-balanced'
+    ? 'roster'
+    : orderedPlacement(state.route)
+}
+
+/**
+ * The collapsed sidebar's lines: one per account the sidebar shows, in the
+ * order routing tries them. In vault mode that is every vault account and no
+ * local one, as the expanded view lists them. Locally it is main and the
+ * enabled fallbacks; with the fallback section hidden, only main, plus the
+ * fallback serving this session so the session's account never disappears.
+ * `state` carries this session's routing (`activeId`, `route`).
+ */
+export function getCollapsedAccountLines(
+  state: SidebarState,
+  options: { now?: number; showFallbacks?: boolean } = {},
+): CollapsedAccountLine[] {
+  const now = options.now ?? Date.now()
+  const activeId = resolveActiveAccount(state).id
+  const accounts: Array<{
+    id: string
+    name: string
+    quota: AccountQuota | null
+    killed: boolean
+  }> =
+    state.vaultAccounts !== undefined
+      ? vaultAccountsInPlacementOrder(state).map((account) => ({
+          id: account.id,
+          name: account.label ?? account.id,
+          quota: account.quota,
+          killed: account.killed,
+        }))
+      : localAccountsInPlacementOrder(
+          state,
+          activeId,
+          options.showFallbacks ?? true,
+        )
+  return accounts.map((account) => {
+    const projection = sidebarQuotaProjection(account.quota, now)
+    const reading =
+      projection && (projection.limits.length > 0 || projection.budget)
+        ? projection
+        : undefined
+    return {
+      id: account.id,
+      name: account.name,
+      killed: account.killed,
+      active: account.id === activeId,
+      stale: reading ? isQuotaStale(reading, { now }) : false,
+      text: reading ? formatQuota(reading, { now, form: 'narrow' }) : null,
+    }
+  })
+}
+
+function localAccountsInPlacementOrder(
+  state: SidebarState,
+  activeId: string,
+  showFallbacks: boolean,
+) {
+  const accounts = [
+    {
+      id: 'main',
+      name: 'main',
+      quota: state.main.quota,
+      killed: state.main.killed,
+    },
+    ...state.fallbacks
+      .filter(
+        (account) =>
+          account.enabled && (showFallbacks || account.id === activeId),
+      )
+      .map((account) => ({
+        id: account.id,
+        name: account.label ?? account.id,
+        quota: account.quota,
+        killed: account.killed,
+      })),
+  ]
+  const byId = new Map(accounts.map((account) => [account.id, account]))
+  return orderForPlacement(
+    accounts.map((account) => account.id),
+    placementOf(state),
+    'main',
+  ).flatMap((id) => {
+    const account = byId.get(id)
+    return account ? [account] : []
+  })
+}
+
+/**
+ * Terminal columns a string takes: wide characters (CJK, most emoji) take
+ * two. Uses Bun's measurement when the host runs on Bun, else counts code
+ * points.
+ */
+export function displayWidth(text: string): number {
+  const bun = (
+    globalThis as { Bun?: { stringWidth?: (text: string) => number } }
+  ).Bun
+  return bun?.stringWidth ? bun.stringWidth(text) : Array.from(text).length
+}
+
+/**
+ * Cut a label to at most `columns` columns, ending in `…` when it was cut.
+ * The collapsed sidebar shortens only the label, never the quota text.
+ */
+export function fitCollapsedLabel(label: string, columns: number): string {
+  if (displayWidth(label) <= columns) return label
+  if (columns < 1) return ''
+  let kept = ''
+  let used = 0
+  for (const char of label) {
+    const width = displayWidth(char)
+    if (used + width > columns - 1) break
+    kept += char
+    used += width
+  }
+  return `${kept}\u2026`
 }
 
 const PACING_MIN_ELAPSED_MS = 5 * 60 * 1000

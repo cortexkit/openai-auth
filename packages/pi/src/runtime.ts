@@ -44,10 +44,10 @@ import {
   redactCredentialError,
   redactCredentialResponse,
   redactCredentialText,
-  VAULT_MODE_REFUSALS,
   VAULT_REQUEST_ROSTER_WAIT_MS,
   type VaultModeRefusal,
   vaultModeNoRouteCause,
+  vaultModeRefusalText,
   vaultStateDir,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
@@ -624,7 +624,7 @@ export class PiOpenAIRuntime {
             errorEvent(
               model,
               attempt.refusal
-                ? VAULT_MODE_REFUSALS[attempt.refusal]
+                ? vaultModeRefusalText(attempt.refusal, this.vault.name)
                 : blockedMessage(attempt.block),
             ),
           )

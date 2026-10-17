@@ -18,7 +18,7 @@ import {
   createEffect,
   createSignal,
   For,
-  type JSX,
+  Index,
   onCleanup,
   Show,
 } from 'solid-js'
@@ -28,8 +28,12 @@ import { createRpcClient } from './rpc/rpc-client.js'
 import { resolveRpcDir } from './rpc/rpc-dir.js'
 import {
   type AccountQuota,
+  type CollapsedAccountLine,
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
+  displayWidth,
+  fitCollapsedLabel,
+  getCollapsedAccountLines,
   getCollapsedQuotaSummary,
   getPresentQuotaWindows,
   getSidebarState,
@@ -250,17 +254,72 @@ function StatRow(props: {
   )
 }
 
-// Compact row for the collapsed view: muted label left, caller-provided value
-// right. Mirrors StatRow's layout so columns line up.
-function CollapsedRow(props: {
+// One account in the collapsed view: label left; narrow quota text and the
+// status dot right (red ⊘ when killed). The session's account keeps the
+// usage tone; other accounts, and any account whose reading is stale, are
+// drawn muted. The row measures its own width so only the label is cut (with
+// …) when the line does not fit; the quota text is never cut.
+function CollapsedAccountRow(props: {
   theme: ThemeCurrent
-  label: string
-  children: JSX.Element
+  line: CollapsedAccountLine
+  tone: Tone
 }) {
+  const [width, setWidth] = createSignal(0)
+  let row: { width: number } | undefined
+  const dim = () => props.line.stale || !props.line.active
+  const label = () => {
+    const columns = width()
+    if (columns <= 0) return props.line.name
+    // The value side is the text plus ` ●`, or a lone `—`; one column
+    // separates it from the label.
+    const value =
+      props.line.text === null ? 1 : displayWidth(props.line.text) + 2
+    return fitCollapsedLabel(props.line.name, columns - value - 1)
+  }
   return (
-    <box width='100%' flexDirection='row' justifyContent='space-between'>
-      <text fg={props.theme.textMuted}>{props.label}</text>
-      {props.children}
+    <box
+      ref={(element: { width: number }) => {
+        row = element
+      }}
+      onSizeChange={() => setWidth(row?.width ?? 0)}
+      width='100%'
+      flexDirection='row'
+      justifyContent='space-between'
+    >
+      <text
+        fg={toneColor(props.theme, dim() ? 'muted' : 'text')}
+        wrapMode='none'
+        flexShrink={1}
+      >
+        {label()}
+      </text>
+      <Show
+        when={props.line.text !== null}
+        fallback={<text fg={props.theme.textMuted}>{'\u2014'}</text>}
+      >
+        <box flexDirection='row' flexShrink={0}>
+          <Show
+            when={!dim()}
+            fallback={
+              <text fg={toneColor(props.theme, 'muted')}>
+                {props.line.text}
+              </text>
+            }
+          >
+            <text fg={toneColor(props.theme, props.tone)}>
+              <b>{props.line.text}</b>
+            </text>
+          </Show>
+          <text
+            fg={toneColor(
+              props.theme,
+              props.line.killed ? 'err' : dim() ? 'muted' : props.tone,
+            )}
+          >
+            {props.line.killed ? ' \u2298' : ' \u25cf'}
+          </text>
+        </box>
+      </Show>
     </box>
   )
 }
@@ -823,6 +882,10 @@ function QuotaSidebar(props: {
     route: sessionRouting().route,
   })
   const activeAccount = () => resolveActiveAccount(sessionState())
+  const collapsedLines = () =>
+    getCollapsedAccountLines(sessionState(), {
+      showFallbacks: prefs().sections.fallbackAccounts,
+    })
   const quotaLabelWidth = () => computeQuotaLabelWidth(renderedQuotas(state()))
   const activeQuotaSummary = () =>
     getCollapsedQuotaSummary(activeAccount().quota)
@@ -910,28 +973,17 @@ function QuotaSidebar(props: {
         </Show>
       </box>
 
-      {/* Collapsed: active account's present quota windows + dot (red ⊘ when killed) */}
+      {/* Collapsed: one line per account, narrow quota text + dot (red ⊘ when killed) */}
       <Show when={collapsed() && hasData()}>
-        <CollapsedRow theme={theme()} label={activeAccount().name}>
-          <Show
-            when={activeQuotaSummary().text != null}
-            fallback={<text fg={theme().textMuted}>{'\u2014'}</text>}
-          >
-            <box flexDirection='row'>
-              <text fg={toneColor(theme(), activeQuotaTone())}>
-                <b>{activeQuotaSummary().text}</b>
-              </text>
-              <text
-                fg={toneColor(
-                  theme(),
-                  activeAccount().killed ? 'err' : activeQuotaTone(),
-                )}
-              >
-                {activeAccount().killed ? ' \u2298' : ' \u25cf'}
-              </text>
-            </box>
-          </Show>
-        </CollapsedRow>
+        <Index each={collapsedLines()}>
+          {(line) => (
+            <CollapsedAccountRow
+              theme={theme()}
+              line={line()}
+              tone={activeQuotaTone()}
+            />
+          )}
+        </Index>
       </Show>
 
       {/* Expanded: full sections. Also render when there's no data so the

@@ -57,6 +57,7 @@ import {
   type TokenResponse,
   TombstoneRefreshError,
   vaultModeNoRouteCause,
+  vaultModeRefusalText,
   vaultStateDir,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
@@ -4438,13 +4439,13 @@ export async function CodexAuthPlugin(
                 if (loginRequired && !isVaultModeRefusal(cause))
                   throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)
                 return new Response(
-                  LOCAL_CREDENTIAL_REFUSALS[
-                    isVaultModeRefusal(cause)
-                      ? cause
-                      : missingTombstoneMain
-                        ? 'missing-main'
-                        : (cause ?? 'unusable')
-                  ],
+                  isVaultModeRefusal(cause)
+                    ? vaultModeRefusalText(cause, vault.name)
+                    : LOCAL_CREDENTIAL_REFUSALS[
+                        missingTombstoneMain
+                          ? 'missing-main'
+                          : (cause ?? 'unusable')
+                      ],
                   {
                     status: 401,
                     headers: { 'content-type': 'text/plain; charset=utf-8' },

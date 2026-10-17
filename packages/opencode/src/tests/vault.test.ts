@@ -134,9 +134,12 @@ afterEach(async () => {
   })
 })
 
-async function startDaemon(credentials: Record<string, MockCredential> = {}) {
+async function startDaemon(
+  credentials: Record<string, MockCredential> = {},
+  grants?: MockDaemon['grants'],
+) {
   daemon = await clock.phase('mock daemon listen', () =>
-    startMockDaemon({ directory: dir, credentials }),
+    startMockDaemon({ directory: dir, credentials, grants }),
   )
   return daemon
 }
@@ -506,6 +509,48 @@ describe('migrated credential refusal messages', () => {
     terminal(message)
     expect(wire.sends).toEqual([])
   })
+
+  // A vault that lists no account says why when it reports this host's
+  // grants: none at all, or one that reaches no login. An older vault does
+  // not, and keeps the general text.
+  for (const [name, grants, expected] of [
+    [
+      'no grant gives the exact grant command',
+      [],
+      'Request refused locally: this host is connected to the credential vault, which has no grant letting it read OpenAI accounts, and local accounts are not used while it is connected. Disconnect this host from the vault, or grant it access with: ck auth grant --principal enrolled:openai-auth-opencode --selector-kind category --selector openai-native --operation read',
+    ],
+    [
+      'a grant reaching no login names reclassify and status',
+      [
+        {
+          selector_kind: 'category',
+          selector: 'openai-native',
+          operation: 'read',
+        },
+      ],
+      VAULT_MODE_REFUSALS['vault-grant-unreached'],
+    ],
+    [
+      'an older vault keeps the general empty-vault text',
+      undefined,
+      VAULT_MODE_REFUSALS['vault-empty'],
+    ],
+  ] as const) {
+    test(`an empty vault refusal: ${name}`, async () => {
+      await startDaemon({}, grants as MockDaemon['grants'])
+      enroll()
+      seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+      const wire = installWire()
+      const { vault } = await plugin()
+      expect(vault.snapshot()?.rows).toEqual([])
+      const response = await request(await fetchOverride())
+      expect(response.status).toBe(401)
+      const message = await response.text()
+      expect(message).toBe(expected)
+      terminal(message)
+      expect(wire.sends).toEqual([])
+    })
+  }
 })
 
 async function fetchOverride(): Promise<typeof globalThis.fetch> {

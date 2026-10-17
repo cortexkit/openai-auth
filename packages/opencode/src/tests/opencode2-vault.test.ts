@@ -22,6 +22,7 @@ import {
 import {
   VAULT_MODE_REFUSALS,
   type VaultModeRefusal,
+  vaultModeRefusalText,
   vaultPaths,
 } from '@cortexkit/openai-auth-core/internal'
 import {
@@ -96,6 +97,8 @@ async function start(
     /** Runs the pool lifecycle (migration, then adoptions of slot logins). */
     poolMigration?: boolean
     reverseVaultRoster?: boolean
+    /** The grants the vault reports for this host; undefined is an older vault. */
+    grants?: MockDaemon['grants']
   } = {},
 ) {
   const files = poolFiles()
@@ -104,6 +107,7 @@ async function start(
   const daemon: MockDaemon = await startMockDaemon({
     directory: files.dir,
     credentials,
+    grants: options.grants,
   })
   // An approved enrollment, as Connect leaves it.
   const stateDir = join(files.dir, 'vault')
@@ -230,7 +234,9 @@ async function expectVaultRefusal(host: Host, cause: VaultModeRefusal) {
       (reason: unknown) => reason,
     )
   expect(error).toBeInstanceOf(OpenCode2AuthError)
-  expect((error as OpenCode2AuthError).message).toBe(VAULT_MODE_REFUSALS[cause])
+  expect((error as OpenCode2AuthError).message).toBe(
+    vaultModeRefusalText(cause, 'openai-auth-opencode'),
+  )
   // Nothing was given a credential to go out with.
   expect(draft.request.headers.get('authorization')).toBe(
     `Bearer ${PLACEHOLDER}`,
@@ -478,6 +484,42 @@ describe('vault accounts on OpenCode 2', () => {
   it('refuses locally when the vault serves no account', async () => {
     const { host } = await start('main-first', [{ id: 'main' }], {})
     await expectVaultRefusal(host, 'vault-empty')
+  })
+
+  it('an empty vault with no grant for this host refuses with the exact grant command', async () => {
+    const { host } = await start(
+      'main-first',
+      [{ id: 'main' }],
+      {},
+      { grants: [] },
+    )
+    await expectVaultRefusal(host, 'vault-no-grant')
+    expect(
+      vaultModeRefusalText('vault-no-grant', 'openai-auth-opencode'),
+    ).toEndWith(
+      'grant it access with: ck auth grant --principal enrolled:openai-auth-opencode --selector-kind category --selector openai-native --operation read',
+    )
+  })
+
+  it('an empty vault whose grant reaches no login refuses with reclassify and status', async () => {
+    const { host } = await start(
+      'main-first',
+      [{ id: 'main' }],
+      {},
+      {
+        grants: [
+          {
+            selector_kind: 'category',
+            selector: 'openai-native',
+            operation: 'read',
+          },
+        ],
+      },
+    )
+    await expectVaultRefusal(host, 'vault-grant-unreached')
+    expect(VAULT_MODE_REFUSALS['vault-grant-unreached']).toContain(
+      'ck auth reclassify --from-registry',
+    )
   })
 
   it('routes the pool rows again once this host disconnects', async () => {

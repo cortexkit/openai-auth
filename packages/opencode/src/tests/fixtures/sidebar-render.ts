@@ -366,7 +366,8 @@ try {
   await waitFrame(v1, (text) => text.includes('▶ LIVE PREFS'))
   parity()
   assert.doesNotMatch(frame(), /Quota|Routing|resets/)
-  assert.match(frame(), /60% left/)
+  // Collapsed, each account's line carries the narrow quota text.
+  assert.match(frame(), /5h 60% · 7d 30% left/)
   // Use terminal mouse input on the badge, not a controller-only toggle.
   const persisted = new Promise<void>((resolve) => {
     const stop = watchTuiPreferences(() => {

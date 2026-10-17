@@ -133,6 +133,7 @@ export interface CreateAuthMethodsOptions {
     | 'identities'
     | 'refresh'
     | 'pollQuota'
+    | 'grantReach'
   >
 }
 

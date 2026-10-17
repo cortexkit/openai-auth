@@ -41,6 +41,15 @@ While OpenCode or Pi holds a vault token (**vault mode**), its requests use only
 - The OpenCode sidebar lists vault accounts only, including accounts that need sign-in or are unavailable. It keeps their last quota reading and shows your `/openai` on/off choice separately from the vault's state. A **blocked** account is below its configured quota floor and will not route. On OpenCode 1, `/openai` and the `opencode auth login` menu also list vault accounts only.
 - A request no vault account can serve is refused locally. The request error explains the cause and remedy: make accounts available in the vault, or disconnect the affected OpenCode or Pi installation.
 
+### When the vault serves no account
+
+When the vault lists no OpenAI account for OpenCode or Pi, the request error, Connect and the Vault section of the menu name the cause and the exact fix, as long as the vault reports what the application is granted:
+
+- **No grant.** Nothing lets the application read your OpenAI accounts. Run the grant command from [Connecting a host](#connecting-a-host), for example `ck auth grant --principal enrolled:openai-auth-opencode --selector-kind category --selector openai-native --operation read` (with `openai-auth-pi` for Pi).
+- **A grant that reaches no login.** The grant exists, but no login in the vault has the `openai-native` category. Run `ck auth reclassify --from-registry`, which fills only empty category sets from the vault's defaults, then check the CATEGORIES column with `ck auth status`.
+
+An older vault does not report grants. The message then names both checks: the categories with `ck auth status`, and the grant with `ck auth grant`.
+
 In vault mode, "main" in the **Main first** and **Fallback first** routing modes means the vault's default OpenAI account, `chatgpt:openai`; see [routing](accounts-and-routing.md#routing).
 
 Disconnecting OpenCode makes its local pool eligible again; disconnecting Pi restores its local login and fallbacks. OpenCode may still need to transfer its old slot login into the pool, as described below.

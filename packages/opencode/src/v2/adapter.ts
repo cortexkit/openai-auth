@@ -63,9 +63,9 @@ import {
   quotaSnapshotPassesPolicy,
   type RoutingMode,
   resolveMidStreamRateLimitResetAt,
-  VAULT_MODE_REFUSALS,
   type VaultModeRefusal,
   vaultModeNoRouteCause,
+  vaultModeRefusalText,
 } from '@cortexkit/openai-auth-core/internal'
 import type { PoolAccountSource } from '../core/pool-account-source'
 import { POOL_LOGIN_REQUIRED_MESSAGE } from '../core/pool-main'
@@ -165,6 +165,8 @@ export type VaultAccess = Pick<
   | 'reportFailure'
   | 'recordSnapshot'
   | 'requestReading'
+  | 'grantReach'
+  | 'name'
 >
 
 /**
@@ -734,7 +736,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         providerID: OPENAI_PROVIDER_ID,
         sessionID: input.sessionID,
         requestKind: input.kind,
-        message: VAULT_MODE_REFUSALS[cause],
+        message: vaultModeRefusalText(cause, vault.name),
       })
     }
     if (accountId !== undefined && primary) {

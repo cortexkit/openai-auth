@@ -72,7 +72,7 @@ import {
   vaultAccountName,
 } from './vault-account-menu'
 import { createVaultCommandMenu, menuStore } from './vault-command-menu'
-import { VAULT_EMPTY_ACCESS_HINT } from './vault-messages'
+import { vaultEmptyAccessHint } from './vault-messages'
 
 /** The one slash command, without the slash. */
 export const OPENAI_COMMAND_NAME = 'openai'
@@ -707,6 +707,7 @@ export interface VaultSectionDeps {
     | 'accept'
     | 'routes'
     | 'snapshot'
+    | 'grantReach'
   >
   /** Runs after the vault accounts this host may route change (connected, disconnected, one disabled or enabled). */
   changed?(): unknown
@@ -742,7 +743,7 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
           ...(connected
             ? [
                 status.accounts.length === 0
-                  ? VAULT_EMPTY_ACCESS_HINT
+                  ? vaultEmptyAccessHint(status.name, vault.grantReach())
                   : `The vault serves ${status.accounts.length} OpenAI account${status.accounts.length === 1 ? '' : 's'}; ${routing} can route now.`,
               ]
             : []),

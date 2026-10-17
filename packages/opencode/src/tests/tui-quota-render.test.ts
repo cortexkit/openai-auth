@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { join } from 'node:path'
 import {
   formatQuota,
   projectQuota,
@@ -6,6 +7,8 @@ import {
 } from '@cortexkit/common-auth/quota'
 import { sidebarQuotaFromPoolMap } from '../core/pool-sidebar.ts'
 import {
+  fitCollapsedLabel,
+  getCollapsedAccountLines,
   getCollapsedQuotaSummary,
   hashSidebarSessionId,
   type SidebarState,
@@ -535,4 +538,151 @@ describe('dynamic quota TUI rows', () => {
       { label: 'Route', value: 'main-first', tone: 'accent' },
     ])
   })
+})
+
+describe('collapsed sidebar: one line per account', () => {
+  const now = Date.UTC(2026, 6, 16, 12, 0, 0)
+  const quota = (used: number, ageMs = 0) => ({
+    checkedAt: now - ageMs,
+    primary: {
+      usedPercent: used,
+      remainingPercent: 100 - used,
+      windowMinutes: 300,
+      checkedAt: now - ageMs,
+    },
+    secondary: {
+      usedPercent: 10,
+      remainingPercent: 90,
+      windowMinutes: 10080,
+      checkedAt: now - ageMs,
+    },
+  })
+  const fallback = (id: string, used: number | null, extra = {}) => ({
+    id,
+    label: id.toUpperCase(),
+    enabled: true,
+    quota: used === null ? null : quota(used),
+    killed: false,
+    ...extra,
+  })
+  const base: SidebarState = {
+    main: { quota: quota(42), killed: false },
+    fallbacks: [fallback('spare', 20), fallback('work', null)],
+    activeId: 'spare',
+    route: 'main-first',
+    lastUpdated: now,
+  }
+
+  test('lists main and every enabled fallback in placement order, the session account active', () => {
+    expect(getCollapsedAccountLines(base, { now })).toEqual([
+      {
+        id: 'main',
+        name: 'main',
+        killed: false,
+        active: false,
+        stale: false,
+        text: '5h 58% · 7d 90% left',
+      },
+      {
+        id: 'spare',
+        name: 'SPARE',
+        killed: false,
+        active: true,
+        stale: false,
+        text: '5h 80% · 7d 90% left',
+      },
+      {
+        id: 'work',
+        name: 'WORK',
+        killed: false,
+        active: false,
+        stale: false,
+        text: null,
+      },
+    ])
+    const last = getCollapsedAccountLines(
+      { ...base, route: 'fallback-first' },
+      { now },
+    )
+    expect(last.map((line) => line.id)).toEqual(['spare', 'work', 'main'])
+  })
+
+  test('skips disabled fallbacks, and with the fallback section hidden keeps only main and the active one', () => {
+    const state = {
+      ...base,
+      fallbacks: [...base.fallbacks, fallback('off', 5, { enabled: false })],
+    }
+    expect(
+      getCollapsedAccountLines(state, { now }).map((line) => line.id),
+    ).toEqual(['main', 'spare', 'work'])
+    expect(
+      getCollapsedAccountLines(state, { now, showFallbacks: false }).map(
+        (line) => line.id,
+      ),
+    ).toEqual(['main', 'spare'])
+  })
+
+  test('vault mode lists only the vault accounts, in placement order', () => {
+    const state: SidebarState = {
+      ...base,
+      main: { quota: null, killed: false },
+      fallbacks: [],
+      activeId: 'vault:b',
+      vaultAccounts: [
+        fallback('vault:a', 30),
+        {
+          ...fallback('vault:b', 60),
+          credentialId: 'chatgpt:openai',
+        },
+      ],
+    }
+    const lines = getCollapsedAccountLines(state, { now })
+    expect(lines.map((line) => [line.id, line.active])).toEqual([
+      ['vault:b', true],
+      ['vault:a', false],
+    ])
+  })
+
+  test('a stale reading is marked stale and its narrow text carries no age', () => {
+    const [main] = getCollapsedAccountLines(
+      { ...base, main: { quota: quota(42, 3 * 60 * 60_000), killed: false } },
+      { now },
+    )
+    expect(main?.stale).toBe(true)
+    expect(main?.text).toBe('5h 58% · 7d 90% left')
+  })
+
+  test('labels are cut with an ellipsis to the room left, never past it', () => {
+    expect(fitCollapsedLabel('Spare', 5)).toBe('Spare')
+    expect(fitCollapsedLabel('Spare', 4)).toBe('Spa…')
+    expect(fitCollapsedLabel('Spare', 1)).toBe('…')
+    expect(fitCollapsedLabel('Spare', 0)).toBe('')
+    expect(fitCollapsedLabel('テスト名前', 5)).toBe('テス…')
+  })
+})
+
+describe('collapsed sidebar frame on OpenCode 1 and OpenCode 2', () => {
+  test('renders one line per account with whole quota text in a 42-column frame', async () => {
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        '--conditions=browser',
+        '--preload',
+        '@opentui/solid/runtime-plugin-support',
+        'src/tests/fixtures/collapsed-sidebar-render.ts',
+      ],
+      {
+        cwd: join(import.meta.dir, '..', '..'),
+        stdout: 'pipe',
+        stderr: 'pipe',
+      },
+    )
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: '' })
+    expect(stdout).toContain('collapsed-sidebar-render passed')
+  }, 30_000)
 })

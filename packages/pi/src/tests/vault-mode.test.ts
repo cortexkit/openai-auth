@@ -632,6 +632,62 @@ describe('Pi in vault mode', () => {
     }
   })
 
+  // A vault that lists no account says why when it reports Pi's grants. The
+  // menu's Vault section and the request refusal give the same fix.
+  for (const [name, grants, refusal, menuHint] of [
+    [
+      'no grant names the grant command for Pi',
+      [],
+      'Request refused locally: this host is connected to the credential vault, which has no grant letting it read OpenAI accounts, and local accounts are not used while it is connected. Disconnect this host from the vault, or grant it access with: ck auth grant --principal enrolled:openai-auth-pi --selector-kind category --selector openai-native --operation read',
+      'The vault has no grant letting openai-auth-pi read OpenAI accounts. Grant it with `ck auth grant --principal enrolled:openai-auth-pi --selector-kind category --selector openai-native --operation read`.',
+    ],
+    [
+      'a grant reaching no login names reclassify and status',
+      [
+        {
+          selector_kind: 'category',
+          selector: 'openai-native',
+          operation: 'read',
+        },
+      ],
+      VAULT_MODE_REFUSALS['vault-grant-unreached'],
+      "The vault's grant for openai-auth-pi reaches no ChatGPT login: no login has the `openai-native` category. `ck auth reclassify --from-registry` fills empty category sets from the vault's defaults; then check the CATEGORIES column with `ck auth status`.",
+    ],
+    [
+      'an older vault keeps the general texts',
+      undefined,
+      VAULT_MODE_REFUSALS['vault-empty'],
+      'No ChatGPT login in the vault has the `openai-native` category, or the grant is missing. Check `ck auth status` for categories and `ck auth grant` for the grant.',
+    ],
+  ] as const) {
+    test(`an empty vault: ${name}`, async () => {
+      daemon = await startMockDaemon({
+        directory: dir,
+        credentials: {},
+        grants: grants as MockDaemon['grants'],
+      })
+      const target = vault()
+      // The menu is only read here, so Pi's login needs no durable stash.
+      const slot = volatileSlot()
+      const runtime = runtimeWith(target, slot)
+      try {
+        enroll()
+        await target.refresh()
+
+        expect(errorOf(await send(runtime))).toBe(refusal)
+        const { menu } = await createPiMenu(runtime.commandSupport()).open({
+          notify() {},
+        })
+        expect(
+          menu.sections.find((section) => section.id === 'vault')?.lines,
+        ).toContain(menuHint)
+        expect(codexTokens).toEqual([])
+      } finally {
+        target.close()
+      }
+    })
+  }
+
   test('a vault that cannot be reached refuses the request locally after a bounded wait: nothing is sent, refreshed or polled', async () => {
     const target = vault({ connectScoped: () => new Promise(() => {}) })
     const runtime = runtimeWith(target)
