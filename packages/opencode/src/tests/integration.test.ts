@@ -3757,6 +3757,11 @@ describe('integration: active fallback routing', () => {
         'https://api.openai.com/v1/responses',
         responseRequestInit({ 'x-session-affinity': sessionId }),
       )
+      // The first request's sidebar write shows fallback-2 below its floor and
+      // prunes pins to it. Let it land before seeding the second session's pin,
+      // or it can erase that pin and the second request places fresh instead of
+      // migrating.
+      await drainSidebarWrites()
 
       const postResponseSession = 'post-response-migration-session'
       seedStickyBalancedAccounts()
