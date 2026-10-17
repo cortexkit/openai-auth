@@ -1829,9 +1829,9 @@ expect_red = ["^vault\\scommand\\smenu\\sCheck\\snow\\sin\\svault\\smode\\spolls
 
 [[control]]
 id = "menu-common-auth-release"
-guards = "all packages require the Windows private-file common-auth release, which also retains Pi-slot and replacement-slot menus"
+guards = "all packages require the common-auth release whose file leases always use wall time"
 file = "packages/core/package.json"
-old = '"@cortexkit/common-auth": "^0.17.2"'
+old = '"@cortexkit/common-auth": "^0.18.0"'
 new = '"@cortexkit/common-auth": "^0.14.2"'
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
