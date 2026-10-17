@@ -217,10 +217,13 @@ const hostView = (messages) => messages.flatMap((m) => {
 })
 let frames = 0
 export default { ...plugin, async setup(ctx) {
+  // With PROOF_HOST_FRAMES, a recorder registered before the plugin's own
+  // hooks keeps each frame as the host built it, and when the plugin got it.
+  const early = process.env.PROOF_HOST_FRAMES === '1' ? await ctx.session.hook('experimental.ws.send', (d) => rec('ws.send.host', { ...scope(d), frame: d.frame }), { providerID: 'openai' }) : undefined
   const dispose = await plugin.setup(ctx)
   const location = ctx.location?.directory
   rec('setup', { location })
-  const regs = []
+  const regs = early ? [early] : []
   const hook = async (name, fn) => regs.push(await ctx.session.hook(name, fn, { providerID: 'openai' }))
   // P6: the last owned primary HTTP request of each session, without a credential.
   const captures = new Map()
@@ -281,6 +284,7 @@ export default { ...plugin, async setup(ctx) {
       seen.turn = turns.n
       seen.replacement = frame
     }
+    if (process.env.PROOF_HOST_FRAMES === '1') seen.sent = frame
     rec('ws.send', seen)
     // Mirror: the full conversation the server now holds for this send.
     if (body?.type === 'response.create') {
@@ -411,6 +415,12 @@ export async function startProofHost(input: {
   accounts: MockAccount[]
   used?: Partial<Record<MockAccount, number>>
   rewrite?: boolean
+  /**
+   * Records each WebSocket frame as the host built it (`ws.send.host`, from
+   * a hook registered before the plugin's) and as it left the plugin
+   * (`sent` on `ws.send`).
+   */
+  hostFrames?: boolean
   thirdParty?: { bytes: number }
   pool?: boolean
   /** OpenCode 2's own `warming` setting, if the scenario turns it on. */
@@ -456,6 +466,7 @@ export async function startProofHost(input: {
   const env: Record<string, string> = {
     ...isolated,
     PROOF_REWRITE: input.rewrite ? '1' : '0',
+    PROOF_HOST_FRAMES: input.hostFrames ? '1' : '0',
     PROOF_POOL: input.pool ? '1' : '0',
     PROOF_CONFIG_DIR: configDir,
     PROOF_THIRD_PARTY: input.thirdParty ? '1' : '0',

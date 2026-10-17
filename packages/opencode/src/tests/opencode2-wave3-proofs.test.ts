@@ -8,6 +8,9 @@
 //   its frames (plus OpenCode 2's own `warming` setting, observed);
 // - P5: what the plugin knows about a WebSocket request's size before the
 //   handshake that picks its account.
+// It also checks, on the same host, the capability built on P1: the plugin
+// shapes every owned WebSocket frame as OpenCode 1 does, keeping the host's
+// input.
 // Runs only with OPENAI_AUTH_OPENCODE2_PROOFS=1, after `bun run build`, against
 // the pinned host fixture (install it as `opencode2-e2e.test.ts` describes).
 // Each test prints its evidence as `PROOF-EVIDENCE <name> <json>` lines.
@@ -17,6 +20,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { prepareCodexRequest } from '../codex-request'
 import { hostBinary } from './fixtures/opencode-host'
 import { installPackedPlugin } from './fixtures/opencode2-pack'
 import type { ProofRecord } from './fixtures/opencode2-proof-codex'
@@ -343,6 +347,200 @@ describe.skipIf(!ENABLED)('OpenCode 2 wave 3 proofs (real host)', () => {
     }
   }, 300_000)
 
+  test("WebSocket frame shaping: seven frames across a tool step, compaction, refusal and failover carry OpenCode 1's shape, the frame turns and the host's input", async () => {
+    const host = await startProofHost({
+      cli,
+      consumer,
+      transport: 'websocket',
+      accounts: ['A', 'B'],
+      used: { A: 5, B: 40 },
+      hostFrames: true,
+      compaction: { auto: false, keep: { tokens: 1 } },
+    })
+    try {
+      const steps: Record<string, unknown> = {}
+      const t1 = await host.turn('Turn 1: USE-TOOL read the readme.')
+      const sessionID = t1.sessionID ?? ''
+      steps.t1 = t1.exit
+      steps.t2 = (
+        await host.turn('Turn 2: say hello.', { continue: true })
+      ).exit
+      steps.compact = await compact(host, sessionID)
+      steps.t3 = (
+        await host.turn('Turn 3: after compaction.', { continue: true })
+      ).exit
+      host.mock.reject('A')
+      steps.t4 = (
+        await host.turn('Turn 4: the account fails over.', { continue: true })
+      ).exit
+      steps.t5 = (
+        await host.turn('Turn 5: after the failover.', { continue: true })
+      ).exit
+      const trace = host.trace()
+      const records = host.records()
+      const before = trace.filter((event) => event.hook === 'ws.send.host')
+      const after = trace.filter((event) => event.hook === 'ws.send')
+      const wire = records.filter((record) => record.action === 'frame')
+      const rows = after.map((send, index) => {
+        const hostText = before[index]?.frame as string
+        const sentText = send.sent as string
+        const sent = JSON.parse(sentText)
+        const metadata = JSON.parse(
+          sent.client_metadata['x-codex-turn-metadata'],
+        )
+        const context = trace
+          .filter(
+            (event) =>
+              event.hook === 'context' &&
+              event.sessionID === send.sessionID &&
+              event.seq < send.seq,
+          )
+          .at(-1)
+        return {
+          hostText,
+          sentText,
+          sent,
+          // The window in which the plugin had the frame: from the hook run
+          // before the plugin's to the one after it.
+          window: [before[index]?.at as number, send.at],
+          startMs: sent.client_metadata['x-codex-ws-stream-request-start-ms'],
+          turnID: metadata.turn_id as string,
+          turnStartedAt: metadata.turn_started_at_unix_ms as number,
+          record: wire[index],
+          host: (context?.view as string[] | undefined) ?? [],
+          provider: providerView(wire[index]?.conversation),
+        }
+      })
+      evidence('s10a.steps', steps)
+      evidence(
+        's10a.frames',
+        rows.map((row) => ({
+          window: row.window,
+          startMs: row.startMs,
+          turnID: row.turnID,
+          turnStartedAt: row.turnStartedAt,
+          connection: row.record?.connection,
+          identity: row.record?.identity,
+          previous: row.record?.previous ?? null,
+          outcome: row.record?.outcome,
+          keys: Object.keys(row.sent),
+        })),
+      )
+
+      expect(steps).toMatchObject({ t1: 0, t2: 0, t3: 0, t4: 0, t5: 0 })
+      expect(steps.compact).toMatchObject({ started: 200, waited: 204 })
+      expect(before.length).toBe(7)
+      expect(rows.length).toBe(7)
+      expect(wire.length).toBe(7)
+      // What the plugin left in each frame is what reached the server.
+      for (const row of rows) expect(row.record?.raw).toBe(row.sentText)
+      expect(rows.map((row) => row.record?.outcome)).toEqual([
+        'tool-call',
+        'text',
+        'text',
+        'text',
+        'usage-limit',
+        'text',
+        'text',
+      ])
+      expect(rows.map((row) => Boolean(row.sent.previous_response_id))).toEqual(
+        [false, true, true, false, true, false, true],
+      )
+      for (const row of rows) {
+        // The host's input, as the host meant it.
+        expect(JSON.stringify(row.sent.input)).toBe(
+          JSON.stringify(JSON.parse(row.hostText).input),
+        )
+        // OpenCode 1's WebSocket builder output for the same host body,
+        // turn and send time, byte for byte: key order and every field.
+        const { max_output_tokens: _cap, ...body } = JSON.parse(row.hostText)
+        const opencode1 = prepareCodexRequest({
+          init: { body: JSON.stringify(body) },
+          headers: new Headers(),
+          metadata: {
+            threadID: row.sent.prompt_cache_key,
+            windowID: row.sent.client_metadata['x-codex-window-id'],
+            turnID: row.turnID,
+            turnStartedAt: row.turnStartedAt,
+          },
+          installationID: row.sent.client_metadata['x-codex-installation-id'],
+          runtime: { now: () => Number(row.startMs), uuid: () => 'unused' },
+          websocket: true,
+          responsesLite: false,
+          rewriteLite: () => {},
+        })
+        expect(row.sentText).toBe(String(opencode1.init?.body))
+        expect(row.sent.prompt_cache_key).not.toBe(sessionID)
+        // The send time is a whole millisecond inside the frame's own window.
+        expect(row.startMs).toMatch(/^\d+$/)
+        expect(Number(row.startMs)).toBeGreaterThanOrEqual(row.window[0] ?? 0)
+        expect(Number(row.startMs)).toBeLessThanOrEqual(row.window[1] ?? 0)
+      }
+      // Turn ids move only with a new user message: not on the tool output,
+      // not on the failover resend; compaction and title leave them alone.
+      const order: string[] = []
+      for (const row of rows)
+        if (!order.includes(row.turnID)) order.push(row.turnID)
+      expect(rows.map((row) => order.indexOf(row.turnID) + 1)).toEqual([
+        1, 1, 2, 3, 4, 4, 5,
+      ])
+      // Each turn starts inside its first frame's window and keeps that start.
+      for (const row of rows) {
+        const first = rows.find((other) => other.turnID === row.turnID)
+        expect(Number.isInteger(row.turnStartedAt)).toBe(true)
+        expect(row.turnStartedAt).toBe(first?.turnStartedAt ?? -1)
+        expect(row.turnStartedAt).toBeGreaterThanOrEqual(first?.window[0] ?? 0)
+        expect(row.turnStartedAt).toBeLessThanOrEqual(first?.window[1] ?? 0)
+      }
+      // Each chained frame named the response before it on its socket, and
+      // the server never lost the chain.
+      for (const index of [1, 2, 4, 6]) {
+        expect(rows[index - 1]?.record?.responseID).toStartWith('resp_')
+        expect(rows[index]?.sent.previous_response_id).toBe(
+          rows[index - 1]?.record?.responseID,
+        )
+      }
+      expect(
+        records.filter(
+          (record) => record.outcome === 'previous_response_not_found',
+        ),
+      ).toEqual([])
+      // One socket per account, opened with one unchanged header set each.
+      expect(
+        records
+          .filter((record) => record.action === 'handshake')
+          .map((record) => [record.connection, record.identity]),
+      ).toEqual([
+        [1, 'A'],
+        [2, 'B'],
+      ])
+      expect(
+        rows.map((row) => `${row.record?.connection}${row.record?.identity}`),
+      ).toEqual(['1A', '1A', '1A', '1A', '1A', '2B', '2B'])
+      const hookHeaders = trace
+        .filter((event) => event.hook === 'ws.handshake')
+        .map((event) => JSON.stringify(event.headers))
+      expect(new Set(hookHeaders).size).toBe(2)
+      for (const headers of hookHeaders)
+        expect(headers).not.toContain('x-codex-turn-metadata')
+      // What the host meant to send is what the server holds, frame by frame.
+      for (const row of rows)
+        if (row.record?.outcome !== 'usage-limit')
+          expect(row.provider).toEqual(row.host)
+      // Title and compaction went over HTTP with HTTP shaping only.
+      expect(
+        trace
+          .filter((event) => event.hook === 'http.request')
+          .map((event) => event.kind),
+      ).toEqual(['title', 'compaction'])
+      expect(new Set(after.map((send) => send.kind))).toEqual(
+        new Set(['primary']),
+      )
+    } finally {
+      await host.stop()
+    }
+  }, 300_000)
+
   test('P1: an API-key session is not rewritten by the plugin', async () => {
     const key = 'sk-proof-user-key'
     const host = await startProofHost({
@@ -351,6 +549,7 @@ describe.skipIf(!ENABLED)('OpenCode 2 wave 3 proofs (real host)', () => {
       transport: 'websocket',
       accounts: ['A'],
       apiKey: key,
+      hostFrames: true,
     })
     try {
       const t1 = await host.turn('Turn 1: say hello.')
@@ -377,6 +576,12 @@ describe.skipIf(!ENABLED)('OpenCode 2 wave 3 proofs (real host)', () => {
       const sends = trace.filter((event) => event.hook === 'ws.send')
       expect(sends.length).toBe(2)
       for (const send of sends) expect(send.cacheKey).toBe(t1.sessionID)
+      // Each frame left the plugin byte for byte as the host built it.
+      const built = trace.filter((event) => event.hook === 'ws.send.host')
+      expect(built.length).toBe(2)
+      expect(sends.map((send) => send.sent)).toEqual(
+        built.map((event) => event.frame),
+      )
       // The key went out as the bearer, with no pool account or Codex identity.
       for (const event of trace.filter(
         (entry) => entry.hook === 'ws.handshake',
