@@ -140,8 +140,12 @@ async function start(enabled = true) {
   }
   function records() {
     if (!existsSync(dir)) return []
+    // readdir order is filesystem-specific (hash order on ext4). Dump names start
+    // with the creation time, pid and a per-process counter, so sorting them
+    // gives write order within this test's single process.
     return readdirSync(dir)
       .filter((name) => name.endsWith('.meta.json'))
+      .sort()
       .map((name) => {
         const prefix = join(dir, name.slice(0, -'.meta.json'.length))
         return {
