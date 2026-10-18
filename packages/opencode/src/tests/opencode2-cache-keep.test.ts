@@ -23,6 +23,7 @@ import {
   type CacheKeepLocation,
   type CacheKeepSettingsView,
 } from '../v2/cache-keep'
+import { FrameMirror } from '../v2/frame-mirror'
 import { setupOpenAIAuth } from '../v2/setup'
 import {
   fakeOpenCode2Host,
@@ -269,6 +270,27 @@ describe('OpenCode 2 keep-warm caps', () => {
     const options = spy.mock.calls[0]![0]
     expect(options.maxTargets).toBe(CACHE_KEEP_CAPS.maxTargets)
     expect(options.maxBytes).toBe(CACHE_KEEP_CAPS.maxBytes)
+  })
+
+  test('the OpenCode 2 manager effective caps equal the frame mirror caps', async () => {
+    const mirror = new FrameMirror()
+    const fake = fakeLocation()
+    const { lease } = acquire(fake.location)
+    for (let i = 0; i <= mirror.caps.maxTargets; i++)
+      await lease.capture(captured(`ses_${i}`))
+    expect(lease.manager.status().tracked).toBe(mirror.caps.maxTargets)
+    await lease.capture(
+      captured('too-large', { body: 'x'.repeat(mirror.caps.maxBytes + 1) }),
+    )
+    expect(
+      lease.manager.status().targets.some((t) => t.sessionKey === 'too-large'),
+    ).toBe(false)
+    await lease.capture(
+      captured('fits', { body: 'x'.repeat(mirror.caps.maxBytes) }),
+    )
+    expect(lease.manager.status().targets.map((t) => t.sessionKey)).toEqual([
+      'fits',
+    ])
   })
 
   test('the OpenCode 2 manager evicts the least recently used session past maxTargets', async () => {

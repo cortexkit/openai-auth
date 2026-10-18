@@ -104,6 +104,7 @@ import {
 import { acquireCodexSessions } from './codex-sessions'
 import { CodexHttpState } from './codex-wire'
 import { type ControlPlaneMenu, installControlPlane } from './control-plane'
+import { acquireFrameMirror, type FrameMirror } from './frame-mirror'
 import { opencode1HostSlot } from './host-slot'
 import {
   assertLocalPoolLogin,
@@ -219,6 +220,7 @@ async function installPoolHooks<Q, A>(
     request: Request
     attempt: Attempt<A>
   }) => Promise<void>,
+  mirror?: FrameMirror,
 ) {
   const dumps = new RequestDumps(log)
   // installOpenCode2Auth supplies an Attempt to the rewrite callbacks before it
@@ -294,6 +296,8 @@ async function installPoolHooks<Q, A>(
               const sent = draft as SessionHooks['experimental.ws.send']
               const socket = sockets.get(`${sent.sessionID}:${sent.kind}`)
               if (socket) await dumps.frame(sent.frame, socket.attempt)
+              if (socket && sent.kind === 'primary')
+                mirror?.send(sent.sessionID, sent.frame)
             }
             if (request || handshake) {
               const scope = request ?? handshake
@@ -331,6 +335,8 @@ async function installPoolHooks<Q, A>(
               if (socket) {
                 // Only an owned socket's frames move the frame turn state.
                 codex.frameReceived(received.sessionID, received.frame)
+                if (received.kind === 'primary')
+                  mirror?.receive(received.sessionID, received.frame)
                 received.frame = redactCredentialFrame(
                   received.frame,
                   socket.bearer,
@@ -639,6 +645,7 @@ export async function setupOpenAIAuth(
   // One keep-warm manager per process and account store; this location lends
   // it its own pool source, vault, settings and request capture.
   const cacheKeepSettings = cacheKeepSettingsOf(storage)
+  const mirror = acquireFrameMirror(paths())
   const cacheKeep = acquireCacheKeep(
     paths(),
     {
@@ -690,6 +697,7 @@ export async function setupOpenAIAuth(
     log,
     codex,
     (input: CacheKeepCaptureInput) => cacheKeep.capture(input),
+    mirror,
   )
   openai.attach(installation)
 
@@ -803,8 +811,8 @@ export async function setupOpenAIAuth(
         )
       : undefined
 
-  // A deleted session's pin, remembered account and keep-warm target go with
-  // it.
+  // A deleted session's pin, remembered account, mirror and keep-warm target
+  // go with it.
   const abort = new AbortController()
   void (async () => {
     try {
@@ -812,6 +820,7 @@ export async function setupOpenAIAuth(
         if (event.type === 'session.deleted') {
           openai.forgetSession(event.data.sessionID)
           cacheKeep.forget(event.data.sessionID)
+          mirror.forget(event.data.sessionID)
         }
       }
     } catch (error) {

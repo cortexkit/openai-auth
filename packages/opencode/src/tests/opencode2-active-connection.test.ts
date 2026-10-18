@@ -8,6 +8,7 @@ import {
   placeholderSecret,
 } from '@cortexkit/common-auth/opencode2'
 import type { Credential } from '@opencode/plugin'
+import { acquireFrameMirror } from '../v2/frame-mirror'
 import { POOL_BROWSER_METHOD } from '../v2/login'
 import { setupOpenAIAuth } from '../v2/setup'
 import {
@@ -169,6 +170,47 @@ async function expectUntouched(host: Host, token: string) {
 }
 
 describe('OpenCode 2 active connection gate', () => {
+  it('mirrors only owned primary frames and drops the mirror on session deletion', async () => {
+    const { host, files } = await start(poolCredential())
+    const mirror = acquireFrameMirror(files.paths())
+    const frame = JSON.stringify({
+      type: 'response.create',
+      model: 'gpt-5.5',
+      input: [{ role: 'user', content: 'hello' }],
+    })
+    const completed = JSON.stringify({
+      type: 'response.completed',
+      response: { id: 'r1' },
+    })
+    for (const [token, kind, expected] of [
+      ['sk-user-key', 'primary', false],
+      [PLACEHOLDER, 'title', false],
+      [PLACEHOLDER, 'primary', true],
+    ] as const) {
+      await host.fire('experimental.ws.handshake', {
+        ...scope(),
+        kind,
+        url: 'wss://api.openai.com/v1/responses',
+        headers: { authorization: `Bearer ${token}` },
+      })
+      const sent = { ...scope(), kind, frame }
+      await host.fire('experimental.ws.send', sent)
+      await host.fire('experimental.ws.receive', {
+        ...scope(),
+        kind,
+        frame: completed,
+      })
+      expect(mirror.replay(scope().sessionID) !== undefined).toBe(expected)
+      if (!expected) expect(mirror.status()).toEqual({ bytes: 0, sessions: [] })
+      if (expected)
+        expect(JSON.parse(mirror.replay(scope().sessionID)!).input).toEqual(
+          JSON.parse(sent.frame).input,
+        )
+    }
+    await host.publish('session.deleted', { sessionID: scope().sessionID })
+    expect(mirror.status()).toEqual({ bytes: 0, sessions: [] })
+  })
+
   it('leaves an active API key untouched and records no pool feedback', async () => {
     const { host, files, stop } = await start({
       type: 'key',

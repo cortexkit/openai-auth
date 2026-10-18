@@ -5537,3 +5537,146 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-c
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode 2 keep-warm in setup Cache menu settings reach the shared manager and captures in both live locations$']
+
+[[control]]
+id = "opencode2-mirror-session-byte-cap"
+guards = "an oversized mirror session is dropped without evicting other sessions, including pending input and unfinished output"
+file = "packages/opencode/src/v2/frame-mirror.ts"
+old = "    if (bytes > this.caps.maxBytes) return false"
+new = "    if (false) return false // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-frame-mirror.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 frame mirror per-session byte cap drops oversized full frames, pending deltas and completed output$']
+
+[[control]]
+id = "opencode2-mirror-total-byte-cap"
+guards = "head and pending mirror bytes across all sessions stay within the shared manager byte budget"
+file = "packages/opencode/src/v2/frame-mirror.ts"
+old = "      this.bytes > this.caps.maxBytes"
+new = "      false // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-frame-mirror.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 frame mirror total byte cap evicts the least recently used session including pending sends$']
+
+[[control]]
+id = "opencode2-mirror-session-count-cap"
+guards = "the mirror retains at most the shared manager session count, evicting the least recently used session"
+file = "packages/opencode/src/v2/frame-mirror.ts"
+old = "      this.entries.size > this.caps.maxTargets ||"
+new = "      false || // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-frame-mirror.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 frame mirror session count cap is LRU and keeps only one head and one pending send$']
+
+[[control]]
+id = "opencode2-mirror-counts-unfinished-output"
+guards = "the mirror accounts for unfinished output as well as its completed head and pending input"
+file = "packages/opencode/src/v2/frame-mirror.ts"
+old = "      JSON.stringify({ head: entry.head, pending: entry.pending }),"
+new = "      JSON.stringify({ head: entry.head, pending: entry.pending && { ...entry.pending, output: [] } }), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-frame-mirror.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 frame mirror completed head plus pending input and unfinished output share the byte budget$']
+
+[[control]]
+id = "opencode2-mirror-lru-replay"
+guards = "reading a completed mirror head marks that session as recently used for eviction"
+file = "packages/opencode/src/v2/frame-mirror.ts"
+old = "    this.entries.delete(sessionID)\n    this.entries.set(sessionID, entry)"
+new = "    // NON-VACUITY BREAK: leave an existing key in its old position\n    this.entries.set(sessionID, entry)"
+test_file = "packages/opencode/src/tests/opencode2-frame-mirror.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 frame mirror total byte cap evicts the least recently used session including pending sends$']
+
+[[control]]
+id = "opencode2-mirror-unavailable-baseline"
+guards = "a delta naming anything other than the completed head drops the baseline and stores nothing until a full frame"
+file = "packages/opencode/src/v2/frame-mirror.ts"
+old = "    if (previous && previous !== head?.responseID) {"
+new = "    if (false) { // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-frame-mirror.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 frame mirror an unavailable baseline stores no delta or output until a full frame recovers$']
+
+[[control]]
+id = "opencode2-mirror-full-frame-reset"
+guards = "a full frame replaces the old chain after compaction, failover or a new socket"
+file = "packages/opencode/src/v2/frame-mirror.ts"
+old = "      ...(previous && head ? { head } : {}),"
+new = "      ...(head ? { head } : {}), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-frame-mirror.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 frame mirror rebuilds tool, compaction, failover and new-socket resends with encrypted output intact$']
+
+[[control]]
+id = "opencode2-mirror-completion-consumes-pending"
+guards = "each completed response captures exactly once, even when the server repeats a completed event"
+file = "packages/opencode/src/v2/frame-mirror.ts"
+old = "      if (!this.keep(sessionID, { head, bytes: 0 })) return"
+new = "      if (!this.keep(sessionID, { head, pending, bytes: 0 })) return // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-frame-mirror.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 frame mirror tracks exactly once per completed response and ignores unrelated or duplicate events$']
+
+[[control]]
+id = "opencode2-mirror-keeps-encrypted-output"
+guards = "the completed mirror includes all output_item.done items including encrypted reasoning unchanged"
+file = "packages/opencode/src/v2/frame-mirror.ts"
+old = "          ...pending.output,"
+new = "          ...pending.output.filter((item: any) => item.type !== 'reasoning'), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-frame-mirror.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 frame mirror rebuilds tool, compaction, failover and new-socket resends with encrypted output intact$']
+
+[[control]]
+id = "opencode2-mirror-session-deleted"
+guards = "the host session.deleted event drops the process-wide frame mirror entry"
+file = "packages/opencode/src/v2/setup.ts"
+old = "          mirror.forget(event.data.sessionID)"
+new = "          void event.data.sessionID // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-active-connection.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-active-connection.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-active-connection.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 active connection gate mirrors only owned primary frames and drops the mirror on session deletion$']
+
+[[control]]
+id = "opencode2-mirror-owned-primary-only"
+guards = "the mirror observes only owned primary WebSocket frames, never API keys or side kinds"
+file = "packages/opencode/src/v2/setup.ts"
+old = "              if (socket && sent.kind === 'primary')"
+new = "              if (true) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-active-connection.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-active-connection.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-active-connection.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 active connection gate mirrors only owned primary frames and drops the mirror on session deletion$']

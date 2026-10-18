@@ -366,6 +366,11 @@ export default { ...plugin, async setup(ctx) {
         rec('replay-result', { sessionID, status: response.status, completed })
         return reply(200, { status: response.status, completed, row: access.row, cacheKey: body.prompt_cache_key, headers: Object.keys(capture.headers) })
       }
+      if (url.pathname === '/frame-mirror') {
+        const registry = globalThis[Symbol.for('@cortexkit/openai-auth/opencode2-frame-mirror')]
+        const bodies = [...(registry?.values() ?? [])].map(mirror => mirror.replay(sessionID)).filter(body => body !== undefined)
+        return bodies.length === 1 ? reply(200, { body: JSON.parse(bodies[0]) }) : reply(404, { error: 'no unique mirror head' })
+      }
       if (url.pathname === '/replay-ws') {
         const mirror = mirrors.get(sessionID)
         const last = mirror?.last
