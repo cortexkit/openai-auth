@@ -1,4 +1,5 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
+import { Buffer } from 'node:buffer'
 import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import { CACHE_KEEP_CAPS } from '../core/cachekeep'
@@ -45,8 +46,107 @@ function replay(mirror: FrameMirror, sessionID = 'ses') {
 }
 
 describe('OpenCode 2 frame mirror', () => {
-  test('rebuilds tool, compaction, failover and new-socket resends with encrypted output intact', () => {
+  test('disabled mirroring does no JSON work and enabling recovers only at a full frame', () => {
     const mirror = new FrameMirror()
+    const frames = [
+      full([user('x'.repeat(2 * 1024 * 1024))]),
+      delta('old', [user('delta')]),
+    ]
+    const events = [
+      JSON.stringify({ type: 'response.created', response: { id: 'old' } }),
+      JSON.stringify({
+        type: 'response.output_item.done',
+        item: text('answer'),
+      }),
+      JSON.stringify({ type: 'response.completed', response: { id: 'old' } }),
+    ]
+    const parse = spyOn(JSON, 'parse')
+    const stringify = spyOn(JSON, 'stringify')
+    try {
+      for (let i = 0; i < 50; i++) {
+        mirror.send('ses', frames[i % 2]!)
+        for (const frame of events) mirror.receive('ses', frame)
+      }
+      expect(parse).not.toHaveBeenCalled()
+      expect(stringify).not.toHaveBeenCalled()
+    } finally {
+      parse.mockRestore()
+      stringify.mockRestore()
+    }
+    mirror.setEnabled(true)
+    mirror.send('ses', frames[1]!)
+    complete(mirror, 'ses', 'delta')
+    expect(replay(mirror)).toBeUndefined()
+    mirror.send('ses', frames[0]!)
+    complete(mirror, 'ses', 'full')
+    expect(replay(mirror)).toBeDefined()
+    mirror.send('pending', full([user('also clear pending')]))
+    mirror.setEnabled(false)
+    expect(mirror.status()).toEqual({ bytes: 0, sessions: [] })
+    mirror.setEnabled(true)
+    mirror.send('ses', delta('full', [user('no old baseline')]))
+    complete(mirror, 'ses', 'lost')
+    expect(replay(mirror)).toBeUndefined()
+  })
+
+  test('fifty output items never serialize the two MiB head and deltas are never parsed', () => {
+    const mirror = new FrameMirror(true)
+    mirror.send('ses', full([user('x'.repeat(2 * 1024 * 1024))]))
+    complete(mirror, 'ses', 'r1')
+    const sent = delta('r1', [user('next')])
+    const created = JSON.stringify({
+      type: 'response.created',
+      response: { id: 'r2' },
+    })
+    const output = Array.from({ length: 50 }, (_, i) =>
+      JSON.stringify({
+        type: 'response.output_item.done',
+        item: text(`item-${i}`),
+      }),
+    )
+    const completed = JSON.stringify({
+      type: 'response.completed',
+      response: { id: 'r2' },
+    })
+    const deltaFrame = JSON.stringify({
+      type: 'response.output_text.delta',
+      delta: 'tokens',
+    })
+    const stringify = JSON.stringify
+    const lengths: number[] = []
+    const spy = spyOn(JSON, 'stringify').mockImplementation(((
+      ...args: Parameters<typeof JSON.stringify>
+    ) => {
+      const value = stringify(...args)
+      lengths.push(value?.length ?? 0)
+      return value
+    }) as typeof JSON.stringify)
+    try {
+      mirror.send('ses', sent)
+      mirror.receive('ses', created)
+      for (const frame of output) mirror.receive('ses', frame)
+      mirror.receive('ses', completed)
+      expect(lengths.length).toBeGreaterThanOrEqual(50)
+      expect(Math.max(...lengths)).toBeLessThan(1024)
+      expect(lengths.reduce((sum, value) => sum + value, 0)).toBeLessThan(
+        10_000,
+      )
+    } finally {
+      spy.mockRestore()
+    }
+    mirror.send('ses', delta('r2', []))
+    const parse = spyOn(JSON, 'parse')
+    try {
+      for (let i = 0; i < 50; i++) mirror.receive('ses', deltaFrame)
+      expect(parse).not.toHaveBeenCalled()
+    } finally {
+      parse.mockRestore()
+    }
+    expect(replay(mirror)?.input).toHaveLength(52)
+  })
+
+  test('rebuilds tool, compaction, failover and new-socket resends with encrypted output intact', () => {
+    const mirror = new FrameMirror(true)
     const tracked: FrameMirrorCapture[] = []
     const track = (capture: FrameMirrorCapture) => tracked.push(capture)
     const reasoning = {
@@ -122,7 +222,7 @@ describe('OpenCode 2 frame mirror', () => {
   })
 
   test('tracks exactly once per completed response and ignores unrelated or duplicate events', () => {
-    const mirror = new FrameMirror()
+    const mirror = new FrameMirror(true)
     const tracked: FrameMirrorCapture[] = []
     const track = (capture: FrameMirrorCapture) => tracked.push(capture)
     mirror.send('ses', full([user('hello')]))
@@ -151,7 +251,7 @@ describe('OpenCode 2 frame mirror', () => {
   })
 
   test('an unavailable baseline stores no delta or output until a full frame recovers', () => {
-    const mirror = new FrameMirror()
+    const mirror = new FrameMirror(true)
     const tracked: FrameMirrorCapture[] = []
     const track = (capture: FrameMirrorCapture) => tracked.push(capture)
     mirror.send('ses', full([user('old')]))
@@ -172,7 +272,7 @@ describe('OpenCode 2 frame mirror', () => {
   })
 
   test('response ids keep stale output and completion out of the pending send', () => {
-    const mirror = new FrameMirror()
+    const mirror = new FrameMirror(true)
     const tracked: FrameMirrorCapture[] = []
     const track = (capture: FrameMirrorCapture) => tracked.push(capture)
     mirror.send('ses', full([user('hello')]))
@@ -197,7 +297,7 @@ describe('OpenCode 2 frame mirror', () => {
   })
 
   test('completed head plus pending input and unfinished output share the byte budget', () => {
-    const mirror = new FrameMirror()
+    const mirror = new FrameMirror(true)
     const tracked: FrameMirrorCapture[] = []
     const chunk = 'x'.repeat(Math.floor(CACHE_KEEP_CAPS.maxBytes / 4))
     mirror.send('ses', full([user(chunk)]))
@@ -218,7 +318,7 @@ describe('OpenCode 2 frame mirror', () => {
   })
 
   test('per-session byte cap drops oversized full frames, pending deltas and completed output', () => {
-    const mirror = new FrameMirror()
+    const mirror = new FrameMirror(true)
     const huge = user('密'.repeat(Math.ceil(CACHE_KEEP_CAPS.maxBytes / 3)))
     mirror.send('safe', full([user('safe')]))
     complete(mirror, 'safe', 'safe')
@@ -236,7 +336,7 @@ describe('OpenCode 2 frame mirror', () => {
   })
 
   test('total byte cap evicts the least recently used session including pending sends', () => {
-    const mirror = new FrameMirror()
+    const mirror = new FrameMirror(true)
     const chunk = user('x'.repeat(Math.floor(CACHE_KEEP_CAPS.maxBytes / 3)))
     for (const id of ['old', 'recent']) {
       mirror.send(id, full([chunk]))
@@ -253,7 +353,7 @@ describe('OpenCode 2 frame mirror', () => {
   })
 
   test('session count cap is LRU and keeps only one head and one pending send', () => {
-    const mirror = new FrameMirror()
+    const mirror = new FrameMirror(true)
     for (let i = 0; i < CACHE_KEEP_CAPS.maxTargets; i++) {
       mirror.send(String(i), full([user('first')]))
       complete(mirror, String(i), `r${i}`)
@@ -276,6 +376,7 @@ describe('OpenCode 2 frame mirror', () => {
     const root = `.frame-mirror-${randomUUID()}`
     const paths = { configPath: `${root}/c.json`, statePath: `${root}/s.json` }
     const mirror = acquireFrameMirror(paths)
+    mirror.setEnabled(true)
     const same = acquireFrameMirror({
       configPath: resolve(paths.configPath),
       statePath: resolve(paths.statePath),
@@ -289,5 +390,69 @@ describe('OpenCode 2 frame mirror', () => {
     expect(replay(mirror)?.input).toEqual([user('shared')])
     same.forget('ses')
     expect(replay(mirror)).toBeUndefined()
+  })
+
+  test('incremental bytes equal serialized payload bytes through every state transition and the exact cap boundary', () => {
+    const mirror = new FrameMirror(true)
+    const fields = { model: 'gpt-5.5', instructions: '密\\"' }
+    const input = [user('雪'), user('escaped\\"')]
+    const output = [
+      text('🙂'),
+      { type: 'reasoning', encrypted_content: '密文' },
+    ]
+    const size = (value: unknown) => Buffer.byteLength(JSON.stringify(value))
+    mirror.send('ses', full(input, fields))
+    expect(mirror.status().bytes).toBe(
+      size({ fields, pending: { input, output: [] } }),
+    )
+    mirror.receive(
+      'ses',
+      JSON.stringify({ type: 'response.created', response: { id: 'r密' } }),
+    )
+    expect(mirror.status().bytes).toBe(
+      size({ fields, pending: { input, output: [], responseID: 'r密' } }),
+    )
+    for (const item of output)
+      mirror.receive(
+        'ses',
+        JSON.stringify({ type: 'response.output_item.done', item }),
+      )
+    expect(mirror.status().bytes).toBe(
+      size({ fields, pending: { input, output, responseID: 'r密' } }),
+    )
+    complete(mirror, 'ses', 'r密')
+    const head = { responseID: 'r密', input: [...input, ...output] }
+    expect(mirror.status().bytes).toBe(size({ fields, head }))
+    const added = [user('next')]
+    mirror.send('ses', delta('r密', added))
+    expect(mirror.status().bytes).toBe(
+      size({ fields, head, pending: { input: added, output: [] } }),
+    )
+    complete(mirror, 'ses', 'next')
+    expect(mirror.status().bytes).toBe(
+      size({
+        fields,
+        head: { responseID: 'next', input: [...head.input, ...added] },
+      }),
+    )
+    mirror.forget('ses')
+    expect(mirror.status().bytes).toBe(0)
+
+    const overhead = size({
+      fields: { model: 'gpt-5.5' },
+      pending: { input: [user('')], output: [] },
+    })
+    mirror.send(
+      'fits',
+      full([user('x'.repeat(mirror.caps.maxBytes - overhead))]),
+    )
+    expect(mirror.status().bytes).toBe(mirror.caps.maxBytes)
+    expect(mirror.status().sessions).toHaveLength(1)
+    mirror.forget('fits')
+    mirror.send(
+      'over',
+      full([user('x'.repeat(mirror.caps.maxBytes - overhead + 1))]),
+    )
+    expect(mirror.status()).toEqual({ bytes: 0, sessions: [] })
   })
 })

@@ -5581,8 +5581,8 @@ expect_red = ['^OpenCode 2 frame mirror session count cap is LRU and keeps only 
 id = "opencode2-mirror-counts-unfinished-output"
 guards = "the mirror accounts for unfinished output as well as its completed head and pending input"
 file = "packages/opencode/src/v2/frame-mirror.ts"
-old = "      JSON.stringify({ head: entry.head, pending: entry.pending }),"
-new = "      JSON.stringify({ head: entry.head, pending: entry.pending && { ...entry.pending, output: [] } }), // NON-VACUITY BREAK"
+old = "      pending.outputBytes += jsonBytes(event.item)"
+new = "      pending.outputBytes += 0 // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/opencode2-frame-mirror.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
@@ -5633,8 +5633,8 @@ expect_red = ['^OpenCode 2 frame mirror rebuilds tool, compaction, failover and 
 id = "opencode2-mirror-completion-consumes-pending"
 guards = "each completed response captures exactly once, even when the server repeats a completed event"
 file = "packages/opencode/src/v2/frame-mirror.ts"
-old = "      if (!this.keep(sessionID, { head, bytes: 0 })) return"
-new = "      if (!this.keep(sessionID, { head, pending, bytes: 0 })) return // NON-VACUITY BREAK"
+old = "      const completed = { ...entry, head, pending: undefined }"
+new = "      const completed = { ...entry, head, pending } // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/opencode2-frame-mirror.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
@@ -5680,3 +5680,68 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-a
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-active-connection.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode 2 active connection gate mirrors only owned primary frames and drops the mirror on session deletion$']
+
+[[control]]
+id = "opencode2-mirror-disabled-json-gate"
+guards = "disabled keep-warm returns from mirror sends before parsing or serializing any long-session frame"
+file = "packages/opencode/src/v2/frame-mirror.ts"
+old = "    if (!this.enabled) return"
+new = "    // NON-VACUITY BREAK: parse even while keep-warm is off"
+test_file = "packages/opencode/src/tests/opencode2-frame-mirror.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 frame mirror disabled mirroring does no JSON work and enabling recovers only at a full frame$']
+
+[[control]]
+id = "opencode2-mirror-disable-clears-all"
+guards = "turning keep-warm off immediately removes every completed and pending mirror baseline"
+file = "packages/opencode/src/v2/frame-mirror.ts"
+old = "      this.entries.clear()"
+new = "      // NON-VACUITY BREAK: retain disabled session payloads"
+test_file = "packages/opencode/src/tests/opencode2-frame-mirror.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 frame mirror disabled mirroring does no JSON work and enabling recovers only at a full frame$']
+
+[[control]]
+id = "opencode2-mirror-shared-settings-gate"
+guards = "the store-scoped Cache menu setting controls the shared mirror and disabling clears other locations' baselines"
+file = "packages/opencode/src/v2/cache-keep.ts"
+old = "      mirror.setEnabled(owned.settings.enabled)"
+new = "      void owned.settings.enabled // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 keep-warm in setup Cache menu settings reach the shared manager and captures in both live locations$']
+
+[[control]]
+id = "opencode2-mirror-receive-prefilter"
+guards = "streamed delta frames bypass mirror JSON parsing on an active long session"
+file = "packages/opencode/src/v2/frame-mirror.ts"
+old = "      (!frame.includes('response.created') &&"
+new = "      (false && // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-frame-mirror.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 frame mirror fifty output items never serialize the two MiB head and deltas are never parsed$']
+
+[[control]]
+id = "opencode2-mirror-incremental-accounting"
+guards = "output items update cached byte sums without reserializing the completed conversation head"
+file = "packages/opencode/src/v2/frame-mirror.ts"
+old = "    const bytes = entryBytes(entry)"
+new = "    const bytes = jsonBytes({ fields: entry.fields, head: entry.head, pending: entry.pending }) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-frame-mirror.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 frame mirror fifty output items never serialize the two MiB head and deltas are never parsed$']

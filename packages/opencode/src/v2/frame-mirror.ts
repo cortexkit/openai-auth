@@ -11,14 +11,68 @@ export interface FrameMirrorCapture {
 }
 
 type Fields = Record<string, unknown>
-type Head = { responseID: string; fields: Fields; input: unknown[] }
-type Pending = {
-  fields: Fields
+type Head = {
+  responseID: string
+  responseIDBytes: number
   input: unknown[]
-  output: unknown[]
-  responseID?: string
+  inputBytes: number
 }
-type Entry = { head?: Head; pending?: Pending; bytes: number }
+type Pending = {
+  input: unknown[]
+  inputBytes: number
+  output: unknown[]
+  outputBytes: number
+  responseID?: string
+  responseIDBytes: number
+}
+type Entry = {
+  fields: Fields
+  fieldsBytes: number
+  head?: Head
+  pending?: Pending
+  bytes: number
+}
+
+function jsonBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value))
+}
+
+/** Item sums exclude array punctuation, which is derived from the item count. */
+function inputBytes(items: unknown[]): number {
+  return items.reduce<number>((bytes, item) => bytes + jsonBytes(item), 0)
+}
+
+function arrayBytes(bytes: number, count: number): number {
+  return 2 + bytes + Math.max(0, count - 1)
+}
+
+/** Exact JSON size of the retained payload, excluding cached byte counters. */
+function entryBytes(entry: Entry): number {
+  const head = entry.head
+  const pending = entry.pending
+  return (
+    '{"fields":'.length +
+    entry.fieldsBytes +
+    '}'.length +
+    (head
+      ? ',"head":{"responseID":'.length +
+        head.responseIDBytes +
+        ',"input":'.length +
+        arrayBytes(head.inputBytes, head.input.length) +
+        '}'.length
+      : 0) +
+    (pending
+      ? ',"pending":{"input":'.length +
+        arrayBytes(pending.inputBytes, pending.input.length) +
+        ',"output":'.length +
+        arrayBytes(pending.outputBytes, pending.output.length) +
+        (pending.responseID === undefined
+          ? 0
+          : ',"responseID":'.length + pending.responseIDBytes) +
+        '}'.length
+      : 0)
+  )
+}
 
 function object(text: string): Fields | undefined {
   try {
@@ -40,8 +94,20 @@ export class FrameMirror {
   private readonly entries = new Map<string, Entry>()
   private bytes = 0
 
+  constructor(private enabled = false) {}
+
+  /** Disabling discards every baseline; re-enabling waits for a new full frame. */
+  setEnabled(enabled: boolean): void {
+    this.enabled = enabled
+    if (!enabled) {
+      this.entries.clear()
+      this.bytes = 0
+    }
+  }
+
   /** Records the final response.create bytes, without changing the host frame. */
   send(sessionID: string, frame: string): void {
+    if (!this.enabled) return
     const body = object(frame)
     if (body?.type !== 'response.create') return
     if (!Array.isArray(body.input)) {
@@ -49,7 +115,8 @@ export class FrameMirror {
       return
     }
     const previous = body.previous_response_id
-    const head = this.entries.get(sessionID)?.head
+    const prior = this.entries.get(sessionID)
+    const head = prior?.head
     if (previous && previous !== head?.responseID) {
       // Retaining this delta would turn a partial prompt into a full replay.
       this.forget(sessionID)
@@ -62,11 +129,15 @@ export class FrameMirror {
       ...fields
     } = body
     this.keep(sessionID, {
+      fields: previous && prior ? prior.fields : fields,
+      fieldsBytes: previous && prior ? prior.fieldsBytes : jsonBytes(fields),
       ...(previous && head ? { head } : {}),
       pending: {
-        fields: previous && head ? head.fields : fields,
         input: input as unknown[],
+        inputBytes: inputBytes(input as unknown[]),
         output: [],
+        outputBytes: 0,
+        responseIDBytes: 0,
       },
       bytes: 0,
     })
@@ -83,6 +154,13 @@ export class FrameMirror {
     frame: string,
     track?: (capture: FrameMirrorCapture) => void,
   ): void {
+    if (
+      !this.enabled ||
+      (!frame.includes('response.created') &&
+        !frame.includes('response.output_item.done') &&
+        !frame.includes('response.completed'))
+    )
+      return
     const entry = this.entries.get(sessionID)
     if (!entry?.pending) return
     const event = object(frame)
@@ -91,6 +169,7 @@ export class FrameMirror {
     const response = event.response as Fields | undefined
     if (event.type === 'response.created' && typeof response?.id === 'string') {
       pending.responseID = response.id
+      pending.responseIDBytes = jsonBytes(response.id)
       this.keep(sessionID, entry)
     } else if (event.type === 'response.output_item.done' && event.item) {
       if (
@@ -100,6 +179,7 @@ export class FrameMirror {
       )
         return
       pending.output.push(event.item)
+      pending.outputBytes += jsonBytes(event.item)
       this.keep(sessionID, entry)
     } else if (
       event.type === 'response.completed' &&
@@ -112,18 +192,26 @@ export class FrameMirror {
         return
       const head: Head = {
         responseID: response.id,
-        fields: pending.fields,
+        responseIDBytes:
+          pending.responseID === response.id
+            ? pending.responseIDBytes
+            : jsonBytes(response.id),
         input: [
           ...(entry.head?.input ?? []),
           ...pending.input,
           ...pending.output,
         ],
+        inputBytes:
+          (entry.head?.inputBytes ?? 0) +
+          pending.inputBytes +
+          pending.outputBytes,
       }
-      if (!this.keep(sessionID, { head, bytes: 0 })) return
+      const completed = { ...entry, head, pending: undefined }
+      if (!this.keep(sessionID, completed)) return
       track?.({
         sessionID,
         responseID: head.responseID,
-        bodyText: this.body(head),
+        bodyText: this.body(entry.fields, head),
       })
     }
   }
@@ -134,7 +222,7 @@ export class FrameMirror {
     if (!entry?.head) return undefined
     this.entries.delete(sessionID)
     this.entries.set(sessionID, entry)
-    return this.body(entry.head)
+    return this.body(entry.fields, entry.head)
   }
 
   forget(sessionID: string): void {
@@ -156,16 +244,14 @@ export class FrameMirror {
     }
   }
 
-  private body(head: Head): string {
-    return JSON.stringify({ ...head.fields, input: head.input, stream: true })
+  private body(fields: Fields, head: Head): string {
+    return JSON.stringify({ ...fields, input: head.input, stream: true })
   }
 
   private keep(sessionID: string, entry: Entry): boolean {
     // Count both head and pending, including unfinished output. A single
     // session cannot retain more bytes than the entire store's byte budget.
-    const bytes = Buffer.byteLength(
-      JSON.stringify({ head: entry.head, pending: entry.pending }),
-    )
+    const bytes = entryBytes(entry)
     this.forget(sessionID)
     if (bytes > this.caps.maxBytes) return false
     entry.bytes = bytes

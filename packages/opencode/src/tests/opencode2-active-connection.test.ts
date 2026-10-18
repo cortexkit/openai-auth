@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test'
-import { readFileSync, rmSync } from 'node:fs'
+import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   isPlaceholderCredential,
@@ -35,9 +35,15 @@ async function start(
   credential: Credential.Value,
   rows = [{ id: 'main' }],
   methods: RegisteredMethod[] = [],
+  keepWarm = false,
 ) {
   const files = poolFiles()
   seedPool(files, 'main-first', rows)
+  if (keepWarm) {
+    const config = files.readConfig()
+    Object.assign(config, { cacheKeep: { enabled: true } })
+    writeFileSync(files.configPath, JSON.stringify(config))
+  }
   const before = {
     config: readFileSync(files.configPath, 'utf8'),
     state: readFileSync(files.statePath, 'utf8'),
@@ -171,7 +177,12 @@ async function expectUntouched(host: Host, token: string) {
 
 describe('OpenCode 2 active connection gate', () => {
   it('mirrors only owned primary frames and drops the mirror on session deletion', async () => {
-    const { host, files } = await start(poolCredential())
+    const { host, files } = await start(
+      poolCredential(),
+      undefined,
+      undefined,
+      true,
+    )
     const mirror = acquireFrameMirror(files.paths())
     const frame = JSON.stringify({
       type: 'response.create',
