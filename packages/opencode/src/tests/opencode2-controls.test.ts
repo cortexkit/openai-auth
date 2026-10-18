@@ -563,8 +563,12 @@ for (const enrolled of [false, true]) {
         ]
           .filter(
             (actionId) =>
-              sectionId !== 'diagnostics' ||
-              !['logging', 'dump'].includes(actionId),
+              (sectionId !== 'diagnostics' ||
+                !['logging', 'dump'].includes(actionId)) &&
+              (sectionId !== 'cache' ||
+                !['enabled', 'subagents', 'sustain', 'window'].includes(
+                  actionId,
+                )),
           )
           .map((actionId) => ({ sectionId, actionId })),
       ),

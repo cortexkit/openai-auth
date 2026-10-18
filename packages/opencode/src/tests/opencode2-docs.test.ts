@@ -21,7 +21,7 @@ test('OpenCode 2 docs offer log level changes and request dumps with their warni
   expect(unavailable).toContain(
     'vault enrollment and per-host account controls',
   )
-  expect(unavailable).toContain('cache keep-warm')
+  expect(unavailable).toContain('HTTP keep-warm is available')
   for (const passage of [menu, unavailable])
     expect(passage).not.toMatch(
       /\.ts\b|allowed\(|unavailableSections|hook|test/,
@@ -50,7 +50,7 @@ test('OpenCode 2 docs describe the HTTP and WebSocket request shapes as availabl
   expect(socket).toContain('A tool step stays in its turn')
   expect(socket).toContain('exactly as OpenCode 2 built it')
   expect(socket).toContain('one WebSocket per account')
-  expect(unavailable).not.toContain('WebSocket')
+  expect(unavailable).not.toContain('WebSocket request shape')
   expect(unavailable).not.toContain('conversation headers')
   expect(unavailable).not.toContain('tool formatting')
   for (const passage of [shape, socket, unavailable]) {
@@ -81,14 +81,13 @@ test('OpenCode 2 docs offer reset-credit preview and confirmed redemption, and n
   expect(menu).toContain('and spends nothing')
   expect(menu).toContain('spent only after you confirm it')
   expect(vault).toContain('Reset credits works only with local accounts')
-  expect(vault).toContain('Cache shows "Not available on OpenCode 2 yet."')
+  expect(vault).toContain('Cache shows the tracked HTTP sessions')
   expect(unavailable).not.toMatch(/reset.credit|redemption/i)
-  // Vault enrollment, per-host vault account controls and keep-warm are
-  // still listed as not on OpenCode 2.
+  // Vault enrollment and per-host vault account controls remain unavailable.
   expect(unavailable).toContain(
     'vault enrollment and per-host account controls',
   )
-  expect(unavailable).toContain('cache keep-warm')
+  expect(unavailable).toContain('HTTP keep-warm is available')
   for (const passage of [menu, unavailable]) {
     expect(passage).not.toMatch(
       /\.ts\b|\.json\b|allowed\(|unavailableSections|hook|test/,
@@ -98,4 +97,29 @@ test('OpenCode 2 docs offer reset-credit preview and confirmed redemption, and n
       if (/reset credit/i.test(sentence))
         expect(sentence).not.toMatch(/not available|not implemented/i)
   }
+})
+
+test('OpenCode 2 docs explain count placement and the two warmers without promising WebSocket warming', () => {
+  const doc = readFileSync(
+    new URL('../../../../docs/opencode-2.md', import.meta.url),
+    'utf8',
+  )
+  const cache = readFileSync(
+    new URL('../../../../docs/cache-keep-warm.md', import.meta.url),
+    'utf8',
+  )
+  expect(doc).toContain('session count, not request size')
+  expect(doc).toContain('on both HTTP and WebSocket')
+  expect(doc).toContain('before the request exists')
+  expect(doc).toContain('Cache, Diagnostics')
+  for (const text of [doc, cache]) {
+    expect(text).toContain("plugin's warming is invisible")
+    expect(text).toContain('Both can be on')
+    expect(text).toContain(
+      "If you turn off OpenCode's warming, the plugin waits for the session's next real request before warming it again.",
+    )
+    expect(text).toContain('keep-alive message')
+    expect(text).toContain('WebSocket')
+  }
+  expect(cache).toContain('WebSocket sessions are not warmed by the plugin yet')
 })

@@ -4263,8 +4263,8 @@ expect_red = ['^OpenCode 2 rejects all non-control engine rows in local mode$']
 id = "opencode2-diagnostics-visible"
 guards = "Diagnostics exposes the shared section once log level changes are available"
 file = "packages/opencode/src/v2/menu.ts"
-old = "    unavailableSections: ['cache'],"
-new = "    unavailableSections: ['cache', 'diagnostics'], // NON-VACUITY BREAK"
+old = "    unavailableSections: [],"
+new = "    unavailableSections: ['diagnostics'], // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
@@ -4606,8 +4606,8 @@ expect_red = ['^OpenCode\s2\sreset\scredits\smenu\sreset\srequests\sother\sthan\
 id = "opencode2-reset-visible"
 guards = "OpenCode 2 shows the Reset credits section with its accounts and actions once its actions are admitted"
 file = "packages/opencode/src/v2/menu.ts"
-old = "    unavailableSections: ['cache'],"
-new = "    unavailableSections: ['cache', 'reset'], // NON-VACUITY BREAK"
+old = "    unavailableSections: [],"
+new = "    unavailableSections: ['reset'], // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/opencode2-reset-apply.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-reset-apply.test.ts", "-t", "{test}"]
@@ -5463,3 +5463,77 @@ expect_red = ["^OpenCode 2 shutdown stops waiting for a contended host-slot tran
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+[[control]]
+id = "opencode2-host-warm-retires-target"
+guards = "an owned host keep-alive retires the plugin capture until the next real request, in both TTL profiles"
+file = "packages/opencode/src/v2/cache-keep.ts"
+old = "          owned.manager.remove(input.sessionID)"
+new = "          // NON-VACUITY BREAK: leave the plugin capture warming"
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 keep-warm capture and replay host keep-alive retires gpt-5\.5 until a real capture, without leaking counters or backoff$']
+
+[[control]]
+id = "opencode2-host-warm-not-captured"
+guards = "generate requests, including the host keep-alive, never become plugin keep-warm targets or count as user activity"
+file = "packages/opencode/src/v2/cache-keep.ts"
+old = """        return
+      }
+      const data = input.attempt.data"""
+new = """        // NON-VACUITY BREAK: capture side requests as user activity
+      }
+      const data = input.attempt.data"""
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 keep-warm capture and replay host keep-alive is never captured as user activity$']
+
+[[control]]
+id = "opencode2-host-warm-recognition"
+guards = "only a generate whose final input is the user keep-alive prefix retires the matching session, not ordinary side requests"
+file = "packages/opencode/src/v2/cache-keep.ts"
+old = "          isHostWarm(await input.request.clone().text())"
+new = "          true // NON-VACUITY BREAK: mistake every generate for a host warm"
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 keep-warm capture and replay host keep-alive recognition requires generate, the same session and a final user prefix$']
+
+[[control]]
+id = "opencode2-cache-menu-live-settings"
+guards = "Cache menu writes take effect in the shared manager immediately, even when another location is its live dependency holder"
+file = "packages/opencode/src/v2/setup.ts"
+old = "                cacheKeep.configure({ enabled }),"
+new = "                undefined, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 keep-warm in setup Cache menu settings reach the shared manager and captures in both live locations$']
+
+[[control]]
+id = "opencode2-cache-menu-actions"
+guards = "OpenCode 2 exposes all four Cache actions through its capability fence instead of silently refusing saved settings changes"
+file = "packages/opencode/src/v2/menu.ts"
+old = """    case 'cache':
+      return (
+        !item &&
+        ['enabled', 'subagents', 'sustain', 'window'].includes(request.actionId)
+      )"""
+new = """    case 'cache':
+      return false // NON-VACUITY BREAK"""
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 keep-warm in setup Cache menu settings reach the shared manager and captures in both live locations$']

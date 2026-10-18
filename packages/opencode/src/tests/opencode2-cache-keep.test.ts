@@ -12,6 +12,9 @@ import { CacheKeepManager } from '@cortexkit/common-auth/cachekeep'
 import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import * as cachekeep from '../core/cachekeep'
 import { CACHE_KEEP_CAPS } from '../core/cachekeep'
+import { drainNotifications } from '../rpc/notifications'
+import { createRpcClient } from '../rpc/rpc-client'
+import { resolveRpcDir } from '../rpc/rpc-dir'
 import {
   acquireCacheKeep,
   CACHE_KEEP_JOIN_MS,
@@ -289,6 +292,124 @@ describe('OpenCode 2 keep-warm caps', () => {
 })
 
 describe('OpenCode 2 keep-warm capture and replay', () => {
+  for (const [model, ttl] of [
+    ['gpt-5.5', 5 * MINUTE],
+    ['gpt-5.6', 30 * MINUTE],
+  ] as const) {
+    test(`host keep-alive retires ${model} until a real capture, without leaking counters or backoff`, async () => {
+      const fake = served()
+      const { lease, clock } = acquire(fake.location)
+      await lease.capture(captured('ses', { model }))
+      await advance(lease, clock, ttl - MINUTE)
+      expect(fake.sent).toHaveLength(1)
+      fake.state.status = 503
+      await advance(lease, clock, ttl - MINUTE)
+      expect(lease.manager.status().targets[0]).toMatchObject({
+        warmCount: 1,
+        failures: 1,
+      })
+      await lease.capture(
+        captured('ses', {
+          kind: 'generate',
+          body: JSON.stringify({
+            model,
+            input: [
+              { role: 'user', content: 'previous real turn' },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'input_text',
+                    text: 'This is a keep-alive request. Stay warm.',
+                  },
+                ],
+              },
+            ],
+          }),
+        }),
+      )
+      expect(lease.manager.status().tracked).toBe(0)
+      const sends = fake.sent.length
+      await advance(lease, clock, ttl)
+      expect(fake.sent).toHaveLength(sends)
+      fake.state.status = 200
+      await lease.capture(captured('ses', { model }))
+      expect(lease.manager.status().targets[0]).toMatchObject({
+        warmCount: 0,
+        failures: 0,
+      })
+      expect(lease.manager.status().targets[0]?.backoffUntil).toBeUndefined()
+      await advance(lease, clock, ttl - MINUTE)
+      expect(fake.sent).toHaveLength(sends + 1)
+      expect(fake.sent.at(-1)?.body.input).toEqual([
+        { role: 'user', content: 'hello' },
+      ])
+    })
+  }
+
+  test('host keep-alive recognition requires generate, the same session and a final user prefix', async () => {
+    const fake = served()
+    const { lease } = acquire(fake.location)
+    await lease.capture(captured('ses'))
+    const body = (role: string, text: string) =>
+      JSON.stringify({ input: [{ role, content: text }] })
+    for (const input of [
+      captured('other', {
+        kind: 'generate',
+        body: body('user', 'This is a keep-alive request.'),
+      }),
+      captured('ses', {
+        kind: 'title',
+        body: body('user', 'This is a keep-alive request.'),
+      }),
+      captured('ses', {
+        kind: 'generate',
+        body: body('assistant', 'This is a keep-alive request.'),
+      }),
+      captured('ses', {
+        kind: 'generate',
+        body: body('user', 'Not This is a keep-alive request.'),
+      }),
+      captured('ses', { kind: 'generate', body: '{invalid' }),
+      captured('ses', {
+        kind: 'generate',
+        body: JSON.stringify({
+          input: [
+            { role: 'user', content: 'This is a keep-alive request.' },
+            { role: 'assistant', content: 'done' },
+          ],
+        }),
+      }),
+    ]) {
+      await lease.capture(input)
+      expect(lease.manager.status().targets.map((t) => t.sessionKey)).toEqual([
+        'ses',
+      ])
+    }
+    await lease.capture(
+      captured('ses', {
+        kind: 'generate',
+        body: body('user', 'This is a keep-alive request.'),
+      }),
+    )
+    expect(lease.manager.status().tracked).toBe(0)
+  })
+
+  test('host keep-alive is never captured as user activity', async () => {
+    const fake = served()
+    const { lease } = acquire(fake.location)
+    await lease.capture(
+      captured('ses', {
+        kind: 'generate',
+        body: JSON.stringify({
+          input: [{ role: 'user', content: 'This is a keep-alive request.' }],
+        }),
+      }),
+    )
+    expect(lease.manager.status().tracked).toBe(0)
+    expect(lease.manager.status().running).toBe(false)
+  })
+
   test('captures the final request keyed by the host session and holds no token', async () => {
     const fake = served('ses_host')
     const { lease } = acquire(fake.location)
@@ -680,8 +801,9 @@ function managerOf(files: ReturnType<typeof poolFiles>) {
 async function startLocation(
   files: ReturnType<typeof poolFiles>,
   shared: { clock: { now: number }; timers: ReturnType<typeof fakeTimers> },
+  directory?: string,
 ) {
-  const host = fakeOpenCode2Host()
+  const host = fakeOpenCode2Host({ directory })
   const warms: Sent[] = []
   const stop = await setupOpenAIAuth(host.ctx, {
     paths: files.paths,
@@ -718,7 +840,11 @@ async function startLocation(
     await stop?.()
   }
   cleanups.push(dispose)
-  const request = (sessionID: string, kind: 'primary' | 'title' = 'primary') =>
+  const request = (
+    sessionID: string,
+    kind: 'primary' | 'title' = 'primary',
+    headers: Record<string, string> = {},
+  ) =>
     host.fire('http.request', {
       ...scope(sessionID, kind),
       request: new Request('https://api.openai.com/v1/responses', {
@@ -726,6 +852,7 @@ async function startLocation(
         headers: {
           authorization: `Bearer ${placeholderSecret('openai')}`,
           'content-type': 'application/json',
+          ...headers,
         },
         body: JSON.stringify({
           model: 'gpt-5.5',
@@ -748,6 +875,93 @@ function keepWarmPool() {
 }
 
 describe('OpenCode 2 keep-warm in setup', () => {
+  test('Cache menu settings reach the shared manager and captures in both live locations', async () => {
+    const files = keepWarmPool()
+    const config = JSON.parse(readFileSync(files.configPath, 'utf8'))
+    config.cacheKeep.enabled = false
+    writeFileSync(files.configPath, JSON.stringify(config))
+    const shared = { clock: { now: START }, timers: fakeTimers() }
+    const directory = join(files.dir, 'A')
+    const a = await startLocation(files, shared, directory)
+    const b = await startLocation(files, shared, join(files.dir, 'B'))
+    const client = createRpcClient(
+      (await resolveRpcDir(directory)).dir,
+      process.pid,
+    )
+    const apply = (
+      actionId: string,
+      values: Record<string, boolean | string>,
+    ) =>
+      client.apply({ command: 'openai', sectionId: 'cache', actionId, values })
+    await client.pending(0, 'ses_on')
+    await a.host.commands[0]!.execute({ sessionID: 'ses_on' })
+    const opened = drainNotifications(0, 'ses_on').at(-1)!.payload
+    if (!('menu' in opened)) throw new Error('expected the OpenAI menu')
+    const section = opened.menu.sections.find((s) => s.id === 'cache')!
+    expect(section.actions.map((a) => a.id)).toEqual([
+      'enabled',
+      'subagents',
+      'sustain',
+      'window',
+    ])
+    expect(section.lines).toContain(
+      "Sessions using OpenCode 2's WebSocket are not warmed yet.",
+    )
+    expect((await apply('unknown', {})).ok).toBe(false)
+    expect(
+      (
+        await client.apply({
+          command: 'openai',
+          sectionId: 'cache',
+          actionId: 'enabled',
+          itemId: 'ses_on',
+          values: { enabled: true },
+        })
+      ).ok,
+    ).toBe(false)
+    await b.request('ses_off')
+    const manager = managerOf(files)!
+    expect(manager.status().tracked).toBe(0)
+    expect((await apply('enabled', { enabled: true })).ok).toBe(true)
+    await b.request('ses_on')
+    expect(manager.status().tracked).toBe(1)
+    expect((await apply('subagents', { subagents: true })).ok).toBe(true)
+    await b.request('child', 'primary', {
+      'x-opencode-parent-session-id': 'ses_on',
+    })
+    expect(
+      manager.status().targets.find((t) => t.sessionKey === 'child')
+        ?.isSubagent,
+    ).toBe(true)
+    expect((await apply('subagents', { subagents: false })).ok).toBe(true)
+    manager.remove('child')
+    await b.request('child_off', 'primary', {
+      'x-opencode-parent-session-id': 'ses_on',
+    })
+    expect(manager.status().targets.map((t) => t.sessionKey)).toEqual([
+      'ses_on',
+    ])
+    expect((await apply('sustain', { sustain: true })).ok).toBe(true)
+    expect(manager.status().sustain).toBe(true)
+    expect((await apply('window', { window: '22-6' })).ok).toBe(true)
+    expect(manager.status().window).toEqual({ startHour: 22, endHour: 6 })
+    await a.request('ses_outside')
+    shared.clock.now += 4 * MINUTE
+    await manager.tick()
+    expect(b.warms).toHaveLength(0)
+    expect(manager.status().tracked).toBe(1)
+    expect((await apply('window', { window: '' })).ok).toBe(true)
+    await manager.tick()
+    expect(b.warms).toHaveLength(1)
+    expect(
+      JSON.parse(readFileSync(files.configPath, 'utf8')).cacheKeep,
+    ).toMatchObject({ enabled: true, subagents: false, sustain: true })
+    expect((await apply('enabled', { enabled: false })).ok).toBe(true)
+    expect(manager.status().running).toBe(false)
+    await b.request('ses_off_again')
+    expect(manager.status().tracked).toBe(0)
+  })
+
   test('captures the final owned agent-loop request at the post-installer seam and warms it with the pool token', async () => {
     const files = keepWarmPool()
     const shared = { clock: { now: Date.now() }, timers: fakeTimers() }

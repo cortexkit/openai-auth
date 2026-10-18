@@ -29,6 +29,11 @@ function allowed(request: {
       return !item && request.actionId === 'clear-pin'
     case 'diagnostics':
       return !item && ['logging', 'dump'].includes(request.actionId)
+    case 'cache':
+      return (
+        !item &&
+        ['enabled', 'subagents', 'sustain', 'window'].includes(request.actionId)
+      )
     case 'reset':
       // Spend and retry still need `confirmed: true`, which the shared menu
       // checks before it runs either one; preview spends nothing.
@@ -45,7 +50,9 @@ export function createControlPlaneMenu(
   const controls: OpenCodeMenuContext = {
     ...context,
     allowAction: allowed,
-    unavailableSections: ['cache'],
+    unavailableSections: [],
+    cacheKeepNotice:
+      "Sessions using OpenCode 2's WebSocket are not warmed yet.",
   }
   return {
     open: (sessionId) => openOpenAiMenu(controls, sessionId),

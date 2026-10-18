@@ -461,20 +461,26 @@ describe('OpenCode 2 reset credits menu', () => {
     expectNothingSpent(f)
   })
 
-  test('Cache is still not available', async () => {
+  test('Cache is available alongside reset credits without spending a credit', async () => {
     const f = await start()
     const cache = (await f.menu.open('S')).menu.sections.find(
       (section) => section.id === 'cache',
     )
-    expect(cache?.lines).toEqual(['Not available on OpenCode 2 yet.'])
+    expect(cache?.actions.map((action) => action.id)).toEqual([
+      'enabled',
+      'subagents',
+      'sustain',
+      'window',
+    ])
     const result = await f.menu.apply({
       command: 'openai',
       sectionId: 'cache',
       actionId: 'enabled',
       values: { enabled: true },
     })
-    expect(result.ok).toBe(false)
-    expect(text(result)).toBe('Not available on OpenCode 2 yet.')
+    expect(result.ok).toBe(true)
+    expect(text(result)).toContain('Keep-warm is on.')
+    expectNothingSpent(f)
   })
 })
 
@@ -897,7 +903,7 @@ describe('OpenCode 2 reset credits in vault mode', () => {
     expectNothingSpent(f)
   })
 
-  test('Cache is still not available', async () => {
+  test('Cache remains available in vault mode without spending a credit', async () => {
     const f = await start({ vault: true })
     const result = await f.menu.apply({
       command: 'openai',
@@ -905,8 +911,9 @@ describe('OpenCode 2 reset credits in vault mode', () => {
       actionId: 'enabled',
       values: { enabled: true },
     })
-    expect(result.ok).toBe(false)
+    expect(result.ok).toBe(true)
     expect(result.text).not.toBe(VAULT_LOCAL_ACTION_REFUSAL)
-    expect(result.text).toBe('Not available on OpenCode 2 yet.')
+    expect(result.text).toContain('Keep-warm is on.')
+    expectNothingSpent(f)
   })
 })

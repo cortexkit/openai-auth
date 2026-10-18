@@ -158,6 +158,8 @@ export interface CacheKeepCaptureInput {
 /** One location's hold on its store's keep-warm manager. */
 export interface CacheKeepLease {
   readonly manager: OpenAICacheKeepManager
+  /** Updates the settings shared by every location over this account store. */
+  configure(settings: Partial<CacheKeepSettingsView>): void
   /**
    * Tracks an owned agent-loop request while keep-warm is on. Never throws:
    * a capture that cannot be made logs one warning and the request goes on.
@@ -175,6 +177,7 @@ export interface CacheKeepLease {
 type Holder = { location: CacheKeepLocation }
 type Entry = {
   manager: OpenAICacheKeepManager
+  settings: CacheKeepSettingsView
   holders: Holder[]
   joinTimeoutMs: number
 }
@@ -188,7 +191,10 @@ const processState = globalThis as typeof globalThis & {
 const entries = processState[registryKey] ?? new Map<string, Entry>()
 processState[registryKey] = entries
 
-function createEntry(setup: CacheKeepManagerSetup): Entry {
+function createEntry(
+  setup: CacheKeepManagerSetup,
+  settings: CacheKeepSettingsView,
+): Entry {
   const holders: Holder[] = []
   // The newest holder lends the dependencies: after a location reloads, the
   // reloaded one serves its warms.
@@ -297,8 +303,31 @@ function createEntry(setup: CacheKeepManagerSetup): Entry {
   })
   return {
     manager,
+    settings,
     holders,
     joinTimeoutMs: setup.joinTimeoutMs ?? CACHE_KEEP_JOIN_MS,
+  }
+}
+
+/** OpenCode's model-visible keep-alive prompt is not user activity to capture. */
+function isHostWarm(bodyText: string): boolean {
+  try {
+    const body = JSON.parse(bodyText)
+    const last = Array.isArray(body.input) ? body.input.at(-1) : undefined
+    if (last?.role !== 'user') return false
+    const text =
+      typeof last.content === 'string'
+        ? last.content
+        : Array.isArray(last.content)
+          ? last.content
+              .map((part: { text?: unknown }) =>
+                typeof part?.text === 'string' ? part.text : '',
+              )
+              .join('')
+          : ''
+    return text.startsWith('This is a keep-alive request.')
+  } catch {
+    return false
   }
 }
 
@@ -329,18 +358,33 @@ export function acquireCacheKeep(
   ])
   let entry = entries.get(key)
   if (!entry) {
-    entry = createEntry(setup)
+    entry = createEntry(setup, location.settings())
     entries.set(key, entry)
   }
   const owned = entry
-  const holder: Holder = { location }
+  const holder: Holder = {
+    location: { ...location, settings: () => owned.settings },
+  }
   owned.holders.push(holder)
   let released = false
 
   const capture = async (input: CacheKeepCaptureInput) => {
     try {
-      const settings = location.settings()
-      if (released || !settings.enabled || input.kind !== 'primary') return
+      const settings = holder.location.settings()
+      if (released || !settings.enabled) return
+      if (input.kind !== 'primary') {
+        if (
+          input.kind === 'generate' &&
+          isHostWarm(await input.request.clone().text())
+        ) {
+          if (released) return
+          // The shared manager cannot defer an existing target without resetting
+          // its idle and retry counters. Let the host own warming until the next
+          // real request instead of replaying the same cache twice.
+          owned.manager.remove(input.sessionID)
+        }
+        return
+      }
       const data = input.attempt.data
       const credentialMode =
         data?.kind === 'pool'
@@ -380,6 +424,9 @@ export function acquireCacheKeep(
 
   return {
     manager: owned.manager,
+    configure: (settings) => {
+      Object.assign(owned.settings, settings)
+    },
     capture,
     forget: (sessionID) => owned.manager.remove(sessionID),
     async release() {

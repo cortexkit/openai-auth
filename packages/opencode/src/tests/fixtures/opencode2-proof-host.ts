@@ -89,6 +89,7 @@ function seedPool(
   configDir: string,
   accounts: MockAccount[],
   used: Partial<Record<MockAccount, number>>,
+  keepWarm = false,
 ) {
   mkdirSync(configDir, { recursive: true })
   const checkedAt = Date.now()
@@ -99,6 +100,7 @@ function seedPool(
       version: 1,
       main: { type: 'opencode', provider: 'openai' },
       routing: { mode: 'sticky-balanced' },
+      ...(keepWarm ? { cacheKeep: { enabled: true } } : {}),
       accounts: accounts.map((account) => ({
         id: rowId(account),
         type: 'oauth',
@@ -196,7 +198,7 @@ async function collect(
  * `http.request` callbacks see what the plugin left in the draft.
  */
 function probeSource(trace: string) {
-  return `import plugin from '${PACKAGE_NAME}/server'
+  return `import plugin, { createOpenAIAuthPlugin } from '${PACKAGE_NAME}/server'
 import { appendFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 const TRACE = ${JSON.stringify(trace)}
@@ -216,11 +218,23 @@ const hostView = (messages) => messages.flatMap((m) => {
   })
 })
 let frames = 0
+// A fake clock drives the real plugin manager, not a separate replay adapter.
+// Its timer is counted rather than scheduled so the test controls every warm.
+const cacheState = globalThis[Symbol.for('proof-cache-clock')] ??= { now: Date.now(), armed: 0, cleared: 0 }
+const keepWarm = process.env.PROOF_CACHE_KEEP === '1'
+const packed = keepWarm ? createOpenAIAuthPlugin({
+  now: () => cacheState.now,
+  cacheKeep: {
+    setIntervalImpl: () => { cacheState.armed++; return { unref() {} } },
+    clearIntervalImpl: () => { cacheState.cleared++ },
+  },
+}) : plugin
+const cacheEntries = () => [...(globalThis[Symbol.for('@cortexkit/openai-auth/opencode2-cache-keep')]?.values() ?? [])]
 export default { ...plugin, async setup(ctx) {
   // With PROOF_HOST_FRAMES, a recorder registered before the plugin's own
   // hooks keeps each frame as the host built it, and when the plugin got it.
   const early = process.env.PROOF_HOST_FRAMES === '1' ? await ctx.session.hook('experimental.ws.send', (d) => rec('ws.send.host', { ...scope(d), frame: d.frame }), { providerID: 'openai' }) : undefined
-  const dispose = await plugin.setup(ctx)
+  const dispose = await packed.setup(ctx)
   const location = ctx.location?.directory
   rec('setup', { location })
   const regs = early ? [early] : []
@@ -321,6 +335,22 @@ export default { ...plugin, async setup(ctx) {
     const sessionID = url.searchParams.get('session')
     const reply = (status, value) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)) }
     try {
+      if (url.pathname === '/cache' || url.pathname === '/cache-tick') {
+        if (!keepWarm) return reply(409, { error: 'plugin keep-warm not enabled' })
+        const entries = cacheEntries()
+        if (url.pathname === '/cache-tick') {
+          cacheState.now += Number(url.searchParams.get('advance') ?? 0)
+          for (const entry of entries) await entry.manager.tick()
+        }
+        return reply(200, { managers: entries.length, holders: entries.map(e => e.holders.length), armed: cacheState.armed, cleared: cacheState.cleared, status: entries.map(e => e.manager.status()) })
+      }
+      if (url.pathname === '/record-account') {
+        // Simulate the adapter's recorded primary choice before its HTTP
+        // capture arrives, so a stale target is tested in that narrow gap.
+        const accounts = globalThis[Symbol.for('@cortexkit/openai-auth/opencode2-session-accounts')]
+        for (const registry of accounts?.values() ?? []) registry.record(sessionID, url.searchParams.get('account'))
+        return reply(200, { recorded: true })
+      }
       if (url.pathname === '/replay-http') {
         const capture = captures.get(sessionID)
         if (!capture) return reply(404, { error: 'no capture' })
@@ -423,6 +453,8 @@ export async function startProofHost(input: {
   hostFrames?: boolean
   thirdParty?: { bytes: number }
   pool?: boolean
+  /** Enable the plugin's real manager, with a manually advanced clock. */
+  keepWarm?: boolean
   /** OpenCode 2's own `warming` setting, if the scenario turns it on. */
   warming?: unknown
   model?: string
@@ -450,7 +482,7 @@ export async function startProofHost(input: {
   const trace = join(root, 'trace.jsonl')
   writeFileSync(trace, '')
   const configDir = join(isolated.XDG_CONFIG_HOME, 'opencode')
-  seedPool(configDir, input.accounts, input.used ?? {})
+  seedPool(configDir, input.accounts, input.used ?? {}, input.keepWarm)
   const probe = join(
     input.consumer,
     `proof-probe-${Math.random().toString(36).slice(2)}`,
@@ -468,6 +500,7 @@ export async function startProofHost(input: {
     PROOF_REWRITE: input.rewrite ? '1' : '0',
     PROOF_HOST_FRAMES: input.hostFrames ? '1' : '0',
     PROOF_POOL: input.pool ? '1' : '0',
+    PROOF_CACHE_KEEP: input.keepWarm ? '1' : '0',
     PROOF_CONFIG_DIR: configDir,
     PROOF_THIRD_PARTY: input.thirdParty ? '1' : '0',
     PROOF_THIRD_PARTY_BYTES: String(input.thirdParty?.bytes ?? 0),

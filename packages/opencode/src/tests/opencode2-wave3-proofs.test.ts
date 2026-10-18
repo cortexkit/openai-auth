@@ -820,6 +820,115 @@ describe.skipIf(!ENABLED)('OpenCode 2 wave 3 proofs (real host)', () => {
     }
   }, 300_000)
 
+  test('plugin HTTP keep-warm stays invisible, follows the captured account and stops on deletion or reload', async () => {
+    const host = await startProofHost({
+      cli,
+      consumer,
+      transport: 'http',
+      accounts: ['A', 'B'],
+      used: { A: 5, B: 40 },
+      keepWarm: true,
+    })
+    const tick = () => host.control('/cache-tick?advance=240000')
+    const bodies = (records: ProofRecord[]) =>
+      records
+        .filter((r) => r.transport === 'http' && r.outcome !== undefined)
+        .map((r) => ({ record: r, body: JSON.parse(r.raw ?? '{}') }))
+    try {
+      const first = await host.turn('Turn 1: say hello.')
+      expect(first.exit).toBe(0)
+      const sessionID = first.sessionID!
+      const original = bodies(host.records()).findLast(({ body }) =>
+        Array.isArray(body.tools),
+      )!
+      const before = await messageCount(host, sessionID)
+      const hooks = host.trace().length
+      const records = host.records().length
+      expect((await tick()).json).toMatchObject({
+        managers: 1,
+        holders: [1],
+        armed: 1,
+        cleared: 0,
+        status: [{ targets: [{ warmCount: 1, failures: 0 }] }],
+      })
+      const warms = bodies(host.records().slice(records))
+      expect(warms).toHaveLength(1)
+      const warm = warms[0]!
+      expect(warm.record).toMatchObject({ identity: 'A', outcome: 'text' })
+      expect(warm.body.store).toBe(false)
+      expect(warm.body.prompt_cache_key).toBe(original.body.prompt_cache_key)
+      expect(warm.body.input).toEqual(original.body.input)
+      for (const cap of [
+        'max_output_tokens',
+        'max_tokens',
+        'max_completion_tokens',
+      ])
+        expect(warm.body).not.toHaveProperty(cap)
+      expect(host.trace().slice(hooks)).toEqual([])
+      expect(await messageCount(host, sessionID)).toEqual(before)
+      expect(
+        (await host.turn('Turn 2: after plugin warm.', { session: sessionID }))
+          .exit,
+      ).toBe(0)
+      const next = bodies(host.records()).findLast(({ body }) =>
+        Array.isArray(body.tools),
+      )!
+      expect(providerView(next.body.input)).toEqual([
+        'user:"Turn 1: say hello."',
+        `assistant:PROOF-REPLY-${original.record.responseID?.slice(5)}`,
+        'user:"Turn 2: after plugin warm."',
+      ])
+      // A recorded account change alone cannot replay an old capture on the
+      // new account. Only the next real request may supply its prompt.
+      await host.control(`/record-account?session=${sessionID}&account=B`)
+      const moved = host.records().length
+      const retired = await tick()
+      expect(retired.json.status).toMatchObject([{ tracked: 0 }])
+      expect(host.records()).toHaveLength(moved)
+      host.mock.reject('A')
+      expect(
+        (await host.turn('Turn 3: move to B.', { session: sessionID })).exit,
+      ).toBe(0)
+      const capturedB = host.records().length
+      await tick()
+      expect(
+        bodies(host.records().slice(capturedB)).map(
+          ({ record }) => record.identity,
+        ),
+      ).toEqual(['B'])
+
+      expect((await host.api('POST', '/api/location/reload')).status).toBe(204)
+      expect(
+        (await host.turn('Turn 4: after reload.', { session: sessionID })).exit,
+      ).toBe(0)
+      const reloaded = host.records().length
+      expect((await tick()).json).toMatchObject({
+        managers: 1,
+        holders: [1],
+        armed: 2,
+        cleared: 1,
+      })
+      expect(
+        bodies(host.records().slice(reloaded)).map(
+          ({ record }) => record.identity,
+        ),
+      ).toEqual(['B'])
+      expect(
+        (await host.api('DELETE', `/api/session/${sessionID}`)).status,
+      ).toBe(204)
+      const deleted = host.records().length
+      expect((await tick()).json.status).toMatchObject([{ tracked: 0 }])
+      expect(host.records()).toHaveLength(deleted)
+      evidence('plugin.http.keep-warm', {
+        warm: warm.record,
+        messages: before,
+        lifecycle: (await host.control('/cache')).json,
+      })
+    } finally {
+      await host.stop()
+    }
+  }, 300_000)
+
   test('P6: a WebSocket session as rebuilt from its frames', async () => {
     const host = await startProofHost({
       cli,
@@ -875,6 +984,7 @@ describe.skipIf(!ENABLED)('OpenCode 2 wave 3 proofs (real host)', () => {
         transport,
         accounts: ['A'],
         warming: { interval: '3 seconds', duration: '8 seconds' },
+        keepWarm: true,
       })
       try {
         const out: Record<string, unknown> = {}
@@ -883,6 +993,11 @@ describe.skipIf(!ENABLED)('OpenCode 2 wave 3 proofs (real host)', () => {
         out.messagesBefore = await messageCount(host, sessionID)
         await Bun.sleep(9000)
         out.messagesAfter = await messageCount(host, sessionID)
+        const countAfterHostWarm = host.records().length
+        expect(
+          (await host.control('/cache-tick?advance=240000')).json.status,
+        ).toMatchObject([{ tracked: 0 }])
+        expect(host.records()).toHaveLength(countAfterHostWarm)
         const t2 = await host.turn('Turn 2: after warming.', { continue: true })
         out.t2 = t2.exit
         out.sequence = sequence(host.trace(), sessionID)

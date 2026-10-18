@@ -783,6 +783,14 @@ export async function setupOpenAIAuth(
                   (row) => ({ ...row, account: row.id }),
                 ),
               getStickyRouting: async (sessionId) => pins.get(sessionId),
+              cacheKeepManager: cacheKeep.manager,
+              setCacheKeepEnabled: (enabled) =>
+                cacheKeep.configure({ enabled }),
+              setCacheKeepSubagents: (subagents) =>
+                cacheKeep.configure({ subagents }),
+              setCacheKeepSustain: (sustain) =>
+                cacheKeep.configure({ sustain }),
+              setCacheKeepWindow: (window) => cacheKeep.configure({ window }),
               afterWrite: () => source.load(),
               refreshSidebar: () => sidebar.publish(),
               clearStickyRouting: async (sessionId) => {

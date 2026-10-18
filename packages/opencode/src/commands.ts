@@ -82,7 +82,12 @@ export interface OpenCodeMenuContext {
   refreshSidebar?: () => Promise<void>
   /** Re-read the pool so requests route across the changed rows at once. */
   afterWrite?: () => unknown
-  cacheKeepManager?: CacheKeepManager | null
+  cacheKeepManager?: Pick<
+    CacheKeepManager,
+    'status' | 'start' | 'stop' | 'remove'
+  > | null
+  /** Host-specific limits to show alongside the keep-warm status. */
+  cacheKeepNotice?: string
   setCacheKeepEnabled?: (enabled: boolean) => void
   setCacheKeepSubagents?: (enabled: boolean) => void
   setCacheKeepSustain?: (enabled: boolean) => void
@@ -162,6 +167,7 @@ function cacheSection(ctx: OpenCodeMenuContext) {
           `Keep-warm ${enabled ? 'on' : 'off'} · ${status.tracked === 0 ? 'no sessions' : `${status.tracked} session${status.tracked === 1 ? '' : 's'}`}`,
           `Timer ${status.running ? 'armed' : 'idle'} · subagents ${subagents ? 'on' : 'off'} · sustain ${status.sustain ? 'on' : 'off'}`,
           `Window ${windowLabel}`,
+          ...(ctx.cacheKeepNotice ? [ctx.cacheKeepNotice] : []),
           `TTL ${Math.round(status.ttlMs / 1000)}s · lead ${Math.round(status.leadMs / 1000)}s · idle cap ${Math.round(status.maxIdleWarmMs / 60_000)}min (subagents ${Math.round(status.maxSubagentIdleMs / 60_000)}min)`,
         ],
         items: status.targets.map((target) => ({
