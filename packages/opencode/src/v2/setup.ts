@@ -102,9 +102,13 @@ import {
   cacheKeepSettingsOf,
 } from './cache-keep'
 import { acquireCodexSessions } from './codex-sessions'
-import { CodexHttpState } from './codex-wire'
+import { CodexHttpState, codexReplayRequest } from './codex-wire'
 import { type ControlPlaneMenu, installControlPlane } from './control-plane'
-import { acquireFrameMirror, type FrameMirror } from './frame-mirror'
+import {
+  acquireFrameMirror,
+  type FrameMirror,
+  type FrameMirrorCapture,
+} from './frame-mirror'
 import { opencode1HostSlot } from './host-slot'
 import {
   assertLocalPoolLogin,
@@ -221,6 +225,7 @@ async function installPoolHooks<Q, A>(
     attempt: Attempt<A>
   }) => Promise<void>,
   mirror?: FrameMirror,
+  onOwnedFrame?: (sessionID: string) => void,
 ) {
   const dumps = new RequestDumps(log)
   // installOpenCode2Auth supplies an Attempt to the rewrite callbacks before it
@@ -230,12 +235,23 @@ async function installPoolHooks<Q, A>(
   // Receive/retry hooks have no request object to identify the send they answer.
   // They answer the last handshake or send for this session, so remember its
   // bearer. A send using another integration's login is not ours to rewrite.
-  const sockets = new Map<string, { bearer: string; attempt: Attempt<A> }>()
+  const sockets = new Map<
+    string,
+    { bearer: string; attempt: Attempt<A>; url: string; headers: Headers }
+  >()
   const latest = new Map<string, string>()
   const forget = (sessionID: string) => {
     latest.delete(sessionID)
     for (const key of sockets.keys())
       if (key.startsWith(`${sessionID}:`)) sockets.delete(key)
+  }
+  const recordPrimaryWebSocketFrame = (
+    sent: SessionHooks['experimental.ws.send'],
+  ) => {
+    // Remove this session's saved keep-warm request before the next send.
+    // Otherwise a missing response baseline could leave stale history warming.
+    onOwnedFrame?.(sent.sessionID)
+    mirror?.send(sent.sessionID, sent.frame)
   }
   const context: OpenCode2HookContext = {
     session: {
@@ -297,7 +313,7 @@ async function installPoolHooks<Q, A>(
               const socket = sockets.get(`${sent.sessionID}:${sent.kind}`)
               if (socket) await dumps.frame(sent.frame, socket.attempt)
               if (socket && sent.kind === 'primary')
-                mirror?.send(sent.sessionID, sent.frame)
+                recordPrimaryWebSocketFrame(sent)
             }
             if (request || handshake) {
               const scope = request ?? handshake
@@ -316,7 +332,20 @@ async function installPoolHooks<Q, A>(
               if (handshake) {
                 const key = `${handshake.sessionID}:${handshake.kind}`
                 if (owned && bearer && observation.attempt)
-                  sockets.set(key, { bearer, attempt: observation.attempt })
+                  sockets.set(key, {
+                    bearer,
+                    attempt: observation.attempt,
+                    url: handshake.url,
+                    headers: new Headers(
+                      Object.entries(handshake.headers).filter(([name]) =>
+                        [
+                          'chatgpt-account-id',
+                          'x-opencode-parent-session-id',
+                          'x-parent-session-id',
+                        ].includes(name.toLowerCase()),
+                      ),
+                    ),
+                  })
                 else sockets.delete(key)
               }
               if (latest.size > 512) {
@@ -335,8 +364,40 @@ async function installPoolHooks<Q, A>(
               if (socket) {
                 // Only an owned socket's frames move the frame turn state.
                 codex.frameReceived(received.sessionID, received.frame)
-                if (received.kind === 'primary')
-                  mirror?.receive(received.sessionID, received.frame)
+                if (received.kind === 'primary') {
+                  let capture: FrameMirrorCapture | undefined
+                  mirror?.receive(
+                    received.sessionID,
+                    received.frame,
+                    (head) => {
+                      capture = head
+                    },
+                  )
+                  if (capture) {
+                    try {
+                      const request = codexReplayRequest(
+                        capture,
+                        socket.url,
+                        socket.headers,
+                        codex,
+                      )
+                      if (request)
+                        await onOwnedRequest?.({
+                          sessionID: received.sessionID,
+                          kind: 'primary',
+                          request,
+                          attempt: socket.attempt,
+                        })
+                    } catch (error) {
+                      log.warn('cachekeep WebSocket capture failed', {
+                        error:
+                          error instanceof Error
+                            ? error.message
+                            : String(error),
+                      })
+                    }
+                  }
+                }
                 received.frame = redactCredentialFrame(
                   received.frame,
                   socket.bearer,
@@ -698,6 +759,7 @@ export async function setupOpenAIAuth(
     codex,
     (input: CacheKeepCaptureInput) => cacheKeep.capture(input),
     mirror,
+    (sessionID) => cacheKeep.forget(sessionID),
   )
   openai.attach(installation)
 

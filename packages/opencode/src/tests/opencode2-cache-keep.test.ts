@@ -23,7 +23,9 @@ import {
   type CacheKeepLocation,
   type CacheKeepSettingsView,
 } from '../v2/cache-keep'
+import { CodexHttpState, codexReplayRequest } from '../v2/codex-wire'
 import { acquireFrameMirror, FrameMirror } from '../v2/frame-mirror'
+import { acquireSessionAccounts } from '../v2/session-accounts'
 import { setupOpenAIAuth } from '../v2/setup'
 import {
   fakeOpenCode2Host,
@@ -44,7 +46,12 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
 })
 
-type Sent = { url: string; headers: Headers; body: Record<string, unknown> }
+type Sent = {
+  url: string
+  method: string | undefined
+  headers: Headers
+  body: Record<string, unknown>
+}
 
 /** Fake timers: counts how often an interval is armed and cleared. */
 function fakeTimers() {
@@ -120,6 +127,7 @@ function fakeLocation() {
       if (state.gate) await state.gate
       sent.push({
         url: String(url),
+        method: init?.method,
         headers: new Headers(init?.headers),
         body: JSON.parse(String(init?.body)),
       })
@@ -824,11 +832,17 @@ async function startLocation(
   files: ReturnType<typeof poolFiles>,
   shared: { clock: { now: number }; timers: ReturnType<typeof fakeTimers> },
   directory?: string,
+  parents?: Map<string, string>,
 ) {
-  const host = fakeOpenCode2Host({ directory })
+  const host = fakeOpenCode2Host({ directory, parents })
+  const codex = new CodexHttpState({
+    now: () => shared.clock.now,
+    uuid: randomUUID,
+  })
   const warms: Sent[] = []
   const stop = await setupOpenAIAuth(host.ctx, {
     paths: files.paths,
+    codex,
     heartbeat: false,
     now: () => shared.clock.now,
     sidebarStateFile: join(files.dir, 'sidebar.json'),
@@ -842,6 +856,7 @@ async function startLocation(
           return new Response('{}', { status: 503 })
         warms.push({
           url: String(url),
+          method: init?.method,
           headers: new Headers(init?.headers),
           body: JSON.parse(String(init?.body)),
         })
@@ -883,8 +898,251 @@ async function startLocation(
         }),
       }),
     })
-  return { host, warms, request, dispose }
+  return { host, warms, request, dispose, codex }
 }
+
+async function websocket(
+  location: Awaited<ReturnType<typeof startLocation>>,
+  sessionID = 'ses_ws',
+  headers: Record<string, string> = {},
+) {
+  await location.host.fire('experimental.ws.handshake', {
+    ...scope(sessionID),
+    url: 'wss://chatgpt.com/backend-api/codex/responses',
+    headers: {
+      authorization: `Bearer ${placeholderSecret('openai')}`,
+      ...headers,
+    },
+  })
+  return {
+    send: async (body: Record<string, unknown>) => {
+      const draft = { ...scope(sessionID), frame: JSON.stringify(body) }
+      await location.host.fire('experimental.ws.send', draft)
+      return JSON.parse(draft.frame)
+    },
+    complete: async (id: string, output: unknown[] = []) => {
+      for (const item of output)
+        await location.host.fire('experimental.ws.receive', {
+          ...scope(sessionID),
+          frame: JSON.stringify({ type: 'response.output_item.done', item }),
+        })
+      await location.host.fire('experimental.ws.receive', {
+        ...scope(sessionID),
+        frame: JSON.stringify({ type: 'response.completed', response: { id } }),
+      })
+    },
+  }
+}
+
+describe('OpenCode 2 WebSocket keep-warm', () => {
+  test('replay builds HTTP headers before the manager sanitizes the request', () => {
+    const state = new CodexHttpState({ now: () => START, uuid: randomUUID })
+    state.get('ses_ws')
+    const input = [{ role: 'user', content: 'hello' }]
+    state.advanceFrame('ses_ws', { type: 'response.create', input })
+    const bodyText = JSON.stringify({ model: 'gpt-5.5', input, stream: true })
+    const request = codexReplayRequest(
+      { sessionID: 'ses_ws', responseID: 'r1', bodyText },
+      'wss://chatgpt.com/backend-api/codex/responses',
+      new Headers({
+        authorization: 'Bearer private',
+        cookie: 'private',
+        'chatgpt-account-id': 'chatgpt-main',
+      }),
+      state,
+    )!
+    expect(request.headers.get('accept')).toBe('text/event-stream')
+    expect(request.headers.get('content-type')).toBe('application/json')
+    expect(request.headers.has('authorization')).toBe(false)
+    expect(request.headers.has('cookie')).toBe(false)
+    expect(request.headers.get('chatgpt-account-id')).toBe('chatgpt-main')
+    expect(request.method).toBe('POST')
+  })
+
+  test('two HTTP warms preserve the WebSocket turn, history and next tool-output input', async () => {
+    const files = keepWarmPool()
+    const shared = { clock: { now: START }, timers: fakeTimers() }
+    const location = await startLocation(files, shared)
+    await location.request('ses_ws')
+    const ws = await websocket(location)
+    const input = [{ role: 'user', content: 'read café \\u0061 1.25' }]
+    const first = await ws.send({
+      type: 'response.create',
+      model: 'gpt-5.5',
+      input,
+      instructions: 'help',
+      tools: [],
+      store: true,
+      max_output_tokens: 12,
+      max_tokens: 13,
+    })
+    const output = [
+      { type: 'reasoning', encrypted_content: 'opaque' },
+      {
+        type: 'function_call',
+        call_id: 'call_1',
+        name: 'read',
+        arguments: '{}',
+      },
+    ]
+    await ws.complete('r1', output)
+    const metadata = location.codex.get('ses_ws')
+    const before = structuredClone(metadata)
+    const beforeTurn = structuredClone(location.codex.frameTurns.get('ses_ws')!)
+    const manager = managerOf(files)!
+    expect(manager.status().tracked).toBe(1)
+    for (let n = 0; n < 2; n++) {
+      shared.clock.now += 4 * MINUTE
+      await manager.tick()
+    }
+    expect(location.warms).toHaveLength(2)
+    expect(metadata).toEqual(before)
+    expect(location.codex.frameTurns.get('ses_ws')).toEqual(beforeTurn)
+    for (const warm of location.warms) {
+      expect(warm.method).toBe('POST')
+      expect(warm.url).toBe('https://chatgpt.com/backend-api/codex/responses')
+      expect(warm.body).toMatchObject({
+        model: 'gpt-5.5',
+        instructions: 'help',
+        input: [...input, ...output],
+        stream: true,
+        store: false,
+        prompt_cache_key: metadata.threadID,
+      })
+      for (const key of [
+        'type',
+        'previous_response_id',
+        'max_output_tokens',
+        'max_tokens',
+        'max_completion_tokens',
+      ])
+        expect(warm.body).not.toHaveProperty(key)
+      expect(warm.headers.get('accept')).toBe('text/event-stream')
+      expect(warm.headers.get('session-id')).toBe(metadata.threadID)
+      expect(
+        JSON.parse(warm.headers.get('x-codex-turn-metadata')!),
+      ).toMatchObject({
+        turn_id: beforeTurn.turnID,
+        turn_started_at_unix_ms: beforeTurn.turnStartedAt,
+      })
+      expect(warm.body.client_metadata).not.toHaveProperty(
+        'x-codex-turn-metadata',
+      )
+      expect(warm.body.client_metadata).not.toHaveProperty(
+        'x-codex-ws-stream-request-start-ms',
+      )
+    }
+    const delta = [
+      { type: 'function_call_output', call_id: 'call_1', output: 'file' },
+    ]
+    const next = await ws.send({
+      type: 'response.create',
+      model: 'gpt-5.5',
+      previous_response_id: 'r1',
+      input: delta,
+    })
+    const turn = (body: typeof next) =>
+      JSON.parse(body.client_metadata['x-codex-turn-metadata'])
+    expect(turn(next).turn_id).toBe(turn(first).turn_id)
+    expect(turn(next).turn_started_at_unix_ms).toBe(
+      turn(first).turn_started_at_unix_ms,
+    )
+    expect(next.input).toEqual(delta)
+    const http = await location.request('ses_ws')
+    expect(
+      JSON.parse(http.request.headers.get('x-codex-turn-metadata')!),
+    ).toMatchObject({
+      turn_id: before.turnID,
+      turn_started_at_unix_ms: before.turnStartedAt,
+    })
+    expect(location.host.turns).toEqual([])
+  })
+
+  test('an unavailable WebSocket baseline retires its warm until a full frame completes', async () => {
+    const files = keepWarmPool()
+    const shared = { clock: { now: START }, timers: fakeTimers() }
+    const location = await startLocation(files, shared)
+    const ws = await websocket(location)
+    const full = {
+      type: 'response.create',
+      model: 'gpt-5.5',
+      input: [{ role: 'user', content: 'hi' }],
+    }
+    await ws.send(full)
+    await ws.complete('r1')
+    expect(managerOf(files)!.status().tracked).toBe(1)
+    await ws.send({ ...full, previous_response_id: 'missing' })
+    await ws.complete('r2')
+    shared.clock.now += 4 * MINUTE
+    await managerOf(files)!.tick()
+    expect(managerOf(files)!.status().tracked).toBe(0)
+    expect(location.warms).toHaveLength(0)
+    await ws.send(full)
+    await ws.complete('r3')
+    shared.clock.now += 4 * MINUTE
+    await managerOf(files)!.tick()
+    expect(location.warms).toHaveLength(1)
+  })
+
+  test('a rerouted WebSocket session never warms the old captured account', async () => {
+    const files = keepWarmPool()
+    const shared = { clock: { now: START }, timers: fakeTimers() }
+    const location = await startLocation(files, shared)
+    const ws = await websocket(location)
+    await ws.send({
+      type: 'response.create',
+      model: 'gpt-5.5',
+      input: [{ role: 'user', content: 'hi' }],
+    })
+    await ws.complete('r1')
+    expect(managerOf(files)!.status().tracked).toBe(1)
+    acquireSessionAccounts(files.paths()).record('ses_ws', 'B')
+    shared.clock.now += 4 * MINUTE
+    await managerOf(files)!.tick()
+    expect(location.warms).toHaveLength(0)
+    expect(managerOf(files)!.status().tracked).toBe(0)
+  })
+
+  for (const parent of [
+    'x-opencode-parent-session-id',
+    'x-parent-session-id',
+    'parentID',
+  ]) {
+    for (const optedIn of [false, true]) {
+      test(`WebSocket subagent via ${parent} warms only with opt-in ${optedIn}`, async () => {
+        const files = keepWarmPool()
+        const config = JSON.parse(readFileSync(files.configPath, 'utf8'))
+        config.cacheKeep.subagents = optedIn
+        writeFileSync(files.configPath, JSON.stringify(config))
+        const shared = { clock: { now: START }, timers: fakeTimers() }
+        const location = await startLocation(
+          files,
+          shared,
+          undefined,
+          parent === 'parentID'
+            ? new Map([['ses_child', 'parent']])
+            : undefined,
+        )
+        const ws = await websocket(
+          location,
+          'ses_child',
+          parent === 'parentID' ? {} : { [parent]: 'parent' },
+        )
+        await ws.send({
+          type: 'response.create',
+          model: 'gpt-5.5',
+          input: [{ role: 'user', content: 'hi' }],
+        })
+        await ws.complete('r1')
+        shared.clock.now += 4 * MINUTE
+        await managerOf(files)!.tick()
+        expect(location.warms).toHaveLength(optedIn ? 1 : 0)
+        if (optedIn)
+          expect(managerOf(files)!.status().targets[0]!.isSubagent).toBe(true)
+      })
+    }
+  }
+})
 
 function keepWarmPool() {
   const files = poolFiles()
@@ -934,7 +1192,7 @@ describe('OpenCode 2 keep-warm in setup', () => {
       'sustain',
       'window',
     ])
-    expect(section.lines).toContain(
+    expect(section.lines).not.toContain(
       "Sessions using OpenCode 2's WebSocket are not warmed yet.",
     )
     expect((await apply('unknown', {})).ok).toBe(false)

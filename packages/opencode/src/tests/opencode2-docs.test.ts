@@ -21,7 +21,7 @@ test('OpenCode 2 docs offer log level changes and request dumps with their warni
   expect(unavailable).toContain(
     'vault enrollment and per-host account controls',
   )
-  expect(unavailable).toContain('HTTP keep-warm is available')
+  expect(unavailable).not.toContain('keep-warm')
   for (const passage of [menu, unavailable])
     expect(passage).not.toMatch(
       /\.ts\b|allowed\(|unavailableSections|hook|test/,
@@ -81,13 +81,13 @@ test('OpenCode 2 docs offer reset-credit preview and confirmed redemption, and n
   expect(menu).toContain('and spends nothing')
   expect(menu).toContain('spent only after you confirm it')
   expect(vault).toContain('Reset credits works only with local accounts')
-  expect(vault).toContain('Cache shows the tracked HTTP sessions')
+  expect(vault).toContain('Cache shows the tracked HTTP and WebSocket sessions')
   expect(unavailable).not.toMatch(/reset.credit|redemption/i)
   // Vault enrollment and per-host vault account controls remain unavailable.
   expect(unavailable).toContain(
     'vault enrollment and per-host account controls',
   )
-  expect(unavailable).toContain('HTTP keep-warm is available')
+  expect(unavailable).not.toContain('keep-warm')
   for (const passage of [menu, unavailable]) {
     expect(passage).not.toMatch(
       /\.ts\b|\.json\b|allowed\(|unavailableSections|hook|test/,
@@ -99,7 +99,7 @@ test('OpenCode 2 docs offer reset-credit preview and confirmed redemption, and n
   }
 })
 
-test('OpenCode 2 docs explain count placement and the two warmers without promising WebSocket warming', () => {
+test('OpenCode 2 docs explain count placement and invisible HTTP and WebSocket warming', () => {
   const doc = readFileSync(
     new URL('../../../../docs/opencode-2.md', import.meta.url),
     'utf8',
@@ -121,5 +121,5 @@ test('OpenCode 2 docs explain count placement and the two warmers without promis
     expect(text).toContain('keep-alive message')
     expect(text).toContain('WebSocket')
   }
-  expect(cache).toContain('WebSocket sessions are not warmed by the plugin yet')
+  expect(cache).toContain('both HTTP and WebSocket sessions')
 })

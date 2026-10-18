@@ -18,6 +18,7 @@ import {
 } from '../index'
 import { uuidV7 } from '../util/uuid-v7'
 import type { CodexSessionStore } from './codex-sessions'
+import type { FrameMirrorCapture } from './frame-mirror'
 import {
   type FrameTurn,
   FrameTurnState,
@@ -335,6 +336,50 @@ export async function rewriteCodexHttpRequest(
     },
   })
   return new Request(request, { headers, body: prepared.init?.body })
+}
+
+/** Replay the conversation through the last completed WebSocket response over HTTP. */
+export function codexReplayRequest(
+  capture: FrameMirrorCapture,
+  url: string,
+  socketHeaders: Headers,
+  state: CodexHttpState,
+): Request | undefined {
+  const session = state.sessions.get(capture.sessionID)
+  const turn = state.frameTurns.get(capture.sessionID)
+  if (!session || !turn) return undefined
+  const metadata = frameRequestMetadata(session, turn)
+  // Keep routing identity and the host's parent hint, not the handshake bearer.
+  const headers = new Headers({ 'content-type': 'application/json' })
+  for (const name of [
+    'chatgpt-account-id',
+    'x-opencode-parent-session-id',
+    'x-parent-session-id',
+  ]) {
+    const value = socketHeaders.get(name)
+    if (value !== null) headers.set(name, value)
+  }
+  // Prepare only HTTP headers. FrameMirrorCapture.bodyText already contains the
+  // completed conversation and the WebSocket request's other body fields.
+  prepareCodexRequest({
+    init: { body: capture.bodyText },
+    headers,
+    metadata,
+    installationID: state.installationID,
+    runtime: state.runtime,
+    websocket: false,
+    skipTurnUpdate: true,
+    responsesLite: false,
+    rewriteLite: () => {},
+  })
+  const endpoint = new URL(url)
+  if (endpoint.protocol === 'wss:') endpoint.protocol = 'https:'
+  if (endpoint.protocol === 'ws:') endpoint.protocol = 'http:'
+  return new Request(endpoint, {
+    method: 'POST',
+    headers,
+    body: capture.bodyText,
+  })
 }
 
 /**

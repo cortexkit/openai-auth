@@ -51,8 +51,6 @@ export function createControlPlaneMenu(
     ...context,
     allowAction: allowed,
     unavailableSections: [],
-    cacheKeepNotice:
-      "Sessions using OpenCode 2's WebSocket are not warmed yet.",
   }
   return {
     open: (sessionId) => openOpenAiMenu(controls, sessionId),

@@ -126,6 +126,8 @@ export function prepareCodexRequest(input: {
   responsesLite: boolean
   dumpSessionID?: string
   runtime?: CodexRequestRuntime
+  /** Background replays read the turn without recording history. Defaults to false. */
+  skipTurnUpdate?: boolean
   /** Each host owns its effort policy; it runs once, after host-history capture. */
   applyEffort?: (
     body: Record<string, unknown>,
@@ -140,10 +142,12 @@ export function prepareCodexRequest(input: {
   if (!input.metadata) return { init: input.init }
   const body = parseJsonObject(input.init?.body)
   const now = input.runtime?.now ?? Date.now
-  if (!input.websocket)
-    updateHttpTurnMetadata(input.metadata, body, input.runtime)
-  else if (!input.metadata.turnStartedAt) input.metadata.turnStartedAt = now()
-  if (!input.metadata.turnStartedAt) input.metadata.turnStartedAt = now()
+  if (!input.skipTurnUpdate) {
+    if (!input.websocket)
+      updateHttpTurnMetadata(input.metadata, body, input.runtime)
+    else if (!input.metadata.turnStartedAt) input.metadata.turnStartedAt = now()
+    if (!input.metadata.turnStartedAt) input.metadata.turnStartedAt = now()
+  }
   // HTTP compares the host's full conversation history to find a new user turn.
   // WebSocket turn identity is finalized by the pool after choosing which input
   // suffix to send, including its optional cache-warming request.

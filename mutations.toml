@@ -5745,3 +5745,83 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-f
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-frame-mirror.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode 2 frame mirror fifty output items never serialize the two MiB head and deltas are never parsed$']
+
+
+# WebSocket replay shares the HTTP manager, but must not become a real turn.
+[[control]]
+id = "opencode2-ws-replay-read-only-turn"
+guards = "building replay headers reads the current WebSocket turn without advancing it as an HTTP user request"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = "    skipTurnUpdate: true,"
+new = "    skipTurnUpdate: false, // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 WebSocket keep-warm two HTTP warms preserve the WebSocket turn, history and next tool-output input$']
+
+[[control]]
+id = "opencode2-ws-replay-http-headers"
+guards = "WebSocket replay obtains HTTP headers from the Codex builder rather than WebSocket handshake shaping"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = "    websocket: false,\n    skipTurnUpdate: true,"
+new = "    websocket: true, // NON-VACUITY BREAK\n    skipTurnUpdate: true,"
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 WebSocket keep-warm replay builds HTTP headers before the manager sanitizes the request$']
+
+[[control]]
+id = "opencode2-ws-replay-captures-completion"
+guards = "a completed mirror head is captured by the shared HTTP keep-warm manager"
+file = "packages/opencode/src/v2/setup.ts"
+old = "                      capture = head"
+new = "                      void head // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 WebSocket keep-warm two HTTP warms preserve the WebSocket turn, history and next tool-output input$']
+
+[[control]]
+id = "opencode2-ws-replay-retires-pending-target"
+guards = "a new primary WebSocket send retires an older warm so an unavailable baseline cannot replay stale history"
+file = "packages/opencode/src/v2/setup.ts"
+old = "    onOwnedFrame?.(sent.sessionID)"
+new = "    void sent.sessionID // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 WebSocket keep-warm an unavailable WebSocket baseline retires its warm until a full frame completes$']
+
+[[control]]
+id = "opencode2-ws-replay-parent-hint"
+guards = "WebSocket replay carries the host parent-session header into the S9 subagent opt-in rule"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = "    if (value !== null) headers.set(name, value)"
+new = "    if (value !== null && !name.includes('parent-session-id')) headers.set(name, value) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 WebSocket keep-warm WebSocket subagent via x-opencode-parent-session-id warms only with opt-in false$']
+
+[[control]]
+id = "opencode2-ws-replay-current-frame-turn"
+guards = "HTTP replay headers carry the WebSocket frame turn instead of the separate real HTTP turn"
+file = "packages/opencode/src/v2/codex-wire.ts"
+old = "  const metadata = frameRequestMetadata(session, turn)"
+new = "  const metadata = { ...session } // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-cache-keep.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 WebSocket keep-warm two HTTP warms preserve the WebSocket turn, history and next tool-output input$']

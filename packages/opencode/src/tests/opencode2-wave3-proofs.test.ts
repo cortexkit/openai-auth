@@ -929,7 +929,7 @@ describe.skipIf(!ENABLED)('OpenCode 2 wave 3 proofs (real host)', () => {
     }
   }, 300_000)
 
-  test('the production frame mirror follows host tool, compaction and failover conversations without warming', async () => {
+  test('the production WebSocket replay warms over HTTP invisibly and preserves the next socket chain', async () => {
     const host = await startProofHost({
       cli,
       consumer,
@@ -989,11 +989,60 @@ describe.skipIf(!ENABLED)('OpenCode 2 wave 3 proofs (real host)', () => {
       ).toBe(0)
       await assertHead()
       const beforeWarm = host.records().length
+      const beforeMessages = await messageCount(host, sessionID)
+      const beforeHooks = host.trace().length
+      const head = (await host.control(`/frame-mirror?session=${sessionID}`))
+        .json.body as Record<string, unknown>
+      const prior = host
+        .records()
+        .findLast((record) => record.action === 'frame')!
       const cache = await host.control('/cache-tick?advance=240000')
       expect(cache.json.status).toEqual([
-        expect.objectContaining({ tracked: 0 }),
+        expect.objectContaining({
+          tracked: 1,
+          targets: [expect.objectContaining({ warmCount: 1, failures: 0 })],
+        }),
       ])
-      expect(host.records().slice(beforeWarm)).toEqual([])
+      const warms = host
+        .records()
+        .slice(beforeWarm)
+        .filter(
+          (record) =>
+            record.transport === 'http' && record.outcome !== undefined,
+        )
+      expect(warms).toHaveLength(1)
+      const warm = warms[0]!
+      expect(warm).toMatchObject({ identity: 'B', outcome: 'text' })
+      const body = JSON.parse(warm.raw!)
+      expect(body.input).toEqual(head.input)
+      expect(body.prompt_cache_key).toBe(head.prompt_cache_key)
+      expect(body).toMatchObject({ store: false, stream: true })
+      for (const key of [
+        'type',
+        'previous_response_id',
+        'max_output_tokens',
+        'max_tokens',
+        'max_completion_tokens',
+      ])
+        expect(body).not.toHaveProperty(key)
+      expect(host.trace().slice(beforeHooks)).toEqual([])
+      expect(await messageCount(host, sessionID)).toEqual(beforeMessages)
+      expect(
+        (await host.turn('Turn 6: after invisible warm.', { continue: true }))
+          .exit,
+      ).toBe(0)
+      const next = host
+        .records()
+        .findLast((record) => record.action === 'frame')!
+      expect(JSON.parse(next.raw!).previous_response_id).toBe(prior.responseID)
+      await assertHead()
+      // Rerouting retires the old target before a replacement request exists.
+      await host.control(`/record-account?session=${sessionID}&account=main`)
+      const moved = host.records().length
+      expect(
+        (await host.control('/cache-tick?advance=240000')).json.status,
+      ).toMatchObject([{ tracked: 0 }])
+      expect(host.records()).toHaveLength(moved)
       expect(
         host
           .records()

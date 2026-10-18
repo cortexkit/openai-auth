@@ -50,7 +50,7 @@ On OpenCode 2, models show OpenCode's own prices, even when you use the plugin's
 
 On OpenCode 2, [`/openai`](commands.md#the-openai-command) shows the same sections as on OpenCode 1: Accounts, Quota, Routing, Limits, Cache, Diagnostics, Reset credits, This session and Vault. From it you can add accounts (browser or headless sign-in), turn accounts on and off, remove them after confirming, set their order and the routing mode, check quota, set quota floors and the killswitch, set the log level in Diagnostics, turn request dumps on and off, preview an account's [reset credits](accounts-and-routing.md#reset-credits), spend one or retry the last redemption, and clear the current session's account pin. The log level takes effect immediately and is saved for the next start. [Request dumps](troubleshooting.md#request-dumps) may contain prompt and session content; the menu warns you when you turn them on. Turn them off after debugging. Preview shows an account's quota, its reset credits and whether one can be spent, and spends nothing. A reset credit is spent only after you confirm it, and a spent credit can't be given back. The main account can't be removed; to replace the main login, use `opencode auth login`.
 
-While connected to the [vault](vault.md), the menu shows only vault accounts, and local account changes are refused. Quota checks, routing, floors, the killswitch, log level changes, request dumps and clearing a pin still work. Reset credits works only with local accounts, so while connected it says the accounts are managed in the vault and spends nothing, as on OpenCode 1. Cache shows the tracked HTTP sessions and lets you turn keep-warm and subagent warming on or off, sustain main sessions past their idle cap, and set a warm window.
+While connected to the [vault](vault.md), the menu shows only vault accounts, and local account changes are refused. Quota checks, routing, floors, the killswitch, log level changes, request dumps and clearing a pin still work. Reset credits works only with local accounts, so while connected it says the accounts are managed in the vault and spends nothing, as on OpenCode 1. Cache shows the tracked HTTP and WebSocket sessions and lets you turn keep-warm and subagent warming on or off, sustain main sessions past their idle cap, and set the hours when warming is allowed.
 
 ## Sidebar
 
@@ -64,4 +64,4 @@ One difference: OpenCode 2 always places the sidebar after its own panels, so th
 
 ## Not on OpenCode 2 yet
 
-The menu's vault enrollment and per-host account controls are not implemented on OpenCode 2 yet. The plugin does not warm sessions using OpenCode 2's WebSocket yet; HTTP keep-warm is available.
+The menu's vault enrollment and per-host account controls are not implemented on OpenCode 2 yet.

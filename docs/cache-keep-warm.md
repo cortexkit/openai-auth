@@ -1,6 +1,6 @@
 # Cache keep-warm
 
-Keep-warm is available on OpenCode 1 (the 1.x series) and for HTTP sessions on [OpenCode 2](opencode-2.md). OpenCode 2's WebSocket sessions are not warmed by the plugin yet. Keep-warm is not on Pi yet.
+Keep-warm is available on OpenCode 1 (the 1.x series) and for both HTTP and WebSocket sessions on [OpenCode 2](opencode-2.md). Keep-warm is not on Pi yet.
 
 The Cache section of the plugin's [`/openai` slash-command menu](commands.md#the-openai-command) keeps an idle session's prompt cached so its next turn can reuse it. Keep-warm replays the latest real request just before the cache expires, with `store: false` so the replay stores no turn. The cache lifetime is 30 minutes for GPT-5.6 and later, and five minutes by default for other models.
 

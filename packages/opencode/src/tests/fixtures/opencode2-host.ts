@@ -40,6 +40,7 @@ export function fakeOpenCode2Host(
     methods?: RegisteredMethod[]
     directory?: string
     sessions?: Map<string, string>
+    parents?: Map<string, string>
   } = {},
 ) {
   let activeCredential = options.activeCredential
@@ -82,6 +83,7 @@ export function fakeOpenCode2Host(
       : {}),
     session: {
       get: async ({ sessionID }: { sessionID: string }) => ({
+        parentID: options.parents?.get(sessionID),
         location: {
           directory: options.sessions?.get(sessionID) ?? options.directory,
         },
