@@ -496,6 +496,11 @@ describe('OpenCode 2 reset credits redemption', () => {
   test('a confirmed Spend redeems on the chosen account, verifies the window and reports the remaining credits', async () => {
     const f = await start()
     refreshesAfterReset(f)
+    // The pool polls every row when it loads, reading 2 available credits.
+    // With a fixed clock that reading ties with the post-spend re-check, and the
+    // newest-reading merge would keep whichever lands last. Move the clock so
+    // the re-check is newer, as it always is in use.
+    f.advance(1_000)
     const result = await f.confirm('alpha', 'spend')
     expect(result.ok).toBe(true)
     expect(text(result)).toContain('Code: `reset`')
