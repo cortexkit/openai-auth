@@ -278,6 +278,8 @@ export const LEGACY_LOCK_DEFAULTS: Readonly<LegacyLockOptions> = Object.freeze({
 export interface PoolMigrationDeps {
   paths: AccountPaths
   slot: HostSlotAdapter
+  /** Stop waiting for transfer locks; a transfer already holding them finishes. */
+  signal?: AbortSignal
   now?: () => number
   sleep?: (ms: number) => Promise<void>
   /** Id for a new row whose login carries no usable wire identity. */
@@ -548,9 +550,11 @@ async function acquireLock(
   name: string,
   path: string,
   ttlMs: number,
+  signal?: AbortSignal,
 ): Promise<HeldLock> {
   const started = performance.now()
   for (;;) {
+    if (signal?.aborted) throw new LegacyLockContention(name)
     const lock = await acquireRefreshFileLock({
       name,
       path,
@@ -560,7 +564,11 @@ async function acquireLock(
         ? { renewIntervalMs: ctx.locks.renewIntervalMs }
         : {}),
     })
-    if (lock) return lock
+    if (lock) {
+      if (!signal?.aborted) return lock
+      await lock.release()
+      throw new LegacyLockContention(name)
+    }
     if (performance.now() - started >= ctx.locks.timeoutMs)
       throw new LegacyLockContention(name)
     await ctx.sleep(ctx.locks.retryMs)
@@ -1834,12 +1842,14 @@ async function run(
       'pool-slot-transfer',
       ctx.slot.path ?? opencodeAuthPath(),
       ctx.locks.mainRefreshTtlMs,
+      deps.signal,
     )
     runLock = await acquireLock(
       ctx,
       POOL_MIGRATION_LOCK_NAME,
       ctx.paths.configPath,
       ctx.locks.mainRefreshTtlMs,
+      deps.signal,
     )
   } catch (error) {
     await slotLock?.release().catch(() => {})

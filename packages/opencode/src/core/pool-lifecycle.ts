@@ -143,6 +143,7 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
     deps.fence ?? (() => migrationFenceOpen({ currentVersion: deps.version }))
 
   let started = false
+  const abort = new AbortController()
   let stopped = false
   let isMigrated = false
   let failures = 0
@@ -167,6 +168,7 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
     slot: deps.slot,
     log,
     ...deps.runDeps,
+    signal: abort.signal,
   })
 
   /** Runs `task` after everything queued before it; never rejects. */
@@ -345,6 +347,9 @@ export function createPoolLifecycle(deps: PoolLifecycleDeps): PoolLifecycle {
     },
     dispose() {
       stopped = true
+      // No transfer has begun while its outer locks are contended. Let that
+      // wait end at disposal instead of holding shutdown for the lock budget.
+      abort.abort()
       if (timer !== undefined) timers.clear(timer)
       timer = undefined
     },

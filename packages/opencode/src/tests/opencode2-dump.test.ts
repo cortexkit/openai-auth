@@ -1,4 +1,4 @@
-import { afterEach, expect, spyOn, test } from 'bun:test'
+import { afterAll, afterEach, beforeEach, expect, spyOn } from 'bun:test'
 import {
   existsSync,
   readdirSync,
@@ -25,17 +25,51 @@ import {
   scope,
   seedPool,
 } from './fixtures/opencode2-host'
+import { openCode2PhaseClock } from './fixtures/opencode2-phase-clock'
+import { createRequestTestScope } from './request-test-scope'
 import { restoreEnv } from './setup-env'
 
 const cleanups: Array<() => unknown> = []
-afterEach(async () => {
-  for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
-  resetSettingsForTest()
-  requestDump.resetDumpStateForTest()
-  setLogLevel(undefined)
+const lifetime = createRequestTestScope()
+const clocks = new Set<ReturnType<typeof openCode2PhaseClock>>()
+const test = (name: string, body: () => Promise<void>) =>
+  lifetime.it(name, async () => {
+    try {
+      await body()
+    } catch (error) {
+      for (const clock of clocks) clock.report()
+      throw error
+    }
+  })
+let teardown: Promise<void> | undefined
+beforeEach(async () => {
+  // A hook timeout does not cancel its cleanup promise. Keep its spies and
+  // paths installed until it drains, before the next fixture captures them.
+  await teardown?.catch(() => {})
+})
+afterAll(async () => {
+  await teardown?.catch(() => {})
+})
+afterEach(() => {
+  teardown = lifetime.teardown(async () => {
+    try {
+      for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+    } finally {
+      resetSettingsForTest()
+      requestDump.resetDumpStateForTest()
+      setLogLevel(undefined)
+    }
+  })
+  return teardown
 })
 
 async function start(enabled = true) {
+  const clock = openCode2PhaseClock()
+  clocks.add(clock)
+  cleanups.push(() => {
+    clocks.delete(clock)
+    clock.dispose()
+  })
   await flushForTest()
   const files = poolFiles()
   cleanups.push(() => rmSync(files.dir, { recursive: true, force: true }))
@@ -82,22 +116,27 @@ async function start(enabled = true) {
   )
   cleanups.push(() => spy.mockRestore())
   const host = fakeOpenCode2Host()
-  const stop = await setupOpenAIAuth(host.ctx, {
-    paths: files.paths,
-    heartbeat: false,
-    sidebarStateFile: join(files.dir, 'sidebar.json'),
-    fetch: Object.assign(async () => new Response('{}', { status: 503 }), {
-      preconnect: () => {},
+  const stop = await clock.time('setup', () =>
+    setupOpenAIAuth(host.ctx, {
+      paths: files.paths,
+      heartbeat: false,
+      sidebarStateFile: join(files.dir, 'sidebar.json'),
+      fetch: Object.assign(async () => new Response('{}', { status: 503 }), {
+        preconnect: () => {},
+      }),
+      vault: {
+        stateDir: join(files.dir, 'vault'),
+        connectionFile: () => join(files.dir, 'no-vault.json'),
+        pollIntervalMs: 0,
+      },
     }),
-    vault: {
-      stateDir: join(files.dir, 'vault'),
-      connectionFile: () => join(files.dir, 'no-vault.json'),
-      pollIntervalMs: 0,
-    },
-  })
-  cleanups.push(async () => {
-    await stop?.()
-  })
+  )
+  let stopping: Promise<void> | undefined
+  const close = () =>
+    (stopping ??= clock.time('stop', async () => {
+      await stop?.()
+    }))
+  cleanups.push(close)
   const body = JSON.stringify({
     model: 'gpt-5.5',
     input: [],
@@ -165,9 +204,7 @@ async function start(enabled = true) {
     response,
     records,
     attempts,
-    stop: async () => {
-      await stop?.()
-    },
+    stop: close,
     // OpenCode 2's retry callback carries a session id, not the failed Request.
     // Call onAttemptEnd with a chosen Attempt to test request-specific errors
     // while the real setup still captures and correlates the outgoing Request.
