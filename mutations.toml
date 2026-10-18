@@ -5404,3 +5404,62 @@ only = false
 timeout_s = 600
 build_timeout_s = 1800
 
+
+[[control]]
+id = "opencode2-dump-next-test-drains"
+guards = "A timed-out dump hook drains before the next test captures shared installer spies or paths"
+file = "packages/opencode/src/tests/opencode2-dump.test.ts"
+old = """
+beforeEach(async () => {
+  // A hook timeout does not cancel its cleanup promise. Keep its spies and
+  // paths installed until it drains, before the next fixture captures them.
+  await teardown?.catch(() => {})
+})"""
+new = "beforeEach(() => { /* NON-VACUITY BREAK */ })"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-dump-isolation.test.ts"
+runner = "command"
+command = ["bash", "-c", 'git diff --stat -- packages/opencode/src/tests/opencode2-dump.test.ts; bun test --cwd packages/opencode ./src/tests/opencode2-dump-isolation.test.ts -t "$1"', "_", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump-isolation.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode 2 dump hook timeout fails only its owner and restores menu settings$"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "opencode2-dump-next-file-drains"
+guards = "The last timed-out dump cleanup restores settings before a later file opens the vault menu"
+file = "packages/opencode/src/tests/opencode2-dump.test.ts"
+old = """
+afterAll(async () => {
+  await teardown?.catch(() => {})
+})"""
+new = "afterAll(() => { /* NON-VACUITY BREAK */ })"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-dump-isolation.test.ts"
+runner = "command"
+command = ["bash", "-c", 'git diff --stat -- packages/opencode/src/tests/opencode2-dump.test.ts; bun test --cwd packages/opencode ./src/tests/opencode2-dump-isolation.test.ts -t "$1"', "_", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump-isolation.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode 2 last dump hook timeout drains before the next file reads settings$"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800
+
+[[control]]
+id = "opencode2-shutdown-cancels-lock-wait"
+guards = "Disposal cancels lifecycle transfer-lock waits before the shutdown cap without interrupting a transfer already holding its locks"
+file = "packages/opencode/src/core/pool-lifecycle.ts"
+old = "      abort.abort()"
+new = "      // NON-VACUITY BREAK"
+edits = []
+test_file = "packages/opencode/src/tests/opencode2-shutdown.test.ts"
+runner = "command"
+command = ["bash", "-c", 'git diff --stat -- packages/opencode/src/core/pool-lifecycle.ts; bun test --cwd packages/opencode ./src/tests/opencode2-shutdown.test.ts -t "$1"', "_", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-shutdown.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^OpenCode 2 shutdown stops waiting for a contended host-slot transfer lock$"]
+only = false
+timeout_s = 600
+build_timeout_s = 1800

@@ -30,7 +30,9 @@ async function timeoutChild(filter: string) {
       new Response(child.stdout).text(),
       new Response(child.stderr).text(),
     ])
-    const output = stdout + stderr
+    // Keep the child summary distinct from the outer Bun runner's test count
+    // when a failed assertion includes the captured child output.
+    const output = (stdout + stderr).replaceAll('Ran ', 'Child ran ')
     expect(code).toBe(1)
     expect(output).toContain(
       'a beforeEach/afterEach hook timed out for this test',

@@ -63,7 +63,11 @@ export function openCode2PhaseClock(
     }
     try {
       const result = action()
-      if (result instanceof Promise) void result.then(finish, finish)
+      if (result instanceof Promise)
+        void result.then(finish, () => {
+          failed = true
+          finish()
+        })
       else finish()
       return result
     } catch (error) {
