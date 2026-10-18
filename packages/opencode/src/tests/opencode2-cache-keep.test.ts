@@ -23,6 +23,7 @@ import {
   type CacheKeepLocation,
   type CacheKeepSettingsView,
 } from '../v2/cache-keep'
+import { acquireFrameMirror, FrameMirror } from '../v2/frame-mirror'
 import { setupOpenAIAuth } from '../v2/setup'
 import {
   fakeOpenCode2Host,
@@ -269,6 +270,27 @@ describe('OpenCode 2 keep-warm caps', () => {
     const options = spy.mock.calls[0]![0]
     expect(options.maxTargets).toBe(CACHE_KEEP_CAPS.maxTargets)
     expect(options.maxBytes).toBe(CACHE_KEEP_CAPS.maxBytes)
+  })
+
+  test('the OpenCode 2 manager effective caps equal the frame mirror caps', async () => {
+    const mirror = new FrameMirror()
+    const fake = fakeLocation()
+    const { lease } = acquire(fake.location)
+    for (let i = 0; i <= mirror.caps.maxTargets; i++)
+      await lease.capture(captured(`ses_${i}`))
+    expect(lease.manager.status().tracked).toBe(mirror.caps.maxTargets)
+    await lease.capture(
+      captured('too-large', { body: 'x'.repeat(mirror.caps.maxBytes + 1) }),
+    )
+    expect(
+      lease.manager.status().targets.some((t) => t.sessionKey === 'too-large'),
+    ).toBe(false)
+    await lease.capture(
+      captured('fits', { body: 'x'.repeat(mirror.caps.maxBytes) }),
+    )
+    expect(lease.manager.status().targets.map((t) => t.sessionKey)).toEqual([
+      'fits',
+    ])
   })
 
   test('the OpenCode 2 manager evicts the least recently used session past maxTargets', async () => {
@@ -884,6 +906,14 @@ describe('OpenCode 2 keep-warm in setup', () => {
     const directory = join(files.dir, 'A')
     const a = await startLocation(files, shared, directory)
     const b = await startLocation(files, shared, join(files.dir, 'B'))
+    const mirror = acquireFrameMirror(files.paths())
+    const frame = JSON.stringify({
+      type: 'response.create',
+      model: 'gpt-5.5',
+      input: [{ role: 'user', content: 'mirror' }],
+    })
+    mirror.send('ws_off', frame)
+    expect(mirror.status()).toEqual({ bytes: 0, sessions: [] })
     const client = createRpcClient(
       (await resolveRpcDir(directory)).dir,
       process.pid,
@@ -923,6 +953,13 @@ describe('OpenCode 2 keep-warm in setup', () => {
     const manager = managerOf(files)!
     expect(manager.status().tracked).toBe(0)
     expect((await apply('enabled', { enabled: true })).ok).toBe(true)
+    mirror.send('ws_on', frame)
+    mirror.receive(
+      'ws_on',
+      JSON.stringify({ type: 'response.completed', response: { id: 'r1' } }),
+    )
+    mirror.send('ws_pending', frame)
+    expect(mirror.status().sessions).toHaveLength(2)
     await b.request('ses_on')
     expect(manager.status().tracked).toBe(1)
     expect((await apply('subagents', { subagents: true })).ok).toBe(true)
@@ -957,6 +994,9 @@ describe('OpenCode 2 keep-warm in setup', () => {
       JSON.parse(readFileSync(files.configPath, 'utf8')).cacheKeep,
     ).toMatchObject({ enabled: true, subagents: false, sustain: true })
     expect((await apply('enabled', { enabled: false })).ok).toBe(true)
+    expect(mirror.status()).toEqual({ bytes: 0, sessions: [] })
+    mirror.send('ws_off_again', frame)
+    expect(mirror.status()).toEqual({ bytes: 0, sessions: [] })
     expect(manager.status().running).toBe(false)
     await b.request('ses_off_again')
     expect(manager.status().tracked).toBe(0)

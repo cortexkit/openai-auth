@@ -50,6 +50,7 @@ import {
 } from '../core/cachekeep'
 import type { PoolAccountSource } from '../core/pool-account-source'
 import type { OpenAIAttemptData } from './adapter'
+import { acquireFrameMirror } from './frame-mirror'
 import type { ActiveAccounts } from './session-accounts'
 
 /**
@@ -362,6 +363,8 @@ export function acquireCacheKeep(
     entries.set(key, entry)
   }
   const owned = entry
+  const mirror = acquireFrameMirror(paths)
+  mirror.setEnabled(owned.settings.enabled)
   const holder: Holder = {
     location: { ...location, settings: () => owned.settings },
   }
@@ -426,6 +429,7 @@ export function acquireCacheKeep(
     manager: owned.manager,
     configure: (settings) => {
       Object.assign(owned.settings, settings)
+      mirror.setEnabled(owned.settings.enabled)
     },
     capture,
     forget: (sessionID) => owned.manager.remove(sessionID),

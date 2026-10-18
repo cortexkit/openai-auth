@@ -929,6 +929,82 @@ describe.skipIf(!ENABLED)('OpenCode 2 wave 3 proofs (real host)', () => {
     }
   }, 300_000)
 
+  test('the production frame mirror follows host tool, compaction and failover conversations without warming', async () => {
+    const host = await startProofHost({
+      cli,
+      consumer,
+      transport: 'websocket',
+      accounts: ['A', 'B'],
+      used: { A: 5, B: 40 },
+      pool: true,
+      keepWarm: true,
+      compaction: { auto: false, keep: { tokens: 1 } },
+    })
+    try {
+      const first = await host.turn('Turn 1: USE-TOOL read the readme.')
+      const sessionID = first.sessionID ?? ''
+      const assertHead = async () => {
+        const result = await host.control(`/frame-mirror?session=${sessionID}`)
+        expect(result.status).toBe(200)
+        const body = result.json.body as Record<string, unknown>
+        const last = host
+          .trace()
+          .filter(
+            (event) =>
+              event.hook === 'context' && event.sessionID === sessionID,
+          )
+          .at(-1)
+        const view = providerView(body.input as unknown[])
+        expect(view.slice(0, -1)).toEqual(last?.view as string[])
+        expect(view.at(-1)).toStartWith('assistant:')
+        expect(body.stream).toBe(true)
+        expect(body).not.toHaveProperty('type')
+        expect(body).not.toHaveProperty('previous_response_id')
+        const probe = await host.control(`/replay-ws?session=${sessionID}`)
+        expect(body.input).toEqual(
+          (probe.json.body as Record<string, unknown>).input,
+        )
+      }
+      expect(first.exit).toBe(0)
+      await assertHead()
+      expect((await host.turn('Turn 2: hello.', { continue: true })).exit).toBe(
+        0,
+      )
+      await assertHead()
+      expect(await compact(host, sessionID)).toMatchObject({
+        started: 200,
+        waited: 204,
+      })
+      expect(
+        (await host.turn('Turn 3: after compaction.', { continue: true })).exit,
+      ).toBe(0)
+      await assertHead()
+      host.mock.reject('A')
+      expect(
+        (await host.turn('Turn 4: fail over.', { continue: true })).exit,
+      ).toBe(0)
+      await assertHead()
+      expect(
+        (await host.turn('Turn 5: new socket chain.', { continue: true })).exit,
+      ).toBe(0)
+      await assertHead()
+      const beforeWarm = host.records().length
+      const cache = await host.control('/cache-tick?advance=240000')
+      expect(cache.json.status).toEqual([
+        expect.objectContaining({ tracked: 0 }),
+      ])
+      expect(host.records().slice(beforeWarm)).toEqual([])
+      expect(
+        host
+          .records()
+          .filter((record) => record.action === 'handshake')
+          .map((r) => r.identity),
+      ).toEqual(['A', 'B'])
+    } finally {
+      await host.stop()
+    }
+  }, 300_000)
+
   test('P6: a WebSocket session as rebuilt from its frames', async () => {
     const host = await startProofHost({
       cli,
