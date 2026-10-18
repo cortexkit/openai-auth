@@ -3,13 +3,15 @@ import { resolve } from 'node:path'
 
 async function timeoutChild(filter: string) {
   const abort = new AbortController()
-  const deadline = setTimeout(() => abort.abort(), 4_000)
+  // The child waits out the fixture's 3.2 s delayed cleanup before its next
+  // file, plus Bun's start-up; 10 s leaves room on a loaded runner.
+  const deadline = setTimeout(() => abort.abort(), 10_000)
   const child = Bun.spawn(
     [
       process.execPath,
       'test',
       '--timeout',
-      '1000',
+      '2000',
       '--preload',
       './src/tests/fixtures/opencode2-dump-timeout.ts',
       './src/tests/opencode2-dump.test.ts',
@@ -56,11 +58,11 @@ test('OpenCode 2 dump hook timeout fails only its owner and restores menu settin
     '(pass) OpenCode 2 dumps final merged HTTP request once at status 400',
   )
   expect(output).toContain('2 pass')
-})
+}, 15_000)
 
 test('OpenCode 2 last dump hook timeout drains before the next file reads settings', async () => {
   const output = await timeoutChild(
     'final merged HTTP request once at status 200|disconnected output is byte-identical',
   )
   expect(output).toContain('1 pass')
-})
+}, 15_000)
