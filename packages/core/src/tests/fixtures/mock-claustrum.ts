@@ -98,6 +98,16 @@ export interface MockDaemon {
   grants?: Array<{ selector_kind: string; selector: string; operation: string }>
   insulaOpens: number
   insulaReads: number
+  /**
+   * While set, the daemon answers every vault call with this transport error
+   * code instead of the vault module's reply, as when the vault module cannot
+   * be reached through a live daemon. It fails at once, where a stopped
+   * daemon makes the client retry its connection for about three seconds per
+   * call.
+   */
+  outage?: string
+  /** The vault methods called while `outage` was set, in order. */
+  outageCalls: string[]
   /** Live transport connections, for consumer lifecycle assertions. */
   readonly connections: number
   onReport?: (report: MockReport) => void
@@ -144,6 +154,7 @@ export async function startMockDaemon(input: {
     lists: 0,
     insulaOpens: 0,
     insulaReads: 0,
+    outageCalls: [],
     ...(input.grants !== undefined && { grants: input.grants }),
     get connections() {
       return sockets.size
@@ -386,6 +397,16 @@ export async function startMockDaemon(input: {
             socket,
             header,
             { code: 'unknown_channel' },
+            subc.FrameType.Error,
+          )
+          continue
+        }
+        if (state.outage !== undefined) {
+          state.outageCalls.push(request.method ?? '')
+          writeResponse(
+            socket,
+            header,
+            { code: state.outage, message: 'mock vault unreachable' },
             subc.FrameType.Error,
           )
           continue

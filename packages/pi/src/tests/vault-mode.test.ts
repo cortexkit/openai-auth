@@ -711,6 +711,74 @@ describe('Pi in vault mode', () => {
     }
   }, 10_000)
 
+  // The vault stops answering after it has served this process a token. The
+  // shared vault code keeps the last token it served each account, in memory
+  // only, and serves it while the vault cannot be reached; `outage` makes the
+  // mock daemon answer every vault call with a transport error.
+  test('a request during a vault outage is sent with the kept token at its record version, the first after the vault returns is served fresh, and no local account is routed, refreshed or polled', async () => {
+    const running = await startMockDaemon({
+      directory: dir,
+      credentials: {
+        'oauth:openai:vault': vaultLogin('chatgpt-vault', {
+          record_version: 7,
+        }),
+      },
+    })
+    daemon = running
+    await addExpiredLocalRow()
+    enroll()
+    const target = vault()
+    const runtime = runtimeWith(target)
+    // The receipt behind each model request: its record version, and whether
+    // it was the token kept from an earlier read.
+    const receipts: Array<{ recordVersion: number; kept: boolean }> = []
+    const original = target.send.bind(target)
+    const sends = spyOn(target, 'send').mockImplementation(
+      (routeId, dispatch, options) =>
+        original(
+          routeId,
+          (token, attempt) => {
+            if (options.site === 'model')
+              receipts.push({
+                recordVersion: attempt.recordVersion,
+                kept: attempt.fromKeptReceipt === true,
+              })
+            return dispatch(token, attempt)
+          },
+          options,
+        ),
+    )
+    try {
+      await target.refresh()
+      await target.pollStale(0)
+      expect(errorOf(await send(runtime))).toBeUndefined()
+
+      running.outage = 'connection_dropped'
+      expect(errorOf(await send(runtime))).toBeUndefined()
+      expect(running.outageCalls).toContain('credential.get_scoped')
+      expect(codexTokens).toEqual([VAULT_ACCESS, VAULT_ACCESS])
+      expect(receipts).toEqual([
+        { recordVersion: 7, kept: false },
+        { recordVersion: 7, kept: true },
+      ])
+
+      const rotated = chatgptAccessToken('chatgpt-vault', 'rotated')
+      running.credentials['oauth:openai:vault'] = vaultLogin('chatgpt-vault', {
+        record_version: 8,
+        payload: JSON.stringify({ access_token: rotated }),
+      })
+      running.outage = undefined
+      expect(errorOf(await send(runtime))).toBeUndefined()
+      expect(codexTokens.at(-1)).toBe(rotated)
+      expect(receipts.at(-1)).toEqual({ recordVersion: 8, kept: false })
+      expect(whamTokens).not.toContain(chatgptAccessToken('chatgpt-local'))
+      expect(refreshes).toBe(0)
+    } finally {
+      sends.mockRestore()
+      target.close()
+    }
+  })
+
   test("disconnecting restores local routing: Pi's login serves again", async () => {
     daemon = await startMockDaemon({
       directory: dir,

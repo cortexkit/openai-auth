@@ -22,6 +22,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { MenuTerminal } from '@cortexkit/common-auth/auth-menu'
 import {
+  type ClaustrumScopedAttempt,
   connectClaustrumScopedClient,
   readClaustrumEnrollmentToken,
 } from '@cortexkit/common-auth/claustrum'
@@ -455,13 +456,20 @@ describe('migrated credential refusal messages', () => {
     expect(network.sends).toEqual([])
   })
 
+  // The account's quota reading comes from insula, so the vault has never
+  // served this process a token: once the vault is unreachable there is no
+  // kept token to send with.
   test('a vault refusal returns a distinct fixed explanatory local 401', async () => {
-    await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
+    const running = await startDaemon({
+      'oauth:openai:vault': vaultLogin('chatgpt-vault'),
+    })
+    running.insula = { reply: { result: [insulaReading('chatgpt-vault')] } }
     enroll()
     seedPool(files, [{ id: 'main', enabled: false, quota: quotaMap(10) }])
     const wire = installWire()
     await plugin()
     const send = await fetchOverride()
+    expect(running.gets).toEqual([])
     await daemon!.stop()
     daemon = undefined
     const response = await request(send)
@@ -552,6 +560,20 @@ describe('migrated credential refusal messages', () => {
     })
   }
 })
+
+/** A current insula quota reading for the vault account `account`. */
+function insulaReading(account: string) {
+  return {
+    provider: 'codex',
+    account,
+    fetchedAt: new Date(Date.now() - 60_000).toISOString(),
+    source: 'vault',
+    usage: {
+      primary: { usedPercent: 10, windowMinutes: 300 },
+      secondary: { usedPercent: 10, windowMinutes: 10080 },
+    },
+  }
+}
 
 async function fetchOverride(): Promise<typeof globalThis.fetch> {
   const loader = hooks?.auth?.loader
@@ -757,12 +779,9 @@ describe('vault cachekeep', () => {
     expect(running.reports).toEqual([])
   })
 
-  for (const refusal of [
-    'cold',
-    'declined',
-    'refused',
-    'unreachable',
-  ] as const) {
+  // An unreachable vault is not a refusal once it has served this process:
+  // the warm is sent with the kept token (see the outage tests below).
+  for (const refusal of ['cold', 'declined', 'refused'] as const) {
     test(`a ${refusal} vault warm backs off without a provider report`, async () => {
       const { running, vault, manager, sends, makeDue, routeId } =
         await trackedWarm()
@@ -772,11 +791,9 @@ describe('vault cachekeep', () => {
       } else if (refusal === 'declined') {
         if (!routeId) throw new Error('no vault route')
         await vault.decline(routeId)
-      } else if (refusal === 'refused') {
+      } else {
         running.credentials['oauth:openai:vault']!.refuse =
           'credential_unavailable'
-      } else {
-        await running.stop()
       }
       const gets = running.gets.length
       makeDue()
@@ -794,6 +811,46 @@ describe('vault cachekeep', () => {
       expect(sends).toHaveLength(1)
     })
   }
+
+  test('a vault warm during an outage is sent with the kept token and never reaches a local account', async () => {
+    const { running, manager, wire, sends, makeDue } = await trackedWarm(7)
+    running.outage = 'connection_dropped'
+    makeDue()
+    await manager.tick()
+    expect(running.outageCalls).toContain('credential.get_scoped')
+    expect(sends).toHaveLength(2)
+    expect(sends[1]?.headers.get('authorization')).toBe(
+      `Bearer ${VAULT_ACCESS}`,
+    )
+    expect(sends[1]?.headers.get('chatgpt-account-id')).toBe('chatgpt-vault')
+    expect(manager.status().targets[0]?.lastWarmedAt).toBeNumber()
+    await scope.settlePluginWork()
+    expect(wire.sends).not.toContain('Bearer main-token')
+    expect(wire.polls).not.toContain('Bearer main-token')
+    expect(wire.refreshTokens).toEqual([])
+  })
+
+  test('a 401 on a kept warm token is neither retried nor reported, and the account then refuses until the vault is back', async () => {
+    const { running, vault, manager, sends, makeDue, setStatus, routeId } =
+      await trackedWarm(7)
+    running.outage = 'connection_dropped'
+    setStatus(401)
+    makeDue()
+    await manager.tick()
+    expect(sends).toHaveLength(2)
+    expect(sends[1]?.headers.get('authorization')).toBe(
+      `Bearer ${VAULT_ACCESS}`,
+    )
+    expect(running.outageCalls).not.toContain('credential.report_auth_failure')
+    expect(manager.status().targets[0]?.backoffUntil).toBeGreaterThan(
+      Date.now(),
+    )
+    if (!routeId) throw new Error('no vault route')
+    expect(await vault.authorize(routeId)).toBeUndefined()
+    running.outage = undefined
+    expect(await vault.authorize(routeId)).toMatchObject({ recordVersion: 7 })
+    expect(running.reports).toEqual([])
+  })
 
   test('a warm 401 reports the served record version once and backs off', async () => {
     const { running, manager, sends, makeDue, setStatus } = await trackedWarm(7)
@@ -1953,6 +2010,125 @@ describe('routing', () => {
       'oauth:openai:b',
     ])
     expect(wire.sends).toEqual([`Bearer ${chatgptAccessToken('chatgpt-b')}`])
+  })
+})
+
+/**
+ * Records the receipt behind each model request a vault account served: the
+ * record version it was served at and whether it was the token kept from an
+ * earlier read because the vault could not be reached.
+ */
+function servedReceipts(vault: OpenAiVault) {
+  const receipts: Array<
+    Pick<ClaustrumScopedAttempt, 'recordVersion'> & {
+      kept: boolean
+    }
+  > = []
+  const original = vault.send.bind(vault)
+  const spy = spyOn(vault, 'send').mockImplementation(
+    (routeId, dispatch, options) =>
+      original(
+        routeId,
+        (token, attempt) => {
+          if (options.site === 'model')
+            receipts.push({
+              recordVersion: attempt.recordVersion,
+              kept: attempt.fromKeptReceipt === true,
+            })
+          return dispatch(token, attempt)
+        },
+        options,
+      ),
+  )
+  return { receipts, restore: () => spy.mockRestore() }
+}
+
+// The vault stops answering after it has served this process a token. The
+// shared vault code keeps the last token it served each account, in memory
+// only, and serves it while the vault cannot be reached; `outage` makes the
+// mock daemon answer every vault call with a transport error.
+describe('a vault outage after the vault has served this process', () => {
+  test('OpenCode 1: a request during an outage is sent with the kept token at its record version, the first one after the vault returns is served fresh, and no local account is routed, refreshed or polled', async () => {
+    const running = await startDaemon({
+      'oauth:openai:vault': vaultLogin('chatgpt-vault', { record_version: 7 }),
+    })
+    enroll()
+    // Two local rows with run-out tokens: a local refresh or poll would show
+    // on the wire, and fallback-first would put `spare` first if it routed.
+    seedPool(
+      files,
+      [
+        { id: 'main', quota: quotaMap(10), expires: Date.now() - HOUR },
+        { id: 'spare', quota: quotaMap(5), expires: Date.now() - HOUR },
+      ],
+      { routing: { mode: 'fallback-first' } },
+    )
+    const wire = installWire()
+    const { vault } = await plugin()
+    const send = await fetchOverride()
+    const { receipts, restore } = servedReceipts(vault)
+    try {
+      expect((await request(send)).status).toBe(200)
+
+      running.outage = 'connection_dropped'
+      expect((await request(send)).status).toBe(200)
+      expect(running.outageCalls).toContain('credential.get_scoped')
+      expect(wire.sends).toEqual([
+        `Bearer ${VAULT_ACCESS}`,
+        `Bearer ${VAULT_ACCESS}`,
+      ])
+      expect(receipts).toEqual([
+        { recordVersion: 7, kept: false },
+        { recordVersion: 7, kept: true },
+      ])
+
+      const rotated = chatgptAccessToken('chatgpt-vault', 'rotated')
+      running.credentials['oauth:openai:vault'] = vaultLogin('chatgpt-vault', {
+        record_version: 8,
+        payload: JSON.stringify({ access_token: rotated }),
+      })
+      running.outage = undefined
+      expect((await request(send)).status).toBe(200)
+      expect(wire.sends.at(-1)).toBe(`Bearer ${rotated}`)
+      expect(receipts.at(-1)).toEqual({ recordVersion: 8, kept: false })
+
+      await scope.settlePluginWork()
+      expect(wire.refreshTokens).toEqual([])
+      expect(wire.polls).not.toContain('Bearer main-token')
+      expect(wire.polls).not.toContain('Bearer spare-token')
+    } finally {
+      restore()
+    }
+  })
+
+  test('OpenCode 1: a vault refusal while reachable drops the kept token, so a later outage refuses with the vault-refused text and sends nothing', async () => {
+    const running = await startDaemon({
+      'oauth:openai:vault': vaultLogin('chatgpt-vault'),
+    })
+    enroll()
+    seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+    const wire = installWire()
+    await plugin()
+    const send = await fetchOverride()
+
+    // First, with nothing yet discarding the kept token, an outage is served with it.
+    running.outage = 'connection_dropped'
+    expect((await request(send)).status).toBe(200)
+    running.outage = undefined
+
+    const credential = running.credentials['oauth:openai:vault']
+    if (!credential) throw new Error('no credential')
+    credential.refuse = 'declined'
+    const refused = await request(send)
+    expect(refused.status).toBe(401)
+    expect(await refused.text()).toBe(VAULT_MODE_REFUSALS['vault-refused'])
+
+    delete credential.refuse
+    running.outage = 'connection_dropped'
+    const later = await request(send)
+    expect(later.status).toBe(401)
+    expect(await later.text()).toBe(VAULT_MODE_REFUSALS['vault-refused'])
+    expect(wire.sends).toEqual([`Bearer ${VAULT_ACCESS}`])
   })
 })
 
