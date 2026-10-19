@@ -15,11 +15,13 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { join } from 'node:path'
+import type { ClaustrumScopedAttempt } from '@cortexkit/common-auth/claustrum'
 import {
   OpenCode2AuthError,
   placeholderSecret,
 } from '@cortexkit/common-auth/opencode2'
 import {
+  OpenAiVault,
   VAULT_MODE_REFUSALS,
   type VaultModeRefusal,
   vaultModeRefusalText,
@@ -243,6 +245,28 @@ async function expectVaultRefusal(host: Host, cause: VaultModeRefusal) {
   )
 }
 
+/**
+ * The receipts the vault authorized from here on, in order: the record
+ * version each was served at and whether it was the token kept from an
+ * earlier read because the vault could not be reached.
+ */
+function authorizedReceipts() {
+  const spy = spyOn(OpenAiVault.prototype, 'authorize')
+  cleanups.push(() => spy.mockRestore())
+  return async () => {
+    const receipts: Array<{ recordVersion: number; kept: boolean }> = []
+    for (const result of spy.mock.results) {
+      const receipt = (await result.value) as ClaustrumScopedAttempt | undefined
+      if (receipt)
+        receipts.push({
+          recordVersion: receipt.recordVersion,
+          kept: receipt.fromKeptReceipt === true,
+        })
+    }
+    return receipts
+  }
+}
+
 async function send(host: Host, status: number) {
   const draftScope = scope('ses_1', 'primary')
   const headers = {
@@ -441,6 +465,78 @@ describe('vault accounts on OpenCode 2', () => {
         record_version: 7,
       }),
     ])
+  })
+
+  // The vault stops answering after it has served this process a token. The
+  // shared vault code keeps the last token it served each account, in memory
+  // only, and serves it while the vault cannot be reached; `outage` makes the
+  // mock daemon answer every vault call with a transport error.
+  it('during a vault outage a send carries the kept receipt at its record version, the first send after the vault returns is authorized fresh, and no pool row is asked for a token', async () => {
+    const { host, daemon } = await start('fallback-first', [{ id: 'main' }], {
+      'oauth:openai:vault': vaultLogin('chatgpt-vault', { record_version: 7 }),
+    })
+    const receipts = authorizedReceipts()
+    const tokens = spyOn(PoolAccountSource.prototype, 'usableToken')
+    cleanups.push(() => tokens.mockRestore())
+    expect((await send(host, 200)).get('authorization')).toBe(
+      `Bearer ${VAULT_ACCESS}`,
+    )
+
+    daemon.outage = 'connection_dropped'
+    const during = await send(host, 200)
+    expect(daemon.outageCalls).toContain('credential.get_scoped')
+    expect(during.get('authorization')).toBe(`Bearer ${VAULT_ACCESS}`)
+    expect(during.get('chatgpt-account-id')).toBe('chatgpt-vault')
+    expect((await receipts()).at(-1)).toEqual({ recordVersion: 7, kept: true })
+
+    const rotated = chatgptAccessToken('chatgpt-vault', 'rotated')
+    daemon.credentials['oauth:openai:vault'] = vaultLogin('chatgpt-vault', {
+      record_version: 8,
+      payload: JSON.stringify({ access_token: rotated }),
+    })
+    daemon.outage = undefined
+    expect((await send(host, 200)).get('authorization')).toBe(
+      `Bearer ${rotated}`,
+    )
+    expect((await receipts()).at(-1)).toEqual({ recordVersion: 8, kept: false })
+    expect(tokens).not.toHaveBeenCalled()
+  })
+
+  it('a 401 on a kept receipt is not reported, and the account then refuses for the rest of the outage', async () => {
+    const { host, daemon } = await start('fallback-first', [{ id: 'main' }], {
+      'oauth:openai:vault': vaultLogin('chatgpt-vault', { record_version: 7 }),
+    })
+    expect((await send(host, 200)).get('authorization')).toBe(
+      `Bearer ${VAULT_ACCESS}`,
+    )
+    daemon.outage = 'connection_dropped'
+    expect((await send(host, 401)).get('authorization')).toBe(
+      `Bearer ${VAULT_ACCESS}`,
+    )
+    await expectVaultRefusal(host, 'vault-refused')
+    expect(daemon.outageCalls).not.toContain('credential.report_auth_failure')
+    daemon.outage = undefined
+    expect(daemon.reports).toEqual([])
+  })
+
+  it('a 401 reported while the vault answers is not served again during a later outage', async () => {
+    const { host, daemon } = await start('fallback-first', [{ id: 'main' }], {
+      'oauth:openai:vault': vaultLogin('chatgpt-vault', { record_version: 7 }),
+    })
+    // First, with nothing yet discarding the kept token, an outage is served with it.
+    daemon.outage = 'connection_dropped'
+    expect((await send(host, 200)).get('authorization')).toBe(
+      `Bearer ${VAULT_ACCESS}`,
+    )
+    daemon.outage = undefined
+
+    await send(host, 401)
+    await waitFor(() => daemon.reports.length > 0, 'the 401 report')
+    expect(daemon.reports).toEqual([
+      expect.objectContaining({ provider_status: 401, record_version: 7 }),
+    ])
+    daemon.outage = 'connection_dropped'
+    await expectVaultRefusal(host, 'vault-refused')
   })
 
   it('refuses locally a request the vault refuses to serve: no local row takes it', async () => {

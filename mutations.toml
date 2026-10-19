@@ -5825,3 +5825,61 @@ command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-c
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-cache-keep.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode 2 WebSocket keep-warm two HTTP warms preserve the WebSocket turn, history and next tool-output input$']
+
+# A vault outage after the vault has served this process. The shared vault
+# code keeps the last token it served each account and serves it only while
+# the vault is unreachable; it drops that token on a 401 only if this plugin
+# hands the 401 to it. The mock daemon's outage switch must actually take the
+# vault down, or every outage proof passes against a reachable vault.
+
+[[control]]
+id = "vault-quota-401-status-reaches-custody"
+guards = "a usage-poll 401 reaches the vault code as a status, so a kept token OpenAI rejected is dropped instead of served again in the same outage"
+file = "packages/core/src/vault.ts"
+old = "          if (typeof status === 'number') return new Response(null, { status })"
+new = "          // NON-VACUITY BREAK: hide the HTTP status from the vault code."
+test_file = "packages/core/src/tests/vault-kept-receipt.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-kept-receipt.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-kept-receipt.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault quota polls through a vault outage a 401 on a kept quota token is neither retried nor reported, and the account then refuses$']
+
+[[control]]
+id = "opencode2-vault-401-reaches-custody"
+guards = "an OpenCode 2 send's 401 is handed to the vault code, so a kept token OpenAI rejected is not sent again in the same outage"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "      await vault?.reportFailure(data.receipt, 401)"
+new = "      // NON-VACUITY BREAK: never hand a 401 to the vault code."
+test_file = "packages/opencode/src/tests/opencode2-vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault accounts on OpenCode 2 a 401 on a kept receipt is not reported, and the account then refuses for the rest of the outage$']
+
+[[control]]
+id = "vault-report-failure-reaches-consumer"
+guards = "OpenAiVault.reportFailure passes a 401 to the shared consumer, which drops the kept token for that account"
+file = "packages/core/src/vault.ts"
+old = "      await this.#consumer.reportFailure(attempt, 401, 'direct')"
+new = "      void attempt // NON-VACUITY BREAK: drop the 401 before the vault code sees it."
+test_file = "packages/opencode/src/tests/opencode2-vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault accounts on OpenCode 2 a 401 on a kept receipt is not reported, and the account then refuses for the rest of the outage$']
+
+[[control]]
+id = "mock-claustrum-outage-takes-vault-down"
+guards = "the mock daemon's outage switch makes every vault call fail, so outage proofs never run against a reachable vault"
+file = "packages/core/src/tests/fixtures/mock-claustrum.ts"
+old = "        if (state.outage !== undefined) {"
+new = "        if (state.outage === 'never') { // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^a vault outage after the vault has served this process OpenCode 1: a request during an outage is sent with the kept token at its record version, the first one after the vault returns is served fresh, and no local account is routed, refreshed or polled$']
