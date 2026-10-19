@@ -2784,7 +2784,7 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/startup-order.test.ts", "-t", "{test}"]
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/startup-order.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^Pi\s1\.0\.4\sstartup\sswaps\sthe\senrolled\sslot\sbefore\sauth\sresolution\sand\sthe\sfirst\srequest$']
+expect_red = ['^Pi\s1\.3\.0\sstartup\sswaps\sthe\senrolled\sslot\sbefore\sauth\sresolution\sand\sthe\sfirst\srequest$']
 expect_message = "toBeGreaterThan"
 
 [[control]]
@@ -2798,7 +2798,7 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/startup-order.test.ts", "-t", "{test}"]
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/startup-order.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^Pi\s1\.0\.4\sstartup\sswaps\sthe\senrolled\sslot\sbefore\sauth\sresolution\sand\sthe\sfirst\srequest$']
+expect_red = ['^Pi\s1\.3\.0\sstartup\sswaps\sthe\senrolled\sslot\sbefore\sauth\sresolution\sand\sthe\sfirst\srequest$']
 expect_message = "expect(hostEntry.key).toBe(VAULT_PLACEHOLDER_KEY)"
 
 # Pi enrollment races: mode is re-read at local side-effect boundaries, and

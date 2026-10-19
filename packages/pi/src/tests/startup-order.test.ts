@@ -31,7 +31,7 @@ type ComposingRuntime = { composeProvider(id: string): Provider | undefined }
 
 // The SDK constructs its own ModelRuntime and loads the extension through Pi's
 // real loader. These observers delegate unchanged; they only record the order.
-test('Pi 1.0.4 startup swaps the enrolled slot before auth resolution and the first request', async () => {
+test('Pi 1.3.0 startup swaps the enrolled slot before auth resolution and the first request', async () => {
   if (process.env.PI_STARTUP_ORDER_CHILD !== '1') {
     const homeDir = mkdtempSync(join(tmpdir(), 'pi-vault-startup-home-'))
     try {
@@ -41,7 +41,7 @@ test('Pi 1.0.4 startup swaps the enrolled slot before auth resolution and the fi
           'test',
           './src/tests/startup-order.test.ts',
           '-t',
-          'Pi 1.0.4 startup swaps the enrolled slot before auth resolution and the first request',
+          'Pi 1.3.0 startup swaps the enrolled slot before auth resolution and the first request',
         ],
         {
           cwd: join(import.meta.dir, '../..'),
