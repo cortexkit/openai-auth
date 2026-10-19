@@ -253,7 +253,7 @@ async function expectVaultRefusal(host: Host, cause: VaultModeRefusal) {
 function authorizedReceipts() {
   const spy = spyOn(OpenAiVault.prototype, 'authorize')
   cleanups.push(() => spy.mockRestore())
-  return async () => {
+  const receipts = async () => {
     const receipts: Array<{ recordVersion: number; kept: boolean }> = []
     for (const result of spy.mock.results) {
       const receipt = (await result.value) as ClaustrumScopedAttempt | undefined
@@ -265,6 +265,20 @@ function authorizedReceipts() {
     }
     return receipts
   }
+  /**
+   * Waits until every vault that authorized a send reports kept receipts as
+   * inactive. That happens when the vault answers the `list_scoped` call a
+   * send served from a kept receipt starts in the background.
+   */
+  const answered = () =>
+    waitFor(
+      () =>
+        spy.mock.contexts.every(
+          (vault) => !(vault as OpenAiVault).keptReceiptState().active,
+        ),
+      'the vault to answer again',
+    )
+  return Object.assign(receipts, { answered })
 }
 
 async function send(host: Host, status: number) {
@@ -471,7 +485,7 @@ describe('vault accounts on OpenCode 2', () => {
   // shared vault code keeps the last token it served each account, in memory
   // only, and serves it while the vault cannot be reached; `outage` makes the
   // mock daemon answer every vault call with a transport error.
-  it('during a vault outage a send carries the kept receipt at its record version, the first send after the vault returns is authorized fresh, and no pool row is asked for a token', async () => {
+  it('during a vault outage a send carries the kept receipt at its record version, the first send after the vault answers again is authorized fresh, and no pool row is asked for a token', async () => {
     const { host, daemon } = await start('fallback-first', [{ id: 'main' }], {
       'oauth:openai:vault': vaultLogin('chatgpt-vault', { record_version: 7 }),
     })
@@ -495,6 +509,14 @@ describe('vault accounts on OpenCode 2', () => {
       payload: JSON.stringify({ access_token: rotated }),
     })
     daemon.outage = undefined
+    // The outage ends when the vault answers again, not on the next send:
+    // that send is still served the kept receipt at once and starts a
+    // background list, and once the list is answered sends are fresh.
+    expect((await send(host, 200)).get('authorization')).toBe(
+      `Bearer ${VAULT_ACCESS}`,
+    )
+    expect((await receipts()).at(-1)).toEqual({ recordVersion: 7, kept: true })
+    await receipts.answered()
     expect((await send(host, 200)).get('authorization')).toBe(
       `Bearer ${rotated}`,
     )
@@ -523,12 +545,19 @@ describe('vault accounts on OpenCode 2', () => {
     const { host, daemon } = await start('fallback-first', [{ id: 'main' }], {
       'oauth:openai:vault': vaultLogin('chatgpt-vault', { record_version: 7 }),
     })
+    const receipts = authorizedReceipts()
     // First, with nothing yet discarding the kept token, an outage is served with it.
     daemon.outage = 'connection_dropped'
     expect((await send(host, 200)).get('authorization')).toBe(
       `Bearer ${VAULT_ACCESS}`,
     )
     daemon.outage = undefined
+    // The outage lasts until the vault answers a call again. This send is
+    // served from the kept receipt (the token the vault last served) and
+    // starts a background `list_scoped` call; the vault's answer to that
+    // call ends the outage.
+    await send(host, 200)
+    await receipts.answered()
 
     await send(host, 401)
     await waitFor(() => daemon.reports.length > 0, 'the 401 report')

@@ -715,7 +715,7 @@ describe('Pi in vault mode', () => {
   // shared vault code keeps the last token it served each account, in memory
   // only, and serves it while the vault cannot be reached; `outage` makes the
   // mock daemon answer every vault call with a transport error.
-  test('a request during a vault outage is sent with the kept token at its record version, the first after the vault returns is served fresh, and no local account is routed, refreshed or polled', async () => {
+  test('a request during a vault outage is sent with the kept token at its record version, the first after the vault answers again is served fresh, and no local account is routed, refreshed or polled', async () => {
     const running = await startMockDaemon({
       directory: dir,
       credentials: {
@@ -768,6 +768,17 @@ describe('Pi in vault mode', () => {
         payload: JSON.stringify({ access_token: rotated }),
       })
       running.outage = undefined
+      // The outage ends when the vault answers again, not on the next send:
+      // that send is still served the kept token at once and starts a
+      // background list, and once the list is answered sends are fresh.
+      expect(errorOf(await send(runtime))).toBeUndefined()
+      expect(codexTokens.at(-1)).toBe(VAULT_ACCESS)
+      expect(receipts.at(-1)).toEqual({ recordVersion: 7, kept: true })
+      const deadline = Date.now() + 2_000
+      while (target.keptReceiptState().active) {
+        if (Date.now() > deadline) throw new Error('kept serving never ended')
+        await Bun.sleep(5)
+      }
       expect(errorOf(await send(runtime))).toBeUndefined()
       expect(codexTokens.at(-1)).toBe(rotated)
       expect(receipts.at(-1)).toEqual({ recordVersion: 8, kept: false })

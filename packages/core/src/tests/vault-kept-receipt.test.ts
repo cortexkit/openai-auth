@@ -116,6 +116,20 @@ async function setup() {
   }
 }
 
+/**
+ * Waits until `keptReceiptState().active` is false. During an outage, each
+ * send served a kept token also starts a `list_scoped` call in the
+ * background; when the vault answers that call, the outage ends and kept
+ * tokens are no longer served. The send itself never waits for that call.
+ */
+async function recovered(vault: OpenAiVault): Promise<void> {
+  const deadline = Date.now() + 2_000
+  while (vault.keptReceiptState().active) {
+    if (Date.now() > deadline) throw new Error('kept-token serving never ended')
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}
+
 const bearer = (account: string, salt = '') =>
   `Bearer ${chatgptAccessToken(account, salt)}`
 
@@ -140,9 +154,19 @@ describe('vault quota polls through a vault outage', () => {
         payload: JSON.stringify({ access_token: rotated }),
       }),
     })
+    // Once an outage has begun, a send does not wait on the vault: it is
+    // served the kept token at once and starts a background list that tells
+    // whether the vault is back.
+    expect(await env.vault.pollQuota(env.a)).toEqual({ ok: true })
+    expect(env.daemon.gets.map((get) => get.credential_id)).toEqual(['a'])
+    expect(env.wham[2]).toEqual({
+      account: 'account-a',
+      bearer: bearer('account-a'),
+    })
+    await recovered(env.vault)
     expect(await env.vault.pollQuota(env.a)).toEqual({ ok: true })
     expect(env.daemon.gets.map((get) => get.credential_id)).toEqual(['a', 'a'])
-    expect(env.wham[2]).toEqual({
+    expect(env.wham[3]).toEqual({
       account: 'account-a',
       bearer: `Bearer ${rotated}`,
     })
@@ -164,17 +188,21 @@ describe('vault quota polls through a vault outage', () => {
       const started = (await readLog())
         .split('\n')
         .filter((line) => line.includes('serving kept vault receipt'))
+      // One line per outage, naming only its reason: since common-auth
+      // 0.21.0 the outage belongs to the vault connection, not to a route.
       expect(started).toHaveLength(1)
-      expect(started[0]).toContain(`"routeId":"${env.a}"`)
       expect(started[0]).toContain('"reason":"unreachable"')
+      expect(started[0]).not.toContain(env.a)
 
       env.restore(credentials())
       expect(await env.vault.pollQuota(env.a)).toEqual({ ok: true })
+      await recovered(env.vault)
       const resumed = (await readLog())
         .split('\n')
         .filter((line) => line.includes('vault receipt serving resumed'))
       expect(resumed).toHaveLength(1)
-      expect(resumed[0]).toContain(`"routeId":"${env.a}"`)
+      expect(resumed[0]).toContain('"reason":"reachable"')
+      expect(resumed[0]).not.toContain(env.a)
       expect(await readLog()).not.toContain(chatgptAccessToken('account-a'))
     } finally {
       resetLoggerForTest()

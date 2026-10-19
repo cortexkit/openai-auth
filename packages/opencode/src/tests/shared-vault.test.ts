@@ -306,7 +306,7 @@ describe('one host vault per process', () => {
           .split('\n')
           .slice(1)
           .find((frame) => !frame.includes('shared-vault.test.ts')) ?? ''
-      if (!creator.includes('/vault.ts'))
+      if (!creator.includes('/claustrum/consumer.js'))
         return originalSetTimeout(callback, delay, ...args)
       const timer = {
         run: () => {

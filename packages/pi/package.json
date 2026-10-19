@@ -38,13 +38,13 @@
     "prepublishOnly": "bun run build"
   },
   "devDependencies": {
-    "@cortexkit/common-auth": "^0.20.0",
+    "@cortexkit/common-auth": "^0.21.0",
     "@cortexkit/openai-auth-core": "workspace:*"
   },
   "dependencies": {
-    "@cortexkit/claustrum-client": "^0.10.0",
+    "@cortexkit/claustrum-client": "^0.12.0",
     "@cortexkit/private-files": "^0.2.1",
-    "@cortexkit/subc-client": "^0.16.0"
+    "@cortexkit/subc-client": "^0.22.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=1.0.1",

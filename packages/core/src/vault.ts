@@ -12,9 +12,11 @@
  * Once enrolled (vault mode), the OpenAI credentials the vault lets this host
  * read are the only accounts the host routes (`routes()`): no local pool row,
  * login slot or native login is used, refreshed or polled until the host
- * disconnects. A vault row never holds a token: each send asks
- * the vault for one (`send`), deliberately without a cache, so a revoked
- * enrollment or a changed record takes effect on the next request. A 401 on a
+ * disconnects. A vault row never holds a token: while the vault is
+ * reachable each send asks it for one (`send`), deliberately without a
+ * cache, so a revoked enrollment or a changed record takes effect on the
+ * next request. Only while the vault cannot be reached does the shared
+ * consumer reuse the token it last served each account, in memory. A 401 on a
  * served credential is reported to the vault with the exact record version
  * that send used; nothing else is reported. Vault quota lives in the roster
  * file next to the token, not in the account store.
@@ -27,6 +29,7 @@ import {
   assertHostSlotMatchesMode,
   ClaustrumConsumer,
   ClaustrumConsumerError,
+  type ClaustrumConsumerOptions,
   type ClaustrumEnrollmentConnection,
   ClaustrumEnrollmentManager,
   type ClaustrumEnrollmentPaths,
@@ -34,11 +37,13 @@ import {
   type ClaustrumFamily,
   type ClaustrumScopedAttempt,
   type ClaustrumScopedClient,
+  type ClaustrumWatchState,
   connectClaustrumEnrollmentClient,
   connectClaustrumScopedClient,
   enrollmentAuthority,
   enrollmentName,
   hostEnrollmentPaths,
+  type KeptReceiptState,
   type QuotaReceipt,
   readClaustrumEnrollmentStatus,
   readVaultRoster,
@@ -261,6 +266,42 @@ export interface OpenAiVaultOptions {
   pollIntervalMs?: number
   fetchImpl?: () => typeof fetch
   now?: () => number
+  /**
+   * Replace the timers behind the background poll, the vault and insula
+   * watches' retries and the outage probe (tests).
+   */
+  setTimeoutImpl?: typeof setTimeout
+  clearTimeoutImpl?: typeof clearTimeout
+}
+
+type VaultInsulaQuota = NonNullable<
+  ReturnType<typeof normalizeInsulaCodexQuota>
+>
+
+/**
+ * The shared consumer, reporting every roster discovery to `onDiscovery`.
+ * Its own poll, its vault watch and its send path all start discoveries by
+ * calling `refresh()` on the instance, so overriding it here sees each one,
+ * including those `OpenAiVault` did not start itself.
+ */
+class ObservedConsumer extends ClaustrumConsumer<VaultInsulaQuota> {
+  readonly #onDiscovery: (
+    discovery: Promise<VaultRosterFile | undefined>,
+  ) => void
+
+  constructor(
+    options: ClaustrumConsumerOptions<VaultInsulaQuota>,
+    onDiscovery: (discovery: Promise<VaultRosterFile | undefined>) => void,
+  ) {
+    super(options)
+    this.#onDiscovery = onDiscovery
+  }
+
+  override refresh(): Promise<VaultRosterFile | undefined> {
+    const discovery = super.refresh()
+    this.#onDiscovery(discovery)
+    return discovery
+  }
 }
 
 /** One host's view of its OpenAI accounts in the vault. */
@@ -269,9 +310,7 @@ export class OpenAiVault {
   readonly name: string
   readonly paths: VaultPaths
   readonly #options: OpenAiVaultOptions
-  readonly #consumer: ClaustrumConsumer<
-    NonNullable<ReturnType<typeof normalizeInsulaCodexQuota>>
-  >
+  readonly #consumer: ObservedConsumer
   readonly #pulls = new Map<string, Promise<unknown>>()
   readonly #quotaPolls = new Map<
     string,
@@ -281,13 +320,15 @@ export class OpenAiVault {
   #consumerHasInsula: boolean | undefined
   #lastError: string | undefined
   #waiting: Promise<ClaustrumEnrollmentStatus> | undefined
-  /** The roster discovery this instance has in flight, if any. */
+  /**
+   * The roster discovery the consumer has in flight, if any, whoever started
+   * it: this class, the consumer's poll, its vault watch or a send.
+   */
   #discovery: Promise<VaultRosterFile | undefined> | undefined
   #polling = false
   #closed = false
   /** Settles once this instance's first roster discovery has, either way. */
   readonly #firstRoster = Promise.withResolvers<void>()
-  #pollTimer: ReturnType<typeof setTimeout> | undefined
   #authority: 'vault' | 'local' | 'unreadable' | 'unknown' = 'unknown'
   #authorityKey: string | undefined
 
@@ -296,25 +337,37 @@ export class OpenAiVault {
     this.host = options.host
     this.name = vaultEnrollmentName(options.host)
     this.paths = vaultPaths(options.stateDir, options.host)
-    this.#consumer = new ClaustrumConsumer({
-      rosterPath: this.paths.rosterPath,
-      tokenPath: this.paths.tokenPath,
-      family: VAULT_FAMILY,
-      connect: () => this.#connectScoped(),
-      // Unknown or unreadable enrollment must never enable local credentials.
-      isCustodyActive: () => this.enrolled(),
-      ...(options.reservedRouteIds
-        ? { reservedRouteIds: options.reservedRouteIds }
-        : {}),
-      parseIdentity: vaultIdentityOf,
-      insula: { provider: 'codex', normalize: normalizeInsulaCodexQuota },
-      ...(options.now ? { now: options.now } : {}),
-      onRoster: () => {
-        this.#lastError = undefined
+    this.#consumer = new ObservedConsumer(
+      {
+        rosterPath: this.paths.rosterPath,
+        tokenPath: this.paths.tokenPath,
+        family: VAULT_FAMILY,
+        connect: () => this.#connectScoped(),
+        // Unknown or unreadable enrollment must never enable local credentials.
+        isCustodyActive: () => this.#custodyActive(),
+        ...(options.reservedRouteIds
+          ? { reservedRouteIds: options.reservedRouteIds }
+          : {}),
+        parseIdentity: vaultIdentityOf,
+        insula: { provider: 'codex', normalize: normalizeInsulaCodexQuota },
+        ...(options.now ? { now: options.now } : {}),
+        ...(options.pollIntervalMs !== undefined
+          ? { pollIntervalMs: options.pollIntervalMs }
+          : {}),
+        ...(options.setTimeoutImpl
+          ? { setTimeoutImpl: options.setTimeoutImpl }
+          : {}),
+        ...(options.clearTimeoutImpl
+          ? { clearTimeoutImpl: options.clearTimeoutImpl }
+          : {}),
+        onRoster: () => {
+          this.#lastError = undefined
+        },
+        onError: (error) => this.#fail('vault roster refresh failed', error),
+        logger: log,
       },
-      onError: (error) => this.#fail('vault roster refresh failed', error),
-      logger: log,
-    })
+      (discovery) => this.#track(discovery),
+    )
   }
 
   #connectionFile(): string {
@@ -408,47 +461,53 @@ export class OpenAiVault {
   }
 
   /**
-   * Polls enrollment files and the vault's accounts. With local authority the
-   * consumer sends no vault request. A new enrollment completed by another
-   * process is detected on the next poll.
+   * The consumer's mode check, run before each of its discoveries, sends and
+   * quota reads. The enrollment files are read again only when they changed
+   * since the last read, so a new enrollment or a disconnect made by another
+   * process applies on the consumer's next poll.
+   */
+  async #custodyActive(): Promise<boolean> {
+    if (this.#authorityKey !== this.#enrollmentKey()) await this.authority()
+    return this.enrolled()
+  }
+
+  /**
+   * Starts the consumer's background poll and its vault and insula watches.
+   * With local authority the consumer sends no vault request. A new
+   * enrollment completed by another process is detected on the next poll.
+   * While the vault watch is open the poll lists the vault only every five
+   * minutes, and a notice that the visible accounts changed starts a
+   * discovery at once; without a watch (an older vault or client, or a
+   * refusal) every poll lists the vault as before.
    */
   start(): void {
-    // The poll runs here rather than in the consumer (`ClaustrumConsumer.start`)
-    // so every discovery this instance starts goes through `#discover`,
-    // which `refresh` needs to tell a discovery already in flight from one
-    // that began after it was called.
     if (this.#polling || this.#closed) return
     this.#polling = true
-    const tick = async () => {
-      try {
-        await this.authority()
-        await this.#discover()
-        await this.#consumer.refreshInsulaQuota()
-      } catch (error) {
-        if (!this.#closed) this.#fail('vault roster refresh failed', error)
-      }
-      if (this.#closed) return
-      const delay = this.#options.pollIntervalMs ?? 5_000
-      if (delay <= 0) return
-      this.#pollTimer = setTimeout(() => {
-        this.#pollTimer = undefined
-        void tick()
-      }, delay)
-      this.#pollTimer.unref?.()
-    }
-    void tick()
+    this.#consumer.start()
+  }
+
+  /**
+   * Remembers a discovery the consumer reports, so `refresh` can wait out one
+   * that was already running when it was called, and `firstRoster` settles
+   * once the first one ends.
+   */
+  #track(discovery: Promise<VaultRosterFile | undefined>): void {
+    if (this.#discovery === discovery) return
+    this.#discovery = discovery
+    discovery
+      .finally(() => {
+        if (this.#discovery === discovery) this.#discovery = undefined
+        this.#firstRoster.resolve()
+      })
+      .catch(() => {})
   }
 
   /**
    * One roster discovery through the consumer, shared by every caller that
-   * arrives while it runs.
+   * arrives while it runs (the consumer coalesces them).
    */
   #discover(): Promise<VaultRosterFile | undefined> {
-    this.#discovery ??= this.#consumer.refresh().finally(() => {
-      this.#discovery = undefined
-      this.#firstRoster.resolve()
-    })
-    return this.#discovery
+    return this.#consumer.refresh()
   }
 
   /**
@@ -504,6 +563,22 @@ export class OpenAiVault {
 
   snapshot(): VaultRosterFile | undefined {
     return this.#consumer.snapshot()
+  }
+
+  /**
+   * Whether the consumer learns about vault and insula changes from a watch
+   * or by polling, without any I/O.
+   */
+  watchState(): ClaustrumWatchState {
+    return this.#consumer.watchState()
+  }
+
+  /**
+   * Whether any account is being served the last token the vault gave it
+   * because the vault cannot be reached, without any I/O.
+   */
+  keptReceiptState(): KeptReceiptState {
+    return this.#consumer.keptReceiptState()
   }
 
   /**
@@ -938,8 +1013,6 @@ export class OpenAiVault {
   close(): void {
     this.#closed = true
     this.#firstRoster.resolve()
-    if (this.#pollTimer) clearTimeout(this.#pollTimer)
-    this.#pollTimer = undefined
     this.#consumer.close()
   }
 }

@@ -294,12 +294,12 @@ describe('vault command menu', () => {
           'utf8',
         ),
       )
-      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.20.0')
+      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.21.0')
       expect(
         (manifest.dependencies ?? manifest.devDependencies)[
           '@cortexkit/claustrum-client'
         ],
-      ).toBe('^0.10.0')
+      ).toBe('^0.12.0')
     }
   })
   // Vault mode is exclusive: while connected, the vault's accounts are the

@@ -2043,12 +2043,24 @@ function servedReceipts(vault: OpenAiVault) {
   return { receipts, restore: () => spy.mockRestore() }
 }
 
+/**
+ * Waits until the vault has answered again and kept-token serving ended. A
+ * send during an outage starts a background list; nothing waits on it.
+ */
+async function waitForVaultAnswer(vault: OpenAiVault): Promise<void> {
+  const deadline = Date.now() + 2_000
+  while (vault.keptReceiptState().active) {
+    if (Date.now() > deadline) throw new Error('kept-token serving never ended')
+    await Bun.sleep(5)
+  }
+}
+
 // The vault stops answering after it has served this process a token. The
 // shared vault code keeps the last token it served each account, in memory
 // only, and serves it while the vault cannot be reached; `outage` makes the
 // mock daemon answer every vault call with a transport error.
 describe('a vault outage after the vault has served this process', () => {
-  test('OpenCode 1: a request during an outage is sent with the kept token at its record version, the first one after the vault returns is served fresh, and no local account is routed, refreshed or polled', async () => {
+  test('OpenCode 1: a request during an outage is sent with the kept token at its record version, the first one after the vault answers again is served fresh, and no local account is routed, refreshed or polled', async () => {
     const running = await startDaemon({
       'oauth:openai:vault': vaultLogin('chatgpt-vault', { record_version: 7 }),
     })
@@ -2088,6 +2100,13 @@ describe('a vault outage after the vault has served this process', () => {
         payload: JSON.stringify({ access_token: rotated }),
       })
       running.outage = undefined
+      // The outage ends when the vault answers again, not on the next send:
+      // that send is still served the kept token at once and starts a
+      // background list, and once the list is answered sends are fresh.
+      expect((await request(send)).status).toBe(200)
+      expect(wire.sends.at(-1)).toBe(`Bearer ${VAULT_ACCESS}`)
+      expect(receipts.at(-1)).toEqual({ recordVersion: 7, kept: true })
+      await waitForVaultAnswer(vault)
       expect((await request(send)).status).toBe(200)
       expect(wire.sends.at(-1)).toBe(`Bearer ${rotated}`)
       expect(receipts.at(-1)).toEqual({ recordVersion: 8, kept: false })
@@ -2108,13 +2127,15 @@ describe('a vault outage after the vault has served this process', () => {
     enroll()
     seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
     const wire = installWire()
-    await plugin()
+    const { vault } = await plugin()
     const send = await fetchOverride()
 
     // First, with nothing yet discarding the kept token, an outage is served with it.
     running.outage = 'connection_dropped'
     expect((await request(send)).status).toBe(200)
     running.outage = undefined
+    // A list the vault answers ends the outage, so the next send asks it.
+    await vault.refresh()
 
     const credential = running.credentials['oauth:openai:vault']
     if (!credential) throw new Error('no credential')

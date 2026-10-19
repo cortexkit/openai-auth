@@ -1831,7 +1831,7 @@ expect_red = ["^vault\\scommand\\smenu\\sCheck\\snow\\sin\\svault\\smode\\spolls
 id = "menu-common-auth-release"
 guards = "all packages require the common-auth release whose file leases always use wall time"
 file = "packages/core/package.json"
-old = '"@cortexkit/common-auth": "^0.20.0"'
+old = '"@cortexkit/common-auth": "^0.21.0"'
 new = '"@cortexkit/common-auth": "^0.14.2"'
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
@@ -5882,4 +5882,35 @@ runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^a vault outage after the vault has served this process OpenCode 1: a request during an outage is sent with the kept token at its record version, the first one after the vault returns is served fresh, and no local account is routed, refreshed or polled$']
+expect_red = ['^a vault outage after the vault has served this process OpenCode 1: a request during an outage is sent with the kept token at its record version, the first one after the vault answers again is served fresh, and no local account is routed, refreshed or polled$']
+
+[[control]]
+id = "vault-start-opens-watches"
+guards = "OpenAiVault.start runs the shared consumer's poll, which opens the vault watch, so an idle vault-mode host stops listing the vault on every poll"
+file = "packages/core/src/vault.ts"
+old = "    this.#consumer.start()"
+new = """
+    // NON-VACUITY BREAK: the poll openai-auth ran itself before common-auth
+    // 0.21.0, which lists the vault on every tick and never opens a watch.
+    const tick = async () => {
+      try {
+        await this.#discover()
+        await this.#consumer.refreshInsulaQuota()
+      } catch {}
+      if (this.#closed) return
+      const delay = this.#options.pollIntervalMs ?? 5_000
+      if (delay <= 0) return
+      ;(this.#options.setTimeoutImpl ?? setTimeout)(() => void tick(), delay)
+    }
+    void tick()"""
+edits = []
+test_file = "packages/core/src/tests/vault-watch.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-watch.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-watch.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ["^vault watch an idle vault with an open watch lists the vault only when a notice shows a change$"]
+expect_message = "timed out waiting: the vault watch"
+only = false
+timeout_s = 600
+build_timeout_s = 1800

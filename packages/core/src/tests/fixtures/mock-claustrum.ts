@@ -36,7 +36,14 @@ interface SubcWire {
     corr: bigint
   }
   encodeFrame(frame: unknown): Uint8Array
-  FrameType: { Request: number; Response: number; Error: number }
+  FrameType: {
+    Request: number
+    Response: number
+    StreamData: number
+    Error: number
+    Cancel: number
+    Goodbye: number
+  }
   HEADER_LEN: number
   PROTOCOL_VERSION: number
   Priority: { Interactive: number }
@@ -81,6 +88,15 @@ export interface MockReport {
   reporter_source?: string
 }
 
+/**
+ * How the mock answers a watch (`auth.watch_scoped` on the vault route,
+ * `usage.watch` on insula's). `accept` holds it open and sends notice seq 1
+ * at once, as a current module does. `unsupported` refuses with
+ * `unknown_method`, as a module from before watches does. `not_accepting`
+ * ends it at once with no notice, as a draining vault does.
+ */
+export type MockWatchMode = 'accept' | 'unsupported' | 'not_accepting'
+
 export interface MockDaemon {
   connectionFile: string
   credentials: Record<string, MockCredential>
@@ -98,6 +114,23 @@ export interface MockDaemon {
   grants?: Array<{ selector_kind: string; selector: string; operation: string }>
   insulaOpens: number
   insulaReads: number
+  /** How the vault answers `auth.watch_scoped`; `unsupported` by default. */
+  watch: MockWatchMode
+  /** `auth.watch_scoped` requests received, accepted or not. */
+  watches: number
+  /** How insula answers `usage.watch`; `unsupported` by default. */
+  usageWatch: MockWatchMode
+  /** `usage.watch` requests received, accepted or not. */
+  usageWatches: number
+  /** Watches of either kind held open right now. */
+  readonly openWatches: { vault: number; usage: number }
+  /**
+   * Sends every open vault watch a notice carrying the current view, as the
+   * vault does when what the caller can see changes.
+   */
+  notifyVault(): void
+  /** Sends every open insula watch a notice naming `provider`. */
+  notifyUsage(provider?: string): void
   /**
    * While set, the daemon answers every vault call with this transport error
    * code instead of the vault module's reply, as when the vault module cannot
@@ -117,6 +150,14 @@ export interface MockDaemon {
 }
 
 type Wire = Record<string, unknown>
+
+/** One held watch: its socket, the request it answers and its next seq. */
+interface OpenWatch {
+  socket: Socket
+  header: ReturnType<SubcWire['decodeHeader']>
+  kind: 'vault' | 'usage'
+  seq: number
+}
 
 function error(code: string, errorClass = 'permanent'): Wire {
   return { error: { code, class: errorClass } }
@@ -143,6 +184,9 @@ export async function startMockDaemon(input: {
     }
   >()
   let nextRequest = 1
+  const watches = new Set<OpenWatch>()
+  // Names this daemon's lifetime in notices, as a module's process epoch does.
+  const noticeEpoch = `mock-${process.pid}-${Date.now()}`
 
   const state: MockDaemon = {
     connectionFile: '',
@@ -154,6 +198,25 @@ export async function startMockDaemon(input: {
     lists: 0,
     insulaOpens: 0,
     insulaReads: 0,
+    watch: 'unsupported',
+    watches: 0,
+    usageWatch: 'unsupported',
+    usageWatches: 0,
+    get openWatches() {
+      let vault = 0
+      let usage = 0
+      for (const watch of watches)
+        if (watch.kind === 'vault') vault++
+        else usage++
+      return { vault, usage }
+    },
+    notifyVault() {
+      for (const watch of watches) if (watch.kind === 'vault') notice(watch)
+    },
+    notifyUsage(provider) {
+      for (const watch of watches)
+        if (watch.kind === 'usage') notice(watch, provider)
+    },
     outageCalls: [],
     ...(input.grants !== undefined && { grants: input.grants }),
     get connections() {
@@ -171,6 +234,64 @@ export async function startMockDaemon(input: {
       if (entry) entry.status = 'denied'
     },
     stop: async () => {},
+  }
+
+  /** One notice on a held watch, in the module's wire shape for that kind. */
+  function notice(watch: OpenWatch, provider?: string): void {
+    const seq = watch.seq++
+    const body =
+      watch.kind === 'vault'
+        ? {
+            kind: 'changed',
+            epoch: noticeEpoch,
+            seq,
+            view: (inventory().result as Wire).view,
+            keys: '',
+          }
+        : {
+            kind: 'changed',
+            epoch: noticeEpoch,
+            seq,
+            ...(provider !== undefined && { provider }),
+          }
+    writeResponse(watch.socket, watch.header, body, subc.FrameType.StreamData)
+  }
+
+  /**
+   * Answers a watch request as `mode` says. An accepted watch is held until
+   * the client cancels it, closes its route or drops the connection.
+   */
+  function openWatch(
+    socket: Socket,
+    header: ReturnType<SubcWire['decodeHeader']>,
+    kind: OpenWatch['kind'],
+    mode: MockWatchMode,
+  ): void {
+    if (mode === 'unsupported') {
+      writeResponse(
+        socket,
+        header,
+        { code: 'unknown_method', message: 'mock module has no watch' },
+        subc.FrameType.Error,
+      )
+      return
+    }
+    if (mode === 'not_accepting') {
+      writeResponse(socket, header, { result: {} })
+      return
+    }
+    const watch: OpenWatch = { socket, header, kind, seq: 1 }
+    watches.add(watch)
+    notice(watch)
+  }
+
+  /** Forgets the watches a client ended (CANCEL, GOODBYE or a lost socket). */
+  function dropWatches(
+    socket: Socket,
+    match: (watch: OpenWatch) => boolean = () => true,
+  ): void {
+    for (const watch of watches)
+      if (watch.socket === socket && match(watch)) watches.delete(watch)
   }
 
   function inventory(): Wire {
@@ -307,12 +428,18 @@ export async function startMockDaemon(input: {
 
   const server = createServer((socket) => {
     sockets.add(socket)
-    socket.once('close', () => sockets.delete(socket))
+    socket.once('close', () => {
+      sockets.delete(socket)
+      dropWatches(socket)
+    })
     socket.on('error', () => {})
     let buffer = Buffer.alloc(0)
     let phase: 'hello' | 'auth' | 'frames' = 'hello'
-    let routeChannel: number | undefined
-    let insulaRoute = false
+    // Each route.open gets its own channel, so a client holding a watch on a
+    // dedicated route beside its call route reaches the right one. The value
+    // says whether the route is insula's.
+    const routes = new Map<number, { insula: boolean }>()
+    let nextChannel = 7
 
     socket.on('data', (chunk) => {
       buffer = Buffer.concat([
@@ -362,6 +489,22 @@ export async function startMockDaemon(input: {
           subc.HEADER_LEN + header.len,
         )
         buffer = buffer.subarray(subc.HEADER_LEN + header.len)
+        if (
+          header.ty === subc.FrameType.Cancel ||
+          header.ty === subc.FrameType.Goodbye
+        ) {
+          // A cancelled request names its corr; a GOODBYE ends the whole route.
+          dropWatches(
+            socket,
+            (watch) =>
+              watch.header.channel === header.channel &&
+              (header.ty === subc.FrameType.Goodbye ||
+                watch.header.corr === header.corr),
+          )
+          if (header.ty === subc.FrameType.Goodbye)
+            routes.delete(header.channel)
+          continue
+        }
         if (header.ty !== subc.FrameType.Request) continue
         const request = JSON.parse(body.toString('utf8')) as {
           method?: string
@@ -371,7 +514,7 @@ export async function startMockDaemon(input: {
         }
         if (header.channel === 0) {
           if (request.op === 'route.open') {
-            insulaRoute = request.target?.module_id === 'insula'
+            const insulaRoute = request.target?.module_id === 'insula'
             if (insulaRoute) {
               state.insulaOpens++
               if (!state.insula || state.insula.refusal) {
@@ -387,12 +530,19 @@ export async function startMockDaemon(input: {
                 continue
               }
             }
-            routeChannel = 7
+            const channel = nextChannel++
+            routes.set(channel, { insula: insulaRoute })
+            writeResponse(socket, header, {
+              route_channel: channel,
+              route_epoch: 1,
+            })
+            continue
           }
           writeResponse(socket, header, { route_channel: 7, route_epoch: 1 })
           continue
         }
-        if (header.channel !== routeChannel) {
+        const route = routes.get(header.channel)
+        if (!route) {
           writeResponse(
             socket,
             header,
@@ -401,6 +551,7 @@ export async function startMockDaemon(input: {
           )
           continue
         }
+        const insulaRoute = route.insula
         if (state.outage !== undefined) {
           state.outageCalls.push(request.method ?? '')
           writeResponse(
@@ -415,6 +566,16 @@ export async function startMockDaemon(input: {
           state.insulaReads++
           if (!state.insula?.hung)
             writeResponse(socket, header, state.insula?.reply ?? { result: [] })
+          continue
+        }
+        if (insulaRoute && request.method === 'usage.watch') {
+          state.usageWatches++
+          openWatch(socket, header, 'usage', state.usageWatch)
+          continue
+        }
+        if (!insulaRoute && request.method === 'auth.watch_scoped') {
+          state.watches++
+          openWatch(socket, header, 'vault', state.watch)
           continue
         }
         writeResponse(
