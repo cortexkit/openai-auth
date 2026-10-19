@@ -1,11 +1,20 @@
 import { describe, expect, it } from 'bun:test'
-import { readdirSync, readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import { getConfigDir } from '../config'
 import {
+  assertFloorSidebarLocal,
   FLOOR_ENV,
   FLOOR_ROOTS,
+  FLOOR_SIDEBAR_VAULT_LEAK,
   NETWORK_GUARD_MESSAGE,
   restoreEnv,
   unsetEnv,
@@ -71,5 +80,75 @@ describe('test environment floor', () => {
         })
     }
     expect(offenders).toEqual([])
+  })
+})
+
+// The floor sidebar file is shared by every test in the process. A vault-mode
+// snapshot left in it makes later local-mode writes drop their own routing
+// entries, so a later test fails or passes by file order alone. The preload
+// fails the test that leaves one.
+describe('floor sidebar file guard', () => {
+  const snapshot = (vaultAccounts?: unknown[]) =>
+    JSON.stringify({
+      main: { quota: null, killed: false },
+      fallbacks: [],
+      route: 'main-first',
+      lastUpdated: 1,
+      ...(vaultAccounts ? { vaultAccounts } : {}),
+    })
+
+  it('fails on a vault-mode snapshot and removes it so the next test starts clean', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oai-floor-sidebar-'))
+    try {
+      const file = join(dir, 'sidebar-state.json')
+      writeFileSync(file, snapshot([]))
+      expect(() => assertFloorSidebarLocal(file)).toThrow(
+        FLOOR_SIDEBAR_VAULT_LEAK,
+      )
+      expect(existsSync(file)).toBe(false)
+
+      // A local-mode snapshot is what every local test writes: kept.
+      writeFileSync(file, snapshot())
+      expect(() => assertFloorSidebarLocal(file)).not.toThrow()
+      expect(readFileSync(file, 'utf8')).toBe(snapshot())
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('fails the leaking test by name in a real bun test run and not the test after it', async () => {
+    // Without the floored file variables the child's preload makes a floor of
+    // its own (removed when it exits), so the fixture never touches this
+    // process's floor sidebar file. The root directories can stay: the
+    // child's preload replaces them unconditionally.
+    const env = { ...process.env }
+    for (const name of Object.keys(FLOOR_ENV)) {
+      if (!(name in FLOOR_ROOTS)) delete env[name]
+    }
+    const child = Bun.spawn(
+      [process.execPath, 'test', './src/tests/fixtures/floor-sidebar-leak.ts'],
+      {
+        cwd: resolve(import.meta.dir, '../..'),
+        env,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      },
+    )
+    const [code, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ])
+    // Keep the child's summary apart from this runner's own counts.
+    const output = (stdout + stderr).replaceAll('Ran ', 'Child ran ')
+    expect(output).toContain(FLOOR_SIDEBAR_VAULT_LEAK)
+    expect(output).toContain(
+      '(fail) leaves a vault-mode snapshot in the floor sidebar file',
+    )
+    expect(output).toContain(
+      '(pass) runs after the leaking test with the snapshot gone',
+    )
+    expect(output).toContain('1 fail')
+    expect(code).toBe(1)
   })
 })

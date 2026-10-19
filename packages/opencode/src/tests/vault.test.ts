@@ -115,6 +115,13 @@ beforeEach(() => {
   stateDir = join(dir, 'vault')
   process.env.OPENCODE_OPENAI_AUTH_FILE = files.configFile
   process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = files.stateFile
+  // Vault mode writes a vault-mode snapshot to the sidebar file. On the
+  // process-wide floor file it would outlive this test and strip the routing
+  // entries of the next local-mode test that runs in this process.
+  process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = join(
+    dir,
+    'sidebar.json',
+  )
   originalFetch = globalThis.fetch
 })
 

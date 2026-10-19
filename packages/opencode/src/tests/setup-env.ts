@@ -19,7 +19,7 @@
  */
 
 import { afterEach } from 'bun:test'
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { isAbsolute, join, resolve, sep } from 'node:path'
 
@@ -154,6 +154,54 @@ afterEach(() => {
     if (!process.env[name]) process.env[name] = value
   }
 })
+
+/** The failure text of `assertFloorSidebarLocal`, for tests that check it. */
+export const FLOOR_SIDEBAR_VAULT_LEAK =
+  'left a vault-mode snapshot in the shared floor sidebar file'
+
+/**
+ * Fail the test that leaves the shared floor sidebar file in vault mode.
+ *
+ * Every test that does not name its own OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE
+ * writes this one file, and it lives for the whole test process. A vault-mode
+ * machine snapshot (one that lists `vaultAccounts`) changes how every later
+ * write merges: while the file lists vault accounts, a write keeps only vault
+ * routing entries and pins (`writeMergedSidebarState`), so a later local-mode
+ * test loses the routing entry its request just recorded. Whether that test
+ * fails then depends on which file Bun happened to run before it, and Bun
+ * does not promise a file order (it differs between machines, and with
+ * --randomize), so the failure shows up on one CI host and not another. The
+ * file is removed before throwing, so only the test that left the snapshot
+ * fails, not every test after it.
+ */
+export function assertFloorSidebarLocal(
+  file: string = FLOOR_ENV.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE ??
+    FLOOR_SIDEBAR_STATE_FILE,
+): void {
+  let vaultMode = false
+  try {
+    const state = JSON.parse(readFileSync(file, 'utf8')) as unknown
+    vaultMode =
+      typeof state === 'object' &&
+      state !== null &&
+      Array.isArray((state as { vaultAccounts?: unknown }).vaultAccounts)
+  } catch {
+    // No file, or one no reader would parse: nothing that changes a merge.
+    return
+  }
+  if (!vaultMode) return
+  rmSync(file, { force: true })
+  throw new Error(
+    `This test ${FLOOR_SIDEBAR_VAULT_LEAK} (${file}). Later local-mode ` +
+      'tests would lose their sidebar routing entries. Point ' +
+      'OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE at a file of its own for any ' +
+      'test that runs the plugin in vault mode.',
+  )
+}
+
+// Runs after each test file's own afterEach, so the plugin has been disposed
+// and its sidebar writes drained by the time the file is read.
+afterEach(() => assertFloorSidebarLocal())
 
 // Tests never need the network. A request that escapes its stub (typically
 // background work from a loader that outlives the test that restored

@@ -1927,6 +1927,53 @@ list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode
 test_count_pattern = "Ran {count} test"
 expect_red = ['^drains\sa\sstarted\ssource\sread\sbefore\sthe\snext\swire,\snaming\sits\sowner$']
 
+# The floor sidebar file is shared by every test in a process. A vault-mode
+# snapshot left in it makes later local-mode writes drop their own routing
+# entries, so a later test fails by file order alone (Bun promises no file
+# order). The preload fails the test that leaves one, by name.
+
+[[control]]
+id = "floor-sidebar-guard-detects-vault-snapshot"
+guards = "the preload recognises a vault-mode snapshot left in the shared floor sidebar file"
+file = "packages/opencode/src/tests/setup-env.ts"
+old = "      Array.isArray((state as { vaultAccounts?: unknown }).vaultAccounts)"
+new = "      false // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/floor-env.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/floor-env.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/floor-env.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^floor\ssidebar\sfile\sguard\sfails\son\sa\svault-mode\ssnapshot\sand\sremoves\sit\sso\sthe\snext\stest\sstarts\sclean$']
+expect_message = "left a vault-mode snapshot in the shared floor sidebar file"
+
+[[control]]
+id = "floor-sidebar-guard-runs-after-each-test"
+guards = "the preload checks the floor sidebar file after every test and fails the test that left a vault-mode snapshot"
+file = "packages/opencode/src/tests/setup-env.ts"
+old = "afterEach(() => assertFloorSidebarLocal())"
+new = "// NON-VACUITY BREAK: the floor sidebar file is never checked."
+test_file = "packages/opencode/src/tests/floor-env.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/floor-env.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/floor-env.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^floor\ssidebar\sfile\sguard\sfails\sthe\sleaking\stest\sby\sname\sin\sa\sreal\sbun\stest\srun\sand\snot\sthe\stest\safter\sit$']
+expect_message = "left a vault-mode snapshot in the shared floor sidebar file"
+
+[[control]]
+id = "vault-tests-own-their-sidebar-file"
+guards = "vault-mode plugin tests write their own sidebar file, never the shared floor file a later local-mode test reads"
+file = "packages/opencode/src/tests/vault.test.ts"
+old = "  process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = join(\n    dir,\n    'sidebar.json',\n  )\n"
+new = "  // NON-VACUITY BREAK: write the shared floor sidebar file.\n"
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^routing\sa\svault\saccount\sserves\sa\srequest\sin\smain-first,\swith\sone\svault\sread\sper\ssend$']
+expect_message = "left a vault-mode snapshot in the shared floor sidebar file"
+
 # OpenCode 2: the pool handles a send only when the host-prepared bearer is its
 # placeholder; requests using other credentials pass through unchanged.
 
