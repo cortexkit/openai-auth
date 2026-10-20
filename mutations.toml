@@ -1199,6 +1199,34 @@ expect_message = "\"type\": \"configuration_update\","
 # later writes.
 
 [[control]]
+id = "vault-startup-roster-rejection-contained"
+guards = "the fire-and-forget startup quota poll absorbs a real expired roster lease and warns once"
+file = "packages/opencode/src/core/shared-vault.ts"
+old = "          log.warn('vault background quota poll failed', {"
+new = "          throw error // NON-VACUITY BREAK\n          log.warn('vault background quota poll failed', {"
+test_file = "packages/opencode/src/tests/roster-write-rejection.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/roster-write-rejection.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/roster-write-rejection.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\sstartup\svault\squota\spoll\scontains\san\sexpired\sroster\slease\sand\swarns\sonce$']
+expect_message = "background roster quota poll leaked LockOwnershipError"
+
+[[control]]
+id = "vault-interval-roster-rejection-contained"
+guards = "the interval quota callback absorbs a real expired roster lease and warns once"
+file = "packages/opencode/src/core/shared-vault.ts"
+old = "          log.warn('vault background quota poll failed', {"
+new = "          throw error // NON-VACUITY BREAK\n          log.warn('vault background quota poll failed', {"
+test_file = "packages/opencode/src/tests/roster-write-rejection.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/roster-write-rejection.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/roster-write-rejection.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\sinterval\svault\squota\spoll\scontains\san\sexpired\sroster\slease\sand\swarns\sonce$']
+expect_message = "background roster quota poll leaked LockOwnershipError"
+
+[[control]]
 id = "session-deletion-sidebar-rejection-contained"
 guards = "OpenCode discards event hook promises, so a real expired sidebar lease must not reject the session-deletion hook"
 file = "packages/opencode/src/index.ts"

@@ -5,7 +5,9 @@ import {
   OpenAiVault,
   type OpenAiVaultOptions,
 } from '@cortexkit/openai-auth-core/internal'
+import { createLogger } from '../logger'
 
+const log = createLogger('vault')
 const QUOTA_POLL_INTERVAL_MS = 60_000
 const QUOTA_STALE_AFTER_MS = 4 * 60_000
 
@@ -86,8 +88,16 @@ export function acquireOpenCodeVault(
       if (released || owned.started) return
       owned.started = true
       const pollQuota = async () => {
-        if (owned.holders.size && (await owned.vault.authority()) !== 'local')
-          await owned.vault.pollStale(QUOTA_STALE_AFTER_MS)
+        try {
+          if (owned.holders.size && (await owned.vault.authority()) !== 'local')
+            await owned.vault.pollStale(QUOTA_STALE_AFTER_MS)
+        } catch (error) {
+          // Startup and interval callbacks have no awaiting caller. A failed
+          // quota write must not escape this auxiliary background task.
+          log.warn('vault background quota poll failed', {
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
       }
       // Start owns the first read; later holders join its completion rather
       // than refreshing, which would deliberately start another discovery.
