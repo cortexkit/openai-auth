@@ -287,14 +287,20 @@ describe('vault command menu', () => {
     expect(quota.actions[0]?.knobs).toEqual([])
   })
   test('all three packages require the Windows private-file release', () => {
+    const root = join(import.meta.dir, '../../../..')
+    const sharedConsumer = Bun.resolveSync(
+      '@cortexkit/common-auth/claustrum',
+      join(root, 'packages/core'),
+    )
     for (const name of ['core', 'opencode', 'pi']) {
+      const packageDir = join(root, `packages/${name}`)
       const manifest = JSON.parse(
-        readFileSync(
-          join(import.meta.dir, '../../../..', `packages/${name}/package.json`),
-          'utf8',
-        ),
+        readFileSync(join(packageDir, 'package.json'), 'utf8'),
       )
-      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.21.0')
+      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.22.0')
+      expect(
+        Bun.resolveSync('@cortexkit/common-auth/claustrum', packageDir),
+      ).toBe(sharedConsumer)
       expect(
         (manifest.dependencies ?? manifest.devDependencies)[
           '@cortexkit/claustrum-client'

@@ -7,6 +7,10 @@ import { mutateVaultRoster } from '@cortexkit/common-auth/claustrum'
 
 import { flushForTest, initLogger, resetLoggerForTest } from '../logger'
 import { windowsFromQuotaMap } from '../pool-quota'
+import {
+  FIRST_QUOTA_READING_WAIT_MS,
+  waitForFirstQuotaReading,
+} from '../pool-routing'
 import { OpenAiVault } from '../vault'
 import {
   type MockDaemon,
@@ -133,7 +137,9 @@ describe('vault insula quota', () => {
 
   test('current hit skips wham only for its matched account', async () => {
     const env = await setup()
-    env.daemon.insula = { reply: { result: [current(env.now)] } }
+    env.daemon.insula = {
+      reply: { result: [current(env.now)], completeProviders: ['codex'] },
+    }
     const a = route(env.vault)
     const b = route(env.vault, 'account-b')
     expect(await env.vault.pollQuota(a)).toEqual({ ok: true })
@@ -232,7 +238,7 @@ describe('vault insula quota', () => {
             ],
           },
         },
-        missing: { reply: { result: [] } },
+        missing: { reply: { result: [], completeProviders: ['codex'] } },
         refused: { refusal: 'capability_denied' },
         hung: { hung: true },
         malformed: { reply: { result: {} } },
@@ -248,6 +254,147 @@ describe('vault insula quota', () => {
     },
     10_000,
   )
+
+  test('cold background polls defer wham within the provider bound', async () => {
+    const env = await setup()
+    env.daemon.insula = { reply: { result: [], pending: true } }
+    const results = await env.vault.pollStale(0)
+    expect(results).toHaveLength(2)
+    env.advance(119_999)
+    await env.vault.pollQuota(route(env.vault))
+    expect(env.wham).toEqual([])
+    expect(results.every((result) => !result.ok)).toBe(true)
+    expect(env.daemon.gets).toEqual([])
+    expect(env.vault.routes().every((row) => row.quota === undefined)).toBe(
+      true,
+    )
+  })
+
+  test('upstream-failed background polls defer wham', async () => {
+    const env = await setup()
+    env.daemon.insula = {
+      reply: {
+        result: [{ ...current(env.now), errorClass: 'upstream_failed' }],
+      },
+    }
+    const id = route(env.vault)
+    const result = await env.vault.pollQuota(id)
+    await env.vault.pollQuota(id)
+    expect(env.wham).toEqual([])
+    expect(result.ok).toBe(false)
+    expect(env.daemon.gets).toEqual([])
+    expect(
+      env.vault.routes().find((row) => row.id === id)?.quota,
+    ).toBeUndefined()
+  })
+
+  test('skip source transitions include reasons without duplicate consumer logs', async () => {
+    const env = await setup()
+    const id = route(env.vault)
+    const logFile = join(env.dir, 'vault.log')
+    resetLoggerForTest()
+    initLogger({ file: logFile, level: 'info' })
+    try {
+      const replies = [
+        { result: [] },
+        { result: [{ provider: 'codex', errorClass: 'upstream_failed' }] },
+        { result: [current(env.now + 120_000)] },
+      ]
+      for (const reply of replies) {
+        env.daemon.insula = { reply }
+        await env.vault.pollQuota(id)
+        await env.vault.pollQuota(id)
+        env.advance(60_000)
+      }
+      await flushForTest()
+      const text = readFileSync(logFile, 'utf8')
+      const transitions = text
+        .split('\n')
+        .filter((line) =>
+          line.includes('vault background quota source changed'),
+        )
+      expect(transitions).toHaveLength(3)
+      for (const [i, reason] of [
+        '"cold"',
+        '"upstream-failed"',
+        'null',
+      ].entries()) {
+        expect(transitions[i]).toContain(`"routeId":"${id}"`)
+        expect(transitions[i]).toContain('"source":"insula"')
+        expect(transitions[i]).toContain(`"reason":${reason}`)
+      }
+      expect(text).not.toContain('skipped insula provider poll')
+      expect(text).not.toContain('account-a')
+      expect(env.wham).toEqual([])
+    } finally {
+      resetLoggerForTest()
+    }
+  })
+
+  test.each(['stale', 'credential', 'absent', 'unreachable'] as const)(
+    '%s miss invokes exactly one account-bound fallback',
+    async (miss) => {
+      const env = await setup()
+      const entry = current(env.now)
+      const replies = {
+        stale: { result: [{ ...entry, stale: true }] },
+        credential: {
+          result: [{ provider: 'codex', errorClass: 'credential_rejected' }],
+        },
+        absent: { result: [], completeProviders: ['codex'] },
+        unreachable: { result: {} },
+      }
+      env.daemon.insula = { reply: replies[miss] }
+      const id = route(env.vault)
+      const poll = env.vault.pollQuota(id)
+      expect(env.vault.pollQuota(id)).toBe(poll)
+      expect(await poll).toEqual({ ok: true })
+      expect(env.wham).toEqual(['account-a'])
+      expect(env.daemon.gets).toHaveLength(1)
+      expect(
+        windowsFromQuotaMap(
+          env.vault.routes().find((row) => row.id === id)?.quota,
+        )?.primary?.usedPercent,
+      ).toBe(20)
+    },
+  )
+
+  test('cold provider bound expires across accounts after two minutes', async () => {
+    const env = await setup()
+    env.daemon.insula = { reply: { result: [] } }
+    await env.vault.pollQuota(route(env.vault))
+    env.advance(119_999)
+    const b = route(env.vault, 'account-b')
+    await env.vault.pollQuota(b)
+    expect(env.wham).toEqual([])
+    env.advance(1)
+    expect(await env.vault.pollQuota(b)).toEqual({ ok: true })
+    expect(env.wham).toEqual(['account-b'])
+  })
+
+  test('first quota wait settles on a skipped background poll within its bound', async () => {
+    const env = await setup()
+    env.daemon.insula = { reply: { result: [] } }
+    const id = route(env.vault)
+    const poll = env.vault.pollQuota(id)
+    const start = Date.now()
+    const waiting = waitForFirstQuotaReading({
+      rows: [{ id, kind: 'oauth' }],
+      now: env.now,
+      rateLimitMarks: new Map(),
+      refreshBackoff: new Map(),
+      killswitch: new Map(),
+      requestPull: (routeId) => env.vault.requestReading(routeId),
+    })
+    expect(waiting).toBeDefined()
+    await waiting
+    expect(Date.now() - start).toBeLessThan(FIRST_QUOTA_READING_WAIT_MS)
+    expect((await poll).ok).toBe(false)
+    expect(env.wham).toEqual([])
+    // A later request-time read is separate from the background poll and still fetches quota.
+    await env.vault.requestReading(id)
+    expect(env.wham).toEqual(['account-a'])
+  })
 
   test('refused next tick invalidates a previously current hit', async () => {
     const env = await setup()

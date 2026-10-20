@@ -343,7 +343,7 @@ expect_red = ["^vault\\srequestReading\\sreports\\srejected\\squota\\spolls\\swi
 id = "vault-quota-source-logs-only-transitions"
 guards = "a route with an unchanged background quota source is not logged again"
 file = "packages/core/src/vault.ts"
-old = "    if (this.#lastQuotaSource.get(routeId) === source) return"
+old = "    if (previous?.source === source && previous.reason === reason) return"
 new = "    if (false) return // NON-VACUITY BREAK: log unchanged quota polls."
 test_file = "packages/core/src/tests/vault-insula-quota.test.ts"
 runner = "command"
@@ -1859,7 +1859,7 @@ expect_red = ["^vault\\scommand\\smenu\\sCheck\\snow\\sin\\svault\\smode\\spolls
 id = "menu-common-auth-release"
 guards = "all packages require the common-auth release whose file leases always use wall time"
 file = "packages/core/package.json"
-old = '"@cortexkit/common-auth": "^0.21.0"'
+old = '"@cortexkit/common-auth": "^0.22.0"'
 new = '"@cortexkit/common-auth": "^0.14.2"'
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
@@ -3910,7 +3910,7 @@ expect_red = ['^vault\sinsula\squota\scurrent\shit\sskips\swham\sonly\sfor\sits\
 
 [[control]]
 id = "insula-vault-miss-falls-back"
-guards = "a missing insula entry leaves the existing wham poll in charge"
+guards = "an absent insula entry after a complete provider sweep leaves the existing wham poll in charge"
 file = "packages/core/src/vault.ts"
 old = "    let failure: string | undefined\n    const fetchImpl = this.#options.fetchImpl?.() ?? globalThis.fetch"
 new = "    if (background) return { ok: true } // NON-VACUITY BREAK\n    let failure: string | undefined\n    const fetchImpl = this.#options.fetchImpl?.() ?? globalThis.fetch"
@@ -3920,6 +3920,34 @@ command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-insula-qu
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^vault\sinsula\squota\smissing\ssource\sfalls\sback\sto\swham$']
+
+[[control]]
+id = "insula-vault-skip-upstream-failed"
+guards = "an upstream failure defers the background provider poll instead of multiplying account rate limits"
+file = "packages/core/src/vault.ts"
+old = "      return { ok: false, error: `insula ${reason}` }"
+new = "      return this.#pollProviderQuota(routeId, background) // NON-VACUITY BREAK"
+test_file = "packages/core/src/tests/vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sinsula\squota\supstream-failed\sbackground\spolls\sdefer\swham$']
+expect_message = 'expect(received).toEqual(expected)'
+
+[[control]]
+id = "insula-vault-skip-cold"
+guards = "a cold insula cache defers background provider polls within the bounded first-read wait"
+file = "packages/core/src/vault.ts"
+old = "      return { ok: false, error: `insula ${reason}` }"
+new = "      return this.#pollProviderQuota(routeId, background) // NON-VACUITY BREAK"
+test_file = "packages/core/src/tests/vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sinsula\squota\scold\sbackground\spolls\sdefer\swham\swithin\sthe\sprovider\sbound$']
+expect_message = 'expect(received).toEqual(expected)'
 
 [[control]]
 id = "insula-vault-hit-no-discovery"
