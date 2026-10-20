@@ -24,7 +24,6 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15",
-    "@cortexkit/common-auth": "file:.cortexkit/candidates/cortexkit-common-auth-0.22.0.tgz",
     "@cortexkit/openai-auth-core": "workspace:*",
     "@earendil-works/pi-ai": "1.3.0",
     "@earendil-works/pi-coding-agent": "1.3.0",
