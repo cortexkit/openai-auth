@@ -74,6 +74,8 @@ type VaultQuotaSourceReason =
   | 'insula-not-configured'
   | 'insula-unusable'
   | 'no-insula-reading'
+  | 'cold'
+  | 'upstream-failed'
   | null
 
 /** The plugin part of each host's enrollment name (`openai-auth-opencode`, `openai-auth-pi`). */
@@ -316,7 +318,10 @@ export class OpenAiVault {
     string,
     Promise<{ ok: boolean; error?: string }>
   >()
-  readonly #lastQuotaSource = new Map<string, VaultQuotaSource>()
+  readonly #lastQuotaSource = new Map<
+    string,
+    { source: VaultQuotaSource; reason: VaultQuotaSourceReason }
+  >()
   #consumerHasInsula: boolean | undefined
   #lastError: string | undefined
   #waiting: Promise<ClaustrumEnrollmentStatus> | undefined
@@ -364,7 +369,14 @@ export class OpenAiVault {
           this.#lastError = undefined
         },
         onError: (error) => this.#fail('vault roster refresh failed', error),
-        logger: log,
+        logger: {
+          ...log,
+          warn: (message, fields) => {
+            // The route-aware background source log below includes these skips.
+            if (message !== 'skipped insula provider poll')
+              log.warn(message, fields)
+          },
+        },
       },
       (discovery) => this.#track(discovery),
     )
@@ -401,8 +413,9 @@ export class OpenAiVault {
     source: VaultQuotaSource,
     reason: VaultQuotaSourceReason,
   ): void {
-    if (this.#lastQuotaSource.get(routeId) === source) return
-    this.#lastQuotaSource.set(routeId, source)
+    const previous = this.#lastQuotaSource.get(routeId)
+    if (previous?.source === source && previous.reason === reason) return
+    this.#lastQuotaSource.set(routeId, { source, reason })
     log.info('vault background quota source changed', {
       routeId,
       source,
@@ -738,7 +751,7 @@ export class OpenAiVault {
     )
   }
 
-  /** Joins a quota poll; current insula quota for the same account replaces a background ChatGPT wham/usage request. */
+  /** Joins a quota poll; insula decides whether a background provider read is needed. */
   pollQuota(
     routeId: string,
     background = true,
@@ -762,7 +775,22 @@ export class OpenAiVault {
       const row = (await readVaultRoster(this.paths.rosterPath))?.rows.find(
         (row) => row.routeId === routeId,
       )
-      const cached = await this.#consumer.cachedInsulaQuotaForRoute(routeId)
+      let fallback: { ok: boolean; error?: string } | undefined
+      const cached = await this.#consumer.pollInsulaQuotaForRoute(
+        routeId,
+        async () => {
+          this.#logQuotaSource(
+            routeId,
+            'fallback',
+            this.#consumerHasInsula === false
+              ? 'insula-not-configured'
+              : 'no-insula-reading',
+          )
+          fallback = await this.#pollProviderQuota(routeId, background)
+          return undefined
+        },
+      )
+      if (fallback) return fallback
       if (cached !== undefined && row?.accountIdentity) {
         const observation = observationFromSnapshot(
           cached,
@@ -785,14 +813,22 @@ export class OpenAiVault {
         this.#logQuotaSource(routeId, 'fallback', 'account-changed')
         return { ok: false, error: 'vault account changed' }
       }
-      this.#logQuotaSource(
-        routeId,
-        'fallback',
-        this.#consumerHasInsula === false
-          ? 'insula-not-configured'
-          : 'no-insula-reading',
-      )
+      // When insula skips this background poll, do not fall back to a provider read.
+      const { miss } = await this.#consumer.lookupInsulaQuotaForRoute(routeId)
+      const reason =
+        miss === 'cold' || miss === 'upstream-failed'
+          ? miss
+          : 'no-insula-reading'
+      this.#logQuotaSource(routeId, 'insula', reason)
+      return { ok: false, error: `insula ${reason}` }
     }
+    return this.#pollProviderQuota(routeId, background)
+  }
+
+  async #pollProviderQuota(
+    routeId: string,
+    background: boolean,
+  ): Promise<{ ok: boolean; error?: string }> {
     let failure: string | undefined
     const fetchImpl = this.#options.fetchImpl?.() ?? globalThis.fetch
     const response = await this.send(

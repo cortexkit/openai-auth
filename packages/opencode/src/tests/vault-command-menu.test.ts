@@ -287,14 +287,32 @@ describe('vault command menu', () => {
     expect(quota.actions[0]?.knobs).toEqual([])
   })
   test('all three packages require the Windows private-file release', () => {
-    for (const name of ['core', 'opencode', 'pi']) {
-      const manifest = JSON.parse(
-        readFileSync(
-          join(import.meta.dir, '../../../..', `packages/${name}/package.json`),
-          'utf8',
-        ),
+    const root = join(import.meta.dir, '../../../..')
+    const workspace = JSON.parse(
+      readFileSync(join(root, 'package.json'), 'utf8'),
+    )
+    const requirement = workspace.devDependencies['@cortexkit/common-auth']
+    if (requirement.startsWith('file:')) {
+      expect(requirement).toBe(
+        'file:.cortexkit/candidates/cortexkit-common-auth-0.22.0.tgz',
       )
-      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.21.0')
+    } else {
+      expect(Bun.semver.satisfies('0.22.0', requirement)).toBe(true)
+      expect(Bun.semver.satisfies('0.14.2', requirement)).toBe(false)
+    }
+    const sharedConsumer = Bun.resolveSync(
+      '@cortexkit/common-auth/claustrum',
+      root,
+    )
+    for (const name of ['core', 'opencode', 'pi']) {
+      const packageDir = join(root, `packages/${name}`)
+      const manifest = JSON.parse(
+        readFileSync(join(packageDir, 'package.json'), 'utf8'),
+      )
+      expect(manifest.devDependencies['@cortexkit/common-auth']).toBeUndefined()
+      expect(
+        Bun.resolveSync('@cortexkit/common-auth/claustrum', packageDir),
+      ).toBe(sharedConsumer)
       expect(
         (manifest.dependencies ?? manifest.devDependencies)[
           '@cortexkit/claustrum-client'
