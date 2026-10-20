@@ -1,18 +1,9 @@
-import {
-  execFileSync as defaultExecFileSync,
-  spawn as defaultSpawn,
-} from 'node:child_process'
-
-type BrowserExec = (
-  file: string,
-  args: string[],
-  options: { stdio: 'ignore'; timeout: number },
-) => unknown
+import { spawn as defaultSpawn } from 'node:child_process'
 
 type BrowserSpawn = (
   file: string,
   args: string[],
-  options: { stdio: 'ignore'; windowsHide: true },
+  options: { stdio: 'ignore'; windowsHide?: true },
 ) => {
   pid?: number
   unref(): void
@@ -22,7 +13,6 @@ type BrowserSpawn = (
 export function openUrl(
   url: string,
   platform: NodeJS.Platform = process.platform,
-  execFileSync: BrowserExec = defaultExecFileSync,
   spawn: BrowserSpawn = defaultSpawn,
 ): boolean {
   try {
@@ -56,11 +46,15 @@ export function openUrl(
       return child.pid !== undefined
     }
 
-    execFileSync(platform === 'darwin' ? 'open' : 'xdg-open', [url], {
+    const child = spawn(platform === 'darwin' ? 'open' : 'xdg-open', [url], {
       stdio: 'ignore',
-      timeout: 3000,
     })
-    return true
+    // A failed launch reports asynchronously; without a listener it would
+    // become an uncaught exception after this function has returned.
+    child.on('error', () => {})
+    child.unref()
+    // The URL handler's process may outlive the caller; a pid means launch began.
+    return child.pid !== undefined
   } catch {
     // Browser launch is best effort; the printed URL remains the fallback.
     return false

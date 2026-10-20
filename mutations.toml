@@ -3154,6 +3154,55 @@ list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode
 test_count_pattern = "Ran {count} test"
 expect_red = ['^browser\sopener\suses\sa\sshell-free\sPowerShell\scommand\sfor\sa\scomplete\sOAuth\sURL\son\sWindows$']
 
+[[control]]
+id = "opener-posix-does-not-wait"
+guards = "macOS and Linux browser openers start their URL handler without waiting for it"
+file = "packages/core/src/util/open-url.ts"
+old = '''    const child = spawn(platform === 'darwin' ? 'open' : 'xdg-open', [url], {
+      stdio: 'ignore',
+    })
+    // A failed launch reports asynchronously; without a listener it would
+    // become an uncaught exception after this function has returned.
+    child.on('error', () => {})
+    child.unref()
+    // The URL handler's process may outlive the caller; a pid means launch began.
+    return child.pid !== undefined'''
+new = '''    process.getBuiltinModule('node:child_process').execFileSync(
+      process.execPath,
+      ['-e', '0'],
+      { stdio: 'ignore', timeout: 3000 },
+    )
+    return true // NON-VACUITY BREAK'''
+test_file = "packages/opencode/src/tests/browser-opener.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/browser-opener.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/browser-opener.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^browser\sopener\slaunches\sopen\sand\sxdg-open\swithout\swaiting\son\smacOS\sand\sLinux$']
+expect_message = "macOS/Linux opener must launch asynchronously"
+
+[[control]]
+id = "opener-posix-handles-late-error"
+guards = "a late POSIX browser-spawn error is handled rather than raised as an uncaught exception"
+file = "packages/core/src/util/open-url.ts"
+old = '''    // A failed launch reports asynchronously; without a listener it would
+    // become an uncaught exception after this function has returned.
+    child.on('error', () => {})
+    child.unref()
+    // The URL handler's process may outlive the caller; a pid means launch began.'''
+new = '''    // A failed launch reports asynchronously; without a listener it would
+    // become an uncaught exception after this function has returned.
+    void child // NON-VACUITY BREAK: leave a late process error unhandled.
+    child.unref()
+    // The URL handler's process may outlive the caller; a pid means launch began.'''
+test_file = "packages/opencode/src/tests/browser-opener.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/browser-opener.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/browser-opener.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^browser\sopener\sdoes\snot\sthrow\swhen\sa\sbrowser\slaunch\serror\sarrives\safter\sreturn$']
+expect_message = "late browser launch errors must be handled"
+
 # Prevent local sends/writes after vault enrollment and remove credentials from provider errors.
 
 [[control]]
