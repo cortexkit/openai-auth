@@ -474,8 +474,28 @@ describe('prepaid credits on an OpenCode 1 WebSocket stream', () => {
   test('in local pool mode the frame credits reach the pool row and sidebar-state.json', async () => {
     await startDaemon()
     seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
-    installWire()
+    // Only the load-time usage poll answers (20%). A poll the request itself
+    // starts fails, so its reading cannot land after the frame's (30%) and
+    // replace it.
+    let polls = 0
+    installWire({
+      usage: () =>
+        polls++ === 0
+          ? new Response(usageBody(20), { status: 200 })
+          : new Response('', { status: 503 }),
+    })
     const server = codexSocket()
+    const poolPrimary = () => {
+      const quota = (
+        readJson(files.configFile).commonAuthPool as {
+          rows: Record<string, { quota?: QuotaMap }>
+        }
+      ).rows.main?.quota
+      const limit = quota?.limits.find(
+        (entry) => entry.label === 'primary' && entry.kind === 'reading',
+      )
+      return limit?.kind === 'reading' ? limit.usedPercent : undefined
+    }
     try {
       await plugin(
         { ...PLACEHOLDER },
@@ -483,6 +503,11 @@ describe('prepaid credits on an OpenCode 1 WebSocket stream', () => {
           experimentalWebSockets: true,
           codexApiEndpoint: new URL('/responses', server.url).href,
         },
+      )
+      // Let the load-time reading land before the request.
+      await waitFor(
+        () => (poolPrimary() === 20 ? true : undefined),
+        'the load-time usage poll in the pool row',
       )
       await (await request(await fetchOverride(), 'ws-credits', true)).text()
       // Wait for the frame's window reading, then check the credits it
