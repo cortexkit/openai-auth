@@ -1,6 +1,7 @@
 // Renders the expanded sidebar on OpenCode 2 (the `sidebar.content` slot) and
-// OpenCode 1 (the `sidebar_content` slot) at every frame width from 42 columns
-// (the sidebar width OpenCode uses) down to 16, and checks each quota row:
+// OpenCode 1 (the `sidebar_content` slot) at every width the plugin may be
+// given, from 42 cells down to 16 (a default OpenCode sidebar gives it 36 or
+// 37), and checks each quota row:
 // it stays on one line, keeps a space between the "N% left" figure and the
 // reset time, and when the row is too narrow drops the reset first, then
 // shortens the bar. The pacing line under a row is cut with … rather than
@@ -247,6 +248,15 @@ try {
         `the ${row.label} row is not laid out as expected ${at}`,
       )
       assert.equal(line.match(BAR)?.length ?? 0, bar)
+      // OpenCode gives the plugin 36 cells (OpenCode 1 once the sidebar
+      // scrollbar shows) or 37 (OpenCode 2). At those widths and wider an
+      // ordinary row draws whole: full bar, figure, one blank cell at least,
+      // reset.
+      if (width >= 36)
+        assert.ok(
+          bar === BAR_WIDTH && line.endsWith(` ${row.reset}`),
+          `the ${row.label} row is not drawn whole ${at}`,
+        )
     }
     if (width === FULL_WIDTH)
       for (const row of rows)
