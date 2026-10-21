@@ -6131,3 +6131,35 @@ list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode
 test_count_pattern = "Ran {count} test"
 expect_red = ['^prepaid\scredits\sfrom\sthe\sCodex\sbackend\slocal\spool\smode:\susage-poll\scredits\sreach\sthe\srow\squota\smap\sand\ssidebar-state\.json$']
 expect_message = "expect(state.main.quota?.credits).toEqual(credits)"
+
+[[control]]
+id = "prepaid-credits-websocket"
+guards = "a codex.rate_limits frame's prepaid credits are kept, so WebSocket traffic records them in the pool and the sidebar"
+file = "packages/core/src/quota-normalize.ts"
+old = "  const credits = creditsFromWs(event.credits)\n  if (credits) snapshot.credits = credits"
+new = "  const credits = creditsFromWs(event.credits)\n  if (false && credits) snapshot.credits = credits // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^prepaid\scredits\son\san\sOpenCode\s1\sWebSocket\sstream\sin\slocal\spool\smode\sthe\sframe\scredits\sreach\sthe\spool\srow\sand\ssidebar-state\.json$']
+expect_message = "expect(stored.credits).toEqual(expected)"
+
+# OpenCode 2's native select lists a Quota item's compact reading in the
+# footer and its full reading as the option text; joining both showed the
+# reading twice.
+
+[[control]]
+id = "opencode2-quota-shown-once"
+guards = "OpenCode 2 lists each account's quota once, with the status in the footer as OpenCode 1 does"
+file = "packages/opencode/src/tui/v2-dialog.ts"
+old = "          description: inlineDescription(item.detail),"
+new = "          description: inlineDescription(item.status, item.detail), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^prepaid\scredits\sin\s/openai\sQuota\sOpenCode\s2\sshows\seach\saccount\squota\sonce,\sas\sOpenCode\s1\sdoes$']
+expect_message = "expect(native).toMatchObject({"

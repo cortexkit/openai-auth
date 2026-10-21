@@ -26,7 +26,7 @@ import {
   connectClaustrumScopedClient,
   readClaustrumEnrollmentToken,
 } from '@cortexkit/common-auth/claustrum'
-import { quotaCodec } from '@cortexkit/common-auth/quota'
+import { type QuotaMap, quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore } from '@cortexkit/common-auth/store'
 import {
   loadAccounts,
@@ -417,6 +417,141 @@ describe('OpenCode 1 vault stream admission', () => {
         expect.objectContaining({ usedPercent: 10 }),
       )
       spy.mockRestore()
+    } finally {
+      await hooks?.dispose?.()
+      hooks = undefined
+      await server.stop(true)
+    }
+  })
+})
+
+describe('prepaid credits on an OpenCode 1 WebSocket stream', () => {
+  // The codex.rate_limits frame carries the workspace's prepaid credits as
+  // the Codex client reads them: has_credits and unlimited, and a balance
+  // the backend sends as a string.
+  const credits = { has_credits: true, unlimited: false, balance: '87.4' }
+
+  /** A Codex WebSocket that answers each request with one quota frame. */
+  function codexSocket() {
+    return Bun.serve({
+      port: 0,
+      fetch(req, server) {
+        if (server.upgrade(req)) return
+        return new Response('websocket required', { status: 400 })
+      },
+      websocket: {
+        message(ws, message) {
+          if (JSON.parse(String(message)).generate !== false)
+            ws.send(
+              JSON.stringify({
+                type: 'codex.rate_limits',
+                rate_limits: {
+                  primary: { used_percent: 30, window_minutes: 300 },
+                  secondary: null,
+                },
+                credits,
+              }),
+            )
+          ws.send(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: 'completed' },
+            }),
+          )
+        },
+      },
+    })
+  }
+
+  const sidebarFile = () => join(dir, 'sidebar.json')
+  const expected = {
+    hasCredits: true,
+    unlimited: false,
+    balance: 87.4,
+    checkedAt: expect.any(Number),
+  }
+
+  test('in local pool mode the frame credits reach the pool row and sidebar-state.json', async () => {
+    await startDaemon()
+    seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+    installWire()
+    const server = codexSocket()
+    try {
+      await plugin(
+        { ...PLACEHOLDER },
+        {
+          experimentalWebSockets: true,
+          codexApiEndpoint: new URL('/responses', server.url).href,
+        },
+      )
+      await (await request(await fetchOverride(), 'ws-credits', true)).text()
+      // Wait for the frame's window reading, then check the credits it
+      // carried arrived with it.
+      const stored = await waitFor(() => {
+        const row = (
+          readJson(files.configFile).commonAuthPool as {
+            rows: Record<string, { quota?: QuotaMap }>
+          }
+        ).rows.main
+        return row?.quota?.limits.some(
+          (limit) => limit.kind === 'reading' && limit.usedPercent === 30,
+        )
+          ? row.quota
+          : undefined
+      }, 'the frame reading in the pool row')
+      expect(stored.credits).toEqual(expected)
+      const sidebar = await waitFor(() => {
+        try {
+          const state = JSON.parse(readFileSync(sidebarFile(), 'utf8'))
+          return state.main?.quota?.primary?.usedPercent === 30
+            ? state.main.quota
+            : undefined
+        } catch {
+          return undefined
+        }
+      }, 'the frame reading in the sidebar')
+      expect(sidebar.credits).toEqual(stored.credits)
+    } finally {
+      await hooks?.dispose?.()
+      hooks = undefined
+      await server.stop(true)
+    }
+  })
+
+  test('in vault mode the frame credits reach the vault roster and sidebar-state.json', async () => {
+    await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
+    enroll()
+    seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+    installWire()
+    const server = codexSocket()
+    try {
+      const { vault } = await plugin(
+        { ...PLACEHOLDER },
+        {
+          experimentalWebSockets: true,
+          codexApiEndpoint: new URL('/responses', server.url).href,
+        },
+      )
+      await (await request(await fetchOverride(), 'ws-credits', true)).text()
+      const stored = await waitFor(() => {
+        const quota = vault.routes()[0]?.quota
+        return quota?.limits.some(
+          (limit) => limit.kind === 'reading' && limit.usedPercent === 30,
+        )
+          ? quota
+          : undefined
+      }, 'the frame reading in the vault roster')
+      expect(stored.credits).toEqual(expected)
+      const sidebar = await waitFor(() => {
+        try {
+          const state = JSON.parse(readFileSync(sidebarFile(), 'utf8'))
+          const quota = state.vaultAccounts?.[0]?.quota
+          return quota?.primary?.usedPercent === 30 ? quota : undefined
+        } catch {
+          return undefined
+        }
+      }, 'the frame reading in the sidebar')
+      expect(sidebar.credits).toEqual(stored.credits)
     } finally {
       await hooks?.dispose?.()
       hooks = undefined

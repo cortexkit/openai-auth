@@ -90,6 +90,13 @@ function DialogSelect(props: { title: string; options: Option[] }) {
                             <span> {option.description}</span>
                           </Show>
                         </text>
+                        {/* The right-aligned footer (2.0.22 dialog-select.tsx
+                            884-897; 1.18.30 draws it the same way). */}
+                        <Show when={option.footer}>
+                          <box flexShrink={0}>
+                            <text>{option.footer}</text>
+                          </box>
+                        </Show>
                       </box>
                       <For each={option.details}>
                         {(detail) => (
@@ -210,6 +217,8 @@ if (process.argv[2] === 'v2') {
             'Read-only note',
             'Not an option',
             'Main account',
+            // The item's status, drawn once in the footer.
+            'Enabled',
             'Turn request dumps off',
             'Set the log level',
             'Back',

@@ -38,7 +38,12 @@ export async function openControlDialog(
         .filter((item) => item.actions.length > 0)
         .map((item) => ({
           title: item.label,
-          description: inlineDescription(item.status, item.detail),
+          // As in OpenCode 1's dialog: the detail is the option's text and the
+          // status sits right-aligned in the footer. Joining both into one
+          // text showed a Quota item's reading twice, once in its compact
+          // form (the status) and again in its full form (the detail).
+          description: inlineDescription(item.detail),
+          ...(item.status ? { footer: item.status } : {}),
           value: { itemId: item.id, actions: item.actions },
         })),
       ...section.actions.map((action) => ({

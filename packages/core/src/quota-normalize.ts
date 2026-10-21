@@ -170,6 +170,7 @@ interface WsRateLimitsFrame {
   type: string
   rate_limits: WsRateLimits
   plan_type?: string
+  credits?: unknown
 }
 
 function windowFromWs(
@@ -209,7 +210,39 @@ export function normalizeWsFrame(event: WsRateLimitsFrame): OAuthQuotaSnapshot {
   if (primary) snapshot.primary = primary
   const secondary = windowFromWs(event.rate_limits?.secondary)
   if (secondary) snapshot.secondary = secondary
+  const credits = creditsFromWs(event.credits)
+  if (credits) snapshot.credits = credits
   return snapshot
+}
+
+/**
+ * Prepaid credits from the frame's `credits` object, read as the Codex
+ * client reads that event: `has_credits` and `unlimited` must both be
+ * booleans, and `balance` (sent as a string) is optional. Anything less says
+ * nothing about credits, so no record is made.
+ */
+function creditsFromWs(value: unknown): OAuthCredits | undefined {
+  if (value === null || typeof value !== 'object') return undefined
+  const credits = value as Record<string, unknown>
+  if (
+    typeof credits.has_credits !== 'boolean' ||
+    typeof credits.unlimited !== 'boolean'
+  )
+    return undefined
+  const balance = nonNegativeNumberish(
+    typeof credits.balance === 'string'
+      ? credits.balance.trim()
+      : credits.balance,
+  )
+  return {
+    hasCredits: credits.has_credits,
+    unlimited: credits.unlimited,
+    ...(balance !== undefined ? { balance } : {}),
+    ...(typeof credits.overage_limit_reached === 'boolean'
+      ? { overageLimitReached: credits.overage_limit_reached }
+      : {}),
+    checkedAt: Date.now(),
+  }
 }
 
 // ---------------------------------------------------------------------------

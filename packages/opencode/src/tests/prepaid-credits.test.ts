@@ -18,6 +18,7 @@ import type { RoutingRow } from '@cortexkit/common-auth/routing'
 import {
   normalizeQuotaHeaders,
   normalizeWham,
+  normalizeWsFrame,
   OpenAiVault,
 } from '@cortexkit/openai-auth-core/internal'
 import {
@@ -158,6 +159,40 @@ describe('prepaid credits from the Codex backend', () => {
       },
     ])
       expect(headers(partial)).not.toHaveProperty('credits')
+  })
+
+  test('a WebSocket rate-limit frame is read as the Codex client reads it', () => {
+    const frame = (credits: unknown) =>
+      normalizeWsFrame({
+        type: 'codex.rate_limits',
+        rate_limits: { primary: { used_percent: 10, window_minutes: 300 } },
+        ...(credits === undefined ? {} : { credits }),
+      })
+    expect(
+      frame({ has_credits: true, unlimited: false, balance: ' 87.4 ' }).credits,
+    ).toEqual({
+      hasCredits: true,
+      unlimited: false,
+      balance: 87.4,
+      checkedAt: expect.any(Number),
+    })
+    expect(
+      frame({ has_credits: false, unlimited: true, balance: null }).credits,
+    ).toEqual({
+      hasCredits: false,
+      unlimited: true,
+      checkedAt: expect.any(Number),
+    })
+    // Both flags are required; anything less says nothing about credits.
+    for (const partial of [
+      undefined,
+      null,
+      {},
+      { has_credits: true },
+      { unlimited: true },
+      { has_credits: 'true', unlimited: false },
+    ])
+      expect(frame(partial)).not.toHaveProperty('credits')
   })
 
   test('an observation carries credits with its own time, and omits them when none were reported', () => {

@@ -769,7 +769,11 @@ describe('prepaid credits in /openai Quota', () => {
   /** What OpenCode 2's native dialog lists for the Quota section. */
   async function opencode2QuotaOptions(ctx: OpenCodeMenuContext) {
     const payload = await createControlPlaneMenu(ctx).open('S')
-    let options: Array<{ title: string; description?: string }> = []
+    let options: Array<{
+      title: string
+      description?: string
+      footer?: string
+    }> = []
     let step = 0
     const dialog = {
       async select(input: { options: typeof options }) {
@@ -803,6 +807,32 @@ describe('prepaid credits in /openai Quota', () => {
       )?.description,
     }
   }
+
+  test('OpenCode 2 shows each account quota once, as OpenCode 1 does', async () => {
+    for (const connected of [false, true]) {
+      const ctx = context(connected)
+      const menu = (await createOpenCodeMenu(ctx).open(invocation)).menu
+      const quota = menu.sections.find((section) => section.id === 'quota')!
+      const opencode1 = sectionOptions(quota)
+      const opencode2 = await opencode2QuotaOptions(ctx)
+      for (const item of quota.items) {
+        const native = opencode2.find((option) => option.title === item.label)
+        // The full form is the option's text and the compact form its
+        // right-hand footer, exactly as OpenCode 1's dialog lists it.
+        expect(native).toMatchObject({
+          description: item.detail,
+          footer: item.status,
+        })
+        expect(native?.description).toBe(
+          opencode1.find((option) => option.title === item.label)?.description,
+        )
+        // The window figure (`5h 93% left`) appears once, not once per form.
+        const figure = item.status?.split(' · ')[0] ?? ''
+        expect(figure).toMatch(/^5h \d+% left$/)
+        expect(native?.description?.split(figure)).toHaveLength(2)
+      }
+    }
+  })
 
   test('local accounts show their prepaid credits on OpenCode 1 and OpenCode 2', async () => {
     for (const { credits, text } of cases) {
