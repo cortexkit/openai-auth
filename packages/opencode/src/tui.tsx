@@ -16,6 +16,7 @@ import type {
 } from '@opencode-ai/plugin/tui'
 import {
   createEffect,
+  createMemo,
   createSignal,
   For,
   Index,
@@ -585,6 +586,11 @@ function QuotaRow(props: {
       figure: figure(),
       resetText: props.resetText,
     })
+  // Memos, so a new measured width that leaves the fit unchanged (as the
+  // first measurement usually does) does not rebuild the bar's text nodes:
+  // rebuilt nodes are blank until the next frame is drawn.
+  const barCells = createMemo(() => fit().barCells)
+  const showReset = createMemo(() => fit().showReset)
   const fittedPaceLine = () => {
     const line = paceLine()
     if (line === null || columns() <= 0) return line
@@ -629,7 +635,7 @@ function QuotaRow(props: {
           <For
             each={quotaBarSegments(
               used(),
-              { ...props.appearance, barWidth: fit().barCells },
+              { ...props.appearance, barWidth: barCells() },
               props.pacing,
             )}
           >
@@ -646,7 +652,7 @@ function QuotaRow(props: {
             {figure()}
           </text>
         </box>
-        <Show when={fit().showReset}>
+        <Show when={showReset()}>
           <text fg={props.theme.textMuted} wrapMode='none' flexShrink={0}>
             {props.resetText}
           </text>
