@@ -119,10 +119,23 @@ const intervalSpy = spyOn(globalThis, 'setInterval').mockImplementation(((
   return setIntervalImpl(callback, delay)
 }) as typeof setInterval)
 const pollStale = lease.vault.pollStale.bind(lease.vault)
+// With `poll-rejects` the armed poll itself rejects instead of a lease
+// expiring. Since common-auth publishes roster quota writes in the background
+// and retries them, an expired lease no longer makes the poll reject; this
+// mode checks that a poll which does reject is still contained.
+const rejectPoll = process.argv[3] === 'poll-rejects'
+let armed = false
+const arm = (value: boolean) => {
+  armed = value
+  expire = value && !rejectPoll
+}
 let currentPoll: Promise<unknown> | undefined
 const started = Promise.withResolvers<void>()
 const pollSpy = spyOn(lease.vault, 'pollStale').mockImplementation((age) => {
-  currentPoll = pollStale(age)
+  if (armed && rejectPoll) {
+    currentPoll = Promise.reject(new Error('injected quota poll failure'))
+    failed.resolve()
+  } else currentPoll = pollStale(age)
   started.resolve()
   return currentPoll as ReturnType<typeof pollStale>
 })
@@ -132,14 +145,14 @@ try {
   // mistaken for a failed discovery or an optional daemon read.
   lease.start()
   await lease.firstRoster
-  expire = process.argv[2] === 'startup'
+  arm(process.argv[2] === 'startup')
   await started.promise
-  if (!expire) {
+  if (!armed) {
     if (!currentPoll || !interval) throw new Error('startup poll did not run')
     await currentPoll
     now += 5 * 60_000
     updateUsage()
-    expire = true
+    arm(true)
     interval()
   }
   await failed.promise
@@ -148,9 +161,9 @@ try {
   await currentPoll?.catch(() => {})
   await new Promise<void>((resolve) => setImmediate(resolve))
   await new Promise<void>((resolve) => setImmediate(resolve))
-  expire = false
+  arm(false)
   const recovered = (await lease.vault.pollStale(0)).every((row) => row.ok)
-  expire = true
+  expire = !rejectPoll
   const route = lease.vault.routes()[0]
   if (!route) throw new Error('recovery lost the vault route')
   const declineRejected = await lease.vault.decline(route.id).then(
