@@ -652,19 +652,25 @@ function QuotaRow(props: {
           </text>
         </Show>
       </box>
-      <Show when={fittedPaceLine()}>
-        <box width='100%' flexDirection='row'>
-          <text fg={props.theme.textMuted}>{''.padEnd(props.labelWidth)}</text>
-          <text
-            fg={toneColor(
-              props.theme,
-              props.pacing?.state === 'deficit' ? 'warn' : 'muted',
-            )}
-            wrapMode='none'
-          >
-            {fittedPaceLine()}
-          </text>
-        </box>
+      {/* Keyed, so a cut to a new width draws a new text node: on Bun 1.3
+          an existing node kept drawing the text it was created with. */}
+      <Show when={fittedPaceLine()} keyed>
+        {(line) => (
+          <box width='100%' flexDirection='row'>
+            <text fg={props.theme.textMuted}>
+              {''.padEnd(props.labelWidth)}
+            </text>
+            <text
+              fg={toneColor(
+                props.theme,
+                props.pacing?.state === 'deficit' ? 'warn' : 'muted',
+              )}
+              wrapMode='none'
+            >
+              {line}
+            </text>
+          </box>
+        )}
       </Show>
     </Show>
   )
