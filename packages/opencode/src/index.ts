@@ -883,6 +883,11 @@ export function mergePushedQuotaMetadata(
   ) {
     merged.spendControl = previous.spendControl
   }
+  // Prepaid credits come only from a usage poll or the response headers that
+  // carry them; a push without them keeps the last reading, with its own time.
+  if (merged.credits === undefined && previous.credits !== undefined) {
+    merged.credits = previous.credits
+  }
   return merged
 }
 

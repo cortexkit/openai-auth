@@ -212,7 +212,6 @@ describe('normalizeSidebarState', () => {
         },
       },
       planType: 'pro',
-      credits: 100,
       lastUpdated: 1718000000000,
     }
     const result = normalizeSidebarState(full)
@@ -242,8 +241,17 @@ describe('normalizeSidebarState', () => {
       },
     })
     expect(result.planType).toBe('pro')
-    expect(result.credits).toBe(100)
     expect(result.lastUpdated).toBe(1718000000000)
+  })
+
+  test('drops the old top-level credits number, which nothing wrote', () => {
+    // Prepaid credits are per account now (each quota's `credits`), so a
+    // top-level number from a hand-edited file is not read back.
+    const result = normalizeSidebarState({
+      ...DEFAULT_SIDEBAR_STATE,
+      credits: 100,
+    })
+    expect('credits' in result).toBe(false)
   })
 
   test('normalizes reset credits independently for main and fallback accounts', () => {

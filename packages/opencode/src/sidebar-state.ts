@@ -3,6 +3,7 @@ import {
   isQuotaStale,
   type ProjectedQuota,
   projectQuota,
+  quotaCreditsText,
   quotaWindowName,
 } from '@cortexkit/common-auth/quota'
 import { orderForPlacement } from '@cortexkit/common-auth/routing'
@@ -39,6 +40,42 @@ export interface AccountQuota {
   // The source reported that no credit budget exists; see OAuthQuotaSnapshot.
   spendControlCleared?: true
   resetCreditsAvailable?: number
+  /**
+   * Prepaid workspace credits, absent when no reading reported any. Separate
+   * from `spendControl`, the budget a workspace sets on the account.
+   */
+  credits?: AccountCredits
+}
+
+/** Prepaid credits as the last reading that reported them saw them. */
+export interface AccountCredits {
+  hasCredits: boolean
+  unlimited: boolean
+  balance?: number
+  overageLimitReached?: boolean
+  /** When that reading was taken, when the writer recorded it. */
+  checkedAt?: number
+}
+
+/**
+ * The prepaid-credits text for an account (`Unlimited`, `<n> credits` or
+ * `Available`), or undefined when it has none or the file holds no
+ * well-formed credits record. The file is read unchecked, so the record's
+ * fields are checked here before the shared wording is applied.
+ */
+export function accountCreditsText(
+  quota: AccountQuota | null | undefined,
+): string | undefined {
+  const credits: unknown = quota?.credits
+  if (credits === null || typeof credits !== 'object') return undefined
+  const { hasCredits, unlimited, balance } = credits as Record<string, unknown>
+  if (typeof hasCredits !== 'boolean' || typeof unlimited !== 'boolean')
+    return undefined
+  return quotaCreditsText({
+    hasCredits,
+    unlimited,
+    ...(typeof balance === 'number' ? { balance } : {}),
+  })
 }
 
 export type QuotaWindowKey = 'primary' | 'secondary'
@@ -164,7 +201,6 @@ export interface SidebarState {
   activeRouting?: ActiveRoutingMap
   stickyAssignments?: StickyAssignmentMap
   planType?: string
-  credits?: number
   lastUpdated: number
   /**
    * True when the accounts come from the shared account pool (a migrated
@@ -435,7 +471,6 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
 
   // Optional top-level fields
   const planType = typeof r.planType === 'string' ? r.planType : undefined
-  const credits = typeof r.credits === 'number' ? r.credits : undefined
   const activeRouting = normalizeActiveRouting(r.activeRouting)
   const stickyAssignments = normalizeStickyAssignments(r.stickyAssignments)
   return {
@@ -447,7 +482,6 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
     ...(activeRouting !== undefined ? { activeRouting } : {}),
     ...(stickyAssignments !== undefined ? { stickyAssignments } : {}),
     ...(planType !== undefined ? { planType } : {}),
-    ...(credits !== undefined ? { credits } : {}),
     ...(r.accountPool === true ? { accountPool: true } : {}),
     ...(vaultAccounts !== undefined ? { vaultAccounts } : {}),
   }
@@ -1076,7 +1110,6 @@ export type SidebarMachineState = Pick<
   | 'main'
   | 'fallbacks'
   | 'planType'
-  | 'credits'
   | 'lastUpdated'
   | 'accountPool'
   | 'vaultAccounts'
@@ -1203,6 +1236,22 @@ function mergeSpendControl(
   return older.spendControl
 }
 
+// Prepaid credits are judged by their own reading time, like each window: a
+// side that carries none says nothing about them, so the other side's record
+// stays, and when both carry one the later reading wins (an untimed record,
+// from an older version, loses to a timed one).
+function fresherCredits(
+  incoming: AccountCredits | undefined,
+  existing: AccountCredits | undefined,
+): AccountCredits | undefined {
+  if (!incoming || !existing) return incoming ?? existing
+  const at = (credits: AccountCredits) =>
+    typeof credits.checkedAt === 'number' && Number.isFinite(credits.checkedAt)
+      ? credits.checkedAt
+      : Number.NEGATIVE_INFINITY
+  return at(existing) > at(incoming) ? existing : incoming
+}
+
 function mergeQuotaByWindow(
   incoming: AccountQuota | null,
   existing: AccountQuota | null,
@@ -1235,6 +1284,7 @@ function mergeQuotaByWindow(
     spendControl === undefined &&
     (incoming.spendControlCleared === true ||
       existing.spendControlCleared === true)
+  const credits = fresherCredits(incoming.credits, existing.credits)
   let checkedAt: number | undefined
   for (const stamp of [
     finiteWindowCheckedAt(primary),
@@ -1249,6 +1299,7 @@ function mergeQuotaByWindow(
   const {
     spendControl: _incomingSpendControl,
     spendControlCleared: _incomingCleared,
+    credits: _incomingCredits,
     ...incomingRest
   } = incoming
   return {
@@ -1257,6 +1308,7 @@ function mergeQuotaByWindow(
     secondary,
     ...(spendControl !== undefined ? { spendControl } : {}),
     ...(spendControlCleared ? { spendControlCleared: true as const } : {}),
+    ...(credits !== undefined ? { credits } : {}),
     checkedAt: checkedAt ?? incoming.checkedAt,
   }
 }

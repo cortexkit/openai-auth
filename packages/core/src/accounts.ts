@@ -103,11 +103,19 @@ export interface OAuthSpendControlReading {
   reached: boolean
 }
 
+/**
+ * Prepaid workspace credits as the Codex backend reports them, in the usage
+ * poll's `credits` object or the `x-codex-credits-*` response headers. The
+ * headers carry no overage verdict, so `overageLimitReached` is optional.
+ * `checkedAt` is when the source was read. It is optional because accounts
+ * files written by older versions hold credits without it.
+ */
 export interface OAuthCredits {
   hasCredits: boolean
   unlimited: boolean
-  overageLimitReached: boolean
+  overageLimitReached?: boolean
   balance?: number
+  checkedAt?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -575,14 +583,20 @@ function normalizeQuota(value: unknown): OAuthAccount['quota'] {
     isRecord(credits) &&
     typeof credits.hasCredits === 'boolean' &&
     typeof credits.unlimited === 'boolean' &&
-    typeof credits.overageLimitReached === 'boolean'
+    (credits.overageLimitReached === undefined ||
+      typeof credits.overageLimitReached === 'boolean')
   ) {
     const balance = Number(credits.balance)
+    const checkedAt =
+      typeof credits.checkedAt === 'number' ? credits.checkedAt : Number.NaN
     quota.credits = {
       hasCredits: credits.hasCredits,
       unlimited: credits.unlimited,
-      overageLimitReached: credits.overageLimitReached,
+      ...(typeof credits.overageLimitReached === 'boolean'
+        ? { overageLimitReached: credits.overageLimitReached }
+        : {}),
       ...(Number.isFinite(balance) ? { balance } : {}),
+      ...(Number.isFinite(checkedAt) ? { checkedAt } : {}),
     }
   }
 

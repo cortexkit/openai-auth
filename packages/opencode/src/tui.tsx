@@ -29,6 +29,7 @@ import { createRpcClient } from './rpc/rpc-client.js'
 import { resolveRpcDir } from './rpc/rpc-dir.js'
 import {
   type AccountQuota,
+  accountCreditsText,
   type CollapsedAccountLine,
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
@@ -249,6 +250,45 @@ function StatRow(props: {
     <box width='100%' flexDirection='row' justifyContent='space-between'>
       <text fg={props.theme.textMuted}>{props.label}</text>
       <text fg={toneColor(props.theme, props.tone ?? 'text')}>
+        <b>{props.value}</b>
+      </text>
+    </box>
+  )
+}
+
+// One of an account's own rows under its quota bars (budget amounts, prepaid
+// credits, reset credits): muted label left, value right. Like the quota rows
+// it stays on one line: it measures its own width and, when both do not fit,
+// cuts only the label (with …), keeping one blank cell before the value.
+function AccountMetaRow(props: {
+  theme: ThemeCurrent
+  label: string
+  value: string
+}) {
+  const [width, setWidth] = createSignal(0)
+  let row: { width: number } | undefined
+  const label = () => {
+    const columns = width()
+    if (columns <= 0) return props.label
+    return fitCollapsedLabel(
+      props.label,
+      columns - displayWidth(props.value) - 1,
+    )
+  }
+  return (
+    <box
+      ref={(element: { width: number }) => {
+        row = element
+      }}
+      onSizeChange={() => setWidth(row?.width ?? 0)}
+      width='100%'
+      flexDirection='row'
+      justifyContent='space-between'
+    >
+      <text fg={props.theme.textMuted} wrapMode='none' flexShrink={1}>
+        {label()}
+      </text>
+      <text fg={props.theme.text} wrapMode='none' flexShrink={0}>
         <b>{props.value}</b>
       </text>
     </box>
@@ -476,9 +516,6 @@ export function getQuotaMetadataRows(
 ): Array<{ label: string; value: string }> {
   const rows: Array<{ label: string; value: string }> = []
   if (state.planType) rows.push({ label: 'Plan', value: state.planType })
-  if (state.credits !== undefined) {
-    rows.push({ label: 'Credits', value: String(state.credits) })
-  }
   return rows
 }
 
@@ -500,9 +537,15 @@ export function formatSpendControlAmounts(
   return `${formatGroupedAmount(spendControl.used)} / ${formatGroupedAmount(spendControl.limit)} ${unit}`
 }
 
+/**
+ * The account's own rows under its quota bars: the workspace budget's amounts
+ * (`credits`), the prepaid credits (`prepaid`, worded by `accountCreditsText`)
+ * and the reset-credit count (`resets`), each only when known.
+ */
 export function getAccountMetadataRows(
   resetCredits: number | undefined,
   spendControl?: SpendControlReading,
+  prepaidCredits?: string,
 ): Array<{ label: string; value: string }> {
   const rows: Array<{ label: string; value: string }> = []
   if (spendControl) {
@@ -510,6 +553,9 @@ export function getAccountMetadataRows(
       label: 'credits',
       value: formatSpendControlAmounts(spendControl),
     })
+  }
+  if (prepaidCredits !== undefined) {
+    rows.push({ label: 'prepaid', value: prepaidCredits })
   }
   if (resetCredits !== undefined) {
     rows.push({ label: 'resets', value: String(resetCredits) })
@@ -762,14 +808,14 @@ function AccountBlock(props: {
         each={getAccountMetadataRows(
           props.resetCredits,
           props.quota?.spendControl,
+          accountCreditsText(props.quota),
         )}
       >
         {(row) => (
-          <StatRow
+          <AccountMetaRow
             theme={props.theme}
             label={row.label}
             value={row.value}
-            tone='text'
           />
         )}
       </For>

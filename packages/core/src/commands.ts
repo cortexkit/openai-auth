@@ -71,7 +71,11 @@ import {
   VAULT_LOCAL_ACTION_REFUSAL,
   vaultAccountName,
 } from './vault-account-menu'
-import { createVaultCommandMenu, menuStore } from './vault-command-menu'
+import {
+  createVaultCommandMenu,
+  menuStore,
+  withQuotaSectionCredits,
+} from './vault-command-menu'
 import { vaultEmptyAccessHint } from './vault-messages'
 
 /** The one slash command, without the slash. */
@@ -1150,6 +1154,24 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
     const notify = invocation.notify.bind(invocation)
     return { ...(sessionId !== undefined ? { sessionId } : {}), notify }
   }
+  // The shared Quota section lists each local account's windows but not its
+  // prepaid credits, so they are added to each account's detail from the
+  // pool rows. In vault mode the vault's own Quota section adds them.
+  const withLocalCredits = async <T extends { menu: CommandMenuModel }>(
+    payload: T,
+  ): Promise<T> => {
+    if (options.vault && (await options.vault.authority()) !== 'local')
+      return payload
+    const load = await options.store.read().catch(() => undefined)
+    if (load?.status !== 'ready') return payload
+    return {
+      ...payload,
+      menu: withQuotaSectionCredits(
+        payload.menu,
+        new Map(load.rows.map((row) => [row.id, row.quota])),
+      ),
+    }
+  }
   return {
     command: OPENAI_COMMAND_NAME,
     async open(invocation): Promise<CommandDialogPayload> {
@@ -1164,7 +1186,7 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
           menu: migrationNoticeMenu(state.blockers),
         }
       const payload = await menu.open(context)
-      return { ...payload, menu: scrubMenu(payload.menu) }
+      return withLocalCredits({ ...payload, menu: scrubMenu(payload.menu) })
     },
     async apply(
       request: CommandApplyRequest,
@@ -1202,7 +1224,7 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
       }
       const result = await menu.apply(request, context)
       if (result.ok) await options.afterApply?.()
-      return { ...result, menu: scrubMenu(result.menu) }
+      return withLocalCredits({ ...result, menu: scrubMenu(result.menu) })
     },
   }
 }

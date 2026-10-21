@@ -7,6 +7,8 @@ import {
 } from '@cortexkit/common-auth/quota'
 import { sidebarQuotaFromPoolMap } from '../core/pool-sidebar.ts'
 import {
+  type AccountQuota,
+  accountCreditsText,
   fitCollapsedLabel,
   getCollapsedAccountLines,
   getCollapsedQuotaSummary,
@@ -466,6 +468,52 @@ describe('dynamic quota TUI rows', () => {
         reached: true,
       }),
     ).toContainEqual({ label: 'credits', value: '1 / 1 credit' })
+  })
+
+  test('an account with prepaid credits gets a prepaid row in the Codex wording', () => {
+    const prepaid = (credits: unknown) =>
+      getAccountMetadataRows(
+        undefined,
+        undefined,
+        accountCreditsText({ credits } as AccountQuota),
+      )
+    const checkedAt = now
+    expect(prepaid({ hasCredits: false, unlimited: true, checkedAt })).toEqual([
+      { label: 'prepaid', value: 'Unlimited' },
+    ])
+    expect(
+      prepaid({ hasCredits: true, unlimited: false, balance: 87.4, checkedAt }),
+    ).toEqual([{ label: 'prepaid', value: '87 credits' }])
+    expect(
+      prepaid({ hasCredits: true, unlimited: false, balance: 0, checkedAt }),
+    ).toEqual([{ label: 'prepaid', value: 'Available' }])
+    expect(prepaid({ hasCredits: true, unlimited: false, checkedAt })).toEqual([
+      { label: 'prepaid', value: 'Available' },
+    ])
+    // No credits, no reading of them, or a record the file mangled: no row.
+    for (const credits of [
+      { hasCredits: false, unlimited: false, balance: 50, checkedAt },
+      undefined,
+      { hasCredits: 'yes', unlimited: true },
+      'Unlimited',
+    ])
+      expect(prepaid(credits)).toEqual([])
+    // The prepaid row sits between the budget and the reset-credit count.
+    expect(
+      getAccountMetadataRows(
+        2,
+        {
+          limit: 10,
+          used: 1,
+          remaining: 9,
+          usedPercent: 10,
+          remainingPercent: 90,
+          unit: 'credit',
+          reached: false,
+        },
+        'Unlimited',
+      ).map((row) => row.label),
+    ).toEqual(['credits', 'prepaid', 'resets'])
   })
 
   test('a drawer apply sends the sessionId on its RPC request', () => {

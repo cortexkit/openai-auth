@@ -15,6 +15,7 @@ import {
 import {
   formatQuota,
   projectQuota,
+  quotaCreditsText,
   quotaTextParts,
 } from '@cortexkit/common-auth/quota'
 import {
@@ -87,10 +88,12 @@ function piLoginSection(quota: () => OAuthQuotaSnapshot | undefined) {
           : {}),
       })
       const parts = quotaTextParts(projection, { now })
+      const credits = quotaCreditsText(snapshot?.credits)
       return {
         lines: [
           'Managed by Pi /login',
           ...(parts.length > 0 ? parts : [formatQuota(projection, { now })]),
+          ...(credits ? [`prepaid ${credits}`] : []),
         ],
       }
     },

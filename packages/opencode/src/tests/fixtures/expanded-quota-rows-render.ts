@@ -66,6 +66,12 @@ publish({
         ).toISOString(),
         checkedAt: now,
       },
+      credits: {
+        hasCredits: true,
+        unlimited: false,
+        balance: 1234.6,
+        checkedAt: now,
+      },
     },
   },
   fallbacks: [],
@@ -195,6 +201,8 @@ const rows = [
   { label: '7d', figure: '100% left', reset: '6d23h', usedCells: 0 },
 ] as const
 const LABEL_WIDTH = 3
+// quotaCreditsText's wording for the published balance of 1234.6.
+const CREDITS = '1235 credits'
 const BAR_WIDTH = 10
 const MIN_BAR = 3
 
@@ -207,7 +215,7 @@ try {
     const frame = view.captureCharFrame()
     if (process.env.SHOW_FRAMES) {
       const first = lines.findIndex((line) => line.startsWith('5h'))
-      const shown = lines.slice(first, first + 3)
+      const shown = lines.slice(first, first + 4)
       console.log(`width ${width}:\n${shown.map((l) => `|${l}|`).join('\n')}`)
     }
     const at = `at width ${width}: ${frame}`
@@ -224,7 +232,7 @@ try {
       // neither the pacing line, the next row, nor blank.
       assert.match(
         next.trim(),
-        /^(?:deficit .*|7d .*|)$/,
+        /^(?:deficit .*|7d .*|.* 1235 credits|)$/,
         `the ${row.label} row wraps onto a second line ${at}`,
       )
       assert.ok(
@@ -261,6 +269,29 @@ try {
     if (width === FULL_WIDTH)
       for (const row of rows)
         assert.ok(frame.includes(row.reset), `no ${row.reset} ${at}`)
+
+    // The account's prepaid credits: one line whose value is never cut and
+    // keeps a blank cell before it. When both do not fit, the label is cut
+    // with ….
+    const credits = lines.filter((line) => line.trimEnd().endsWith(CREDITS))
+    assert.equal(credits.length, 1, `the prepaid row is missing ${at}`)
+    const creditsLine = credits[0] ?? ''
+    assert.match(
+      creditsLine,
+      /^(?:prepaid|[a-z]*…) +1235 credits$/,
+      `the prepaid row runs its label into the value ${at}`,
+    )
+    assert.equal(
+      (lines[lines.indexOf(creditsLine) + 1] ?? '').trim(),
+      '',
+      `the prepaid row wraps onto a second line ${at}`,
+    )
+    if (width >= 36)
+      assert.equal(
+        creditsLine,
+        `prepaid${' '.repeat(columns - 7 - CREDITS.length)}${CREDITS}`,
+        `the prepaid row is not drawn whole ${at}`,
+      )
 
     // The pacing line: whole when it fits, else cut to one line with ….
     const pacing = lines.filter((line) => line.trim().startsWith('deficit'))

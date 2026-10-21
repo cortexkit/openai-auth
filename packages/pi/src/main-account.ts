@@ -120,10 +120,14 @@ export class PiMainAccount {
     return this.quota
   }
 
-  /** The fixed windows of the quota map, plus the last poll's budget and reset credits. */
+  /**
+   * The fixed windows of the quota map and its prepaid credits, plus the last
+   * poll's budget and reset credits.
+   */
   quotaSnapshot(): OAuthQuotaSnapshot | undefined {
     const windows = windowsFromQuotaMap(this.quota)
-    if (!windows && !this.snapshot) return undefined
+    const credits = this.quota?.credits
+    if (!windows && !this.snapshot && !credits) return undefined
     return {
       ...(this.snapshot?.resetCreditsAvailable !== undefined
         ? { resetCreditsAvailable: this.snapshot.resetCreditsAvailable }
@@ -131,6 +135,7 @@ export class PiMainAccount {
       ...(this.snapshot?.spendControl
         ? { spendControl: this.snapshot.spendControl }
         : {}),
+      ...(credits ? { credits: { ...credits } } : {}),
       ...windows,
     }
   }

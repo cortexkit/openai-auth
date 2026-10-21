@@ -8,6 +8,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
+import type { QuotaMap } from '@cortexkit/common-auth/quota'
 import * as poolStores from '@cortexkit/common-auth/store'
 import {
   type AccountPaths,
@@ -380,6 +381,73 @@ describe('the sidebar of a migrated install', () => {
     expect(
       state.fallbacks.map((entry) => entry.quota?.primary?.usedPercent),
     ).toEqual([30, 40])
+  })
+
+  it('carries usage-poll prepaid credits into the pool row and the sidebar file', async () => {
+    const stale = Date.now() - HOUR
+    seedPool(files, [
+      { id: 'main', quota: quotaMap(10, stale) },
+      { id: 'fallback-1', quota: quotaMap(10, stale) },
+    ])
+    const credits = {
+      has_credits: true,
+      unlimited: false,
+      overage_limit_reached: false,
+      balance: '40',
+    }
+    // The polls at load fail, so the rows stay stale for the background
+    // pass. Then only main's workspace reports credits; fallback-1's reply
+    // has none.
+    let failing = true
+    const wire = installWire({
+      usage: (bearer) =>
+        failing
+          ? new Response('', { status: 503 })
+          : new Response(
+              JSON.stringify({
+                ...JSON.parse(usageBody(20)),
+                ...(bearer === 'Bearer main-token' ? { credits } : {}),
+              }),
+              { status: 200 },
+            ),
+    })
+    const timers = manualTimers()
+    hooks = await loadPlugin({ backgroundQuota: timers.options })
+    await waitFor(
+      () => (wire.polls.length >= 2 ? true : undefined),
+      'the first pool polls',
+    )
+    await settleSurfaceWork()
+    failing = false
+    // The background pass polls the stale rows and rewrites the sidebar from
+    // the pool's rows.
+    timers.tick?.()
+    const state = await waitFor(() => {
+      try {
+        const parsed = normalizeSidebarState(
+          JSON.parse(readFileSync(sidebarFile, 'utf8')),
+        )
+        return parsed.main.quota?.credits ? parsed : undefined
+      } catch {
+        return undefined
+      }
+    }, 'the pool sidebar snapshot with credits')
+    await settleSurfaceWork()
+
+    const stored = config().commonAuthPool.rows.main?.quota as QuotaMap
+    expect(stored.credits).toEqual({
+      hasCredits: true,
+      unlimited: false,
+      balance: 40,
+      overageLimitReached: false,
+      checkedAt: expect.any(Number),
+    })
+    expect(state.main.quota?.credits).toEqual(stored.credits)
+    expect(
+      config().commonAuthPool.rows['fallback-1']?.quota,
+    ).not.toHaveProperty('credits')
+    expect(state.fallbacks[0]?.quota?.primary?.usedPercent).toBe(20)
+    expect(state.fallbacks[0]?.quota).not.toHaveProperty('credits')
   })
 
   it('projects rows without renaming any field an older reader knows', () => {

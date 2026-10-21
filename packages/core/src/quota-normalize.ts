@@ -1,4 +1,8 @@
-import type { AccountQuotaWindow, OAuthQuotaSnapshot } from './accounts.ts'
+import type {
+  AccountQuotaWindow,
+  OAuthCredits,
+  OAuthQuotaSnapshot,
+} from './accounts.ts'
 
 // ---------------------------------------------------------------------------
 // Shared helper: Codex reset_at is epoch SECONDS; tolerate ms and ISO too.
@@ -96,7 +100,37 @@ export function normalizeQuotaHeaders(h: Headers): OAuthQuotaSnapshot {
   if (primary) snapshot.primary = primary
   const secondary = windowFromHeader(h, 'x-codex-secondary-used-percent')
   if (secondary) snapshot.secondary = secondary
+  const credits = creditsFromHeaders(h)
+  if (credits) snapshot.credits = credits
   return snapshot
+}
+
+// The Codex client reads these booleans as `true`/`false` (any case) or 1/0.
+function headerBool(h: Headers, name: string): boolean | undefined {
+  const raw = h.get(name)?.trim()
+  if (raw === undefined) return undefined
+  if (raw.toLowerCase() === 'true' || raw === '1') return true
+  if (raw.toLowerCase() === 'false' || raw === '0') return false
+  return undefined
+}
+
+/**
+ * Prepaid credits from the `x-codex-credits-*` headers, read as the Codex
+ * client reads them: both `has-credits` and `unlimited` must be present and
+ * boolean, and the balance is optional. Anything less says nothing about
+ * credits, so no record is made rather than a fabricated "no credits".
+ */
+function creditsFromHeaders(h: Headers): OAuthCredits | undefined {
+  const hasCredits = headerBool(h, 'x-codex-credits-has-credits')
+  const unlimited = headerBool(h, 'x-codex-credits-unlimited')
+  if (hasCredits === undefined || unlimited === undefined) return undefined
+  const balance = nonNegativeNumberish(h.get('x-codex-credits-balance')?.trim())
+  return {
+    hasCredits,
+    unlimited,
+    ...(balance !== undefined ? { balance } : {}),
+    checkedAt: Date.now(),
+  }
 }
 
 /**
@@ -329,6 +363,7 @@ export function normalizeWham(json: WhamUsageResponse): OAuthQuotaSnapshot {
       unlimited: credits.unlimited,
       overageLimitReached: credits.overage_limit_reached,
       ...(balance !== undefined ? { balance } : {}),
+      checkedAt: Date.now(),
     }
   }
   return snapshot

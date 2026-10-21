@@ -25,6 +25,8 @@ import {
 import { getSettings } from '../config'
 import { openAccountPool } from '../core/pool-accounts'
 import { sectionOptions } from '../tui/command-dialogs'
+import { openControlDialog } from '../tui/v2-dialog'
+import { createControlPlaneMenu } from '../v2/menu'
 import {
   quotaMap as fixtureQuotaMap,
   readJson,
@@ -738,4 +740,111 @@ test('OpenCode 2 vault read-only projection preserves wave-one data and reset pr
     readFileSync(files.configFile, 'utf8'),
     readFileSync(files.stateFile, 'utf8'),
   ]).toEqual(before)
+})
+
+describe('prepaid credits in /openai Quota', () => {
+  // quotaCreditsText's three wordings, each published on the main account;
+  // the other accounts report no credits and show none.
+  const cases = [
+    {
+      credits: { hasCredits: false, unlimited: true, checkedAt: now },
+      text: 'Unlimited',
+    },
+    {
+      credits: {
+        hasCredits: true,
+        unlimited: false,
+        balance: 1234.6,
+        overageLimitReached: false,
+        checkedAt: now,
+      },
+      text: '1235 credits',
+    },
+    {
+      credits: { hasCredits: true, unlimited: false, checkedAt: now },
+      text: 'Available',
+    },
+  ]
+
+  /** What OpenCode 2's native dialog lists for the Quota section. */
+  async function opencode2QuotaOptions(ctx: OpenCodeMenuContext) {
+    const payload = await createControlPlaneMenu(ctx).open('S')
+    let options: Array<{ title: string; description?: string }> = []
+    let step = 0
+    const dialog = {
+      async select(input: { options: typeof options }) {
+        step++
+        if (step === 1) return 'quota'
+        // Step 2 lists the section; leaving it returns to the sections,
+        // where step 3 closes the dialog.
+        if (step === 2) options = input.options
+        return undefined
+      },
+    } as unknown as Parameters<typeof openControlDialog>[0]
+    await openControlDialog(dialog, payload, async () => {
+      throw new Error('must not apply')
+    })
+    return options
+  }
+
+  async function surfaces(ctx: OpenCodeMenuContext, name: string) {
+    const menu = (await createOpenCodeMenu(ctx).open(invocation)).menu
+    const quota = menu.sections.find((section) => section.id === 'quota')!
+    return {
+      // OpenCode 1's text output and its TUI dialog.
+      text: (menuText(menu).split('### Quota\n')[1] ?? '')
+        .split('\n###')[0]
+        ?.split('\n')
+        .find((line) => line.startsWith(`- ${name}: `)),
+      dialog: sectionOptions(quota).find((option) => option.title === name)
+        ?.description,
+      opencode2: (await opencode2QuotaOptions(ctx)).find(
+        (option) => option.title === name,
+      )?.description,
+    }
+  }
+
+  test('local accounts show their prepaid credits on OpenCode 1 and OpenCode 2', async () => {
+    for (const { credits, text } of cases) {
+      const config = readJson(files.configFile) as {
+        commonAuthPool: { rows: Record<string, { quota: QuotaMap }> }
+      }
+      config.commonAuthPool.rows.main!.quota.credits = credits
+      writeFileSync(files.configFile, JSON.stringify(config))
+      const ctx = context(false)
+      const main = await surfaces(ctx, 'main')
+      expect(main.text).toBe(
+        `- main: 5h 93% left, resets 2h · checked 3d ago · prepaid ${text}`,
+      )
+      expect(main.dialog).toEndWith(` · prepaid ${text}`)
+      expect(main.opencode2).toEndWith(` · prepaid ${text}`)
+      const ufuk = await surfaces(ctx, 'ufuk')
+      expect(ufuk.text).toBe('- ufuk: 5h 15% left, resets 2h')
+      expect(ufuk.dialog).not.toContain('prepaid')
+      expect(ufuk.opencode2).not.toContain('prepaid')
+    }
+  })
+
+  test('vault accounts show their prepaid credits on OpenCode 1 and OpenCode 2', async () => {
+    for (const { credits, text } of cases) {
+      roster[0]!.quota = { ...roster[0]!.quota!, credits }
+      // An account the vault will not serve is a line, not an option.
+      roster[2]!.state = 'needs_reauth'
+      roster[2]!.quota = { ...roster[2]!.quota!, credits }
+      const ctx = context(true)
+      const main = await surfaces(ctx, 'vault-user@example.com')
+      expect(main.text).toEndWith(` · prepaid ${text}`)
+      expect(main.dialog).toEndWith(` · prepaid ${text}`)
+      expect(main.opencode2).toEndWith(` · prepaid ${text}`)
+      const gmail = await surfaces(ctx, 'gmail')
+      expect(gmail.text).not.toContain('prepaid')
+      expect(gmail.opencode2).not.toContain('prepaid')
+      const quota = (await sections()).find(
+        (section) => section.id === 'quota',
+      )!
+      expect(quota.lines).toEqual([
+        `live (needs_reauth): 5h 15% left · prepaid ${text}`,
+      ])
+    }
+  })
 })

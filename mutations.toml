@@ -6100,3 +6100,34 @@ expect_message = "timed out waiting: the vault watch"
 only = false
 timeout_s = 600
 build_timeout_s = 1800
+
+# Prepaid workspace credits reach the pool's quota map (the vault roster in
+# vault mode) and the sidebar file, or nothing shows them.
+
+[[control]]
+id = "prepaid-credits-observation"
+guards = "a usage poll's prepaid credits are kept in the pool observation, so they reach the vault roster and the sidebar"
+file = "packages/core/src/pool-quota.ts"
+old = "    ...(prepaid ? { credits: prepaid } : {}),"
+new = "    ...(false && prepaid ? { credits: prepaid } : {}), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/prepaid-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/prepaid-credits.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/prepaid-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^prepaid\scredits\sfrom\sthe\sCodex\sbackend\svault\smode:\susage-poll\scredits\sreach\sthe\svault\sroster\sand\ssidebar-state\.json\swith\sthe\spoll\stime$']
+expect_message = "expect((await rosterRow(env.vault)).quota?.credits).toEqual(credits)"
+
+[[control]]
+id = "prepaid-credits-sidebar"
+guards = "the sidebar file carries each pool row's prepaid credits"
+file = "packages/opencode/src/core/pool-sidebar.ts"
+old = "    ...(credits ? { credits: { ...credits } } : {}),"
+new = "    ...(false && credits ? { credits: { ...credits } } : {}), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/prepaid-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/prepaid-credits.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/prepaid-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^prepaid\scredits\sfrom\sthe\sCodex\sbackend\slocal\spool\smode:\susage-poll\scredits\sreach\sthe\srow\squota\smap\sand\ssidebar-state\.json$']
+expect_message = "expect(state.main.quota?.credits).toEqual(credits)"

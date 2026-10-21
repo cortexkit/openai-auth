@@ -256,6 +256,7 @@ describe('quota normalize → QuotaSnapshot', () => {
       hasCredits: true,
       unlimited: false,
       overageLimitReached: false,
+      checkedAt: expect.any(Number),
     })
   })
 
@@ -275,6 +276,7 @@ describe('quota normalize → QuotaSnapshot', () => {
       unlimited: false,
       overageLimitReached: false,
       balance: 12.5,
+      checkedAt: expect.any(Number),
     })
   })
 

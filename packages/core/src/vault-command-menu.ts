@@ -3,6 +3,7 @@ import {
   CommandError,
   type CommandInvocation,
   type CommandMenu,
+  type CommandMenuModel,
   type CommandMenuOptions,
   createCommandMenu,
   type MenuAction,
@@ -10,7 +11,12 @@ import {
   type SectionContent,
   type StoreSectionSlot,
 } from '@cortexkit/common-auth/commands'
-import { formatQuota, projectQuota } from '@cortexkit/common-auth/quota'
+import {
+  formatQuota,
+  isQuotaMap,
+  projectQuota,
+  quotaCreditsText,
+} from '@cortexkit/common-auth/quota'
 import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
 import {
   type AccountStorage,
@@ -30,6 +36,51 @@ import {
 
 function record(value: unknown): Record<string, unknown> {
   return isRecord(value) ? { ...value } : {}
+}
+
+/**
+ * `text` followed by the account's prepaid credits (` · prepaid Unlimited`,
+ * ` · prepaid 120 credits`, ` · prepaid Available`) when its quota map holds
+ * credits worth showing; `text` unchanged otherwise. `quota` is a pool or
+ * vault row's quota map.
+ */
+export function withPrepaidCredits(text: string, quota: unknown): string {
+  const credits = isQuotaMap(quota)
+    ? quotaCreditsText(quota.credits)
+    : undefined
+  return credits ? `${text} · prepaid ${credits}` : text
+}
+
+/**
+ * The menu with each Quota item's detail followed by its account's prepaid
+ * credits, looked up by item id in `quotaById` (the rows' quota maps). The
+ * shared Quota section does not show credits itself.
+ */
+export function withQuotaSectionCredits(
+  menu: CommandMenuModel,
+  quotaById: ReadonlyMap<string, unknown>,
+): CommandMenuModel {
+  return {
+    ...menu,
+    sections: menu.sections.map((section) =>
+      section.id !== 'quota'
+        ? section
+        : {
+            ...section,
+            items: section.items.map((item) =>
+              item.detail === undefined
+                ? item
+                : {
+                    ...item,
+                    detail: withPrepaidCredits(
+                      item.detail,
+                      quotaById.get(item.id),
+                    ),
+                  },
+            ),
+          },
+    ),
+  }
 }
 
 /** Delegate built-in actions without changing their input validation or confirmation requirements. */
@@ -240,7 +291,7 @@ export function createVaultCommandMenu(
           .filter((row) => !view.routes.has(row.routeId))
           .map(
             (row) =>
-              `${vaultAccountName(row)} (${row.enabled ? row.state : 'disabled'}): ${quotaText(row, 'compact')}`,
+              `${vaultAccountName(row)} (${row.enabled ? row.state : 'disabled'}): ${withPrepaidCredits(quotaText(row, 'compact'), row.quota)}`,
           ),
         items: view.status.accounts
           .filter((row) => view.routes.has(row.routeId))
@@ -249,7 +300,7 @@ export function createVaultCommandMenu(
             label: vaultAccountName(row),
             group: 'Accounts',
             status: quotaText(row, 'compact'),
-            detail: quotaText(row, 'full'),
+            detail: withPrepaidCredits(quotaText(row, 'full'), row.quota),
             actions: [checkQuota(row.routeId)],
           })),
         actions: view.routes.size > 0 ? [checkQuota()] : [],

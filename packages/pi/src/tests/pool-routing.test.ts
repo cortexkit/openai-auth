@@ -633,6 +633,56 @@ describe('Pi /openai on the account pool', () => {
     expect(login?.lines.join('\n')).toContain('5h 93% left')
   })
 
+  test('Quota shows each account its prepaid credits, in the Codex wording', async () => {
+    const runtime = makeRuntime()
+    await ready(runtime)
+    // Each account's workspace reports a different credits state; beta's
+    // usage reply carries no credits object at all.
+    const credits: Record<string, unknown> = {
+      [MAIN_TOKEN]: {
+        has_credits: true,
+        unlimited: false,
+        overage_limit_reached: false,
+        balance: null,
+      },
+      [ALPHA_TOKEN]: {
+        has_credits: true,
+        unlimited: false,
+        overage_limit_reached: false,
+        balance: '1234.6',
+      },
+    }
+    whamHandler = async (call) => {
+      const body = await whamOk(20).json()
+      return Response.json(
+        call.token !== undefined && call.token in credits
+          ? { ...body, credits: credits[call.token] }
+          : body,
+      )
+    }
+
+    const result = await createPiMenu(runtime.commandSupport()).apply(
+      {
+        command: 'openai',
+        sectionId: 'quota',
+        actionId: 'check',
+        values: { account: '*' },
+      },
+      { notify: () => {} },
+    )
+
+    expect(result.ok).toBe(true)
+    const quota = result.menu.sections.find((section) => section.id === 'quota')
+    const detail = (id: string) =>
+      quota?.items.find((item) => item.id === id)?.detail
+    expect(detail('alpha')).toEndWith(' · prepaid 1235 credits')
+    expect(detail('beta')).not.toContain('prepaid')
+    const login = result.menu.sections.find(
+      (section) => section.id === 'pi-login',
+    )
+    expect(login?.lines.at(-1)).toBe('prepaid Available')
+  })
+
   test('a per-account quota check polls only the chosen pool row', async () => {
     const runtime = makeRuntime()
     await ready(runtime)

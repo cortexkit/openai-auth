@@ -16,6 +16,7 @@ import {
   type ObservedPair,
   type ObservedReading,
   projectQuota,
+  type QuotaCredits,
   type QuotaObservation,
 } from '@cortexkit/common-auth/quota'
 import type { AccountQuotaWindow, OAuthQuotaSnapshot } from './accounts'
@@ -77,6 +78,34 @@ function budgetFor(
 }
 
 /**
+ * The snapshot's prepaid credits as the pool stores them, stamped with the
+ * observation's time, or undefined when the snapshot carries no well-formed
+ * credits record.
+ */
+function prepaidCreditsFor(
+  value: unknown,
+  checkedAt: number,
+): QuotaCredits | undefined {
+  if (
+    !isRecord(value) ||
+    typeof value.hasCredits !== 'boolean' ||
+    typeof value.unlimited !== 'boolean'
+  )
+    return undefined
+  return {
+    hasCredits: value.hasCredits,
+    unlimited: value.unlimited,
+    ...(finite(value.balance) && value.balance >= 0
+      ? { balance: value.balance }
+      : {}),
+    ...(typeof value.overageLimitReached === 'boolean'
+      ? { overageLimitReached: value.overageLimitReached }
+      : {}),
+    checkedAt,
+  }
+}
+
+/**
  * One pool observation for a quota snapshot taken at `checkedAt`, or
  * undefined when the snapshot says nothing.
  *
@@ -107,7 +136,16 @@ export function observationFromSnapshot(
     typeof credits === 'number' && Number.isSafeInteger(credits) && credits >= 0
       ? { resetCredits: { value: credits, checkedAt } }
       : undefined
-  if (readings.length === 0 && coverage.length === 0 && !budget && !counters)
+  // Likewise, prepaid credits are recorded only when the source reported them;
+  // a source that carries none leaves the stored credits alone.
+  const prepaid = prepaidCreditsFor(snapshot.credits, checkedAt)
+  if (
+    readings.length === 0 &&
+    coverage.length === 0 &&
+    !budget &&
+    !counters &&
+    !prepaid
+  )
     return undefined
   return {
     checkedAt,
@@ -115,6 +153,7 @@ export function observationFromSnapshot(
     ...(coverage.length > 0 ? { coverage } : {}),
     ...(budget ? { budget } : {}),
     ...(counters ? { counters } : {}),
+    ...(prepaid ? { credits: prepaid } : {}),
   }
 }
 

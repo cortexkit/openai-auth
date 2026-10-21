@@ -74,7 +74,10 @@ export function sidebarQuotaFromPoolMap(
 ): AccountQuota | null {
   const windows = windowsFromQuotaMap(map)
   const spendControl = spendControlOf(map)
-  if (!windows && !spendControl) return null
+  // The pool keeps prepaid credits only when a reading reported them, with
+  // that reading's time, so they are copied as they are.
+  const credits = isQuotaMap(map) ? map.credits : undefined
+  if (!windows && !spendControl && !credits) return null
   const checkedAt = isQuotaMap(map) ? projectQuota(map).checkedAt : undefined
   return {
     ...(checkedAt !== undefined ? { checkedAt } : {}),
@@ -84,6 +87,7 @@ export function sidebarQuotaFromPoolMap(
     ...(resetCredits !== undefined
       ? { resetCreditsAvailable: resetCredits }
       : {}),
+    ...(credits ? { credits: { ...credits } } : {}),
   }
 }
 
