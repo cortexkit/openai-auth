@@ -27,7 +27,12 @@ for (const trigger of ['startup', 'interval']) {
     if (result.unhandled.length)
       throw new Error('background roster quota poll leaked LockOwnershipError')
     expect(result.warnings).toHaveLength(1)
-    expect(result.warnings[0]).toContain('vault background quota poll failed')
+    // The poll queues its reading; the shared roster writer publishes it a
+    // moment later and, on the lost lease, warns once and keeps the reading
+    // to retry.
+    expect(result.warnings[0]).toContain(
+      'vault quota publication delayed; retrying',
+    )
     expect(result.warnings[0]).toContain('Lost claustrum-roster-write lock')
     expect(result.recovered).toBe(true)
     expect(result.declineRejected).toBe(true)

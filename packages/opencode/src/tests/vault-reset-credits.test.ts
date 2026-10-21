@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { drainVaultQuota } from '@cortexkit/common-auth/claustrum'
 import { OpenAiVault } from '@cortexkit/openai-auth-core/internal'
 import {
   startMockDaemon,
@@ -115,6 +116,9 @@ describe('vault reset credits', () => {
       }
       expect(await env.vault.pollQuota(env.id)).toEqual({ ok: true })
       expect(env.whamReads).toBe(source === 'wham' ? 1 : 0)
+      // The roster write is queued and published a moment later; the second
+      // process reads the roster file, so wait for the write to land.
+      await drainVaultQuota(env.vault.paths.rosterPath)
       expect(env.vault.snapshot()?.rows[0]?.quota?.counters).toEqual({
         resetCredits: { value: credits, checkedAt },
       })
