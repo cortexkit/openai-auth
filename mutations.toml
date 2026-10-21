@@ -5152,6 +5152,40 @@ list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode
 test_count_pattern = "Ran {count} test"
 expect_red = ['^collapsed sidebar frame on OpenCode 1 and OpenCode 2 renders one line per account with whole quota text in a 42-column frame$']
 
+# An expanded quota row keeps one blank cell between the "N% left" figure and
+# the reset time; without it a row exactly as wide as its content draws
+# "left4h39m". The frame test renders the compiled TUI on OpenCode 1 and
+# OpenCode 2 at every width from 42 down, so the command rebuilds it first.
+[[control]]
+id = "expanded-quota-row-reset-gap"
+guards = "an expanded quota row never draws the reset time touching the quota figure"
+file = "packages/opencode/src/tui.tsx"
+old = "  if (reset > 0 && fixed + barWidth + 1 + reset <= columns)"
+new = "  if (reset > 0 && fixed + barWidth + reset <= columns) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/tui-quota-render.test.ts"
+runner = "command"
+command = ["sh", "-c", "bun run --cwd packages/opencode build:tui && bun test --cwd packages/opencode src/tests/tui-quota-render.test.ts -t \"$1\"", "sidebar-mutation", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/tui-quota-render.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^expanded sidebar frame on OpenCode 1 and OpenCode 2 quota rows stay on one line with a space before the reset at every width from 42 to 16 columns$']
+expect_message = "quota figure runs into the reset at width 30"
+
+# The pacing line under an expanded quota row is cut with an ellipsis to the
+# row's width instead of wrapping or running off the edge.
+[[control]]
+id = "expanded-quota-pacing-line-cut"
+guards = "an expanded quota row's pacing line stays on one line, cut with an ellipsis"
+file = "packages/opencode/src/tui.tsx"
+old = "    return fitCollapsedLabel(line, columns() - props.labelWidth)"
+new = "    return line // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/tui-quota-render.test.ts"
+runner = "command"
+command = ["sh", "-c", "bun run --cwd packages/opencode build:tui && bun test --cwd packages/opencode src/tests/tui-quota-render.test.ts -t \"$1\"", "sidebar-mutation", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "src/tests/tui-quota-render.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^expanded sidebar frame on OpenCode 1 and OpenCode 2 quota rows stay on one line with a space before the reset at every width from 42 to 16 columns$']
+expect_message = "the pacing line is not cut with an ellipsis at width 30"
+
 # Each collapsed line uses the shared narrow quota text, short enough that the
 # quota is never cut in a narrow sidebar.
 [[control]]

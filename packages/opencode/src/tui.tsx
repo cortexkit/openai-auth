@@ -516,10 +516,52 @@ export function getAccountMetadataRows(
   return rows
 }
 
+/** The fewest cells a shortened quota bar keeps; below this it is dropped. */
+const MIN_QUOTA_BAR_CELLS = 3
+
+export interface QuotaRowFit {
+  /** Cells of usage bar to draw; 0 draws no bar. */
+  barCells: number
+  showReset: boolean
+}
+
+/**
+ * How an expanded quota row fits on one line `columns` cells wide. The row is
+ * the padded label, the bar, the " N% left" figure and, at the right edge, the
+ * reset time. When it does not fit, the reset time goes first, then the bar
+ * shrinks (to no fewer than MIN_QUOTA_BAR_CELLS cells, else it is dropped).
+ * The label and the figure are never cut. `columns` of 0 means the row has not
+ * been measured yet, and everything is drawn.
+ */
+export function fitQuotaRow(input: {
+  columns: number
+  label: string
+  barWidth: number
+  figure: string
+  resetText?: string
+}): QuotaRowFit {
+  const { columns, barWidth } = input
+  const reset = input.resetText ? displayWidth(input.resetText) : 0
+  if (columns <= 0) return { barCells: barWidth, showReset: reset > 0 }
+  const fixed = displayWidth(input.label) + displayWidth(input.figure)
+  // The reset sits at the right edge with at least one blank cell before it,
+  // so it never runs into the figure.
+  if (reset > 0 && fixed + barWidth + 1 + reset <= columns)
+    return { barCells: barWidth, showReset: true }
+  const room = columns - fixed
+  if (room >= barWidth) return { barCells: barWidth, showReset: false }
+  return {
+    barCells: room >= MIN_QUOTA_BAR_CELLS ? room : 0,
+    showReset: false,
+  }
+}
+
 // Quota window row: muted label left, tone-colored usage bar and shared quota text.
 // When pacing data is present, the bar
 // gains a pace segment and an off-pace window adds a muted subline with the
 // reserve/deficit delta and the projected runout.
+// The row measures its own width and never wraps: fitQuotaRow decides what is
+// left out when it is too narrow, and the pacing subline is cut with ….
 function QuotaRow(props: {
   theme: ThemeCurrent
   appearance: AppearancePrefs
@@ -531,6 +573,24 @@ function QuotaRow(props: {
   pacing: QuotaPacing | null
 }) {
   const used = () => props.window?.usedPercent ?? 0
+  const [columns, setColumns] = createSignal(0)
+  let row: { width: number } | undefined
+  const label = () => props.label.padEnd(props.labelWidth)
+  const figure = () => ` ${props.text.slice(props.label.length + 1)}`
+  const fit = () =>
+    fitQuotaRow({
+      columns: columns(),
+      label: label(),
+      barWidth: props.appearance.barWidth,
+      figure: figure(),
+      resetText: props.resetText,
+    })
+  const fittedPaceLine = () => {
+    const line = paceLine()
+    if (line === null || columns() <= 0) return line
+    // The subline is indented by the label column; cut it to the rest.
+    return fitCollapsedLabel(line, columns() - props.labelWidth)
+  }
   const paceLine = () => {
     const pacing = props.pacing
     if (!pacing || pacing.state === 'on-pace') return null
@@ -553,29 +613,46 @@ function QuotaRow(props: {
       }
     >
       {/* Bars show usage; the adjacent figure shows quota left, as in the dialog. */}
-      <box width='100%' flexDirection='row' justifyContent='space-between'>
-        <box flexDirection='row'>
-          <text fg={props.theme.textMuted}>
-            {props.label.padEnd(props.labelWidth)}
+      <box
+        ref={(element: { width: number }) => {
+          row = element
+        }}
+        onSizeChange={() => setColumns(row?.width ?? 0)}
+        width='100%'
+        flexDirection='row'
+        justifyContent='space-between'
+      >
+        <box flexDirection='row' flexShrink={0}>
+          <text fg={props.theme.textMuted} wrapMode='none'>
+            {label()}
           </text>
-          <For each={quotaBarSegments(used(), props.appearance, props.pacing)}>
+          <For
+            each={quotaBarSegments(
+              used(),
+              { ...props.appearance, barWidth: fit().barCells },
+              props.pacing,
+            )}
+          >
             {(segment) => (
-              <text fg={toneColor(props.theme, segment.tone)}>
+              <text fg={toneColor(props.theme, segment.tone)} wrapMode='none'>
                 {segment.text}
               </text>
             )}
           </For>
           <text
             fg={toneColor(props.theme, usageTone(used(), props.appearance))}
+            wrapMode='none'
           >
-            {` ${props.text.slice(props.label.length + 1)}`}
+            {figure()}
           </text>
         </box>
-        <Show when={props.resetText}>
-          <text fg={props.theme.textMuted}>{props.resetText}</text>
+        <Show when={fit().showReset}>
+          <text fg={props.theme.textMuted} wrapMode='none' flexShrink={0}>
+            {props.resetText}
+          </text>
         </Show>
       </box>
-      <Show when={paceLine()}>
+      <Show when={fittedPaceLine()}>
         <box width='100%' flexDirection='row'>
           <text fg={props.theme.textMuted}>{''.padEnd(props.labelWidth)}</text>
           <text
@@ -583,8 +660,9 @@ function QuotaRow(props: {
               props.theme,
               props.pacing?.state === 'deficit' ? 'warn' : 'muted',
             )}
+            wrapMode='none'
           >
-            {paceLine()}
+            {fittedPaceLine()}
           </text>
         </box>
       </Show>

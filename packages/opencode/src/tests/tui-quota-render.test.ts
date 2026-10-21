@@ -18,6 +18,7 @@ import {
   buildQuotaRowsForDisplay,
   buildRoutingRowsForDisplay,
   computeQuotaLabelWidth,
+  fitQuotaRow,
   getAccountMetadataRows,
   getQuotaMetadataRows,
   isQuotaLoaded,
@@ -684,5 +685,53 @@ describe('collapsed sidebar frame on OpenCode 1 and OpenCode 2', () => {
     ])
     expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: '' })
     expect(stdout).toContain('collapsed-sidebar-render passed')
+  }, 30_000)
+})
+
+describe('expanded sidebar quota rows', () => {
+  const row = { label: '7d ', barWidth: 10, figure: ' 100% left' }
+
+  test('a narrow row drops the reset first, then shortens the bar, then drops it', () => {
+    const at = (columns: number) =>
+      fitQuotaRow({ ...row, columns, resetText: '6d23h' })
+    // Label 3 + bar 10 + figure 10 + one blank cell + reset 5 = 29.
+    expect(at(29)).toEqual({ barCells: 10, showReset: true })
+    expect(at(28)).toEqual({ barCells: 10, showReset: false })
+    expect(at(23)).toEqual({ barCells: 10, showReset: false })
+    expect(at(22)).toEqual({ barCells: 9, showReset: false })
+    expect(at(16)).toEqual({ barCells: 3, showReset: false })
+    expect(at(15)).toEqual({ barCells: 0, showReset: false })
+    // Not measured yet: everything is drawn.
+    expect(at(0)).toEqual({ barCells: 10, showReset: true })
+    expect(fitQuotaRow({ ...row, columns: 40 })).toEqual({
+      barCells: 10,
+      showReset: false,
+    })
+  })
+})
+
+describe('expanded sidebar frame on OpenCode 1 and OpenCode 2', () => {
+  test('quota rows stay on one line with a space before the reset at every width from 42 to 16 columns', async () => {
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        '--conditions=browser',
+        '--preload',
+        '@opentui/solid/runtime-plugin-support',
+        'src/tests/fixtures/expanded-quota-rows-render.ts',
+      ],
+      {
+        cwd: join(import.meta.dir, '..', '..'),
+        stdout: 'pipe',
+        stderr: 'pipe',
+      },
+    )
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: '' })
+    expect(stdout).toContain('expanded-quota-rows-render passed')
   }, 30_000)
 })
