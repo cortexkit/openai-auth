@@ -6163,3 +6163,49 @@ list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode
 test_count_pattern = "Ran {count} test"
 expect_red = ['^prepaid\scredits\sin\s/openai\sQuota\sOpenCode\s2\sshows\seach\saccount\squota\sonce,\sas\sOpenCode\s1\sdoes$']
 expect_message = "expect(native).toMatchObject({"
+
+# Prepaid credits are a paid fallback: an account with free quota always
+# serves before an account that could only serve on credits, and credits
+# whose reading is stale or whose overage limit is reached are not usable.
+
+[[control]]
+id = "prepaid-credits-after-free-quota"
+guards = "an account with free quota serves before an exhausted account that would serve on prepaid credits"
+file = "packages/core/src/pool-routing.ts"
+old = "  if (free.length > 0) return { kind: 'send', order: free, lastPath: false }"
+new = "  if (free.length > 0 && credits.length === 0) return { kind: 'send', order: free, lastPath: false } // NON-VACUITY BREAK"
+test_file = "packages/core/src/tests/pool-routing-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/pool-routing-credits.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/pool-routing-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^prepaid\scredits\sas\sa\sfallback\stier\sfree\squota\son\sanother\saccount\sserves\sbefore\san\sexhausted\saccount\swith\scredits,\sin\severy\srouting\smode$']
+expect_message = "toEqual({ kind: 'send', order: ['b'], lastPath: false })"
+
+[[control]]
+id = "prepaid-credits-overage-reached"
+guards = "credits whose overage limit is reached are not usable for routing"
+file = "packages/core/src/pool-routing.ts"
+old = "  if (record.overageLimitReached === true) return false"
+new = "  if (false && record.overageLimitReached === true) return false // NON-VACUITY BREAK"
+test_file = "packages/core/src/tests/pool-routing-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/pool-routing-credits.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/pool-routing-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^prepaid\scredits\sas\sa\sfallback\stier\sstale\scredits,\sa\sreached\soverage\slimit,\sa\szero\sbalance\sand\sno\srecord\sare\snot\susable$']
+expect_message = "expect(creditsUsable(credits, NOW)).toBe(false)"
+
+[[control]]
+id = "prepaid-credits-stale"
+guards = "a credits reading older than the routing staleness bound is not usable"
+file = "packages/core/src/pool-routing.ts"
+old = "  if (!(now - record.checkedAt <= QUOTA_STALENESS_MS)) return false"
+new = "  if (false && !(now - record.checkedAt <= QUOTA_STALENESS_MS)) return false // NON-VACUITY BREAK"
+test_file = "packages/core/src/tests/pool-routing-credits.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/pool-routing-credits.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/pool-routing-credits.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^prepaid\scredits\sas\sa\sfallback\stier\sstale\scredits,\sa\sreached\soverage\slimit,\sa\szero\sbalance\sand\sno\srecord\sare\snot\susable$']
+expect_message = "expect(creditsUsable(credits, NOW)).toBe(false)"
