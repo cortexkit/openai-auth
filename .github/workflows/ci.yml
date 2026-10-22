@@ -141,7 +141,12 @@ jobs:
   mutations-main:
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: check
+    name: mutations-main (shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
@@ -163,11 +168,11 @@ jobs:
       - name: Replay the full catalogue
         run: |
           mkdir -p mutations-report
-          ckdev-mutate run --all ${BROAD:+--broad} --report mutations-report/all.json
+          ckdev-mutate run --all --shard ${{ matrix.shard }}/4 ${BROAD:+--broad} --report mutations-report/all-${{ matrix.shard }}.json
         env:
           BROAD: ${{ github.event_name != 'push' && 'true' || '' }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: mutations-${{ github.event_name == 'push' && 'main' || 'broad' }}
-          path: mutations-report/all.json
+          name: mutations-${{ github.event_name == 'push' && 'main' || 'broad' }}-${{ matrix.shard }}
+          path: mutations-report/all-${{ matrix.shard }}.json
