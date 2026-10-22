@@ -32,6 +32,7 @@ import {
   type AccountPaths,
   type AccountStorage,
   codexRefreshFn,
+  createLogger,
   extractAccountId,
   isCompleteQuotaHeaderFrame,
   loadAccounts,
@@ -53,6 +54,7 @@ import {
 } from '@cortexkit/openai-auth-core/internal'
 import { observationFromSnapshot } from '@cortexkit/openai-auth-core/pool-quota'
 import {
+  CreditsServing,
   FIRST_QUOTA_READING_WAIT_MS,
   FORMER_MAIN_ID,
   POOL_QUOTA_UNKNOWN_RETRY_SECONDS,
@@ -92,6 +94,7 @@ export const FIRST_READING_WAIT_MS = FIRST_QUOTA_READING_WAIT_MS
 
 /** Longest a request waits for a lock-free re-read of the account settings. */
 const STORAGE_READ_BUDGET_MS = 500
+const routingLog = createLogger('routing')
 
 type StreamSimple = (
   model: Model<Api>,
@@ -197,6 +200,11 @@ export class PiOpenAIRuntime {
   readonly pool: PiPoolSource
   readonly vault: OpenAiVault
   private readonly deps: PiOpenAIRuntimeDeps
+  /**
+   * Which accounts this runtime serves on prepaid credits, so the info line
+   * is written once when an account starts serving on them.
+   */
+  private readonly creditsServing = new CreditsServing()
   /**
    * The vault account behind each recent vault token, with the receipt the
    * vault served the token under, newest last, so a rate-limit frame
@@ -717,6 +725,12 @@ export class PiOpenAIRuntime {
               ? this.attempt(model, context, options, account.id, account.token)
               : Promise.resolve(undefined),
         placePin: placePiStickyPin,
+        creditsServing: this.creditsServing,
+        // Only the credits info line: this router's debug lines stay off.
+        log: {
+          debug: () => {},
+          info: (message, data) => routingLog.info(message, data),
+        },
       })
     const result = await run()
     if (result.kind === 'blocked') {

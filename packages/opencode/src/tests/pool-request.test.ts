@@ -199,6 +199,7 @@ function quotaMap(
     checkedAt?: number
     resetInMs?: number
     budget?: { reached: boolean; resetInMs?: number }
+    credits?: { hasCredits: boolean; unlimited: boolean; balance?: number }
   } = {},
 ) {
   const checkedAt = options.checkedAt ?? Date.now()
@@ -225,6 +226,7 @@ function quotaMap(
           },
         }
       : {}),
+    ...(options.credits ? { credits: { ...options.credits, checkedAt } } : {}),
   }
 }
 
@@ -884,6 +886,40 @@ describe('exhaustion and the credit budget on a migrated install', () => {
 
       expect(response.status).toBe(200)
       expect(wire.sends).toHaveLength(1)
+    })
+  }
+})
+
+describe('prepaid credits on a migrated install', () => {
+  const failedPolls = () => new Response('', { status: 503 })
+  const credits = { hasCredits: true, unlimited: false, balance: 25 }
+
+  for (const mode of MODES) {
+    it(`${mode}: with every window spent, the account with credits serves before the one the mode tries first`, async () => {
+      // fallback-first tries main last; every other mode tries it first. The
+      // credits sit on the account the mode would try last.
+      const withCredits = mode === 'fallback-first' ? 'main' : 'fallback-1'
+      seedPool(mode, [
+        {
+          id: 'main',
+          quota:
+            withCredits === 'main' ? quotaMap(100, { credits }) : quotaMap(100),
+        },
+        {
+          id: 'fallback-1',
+          quota:
+            withCredits === 'fallback-1'
+              ? quotaMap(100, { credits })
+              : quotaMap(100),
+        },
+      ])
+      const wire = installWire({ usage: failedPolls })
+      const fetchOverride = await loadFetch()
+
+      const response = await fetchOverride(URL_RESPONSES, request('s-credits'))
+
+      expect(response.status).toBe(200)
+      expect(wire.sends).toEqual([bearer(withCredits)])
     })
   }
 })

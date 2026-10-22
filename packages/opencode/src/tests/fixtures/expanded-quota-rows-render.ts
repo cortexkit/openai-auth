@@ -80,7 +80,7 @@ publish({
 })
 
 function publish(state: Record<string, unknown>) {
-  writeFileSync(stateFile, JSON.stringify({ ...state, lastUpdated: now }))
+  writeFileSync(stateFile, JSON.stringify({ lastUpdated: now, ...state }))
 }
 
 const color = (hex: string) => RGBA.fromHex(hex)
@@ -305,6 +305,57 @@ try {
       )
     }
     if (width === FULL_WIDTH) assert.match(pace, full)
+  }
+
+  // The session's account has used up its 5h window and is serving on its
+  // prepaid credits: the prepaid row says so, on one line, at the widths
+  // OpenCode gives the plugin (36 and 37 cells). A later `lastUpdated`, so
+  // the sidebar's poll takes the new file.
+  publish({
+    lastUpdated: now + 1,
+    main: {
+      killed: false,
+      quota: {
+        checkedAt: now,
+        primary: {
+          usedPercent: 100,
+          remainingPercent: 0,
+          windowMinutes: 300,
+          resetsAt: new Date(now + 2 * HOUR).toISOString(),
+          checkedAt: now,
+        },
+        credits: {
+          hasCredits: true,
+          unlimited: false,
+          balance: 1234.6,
+          checkedAt: now,
+        },
+      },
+    },
+    fallbacks: [],
+    activeId: 'main',
+    route: 'main-first',
+  })
+  await Promise.all([...polls.values()].map((refresh) => refresh()))
+  for (const width of [37, 36]) {
+    await drawAt(width)
+    const columns = width - 2
+    const lines = contentLines(width)
+    const at = `at width ${width}: ${view.captureCharFrame()}`
+    const serving = lines.filter((line) => line.trimEnd().endsWith(CREDITS))
+    assert.equal(serving.length, 1, `the prepaid row is missing ${at}`)
+    const line = serving[0] ?? ''
+    const label = 'serving on credits'
+    assert.equal(
+      line,
+      `${label}${' '.repeat(columns - label.length - CREDITS.length)}${CREDITS}`,
+      `the serving-on-credits row is not drawn whole on one line ${at}`,
+    )
+    assert.equal(
+      (lines[lines.indexOf(line) + 1] ?? '').trim(),
+      '',
+      `the serving-on-credits row wraps onto a second line ${at}`,
+    )
   }
 } finally {
   cleanup()

@@ -145,7 +145,10 @@ import {
   type PoolPinPlacement,
   servePoolRequest,
 } from './core/pool-request'
-import { POOL_QUOTA_UNKNOWN_RETRY_SECONDS } from './core/pool-routing'
+import {
+  CreditsServing,
+  POOL_QUOTA_UNKNOWN_RETRY_SECONDS,
+} from './core/pool-routing'
 import {
   buildPoolSidebarMachineState,
   buildVaultSidebarMachineState,
@@ -1775,6 +1778,9 @@ export async function CodexAuthPlugin(
         const logQ = createLogger('quota')
         const logR = createLogger('refresh')
         const logA = createLogger('accounts')
+        // Which accounts this process serves on prepaid credits, so the info
+        // line is written once when an account starts serving on them.
+        const creditsServing = new CreditsServing()
 
         // One-line resolved-config marker so the active endpoint/transport is
         // observable in the file log without enabling request dumps.
@@ -4476,6 +4482,7 @@ export async function CodexAuthPlugin(
               Boolean(
                 (init?.signal as AbortSignal | undefined | null)?.aborted,
               ),
+            creditsServing,
             log: logA,
           })
           queueRequestSidebarRouting(

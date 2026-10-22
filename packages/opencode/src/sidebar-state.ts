@@ -8,6 +8,7 @@ import {
 } from '@cortexkit/common-auth/quota'
 import { orderForPlacement } from '@cortexkit/common-auth/routing'
 import {
+  creditsUsable,
   orderedPlacement,
   vaultMainRouteId,
 } from '@cortexkit/openai-auth-core/pool-routing'
@@ -76,6 +77,22 @@ export function accountCreditsText(
     unlimited,
     ...(typeof balance === 'number' ? { balance } : {}),
   })
+}
+
+/**
+ * Whether an account can serve only on its prepaid credits: one of its
+ * windows reads used up with the reset still ahead, the workspace's spending
+ * cap is not reached, and its credits are usable by the rule routing applies
+ * (`creditsUsable`). The sidebar uses it to mark the account a session is
+ * using as serving on credits.
+ */
+export function accountServesOnCredits(
+  quota: AccountQuota | null | undefined,
+  now = Date.now(),
+): boolean {
+  if (!exhaustedQuotaResetAt(quota, now)) return false
+  if (spendControlExhaustedResetAt(quota, now)) return false
+  return creditsUsable(quota?.credits, now)
 }
 
 export type QuotaWindowKey = 'primary' | 'secondary'

@@ -52,6 +52,7 @@ import type { PoolAccountSource } from './pool-account-source'
 import { windowsFromQuotaMap } from './pool-quota'
 import {
   admitSticky,
+  type CreditsServing,
   FORMER_MAIN_ID,
   orderedPlacement,
   type PoolBlock,
@@ -219,8 +220,14 @@ export interface PoolRequestContext {
   resetCredits(id: string): number | undefined
   /** Whether this send failure is the caller aborting the request. */
   isAbort(error: unknown): boolean
+  /**
+   * The accounts this process serves on prepaid credits, told about each
+   * served request so it can log when an account starts serving on them.
+   */
+  creditsServing?: CreditsServing
   log: {
     debug(message: string, meta?: Record<string, unknown>): void
+    info?(message: string, meta?: Record<string, unknown>): void
   }
 }
 
@@ -415,8 +422,9 @@ async function serveOrdered(
   rows: readonly PoolTarget[],
 ): Promise<PoolRequestResult> {
   const placement = orderedPlacement(ctx.mode)
+  const routing = routingInput(ctx, rows)
   const plan = planOrdered({
-    ...routingInput(ctx, rows),
+    ...routing,
     placement,
     mainId: ctx.vault
       ? ctx.mode === 'sticky-balanced'
@@ -499,7 +507,10 @@ async function serveOrdered(
     last = { response, servedId: row.id }
     attempts.push({ id: row.id, status: response.status })
   }
-  if (last) return last
+  if (last) {
+    noteServed(ctx, routing, last.servedId)
+    return last
+  }
   return {
     response: ctx.blocked(
       { reason: 'no-credential' },
@@ -640,5 +651,22 @@ async function serveSticky(
       }
     }
   }
+  noteServed(ctx, routing, row.id)
   return { response, servedId: row.id }
+}
+
+/** Tells the credits tracker which account served, on the rows routed over. */
+function noteServed(
+  ctx: PoolRequestContext,
+  routing: PoolRoutingInput,
+  id: string,
+): void {
+  const info = ctx.log.info
+  ctx.creditsServing?.served(
+    routing,
+    id,
+    info
+      ? { info: (message, data) => info.call(ctx.log, message, data) }
+      : undefined,
+  )
 }

@@ -262,6 +262,34 @@ describe('Pi requests on the account pool', () => {
     )
   })
 
+  test('with every window spent, the account with prepaid credits serves before the one main-first tries first', async () => {
+    // Every account reads 100% used; only beta reports usable credits.
+    whamHandler = async (call) => {
+      const json = (await whamOk(100).json()) as Record<string, unknown>
+      return Response.json(
+        call.token === BETA_TOKEN
+          ? {
+              ...json,
+              credits: {
+                has_credits: true,
+                unlimited: false,
+                overage_limit_reached: false,
+                balance: '30',
+              },
+            }
+          : json,
+      )
+    }
+    const runtime = makeRuntime()
+    await ready(runtime)
+    await setMode('main-first')
+
+    const events = await send(runtime)
+
+    expect(events[0]?.type).toBe('start')
+    expect(codexTokens()).toEqual([BETA_TOKEN])
+  })
+
   test('a 429 with confirmed exhaustion moves a sticky pin to another account', async () => {
     const runtime = makeRuntime()
     await ready(runtime)

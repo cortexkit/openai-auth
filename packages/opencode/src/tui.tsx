@@ -30,6 +30,7 @@ import { resolveRpcDir } from './rpc/rpc-dir.js'
 import {
   type AccountQuota,
   accountCreditsText,
+  accountServesOnCredits,
   type CollapsedAccountLine,
   computeQuotaPacing,
   DEFAULT_SIDEBAR_STATE,
@@ -540,12 +541,15 @@ export function formatSpendControlAmounts(
 /**
  * The account's own rows under its quota bars: the workspace budget's amounts
  * (`credits`), the prepaid credits (`prepaid`, worded by `accountCreditsText`)
- * and the reset-credit count (`resets`), each only when known.
+ * and the reset-credit count (`resets`), each only when known. While the
+ * account is serving the session on its prepaid credits (its free quota is
+ * used up), the prepaid row says so in place of its `prepaid` label.
  */
 export function getAccountMetadataRows(
   resetCredits: number | undefined,
   spendControl?: SpendControlReading,
   prepaidCredits?: string,
+  servingOnCredits = false,
 ): Array<{ label: string; value: string }> {
   const rows: Array<{ label: string; value: string }> = []
   if (spendControl) {
@@ -555,7 +559,10 @@ export function getAccountMetadataRows(
     })
   }
   if (prepaidCredits !== undefined) {
-    rows.push({ label: 'prepaid', value: prepaidCredits })
+    rows.push({
+      label: servingOnCredits ? 'serving on credits' : 'prepaid',
+      value: prepaidCredits,
+    })
   }
   if (resetCredits !== undefined) {
     rows.push({ label: 'resets', value: String(resetCredits) })
@@ -809,6 +816,7 @@ function AccountBlock(props: {
           props.resetCredits,
           props.quota?.spendControl,
           accountCreditsText(props.quota),
+          props.active && accountServesOnCredits(props.quota, Date.now()),
         )}
       >
         {(row) => (

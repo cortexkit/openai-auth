@@ -73,6 +73,7 @@ import { windowsFromQuotaMap } from '../core/pool-quota'
 import { routableRows } from '../core/pool-request'
 import {
   admitSticky,
+  CreditsServing,
   FORMER_MAIN_ID,
   orderedPlacement,
   type PoolRoutingInput,
@@ -149,6 +150,7 @@ export type PoolAccess = Pick<
 export interface OpenAIAdapterLogger {
   debug(message: string, data?: Record<string, unknown>): void
   warn(message: string, data?: Record<string, unknown>): void
+  info?(message: string, data?: Record<string, unknown>): void
 }
 
 /** The parts of this host's vault (`OpenAiVault`) the adapter uses. */
@@ -413,6 +415,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   // The row each session's latest agent-loop request went to, which its
   // title, compaction and generate requests follow in the ordered modes.
   const sessionAccounts = deps.sessionAccounts ?? new SessionAccounts()
+  // Which accounts this host serves on prepaid credits, so the info line is
+  // written once when an account starts serving on them.
+  const creditsServing = new CreditsServing()
 
   /**
    * The accounts one request may be sent with now: the routable pool rows,
@@ -741,6 +746,16 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     if (accountId !== undefined && primary) {
       sessionAccounts.record(input.sessionID, accountId)
       deps.onRoute?.(input.sessionID, accountId, mode)
+    }
+    if (accountId !== undefined) {
+      const info = log?.info
+      creditsServing.served(
+        routing,
+        accountId,
+        log && info
+          ? { info: (message, data) => info.call(log, message, data) }
+          : undefined,
+      )
     }
     log?.debug('pool account chosen', {
       kind: input.kind,

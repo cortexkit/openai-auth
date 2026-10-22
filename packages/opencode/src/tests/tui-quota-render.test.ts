@@ -9,6 +9,7 @@ import { sidebarQuotaFromPoolMap } from '../core/pool-sidebar.ts'
 import {
   type AccountQuota,
   accountCreditsText,
+  accountServesOnCredits,
   fitCollapsedLabel,
   getCollapsedAccountLines,
   getCollapsedQuotaSummary,
@@ -514,6 +515,54 @@ describe('dynamic quota TUI rows', () => {
         'Unlimited',
       ).map((row) => row.label),
     ).toEqual(['credits', 'prepaid', 'resets'])
+  })
+
+  test('the account a session is using on its prepaid credits names that on its prepaid row', () => {
+    const credits = {
+      hasCredits: true,
+      unlimited: false,
+      balance: 12,
+      checkedAt: now,
+    }
+    const window = (usedPercent: number) => ({
+      usedPercent,
+      remainingPercent: 100 - usedPercent,
+      resetsAt: new Date(now + 60 * 60_000).toISOString(),
+      checkedAt: now,
+    })
+    const onCredits: AccountQuota = { primary: window(100), credits }
+    expect(accountServesOnCredits(onCredits, now)).toBe(true)
+    // Free quota left, credits not usable, or the spending cap reached: the
+    // account is not serving on credits.
+    for (const quota of [
+      { primary: window(40), credits },
+      { primary: window(100), credits: { ...credits, balance: 0 } },
+      {
+        primary: window(100),
+        credits: { ...credits, checkedAt: now - 20 * 60_000 },
+      },
+      { primary: window(100) },
+      {
+        primary: window(100),
+        credits,
+        spendControl: {
+          limit: 10,
+          used: 10,
+          remaining: 0,
+          usedPercent: 100,
+          remainingPercent: 0,
+          reached: true,
+          resetsAt: new Date(now + 24 * 60 * 60_000).toISOString(),
+        },
+      },
+    ] as AccountQuota[])
+      expect(accountServesOnCredits(quota, now)).toBe(false)
+    expect(
+      getAccountMetadataRows(undefined, undefined, '12 credits', true),
+    ).toEqual([{ label: 'serving on credits', value: '12 credits' }])
+    expect(getAccountMetadataRows(undefined, undefined, '12 credits')).toEqual([
+      { label: 'prepaid', value: '12 credits' },
+    ])
   })
 
   test('a drawer apply sends the sessionId on its RPC request', () => {

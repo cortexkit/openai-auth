@@ -29,8 +29,23 @@
 //   as not replayable; Pi sends a request again only after its first attempt
 //   failed before streaming anything, so it leaves the flag unset and every
 //   request is replayable.
+// - The prepaid-credits tier. A ChatGPT workspace can hold prepaid credits,
+//   and the Codex backend keeps serving an account from them after its
+//   rate-limit windows are used up. Credits cost money, so they are only a
+//   fallback: an account with free quota left always serves first, and an
+//   account whose windows are spent but whose credits are usable (see
+//   `creditsUsable`) serves only when no account has free quota. The library
+//   refuses such an account as exhausted, so this file puts it back between
+//   the free accounts and the last path, for every routing mode and for
+//   placing new sessions.
 
-import { type ProjectedQuota, projectQuota } from '@cortexkit/common-auth/quota'
+import {
+  budgetExhaustedResetAt,
+  isQuotaCredits,
+  type ProjectedQuota,
+  projectQuota,
+  type QuotaCredits,
+} from '@cortexkit/common-auth/quota'
 import {
   type AdmissionRefusal,
   type AdmissionResult,
@@ -38,6 +53,7 @@ import {
   decideStickyBreak,
   type OrderedPlacement,
   orderForPlacement,
+  QUOTA_STALENESS_MS,
   type RoutingRow,
   routeOrdered,
   routeSticky,
@@ -218,6 +234,138 @@ function isConfirmedExhaustion(refusal: AdmissionRefusal): boolean {
   return refusal.reason === 'exhausted' || refusal.reason === 'budget-spent'
 }
 
+/**
+ * Whether an account's prepaid credits can pay for a request. The record must
+ * be well formed and no older than the quota readings routing trusts
+ * (`QUOTA_STALENESS_MS`, the age after which sticky routing stops trusting a
+ * window reading). The overage allowance must not be used up, and the credits
+ * must be unlimited or present with a balance above zero. A record that says
+ * the account has credits but reports no balance counts as usable: the
+ * backend said it has credits, and the Codex client reads it the same way. A
+ * missing, stale or malformed record is never usable; nothing is inferred.
+ */
+export function creditsUsable(credits: unknown, now: number): boolean {
+  if (!isQuotaCredits(credits)) return false
+  const record: QuotaCredits = credits
+  // Written so a non-finite age also reads as stale.
+  if (!(now - record.checkedAt <= QUOTA_STALENESS_MS)) return false
+  if (record.overageLimitReached === true) return false
+  if (record.unlimited) return true
+  return (
+    record.hasCredits && (record.balance === undefined || record.balance > 0)
+  )
+}
+
+/** The rows of one request split into the free-quota and credits tiers. */
+interface CreditsTiers {
+  /**
+   * Rows with free quota: admitted without the library's last-path exception
+   * for spent credit budgets, and not below a killswitch floor.
+   */
+  free: ReadonlySet<string>
+  /**
+   * Rows that can serve only on prepaid credits, in roster order: refused
+   * for a spent window with a future reset, holding usable credits, with the
+   * workspace's spending cap not reached and the killswitch passing.
+   */
+  credits: readonly string[]
+}
+
+function creditsTiers(
+  rows: readonly RoutingRow[],
+  input: PoolRoutingInput,
+  admission: AdmissionResult,
+): CreditsTiers {
+  const passes = (id: string) => input.killswitch.get(id) !== false
+  const free = new Set(
+    admission.admitted
+      .filter((row) => row.lastPath !== true && passes(row.id))
+      .map((row) => row.id),
+  )
+  const refusals = new Map(
+    admission.refused.map((refusal) => [refusal.id, refusal]),
+  )
+  const credits = rows
+    .filter((row) => {
+      if (row.kind !== 'oauth' || !passes(row.id)) return false
+      if (refusals.get(row.id)?.reason !== 'exhausted') return false
+      const projection = projectQuota(row.quota)
+      // A reached spending cap blocks the account whatever credits it holds.
+      if (budgetExhaustedResetAt(projection, input.now)) return false
+      return creditsUsable(projection.credits, input.now)
+    })
+    .map((row) => row.id)
+  return { free, credits }
+}
+
+function admitQuietly(
+  input: PoolRoutingInput,
+  rows: readonly RoutingRow[] = input.rows,
+): AdmissionResult {
+  return admit({
+    rows,
+    now: input.now,
+    rateLimitMarks: input.rateLimitMarks,
+    refreshBackoff: input.refreshBackoff,
+    requestPull: () => {},
+  })
+}
+
+/**
+ * The rows that would serve this request only on prepaid credits, in roster
+ * order. Hosts use it to tell, after a request was served, whether it was
+ * served on credits.
+ */
+export function creditsFallbackIds(input: PoolRoutingInput): string[] {
+  return [...creditsTiers(input.rows, input, admitQuietly(input)).credits]
+}
+
+/** The logger `CreditsServing` writes its info line to. */
+export interface CreditsServingLog {
+  info(message: string, data?: Record<string, unknown>): void
+}
+
+/**
+ * Which accounts this process is currently serving on prepaid credits. A
+ * host reports each served request with `served`; the first request an
+ * account serves on credits is logged at info (account key and reason only),
+ * and the account stays marked, without further lines, until it serves on
+ * free quota again or stops qualifying for credits. A request served on free
+ * quota clears every mark: free quota exists, so sessions pinned to a credits
+ * account move off it at their next request.
+ */
+export class CreditsServing {
+  readonly #ids = new Set<string>()
+
+  served(input: PoolRoutingInput, id: string, log?: CreditsServingLog): void {
+    const admission = admitQuietly(input)
+    const tiers = creditsTiers(input.rows, input, admission)
+    const credits = new Set(tiers.credits)
+    if (tiers.free.has(id)) {
+      this.#ids.clear()
+      return
+    }
+    for (const marked of [...this.#ids])
+      if (!credits.has(marked)) this.#ids.delete(marked)
+    if (!credits.has(id) || this.#ids.has(id)) return
+    this.#ids.add(id)
+    log?.info('serving requests on prepaid credits', {
+      accountId: id,
+      reason: 'free quota used up',
+    })
+  }
+
+  /** Whether `id` is currently marked as serving on credits. */
+  has(id: string): boolean {
+    return this.#ids.has(id)
+  }
+
+  /** The accounts currently marked as serving on credits. */
+  ids(): ReadonlySet<string> {
+    return new Set(this.#ids)
+  }
+}
+
 /** Why one row cannot serve, read from the admission result and killswitch. */
 export function blockFor(
   id: string | undefined,
@@ -302,11 +450,22 @@ export function planOrdered(
       .map((refusal) => refusal.id),
   )
   const lastPath = ids.filter((id) => confirmed.has(id))
+  const tiers = creditsTiers(input.rows, input, route.admission)
+  const free = route.order.filter((id) => tiers.free.has(id))
+  // Credits rows in placement order, whatever their place in the roster
+  // relative to rows that hold no credits.
+  const credits = ids.filter((id) => tiers.credits.includes(id))
 
   if (!replayable) {
+    // The gate keeps main whatever its tier; without main, free quota comes
+    // before credits and credits before the last path.
     const hasMain = ids.includes(mainId)
-    const target = hasMain ? mainId : (route.order[0] ?? lastPath[0])
+    const target = hasMain
+      ? mainId
+      : (free[0] ?? credits[0] ?? route.order[0] ?? lastPath[0])
     if (target !== undefined && route.order.includes(target))
+      return { kind: 'send', order: [target], lastPath: false }
+    if (target !== undefined && credits.includes(target))
       return { kind: 'send', order: [target], lastPath: false }
     if (target !== undefined && confirmed.has(target))
       return { kind: 'send', order: [target], lastPath: true }
@@ -318,6 +477,18 @@ export function planOrdered(
     }
   }
 
+  if (free.length > 0) return { kind: 'send', order: free, lastPath: false }
+  // No free quota: credits rows first, then whatever today's last path would
+  // try (rows the library keeps for spent credit budgets, else every row
+  // confirmed exhausted), in case a credits row is refused after all.
+  if (credits.length > 0) {
+    const rest = route.order.length > 0 ? route.order : lastPath
+    return {
+      kind: 'send',
+      order: [...credits, ...rest.filter((id) => !credits.includes(id))],
+      lastPath: false,
+    }
+  }
   if (route.order.length > 0)
     return { kind: 'send', order: route.order, lastPath: false }
   if (lastPath.length > 0)
@@ -415,7 +586,10 @@ function routePoolSticky(
 /**
  * Places a session that holds no usable pin: the row the library routes a
  * pinless request to, leaving out `exclude`, weighed by the bytes other
- * sessions committed to each row. Undefined when no row is admissible.
+ * sessions committed to each row. When no row has free quota, the first row
+ * in roster order that can serve on prepaid credits takes the session before
+ * any row the library would place on its last path. Undefined when no row is
+ * admissible.
  */
 export function selectStickyRow(
   input: PoolRoutingInput,
@@ -424,14 +598,29 @@ export function selectStickyRow(
   pendingBytes: ReadonlyMap<string, number>,
 ): StickySelection | undefined {
   const route = routePoolSticky(input, options, { exclude, pendingBytes })
+  const rows = input.rows.filter((row) => !exclude.has(row.id))
+  const tiers = creditsTiers(rows, input, route.admission)
   // With no pin passed in, the library never dispatches by pin.
-  if (route.outcome !== 'dispatch' || route.source === 'pin') return undefined
+  const selected =
+    route.outcome === 'dispatch' && route.source !== 'pin'
+      ? {
+          accountId: route.accountId,
+          source: route.source,
+          ...(route.quotaCheckedAt === undefined
+            ? {}
+            : { quotaCheckedAt: route.quotaCheckedAt }),
+        }
+      : undefined
+  if (selected && tiers.free.has(selected.accountId)) return selected
+  const credits = tiers.credits[0]
+  if (credits === undefined) return selected
+  const checkedAt = projectQuota(
+    rows.find((row) => row.id === credits)?.quota,
+  ).checkedAt
   return {
-    accountId: route.accountId,
-    source: route.source,
-    ...(route.quotaCheckedAt === undefined
-      ? {}
-      : { quotaCheckedAt: route.quotaCheckedAt }),
+    accountId: credits,
+    source: 'mode-fallback',
+    ...(checkedAt === undefined ? {} : { quotaCheckedAt: checkedAt }),
   }
 }
 
@@ -441,6 +630,8 @@ export function selectStickyRow(
  * - `serve`: the pinned row serves.
  * - `move`: the row is confirmed unable to serve (killed, a spent window, a
  *   spent credit budget) and another row can, so the session moves for good.
+ *   A row serving on prepaid credits moves too once another row has free
+ *   quota, and a spent row moves to a credits row when no row has free quota.
  * - `detour`: the row's quota is not known yet, so this one request goes
  *   elsewhere and the pin stays, to be used again once a reading arrives.
  * - `last-path`: no other row can serve and the pinned row is refused only
@@ -462,13 +653,35 @@ export function routePinnedRow(
   id: string,
 ): PinnedRowRoute {
   const killed = input.killswitch.get(id) === false
+  const move = {
+    kind: 'move',
+    reason: killed ? 'killswitch' : 'exhausted',
+  } as const
   const route = routePoolSticky(input, options, { pin: id })
+  const tiers = creditsTiers(input.rows, input, route.admission)
+  const onCredits = tiers.credits.includes(id)
+  const othersOnCredits = tiers.credits.some((other) => other !== id)
   if (route.outcome === 'dispatch') {
-    if (route.pin.action === 'assign')
-      return { kind: 'move', reason: killed ? 'killswitch' : 'exhausted' }
-    return route.accountId === id ? { kind: 'serve' } : { kind: 'detour' }
+    // The library only sends to a row it admitted. When that row has no free
+    // quota (the library's last path for spent credit budgets), credits come
+    // first: a credits pin keeps serving, any other pin moves to credits.
+    const toLastPath = !tiers.free.has(route.accountId)
+    if (route.pin.action === 'assign') {
+      if (toLastPath && onCredits) return { kind: 'serve' }
+      return move
+    }
+    if (route.accountId !== id) return { kind: 'detour' }
+    if (toLastPath && othersOnCredits) return move
+    return { kind: 'serve' }
   }
   const refusal = route.admission.refused.find((entry) => entry.id === id)
+  const confirmed =
+    killed || (refusal !== undefined && isConfirmedExhaustion(refusal))
+  // No row has free quota. A credits pin serves on its credits; a pin
+  // confirmed unable to serve moves to a credits row; a pin still waiting
+  // for a reading keeps its pin and this one request goes to credits.
+  if (onCredits) return { kind: 'serve' }
+  if (othersOnCredits) return confirmed ? move : { kind: 'detour' }
   if (!killed && refusal && isConfirmedExhaustion(refusal))
     return { kind: 'last-path' }
   return { kind: 'none' }

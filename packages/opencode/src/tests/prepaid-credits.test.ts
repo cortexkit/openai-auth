@@ -2,30 +2,35 @@
 // poll's `credits` object and in the `x-codex-credits-*` response headers.
 // They travel into the pool's quota map (the vault roster in vault mode) with
 // the reading's time and from there into sidebar-state.json. A source that
-// reports none leaves them absent, never a made-up "no credits". Routing does
-// not read them.
+// reports none leaves them absent, never a made-up "no credits". Routing
+// uses them only as a fallback once no account has free quota; the shared
+// rule is tested in core (pool-routing-credits.test.ts), and here on
+// OpenCode 2.
 
 import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { drainVaultQuota } from '@cortexkit/common-auth/claustrum'
+import {
+  type ClaustrumScopedAttempt,
+  drainVaultQuota,
+} from '@cortexkit/common-auth/claustrum'
+import {
+  installOpenCode2Auth,
+  placeholderSecret,
+} from '@cortexkit/common-auth/opencode2'
 import {
   mergeQuotaObservation,
   type QuotaMap,
 } from '@cortexkit/common-auth/quota'
-import type { RoutingRow } from '@cortexkit/common-auth/routing'
+import type { PoolRow } from '@cortexkit/common-auth/store'
 import {
+  type AccountStorage,
   normalizeQuotaHeaders,
   normalizeWham,
   normalizeWsFrame,
   OpenAiVault,
 } from '@cortexkit/openai-auth-core/internal'
-import {
-  planOrdered,
-  routePinnedRow,
-  selectStickyRow,
-} from '@cortexkit/openai-auth-core/pool-routing'
 import {
   startMockDaemon,
   vaultLogin,
@@ -42,6 +47,13 @@ import {
   type SidebarState,
   setSidebarMachineState,
 } from '../sidebar-state'
+import {
+  createOpenAIAdapter,
+  type PoolAccess,
+  type VaultAccess,
+} from '../v2/adapter'
+import { SessionPins } from '../v2/pins'
+import { fakeOpenCode2Host, scope } from './fixtures/opencode2-host'
 
 const cleanups: Array<() => Promise<void>> = []
 afterEach(async () => {
@@ -389,78 +401,163 @@ function pushWindow() {
   return { usedPercent: 10, remainingPercent: 90 }
 }
 
-describe('routing with prepaid credits', () => {
-  // `main` has spent its window but holds unlimited credits; `spare` has
-  // quota. Credits change nothing: main is still skipped while spare can serve.
-  const now = 1_800_000_000_000
-  const spent = mergeQuotaObservation(
-    undefined,
-    observationFromSnapshot(
-      {
-        primary: {
-          usedPercent: 100,
-          resetsAt: new Date(now + HOUR).toISOString(),
-          windowMinutes: 300,
-        },
-        credits: { hasCredits: true, unlimited: true, balance: 500 },
-      },
-      now,
-      true,
-    ),
-  )
-  const spare = mergeQuotaObservation(
-    undefined,
-    observationFromSnapshot(
-      {
-        primary: {
-          usedPercent: 20,
-          resetsAt: new Date(now + HOUR).toISOString(),
-          windowMinutes: 300,
-        },
-      },
-      now,
-      true,
-    ),
-  )
-  const rows: RoutingRow[] = [
-    { id: 'main', kind: 'oauth', quota: spent },
-    { id: 'spare', kind: 'oauth', quota: spare },
-  ]
-  const input = {
-    rows,
-    now,
-    rateLimitMarks: new Map<string, number>(),
-    refreshBackoff: new Map<string, number>(),
-    killswitch: new Map<string, boolean>(),
-    requestPull: () => {},
-  }
-  const sticky = {
-    requestBytes: 1,
-    reservePercent: () => ({}),
-    resetCredits: () => undefined,
-  }
+// OpenCode 2: the adapter behind the real installer on a fake OpenCode 2
+// host, over a stand-in pool source and vault. Every account's windows are
+// spent; the account holding usable credits serves, ahead of an account the
+// mode would otherwise try first, and the switch is logged once.
+const PLACEHOLDER = placeholderSecret('openai')
 
-  test('the stored map holds the credits routing is given', () => {
-    expect(spent.credits).toEqual({
-      hasCredits: true,
-      unlimited: true,
-      balance: 500,
-      checkedAt: now,
+function spentQuota(credits?: QuotaMap['credits']): QuotaMap {
+  return {
+    limits: [
+      {
+        scope: 'all',
+        label: 'primary',
+        kind: 'reading',
+        checkedAt: Date.now(),
+        usedPercent: 100,
+        resetsAt: new Date(Date.now() + 2 * HOUR).toISOString(),
+        windowMinutes: 300,
+      },
+    ],
+    ...(credits ? { credits } : {}),
+  }
+}
+
+const usableCredits = () => ({
+  hasCredits: true,
+  unlimited: false,
+  balance: 40,
+  checkedAt: Date.now(),
+})
+
+function creditsPoolRow(id: string, quota: QuotaMap): PoolRow {
+  return {
+    id,
+    type: 'oauth',
+    enabled: true,
+    candidate: true,
+    hasEntry: true,
+    needsFirstReading: false,
+    credentialEpoch: 1,
+    identity: `chatgpt-${id}`,
+    credential: {
+      type: 'oauth',
+      access: `${id}-token`,
+      refresh: `${id}-refresh`,
+      expires: Date.now() + 24 * HOUR,
+    },
+    quota,
+  } as PoolRow
+}
+
+function stubPool(rows: PoolRow[]): PoolAccess {
+  const view = { active: true, rows }
+  return {
+    current: async () => view,
+    peek: () => view,
+    prepareTokens: async () => {},
+    usableToken: (row: PoolRow) => `${row.id}-token`,
+    rateLimitMarks: () => new Map(),
+    refreshBackoffFor: () => new Map(),
+    requestReading: () => {},
+    recordSnapshot: () => {},
+    markRateLimited: () => {},
+  } as unknown as PoolAccess
+}
+
+function stubVaultRoutes(
+  routes: Array<{ id: string; quota: QuotaMap }>,
+): VaultAccess {
+  const listed = routes.map((route) => ({
+    ...route,
+    kind: 'oauth' as const,
+    identity: `chatgpt-${route.id}`,
+  }))
+  return {
+    routes: () => listed,
+    identities: () => new Set(listed.map((route) => route.identity)),
+    enrolled: () => true,
+    authority: async () => 'vault',
+    snapshot: () => undefined,
+    authorize: async (id: string): Promise<ClaustrumScopedAttempt> => ({
+      credentialId: id,
+      credentialType: 'oauth',
+      accountIdentity: `chatgpt-${id}`,
+      accountIdentitySource: 'asserted',
+      accessToken: `${id}-token`,
+      recordVersion: 1,
+      expiresAtMs: null,
+    }),
+    reportFailure: async () => {},
+    recordSnapshot: async () => {},
+    requestReading: () => {},
+  } as unknown as VaultAccess
+}
+
+async function bearerFor(
+  openai: ReturnType<typeof createOpenAIAdapter>,
+  sessionID: string,
+): Promise<string | undefined> {
+  const host = fakeOpenCode2Host()
+  await installOpenCode2Auth(host.ctx, openai.adapter)
+  const draft = {
+    ...scope(sessionID, 'primary'),
+    headers: { Authorization: `Bearer ${PLACEHOLDER}` } as Record<
+      string,
+      string
+    >,
+  }
+  await host.fire('model.request', draft)
+  return new Headers(draft.headers).get('authorization') ?? undefined
+}
+
+describe('OpenCode 2 routing with prepaid credits', () => {
+  test('local pool: with every window spent, the account with credits serves first and the switch is logged once', async () => {
+    const lines: Array<[string, Record<string, unknown> | undefined]> = []
+    const openai = createOpenAIAdapter({
+      source: stubPool([
+        creditsPoolRow('a', spentQuota()),
+        creditsPoolRow('b', spentQuota(usableCredits())),
+      ]),
+      storage: async (): Promise<AccountStorage> => ({
+        version: 1,
+        accounts: [],
+        routing: { mode: 'main-first' },
+      }),
+      pins: new SessionPins(),
+      log: {
+        debug: () => {},
+        warn: () => {},
+        info: (message, data) => lines.push([message, data]),
+      },
     })
+    expect(await bearerFor(openai, 'ses_1')).toBe('Bearer b-token')
+    expect(await bearerFor(openai, 'ses_2')).toBe('Bearer b-token')
+    expect(lines).toEqual([
+      [
+        'serving requests on prepaid credits',
+        { accountId: 'b', reason: 'free quota used up' },
+      ],
+    ])
   })
 
-  test('an exhausted account with credits is still skipped while another has quota', () => {
-    expect(planOrdered({ ...input, placement: 'main-first' })).toEqual({
-      kind: 'send',
-      order: ['spare'],
-      lastPath: false,
+  test('vault mode, sticky-balanced: with every window spent, the vault account with credits takes the session', async () => {
+    const openai = createOpenAIAdapter({
+      source: stubPool([]),
+      storage: async (): Promise<AccountStorage> => ({
+        version: 1,
+        accounts: [],
+        routing: { mode: 'sticky-balanced' },
+      }),
+      pins: new SessionPins(),
+      vault: stubVaultRoutes([
+        { id: 'oauth:openai:one', quota: spentQuota() },
+        { id: 'oauth:openai:two', quota: spentQuota(usableCredits()) },
+      ]),
     })
-    expect(
-      selectStickyRow(input, sticky, new Set(), new Map())?.accountId,
-    ).toBe('spare')
-    expect(routePinnedRow(input, sticky, 'main')).toEqual({
-      kind: 'move',
-      reason: 'exhausted',
-    })
+    expect(await bearerFor(openai, 'ses_1')).toBe(
+      'Bearer oauth:openai:two-token',
+    )
   })
 })

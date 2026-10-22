@@ -39,6 +39,7 @@ import {
 import { windowsFromQuotaMap } from '@cortexkit/openai-auth-core/pool-quota'
 import {
   admitSticky,
+  type CreditsServing,
   FORMER_MAIN_ID,
   orderedPlacement,
   type PoolBlock,
@@ -103,7 +104,15 @@ export interface PiRouteContext<A extends RouteAttempt> {
   send(account: RouteAccount): Promise<A | undefined>
   /** The session pin ledger: decides (and, when asked, records) a session's pin. */
   placePin(input: StickyPinPlacement): { accountId: string } | undefined
-  log?: { debug(message: string, meta?: Record<string, unknown>): void }
+  /**
+   * The accounts this process serves on prepaid credits, told about each
+   * served request so it can log when an account starts serving on them.
+   */
+  creditsServing?: CreditsServing
+  log?: {
+    debug(message: string, meta?: Record<string, unknown>): void
+    info?(message: string, meta?: Record<string, unknown>): void
+  }
 }
 
 export type PiRouteResult<A> =
@@ -198,8 +207,9 @@ async function routeOrdered<A extends RouteAttempt>(
   accounts: readonly RouteAccount[],
 ): Promise<PiRouteResult<A>> {
   const placement = orderedPlacement(ctx.mode)
+  const routing = routingInput(ctx, accounts)
   const plan = planOrdered({
-    ...routingInput(ctx, accounts),
+    ...routing,
     placement,
     mainId: ctx.mainId,
   })
@@ -247,7 +257,10 @@ async function routeOrdered<A extends RouteAttempt>(
       ...(attempt.status !== undefined ? { status: attempt.status } : {}),
     })
   }
-  if (last) return { kind: 'sent', ...last }
+  if (last) {
+    noteServed(ctx, routing, last.accountId)
+    return { kind: 'sent', ...last }
+  }
   return { kind: 'blocked', block: { reason: 'no-credential' } }
 }
 
@@ -380,5 +393,23 @@ async function routeSticky<A extends RouteAttempt>(
       }
     }
   }
+  noteServed(ctx, routing, account.id)
   return { kind: 'sent', attempt, accountId: account.id }
+}
+
+/** Tells the credits tracker which account served, on the accounts routed over. */
+function noteServed<A extends RouteAttempt>(
+  ctx: PiRouteContext<A>,
+  routing: PoolRoutingInput,
+  id: string,
+): void {
+  const log = ctx.log
+  const info = log?.info
+  ctx.creditsServing?.served(
+    routing,
+    id,
+    log && info
+      ? { info: (message, data) => info.call(log, message, data) }
+      : undefined,
+  )
 }
