@@ -37,7 +37,8 @@
 //   `creditsUsable`) serves only when no account has free quota. The library
 //   refuses such an account as exhausted, so this file puts it back between
 //   the free accounts and the last path, for every routing mode and for
-//   placing new sessions.
+//   placing new sessions. The no-replay gate still wins: a request that
+//   cannot be replayed goes to main when present, whatever its tier.
 
 import {
   budgetExhaustedResetAt,
@@ -313,8 +314,8 @@ function admitQuietly(
 
 /**
  * The rows that would serve this request only on prepaid credits, in roster
- * order. Hosts use it to tell, after a request was served, whether it was
- * served on credits.
+ * order. Comparing the account that served with these ids tells whether the
+ * request was served on credits (`CreditsServing` does so for each host).
  */
 export function creditsFallbackIds(input: PoolRoutingInput): string[] {
   return [...creditsTiers(input.rows, input, admitQuietly(input)).credits]

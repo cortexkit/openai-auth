@@ -57,14 +57,14 @@ Subagents receive independent pins, and a resumed subagent reuses its own pin. T
 
 A ChatGPT workspace can hold prepaid credits, and Codex keeps answering on them after an account's 5-hour or weekly window is used up. Credits cost money, so routing uses them only after free quota runs out:
 
-- An account with free quota left always serves before an account that could only serve on credits, in every routing mode and when a new session is placed.
+- An account with free quota left always serves before an account that could only serve on credits, in every routing mode and when a new session is placed. The one exception is a request that cannot be sent twice: it still goes to the main account alone, as before, even if that account is serving on credits.
 - When no account has free quota, an account whose credits are usable serves next, ahead of accounts without credits, whatever the configured order. With several such accounts, the configured order decides.
 - A session pinned to an account whose window runs out moves, as before: to an account with free quota when there is one, otherwise to an account with credits. A session serving on credits moves back to free quota at its next request once another account has some again.
-- Credits count as usable only when the latest reading of them is less than 15 minutes old, reports credits (unlimited, or with a balance above zero, or without a balance at all), and does not say the overage limit is reached. A missing or older reading means no usable credits.
+- Credits count as usable only when the latest reading of them is no more than 15 minutes old, reports credits (unlimited, or with a balance above zero, or without a balance at all), and does not say the overage limit is reached. A missing or older reading means no usable credits.
 - [Killswitch floors](#killswitch) and the workspace's own spending cap (its credit budget) still block an account, credits or not. With the killswitch on, a used-up window is below any floor above 0%, so that account does not serve on credits.
 - When no account has free quota or usable credits, requests go out as before.
 
-Codex does not say whether credits were granted or bought, so the plugin treats all of them the same. The first request an account serves on credits writes one line to the log (the account's key, no balance), and the sidebar marks the session's account `serving on credits` beside its prepaid credits.
+Codex does not say whether credits were granted or bought, so the plugin treats all of them the same. Each time an account starts serving on credits, its first such request writes one line to the log (the account's key, no balance), and the sidebar marks the session's account `serving on credits` beside its prepaid credits.
 
 ## Killswitch
 
