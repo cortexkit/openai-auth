@@ -102,7 +102,6 @@ jobs:
   # not to helpers the test uses; the full replay on main covers those.
   mutations-pr:
     if: github.event_name == 'pull_request'
-    needs: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -137,10 +136,11 @@ jobs:
   # catalogue with `--broad`. Bun test rows are command rows, which cannot
   # observe other test targets, so `--broad` replays them as a plain run does;
   # it is kept so a future Cargo row, or a runner that adds breadth for
-  # command rows, is audited without a workflow change.
+  # command rows, is audited without a workflow change. The mutation jobs run
+  # alongside `check` rather than after it: each sets itself up from scratch, so
+  # waiting on `check` only added its time to every run's wall time.
   mutations-main:
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: check
     name: mutations-main (shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
     strategy:
