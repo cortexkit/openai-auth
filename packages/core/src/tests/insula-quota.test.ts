@@ -19,6 +19,54 @@ const entry: InsulaUsageEntry = {
 }
 
 describe('insula codex normalization', () => {
+  test('credits pools carry only published balance and blocking overage facts at fetch time', () => {
+    const reading = (pool: Record<string, unknown>) =>
+      normalizeInsulaCodexQuota(
+        {
+          ...entry,
+          spend: [
+            {
+              id: 'credits',
+              label: 'Prepaid credits',
+              funding: 'unknown',
+              basis: 'reported',
+              ...pool,
+            },
+          ],
+        },
+        context,
+      )?.credits
+    expect(
+      reading({ remaining: { minor: 125, exponent: 1, unit: 'credit' } }),
+    ).toEqual({
+      hasCredits: true,
+      unlimited: false,
+      balance: 12.5,
+      checkedAt: fetchedAt,
+    })
+    expect(reading({ basis: 'unstated' })).toEqual({
+      hasCredits: true,
+      unlimited: false,
+      checkedAt: fetchedAt,
+    })
+    expect(
+      reading({
+        spendable: false,
+        remaining: { minor: 0, exponent: 1, unit: 'credit' },
+      }),
+    ).toEqual({
+      hasCredits: true,
+      unlimited: false,
+      balance: 0,
+      overageLimitReached: true,
+      checkedAt: fetchedAt,
+    })
+    expect(reading({ spendable: true })?.overageLimitReached).toBeUndefined()
+    expect(
+      reading({ remaining: { minor: -1, exponent: 1 } })?.balance,
+    ).toBeUndefined()
+  })
+
   test('raw usage beats the saved-reset published zero', () => {
     const reading = normalizeInsulaCodexQuota(entry, context)
     expect(reading?.primary.usedPercent).toBe(100)

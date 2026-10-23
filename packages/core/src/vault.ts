@@ -53,7 +53,10 @@ import {
 } from '@cortexkit/common-auth/claustrum'
 import { CommandError } from '@cortexkit/common-auth/commands'
 import { projectQuota, type QuotaMap } from '@cortexkit/common-auth/quota'
-import { normalizeInsulaCodexQuota } from './insula-quota'
+import {
+  normalizeInsulaCodexQuota,
+  preserveInsulaUnlimited,
+} from './insula-quota'
 import { createLogger } from './logger'
 import { extractAccountIdFromClaims, parseJwtClaims } from './oauth'
 import { observationFromSnapshot } from './pool-quota'
@@ -793,7 +796,10 @@ export class OpenAiVault {
       if (fallback) return fallback
       if (cached !== undefined && row?.accountIdentity) {
         const observation = observationFromSnapshot(
-          cached,
+          preserveInsulaUnlimited(
+            cached,
+            this.routes().find((route) => route.id === routeId)?.quota,
+          ),
           cached.primary.checkedAt,
           true,
         )
@@ -840,7 +846,10 @@ export class OpenAiVault {
             : await this.#consumer.cachedInsulaQuota(attempt)
           if (cached !== undefined) {
             const observation = observationFromSnapshot(
-              cached,
+              preserveInsulaUnlimited(
+                cached,
+                this.routes().find((route) => route.id === routeId)?.quota,
+              ),
               cached.primary.checkedAt,
               true,
             )
@@ -916,6 +925,13 @@ export class OpenAiVault {
       results.push({ id: route.id, ...(await this.pollQuota(route.id)) })
     }
     return results
+  }
+
+  /** Reorders this host's vault roster without touching its local accounts. */
+  async reorder(routeIds: readonly string[]) {
+    if ((await this.authority()) !== 'vault')
+      throw new Error('Vault order can only be changed in vault mode.')
+    return this.#consumer.reorder(routeIds)
   }
 
   /** Declines a vault account: it stays listed and never routes until accepted. */
@@ -1109,6 +1125,14 @@ export function vaultConnectOutcome(
   vault: Pick<OpenAiVault, 'name' | 'routes' | 'snapshot' | 'grantReach'>,
   status: ClaustrumEnrollmentStatus,
 ): { ok: boolean; text: string } {
+  if (
+    (status.state === 'blocked' || status.state === 'unavailable') &&
+    status.code === 'unknown_method'
+  )
+    return {
+      ok: false,
+      text: 'Enrollment stopped (unknown_method). Update the Claustrum vault to a version that supports connecting plugins, then run Connect again.',
+    }
   switch (status.state) {
     case 'approved': {
       const accounts = vault.snapshot()?.rows.length ?? 0
@@ -1125,7 +1149,7 @@ export function vaultConnectOutcome(
     case 'blocked':
       return {
         ok: false,
-        text: `Enrollment stopped (${status.code}). Run Connect again to send a new request.`,
+        text: `Enrollment stopped (${status.code}). Resolve the refusal before running Connect again.`,
       }
     case 'pending':
     case 'busy':

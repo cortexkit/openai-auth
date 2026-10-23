@@ -191,6 +191,49 @@ function enroll() {
 }
 
 describe('Pi and the Claustrum vault', () => {
+  test('Routing sets vault order by email and the next Pi request uses that order', async () => {
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: {
+        a: vaultLogin('chatgpt-a', { wire: { email: 'alice@example.com' } }),
+        b: vaultLogin('chatgpt-b', { wire: { email: 'bob@example.com' } }),
+      },
+    })
+    enroll()
+    const target = vault()
+    const runtime = runtimeWith(target)
+    try {
+      await target.refresh()
+      await target.pollStale(0)
+      await setMode('ordered')
+      const command = createPiMenu(runtime.commandSupport())
+      const invocation = { notify() {} }
+      const opened = await command.open(invocation)
+      expect(
+        opened.menu.sections.find((section) => section.id === 'routing')!.lines,
+      ).toContain('Vault account order: alice@example.com, bob@example.com')
+      const applied = await command.apply(
+        {
+          command: 'openai',
+          sectionId: 'routing',
+          actionId: 'order',
+          values: { order: 'bob@example.com, alice@example.com' },
+        },
+        invocation,
+      )
+      expect(applied.ok).toBe(true)
+      expect(
+        JSON.parse(readFileSync(target.paths.rosterPath, 'utf8')).rows.map(
+          (row: { email: string }) => row.email,
+        ),
+      ).toEqual(['bob@example.com', 'alice@example.com'])
+      expect((await send(runtime, 'session-1'))[0]?.type).toBe('start')
+      expect(codexTokens).toEqual([chatgptAccessToken('chatgpt-b')])
+    } finally {
+      target.close()
+    }
+  })
+
   test('vault mode hides local-writing Pi dialog actions and a stale add refuses without changing pool bytes', async () => {
     daemon = await startMockDaemon({
       directory: dir,

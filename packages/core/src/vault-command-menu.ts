@@ -211,7 +211,28 @@ export function createVaultCommandMenu(
       accounts: options.accounts,
       quota: options.quota,
       limits: options.limits,
-      routing: { ...options.routing, formerMainId: mainId ?? '' },
+      routing: {
+        ...options.routing,
+        formerMainId: mainId ?? '',
+        vaultOrder: async () => {
+          const view = await readVaultMenu(vault)
+          if (!isVaultMenuConnected(view)) return undefined
+          return {
+            rows: view.status.accounts.map((row) => ({
+              id: row.routeId,
+              label: vaultAccountName(row),
+            })),
+            reorder: async (ids) => {
+              if (!isVaultMenuConnected(await readVaultMenu(vault)))
+                throw new CommandError(
+                  'vault-local-action',
+                  VAULT_LOCAL_ACTION_REFUSAL,
+                )
+              return vault.reorder(ids)
+            },
+          }
+        },
+      },
       ...(options.extraLocks ? { extraLocks: options.extraLocks } : {}),
       ...(options.now ? { now: options.now } : {}),
     })
@@ -334,12 +355,14 @@ export function createVaultCommandMenu(
               ),
       }
     })
-    // Only plugin settings may be forwarded. Account management and roster
-    // ordering belong to the vault, not to this host's dormant local pool.
+    // Account management stays in the vault. Routing order uses the vault
+    // roster, never this host's dormant local pool.
     const actions = section.actions
       .filter(
         (action) =>
-          slot === 'limits' || (slot === 'routing' && action.id === 'mode'),
+          slot === 'limits' ||
+          (slot === 'routing' &&
+            (action.id === 'mode' || action.id === 'order')),
       )
       .map((action) => forwardAction(source, slot, action))
     const mode = section.actions
@@ -437,7 +460,6 @@ export function createVaultCommandMenu(
       if (
         menu === connectedMenu &&
         (request.sectionId === 'accounts' ||
-          (request.sectionId === 'routing' && request.actionId === 'order') ||
           request.sectionId === 'reset' ||
           (request.sectionId === 'quota' &&
             (await readVaultMenu(vault)).routes.size === 0) ||

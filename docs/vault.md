@@ -19,6 +19,8 @@ The grant reaches only vault logins that carry the `openai-native` category, for
 
 Pi's commands identify its separate enrollment, `openai-auth-pi`, instead of OpenCode's. Pi reports when the vault owner approves its request.
 
+Errors that reconnecting cannot fix stop immediately rather than reconnecting or waiting for approval. If Connect reports `unknown_method`, update the Claustrum vault to a version that supports connecting plugins before trying again. Protocol/configuration refusals are not evidence that a ChatGPT credential is gone and do not delete accounts or ask them to sign in again.
+
 After approval, the vault issues a token authorizing OpenCode or Pi to use the vault, not a ChatGPT login. It is stored owner-only in `openai-auth-vault/` next to the account state file. **Disconnect** removes the local token and enrollment-state file, not the vault's accounts or approved enrollment. OpenCode 1 and 2 share this connection, so disconnecting OpenCode affects both; disconnecting Pi affects only Pi.
 
 The Vault section of `/openai` shows OpenCode's connection, available OpenAI accounts and last error. Disabling an account prevents OpenCode from using it without deleting it from the vault; Pi's menu controls Pi separately.
@@ -51,6 +53,10 @@ When the vault lists no OpenAI account for OpenCode or Pi, the request error, Co
 An older vault does not report grants. The message then names both checks: the categories with `ck auth status`, and the grant with `ck auth grant`.
 
 In vault mode, "main" in the **Main first** and **Fallback first** routing modes means the vault's default OpenAI account, `chatgpt:openai`; see [routing](accounts-and-routing.md#routing).
+
+Routing → **Set order** shows the vault accounts by the same names as Accounts (email first) and changes this host's vault roster. This works on OpenCode 1, OpenCode 2 and Pi, including unavailable or disabled roster rows. It never reorders the local pool; other local-account actions remain refused while connected. Stale account names or route ids from the other mode are refused without writing an order.
+
+Insula background quota includes its `credits` spend pool as well as usage windows, workspace spending limits and saved resets, so [prepaid-credit routing](accounts-and-routing.md#prepaid-credits) need not wait for a model request. Credits keep Insula's fetch time. An absent credits pool preserves the prior reading without renewing it. Insula's `unlimited` boolean is used when present. Older builds omit it: a balance-less pool then preserves a known unlimited reading; without one it is shown as available credits, not unlimited. An explicit `false` does replace a prior unlimited verdict.
 
 Disconnecting OpenCode makes its local pool eligible again; disconnecting Pi restores its local login and fallbacks. OpenCode may still need to transfer its old slot login into the pool, as described below.
 

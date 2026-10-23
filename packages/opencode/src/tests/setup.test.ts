@@ -22,6 +22,7 @@ import {
   type beginAccountLogin,
   OpenAiVault,
 } from '@cortexkit/openai-auth-core/internal'
+import { startMockDaemon } from '../../../core/src/tests/fixtures/mock-claustrum'
 import piPackage from '../../../pi/package.json'
 import { getPiAccountPaths } from '../../../pi/src/paths'
 import packageInfo from '../../package.json'
@@ -139,6 +140,37 @@ afterEach(() => {
 })
 
 describe('setup', () => {
+  test('an old vault stops setup immediately without reconnecting or writing a local login', async () => {
+    const daemon = await startMockDaemon({ directory: root, credentials: {} })
+    process.env.CLAUSTRUM_SUBC_CONNECTION = daemon.connectionFile
+    seed(join(root, 'bin', 'ck'), '')
+    io.fs = {
+      exists: existsSync,
+      isDirectory: (path) => existsSync(path) && statSync(path).isDirectory(),
+      isFile: (path) => existsSync(path) && statSync(path).isFile(),
+      isExecutable: (path) => existsSync(path) && statSync(path).isFile(),
+      readText: (path) => readFileSync(path, 'utf8'),
+      realpath: (path) => path,
+    }
+    let waits = 0
+    io.wait = async () => {
+      waits++
+    }
+    daemon.outage = 'unknown_method'
+    try {
+      await expect(
+        runSetup(plugin(), ['--yes', '--claustrum', '--opencode=1'], io),
+      ).rejects.toThrow('too old to connect plugins')
+      expect(waits).toBe(0)
+      expect(daemon.outageCalls).toEqual(['auth.enroll_propose'])
+      expect(beginLogin).not.toHaveBeenCalled()
+      expect(existsSync(authPath())).toBe(false)
+      expect(existsSync(getAccountPaths().configPath)).toBe(false)
+    } finally {
+      await daemon.stop()
+    }
+  })
+
   test('fresh dry run plans versioned registration without any credential writes', async () => {
     const result = await runSetup(
       plugin(),

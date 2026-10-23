@@ -18,6 +18,7 @@ let dir: string
 let paths: AccountPaths
 let source: PoolAccountSource
 const requestScope = () => ({
+  phase: 'request' as const,
   ...scope(),
   providerID: 'openai',
   modelID: 'gpt-5.5',

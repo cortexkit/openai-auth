@@ -1,5 +1,7 @@
 # Accounts and routing
 
+These instructions apply to Windows, Linux and macOS. Paths written with `~` mean the user's home directory; the plugin uses the operating system's native path separators.
+
 ## Multiple accounts
 
 The plugin supports a **main** ChatGPT account plus **fallback** accounts to use when the chosen account cannot serve a request. The [routing mode](#routing) decides when to switch accounts.
@@ -16,9 +18,9 @@ When OpenCode or Pi is connected to the [Claustrum vault](vault.md), the vault's
 
 ## The account pool
 
-On OpenCode, every local ChatGPT account and its credential live in one shared on-disk store, the account pool, in `~/.config/opencode/openai-auth.json` and its state file. OpenCode 1 and OpenCode 2 use the same files.
+On OpenCode, every local ChatGPT account and its credential live in one shared on-disk store, the account pool. The default files are `openai-auth.json` and `openai-auth-state.json` in `.config/opencode` under the user's home directory (shown here as `~/.config/opencode`), on Windows, Linux and macOS. `XDG_CONFIG_HOME` changes the base config directory, `OPENCODE_CONFIG_DIR` overrides OpenCode's config directory, and `OPENCODE_OPENAI_AUTH_FILE` and `OPENCODE_OPENAI_AUTH_STATE_FILE` can name the pool and state files directly. OpenCode 1 and OpenCode 2 use the same files.
 
-An install from before the pool keeps its main login in OpenCode 1's login store (`~/.local/share/opencode/auth.json`). The plugin moves it into pool row `main` and replaces OpenCode's login with a **placeholder**: a non-secret login record with an empty access token and a fixed refresh-token marker. The plugin recognizes this placeholder record and reads the real credentials from the pool instead.
+An install from before the pool keeps its main login in OpenCode 1's login store (`auth.json`). The plugin moves it into pool row `main` and replaces OpenCode's login with a **placeholder**: a non-secret login record with an empty access token and a fixed refresh-token marker. The plugin recognizes this placeholder record and reads the real credentials from the pool instead.
 
 Moving the main login waits until every running OpenCode process uses this plugin version or newer, so every process understands the pool. Until migration finishes, `/openai` shows an **Accounts are moving** notice and lists any processes blocking it. A ChatGPT login written into OpenCode's `openai` slot later is adopted into the pool the same way.
 
@@ -41,7 +43,7 @@ The Routing section of `/openai` sets the routing mode and account order:
 | `fallback-first` | Try usable fallback accounts first (preserving the main account's quota), and fall through to the main account only if no fallback can serve. |
 | `sticky-balanced` | For a session with no pin, choose the account with the lowest projected pressure: estimated request load relative to available quota capacity. Keep that assignment. |
 
-In vault mode, **main** means the vault's default OpenAI account: the credential named exactly `chatgpt:openai`, without an alias suffix. **Main first** tries that account first; **Fallback first** tries it last. No local login is used. If the vault has only aliased accounts, both modes use roster order like **Ordered**, and Routing explains that there is no default vault account. Sticky balanced is unchanged. Account order is managed in the vault while connected.
+In vault mode, **main** means the vault's default OpenAI account: the credential named exactly `chatgpt:openai`, without an alias suffix. **Main first** tries that account first; **Fallback first** tries it last. No local login is used. If the vault has only aliased accounts, both modes use roster order like **Ordered**, and Routing explains that there is no default vault account. Sticky balanced keeps a session's assigned vault account while it can serve. **Set order** in Routing changes this host's vault roster on OpenCode 1, OpenCode 2 and Pi, not its dormant local pool. Enter every displayed account name (email when available), separated by commas, in the desired order. Route ids are also accepted; use them when names are ambiguous. Local mode continues to order local account ids.
 
 ### Sticky-balanced
 
@@ -65,6 +67,8 @@ A ChatGPT workspace can hold prepaid credits, and Codex keeps answering on them 
 - When no account has free quota or usable credits, requests go out as before.
 
 Codex does not say whether credits were granted or bought, so the plugin treats all of them the same. Each time an account starts serving on credits, its first such request writes one line to the log (the account's key, no balance), and the sidebar marks the session's account `serving on credits` beside its prepaid credits.
+
+In vault mode, background readings from Insula also supply prepaid credits, stamped with Insula's fetch time rather than when the cache was read. A missing credits pool says nothing and keeps the previous reading, including its original age; it does not clear credits or make them fresh. Current Insula builds pass through Codex's explicit unlimited verdict. For older builds that omit it, the plugin conservatively records available credits (with a balance when published), never infers unlimited from an absent ceiling, and preserves an explicit unlimited reading from Codex when Insula reports neither that verdict nor a balance. Insula's explicit spending block is respected; an absent block is not invented as an affirmative overage verdict.
 
 ## Killswitch
 
@@ -92,4 +96,4 @@ On Pi, every request goes out with one account's token, chosen by the [routing m
 - In local mode, `main-first` tries your Pi login first, then the fallbacks in order; `fallback-first` tries the fallbacks first and your Pi login last. In vault mode, main is the vault's default OpenAI account instead. When an account answers with a rate-limit or authentication error before anything was streamed, the next account in the routing order is tried.
 - `sticky-balanced` keeps each Pi session on one account, spreading new sessions by remaining quota; confirmed exhaustion causes a lasting account switch.
 
-Your Pi login stays where Pi keeps it: Pi refreshes it, and the extension only uses the token Pi hands it. Fallback accounts live in the extension's own store (`openai-auth.json` in Pi's agent directory, `~/.pi/agent` unless `PI_AGENT_DIR` says otherwise, or the file `PI_OPENAI_AUTH_FILE` names) and are refreshed there. A fallback that is the same ChatGPT account as your Pi login is skipped, so retrying a request cannot try that account twice. An account is used only once its quota is known: each account's quota is checked as soon as the extension sees it, and quota from every response keeps it current. A store written by an earlier version is converted to the account-pool format the first time it is read, keeping its accounts.
+Your Pi login stays where Pi keeps it: Pi refreshes it, and the extension only uses the token Pi hands it. Fallback accounts live in the extension's own store, `openai-auth.json` in the `.pi/agent` directory under the user's home by default on Windows, Linux and macOS. `PI_AGENT_DIR` changes that directory, and `PI_OPENAI_AUTH_FILE` can name the file directly; the extension refreshes those credentials there. A fallback that is the same ChatGPT account as your Pi login is skipped, so retrying a request cannot try that account twice. An account is used only once its quota is known: each account's quota is checked as soon as the extension sees it, and quota from every response keeps it current. A store written by an earlier version is converted to the account-pool format the first time it is read, keeping its accounts.

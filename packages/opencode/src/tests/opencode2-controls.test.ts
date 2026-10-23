@@ -55,6 +55,7 @@ function fixture(enrolled = false) {
   const effects = {
     logins: [] as unknown[],
     polls: [] as string[],
+    orders: [] as string[][],
     enrollments: 0,
   }
   let finish!: (account: IngestAccount) => void
@@ -135,6 +136,10 @@ function fixture(enrolled = false) {
       declined: [],
     }),
     refresh: async () => {},
+    reorder: async (ids: readonly string[]) => {
+      effects.orders.push([...ids])
+      return { ids, outcome: 'reordered' as const }
+    },
     connectStep: async () => {
       effects.enrollments++
       throw new Error('unexpected enrollment')
@@ -318,6 +323,9 @@ for (const enrolled of [false, true]) {
         ['quota', 'limits'].includes(row.sectionId)
           ? { itemId: 'vault:alpha' }
           : {}),
+        ...(enrolled && row.name === 'order'
+          ? { values: { order: 'vault:beta, vault:alpha' } }
+          : {}),
       }
       const expected = await createOpenCodeMenu(oracle.context).apply(
         request,
@@ -343,7 +351,8 @@ for (const enrolled of [false, true]) {
       if (
         !enrolled ||
         ['quota', 'limits', 'session', 'diagnostics'].includes(row.sectionId) ||
-        row.name === 'mode'
+        row.name === 'mode' ||
+        row.name === 'order'
       )
         expect(got.ok).toBe(true)
       else expect(got.code).toBe('vault-local-action')
@@ -588,7 +597,12 @@ for (const enrolled of [false, true]) {
       expect(JSON.stringify(result)).not.toContain('secret-access')
     }
     expect(f.writes).toEqual([])
-    expect(f.effects).toEqual({ logins: [], polls: [], enrollments: 0 })
+    expect(f.effects).toEqual({
+      logins: [],
+      polls: [],
+      orders: [],
+      enrollments: 0,
+    })
     expect(f.bytes()).toEqual(before)
   })
 }

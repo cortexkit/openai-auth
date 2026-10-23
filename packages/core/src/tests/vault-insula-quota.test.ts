@@ -4,11 +4,13 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mutateVaultRoster } from '@cortexkit/common-auth/claustrum'
+import { quotaCreditsText } from '@cortexkit/common-auth/quota'
 
 import { flushForTest, initLogger, resetLoggerForTest } from '../logger'
 import { windowsFromQuotaMap } from '../pool-quota'
 import {
   FIRST_QUOTA_READING_WAIT_MS,
+  planOrdered,
   waitForFirstQuotaReading,
 } from '../pool-routing'
 import { OpenAiVault } from '../vault'
@@ -107,6 +109,204 @@ function route(vault: OpenAiVault, identity = 'account-a') {
 }
 
 describe('vault insula quota', () => {
+  for (const unlimited of [true, false]) {
+    test(`explicit insula unlimited ${unlimited} replaces the previous verdict`, async () => {
+      const env = await setup()
+      const id = route(env.vault)
+      const receipt = await env.vault.authorize(id)
+      await env.vault.recordSnapshot(
+        id,
+        {
+          primary: { usedPercent: 10 },
+          credits: { hasCredits: true, unlimited: !unlimited },
+        },
+        false,
+        receipt!,
+      )
+      env.advance(120_000)
+      env.daemon.insula = {
+        reply: {
+          result: [
+            {
+              ...current(env.now),
+              spend: [
+                {
+                  id: 'credits',
+                  label: 'Prepaid credits',
+                  funding: 'unknown',
+                  basis: 'unstated',
+                  unlimited,
+                },
+              ],
+            },
+          ],
+        },
+      }
+      expect(await env.vault.pollQuota(id)).toEqual({ ok: true })
+      const credits = env.vault.routes().find((row) => row.id === id)
+        ?.quota?.credits
+      expect(credits).toEqual({
+        hasCredits: true,
+        unlimited,
+        checkedAt: env.now - 60_000,
+      })
+      expect(quotaCreditsText(credits)).toBe(
+        unlimited ? 'Unlimited' : 'Available',
+      )
+      expect(env.wham).toEqual([])
+    })
+  }
+
+  test('background credits use the insula fetch time and route before exhausted accounts without credits', async () => {
+    const env = await setup()
+    const a = route(env.vault)
+    const b = route(env.vault, 'account-b')
+    const entry = (account: string) => {
+      const value = current(env.now, account)
+      return {
+        ...value,
+        usage: {
+          primary: {
+            ...value.usage.primary,
+            resetsAt: new Date(env.now + 3600_000).toISOString(),
+          },
+          secondary: {
+            ...value.usage.secondary,
+            resetsAt: new Date(env.now + 86_400_000).toISOString(),
+          },
+        },
+      }
+    }
+    env.daemon.insula = {
+      reply: {
+        result: [
+          entry('account-a'),
+          {
+            ...entry('account-b'),
+            spend: [
+              {
+                id: 'credits',
+                label: 'Prepaid credits',
+                funding: 'unknown',
+                basis: 'reported',
+                remaining: { minor: 125, exponent: 1, unit: 'credit' },
+              },
+            ],
+          },
+        ],
+      },
+    }
+    expect(await env.vault.pollStale(0)).toEqual([
+      { id: a, ok: true },
+      { id: b, ok: true },
+    ])
+    expect(
+      env.vault.routes().find((row) => row.id === b)?.quota?.credits,
+    ).toEqual({
+      hasCredits: true,
+      unlimited: false,
+      balance: 12.5,
+      checkedAt: env.now - 60_000,
+    })
+    const input = () => ({
+      rows: env.vault.routes(),
+      now: env.now,
+      placement: 'roster' as const,
+      mainId: null,
+      killswitch: new Map([
+        [a, true],
+        [b, true],
+      ]),
+      rateLimitMarks: new Map<string, number>(),
+      refreshBackoff: new Map<string, number>(),
+      requestPull: () => {},
+    })
+    expect(planOrdered(input())).toMatchObject({
+      kind: 'send',
+      order: [b, a],
+      lastPath: false,
+    })
+    env.advance(15 * 60_000)
+    expect(planOrdered(input())).not.toMatchObject({
+      kind: 'send',
+      order: [b, a],
+      lastPath: false,
+    })
+    expect(env.wham).toEqual([])
+    expect(env.daemon.gets).toEqual([])
+  })
+
+  test('an absent insula credits pool preserves the previous reading without refreshing its time', async () => {
+    const env = await setup()
+    const id = route(env.vault)
+    const receipt = await env.vault.authorize(id)
+    const credits = {
+      hasCredits: true,
+      unlimited: false,
+      balance: 42,
+      checkedAt: env.now,
+    }
+    await env.vault.recordSnapshot(
+      id,
+      { primary: { usedPercent: 10 }, credits },
+      false,
+      receipt!,
+    )
+    env.advance(60_000)
+    env.daemon.insula = { reply: { result: [current(env.now)] } }
+    expect(await env.vault.pollQuota(id)).toEqual({ ok: true })
+    expect(
+      env.vault.routes().find((row) => row.id === id)?.quota?.credits,
+    ).toEqual(credits)
+  })
+
+  test('a balance-less insula pool refreshes but never downgrades explicit unlimited credits', async () => {
+    const env = await setup()
+    const id = route(env.vault)
+    const receipt = await env.vault.authorize(id)
+    await env.vault.recordSnapshot(
+      id,
+      {
+        primary: { usedPercent: 10 },
+        credits: { hasCredits: true, unlimited: true },
+      },
+      false,
+      receipt!,
+    )
+    env.advance(120_000)
+    env.daemon.insula = {
+      reply: {
+        result: [
+          {
+            ...current(env.now),
+            spend: [
+              {
+                id: 'credits',
+                label: 'Prepaid credits',
+                funding: 'unknown',
+                basis: 'unstated',
+              },
+            ],
+          },
+        ],
+      },
+    }
+    expect(await env.vault.pollQuota(id)).toEqual({ ok: true })
+    expect(
+      env.vault.routes().find((row) => row.id === id)?.quota?.credits,
+    ).toEqual({
+      hasCredits: true,
+      unlimited: true,
+      checkedAt: env.now - 60_000,
+    })
+    env.advance(60_000)
+    await env.vault.pollQuota(id, false)
+    expect(
+      env.vault.routes().find((row) => row.id === id)?.quota?.credits
+        ?.unlimited,
+    ).toBe(true)
+  })
+
   test('three matched accounts add no discovery to a background tick', async () => {
     const env = await setup()
     env.daemon.credentials.c = vaultLogin('account-c')

@@ -74,6 +74,11 @@ test('refused Windows log writes cannot escape callers and warn only once at shu
     // Each write attempt is refused at its first private-files call: the
     // parent-folder check, or the owner-only create when that check passes.
     mock.module('@cortexkit/private-files', () => ({
+      PrivateFilesUnavailableError: class PrivateFilesUnavailableError extends Error {},
+      async verifyPrivatePath() {
+        // The native preflight probes a missing path before any real log write.
+        throw Object.assign(new Error('not found'), { code: 'ENOENT' });
+      },
       async verifySafeParent(path) {
         refusals++;
         return { ok: false, reason: 'writable-by-others', path };

@@ -48,6 +48,15 @@ export class SessionPins {
     return new Map(this.pins)
   }
 
+  /** Commit a planned placement only if this session has not changed meanwhile. */
+  commit(
+    sessionId: string,
+    previous: StickyPin | undefined,
+    next: StickyPin,
+  ): void {
+    if (this.pins.get(sessionId) === previous) this.set(sessionId, next)
+  }
+
   get size(): number {
     return this.pins.size
   }

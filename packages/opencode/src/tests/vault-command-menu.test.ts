@@ -1,12 +1,22 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { VaultRosterRow } from '@cortexkit/common-auth/claustrum'
+import {
+  drainVaultQuota,
+  type VaultRosterRow,
+} from '@cortexkit/common-auth/claustrum'
 import type {
   CommandApplyRequest,
   CommandInvocation,
 } from '@cortexkit/common-auth/commands'
+import { installOpenCode2Auth } from '@cortexkit/common-auth/opencode2'
 import {
   formatQuota,
   projectQuota,
@@ -14,9 +24,13 @@ import {
 } from '@cortexkit/common-auth/quota'
 import {
   loadAccounts,
-  type OpenAiVault,
+  OpenAiVault,
   QuotaManager,
 } from '@cortexkit/openai-auth-core/internal'
+import {
+  startMockDaemon,
+  vaultLogin,
+} from '../../../core/src/tests/fixtures/mock-claustrum'
 import {
   createOpenCodeMenu,
   menuText,
@@ -26,7 +40,10 @@ import { getSettings } from '../config'
 import { openAccountPool } from '../core/pool-accounts'
 import { sectionOptions } from '../tui/command-dialogs'
 import { openControlDialog } from '../tui/v2-dialog'
+import { createOpenAIAdapter, type PoolAccess } from '../v2/adapter'
 import { createControlPlaneMenu } from '../v2/menu'
+import { SessionPins } from '../v2/pins'
+import { fakeOpenCode2Host, scope } from './fixtures/opencode2-host'
 import {
   quotaMap as fixtureQuotaMap,
   readJson,
@@ -159,6 +176,152 @@ async function sections(connected = true) {
 }
 
 describe('vault command menu', () => {
+  test('vault order by displayed name writes the roster and the next request follows it on both OpenCode menus', async () => {
+    const daemon = await startMockDaemon({
+      directory: dir,
+      credentials: {
+        a: vaultLogin('account-a', { wire: { email: 'alice@example.com' } }),
+        b: vaultLogin('account-b', { wire: { email: 'bob@example.com' } }),
+      },
+    })
+    const remote = new OpenAiVault({
+      host: 'opencode',
+      stateDir: join(dir, 'vault'),
+      connectionFile: () => daemon.connectionFile,
+      pollIntervalMs: 0,
+    })
+    mkdirSync(join(dir, 'vault'), { recursive: true })
+    writeFileSync(
+      remote.paths.tokenPath,
+      JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    const ctx = { ...context(), vault: remote }
+    const localBefore = [files.configFile, files.stateFile].map((file) =>
+      readFileSync(file),
+    )
+    try {
+      await remote.refresh()
+      for (const route of remote.routes()) {
+        const receipt = await remote.authorize(route.id)
+        expect(receipt).toBeDefined()
+        await remote.recordSnapshot(
+          route.id,
+          {
+            primary: {
+              usedPercent: 10,
+              remainingPercent: 90,
+              checkedAt: Date.now(),
+              windowMinutes: 300,
+            },
+          },
+          false,
+          receipt!,
+        )
+      }
+      for (const readOnly of [false, true]) {
+        // The server control-plane menu supplies the writable OpenCode 2 menu.
+        const menu = createOpenCodeMenu(ctx)
+        const v2 = createControlPlaneMenu(ctx)
+        const opened = readOnly
+          ? await v2.open('ses_1')
+          : await menu.open(invocation)
+        expect(
+          opened.menu.sections.find((s) => s.id === 'routing')!.lines,
+        ).toContain('Vault account order: alice@example.com, bob@example.com')
+        const input = {
+          command: 'openai',
+          sectionId: 'routing',
+          actionId: 'order',
+          values: { order: 'bob@example.com, alice@example.com' },
+        }
+        const applied = readOnly
+          ? await v2.apply(input)
+          : await menu.apply(input, invocation)
+        expect(applied.ok).toBe(true)
+        const saved = JSON.parse(readFileSync(remote.paths.rosterPath, 'utf8'))
+        expect(saved.rows.map((row: VaultRosterRow) => row.email)).toEqual([
+          'bob@example.com',
+          'alice@example.com',
+        ])
+        const host = fakeOpenCode2Host()
+        const openai = createOpenAIAdapter({
+          source: {
+            rateLimitMarks: () => new Map(),
+            refreshBackoffFor: () => new Map(),
+          } as unknown as PoolAccess,
+          vault: remote,
+          pins: new SessionPins(),
+          storage: async () => ({
+            version: 1,
+            accounts: [],
+            routing: { mode: 'ordered' },
+          }),
+        })
+        const installation = await installOpenCode2Auth(
+          host.ctx,
+          openai.adapter,
+        )
+        try {
+          const draft = { ...scope(), headers: {} as Record<string, string> }
+          await host.fire('model.request', draft)
+          expect(new Headers(draft.headers).get('chatgpt-account-id')).toBe(
+            'account-b',
+          )
+        } finally {
+          await installation.dispose()
+        }
+        await remote.reorder(
+          [...remote.snapshot()!.rows].reverse().map((row) => row.routeId),
+        )
+      }
+      expect(
+        [files.configFile, files.stateFile].map((file) => readFileSync(file)),
+      ).toEqual(localBefore)
+      const menu = createOpenCodeMenu(ctx)
+      await menu.open(invocation)
+      await drainVaultQuota(remote.paths.rosterPath)
+      const vaultBefore = readFileSync(remote.paths.rosterPath)
+      await remote.disconnect()
+      const stale = await menu.apply(
+        {
+          command: 'openai',
+          sectionId: 'routing',
+          actionId: 'order',
+          values: { order: 'bob@example.com, alice@example.com' },
+        },
+        invocation,
+      )
+      expect(stale.ok).toBe(false)
+      expect(readFileSync(remote.paths.rosterPath)).toEqual(vaultBefore)
+      expect(
+        [files.configFile, files.stateFile].map((file) => readFileSync(file)),
+      ).toEqual(localBefore)
+      writeFileSync(
+        remote.paths.tokenPath,
+        JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
+        { mode: 0o600 },
+      )
+      const staleLocal = await menu.apply(
+        {
+          command: 'openai',
+          sectionId: 'routing',
+          actionId: 'order',
+          values: { order: 'ufuk, main' },
+        },
+        invocation,
+      )
+      expect(staleLocal.ok).toBe(false)
+      expect(readFileSync(remote.paths.rosterPath)).toEqual(vaultBefore)
+      expect(
+        [files.configFile, files.stateFile].map((file) => readFileSync(file)),
+      ).toEqual(localBefore)
+    } finally {
+      remote.close()
+      await daemon.stop()
+    }
+  })
+
   test('Routing shows the default vault account placement without renaming any route', async () => {
     roster[1]!.credentialId = 'chatgpt:openai'
     const menu = createOpenCodeMenu(context())
@@ -180,13 +343,13 @@ describe('vault command menu', () => {
         (section) => section.id === 'routing',
       )!
       expect(routing.lines).toContain(
-        'Roster order: vault:chatgpt-main, vault:chatgpt-ufuk, vault:chatgpt-live',
+        'Vault account order: vault-user@example.com, gmail, live',
       )
       if (mode !== 'ordered')
         expect(routing.lines).toContain(
           mode === 'main-first'
-            ? 'Tried in order: vault:chatgpt-ufuk, vault:chatgpt-main, vault:chatgpt-live'
-            : 'Tried in order: vault:chatgpt-main, vault:chatgpt-live, vault:chatgpt-ufuk',
+            ? 'Tried in order: gmail, vault-user@example.com, live'
+            : 'Tried in order: vault-user@example.com, live, gmail',
         )
       expect(routing.lines).not.toContain(
         'No default vault account, so this mode orders like Ordered',
@@ -299,7 +462,7 @@ describe('vault command menu', () => {
       const manifest = JSON.parse(
         readFileSync(join(packageDir, 'package.json'), 'utf8'),
       )
-      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.23.0')
+      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.25.0')
       expect(
         Bun.resolveSync('@cortexkit/common-auth/claustrum', packageDir),
       ).toBe(sharedConsumer)
@@ -307,7 +470,7 @@ describe('vault command menu', () => {
         (manifest.dependencies ?? manifest.devDependencies)[
           '@cortexkit/claustrum-client'
         ],
-      ).toBe('^0.12.0')
+      ).toBe('^0.13.0')
     }
   })
   // Vault mode is exclusive: while connected, the vault's accounts are the
@@ -446,7 +609,7 @@ describe('vault command menu', () => {
       connected.sections
         .find((section) => section.id === 'routing')!
         .actions.map((action) => action.id),
-    ).toEqual(['mode'])
+    ).toEqual(['mode', 'order'])
     expect(
       connected.sections
         .find((section) => section.id === 'limits')!
@@ -505,11 +668,6 @@ describe('vault command menu', () => {
         itemId: 'ufuk',
         actionId,
       })),
-      {
-        sectionId: 'routing',
-        actionId: 'order',
-        values: { order: 'ufuk, main' },
-      },
       ...['preview', 'spend', 'retry'].map((actionId) => ({
         sectionId: 'reset',
         itemId: 'ufuk',

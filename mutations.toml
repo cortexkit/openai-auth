@@ -1859,7 +1859,7 @@ expect_red = ["^vault\\scommand\\smenu\\sCheck\\snow\\sin\\svault\\smode\\spolls
 id = "menu-common-auth-release"
 guards = "all packages require the common-auth release whose file leases always use wall time"
 file = "packages/core/package.json"
-old = '"@cortexkit/common-auth": "^0.23.0"'
+old = '"@cortexkit/common-auth": "^0.25.0"'
 new = '"@cortexkit/common-auth": "^0.14.2"'
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
@@ -2597,8 +2597,8 @@ expect_message = "missing vault activation method"
 id = "menu-vault-accounts-no-add"
 guards = "OpenCode never offers the local OAuth add action while enrolled and restores the original menu after disconnect"
 file = "packages/core/src/vault-command-menu.ts"
-old = "          slot === 'limits' || (slot === 'routing' && action.id === 'mode'),"
-new = "          slot === 'accounts' || slot === 'limits' || (slot === 'routing' && action.id === 'mode'), // NON-VACUITY BREAK"
+old = "          slot === 'limits' ||"
+new = "          slot === 'accounts' || slot === 'limits' || // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
@@ -2622,18 +2622,17 @@ expect_red = ['^vault\scommand\smenu\svault\smode\shides\slocal-writing\sdialog\
 expect_message = "Received: false"
 
 [[control]]
-id = "menu-vault-routing-no-reorder"
-guards = "vault mode retains routing mode settings but never offers a local roster reorder"
+id = "menu-vault-order-wiring"
+guards = "vault order is named and written through the consumer without reordering the local pool"
 file = "packages/core/src/vault-command-menu.ts"
-old = "          slot === 'limits' || (slot === 'routing' && action.id === 'mode'),"
-new = "          slot === 'limits' || slot === 'routing', // NON-VACUITY BREAK"
+old = "        vaultOrder: async () => {"
+new = "        unusedVaultOrder: async () => { // NON-VACUITY BREAK"
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/vault-command-menu.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
-expect_red = ['^vault\scommand\smenu\svault\smode\shides\slocal-writing\sdialog\sactions\sand\sdisconnect\srestores\sthem\sunchanged$']
-expect_message = '"order"'
+expect_red = ['^vault\scommand\smenu\svault\sorder\sby\sdisplayed\sname\swrites\sthe\sroster\sand\sthe\snext\srequest\sfollows\sit\son\sboth\sOpenCode\smenus$']
 
 [[control]]
 id = "menu-vault-reset-no-local-actions"
@@ -2695,8 +2694,8 @@ expect_message = "expect(logins).toBe(0)"
 id = "menu-pi-vault-accounts-no-add"
 guards = "Pi hides local account writes and refuses a stale add with byte-identical files then restores the menu after disconnect"
 file = "packages/core/src/vault-command-menu.ts"
-old = "          slot === 'limits' || (slot === 'routing' && action.id === 'mode'),"
-new = "          slot === 'accounts' || slot === 'limits' || (slot === 'routing' && action.id === 'mode'), // NON-VACUITY BREAK"
+old = "          slot === 'limits' ||"
+new = "          slot === 'accounts' || slot === 'limits' || // NON-VACUITY BREAK"
 test_file = "packages/pi/src/tests/vault.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/vault.test.ts", "-t", "{test}"]
@@ -5355,9 +5354,9 @@ build_timeout_s = 1800
 
 [[control]]
 id = "opencode2-active-account-records-primary"
-guards = "chooseAccount records every agent-loop choice, in every routing mode, in the session-account registry that title, compaction and generate requests follow and keep-warm reads as activeAccount"
+guards = "used agent-loop choices in every routing mode reach the session-account registry that background requests and keep-warm follow"
 file = "packages/opencode/src/v2/adapter.ts"
-old = "      sessionAccounts.record(input.sessionID, accountId)"
+old = "          sessionAccounts.record(input.sessionID, chosenId)"
 new = "      // NON-VACUITY BREAK"
 edits = []
 test_file = "packages/opencode/src/tests/opencode2-plugin.test.ts"
@@ -6209,3 +6208,68 @@ list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "
 test_count_pattern = "Ran {count} test"
 expect_red = ['^prepaid\scredits\sas\sa\sfallback\stier\sstale\scredits,\sa\sreached\soverage\slimit,\sa\szero\sbalance\sand\sno\srecord\sare\snot\susable$']
 expect_message = "expect(creditsUsable(credits, NOW)).toBe(false)"
+
+[[control]]
+id = "opencode2-drop-kept-choice"
+guards = "a model-change discard releases exactly its queued retry placement"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "      keptChoices.delete(key)"
+new = "      void key // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-retry-choice.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-retry-choice.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-retry-choice.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\skept\sretry\schoice\sdropChoice\sdiscards\sa\smodel-change\splacement\swithout\stouching\sanother\ssession$']
+
+[[control]]
+id = "opencode2-undefined-no-pin-write"
+guards = "an undefined choice after token refusals cannot reserve pending bytes or change any pin"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "        (sessionId, pin) => plannedPins.set(sessionId, pin),"
+new = "        (sessionId, pin) => pins.commit(sessionId, pins.snapshot().get(sessionId), pin), // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-retry-choice.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-retry-choice.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-retry-choice.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\skept\sretry\schoice\sundefined\safter\stoken\srefusals\sleaves\spins\spending\sbytes\sand\sactive\saccounts\suntouched$']
+
+[[control]]
+id = "insula-credits-mapping"
+guards = "background Insula prepaid credits reach routing with the producer fetch time"
+file = "packages/core/src/insula-quota.ts"
+old = "    ...(credits && { credits }),"
+new = "    ...(false && { credits }), // NON-VACUITY BREAK"
+test_file = "packages/core/src/tests/vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sinsula\squota\sbackground\scredits\suse\sthe\sinsula\sfetch\stime\sand\sroute\sbefore\sexhausted\saccounts\swithout\scredits$']
+
+[[control]]
+id = "insula-preserve-unlimited"
+guards = "a balance-less Insula pool never downgrades a known unlimited account"
+file = "packages/core/src/insula-quota.ts"
+old = "    return { ...snapshot, credits: { ...snapshot.credits, unlimited: true } }"
+new = "    return snapshot // NON-VACUITY BREAK"
+test_file = "packages/core/src/tests/vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sinsula\squota\sa\sbalance-less\sinsula\spool\srefreshes\sbut\snever\sdowngrades\sexplicit\sunlimited\scredits$']
+
+[[control]]
+id = "insula-explicit-unlimited"
+guards = "an explicit Insula unlimited verdict reaches the credits reading instead of being discarded"
+file = "packages/core/src/insula-quota.ts"
+old = "    unlimited: typeof pool.unlimited === 'boolean' ? pool.unlimited : false,"
+new = "    unlimited: false, // NON-VACUITY BREAK"
+test_file = "packages/core/src/tests/vault-insula-quota.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^vault\sinsula\squota\sexplicit\sinsula\sunlimited\strue\sreplaces\sthe\sprevious\sverdict$']

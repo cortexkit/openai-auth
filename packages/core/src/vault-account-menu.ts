@@ -26,6 +26,7 @@ export type MenuVault = Pick<
   | 'routes'
   | 'pollQuota'
   | 'snapshot'
+  | 'reorder'
 >
 
 export interface VaultMenuView {

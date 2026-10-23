@@ -5,6 +5,7 @@ import type {
 } from '@cortexkit/common-auth/claustrum'
 import type {
   AccountQuotaWindow,
+  OAuthCredits,
   OAuthQuotaSnapshot,
   OAuthSpendControlReading,
 } from './accounts'
@@ -72,11 +73,50 @@ function spendReading(
   }
 }
 
+function creditsReading(
+  pool: unknown,
+  checkedAt: number,
+): OAuthCredits | undefined {
+  if (!isRecord(pool)) return undefined
+  const balance = amount(pool.remaining)
+  return {
+    hasCredits: true,
+    // Older Insula builds omit unlimited. An absent ceiling alone never
+    // proves an unlimited entitlement; use only the explicit provider verdict.
+    unlimited: typeof pool.unlimited === 'boolean' ? pool.unlimited : false,
+    ...(balance !== undefined && balance >= 0 && { balance }),
+    ...(pool.spendable === false && { overageLimitReached: true }),
+    checkedAt,
+  }
+}
+
+/** A legacy balance-less Insula pool cannot contradict an explicit unlimited reading. */
+export function preserveInsulaUnlimited<
+  T extends OAuthQuotaSnapshot & { insulaCreditsUnlimitedUnstated?: true },
+>(snapshot: T, quota: unknown): T {
+  if (
+    snapshot.insulaCreditsUnlimitedUnstated &&
+    snapshot.credits &&
+    snapshot.credits.balance === undefined &&
+    isRecord(quota) &&
+    isRecord(quota.credits) &&
+    quota.credits.unlimited === true
+  )
+    return { ...snapshot, credits: { ...snapshot.credits, unlimited: true } }
+  return snapshot
+}
+
 /** Convert Codex quota while preserving when insula fetched it, not when the cache was read. */
 export function normalizeInsulaCodexQuota(
   entry: InsulaUsageEntry,
   context: InsulaQuotaContext,
-): (OAuthQuotaSnapshot & { primary: AccountQuotaWindow }) | undefined {
+):
+  | (OAuthQuotaSnapshot & {
+      primary: AccountQuotaWindow
+      /** Normalization metadata only; never written into a quota observation. */
+      insulaCreditsUnlimitedUnstated?: true
+    })
+  | undefined {
   const primary = windowReading(entry.usage?.primary, context.fetchedAt)
   if (!primary || !Number.isFinite(context.fetchedAt)) return undefined
   const secondary = windowReading(entry.usage?.secondary, context.fetchedAt)
@@ -86,11 +126,21 @@ export function normalizeInsulaCodexQuota(
       )
     : undefined
   const spendControl = isRecord(pool) ? spendReading(pool) : undefined
+  const creditsPool = Array.isArray(entry.spend)
+    ? entry.spend.find((value) => isRecord(value) && value.id === 'credits')
+    : undefined
+  const credits = creditsReading(creditsPool, context.fetchedAt)
   const available = isRecord(entry.savedResets)
     ? entry.savedResets.availableCount
     : undefined
   return {
     primary,
+    ...(credits && { credits }),
+    ...(credits &&
+      isRecord(creditsPool) &&
+      typeof creditsPool.unlimited !== 'boolean' && {
+        insulaCreditsUnlimitedUnstated: true as const,
+      }),
     ...(secondary && { secondary }),
     ...(typeof available === 'number' &&
       Number.isFinite(available) &&

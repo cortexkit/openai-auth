@@ -130,6 +130,7 @@ export interface CreateAuthMethodsOptions {
     | 'waitForApproval'
     | 'routes'
     | 'snapshot'
+    | 'reorder'
     | 'identities'
     | 'refresh'
     | 'pollQuota'

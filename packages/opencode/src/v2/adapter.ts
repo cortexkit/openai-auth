@@ -49,7 +49,7 @@ import type {
 } from '@cortexkit/common-auth/opencode2'
 import { OpenCode2AuthError } from '@cortexkit/common-auth/opencode2'
 import { isQuotaMap } from '@cortexkit/common-auth/quota'
-import type { RoutingRow } from '@cortexkit/common-auth/routing'
+import type { RoutingRow, StickyPin } from '@cortexkit/common-auth/routing'
 import type { PoolRow } from '@cortexkit/common-auth/store'
 import {
   type AccountStorage,
@@ -60,6 +60,7 @@ import {
   normalizeWsFrame,
   type OpenAiVault,
   parseJwtClaims,
+  placeStickyPin,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
   resolveMidStreamRateLimitResetAt,
@@ -405,8 +406,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   const effort = new MidConversationEffort(deps.codex)
   // Vault receipts authorized while choosing an account, kept until the
   // installer's `accountHeaders` call for the same session, request kind and
-  // account (it follows `chooseAccount` at once) takes them.
+  // account consumes them. A kept retry choice may wait until a later attempt.
   const receipts = new Map<string, ClaustrumScopedAttempt>()
+  // Retry choices may be discarded before any send. Delay their pin and
+  // active-account writes until accountHeaders consumes the kept choice.
+  const keptChoices = new Map<string, () => void>()
   const receiptKey = (scope: AccountRequest) =>
     `${scope.sessionID}\u0000${scope.kind}\u0000${scope.accountId}`
   // Rate-limit marks of vault accounts (the pool source marks only its own
@@ -537,6 +541,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     sessionId: string,
     excluded: ReadonlySet<string>,
     persist: boolean,
+    plannedPins: Map<string, StickyPin>,
   ): string | undefined => {
     const quotaById = new Map(
       targets.map((target) => [target.id, target.quota]),
@@ -557,26 +562,30 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     }
     const sticky = admitSticky(routing)
     const place = (exclude: readonly string[], keep: boolean) =>
-      pins.place({
-        sessionId,
-        requestBytes: NOMINAL_REQUEST_BYTES,
-        validPinnedAccountIds: routing.rows
-          .map((row) => row.id)
-          .filter((id) => !sticky.excluded.has(id)),
-        excludeAccountIds: exclude,
-        quotaCheckedAtByAccount: Object.fromEntries(
-          routing.rows.map((row) => [
-            row.id,
-            sticky.projections.get(row.id)?.checkedAt,
-          ]),
-        ),
-        wireAccountIdByAccount: Object.fromEntries(
-          targets.map((target) => [target.id, target.identity]),
-        ),
-        select: (pendingBytes) =>
-          selectStickyRow(routing, options, new Set(exclude), pendingBytes),
-        persist: keep,
-      })
+      placeStickyPin(
+        plannedPins,
+        {
+          sessionId,
+          requestBytes: NOMINAL_REQUEST_BYTES,
+          validPinnedAccountIds: routing.rows
+            .map((row) => row.id)
+            .filter((id) => !sticky.excluded.has(id)),
+          excludeAccountIds: exclude,
+          quotaCheckedAtByAccount: Object.fromEntries(
+            routing.rows.map((row) => [
+              row.id,
+              sticky.projections.get(row.id)?.checkedAt,
+            ]),
+          ),
+          wireAccountIdByAccount: Object.fromEntries(
+            targets.map((target) => [target.id, target.identity]),
+          ),
+          select: (pendingBytes) =>
+            selectStickyRow(routing, options, new Set(exclude), pendingBytes),
+          persist: keep,
+        },
+        (sessionId, pin) => plannedPins.set(sessionId, pin),
+      )
     const base = [...excluded]
     const assignment = place(base, persist)
     if (!assignment) return undefined
@@ -643,7 +652,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       targets = currentTargets(storage, at, vaultMode)
     }
     const byId = new Map(targets.map((target) => [target.id, target]))
-    const routing = routingInput(targets, storage, at)
+    let routing = routingInput(targets, storage, at)
     const excluded = new Set<string>(
       input.rerouteFrom ? [input.rerouteFrom.accountId] : [],
     )
@@ -655,11 +664,16 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     // them, so the choice runs again without them, as the OpenCode 1 request
     // path moves on to the next account.
     const refused = new Set<string>()
+    const originalPin = pins.snapshot().get(input.sessionID)
+    let plannedPins = new Map(pins.snapshot())
     let accountId: string | undefined
     for (;;) {
       const skip = new Set([...excluded, ...refused])
       accountId = undefined
       if (mode === 'sticky-balanced') {
+        // Each candidate starts from the live ledger. A failed token check,
+        // admission refusal or undefined choice cannot reserve pending bytes.
+        plannedPins = new Map(pins.snapshot())
         accountId = chooseSticky(
           routing,
           targets,
@@ -670,7 +684,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           // that succeeds later, the vault unreachable for a moment), so
           // choosing again after one does not move the session's sticky pin.
           primary && refused.size === 0,
+          plannedPins,
         )
+        if (accountId === undefined) plannedPins = new Map(pins.snapshot())
       }
       accountId ??= chooseOrdered(
         routing,
@@ -684,6 +700,16 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           : undefined,
       )
       if (accountId === undefined || refused.has(accountId)) {
+        // With no alternative, keep the refused account for the host's own
+        // delayed retry. common-auth's OpenCode 2 installer consumes this choice
+        // without asking the adapter to choose twice.
+        if (excluded.size > 0) {
+          const rateLimitMarks = new Map(routing.rateLimitMarks)
+          for (const id of excluded) rateLimitMarks.delete(id)
+          routing = { ...routing, rateLimitMarks }
+          excluded.clear()
+          continue
+        }
         accountId = undefined
         break
       }
@@ -743,11 +769,20 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         message: vaultModeRefusalText(cause, vault.name),
       })
     }
-    if (accountId !== undefined && primary) {
-      sessionAccounts.record(input.sessionID, accountId)
-      deps.onRoute?.(input.sessionID, accountId, mode)
-    }
     if (accountId !== undefined) {
+      const chosenId = accountId
+      const nextPin = plannedPins.get(input.sessionID)
+      const commit = () => {
+        if (nextPin && nextPin !== originalPin)
+          pins.commit(input.sessionID, originalPin, nextPin)
+        if (primary) {
+          sessionAccounts.record(input.sessionID, chosenId)
+          deps.onRoute?.(input.sessionID, chosenId, mode)
+        }
+      }
+      if (input.phase === 'retry')
+        keptChoices.set(receiptKey({ ...input, accountId }), commit)
+      else commit()
       const info = log?.info
       creditsServing.served(
         routing,
@@ -772,6 +807,12 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     request: AccountRequest,
   ): Promise<AccountHeadersResult<OpenAIAttemptData>> => {
     const { accountId } = request
+    const choiceKey = receiptKey(request)
+    const keptCommit = keptChoices.get(choiceKey)
+    keptChoices.delete(choiceKey)
+    const commitChoice = () => {
+      keptCommit?.()
+    }
     // An account chosen a moment ago may have nothing to send with by now
     // (its token cleared or expired since, or the vault refusing this send).
     // The request is then refused here with the installer's own no-account
@@ -804,6 +845,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         )
         throw refuse()
       }
+      commitChoice()
       return {
         headers: {
           ...CODEX_CLIENT_HEADERS,
@@ -825,6 +867,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       throw refuse()
     }
     const identity = row.identity ?? identityOfToken(token)
+    commitChoice()
     return {
       headers: {
         ...CODEX_CLIENT_HEADERS,
@@ -838,6 +881,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
 
   const adapter: OpenCode2AuthAdapter<CodexQuotaReading, OpenAIAttemptData> = {
     providerID: OPENAI_PROVIDER_ID,
+    dropChoice(input) {
+      const key = receiptKey(input)
+      keptChoices.delete(key)
+      receipts.delete(key)
+    },
     chooseAccount,
     accountHeaders,
     async rewriteRequest({ request, sessionID, kind }) {
