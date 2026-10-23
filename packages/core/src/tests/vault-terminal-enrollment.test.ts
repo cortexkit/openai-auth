@@ -30,7 +30,7 @@ test('unsupported enrollment stops without reconnecting or polling and tells the
     expect(daemon.outageCalls).toEqual(['auth.enroll_propose'])
     expect(vaultConnectOutcome(vault, status)).toEqual({
       ok: false,
-      text: 'Enrollment stopped (unknown_method). Update the Claustrum vault to a version that supports connecting plugins, then run Connect again.',
+      text: 'Enrollment stopped (unknown_method). This Claustrum vault is too old to connect plugins. Run ck upgrade to move to Claustrum v0.2.0 or newer (read "Upgrading from v0.1.3" in its release notes first), then run Connect again.',
     })
     expect(vault.routes()).toEqual([])
   } finally {
