@@ -928,8 +928,8 @@ expect_message = "Received promise that resolved"
 id = "opencode2-tokenless-row-never-sends"
 guards = "OpenCode 2 refuses locally when the chosen row has no usable token, instead of sending an empty bearer"
 file = "packages/opencode/src/v2/adapter.ts"
-old = "    if (!row || !token) {\n      log?.warn('pool row holds no usable token; refusing the request'"
-new = "    if (!row) {\n      log?.warn('pool row holds no usable token; refusing the request'"
+old = "      if (!row || !token) {\n        log?.warn('pool row holds no usable token; refusing the request'"
+new = "      if (!row) { // NON-VACUITY BREAK\n        log?.warn('pool row holds no usable token; refusing the request'"
 test_file = "packages/opencode/src/tests/opencode2-no-unauthorized-send.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-no-unauthorized-send.test.ts", "-t", "{test}"]
@@ -6226,8 +6226,8 @@ expect_red = ['^OpenCode\s2\skept\sretry\schoice\sdropChoice\sdiscards\sa\smodel
 id = "opencode2-undefined-no-pin-write"
 guards = "an undefined choice after token refusals cannot reserve pending bytes or change any pin"
 file = "packages/opencode/src/v2/adapter.ts"
-old = "        (sessionId, pin) => plannedPins.set(sessionId, pin),"
-new = "        (sessionId, pin) => pins.commit(sessionId, pins.snapshot().get(sessionId), pin), // NON-VACUITY BREAK"
+old = "        if (reservation) pins.rollback(reservation)"
+new = "        // NON-VACUITY BREAK: leak the refused candidate reservation"
 test_file = "packages/opencode/src/tests/opencode2-retry-choice.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-retry-choice.test.ts", "-t", "{test}"]
@@ -6273,3 +6273,29 @@ command = ["bun", "test", "--cwd", "packages/core", "./src/tests/vault-insula-qu
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/core", "./src/tests/vault-insula-quota.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^vault\sinsula\squota\sexplicit\sinsula\sunlimited\strue\sreplaces\sthe\sprevious\sverdict$']
+
+[[control]]
+id = "opencode2-live-choice-reservation"
+guards = "overlapping cold sessions in different project adapters see live pending-byte reservations before authorization completes"
+file = "packages/opencode/src/v2/pins.ts"
+old = "      if (reservation.sessionId !== excludeReservationFor)"
+new = "      if (false) // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-concurrent-choice.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-concurrent-choice.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-concurrent-choice.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^overlapping\scold\ssessions\sreserve\spending\sbytes\sacross\sproject\sadapters$']
+
+[[control]]
+id = "opencode2-drop-choice-reservation"
+guards = "a model-change discard releases its live pending-byte reservation before the next session choice"
+file = "packages/opencode/src/v2/adapter.ts"
+old = "      keptChoices.get(key)?.drop()"
+new = "      // NON-VACUITY BREAK"
+test_file = "packages/opencode/src/tests/opencode2-retry-choice.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-retry-choice.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-retry-choice.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\skept\sretry\schoice\sdropChoice\sdiscards\sa\smodel-change\splacement\swithout\stouching\sanother\ssession$']

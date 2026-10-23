@@ -95,7 +95,7 @@ import {
   rewriteCodexHttpRequest,
 } from './codex-wire'
 import { codexRequestURL } from './endpoint'
-import type { SessionPins } from './pins'
+import type { PinReservation, SessionPins } from './pins'
 import { SessionAccounts } from './session-accounts'
 
 /** The provider (and integration) OpenCode 2 serves ChatGPT logins under. */
@@ -408,9 +408,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   // installer's `accountHeaders` call for the same session, request kind and
   // account consumes them. A kept retry choice may wait until a later attempt.
   const receipts = new Map<string, ClaustrumScopedAttempt>()
-  // Retry choices may be discarded before any send. Delay their pin and
-  // active-account writes until accountHeaders consumes the kept choice.
-  const keptChoices = new Map<string, () => void>()
+  // Retry choices reserve live pending bytes, but publish their pin and active
+  // account only when accountHeaders consumes them. A discard releases the lease.
+  const keptChoices = new Map<string, { commit(): void; drop(): void }>()
   const receiptKey = (scope: AccountRequest) =>
     `${scope.sessionID}\u0000${scope.kind}\u0000${scope.accountId}`
   // Rate-limit marks of vault accounts (the pool source marks only its own
@@ -664,143 +664,174 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     // them, so the choice runs again without them, as the OpenCode 1 request
     // path moves on to the next account.
     const refused = new Set<string>()
-    const originalPin = pins.snapshot().get(input.sessionID)
-    let plannedPins = new Map(pins.snapshot())
+    let plannedPin: StickyPin | undefined
+    let reservation: PinReservation | undefined
     let accountId: string | undefined
-    for (;;) {
-      const skip = new Set([...excluded, ...refused])
-      accountId = undefined
-      if (mode === 'sticky-balanced') {
-        // Each candidate starts from the live ledger. A failed token check,
-        // admission refusal or undefined choice cannot reserve pending bytes.
-        plannedPins = new Map(pins.snapshot())
-        accountId = chooseSticky(
-          routing,
-          targets,
-          storage,
-          input.sessionID,
-          skip,
-          // A missing token or a vault refusal may be temporary (a refresh
-          // that succeeds later, the vault unreachable for a moment), so
-          // choosing again after one does not move the session's sticky pin.
-          primary && refused.size === 0,
-          plannedPins,
-        )
-        if (accountId === undefined) plannedPins = new Map(pins.snapshot())
-      }
-      accountId ??= chooseOrdered(
-        routing,
-        mode,
-        skip,
-        primary ? undefined : sessionAccounts.activeAccount(input.sessionID),
-        vaultMode
-          ? mode === 'sticky-balanced'
-            ? null
-            : vaultMainRouteId(vault?.routes() ?? [])
-          : undefined,
-      )
-      if (accountId === undefined || refused.has(accountId)) {
-        // With no alternative, keep the refused account for the host's own
-        // delayed retry. common-auth's OpenCode 2 installer consumes this choice
-        // without asking the adapter to choose twice.
-        if (excluded.size > 0) {
-          const rateLimitMarks = new Map(routing.rateLimitMarks)
-          for (const id of excluded) rateLimitMarks.delete(id)
-          routing = { ...routing, rateLimitMarks }
-          excluded.clear()
-          continue
-        }
+    try {
+      for (;;) {
+        const skip = new Set([...excluded, ...refused])
         accountId = undefined
-        break
-      }
-      const row = byId.get(accountId)?.row
-      if (row) {
-        if (source.usableToken(row) !== undefined) break
-        log?.debug('pool row holds no usable token; choosing again', {
-          accountId,
-        })
-      } else {
-        if (!vault) break
-        const receipt = await vault.authorize(accountId)
-        if (receipt) {
-          receipts.set(receiptKey({ ...input, accountId }), receipt)
+        plannedPin = undefined
+        if (mode === 'sticky-balanced') {
+          const plannedPins = new Map(pins.placementSnapshot(input.sessionID))
+          const previous = plannedPins.get(input.sessionID)
+          accountId = chooseSticky(
+            routing,
+            targets,
+            storage,
+            input.sessionID,
+            skip,
+            // A missing token or a vault refusal may be temporary (a refresh
+            // that succeeds later, the vault unreachable for a moment), so
+            // choosing again after one does not move the session's sticky pin.
+            primary && refused.size === 0,
+            plannedPins,
+          )
+          if (
+            accountId !== undefined &&
+            plannedPins.get(input.sessionID) !== previous
+          )
+            plannedPin = plannedPins.get(input.sessionID)
+        }
+        accountId ??= chooseOrdered(
+          routing,
+          mode,
+          skip,
+          primary ? undefined : sessionAccounts.activeAccount(input.sessionID),
+          vaultMode
+            ? mode === 'sticky-balanced'
+              ? null
+              : vaultMainRouteId(vault?.routes() ?? [])
+            : undefined,
+        )
+        if (accountId === undefined || refused.has(accountId)) {
+          // With no alternative, keep the refused account for the host's own
+          // delayed retry. common-auth's OpenCode 2 installer consumes this choice
+          // without asking the adapter to choose twice.
+          if (excluded.size > 0) {
+            // Ignore the refusal only for this last-account decision. The live
+            // rate-limit mark stays in place, and the host still owns the wait.
+            const rateLimitMarks = new Map(routing.rateLimitMarks)
+            for (const id of excluded) rateLimitMarks.delete(id)
+            routing = { ...routing, rateLimitMarks }
+            excluded.clear()
+            continue
+          }
+          accountId = undefined
           break
         }
-        log?.debug('the vault refused to serve an account; choosing again', {
-          accountId,
+        if (primary && mode === 'sticky-balanced') {
+          const checkedAt =
+            admitSticky(routing).projections.get(accountId)?.checkedAt
+          const identity = byId.get(accountId)?.identity
+          // Publish the pending-byte reservation before authorization can yield,
+          // so another project's cold session sees this choice's demand.
+          reservation = pins.reserve(input.sessionID, {
+            accountId,
+            inputBytes: NOMINAL_REQUEST_BYTES,
+            ...(checkedAt !== undefined ? { quotaCheckedAt: checkedAt } : {}),
+            ...(identity !== undefined ? { wireIdentity: identity } : {}),
+          })
+        }
+        const row = byId.get(accountId)?.row
+        if (row) {
+          if (source.usableToken(row) !== undefined) break
+          log?.debug('pool row holds no usable token; choosing again', {
+            accountId,
+          })
+        } else {
+          if (!vault) break
+          const receipt = await vault.authorize(accountId)
+          if (receipt) {
+            receipts.set(receiptKey({ ...input, accountId }), receipt)
+            break
+          }
+          log?.debug('the vault refused to serve an account; choosing again', {
+            accountId,
+          })
+        }
+        if (reservation) pins.rollback(reservation)
+        reservation = undefined
+        refused.add(accountId)
+      }
+      // No row could serve and the login lives in another store. Without this,
+      // the installer turns an empty choice into its generic no-account error;
+      // give the same sign-in instructions OpenCode 1 gives instead. Only after
+      // routing found no row, so a setup with other accounts still uses them.
+      if (
+        accountId === undefined &&
+        !vaultMode &&
+        targets.length === 0 &&
+        (await deps.slotPlaceholderWithoutMain?.())
+      )
+        refuseMissingLogin()
+      // Vault mode never falls back to a local account. When no vault account
+      // could be tried, or the vault refused every one it was asked for, the
+      // request is refused here with a fixed text naming the cause and the
+      // remedy. An admission refusal (quota) keeps the installer's own.
+      if (
+        accountId === undefined &&
+        vaultMode &&
+        vault &&
+        (targets.length === 0 || refused.size > 0)
+      ) {
+        const cause: VaultModeRefusal =
+          refused.size > 0 ? 'vault-refused' : vaultModeNoRouteCause(vault)
+        log?.warn(
+          'vault mode: no vault account can serve; refusing the request',
+          {
+            cause,
+          },
+        )
+        throw new OpenCode2AuthError({
+          kind: 'no-account',
+          providerID: OPENAI_PROVIDER_ID,
+          sessionID: input.sessionID,
+          requestKind: input.kind,
+          message: vaultModeRefusalText(cause, vault.name),
         })
       }
-      refused.add(accountId)
-    }
-    // No row could serve and the login lives in another store. Without this,
-    // the installer turns an empty choice into its generic no-account error;
-    // give the same sign-in instructions OpenCode 1 gives instead. Only after
-    // routing found no row, so a setup with other accounts still uses them.
-    if (
-      accountId === undefined &&
-      !vaultMode &&
-      targets.length === 0 &&
-      (await deps.slotPlaceholderWithoutMain?.())
-    )
-      refuseMissingLogin()
-    // Vault mode never falls back to a local account. When no vault account
-    // could be tried, or the vault refused every one it was asked for, the
-    // request is refused here with a fixed text naming the cause and the
-    // remedy. An admission refusal (quota) keeps the installer's own.
-    if (
-      accountId === undefined &&
-      vaultMode &&
-      vault &&
-      (targets.length === 0 || refused.size > 0)
-    ) {
-      const cause: VaultModeRefusal =
-        refused.size > 0 ? 'vault-refused' : vaultModeNoRouteCause(vault)
-      log?.warn(
-        'vault mode: no vault account can serve; refusing the request',
-        {
-          cause,
-        },
-      )
-      throw new OpenCode2AuthError({
-        kind: 'no-account',
-        providerID: OPENAI_PROVIDER_ID,
-        sessionID: input.sessionID,
-        requestKind: input.kind,
-        message: vaultModeRefusalText(cause, vault.name),
-      })
-    }
-    if (accountId !== undefined) {
-      const chosenId = accountId
-      const nextPin = plannedPins.get(input.sessionID)
-      const commit = () => {
-        if (nextPin && nextPin !== originalPin)
-          pins.commit(input.sessionID, originalPin, nextPin)
-        if (primary) {
-          sessionAccounts.record(input.sessionID, chosenId)
-          deps.onRoute?.(input.sessionID, chosenId, mode)
+      if (accountId !== undefined) {
+        const chosenId = accountId
+        const heldReservation = reservation
+        const nextPin = plannedPin
+        const commit = () => {
+          if (heldReservation) pins.finish(heldReservation, nextPin)
+          if (primary) {
+            sessionAccounts.record(input.sessionID, chosenId)
+            deps.onRoute?.(input.sessionID, chosenId, mode)
+          }
         }
+        if (input.phase === 'retry') {
+          keptChoices.set(receiptKey({ ...input, accountId }), {
+            commit,
+            drop: () => {
+              if (heldReservation) pins.rollback(heldReservation)
+            },
+          })
+          reservation = undefined
+        } else commit()
+        const info = log?.info
+        creditsServing.served(
+          routing,
+          accountId,
+          log && info
+            ? { info: (message, data) => info.call(log, message, data) }
+            : undefined,
+        )
       }
-      if (input.phase === 'retry')
-        keptChoices.set(receiptKey({ ...input, accountId }), commit)
-      else commit()
-      const info = log?.info
-      creditsServing.served(
-        routing,
+      log?.debug('pool account chosen', {
+        kind: input.kind,
         accountId,
-        log && info
-          ? { info: (message, data) => info.call(log, message, data) }
-          : undefined,
-      )
+        mode,
+        ...(input.rerouteFrom
+          ? { rerouteFrom: input.rerouteFrom.accountId }
+          : {}),
+      })
+      return accountId
+    } finally {
+      if (reservation) pins.rollback(reservation)
     }
-    log?.debug('pool account chosen', {
-      kind: input.kind,
-      accountId,
-      mode,
-      ...(input.rerouteFrom
-        ? { rerouteFrom: input.rerouteFrom.accountId }
-        : {}),
-    })
-    return accountId
   }
 
   const accountHeaders = async (
@@ -808,74 +839,78 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   ): Promise<AccountHeadersResult<OpenAIAttemptData>> => {
     const { accountId } = request
     const choiceKey = receiptKey(request)
-    const keptCommit = keptChoices.get(choiceKey)
+    const keptChoice = keptChoices.get(choiceKey)
     keptChoices.delete(choiceKey)
     const commitChoice = () => {
-      keptCommit?.()
+      keptChoice?.commit()
     }
-    // An account chosen a moment ago may have nothing to send with by now
-    // (its token cleared or expired since, or the vault refusing this send).
-    // The request is then refused here with the installer's own no-account
-    // refusal, the one it raises when no account is chosen at all, so the
-    // host stops before sending. It is never sent without a credential, nor
-    // with the host's placeholder.
-    const refuse = () =>
-      new OpenCode2AuthError({
-        kind: 'no-account',
-        providerID: OPENAI_PROVIDER_ID,
-        sessionID: request.sessionID,
-        requestKind: request.kind,
-        message: NO_ACCOUNT_REFUSAL,
-      })
-    // In vault mode no pool row is sent with, so only the vault is asked.
-    const row =
-      vault && (await vault.authority()) !== 'local'
-        ? undefined
-        : source.peek().rows.find((candidate) => candidate.id === accountId)
-    if (!row && vault) {
-      const key = receiptKey(request)
-      const receipt = receipts.get(key) ?? (await vault.authorize(accountId))
-      receipts.delete(key)
-      if (!receipt) {
-        log?.warn(
-          'the vault refused to serve an account; refusing the request',
-          {
-            accountId,
+    try {
+      // An account chosen a moment ago may have nothing to send with by now
+      // (its token cleared or expired since, or the vault refusing this send).
+      // The request is then refused here with the installer's own no-account
+      // refusal, the one it raises when no account is chosen at all, so the
+      // host stops before sending. It is never sent without a credential, nor
+      // with the host's placeholder.
+      const refuse = () =>
+        new OpenCode2AuthError({
+          kind: 'no-account',
+          providerID: OPENAI_PROVIDER_ID,
+          sessionID: request.sessionID,
+          requestKind: request.kind,
+          message: NO_ACCOUNT_REFUSAL,
+        })
+      // In vault mode no pool row is sent with, so only the vault is asked.
+      const row =
+        vault && (await vault.authority()) !== 'local'
+          ? undefined
+          : source.peek().rows.find((candidate) => candidate.id === accountId)
+      if (!row && vault) {
+        const key = receiptKey(request)
+        const receipt = receipts.get(key) ?? (await vault.authorize(accountId))
+        receipts.delete(key)
+        if (!receipt) {
+          log?.warn(
+            'the vault refused to serve an account; refusing the request',
+            {
+              accountId,
+            },
+          )
+          throw refuse()
+        }
+        commitChoice()
+        return {
+          headers: {
+            ...CODEX_CLIENT_HEADERS,
+            'session-id': request.sessionID,
+            authorization: `Bearer ${receipt.accessToken}`,
+            'chatgpt-account-id':
+              receipt.accountIdentity ??
+              identityOfToken(receipt.accessToken) ??
+              null,
           },
-        )
+          attempt: { kind: 'vault', routeId: accountId, receipt },
+        }
+      }
+      const token = row ? source.usableToken(row) : undefined
+      if (!row || !token) {
+        log?.warn('pool row holds no usable token; refusing the request', {
+          accountId,
+        })
         throw refuse()
       }
+      const identity = row.identity ?? identityOfToken(token)
       commitChoice()
       return {
         headers: {
           ...CODEX_CLIENT_HEADERS,
           'session-id': request.sessionID,
-          authorization: `Bearer ${receipt.accessToken}`,
-          'chatgpt-account-id':
-            receipt.accountIdentity ??
-            identityOfToken(receipt.accessToken) ??
-            null,
+          authorization: `Bearer ${token}`,
+          'chatgpt-account-id': identity ?? null,
         },
-        attempt: { kind: 'vault', routeId: accountId, receipt },
+        attempt: { kind: 'pool', token, credentialEpoch: row.credentialEpoch },
       }
-    }
-    const token = row ? source.usableToken(row) : undefined
-    if (!row || !token) {
-      log?.warn('pool row holds no usable token; refusing the request', {
-        accountId,
-      })
-      throw refuse()
-    }
-    const identity = row.identity ?? identityOfToken(token)
-    commitChoice()
-    return {
-      headers: {
-        ...CODEX_CLIENT_HEADERS,
-        'session-id': request.sessionID,
-        authorization: `Bearer ${token}`,
-        'chatgpt-account-id': identity ?? null,
-      },
-      attempt: { kind: 'pool', token, credentialEpoch: row.credentialEpoch },
+    } finally {
+      keptChoice?.drop()
     }
   }
 
@@ -883,6 +918,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     providerID: OPENAI_PROVIDER_ID,
     dropChoice(input) {
       const key = receiptKey(input)
+      keptChoices.get(key)?.drop()
       keptChoices.delete(key)
       receipts.delete(key)
     },

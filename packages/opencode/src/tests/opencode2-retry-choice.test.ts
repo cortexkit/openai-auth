@@ -51,12 +51,14 @@ async function fixture(ids = ['a', 'b']) {
       }) as AccountStorage,
   })
   const choices: ChooseAccountInput[] = []
+  const choiceStarts: Array<ReturnType<SessionPins['placementSnapshot']>> = []
   const drops: string[] = []
   const host = fakeOpenCode2Host()
   const installation = await installOpenCode2Auth(host.ctx, {
     ...openai.adapter,
     chooseAccount: (input) => {
       choices.push(input)
+      choiceStarts.push(pins.placementSnapshot())
       return openai.adapter.chooseAccount(input)
     },
     dropChoice: async (input) => {
@@ -105,6 +107,8 @@ async function fixture(ids = ['a', 'b']) {
     pins,
     openai,
     choices,
+    choiceStarts,
+    marks,
     drops,
     routes,
     request,
@@ -157,6 +161,12 @@ describe('OpenCode 2 kept retry choice', () => {
       )
       expect(f.choices).toHaveLength(2)
       expect(f.drops).toEqual([])
+      const mark = f.marks.get('a')
+      expect(mark).toBeGreaterThan(Date.now())
+      await expect(f.request('new-session')).rejects.toBeInstanceOf(
+        OpenCode2AuthError,
+      )
+      expect(f.marks.get('a')).toBe(mark)
     } finally {
       await f.installation.dispose()
     }
@@ -170,6 +180,7 @@ describe('OpenCode 2 kept retry choice', () => {
       f.setUsable(false)
       await expect(f.request()).rejects.toBeInstanceOf(OpenCode2AuthError)
       expect(f.pins.snapshot()).toEqual(before)
+      expect(f.pins.placementSnapshot()).toEqual(before)
       expect(f.openai.activeAccount('ses_1')).toBeUndefined()
       f.setUsable(true)
       await f.request()
@@ -191,6 +202,7 @@ describe('OpenCode 2 kept retry choice', () => {
       const before = f.pins.snapshot()
       expect(await f.refuse(first)).toEqual({ retry: true, delay: 0 })
       expect(f.openai.activeAccount('ses_1')).toBe('a')
+      expect(f.pins.placementSnapshot().get('ses_1')?.accountId).toBe('b')
       // The changed model releases the kept placement even when its fresh
       // account choice cannot find a usable token.
       f.setUsable(false)
@@ -198,6 +210,8 @@ describe('OpenCode 2 kept retry choice', () => {
         OpenCode2AuthError,
       )
       expect(f.drops).toEqual(['b'])
+      expect(f.choiceStarts[3]).toEqual(before)
+      expect(f.pins.placementSnapshot()).toEqual(before)
       expect(f.pins.snapshot().get('other')).toEqual(before.get('other'))
       expect(f.choices.map((input) => input.phase)).toEqual([
         'request',
