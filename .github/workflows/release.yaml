@@ -50,9 +50,19 @@ jobs:
           required_jobs='["check", "opencode1-e2e", "opencode2-e2e", "mutations-main (shard 1/4)", "mutations-main (shard 2/4)", "mutations-main (shard 3/4)", "mutations-main (shard 4/4)"]'
           runs_url="repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${RELEASE_SHA}&per_page=100"
 
+          # A GitHub API answer that may clear on its own (5xx, rate limit or a
+          # dropped connection) is retried until the deadline; any other
+          # failure, such as a permission error, stops the release at once.
+          transient() { grep -Eqi 'HTTP (5[0-9][0-9]|429)|connection|timed? ?out|EOF' <<< "$1"; }
+
           echo "Waiting up to 30 minutes for the main-branch CI run on ${RELEASE_SHA}."
           while (( SECONDS < deadline )); do
             if ! runs_json=$(gh api "$runs_url" 2>&1); then
+              if transient "$runs_json"; then
+                echo "GitHub API error while listing CI runs; retrying: ${runs_json}"
+                sleep 15
+                continue
+              fi
               echo "::error::Unable to query CI workflow runs for ${RELEASE_SHA}: ${runs_json}"
               exit 1
             fi
@@ -72,6 +82,11 @@ jobs:
                 fi
 
                 if ! jobs_json=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100&filter=latest" 2>&1); then
+                  if transient "$jobs_json"; then
+                    echo "GitHub API error while reading CI jobs; retrying: ${jobs_json}"
+                    sleep 15
+                    continue
+                  fi
                   echo "::error::Unable to query jobs for successful CI run ${run_id}: ${jobs_json}"
                   exit 1
                 fi
