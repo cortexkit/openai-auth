@@ -48,6 +48,8 @@ command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/pool-routing.test
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/pool-routing.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^Pi\srequests\son\sthe\saccount\spool\sPi\scoalesces\sa\sheld-lock\sburst\sand\sdrains\son\sruntime\sshutdown$']
+
+[[control]]
 id = "request-dump-byte-cap"
 guards = "OpenCode request dumps forward the configured byte cap and evict oldest whole dumps"
 file = "packages/opencode/src/dump.ts"
