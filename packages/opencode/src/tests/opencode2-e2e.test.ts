@@ -675,8 +675,16 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     if (scratch) rmSync(scratch, { recursive: true, force: true })
   })
 
-  test('P0: packed command, dialog and sidebar mount on the locked host', async () => {
-    const root = join(scratch, 'control-plane')
+  /**
+   * Runs the control-plane probe and checks the packed command, dialog and
+   * sidebar. With `hostResetup`, the host also reloads the TUI plugin before
+   * phase 4, as OpenCode sometimes does by itself after a location reload.
+   */
+  async function proveControlPlane(hostResetup: boolean) {
+    const root = join(
+      scratch,
+      hostResetup ? 'control-plane-host-resetup' : 'control-plane',
+    )
     mkdirSync(root)
     const env = isolatedEnv(root)
     seedPool(join(env.XDG_CONFIG_HOME, 'opencode'), ['A', 'B'])
@@ -685,6 +693,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       consumer: packedConsumer,
       root,
       env,
+      hostResetup,
     })
     expect(result.trace).toContain('"server"')
     expect(result.trace).not.toContain('"failure"')
@@ -718,15 +727,31 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       ],
     )
     expect(rows('server').length).toBeGreaterThanOrEqual(3)
-    expect(rows('slot').map((row) => row.slots)).toEqual([1, 0, 1])
-    expect(
-      rows('slot')
-        .filter((row) => row.slots === 1)
-        .map((row) => [row.anchor, row.numericOrder]),
-    ).toEqual([
-      ['sidebar.content', false],
-      ['sidebar.content', false],
-    ])
+    // OpenCode may dispose the TUI plugin and run its setup again after a
+    // location reload, so the number of mounts varies from run to run. Each
+    // mount is released before the next one, and the last one stays mounted.
+    const slots = rows('slot').map((row) => row.slots)
+    expect(slots.length).toBeGreaterThanOrEqual(3)
+    expect(slots).toEqual(slots.map((_, index) => (index % 2 === 0 ? 1 : 0)))
+    const mounts = rows('slot').filter((row) => row.slots === 1)
+    expect(mounts.map((row) => [row.anchor, row.numericOrder])).toEqual(
+      mounts.map(() => ['sidebar.content', false]),
+    )
+    const done = rows('done')[0]
+    const setups = rows('tui').length
+    console.log(`P0: the host ran the TUI plugin's setup ${setups} time(s)`)
+    expect(done.setups).toBe(setups)
+    // However often the host set the plugin up, exactly one mount is live at
+    // the end: one sidebar slot and one RPC poll loop, both from the newest
+    // mount, and phase 4's dialog was opened by that mount.
+    expect(done.slots).toBe(1)
+    expect(done.polls).toEqual([done.generation])
+    expect(rows('dialog').at(-1)?.generation).toBe(done.generation)
+    // No host error or unhandled rejection reached the terminal.
+    for (const text of [result.output, result.screen]) {
+      expect(text).not.toContain('TypeError')
+      expect(text).not.toMatch(/unhandled/i)
+    }
     expect(rows('dialog').map((row) => [row.phase, row.dialogs])).toEqual([
       [1, 1],
       [2, 1],
@@ -778,9 +803,25 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     expect(
       events
         .slice(reloaded + 1)
-        .some((row) => row.event === 'tick' && row.generation === 2),
+        .some((row) => row.event === 'tick' && row.generation > 1),
     ).toBe(true)
-  }, 60_000)
+    if (hostResetup) {
+      expect(setups).toBeGreaterThanOrEqual(2)
+      expect(rows('host-dispose').length).toBeGreaterThanOrEqual(1)
+    }
+  }
+
+  test(
+    'P0: packed command, dialog and sidebar mount on the locked host',
+    () => proveControlPlane(false),
+    60_000,
+  )
+
+  test(
+    'P0: after the host sets the TUI plugin up again, one mount stays live and the dialog still works',
+    () => proveControlPlane(true),
+    60_000,
+  )
 
   test('http: a prepared API key bypasses a migrated pool without attribution', async () => {
     const key = 'sk-opencode2-user-key'

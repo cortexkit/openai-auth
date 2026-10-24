@@ -8,6 +8,8 @@ export async function controlPlaneProbe(input: {
   consumer: string
   root: string
   env: Record<string, string>
+  /** Make the host dispose the TUI plugin and set it up again before phase 4. */
+  hostResetup?: boolean
 }) {
   const directory = join(input.root, 'project')
   const plugin = join(input.consumer, 'control-plane-probe')
@@ -54,87 +56,143 @@ export default { id: 'openai-control-plane-probe', async setup(ctx) {
 import { readFileSync, watch } from 'node:fs'
 ${record}
 record('tui-import', { keys: Object.keys(plugin) })
-export default { id: plugin.id, async setup(ctx) {
-  record('tui', { keys: Object.keys(ctx), ui: Object.keys(ctx.ui) })
-  let slots = 0, dialogs = 0, generation = 0, phase = 0, finish
+// OpenCode may dispose this TUI plugin and run its setup again on the same
+// loaded module, for example after a location reload, and it does so only on
+// some runs. The probe's state is kept on globalThis so such a repeated setup
+// mounts openai-auth on the new context and the proof sequence keeps running
+// once per process instead of starting over.
+const probe = (globalThis[Symbol.for('openai-auth.p0-probe')] ??= {
+  setups: 0, slots: 0, dialogs: 0, generation: 0, phase: 0, finish: undefined,
+  // The live host context and its mount; undefined between a host dispose
+  // and the host's next setup.
+  current: undefined, waiters: [], started: false,
+  // Live 500 ms RPC poll intervals, each with the mount generation that made it.
+  polls: new Map(),
+})
+const clearIntervalOriginal = globalThis.clearInterval
+globalThis.clearInterval = (handle) => { probe.polls.delete(handle); return clearIntervalOriginal(handle) }
+/** The live host context, waiting for the host's next setup after it disposed one. */
+const live = () => probe.current ? Promise.resolve(probe.current) : new Promise(resolve => probe.waiters.push(resolve))
+const mount = async (instance) => {
+  const ctx = instance.ctx
+  const current = ++probe.generation
   const observed = Object.create(ctx)
   Object.defineProperty(observed, 'ui', { value: { ...ctx.ui, slot(claim) {
-    slots++; record('slot', { slots, anchor: claim.append, numericOrder: 'order' in claim })
-    const remove = ctx.ui.slot({ ...claim, render(input) { record('render', { phase, sessionId: input.sessionID }); return claim.render(input) } })
-    return () => { slots--; remove(); record('slot', { slots }) }
+    // A context the host has disposed takes no new slots; a real host never
+    // mounts on one, so this mount is dropped once setup returns.
+    if (instance.closed) { record('slot-skipped', { generation: current }); return () => {} }
+    probe.slots++; record('slot', { slots: probe.slots, anchor: claim.append, numericOrder: 'order' in claim })
+    const remove = ctx.ui.slot({ ...claim, render(input) { record('render', { phase: probe.phase, sessionId: input.sessionID }); return claim.render(input) } })
+    return () => { probe.slots--; remove(); record('slot', { slots: probe.slots }) }
   } } })
-  const mount = async () => {
-    const current = ++generation
-    const original = globalThis.setInterval
-    globalThis.setInterval = (fn, ms, ...args) => original(() => {
+  const original = globalThis.setInterval
+  globalThis.setInterval = (fn, ms, ...args) => {
+    const handle = original(() => {
       if (ms === 500) record('tick', { generation: current })
       fn(...args)
     }, ms)
-    try {
-      return await plugin.setup(observed, {
-        async openDialog(payload, apply) {
-          try {
-            dialogs++; record('dialog', { phase, dialogs, title: payload.menu.title })
-            const actionId = await ctx.ui.dialog.select({ title: payload.menu.title + ' ' + phase, options: [{ title: 'Check connection', value: 'apply' }] })
-            dialogs--
-            if (actionId === undefined) throw new Error('proof dialog cancelled')
-            const result = await apply({ command: 'openai', sectionId: 'connection', actionId })
-            record('result', { phase, result, slots, dialogs })
-            finish?.()
-          } catch (error) { record('failure', { message: String(error) }) }
-        },
-      })
-    } finally { globalThis.setInterval = original }
+    if (ms === 500) probe.polls.set(handle, current)
+    return handle
   }
-  let dispose = await mount()
-  void (async () => { try {
-    const a = await ctx.client.session.create()
-    const b = await ctx.client.session.create()
-    const c = await ctx.client.session.create({ location: { directory: ${JSON.stringify(join(input.root, 'other-project'))} } })
-    record('sessions', { a: a.id, b: b.id, c: c.id })
-    const invoke = async (session) => {
-      phase++
-      await ctx.data.session.sync(session.id)
-      ctx.ui.router.navigate({ type: 'session', sessionID: session.id })
-      await new Promise(resolve => setTimeout(resolve, 1100))
-      const commands = await ctx.client.command.list({ location: { directory: session.location.directory } })
-      record('commands', { phase, count: commands.data.filter(x => x.name === 'openai').length, slots })
-      const done = new Promise(resolve => { finish = resolve })
-      await ctx.client.session.command({ sessionID: session.id, name: 'openai', text: '' })
-      await done
+  try {
+    return await plugin.setup(observed, {
+      async openDialog(payload, apply) {
+        try {
+          probe.dialogs++; record('dialog', { phase: probe.phase, dialogs: probe.dialogs, title: payload.menu.title, generation: current })
+          const actionId = await ctx.ui.dialog.select({ title: payload.menu.title + ' ' + probe.phase, options: [{ title: 'Check connection', value: 'apply' }] })
+          probe.dialogs--
+          if (actionId === undefined) throw new Error('proof dialog cancelled' + (instance.closed ? ' by a host dispose' : ''))
+          const result = await apply({ command: 'openai', sectionId: 'connection', actionId })
+          record('result', { phase: probe.phase, result, slots: probe.slots, dialogs: probe.dialogs })
+          probe.finish?.()
+        } catch (error) { record('failure', { message: String(error) }) }
+      },
+    })
+  } finally { globalThis.setInterval = original }
+}
+const sequence = async () => { try {
+  // Each step reads the context that is live when it runs.
+  const ctx = async () => (await live()).ctx
+  const a = await (await ctx()).client.session.create()
+  const b = await (await ctx()).client.session.create()
+  const c = await (await ctx()).client.session.create({ location: { directory: ${JSON.stringify(join(input.root, 'other-project'))} } })
+  record('sessions', { a: a.id, b: b.id, c: c.id })
+  const invoke = async (session) => {
+    const phase = ++probe.phase
+    await (await ctx()).data.session.sync(session.id)
+    ;(await ctx()).ui.router.navigate({ type: 'session', sessionID: session.id })
+    await new Promise(resolve => setTimeout(resolve, 1100))
+    const commands = await (await ctx()).client.command.list({ location: { directory: session.location.directory } })
+    record('commands', { phase, count: commands.data.filter(x => x.name === 'openai').length, slots: probe.slots })
+    const done = new Promise(resolve => { probe.finish = resolve })
+    await (await ctx()).client.session.command({ sessionID: session.id, name: 'openai', text: '' })
+    await done
+  }
+  await invoke(a)
+  const before = (await ctx()).themeMode
+  ;(await ctx()).keymap.dispatch('theme.switch_mode')
+  await invoke(b)
+  record('theme', { before, after: (await ctx()).themeMode })
+  await invoke(c)
+  const countBoth = async (stage) => {
+    for (const session of [a, c]) {
+      const result = await (await ctx()).client.command.list({ location: { directory: session.location.directory } })
+      record('location-count', { stage, directory: session.location.directory, count: result.data.filter(x => x.name === 'openai').length })
     }
-    await invoke(a)
-    const before = ctx.themeMode
-    ctx.keymap.dispatch('theme.switch_mode')
-    await invoke(b)
-    record('theme', { before, after: ctx.themeMode })
-    await invoke(c)
-    const countBoth = async (stage) => {
-      for (const session of [a, c]) {
-        const result = await ctx.client.command.list({ location: { directory: session.location.directory } })
-        record('location-count', { stage, directory: session.location.directory, count: result.data.filter(x => x.name === 'openai').length })
-      }
-    }
-    await countBoth('both-set-up')
-    const readyCount = () => readFileSync(${JSON.stringify(trace)}, 'utf8').split('\\n').filter(line => line.includes('"event":"server-ready"')).length
-    const previousReady = readyCount()
-    await ctx.client.location.reload()
-    // Location reload returns before asynchronous plugin setup. Listing each
-    // location activates it; its setup-complete event is the readiness barrier.
-    for (const session of [a, c]) await ctx.client.command.list({ location: { directory: session.location.directory } })
+  }
+  await countBoth('both-set-up')
+  const readyCount = () => readFileSync(${JSON.stringify(trace)}, 'utf8').split('\\n').filter(line => line.includes('"event":"server-ready"')).length
+  const previousReady = readyCount()
+  await (await ctx()).client.location.reload()
+  // Location reload returns before asynchronous plugin setup. Listing each
+  // location activates it; its setup-complete event is the readiness barrier.
+  for (const session of [a, c]) await (await ctx()).client.command.list({ location: { directory: session.location.directory } })
+  await new Promise(resolve => {
+    const check = () => { if (readyCount() >= previousReady + 2) { watcher.close(); resolve() } }
+    const watcher = watch(${JSON.stringify(trace)}, check)
+    check()
+  })
+  await countBoth('location-reloaded')
+  // The probe's own remount, on whichever host context is live now.
+  const instance = await live()
+  instance.dispose?.()
+  record('reload', { oldGeneration: probe.generation })
+  instance.dispose = await mount(instance)
+  // The host disposed this context while the remount ran: its next setup
+  // holds the live mount, so this one is released.
+  if (instance.closed) instance.dispose?.()
+  if (${JSON.stringify(input.hostResetup === true)}) {
+    // Editing this plugin's source makes OpenCode reload it: the host runs
+    // the current setup's cleanup and calls setup again on a new context, as
+    // it sometimes does by itself after a location reload.
+    const setups = probe.setups
+    record('force-host-resetup', { setups })
+    appendFileSync(${JSON.stringify(join(plugin, 'tui.js'))}, '\\n// edited by the probe so the host reloads this plugin\\n')
     await new Promise(resolve => {
-      const check = () => { if (readyCount() >= previousReady + 2) { watcher.close(); resolve() } }
-      const watcher = watch(${JSON.stringify(trace)}, check)
+      const check = () => probe.setups > setups && probe.current ? resolve() : setTimeout(check, 50)
       check()
     })
-    await countBoth('location-reloaded')
-    dispose()
-    record('reload', { oldGeneration: generation })
-    dispose = await mount()
-    await invoke(c)
-    record('done', { slots, dialogs, generation })
-  } catch (error) { record('failure', { message: String(error), stack: error.stack }) } })()
-  return () => dispose?.()
+  }
+  await invoke(c)
+  // A host dispose just before this point leaves no live mount until the
+  // host's next setup; the final counts are taken with one in place.
+  await live()
+  record('done', { slots: probe.slots, dialogs: probe.dialogs, generation: probe.generation, setups: probe.setups, polls: [...probe.polls.values()] })
+} catch (error) { record('failure', { message: String(error), stack: error.stack }) } }
+export default { id: plugin.id, async setup(ctx) {
+  const setup = ++probe.setups
+  record('tui', { setup, keys: Object.keys(ctx), ui: Object.keys(ctx.ui) })
+  const instance = { ctx, setup, closed: false, dispose: undefined }
+  instance.dispose = await mount(instance)
+  probe.current = instance
+  for (const resolve of probe.waiters.splice(0)) resolve(instance)
+  if (!probe.started) { probe.started = true; void sequence() }
+  return () => {
+    record('host-dispose', { setup })
+    instance.closed = true
+    if (probe.current === instance) probe.current = undefined
+    instance.dispose?.()
+  }
 } }
 `,
   )
