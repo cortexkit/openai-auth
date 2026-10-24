@@ -26,6 +26,7 @@ import {
   normalizeSidebarState,
   type SidebarState,
 } from '../sidebar-state.ts'
+import { exerciseCoalescedQuota } from './fixtures/coalesced-quota'
 import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
@@ -1467,6 +1468,36 @@ async function holdLock(path: string, name: string) {
 }
 
 describe('the migrated request path never waits on the store locks', () => {
+  it('OpenCode 1 coalesces a held-lock burst and drains on plugin dispose', async () => {
+    seedPool('main-first', [{ id: 'main', quota: healthy() }])
+    installWire({ usage: () => new Response('', { status: 503 }) })
+    let source: PoolAccountSource | undefined
+    const record = PoolAccountSource.prototype.recordSnapshot
+    const capture = spyOn(
+      PoolAccountSource.prototype,
+      'recordSnapshot',
+    ).mockImplementation(function (this: PoolAccountSource, ...args) {
+      source = this
+      return record.apply(this, args)
+    })
+    try {
+      const fetchOverride = await loadFetch()
+      await fetchOverride(URL_RESPONSES, request('coalesced'))
+      if (!source) throw new Error('request did not record quota')
+      await source.settled()
+      await exerciseCoalescedQuota(
+        source.poolStore(),
+        { configPath: configFile, statePath: stateFile },
+        async () => {
+          await hooks?.dispose?.()
+        },
+        'main',
+      )
+    } finally {
+      capture.mockRestore()
+    }
+  })
+
   for (const mode of MODES) {
     it(`${mode}: reaches the wire within the bound while every store lock is held, and the quota lands after release`, async () => {
       seedPool(mode, [

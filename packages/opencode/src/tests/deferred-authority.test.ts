@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { observationFromSnapshot } from '@cortexkit/openai-auth-core/pool-quota'
 import { PoolAccountSource } from '../core/pool-account-source'
+import { waitForQuotaPersistence } from './fixtures/coalesced-quota'
 import { quotaMap, seedPool } from './fixtures/pool-install'
 
 const cleanups: Array<() => Promise<void>> = []
@@ -71,6 +72,15 @@ for (const operation of [
     })
     await source.load()
     await source.settled()
+    const initial = await source.poolStore().read()
+    if (initial.status !== 'ready') throw new Error('pool not ready')
+    await waitForQuotaPersistence(() => {
+      const saved = JSON.parse(readFileSync(paths.configPath, 'utf8'))
+      return (
+        JSON.stringify(saved.commonAuthPool.rows.main.quota) ===
+        JSON.stringify(initial.rows[0]?.quota)
+      )
+    })
     const bytes = () =>
       [paths.configPath, paths.statePath].map((path) =>
         readFileSync(path, 'utf8'),
@@ -115,7 +125,10 @@ for (const operation of [
           .catch(() => {})
     }
     await source.settled()
-    expect(commits).toBe(1)
+    await source.dispose()
+    // A refused background flush retries, but must not write after enrollment
+    // transfers authority to the vault.
+    expect(commits).toBeGreaterThan(0)
     expect(bytes()).toEqual(before)
   })
 }

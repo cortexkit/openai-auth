@@ -166,6 +166,8 @@ export class PiPoolSource {
   }
   private inflightRead: { key: string; promise: Promise<Snapshot> } | undefined
   private store: { configPath: string; store: PoolStore } | undefined
+  private readonly stores = new Set<PoolStore>()
+  private disposal: Promise<void> | undefined
   private initializing:
     | { configPath: string; promise: Promise<void> }
     | undefined
@@ -244,6 +246,7 @@ export class PiPoolSource {
       configPath: paths.configPath,
       statePath: paths.statePath,
       quota: quotaCodec,
+      coalesceQuota: true,
       now: this.now,
       pull: (request) => this.coalescedPull(request),
       onPullFailure: (rowId, error) => {
@@ -278,6 +281,7 @@ export class PiPoolSource {
       },
     })
     this.store = { configPath: paths.configPath, store }
+    this.stores.add(store)
     return store
   }
 
@@ -519,10 +523,9 @@ export class PiPoolSource {
     const write = previous
       .then(async () => {
         if (
-          this.disposed ||
-          (this.deps.vaultAuthority
+          this.deps.vaultAuthority
             ? (await this.deps.vaultAuthority()) !== 'local'
-            : this.setAside())
+            : this.setAside()
         )
           return
         return store.recordQuota(row.id, attribution, observation)
@@ -730,9 +733,14 @@ export class PiPoolSource {
     return this.deps.vaultMode?.() === true
   }
 
-  /** Stops new polls and writes; ones already started finish on their own. */
-  dispose(): void {
+  /** Stop admission, submit accepted snapshots, then drain each serving store. */
+  dispose(): Promise<void> {
     this.disposed = true
+    this.disposal ??= (async () => {
+      await Promise.allSettled([...this.writes.values()])
+      await Promise.all([...this.stores].map((store) => store.close()))
+    })()
+    return this.disposal
   }
 
   /** Resolves once every queued quota write, poll, refresh and initialization has settled (tests). */
@@ -745,7 +753,10 @@ export class PiPoolSource {
       ]
       await Promise.allSettled(pending)
       await this.store?.store.pullsSettled()
-      if (this.writes.size === 0 && this.refreshing.size === 0) return
+      if (this.writes.size === 0 && this.refreshing.size === 0) {
+        await this.disposal
+        return
+      }
     }
   }
 }

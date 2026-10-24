@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -28,8 +28,9 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from '@earendil-works/pi-coding-agent'
-
+import { exerciseCoalescedQuota } from '../../../opencode/src/tests/fixtures/coalesced-quota'
 import { createPiMenu, registerCommands } from '../commands.ts'
+import cortexKitPiOpenAIAuth from '../index.ts'
 import { PiPoolSource } from '../pool-source.ts'
 import {
   clearPiStickyRouting,
@@ -229,6 +230,54 @@ afterEach(() => {
 })
 
 describe('Pi requests on the account pool', () => {
+  test('Pi coalesces a held-lock burst and drains on runtime shutdown', async () => {
+    const previousFile = process.env.PI_OPENAI_AUTH_FILE
+    const previousState = process.env.PI_OPENAI_AUTH_STATE_FILE
+    const previousFetch = globalThis.fetch
+    process.env.PI_OPENAI_AUTH_FILE = paths.configPath
+    process.env.PI_OPENAI_AUTH_STATE_FILE = paths.statePath
+    globalThis.fetch = fakeFetch
+    let runtime: PiOpenAIRuntime | undefined
+    let shutdown: (() => Promise<void>) | undefined
+    const support = PiOpenAIRuntime.prototype.commandSupport
+    const capture = spyOn(
+      PiOpenAIRuntime.prototype,
+      'commandSupport',
+    ).mockImplementation(function (this: PiOpenAIRuntime) {
+      runtime = this
+      return support.call(this)
+    })
+    try {
+      await cortexKitPiOpenAIAuth({
+        registerCommand() {},
+        registerProvider() {},
+        on(name: string, handler: () => Promise<void>) {
+          if (name === 'session_shutdown') shutdown = handler
+        },
+      } as never)
+      if (!runtime) throw new Error('extension did not create its runtime')
+      await ready(runtime)
+      await exerciseCoalescedQuota(
+        runtime.pool.poolStore(),
+        paths,
+        async () => {
+          if (!shutdown) throw new Error('Pi did not register session_shutdown')
+          await shutdown()
+        },
+        'alpha',
+      )
+    } finally {
+      await shutdown?.()
+      capture.mockRestore()
+      globalThis.fetch = previousFetch
+      if (previousFile === undefined) delete process.env.PI_OPENAI_AUTH_FILE
+      else process.env.PI_OPENAI_AUTH_FILE = previousFile
+      if (previousState === undefined)
+        delete process.env.PI_OPENAI_AUTH_STATE_FILE
+      else process.env.PI_OPENAI_AUTH_STATE_FILE = previousState
+    }
+  })
+
   test('sends with the chosen account token in each routing mode, and a mode switch moves traffic', async () => {
     const runtime = makeRuntime()
     await ready(runtime)
@@ -386,7 +435,7 @@ describe('Pi requests on the account pool', () => {
       })
 
     await send(runtime)
-    await runtime.pool.settled()
+    await runtime.pool.dispose()
 
     const load = await store().read()
     const rows = load.status === 'ready' ? load.rows : []
@@ -597,6 +646,7 @@ describe('a Pi pool row whose replace stopped between its two writes', () => {
     const runtime = makeRuntime()
     await ready(runtime)
 
+    await runtime.pool.dispose()
     const completed = await beta()
     expect(completed).toMatchObject({
       candidate: true,

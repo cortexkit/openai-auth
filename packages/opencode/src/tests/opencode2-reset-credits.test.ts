@@ -29,6 +29,7 @@ import {
   ResetCreditCounts,
   type ResetPoolAccess,
 } from '../v2/reset-credits'
+import { waitForQuotaPersistence } from './fixtures/coalesced-quota'
 import { type PoolFiles, poolFiles, seedPool } from './fixtures/opencode2-host'
 import { type Json, jwt } from './fixtures/pool-migration-harness'
 import { FLOOR_ENV } from './setup-env'
@@ -404,6 +405,9 @@ describe('OpenCode 2 reset quota re-check and quota view', () => {
     })
     expect(server.bearers).toEqual(['Bearer alpha-token'])
 
+    await waitForQuotaPersistence(
+      () => savedQuota(pool, 'alpha')?.counters?.resetCredits?.value === 5,
+    )
     const saved = savedQuota(pool, 'alpha')
     expect(saved?.counters?.resetCredits).toEqual({ value: 5, checkedAt: NOW })
     expect(
@@ -435,6 +439,9 @@ describe('OpenCode 2 reset quota re-check and quota view', () => {
       account: 'main',
       ok: true,
     })
+    await waitForQuotaPersistence(
+      () => savedQuota(pool, 'main')?.counters?.resetCredits?.value === 0,
+    )
     expect(savedQuota(pool, 'main')?.counters?.resetCredits).toEqual({
       value: 0,
       checkedAt: NOW,
