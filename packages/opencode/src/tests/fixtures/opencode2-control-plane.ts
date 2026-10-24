@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, watch, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { TerminalScreen } from './terminal-screen'
 
 /** Runs the packed entries in the pinned OpenCode version's terminal renderer. */
 export async function controlPlaneProbe(input: {
@@ -145,7 +146,36 @@ export default { id: plugin.id, async setup(ctx) {
     JSON.stringify({ plugins: [plugin] }),
   )
   let output = ''
-  const entered = new Set<number>()
+  // OpenTUI repaints only changed cells, so a dialog title whose text differs
+  // from what was on screen only in its phase digit never appears whole in
+  // the byte stream. Titles are read from the emulated screen instead, and
+  // every row it has shown is kept for the test's assertions.
+  const screen = new TerminalScreen(140, 45)
+  const shown = new Set<string>()
+  // The phase whose dialog Enter answers next; phases run one after another.
+  let waiting = 1
+  const dialogTraced = (phase: number) =>
+    readFileSync(trace, 'utf8')
+      .split('\n')
+      .some((line) => {
+        // A line still being appended is not a complete record yet.
+        try {
+          const entry = JSON.parse(line)
+          return entry.event === 'dialog' && entry.phase === phase
+        } catch {
+          return false
+        }
+      })
+  const title = (phase: number) => `OpenAI P0 connection ${phase}`
+  // Presses Enter once the plugin has traced the waiting phase's dialog and
+  // its title is on screen, so the key reaches the open dialog. Both screen
+  // output and trace appends call it: either may complete the condition.
+  const answerDialog = (write: (key: string) => void) => {
+    if (waiting > 4 || !screen.shows(title(waiting))) return
+    if (!dialogTraced(waiting)) return
+    waiting++
+    write('\r')
+  }
   const process = Bun.spawn([input.cli, '--standalone'], {
     cwd: directory,
     env: { ...input.env, TERM: 'xterm-256color' },
@@ -155,16 +185,10 @@ export default { id: plugin.id, async setup(ctx) {
       data(terminal, data) {
         const text = Buffer.from(data).toString()
         output += text
+        screen.write(data)
+        for (const line of screen.lines()) if (line) shown.add(line)
         if (text.includes('\x1b[6n')) terminal.write('\x1b[1;1R')
-        for (let phase = 1; phase <= 4; phase++) {
-          if (
-            !entered.has(phase) &&
-            output.includes(`OpenAI P0 connection ${phase}`)
-          ) {
-            entered.add(phase)
-            terminal.write('\r')
-          }
-        }
+        answerDialog((key) => terminal.write(key))
       },
     },
   })
@@ -172,13 +196,18 @@ export default { id: plugin.id, async setup(ctx) {
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
         watcher.close()
+        const stage =
+          waiting <= 4
+            ? `waiting on phase ${waiting}'s dialog (dialog event in trace: ${dialogTraced(waiting)}, title on screen: ${screen.shows(title(waiting))})`
+            : 'all four dialogs were answered; waiting for the done event'
         reject(
           new Error(
-            `P0 did not finish: ${readFileSync(trace, 'utf8')}\n${output.slice(-6000)}`,
+            `P0 did not finish, ${stage}:\n${readFileSync(trace, 'utf8')}\n--- screen ---\n${screen.lines().join('\n')}\n--- output tail ---\n${output.slice(-6000)}`,
           ),
         )
       }, 20_000)
       const check = () => {
+        answerDialog((key) => process.terminal?.write(key))
         const text = readFileSync(trace, 'utf8')
         if (
           !text.includes('"event":"done"') &&
@@ -192,7 +221,12 @@ export default { id: plugin.id, async setup(ctx) {
       const watcher = watch(trace, check)
       check()
     })
-    return { output, trace: readFileSync(trace, 'utf8') }
+    return {
+      output,
+      /** Every row the screen has shown, once each, in first-seen order. */
+      screen: [...shown].join('\n'),
+      trace: readFileSync(trace, 'utf8'),
+    }
   } finally {
     process.kill()
     await process.exited

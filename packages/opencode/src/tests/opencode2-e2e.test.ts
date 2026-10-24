@@ -697,14 +697,17 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       events.filter((entry) => entry.event === event)
     // Require visible server-published quotas and a component render event;
     // registering a slot or rendering placeholder text alone is not enough.
+    // Visible text is read from the rendered screen: the renderer repaints
+    // only changed cells, so the raw bytes may never hold a phrase whole.
     const outcome =
-      result.output.includes('95% left') &&
-      result.output.includes('60% left') &&
+      result.screen.includes('95% left') &&
+      result.screen.includes('60% left') &&
       rows('render').length > 0
         ? 'a'
         : 'c'
     expect(outcome).toBe('a')
     expect(result.output).not.toContain('OpenAI P0 sidebar component')
+    expect(result.screen).not.toContain('OpenAI P0 sidebar component')
     expect(rows('commands').map((row) => row.count)).toEqual([1, 1, 1, 1])
     expect(rows('location-count').map((row) => [row.stage, row.count])).toEqual(
       [
@@ -731,7 +734,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       [4, 1],
     ])
     for (let phase = 1; phase <= 4; phase++)
-      expect(result.output).toContain(`OpenAI P0 connection ${phase}`)
+      expect(result.screen).toContain(`OpenAI P0 connection ${phase}`)
     const sessions = rows('sessions')[0]
     expect([...new Set(rows('render').map((row) => row.sessionId))]).toEqual([
       sessions.a,
