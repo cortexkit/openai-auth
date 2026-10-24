@@ -20,6 +20,8 @@ import {
 } from '../config'
 import { dumpCodexRequest, resetDumpStateForTest } from '../dump'
 import { CodexAuthPlugin, rewriteResponsesLiteBody } from '../index'
+import { ageDumpFiles, waitForDumpCap } from './fixtures/dump-retention'
+import { quotaMap, seedPool } from './fixtures/pool-install'
 import { createRequestTestScope } from './request-test-scope'
 
 const scope = createRequestTestScope()
@@ -691,6 +693,48 @@ describe('request dumps', () => {
     )
   }
 
+  test('evicts the oldest whole dumps and keeps the directory under the configured byte cap', async () => {
+    await withDumpEnv(async (dumpDir) => {
+      process.env.OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES = '0'
+      refreshSettings()
+      const writeDump = (sessionID: string) =>
+        dumpCodexRequest({
+          sessionID,
+          transport: 'http',
+          phase: 'http',
+          bodyText: JSON.stringify({ input: [{ content: 'x'.repeat(1800) }] }),
+        })
+      await writeDump('oldest')
+      const oldestFiles = await readdir(dumpDir)
+      expect(oldestFiles.length).toBeGreaterThan(0)
+      for (let i = 0; i < 8; i++) await writeDump(`newer-${i}`)
+      await ageDumpFiles(dumpDir)
+      process.env.OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES = '12000'
+      refreshSettings()
+      resetDumpStateForTest()
+      await writeDump('latest')
+      const { files: remaining, bytes } = await waitForDumpCap(dumpDir, 12000)
+      expect(bytes).toBeLessThanOrEqual(12000)
+      expect(remaining.length).toBeGreaterThan(0)
+      for (const file of oldestFiles) expect(remaining).not.toContain(file)
+      expect((await readMetas(dumpDir)).map((meta) => meta.session)).toContain(
+        'newer-7',
+      )
+      expect((await readMetas(dumpDir)).map((meta) => meta.session)).toContain(
+        'latest',
+      )
+      for (const file of remaining) {
+        const id = file.replace(
+          /\.(?:body\.json|meta\.json|request\.json)$/,
+          '',
+        )
+        for (const suffix of ['.body.json', '.meta.json', '.request.json']) {
+          expect(remaining).toContain(`${id}${suffix}`)
+        }
+      }
+    })
+  })
+
   test('switches dumps on and off at runtime without a restart', async () => {
     await withDumpEnv(async (dumpDir) => {
       const dump = (session: string) =>
@@ -711,6 +755,75 @@ describe('request dumps', () => {
       await dump('ses_switch_on')
       const metas = await readMetas(dumpDir)
       expect(metas.map((meta) => meta.session)).toEqual(['ses_switch_on'])
+    })
+  })
+
+  test('turning dumps off through one loader menu stops the other process next request', async () => {
+    await withDumpEnv(async (dumpDir) => {
+      const root = join(dumpDir, '..')
+      const configFile = process.env.OPENCODE_OPENAI_AUTH_FILE!
+      const previousState = process.env.OPENCODE_OPENAI_AUTH_STATE_FILE
+      const originalFetch = globalThis.fetch
+      process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = join(
+        root,
+        'toggle-state.json',
+      )
+      delete process.env.CORTEXKIT_OPENAI_AUTH_DUMP
+      seedPool(
+        { configFile, stateFile: process.env.OPENCODE_OPENAI_AUTH_STATE_FILE },
+        [{ id: 'main', quota: quotaMap(10) }],
+        { dump: true },
+      )
+      resetSettingsForTest()
+      resetDumpStateForTest()
+      globalThis.fetch = Object.assign(async () => new Response('ok'), {
+        preconnect: () => {},
+      })
+      try {
+        const hooks = await dumpPlugin({ experimentalWebSockets: false })
+        const fetch = await pluginFetch(hooks)
+        const send = () =>
+          fetch('https://api.openai.com/v1/responses', {
+            method: 'POST',
+            headers: { 'x-session-affinity': 'cross-process-toggle' },
+            body: JSON.stringify(toolRequestBody()),
+          })
+        await send()
+        const before = (await readdir(dumpDir)).sort()
+        expect(before).toHaveLength(3)
+        const child = Bun.spawn(
+          [
+            process.execPath,
+            join(import.meta.dir, 'fixtures', 'dump-toggle-loader.ts'),
+            root,
+          ],
+          {
+            env: { ...process.env },
+            stdout: 'pipe',
+            stderr: 'pipe',
+          },
+        )
+        const [exit, stdout, stderr] = await Promise.all([
+          child.exited,
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+        ])
+        expect({ exit, stderr }).toEqual({ exit: 0, stderr: '' })
+        expect(stdout).toContain(
+          'separate loader turned dumps off through /openai',
+        )
+        expect(
+          JSON.parse(await readFile(configFile, 'utf8')).dump.enabled,
+        ).toBe(false)
+        // Only the other process refreshed its memoized settings.
+        expect(getSettings().dump).toBe(true)
+        await send()
+        expect((await readdir(dumpDir)).sort()).toEqual(before)
+      } finally {
+        await disposePluginWork()
+        globalThis.fetch = originalFetch
+        restoreEnv('OPENCODE_OPENAI_AUTH_STATE_FILE', previousState)
+      }
     })
   })
 
@@ -1161,10 +1274,12 @@ async function withDumpEnv(run: (dumpDir: string) => Promise<void>) {
   const dumpDir = join(rootDir, 'dumps')
   const originalDump = process.env.CORTEXKIT_OPENAI_AUTH_DUMP
   const originalDumpDir = process.env.OPENCODE_OPENAI_AUTH_DUMP_DIR
+  const originalDumpMaxBytes = process.env.OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES
   const originalConfigFile = process.env.OPENCODE_OPENAI_AUTH_FILE
   const originalConfigDir = process.env.OPENCODE_CONFIG_DIR
   process.env.CORTEXKIT_OPENAI_AUTH_DUMP = '1'
   process.env.OPENCODE_OPENAI_AUTH_DUMP_DIR = dumpDir
+  delete process.env.OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES
   process.env.OPENCODE_OPENAI_AUTH_FILE = join(rootDir, 'missing.json')
   process.env.OPENCODE_CONFIG_DIR = rootDir
   resetSettingsForTest()
@@ -1175,6 +1290,7 @@ async function withDumpEnv(run: (dumpDir: string) => Promise<void>) {
     await disposePluginWork()
     restoreEnv('CORTEXKIT_OPENAI_AUTH_DUMP', originalDump)
     restoreEnv('OPENCODE_OPENAI_AUTH_DUMP_DIR', originalDumpDir)
+    restoreEnv('OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES', originalDumpMaxBytes)
     restoreEnv('OPENCODE_OPENAI_AUTH_FILE', originalConfigFile)
     restoreEnv('OPENCODE_CONFIG_DIR', originalConfigDir)
     resetSettingsForTest()

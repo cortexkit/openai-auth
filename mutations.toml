@@ -11,6 +11,45 @@
 # twice, output replayed, a crash that loses an account, a wire contract.
 
 [[control]]
+id = "request-dump-byte-cap"
+guards = "OpenCode request dumps forward the configured byte cap and evict oldest whole dumps"
+file = "packages/opencode/src/dump.ts"
+old = "    maxBytes: dumperMaxBytes,"
+new = "    maxBytes: 0, // NON-VACUITY BREAK: disable retention."
+test_file = "packages/opencode/src/tests/dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/dump.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^request dumps evicts the oldest whole dumps and keeps the directory under the configured byte cap$']
+
+[[control]]
+id = "request-dump-cross-process-toggle"
+guards = "turning dumps off in one loader stops other processes using the same config file"
+file = "packages/opencode/src/dump.ts"
+old = "  if (!isRequestDumpEnabled()) {"
+new = "  if (!getSettings().dump) { // NON-VACUITY BREAK: use the stale process cache."
+test_file = "packages/opencode/src/tests/dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/dump.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^request dumps turning dumps off through one loader menu stops the other process next request$']
+
+[[control]]
+id = "opencode2-request-dump-byte-cap"
+guards = "OpenCode 2 request dumps share the directory byte cap rather than growing without bound"
+file = "packages/opencode/src/dump.ts"
+old = "    maxBytes: dumperMaxBytes,"
+new = "    maxBytes: 0, // NON-VACUITY BREAK: disable retention."
+test_file = "packages/opencode/src/tests/opencode2-dump.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-dump.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 evicts old whole dumps under the shared directory byte cap$']
+
+[[control]]
 id = "pi-test-native-auth-isolation"
 guards = "Pi tests resolve native auth only inside a temporary agent directory, never the developer login"
 file = "packages/pi/src/tests/test-isolation.ts"

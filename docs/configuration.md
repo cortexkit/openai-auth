@@ -34,9 +34,22 @@ Config file: `~/.config/opencode/openai-auth.json`. The directory follows `OPENC
 | Responses Lite | `responsesLite` | `CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE` | `false` | Send requests for the models Codex marks for Responses Lite (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` and `gpt-6.1-sol`) in Codex's Responses Lite shape, the wire format the Codex CLI itself uses for these models. |
 | Request dumps | `dump` | `CORTEXKIT_OPENAI_AUTH_DUMP` | `false` | Write final Codex request bodies and redacted request metadata for cache debugging. Bodies may contain prompt and session content. The config field also accepts `{ "enabled": true }`, the form the plugin's [`/openai` slash-command menu](commands.md#the-openai-command) saves. See [Troubleshooting](troubleshooting.md#request-dumps). |
 | Dump directory | `dumpDir` | `OPENCODE_OPENAI_AUTH_DUMP_DIR` | OS temp dir: `opencode-openai-auth-dumps` | Destination for `.body.json`, `.meta.json` and `.request.json` dump files. |
+| Dump retention cap | `dumpMaxBytes` | `OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES` | `536870912` (512 MiB) | Retain this many dump-artifact bytes, evicting whole dumps oldest first. `0` disables the cap. Applies to both OpenCode 1 and 2. |
 | Codex endpoint | `codexApiEndpoint` | `CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT` | `https://chatgpt.com/backend-api/codex/responses` | Send rewritten Codex requests to a compatible proxy or relay instead of ChatGPT's backend endpoint. |
 
 Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty, in any case. Any other value is ignored, and the config file or the default decides.
+
+`dumpMaxBytes` accepts a nonnegative safe integer in bytes (a JSON number in the config file). An invalid value, including an empty environment variable, negative number, fraction, or unit suffix such as `512MiB`, falls back to 512 MiB and logs one warning per process. An explicitly set environment variable takes precedence even when invalid. `0` means **unlimited**, not zero retained bytes; use it only if you manage cleanup yourself.
+
+Both OpenCode versions use the same directory and retention settings. The default directory is `opencode-openai-auth-dumps` inside Node's OS temporary directory:
+
+| OS | Default dump directory |
+| --- | --- |
+| Linux | `/tmp/opencode-openai-auth-dumps` |
+| macOS | `$TMPDIR/opencode-openai-auth-dumps`, normally `/var/folders/<user-specific directories>/T/opencode-openai-auth-dumps` |
+| Windows | `%TEMP%\opencode-openai-auth-dumps`, normally `%USERPROFILE%\AppData\Local\Temp\opencode-openai-auth-dumps` |
+
+OS temporary-directory environment overrides can change these locations; `dumpDir` / `OPENCODE_OPENAI_AUTH_DUMP_DIR` selects an explicit destination on every OS. Retention is best-effort background cleanup after successful writes, at most once every five minutes. Dumps younger than one minute and the just-written dump are protected, so usage can exceed the cap (including for a single oversized request). Another eligible successful write must trigger a sweep to reclaim excess bytes; while idle, the excess can persist. Only recognized dump artifacts are evicted; unrelated files and symlinks are left alone. The Diagnostics section of `/openai` shows a read-only size snapshot and the cap while dumps are on. It counts top-level regular files without reading their contents or traversing subdirectories, only when the menu is built, not on requests.
 
 The `webSearch` setting and `CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH` have been removed, along with the `web_search` tool the plugin used to add to requests; a config file that still sets `webSearch` loads normally and the key is ignored.
 

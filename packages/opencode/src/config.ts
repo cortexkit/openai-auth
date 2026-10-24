@@ -10,12 +10,17 @@
 // Resolution per setting: an explicitly-set env var wins; otherwise the config
 // file value; otherwise the default.
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, statSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createLogger } from './logger'
 
 export const DEFAULT_CODEX_API_ENDPOINT =
   'https://chatgpt.com/backend-api/codex/responses'
+export const DEFAULT_DUMP_MAX_BYTES = 512 * 1024 * 1024
+
+const log = createLogger('config')
+let warnedDumpMaxBytes = false
 
 /** Shape of ~/.config/opencode/openai-auth.json (all fields optional). */
 export interface OpenAIAuthConfig {
@@ -29,6 +34,8 @@ export interface OpenAIAuthConfig {
   dump?: boolean | { enabled?: boolean }
   /** Directory for request dumps. Defaults to the OS temp directory. */
   dumpDir?: string
+  /** Retained dump bytes. Default 512 MiB; zero disables the cap. */
+  dumpMaxBytes?: number
   /** Codex-compatible Responses endpoint. Defaults to ChatGPT's Codex backend. */
   codexApiEndpoint?: string
 }
@@ -39,6 +46,7 @@ export interface ResolvedSettings {
   responsesLite: boolean
   dump: boolean
   dumpDir: string
+  dumpMaxBytes: number
   codexApiEndpoint: string
 }
 
@@ -50,6 +58,7 @@ const ENV = {
   responsesLite: 'CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE',
   dump: 'CORTEXKIT_OPENAI_AUTH_DUMP',
   dumpDir: 'OPENCODE_OPENAI_AUTH_DUMP_DIR',
+  dumpMaxBytes: 'OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES',
   codexApiEndpoint: 'CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT',
   configFile: 'OPENCODE_OPENAI_AUTH_FILE',
   stateFile: 'OPENCODE_OPENAI_AUTH_STATE_FILE',
@@ -112,27 +121,86 @@ function resolveBool(
   return def
 }
 
+function resolveDumpMaxBytes(configValue: unknown): number {
+  const env = process.env[ENV.dumpMaxBytes]
+  const raw = env ?? configValue
+  if (raw === undefined) return DEFAULT_DUMP_MAX_BYTES
+  const value = env?.trim() ? Number(env) : raw
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) {
+    return value
+  }
+  if (!warnedDumpMaxBytes) {
+    warnedDumpMaxBytes = true
+    log.warn('Invalid dumpMaxBytes; using the default 512 MiB cap', {
+      env: ENV.dumpMaxBytes,
+    })
+  }
+  return DEFAULT_DUMP_MAX_BYTES
+}
+
+function configDumpEnabled(config: OpenAIAuthConfig): boolean | undefined {
+  if (typeof config.dump === 'boolean') return config.dump
+  if (config.dump && typeof config.dump === 'object') return config.dump.enabled
+  return undefined
+}
+
+let dumpCache:
+  | {
+      path: string
+      mtimeMs?: number
+      ctimeMs?: number
+      size?: number
+      enabled: boolean
+    }
+  | undefined
+
+/** Observe other processes' dump toggles without rereading unchanged config files. */
+export function isRequestDumpEnabled(): boolean {
+  const override = envBool(ENV.dump)
+  if (override !== undefined) return override
+  const path = getConfigPath()
+  let stamp: { mtimeMs: number; ctimeMs: number; size: number } | undefined
+  try {
+    stamp = statSync(path)
+  } catch {
+    // Missing or unreadable config uses the default until its file stamp changes.
+  }
+  if (
+    dumpCache?.path === path &&
+    dumpCache.mtimeMs === stamp?.mtimeMs &&
+    dumpCache.ctimeMs === stamp?.ctimeMs &&
+    dumpCache.size === stamp?.size
+  )
+    return dumpCache.enabled
+  const enabled = resolveBool(
+    ENV.dump,
+    configDumpEnabled(readConfigFile()),
+    false,
+  )
+  dumpCache = {
+    path,
+    mtimeMs: stamp?.mtimeMs,
+    ctimeMs: stamp?.ctimeMs,
+    size: stamp?.size,
+    enabled,
+  }
+  return enabled
+}
+
 function resolve(): ResolvedSettings {
   const config = readConfigFile()
-  let dumpConfig: boolean | undefined
-  if (config.dump !== undefined && config.dump !== null) {
-    if (typeof config.dump === 'object') {
-      dumpConfig = config.dump.enabled
-    } else if (typeof config.dump === 'boolean') {
-      dumpConfig = config.dump
-    }
-  }
 
   return {
     webSockets: resolveBool(ENV.webSockets, config.webSockets, false),
     rawWebSocket: resolveBool(ENV.rawWebSocket, config.rawWebSocket, false),
     responsesLite: resolveBool(ENV.responsesLite, config.responsesLite, false),
-    dump: resolveBool(ENV.dump, dumpConfig, false),
+    dump: resolveBool(ENV.dump, configDumpEnabled(config), false),
     dumpDir:
       process.env[ENV.dumpDir]?.trim() ||
       (typeof config.dumpDir === 'string' && config.dumpDir.trim()
         ? config.dumpDir.trim()
         : join(tmpdir(), 'opencode-openai-auth-dumps')),
+    dumpMaxBytes: resolveDumpMaxBytes(config.dumpMaxBytes),
     codexApiEndpoint:
       process.env[ENV.codexApiEndpoint]?.trim() ||
       (typeof config.codexApiEndpoint === 'string' &&
@@ -147,10 +215,10 @@ let cached: ResolvedSettings | undefined
 /**
  * Resolved settings, memoized per process.
  *
- * Env and the config file are read once because neither changes under a running
- * process — except through a command that writes the config itself. Those
- * commands must call `refreshSettings()`, or the process keeps serving the
- * values it read at startup while the file on disk says otherwise.
+ * Commands that write settings must call `refreshSettings()` to update this
+ * process's snapshot. Request dump on/off decisions use `isRequestDumpEnabled()`
+ * instead, so another process's toggle is observed without refreshing unrelated
+ * settings on every request.
  */
 export function getSettings(): ResolvedSettings {
   if (!cached) cached = resolve()
@@ -163,10 +231,13 @@ export function getSettings(): ResolvedSettings {
  */
 export function refreshSettings(): ResolvedSettings {
   cached = undefined
+  dumpCache = undefined
   return getSettings()
 }
 
 /** Test-only: drop the memoized settings so a later getSettings() re-reads env + config. */
 export function resetSettingsForTest(): void {
   cached = undefined
+  dumpCache = undefined
+  warnedDumpMaxBytes = false
 }

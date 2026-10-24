@@ -42,9 +42,10 @@ import {
   type RefreshAllQuotaResult,
   setLogLevel,
 } from '@cortexkit/openai-auth-core/internal'
-import { getSettings, refreshSettings } from './config'
+import { getSettings, isRequestDumpEnabled, refreshSettings } from './config'
 import { poolRemovalRefusal, poolSettingsLocks } from './core/pool-accounts'
 import { legacyRefreshLocks } from './core/pool-migration'
+import { formatDumpBytes, getDumpDirectorySize } from './dump-size'
 import { createLogger } from './logger'
 import { pushNotification } from './rpc/notifications'
 
@@ -311,26 +312,34 @@ function diagnosticsSection(ctx: OpenCodeMenuContext) {
     title: 'Diagnostics',
     build: async () => {
       const settings = getSettings()
+      const dumping = isRequestDumpEnabled()
       const storage = await ctx.loadAccounts(storePaths(ctx))
       const level = storage?.logging?.level ?? 'info'
+      const size = dumping
+        ? await getDumpDirectorySize(settings.dumpDir)
+        : undefined
+      const usage =
+        size === undefined ? 'size unavailable' : formatDumpBytes(size)
+      const cap =
+        settings.dumpMaxBytes === 0
+          ? 'no cap'
+          : `${formatDumpBytes(settings.dumpMaxBytes)} cap`
       return {
         lines: [
-          `Dumps ${settings.dump ? 'on' : 'off'}`,
+          dumping ? `Dumps on (${usage} / ${cap})` : 'Dumps off',
           `Dump directory: ${settings.dumpDir}`,
           `Log level: ${level}`,
         ],
         actions: [
           {
             id: 'dump',
-            label: settings.dump
-              ? 'Turn request dumps off'
-              : 'Turn request dumps on',
+            label: dumping ? 'Turn request dumps off' : 'Turn request dumps on',
             knobs: [
               {
                 kind: 'toggle' as const,
                 id: 'enabled',
                 label: 'Request dumps',
-                value: !settings.dump,
+                value: !dumping,
               },
             ],
             run: async ({ values }: { values: Record<string, unknown> }) => {

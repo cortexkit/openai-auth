@@ -1,8 +1,15 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import * as fs from 'node:fs'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { getSettings, resetSettingsForTest } from '../config'
+import {
+  getSettings,
+  isRequestDumpEnabled,
+  refreshSettings,
+  resetSettingsForTest,
+} from '../config'
+import { flushForTest } from '../logger'
 
 describe('config resolution', () => {
   let tempDir: string
@@ -12,6 +19,9 @@ describe('config resolution', () => {
     'OPENCODE_OPENAI_AUTH_FILE',
     'CORTEXKIT_OPENAI_AUTH_DUMP',
     'CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE',
+    'OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES',
+    'OPENCODE_OPENAI_AUTH_LOG_FILE',
+    'OPENCODE_OPENAI_AUTH_LOG_LEVEL',
   ]
 
   beforeEach(async () => {
@@ -21,6 +31,7 @@ describe('config resolution', () => {
     tempDir = await mkdtemp(join(tmpdir(), 'openai-auth-config-test-'))
     configPath = join(tempDir, 'openai-auth.json')
     process.env.OPENCODE_OPENAI_AUTH_FILE = configPath
+    delete process.env.OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES
   })
 
   afterEach(async () => {
@@ -100,6 +111,115 @@ describe('config resolution', () => {
       process.env.CORTEXKIT_OPENAI_AUTH_DUMP = 'true'
       resetSettingsForTest()
       expect(getSettings().dump).toBe(true)
+    })
+  })
+
+  describe('dump byte cap resolution', () => {
+    test('defaults to 512 MiB', () => {
+      resetSettingsForTest()
+      expect(getSettings().dumpMaxBytes).toBe(512 * 1024 * 1024)
+    })
+
+    test('env overrides the config cap and zero disables the cap', async () => {
+      await writeFile(configPath, JSON.stringify({ dumpMaxBytes: 4096 }))
+      resetSettingsForTest()
+      expect(getSettings().dumpMaxBytes).toBe(4096)
+      process.env.OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES = ' 8192 '
+      expect(refreshSettings().dumpMaxBytes).toBe(8192)
+      process.env.OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES = '0'
+      expect(refreshSettings().dumpMaxBytes).toBe(0)
+    })
+
+    test('invalid byte caps fall back to 512 MiB', async () => {
+      await writeFile(configPath, JSON.stringify({ dumpMaxBytes: 4096 }))
+      for (const raw of [
+        '',
+        ' ',
+        '-1',
+        '1.5',
+        'NaN',
+        'Infinity',
+        '12MiB',
+        '9007199254740992',
+      ]) {
+        process.env.OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES = raw
+        expect(refreshSettings().dumpMaxBytes).toBe(512 * 1024 * 1024)
+      }
+      delete process.env.OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES
+      for (const value of [-1, 0.5, '1024', null]) {
+        await writeFile(configPath, JSON.stringify({ dumpMaxBytes: value }))
+        expect(refreshSettings().dumpMaxBytes).toBe(512 * 1024 * 1024)
+      }
+    })
+
+    test('warns only once for invalid caps even when settings are refreshed', async () => {
+      await flushForTest()
+      const log = join(tempDir, 'config.log')
+      process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = log
+      process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = 'warn'
+      process.env.OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES = '-1'
+      resetSettingsForTest()
+      expect(getSettings().dumpMaxBytes).toBe(512 * 1024 * 1024)
+      expect(refreshSettings().dumpMaxBytes).toBe(512 * 1024 * 1024)
+      await flushForTest()
+      const lines = (await readFile(log, 'utf8')).trim().split('\n')
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toContain('Invalid dumpMaxBytes')
+      expect(lines[0]).toContain('OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES')
+    })
+  })
+
+  describe('live dump setting', () => {
+    test('stats unchanged config once per decision without rereading it', async () => {
+      delete process.env.CORTEXKIT_OPENAI_AUTH_DUMP
+      await writeFile(configPath, JSON.stringify({ dump: false }))
+      resetSettingsForTest()
+      const reads = spyOn(fs, 'readFileSync')
+      const stats = spyOn(fs, 'statSync')
+      try {
+        expect(isRequestDumpEnabled()).toBe(false)
+        expect(isRequestDumpEnabled()).toBe(false)
+        expect(isRequestDumpEnabled()).toBe(false)
+        expect(reads).toHaveBeenCalledTimes(1)
+        expect(stats).toHaveBeenCalledTimes(3)
+      } finally {
+        reads.mockRestore()
+        stats.mockRestore()
+      }
+    })
+
+    test('environment dump overrides need no stat and still win over file changes', async () => {
+      await writeFile(configPath, JSON.stringify({ dump: true }))
+      resetSettingsForTest()
+      const stats = spyOn(fs, 'statSync')
+      try {
+        process.env.CORTEXKIT_OPENAI_AUTH_DUMP = 'false'
+        expect(isRequestDumpEnabled()).toBe(false)
+        await writeFile(configPath, JSON.stringify({ dump: false }))
+        process.env.CORTEXKIT_OPENAI_AUTH_DUMP = 'true'
+        expect(isRequestDumpEnabled()).toBe(true)
+        expect(stats).not.toHaveBeenCalled()
+      } finally {
+        stats.mockRestore()
+      }
+    })
+
+    test('observes missing created changed deleted and malformed config without a refresh', async () => {
+      delete process.env.CORTEXKIT_OPENAI_AUTH_DUMP
+      resetSettingsForTest()
+      expect(isRequestDumpEnabled()).toBe(false)
+      await writeFile(configPath, JSON.stringify({ dump: { enabled: true } }))
+      expect(isRequestDumpEnabled()).toBe(true)
+      await writeFile(configPath, JSON.stringify({ dump: false }))
+      expect(isRequestDumpEnabled()).toBe(false)
+      await writeFile(configPath, JSON.stringify({ dump: true }))
+      expect(isRequestDumpEnabled()).toBe(true)
+      await writeFile(configPath, '{ malformed')
+      expect(isRequestDumpEnabled()).toBe(false)
+      await rm(configPath)
+      expect(isRequestDumpEnabled()).toBe(false)
+      await writeFile(configPath, JSON.stringify({ dump: true }))
+      expect(isRequestDumpEnabled()).toBe(true)
     })
   })
 
