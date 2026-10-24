@@ -205,8 +205,13 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
   // first session reloads Pi's auth snapshot before looking up any login.
   await syncSlot().catch(() => {})
   registerPiProvider(pi, runtime)
-  setInterval(syncInBackground, PROVIDER_SYNC_INTERVAL_MS).unref?.()
+  const syncTimer = setInterval(syncInBackground, PROVIDER_SYNC_INTERVAL_MS)
+  syncTimer.unref?.()
   if (typeof pi.on === 'function') {
+    pi.on('session_shutdown', async () => {
+      clearInterval(syncTimer)
+      await runtime.pool.dispose()
+    })
     pi.on('session_start', async (_event, ctx) => {
       refresh = () => ctx.modelRegistry.refresh()
       notify = (message, level) => ctx.ui.notify(message, level)

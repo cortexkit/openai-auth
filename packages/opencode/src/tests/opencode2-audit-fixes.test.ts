@@ -4,7 +4,7 @@
 // new logins, slot writes preserve concurrent changes, and quota readings
 // are attributed only to the credential that served the request.
 
-import { afterEach, describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it, spyOn } from 'bun:test'
 import {
   chmodSync,
   readFileSync,
@@ -17,11 +17,13 @@ import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore } from '@cortexkit/common-auth/store'
 import type { Credential } from '@opencode/plugin'
+import { PoolAccountSource } from '../core/pool-account-source'
 import { POOL_LOGIN_REQUIRED_MESSAGE } from '../core/pool-main'
 import { POOL_PLACEHOLDER } from '../core/pool-migration'
 import { NO_OPENCODE1_LOGINS, opencode1HostSlot } from '../v2/host-slot'
 import { writeLoginToPool } from '../v2/login'
 import { type OpenAIAuthV2Options, setupOpenAIAuth } from '../v2/setup'
+import { exerciseCoalescedQuota } from './fixtures/coalesced-quota'
 import {
   fakeOpenCode2Host,
   type PoolFiles,
@@ -385,6 +387,35 @@ describe("OpenCode 2 entry: OpenCode 1's auth.json as the login slot", () => {
 })
 
 describe('OpenCode 2 entry: quota attribution', () => {
+  it('OpenCode 2 coalesces a held-lock burst and drains on location teardown', async () => {
+    const files = poolFiles()
+    seedPool(files, 'main-first', [
+      { id: 'main', identity: 'acct-main', access: jwt('acct-main') },
+    ])
+    let source: PoolAccountSource | undefined
+    const load = PoolAccountSource.prototype.load
+    const capture = spyOn(
+      PoolAccountSource.prototype,
+      'load',
+    ).mockImplementation(function (this: PoolAccountSource) {
+      source = this
+      return load.call(this)
+    })
+    try {
+      const { stop } = await start(files)
+      if (!source) throw new Error('location did not open a pool source')
+      await source.settled()
+      await exerciseCoalescedQuota(
+        source.poolStore(),
+        files.paths(),
+        stop,
+        'main',
+      )
+    } finally {
+      capture.mockRestore()
+    }
+  })
+
   it("drops a quota reading that arrives after the row's credential was replaced", async () => {
     const files = poolFiles()
     seedPool(files, 'main-first', [

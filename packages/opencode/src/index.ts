@@ -1505,7 +1505,7 @@ export async function CodexAuthPlugin(
     async dispose() {
       vaultLease.release()
       poolLifecycle?.dispose()
-      poolAccountSource?.dispose()
+      await poolAccountSource?.dispose()
       backgroundQuotaRefresh.stop()
       sidebarBookkeeping?.stop()
       activeFallbackManager?.stopBackgroundRefresh()
@@ -1807,7 +1807,7 @@ export async function CodexAuthPlugin(
         // any other install it only reads the config once here and stays
         // idle. The first read is awaited because the loader is not the
         // request path; it also starts every row's first quota poll.
-        poolAccountSource?.dispose()
+        await poolAccountSource?.dispose()
         const poolSource = new PoolAccountSource({
           paths: () => getAccountPaths(getConfigPath()),
           refreshProvider: async (credential) => {

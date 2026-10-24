@@ -35,6 +35,7 @@ import type { ApplyResult, OpenDialogPayload } from '../rpc/protocol'
 import type { ControlPlaneMenu } from '../v2/control-plane'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { setupOpenAIAuth } from '../v2/setup'
+import { waitForQuotaPersistence } from './fixtures/coalesced-quota'
 import {
   fakeOpenCode2Host,
   type PoolFiles,
@@ -514,8 +515,14 @@ describe('OpenCode 2 reset credits redemption', () => {
         pair: [expect.any(String), 'credit-alpha-1'],
       },
     ])
-    // The re-check after the spend wrote the pool's quota map, which sticky
-    // placement reads its saved balance from: 5 available.
+    // The re-check publishes 5 available credits immediately, then the
+    // detached writer commits the balance to the pool's quota map.
+    await waitForQuotaPersistence(() => {
+      const quota = f.files.readConfig().commonAuthPool.rows.alpha?.quota as
+        | { counters?: { resetCredits?: { value: number } } }
+        | undefined
+      return quota?.counters?.resetCredits?.value === 5
+    })
     const quota = (
       f.files.readConfig().commonAuthPool.rows.alpha as {
         quota?: { counters?: { resetCredits?: { value: number } } }

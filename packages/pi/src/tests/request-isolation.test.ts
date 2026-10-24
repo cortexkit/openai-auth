@@ -411,8 +411,10 @@ for (const operation of [
           .catch(() => {})
     }
     await source.settled()
-    source.dispose()
-    expect(commits).toBe(1)
+    await source.dispose()
+    // Refused background quota writes retry, but enrollment must prevent
+    // every attempt from changing the local files.
+    expect(commits).toBeGreaterThan(0)
     expect(bytes()).toEqual(before)
   })
 }

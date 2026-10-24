@@ -11,6 +11,45 @@
 # twice, output replayed, a crash that loses an account, a wire contract.
 
 [[control]]
+id = "opencode1-coalesced-quota"
+guards = "OpenCode 1 accepts quota without waiting for the store lock and drains every reading on dispose"
+file = "packages/opencode/src/core/pool-account-source.ts"
+old = "      coalesceQuota: true,"
+new = "      coalesceQuota: false,"
+test_file = "packages/opencode/src/tests/pool-request.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/pool-request.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/pool-request.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^the\smigrated\srequest\spath\snever\swaits\son\sthe\sstore\slocks\sOpenCode\s1\scoalesces\sa\sheld-lock\sburst\sand\sdrains\son\splugin\sdispose$']
+
+[[control]]
+id = "opencode2-coalesced-quota"
+guards = "OpenCode 2 accepts quota without waiting for the store lock and drains every reading on location teardown"
+file = "packages/opencode/src/core/pool-account-source.ts"
+old = "      coalesceQuota: true,"
+new = "      coalesceQuota: false,"
+test_file = "packages/opencode/src/tests/opencode2-audit-fixes.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-audit-fixes.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-audit-fixes.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\sentry:\squota\sattribution\sOpenCode\s2\scoalesces\sa\sheld-lock\sburst\sand\sdrains\son\slocation\steardown$']
+
+[[control]]
+id = "pi-coalesced-quota"
+guards = "Pi accepts quota without waiting for the store lock and drains every reading on shutdown"
+file = "packages/pi/src/pool-source.ts"
+old = "      coalesceQuota: true,"
+new = "      coalesceQuota: false,"
+test_file = "packages/pi/src/tests/pool-routing.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/pi", "./src/tests/pool-routing.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/pi", "./src/tests/pool-routing.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^Pi\srequests\son\sthe\saccount\spool\sPi\scoalesces\sa\sheld-lock\sburst\sand\sdrains\son\sruntime\sshutdown$']
+
+[[control]]
 id = "pi-test-native-auth-isolation"
 guards = "Pi tests resolve native auth only inside a temporary agent directory, never the developer login"
 file = "packages/pi/src/tests/test-isolation.ts"
@@ -1859,7 +1898,7 @@ expect_red = ["^vault\\scommand\\smenu\\sCheck\\snow\\sin\\svault\\smode\\spolls
 id = "menu-common-auth-release"
 guards = "all packages require the common-auth release whose file leases always use wall time"
 file = "packages/core/package.json"
-old = '"@cortexkit/common-auth": "^0.25.0"'
+old = '"@cortexkit/common-auth": "^0.26.0"'
 new = '"@cortexkit/common-auth": "^0.14.2"'
 test_file = "packages/opencode/src/tests/vault-command-menu.test.ts"
 runner = "command"
@@ -3819,8 +3858,10 @@ old = """  async settled(): Promise<void> {
         this.writes.size === 0 &&
         this.refreshing.size === 0 &&
         !this.inflightRead
-      )
+      ) {
+        await this.disposal
         return
+      }
     }
   }"""
 new = """  async settled(): Promise<void> {
@@ -3829,7 +3870,10 @@ new = """  async settled(): Promise<void> {
       const pending = [...this.writes.values(), ...this.refreshing.values()]
       await Promise.allSettled(pending)
       await this.store?.store.pullsSettled()
-      if (this.writes.size === 0 && this.refreshing.size === 0) return
+      if (this.writes.size === 0 && this.refreshing.size === 0) {
+        await this.disposal
+        return
+      }
     }
   }"""
 test_file = "packages/opencode/src/tests/pool-source-disposal.test.ts"

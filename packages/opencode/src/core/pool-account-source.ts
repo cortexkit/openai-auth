@@ -245,6 +245,8 @@ export class PoolAccountSource {
   }
   private inflightRead: { key: string; promise: Promise<Snapshot> } | undefined
   private store: { configPath: string; store: PoolStore } | undefined
+  private readonly stores = new Set<PoolStore>()
+  private disposal: Promise<void> | undefined
   private readonly refreshing = new Map<string, Promise<void>>()
   private readonly backoff = new Map<string, BackoffEntry>()
   /**
@@ -366,6 +368,7 @@ export class PoolAccountSource {
       configPath: paths.configPath,
       statePath: paths.statePath,
       quota: quotaCodec,
+      coalesceQuota: true,
       now: this.now,
       pull: (request) => this.coalescedPull(request),
       onPullFailure: (rowId, error) => {
@@ -398,6 +401,7 @@ export class PoolAccountSource {
       },
     })
     this.store = { configPath: paths.configPath, store }
+    this.stores.add(store)
     return store
   }
 
@@ -1043,9 +1047,14 @@ export class PoolAccountSource {
   // Lifecycle
   // -------------------------------------------------------------------------
 
-  /** Stops new polls and writes; ones already started finish on their own. */
-  dispose(): void {
+  /** Stop admission, submit accepted snapshots, then drain each serving store. */
+  dispose(): Promise<void> {
     this.disposed = true
+    this.disposal ??= (async () => {
+      await Promise.allSettled([...this.writes.values()])
+      await Promise.all([...this.stores].map((store) => store.close()))
+    })()
+    return this.disposal
   }
 
   /** Joins the cached in-flight read, quota writes, polls and refreshes. */
@@ -1062,8 +1071,10 @@ export class PoolAccountSource {
         this.writes.size === 0 &&
         this.refreshing.size === 0 &&
         !this.inflightRead
-      )
+      ) {
+        await this.disposal
         return
+      }
     }
   }
 }

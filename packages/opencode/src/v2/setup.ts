@@ -903,7 +903,7 @@ export async function setupOpenAIAuth(
     const cacheKeepReleased = cacheKeep.release()
     await controlPlane?.()
     lifecycle?.dispose()
-    source.dispose()
+    await source.dispose()
     await sidebar.release()
     await Promise.allSettled([
       installation.dispose(),

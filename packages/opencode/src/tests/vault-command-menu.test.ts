@@ -462,7 +462,7 @@ describe('vault command menu', () => {
       const manifest = JSON.parse(
         readFileSync(join(packageDir, 'package.json'), 'utf8'),
       )
-      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.25.0')
+      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.26.0')
       expect(
         Bun.resolveSync('@cortexkit/common-auth/claustrum', packageDir),
       ).toBe(sharedConsumer)
