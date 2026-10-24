@@ -1,6 +1,6 @@
 import type { Attempt, AttemptOutcome } from '@cortexkit/common-auth/opencode2'
 import { redactCredentialText } from '@cortexkit/openai-auth-core/internal'
-import { getSettings } from '../config'
+import { isRequestDumpEnabled } from '../config'
 import { dumpCodexRequest } from '../dump'
 
 type DumpInput = Parameters<typeof dumpCodexRequest>[0]
@@ -35,8 +35,8 @@ export class RequestDumps {
   }
 
   async captureHttp(request: Request, attempt: Attempt) {
+    if (!isRequestDumpEnabled()) return
     await this.safely(async () => {
-      if (!getSettings().dump) return
       const input: DumpInput = {
         sessionID: attempt.sessionID,
         accountId: attempt.accountId,

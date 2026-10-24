@@ -7,6 +7,7 @@
 // setting names moved to the shared vocabulary on the way.
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -739,6 +740,30 @@ describe('/openai on a migrated install', () => {
     })
     expect(level.ok).toBe(true)
     expect(config().logging).toEqual({ level: 'debug' })
+  })
+
+  test('Diagnostics measures the dump directory only on menu builds and shows its cap', async () => {
+    const dumpDir = join(tmpDir, 'dumps')
+    seed({ dump: true, dumpDir, dumpMaxBytes: 536870912 })
+    refreshSettings()
+    const ctx = context()
+    const lines = async () =>
+      (await openOpenAiMenu(ctx, 'session-a')).menu.sections.find(
+        (section) => section.id === 'diagnostics',
+      )!.lines
+    expect(await lines()).toContain('Dumps on (0 B / 512 MiB cap)')
+    mkdirSync(dumpDir)
+    writeFileSync(join(dumpDir, 'example.body.json'), 'x'.repeat(2048))
+    mkdirSync(join(dumpDir, 'nested'))
+    writeFileSync(join(dumpDir, 'nested', 'ignored'), 'x'.repeat(4096))
+    expect(await lines()).toContain('Dumps on (2 KiB / 512 MiB cap)')
+    expect(await lines()).toContain(`Dump directory: ${dumpDir}`)
+    seed({ dump: true, dumpDir, dumpMaxBytes: 0 })
+    refreshSettings()
+    expect(await lines()).toContain('Dumps on (2 KiB / no cap)')
+    seed({ dump: false, dumpDir })
+    refreshSettings()
+    expect(await lines()).toContain('Dumps off')
   })
 
   test("the session section clears this session's pin only", async () => {

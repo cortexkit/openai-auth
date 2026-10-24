@@ -14,11 +14,12 @@ import type {
   OpenCode2AuthAdapter,
 } from '@cortexkit/common-auth/opencode2'
 import * as auth from '@cortexkit/common-auth/opencode2'
-import { resetSettingsForTest } from '../config'
+import { refreshSettings, resetSettingsForTest } from '../config'
 import * as requestDump from '../dump'
 import { flushForTest, setLogLevel } from '../logger'
 import { RequestDumps } from '../v2/request-dumps'
 import { setupOpenAIAuth } from '../v2/setup'
+import { ageDumpFiles, waitForDumpCap } from './fixtures/dump-retention'
 import {
   fakeOpenCode2Host,
   poolFiles,
@@ -63,7 +64,7 @@ afterEach(() => {
   return teardown
 })
 
-async function start(enabled = true) {
+async function start(enabled = true, maxBytes = '536870912') {
   const clock = openCode2PhaseClock()
   clocks.add(clock)
   cleanups.push(() => {
@@ -85,6 +86,7 @@ async function start(enabled = true) {
   const env = {
     OPENCODE_OPENAI_AUTH_FILE: files.configPath,
     OPENCODE_OPENAI_AUTH_DUMP_DIR: dir,
+    OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES: maxBytes,
     OPENCODE_OPENAI_AUTH_LOG_FILE: log,
     CORTEXKIT_OPENAI_AUTH_DUMP: enabled ? '1' : '0',
   }
@@ -275,6 +277,61 @@ test('OpenCode 2 dumps off create no directory', async () => {
   const f = await start(false)
   await (await f.response(await f.request())).text()
   expect(existsSync(f.dir)).toBe(false)
+})
+
+test('OpenCode 2 follows config dump toggles without refresh or disabled body snapshots', async () => {
+  const f = await start()
+  delete process.env.CORTEXKIT_OPENAI_AUTH_DUMP
+  const update = (enabled: boolean) => {
+    const config = JSON.parse(readFileSync(f.files.configPath, 'utf8'))
+    config.dump = { enabled }
+    writeFileSync(f.files.configPath, JSON.stringify(config))
+  }
+  update(true)
+  resetSettingsForTest()
+  await (await f.response(await f.request())).text()
+  expect(f.records()).toHaveLength(1)
+  update(false)
+  await (await f.response(await f.request())).text()
+  expect(f.records()).toHaveLength(1)
+  const request = new Request('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    body: f.body,
+  })
+  const clone = spyOn(request, 'clone')
+  try {
+    await new RequestDumps({ warn: () => {} }).captureHttp(
+      request,
+      f.attempts[0]!,
+    )
+    expect(clone).not.toHaveBeenCalled()
+  } finally {
+    clone.mockRestore()
+  }
+  update(true)
+  await (await f.response(await f.request())).text()
+  expect(f.records()).toHaveLength(2)
+})
+
+test('OpenCode 2 evicts old whole dumps under the shared directory byte cap', async () => {
+  const f = await start(true, '0')
+  for (let i = 0; i < 8; i++) await (await f.response(await f.request())).text()
+  const seeded = await ageDumpFiles(f.dir)
+  const oldestId = seeded[0]!.replace(/\.(body|meta|request)\.json$/, '')
+  process.env.OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES = '6500'
+  refreshSettings()
+  requestDump.resetDumpStateForTest()
+  await (await f.response(await f.request())).text()
+  const { files: remaining, bytes } = await waitForDumpCap(f.dir, 6500)
+  expect(bytes).toBeLessThanOrEqual(6500)
+  expect(remaining.length).toBeGreaterThan(0)
+  expect(remaining.some((name) => name.startsWith(oldestId))).toBe(false)
+  expect(f.records().at(-1)!.meta.status).toBe(200)
+  for (const name of remaining) {
+    const id = name.replace(/\.(body|meta|request)\.json$/, '')
+    for (const suffix of ['.body.json', '.meta.json', '.request.json'])
+      expect(remaining).toContain(`${id}${suffix}`)
+  }
 })
 
 test('OpenCode 2 non-owned HTTP requests write no dump and stay unchanged', async () => {

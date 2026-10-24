@@ -159,7 +159,7 @@ const diagnostics: Section = {
   slot: 'diagnostics',
   title: 'Diagnostics',
   lines: [
-    'Dumps on',
+    'Dumps on (12 MiB / 512 MiB cap)',
     'Dump directory: /tmp/opencode-openai-auth-dumps',
     'Log level: info',
   ],

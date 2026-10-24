@@ -9,7 +9,7 @@
  */
 import { createHash } from 'node:crypto'
 import { createDumper, type Dumper } from '@cortexkit/common-auth/dump'
-import { getSettings } from './config'
+import { getSettings, isRequestDumpEnabled } from './config'
 import { createLogger } from './logger'
 
 const log = createLogger('dump')
@@ -96,10 +96,14 @@ export function bodySummary(parsed: Record<string, unknown>) {
   }
 }
 
+let dumperMaxBytes: number
+
 function newDumper(): Dumper {
+  dumperMaxBytes = getSettings().dumpMaxBytes
   return createDumper({
     // Read on every dump, so a changed setting needs no restart.
     dir: () => getSettings().dumpDir,
+    maxBytes: dumperMaxBytes,
     logger: log,
     secretKeys: DUMP_SECRET_KEYS,
     schemaKeys: DUMP_SCHEMA_KEYS,
@@ -121,10 +125,12 @@ export async function dumpCodexRequest(input: {
   status?: number
   error?: string
 }): Promise<void> {
-  // The dump setting is read per request, so toggling it applies at once.
-  const enabled = getSettings().dump === true
-  dumper.setEnabled(enabled)
-  if (!enabled) return
+  if (!isRequestDumpEnabled()) {
+    dumper.setEnabled(false)
+    return
+  }
+  if (getSettings().dumpMaxBytes !== dumperMaxBytes) dumper = newDumper()
+  dumper.setEnabled(true)
   const bodyText =
     typeof input.bodyText === 'function' ? input.bodyText() : input.bodyText
   await dumper.dump({
@@ -142,8 +148,7 @@ export async function dumpCodexRequest(input: {
 }
 
 export async function dumpDiagnostic(event: Record<string, unknown>) {
-  const settings = getSettings()
-  if (!settings.dump) return
+  if (!isRequestDumpEnabled()) return
   log.debug('diagnostic', event)
 }
 

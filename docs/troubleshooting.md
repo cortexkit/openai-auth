@@ -21,7 +21,9 @@ CORTEXKIT_OPENAI_AUTH_DUMP=1 opencode
 
 Each request produces `.body.json`, `.meta.json` and `.request.json` files in the dump directory (OS temp dir: `opencode-openai-auth-dumps`, or `dumpDir` / `OPENCODE_OPENAI_AUTH_DUMP_DIR`; see [Configuration](configuration.md#settings)).
 
-Turn dumps off after debugging: `.body.json` files contain the full rewritten prompt and request body. To analyze a **cache cliff**, a sudden drop in prompt-cache hits between turns, see [Development](development.md#analyzing-cache-cliffs).
+OpenCode 1 and 2 share a default **512 MiB** dump retention cap. Set `OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES` (or `dumpMaxBytes` in the config) to a nonnegative integer byte count to change it; `0` disables cleanup. Invalid values use the default with one warning. The background sweep evicts the oldest whole dumps, at most once every five minutes after successful writes. Recent dumps are protected for one minute, and the newest write is kept, so usage can exceed the cap. Another eligible successful write must trigger a sweep to reclaim excess bytes; while idle, the excess can persist. Unrelated files are not removed. The Diagnostics dump line shows the directory's current size and cap when you open `/openai`; it does not scan the directory during requests. See [Configuration](configuration.md#settings) for default paths on Linux, macOS and Windows.
+
+Turn dumps off after debugging: `.body.json` files contain the full rewritten prompt and request body. Turning them off through `/openai` updates the shared config file; all OpenCode 1 and 2 processes using that file pick up the change at their next dump decision, without restarting. The check is stat-gated: unchanged config is not reread, and an explicit `CORTEXKIT_OPENAI_AUTH_DUMP` override still wins (restart a process launched with `CORTEXKIT_OPENAI_AUTH_DUMP=1` without that override to turn it off). Turning dumps off does not delete existing files. To analyze a **cache cliff**, a sudden drop in prompt-cache hits between turns, see [Development](development.md#analyzing-cache-cliffs).
 
 ## OpenCode keeps using an old build
 
