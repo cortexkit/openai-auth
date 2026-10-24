@@ -747,7 +747,8 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     expect(done.slots).toBe(1)
     expect(done.polls).toEqual([done.generation])
     expect(rows('dialog').at(-1)?.generation).toBe(done.generation)
-    // No host error or unhandled rejection reached the terminal.
+    // Neither the terminal output nor the rendered screen shows a TypeError
+    // or any text about an unhandled error or rejection.
     for (const text of [result.output, result.screen]) {
       expect(text).not.toContain('TypeError')
       expect(text).not.toMatch(/unhandled/i)
