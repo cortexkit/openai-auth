@@ -77,7 +77,8 @@ export class TerminalScreen {
   }
 
   private print(glyph: string, code: number) {
-    // Combining marks and zero-width joiners join the previous cell.
+    // Combining marks, zero-width joiners and variation selectors take no
+    // cell of their own; they are dropped, which leaves cell columns intact.
     if (
       (code >= 0x0300 && code <= 0x036f) ||
       code === 0x200d ||
@@ -139,7 +140,10 @@ export class TerminalScreen {
       return start + 2 < input.length ? start + 3 : undefined
     if (kind === '7') this.saved = { row: this.row, col: this.col }
     if (kind === '8') this.moveTo(this.saved.row, this.saved.col)
-    if (kind === 'c') this.erase(0, 0, this.rows - 1, this.cols - 1)
+    if (kind === 'c') {
+      this.erase(0, 0, this.rows - 1, this.cols - 1)
+      this.moveTo(0, 0)
+    }
     return start + 2
   }
 
@@ -202,7 +206,8 @@ export class TerminalScreen {
         if (mode === 0)
           this.erase(this.row, this.col, this.rows - 1, this.cols - 1)
         else if (mode === 1) this.erase(0, 0, this.row, this.col)
-        else this.erase(0, 0, this.rows - 1, this.cols - 1)
+        else if (mode === 2) this.erase(0, 0, this.rows - 1, this.cols - 1)
+        // Mode 3 clears only the scrollback, which this screen does not keep.
         break
       }
       case 'K': {
