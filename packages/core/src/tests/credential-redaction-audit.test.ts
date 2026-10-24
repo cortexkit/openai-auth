@@ -167,7 +167,16 @@ test('audit cancellation after completion cannot reject with a raw credential', 
   )
   const response = await redactCredentialResponse(source, token, 'event-stream')
   expect(await response.text()).toBe('data: {}\n\n')
-  await expect(response.body!.cancel()).resolves.toBeUndefined()
+  // Whether cancel() on a fully read body resolves or rejects is up to the
+  // runtime: Bun 1.3 resolves, Bun 1.4.4 rejects because the consumed stream
+  // stays locked (as a plain Response's body does too). What this guards is
+  // that neither outcome carries the credential and the source's own cancel
+  // never runs after completion.
+  const outcome = await response.body!.cancel().then(
+    () => undefined,
+    (error: unknown) => error,
+  )
+  expect(String(outcome ?? '')).not.toContain(token)
   expect(canceled).toBe(0)
 })
 
