@@ -86,6 +86,20 @@ const theme = {
   warning: color('#ffaa00'),
   error: color('#ff0055'),
 }
+const hostTheme = {
+  text: {
+    base: color('#f0f0f0'),
+    muted: color('#888888'),
+    feedback: {
+      success: { base: color('#00cc55') },
+      warning: { base: color('#ffaa00') },
+      error: { base: color('#ff0055') },
+    },
+    action: { primary: { base: color('#55aaff') } },
+  },
+  background: { base: color('#101010') },
+  border: { base: color('#55aaff') },
+}
 type Claim = {
   render(input: { readonly sessionID: string }): JSX.Element
 }
@@ -113,7 +127,7 @@ globalThis.clearInterval = ((timer: ReturnType<typeof setInterval>) => {
 }) as typeof clearInterval
 const on = () => () => {}
 const cleanup = await plugin.setup({
-  theme,
+  theme: hostTheme,
   data: { on },
   ui: {
     router: { current: () => ({ type: 'home' }) },

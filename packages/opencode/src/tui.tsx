@@ -14,6 +14,7 @@ import type {
   TuiPluginApi,
   TuiPluginModule,
 } from '@opencode-ai/plugin/tui'
+import { RGBA } from '@opentui/core'
 import {
   createEffect,
   createMemo,
@@ -120,6 +121,51 @@ type ThemeCurrent = Pick<
   | 'error'
 >
 type ThemeColor = ThemeCurrent['text']
+
+type HostColor = { readonly base?: ThemeColor; readonly muted?: ThemeColor }
+type SidebarHostTheme = {
+  readonly text?: HostColor & {
+    readonly action?: { readonly primary?: HostColor }
+    readonly feedback?: Partial<
+      Record<'success' | 'warning' | 'error', HostColor>
+    >
+  }
+  readonly background?: HostColor & { readonly raised?: HostColor }
+  readonly border?: HostColor
+}
+
+// OpenCode 2 supplies semantic tokens, not OpenCode 1's flat palette. Missing
+// tokens use siblings; the neutral defaults cover even an empty host theme.
+export function sidebarThemeFromHost(theme: SidebarHostTheme): ThemeCurrent {
+  const text =
+    theme.text?.base ??
+    theme.text?.muted ??
+    theme.text?.action?.primary?.base ??
+    RGBA.fromHex('#ffffff')
+  const accent = theme.text?.action?.primary?.base ?? text
+  return {
+    text,
+    textMuted: theme.text?.muted ?? text,
+    accent,
+    background:
+      theme.background?.base ??
+      theme.background?.raised?.base ??
+      RGBA.fromHex('#000000'),
+    borderActive: theme.border?.base ?? accent,
+    success:
+      theme.text?.feedback?.success?.base ??
+      theme.text?.feedback?.success?.muted ??
+      accent,
+    warning:
+      theme.text?.feedback?.warning?.base ??
+      theme.text?.feedback?.warning?.muted ??
+      accent,
+    error:
+      theme.text?.feedback?.error?.base ??
+      theme.text?.feedback?.error?.muted ??
+      accent,
+  }
+}
 
 // Tone -> theme token. Theme tokens only — never hardcoded colors. Fallbacks
 // resolve to other theme tokens so the sidebar always tracks the active theme.
@@ -1337,7 +1383,7 @@ async function setup(
   const api = {
     theme: {
       get current() {
-        return context.theme
+        return sidebarThemeFromHost(context.theme)
       },
     },
     event: {

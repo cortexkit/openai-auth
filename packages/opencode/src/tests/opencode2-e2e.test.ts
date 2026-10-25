@@ -752,6 +752,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     for (const text of [result.output, result.screen]) {
       expect(text).not.toContain('TypeError')
       expect(text).not.toMatch(/unhandled/i)
+      expect(text).not.toContain('Plugin cortexkit.openai-auth crashed')
     }
     expect(rows('dialog').map((row) => [row.phase, row.dialogs])).toEqual([
       [1, 1],

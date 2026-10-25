@@ -114,8 +114,46 @@ const dark = {
   warning: color('#ffaa00'),
   error: color('#ff0055'),
 }
-const light = { ...dark, text: color('#101010'), background: color('#f0f0f0') }
+const light = {
+  text: color('#101010'),
+  textMuted: color('#555555'),
+  accent: color('#0044cc'),
+  background: color('#f0f0f0'),
+  borderActive: color('#663399'),
+  success: color('#006622'),
+  warning: color('#aa5500'),
+  error: color('#aa0022'),
+}
 const [theme, setTheme] = createSignal(dark)
+const hostDark = {
+  text: {
+    base: color('#f0f0f0'),
+    muted: color('#888888'),
+    feedback: {
+      success: { base: color('#00cc55') },
+      warning: { base: color('#ffaa00') },
+      error: { base: color('#ff0055') },
+    },
+    action: { primary: { base: color('#55aaff') } },
+  },
+  background: { base: color('#101010') },
+  border: { base: color('#55aaff') },
+}
+const hostLight = {
+  text: {
+    base: color('#101010'),
+    muted: color('#555555'),
+    action: { primary: { base: color('#0044cc') } },
+    feedback: {
+      success: { base: color('#006622') },
+      warning: { base: color('#aa5500') },
+      error: { base: color('#aa0022') },
+    },
+  },
+  background: { base: color('#f0f0f0') },
+  border: { base: color('#663399') },
+}
+const [hostTheme, setHostTheme] = createSignal(hostDark)
 const [session, setSession] = createSignal('first')
 type Claim = {
   append: string
@@ -147,7 +185,7 @@ globalThis.clearInterval = ((timer: ReturnType<typeof setInterval>) => {
 const listeners = new Set<() => void>()
 const context = {
   get theme() {
-    return theme()
+    return hostTheme()
   },
   data: {
     on(_type: string, listener: () => void) {
@@ -274,6 +312,7 @@ try {
   }
   const darkSpans = view.captureSpans()
   setTheme(light)
+  setHostTheme(hostLight)
   await view.renderOnce()
   await v1.renderOnce()
   parity()
@@ -284,6 +323,19 @@ try {
     .find((span) => span.text.includes('OPENAI'))
   assert.deepEqual(badge?.fg, light.background)
   assert.deepEqual(badge?.bg, light.accent)
+  const spans = view.captureSpans().lines.flatMap((line) => line.spans)
+  assert.ok(
+    spans.some(
+      (span) => span.text.includes('60% left') && span.fg.equals(light.success),
+    ),
+    'mounted quota rows did not receive the new success colour',
+  )
+  assert.ok(
+    spans.some(
+      (span) => span.text.includes('30% left') && span.fg.equals(light.warning),
+    ),
+    'mounted quota rows did not receive the new warning colour',
+  )
 
   publish({
     ...initial,
