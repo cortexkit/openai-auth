@@ -7459,6 +7459,7 @@ describe('integration: active fallback routing', () => {
   it('gates Responses Lite by setting and exact HTTP model', async () => {
     const cases = [
       { name: 'sol', model: 'gpt-5.6-sol', enabled: true, marked: true },
+      { name: 'terra', model: 'gpt-6.1-terra', enabled: true, marked: true },
       {
         name: 'legacy-pro',
         model: 'gpt-5.6-sol-pro',
@@ -7550,53 +7551,56 @@ describe('integration: active fallback routing', () => {
     ])
     expect(tools.some((tool) => tool.type === 'web_search')).toBe(false)
   })
-  it('rewrites an eligible HTTP body for Responses Lite', async () => {
-    const captured = await captureResponsesLiteHttpRequest(
-      'gpt-5.6-sol',
-      true,
-      'responses-lite-body',
-      { hostedTool: true },
-    )
-    const body = JSON.parse(String(captured.body)) as Record<string, unknown>
-    expect(body.reasoning).toEqual({ effort: 'low', context: 'all_turns' })
-    expect(body.parallel_tool_calls).toBe(false)
-    expect('instructions' in body).toBe(false)
-    expect('tools' in body).toBe(false)
+  it.each(['gpt-5.6-sol', 'gpt-6.1-terra'])(
+    'rewrites an eligible HTTP body for Responses Lite (%s)',
+    async (model) => {
+      const captured = await captureResponsesLiteHttpRequest(
+        model,
+        true,
+        `responses-lite-body-${model}`,
+        { hostedTool: true },
+      )
+      const body = JSON.parse(String(captured.body)) as Record<string, unknown>
+      expect(body.reasoning).toEqual({ effort: 'low', context: 'all_turns' })
+      expect(body.parallel_tool_calls).toBe(false)
+      expect('instructions' in body).toBe(false)
+      expect('tools' in body).toBe(false)
 
-    const input = body.input as Array<Record<string, unknown>>
-    expect(input[0]).toMatchObject({
-      type: 'additional_tools',
-      role: 'developer',
-    })
-    expect(input[0]?.tools).toContainEqual({
-      type: 'function',
-      name: 'read',
-      strict: false,
-      parameters: {},
-    })
-    expect(
-      (input[0]?.tools as Array<Record<string, unknown>> | undefined)?.some(
-        (tool) => tool.type === 'web_search',
-      ) ?? false,
-    ).toBe(false)
-    expect(input[1]).toEqual({
-      type: 'message',
-      role: 'developer',
-      content: [{ type: 'input_text', text: 'Be concise' }],
-    })
-    const sourceInput = input.slice(2)
-    expect([
-      (
-        sourceInput[0]?.content as Array<Record<string, unknown>> | undefined
-      )?.[1]?.detail,
-      (
-        sourceInput[1]?.output as Array<Record<string, unknown>> | undefined
-      )?.[0]?.detail,
-      (
-        sourceInput[2]?.output as Array<Record<string, unknown>> | undefined
-      )?.[0]?.detail,
-    ]).toEqual([undefined, undefined, undefined])
-  })
+      const input = body.input as Array<Record<string, unknown>>
+      expect(input[0]).toMatchObject({
+        type: 'additional_tools',
+        role: 'developer',
+      })
+      expect(input[0]?.tools).toContainEqual({
+        type: 'function',
+        name: 'read',
+        strict: false,
+        parameters: {},
+      })
+      expect(
+        (input[0]?.tools as Array<Record<string, unknown>> | undefined)?.some(
+          (tool) => tool.type === 'web_search',
+        ) ?? false,
+      ).toBe(false)
+      expect(input[1]).toEqual({
+        type: 'message',
+        role: 'developer',
+        content: [{ type: 'input_text', text: 'Be concise' }],
+      })
+      const sourceInput = input.slice(2)
+      expect([
+        (
+          sourceInput[0]?.content as Array<Record<string, unknown>> | undefined
+        )?.[1]?.detail,
+        (
+          sourceInput[1]?.output as Array<Record<string, unknown>> | undefined
+        )?.[0]?.detail,
+        (
+          sourceInput[2]?.output as Array<Record<string, unknown>> | undefined
+        )?.[0]?.detail,
+      ]).toEqual([undefined, undefined, undefined])
+    },
+  )
 
   it('preserves the standard body when Responses Lite is disabled', async () => {
     const captured = await captureResponsesLiteHttpRequest(

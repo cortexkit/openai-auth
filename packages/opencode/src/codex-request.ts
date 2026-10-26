@@ -18,6 +18,7 @@ export const RESPONSES_LITE_MODELS: ReadonlySet<string> = new Set([
   'gpt-6-sol',
   'gpt-6-luna',
   'gpt-6.1-sol',
+  'gpt-6.1-terra',
 ])
 const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
 // gpt-6.1-sol requires Codex client >= 0.159.0: the backend's model catalog

@@ -109,6 +109,7 @@ async function surfacedModels() {
       'gpt-6-sol': model('gpt-6-sol', 'gpt-6-sol'),
       'gpt-6-luna': model('gpt-6-luna', 'gpt-6-luna'),
       'gpt-6.1-sol': model('gpt-6.1-sol', 'gpt-6.1-sol'),
+      'gpt-6.1-terra': model('gpt-6.1-terra', 'gpt-6.1-terra'),
       'gpt-6.1': model('gpt-6.1', 'gpt-6.1'),
       'gpt-6.1-fast': model('gpt-6.1-fast', 'gpt-6.1'),
     },
@@ -405,11 +406,10 @@ describe('provider.models filter', () => {
     })
   })
 
-  it('keeps the 5.6 family under the long-context surcharge line', async () => {
-    // The exemption covers gpt-6-astra only: the 5.6 family still costs 2x input
-    // and 1.5x output on the whole request above 272k input tokens, so its 244k
-    // input cap stays even though the Codex backend accepted 861,550 input
-    // tokens from gpt-5.6-sol when measured.
+  it('keeps the 5.6 family at its prior cost caps pending review', async () => {
+    // The 2026-10-26 ChatGPT rate card removes the Codex long-context
+    // multiplier. Keep the prior cost caps until they are reviewed separately;
+    // the backend accepted 861,550 input tokens from gpt-5.6-sol when measured.
     const models = await surfacedModels()
     expect(models['gpt-5.6-sol']?.limit?.input).toBeLessThan(272_000)
     expect(models['gpt-5.6-luna']?.limit).toEqual({
@@ -430,12 +430,18 @@ describe('provider.models filter', () => {
     })
   })
 
-  it("surfaces gpt-6-sol and gpt-6-luna under the surcharge line, not astra's window", async () => {
-    // Both report the same 872k window as gpt-6-astra, which makes "it is a
-    // gpt-6 model, give it astra's window" the natural mistake. The rate card's
-    // Codex long-context exception names GPT-6 Astra alone, so these two pay
-    // 2x input and 1.5x output on the whole request above 272k input tokens and
-    // are held under that line like the 5.6 family.
+  it('gives gpt-6.1-terra the 500k context Codex uses by default', async () => {
+    const models = await surfacedModels()
+    expect(models['gpt-6.1-terra']?.limit).toEqual({
+      context: 500_000,
+      input: 372_000,
+      output: 128_000,
+    })
+  })
+
+  it('surfaces gpt-6-sol and gpt-6-luna at their prior cost caps pending review', async () => {
+    // Both report astra's 872k window, but retain their prior cost caps until
+    // those are reviewed separately under the updated ChatGPT rate card.
     const models = await surfacedModels()
     for (const id of ['gpt-6-sol', 'gpt-6-luna']) {
       expect(models[id]).toBeDefined()
@@ -456,7 +462,7 @@ describe('provider.models filter', () => {
   })
 
   it('drops the bare gpt-6.1 and its synthetics', async () => {
-    // Only gpt-6.1-sol is served; the bare id answers 400 like gpt-6 does.
+    // The named Sol/Terra variants are served; the bare id answers 400 like gpt-6.
     const models = await surfacedModels()
     expect(models['gpt-6.1']).toBeUndefined()
     expect(models['gpt-6.1-fast']).toBeUndefined()

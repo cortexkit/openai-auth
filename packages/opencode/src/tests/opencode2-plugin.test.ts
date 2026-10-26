@@ -1078,6 +1078,7 @@ describe('OpenCode 2 entry: models', () => {
       model('gpt-5.6'),
       model('gpt-5.6-sol'),
       model('gpt-6-astra'),
+      model('gpt-6.1-terra'),
       model('gpt-6'),
       model('gpt-4.1'),
       model('gpt-5.4-mini'),
@@ -1094,10 +1095,18 @@ describe('OpenCode 2 entry: models', () => {
       'gpt-5.6': 'off',
       'gpt-5.6-sol': 372_000,
       'gpt-6-astra': 872_000,
+      'gpt-6.1-terra': 500_000,
       'gpt-6': 'off',
       'gpt-4.1': 'off',
       'gpt-5.4-mini': 1_000_000,
     })
+    expect(models.find((entry) => entry.id === 'gpt-6.1-terra')?.limit).toEqual(
+      {
+        context: 500_000,
+        input: 372_000,
+        output: 128_000,
+      },
+    )
   })
 
   it('registers the rules as a model transform for provider openai only', async () => {

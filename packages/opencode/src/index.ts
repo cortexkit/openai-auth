@@ -230,8 +230,9 @@ export const ALLOWED_MODELS = new Set([
 // Same shape for gpt-6: the backend rejects the bare id ("not supported when
 // using Codex with a ChatGPT account") and serves only the named variants
 // (gpt-6-astra, gpt-6-sol, gpt-6-luna), so any -fast/-pro synthetics inheriting
-// api.id "gpt-6" drop with it. gpt-6.1 is the same again: only gpt-6.1-sol is
-// served, and the bare id (like gpt-6.1-luna and gpt-6.1-astra) answers 400.
+// api.id "gpt-6" drop with it. gpt-6.1 is the same again: gpt-6.1-sol and
+// gpt-6.1-terra are served, but the bare id (like gpt-6.1-luna and
+// gpt-6.1-astra) answers 400.
 export const DISALLOWED_MODELS = new Set(['gpt-5.6', 'gpt-6', 'gpt-6.1'])
 
 /**
@@ -283,32 +284,24 @@ export function codexOAuthModelLimit(
   // reserve.
   if (modelId.includes('gpt-6-astra'))
     return { context: 872_000, input: 744_000, output: 128_000 }
-  // The 5.6 family is NOT exempt — same rate card, same date: above 272k input
-  // tokens it costs 2x input and 1.5x output ON THE WHOLE REQUEST, so `input`
-  // is held under that line at 244k and `context` is that cap plus the 128k
-  // output reserve. This is a cost decision, never a capability one —
-  // gpt-5.6-sol accepted 861,550 input tokens when measured — so do not
-  // "correct" these numbers upward to that ceiling without re-reading the rate
-  // card first.
+  // The 5.6 family, gpt-6-sol and gpt-6-luna retain their 244k input / 372k
+  // context caps as a prior cost decision, now pending review. These are not
+  // capability limits: gpt-5.6-sol accepted 861,550 input tokens when measured,
+  // and gpt-6-sol / gpt-6-luna report the same 872k window as astra.
   //
-  // gpt-6-sol and gpt-6-luna are NOT exempt either, even though they share
-  // astra's 872k reported window. The rate card, re-read 2026-09-25, names
-  // only GPT-6 Astra in its Codex long-context exception; the surcharge row
-  // applies to everything else. Checking the model family is the wrong test -
-  // it is the rate card's named list.
+  // OpenAI's ChatGPT rate card (help.openai.com/en/articles/20001415, read
+  // 2026-10-26), "Long-context pricing in Codex": "When you use Codex signed
+  // in with ChatGPT, no long-context multiplier applies to any Codex model,
+  // including requests above 272K input tokens."
   //
   // gpt-6.1-sol gets Codex's own 500k default context (raised from 272k
-  // around 2026-10-12), and on a subscription it pays no surcharge for the
-  // input above 272K. OpenAI's "ChatGPT Work and Codex" help article
-  // (help.openai.com/en/articles/20001275, read 2026-10-16 from its search
-  // index because the page answered 403): "There's no additional long-context
-  // surcharge for GPT-6.1 Sol usage covered by your subscription's included
-  // allowance." Purchased credits and the platform API keep the surcharge
-  // (developers.openai.com/api/docs/models/gpt-6.1-sol: 2x input and 1.5x
-  // output on the full request above 272K), so a `codexApiEndpoint` override
-  // pointed at a differently billed surface is the operator's to re-check, as
-  // for gpt-6-astra. `input` is the window minus the 128k output reserve.
-  if (modelId.includes('gpt-6.1-sol'))
+  // around 2026-10-12). gpt-6.1-terra uses the same default: Codex CLI's
+  // models_cache.json (client 0.164.0, fetched 2026-10-26T18:37Z) reports
+  // context_window 500000, despite max_context_window 872000. `input` is the
+  // default window minus the 128k output reserve. As for gpt-6-astra, an
+  // endpoint override pointed at a differently billed surface is the operator's
+  // to re-check; the ChatGPT rate card does not establish platform API pricing.
+  if (modelId.includes('gpt-6.1-sol') || modelId.includes('gpt-6.1-terra'))
     return { context: 500_000, input: 372_000, output: 128_000 }
   if (
     modelId.includes('gpt-5.6') ||

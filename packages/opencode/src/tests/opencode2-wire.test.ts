@@ -296,52 +296,60 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
     expect(turn?.headers.get(RESPONSES_LITE_HEADER)).toBe(null)
   })
 
-  it('sends a Lite model in the Lite shape with its header when the setting is on', async () => {
-    const request = () =>
-      httpBody('low', [user('one')], {
-        model: 'gpt-5.6-luna',
-        parallel_tool_calls: true,
-      })
-    const effort = testEffort()
-    const standard = await rewriteCodexHttpRequest(
-      request(),
-      SESSION,
-      effort,
-      false,
-    )
-    expect(standard?.headers.get(RESPONSES_LITE_HEADER)).toBeNull()
-    const lite = await rewriteCodexHttpRequest(request(), SESSION, effort, true)
-    expect(lite?.headers.get(RESPONSES_LITE_HEADER)).toBe('true')
-    const body = await lite?.json()
-    expect(body.tools).toBe(undefined)
-    expect(body.instructions).toBe(undefined)
-    expect(body.parallel_tool_calls).toBe(false)
-    expect(body.reasoning.context).toBe('all_turns')
-    expect(body.input).toEqual([
-      {
-        type: 'additional_tools',
-        role: 'developer',
-        tools: [{ type: 'function', name: 'x', strict: false }],
-      },
-      {
-        type: 'message',
-        role: 'developer',
-        content: [{ type: 'input_text', text: 'be brief' }],
-      },
-      user('one'),
-    ])
-    // A model not marked Lite keeps the standard shape.
-    const nonLite = await rewriteCodexHttpRequest(
-      httpBody('low', [user('one')], { model: 'gpt-5.5' }),
-      SESSION,
-      effort,
-      true,
-    )
-    expect(nonLite?.headers.get(RESPONSES_LITE_HEADER)).toBeNull()
-    expect((await nonLite!.json()).tools).toEqual([
-      { type: 'function', name: 'x', strict: false },
-    ])
-  })
+  it.each(['gpt-5.6-luna', 'gpt-6.1-terra'])(
+    'sends a Lite model in the Lite shape with its header when the setting is on (%s)',
+    async (model) => {
+      const request = () =>
+        httpBody('low', [user('one')], {
+          model,
+          parallel_tool_calls: true,
+        })
+      const effort = testEffort()
+      const standard = await rewriteCodexHttpRequest(
+        request(),
+        SESSION,
+        effort,
+        false,
+      )
+      expect(standard?.headers.get(RESPONSES_LITE_HEADER)).toBeNull()
+      const lite = await rewriteCodexHttpRequest(
+        request(),
+        SESSION,
+        effort,
+        true,
+      )
+      expect(lite?.headers.get(RESPONSES_LITE_HEADER)).toBe('true')
+      const body = await lite?.json()
+      expect(body.tools).toBe(undefined)
+      expect(body.instructions).toBe(undefined)
+      expect(body.parallel_tool_calls).toBe(false)
+      expect(body.reasoning.context).toBe('all_turns')
+      expect(body.input).toEqual([
+        {
+          type: 'additional_tools',
+          role: 'developer',
+          tools: [{ type: 'function', name: 'x', strict: false }],
+        },
+        {
+          type: 'message',
+          role: 'developer',
+          content: [{ type: 'input_text', text: 'be brief' }],
+        },
+        user('one'),
+      ])
+      // A model not marked Lite keeps the standard shape.
+      const nonLite = await rewriteCodexHttpRequest(
+        httpBody('low', [user('one')], { model: 'gpt-5.5' }),
+        SESSION,
+        effort,
+        true,
+      )
+      expect(nonLite?.headers.get(RESPONSES_LITE_HEADER)).toBeNull()
+      expect((await nonLite!.json()).tools).toEqual([
+        { type: 'function', name: 'x', strict: false },
+      ])
+    },
+  )
 
   it('leaves requests to other endpoints alone', async () => {
     const effort = testEffort()
