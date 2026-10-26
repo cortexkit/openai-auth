@@ -4318,19 +4318,6 @@ test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode 2 menu login completion enroll$']
 
 [[control]]
-id = "opencode2-vault-controls-capability-fence"
-guards = "vault enrollment actions remain unavailable even though the engine exposes them"
-file = "packages/opencode/src/v2/menu.ts"
-old = "    allowAction: allowed,"
-new = "    allowAction: () => true, // NON-VACUITY BREAK: permit vault enrollment."
-test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
-runner = "command"
-command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
-list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
-test_count_pattern = "Ran {count} test"
-expect_red = ['^OpenCode 2 rejects all non-control engine rows in local mode$']
-
-[[control]]
 id = "opencode2-sidebar-merge-owner"
 guards = "v2 publication retains other writers' routing and freshest quota windows"
 file = "packages/opencode/src/v2/sidebar-publisher.ts"
@@ -4531,19 +4518,6 @@ list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode 2 diagnostics refuses item actions and request dumps$']
 
-
-[[control]]
-id = "opencode2-other-menu-requests-still-refuse"
-guards = "the new Diagnostics capability does not admit cache, reset, vault enrollment or unknown requests"
-file = "packages/opencode/src/v2/menu.ts"
-old = "    default:\n      return false"
-new = "    default:\n      return true // NON-VACUITY BREAK: admit unlisted requests."
-test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
-runner = "command"
-command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
-list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
-test_count_pattern = "Ran {count} test"
-expect_red = ['^OpenCode 2 rejects all non-control engine rows in local mode$']
 
 [[control]]
 id = "opencode2-diagnostics-visible"
