@@ -10,6 +10,15 @@ set -euo pipefail
 VERSION="${1:-}"
 DRY="${2:-}"
 
+# Refuse anything that isn't exactly the dry-run flag. A mistyped flag such
+# as --dry-run used to fall through to a real release that commits, tags,
+# pushes and starts the npm publish.
+if [[ $# -gt 2 || ( -n "$DRY" && "$DRY" != "--dry" ) ]]; then
+  if [[ $# -gt 2 ]]; then BAD="${3}"; else BAD="$DRY"; fi
+  echo "Error: unknown argument '$BAD'; the only option is --dry"
+  exit 1
+fi
+
 if [[ -z "$VERSION" ]]; then
   echo "Usage: ./scripts/release.sh <version> [--dry]"
   echo "  e.g. ./scripts/release.sh 0.2.0"
