@@ -3323,11 +3323,12 @@ describe('integration: active fallback routing', () => {
     )
   })
 
-  test.each(['gpt-6-sol', 'gpt-6-luna', 'gpt-6.1-sol'])(
+  test.each(['gpt-6-sol', 'gpt-6-luna', 'gpt-6.1-sol', 'gpt-6.1-terra'])(
     '%s carries a mid-session effort change as a configuration_update',
     async (model) => {
-      // Both were measured changing effort through the item, not merely
-      // accepting it, so they get the same prefix-preserving treatment as astra.
+      // Enabled models keep the request-level effort pinned while the update
+      // item carries the new effort. This checks the wire shape, not Terra's
+      // live effect on reasoning tokens.
       const sent = await captureEffortChange(model, ['low', 'xhigh'])
       expect((sent[1]?.reasoning as Record<string, unknown>)?.effort).toBe(
         'low',

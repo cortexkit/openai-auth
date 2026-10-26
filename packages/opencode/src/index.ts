@@ -1025,14 +1025,16 @@ export function resolveSidebarSessionId(headers: Headers): string | undefined {
   )
 }
 
-// Models where a `configuration_update` item is both accepted and shown to change
-// effort. Accepted is not enough: a silently ignored item also completes with 200,
-// so each entry was measured by reasoning tokens on one hard prompt at low effort,
-// without and with an update to xhigh:
+// Models enabled for mid-conversation effort changes. A `configuration_update`
+// must both be accepted and change effort: a silently ignored item can also
+// complete with 200. Measurements use reasoning tokens on one hard prompt at
+// low effort, without and with an update to xhigh:
 //   gpt-6-sol    91 -> 516
 //   gpt-6-luna   1034 -> 3126
 //   gpt-6.1-sol  878, 938 -> 1227, 1247 (two samples each; a request-level
 //                xhigh on the same prompt gave 733 and 1456)
+//   gpt-6.1-terra  <measured by head>
+// Terra is provisionally enabled pending its live measurement.
 // gpt-5.6-sol is deliberately NOT here. It answered 400 for this item until
 // September 2026, now accepts it, and moved 2292 -> 3785 on a single sample -
 // too weak to tell from noise, on a model people already run, where the
@@ -1042,6 +1044,7 @@ export const MID_CONVERSATION_EFFORT_MODELS: ReadonlySet<string> = new Set([
   'gpt-6-sol',
   'gpt-6-luna',
   'gpt-6.1-sol',
+  'gpt-6.1-terra',
 ])
 
 // OpenCode's built-in definitions (packages/opencode/src/agent/agent.ts in the

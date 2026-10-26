@@ -248,53 +248,54 @@ describe('mid-conversation effort on WebSocket frames', () => {
 })
 
 describe('mid-conversation effort and Responses Lite on HTTP', () => {
-  it('carries the update on every request after a change, before the turn user message', async () => {
-    const effort = testEffort()
-    const first = await rewriteCodexHttpRequest(
-      httpBody('low', [user('one')]),
-      SESSION,
-      effort,
-      false,
-    )
-    expect((await first!.json()).reasoning.effort).toBe('low')
-    const turn = await rewriteCodexHttpRequest(
-      httpBody('high', [user('one'), assistant('a'), user('two')]),
-      SESSION,
-      effort,
-      false,
-    )
-    const step = await rewriteCodexHttpRequest(
-      httpBody('high', [
+  it.each(['gpt-6.1-sol', 'gpt-6.1-terra'])(
+    'carries the update on every request after a change, before the turn user message (%s)',
+    async (model) => {
+      const effort = testEffort()
+      const first = await rewriteCodexHttpRequest(
+        httpBody('low', [user('one')], { model }),
+        SESSION,
+        effort,
+        false,
+      )
+      expect((await first!.json()).reasoning.effort).toBe('low')
+      const turn = await rewriteCodexHttpRequest(
+        httpBody('high', [user('one'), assistant('a'), user('two')], { model }),
+        SESSION,
+        effort,
+        false,
+      )
+      const step = await rewriteCodexHttpRequest(
+        httpBody(
+          'high',
+          [user('one'), assistant('a'), user('two'), call, output],
+          { model },
+        ),
+        SESSION,
+        effort,
+        false,
+      )
+      const turnBody = await turn?.json()
+      const stepBody = await step?.json()
+      expect(turnBody.reasoning).toEqual({ effort: 'low', summary: 'auto' })
+      expect(turnBody.input).toEqual([
         user('one'),
         assistant('a'),
+        update('high'),
+        user('two'),
+      ])
+      expect(stepBody.reasoning).toEqual({ effort: 'low', summary: 'auto' })
+      expect(stepBody.input).toEqual([
+        user('one'),
+        assistant('a'),
+        update('high'),
         user('two'),
         call,
         output,
-      ]),
-      SESSION,
-      effort,
-      false,
-    )
-    const turnBody = await turn?.json()
-    const stepBody = await step?.json()
-    expect(turnBody.reasoning).toEqual({ effort: 'low', summary: 'auto' })
-    expect(turnBody.input).toEqual([
-      user('one'),
-      assistant('a'),
-      update('high'),
-      user('two'),
-    ])
-    expect(stepBody.reasoning).toEqual({ effort: 'low', summary: 'auto' })
-    expect(stepBody.input).toEqual([
-      user('one'),
-      assistant('a'),
-      update('high'),
-      user('two'),
-      call,
-      output,
-    ])
-    expect(turn?.headers.get(RESPONSES_LITE_HEADER)).toBe(null)
-  })
+      ])
+      expect(turn?.headers.get(RESPONSES_LITE_HEADER)).toBe(null)
+    },
+  )
 
   it.each(['gpt-5.6-luna', 'gpt-6.1-terra'])(
     'sends a Lite model in the Lite shape with its header when the setting is on (%s)',
