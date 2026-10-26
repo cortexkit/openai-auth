@@ -3,6 +3,7 @@ import { resolveClaustrumConnectionPath } from '@cortexkit/claustrum-client'
 import {
   enrollmentAuthority,
   hostEnrollmentPaths,
+  readClaustrumEnrollmentStatus,
 } from '@cortexkit/common-auth/claustrum'
 import {
   assertHostsStopped,
@@ -78,8 +79,24 @@ export function createSetupPlugin(deps: SetupDependencies = {}): SetupPlugin {
     async beforeRegister(host, mode) {
       // Vault enrollment must not read, rewrite or migrate local credentials.
       if (mode === 'claustrum') {
+        const enrollment = await readClaustrumEnrollmentStatus(
+          hostEnrollmentPaths(paths[host]),
+          vaultEnrollmentName(host),
+        )
+        const approvedName =
+          enrollment.state === 'approved' ? enrollment.approvedName : undefined
+        const grantName =
+          approvedName ??
+          ('proposedName' in enrollment
+            ? enrollment.proposedName
+            : vaultEnrollmentName(host))
+        if (!approvedName) {
+          print(
+            'The enrollment state does not record an approved name. The command below uses the proposed name; if the vault approved a different name, substitute it.',
+          )
+        }
         print(
-          `Allow this host to read OpenAI accounts with:\n  ck auth grant --principal enrolled:${vaultEnrollmentName(host)} --selector-kind category --selector ${VAULT_FAMILY.category} --operation read`,
+          `Allow this host to read OpenAI accounts with:\n  ck auth grant --principal enrolled:${grantName} --selector-kind category --selector ${VAULT_FAMILY.category} --operation read`,
         )
         if (host === 'opencode') {
           print(

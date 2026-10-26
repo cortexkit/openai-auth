@@ -11,6 +11,32 @@
 # twice, output replayed, a crash that loses an account, a wire contract.
 
 [[control]]
+id = "opencode2-vault-connect"
+guards = "OpenCode 2 can enroll from the real menu without blocking while approval returns to the requesting session"
+file = "packages/opencode/src/v2/menu.ts"
+old = "        : ['connect', 'disconnect'].includes(request.actionId)"
+new = "        : false"
+test_file = "packages/opencode/src/tests/opencode2-controls.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-controls.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode 2 vault Connect returns before approval and reports approved to its session$']
+
+[[control]]
+id = "setup-approved-grant-name"
+guards = "Setup grants OpenAI access to the actual approved enrollment name instead of the default proposal"
+file = "packages/opencode/src/setup.ts"
+old = 'enrolled:${grantName}'
+new = 'enrolled:${vaultEnrollmentName(host)}'
+test_file = "packages/opencode/src/tests/setup.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/setup.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^setup opencode enrollment is written exactly where the running plugin reads it$']
+
+[[control]]
 id = "opencode1-coalesced-quota"
 guards = "OpenCode 1 accepts quota without waiting for the store lock and drains every reading on dispose"
 file = "packages/opencode/src/core/pool-account-source.ts"

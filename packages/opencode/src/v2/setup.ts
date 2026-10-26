@@ -536,8 +536,8 @@ export async function setupOpenAIAuth(
     return () => installation.dispose()
   }
 
-  // The vault serves nothing until this host is enrolled as
-  // `openai-auth-opencode` (from OpenCode 1's `opencode auth login` menu).
+  // The vault serves nothing until this host is enrolled through
+  // /openai → Vault → Connect or setup.
   // Each poll reads the shared enrollment authority, so an enrollment
   // completed by another process is picked up. It is built before the
   // pool source, whose first load already asks which accounts it holds, and

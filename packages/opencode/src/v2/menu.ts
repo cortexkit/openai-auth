@@ -27,6 +27,10 @@ function allowed(request: {
         : request.actionId === 'killswitch'
     case 'session':
       return !item && request.actionId === 'clear-pin'
+    case 'vault':
+      return item
+        ? ['enable', 'disable'].includes(request.actionId)
+        : ['connect', 'disconnect'].includes(request.actionId)
     case 'diagnostics':
       return !item && ['logging', 'dump'].includes(request.actionId)
     case 'cache':

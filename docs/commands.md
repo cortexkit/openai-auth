@@ -19,7 +19,7 @@ For OpenCode 2, setup prints the detected OpenCode 2 login command and names its
 
 ## The `/openai` command
 
-On OpenCode 1, the plugin's `/openai` slash command opens its menu in the terminal UI. Its sections, in order:
+On OpenCode 1 and 2, the plugin's `/openai` slash command opens its menu in the terminal UI. Its sections, in order:
 
 | Section | What it does |
 | --- | --- |
@@ -39,7 +39,7 @@ The menu saves settings in the account pool, under `routing.mode`, `killswitch.{
 
 The eight earlier commands (`/openai-account`, `/openai-quota`, `/openai-routing`, `/openai-killswitch`, `/openai-cachekeep`, `/openai-dump`, `/openai-logging`, `/openai-reset`) are gone; their actions are sections of the menu.
 
-The menu and the sidebar are not available on [OpenCode 2](opencode-2.md) yet.
+See [OpenCode 2](opencode-2.md) for its login methods and host-specific differences.
 
 ## From a terminal, without a TUI session
 
