@@ -51,7 +51,14 @@ import {
   sidebarQuotaProjection,
 } from './sidebar-state.js'
 import { openCommandDialog } from './tui/command-dialogs.js'
-import { setupTui, type TuiTransportOptions } from './tui/v2.js'
+import {
+  POLL_FAILURE_LOG_INTERVAL_MS,
+  pollFailureClass,
+  SLOW_SERVER_MESSAGE,
+  SLOW_SERVER_POLL_FAILURES,
+  setupTui,
+  type TuiTransportOptions,
+} from './tui/v2.js'
 import {
   type AppearancePrefs,
   computeEffectiveOrder,
@@ -1337,6 +1344,10 @@ const tui: TuiPlugin = async (api) => {
     })
     let lastNotificationId = 0
     let rpcInFlight = false
+    // A stretch of consecutive failed polls ends at the next success, which
+    // re-arms the slow-server toast.
+    let rpcFailures = 0
+    let lastRpcFailureLogAt = 0
     setInterval(() => {
       if (rpcInFlight) return
       const current = (api.route as { current?: unknown }).current
@@ -1349,6 +1360,7 @@ const tui: TuiPlugin = async (api) => {
       void rpcClient
         .pending(lastNotificationId, sessionId)
         .then((messages) => {
+          rpcFailures = 0
           for (const message of [...messages].sort((a, b) => a.id - b.id)) {
             lastNotificationId = Math.max(lastNotificationId, message.id)
             const payload = message.payload
@@ -1364,7 +1376,22 @@ const tui: TuiPlugin = async (api) => {
             )
           }
         })
-        .catch(() => {})
+        .catch((error) => {
+          // The server can be absent while a location starts or is reloaded,
+          // and a busy one can fail polls in a row. After a few, say so once
+          // through the host's toast instead of staying silent, and log at
+          // most one line a minute with the error class only.
+          rpcFailures++
+          const now = Date.now()
+          if (now - lastRpcFailureLogAt >= POLL_FAILURE_LOG_INTERVAL_MS) {
+            lastRpcFailureLogAt = now
+            log.warn('OpenAI plugin poll failed', {
+              error: pollFailureClass(error),
+            })
+          }
+          if (rpcFailures === SLOW_SERVER_POLL_FAILURES)
+            api.ui.toast({ message: SLOW_SERVER_MESSAGE })
+        })
         .finally(() => {
           rpcInFlight = false
         })

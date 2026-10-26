@@ -64,7 +64,7 @@ test('OpenCode 2 command delivers the menu when the first session poll arrives l
   expect(f.host.turns).toEqual([])
 })
 
-test('OpenCode 2 command logs a bounded no-TUI refusal without queuing a menu or session input', async () => {
+test('OpenCode 2 command refusal for a missing TUI queues one notice and adds no session input', async () => {
   const f = await start()
   const began = performance.now()
   const command = f.host.commands[0]!.execute({
@@ -78,7 +78,21 @@ test('OpenCode 2 command logs a bounded no-TUI refusal without queuing a menu or
   expect(elapsed).toBeLessThan(3_000)
   expect(f.opened).toEqual([])
   expect(f.host.turns).toEqual([])
-  expect(await f.client.pending(0, 'private-session-id')).toEqual([])
+  // The refusal leaves exactly one notice for the session, which the TUI
+  // shows as a toast at its next successful poll. Draining past it prunes
+  // it, so it is shown once; it never enters the conversation.
+  const refused = await f.client.pending(0, 'private-session-id')
+  expect(refused).toHaveLength(1)
+  expect(refused[0]!.payload).toEqual({
+    command: 'openai',
+    notify: {
+      message: '/openai timed out waiting for the terminal UI. Run it again.',
+      kind: 'warning',
+    },
+  })
+  expect(await f.client.pending(refused[0]!.id, 'private-session-id')).toEqual(
+    [],
+  )
   await flushForTest()
   const log = readFileSync(f.logFile, 'utf8')
   // The sessionless poll also emits an RPC warning; count only command refusals.

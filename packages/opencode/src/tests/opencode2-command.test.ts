@@ -146,7 +146,18 @@ test('OpenCode 2 no-TUI execution makes no writes or model turns and spends noth
   await f.host.commands[0]!.execute({ sessionID: 'headless' })
   expect(f.bytes()).toEqual(before)
   expect(f.effects()).toEqual({ fetches: 0, logins: 0, turns: 0 })
-  expect(drainNotifications(0, 'headless')).toEqual([])
+  // The refusal leaves exactly one notice for the session's TUI; draining
+  // past it prunes it, so it is shown once and never enters the conversation.
+  const queued = drainNotifications(0, 'headless')
+  expect(queued).toHaveLength(1)
+  expect(queued[0]!.payload).toEqual({
+    command: 'openai',
+    notify: {
+      message: '/openai timed out waiting for the terminal UI. Run it again.',
+      kind: 'warning',
+    },
+  })
+  expect(drainNotifications(queued[0]!.id, 'headless')).toEqual([])
 })
 
 test('OpenCode 2 stand-aside registers no command while blocked migration uses the shared notice', async () => {

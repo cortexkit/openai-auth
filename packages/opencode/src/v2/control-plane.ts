@@ -90,6 +90,26 @@ export async function installControlPlane(
         !connected ||
         state.locations.get(session.location.directory) !== owner
       ) {
+        if (!connected && !owner.closed.signal.aborted) {
+          // A slow server can miss the 2 s first-poll window while the TUI
+          // keeps polling behind it. Leave a notice the TUI shows as a toast
+          // at its next successful poll, so the refusal is visible. It adds
+          // nothing to the conversation: the queue only feeds the TUI poll.
+          // Session-targeted, so the draining TUI prunes it after showing it
+          // once; the process-wide queue cap bounds it when no TUI ever
+          // drains it (QUEUE_CAP in common-auth `src/rpc/notifications.ts`).
+          pushNotification(
+            {
+              command: 'openai',
+              notify: {
+                message:
+                  '/openai timed out waiting for the terminal UI. Run it again.',
+                kind: 'warning',
+              },
+            },
+            input.sessionID,
+          )
+        }
         return refuse(
           owner.closed.signal.aborted
             ? 'location closed'

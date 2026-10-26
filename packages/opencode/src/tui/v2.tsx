@@ -1,15 +1,43 @@
 /** @jsxImportSource @opentui/solid */
 import type { Plugin } from '@opencode/plugin/tui'
 import type { JSX } from 'solid-js'
+import { createLogger } from '../logger'
 import {
   type ApplyRequest,
   type ApplyResult,
   isNotifyPayload,
   type OpenDialogPayload,
 } from '../rpc/protocol'
-import { createRpcClient } from '../rpc/rpc-client'
+import { createRpcClient, type RpcClient } from '../rpc/rpc-client'
 import { resolveRpcDir } from '../rpc/rpc-dir'
 import { openControlDialog } from './v2-dialog'
+
+/**
+ * How long one `pending` poll may take before the client gives up on it.
+ * The shared default is 2 s, which a busy OpenCode server exceeds on every
+ * poll, so a queued menu waits for a lucky fast poll. Retrying with a longer
+ * budget is safe: the server prunes only notifications at or below the
+ * client's cursor (`drainNotifications` in common-auth
+ * `src/rpc/notifications.ts`), so a reply the client never read is sent again.
+ */
+export const PENDING_POLL_TIMEOUT_MS = 15_000
+/** Consecutive failed polls before the TUI says the server is slow. */
+export const SLOW_SERVER_POLL_FAILURES = 3
+/** Poll failures log at most one line per minute, no matter how fast polls fail. */
+export const POLL_FAILURE_LOG_INTERVAL_MS = 60_000
+/** Toast shown once per stretch of failed polls, through the host's surface. */
+export const SLOW_SERVER_MESSAGE =
+  'Waiting for the OpenAI plugin: the OpenCode server is slow.'
+
+/**
+ * The error's class for poll-failure logs: never its message, which can carry
+ * the request URL with the RPC bearer token.
+ */
+export function pollFailureClass(error: unknown): string {
+  return error instanceof Error ? error.constructor.name : typeof error
+}
+
+const log = createLogger('rpc-tui')
 
 export interface TuiTransportOptions {
   /** Test-only label for proving that the host can render a sidebar component. */
@@ -22,6 +50,14 @@ export interface TuiTransportOptions {
     payload: OpenDialogPayload,
     apply: (request: Omit<ApplyRequest, 'sessionId'>) => Promise<ApplyResult>,
   ) => Promise<void>
+  /**
+   * Builds the RPC client the poll drains. Tests inject failures here; a
+   * host setup that runs again needs its own RPC client.
+   */
+  createRpcClient?: (dir: string, expectedPid?: number) => RpcClient
+  /** Timer seam so tests can drive poll cycles without wall-clock waits. */
+  setIntervalImpl?: typeof globalThis.setInterval
+  clearIntervalImpl?: typeof globalThis.clearInterval
 }
 
 const KEY = Symbol.for('cortexkit.openai-auth.v2.tui')
@@ -45,7 +81,16 @@ export async function setupTui(
   let inFlight = false
   let dialogOpen = false
   let directory = ''
-  let client: ReturnType<typeof createRpcClient> | undefined
+  let client: RpcClient | undefined
+  // Stretches of consecutive failed polls end at the next success, which
+  // re-arms both the log line and the slow-server toast.
+  let consecutiveFailures = 0
+  let lastPollFailureLogAt = 0
+  const makeClient =
+    options.createRpcClient ??
+    ((dir: string, expectedPid?: number) => createRpcClient(dir, expectedPid))
+  const setIntervalImpl = options.setIntervalImpl ?? setInterval
+  const clearIntervalImpl = options.clearIntervalImpl ?? clearInterval
   const unmount =
     options.sidebarText === undefined
       ? options.sidebar
@@ -72,14 +117,16 @@ export async function setupTui(
         directory = session.location.directory
         const resolved = await resolveRpcDir(directory)
         if (disposed) return
-        client = createRpcClient(resolved.dir, process.pid)
+        client = makeClient(resolved.dir, process.pid)
       }
       const rpc = client
       if (!rpc) return
       const messages = await rpc.pending(
         state.lastIds.get(sessionId) ?? 0,
         sessionId,
+        PENDING_POLL_TIMEOUT_MS,
       )
+      consecutiveFailures = 0
       if (
         disposed ||
         context.ui.router.current().type !== 'session' ||
@@ -107,20 +154,36 @@ export async function setupTui(
           })
         }
       }
-    } catch {
-      // The server can be absent while a location starts or is reloaded.
+    } catch (error) {
+      // The server can be absent while a location starts or is reloaded, and
+      // a busy one can fail polls in a row. Count the stretch: after a few,
+      // say so once through the host's toast instead of staying silent, and
+      // log at most one line a minute with the error class only.
+      consecutiveFailures++
+      const now = Date.now()
+      if (now - lastPollFailureLogAt >= POLL_FAILURE_LOG_INTERVAL_MS) {
+        lastPollFailureLogAt = now
+        log.warn('OpenAI plugin poll failed', {
+          error: pollFailureClass(error),
+        })
+      }
+      if (consecutiveFailures === SLOW_SERVER_POLL_FAILURES)
+        context.ui.toast.show({
+          message: SLOW_SERVER_MESSAGE,
+          sessionID: sessionId,
+        })
     } finally {
       inFlight = false
     }
   }
-  const timer = setInterval(() => {
+  const timer = setIntervalImpl(() => {
     void poll()
   }, 500)
   const mount: Mount = {
     dispose() {
       if (disposed) return
       disposed = true
-      clearInterval(timer)
+      clearIntervalImpl(timer)
       unmount?.()
       options.sidebar?.dispose()
       if (dialogOpen) context.ui.dialog.clear()

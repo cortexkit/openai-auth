@@ -14,6 +14,9 @@ export interface RpcClient {
   pending: (
     lastReceivedId: number,
     sessionId?: string,
+    // The shared client already takes a per-call timeout; the TUI's poll
+    // passes its own longer one so one slow server never looks like silence.
+    timeoutMs?: number,
   ) => Promise<RpcNotification[]>
   apply: (request: ApplyRequest, timeoutMs?: number) => Promise<ApplyResult>
 }
