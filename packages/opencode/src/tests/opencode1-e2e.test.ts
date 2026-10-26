@@ -582,6 +582,19 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 1 (real host)', () => {
               ),
             ).toBe(false)
             if (variants.length === 1) return
+            // Only a model measured to honour configuration_update keeps its
+            // opening effort and carries the change as an input item. Terra is
+            // not measured yet, so its change goes out as request-level effort.
+            if (model === 'gpt-6.1-terra') {
+              expect(bodies[1]?.reasoning).toMatchObject({ effort: 'xhigh' })
+              expect(
+                bodies[1]?.input.some(
+                  (item: Record<string, unknown>) =>
+                    item.type === 'configuration_update',
+                ),
+              ).toBe(false)
+              return
+            }
             expect(bodies[1]?.reasoning).toMatchObject({ effort: 'low' })
             expect(
               bodies[1]?.input.filter(
