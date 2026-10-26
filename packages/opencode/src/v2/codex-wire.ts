@@ -154,9 +154,10 @@ export type WireForm = 'http' | 'ws'
 
 /**
  * OpenCode 1's mid-conversation effort rule (`applyMidConversationEffort`),
- * for the models enabled in `MID_CONVERSATION_EFFORT_MODELS` when the host
- * does not carry the change itself (`HOST_EFFORT_UPDATE_MODEL`): `gpt-6.1-sol`
- * on 2.0.21, and provisionally `gpt-6.1-terra` pending live measurement.
+ * for the models where a `configuration_update` item is known to change
+ * effort (`MID_CONVERSATION_EFFORT_MODELS`) and the host does not carry the
+ * change itself (`HOST_EFFORT_UPDATE_MODEL`): `gpt-6.1-sol`, which only
+ * 2.0.21 needs it for.
  *
  * The backend keys its prompt cache on the request-level
  * `reasoning.effort`, so a session that changes effort part-way would have
