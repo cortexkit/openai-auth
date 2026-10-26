@@ -406,17 +406,15 @@ describe('provider.models filter', () => {
     })
   })
 
-  it('keeps the 5.6 family at its prior cost caps pending review', async () => {
-    // The 2026-10-26 ChatGPT rate card removes the Codex long-context
-    // multiplier. Keep the prior cost caps until they are reviewed separately;
-    // the backend accepted 861,550 input tokens from gpt-5.6-sol when measured.
+  it('gives the 5.6 family the full reported Codex window', async () => {
     const models = await surfacedModels()
-    expect(models['gpt-5.6-sol']?.limit?.input).toBeLessThan(272_000)
-    expect(models['gpt-5.6-luna']?.limit).toEqual({
-      context: 372_000,
-      input: 244_000,
-      output: 128_000,
-    })
+    for (const id of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+      expect(models[id]?.limit).toEqual({
+        context: 872_000,
+        input: 744_000,
+        output: 128_000,
+      })
+    }
   })
 
   it('gives gpt-6.1-sol the 500k context Codex uses by default', async () => {
@@ -439,15 +437,13 @@ describe('provider.models filter', () => {
     })
   })
 
-  it('surfaces gpt-6-sol and gpt-6-luna at their prior cost caps pending review', async () => {
-    // Both report astra's 872k window, but retain their prior cost caps until
-    // those are reviewed separately under the updated ChatGPT rate card.
+  it('surfaces gpt-6-sol and gpt-6-luna with the full reported Codex window', async () => {
     const models = await surfacedModels()
     for (const id of ['gpt-6-sol', 'gpt-6-luna']) {
       expect(models[id]).toBeDefined()
       expect(models[id]?.limit).toEqual({
-        context: 372_000,
-        input: 244_000,
+        context: 872_000,
+        input: 744_000,
         output: 128_000,
       })
     }
