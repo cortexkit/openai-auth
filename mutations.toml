@@ -4204,14 +4204,27 @@ expect_red = ['^OpenCode\s2\sunavailable\ssections\srefuse\ssection-only\sapplie
 id = "opencode2-no-tui-no-write"
 guards = "a headless command never starts a model turn, writes conversation messages or spends"
 file = "packages/opencode/src/v2/control-plane.ts"
-old = "      if (!owner || !isTuiConnected(input.sessionID)) return"
-new = "      if (!owner) return\n      await api.prompt({ sessionID: input.sessionID, text: 'NON-VACUITY BREAK' })"
+old = "      if (!owner) return refuse('location closed')"
+new = "      if (!owner) return refuse('location closed')\n      await api.prompt({ sessionID: input.sessionID, text: 'NON-VACUITY BREAK' })"
 test_file = "packages/opencode/src/tests/opencode2-command.test.ts"
 runner = "command"
 command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-command.test.ts", "-t", "{test}"]
 list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-command.test.ts", "-t", "{test}"]
 test_count_pattern = "Ran {count} test"
 expect_red = ['^OpenCode\s2\sno-TUI\sexecution\smakes\sno\swrites\sor\smodel\sturns\sand\sspends\snothing$']
+
+[[control]]
+id = "opencode2-no-tui-refusal-log"
+guards = "a command with no TUI logs its bounded refusal without session content or an undrainable menu"
+file = "packages/opencode/src/v2/control-plane.ts"
+old = "  log.warn(`/openai needs the terminal UI (session state: ${state}).`)"
+new = "  return // NON-VACUITY BREAK: restore the silent refusal."
+test_file = "packages/opencode/src/tests/opencode2-command-connect.test.ts"
+runner = "command"
+command = ["bun", "test", "--cwd", "packages/opencode", "./src/tests/opencode2-command-connect.test.ts", "-t", "{test}"]
+list_command = ["bun", "scripts/list-bun-tests.mjs", "--cwd", "packages/opencode", "./src/tests/opencode2-command-connect.test.ts", "-t", "{test}"]
+test_count_pattern = "Ran {count} test"
+expect_red = ['^OpenCode\s2\scommand\slogs\sa\sbounded\sno-TUI\srefusal\swithout\squeuing\sa\smenu\sor\ssession\sinput$']
 
 [[control]]
 id = "opencode2-knob-credential-scrubbing"

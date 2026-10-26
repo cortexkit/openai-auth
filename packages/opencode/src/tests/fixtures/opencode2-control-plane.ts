@@ -117,18 +117,30 @@ const sequence = async () => { try {
   const b = await (await ctx()).client.session.create()
   const c = await (await ctx()).client.session.create({ location: { directory: ${JSON.stringify(join(input.root, 'other-project'))} } })
   record('sessions', { a: a.id, b: b.id, c: c.id })
-  const invoke = async (session) => {
+  const invoke = async (session, fresh = false) => {
     const phase = ++probe.phase
-    await (await ctx()).data.session.sync(session.id)
-    ;(await ctx()).ui.router.navigate({ type: 'session', sessionID: session.id })
-    await new Promise(resolve => setTimeout(resolve, 1100))
+    const navigate = async () => {
+      await (await ctx()).data.session.sync(session.id)
+      ;(await ctx()).ui.router.navigate({ type: 'session', sessionID: session.id })
+    }
+    if (!fresh) {
+      await navigate()
+      await new Promise(resolve => setTimeout(resolve, 1100))
+    }
     const commands = await (await ctx()).client.command.list({ location: { directory: session.location.directory } })
     record('commands', { phase, count: commands.data.filter(x => x.name === 'openai').length, slots: probe.slots })
     const done = new Promise(resolve => { probe.finish = resolve })
-    await (await ctx()).client.session.command({ sessionID: session.id, name: 'openai', text: '' })
+    const command = (await ctx()).client.session.command({ sessionID: session.id, name: 'openai', text: '' })
+    if (fresh) {
+      // Dispatch from home before navigating, so the new session has no TUI poll yet.
+      record('fresh-session-command', { sessionId: session.id })
+      await new Promise(resolve => setTimeout(resolve, 150))
+      await navigate()
+    }
+    await command
     await done
   }
-  await invoke(a)
+  await invoke(a, true)
   const before = (await ctx()).themeMode
   ;(await ctx()).keymap.dispatch('theme.switch_mode')
   await invoke(b)

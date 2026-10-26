@@ -1,9 +1,10 @@
 import { adoptRpcServer } from '@cortexkit/common-auth/rpc'
 import type { Plugin } from '@opencode/plugin'
+import { createLogger } from '../logger'
 import {
   drainNotifications,
-  isTuiConnected,
   pushNotification,
+  waitForTuiConnected,
 } from '../rpc/notifications'
 import type { ApplyResult, OpenDialogPayload } from '../rpc/protocol'
 import { resolveRpcDir } from '../rpc/rpc-dir'
@@ -19,6 +20,7 @@ type Context = Pick<Plugin.Context, 'command' | 'location' | 'session'>
 type Location = {
   menu: ControlPlaneMenu
   session: Context['session']
+  closed: AbortController
   registration?: { dispose(): Promise<void> }
 }
 type Registry = {
@@ -30,6 +32,11 @@ type Registry = {
   }
 }
 const KEY = Symbol.for('cortexkit.openai-auth.v2.commands')
+const log = createLogger('v2-command')
+
+function refuse(state: string) {
+  log.warn(`/openai needs the terminal UI (session state: ${state}).`)
+}
 
 function registry(): Registry {
   const process = globalThis as typeof globalThis & { [KEY]?: Registry }
@@ -44,7 +51,11 @@ export async function installControlPlane(
 ) {
   const state = registry()
   const directory = ctx.location.directory
-  const location: Location = { menu, session: ctx.session }
+  const location: Location = {
+    menu,
+    session: ctx.session,
+    closed: new AbortController(),
+  }
   const rpcDir = await resolveRpcDir(directory)
   const rpc = await adoptRpcServer(RPC_SERVER_REGISTRY_KEY, rpcDir.dir, () =>
     startRpcServer({
@@ -59,6 +70,7 @@ export async function installControlPlane(
   )
   const previous = state.locations.get(directory)
   state.locations.set(directory, location)
+  previous?.closed.abort()
   await previous?.registration?.dispose()
   state.command ??= {
     name: 'openai',
@@ -66,10 +78,24 @@ export async function installControlPlane(
     async execute(input) {
       // Any live location can read the host's process-wide session service.
       const api = state.locations.values().next().value?.session
-      if (!api) return
+      if (!api) return refuse('no live location')
       const session = await api.get({ sessionID: input.sessionID })
       const owner = state.locations.get(session.location.directory)
-      if (!owner || !isTuiConnected(input.sessionID)) return
+      if (!owner) return refuse('location closed')
+      const connected = await waitForTuiConnected(
+        input.sessionID,
+        owner.closed.signal,
+      )
+      if (
+        !connected ||
+        state.locations.get(session.location.directory) !== owner
+      ) {
+        return refuse(
+          owner.closed.signal.aborted
+            ? 'location closed'
+            : 'no TUI poll within 2 s',
+        )
+      }
       const payload = await owner.menu.open(input.sessionID)
       pushNotification(payload, input.sessionID)
     },
@@ -80,6 +106,7 @@ export async function installControlPlane(
       editor.add(command)
     })
   } catch (error) {
+    location.closed.abort()
     if (state.locations.get(directory) === location)
       state.locations.delete(directory)
     await rpc.release()
@@ -89,6 +116,7 @@ export async function installControlPlane(
   return async () => {
     if (disposed) return
     disposed = true
+    location.closed.abort()
     if (state.locations.get(directory) === location)
       state.locations.delete(directory)
     await rpc.release()

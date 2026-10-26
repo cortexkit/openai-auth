@@ -27,6 +27,32 @@ const PROCESS_QUEUE_SCOPE: NotificationScope = {
   registrationSessionId: 'process',
 }
 
+const pollWaiters = new Map<string, Set<(connected: boolean) => void>>()
+
+/** Wait for drainNotifications to mark this session connected, without draining the queue here. */
+export function waitForTuiConnected(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false)
+  if (isTuiConnected(sessionId)) return Promise.resolve(true)
+  return new Promise((resolve) => {
+    const finish = (connected: boolean) => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
+      listeners.delete(finish)
+      if (listeners.size === 0) pollWaiters.delete(sessionId)
+      resolve(connected)
+    }
+    const abort = () => finish(false)
+    const timer = setTimeout(() => finish(false), 2_000)
+    const listeners = pollWaiters.get(sessionId) ?? new Set()
+    pollWaiters.set(sessionId, listeners)
+    listeners.add(finish)
+    signal?.addEventListener('abort', abort, { once: true })
+  })
+}
+
 export function pushNotification(
   payload: OpenDialogPayload | NotifyPayload,
   sessionId?: string,
@@ -46,11 +72,15 @@ export function drainNotifications(
 ): RpcNotification[] {
   // Only payloads built by this plugin are ever pushed: the `/openai` menu
   // and its messages.
-  return drainCommonNotifications(
+  const notifications = drainCommonNotifications(
     PROCESS_QUEUE_SCOPE,
     lastReceivedId,
     sessionId,
   ) as unknown as RpcNotification[]
+  if (sessionId !== undefined) {
+    for (const finish of pollWaiters.get(sessionId) ?? []) finish(true)
+  }
+  return notifications
 }
 
 export function isTuiConnected(sessionId: string): boolean {
@@ -58,5 +88,7 @@ export function isTuiConnected(sessionId: string): boolean {
 }
 
 export function resetNotificationsForTest(): void {
+  for (const listeners of pollWaiters.values())
+    for (const finish of listeners) finish(false)
   resetCommonNotificationsForTest(PROCESS_QUEUE_SCOPE)
 }

@@ -698,6 +698,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     expect(result.trace).toContain('"server"')
     expect(result.trace).not.toContain('"failure"')
     expect(result.trace).toContain('"event":"done"')
+    expect(result.trace).toContain('"event":"fresh-session-command"')
     const events = result.trace
       .trim()
       .split('\n')
