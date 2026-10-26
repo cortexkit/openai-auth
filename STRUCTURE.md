@@ -44,7 +44,7 @@
 │   ├── core/                      # @cortexkit/openai-auth-core (private shared core, never published)
 │   │   ├── src/                   # Shared store, OAuth, quota, commands, logger (no env reads, no host paths)
 │   │   │   ├── util/              # error.ts, record.ts, open-url.ts (shared helpers)
-│   │   │   ├── tests/             # Core bun tests + export-manifest gate
+│   │   │   ├── tests/             # Core bun tests
 │   │   │   ├── index.ts           # Command seam (buildDialogPayload, applyCommand)
 │   │   │   ├── internal.ts        # Host support (store, OAuth, quota, logger, protocol)
 │   │   │   ├── accounts.ts / provider.ts / quota-manager.ts / oauth.ts # Store, seams, quota
@@ -206,7 +206,7 @@
 
 **Tests:**
 - `packages/opencode/src/tests/` — co-located bun tests (`*.test.ts`).
-- `packages/core/src/tests/` — shared-core bun tests, including `export-manifest.test.ts` (fails when the `index.ts`/`internal.ts` exports drift from `export-manifest.ts`) and `fixtures/mock-claustrum.ts` (a Claustrum daemon stand-in speaking the real wire protocol, which the OpenCode and Pi `vault.test.ts` files drive the real client against).
+- `packages/core/src/tests/` — shared-core bun tests, including `export-surface.test.ts` (fails when the root subpath exposes a command body or a store, OAuth or reset entry point) and `fixtures/mock-claustrum.ts` (a Claustrum daemon stand-in speaking the real wire protocol, which the OpenCode and Pi `vault.test.ts` files drive the real client against).
 - `packages/core/src/tests/reset-credits.test.ts` — reset-credit listing and consumption, redemption preconditions, and atomic persisted redemption state.
 - `packages/opencode/src/tests/background-quota-refresh.test.ts` — background quota poller tests, lease renewal, and snapshot timestamp merging.
 - `packages/opencode/src/tests/sticky-routing.test.ts` — sticky-balanced selection, sustainable spend weighting, and sticky break decisions.

@@ -348,10 +348,12 @@ const HANDLED_SENTINEL = '__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__'
 let bootQuotaSeedStarted = false
 let bootQuotaSeedPromise: Promise<unknown> | undefined
 
+/** @internal Test seam; kept out of the published declarations. */
 export function __bootQuotaSeedPromiseForTest(): Promise<unknown> | undefined {
   return bootQuotaSeedPromise
 }
 
+/** @internal Test seam; kept out of the published declarations. */
 export function __resetBootQuotaSeedForTest(): void {
   bootQuotaSeedStarted = false
   bootQuotaSeedPromise = undefined
@@ -732,7 +734,9 @@ let menuContextForTest: OpenCodeMenuContext | null = null
 /**
  * Test seam: the context the latest loader run gave the `/openai` menu, so a
  * test of the loader's live gates (keep-warm, sticky pins) can drive them on
- * an install the menu itself would not open on.
+ * an install the menu itself would not open on. Kept out of the published
+ * declarations.
+ * @internal
  */
 export function __menuContextForTest(): OpenCodeMenuContext | null {
   return menuContextForTest

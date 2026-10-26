@@ -7,9 +7,6 @@
  * host visibly reaching past the command seam on `.`, which is the point of
  * keeping the two apart — the package is private, so this split is
  * documentation rather than a compatibility promise.
- *
- * `src/tests/export-manifest.ts` is the authoritative list of what this file
- * and `./index.ts` expose, and a test fails when the two disagree.
  */
 
 export {

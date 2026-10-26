@@ -12,7 +12,6 @@ import {
   generatePKCE,
   HTML_ERROR,
   HTML_SUCCESS,
-  type IdTokenClaims,
   type IngestAccount,
   OAUTH_PORT,
   parseJwtClaims,
@@ -772,18 +771,6 @@ describe('OAuth server concurrency (C1/C2)', () => {
     await expect(pending).rejects.toThrow('OAuth callback timeout')
     await expectOAuthListenersClosed()
   })
-})
-
-// ---------------------------------------------------------------------------
-// Council U1: IdTokenClaims has email
-// ---------------------------------------------------------------------------
-
-test('U1: IdTokenClaims type includes email', () => {
-  const claims: IdTokenClaims = {
-    email: 'user@example.com',
-    chatgpt_account_id: 'acc-1',
-  }
-  expect(claims.email).toBe('user@example.com')
 })
 
 // ---------------------------------------------------------------------------

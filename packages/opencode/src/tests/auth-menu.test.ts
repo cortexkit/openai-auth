@@ -2,7 +2,6 @@ import { afterEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import type { MenuTerminal } from '@cortexkit/common-auth/auth-menu'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import {
@@ -18,16 +17,6 @@ import {
   createAuthMethods,
 } from '../auth/methods'
 import { quotaMap, readJson, seedPool } from './fixtures/pool-install'
-
-/** The six actions recorded in the auth-login capture. */
-const CAPTURED_ACTIONS = [
-  'Add account',
-  'Auth current',
-  'Check quotas',
-  'Auth doctor',
-  'Apply repairs',
-  'Delete all accounts',
-]
 
 const DOWN = '\u001b[B'
 const ENTER = '\r'
@@ -287,33 +276,6 @@ describe('OpenCode auth method relocation', () => {
 })
 
 describe('OpenCode auth menu', () => {
-  test('the recorded auth-login capture still says every action reports a failed login', () => {
-    const baseline = readFileSync(
-      fileURLToPath(
-        new URL(
-          './fixtures/baselines/opencode-auth-menu.v1.18.30.txt',
-          import.meta.url,
-        ),
-      ),
-      'utf8',
-    )
-    const expectedStdout =
-      '┌  Add credential\n\u001b[?25l│\n◆  Failed to authorize\n\u001b[?25h│\n└  Done\n\n'
-
-    // The capture was taken with the six actions of the menu this one
-    // replaced; it pins what OpenCode prints for a menu result, which the
-    // shared menu returns unchanged (`menuCompletedResult`).
-    for (const action of CAPTURED_ACTIONS) {
-      const escaped = action.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      const section = baseline.match(
-        new RegExp(`\\[${escaped}\\]\\nexit_code=(\\d+)\\nstdout_json=(".*")`),
-      )
-      expect(section?.[1]).toBe('0')
-      expect(JSON.parse(section?.[2] ?? 'null')).toBe(expectedStdout)
-    }
-    expect(baseline).not.toContain('Login successful')
-  })
-
   function poolFiles() {
     const paths = tempPaths()
     return {

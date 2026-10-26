@@ -182,8 +182,6 @@ export class PiPoolSource {
     Promise<QuotaObservation | undefined>
   >()
   private readonly polled = new Set<string>()
-  /** The latest full poll snapshot per row id, for the `/openai` quota check. */
-  private readonly polledSnapshots = new Map<string, OAuthQuotaSnapshot>()
   private readonly pollOutcomes = new Map<string, PoolPollResult>()
   private disposed = false
 
@@ -227,11 +225,6 @@ export class PiPoolSource {
   /** The store the rows live in, for account management. */
   poolStore(): PoolStore {
     return this.storeFor(this.deps.paths())
-  }
-
-  /** The latest full poll snapshot of a row (reset credits, credit budget). */
-  polledSnapshot(id: string): OAuthQuotaSnapshot | undefined {
-    return this.polledSnapshots.get(id)
   }
 
   private filesKey(): string {
@@ -465,7 +458,6 @@ export class PiPoolSource {
       throw error
     }
     this.pollOutcomes.set(request.id, { id: request.id, ok: true })
-    this.polledSnapshots.set(request.id, poll.snapshot)
     const row = this.snapshot.rows.find((r) => r.id === request.id)
     if (
       row &&

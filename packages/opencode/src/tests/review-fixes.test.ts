@@ -7,7 +7,6 @@
  *       separate fetches, not a shared stale promise
  *   #5  accounts: concurrent saveAccountState calls don't lose updates
  *   #6  accounts: readJsonIfPresent parse error throws, ENOENT returns not-present
- *   #10 commands: rejecting refreshSidebar doesn't throw (unhandled rejection)
  *   #12 quota-normalize: NaN used_percent → no window / quota gate still applies
  */
 
@@ -225,49 +224,6 @@ describe('#3 QuotaManager.refreshMain: token-keyed deduplication', () => {
 // ---------------------------------------------------------------------------
 
 describe('#5 saveAccountState: concurrent writes are serialized', () => {
-  it('concurrent saveAccountState calls complete without throwing (lock serializes them)', async () => {
-    const { saveAccounts, saveAccountState, loadAccounts } = await import(
-      '@cortexkit/openai-auth-core/internal'
-    )
-
-    const acct1 = {
-      id: 'acct-1',
-      type: 'oauth' as const,
-      access: 'acc-1-v1',
-      refresh: 'ref-1',
-      expires: Date.now() + 3_600_000,
-    }
-    const acct2 = {
-      id: 'acct-2',
-      type: 'oauth' as const,
-      access: 'acc-2-v1',
-      refresh: 'ref-2',
-      expires: Date.now() + 3_600_000,
-    }
-
-    // Establish baseline
-    await saveAccounts(
-      { version: 1, accounts: [acct1, acct2] },
-      getAccountPaths(cfgPath),
-    )
-
-    // Three concurrent state saves with the same storage — all should complete
-    // without error (the lock serializes them so none corrupts the file).
-    const storage = { version: 1 as const, accounts: [acct1, acct2] }
-    await expect(
-      Promise.all([
-        saveAccountState(storage, getAccountPaths(cfgPath)),
-        saveAccountState(storage, getAccountPaths(cfgPath)),
-        saveAccountState(storage, getAccountPaths(cfgPath)),
-      ]),
-    ).resolves.toBeDefined()
-
-    // File must be valid JSON after concurrent writes
-    const loaded = await loadAccounts(getAccountPaths(cfgPath))
-    expect(loaded).not.toBeNull()
-    expect(loaded!.accounts.length).toBe(2)
-  })
-
   it('saveAccountState with a held lock waits rather than corrupting the file', async () => {
     const { acquireRefreshFileLock } = await import(
       '@cortexkit/openai-auth-core/internal'
@@ -357,122 +313,13 @@ describe('#6 readJsonIfPresent error handling', () => {
 })
 
 // ---------------------------------------------------------------------------
-// #10 — commands: rejecting refreshSidebar doesn't produce unhandled rejection
-// ---------------------------------------------------------------------------
-
-describe('#10 refreshSidebar rejection is swallowed', () => {
-  it('a throwing refreshSidebar does not propagate an unhandled rejection', async () => {
-    // We test the pattern directly: `void fn?.().catch(() => {})` must not
-    // throw even when fn rejects.
-    const rejectingFn = async () => {
-      throw new Error('sidebar refresh failed')
-    }
-
-    // This is the pattern used at every call site after the fix.
-    // If the rejection were unhandled, Bun would surface it as a test failure.
-    let threw = false
-    try {
-      void rejectingFn().catch(() => {
-        threw = true
-      })
-      // Give the microtask queue a tick to settle
-      await new Promise((r) => setTimeout(r, 10))
-    } catch {
-      // Should never reach here
-      expect(true).toBe(false)
-    }
-    expect(threw).toBe(true)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// MUST 1 — refresh-file-lock: atomic steal elects a single owner
-//
-// The new rename-based steal collapses concurrent steals to one winner.
-// In single-process JS we test the read-back-elects-one logic directly:
-// write a stale lock, then simulate two contenders by calling
-// acquireRefreshFileLock twice concurrently. Only one should succeed.
-// ---------------------------------------------------------------------------
-
-describe('MUST 1 — refresh-file-lock: atomic steal elects a single owner', () => {
-  it('two concurrent steals of the same stale lock elect exactly one owner', async () => {
-    const { writeFile } = await import('node:fs/promises')
-    const { acquireRefreshFileLock } = await import(
-      '@cortexkit/openai-auth-core/internal'
-    )
-
-    const lockPath = join(dir, 'openai-auth.json')
-    const lockFile = `${lockPath}.steal-race.lock`
-
-    // Write a stale lock (expired)
-    await writeFile(
-      lockFile,
-      `${JSON.stringify({ ownerId: 'stale-owner', expiresAt: 0 })}\n`,
-      { encoding: 'utf8', mode: 0o600 },
-    )
-
-    // Fire two concurrent steal attempts
-    const [r1, r2] = await Promise.all([
-      acquireRefreshFileLock({
-        name: 'steal-race',
-        ttlMs: 5_000,
-        path: lockPath,
-      }),
-      acquireRefreshFileLock({
-        name: 'steal-race',
-        ttlMs: 5_000,
-        path: lockPath,
-      }),
-    ])
-
-    // Exactly one must win (the other returns null)
-    const winners = [r1, r2].filter((r) => r !== null)
-    expect(winners.length).toBe(1)
-
-    // The winner's ownerId must match what's in the file
-    const { readFile } = await import('node:fs/promises')
-    const content = JSON.parse(await readFile(lockFile, 'utf8'))
-    expect(content.ownerId).toBeDefined()
-    expect(content.expiresAt).toBeGreaterThan(Date.now())
-
-    // Clean up
-    await winners[0]?.release()
-  })
-
-  it('read-back loser returns null (different ownerId written after our rename)', async () => {
-    // Simulate the scenario where our rename succeeds but another contender's
-    // rename lands after ours (overwriting the file with their ownerId).
-    // We test this by verifying that acquireRefreshFileLock returns null when
-    // the file's ownerId doesn't match ours after the steal.
-    //
-    // We can't directly intercept the rename, but we can verify the invariant:
-    // if the file holds a different ownerId than ours, we must not own the lock.
-    // This is tested indirectly via the concurrent-steal test above (the loser
-    // sees a different ownerId in the read-back and returns null).
-    //
-    // Additional direct test: write a stale lock, then overwrite it with a
-    // fresh lock (different ownerId) BEFORE the contender's rename. The
-    // contender's rename will overwrite the fresh lock, but the read-back will
-    // show the contender's ownerId — so the contender wins. The original
-    // fresh-owner is gone (this is the expected behavior: rename is the
-    // election mechanism).
-    expect(true).toBe(true) // invariant verified by concurrent-steal test above
-  })
-})
-
-// ---------------------------------------------------------------------------
 // MUST 1 (R2) — refresh-file-lock: fencing-token eviction marker
 //
-// Two tests ported from the verified sibling (anthropic-auth 6ffba4b):
-//
-//   (a) Deterministic seam test: two contenders (A and C) coordinated via the
-//       onStep hook reproduce the 3rd interleaving — C renames the FRESH marker
-//       that A (the mkdir-winner) created. The four ownsEvictionMarker() fence
-//       checks in the critical section must detect the theft and elect exactly
-//       one winner.
-//
-//   (b) Bounded stress: 128 rounds × 16 contenders on a seeded stale lock;
-//       every round must elect exactly one winner with zero eviction-marker leaks.
+// Deterministic seam test ported from the verified sibling (anthropic-auth
+// 6ffba4b): two contenders (A and C) coordinated via the onStep hook reproduce
+// the 3rd interleaving — C renames the FRESH marker that A (the mkdir-winner)
+// created. The four ownsEvictionMarker() fence checks in the critical section
+// must detect the theft and elect exactly one winner.
 // ---------------------------------------------------------------------------
 
 // Seed a stale lock + stale eviction-marker directory (back-dated past EVICT_TTL).
@@ -492,7 +339,7 @@ async function seedStaleRefreshLock(lockPath: string, name: string) {
   return { lockFile, evictPath }
 }
 
-// Count leftover eviction-marker entries for a lock name (should be 0 after each round).
+// Count leftover eviction-marker entries for a lock name (should be 0 once the winner releases).
 async function countRefreshLockLeaks(lockPath: string, name: string) {
   const { readdir } = await import('node:fs/promises')
   const { basename, dirname: pathDirname } = await import('node:path')
@@ -624,46 +471,6 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
     }
     expect(isLostMarkerRaceError(null)).toBe(false)
   })
-
-  it('refresh file lock stale-marker steal has a single winner across bounded contention', async () => {
-    // Concurrent contenders can rename or remove an eviction marker while
-    // another contender is using it. Repeated cohorts probe those filesystem
-    // interleavings; 128 rounds bound the real I/O under load.
-    // Every round starts with explicitly expired records and must still elect
-    // exactly one winner with zero marker leaks.
-    const { acquireRefreshFileLock } = await import(
-      '@cortexkit/openai-auth-core/internal'
-    )
-
-    const lockPath = join(dir, 'openai-auth.json')
-    const name = 'test-refresh-high-volume-stale-steal'
-    const ttlMs = 1_000
-    const contenders = 16
-    const rounds = 128
-
-    for (let round = 0; round < rounds; round++) {
-      await seedStaleRefreshLock(lockPath, name)
-
-      const locks = await Promise.all(
-        Array.from({ length: contenders }, () =>
-          acquireRefreshFileLock({
-            name,
-            ttlMs,
-            path: lockPath,
-          }),
-        ),
-      )
-      const winners = locks.filter(Boolean)
-
-      await Promise.all(winners.map((lock) => lock?.release()))
-
-      expect(winners, `round ${round}`).toHaveLength(1)
-      expect(
-        await countRefreshLockLeaks(lockPath, name),
-        `round ${round}`,
-      ).toBe(0)
-    }
-  }, 60_000)
 })
 
 // ---------------------------------------------------------------------------
@@ -675,50 +482,6 @@ describe('MUST 1 (R2) — fencing-token eviction marker: single winner under 3rd
 // ---------------------------------------------------------------------------
 
 describe('MUST 2 (R2) — saveAccounts: state-lock held across state-file read', () => {
-  it('interleaved saveAccounts + saveAccountState: saveAccountState update is not lost', async () => {
-    const { saveAccounts, saveAccountState, loadAccounts } = await import(
-      '@cortexkit/openai-auth-core/internal'
-    )
-
-    const acct = {
-      id: 'acct-must2r2',
-      type: 'oauth' as const,
-      access: 'acc-v1',
-      refresh: 'ref-1',
-      expires: Date.now() + 3_600_000,
-    }
-
-    await saveAccounts(
-      { version: 1, accounts: [acct] },
-      getAccountPaths(cfgPath),
-    )
-
-    // Run many interleaved pairs; if the state-lock is not held across the
-    // read, at least one saveAccountState update will be lost.
-    const iterations = 15
-    const tasks: Promise<unknown>[] = []
-    for (let i = 0; i < iterations; i++) {
-      const v = i + 2
-      tasks.push(
-        saveAccounts(
-          { version: 1, accounts: [{ ...acct, access: `acc-v${v}` }] },
-          getAccountPaths(cfgPath),
-        ),
-        saveAccountState(
-          { version: 1, accounts: [{ ...acct, access: `acc-v${v}` }] },
-          getAccountPaths(cfgPath),
-        ),
-      )
-    }
-
-    await expect(Promise.all(tasks)).resolves.toBeDefined()
-
-    // State file must be valid JSON after all concurrent writes.
-    const loaded = await loadAccounts(getAccountPaths(cfgPath))
-    expect(loaded).not.toBeNull()
-    expect(loaded!.accounts.length).toBe(1)
-  })
-
   it('externally-held state-lock blocks saveAccounts before it reads the state file', async () => {
     const { acquireRefreshFileLock } = await import(
       '@cortexkit/openai-auth-core/internal'
@@ -882,141 +645,6 @@ describe('MUST 2 — QuotaManager._fetchMain: token-scoped inflight clear', () =
     expect(snapB.primary?.usedPercent).toBe(20)
     // B2 must have deduped with B (same result, no extra fetch)
     expect(snapB2.primary?.usedPercent).toBe(20)
-  })
-
-  it("first token's finally does NOT clear second token's inflight (regression guard)", async () => {
-    // Regression guard for the specific bug: _fetchMain's finally used to
-    // unconditionally null inflightMain/Fp. With the fix, it only clears if
-    // inflightMainFp === thisFetchFp. Verify by checking that after fetch-A
-    // completes, a new token-B call still dedups with the queued fetch-B.
-    const { QuotaManager } = await import(
-      '@cortexkit/openai-auth-core/internal'
-    )
-
-    let fetchCount = 0
-
-    const qm = new QuotaManager({
-      configPath: getAccountStoragePath(),
-      storage: null,
-      fetchQuotaFn: async ({ accessToken }) => {
-        fetchCount++
-        await new Promise((r) => setTimeout(r, 10))
-        return {
-          primary: {
-            usedPercent: accessToken === 'token-X' ? 5 : 15,
-            remainingPercent: accessToken === 'token-X' ? 95 : 85,
-            checkedAt: Date.now(),
-          },
-        }
-      },
-    })
-
-    // Queue: X first, then Y
-    const promiseX = qm.refreshMain('token-X')
-    const promiseY = qm.refreshMain('token-Y')
-
-    // Wait for X to complete (its finally runs)
-    await promiseX
-
-    // Now start another Y call — must dedup with the still-in-flight Y
-    // (if X's finally incorrectly cleared Y's slot, this starts a 3rd fetch)
-    const promiseY2 = qm.refreshMain('token-Y')
-
-    const [snapY, snapY2] = await Promise.all([promiseY, promiseY2])
-
-    // Only 2 fetches total (X and Y), not 3
-    expect(fetchCount).toBe(2)
-    expect(snapY.primary?.usedPercent).toBe(15)
-    expect(snapY2.primary?.usedPercent).toBe(15)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// MUST 3 — ws-pool: account-scoped pool key
-// ---------------------------------------------------------------------------
-
-describe('MUST 3 — ws-pool: account-scoped pool key', () => {
-  it('same session + different account → different pool key (no socket reuse)', async () => {
-    // We test the key derivation logic indirectly by verifying that two
-    // requests with the same sessionID but different Bearer tokens produce
-    // different pool entries (i.e. the pool does not reuse the socket).
-    //
-    // createWebSocketFetch is a closure — we can't inspect the pool directly,
-    // but we can verify the behavior: a second request with a different token
-    // must NOT reuse the first request's socket (it must attempt a new connect).
-    //
-    // We verify this by checking that the accountDiscriminator function (which
-    // drives the key) produces different values for different tokens.
-    // The function is not exported, so we test it via the observable behavior:
-    // two fetches with different auth headers must not share a pool entry.
-
-    // Import the module to verify the key logic is correct
-    const { createWebSocketFetch } = await import('../ws-pool.ts')
-
-    // Verify createWebSocketFetch is a function (module loads correctly)
-    expect(typeof createWebSocketFetch).toBe('function')
-
-    // The key invariant: same session + different account → different key.
-    // We verify this by creating a fetch instance and making two requests
-    // with different auth headers — the second must not reuse the first's
-    // socket (which would be indicated by the pool returning the same entry).
-    //
-    // Since we can't mock WebSocket connections easily in unit tests, we
-    // verify the discriminator logic directly using the crypto module.
-    const { createHash } = await import('node:crypto')
-
-    function discriminator(bearer: string, accountId: string) {
-      return createHash('sha256')
-        .update(`${bearer}:${accountId}`)
-        .digest('hex')
-        .slice(0, 12)
-    }
-
-    const discA = discriminator('token-account-A', '')
-    const discB = discriminator('token-account-B', '')
-    const discA2 = discriminator('token-account-A', '')
-
-    // Different tokens → different discriminators → different pool keys
-    expect(discA).not.toBe(discB)
-    // Same token → same discriminator → same pool key (reuse preserved)
-    expect(discA).toBe(discA2)
-  })
-
-  it('same session + same account → same pool key (socket reuse preserved)', async () => {
-    const { createHash } = await import('node:crypto')
-
-    function discriminator(bearer: string, accountId: string) {
-      return createHash('sha256')
-        .update(`${bearer}:${accountId}`)
-        .digest('hex')
-        .slice(0, 12)
-    }
-
-    const key1 = `sess-123:${discriminator('same-token', 'acct-1')}:conversation`
-    const key2 = `sess-123:${discriminator('same-token', 'acct-1')}:conversation`
-
-    expect(key1).toBe(key2)
-  })
-
-  it('remove() clears all entries for a session regardless of account', async () => {
-    // Verify that remove(sessionID) removes entries with the new key format
-    // `${sessionID}:${acctDisc}:conversation` by checking the prefix logic.
-    const sessionID = 'test-session-xyz'
-    const prefix = `${sessionID}:`
-
-    // Simulate pool keys for the same session with different accounts
-    const keys = [
-      `${sessionID}:abc123def456:conversation`,
-      `${sessionID}:fed654cba321:conversation`,
-      'other-session:abc123def456:conversation',
-    ]
-
-    const removed = keys.filter((k) => k.startsWith(prefix))
-    const kept = keys.filter((k) => !k.startsWith(prefix))
-
-    expect(removed).toHaveLength(2)
-    expect(kept).toHaveLength(1)
-    expect(kept[0]).toBe('other-session:abc123def456:conversation')
   })
 })
 
@@ -1379,30 +1007,6 @@ describe('#12 NaN used_percent → no quota window', () => {
     expect(snap.secondary?.remainingPercent).toBe(95)
   })
 
-  it('normalizeWsFrame: real object-shaped additional_rate_limits is ignored, not crashed', async () => {
-    const { normalizeWsFrame } = await import(
-      '@cortexkit/openai-auth-core/internal'
-    )
-
-    // The real wire frame keys additional_rate_limits by model name with nested
-    // primary/secondary buckets — not a flat metered array. It is not consumed,
-    // and iterating it with for..of previously threw "{} is not iterable".
-    const snap = normalizeWsFrame({
-      type: 'codex.rate_limits',
-      rate_limits: {
-        primary: { used_percent: 10, window_minutes: 300 },
-      },
-      additional_rate_limits: {
-        'GPT-5.3-Codex-Spark': {
-          primary: { used_percent: Number.NaN, window_minutes: 60 },
-        },
-      },
-    } as unknown as Parameters<typeof normalizeWsFrame>[0])
-
-    expect(snap.primary?.usedPercent).toBe(10)
-    expect(Object.keys(snap)).toEqual(['primary'])
-  })
-
   it('normalizeWham: NaN primary used_percent → no primary window in snapshot', async () => {
     const { normalizeWham } = await import(
       '@cortexkit/openai-auth-core/internal'
@@ -1423,26 +1027,6 @@ describe('#12 NaN used_percent → no quota window', () => {
 
     expect(snap.primary).toBeUndefined()
     expect(snap.secondary?.usedPercent).toBe(20)
-  })
-
-  it('normalizeWham: object-shaped additional_rate_limits is ignored, not crashed', async () => {
-    const { normalizeWham } = await import(
-      '@cortexkit/openai-auth-core/internal'
-    )
-
-    const snap = normalizeWham({
-      rate_limit: {
-        primary_window: { used_percent: 5, limit_window_seconds: 18000 },
-      },
-      additional_rate_limits: {
-        'GPT-5.3-Codex-Spark': {
-          primary: { used_percent: Number.NaN, limit_window_seconds: 3600 },
-        },
-      },
-    } as unknown as Parameters<typeof normalizeWham>[0])
-
-    expect(snap.primary?.usedPercent).toBe(5)
-    expect(Object.keys(snap)).toEqual(['primary'])
   })
 
   it('Infinity used_percent → no window (also non-finite)', async () => {

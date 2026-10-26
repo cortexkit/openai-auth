@@ -265,7 +265,11 @@ let legacySidebarStateFile = join(
   'opencode-openai-auth',
   'sidebar-state.json',
 )
-/** Test seam: point the one-time import at a fixture instead of the temp folder. */
+/**
+ * Test seam: point the one-time import at a fixture instead of the temp folder.
+ * Kept out of the published declarations.
+ * @internal
+ */
 export function setLegacySidebarStateFileForTest(file: string): void {
   legacySidebarStateFile = file
   importedDefaultFiles.clear()

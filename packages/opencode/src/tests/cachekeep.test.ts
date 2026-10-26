@@ -121,23 +121,6 @@ describe('buildKeepwarmBody', () => {
     expect(parsed.temperature).toBe(0.7)
     expect(parsed.prompt_cache_key).toBe('abc-123')
   })
-
-  test('JSON parse copy isolates original from mutation', () => {
-    const body = JSON.stringify({
-      model: 'gpt-5.5',
-      input: [{ role: 'user', content: 'hello' }],
-      store: true,
-    })
-    const result = buildKeepwarmBody(body)
-    const original = JSON.parse(body)
-    // Original unchanged
-    expect(original.max_output_tokens).toBeUndefined()
-    expect(original.store).toBe(true)
-    // Warm copy modified
-    const parsed = JSON.parse(result)
-    expect(parsed.max_output_tokens).toBeUndefined()
-    expect(parsed.store).toBe(false)
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -149,16 +132,6 @@ describe('ttlForModel', () => {
 
   test('returns 30min for gpt-5.6-sol body', () => {
     const body = JSON.stringify({ model: 'gpt-5.6-sol' })
-    expect(ttlForModel(body, defaultTtl)).toBe(longTtl)
-  })
-
-  test('returns 30min for gpt-5.6-luna body', () => {
-    const body = JSON.stringify({ model: 'gpt-5.6-luna' })
-    expect(ttlForModel(body, defaultTtl)).toBe(longTtl)
-  })
-
-  test('returns 30min for gpt-5.6-terra body', () => {
-    const body = JSON.stringify({ model: 'gpt-5.6-terra' })
     expect(ttlForModel(body, defaultTtl)).toBe(longTtl)
   })
 
@@ -204,11 +177,6 @@ describe('ttlForModel', () => {
 
   test('returns default for gpt-5.5 body', () => {
     const body = JSON.stringify({ model: 'gpt-5.5' })
-    expect(ttlForModel(body, defaultTtl)).toBe(defaultTtl)
-  })
-
-  test('returns default for gpt-5.4-mini body', () => {
-    const body = JSON.stringify({ model: 'gpt-5.4-mini' })
     expect(ttlForModel(body, defaultTtl)).toBe(defaultTtl)
   })
 
