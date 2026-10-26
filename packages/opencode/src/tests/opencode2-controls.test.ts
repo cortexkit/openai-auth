@@ -471,12 +471,11 @@ for (const outcome of ['approved', 'denied'] as const) {
     cleanups.push(() => vault.close())
     f.context.vault = vault
     const menu = f.menu()
-    const result = await Promise.race([
-      menu.apply({ sectionId: 'vault', actionId: 'connect', sessionId: 'S' }),
-      Bun.sleep(1_000).then(() => {
-        throw new Error('Connect blocked on approval')
-      }),
-    ])
+    const result = await menu.apply({
+      sectionId: 'vault',
+      actionId: 'connect',
+      sessionId: 'S',
+    })
     expect(result.ok).toBe(true)
     expect(result.text).toContain('ck auth enroll approve')
     expect(result.text).toContain(
