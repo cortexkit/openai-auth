@@ -92,6 +92,15 @@
 // file, and the vault's `claustrum-roster` then `claustrum-roster-write` at
 // the vault roster file (both in `@cortexkit/common-auth`).
 //
+// Outside this order, and only at plugin start before this process has built
+// its store, vault or sessions stores (so it holds none of the locks above):
+// the move of the runtime files to the state home (`runtime-layout.ts`) takes
+// `runtime-layout` at the state folder's layout marker, then `save` at the old
+// state path, then `claustrum-roster-write` at the old vault roster, then
+// `sessions` at each old Codex sessions file. Every holder of those four only
+// ever waits for locks further down that list, if any, never for
+// `runtime-layout`, so the move cannot be part of a wait cycle.
+//
 // One acquisition runs against this order, and only as a try: the slot
 // refresh holds `main-refresh` (5) and tries the run lock (1) in
 // `reclaimExpiredPoolTransfer`. A run that holds the run lock and waits for

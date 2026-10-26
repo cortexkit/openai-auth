@@ -82,13 +82,15 @@ export type { RuntimeLayout }
 /** Name of the lock held while a process decides or moves the layout. */
 export const RUNTIME_LAYOUT_LOCK_NAME = 'runtime-layout'
 const LOCK_TTL_MS = 10_000
-/**
- * The layout lock is held only for a decision or a copy of a few small files;
- * a crashed holder's lease ends after `LOCK_TTL_MS`. Longer than both.
- */
-const LAYOUT_LOCK_WAIT_MS = 30_000
 /** The store's own `save` wait, which the other data locks share. */
 const DATA_LOCK_WAIT_MS = 15_000
+/**
+ * How long a starting process waits for the layout lock. A holder keeps it
+ * for a decision or a move; a move may wait `DATA_LOCK_WAIT_MS` for each of
+ * its four data locks, and a crashed holder's lease ends after `LOCK_TTL_MS`.
+ * The wait covers the longest of those before it gives up.
+ */
+const LAYOUT_LOCK_WAIT_MS = 4 * DATA_LOCK_WAIT_MS + LOCK_TTL_MS
 const LOCK_RETRY_MS = 50
 // The same budget common-auth's `replaceWindowsFile` gives a rename that
 // Windows refuses because another process has the file open.

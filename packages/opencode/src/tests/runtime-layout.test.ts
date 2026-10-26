@@ -269,7 +269,10 @@ describe('moving an existing layout', () => {
 
     // A later start: the old files changed meanwhile (they were still
     // authoritative), so the partial copies must not survive.
-    const changed = { ...files, 'openai-auth-state.json': '{"refresh":"b"}\n' }
+    const changed: Record<string, string> = {
+      ...files,
+      'openai-auth-state.json': '{"refresh":"b"}\n',
+    }
     seed(defaultConfigDir(), changed)
     rmSync(join(defaultConfigDir(), 'openai-auth-sessions.json'))
     const { 'openai-auth-sessions.json': _gone, ...remaining } = changed
@@ -473,8 +476,8 @@ describe('chosen paths and other config folders', () => {
         'openai-auth-sessions-opencode2.json': '',
       }),
     ).toEqual({
-      'openai-auth-sessions.json': s1,
-      'openai-auth-sessions-opencode2.json': s2,
+      'openai-auth-sessions.json': s1 ?? null,
+      'openai-auth-sessions-opencode2.json': s2 ?? null,
     })
     expect(existsSync(join(stateHomeDir(), 'openai-auth-state.json'))).toBe(
       false,
