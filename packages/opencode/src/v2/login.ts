@@ -61,7 +61,7 @@ export const POOL_BROWSER_METHOD = 'openai-auth-pool-browser'
 export const POOL_HEADLESS_METHOD = 'openai-auth-pool-headless'
 export const VAULT_METHOD = 'openai-auth-vault'
 export const VAULT_ACTIVATION_REFUSAL =
-  'Vault login requires this OpenCode host to be enrolled in the Claustrum vault. Connect to the vault or disconnect this host before trying again.'
+  'Vault login requires this OpenCode host to be enrolled in the Claustrum vault. Run /openai → Vault → Connect and approve the request before trying again.'
 
 export async function assertLocalPoolLogin(
   vault: Pick<OpenAiVault, 'authority'>,

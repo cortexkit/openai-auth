@@ -187,6 +187,7 @@ describe('OpenCode 2 vault activation', () => {
     await expect(
       vaultLoginMethod(vault).activate(loginContext),
     ).rejects.toThrow(VAULT_ACTIVATION_REFUSAL)
+    expect(VAULT_ACTIVATION_REFUSAL).toContain('/openai → Vault → Connect')
     expect(snapshot()).toEqual(before)
   })
 

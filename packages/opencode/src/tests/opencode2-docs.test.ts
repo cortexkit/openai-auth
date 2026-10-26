@@ -7,7 +7,7 @@ test('OpenCode 2 docs offer log level changes and request dumps with their warni
     'utf8',
   )
   const menu = doc.split('## The `/openai` menu')[1]?.split('## Sidebar')[0]
-  const unavailable = doc.split('## Not on OpenCode 2 yet')[1]
+  const unavailable = doc.split('## Not on OpenCode 2 yet')[1] ?? ''
   expect(menu).toContain('Diagnostics')
   expect(menu).toContain('set the log level')
   expect(menu).toContain('turn request dumps on and off')
@@ -18,7 +18,7 @@ test('OpenCode 2 docs offer log level changes and request dumps with their warni
   expect(menu).not.toContain('Cache, Diagnostics and Reset credits')
   expect(unavailable).not.toContain('request dumps')
   expect(unavailable).not.toContain('diagnostics actions')
-  expect(unavailable).toContain(
+  expect(unavailable).not.toContain(
     'vault enrollment and per-host account controls',
   )
   expect(unavailable).not.toContain('keep-warm')
@@ -43,7 +43,7 @@ test('OpenCode 2 docs describe the HTTP and WebSocket request shapes as availabl
   const socket = lines.find((line) =>
     line.startsWith('- **Codex request shape over the WebSocket.**'),
   )
-  const unavailable = doc.split('## Not on OpenCode 2 yet')[1]
+  const unavailable = doc.split('## Not on OpenCode 2 yet')[1] ?? ''
   expect(shape).toContain('conversation headers and tool formatting')
   expect(shape).toContain('after a server restart')
   expect(socket).toContain("OpenCode 1's WebSocket request shape")
@@ -70,7 +70,7 @@ test('OpenCode 2 docs offer reset-credit preview and confirmed redemption, and n
     'utf8',
   )
   const menu = doc.split('## The `/openai` menu')[1]?.split('## Sidebar')[0]
-  const unavailable = doc.split('## Not on OpenCode 2 yet')[1]
+  const unavailable = doc.split('## Not on OpenCode 2 yet')[1] ?? ''
   const vault = menu
     ?.split('\n')
     .find((line) => line.startsWith('While connected to the'))
@@ -83,8 +83,7 @@ test('OpenCode 2 docs offer reset-credit preview and confirmed redemption, and n
   expect(vault).toContain('Reset credits works only with local accounts')
   expect(vault).toContain('Cache shows the tracked HTTP and WebSocket sessions')
   expect(unavailable).not.toMatch(/reset.credit|redemption/i)
-  // Vault enrollment and per-host vault account controls remain unavailable.
-  expect(unavailable).toContain(
+  expect(unavailable).not.toContain(
     'vault enrollment and per-host account controls',
   )
   expect(unavailable).not.toContain('keep-warm')
@@ -97,6 +96,24 @@ test('OpenCode 2 docs offer reset-credit preview and confirmed redemption, and n
       if (/reset credit/i.test(sentence))
         expect(sentence).not.toMatch(/not available|not implemented/i)
   }
+})
+
+test('OpenCode 2 docs offer vault enrollment and per-host account controls from the running host', () => {
+  const doc = readFileSync(
+    new URL('../../../../docs/opencode-2.md', import.meta.url),
+    'utf8',
+  )
+  const menu = doc.split('## The `/openai` menu')[1]?.split('## Sidebar')[0]
+  expect(menu).toContain('Vault → **Connect**')
+  expect(menu).toContain('Approval waits in the background')
+  expect(menu).toContain('session that requested it')
+  expect(menu).toContain('Vault → **Disconnect**')
+  expect(menu).toContain('**Disable on this host** or **Enable on this host**')
+  expect(menu).toContain(
+    'Setup still requires all OpenCode and Pi processes to stop',
+  )
+  expect(menu).toContain('Windows, Linux and macOS')
+  expect(doc).not.toContain('not implemented on OpenCode 2 yet')
 })
 
 test('OpenCode 2 docs explain count placement and invisible HTTP and WebSocket warming', () => {

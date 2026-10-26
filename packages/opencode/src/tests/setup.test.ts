@@ -345,6 +345,7 @@ describe('setup', () => {
         realpath: (path) => path,
       }
       const name = `openai-auth-${host}`
+      const approvedName = `${name}-secondary`
       const connect = mock(
         async (): Promise<ClaustrumEnrollmentConnection> => ({
           enrollPropose: async (input) => {
@@ -353,7 +354,7 @@ describe('setup', () => {
           },
           enrollPoll: async () => ({
             status: 'approved',
-            name,
+            name: approvedName,
             token: '02'.repeat(32),
             tokenGeneration: 2,
           }),
@@ -364,6 +365,9 @@ describe('setup', () => {
       const setup = plugin()
       expect(setup.packages.pi).toBe(piPackage.name)
       await runSetup(setup, ['--yes', '--claustrum', '--opencode=1'], io)
+      expect(output).toContain(
+        `ck auth grant --principal enrolled:${approvedName} --selector-kind category --selector openai-native --operation read`,
+      )
       expect(connect).toHaveBeenCalledWith({
         connectionFile: join(root, 'connection.json'),
         handshakeTimeoutMs: 2000,
@@ -405,6 +409,40 @@ describe('setup', () => {
           ),
         ),
       ).toBe(false)
+    })
+  }
+
+  for (const savedProposal of [undefined, 'my-opencode-host']) {
+    test(`grant guidance explains the missing approved name and uses ${savedProposal ?? 'the default proposal'}`, async () => {
+      const stateDir = join(root, 'oc-state', 'openai-auth-vault')
+      seed(
+        join(stateDir, 'opencode-enrollment.json'),
+        JSON.stringify({ token: '03'.repeat(32), token_generation: 1 }),
+      )
+      if (savedProposal)
+        seed(
+          join(stateDir, 'opencode-enrollment-state.json'),
+          JSON.stringify({
+            version: 1,
+            phase: 'approved',
+            proposedName: savedProposal,
+            tokenGeneration: 1,
+            updatedAt: 1,
+          }),
+        )
+      await plugin().beforeRegister!('opencode', 'claustrum', {
+        ...localContext,
+        mode: 'claustrum',
+      })
+      expect(output).toContain(
+        'The enrollment state does not record an approved name',
+      )
+      expect(output).toContain(
+        'if the vault approved a different name, substitute it',
+      )
+      expect(output).toContain(
+        `ck auth grant --principal enrolled:${savedProposal ?? 'openai-auth-opencode'} --selector-kind category --selector openai-native --operation read`,
+      )
     })
   }
 

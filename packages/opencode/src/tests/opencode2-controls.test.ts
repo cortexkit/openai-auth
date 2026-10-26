@@ -8,8 +8,12 @@ import type { PoolStore } from '@cortexkit/common-auth/store'
 import {
   type IngestAccount,
   loadAccounts,
-  type OpenAiVault,
+  OpenAiVault,
 } from '@cortexkit/openai-auth-core/internal'
+import {
+  startMockDaemon,
+  vaultLogin,
+} from '../../../core/src/tests/fixtures/mock-claustrum'
 import { createOpenCodeMenu, type OpenCodeMenuContext } from '../commands'
 import { refreshSettings, resetSettingsForTest } from '../config'
 import { openAccountPool } from '../core/pool-accounts'
@@ -449,6 +453,93 @@ async function notification(session = 'S') {
   throw new Error('login did not notify')
 }
 
+for (const outcome of ['approved', 'denied'] as const) {
+  test(`OpenCode 2 vault Connect returns before approval and reports ${outcome} to its session`, async () => {
+    const f = fixture()
+    const before = f.bytes()
+    const daemon = await startMockDaemon({
+      directory: f.files.dir,
+      credentials: { 'chatgpt:openai': vaultLogin('vault-main') },
+    })
+    cleanups.push(() => daemon.stop())
+    const vault = new OpenAiVault({
+      host: 'opencode',
+      stateDir: join(f.files.dir, 'vault'),
+      connectionFile: () => daemon.connectionFile,
+      pollIntervalMs: 0,
+    })
+    cleanups.push(() => vault.close())
+    f.context.vault = vault
+    const menu = f.menu()
+    const result = await Promise.race([
+      menu.apply({ sectionId: 'vault', actionId: 'connect', sessionId: 'S' }),
+      Bun.sleep(1_000).then(() => {
+        throw new Error('Connect blocked on approval')
+      }),
+    ])
+    expect(result.ok).toBe(true)
+    expect(result.text).toContain('ck auth enroll approve')
+    expect(result.text).toContain(
+      'ck auth grant --principal enrolled:openai-auth-opencode',
+    )
+    expect(result.text).toContain('Waiting for the approval')
+    expect(daemon.proposals).toHaveLength(1)
+    const pending = (await vault.status()).enrollment
+    if (pending.state !== 'pending' || !pending.requestId)
+      throw new Error('Connect did not save a pending enrollment')
+    expect(drainNotifications(0, 'S')).toEqual([])
+    expect(
+      (await menu.open('T')).menu.sections.some((s) => s.id === 'vault'),
+    ).toBe(true)
+    if (outcome === 'approved') daemon.approve(pending.requestId)
+    else daemon.deny(pending.requestId)
+    const deadline = Date.now() + 5_000
+    let messages = drainNotifications(0, 'S')
+    while (!messages.length && Date.now() < deadline) {
+      await Bun.sleep(10)
+      messages = drainNotifications(0, 'S')
+    }
+    expect(messages).toHaveLength(1)
+    expect(messages[0]!.payload).toEqual({
+      command: 'openai',
+      notify: {
+        message:
+          outcome === 'approved'
+            ? 'Connected: the vault approved openai-auth-opencode. It serves 1 OpenAI account to this host.'
+            : 'The vault denied the enrollment request. Run Connect again to send a new one.',
+        kind: outcome === 'approved' ? 'info' : 'warning',
+      },
+    })
+    expect(drainNotifications(0, 'T')).toEqual([])
+    if (outcome === 'approved') {
+      const route = vault.snapshot()!.rows[0]!.routeId
+      for (const actionId of ['disable', 'enable']) {
+        expect(
+          (await menu.apply({ sectionId: 'vault', itemId: route, actionId }))
+            .ok,
+        ).toBe(true)
+        expect(vault.snapshot()!.rows[0]!.enabled).toBe(actionId === 'enable')
+      }
+      expect(
+        (await menu.apply({ sectionId: 'vault', actionId: 'disconnect' })).ok,
+      ).toBe(false)
+      expect(await vault.authority()).toBe('vault')
+      expect(
+        (
+          await menu.apply({
+            sectionId: 'vault',
+            actionId: 'disconnect',
+            confirmed: true,
+          })
+        ).ok,
+      ).toBe(true)
+      expect(await vault.authority()).toBe('local')
+    }
+    expect(f.writes).toEqual([])
+    expect(f.bytes()).toEqual(before)
+  }, 15_000)
+}
+
 for (const ending of [
   'close',
   'reload',
@@ -523,12 +614,23 @@ for (const enrolled of [false, true]) {
     const f = fixture(enrolled)
     const capable = await createOpenCodeMenu(f.context).open(invocation)
     const permitted = new Set(
-      rows.map(
+      [
+        ...rows,
+        { sectionId: 'vault', actionId: 'connect' },
+        { sectionId: 'vault', actionId: 'disconnect' },
+        ...['enable', 'disable'].map((actionId) => ({
+          sectionId: 'vault',
+          actionId,
+          itemId: 'vault:alpha',
+        })),
+      ].map(
         (row) =>
           `${row.sectionId}:${row.actionId}:${'itemId' in row ? 'item' : 'section'}`,
       ),
     )
-    const requests = capable.menu.sections
+    const requests: Array<
+      Pick<CommandApplyRequest, 'sectionId' | 'actionId' | 'itemId'>
+    > = capable.menu.sections
       .flatMap((section) => [
         ...section.actions.map((action) => ({
           sectionId: section.id,
@@ -549,11 +651,10 @@ for (const enrolled of [false, true]) {
           ),
       )
     requests.push(
-      { sectionId: 'vault', actionId: 'connect' },
-      { sectionId: 'vault', actionId: 'disconnect' },
+      { sectionId: 'vault', itemId: 'vault:alpha', actionId: 'connect' },
+      { sectionId: 'vault', itemId: 'vault:alpha', actionId: 'disconnect' },
       ...['enable', 'disable'].map((actionId) => ({
         sectionId: 'vault',
-        itemId: 'vault:alpha',
         actionId,
       })),
       ...['cache', 'diagnostics', 'reset'].flatMap((sectionId) =>
