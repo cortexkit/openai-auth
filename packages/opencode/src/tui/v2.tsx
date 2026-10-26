@@ -111,6 +111,24 @@ export async function setupTui(
     const sessionId = route.sessionID
     const session = context.data.session.get(sessionId)
     if (!session) return
+    // Counts one failed poll: after a few in a row the TUI says through the
+    // host's toast that the server is slow instead of staying silent, and
+    // logs at most one line a minute with the error class only.
+    const notePollFailure = (error: unknown) => {
+      consecutiveFailures++
+      const now = Date.now()
+      if (now - lastPollFailureLogAt >= POLL_FAILURE_LOG_INTERVAL_MS) {
+        lastPollFailureLogAt = now
+        log.warn('OpenAI plugin poll failed', {
+          error: pollFailureClass(error),
+        })
+      }
+      if (consecutiveFailures === SLOW_SERVER_POLL_FAILURES)
+        context.ui.toast.show({
+          message: SLOW_SERVER_MESSAGE,
+          sessionID: sessionId,
+        })
+    }
     inFlight = true
     try {
       if (directory !== session.location.directory) {
@@ -121,11 +139,27 @@ export async function setupTui(
       }
       const rpc = client
       if (!rpc) return
+      const pollStartedAt = Date.now()
       const messages = await rpc.pending(
         state.lastIds.get(sessionId) ?? 0,
         sessionId,
         PENDING_POLL_TIMEOUT_MS,
       )
+      // A poll counts as failed when it throws, or when it answers empty
+      // after taking at least its own timeout: a socket timeout resolves to
+      // no messages instead of throwing, so elapsed time is the only signal
+      // a slow server leaves. A fast empty poll is a healthy idle server.
+      if (
+        messages.length === 0 &&
+        Date.now() - pollStartedAt >= PENDING_POLL_TIMEOUT_MS
+      ) {
+        notePollFailure(
+          new Error(
+            `RPC pending poll timed out after ${PENDING_POLL_TIMEOUT_MS} ms`,
+          ),
+        )
+        return
+      }
       consecutiveFailures = 0
       if (
         disposed ||
@@ -155,23 +189,8 @@ export async function setupTui(
         }
       }
     } catch (error) {
-      // The server can be absent while a location starts or is reloaded, and
-      // a busy one can fail polls in a row. Count the stretch: after a few,
-      // say so once through the host's toast instead of staying silent, and
-      // log at most one line a minute with the error class only.
-      consecutiveFailures++
-      const now = Date.now()
-      if (now - lastPollFailureLogAt >= POLL_FAILURE_LOG_INTERVAL_MS) {
-        lastPollFailureLogAt = now
-        log.warn('OpenAI plugin poll failed', {
-          error: pollFailureClass(error),
-        })
-      }
-      if (consecutiveFailures === SLOW_SERVER_POLL_FAILURES)
-        context.ui.toast.show({
-          message: SLOW_SERVER_MESSAGE,
-          sessionID: sessionId,
-        })
+      // The server can be absent while a location starts or is reloaded.
+      notePollFailure(error)
     } finally {
       inFlight = false
     }

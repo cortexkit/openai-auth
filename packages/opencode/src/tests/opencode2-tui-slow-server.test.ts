@@ -74,6 +74,7 @@ function fakeClient(options: {
   timeouts: Array<number | undefined>
   menu: RpcNotification[]
   failure?: () => Error
+  onPending?: () => void
 }): RpcClient {
   let menuSent = false
   return {
@@ -82,6 +83,7 @@ function fakeClient(options: {
       _sessionId?: string,
       timeoutMs?: number,
     ) {
+      options.onPending?.()
       options.timeouts.push(timeoutMs)
       if (options.failuresLeft.count > 0) {
         options.failuresLeft.count--
@@ -167,6 +169,67 @@ test('OpenCode 2 TUI shows one slow-server toast after failed polls, then opens 
     expect(toasts).toHaveLength(1)
     // Every poll passed the longer timeout, not the shared 2 s default.
     expect(timeouts).toEqual(Array(timeouts.length).fill(POLL_TIMEOUT_MS))
+  } finally {
+    dispose()
+  }
+})
+
+test('OpenCode 2 TUI counts an empty poll that takes its whole timeout as failed', async () => {
+  const file = await logFile()
+  const toasts: Array<{ message: string; sessionID?: string }> = []
+  // The poll measures elapsed time with Date.now, so the test moves the
+  // same clock the poll reads: slow calls take the poll's whole timeout.
+  let now = 2_000_000
+  const clock = spyOn(Date, 'now').mockImplementation(() => now)
+  cleanups.push(() => clock.mockRestore())
+  // Calls 0, 1, 2, 4 and 5 answer empty only after the timeout elapses, as
+  // a real socket timeout does; call 3 answers empty at once, like a
+  // healthy idle server, and must not count as a failure.
+  const slowCalls = new Set([0, 1, 2, 4, 5])
+  let calls = 0
+  const timers = fakeTimers()
+  const dispose = await setupTui(
+    fakeContext('slow-empty-session', 'slow-empty-directory', toasts),
+    {
+      createRpcClient: () =>
+        fakeClient({
+          failuresLeft: { count: 0 },
+          timeouts: [],
+          menu: [],
+          onPending: () => {
+            if (slowCalls.has(calls)) now += POLL_TIMEOUT_MS
+            calls++
+          },
+        }),
+      openDialog: async () => {},
+      setIntervalImpl: timers.setIntervalImpl,
+      clearIntervalImpl: timers.clearIntervalImpl,
+    },
+  )
+  cleanups.push(dispose)
+  try {
+    // The initial poll runs at setup; the rest are driven by hand.
+    await settle()
+    for (let i = 0; i < 5; i++) {
+      timers.callbacks[0]!()
+      await settle()
+    }
+    // Three consecutive slow empty polls: exactly one toast. The fast empty
+    // poll in the middle reset the stretch, so the last two slows stay quiet.
+    expect(toasts).toEqual([
+      { message: SLOW_SERVER_TOAST, sessionID: 'slow-empty-session' },
+    ])
+    // The slow polls logged with the timeout error class only: no request
+    // URL, no bearer token. The minute boundary falls inside the stretch,
+    // so exactly two lines were written.
+    await flushForTest()
+    const logged = readFileSync(file, 'utf8')
+    const failures = logged
+      .split('\n')
+      .filter((line) => line.includes('poll failed'))
+    expect(failures).toHaveLength(2)
+    expect(logged).toContain('"error":"Error"')
+    expect(logged).not.toContain('pending-notifications')
   } finally {
     dispose()
   }

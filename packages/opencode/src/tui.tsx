@@ -26,7 +26,7 @@ import {
 } from 'solid-js'
 import { createLogger } from './logger.js'
 import { type ApplyRequest, isNotifyPayload } from './rpc/protocol.js'
-import { createRpcClient } from './rpc/rpc-client.js'
+import { createRpcClient, DEFAULT_RPC_TIMEOUT_MS } from './rpc/rpc-client.js'
 import { resolveRpcDir } from './rpc/rpc-dir.js'
 import {
   type AccountQuota,
@@ -1348,6 +1348,21 @@ const tui: TuiPlugin = async (api) => {
     // re-arms the slow-server toast.
     let rpcFailures = 0
     let lastRpcFailureLogAt = 0
+    // Counts one failed poll: a throw, or an empty answer after taking at
+    // least the poll's own timeout (a socket timeout resolves to no messages
+    // instead of throwing, so elapsed time is the slow server's only signal).
+    const noteRpcPollFailure = (error: unknown) => {
+      rpcFailures++
+      const now = Date.now()
+      if (now - lastRpcFailureLogAt >= POLL_FAILURE_LOG_INTERVAL_MS) {
+        lastRpcFailureLogAt = now
+        log.warn('OpenAI plugin poll failed', {
+          error: pollFailureClass(error),
+        })
+      }
+      if (rpcFailures === SLOW_SERVER_POLL_FAILURES)
+        api.ui.toast({ message: SLOW_SERVER_MESSAGE })
+    }
     setInterval(() => {
       if (rpcInFlight) return
       const current = (api.route as { current?: unknown }).current
@@ -1357,9 +1372,21 @@ const tui: TuiPlugin = async (api) => {
         resolved as { params?: { sessionID?: string } } | undefined
       )?.params?.sessionID
       rpcInFlight = true
+      const pollStartedAt = Date.now()
       void rpcClient
         .pending(lastNotificationId, sessionId)
         .then((messages) => {
+          if (
+            messages.length === 0 &&
+            Date.now() - pollStartedAt >= DEFAULT_RPC_TIMEOUT_MS
+          ) {
+            noteRpcPollFailure(
+              new Error(
+                `RPC pending poll timed out after ${DEFAULT_RPC_TIMEOUT_MS} ms`,
+              ),
+            )
+            return
+          }
           rpcFailures = 0
           for (const message of [...messages].sort((a, b) => a.id - b.id)) {
             lastNotificationId = Math.max(lastNotificationId, message.id)
@@ -1377,20 +1404,8 @@ const tui: TuiPlugin = async (api) => {
           }
         })
         .catch((error) => {
-          // The server can be absent while a location starts or is reloaded,
-          // and a busy one can fail polls in a row. After a few, say so once
-          // through the host's toast instead of staying silent, and log at
-          // most one line a minute with the error class only.
-          rpcFailures++
-          const now = Date.now()
-          if (now - lastRpcFailureLogAt >= POLL_FAILURE_LOG_INTERVAL_MS) {
-            lastRpcFailureLogAt = now
-            log.warn('OpenAI plugin poll failed', {
-              error: pollFailureClass(error),
-            })
-          }
-          if (rpcFailures === SLOW_SERVER_POLL_FAILURES)
-            api.ui.toast({ message: SLOW_SERVER_MESSAGE })
+          // The server can be absent while a location starts or is reloaded.
+          noteRpcPollFailure(error)
         })
         .finally(() => {
           rpcInFlight = false
