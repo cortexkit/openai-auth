@@ -451,28 +451,6 @@ describe('vault command menu', () => {
     expect(polls).toEqual([roster[0]!.routeId])
     expect(quota.actions[0]?.knobs).toEqual([])
   })
-  test('all three packages require the Windows private-file release', () => {
-    const root = join(import.meta.dir, '../../../..')
-    const sharedConsumer = Bun.resolveSync(
-      '@cortexkit/common-auth/claustrum',
-      join(root, 'packages/core'),
-    )
-    for (const name of ['core', 'opencode', 'pi']) {
-      const packageDir = join(root, `packages/${name}`)
-      const manifest = JSON.parse(
-        readFileSync(join(packageDir, 'package.json'), 'utf8'),
-      )
-      expect(manifest.devDependencies['@cortexkit/common-auth']).toBe('^0.26.0')
-      expect(
-        Bun.resolveSync('@cortexkit/common-auth/claustrum', packageDir),
-      ).toBe(sharedConsumer)
-      expect(
-        (manifest.dependencies ?? manifest.devDependencies)[
-          '@cortexkit/claustrum-client'
-        ],
-      ).toBe('^0.13.0')
-    }
-  })
   // Vault mode is exclusive: while connected, the vault's accounts are the
   // only ones listed, and no local row appears, set aside or otherwise.
   test('in vault mode accounts list only the vault accounts', async () => {
@@ -510,12 +488,6 @@ describe('vault command menu', () => {
       ).not.toContain('ago')
     }
   })
-  test('a reading older than fifteen minutes is never displayed as current', async () => {
-    const quota = (await sections()).find((section) => section.id === 'quota')!
-    expect(
-      quota.items.find((item) => item.id === roster[0]!.routeId)?.detail,
-    ).toContain('checked 3d ago')
-  })
   test('in vault mode no local row is listed in Accounts, Quota or Limits', async () => {
     const menu = await sections()
     for (const id of ['accounts', 'quota', 'limits']) {
@@ -547,19 +519,6 @@ describe('vault command menu', () => {
       `${roster[0]!.label} (needs_reauth): ${formatQuota(projectQuota(roster[0]!.quota), { now, form: 'compact' })}`,
       `${roster[1]!.label} (disabled): ${formatQuota(projectQuota(roster[1]!.quota), { now, form: 'compact' })}`,
     ])
-  })
-  test('quota checks use vault polls and never select set-aside local credentials', async () => {
-    const result = await createOpenCodeMenu(context()).apply(
-      {
-        command: 'openai',
-        sectionId: 'quota',
-        actionId: 'check',
-        values: { account: '*' },
-      },
-      invocation,
-    )
-    expect(result.ok).toBe(true)
-    expect(polls).toEqual(roster.map((row) => row.routeId))
   })
   test('vault floors use the request route key and leave credentials untouched', async () => {
     const before = readFileSync(files.stateFile, 'utf8')

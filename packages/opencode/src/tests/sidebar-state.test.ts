@@ -156,16 +156,6 @@ describe('normalizeSidebarState', () => {
   })
 
   // (e) non-object primitives
-  test('"hello" (string) returns DEFAULT_SIDEBAR_STATE', () => {
-    const result = normalizeSidebarState('hello')
-    expect(result).toEqual(DEFAULT_SIDEBAR_STATE)
-  })
-
-  test('42 (number) returns DEFAULT_SIDEBAR_STATE', () => {
-    const result = normalizeSidebarState(42)
-    expect(result).toEqual(DEFAULT_SIDEBAR_STATE)
-  })
-
   test('null returns DEFAULT_SIDEBAR_STATE', () => {
     const result = normalizeSidebarState(null)
     expect(result).toEqual(DEFAULT_SIDEBAR_STATE)

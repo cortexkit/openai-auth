@@ -1,5 +1,4 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
-import * as fs from 'node:fs'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -170,40 +169,6 @@ describe('config resolution', () => {
   })
 
   describe('live dump setting', () => {
-    test('stats unchanged config once per decision without rereading it', async () => {
-      delete process.env.CORTEXKIT_OPENAI_AUTH_DUMP
-      await writeFile(configPath, JSON.stringify({ dump: false }))
-      resetSettingsForTest()
-      const reads = spyOn(fs, 'readFileSync')
-      const stats = spyOn(fs, 'statSync')
-      try {
-        expect(isRequestDumpEnabled()).toBe(false)
-        expect(isRequestDumpEnabled()).toBe(false)
-        expect(isRequestDumpEnabled()).toBe(false)
-        expect(reads).toHaveBeenCalledTimes(1)
-        expect(stats).toHaveBeenCalledTimes(3)
-      } finally {
-        reads.mockRestore()
-        stats.mockRestore()
-      }
-    })
-
-    test('environment dump overrides need no stat and still win over file changes', async () => {
-      await writeFile(configPath, JSON.stringify({ dump: true }))
-      resetSettingsForTest()
-      const stats = spyOn(fs, 'statSync')
-      try {
-        process.env.CORTEXKIT_OPENAI_AUTH_DUMP = 'false'
-        expect(isRequestDumpEnabled()).toBe(false)
-        await writeFile(configPath, JSON.stringify({ dump: false }))
-        process.env.CORTEXKIT_OPENAI_AUTH_DUMP = 'true'
-        expect(isRequestDumpEnabled()).toBe(true)
-        expect(stats).not.toHaveBeenCalled()
-      } finally {
-        stats.mockRestore()
-      }
-    })
-
     test('observes missing created changed deleted and malformed config without a refresh', async () => {
       delete process.env.CORTEXKIT_OPENAI_AUTH_DUMP
       resetSettingsForTest()

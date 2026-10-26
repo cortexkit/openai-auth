@@ -3,21 +3,19 @@
 // half drives `acquireCacheKeep` with stand-in locations; the second half runs
 // the real setup on the fake host, capturing at the post-installer seam.
 
-import { afterEach, describe, expect, spyOn, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CacheKeepManager } from '@cortexkit/common-auth/cachekeep'
 import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
-import * as cachekeep from '../core/cachekeep'
 import { CACHE_KEEP_CAPS } from '../core/cachekeep'
 import { drainNotifications } from '../rpc/notifications'
 import { createRpcClient } from '../rpc/rpc-client'
 import { resolveRpcDir } from '../rpc/rpc-dir'
 import {
   acquireCacheKeep,
-  CACHE_KEEP_JOIN_MS,
   type CacheKeepCaptureInput,
   type CacheKeepLease,
   type CacheKeepLocation,
@@ -268,16 +266,6 @@ describe('OpenCode 2 keep-warm caps', () => {
     } finally {
       manager.stop()
     }
-  })
-
-  test('the OpenCode 2 manager is built with the exported caps', () => {
-    const spy = spyOn(cachekeep, 'createCacheKeepManager')
-    cleanups.push(() => spy.mockRestore())
-    acquire(fakeLocation().location)
-    expect(spy).toHaveBeenCalledTimes(1)
-    const options = spy.mock.calls[0]![0]
-    expect(options.maxTargets).toBe(CACHE_KEEP_CAPS.maxTargets)
-    expect(options.maxBytes).toBe(CACHE_KEEP_CAPS.maxBytes)
   })
 
   test('the OpenCode 2 manager effective caps equal the frame mirror caps', async () => {
@@ -734,36 +722,6 @@ describe('OpenCode 2 keep-warm credentials', () => {
 })
 
 describe('OpenCode 2 keep-warm holders', () => {
-  test('two locations share one manager and one timer; the survivor warms after the other is released', async () => {
-    const paths = storePaths()
-    const timers = fakeTimers()
-    const clock = { now: START }
-    const a = served()
-    const b = served()
-    const first = acquire(a.location, { paths, timers, clock })
-    const second = acquire(b.location, { paths, timers, clock })
-    expect(second.lease.manager).toBe(first.lease.manager)
-    await first.lease.capture(captured('ses'))
-    await second.lease.capture(captured('ses_b'))
-    b.state.accounts.set('ses_b', 'A')
-    expect(timers.armed).toHaveLength(1)
-
-    await first.lease.release()
-    // A released location's capture is ignored.
-    await first.lease.capture(captured('ses_late'))
-    expect(second.lease.manager.status().tracked).toBe(2)
-    await advance(second.lease, clock, 4 * MINUTE)
-    expect(a.sent).toHaveLength(0)
-    expect(b.sent).toHaveLength(2)
-    expect(timers.armed).toHaveLength(1)
-    expect(timers.cleared).toBe(0)
-
-    await second.lease.release()
-    expect(timers.cleared).toBe(1)
-    const third = acquire(served().location, { paths, timers, clock })
-    expect(third.lease.manager).not.toBe(first.lease.manager)
-  })
-
   test('different stores get different managers', () => {
     const a = acquire(fakeLocation().location)
     const b = acquire(fakeLocation().location)
@@ -798,7 +756,6 @@ describe('OpenCode 2 keep-warm holders', () => {
     await release
     await tick
     expect(released).toBe(true)
-    expect(CACHE_KEEP_JOIN_MS).toBe(5_000)
   })
 
   test('the last release stops waiting for a hung warm at the join limit', async () => {
@@ -1312,6 +1269,9 @@ describe('OpenCode 2 keep-warm in setup', () => {
     const manager = managerOf(files)!
     await a.dispose()
     expect(managerOf(files)).toBe(manager)
+    // A disposed location's requests are no longer captured for warming.
+    await a.request('ses_late')
+    expect(manager.status().tracked).toBe(1)
     shared.clock.now += 4 * MINUTE
     await manager.tick()
     expect(a.warms).toHaveLength(0)

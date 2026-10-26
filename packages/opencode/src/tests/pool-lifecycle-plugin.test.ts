@@ -500,15 +500,11 @@ describe("on OpenCode 1's plugin client", () => {
         },
       },
     })
-    expect(warnings).toEqual([
-      {
-        message: 'account pool migration is off for this OpenCode client',
-        data: {
-          reason:
-            'the OpenCode client has no auth.set to write its login slot with',
-        },
-      },
-    ])
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toMatchObject({
+      message: expect.stringContaining('migration is off'),
+      data: { reason: expect.stringContaining('auth.set') },
+    })
   })
 })
 

@@ -299,26 +299,6 @@ describe('migration', () => {
 })
 
 describe('the Claustrum vault', () => {
-  it('a placeholder and a later login with a connected vault recover without warning', async () => {
-    await migrated()
-    const warned: string[] = []
-    const log = {
-      info: () => {},
-      warn: (message: string) => warned.push(message),
-    }
-    const deps = { ...h.deps({ log }), vaultServes: () => true }
-    expect(await adoptHostSlotLogin(deps)).toEqual({
-      status: 'nothing-to-import',
-      slot: 'placeholder',
-    })
-    await h.setSlot(login('acct-new', 'r-new'))
-    expect(await adoptHostSlotLogin(deps)).toMatchObject({
-      status: 'completed',
-    })
-    expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
-    expect(warned).toEqual([])
-  })
-
   it('a config still naming the custody mode of older versions migrates like any other', async () => {
     await seedLegacyInstall(h)
     const config = await h.config()

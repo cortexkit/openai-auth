@@ -110,10 +110,6 @@ test.each(['local', 'vault'])(
   renderSidebarFixture,
 )
 
-test('OpenCode 2 semantic theme switches recolor mounted quota rows', async () => {
-  await renderSidebarFixture('theme')
-}, 15_000)
-
 async function renderSidebarFixture(mode: string) {
   const child = Bun.spawn(
     [

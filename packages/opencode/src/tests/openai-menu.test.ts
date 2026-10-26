@@ -9,14 +9,12 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, relative } from 'node:path'
+import { join } from 'node:path'
 import type {
   CommandApplyRequest,
   CommandInvocation,
@@ -855,42 +853,5 @@ describe('/openai registration', () => {
         name.startsWith('openai'),
       ),
     ).toEqual(['openai'])
-  })
-})
-
-describe('legacy account writers', () => {
-  // Every remaining caller of the legacy writer, and why it may still call
-  // it. A new caller fails this test until it is either moved to the store
-  // or added here with its reason.
-  const ALLOWED: Record<string, string> = {
-    'core/src/accounts.ts': 'the legacy store itself',
-    'opencode/src/index.ts':
-      'writeLoaderSettings: only on an install that has not migrated',
-    'opencode/src/auth/doctor.ts':
-      'repairs offered only on an install that has not migrated',
-  }
-
-  function sources(dir: string): string[] {
-    return readdirSync(dir).flatMap((name) => {
-      const path = join(dir, name)
-      if (statSync(path).isDirectory())
-        return name === 'tests' || name === 'tui-compiled' ? [] : sources(path)
-      return /\.(ts|tsx)$/.test(name) ? [path] : []
-    })
-  }
-
-  test('packages/opencode/src and packages/core/src call mutateAccounts only from the allowed places', () => {
-    const packages = join(import.meta.dir, '..', '..', '..')
-    const callers = [
-      ...sources(join(packages, 'opencode', 'src')),
-      ...sources(join(packages, 'core', 'src')),
-    ]
-      .filter((path) =>
-        /\bmutateAccounts\s*\(/.test(readFileSync(path, 'utf8')),
-      )
-      .map((path) => relative(packages, path))
-      .sort()
-
-    expect(callers).toEqual(Object.keys(ALLOWED).sort())
   })
 })

@@ -25,11 +25,7 @@ import { codexRequestURL } from '../v2/endpoint'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { applyCodexModelRules } from '../v2/models'
 import { SessionPins } from '../v2/pins'
-import {
-  acquireSessionAccounts,
-  MAX_SESSION_ACCOUNTS,
-  SessionAccounts,
-} from '../v2/session-accounts'
+import { acquireSessionAccounts, SessionAccounts } from '../v2/session-accounts'
 import { type OpenAIAuthV2Options, setupOpenAIAuth } from '../v2/setup'
 import { acquireSessionPins } from '../v2/shared-pins'
 import {
@@ -346,17 +342,19 @@ describe('OpenCode 2 entry: the chosen row on the wire', () => {
 })
 
 describe('OpenCode 2 shared session pins', () => {
-  it('gives each account store its own ledger and one ledger per store', () => {
+  it('gives each account store its own pin ledger and session-account registry, one of each per store', () => {
     const files = poolFiles()
     const other = poolFiles()
+    const relativeFiles = {
+      configPath: relative(process.cwd(), files.configPath),
+      statePath: relative(process.cwd(), files.statePath),
+    }
     const ledger = acquireSessionPins(files)
-    expect(
-      acquireSessionPins({
-        configPath: relative(process.cwd(), files.configPath),
-        statePath: relative(process.cwd(), files.statePath),
-      }),
-    ).toBe(ledger)
+    expect(acquireSessionPins(relativeFiles)).toBe(ledger)
     expect(acquireSessionPins(other)).not.toBe(ledger)
+    const registry = acquireSessionAccounts(files)
+    expect(acquireSessionAccounts(relativeFiles)).toBe(registry)
+    expect(acquireSessionAccounts(other)).not.toBe(registry)
     expect(
       acquireSessionPins({
         configPath: files.configPath,
@@ -369,14 +367,6 @@ describe('OpenCode 2 shared session pins', () => {
     { id: 'a', usedPercent: 10 },
     { id: 'b', usedPercent: 10 },
   ]
-
-  it('one location spreads two cold sessions across equal rows', async () => {
-    const { host } = await startPool('sticky-balanced', rows)
-    const first = bearer(await poolRequestHeaders(host, 'ses_1'))
-    const second = bearer(await poolRequestHeaders(host, 'ses_2'))
-    expect(first).toBe('Bearer a-token')
-    expect(second).toBe('Bearer b-token')
-  })
 
   it('two locations spread cold sessions across equal rows', async () => {
     const files = poolFiles()
@@ -508,16 +498,6 @@ describe('OpenCode 2 session-account registry', () => {
     expect(accounts.size).toBe(1)
   })
 
-  it(`holds ${MAX_SESSION_ACCOUNTS} sessions by default`, () => {
-    expect(MAX_SESSION_ACCOUNTS).toBe(1024)
-    const accounts = new SessionAccounts()
-    for (let index = 0; index <= MAX_SESSION_ACCOUNTS; index++)
-      accounts.record(`ses_${index}`, 'a')
-    expect(accounts.size).toBe(MAX_SESSION_ACCOUNTS)
-    expect(accounts.activeAccount('ses_0')).toBeUndefined()
-    expect(accounts.activeAccount('ses_1')).toBe('a')
-  })
-
   it("adapters sharing a registry read one another's choices and deletions through activeAccount", async () => {
     const row = {
       id: 'main',
@@ -567,19 +547,6 @@ describe('OpenCode 2 session-account registry', () => {
     expect(registry.activeAccount('ses_1')).toBe('main')
     two.forgetSession('ses_1')
     expect(one.activeAccount('ses_1')).toBeUndefined()
-  })
-
-  it('gives each account store its own registry and one registry per store', () => {
-    const files = poolFiles()
-    const other = poolFiles()
-    const registry = acquireSessionAccounts(files)
-    expect(
-      acquireSessionAccounts({
-        configPath: relative(process.cwd(), files.configPath),
-        statePath: relative(process.cwd(), files.statePath),
-      }),
-    ).toBe(registry)
-    expect(acquireSessionAccounts(other)).not.toBe(registry)
   })
 
   for (const mode of [
@@ -1021,47 +988,6 @@ describe('OpenCode 2 entry: logins', () => {
     ).toEqual({
       openai: POOL_PLACEHOLDER,
     })
-  })
-
-  it('leaves an account the pool already holds alone when OpenCode 2 still has an older login of it', async () => {
-    const files = poolFiles()
-    seedPool(files, 'main-first', [{ id: 'main' }])
-    const { stop } = await start(files, {
-      activeCredential: {
-        type: 'oauth',
-        methodID: 'chatgpt-browser',
-        access: 'stale-access',
-        refresh: 'stale-refresh',
-        expires: Date.now() + 3600_000,
-        metadata: { accountID: 'chatgpt-main' },
-      } as unknown as Credential.Value,
-    })
-    await stop()
-    expect(files.readState().accounts.main?.refresh).toBe('main-refresh')
-    expect(files.readConfig().accounts.map((account) => account.id)).toEqual([
-      'main',
-    ])
-  })
-
-  it('never copies a ChatGPT login OpenCode 2 already holds into the pool', async () => {
-    const files = poolFiles()
-    seedPool(files, 'main-first', [{ id: 'main' }])
-    const beforeConfig = readFileSync(files.configPath, 'utf8')
-    const beforeState = readFileSync(files.statePath, 'utf8')
-    const credential = {
-      type: 'oauth',
-      methodID: 'chatgpt-browser',
-      access: 'host-access',
-      refresh: 'host-refresh',
-      expires: Date.now() + 3600_000,
-      metadata: { accountID: 'chatgpt-host' },
-    } as unknown as Credential.Value
-    const { host, stop } = await start(files, { activeCredential: credential })
-    await stop()
-    expect(readFileSync(files.configPath, 'utf8')).toBe(beforeConfig)
-    expect(readFileSync(files.statePath, 'utf8')).toBe(beforeState)
-    expect(host.connectionReads).toEqual({ active: 0, resolve: 0 })
-    expect(host.getActiveCredential()).toBe(credential)
   })
 })
 

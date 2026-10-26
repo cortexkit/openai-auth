@@ -82,13 +82,15 @@ describe('first quota reading admission', () => {
   test('unknown quota still refuses when no first reading arrives within the bound', async () => {
     const routing = input(() => new Promise<void>(() => {}))
     const start = Date.now()
-    await waitForFirstQuotaReading(routing)
-    expect(Date.now() - start).toBeGreaterThanOrEqual(4_900)
+    // A short bound stands in for the 5 s production default: the property is
+    // that the wait ends at the bound and the row still refuses.
+    await waitForFirstQuotaReading(routing, 50)
+    expect(Date.now() - start).toBeGreaterThanOrEqual(45)
     expect(plan(routing)).toEqual({
       kind: 'block',
       block: { reason: 'quota-unknown' },
     })
-  }, 8_000)
+  })
 
   test('an unreadable first reading still refuses without trusting pull completion', async () => {
     const failed = Promise.reject(new Error('unreadable'))

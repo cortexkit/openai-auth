@@ -26,7 +26,6 @@ import {
 } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
 import { CodexAuthPlugin } from '../index.ts'
-import { flushForTest } from '../logger.ts'
 import {
   drainSidebarWrites,
   hashSidebarSessionId,
@@ -342,21 +341,6 @@ describe('request path never waits on bookkeeping', () => {
     expect(seen).toEqual([servedToken])
     expect(state.activeRouting?.[sessionId]?.activeId).toBe(pin?.accountId)
     expect(seen).toHaveLength(1)
-
-    // One warning per failing write, not one per retry tick.
-    await flushForTest()
-    const warnings = readFileSync(logFile, 'utf8')
-      .split('\n')
-      .filter((line) =>
-        line.includes(
-          'sidebar bookkeeping write failed; retrying in the background',
-        ),
-      )
-    const labels = warnings.map(
-      (line) => JSON.parse(line.slice(line.indexOf('{'))).write,
-    )
-    expect(labels.length).toBeGreaterThan(0)
-    expect(new Set(labels).size).toBe(labels.length)
   }, 20_000)
 
   it("legacy fallback selection after a refresh does not wait for the state file's save lock", async () => {

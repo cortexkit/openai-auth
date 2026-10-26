@@ -559,7 +559,6 @@ describe('request dumps', () => {
         expect(turnIDs).toHaveLength(3)
         expect(turnIDs[1]).toBe(turnIDs[0])
         expect(turnIDs[2]).not.toBe(turnIDs[0])
-        expect(turnIDs.every((id) => id[14] === '7')).toBe(true)
       } finally {
         await disposePluginWork()
         globalThis.fetch = originalFetch

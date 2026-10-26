@@ -315,11 +315,11 @@ describe('#6 readJsonIfPresent error handling', () => {
 // ---------------------------------------------------------------------------
 // MUST 1 (R2) — refresh-file-lock: fencing-token eviction marker
 //
-// Deterministic seam test ported from the verified sibling (anthropic-auth
-// 6ffba4b): two contenders (A and C) coordinated via the onStep hook reproduce
-// the 3rd interleaving — C renames the FRESH marker that A (the mkdir-winner)
-// created. The four ownsEvictionMarker() fence checks in the critical section
-// must detect the theft and elect exactly one winner.
+// Deterministic race test: two contenders (A and C), coordinated through the
+// onStep hook, race over a stale refresh lock. C renames the fresh eviction
+// marker that A created after winning the mkdir. The ownsEvictionMarker()
+// checks in the critical section must detect the theft and let exactly one
+// contender acquire the lock.
 // ---------------------------------------------------------------------------
 
 // Seed a stale lock + stale eviction-marker directory (back-dated past EVICT_TTL).

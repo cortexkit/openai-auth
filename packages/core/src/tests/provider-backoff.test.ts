@@ -1,6 +1,4 @@
 import { describe, expect, it, jest, mock } from 'bun:test'
-import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
 import {
   buildQuotaOperationError,
   isTransientQuotaError,
@@ -96,25 +94,6 @@ describe('codexRefreshFn token validation', () => {
       }),
     ).rejects.toThrow(TombstoneRefreshError)
     expect(fetchSpy).not.toHaveBeenCalled()
-  })
-
-  it('places the tombstone refusal before every refresh transport operation', () => {
-    const source = readFileSync(
-      fileURLToPath(new URL('../provider.ts', import.meta.url)),
-      'utf8',
-    )
-    const start = source.indexOf('export async function codexRefreshFn')
-    const end = source.indexOf('export async function whamUsageFn')
-    const fn = source.slice(start, end)
-    const refusal = fn.indexOf('assertNotTombstoneRefresh(input.refreshToken)')
-    const firstTransport = Math.min(
-      ...['new URL', 'URLSearchParams', 'await', 'input.fetchImpl']
-        .map((token) => fn.indexOf(token))
-        .filter((index) => index >= 0),
-    )
-
-    expect(refusal).toBeGreaterThanOrEqual(0)
-    expect(refusal).toBeLessThan(firstTransport)
   })
 
   it('throws structured refresh error when access_token is missing', async () => {

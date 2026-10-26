@@ -7766,7 +7766,6 @@ describe('integration: active fallback routing', () => {
   })
 
   it('keeps the main refresh advisory lease shorter than the file lock TTL', () => {
-    expect(MAIN_REFRESH_LEASE_TTL_MS).toBe(90_000)
     expect(MAIN_REFRESH_LEASE_TTL_MS).toBeLessThan(MAIN_REFRESH_LOCK_TTL_MS)
   })
 

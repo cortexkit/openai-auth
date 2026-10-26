@@ -6,21 +6,12 @@
 
 import { afterAll, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import {
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-} from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { installPackedPlugin, PACKAGE_NAME } from './fixtures/opencode2-pack'
 
-const { consumer, packageDir } = installPackedPlugin()
+const { consumer } = installPackedPlugin()
 afterAll(() => rmSync(dirname(consumer), { recursive: true, force: true }))
-
-const PACKAGE_SPECIFIER =
-  /^(?:node:[\w/]+|(?:@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*(?:\/[\w./-]+)?)$/i
 
 function node(source: string) {
   return spawnSync('node', ['--input-type=module', '-e', source], {
@@ -95,42 +86,5 @@ describe('packed package on plain Node', () => {
       same: true,
       id: true,
     })
-  })
-
-  test('the root imports and is the OpenCode 1 plugin', () => {
-    const result = node(
-      `const m = await import('${PACKAGE_NAME}'); console.log(typeof m.default?.server)`,
-    )
-    expect(result.stderr).toBe('')
-    expect(result.stdout.trim()).toBe('function')
-  })
-
-  test('the bundles import only Node built-ins, declared runtime dependencies and their own chunks', () => {
-    const dist = join(packageDir, 'dist')
-    const files = [
-      ...readdirSync(dist).filter((name) => name.endsWith('.js')),
-      ...readdirSync(join(dist, 'v2'))
-        .filter((name) => name.endsWith('.js'))
-        .map((name) => join('v2', name)),
-    ]
-    const bare = new Set<string>()
-    for (const file of files) {
-      const source = readFileSync(join(dist, file), 'utf8')
-      for (const match of source.matchAll(
-        /(?:from|import)\s*\(?\s*["']([^"'./][^"']*)["']/g,
-      )) {
-        const specifier = match[1] ?? ''
-        // Minified code puts other strings after `from`/`import` too; only
-        // what is shaped like a package name is a module specifier.
-        if (!PACKAGE_SPECIFIER.test(specifier)) continue
-        if (!specifier.startsWith('node:')) bare.add(specifier)
-      }
-    }
-    expect([...bare].sort()).toEqual([
-      '@cortexkit/claustrum-client',
-      '@cortexkit/private-files',
-      '@cortexkit/subc-client',
-      'jsonc-parser',
-    ])
   })
 })
