@@ -1,2 +1,0 @@
-# Spec campaign slices only append catalogue rows; a union merge keeps every row.
-mutations.toml merge=union

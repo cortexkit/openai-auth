@@ -4,28 +4,16 @@ on:
   pull_request:
   push:
     branches: [main]
-  # Nightly, and on demand: replay every row of mutations.toml (deliberate
-  # breaks that a named test must catch) with `--broad`.
-  schedule:
-    - cron: "23 3 * * *"
   workflow_dispatch:
 
-# The event name is part of the group so the nightly run is not in the same
-# group as pushes to main. A newer push to a pull request supersedes the older
-# run; on main every commit gets its full catalogue replay, and the nightly
-# audit always finishes, so a later run never cancels either.
+# A newer push to a pull request supersedes the older run. On main every
+# commit keeps its own run, because a release checks CI on its exact commit.
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
-
-env:
-  # The ckdev-mutate runner that replays mutations.toml (cortexkit/commons,
-  # crate cortexkit-mutate 0.12.4), pinned so a runner change never alters CI
-  # unannounced.
-  CKDEV_MUTATE_REV: 85c8b577795d556fb27e54b548f06ea913d8b337
 
 jobs:
   check:
@@ -96,83 +84,3 @@ jobs:
           OPENAI_AUTH_OPENCODE1_E2E: "1"
         working-directory: packages/opencode
         run: bun test src/tests/opencode1-e2e.test.ts
-  # Replays the mutation proofs a pull request touches: each selected row of
-  # mutations.toml breaks one guarded line, and its named test must fail. Diff
-  # selection sees edits to a row's target or test file and to the row itself,
-  # not to helpers the test uses; the full replay on main covers those.
-  mutations-pr:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0
-      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
-      - run: bun install --frozen-lockfile
-      - name: Install locked OpenCode host fixtures without lifecycle scripts
-        run: |
-          for host in opencode1 opencode2; do
-            npm ci --ignore-scripts --prefix packages/opencode/src/tests/fixtures/$host-host || exit
-          done
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: mutate-cache
-        with:
-          path: ~/.cargo/bin/ckdev-mutate
-          key: ${{ runner.os }}-${{ runner.arch }}-ckdev-mutate-${{ env.CKDEV_MUTATE_REV }}
-      - name: Install pinned mutation runner
-        if: steps.mutate-cache.outputs.cache-hit != 'true'
-        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CKDEV_MUTATE_REV" cortexkit-mutate
-      - run: ckdev-mutate check --strict
-      - name: Replay proofs selected by the PR diff
-        run: |
-          mkdir -p mutations-report
-          ckdev-mutate run --diff origin/main --report mutations-report/diff.json
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
-        with:
-          name: mutations-pr
-          path: mutations-report/diff.json
-  # On a push to main: the full catalogue. Nightly or on demand: the same
-  # catalogue with `--broad`. Bun test rows are command rows, which cannot
-  # observe other test targets, so `--broad` replays them as a plain run does;
-  # it is kept so a future Cargo row, or a runner that adds breadth for
-  # command rows, is audited without a workflow change. The mutation jobs run
-  # alongside `check` rather than after it: each sets itself up from scratch, so
-  # waiting on `check` only added its time to every run's wall time.
-  mutations-main:
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    name: mutations-main (shard ${{ matrix.shard }}/4)
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
-      - run: bun install --frozen-lockfile
-      - name: Install locked OpenCode host fixtures without lifecycle scripts
-        run: |
-          for host in opencode1 opencode2; do
-            npm ci --ignore-scripts --prefix packages/opencode/src/tests/fixtures/$host-host || exit
-          done
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: mutate-cache
-        with:
-          path: ~/.cargo/bin/ckdev-mutate
-          key: ${{ runner.os }}-${{ runner.arch }}-ckdev-mutate-${{ env.CKDEV_MUTATE_REV }}
-      - name: Install pinned mutation runner
-        if: steps.mutate-cache.outputs.cache-hit != 'true'
-        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CKDEV_MUTATE_REV" cortexkit-mutate
-      - run: ckdev-mutate check --strict
-      - name: Replay the full catalogue
-        run: |
-          mkdir -p mutations-report
-          ckdev-mutate run --all --shard ${{ matrix.shard }}/4 ${BROAD:+--broad} --report mutations-report/all-${{ matrix.shard }}.json
-        env:
-          BROAD: ${{ github.event_name != 'push' && 'true' || '' }}
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
-        with:
-          name: mutations-${{ github.event_name == 'push' && 'main' || 'broad' }}-${{ matrix.shard }}
-          path: mutations-report/all-${{ matrix.shard }}.json

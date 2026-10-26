@@ -38,7 +38,7 @@ Then start OpenCode and run `/openai`.
 - [OpenCode 2](docs/opencode-2.md): install and differences from OpenCode 1.
 - [Transports](docs/transports.md): HTTP and the WebSocket transports.
 - [Troubleshooting](docs/troubleshooting.md): logging, request dumps and clearing the plugin cache.
-- [Development](docs/development.md): working on this repository, tests and the mutation catalogue.
+- [Development](docs/development.md): working on this repository and running its tests.
 - [Release](docs/release.md): publishing a new version.
 
 ## License

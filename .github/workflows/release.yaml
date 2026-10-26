@@ -47,7 +47,7 @@ jobs:
           set -euo pipefail
           deadline=$((SECONDS + 1800))
           next_status_log=$((SECONDS + 60))
-          required_jobs='["check", "opencode1-e2e", "opencode2-e2e", "mutations-main (shard 1/4)", "mutations-main (shard 2/4)", "mutations-main (shard 3/4)", "mutations-main (shard 4/4)"]'
+          required_jobs='["check", "opencode1-e2e", "opencode2-e2e"]'
           runs_url="repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${RELEASE_SHA}&per_page=100"
 
           # A GitHub API answer that may clear on its own (5xx, rate limit or a

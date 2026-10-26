@@ -101,12 +101,7 @@ continuation, and equal-length rule for turn detection are unchanged.
 - `createWebSocketFetch > disabled dumps serialize only the wire frames`
 - `createWebSocketFetch > cached WS decisions preserve append edits tool order compaction and prewarm`
 
-The two dump-site mutations (`ws-disabled-main-dump-is-lazy`,
-`ws-disabled-prewarm-dump-is-lazy`) target actual transport argument construction,
-not just the dumper's callback API. The cache mutation
-`canonical-input-validates-earlier-edits` removes value validation before reuse.
-Each has a named assertion in `mutations.toml`. Existing transport/integration
-assertions were not changed or renamed.
+Existing transport/integration assertions were not changed or renamed.
 
 ## Correctness review follow-up
 
@@ -133,30 +128,24 @@ small signature, but that is a separate request and not a steady-state tool-loop
 cost. The necessary exact comparison remains much cheaper than serializing the
 history repeatedly.
 
-The additional assertions and their deliberate reverse controls are:
+The additional assertions are:
 
 1. `createWebSocketFetch > prewarm continuation uses the actual ordered request signature`
    checks that a source body with its own `constructor: 0` does not chain to
    the differently ordered prewarm body, while an ordinary request still chains.
-   `ws-prewarm-signature-describes-sent-body` substitutes the source signature.
 2. `request dumps > Responses Lite removes image details without mutating host items`
    checks copy-on-write deletion and sharing of unaffected paths.
    `request dumps > Responses Lite image histories keep HTTP turns below and above the cache cap`
    checks the emitted body and stable turn ids at 2 and 513 host items.
-   `responses-lite-image-details-copy-on-write` deletes from the original image.
    This intentionally corrects the old in-place mutation: the host history is
    now the turn baseline at all sizes, as the existing HTTP baseline comment
    intended, instead of rotating Lite turns only when retention was exceeded.
 3. `createWebSocketFetch > canonicalization failures return an errored response instead of rejecting fetch`
    injects a throwing real canonicalizer binding and verifies that fetch resolves
    with the normal SSE response whose reader surfaces `ResponseStreamError`.
-   `ws-canonicalization-inside-error-boundary` moves preparation outside `try`.
 4. `canonical input > does not match non-enumerable properties in place of enumerable keys`
    covers a cached `{a:1}` against an enumerable `b` and non-enumerable `a`.
    `canonical input > recomputes items with own toJSON functions`
    covers both non-enumerable and changing enumerable serialization hooks.
-   `canonical-input-requires-enumerable-keys` and
-   `canonical-input-recomputes-serialization-hooks` independently undo those
-   guards, so each condition has its own named red assertion.
 
-The existing assertions and the original three mutation controls are unchanged.
+The existing assertions are unchanged.
