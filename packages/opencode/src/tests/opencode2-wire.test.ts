@@ -248,100 +248,109 @@ describe('mid-conversation effort on WebSocket frames', () => {
 })
 
 describe('mid-conversation effort and Responses Lite on HTTP', () => {
-  it('carries the update on every request after a change, before the turn user message', async () => {
-    const effort = testEffort()
-    const first = await rewriteCodexHttpRequest(
-      httpBody('low', [user('one')]),
-      SESSION,
-      effort,
-      false,
-    )
-    expect((await first!.json()).reasoning.effort).toBe('low')
-    const turn = await rewriteCodexHttpRequest(
-      httpBody('high', [user('one'), assistant('a'), user('two')]),
-      SESSION,
-      effort,
-      false,
-    )
-    const step = await rewriteCodexHttpRequest(
-      httpBody('high', [
+  it.each(['gpt-6.1-sol', 'gpt-6.1-terra'])(
+    'carries the update on every request after a change, before the turn user message (%s)',
+    async (model) => {
+      const effort = testEffort()
+      const first = await rewriteCodexHttpRequest(
+        httpBody('low', [user('one')], { model }),
+        SESSION,
+        effort,
+        false,
+      )
+      expect((await first!.json()).reasoning.effort).toBe('low')
+      const turn = await rewriteCodexHttpRequest(
+        httpBody('high', [user('one'), assistant('a'), user('two')], { model }),
+        SESSION,
+        effort,
+        false,
+      )
+      const step = await rewriteCodexHttpRequest(
+        httpBody(
+          'high',
+          [user('one'), assistant('a'), user('two'), call, output],
+          { model },
+        ),
+        SESSION,
+        effort,
+        false,
+      )
+      const turnBody = await turn?.json()
+      const stepBody = await step?.json()
+      expect(turnBody.reasoning).toEqual({ effort: 'low', summary: 'auto' })
+      expect(turnBody.input).toEqual([
         user('one'),
         assistant('a'),
+        update('high'),
+        user('two'),
+      ])
+      expect(stepBody.reasoning).toEqual({ effort: 'low', summary: 'auto' })
+      expect(stepBody.input).toEqual([
+        user('one'),
+        assistant('a'),
+        update('high'),
         user('two'),
         call,
         output,
-      ]),
-      SESSION,
-      effort,
-      false,
-    )
-    const turnBody = await turn?.json()
-    const stepBody = await step?.json()
-    expect(turnBody.reasoning).toEqual({ effort: 'low', summary: 'auto' })
-    expect(turnBody.input).toEqual([
-      user('one'),
-      assistant('a'),
-      update('high'),
-      user('two'),
-    ])
-    expect(stepBody.reasoning).toEqual({ effort: 'low', summary: 'auto' })
-    expect(stepBody.input).toEqual([
-      user('one'),
-      assistant('a'),
-      update('high'),
-      user('two'),
-      call,
-      output,
-    ])
-    expect(turn?.headers.get(RESPONSES_LITE_HEADER)).toBe(null)
-  })
+      ])
+      expect(turn?.headers.get(RESPONSES_LITE_HEADER)).toBe(null)
+    },
+  )
 
-  it('sends a Lite model in the Lite shape with its header when the setting is on', async () => {
-    const request = () =>
-      httpBody('low', [user('one')], {
-        model: 'gpt-5.6-luna',
-        parallel_tool_calls: true,
-      })
-    const effort = testEffort()
-    const standard = await rewriteCodexHttpRequest(
-      request(),
-      SESSION,
-      effort,
-      false,
-    )
-    expect(standard?.headers.get(RESPONSES_LITE_HEADER)).toBeNull()
-    const lite = await rewriteCodexHttpRequest(request(), SESSION, effort, true)
-    expect(lite?.headers.get(RESPONSES_LITE_HEADER)).toBe('true')
-    const body = await lite?.json()
-    expect(body.tools).toBe(undefined)
-    expect(body.instructions).toBe(undefined)
-    expect(body.parallel_tool_calls).toBe(false)
-    expect(body.reasoning.context).toBe('all_turns')
-    expect(body.input).toEqual([
-      {
-        type: 'additional_tools',
-        role: 'developer',
-        tools: [{ type: 'function', name: 'x', strict: false }],
-      },
-      {
-        type: 'message',
-        role: 'developer',
-        content: [{ type: 'input_text', text: 'be brief' }],
-      },
-      user('one'),
-    ])
-    // A model not marked Lite keeps the standard shape.
-    const nonLite = await rewriteCodexHttpRequest(
-      httpBody('low', [user('one')], { model: 'gpt-5.5' }),
-      SESSION,
-      effort,
-      true,
-    )
-    expect(nonLite?.headers.get(RESPONSES_LITE_HEADER)).toBeNull()
-    expect((await nonLite!.json()).tools).toEqual([
-      { type: 'function', name: 'x', strict: false },
-    ])
-  })
+  it.each(['gpt-5.6-luna', 'gpt-6.1-terra'])(
+    'sends a Lite model in the Lite shape with its header when the setting is on (%s)',
+    async (model) => {
+      const request = () =>
+        httpBody('low', [user('one')], {
+          model,
+          parallel_tool_calls: true,
+        })
+      const effort = testEffort()
+      const standard = await rewriteCodexHttpRequest(
+        request(),
+        SESSION,
+        effort,
+        false,
+      )
+      expect(standard?.headers.get(RESPONSES_LITE_HEADER)).toBeNull()
+      const lite = await rewriteCodexHttpRequest(
+        request(),
+        SESSION,
+        effort,
+        true,
+      )
+      expect(lite?.headers.get(RESPONSES_LITE_HEADER)).toBe('true')
+      const body = await lite?.json()
+      expect(body.tools).toBe(undefined)
+      expect(body.instructions).toBe(undefined)
+      expect(body.parallel_tool_calls).toBe(false)
+      expect(body.reasoning.context).toBe('all_turns')
+      expect(body.input).toEqual([
+        {
+          type: 'additional_tools',
+          role: 'developer',
+          tools: [{ type: 'function', name: 'x', strict: false }],
+        },
+        {
+          type: 'message',
+          role: 'developer',
+          content: [{ type: 'input_text', text: 'be brief' }],
+        },
+        user('one'),
+      ])
+      // A model not marked Lite keeps the standard shape.
+      const nonLite = await rewriteCodexHttpRequest(
+        httpBody('low', [user('one')], { model: 'gpt-5.5' }),
+        SESSION,
+        effort,
+        true,
+      )
+      expect(nonLite?.headers.get(RESPONSES_LITE_HEADER)).toBeNull()
+      expect((await nonLite!.json()).tools).toEqual([
+        { type: 'function', name: 'x', strict: false },
+      ])
+    },
+  )
 
   it('leaves requests to other endpoints alone', async () => {
     const effort = testEffort()

@@ -38,6 +38,7 @@ type MockModel = {
   options: { reasoningMode?: string }
   cost: ModelCost
   limit: { context: number; input: number; output: number }
+  variants?: Record<string, Record<string, unknown>>
 }
 
 function failingFetch(message: string): typeof globalThis.fetch {
@@ -108,7 +109,21 @@ async function surfacedModels() {
       }),
       'gpt-6-sol': model('gpt-6-sol', 'gpt-6-sol'),
       'gpt-6-luna': model('gpt-6-luna', 'gpt-6-luna'),
-      'gpt-6.1-sol': model('gpt-6.1-sol', 'gpt-6.1-sol'),
+      'gpt-6.1-sol': {
+        ...model('gpt-6.1-sol', 'gpt-6.1-sol'),
+        variants: {
+          low: { reasoningEffort: 'low', reasoningSummary: 'auto' },
+          xhigh: { reasoningEffort: 'xhigh' },
+          future: { reasoningEffort: 'future' },
+        },
+      },
+      'gpt-6.1-terra': {
+        ...model('gpt-6.1-terra', 'gpt-6.1-terra'),
+        variants: {
+          low: { reasoningEffort: 'low', reasoningSummary: 'detailed' },
+          custom: { reasoningEffort: 'high' },
+        },
+      },
       'gpt-6.1': model('gpt-6.1', 'gpt-6.1'),
       'gpt-6.1-fast': model('gpt-6.1-fast', 'gpt-6.1'),
     },
@@ -405,18 +420,15 @@ describe('provider.models filter', () => {
     })
   })
 
-  it('keeps the 5.6 family under the long-context surcharge line', async () => {
-    // The exemption covers gpt-6-astra only: the 5.6 family still costs 2x input
-    // and 1.5x output on the whole request above 272k input tokens, so its 244k
-    // input cap stays even though the Codex backend accepted 861,550 input
-    // tokens from gpt-5.6-sol when measured.
+  it('gives the 5.6 family the full reported Codex window', async () => {
     const models = await surfacedModels()
-    expect(models['gpt-5.6-sol']?.limit?.input).toBeLessThan(272_000)
-    expect(models['gpt-5.6-luna']?.limit).toEqual({
-      context: 372_000,
-      input: 244_000,
-      output: 128_000,
-    })
+    for (const id of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+      expect(models[id]?.limit).toEqual({
+        context: 872_000,
+        input: 744_000,
+        output: 128_000,
+      })
+    }
   })
 
   it('gives gpt-6.1-sol the 500k context Codex uses by default', async () => {
@@ -430,18 +442,33 @@ describe('provider.models filter', () => {
     })
   })
 
-  it("surfaces gpt-6-sol and gpt-6-luna under the surcharge line, not astra's window", async () => {
-    // Both report the same 872k window as gpt-6-astra, which makes "it is a
-    // gpt-6 model, give it astra's window" the natural mistake. The rate card's
-    // Codex long-context exception names GPT-6 Astra alone, so these two pay
-    // 2x input and 1.5x output on the whole request above 272k input tokens and
-    // are held under that line like the 5.6 family.
+  it('inherits Sol variants for Terra without replacing Terra overrides', async () => {
+    const models = await surfacedModels()
+    expect(models['gpt-6.1-terra']?.variants).toEqual({
+      low: { reasoningEffort: 'low', reasoningSummary: 'detailed' },
+      xhigh: { reasoningEffort: 'xhigh' },
+      future: { reasoningEffort: 'future' },
+      custom: { reasoningEffort: 'high' },
+    })
+    expect(models['gpt-6.1-sol']?.variants).not.toHaveProperty('custom')
+  })
+
+  it('gives gpt-6.1-terra the 500k context Codex uses by default', async () => {
+    const models = await surfacedModels()
+    expect(models['gpt-6.1-terra']?.limit).toEqual({
+      context: 500_000,
+      input: 372_000,
+      output: 128_000,
+    })
+  })
+
+  it('surfaces gpt-6-sol and gpt-6-luna with the full reported Codex window', async () => {
     const models = await surfacedModels()
     for (const id of ['gpt-6-sol', 'gpt-6-luna']) {
       expect(models[id]).toBeDefined()
       expect(models[id]?.limit).toEqual({
-        context: 372_000,
-        input: 244_000,
+        context: 872_000,
+        input: 744_000,
         output: 128_000,
       })
     }
@@ -456,7 +483,7 @@ describe('provider.models filter', () => {
   })
 
   it('drops the bare gpt-6.1 and its synthetics', async () => {
-    // Only gpt-6.1-sol is served; the bare id answers 400 like gpt-6 does.
+    // The named Sol/Terra variants are served; the bare id answers 400 like gpt-6.
     const models = await surfacedModels()
     expect(models['gpt-6.1']).toBeUndefined()
     expect(models['gpt-6.1-fast']).toBeUndefined()

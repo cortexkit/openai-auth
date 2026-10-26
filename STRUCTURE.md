@@ -235,7 +235,7 @@ Example: `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS`, `CORTEXKIT_OPENAI_AUTH_RAW_WS`, `OP
 
 **RPC methods:** lowercase, dash-separated (`pending-notifications`, `apply`). JSON-RPC-shaped bodies.
 
-**Model IDs:** GPT-style dotted identifiers that pass `gpt-X.Y` or major versions like `gpt-X`; the allow-list at `packages/opencode/src/index.ts` (`ALLOWED_MODELS`) and the regex `^gpt-(\d+(?:\.\d+)?)` with `> 5.4` fallback define which models surface to the TUI (explicitly disallowing the bare `gpt-5.6` and `gpt-6` while accepting `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, and the `gpt-5.6` `-luna`/`-sol`/`-terra` variants).
+**Model IDs:** GPT-style dotted identifiers that pass `gpt-X.Y` or major versions like `gpt-X`; the allow-list at `packages/opencode/src/index.ts` (`ALLOWED_MODELS`) and the regex `^gpt-(\d+(?:\.\d+)?)` with `> 5.4` fallback define which models surface to the TUI (explicitly disallowing the bare `gpt-5.6`, `gpt-6` and `gpt-6.1` while accepting `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6.1-sol`, `gpt-6.1-terra`, and the `gpt-5.6` `-luna`/`-sol`/`-terra` variants).
 
 ## Where to Add New Code
 

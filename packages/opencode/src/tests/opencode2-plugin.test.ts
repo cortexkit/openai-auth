@@ -1065,6 +1065,54 @@ describe('OpenCode 2 entry: the pool migration', () => {
 })
 
 describe('OpenCode 2 entry: models', () => {
+  it('inherits Sol variants for Terra without replacing Terra overrides', async () => {
+    const { host } = await startPool('main-first', [{ id: 'main' }])
+    const models = host.transformModels([
+      {
+        id: 'gpt-6.1-sol',
+        providerID: 'openai',
+        enabled: true,
+        limit: { context: 1, output: 1 },
+        variants: [
+          { id: 'low', settings: { reasoning: { effort: 'low' } } },
+          { id: 'xhigh', settings: { reasoning: { effort: 'xhigh' } } },
+          { id: 'future', body: { custom: true } },
+        ],
+      },
+      {
+        id: 'gpt-6.1-terra',
+        providerID: 'openai',
+        enabled: true,
+        limit: { context: 1, output: 1 },
+        variants: [
+          {
+            id: 'low',
+            settings: { reasoning: { effort: 'low', summary: 'detailed' } },
+          },
+          { id: 'custom', headers: { custom: 'value' } },
+        ],
+      },
+      {
+        id: 'gpt-6.1-terra',
+        providerID: 'other',
+        enabled: true,
+        limit: { context: 1, output: 1 },
+        variants: [],
+      },
+    ])
+    expect(models[1]?.variants).toEqual([
+      {
+        id: 'low',
+        settings: { reasoning: { effort: 'low', summary: 'detailed' } },
+      },
+      { id: 'xhigh', settings: { reasoning: { effort: 'xhigh' } } },
+      { id: 'future', body: { custom: true } },
+      { id: 'custom', headers: { custom: 'value' } },
+    ])
+    expect(models[0]?.variants).toHaveLength(3)
+    expect(models[2]?.variants).toEqual([])
+  })
+
   it('applies the OpenCode 1 allow and deny lists and context caps', () => {
     const model = (id: string, modelID = id): FakeModel => ({
       id,
@@ -1077,7 +1125,13 @@ describe('OpenCode 2 entry: models', () => {
       model('gpt-5.5'),
       model('gpt-5.6'),
       model('gpt-5.6-sol'),
+      model('gpt-5.6-terra'),
+      model('gpt-5.6-luna'),
       model('gpt-6-astra'),
+      model('gpt-6-sol'),
+      model('gpt-6-luna'),
+      model('gpt-6.1-sol'),
+      model('gpt-6.1-terra'),
       model('gpt-6'),
       model('gpt-4.1'),
       model('gpt-5.4-mini'),
@@ -1092,12 +1146,39 @@ describe('OpenCode 2 entry: models', () => {
     expect(view).toEqual({
       'gpt-5.5': 400_000,
       'gpt-5.6': 'off',
-      'gpt-5.6-sol': 372_000,
+      'gpt-5.6-sol': 872_000,
+      'gpt-5.6-terra': 872_000,
+      'gpt-5.6-luna': 872_000,
       'gpt-6-astra': 872_000,
+      'gpt-6-sol': 872_000,
+      'gpt-6-luna': 872_000,
+      'gpt-6.1-sol': 500_000,
+      'gpt-6.1-terra': 500_000,
       'gpt-6': 'off',
       'gpt-4.1': 'off',
       'gpt-5.4-mini': 1_000_000,
     })
+    for (const id of [
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-6-astra',
+      'gpt-6-sol',
+      'gpt-6-luna',
+    ]) {
+      expect(models.find((entry) => entry.id === id)?.limit).toEqual({
+        context: 872_000,
+        input: 744_000,
+        output: 128_000,
+      })
+    }
+    for (const id of ['gpt-6.1-sol', 'gpt-6.1-terra']) {
+      expect(models.find((entry) => entry.id === id)?.limit).toEqual({
+        context: 500_000,
+        input: 372_000,
+        output: 128_000,
+      })
+    }
   })
 
   it('registers the rules as a model transform for provider openai only', async () => {
