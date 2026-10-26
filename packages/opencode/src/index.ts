@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { statSync } from 'node:fs'
 import os from 'node:os'
-import { join } from 'node:path'
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import { parseApplyRequest } from '@cortexkit/common-auth/commands'
 import {
@@ -82,8 +81,12 @@ import {
   type OpenCodeMenuContext,
   openOpenAiMenu,
 } from './commands'
-import { getConfigDir, getConfigPath, getSettings } from './config'
-import { getAccountPaths, getAccountStatePath } from './core/account-paths'
+import { getConfigPath, getSettings } from './config'
+import {
+  getAccountPaths,
+  getAccountStatePath,
+  getCodexSessionsPath,
+} from './core/account-paths'
 import {
   acquireBackgroundRefreshLock,
   BackgroundQuotaRefresh,
@@ -157,6 +160,10 @@ import {
   type ProcessHeartbeatHandle,
   startProcessHeartbeat,
 } from './core/process-heartbeat'
+import {
+  prepareRuntimeLayout,
+  type RuntimeLayoutOptions,
+} from './core/runtime-layout'
 import { acquireOpenCodeVault } from './core/shared-vault'
 import {
   decideStickyBreak,
@@ -744,6 +751,8 @@ export {
 export const POOL_MIGRATION_ENABLED = true
 
 interface CodexAuthPluginOptions {
+  /** Test seams for the one-time move of the runtime files (`core/runtime-layout.ts`). */
+  runtimeLayout?: Partial<Omit<RuntimeLayoutOptions, 'version'>>
   /**
    * Test seams for the background account-pool migration and adoption
    * (`core/pool-lifecycle.ts`): its fence, timers, run functions and
@@ -830,7 +839,7 @@ function getCodexSessionMetadata(
 }
 
 function codexSessionStatePath() {
-  return join(getConfigDir(), 'openai-auth-sessions.json')
+  return getCodexSessionsPath('opencode1')
 }
 
 export function findCachekeepFallbackAccount(
@@ -1207,6 +1216,13 @@ export async function CodexAuthPlugin(
   input: PluginInput,
   options: CodexAuthPluginOptions = {},
 ): Promise<Hooks> {
+  // Before anything resolves a runtime path: where this process keeps its
+  // state file, vault folder and sessions file for its whole life, moving
+  // them out of OpenCode's config folder first when that is safe.
+  await prepareRuntimeLayout({
+    version: PackageVersion,
+    ...options.runtimeLayout,
+  })
   const codexApiEndpoint =
     options.codexApiEndpoint ?? getSettings().codexApiEndpoint
   const installationID = crypto.randomUUID()

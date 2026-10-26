@@ -85,6 +85,10 @@ import {
   poolPlaceholderWithoutMain,
 } from '../core/pool-migration'
 import { startProcessHeartbeat } from '../core/process-heartbeat'
+import {
+  prepareRuntimeLayout,
+  type RuntimeLayoutOptions,
+} from '../core/runtime-layout'
 import { acquireOpenCodeVault } from '../core/shared-vault'
 import { migrationFenceOpen } from '../core/version-fence'
 import { POOL_MIGRATION_ENABLED } from '../index'
@@ -185,6 +189,8 @@ export interface OpenAIAuthV2Options {
   poolMigration?: boolean
   /** Whether to write this process's heartbeat (other processes' fence reads it). */
   heartbeat?: boolean
+  /** Test seams for the one-time move of the runtime files (`core/runtime-layout.ts`). */
+  runtimeLayout?: Partial<Omit<RuntimeLayoutOptions, 'version'>>
   /** The vault's directory and connections; the production ones by default. */
   vault?: Partial<
     Pick<
@@ -496,6 +502,11 @@ export async function setupOpenAIAuth(
 ): Promise<Plugin.Cleanup> {
   const log = createLogger('opencode2')
   const logQ = createLogger('quota')
+  const version = options.version ?? PackageVersion
+  // Before anything resolves a runtime path: where this process keeps its
+  // state file, vault folder and sessions file for its whole life, moving
+  // them out of OpenCode's config folder first when that is safe.
+  await prepareRuntimeLayout({ version, ...options.runtimeLayout })
   const paths = options.paths ?? (() => getAccountPaths(getConfigPath()))
   // The logger starts with the environment floor. A saved choice overrides it,
   // just as it does on OpenCode 1, before setup writes any diagnostic lines.
@@ -506,7 +517,6 @@ export async function setupOpenAIAuth(
   }
   const fetchImpl = options.fetch ?? fetch
   const now = options.now ?? Date.now
-  const version = options.version ?? PackageVersion
   const migrationEnabled = options.poolMigration ?? POOL_MIGRATION_ENABLED
 
   if (!migrationEnabled && !poolMigrated(paths().configPath)) {

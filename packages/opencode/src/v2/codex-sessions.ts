@@ -14,7 +14,7 @@
 // still holds a session another process deleted cannot bring it back.
 
 import { mkdirSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import {
   acquireRefreshFileLock,
   type RefreshFileLock,
@@ -25,16 +25,19 @@ import {
   readCodexSessionThreads,
   writeCodexSessionThreads,
 } from '../codex-sessions'
-import { getConfigDir } from '../config'
+import {
+  getCodexSessionsPath,
+  OPENCODE2_CODEX_SESSIONS_FILE,
+} from '../core/account-paths'
 import { uuidV7 } from '../util/uuid-v7'
 import { FrameTurnState } from './frame-turn'
 
 /** OpenCode 2's file, next to OpenCode 1's `openai-auth-sessions.json`. */
-export const OPENCODE2_CODEX_SESSIONS_FILE =
-  'openai-auth-sessions-opencode2.json'
+export { OPENCODE2_CODEX_SESSIONS_FILE }
 
+/** In the runtime folder `core/account-paths.ts` resolves. */
 export function opencode2CodexSessionsPath(): string {
-  return join(getConfigDir(), OPENCODE2_CODEX_SESSIONS_FILE)
+  return getCodexSessionsPath('opencode2')
 }
 
 const LOCK_NAME = 'sessions'

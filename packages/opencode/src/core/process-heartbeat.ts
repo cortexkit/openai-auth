@@ -9,16 +9,28 @@
 //
 // Writing it is best-effort. A failure is logged and never fails the loader,
 // and nothing here runs on the request path.
+//
+// The file also carries `layouts`: for each OpenCode config folder this
+// process resolved, whether it keeps that folder's runtime files in the
+// config folder itself (`legacy`) or in the state home (`state-home`), see
+// `runtime-layout.ts`. A process that runs on the legacy layout keeps its
+// file until it exits, even after its last owner released it, because its
+// paths stay fixed for its whole life and the move must wait for it.
 
 import { randomUUID } from 'node:crypto'
 import { chmod, mkdir, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
+/** Where one process keeps one config folder's runtime files. */
+export type ProcessLayout = 'legacy' | 'state-home'
+
 export interface ProcessHeartbeat {
   pid: number
   version: string
   startedAt: number
+  /** Config folder key (`runtimeLayoutLocation().key`) to its layout. */
+  layouts: Record<string, ProcessLayout>
 }
 
 /**
@@ -43,6 +55,26 @@ export function processHeartbeatPath(
 // the last of them disposes.
 let liveOwners = 0
 let processStartedAt: number | undefined
+
+// The layouts this process chose, one per config folder. Kept on the global
+// object because OpenCode 2 may load more than one copy of this bundle into
+// one process, and every copy must write the same heartbeat.
+const layoutsKey = Symbol.for('@cortexkit/openai-auth/process-layouts')
+const layoutState = globalThis as typeof globalThis & {
+  [layoutsKey]?: Map<string, ProcessLayout>
+}
+const processLayouts = layoutState[layoutsKey] ?? new Map()
+layoutState[layoutsKey] = processLayouts
+
+function layoutsRecord(): Record<string, ProcessLayout> {
+  return Object.fromEntries(processLayouts)
+}
+
+function holdsLegacyLayout(): boolean {
+  for (const layout of processLayouts.values())
+    if (layout === 'legacy') return true
+  return false
+}
 
 export interface HeartbeatLogger {
   warn(message: string, meta?: Record<string, unknown>): unknown
@@ -101,6 +133,7 @@ export async function startProcessHeartbeat(input: {
       pid,
       version: input.version,
       startedAt: processStartedAt,
+      layouts: layoutsRecord(),
     })
   } catch (error) {
     input.logger.warn('process heartbeat not written', {
@@ -116,6 +149,8 @@ export async function startProcessHeartbeat(input: {
       released = true
       liveOwners = Math.max(0, liveOwners - 1)
       if (liveOwners > 0) return
+      // A legacy-layout process keeps using the old paths until it exits.
+      if (holdsLegacyLayout()) return
       await rm(processHeartbeatPath(pid, dir), { force: true }).catch(
         (error: unknown) => {
           input.logger.warn('process heartbeat not removed', {
@@ -128,8 +163,36 @@ export async function startProcessHeartbeat(input: {
   }
 }
 
+/**
+ * Record which layout this process uses for one config folder. A `legacy`
+ * choice is written to the heartbeat file at once, because another process
+ * deciding whether it may move the files reads it; the caller makes the
+ * choice and this write while it holds the layout lock. A `state-home`
+ * choice only goes into the next heartbeat write. Throws when the write
+ * fails.
+ */
+export async function recordProcessLayout(input: {
+  key: string
+  layout: ProcessLayout
+  version: string
+  now?: () => number
+  pid?: number
+  dir?: string
+}): Promise<void> {
+  processLayouts.set(input.key, input.layout)
+  if (input.layout !== 'legacy') return
+  processStartedAt ??= (input.now ?? Date.now)()
+  await writeHeartbeatFile(input.dir ?? processHeartbeatDir(), {
+    pid: input.pid ?? process.pid,
+    version: input.version,
+    startedAt: processStartedAt,
+    layouts: layoutsRecord(),
+  })
+}
+
 /** Forget the process-wide owner count; for tests only. */
 export function __resetProcessHeartbeatForTest(): void {
   liveOwners = 0
   processStartedAt = undefined
+  processLayouts.clear()
 }

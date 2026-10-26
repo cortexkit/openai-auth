@@ -17,6 +17,13 @@
 // file but no heartbeat predates heartbeats, so it is an older version. The
 // fence fails closed: any file or directory it cannot read, or a version it
 // cannot parse, keeps it shut.
+//
+// The same fence guards the move of the runtime files out of OpenCode's
+// config folder (`runtime-layout.ts`), which passes `layoutKey`. A heartbeat
+// then also names, under `layouts`, which file layout the process uses for
+// each config folder; a live process on the legacy layout for that folder
+// keeps the fence shut, and so does a heartbeat with no `layouts` at all,
+// because it was written by a version that predates the move.
 
 import { readdir, readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -47,9 +54,20 @@ export interface VersionFenceOptions {
   isAlive?: (pid: number) => boolean
   /** This process, which never blocks itself. Defaults to `process.pid`. */
   selfPid?: number
+  /**
+   * The config folder whose runtime files are about to move, as
+   * `runtimeLayoutLocation().key` names it. When set, a live process that
+   * still uses the legacy layout for it, or that writes no layouts at all,
+   * also keeps the fence shut.
+   */
+  layoutKey?: string
 }
 
-function defaultStateHome(): string {
+/**
+ * The XDG state base every state-home file of the plugin lives under:
+ * `$XDG_STATE_HOME`, else `~/.local/state`, on every OS.
+ */
+export function defaultStateHome(): string {
   return process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state')
 }
 
@@ -139,7 +157,7 @@ async function list(dir: string): Promise<Listing> {
 type Heartbeat =
   | { kind: 'gone' }
   | { kind: 'unreadable' }
-  | { kind: 'ok'; version: string }
+  | { kind: 'ok'; version: string; layouts?: Record<string, unknown> }
 
 async function readHeartbeat(path: string, pid: number): Promise<Heartbeat> {
   let text: string
@@ -158,8 +176,18 @@ async function readHeartbeat(path: string, pid: number): Promise<Heartbeat> {
       typeof value === 'object' &&
       (value as { pid?: unknown }).pid === pid &&
       typeof (value as { version?: unknown }).version === 'string'
-    )
-      return { kind: 'ok', version: (value as { version: string }).version }
+    ) {
+      const layouts = (value as { layouts?: unknown }).layouts
+      return {
+        kind: 'ok',
+        version: (value as { version: string }).version,
+        ...(layouts !== null &&
+        typeof layouts === 'object' &&
+        !Array.isArray(layouts)
+          ? { layouts: layouts as Record<string, unknown> }
+          : {}),
+      }
+    }
   } catch {}
   return { kind: 'unreadable' }
 }
@@ -210,7 +238,15 @@ export async function migrationFenceOpen(
       continue
     }
     const order = compareVersions(heartbeat.version, options.currentVersion)
-    if (order === undefined || order < 0)
+    if (order === undefined || order < 0) {
+      block({ pid, version: heartbeat.version, detail: path })
+      continue
+    }
+    if (
+      options.layoutKey !== undefined &&
+      (heartbeat.layouts === undefined ||
+        heartbeat.layouts[options.layoutKey] === 'legacy')
+    )
       block({ pid, version: heartbeat.version, detail: path })
   }
 
