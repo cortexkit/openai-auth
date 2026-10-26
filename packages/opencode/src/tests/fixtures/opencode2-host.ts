@@ -32,6 +32,7 @@ export type FakeModel = {
   providerID: string
   enabled: boolean
   limit: { context: number; input?: number; output: number }
+  variants?: Array<{ id: string; [key: string]: unknown }>
 }
 
 export function fakeOpenCode2Host(

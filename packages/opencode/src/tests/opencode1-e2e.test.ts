@@ -50,6 +50,7 @@ import {
   type MockCodex,
   startMockCodex,
   type WireRecord,
+  type WireSample,
 } from './fixtures/opencode2-mock-codex'
 
 const ENABLED = process.env.OPENAI_AUTH_OPENCODE1_E2E === '1'
@@ -211,6 +212,7 @@ interface ScenarioResult {
   /** What stopped the scenario before its end, if anything did. */
   readonly failure?: unknown
   readonly wire: WireRecord[]
+  readonly samples: WireSample[]
   readonly runExit: number | null
   readonly runStdout: string
   readonly config: Record<string, any>
@@ -224,6 +226,7 @@ interface ScenarioResult {
 async function runScenario(
   vaultActivation = false,
   reject?: 'stream-error-missing-type' | 'stream-error-plain-type',
+  effort?: { model: string; variants: string[]; webSockets: boolean },
 ): Promise<ScenarioResult> {
   const root = mkdtempSync(join(tmpdir(), 'oai-oc1-e2e-'))
   const project = join(root, 'project')
@@ -257,6 +260,54 @@ async function runScenario(
       { mode: 0o600 },
     )
   } else seedLegacyInstall(configDir, dataDir)
+  if (effort) {
+    writeFileSync(
+      configFile,
+      JSON.stringify({
+        ...readJson(configFile),
+        webSockets: effort.webSockets,
+        responsesLite: false,
+        codexApiEndpoint: `${mock.url}/backend-api/codex/responses`,
+      }),
+    )
+    // Config-only models arrive after provider.models. Seed a catalog so the
+    // real model hook must fill Terra's missing variants before host selection.
+    const catalogPath = join(root, 'models.json')
+    writeFileSync(
+      catalogPath,
+      JSON.stringify({
+        openai: {
+          id: 'openai',
+          name: 'OpenAI',
+          env: ['OPENAI_API_KEY'],
+          npm: '@ai-sdk/openai',
+          api: 'https://api.openai.com/v1',
+          models: Object.fromEntries(
+            (
+              [
+                ['gpt-6.1-sol', ['low', 'medium', 'high', 'xhigh', 'max']],
+                ['gpt-6.1-terra', ['low', 'medium', 'high']],
+              ] as const
+            ).map(([id, values]) => [
+              id,
+              {
+                id,
+                name: id,
+                release_date: '2026-10-26',
+                attachment: false,
+                reasoning: true,
+                temperature: false,
+                tool_call: true,
+                reasoning_options: [{ type: 'effort', values }],
+                limit: { context: 1_050_000, output: 128_000 },
+              },
+            ]),
+          ),
+        },
+      }),
+    )
+    Object.assign(env, { OPENCODE_MODELS_PATH: catalogPath })
+  }
   writeFileSync(
     join(configDir, 'opencode.json'),
     JSON.stringify(
@@ -325,6 +376,7 @@ async function runScenario(
   ])
   let run = { exit: null as number | null, stdout: '', stderr: '' }
   let wireBeforeRun: WireRecord[] = []
+  let hostModel: unknown
   let failure: unknown
   try {
     await waitFor(
@@ -364,33 +416,62 @@ async function runScenario(
       server,
     )
     wireBeforeRun = [...mock.records]
+    if (effort) {
+      const providerView = (await (
+        await fetch(
+          `${serverURL}/config/providers?directory=${encodeURIComponent(project)}`,
+        )
+      ).json()) as {
+        providers: Array<{ id: string; models: Record<string, unknown> }>
+      }
+      hostModel = providerView.providers.find(
+        (provider) => provider.id === 'openai',
+      )?.models[effort.model]
+    }
     if (reject) mock.reject('V', reject)
-    const child = Bun.spawn(
-      [
-        binary,
-        'run',
-        '--attach',
-        serverURL,
-        '--dir',
-        project,
-        '--format',
-        'json',
-        '--model',
-        'openai/gpt-5.5',
-        'Say hello.',
-      ],
-      { cwd: project, env, stdout: 'pipe', stderr: 'pipe' },
-    )
-    const out: string[] = []
-    const err: string[] = []
-    const timer = setTimeout(() => child.kill('SIGKILL'), 90_000)
-    await Promise.all([
-      collect(child.stdout, out),
-      collect(child.stderr, err),
-      child.exited,
-    ])
-    clearTimeout(timer)
-    run = { exit: child.exitCode, stdout: out.join(''), stderr: err.join('') }
+    const session = effort
+      ? ((await (
+          await fetch(
+            `${serverURL}/session?directory=${encodeURIComponent(project)}`,
+            {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: '{}',
+            },
+          )
+        ).json()) as { id: string })
+      : undefined
+    for (const variant of effort?.variants ?? [undefined]) {
+      const child = Bun.spawn(
+        [
+          binary,
+          'run',
+          '--attach',
+          serverURL,
+          '--dir',
+          project,
+          '--format',
+          'json',
+          '--model',
+          `openai/${effort?.model ?? 'gpt-5.5'}`,
+          ...(variant ? ['--variant', variant] : []),
+          ...(session ? ['--session', session.id] : []),
+          'Say hello.',
+        ],
+        { cwd: project, env, stdout: 'pipe', stderr: 'pipe' },
+      )
+      const out: string[] = []
+      const err: string[] = []
+      const timer = setTimeout(() => child.kill('SIGKILL'), 90_000)
+      await Promise.all([
+        collect(child.stdout, out),
+        collect(child.stderr, err),
+        child.exited,
+      ])
+      clearTimeout(timer)
+      run = { exit: child.exitCode, stdout: out.join(''), stderr: err.join('') }
+      if (child.exitCode !== 0) break
+    }
   } catch (error) {
     failure = error
   } finally {
@@ -430,6 +511,7 @@ async function runScenario(
   const result: ScenarioResult = {
     ...(failure !== undefined ? { failure } : {}),
     wire: [...mock.records],
+    samples: [...mock.samples],
     runExit: run.exit,
     runStdout: run.stdout,
     config,
@@ -440,6 +522,8 @@ async function runScenario(
     diagnostics: [
       `wire before the run: ${JSON.stringify(wireBeforeRun)}`,
       `wire: ${JSON.stringify(mock.records)}`,
+      `samples: ${JSON.stringify(mock.samples)}`,
+      `host model: ${JSON.stringify(hostModel)}`,
       `config: ${JSON.stringify(config)}`,
       `slot: ${JSON.stringify(slot)}`,
       `--- run (exit ${run.exit}) ---\n${run.stdout}\n${run.stderr}`,
@@ -465,6 +549,58 @@ function verify(result: ScenarioResult, assertions: () => void) {
 }
 
 describe.skipIf(!ENABLED)('openai-auth on OpenCode 1 (real host)', () => {
+  for (const model of ['gpt-6.1-terra', 'gpt-6.1-sol']) {
+    for (const webSockets of [false, true]) {
+      for (const variants of [['low', 'xhigh'], ['xhigh']]) {
+        test(`${model} sends ${variants.join(' then ')} effort over ${webSockets ? 'WebSocket' : 'HTTP'}`, async () => {
+          const result = await runScenario(false, undefined, {
+            model,
+            variants,
+            webSockets,
+          })
+          verify(result, () => {
+            expect(result.runExit).toBe(0)
+            // Prewarm frames deliberately do not generate an answer.
+            const samples = result.samples.filter((sample) => {
+              const body = sample.body as Record<string, unknown>
+              return body.model === model && body.generate !== false
+            })
+            expect(
+              samples.every(
+                (sample) => sample.transport === (webSockets ? 'ws' : 'http'),
+              ),
+            ).toBe(true)
+            const bodies = samples.map(
+              (sample) => sample.body as Record<string, any>,
+            )
+            expect(bodies).toHaveLength(variants.length)
+            expect(bodies[0]?.reasoning).toMatchObject({ effort: variants[0] })
+            expect(
+              bodies[0]?.input.some(
+                (item: Record<string, unknown>) =>
+                  item.type === 'configuration_update',
+              ),
+            ).toBe(false)
+            if (variants.length === 1) return
+            expect(bodies[1]?.reasoning).toMatchObject({ effort: 'low' })
+            expect(
+              bodies[1]?.input.filter(
+                (item: Record<string, unknown>) =>
+                  item.type === 'configuration_update',
+              ),
+            ).toEqual([
+              { type: 'configuration_update', reasoning: { effort: 'xhigh' } },
+            ])
+            expect(bodies[1]?.input.at(-2)).toEqual({
+              type: 'configuration_update',
+              reasoning: { effort: 'xhigh' },
+            })
+            expect(bodies[1]?.input.at(-1)?.role).toBe('user')
+          })
+        }, 240_000)
+      }
+    }
+  }
   for (const mode of [
     'stream-error-missing-type',
     'stream-error-plain-type',

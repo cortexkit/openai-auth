@@ -37,6 +37,8 @@ Config file: `~/.config/opencode/openai-auth.json`. The directory follows `OPENC
 | Dump retention cap | `dumpMaxBytes` | `OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES` | `536870912` (512 MiB) | Retain this many dump-artifact bytes, evicting whole dumps oldest first. `0` disables the cap. Applies to both OpenCode 1 and 2. |
 | Codex endpoint | `codexApiEndpoint` | `CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT` | `https://chatgpt.com/backend-api/codex/responses` | Send rewritten Codex requests to a compatible proxy or relay instead of ChatGPT's backend endpoint. |
 
+On both OpenCode versions, `gpt-6.1-terra` inherits missing reasoning variants from the host's `gpt-6.1-sol` model. This makes variants such as `xhigh` available even when the host's Terra catalog entry is incomplete; Terra's existing variant definitions and custom overrides take precedence.
+
 Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty, in any case. Any other value is ignored, and the config file or the default decides.
 
 `dumpMaxBytes` accepts a nonnegative safe integer in bytes (a JSON number in the config file). An invalid value, including an empty environment variable, negative number, fraction, or unit suffix such as `512MiB`, falls back to 512 MiB and logs one warning per process. An explicitly set environment variable takes precedence even when invalid. `0` means **unlimited**, not zero retained bytes; use it only if you manage cleanup yourself.

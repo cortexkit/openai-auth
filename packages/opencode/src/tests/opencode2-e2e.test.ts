@@ -356,6 +356,7 @@ async function runScenario(input: {
               'gpt-5.5': { name: 'GPT-5.5 (mock)' },
               'gpt-6-sol': { name: 'GPT-6 Sol (mock)' },
               'gpt-6.1-sol': { name: 'GPT-6.1 Sol (mock)' },
+              'gpt-6.1-terra': { name: 'GPT-6.1 Terra (mock)' },
             },
           },
         },
@@ -1056,6 +1057,36 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       ).toEqual([false, true, true])
     })
   }, 180_000)
+
+  for (const transport of ['http', 'websocket'] as const) {
+    test(`${transport}: Terra inherits Sol's xhigh variant on the wire`, async () => {
+      const result = await runScenario({
+        transport,
+        accounts: ['A'],
+        model: 'gpt-6.1-terra',
+        turns: [{ variant: 'low' }, { variant: 'xhigh' }],
+      })
+      verify(result, () => {
+        expect(result.exits).toEqual([0, 0])
+        const bodies = samplesOn(
+          result,
+          transport === 'websocket' ? 'ws' : 'http',
+        ).map(bodyOf)
+        expect(bodies).toHaveLength(2)
+        expect(bodies[0]?.reasoning?.effort).toBe('low')
+        expect(bodies[1]?.reasoning?.effort).toBe('low')
+        expect(
+          bodies[1]?.input.filter(
+            (item: Record<string, unknown>) =>
+              item.type === 'configuration_update',
+          ),
+        ).toEqual([
+          { type: 'configuration_update', reasoning: { effort: 'xhigh' } },
+        ])
+        expect(bodies[1]?.input.at(-1)?.role).toBe('user')
+      })
+    }, 240_000)
+  }
 
   test('websocket: an effort change goes in as an update item, the effort stays pinned, and the turns after it chain on the same socket', async () => {
     const result = await runScenario({

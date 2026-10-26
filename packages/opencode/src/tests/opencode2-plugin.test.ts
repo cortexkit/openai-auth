@@ -1065,6 +1065,54 @@ describe('OpenCode 2 entry: the pool migration', () => {
 })
 
 describe('OpenCode 2 entry: models', () => {
+  it('inherits Sol variants for Terra without replacing Terra overrides', async () => {
+    const { host } = await startPool('main-first', [{ id: 'main' }])
+    const models = host.transformModels([
+      {
+        id: 'gpt-6.1-sol',
+        providerID: 'openai',
+        enabled: true,
+        limit: { context: 1, output: 1 },
+        variants: [
+          { id: 'low', settings: { reasoning: { effort: 'low' } } },
+          { id: 'xhigh', settings: { reasoning: { effort: 'xhigh' } } },
+          { id: 'future', body: { custom: true } },
+        ],
+      },
+      {
+        id: 'gpt-6.1-terra',
+        providerID: 'openai',
+        enabled: true,
+        limit: { context: 1, output: 1 },
+        variants: [
+          {
+            id: 'low',
+            settings: { reasoning: { effort: 'low', summary: 'detailed' } },
+          },
+          { id: 'custom', headers: { custom: 'value' } },
+        ],
+      },
+      {
+        id: 'gpt-6.1-terra',
+        providerID: 'other',
+        enabled: true,
+        limit: { context: 1, output: 1 },
+        variants: [],
+      },
+    ])
+    expect(models[1]?.variants).toEqual([
+      {
+        id: 'low',
+        settings: { reasoning: { effort: 'low', summary: 'detailed' } },
+      },
+      { id: 'xhigh', settings: { reasoning: { effort: 'xhigh' } } },
+      { id: 'future', body: { custom: true } },
+      { id: 'custom', headers: { custom: 'value' } },
+    ])
+    expect(models[0]?.variants).toHaveLength(3)
+    expect(models[2]?.variants).toEqual([])
+  })
+
   it('applies the OpenCode 1 allow and deny lists and context caps', () => {
     const model = (id: string, modelID = id): FakeModel => ({
       id,

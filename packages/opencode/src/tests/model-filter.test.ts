@@ -38,6 +38,7 @@ type MockModel = {
   options: { reasoningMode?: string }
   cost: ModelCost
   limit: { context: number; input: number; output: number }
+  variants?: Record<string, Record<string, unknown>>
 }
 
 function failingFetch(message: string): typeof globalThis.fetch {
@@ -108,8 +109,21 @@ async function surfacedModels() {
       }),
       'gpt-6-sol': model('gpt-6-sol', 'gpt-6-sol'),
       'gpt-6-luna': model('gpt-6-luna', 'gpt-6-luna'),
-      'gpt-6.1-sol': model('gpt-6.1-sol', 'gpt-6.1-sol'),
-      'gpt-6.1-terra': model('gpt-6.1-terra', 'gpt-6.1-terra'),
+      'gpt-6.1-sol': {
+        ...model('gpt-6.1-sol', 'gpt-6.1-sol'),
+        variants: {
+          low: { reasoningEffort: 'low', reasoningSummary: 'auto' },
+          xhigh: { reasoningEffort: 'xhigh' },
+          future: { reasoningEffort: 'future' },
+        },
+      },
+      'gpt-6.1-terra': {
+        ...model('gpt-6.1-terra', 'gpt-6.1-terra'),
+        variants: {
+          low: { reasoningEffort: 'low', reasoningSummary: 'detailed' },
+          custom: { reasoningEffort: 'high' },
+        },
+      },
       'gpt-6.1': model('gpt-6.1', 'gpt-6.1'),
       'gpt-6.1-fast': model('gpt-6.1-fast', 'gpt-6.1'),
     },
@@ -426,6 +440,17 @@ describe('provider.models filter', () => {
       input: 372_000,
       output: 128_000,
     })
+  })
+
+  it('inherits Sol variants for Terra without replacing Terra overrides', async () => {
+    const models = await surfacedModels()
+    expect(models['gpt-6.1-terra']?.variants).toEqual({
+      low: { reasoningEffort: 'low', reasoningSummary: 'detailed' },
+      xhigh: { reasoningEffort: 'xhigh' },
+      future: { reasoningEffort: 'future' },
+      custom: { reasoningEffort: 'high' },
+    })
+    expect(models['gpt-6.1-sol']?.variants).not.toHaveProperty('custom')
   })
 
   it('gives gpt-6.1-terra the 500k context Codex uses by default', async () => {

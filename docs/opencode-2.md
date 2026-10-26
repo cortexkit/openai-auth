@@ -40,7 +40,7 @@ To use only the [Claustrum vault](vault.md), enroll OpenCode with `/openai` → 
 - **Quota** from the `x-codex-*` response headers and `codex.rate_limits` frames is recorded on the account that served.
 - **Claustrum vault accounts** replace the pool's own while OpenCode is connected to the vault. OpenCode 1 and 2 share one enrollment; connect from `/openai` → **Vault** → **Connect** in either version, or with setup. No pool account is used, refreshed or polled while connected, and only ChatGPT logins are used, never API keys. Each request asks the vault for its token; if the vault refuses, another vault account is tried before anything is sent. If none can serve, the request is refused locally. An HTTP 401 is reported to the vault against the exact credential version used; a refused WebSocket handshake is not reported to the vault. A vault account starts serving after its first background quota reading.
 - **Responses Lite** (`responsesLite: true`) applies to HTTP requests for the Lite models. Over the WebSocket the standard request shape is sent: the Lite shape moves `tools` and `instructions` into the input, which would put the server's view of the conversation out of step with OpenCode 2's own continuation.
-- **Models**: the same allow and deny lists and context caps as on OpenCode 1, including Codex's 500k default context for `gpt-6.1-sol` and `gpt-6.1-terra` (372k input, 128k output).
+- **Models**: the same allow and deny lists and context caps as on OpenCode 1, including Codex's 500k default context for `gpt-6.1-sol` and `gpt-6.1-terra` (372k input, 128k output). Terra inherits the host's Sol reasoning variants when they are missing from Terra's catalog entry, without replacing Terra's existing variant definitions.
 
 ## Model costs
 

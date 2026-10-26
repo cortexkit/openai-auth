@@ -295,6 +295,13 @@ export function codexOAuthModelLimit(
   return undefined
 }
 
+/** Terra supports Sol's reasoning variants before every host catalog knows it. */
+export function codexOAuthModelVariantSource(
+  modelId: string,
+): string | undefined {
+  return modelId === 'gpt-6.1-terra' ? 'gpt-6.1-sol' : undefined
+}
+
 /**
  * Surfaced when a request would go to the wire with no credential.
  *
@@ -1572,18 +1579,28 @@ export async function CodexAuthPlugin(
                 model.options.reasoningMode !== 'pro' &&
                 codexOAuthModelListed(model.api.id),
             )
-            .map(([modelID, model]) => [
-              modelID,
-              {
-                ...model,
-                cost: zeroCosts
-                  ? { input: 0, output: 0, cache: { read: 0, write: 0 } }
-                  : (catalog?.[model.api.id] ??
-                    catalog?.[modelID] ??
-                    model.cost),
-                limit: codexOAuthModelLimit(model.id) ?? model.limit,
-              },
-            ]),
+            .map(([modelID, model]) => {
+              const sourceID = codexOAuthModelVariantSource(model.id)
+              const source = sourceID
+                ? provider.models[sourceID]?.variants
+                : undefined
+              return [
+                modelID,
+                {
+                  ...model,
+                  // Preserve Terra's own definitions, including configured overrides.
+                  ...(source
+                    ? { variants: { ...source, ...model.variants } }
+                    : {}),
+                  cost: zeroCosts
+                    ? { input: 0, output: 0, cache: { read: 0, write: 0 } }
+                    : (catalog?.[model.api.id] ??
+                      catalog?.[modelID] ??
+                      model.cost),
+                  limit: codexOAuthModelLimit(model.id) ?? model.limit,
+                },
+              ]
+            }),
         )
       },
     },
