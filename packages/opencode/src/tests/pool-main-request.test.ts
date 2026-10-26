@@ -730,6 +730,9 @@ describe('process heartbeat', () => {
       pid: process.pid,
       version: PackageVersion,
       startedAt: expect.any(Number),
+      // Which file layout this process uses per config folder; the layout
+      // tests (`runtime-layout.test.ts`) pin its contents.
+      layouts: expect.any(Object),
     })
     const { startedAt } = JSON.parse(readFileSync(file, 'utf8'))
     expect(startedAt).toBeGreaterThanOrEqual(startedBefore)

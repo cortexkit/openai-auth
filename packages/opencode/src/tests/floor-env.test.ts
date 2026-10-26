@@ -33,9 +33,10 @@ function isUnder(child: string, parent: string): boolean {
 
 describe('test environment floor', () => {
   it('resolves the plugin config dir under the floor when OPENCODE_CONFIG_DIR is removed', () => {
-    // The sessions file lives in getConfigDir(). Removing OPENCODE_CONFIG_DIR
-    // falls back to XDG_CONFIG_HOME, which must itself be floored, or the
-    // fallback lands in the operator's ~/.config/opencode.
+    // Runtime files (the sessions files among them) live in getConfigDir()
+    // until they move to the state home. Removing OPENCODE_CONFIG_DIR falls
+    // back to XDG_CONFIG_HOME, which must itself be floored, or the fallback
+    // lands in the operator's ~/.config/opencode.
     const floorDir = resolve(FLOOR_ROOTS.OPENCODE_CONFIG_DIR, '..', '..', '..')
     unsetEnv('OPENCODE_CONFIG_DIR')
     try {

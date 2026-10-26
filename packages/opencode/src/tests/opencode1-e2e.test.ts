@@ -220,7 +220,31 @@ interface ScenarioResult {
   readonly slot: unknown
   readonly authFileMode: number
   readonly doctorFindings: unknown[]
+  /**
+   * Where the runtime files ended up: the state folder's layout marker, the
+   * bytes of each seeded old-layout file at its new path, and the runtime
+   * files still in OpenCode's config folder.
+   */
+  readonly runtime: {
+    marker: Record<string, unknown>
+    moved: Record<string, string | null>
+    leftInConfig: string[]
+  }
   readonly diagnostics: string
+}
+
+/**
+ * Runtime files as versions before the move left them in OpenCode's config
+ * folder, relative to it: an empty account state, the vault enrollment, and
+ * a saved Codex session.
+ */
+const OLD_LAYOUT: Record<string, string> = {
+  'openai-auth-state.json': '{"version":1,"accounts":{}}\n',
+  'openai-auth-vault/opencode-enrollment.json': JSON.stringify({
+    token: '01'.repeat(32),
+    token_generation: 1,
+  }),
+  'openai-auth-sessions.json': `${JSON.stringify({ version: 1, sessions: { ses_old: { threadID: 'thread-before-the-move' } } })}\n`,
 }
 
 async function runScenario(
@@ -237,7 +261,10 @@ async function runScenario(
   const configDir = join(env.XDG_CONFIG_HOME, 'opencode')
   const dataDir = join(env.XDG_DATA_HOME, 'opencode')
   const configFile = join(configDir, 'openai-auth.json')
-  const stateFile = join(configDir, 'openai-auth-state.json')
+  // The plugin keeps its runtime files in the state home once it has moved
+  // them there (or on a fresh install).
+  const runtimeDir = join(env.XDG_STATE_HOME, 'cortexkit', 'openai-auth')
+  const stateFile = join(runtimeDir, 'openai-auth-state.json')
   const authFile = join(dataDir, 'auth.json')
   const daemon = vaultActivation
     ? await startMockDaemon({
@@ -251,14 +278,14 @@ async function runScenario(
     mkdirSync(configDir, { recursive: true })
     mkdirSync(dataDir, { recursive: true })
     writeFileSync(authFile, '{}\n', { mode: 0o600 })
-    const paths = vaultPaths(vaultStateDir(stateFile), 'opencode')
-    rosterPath = paths.rosterPath
-    mkdirSync(join(paths.tokenPath, '..'), { recursive: true, mode: 0o700 })
-    writeFileSync(
-      paths.tokenPath,
-      JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
-      { mode: 0o600 },
-    )
+    rosterPath = vaultPaths(vaultStateDir(stateFile), 'opencode').rosterPath
+    // An approved enrollment, a state file and a sessions file where an
+    // older version kept them: the first plugin start moves them.
+    for (const [relative, text] of Object.entries(OLD_LAYOUT)) {
+      const path = join(configDir, relative)
+      mkdirSync(join(path, '..'), { recursive: true, mode: 0o700 })
+      writeFileSync(path, text, { mode: 0o600 })
+    }
   } else seedLegacyInstall(configDir, dataDir)
   if (effort) {
     writeFileSync(
@@ -508,6 +535,22 @@ async function runScenario(
   try {
     pluginLog = readFileSync(env.OPENCODE_OPENAI_AUTH_LOG_FILE, 'utf8')
   } catch {}
+  const readText = (path: string) =>
+    existsSync(path) ? readFileSync(path, 'utf8') : null
+  const runtime = {
+    marker: readJson(join(runtimeDir, 'layout.json')),
+    moved: Object.fromEntries(
+      Object.keys(OLD_LAYOUT).map((relative) => [
+        relative,
+        readText(join(runtimeDir, relative)),
+      ]),
+    ),
+    leftInConfig: [
+      'openai-auth-state.json',
+      'openai-auth-vault',
+      'openai-auth-sessions.json',
+    ].filter((name) => existsSync(join(configDir, name))),
+  }
   const result: ScenarioResult = {
     ...(failure !== undefined ? { failure } : {}),
     wire: [...mock.records],
@@ -519,6 +562,7 @@ async function runScenario(
     slot,
     authFileMode: existsSync(authFile) ? statSync(authFile).mode & 0o777 : 0,
     doctorFindings,
+    runtime,
     diagnostics: [
       `wire before the run: ${JSON.stringify(wireBeforeRun)}`,
       `wire: ${JSON.stringify(mock.records)}`,
@@ -526,6 +570,7 @@ async function runScenario(
       `host model: ${JSON.stringify(hostModel)}`,
       `config: ${JSON.stringify(config)}`,
       `slot: ${JSON.stringify(slot)}`,
+      `runtime files: ${JSON.stringify(runtime)}`,
       `--- run (exit ${run.exit}) ---\n${run.stdout}\n${run.stderr}`,
       `--- plugin log (tail) ---\n${pluginLog.slice(-8000)}`,
       `--- host log (tail) ---\n${serverLog.join('').slice(-8000)}`,
@@ -666,6 +711,13 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 1 (real host)', () => {
       // The placeholder went through OpenCode 1's own writer, which keeps
       // `auth.json` readable by its owner only.
       expect(result.authFileMode).toBe(0o600)
+      // A fresh install keeps its runtime files in the state home from the
+      // start, and none in OpenCode's config folder.
+      expect(result.runtime.marker).toMatchObject({
+        version: 1,
+        oldFilesRemoved: true,
+      })
+      expect(result.runtime.leftInConfig).toEqual([])
 
       // The turn after the move, with the slot holding the placeholder, went
       // out under the row's login and account.
@@ -686,9 +738,26 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 1 (real host)', () => {
     })
   }, 240_000)
 
-  test('vault login activates an empty host slot and requests route only to the vault', async () => {
+  test('vault login moves the old runtime files, activates an empty host slot and requests route only to the vault', async () => {
     const result = await runScenario(true)
     verify(result, () => {
+      // The first plugin start (the login) moved the state file, the vault
+      // enrollment and the sessions file out of OpenCode's config folder,
+      // byte for byte, and the host still served from the vault after it.
+      expect(result.runtime.marker).toMatchObject({
+        version: 1,
+        oldFilesRemoved: true,
+      })
+      expect(result.runtime.leftInConfig).toEqual([])
+      expect(
+        result.runtime.moved['openai-auth-vault/opencode-enrollment.json'],
+      ).toBe(OLD_LAYOUT['openai-auth-vault/opencode-enrollment.json'])
+      // The request saved its own session beside the moved one.
+      expect(
+        JSON.parse(result.runtime.moved['openai-auth-sessions.json'] ?? '{}')
+          .sessions?.ses_old,
+      ).toEqual({ threadID: 'thread-before-the-move' })
+      expect(result.runtime.moved['openai-auth-state.json']).not.toBeNull()
       expect(isPoolPlaceholder(result.slot)).toBe(true)
       expect(result.slot).toEqual(POOL_PLACEHOLDER)
       expect(result.config.commonAuthPool?.rows ?? {}).toEqual({})

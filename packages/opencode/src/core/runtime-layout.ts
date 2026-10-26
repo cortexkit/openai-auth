@@ -618,7 +618,8 @@ async function readMarker(path: string): Promise<LayoutMarker | undefined> {
   try {
     text = await readFile(path, 'utf8')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'ENOTDIR') return undefined
     // It exists, which is what makes the folder authoritative (the
     // resolver's own check is existence alone); see below.
     return { version: 1, oldDir: '', oldFilesRemoved: true }

@@ -265,8 +265,24 @@ interface ScenarioResult {
   }
   readonly state: { accounts: Record<string, { refresh?: string }> }
   readonly exported: string
+  /**
+   * Where the runtime files ended up: the state folder's layout marker, the
+   * bytes of the seeded vault enrollment and sessions file at their new
+   * paths, and the runtime files still in OpenCode's config folder.
+   */
+  readonly runtime: {
+    marker: Record<string, unknown>
+    moved: Record<string, string | null>
+    leftInConfig: string[]
+  }
   readonly diagnostics: string
 }
+
+/** The vault enrollment `seedPool`'s vault scenarios add to the old layout. */
+const OLD_VAULT_TOKEN = 'openai-auth-vault/opencode-enrollment.json'
+/** A saved Codex session where versions before the move kept it. */
+const OLD_SESSIONS = 'openai-auth-sessions-opencode2.json'
+const OLD_SESSIONS_TEXT = `${JSON.stringify({ version: 1, sessions: { ses_old: { threadID: 'thread-before-the-move' } } })}\n`
 
 async function runScenario(input: {
   transport: Transport
@@ -298,7 +314,10 @@ async function runScenario(input: {
     OPENAI_AUTH_E2E_RETRIES: join(root, 'retries.jsonl'),
   }
   const configDir = join(isolated.XDG_CONFIG_HOME, 'opencode')
+  // The pool is seeded where versions before the move kept it; the plugin
+  // moves its runtime files into the state home at its first start.
   seedPool(configDir, input.accounts, input.mode)
+  const runtimeDir = join(isolated.XDG_STATE_HOME, 'cortexkit', 'openai-auth')
   if (input.upgrade) {
     const dataDir = join(isolated.XDG_DATA_HOME, 'opencode')
     mkdirSync(dataDir, { recursive: true })
@@ -330,6 +349,9 @@ async function runScenario(input: {
       JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
       { mode: 0o600 },
     )
+    writeFileSync(join(configDir, OLD_SESSIONS), OLD_SESSIONS_TEXT, {
+      mode: 0o600,
+    })
   }
   const model = input.model ?? 'gpt-5.5'
   writeFileSync(
@@ -454,7 +476,24 @@ async function runScenario(input: {
     }
   }
   const config = read(join(configDir, 'openai-auth.json'))
-  const state = read(join(configDir, 'openai-auth-state.json'))
+  const state = read(join(runtimeDir, 'openai-auth-state.json'))
+  const readText = (path: string) =>
+    existsSync(path) ? readFileSync(path, 'utf8') : null
+  const runtime = {
+    marker: read(join(runtimeDir, 'layout.json')),
+    moved: Object.fromEntries(
+      [OLD_VAULT_TOKEN, OLD_SESSIONS].map((relative) => [
+        relative,
+        readText(join(runtimeDir, relative)),
+      ]),
+    ),
+    leftInConfig: [
+      'openai-auth-state.json',
+      'openai-auth-vault',
+      'openai-auth-sessions.json',
+      OLD_SESSIONS,
+    ].filter((name) => existsSync(join(configDir, name))),
+  }
   let pluginLog = ''
   try {
     pluginLog = readFileSync(isolated.OPENCODE_OPENAI_AUTH_LOG_FILE, 'utf8')
@@ -475,6 +514,7 @@ async function runScenario(input: {
   const diagnostics = [
     `exported credential: ${exported}`,
     `destinations: ${JSON.stringify(destinations)}`,
+    `runtime files: ${JSON.stringify(runtime)}`,
     `vault reports: ${JSON.stringify(daemon?.reports ?? [])}`,
     `wire: ${JSON.stringify(mock.records)}`,
     `samples: ${JSON.stringify(mock.samples)}`,
@@ -496,6 +536,7 @@ async function runScenario(input: {
     config,
     state,
     exported,
+    runtime,
     diagnostics,
   }
 }
@@ -1168,7 +1209,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     })
   }, 180_000)
 
-  test('http: a vault account is served with the token the vault hands out, and a 401 is reported with its record version', async () => {
+  test('http: the old runtime files move to the state home, then a vault account is served with the token the vault hands out, and a 401 is reported with its record version', async () => {
     const result = await runScenario({
       transport: 'http',
       accounts: ['A'],
@@ -1178,6 +1219,21 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       turns: [{}, {}, { reject: { account: 'V', mode: 'unauthorized' } }],
     })
     verify(result, () => {
+      // The server's start moved the state file, the vault enrollment and the
+      // sessions file out of OpenCode's config folder; vault mode survived it.
+      expect(result.runtime.marker).toMatchObject({
+        version: 1,
+        oldFilesRemoved: true,
+      })
+      expect(result.runtime.leftInConfig).toEqual([])
+      expect(result.runtime.moved[OLD_VAULT_TOKEN]).toBe(
+        JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+      )
+      expect(
+        JSON.parse(result.runtime.moved[OLD_SESSIONS] ?? '{}').sessions
+          ?.ses_old,
+      ).toEqual({ threadID: 'thread-before-the-move' })
+      expect(result.state.accounts.main?.refresh).toBe('refresh-A')
       expect(result.exits.slice(0, 2)).toEqual([0, 0])
       expectOnlyPoolAccountsOnWire(result)
       const served = pick(primaries(result.wire), 'identity', 'rejected')

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import {
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -32,6 +33,21 @@ function tempDir() {
 }
 
 const readJson = (path: string) => JSON.parse(readFileSync(path, 'utf8'))
+
+/**
+ * Where a server process with OPENCODE_CONFIG_DIR at `configDir` keeps its
+ * sessions files: the state-home folder keyed to that config folder, which
+ * names it in `config-dir.json`.
+ */
+function runtimeDir(root: string, configDir: string): string {
+  const base = join(root, 'XDG_STATE_HOME', 'cortexkit', 'openai-auth')
+  for (const name of readdirSync(base)) {
+    if (!name.startsWith('config-')) continue
+    const note = readJson(join(base, name, 'config-dir.json'))
+    if (note.configDir === configDir) return join(base, name)
+  }
+  throw new Error(`no state-home folder names ${configDir}`)
+}
 
 const threadsOf = (store: CodexSessionStore) =>
   Object.fromEntries(
@@ -272,10 +288,12 @@ describe('OpenCode 2 sessions across locations and restarts', () => {
       expect(later?.threadID).toBe(opened?.threadID as string)
       expect(later?.turnID).toBe(opened?.turnID as string)
     }
-    expect(readJson(join(configDir, OPENCODE2_FILE))).toEqual({
-      version: 1,
-      sessions: { ses_1: { threadID: opened?.threadID } },
-    })
+    expect(readJson(join(runtimeDir(root, configDir), OPENCODE2_FILE))).toEqual(
+      {
+        version: 1,
+        sessions: { ses_1: { threadID: opened?.threadID } },
+      },
+    )
     const [restarted] = await runProcess(root, configDir, 1, [send(0, 'ses_1')])
     expect(restarted?.threadID).toBe(opened?.threadID as string)
     expect(restarted?.cacheKey).toBe(opened?.threadID)
@@ -285,6 +303,8 @@ describe('OpenCode 2 sessions across locations and restarts', () => {
 
   test('OpenCode 2 processes leave OpenCode 1 sessions unchanged and keep every thread id', async () => {
     const { root, configDir } = serverFixture()
+    // Seeded where versions before the move kept it; the first server start
+    // moves it, unchanged, into the state home.
     const opencode1 = join(configDir, OPENCODE1_FILE)
     const seeded = `${JSON.stringify(
       { version: 1, sessions: { ses_1: { threadID: 'opencode1-thread' } } },
@@ -330,8 +350,10 @@ describe('OpenCode 2 sessions across locations and restarts', () => {
       Object.fromEntries(created.map((sent) => [sent.session, sent.threadID])),
     )
     expect(
-      readJson(join(configDir, OPENCODE2_FILE)).sessions,
+      readJson(join(runtimeDir(root, configDir), OPENCODE2_FILE)).sessions,
     ).not.toHaveProperty('ses_gone')
-    expect(readFileSync(opencode1, 'utf8')).toBe(seeded)
+    expect(
+      readFileSync(join(runtimeDir(root, configDir), OPENCODE1_FILE), 'utf8'),
+    ).toBe(seeded)
   })
 })
