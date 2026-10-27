@@ -1,6 +1,6 @@
 # OpenCode 2
 
-The OpenCode package, `@cortexkit/opencode-openai-auth`, runs on OpenCode 2 (`@opencode/cli`, tested on 2.0.22).
+The OpenCode package, `@cortexkit/opencode-openai-auth`, runs on OpenCode 2 (`@opencode/cli`, tested on 2.2.0).
 
 ## Manual install
 
