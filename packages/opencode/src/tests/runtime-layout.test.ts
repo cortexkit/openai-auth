@@ -190,8 +190,10 @@ const REFUSED = /^openai-auth cannot start: /
 describe('where the runtime folder is', () => {
   it('is opencode/ only for <home>/.config/opencode, and a keyed folder for every other config folder', async () => {
     const home = join(root, 'home')
+    // `os.homedir()` reads HOME on POSIX and USERPROFILE on Windows.
     const env = (extra: Record<string, string | undefined>) => ({
       HOME: home,
+      USERPROFILE: home,
       XDG_CONFIG_HOME: undefined,
       OPENCODE_CONFIG_DIR: undefined,
       ...extra,
@@ -733,7 +735,16 @@ describe('paths the move must not touch', () => {
     seed(configDir(), files)
     mkdirSync(dirname(runtimeDir()), { recursive: true })
     symlinkSync(configDir(), runtimeDir(), POSIX ? 'dir' : 'junction')
-    expect(await prepare()).toBe('legacy')
+    if (POSIX) {
+      // Registered on the legacy layout; the move is refused.
+      expect(await prepare()).toBe('legacy')
+    } else {
+      // Windows' private-files check refuses the junction when the layout
+      // lock is taken there, so the start is refused instead.
+      await expect(prepare()).rejects.toThrow(
+        /is not a folder only your user can access, or it is a link/,
+      )
+    }
     expect(present(configDir(), files)).toEqual(files)
     expect(existsSync(join(configDir(), 'layout.json'))).toBe(false)
   })

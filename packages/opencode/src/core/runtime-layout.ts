@@ -142,11 +142,19 @@ export class RuntimeLayoutRefusal extends Error {
   constructor(
     readonly stateDir: string,
     readonly errorClass: string,
-    message = `openai-auth cannot start: it could not settle where its runtime files live in ${stateDir} (${errorClass}). Check that this folder can be created and written by your user, then restart OpenCode.`,
+    message = refusalMessage(stateDir, errorClass),
   ) {
     super(message)
     this.name = 'RuntimeLayoutRefusal'
   }
+}
+
+function refusalMessage(stateDir: string, errorClass: string): string {
+  // The private-files check refused the folder itself: it is a link, or
+  // others can reach it. Creating or writing it is not the problem.
+  if (errorClass === 'ERR_PRIVATE_FILES_SECURITY')
+    return `openai-auth cannot start: ${stateDir} is not a folder only your user can access, or it is a link, so the plugin will not use it (${errorClass}). Replace it with a plain folder of your own, then restart OpenCode.`
+  return `openai-auth cannot start: it could not settle where its runtime files live in ${stateDir} (${errorClass}). Check that this folder can be created and written by your user, then restart OpenCode.`
 }
 
 function foreignFolder(stateDir: string, identity: string) {
@@ -247,6 +255,18 @@ function errorClass(error: unknown): string {
   const code = (error as { code?: unknown } | null)?.code
   if (typeof code === 'string' && code) return code
   return error instanceof Error ? error.name : typeof error
+}
+
+/**
+ * The name of the file an error is about, without its folder, and the
+ * private-file stage when there is one, for a log line.
+ */
+function errorFile(error: unknown): { file?: string; stage?: string } {
+  const { path, stage } = (error ?? {}) as { path?: unknown; stage?: unknown }
+  return {
+    ...(typeof path === 'string' && path ? { file: basename(path) } : {}),
+    ...(typeof stage === 'string' && stage ? { stage } : {}),
+  }
 }
 
 class LayoutMoveError extends Error {
@@ -598,10 +618,14 @@ async function finishOldFiles(
 ): Promise<void> {
   let locks: RefreshFileLock[] = []
   let done = false
+  // Which step failed, for the warning below.
+  let step = 'fence'
   try {
     const gate = await input.fence()
     if (!gate.open) return
+    step = 'data-locks'
     locks = await takeDataLocks(location, files)
+    step = 'same-file-check'
     const aliases = await physicalAliases(location, files)
     if (aliases.length > 0) {
       logOnce(`${location.key}\0cleanup-aliased`, () =>
@@ -612,6 +636,7 @@ async function finishOldFiles(
       )
       return
     }
+    step = 'remove-old-copies'
     await layoutLock.assertOwned()
     await removeOldCopies(
       location,
@@ -620,14 +645,21 @@ async function finishOldFiles(
       input.log,
     )
     done = true
+    step = 'marker'
     await layoutLock.assertOwned()
     await writeMarker(markerPath, { ...marker, oldFilesRemoved: true })
+    step = 'manifest'
     await removeManifest(location.stateHomeDir)
   } catch (error) {
     logOnce(`${location.key}\0cleanup`, () =>
       input.log.warn(
         "openai-auth could not finish removing its old files from OpenCode's config folder; it tries again at the next start",
-        { configDir: location.configDir, errorClass: errorClass(error) },
+        {
+          configDir: location.configDir,
+          step,
+          errorClass: errorClass(error),
+          ...errorFile(error),
+        },
       ),
     )
   } finally {
@@ -1033,12 +1065,20 @@ async function takeLock(
 ): Promise<RefreshFileLock> {
   const started = performance.now()
   for (;;) {
-    const lock = await acquireRefreshFileLock({
-      name,
-      path,
-      ttlMs: LOCK_TTL_MS,
-      renew: true,
-    })
+    let lock: RefreshFileLock | null = null
+    try {
+      lock = await acquireRefreshFileLock({
+        name,
+        path,
+        ttlMs: LOCK_TTL_MS,
+        renew: true,
+      })
+    } catch (error) {
+      // On Windows a holder that releases while this attempt reads its lock
+      // file makes the attempt fail with ENOENT: the lock is free, so try
+      // again rather than fail.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
     if (lock) return lock
     if (performance.now() - started >= waitMs)
       throw new LayoutMoveError('lock-timeout', `${name} lock at ${path}`)
