@@ -1,7 +1,9 @@
 // Renders the collapsed sidebar on OpenCode 2 (the `sidebar.content` slot)
 // and OpenCode 1 (the `sidebar_content` slot) side by side in a 42-column
 // frame, the sidebar width OpenCode uses, and checks both draw the same
-// characters and colors. Run as a script with the shared Solid/OpenTUI
+// characters and colors; then at 37 and 36 columns (the widths a default
+// OpenCode sidebar gives the plugin) checks the border and whole quota text.
+// Run as a script with the shared Solid/OpenTUI
 // runtime preloaded (see tui-quota-render.test.ts); it prints
 // `collapsed-sidebar-render passed` on success.
 import assert from 'node:assert/strict'
@@ -326,6 +328,37 @@ try {
   assert.equal(cut.length, full?.length)
   assert.ok(!frame().includes(long))
   assert.ok(cut.length < WIDTH, cut)
+
+  // At the widths OpenCode gives the plugin (37 on OpenCode 2, 36 on
+  // OpenCode 1 once its sidebar scrollbar shows) the sidebar keeps its
+  // single-line border, and every account line still fits on one row with
+  // its quota text whole: only the label is cut.
+  for (const width of [37, 36]) {
+    view.resize(width, 14)
+    v1.resize(width, 14)
+    await step({
+      main: { quota: fresh, killed: false },
+      fallbacks: [account('long', long, fresh)],
+      ...route('main'),
+    })
+    const lines = frame()
+      .split('\n')
+      .map((line) => Array.from(line))
+    const at = `at width ${width}: ${frame()}`
+    assert.ok(
+      lines[0]?.[0] === '┌' && lines[0]?.[width - 1] === '┐',
+      `the sidebar has no top border corners ${at}`,
+    )
+    assert.ok(
+      lines.some((line) => line[0] === '└' && line[width - 1] === '┘'),
+      `the sidebar has no bottom border corners ${at}`,
+    )
+    const [mainLine = '', longLine = ''] = accountLines()
+    assert.match(mainLine, new RegExp(`^main +${NARROW} ●$`), at)
+    assert.match(longLine, new RegExp(`^a-very-[^ ]*… ${NARROW} ●$`), at)
+    // Border and padding take two columns each side.
+    assert.equal(longLine.length, width - 4, at)
+  }
 } finally {
   cleanup()
   await view.dispose()

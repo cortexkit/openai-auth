@@ -808,7 +808,7 @@ describe('expanded sidebar quota rows', () => {
 })
 
 describe('expanded sidebar frame on OpenCode 1 and OpenCode 2', () => {
-  test('quota rows stay on one line with a space before the reset at every width from 42 to 16 columns', async () => {
+  test('quota rows stay on one line with a space before the reset at every width from 42 to 18 columns', async () => {
     const child = Bun.spawn(
       [
         process.execPath,

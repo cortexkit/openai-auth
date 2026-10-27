@@ -112,9 +112,6 @@ const PLUGIN_VERSION: string = (() => {
   return ''
 })()
 
-// biome-ignore lint/suspicious/noExplicitAny: opentui border prop not typed in plugin tui surface
-const SINGLE_BORDER = { type: 'single' } as any
-
 type Tone = 'ok' | 'warn' | 'err' | 'muted' | 'accent' | 'text'
 type ThemeCurrent = Pick<
   TuiPluginApi['theme']['current'],
@@ -294,17 +291,46 @@ function SectionHeader(props: {
   )
 }
 
+// A muted label left and a value right (route, health, killswitch). Like the
+// quota rows it stays on one line: it measures its own width and, when both do
+// not fit, cuts only the value (with …), keeping one blank cell after the
+// label.
 function StatRow(props: {
   theme: ThemeCurrent
   label: string
   value: string
   tone?: Tone
 }) {
+  const [width, setWidth] = createSignal(0)
+  let row: { width: number } | undefined
+  const value = () => {
+    const columns = width()
+    if (columns <= 0) return props.value
+    return fitCollapsedLabel(
+      props.value,
+      columns - displayWidth(props.label) - 1,
+    )
+  }
   return (
-    <box width='100%' flexDirection='row' justifyContent='space-between'>
-      <text fg={props.theme.textMuted}>{props.label}</text>
-      <text fg={toneColor(props.theme, props.tone ?? 'text')}>
-        <b>{props.value}</b>
+    <box
+      ref={(element: { width: number }) => {
+        row = element
+      }}
+      onSizeChange={() => setWidth(row?.width ?? 0)}
+      width='100%'
+      flexDirection='row'
+      justifyContent='space-between'
+      columnGap={1}
+    >
+      <text fg={props.theme.textMuted} wrapMode='none' flexShrink={0}>
+        {props.label}
+      </text>
+      <text
+        fg={toneColor(props.theme, props.tone ?? 'text')}
+        wrapMode='none'
+        flexShrink={1}
+      >
+        <b>{value()}</b>
       </text>
     </box>
   )
@@ -1127,7 +1153,8 @@ function QuotaSidebar(props: {
     <box
       width='100%'
       flexDirection='column'
-      border={SINGLE_BORDER}
+      border
+      borderStyle='single'
       borderColor={theme().borderActive}
       paddingTop={1}
       paddingBottom={1}

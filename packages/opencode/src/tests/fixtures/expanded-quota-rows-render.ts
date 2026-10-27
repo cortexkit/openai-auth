@@ -1,11 +1,14 @@
 // Renders the expanded sidebar on OpenCode 2 (the `sidebar.content` slot) and
 // OpenCode 1 (the `sidebar_content` slot) at every width the plugin may be
-// given, from 42 cells down to 16 (a default OpenCode sidebar gives it 36 or
-// 37), and checks each quota row:
+// given, from 42 cells down to 18 (a default OpenCode sidebar gives it 36 or
+// 37), and checks the sidebar's single-line border is drawn and each quota
+// row:
 // it stays on one line, keeps a space between the "N% left" figure and the
 // reset time, and when the row is too narrow drops the reset first, then
 // shortens the bar. The pacing line under a row is cut with … rather than
-// wrapped. Both hosts must draw the same characters and colors. Run as a
+// wrapped. The Killswitch row keeps a blank cell after its label and cuts a
+// value too long for the row with …. Both hosts must draw the same characters
+// and colors. Run as a
 // script with the shared Solid/OpenTUI runtime preloaded (see
 // tui-quota-render.test.ts); it prints `expanded-quota-rows-render passed` on
 // success. Set SHOW_FRAMES=1 to print the quota rows drawn at each width.
@@ -147,7 +150,7 @@ const cleanup = await plugin.setup({
     },
   },
 })
-const HEIGHT = 24
+const HEIGHT = 30
 const FULL_WIDTH = 42
 const view = await testRender(() => claim?.render({ sessionID: 'session' }), {
   width: FULL_WIDTH,
@@ -193,8 +196,11 @@ async function drawAt(width: number) {
   assert.deepEqual(view.captureSpans(), v1.captureSpans())
 }
 
+// The sidebar's border and one-cell padding take two columns on each side.
+const EDGE = 2
+
 /**
- * The frame's lines without the sidebar's one-column padding on each side, so
+ * The frame's lines without the sidebar's border and padding on each side, so
  * every line is the `columns` the rows lay themselves out in.
  */
 function contentLines(width: number): string[] {
@@ -203,9 +209,25 @@ function contentLines(width: number): string[] {
     .split('\n')
     .map((line) =>
       Array.from(line)
-        .slice(1, width - 1)
+        .slice(EDGE, width - EDGE)
         .join(''),
     )
+}
+
+/** Asserts the sidebar's box is drawn with single-line corners. */
+function assertBorder(width: number) {
+  const frame = view.captureCharFrame()
+  const lines = frame.split('\n').map((line) => Array.from(line))
+  const at = `at width ${width}: ${frame}`
+  const top = lines[0] ?? []
+  assert.ok(
+    top[0] === '┌' && top[width - 1] === '┐',
+    `the sidebar has no top border corners ${at}`,
+  )
+  assert.ok(
+    lines.some((line) => line[0] === '└' && line[width - 1] === '┘'),
+    `the sidebar has no bottom border corners ${at}`,
+  )
 }
 
 const BAR = /[█░▒▓]/g
@@ -222,9 +244,10 @@ const MIN_BAR = 3
 
 await Promise.all([...polls.values()].map((refresh) => refresh()))
 try {
-  for (let width = FULL_WIDTH; width >= 16; width--) {
+  for (let width = FULL_WIDTH; width >= 18; width--) {
     await drawAt(width)
-    const columns = width - 2
+    assertBorder(width)
+    const columns = width - 2 * EDGE
     const lines = contentLines(width)
     const frame = view.captureCharFrame()
     if (process.env.SHOW_FRAMES) {
@@ -353,7 +376,7 @@ try {
   await Promise.all([...polls.values()].map((refresh) => refresh()))
   for (const width of [37, 36]) {
     await drawAt(width)
-    const columns = width - 2
+    const columns = width - 2 * EDGE
     const lines = contentLines(width)
     const at = `at width ${width}: ${view.captureCharFrame()}`
     const serving = lines.filter((line) => line.trimEnd().endsWith(CREDITS))
@@ -370,6 +393,91 @@ try {
       '',
       `the serving-on-credits row wraps onto a second line ${at}`,
     )
+  }
+
+  // The Killswitch row names the blocked accounts. At the widths OpenCode
+  // gives the plugin it keeps at least one blank cell after its label, and a
+  // value too long for the row is cut with … on its one line rather than run
+  // into the label or wrapped. The accounts carry no reading, so the quota
+  // section stays short and the row is inside the frame.
+  const killed = (label: string) => ({
+    id: label,
+    label,
+    enabled: true,
+    killed: true,
+    quota: null,
+  })
+  const showKilled = async (labels: string[], sequence: number) => {
+    publish({
+      lastUpdated: now + sequence,
+      main: { killed: false, quota: null },
+      fallbacks: labels.map(killed),
+      activeId: 'main',
+      route: 'main-first',
+    })
+    await Promise.all([...polls.values()].map((refresh) => refresh()))
+  }
+  /** The Killswitch row and the row under it, border and padding left out. */
+  const killswitchRow = () => {
+    const lines = view
+      .captureCharFrame()
+      .split('\n')
+      .map((line) => line.replace(/^[│ ]+|[│ ]+$/g, ''))
+    const index = lines.findIndex((line) => line.startsWith('Killswitch'))
+    return { row: lines[index] ?? '', next: lines[index + 1] ?? '' }
+  }
+  // One blocked account: its value is 24 cells, so with the label and the
+  // blank cell the row needs 35 columns. 36 and 37 give it 32 and 33.
+  await showKilled(['team@example.com'], 2)
+  const expectedKillswitch: Record<number, string> = {
+    36: 'Killswitch team@example.com blo…',
+    37: 'Killswitch team@example.com bloc…',
+  }
+  for (const width of [36, 37]) {
+    await drawAt(width)
+    const { row, next } = killswitchRow()
+    const at = `at width ${width}: ${view.captureCharFrame()}`
+    assert.match(
+      row,
+      /^Killswitch [^ ]/,
+      `the Killswitch row has no blank cell before its value ${at}`,
+    )
+    assert.equal(
+      row,
+      expectedKillswitch[width],
+      `the Killswitch row is not cut to its width ${at}`,
+    )
+    assert.equal(next.trim(), '', `the Killswitch row wraps ${at}`)
+  }
+  // Two blocked accounts: a value far longer than the row is cut with ….
+  const names = ['team@example.com', 'personal@example.com']
+  const full = `${names.join(', ')} blocked`
+  await showKilled(names, 3)
+  for (const width of [37, 36]) {
+    await drawAt(width)
+    const columns = width - 2 * EDGE
+    const { row, next } = killswitchRow()
+    const at = `at width ${width}: ${view.captureCharFrame()}`
+    assert.ok(
+      row.endsWith('…'),
+      `the long Killswitch value is not cut with … ${at}`,
+    )
+    assert.match(
+      row,
+      /^Killswitch [^ ]/,
+      `no blank cell before the value ${at}`,
+    )
+    const value = row.slice('Killswitch '.length, -1)
+    assert.ok(
+      value.length > 0 && full.startsWith(value),
+      `the Killswitch value is not the start of "${full}" ${at}`,
+    )
+    assert.equal(
+      Array.from(row).length,
+      columns,
+      `the Killswitch row does not fill its width ${at}`,
+    )
+    assert.equal(next.trim(), '', `the Killswitch row wraps ${at}`)
   }
 } finally {
   cleanup()
