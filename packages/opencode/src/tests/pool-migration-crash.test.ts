@@ -8,6 +8,7 @@ import { mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
+import { writePortFile as writeCommonPortFile } from '@cortexkit/common-auth/rpc'
 import { openPoolStore } from '@cortexkit/common-auth/store'
 import {
   hashRefreshToken,
@@ -24,7 +25,6 @@ import {
   poolPlaceholderWithoutMain,
 } from '../core/pool-migration.ts'
 import { migrationFenceOpen, rpcStateRoot } from '../core/version-fence.ts'
-import { writePortFile } from '../rpc/port-file.ts'
 import { createFailurePhaseClock } from './failure-phase-clock.ts'
 import {
   CRASH_EXIT_CODE,
@@ -124,7 +124,9 @@ async function fenceWithPreTolerantBuildRunning(
   migratorPid: number | undefined,
 ) {
   const stateHome = join(h.dir, 'xdg-state')
-  await writePortFile(
+  // The library writer, not the plugin's: this version's writer stamps its
+  // own version into the record, which a pre-tolerant build never did.
+  await writeCommonPortFile(
     join(rpcStateRoot(stateHome), 'openai-auth-0123456789abcdef'),
     { pid: process.pid, port: 1, token: 'pre-tolerant-build' },
   )
