@@ -89,6 +89,12 @@ export interface OpenCodeMenuContext {
   > | null
   /** Host-specific limits to show alongside the keep-warm status. */
   cacheKeepNotice?: string
+  /**
+   * A one-time status line about the runtime files' location, such as old
+   * files found again in OpenCode's config folder; undefined when there is
+   * nothing to show (`takeRuntimeLayoutNotice`).
+   */
+  layoutNotice?: () => string | undefined
   setCacheKeepEnabled?: (enabled: boolean) => void
   setCacheKeepSubagents?: (enabled: boolean) => void
   setCacheKeepSustain?: (enabled: boolean) => void
@@ -324,11 +330,13 @@ function diagnosticsSection(ctx: OpenCodeMenuContext) {
         settings.dumpMaxBytes === 0
           ? 'no cap'
           : `${formatDumpBytes(settings.dumpMaxBytes)} cap`
+      const layoutNotice = ctx.layoutNotice?.()
       return {
         lines: [
           dumping ? `Dumps on (${usage} / ${cap})` : 'Dumps off',
           `Dump directory: ${settings.dumpDir}`,
           `Log level: ${level}`,
+          ...(layoutNotice ? [layoutNotice] : []),
         ],
         actions: [
           {

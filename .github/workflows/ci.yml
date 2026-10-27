@@ -84,3 +84,20 @@ jobs:
           OPENAI_AUTH_OPENCODE1_E2E: "1"
         working-directory: packages/opencode
         run: bun test src/tests/opencode1-e2e.test.ts
+  # The one-time move of the runtime files into the state home on Windows,
+  # where owner-only files and folders go through the private-files ACLs,
+  # links are junctions and an open file can refuse to be removed.
+  runtime-layout-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+      - run: bun install --frozen-lockfile
+      - name: Runtime layout move
+        working-directory: packages/opencode
+        run: bun test src/tests/runtime-layout.test.ts

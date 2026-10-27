@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -34,28 +35,13 @@ function tempDir() {
 
 const readJson = (path: string) => JSON.parse(readFileSync(path, 'utf8'))
 
-/**
- * Where a server process with OPENCODE_CONFIG_DIR at `configDir` keeps its
- * sessions files: the state-home folder keyed to that config folder, which
- * names it in `config-dir.json`.
- */
-function runtimeDir(root: string, configDir: string): string {
-  const base = join(root, 'XDG_STATE_HOME', 'cortexkit', 'openai-auth')
-  for (const name of readdirSync(base)) {
-    if (!name.startsWith('config-')) continue
-    const note = readJson(join(base, name, 'config-dir.json'))
-    if (note.configDir === configDir) return join(base, name)
-  }
-  throw new Error(`no state-home folder names ${configDir}`)
-}
-
 const threadsOf = (store: CodexSessionStore) =>
   Object.fromEntries(
     [...store.sessions].map(([id, metadata]) => [id, metadata.threadID]),
   )
 
 describe('Codex session file helpers', () => {
-  test('OpenCode 1 save writes the whole map at the given path and load mints fresh turn ids', () => {
+  test('OpenCode 1 save writes the whole map at the given path and load mints fresh turn ids', async () => {
     const path = join(tempDir(), 'nested', OPENCODE1_FILE)
     const sessions = new Map<string, CodexSessionMetadata>([
       [
@@ -67,7 +53,7 @@ describe('Codex session file helpers', () => {
         { threadID: 'thread-b', turnID: 'turn-b', windowID: 'thread-b:0' },
       ],
     ])
-    saveCodexSessions(path, sessions)
+    await saveCodexSessions(path, sessions)
     // The exact bytes OpenCode 1 has always written.
     expect(readFileSync(path, 'utf8')).toBe(
       '{\n  "version": 1,\n  "sessions": {\n    "ses_a": {\n      "threadID": "thread-a"\n    },\n    "ses_b": {\n      "threadID": "thread-b"\n    }\n  }\n}\n',
@@ -85,6 +71,32 @@ describe('Codex session file helpers', () => {
       ],
     ])
     expect(loadCodexSessions(join(tempDir(), 'missing.json')).size).toBe(0)
+  })
+
+  test("OpenCode 1 save waits for the file's sessions lock and writes it owner-only", async () => {
+    const path = join(tempDir(), OPENCODE1_FILE)
+    const held = await acquireRefreshFileLock({
+      name: 'sessions',
+      path,
+      ttlMs: 10_000,
+    })
+    expect(held).not.toBeNull()
+    const sessions = new Map<string, CodexSessionMetadata>([
+      [
+        'ses_a',
+        { threadID: 'thread-a', turnID: 'turn-a', windowID: 'thread-a:0' },
+      ],
+    ])
+    const saving = saveCodexSessions(path, sessions)
+    await Bun.sleep(200)
+    // Nothing is written while another writer (or the runtime-file move)
+    // holds the lock.
+    expect(existsSync(path)).toBe(false)
+    await held?.release()
+    await saving
+    expect(readJson(path).sessions).toEqual({ ses_a: { threadID: 'thread-a' } })
+    if (process.platform !== 'win32')
+      expect(statSync(path).mode & 0o777).toBe(0o600)
   })
 })
 
@@ -288,12 +300,10 @@ describe('OpenCode 2 sessions across locations and restarts', () => {
       expect(later?.threadID).toBe(opened?.threadID as string)
       expect(later?.turnID).toBe(opened?.turnID as string)
     }
-    expect(readJson(join(runtimeDir(root, configDir), OPENCODE2_FILE))).toEqual(
-      {
-        version: 1,
-        sessions: { ses_1: { threadID: opened?.threadID } },
-      },
-    )
+    expect(readJson(join(configDir, OPENCODE2_FILE))).toEqual({
+      version: 1,
+      sessions: { ses_1: { threadID: opened?.threadID } },
+    })
     const [restarted] = await runProcess(root, configDir, 1, [send(0, 'ses_1')])
     expect(restarted?.threadID).toBe(opened?.threadID as string)
     expect(restarted?.cacheKey).toBe(opened?.threadID)
@@ -303,8 +313,6 @@ describe('OpenCode 2 sessions across locations and restarts', () => {
 
   test('OpenCode 2 processes leave OpenCode 1 sessions unchanged and keep every thread id', async () => {
     const { root, configDir } = serverFixture()
-    // Seeded where versions before the move kept it; the first server start
-    // moves it, unchanged, into the state home.
     const opencode1 = join(configDir, OPENCODE1_FILE)
     const seeded = `${JSON.stringify(
       { version: 1, sessions: { ses_1: { threadID: 'opencode1-thread' } } },
@@ -350,10 +358,8 @@ describe('OpenCode 2 sessions across locations and restarts', () => {
       Object.fromEntries(created.map((sent) => [sent.session, sent.threadID])),
     )
     expect(
-      readJson(join(runtimeDir(root, configDir), OPENCODE2_FILE)).sessions,
+      readJson(join(configDir, OPENCODE2_FILE)).sessions,
     ).not.toHaveProperty('ses_gone')
-    expect(
-      readFileSync(join(runtimeDir(root, configDir), OPENCODE1_FILE), 'utf8'),
-    ).toBe(seeded)
+    expect(readFileSync(opencode1, 'utf8')).toBe(seeded)
   })
 })

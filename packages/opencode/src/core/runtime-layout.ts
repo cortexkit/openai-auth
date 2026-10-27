@@ -15,34 +15,48 @@
 // - `layout.json` in the state-home folder makes that folder authoritative.
 //   Without it, any old file keeps the config folder authoritative; with no
 //   old file either (a fresh install) the marker is written straight away.
+//   `config-dir.json` names the config folder the state-home folder belongs
+//   to; a folder that names another one is refused and left alone.
+// - Only a process that resolves every runtime file at its default location
+//   moves files or writes the marker. A process with OPENCODE_OPENAI_AUTH_FILE
+//   naming a custom file or with OPENCODE_OPENAI_AUTH_STATE_FILE set follows
+//   an existing marker for the files it does not override, and otherwise
+//   stays on the legacy layout. If an override names a file of the state-home
+//   folder, it stays on the legacy layout and that file is never touched.
 // - The move, and the fresh install's marker, wait while any other live
 //   process could still write the old files: one that runs an older version,
-//   or one that runs this version on the legacy layout for this config folder
-//   (its heartbeat says so, `process-heartbeat.ts`). A process that starts
-//   while one of those is alive takes the legacy layout too, and records it.
-//   So the move happens at the first start after every OpenCode using that
-//   config folder has been closed or restarted on this version.
-// - Every decision is made holding the layout lock in the state-home folder,
-//   and a legacy choice is written to the heartbeat before the lock is
-//   released, so a process deciding later sees it.
+//   or one on the legacy layout (its heartbeat says so, `process-heartbeat.ts`).
+//   A process that starts while one of those is alive takes the legacy layout
+//   too. So the move happens at the first start after every OpenCode using
+//   that config folder has been closed or restarted on this version.
+// - Every decision is made holding the layout lock in the state-home folder.
+//   A legacy choice is allowed only once it is in this process's heartbeat,
+//   written while that lock is held, so a process deciding later sees it. A
+//   process that cannot take the lock or write that record refuses to start
+//   (`RuntimeLayoutRefusal`) rather than run unseen on the old files.
 // - The move holds the layout lock, then the store's `save` lock at the old
 //   state file, the vault's `claustrum-roster-write` lock at the old roster
 //   and the `sessions` lock at each old sessions file (the order of the lock
-//   list in `pool-migration.ts`). It re-reads the heartbeats under all of
-//   them right before copying. Each file is copied owner-only and made
-//   durable, read back and compared byte for byte; the marker is written
-//   after every copy, and only then are the old files removed. A crash before
-//   the marker leaves the old files authoritative and the next start copies
-//   again over the partial new ones. A crash after it leaves the new files
-//   authoritative; the next start removes old copies identical to the new
-//   ones and leaves any that differ. The marker then records that the old
-//   files are dealt with, and old files are never read, copied, removed or
-//   overwritten again: if some reappear (an older version ran again), each
-//   process warns once and leaves them.
-// - A failed move leaves the process on the legacy layout and logs the error
-//   class once; the next start tries again. Nothing here runs on a request.
+//   list in `pool-migration.ts`). Under all of them it reads the heartbeats
+//   again, refuses when an old file and its new place are one physical file,
+//   and refuses when the state-home folder holds a runtime file that is not
+//   one of the copies an unfinished move listed in `layout-moving.json`. Each file is copied owner-only and made durable,
+//   read back and compared byte for byte; the marker is written after every
+//   copy, and only then are the old files removed, each one after comparing
+//   its bytes once more. A crash before the marker leaves the old files
+//   authoritative and the next start copies again over the partial new ones.
+//   A crash after it leaves the new files authoritative; the next start takes
+//   the same locks and removes old copies identical to the new ones, leaving
+//   any that differ. The marker then records that the old files are dealt
+//   with, and old files are never read, copied, removed or overwritten again:
+//   if some reappear (an older version ran again), each process warns once
+//   and leaves them.
+// - The layout lock is checked again before every destructive step. A move
+//   that fails leaves the process on the legacy layout (registered) and logs
+//   the error class once; the next start tries again. Nothing here runs on a
+//   request.
 
-import type { Dirent } from 'node:fs'
+import { type Dirent, realpathSync } from 'node:fs'
 import {
   chmod,
   mkdir,
@@ -52,18 +66,27 @@ import {
   stat,
   unlink,
 } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from 'node:path'
 import {
   acquireRefreshFileLock,
   type RefreshFileLock,
   writeJsonAtomic,
 } from '@cortexkit/common-auth/fs'
 import { vaultPaths, vaultStateDir } from '@cortexkit/openai-auth-core/internal'
+import { CODEX_SESSIONS_LOCK_NAME } from '../codex-sessions'
 import { createLogger } from '../logger'
 import {
   ACCOUNT_STATE_FILE_NAME,
   accountPathsCollide,
   chosenAccountStatePath,
+  customAccountConfigPath,
   decidedRuntimeLayout,
   OPENCODE1_CODEX_SESSIONS_FILE,
   OPENCODE2_CODEX_SESSIONS_FILE,
@@ -81,17 +104,21 @@ export type { RuntimeLayout }
 
 /** Name of the lock held while a process decides or moves the layout. */
 export const RUNTIME_LAYOUT_LOCK_NAME = 'runtime-layout'
+/** Lists the copies an unfinished move has put in the state-home folder. */
+export const RUNTIME_LAYOUT_MANIFEST_FILE = 'layout-moving.json'
 const LOCK_TTL_MS = 10_000
 /** The store's own `save` wait, which the other data locks share. */
 const DATA_LOCK_WAIT_MS = 15_000
 /**
- * How long a starting process waits for the layout lock. A holder keeps it
- * for a decision or a move; a move may wait `DATA_LOCK_WAIT_MS` for each of
- * its four data locks, and a crashed holder's lease ends after `LOCK_TTL_MS`.
- * The wait covers the longest of those before it gives up.
+ * How long a starting process waits for the layout lock: 70 seconds. A move
+ * may wait `DATA_LOCK_WAIT_MS` (15 s) for each of its four data locks, and a
+ * crashed holder's lease ends after `LOCK_TTL_MS` (10 s); 4 × 15 s + 10 s.
  */
 const LAYOUT_LOCK_WAIT_MS = 4 * DATA_LOCK_WAIT_MS + LOCK_TTL_MS
 const LOCK_RETRY_MS = 50
+/** A marker read that fails for a reason other than absence is retried. */
+const MARKER_READ_ATTEMPTS = 5
+const MARKER_READ_RETRY_MS = 50
 // The same budget common-auth's `replaceWindowsFile` gives a rename that
 // Windows refuses because another process has the file open.
 const SHARING_RETRY_DELAYS_MS = [0, 10, 20, 40, 80, 100]
@@ -100,6 +127,35 @@ const SHARING_RETRY_BUDGET_MS = 500
 /** The message logged once by a process that keeps the legacy layout. */
 export const RUNTIME_LAYOUT_DEFERRED_MESSAGE =
   "openai-auth keeps its files in OpenCode's config folder until every running OpenCode using it has restarted on this version."
+
+/** Logged, and shown once in `/openai`, when old files appear again. */
+export const RUNTIME_LAYOUT_REAPPEARED_MESSAGE =
+  "openai-auth found runtime files in OpenCode's config folder again (an older version may have run). It does not use them and leaves them in place; its files are in its state folder."
+
+/**
+ * Plugin start stops when it cannot settle a safe runtime layout: it could
+ * not take the layout lock or write its heartbeat (so other processes could
+ * not see which files it uses), could not read the marker, or found a
+ * state-home folder that belongs to another config folder.
+ */
+export class RuntimeLayoutRefusal extends Error {
+  constructor(
+    readonly stateDir: string,
+    readonly errorClass: string,
+    message = `openai-auth cannot start: it could not settle where its runtime files live in ${stateDir} (${errorClass}). Check that this folder can be created and written by your user, then restart OpenCode.`,
+  ) {
+    super(message)
+    this.name = 'RuntimeLayoutRefusal'
+  }
+}
+
+function foreignFolder(stateDir: string, identity: string) {
+  return new RuntimeLayoutRefusal(
+    stateDir,
+    'foreign-folder',
+    `openai-auth cannot start: ${stateDir} belongs to another OpenCode config folder, not ${identity}. It was left untouched. Move it aside, then restart OpenCode.`,
+  )
+}
 
 export interface RuntimeLayoutLogger {
   info(message: string, meta?: Record<string, unknown>): unknown
@@ -110,8 +166,8 @@ export interface RuntimeLayoutOptions {
   /** This build's version, for the version fence. */
   version: string
   log?: RuntimeLayoutLogger
-  /** Defaults to `migrationFenceOpen` for `version` and the config folder. */
-  fence?: (layoutKey: string) => Promise<VersionFenceResult>
+  /** Defaults to `migrationFenceOpen` for `version`, with the layout checks. */
+  fence?: () => Promise<VersionFenceResult>
   /**
    * Test seams, run at one step of the move. A step that throws stands in for
    * a crash there: nothing after it runs.
@@ -126,8 +182,8 @@ export interface RuntimeLayoutOptions {
 
 interface LayoutMarker {
   version: 1
-  /** The config folder the files came from. */
-  oldDir: string
+  /** The identity of the config folder the files came from. */
+  oldDir?: string
   /** Set once the old files were removed or knowingly left in place. */
   oldFilesRemoved?: boolean
 }
@@ -140,10 +196,8 @@ interface LayoutFile {
 
 /** The runtime files of one config folder, in both layouts. */
 interface LayoutFiles {
-  /** Undefined when a chosen state path is the old default state file. */
-  state?: LayoutFile
-  /** Undefined when a chosen state path keeps its vault in the old folder. */
-  vault?: { old: string; next: string }
+  state: LayoutFile
+  vault: { old: string; next: string }
   sessions: LayoutFile[]
 }
 
@@ -154,6 +208,7 @@ const globalState = globalThis as typeof globalThis & {
   [stateKey]?: {
     runs: Map<string, Promise<RuntimeLayout>>
     logged: Set<string>
+    notice?: { text: string; shown: boolean }
   }
 }
 const processState = globalState[stateKey] ?? {
@@ -162,10 +217,23 @@ const processState = globalState[stateKey] ?? {
 }
 globalState[stateKey] = processState
 
-/** Test seam: forget this process's runs and one-time log lines. */
+/** Test seam: forget this process's runs, log lines and notice. */
 export function __resetRuntimeLayoutRunsForTest(): void {
   processState.runs.clear()
   processState.logged.clear()
+  processState.notice = undefined
+}
+
+/**
+ * The status line `/openai` shows once per process when old runtime files
+ * appeared again in OpenCode's config folder; undefined after that, and when
+ * there is nothing to report.
+ */
+export function takeRuntimeLayoutNotice(): string | undefined {
+  const notice = processState.notice
+  if (!notice || notice.shown) return undefined
+  notice.shown = true
+  return notice.text
 }
 
 function logOnce(key: string, write: () => void): void {
@@ -175,6 +243,7 @@ function logOnce(key: string, write: () => void): void {
 }
 
 function errorClass(error: unknown): string {
+  if (error instanceof RuntimeLayoutRefusal) return error.errorClass
   const code = (error as { code?: unknown } | null)?.code
   if (typeof code === 'string' && code) return code
   return error instanceof Error ? error.name : typeof error
@@ -194,8 +263,8 @@ class LayoutMoveError extends Error {
  * Decide, once per process, where this config folder's runtime files live,
  * moving them first when that is safe. Call at plugin start before anything
  * resolves a runtime path. Resolves to the layout the resolver in
- * `account-paths.ts` now uses; it rejects only when another live process holds
- * the layout lock for longer than any move takes and no marker exists.
+ * `account-paths.ts` now uses; rejects with `RuntimeLayoutRefusal` when the
+ * plugin must not start.
  */
 export function prepareRuntimeLayout(
   options: RuntimeLayoutOptions,
@@ -206,9 +275,15 @@ export function prepareRuntimeLayout(
   const runKey = `${location.stateHomeDir}\0${location.key}`
   let run = processState.runs.get(runKey)
   if (!run) {
-    run = decide(location, options).finally(() => {
-      processState.runs.delete(runKey)
-    })
+    run = decide(location, options)
+      .catch((error: unknown) => {
+        // Anything not handled on the way stops the start the same way.
+        if (error instanceof RuntimeLayoutRefusal) throw error
+        throw new RuntimeLayoutRefusal(location.stateHomeDir, errorClass(error))
+      })
+      .finally(() => {
+        processState.runs.delete(runKey)
+      })
     processState.runs.set(runKey, run)
   }
   return run
@@ -219,129 +294,157 @@ async function decide(
   options: RuntimeLayoutOptions,
 ): Promise<RuntimeLayout> {
   const log = options.log ?? createLogger('runtime-layout')
-  const markerPath = join(location.stateHomeDir, RUNTIME_LAYOUT_MARKER_FILE)
-  const files = await layoutFiles(location)
+  const stateDir = location.stateHomeDir
+  const markerPath = join(stateDir, RUNTIME_LAYOUT_MARKER_FILE)
+  const files = layoutFiles(location)
+  const overrides = overridePaths()
+  const overriding = overrides.length > 0
+  const overrideInDestination = overrides.some((path) =>
+    insideOrSame(path, stateDir),
+  )
+  const fence = options.fence ?? defaultFence(options.version)
 
-  const settle = async (layout: RuntimeLayout): Promise<RuntimeLayout> => {
-    if (layout === 'legacy') {
-      try {
-        await recordProcessLayout({
-          key: location.key,
-          layout,
-          version: options.version,
-        })
-      } catch (error) {
-        logOnce(`${location.key}\0record`, () =>
-          log.warn(
-            'could not record that this process uses the legacy file layout',
-            { configDir: location.configDir, errorClass: errorClass(error) },
-          ),
-        )
-      }
-    } else {
-      await recordProcessLayout({
-        key: location.key,
-        layout,
-        version: options.version,
-      })
-    }
-    setRuntimeLayout(location, layout)
-    return layout
+  const stateHome = async (): Promise<RuntimeLayout> => {
+    await recordProcessLayout({
+      key: location.key,
+      layout: 'state-home',
+      version: options.version,
+    })
+    setRuntimeLayout(location, 'state-home')
+    return 'state-home'
   }
 
-  // A finished move needs no lock: the marker never goes away again.
-  const early = await readMarker(markerPath)
-  if (early?.oldFilesRemoved) {
-    await warnIfOldFilesReappeared(location, files, log)
-    return settle('state-home')
+  // Read-only first: whose folder this is, and whether the move is done.
+  let marker = await readMarker(markerPath, stateDir)
+  await assertOwnFolder(location, marker)
+  if (marker?.oldFilesRemoved && !overrideInDestination) {
+    await noticeReappearedFiles(location, files, overrides, log)
+    return stateHome()
   }
 
+  // A state-home folder that is OpenCode's config folder itself (a link or a
+  // mount) gets no chmod or note of its own; the move then stays legacy.
+  const aliased = await samePhysical(location.configDir, stateDir)
   let layoutLock: RefreshFileLock
   try {
-    await ensureOwnerOnlyDir(location.stateHomeDir)
+    if (!aliased) await ensureOwnerOnlyDir(stateDir)
     layoutLock = await takeLock(
       RUNTIME_LAYOUT_LOCK_NAME,
       markerPath,
       options.layoutLockWaitMs ?? LAYOUT_LOCK_WAIT_MS,
     )
   } catch (error) {
-    if (await readMarker(markerPath)) return settle('state-home')
-    if (error instanceof LayoutMoveError && error.code === 'lock-timeout')
-      throw new Error(
-        `openai-auth could not decide where its runtime files live: another process has held ${RUNTIME_LAYOUT_LOCK_NAME} at ${markerPath} for too long. Restart OpenCode.`,
-      )
-    // The state home cannot be written at all, so no other process can move
-    // the files there either.
-    logOnce(`${location.key}\0failed`, () =>
-      log.warn(
-        "openai-auth's runtime files stay in OpenCode's config folder: the state folder is not usable; the move is tried again at the next start",
-        { configDir: location.configDir, errorClass: errorClass(error) },
-      ),
-    )
-    return settle('legacy')
+    // Only an existing marker settles the layout without the lock.
+    marker = await readMarker(markerPath, stateDir)
+    if (marker && !overrideInDestination) return stateHome()
+    throw new RuntimeLayoutRefusal(stateDir, errorClass(error))
+  }
+
+  const lock = layoutLock
+  const legacy = async (): Promise<RuntimeLayout> => {
+    try {
+      await lock.assertOwned()
+      await recordProcessLayout({
+        key: location.key,
+        layout: 'legacy',
+        version: options.version,
+      })
+    } catch (error) {
+      throw new RuntimeLayoutRefusal(stateDir, errorClass(error))
+    }
+    setRuntimeLayout(location, 'legacy')
+    return 'legacy'
   }
 
   try {
-    const marker = await readMarker(markerPath)
-    if (marker) {
-      if (!marker.oldFilesRemoved)
-        await finishOldFiles(location, files, markerPath, marker, options, log)
-      return await settle('state-home')
-    }
+    marker = await readMarker(markerPath, stateDir)
+    await assertOwnFolder(location, marker)
+    if (!aliased) await writeOwnerNote(location)
 
-    const fence = options.fence ?? defaultFence(options.version)
-    const gate = await fence(location.key)
+    if (overrideInDestination) {
+      logOnce(`${location.key}\0override`, () =>
+        log.warn(
+          "openai-auth keeps its runtime files in OpenCode's config folder: a path set by OPENCODE_OPENAI_AUTH_STATE_FILE or OPENCODE_OPENAI_AUTH_FILE is inside its state folder, which it never touches",
+          { stateDir, overrides },
+        ),
+      )
+      return await legacy()
+    }
+    if (marker) {
+      if (!marker.oldFilesRemoved && !overriding && !aliased)
+        await finishOldFiles(location, files, markerPath, marker, lock, {
+          fence,
+          log,
+        })
+      return await stateHome()
+    }
+    // Only a process that resolves every runtime file at its default place
+    // moves them; with an override it follows a marker or stays legacy.
+    if (overriding) return await legacy()
+    if (aliased) {
+      logOnce(`${location.key}\0aliased`, () =>
+        log.warn(
+          "openai-auth keeps its runtime files in OpenCode's config folder: its state folder is that same folder",
+          { configDir: location.configDir, stateDir },
+        ),
+      )
+      return await legacy()
+    }
+    const gate = await fence()
     if (!gate.open) {
       logDeferral(location, gate.blockers, log)
-      return await settle('legacy')
+      return await legacy()
     }
 
-    let markerWritten = false
+    let markerStarted = false
     try {
-      const outcome = await moveFiles(
-        location,
-        files,
-        markerPath,
+      const outcome = await moveFiles(location, files, markerPath, lock, {
         fence,
-        options,
         log,
-        () => {
-          markerWritten = true
+        steps: options.steps,
+        onMarker: () => {
+          markerStarted = true
         },
-      )
-      if (outcome.deferred) {
+      })
+      if (outcome.kind === 'deferred') {
         logDeferral(location, outcome.blockers, log)
-        return await settle('legacy')
+        return await legacy()
+      }
+      if (outcome.kind === 'refused') {
+        logOnce(`${location.key}\0refused`, () =>
+          log.warn(
+            "openai-auth keeps its runtime files in OpenCode's config folder: it will not move them",
+            { reason: outcome.reason, paths: outcome.paths, stateDir },
+          ),
+        )
+        return await legacy()
       }
       if (outcome.moved)
         log.info(
           "openai-auth moved its runtime files out of OpenCode's config folder",
-          {
-            from: location.configDir,
-            to: location.stateHomeDir,
-          },
+          { from: location.configDir, to: stateDir },
         )
-      return await settle('state-home')
+      return await stateHome()
     } catch (error) {
-      // Past the marker the new folder holds every file; whatever failed
-      // after it is finished at the next start.
-      if (markerWritten) return await settle('state-home')
+      if (error instanceof RuntimeLayoutRefusal) throw error
+      // Once the marker write began, the marker on disk decides.
+      if (markerStarted && (await readMarker(markerPath, stateDir)))
+        return await stateHome()
       logOnce(`${location.key}\0failed`, () =>
         log.warn(
           "openai-auth's runtime files stay in OpenCode's config folder: moving them failed; the move is tried again at the next start",
           { configDir: location.configDir, errorClass: errorClass(error) },
         ),
       )
-      return await settle('legacy')
+      return await legacy()
     }
   } finally {
-    await layoutLock.release().catch(() => {})
+    await lock.release().catch(() => {})
   }
 }
 
 function defaultFence(version: string) {
-  return (layoutKey: string) =>
-    migrationFenceOpen({ currentVersion: version, layoutKey })
+  return () => migrationFenceOpen({ currentVersion: version, layoutMove: true })
 }
 
 function logDeferral(
@@ -357,128 +460,227 @@ function logDeferral(
   )
 }
 
+/** Every path an override in effect resolves to; empty without overrides. */
+function overridePaths(): string[] {
+  const state = chosenAccountStatePath()
+  if (state === undefined) return []
+  const config = customAccountConfigPath()
+  return [state, vaultStateDir(state), ...(config ? [config] : [])]
+}
+
+/** True when `path` is `folder` itself or anything inside it. */
+function insideOrSame(path: string, folder: string): boolean {
+  const between = relative(realOrNearest(folder), realOrNearest(path))
+  if (between === '') return true
+  if (!between.startsWith('..') && !isAbsolute(between)) return true
+  return accountPathsCollide(path, folder)
+}
+
+/**
+ * The real path of `path`, or of its nearest existing ancestor with the rest
+ * appended, so a path that does not exist yet compares with real ones.
+ */
+function realOrNearest(path: string): string {
+  let current = resolve(path)
+  const rest: string[] = []
+  for (;;) {
+    try {
+      return join(realpathSync.native(current), ...rest)
+    } catch {}
+    const parent = dirname(current)
+    if (parent === current) return resolve(path)
+    rest.unshift(basename(current))
+    current = parent
+  }
+}
+
+type MoveOutcome =
+  | { kind: 'deferred'; blockers: unknown }
+  | { kind: 'refused'; reason: string; paths: string[] }
+  | { kind: 'moved'; moved: boolean }
+
 /**
  * Copy every old file, then write the marker, then remove the old files.
- * `deferred` when a process that could still write the old files showed up
- * since the first check.
+ * Holds the data locks throughout; the caller holds the layout lock.
  */
 async function moveFiles(
   location: RuntimeLayoutLocation,
   files: LayoutFiles,
   markerPath: string,
-  fence: (layoutKey: string) => Promise<VersionFenceResult>,
-  options: RuntimeLayoutOptions,
-  log: RuntimeLayoutLogger,
-  onMarker: () => void,
-): Promise<
-  { deferred: true; blockers: unknown } | { deferred: false; moved: boolean }
-> {
-  const locks: RefreshFileLock[] = []
+  layoutLock: RefreshFileLock,
+  input: {
+    fence: () => Promise<VersionFenceResult>
+    log: RuntimeLayoutLogger
+    steps?: RuntimeLayoutOptions['steps']
+    onMarker: () => void
+  },
+): Promise<MoveOutcome> {
+  const stateDir = location.stateHomeDir
+  const locks = await takeDataLocks(location, files)
   let oldVaultEmptied = false
   try {
-    if (files.state && (await exists(files.state.old)))
-      locks.push(await takeLock('save', files.state.old, DATA_LOCK_WAIT_MS))
-    if (files.vault && (await exists(files.vault.old)))
-      locks.push(
-        await takeLock(
-          'claustrum-roster-write',
-          vaultPaths(files.vault.old, 'opencode').rosterPath,
-          DATA_LOCK_WAIT_MS,
-        ),
-      )
-    for (const sessions of files.sessions)
-      if (await exists(sessions.old))
-        locks.push(await takeLock('sessions', sessions.old, DATA_LOCK_WAIT_MS))
-
     // Heartbeats read again under every lock, right before the copy: a
     // process that started since the first check and kept the legacy layout
     // has recorded it by now.
-    const gate = await fence(location.key)
-    if (!gate.open) return { deferred: true, blockers: gate.blockers }
+    const gate = await input.fence()
+    if (!gate.open) return { kind: 'deferred', blockers: gate.blockers }
+
+    const aliases = await physicalAliases(location, files)
+    if (aliases.length > 0)
+      return { kind: 'refused', reason: 'same-physical-file', paths: aliases }
+
+    // A runtime file in the state-home folder that no unfinished move of ours
+    // listed was put there by someone else (an override, by hand): leave it.
+    const listed = await readManifest(stateDir)
+    const foreign = (await destinationFiles(files)).filter(
+      (path) => !listed.has(path),
+    )
+    if (foreign.length > 0)
+      return { kind: 'refused', reason: 'destination-in-use', paths: foreign }
 
     const present = await presentOldFiles(files)
-    await removeUnmarkedNewFiles(files, present)
-    for (const file of present) await copyVerified(file)
-    await options.steps?.afterCopy?.()
+    await layoutLock.assertOwned()
+    await writeManifest(stateDir, [
+      ...new Set([...listed, ...present.map((file) => file.next)]),
+    ])
+    // Copies an earlier, interrupted move left whose source has since gone.
+    const wanted = new Set(present.map((file) => file.next))
+    for (const path of listed) {
+      if (wanted.has(path)) continue
+      await layoutLock.assertOwned()
+      await unlink(path).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'ENOENT') throw error
+      })
+    }
+    for (const file of present) {
+      await layoutLock.assertOwned()
+      await copyVerified(file)
+    }
+    await input.steps?.afterCopy?.()
 
+    await layoutLock.assertOwned()
     for (const lock of locks) await lock.assertOwned()
-    if (!location.isDefaultConfigDir)
-      await writePrivateText(
-        join(location.stateHomeDir, RUNTIME_CONFIG_DIR_NOTE_FILE),
-        `${JSON.stringify({ configDir: location.configDir }, null, 2)}\n`,
-      )
-    const marker: LayoutMarker = { version: 1, oldDir: location.configDir }
+    const marker: LayoutMarker = { version: 1, oldDir: location.key }
+    input.onMarker()
     await writeMarker(markerPath, marker)
-    onMarker()
-    await options.steps?.afterMarker?.()
+    await input.steps?.afterMarker?.()
 
-    await removeOldCopies(location, present, log)
+    await layoutLock.assertOwned()
+    await removeOldCopies(location, present, layoutLock, input.log)
     oldVaultEmptied = true
     await writeMarker(markerPath, { ...marker, oldFilesRemoved: true })
-    return { deferred: false, moved: present.length > 0 }
+    await removeManifest(stateDir)
+    return { kind: 'moved', moved: present.length > 0 }
   } finally {
     for (const lock of locks.reverse()) await lock.release().catch(() => {})
     // The roster lock is released now, so the emptied old vault folder can
     // go; rmdir leaves a folder that still holds anything.
-    if (oldVaultEmptied && files.vault)
-      await rmdir(files.vault.old).catch(() => {})
+    if (oldVaultEmptied) await rmdir(files.vault.old).catch(() => {})
   }
 }
 
 /**
- * A start after a crash that came after the marker: remove the old copies
- * that are identical to the new files, keep the rest, and record that the
- * old files are dealt with. Waits, like the move, while a process that could
- * still use the old files is alive.
+ * A start after a crash that came after the marker: under the same locks as
+ * the move, remove the old copies that are identical to the new files, keep
+ * the rest, and record that the old files are dealt with. Waits, like the
+ * move, while a process that could still use the old files is alive.
  */
 async function finishOldFiles(
   location: RuntimeLayoutLocation,
   files: LayoutFiles,
   markerPath: string,
   marker: LayoutMarker,
-  options: RuntimeLayoutOptions,
-  log: RuntimeLayoutLogger,
+  layoutLock: RefreshFileLock,
+  input: {
+    fence: () => Promise<VersionFenceResult>
+    log: RuntimeLayoutLogger
+  },
 ): Promise<void> {
+  let locks: RefreshFileLock[] = []
+  let done = false
   try {
-    const fence = options.fence ?? defaultFence(options.version)
-    const gate = await fence(location.key)
+    const gate = await input.fence()
     if (!gate.open) return
-    await removeOldCopies(location, await presentOldFiles(files), log)
-    if (files.vault) await rmdir(files.vault.old).catch(() => {})
+    locks = await takeDataLocks(location, files)
+    const aliases = await physicalAliases(location, files)
+    if (aliases.length > 0) {
+      logOnce(`${location.key}\0cleanup-aliased`, () =>
+        input.log.warn(
+          "openai-auth leaves its old files in OpenCode's config folder: they are the same files as its new ones",
+          { paths: aliases },
+        ),
+      )
+      return
+    }
+    await layoutLock.assertOwned()
+    await removeOldCopies(
+      location,
+      await presentOldFiles(files),
+      layoutLock,
+      input.log,
+    )
+    done = true
+    await layoutLock.assertOwned()
     await writeMarker(markerPath, { ...marker, oldFilesRemoved: true })
+    await removeManifest(location.stateHomeDir)
   } catch (error) {
     logOnce(`${location.key}\0cleanup`, () =>
-      log.warn(
+      input.log.warn(
         "openai-auth could not finish removing its old files from OpenCode's config folder; it tries again at the next start",
         { configDir: location.configDir, errorClass: errorClass(error) },
       ),
     )
+  } finally {
+    for (const lock of locks.reverse()) await lock.release().catch(() => {})
+    if (done) await rmdir(files.vault.old).catch(() => {})
   }
 }
 
-async function layoutFiles(
+/**
+ * The move's data locks at the old paths, in the order of the lock list in
+ * `pool-migration.ts`: `save` at the state file, `claustrum-roster-write` at
+ * the vault roster, `sessions` at each sessions file. Taken whether or not
+ * the file exists yet, so a writer about to create one waits too; nothing is
+ * created in a config folder or vault folder that does not exist.
+ */
+async function takeDataLocks(
   location: RuntimeLayoutLocation,
-): Promise<LayoutFiles> {
+  files: LayoutFiles,
+): Promise<RefreshFileLock[]> {
+  const locks: RefreshFileLock[] = []
+  try {
+    if (await exists(location.configDir)) {
+      locks.push(await takeLock('save', files.state.old, DATA_LOCK_WAIT_MS))
+      if (await exists(files.vault.old))
+        locks.push(
+          await takeLock(
+            'claustrum-roster-write',
+            vaultPaths(files.vault.old, 'opencode').rosterPath,
+            DATA_LOCK_WAIT_MS,
+          ),
+        )
+      for (const sessions of files.sessions)
+        locks.push(
+          await takeLock(
+            CODEX_SESSIONS_LOCK_NAME,
+            sessions.old,
+            DATA_LOCK_WAIT_MS,
+          ),
+        )
+    }
+    return locks
+  } catch (error) {
+    for (const lock of locks.reverse()) await lock.release().catch(() => {})
+    throw error
+  }
+}
+
+function layoutFiles(location: RuntimeLayoutLocation): LayoutFiles {
   const oldState = join(location.configDir, ACCOUNT_STATE_FILE_NAME)
   const nextState = join(location.stateHomeDir, ACCOUNT_STATE_FILE_NAME)
-  // A state file the user chose is never moved: when it is the old default
-  // file itself, or keeps its vault in the old vault folder, that part stays.
-  const chosen = chosenAccountStatePath()
-  const keepState =
-    chosen !== undefined && accountPathsCollide(chosen, oldState)
-  const keepVault =
-    chosen !== undefined &&
-    accountPathsCollide(vaultStateDir(chosen), vaultStateDir(oldState))
   return {
-    ...(keepState ? {} : { state: { old: oldState, next: nextState } }),
-    ...(keepVault
-      ? {}
-      : {
-          vault: {
-            old: vaultStateDir(oldState),
-            next: vaultStateDir(nextState),
-          },
-        }),
+    state: { old: oldState, next: nextState },
+    vault: { old: vaultStateDir(oldState), next: vaultStateDir(nextState) },
     sessions: [
       OPENCODE1_CODEX_SESSIONS_FILE,
       OPENCODE2_CODEX_SESSIONS_FILE,
@@ -491,7 +693,7 @@ async function layoutFiles(
 
 /** Lock files, eviction markers and staged writes come and go with a writer. */
 function isTransient(name: string): boolean {
-  return name.includes('.lock') || name.endsWith('.tmp')
+  return name.includes('.lock') || name.includes('.tmp')
 }
 
 /** The regular, non-transient files directly in a folder. */
@@ -500,7 +702,8 @@ async function folderFiles(dir: string): Promise<string[]> {
   try {
     entries = await readdir(dir, { withFileTypes: true })
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'ENOTDIR') return []
     throw error
   }
   return entries
@@ -512,39 +715,66 @@ async function folderFiles(dir: string): Promise<string[]> {
 /** Every runtime file that exists in the old layout, paired with its target. */
 async function presentOldFiles(files: LayoutFiles): Promise<LayoutFile[]> {
   const present: LayoutFile[] = []
-  if (files.state && (await exists(files.state.old))) present.push(files.state)
-  if (files.vault) {
-    const vault = files.vault
-    for (const name of await folderFiles(vault.old))
-      present.push({ old: join(vault.old, name), next: join(vault.next, name) })
-  }
+  if (await exists(files.state.old)) present.push(files.state)
+  for (const name of await folderFiles(files.vault.old))
+    present.push({
+      old: join(files.vault.old, name),
+      next: join(files.vault.next, name),
+    })
   for (const sessions of files.sessions)
     if (await exists(sessions.old)) present.push(sessions)
   return present
 }
 
+/** Every runtime file that exists in the state-home layout. */
+async function destinationFiles(files: LayoutFiles): Promise<string[]> {
+  const found: string[] = []
+  if (await exists(files.state.next)) found.push(files.state.next)
+  for (const name of await folderFiles(files.vault.next))
+    found.push(join(files.vault.next, name))
+  for (const sessions of files.sessions)
+    if (await exists(sessions.next)) found.push(sessions.next)
+  return found
+}
+
 /**
- * Before the marker nothing uses the state-home folder, so a runtime file
- * there that has no old counterpart is left from an interrupted move whose
- * source has since gone. Remove it, or the marker would make it authoritative.
+ * Old paths that are the same physical file or folder as their new place (a
+ * link or a mount): moving those would copy a file onto itself and then
+ * delete it.
  */
-async function removeUnmarkedNewFiles(
+async function physicalAliases(
+  location: RuntimeLayoutLocation,
   files: LayoutFiles,
-  present: LayoutFile[],
-): Promise<void> {
-  const wanted = new Set(present.map((file) => file.next))
-  const candidates = files.sessions.map((file) => file.next)
-  if (files.state) candidates.push(files.state.next)
-  if (files.vault) {
-    const vaultDir = files.vault.next
-    for (const name of await folderFiles(vaultDir))
-      candidates.push(join(vaultDir, name))
+): Promise<string[]> {
+  const pairs: [string, string][] = [
+    [location.configDir, location.stateHomeDir],
+    [files.vault.old, files.vault.next],
+    [files.state.old, files.state.next],
+    ...files.sessions.map((file): [string, string] => [file.old, file.next]),
+  ]
+  for (const name of await folderFiles(files.vault.old))
+    pairs.push([join(files.vault.old, name), join(files.vault.next, name)])
+  const aliased: string[] = []
+  for (const [old, next] of pairs)
+    if (await samePhysical(old, next)) aliased.push(old)
+  return aliased
+}
+
+/** True when both paths exist and are one file or folder (device and inode). */
+async function samePhysical(a: string, b: string): Promise<boolean> {
+  const id = async (path: string) => {
+    try {
+      const info = await stat(path, { bigint: true })
+      // A file system without inode numbers cannot prove anything here.
+      return info.ino === 0n ? undefined : `${info.dev}:${info.ino}`
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'ENOENT' || code === 'ENOTDIR') return undefined
+      throw error
+    }
   }
-  for (const path of candidates)
-    if (!wanted.has(path))
-      await unlink(path).catch((error: NodeJS.ErrnoException) => {
-        if (error.code !== 'ENOENT') throw error
-      })
+  const left = await id(a)
+  return left !== undefined && left === (await id(b))
 }
 
 async function copyVerified(file: LayoutFile): Promise<void> {
@@ -563,24 +793,20 @@ async function copyVerified(file: LayoutFile): Promise<void> {
 }
 
 /**
- * Remove each old file whose bytes equal its new copy. One that differs, or
- * that Windows will not let go of, stays where it is.
+ * Remove each old file whose bytes equal its new copy, comparing again right
+ * before every unlink attempt. One that differs, or that Windows will not let
+ * go of, stays where it is. The caller holds the data locks.
  */
 async function removeOldCopies(
   location: RuntimeLayoutLocation,
   present: LayoutFile[],
+  layoutLock: RefreshFileLock,
   log: RuntimeLayoutLogger,
 ): Promise<void> {
   const kept: string[] = []
   for (const file of present) {
-    if (!(await exists(file.old))) continue
-    let same = false
-    try {
-      same = (await readFile(file.old)).equals(await readFile(file.next))
-    } catch {
-      // Unreadable on either side: not provably a copy, so it stays.
-    }
-    if (!same || !(await unlinkWithSharingRetry(file.old))) kept.push(file.old)
+    await layoutLock.assertOwned()
+    if (!(await unlinkIfIdentical(file))) kept.push(file.old)
   }
   if (kept.length > 0)
     log.warn(
@@ -589,55 +815,186 @@ async function removeOldCopies(
     )
 }
 
-async function warnIfOldFilesReappeared(
+/**
+ * Unlink `file.old` only while its bytes equal `file.next`, retrying on
+ * Windows while another process has it open. True when it is gone.
+ */
+async function unlinkIfIdentical(file: LayoutFile): Promise<boolean> {
+  const started = performance.now()
+  for (const delay of SHARING_RETRY_DELAYS_MS) {
+    if (delay > 0) await new Promise((done) => setTimeout(done, delay))
+    let same: boolean
+    try {
+      same = (await readFile(file.old)).equals(await readFile(file.next))
+    } catch (error) {
+      if (
+        (error as NodeJS.ErrnoException).code === 'ENOENT' &&
+        !(await exists(file.old))
+      )
+        return true
+      // Unreadable on either side: not provably a copy, so it stays.
+      return false
+    }
+    if (!same) return false
+    try {
+      await unlink(file.old)
+      return true
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'ENOENT') return true
+      const sharing =
+        process.platform === 'win32' &&
+        (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES')
+      if (!sharing || performance.now() - started >= SHARING_RETRY_BUDGET_MS)
+        return false
+    }
+  }
+  return false
+}
+
+async function noticeReappearedFiles(
   location: RuntimeLayoutLocation,
   files: LayoutFiles,
+  overrides: string[],
   log: RuntimeLayoutLogger,
 ): Promise<void> {
+  // A file an override names is this process's own, wherever it is.
+  const own = (path: string) =>
+    overrides.some((override) => accountPathsCollide(override, path))
   const found: string[] = []
   try {
-    for (const file of [
-      ...(files.state ? [files.state] : []),
-      ...files.sessions,
-    ])
-      if (await exists(file.old)) found.push(file.old)
-    if (files.vault && (await folderFiles(files.vault.old)).length > 0)
+    if (!own(files.state.old) && (await exists(files.state.old)))
+      found.push(files.state.old)
+    if (!own(files.vault.old) && (await folderFiles(files.vault.old)).length)
       found.push(files.vault.old)
+    for (const file of files.sessions)
+      if (await exists(file.old)) found.push(file.old)
   } catch {
     // Only a warning depends on this; an unreadable folder warns nothing.
   }
   if (found.length === 0) return
-  logOnce(`${location.key}\0reappeared`, () =>
-    log.warn(
-      "openai-auth found runtime files in OpenCode's config folder again (an older version may have run). It does not use them and leaves them in place; its files are in the state folder",
-      { configDir: location.configDir, stateDir: location.stateHomeDir, found },
-    ),
-  )
+  logOnce(`${location.key}\0reappeared`, () => {
+    processState.notice = {
+      text: `${RUNTIME_LAYOUT_REAPPEARED_MESSAGE} Old folder: ${location.configDir}`,
+      shown: false,
+    }
+    log.warn(RUNTIME_LAYOUT_REAPPEARED_MESSAGE, {
+      configDir: location.configDir,
+      stateDir: location.stateHomeDir,
+      found,
+    })
+  })
 }
 
-async function readMarker(path: string): Promise<LayoutMarker | undefined> {
-  let text: string
-  try {
-    text = await readFile(path, 'utf8')
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
-    if (code === 'ENOENT' || code === 'ENOTDIR') return undefined
-    // It exists, which is what makes the folder authoritative (the
-    // resolver's own check is existence alone); see below.
-    return { version: 1, oldDir: '', oldFilesRemoved: true }
+/**
+ * The marker, or undefined when it does not exist. A marker that exists but
+ * does not parse still makes the folder authoritative, and nothing can tell
+ * whether its old files were dealt with, so they are left alone. Any other
+ * read failure is retried briefly and then refuses the start: it proves
+ * neither that the marker exists nor that it does not.
+ */
+async function readMarker(
+  path: string,
+  stateDir: string,
+): Promise<LayoutMarker | undefined> {
+  let text: string | undefined
+  let failure: unknown
+  for (let attempt = 0; attempt < MARKER_READ_ATTEMPTS; attempt++) {
+    if (attempt > 0)
+      await new Promise((done) => setTimeout(done, MARKER_READ_RETRY_MS))
+    try {
+      text = await readFile(path, 'utf8')
+      break
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'ENOENT' || code === 'ENOTDIR') return undefined
+      failure = error
+    }
   }
+  if (text === undefined)
+    throw new RuntimeLayoutRefusal(stateDir, errorClass(failure))
   try {
     const value = JSON.parse(text) as Partial<LayoutMarker> | null
-    if (value && typeof value === 'object' && typeof value.oldDir === 'string')
+    if (value && typeof value === 'object' && !Array.isArray(value))
       return {
         version: 1,
-        oldDir: value.oldDir,
+        ...(typeof value.oldDir === 'string' ? { oldDir: value.oldDir } : {}),
         ...(value.oldFilesRemoved === true ? { oldFilesRemoved: true } : {}),
       }
   } catch {}
-  // A marker that cannot be parsed still makes the folder authoritative, and
-  // nothing can tell whether the old files were dealt with: leave them alone.
-  return { version: 1, oldDir: '', oldFilesRemoved: true }
+  return { version: 1, oldFilesRemoved: true }
+}
+
+/**
+ * Refuse a state-home folder whose `config-dir.json` or marker names another
+ * config folder: its files belong to that folder's OpenCode.
+ */
+async function assertOwnFolder(
+  location: RuntimeLayoutLocation,
+  marker: LayoutMarker | undefined,
+): Promise<void> {
+  const stateDir = location.stateHomeDir
+  if (marker?.oldDir !== undefined && marker.oldDir !== location.key)
+    throw foreignFolder(stateDir, location.key)
+  let text: string
+  try {
+    text = await readFile(join(stateDir, RUNTIME_CONFIG_DIR_NOTE_FILE), 'utf8')
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'ENOTDIR') return
+    throw new RuntimeLayoutRefusal(stateDir, errorClass(error))
+  }
+  let owner: unknown
+  try {
+    owner = (JSON.parse(text) as { configDir?: unknown } | null)?.configDir
+  } catch {}
+  if (owner !== location.key) throw foreignFolder(stateDir, location.key)
+}
+
+/** Name this folder's config folder, once; the caller holds the layout lock. */
+async function writeOwnerNote(location: RuntimeLayoutLocation): Promise<void> {
+  const path = join(location.stateHomeDir, RUNTIME_CONFIG_DIR_NOTE_FILE)
+  if (await exists(path)) return
+  await writePrivateText(
+    path,
+    `${JSON.stringify({ version: 1, configDir: location.key }, null, 2)}\n`,
+  )
+}
+
+/** The copies an unfinished move listed; empty when there is none. */
+async function readManifest(stateDir: string): Promise<Set<string>> {
+  let text: string
+  try {
+    text = await readFile(join(stateDir, RUNTIME_LAYOUT_MANIFEST_FILE), 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return new Set()
+    throw error
+  }
+  // A manifest that does not parse proves nothing about whose files these
+  // are; the destination check then treats them as someone else's.
+  try {
+    const value = JSON.parse(text) as { files?: unknown } | null
+    if (Array.isArray(value?.files))
+      return new Set(
+        value.files.filter((path): path is string => typeof path === 'string'),
+      )
+  } catch {}
+  return new Set()
+}
+
+async function writeManifest(stateDir: string, paths: string[]): Promise<void> {
+  await writePrivateText(
+    join(stateDir, RUNTIME_LAYOUT_MANIFEST_FILE),
+    `${JSON.stringify({ version: 1, files: paths }, null, 2)}\n`,
+  )
+}
+
+async function removeManifest(stateDir: string): Promise<void> {
+  await unlink(join(stateDir, RUNTIME_LAYOUT_MANIFEST_FILE)).catch(
+    (error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT') throw error
+    },
+  )
 }
 
 async function writeMarker(path: string, marker: LayoutMarker): Promise<void> {
@@ -694,31 +1051,8 @@ async function exists(path: string): Promise<boolean> {
     await stat(path)
     return true
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'ENOTDIR') return false
     throw error
   }
-}
-
-/**
- * Unlink, retrying on Windows while another process has the file open. False
- * when the file is still there afterwards.
- */
-async function unlinkWithSharingRetry(path: string): Promise<boolean> {
-  const started = performance.now()
-  for (const delay of SHARING_RETRY_DELAYS_MS) {
-    if (delay > 0) await new Promise((done) => setTimeout(done, delay))
-    try {
-      await unlink(path)
-      return true
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code
-      if (code === 'ENOENT') return true
-      const sharing =
-        process.platform === 'win32' &&
-        (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES')
-      if (!sharing || performance.now() - started >= SHARING_RETRY_BUDGET_MS)
-        return false
-    }
-  }
-  return false
 }

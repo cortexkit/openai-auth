@@ -44,7 +44,7 @@ import {
   POOL_MIGRATION_KEY,
   POOL_PLACEHOLDER,
 } from '../core/pool-migration'
-import { hostBinary } from './fixtures/opencode-host'
+import { hostBinary, runtimeStateDir } from './fixtures/opencode-host'
 import {
   MOCK_ACCOUNTS,
   type MockCodex,
@@ -263,7 +263,7 @@ async function runScenario(
   const configFile = join(configDir, 'openai-auth.json')
   // The plugin keeps its runtime files in the state home once it has moved
   // them there (or on a fresh install).
-  const runtimeDir = join(env.XDG_STATE_HOME, 'cortexkit', 'openai-auth')
+  const runtimeDir = runtimeStateDir(env.XDG_STATE_HOME, configDir)
   const stateFile = join(runtimeDir, 'openai-auth-state.json')
   const authFile = join(dataDir, 'auth.json')
   const daemon = vaultActivation

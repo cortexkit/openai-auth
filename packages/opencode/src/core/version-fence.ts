@@ -19,11 +19,14 @@
 // cannot parse, keeps it shut.
 //
 // The same fence guards the move of the runtime files out of OpenCode's
-// config folder (`runtime-layout.ts`), which passes `layoutKey`. A heartbeat
+// config folder (`runtime-layout.ts`), which passes `layoutMove`. A heartbeat
 // then also names, under `layouts`, which file layout the process uses for
-// each config folder; a live process on the legacy layout for that folder
-// keeps the fence shut, and so does a heartbeat with no `layouts` at all,
-// because it was written by a version that predates the move.
+// each config folder. A live process on the legacy layout for any config
+// folder keeps the fence shut, and so does a heartbeat with no `layouts` at
+// all, because it was written by a version that predates the move. Any
+// folder, not just the one moving: a key written by another version may be
+// spelled differently for the same folder, and blocking too widely only
+// delays a move.
 
 import { readdir, readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -55,12 +58,11 @@ export interface VersionFenceOptions {
   /** This process, which never blocks itself. Defaults to `process.pid`. */
   selfPid?: number
   /**
-   * The config folder whose runtime files are about to move, as
-   * `runtimeLayoutLocation().key` names it. When set, a live process that
-   * still uses the legacy layout for it, or that writes no layouts at all,
-   * also keeps the fence shut.
+   * Set when the runtime files are about to move: a live process that uses
+   * the legacy layout for any config folder, or that writes no layouts at
+   * all, also keeps the fence shut.
    */
-  layoutKey?: string
+  layoutMove?: boolean
 }
 
 /**
@@ -243,9 +245,9 @@ export async function migrationFenceOpen(
       continue
     }
     if (
-      options.layoutKey !== undefined &&
+      options.layoutMove === true &&
       (heartbeat.layouts === undefined ||
-        heartbeat.layouts[options.layoutKey] === 'legacy')
+        Object.values(heartbeat.layouts).includes('legacy'))
     )
       block({ pid, version: heartbeat.version, detail: path })
   }

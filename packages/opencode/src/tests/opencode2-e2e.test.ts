@@ -30,7 +30,7 @@ import {
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import { POOL_PLACEHOLDER } from '../core/pool-migration'
 import { CODEX_USER_AGENT, CODEX_VERSION } from '../index'
-import { hostBinary } from './fixtures/opencode-host'
+import { hostBinary, runtimeStateDir } from './fixtures/opencode-host'
 import { controlPlaneProbe } from './fixtures/opencode2-control-plane'
 import {
   MOCK_ACCOUNTS,
@@ -317,7 +317,7 @@ async function runScenario(input: {
   // The pool is seeded where versions before the move kept it; the plugin
   // moves its runtime files into the state home at its first start.
   seedPool(configDir, input.accounts, input.mode)
-  const runtimeDir = join(isolated.XDG_STATE_HOME, 'cortexkit', 'openai-auth')
+  const runtimeDir = runtimeStateDir(isolated.XDG_STATE_HOME, configDir)
   if (input.upgrade) {
     const dataDir = join(isolated.XDG_DATA_HOME, 'opencode')
     mkdirSync(dataDir, { recursive: true })

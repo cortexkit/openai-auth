@@ -1,6 +1,10 @@
 // The one-time move of the runtime files (account state, vault folder, Codex
 // sessions) out of OpenCode's config folder into the state home, and the
 // resolver that follows it. Real files in temporary folders throughout.
+//
+// The tests reach new parts of the module through `layoutModule()` rather
+// than named imports, so each one fails on its own assertion against a build
+// that lacks them instead of the whole file failing to load.
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import {
   chmodSync,
@@ -9,17 +13,20 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   enrollmentAuthority,
   hostEnrollmentPaths,
 } from '@cortexkit/common-auth/claustrum'
+import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import {
   vaultEnrollmentName,
   vaultPaths,
@@ -36,6 +43,7 @@ import {
   processHeartbeatPath,
   startProcessHeartbeat,
 } from '../core/process-heartbeat'
+import * as runtimeLayout from '../core/runtime-layout'
 import {
   __resetRuntimeLayoutRunsForTest,
   prepareRuntimeLayout,
@@ -53,13 +61,14 @@ const ENV_NAMES = [
   'OPENCODE_OPENAI_AUTH_FILE',
   'OPENCODE_OPENAI_AUTH_STATE_FILE',
 ] as const
+const POSIX = process.platform !== 'win32'
 
 let root: string
 let saved: Record<string, string | undefined>
 let logged: { level: string; message: string; meta?: unknown }[]
 
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'runtime-layout-'))
+  root = realpathSync.native(mkdtempSync(join(tmpdir(), 'runtime-layout-')))
   saved = Object.fromEntries(ENV_NAMES.map((name) => [name, process.env[name]]))
   process.env.XDG_CONFIG_HOME = join(root, 'config')
   process.env.XDG_STATE_HOME = join(root, 'state')
@@ -73,6 +82,9 @@ beforeEach(() => {
 afterEach(() => {
   for (const name of ENV_NAMES) restoreEnv(name, saved[name])
   resetProcess()
+  try {
+    chmodSync(join(root, 'state'), 0o700)
+  } catch {}
   rmSync(root, { recursive: true, force: true })
 })
 
@@ -82,6 +94,10 @@ function resetProcess() {
   __resetRuntimeLayoutRunsForTest()
   __resetProcessHeartbeatForTest()
 }
+
+/** The module's exports, including ones a build might lack. */
+const layoutModule = () =>
+  runtimeLayout as typeof runtimeLayout & Record<string, unknown>
 
 function prepare(options: Partial<RuntimeLayoutOptions> = {}) {
   return prepareRuntimeLayout({
@@ -94,11 +110,14 @@ function prepare(options: Partial<RuntimeLayoutOptions> = {}) {
   })
 }
 
-const defaultConfigDir = () => join(root, 'config', 'opencode')
-const stateHomeDir = () => join(root, 'state', 'cortexkit', 'openai-auth')
+/** OpenCode's config folder in these tests: `opencode` in XDG_CONFIG_HOME. */
+const configDir = () => join(root, 'config', 'opencode')
+/** The state-home runtime folder the resolver names for that config folder. */
+const runtimeDir = () => runtimeLayoutLocation().stateHomeDir
+const stateRoot = () => join(root, 'state', 'cortexkit', 'openai-auth')
 
 function writePrivate(path: string, text: string) {
-  mkdirSync(join(path, '..'), { recursive: true, mode: 0o700 })
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
   writeFileSync(path, text, { mode: 0o600 })
   chmodSync(path, 0o600)
 }
@@ -143,7 +162,7 @@ function present(dir: string, files: Record<string, string>) {
 const absent = (files: Record<string, string>) =>
   Object.fromEntries(Object.keys(files).map((relative) => [relative, null]))
 
-function marker(dir = stateHomeDir()) {
+function marker(dir = runtimeDir()) {
   const path = join(dir, 'layout.json')
   return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined
 }
@@ -166,40 +185,98 @@ function heartbeat(pid: number, body: Record<string, unknown>) {
   return path
 }
 
+const REFUSED = /^openai-auth cannot start: /
+
+describe('where the runtime folder is', () => {
+  it('is opencode/ only for <home>/.config/opencode, and a keyed folder for every other config folder', async () => {
+    const home = join(root, 'home')
+    const env = (extra: Record<string, string | undefined>) => ({
+      HOME: home,
+      XDG_CONFIG_HOME: undefined,
+      OPENCODE_CONFIG_DIR: undefined,
+      ...extra,
+    })
+    const atHome = await spawnLayoutProcess('once', env({}))
+    const first = await spawnLayoutProcess(
+      'once',
+      env({ XDG_CONFIG_HOME: join(root, 'xdg-a') }),
+    )
+    const second = await spawnLayoutProcess(
+      'once',
+      env({ XDG_CONFIG_HOME: join(root, 'xdg-b') }),
+    )
+    expect(atHome.result.runtimeDir).toBe(join(stateRoot(), 'opencode'))
+    for (const other of [first, second])
+      expect(other.result.runtimeDir).toMatch(
+        /[\\/]cortexkit[\\/]openai-auth[\\/]opencode-[0-9a-f]{16}$/,
+      )
+    // Two XDG_CONFIG_HOME values never share a folder.
+    expect(first.result.runtimeDir).not.toBe(second.result.runtimeDir)
+    expect(
+      JSON.parse(
+        readFileSync(
+          join(atHome.result.runtimeDir as string, 'config-dir.json'),
+          'utf8',
+        ),
+      ),
+    ).toEqual({ version: 1, configDir: join(home, '.config', 'opencode') })
+  })
+
+  it('names the config folder by its real path, without folding case', () => {
+    const real = join(root, 'Real-Config')
+    mkdirSync(real, { recursive: true })
+    const link = join(root, 'link-config')
+    symlinkSync(real, link, POSIX ? 'dir' : 'junction')
+    process.env.OPENCODE_CONFIG_DIR = link
+    const viaLink = runtimeLayoutLocation()
+    expect(viaLink.key).toBe(realpathSync.native(real))
+    __resetRuntimeLayoutsForTest()
+    process.env.OPENCODE_CONFIG_DIR = real
+    expect(runtimeLayoutLocation().stateHomeDir).toBe(viaLink.stateHomeDir)
+    // A folder that does not exist yet is named by its resolved path.
+    __resetRuntimeLayoutsForTest()
+    process.env.OPENCODE_CONFIG_DIR = join(root, 'Not-There')
+    expect(runtimeLayoutLocation().key).toBe(join(root, 'Not-There'))
+  })
+})
+
 describe('the runtime layout on a fresh install', () => {
   it('writes the marker and resolves every runtime file in the state home', async () => {
     expect(await prepare()).toBe('state-home')
+    expect(runtimeDir()).toMatch(/[\\/]opencode-[0-9a-f]{16}$/)
     expect(marker()).toEqual({
       version: 1,
-      oldDir: defaultConfigDir(),
+      oldDir: runtimeLayoutLocation().key,
       oldFilesRemoved: true,
     })
     const paths = getAccountPaths()
-    expect(paths.configPath).toBe(join(defaultConfigDir(), 'openai-auth.json'))
-    expect(paths.statePath).toBe(join(stateHomeDir(), 'openai-auth-state.json'))
+    expect(paths.configPath).toBe(join(configDir(), 'openai-auth.json'))
+    expect(paths.statePath).toBe(join(runtimeDir(), 'openai-auth-state.json'))
     expect(vaultStateDir(paths.statePath)).toBe(
-      join(stateHomeDir(), 'openai-auth-vault'),
+      join(runtimeDir(), 'openai-auth-vault'),
     )
     expect(getCodexSessionsPath('opencode1')).toBe(
-      join(stateHomeDir(), 'openai-auth-sessions.json'),
+      join(runtimeDir(), 'openai-auth-sessions.json'),
     )
     expect(getCodexSessionsPath('opencode2')).toBe(
-      join(stateHomeDir(), 'openai-auth-sessions-opencode2.json'),
+      join(runtimeDir(), 'openai-auth-sessions-opencode2.json'),
     )
-    if (process.platform !== 'win32')
-      expect(statSync(stateHomeDir()).mode & 0o777).toBe(0o700)
+    expect(
+      JSON.parse(readFileSync(join(runtimeDir(), 'config-dir.json'), 'utf8')),
+    ).toEqual({ version: 1, configDir: runtimeLayoutLocation().key })
+    if (POSIX) expect(statSync(runtimeDir()).mode & 0o777).toBe(0o700)
     // Nothing was created in OpenCode's config folder.
-    expect(existsSync(defaultConfigDir())).toBe(false)
+    expect(existsSync(configDir())).toBe(false)
   })
 
   it('a tool that never prepared follows the marker alone', async () => {
     expect(getAccountPaths().statePath).toBe(
-      join(defaultConfigDir(), 'openai-auth-state.json'),
+      join(configDir(), 'openai-auth-state.json'),
     )
     await prepare()
     resetProcess()
     expect(getAccountPaths().statePath).toBe(
-      join(stateHomeDir(), 'openai-auth-state.json'),
+      join(runtimeDir(), 'openai-auth-state.json'),
     )
   })
 })
@@ -207,40 +284,34 @@ describe('the runtime layout on a fresh install', () => {
 describe('moving an existing layout', () => {
   it('moves the state, the vault folder and both sessions files byte for byte, keeping vault mode', async () => {
     const files = oldLayout()
-    seed(defaultConfigDir(), files)
-    writePrivate(
-      join(defaultConfigDir(), 'openai-auth.json'),
-      '{"keep":true}\n',
-    )
+    seed(configDir(), files)
+    writePrivate(join(configDir(), 'openai-auth.json'), '{"keep":true}\n')
     expect(await authority()).toBe('vault')
 
     resetProcess()
     expect(await prepare()).toBe('state-home')
 
-    expect(present(stateHomeDir(), files)).toEqual(files)
-    expect(present(defaultConfigDir(), files)).toEqual(absent(files))
-    expect(existsSync(join(defaultConfigDir(), 'openai-auth-vault'))).toBe(
-      false,
-    )
+    expect(present(runtimeDir(), files)).toEqual(files)
+    expect(present(configDir(), files)).toEqual(absent(files))
+    expect(existsSync(join(configDir(), 'openai-auth-vault'))).toBe(false)
     // The settings file stays where OpenCode users edit it.
-    expect(
-      readFileSync(join(defaultConfigDir(), 'openai-auth.json'), 'utf8'),
-    ).toBe('{"keep":true}\n')
+    expect(readFileSync(join(configDir(), 'openai-auth.json'), 'utf8')).toBe(
+      '{"keep":true}\n',
+    )
     expect(await authority()).toBe('vault')
     expect(
       vaultPaths(vaultStateDir(getAccountPaths().statePath), 'opencode')
         .rosterPath,
-    ).toBe(join(stateHomeDir(), 'openai-auth-vault', 'opencode-roster.json'))
-    if (process.platform !== 'win32') {
+    ).toBe(join(runtimeDir(), 'openai-auth-vault', 'opencode-roster.json'))
+    if (POSIX) {
       for (const relative of Object.keys(files))
-        expect(statSync(join(stateHomeDir(), relative)).mode & 0o777).toBe(
-          0o600,
-        )
+        expect(statSync(join(runtimeDir(), relative)).mode & 0o777).toBe(0o600)
       expect(
-        statSync(join(stateHomeDir(), 'openai-auth-vault')).mode & 0o777,
+        statSync(join(runtimeDir(), 'openai-auth-vault')).mode & 0o777,
       ).toBe(0o700)
     }
     expect(marker()?.oldFilesRemoved).toBe(true)
+    expect(existsSync(join(runtimeDir(), 'layout-moving.json'))).toBe(false)
     expect(logged.map((line) => line.message)).toContain(
       "openai-auth moved its runtime files out of OpenCode's config folder",
     )
@@ -248,7 +319,7 @@ describe('moving an existing layout', () => {
 
   it('a crash after the copy and before the marker leaves the old files authoritative; the next start completes', async () => {
     const files = oldLayout()
-    seed(defaultConfigDir(), files)
+    seed(configDir(), files)
     expect(
       await prepare({
         steps: {
@@ -259,12 +330,12 @@ describe('moving an existing layout', () => {
       }),
     ).toBe('legacy')
     expect(marker()).toBeUndefined()
-    expect(present(defaultConfigDir(), files)).toEqual(files)
+    expect(present(configDir(), files)).toEqual(files)
     expect(getAccountPaths().statePath).toBe(
-      join(defaultConfigDir(), 'openai-auth-state.json'),
+      join(configDir(), 'openai-auth-state.json'),
     )
     expect(getCodexSessionsPath('opencode2')).toBe(
-      join(defaultConfigDir(), 'openai-auth-sessions-opencode2.json'),
+      join(configDir(), 'openai-auth-sessions-opencode2.json'),
     )
 
     // A later start: the old files changed meanwhile (they were still
@@ -273,21 +344,24 @@ describe('moving an existing layout', () => {
       ...files,
       'openai-auth-state.json': '{"refresh":"b"}\n',
     }
-    seed(defaultConfigDir(), changed)
-    rmSync(join(defaultConfigDir(), 'openai-auth-sessions.json'))
+    seed(configDir(), changed)
+    rmSync(join(configDir(), 'openai-auth-sessions.json'))
     const { 'openai-auth-sessions.json': _gone, ...remaining } = changed
+    // The test's own heartbeat says legacy; this "next start" is another
+    // process, which would not see its own pid.
+    rmSync(processHeartbeatPath(), { force: true })
     resetProcess()
     expect(await prepare()).toBe('state-home')
-    expect(present(stateHomeDir(), changed)).toEqual({
+    expect(present(runtimeDir(), changed)).toEqual({
       ...remaining,
       'openai-auth-sessions.json': null,
     })
-    expect(present(defaultConfigDir(), changed)).toEqual(absent(changed))
+    expect(present(configDir(), changed)).toEqual(absent(changed))
   })
 
   it('a crash after the marker: the next start removes identical leftovers and keeps differing ones', async () => {
     const files = oldLayout()
-    seed(defaultConfigDir(), files)
+    seed(configDir(), files)
     expect(
       await prepare({
         steps: {
@@ -297,18 +371,21 @@ describe('moving an existing layout', () => {
         },
       }),
     ).toBe('state-home')
-    expect(marker()).toEqual({ version: 1, oldDir: defaultConfigDir() })
-    expect(present(defaultConfigDir(), files)).toEqual(files)
-    expect(present(stateHomeDir(), files)).toEqual(files)
+    expect(marker()).toEqual({
+      version: 1,
+      oldDir: runtimeLayoutLocation().key,
+    })
+    expect(present(configDir(), files)).toEqual(files)
+    expect(present(runtimeDir(), files)).toEqual(files)
 
-    const differing = join(defaultConfigDir(), 'openai-auth-sessions.json')
+    const differing = join(configDir(), 'openai-auth-sessions.json')
     writeFileSync(differing, '{"downgrade":true}\n')
     resetProcess()
     expect(await prepare()).toBe('state-home')
     const { 'openai-auth-sessions.json': _kept, ...identical } = files
-    expect(present(defaultConfigDir(), identical)).toEqual(absent(identical))
+    expect(present(configDir(), identical)).toEqual(absent(identical))
     expect(readFileSync(differing, 'utf8')).toBe('{"downgrade":true}\n')
-    expect(present(stateHomeDir(), files)).toEqual(files)
+    expect(present(runtimeDir(), files)).toEqual(files)
     expect(marker()?.oldFilesRemoved).toBe(true)
     expect(logged).toContainEqual(
       expect.objectContaining({
@@ -318,40 +395,126 @@ describe('moving an existing layout', () => {
     )
   })
 
-  it('old files that reappear after the move are never read nor removed', async () => {
-    seed(defaultConfigDir(), oldLayout())
+  it('cleanup after a crash waits for the store lock and compares again before it unlinks', async () => {
+    const files = oldLayout()
+    seed(configDir(), files)
+    await prepare({
+      steps: {
+        afterMarker: () => {
+          throw new Error('crash')
+        },
+      },
+    })
+    const oldState = join(configDir(), 'openai-auth-state.json')
+    // A writer holds the store's lock on the old state file and replaces it.
+    const held = await acquireRefreshFileLock({
+      name: 'save',
+      path: oldState,
+      ttlMs: 10_000,
+    })
+    expect(held).not.toBeNull()
+    resetProcess()
+    let settled = false
+    const run = prepare().then((layout) => {
+      settled = true
+      return layout
+    })
+    await Bun.sleep(300)
+    expect(settled).toBe(false)
+    writeFileSync(oldState, '{"refresh":"written-under-the-lock"}\n')
+    await held?.release()
+    expect(await run).toBe('state-home')
+    expect(readFileSync(oldState, 'utf8')).toBe(
+      '{"refresh":"written-under-the-lock"}\n',
+    )
+    expect(logged).toContainEqual(
+      expect.objectContaining({
+        level: 'warn',
+        meta: expect.objectContaining({ kept: [oldState] }),
+      }),
+    )
+  })
+
+  it('old files that reappear after the move are never read nor removed, and /openai shows it once', async () => {
+    seed(configDir(), oldLayout())
     await prepare()
     // An older version ran again and wrote its own files.
     const downgrade = oldLayout('downgrade')
-    seed(defaultConfigDir(), downgrade)
+    seed(configDir(), downgrade)
     resetProcess()
     expect(await prepare()).toBe('state-home')
-    expect(present(defaultConfigDir(), downgrade)).toEqual(downgrade)
-    expect(present(stateHomeDir(), oldLayout())).toEqual(oldLayout())
+    expect(present(configDir(), downgrade)).toEqual(downgrade)
+    expect(present(runtimeDir(), oldLayout())).toEqual(oldLayout())
     expect(getAccountPaths().statePath).toBe(
-      join(stateHomeDir(), 'openai-auth-state.json'),
+      join(runtimeDir(), 'openai-auth-state.json'),
     )
     const warnings = logged.filter((line) => line.level === 'warn')
     expect(warnings).toHaveLength(1)
-    expect(warnings[0]?.meta).toMatchObject({ configDir: defaultConfigDir() })
+    expect(warnings[0]?.meta).toMatchObject({ configDir: configDir() })
+    const take = layoutModule().takeRuntimeLayoutNotice as
+      | (() => string | undefined)
+      | undefined
+    expect(typeof take).toBe('function')
+    expect(take?.()).toContain(configDir())
+    expect(take?.()).toBeUndefined()
     // One warning per process.
     __resetRuntimeLayoutsForTest()
     await prepare()
     expect(logged.filter((line) => line.level === 'warn')).toHaveLength(1)
+  })
+
+  it('a marker that does not parse keeps the state home authoritative and the old files untouched', async () => {
+    const files = oldLayout()
+    seed(configDir(), files)
+    writePrivate(join(runtimeDir(), 'layout.json'), '{ not json')
+    expect(await prepare()).toBe('state-home')
+    expect(present(configDir(), files)).toEqual(files)
+  })
+
+  it('a marker that cannot be read refuses the start instead of counting as moved', async () => {
+    seed(configDir(), oldLayout())
+    // A folder where the marker should be: it exists, and reading it fails.
+    mkdirSync(join(runtimeDir(), 'layout.json'), { recursive: true })
+    await expect(prepare()).rejects.toThrow(REFUSED)
+    expect(present(configDir(), oldLayout())).toEqual(oldLayout())
+  })
+
+  it('a layout lease lost before the marker writes no marker and refuses to run unregistered', async () => {
+    const files = oldLayout()
+    seed(configDir(), files)
+    const lockPath = `${join(runtimeDir(), 'layout.json')}.runtime-layout.lock`
+    await expect(
+      prepare({
+        steps: {
+          afterCopy: () => {
+            // Another process took the lease over while this one stalled.
+            writeFileSync(
+              lockPath,
+              JSON.stringify({
+                ownerId: 'another-process',
+                expiresAt: Date.now() + 60_000,
+              }),
+            )
+          },
+        },
+      }),
+    ).rejects.toThrow(REFUSED)
+    expect(marker()).toBeUndefined()
+    expect(present(configDir(), files)).toEqual(files)
   })
 })
 
 describe('processes that could still write the old files', () => {
   it('a live older version defers the move; once it is gone the move completes', async () => {
     const files = oldLayout()
-    seed(defaultConfigDir(), files)
+    seed(configDir(), files)
     // The test runner's parent is alive and is not this process.
     const older = heartbeat(process.ppid, { version: '1.6.2' })
     expect(await prepare()).toBe('legacy')
     expect(marker()).toBeUndefined()
-    expect(present(defaultConfigDir(), files)).toEqual(files)
+    expect(present(configDir(), files)).toEqual(files)
     expect(getAccountPaths().statePath).toBe(
-      join(defaultConfigDir(), 'openai-auth-state.json'),
+      join(configDir(), 'openai-auth-state.json'),
     )
     expect(logged).toContainEqual(
       expect.objectContaining({ message: RUNTIME_LAYOUT_DEFERRED_MESSAGE }),
@@ -364,14 +527,25 @@ describe('processes that could still write the old files', () => {
     rmSync(processHeartbeatPath())
     resetProcess()
     expect(await prepare()).toBe('state-home')
-    expect(present(stateHomeDir(), files)).toEqual(files)
-    expect(present(defaultConfigDir(), files)).toEqual(absent(files))
+    expect(present(runtimeDir(), files)).toEqual(files)
+    expect(present(configDir(), files)).toEqual(absent(files))
   })
 
   it('a heartbeat without layouts predates the move and defers it, even at the same version', async () => {
-    seed(defaultConfigDir(), oldLayout())
+    seed(configDir(), oldLayout())
     heartbeat(process.ppid, { version: VERSION })
     expect(await prepare()).toBe('legacy')
+  })
+
+  it('a live legacy heartbeat under another config folder key blocks the move too', async () => {
+    seed(configDir(), oldLayout())
+    heartbeat(process.ppid, {
+      version: VERSION,
+      layouts: { [join(root, 'some', 'other', 'opencode')]: 'legacy' },
+    })
+    expect(await prepare()).toBe('legacy')
+    expect(marker()).toBeUndefined()
+    expect(present(configDir(), oldLayout())).toEqual(oldLayout())
   })
 
   it('a fresh install waits for an older version too', async () => {
@@ -380,9 +554,27 @@ describe('processes that could still write the old files', () => {
     expect(marker()).toBeUndefined()
   })
 
+  it('a process that cannot record its legacy layout refuses to start', async () => {
+    seed(configDir(), oldLayout())
+    heartbeat(process.ppid, { version: '1.6.2' })
+    // This process's own heartbeat file cannot be written: a folder is in
+    // its place.
+    mkdirSync(processHeartbeatPath(), { recursive: true })
+    await expect(prepare()).rejects.toThrow(REFUSED)
+  })
+
+  it('a state folder that cannot be created refuses the start rather than run unregistered', async () => {
+    seed(configDir(), oldLayout())
+    mkdirSync(join(root, 'state', 'cortexkit'), { recursive: true })
+    // A file where the state folder's parent should be.
+    writeFileSync(stateRoot(), 'not a folder')
+    await expect(prepare()).rejects.toThrow(REFUSED)
+    expect(present(configDir(), oldLayout())).toEqual(oldLayout())
+  })
+
   it('a live process on the legacy layout keeps a new one legacy; after it exits the next start moves', async () => {
     const files = oldLayout()
-    seed(defaultConfigDir(), files)
+    seed(configDir(), files)
     const older = heartbeat(process.ppid, { version: '1.6.2' })
     // Process A starts while an older version runs, so it takes the legacy
     // layout, and keeps running after the older version exits.
@@ -393,7 +585,7 @@ describe('processes that could still write the old files', () => {
     // Process B starts while A is alive: legacy too.
     const b = await spawnLayoutProcess('once')
     expect(b.result.layout).toBe('legacy')
-    expect(present(defaultConfigDir(), files)).toEqual(files)
+    expect(present(configDir(), files)).toEqual(files)
 
     a.child.kill()
     await a.child.exited
@@ -401,15 +593,15 @@ describe('processes that could still write the old files', () => {
     const c = await spawnLayoutProcess('once')
     expect(c.result.layout).toBe('state-home')
     expect(c.result.statePath).toBe(
-      join(stateHomeDir(), 'openai-auth-state.json'),
+      join(runtimeDir(), 'openai-auth-state.json'),
     )
-    expect(present(stateHomeDir(), files)).toEqual(files)
-    expect(present(defaultConfigDir(), files)).toEqual(absent(files))
+    expect(present(runtimeDir(), files)).toEqual(files)
+    expect(present(configDir(), files)).toEqual(absent(files))
   })
 
   it('two processes starting together produce one move and identical files', async () => {
     const files = oldLayout()
-    seed(defaultConfigDir(), files)
+    seed(configDir(), files)
     const [one, two] = await Promise.all([
       spawnLayoutProcess('once'),
       spawnLayoutProcess('once'),
@@ -418,12 +610,12 @@ describe('processes that could still write the old files', () => {
       'state-home',
       'state-home',
     ])
-    expect(one.result.statePath).toBe(two.result.statePath)
-    expect(present(stateHomeDir(), files)).toEqual(files)
-    expect(present(defaultConfigDir(), files)).toEqual(absent(files))
+    expect(one.result.statePath).toBe(two.result.statePath as string)
+    expect(present(runtimeDir(), files)).toEqual(files)
+    expect(present(configDir(), files)).toEqual(absent(files))
     expect(marker()?.oldFilesRemoved).toBe(true)
     expect(
-      readdirSync(stateHomeDir()).filter((name) => name.endsWith('.tmp')),
+      readdirSync(runtimeDir()).filter((name) => name.includes('.tmp')),
     ).toEqual([])
   })
 
@@ -439,8 +631,10 @@ describe('processes that could still write the old files', () => {
   })
 })
 
-describe('chosen paths and other config folders', () => {
-  it('OPENCODE_OPENAI_AUTH_STATE_FILE wins and its files are never moved', async () => {
+describe('paths the move must not touch', () => {
+  it('OPENCODE_OPENAI_AUTH_STATE_FILE elsewhere: no move and no marker, the chosen files untouched', async () => {
+    const files = oldLayout()
+    seed(configDir(), files)
     const chosenDir = join(root, 'chosen')
     const chosen = oldLayout('chosen')
     seed(chosenDir, chosen)
@@ -448,65 +642,125 @@ describe('chosen paths and other config folders', () => {
       chosenDir,
       'openai-auth-state.json',
     )
-    expect(await prepare()).toBe('state-home')
+    expect(await prepare()).toBe('legacy')
+    expect(marker()).toBeUndefined()
     expect(getAccountPaths().statePath).toBe(
       join(chosenDir, 'openai-auth-state.json'),
     )
     expect(present(chosenDir, chosen)).toEqual(chosen)
+    expect(present(configDir(), files)).toEqual(files)
     expect(await authority()).toBe('vault')
   })
 
-  it('a state file override naming the old default file keeps it and its vault in place', async () => {
+  it('a state file override naming the old default file writes no marker, so a later start without it moves the state', async () => {
     const files = oldLayout()
-    seed(defaultConfigDir(), files)
+    seed(configDir(), files)
     process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = join(
-      defaultConfigDir(),
+      configDir(),
       'openai-auth-state.json',
     )
+    expect(await prepare()).toBe('legacy')
+    expect(marker()).toBeUndefined()
+    expect(present(configDir(), files)).toEqual(files)
+
+    // Because the start with the override wrote no marker, a later process
+    // without the override moves every file, the state file included.
+    rmSync(processHeartbeatPath(), { force: true })
+    unsetEnv('OPENCODE_OPENAI_AUTH_STATE_FILE')
+    resetProcess()
     expect(await prepare()).toBe('state-home')
-    const {
-      'openai-auth-sessions.json': s1,
-      'openai-auth-sessions-opencode2.json': s2,
-      ...kept
-    } = files
-    expect(present(defaultConfigDir(), kept)).toEqual(kept)
-    expect(
-      present(stateHomeDir(), {
-        'openai-auth-sessions.json': '',
-        'openai-auth-sessions-opencode2.json': '',
-      }),
-    ).toEqual({
-      'openai-auth-sessions.json': s1 ?? null,
-      'openai-auth-sessions-opencode2.json': s2 ?? null,
-    })
-    expect(existsSync(join(stateHomeDir(), 'openai-auth-state.json'))).toBe(
-      false,
-    )
-    expect(getAccountPaths().statePath).toBe(
-      join(defaultConfigDir(), 'openai-auth-state.json'),
+    expect(present(runtimeDir(), files)).toEqual(files)
+  })
+
+  it('an override follows an existing marker for the files it does not name', async () => {
+    await prepare()
+    resetProcess()
+    const chosen = join(root, 'chosen', 'state.json')
+    writePrivate(chosen, '{"chosen":true}\n')
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = chosen
+    expect(await prepare()).toBe('state-home')
+    expect(getAccountPaths().statePath).toBe(chosen)
+    expect(getCodexSessionsPath('opencode2')).toBe(
+      join(runtimeDir(), 'openai-auth-sessions-opencode2.json'),
     )
   })
 
-  it('a custom OPENCODE_OPENAI_AUTH_FILE keeps its state file beside it', async () => {
-    const customDir = join(root, 'custom')
-    const custom = join(customDir, 'mine.json')
+  it('an explicit state file inside the destination is never overwritten or deleted', async () => {
+    seed(configDir(), oldLayout())
+    const destination = join(runtimeDir(), 'openai-auth-state.json')
+    writePrivate(destination, '{"only-copy":true}\n')
+    const vaultToken = join(
+      runtimeDir(),
+      'openai-auth-vault',
+      'opencode-enrollment.json',
+    )
+    writePrivate(vaultToken, '{"vault-only-copy":true}\n')
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = destination
+    expect(await prepare()).toBe('legacy')
+    expect(readFileSync(destination, 'utf8')).toBe('{"only-copy":true}\n')
+    expect(readFileSync(vaultToken, 'utf8')).toBe('{"vault-only-copy":true}\n')
+    expect(marker()).toBeUndefined()
+    expect(present(configDir(), oldLayout())).toEqual(oldLayout())
+  })
+
+  it('a custom config file whose state lies in the destination is never touched', async () => {
+    const custom = join(runtimeDir(), 'openai-auth.json')
     writePrivate(custom, '{}\n')
-    writePrivate(`${custom}.state.json`, '{"refresh":"custom"}\n')
+    const derived = join(runtimeDir(), 'openai-auth-state.json')
+    writePrivate(derived, '{"custom-state":true}\n')
     process.env.OPENCODE_OPENAI_AUTH_FILE = custom
-    expect(await prepare()).toBe('state-home')
-    expect(getAccountPaths()).toEqual({
-      configPath: custom,
-      statePath: `${custom}.state.json`,
-    })
-    expect(readFileSync(`${custom}.state.json`, 'utf8')).toBe(
-      '{"refresh":"custom"}\n',
-    )
-    expect(vaultStateDir(getAccountPaths().statePath)).toBe(
-      join(customDir, 'openai-auth-vault'),
-    )
+    expect(await prepare()).toBe('legacy')
+    expect(getAccountPaths().statePath).toBe(derived)
+    expect(readFileSync(derived, 'utf8')).toBe('{"custom-state":true}\n')
+    expect(marker()).toBeUndefined()
   })
 
-  it('a non-default OPENCODE_CONFIG_DIR gets its own keyed folder, and two folders never share one', async () => {
+  it('a runtime file another process put in the destination stops the move and is kept', async () => {
+    const files = oldLayout()
+    seed(configDir(), files)
+    // A state file left in the destination by a process whose state-file
+    // override pointed there.
+    const foreign = join(runtimeDir(), 'openai-auth-state.json')
+    writePrivate(foreign, '{"someone-elses":true}\n')
+    expect(await prepare()).toBe('legacy')
+    expect(readFileSync(foreign, 'utf8')).toBe('{"someone-elses":true}\n')
+    expect(marker()).toBeUndefined()
+    expect(present(configDir(), files)).toEqual(files)
+  })
+
+  it('a state folder that is the config folder itself (a link) is refused and nothing is lost', async () => {
+    const files = oldLayout()
+    seed(configDir(), files)
+    mkdirSync(dirname(runtimeDir()), { recursive: true })
+    symlinkSync(configDir(), runtimeDir(), POSIX ? 'dir' : 'junction')
+    expect(await prepare()).toBe('legacy')
+    expect(present(configDir(), files)).toEqual(files)
+    expect(existsSync(join(configDir(), 'layout.json'))).toBe(false)
+  })
+
+  it('a state folder that names another config folder is refused and left untouched', async () => {
+    const files = oldLayout()
+    seed(configDir(), files)
+    writePrivate(
+      join(runtimeDir(), 'config-dir.json'),
+      `${JSON.stringify({ version: 1, configDir: join(root, 'elsewhere') })}\n`,
+    )
+    await expect(prepare()).rejects.toThrow(/belongs to another OpenCode/)
+    expect(present(configDir(), files)).toEqual(files)
+    expect(marker()).toBeUndefined()
+  })
+
+  it('a marker naming another config folder is refused', async () => {
+    seed(configDir(), oldLayout())
+    writePrivate(
+      join(runtimeDir(), 'layout.json'),
+      `${JSON.stringify({ version: 1, oldDir: join(root, 'elsewhere'), oldFilesRemoved: true })}\n`,
+    )
+    await expect(prepare()).rejects.toThrow(/belongs to another OpenCode/)
+    expect(present(configDir(), oldLayout())).toEqual(oldLayout())
+  })
+
+  it('two config folders never share a runtime folder', async () => {
     const first = join(root, 'first-config')
     const second = join(root, 'second-config')
     seed(first, oldLayout('first'))
@@ -514,50 +768,42 @@ describe('chosen paths and other config folders', () => {
 
     process.env.OPENCODE_CONFIG_DIR = first
     expect(await prepare()).toBe('state-home')
-    const firstState = getAccountPaths().statePath
-    const firstDir = runtimeLayoutLocation().stateHomeDir
+    const firstDir = runtimeDir()
 
     resetProcess()
     process.env.OPENCODE_CONFIG_DIR = second
     expect(await prepare()).toBe('state-home')
-    const secondState = getAccountPaths().statePath
-    const secondDir = runtimeLayoutLocation().stateHomeDir
+    const secondDir = runtimeDir()
 
-    expect(firstDir).toMatch(
-      new RegExp(
-        `^${stateHomeDir().replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')}[\\\\/]config-[0-9a-f]{16}$`,
-      ),
-    )
     expect(secondDir).not.toBe(firstDir)
-    expect(firstState).toBe(join(firstDir, 'openai-auth-state.json'))
-    expect(secondState).toBe(join(secondDir, 'openai-auth-state.json'))
     expect(present(firstDir, oldLayout('first'))).toEqual(oldLayout('first'))
     expect(present(secondDir, oldLayout('second'))).toEqual(oldLayout('second'))
-    for (const [dir, configDir] of [
+    for (const [dir, config] of [
       [firstDir, first],
       [secondDir, second],
     ] as const)
       expect(
         JSON.parse(readFileSync(join(dir, 'config-dir.json'), 'utf8')),
-      ).toEqual({ configDir })
-    // The default folder's own files are untouched by either.
-    expect(marker()).toBeUndefined()
-  })
-
-  it('OPENCODE_CONFIG_DIR naming the default folder uses the default state folder', async () => {
-    process.env.OPENCODE_CONFIG_DIR = defaultConfigDir()
-    expect(await prepare()).toBe('state-home')
-    expect(runtimeLayoutLocation().stateHomeDir).toBe(stateHomeDir())
+      ).toEqual({ version: 1, configDir: config })
   })
 })
 
-/** Runs the layout decision in its own process with this test's environment. */
-async function spawnLayoutProcess(mode: 'once' | 'hold') {
+/**
+ * Runs the layout decision in its own process with this test's environment
+ * plus `extra` (an undefined value removes a variable).
+ */
+async function spawnLayoutProcess(
+  mode: 'once' | 'hold',
+  extra: Record<string, string | undefined> = {},
+) {
   const env: Record<string, string | undefined> = {
     ...process.env,
     NODE_ENV: 'test',
     RUNTIME_LAYOUT_TEST_VERSION: VERSION,
+    ...extra,
   }
+  for (const [name, value] of Object.entries(env))
+    if (value === undefined) delete env[name]
   const child = Bun.spawn(
     [
       process.execPath,
@@ -584,10 +830,11 @@ async function spawnLayoutProcess(mode: 'once' | 'hold') {
   return {
     child,
     result: JSON.parse(text.trim()) as {
-      layout: string
-      pid: number
-      statePath: string
-      sessions: string
+      layout?: string
+      error?: string
+      pid?: number
+      statePath?: string
+      runtimeDir?: string
     },
   }
 }

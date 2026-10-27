@@ -88,6 +88,7 @@ import { startProcessHeartbeat } from '../core/process-heartbeat'
 import {
   prepareRuntimeLayout,
   type RuntimeLayoutOptions,
+  takeRuntimeLayoutNotice,
 } from '../core/runtime-layout'
 import { acquireOpenCodeVault } from '../core/shared-vault'
 import { migrationFenceOpen } from '../core/version-fence'
@@ -847,6 +848,7 @@ export async function setupOpenAIAuth(
               accountStoragePath: paths().configPath,
               accountStatePath: paths().statePath,
               packageVersion: version,
+              layoutNotice: takeRuntimeLayoutNotice,
               loadAccounts,
               store: () => source.poolStore(),
               migration: async () => {

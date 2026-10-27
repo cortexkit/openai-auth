@@ -15,12 +15,11 @@
 
 import { mkdirSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
-import {
-  acquireRefreshFileLock,
-  type RefreshFileLock,
-} from '@cortexkit/common-auth/fs'
+import type { RefreshFileLock } from '@cortexkit/common-auth/fs'
 import type { CodexSessionMetadata } from '../codex-request'
 import {
+  acquireCodexSessionsLock,
+  CODEX_SESSIONS_LOCK_WAIT_MS,
   loadCodexSessions,
   readCodexSessionThreads,
   writeCodexSessionThreads,
@@ -40,19 +39,12 @@ export function opencode2CodexSessionsPath(): string {
   return getCodexSessionsPath('opencode2')
 }
 
-const LOCK_NAME = 'sessions'
-/** Longer than any save holds the lock: a re-read and one small rename. */
-const LOCK_TTL_MS = 10_000
-/** A save gives up after this long and leaves its changes for the next one. */
-const LOCK_WAIT_MS = 5_000
-const LOCK_RETRY_MS = 25
-
 export interface CodexSessionStoreOptions {
   /** Mints the turn ids of loaded sessions; UUIDv7 by default. */
   uuid?: () => string
   /** Test seam: runs while the lock is held, after the file was re-read. */
   afterRead?: () => Promise<void>
-  /** Test seam: the lock wait; `LOCK_WAIT_MS` by default. */
+  /** Test seam: the lock wait; `CODEX_SESSIONS_LOCK_WAIT_MS` by default. */
   lockWaitMs?: number
 }
 
@@ -161,18 +153,11 @@ export class CodexSessionStore {
       if (!this.sessions.has(id)) this.#deleted.delete(id)
   }
 
-  async #lock(): Promise<RefreshFileLock | null> {
-    const deadline =
-      performance.now() + (this.options.lockWaitMs ?? LOCK_WAIT_MS)
-    for (;;) {
-      const lock = await acquireRefreshFileLock({
-        name: LOCK_NAME,
-        path: this.path,
-        ttlMs: LOCK_TTL_MS,
-      })
-      if (lock || performance.now() >= deadline) return lock
-      await new Promise((done) => setTimeout(done, LOCK_RETRY_MS))
-    }
+  #lock(): Promise<RefreshFileLock | null> {
+    return acquireCodexSessionsLock(
+      this.path,
+      this.options.lockWaitMs ?? CODEX_SESSIONS_LOCK_WAIT_MS,
+    )
   }
 }
 

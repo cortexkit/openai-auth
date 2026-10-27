@@ -163,6 +163,7 @@ import {
 import {
   prepareRuntimeLayout,
   type RuntimeLayoutOptions,
+  takeRuntimeLayoutNotice,
 } from './core/runtime-layout'
 import { acquireOpenCodeVault } from './core/shared-vault'
 import {
@@ -2892,6 +2893,7 @@ export async function CodexAuthPlugin(
           accountStoragePath: menuPaths.configPath,
           accountStatePath: menuPaths.statePath,
           packageVersion: PackageVersion,
+          layoutNotice: takeRuntimeLayoutNotice,
           quotaManager,
           loadAccounts,
           beginAccountLogin,

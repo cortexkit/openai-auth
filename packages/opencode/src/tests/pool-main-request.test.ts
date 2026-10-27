@@ -23,6 +23,10 @@ import type {
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
 import { createAuthDoctorReport } from '../auth/doctor.ts'
 import {
+  __resetRuntimeLayoutsForTest,
+  runtimeLayoutLocation,
+} from '../core/account-paths.ts'
+import {
   isPoolMainPlaceholder,
   POOL_MAIN_PLACEHOLDER_REFRESH,
 } from '../core/pool-main.ts'
@@ -35,6 +39,7 @@ import {
   __resetProcessHeartbeatForTest,
   processHeartbeatPath,
 } from '../core/process-heartbeat.ts'
+import { __resetRuntimeLayoutRunsForTest } from '../core/runtime-layout.ts'
 import { CodexAuthPlugin, createResetTargetResolver } from '../index.ts'
 import { flushForTest } from '../logger.ts'
 import {
@@ -709,11 +714,38 @@ describe('main refresh re-reads the slot once it holds the lock', () => {
 describe('process heartbeat', () => {
   beforeEach(() => {
     __resetProcessHeartbeatForTest()
+    __resetRuntimeLayoutsForTest()
+    __resetRuntimeLayoutRunsForTest()
   })
+
+  /**
+   * A state home whose runtime folder for this test's config folder already
+   * holds a finished move, so the plugin starts on the state-home layout. The
+   * test environment names its state and config files explicitly, and such a
+   * process otherwise stays on the legacy layout, whose heartbeat is kept
+   * until the process exits.
+   */
+  function settledStateHome(stateHome: string) {
+    process.env.XDG_STATE_HOME = stateHome
+    const location = runtimeLayoutLocation()
+    mkdirSync(location.stateHomeDir, { recursive: true })
+    writeFileSync(
+      join(location.stateHomeDir, 'config-dir.json'),
+      JSON.stringify({ version: 1, configDir: location.key }),
+    )
+    writeFileSync(
+      join(location.stateHomeDir, 'layout.json'),
+      JSON.stringify({
+        version: 1,
+        oldDir: location.key,
+        oldFilesRemoved: true,
+      }),
+    )
+  }
 
   it('is written on loader start and removed on dispose', async () => {
     const stateHome = mkdtempSync(join(tmpdir(), 'oai-heartbeat-'))
-    process.env.XDG_STATE_HOME = stateHome
+    settledStateHome(stateHome)
     seedStore('main-first', [])
     installWire()
     const startedBefore = Date.now()
@@ -746,10 +778,11 @@ describe('process heartbeat', () => {
 
   it('a heartbeat that cannot be written does not fail the loader', async () => {
     const stateHome = mkdtempSync(join(tmpdir(), 'oai-heartbeat-blocked-'))
-    // A regular file where the state directory should be: mkdir under it fails.
-    const blocker = join(stateHome, 'not-a-directory')
-    writeFileSync(blocker, '')
-    process.env.XDG_STATE_HOME = blocker
+    // The runtime files' layout is settled, so only the heartbeat is written
+    // at start. A regular file where the heartbeat directory should be: mkdir
+    // under it fails.
+    settledStateHome(stateHome)
+    writeFileSync(join(stateHome, 'cortexkit', 'openai-auth', 'processes'), '')
     seedStore('main-first', [])
     const wire = installWire()
 

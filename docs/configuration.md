@@ -96,34 +96,39 @@ The settings file `openai-auth.json` stays in OpenCode's config folder, where yo
 - the Codex sessions files `openai-auth-sessions.json` (OpenCode 1) and `openai-auth-sessions-opencode2.json` (OpenCode 2);
 - the lock folders and temporary files of each of these.
 
-The state folder is `cortexkit/openai-auth` under `XDG_STATE_HOME`, or under `.local/state` in your home folder when `XDG_STATE_HOME` is unset. That is the same rule on every OS, and the same folder that already holds `sidebar-state.json`:
+The plugin's state folder is `cortexkit/openai-auth` under `XDG_STATE_HOME`, or under `.local/state` in your home folder when `XDG_STATE_HOME` is unset. That is the same rule on every OS, and the same folder that already holds `sidebar-state.json`. The runtime files of one OpenCode config folder go in a subfolder of it:
 
-| OS | Default state folder |
+- `opencode/` for the config folder `.config/opencode` in your home folder;
+- `opencode-<16 hex characters>/` for any other config folder, for example one named by `OPENCODE_CONFIG_DIR` or reached through a different `XDG_CONFIG_HOME`. The characters are the start of the SHA-256 of the config folder's real path, so two config folders never share a file.
+
+| OS | Runtime folder for the default config folder |
 | --- | --- |
-| Linux | `~/.local/state/cortexkit/openai-auth/` |
-| macOS | `~/.local/state/cortexkit/openai-auth/`, that is `/Users/<you>/.local/state/cortexkit/openai-auth/` |
-| Windows | `%USERPROFILE%\.local\state\cortexkit\openai-auth\` |
+| Linux | `~/.local/state/cortexkit/openai-auth/opencode/` |
+| macOS | `~/.local/state/cortexkit/openai-auth/opencode/`, that is `/Users/<you>/.local/state/cortexkit/openai-auth/opencode/` |
+| Windows | `%USERPROFILE%\.local\state\cortexkit\openai-auth\opencode\` |
 
-The plugin creates these folders and files owner-only: mode `0700` for folders and `0600` for files on Linux and macOS, and an access list that grants only your user on Windows.
+Each runtime folder holds `config-dir.json`, which names the config folder it belongs to. If it names a different one, the plugin refuses to start and leaves the folder alone. The plugin creates these folders and files owner-only: mode `0700` for folders and `0600` for files on Linux and macOS, and an access list that grants only your user on Windows.
 
-When `OPENCODE_CONFIG_DIR` names a folder other than OpenCode's default one (`opencode` in `XDG_CONFIG_HOME`, else in `~/.config`), the files go in a subfolder of the state folder named after that config folder, `config-<16 hex characters>`, so two config folders never share a file. A `config-dir.json` file in the subfolder names the config folder it belongs to.
-
-`OPENCODE_OPENAI_AUTH_STATE_FILE`, and a custom config file named by `OPENCODE_OPENAI_AUTH_FILE`, keep the state file and its vault folder where they say (see the table above). The sessions files still go in the state folder.
+`OPENCODE_OPENAI_AUTH_STATE_FILE`, and a custom config file named by `OPENCODE_OPENAI_AUTH_FILE`, keep the state file and its vault folder where they say (see the table above), and the plugin never moves or deletes them.
 
 ### The move from OpenCode's config folder
 
-Versions before this one kept these files in OpenCode's config folder. At its first start, the plugin copies them into the state folder, checks every copy byte for byte, records the move in `layout.json` in the state folder, and then removes the old files. Vault enrollment comes along unchanged.
+Versions before this one kept these files in OpenCode's config folder. At its first start, the plugin copies them into the runtime folder, checks every copy byte for byte, records the move in `layout.json` in the runtime folder, and then removes the old files, comparing each one with its copy again just before removing it. Vault enrollment comes along unchanged.
 
-The move waits while any other OpenCode process that uses the same config folder could still write the old files, because a sign-in token written to the old folder after the move would be lost. Such a process is one running an older version of the plugin, or one that started while such a process was running. While the move waits, the plugin keeps using the old files and logs once: "openai-auth keeps its files in OpenCode's config folder until every running OpenCode using it has restarted on this version." **The move happens at the first start after every OpenCode using that config folder has been closed or restarted on this version.**
+Only an OpenCode started without `OPENCODE_OPENAI_AUTH_STATE_FILE` and without a custom `OPENCODE_OPENAI_AUTH_FILE` moves the files. With either set, the plugin uses the moved sessions files once another start has moved them, and keeps every file in OpenCode's config folder until then. It also keeps them there, and touches nothing, when one of those paths points inside the runtime folder, when the runtime folder holds a runtime file the plugin did not put there, or when the runtime folder and OpenCode's config folder are the same folder (through a link or a mount).
 
-If the move fails, for example because the disk is full, the plugin keeps using the old files, logs the error once, and tries again at the next start. Once the move is done, the plugin never reads or deletes files in the old location. If some appear there again, for example because an older version ran, it logs a warning naming the folder and leaves them alone.
+The move waits while any other OpenCode process could still write the old files, because a sign-in token written to the old folder after the move would be lost. Such a process is one running an older version of the plugin, or one that started while such a process was running. While the move waits, the plugin keeps using the old files and logs once: "openai-auth keeps its files in OpenCode's config folder until every running OpenCode using it has restarted on this version." **The move happens at the first start after every OpenCode using that config folder has been closed or restarted on this version.**
+
+If the move fails, for example because the disk is full, the plugin keeps using the old files, logs the error once, and tries again at the next start. If it cannot record that it uses the old files, or cannot use or read its state folder at all, it refuses to start and names the folder and the error, rather than run where other OpenCode processes cannot see it. Once the move is done, the plugin never reads or deletes files in the old location. If some appear there again, for example because an older version ran, it logs a warning naming the folder, shows it once in the Diagnostics section of `/openai`, and leaves them alone.
+
+What the move cannot see: it finds other OpenCode processes through the heartbeat and port files they leave in the state folder. A short-lived tool from an older version that runs during the move and leaves neither, such as an older `opencode auth login`, can write to the old folder, and that write is not seen; sign in again if an account goes missing after such a run. A process is also recognized by its process id alone, so an id reused by an unrelated process only delays the move. In the rare case where this version crashed and an older version later started with the same id, the older version would not be noticed.
 
 ### Downgrading
 
 A version from before the move looks only in OpenCode's config folder, so after the move it finds no accounts and no vault enrollment. Nothing is lost. To go back to an older version, do one of these:
 
-- move `openai-auth-state.json`, `openai-auth-vault/` and the sessions files from the state folder back into OpenCode's config folder, and delete `layout.json` from the state folder so a later upgrade moves them again;
-- or set `OPENCODE_OPENAI_AUTH_STATE_FILE` to the state file in the state folder, for example `~/.local/state/cortexkit/openai-auth/openai-auth-state.json`. The older version then reads the state file and the vault folder from there.
+- move `openai-auth-state.json`, `openai-auth-vault/` and the sessions files from the runtime folder back into OpenCode's config folder, and delete `layout.json` from the runtime folder so a later upgrade moves them again;
+- or set `OPENCODE_OPENAI_AUTH_STATE_FILE` to the state file in the runtime folder, for example `~/.local/state/cortexkit/openai-auth/opencode/openai-auth-state.json`. The older version then reads the state file and the vault folder from there.
 
 ## Pi
 

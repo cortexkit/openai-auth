@@ -26,9 +26,10 @@ import { defaultStateHome } from './version-fence'
  * the Codex sessions files) live in one of two places, the "runtime folder":
  * - the legacy layout: OpenCode's config folder itself, where versions before
  *   the move kept them;
- * - the state-home layout: `<state home>/cortexkit/openai-auth/`, or a
- *   `config-<hash>/` folder inside it when OPENCODE_CONFIG_DIR names a folder
- *   other than the default, so two config folders never share a file.
+ * - the state-home layout: `<state home>/cortexkit/openai-auth/opencode/` for
+ *   the config folder `<home>/.config/opencode`, and
+ *   `<state home>/cortexkit/openai-auth/opencode-<hash>/` for any other one,
+ *   so two config folders never share a file.
  * `runtime-layout.ts` decides which one at plugin start and moves the files
  * once; until a process has decided, the layout marker alone tells. The
  * settings file `openai-auth.json` stays in OpenCode's config folder either way.
@@ -44,7 +45,7 @@ export const OPENCODE2_CODEX_SESSIONS_FILE =
   'openai-auth-sessions-opencode2.json'
 /** In the state-home folder: present once that folder is authoritative. */
 export const RUNTIME_LAYOUT_MARKER_FILE = 'layout.json'
-/** In a keyed state-home folder: names the config folder it belongs to. */
+/** In every state-home runtime folder: names the config folder it belongs to. */
 export const RUNTIME_CONFIG_DIR_NOTE_FILE = 'config-dir.json'
 
 function getConfigDir() {
@@ -115,52 +116,64 @@ export function accountPathsCollide(
 }
 
 /**
- * A config folder as one comparable string: symlinks resolved where the
- * folder (or its parent) exists, and case folded where the file system
- * usually ignores case. Two spellings of one folder must map to one
- * state-home folder, or a process using the other spelling would find an
- * empty one.
+ * A config folder's identity: its real path as the file system spells it
+ * (symlinks resolved, on-disk case), or the resolved path when the folder
+ * does not exist. Nothing else is normalized: case folding would merge two
+ * distinct folders on a case-sensitive volume. Heartbeats name a config
+ * folder by exactly this string.
  */
-function comparableDir(path: string): string {
-  return normalizePathForComparison(
-    realpathForComparison(resolve(path)) ?? resolve(path),
-    process.platform,
-  )
+export function configDirIdentity(path: string): string {
+  try {
+    return realpathSync.native(path)
+  } catch {
+    return resolve(path)
+  }
 }
 
 /** Both folders a config folder's runtime files can live in. */
 export interface RuntimeLayoutLocation {
-  /** Identifies the config folder in the layout records of heartbeats. */
+  /** The config folder's identity (`configDirIdentity`). */
   key: string
   /** OpenCode's config folder: the legacy runtime folder. */
   configDir: string
   /** The state-home runtime folder for this config folder. */
   stateHomeDir: string
-  /** True when the config folder is OpenCode's default one. */
+  /** True when the config folder is `<home>/.config/opencode`. */
   isDefaultConfigDir: boolean
 }
 
 const locationCache = new Map<string, RuntimeLayoutLocation>()
 
+/**
+ * Where this config folder's runtime files live in the state home. Only the
+ * folder `<home>/.config/opencode` gets the plain `opencode/` folder; that is
+ * decided from the home directory, not from XDG_CONFIG_HOME, so two
+ * processes with different XDG_CONFIG_HOME values never share one. Every
+ * other config folder gets `opencode-<first 16 hex of sha256(identity)>/`.
+ */
 export function runtimeLayoutLocation(
   configDir = getConfigDir(),
 ): RuntimeLayoutLocation {
   const stateHome = defaultStateHome()
-  const fallback = defaultConfigDir()
-  const cacheKey = `${configDir}\0${fallback}\0${stateHome}`
+  const homeConfig = join(homedir(), '.config', 'opencode')
+  const cacheKey = `${configDir}\0${homeConfig}\0${stateHome}`
   const cached = locationCache.get(cacheKey)
-  if (cached) return cached
-  const key = comparableDir(configDir)
-  const isDefaultConfigDir = key === comparableDir(fallback)
+  // Once this process has decided its layout the location is fixed for its
+  // life; before that it is recomputed, since the folder may appear or turn
+  // out to be a link.
+  if (cached && decidedRuntimeLayout(cached)) return cached
+  const key = configDirIdentity(configDir)
+  if (cached && cached.key === key) return cached
+  const isDefaultConfigDir = key === configDirIdentity(homeConfig)
   const root = join(stateHome, 'cortexkit', 'openai-auth')
   const location: RuntimeLayoutLocation = {
     key,
     configDir,
     stateHomeDir: isDefaultConfigDir
-      ? root
+      ? join(root, 'opencode')
       : join(
           root,
-          `config-${createHash('sha256').update(key).digest('hex').slice(0, 16)}`,
+          `opencode-${createHash('sha256').update(key).digest('hex').slice(0, 16)}`,
         ),
     isDefaultConfigDir,
   }
@@ -257,6 +270,16 @@ export function chosenAccountStatePath(
   return isDefaultConfigPath(configPath)
     ? undefined
     : deriveStatePath(configPath)
+}
+
+/**
+ * The config file named by OPENCODE_OPENAI_AUTH_FILE when it is not
+ * `openai-auth.json` in OpenCode's config folder; undefined otherwise.
+ */
+export function customAccountConfigPath(
+  configPath = getAccountStoragePath(),
+): string | undefined {
+  return isDefaultConfigPath(configPath) ? undefined : configPath
 }
 
 export function getAccountStatePath(configPath = getAccountStoragePath()) {
