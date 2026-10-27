@@ -3,17 +3,6 @@ import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import { isQuotaMap, quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore, type PoolStore } from '@cortexkit/common-auth/store'
 
-/** Accepted quota is visible before the detached writer commits it to disk. */
-export async function waitForQuotaPersistence(
-  persisted: () => boolean | Promise<boolean>,
-): Promise<void> {
-  const deadline = Date.now() + 3_000
-  while (!(await persisted())) {
-    if (Date.now() >= deadline) throw new Error('quota did not reach disk')
-    await Bun.sleep(10)
-  }
-}
-
 /** Exercise the serving store, but verify durability through a fresh reader. */
 export async function exerciseCoalescedQuota(
   store: PoolStore,

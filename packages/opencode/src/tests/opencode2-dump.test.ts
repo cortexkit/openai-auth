@@ -9,10 +9,7 @@ import {
 } from 'node:fs'
 import { join } from 'node:path'
 import { PrivateFileError } from '@cortexkit/common-auth/fs'
-import type {
-  Attempt,
-  OpenCode2AuthAdapter,
-} from '@cortexkit/common-auth/opencode2'
+import type { Attempt } from '@cortexkit/common-auth/opencode2'
 import * as auth from '@cortexkit/common-auth/opencode2'
 import { refreshSettings, resetSettingsForTest } from '../config'
 import * as requestDump from '../dump'
@@ -98,7 +95,7 @@ async function start(enabled = true, maxBytes = '536870912') {
   resetSettingsForTest()
   requestDump.resetDumpStateForTest()
   const attempts: Attempt[] = []
-  let installed!: OpenCode2AuthAdapter
+  let installed!: Parameters<typeof auth.installOpenCode2Auth>[1]
   const install = auth.installOpenCode2Auth
   const spy = spyOn(auth, 'installOpenCode2Auth').mockImplementation(
     (ctx, adapter, options) => {
