@@ -420,14 +420,15 @@ try {
   assert.doesNotMatch(frame(), /Quota|Routing|resets/)
   // Collapsed, each account's line carries the narrow quota text.
   assert.match(frame(), /5h 60% · 7d 30% left/)
-  // Use terminal mouse input on the badge, not a controller-only toggle.
+  // Use terminal mouse input on the badge, not a controller-only toggle. The
+  // badge sits on row 2: the sidebar's border and its top padding come first.
   const persisted = new Promise<void>((resolve) => {
     const stop = watchTuiPreferences(() => {
       stop()
       resolve()
     })
   })
-  await view.mockMouse.click(5, 1)
+  await view.mockMouse.click(5, 2)
   await waitFrame(view, (text) => text.includes('▼ LIVE PREFS'))
   await persisted
   assert.equal(
