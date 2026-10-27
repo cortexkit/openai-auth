@@ -10,7 +10,7 @@ import {
   startRpcServer as startCommonRpcServer,
 } from '@cortexkit/common-auth/rpc'
 import { createLogger } from '../logger'
-import { isOpenaiRpcStateDir } from './port-file'
+import { isOpenaiRpcStateDir, writePortFile } from './port-file'
 import type { ApplyResult, RpcNotification } from './protocol'
 
 export type { RpcServerHandle } from '@cortexkit/common-auth/rpc'
@@ -38,10 +38,10 @@ export interface RpcServerOptions {
   receiptTimeoutMs?: number
 }
 
-export function startRpcServer(
+export async function startRpcServer(
   options: RpcServerOptions,
 ): Promise<RpcServerHandle> {
-  return startCommonRpcServer({
+  const server = await startCommonRpcServer({
     ...options,
     isManagedDir: isOpenaiRpcStateDir,
     log,
@@ -57,4 +57,17 @@ export function startRpcServer(
         ReturnType<Parameters<typeof startCommonRpcServer>[0]['apply']>
       >,
   })
+  try {
+    // The shared server publishes an unversioned record first. Replace it
+    // before returning; until then other processes conservatively block.
+    await writePortFile(
+      options.dir,
+      { port: server.port, token: server.token, pid: process.pid },
+      { secureDir: options.secureDir },
+    )
+    return server
+  } catch (error) {
+    await server.stop()
+    throw error
+  }
 }

@@ -46,11 +46,11 @@
 //   its bytes once more. A crash before the marker leaves the old files
 //   authoritative and the next start copies again over the partial new ones.
 //   A crash after it leaves the new files authoritative; the next start takes
-//   the same locks and removes old copies identical to the new ones, leaving
-//   any that differ. The marker then records that the old files are dealt
-//   with, and old files are never read, copied, removed or overwritten again:
-//   if some reappear (an older version ran again), each process warns once
-//   and leaves them.
+//   the same locks and removes old copies identical to the new ones. Differing
+//   credentials refuse the start: the old copy may hold the only live refresh
+//   token. Differing sessions stay. The marker then records that the old files
+//   are dealt with; reappeared credentials also refuse the start, while each
+//   process warns once about reappeared sessions and leaves them alone.
 // - The layout lock is checked again before every destructive step. A move
 //   that fails leaves the process on the legacy layout (registered) and logs
 //   the error class once; the next start tries again. Nothing here runs on a
@@ -128,15 +128,15 @@ const SHARING_RETRY_BUDGET_MS = 500
 export const RUNTIME_LAYOUT_DEFERRED_MESSAGE =
   "openai-auth keeps its files in OpenCode's config folder until every running OpenCode using it has restarted on this version."
 
-/** Logged, and shown once in `/openai`, when old files appear again. */
+/** Logged, and shown once in `/openai`, when old session files appear again. */
 export const RUNTIME_LAYOUT_REAPPEARED_MESSAGE =
   "openai-auth found runtime files in OpenCode's config folder again (an older version may have run). It does not use them and leaves them in place; its files are in its state folder."
 
 /**
  * Plugin start stops when it cannot settle a safe runtime layout: it could
  * not take the layout lock or write its heartbeat (so other processes could
- * not see which files it uses), could not read the marker, or found a
- * state-home folder that belongs to another config folder.
+ * not see which files it uses), could not trust the marker, found conflicting
+ * credentials, or found a state-home folder owned by another config folder.
  */
 export class RuntimeLayoutRefusal extends Error {
   constructor(
@@ -162,6 +162,14 @@ function foreignFolder(stateDir: string, identity: string) {
     stateDir,
     'foreign-folder',
     `openai-auth cannot start: ${stateDir} belongs to another OpenCode config folder, not ${identity}. It was left untouched. Move it aside, then restart OpenCode.`,
+  )
+}
+
+function credentialConflict(stateDir: string, file: LayoutFile) {
+  return new RuntimeLayoutRefusal(
+    stateDir,
+    'credential-conflict',
+    `openai-auth cannot start: runtime credentials conflict between ${file.old} and ${file.next}. Keep the newer one, delete the other, then restart OpenCode.`,
   )
 }
 
@@ -601,9 +609,9 @@ async function moveFiles(
 
 /**
  * A start after a crash that came after the marker: under the same locks as
- * the move, remove the old copies that are identical to the new files, keep
- * the rest, and record that the old files are dealt with. Waits, like the
- * move, while a process that could still use the old files is alive.
+ * the move, remove identical old copies and refuse conflicting credentials.
+ * Differing session files stay in place. Waits, like the move, while a process
+ * that could still use the old files is alive.
  */
 async function finishOldFiles(
   location: RuntimeLayoutLocation,
@@ -651,6 +659,7 @@ async function finishOldFiles(
     step = 'manifest'
     await removeManifest(location.stateHomeDir)
   } catch (error) {
+    if (error instanceof RuntimeLayoutRefusal) throw error
     logOnce(`${location.key}\0cleanup`, () =>
       input.log.warn(
         "openai-auth could not finish removing its old files from OpenCode's config folder; it tries again at the next start",
@@ -826,8 +835,9 @@ async function copyVerified(file: LayoutFile): Promise<void> {
 
 /**
  * Remove each old file whose bytes equal its new copy, comparing again right
- * before every unlink attempt. One that differs, or that Windows will not let
- * go of, stays where it is. The caller holds the data locks.
+ * before every unlink attempt. Differing credentials refuse the start because
+ * the old copy may hold the only live refresh token. Differing sessions, or
+ * files that Windows will not let go of, stay. The caller holds the data locks.
  */
 async function removeOldCopies(
   location: RuntimeLayoutLocation,
@@ -836,9 +846,13 @@ async function removeOldCopies(
   log: RuntimeLayoutLogger,
 ): Promise<void> {
   const kept: string[] = []
+  const files = layoutFiles(location)
   for (const file of present) {
     await layoutLock.assertOwned()
-    if (!(await unlinkIfIdentical(file))) kept.push(file.old)
+    const credentials =
+      file.old === files.state.old || insideOrSame(file.old, files.vault.old)
+    if (!(await unlinkIfIdentical(file, location.stateHomeDir, credentials)))
+      kept.push(file.old)
   }
   if (kept.length > 0)
     log.warn(
@@ -851,7 +865,11 @@ async function removeOldCopies(
  * Unlink `file.old` only while its bytes equal `file.next`, retrying on
  * Windows while another process has it open. True when it is gone.
  */
-async function unlinkIfIdentical(file: LayoutFile): Promise<boolean> {
+async function unlinkIfIdentical(
+  file: LayoutFile,
+  stateDir: string,
+  credentials: boolean,
+): Promise<boolean> {
   const started = performance.now()
   for (const delay of SHARING_RETRY_DELAYS_MS) {
     if (delay > 0) await new Promise((done) => setTimeout(done, delay))
@@ -864,10 +882,15 @@ async function unlinkIfIdentical(file: LayoutFile): Promise<boolean> {
         !(await exists(file.old))
       )
         return true
-      // Unreadable on either side: not provably a copy, so it stays.
+      // Unreadable on either side: credentials are ambiguous, while a session
+      // file can safely stay without being used.
+      if (credentials) throw credentialConflict(stateDir, file)
       return false
     }
-    if (!same) return false
+    if (!same) {
+      if (credentials) throw credentialConflict(stateDir, file)
+      return false
+    }
     try {
       await unlink(file.old)
       return true
@@ -893,12 +916,20 @@ async function noticeReappearedFiles(
   // A file an override names is this process's own, wherever it is.
   const own = (path: string) =>
     overrides.some((override) => accountPathsCollide(override, path))
+  if (!own(files.state.old) && (await exists(files.state.old)))
+    throw credentialConflict(location.stateHomeDir, files.state)
+  if (!own(files.vault.old)) {
+    for (const name of await folderFiles(files.vault.old)) {
+      const old = join(files.vault.old, name)
+      if (!own(old))
+        throw credentialConflict(location.stateHomeDir, {
+          old,
+          next: join(files.vault.next, name),
+        })
+    }
+  }
   const found: string[] = []
   try {
-    if (!own(files.state.old) && (await exists(files.state.old)))
-      found.push(files.state.old)
-    if (!own(files.vault.old) && (await folderFiles(files.vault.old)).length)
-      found.push(files.vault.old)
     for (const file of files.sessions)
       if (await exists(file.old)) found.push(file.old)
   } catch {
@@ -919,11 +950,10 @@ async function noticeReappearedFiles(
 }
 
 /**
- * The marker, or undefined when it does not exist. A marker that exists but
- * does not parse still makes the folder authoritative, and nothing can tell
- * whether its old files were dealt with, so they are left alone. Any other
- * read failure is retried briefly and then refuses the start: it proves
- * neither that the marker exists nor that it does not.
+ * The marker, or undefined when it does not exist. It is written atomically
+ * after all copies are verified, so malformed contents mean outside damage,
+ * not evidence that the move completed. Other read failures are retried
+ * briefly, then refuse the start: they prove neither presence nor absence.
  */
 async function readMarker(
   path: string,
@@ -954,7 +984,11 @@ async function readMarker(
         ...(value.oldFilesRemoved === true ? { oldFilesRemoved: true } : {}),
       }
   } catch {}
-  return { version: 1, oldFilesRemoved: true }
+  throw new RuntimeLayoutRefusal(
+    stateDir,
+    'malformed-marker',
+    `openai-auth cannot start: ${path} is malformed. The old files are still in OpenCode's config folder. Delete layout.json, then restart OpenCode.`,
+  )
 }
 
 /**

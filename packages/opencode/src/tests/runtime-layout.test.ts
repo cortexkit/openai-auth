@@ -187,6 +187,17 @@ function heartbeat(pid: number, body: Record<string, unknown>) {
 
 const REFUSED = /^openai-auth cannot start: /
 
+const credentialConflictMessage = (relative: string) =>
+  `openai-auth cannot start: runtime credentials conflict between ${join(configDir(), relative)} and ${join(runtimeDir(), relative)}. Keep the newer one, delete the other, then restart OpenCode.`
+
+const CREDENTIAL_FILES = [
+  'openai-auth-state.json',
+  'openai-auth-vault/opencode-enrollment.json',
+  'openai-auth-vault/opencode-enrollment-state.json',
+  'openai-auth-vault/opencode-roster.json',
+  'openai-auth-vault/another-credential.json',
+]
+
 describe('where the runtime folder is', () => {
   it('is opencode/ only for <home>/.config/opencode, and a keyed folder for every other config folder', async () => {
     const home = join(root, 'home')
@@ -361,7 +372,7 @@ describe('moving an existing layout', () => {
     expect(present(configDir(), changed)).toEqual(absent(changed))
   })
 
-  it('a crash after the marker: the next start removes identical leftovers and keeps differing ones', async () => {
+  it('a crash after the marker: the next start removes identical leftovers and keeps differing sessions', async () => {
     const files = oldLayout()
     seed(configDir(), files)
     expect(
@@ -397,6 +408,82 @@ describe('moving an existing layout', () => {
     )
   })
 
+  it.each(CREDENTIAL_FILES)(
+    'refuses changed old credentials during immediate cleanup: %s',
+    async (relative) => {
+      const files = { ...oldLayout(), [relative]: 'original-credentials\n' }
+      seed(configDir(), files)
+      await expect(
+        prepare({
+          steps: {
+            afterMarker: () => {
+              writePrivate(join(configDir(), relative), 'newer-credentials\n')
+            },
+          },
+        }),
+      ).rejects.toMatchObject({
+        name: 'RuntimeLayoutRefusal',
+        message: credentialConflictMessage(relative),
+      })
+      expect(marker()?.oldFilesRemoved).not.toBe(true)
+      expect(readFileSync(join(configDir(), relative), 'utf8')).toBe(
+        'newer-credentials\n',
+      )
+      expect(readFileSync(join(runtimeDir(), relative), 'utf8')).toBe(
+        'original-credentials\n',
+      )
+    },
+  )
+
+  it.each(CREDENTIAL_FILES)(
+    'refuses changed old credentials when cleanup retries after a crash: %s',
+    async (relative) => {
+      const files = { ...oldLayout(), [relative]: 'original-credentials\n' }
+      seed(configDir(), files)
+      await prepare({
+        steps: {
+          afterMarker: () => {
+            throw new Error('crash')
+          },
+        },
+      })
+      writePrivate(join(configDir(), relative), 'newer-credentials\n')
+      resetProcess()
+      await expect(prepare()).rejects.toMatchObject({
+        name: 'RuntimeLayoutRefusal',
+        message: credentialConflictMessage(relative),
+      })
+      expect(marker()?.oldFilesRemoved).not.toBe(true)
+      expect(readFileSync(join(configDir(), relative), 'utf8')).toBe(
+        'newer-credentials\n',
+      )
+      expect(readFileSync(join(runtimeDir(), relative), 'utf8')).toBe(
+        'original-credentials\n',
+      )
+    },
+  )
+
+  it.each([
+    'openai-auth-state.json',
+    'openai-auth-vault/opencode-enrollment.json',
+  ])(
+    'refuses cleanup when the new credential copy cannot be compared: %s',
+    async (relative) => {
+      seed(configDir(), oldLayout())
+      await expect(
+        prepare({
+          steps: {
+            afterMarker: () => {
+              rmSync(join(runtimeDir(), relative))
+            },
+          },
+        }),
+      ).rejects.toThrow(credentialConflictMessage(relative))
+      expect(existsSync(join(configDir(), relative))).toBe(true)
+      expect(marker()?.oldFilesRemoved).not.toBe(true)
+    },
+  )
+
   it('cleanup after a crash waits for the store lock and compares again before it unlinks', async () => {
     const files = oldLayout()
     seed(configDir(), files)
@@ -425,23 +512,85 @@ describe('moving an existing layout', () => {
     expect(settled).toBe(false)
     writeFileSync(oldState, '{"refresh":"written-under-the-lock"}\n')
     await held?.release()
-    expect(await run).toBe('state-home')
+    await expect(run).rejects.toThrow(
+      credentialConflictMessage('openai-auth-state.json'),
+    )
     expect(readFileSync(oldState, 'utf8')).toBe(
       '{"refresh":"written-under-the-lock"}\n',
     )
-    expect(logged).toContainEqual(
-      expect.objectContaining({
-        level: 'warn',
-        meta: expect.objectContaining({ kept: [oldState] }),
-      }),
+    expect(marker()?.oldFilesRemoved).not.toBe(true)
+  })
+
+  it.each(CREDENTIAL_FILES)(
+    'refuses old credentials that reappear after a finished move: %s',
+    async (relative) => {
+      const files = { ...oldLayout(), [relative]: 'original-credentials\n' }
+      seed(configDir(), files)
+      await prepare()
+      expect(marker()?.oldFilesRemoved).toBe(true)
+      writePrivate(join(configDir(), relative), 'newer-credentials\n')
+      resetProcess()
+      await expect(prepare()).rejects.toMatchObject({
+        name: 'RuntimeLayoutRefusal',
+        message: credentialConflictMessage(relative),
+      })
+      expect(readFileSync(join(configDir(), relative), 'utf8')).toBe(
+        'newer-credentials\n',
+      )
+      expect(readFileSync(join(runtimeDir(), relative), 'utf8')).toBe(
+        'original-credentials\n',
+      )
+    },
+  )
+
+  it('does not conflict with reappeared state and vault files owned by a state override', async () => {
+    seed(configDir(), oldLayout())
+    await prepare()
+    seed(configDir(), oldLayout('override'))
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = join(
+      configDir(),
+      'openai-auth-state.json',
+    )
+    resetProcess()
+    expect(await prepare()).toBe('state-home')
+    expect(present(configDir(), oldLayout('override'))).toEqual(
+      oldLayout('override'),
     )
   })
 
-  it('old files that reappear after the move are never read nor removed, and /openai shows it once', async () => {
+  it.each(['OPENCODE_OPENAI_AUTH_STATE_FILE', 'OPENCODE_OPENAI_AUTH_FILE'])(
+    'does not conflict with an individual reappeared vault file named by %s',
+    async (override) => {
+      seed(configDir(), oldLayout())
+      await prepare()
+      const relative = 'openai-auth-vault/opencode-enrollment.json'
+      const path = join(configDir(), relative)
+      writePrivate(path, 'override-owned\n')
+      process.env[override] = path
+      resetProcess()
+      expect(await prepare()).toBe('state-home')
+      expect(readFileSync(path, 'utf8')).toBe('override-owned\n')
+
+      writePrivate(
+        join(configDir(), 'openai-auth-vault/unowned.json'),
+        'unowned-credentials\n',
+      )
+      resetProcess()
+      await expect(prepare()).rejects.toThrow(
+        credentialConflictMessage('openai-auth-vault/unowned.json'),
+      )
+    },
+  )
+
+  it('old sessions that reappear after the move are never read nor removed, and /openai shows it once', async () => {
     seed(configDir(), oldLayout())
     await prepare()
     // An older version ran again and wrote its own files.
-    const downgrade = oldLayout('downgrade')
+    const downgrade = Object.fromEntries(
+      Object.entries(oldLayout('downgrade')).filter(([relative]) =>
+        relative.startsWith('openai-auth-sessions'),
+      ),
+    )
     seed(configDir(), downgrade)
     resetProcess()
     expect(await prepare()).toBe('state-home')
@@ -465,13 +614,22 @@ describe('moving an existing layout', () => {
     expect(logged.filter((line) => line.level === 'warn')).toHaveLength(1)
   })
 
-  it('a marker that does not parse keeps the state home authoritative and the old files untouched', async () => {
-    const files = oldLayout()
-    seed(configDir(), files)
-    writePrivate(join(runtimeDir(), 'layout.json'), '{ not json')
-    expect(await prepare()).toBe('state-home')
-    expect(present(configDir(), files)).toEqual(files)
-  })
+  it.each(['{ not json', 'null', '[]', 'false', '42', '"marker"'])(
+    'a malformed marker refuses the start and leaves old files untouched: %s',
+    async (text) => {
+      const files = oldLayout()
+      seed(configDir(), files)
+      const path = join(runtimeDir(), 'layout.json')
+      writePrivate(path, text)
+      await expect(prepare()).rejects.toMatchObject({
+        name: 'RuntimeLayoutRefusal',
+        message: `openai-auth cannot start: ${path} is malformed. The old files are still in OpenCode's config folder. Delete layout.json, then restart OpenCode.`,
+      })
+      expect(present(configDir(), files)).toEqual(files)
+      expect(present(runtimeDir(), files)).toEqual(absent(files))
+      expect(readFileSync(path, 'utf8')).toBe(text)
+    },
+  )
 
   it('a marker that cannot be read refuses the start instead of counting as moved', async () => {
     seed(configDir(), oldLayout())

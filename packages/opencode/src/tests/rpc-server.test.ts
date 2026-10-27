@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect } from 'bun:test'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { PluginInput } from '@opencode-ai/plugin'
 import { CodexAuthPlugin } from '../index'
 import { resetNotificationsForTest } from '../rpc/notifications'
-import { discoverPortFile } from '../rpc/port-file'
+import { discoverPortFile, writePortFile } from '../rpc/port-file'
 import { resolveRpcDir } from '../rpc/rpc-dir'
+import { startRpcServer } from '../rpc/rpc-server'
+import { PackageVersion } from '../version'
 import { quotaMap, seedPool } from './fixtures/pool-install'
 import { rpcServerRegistry } from './fixtures/rpc-registry'
 import { createRequestTestScope } from './request-test-scope'
@@ -119,6 +121,57 @@ afterEach(async () => {
 })
 
 describe('rpc-server', () => {
+  test('the port writer stamps its plugin version without breaking discovery', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oa-rpc-version-'))
+    try {
+      const path = await writePortFile(dir, {
+        pid: process.pid,
+        port: 4321,
+        token: 'test-token',
+      })
+      expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({
+        pid: process.pid,
+        port: 4321,
+        token: 'test-token',
+        version: PackageVersion,
+      })
+      expect(await discoverPortFile(dir, process.pid)).toMatchObject({
+        pid: process.pid,
+        port: 4321,
+        token: 'test-token',
+      })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('the running RPC server publishes its own version in the port file', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oa-rpc-server-version-'))
+    const server = await startRpcServer({
+      dir,
+      drain: () => [],
+      apply: async () => {
+        throw new Error('unexpected apply request in port-file test')
+      },
+    })
+    try {
+      const path = join(dir, `port-${process.pid}.json`)
+      expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({
+        pid: process.pid,
+        port: server.port,
+        token: server.token,
+        version: PackageVersion,
+      })
+      expect(await discoverPortFile(dir, process.pid)).toMatchObject({
+        port: server.port,
+        token: server.token,
+      })
+    } finally {
+      await server.stop()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test('keeps RPC ports discoverable and applies with each project captured context', async () => {
     const root = await mkdtemp(join(tmpdir(), 'oa-rpc-projects-'))
     const originalFetch = globalThis.fetch
@@ -156,6 +209,12 @@ describe('rpc-server', () => {
       expect(portA).not.toBeNull()
       expect(portB).not.toBeNull()
       expect(portA?.port).not.toBe(portB?.port)
+      for (const rpc of [rpcA, rpcB])
+        expect(
+          JSON.parse(
+            await readFile(join(rpc.dir, `port-${process.pid}.json`), 'utf8'),
+          ).version,
+        ).toBe(PackageVersion)
 
       const responseA = await originalFetch(
         `http://127.0.0.1:${portA?.port}/rpc/apply`,

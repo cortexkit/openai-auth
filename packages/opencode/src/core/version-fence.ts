@@ -13,10 +13,10 @@
 //   which every plugin version writes (`<dir>` is `openai-auth-<hash>`, or the
 //   unprefixed `<hash>` older versions used).
 //
-// A process counts as running while its pid is alive. A live pid with a port
-// file but no heartbeat predates heartbeats, so it is an older version. The
-// fence fails closed: any file or directory it cannot read, or a version it
-// cannot parse, keeps it shut.
+// A process counts as running while its pid is alive. Each record must carry
+// its own current-or-newer version: a heartbeat left by a crashed process
+// cannot vouch for a port file written by an older process reusing that pid.
+// The fence fails closed on unreadable records and missing or invalid versions.
 //
 // The same fence guards the move of the runtime files out of OpenCode's
 // config folder (`runtime-layout.ts`), which passes `layoutMove`. A heartbeat
@@ -37,7 +37,7 @@ import { isOpenaiRpcStateDir } from '../rpc/port-file'
 export interface VersionFenceBlocker {
   /** `'unknown'` when a whole directory could not be read. */
   pid: number | 'unknown'
-  /** The version its heartbeat names, or `'unknown'`. */
+  /** The version its heartbeat or port file names, or `'unknown'`. */
   version: string
   /** The file or directory that showed it. */
   detail: string
@@ -156,12 +156,15 @@ async function list(dir: string): Promise<Listing> {
   }
 }
 
-type Heartbeat =
+type ProcessRecord =
   | { kind: 'gone' }
   | { kind: 'unreadable' }
   | { kind: 'ok'; version: string; layouts?: Record<string, unknown> }
 
-async function readHeartbeat(path: string, pid: number): Promise<Heartbeat> {
+async function readProcessRecord(
+  path: string,
+  pid: number,
+): Promise<ProcessRecord> {
   let text: string
   try {
     text = await readFile(path, 'utf8')
@@ -223,7 +226,6 @@ export async function migrationFenceOpen(
 
   // Heartbeats: the version a live process says it runs.
   const heartbeatDir = processHeartbeatDir(options.stateHome)
-  const withHeartbeat = new Set<number>()
   const heartbeats = await list(heartbeatDir)
   if (!heartbeats.ok)
     block({ pid: 'unknown', version: 'unknown', detail: heartbeats.error })
@@ -231,9 +233,8 @@ export async function migrationFenceOpen(
     const pid = pidFrom(name, /^(\d+)\.json$/)
     if (pid === undefined || pid === self) continue
     const path = join(heartbeatDir, name)
-    const heartbeat = await readHeartbeat(path, pid)
+    const heartbeat = await readProcessRecord(path, pid)
     if (heartbeat.kind === 'gone') continue
-    withHeartbeat.add(pid)
     if (!alive(pid)) continue
     if (heartbeat.kind === 'unreadable') {
       block({ pid, version: 'unknown', detail: path })
@@ -252,8 +253,8 @@ export async function migrationFenceOpen(
       block({ pid, version: heartbeat.version, detail: path })
   }
 
-  // Port files: every plugin version writes one per process. Only its name
-  // matters (`port-<pid>.json`), so an unreadable body still names the pid.
+  // Port files prove their version independently of heartbeats. Even an
+  // unreadable body still names a pid through `port-<pid>.json`.
   const rpcRoot = options.rpcDir ?? rpcStateRoot(options.stateHome)
   const projects = await list(rpcRoot)
   if (!projects.ok)
@@ -270,9 +271,14 @@ export async function migrationFenceOpen(
     }
     for (const name of ports.names) {
       const pid = pidFrom(name, /^port-(\d+)\.json$/)
-      if (pid === undefined || pid === self || withHeartbeat.has(pid)) continue
-      if (alive(pid))
-        block({ pid, version: 'unknown', detail: join(dir, name) })
+      if (pid === undefined || pid === self || !alive(pid)) continue
+      const path = join(dir, name)
+      const port = await readProcessRecord(path, pid)
+      if (port.kind === 'gone') continue
+      const version = port.kind === 'ok' ? port.version : 'unknown'
+      const order = compareVersions(version, options.currentVersion)
+      if (order === undefined || order < 0)
+        block({ pid, version, detail: path })
     }
   }
 

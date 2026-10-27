@@ -47,11 +47,18 @@ function heartbeat(pid: number, body: unknown): string {
   return path
 }
 
-function portFile(pid: number, project = 'openai-auth-0123456789abcdef') {
+function portFile(
+  pid: number,
+  project = 'openai-auth-0123456789abcdef',
+  version?: string,
+) {
   const dir = join(rpcStateRoot(stateHome), project)
   mkdirSync(dir, { recursive: true })
   const path = join(dir, `port-${pid}.json`)
-  writeFileSync(path, JSON.stringify({ pid, port: 4000, startedAt: 1 }))
+  writeFileSync(
+    path,
+    JSON.stringify({ pid, port: 4000, startedAt: 1, version }),
+  )
   return path
 }
 
@@ -73,8 +80,8 @@ describe('the version fence', () => {
     live.add(11).add(12)
     heartbeat(11, { pid: 11, version: CURRENT, startedAt: 1 })
     heartbeat(12, { pid: 12, version: '0.13.1', startedAt: 1 })
-    portFile(11)
-    portFile(12)
+    portFile(11, undefined, CURRENT)
+    portFile(12, undefined, '0.13.1')
     expect(await fence()).toEqual({ open: true })
   })
 
@@ -96,7 +103,7 @@ describe('the version fence', () => {
     }
     live.add(71).add(72).add(73)
     write(71, CURRENT)
-    portFile(71)
+    portFile(71, undefined, CURRENT)
     expect(await fence()).toEqual({ open: true })
     const older = write(72, '0.11.0')
     portFile(72)
@@ -152,11 +159,77 @@ describe('the version fence', () => {
     })
   })
 
-  it('a heartbeat decides over the same process port file', async () => {
-    live.add(44)
-    heartbeat(44, { pid: 44, version: CURRENT, startedAt: 1 })
-    portFile(44)
+  it.each([undefined, '0.11.0', 'next'])(
+    'a current heartbeat never exonerates an unsafe live port file: %s',
+    async (version) => {
+      live.add(44)
+      heartbeat(44, {
+        pid: 44,
+        version: CURRENT,
+        startedAt: 1,
+        layouts: { config: 'state-home' },
+      })
+      const path = portFile(44, undefined, version)
+      for (const layoutMove of [false, true])
+        expect(
+          await migrationFenceOpen({
+            stateHome,
+            currentVersion: CURRENT,
+            selfPid: SELF,
+            isAlive: (pid) => live.has(pid),
+            layoutMove,
+          }),
+        ).toEqual({
+          open: false,
+          blockers: [{ pid: 44, version: version ?? 'unknown', detail: path }],
+        })
+    },
+  )
+
+  it('a dead process heartbeat cannot hide an older host that reuses its pid', async () => {
+    heartbeat(45, { pid: 45, version: CURRENT, startedAt: 1 })
+    portFile(45, undefined, CURRENT)
     expect(await fence()).toEqual({ open: true })
+    live.add(45)
+    const path = portFile(45)
+    expect(await fence()).toEqual({
+      open: false,
+      blockers: [{ pid: 45, version: 'unknown', detail: path }],
+    })
+  })
+
+  it.each([CURRENT, '0.13.1'])(
+    'a live port file is exonerated by its own current-or-newer version: %s',
+    async (version) => {
+      live.add(46)
+      portFile(46, undefined, version)
+      expect(await fence()).toEqual({ open: true })
+    },
+  )
+
+  it.each(['{"pid":47', 'null', '[]', '{"pid":99,"version":"0.12.0"}'])(
+    'a malformed live port file blocks despite a current heartbeat: %s',
+    async (body) => {
+      live.add(47)
+      heartbeat(47, { pid: 47, version: CURRENT, startedAt: 1 })
+      const path = portFile(47)
+      writeFileSync(path, body)
+      expect(await fence()).toEqual({
+        open: false,
+        blockers: [{ pid: 47, version: 'unknown', detail: path }],
+      })
+    },
+  )
+
+  it('an unreadable live port file blocks despite a current heartbeat', async () => {
+    live.add(48)
+    heartbeat(48, { pid: 48, version: CURRENT, startedAt: 1 })
+    const path = portFile(48, undefined, CURRENT)
+    chmodSync(path, 0o000)
+    expect(await fence()).toEqual({
+      open: false,
+      blockers: [{ pid: 48, version: 'unknown', detail: path }],
+    })
   })
 
   it('never counts this process, whatever its files say', async () => {
