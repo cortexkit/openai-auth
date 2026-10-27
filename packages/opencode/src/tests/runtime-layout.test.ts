@@ -5,6 +5,7 @@
 // The tests reach new parts of the module through `layoutModule()` rather
 // than named imports, so each one fails on its own assertion against a build
 // that lacks them instead of the whole file failing to load.
+import { dlopen, FFIType, ptr } from 'bun:ffi'
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { createHash } from 'node:crypto'
 import {
@@ -81,14 +82,45 @@ beforeEach(() => {
   logged = []
 })
 
-afterEach(() => {
+/** Every `prepare()` of the current test that has not settled yet. */
+const preparing = new Set<Promise<unknown>>()
+/** How long the teardown waits for them; under the hook's own timeout. */
+const PREPARE_SETTLE_MS = 25_000
+
+afterEach(async () => {
+  // A test that timed out still has its `prepare()` running, and the rest of
+  // its body runs once that settles. Both name their files through `root`
+  // and the environment, so they must finish before the next test replaces
+  // those, or they act on the next test's folder; and the folder cannot be
+  // deleted on Windows while they hold its files open.
+  await settlePreparing()
   for (const name of ENV_NAMES) restoreEnv(name, saved[name])
   resetProcess()
   try {
     chmodSync(join(root, 'state'), 0o700)
   } catch {}
   rmSync(root, { recursive: true, force: true })
-})
+}, PREPARE_SETTLE_MS + 5_000)
+
+/**
+ * Wait until no `prepare()` is running, including any the waiting lets a
+ * test body start, for at most `PREPARE_SETTLE_MS`.
+ */
+async function settlePreparing(): Promise<void> {
+  const deadline = performance.now() + PREPARE_SETTLE_MS
+  while (preparing.size > 0) {
+    const left = deadline - performance.now()
+    if (left <= 0) return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    await Promise.race([
+      Promise.allSettled([...preparing]),
+      new Promise((done) => {
+        timer = setTimeout(done, left)
+      }),
+    ])
+    clearTimeout(timer)
+  }
+}
 
 /** Stands in for a new process: nothing decided, nothing logged. */
 function resetProcess() {
@@ -102,7 +134,7 @@ const layoutModule = () =>
   runtimeLayout as typeof runtimeLayout & Record<string, unknown>
 
 function prepare(options: Partial<RuntimeLayoutOptions> = {}) {
-  return prepareRuntimeLayout({
+  const run = prepareRuntimeLayout({
     version: VERSION,
     log: {
       info: (message, meta) => logged.push({ level: 'info', message, meta }),
@@ -110,6 +142,10 @@ function prepare(options: Partial<RuntimeLayoutOptions> = {}) {
     },
     ...options,
   })
+  preparing.add(run)
+  const settled = () => preparing.delete(run)
+  run.then(settled, settled)
+  return run
 }
 
 /** OpenCode's config folder in these tests: `opencode` in XDG_CONFIG_HOME. */
@@ -122,6 +158,52 @@ function writePrivate(path: string, text: string) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
   writeFileSync(path, text, { mode: 0o600 })
   chmodSync(path, 0o600)
+}
+
+/**
+ * Windows only: open `path` the way an antivirus scan or another program can,
+ * sharing nothing, so every other attempt to read or remove it fails with a
+ * sharing violation (EBUSY) until the returned function closes it.
+ */
+function holdWithoutSharing(path: string): () => void {
+  const kernel32 = dlopen('kernel32.dll', {
+    CreateFileW: {
+      args: [
+        FFIType.ptr,
+        FFIType.u32,
+        FFIType.u32,
+        FFIType.ptr,
+        FFIType.u32,
+        FFIType.u32,
+        FFIType.ptr,
+      ],
+      returns: FFIType.i64,
+    },
+    CloseHandle: { args: [FFIType.i64], returns: FFIType.i32 },
+  })
+  const GENERIC_READ = 0x80000000
+  const NO_SHARING = 0
+  const OPEN_EXISTING = 3
+  const FILE_ATTRIBUTE_NORMAL = 0x80
+  const name = Buffer.from(`${path}\0`, 'utf16le')
+  const handle = kernel32.symbols.CreateFileW(
+    ptr(name),
+    GENERIC_READ,
+    NO_SHARING,
+    null,
+    OPEN_EXISTING,
+    FILE_ATTRIBUTE_NORMAL,
+    null,
+  )
+  // INVALID_HANDLE_VALUE
+  if (BigInt(handle) === -1n) {
+    kernel32.close()
+    throw new Error(`could not open ${path} without sharing`)
+  }
+  return () => {
+    kernel32.symbols.CloseHandle(handle)
+    kernel32.close()
+  }
 }
 
 /** Every runtime file of the old layout, relative to its folder, with bytes. */
@@ -609,6 +691,75 @@ describe('moving an existing layout', () => {
       expect(await prepare()).toBe('state-home')
       expect(present(configDir(), files)).toEqual(leftAfterMove(files))
       expect(marker()?.oldFilesRemoved).toBe(true)
+    },
+  )
+
+  // Windows refuses to read or remove a file that another program (an
+  // antivirus scan, an indexer) holds open without sharing. Such an old
+  // credential cannot be compared, which says nothing about its bytes: the
+  // cleanup keeps it and tries again at the next start instead of reporting a
+  // conflict between two copies that may be identical.
+  it.skipIf(POSIX).each([
+    ['during the move', 'openai-auth-vault/opencode-roster.json'],
+    ['after a crash', 'openai-auth-state.json'],
+    ['after a crash', 'openai-auth-vault/opencode-roster.json'],
+  ] as const)(
+    'an old credential Windows holds open during cleanup %s is retried at the next start, not refused: %s',
+    async (when, relative) => {
+      const files = oldLayout()
+      seed(configDir(), files)
+      const oldPath = join(configDir(), relative)
+      let release: (() => void) | undefined
+      try {
+        if (when === 'after a crash') {
+          await prepare({
+            steps: {
+              afterMarker: () => {
+                throw new Error('crash')
+              },
+            },
+          })
+          release = holdWithoutSharing(oldPath)
+          resetProcess()
+          expect(await prepare()).toBe('state-home')
+        } else {
+          expect(
+            await prepare({
+              steps: {
+                afterMarker: () => {
+                  release = holdWithoutSharing(oldPath)
+                },
+              },
+            }),
+          ).toBe('state-home')
+        }
+      } finally {
+        release?.()
+      }
+      expect(readFileSync(oldPath, 'utf8')).toBe(files[relative] as string)
+      expect(marker()?.oldFilesRemoved).not.toBe(true)
+      expect(
+        logged.filter((line) =>
+          line.message.startsWith('openai-auth could not finish removing'),
+        ),
+      ).toEqual([
+        expect.objectContaining({
+          level: 'warn',
+          meta: expect.objectContaining({
+            step: 'remove-old-copies',
+            errorClass: 'old-credential-kept',
+            file: basename(relative),
+          }),
+        }),
+      ])
+
+      resetProcess()
+      logged = []
+      expect(await prepare()).toBe('state-home')
+      expect(present(configDir(), files)).toEqual(leftAfterMove(files))
+      expect(present(runtimeDir(), files)).toEqual(files)
+      expect(marker()?.oldFilesRemoved).toBe(true)
+      expect(logged.filter((line) => line.level === 'warn')).toEqual([])
     },
   )
 

@@ -49,7 +49,8 @@
 //   the same locks and removes old copies identical to the new ones. Differing
 //   credentials refuse the start: the old copy may hold the only live refresh
 //   token. Differing sessions stay. An identical old credential that cannot
-//   be removed (Windows may hold a file open) is logged once as a cleanup
+//   be removed (Windows may hold a file open), or that Windows keeps open so
+//   it cannot be compared, is logged once as a cleanup
 //   failure; the marker then does not record the old files as dealt with, so
 //   the next start tries the removal again. Once the marker records that the
 //   old files are dealt with, reappeared credentials refuse the start, while
@@ -1116,7 +1117,8 @@ async function copyVerified(file: LayoutFile): Promise<void> {
  * before every unlink attempt. Differing credentials refuse the start because
  * the old copy may hold the only live refresh token. Differing sessions, or
  * session files that Windows will not let go of, stay with a warning. An
- * identical credential file that cannot be removed throws
+ * identical credential file that cannot be removed, or one Windows keeps open
+ * so it cannot be compared, throws
  * `OldCredentialKeptError` once every other file was tried, so the caller
  * leaves the marker without `oldFilesRemoved` and the next start tries again.
  * The enrollment state file a move leaves on purpose (`isVaultStateLeftover`)
@@ -1179,10 +1181,27 @@ async function beforeRemove(
 }
 
 /**
+ * On Windows, a file another process has open (an antivirus scan, an indexer,
+ * a writer that has not closed it yet) can refuse to be read or removed for a
+ * moment. These codes do not say whether the file exists or what it holds.
+ */
+function isWindowsSharingError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code
+  return (
+    process.platform === 'win32' &&
+    (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES')
+  )
+}
+
+/**
  * Unlink `file.old` only while its bytes equal `file.next`, retrying on
- * Windows while another process has it open. `guard` runs right before every
- * unlink attempt and throws when the removal must not happen. True when the
- * file is gone.
+ * Windows while another process has either file open. `guard` runs right
+ * before every unlink attempt and throws when the removal must not happen.
+ * True when the file is gone. False when it stays: a session file that
+ * differs or cannot be read, or a file Windows kept open past the retry
+ * budget, whether for the comparison or for the removal. Differing
+ * credentials, or credentials unreadable for any other reason, throw
+ * `credentialConflict`.
  */
 async function unlinkIfIdentical(
   file: LayoutFile,
@@ -1202,8 +1221,15 @@ async function unlinkIfIdentical(
         !(await exists(file.old))
       )
         return true
-      // Unreadable on either side: credentials are ambiguous, while a session
-      // file can safely stay without being used.
+      // A file Windows holds open is not evidence that the two copies differ:
+      // compare again shortly, and past the budget leave the old file for the
+      // next start, as when the unlink itself is refused.
+      if (isWindowsSharingError(error)) {
+        if (performance.now() - started >= SHARING_RETRY_BUDGET_MS) return false
+        continue
+      }
+      // Unreadable on either side for another reason: credentials are
+      // ambiguous, while a session file can safely stay without being used.
       if (credentials) throw credentialConflict(stateDir, file)
       return false
     }
@@ -1216,12 +1242,11 @@ async function unlinkIfIdentical(
       await unlink(file.old)
       return true
     } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code
-      if (code === 'ENOENT') return true
-      const sharing =
-        process.platform === 'win32' &&
-        (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES')
-      if (!sharing || performance.now() - started >= SHARING_RETRY_BUDGET_MS)
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true
+      if (
+        !isWindowsSharingError(error) ||
+        performance.now() - started >= SHARING_RETRY_BUDGET_MS
+      )
         return false
     }
   }
