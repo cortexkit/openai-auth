@@ -12,10 +12,19 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
+import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import type { CodexSessionMetadata } from '../codex-request'
 import { loadCodexSessions, saveCodexSessions } from '../codex-sessions'
 import { acquireCodexSessions, CodexSessionStore } from '../v2/codex-sessions'
-import { poolFiles, seedPool } from './fixtures/opencode2-host'
+import { CodexHttpState } from '../v2/codex-wire'
+import { opencode1HostSlot } from '../v2/host-slot'
+import { setupOpenAIAuth } from '../v2/setup'
+import {
+  fakeOpenCode2Host,
+  poolFiles,
+  scope,
+  seedPool,
+} from './fixtures/opencode2-host'
 import type { SentRequest, SessionStep } from './fixtures/opencode2-sessions'
 
 const OPENCODE1_FILE = 'openai-auth-sessions.json'
@@ -143,7 +152,9 @@ describe('OpenCode 2 session store', () => {
       pausedA = done
     })
     const order: string[] = []
+    // No save delay: B must start its save while A holds the lock.
     const a = new CodexSessionStore(path, {
+      saveDelayMs: 0,
       afterRead: async () => {
         order.push('a read')
         pausedA()
@@ -153,6 +164,7 @@ describe('OpenCode 2 session store', () => {
       },
     })
     const b = new CodexSessionStore(path, {
+      saveDelayMs: 0,
       afterRead: async () => {
         order.push('b read')
       },
@@ -213,6 +225,147 @@ describe('OpenCode 2 session store', () => {
     await held?.release()
     await store.save()
     expect(readJson(path).sessions).toEqual({ ses_a: { threadID: thread } })
+  })
+
+  test('deleting a session the store never knew takes no lock and leaves the file alone', async () => {
+    const path = join(tempDir(), OPENCODE2_FILE)
+    const writer = new CodexSessionStore(path)
+    const thread = writer.get('ses_a').threadID
+    await writer.settled()
+    const bytes = readFileSync(path, 'utf8')
+    const before = statSync(path)
+    // While another writer holds the lock, a save that tried to take it would
+    // wait the whole 30 s lock wait instead of settling.
+    const held = await acquireRefreshFileLock({
+      name: 'sessions',
+      path,
+      ttlMs: 60_000,
+    })
+    expect(held).not.toBeNull()
+    const store = new CodexSessionStore(path, {
+      lockWaitMs: 30_000,
+      saveDelayMs: 10,
+    })
+    store.delete('ses_never_used_openai')
+    const outcome = await Promise.race([
+      Bun.sleep(50).then(() => store.settled().then(() => 'settled')),
+      Bun.sleep(1_000).then(() => 'waited for the lock'),
+    ])
+    await held?.release()
+    await store.settled()
+    expect(outcome).toBe('settled')
+    expect(readFileSync(path, 'utf8')).toBe(bytes)
+    const after = statSync(path)
+    expect([after.ino, after.mtimeMs]).toEqual([before.ino, before.mtimeMs])
+    expect(threadsOf(new CodexSessionStore(path))).toEqual({ ses_a: thread })
+  })
+
+  test('deleting a session another process saved after this one loaded removes it', async () => {
+    const path = join(tempDir(), OPENCODE2_FILE)
+    const late = new CodexSessionStore(path)
+    const writer = new CodexSessionStore(path)
+    const kept = writer.get('ses_keep').threadID
+    writer.get('ses_gone')
+    await writer.settled()
+    expect(late.sessions.has('ses_gone')).toBe(false)
+    late.delete('ses_gone')
+    await late.settled()
+    expect(threadsOf(new CodexSessionStore(path))).toEqual({ ses_keep: kept })
+  })
+
+  test('a save whose merged sessions match the file re-reads it under the lock and does not replace it', async () => {
+    const path = join(tempDir(), OPENCODE2_FILE)
+    const a = new CodexSessionStore(path)
+    const kept = a.get('ses_keep').threadID
+    a.get('ses_gone')
+    await a.settled()
+    let reads = 0
+    const b = new CodexSessionStore(path, {
+      afterRead: async () => {
+        reads++
+      },
+    })
+    expect(b.sessions.has('ses_gone')).toBe(true)
+    a.delete('ses_gone')
+    await a.settled()
+    const bytes = readFileSync(path, 'utf8')
+    const before = statSync(path)
+    // B still holds the session, so it records the deletion; the file it
+    // re-reads under the lock no longer has it, so there is nothing to write.
+    b.delete('ses_gone')
+    await b.settled()
+    expect(reads).toBe(1)
+    expect(readFileSync(path, 'utf8')).toBe(bytes)
+    const after = statSync(path)
+    expect([after.ino, after.mtimeMs]).toEqual([before.ino, before.mtimeMs])
+    expect(threadsOf(new CodexSessionStore(path))).toEqual({ ses_keep: kept })
+  })
+
+  test('five sessions starting within the save delay are saved in one write', async () => {
+    const path = join(tempDir(), OPENCODE2_FILE)
+    let writes = 0
+    const store = new CodexSessionStore(path, {
+      saveDelayMs: 300,
+      afterRead: async () => {
+        writes++
+      },
+    })
+    const ids = ['ses_1', 'ses_2', 'ses_3', 'ses_4', 'ses_5']
+    for (const id of ids) {
+      store.get(id)
+      await Bun.sleep(20)
+    }
+    // Let the delayed save run on its own rather than flushing it.
+    await Bun.sleep(600)
+    await store.settled()
+    expect(writes).toBe(1)
+    expect(Object.keys(readJson(path).sessions).sort()).toEqual(ids)
+  })
+
+  test('stopping the plugin saves a session whose delayed save is still pending', async () => {
+    const files = poolFiles(tempDir())
+    seedPool(files, 'main-first', [{ id: 'main' }])
+    const path = join(files.dir, OPENCODE2_FILE)
+    const store = new CodexSessionStore(path, { saveDelayMs: 60_000 })
+    const host = fakeOpenCode2Host()
+    const offline = (async () => {
+      throw new Error('offline in tests')
+    }) as unknown as typeof fetch
+    const stop = await setupOpenAIAuth(host.ctx, {
+      codex: new CodexHttpState(undefined, undefined, store),
+      paths: files.paths,
+      sidebarStateFile: join(files.dir, 'sidebar.json'),
+      slot: opencode1HostSlot(join(files.dir, 'auth.json')),
+      fence: async () => ({ open: true }),
+      heartbeat: false,
+      fetch: offline,
+    })
+    const draft = {
+      ...scope('ses_1'),
+      request: new Request('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${placeholderSecret('openai')}`,
+          'content-type': 'application/json',
+          'session-id': 'ses_1',
+        },
+        body: JSON.stringify({
+          model: 'gpt-5.5',
+          stream: true,
+          input: [
+            { role: 'user', content: [{ type: 'input_text', text: 'hi' }] },
+          ],
+        }),
+      }),
+    }
+    await host.fire('http.request', draft)
+    const thread = draft.request.headers.get('thread-id')
+    expect(thread).toBe(store.sessions.get('ses_1')?.threadID as string)
+    expect(existsSync(path)).toBe(false)
+    const started = performance.now()
+    await stop?.()
+    expect(performance.now() - started).toBeLessThan(5_000)
+    expect(readJson(path).sessions).toEqual({ ses_1: { threadID: thread } })
   })
 })
 

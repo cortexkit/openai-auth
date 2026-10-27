@@ -924,8 +924,9 @@ export async function setupOpenAIAuth(
     ])
     // Join account-pool transfers and reads after stopping new slot adoptions.
     // Their reloads must finish before releasing this host's state. Also finish
-    // saving the sessions this location created or deleted, so a restart right
-    // after still finds their thread ids. Preserve the five-second shutdown
+    // saving the sessions this location created or deleted, starting a save
+    // still inside its delay now, so a restart right after still finds their
+    // thread ids. Preserve the five-second shutdown
     // limit for an unresponsive provider, login slot or session-file lock.
     let settleTimer: ReturnType<typeof setTimeout> | undefined
     try {
