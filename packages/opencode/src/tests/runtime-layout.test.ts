@@ -21,7 +21,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   enrollmentAuthority,
@@ -503,6 +503,112 @@ describe('moving an existing layout', () => {
       ).rejects.toThrow(credentialConflictMessage(relative))
       expect(existsSync(join(configDir(), relative))).toBe(true)
       expect(marker()?.oldFilesRemoved).not.toBe(true)
+    },
+  )
+
+  // An old credential identical to its copy that cannot be removed, as when
+  // Windows holds it open, stands in here as a folder made read-only right
+  // before the removal. Root ignores folder permissions, so the test needs an
+  // ordinary user.
+  it
+    .skipIf(!POSIX || process.getuid?.() === 0)
+    .each(['openai-auth-state.json', 'openai-auth-vault/opencode-roster.json'])(
+    'an old credential that cannot be removed is retried at the next start, not refused: %s',
+    async (relative) => {
+      const files = oldLayout()
+      seed(configDir(), files)
+      const oldPath = join(configDir(), relative)
+      const folder = dirname(oldPath)
+      try {
+        expect(
+          await prepare({
+            steps: {
+              // Writable again before the next removal, so the lock files
+              // in that folder can go when the move releases them.
+              beforeRemove: (path) => {
+                chmodSync(folder, path === oldPath ? 0o500 : 0o700)
+              },
+            },
+          }),
+        ).toBe('state-home')
+      } finally {
+        chmodSync(folder, 0o700)
+      }
+      expect(readFileSync(oldPath, 'utf8')).toBe(files[relative] as string)
+      expect(marker()?.oldFilesRemoved).not.toBe(true)
+      expect(
+        logged.filter((line) =>
+          line.message.startsWith('openai-auth could not finish removing'),
+        ),
+      ).toEqual([
+        expect.objectContaining({
+          level: 'warn',
+          meta: expect.objectContaining({
+            step: 'remove-old-copies',
+            errorClass: 'old-credential-kept',
+            file: basename(relative),
+          }),
+        }),
+      ])
+
+      // The file can be removed again: the next start finishes the cleanup
+      // instead of finding a reappeared credential.
+      resetProcess()
+      logged = []
+      expect(await prepare()).toBe('state-home')
+      expect(existsSync(oldPath)).toBe(false)
+      expect(present(configDir(), files)).toEqual(leftAfterMove(files))
+      expect(present(runtimeDir(), files)).toEqual(files)
+      expect(marker()?.oldFilesRemoved).toBe(true)
+      expect(logged.filter((line) => line.level === 'warn')).toEqual([])
+      resetProcess()
+      expect(await prepare()).toBe('state-home')
+    },
+  )
+
+  it.skipIf(!POSIX || process.getuid?.() === 0)(
+    'an old credential that a later start cannot remove is logged once and retried again',
+    async () => {
+      const files = oldLayout()
+      seed(configDir(), files)
+      await prepare({
+        steps: {
+          afterMarker: () => {
+            throw new Error('crash')
+          },
+        },
+      })
+      const oldPath = join(configDir(), 'openai-auth-state.json')
+      resetProcess()
+      try {
+        expect(
+          await prepare({
+            steps: {
+              beforeRemove: (path) => {
+                chmodSync(configDir(), path === oldPath ? 0o500 : 0o700)
+              },
+            },
+          }),
+        ).toBe('state-home')
+      } finally {
+        chmodSync(configDir(), 0o700)
+      }
+      expect(existsSync(oldPath)).toBe(true)
+      expect(marker()?.oldFilesRemoved).not.toBe(true)
+      expect(logged).toContainEqual(
+        expect.objectContaining({
+          level: 'warn',
+          meta: expect.objectContaining({
+            step: 'remove-old-copies',
+            errorClass: 'old-credential-kept',
+          }),
+        }),
+      )
+
+      resetProcess()
+      expect(await prepare()).toBe('state-home')
+      expect(present(configDir(), files)).toEqual(leftAfterMove(files))
+      expect(marker()?.oldFilesRemoved).toBe(true)
     },
   )
 
@@ -1018,6 +1124,27 @@ function pendingLayout(): Record<string, string> {
   }
 }
 
+/** The old vault token, relative to the config folder. */
+const VAULT_TOKEN = 'openai-auth-vault/opencode-enrollment.json'
+
+/**
+ * What an older version's reconcile() writes over an approved state whose
+ * token is gone.
+ */
+const BLOCKED_MISSING_TOKEN = `${JSON.stringify({
+  version: 1,
+  phase: 'blocked',
+  proposedName: vaultEnrollmentName('opencode'),
+  errorCode: 'missing_token',
+  updatedAt: 2,
+})}\n`
+
+/** The approved state with a newer timestamp than the one that moved. */
+const APPROVED_LATER = (oldLayout()[VAULT_STATE] as string).replace(
+  '"updatedAt":1',
+  '"updatedAt":2',
+)
+
 describe('an approved vault enrollment and older versions', () => {
   it('the move removes the old token but leaves the old state, so an older version stays in vault mode', async () => {
     const files = oldLayout()
@@ -1054,24 +1181,85 @@ describe('an approved vault enrollment and older versions', () => {
     )
   })
 
-  it('anything else at the leftover path is still a conflict', async () => {
-    const files = oldLayout()
-    seed(configDir(), files)
-    await prepare()
-    // An older version rewrote the state (same phase, a newer timestamp).
-    const rewritten = (files[VAULT_STATE] as string).replace(
-      '"updatedAt":1',
-      '"updatedAt":2',
-    )
-    expect(rewritten).not.toBe(files[VAULT_STATE])
-    writePrivate(join(configDir(), VAULT_STATE), rewritten)
-    resetProcess()
-    await expect(prepare()).rejects.toMatchObject({
-      name: 'RuntimeLayoutRefusal',
-      message: credentialConflictMessage(VAULT_STATE),
-    })
-    expect(readFileSync(join(configDir(), VAULT_STATE), 'utf8')).toBe(rewritten)
-  })
+  it.each([
+    ['blocked for the missing token', BLOCKED_MISSING_TOKEN],
+    ['approved at a newer time', APPROVED_LATER],
+  ])(
+    "accepts an older version's rewrite of the leftover (%s) and the old folder still reads vault",
+    async (_label, rewritten) => {
+      seed(configDir(), oldLayout())
+      await prepare()
+      // An older version's reconcile() found the approved state without its
+      // token and rewrote it.
+      writePrivate(join(configDir(), VAULT_STATE), rewritten)
+      resetProcess()
+      logged = []
+      expect(await prepare()).toBe('state-home')
+      expect(logged.filter((line) => line.level === 'warn')).toEqual([])
+      expect(readFileSync(join(configDir(), VAULT_STATE), 'utf8')).toBe(
+        rewritten,
+      )
+      expect(await oldFolderAuthority()).toBe('vault')
+      expect(await authority()).toBe('vault')
+    },
+  )
+
+  it.each([
+    [
+      'an enrollment request with its secret',
+      `${JSON.stringify({
+        version: 1,
+        phase: 'pending',
+        proposedName: vaultEnrollmentName('opencode'),
+        requestSecret: 'ab'.repeat(32),
+        createdAt: 2,
+        updatedAt: 2,
+      })}\n`,
+    ],
+    ['a file that is not an enrollment state', '{"someone-elses":true}\n'],
+    [
+      "another enrollment's state",
+      BLOCKED_MISSING_TOKEN.replace(
+        vaultEnrollmentName('opencode'),
+        vaultEnrollmentName('pi'),
+      ),
+    ],
+  ])(
+    'anything else at the leftover path is still a conflict: %s',
+    async (_label, other) => {
+      seed(configDir(), oldLayout())
+      await prepare()
+      writePrivate(join(configDir(), VAULT_STATE), other)
+      resetProcess()
+      await expect(prepare()).rejects.toMatchObject({
+        name: 'RuntimeLayoutRefusal',
+        message: credentialConflictMessage(VAULT_STATE),
+      })
+      expect(readFileSync(join(configDir(), VAULT_STATE), 'utf8')).toBe(other)
+    },
+  )
+
+  it.each([
+    ['as it moved', undefined],
+    ['rewritten by an older version', BLOCKED_MISSING_TOKEN],
+  ])(
+    'a token file in the old vault folder is a conflict, beside the leftover %s',
+    async (_label, rewritten) => {
+      const files = oldLayout()
+      seed(configDir(), files)
+      await prepare()
+      if (rewritten) writePrivate(join(configDir(), VAULT_STATE), rewritten)
+      writePrivate(join(configDir(), VAULT_TOKEN), files[VAULT_TOKEN] as string)
+      resetProcess()
+      await expect(prepare()).rejects.toMatchObject({
+        name: 'RuntimeLayoutRefusal',
+        message: credentialConflictMessage(
+          rewritten ? VAULT_STATE : VAULT_TOKEN,
+        ),
+      })
+      expect(existsSync(join(configDir(), VAULT_TOKEN))).toBe(true)
+    },
+  )
 
   it('an enrollment that was never approved is removed as before', async () => {
     const files = pendingLayout()
@@ -1103,6 +1291,29 @@ describe('an approved vault enrollment and older versions', () => {
     expect(existsSync(join(configDir(), 'openai-auth-vault'))).toBe(false)
     expect(await oldFolderAuthority()).toBe('local')
     expect(await authority()).toBe('local')
+  })
+
+  it('Disconnect removes the leftover an older version rewrote', async () => {
+    seed(configDir(), oldLayout())
+    await prepare()
+    writePrivate(join(configDir(), VAULT_STATE), BLOCKED_MISSING_TOKEN)
+    const lease = acquireOpenCodeVault(
+      {
+        host: 'opencode',
+        stateDir: vaultStateDir(getAccountPaths().statePath),
+        connectionFile: () => join(root, 'no-vault.json'),
+        pollIntervalMs: 0,
+      },
+      getAccountPaths(),
+    )
+    try {
+      await lease.vault.disconnect()
+    } finally {
+      lease.release()
+    }
+    expect(existsSync(join(configDir(), VAULT_STATE))).toBe(false)
+    expect(existsSync(join(configDir(), 'openai-auth-vault'))).toBe(false)
+    expect(await oldFolderAuthority()).toBe('local')
   })
 
   it('Disconnect leaves a state file at the leftover path that the move did not leave', async () => {

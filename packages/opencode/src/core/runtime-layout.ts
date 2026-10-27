@@ -48,18 +48,26 @@
 //   A crash after it leaves the new files authoritative; the next start takes
 //   the same locks and removes old copies identical to the new ones. Differing
 //   credentials refuse the start: the old copy may hold the only live refresh
-//   token. Differing sessions stay. The marker then records that the old files
-//   are dealt with; reappeared credentials also refuse the start, while each
-//   process warns once about reappeared sessions and leaves them alone.
+//   token. Differing sessions stay. An identical old credential that cannot
+//   be removed (Windows may hold a file open) is logged once as a cleanup
+//   failure; the marker then does not record the old files as dealt with, so
+//   the next start tries the removal again. Once the marker records that the
+//   old files are dealt with, reappeared credentials refuse the start, while
+//   each process warns once about reappeared sessions and leaves them alone.
 // - A vault enrollment that is approved keeps one old file: the enrollment
 //   state file stays in the old vault folder, byte for byte the copy that
 //   moved, and only the old token is removed. Every version reads an approved
 //   state without a token as vault mode with a missing token, never as local,
 //   so an older version that still looks in the config folder refuses instead
-//   of serving local credentials. The marker records that file's SHA-256;
-//   later starts accept exactly those bytes there, and anything else at that
-//   path is a conflict like any other reappeared credential. Disconnect on
-//   this version removes it (`removeMovedVaultStateLeftover`).
+//   of serving local credentials. The marker records that file's SHA-256.
+//   Later starts accept those bytes there, and also any state an older
+//   version rewrote it to that common-auth still reads as vault mode without
+//   a token (approved, or blocked for the missing token) under this host's
+//   enrollment name, as long as no token file is in the old vault folder: an
+//   older version's `reconcile()` rewrites an approved state without a token
+//   to blocked, and that file holds no secret. Anything else at that path is a
+//   conflict like any other reappeared credential. Disconnect on this version
+//   removes it (`removeMovedVaultStateLeftover`).
 // - The layout lock is checked again before every destructive step, the
 //   removal of the move's `layout-moving.json` and of the old vault folder
 //   included; `layout-moving.json` is the last thing removed. A move
@@ -87,11 +95,19 @@ import {
   resolve,
 } from 'node:path'
 import {
+  type ClaustrumEnrollmentPaths,
+  readClaustrumEnrollmentStatus,
+} from '@cortexkit/common-auth/claustrum'
+import {
   acquireRefreshFileLock,
   type RefreshFileLock,
   writeJsonAtomic,
 } from '@cortexkit/common-auth/fs'
-import { vaultPaths, vaultStateDir } from '@cortexkit/openai-auth-core/internal'
+import {
+  vaultEnrollmentName,
+  vaultPaths,
+  vaultStateDir,
+} from '@cortexkit/openai-auth-core/internal'
 import { CODEX_SESSIONS_LOCK_NAME } from '../codex-sessions'
 import { createLogger } from '../logger'
 import {
@@ -308,6 +324,37 @@ class LayoutMoveError extends Error {
     super(message)
     this.name = 'LayoutMoveError'
   }
+}
+
+/**
+ * An old credential file identical to its new copy that could not be
+ * removed. Not a refusal: the start goes on in the state home, and the marker
+ * is left without `oldFilesRemoved` so the next start removes it.
+ */
+class OldCredentialKeptError extends LayoutMoveError {
+  constructor(readonly path: string) {
+    super('old-credential-kept', `${path} could not be removed`)
+  }
+}
+
+/** The one warning for old files a move or a later start failed to remove. */
+function logCleanupFailure(
+  location: RuntimeLayoutLocation,
+  log: RuntimeLayoutLogger,
+  step: string,
+  error: unknown,
+): void {
+  logOnce(`${location.key}\0cleanup`, () =>
+    log.warn(
+      "openai-auth could not finish removing its old files from OpenCode's config folder; it tries again at the next start",
+      {
+        configDir: location.configDir,
+        step,
+        errorClass: errorClass(error),
+        ...errorFile(error),
+      },
+    ),
+  )
 }
 
 /**
@@ -630,11 +677,20 @@ async function moveFiles(
     await input.steps?.afterMarker?.()
 
     await layoutLock.assertOwned()
-    await removeOldCopies(location, present, layoutLock, {
-      log: input.log,
-      keptVaultState,
-      steps: input.steps,
-    })
+    try {
+      await removeOldCopies(location, present, layoutLock, {
+        log: input.log,
+        keptVaultState,
+        steps: input.steps,
+      })
+    } catch (error) {
+      if (!(error instanceof OldCredentialKeptError)) throw error
+      // The copies are verified and the marker is written, so this process
+      // runs on the new files; the marker stays without `oldFilesRemoved` and
+      // the next start removes what is left.
+      logCleanupFailure(location, input.log, 'remove-old-copies', error)
+      return { kind: 'moved', moved: present.length > 0 }
+    }
     oldVaultEmptied = true
     await layoutLock.assertOwned()
     await writeMarker(markerPath, { ...marker, oldFilesRemoved: true })
@@ -706,17 +762,7 @@ async function finishOldFiles(
     await removeManifestOwned(location.stateHomeDir, layoutLock, input.steps)
   } catch (error) {
     if (error instanceof RuntimeLayoutRefusal) throw error
-    logOnce(`${location.key}\0cleanup`, () =>
-      input.log.warn(
-        "openai-auth could not finish removing its old files from OpenCode's config folder; it tries again at the next start",
-        {
-          configDir: location.configDir,
-          step,
-          errorClass: errorClass(error),
-          ...errorFile(error),
-        },
-      ),
-    )
+    logCleanupFailure(location, input.log, step, error)
   } finally {
     for (const lock of locks.reverse()) await lock.release().catch(() => {})
     if (done) await removeOldVaultFolder(files, layoutLock, input.steps)
@@ -845,13 +891,51 @@ function vaultStateFile(files: LayoutFiles): LayoutFile {
   }
 }
 
+/** The name OpenCode enrolls with the vault under. */
+const OPENCODE_ENROLLMENT_NAME = vaultEnrollmentName('opencode')
+
+/**
+ * A token path that no one writes, beside the state-home copy of the
+ * enrollment state, for reading that copy as if its token were gone. Should a
+ * file ever be there, common-auth reads the state as approved, which
+ * `vaultModeWithoutToken` does not accept: the move then removes the old state
+ * file as it does any other.
+ */
+const NO_TOKEN_FILE = 'opencode-enrollment-no-token.json'
+
+/**
+ * True when common-auth's own reader takes the enrollment files at `paths` for
+ * vault mode with the token missing, under OpenCode's enrollment name: the
+ * state is approved, or blocked because the token is missing, and there is no
+ * token file. A token file, another enrollment name, a pending or denied
+ * state, or a file the reader rejects (malformed, not owner-only) is false.
+ */
+async function vaultModeWithoutToken(
+  paths: ClaustrumEnrollmentPaths,
+): Promise<boolean> {
+  try {
+    const status = await readClaustrumEnrollmentStatus(
+      paths,
+      OPENCODE_ENROLLMENT_NAME,
+    )
+    return (
+      status.state === 'blocked' &&
+      status.code === 'missing_token' &&
+      status.proposedName === OPENCODE_ENROLLMENT_NAME
+    )
+  } catch {
+    return false
+  }
+}
+
 /**
  * The SHA-256 of the enrollment state file this move copied, when that state
- * keeps a host in vault mode without its token: approved, or blocked because
- * the token is missing. common-auth's `enrollmentAuthority` reads either one
- * as 'vault' when no token is next to it, so leaving it in the old vault
- * folder keeps an older version in vault mode. Any other state (pending,
- * denied, unreadable) protects nothing, and the old copy is removed as usual.
+ * keeps the host in vault mode once the old token is gone: approved, or
+ * blocked because the token is missing, under OpenCode's enrollment name.
+ * common-auth's `enrollmentAuthority` reads such a state with no token next
+ * to it as 'vault', so leaving it in the old vault folder keeps an older
+ * version in vault mode. Any other state (pending, denied, unreadable)
+ * protects nothing, and the old copy is removed as usual.
  */
 async function keepableVaultState(
   files: LayoutFiles,
@@ -859,18 +943,13 @@ async function keepableVaultState(
 ): Promise<string | undefined> {
   const state = vaultStateFile(files)
   if (!present.some((file) => file.old === state.old)) return undefined
-  // The copy, verified byte for byte against the old file.
-  const bytes = await readFile(state.next)
-  let value: { phase?: unknown; errorCode?: unknown } | null
-  try {
-    value = JSON.parse(bytes.toString('utf8'))
-  } catch {
-    return undefined
-  }
-  const vaultMode =
-    value?.phase === 'approved' ||
-    (value?.phase === 'blocked' && value.errorCode === 'missing_token')
-  return vaultMode ? sha256(bytes) : undefined
+  // The copy, verified byte for byte against the old file, read the way an
+  // older version will read the old one after the move removes its token.
+  const keepable = await vaultModeWithoutToken({
+    statePath: state.next,
+    tokenPath: join(files.vault.next, NO_TOKEN_FILE),
+  })
+  return keepable ? sha256(await readFile(state.next)) : undefined
 }
 
 /** True when `path` holds exactly the bytes whose SHA-256 is `hash`. */
@@ -887,11 +966,29 @@ async function isKeptVaultState(
 }
 
 /**
+ * True when the old vault folder's enrollment state file is the one a move
+ * left there on purpose (the marker recorded a hash): still exactly those
+ * bytes, or rewritten by an older version to another state common-auth reads
+ * as vault mode without a token (see `vaultModeWithoutToken`), with no token
+ * file next to it. Such a file holds no secret.
+ */
+async function isVaultStateLeftover(
+  files: LayoutFiles,
+  keptVaultState: string | undefined,
+): Promise<boolean> {
+  if (!keptVaultState) return false
+  const old = vaultPaths(files.vault.old, 'opencode')
+  if (await isKeptVaultState(old.statePath, keptVaultState)) return true
+  return vaultModeWithoutToken(old)
+}
+
+/**
  * After Disconnect, remove the enrollment state file a move left in the old
  * vault folder, so an older version no longer reads this host as enrolled.
- * Acts only for this config folder's state-home vault folder (`vaultDir`) and
- * only on exactly the bytes the marker recorded; anything else there stays.
- * The emptied old vault folder goes too.
+ * Acts only for this config folder's state-home vault folder (`vaultDir`),
+ * only when the marker records that the move left such a file, and only on a
+ * file `isVaultStateLeftover` accepts; anything else there stays. The emptied
+ * old vault folder goes too.
  */
 export async function removeMovedVaultStateLeftover(
   vaultDir: string,
@@ -906,7 +1003,7 @@ export async function removeMovedVaultStateLeftover(
   )
   if (!marker?.keptVaultState || marker.oldDir !== location.key) return
   const leftover = vaultStateFile(files).old
-  if (!(await isKeptVaultState(leftover, marker.keptVaultState))) return
+  if (!(await isVaultStateLeftover(files, marker.keptVaultState))) return
   await unlink(leftover).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== 'ENOENT') throw error
   })
@@ -1018,9 +1115,12 @@ async function copyVerified(file: LayoutFile): Promise<void> {
  * Remove each old file whose bytes equal its new copy, comparing again right
  * before every unlink attempt. Differing credentials refuse the start because
  * the old copy may hold the only live refresh token. Differing sessions, or
- * files that Windows will not let go of, stay. The approved enrollment state
- * file whose SHA-256 the marker records (`keptVaultState`) stays on purpose
- * and is not reported. The caller holds the data locks.
+ * session files that Windows will not let go of, stay with a warning. An
+ * identical credential file that cannot be removed throws
+ * `OldCredentialKeptError` once every other file was tried, so the caller
+ * leaves the marker without `oldFilesRemoved` and the next start tries again.
+ * The enrollment state file a move leaves on purpose (`isVaultStateLeftover`)
+ * stays and is not reported. The caller holds the data locks.
  */
 async function removeOldCopies(
   location: RuntimeLayoutLocation,
@@ -1033,15 +1133,23 @@ async function removeOldCopies(
   },
 ): Promise<void> {
   const kept: string[] = []
+  const credentialsKept: string[] = []
   const files = layoutFiles(location)
   const keptState = vaultStateFile(files).old
-  for (const file of present) {
+  // The enrollment state file comes last: whether it may stay depends on the
+  // old token being gone, and the token is one of the files removed here.
+  const ordered = [
+    ...present.filter((file) => file.old !== keptState),
+    ...present.filter((file) => file.old === keptState),
+  ]
+  for (const file of ordered) {
     await layoutLock.assertOwned()
-    if (
-      file.old === keptState &&
-      (await isKeptVaultState(file.old, input.keptVaultState))
-    )
-      continue
+    if (file.old === keptState) {
+      if (await isVaultStateLeftover(files, input.keptVaultState)) continue
+      // An old credential still in place means another try at the next
+      // start; the state file is judged then, beside what is left by then.
+      if (credentialsKept.length > 0) continue
+    }
     const credentials =
       file.old === files.state.old || insideOrSame(file.old, files.vault.old)
     if (
@@ -1049,13 +1157,15 @@ async function removeOldCopies(
         beforeRemove(file.old, layoutLock, input.steps),
       ))
     )
-      kept.push(file.old)
+      (credentials ? credentialsKept : kept).push(file.old)
   }
   if (kept.length > 0)
     input.log.warn(
       "openai-auth left old files in OpenCode's config folder; it no longer reads them",
       { configDir: location.configDir, kept },
     )
+  const [first] = credentialsKept
+  if (first !== undefined) throw new OldCredentialKeptError(first)
 }
 
 /** The test seam, then the lease check that must come right before a removal. */
@@ -1134,11 +1244,11 @@ async function noticeReappearedFiles(
     const keptState = vaultStateFile(files).old
     for (const name of await folderFiles(files.vault.old)) {
       const old = join(files.vault.old, name)
-      // The approved enrollment state file the move left on purpose, still
-      // exactly the bytes the marker recorded.
+      // The enrollment state file the move left on purpose, as it moved or as
+      // an older version rewrote it without leaving vault mode.
       if (
         old === keptState &&
-        (await isKeptVaultState(old, marker.keptVaultState))
+        (await isVaultStateLeftover(files, marker.keptVaultState))
       )
         continue
       if (!own(old))
