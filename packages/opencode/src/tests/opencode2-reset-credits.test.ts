@@ -29,7 +29,6 @@ import {
   ResetCreditCounts,
   type ResetPoolAccess,
 } from '../v2/reset-credits'
-import { waitForQuotaPersistence } from './fixtures/coalesced-quota'
 import { type PoolFiles, poolFiles, seedPool } from './fixtures/opencode2-host'
 import { type Json, jwt } from './fixtures/pool-migration-harness'
 import { FLOOR_ENV } from './setup-env'
@@ -397,7 +396,7 @@ describe('OpenCode 2 reset quota re-check and quota view', () => {
   }
 
   it('writes the pool quota map at the injected time and keeps the applicable count apart: available 5, applicable 2', async () => {
-    const { pool, server, deps } = await polledPool()
+    const { pool, server, source, deps } = await polledPool()
     server.reply = usageReply({ available: 5, applicable: 2 })
     expect(await deps.refreshResetTargetQuota('alpha')).toEqual({
       account: 'alpha',
@@ -405,9 +404,7 @@ describe('OpenCode 2 reset quota re-check and quota view', () => {
     })
     expect(server.bearers).toEqual(['Bearer alpha-token'])
 
-    await waitForQuotaPersistence(
-      () => savedQuota(pool, 'alpha')?.counters?.resetCredits?.value === 5,
-    )
+    await source.dispose()
     const saved = savedQuota(pool, 'alpha')
     expect(saved?.counters?.resetCredits).toEqual({ value: 5, checkedAt: NOW })
     expect(
@@ -428,34 +425,28 @@ describe('OpenCode 2 reset quota re-check and quota view', () => {
     expect(entry?.accountId).toBe('chatgpt-alpha')
   })
 
-  it('omits the applicable count when the last poll carried none, and never shows the available count in its place', async () => {
-    const { pool, server, deps } = await polledPool()
-    server.reply = usageReply({ available: 5, applicable: 2 })
-    await deps.refreshResetTargetQuota('main')
-    expect(deps.quotaManager.getMain()?.quota.resetCreditsApplicable).toBe(2)
+  for (const available of [0, 5]) {
+    it(`omits the applicable count when the last poll carried none, and never shows the available count (${available}) in its place`, async () => {
+      const { pool, server, source, deps } = await polledPool()
+      server.reply = usageReply({ available: 5, applicable: 2 })
+      await deps.refreshResetTargetQuota('main')
+      expect(deps.quotaManager.getMain()?.quota.resetCreditsApplicable).toBe(2)
 
-    server.reply = usageReply({ available: 0 })
-    expect(await deps.refreshResetTargetQuota('main')).toEqual({
-      account: 'main',
-      ok: true,
+      server.reply = usageReply({ available })
+      expect(await deps.refreshResetTargetQuota('main')).toEqual({
+        account: 'main',
+        ok: true,
+      })
+      await source.dispose()
+      expect(savedQuota(pool, 'main')?.counters?.resetCredits).toEqual({
+        value: available,
+        checkedAt: NOW,
+      })
+      const quota = deps.quotaManager.getMain()?.quota
+      expect(quota?.primary?.usedPercent).toBe(30)
+      expect(quota && 'resetCreditsApplicable' in quota).toBe(false)
     })
-    await waitForQuotaPersistence(
-      () => savedQuota(pool, 'main')?.counters?.resetCredits?.value === 0,
-    )
-    expect(savedQuota(pool, 'main')?.counters?.resetCredits).toEqual({
-      value: 0,
-      checkedAt: NOW,
-    })
-    const quota = deps.quotaManager.getMain()?.quota
-    expect(quota?.primary?.usedPercent).toBe(30)
-    expect(quota && 'resetCreditsApplicable' in quota).toBe(false)
-
-    server.reply = usageReply({ available: 5 })
-    await deps.refreshResetTargetQuota('main')
-    expect(
-      deps.quotaManager.getMain()?.quota.resetCreditsApplicable,
-    ).toBeUndefined()
-  })
+  }
 
   it('reports an unknown account and a vault-mode host without polling', async () => {
     const { pool, server, source, deps } = await polledPool()

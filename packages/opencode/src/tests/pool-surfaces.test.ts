@@ -434,10 +434,8 @@ describe('the sidebar of a migrated install', () => {
     }, 'the pool sidebar snapshot with credits')
     await settleSurfaceWork()
 
-    await waitFor(() => {
-      const quota = config().commonAuthPool.rows.main?.quota as QuotaMap
-      return quota.credits?.balance === 40 ? true : undefined
-    }, 'the detached pool quota write with credits')
+    await hooks?.dispose?.()
+    hooks = undefined
     const stored = config().commonAuthPool.rows.main?.quota as QuotaMap
     expect(stored.credits).toEqual({
       hasCredits: true,

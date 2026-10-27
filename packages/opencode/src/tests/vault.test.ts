@@ -785,9 +785,8 @@ async function setMode(mode: PoolMode) {
   }).updateSettings((settings) => {
     settings.routing = { mode }
   })
-  // The request path re-reads the config only when its modification time
-  // changes; a short pause makes sure the next request sees the new mode.
-  await Bun.sleep(5)
+  // Routing mode names have different lengths, so a mode change invalidates
+  // the request cache by file size even if the modification time is unchanged.
 }
 
 describe('vault cachekeep', () => {

@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { observationFromSnapshot } from '@cortexkit/openai-auth-core/pool-quota'
 import { PoolAccountSource } from '../core/pool-account-source'
-import { waitForQuotaPersistence } from './fixtures/coalesced-quota'
 import { quotaMap, seedPool } from './fixtures/pool-install'
 
 const cleanups: Array<() => Promise<void>> = []
@@ -35,36 +34,38 @@ for (const operation of [
     let enrolled = false
     let armed = false
     let commits = 0
-    const source = new PoolAccountSource({
-      paths: () => paths,
-      vaultAuthority: async () => (enrolled ? 'vault' : 'local'),
-      store: {
-        onStep: (step) => {
-          if (armed && step.startsWith('before-')) {
-            commits++
-            enrolled = true
-          }
-        },
-      },
-      refreshProvider: async () => ({
-        access: 'rotated',
-        refresh: 'rotated-refresh',
-        expires: Date.now() + 86400_000,
-      }),
-      pullQuota: async () =>
-        observationFromSnapshot(
-          {
-            primary: {
-              usedPercent: 63,
-              remainingPercent: 37,
-              windowMinutes: 300,
-              checkedAt: Date.now(),
-            },
+    const makeSource = () =>
+      new PoolAccountSource({
+        paths: () => paths,
+        vaultAuthority: async () => (enrolled ? 'vault' : 'local'),
+        store: {
+          onStep: (step) => {
+            if (armed && step.startsWith('before-')) {
+              commits++
+              enrolled = true
+            }
           },
-          Date.now(),
-          true,
-        ),
-    })
+        },
+        refreshProvider: async () => ({
+          access: 'rotated',
+          refresh: 'rotated-refresh',
+          expires: Date.now() + 86400_000,
+        }),
+        pullQuota: async () =>
+          observationFromSnapshot(
+            {
+              primary: {
+                usedPercent: 63,
+                remainingPercent: 37,
+                windowMinutes: 300,
+                checkedAt: Date.now(),
+              },
+            },
+            Date.now(),
+            true,
+          ),
+      })
+    let source = makeSource()
     cleanups.push(async () => {
       source.dispose()
       await source.settled()
@@ -74,13 +75,10 @@ for (const operation of [
     await source.settled()
     const initial = await source.poolStore().read()
     if (initial.status !== 'ready') throw new Error('pool not ready')
-    await waitForQuotaPersistence(() => {
-      const saved = JSON.parse(readFileSync(paths.configPath, 'utf8'))
-      return (
-        JSON.stringify(saved.commonAuthPool.rows.main.quota) ===
-        JSON.stringify(initial.rows[0]?.quota)
-      )
-    })
+    await source.dispose()
+    // Use a fresh writer after draining startup quota so the authority fence
+    // is exercised by a later commit, not by an already-closed store.
+    source = makeSource()
     const bytes = () =>
       [paths.configPath, paths.statePath].map((path) =>
         readFileSync(path, 'utf8'),

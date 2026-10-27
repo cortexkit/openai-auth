@@ -35,7 +35,6 @@ import type { ApplyResult, OpenDialogPayload } from '../rpc/protocol'
 import type { ControlPlaneMenu } from '../v2/control-plane'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { setupOpenAIAuth } from '../v2/setup'
-import { waitForQuotaPersistence } from './fixtures/coalesced-quota'
 import {
   fakeOpenCode2Host,
   type PoolFiles,
@@ -303,7 +302,9 @@ async function start(options: StartOptions = {}) {
       ...(daemon ? { connectionFile: () => daemon.connectionFile } : {}),
     },
   })
-  cleanups.push(dispose)
+  let closing: Promise<void> | undefined
+  const close = () => (closing ??= Promise.resolve(dispose()))
+  cleanups.push(close)
   if (daemon) await firstVaultReading(files, vaultDir, daemon)
   const menu = locationMenu(directory)
   const apply = (
@@ -324,6 +325,7 @@ async function start(options: StartOptions = {}) {
     wire,
     host,
     daemon,
+    dispose: close,
     menu,
     apply,
     /** Spend or retry as the TUI dialog sends it after its confirm prompt. */
@@ -515,14 +517,8 @@ describe('OpenCode 2 reset credits redemption', () => {
         pair: [expect.any(String), 'credit-alpha-1'],
       },
     ])
-    // The re-check publishes 5 available credits immediately, then the
-    // detached writer commits the balance to the pool's quota map.
-    await waitForQuotaPersistence(() => {
-      const quota = f.files.readConfig().commonAuthPool.rows.alpha?.quota as
-        | { counters?: { resetCredits?: { value: number } } }
-        | undefined
-      return quota?.counters?.resetCredits?.value === 5
-    })
+    // Shutdown drains accepted quota without waiting for its normal commit interval.
+    await f.dispose()
     const quota = (
       f.files.readConfig().commonAuthPool.rows.alpha as {
         quota?: { counters?: { resetCredits?: { value: number } } }
