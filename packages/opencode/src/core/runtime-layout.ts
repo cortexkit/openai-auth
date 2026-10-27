@@ -1122,7 +1122,9 @@ async function copyVerified(file: LayoutFile): Promise<void> {
  * `OldCredentialKeptError` once every other file was tried, so the caller
  * leaves the marker without `oldFilesRemoved` and the next start tries again.
  * The enrollment state file a move leaves on purpose (`isVaultStateLeftover`)
- * stays and is not reported. The caller holds the data locks.
+ * stays and is not reported; so does that file whenever the marker records a
+ * kept state and its bytes equal the state-home copy. The caller holds the
+ * data locks.
  */
 async function removeOldCopies(
   location: RuntimeLayoutLocation,
@@ -1151,6 +1153,13 @@ async function removeOldCopies(
       // An old credential still in place means another try at the next
       // start; the state file is judged then, beside what is left by then.
       if (credentialsKept.length > 0) continue
+      // The move left a state file here on purpose. Whenever the leftover
+      // check above rejects it (a read that failed for a moment is enough),
+      // a copy identical to the state-home one must still stay: removing it
+      // would make an older version read this host as local. Differing bytes
+      // are judged below.
+      if (input.keptVaultState && (await sameBytes(file.old, file.next)))
+        continue
     }
     const credentials =
       file.old === files.state.old || insideOrSame(file.old, files.vault.old)
@@ -1168,6 +1177,15 @@ async function removeOldCopies(
     )
   const [first] = credentialsKept
   if (first !== undefined) throw new OldCredentialKeptError(first)
+}
+
+/** True when both files can be read and hold the same bytes. */
+async function sameBytes(a: string, b: string): Promise<boolean> {
+  try {
+    return (await readFile(a)).equals(await readFile(b))
+  } catch {
+    return false
+  }
 }
 
 /** The test seam, then the lease check that must come right before a removal. */

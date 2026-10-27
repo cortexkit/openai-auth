@@ -1421,6 +1421,33 @@ describe('an approved vault enrollment and older versions', () => {
     expect(marker()?.keptVaultState).toBeUndefined()
   })
 
+  // A failed read can make the leftover check reject the old enrollment state
+  // for a moment. This test makes that check reject it without a failed read,
+  // through a pending state (never accepted as a leftover) and a marker hash
+  // for other bytes. The old state file, byte for byte its state-home copy,
+  // must still stay.
+  it('cleanup after a crash keeps an old enrollment state identical to its copy when the leftover check rejects it', async () => {
+    const files = pendingLayout()
+    seed(configDir(), files)
+    await prepare({
+      steps: {
+        afterMarker: () => {
+          throw new Error('crash')
+        },
+      },
+    })
+    writePrivate(
+      join(runtimeDir(), 'layout.json'),
+      JSON.stringify({ ...marker(), keptVaultState: sha256('other bytes') }),
+    )
+    resetProcess()
+    expect(await prepare()).toBe('state-home')
+    expect(readFileSync(join(configDir(), VAULT_STATE), 'utf8')).toBe(
+      files[VAULT_STATE] as string,
+    )
+    expect(existsSync(join(configDir(), VAULT_TOKEN))).toBe(false)
+  })
+
   it('Disconnect on this version removes the leftover, and an older version then reads local', async () => {
     seed(configDir(), oldLayout())
     await prepare()
