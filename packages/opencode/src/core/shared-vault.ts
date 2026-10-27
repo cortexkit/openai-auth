@@ -6,6 +6,7 @@ import {
   type OpenAiVaultOptions,
 } from '@cortexkit/openai-auth-core/internal'
 import { createLogger } from '../logger'
+import { removeMovedVaultStateLeftover } from './runtime-layout'
 
 const log = createLogger('vault')
 const QUOTA_POLL_INTERVAL_MS = 60_000
@@ -69,6 +70,20 @@ export function acquireOpenCodeVault(
       // reserved. A released holder is no longer in the set and is never asked.
       reservedRouteIds: () =>
         new Set([...holders].flatMap((live) => [...live.reservedRouteIds()])),
+      afterDisconnect: async () => {
+        await options.afterDisconnect?.()
+        // The runtime-file move leaves the approved enrollment state in the
+        // config folder's old vault folder so older versions stay in vault
+        // mode; once this host disconnects, that copy goes too. A failure
+        // leaves older versions refusing, which is the safe side.
+        try {
+          await removeMovedVaultStateLeftover(stateDir)
+        } catch (error) {
+          log.warn('could not remove the old vault enrollment state', {
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+      },
     })
     entry = {
       vault,

@@ -6,6 +6,7 @@
 // than named imports, so each one fails on its own assertion against a build
 // that lacks them instead of the whole file failing to load.
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { createHash } from 'node:crypto'
 import {
   chmodSync,
   existsSync,
@@ -50,6 +51,7 @@ import {
   RUNTIME_LAYOUT_DEFERRED_MESSAGE,
   type RuntimeLayoutOptions,
 } from '../core/runtime-layout'
+import { acquireOpenCodeVault } from '../core/shared-vault'
 import { processHeartbeatDir } from '../core/version-fence'
 import { restoreEnv, unsetEnv } from './setup-env'
 
@@ -161,6 +163,22 @@ function present(dir: string, files: Record<string, string>) {
 
 const absent = (files: Record<string, string>) =>
   Object.fromEntries(Object.keys(files).map((relative) => [relative, null]))
+
+/** The approved enrollment state file, relative to the config folder. */
+const VAULT_STATE = 'openai-auth-vault/opencode-enrollment-state.json'
+
+/**
+ * What a finished move leaves of `files` in the config folder: only an
+ * approved enrollment state file, byte for byte, so older versions stay in
+ * vault mode.
+ */
+const leftAfterMove = (files: Record<string, string>) => ({
+  ...absent(files),
+  ...(VAULT_STATE in files ? { [VAULT_STATE]: files[VAULT_STATE] } : {}),
+})
+
+const sha256 = (text: string) =>
+  createHash('sha256').update(text, 'utf8').digest('hex')
 
 function marker(dir = runtimeDir()) {
   const path = join(dir, 'layout.json')
@@ -305,8 +323,11 @@ describe('moving an existing layout', () => {
     expect(await prepare()).toBe('state-home')
 
     expect(present(runtimeDir(), files)).toEqual(files)
-    expect(present(configDir(), files)).toEqual(absent(files))
-    expect(existsSync(join(configDir(), 'openai-auth-vault'))).toBe(false)
+    expect(present(configDir(), files)).toEqual(leftAfterMove(files))
+    // Only the approved enrollment state stays in the old vault folder.
+    expect(readdirSync(join(configDir(), 'openai-auth-vault'))).toEqual([
+      'opencode-enrollment-state.json',
+    ])
     // The settings file stays where OpenCode users edit it.
     expect(readFileSync(join(configDir(), 'openai-auth.json'), 'utf8')).toBe(
       '{"keep":true}\n',
@@ -369,7 +390,7 @@ describe('moving an existing layout', () => {
       ...remaining,
       'openai-auth-sessions.json': null,
     })
-    expect(present(configDir(), changed)).toEqual(absent(changed))
+    expect(present(configDir(), changed)).toEqual(leftAfterMove(changed))
   })
 
   it('a crash after the marker: the next start removes identical leftovers and keeps differing sessions', async () => {
@@ -387,6 +408,7 @@ describe('moving an existing layout', () => {
     expect(marker()).toEqual({
       version: 1,
       oldDir: runtimeLayoutLocation().key,
+      keptVaultState: sha256(files[VAULT_STATE] as string),
     })
     expect(present(configDir(), files)).toEqual(files)
     expect(present(runtimeDir(), files)).toEqual(files)
@@ -396,7 +418,7 @@ describe('moving an existing layout', () => {
     resetProcess()
     expect(await prepare()).toBe('state-home')
     const { 'openai-auth-sessions.json': _kept, ...identical } = files
-    expect(present(configDir(), identical)).toEqual(absent(identical))
+    expect(present(configDir(), identical)).toEqual(leftAfterMove(identical))
     expect(readFileSync(differing, 'utf8')).toBe('{"downgrade":true}\n')
     expect(present(runtimeDir(), files)).toEqual(files)
     expect(marker()?.oldFilesRemoved).toBe(true)
@@ -688,7 +710,7 @@ describe('processes that could still write the old files', () => {
     resetProcess()
     expect(await prepare()).toBe('state-home')
     expect(present(runtimeDir(), files)).toEqual(files)
-    expect(present(configDir(), files)).toEqual(absent(files))
+    expect(present(configDir(), files)).toEqual(leftAfterMove(files))
   })
 
   it('a heartbeat without layouts predates the move and defers it, even at the same version', async () => {
@@ -756,7 +778,7 @@ describe('processes that could still write the old files', () => {
       join(runtimeDir(), 'openai-auth-state.json'),
     )
     expect(present(runtimeDir(), files)).toEqual(files)
-    expect(present(configDir(), files)).toEqual(absent(files))
+    expect(present(configDir(), files)).toEqual(leftAfterMove(files))
   })
 
   it('two processes starting together produce one move and identical files', async () => {
@@ -772,7 +794,7 @@ describe('processes that could still write the old files', () => {
     ])
     expect(one.result.statePath).toBe(two.result.statePath as string)
     expect(present(runtimeDir(), files)).toEqual(files)
-    expect(present(configDir(), files)).toEqual(absent(files))
+    expect(present(configDir(), files)).toEqual(leftAfterMove(files))
     expect(marker()?.oldFilesRemoved).toBe(true)
     expect(
       readdirSync(runtimeDir()).filter((name) => name.includes('.tmp')),
@@ -954,6 +976,250 @@ describe('paths the move must not touch', () => {
       expect(
         JSON.parse(readFileSync(join(dir, 'config-dir.json'), 'utf8')),
       ).toEqual({ version: 1, configDir: config })
+  })
+})
+
+/** The vault mode an older version reads from OpenCode's config folder. */
+function oldFolderAuthority() {
+  return enrollmentAuthority(
+    hostEnrollmentPaths({
+      stateDir: join(configDir(), 'openai-auth-vault'),
+      host: 'opencode',
+    }),
+    vaultEnrollmentName('opencode'),
+  )
+}
+
+/** Another process takes the layout lease over from this one. */
+function stealLayoutLease() {
+  writeFileSync(
+    layoutLockPath(),
+    JSON.stringify({
+      ownerId: 'another-process',
+      expiresAt: Date.now() + 60_000,
+    }),
+  )
+}
+
+const layoutLockPath = () =>
+  `${join(runtimeDir(), 'layout.json')}.runtime-layout.lock`
+
+/** The old layout with an enrollment that was never approved. */
+function pendingLayout(): Record<string, string> {
+  return {
+    ...oldLayout(),
+    [VAULT_STATE]: `${JSON.stringify({
+      version: 1,
+      phase: 'pending',
+      proposedName: vaultEnrollmentName('opencode'),
+      createdAt: 1,
+      updatedAt: 1,
+    })}\n`,
+  }
+}
+
+describe('an approved vault enrollment and older versions', () => {
+  it('the move removes the old token but leaves the old state, so an older version stays in vault mode', async () => {
+    const files = oldLayout()
+    seed(configDir(), files)
+    expect(await prepare()).toBe('state-home')
+    expect(
+      existsSync(
+        join(configDir(), 'openai-auth-vault/opencode-enrollment.json'),
+      ),
+    ).toBe(false)
+    expect(readFileSync(join(configDir(), VAULT_STATE), 'utf8')).toBe(
+      files[VAULT_STATE] as string,
+    )
+    expect(marker()).toMatchObject({
+      oldFilesRemoved: true,
+      keptVaultState: sha256(files[VAULT_STATE] as string),
+    })
+    // An older version reads the old folder: approved without a token is
+    // vault mode with a missing token, never local.
+    expect(await oldFolderAuthority()).toBe('vault')
+    expect(await authority()).toBe('vault')
+  })
+
+  it('the next start accepts the leftover without a conflict or a warning', async () => {
+    const files = oldLayout()
+    seed(configDir(), files)
+    await prepare()
+    resetProcess()
+    logged = []
+    expect(await prepare()).toBe('state-home')
+    expect(logged.filter((line) => line.level === 'warn')).toEqual([])
+    expect(readFileSync(join(configDir(), VAULT_STATE), 'utf8')).toBe(
+      files[VAULT_STATE] as string,
+    )
+  })
+
+  it('anything else at the leftover path is still a conflict', async () => {
+    const files = oldLayout()
+    seed(configDir(), files)
+    await prepare()
+    // An older version rewrote the state (same phase, a newer timestamp).
+    const rewritten = (files[VAULT_STATE] as string).replace(
+      '"updatedAt":1',
+      '"updatedAt":2',
+    )
+    expect(rewritten).not.toBe(files[VAULT_STATE])
+    writePrivate(join(configDir(), VAULT_STATE), rewritten)
+    resetProcess()
+    await expect(prepare()).rejects.toMatchObject({
+      name: 'RuntimeLayoutRefusal',
+      message: credentialConflictMessage(VAULT_STATE),
+    })
+    expect(readFileSync(join(configDir(), VAULT_STATE), 'utf8')).toBe(rewritten)
+  })
+
+  it('an enrollment that was never approved is removed as before', async () => {
+    const files = pendingLayout()
+    seed(configDir(), files)
+    expect(await prepare()).toBe('state-home')
+    expect(present(configDir(), files)).toEqual(absent(files))
+    expect(existsSync(join(configDir(), 'openai-auth-vault'))).toBe(false)
+    expect(marker()?.keptVaultState).toBeUndefined()
+  })
+
+  it('Disconnect on this version removes the leftover, and an older version then reads local', async () => {
+    seed(configDir(), oldLayout())
+    await prepare()
+    const lease = acquireOpenCodeVault(
+      {
+        host: 'opencode',
+        stateDir: vaultStateDir(getAccountPaths().statePath),
+        connectionFile: () => join(root, 'no-vault.json'),
+        pollIntervalMs: 0,
+      },
+      getAccountPaths(),
+    )
+    try {
+      await lease.vault.disconnect()
+    } finally {
+      lease.release()
+    }
+    expect(existsSync(join(configDir(), VAULT_STATE))).toBe(false)
+    expect(existsSync(join(configDir(), 'openai-auth-vault'))).toBe(false)
+    expect(await oldFolderAuthority()).toBe('local')
+    expect(await authority()).toBe('local')
+  })
+
+  it('Disconnect leaves a state file at the leftover path that the move did not leave', async () => {
+    seed(configDir(), oldLayout())
+    await prepare()
+    const other = '{"someone-elses":true}\n'
+    writePrivate(join(configDir(), VAULT_STATE), other)
+    const lease = acquireOpenCodeVault(
+      {
+        host: 'opencode',
+        stateDir: vaultStateDir(getAccountPaths().statePath),
+        connectionFile: () => join(root, 'no-vault.json'),
+        pollIntervalMs: 0,
+      },
+      getAccountPaths(),
+    )
+    try {
+      await lease.vault.disconnect()
+    } finally {
+      lease.release()
+    }
+    expect(readFileSync(join(configDir(), VAULT_STATE), 'utf8')).toBe(other)
+  })
+})
+
+describe('the layout lease before every removal', () => {
+  it('a lease lost right before an old file is unlinked removes nothing', async () => {
+    const files = oldLayout()
+    seed(configDir(), files)
+    const removing: string[] = []
+    await prepare({
+      steps: {
+        beforeRemove: (path) => {
+          removing.push(path)
+          if (removing.length === 1) stealLayoutLease()
+        },
+      },
+    })
+    expect(removing[0]).toBe(join(configDir(), 'openai-auth-state.json'))
+    expect(present(configDir(), files)).toEqual(files)
+    expect(marker()?.oldFilesRemoved).not.toBe(true)
+  })
+
+  it('a lease lost right before the manifest is removed keeps it; the next start removes it', async () => {
+    const files = oldLayout()
+    seed(configDir(), files)
+    const manifest = join(runtimeDir(), 'layout-moving.json')
+    await prepare({
+      steps: {
+        beforeRemove: (path) => {
+          if (path === manifest) stealLayoutLease()
+        },
+      },
+    })
+    expect(marker()?.oldFilesRemoved).toBe(true)
+    expect(existsSync(manifest)).toBe(true)
+
+    rmSync(layoutLockPath(), { force: true })
+    resetProcess()
+    expect(await prepare()).toBe('state-home')
+    expect(existsSync(manifest)).toBe(false)
+  })
+
+  it('a manifest left after a finished move is removed at the next start', async () => {
+    seed(configDir(), oldLayout())
+    await prepare()
+    const manifest = join(runtimeDir(), 'layout-moving.json')
+    // As if the move stopped between its last marker write and this removal.
+    writePrivate(
+      manifest,
+      `${JSON.stringify({ version: 1, files: [join(runtimeDir(), 'openai-auth-state.json')] })}\n`,
+    )
+    resetProcess()
+    expect(await prepare()).toBe('state-home')
+    expect(existsSync(manifest)).toBe(false)
+    expect(existsSync(join(runtimeDir(), 'openai-auth-state.json'))).toBe(true)
+  })
+
+  it('a lease lost right before the old vault folder is removed keeps the folder', async () => {
+    seed(configDir(), pendingLayout())
+    const oldVault = join(configDir(), 'openai-auth-vault')
+    await prepare({
+      steps: {
+        beforeRemove: (path) => {
+          if (path === oldVault) stealLayoutLease()
+        },
+      },
+    })
+    expect(marker()?.oldFilesRemoved).toBe(true)
+    expect(existsSync(oldVault)).toBe(true)
+    expect(readdirSync(oldVault)).toEqual([])
+  })
+
+  it('cleanup after a crash reads the fence again under the data locks', async () => {
+    const files = oldLayout()
+    seed(configDir(), files)
+    await prepare({
+      steps: {
+        afterMarker: () => {
+          throw new Error('crash')
+        },
+      },
+    })
+    resetProcess()
+    let reads = 0
+    // Open before the locks; closed under them, as when a process on the
+    // legacy layout started while this one waited for them.
+    const fence = async () => {
+      reads++
+      return reads === 1
+        ? { open: true as const }
+        : { open: false as const, blockers: [] }
+    }
+    expect(await prepare({ fence })).toBe('state-home')
+    expect(reads).toBe(2)
+    expect(present(configDir(), files)).toEqual(files)
+    expect(marker()?.oldFilesRemoved).not.toBe(true)
   })
 })
 

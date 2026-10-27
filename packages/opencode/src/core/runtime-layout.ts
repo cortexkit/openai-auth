@@ -51,11 +51,23 @@
 //   token. Differing sessions stay. The marker then records that the old files
 //   are dealt with; reappeared credentials also refuse the start, while each
 //   process warns once about reappeared sessions and leaves them alone.
-// - The layout lock is checked again before every destructive step. A move
+// - A vault enrollment that is approved keeps one old file: the enrollment
+//   state file stays in the old vault folder, byte for byte the copy that
+//   moved, and only the old token is removed. Every version reads an approved
+//   state without a token as vault mode with a missing token, never as local,
+//   so an older version that still looks in the config folder refuses instead
+//   of serving local credentials. The marker records that file's SHA-256;
+//   later starts accept exactly those bytes there, and anything else at that
+//   path is a conflict like any other reappeared credential. Disconnect on
+//   this version removes it (`removeMovedVaultStateLeftover`).
+// - The layout lock is checked again before every destructive step, the
+//   removal of the move's `layout-moving.json` and of the old vault folder
+//   included; `layout-moving.json` is the last thing removed. A move
 //   that fails leaves the process on the legacy layout (registered) and logs
 //   the error class once; the next start tries again. Nothing here runs on a
 //   request.
 
+import { createHash } from 'node:crypto'
 import { type Dirent, realpathSync } from 'node:fs'
 import {
   chmod,
@@ -191,6 +203,12 @@ export interface RuntimeLayoutOptions {
   steps?: {
     afterCopy?: () => void | Promise<void>
     afterMarker?: () => void | Promise<void>
+    /**
+     * Runs right before each removal of an old file, of the move's
+     * `layout-moving.json` and of the old vault folder, ahead of the lease
+     * check that guards it.
+     */
+    beforeRemove?: (path: string) => void | Promise<void>
   }
   /** Test seam: how long to wait for the layout lock. */
   layoutLockWaitMs?: number
@@ -202,6 +220,11 @@ interface LayoutMarker {
   oldDir?: string
   /** Set once the old files were removed or knowingly left in place. */
   oldFilesRemoved?: boolean
+  /**
+   * SHA-256 (hex) of the approved enrollment state file the move leaves in
+   * the old vault folder; absent when the move left none there.
+   */
+  keptVaultState?: string
 }
 
 /** One runtime file and where it lives in each layout. */
@@ -346,8 +369,13 @@ async function decide(
   let marker = await readMarker(markerPath, stateDir)
   await assertOwnFolder(location, marker)
   if (marker?.oldFilesRemoved && !overrideInDestination) {
-    await noticeReappearedFiles(location, files, overrides, log)
-    return stateHome()
+    await noticeReappearedFiles(location, files, overrides, marker, log)
+    // A move that stopped right after its last marker write left its
+    // `layout-moving.json`; it is removed below, under the layout lock.
+    const manifestLeft = await exists(
+      join(stateDir, RUNTIME_LAYOUT_MANIFEST_FILE),
+    ).catch(() => true)
+    if (!manifestLeft) return stateHome()
   }
 
   // A state-home folder that is OpenCode's config folder itself (a link or a
@@ -403,7 +431,10 @@ async function decide(
         await finishOldFiles(location, files, markerPath, marker, lock, {
           fence,
           log,
+          steps: options.steps,
         })
+      else if (marker.oldFilesRemoved)
+        await removeLeftoverManifest(location, lock, options.steps, log)
       return await stateHome()
     }
     // Only a process that resolves every runtime file at its default place
@@ -588,22 +619,33 @@ async function moveFiles(
 
     await layoutLock.assertOwned()
     for (const lock of locks) await lock.assertOwned()
-    const marker: LayoutMarker = { version: 1, oldDir: location.key }
+    const keptVaultState = await keepableVaultState(files, present)
+    const marker: LayoutMarker = {
+      version: 1,
+      oldDir: location.key,
+      ...(keptVaultState ? { keptVaultState } : {}),
+    }
     input.onMarker()
     await writeMarker(markerPath, marker)
     await input.steps?.afterMarker?.()
 
     await layoutLock.assertOwned()
-    await removeOldCopies(location, present, layoutLock, input.log)
+    await removeOldCopies(location, present, layoutLock, {
+      log: input.log,
+      keptVaultState,
+      steps: input.steps,
+    })
     oldVaultEmptied = true
+    await layoutLock.assertOwned()
     await writeMarker(markerPath, { ...marker, oldFilesRemoved: true })
-    await removeManifest(stateDir)
+    await removeManifestOwned(stateDir, layoutLock, input.steps)
     return { kind: 'moved', moved: present.length > 0 }
   } finally {
     for (const lock of locks.reverse()) await lock.release().catch(() => {})
     // The roster lock is released now, so the emptied old vault folder can
     // go; rmdir leaves a folder that still holds anything.
-    if (oldVaultEmptied) await rmdir(files.vault.old).catch(() => {})
+    if (oldVaultEmptied)
+      await removeOldVaultFolder(files, layoutLock, input.steps)
   }
 }
 
@@ -622,6 +664,7 @@ async function finishOldFiles(
   input: {
     fence: () => Promise<VersionFenceResult>
     log: RuntimeLayoutLogger
+    steps?: RuntimeLayoutOptions['steps']
   },
 ): Promise<void> {
   let locks: RefreshFileLock[] = []
@@ -629,10 +672,14 @@ async function finishOldFiles(
   // Which step failed, for the warning below.
   let step = 'fence'
   try {
-    const gate = await input.fence()
-    if (!gate.open) return
+    // Read first so a closed fence does not wait for the data locks, and
+    // again under them, as the move does: a process that started meanwhile
+    // and kept the legacy layout has recorded it by then.
+    if (!(await input.fence()).open) return
     step = 'data-locks'
     locks = await takeDataLocks(location, files)
+    step = 'fence'
+    if (!(await input.fence()).open) return
     step = 'same-file-check'
     const aliases = await physicalAliases(location, files)
     if (aliases.length > 0) {
@@ -646,18 +693,17 @@ async function finishOldFiles(
     }
     step = 'remove-old-copies'
     await layoutLock.assertOwned()
-    await removeOldCopies(
-      location,
-      await presentOldFiles(files),
-      layoutLock,
-      input.log,
-    )
+    await removeOldCopies(location, await presentOldFiles(files), layoutLock, {
+      log: input.log,
+      keptVaultState: marker.keptVaultState,
+      steps: input.steps,
+    })
     done = true
     step = 'marker'
     await layoutLock.assertOwned()
     await writeMarker(markerPath, { ...marker, oldFilesRemoved: true })
     step = 'manifest'
-    await removeManifest(location.stateHomeDir)
+    await removeManifestOwned(location.stateHomeDir, layoutLock, input.steps)
   } catch (error) {
     if (error instanceof RuntimeLayoutRefusal) throw error
     logOnce(`${location.key}\0cleanup`, () =>
@@ -673,8 +719,61 @@ async function finishOldFiles(
     )
   } finally {
     for (const lock of locks.reverse()) await lock.release().catch(() => {})
-    if (done) await rmdir(files.vault.old).catch(() => {})
+    if (done) await removeOldVaultFolder(files, layoutLock, input.steps)
   }
+}
+
+/**
+ * Remove the `layout-moving.json` a move left behind when it stopped after
+ * marking its old files dealt with; the caller holds the layout lock. A
+ * failure is logged and retried at the next start.
+ */
+async function removeLeftoverManifest(
+  location: RuntimeLayoutLocation,
+  layoutLock: RefreshFileLock,
+  steps: RuntimeLayoutOptions['steps'],
+  log: RuntimeLayoutLogger,
+): Promise<void> {
+  try {
+    await removeManifestOwned(location.stateHomeDir, layoutLock, steps)
+  } catch (error) {
+    logOnce(`${location.key}\0manifest`, () =>
+      log.warn(
+        `openai-auth could not remove ${RUNTIME_LAYOUT_MANIFEST_FILE} from its state folder; it tries again at the next start`,
+        { stateDir: location.stateHomeDir, errorClass: errorClass(error) },
+      ),
+    )
+  }
+}
+
+/** Remove the move's manifest once the layout lock is confirmed still held. */
+async function removeManifestOwned(
+  stateDir: string,
+  layoutLock: RefreshFileLock,
+  steps: RuntimeLayoutOptions['steps'],
+): Promise<void> {
+  const path = join(stateDir, RUNTIME_LAYOUT_MANIFEST_FILE)
+  if (!(await exists(path))) return
+  await steps?.beforeRemove?.(path)
+  await layoutLock.assertOwned()
+  await removeManifest(stateDir)
+}
+
+/**
+ * Remove the old vault folder if it is empty, once the layout lock is
+ * confirmed still held. Best effort: rmdir leaves a folder that still holds
+ * anything, such as the enrollment state file a vault-mode move keeps.
+ */
+async function removeOldVaultFolder(
+  files: LayoutFiles,
+  layoutLock: RefreshFileLock,
+  steps: RuntimeLayoutOptions['steps'],
+): Promise<void> {
+  try {
+    await steps?.beforeRemove?.(files.vault.old)
+    await layoutLock.assertOwned()
+    await rmdir(files.vault.old)
+  } catch {}
 }
 
 /**
@@ -730,6 +829,88 @@ function layoutFiles(location: RuntimeLayoutLocation): LayoutFiles {
       next: join(location.stateHomeDir, name),
     })),
   }
+}
+
+const SHA256_HEX = /^[0-9a-f]{64}$/
+
+function sha256(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex')
+}
+
+/** OpenCode's vault enrollment state file, in both layouts. */
+function vaultStateFile(files: LayoutFiles): LayoutFile {
+  return {
+    old: vaultPaths(files.vault.old, 'opencode').statePath,
+    next: vaultPaths(files.vault.next, 'opencode').statePath,
+  }
+}
+
+/**
+ * The SHA-256 of the enrollment state file this move copied, when that state
+ * keeps a host in vault mode without its token: approved, or blocked because
+ * the token is missing. common-auth's `enrollmentAuthority` reads either one
+ * as 'vault' when no token is next to it, so leaving it in the old vault
+ * folder keeps an older version in vault mode. Any other state (pending,
+ * denied, unreadable) protects nothing, and the old copy is removed as usual.
+ */
+async function keepableVaultState(
+  files: LayoutFiles,
+  present: LayoutFile[],
+): Promise<string | undefined> {
+  const state = vaultStateFile(files)
+  if (!present.some((file) => file.old === state.old)) return undefined
+  // The copy, verified byte for byte against the old file.
+  const bytes = await readFile(state.next)
+  let value: { phase?: unknown; errorCode?: unknown } | null
+  try {
+    value = JSON.parse(bytes.toString('utf8'))
+  } catch {
+    return undefined
+  }
+  const vaultMode =
+    value?.phase === 'approved' ||
+    (value?.phase === 'blocked' && value.errorCode === 'missing_token')
+  return vaultMode ? sha256(bytes) : undefined
+}
+
+/** True when `path` holds exactly the bytes whose SHA-256 is `hash`. */
+async function isKeptVaultState(
+  path: string,
+  hash: string | undefined,
+): Promise<boolean> {
+  if (!hash) return false
+  try {
+    return sha256(await readFile(path)) === hash
+  } catch {
+    return false
+  }
+}
+
+/**
+ * After Disconnect, remove the enrollment state file a move left in the old
+ * vault folder, so an older version no longer reads this host as enrolled.
+ * Acts only for this config folder's state-home vault folder (`vaultDir`) and
+ * only on exactly the bytes the marker recorded; anything else there stays.
+ * The emptied old vault folder goes too.
+ */
+export async function removeMovedVaultStateLeftover(
+  vaultDir: string,
+): Promise<void> {
+  const location = runtimeLayoutLocation()
+  const files = layoutFiles(location)
+  if (resolve(vaultDir) !== resolve(files.vault.next)) return
+  const stateDir = location.stateHomeDir
+  const marker = await readMarker(
+    join(stateDir, RUNTIME_LAYOUT_MARKER_FILE),
+    stateDir,
+  )
+  if (!marker?.keptVaultState || marker.oldDir !== location.key) return
+  const leftover = vaultStateFile(files).old
+  if (!(await isKeptVaultState(leftover, marker.keptVaultState))) return
+  await unlink(leftover).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT') throw error
+  })
+  await rmdir(files.vault.old).catch(() => {})
 }
 
 /** Lock files, eviction markers and staged writes come and go with a writer. */
@@ -837,38 +1018,67 @@ async function copyVerified(file: LayoutFile): Promise<void> {
  * Remove each old file whose bytes equal its new copy, comparing again right
  * before every unlink attempt. Differing credentials refuse the start because
  * the old copy may hold the only live refresh token. Differing sessions, or
- * files that Windows will not let go of, stay. The caller holds the data locks.
+ * files that Windows will not let go of, stay. The approved enrollment state
+ * file whose SHA-256 the marker records (`keptVaultState`) stays on purpose
+ * and is not reported. The caller holds the data locks.
  */
 async function removeOldCopies(
   location: RuntimeLayoutLocation,
   present: LayoutFile[],
   layoutLock: RefreshFileLock,
-  log: RuntimeLayoutLogger,
+  input: {
+    log: RuntimeLayoutLogger
+    keptVaultState: string | undefined
+    steps?: RuntimeLayoutOptions['steps']
+  },
 ): Promise<void> {
   const kept: string[] = []
   const files = layoutFiles(location)
+  const keptState = vaultStateFile(files).old
   for (const file of present) {
     await layoutLock.assertOwned()
+    if (
+      file.old === keptState &&
+      (await isKeptVaultState(file.old, input.keptVaultState))
+    )
+      continue
     const credentials =
       file.old === files.state.old || insideOrSame(file.old, files.vault.old)
-    if (!(await unlinkIfIdentical(file, location.stateHomeDir, credentials)))
+    if (
+      !(await unlinkIfIdentical(file, location.stateHomeDir, credentials, () =>
+        beforeRemove(file.old, layoutLock, input.steps),
+      ))
+    )
       kept.push(file.old)
   }
   if (kept.length > 0)
-    log.warn(
+    input.log.warn(
       "openai-auth left old files in OpenCode's config folder; it no longer reads them",
       { configDir: location.configDir, kept },
     )
 }
 
+/** The test seam, then the lease check that must come right before a removal. */
+async function beforeRemove(
+  path: string,
+  layoutLock: RefreshFileLock,
+  steps: RuntimeLayoutOptions['steps'],
+): Promise<void> {
+  await steps?.beforeRemove?.(path)
+  await layoutLock.assertOwned()
+}
+
 /**
  * Unlink `file.old` only while its bytes equal `file.next`, retrying on
- * Windows while another process has it open. True when it is gone.
+ * Windows while another process has it open. `guard` runs right before every
+ * unlink attempt and throws when the removal must not happen. True when the
+ * file is gone.
  */
 async function unlinkIfIdentical(
   file: LayoutFile,
   stateDir: string,
   credentials: boolean,
+  guard: () => Promise<void>,
 ): Promise<boolean> {
   const started = performance.now()
   for (const delay of SHARING_RETRY_DELAYS_MS) {
@@ -891,6 +1101,7 @@ async function unlinkIfIdentical(
       if (credentials) throw credentialConflict(stateDir, file)
       return false
     }
+    await guard()
     try {
       await unlink(file.old)
       return true
@@ -911,6 +1122,7 @@ async function noticeReappearedFiles(
   location: RuntimeLayoutLocation,
   files: LayoutFiles,
   overrides: string[],
+  marker: LayoutMarker,
   log: RuntimeLayoutLogger,
 ): Promise<void> {
   // A file an override names is this process's own, wherever it is.
@@ -919,8 +1131,16 @@ async function noticeReappearedFiles(
   if (!own(files.state.old) && (await exists(files.state.old)))
     throw credentialConflict(location.stateHomeDir, files.state)
   if (!own(files.vault.old)) {
+    const keptState = vaultStateFile(files).old
     for (const name of await folderFiles(files.vault.old)) {
       const old = join(files.vault.old, name)
+      // The approved enrollment state file the move left on purpose, still
+      // exactly the bytes the marker recorded.
+      if (
+        old === keptState &&
+        (await isKeptVaultState(old, marker.keptVaultState))
+      )
+        continue
       if (!own(old))
         throw credentialConflict(location.stateHomeDir, {
           old,
@@ -982,6 +1202,10 @@ async function readMarker(
         version: 1,
         ...(typeof value.oldDir === 'string' ? { oldDir: value.oldDir } : {}),
         ...(value.oldFilesRemoved === true ? { oldFilesRemoved: true } : {}),
+        ...(typeof value.keptVaultState === 'string' &&
+        SHA256_HEX.test(value.keptVaultState)
+          ? { keptVaultState: value.keptVaultState }
+          : {}),
       }
   } catch {}
   throw new RuntimeLayoutRefusal(

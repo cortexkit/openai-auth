@@ -277,6 +277,11 @@ export interface OpenAiVaultOptions {
    */
   setTimeoutImpl?: typeof setTimeout
   clearTimeoutImpl?: typeof clearTimeout
+  /**
+   * Runs at the end of `disconnect`, after the token and state files are
+   * deleted, for host-specific cleanup of other enrollment files.
+   */
+  afterDisconnect?: () => Promise<void>
 }
 
 type VaultInsulaQuota = NonNullable<
@@ -1046,6 +1051,7 @@ export class OpenAiVault {
   async disconnect(): Promise<void> {
     await rm(this.paths.tokenPath, { force: true })
     await rm(this.paths.statePath, { force: true })
+    await this.#options.afterDisconnect?.()
     await this.authority()
     this.#lastError = undefined
     log.info('vault enrollment forgotten', { host: this.host })
