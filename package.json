@@ -33,7 +33,7 @@
     "@types/bun": "1.4.3",
     "bun-types": "1.4.3",
     "lefthook": "2.2.2",
-    "tsdown": "0.23.1",
+    "tsdown": "0.23.2",
     "typescript": "7.0.2"
   }
 }
