@@ -235,6 +235,8 @@ export interface SidebarState {
    * account's email when the vault knows it, else the vault's label.
    */
   vaultAccounts?: SidebarAccountState[]
+  /** Whether the vault supplied a roster snapshot, including an empty one. */
+  vaultDiscovered?: boolean
 }
 
 import { createHash } from 'node:crypto'
@@ -505,6 +507,9 @@ export function normalizeSidebarState(raw: unknown): SidebarState {
     ...(planType !== undefined ? { planType } : {}),
     ...(r.accountPool === true ? { accountPool: true } : {}),
     ...(vaultAccounts !== undefined ? { vaultAccounts } : {}),
+    ...(typeof r.vaultDiscovered === 'boolean'
+      ? { vaultDiscovered: r.vaultDiscovered }
+      : {}),
   }
 }
 
@@ -1134,6 +1139,7 @@ export type SidebarMachineState = Pick<
   | 'lastUpdated'
   | 'accountPool'
   | 'vaultAccounts'
+  | 'vaultDiscovered'
 > & { route: string }
 
 // The freshest signal across every timestamp a snapshot carries: either window
@@ -1419,6 +1425,7 @@ export function setSidebarMachineState(
           // Likewise taken from the snapshot: present only in vault mode, so
           // a snapshot written after a disconnect drops the vault accounts.
           vaultAccounts: machineState.vaultAccounts,
+          vaultDiscovered: machineState.vaultDiscovered,
         }
       },
       hooks,

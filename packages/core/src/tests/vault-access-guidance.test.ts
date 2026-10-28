@@ -59,6 +59,7 @@ async function menuLines(reach: VaultGrantReach | undefined) {
           proposedName: NAME,
           tokenGeneration: 1,
         },
+        discovered: true,
         accounts: [],
       }),
       routes: () => [],

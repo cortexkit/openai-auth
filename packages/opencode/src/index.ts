@@ -2758,7 +2758,7 @@ export async function CodexAuthPlugin(
             )
             await setSidebarMachineState(
               buildVaultSidebarMachineState(
-                vault.snapshot()?.rows ?? [],
+                vault.snapshot()?.rows,
                 new Set(vault.routes().map((route) => route.id)),
                 vaultStore,
                 Date.now(),

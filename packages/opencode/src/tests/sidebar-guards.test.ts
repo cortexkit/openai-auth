@@ -55,6 +55,34 @@ function vaultRow(
   }
 }
 
+test('sidebar distinguishes the first vault answer from an answered empty roster', async () => {
+  const path = file()
+  for (const rows of [undefined, []]) {
+    await setSidebarMachineState(
+      buildVaultSidebarMachineState(rows, new Set(), null, Date.now()),
+      path,
+    )
+    const state = await getSidebarState(path)
+    expect(state.vaultAccounts).toEqual([])
+    expect(state.vaultDiscovered).toBe(rows !== undefined)
+  }
+  expect(normalizeSidebarState({ vaultDiscovered: 'true' })).not.toHaveProperty(
+    'vaultDiscovered',
+  )
+  await setSidebarMachineState(
+    {
+      main: { quota: null, killed: false },
+      fallbacks: [],
+      route: 'main-first',
+      lastUpdated: Date.now(),
+    },
+    path,
+  )
+  const local = await getSidebarState(path)
+  expect(local.vaultAccounts).toBeUndefined()
+  expect(local.vaultDiscovered).toBeUndefined()
+})
+
 test('sidebar guards retain unavailable vault accounts separately from the host toggle', async () => {
   const path = file()
   const rows = [

@@ -1190,7 +1190,13 @@ function QuotaSidebar(props: {
           when={hasData()}
           fallback={
             <box marginTop={1} width='100%'>
-              <text fg={theme().textMuted}>{'Waiting for quota\u2026'}</text>
+              <text fg={theme().textMuted}>
+                {vaultMode()
+                  ? state().vaultDiscovered === true
+                    ? 'No vault accounts'
+                    : "Waiting for the vault's first answer"
+                  : 'Waiting for quota\u2026'}
+              </text>
             </box>
           }
         >

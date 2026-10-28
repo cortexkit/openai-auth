@@ -360,9 +360,10 @@ export function createVaultCommandMenu(
     const actions = section.actions
       .filter(
         (action) =>
-          slot === 'limits' ||
-          (slot === 'routing' &&
-            (action.id === 'mode' || action.id === 'order')),
+          view.status.accounts.length > 0 &&
+          (slot === 'limits' ||
+            (slot === 'routing' &&
+              (action.id === 'mode' || action.id === 'order'))),
       )
       .map((action) => forwardAction(source, slot, action))
     const mode = section.actions
@@ -377,8 +378,12 @@ export function createVaultCommandMenu(
       lines:
         slot === 'accounts'
           ? [
-              `${view.status.accounts.length} vault account${view.status.accounts.length === 1 ? '' : 's'}`,
-              `${view.routes.size} can route`,
+              ...(view.status.discovered
+                ? [
+                    `${view.status.accounts.length} vault account${view.status.accounts.length === 1 ? '' : 's'}`,
+                    `${view.routes.size} can route`,
+                  ]
+                : ["Connected · waiting for the vault's first answer"]),
               VAULT_MODE_LOCAL_NOTE,
             ]
           : [

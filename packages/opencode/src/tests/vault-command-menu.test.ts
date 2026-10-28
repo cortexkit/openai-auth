@@ -113,6 +113,7 @@ function vault(connected = true): OpenAiVault {
             scopes: [],
           }
         : { state: 'idle' },
+      discovered: connected,
       accounts: connected ? roster : [],
     }),
     identities: () =>
@@ -176,6 +177,81 @@ async function sections(connected = true) {
 }
 
 describe('vault command menu', () => {
+  test('both OpenCode menus wait for the first vault answer without an empty-access hint', async () => {
+    const gate = Promise.withResolvers<void>()
+    const daemon = await startMockDaemon({
+      directory: dir,
+      credentials: {},
+      grants: [],
+      listReplyGate: gate.promise,
+    })
+    const remote = new OpenAiVault({
+      host: 'opencode',
+      stateDir: join(dir, 'vault'),
+      connectionFile: () => daemon.connectionFile,
+      pollIntervalMs: 0,
+    })
+    mkdirSync(join(dir, 'vault'), { recursive: true })
+    writeFileSync(
+      remote.paths.tokenPath,
+      JSON.stringify({ token: 'ab'.repeat(32), token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    const ctx = { ...context(), vault: remote }
+    try {
+      const started = Date.now()
+      const first = await createOpenCodeMenu(ctx).open(invocation)
+      expect(Date.now() - started).toBeGreaterThanOrEqual(1_900)
+      expect(daemon.lists).toBe(1)
+      const second = await createOpenCodeMenu({ ...ctx, readOnly: true }).open(
+        invocation,
+      )
+      for (const payload of [first, second]) {
+        const section = payload.menu.sections.find((s) => s.id === 'vault')!
+        expect(section.lines).toContain(
+          "Connected · waiting for the vault's first answer",
+        )
+        expect(section.lines?.join('\n')).not.toMatch(
+          /0 accounts|ck auth grant|reclassify/,
+        )
+        expect(section.items).toEqual([])
+        expect(section.actions.map((a) => a.id)).toEqual(['disconnect'])
+        expect(
+          payload.menu.sections.find((s) => s.id === 'accounts')?.items,
+        ).toEqual([])
+        for (const id of ['accounts', 'quota', 'limits', 'routing']) {
+          expect(
+            payload.menu.sections.find((s) => s.id === id)?.actions,
+          ).toEqual([])
+        }
+      }
+      expect(await remote.status()).toMatchObject({
+        discovered: false,
+        accounts: [],
+      })
+      gate.resolve()
+      await remote.refresh()
+      expect(await remote.status()).toMatchObject({
+        discovered: true,
+        accounts: [],
+      })
+      for (const readOnly of [false, true]) {
+        const { menu } = await createOpenCodeMenu({ ...ctx, readOnly }).open(
+          invocation,
+        )
+        const section = menu.sections.find((s) => s.id === 'vault')!
+        expect(section.lines).toContain('Connected · 0 accounts')
+        expect(section.lines?.join('\n')).toContain(
+          'The vault has no grant letting openai-auth-opencode read OpenAI accounts.',
+        )
+      }
+    } finally {
+      gate.resolve()
+      remote.close()
+      await daemon.stop()
+    }
+  }, 10_000)
+
   test('vault order by displayed name writes the roster and the next request follows it on both OpenCode menus', async () => {
     const daemon = await startMockDaemon({
       directory: dir,

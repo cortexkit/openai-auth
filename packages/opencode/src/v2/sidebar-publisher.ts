@@ -160,7 +160,7 @@ class SidebarPublisher {
           : loadAccounts(producer.paths))
         const machine = vaultMode
           ? buildVaultSidebarMachineState(
-              producer.vault.snapshot()?.rows ?? [],
+              producer.vault.snapshot()?.rows,
               new Set(producer.vault.routes().map((route) => route.id)),
               store,
               Date.now(),

@@ -738,13 +738,15 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
       return {
         lines: [
           connected
-            ? `Connected · ${status.accounts.length} account${status.accounts.length === 1 ? '' : 's'}`
+            ? status.discovered
+              ? `Connected · ${status.accounts.length} account${status.accounts.length === 1 ? '' : 's'}`
+              : "Connected · waiting for the vault's first answer"
             : status.enrollment.state === 'idle'
               ? 'Not connected'
               : `Enrollment ${status.enrollment.state}`,
           vaultEnrollmentLine(status.host, status.name, status.enrollment),
           ...vaultApprovalInstructions(status.name, status.enrollment),
-          ...(connected
+          ...(connected && status.discovered
             ? [
                 status.accounts.length === 0
                   ? vaultEmptyAccessHint(status.name, vault.grantReach())

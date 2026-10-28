@@ -439,18 +439,29 @@ try {
   assert.match(frame(), /deficit 20%/)
   assert.equal(registrations, 1)
 
-  for (const missing of ['absent', 'unreadable', 'data-less', 'empty-vault']) {
+  for (const missing of [
+    'absent',
+    'unreadable',
+    'data-less',
+    'pending-vault',
+    'empty-vault',
+  ]) {
     if (missing === 'absent') rmSync(stateFile)
     else if (missing === 'unreadable') writeFileSync(stateFile, '{broken')
     else
       publish({
         main: { quota: null, killed: false },
         fallbacks: [],
-        ...(missing === 'empty-vault' ? { vaultAccounts: [] } : {}),
+        ...(missing.endsWith('-vault')
+          ? { vaultAccounts: [], vaultDiscovered: missing === 'empty-vault' }
+          : {}),
       })
     await tick()
     parity()
-    assert.match(frame(), /Waiting for quota…/)
+    if (missing === 'empty-vault') assert.match(frame(), /No vault accounts/)
+    else if (missing === 'pending-vault')
+      assert.match(frame(), /Waiting for the vault's first answer/)
+    else assert.match(frame(), /Waiting for quota…/)
     assert.doesNotMatch(frame(), /60% left|80% left/)
   }
   const oldRefresh = [...polls.values()][0]

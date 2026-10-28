@@ -632,6 +632,56 @@ describe('Pi in vault mode', () => {
     }
   })
 
+  test('Pi /openai waits for the first vault answer without an empty-access hint', async () => {
+    const gate = Promise.withResolvers<void>()
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: {},
+      grants: [],
+      listReplyGate: gate.promise,
+    })
+    const target = vault()
+    const runtime = runtimeWith(target, volatileSlot())
+    try {
+      enroll()
+      const started = Date.now()
+      const { menu } = await createPiMenu(runtime.commandSupport()).open({
+        notify() {},
+      })
+      expect(Date.now() - started).toBeGreaterThanOrEqual(1_900)
+      expect(daemon.lists).toBe(1)
+      expect(await target.status()).toMatchObject({
+        discovered: false,
+        accounts: [],
+      })
+      const section = menu.sections.find((s) => s.id === 'vault')!
+      expect(section.lines).toContain(
+        "Connected · waiting for the vault's first answer",
+      )
+      expect(section.lines?.join('\n')).not.toMatch(
+        /0 accounts|ck auth grant|reclassify/,
+      )
+      expect(section.items).toEqual([])
+      expect(section.actions.map((a) => a.id)).toEqual(['disconnect'])
+      expect(menu.sections.find((s) => s.id === 'accounts')?.items).toEqual([])
+      gate.resolve()
+      await target.refresh()
+      expect(await target.status()).toMatchObject({
+        discovered: true,
+        accounts: [],
+      })
+      const answered = await createPiMenu(runtime.commandSupport()).open({
+        notify() {},
+      })
+      expect(
+        answered.menu.sections.find((s) => s.id === 'vault')?.lines,
+      ).toContain('Connected · 0 accounts')
+    } finally {
+      gate.resolve()
+      target.close()
+    }
+  }, 10_000)
+
   // A vault that lists no account says why when it reports Pi's grants. The
   // menu's Vault section and the request refusal give the same fix.
   for (const [name, grants, refusal, menuHint] of [

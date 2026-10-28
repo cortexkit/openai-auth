@@ -101,7 +101,7 @@ export function sidebarQuotaFromPoolMap(
  * its last reading.
  */
 export function buildVaultSidebarMachineState(
-  rows: readonly VaultRosterRow[],
+  rows: readonly VaultRosterRow[] | undefined,
   routable: ReadonlySet<string>,
   store:
     | Pick<AccountStorage, 'routing' | 'killswitch' | 'quota'>
@@ -109,15 +109,17 @@ export function buildVaultSidebarMachineState(
     | undefined,
   now: number,
 ): SidebarMachineState {
+  const accounts = rows ?? []
   const verdicts = poolKillswitchVerdicts(
-    rows.map((row) => ({ id: row.routeId, quota: row.quota })),
+    accounts.map((row) => ({ id: row.routeId, quota: row.quota })),
     { version: 1, accounts: [], ...store },
     now,
   )
   return {
     main: { quota: null, killed: false },
     fallbacks: [],
-    vaultAccounts: rows.map((row) => {
+    vaultDiscovered: rows !== undefined,
+    vaultAccounts: accounts.map((row) => {
       const credits = row.quota?.counters?.resetCredits?.value
       return {
         id: row.routeId,

@@ -240,6 +240,8 @@ export interface VaultStatus {
   /** The name this host enrolls as. */
   name: string
   enrollment: ClaustrumEnrollmentStatus
+  /** Whether a roster snapshot exists, including an answered empty list. */
+  discovered: boolean
   /** Every vault account this host can see, declined and cold ones included. */
   accounts: readonly VaultRosterRow[]
   lastError?: string
@@ -966,11 +968,13 @@ export class OpenAiVault {
             : 'unreadable-state',
       }
     }
+    const snapshot = this.enrolled() ? this.snapshot() : undefined
     return {
       host: this.host,
       name: this.name,
       enrollment,
-      accounts: this.enrolled() ? (this.snapshot()?.rows ?? []) : [],
+      discovered: snapshot !== undefined,
+      accounts: snapshot?.rows ?? [],
       ...(this.#lastError ? { lastError: this.#lastError } : {}),
     }
   }

@@ -169,6 +169,8 @@ export async function startMockDaemon(input: {
   category?: string
   refreshAdapter?: string
   grants?: MockDaemon['grants']
+  /** Hold list replies until released, even while other vault calls continue. */
+  listReplyGate?: Promise<void>
 }): Promise<MockDaemon> {
   const category = input.category ?? 'openai-native'
   const adapter = input.refreshAdapter ?? 'openai'
@@ -578,11 +580,17 @@ export async function startMockDaemon(input: {
           openWatch(socket, header, 'vault', state.watch)
           continue
         }
-        writeResponse(
-          socket,
-          header,
-          handle(request.method, request.params ?? {}),
-        )
+        const reply = handle(request.method, request.params ?? {})
+        if (
+          request.method === 'credential.list_scoped' &&
+          input.listReplyGate
+        ) {
+          void input.listReplyGate.then(() => {
+            if (!socket.destroyed) writeResponse(socket, header, reply)
+          })
+        } else {
+          writeResponse(socket, header, reply)
+        }
       }
     })
   })
