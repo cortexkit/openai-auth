@@ -1575,9 +1575,15 @@ export async function CodexAuthPlugin(
       async models(provider, ctx) {
         if (ctx.auth?.type !== 'oauth') return provider.models
 
-        const storage = await loadAccountSettings(
-          getAccountPaths(getConfigPath()),
-        )
+        // Vault mode never reads the local credential store (its state file
+        // may be corrupt or hold unused local credentials); the catalogue
+        // choice only needs the cost-zeroing preference, which the settings
+        // projection carries. Local mode keeps reading the full store, as it
+        // always has.
+        const storage =
+          (await vault.authority()) !== 'local'
+            ? await loadAccountSettings(getAccountPaths(getConfigPath()))
+            : await loadAccounts(getAccountPaths(getConfigPath()))
         const zeroCosts = !storage || isCostZeroingEnabled(storage)
         const catalog = zeroCosts ? null : await loadModelsDevCosts()
         if (!zeroCosts && catalog && !loggedCostRestoration) {
@@ -1722,7 +1728,6 @@ export async function CodexAuthPlugin(
         // a request's read overruns its budget, and the fallback if a display
         // write cannot read the current config.
         let lastRequestStorage = storage
-        let localStorageLoaded = !loaderVaultMode
 
         // Request routing and sidebar projections share this stat-gated read.
         // A loader can be idle while another process changes routing, so a
@@ -1748,33 +1753,15 @@ export async function CodexAuthPlugin(
           },
         })
 
-        async function loadCurrentStorageForDisplay(
-          authority?: 'local' | 'vault' | 'unreadable',
-        ) {
-          if ((authority ?? (await vault.authority())) !== 'local') {
-            // Preferences never seed the local read cache. After disconnect,
-            // even an unchanged config must reload the current credentials.
-            localStorageLoaded = false
-            currentStorageReader.invalidate()
-            return loadAccountSettings(getAccountPaths(getConfigPath()))
-          }
+        function loadCurrentStorageForDisplay() {
           return currentStorageReader.read()
         }
 
         // Request reads wait only for the hot-path budget. A changed config is
         // read in the background and serves the next request if it is slow.
-        async function loadRequestAccounts(
-          authority?: 'local' | 'vault' | 'unreadable',
-        ) {
-          const mode = authority ?? (await vault.authority())
-          if (mode !== 'local') return loadCurrentStorageForDisplay(mode)
-          if (!localStorageLoaded) {
-            const current = await loadCurrentStorageForDisplay(mode)
-            localStorageLoaded = true
-            return current
-          }
+        async function loadRequestAccounts() {
           return settleWithinBudget(
-            loadCurrentStorageForDisplay(mode),
+            Promise.resolve(loadCurrentStorageForDisplay()),
             HOT_PATH_READ_BUDGET_MS,
             () => lastRequestStorage,
           )
@@ -2751,22 +2738,22 @@ export async function CodexAuthPlugin(
           qm: QuotaManager,
           mainAccountIdentity?: string,
         ) {
-          const currentStorage = loadCurrentStorageForDisplay()
-          const store =
-            currentStorage instanceof Promise
-              ? await currentStorage.catch(() => lastRequestStorage)
-              : currentStorage
-          const displayMainAccountIdentity =
-            mainAccountIdentity ?? store?.mainAccountId
-          // Vault mode: the sidebar lists the vault accounts that serve this
-          // host, with the quota the vault roster holds for each. No local
-          // account is read for it.
+          // Vault mode never reads the local store: its state file may be
+          // corrupt or hold unused local credentials. The cached enrolled
+          // check keeps the local path exactly as before, with no extra
+          // authority read on the display path.
           if (vault.enrolled()) {
+            // Preferences never seed the local read cache. After disconnect,
+            // even an unchanged config must reload the current credentials.
+            currentStorageReader.invalidate()
+            const vaultStore = await loadAccountSettings(
+              getAccountPaths(getConfigPath()),
+            )
             await setSidebarMachineState(
               buildVaultSidebarMachineState(
                 vault.snapshot()?.rows ?? [],
                 new Set(vault.routes().map((route) => route.id)),
-                store,
+                vaultStore,
                 Date.now(),
               ),
               boundSidebarFile,
@@ -2774,6 +2761,13 @@ export async function CodexAuthPlugin(
             )
             return
           }
+          const currentStorage = loadCurrentStorageForDisplay()
+          const store =
+            currentStorage instanceof Promise
+              ? await currentStorage.catch(() => lastRequestStorage)
+              : currentStorage
+          const displayMainAccountIdentity =
+            mainAccountIdentity ?? store?.mainAccountId
           // A migrated install's accounts are the pool's rows: row `main` is
           // the main account and the rest follow in roster order, with the
           // quota the pool holds for each.
@@ -4557,7 +4551,12 @@ export async function CodexAuthPlugin(
               requestHeaders.get('x-parent-session-id')?.trim() || undefined
             // Main-first and fallback-first select per request; sticky-balanced
             // resolves a per-session pin from sidebar state before sending.
-            const reqStorage = await loadRequestAccounts(authority)
+            // Vault mode never reads the local store; local mode reads it
+            // exactly as before, within the hot-path budget.
+            const reqStorage =
+              authority !== 'local'
+                ? await loadAccountSettings(getAccountPaths(getConfigPath()))
+                : await loadRequestAccounts()
 
             // Vault mode (this host is enrolled with the Claustrum vault):
             // only the vault's accounts serve. OpenCode's slot, the pool rows
