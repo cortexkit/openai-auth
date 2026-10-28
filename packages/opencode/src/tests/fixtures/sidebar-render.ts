@@ -8,6 +8,10 @@ import { createSignal } from 'solid-js'
 import type { SidebarState } from '../../sidebar-state'
 
 const root = mkdtempSync(join(tmpdir(), 'openai-sidebar-render-'))
+// The version the sidebar header shows, from the plugin's package.json.
+const PACKAGE_VERSION: string = JSON.parse(
+  readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'),
+).version
 const stateFile = join(root, 'sidebar.json')
 const prefsFile = join(root, 'preferences.jsonc')
 const accountFile = join(root, 'accounts.json')
@@ -350,7 +354,13 @@ try {
   })
   await tick()
   parity()
-  assert.match(frame(), /LIMITED/)
+  // The header keeps the plugin's version while something is wrong: blocked
+  // accounts and backoffs show on their own rows, not as a header badge.
+  assert.doesNotMatch(frame(), /LIMITED/)
+  assert.ok(
+    frame().includes(`v${PACKAGE_VERSION}`),
+    `the header lost the version while degraded: ${frame()}`,
+  )
   assert.match(frame(), /Health/)
   assert.match(frame(), /Quota API\s+backoff/)
   assert.match(frame(), /Token refresh\s+backoff/)
