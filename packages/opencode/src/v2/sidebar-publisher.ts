@@ -3,6 +3,7 @@ import { resolve } from 'node:path'
 import type { StickyPin } from '@cortexkit/common-auth/routing'
 import {
   type AccountPaths,
+  loadAccountSettings,
   loadAccounts,
   type OpenAiVault,
 } from '@cortexkit/openai-auth-core/internal'
@@ -154,7 +155,9 @@ class SidebarPublisher {
           this.producers.has(producer) &&
           producer.vault.enrolled() === vaultMode &&
           enrollmentStamp(producer) === authorityStamp
-        const store = await loadAccounts(producer.paths)
+        const store = await (vaultMode
+          ? loadAccountSettings(producer.paths)
+          : loadAccounts(producer.paths))
         const machine = vaultMode
           ? buildVaultSidebarMachineState(
               producer.vault.snapshot()?.rows ?? [],

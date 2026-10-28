@@ -57,6 +57,7 @@ import {
   resolveSessionSidebarRouting,
   setSidebarState,
 } from '../sidebar-state'
+import { guardLocalStoreReads } from './fixtures/local-store-read-guard'
 import {
   HOUR,
   installWire,
@@ -99,6 +100,7 @@ let daemon: MockDaemon | undefined
 let hooks: Hooks | undefined
 let originalFetch: typeof globalThis.fetch
 let stopWarmCodex: (() => Promise<void>) | undefined
+let restoreLocalStoreReads: (() => void) | undefined
 const scope = createRequestTestScope()
 const test = scope.it
 const clock = createFailurePhaseClock()
@@ -126,6 +128,8 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
+  restoreLocalStoreReads?.()
+  restoreLocalStoreReads = undefined
   await scope.teardown(async () => {
     await hooks?.dispose?.()
     hooks = undefined
@@ -2383,7 +2387,23 @@ describe('vault mode', () => {
     const row = vault.snapshot()?.rows[0]
     if (!route || !row) throw new Error('no vault account')
 
-    const stateNow = await getSidebarState(sidebarFile)
+    // The sidebar publisher checks vault enrollment and reads config preferences
+    // before queuing its file write. Draining the write queue alone does not
+    // wait for that work to finish.
+    const stateNow = await waitFor(() => {
+      try {
+        const state = readJson(sidebarFile) as unknown as Awaited<
+          ReturnType<typeof getSidebarState>
+        >
+        return state.vaultAccounts?.[0]?.quota &&
+          resolveSessionSidebarRouting(state, 'sidebar-session').activeId ===
+            route.id
+          ? state
+          : undefined
+      } catch {
+        return undefined
+      }
+    }, 'the vault sidebar snapshot and active route')
 
     expect(stateNow.vaultAccounts?.map((account) => account.id)).toEqual([
       route.id,
@@ -2404,17 +2424,56 @@ describe('vault mode', () => {
     await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
     enroll()
     seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+    const reads = guardLocalStoreReads(files.configFile, files.stateFile)
+    restoreLocalStoreReads = reads.restore
     const wire = installWire()
     const { vault } = await plugin()
     const send = await fetchOverride()
     await request(send)
     expect(wire.sends).toEqual([`Bearer ${VAULT_ACCESS}`])
+    expect(
+      await hooks?.provider?.models?.(
+        { models: {} } as never,
+        { auth: { type: 'oauth' } } as never,
+      ),
+    ).toEqual({})
+    await hooks?.event?.({
+      event: { type: 'session.deleted', properties: { info: { id: 'gone' } } },
+    } as never)
+    await scope.settlePluginWork()
+    expect(reads.counts()).toEqual({ stateReads: 0, rowReads: 0 })
 
+    reads.allowLocal()
     await vault.disconnect()
     const response = await request(send)
 
     expect(response.status).toBe(200)
     expect(wire.sends).toEqual([`Bearer ${VAULT_ACCESS}`, 'Bearer main-token'])
+    expect(reads.counts().stateReads).toBeGreaterThan(0)
+  })
+
+  test('a corrupt local state keeps vault startup and requests on the saved killswitch floors', async () => {
+    await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
+    enroll()
+    seedPool(files, [{ id: 'main', quota: quotaMap(10) }], {
+      killswitch: {
+        enabled: true,
+        schema: 'floors-v1',
+        defaults: { primary: 95 },
+      },
+    })
+    writeFileSync(files.stateFile, '{broken')
+    const config = readFileSync(files.configFile, 'utf8')
+    const wire = installWire()
+    await plugin()
+    const send = await fetchOverride()
+
+    const response = await request(send)
+
+    expect(response.status).not.toBe(200)
+    expect(wire.sends).toEqual([])
+    expect(readFileSync(files.configFile, 'utf8')).toBe(config)
+    expect(readFileSync(files.stateFile, 'utf8')).toBe('{broken')
   })
 })
 

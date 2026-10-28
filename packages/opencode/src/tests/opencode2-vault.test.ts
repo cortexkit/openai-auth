@@ -42,6 +42,7 @@ import { flushForTest } from '../logger'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { VAULT_METHOD } from '../v2/login'
 import { setupOpenAIAuth } from '../v2/setup'
+import { guardLocalStoreReads } from './fixtures/local-store-read-guard'
 import {
   fakeOpenCode2Host,
   type PoolFiles,
@@ -648,17 +649,48 @@ describe('vault accounts on OpenCode 2', () => {
   })
 
   it('routes the pool rows again once this host disconnects', async () => {
-    const { host, tokenPath } = await start('main-first', [{ id: 'main' }], {
-      'oauth:openai:vault': vaultLogin('chatgpt-vault'),
-    })
+    let reads: ReturnType<typeof guardLocalStoreReads> | undefined
+    const { host, tokenPath } = await start(
+      'main-first',
+      [{ id: 'main' }],
+      {
+        'oauth:openai:vault': vaultLogin('chatgpt-vault'),
+      },
+      {
+        prepare: (files) => {
+          reads = guardLocalStoreReads(files.configPath, files.statePath)
+          cleanups.push(() => reads?.restore())
+        },
+      },
+    )
     expect((await send(host, 200)).get('authorization')).toBe(
       `Bearer ${VAULT_ACCESS}`,
     )
+    expect(reads?.counts()).toEqual({ stateReads: 0, rowReads: 0 })
     // Disconnect deletes the enrollment token.
+    reads?.allowLocal()
     rmSync(tokenPath)
     expect((await send(host, 200)).get('authorization')).toBe(
       'Bearer main-token',
     )
+    expect(reads?.counts().stateReads).toBeGreaterThan(0)
+  })
+
+  it('a corrupt local state does not affect vault startup or requests', async () => {
+    const { host, files } = await start(
+      'main-first',
+      [{ id: 'main' }],
+      {
+        'oauth:openai:vault': vaultLogin('chatgpt-vault'),
+      },
+      {
+        prepare: (files) => writeFileSync(files.statePath, '{broken'),
+      },
+    )
+    expect((await send(host, 200)).get('authorization')).toBe(
+      `Bearer ${VAULT_ACCESS}`,
+    )
+    expect(readFileSync(files.statePath, 'utf8')).toBe('{broken')
   })
 
   it('skips a pool row signing in as an account the vault holds, and never routes a vault API key', async () => {

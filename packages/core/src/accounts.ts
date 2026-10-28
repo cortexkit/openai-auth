@@ -937,6 +937,57 @@ export async function loadAccounts(paths: AccountPaths) {
   return normalizeStorage(mergeConfigAndState(config.value, state.value))
 }
 
+const warnedSettingsReads = new Set<string>()
+
+/**
+ * Plugin preferences without opening credential state or inspecting local rows.
+ * Vault routing uses these preferences even when the unused local store is broken.
+ */
+export async function loadAccountSettings(
+  paths: Pick<AccountPaths, 'configPath'>,
+): Promise<AccountStorage | null> {
+  try {
+    const { exists, value } = await readJsonIfPresent(paths.configPath)
+    if (!exists) return null
+    if (!isRecord(value)) throw new Error('settings must be an object')
+    const refresh = isRecord(value.refresh) ? value.refresh : {}
+    const quota = isRecord(value.quota) ? value.quota : {}
+    return {
+      version: 1,
+      accounts: [],
+      routing: isRecord(value.routing) ? value.routing : undefined,
+      fallbackOn: Array.isArray(value.fallbackOn)
+        ? value.fallbackOn.filter((status) => Number.isInteger(status))
+        : undefined,
+      refresh: objectWithDefinedEntries({
+        enabled: refresh.enabled,
+        refreshBeforeExpiryMinutes: refresh.refreshBeforeExpiryMinutes,
+      }),
+      quota: objectWithDefinedEntries({
+        enabled: quota.enabled,
+        checkIntervalMinutes: quota.checkIntervalMinutes,
+        refreshEveryNRequests: quota.refreshEveryNRequests,
+        minimumRemaining: quota.minimumRemaining,
+        failClosedOnUnknownQuota: quota.failClosedOnUnknownQuota,
+      }),
+      dump: isRecord(value.dump) ? value.dump : undefined,
+      costZeroing: isRecord(value.costZeroing) ? value.costZeroing : undefined,
+      killswitch: isRecord(value.killswitch) ? value.killswitch : undefined,
+      logging: isRecord(value.logging) ? value.logging : undefined,
+      cachekeep: isRecord(value.cachekeep) ? value.cachekeep : undefined,
+      cacheKeep: isRecord(value.cacheKeep) ? value.cacheKeep : undefined,
+    }
+  } catch {
+    if (!warnedSettingsReads.has(paths.configPath)) {
+      warnedSettingsReads.add(paths.configPath)
+      logA.warn('could not read OpenAI auth settings; using defaults', {
+        path: paths.configPath,
+      })
+    }
+    return null
+  }
+}
+
 function omitUndefinedTopLevel(value: Record<string, unknown>) {
   return Object.fromEntries(
     Object.entries(value).filter(([, entry]) => entry !== undefined),

@@ -35,6 +35,7 @@ import {
   isTombstoned,
   killswitchPassesPolicy,
   killswitchRetryAfterSeconds,
+  loadAccountSettings,
   loadAccounts,
   migrateIfNeeded,
   mutateAccounts,
@@ -1554,8 +1555,10 @@ export async function CodexAuthPlugin(
       stickyPinOverlay.delete(deletedSessionHash)
       sidebarBookkeeping?.cancel(`pin:${deletedSessionHash}`)
       if (sidebarStateFileForEvents) {
-        const accounts = (await loadAccounts(getAccountPaths(getConfigPath())))
-          ?.accounts
+        const accounts =
+          (await vault.authority()) !== 'local'
+            ? vault.routes().map((route) => ({ id: route.id }))
+            : (await loadAccounts(getAccountPaths(getConfigPath())))?.accounts
         // OpenCode discards event-hook promises. The writer already logs a
         // failure; keep deletion cleanup running without rejecting the hook.
         await removeSidebarActiveRouting(
@@ -1572,7 +1575,9 @@ export async function CodexAuthPlugin(
       async models(provider, ctx) {
         if (ctx.auth?.type !== 'oauth') return provider.models
 
-        const storage = await loadAccounts(getAccountPaths(getConfigPath()))
+        const storage = await loadAccountSettings(
+          getAccountPaths(getConfigPath()),
+        )
         const zeroCosts = !storage || isCostZeroingEnabled(storage)
         const catalog = zeroCosts ? null : await loadModelsDevCosts()
         if (!zeroCosts && catalog && !loggedCostRestoration) {
@@ -1685,8 +1690,9 @@ export async function CodexAuthPlugin(
         // Use valid local settings for vault account selection and cache keep-warm.
         // A broken local credential store must not prevent serving vault accounts
         // or explaining how to recover an unavailable vault.
-        const storage = await loadAccounts(
-          getAccountPaths(getConfigPath()),
+        const storage = await (loaderVaultMode
+          ? loadAccountSettings(getAccountPaths(getConfigPath()))
+          : loadAccounts(getAccountPaths(getConfigPath()))
         ).catch(async (err) => {
           if ((await vault.authority()) !== 'local') return null
           const path = getConfigPath()
@@ -1716,6 +1722,7 @@ export async function CodexAuthPlugin(
         // a request's read overruns its budget, and the fallback if a display
         // write cannot read the current config.
         let lastRequestStorage = storage
+        let localStorageLoaded = !loaderVaultMode
 
         // Request routing and sidebar projections share this stat-gated read.
         // A loader can be idle while another process changes routing, so a
@@ -1732,7 +1739,8 @@ export async function CodexAuthPlugin(
           },
           read: (path) => loadAccounts(getAccountPaths(path)),
           fallback: async (error) => {
-            if ((await vault.authority()) !== 'local') return lastRequestStorage
+            if ((await vault.authority()) !== 'local')
+              return loadAccountSettings(getAccountPaths(getConfigPath()))
             throw error
           },
           onRead: (next) => {
@@ -1740,15 +1748,33 @@ export async function CodexAuthPlugin(
           },
         })
 
-        function loadCurrentStorageForDisplay() {
+        async function loadCurrentStorageForDisplay(
+          authority?: 'local' | 'vault' | 'unreadable',
+        ) {
+          if ((authority ?? (await vault.authority())) !== 'local') {
+            // Preferences never seed the local read cache. After disconnect,
+            // even an unchanged config must reload the current credentials.
+            localStorageLoaded = false
+            currentStorageReader.invalidate()
+            return loadAccountSettings(getAccountPaths(getConfigPath()))
+          }
           return currentStorageReader.read()
         }
 
         // Request reads wait only for the hot-path budget. A changed config is
         // read in the background and serves the next request if it is slow.
-        async function loadRequestAccounts() {
+        async function loadRequestAccounts(
+          authority?: 'local' | 'vault' | 'unreadable',
+        ) {
+          const mode = authority ?? (await vault.authority())
+          if (mode !== 'local') return loadCurrentStorageForDisplay(mode)
+          if (!localStorageLoaded) {
+            const current = await loadCurrentStorageForDisplay(mode)
+            localStorageLoaded = true
+            return current
+          }
           return settleWithinBudget(
-            Promise.resolve(loadCurrentStorageForDisplay()),
+            loadCurrentStorageForDisplay(mode),
             HOT_PATH_READ_BUDGET_MS,
             () => lastRequestStorage,
           )
@@ -4531,7 +4557,7 @@ export async function CodexAuthPlugin(
               requestHeaders.get('x-parent-session-id')?.trim() || undefined
             // Main-first and fallback-first select per request; sticky-balanced
             // resolves a per-session pin from sidebar state before sending.
-            const reqStorage = await loadRequestAccounts()
+            const reqStorage = await loadRequestAccounts(authority)
 
             // Vault mode (this host is enrolled with the Claustrum vault):
             // only the vault's accounts serve. OpenCode's slot, the pool rows

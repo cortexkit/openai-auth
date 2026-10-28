@@ -54,6 +54,7 @@ import {
   beginAccountLogin,
   codexRefreshFn,
   extractAccountId,
+  loadAccountSettings,
   loadAccounts,
   type OpenAiVaultOptions,
   redactCredentialError,
@@ -511,7 +512,7 @@ export async function setupOpenAIAuth(
   const paths = options.paths ?? (() => getAccountPaths(getConfigPath()))
   // The logger starts with the environment floor. A saved choice overrides it,
   // just as it does on OpenCode 1, before setup writes any diagnostic lines.
-  const storage = await loadAccounts(paths())
+  const storage = await loadAccountSettings(paths())
   const storedLevel = storage?.logging?.level
   if (storedLevel && typeof storedLevel === 'string') {
     setLogLevel(storedLevel as Parameters<typeof setLogLevel>[0])
@@ -584,6 +585,10 @@ export async function setupOpenAIAuth(
     paths(),
   )
   const vault = vaultLease.vault
+  const loadStorage = async () =>
+    (await vault.authority()) === 'local'
+      ? loadAccounts(paths())
+      : loadAccountSettings(paths())
   let setupComplete = false
   let closing = false
   using _leaseRollback = {
@@ -634,7 +639,7 @@ export async function setupOpenAIAuth(
     vaultFirstRosterBackgroundWaitMs: vaultRosterWaitMs,
     log: createLogger('pool'),
   })
-  await source.load()
+  if ((await vault.authority()) === 'local') await source.load()
 
   const heartbeat =
     options.heartbeat === false
@@ -722,7 +727,7 @@ export async function setupOpenAIAuth(
     paths(),
     {
       source,
-      storage: () => loadAccounts(paths()),
+      storage: loadStorage,
       vault,
       // The same process-wide registry the adapter below records into.
       accounts: acquireSessionAccounts(paths()),
@@ -748,7 +753,7 @@ export async function setupOpenAIAuth(
     onRoute: sidebar.route,
     source,
     slotPlaceholderWithoutMain,
-    storage: () => loadAccounts(paths()),
+    storage: loadStorage,
     pins,
     sessionAccounts: acquireSessionAccounts(paths()),
     vault,
@@ -837,7 +842,7 @@ export async function setupOpenAIAuth(
               // no host login is read in its place.
               ...createPoolResetDeps({
                 source,
-                storage: () => loadAccounts(paths()),
+                storage: loadStorage,
                 counts: resetCounts,
                 now,
                 authority: () => vault.authority(),
