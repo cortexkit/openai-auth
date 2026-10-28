@@ -1153,15 +1153,13 @@ function QuotaSidebar(props: {
     <box
       width='100%'
       flexDirection='column'
-      border
-      borderStyle='single'
-      borderColor={theme().borderActive}
       paddingTop={1}
       paddingBottom={1}
       paddingLeft={1}
       paddingRight={1}
     >
-      {/* Header: ▼/▶ OPENAI badge (click to collapse) + version, or LIMITED badge */}
+      {/* Header: ▼/▶ OPENAI badge (click to collapse) + version. Blocked
+          accounts show on their own rows, so the header does not change. */}
       {/* biome-ignore lint/a11y/noStaticElementInteractions: opentui renders to a terminal, not the DOM — ARIA roles do not apply */}
       <box
         width='100%'
@@ -1177,23 +1175,8 @@ function QuotaSidebar(props: {
             <b>{headerLabel()}</b>
           </text>
         </box>
-        <Show
-          when={degraded()}
-          fallback={
-            <Show when={prefs().header.showVersion && PLUGIN_VERSION !== ''}>
-              <text fg={theme().textMuted}>{`v${PLUGIN_VERSION}`}</text>
-            </Show>
-          }
-        >
-          <box
-            paddingLeft={1}
-            paddingRight={1}
-            backgroundColor={theme().warning}
-          >
-            <text fg={theme().background}>
-              <b>{'LIMITED'}</b>
-            </text>
-          </box>
+        <Show when={prefs().header.showVersion && PLUGIN_VERSION !== ''}>
+          <text fg={theme().textMuted}>{`v${PLUGIN_VERSION}`}</text>
         </Show>
       </box>
 

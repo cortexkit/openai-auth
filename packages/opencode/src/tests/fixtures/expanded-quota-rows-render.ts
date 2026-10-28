@@ -1,25 +1,28 @@
 // Renders the expanded sidebar on OpenCode 2 (the `sidebar.content` slot) and
 // OpenCode 1 (the `sidebar_content` slot) at every width the plugin may be
-// given, from 42 cells down to 18 (a default OpenCode sidebar gives it 36 or
-// 37), and checks the sidebar's single-line border is drawn and each quota
-// row:
+// given, from 42 cells down to 16 (a default OpenCode sidebar gives it 36 or
+// 37), and checks each quota row:
 // it stays on one line, keeps a space between the "N% left" figure and the
 // reset time, and when the row is too narrow drops the reset first, then
 // shortens the bar. The pacing line under a row is cut with … rather than
 // wrapped. The Killswitch row keeps a blank cell after its label and cuts a
-// value too long for the row with …. Both hosts must draw the same characters
-// and colors. Run as a
-// script with the shared Solid/OpenTUI runtime preloaded (see
+// value too long for the row with …, and the header keeps the version while
+// an account is blocked. Both hosts must draw the same characters and colors.
+// Run as a script with the shared Solid/OpenTUI runtime preloaded (see
 // tui-quota-render.test.ts); it prints `expanded-quota-rows-render passed` on
 // success. Set SHOW_FRAMES=1 to print the quota rows drawn at each width.
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { RGBA } from '@opentui/core'
 import { type JSX, testRender } from '@opentui/solid'
 
 const root = mkdtempSync(join(tmpdir(), 'openai-expanded-rows-render-'))
+// The version the sidebar header shows, from the plugin's package.json.
+const PACKAGE_VERSION: string = JSON.parse(
+  readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'),
+).version
 const stateFile = join(root, 'sidebar.json')
 const prefsFile = join(root, 'preferences.jsonc')
 process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = stateFile
@@ -196,12 +199,12 @@ async function drawAt(width: number) {
   assert.deepEqual(view.captureSpans(), v1.captureSpans())
 }
 
-// The sidebar's border and one-cell padding take two columns on each side.
-const EDGE = 2
+// The sidebar's one-cell padding on each side.
+const EDGE = 1
 
 /**
- * The frame's lines without the sidebar's border and padding on each side, so
- * every line is the `columns` the rows lay themselves out in.
+ * The frame's lines without the sidebar's padding on each side, so every line
+ * is the `columns` the rows lay themselves out in.
  */
 function contentLines(width: number): string[] {
   return view
@@ -212,22 +215,6 @@ function contentLines(width: number): string[] {
         .slice(EDGE, width - EDGE)
         .join(''),
     )
-}
-
-/** Asserts the sidebar's box is drawn with single-line corners. */
-function assertBorder(width: number) {
-  const frame = view.captureCharFrame()
-  const lines = frame.split('\n').map((line) => Array.from(line))
-  const at = `at width ${width}: ${frame}`
-  const top = lines[0] ?? []
-  assert.ok(
-    top[0] === '┌' && top[width - 1] === '┐',
-    `the sidebar has no top border corners ${at}`,
-  )
-  assert.ok(
-    lines.some((line) => line[0] === '└' && line[width - 1] === '┘'),
-    `the sidebar has no bottom border corners ${at}`,
-  )
 }
 
 const BAR = /[█░▒▓]/g
@@ -244,9 +231,8 @@ const MIN_BAR = 3
 
 await Promise.all([...polls.values()].map((refresh) => refresh()))
 try {
-  for (let width = FULL_WIDTH; width >= 18; width--) {
+  for (let width = FULL_WIDTH; width >= 16; width--) {
     await drawAt(width)
-    assertBorder(width)
     const columns = width - 2 * EDGE
     const lines = contentLines(width)
     const frame = view.captureCharFrame()
@@ -395,11 +381,11 @@ try {
     )
   }
 
-  // The Killswitch row names the blocked accounts. At the widths OpenCode
-  // gives the plugin it keeps at least one blank cell after its label, and a
-  // value too long for the row is cut with … on its one line rather than run
-  // into the label or wrapped. The accounts carry no reading, so the quota
-  // section stays short and the row is inside the frame.
+  // The Killswitch row names the blocked accounts. It keeps at least one
+  // blank cell after its label, and a value too long for the row is cut with
+  // … on its one line rather than run into the label or wrapped. The
+  // accounts carry no reading, so the quota section stays short and the row
+  // is inside the frame.
   const killed = (label: string) => ({
     id: label,
     label,
@@ -417,23 +403,37 @@ try {
     })
     await Promise.all([...polls.values()].map((refresh) => refresh()))
   }
-  /** The Killswitch row and the row under it, border and padding left out. */
+  /** The Killswitch row and the row under it, padding left out. */
   const killswitchRow = () => {
     const lines = view
       .captureCharFrame()
       .split('\n')
-      .map((line) => line.replace(/^[│ ]+|[│ ]+$/g, ''))
+      .map((line) => line.trim())
     const index = lines.findIndex((line) => line.startsWith('Killswitch'))
     return { row: lines[index] ?? '', next: lines[index + 1] ?? '' }
   }
-  // One blocked account: its value is 24 cells, so with the label and the
-  // blank cell the row needs 35 columns. 36 and 37 give it 32 and 33.
   await showKilled(['team@example.com'], 2)
-  const expectedKillswitch: Record<number, string> = {
-    36: 'Killswitch team@example.com blo…',
-    37: 'Killswitch team@example.com bloc…',
+  // A blocked account shows on its own rows; the header keeps the version
+  // rather than swapping it for a badge.
+  for (const width of [42, 37, 36]) {
+    await drawAt(width)
+    const header = view.captureCharFrame().split('\n')[1] ?? ''
+    const at = `at width ${width}: ${view.captureCharFrame()}`
+    assert.ok(
+      header.trimEnd().endsWith(`v${PACKAGE_VERSION}`) &&
+        !header.includes('LIMITED'),
+      `the header does not show the version while an account is blocked ${at}`,
+    )
   }
-  for (const width of [36, 37]) {
+  // One blocked account: its value is 24 cells, so with the label and the
+  // blank cell the row needs 35 columns: whole at 37 and wider, cut below.
+  const expectedKillswitch: Record<number, string> = {
+    36: 'Killswitch team@example.com block…',
+    42: `Killswitch${' '.repeat(6)}team@example.com blocked`,
+    37: 'Killswitch team@example.com blocked',
+    16: 'Killswitch te…',
+  }
+  for (const width of [36, 42, 37, 16]) {
     await drawAt(width)
     const { row, next } = killswitchRow()
     const at = `at width ${width}: ${view.captureCharFrame()}`
@@ -445,15 +445,15 @@ try {
     assert.equal(
       row,
       expectedKillswitch[width],
-      `the Killswitch row is not cut to its width ${at}`,
+      `the Killswitch row is not fitted to its width ${at}`,
     )
-    assert.equal(next.trim(), '', `the Killswitch row wraps ${at}`)
+    assert.equal(next, '', `the Killswitch row wraps ${at}`)
   }
   // Two blocked accounts: a value far longer than the row is cut with ….
   const names = ['team@example.com', 'personal@example.com']
   const full = `${names.join(', ')} blocked`
   await showKilled(names, 3)
-  for (const width of [37, 36]) {
+  for (const width of [42, 37, 36, 16]) {
     await drawAt(width)
     const columns = width - 2 * EDGE
     const { row, next } = killswitchRow()
@@ -477,7 +477,7 @@ try {
       columns,
       `the Killswitch row does not fill its width ${at}`,
     )
-    assert.equal(next.trim(), '', `the Killswitch row wraps ${at}`)
+    assert.equal(next, '', `the Killswitch row wraps ${at}`)
   }
 } finally {
   cleanup()
