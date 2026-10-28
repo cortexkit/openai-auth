@@ -20,6 +20,10 @@ updates:
       # share one installed copy, so subc-client moves only together with
       # claustrum-client and common-auth.
       - dependency-name: "@cortexkit/subc-client"
+      # tsdown is pinned to 0.23.1: 0.23.2 pulls a rolldown-plugin-dts beta
+      # that needs the classic TypeScript API, which TS 7 has none of.
+      # Unpin once rolldown-plugin-dts supports TS 7.
+      - dependency-name: "tsdown"
 
   - package-ecosystem: "github-actions"
     directory: "/"

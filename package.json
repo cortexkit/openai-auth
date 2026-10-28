@@ -23,15 +23,15 @@
     "check:local-deps": "bun scripts/check-local-deps.mjs"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.15",
+    "@biomejs/biome": "2.6.3",
     "@cortexkit/openai-auth-core": "workspace:*",
-    "@earendil-works/pi-ai": "1.3.0",
-    "@earendil-works/pi-coding-agent": "1.3.0",
-    "@earendil-works/pi-tui": "1.3.0",
-    "@opencode-ai/plugin": "1.19.3",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0",
+    "@opencode-ai/plugin": "1.19.4",
     "@tsconfig/bun": "1.0.11",
     "@types/bun": "1.4.3",
-    "bun-types": "1.4.3",
+    "bun-types": "1.4.4",
     "lefthook": "2.2.2",
     "tsdown": "0.23.1",
     "typescript": "7.0.2"
