@@ -1728,6 +1728,11 @@ export async function CodexAuthPlugin(
         // a request's read overruns its budget, and the fallback if a display
         // write cannot read the current config.
         let lastRequestStorage = storage
+        // A loader that started in vault mode holds only the settings
+        // projection: no rows, no main quota. After a disconnect, the first
+        // local request must wait for the real store instead of falling back
+        // to that projection when the read overruns its budget.
+        let lastRequestStorageIsLocal = !loaderVaultMode
 
         // Request routing and sidebar projections share this stat-gated read.
         // A loader can be idle while another process changes routing, so a
@@ -1750,6 +1755,7 @@ export async function CodexAuthPlugin(
           },
           onRead: (next) => {
             lastRequestStorage = next
+            lastRequestStorageIsLocal = true
           },
         })
 
@@ -1760,6 +1766,7 @@ export async function CodexAuthPlugin(
         // Request reads wait only for the hot-path budget. A changed config is
         // read in the background and serves the next request if it is slow.
         async function loadRequestAccounts() {
+          if (!lastRequestStorageIsLocal) return loadCurrentStorageForDisplay()
           return settleWithinBudget(
             Promise.resolve(loadCurrentStorageForDisplay()),
             HOT_PATH_READ_BUDGET_MS,
