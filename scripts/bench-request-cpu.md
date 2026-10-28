@@ -23,18 +23,18 @@ append-only tool-loop requests on an existing chain.
 
 Each cell is **baseline → optimized**, in ms/request.
 
-| Real function / path | 50 items | 200 items | 400 items |
-| --- | ---: | ---: | ---: |
-| `stableStringify`, one complete history (reference cost) | 0.186 → 0.199 | 0.684 → 1.011 | 1.400 → 1.830 |
-| HTTP `updateHttpTurnMetadata` | 0.367 → 0.025 | 1.424 → 0.188 | 3.047 → 0.366 |
+| Real function / path                                                     |          50 items |         200 items |         400 items |
+| ------------------------------------------------------------------------ | ----------------: | ----------------: | ----------------: |
+| `stableStringify`, one complete history (reference cost)                 |     0.186 → 0.199 |     0.684 → 1.011 |     1.400 → 1.830 |
+| HTTP `updateHttpTurnMetadata`                                            |     0.367 → 0.025 |     1.424 → 0.188 |     3.047 → 0.366 |
 | **HTTP `prepareCodexRequest` TOTAL**, parse + decisions + full wire body | **0.556 → 0.290** | **2.240 → 1.496** | **5.739 → 2.809** |
-| WS `bodySignature` (reference cost) | 0.033 → 0.026 | 0.041 → 0.033 | 0.048 → 0.036 |
-| WS `requestComparison`, canonical items + signature, once per request | — → 0.044 | — → 0.119 | — → 0.308 |
-| WS `shouldPrewarm` | 0.334 → 0.002 | 1.385 → 0.002 | 2.943 → 0.005 |
-| WS `withContinuation` | 0.362 → 0.003 | 1.383 → 0.004 | 2.760 → 0.006 |
-| WS `applyTurnId` | 0.364 → 0.002 | 1.388 → 0.005 | 2.773 → 0.007 |
-| WS `updateContinuation` | 0.031 → 0.001 | 0.038 → 0.003 | 0.043 → 0.003 |
-| WS disabled main dump, including argument construction | 0.109 → 0.001 | 0.414 → 0.003 | 0.864 → 0.004 |
+| WS `bodySignature` (reference cost)                                      |     0.033 → 0.026 |     0.041 → 0.033 |     0.048 → 0.036 |
+| WS `requestComparison`, canonical items + signature, once per request    |         — → 0.044 |         — → 0.119 |         — → 0.308 |
+| WS `shouldPrewarm`                                                       |     0.334 → 0.002 |     1.385 → 0.002 |     2.943 → 0.005 |
+| WS `withContinuation`                                                    |     0.362 → 0.003 |     1.383 → 0.004 |     2.760 → 0.006 |
+| WS `applyTurnId`                                                         |     0.364 → 0.002 |     1.388 → 0.005 |     2.773 → 0.007 |
+| WS `updateContinuation`                                                  |     0.031 → 0.001 |     0.038 → 0.003 |     0.043 → 0.003 |
+| WS disabled main dump, including argument construction                   |     0.109 → 0.001 |     0.414 → 0.003 |     0.864 → 0.004 |
 | **WS TOTAL**, parse + decisions + dump + trimmed wire frame + completion | **1.275 → 0.224** | **5.358 → 0.709** | **9.457 → 1.683** |
 
 Measurement preceded implementation. An initial 150-request arithmetic-mean run
@@ -108,19 +108,19 @@ Existing transport/integration assertions were not changed or renamed.
 The same benchmark was rerun after restoring four corner-case contracts. The
 following numbers use the identical methodology above, in median ms/request:
 
-| Real function / path | 50 items | 200 items | 400 items |
-| --- | ---: | ---: | ---: |
-| `stableStringify`, one complete history | 0.214 | 0.883 | 2.324 |
-| HTTP `updateHttpTurnMetadata` | 0.032 | 0.160 | 0.344 |
-| **HTTP `prepareCodexRequest` TOTAL** | **0.296** | **1.390** | **2.209** |
-| WS `bodySignature` | 0.026 | 0.030 | 0.030 |
-| WS `requestComparison` | 0.047 | 0.135 | 0.294 |
-| WS `shouldPrewarm` | 0.002 | 0.003 | 0.005 |
-| WS `withContinuation` | 0.003 | 0.004 | 0.006 |
-| WS `applyTurnId` | 0.003 | 0.006 | 0.005 |
-| WS `updateContinuation` | 0.001 | 0.003 | 0.003 |
-| WS disabled main dump | 0.002 | 0.004 | 0.003 |
-| **WS TOTAL** | **0.188** | **0.640** | **1.300** |
+| Real function / path                    |  50 items | 200 items | 400 items |
+| --------------------------------------- | --------: | --------: | --------: |
+| `stableStringify`, one complete history |     0.214 |     0.883 |     2.324 |
+| HTTP `updateHttpTurnMetadata`           |     0.032 |     0.160 |     0.344 |
+| **HTTP `prepareCodexRequest` TOTAL**    | **0.296** | **1.390** | **2.209** |
+| WS `bodySignature`                      |     0.026 |     0.030 |     0.030 |
+| WS `requestComparison`                  |     0.047 |     0.135 |     0.294 |
+| WS `shouldPrewarm`                      |     0.002 |     0.003 |     0.005 |
+| WS `withContinuation`                   |     0.003 |     0.004 |     0.006 |
+| WS `applyTurnId`                        |     0.003 |     0.006 |     0.005 |
+| WS `updateContinuation`                 |     0.001 |     0.003 |     0.003 |
+| WS disabled main dump                   |     0.002 |     0.004 |     0.003 |
+| **WS TOTAL**                            | **0.188** | **0.640** | **1.300** |
 
 No performance regression is apparent relative to the first optimized run;
 wall measurements continue to vary with load. Prewarm now computes its own
