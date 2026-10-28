@@ -14,6 +14,7 @@ const QUOTA_STALE_AFTER_MS = 4 * 60_000
 
 type Holder = { reservedRouteIds: () => Iterable<string> }
 type Entry = {
+  protocol: 1
   vault: OpenAiVault
   holders: Set<Holder>
   firstRoster: PromiseWithResolvers<void>
@@ -30,6 +31,23 @@ const processState = globalThis as typeof globalThis & {
 }
 const entries = processState[registryKey] ?? new Map<string, Entry>()
 processState[registryKey] = entries
+
+function compatibleEntry(value: unknown): value is Entry {
+  if (!value || typeof value !== 'object') return false
+  const entry = value as Partial<Entry>
+  // Method presence alone cannot identify old status/routes return shapes.
+  // Only entries created with this protocol guarantee those shapes too.
+  return (
+    entry.protocol === 1 &&
+    entry.holders instanceof Set &&
+    typeof entry.firstRoster?.resolve === 'function' &&
+    entry.firstRoster.promise instanceof Promise &&
+    typeof entry.started === 'boolean' &&
+    typeof entry.vault?.awaitRequestRoster === 'function' &&
+    typeof entry.vault?.grantReach === 'function' &&
+    typeof entry.vault?.reorder === 'function'
+  )
+}
 
 /**
  * Gives one plugin instance (one project) a reference to the vault consumer
@@ -56,7 +74,19 @@ export function acquireOpenCodeVault(
   const holder: Holder = {
     reservedRouteIds: options.reservedRouteIds ?? (() => []),
   }
-  let entry = isolated ? undefined : entries.get(key)
+  let registry = entries
+  const candidate = entries.get(key)
+  if (!isolated && candidate !== undefined && !compatibleEntry(candidate)) {
+    // Old consumers can still own timers and leases. Do not close them, enter
+    // their methods, or replace their entries. Current copies share a separate
+    // registry.
+    const shared = entries as typeof entries & {
+      compatibleV1?: Map<string, Entry>
+    }
+    shared.compatibleV1 ??= new Map()
+    registry = shared.compatibleV1
+  }
+  let entry = isolated ? undefined : registry.get(key)
   if (!entry) {
     const holders = new Set<Holder>()
     const vault = new OpenAiVault({
@@ -86,12 +116,13 @@ export function acquireOpenCodeVault(
       },
     })
     entry = {
+      protocol: 1,
       vault,
       holders,
       firstRoster: Promise.withResolvers<void>(),
       started: false,
     }
-    if (!isolated) entries.set(key, entry)
+    if (!isolated) registry.set(key, entry)
   }
   entry.holders.add(holder)
   const owned = entry
@@ -133,7 +164,7 @@ export function acquireOpenCodeVault(
       if (owned.quotaPoll) clearInterval(owned.quotaPoll)
       owned.vault.close()
       owned.firstRoster.resolve()
-      if (!isolated && entries.get(key) === owned) entries.delete(key)
+      if (!isolated && registry.get(key) === owned) registry.delete(key)
     },
   }
 }

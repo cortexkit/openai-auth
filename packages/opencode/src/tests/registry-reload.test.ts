@@ -101,3 +101,30 @@ it('ignores a foreign Codex store without replacing its registry entry', async (
     sessions: 0,
   })
 })
+
+for (const mode of ['old-vault', 'old-vault-status']) {
+  it(`ignores ${mode} consumers without calling or replacing them`, async () => {
+    const { result } = await scenario(mode)
+    expect(result).toEqual({
+      foreignCalls: 0,
+      ignored: true,
+      shared: true,
+      retained: true,
+      holders: 0,
+      discovered: true,
+      methods: true,
+    })
+  })
+}
+
+it('ignores pre-reservation pin ledgers without calling or replacing them', async () => {
+  const { result } = await scenario('old-pins')
+  expect(result).toEqual({
+    foreignCalls: 0,
+    ignored: true,
+    retained: true,
+    shared: true,
+    pending: 0,
+    reservations: true,
+  })
+})

@@ -72,6 +72,111 @@ if (mode?.startsWith('legacy-')) {
       messages,
     }),
   )
+} else if (mode === 'old-vault' || mode === 'old-vault-status') {
+  const { OpenAiVault } = await import('@cortexkit/openai-auth-core/internal')
+  const config = process.env.OPENCODE_CONFIG_DIR as string
+  const paths = {
+    configPath: join(config, 'pool.json'),
+    statePath: join(config, 'state.json'),
+  }
+  const stateDir = join(config, 'openai-auth-vault')
+  const connectionFile = join(config, 'claustrum.json')
+  let foreignCalls = 0
+  const foreign = () => {
+    foreignCalls++
+  }
+  const vault: Record<string, unknown> = {
+    authority: foreign,
+    pollStale: foreign,
+    start: foreign,
+    firstRoster: foreign,
+    close: foreign,
+  }
+  if (mode === 'old-vault-status') {
+    // v1.8.0 had the current methods but status lacked discovered.
+    for (const method of Object.getOwnPropertyNames(OpenAiVault.prototype))
+      if (method !== 'constructor') vault[method] = foreign
+  }
+  vault.status = async () => {
+    foreignCalls++
+    return { accounts: [] }
+  }
+  const entry = {
+    vault,
+    holders: new Set(),
+    firstRoster: Promise.withResolvers<void>(),
+    started: false,
+  }
+  const key = JSON.stringify([
+    'opencode',
+    stateDir,
+    connectionFile,
+    paths.configPath,
+    paths.statePath,
+  ])
+  const registry = new Map([[key, entry]])
+  globals[Symbol.for('@cortexkit/openai-auth/opencode-vaults')] = registry
+  const { acquireOpenCodeVault } = await import('../../core/shared-vault')
+  const options = {
+    host: 'opencode' as const,
+    stateDir,
+    connectionFile: () => connectionFile,
+  }
+  const first = acquireOpenCodeVault(options, paths)
+  const second = acquireOpenCodeVault(options, paths)
+  const status = await first.vault.status()
+  first.release()
+  second.release()
+  console.log(
+    JSON.stringify({
+      foreignCalls,
+      ignored: first.vault !== (vault as unknown),
+      shared: first.vault === second.vault,
+      retained: registry.get(key) === entry,
+      holders: entry.holders.size,
+      discovered: typeof status.discovered === 'boolean',
+      methods: [
+        first.vault.awaitRequestRoster,
+        first.vault.grantReach,
+        first.vault.reorder,
+      ].every((method) => typeof method === 'function'),
+    }),
+  )
+} else if (mode === 'old-pins') {
+  const config = process.env.OPENCODE_CONFIG_DIR as string
+  const paths = {
+    configPath: join(config, 'pool.json'),
+    statePath: join(config, 'state.json'),
+  }
+  let foreignCalls = 0
+  const foreign = () => {
+    foreignCalls++
+    throw new Error('old ledger called')
+  }
+  const old = {
+    get: foreign,
+    forget: foreign,
+    subscribe: foreign,
+    snapshot: foreign,
+    place: foreign,
+  }
+  const key = JSON.stringify([paths.configPath, paths.statePath])
+  const registry = new Map([[key, old]])
+  globals[Symbol.for('@cortexkit/openai-auth/opencode2-pins')] = registry
+  const { acquireSessionPins } = await import('../../v2/shared-pins')
+  const pins = acquireSessionPins(paths)
+  console.log(
+    JSON.stringify({
+      foreignCalls,
+      ignored: pins !== (old as unknown),
+      retained: registry.get(key) === old,
+      shared: pins === acquireSessionPins(paths),
+      pending: pins.placementSnapshot().size,
+      reservations: [pins.reserve, pins.rollback, pins.finish].every(
+        (method) => typeof method === 'function',
+      ),
+    }),
+  )
 } else if (mode === 'old-control-plane') {
   const { fakeOpenCode2Host } = await import('./opencode2-host')
   const directory = process.env.OPENCODE_CONFIG_DIR as string
