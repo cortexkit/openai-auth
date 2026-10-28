@@ -102,17 +102,31 @@ async function writeHeartbeatFile(
   // mkdir's mode does not apply to a directory that already exists.
   await chmod(dir, 0o700)
   const target = processHeartbeatPath(heartbeat.pid, dir)
+  const legacyTarget = join(dir, `0${heartbeat.pid}.json`)
+  // Pre-layout release handles can still unlink <pid>.json after a newer
+  // location starts. Existing fences accept a decimal pid with a leading zero,
+  // while those release handles only unlink the canonical name. The extra
+  // legacy record blocks moves until this pid exits.
+  const targets = hasLegacyRuntimeGeneration()
+    ? [legacyTarget, target]
+    : [target]
+  if (!hasLegacyRuntimeGeneration()) {
+    // A fresh process may reuse the pid of an exited legacy generation.
+    await rm(legacyTarget, { force: true }).catch(() => {})
+  }
   // Written to a temporary name and renamed into place, so a reader never
   // sees a half-written file.
-  const temporary = `${target}.${randomUUID()}.tmp`
-  try {
-    await writeFile(temporary, `${JSON.stringify(heartbeat)}\n`, {
-      mode: 0o600,
-    })
-    await rename(temporary, target)
-  } catch (error) {
-    await rm(temporary, { force: true }).catch(() => {})
-    throw error
+  for (const path of targets) {
+    const temporary = `${path}.${randomUUID()}.tmp`
+    try {
+      await writeFile(temporary, `${JSON.stringify(heartbeat)}\n`, {
+        mode: 0o600,
+      })
+      await rename(temporary, path)
+    } catch (error) {
+      await rm(temporary, { force: true }).catch(() => {})
+      throw error
+    }
   }
   return target
 }

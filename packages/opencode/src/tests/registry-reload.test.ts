@@ -48,6 +48,7 @@ for (const marker of ['vault', 'rpc-symbol', 'rpc-string']) {
     expect(result.oldState).toBe('old generation still owns this file')
     expect(result.selfFence.open).toBe(false)
     expect(result.otherFence.open).toBe(false)
+    expect(result.afterOldReleaseFence.open).toBe(false)
     expect(
       result.messages.filter((line: string) => line.includes('until restart')),
     ).toHaveLength(1)
@@ -64,6 +65,7 @@ it('a fresh current vault import does not look like an older generation', async 
   const { result } = await scenario('fresh-vault-import')
   expect(result.layout).toBe('state-home')
   expect(result.layouts).toEqual({ [result.key]: 'state-home' })
+  expect(result.staleWitnessRemoved).toBe(true)
 })
 
 it('reloads a pre-1.6.2 control plane without entering foreign locations', async () => {

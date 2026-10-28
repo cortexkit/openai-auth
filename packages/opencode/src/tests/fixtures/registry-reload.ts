@@ -1,6 +1,12 @@
 // Each scenario starts before importing plugin code: module initialization is
 // part of the reload boundary, not just the setup function's body.
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { join } from 'node:path'
 
 const mode = process.argv[2]
@@ -53,8 +59,15 @@ if (mode?.startsWith('legacy-')) {
     selfPid: process.pid + 1,
     isAlive: (pid) => pid === process.pid,
   })
-  // An unwritable heartbeat on the next location remains best-effort on reload.
+  // An old generation's last owner can unlink the canonical heartbeat later.
   rmSync(handle.path as string)
+  const afterOldReleaseFence = await migrationFenceOpen({
+    currentVersion: version,
+    layoutMove: true,
+    selfPid: process.pid + 1,
+    isAlive: (pid) => pid === process.pid,
+  })
+  // An unwritable canonical file on the next location remains best-effort.
   mkdirSync(handle.path as string)
   process.env.OPENCODE_CONFIG_DIR = join(config, 'another-location')
   const unwritable = await runtime.prepareRuntimeLayout({ version, log })
@@ -69,6 +82,7 @@ if (mode?.startsWith('legacy-')) {
       oldState: readFileSync(oldState, 'utf8'),
       selfFence,
       otherFence,
+      afterOldReleaseFence,
       messages,
     }),
   )
@@ -339,14 +353,23 @@ if (mode?.startsWith('legacy-')) {
     log,
     fence: async () => ({ open: true }),
   })
+  const dir = heartbeat.processHeartbeatDir()
+  mkdirSync(dir, { recursive: true })
+  const oldWitness = join(dir, `0${process.pid}.json`)
+  writeFileSync(
+    oldWitness,
+    'stale witness from a previous process with this pid',
+  )
   const handle = await heartbeat.startProcessHeartbeat({ version, logger: log })
   const record = JSON.parse(readFileSync(handle.path as string, 'utf8'))
+  const staleWitnessRemoved = !existsSync(oldWitness)
   await handle.release()
   console.log(
     JSON.stringify({
       layout,
       layouts: record.layouts,
       key: paths.runtimeLayoutLocation().key,
+      staleWitnessRemoved,
     }),
   )
 } else if (mode === 'partial-layout-state') {
