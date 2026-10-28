@@ -34,6 +34,20 @@ type Registry = {
 const KEY = Symbol.for('cortexkit.openai-auth.v2.commands')
 const log = createLogger('v2-command')
 
+function isLocation(value: unknown): value is Location {
+  if (!value || typeof value !== 'object') return false
+  const location = value as Partial<Location>
+  return (
+    location.closed instanceof AbortController &&
+    typeof location.menu?.open === 'function' &&
+    typeof location.menu?.apply === 'function' &&
+    typeof location.session?.get === 'function' &&
+    (location.registration === undefined ||
+      (location.registration !== null &&
+        typeof location.registration.dispose === 'function'))
+  )
+}
+
 function refuse(state: string) {
   log.warn(`/openai needs the terminal UI (session state: ${state}).`)
 }
@@ -41,6 +55,7 @@ function refuse(state: string) {
 function registry(): Registry {
   const process = globalThis as typeof globalThis & { [KEY]?: Registry }
   process[KEY] ??= { locations: new Map() }
+  process[KEY].locations ??= new Map()
   return process[KEY]
 }
 
@@ -63,25 +78,28 @@ export async function installControlPlane(
       drain: drainNotifications,
       apply: (request) => {
         const owner = state.locations.get(directory)
-        if (!owner) throw new Error('The OpenAI menu location was closed')
+        if (!isLocation(owner))
+          throw new Error('The OpenAI menu location was closed')
         return owner.menu.apply(request)
       },
     }),
   )
   const previous = state.locations.get(directory)
   state.locations.set(directory, location)
-  previous?.closed.abort()
-  await previous?.registration?.dispose()
-  state.command ??= {
+  if (isLocation(previous)) {
+    previous.closed.abort()
+    await previous.registration?.dispose()
+  }
+  const currentCommand: NonNullable<Registry['command']> = {
     name: 'openai',
     description: 'OpenAI account menu',
     async execute(input) {
       // Any live location can read the host's process-wide session service.
-      const api = state.locations.values().next().value?.session
+      const api = [...state.locations.values()].find(isLocation)?.session
       if (!api) return refuse('no live location')
       const session = await api.get({ sessionID: input.sessionID })
       const owner = state.locations.get(session.location.directory)
-      if (!owner) return refuse('location closed')
+      if (!isLocation(owner)) return refuse('location closed')
       const connected = await waitForTuiConnected(
         input.sessionID,
         owner.closed.signal,
@@ -120,6 +138,10 @@ export async function installControlPlane(
       pushNotification(payload, input.sessionID)
     },
   }
+  // Keep the command object held by other locations, but dispatch through the
+  // current implementation so it never enters a pre-abort-controller location.
+  state.command ??= currentCommand
+  state.command.execute = currentCommand.execute
   const command = state.command
   try {
     location.registration = await ctx.command.transform((editor) => {

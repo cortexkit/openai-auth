@@ -99,10 +99,9 @@ export class CodexHttpState {
   /** Drops a deleted host session; a later request with its id starts a new thread. */
   forget(sessionID: string): void {
     if (this.store) this.store.delete(sessionID)
-    else {
-      this.sessions.delete(sessionID)
-      this.frameTurns.forget(sessionID)
-    }
+    else this.sessions.delete(sessionID)
+    // An older shared store's delete method does not know about frame turns.
+    this.frameTurns.forget(sessionID)
   }
 }
 

@@ -21,6 +21,7 @@ import { randomUUID } from 'node:crypto'
 import { chmod, mkdir, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { hasLegacyRuntimeGeneration } from './runtime-process-state'
 
 /** Where one process keeps one config folder's runtime files. */
 export type ProcessLayout = 'legacy' | 'state-home'
@@ -67,10 +68,16 @@ const processLayouts = layoutState[layoutsKey] ?? new Map()
 layoutState[layoutsKey] = processLayouts
 
 function layoutsRecord(): Record<string, ProcessLayout> {
-  return Object.fromEntries(processLayouts)
+  return {
+    ...Object.fromEntries(processLayouts),
+    // Older generations did not record config-folder identities. A sentinel
+    // blocks moves for every folder, including before the first setup finishes.
+    ...(hasLegacyRuntimeGeneration() ? { '*': 'legacy' as const } : {}),
+  }
 }
 
 function holdsLegacyLayout(): boolean {
+  if (hasLegacyRuntimeGeneration()) return true
   for (const layout of processLayouts.values())
     if (layout === 'legacy') return true
   return false
@@ -179,8 +186,9 @@ export async function recordProcessLayout(input: {
   pid?: number
   dir?: string
 }): Promise<void> {
-  processLayouts.set(input.key, input.layout)
-  if (input.layout !== 'legacy') return
+  const layout = hasLegacyRuntimeGeneration() ? 'legacy' : input.layout
+  processLayouts.set(input.key, layout)
+  if (layout !== 'legacy') return
   processStartedAt ??= (input.now ?? Date.now)()
   await writeHeartbeatFile(input.dir ?? processHeartbeatDir(), {
     pid: input.pid ?? process.pid,

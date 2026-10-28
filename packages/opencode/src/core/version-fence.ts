@@ -32,6 +32,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { isOpenaiRpcStateDir } from '../rpc/port-file'
+import { hasLegacyRuntimeGeneration } from './runtime-process-state'
 
 /** One live process that keeps the fence shut. */
 export interface VersionFenceBlocker {
@@ -55,7 +56,7 @@ export interface VersionFenceOptions {
   /** The version that wants to migrate. */
   currentVersion: string
   isAlive?: (pid: number) => boolean
-  /** This process, which never blocks itself. Defaults to `process.pid`. */
+  /** This process; only an older generation in it blocks its own layout move. */
   selfPid?: number
   /**
    * Set when the runtime files are about to move: a live process that uses
@@ -211,6 +212,16 @@ export async function migrationFenceOpen(
     const key = entry.pid === 'unknown' ? `dir:${entry.detail}` : entry.pid
     if (!blockers.has(key)) blockers.set(key, entry)
   }
+  if (
+    options.layoutMove &&
+    self === process.pid &&
+    hasLegacyRuntimeGeneration()
+  )
+    block({
+      pid: self,
+      version: 'unknown',
+      detail: 'an older plugin generation ran in this process',
+    })
   const alive = (pid: number) => {
     try {
       return isAlive(pid)

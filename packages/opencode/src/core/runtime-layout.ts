@@ -127,6 +127,10 @@ import {
   setRuntimeLayout,
 } from './account-paths'
 import { recordProcessLayout } from './process-heartbeat'
+import {
+  hasLegacyRuntimeGeneration,
+  runtimeProcessState as processState,
+} from './runtime-process-state'
 import { migrationFenceOpen, type VersionFenceResult } from './version-fence'
 
 export type { RuntimeLayout }
@@ -257,22 +261,6 @@ interface LayoutFiles {
   sessions: LayoutFile[]
 }
 
-// Per-process bookkeeping, on the global object because OpenCode 2 may load
-// more than one copy of this bundle into one process.
-const stateKey = Symbol.for('@cortexkit/openai-auth/runtime-layout-runs')
-const globalState = globalThis as typeof globalThis & {
-  [stateKey]?: {
-    runs: Map<string, Promise<RuntimeLayout>>
-    logged: Set<string>
-    notice?: { text: string; shown: boolean }
-  }
-}
-const processState = globalState[stateKey] ?? {
-  runs: new Map<string, Promise<RuntimeLayout>>(),
-  logged: new Set<string>(),
-}
-globalState[stateKey] = processState
-
 /** Test seam: forget this process's runs, log lines and notice. */
 export function __resetRuntimeLayoutRunsForTest(): void {
   processState.runs.clear()
@@ -393,6 +381,29 @@ async function decide(
   options: RuntimeLayoutOptions,
 ): Promise<RuntimeLayout> {
   const log = options.log ?? createLogger('runtime-layout')
+  if (hasLegacyRuntimeGeneration()) {
+    // No filesystem inspection or lock is needed: old timers may still own
+    // these paths, even if another process has already written a move marker.
+    setRuntimeLayout(location, 'legacy')
+    logOnce('legacy-generation', () =>
+      log.info(
+        "openai-auth keeps its runtime files in OpenCode's config folder until restart: an older plugin version ran in this process",
+      ),
+    )
+    try {
+      await recordProcessLayout({
+        key: location.key,
+        layout: 'legacy',
+        version: options.version,
+      })
+    } catch (error) {
+      // Reload must not refuse startup when auxiliary heartbeat writing fails.
+      log.warn('process heartbeat not written', {
+        errorClass: errorClass(error),
+      })
+    }
+    return 'legacy'
+  }
   const stateDir = location.stateHomeDir
   const markerPath = join(stateDir, RUNTIME_LAYOUT_MARKER_FILE)
   const files = layoutFiles(location)

@@ -248,6 +248,24 @@ const processState = globalThis as typeof globalThis & {
 const stores = processState[registryKey] ?? new Map<string, CodexSessionStore>()
 processState[registryKey] = stores
 
+function isStore(value: unknown): value is CodexSessionStore {
+  if (!value || typeof value !== 'object') return false
+  const store = value as Partial<CodexSessionStore>
+  return (
+    store.sessions instanceof Map &&
+    typeof store.get === 'function' &&
+    typeof store.delete === 'function' &&
+    typeof store.save === 'function' &&
+    typeof store.settled === 'function' &&
+    (store.frameTurns === undefined ||
+      (store.frameTurns !== null &&
+        typeof store.frameTurns.advance === 'function' &&
+        typeof store.frameTurns.get === 'function' &&
+        typeof store.frameTurns.completed === 'function' &&
+        typeof store.frameTurns.forget === 'function'))
+  )
+}
+
 /**
  * The process's one store for this session file, loading the file the first
  * time. Never released: the map lives until the server process exits, so a
@@ -257,10 +275,25 @@ export function acquireCodexSessions(
   path = opencode2CodexSessionsPath(),
 ): CodexSessionStore {
   const key = resolve(path)
-  let store = stores.get(key)
+  // A foreign entry may still own pending writes. Leave it and its registry
+  // intact; new copies share a separate map rather than entering its methods.
+  const sharedRegistry = stores as typeof stores & {
+    compatible?: Map<string, CodexSessionStore>
+  }
+  const candidate = stores.get(key)
+  let registry = stores
+  if (candidate !== undefined && !isStore(candidate)) {
+    sharedRegistry.compatible ??= new Map()
+    registry = sharedRegistry.compatible
+  }
+  let store = registry.get(key)
   if (!store) {
     store = new CodexSessionStore(key)
-    stores.set(key, store)
+    registry.set(key, store)
   }
+  // Releases before 1.2 kept the same public store protocol but did not track
+  // WebSocket frame turns. Add that state to the store old locations still hold.
+  const shared: { frameTurns?: FrameTurnState } = store
+  shared.frameTurns ??= new FrameTurnState()
   return store
 }

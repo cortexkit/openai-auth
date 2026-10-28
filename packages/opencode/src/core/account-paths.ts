@@ -8,6 +8,7 @@ import {
   type AccountPaths,
   deriveStatePath,
 } from '@cortexkit/openai-auth-core/tui-support'
+import { hasLegacyRuntimeGeneration } from './runtime-process-state'
 import { defaultStateHome } from './version-fence'
 
 /**
@@ -205,7 +206,10 @@ export function setRuntimeLayout(
   location: RuntimeLayoutLocation,
   layout: RuntimeLayout,
 ): void {
-  decisions.set(decisionKey(location), layout)
+  decisions.set(
+    decisionKey(location),
+    hasLegacyRuntimeGeneration() ? 'legacy' : layout,
+  )
 }
 
 /** The layout this process fixed for a config folder, if any. */
@@ -228,6 +232,7 @@ export function __resetRuntimeLayoutsForTest(): void {
  * OpenCode's config folder until then.
  */
 export function getRuntimeDir(configDir = getConfigDir()): string {
+  if (hasLegacyRuntimeGeneration()) return configDir
   const location = runtimeLayoutLocation(configDir)
   const layout =
     decidedRuntimeLayout(location) ??

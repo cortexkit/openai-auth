@@ -62,6 +62,7 @@ let serverPlugin = ''
 let loginPlugin = ''
 let vaultPlugin = ''
 let upgradePlugin = ''
+let reloadPlugin = ''
 let packedConsumer = ''
 
 /** The vault account's record version, which a 401 must be reported with. */
@@ -276,6 +277,8 @@ interface ScenarioResult {
     leftInConfig: string[]
   }
   readonly diagnostics: string
+  readonly reloadTrace: Array<{ event: string }>
+  readonly heartbeatLayouts: Record<string, string>
 }
 
 /** The vault enrollment `seedPool`'s vault scenarios add to the old layout. */
@@ -300,6 +303,11 @@ async function runScenario(input: {
   model?: string
   /** Serve account V from a mock Claustrum vault this host is enrolled in. */
   vault?: boolean
+  /**
+   * Seed an old vault registry and command locations without abort controllers,
+   * then edit the live entry to load the current server code.
+   */
+  reload?: boolean
 }): Promise<ScenarioResult> {
   const root = mkdtempSync(join(tmpdir(), 'oai-oc2-e2e-'))
   const project = join(root, 'project')
@@ -312,6 +320,7 @@ async function runScenario(input: {
     // Read by the vault plugin entry, which sends its quota polls to the mock.
     OPENAI_AUTH_E2E_MOCK_URL: mock.url,
     OPENAI_AUTH_E2E_RETRIES: join(root, 'retries.jsonl'),
+    OPENAI_AUTH_E2E_RELOAD_TRACE: join(root, 'reload.jsonl'),
   }
   const configDir = join(isolated.XDG_CONFIG_HOME, 'opencode')
   // The pool is seeded where versions before the move kept it; the plugin
@@ -359,7 +368,11 @@ async function runScenario(input: {
     JSON.stringify(
       {
         plugins: [
-          input.upgrade ? upgradePlugin : (input.plugin ?? serverPlugin),
+          input.reload
+            ? reloadPlugin
+            : input.upgrade
+              ? upgradePlugin
+              : (input.plugin ?? serverPlugin),
         ],
         providers: {
           openai: {
@@ -415,6 +428,45 @@ async function runScenario(input: {
   let exported = ''
   try {
     await waitForServer(serverURL, server)
+    if (input.reload) {
+      const response = await fetch(`${serverURL}/api/location`, {
+        headers: { authorization: `Basic ${btoa(`opencode:${PASSWORD}`)}` },
+      })
+      if (!response.ok)
+        throw new Error(`location setup answered ${response.status}`)
+      await response.body?.cancel()
+      const trace = () =>
+        existsSync(env.OPENAI_AUTH_E2E_RELOAD_TRACE ?? '')
+          ? readFileSync(env.OPENAI_AUTH_E2E_RELOAD_TRACE ?? '', 'utf8')
+          : ''
+      const waitForSetup = async (event: string) => {
+        const deadline = Date.now() + 30_000
+        while (!trace().includes(`"event":"${event}"`)) {
+          if (Date.now() >= deadline)
+            throw new Error(
+              `plugin reload never reached ${event}: ${trace()}\n${serverLog.join('')}`,
+            )
+          await Bun.sleep(50)
+        }
+      }
+      await waitForSetup('old-setup')
+      writeFileSync(
+        join(reloadPlugin, 'index.js'),
+        [
+          `import plugin from '${PACKAGE_NAME}/server'`,
+          "import { appendFileSync } from 'node:fs'",
+          "export default { id: 'openai-auth-reload-probe', async setup(ctx) {",
+          '  const dispose = await plugin.setup(ctx)',
+          '  appendFileSync(process.env.OPENAI_AUTH_E2E_RELOAD_TRACE, JSON.stringify({event:"new-setup"}) + "\\n")',
+          '  return dispose',
+          '} }',
+        ].join('\n'),
+      )
+      await waitForSetup('new-setup')
+      // Bare timers are not owned by the host's plugin scope. Observe the old
+      // generation after replacement, not just while its cleanup was pending.
+      await Bun.sleep(100)
+    }
     if (input.login) {
       const login = await runCli(
         [
@@ -524,6 +576,22 @@ async function runScenario(input: {
     `--- plugin log (tail) ---\n${pluginLog.slice(-6000)}`,
     `--- host log (tail) ---\n${serverLog.join('').slice(-6000)}`,
   ].join('\n')
+  const reloadTrace = existsSync(env.OPENAI_AUTH_E2E_RELOAD_TRACE ?? '')
+    ? readFileSync(env.OPENAI_AUTH_E2E_RELOAD_TRACE ?? '', 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+    : []
+  const heartbeatLayouts =
+    read(
+      join(
+        isolated.XDG_STATE_HOME,
+        'cortexkit',
+        'openai-auth',
+        'processes',
+        `${server.pid}.json`,
+      ),
+    ).layouts ?? {}
   rmSync(root, { recursive: true, force: true })
   return {
     destinations,
@@ -538,6 +606,8 @@ async function runScenario(input: {
     exported,
     runtime,
     diagnostics,
+    reloadTrace,
+    heartbeatLayouts,
   }
 }
 
@@ -638,6 +708,23 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         '  return async () => { await retry.dispose(); await dispose?.() }',
         '} }',
         '',
+      ].join('\n'),
+    )
+    reloadPlugin = join(consumer, 'reload-plugin')
+    mkdirSync(reloadPlugin, { recursive: true })
+    writeFileSync(
+      join(reloadPlugin, 'index.js'),
+      [
+        "import { appendFileSync } from 'node:fs'",
+        'const record = (event) => appendFileSync(process.env.OPENAI_AUTH_E2E_RELOAD_TRACE, JSON.stringify({event}) + "\\n")',
+        "export default { id: 'openai-auth-reload-probe', async setup(ctx) {",
+        "  globalThis[Symbol.for('@cortexkit/openai-auth/opencode-vaults')] ??= new Map()",
+        "  globalThis[Symbol.for('cortexkit.openai-auth.v2.commands')] ??= { locations: new Map([[ctx.location.directory, {session: ctx.session, menu: {open() {throw new Error('old menu called')}, apply() {throw new Error('old apply called')}}}]]) }",
+        // Model a process-wide owner that outlives the old location's cleanup.
+        "  setInterval(() => record('old-tick'), 20).unref()",
+        "  record('old-setup')",
+        "  return () => record('old-dispose')",
+        '} }',
       ].join('\n'),
     )
     // Observe the destination chosen by the real driver before redirecting
@@ -867,6 +954,34 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     () => proveControlPlane(true),
     60_000,
   )
+
+  test('server plugin reload preserves old-shape state and defers the runtime move', async () => {
+    const result = await runScenario({
+      transport: 'http',
+      accounts: ['A'],
+      turns: [{}],
+      reload: true,
+    })
+    verify(result, () => {
+      expect(result.exits).toEqual([0])
+      expect(primaries(result.wire).length).toBeGreaterThan(0)
+      expect(
+        primaries(result.wire).every((entry) => entry.identity === 'A'),
+      ).toBe(true)
+      expect(result.runtime.marker).toEqual({})
+      expect(result.runtime.leftInConfig).toContain('openai-auth-state.json')
+      expect(Object.values(result.heartbeatLayouts)).toContain('legacy')
+      expect(Object.values(result.heartbeatLayouts)).not.toContain('state-home')
+      const events = result.reloadTrace.map((entry) => entry.event)
+      const replacement = events.indexOf('new-setup')
+      expect(events).toContain('old-dispose')
+      expect(replacement).toBeGreaterThan(events.indexOf('old-dispose'))
+      expect(events.slice(replacement + 1)).toContain('old-tick')
+      expect(
+        result.diagnostics.match(/until restart: an older plugin version ran/g),
+      ).toHaveLength(1)
+    })
+  }, 120_000)
 
   test('http: a prepared API key bypasses a migrated pool without attribution', async () => {
     const key = 'sk-opencode2-user-key'
