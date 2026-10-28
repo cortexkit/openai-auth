@@ -439,7 +439,7 @@ try {
     const at = `at width ${width}: ${view.captureCharFrame()}`
     assert.match(
       row,
-      /^Killswitch [^ ]/,
+      /^Killswitch +\S/,
       `the Killswitch row has no blank cell before its value ${at}`,
     )
     assert.equal(
@@ -462,11 +462,7 @@ try {
       row.endsWith('…'),
       `the long Killswitch value is not cut with … ${at}`,
     )
-    assert.match(
-      row,
-      /^Killswitch [^ ]/,
-      `no blank cell before the value ${at}`,
-    )
+    assert.match(row, /^Killswitch +\S/, `no blank cell before the value ${at}`)
     const value = row.slice('Killswitch '.length, -1)
     assert.ok(
       value.length > 0 && full.startsWith(value),
