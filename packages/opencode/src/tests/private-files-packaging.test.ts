@@ -44,7 +44,7 @@ describe('private-files packaging boundary', () => {
       const manifest = JSON.parse(
         readFileSync(join(root, 'package.json'), 'utf8'),
       )
-      expect(manifest.dependencies['@cortexkit/private-files']).toBe('^0.2.1')
+      expect(manifest.dependencies['@cortexkit/private-files']).toBe('^0.2.2')
       assertExternalTree(join(root, 'dist'))
     })
   }
