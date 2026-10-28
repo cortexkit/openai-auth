@@ -1,2 +1,4 @@
 # Files git does not hold that engram backs up nightly.
 .cortexkit/internal-docs/
+.cortexkit/scripts/
+.cortexkit/prefrontal/
