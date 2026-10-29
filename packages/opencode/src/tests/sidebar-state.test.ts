@@ -34,6 +34,7 @@ import {
   isQuotaExhausted,
   isUsableRoutingEntry,
   normalizeSidebarState,
+  persistSidebarStickyAssignment,
   pruneActiveRouting,
   pruneStickyAssignments,
   removeSidebarActiveRouting,
@@ -2809,6 +2810,119 @@ test('routing writers prune disabled and killed sticky assignments', async () =>
   expect((await getSidebarState(removeFile)).stickyAssignments).toEqual(
     expectedStickyAssignments,
   )
+})
+
+for (const writer of ['routing', 'legacy-routing', 'pin'] as const) {
+  test(`local ${writer} writer survives a stale vault snapshot after another process disconnects`, async () => {
+    const file = join(
+      mkdtempSync(join(tmpdir(), 'oai-sb-disconnect-')),
+      'sidebar.json',
+    )
+    const now = Date.now()
+    await setSidebarState(
+      make({ vaultAccounts: [], vaultDiscovered: true }),
+      file,
+    )
+    const hooks = { vaultMode: false, canWrite: () => true }
+    const assignment = {
+      accountId: 'local-fallback',
+      assignedAt: now,
+      lastSeenAt: now,
+      inputBytes: 128,
+    }
+    if (writer === 'pin') {
+      await persistSidebarStickyAssignment(
+        {
+          sessionId: 'session',
+          assignment,
+          validPinnedAccountIds: ['local-fallback'],
+        },
+        file,
+        hooks,
+      )
+    } else if (writer === 'routing') {
+      await upsertSidebarActiveRouting(
+        {
+          sessionId: 'session',
+          activeId: 'local-fallback',
+          route: 'sticky-balanced',
+          updatedAt: now,
+        },
+        [fb({ id: 'local-fallback' })],
+        file,
+        hooks,
+      )
+    } else {
+      await setSidebarLegacyRouting(
+        { activeId: 'local-fallback', route: 'fallback-first', updatedAt: now },
+        file,
+        hooks,
+      )
+    }
+    const local = await getSidebarState(file)
+    if (writer === 'pin')
+      expect(
+        local.stickyAssignments?.[hashSidebarSessionId('session')],
+      ).toEqual(assignment)
+    else expect(local.activeId).toBe('local-fallback')
+    if (writer === 'routing')
+      expect(local.activeRouting?.session?.activeId).toBe('local-fallback')
+    expect(local.vaultAccounts).toBeUndefined()
+    expect(local.vaultDiscovered).toBeUndefined()
+
+    await setSidebarMachineState(
+      {
+        main: main(null),
+        fallbacks: [],
+        vaultAccounts: [],
+        route: 'main-first',
+        lastUpdated: now + 1,
+      },
+      file,
+      { vaultMode: true, canWrite: () => true },
+    )
+    const vault = await getSidebarState(file)
+    expect(vault.activeId).toBeUndefined()
+    expect(vault.activeRouting?.session).toBeUndefined()
+    expect(
+      vault.stickyAssignments?.[hashSidebarSessionId('session')],
+    ).toBeUndefined()
+  })
+}
+
+test('sticky pin writes recheck writer authority after waiting on the file', async () => {
+  const file = join(
+    mkdtempSync(join(tmpdir(), 'oai-sb-pin-authority-')),
+    'sidebar.json',
+  )
+  await setSidebarState(make({ vaultAccounts: [] }), file)
+  let local = true
+  const now = Date.now()
+  await persistSidebarStickyAssignment(
+    {
+      sessionId: 'late',
+      assignment: {
+        accountId: 'main',
+        assignedAt: now,
+        lastSeenAt: now,
+        inputBytes: 128,
+      },
+      validPinnedAccountIds: ['main'],
+    },
+    file,
+    {
+      vaultMode: false,
+      canWrite: () => local,
+      beforeRecheck: () => {
+        local = false
+      },
+    },
+  )
+  const state = await getSidebarState(file)
+  expect(state.vaultAccounts).toEqual([])
+  expect(
+    state.stickyAssignments?.[hashSidebarSessionId('late')],
+  ).toBeUndefined()
 })
 
 test('vault machine writes clear persisted local main identity and quota', async () => {

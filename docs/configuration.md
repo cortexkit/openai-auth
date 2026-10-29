@@ -138,7 +138,7 @@ Close every OpenCode process before switching versions or moving credentials. Do
 
 ## Pi
 
-The settings above are the OpenCode plugin's; the Pi extension does not read them. Its account store is `openai-auth.json` in Pi's agent directory (`~/.pi/agent` unless `PI_AGENT_DIR` says otherwise); `PI_OPENAI_AUTH_FILE` overrides the store's path and `PI_OPENAI_AUTH_STATE_FILE` the state file's path.
+The settings above are the OpenCode plugin's; the Pi extension does not read them. Its account store is `openai-auth.json` in Pi's agent directory (`~/.pi/agent` unless `PI_CODING_AGENT_DIR` says otherwise, with `~` expanded by Pi); `PI_OPENAI_AUTH_FILE` overrides the store's path and `PI_OPENAI_AUTH_STATE_FILE` the state file's path. `PI_AGENT_DIR` is not used. If only `~/.pi/agent` has an existing store (settings, account state, or a vault enrollment token/state file), the extension keeps using it there and logs a warning to stderr once per process. A cached vault roster alone does not count as an enrollment. If the configured directory already has a store, it wins; if neither has one, the configured directory is used. Credentials are never copied or moved between directories.
 
 The Pi provider catalog includes `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini` and `gpt-5.3-codex-spark`.
 

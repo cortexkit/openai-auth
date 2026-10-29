@@ -22,7 +22,7 @@ import {
   vaultStateDir,
 } from '@cortexkit/openai-auth-core/internal'
 import piPackage from '../../pi/package.json'
-import { getPiAccountPaths } from '../../pi/src/paths'
+import { getPiAccountPaths } from '../../pi/src/store-paths'
 import packageInfo from '../package.json'
 import { getAccountPaths } from './core/account-paths'
 import { opencodeAuthIsEnvBacked } from './core/host-slot'

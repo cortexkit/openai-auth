@@ -434,7 +434,10 @@ async function decide(
     const manifestLeft = await exists(
       join(stateDir, RUNTIME_LAYOUT_MANIFEST_FILE),
     ).catch(() => true)
-    if (!manifestLeft) return stateHome()
+    const tempsLeft =
+      !overriding &&
+      (await oldAtomicTemps(files).catch(() => [true])).length > 0
+    if (!manifestLeft && !tempsLeft) return stateHome()
   }
 
   // A state-home folder that is OpenCode's config folder itself (a link or a
@@ -486,7 +489,7 @@ async function decide(
       return await legacy()
     }
     if (marker) {
-      if (!marker.oldFilesRemoved && !overriding && !aliased)
+      if (!overriding && !aliased)
         await finishOldFiles(location, files, markerPath, marker, lock, {
           fence,
           log,
@@ -695,6 +698,7 @@ async function moveFiles(
         keptVaultState,
         steps: input.steps,
       })
+      await removeOldAtomicTemps(files, layoutLock, locks, input.steps)
     } catch (error) {
       if (!(error instanceof OldCredentialKeptError)) throw error
       // The copies are verified and the marker is written, so this process
@@ -761,11 +765,19 @@ async function finishOldFiles(
     }
     step = 'remove-old-copies'
     await layoutLock.assertOwned()
-    await removeOldCopies(location, await presentOldFiles(files), layoutLock, {
-      log: input.log,
-      keptVaultState: marker.keptVaultState,
-      steps: input.steps,
-    })
+    if (!marker.oldFilesRemoved)
+      await removeOldCopies(
+        location,
+        await presentOldFiles(files),
+        layoutLock,
+        {
+          log: input.log,
+          keptVaultState: marker.keptVaultState,
+          steps: input.steps,
+        },
+      )
+    step = 'remove-old-temps'
+    await removeOldAtomicTemps(files, layoutLock, locks, input.steps)
     done = true
     step = 'marker'
     await layoutLock.assertOwned()
@@ -1025,6 +1037,63 @@ export async function removeMovedVaultStateLeftover(
 /** Lock files, eviction markers and staged writes come and go with a writer. */
 function isTransient(name: string): boolean {
   return name.includes('.lock') || name.includes('.tmp')
+}
+
+// common-auth's default atomic writer uses a lowercase randomUUID() suffix.
+// Match only stages beside known runtime targets, never arbitrary *.tmp files.
+const ATOMIC_STAGE_SUFFIX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/
+
+async function oldAtomicTemps(files: LayoutFiles): Promise<string[]> {
+  const vault = vaultPaths(files.vault.old, 'opencode')
+  const targets = [
+    files.state.old,
+    ...files.sessions.map((file) => file.old),
+    vault.rosterPath,
+    vault.statePath,
+    vault.tokenPath,
+  ]
+  const found: string[] = []
+  for (const dir of new Set(targets.map(dirname))) {
+    let entries: Dirent[]
+    try {
+      entries = await readdir(dir, { withFileTypes: true })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+      throw error
+    }
+    const prefixes = targets
+      .filter((path) => dirname(path) === dir)
+      .map((path) => `${basename(path)}.`)
+    for (const entry of entries) {
+      if (
+        entry.isFile() &&
+        prefixes.some(
+          (prefix) =>
+            entry.name.startsWith(prefix) &&
+            ATOMIC_STAGE_SUFFIX.test(entry.name.slice(prefix.length)),
+        )
+      )
+        found.push(join(dir, entry.name))
+    }
+  }
+  return found
+}
+
+async function removeOldAtomicTemps(
+  files: LayoutFiles,
+  layoutLock: RefreshFileLock,
+  locks: RefreshFileLock[],
+  steps: RuntimeLayoutOptions['steps'],
+): Promise<void> {
+  for (const path of await oldAtomicTemps(files)) {
+    await steps?.beforeRemove?.(path)
+    await layoutLock.assertOwned()
+    for (const lock of locks) await lock.assertOwned()
+    await unlink(path).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT') throw error
+    })
+  }
 }
 
 /** The regular, non-transient files directly in a folder. */

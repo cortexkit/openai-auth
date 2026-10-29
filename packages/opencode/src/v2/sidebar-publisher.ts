@@ -170,7 +170,8 @@ class SidebarPublisher {
               store,
               Date.now(),
             )
-        await setSidebarMachineState(machine, this.file, { canWrite })
+        const hooks = { canWrite, vaultMode }
+        await setSidebarMachineState(machine, this.file, hooks)
         if (!canWrite() || !routing) return
         const accounts = machine.vaultAccounts ?? machine.fallbacks
         if (routing.accountId === undefined) {
@@ -179,7 +180,7 @@ class SidebarPublisher {
             routing.sessionId,
             accounts,
             this.file,
-            { canWrite },
+            hooks,
           )
           return
         }
@@ -202,6 +203,7 @@ class SidebarPublisher {
               ],
             },
             this.file,
+            hooks,
           )
         }
         await upsertSidebarActiveRouting(
@@ -213,7 +215,7 @@ class SidebarPublisher {
           },
           accounts,
           this.file,
-          { canWrite },
+          hooks,
         )
       })
       .catch(() => {

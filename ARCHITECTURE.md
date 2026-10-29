@@ -147,7 +147,7 @@
 - Purpose: Same Codex OAuth capability for the Pi coding agent (separate OpenAI Codex Responses API surface), plus the shared account commands.
 - Location: `packages/pi/src/index.ts`, `packages/pi/src/commands.ts`, `packages/pi/src/paths.ts`, `packages/pi/src/routing.ts`, `packages/pi/src/raw-ws-node.ts`
 - Contains: Provider registration (`openai-codex`), model list (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`), custom streaming wrapper, hand-rolled WebSocket shim, and thin wrappers registering `openai-account`, `openai-quota` and `openai-routing` over the shared core bodies. Not `openai-reset`: it spends an irreversible credit bound to a ChatGPT identity Pi has no concept of.
-- Storage: its own paths (`PI_OPENAI_AUTH_FILE` else `PI_AGENT_DIR` else `~/.pi/agent`), never the `OPENCODE_*` variables for either file.
+- Storage: `PI_OPENAI_AUTH_FILE` else Pi's `getAgentDir()` (`PI_CODING_AGENT_DIR` with tilde expansion, default `~/.pi/agent`), retaining a default-directory store in place with a warning if the configured directory has none; never the `OPENCODE_*` variables for either file.
 - Known gap: the Pi request path does not read the store, so a routing choice persists without moving traffic. Tracked as issue #153.
 - Depends on: `@earendil-works/pi-ai` (imported via `/compat` to match Pi loader's alias table), `@earendil-works/pi-coding-agent`, `node:net`/`node:tls`, `@cortexkit/openai-auth-core`.
 - Used by: Pi extension loader.
