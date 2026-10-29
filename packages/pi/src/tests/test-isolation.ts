@@ -5,8 +5,8 @@ import { join, resolve } from 'node:path'
 import { getAgentDir } from '@earendil-works/pi-coding-agent'
 
 // Register in each test file so direct, filtered and subprocess test runs all
-// isolate native Pi auth. PI_AGENT_DIR only steers the extension's own store;
-// Pi 1.0.4 resolves its auth.json through PI_CODING_AGENT_DIR instead.
+// isolate both native Pi auth and the extension store through Pi's own
+// PI_CODING_AGENT_DIR setting.
 export function isolatePiAgentDir(): () => string {
   let dir: string
   let previous: string | undefined
