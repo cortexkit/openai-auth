@@ -11,6 +11,9 @@ Standing rules for workers. Anything not listed here comes to the coordinating a
 - Show each fix's test failing without the fix (revert the fix, run the test, restore it), and quote the failure line in the report.
 - Windows runs in CI only. If a change touches file permissions, locks, paths or process spawning, say so in the report, so the coordinating agent runs the Windows workflow before merging.
 
+## Report-only tasks
+- A task that only writes a report under `.cortexkit/internal-docs/` changes no product code: skip the gate, commit nothing, and deliver with the existing HEAD. The report reaches the head when the task is settled.
+
 ## Pre-approved (do it, then report it)
 - Regenerate `bun.lock` after a manifest change you were asked to make.
 - Add test seams and test-only helpers, kept out of the published types.
