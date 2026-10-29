@@ -114,20 +114,30 @@ suite() {
   (trap - EXIT; cd "$directory"; exec "$@") > "$logs/$name.log" 2>&1 &
   pids+=("$!")
 }
+failed=
+collect() {
+  local i status
+  for i in "${!pids[@]}"; do
+    status=0
+    wait "${pids[$i]}" || status=$?
+    counts "${names[$i]}" "$logs/${names[$i]}.log" || status=1
+    if [[ $status -ne 0 ]]; then
+      tail -n 80 "$logs/${names[$i]}.log"
+      if [[ -z "$failed" ]]; then failed=${names[$i]}; fi
+    fi
+  done
+  names=()
+  pids=()
+}
 step=suites
-for package in core opencode pi; do
-  suite "$package" "packages/$package" bun run test
-done
+# The OpenCode unit suite asserts real time limits (5 s test timeouts around
+# vault and WebSocket timing). Run it alone after the other suites rather than
+# beside the real-host suites, which saturate the job's cores.
+suite core packages/core bun run test
+suite pi packages/pi bun run test
 suite opencode1-e2e packages/opencode env OPENAI_AUTH_OPENCODE1_E2E=1 bun test src/tests/opencode1-e2e.test.ts
 suite opencode2-e2e packages/opencode env OPENAI_AUTH_OPENCODE2_E2E=1 bun test src/tests/opencode2-e2e.test.ts
-failed=
-for i in "${!pids[@]}"; do
-  status=0
-  wait "${pids[$i]}" || status=$?
-  counts "${names[$i]}" "$logs/${names[$i]}.log" || status=1
-  if [[ $status -ne 0 ]]; then
-    tail -n 80 "$logs/${names[$i]}.log"
-    if [[ -z "$failed" ]]; then failed=${names[$i]}; fi
-  fi
-done
+collect
+suite opencode packages/opencode bun run test
+collect
 if [[ -n "$failed" ]]; then step=$failed; exit 1; fi
