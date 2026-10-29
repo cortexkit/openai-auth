@@ -10,7 +10,8 @@ packages/opencode/src/tui-compiled/
 .opencode/
 .claude/
 .alfonso/
-.cortexkit/
+.cortexkit/*
+!.cortexkit/WORKER.md
 HANDOVER.md
 
 # Paused local benchmark harness (owned out-of-tree)

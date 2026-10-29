@@ -73,20 +73,10 @@ echo ""
 echo "→ Running pre-release checks..."
 echo ""
 
-echo "  bun format:check..."
-bun run format:check 2>&1 || { echo "Error: Format check failed"; exit 1; }
-
-echo "  bun lint..."
-bun run lint 2>&1 || { echo "Error: Lint failed"; exit 1; }
-
-echo "  bun typecheck..."
-bun run typecheck 2>&1 || { echo "Error: Typecheck failed"; exit 1; }
+./scripts/gate.sh --fast
 
 echo "  bun test..."
 bun run test 2>&1 || { echo "Error: Tests failed"; exit 1; }
-
-echo "  bun build..."
-bun run build 2>&1 || { echo "Error: Build failed"; exit 1; }
 
 echo "  ✓ All checks passed"
 echo ""
