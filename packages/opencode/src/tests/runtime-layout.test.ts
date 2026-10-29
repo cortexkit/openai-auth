@@ -395,6 +395,56 @@ describe('the runtime layout on a fresh install', () => {
 })
 
 describe('moving an existing layout', () => {
+  for (const phase of ['move', 'retry', 'finished'] as const) {
+    it(`removes only owned atomic-write temps on ${phase}, preserving enrollment state`, async () => {
+      const files = oldLayout()
+      seed(configDir(), files)
+      if (phase !== 'move') {
+        await prepare({
+          ...(phase === 'retry'
+            ? {
+                steps: {
+                  afterMarker: () => {
+                    throw new Error('crash')
+                  },
+                },
+              }
+            : {}),
+        })
+        resetProcess()
+      }
+      const uuid = '01234567-89ab-4cde-8fab-0123456789ab'
+      const temps = Object.fromEntries(
+        Object.keys(files).map((name) => [`${name}.${uuid}.tmp`, 'staged']),
+      )
+      seed(configDir(), temps)
+      const foreign = {
+        [`openai-auth.json.${uuid}.tmp`]: 'settings are not moved',
+        [`other.json.${uuid}.tmp`]: 'not ours',
+        [`openai-auth-vault/other.json.${uuid}.tmp`]: 'not ours',
+        'openai-auth-vault/opencode-roster.json.not-a-uuid.tmp': 'not ours',
+        [`openai-auth-vault/opencode-roster.json.${uuid}.tmp.bak`]: 'not ours',
+      }
+      seed(configDir(), foreign)
+      const stagedDir = join(
+        configDir(),
+        `openai-auth-state.json.${uuid.replace('01234567', '12345678')}.tmp`,
+      )
+      mkdirSync(stagedDir)
+
+      expect(await prepare()).toBe('state-home')
+      expect(present(configDir(), temps)).toEqual(absent(temps))
+      expect(present(configDir(), foreign)).toEqual(foreign)
+      expect(statSync(stagedDir).isDirectory()).toBe(true)
+      expect(present(configDir(), files)).toEqual(leftAfterMove(files))
+      expect(present(runtimeDir(), temps)).toEqual(absent(temps))
+      expect(marker()?.oldFilesRemoved).toBe(true)
+      expect(marker()?.keptVaultState).toBe(
+        sha256(files[VAULT_STATE] as string),
+      )
+    })
+  }
+
   it('moves the state, the vault folder and both sessions files byte for byte, keeping vault mode', async () => {
     const files = oldLayout()
     seed(configDir(), files)
@@ -1518,6 +1568,49 @@ describe('an approved vault enrollment and older versions', () => {
 })
 
 describe('the layout lease before every removal', () => {
+  it('a lease lost before an atomic-write temp unlink keeps it for the next start', async () => {
+    seed(configDir(), oldLayout())
+    await prepare()
+    resetProcess()
+    const temp = join(
+      configDir(),
+      'openai-auth-vault/opencode-roster.json.01234567-89ab-4cde-8fab-0123456789ab.tmp',
+    )
+    writePrivate(temp, 'staged')
+    await prepare({
+      steps: {
+        beforeRemove: (path) => {
+          if (path === temp) stealLayoutLease()
+        },
+      },
+    })
+    expect(readFileSync(temp, 'utf8')).toBe('staged')
+    rmSync(layoutLockPath(), { force: true })
+    resetProcess()
+    await prepare()
+    expect(existsSync(temp)).toBe(false)
+  })
+
+  it('a finished move leaves atomic-write temps alone while a legacy writer is alive or a path is overridden', async () => {
+    seed(configDir(), oldLayout())
+    await prepare()
+    resetProcess()
+    const temp = join(
+      configDir(),
+      'openai-auth-state.json.01234567-89ab-4cde-8fab-0123456789ab.tmp',
+    )
+    writePrivate(temp, 'staged')
+    await prepare({ fence: async () => ({ open: false, blockers: [] }) })
+    expect(existsSync(temp)).toBe(true)
+    resetProcess()
+    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = join(
+      configDir(),
+      'openai-auth-state.json',
+    )
+    await prepare()
+    expect(existsSync(temp)).toBe(true)
+  })
+
   it('a lease lost right before an old file is unlinked removes nothing', async () => {
     const files = oldLayout()
     seed(configDir(), files)
