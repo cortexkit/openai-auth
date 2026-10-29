@@ -2845,7 +2845,10 @@ export async function CodexAuthPlugin(
           stickyState: SidebarState,
           vaultRouting = false,
         ): void {
-          const hooks = { canWrite: () => vault.enrolled() === vaultRouting }
+          const hooks = {
+            vaultMode: vaultRouting,
+            canWrite: () => vault.enrolled() === vaultRouting,
+          }
           const input = { activeId, route, updatedAt: Date.now() }
           if (!sessionId) {
             sidebarBookkeepingQueue.enqueue('routing:legacy', 'routing', () =>
@@ -3880,6 +3883,7 @@ export async function CodexAuthPlugin(
           )
           const excluded = new Set(input.excludeAccountIds)
           const assignment = placeStickyPin({
+            vaultMode: false,
             sessionId: input.sessionId,
             requestBytes: input.requestBytes,
             sidebarSnapshot: input.sidebarSnapshot,
@@ -3934,6 +3938,7 @@ export async function CodexAuthPlugin(
         // serve one request elsewhere while the session keeps its pin.
         function placeStickyPin(
           input: Omit<PoolPinPlacement, 'select'> & {
+            vaultMode: boolean
             sidebarSnapshot: SidebarSnapshot
             select: (pendingBytes: ReadonlyMap<string, number>) =>
               | {
@@ -3989,6 +3994,7 @@ export async function CodexAuthPlugin(
             })
           }
           if (assignment && plan.next !== undefined) {
+            const vaultMode = input.vaultMode
             const sessionHash = hashSidebarSessionId(input.sessionId)
             const entry = rememberStickyPin(
               stickyPinOverlay,
@@ -4006,6 +4012,7 @@ export async function CodexAuthPlugin(
                     validPinnedAccountIds,
                   },
                   boundSidebarFile,
+                  { vaultMode, canWrite: () => vault.enrolled() === vaultMode },
                 )
                 entry.persistedAt = Date.now()
               },
@@ -4484,7 +4491,7 @@ export async function CodexAuthPlugin(
               }
             },
             placePin: (placement) =>
-              placeStickyPin({ ...placement, sidebarSnapshot }),
+              placeStickyPin({ ...placement, sidebarSnapshot, vaultMode }),
             blocked: (block, quotas, cause) => {
               if (block.reason === 'no-credential') {
                 // Routing has already tried every row that could serve, so

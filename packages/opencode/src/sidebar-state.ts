@@ -992,6 +992,8 @@ let sidebarWriteChain: Promise<void> = Promise.resolve()
 type SidebarMergeHooks = Pick<SidebarFileHooks, 'beforeRecheck'> & {
   /** Whether this snapshot may still be written; checked again after lock waits. */
   canWrite?: () => boolean
+  /** The writer's current vault mode, used instead of the file's older mode. */
+  vaultMode?: boolean
 }
 
 function enqueueSidebarWrite(operation: () => Promise<void>): Promise<void> {
@@ -1093,11 +1095,17 @@ function writeMergedSidebarState(
           if (hooks?.canWrite && !hooks.canWrite()) return undefined
           const next = merge(latest)
           if (next === undefined) return undefined
+          // A disconnect in another process can leave a vault roster on disk.
+          // When the writer is local, clear that roster before filtering session data.
+          if (hooks?.vaultMode === false) {
+            next.vaultAccounts = undefined
+            next.vaultDiscovered = undefined
+          }
           // A mode switch must not leave local session records in a vault-only
           // file. This runs inside the file lock for every writer, including
           // late request bookkeeping. Vault pins survive temporary unavailability,
           // but quota-blocked pins are pruned just as they are in local mode.
-          if (next.vaultAccounts !== undefined) {
+          if (hooks?.vaultMode ?? next.vaultAccounts !== undefined) {
             next.activeId = next.activeId?.startsWith('vault:')
               ? next.activeId
               : undefined
@@ -1457,7 +1465,7 @@ export function upsertSidebarActiveRouting(
         )
         const stickyAssignments = pruneStickyAssignments(
           latest.stickyAssignments,
-          latest.vaultAccounts !== undefined
+          (hooks?.vaultMode ?? latest.vaultAccounts !== undefined)
             ? undefined
             : usableRoutingAccountIds(accounts),
           Date.now(),
@@ -1514,7 +1522,7 @@ export function removeSidebarActiveRouting(
         )
         const stickyAssignments = pruneStickyAssignments(
           latest.stickyAssignments,
-          latest.vaultAccounts !== undefined
+          (hooks?.vaultMode ?? latest.vaultAccounts !== undefined)
             ? undefined
             : usableRoutingAccountIds(accounts),
           now,
@@ -1770,53 +1778,62 @@ export function persistSidebarStickyAssignment(
     validPinnedAccountIds: readonly string[]
   },
   file = getSidebarStateFile(),
+  hooks?: SidebarMergeHooks,
 ): Promise<void> {
   const sessionHash = hashSidebarSessionId(input.sessionId)
   const validPinnedAccountIds = new Set(input.validPinnedAccountIds)
   return enqueueSidebarWrite(async () => {
-    await writeMergedSidebarState(file, (latest) => {
-      const now = Date.now()
-      const stickyAssignments = pruneStickyAssignments(
-        latest.stickyAssignments,
-        latest.vaultAccounts !== undefined ? undefined : validPinnedAccountIds,
-        now,
-      )
-      const current = stickyAssignments?.[sessionHash]
-      if (current && current.assignedAt > input.assignment.assignedAt) {
-        if (stickyAssignmentsEqual(latest.stickyAssignments, stickyAssignments))
-          return undefined
+    await writeMergedSidebarState(
+      file,
+      (latest) => {
+        const now = Date.now()
+        const stickyAssignments = pruneStickyAssignments(
+          latest.stickyAssignments,
+          (hooks?.vaultMode ?? latest.vaultAccounts !== undefined)
+            ? undefined
+            : validPinnedAccountIds,
+          now,
+        )
+        const current = stickyAssignments?.[sessionHash]
+        if (current && current.assignedAt > input.assignment.assignedAt) {
+          if (
+            stickyAssignmentsEqual(latest.stickyAssignments, stickyAssignments)
+          )
+            return undefined
+          return {
+            ...latest,
+            stickyAssignments,
+            lastUpdated: Math.max(now, latest.lastUpdated + 1),
+          }
+        }
+        const samePlacement =
+          current !== undefined &&
+          current.accountId === input.assignment.accountId &&
+          current.assignedAt === input.assignment.assignedAt
+        const assignment = samePlacement
+          ? {
+              ...input.assignment,
+              inputBytes: Math.max(
+                current.inputBytes,
+                input.assignment.inputBytes,
+              ),
+              lastSeenAt: Math.max(
+                current.lastSeenAt,
+                input.assignment.lastSeenAt,
+              ),
+            }
+          : input.assignment
         return {
           ...latest,
-          stickyAssignments,
+          stickyAssignments: limitStickyAssignments(
+            { ...stickyAssignments, [sessionHash]: assignment },
+            sessionHash,
+          ),
           lastUpdated: Math.max(now, latest.lastUpdated + 1),
         }
-      }
-      const samePlacement =
-        current !== undefined &&
-        current.accountId === input.assignment.accountId &&
-        current.assignedAt === input.assignment.assignedAt
-      const assignment = samePlacement
-        ? {
-            ...input.assignment,
-            inputBytes: Math.max(
-              current.inputBytes,
-              input.assignment.inputBytes,
-            ),
-            lastSeenAt: Math.max(
-              current.lastSeenAt,
-              input.assignment.lastSeenAt,
-            ),
-          }
-        : input.assignment
-      return {
-        ...latest,
-        stickyAssignments: limitStickyAssignments(
-          { ...stickyAssignments, [sessionHash]: assignment },
-          sessionHash,
-        ),
-        lastUpdated: Math.max(now, latest.lastUpdated + 1),
-      }
-    })
+      },
+      hooks,
+    )
   })
 }
 
