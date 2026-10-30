@@ -68,16 +68,33 @@ counts() {
 }
 
 step=toolchain
-printf 'Toolchain: Bun %s, Node %s\n' "$(bun --version)" "$(node --version)"
 if [[ -z "$fast" ]]; then
-  expected_bun=$(bun -e 'console.log(Bun.TOML.parse(await Bun.file("mise.toml").text()).tools.bun)')
-  [[ "$(bun --version)" == "$expected_bun" ]] || {
-    echo "Use Bun $expected_bun from mise.toml" >&2; exit 1;
-  }
   [[ "$(uname -s)" == Linux && "$(node -p 'process.versions.node.split(".")[0]')" == 24 ]] || {
     echo 'Run the full gate on Linux with Node 24 (CI toolchain)' >&2; exit 1;
   }
+  # Read the pin without Bun so even a missing host Bun can be bootstrapped.
+  expected_bun=$(node -p 'require("node:fs").readFileSync("mise.toml", "utf8").match(/^bun\s*=\s*"([^"]+)"\s*$/m)?.[1] ?? ""')
+  [[ -n "$expected_bun" ]] || { echo 'Cannot read the Bun pin from mise.toml' >&2; exit 1; }
+  actual_bun=$(bun --version 2>/dev/null || true)
+  if [[ "$actual_bun" != "$expected_bun" ]]; then
+    bun_tools="$PWD/target/scratch/gate-tools"
+    printf 'Fetching pinned Bun %s into %s (host Bun: %s)\n' "$expected_bun" "$bun_tools" "${actual_bun:-unavailable}"
+    if npm install --prefix "$bun_tools" --no-save --package-lock=false "bun@$expected_bun"; then
+      export PATH="$bun_tools/node_modules/.bin:$PATH"
+      hash -r
+    else
+      status=$?
+      printf 'Cannot obtain pinned Bun %s: npm install failed (exit %s)\n' "$expected_bun" "$status" >&2
+      exit "$status"
+    fi
+  fi
+  actual_bun=$(bun --version 2>/dev/null || true)
+  [[ "$actual_bun" == "$expected_bun" ]] || {
+    printf 'Cannot use pinned Bun %s: selected %s reports %s\n' "$expected_bun" "$(command -v bun || true)" "${actual_bun:-no version}" >&2
+    exit 1
+  }
 fi
+printf 'Toolchain: Bun %s (%s), Node %s\n' "$(bun --version)" "$(command -v bun)" "$(node --version)"
 run frozen-lockfile bun install --frozen-lockfile
 if [[ -z "$fast" ]]; then
   for host in opencode1 opencode2; do

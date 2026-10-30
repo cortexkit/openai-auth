@@ -1,5 +1,6 @@
 # Dependencies and build outputs
 node_modules/
+target/scratch/gate-tools/
 dist/
 packages/*/dist/
 packages/opencode/src/tui-compiled/
