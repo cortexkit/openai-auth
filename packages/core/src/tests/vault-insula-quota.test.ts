@@ -488,6 +488,62 @@ describe('vault insula quota', () => {
     ).toBeUndefined()
   })
 
+  test('kept upstream-failed reading suppresses direct background polling', async () => {
+    const env = await setup()
+    env.daemon.insula = {
+      reply: {
+        result: [
+          {
+            ...current(env.now),
+            fetchedAt: new Date(env.now - 600_000).toISOString(),
+            stale: {
+              since: new Date(env.now - 300_000).toISOString(),
+              class: 'upstream_failed',
+            },
+          },
+        ],
+      },
+    }
+    const id = route(env.vault)
+    expect(await env.vault.pollQuota(id)).toEqual({
+      ok: false,
+      error: 'insula upstream-failed',
+    })
+    expect(env.wham).toEqual([])
+    expect(env.daemon.gets).toEqual([])
+    expect(
+      env.vault.routes().find((row) => row.id === id)?.quota,
+    ).toBeUndefined()
+  })
+
+  test('kept local-source-unavailable reading makes exactly one direct background poll', async () => {
+    const env = await setup()
+    env.daemon.insula = {
+      reply: {
+        result: [
+          {
+            ...current(env.now),
+            stale: {
+              since: new Date(env.now - 30_000).toISOString(),
+              class: 'local_source_unavailable',
+            },
+          },
+        ],
+      },
+    }
+    const id = route(env.vault)
+    const poll = env.vault.pollQuota(id)
+    expect(env.vault.pollQuota(id)).toBe(poll)
+    expect(await poll).toEqual({ ok: true })
+    expect(env.wham).toEqual(['account-a'])
+    expect(env.daemon.gets).toHaveLength(1)
+    expect(
+      windowsFromQuotaMap(
+        env.vault.routes().find((row) => row.id === id)?.quota,
+      )?.primary?.usedPercent,
+    ).toBe(20)
+  })
+
   test('skip source transitions include reasons without duplicate consumer logs', async () => {
     const env = await setup()
     const id = route(env.vault)
@@ -537,7 +593,11 @@ describe('vault insula quota', () => {
       const env = await setup()
       const entry = current(env.now)
       const replies = {
-        stale: { result: [{ ...entry, stale: true }] },
+        stale: {
+          result: [
+            { ...entry, fetchedAt: new Date(env.now - 240_000).toISOString() },
+          ],
+        },
         credential: {
           result: [{ provider: 'codex', errorClass: 'credential_rejected' }],
         },
