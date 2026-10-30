@@ -29,7 +29,6 @@ import {
   assertHostSlotMatchesMode,
   ClaustrumConsumer,
   ClaustrumConsumerError,
-  type ClaustrumConsumerOptions,
   type ClaustrumEnrollmentConnection,
   ClaustrumEnrollmentManager,
   type ClaustrumEnrollmentPaths,
@@ -290,39 +289,13 @@ type VaultInsulaQuota = NonNullable<
   ReturnType<typeof normalizeInsulaCodexQuota>
 >
 
-/**
- * The shared consumer, reporting every roster discovery to `onDiscovery`.
- * Its own poll, its vault watch and its send path all start discoveries by
- * calling `refresh()` on the instance, so overriding it here sees each one,
- * including those `OpenAiVault` did not start itself.
- */
-class ObservedConsumer extends ClaustrumConsumer<VaultInsulaQuota> {
-  readonly #onDiscovery: (
-    discovery: Promise<VaultRosterFile | undefined>,
-  ) => void
-
-  constructor(
-    options: ClaustrumConsumerOptions<VaultInsulaQuota>,
-    onDiscovery: (discovery: Promise<VaultRosterFile | undefined>) => void,
-  ) {
-    super(options)
-    this.#onDiscovery = onDiscovery
-  }
-
-  override refresh(): Promise<VaultRosterFile | undefined> {
-    const discovery = super.refresh()
-    this.#onDiscovery(discovery)
-    return discovery
-  }
-}
-
 /** One host's view of its OpenAI accounts in the vault. */
 export class OpenAiVault {
   readonly host: VaultHost
   readonly name: string
   readonly paths: VaultPaths
   readonly #options: OpenAiVaultOptions
-  readonly #consumer: ObservedConsumer
+  readonly #consumer: ClaustrumConsumer<VaultInsulaQuota>
   readonly #pulls = new Map<string, Promise<unknown>>()
   readonly #quotaPolls = new Map<
     string,
@@ -352,44 +325,42 @@ export class OpenAiVault {
     this.host = options.host
     this.name = vaultEnrollmentName(options.host)
     this.paths = vaultPaths(options.stateDir, options.host)
-    this.#consumer = new ObservedConsumer(
-      {
-        rosterPath: this.paths.rosterPath,
-        tokenPath: this.paths.tokenPath,
-        family: VAULT_FAMILY,
-        connect: () => this.#connectScoped(),
-        // Unknown or unreadable enrollment must never enable local credentials.
-        isCustodyActive: () => this.#custodyActive(),
-        ...(options.reservedRouteIds
-          ? { reservedRouteIds: options.reservedRouteIds }
-          : {}),
-        parseIdentity: vaultIdentityOf,
-        insula: { provider: 'codex', normalize: normalizeInsulaCodexQuota },
-        ...(options.now ? { now: options.now } : {}),
-        ...(options.pollIntervalMs !== undefined
-          ? { pollIntervalMs: options.pollIntervalMs }
-          : {}),
-        ...(options.setTimeoutImpl
-          ? { setTimeoutImpl: options.setTimeoutImpl }
-          : {}),
-        ...(options.clearTimeoutImpl
-          ? { clearTimeoutImpl: options.clearTimeoutImpl }
-          : {}),
-        onRoster: () => {
-          this.#lastError = undefined
-        },
-        onError: (error) => this.#fail('vault roster refresh failed', error),
-        logger: {
-          ...log,
-          warn: (message, fields) => {
-            // The route-aware background source log below includes these skips.
-            if (message !== 'skipped insula provider poll')
-              log.warn(message, fields)
-          },
+    this.#consumer = new ClaustrumConsumer<VaultInsulaQuota>({
+      rosterPath: this.paths.rosterPath,
+      tokenPath: this.paths.tokenPath,
+      family: VAULT_FAMILY,
+      connect: () => this.#connectScoped(),
+      // Unknown or unreadable enrollment must never enable local credentials.
+      isCustodyActive: () => this.#custodyActive(),
+      ...(options.reservedRouteIds
+        ? { reservedRouteIds: options.reservedRouteIds }
+        : {}),
+      parseIdentity: vaultIdentityOf,
+      insula: { provider: 'codex', normalize: normalizeInsulaCodexQuota },
+      ...(options.now ? { now: options.now } : {}),
+      ...(options.pollIntervalMs !== undefined
+        ? { pollIntervalMs: options.pollIntervalMs }
+        : {}),
+      ...(options.setTimeoutImpl
+        ? { setTimeoutImpl: options.setTimeoutImpl }
+        : {}),
+      ...(options.clearTimeoutImpl
+        ? { clearTimeoutImpl: options.clearTimeoutImpl }
+        : {}),
+      onRoster: () => {
+        this.#lastError = undefined
+      },
+      onDiscovery: (discovery) => this.#track(discovery),
+      onError: (error) => this.#fail('vault roster refresh failed', error),
+      logger: {
+        ...log,
+        warn: (message, fields) => {
+          // The route-aware background source log below includes these skips.
+          if (message !== 'skipped insula provider poll')
+            log.warn(message, fields)
         },
       },
-      (discovery) => this.#track(discovery),
-    )
+    })
   }
 
   #connectionFile(): string {

@@ -24,12 +24,12 @@
       "version": "0.0.0",
       "devDependencies": {
         "@cortexkit/claustrum-client": "^0.13.0",
-        "@cortexkit/common-auth": "^0.29.0",
+        "@cortexkit/common-auth": "^0.31.0",
       },
     },
     "packages/opencode": {
       "name": "@cortexkit/opencode-openai-auth",
-      "version": "1.8.1",
+      "version": "1.8.4",
       "bin": {
         "opencode-openai-auth": "./dist/bin.js",
       },
@@ -45,7 +45,7 @@
       },
       "devDependencies": {
         "@ai-sdk/openai": "3.0.88",
-        "@cortexkit/common-auth": "^0.29.0",
+        "@cortexkit/common-auth": "^0.31.0",
         "@cortexkit/openai-auth-core": "workspace:*",
         "@opencode/plugin": "2.2.0",
       },
@@ -59,14 +59,14 @@
     },
     "packages/pi": {
       "name": "@cortexkit/pi-openai-auth",
-      "version": "1.8.1",
+      "version": "1.8.4",
       "dependencies": {
         "@cortexkit/claustrum-client": "^0.13.0",
         "@cortexkit/private-files": "^0.2.2",
         "@cortexkit/subc-client": "^0.22.0",
       },
       "devDependencies": {
-        "@cortexkit/common-auth": "^0.29.0",
+        "@cortexkit/common-auth": "^0.31.0",
         "@cortexkit/openai-auth-core": "workspace:*",
       },
       "peerDependencies": {
@@ -225,7 +225,7 @@
 
     "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.13.0", "", { "dependencies": { "@cortexkit/store": "^0.2.1", "@cortexkit/subc-client": "^0.22.0" } }, "sha512-237CTyBx/bnKT+D/1VO13Nn6coIQJgkp6aml31APeGKdV5hNhULzpiI0VQQWXe/NGQUFlLX5lkSP4pkWmuwTaw=="],
 
-    "@cortexkit/common-auth": ["@cortexkit/common-auth@0.29.0", "", { "dependencies": { "@cortexkit/private-files": "^0.2.2", "jsonc-parser": "^3.3.1" }, "peerDependencies": { "@cortexkit/claustrum-client": ">=0.6.2", "@cortexkit/subc-client": "^0.16.0 || ^0.22.0", "@opencode/plugin": ">=2.0.21", "@opentui/core": ">=0.5.11", "@opentui/solid": ">=0.5.11", "solid-js": "1.9.12" }, "optionalPeers": ["@cortexkit/claustrum-client", "@cortexkit/subc-client", "@opencode/plugin", "@opentui/core", "@opentui/solid", "solid-js"] }, "sha512-XnNFY5ppNQRDP09lUTDDONGHwiJ8Z93w8/NP16pmWpC6lzBPkC7XJcHhld+B6iLATaNvbcenfhecitB8fS9nbQ=="],
+    "@cortexkit/common-auth": ["@cortexkit/common-auth@0.31.0", "", { "dependencies": { "@cortexkit/private-files": "^0.2.2", "jsonc-parser": "^3.3.1" }, "peerDependencies": { "@cortexkit/claustrum-client": ">=0.6.2", "@cortexkit/subc-client": "^0.16.0 || ^0.22.0", "@opencode/plugin": ">=2.0.21", "@opentui/core": ">=0.5.11", "@opentui/solid": ">=0.5.11", "solid-js": "1.9.12" }, "optionalPeers": ["@cortexkit/claustrum-client", "@cortexkit/subc-client", "@opencode/plugin", "@opentui/core", "@opentui/solid", "solid-js"] }, "sha512-An0i6ywuMISocrZKZvYkVhExhg0/v0uUR7PU3QpDqko0+mTq4GA9zCJY2q74TK6fwF0w2Xw0mqxTNIUW8+4Apw=="],
 
     "@cortexkit/openai-auth-core": ["@cortexkit/openai-auth-core@workspace:packages/core"],
 
