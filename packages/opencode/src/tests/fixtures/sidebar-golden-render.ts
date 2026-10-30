@@ -182,6 +182,23 @@ const v1 = await testRender(() => v1Render?.(), {
   height: HEIGHT,
 })
 
+// The OpenCode 2 view mounts before the state poll, so its first frame can
+// still lack rows that the poll's reading adds. On macOS, one render pass
+// missed the "deficit … out in …" lines under each window and the cut-off
+// "…" in the Killswitch row. Render both views until neither frame changes,
+// and fail if they never settle.
+async function settle() {
+  let previous = ''
+  for (let pass = 0; pass < 10; pass++) {
+    await view.renderOnce()
+    await v1.renderOnce()
+    const frames = `${view.captureCharFrame()}\u0000${v1.captureCharFrame()}`
+    if (frames === previous) return
+    previous = frames
+  }
+  throw new Error('sidebar frames did not settle within 10 render passes')
+}
+
 function captureGolden(name: string) {
   assert.equal(view.captureCharFrame(), v1.captureCharFrame())
   assert.deepEqual(view.captureSpans(), v1.captureSpans())
@@ -204,17 +221,13 @@ try {
   await Promise.all([...polls.values()].map((refresh) => refresh()))
   if (!collapsed) {
     // Preserve the first layout as well as the settled, resized frames.
-    await view.renderOnce()
-    await v1.renderOnce()
+    await settle()
     captureGolden('expanded-initial-30')
   }
   for (const width of [16, 36, 37, 42]) {
     view.resize(width, HEIGHT)
     v1.resize(width, HEIGHT)
-    for (let pass = 0; pass < 3; pass++) {
-      await view.renderOnce()
-      await v1.renderOnce()
-    }
+    await settle()
     const chars = view.captureCharFrame()
     assert.equal(chars, v1.captureCharFrame())
     assert.deepEqual(view.captureSpans(), v1.captureSpans())
