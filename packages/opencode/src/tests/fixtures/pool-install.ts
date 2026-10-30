@@ -129,9 +129,13 @@ export function usageBody(usedPercent: number) {
 
 /** Replaces the network: token refreshes, quota polls and model requests. */
 export function installWire(
-  options: { usage?: (bearer: string) => Response } = {},
+  options: {
+    usage?: (bearer: string) => Response | Promise<Response>
+    phase?: <T>(name: string, action: () => T) => T
+  } = {},
 ): Wire {
   const wire: Wire = { sends: [], polls: [], refreshTokens: [] }
+  const phase = options.phase ?? ((_name, action) => action())
   globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
     const target = String(url)
     const bearer = new Headers(init?.headers).get('authorization') ?? ''
@@ -139,21 +143,27 @@ export function installWire(
       const refreshToken =
         new URLSearchParams(String(init?.body ?? '')).get('refresh_token') ?? ''
       wire.refreshTokens.push(refreshToken)
-      return new Response(
-        JSON.stringify({
-          access_token: `refreshed-${refreshToken}`,
-          refresh_token: `rotated-${refreshToken}`,
-          expires_in: 3600,
-          id_token: 'id',
-        }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
+      return phase(
+        `token refresh: ${refreshToken}`,
+        () =>
+          new Response(
+            JSON.stringify({
+              access_token: `refreshed-${refreshToken}`,
+              refresh_token: `rotated-${refreshToken}`,
+              expires_in: 3600,
+              id_token: 'id',
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
       )
     }
     if (target.includes('/wham/usage')) {
       wire.polls.push(bearer)
-      return options.usage
-        ? options.usage(bearer)
-        : new Response(usageBody(10), { status: 200 })
+      return phase(`wham poll: ${bearer}`, () =>
+        options.usage
+          ? options.usage(bearer)
+          : new Response(usageBody(10), { status: 200 }),
+      )
     }
     if (target.includes('/responses')) {
       wire.sends.push(bearer)
@@ -212,10 +222,11 @@ export async function waitFor<T>(
   read: () => T | undefined,
   what: string,
   timeoutMs = 5_000,
+  phase: <R>(name: string, action: () => R) => R = (_name, action) => action(),
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const value = read()
+    const value = phase(`wait read: ${what}`, read)
     if (value !== undefined) return value
     await new Promise((resolve) => setTimeout(resolve, 20))
   }

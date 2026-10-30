@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, spyOn } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import * as authFs from '@cortexkit/common-auth/fs'
 import { acquireRefreshFileLock } from '@cortexkit/common-auth/fs'
 import type { QuotaMap } from '@cortexkit/common-auth/quota'
 import * as poolStores from '@cortexkit/common-auth/store'
@@ -29,6 +30,7 @@ import {
   normalizeSidebarState,
   type SidebarState,
 } from '../sidebar-state.ts'
+import { failureTimeline } from './fixtures/failure-timeline'
 import {
   HOUR,
   installWire,
@@ -39,6 +41,7 @@ import {
   usageBody,
   waitFor,
 } from './fixtures/pool-install'
+import { poolQuotaTimer } from './fixtures/pool-quota-timer'
 import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
@@ -58,6 +61,7 @@ const scope = createRequestTestScope()
 const sources = new Set<PoolAccountSource>()
 const backgroundRuns = new Set<Promise<void>>()
 const restores: Array<() => void> = []
+let timeline: ReturnType<typeof failureTimeline>
 
 async function settleSurfaceWork() {
   await __bootQuotaSeedPromiseForTest()
@@ -69,8 +73,11 @@ async function settleSurfaceWork() {
 
 const it = (name: string, body: () => void | Promise<void>) =>
   scope.it(name, async () => {
-    await body()
-    await settleSurfaceWork()
+    timeline = failureTimeline(name)
+    await timeline.run('body', async () => {
+      await body()
+      await timeline.phase('settle surface work', settleSurfaceWork)
+    })
   })
 
 beforeEach(() => {
@@ -127,21 +134,23 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
-  await scope.teardown(async () => {
-    await settleSurfaceWork()
-    await hooks?.dispose?.()
-    for (const restore of restores.splice(0)) restore()
-    globalThis.fetch = originalFetch
-    await drainSidebarWrites()
-    process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
-    process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
-    process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
-      FLOOR_SIDEBAR_STATE_FILE
-    process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
-    restoreEnv('OPENCODE_CONFIG_DIR')
-    delete process.env.NODE_ENV
-    rmSync(configDir, { recursive: true, force: true })
-  })
+  await timeline.run('teardown', () =>
+    scope.teardown(async () => {
+      await settleSurfaceWork()
+      await hooks?.dispose?.()
+      for (const restore of restores.splice(0)) restore()
+      globalThis.fetch = originalFetch
+      await drainSidebarWrites()
+      process.env.OPENCODE_OPENAI_AUTH_FILE = FLOOR_AUTH_FILE
+      process.env.OPENCODE_OPENAI_AUTH_STATE_FILE = FLOOR_STATE_FILE
+      process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE =
+        FLOOR_SIDEBAR_STATE_FILE
+      process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = FLOOR_LOG_FILE
+      restoreEnv('OPENCODE_CONFIG_DIR')
+      delete process.env.NODE_ENV
+      rmSync(configDir, { recursive: true, force: true })
+    }),
+  )
 })
 
 /** Background poller timers whose tick the test fires by hand. */
@@ -236,12 +245,43 @@ describe('a migrated install refreshes and polls its rows only through the pool'
   })
 
   it('polls under the bg-quota-refresh lease, refreshing due tokens through the pool', async () => {
+    const acquire = authFs.acquireRefreshFileLock
+    const leaseSpy = spyOn(authFs, 'acquireRefreshFileLock').mockImplementation(
+      (options) => {
+        if (options.name !== 'bg-quota-refresh') return acquire(options)
+        return timeline.phase(`lease acquire: ${options.name}`, async () => {
+          const lease = await acquire({
+            ...options,
+            onStep: (step) =>
+              timeline.phase(`lease ${options.name}: ${step}`, () =>
+                options.onStep?.(step),
+              ),
+            onRenewalTimer: (event) =>
+              timeline.phase(`lease ${options.name}: renewal ${event}`, () =>
+                options.onRenewalTimer?.(event),
+              ),
+          })
+          if (lease) {
+            const release = lease.release.bind(lease)
+            lease.release = (...args) =>
+              timeline.phase('lease release: bg-quota-refresh', () =>
+                release(...args),
+              )
+          }
+          return lease
+        })
+      },
+    )
+    restores.push(() => leaseSpy.mockRestore())
     // Hold a prior plugin's startup quota request before it calls fetch.
     // Its pending request must finish before global fetch is replaced below;
     // otherwise Bearer prior-token is recorded as a third poll by the new wire.
     // This reproduces a supported mechanism, not a proven historical cause.
     seedPool(files, [{ id: 'prior', quota: quotaMap(10) }])
-    installWire({ usage: () => new Response('', { status: 503 }) })
+    installWire({
+      usage: () => new Response('', { status: 503 }),
+      phase: timeline.phase,
+    })
     const entered = Promise.withResolvers<void>()
     const release = Promise.withResolvers<void>()
     const open = poolStores.openPoolStore
@@ -249,7 +289,13 @@ describe('a migrated install refreshes and polls its rows only through the pool'
       (options) =>
         open({
           ...options,
-          hold: async (step) => {
+          onStep: (step, info) =>
+            timeline.phase(`pool write: ${step}`, () =>
+              options.onStep?.(step, info),
+            ),
+          hold: async (step, row) => {
+            timeline.phase(`pool ${row}: ${step}`, () => {})
+            await options.hold?.(step, row)
             if (step === 'pull-before-request') {
               entered.resolve()
               await release.promise
@@ -264,6 +310,29 @@ describe('a migrated install refreshes and polls its rows only through the pool'
     } finally {
       storeSpy.mockRestore()
     }
+    const quotaCommits = poolQuotaTimer(timeline)
+    const currentStoreSpy = spyOn(
+      poolStores,
+      'openPoolStore',
+    ).mockImplementation((options) => {
+      const store = open({
+        ...options,
+        quotaCommitTimer: quotaCommits.timer,
+        onStep: (step, info) =>
+          timeline.phase(`pool write: ${step}`, () =>
+            options.onStep?.(step, info),
+          ),
+        hold: (step, row) =>
+          timeline.phase(`pool ${row}: ${step}`, () =>
+            options.hold?.(step, row),
+          ),
+      })
+      const refresh = store.refresh.bind(store)
+      store.refresh = (...args) =>
+        timeline.phase(`row token refresh: ${args[0]}`, () => refresh(...args))
+      return store
+    })
+    restores.push(() => currentStoreSpy.mockRestore())
     const priorSource = [...sources].at(-1)
     if (!priorSource) throw new Error('prior pool source missing')
     const previous = createRequestTestScope()
@@ -292,14 +361,20 @@ describe('a migrated install refreshes and polls its rows only through the pool'
         expires: Date.now() + 3 * 60_000,
       },
     ])
-    let usage = () => new Response('', { status: 503 })
-    const wire = installWire({ usage: () => usage() })
+    let usage: (bearer: string) => Response | Promise<Response> = () =>
+      new Response('', { status: 503 })
+    const wire = installWire({
+      usage: (bearer) => usage(bearer),
+      phase: timeline.phase,
+    })
     release.resolve()
     const timers = manualTimers()
     hooks = await loadPlugin({ backgroundQuota: timers.options })
     await waitFor(
       () => (wire.polls.length >= 2 ? true : undefined),
       'the first pool polls',
+      5_000,
+      timeline.phase,
     )
     await priorSource.poolStore().pullsSettled()
     await settleSurfaceWork()
@@ -328,14 +403,33 @@ describe('a migrated install refreshes and polls its rows only through the pool'
 
     // With the lease free, the pass refreshes the due token and polls both
     // stale rows, and the readings land in the pool's quota maps.
-    usage = () => new Response(usageBody(33), { status: 200 })
+    const releaseFallback = Promise.withResolvers<void>()
+    usage = async (bearer) => {
+      if (bearer === 'Bearer refreshed-fallback-1-refresh')
+        await releaseFallback.promise
+      return new Response(usageBody(33), { status: 200 })
+    }
     tick()
+    try {
+      // Publish main before the fallback answers, so its reading must use a
+      // second commit slot even on a machine fast enough to batch both polls.
+      await timeline.phase('main quota queued', quotaCommits.next)
+      await timeline.phase('publish main quota', quotaCommits.drain)
+    } finally {
+      releaseFallback.resolve()
+    }
+    await timeline.phase('background polls settled', settleSurfaceWork)
+    // Pool reads include queued quota immediately, but this assertion reads
+    // disk. Drive the detached writer rather than wait for its 30-second slot.
+    await timeline.phase('publish remaining quota', quotaCommits.drain)
     await waitFor(
       () =>
         poolPrimaryUsed('main') === 33 && poolPrimaryUsed('fallback-1') === 33
           ? true
           : undefined,
       'both rows polled into the pool',
+      5_000,
+      timeline.phase,
     )
     await settleSurfaceWork()
     expect(wire.refreshTokens).toEqual(['fallback-1-refresh'])
