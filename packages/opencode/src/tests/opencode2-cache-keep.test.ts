@@ -643,6 +643,33 @@ describe('OpenCode 2 keep-warm credentials', () => {
     expect(fake.warnings).toEqual([])
   })
 
+  test('a vault keep-warm replay never asks the fleet to choose again', async () => {
+    const key = Symbol.for('cortexkit.routing')
+    const previous = Object.getOwnPropertyDescriptor(globalThis, key)
+    let asks = 0
+    Reflect.set(globalThis, key, () => ({
+      accountFor: async () => {
+        asks++
+        return { account_id: 'another-account' }
+      },
+    }))
+    try {
+      const fake = served()
+      fake.state.authority = 'vault'
+      fake.state.owned.add('V')
+      fake.state.accounts.set('ses', 'V')
+      fake.state.receiptIdentity.set('V', 'chatgpt-V')
+      const { lease, clock } = acquire(fake.location)
+      await lease.capture(captured('ses', { accountId: 'V', mode: 'vault' }))
+      await advance(lease, clock, 4 * MINUTE)
+      expect(fake.sent).toHaveLength(1)
+      expect(asks).toBe(0)
+    } finally {
+      if (previous) Object.defineProperty(globalThis, key, previous)
+      else Reflect.deleteProperty(globalThis, key)
+    }
+  })
+
   test('a vault receipt for another login sends nothing and drops the target', async () => {
     const fake = served()
     fake.state.authority = 'vault'

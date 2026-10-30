@@ -10,9 +10,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { VaultRosterRow } from '@cortexkit/common-auth/claustrum'
 import type { QuotaMap } from '@cortexkit/common-auth/quota'
-import type {
-  AccountPaths,
-  AccountStorage,
+import {
+  type AccountPaths,
+  type AccountStorage,
+  placeStickyPin,
 } from '@cortexkit/openai-auth-core/internal'
 import { PoolAccountSource } from '../core/pool-account-source'
 import {
@@ -67,6 +68,7 @@ describe('the request path in vault mode', () => {
     storage: AccountStorage | null = null,
     mode: PoolRequestContext['mode'] = 'fallback-first',
     status = 200,
+    overrides: Partial<PoolRequestContext> = {},
   ) {
     seedPool({ configFile: paths.configPath, stateFile: paths.statePath }, [
       { id: 'main', quota: quotaMap(10) },
@@ -104,6 +106,7 @@ describe('the request path in vault mode', () => {
       resetCredits: () => undefined,
       isAbort: () => false,
       log: { debug: () => {} },
+      ...overrides,
     }
     try {
       const result = await servePoolRequest(ctx)
@@ -122,10 +125,182 @@ describe('the request path in vault mode', () => {
       routes: () => routes,
       awaitRoster: async () => {},
       noRouteCause: () => cause,
-      send: async (id, dispatch) => dispatch(`vault-token-${id}`, {} as never),
+      send: async (id, dispatch) =>
+        dispatch(`vault-token-${id}`, {
+          credentialId: routes.find((row) => row.id === id)?.credentialId ?? id,
+          accountIdentity: routes.find((row) => row.id === id)?.identity,
+          accountIdentitySource: 'asserted',
+        }),
       requestReading: () => {},
     }
   }
+
+  it('an eligible fleet answer places a cold vault session on the named account', async () => {
+    const key = Symbol.for('cortexkit.routing')
+    const previous = Reflect.get(globalThis, key)
+    const asks: unknown[] = []
+    const reports: unknown[] = []
+    Reflect.set(globalThis, key, () => ({
+      accountFor: async (...args: unknown[]) => {
+        asks.push(args)
+        return { account_id: 'account-b' }
+      },
+      report: (report: unknown) => {
+        reports.push(report)
+        return new Promise(() => {})
+      },
+    }))
+    const pins = new Map()
+    try {
+      const routes = ['a', 'b'].map((id) => ({
+        id: `vault:${id}`,
+        identity: `account-${id}`,
+        credentialId: `credential-${id}`,
+        kind: 'oauth' as const,
+        quota: quotaMap(10),
+      }))
+      const result = await serve(
+        vaultWith(routes),
+        null,
+        'sticky-balanced',
+        200,
+        {
+          sessionId: 'cold-session',
+          routingRequest: { modelId: 'gpt-6', kind: 'primary' },
+          placePin: (input) =>
+            placeStickyPin(pins, input, (id, pin) => pins.set(id, pin)),
+        },
+      )
+      expect(result.result.servedId).toBe('vault:b')
+      expect(pins.get('cold-session')?.accountId).toBe('vault:b')
+      expect(asks).toHaveLength(1)
+      expect(reports).toEqual([
+        {
+          account_id: 'account-b',
+          credential_id: 'credential-b',
+          outcome: 'served',
+          headers: {},
+        },
+      ])
+      const warm = await serve(
+        vaultWith(routes),
+        null,
+        'sticky-balanced',
+        200,
+        {
+          sessionId: 'cold-session',
+          routingRequest: { modelId: 'gpt-6', kind: 'primary' },
+          placePin: (input) =>
+            placeStickyPin(pins, input, (id, pin) => pins.set(id, pin)),
+        },
+      )
+      expect(warm.result.servedId).toBe('vault:b')
+      expect(asks).toHaveLength(1)
+    } finally {
+      if (previous === undefined) Reflect.deleteProperty(globalThis, key)
+      else Reflect.set(globalThis, key, previous)
+    }
+  })
+
+  for (const kind of [
+    'ineligible',
+    'no-answer',
+    'throw',
+    'timeout',
+    'retry',
+    'title',
+    'compaction',
+    'keep-warm',
+    'local',
+  ] as const) {
+    it(`OpenCode 1 ${kind} keeps its own ordered choice`, async () => {
+      const key = Symbol.for('cortexkit.routing')
+      const previous = Reflect.get(globalThis, key)
+      let asks = 0
+      Reflect.set(globalThis, key, () => ({
+        accountFor: async () => {
+          asks++
+          if (kind === 'throw') throw new Error('offline')
+          if (kind === 'timeout') return new Promise(() => {})
+          if (kind === 'no-answer') return undefined
+          return {
+            account_id: kind === 'ineligible' ? 'outside-roster' : 'account-b',
+          }
+        },
+      }))
+      try {
+        const routes = ['a', 'b'].map((id) => ({
+          id: `vault:${id}`,
+          identity: `account-${id}`,
+          credentialId: `credential-${id}`,
+          kind: 'oauth' as const,
+          quota: quotaMap(10),
+        }))
+        const neverAsk = [
+          'retry',
+          'title',
+          'compaction',
+          'keep-warm',
+          'local',
+        ].includes(kind)
+        const { result } = await serve(
+          vaultWith(routes),
+          null,
+          'ordered',
+          200,
+          {
+            ...(kind === 'local' ? { vault: undefined } : {}),
+            sessionId: 'ordered-session',
+            routingRequest: {
+              modelId: 'gpt-6',
+              kind: ['title', 'compaction', 'keep-warm'].includes(kind)
+                ? kind
+                : 'primary',
+              retry: kind === 'retry',
+            },
+          },
+        )
+        expect(result.servedId).toBe(kind === 'local' ? 'main' : 'vault:a')
+        expect(asks).toBe(neverAsk ? 0 : 1)
+      } finally {
+        if (previous === undefined) Reflect.deleteProperty(globalThis, key)
+        else Reflect.set(globalThis, key, previous)
+      }
+    })
+  }
+
+  it('an ordered fleet choice is asked once, never again for its retry', async () => {
+    const key = Symbol.for('cortexkit.routing')
+    const previous = Reflect.get(globalThis, key)
+    let asks = 0
+    Reflect.set(globalThis, key, () => ({
+      accountFor: async () => {
+        asks++
+        return { account_id: 'account-b' }
+      },
+    }))
+    try {
+      const routes = ['a', 'b'].map((id) => ({
+        id: `vault:${id}`,
+        identity: `account-${id}`,
+        credentialId: `credential-${id}`,
+        kind: 'oauth' as const,
+        quota: quotaMap(10),
+      }))
+      const { sent } = await serve(vaultWith(routes), null, 'ordered', 429, {
+        sessionId: 'retry-session',
+        routingRequest: { modelId: 'gpt-6', kind: 'primary' },
+      })
+      expect(sent).toEqual([
+        'vault:b:vault-token-vault:b',
+        'vault:a:vault-token-vault:a',
+      ])
+      expect(asks).toBe(1)
+    } finally {
+      if (previous === undefined) Reflect.deleteProperty(globalThis, key)
+      else Reflect.set(globalThis, key, previous)
+    }
+  })
 
   it('main-first places the default vault account first and fallback-first places it last', async () => {
     const main = {

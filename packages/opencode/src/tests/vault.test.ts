@@ -46,6 +46,7 @@ import {
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import { authDoctorChecks, readStoreIds } from '../auth/doctor'
 import { createAuthMethods } from '../auth/methods'
+import { OPENAI_AGENT_HEADER } from '../codex-request'
 import { applyOpenAiMenu } from '../commands'
 import type { OpenAICacheKeepManager } from '../core/cachekeep'
 import { PoolAccountSource } from '../core/pool-account-source'
@@ -761,12 +762,14 @@ function request(
   fetchImpl: typeof globalThis.fetch,
   sessionId?: string,
   stream?: boolean,
+  agent?: string,
 ): Promise<Response> {
   return scope.wrap(fetchImpl)('https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       ...(sessionId ? { 'x-session-id': sessionId } : {}),
+      ...(agent ? { [OPENAI_AGENT_HEADER]: agent } : {}),
     },
     body: JSON.stringify({
       model: 'gpt-5.5',
@@ -792,6 +795,38 @@ async function setMode(mode: PoolMode) {
   // Routing mode names have different lengths, so a mode change invalidates
   // the request cache by file size even if the modification time is unchanged.
 }
+
+test('the OpenCode 1 fetch entry asks fleet routing only for an agent-loop request', async () => {
+  const key = Symbol.for('cortexkit.routing')
+  const previous = Object.getOwnPropertyDescriptor(globalThis, key)
+  let asks = 0
+  Reflect.set(globalThis, key, () => ({
+    accountFor: async () => {
+      asks++
+      return { account_id: 'chatgpt-b' }
+    },
+  }))
+  try {
+    await startDaemon({
+      'oauth:openai:a': vaultLogin('chatgpt-a'),
+      'oauth:openai:b': vaultLogin('chatgpt-b'),
+    })
+    enroll()
+    seedPool(files, [], { routing: { mode: 'ordered' } })
+    const wire = installWire()
+    await plugin()
+    const fetchImpl = await fetchOverride()
+    await request(fetchImpl, 'title-session', false, 'title')
+    expect(asks).toBe(0)
+    expect(wire.sends).toEqual([`Bearer ${chatgptAccessToken('chatgpt-a')}`])
+    await request(fetchImpl, 'agent-session', false, 'build')
+    expect(asks).toBe(1)
+    expect(wire.sends.at(-1)).toBe(`Bearer ${chatgptAccessToken('chatgpt-b')}`)
+  } finally {
+    if (previous) Object.defineProperty(globalThis, key, previous)
+    else Reflect.deleteProperty(globalThis, key)
+  }
+})
 
 describe('vault cachekeep', () => {
   async function trackedWarm(recordVersion = 7, local = false) {

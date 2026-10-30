@@ -58,6 +58,7 @@ import {
   TombstoneRefreshError,
   vaultModeNoRouteCause,
   vaultModeRefusalText,
+  vaultRoutingRequestFromBody,
   vaultStateDir,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
@@ -4452,6 +4453,14 @@ export async function CodexAuthPlugin(
             storage: reqStorage,
             mode,
             sessionId,
+            routingRequest: vaultMode
+              ? vaultRoutingRequestFromBody(
+                  init?.body,
+                  effectiveRequestHeaders(requestInput, init).get(
+                    OPENAI_AGENT_HEADER,
+                  ) ?? undefined,
+                )
+              : undefined,
             body: typeof init?.body === 'string' ? init.body : undefined,
             replayable: isReplayableRequest(requestInput, init),
             now: Date.now,

@@ -37,6 +37,7 @@ import {
 import type { PoolRow } from '@cortexkit/common-auth/store'
 import {
   type AccountStorage,
+  chooseVaultRouting,
   getFallbackStatuses,
   getKillswitchThresholdsForAccount,
   isShieldedMainRow,
@@ -44,9 +45,11 @@ import {
   type OAuthQuotaSnapshot,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
+  reportVaultRouting,
   VAULT_MODE_REFUSAL_CAUSES,
   VAULT_MODE_REFUSALS,
   type VaultModeRefusal,
+  type VaultRoutingRequest,
 } from '@cortexkit/openai-auth-core/internal'
 import type { PoolAccountSource } from './pool-account-source'
 import { windowsFromQuotaMap } from './pool-quota'
@@ -187,6 +190,7 @@ export interface PoolRequestContext {
   storage: AccountStorage | null
   mode: RoutingMode
   sessionId: string | undefined
+  routingRequest?: VaultRoutingRequest
   /** The buffered request body, when there is one. */
   body: string | undefined
   replayable: boolean
@@ -375,6 +379,7 @@ async function sendTo(
   }
   return ctx.vault?.send(target.id, async (token, attempt) => {
     const response = await ctx.send(target, token, attempt)
+    reportVaultRouting(ctx.sessionId, attempt, response.headers)
     ctx.recordQuota(response, target, token, attempt)
     return response
   })
@@ -413,6 +418,7 @@ export async function servePoolRequest(
   ) {
     const sticky = await serveSticky(ctx, rows, ctx.sessionId, ctx.body)
     if (sticky) return sticky
+    return serveOrdered({ ...ctx, routingRequest: undefined }, rows)
   }
   return serveOrdered(ctx, rows)
 }
@@ -464,6 +470,18 @@ async function serveOrdered(
   }
 
   const byId = new Map(rows.map((row) => [row.id, row]))
+  const preferred = await chooseVaultRouting({
+    vaultMode: ctx.vault !== undefined,
+    fresh: true,
+    sessionId: ctx.sessionId,
+    request: ctx.routingRequest,
+    routes: ctx.vault?.routes() ?? [],
+    routing,
+    eligibleIds: plan.order,
+  })
+  const order = preferred
+    ? [preferred, ...plan.order.filter((id) => id !== preferred)]
+    : plan.order
   const retryStatuses = getFallbackStatuses(ctx.storage)
   const attempts: OrderedAttempt[] = []
   // Accounts that had nothing to send with (a vault account the vault would
@@ -474,7 +492,7 @@ async function serveOrdered(
   let vaultRefused = false
   for (;;) {
     const id = nextOrderedAttempt(
-      plan.order.filter((candidate) => !unsent.has(candidate)),
+      order.filter((candidate) => !unsent.has(candidate)),
       attempts,
       retryStatuses,
     )
@@ -548,6 +566,8 @@ async function serveSticky(
     },
   }
 
+  let preferred: StickySelection | undefined
+  let cold = false
   const placer =
     (input: PoolRoutingInput, admission: StickyAdmission) =>
     (exclude: readonly string[], persist: boolean) => {
@@ -572,14 +592,37 @@ async function serveSticky(
         wireAccountIdByAccount: Object.fromEntries(
           rows.map((row) => [row.id, row.identity]),
         ),
-        select: (pendingBytes) =>
-          selectStickyRow(input, options, excluded, pendingBytes),
+        select: (pendingBytes) => {
+          if (!persist && exclude.length === 0) cold = true
+          const selected =
+            preferred ?? selectStickyRow(input, options, excluded, pendingBytes)
+          return selected
+        },
         persist,
       })
     }
 
   let place = placer(routing, sticky)
+  const preview = ctx.vault && ctx.routingRequest ? place([], false) : undefined
+  if (preview && cold) {
+    const advised = await chooseVaultRouting({
+      vaultMode: ctx.vault !== undefined,
+      fresh: true,
+      sessionId,
+      request: ctx.routingRequest,
+      routes: ctx.vault?.routes() ?? [],
+      routing,
+    })
+    preferred = advised
+      ? {
+          accountId: advised,
+          source: 'mode-fallback',
+          quotaCheckedAt: sticky.projections.get(advised)?.checkedAt,
+        }
+      : undefined
+  }
   const assignment = place([], true)
+  preferred = undefined
   if (!assignment) return undefined
   let id = assignment.accountId
 

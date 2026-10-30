@@ -53,6 +53,7 @@ import type { RoutingRow, StickyPin } from '@cortexkit/common-auth/routing'
 import type { PoolRow } from '@cortexkit/common-auth/store'
 import {
   type AccountStorage,
+  chooseVaultRouting,
   extractAccountIdFromClaims,
   getKillswitchThresholdsForAccount,
   isCompleteQuotaHeaderFrame,
@@ -63,6 +64,7 @@ import {
   placeStickyPin,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
+  reportVaultRouting,
   resolveMidStreamRateLimitResetAt,
   type VaultModeRefusal,
   vaultModeNoRouteCause,
@@ -551,6 +553,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     excluded: ReadonlySet<string>,
     persist: boolean,
     plannedPins: Map<string, StickyPin>,
+    preferred?: string,
   ): string | undefined => {
     const quotaById = new Map(
       targets.map((target) => [target.id, target.quota]),
@@ -590,7 +593,18 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             targets.map((target) => [target.id, target.identity]),
           ),
           select: (pendingBytes) =>
-            selectStickyRow(routing, options, new Set(exclude), pendingBytes),
+            preferred
+              ? {
+                  accountId: preferred,
+                  source: 'mode-fallback',
+                  quotaCheckedAt: sticky.projections.get(preferred)?.checkedAt,
+                }
+              : selectStickyRow(
+                  routing,
+                  options,
+                  new Set(exclude),
+                  pendingBytes,
+                ),
           persist: keep,
         },
         (sessionId, pin) => plannedPins.set(sessionId, pin),
@@ -676,14 +690,27 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     let plannedPin: StickyPin | undefined
     let reservation: PinReservation | undefined
     let accountId: string | undefined
+    let routingConsulted = false
+    const reserveAccount = (id: string) => {
+      const checkedAt = admitSticky(routing).projections.get(id)?.checkedAt
+      const identity = byId.get(id)?.identity
+      return pins.reserve(input.sessionID, {
+        accountId: id,
+        inputBytes: NOMINAL_REQUEST_BYTES,
+        ...(checkedAt !== undefined ? { quotaCheckedAt: checkedAt } : {}),
+        ...(identity !== undefined ? { wireIdentity: identity } : {}),
+      })
+    }
     try {
       for (;;) {
         const skip = new Set([...excluded, ...refused])
         accountId = undefined
         plannedPin = undefined
+        let cold = mode !== 'sticky-balanced'
         if (mode === 'sticky-balanced') {
           const plannedPins = new Map(pins.placementSnapshot(input.sessionID))
           const previous = plannedPins.get(input.sessionID)
+          cold = previous === undefined
           accountId = chooseSticky(
             routing,
             targets,
@@ -745,17 +772,50 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           break
         }
         if (primary && mode === 'sticky-balanced') {
-          const checkedAt =
-            admitSticky(routing).projections.get(accountId)?.checkedAt
-          const identity = byId.get(accountId)?.identity
-          // Publish the pending-byte reservation before authorization can yield,
-          // so another project's cold session sees this choice's demand.
-          reservation = pins.reserve(input.sessionID, {
-            accountId,
-            inputBytes: NOMINAL_REQUEST_BYTES,
-            ...(checkedAt !== undefined ? { quotaCheckedAt: checkedAt } : {}),
-            ...(identity !== undefined ? { wireIdentity: identity } : {}),
+          // Reserve this request's bytes before optional routing or authorization
+          // yields, so other sessions include it when balancing account choices.
+          reservation = reserveAccount(accountId)
+        }
+        if (!routingConsulted) {
+          routingConsulted = true
+          const preferred = await chooseVaultRouting({
+            vaultMode,
+            fresh: cold,
+            sessionId: input.sessionID,
+            request: {
+              modelId: input.modelID,
+              kind: input.kind,
+              retry: input.phase === 'retry' || input.rerouteFrom !== undefined,
+            },
+            routes: vault?.routes() ?? [],
+            routing,
+            eligibleIds: targets
+              .filter((target) => !skip.has(target.id))
+              .map((target) => target.id),
           })
+          if (preferred && preferred !== accountId) {
+            if (reservation) pins.rollback(reservation)
+            reservation = undefined
+            if (mode === 'sticky-balanced') {
+              const stickyPins = new Map(
+                pins.placementSnapshot(input.sessionID),
+              )
+              accountId =
+                chooseSticky(
+                  routing,
+                  targets,
+                  storage,
+                  input.sessionID,
+                  skip,
+                  primary,
+                  stickyPins,
+                  preferred,
+                ) ?? accountId
+              plannedPin = stickyPins.get(input.sessionID) ?? plannedPin
+            } else accountId = preferred
+            if (primary && mode === 'sticky-balanced')
+              reservation = reserveAccount(accountId)
+          }
         }
         const row = byId.get(accountId)?.row
         if (row) {
@@ -968,7 +1028,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         : undefined,
     rewriteWebSocketFrame: ({ frame, sessionID, kind }) =>
       rewriteCodexFrame(frame, { sessionID, kind }, effort),
-    quotaFromHeaders: (headers) => quotaFromCodexHeaders(headers),
+    quotaFromHeaders: (headers, _status, attempt) => {
+      if (attempt.data?.kind === 'vault')
+        reportVaultRouting(attempt.sessionID, attempt.data.receipt, headers)
+      return quotaFromCodexHeaders(headers)
+    },
     async limitFromResponse({ status, headers, body }) {
       if (status < 400) return undefined
       const parsed = parseJson(await body().catch(() => ''))
@@ -983,7 +1047,19 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       const after = retryAfterMs(headers)
       return after === undefined ? limit : { ...limit, retryAfterMs: after }
     },
-    inspectEvent: ({ data }) => inspectCodexEvent(data, now()),
+    inspectEvent: ({ data, transport, attempt }) => {
+      // WebSocket completions have no HTTP header hook to report their served outcome.
+      if (transport === 'ws' && attempt.data?.kind === 'vault') {
+        const event = parseJson(data)
+        if (isRecord(event) && event.type === 'response.completed')
+          reportVaultRouting(
+            attempt.sessionID,
+            attempt.data.receipt,
+            new Headers(),
+          )
+      }
+      return inspectCodexEvent(data, now())
+    },
     limitFromError(error: HostError) {
       const parsed = parseJson(error.message)
       const signal =
