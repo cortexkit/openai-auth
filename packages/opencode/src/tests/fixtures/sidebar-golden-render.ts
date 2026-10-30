@@ -183,20 +183,17 @@ const v1 = await testRender(() => v1Render?.(), {
 })
 
 // The OpenCode 2 view mounts before the state poll, so its first frame can
-// still lack rows that the poll's reading adds. On macOS, one render pass
+// still lack rows that the poll's reading adds. On macOS a single render pass
 // missed the "deficit … out in …" lines under each window and the cut-off
-// "…" in the Killswitch row. Render both views until neither frame changes,
-// and fail if they never settle.
+// "…" in the Killswitch row; a second pass drew them. Give both views three
+// passes before any capture, as the resized captures always did. Capturing
+// between passes is not safe: OpenTUI 0.7 can refuse it with OutputBusy while
+// a frame is still being written out.
 async function settle() {
-  let previous = ''
-  for (let pass = 0; pass < 10; pass++) {
+  for (let pass = 0; pass < 3; pass++) {
     await view.renderOnce()
     await v1.renderOnce()
-    const frames = `${view.captureCharFrame()}\u0000${v1.captureCharFrame()}`
-    if (frames === previous) return
-    previous = frames
   }
-  throw new Error('sidebar frames did not settle within 10 render passes')
 }
 
 function captureGolden(name: string) {
