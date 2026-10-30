@@ -146,6 +146,13 @@ export interface PoolAccountSourceDeps {
   >
   log?: Pick<ReturnType<typeof createLogger>, 'debug' | 'info' | 'warn'>
   /**
+   * Where rate-limit marks are kept: account key to mark expiry (epoch ms).
+   * OpenCode 2 passes one map per account store, shared by every location in
+   * the process, so a 429 seen in one project keeps the others off the
+   * account too. Without it the source keeps its own.
+   */
+  rateLimitMarks?: Map<string, number>
+  /**
    * The ChatGPT accounts the Claustrum vault holds for this host. A row
    * signing in as one of them is not this host's to use (one account has
    * one owner, and the vault owns it): request routing skips it, and this
@@ -262,7 +269,7 @@ export class PoolAccountSource {
   >()
   private readonly pending = new Map<string, PendingObservation[]>()
   private readonly writes = new Map<string, Promise<void>>()
-  private readonly marks = new Map<string, number>()
+  private readonly marks: Map<string, number>
   private readonly lastPull = new Map<string, number>()
   private readonly quotaPulls = new Map<
     string,
@@ -281,6 +288,7 @@ export class PoolAccountSource {
     this.deps = deps
     this.now = deps.now ?? Date.now
     this.log = deps.log ?? createLogger('pool')
+    this.marks = deps.rateLimitMarks ?? new Map()
     this.vaultRosterSettled = deps.vaultFirstRoster === undefined
     const settled = () => {
       this.vaultRosterSettled = true

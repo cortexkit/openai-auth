@@ -127,6 +127,7 @@ import {
 } from './login'
 import { createControlPlaneMenu } from './menu'
 import { registerCodexModelRules } from './models'
+import { acquirePoolRateLimitMarks } from './rate-limit-marks'
 import { RequestDumps } from './request-dumps'
 import {
   createPoolQuotaPull,
@@ -602,6 +603,8 @@ export async function setupOpenAIAuth(
   const resetCounts = new ResetCreditCounts()
   const source = new PoolAccountSource({
     paths,
+    // One map per account store for every location in this process.
+    rateLimitMarks: acquirePoolRateLimitMarks(paths()),
     refreshProvider: async (credential) => {
       const tokens = await codexRefreshFn({
         refreshToken: credential.refresh,

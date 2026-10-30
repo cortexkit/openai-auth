@@ -96,6 +96,7 @@ import {
 } from './codex-wire'
 import { codexRequestURL } from './endpoint'
 import type { PinReservation, SessionPins } from './pins'
+import { acquireVaultRateLimitMarks } from './rate-limit-marks'
 import { SessionAccounts } from './session-accounts'
 
 /** The provider (and integration) OpenCode 2 serves ChatGPT logins under. */
@@ -168,7 +169,9 @@ export type VaultAccess = Pick<
   | 'requestReading'
   | 'grantReach'
   | 'name'
->
+> &
+  // The roster file names the vault whose rate-limit marks this host shares.
+  Partial<Pick<OpenAiVault, 'paths'>>
 
 /**
  * What one send went out with, carried as the attempt's `data`: the pool
@@ -413,9 +416,15 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   const keptChoices = new Map<string, { commit(): void; drop(): void }>()
   const receiptKey = (scope: AccountRequest) =>
     `${scope.sessionID}\u0000${scope.kind}\u0000${scope.accountId}`
-  // Rate-limit marks of vault accounts (the pool source marks only its own
-  // rows): account id to the mark's expiry time.
-  const vaultMarks = new Map<string, number>()
+  // Rate-limit marks of vault accounts (the pool source keeps its rows'):
+  // account id to the mark's expiry time. Every location in the process that
+  // reads the same vault roster shares one map, so a 429 seen in one project
+  // keeps the others off the account too. A vault with no roster file (tests)
+  // gets a private map.
+  const rosterPath = vault?.paths?.rosterPath
+  const vaultMarks = rosterPath
+    ? acquireVaultRateLimitMarks(rosterPath)
+    : new Map<string, number>()
   // The row each session's latest agent-loop request went to, which its
   // title, compaction and generate requests follow in the ordered modes.
   const sessionAccounts = deps.sessionAccounts ?? new SessionAccounts()
@@ -715,6 +724,17 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             for (const id of excluded) rateLimitMarks.delete(id)
             routing = { ...routing, rateLimitMarks }
             excluded.clear()
+            continue
+          }
+          // Rate-limit marks only steer requests to other accounts. As on
+          // OpenCode 1, they never leave a request with no account to try:
+          // when every remaining account is marked, choose again without the
+          // marks and let the provider answer. The marks stay in place for
+          // the requests after this one. An account below its killswitch floor
+          // (the minimum remaining quota the user set), or one the vault
+          // refused, is still never used: those are decisions, not hints.
+          if (routing.rateLimitMarks.size > 0) {
+            routing = { ...routing, rateLimitMarks: new Map() }
             continue
           }
           accountId = undefined

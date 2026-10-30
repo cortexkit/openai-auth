@@ -1056,8 +1056,21 @@ export function parseRateLimitSignal(value: unknown):
         ? Date.now() + resetsInSeconds * 1000
         : undefined
 
-  return { window: type ?? 'primary', resetAt }
+  // The window names the limit for the mark's expiry. Only a `response.failed`
+  // frame names a quota window (`primary`, `secondary`); a 429 body names its
+  // error type or code instead. Codex's own client treats only
+  // `usage_limit_reached` (and the quota codes) as the account's usage limit,
+  // and every other 429 (`turn_rate_limit_exceeded`, `rate_limit_exceeded`, a
+  // body with no type) as a short rate limit retried after `Retry-After`. So a
+  // 429 never reports a quota window it doesn't name: if it did, its mark
+  // would take that window's cached reset, hours away, instead of its own
+  // `Retry-After` or the short default.
+  const code = typeof detail.code === 'string' ? detail.code : undefined
+  return { window: type ?? code ?? RATE_LIMIT_WINDOW, resetAt }
 }
+
+/** The window of a 429 that names neither an error type nor a code. */
+export const RATE_LIMIT_WINDOW = 'rate_limit'
 
 function cancelError(reason: unknown) {
   if (isAbortError(reason)) return reason
