@@ -1,5 +1,5 @@
 {
-  "chars": "                                     \n  ▼ OPENAI                    v1.8.4 \n                                     \n Quota                               \n main                         active \n 5h      █▓░░░░░░░░ 80% left   4h39m \n         deficit 13% · out in 1h24m  \n 7d      ██████▓░░░ 30% left      3d \n         deficit 13% · out in 1d17h  \n credits ██░░░░░░░░ 80% left         \n credits         502 / 2,500 credits \n prepaid                1235 credits \n resets                            3 \n                                     \n Work account                blocked \n 5h      █▓░░░░░░░░ 80% left   4h39m \n         deficit 13% · out in 1h24m  \n checked 3h ago                      \n                                     \n Spare                          idle \n checking…                           \n                                     \n Routing                             \n Route                    main-first \n                                     \n Health                              \n Quota API               backoff 17m \n Token refresh            backoff 2h \n Killswitch     Work account blocked \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n",
+  "chars": "                                     \n  ▼ OPENAI                           \n                                     \n Quota                               \n main                         active \n 5h      █▓░░░░░░░░ 80% left   4h39m \n         deficit 13% · out in 1h24m  \n 7d      ██████▓░░░ 30% left      3d \n         deficit 13% · out in 1d17h  \n credits ██░░░░░░░░ 80% left         \n credits         502 / 2,500 credits \n prepaid                1235 credits \n resets                            3 \n                                     \n Work account                blocked \n 5h      █▓░░░░░░░░ 80% left   4h39m \n         deficit 13% · out in 1h24m  \n checked 3h ago                      \n                                     \n Spare                          idle \n checking…                           \n                                     \n Routing                             \n Route                    main-first \n                                     \n Health                              \n Quota API               backoff 17m \n Token refresh            backoff 2h \n Killswitch     Work account blocked \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n                                     \n",
   "spans": {
     "cols": 37,
     "rows": 42,
@@ -117,7 +117,7 @@
             "width": 1
           },
           {
-            "text": "                   ",
+            "text": "                          ",
             "fg": {
               "buffer": {
                 "0": 255,
@@ -135,49 +135,7 @@
               }
             },
             "attributes": 0,
-            "width": 19
-          },
-          {
-            "text": "v1.8.4",
-            "fg": {
-              "buffer": {
-                "0": 136,
-                "1": 136,
-                "2": 136,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 0,
-                "1": 0,
-                "2": 0,
-                "3": 0
-              }
-            },
-            "attributes": 0,
-            "width": 6
-          },
-          {
-            "text": " ",
-            "fg": {
-              "buffer": {
-                "0": 255,
-                "1": 255,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 0,
-                "1": 0,
-                "2": 0,
-                "3": 0
-              }
-            },
-            "attributes": 0,
-            "width": 1
+            "width": 26
           }
         ]
       },

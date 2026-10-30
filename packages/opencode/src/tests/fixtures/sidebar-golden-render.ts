@@ -21,6 +21,9 @@ writeFileSync(
     'openai-auth': {
       collapsed,
       sections: { pacing: true, routing: true, health: true },
+      // The header reads the version from package.json, so a release's version
+      // bump would change every golden. Other tests cover the version text.
+      header: { showVersion: false },
     },
   }),
 )

@@ -1,5 +1,5 @@
 {
-  "chars": "                \n  ▼       v1.8. \n  OPENAI  4     \n                \n Quota          \n main    active \n 5h       80% le\n         defic… \n 7d       30% le\n         defic… \n credits  80% le\n 502 / 2,500 cr \n … 1235 credits \n resets       3 \n                \n Work     block \n account  ed    \n 5h       80% le\n         defic… \n checked 3h ago \n                \n Spare     idle \n checking…      \n                \n Routing        \n Route main-fi… \n                \n Health         \n Quota API bac… \n Token refresh  \n Killswitch Wo… \n                \n                \n                \n                \n                \n                \n                \n                \n                \n                \n                \n",
+  "chars": "                \n  ▼ OPENAI      \n                \n Quota          \n main    active \n 5h       80% le\n         defic… \n 7d       30% le\n         defic… \n credits  80% le\n 502 / 2,500 cr \n … 1235 credits \n resets       3 \n                \n Work     block \n account  ed    \n 5h       80% le\n         defic… \n checked 3h ago \n                \n Spare     idle \n checking…      \n                \n Routing        \n Route main-fi… \n                \n Health         \n Quota API bac… \n Token refresh  \n Killswitch Wo… \n                \n                \n                \n                \n                \n                \n                \n                \n                \n                \n                \n                \n",
   "spans": {
     "cols": 16,
     "rows": 42,
@@ -75,7 +75,7 @@
             "width": 1
           },
           {
-            "text": "▼ ",
+            "text": "▼ OPENAI",
             "fg": {
               "buffer": {
                 "0": 16,
@@ -93,95 +93,7 @@
               }
             },
             "attributes": 1,
-            "width": 2
-          },
-          {
-            "text": "      ",
-            "fg": {
-              "buffer": {
-                "0": 255,
-                "1": 255,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 85,
-                "1": 170,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "attributes": 0,
-            "width": 6
-          },
-          {
-            "text": "v1.8.",
-            "fg": {
-              "buffer": {
-                "0": 136,
-                "1": 136,
-                "2": 136,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 0,
-                "1": 0,
-                "2": 0,
-                "3": 0
-              }
-            },
-            "attributes": 0,
-            "width": 5
-          },
-          {
-            "text": " ",
-            "fg": {
-              "buffer": {
-                "0": 255,
-                "1": 255,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 0,
-                "1": 0,
-                "2": 0,
-                "3": 0
-              }
-            },
-            "attributes": 0,
-            "width": 1
-          }
-        ]
-      },
-      {
-        "spans": [
-          {
-            "text": " ",
-            "fg": {
-              "buffer": {
-                "0": 255,
-                "1": 255,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 0,
-                "1": 0,
-                "2": 0,
-                "3": 0
-              }
-            },
-            "attributes": 0,
-            "width": 1
+            "width": 8
           },
           {
             "text": " ",
@@ -199,69 +111,6 @@
                 "1": 170,
                 "2": 255,
                 "3": 255
-              }
-            },
-            "attributes": 0,
-            "width": 1
-          },
-          {
-            "text": "OPENAI",
-            "fg": {
-              "buffer": {
-                "0": 16,
-                "1": 16,
-                "2": 16,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 85,
-                "1": 170,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "attributes": 1,
-            "width": 6
-          },
-          {
-            "text": "  ",
-            "fg": {
-              "buffer": {
-                "0": 255,
-                "1": 255,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 85,
-                "1": 170,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "attributes": 0,
-            "width": 2
-          },
-          {
-            "text": "4",
-            "fg": {
-              "buffer": {
-                "0": 136,
-                "1": 136,
-                "2": 136,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 0,
-                "1": 0,
-                "2": 0,
-                "3": 0
               }
             },
             "attributes": 0,
@@ -2394,6 +2243,31 @@
             },
             "attributes": 0,
             "width": 1
+          }
+        ]
+      },
+      {
+        "spans": [
+          {
+            "text": "                ",
+            "fg": {
+              "buffer": {
+                "0": 255,
+                "1": 255,
+                "2": 255,
+                "3": 255
+              }
+            },
+            "bg": {
+              "buffer": {
+                "0": 0,
+                "1": 0,
+                "2": 0,
+                "3": 0
+              }
+            },
+            "attributes": 0,
+            "width": 16
           }
         ]
       },

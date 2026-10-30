@@ -1,5 +1,5 @@
 {
-  "chars": "                                          \n  ▶ OPENAI                         v1.8.4 \n main     5h 80% · 7d 30% · cr 80% left ● \n Work account               5h 80% left ⊘ \n Spare                                  — \n                                          \n                                          \n                                          \n",
+  "chars": "                                          \n  ▶ OPENAI                                \n main     5h 80% · 7d 30% · cr 80% left ● \n Work account               5h 80% left ⊘ \n Spare                                  — \n                                          \n                                          \n                                          \n",
   "spans": {
     "cols": 42,
     "rows": 8,
@@ -117,7 +117,7 @@
             "width": 1
           },
           {
-            "text": "                        ",
+            "text": "                               ",
             "fg": {
               "buffer": {
                 "0": 255,
@@ -135,49 +135,7 @@
               }
             },
             "attributes": 0,
-            "width": 24
-          },
-          {
-            "text": "v1.8.4",
-            "fg": {
-              "buffer": {
-                "0": 136,
-                "1": 136,
-                "2": 136,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 0,
-                "1": 0,
-                "2": 0,
-                "3": 0
-              }
-            },
-            "attributes": 0,
-            "width": 6
-          },
-          {
-            "text": " ",
-            "fg": {
-              "buffer": {
-                "0": 255,
-                "1": 255,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 0,
-                "1": 0,
-                "2": 0,
-                "3": 0
-              }
-            },
-            "attributes": 0,
-            "width": 1
+            "width": 31
           }
         ]
       },
