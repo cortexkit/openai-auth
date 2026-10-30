@@ -19,6 +19,7 @@ import {
 } from '../core/pool-migration'
 import { routableRows } from '../core/pool-request'
 import { opencode1HostSlot } from '../v2/host-slot'
+import { failureTimeline } from './fixtures/failure-timeline'
 import {
   type Harness,
   harness,
@@ -28,13 +29,26 @@ import {
 } from './fixtures/pool-migration-harness'
 
 const fixtures: Harness[] = []
+let lifecycleTimeline: ReturnType<typeof failureTimeline> | undefined
 const fresh = () => {
   const h = harness()
   fixtures.push(h)
   return h
 }
-afterEach(() => {
-  for (const h of fixtures.splice(0)) h.cleanup()
+afterEach(async () => {
+  const cleanup = () => {
+    for (const h of fixtures.splice(0)) {
+      if (lifecycleTimeline)
+        lifecycleTimeline.phase('fixture cleanup', () => h.cleanup())
+      else h.cleanup()
+    }
+  }
+  try {
+    if (lifecycleTimeline) await lifecycleTimeline.run('afterEach', cleanup)
+    else cleanup()
+  } finally {
+    lifecycleTimeline = undefined
+  }
 })
 
 describe('login slot audit', () => {
@@ -261,62 +275,83 @@ describe('login slot audit', () => {
   })
 
   test('the lifecycle restores the placeholder while the vault serves', async () => {
-    const h = fresh()
-    await seedLegacyInstall(h)
-    await migrateToPool(h.deps())
-    await h.setSlot({ ...login('stray-account', 'stray-refresh'), expires: 0 })
-    const lifecycle = createPoolLifecycle({
-      paths: () => h.paths,
-      slot: h.slot,
-      version: '1.0.0',
-      fence: async () => ({ open: true }),
-      runDeps: { vaultServes: () => true },
-      timers: { set: () => 1, clear: () => {} },
-    })
-    try {
-      lifecycle.start()
-      await lifecycle.idle()
-      expect(isPoolPlaceholder(await h.slotValue())).toBe(true)
-      expect(await poolTokens(h)).toContain('stray-refresh')
-      // The imported copy cannot compete with the vault's owner for refresh
-      // or routing, even when the newly signed-in token is already expired.
-      const identities = new Set(['stray-account'])
-      const refreshed: string[] = []
-      const polled: string[] = []
-      const source = new PoolAccountSource({
+    const clock = failureTimeline(
+      'the lifecycle restores the placeholder while the vault serves',
+    )
+    lifecycleTimeline = clock
+    await clock.run('body', async () => {
+      const h = fresh()
+      await clock.phase('seed legacy install', () => seedLegacyInstall(h))
+      await clock.phase('migrate to pool', () => migrateToPool(h.deps()))
+      await clock.phase('set stray login', () =>
+        h.setSlot({ ...login('stray-account', 'stray-refresh'), expires: 0 }),
+      )
+      const lifecycle = createPoolLifecycle({
         paths: () => h.paths,
-        vaultIdentities: () => identities,
-        refreshProvider: async (credential) => {
-          refreshed.push(credential.refresh)
-          return {
-            access: credential.access ?? 'rotated',
-            refresh: `${credential.refresh}-next`,
-            expires: Date.now() + 3600_000,
-          }
+        slot: h.slot,
+        version: '1.0.0',
+        fence: async () => ({ open: true }),
+        runDeps: {
+          vaultServes: () => true,
+          onStep: (step) => clock.phase(`lifecycle: ${step}`, () => {}),
         },
-        pullQuota: async (request) => {
-          polled.push(request.id)
-          return undefined
-        },
+        timers: { set: () => 1, clear: () => {} },
       })
       try {
-        await source.load()
-        await source.poolStore().pullsSettled()
-        await source.prepareTokens(await h.rows(), null, { waitForAll: true })
-        expect(polled).not.toContain('stray-account')
-        expect(refreshed).not.toContain('stray-refresh')
+        clock.phase('lifecycle start', () => lifecycle.start())
+        await clock.phase('lifecycle idle', () => lifecycle.idle())
         expect(
-          routableRows(await h.rows(), null, Date.now(), identities).some(
-            (row) => row.identity === 'stray-account',
+          isPoolPlaceholder(
+            await clock.phase('read slot', () => h.slotValue()),
           ),
-        ).toBe(false)
+        ).toBe(true)
+        expect(
+          await clock.phase('read pool tokens', () => poolTokens(h)),
+        ).toContain('stray-refresh')
+        // The imported copy cannot compete with the vault's owner for refresh
+        // or routing, even when the newly signed-in token is already expired.
+        const identities = new Set(['stray-account'])
+        const refreshed: string[] = []
+        const polled: string[] = []
+        const source = new PoolAccountSource({
+          paths: () => h.paths,
+          vaultIdentities: () => identities,
+          refreshProvider: async (credential) => {
+            refreshed.push(credential.refresh)
+            return {
+              access: credential.access ?? 'rotated',
+              refresh: `${credential.refresh}-next`,
+              expires: Date.now() + 3600_000,
+            }
+          },
+          pullQuota: async (request) => {
+            polled.push(request.id)
+            return undefined
+          },
+        })
+        try {
+          await clock.phase('source load', () => source.load())
+          await clock.phase('source pulls settled', () =>
+            source.poolStore().pullsSettled(),
+          )
+          await clock.phase('source prepare tokens', async () =>
+            source.prepareTokens(await h.rows(), null, { waitForAll: true }),
+          )
+          expect(polled).not.toContain('stray-account')
+          expect(refreshed).not.toContain('stray-refresh')
+          expect(
+            routableRows(await h.rows(), null, Date.now(), identities).some(
+              (row) => row.identity === 'stray-account',
+            ),
+          ).toBe(false)
+        } finally {
+          await clock.phase('source dispose', () => source.dispose())
+          await clock.phase('source settled', () => source.settled())
+        }
       } finally {
-        source.dispose()
-        await source.settled()
+        clock.phase('lifecycle dispose', () => lifecycle.dispose())
       }
-    } finally {
-      lifecycle.dispose()
-    }
+    })
   })
 
   test('an interrupted adoption resumes when the vault starts serving', async () => {
