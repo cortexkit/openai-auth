@@ -726,10 +726,14 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             excluded.clear()
             continue
           }
-          // Rate-limit marks only steer requests to other accounts. As on
-          // OpenCode 1, they never leave a request with no account to try:
-          // when every remaining account is marked, choose again without the
-          // marks and let the provider answer. The marks stay in place for
+          // Rate-limit marks only steer requests to other accounts; they never
+          // leave a request with no account to try. OpenCode 1 answers such a
+          // request locally with a 429 whose Retry-After is the mark's end, but
+          // OpenCode 2 gives a fresh request no way to carry a delay: an empty
+          // choice ends the turn with a no-account error the host never
+          // retries. So when every remaining account is marked, choose again
+          // without the marks and let the provider answer; a 429 from it goes
+          // through the host's retry, which can wait. The marks stay in place for
           // the requests after this one. An account below its killswitch floor
           // (the minimum remaining quota the user set), or one the vault
           // refused, is still never used: those are decisions, not hints.

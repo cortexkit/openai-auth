@@ -163,9 +163,9 @@ describe('OpenCode 2 kept retry choice', () => {
       expect(f.drops).toEqual([])
       const mark = f.marks.get('a')
       expect(mark).toBeGreaterThan(Date.now())
-      // A new session is still sent on the only account, as on OpenCode 1:
-      // a mark steers requests to other accounts but never leaves one with
-      // none to try. The mark itself stays for the requests after it.
+      // A new session is still sent on the only account: a mark steers
+      // requests to other accounts but never leaves one with none to try.
+      // The mark itself stays for the requests after it.
       expect(
         (await f.request('new-session')).request.headers.get('authorization'),
       ).toBe('Bearer a-token')
