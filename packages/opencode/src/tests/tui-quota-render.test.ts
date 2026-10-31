@@ -785,7 +785,7 @@ describe('collapsed sidebar frame on OpenCode 1 and OpenCode 2', () => {
 })
 
 describe('expanded sidebar frame on OpenCode 1 and OpenCode 2', () => {
-  test('quota rows stay on one line with a space before the reset at every width from 42 to 16 columns', async () => {
+  test('quota rows fit from 42 to 16 columns and unreadable windows show a muted no reading row', async () => {
     const child = Bun.spawn(
       [
         process.execPath,

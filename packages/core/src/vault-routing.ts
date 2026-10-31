@@ -202,6 +202,7 @@ export function reportVaultRouting(
         )
       : undefined
     const window = minutes === 300 ? '5h' : minutes === 10080 ? '7d' : named
+    if (window !== '5h' && window !== '7d') return
     const headerReset = slot
       ? Number(headers.get(`x-codex-${slot}-reset-at`)) * 1000
       : NaN

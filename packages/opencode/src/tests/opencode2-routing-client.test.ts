@@ -386,7 +386,7 @@ test('OpenCode 2 reports a served vault response without waiting, with only rate
   }
 })
 
-test('OpenCode 2 reports a usage-limit 429 as exhausted, never served', async () => {
+test('OpenCode 2 reports nothing for a usage-limit 429 without a recognized window', async () => {
   const reports: unknown[] = []
   Reflect.set(globalThis, key, () => ({
     accountFor: async () => ({ account_id: 'account-b' }),
@@ -418,15 +418,7 @@ test('OpenCode 2 reports a usage-limit 429 as exhausted, never served', async ()
         { status: 429 },
       ),
     })
-    expect(reports).toEqual([
-      {
-        account_id: 'account-b',
-        credential_id: 'credential-b',
-        outcome: 'exhausted',
-        window: 'usage_limit_reached',
-        resets_at: 1_900_000_000_000,
-      },
-    ])
+    expect(reports).toEqual([])
   } finally {
     await installation.dispose()
   }

@@ -227,30 +227,27 @@ function captureReports() {
 }
 
 test.each(['usage_limit_reached', 'insufficient_quota', 'quota_exceeded'])(
-  '%s 429 reports exhaustion with the explicit reset, not served',
+  '%s 429 without a recognized window reports nothing, even with an explicit reset',
   (code) => {
     const reports = captureReports()
-    reportVaultRouting('session', receipt, {
-      status: 429,
-      headers: new Headers({ 'retry-after': '5' }),
-      limit: { window: code, resetAt: 1_900_000_000_000 },
-    })
-    expect(reports).toEqual([
-      {
-        account_id: 'account-b',
-        credential_id: 'credential-b',
-        outcome: 'exhausted',
-        window: code,
-        resets_at: 1_900_000_000_000,
-      },
-    ])
+    const report = spyOn(routingClient, 'reportRouting')
+    try {
+      reportVaultRouting('session', receipt, {
+        status: 429,
+        headers: new Headers({ 'retry-after': '5' }),
+        limit: { window: code, resetAt: 1_900_000_000_000 },
+      })
+      expect(reports).toEqual([])
+      expect(report).not.toHaveBeenCalled()
+    } finally {
+      report.mockRestore()
+    }
   },
 )
 
 test.each([
   { slot: 'primary', minutes: 300, window: '5h' },
   { slot: 'secondary', minutes: 10080, window: '7d' },
-  { slot: 'primary', minutes: 240, window: 'primary' },
 ])(
   'named $slot with $minutes minutes reports $window and Retry-After',
   ({ slot, minutes, window }) => {
@@ -274,6 +271,47 @@ test.each([
         outcome: 'exhausted',
         window,
         resets_at: 1_800_000_020_000,
+      },
+    ])
+  },
+)
+
+test.each([undefined, 240])(
+  'a named primary window with %s minutes reports nothing',
+  (minutes) => {
+    const reports = captureReports()
+    reportVaultRouting('session', receipt, {
+      status: 429,
+      headers: new Headers({
+        ...(minutes !== undefined
+          ? { 'x-codex-primary-window-minutes': String(minutes) }
+          : {}),
+        'retry-after': '20',
+      }),
+      limit: { window: 'usage_limit_reached' },
+      body: { error: { rate_limit_reached_type: 'primary' } },
+    })
+    expect(reports).toEqual([])
+  },
+)
+
+test.each(['5h', '7d'])(
+  'a usage-limit 429 naming %s reports account-wide exhaustion with the explicit reset',
+  (window) => {
+    const reports = captureReports()
+    reportVaultRouting('session', receipt, {
+      status: 429,
+      headers: new Headers({ 'retry-after': '5' }),
+      limit: { window: 'usage_limit_reached', resetAt: 1_900_000_000_000 },
+      body: { error: { window, pool: 'model-budget' } },
+    })
+    expect(reports).toEqual([
+      {
+        account_id: 'account-b',
+        credential_id: 'credential-b',
+        outcome: 'exhausted',
+        window,
+        resets_at: 1_900_000_000_000,
       },
     ])
   },
@@ -311,7 +349,7 @@ test('cached window minutes can name exhaustion, but only an explicit reset head
   ])
 })
 
-test('a quota code retains a scoped window and accepts an HTTP-date Retry-After', () => {
+test('a quota code with a model-scoped window reports nothing', () => {
   const reports = captureReports()
   reportVaultRouting('session', receipt, {
     status: 429,
@@ -325,12 +363,23 @@ test('a quota code retains a scoped window and accepts an HTTP-date Retry-After'
       },
     },
   })
+  expect(reports).toEqual([])
+})
+
+test('a quota code with a 7d window accepts an HTTP-date Retry-After', () => {
+  const reports = captureReports()
+  reportVaultRouting('session', receipt, {
+    status: 429,
+    headers: new Headers({ 'retry-after': 'Fri, 01 Jan 2027 00:00:00 GMT' }),
+    limit: { window: 'api_error' },
+    body: { error: { code: 'insufficient_quota', window: '7d' } },
+  })
   expect(reports).toEqual([
     {
       account_id: 'account-b',
       credential_id: 'credential-b',
       outcome: 'exhausted',
-      window: 'model-budget',
+      window: '7d',
       resets_at: 1_798_761_600_000,
     },
   ])

@@ -466,6 +466,56 @@ try {
     )
     assert.equal(next, '', `the Killswitch row wraps ${at}`)
   }
+
+  // State-file normalization preserves present windows even when a saved
+  // percentage or timestamp is unusable. Keep those rows visible without
+  // inventing a percentage, bar, reset countdown, or pacing advice.
+  const unreadableWindows = [
+    {},
+    { usedPercent: 20, remainingPercent: 80, checkedAt: 'not-a-number' },
+  ]
+  for (const [index, window] of unreadableWindows.entries()) {
+    publish({
+      lastUpdated: now + 4 + index,
+      main: {
+        killed: false,
+        quota: {
+          checkedAt: now,
+          primary: {
+            windowMinutes: 300,
+            resetsAt: new Date(now + 2 * HOUR).toISOString(),
+            ...window,
+          },
+        },
+      },
+      fallbacks: [],
+      activeId: 'main',
+      route: 'main-first',
+    })
+    await Promise.all([...polls.values()].map((refresh) => refresh()))
+    for (const width of [42, 37, 36, 16]) {
+      await drawAt(width)
+      const lines = contentLines()
+      const at = `at width ${width}: ${view.captureCharFrame()}`
+      assert.deepEqual(
+        lines
+          .filter((line) => line.startsWith('5h '))
+          .map((line) => line.trimEnd()),
+        ['5h no reading'],
+        `the unreadable window is not shown as a no reading row ${at}`,
+      )
+      assert.ok(!lines.some((line) => line.trim().startsWith('deficit')), at)
+      assert.ok(!lines.some((line) => line.startsWith('7d ')), at)
+      const spans = view.captureSpans().lines.flatMap((line) => line.spans)
+      assert.ok(
+        spans.some(
+          (span) =>
+            span.text.includes('no reading') && span.fg.equals(theme.textMuted),
+        ),
+        `the no reading row is not muted ${at}`,
+      )
+    }
+  }
 } finally {
   cleanup()
   await view.dispose()
