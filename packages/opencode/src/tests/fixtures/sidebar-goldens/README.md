@@ -6,6 +6,14 @@ presentation with `@cortexkit/common-auth/quota-sidebar`. Both the OpenCode 1 an
 OpenCode 2 entry points produced each buffer. No whitespace, colors, attributes,
 or narrow-width overflow was normalized.
 
+The buffers follow common-auth 0.32's presentation (verified against 0.32.1): the
+shell loses its top row and side padding, and unnamed windows no longer reserve
+a name gutter. Collapsed rows keep their quota suffix whole (or omit it) and
+always end with a status
+glyph, even without a reading. Expanded names ellipsize before the status, and
+bars shrink before reset times are dropped. These shared presentation rules
+deliberately revise the historical buffers rather than preserve their overflow.
+
 `sidebar-golden-render.ts` fixes time, theme and a local account roster: an active
 account with pacing, credit budget, prepaid and reset credits; a blocked idle
 account with a stale reading; and an unloaded spare. Expanded frames include the

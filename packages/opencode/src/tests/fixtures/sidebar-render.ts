@@ -437,7 +437,7 @@ try {
       resolve()
     })
   })
-  await view.mockMouse.click(5, 1)
+  await view.mockMouse.click(5, 0)
   await waitFrame(view, (text) => text.includes('▼ LIVE PREFS'))
   await persisted
   assert.equal(

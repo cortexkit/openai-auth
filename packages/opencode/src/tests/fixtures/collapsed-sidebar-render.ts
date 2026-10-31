@@ -270,7 +270,7 @@ try {
     ...route('main'),
   })
   assert.equal(accountLines().length, 3)
-  assert.match(accountLines()[2] ?? '', /^Work\s+—$/)
+  assert.match(accountLines()[2] ?? '', /^Work\s+— ●$/)
   assertDim('Work')
 
   // Vault mode lists the vault accounts only.
@@ -327,7 +327,7 @@ try {
   assert.match(cut, /^a-very-long-[^… ]+… 5h 60%/)
   assert.equal(cut.length, full?.length)
   assert.ok(!frame().includes(long))
-  assert.ok(cut.length < WIDTH, cut)
+  assert.equal(cut.length, WIDTH, cut)
 
   // At the widths OpenCode gives the plugin (37 on OpenCode 2, 36 on
   // OpenCode 1 once its sidebar scrollbar shows) every account line still
@@ -345,8 +345,8 @@ try {
     const [mainLine = '', longLine = ''] = accountLines()
     assert.match(mainLine, new RegExp(`^main +${NARROW} ●$`), at)
     assert.match(longLine, new RegExp(`^a-very-[^ ]*… ${NARROW} ●$`), at)
-    // The padding takes one column each side.
-    assert.equal(longLine.length, width - 2, at)
+    // The borderless frame uses the whole allocated row.
+    assert.equal(longLine.length, width, at)
   }
 } finally {
   cleanup()

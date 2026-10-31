@@ -199,22 +199,9 @@ async function drawAt(width: number) {
   assert.deepEqual(view.captureSpans(), v1.captureSpans())
 }
 
-// The sidebar's one-cell padding on each side.
-const EDGE = 1
-
-/**
- * The frame's lines without the sidebar's padding on each side, so every line
- * is the `columns` the rows lay themselves out in.
- */
-function contentLines(width: number): string[] {
-  return view
-    .captureCharFrame()
-    .split('\n')
-    .map((line) =>
-      Array.from(line)
-        .slice(EDGE, width - EDGE)
-        .join(''),
-    )
+/** The borderless frame gives rows its entire allocated width. */
+function contentLines(): string[] {
+  return view.captureCharFrame().split('\n')
 }
 
 const BAR = /[█░▒▓]/g
@@ -227,14 +214,17 @@ const LABEL_WIDTH = 3
 // quotaCreditsText's wording for the published balance of 1234.6.
 const CREDITS = '1235 credits'
 const BAR_WIDTH = 10
-const MIN_BAR = 3
+const MIN_BAR = 4
+// Both rows reserve the widest figure (including its space) and reset in this fixture.
+const FIGURE_WIDTH = 10
+const RESET_WIDTH = 5
 
 await Promise.all([...polls.values()].map((refresh) => refresh()))
 try {
   for (let width = FULL_WIDTH; width >= 16; width--) {
     await drawAt(width)
-    const columns = width - 2 * EDGE
-    const lines = contentLines(width)
+    const columns = width
+    const lines = contentLines()
     const frame = view.captureCharFrame()
     if (process.env.SHOW_FRAMES) {
       const first = lines.findIndex((line) => line.startsWith('5h'))
@@ -262,15 +252,16 @@ try {
         line.includes(` ${row.figure}`),
         `the ${row.label} row lost its figure ${at}`,
       )
-      // Drop order: the reset goes first, then the bar shrinks, keeping at
-      // least MIN_BAR cells or none at all.
-      const fixed = LABEL_WIDTH + 1 + row.figure.length
-      const fitsWhole = fixed + BAR_WIDTH + 1 + row.reset.length <= columns
-      const room = columns - fixed
-      const bar = room >= BAR_WIDTH ? BAR_WIDTH : room >= MIN_BAR ? room : 0
+      // Shrink bars before dropping resets, reserving the account-wide figure
+      // and reset columns. A visible bar keeps at least MIN_BAR cells.
+      const room = columns - LABEL_WIDTH - FIGURE_WIDTH
+      const withReset = room - RESET_WIDTH - 1
+      const showReset = withReset >= MIN_BAR
+      const available = showReset ? withReset : room
+      const bar = available >= MIN_BAR ? Math.min(BAR_WIDTH, available) : 0
       const expectedBar = '█'.repeat(Math.round((row.usedCells * bar) / 10))
       const left = `${row.label} ${expectedBar.padEnd(bar, '░')} ${row.figure}`
-      const expected = fitsWhole
+      const expected = showReset
         ? `${left}${' '.repeat(columns - left.length - row.reset.length)}${row.reset}`
         : left.padEnd(columns)
       assert.equal(
@@ -362,8 +353,8 @@ try {
   await Promise.all([...polls.values()].map((refresh) => refresh()))
   for (const width of [37, 36]) {
     await drawAt(width)
-    const columns = width - 2 * EDGE
-    const lines = contentLines(width)
+    const columns = width
+    const lines = contentLines()
     const at = `at width ${width}: ${view.captureCharFrame()}`
     const serving = lines.filter((line) => line.trimEnd().endsWith(CREDITS))
     assert.equal(serving.length, 1, `the prepaid row is missing ${at}`)
@@ -417,7 +408,7 @@ try {
   // rather than swapping it for a badge.
   for (const width of [42, 37, 36]) {
     await drawAt(width)
-    const header = view.captureCharFrame().split('\n')[1] ?? ''
+    const header = view.captureCharFrame().split('\n')[0] ?? ''
     const at = `at width ${width}: ${view.captureCharFrame()}`
     assert.ok(
       header.trimEnd().endsWith(`v${PACKAGE_VERSION}`) &&
@@ -426,12 +417,12 @@ try {
     )
   }
   // One blocked account: its value is 24 cells, so with the label and the
-  // blank cell the row needs 35 columns: whole at 37 and wider, cut below.
+  // blank cell the row needs 35 columns: whole at 35 and wider, cut below.
   const expectedKillswitch: Record<number, string> = {
-    36: 'Killswitch team@example.com block…',
-    42: `Killswitch${' '.repeat(6)}team@example.com blocked`,
-    37: 'Killswitch team@example.com blocked',
-    16: 'Killswitch te…',
+    36: 'Killswitch  team@example.com blocked',
+    42: `Killswitch${' '.repeat(8)}team@example.com blocked`,
+    37: 'Killswitch   team@example.com blocked',
+    16: 'Killswitch team…',
   }
   for (const width of [36, 42, 37, 16]) {
     await drawAt(width)
@@ -455,7 +446,7 @@ try {
   await showKilled(names, 3)
   for (const width of [42, 37, 36, 16]) {
     await drawAt(width)
-    const columns = width - 2 * EDGE
+    const columns = width
     const { row, next } = killswitchRow()
     const at = `at width ${width}: ${view.captureCharFrame()}`
     assert.ok(

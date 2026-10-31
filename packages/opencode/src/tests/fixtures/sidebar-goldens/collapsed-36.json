@@ -1,5 +1,5 @@
 {
-  "chars": "                                    \n  ▶ OPENAI                          \n m… 5h 80% · 7d 30% · cr 80% left ● \n Work account         5h 80% left ⊘ \n Spare                            — \n                                    \n                                    \n                                    \n",
+  "chars": " ▶ OPENAI                           \nmain 5h 80% · 7d 30% · cr 80% left ●\nWork account           5h 80% left ⊘\nSpare                            — ●\n                                    \n                                    \n                                    \n                                    \n",
   "spans": {
     "cols": 36,
     "rows": 8,
@@ -7,52 +7,6 @@
     "lines": [
       {
         "spans": [
-          {
-            "text": "                                    ",
-            "fg": {
-              "buffer": {
-                "0": 255,
-                "1": 255,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 0,
-                "1": 0,
-                "2": 0,
-                "3": 0
-              }
-            },
-            "attributes": 0,
-            "width": 36
-          }
-        ]
-      },
-      {
-        "spans": [
-          {
-            "text": " ",
-            "fg": {
-              "buffer": {
-                "0": 255,
-                "1": 255,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 0,
-                "1": 0,
-                "2": 0,
-                "3": 0
-              }
-            },
-            "attributes": 0,
-            "width": 1
-          },
           {
             "text": " ",
             "fg": {
@@ -117,7 +71,7 @@
             "width": 1
           },
           {
-            "text": "                         ",
+            "text": "                          ",
             "fg": {
               "buffer": {
                 "0": 255,
@@ -135,35 +89,14 @@
               }
             },
             "attributes": 0,
-            "width": 25
+            "width": 26
           }
         ]
       },
       {
         "spans": [
           {
-            "text": " ",
-            "fg": {
-              "buffer": {
-                "0": 255,
-                "1": 255,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 0,
-                "1": 0,
-                "2": 0,
-                "3": 0
-              }
-            },
-            "attributes": 0,
-            "width": 1
-          },
-          {
-            "text": "m…",
+            "text": "main",
             "fg": {
               "buffer": {
                 "0": 240,
@@ -181,7 +114,7 @@
               }
             },
             "attributes": 0,
-            "width": 2
+            "width": 4
           },
           {
             "text": " ",
@@ -245,53 +178,11 @@
             },
             "attributes": 0,
             "width": 2
-          },
-          {
-            "text": " ",
-            "fg": {
-              "buffer": {
-                "0": 255,
-                "1": 255,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 0,
-                "1": 0,
-                "2": 0,
-                "3": 0
-              }
-            },
-            "attributes": 0,
-            "width": 1
           }
         ]
       },
       {
         "spans": [
-          {
-            "text": " ",
-            "fg": {
-              "buffer": {
-                "0": 255,
-                "1": 255,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 0,
-                "1": 0,
-                "2": 0,
-                "3": 0
-              }
-            },
-            "attributes": 0,
-            "width": 1
-          },
           {
             "text": "Work account",
             "fg": {
@@ -314,7 +205,7 @@
             "width": 12
           },
           {
-            "text": "         ",
+            "text": "           ",
             "fg": {
               "buffer": {
                 "0": 255,
@@ -332,7 +223,7 @@
               }
             },
             "attributes": 0,
-            "width": 9
+            "width": 11
           },
           {
             "text": "5h 80% left",
@@ -375,53 +266,11 @@
             },
             "attributes": 0,
             "width": 2
-          },
-          {
-            "text": " ",
-            "fg": {
-              "buffer": {
-                "0": 255,
-                "1": 255,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 0,
-                "1": 0,
-                "2": 0,
-                "3": 0
-              }
-            },
-            "attributes": 0,
-            "width": 1
           }
         ]
       },
       {
         "spans": [
-          {
-            "text": " ",
-            "fg": {
-              "buffer": {
-                "0": 255,
-                "1": 255,
-                "2": 255,
-                "3": 255
-              }
-            },
-            "bg": {
-              "buffer": {
-                "0": 0,
-                "1": 0,
-                "2": 0,
-                "3": 0
-              }
-            },
-            "attributes": 0,
-            "width": 1
-          },
           {
             "text": "Spare",
             "fg": {
@@ -465,7 +314,7 @@
             "width": 28
           },
           {
-            "text": "—",
+            "text": "— ●",
             "fg": {
               "buffer": {
                 "0": 136,
@@ -483,10 +332,14 @@
               }
             },
             "attributes": 0,
-            "width": 1
-          },
+            "width": 3
+          }
+        ]
+      },
+      {
+        "spans": [
           {
-            "text": " ",
+            "text": "                                    ",
             "fg": {
               "buffer": {
                 "0": 255,
@@ -504,7 +357,7 @@
               }
             },
             "attributes": 0,
-            "width": 1
+            "width": 36
           }
         ]
       },
