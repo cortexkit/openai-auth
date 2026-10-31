@@ -40,17 +40,19 @@ import {
   chooseVaultRouting,
   getFallbackStatuses,
   getKillswitchThresholdsForAccount,
+  isRecord,
   isShieldedMainRow,
   isTombstoned,
   type OAuthQuotaSnapshot,
+  observeVaultRoutingResponse,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
-  reportVaultRouting,
   VAULT_MODE_REFUSAL_CAUSES,
   VAULT_MODE_REFUSALS,
   type VaultModeRefusal,
   type VaultRoutingRequest,
 } from '@cortexkit/openai-auth-core/internal'
+import { parseRateLimitSignal } from '../ws'
 import type { PoolAccountSource } from './pool-account-source'
 import { windowsFromQuotaMap } from './pool-quota'
 import {
@@ -379,9 +381,16 @@ async function sendTo(
   }
   return ctx.vault?.send(target.id, async (token, attempt) => {
     const response = await ctx.send(target, token, attempt)
-    reportVaultRouting(ctx.sessionId, attempt, response.headers)
     ctx.recordQuota(response, target, token, attempt)
-    return response
+    return observeVaultRoutingResponse(ctx.sessionId, attempt, response, {
+      parseLimit: (body) =>
+        parseRateLimitSignal({
+          ...(isRecord(body) ? body : {}),
+          status: response.status,
+        }),
+      quota: target.quota,
+      now: ctx.now,
+    })
   })
 }
 

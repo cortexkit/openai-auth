@@ -2,6 +2,7 @@ import { afterEach, expect, test } from 'bun:test'
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import {
   chooseVaultRouting,
+  observeVaultRoutingResponse,
   reportVaultRouting,
   vaultRoutingRequestFromBody,
 } from '../vault-routing'
@@ -160,17 +161,16 @@ test('served reports filter headers and never wait for the engine', () => {
     accountIdentitySource: 'asserted',
   }
   expect(
-    reportVaultRouting(
-      'session',
-      receipt,
-      new Headers({
+    reportVaultRouting('session', receipt, {
+      status: 200,
+      headers: new Headers({
         'x-codex-primary-used-percent': '42',
         'retry-after': '10',
         authorization: 'Bearer secret',
         'set-cookie': 'secret',
         'x-codex-email': 'private@example.com',
       }),
-    ),
+    }),
   ).toBeUndefined()
   expect(calls).toEqual([
     [
@@ -199,8 +199,269 @@ test('routing report throws and rejections never escape', async () => {
       },
     }))
     expect(() =>
-      reportVaultRouting('session', receipt, new Headers()),
+      reportVaultRouting('session', receipt, {
+        status: 200,
+        headers: new Headers(),
+      }),
     ).not.toThrow()
     await Promise.resolve()
   }
+})
+
+const receipt: QuotaReceipt = {
+  credentialId: 'credential-b',
+  accountIdentity: 'account-b',
+  accountIdentitySource: 'asserted',
+}
+
+function captureReports() {
+  const reports: unknown[] = []
+  Reflect.set(globalThis, key, () => ({
+    report: (payload: unknown) => {
+      reports.push(payload)
+      return new Promise(() => {})
+    },
+  }))
+  return reports
+}
+
+test.each(['usage_limit_reached', 'insufficient_quota', 'quota_exceeded'])(
+  '%s 429 reports exhaustion with the explicit reset, not served',
+  (code) => {
+    const reports = captureReports()
+    reportVaultRouting('session', receipt, {
+      status: 429,
+      headers: new Headers({ 'retry-after': '5' }),
+      limit: { window: code, resetAt: 1_900_000_000_000 },
+    })
+    expect(reports).toEqual([
+      {
+        account_id: 'account-b',
+        credential_id: 'credential-b',
+        outcome: 'exhausted',
+        window: code,
+        resets_at: 1_900_000_000_000,
+      },
+    ])
+  },
+)
+
+test.each([
+  { slot: 'primary', minutes: 300, window: '5h' },
+  { slot: 'secondary', minutes: 10080, window: '7d' },
+  { slot: 'primary', minutes: 240, window: 'primary' },
+])(
+  'named $slot with $minutes minutes reports $window and Retry-After',
+  ({ slot, minutes, window }) => {
+    const reports = captureReports()
+    reportVaultRouting('session', receipt, {
+      status: 429,
+      headers: new Headers({
+        [`x-codex-${slot}-window-minutes`]: String(minutes),
+        'retry-after': '20',
+      }),
+      limit: { window: 'usage_limit_reached' },
+      body: {
+        error: { type: 'usage_limit_reached', rate_limit_reached_type: slot },
+      },
+      now: 1_800_000_000_000,
+    })
+    expect(reports).toEqual([
+      {
+        account_id: 'account-b',
+        credential_id: 'credential-b',
+        outcome: 'exhausted',
+        window,
+        resets_at: 1_800_000_020_000,
+      },
+    ])
+  },
+)
+
+test('cached window minutes can name exhaustion, but only an explicit reset header supplies its reset', () => {
+  const reports = captureReports()
+  reportVaultRouting('session', receipt, {
+    status: 429,
+    headers: new Headers({ 'x-codex-primary-reset-at': '1900000000' }),
+    limit: { window: 'usage_limit_reached' },
+    body: { error: { rate_limit_reached_type: 'primary' } },
+    quota: {
+      limits: [
+        {
+          scope: 'all',
+          label: 'primary',
+          kind: 'reading',
+          usedPercent: 100,
+          windowMinutes: 10080,
+          checkedAt: Date.now(),
+          resetsAt: '2099-01-01T00:00:00Z',
+        },
+      ],
+    },
+  })
+  expect(reports).toEqual([
+    {
+      account_id: 'account-b',
+      credential_id: 'credential-b',
+      outcome: 'exhausted',
+      window: '7d',
+      resets_at: 1_900_000_000_000,
+    },
+  ])
+})
+
+test('a quota code retains a scoped window and accepts an HTTP-date Retry-After', () => {
+  const reports = captureReports()
+  reportVaultRouting('session', receipt, {
+    status: 429,
+    headers: new Headers({ 'retry-after': 'Fri, 01 Jan 2027 00:00:00 GMT' }),
+    limit: { window: 'api_error' },
+    body: {
+      error: {
+        type: 'api_error',
+        code: 'insufficient_quota',
+        window: 'model-budget',
+      },
+    },
+  })
+  expect(reports).toEqual([
+    {
+      account_id: 'account-b',
+      credential_id: 'credential-b',
+      outcome: 'exhausted',
+      window: 'model-budget',
+      resets_at: 1_798_761_600_000,
+    },
+  ])
+})
+
+test.each([
+  { status: 429, limit: { window: 'rate_limit_exceeded' } },
+  { status: 429, limit: { window: 'turn_rate_limit_exceeded' } },
+  { status: 429, limit: { window: 'rate_limit' } },
+  { status: 401, limit: { window: 'usage_limit_reached' } },
+  { status: 500, limit: { window: 'usage_limit_reached' } },
+  { status: 200, failed: true },
+])(
+  '$status with $limit does not report a served or exhausted outcome',
+  (response) => {
+    const reports = captureReports()
+    reportVaultRouting('session', receipt, {
+      ...response,
+      headers: new Headers({
+        'x-codex-primary-used-percent': '100',
+        'retry-after': '10',
+      }),
+    })
+    expect(reports).toEqual([])
+  },
+)
+
+test('successful response observation reports only after consumption, without waiting for routing', async () => {
+  const reports = captureReports()
+  const response = observeVaultRoutingResponse(
+    'session',
+    receipt,
+    new Response('body'),
+    { parseLimit: () => undefined },
+  )
+  expect(reports).toEqual([])
+  expect(await response.text()).toBe('body')
+  expect(reports).toEqual([
+    {
+      account_id: 'account-b',
+      credential_id: 'credential-b',
+      outcome: 'served',
+      headers: {},
+    },
+  ])
+})
+
+test('an SSE error is preserved byte-for-byte and never reported as served', async () => {
+  const reports = captureReports()
+  const body =
+    'data: {"type":"response.created"}\n\ndata: {"type":"error","error":{"message":"failed"}}\n\n'
+  const response = observeVaultRoutingResponse(
+    'session',
+    receipt,
+    new Response(body, { headers: { 'content-type': 'text/event-stream' } }),
+    { parseLimit: () => undefined },
+  )
+  expect(await response.text()).toBe(body)
+  expect(reports).toEqual([])
+})
+
+test('a broken response body never reports served', async () => {
+  const reports = captureReports()
+  const response = observeVaultRoutingResponse(
+    'session',
+    receipt,
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.error(new Error('stream failed'))
+        },
+      }),
+    ),
+    { parseLimit: () => undefined },
+  )
+  await expect(response.text()).rejects.toThrow('stream failed')
+  expect(reports).toEqual([])
+})
+
+test('exhaustion without an explicit reset never borrows the cached reset', () => {
+  const reports = captureReports()
+  reportVaultRouting('session', receipt, {
+    status: 429,
+    headers: new Headers(),
+    limit: { window: 'usage_limit_reached' },
+    body: { error: { rate_limit_reached_type: 'primary' } },
+    quota: {
+      limits: [
+        {
+          scope: 'all',
+          label: 'primary',
+          kind: 'reading',
+          usedPercent: 100,
+          windowMinutes: 300,
+          checkedAt: Date.now(),
+          resetsAt: '2099-01-01T00:00:00Z',
+        },
+      ],
+    },
+  })
+  expect(reports).toEqual([
+    {
+      account_id: 'account-b',
+      credential_id: 'credential-b',
+      outcome: 'exhausted',
+      window: '5h',
+    },
+  ])
+})
+
+test('cancelling an observed body cancels its source and reports nothing', async () => {
+  const reports = captureReports()
+  let cancelled = false
+  let onSourceCancel!: () => void
+  const sourceCancelled = new Promise<void>((resolve) => {
+    onSourceCancel = resolve
+  })
+  const response = observeVaultRoutingResponse(
+    'session',
+    receipt,
+    new Response(
+      new ReadableStream({
+        cancel() {
+          cancelled = true
+          onSourceCancel()
+        },
+      }),
+    ),
+    { parseLimit: () => undefined },
+  )
+  await response.body?.cancel()
+  await sourceCancelled
+  expect(cancelled).toBe(true)
+  expect(reports).toEqual([])
 })

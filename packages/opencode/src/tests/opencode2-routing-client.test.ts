@@ -271,7 +271,7 @@ test('OpenCode 2 reports a served vault response without waiting, with only rate
     expect(draft.request.headers.get('authorization')).toBe(
       'Bearer vault:b-token',
     )
-    await host.fire('http.response', {
+    const received = {
       ...requestScope,
       request: draft.request,
       response: new Response('{}', {
@@ -280,7 +280,10 @@ test('OpenCode 2 reports a served vault response without waiting, with only rate
           'set-cookie': 'secret',
         },
       }),
-    })
+    }
+    await host.fire('http.response', received)
+    expect(reports).toEqual([])
+    await received.response.text()
     expect(reports).toEqual([
       {
         account_id: 'account-b',
@@ -293,3 +296,109 @@ test('OpenCode 2 reports a served vault response without waiting, with only rate
     await installation.dispose()
   }
 })
+
+test('OpenCode 2 reports a usage-limit 429 as exhausted, never served', async () => {
+  const reports: unknown[] = []
+  Reflect.set(globalThis, key, () => ({
+    accountFor: async () => ({ account_id: 'account-b' }),
+    report: (payload: unknown) => {
+      reports.push(payload)
+    },
+  }))
+  const env = fixture()
+  const host = fakeOpenCode2Host()
+  const installation = await installOpenCode2Auth(host.ctx, env.openai.adapter)
+  try {
+    const requestScope = scope('fleet-session')
+    const headers = { authorization: `Bearer ${placeholderSecret('openai')}` }
+    await host.fire('model.request', { ...requestScope, headers })
+    const draft = {
+      ...requestScope,
+      request: new Request('https://codex.test/v1/responses', {
+        method: 'POST',
+        body: '{}',
+        headers,
+      }),
+    }
+    await host.fire('http.request', draft)
+    await host.fire('http.response', {
+      ...requestScope,
+      request: draft.request,
+      response: Response.json(
+        { error: { type: 'usage_limit_reached', resets_at: 1_900_000_000 } },
+        { status: 429 },
+      ),
+    })
+    expect(reports).toEqual([
+      {
+        account_id: 'account-b',
+        credential_id: 'credential-b',
+        outcome: 'exhausted',
+        window: 'usage_limit_reached',
+        resets_at: 1_900_000_000_000,
+      },
+    ])
+  } finally {
+    await installation.dispose()
+  }
+})
+
+for (const scenario of [
+  {
+    name: 'short 429',
+    status: 429,
+    body: JSON.stringify({ error: { type: 'rate_limit_exceeded' } }),
+    type: 'application/json',
+  },
+  { name: '500', status: 500, body: '{}', type: 'application/json' },
+  { name: '401', status: 401, body: '{}', type: 'application/json' },
+  {
+    name: 'stream error after 2xx headers',
+    status: 200,
+    body: 'data: {"type":"error","error":{"message":"failed"}}\n\n',
+    type: 'text/event-stream',
+  },
+]) {
+  test(`OpenCode 2 ${scenario.name} reports no routing outcome`, async () => {
+    const reports: unknown[] = []
+    Reflect.set(globalThis, key, () => ({
+      accountFor: async () => ({ account_id: 'account-b' }),
+      report: (payload: unknown) => {
+        reports.push(payload)
+      },
+    }))
+    const env = fixture()
+    const host = fakeOpenCode2Host()
+    const installation = await installOpenCode2Auth(
+      host.ctx,
+      env.openai.adapter,
+    )
+    try {
+      const requestScope = scope('fleet-session')
+      const headers = { authorization: `Bearer ${placeholderSecret('openai')}` }
+      await host.fire('model.request', { ...requestScope, headers })
+      const draft = {
+        ...requestScope,
+        request: new Request('https://codex.test/v1/responses', {
+          method: 'POST',
+          body: '{}',
+          headers,
+        }),
+      }
+      await host.fire('http.request', draft)
+      const received = {
+        ...requestScope,
+        request: draft.request,
+        response: new Response(scenario.body, {
+          status: scenario.status,
+          headers: { 'content-type': scenario.type, 'retry-after': '10' },
+        }),
+      }
+      await host.fire('http.response', received)
+      await received.response.text()
+      expect(reports).toEqual([])
+    } finally {
+      await installation.dispose()
+    }
+  })
+}

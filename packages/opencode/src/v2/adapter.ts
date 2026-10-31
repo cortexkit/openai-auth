@@ -67,8 +67,10 @@ import {
   reportVaultRouting,
   resolveMidStreamRateLimitResetAt,
   type VaultModeRefusal,
+  type VaultRoutingResponse,
   vaultModeNoRouteCause,
   vaultModeRefusalText,
+  vaultRoutingStreamFailed,
 } from '@cortexkit/openai-auth-core/internal'
 import type { PoolAccountSource } from '../core/pool-account-source'
 import { POOL_LOGIN_REQUIRED_MESSAGE } from '../core/pool-main'
@@ -404,6 +406,11 @@ function retryAfterMs(headers: Headers): number | undefined {
 }
 
 export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
+  const routingResponses = new WeakMap<
+    Attempt<OpenAIAttemptData>,
+    VaultRoutingResponse
+  >()
+  const routingFailures = new WeakSet<Attempt<OpenAIAttemptData>>()
   const { source, pins } = deps
   const now = deps.now ?? Date.now
   const log = deps.log
@@ -1028,18 +1035,28 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         : undefined,
     rewriteWebSocketFrame: ({ frame, sessionID, kind }) =>
       rewriteCodexFrame(frame, { sessionID, kind }, effort),
-    quotaFromHeaders: (headers, _status, attempt) => {
-      if (attempt.data?.kind === 'vault')
-        reportVaultRouting(attempt.sessionID, attempt.data.receipt, headers)
+    quotaFromHeaders: (headers, status, attempt) => {
+      if (attempt.data?.kind === 'vault' && status >= 200 && status < 300)
+        routingResponses.set(attempt, { status, headers })
       return quotaFromCodexHeaders(headers)
     },
-    async limitFromResponse({ status, headers, body }) {
+    async limitFromResponse({ status, headers, body, attempt }) {
       if (status < 400) return undefined
       const parsed = parseJson(await body().catch(() => ''))
       const signal = parseRateLimitSignal({
         ...(isRecord(parsed) ? parsed : {}),
         status,
       })
+      if (attempt.data?.kind === 'vault')
+        reportVaultRouting(attempt.sessionID, attempt.data.receipt, {
+          status,
+          headers,
+          body: parsed,
+          limit: signal,
+          quota: vault?.routes().find((route) => route.id === attempt.accountId)
+            ?.quota,
+          now: now(),
+        })
       if (!signal) return undefined
       const at = now()
       const limit = toLimit(signal, at, status)
@@ -1048,15 +1065,20 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       return after === undefined ? limit : { ...limit, retryAfterMs: after }
     },
     inspectEvent: ({ data, transport, attempt }) => {
-      // WebSocket completions have no HTTP header hook to report their served outcome.
-      if (transport === 'ws' && attempt.data?.kind === 'vault') {
+      if (attempt.data?.kind === 'vault') {
         const event = parseJson(data)
-        if (isRecord(event) && event.type === 'response.completed')
-          reportVaultRouting(
-            attempt.sessionID,
-            attempt.data.receipt,
-            new Headers(),
-          )
+        if (vaultRoutingStreamFailed(event)) routingFailures.add(attempt)
+        // WebSocket completions have no HTTP header hook to report their outcome.
+        if (
+          transport === 'ws' &&
+          isRecord(event) &&
+          event.type === 'response.completed'
+        )
+          reportVaultRouting(attempt.sessionID, attempt.data.receipt, {
+            status: 200,
+            headers: new Headers(),
+            failed: routingFailures.has(attempt),
+          })
       }
       return inspectCodexEvent(data, now())
     },
@@ -1078,6 +1100,19 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     // plugin hook for a WebSocket handshake the server refuses.
     async onAttemptEnd(attempt, outcome) {
       const data = attempt.data
+      const response = routingResponses.get(attempt)
+      routingResponses.delete(attempt)
+      // HTTP success is reported only after the body ends without an error or cancellation.
+      if (
+        data?.kind === 'vault' &&
+        response &&
+        !outcome.error &&
+        !outcome.limit
+      )
+        reportVaultRouting(attempt.sessionID, data.receipt, {
+          ...response,
+          failed: routingFailures.has(attempt),
+        })
       if (data?.kind !== 'vault' || outcome.status !== 401) return
       log?.warn('a vault account answered 401; reporting it to the vault', {
         accountId: attempt.accountId,

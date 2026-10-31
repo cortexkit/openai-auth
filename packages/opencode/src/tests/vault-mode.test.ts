@@ -174,6 +174,7 @@ describe('the request path in vault mode', () => {
       expect(result.result.servedId).toBe('vault:b')
       expect(pins.get('cold-session')?.accountId).toBe('vault:b')
       expect(asks).toHaveLength(1)
+      await result.result.response.text()
       expect(reports).toEqual([
         {
           account_id: 'account-b',
@@ -301,6 +302,129 @@ describe('the request path in vault mode', () => {
       else Reflect.set(globalThis, key, previous)
     }
   })
+
+  for (const scenario of [
+    {
+      name: '2xx',
+      status: 200,
+      body: '{}',
+      reports: 'served',
+      type: 'application/json',
+    },
+    {
+      name: 'usage-limit 429',
+      status: 429,
+      body: JSON.stringify({
+        error: {
+          type: 'usage_limit_reached',
+          rate_limit_reached_type: 'primary',
+          resets_at: 1_900_000_000,
+        },
+      }),
+      reports: 'exhausted',
+      type: 'application/json',
+    },
+    {
+      name: 'short 429',
+      status: 429,
+      body: JSON.stringify({ error: { type: 'turn_rate_limit_exceeded' } }),
+      reports: undefined,
+      type: 'application/json',
+    },
+    {
+      name: '500',
+      status: 500,
+      body: '{}',
+      reports: undefined,
+      type: 'application/json',
+    },
+    {
+      name: '401',
+      status: 401,
+      body: '{}',
+      reports: undefined,
+      type: 'application/json',
+    },
+    {
+      name: 'stream error',
+      status: 200,
+      body: 'data: {"type":"error","error":{"message":"failed"}}\n\n',
+      reports: undefined,
+      type: 'text/event-stream',
+    },
+  ]) {
+    it(`OpenCode 1 ${scenario.name} reports only the classified outcome`, async () => {
+      const key = Symbol.for('cortexkit.routing')
+      const previous = Object.getOwnPropertyDescriptor(globalThis, key)
+      const reports: unknown[] = []
+      Reflect.set(globalThis, key, () => ({
+        report: (payload: unknown) => {
+          reports.push(payload)
+        },
+      }))
+      try {
+        const route = {
+          id: 'vault:a',
+          identity: 'account-a',
+          credentialId: 'credential-a',
+          kind: 'oauth' as const,
+          quota: quotaMap(10),
+        }
+        const { result } = await serve(
+          vaultWith([route]),
+          null,
+          'ordered',
+          scenario.status,
+          {
+            sessionId: 'report-session',
+            send: async () =>
+              new Response(scenario.body, {
+                status: scenario.status,
+                headers: {
+                  'content-type': scenario.type,
+                  'x-codex-primary-used-percent': '42',
+                  'x-codex-primary-window-minutes': '300',
+                  authorization: 'private',
+                },
+              }),
+          },
+        )
+        expect(await result.response.text()).toBe(scenario.body)
+        // The refusal observer reads a detached copy without delaying the request.
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        const identity = {
+          account_id: 'account-a',
+          credential_id: 'credential-a',
+        }
+        expect(reports).toEqual(
+          scenario.reports === 'served'
+            ? [
+                {
+                  ...identity,
+                  outcome: 'served',
+                  headers: {
+                    'x-codex-primary-used-percent': '42',
+                    'x-codex-primary-window-minutes': '300',
+                  },
+                },
+              ]
+            : scenario.reports === 'exhausted'
+              ? [
+                  {
+                    ...identity,
+                    outcome: 'exhausted',
+                    window: '5h',
+                    resets_at: 1_900_000_000_000,
+                  },
+                ]
+              : [],
+        )
+      } finally {
+        if (previous) Object.defineProperty(globalThis, key, previous)
+        else Reflect.deleteProperty(globalThis, key)
+      }
+    })
+  }
 
   it('main-first places the default vault account first and fallback-first places it last', async () => {
     const main = {
