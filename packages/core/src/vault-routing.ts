@@ -19,6 +19,18 @@ interface VaultRoutingRoute {
   credentialId?: string
 }
 
+/** The process-global routing accessor can change after plugin load; check it each time. */
+export function hasVaultRoutingAccessor(): boolean {
+  try {
+    return (
+      typeof Reflect.get(globalThis, Symbol.for('cortexkit.routing')) ===
+      'function'
+    )
+  } catch {
+    return false
+  }
+}
+
 /** Title generation and history maintenance must not choose a new vault account. */
 export function vaultRoutingKind(agent: string | undefined): string {
   return agent && !['title', 'compaction', 'summary'].includes(agent)
@@ -149,7 +161,13 @@ export function reportVaultRouting(
   receipt: QuotaReceipt | undefined,
   response: VaultRoutingResponse,
 ): void {
-  if (!sessionId || !receipt?.accountIdentity || response.failed) return
+  if (
+    !sessionId ||
+    !receipt?.accountIdentity ||
+    response.failed ||
+    !hasVaultRoutingAccessor()
+  )
+    return
   const { status, headers } = response
   const identity = {
     sessionId,
@@ -224,6 +242,16 @@ export function vaultRoutingStreamFailed(event: unknown): boolean {
   )
 }
 
+/** Most SSE lines are token deltas; parse only possible failures. */
+export function vaultRoutingStreamMayFail(data: string): boolean {
+  return (
+    data.includes('"response.failed"') ||
+    data.includes('"type":"error"') ||
+    (data.includes('"error"') && /"type"\s*:\s*"error"/.test(data)) ||
+    (data.includes('"failed"') && /"status"\s*:\s*"failed"/.test(data))
+  )
+}
+
 /** Observe completion without reading ahead of, delaying, or changing the response bytes. */
 export function observeVaultRoutingResponse(
   sessionId: string | undefined,
@@ -235,7 +263,8 @@ export function observeVaultRoutingResponse(
     now?: () => number
   },
 ): Response {
-  if (!sessionId || !receipt.accountIdentity) return response
+  if (!hasVaultRoutingAccessor() || !sessionId || !receipt.accountIdentity)
+    return response
   const outcome = {
     status: response.status,
     headers: response.headers,
@@ -271,8 +300,10 @@ export function observeVaultRoutingResponse(
   let pending = ''
   let failed = false
   const inspect = (line: string) => {
-    if (line.trim() === 'event: error') failed = true
-    if (!line.startsWith('data:')) return
+    if (failed) return
+    if (line.startsWith('event:') && line.slice(6).trim() === 'error')
+      failed = true
+    if (!line.startsWith('data:') || !vaultRoutingStreamMayFail(line)) return
     try {
       failed ||= vaultRoutingStreamFailed(JSON.parse(line.slice(5)))
     } catch {}
@@ -302,9 +333,14 @@ export function observeVaultRoutingResponse(
       },
     }),
   )
-  return new Response(stream, {
+  const observed = new Response(stream, {
     status: response.status,
     statusText: response.statusText,
     headers: response.headers,
   })
+  Object.defineProperties(observed, {
+    url: { value: response.url },
+    redirected: { value: response.redirected },
+  })
+  return observed
 }

@@ -1,14 +1,20 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import type { ClaustrumScopedAttempt } from '@cortexkit/common-auth/claustrum'
 import {
+  type Attempt,
   type ChooseAccountInput,
   installOpenCode2Auth,
   placeholderSecret,
 } from '@cortexkit/common-auth/opencode2'
 import type { QuotaMap } from '@cortexkit/common-auth/quota'
+import * as routingClient from '@cortexkit/common-auth/routing-accessor'
 import type { PoolRow } from '@cortexkit/common-auth/store'
 import type { AccountStorage } from '@cortexkit/openai-auth-core/internal'
-import { createOpenAIAdapter, type PoolAccess } from '../v2/adapter'
+import {
+  createOpenAIAdapter,
+  type OpenAIAttemptData,
+  type PoolAccess,
+} from '../v2/adapter'
 import { SessionPins } from '../v2/pins'
 import { fakeOpenCode2Host, scope } from './fixtures/opencode2-host'
 
@@ -194,6 +200,89 @@ test.each([
     ['retry', 'title', 'compaction', 'local'].includes(kind) ? 0 : 1,
   )
   if (kind === 'refused') expect(env.authorized).toEqual(['vault:b', 'vault:a'])
+})
+
+test('OpenCode 2 skips inactive routing observation and checks the bridge again for later responses', async () => {
+  Reflect.deleteProperty(globalThis, key)
+  const reports: unknown[] = []
+  const enable = () =>
+    Reflect.set(globalThis, key, () => ({
+      report: (payload: unknown) => {
+        reports.push(payload)
+      },
+    }))
+  const env = fixture()
+  let attempt: Attempt<OpenAIAttemptData> | undefined
+  const readHeaders = env.openai.adapter.quotaFromHeaders!
+  env.openai.adapter.quotaFromHeaders = (headers, status, handle) => {
+    attempt = handle
+    return readHeaders(headers, status, handle)
+  }
+  const host = fakeOpenCode2Host()
+  const installation = await installOpenCode2Auth(host.ctx, env.openai.adapter)
+  const report = spyOn(routingClient, 'reportRouting')
+  const receive = async () => {
+    const requestScope = scope('fleet-session')
+    const headers = { authorization: `Bearer ${placeholderSecret('openai')}` }
+    await host.fire('model.request', { ...requestScope, headers })
+    const draft = {
+      ...requestScope,
+      request: new Request('https://codex.test/v1/responses', {
+        method: 'POST',
+        body: '{}',
+        headers,
+      }),
+    }
+    await host.fire('http.request', draft)
+    const received = {
+      ...requestScope,
+      request: draft.request,
+      response: new Response('{}'),
+    }
+    await host.fire('http.response', received)
+    return received.response
+  }
+  try {
+    const absent = await receive()
+    expect(attempt).toBeDefined()
+    for (const active of [false, true]) {
+      if (active) enable()
+      else Reflect.deleteProperty(globalThis, key)
+      const parse = spyOn(JSON, 'parse')
+      try {
+        env.openai.adapter.inspectEvent!({
+          transport: 'http',
+          data: '{"type":"response.output_text.delta","delta":"hello"}',
+          attempt: attempt!,
+        })
+        // Only the existing provider event parser runs, not another routing parser.
+        expect(parse).toHaveBeenCalledTimes(1)
+      } finally {
+        parse.mockRestore()
+      }
+    }
+    await absent.text()
+    expect(report).not.toHaveBeenCalled()
+    const unloaded = await receive()
+    Reflect.deleteProperty(globalThis, key)
+    await unloaded.text()
+    expect(report).not.toHaveBeenCalled()
+    enable()
+    const active = await receive()
+    await active.text()
+    expect(report).toHaveBeenCalledTimes(1)
+    expect(reports).toEqual([
+      {
+        account_id: 'account-a',
+        credential_id: 'credential-a',
+        outcome: 'served',
+        headers: {},
+      },
+    ])
+  } finally {
+    report.mockRestore()
+    await installation.dispose()
+  }
 })
 
 test('OpenCode 2 reports a completed vault WebSocket response without waiting', async () => {

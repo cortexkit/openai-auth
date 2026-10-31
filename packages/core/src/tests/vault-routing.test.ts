@@ -1,5 +1,6 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
+import * as routingClient from '@cortexkit/common-auth/routing-accessor'
 import {
   chooseVaultRouting,
   observeVaultRoutingResponse,
@@ -375,6 +376,110 @@ test('successful response observation reports only after consumption, without wa
       headers: {},
     },
   ])
+})
+
+test.each([{ status: 200 }, { status: 429 }])(
+  'without an accessor, status $status returns the same Response without reaching reportRouting',
+  ({ status }) => {
+    Reflect.deleteProperty(globalThis, key)
+    const report = spyOn(routingClient, 'reportRouting')
+    const response = new Response('data: {"type":"response.completed"}\n\n', {
+      status,
+      headers: { 'content-type': 'text/event-stream' },
+    })
+    const clone = spyOn(response, 'clone')
+    Object.defineProperties(response, {
+      url: { value: 'https://codex.test/redirected' },
+      redirected: { value: true },
+    })
+    try {
+      const observed = observeVaultRoutingResponse(
+        'session',
+        receipt,
+        response,
+        { parseLimit: () => undefined },
+      )
+      expect(observed).toBe(response)
+      expect(observed.url).toBe('https://codex.test/redirected')
+      expect(observed.redirected).toBe(true)
+      reportVaultRouting('session', receipt, {
+        status: 200,
+        headers: new Headers(),
+      })
+      expect(report).not.toHaveBeenCalled()
+      expect(clone).not.toHaveBeenCalled()
+    } finally {
+      report.mockRestore()
+      clone.mockRestore()
+    }
+  },
+)
+
+test('response observation checks bridge presence afresh for late loading and unloading', async () => {
+  Reflect.deleteProperty(globalThis, key)
+  const first = new Response('first')
+  expect(
+    observeVaultRoutingResponse('session', receipt, first, {
+      parseLimit: () => undefined,
+    }),
+  ).toBe(first)
+  const reports = captureReports()
+  const second = new Response('second')
+  Object.defineProperties(second, {
+    url: { value: 'https://codex.test/redirected' },
+    redirected: { value: true },
+  })
+  const observed = observeVaultRoutingResponse('session', receipt, second, {
+    parseLimit: () => undefined,
+  })
+  expect(observed.url).toBe(second.url)
+  expect(observed.redirected).toBe(second.redirected)
+  expect(await observed.text()).toBe('second')
+  expect(reports).toHaveLength(1)
+  Reflect.deleteProperty(globalThis, key)
+  const third = new Response('third')
+  expect(
+    observeVaultRoutingResponse('session', receipt, third, {
+      parseLimit: () => undefined,
+    }),
+  ).toBe(third)
+})
+
+test('active routing observation does not JSON-parse ordinary SSE data lines', async () => {
+  const reports = captureReports()
+  const body =
+    'data: {"type":"response.output_text.delta","delta":"hello"}\n\ndata: {"type":"response.output_text.delta","delta":"error"}\n\ndata: {"type":"response.completed"}\n\n'
+  const parse = spyOn(JSON, 'parse')
+  try {
+    const response = observeVaultRoutingResponse(
+      'session',
+      receipt,
+      new Response(body, { headers: { 'content-type': 'text/event-stream' } }),
+      { parseLimit: () => undefined },
+    )
+    expect(await response.text()).toBe(body)
+    expect(parse).not.toHaveBeenCalled()
+    expect(reports).toHaveLength(1)
+  } finally {
+    parse.mockRestore()
+  }
+})
+
+test.each([
+  'data: {"type":"response.failed"}\n\n',
+  'data: {"type" : "error","error":{"message":"failed"}}\n\n',
+  'event: error\ndata: {"message":"failed"}\n\n',
+  'data: {"type":"response.completed","response":{"status":"failed"}}\n\n',
+])('prefiltered failure remains unserved: %s', async (body) => {
+  const reports = captureReports()
+  const response = observeVaultRoutingResponse(
+    'session',
+    receipt,
+    new Response(body, { headers: { 'content-type': 'text/event-stream' } }),
+    { parseLimit: () => undefined },
+  )
+  expect(await response.text()).toBe(body)
+  expect(reports).toEqual([])
 })
 
 test('an SSE error is preserved byte-for-byte and never reported as served', async () => {

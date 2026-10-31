@@ -56,6 +56,7 @@ import {
   chooseVaultRouting,
   extractAccountIdFromClaims,
   getKillswitchThresholdsForAccount,
+  hasVaultRoutingAccessor,
   isCompleteQuotaHeaderFrame,
   normalizeQuotaHeaders,
   normalizeWsFrame,
@@ -71,6 +72,7 @@ import {
   vaultModeNoRouteCause,
   vaultModeRefusalText,
   vaultRoutingStreamFailed,
+  vaultRoutingStreamMayFail,
 } from '@cortexkit/openai-auth-core/internal'
 import type { PoolAccountSource } from '../core/pool-account-source'
 import { POOL_LOGIN_REQUIRED_MESSAGE } from '../core/pool-main'
@@ -1036,7 +1038,12 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     rewriteWebSocketFrame: ({ frame, sessionID, kind }) =>
       rewriteCodexFrame(frame, { sessionID, kind }, effort),
     quotaFromHeaders: (headers, status, attempt) => {
-      if (attempt.data?.kind === 'vault' && status >= 200 && status < 300)
+      if (
+        attempt.data?.kind === 'vault' &&
+        hasVaultRoutingAccessor() &&
+        status >= 200 &&
+        status < 300
+      )
         routingResponses.set(attempt, { status, headers })
       return quotaFromCodexHeaders(headers)
     },
@@ -1047,7 +1054,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         ...(isRecord(parsed) ? parsed : {}),
         status,
       })
-      if (attempt.data?.kind === 'vault')
+      if (attempt.data?.kind === 'vault' && hasVaultRoutingAccessor())
         reportVaultRouting(attempt.sessionID, attempt.data.receipt, {
           status,
           headers,
@@ -1065,7 +1072,12 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       return after === undefined ? limit : { ...limit, retryAfterMs: after }
     },
     inspectEvent: ({ data, transport, attempt }) => {
-      if (attempt.data?.kind === 'vault') {
+      if (
+        attempt.data?.kind === 'vault' &&
+        hasVaultRoutingAccessor() &&
+        (vaultRoutingStreamMayFail(data) ||
+          (transport === 'ws' && data.includes('"response.completed"')))
+      ) {
         const event = parseJson(data)
         if (vaultRoutingStreamFailed(event)) routingFailures.add(attempt)
         // WebSocket completions have no HTTP header hook to report their outcome.
@@ -1100,7 +1112,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     // plugin hook for a WebSocket handshake the server refuses.
     async onAttemptEnd(attempt, outcome) {
       const data = attempt.data
-      const response = routingResponses.get(attempt)
+      const response =
+        data?.kind === 'vault' && hasVaultRoutingAccessor()
+          ? routingResponses.get(attempt)
+          : undefined
       routingResponses.delete(attempt)
       // HTTP success is reported only after the body ends without an error or cancellation.
       if (
