@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/pi-openai-auth",
-  "version": "1.8.6",
+  "version": "1.9.0",
   "license": "MIT",
   "type": "module",
   "repository": {
