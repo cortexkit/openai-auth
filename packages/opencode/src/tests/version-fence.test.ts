@@ -5,10 +5,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   renameSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -18,6 +20,7 @@ import {
   migrationFenceOpen,
   processHeartbeatDir,
   rpcStateRoot,
+  type VersionFenceOptions,
 } from '../core/version-fence.ts'
 
 const CURRENT = '0.12.0'
@@ -57,19 +60,231 @@ function portFile(
   const path = join(dir, `port-${pid}.json`)
   writeFileSync(
     path,
-    JSON.stringify({ pid, port: 4000, startedAt: 1, version }),
+    JSON.stringify({ pid, port: 4000, startedAt: Date.now(), version }),
   )
   return path
 }
 
-function fence(extra: { currentVersion?: string } = {}) {
+function fence(extra: Partial<VersionFenceOptions> = {}) {
   return migrationFenceOpen({
     stateHome,
-    currentVersion: extra.currentVersion ?? CURRENT,
+    currentVersion: CURRENT,
     isAlive: (pid) => live.has(pid),
     selfPid: SELF,
+    ...extra,
   })
 }
+
+const BOOT = 1_900_000_000_000
+const NOW = BOOT + 60 * 60 * 1000
+const BEFORE_BOOT = BOOT - 5 * 60 * 1000 - 1
+
+function bootFence(extra: Partial<VersionFenceOptions> = {}) {
+  return fence({
+    currentVersion: '1.9.1',
+    selfPid: 0,
+    isAlive: undefined,
+    now: () => NOW,
+    uptime: () => 60 * 60,
+    ...extra,
+  })
+}
+
+describe('records from before the current boot', () => {
+  it.each([false, true])(
+    'ignores and removes a pre-boot heartbeat despite a live reused pid (layoutMove=%s)',
+    async (layoutMove) => {
+      process.kill(process.pid, 0)
+      const path = heartbeat(process.pid, {
+        pid: process.pid,
+        version: '1.8.2',
+        startedAt: BEFORE_BOOT,
+      })
+      expect(await bootFence({ layoutMove })).toEqual({ open: true })
+      expect(existsSync(path)).toBe(false)
+    },
+  )
+
+  it.each([false, true])(
+    'a current-boot heartbeat with the same live pid still blocks (layoutMove=%s)',
+    async (layoutMove) => {
+      const path = heartbeat(process.pid, {
+        pid: process.pid,
+        version: '1.8.2',
+        startedAt: BOOT + 1,
+      })
+      expect(await bootFence({ layoutMove })).toEqual({
+        open: false,
+        blockers: [{ pid: process.pid, version: '1.8.2', detail: path }],
+      })
+      expect(existsSync(path)).toBe(true)
+    },
+  )
+
+  it.each([false, true])(
+    'ignores a pre-boot port record despite a live reused pid (layoutMove=%s)',
+    async (layoutMove) => {
+      const path = portFile(process.pid, undefined, '1.8.2')
+      writeFileSync(
+        path,
+        JSON.stringify({
+          pid: process.pid,
+          version: '1.8.2',
+          startedAt: BEFORE_BOOT,
+        }),
+      )
+      utimesSync(path, new Date(NOW), new Date(NOW))
+      expect(await bootFence({ layoutMove })).toEqual({ open: true })
+      expect(existsSync(path)).toBe(true)
+    },
+  )
+
+  it.each([false, true])(
+    'a current-boot port record with the same live pid still blocks (layoutMove=%s)',
+    async (layoutMove) => {
+      const path = portFile(process.pid, undefined, '1.8.2')
+      writeFileSync(
+        path,
+        JSON.stringify({
+          pid: process.pid,
+          version: '1.8.2',
+          startedAt: BOOT + 1,
+        }),
+      )
+      utimesSync(path, new Date(BEFORE_BOOT), new Date(BEFORE_BOOT))
+      expect(await bootFence({ layoutMove })).toEqual({
+        open: false,
+        blockers: [{ pid: process.pid, version: '1.8.2', detail: path }],
+      })
+    },
+  )
+
+  it.each([
+    [BEFORE_BOOT, true],
+    [BOOT - 5 * 60 * 1000, false],
+    [BOOT + 1, false],
+  ] as const)(
+    'uses an unversioned port file mtime when it has no timestamp: %s',
+    async (time, open) => {
+      const path = portFile(process.pid)
+      writeFileSync(path, JSON.stringify({ pid: process.pid, port: 4000 }))
+      utimesSync(path, new Date(time), new Date(time))
+      expect(await bootFence()).toEqual(
+        open
+          ? { open: true }
+          : {
+              open: false,
+              blockers: [
+                { pid: process.pid, version: 'unknown', detail: path },
+              ],
+            },
+      )
+    },
+  )
+
+  it.each([BOOT - 5 * 60 * 1000, BOOT - 1])(
+    'keeps heartbeat and port blockers within the five-minute margin: %s',
+    async (startedAt) => {
+      const body = { pid: process.pid, version: '1.8.2', startedAt }
+      const path = heartbeat(process.pid, body)
+      const port = portFile(process.pid)
+      writeFileSync(port, JSON.stringify(body))
+      expect(await bootFence()).toEqual({
+        open: false,
+        blockers: [{ pid: process.pid, version: '1.8.2', detail: path }],
+      })
+      expect(existsSync(path)).toBe(true)
+      rmSync(path)
+      expect(await bootFence()).toEqual({
+        open: false,
+        blockers: [{ pid: process.pid, version: '1.8.2', detail: port }],
+      })
+    },
+  )
+
+  it.each([undefined, null, 'yesterday'])(
+    'keeps a heartbeat with no usable startedAt: %s',
+    async (startedAt) => {
+      const path = heartbeat(process.pid, {
+        pid: process.pid,
+        version: '1.8.2',
+        startedAt,
+      })
+      utimesSync(path, new Date(BEFORE_BOOT), new Date(BEFORE_BOOT))
+      expect(await bootFence()).toEqual({
+        open: false,
+        blockers: [{ pid: process.pid, version: '1.8.2', detail: path }],
+      })
+      expect(existsSync(path)).toBe(true)
+    },
+  )
+
+  it.each([null, 'yesterday'])(
+    'does not replace an invalid port timestamp with an old mtime: %s',
+    async (startedAt) => {
+      const path = portFile(process.pid)
+      writeFileSync(path, JSON.stringify({ pid: process.pid, startedAt }))
+      utimesSync(path, new Date(BEFORE_BOOT), new Date(BEFORE_BOOT))
+      expect(await bootFence()).toEqual({
+        open: false,
+        blockers: [{ pid: process.pid, version: 'unknown', detail: path }],
+      })
+    },
+  )
+
+  it.each(['heartbeat', 'port'])(
+    'does not clear an unreadable %s from its old mtime',
+    async (kind) => {
+      const path =
+        kind === 'heartbeat'
+          ? heartbeat(process.pid, '{"pid":')
+          : portFile(process.pid)
+      if (kind === 'port') writeFileSync(path, '{"pid":')
+      utimesSync(path, new Date(BEFORE_BOOT), new Date(BEFORE_BOOT))
+      expect(await bootFence()).toEqual({
+        open: false,
+        blockers: [{ pid: process.pid, version: 'unknown', detail: path }],
+      })
+      expect(existsSync(path)).toBe(true)
+    },
+  )
+
+  it('still blocks the layout move for a current-boot heartbeat without layouts', async () => {
+    const path = heartbeat(process.pid, {
+      pid: process.pid,
+      version: '1.9.1',
+      startedAt: BOOT + 1,
+    })
+    expect(await bootFence()).toEqual({ open: true })
+    expect(await bootFence({ layoutMove: true })).toEqual({
+      open: false,
+      blockers: [{ pid: process.pid, version: '1.9.1', detail: path }],
+    })
+  })
+
+  it('samples clock and uptime only once per check', async () => {
+    heartbeat(process.pid, {
+      pid: process.pid,
+      version: '1.8.2',
+      startedAt: BEFORE_BOOT,
+    })
+    portFile(process.pid)
+    let clocks = 0
+    let uptimes = 0
+    await bootFence({
+      now: () => {
+        clocks++
+        return NOW
+      },
+      uptime: () => {
+        uptimes++
+        return 60 * 60
+      },
+    })
+    expect(clocks).toBe(1)
+    expect(uptimes).toBe(1)
+  })
+})
 
 describe('the version fence', () => {
   it('is open when no plugin process left anything on disk', async () => {
@@ -78,8 +293,8 @@ describe('the version fence', () => {
 
   it('is open when every live heartbeat is the current version or newer', async () => {
     live.add(11).add(12)
-    heartbeat(11, { pid: 11, version: CURRENT, startedAt: 1 })
-    heartbeat(12, { pid: 12, version: '0.13.1', startedAt: 1 })
+    heartbeat(11, { pid: 11, version: CURRENT, startedAt: Date.now() })
+    heartbeat(12, { pid: 12, version: '0.13.1', startedAt: Date.now() })
     portFile(11, undefined, CURRENT)
     portFile(12, undefined, '0.13.1')
     expect(await fence()).toEqual({ open: true })
@@ -117,7 +332,11 @@ describe('the version fence', () => {
 
   it('is shut by a live heartbeat of an older version', async () => {
     live.add(21)
-    const path = heartbeat(21, { pid: 21, version: '0.11.4', startedAt: 1 })
+    const path = heartbeat(21, {
+      pid: 21,
+      version: '0.11.4',
+      startedAt: Date.now(),
+    })
     expect(await fence()).toEqual({
       open: false,
       blockers: [{ pid: 21, version: '0.11.4', detail: path }],
@@ -126,7 +345,7 @@ describe('the version fence', () => {
 
   it('a pre-release of the current version is older than it', async () => {
     live.add(22)
-    heartbeat(22, { pid: 22, version: '0.12.0-beta.3', startedAt: 1 })
+    heartbeat(22, { pid: 22, version: '0.12.0-beta.3', startedAt: Date.now() })
     expect(await fence()).toMatchObject({
       open: false,
       blockers: [{ pid: 22, version: '0.12.0-beta.3' }],
@@ -134,7 +353,7 @@ describe('the version fence', () => {
   })
 
   it('ignores the heartbeat and the port file of a dead process', async () => {
-    heartbeat(31, { pid: 31, version: '0.1.0', startedAt: 1 })
+    heartbeat(31, { pid: 31, version: '0.1.0', startedAt: Date.now() })
     portFile(31)
     portFile(32)
     expect(await fence()).toEqual({ open: true })
@@ -166,7 +385,7 @@ describe('the version fence', () => {
       heartbeat(44, {
         pid: 44,
         version: CURRENT,
-        startedAt: 1,
+        startedAt: Date.now(),
         layouts: { config: 'state-home' },
       })
       const path = portFile(44, undefined, version)
@@ -187,7 +406,7 @@ describe('the version fence', () => {
   )
 
   it('a dead process heartbeat cannot hide an older host that reuses its pid', async () => {
-    heartbeat(45, { pid: 45, version: CURRENT, startedAt: 1 })
+    heartbeat(45, { pid: 45, version: CURRENT, startedAt: Date.now() })
     portFile(45, undefined, CURRENT)
     expect(await fence()).toEqual({ open: true })
     live.add(45)
@@ -211,7 +430,7 @@ describe('the version fence', () => {
     'a malformed live port file blocks despite a current heartbeat: %s',
     async (body) => {
       live.add(47)
-      heartbeat(47, { pid: 47, version: CURRENT, startedAt: 1 })
+      heartbeat(47, { pid: 47, version: CURRENT, startedAt: Date.now() })
       const path = portFile(47)
       writeFileSync(path, body)
       expect(await fence()).toEqual({
@@ -223,7 +442,7 @@ describe('the version fence', () => {
 
   it('an unreadable live port file blocks despite a current heartbeat', async () => {
     live.add(48)
-    heartbeat(48, { pid: 48, version: CURRENT, startedAt: 1 })
+    heartbeat(48, { pid: 48, version: CURRENT, startedAt: Date.now() })
     const path = portFile(48, undefined, CURRENT)
     chmodSync(path, 0o000)
     expect(await fence()).toEqual({
@@ -233,7 +452,7 @@ describe('the version fence', () => {
   })
 
   it('never counts this process, whatever its files say', async () => {
-    heartbeat(SELF, { pid: SELF, version: '0.0.1', startedAt: 1 })
+    heartbeat(SELF, { pid: SELF, version: '0.0.1', startedAt: Date.now() })
     portFile(SELF)
     expect(await fence()).toEqual({ open: true })
   })
@@ -241,8 +460,12 @@ describe('the version fence', () => {
   it('an unparseable heartbeat of a live process blocks, as unknown', async () => {
     live.add(51).add(52).add(53)
     const torn = heartbeat(51, '{"pid":51,"vers')
-    const wrongPid = heartbeat(52, { pid: 99, version: CURRENT, startedAt: 1 })
-    const noVersion = heartbeat(53, { pid: 53, startedAt: 1 })
+    const wrongPid = heartbeat(52, {
+      pid: 99,
+      version: CURRENT,
+      startedAt: Date.now(),
+    })
+    const noVersion = heartbeat(53, { pid: 53, startedAt: Date.now() })
     expect(await fence()).toEqual({
       open: false,
       blockers: [
@@ -255,14 +478,14 @@ describe('the version fence', () => {
 
   it('a version it cannot compare blocks', async () => {
     live.add(54)
-    heartbeat(54, { pid: 54, version: 'next', startedAt: 1 })
+    heartbeat(54, { pid: 54, version: 'next', startedAt: Date.now() })
     expect(await fence()).toMatchObject({
       open: false,
       blockers: [{ pid: 54, version: 'next' }],
     })
     live.delete(54)
     live.add(55)
-    heartbeat(55, { pid: 55, version: CURRENT, startedAt: 1 })
+    heartbeat(55, { pid: 55, version: CURRENT, startedAt: Date.now() })
     expect(await fence({ currentVersion: 'not-a-version' })).toMatchObject({
       open: false,
       blockers: [{ pid: 55 }],
@@ -271,7 +494,11 @@ describe('the version fence', () => {
 
   it('an unreadable heartbeat file of a live process blocks', async () => {
     live.add(56)
-    const path = heartbeat(56, { pid: 56, version: CURRENT, startedAt: 1 })
+    const path = heartbeat(56, {
+      pid: 56,
+      version: CURRENT,
+      startedAt: Date.now(),
+    })
     chmodSync(path, 0o000)
     expect(await fence()).toEqual({
       open: false,
@@ -280,7 +507,7 @@ describe('the version fence', () => {
   })
 
   it('an unreadable heartbeat directory blocks', async () => {
-    heartbeat(57, { pid: 57, version: CURRENT, startedAt: 1 })
+    heartbeat(57, { pid: 57, version: CURRENT, startedAt: Date.now() })
     chmodSync(processHeartbeatDir(stateHome), 0o000)
     expect(await fence()).toMatchObject({
       open: false,

@@ -1130,7 +1130,7 @@ describe('the version fence', () => {
     mkdirSync(processHeartbeatDir(stateHome), { recursive: true })
     writeFileSync(
       join(processHeartbeatDir(stateHome), '4242.json'),
-      JSON.stringify({ pid: 4242, version: '0.11.0', startedAt: 1 }),
+      JSON.stringify({ pid: 4242, version: '0.11.0', startedAt: Date.now() }),
     )
     const live = new Set([4242])
     const fence = () =>

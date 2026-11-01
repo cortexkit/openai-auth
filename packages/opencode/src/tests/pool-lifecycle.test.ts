@@ -103,7 +103,7 @@ function writeOlderHeartbeat(version = '0.11.0') {
   mkdirSync(dir, { recursive: true })
   writeFileSync(
     join(dir, `${OLDER_PID}.json`),
-    JSON.stringify({ pid: OLDER_PID, version, startedAt: 1 }),
+    JSON.stringify({ pid: OLDER_PID, version, startedAt: Date.now() }),
   )
   alive.add(OLDER_PID)
 }

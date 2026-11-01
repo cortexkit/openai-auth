@@ -13,10 +13,14 @@
 //   which every plugin version writes (`<dir>` is `openai-auth-<hash>`, or the
 //   unprefixed `<hash>` older versions used).
 //
-// A process counts as running while its pid is alive. Each record must carry
-// its own current-or-newer version: a heartbeat left by a crashed process
-// cannot vouch for a port file written by an older process reusing that pid.
-// The fence fails closed on unreadable records and missing or invalid versions.
+// A process counts as running while its pid is alive, unless the record
+// predates this system boot by more than five minutes. After a reboot, an
+// unrelated process can reuse a crashed plugin's pid. The margin accounts for
+// clock adjustments and uptime rounding; uncertain times still block.
+// Each record must carry its own current-or-newer version: a heartbeat left
+// by a crashed process cannot vouch for a port file written by an older process
+// reusing that pid. The fence fails closed on unreadable records and missing
+// or invalid versions.
 //
 // The same fence guards the move of the runtime files out of OpenCode's
 // config folder (`runtime-layout.ts`), which passes `layoutMove`. A heartbeat
@@ -28,8 +32,8 @@
 // spelled differently for the same folder, and blocking too widely only
 // delays a move.
 
-import { readdir, readFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
+import { readdir, readFile, rm, stat } from 'node:fs/promises'
+import { homedir, uptime } from 'node:os'
 import { join } from 'node:path'
 import { isOpenaiRpcStateDir } from '../rpc/port-file'
 import { hasLegacyRuntimeGeneration } from './runtime-process-state'
@@ -56,6 +60,8 @@ export interface VersionFenceOptions {
   /** The version that wants to migrate. */
   currentVersion: string
   isAlive?: (pid: number) => boolean
+  now?: () => number
+  uptime?: () => number
   /** This process; only an older generation in it blocks its own layout move. */
   selfPid?: number
   /**
@@ -160,7 +166,12 @@ async function list(dir: string): Promise<Listing> {
 type ProcessRecord =
   | { kind: 'gone' }
   | { kind: 'unreadable' }
-  | { kind: 'ok'; version: string; layouts?: Record<string, unknown> }
+  | {
+      kind: 'ok'
+      version: string
+      startedAt: unknown
+      layouts?: Record<string, unknown>
+    }
 
 async function readProcessRecord(
   path: string,
@@ -180,13 +191,16 @@ async function readProcessRecord(
     if (
       value !== null &&
       typeof value === 'object' &&
-      (value as { pid?: unknown }).pid === pid &&
-      typeof (value as { version?: unknown }).version === 'string'
+      (value as { pid?: unknown }).pid === pid
     ) {
       const layouts = (value as { layouts?: unknown }).layouts
       return {
         kind: 'ok',
-        version: (value as { version: string }).version,
+        version:
+          typeof (value as { version?: unknown }).version === 'string'
+            ? (value as { version: string }).version
+            : 'unknown',
+        startedAt: (value as { startedAt?: unknown }).startedAt,
         ...(layouts !== null &&
         typeof layouts === 'object' &&
         !Array.isArray(layouts)
@@ -207,6 +221,11 @@ export async function migrationFenceOpen(
 ): Promise<VersionFenceResult> {
   const isAlive = options.isAlive ?? pidAlive
   const self = options.selfPid ?? process.pid
+  const boot = (options.now ?? Date.now)() - (options.uptime ?? uptime)() * 1000
+  // Subtract the margin so clock uncertainty can only keep a blocker.
+  const staleBefore = boot - 5 * 60 * 1000
+  const staleByBoot = (time: unknown) =>
+    typeof time === 'number' && Number.isFinite(time) && time < staleBefore
   const blockers = new Map<number | string, VersionFenceBlocker>()
   const block = (entry: VersionFenceBlocker) => {
     const key = entry.pid === 'unknown' ? `dir:${entry.detail}` : entry.pid
@@ -246,6 +265,10 @@ export async function migrationFenceOpen(
     const path = join(heartbeatDir, name)
     const heartbeat = await readProcessRecord(path, pid)
     if (heartbeat.kind === 'gone') continue
+    if (heartbeat.kind === 'ok' && staleByBoot(heartbeat.startedAt)) {
+      await rm(path, { force: true }).catch(() => {})
+      continue
+    }
     if (!alive(pid)) continue
     if (heartbeat.kind === 'unreadable') {
       block({ pid, version: 'unknown', detail: path })
@@ -286,6 +309,17 @@ export async function migrationFenceOpen(
       const path = join(dir, name)
       const port = await readProcessRecord(path, pid)
       if (port.kind === 'gone') continue
+      if (port.kind === 'ok') {
+        // A live server's port file cannot predate the boot it runs in.
+        // Older writers omit startedAt, so only those records use mtime.
+        const time =
+          port.startedAt === undefined
+            ? await stat(path)
+                .then((file) => file.mtimeMs)
+                .catch(() => undefined)
+            : port.startedAt
+        if (staleByBoot(time)) continue
+      }
       const version = port.kind === 'ok' ? port.version : 'unknown'
       const order = compareVersions(version, options.currentVersion)
       if (order === undefined || order < 0)
