@@ -27,7 +27,21 @@ interface Producer {
   source: PoolAccountSource
   pins: SessionPins
   vault: OpenAiVault
+  /**
+   * Builds and writes this producer's sidebar state. The publisher is shared
+   * process-wide and may have been created by an older plugin bundle that
+   * OpenCode 2 reloaded in place, so the code that builds the file must come
+   * from the producer's own bundle, not from the publisher's.
+   */
+  write?: SidebarWrite
 }
+
+type SidebarWrite = (
+  file: string,
+  producer: Producer,
+  routing: RoutingChange | undefined,
+  live: () => boolean,
+) => Promise<void>
 
 function stamp(paths: readonly string[]): string {
   return paths
@@ -73,6 +87,7 @@ class SidebarPublisher {
     Producer,
     { stamp: string; roster: unknown }
   >()
+  readonly protocol = PUBLISHER_PROTOCOL
   private chain = Promise.resolve()
   private timer?: ReturnType<typeof setInterval>
 
@@ -148,74 +163,12 @@ class SidebarPublisher {
     this.chain = this.chain
       .then(async () => {
         if (!this.producers.has(producer)) return
-        const authority = await producer.vault.authority()
-        const vaultMode = authority !== 'local'
-        const authorityStamp = enrollmentStamp(producer)
-        const canWrite = () =>
-          this.producers.has(producer) &&
-          producer.vault.enrolled() === vaultMode &&
-          enrollmentStamp(producer) === authorityStamp
-        const store = await (vaultMode
-          ? loadAccountSettings(producer.paths)
-          : loadAccounts(producer.paths))
-        const machine = vaultMode
-          ? buildVaultSidebarMachineState(
-              producer.vault.snapshot()?.rows,
-              new Set(producer.vault.routes().map((route) => route.id)),
-              store,
-              Date.now(),
-            )
-          : buildPoolSidebarMachineState(
-              (await producer.source.sidebarView()).rows,
-              store,
-              Date.now(),
-            )
-        const hooks = { canWrite, vaultMode }
-        await setSidebarMachineState(machine, this.file, hooks)
-        if (!canWrite() || !routing) return
-        const accounts = machine.vaultAccounts ?? machine.fallbacks
-        if (routing.accountId === undefined) {
-          // Removing one session's active route also removes its projected pin.
-          await removeSidebarActiveRouting(
-            routing.sessionId,
-            accounts,
-            this.file,
-            hooks,
-          )
-          return
-        }
-        if (routing.pin) {
-          const now = Date.now()
-          await persistSidebarStickyAssignment(
-            {
-              sessionId: routing.sessionId,
-              assignment: {
-                accountId: routing.pin.accountId,
-                wireAccountId: routing.pin.wireIdentity,
-                inputBytes: routing.pin.inputBytes ?? 0,
-                quotaCheckedAt: routing.pin.quotaCheckedAt,
-                assignedAt: now,
-                lastSeenAt: now,
-              },
-              validPinnedAccountIds: [
-                ...(vaultMode ? [] : ['main']),
-                ...accounts.filter((row) => row.enabled).map((row) => row.id),
-              ],
-            },
-            this.file,
-            hooks,
-          )
-        }
-        await upsertSidebarActiveRouting(
-          {
-            sessionId: routing.sessionId,
-            activeId: routing.accountId,
-            route: routing.route ?? machine.route,
-            updatedAt: Date.now(),
-          },
-          accounts,
+        // A producer from an older bundle may arrive without `write`.
+        await (producer.write ?? writeSidebar)(
           this.file,
-          hooks,
+          producer,
+          routing,
+          () => this.producers.has(producer),
         )
       })
       .catch(() => {
@@ -233,16 +186,90 @@ class SidebarPublisher {
   }
 }
 
+const writeSidebar: SidebarWrite = async (file, producer, routing, live) => {
+  const authority = await producer.vault.authority()
+  const vaultMode = authority !== 'local'
+  const authorityStamp = enrollmentStamp(producer)
+  const canWrite = () =>
+    live() &&
+    producer.vault.enrolled() === vaultMode &&
+    enrollmentStamp(producer) === authorityStamp
+  const store = await (vaultMode
+    ? loadAccountSettings(producer.paths)
+    : loadAccounts(producer.paths))
+  const machine = vaultMode
+    ? buildVaultSidebarMachineState(
+        producer.vault.snapshot()?.rows,
+        new Set(producer.vault.routes().map((route) => route.id)),
+        store,
+        Date.now(),
+      )
+    : buildPoolSidebarMachineState(
+        (await producer.source.sidebarView()).rows,
+        store,
+        Date.now(),
+      )
+  const hooks = { canWrite, vaultMode }
+  await setSidebarMachineState(machine, file, hooks)
+  if (!canWrite() || !routing) return
+  const accounts = machine.vaultAccounts ?? machine.fallbacks
+  if (routing.accountId === undefined) {
+    // Removing one session's active route also removes its projected pin.
+    await removeSidebarActiveRouting(routing.sessionId, accounts, file, hooks)
+    return
+  }
+  if (routing.pin) {
+    const now = Date.now()
+    await persistSidebarStickyAssignment(
+      {
+        sessionId: routing.sessionId,
+        assignment: {
+          accountId: routing.pin.accountId,
+          wireAccountId: routing.pin.wireIdentity,
+          inputBytes: routing.pin.inputBytes ?? 0,
+          quotaCheckedAt: routing.pin.quotaCheckedAt,
+          assignedAt: now,
+          lastSeenAt: now,
+        },
+        validPinnedAccountIds: [
+          ...(vaultMode ? [] : ['main']),
+          ...accounts.filter((row) => row.enabled).map((row) => row.id),
+        ],
+      },
+      file,
+      hooks,
+    )
+  }
+  await upsertSidebarActiveRouting(
+    {
+      sessionId: routing.sessionId,
+      activeId: routing.accountId,
+      route: routing.route ?? machine.route,
+      updatedAt: Date.now(),
+    },
+    accounts,
+    file,
+    hooks,
+  )
+}
+
 // The process registry makes separately loaded server bundles and project setups
 // share one publication queue and file observer for each sidebar output path.
+// Bump the protocol whenever SidebarPublisher's own behaviour changes: a
+// publisher left by an older bundle (OpenCode 2 reloads plugins in place) is then
+// replaced rather than reused, and it keeps serving only the producers it already
+// has until they release. Changes to how the file is built need no bump, because
+// each producer carries its own bundle's `write`.
+const PUBLISHER_PROTOCOL = 2
 const registryKey = Symbol.for(
   '@cortexkit/openai-auth/opencode2-sidebar-publishers',
 )
 const processState = globalThis as typeof globalThis & {
-  [registryKey]?: Map<string, SidebarPublisher>
+  [registryKey]?: Map<string, SidebarPublisher & { protocol?: number }>
 }
 const publishers =
-  processState[registryKey] ?? new Map<string, SidebarPublisher>()
+  processState[registryKey] ??
+  new Map<string, SidebarPublisher & { protocol?: number }>()
 processState[registryKey] = publishers
 
 export function acquireSidebarPublisher(
@@ -252,11 +279,12 @@ export function acquireSidebarPublisher(
 ) {
   const key = resolve(file)
   let publisher = publishers.get(key)
-  if (!publisher) {
+  if (publisher?.protocol !== PUBLISHER_PROTOCOL) {
     publisher = new SidebarPublisher(key, observationIntervalMs)
     publishers.set(key, publisher)
   }
   const owner = publisher
+  producer = { ...producer, write: producer.write ?? writeSidebar }
   const stop = owner.add(producer)
   let released = false
   for (const [sessionId, pin] of producer.pins.snapshot())
