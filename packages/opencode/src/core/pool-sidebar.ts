@@ -132,9 +132,11 @@ export function buildVaultSidebarMachineState(
         killed: verdicts.get(row.routeId) === false,
         enabled: row.enabled,
         routable: routable.has(row.routeId),
+        // `unclaimed` is left out: it only means the vault's list named no
+        // account for this credential. A row that still routes is serving, and
+        // one that doesn't is caught by the routable check below.
         ...(row.state !== 'active' ||
         row.stale ||
-        row.unclaimed ||
         (row.enabled && !routable.has(row.routeId))
           ? { vaultState: VAULT_STATES.get(row.state) ?? 'unavailable' }
           : {}),

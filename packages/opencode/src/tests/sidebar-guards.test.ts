@@ -98,11 +98,15 @@ test('sidebar guards retain unavailable vault accounts separately from the host 
     vaultRow('unknown', { state: 'future-state-with-private-data' }),
     vaultRow('stale', { stale: true }),
     vaultRow('declined', { enabled: false }),
+    // `unclaimed` only says the vault's list named no account for the
+    // credential; a routable unclaimed row serves and is not unavailable.
+    vaultRow('unclaimed', { unclaimed: true }),
+    vaultRow('unclaimed-blocked', { unclaimed: true }),
   ]
   await setSidebarMachineState(
     buildVaultSidebarMachineState(
       rows,
-      new Set(['vault:ready']),
+      new Set(['vault:ready', 'vault:unclaimed']),
       null,
       Date.now(),
     ),
@@ -124,6 +128,8 @@ test('sidebar guards retain unavailable vault accounts separately from the host 
     ['vault:unknown', true, false, 'unavailable'],
     ['vault:stale', true, false, 'unavailable'],
     ['vault:declined', false, false, undefined],
+    ['vault:unclaimed', true, true, undefined],
+    ['vault:unclaimed-blocked', true, false, 'unavailable'],
   ])
   expect(renderedQuotas(state)).toHaveLength(rows.length)
   expect(
@@ -132,6 +138,9 @@ test('sidebar guards retain unavailable vault accounts separately from the host 
   expect(resolveSessionSidebarRouting(state, 'new').activeId).toBe(
     'vault:ready',
   )
+  expect(
+    state.vaultAccounts?.find(({ id }) => id === 'vault:unclaimed')?.vaultState,
+  ).toBeUndefined()
   // The account keeps its email as its label, as before; the raw vault state
   // is never written.
   expect(state.vaultAccounts?.[1]?.label).toBe('private@example.com')
