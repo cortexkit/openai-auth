@@ -11,7 +11,8 @@ export const VAULT_EMPTY_ACCESS_HINT =
 /**
  * The `ck` command that lets a host read the vault's OpenAI logins, exactly as
  * docs/vault.md ("Connecting a host") and the Connect instructions print it.
- * `name` is the host's enrollment name, for example `openai-auth-opencode`.
+ * `name` is the approved enrollment name when known, otherwise the proposed
+ * name, for example `openai-auth-opencode`.
  */
 export function vaultGrantCommand(name: string): string {
   return `ck auth grant --principal enrolled:${name} --selector-kind category --selector openai-native --operation read`

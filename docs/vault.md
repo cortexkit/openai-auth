@@ -6,12 +6,14 @@
 
 Each application enrolls under its own name, `openai-auth-opencode` for OpenCode and `openai-auth-pi` for Pi, so either can be revoked alone. OpenCode versions 1 and 2 share the `openai-auth-opencode` enrollment and its files.
 
+Approve a second host of the same kind with its own `--name` (for example, `openai-auth-opencode-thalamus1`); the grant must name that same name in `--principal enrolled:<name>`.
+
 **Connect** (in `opencode auth login`, the Vault section of the plugin's [`/openai` slash-command menu](commands.md#the-openai-command), or Pi's `openai` menu) sends an enrollment request for the vault owner to approve with the vault's [`ck` command-line tool](https://github.com/cortexkit/claustrum). It prints the approval and account-access commands:
 
 ```text
 Enrollment request <id> for openai-auth-opencode is waiting for approval. Approve it with:
   ck auth enroll approve --request-id <id>
-and let it read your OpenAI accounts with:
+Then grant OpenAI access to the name you approved with --name (defaults to openai-auth-opencode):
   ck auth grant --principal enrolled:openai-auth-opencode --selector-kind category --selector openai-native --operation read
 ```
 

@@ -9,6 +9,7 @@ import {
   OpenAiVault,
   VAULT_FAMILY,
   VAULT_MODE_REFUSALS,
+  vaultApprovalInstructions,
   vaultConnectOutcome,
   vaultModeNoRouteCause,
   vaultModeRefusalText,
@@ -46,7 +47,10 @@ const CASES = [
   ['an older vault that reports no grants', undefined],
 ] as const
 
-async function menuLines(reach: VaultGrantReach | undefined) {
+async function menuLines(
+  reach: VaultGrantReach | undefined,
+  approvedName?: string,
+) {
   const section = vaultSection({
     vault: {
       name: NAME,
@@ -57,6 +61,7 @@ async function menuLines(reach: VaultGrantReach | undefined) {
         enrollment: {
           state: 'approved',
           proposedName: NAME,
+          approvedName,
           tokenGeneration: 1,
         },
         discovered: true,
@@ -70,7 +75,10 @@ async function menuLines(reach: VaultGrantReach | undefined) {
   return (await section.build({} as never)).lines
 }
 
-function connectText(reach: VaultGrantReach | undefined) {
+function connectText(
+  reach: VaultGrantReach | undefined,
+  approvedName?: string,
+) {
   return vaultConnectOutcome(
     {
       name: NAME,
@@ -78,11 +86,46 @@ function connectText(reach: VaultGrantReach | undefined) {
       snapshot: () => ({ rows: [] }) as never,
       grantReach: () => reach,
     },
-    { state: 'approved', proposedName: NAME, tokenGeneration: 1 },
+    { state: 'approved', proposedName: NAME, approvedName, tokenGeneration: 1 },
   ).text
 }
 
 describe('vault access guidance', () => {
+  test('the Vault section names the approved enrollment and grants that principal', async () => {
+    const lines = await menuLines(NO_GRANT, 'openai-auth-opencode-thalamus1')
+    expect(lines).toContain(
+      'OpenCode (openai-auth-opencode-thalamus1): connected to the Claustrum vault.',
+    )
+    expect(lines).toContain(
+      'The vault has no grant letting openai-auth-opencode-thalamus1 read OpenAI accounts. Grant it with `ck auth grant --principal enrolled:openai-auth-opencode-thalamus1 --selector-kind category --selector openai-native --operation read`.',
+    )
+  })
+
+  test('the empty-vault connect hint names the approved enrollment', () => {
+    const text = connectText(NO_GRANT, 'openai-auth-opencode-thalamus1')
+    expect(text).toContain(
+      'Connected: the vault approved openai-auth-opencode-thalamus1.',
+    )
+    expect(text).toContain(
+      'The vault has no grant letting openai-auth-opencode-thalamus1 read OpenAI accounts. Grant it with `ck auth grant --principal enrolled:openai-auth-opencode-thalamus1 --selector-kind category --selector openai-native --operation read`.',
+    )
+    expect(connectText(UNREACHED, 'openai-auth-opencode-thalamus1')).toContain(
+      "The vault's grant for openai-auth-opencode-thalamus1 reaches no ChatGPT login:",
+    )
+  })
+
+  test('pending grant instructions follow the approved --name, defaulting to the proposal', () => {
+    const lines = vaultApprovalInstructions(NAME, {
+      state: 'pending',
+      proposedName: NAME,
+      requestId: 'request-1',
+    })
+    expect(lines).toContain(
+      'Then grant OpenAI access to the name you approved with --name (defaults to openai-auth-opencode):',
+    )
+    expect(lines).toContain(`  ${GRANT}`)
+  })
+
   test('without a grant, the connect outcome and the menu give the exact grant command', async () => {
     const hint = vaultEmptyAccessHint(NAME, NO_GRANT)
     expect(hint).toBe(

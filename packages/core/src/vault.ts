@@ -185,8 +185,11 @@ export const VAULT_MODE_REFUSALS: Record<
 
 /**
  * The refusal text for a cause. Only `vault-no-grant` depends on the host: it
- * prints the grant command for this host's enrollment name (`vault.name`).
- * Like every refusal it carries no account label or id.
+ * prints the grant command for this host's proposed name (`vault.name`).
+ * Request routing caches the authority mode and roster, not the approved
+ * enrollment name. Keep the proposed name here rather than read enrollment
+ * files just to format a refusal. Like every refusal it carries no account
+ * label or id.
  */
 export function vaultModeRefusalText(
   cause: VaultModeRefusal,
@@ -1069,8 +1072,8 @@ export function vaultApprovalInstructions(
   return [
     `Enrollment request ${status.requestId} for ${name} is waiting for approval. Approve it with:`,
     `  ck auth enroll approve --request-id ${status.requestId}`,
-    `and let it read your OpenAI accounts with:`,
-    `  ck auth grant --principal enrolled:${name} --selector-kind category --selector ${VAULT_FAMILY.category} --operation read`,
+    `Then grant OpenAI access to the name you approved with --name (defaults to ${name}):`,
+    `  ${vaultGrantCommand(name)}`,
   ]
 }
 
@@ -1080,7 +1083,7 @@ export function vaultEnrollmentLine(
   name: string,
   status: ClaustrumEnrollmentStatus,
 ): string {
-  const who = `${HOST_NAMES[host]} (${name})`
+  const who = `${HOST_NAMES[host]} (${status.state === 'approved' ? (status.approvedName ?? name) : name})`
   switch (status.state) {
     case 'approved':
       return `${who}: connected to the Claustrum vault.`
@@ -1116,10 +1119,11 @@ export function vaultConnectOutcome(
     }
   switch (status.state) {
     case 'approved': {
+      const name = status.approvedName ?? vault.name
       const accounts = vault.snapshot()?.rows.length ?? 0
       return {
         ok: true,
-        text: `Connected: the vault approved ${vault.name}. It serves ${accounts} OpenAI account${accounts === 1 ? '' : 's'} to this host${accounts === 0 ? `. ${vaultEmptyAccessHint(vault.name, vault.grantReach())}` : '.'}`,
+        text: `Connected: the vault approved ${name}. It serves ${accounts} OpenAI account${accounts === 1 ? '' : 's'} to this host${accounts === 0 ? `. ${vaultEmptyAccessHint(name, vault.grantReach())}` : '.'}`,
       }
     }
     case 'denied':

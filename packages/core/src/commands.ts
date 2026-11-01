@@ -733,6 +733,10 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
     title: 'Vault',
     build: async () => {
       const status = await vault.status()
+      const name =
+        status.enrollment.state === 'approved'
+          ? (status.enrollment.approvedName ?? status.name)
+          : status.name
       const connected = (await vault.authority()) !== 'local'
       const routing = vault.routes().length
       return {
@@ -749,7 +753,7 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
           ...(connected && status.discovered
             ? [
                 status.accounts.length === 0
-                  ? vaultEmptyAccessHint(status.name, vault.grantReach())
+                  ? vaultEmptyAccessHint(name, vault.grantReach())
                   : `The vault serves ${status.accounts.length} OpenAI account${status.accounts.length === 1 ? '' : 's'}; ${routing} can route now.`,
               ]
             : []),
