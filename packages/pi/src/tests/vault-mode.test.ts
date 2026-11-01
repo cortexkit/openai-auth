@@ -1482,6 +1482,56 @@ describe('Pi vault slot lifecycle', () => {
     }
   })
 
+  test.each(['renamed', 'legacy', 'unreadable'] as const)(
+    'Disconnect uses the enrollment name safely for a %s Pi host',
+    async (state) => {
+      writeNativeLogin()
+      enroll()
+      const statePath = vaultPaths(stateDir, 'pi').statePath
+      writeFileSync(
+        statePath,
+        state === 'unreadable'
+          ? '{invalid'
+          : JSON.stringify({
+              version: 1,
+              phase: 'approved',
+              proposedName: 'openai-auth-pi',
+              ...(state === 'renamed'
+                ? { approvedName: 'openai-auth-pi-thalamus1' }
+                : {}),
+              tokenGeneration: 1,
+              updatedAt: Date.now(),
+            }),
+        { mode: 0o600 },
+      )
+      const target = vault()
+      const runtime = runtimeWith(target)
+      try {
+        await runtime.syncVaultSlot()
+        const result = await createPiMenu(runtime.commandSupport()).apply(
+          {
+            command: 'openai',
+            sectionId: 'vault',
+            actionId: 'disconnect',
+            confirmed: true,
+          },
+          { notify() {} },
+        )
+        expect(result.ok).toBe(true)
+        expect(existsSync(statePath)).toBe(false)
+        expect(result.text).toBe(
+          state === 'renamed'
+            ? 'Disconnected: openai-auth-pi-thalamus1 no longer reads from the vault. Run `ck auth enroll revoke --name openai-auth-pi-thalamus1` to revoke it in the vault too.'
+            : state === 'legacy'
+              ? 'Disconnected: openai-auth-pi no longer reads from the vault. Run `ck auth enroll revoke --name openai-auth-pi` to revoke it in the vault too.'
+              : "Disconnected: openai-auth-pi no longer reads from the vault. Run ck auth enroll list to find this host's enrollment name, then ck auth enroll revoke --name <name>.",
+        )
+      } finally {
+        target.close()
+      }
+    },
+  )
+
   test('a foreign Pi login makes disconnect report a conflict and overwrite neither login', async () => {
     writeNativeLogin()
     enroll()

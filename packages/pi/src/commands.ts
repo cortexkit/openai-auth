@@ -160,6 +160,19 @@ export function createPiMenu(
             confirm:
               'Disconnect this Pi host from the vault and restore its original login?',
             run: async () => {
+              // Disconnect removes the enrollment state and its approved name.
+              // status() reports unreadable state as blocked; do not guess a revoke target.
+              const enrollment = (
+                await pool.vault.status().catch(() => undefined)
+              )?.enrollment
+              const name =
+                enrollment?.state === 'approved'
+                  ? (enrollment.approvedName ?? pool.vault.name)
+                  : pool.vault.name
+              const revoke =
+                enrollment && enrollment.state !== 'blocked'
+                  ? `Run \`ck auth enroll revoke --name ${name}\` to revoke it in the vault too.`
+                  : "Run ck auth enroll list to find this host's enrollment name, then ck auth enroll revoke --name <name>."
               let result:
                 | Awaited<
                     ReturnType<NonNullable<PiPoolCommands['disconnectVault']>>
@@ -191,7 +204,7 @@ export function createPiMenu(
               }
               await dependencies.afterApply?.()
               return [
-                `Disconnected: ${pool.vault.name} no longer reads from the vault. Run \`ck auth enroll revoke --name ${pool.vault.name}\` to revoke it in the vault too.`,
+                `Disconnected: ${name} no longer reads from the vault. ${revoke}`,
                 ...(result === 'conflict' ? [VAULT_SLOT_CONFLICT] : []),
               ].join('\n')
             },

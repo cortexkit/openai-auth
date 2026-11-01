@@ -2,7 +2,10 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { VaultGrantReach } from '@cortexkit/common-auth/claustrum'
+import type {
+  ClaustrumEnrollmentStatus,
+  VaultGrantReach,
+} from '@cortexkit/common-auth/claustrum'
 
 import { vaultSection } from '../commands'
 import {
@@ -160,6 +163,83 @@ describe('vault access guidance', () => {
       `--selector ${VAULT_FAMILY.category}`,
     )
   })
+})
+
+describe('vault disconnect guidance', () => {
+  async function disconnectText(enrollment: ClaustrumEnrollmentStatus | Error) {
+    let disconnected = false
+    let reads = 0
+    const section = vaultSection({
+      vault: {
+        name: NAME,
+        authority: async () => (disconnected ? 'local' : 'vault'),
+        status: async () => {
+          reads++
+          if (reads > 1 && enrollment instanceof Error) throw enrollment
+          return {
+            host: 'opencode',
+            name: NAME,
+            enrollment: disconnected
+              ? { state: 'idle', proposedName: NAME }
+              : reads === 1
+                ? { state: 'approved', proposedName: NAME, tokenGeneration: 1 }
+                : enrollment,
+            discovered: true,
+            accounts: [],
+          }
+        },
+        routes: () => [],
+        snapshot: () => ({ complete: true }),
+        grantReach: () => NO_GRANT,
+        disconnect: async () => {
+          disconnected = true
+        },
+      } as never,
+    })
+    const view = await section.build({} as never)
+    const action = view.actions?.find((action) => action.id === 'disconnect')
+    if (!action) throw new Error('Disconnect action missing')
+    const text = await action.run({} as never)
+    expect(disconnected).toBe(true)
+    return text
+  }
+
+  test('Disconnect reads the approved name before deleting enrollment state', async () => {
+    expect(
+      await disconnectText({
+        state: 'approved',
+        proposedName: NAME,
+        approvedName: 'openai-auth-opencode-thalamus1',
+        tokenGeneration: 1,
+      }),
+    ).toBe(
+      'Disconnected: openai-auth-opencode-thalamus1 no longer reads from the vault. Run `ck auth enroll revoke --name openai-auth-opencode-thalamus1` to revoke it in the vault too.',
+    )
+  })
+
+  test('Disconnect keeps the proposed name when approval did not record a final name', async () => {
+    expect(
+      await disconnectText({
+        state: 'approved',
+        proposedName: NAME,
+        tokenGeneration: 1,
+      }),
+    ).toBe(
+      'Disconnected: openai-auth-opencode no longer reads from the vault. Run `ck auth enroll revoke --name openai-auth-opencode` to revoke it in the vault too.',
+    )
+  })
+
+  test.each([
+    new Error('enrollment state unreadable'),
+    { state: 'blocked', proposedName: NAME, code: 'unreadable-state' } as const,
+  ])(
+    'Disconnect avoids guessing a revoke target when status cannot be read (%j)',
+    async (status) => {
+      expect(await disconnectText(status)).toBe(
+        "Disconnected: openai-auth-opencode no longer reads from the vault. Run ck auth enroll list to find this host's enrollment name, then ck auth enroll revoke --name <name>.",
+      )
+    },
+  )
 })
 
 describe('vault-mode refusal for an empty account list', () => {

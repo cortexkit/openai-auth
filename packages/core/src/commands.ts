@@ -810,9 +810,22 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
                 confirm:
                   'Disconnect from the vault? Connecting again needs a new approval with `ck`.',
                 run: async () => {
+                  // Disconnect removes the enrollment state and its approved name.
+                  // status() reports unreadable state as blocked; do not guess a revoke target.
+                  const enrollment = (
+                    await vault.status().catch(() => undefined)
+                  )?.enrollment
+                  const name =
+                    enrollment?.state === 'approved'
+                      ? (enrollment.approvedName ?? vault.name)
+                      : vault.name
+                  const revoke =
+                    enrollment && enrollment.state !== 'blocked'
+                      ? `Run \`ck auth enroll revoke --name ${name}\` to revoke it in the vault too.`
+                      : "Run ck auth enroll list to find this host's enrollment name, then ck auth enroll revoke --name <name>."
                   await vault.disconnect()
                   await deps.changed?.()
-                  return `Disconnected: ${vault.name} no longer reads from the vault. Run \`ck auth enroll revoke --name ${vault.name}\` to revoke it in the vault too.`
+                  return `Disconnected: ${name} no longer reads from the vault. ${revoke}`
                 },
               },
             ]
