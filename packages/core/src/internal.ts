@@ -41,5 +41,6 @@ export * from './vault'
 export {
   runVaultAccountMenu,
   VAULT_LOCAL_ACTION_REFUSAL,
+  vaultAccountName,
 } from './vault-account-menu'
 export * from './vault-routing'

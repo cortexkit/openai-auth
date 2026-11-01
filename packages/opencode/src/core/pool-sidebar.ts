@@ -17,6 +17,7 @@ import type { PoolRow } from '@cortexkit/common-auth/store'
 import {
   type AccountStorage,
   POOL_MAIN_ROW_ID,
+  vaultAccountName,
 } from '@cortexkit/openai-auth-core/internal'
 import { poolKillswitchVerdicts } from '@cortexkit/openai-auth-core/pool-routing'
 import type {
@@ -124,7 +125,7 @@ export function buildVaultSidebarMachineState(
       return {
         id: row.routeId,
         credentialId: row.credentialId,
-        label: row.email || row.label || row.routeId,
+        label: vaultAccountName(row),
         ...(row.accountIdentity !== undefined
           ? { accountId: row.accountIdentity }
           : {}),

@@ -83,6 +83,34 @@ test('sidebar distinguishes the first vault answer from an answered empty roster
   expect(local.vaultDiscovered).toBeUndefined()
 })
 
+test('the vault main credential shows as main unless the vault names it', () => {
+  const label = (extra: Partial<VaultRosterRow>) =>
+    buildVaultSidebarMachineState(
+      [
+        vaultRow('default', {
+          credentialId: 'chatgpt:openai',
+          label: 'chatgpt:openai',
+          ...extra,
+        }),
+      ],
+      new Set(['vault:default']),
+      null,
+      Date.now(),
+    ).vaultAccounts?.[0]?.label
+  expect(label({})).toBe('main')
+  expect(label({ label: undefined })).toBe('main')
+  expect(label({ email: 'me@example.com' })).toBe('me@example.com')
+  // Only the exact default credential plays main.
+  expect(
+    buildVaultSidebarMachineState(
+      [vaultRow('work', { label: 'work' })],
+      new Set(),
+      null,
+      Date.now(),
+    ).vaultAccounts?.[0]?.label,
+  ).toBe('work')
+})
+
 test('sidebar guards retain unavailable vault accounts separately from the host toggle', async () => {
   const path = file()
   const rows = [

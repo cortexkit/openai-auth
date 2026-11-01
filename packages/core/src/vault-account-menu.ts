@@ -84,8 +84,22 @@ export async function refreshVaultMenu(
   }
 }
 
-export function vaultAccountName(row: VaultRosterRow): string {
-  return row.email || row.label || row.routeId
+/**
+ * The name a vault account shows in the sidebar and menus. The vault's default
+ * credential `chatgpt:openai` plays main and has no third id segment, so its
+ * default label is the bare credential id; show `main` instead, as local mode
+ * does, unless the vault gave it an email or a label of its own.
+ */
+export function vaultAccountName(
+  row: Pick<VaultRosterRow, 'email' | 'label' | 'routeId' | 'credentialId'>,
+): string {
+  if (row.email) return row.email
+  if (
+    row.credentialId === 'chatgpt:openai' &&
+    (!row.label || row.label === row.credentialId)
+  )
+    return 'main'
+  return row.label || row.routeId
 }
 
 function datedQuotaLines(row: PoolRow, now: number): string[] {
