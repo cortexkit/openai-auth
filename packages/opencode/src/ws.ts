@@ -109,7 +109,7 @@ export interface StreamResponsesWebSocketOptions {
   onConnectionInvalid?: (error: ResponseStreamError) => void
   onAbort?: (error: Error) => void
   /** Push per-turn quota from a codex.rate_limits in-band frame. */
-  onQuota?: (s: Record<string, unknown>) => void
+  onQuota?: (s: Record<string, unknown>, frame: Record<string, unknown>) => void
   /** Called when the transport reports quota exhaustion for the current connection. */
   onRateLimitReached?: (window: string, resetAt?: number) => void
 }
@@ -566,7 +566,7 @@ export function streamResponsesWebSocket(
       resetIdleTimeout('idle timeout waiting for websocket')
       // biome-ignore lint/suspicious/noExplicitAny: ws event parsed from JSON
       const quotaFrame = normalizeWsFrame(event as any)
-      options.onQuota?.(quotaFrame as Record<string, unknown>)
+      options.onQuota?.(quotaFrame as Record<string, unknown>, event)
       return
     }
 

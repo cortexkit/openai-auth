@@ -29,6 +29,7 @@ for (const custody of ['local', 'vault'] as const) {
           ? {
               owns: (id) => id === 'vault-warm',
               authority: async () => 'local',
+              reportUsage: () => {},
               send: async (_id, dispatch) => {
                 authorized++
                 return dispatch(token, {} as never)

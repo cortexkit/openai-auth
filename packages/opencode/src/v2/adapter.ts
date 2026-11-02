@@ -171,6 +171,7 @@ export type VaultAccess = Pick<
   | 'snapshot'
   | 'authorize'
   | 'reportFailure'
+  | 'reportUsage'
   | 'recordSnapshot'
   | 'requestReading'
   | 'grantReach'
@@ -1038,6 +1039,12 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     rewriteWebSocketFrame: ({ frame, sessionID, kind }) =>
       rewriteCodexFrame(frame, { sessionID, kind }, effort),
     quotaFromHeaders: (headers, status, attempt) => {
+      if (attempt.data?.kind === 'vault')
+        vault?.reportUsage(
+          attempt.data.routeId,
+          { headers },
+          attempt.data.receipt,
+        )
       if (
         attempt.data?.kind === 'vault' &&
         hasVaultRoutingAccessor() &&
@@ -1072,6 +1079,18 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       return after === undefined ? limit : { ...limit, retryAfterMs: after }
     },
     inspectEvent: ({ data, transport, attempt }) => {
+      if (
+        attempt.data?.kind === 'vault' &&
+        data.includes('codex.rate_limits')
+      ) {
+        const frame = parseJson(data)
+        if (isRecord(frame) && frame.type === 'codex.rate_limits')
+          vault?.reportUsage(
+            attempt.data.routeId,
+            { frame },
+            attempt.data.receipt,
+          )
+      }
       if (
         attempt.data?.kind === 'vault' &&
         hasVaultRoutingAccessor() &&

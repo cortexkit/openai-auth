@@ -115,6 +115,7 @@ function fixture(
       },
       reportFailure: async () => {},
       recordSnapshot: async () => {},
+      reportUsage: () => {},
       requestReading: () => {},
       grantReach: () => undefined,
       name: 'openai-auth-opencode',

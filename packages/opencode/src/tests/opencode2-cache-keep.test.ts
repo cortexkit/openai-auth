@@ -88,6 +88,10 @@ function fakeLocation() {
       window: undefined,
     } as CacheKeepSettingsView,
     status: 200,
+    replyHeaders: {} as Record<string, string>,
+    usageReports: [] as Array<
+      Parameters<CacheKeepLocation['vault']['reportUsage']>
+    >,
     // When set, a send waits for it and ignores the abort signal.
     gate: undefined as Promise<void> | undefined,
     sending: 0,
@@ -108,12 +112,17 @@ function fakeLocation() {
     storage: async () => null,
     vault: {
       authority: async () => state.authority,
+      reportUsage: (...args) => {
+        state.usageReports.push(args)
+      },
       owns: (routeId) => state.owned.has(routeId),
       send: async (routeId, dispatch) => {
         state.vaultSends++
         state.receipts++
         return dispatch(`receipt-token-${state.receipts}`, {
+          credentialId: `credential-${routeId}`,
           accountIdentity: state.receiptIdentity.get(routeId),
+          accountIdentitySource: 'asserted',
         } as never)
       },
     },
@@ -129,7 +138,10 @@ function fakeLocation() {
         headers: new Headers(init?.headers),
         body: JSON.parse(String(init?.body)),
       })
-      return new Response('{}', { status: state.status })
+      return new Response('{}', {
+        status: state.status,
+        headers: state.replyHeaders,
+      })
     }) as unknown as typeof fetch,
     log: {
       debug() {},
@@ -659,11 +671,28 @@ describe('OpenCode 2 keep-warm credentials', () => {
       fake.state.owned.add('V')
       fake.state.accounts.set('ses', 'V')
       fake.state.receiptIdentity.set('V', 'chatgpt-V')
+      fake.state.replyHeaders = { 'x-codex-primary-used-percent': '42' }
       const { lease, clock } = acquire(fake.location)
       await lease.capture(captured('ses', { accountId: 'V', mode: 'vault' }))
       await advance(lease, clock, 4 * MINUTE)
       expect(fake.sent).toHaveLength(1)
       expect(asks).toBe(0)
+      expect(fake.state.usageReports).toEqual([
+        [
+          'V',
+          { headers: expect.any(Headers) },
+          {
+            credentialId: 'credential-V',
+            accountIdentity: 'chatgpt-V',
+            accountIdentitySource: 'asserted',
+          },
+        ],
+      ])
+      const metadata = fake.state.usageReports[0]![1]
+      expect(
+        'headers' in metadata &&
+          metadata.headers.get('x-codex-primary-used-percent'),
+      ).toBe('42')
     } finally {
       if (previous) Object.defineProperty(globalThis, key, previous)
       else Reflect.deleteProperty(globalThis, key)

@@ -735,6 +735,41 @@ export class OpenAiVault {
     )
   }
 
+  /** Forward only reply quota metadata, using the receipt from that send. */
+  reportUsage(
+    routeId: string,
+    reply: { headers: Headers } | { frame: unknown },
+    receipt: QuotaReceipt,
+  ): void {
+    try {
+      let metadata: { headers: Record<string, string> } | { frame: unknown }
+      if ('headers' in reply) {
+        const headers: Record<string, string> = {}
+        reply.headers.forEach((value, name) => {
+          if (name.startsWith('x-codex-')) headers[name] = value
+        })
+        if (Object.keys(headers).length === 0) return
+        metadata = { headers }
+      } else {
+        metadata = { frame: reply.frame }
+      }
+      this.#consumer.reportUsage({
+        routeId,
+        credentialId: receipt.credentialId,
+        reading: {
+          provider: 'codex',
+          observedAtMs: (this.#options.now ?? Date.now)(),
+          ...metadata,
+          ...(receipt.accountIdentity
+            ? { account: receipt.accountIdentity }
+            : {}),
+        },
+      })
+    } catch {
+      // Optional quota bookkeeping must never interrupt a provider response.
+    }
+  }
+
   /** Joins a quota poll; insula decides whether a background provider read is needed. */
   pollQuota(
     routeId: string,

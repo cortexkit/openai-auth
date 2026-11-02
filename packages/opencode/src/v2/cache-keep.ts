@@ -116,7 +116,7 @@ export interface CacheKeepLocation {
   /** The account settings, read for each local-mode token. */
   storage: () => Promise<AccountStorage | null>
   /** This location's vault; a vault-mode warm gets a new receipt here. */
-  vault: Pick<OpenAiVault, 'authority' | 'owns' | 'send'>
+  vault: Pick<OpenAiVault, 'authority' | 'owns' | 'send' | 'reportUsage'>
   /** The account serving each session now (the session-account registry). */
   accounts: ActiveAccounts
   /** This location's live keep-warm settings. */
@@ -250,6 +250,7 @@ function createEntry(
     vault: {
       owns: (routeId) => live()?.vault.owns(routeId) === true,
       authority: () => need().vault.authority(),
+      reportUsage: (...args) => live()?.vault.reportUsage(...args),
       // Each warm reads the enrollment authority afresh and asks for its own
       // receipt. Undefined is the vault's own "refused before sending".
       send: async (routeId, dispatch, options) => {

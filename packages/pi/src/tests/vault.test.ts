@@ -1,7 +1,7 @@
 // The Claustrum vault end to end on Pi: the real claustrum client over a
 // socket to the mock daemon, Pi's `/openai` Vault section, and Pi requests
 // routed to a vault account.
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import {
   chmodSync,
   mkdirSync,
@@ -13,7 +13,10 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { readClaustrumEnrollmentToken } from '@cortexkit/common-auth/claustrum'
+import {
+  ClaustrumConsumer,
+  readClaustrumEnrollmentToken,
+} from '@cortexkit/common-auth/claustrum'
 import { projectQuota } from '@cortexkit/common-auth/quota'
 import {
   type AccountPaths,
@@ -103,6 +106,7 @@ let stateDir: string
 let daemon: MockDaemon
 let codexTokens: string[]
 let codexStatus: (token: string) => number
+let codexReplyHeaders: Record<string, string>
 
 const fakeFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = String(input instanceof Request ? input.url : input)
@@ -112,7 +116,10 @@ const fakeFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url === CODEX_URL) {
     codexTokens.push(token)
     const status = codexStatus(token)
-    return status === 200 ? sseOk() : new Response('{}', { status })
+    const response = status === 200 ? sseOk() : new Response('{}', { status })
+    for (const [name, value] of Object.entries(codexReplyHeaders))
+      response.headers.set(name, value)
+    return response
   }
   if (url === WHAM_URL) return whamOk()
   return new Response('unexpected', { status: 500 })
@@ -127,6 +134,7 @@ beforeEach(() => {
   stateDir = join(dir, 'vault')
   codexTokens = []
   codexStatus = () => 200
+  codexReplyHeaders = {}
 })
 
 afterEach(async () => {
@@ -191,6 +199,93 @@ function enroll() {
 }
 
 describe('Pi and the Claustrum vault', () => {
+  for (const throws of [false, true]) {
+    test(`vault HTTP reply usage preserves the Pi response when reporter throws ${throws}`, async () => {
+      daemon = await startMockDaemon({
+        directory: dir,
+        credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+      })
+      enroll()
+      const target = vault()
+      const runtime = runtimeWith(target)
+      await target.refresh()
+      await target.pollStale(0)
+      codexReplyHeaders = {
+        'x-codex-primary-used-percent': '42',
+        authorization: 'secret',
+        'set-cookie': 'secret',
+      }
+      const report = spyOn(
+        ClaustrumConsumer.prototype,
+        'reportUsage',
+      ).mockImplementation(() => {
+        if (throws) throw new Error('reporter failed')
+      })
+      try {
+        const events = await send(runtime)
+        expect(events.at(-1)?.type).toBe('done')
+        expect(report.mock.calls).toEqual([
+          [
+            {
+              routeId: target.routes()[0]!.id,
+              credentialId: 'oauth:openai:vault',
+              reading: {
+                provider: 'codex',
+                observedAtMs: expect.any(Number),
+                account: 'chatgpt-vault',
+                headers: { 'x-codex-primary-used-percent': '42' },
+              },
+            },
+          ],
+        ])
+      } finally {
+        report.mockRestore()
+        target.close()
+      }
+    })
+  }
+
+  test('local Pi reply quota never reports usage to the vault', async () => {
+    daemon = await startMockDaemon({ directory: dir })
+    const target = vault()
+    const runtime = runtimeWith(target)
+    const localAccess = chatgptAccessToken('chatgpt-local')
+    const report = spyOn(
+      ClaustrumConsumer.prototype,
+      'reportUsage',
+    ).mockImplementation(() => {})
+    try {
+      await runtime
+        .commandSupport()
+        .store()
+        .add({
+          id: 'local',
+          identity: 'chatgpt-local',
+          credential: {
+            type: 'oauth',
+            access: localAccess,
+            refresh: 'local-refresh',
+            expires: Date.now() + 3600_000,
+          },
+        })
+      await runtime.commandSupport().refreshAllQuota()
+      codexReplyHeaders = { 'x-codex-primary-used-percent': '42' }
+      expect((await send(runtime)).at(-1)).toMatchObject({ type: 'done' })
+      expect(codexTokens).toEqual([localAccess])
+      runtime.observeWebSocketMessage(
+        { authorization: `Bearer ${localAccess}` },
+        JSON.stringify({
+          type: 'codex.rate_limits',
+          rate_limits: { primary: { used_percent: 43 } },
+        }),
+      )
+      expect(report).not.toHaveBeenCalled()
+    } finally {
+      report.mockRestore()
+      target.close()
+    }
+  })
+
   test('Routing sets vault order by email and the next Pi request uses that order', async () => {
     daemon = await startMockDaemon({
       directory: dir,
@@ -614,16 +709,37 @@ describe('Pi and the Claustrum vault', () => {
 
     test('is recorded on the vault account with the receipt the token was served under', async () => {
       const { target, runtime } = await served()
+      const report = spyOn(
+        ClaustrumConsumer.prototype,
+        'reportUsage',
+      ).mockImplementation(() => {})
+      try {
+        runtime.observeWebSocketMessage(
+          { Authorization: `Bearer ${VAULT_ACCESS}` },
+          frame,
+        )
 
-      runtime.observeWebSocketMessage(
-        { Authorization: `Bearer ${VAULT_ACCESS}` },
-        frame,
-      )
-
-      for (let i = 0; i < 200 && primaryUsed(target)[0] !== 77; i++)
-        await Bun.sleep(5)
-      expect(primaryUsed(target)).toEqual([77])
-      target.close()
+        for (let i = 0; i < 200 && primaryUsed(target)[0] !== 77; i++)
+          await Bun.sleep(5)
+        expect(primaryUsed(target)).toEqual([77])
+        expect(report.mock.calls).toEqual([
+          [
+            {
+              routeId: target.routes()[0]!.id,
+              credentialId: 'oauth:openai:vault',
+              reading: {
+                provider: 'codex',
+                observedAtMs: expect.any(Number),
+                account: 'chatgpt-vault',
+                frame: JSON.parse(frame),
+              },
+            },
+          ],
+        ])
+      } finally {
+        report.mockRestore()
+        target.close()
+      }
     })
 
     test('is dropped once the vault credential signs in as another account', async () => {

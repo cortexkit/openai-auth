@@ -2666,11 +2666,18 @@ export async function CodexAuthPlugin(
               // Per-request account identity is captured at send time by the
               // pool and threaded here so the frame is attributed to the
               // connection's own account, not the shared mutable globals.
-              onQuota: (s, accessToken, accountId, servedChatgptAccountId) => {
+              onQuota: (
+                s,
+                accessToken,
+                accountId,
+                servedChatgptAccountId,
+                frame,
+              ) => {
                 const served = accountId
                   ? vaultStreams.get(accountId)
                   : undefined
                 if (served) {
+                  vault.reportUsage(served.id, { frame }, served.receipt)
                   void vault
                     .recordSnapshot(served.id, s, true, served.receipt)
                     .then(queueVaultSidebarWrite)
@@ -4482,10 +4489,16 @@ export async function CodexAuthPlugin(
                 // A vault account's quota lives in the vault roster, and is
                 // kept only with the receipt the response was served under.
                 if (!target.row) {
-                  if (attempt)
+                  if (attempt) {
+                    vault.reportUsage(
+                      target.id,
+                      { headers: served.headers },
+                      attempt,
+                    )
                     void vault
                       .recordSnapshot(target.id, snapshot, complete, attempt)
                       .then(queueVaultSidebarWrite)
+                  }
                   return
                 }
                 pushQuota(

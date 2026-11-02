@@ -45,13 +45,14 @@ export interface CreateWebSocketFetchOptions {
    * Receives the snapshot plus the per-request account identity (access token,
    * internal quota account key, and served ChatGPT account id) captured at send
    * time so the frame is attributed to the connection's own account, not a
-   * shared mutable global.
+   * shared mutable global. The final argument is the original parsed frame.
    */
   onQuota?: (
     s: Record<string, unknown>,
     accessToken: string,
     accountId: string | undefined,
     servedChatgptAccountId: string | undefined,
+    frame: Record<string, unknown>,
   ) => void
   /** Receives quota exhaustion plus the account identity captured at send time. */
   onRateLimitReached?: (
@@ -301,12 +302,13 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           ? sourceHeaders['chatgpt-account-id']
           : undefined
       const requestOnQuota = onQuota
-        ? (s: Record<string, unknown>) =>
+        ? (s: Record<string, unknown>, frame: Record<string, unknown>) =>
             onQuota(
               s,
               requestAccessToken,
               requestAccountId,
               requestServedChatgptAccountId,
+              frame,
             )
         : undefined
       const socketHeaders =

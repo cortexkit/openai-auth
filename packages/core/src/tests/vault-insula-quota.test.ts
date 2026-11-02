@@ -1,9 +1,12 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { mutateVaultRoster } from '@cortexkit/common-auth/claustrum'
+import {
+  ClaustrumConsumer,
+  mutateVaultRoster,
+} from '@cortexkit/common-auth/claustrum'
 import { quotaCreditsText } from '@cortexkit/common-auth/quota'
 
 import { flushForTest, initLogger, resetLoggerForTest } from '../logger'
@@ -107,6 +110,152 @@ function route(vault: OpenAiVault, identity = 'account-a') {
   if (!found) throw new Error(`missing route ${identity}`)
   return found.id
 }
+
+describe('vault reply usage reporting', () => {
+  test('headers allowlist forwards only x-codex quota metadata', async () => {
+    const env = await setup()
+    const id = route(env.vault)
+    const receipt = (await env.vault.authorize(id))!
+    const report = spyOn(
+      ClaustrumConsumer.prototype,
+      'reportUsage',
+    ).mockImplementation(() => {})
+    try {
+      env.vault.reportUsage(
+        id,
+        {
+          headers: new Headers({
+            'X-Codex-Primary-Used-Percent': '42',
+            'x-codex-secondary-window-minutes': '10080',
+            authorization: 'Bearer secret',
+            'set-cookie': 'session=secret',
+            cookie: 'session=secret',
+            'x-request-id': 'not-quota',
+          }),
+        },
+        receipt,
+      )
+      expect(report.mock.calls).toEqual([
+        [
+          {
+            routeId: id,
+            credentialId: 'a',
+            reading: {
+              provider: 'codex',
+              observedAtMs: env.now,
+              account: 'account-a',
+              headers: {
+                'x-codex-primary-used-percent': '42',
+                'x-codex-secondary-window-minutes': '10080',
+              },
+            },
+          },
+        ],
+      ])
+      env.vault.reportUsage(
+        id,
+        { headers: new Headers({ 'set-cookie': 'secret' }) },
+        receipt,
+      )
+      expect(report).toHaveBeenCalledTimes(1)
+    } finally {
+      report.mockRestore()
+    }
+  })
+
+  test('concurrent replies retain the credential and account of their own served attempt', async () => {
+    const env = await setup()
+    const report = spyOn(
+      ClaustrumConsumer.prototype,
+      'reportUsage',
+    ).mockImplementation(() => {})
+    const firstStarted = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const frame = {
+      type: 'codex.rate_limits',
+      rate_limits: { primary: { used_percent: 31 } },
+    }
+    try {
+      const first = env.vault.send(
+        route(env.vault),
+        async (_token, receipt) => {
+          firstStarted.resolve()
+          await release.promise
+          env.vault.reportUsage(route(env.vault), { frame }, receipt)
+          return new Response('first')
+        },
+        { site: 'model' },
+      )
+      await firstStarted.promise
+      const secondId = route(env.vault, 'account-b')
+      const second = await env.vault.send(
+        secondId,
+        async (_token, receipt) => {
+          env.vault.reportUsage(secondId, { frame }, receipt)
+          return new Response('second')
+        },
+        { site: 'model' },
+      )
+      env.advance(10)
+      release.resolve()
+      expect(await (await first)?.text()).toBe('first')
+      expect(await second?.text()).toBe('second')
+      expect(report.mock.calls.map(([input]) => input)).toEqual([
+        {
+          routeId: secondId,
+          credentialId: 'b',
+          reading: {
+            provider: 'codex',
+            observedAtMs: env.now - 10,
+            account: 'account-b',
+            frame,
+          },
+        },
+        {
+          routeId: route(env.vault),
+          credentialId: 'a',
+          reading: {
+            provider: 'codex',
+            observedAtMs: env.now,
+            account: 'account-a',
+            frame,
+          },
+        },
+      ])
+    } finally {
+      release.resolve()
+      report.mockRestore()
+    }
+  })
+
+  test('a throwing usage reporter cannot affect a served response', async () => {
+    const env = await setup()
+    const report = spyOn(
+      ClaustrumConsumer.prototype,
+      'reportUsage',
+    ).mockImplementation(() => {
+      throw new Error('reporter failed')
+    })
+    try {
+      const id = route(env.vault)
+      const response = await env.vault.send(
+        id,
+        async (_token, receipt) => {
+          const reply = new Response('provider response', {
+            headers: { 'x-codex-primary-used-percent': '42' },
+          })
+          env.vault.reportUsage(id, { headers: reply.headers }, receipt)
+          return reply
+        },
+        { site: 'model' },
+      )
+      expect(await response?.text()).toBe('provider response')
+      expect(report).toHaveBeenCalledTimes(1)
+    } finally {
+      report.mockRestore()
+    }
+  })
+})
 
 describe('vault insula quota', () => {
   for (const unlimited of [true, false]) {

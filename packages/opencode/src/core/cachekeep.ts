@@ -19,6 +19,7 @@ import {
   type CacheKeepWindow,
   normalizeCacheKeepWindow,
 } from '@cortexkit/common-auth/cachekeep'
+import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import {
   type AccountStorage,
   extractAccountIdFromClaims,
@@ -389,7 +390,7 @@ export interface OpenAICacheKeepAdapterBaseOptions {
    * While enrolled, a replay captured on a local account sends nothing and
    * does not read or refresh that account's token.
    */
-  vault?: Pick<OpenAiVault, 'owns' | 'send' | 'authority'>
+  vault?: Pick<OpenAiVault, 'owns' | 'send' | 'authority' | 'reportUsage'>
   codexResponsesUrl: string
   /**
    * The account the target's session routes to now (see
@@ -448,7 +449,7 @@ export function createOpenAICacheKeepAdapter(
       // row's known identity instead.
       const dispatch = async (
         accessToken: string,
-        vaultAttempt?: { accountIdentity?: string },
+        vaultAttempt?: QuotaReceipt,
         localIdentity?: string,
       ) => {
         // Stopped, or the warm timed out, while the token resolved: send nothing.
@@ -504,6 +505,12 @@ export function createOpenAICacheKeepAdapter(
               signal,
             }),
           )
+          if (vaultAttempt && target.accountId)
+            options.vault?.reportUsage(
+              target.accountId,
+              { headers: response.headers },
+              vaultAttempt,
+            )
           // The shared manager reads and logs diagnostics after this attempt's token leaves scope.
           return await redactCredentialResponse(
             response,

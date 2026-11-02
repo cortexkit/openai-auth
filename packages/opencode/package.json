@@ -71,7 +71,7 @@
     "@opencode/plugin": "2.2.0"
   },
   "dependencies": {
-    "@cortexkit/claustrum-client": "^0.13.0",
+    "@cortexkit/claustrum-client": "^0.14.0",
     "@cortexkit/private-files": "^0.2.2",
     "@cortexkit/subc-client": "^0.22.0",
     "@opentui/core": ">=0.7.0",

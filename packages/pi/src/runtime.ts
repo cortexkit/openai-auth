@@ -544,14 +544,15 @@ export class PiOpenAIRuntime {
     const snapshot = normalizeQuotaHeaders(parsed) as Record<string, unknown>
     const complete = isCompleteQuotaHeaderFrame(parsed)
     const vaultEntry = this.vaultTokens.get(token)
-    if (vaultEntry?.id === accountId)
+    if (vaultEntry?.id === accountId) {
+      this.vault.reportUsage(accountId, { headers: parsed }, vaultEntry.receipt)
       void this.vault.recordSnapshot(
         accountId,
         snapshot,
         complete,
         vaultEntry.receipt,
       )
-    else if (accountId === FORMER_MAIN_ID)
+    } else if (accountId === FORMER_MAIN_ID)
       this.main.record(snapshot, token, complete)
     else this.pool.recordSnapshot(accountId, snapshot, token, complete)
   }
@@ -562,11 +563,17 @@ export class PiOpenAIRuntime {
    * outlive the request that opened it, so the token, not the request,
    * names the account.
    */
-  recordRateLimitFrame(token: string, snapshot: Record<string, unknown>): void {
+  recordRateLimitFrame(
+    token: string,
+    snapshot: Record<string, unknown>,
+    frame?: Record<string, unknown>,
+  ): void {
     // A vault token first: in vault mode it may sign in as the same ChatGPT
     // account as Pi's own login, and the reading is the vault account's.
     const vaultEntry = this.vaultTokens.get(token)
     if (vaultEntry) {
+      if (frame)
+        this.vault.reportUsage(vaultEntry.id, { frame }, vaultEntry.receipt)
       void this.vault.recordSnapshot(
         vaultEntry.id,
         snapshot,
@@ -602,6 +609,7 @@ export class PiOpenAIRuntime {
       normalizeWsFrame(
         event as Parameters<typeof normalizeWsFrame>[0],
       ) as Record<string, unknown>,
+      event as Record<string, unknown>,
     )
   }
 

@@ -22,6 +22,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { MenuTerminal } from '@cortexkit/common-auth/auth-menu'
 import {
+  ClaustrumConsumer,
   type ClaustrumScopedAttempt,
   connectClaustrumScopedClient,
   readClaustrumEnrollmentToken,
@@ -200,6 +201,74 @@ async function plugin(
 }
 
 describe('OpenCode 1 vault stream admission', () => {
+  test('local OpenCode 1 reply quota never reports usage to the vault', async () => {
+    await startDaemon()
+    seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+    installWire()
+    const network = globalThis.fetch
+    globalThis.fetch = (async (url, init) =>
+      String(url).includes('/responses')
+        ? new Response('ok', {
+            headers: { 'x-codex-primary-used-percent': '42' },
+          })
+        : network(url, init)) as typeof fetch
+    await plugin()
+    const report = spyOn(
+      ClaustrumConsumer.prototype,
+      'reportUsage',
+    ).mockImplementation(() => {})
+    try {
+      const response = await request(await fetchOverride(), 'local-usage')
+      expect(await response.text()).toBe('ok')
+      expect(report).not.toHaveBeenCalled()
+    } finally {
+      report.mockRestore()
+    }
+  })
+
+  test('vault HTTP reply usage forwards quota headers to the consumer', async () => {
+    await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
+    enroll()
+    seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+    installWire()
+    const network = globalThis.fetch
+    globalThis.fetch = (async (url, init) =>
+      String(url).includes('/responses')
+        ? new Response('ok', {
+            headers: {
+              'x-codex-primary-used-percent': '42',
+              authorization: 'Bearer secret',
+              'set-cookie': 'secret',
+            },
+          })
+        : network(url, init)) as typeof fetch
+    const { vault } = await plugin()
+    const report = spyOn(
+      ClaustrumConsumer.prototype,
+      'reportUsage',
+    ).mockImplementation(() => {})
+    try {
+      const response = await request(await fetchOverride(), 'usage-http')
+      expect(await response.text()).toBe('ok')
+      expect(report.mock.calls).toEqual([
+        [
+          {
+            routeId: vault.routes()[0]!.id,
+            credentialId: 'oauth:openai:vault',
+            reading: {
+              provider: 'codex',
+              observedAtMs: expect.any(Number),
+              account: 'chatgpt-vault',
+              headers: { 'x-codex-primary-used-percent': '42' },
+            },
+          },
+        ],
+      ])
+    } finally {
+      report.mockRestore()
+    }
+  })
+
   for (const signal of ['limit', 'quota'] as const) {
     // In vault mode the healthy account is the other vault account; the
     // local row `main` never serves.
@@ -219,6 +288,10 @@ describe('OpenCode 1 vault stream admission', () => {
       })
       installWire()
       const sent: string[] = []
+      const report = spyOn(
+        ClaustrumConsumer.prototype,
+        'reportUsage',
+      ).mockImplementation(() => {})
       const server = Bun.serve<{ bearer: string }>({
         port: 0,
         fetch(req, server) {
@@ -317,8 +390,38 @@ describe('OpenCode 1 vault stream admission', () => {
         expect(vaultBearers).toContain(sent[0])
         expect(vaultBearers).toContain(sent[1])
         expect(sent[1]).not.toBe(sent[0])
+        if (signal === 'quota') {
+          expect(report).toHaveBeenCalledTimes(1)
+          expect(report.mock.calls[0]?.[0]).toEqual({
+            routeId: expect.any(String),
+            credentialId:
+              sent[0] === `Bearer ${VAULT_ACCESS}`
+                ? 'oauth:openai:vault'
+                : 'oauth:openai:other',
+            reading: {
+              provider: 'codex',
+              observedAtMs: expect.any(Number),
+              account:
+                sent[0] === `Bearer ${VAULT_ACCESS}`
+                  ? 'chatgpt-vault'
+                  : 'chatgpt-other',
+              frame: {
+                type: 'codex.rate_limits',
+                rate_limits: {
+                  primary: {
+                    used_percent: 90,
+                    window_minutes: 300,
+                    reset_at: expect.any(Number),
+                  },
+                  secondary: null,
+                },
+              },
+            },
+          })
+        } else expect(report).not.toHaveBeenCalled()
         spy.mockRestore()
       } finally {
+        report.mockRestore()
         await hooks?.dispose?.()
         hooks = undefined
         await server.stop(true)
@@ -829,7 +932,11 @@ test('the OpenCode 1 fetch entry asks fleet routing only for an agent-loop reque
 })
 
 describe('vault cachekeep', () => {
-  async function trackedWarm(recordVersion = 7, local = false) {
+  async function trackedWarm(
+    recordVersion = 7,
+    local = false,
+    replyHeaders: Record<string, string> = {},
+  ) {
     const sidebarFile = join(dir, 'sidebar.json')
     process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = sidebarFile
     writeFileSync(sidebarFile, JSON.stringify(DEFAULT_SIDEBAR_STATE))
@@ -855,7 +962,7 @@ describe('vault cachekeep', () => {
       async fetch(req) {
         sends.push({ headers: req.headers, body: await req.json() })
         onSend?.()
-        return new Response('{}', { status })
+        return new Response('{}', { status, headers: replyHeaders })
       },
     })
     stopWarmCodex = async () => {
@@ -953,6 +1060,38 @@ describe('vault cachekeep', () => {
       },
     }
   }
+
+  test('vault keep-warm reply usage reports the replay receipt, not a local row', async () => {
+    const { manager, makeDue, routeId } = await trackedWarm(7, false, {
+      'x-codex-primary-used-percent': '17',
+      authorization: 'secret',
+      'set-cookie': 'secret',
+    })
+    const report = spyOn(
+      ClaustrumConsumer.prototype,
+      'reportUsage',
+    ).mockImplementation(() => {})
+    try {
+      makeDue()
+      await manager.tick()
+      expect(report.mock.calls).toEqual([
+        [
+          {
+            routeId,
+            credentialId: 'oauth:openai:vault',
+            reading: {
+              provider: 'codex',
+              observedAtMs: expect.any(Number),
+              account: 'chatgpt-vault',
+              headers: { 'x-codex-primary-used-percent': '17' },
+            },
+          },
+        ],
+      ])
+    } finally {
+      report.mockRestore()
+    }
+  })
 
   test('a pinned vault warm authorizes each replay and reaches Codex with the served token', async () => {
     const { running, manager, sends, makeDue } = await trackedWarm()
