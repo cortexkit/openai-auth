@@ -234,6 +234,7 @@ function fakeVault(ids: string[], rosterPath: string) {
     }),
     reportFailure: async () => {},
     recordSnapshot: async () => {},
+    reportUsage() {},
     requestReading() {},
     grantReach: () => undefined,
     name: 'test',
