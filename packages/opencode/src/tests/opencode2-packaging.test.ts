@@ -11,7 +11,12 @@ import { dirname, join } from 'node:path'
 import { installPackedPlugin, PACKAGE_NAME } from './fixtures/opencode2-pack'
 
 const { consumer } = installPackedPlugin()
-afterAll(() => rmSync(dirname(consumer), { recursive: true, force: true }))
+// Removing the npm-installed consumer tree is cleanup, not a check. On a
+// loaded macOS disk it can take longer than Bun's 5 s hook limit.
+afterAll(
+  () => rmSync(dirname(consumer), { recursive: true, force: true }),
+  30_000,
+)
 
 function node(source: string) {
   return spawnSync('node', ['--input-type=module', '-e', source], {

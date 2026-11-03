@@ -118,6 +118,8 @@ status=0
 (cd packages/opencode && bun test src/tests/*packaging.test.ts) > "$logs/packaging.log" 2>&1 || status=$?
 counts packaging "$logs/packaging.log" || status=1
 if [[ $status -ne 0 ]]; then tail -n 80 "$logs/packaging.log"; exit "$status"; fi
+# The pack scripts use npm pack, matching release's npm publish; bun pm pack
+# opens package.json for writing and fails where tracked files are read-only.
 run pack-opencode bun run pack:opencode:dry
 run pack-pi bun run pack:pi:dry
 if [[ -n "$fast" ]]; then exit 0; fi

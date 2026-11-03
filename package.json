@@ -16,8 +16,8 @@
     "format": "biome check --write --unsafe .",
     "format:check": "biome format .",
     "lint": "biome check .",
-    "pack:opencode:dry": "cd packages/opencode && bun pm pack --dry-run",
-    "pack:pi:dry": "cd packages/pi && bun pm pack --dry-run",
+    "pack:opencode:dry": "npm pack --dry-run --workspace packages/opencode",
+    "pack:pi:dry": "npm pack --dry-run --workspace packages/pi",
     "prepublishOnly": "bun run build",
     "check:ranges": "bun scripts/check-installed-ranges.mjs",
     "check:local-deps": "bun scripts/check-local-deps.mjs"
