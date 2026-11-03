@@ -24,6 +24,8 @@ A pool login stores ChatGPT credentials in the shared [account pool](accounts-an
 
 To use only the [Claustrum vault](vault.md), enroll OpenCode with `/openai` → **Vault** → **Connect** first, then choose **ChatGPT accounts in the vault**, or run `opencode2 auth login openai --method openai-auth-vault` (use your OpenCode 2 executable's name). This activates vault routing without browser sign-in or a local pool account; OpenCode 2 stores only the placeholder. OpenCode 1 and 2 share the `openai-auth-opencode` enrollment and its token/state files; vault login refuses until that enrollment is approved.
 
+OpenCode 2.2 runs `auth login` through a background server (`opencode service status` shows it). Quitting the OpenCode window doesn't stop that server, and it keeps the plugins it loaded when it started. So after installing or updating the plugin, a login may not find the plugin's methods. Run `opencode service restart` once, or add `--standalone` to the login command, which runs that one login on a temporary server that reads your current configuration. Scripts should always add `--standalone`.
+
 ## How it differs from OpenCode 1
 
 - **OpenCode 2 sends the requests itself**, through its own OpenAI driver over HTTP or its WebSocket. The plugin picks the account and sets that account's `Authorization` and `chatgpt-account-id` through OpenCode 2's session hooks (`@cortexkit/common-auth/opencode2`), and edits the requests only where OpenCode 1's behaviour needs it (below).
