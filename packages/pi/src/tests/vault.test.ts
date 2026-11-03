@@ -166,14 +166,14 @@ function runtimeWith(target: OpenAiVault): PiOpenAIRuntime {
 
 async function send(
   runtime: PiOpenAIRuntime,
-  sessionId?: string,
+  options: { sessionId?: string; apiKey?: string } = {},
 ): Promise<AssistantMessageEvent[]> {
   const events: AssistantMessageEvent[] = []
   const stream = runtime.stream(MODEL, CONTEXT, {
     transport: 'sse',
     fetch: fakeFetch,
     apiKey: VAULT_PLACEHOLDER_KEY,
-    ...(sessionId ? { sessionId } : {}),
+    ...options,
   })
   for await (const event of stream as AsyncIterable<AssistantMessageEvent>)
     events.push(event)
@@ -270,7 +270,11 @@ describe('Pi and the Claustrum vault', () => {
         })
       await runtime.commandSupport().refreshAllQuota()
       codexReplyHeaders = { 'x-codex-primary-used-percent': '42' }
-      expect((await send(runtime)).at(-1)).toMatchObject({ type: 'done' })
+      // No Pi main login is present: only the local pool row should serve.
+      // Local routing treats apiKey as Pi's login; the vault marker is not a JWT.
+      const events = await send(runtime, { apiKey: undefined })
+      expect(runtime.main.currentToken()).toBeUndefined()
+      expect(events.at(-1)).toMatchObject({ type: 'done' })
       expect(codexTokens).toEqual([localAccess])
       runtime.observeWebSocketMessage(
         { authorization: `Bearer ${localAccess}` },
@@ -322,7 +326,9 @@ describe('Pi and the Claustrum vault', () => {
           (row: { email: string }) => row.email,
         ),
       ).toEqual(['bob@example.com', 'alice@example.com'])
-      expect((await send(runtime, 'session-1'))[0]?.type).toBe('start')
+      expect((await send(runtime, { sessionId: 'session-1' }))[0]?.type).toBe(
+        'start',
+      )
       expect(codexTokens).toEqual([chatgptAccessToken('chatgpt-b')])
     } finally {
       target.close()
@@ -567,7 +573,7 @@ describe('Pi and the Claustrum vault', () => {
       await target.pollStale(0)
       await setMode(mode)
 
-      const events = await send(runtime, 'session-1')
+      const events = await send(runtime, { sessionId: 'session-1' })
 
       expect(events[0]?.type).toBe('start')
       expect(codexTokens).toEqual([VAULT_ACCESS])
