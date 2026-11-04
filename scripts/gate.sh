@@ -25,9 +25,14 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 step=usage
 logs=
+# Set only on the two intended exits. macOS /bin/bash 3.2 aborts on an
+# empty-array expansion under `set -u` yet reports status 0 to an EXIT trap,
+# so an unflagged status 0 means the gate stopped early and must fail.
+finished=
 finish() {
   local status=$?
   trap - EXIT
+  if [[ $status -eq 0 && -z $finished ]]; then status=1; fi
   if [[ -n "$logs" ]]; then rm -rf "$logs"; fi
   if [[ $status -eq 0 ]]; then
     printf 'GATE_OK %s\n' "$(git rev-parse HEAD)"
@@ -122,7 +127,7 @@ if [[ $status -ne 0 ]]; then tail -n 80 "$logs/packaging.log"; exit "$status"; f
 # opens package.json for writing and fails where tracked files are read-only.
 run pack-opencode bun run pack:opencode:dry
 run pack-pi bun run pack:pi:dry
-if [[ -n "$fast" ]]; then exit 0; fi
+if [[ -n "$fast" ]]; then finished=1; exit 0; fi
 
 names=()
 pids=()
@@ -160,3 +165,4 @@ collect
 suite opencode packages/opencode bun run test
 collect
 if [[ -n "$failed" ]]; then step=$failed; exit 1; fi
+finished=1
