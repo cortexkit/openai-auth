@@ -44,7 +44,7 @@ import {
 import { installPackedPlugin, PACKAGE_NAME } from './fixtures/opencode2-pack'
 
 const ENABLED = process.env.OPENAI_AUTH_OPENCODE2_E2E === '1'
-export const OPENCODE_CLI_VERSION = '2.2.3'
+export const OPENCODE_CLI_VERSION = '2.2.5'
 const PLACEHOLDER = placeholderSecret('openai')
 const PASSWORD = 'openai-auth-e2e-loopback-only'
 const HOUR = 3600_000
