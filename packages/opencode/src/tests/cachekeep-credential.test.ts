@@ -10,12 +10,16 @@ for (const custody of ['local', 'vault'] as const) {
       const token = 'opaque-warm-attempt-secret'
       const split = `${token.slice(0, 12)}\r\n${token.slice(12)}`
       const logs: unknown[] = []
+      const warnings: unknown[] = []
       const record = (...args: unknown[]) => {
         logs.push(args)
       }
       const logger = {
         error: record,
-        warn: record,
+        warn: (...args: unknown[]) => {
+          record(...args)
+          warnings.push(args)
+        },
         info: record,
         debug: record,
         trace: record,
@@ -78,8 +82,28 @@ for (const custody of ['local', 'vault'] as const) {
         const retained = JSON.stringify(logs)
         expect(retained).not.toContain(token)
         expect(retained).not.toContain(token.slice(12))
-        if (failure !== 'read') expect(retained).toContain('[credential]')
-        else expect(reads).toBe(1)
+        // Failure diagnostics classify the stage and kind without retaining
+        // provider text, even when a credential has already been scrubbed.
+        expect(warnings).toEqual([
+          [
+            'cachekeep failed',
+            {
+              sessionKey: 'warm-audit',
+              accountId: custody === 'vault' ? 'vault-warm' : 'main',
+              failures: 1,
+              backoffUntil: now + 600_000,
+              stage: failure === 'throw' ? 'send' : 'response',
+              class: failure === 'http' ? 429 : 'unknown',
+              ...(failure === 'http'
+                ? { status: 429 }
+                : failure === 'read'
+                  ? { status: 200 }
+                  : {}),
+            },
+          ],
+        ])
+        expect(retained).not.toContain('Refused')
+        if (failure === 'read') expect(reads).toBe(1)
         expect(JSON.stringify(manager.status())).not.toContain(token)
       } finally {
         manager.stop()

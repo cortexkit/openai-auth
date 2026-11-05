@@ -20,9 +20,9 @@
 //   whether output has started (openai-auth's own rule, `isNonEmittingFrame`).
 //
 // The installer retries a request refused before any output on another
-// account, and never after output; `attach` records the refusal as a
-// rate-limit mark on the row first, so the next `chooseAccount` routes
-// around it.
+// account; `attach` records the refusal before the next choice. After output,
+// only an HTTP read failure observed by the installer's own body reader may
+// continue, with the host's delay and the same still-admitted identity.
 //
 // While this host is enrolled with the Claustrum vault (vault mode), the
 // OpenAI accounts the vault serves it are the only accounts routed, through
@@ -47,7 +47,10 @@ import type {
   OpenCode2AuthAdapter,
   OpenCode2AuthInstallation,
 } from '@cortexkit/common-auth/opencode2'
-import { OpenCode2AuthError } from '@cortexkit/common-auth/opencode2'
+import {
+  DEFAULT_MAX_RECORDS,
+  OpenCode2AuthError,
+} from '@cortexkit/common-auth/opencode2'
 import { isQuotaMap } from '@cortexkit/common-auth/quota'
 import type { RoutingRow, StickyPin } from '@cortexkit/common-auth/routing'
 import type { PoolRow } from '@cortexkit/common-auth/store'
@@ -193,6 +196,7 @@ export type OpenAIAttemptData =
       readonly kind: 'pool'
       readonly token: string
       readonly credentialEpoch: number | undefined
+      readonly identity?: string
     }
   | {
       readonly kind: 'vault'
@@ -423,6 +427,23 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   // installer's `accountHeaders` call for the same session, request kind and
   // account consumes them. A kept retry choice may wait until a later attempt.
   const receipts = new Map<string, ClaustrumScopedAttempt>()
+  // A read failure may be continued only as the identity that received its
+  // output. Keep the send's identity, never its old admission decision.
+  const interrupted = new Map<
+    string,
+    Pick<Attempt, 'accountId' | 'modelID' | 'agent' | 'sessionID'> & {
+      data:
+        | { kind: 'pool'; identity: string | undefined }
+        | {
+            kind: 'vault'
+            credentialId: string
+            accountIdentity: string | undefined
+            wireIdentity: string | undefined
+          }
+    }
+  >()
+  const requestKey = (scope: AccountRequest) =>
+    `${scope.sessionID}\u0000${scope.kind}`
   // Retry choices reserve live pending bytes, but publish their pin and active
   // account only when accountHeaders consumes them. A discard releases the lease.
   const keptChoices = new Map<string, { commit(): void; drop(): void }>()
@@ -549,6 +570,26 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     return order[0]
   }
 
+  const stickyOptions = (
+    targets: readonly Target[],
+    storage: AccountStorage | null,
+  ): StickyRouteOptions => {
+    const quotaById = new Map(
+      targets.map((target) => [target.id, target.quota]),
+    )
+    return {
+      requestBytes: NOMINAL_REQUEST_BYTES,
+      reservePercent: (id) =>
+        getKillswitchThresholdsForAccount(
+          storage,
+          id === FORMER_MAIN_ID ? undefined : id,
+        ),
+      // Reset credits only rank placement when no account has fresh free quota
+      // to weigh. Reading the saved balance never asks for a credential.
+      resetCredits: (id) => resetCreditsOfQuota(quotaById.get(id)),
+    }
+  }
+
   /**
    * sticky-balanced: the session's pin while its row can serve; a row
    * confirmed unable to serve loses the pin for good, a row whose quota is
@@ -565,23 +606,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     plannedPins: Map<string, StickyPin>,
     preferred?: string,
   ): string | undefined => {
-    const quotaById = new Map(
-      targets.map((target) => [target.id, target.quota]),
-    )
-    const options: StickyRouteOptions = {
-      requestBytes: NOMINAL_REQUEST_BYTES,
-      reservePercent: (id) =>
-        getKillswitchThresholdsForAccount(
-          storage,
-          id === FORMER_MAIN_ID ? undefined : id,
-        ),
-      // The reset credits each account's saved quota reading records. As on
-      // OpenCode 1, they only matter when no account has a fresh reading with
-      // room above its reserve to weigh: the session then goes to the first
-      // account in roster order holding at least one credit, else the first
-      // account. Reading them touches no token and asks the vault for nothing.
-      resetCredits: (id) => resetCreditsOfQuota(quotaById.get(id)),
-    }
+    const options = stickyOptions(targets, storage)
     const sticky = admitSticky(routing)
     const place = (exclude: readonly string[], keep: boolean) =>
       placeStickyPin(
@@ -932,6 +957,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     request: AccountRequest,
   ): Promise<AccountHeadersResult<OpenAIAttemptData>> => {
     const { accountId } = request
+    interrupted.delete(requestKey(request))
     const choiceKey = receiptKey(request)
     const keptChoice = keptChoices.get(choiceKey)
     keptChoices.delete(choiceKey)
@@ -1001,7 +1027,12 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           authorization: `Bearer ${token}`,
           'chatgpt-account-id': identity ?? null,
         },
-        attempt: { kind: 'pool', token, credentialEpoch: row.credentialEpoch },
+        attempt: {
+          kind: 'pool',
+          token,
+          credentialEpoch: row.credentialEpoch,
+          ...(identity !== undefined ? { identity } : {}),
+        },
       }
     } finally {
       keptChoice?.drop()
@@ -1010,6 +1041,74 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
 
   const adapter: OpenCode2AuthAdapter<CodexQuotaReading, OpenAIAttemptData> = {
     providerID: OPENAI_PROVIDER_ID,
+    async retrySameAccount(input) {
+      if (input.continuation !== 'interrupted-read') return undefined
+      const previous = interrupted.get(requestKey(input))
+      interrupted.delete(requestKey(input))
+      if (
+        !previous ||
+        previous.accountId !== input.accountId ||
+        previous.modelID !== input.modelID ||
+        previous.agent !== input.agent ||
+        input.limit
+      )
+        return undefined
+      const vaultMode =
+        vault !== undefined && (await vault.authority()) !== 'local'
+      const storage = await deps.storage()
+      if (!vaultMode && !(await source.current()).active) return undefined
+      const at = now()
+      const targets = currentTargets(storage, at, vaultMode)
+      const target = targets.find(
+        (candidate) => candidate.id === input.accountId,
+      )
+      if (!target) return undefined
+      const routing = routingInput(targets, storage, at)
+      const mode = storage?.routing?.mode ?? 'main-first'
+      if (mode === 'sticky-balanced') {
+        const pinned = routePinnedRow(
+          routing,
+          stickyOptions(targets, storage),
+          input.accountId,
+        )
+        if (pinned.kind !== 'serve' && pinned.kind !== 'last-path')
+          return undefined
+      } else {
+        const plan = planOrdered({
+          ...routing,
+          placement: orderedPlacement(mode),
+          ...(vaultMode
+            ? { mainId: vaultMainRouteId(vault?.routes() ?? []) }
+            : {}),
+        })
+        if (plan.kind === 'block' || !plan.order.includes(input.accountId))
+          return undefined
+      }
+      const data = previous.data
+      if (target.row) {
+        if (data?.kind !== 'pool') return undefined
+        const token = source.usableToken(target.row)
+        const identity =
+          target.row.identity ?? (token && identityOfToken(token))
+        if (!token || !data.identity || identity !== data.identity)
+          return undefined
+      } else {
+        if (data?.kind !== 'vault' || !vault) return undefined
+        const receipt = await vault.authorize(input.accountId)
+        if (
+          !receipt ||
+          receipt.credentialId !== data.credentialId ||
+          receipt.accountIdentity !== data.accountIdentity ||
+          (receipt.accountIdentity ?? identityOfToken(receipt.accessToken)) !==
+            data.wireIdentity ||
+          (target.identity !== undefined &&
+            target.identity !== data.wireIdentity)
+        )
+          return undefined
+      }
+      return { accountId: input.accountId }
+    },
+    dropSameAccountRetry() {},
     dropChoice(input) {
       const key = receiptKey(input)
       keptChoices.get(key)?.drop()
@@ -1131,6 +1230,29 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     // plugin hook for a WebSocket handshake the server refuses.
     async onAttemptEnd(attempt, outcome) {
       const data = attempt.data
+      if (data && outcome.outputStarted && outcome.error?.reason === 'failed') {
+        interrupted.set(requestKey(attempt), {
+          accountId: attempt.accountId,
+          modelID: attempt.modelID,
+          agent: attempt.agent,
+          sessionID: attempt.sessionID,
+          data:
+            data.kind === 'pool'
+              ? { kind: 'pool', identity: data.identity }
+              : {
+                  kind: 'vault',
+                  credentialId: data.receipt.credentialId,
+                  accountIdentity: data.receipt.accountIdentity,
+                  wireIdentity:
+                    data.receipt.accountIdentity ??
+                    identityOfToken(data.receipt.accessToken),
+                },
+        })
+        if (interrupted.size > DEFAULT_MAX_RECORDS) {
+          const oldest = interrupted.keys().next().value
+          if (oldest !== undefined) interrupted.delete(oldest)
+        }
+      }
       const response =
         data?.kind === 'vault' && hasVaultRoutingAccessor()
           ? routingResponses.get(attempt)
@@ -1239,6 +1361,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       })
     },
     forgetSession(sessionId) {
+      for (const [key, attempt] of interrupted) {
+        if (attempt.sessionID === sessionId) interrupted.delete(key)
+      }
       pins.forget(sessionId)
       sessionAccounts.forget(sessionId)
       effort.forget(sessionId)

@@ -24,7 +24,7 @@
       "version": "0.0.0",
       "devDependencies": {
         "@cortexkit/claustrum-client": "^0.14.0",
-        "@cortexkit/common-auth": "^0.34.0",
+        "@cortexkit/common-auth": "^0.36.0",
       },
     },
     "packages/opencode": {
@@ -45,7 +45,7 @@
       },
       "devDependencies": {
         "@ai-sdk/openai": "3.0.88",
-        "@cortexkit/common-auth": "^0.34.0",
+        "@cortexkit/common-auth": "^0.36.0",
         "@cortexkit/openai-auth-core": "workspace:*",
         "@opencode/plugin": "2.2.5",
       },
@@ -66,7 +66,7 @@
         "@cortexkit/subc-client": "^0.22.0",
       },
       "devDependencies": {
-        "@cortexkit/common-auth": "^0.34.0",
+        "@cortexkit/common-auth": "^0.36.0",
         "@cortexkit/openai-auth-core": "workspace:*",
       },
       "peerDependencies": {
@@ -225,7 +225,7 @@
 
     "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.14.0", "", { "dependencies": { "@cortexkit/store": "^0.2.1", "@cortexkit/subc-client": "^0.22.0" } }, "sha512-L6fb47lONPACfVXpx6+vK/HKq2y5iCtUg+DPk5tPk0YUordIRD6NsrVLTx2HKxJm+QBV9HkS8FR75ulggpbGrQ=="],
 
-    "@cortexkit/common-auth": ["@cortexkit/common-auth@0.34.0", "", { "dependencies": { "@cortexkit/private-files": "^0.2.2", "jsonc-parser": "^3.3.1" }, "peerDependencies": { "@cortexkit/claustrum-client": ">=0.6.2", "@cortexkit/subc-client": "^0.16.0 || ^0.22.0", "@opencode/plugin": ">=2.0.21", "@opentui/core": ">=0.4.5", "@opentui/solid": ">=0.4.5", "solid-js": "1.9.12" }, "optionalPeers": ["@cortexkit/claustrum-client", "@cortexkit/subc-client", "@opencode/plugin", "@opentui/core", "@opentui/solid", "solid-js"] }, "sha512-5V9MnqLQPPNNDdHm17Vluzlc2WDiFUJaUUG3Uw/q/tDPfBYd6L1QqTCkFaTrh1dbDrCjwSPsIYBQwUBxSkViSw=="],
+    "@cortexkit/common-auth": ["@cortexkit/common-auth@0.36.0", "", { "dependencies": { "@cortexkit/private-files": "^0.2.2", "jsonc-parser": "^3.3.1" }, "peerDependencies": { "@cortexkit/claustrum-client": ">=0.6.2", "@cortexkit/subc-client": "^0.16.0 || ^0.22.0", "@opencode/plugin": ">=2.0.21", "@opentui/core": ">=0.4.5", "@opentui/solid": ">=0.4.5", "solid-js": "1.9.12" }, "optionalPeers": ["@cortexkit/claustrum-client", "@cortexkit/subc-client", "@opencode/plugin", "@opentui/core", "@opentui/solid", "solid-js"] }, "sha512-RRkWUIV2/kb17ieUKjvbfwSFOxzFubnm3uQHRqcybLr5MTxekjqe5/SJ9NmXqtq8TBHImxHga6f9aPXgcenROw=="],
 
     "@cortexkit/openai-auth-core": ["@cortexkit/openai-auth-core@workspace:packages/core"],
 

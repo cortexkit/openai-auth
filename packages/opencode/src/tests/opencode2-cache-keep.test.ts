@@ -71,6 +71,7 @@ function fakeTimers() {
 function fakeLocation() {
   const sent: Sent[] = []
   const warnings: string[] = []
+  const warningData: unknown[] = []
   const state = {
     authority: 'local' as 'local' | 'vault' | 'unreadable',
     owned: new Set<string>(),
@@ -145,12 +146,13 @@ function fakeLocation() {
     }) as unknown as typeof fetch,
     log: {
       debug() {},
-      warn: (message) => {
+      warn: (message, data) => {
         warnings.push(message)
+        warningData.push(data)
       },
     },
   }
-  return { location, state, sent, warnings }
+  return { location, state, sent, warnings, warningData }
 }
 
 function storePaths() {
@@ -503,7 +505,7 @@ describe('OpenCode 2 keep-warm capture and replay', () => {
     expect(lease.manager.status().tracked).toBe(0)
   })
 
-  test('a failed warm logs one warning and backs off for ten minutes', async () => {
+  test('a transient warm failure retries before cache expiry and then retires', async () => {
     const fake = served()
     fake.state.status = 500
     const { lease, clock } = acquire(fake.location)
@@ -511,12 +513,60 @@ describe('OpenCode 2 keep-warm capture and replay', () => {
     await advance(lease, clock, 29 * MINUTE)
     expect(fake.sent).toHaveLength(1)
     expect(fake.warnings).toEqual(['cachekeep failed'])
+    expect(fake.warningData).toEqual([
+      {
+        sessionKey: 'ses',
+        accountId: 'A',
+        failures: 1,
+        backoffUntil: clock.now + 20_000,
+        stage: 'response',
+        class: 500,
+        status: 500,
+      },
+    ])
     const [target] = lease.manager.status().targets
     expect(target!.failures).toBe(1)
-    expect(target!.backoffUntil).toBe(clock.now + 10 * MINUTE)
-    await advance(lease, clock, MINUTE)
+    expect(target!.backoffUntil).toBe(clock.now + 20_000)
+    await advance(lease, clock, 19_999)
     expect(fake.sent).toHaveLength(1)
+    await advance(lease, clock, 1)
+    expect(fake.sent).toHaveLength(2)
+    // The next retry is clipped to expiry minus the 30-second send timeout
+    // and five-second safety margin, rather than rebuilding a cold cache.
+    expect(lease.manager.status().targets[0]!.backoffUntil).toBe(
+      START + 30 * MINUTE - 35_000,
+    )
+    await advance(lease, clock, 5_000)
+    expect(fake.sent).toHaveLength(3)
+    await advance(lease, clock, 35_000)
+    expect(fake.sent).toHaveLength(3)
+    expect(lease.manager.status().tracked).toBe(0)
   })
+
+  for (const status of [408, 429, 503, 401, 403]) {
+    test(`a ${status} warm failure ${status === 401 || status === 403 ? 'keeps the ten-minute pause' : 'retries after twenty seconds'}`, async () => {
+      const fake = served()
+      fake.state.status = status
+      const { lease, clock } = acquire(fake.location)
+      await lease.capture(captured('ses', { model: 'gpt-5.6' }))
+      await advance(lease, clock, 29 * MINUTE)
+      const transient = status !== 401 && status !== 403
+      expect(lease.manager.status().targets[0]!.backoffUntil).toBe(
+        clock.now + (transient ? 20_000 : 10 * MINUTE),
+      )
+      fake.state.status = 200
+      await advance(lease, clock, 20_000)
+      expect(fake.sent).toHaveLength(transient ? 2 : 1)
+      if (transient) {
+        expect(lease.manager.status().targets[0]).toMatchObject({
+          failures: 0,
+          warmCount: 1,
+          cacheExpiresAt: clock.now + 30 * MINUTE,
+        })
+        expect(lease.manager.status().targets[0]!.backoffUntil).toBeUndefined()
+      }
+    })
+  }
 
   test('the clock window gates capture and warming', async () => {
     const fake = served()

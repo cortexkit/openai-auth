@@ -23,6 +23,8 @@ Keep-warm only runs for main-agent sessions unless subagent warming is on, and i
 
 `sustain` still obeys the warm window and limits on the number and total bytes of saved requests. When storage is full, the least recently used requests are discarded. Subagent idle and successful-warm-count limits remain unchanged.
 
+Network errors, timeouts, HTTP 408, 429 and 5xx failures retry after 20, 40 and then 60 seconds, shortened when necessary to leave time for the warm before cache expiry. Expired caches are never rebuilt by keep-warm. Other 4xx failures, including 401, retain a ten-minute pause.
+
 In `anthropic-auth`, CortexKit's sister plugin for Claude, the `always` keep-warm option allows warming outside the configured warm window. Here, `sustain` means keep warming a main session past its idle cap; it still respects the configured warm window.
 
 ## Cost
