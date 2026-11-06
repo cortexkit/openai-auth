@@ -5,6 +5,7 @@ import {
 } from '@cortexkit/common-auth/routing-accessor'
 import { windowsFromQuotaMap } from './pool-quota'
 import { type PoolRoutingInput, planOrdered } from './pool-routing'
+import { type RoutingWaitInput, routingHoldWaitMaxS } from './routing-wait'
 import { isRecord } from './util/record'
 
 export interface VaultRoutingRequest {
@@ -66,6 +67,7 @@ export async function chooseVaultRouting(input: {
   routes: readonly VaultRoutingRoute[]
   routing: PoolRoutingInput
   eligibleIds?: readonly string[]
+  wait?: RoutingWaitInput
 }): Promise<string | undefined> {
   const { request, sessionId } = input
   if (
@@ -105,6 +107,11 @@ export async function chooseVaultRouting(input: {
     provider: 'openai',
     modelId: request.modelId,
     candidates,
+    holdWaitMaxS: routingHoldWaitMaxS({
+      ...input.wait,
+      sessionId,
+      now: input.routing.now,
+    }),
   })
   return answer?.candidate.id
 }

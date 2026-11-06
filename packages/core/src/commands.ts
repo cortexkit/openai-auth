@@ -1127,7 +1127,11 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
         : {}),
     },
     quota: options.quotaCheck ? { check: options.quotaCheck } : {},
-    routing: { orderedVariants: ORDERED_VARIANTS, formerMainId: MAIN_ROW_ID },
+    routing: {
+      orderedVariants: ORDERED_VARIANTS,
+      formerMainId: MAIN_ROW_ID,
+      sameAccountWait: true,
+    },
     limits: { labels: FLOOR_LABELS },
     ...(unavailable.has('cache')
       ? { cache: unavailableSection('Cache') }

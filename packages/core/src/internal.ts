@@ -22,6 +22,9 @@ export {
   renderResetCoordinatorResult,
 } from './commands'
 export * from './limit-identity'
+export * from './limit-mark'
+export * from './limit-policy'
+export * from './limit-provenance'
 export {
   acquireOpenAiLimits,
   type LimitsDispatch,
@@ -39,8 +42,11 @@ export * from './protocol'
 export * from './provider'
 export * from './quota-manager'
 export * from './quota-normalize'
+export * from './quota-refusal'
 export * from './refresh-all-quota'
 export * from './reset-credits'
+export * from './routing-wait'
+export * from './session-cache-activity'
 export * from './tombstone'
 export * from './util/credential-redaction'
 export * from './util/error'

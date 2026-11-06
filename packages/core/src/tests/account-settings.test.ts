@@ -3,8 +3,12 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import * as fsp from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { quotaCodec } from '@cortexkit/common-auth/quota'
+import { openPoolStore } from '@cortexkit/common-auth/store'
 import { loadAccountSettings } from '../accounts'
+import { createOpenAiMenu, migrateLegacySettings } from '../commands'
 import { flushForTest, initLogger, resetLoggerForTest } from '../logger'
+import { maxSameAccountWait } from '../routing-wait'
 
 let dir: string
 beforeEach(() => {
@@ -21,7 +25,12 @@ test('settings read neither credential state nor config account rows or runtime 
     commonAuthPool: { rows: { local: {} } },
     mainAccountId: 'local-identity',
     reset: { local: {} },
-    routing: { mode: 'fallback-first' },
+    routing: { mode: 'fallback-first', maxSameAccountWait: 'max' },
+    commonAuthLimits: {
+      schemaVersion: 1,
+      namespace: 'foreign',
+      marks: ['untouched'],
+    },
     logging: { level: 'debug' },
     cacheKeep: { enabled: true },
     refresh: { enabled: false, mainRefreshLeaseTokenHash: 'local-lease' },
@@ -48,7 +57,7 @@ test('settings read neither credential state nor config account rows or runtime 
     expect(settings).toMatchObject({
       version: 1,
       accounts: [],
-      routing: { mode: 'fallback-first' },
+      routing: { mode: 'fallback-first', maxSameAccountWait: 'max' },
       logging: { level: 'debug' },
       cacheKeep: { enabled: true },
       refresh: { enabled: false },
@@ -66,6 +75,106 @@ test('settings read neither credential state nor config account rows or runtime 
     parsed.mockRestore()
     reads.mockRestore()
   }
+})
+
+test.each([undefined, '15', 0, 15, 'max'])(
+  'same-account wait %s round-trips with exact menu choices and no limits-envelope changes',
+  async (value) => {
+    const configPath = join(dir, 'openai-auth.json')
+    const statePath = join(dir, 'openai-auth-state.json')
+    const envelope = {
+      schemaVersion: 1,
+      namespace: 'foreign',
+      generation: 'saved',
+      revision: 2,
+      marks: [{ sentinel: true }],
+    }
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        version: 1,
+        accounts: [],
+        commonAuthPool: { schemaVersion: 1, rows: {} },
+        routing: { mode: 'ordered', maxSameAccountWait: value },
+        commonAuthLimits: envelope,
+      }),
+    )
+    const state = JSON.stringify({
+      version: 1,
+      accounts: {},
+      commonAuthLimits: envelope,
+    })
+    writeFileSync(statePath, state)
+    const store = await openPoolStore({
+      configPath,
+      statePath,
+      provider: 'openai',
+      quota: quotaCodec,
+    })
+    const menu = createOpenAiMenu({ store })
+    const invocation = { sessionId: 's', notify() {} }
+    const opened = await menu.open(invocation)
+    const routing = opened.menu.sections.find(
+      (section) => section.id === 'routing',
+    )!
+    const action = routing.actions?.find(
+      (entry) => entry.id === 'maxSameAccountWait',
+    )
+    if (!action) throw new Error('Missing same-account wait menu action')
+    expect(action.label).toBe('Longest wait on the same account')
+    expect(action.knobs).toEqual([
+      {
+        kind: 'choice',
+        id: 'maxSameAccountWait',
+        label: 'Longest wait on the same account',
+        choices: [
+          { value: '0', label: "Don't wait" },
+          { value: '15', label: '15 minutes' },
+          { value: 'max', label: 'Until the cache expires' },
+        ],
+        value: value === 0 ? '0' : value === 'max' ? 'max' : '15',
+      },
+    ])
+    expect(maxSameAccountWait(await loadAccountSettings({ configPath }))).toBe(
+      value === 0 || value === 'max' ? value : 15,
+    )
+    for (const setting of [0, 15, 'max'] as const) {
+      const result = await menu.apply(
+        {
+          command: 'openai',
+          sectionId: 'routing',
+          actionId: 'maxSameAccountWait',
+          values: { maxSameAccountWait: String(setting) },
+        },
+        invocation,
+      )
+      expect(result.ok).toBe(true)
+      const saved = JSON.parse(readFileSync(configPath, 'utf8'))
+      expect(saved.routing.maxSameAccountWait).toBe(setting)
+      expect(
+        maxSameAccountWait(await loadAccountSettings({ configPath })),
+      ).toBe(setting)
+      expect(saved.commonAuthLimits).toEqual(envelope)
+      expect(readFileSync(statePath, 'utf8')).toBe(state)
+    }
+  },
+)
+
+test('legacy settings migration preserves a limits envelope while normalizing unrelated settings', () => {
+  const envelope = {
+    schemaVersion: 1,
+    namespace: 'vault',
+    revision: 2,
+    marks: ['saved'],
+  }
+  const settings = {
+    cachekeep: { enabled: true },
+    routing: { maxSameAccountWait: 0 },
+    commonAuthLimits: envelope,
+  }
+  expect(migrateLegacySettings(settings, [])).toBe(true)
+  expect(settings.commonAuthLimits).toEqual(envelope)
+  expect(settings.routing.maxSameAccountWait).toBe(0)
 })
 
 test('missing or unparseable settings use defaults without rewriting config', async () => {

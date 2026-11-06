@@ -71,6 +71,63 @@ function fixture() {
   }
 }
 
+test('provenance is shared by namespace owners, retired on clear and not inherited by same-expiry foreign marks', async () => {
+  const f = fixture()
+  const first = f.manager.acquire(f.options)
+  const second = f.manager.acquire(f.options)
+  try {
+    await first.forRequest(true)
+    const account = binding(f.namespace)
+    const now = f.clock.now()
+    const until = now + 90000
+    first.enqueue(mark(account, until, now), {
+      accountKey: account.account,
+      expiry: until,
+      branch: 'provider',
+      observedAt: now,
+      evidenceAt: now,
+    })
+    await first.flush()
+    expect(
+      second.provenance.read(account.account, until, now, now)?.branch,
+    ).toBe('provider')
+    second.enqueue({
+      type: 'clear',
+      binding: account,
+      baseRevision: second.snapshot()!.revision,
+      producerId: 'control',
+      operationId: 'clear',
+      keys: [{ scope: { kind: 'pool' }, window: 'account' }],
+      cause: 'rate-limit',
+      evidenceAt: now,
+    })
+    await second.flush()
+    expect(
+      first.provenance.read(account.account, until, now, now),
+    ).toBeUndefined()
+    first.enqueue(mark(account, until, now + 1, first.snapshot()!.revision))
+    await first.flush()
+    expect(
+      second.provenance.read(account.account, until, now + 1, now),
+    ).toBeUndefined()
+    const stale = { ...account, credentialEpoch: 'wrong' }
+    first.enqueue(mark(stale, until + 1, now + 2, first.snapshot()!.revision), {
+      accountKey: account.account,
+      expiry: until + 1,
+      branch: 'provider',
+      observedAt: now,
+      evidenceAt: now + 2,
+    })
+    await first.flush()
+    expect(
+      first.provenance.read(account.account, until + 1, now + 2, now),
+    ).toBeUndefined()
+  } finally {
+    await first.dispose()
+    await second.dispose()
+  }
+})
+
 describe('core limits namespace lease', () => {
   test('canonical paths share aliases before store directories exist and isolate store tuples', async () => {
     const root = dirname(

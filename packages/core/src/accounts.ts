@@ -293,6 +293,7 @@ export type AccountStorage = {
     // Sticky-balanced retains a per-session pin in sidebar state; configuration
     // here selects only the routing policy, never the serving account itself.
     mode?: RoutingMode
+    maxSameAccountWait?: 0 | 15 | 'max'
   }
   fallbackOn?: number[]
   refresh?: {

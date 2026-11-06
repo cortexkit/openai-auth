@@ -25,7 +25,7 @@ On OpenCode 1 and 2, the plugin's `/openai` slash command opens its menu in the 
 | --- | --- |
 | Accounts | List accounts; add one (browser or device-code sign-in), disable, enable, move or remove one. Row `main`, the account OpenCode signs in with, is never removed. |
 | Quota | Every account's windows and credit budget; **Check now** polls them. |
-| Routing | The routing mode and the roster order. |
+| Routing | The routing mode, roster order and **Longest wait on the same account**. |
 | Limits | Block requests below each account's minimum remaining quota ([killswitch floors](accounts-and-routing.md#killswitch)). |
 | Cache | Prompt-cache keep-warm, subagent warming, sustain and the warm window. |
 | Diagnostics | Request dumps and the log level. |
@@ -35,7 +35,7 @@ On OpenCode 1 and 2, the plugin's `/openai` slash command opens its menu in the 
 
 What each section controls is described in [Accounts and routing](accounts-and-routing.md), [Cache keep-warm](cache-keep-warm.md), [Troubleshooting](troubleshooting.md) and [Claustrum vault](vault.md).
 
-The menu saves settings in the account pool, under `routing.mode`, `killswitch.{enabled,accounts}`, `logging.level`, `cacheKeep.*` and `dump.enabled`. It opens after the main login is transferred from OpenCode 1's `auth.json` into the shared pool. To avoid leaving a process that still reads only `auth.json`, the transfer waits for every running OpenCode process to use this plugin version or newer. Until it finishes, `/openai` shows **Accounts are moving** and lists any blocking processes.
+The menu saves settings in the account pool, under `routing.mode`, `routing.maxSameAccountWait`, `killswitch.{enabled,accounts}`, `logging.level`, `cacheKeep.*` and `dump.enabled`. It opens after the main login is transferred from OpenCode 1's `auth.json` into the shared pool. To avoid leaving a process that still reads only `auth.json`, the transfer waits for every running OpenCode process to use this plugin version or newer. Until it finishes, `/openai` shows **Accounts are moving** and lists any blocking processes.
 
 The eight earlier commands (`/openai-account`, `/openai-quota`, `/openai-routing`, `/openai-killswitch`, `/openai-cachekeep`, `/openai-dump`, `/openai-logging`, `/openai-reset`) are gone; their actions are sections of the menu.
 
@@ -70,10 +70,12 @@ The Pi extension registers one command, `openai`, which opens a menu:
 | --- | --- |
 | Accounts | Add a fallback account through OAuth; disable, enable, move or remove one. |
 | Quota | Check every account's quota now. |
-| Routing | `ordered`, `main-first`, `fallback-first` or `sticky-balanced`, and the roster order. |
+| Routing | `ordered`, `main-first`, `fallback-first` or `sticky-balanced`, the roster order and **Longest wait on the same account**. |
 | Limits | Block requests below each account's minimum remaining quota ([killswitch floors](accounts-and-routing.md#killswitch)). |
 | Pi login | The quota of the account you signed in to Pi with. Routing treats this account as `main`. |
 | This session | Clear this Pi session's account assignment (pin). |
 | Vault | Connect Pi to the Claustrum vault; disable or enable each vault account on Pi alone. See [Claustrum vault](vault.md). |
 
 Sign in to Pi itself with `/login openai-codex`; this is separate from adding fallback accounts in the plugin menu.
+
+**Longest wait on the same account** offers **Don't wait**, **15 minutes** (default) and **Until the cache expires**, saved as `0`, `15` and `"max"` in `routing.maxSameAccountWait`. See [Routing](accounts-and-routing.md#routing) for the cache and reset requirements.

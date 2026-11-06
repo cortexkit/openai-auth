@@ -62,9 +62,61 @@ test('fleet selection uses an eligible vault identity, not a plugin route id', a
   }))
   expect(await chooseVaultRouting(input())).toBe('route-b')
   expect(calls).toEqual([
-    ['session', { provider: 'openai', modelId: 'gpt-6' }, { deadlineMs: 500 }],
+    [
+      'session',
+      { provider: 'openai', modelId: 'gpt-6', hold_wait_max_s: 0 },
+      { deadlineMs: 500 },
+    ],
   ])
 })
+
+test.each([
+  { setting: 0, expected: 0 },
+  { setting: 15, expected: 900 },
+  { setting: 'max', expected: 1799 },
+])(
+  'fleet advice receives the activity account cap for $setting',
+  async ({ setting, expected }) => {
+    const calls: unknown[] = []
+    Reflect.set(globalThis, key, () => ({
+      accountFor: async (...args: unknown[]) => {
+        calls.push(args)
+        return {
+          account_id: 'account-b',
+          credential_id: 'credential-b',
+          retry_after_ms: 999999999,
+        }
+      },
+    }))
+    const request = input()
+    const accountKey = {
+      namespace: 'vault',
+      accountId: 'route-a',
+      incarnation: '1',
+    }
+    expect(
+      await chooseVaultRouting({
+        ...request,
+        eligibleIds: ['route-b'],
+        wait: {
+          activity: {
+            accountKey,
+            lastAcceptedAt: request.routing.now - 1,
+            ttlMs: 1800000,
+          },
+          accountKey,
+          maxSameAccountWait: setting,
+        },
+      }),
+    ).toBe('route-b')
+    expect(calls).toEqual([
+      [
+        { provider: 'openai', modelId: 'gpt-6', hold_wait_max_s: expected },
+        { deadlineMs: 500 },
+      ],
+    ])
+  },
+)
 
 test.each([
   'absent',

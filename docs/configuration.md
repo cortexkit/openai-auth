@@ -55,6 +55,8 @@ OS temporary-directory environment overrides can change these locations; `dumpDi
 
 The `webSearch` setting and `CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH` have been removed, along with the `web_search` tool the plugin used to add to requests; a config file that still sets `webSearch` loads normally and the key is ignored.
 
+The Routing menu saves `routing.maxSameAccountWait`: `0` (**Don't wait**), `15` (**15 minutes**, default) or `"max"` (**Until the cache expires**). Invalid or absent values use `15`; numeric strings are not accepted. A same-account hold requires confirmed exhaustion with every reset fitting the accepted session's cache lifetime. The killswitch takes precedence: with a positive floor on an exhausted window (including the default 5%/10% floors), the account is not admitted and cannot hold or wake on that account. Disable the killswitch or set that window's floor to zero to allow a cache-preserving hold. See [Routing](accounts-and-routing.md#routing).
+
 ### Other environment variables
 
 | Environment variable | Purpose |

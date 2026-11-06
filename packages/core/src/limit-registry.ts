@@ -21,6 +21,7 @@ import {
   poolLimitsNamespace,
   vaultLimitsNamespace,
 } from './limit-identity'
+import { type LimitProvenance, LimitProvenanceStore } from './limit-provenance'
 import {
   LimitRecoveryLatch,
   type RecoveryEvidence,
@@ -64,6 +65,8 @@ class NamespaceLease {
   owners = 0
   registry: LimitsRegistry | undefined
   readonly recovery: LimitRecoveryLatch
+  readonly provenance: LimitProvenanceStore
+  private provenanceGeneration: string | undefined
   private adapter: PersistenceAdapter | undefined
   private acquiring: Promise<void> | undefined
   private releasing: Promise<void> | undefined
@@ -89,6 +92,7 @@ class NamespaceLease {
     private readonly dropped: () => void,
   ) {
     this.recovery = new LimitRecoveryLatch(options.log)
+    this.provenance = new LimitProvenanceStore(options.namespace)
   }
 
   private stopTracking(): void {
@@ -103,6 +107,7 @@ class NamespaceLease {
     this.registry = undefined
     this.adapter = undefined
     this.latestRead = undefined
+    this.provenance.clear()
     if (registry) this.releasing = registry.dispose().catch(() => {})
   }
 
@@ -267,6 +272,13 @@ class NamespaceLease {
       this.latestRead &&
       this.recovery.adopt(this.latestRead, registry.snapshot)
     ) {
+      if (
+        this.provenanceGeneration !== undefined &&
+        this.provenanceGeneration !== registry.snapshot.generation
+      )
+        this.provenance.clear()
+      this.provenanceGeneration = registry.snapshot.generation
+      this.provenance.reconcile(registry.snapshot, this.clock.now())
       this.projection = limitsBindingProjection(this.latestRead.view.bindings)
       this.adoptedBindings = this.latestRead.view.bindings
       for (const operation of registry.snapshot.operationIds)
@@ -286,7 +298,7 @@ class NamespaceLease {
     return this.current()?.snapshot
   }
 
-  enqueue(command: LimitsCommand): void {
+  enqueue(command: LimitsCommand, provenance?: LimitProvenance): void {
     const registry = this.current()
     if (registry) {
       if (command.type !== 'mark')
@@ -295,6 +307,17 @@ class NamespaceLease {
           command,
         )
       registry.enqueue(command)
+      if (command.type !== 'mark')
+        this.provenance.retire(command.binding.account)
+      else if (
+        provenance &&
+        provenance.expiry === command.until &&
+        provenance.evidenceAt === command.evidenceAt &&
+        limitAccountId(provenance.accountKey) ===
+          limitAccountId(command.binding.account)
+      )
+        this.provenance.record(provenance, this.clock.now())
+      else this.provenance.retire(command.binding.account)
     } else if (command.type === 'mark') this.dropped()
   }
 
@@ -391,6 +414,7 @@ class NamespaceLease {
     this.adapter = undefined
     this.projection = undefined
     this.deadline = undefined
+    this.provenance.clear()
   }
 }
 
@@ -486,6 +510,10 @@ export class OpenAiLimitsOwner {
   get registry(): LimitsRegistry | undefined {
     return this.lease.current()
   }
+  get provenance(): LimitProvenanceStore {
+    this.lease.adoptRead()
+    return this.lease.provenance
+  }
   /** Call only for an owned request, after source readiness has completed. */
   async forRequest(sourceReady: boolean): Promise<OpenAiLimitsRequest> {
     if (this.disposed) throw new Error('limits-owner-disposed')
@@ -498,8 +526,8 @@ export class OpenAiLimitsOwner {
   observe(binding: IdentityBinding | undefined): LimitsProbe | undefined {
     return this.lease.observe(binding)
   }
-  enqueue(command: LimitsCommand): void {
-    this.lease.enqueue(command)
+  enqueue(command: LimitsCommand, provenance?: LimitProvenance): void {
+    this.lease.enqueue(command, provenance)
   }
   /** A parsed signal with no bindable account must not become a local mark. */
   dropSignal(): void {
