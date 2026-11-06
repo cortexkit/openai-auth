@@ -44,7 +44,7 @@ describe('shared pool source state', () => {
     const pending = new Map<string, PoolPendingObservation[]>()
     for (let i = 0; i < 12; i++)
       rememberPoolObservation(pending, row(), observation)
-    expect(pending.get('identity:account-a')).toHaveLength(8)
+    expect(pending.get('["a",1]')).toHaveLength(8)
     expect(
       applyPendingPoolObservations(row(), pending, now).quota,
     ).toBeDefined()

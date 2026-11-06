@@ -29,9 +29,11 @@ export type PoolPendingObservation = {
   observation: QuotaObservation
 }
 
-/** Partitions account state by wire identity, falling back to the row id. */
-export function poolAccountKey(row: Pick<PoolRow, 'id' | 'identity'>): string {
-  return row.identity ? `identity:${row.identity}` : `row:${row.id}`
+/** Relogin starts fresh; refresh keeps the epoch, and duplicate identities isolate. */
+export function poolAccountKey(
+  row: Pick<PoolRow, 'id' | 'credentialEpoch'>,
+): string {
+  return JSON.stringify([row.id, row.credentialEpoch ?? null])
 }
 
 export function poolFileKey(path: string): string {

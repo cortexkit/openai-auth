@@ -21,6 +21,15 @@ export {
   type ResetTargetIdentity,
   renderResetCoordinatorResult,
 } from './commands'
+export * from './limit-identity'
+export {
+  acquireOpenAiLimits,
+  type LimitsDispatch,
+  type LimitsProbe,
+  type OpenAiLimitsOptions,
+  type OpenAiLimitsOwner,
+  type OpenAiLimitsRequest,
+} from './limit-registry'
 export * from './logger'
 export * from './oauth'
 export * from './paths'
