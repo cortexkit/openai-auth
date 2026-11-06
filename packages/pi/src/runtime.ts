@@ -26,33 +26,50 @@
 
 import { statSync } from 'node:fs'
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
+import type {
+  AccountKey,
+  LimitDecision,
+  LimitSignal,
+  PolicyFacts,
+} from '@cortexkit/common-auth/limits'
 import type { PiSlot } from '@cortexkit/common-auth/pi-slot'
 import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
 import {
   type AccountPaths,
   type AccountStorage,
+  classifyOpenAiLimitBody,
   codexRefreshFn,
   createLogger,
+  createSessionActivityStore,
   extractAccountId,
   isCompleteQuotaHeaderFrame,
+  limitAccountKey,
   loadAccounts,
   normalizeQuotaHeaders,
   normalizeWsFrame,
   type OAuthQuotaSnapshot,
   OpenAiVault,
+  poolLimitsNamespace,
   type RefreshAllQuotaResult,
   type RoutingMode,
+  recordSessionCompletion,
   redactCredentialError,
   redactCredentialResponse,
   redactCredentialText,
+  type SessionDispatch,
+  ttlForModel,
   VAULT_REQUEST_ROSTER_WAIT_MS,
   type VaultModeRefusal,
+  vaultLimitsNamespace,
   vaultModeNoRouteCause,
   vaultModeRefusalText,
   vaultStateDir,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
-import { observationFromSnapshot } from '@cortexkit/openai-auth-core/pool-quota'
+import {
+  observationFromSnapshot,
+  windowsFromQuotaMap,
+} from '@cortexkit/openai-auth-core/pool-quota'
 import {
   CreditsServing,
   FIRST_QUOTA_READING_WAIT_MS,
@@ -121,6 +138,8 @@ export interface PiOpenAIRuntimeDeps {
   vault?: OpenAiVault
   /** Replaces the disk slot for isolated host-runtime tests. */
   slot?: PiSlot
+  /** Observe limit decisions before Pi publishes its first event; does not wait. */
+  onLimitDecision?(decision: LimitDecision, facts: PolicyFacts): void
 }
 
 /** How many vault tokens are remembered, so a WebSocket frame finds its account. */
@@ -199,6 +218,9 @@ export class PiOpenAIRuntime {
   readonly main: PiMainAccount
   readonly pool: PiPoolSource
   readonly vault: OpenAiVault
+  readonly activity = createSessionActivityStore()
+  /** Captured from a live Pi context; absent in headless hosts. */
+  setWorkingMessage: ((message?: string) => void) | undefined
   private readonly deps: PiOpenAIRuntimeDeps
   /**
    * Which accounts this runtime serves on prepaid credits, so the info line
@@ -462,7 +484,42 @@ export class PiOpenAIRuntime {
         ...(route.quota !== undefined ? { quota: route.quota } : {}),
       })
     }
-    return out
+    return out.map((account) => ({
+      ...account,
+      accountKey: this.accountKey(account),
+    }))
+  }
+
+  private accountKey(account: RouteAccount): AccountKey | undefined {
+    if (!account.identity) return undefined
+    const paths = this.paths()
+    if (account.vault) {
+      const row = this.vault
+        .snapshot()
+        ?.rows.find((value) => value.routeId === account.id)
+      return row
+        ? limitAccountKey(vaultLimitsNamespace(this.vault.paths.rosterPath), {
+            kind: 'vault',
+            routeId: account.id,
+            addedAt: row.addedAt,
+          })
+        : undefined
+    }
+    const namespace = poolLimitsNamespace(paths.configPath, paths.statePath)
+    if (account.id === FORMER_MAIN_ID)
+      return limitAccountKey(namespace, {
+        kind: 'legacy',
+        id: account.id,
+        verifiedIdentity: account.identity,
+      })
+    const row = this.poolRowById(account.id)
+    return row
+      ? limitAccountKey(namespace, {
+          kind: 'pool',
+          id: row.id,
+          credentialEpoch: row.credentialEpoch,
+        })
+      : undefined
   }
 
   /**
@@ -674,7 +731,7 @@ export class PiOpenAIRuntime {
     context: Context,
     options: SimpleStreamOptions | undefined,
   ): Promise<
-    | ({ kind: 'sent' } & StreamAttempt)
+    | ({ kind: 'sent'; decision?: LimitDecision } & StreamAttempt)
     | { kind: 'blocked'; block: PoolBlock; refusal?: VaultModeRefusal }
   > {
     const storage = await this.storage()
@@ -721,6 +778,14 @@ export class PiOpenAIRuntime {
         requestPull: (id) => this.requestPull(id),
         firstReadingWaitMs:
           this.deps.firstReadingWaitMs ?? FIRST_READING_WAIT_MS,
+        limitPolicy: {
+          activity: () =>
+            options?.sessionId
+              ? this.activity.get(options.sessionId)
+              : undefined,
+          onDecision: (decision, facts) =>
+            this.deps.onLimitDecision?.(decision, facts),
+        },
         send: (account) =>
           account.vault
             ? this.vaultAttempt(model, context, options, account.id).then(
@@ -756,7 +821,7 @@ export class PiOpenAIRuntime {
         return { ...result, refusal: 'vault-empty' }
       return result
     }
-    return { kind: 'sent', ...result.attempt }
+    return { kind: 'sent', ...result.attempt, decision: result.decision }
   }
 
   /**
@@ -772,6 +837,22 @@ export class PiOpenAIRuntime {
     token: string,
   ): Promise<StreamAttempt> {
     let status: number | undefined
+    let signal: LimitSignal | undefined
+    let reading: OAuthQuotaSnapshot | undefined
+    const account = this.accounts(this.storageCache?.storage ?? null).find(
+      (value) => value.id === accountId,
+    )
+    const accountKey = account?.accountKey
+    const dispatch: SessionDispatch | undefined =
+      accountKey && options?.sessionId
+        ? {
+            sessionId: options.sessionId,
+            accountKey,
+            dispatchedAt: this.now(),
+            ttlMs: ttlForModel(JSON.stringify({ model: model.id })),
+          }
+        : undefined
+    let body: unknown
     let inner: AssistantMessageEventStream
     try {
       const send = options?.fetch ?? globalThis.fetch
@@ -782,8 +863,18 @@ export class PiOpenAIRuntime {
         fetch: Object.assign(
           async (input: RequestInfo | URL, init?: RequestInit) => {
             try {
+              const response = await send(input, init)
+              // Never read an SSE success body: it may be an unbounded stream.
+              // The clone leaves the SDK's error bytes and response untouched.
+              if (response.status >= 400) {
+                try {
+                  body = await response.clone().text()
+                } catch {
+                  body = undefined
+                }
+              }
               return await redactCredentialResponse(
-                await send(input, init),
+                response,
                 token,
                 'event-stream',
               )
@@ -797,6 +888,30 @@ export class PiOpenAIRuntime {
         onResponse: async (response, responseModel) => {
           status = response.status
           this.recordHeaders(accountId, token, response.headers)
+          const observedAt = this.now()
+          const headersReading = normalizeQuotaHeaders(
+            new Headers(response.headers),
+          )
+          // Freshness must use the same clock as routing and stored observations.
+          for (const window of [
+            headersReading.primary,
+            headersReading.secondary,
+          ]) {
+            if (window) window.checkedAt = observedAt
+          }
+          reading = {
+            ...windowsFromQuotaMap(account?.quota),
+            ...headersReading,
+          }
+          if (accountKey && status === 429)
+            signal = classifyOpenAiLimitBody({
+              account: accountKey,
+              status,
+              headers: new Headers(response.headers),
+              body,
+              now: this.now(),
+              reading,
+            })
           await options?.onResponse?.(response, responseModel)
         },
       })
@@ -806,10 +921,15 @@ export class PiOpenAIRuntime {
         rest: undefined,
       }
     }
+    const runtime = this
     const iterator = (async function* () {
+      let stopped = false
+      let failed = false
       try {
         for await (const event of inner) {
+          if (event.type === 'done') stopped = true
           if (event.type === 'error') {
+            failed = true
             // pi-ai reuses this message in earlier start/delta events; a clone leaves those aliases raw.
             event.error.errorMessage = redactCredentialText(
               event.error.errorMessage ?? '',
@@ -818,6 +938,19 @@ export class PiOpenAIRuntime {
           }
           yield event
         }
+        if (dispatch && stopped && !failed)
+          recordSessionCompletion(
+            runtime.activity,
+            dispatch,
+            runtime
+              .accounts(runtime.storageCache?.storage ?? null)
+              .find((value) => value.id === accountId)?.accountKey,
+            {
+              kind: 'pi',
+              stop: 'stop',
+              aborted: options?.signal?.aborted ?? false,
+            },
+          )
       } catch (error) {
         yield errorEvent(model, redactCredentialError(error, token).message)
       }
@@ -826,6 +959,9 @@ export class PiOpenAIRuntime {
     const head = first.done ? undefined : first.value
     return {
       ...(status !== undefined ? { status } : {}),
+      ...(accountKey ? { accountKey } : {}),
+      ...(signal ? { signal } : {}),
+      ...(reading ? { reading } : {}),
       head,
       rest: first.done || head?.type === 'error' ? undefined : iterator,
     }

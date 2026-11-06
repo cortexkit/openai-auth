@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-
+import type { LimitDecision, PolicyFacts } from '@cortexkit/common-auth/limits'
 import {
   projectQuota,
   type QuotaMap,
@@ -31,13 +31,19 @@ import type {
 import { exerciseCoalescedQuota } from '../../../opencode/src/tests/fixtures/coalesced-quota'
 import { createPiMenu, registerCommands } from '../commands.ts'
 import cortexKitPiOpenAIAuth from '../index.ts'
+import { type RouteAccount, routePiRequest } from '../pool-request.ts'
 import { PiPoolSource } from '../pool-source.ts'
 import {
   clearPiStickyRouting,
   getPiStickyRouting,
   setPiStickyRouting,
 } from '../routing.ts'
-import { FIRST_READING_WAIT_MS, PiOpenAIRuntime } from '../runtime.ts'
+import {
+  errorEvent,
+  FIRST_READING_WAIT_MS,
+  PiOpenAIRuntime,
+  type PiOpenAIRuntimeDeps,
+} from '../runtime.ts'
 import { isolatePiAgentDir } from './test-isolation.ts'
 
 isolatePiAgentDir()
@@ -172,6 +178,7 @@ async function setMode(mode: RoutingMode): Promise<void> {
 
 function makeRuntime(
   firstReadingWaitMs = FIRST_READING_WAIT_MS,
+  overrides: Partial<PiOpenAIRuntimeDeps> = {},
 ): PiOpenAIRuntime {
   return new PiOpenAIRuntime({
     streamSimple,
@@ -179,6 +186,7 @@ function makeRuntime(
     paths: () => paths,
     fetchImpl: fakeFetch,
     firstReadingWaitMs,
+    ...overrides,
   })
 }
 
@@ -222,6 +230,461 @@ beforeEach(async () => {
   tokenHandler = () => new Response('unexpected refresh', { status: 500 })
   await addRow('alpha', ALPHA_TOKEN, 'acct-alpha')
   await addRow('beta', BETA_TOKEN, 'acct-beta')
+})
+
+describe('Pi pre-publication policy evidence', () => {
+  const observations: Array<{ decision: LimitDecision; facts: PolicyFacts }> =
+    []
+  const observe = (decision: LimitDecision, facts: PolicyFacts) =>
+    observations.push({ decision, facts })
+
+  beforeEach(() => {
+    observations.length = 0
+  })
+
+  test('raw body confirmation and headers produce a fitting main hold without changing base fallback', async () => {
+    const now = Date.now()
+    const runtime = makeRuntime(0, { now: () => now, onLimitDecision: observe })
+    await ready(runtime)
+    await send(runtime, { sessionId: 'session-1' })
+    const activity = runtime.activity.get('session-1')
+    expect(activity?.accountKey.accountId).toBe('main')
+    expect(activity?.accountKey.incarnation).toBe('acct-main')
+    expect(activity?.ttlMs).toBe(300_000)
+    const reset = Math.floor(now / 1000) + 60
+    codexHandler = (call) =>
+      call.token === MAIN_TOKEN
+        ? Response.json(
+            {
+              error: {
+                type: 'usage_limit_reached',
+                resets_at: reset,
+              },
+            },
+            {
+              status: 429,
+              headers: {
+                'x-codex-primary-used-percent': '100.0',
+                'x-codex-primary-reset-at': String(reset),
+              },
+            },
+          )
+        : sseOk()
+    calls = []
+    const events = await send(runtime, { sessionId: 'session-1' })
+    expect(events.at(-1)?.type).toBe('done')
+    expect(codexTokens()).toEqual([MAIN_TOKEN, ALPHA_TOKEN])
+    expect(observations).toHaveLength(1)
+    expect(observations[0]?.decision.action).toBe('hold')
+    expect(observations[0]?.facts.signal?.windows[0]).toMatchObject({
+      confirmed: true,
+      resetAt: reset * 1000,
+      provenance: 'provider',
+    })
+    expect(runtime.main.quotaSnapshot()?.primary?.usedPercent).toBe(100)
+    await runtime.pool.dispose()
+  })
+
+  for (const blocker of ['secondary', 'killswitch'] as const) {
+    test(`${blocker} blocker prevents a hold despite a fitting confirmed primary reset`, async () => {
+      const now = Date.now()
+      const runtime = makeRuntime(0, {
+        now: () => now,
+        onLimitDecision: observe,
+      })
+      await ready(runtime)
+      await send(runtime, { sessionId: 'session-1' })
+      if (blocker === 'killswitch')
+        await mutateAccounts((storage) => {
+          storage.killswitch = { enabled: true }
+          return storage
+        }, paths)
+      const reset = Math.floor(now / 1000) + 60
+      codexHandler = (call) =>
+        call.token === MAIN_TOKEN
+          ? Response.json(
+              { error: { type: 'usage_limit_reached', resets_at: reset } },
+              {
+                status: 429,
+                headers: {
+                  'x-codex-primary-used-percent': '100',
+                  'x-codex-primary-reset-at': String(reset),
+                  ...(blocker === 'secondary'
+                    ? {
+                        'x-codex-secondary-used-percent': '100',
+                        'x-codex-secondary-reset-at': String(
+                          reset + 4 * 86_400,
+                        ),
+                      }
+                    : {}),
+                },
+              },
+            )
+          : sseOk()
+      calls = []
+      await send(runtime, { sessionId: 'session-1' })
+      expect(codexTokens()).toEqual([MAIN_TOKEN, ALPHA_TOKEN])
+      expect(observations[0]?.decision.action).not.toBe('hold')
+      const candidate = observations[0]?.facts.candidates.find(
+        (value) => value.account.accountId === 'main',
+      )
+      if (blocker === 'secondary')
+        expect(candidate?.confirmedBlockers).toContainEqual(
+          expect.objectContaining({
+            window: 'secondary',
+            confirmed: true,
+            resetAt: (reset + 4 * 86_400) * 1000,
+          }),
+        )
+      else {
+        expect(candidate?.admitted).toBe(false)
+        expect(observations[0]?.facts.hold).toBeUndefined()
+      }
+      await runtime.pool.dispose()
+    })
+  }
+
+  for (const mode of ['main-first', 'sticky-balanced'] as const) {
+    for (const status of [401, 403]) {
+      for (const parsed of [false, true]) {
+        test(`${mode} ${status} ${parsed ? 'parsed usage body' : 'unparsed body'} never builds hold facts`, async () => {
+          const now = Date.now()
+          await setMode(mode)
+          const runtime = makeRuntime(0, {
+            now: () => now,
+            onLimitDecision: observe,
+          })
+          await ready(runtime)
+          setPiStickyRouting('session-1', 'main')
+          await send(runtime, { sessionId: 'session-1' })
+          const reset = Math.floor(now / 1000) + 60
+          codexHandler = (call) =>
+            call.token === MAIN_TOKEN
+              ? new Response(
+                  parsed
+                    ? JSON.stringify({
+                        error: {
+                          type: 'usage_limit_reached',
+                          resets_at: reset,
+                        },
+                      })
+                    : 'denied',
+                  {
+                    status,
+                    headers: {
+                      'x-codex-primary-used-percent': '100',
+                      'x-codex-primary-reset-at': String(reset),
+                    },
+                  },
+                )
+              : sseOk()
+          calls = []
+          const events = await send(runtime, { sessionId: 'session-1' })
+          expect(events.at(-1)?.type).toBe('done')
+          expect(codexTokens()[0]).toBe(MAIN_TOKEN)
+          expect(codexTokens()).toHaveLength(2)
+          expect(observations).toHaveLength(1)
+          expect(observations[0]?.facts.signal).toBeUndefined()
+          expect(observations[0]?.facts.hold).toBeUndefined()
+          expect(observations[0]?.decision.action).toBe('reroute')
+          await runtime.pool.dispose()
+        })
+      }
+    }
+  }
+
+  test('ordered out-of-list confirmed 429 bypasses the reducer and preserves the provider error', async () => {
+    await mutateAccounts((storage) => {
+      storage.fallbackOn = [401]
+      return storage
+    }, paths)
+    const runtime = makeRuntime(0, { onLimitDecision: observe })
+    await ready(runtime)
+    await send(runtime, { sessionId: 'session-1' })
+    codexHandler = () =>
+      Response.json(
+        {
+          error: {
+            type: 'usage_limit_reached',
+            message: 'original provider refusal',
+            resets_in_seconds: 60,
+          },
+        },
+        { status: 429 },
+      )
+    calls = []
+    const events = await send(runtime, { sessionId: 'session-1' })
+    expect(codexTokens()).toEqual([MAIN_TOKEN])
+    expect(events[0]?.type).toBe('error')
+    if (events[0]?.type === 'error')
+      expect(events[0].error.errorMessage).toBe(
+        'You have hit your ChatGPT usage limit.',
+      )
+    expect(observations).toEqual([])
+    await runtime.pool.dispose()
+  })
+
+  test('sticky unknown 429 retains without a timer and raw percentages are not rounded', async () => {
+    await setMode('sticky-balanced')
+    const runtime = makeRuntime(0, { onLimitDecision: observe })
+    await ready(runtime)
+    setPiStickyRouting('session-1', 'main')
+    await send(runtime, { sessionId: 'session-1' })
+    codexHandler = () =>
+      Response.json(
+        { error: { type: 'rate_limit_exceeded', message: 'unknown limit' } },
+        {
+          status: 429,
+          headers: {
+            'retry-after': '60',
+            'x-codex-primary-used-percent': '99.999',
+          },
+        },
+      )
+    calls = []
+    const events = await send(runtime, { sessionId: 'session-1' })
+    expect(events[0]?.type).toBe('error')
+    expect(codexTokens()).toEqual([MAIN_TOKEN])
+    expect(getPiStickyRouting('session-1')).toBe('main')
+    expect(observations[0]?.decision).toMatchObject({ action: 'retain' })
+    expect(observations[0]?.decision).not.toHaveProperty('retryMs')
+    expect(observations[0]?.facts.hold).toBeUndefined()
+    expect(runtime.main.quotaSnapshot()?.primary?.usedPercent).toBe(99.999)
+    await runtime.pool.dispose()
+  })
+
+  test('observing a sticky alternative schedules no additional quota polls', async () => {
+    const runtime = makeRuntime(0)
+    await ready(runtime)
+    const accounts = (
+      runtime as unknown as { accounts(storage: null): RouteAccount[] }
+    )
+      .accounts(null)
+      .filter((account) => ['main', 'alpha'].includes(account.id))
+      .map((account) =>
+        account.id === 'alpha' ? { ...account, quota: undefined } : account,
+      )
+    let observing = false
+    const pulls: string[] = []
+    try {
+      const result = await routePiRequest({
+        accounts: () => accounts,
+        storage: null,
+        mode: 'sticky-balanced',
+        sessionId: 'session-1',
+        requestBytes: 1,
+        now: Date.now,
+        refreshBackoff: () => new Map(),
+        firstReadingWaitMs: 0,
+        requestPull(id) {
+          if (observing) pulls.push(id)
+        },
+        send: async () => ({ status: 429 }),
+        placePin(input) {
+          if (input.persist) return { accountId: 'main' }
+          observing = true
+          try {
+            input.select(new Map())
+          } finally {
+            observing = false
+          }
+          return undefined
+        },
+        limitPolicy: { activity: () => undefined, onDecision: observe },
+      })
+      expect(result).toMatchObject({ kind: 'sent', accountId: 'main' })
+      expect(observations).toHaveLength(1)
+      expect(pulls).toEqual([])
+    } finally {
+      await runtime.pool.dispose()
+    }
+  })
+
+  test('activity samples dispatch time, model TTL and verified identity across token refresh', async () => {
+    let now = Date.now()
+    const dispatchedAt = now
+    const runtime = makeRuntime(0, { now: () => now, onLimitDecision: observe })
+    await ready(runtime)
+    codexHandler = () => {
+      now += 240_000
+      return sseOk()
+    }
+    await send(runtime, { sessionId: 'session-1' })
+    const activity = runtime.activity.get('session-1')!
+    expect(activity.lastAcceptedAt).toBe(dispatchedAt)
+    expect(activity.ttlMs).toBe(300_000)
+    runtime.main.observeToken(jwt('acct-main', 'refresh'))
+    codexHandler = (call) =>
+      call.token !== ALPHA_TOKEN && call.token !== BETA_TOKEN
+        ? Response.json(
+            { error: { type: 'usage_limit_reached', resets_in_seconds: 60 } },
+            { status: 429 },
+          )
+        : sseOk()
+    await send(runtime, {
+      sessionId: 'session-1',
+      apiKey: jwt('acct-main', 'refresh'),
+    })
+    expect(observations[0]?.facts.attempted).toEqual(activity.accountKey)
+    expect(observations[0]?.decision.action).toBe('hold')
+    now = dispatchedAt + 300_000
+    await send(runtime, {
+      sessionId: 'session-1',
+      apiKey: jwt('acct-main', 'refresh'),
+    })
+    expect(observations.at(-1)?.decision.action).not.toBe('hold')
+    runtime.main.observeToken(jwt('replacement'))
+    await send(runtime, { sessionId: 'session-1', apiKey: jwt('replacement') })
+    expect(observations.at(-1)?.facts.attempted).not.toEqual(
+      activity.accountKey,
+    )
+    expect(observations.at(-1)?.decision.action).not.toBe('hold')
+    await runtime.pool.dispose()
+  })
+
+  test('a supported model records its thirty-minute TTL on clean completion', async () => {
+    const runtime = makeRuntime(0)
+    await ready(runtime)
+    const stream = runtime.stream({ ...MODEL, id: 'gpt-5.6' }, CONTEXT, {
+      apiKey: MAIN_TOKEN,
+      fetch: fakeFetch,
+      transport: 'sse',
+      sessionId: 'session-1',
+    })
+    for await (const _event of stream) {
+      /* drain the accepted response */
+    }
+    expect(runtime.activity.get('session-1')?.ttlMs).toBe(1_800_000)
+    await runtime.pool.dispose()
+  })
+
+  for (const outcome of ['failed', 'aborted', 'replaced'] as const) {
+    test(`${outcome} completion earns no activity`, async () => {
+      const runtime = makeRuntime(0)
+      await ready(runtime)
+      const controller = new AbortController()
+      if (outcome === 'failed')
+        codexHandler = () => new Response('failed', { status: 500 })
+      if (outcome === 'aborted') controller.abort()
+      if (outcome === 'replaced')
+        codexHandler = () => {
+          runtime.main.observeToken(jwt('new-identity'))
+          return sseOk()
+        }
+      await send(runtime, { sessionId: 'session-1', signal: controller.signal })
+      expect(runtime.activity.get('session-1')).toBeUndefined()
+      await runtime.pool.dispose()
+    })
+  }
+
+  for (const reason of ['usage_limit_reached', 'rate_limit_exceeded']) {
+    test(`ordered no-next ${reason} decides once before publishing the original non-error head`, async () => {
+      const now = Date.now()
+      await store().remove('alpha')
+      await store().remove('beta')
+      const error = errorEvent(MODEL, 'unchanged SDK event')
+      if (error.type !== 'error') throw new Error('expected error fixture')
+      const head: AssistantMessageEvent = {
+        type: 'start',
+        partial: error.error,
+      }
+      const runtime = makeRuntime(0, {
+        now: () => now,
+        onLimitDecision: observe,
+        streamSimple(model, _context, options) {
+          const stream = createAssistantMessageEventStream()
+          void (async () => {
+            const response = await options!.fetch!(CODEX_URL, {
+              headers: { authorization: `Bearer ${options?.apiKey}` },
+            })
+            await options?.onResponse?.(
+              {
+                status: response.status,
+                headers: Object.fromEntries(response.headers),
+              },
+              model,
+            )
+            stream.push(head)
+            stream.end()
+          })()
+          return stream
+        },
+      })
+      await ready(runtime)
+      // A clean real response establishes the key using the same runtime path.
+      const normal = makeRuntime(0, { now: () => now })
+      await ready(normal)
+      await send(normal, { sessionId: 'session-1' })
+      const accepted = normal.activity.get('session-1')!
+      expect(accepted.accountKey.accountId).toBe('main')
+      runtime.activity.recordAccepted({
+        sessionId: 'session-1',
+        accountKey: accepted.accountKey,
+        currentAccountKey: accepted.accountKey,
+        lastAcceptedAt: now,
+        ttlMs: 300_000,
+      })
+      codexHandler = () =>
+        Response.json(
+          { error: { type: reason, resets_in_seconds: 60 } },
+          { status: 429 },
+        )
+      calls = []
+      const stream = runtime.stream(MODEL, CONTEXT, {
+        apiKey: MAIN_TOKEN,
+        sessionId: 'session-1',
+        fetch: fakeFetch,
+      })
+      const first = await stream[Symbol.asyncIterator]().next()
+      expect(observations).toHaveLength(1)
+      expect(observations[0]?.facts.selection).toBeUndefined()
+      if (reason === 'usage_limit_reached')
+        expect(observations[0]?.decision.action).toBe('hold')
+      else expect(observations[0]?.decision.action).not.toBe('hold')
+      expect(first.value).toEqual(head)
+      expect(JSON.stringify(first.value)).toBe(JSON.stringify(head))
+      expect(codexTokens()).toEqual([MAIN_TOKEN])
+      await runtime.pool.dispose()
+      await normal.pool.dispose()
+    })
+  }
+
+  test('a setup throw supplies no status or decision and unknown identity earns no activity', async () => {
+    const runtime = makeRuntime(0, {
+      onLimitDecision: observe,
+      streamSimple() {
+        throw new Error('setup failed')
+      },
+    })
+    await ready(runtime)
+    const events = await send(runtime)
+    expect(events[0]?.type).toBe('error')
+    expect(observations).toEqual([])
+    const unknown = makeRuntime(0, { onLimitDecision: observe })
+    await ready(unknown)
+    await send(unknown, {
+      apiKey: 'opaque-unverified-token',
+      sessionId: 'session-1',
+    })
+    expect(unknown.activity.get('session-1')).toBeUndefined()
+    codexHandler = () =>
+      Response.json(
+        { error: { type: 'usage_limit_reached', resets_in_seconds: 60 } },
+        { status: 429 },
+      )
+    await send(unknown, {
+      apiKey: 'opaque-unverified-token',
+      sessionId: 'session-1',
+    })
+    expect(
+      observations.every(
+        ({ decision, facts }) =>
+          decision.action !== 'hold' && facts.hold === undefined,
+      ),
+    ).toBe(true)
+    await runtime.pool.dispose()
+    await unknown.pool.dispose()
+  })
 })
 
 afterEach(() => {

@@ -20,7 +20,21 @@
 // in the vault's accounts alone (`vault` accounts): they hold no token, the
 // caller's `send` asks the vault for one per attempt.
 
-import { isQuotaMap } from '@cortexkit/common-auth/quota'
+import {
+  type AccountKey,
+  createRequestHistory,
+  type LimitCandidate,
+  type LimitDecision,
+  type LimitSignal,
+  type PolicyFacts,
+  type SessionActivity,
+  sameAccount,
+} from '@cortexkit/common-auth/limits'
+import {
+  budgetExhaustedResetAt,
+  isQuotaMap,
+  projectQuota,
+} from '@cortexkit/common-auth/quota'
 import {
   nextOrderedAttempt,
   type OrderedAttempt,
@@ -28,9 +42,14 @@ import {
 } from '@cortexkit/common-auth/routing'
 import {
   type AccountStorage,
+  decideOpenAiLimit,
   getFallbackStatuses,
   getKillswitchThresholdsForAccount,
   isTombstoned,
+  killswitchPassesPolicy,
+  type OAuthQuotaSnapshot,
+  openAiConfirmedBlockers,
+  openAiHoldFacts,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
   type StickyPinPlacement,
@@ -57,6 +76,8 @@ import {
 /** One account a request may be sent with. */
 export interface RouteAccount {
   id: string
+  /** Tracks one login on a row/route; unknown identities cannot earn activity. */
+  accountKey?: AccountKey
   /** The account's ChatGPT identity, when known. */
   identity?: string
   /** Its pool quota map; undefined while no reading has arrived. */
@@ -77,6 +98,18 @@ function sendable(account: RouteAccount | undefined): account is RouteAccount {
 /** What one attempt reports back: the HTTP status, when a response arrived. */
 export interface RouteAttempt {
   status?: number
+  /** Captured before dispatch, so a replacement cannot inherit old evidence. */
+  accountKey?: AccountKey
+  signal?: LimitSignal
+  /** Response headers may arrive before the vault updates its quota reading. */
+  reading?: OAuthQuotaSnapshot
+}
+
+/** Internal policy interface used before Pi publishes the first stream event. */
+export interface PiLimitPolicy {
+  activity(): SessionActivity | undefined
+  decide?: typeof decideOpenAiLimit
+  onDecision?(decision: LimitDecision, facts: PolicyFacts): void
 }
 
 export interface PiRouteContext<A extends RouteAttempt> {
@@ -97,6 +130,7 @@ export interface PiRouteContext<A extends RouteAttempt> {
   requestPull: PoolRoutingInput['requestPull']
   /** Optional override for tests or callers with their own first-reading wait budget. */
   firstReadingWaitMs?: number
+  limitPolicy?: PiLimitPolicy
   /**
    * Sends the request with one account. Undefined when nothing was sent: the
    * vault refused to serve a vault account.
@@ -116,7 +150,7 @@ export interface PiRouteContext<A extends RouteAttempt> {
 }
 
 export type PiRouteResult<A> =
-  | { kind: 'sent'; attempt: A; accountId: string }
+  | { kind: 'sent'; attempt: A; accountId: string; decision?: LimitDecision }
   | { kind: 'blocked'; block: PoolBlock }
 
 /**
@@ -159,6 +193,107 @@ export function routablePoolRows<
       now,
     )
   })
+}
+
+function afterLimit<A extends RouteAttempt>(
+  ctx: PiRouteContext<A>,
+  attempted: RouteAccount,
+  attempt: A,
+  mode: 'ordered' | 'sticky',
+  next?: string,
+): LimitDecision | undefined {
+  const policy = ctx.limitPolicy
+  const key = attempt.accountKey ?? attempted.accountKey
+  if (!policy || !key || attempt.status === undefined) return undefined
+  // Ordered out-of-list responses bypass even the decision observer.
+  if (
+    mode === 'ordered' &&
+    !getFallbackStatuses(ctx.storage).includes(attempt.status)
+  )
+    return undefined
+  const now = ctx.now()
+  const accounts = ctx.accounts()
+  const routing = routingInput(ctx, accounts)
+  const candidates: LimitCandidate[] = accounts.flatMap((account) => {
+    if (!account.accountKey) return []
+    const ownsAttempt = sameAccount(account.accountKey, key)
+    const reading = {
+      ...windowsFromQuotaMap(account.quota),
+      ...(ownsAttempt ? attempt.reading : undefined),
+    }
+    const confirmedBlockers = openAiConfirmedBlockers(
+      ownsAttempt ? attempt.signal : undefined,
+      reading,
+      now,
+    )
+    const backoff = routing.refreshBackoff.get(account.id)
+    const admitted =
+      sendable(account) &&
+      !(backoff !== undefined && backoff > now) &&
+      killswitchPassesPolicy(
+        reading,
+        ctx.storage,
+        account.id === FORMER_MAIN_ID ? undefined : account.id,
+        now,
+      ) &&
+      !budgetExhaustedResetAt(
+        projectQuota(isQuotaMap(account.quota) ? account.quota : undefined),
+        now,
+      )
+    return [
+      {
+        account: account.accountKey,
+        admitted,
+        placementEligible: admitted,
+        ready:
+          admitted &&
+          !!(reading.primary || reading.secondary) &&
+          !confirmedBlockers.length,
+        blockers: [],
+        confirmedBlockers,
+      },
+    ]
+  })
+  const candidate = candidates.find((value) => sameAccount(value.account, key))
+  const selection = candidates.find((value) => value.account.accountId === next)
+  const facts: PolicyFacts = {
+    phase: 'after-limit',
+    host: 'pi',
+    now,
+    clockNow: now,
+    sessionId: ctx.sessionId ?? '',
+    requestScope: { kind: 'pool' },
+    history: createRequestHistory({
+      requestId: ctx.sessionId ?? 'request',
+      originalUrl: 'https://chatgpt.com/backend-api/codex/responses',
+      clockNow: now,
+    }),
+    attempted: key,
+    status: attempt.status,
+    signal: attempt.signal,
+    affinity: mode === 'sticky' ? 'sticky' : 'none',
+    delivery: { owned: true, attributable: true, replayable: true },
+    candidates,
+    ...(selection
+      ? { selection: { account: selection.account, pin: 'preserve' } }
+      : {}),
+    hold:
+      candidate && ctx.sessionId
+        ? openAiHoldFacts({
+            candidate,
+            status: attempt.status,
+            activity: policy.activity(),
+            maxSameAccountWait: ctx.storage?.routing?.maxSameAccountWait,
+            now,
+          })
+        : undefined,
+  }
+  const decision = (policy.decide ?? decideOpenAiLimit)(facts, {
+    mode,
+    fallbackOn: ctx.storage?.fallbackOn,
+  })
+  if (decision) policy.onDecision?.(decision, facts)
+  return decision
 }
 
 function routingInput<A extends RouteAttempt>(
@@ -233,7 +368,9 @@ async function routeOrdered<A extends RouteAttempt>(
   // not serve, an account without a token). Nothing reached the provider, so
   // the next account in the order is tried as if this one were not there.
   const unsent = new Set<string>()
-  let last: { attempt: A; accountId: string } | undefined
+  let last:
+    | { attempt: A; accountId: string; decision?: LimitDecision }
+    | undefined
   for (;;) {
     const id = nextOrderedAttempt(
       plan.order.filter((candidate) => !unsent.has(candidate)),
@@ -256,6 +393,13 @@ async function routeOrdered<A extends RouteAttempt>(
       id: account.id,
       ...(attempt.status !== undefined ? { status: attempt.status } : {}),
     })
+    const next = nextOrderedAttempt(
+      plan.order.filter((candidate) => !unsent.has(candidate)),
+      attempts,
+      retryStatuses,
+    )
+    const decision = afterLimit(ctx, account, attempt, 'ordered', next)
+    if (decision) last.decision = decision
   }
   if (last) {
     noteServed(ctx, routing, last.accountId)
@@ -295,6 +439,7 @@ async function routeSticky<A extends RouteAttempt>(
       input: PoolRoutingInput,
       admission: StickyAdmission,
       current: readonly RouteAccount[],
+      selectionOptions = options,
     ) =>
     (exclude: readonly string[], persist: boolean) => {
       const excluded = new Set(exclude)
@@ -319,7 +464,7 @@ async function routeSticky<A extends RouteAttempt>(
           current.map((account) => [account.id, account.identity]),
         ),
         select: (pendingBytes) =>
-          selectStickyRow(input, options, excluded, pendingBytes),
+          selectStickyRow(input, selectionOptions, excluded, pendingBytes),
         persist,
       })
     }
@@ -364,6 +509,7 @@ async function routeSticky<A extends RouteAttempt>(
   if (!sendable(account)) return undefined
   let attempt = await ctx.send(account)
   if (!attempt) return undefined
+  let decision: LimitDecision | undefined
 
   if (
     attempt.status === 401 ||
@@ -377,6 +523,22 @@ async function routeSticky<A extends RouteAttempt>(
     sticky = admitSticky(routing)
     place = placer(routing, sticky, current)
     const after = stickyBreak(routing, sticky, id, attempt.status)
+    // A proposed alternative is evidence only: no extra quota poll or placement log.
+    const alternative = ctx.limitPolicy
+      ? placer({ ...routing, requestPull: () => {} }, sticky, current, {
+          ...options,
+          onEmptyWeightedSet: () => {},
+        })([id], false)
+      : undefined
+    decision = afterLimit(
+      ctx,
+      account,
+      attempt,
+      'sticky',
+      alternative?.accountId,
+    )
+    // Limit decisions are observations only: keep the status-based routing and
+    // provider event that routing would select without the observer.
     if (after.action === 'migrate') {
       const from = id
       if (migrate(after.reason) && id !== from) {
@@ -387,6 +549,7 @@ async function routeSticky<A extends RouteAttempt>(
         if (replacement && replaced) {
           attempt = replaced
           account = replacement
+          decision = undefined
         } else {
           id = from
         }
@@ -394,7 +557,12 @@ async function routeSticky<A extends RouteAttempt>(
     }
   }
   noteServed(ctx, routing, account.id)
-  return { kind: 'sent', attempt, accountId: account.id }
+  return {
+    kind: 'sent',
+    attempt,
+    accountId: account.id,
+    ...(decision ? { decision } : {}),
+  }
 }
 
 /** Tells the credits tracker which account served, on the accounts routed over. */

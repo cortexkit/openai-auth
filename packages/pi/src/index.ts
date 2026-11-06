@@ -199,6 +199,10 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
     onContext: (ctx) => {
       refresh = () => ctx.modelRegistry.refresh()
       notify = (message, level) => ctx.ui.notify(message, level)
+      runtime.setWorkingMessage =
+        ctx.hasUI && typeof ctx.ui.setWorkingMessage === 'function'
+          ? (message) => ctx.ui.setWorkingMessage(message)
+          : undefined
     },
   })
   // Startup can move the login before a session context is available. The
@@ -215,6 +219,10 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
     pi.on('session_start', async (_event, ctx) => {
       refresh = () => ctx.modelRegistry.refresh()
       notify = (message, level) => ctx.ui.notify(message, level)
+      runtime.setWorkingMessage =
+        ctx.hasUI && typeof ctx.ui.setWorkingMessage === 'function'
+          ? (message) => ctx.ui.setWorkingMessage(message)
+          : undefined
       void runtime.start()
       try {
         await syncSlot()

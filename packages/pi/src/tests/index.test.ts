@@ -2,6 +2,8 @@ import { describe, expect, it, spyOn } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { type PiSlot, PiSlotError } from '@cortexkit/common-auth/pi-slot'
+import type { ExtensionCommandContext } from '@earendil-works/pi-coding-agent'
+import * as commands from '../commands.ts'
 
 import cortexKitPiOpenAIAuth, { installRawCodexWebSocket } from '../index.ts'
 import { PiOpenAIRuntime } from '../runtime.ts'
@@ -15,6 +17,81 @@ type RegisteredProvider = {
 }
 
 describe('Pi OpenAI auth extension', () => {
+  for (const captureFrom of ['onContext', 'session_start'] as const) {
+    it(`captures the working-message UI from ${captureFrom} and drops it in headless contexts`, async () => {
+      let runtime: PiOpenAIRuntime | undefined
+      let onContext: commands.PiCommandDependencies['onContext']
+      let sessionStart:
+        | ((event: unknown, ctx: ExtensionCommandContext) => Promise<void>)
+        | undefined
+      let shutdown: (() => Promise<void>) | undefined
+      const support = PiOpenAIRuntime.prototype.commandSupport
+      const capture = spyOn(
+        PiOpenAIRuntime.prototype,
+        'commandSupport',
+      ).mockImplementation(function (this: PiOpenAIRuntime) {
+        runtime = this
+        return support.call(this)
+      })
+      const register = spyOn(commands, 'registerCommands').mockImplementation(
+        (_pi, dependencies) => {
+          onContext = dependencies?.onContext
+        },
+      )
+      const sync = spyOn(
+        PiOpenAIRuntime.prototype,
+        'syncVaultSlot',
+      ).mockResolvedValue()
+      const start = spyOn(
+        PiOpenAIRuntime.prototype,
+        'start',
+      ).mockResolvedValue()
+      const messages: Array<string | undefined> = []
+      const ui = {
+        setWorkingMessage(message?: string) {
+          expect(this).toBe(ui)
+          messages.push(message)
+        },
+        notify() {},
+      }
+      const context = {
+        hasUI: true,
+        ui,
+        modelRegistry: {
+          refresh() {},
+          getApiKeyForProvider: async () => undefined,
+        },
+      } as unknown as ExtensionCommandContext
+      try {
+        await cortexKitPiOpenAIAuth({
+          registerCommand() {},
+          registerProvider() {},
+          on(name: string, handler: typeof sessionStart) {
+            if (name === 'session_start') sessionStart = handler
+            if (name === 'session_shutdown') shutdown = handler as never
+          },
+        } as never)
+        expect(runtime).toBeDefined()
+        expect(runtime?.setWorkingMessage).toBeUndefined()
+        const captureUi = async (ctx: ExtensionCommandContext) => {
+          if (captureFrom === 'onContext') onContext?.(ctx)
+          else await sessionStart?.({}, ctx)
+        }
+        await captureUi(context)
+        runtime?.setWorkingMessage?.('waiting')
+        runtime?.setWorkingMessage?.()
+        expect(messages).toEqual(['waiting', undefined])
+        await captureUi({ ...context, hasUI: false })
+        expect(runtime?.setWorkingMessage).toBeUndefined()
+      } finally {
+        await shutdown?.()
+        capture.mockRestore()
+        register.mockRestore()
+        sync.mockRestore()
+        start.mockRestore()
+      }
+    })
+  }
   for (const operation of ['inspect', 'enterVault', 'exitVault'] as const) {
     it(`owns ${operation} lock-compromised at startup, session start and a background tick`, async () => {
       const failure = new PiSlotError('lock-compromised')

@@ -17,6 +17,7 @@ import {
   ClaustrumConsumer,
   readClaustrumEnrollmentToken,
 } from '@cortexkit/common-auth/claustrum'
+import type { PolicyFacts } from '@cortexkit/common-auth/limits'
 import { projectQuota } from '@cortexkit/common-auth/quota'
 import {
   type AccountPaths,
@@ -199,6 +200,46 @@ function enroll() {
 }
 
 describe('Pi and the Claustrum vault', () => {
+  test('vault activity and response evidence share the core route incarnation', async () => {
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+    })
+    enroll()
+    const target = vault()
+    const facts: PolicyFacts[] = []
+    const runtime = new PiOpenAIRuntime({
+      streamSimple,
+      createStream: createAssistantMessageEventStream,
+      paths: () => paths,
+      vault: target,
+      fetchImpl: fakeFetch,
+      firstReadingWaitMs: 0,
+      onLimitDecision(_decision, value) {
+        facts.push(value)
+      },
+    })
+    try {
+      await target.refresh()
+      await target.pollStale(0)
+      await send(runtime, { sessionId: 'session-1' })
+      const route = target.snapshot()!.rows[0]!
+      const activity = runtime.activity.get('session-1')!
+      expect(activity.accountKey.accountId).toBe(route.routeId)
+      expect(activity.accountKey.incarnation).toBe(String(route.addedAt))
+      codexStatus = () => 429
+      codexReplyHeaders = { 'x-codex-primary-used-percent': '99.999' }
+      await send(runtime, { sessionId: 'session-1' })
+      expect(facts).toHaveLength(1)
+      expect(facts[0]?.attempted).toEqual(activity.accountKey)
+      expect(facts[0]?.signal?.windows[0]?.confirmed).toBe(false)
+      expect(facts[0]?.hold).toBeUndefined()
+      expect(facts[0]?.candidates[0]?.confirmedBlockers).toEqual([])
+    } finally {
+      target.close()
+      await runtime.pool.dispose()
+    }
+  })
   for (const throws of [false, true]) {
     test(`vault HTTP reply usage preserves the Pi response when reporter throws ${throws}`, async () => {
       daemon = await startMockDaemon({
