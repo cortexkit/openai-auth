@@ -1,7 +1,9 @@
-import { expect, it } from 'bun:test'
+import { expect, it, spyOn } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { PoolAccountSource } from '../core/pool-account-source'
+import { poolFiles, seedPool } from './fixtures/opencode2-host'
 
 async function scenario(mode: string) {
   const root = mkdtempSync(join(tmpdir(), 'registry-reload-'))
@@ -118,6 +120,62 @@ for (const mode of ['old-vault', 'old-vault-status']) {
     })
   })
 }
+
+it('reloads a newly published pool binding inside the registry fresh interval, not quota-only changes', async () => {
+  const clock = spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
+  const files = poolFiles()
+  seedPool(files, 'main-first', [])
+  const roster = Promise.withResolvers<void>()
+  const source = new PoolAccountSource({
+    paths: files.paths,
+    now: () => 1_700_000_000_000,
+    vaultFirstRoster: roster.promise,
+    refreshProvider: async () => {
+      throw new Error('unexpected refresh')
+    },
+    pullQuota: async () => undefined,
+  })
+  try {
+    await source.limitsForRequest()
+    const owner = source.limitsOwner()!
+    const reload = spyOn(owner.registry!, 'reload')
+    try {
+      seedPool(files, 'main-first', [{ id: 'late' }])
+      const request = await source.limitsForRequest()
+      expect(reload).toHaveBeenCalledTimes(1)
+      const binding = source.limitsBindings()[0]!
+      expect(
+        (await request!.beforeDispatch(binding, () => source.limitsBindings()))
+          .status,
+      ).toBe('ready')
+      reload.mockClear()
+      const probe = owner.observe(binding)!
+      owner.enqueue({
+        type: 'mark',
+        binding,
+        baseRevision: probe.baseRevision,
+        producerId: 'reload-test',
+        operationId: 'mark',
+        scope: { kind: 'pool' },
+        window: 'account',
+        cause: 'rate-limit',
+        until: Date.now() + 120_000,
+        evidenceAt: Date.now(),
+        mergeLaw: 'max-until',
+      })
+      await owner.flush()
+      await source.limitsForRequest()
+      expect(reload).not.toHaveBeenCalled()
+    } finally {
+      reload.mockRestore()
+    }
+  } finally {
+    await source.dispose()
+    roster.resolve()
+    clock.mockRestore()
+    rmSync(files.dir, { recursive: true, force: true })
+  }
+})
 
 it('ignores pre-reservation pin ledgers without calling or replacing them', async () => {
   const { result } = await scenario('old-pins')

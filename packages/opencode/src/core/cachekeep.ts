@@ -20,14 +20,22 @@ import {
   normalizeCacheKeepWindow,
 } from '@cortexkit/common-auth/cachekeep'
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
+import type {
+  AccountKey,
+  SessionActivityStore,
+} from '@cortexkit/common-auth/limits'
 import {
   type AccountStorage,
+  ttlForModel as coreTtlForModel,
   extractAccountIdFromClaims,
+  is30MinCacheSupportedModel,
   normalizeQuotaHeaders,
   type OpenAiVault,
   parseJwtClaims,
+  recordSessionCompletion,
   redactCredentialError,
   redactCredentialResponse,
+  type SessionDispatch,
 } from '@cortexkit/openai-auth-core/internal'
 import { sanitizeHttpFallbackInit } from '../codex-http'
 import {
@@ -146,10 +154,7 @@ export function getCacheKeepWindow(
 // Per-model profile
 // ---------------------------------------------------------------------------
 
-// OpenAI guarantees a cached prompt for 30 minutes on gpt-5.6 and later models
-// and for 5 minutes on older ones. It often keeps one longer, but that is best
-// effort, so a warm is timed against the guarantee: just before 30 minutes on
-// these models instead of every 5.
+// Schedule against the conservative model TTL, not longer observed cache tails.
 const THIRTY_MIN_CACHE_TTL_MS = 30 * 60 * 1000
 // Subagent sessions are short-lived: two ~30-min warms give about an hour of
 // cache coverage without over-warming a one-off session.
@@ -161,40 +166,13 @@ const THIRTY_MIN_CACHE_SUBAGENT_MAX_WARMS = 2
 const THIRTY_MIN_CACHE_SUBAGENT_MAX_IDLE_MS =
   2 * THIRTY_MIN_CACHE_TTL_MS + 15 * 60 * 1000
 
-// The model's version, read as numbers from the start of its id
-// (`gpt-6-astra` is 6.0, `gpt-6.1-sol` is 6.1). It must be followed by the end
-// of the id or a dash, so an id like `gpt-5.6x` or `legacy-gpt-5.6` doesn't
-// count.
-const MODEL_VERSION = /^gpt-(\d+)(?:\.(\d+))?(?:-|$)/
-
-/**
- * Whether the request body asks a model whose cached prompt OpenAI guarantees
- * for 30 minutes: gpt-5.6 and every later model.
- */
-function is30MinCacheSupportedModel(bodyText: string): boolean {
-  try {
-    const parsed = JSON.parse(bodyText) as Record<string, unknown>
-    const model = parsed.model
-    if (typeof model !== 'string') return false
-    const match = MODEL_VERSION.exec(model)
-    if (!match) return false
-    const major = Number(match[1])
-    const minor = match[2] === undefined ? 0 : Number(match[2])
-    return major > 5 || (major === 5 && minor >= 6)
-  } catch {
-    return false
-  }
-}
-
 export function ttlForModel(bodyText: string, defaultTtlMs: number): number {
-  return is30MinCacheSupportedModel(bodyText)
-    ? THIRTY_MIN_CACHE_TTL_MS
-    : defaultTtlMs
+  return coreTtlForModel(bodyText, defaultTtlMs)
 }
 
 /**
  * The per-target overrides for a captured request: a model with the 30-minute
- * cache guarantee gets that lifetime, and a subagent on one is retired after
+ * policy TTL gets that lifetime, and a subagent on one is retired after
  * two warms with an idle bound long enough for both. Everything else keeps
  * the manager's defaults.
  */
@@ -379,6 +357,15 @@ export interface CacheKeepCredentialCheck {
 
 export interface OpenAICacheKeepAdapterBaseOptions {
   fetchImpl: typeof fetch
+  /** Session policy activity is committed only after a successful warm is consumed. */
+  activity?: {
+    store: SessionActivityStore
+    /** Current session binding, including whether its account was replaced; never derive it from a bearer alone. */
+    accountKey: (
+      check: CacheKeepCredentialCheck,
+    ) => AccountKey | undefined | Promise<AccountKey | undefined>
+  }
+  now?: () => number
   /**
    * Called with each warm's fresh credential just before the warm is sent.
    * A throw sends nothing and backs the target off, unless the callback has
@@ -454,14 +441,24 @@ export function createOpenAICacheKeepAdapter(
       ) => {
         // Stopped, or the warm timed out, while the token resolved: send nothing.
         signal.throwIfAborted()
-        if (options.verifyCredential)
-          await options.verifyCredential({
-            target,
-            mode: vaultAttempt ? 'vault' : 'local',
-            identity:
-              (vaultAttempt ? vaultAttempt.accountIdentity : localIdentity) ??
-              identityOfToken(accessToken),
-          })
+        const check: CacheKeepCredentialCheck = {
+          target,
+          mode: vaultAttempt ? 'vault' : 'local',
+          identity:
+            (vaultAttempt ? vaultAttempt.accountIdentity : localIdentity) ??
+            identityOfToken(accessToken),
+        }
+        await options.verifyCredential?.(check)
+        const accountKey = await options.activity?.accountKey(check)
+        signal.throwIfAborted()
+        const dispatched: SessionDispatch | undefined = accountKey
+          ? {
+              sessionId: target.meta.routingSessionId ?? target.sessionKey,
+              accountKey,
+              dispatchedAt: (options.now ?? Date.now)(),
+              ttlMs: ttlForModel(target.bodyText, target.ttlMs),
+            }
+          : undefined
 
         const headers: Record<string, string> = {
           ...target.meta.replayHeaders,
@@ -512,10 +509,52 @@ export function createOpenAICacheKeepAdapter(
               vaultAttempt,
             )
           // The shared manager reads and logs diagnostics after this attempt's token leaves scope.
-          return await redactCredentialResponse(
+          const redacted = await redactCredentialResponse(
             response,
             accessToken,
             'event-stream',
+          )
+          if (!redacted.ok || !dispatched || !options.activity) return redacted
+          const activity = options.activity
+          const accept = async () => {
+            const active = await activeAccount?.(target.meta.routingSessionId)
+            if (activeAccount && active !== target.accountId) return
+            const current = await activity.accountKey(check)
+            recordSessionCompletion(activity.store, dispatched, current, {
+              kind: 'keep-warm',
+              status: redacted.status,
+              aborted: signal.aborted,
+            })
+          }
+          if (!redacted.body) {
+            await accept()
+            return redacted
+          }
+          // Completion, not response headers, accepts the warm. A cancelled or
+          // failed body must not extend the session's cache lifetime.
+          const reader = redacted.body.getReader()
+          return new Response(
+            new ReadableStream({
+              async pull(controller) {
+                try {
+                  const chunk = await reader.read()
+                  if (chunk.done) {
+                    await accept()
+                    controller.close()
+                  } else controller.enqueue(chunk.value)
+                } catch (error) {
+                  controller.error(error)
+                }
+              },
+              cancel(reason) {
+                return reader.cancel(reason)
+              },
+            }),
+            {
+              status: redacted.status,
+              statusText: redacted.statusText,
+              headers: redacted.headers,
+            },
           )
         } catch (error) {
           throw redactCredentialError(error, accessToken)
@@ -619,6 +658,7 @@ export function createCacheKeepManager(
     codexResponsesUrl,
     activeAccount,
     verifyCredential,
+    activity,
     logger,
     ...managerOptions
   } = options
@@ -639,6 +679,8 @@ export function createCacheKeepManager(
       codexResponsesUrl,
       activeAccount,
       verifyCredential,
+      activity,
+      now: options.now,
       logger,
     }),
   })

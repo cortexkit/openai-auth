@@ -13,6 +13,14 @@ The Cache section of the plugin's [`/openai` slash-command menu](commands.md#the
 
 The Cache section also shows its timer, tracked sessions and prompt-cache lifetime (TTL).
 
+The same conservative model TTL also bounds same-account quota waits. A successful
+2xx keep-warm counts as activity for the session it was scheduled to warm, using
+the dispatch time rather than the time the response finishes. Rejected, failed or
+cancelled warms do not extend that activity, nor does a warm whose session has
+changed accounts or whose account has been replaced before acceptance. Observed
+cache hits beyond the policy TTL do not extend it; the TTL is a routing bound,
+not a promise about how long the provider retains a cached prompt.
+
 ## OpenCode 2's own warming
 
 The plugin's warming is invisible: it adds no message, visible answer or tool call, and the next turn does not include the warm's answer. OpenCode 2's built-in `warming` setting instead sends a keep-alive message that the model can see. Both can be on without double warming: when OpenCode sends its keep-alive, the plugin stops tracking that session until its next real request. If you turn off OpenCode's warming, the plugin waits for the session's next real request before warming it again.

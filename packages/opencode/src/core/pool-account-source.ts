@@ -26,11 +26,11 @@
 //   it holds), and admission asks for another whenever it refuses a row for
 //   want of one.
 //
-// State that belongs to an account (rate-limit marks, pending quota) is keyed
-// by the row's wire identity where the row records one, so a row that comes
-// to hold a different account never inherits the old account's state.
+// The shared limits seam is acquired only by owned requests. Provider-state
+// writes remain attributed to the credential that produced the observation.
 
 import { readFileSync } from 'node:fs'
+import type { IdentityBinding } from '@cortexkit/common-auth/limits'
 import {
   isQuotaMap,
   projectQuota,
@@ -49,6 +49,7 @@ import {
   type AccountPaths,
   type AccountStorage,
   poolAccountKey as accountKey,
+  acquireOpenAiLimits,
   applyPendingPoolObservations,
   type PoolRefreshBackoff as BackoffEntry,
   extractAccountIdFromClaims,
@@ -56,9 +57,12 @@ import {
   hashRefreshToken,
   mergePoolObservation,
   nextPoolRefreshBackoff,
+  type OpenAiLimitsOwner,
+  type OpenAiLimitsRequest,
   poolOAuthAccess as oauthAccess,
   type PoolPendingObservation as PendingObservation,
   parseJwtClaims,
+  poolLimitsBinding,
   poolRefreshBackoffFor,
   refreshBackoffActive,
   refreshBeforeExpiryMs,
@@ -251,7 +255,9 @@ export class PoolAccountSource {
     readAt: 0,
   }
   private inflightRead: { key: string; promise: Promise<Snapshot> } | undefined
-  private store: { configPath: string; store: PoolStore } | undefined
+  private store:
+    | { configPath: string; statePath: string; store: PoolStore }
+    | undefined
   private readonly stores = new Set<PoolStore>()
   private disposal: Promise<void> | undefined
   private readonly refreshing = new Map<string, Promise<void>>()
@@ -269,6 +275,10 @@ export class PoolAccountSource {
   >()
   private readonly pending = new Map<string, PendingObservation[]>()
   private readonly writes = new Map<string, Promise<void>>()
+  private limits: { key: string; owner: OpenAiLimitsOwner } | undefined
+  private readonly retiredLimits: Promise<void>[] = []
+  // Legacy in-memory mark store, still read by the OpenCode 1 and 2 request paths.
+  // Remove it once both hosts use the shared limits seam.
   private readonly marks: Map<string, number>
   private readonly lastPull = new Map<string, number>()
   private readonly quotaPulls = new Map<
@@ -370,7 +380,11 @@ export class PoolAccountSource {
   }
 
   private storeFor(paths: AccountPaths): PoolStore {
-    if (this.store?.configPath === paths.configPath) return this.store.store
+    if (
+      this.store?.configPath === paths.configPath &&
+      this.store.statePath === paths.statePath
+    )
+      return this.store.store
     const store = openPoolStore({
       provider: 'openai',
       configPath: paths.configPath,
@@ -408,7 +422,11 @@ export class PoolAccountSource {
           )
       },
     })
-    this.store = { configPath: paths.configPath, store }
+    this.store = {
+      configPath: paths.configPath,
+      statePath: paths.statePath,
+      store,
+    }
     this.stores.add(store)
     return store
   }
@@ -698,6 +716,60 @@ export class PoolAccountSource {
   // -------------------------------------------------------------------------
   // Rate-limit marks
   // -------------------------------------------------------------------------
+
+  /** Consumer bindings only: quota and mark changes do not change this projection. */
+  limitsBindings(): IdentityBinding[] {
+    const namespace = this.limits?.owner.namespace
+    if (!namespace || !this.snapshot.active || this.deps.vaultMode?.())
+      return []
+    return this.snapshot.rows.flatMap((row) => {
+      const binding = poolLimitsBinding(namespace, row)
+      return binding ? [binding] : []
+    })
+  }
+
+  limitsBinding(row: PoolRow): IdentityBinding | undefined {
+    const namespace = this.limits?.owner.namespace
+    return namespace ? poolLimitsBinding(namespace, row) : undefined
+  }
+
+  /** Lazy acquisition belongs to an owned request, never a background load/poll. */
+  async limitsForRequest(): Promise<OpenAiLimitsRequest | undefined> {
+    if (this.disposed) return undefined
+    const authority = await this.deps.vaultAuthority?.()
+    if (authority !== undefined && authority !== 'local') return undefined
+    if (this.disposed || this.deps.vaultMode?.()) return undefined
+    // Join the first read, rather than letting the hot-path read budget turn a
+    // present but not-yet-loaded pool into an empty first request.
+    const view = await this.load()
+    if (
+      this.deps.vaultAuthority &&
+      (await this.deps.vaultAuthority()) !== 'local'
+    )
+      return undefined
+    if (!view.active || this.disposed || this.deps.vaultMode?.())
+      return undefined
+    const paths = this.deps.paths()
+    const key = JSON.stringify([paths.configPath, paths.statePath])
+    if (this.limits?.key !== key) {
+      if (this.limits) this.retiredLimits.push(this.limits.owner.dispose())
+      this.limits = {
+        key,
+        owner: acquireOpenAiLimits({
+          source: { kind: 'pool', ...paths, store: this.poolStore() },
+          log: (message) => this.log.warn(message),
+        }),
+      }
+    }
+    const request = await this.limits.owner.forRequest(true)
+    await request.reloadForBindings(() => this.limitsBindings())
+    return request
+  }
+
+  /** Shared authority for host command/recovery bridges; absent before readiness. */
+  limitsOwner(): OpenAiLimitsOwner | undefined {
+    return this.limits?.owner
+  }
 
   /** Marks a row's account rate-limited until `untilMs` (a WebSocket signal). */
   markRateLimited(rowId: string, untilMs: number): void {
@@ -1060,6 +1132,7 @@ export class PoolAccountSource {
     this.disposed = true
     this.disposal ??= (async () => {
       await Promise.allSettled([...this.writes.values()])
+      await Promise.all([...this.retiredLimits, this.limits?.owner.dispose()])
       await Promise.all([...this.stores].map((store) => store.close()))
     })()
     return this.disposal

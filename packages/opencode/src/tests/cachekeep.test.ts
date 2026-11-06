@@ -2,12 +2,14 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createSessionActivityStore } from '@cortexkit/common-auth/limits'
 import type { AccountStorage } from '@cortexkit/openai-auth-core/internal'
 import { getConfigPath } from '../config'
 import {
   buildKeepwarmBody,
   buildKeepwarmCapture,
   createCacheKeepManager,
+  createOpenAICacheKeepAdapter,
   getCacheKeepWindow,
   openaiCacheKeepProfile,
   routedAccountForSession,
@@ -51,6 +53,203 @@ function fakeNow() {
 const CODEX_URL = 'https://chatgpt.com/backend-api/codex/responses'
 const TTL_MS = 5 * 60 * 1000 // 5 min
 const LEAD_MS = 5 * 1000 // 5 s lead
+
+describe('keep-warm session activity', () => {
+  function warmFixture() {
+    const clock = fakeNow()
+    const store = createSessionActivityStore()
+    const key = { namespace: 'pool-test', accountId: 'a', incarnation: '1' }
+    const target = {
+      sessionKey: 'wire-thread',
+      accountId: 'a',
+      bodyText: '{"model":"gpt-5.6"}',
+      isSubagent: false,
+      warmCount: 0,
+      ttlMs: 1_800_000,
+      meta: { replayHeaders: {}, routingSessionId: 'scheduled-session' },
+    }
+    let current: typeof key | undefined = key
+    let active: string | undefined = 'a'
+    const options = {
+      now: clock.now,
+      activity: { store, accountKey: () => current },
+      activeAccount: async () => active,
+      getMainToken: async () => 'main-token',
+      refreshFallback: async () => ({
+        token: 'sent-a-token',
+        identity: 'chatgpt-a',
+      }),
+      codexResponsesUrl: CODEX_URL,
+    }
+    return {
+      clock,
+      store,
+      key,
+      target,
+      options,
+      change: (accountId: string, incarnation = '1') => {
+        current = { ...key, accountId, incarnation }
+        active = accountId
+      },
+    }
+  }
+
+  test('an accepted 2xx warm records its scheduled session at dispatch, not completion', async () => {
+    const f = warmFixture()
+    const adapter = createOpenAICacheKeepAdapter({
+      ...f.options,
+      fetchImpl: mock(async (_url, init) => {
+        expect(new Headers(init?.headers).get('authorization')).toBe(
+          'Bearer sent-a-token',
+        )
+        f.clock.advance(240_000)
+        return new Response('{}')
+      }) as unknown as typeof fetch,
+    })
+    const response = await adapter.send({
+      target: f.target,
+      body: '{}',
+      signal: new AbortController().signal,
+    })
+    expect(f.store.size).toBe(0)
+    await response.text()
+    expect(f.store.get('scheduled-session')).toEqual({
+      accountKey: f.key,
+      lastAcceptedAt: 1_700_000_000_000,
+      ttlMs: 1_800_000,
+    })
+    expect(f.store.get('wire-thread')).toBeUndefined()
+  })
+
+  test('the manager forwards its clock and session activity to a successful scheduled warm', async () => {
+    const f = warmFixture()
+    const manager = createCacheKeepManager({
+      ...f.options,
+      leadMs: LEAD_MS,
+      fetchImpl: mock(
+        async () => new Response('{}'),
+      ) as unknown as typeof fetch,
+    })
+    try {
+      manager.track(f.target)
+      f.clock.advance(1_795_000)
+      await manager.tick()
+      expect(f.store.get('scheduled-session')).toEqual({
+        accountKey: f.key,
+        lastAcceptedAt: 1_700_001_795_000,
+        ttlMs: 1_800_000,
+      })
+    } finally {
+      manager.stop()
+    }
+  })
+
+  for (const failure of [
+    'rejected',
+    'fetch-failed',
+    'body-failed',
+    'cancelled',
+    'account-changed',
+    'epoch-changed',
+    'routing-changed',
+  ]) {
+    test(`${failure} keep-warm records no session activity`, async () => {
+      const f = warmFixture()
+      const abort = new AbortController()
+      const adapter = createOpenAICacheKeepAdapter({
+        ...f.options,
+        activeAccount:
+          failure === 'routing-changed'
+            ? async () => 'b'
+            : f.options.activeAccount,
+        verifyCredential: () => {
+          if (failure === 'rejected') throw new Error('rejected')
+        },
+        fetchImpl: mock(async () => {
+          if (failure === 'fetch-failed') throw new Error('failed')
+          if (failure === 'body-failed')
+            return new Response(
+              new ReadableStream({
+                start(controller) {
+                  controller.error(new Error('failed body'))
+                },
+              }),
+            )
+          return new Response('{}')
+        }) as unknown as typeof fetch,
+      })
+      try {
+        const response = await adapter.send({
+          target: f.target,
+          body: '{}',
+          signal: abort.signal,
+        })
+        if (failure === 'cancelled') abort.abort()
+        if (failure === 'account-changed') f.change('b')
+        if (failure === 'epoch-changed') f.change('a', '2')
+        await response.text()
+      } catch (error) {
+        expect([
+          'rejected',
+          'fetch-failed',
+          'body-failed',
+          'cancelled',
+        ]).toContain(failure)
+        expect(error).toBeDefined()
+      }
+      expect(f.store.size).toBe(0)
+    })
+  }
+
+  for (const status of [401, 429, 500]) {
+    test(`HTTP ${status} keep-warm records no session activity`, async () => {
+      const f = warmFixture()
+      const adapter = createOpenAICacheKeepAdapter({
+        ...f.options,
+        fetchImpl: mock(
+          async () => new Response('{}', { status }),
+        ) as unknown as typeof fetch,
+      })
+      await (
+        await adapter.send({
+          target: f.target,
+          body: '{}',
+          signal: new AbortController().signal,
+        })
+      ).text()
+      expect(f.store.size).toBe(0)
+    })
+  }
+
+  test('an older warm cannot overwrite a newer accepted dispatch', async () => {
+    const f = warmFixture()
+    const adapter = createOpenAICacheKeepAdapter({
+      ...f.options,
+      fetchImpl: mock(
+        async () => new Response('{}'),
+      ) as unknown as typeof fetch,
+    })
+    const response = await adapter.send({
+      target: f.target,
+      body: '{}',
+      signal: new AbortController().signal,
+    })
+    f.store.recordAccepted({
+      sessionId: 'scheduled-session',
+      accountKey: f.key,
+      currentAccountKey: f.key,
+      lastAcceptedAt: 1_700_000_060_000,
+      ttlMs: 300_000,
+    })
+    await response.text()
+    expect(f.store.get('scheduled-session')!.lastAcceptedAt).toBe(
+      1_700_000_060_000,
+    )
+    expect(f.store.get('scheduled-session')!.ttlMs).toBe(300_000)
+    f.store.forgetSession('scheduled-session')
+    expect(f.store.size).toBe(0)
+  })
+})
 
 // ---------------------------------------------------------------------------
 // buildKeepwarmBody
