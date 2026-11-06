@@ -1535,7 +1535,7 @@ export async function CodexAuthPlugin(
   return {
     async dispose() {
       await limitSource?.dispose()
-      vaultLease.release()
+      await vaultLease.release()
       poolLifecycle?.dispose()
       await poolAccountSource?.dispose()
       backgroundQuotaRefresh.stop()

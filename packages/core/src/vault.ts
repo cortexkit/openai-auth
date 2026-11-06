@@ -1086,6 +1086,12 @@ export class OpenAiVault {
     this.#firstRoster.resolve()
     this.#consumer.close()
   }
+
+  /** Join the consumer's bounded drain so a restart cannot inherit a half-written lease. */
+  async dispose(): Promise<void> {
+    this.close()
+    await this.#consumer.dispose()
+  }
 }
 
 function latestReadingAt(quota: QuotaMap | undefined): number | undefined {

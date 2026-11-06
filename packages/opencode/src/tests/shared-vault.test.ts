@@ -416,6 +416,80 @@ describe('one host vault per process', () => {
     expect(daemon.connections).toBe(2)
   })
 
+  for (const location of ['primary', 'compatibleV1'] as const) {
+    test(`shares an older ${location} vault and closes it on last release`, async () => {
+      const options = {
+        host: 'opencode' as const,
+        stateDir,
+        connectionFile: () => daemon.connectionFile,
+        pollIntervalMs: 0,
+      }
+      const paths = {
+        configPath: join(dir, 'openai-auth.json'),
+        statePath: join(dir, 'openai-auth-state.json'),
+      }
+      const key = JSON.stringify([
+        options.host,
+        stateDir,
+        daemon.connectionFile,
+        paths.configPath,
+        paths.statePath,
+      ])
+      const registryKey = Symbol.for('@cortexkit/openai-auth/opencode-vaults')
+      const registry = (
+        globalThis as typeof globalThis & {
+          [registryKey]: Map<string, unknown> & {
+            compatibleV1?: Map<string, unknown>
+          }
+        }
+      )[registryKey]
+      let closes = 0
+      const legacy = {
+        protocol: 1,
+        vault: {
+          awaitRequestRoster() {},
+          grantReach() {},
+          reorder() {},
+          close() {
+            closes++
+          },
+        },
+        holders: new Set(),
+        firstRoster: Promise.withResolvers<void>(),
+        started: false,
+      }
+      const primary = location === 'primary' ? legacy : { protocol: 0 }
+      let selected = registry
+      if (location === 'compatibleV1') {
+        registry.compatibleV1 ??= new Map()
+        selected = registry.compatibleV1
+      }
+      registry.set(key, primary)
+      selected.set(key, legacy)
+      const first = acquireOpenCodeVault(options, paths)
+      const second = acquireOpenCodeVault(options, paths)
+      cleanups.push(async () => {
+        await Promise.allSettled([first.release(), second.release()])
+        if (registry.get(key) === primary) registry.delete(key)
+        if (registry.compatibleV1?.get(key) === legacy)
+          registry.compatibleV1.delete(key)
+      })
+      expect<object>(first.vault).toBe(legacy.vault)
+      expect<object>(second.vault).toBe(legacy.vault)
+      expect(selected.get(key)).toBe(legacy)
+      expect(legacy.holders.size).toBe(2)
+      await first.release()
+      expect(closes).toBe(0)
+      expect(legacy.holders.size).toBe(1)
+      await second.release()
+      await second.release()
+      expect(closes).toBe(1)
+      expect(legacy.holders.size).toBe(0)
+      expect(selected.has(key)).toBe(false)
+      if (location === 'compatibleV1') expect(registry.get(key)).toBe(primary)
+    })
+  }
+
   test('leases share the first roster and never consult a released source', async () => {
     let firstReads = 0
     let secondReads = 0

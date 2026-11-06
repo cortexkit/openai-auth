@@ -968,7 +968,7 @@ export async function setupOpenAIAuth(
       ])
     } finally {
       clearTimeout(settleTimer)
-      vaultLease.release()
+      await vaultLease.release()
       await heartbeat?.release()
     }
   }

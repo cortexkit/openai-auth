@@ -127,6 +127,7 @@ export function acquireOpenCodeVault(
   entry.holders.add(holder)
   const owned = entry
   let released = false
+  let disposal: Promise<void> | undefined
   return {
     vault: owned.vault,
     firstRoster: owned.firstRoster.promise,
@@ -157,14 +158,19 @@ export function acquireOpenCodeVault(
       owned.quotaPoll.unref?.()
     },
     release() {
-      if (released) return
+      if (released) return disposal
       released = true
       owned.holders.delete(holder)
       if (owned.holders.size !== 0) return
       if (owned.quotaPoll) clearInterval(owned.quotaPoll)
-      owned.vault.close()
+      // A vault from an older plugin copy may expose close() instead of dispose().
+      disposal =
+        typeof owned.vault.dispose === 'function'
+          ? owned.vault.dispose()
+          : Promise.resolve(owned.vault.close())
       owned.firstRoster.resolve()
       if (!isolated && registry.get(key) === owned) registry.delete(key)
+      return disposal
     },
   }
 }

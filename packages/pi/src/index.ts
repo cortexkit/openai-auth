@@ -214,7 +214,7 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
   if (typeof pi.on === 'function') {
     pi.on('session_shutdown', async () => {
       clearInterval(syncTimer)
-      await runtime.pool.dispose()
+      await Promise.all([runtime.pool.dispose(), runtime.vault.dispose()])
     })
     pi.on('session_start', async (_event, ctx) => {
       refresh = () => ctx.modelRegistry.refresh()
