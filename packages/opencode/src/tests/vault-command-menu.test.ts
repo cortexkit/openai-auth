@@ -596,6 +596,54 @@ describe('vault command menu', () => {
       `${roster[1]!.label} (disabled): ${formatQuota(projectQuota(roster[1]!.quota), { now, form: 'compact' })}`,
     ])
   })
+  test('vault Routing offers same-account wait choices and saves them without changing state bytes', async () => {
+    const command = createOpenCodeMenu(context())
+    const opened = await command.open(invocation)
+    const wait = opened.menu.sections
+      .find((section) => section.id === 'routing')!
+      .actions.find((action) => action.id === 'maxSameAccountWait')
+    expect(wait).toBeDefined()
+    expect({ label: wait!.label, knobs: wait!.knobs }).toEqual({
+      label: 'Longest wait on the same account',
+      knobs: [
+        {
+          kind: 'choice',
+          id: 'maxSameAccountWait',
+          label: 'Longest wait on the same account',
+          choices: [
+            { value: '0', label: "Don't wait" },
+            { value: '15', label: '15 minutes' },
+            { value: 'max', label: 'Until the cache expires' },
+          ],
+          value: '15',
+        },
+      ],
+    })
+    const before = readFileSync(files.stateFile)
+    for (const value of [0, 15, 'max'] as const) {
+      const result = await command.apply(
+        {
+          command: 'openai',
+          sectionId: 'routing',
+          actionId: 'maxSameAccountWait',
+          values: { maxSameAccountWait: String(value) },
+        },
+        invocation,
+      )
+      expect(result.ok).toBe(true)
+      expect(readJson(files.configFile).routing).toEqual(
+        expect.objectContaining({ maxSameAccountWait: value }),
+      )
+      expect(
+        result.menu.sections
+          .find((section) => section.id === 'routing')!
+          .actions.find((action) => action.id === 'maxSameAccountWait')!
+          .knobs?.[0]?.value,
+      ).toBe(String(value))
+      expect(readFileSync(files.stateFile)).toEqual(before)
+    }
+  })
+
   test('vault floors use the request route key and leave credentials untouched', async () => {
     const before = readFileSync(files.stateFile, 'utf8')
     const result = await createOpenCodeMenu(context()).apply(
@@ -644,7 +692,7 @@ describe('vault command menu', () => {
       connected.sections
         .find((section) => section.id === 'routing')!
         .actions.map((action) => action.id),
-    ).toEqual(['mode', 'order'])
+    ).toEqual(['mode', 'order', 'maxSameAccountWait'])
     expect(
       connected.sections
         .find((section) => section.id === 'limits')!

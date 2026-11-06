@@ -363,7 +363,9 @@ export function createVaultCommandMenu(
           view.status.accounts.length > 0 &&
           (slot === 'limits' ||
             (slot === 'routing' &&
-              (action.id === 'mode' || action.id === 'order'))),
+              (action.id === 'mode' ||
+                action.id === 'order' ||
+                action.id === 'maxSameAccountWait'))),
       )
       .map((action) => forwardAction(source, slot, action))
     const mode = section.actions

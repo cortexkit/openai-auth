@@ -335,6 +335,79 @@ describe('Pi and the Claustrum vault', () => {
     }
   })
 
+  test('vault Routing offers same-account wait choices and saves them without changing state bytes', async () => {
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:work': vaultLogin('chatgpt-work') },
+    })
+    const target = vault()
+    const runtime = runtimeWith(target)
+    try {
+      const support = runtime.commandSupport()
+      await support.store().add({
+        id: 'local',
+        credential: {
+          type: 'oauth',
+          access: 'local-access',
+          refresh: 'local-refresh',
+          expires: Date.now() + 3600_000,
+        },
+      })
+      await support.store().pullsSettled()
+      enroll()
+      await target.refresh()
+      const command = createPiMenu(support)
+      const invocation = { notify() {} }
+      const opened = await command.open(invocation)
+      const wait = opened.menu.sections
+        .find((section) => section.id === 'routing')!
+        .actions.find((action) => action.id === 'maxSameAccountWait')
+      expect(wait).toBeDefined()
+      expect({ label: wait!.label, knobs: wait!.knobs }).toEqual({
+        label: 'Longest wait on the same account',
+        knobs: [
+          {
+            kind: 'choice',
+            id: 'maxSameAccountWait',
+            label: 'Longest wait on the same account',
+            choices: [
+              { value: '0', label: "Don't wait" },
+              { value: '15', label: '15 minutes' },
+              { value: 'max', label: 'Until the cache expires' },
+            ],
+            value: '15',
+          },
+        ],
+      })
+      const before = readFileSync(paths.statePath)
+      for (const value of [0, 15, 'max'] as const) {
+        const result = await command.apply(
+          {
+            command: 'openai',
+            sectionId: 'routing',
+            actionId: 'maxSameAccountWait',
+            values: { maxSameAccountWait: String(value) },
+          },
+          invocation,
+        )
+        expect(result.ok).toBe(true)
+        expect(
+          JSON.parse(readFileSync(paths.configPath, 'utf8')).routing
+            .maxSameAccountWait,
+        ).toBe(value)
+        expect(
+          result.menu.sections
+            .find((section) => section.id === 'routing')!
+            .actions.find((action) => action.id === 'maxSameAccountWait')!
+            .knobs?.[0]?.value,
+        ).toBe(String(value))
+        expect(readFileSync(paths.statePath)).toEqual(before)
+      }
+    } finally {
+      target.close()
+    }
+  })
+
   test('vault mode hides local-writing Pi dialog actions and a stale add refuses without changing pool bytes', async () => {
     daemon = await startMockDaemon({
       directory: dir,
@@ -413,7 +486,7 @@ describe('Pi and the Claustrum vault', () => {
         connected
           .find((section) => section.id === 'routing')!
           .actions.map((action) => action.id),
-      ).toEqual(['mode'])
+      ).toEqual(['mode', 'maxSameAccountWait'])
       expect(
         connected
           .find((section) => section.id === 'vault')!
