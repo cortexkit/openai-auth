@@ -200,6 +200,65 @@ function enroll() {
 }
 
 describe('Pi and the Claustrum vault', () => {
+  test('quota hold wake rereads withdrawn vault custody without another wait or local send', async () => {
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+    })
+    enroll()
+    const target = vault()
+    let now = Date.now()
+    const waits: number[] = []
+    const messages: Array<string | undefined> = []
+    await mutateAccounts((storage) => {
+      storage.killswitch = { enabled: false }
+      return storage
+    }, paths)
+    const runtime = new PiOpenAIRuntime({
+      streamSimple,
+      createStream: createAssistantMessageEventStream,
+      paths: () => paths,
+      vault: target,
+      fetchImpl: fakeFetch,
+      firstReadingWaitMs: 0,
+      now: () => now,
+      waitForPi: async (delay) => {
+        waits.push(delay)
+        now += delay
+        delete daemon.credentials['oauth:openai:vault']
+        await target.refresh()
+        return 'elapsed'
+      },
+    })
+    runtime.setWorkingMessage = (message) => {
+      messages.push(message)
+    }
+    try {
+      await target.refresh()
+      await target.pollStale(0)
+      await send(runtime, { sessionId: 'session-1' })
+      codexTokens = []
+      codexStatus = () => 429
+      const reset = Math.floor(now / 1000) + 60
+      codexReplyHeaders = {
+        'x-codex-primary-used-percent': '100',
+        'x-codex-primary-reset-at': String(reset),
+      }
+      const events = await send(runtime, { sessionId: 'session-1' })
+      expect(waits).toHaveLength(1)
+      expect(waits[0]).toBeGreaterThan(59_000)
+      expect(codexTokens).toHaveLength(1)
+      const last = events.at(-1)
+      expect(last?.type).toBe('error')
+      const message = last?.type === 'error' ? last.error.errorMessage : ''
+      expect(message).toContain('vault')
+      expect(message).not.toContain('Retry in')
+      expect(messages.at(-1)).toBeUndefined()
+    } finally {
+      await target.dispose()
+      await runtime.pool.dispose()
+    }
+  })
   test('vault activity and response evidence share the core route incarnation', async () => {
     daemon = await startMockDaemon({
       directory: dir,

@@ -242,7 +242,7 @@ describe('Pi pre-publication policy evidence', () => {
     observations.length = 0
   })
 
-  test('raw body confirmation and headers produce a fitting main hold without changing base fallback', async () => {
+  test('raw body confirmation and headers take the no-hold fallback without captured UI', async () => {
     const now = Date.now()
     const runtime = makeRuntime(0, { now: () => now, onLimitDecision: observe })
     await ready(runtime)
@@ -275,7 +275,8 @@ describe('Pi pre-publication policy evidence', () => {
     expect(events.at(-1)?.type).toBe('done')
     expect(codexTokens()).toEqual([MAIN_TOKEN, ALPHA_TOKEN])
     expect(observations).toHaveLength(1)
-    expect(observations[0]?.decision.action).toBe('hold')
+    expect(observations[0]?.decision.action).toBe('reroute')
+    expect(observations[0]?.facts.hold).toBeUndefined()
     expect(observations[0]?.facts.signal?.windows[0]).toMatchObject({
       confirmed: true,
       resetAt: reset * 1000,
@@ -526,7 +527,7 @@ describe('Pi pre-publication policy evidence', () => {
       apiKey: jwt('acct-main', 'refresh'),
     })
     expect(observations[0]?.facts.attempted).toEqual(activity.accountKey)
-    expect(observations[0]?.decision.action).toBe('hold')
+    expect(observations[0]?.decision.action).toBe('reroute')
     now = dispatchedAt + 300_000
     await send(runtime, {
       sessionId: 'session-1',
@@ -578,7 +579,7 @@ describe('Pi pre-publication policy evidence', () => {
   }
 
   for (const reason of ['usage_limit_reached', 'rate_limit_exceeded']) {
-    test(`ordered no-next ${reason} decides once before publishing the original non-error head`, async () => {
+    test(`ordered no-next ${reason} decides once before publication without UI`, async () => {
       const now = Date.now()
       await store().remove('alpha')
       await store().remove('beta')
@@ -638,11 +639,17 @@ describe('Pi pre-publication policy evidence', () => {
       const first = await stream[Symbol.asyncIterator]().next()
       expect(observations).toHaveLength(1)
       expect(observations[0]?.facts.selection).toBeUndefined()
-      if (reason === 'usage_limit_reached')
-        expect(observations[0]?.decision.action).toBe('hold')
-      else expect(observations[0]?.decision.action).not.toBe('hold')
-      expect(first.value).toEqual(head)
-      expect(JSON.stringify(first.value)).toBe(JSON.stringify(head))
+      if (reason === 'usage_limit_reached') {
+        expect(observations[0]?.decision.action).toBe('refuse')
+        expect(first.value?.type).toBe('error')
+        expect(
+          first.value?.type === 'error' ? first.value.error.errorMessage : '',
+        ).toBe('Every OpenAI account has used up its quota. Resets in 1m.')
+      } else {
+        expect(observations[0]?.decision.action).not.toBe('hold')
+        expect(first.value).toEqual(head)
+        expect(JSON.stringify(first.value)).toBe(JSON.stringify(head))
+      }
       expect(codexTokens()).toEqual([MAIN_TOKEN])
       await runtime.pool.dispose()
       await normal.pool.dispose()

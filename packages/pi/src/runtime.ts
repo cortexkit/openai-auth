@@ -32,11 +32,13 @@ import type {
   LimitSignal,
   PolicyFacts,
 } from '@cortexkit/common-auth/limits'
+import { waitForPi } from '@cortexkit/common-auth/limits'
 import type { PiSlot } from '@cortexkit/common-auth/pi-slot'
 import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
 import {
   type AccountPaths,
   type AccountStorage,
+  buildOpenAiQuotaRefusal,
   classifyOpenAiLimitBody,
   codexRefreshFn,
   createLogger,
@@ -91,6 +93,7 @@ import type {
 import { PiMainAccount } from './main-account.ts'
 import { getPiAccountPaths } from './paths.ts'
 import {
+  type PiWake,
   type RouteAccount,
   type RouteAttempt,
   routablePoolRows,
@@ -140,6 +143,8 @@ export interface PiOpenAIRuntimeDeps {
   slot?: PiSlot
   /** Observe limit decisions before Pi publishes its first event; does not wait. */
   onLimitDecision?(decision: LimitDecision, facts: PolicyFacts): void
+  /** Replaces the cancellable countdown in isolated stream tests. */
+  waitForPi?: typeof waitForPi
 }
 
 /** How many vault tokens are remembered, so a WebSocket frame finds its account. */
@@ -682,34 +687,83 @@ export class PiOpenAIRuntime {
   ): AssistantMessageEventStream {
     const outer = this.deps.createStream()
     const restoreWebSocket = this.deps.installWebSocket?.() ?? (() => {})
+    const setWorkingMessage = this.setWorkingMessage
     void (async () => {
       try {
-        if (
-          (await this.readAuthority()) !== 'local' &&
-          options?.apiKey !== VAULT_PLACEHOLDER_KEY
-        ) {
-          outer.push(errorEvent(model, VAULT_SLOT_REFUSAL))
-          return
-        }
-        const attempt = await this.route(model, context, options)
-        if (attempt.kind === 'blocked') {
-          outer.push(
-            errorEvent(
-              model,
-              attempt.refusal
-                ? vaultModeRefusalText(attempt.refusal, this.vault.name)
-                : blockedMessage(attempt.block),
-            ),
-          )
-          return
-        }
-        if (attempt.head) outer.push(attempt.head)
-        if (attempt.rest) {
-          for (;;) {
-            const next = await attempt.rest.next()
-            if (next.done) break
-            outer.push(next.value)
+        let waited = false
+        let wake: PiWake | undefined
+        for (;;) {
+          if (options?.signal?.aborted) return
+          if (
+            (await this.readAuthority()) !== 'local' &&
+            options?.apiKey !== VAULT_PLACEHOLDER_KEY
+          ) {
+            outer.push(errorEvent(model, VAULT_SLOT_REFUSAL))
+            return
           }
+          const attempt = await this.route(model, context, options, {
+            canWait: !!setWorkingMessage && !waited,
+            wake,
+          })
+          if (options?.signal?.aborted) return
+          if (attempt.kind === 'policy') {
+            const decision = attempt.decision
+            if (decision.action === 'refuse' || waited || !setWorkingMessage) {
+              const refusal = buildOpenAiQuotaRefusal({
+                decision,
+                host: 'pi',
+                now: this.now(),
+              })
+              outer.push(
+                errorEvent(
+                  model,
+                  refusal.kind === 'throw'
+                    ? refusal.error.message
+                    : refusal.body,
+                ),
+              )
+              return
+            }
+            waited = true
+            let result: 'elapsed' | 'aborted'
+            try {
+              result = await (this.deps.waitForPi ?? waitForPi)(
+                decision.delayMs,
+                {
+                  signal: options?.signal,
+                  setWorkingMessage,
+                },
+              )
+            } finally {
+              // A failed wait helper must not leave Pi's working indicator behind.
+              try {
+                setWorkingMessage()
+              } catch {}
+            }
+            if (result === 'aborted' || options?.signal?.aborted) return
+            wake = attempt.wake
+            continue
+          }
+          if (attempt.kind === 'blocked') {
+            outer.push(
+              errorEvent(
+                model,
+                attempt.refusal
+                  ? vaultModeRefusalText(attempt.refusal, this.vault.name)
+                  : blockedMessage(attempt.block),
+              ),
+            )
+            return
+          }
+          if (attempt.head) outer.push(attempt.head)
+          if (attempt.rest) {
+            for (;;) {
+              const next = await attempt.rest.next()
+              if (next.done) break
+              outer.push(next.value)
+            }
+          }
+          return
         }
       } catch (error) {
         outer.push(
@@ -730,9 +784,14 @@ export class PiOpenAIRuntime {
     model: Model<Api>,
     context: Context,
     options: SimpleStreamOptions | undefined,
+    execution: { canWait: boolean; wake?: PiWake },
   ): Promise<
     | ({ kind: 'sent'; decision?: LimitDecision } & StreamAttempt)
     | { kind: 'blocked'; block: PoolBlock; refusal?: VaultModeRefusal }
+    | Extract<
+        Awaited<ReturnType<typeof routePiRequest<StreamAttempt>>>,
+        { kind: 'policy' }
+      >
   > {
     const storage = await this.storage()
     const vaultMode = (await this.readAuthority()) !== 'local'
@@ -746,7 +805,7 @@ export class PiOpenAIRuntime {
         () => false,
       )
     } else {
-      this.main.observeToken(options?.apiKey)
+      if (!execution.wake) this.main.observeToken(options?.apiKey)
       await this.pool.current()
       // Token refreshes of pool rows run in the background, so no request
       // waits on the pool store's locks; a row whose token ran out sits out
@@ -779,6 +838,10 @@ export class PiOpenAIRuntime {
         firstReadingWaitMs:
           this.deps.firstReadingWaitMs ?? FIRST_READING_WAIT_MS,
         limitPolicy: {
+          execute: true,
+          canWait: execution.canWait,
+          wake: execution.wake,
+          effectiveModel: model.id,
           activity: () =>
             options?.sessionId
               ? this.activity.get(options.sessionId)
@@ -787,16 +850,24 @@ export class PiOpenAIRuntime {
             this.deps.onLimitDecision?.(decision, facts),
         },
         send: (account) =>
-          account.vault
-            ? this.vaultAttempt(model, context, options, account.id).then(
-                (attempt) => {
-                  if (!attempt) vaultRefused = true
-                  return attempt
-                },
-              )
-            : account.token
-              ? this.attempt(model, context, options, account.id, account.token)
-              : Promise.resolve(undefined),
+          options?.signal?.aborted
+            ? Promise.resolve(undefined)
+            : account.vault
+              ? this.vaultAttempt(model, context, options, account.id).then(
+                  (attempt) => {
+                    if (!attempt) vaultRefused = true
+                    return attempt
+                  },
+                )
+              : account.token
+                ? this.attempt(
+                    model,
+                    context,
+                    options,
+                    account.id,
+                    account.token,
+                  )
+                : Promise.resolve(undefined),
         placePin: placePiStickyPin,
         creditsServing: this.creditsServing,
         // Only the credits info line: this router's debug lines stay off.
@@ -806,6 +877,7 @@ export class PiOpenAIRuntime {
         },
       })
     const result = await run()
+    if (result.kind === 'policy') return result
     if (result.kind === 'blocked') {
       // Vault mode never falls back to a local account: a request no vault
       // account could take is refused with a fixed text naming the cause.

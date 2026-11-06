@@ -23,12 +23,14 @@
 import {
   type AccountKey,
   createRequestHistory,
+  decideAfterLimit,
   type LimitCandidate,
   type LimitDecision,
   type LimitSignal,
   type PolicyFacts,
   type SessionActivity,
   sameAccount,
+  sameAccountHoldFacts,
 } from '@cortexkit/common-auth/limits'
 import {
   budgetExhaustedResetAt,
@@ -43,6 +45,7 @@ import {
 import {
   type AccountStorage,
   decideOpenAiLimit,
+  decideOpenAiTerminal,
   getFallbackStatuses,
   getKillswitchThresholdsForAccount,
   isTombstoned,
@@ -50,6 +53,8 @@ import {
   type OAuthQuotaSnapshot,
   openAiConfirmedBlockers,
   openAiHoldFacts,
+  openAiLimitAxes,
+  openAiTerminalFacts,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
   type StickyPinPlacement,
@@ -110,7 +115,23 @@ export interface PiLimitPolicy {
   activity(): SessionActivity | undefined
   decide?: typeof decideOpenAiLimit
   onDecision?(decision: LimitDecision, facts: PolicyFacts): void
+  /** Runtime execution is opt-in; callers without it can observe decisions only. */
+  execute?: boolean
+  canWait?: boolean
+  effectiveModel?: string
+  wake?: PiWake
 }
+
+export interface PiWake {
+  facts: NonNullable<PolicyFacts['wake']>
+  identity?: string
+  signal?: LimitSignal
+}
+
+export type PiWaitDecision = Extract<
+  LimitDecision,
+  { action: 'hold' | 'wait-then-reselect' }
+>
 
 export interface PiRouteContext<A extends RouteAttempt> {
   /** The routable accounts as they are now; read again after each response. */
@@ -152,6 +173,11 @@ export interface PiRouteContext<A extends RouteAttempt> {
 export type PiRouteResult<A> =
   | { kind: 'sent'; attempt: A; accountId: string; decision?: LimitDecision }
   | { kind: 'blocked'; block: PoolBlock }
+  | {
+      kind: 'policy'
+      decision: PiWaitDecision | Extract<LimitDecision, { action: 'refuse' }>
+      wake?: PiWake
+    }
 
 /**
  * Pool rows that may serve beside Pi's login: enabled OAuth rows holding a
@@ -195,34 +221,23 @@ export function routablePoolRows<
   })
 }
 
-function afterLimit<A extends RouteAttempt>(
+function policyCandidates<A extends RouteAttempt>(
   ctx: PiRouteContext<A>,
-  attempted: RouteAccount,
-  attempt: A,
-  mode: 'ordered' | 'sticky',
-  next?: string,
-): LimitDecision | undefined {
-  const policy = ctx.limitPolicy
-  const key = attempt.accountKey ?? attempted.accountKey
-  if (!policy || !key || attempt.status === undefined) return undefined
-  // Ordered out-of-list responses bypass even the decision observer.
-  if (
-    mode === 'ordered' &&
-    !getFallbackStatuses(ctx.storage).includes(attempt.status)
-  )
-    return undefined
+  key?: AccountKey,
+  attempt?: RouteAttempt,
+): LimitCandidate[] {
   const now = ctx.now()
   const accounts = ctx.accounts()
   const routing = routingInput(ctx, accounts)
-  const candidates: LimitCandidate[] = accounts.flatMap((account) => {
+  return accounts.flatMap((account) => {
     if (!account.accountKey) return []
-    const ownsAttempt = sameAccount(account.accountKey, key)
+    const ownsAttempt = key && sameAccount(account.accountKey, key)
     const reading = {
       ...windowsFromQuotaMap(account.quota),
-      ...(ownsAttempt ? attempt.reading : undefined),
+      ...(ownsAttempt ? attempt?.reading : undefined),
     }
     const confirmedBlockers = openAiConfirmedBlockers(
-      ownsAttempt ? attempt.signal : undefined,
+      ownsAttempt ? attempt?.signal : undefined,
       reading,
       now,
     )
@@ -254,6 +269,137 @@ function afterLimit<A extends RouteAttempt>(
       },
     ]
   })
+}
+
+function terminalFacts<A extends RouteAttempt>(
+  ctx: PiRouteContext<A>,
+  key?: AccountKey,
+  attempt?: RouteAttempt,
+) {
+  const candidates = policyCandidates(ctx, key, attempt)
+  const activity = ctx.limitPolicy?.activity()
+  return openAiTerminalFacts({
+    accounts: ctx.accounts().flatMap((account) => {
+      if (!account.accountKey) return []
+      const accountKey = account.accountKey
+      const ownsAttempt = key && sameAccount(account.accountKey, key)
+      return [
+        {
+          account: account.accountKey,
+          usable: sendable(account),
+          reading: {
+            ...windowsFromQuotaMap(account.quota),
+            ...(ownsAttempt ? attempt?.reading : undefined),
+          },
+          confirmedBlockers: candidates.find((value) =>
+            sameAccount(value.account, accountKey),
+          )?.confirmedBlockers,
+          floors:
+            ctx.storage?.killswitch?.enabled === true
+              ? getKillswitchThresholdsForAccount(
+                  ctx.storage,
+                  account.id === FORMER_MAIN_ID ? undefined : account.id,
+                )
+              : undefined,
+        },
+      ]
+    }),
+    effectiveModel: ctx.limitPolicy?.effectiveModel ?? '',
+    now: ctx.now(),
+    maxSameAccountWait:
+      ctx.limitPolicy?.canWait === false
+        ? 0
+        : ctx.storage?.routing?.maxSameAccountWait,
+    activity,
+    currentAccountKey: candidates.find(
+      (candidate) =>
+        activity && sameAccount(candidate.account, activity.accountKey),
+    )?.account,
+  })
+}
+
+function baseFacts<A extends RouteAttempt>(
+  ctx: PiRouteContext<A>,
+): PolicyFacts {
+  const now = ctx.now()
+  return {
+    phase: 'pre-send',
+    host: 'pi',
+    now,
+    clockNow: now,
+    sessionId: ctx.sessionId ?? '',
+    requestScope: { kind: 'pool' },
+    history: createRequestHistory({
+      requestId: ctx.sessionId ?? 'request',
+      originalUrl: 'https://chatgpt.com/backend-api/codex/responses',
+      clockNow: now,
+    }),
+    delivery: { owned: true, attributable: true, replayable: true },
+    candidates: policyCandidates(ctx),
+  }
+}
+
+function policyResult<A extends RouteAttempt>(
+  ctx: PiRouteContext<A>,
+  decision: LimitDecision | undefined,
+  signal?: LimitSignal,
+): PiRouteResult<A> | undefined {
+  if (!ctx.limitPolicy?.execute || !decision) return undefined
+  if (decision.action === 'refuse') return { kind: 'policy', decision }
+  if (decision.action !== 'hold' && decision.action !== 'wait-then-reselect')
+    return undefined
+  const key = decision.checkpoint.accountKey
+  return {
+    kind: 'policy',
+    decision,
+    wake: {
+      facts: {
+        checkpoint: decision.checkpoint,
+        target: decision.target,
+        kind: decision.waitKind ?? 'hold',
+      },
+      identity: ctx
+        .accounts()
+        .find(
+          (account) =>
+            account.accountKey && sameAccount(account.accountKey, key),
+        )?.identity,
+      signal: signal && sameAccount(signal.account, key) ? signal : undefined,
+    },
+  }
+}
+
+function terminalResult<A extends RouteAttempt>(
+  ctx: PiRouteContext<A>,
+  key?: AccountKey,
+  attempt?: RouteAttempt,
+): PiRouteResult<A> {
+  const facts = baseFacts(ctx)
+  const decision = decideOpenAiTerminal(facts, terminalFacts(ctx, key, attempt))
+  ctx.limitPolicy?.onDecision?.(decision, facts)
+  const result = policyResult(ctx, decision, attempt?.signal)
+  if (!result) throw new Error('Missing Pi terminal result')
+  return result
+}
+
+function afterLimit<A extends RouteAttempt>(
+  ctx: PiRouteContext<A>,
+  attempted: RouteAccount,
+  attempt: A,
+  mode: 'ordered' | 'sticky',
+  next?: string,
+): LimitDecision | undefined {
+  const policy = ctx.limitPolicy
+  const key = attempt.accountKey ?? attempted.accountKey
+  if (!policy || !key || attempt.status === undefined) return undefined
+  // Ordered out-of-list responses bypass even the decision observer.
+  if (
+    mode === 'ordered' &&
+    !getFallbackStatuses(ctx.storage).includes(attempt.status)
+  )
+    return undefined
+  const now = ctx.now()
+  const candidates = policyCandidates(ctx, key, attempt)
   const candidate = candidates.find((value) => sameAccount(value.account, key))
   const selection = candidates.find((value) => value.account.accountId === next)
   const facts: PolicyFacts = {
@@ -278,7 +424,7 @@ function afterLimit<A extends RouteAttempt>(
       ? { selection: { account: selection.account, pin: 'preserve' } }
       : {}),
     hold:
-      candidate && ctx.sessionId
+      candidate && ctx.sessionId && policy.canWait !== false
         ? openAiHoldFacts({
             candidate,
             status: attempt.status,
@@ -288,11 +434,22 @@ function afterLimit<A extends RouteAttempt>(
           })
         : undefined,
   }
+  // Terminal quota metadata is meaningful only after the configured status gate
+  // and confirmed exhaustion, never for a generic provider error or auth failure.
+  if (
+    policy.execute &&
+    !next &&
+    attempt.status === 429 &&
+    candidate?.confirmedBlockers?.length
+  )
+    Object.assign(facts, { terminal: terminalFacts(ctx, key, attempt) })
   const decision = (policy.decide ?? decideOpenAiLimit)(facts, {
     mode,
     fallbackOn: ctx.storage?.fallbackOn,
   })
   if (decision) policy.onDecision?.(decision, facts)
+  if (policy.execute && decision?.action === 'refuse' && !facts.terminal)
+    return undefined
   return decision
 }
 
@@ -330,6 +487,91 @@ export async function routePiRequest<A extends RouteAttempt>(
     await firstReading
     accounts = ctx.accounts()
   }
+  const policy = ctx.limitPolicy
+  const wake = policy?.wake
+  if (policy?.execute && wake) {
+    const key = wake.facts.checkpoint.accountKey
+    const account = accounts.find(
+      (value) =>
+        value.accountKey &&
+        sameAccount(value.accountKey, key) &&
+        value.identity === wake.identity,
+    )
+    const facts: PolicyFacts = {
+      ...baseFacts(ctx),
+      candidates: policyCandidates(ctx, key, { signal: wake.signal }).map(
+        (candidate) =>
+          sameAccount(candidate.account, key) && !account
+            ? { ...candidate, admitted: false }
+            : candidate,
+      ),
+      wake: wake.facts,
+      hold: account
+        ? sameAccountHoldFacts({
+            activity: policy.activity(),
+            accountKey: key,
+            maxSameAccountWait: ctx.storage?.routing?.maxSameAccountWait,
+          })
+        : undefined,
+    }
+    // The after-limit wrapper suppresses holds without an attempted account.
+    // Waking has no new attempt, so let the decision function check the saved
+    // reset evidence and whether the session's prompt cache remains usable.
+    const decision = policy.decide
+      ? policy.decide(facts, { mode: 'sticky' })
+      : decideAfterLimit(facts, openAiLimitAxes(ctx.storage?.fallbackOn))
+    if (decision) policy.onDecision?.(decision, facts)
+    if (
+      decision?.action === 'retain' &&
+      decision.reason === 'wait-elapsed' &&
+      account
+    ) {
+      const attempt = await ctx.send(account)
+      if (attempt) {
+        const after = afterLimit(
+          ctx,
+          account,
+          attempt,
+          ctx.mode === 'sticky-balanced' ? 'sticky' : 'ordered',
+        )
+        return (
+          policyResult(ctx, after, attempt.signal) ?? {
+            kind: 'sent',
+            attempt,
+            accountId: account.id,
+            decision: after,
+          }
+        )
+      }
+    }
+    // After a capped terminal wait, fresh alternatives may serve; unchanged
+    // exhaustion must finish without another wait or provider request.
+    const current = policyCandidates(ctx, key, { signal: wake.signal })
+    if (current.length && !current.some((candidate) => candidate.ready)) {
+      // Expired response evidence cannot hide a freshly observed later blocker
+      // in the final scan. Reusing the held account still requires the saved
+      // exhaustion windows to match and expire, as checked above.
+      const signal = wake.signal
+        ? {
+            ...wake.signal,
+            windows: wake.signal.windows.filter(
+              (window) =>
+                window.resetAt === undefined || window.resetAt > ctx.now(),
+            ),
+          }
+        : undefined
+      if (terminalFacts(ctx, key, { signal }).messageKey !== 'timed-mark')
+        return terminalResult(ctx, key, { signal })
+    }
+    if (
+      current.some(
+        (candidate) => candidate.ready && !sameAccount(candidate.account, key),
+      )
+    )
+      accounts = accounts.filter(
+        (value) => !value.accountKey || !sameAccount(value.accountKey, key),
+      )
+  }
   if (ctx.mode === 'sticky-balanced' && ctx.sessionId) {
     const sticky = await routeSticky(ctx, accounts, ctx.sessionId)
     if (sticky) return sticky
@@ -352,6 +594,12 @@ async function routeOrdered<A extends RouteAttempt>(
     ctx.log?.debug('pool admission blocked the request', {
       reason: plan.block.reason,
     })
+    if (
+      ctx.limitPolicy?.execute &&
+      (plan.block.reason === 'quota-exhausted' ||
+        plan.block.reason === 'killswitch')
+    )
+      return terminalResult(ctx)
     return { kind: 'blocked', block: plan.block }
   }
   if (plan.lastPath) {
@@ -400,6 +648,8 @@ async function routeOrdered<A extends RouteAttempt>(
     )
     const decision = afterLimit(ctx, account, attempt, 'ordered', next)
     if (decision) last.decision = decision
+    const execution = policyResult(ctx, decision, attempt.signal)
+    if (execution) return execution
   }
   if (last) {
     noteServed(ctx, routing, last.accountId)
@@ -537,8 +787,8 @@ async function routeSticky<A extends RouteAttempt>(
       'sticky',
       alternative?.accountId,
     )
-    // Limit decisions are observations only: keep the status-based routing and
-    // provider event that routing would select without the observer.
+    const execution = policyResult(ctx, decision, attempt.signal)
+    if (execution) return execution
     if (after.action === 'migrate') {
       const from = id
       if (migrate(after.reason) && id !== from) {
