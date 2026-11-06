@@ -13,6 +13,27 @@ import {
   vaultLimitsBinding,
 } from '@cortexkit/openai-auth-core/internal'
 import type { PoolAccountSource } from './pool-account-source'
+import {
+  settlesWithin,
+  VAULT_FIRST_ROSTER_WAIT_MS,
+} from './pool-account-source'
+
+/** Reuse one request deadline; a later readiness step never starts a new wait. */
+export async function withinVaultDeadline<T>(
+  deadline: number,
+  run: () => Promise<T>,
+): Promise<T | undefined> {
+  const remaining = deadline - performance.now()
+  if (remaining <= 0) return undefined
+  let value: T | undefined
+  await settlesWithin(
+    run().then((result) => {
+      value = result
+    }),
+    remaining,
+  )
+  return value
+}
 
 export interface OpenCodeLimitSourceOptions {
   pool: PoolAccountSource
@@ -32,17 +53,37 @@ export class OpenCodeLimitSource {
 
   constructor(private readonly options: OpenCodeLimitSourceOptions) {}
 
-  async forRequest(): Promise<OpenAiLimitsRequest | undefined> {
+  async forRequest(
+    vaultDeadline = performance.now() + VAULT_FIRST_ROSTER_WAIT_MS,
+  ): Promise<OpenAiLimitsRequest | undefined> {
     if (this.disposed) return undefined
-    const authority = await this.options.vault.authority()
-    if (this.disposed || authority === 'unreadable') return undefined
+    const authority = this.options.vault.enrolled()
+      ? await withinVaultDeadline(vaultDeadline, () =>
+          this.options.vault.authority(),
+        )
+      : await this.options.vault.authority()
+    if (this.disposed || !authority || authority === 'unreadable')
+      return undefined
     if (authority === 'local') return this.options.pool.limitsForRequest()
+    return withinVaultDeadline(vaultDeadline, () =>
+      this.vaultRequest(vaultDeadline),
+    )
+  }
+
+  private async vaultRequest(
+    deadline: number,
+  ): Promise<OpenAiLimitsRequest | undefined> {
     await this.options.vault.awaitRequestRoster()
-    if (this.disposed) return undefined
+    if (this.disposed || performance.now() >= deadline) return undefined
     // Enrollment can change while discovery runs. Never acquire a local store
     // on the vault path, even if discovery returns no usable routes.
     if ((await this.options.vault.authority()) !== 'vault') return undefined
-    if (!this.options.vault.snapshot()) return undefined
+    if (this.disposed || performance.now() >= deadline) return undefined
+    if (
+      !this.options.vault.snapshot() ||
+      !this.options.vault.routes().some((route) => route.kind === 'oauth')
+    )
+      return undefined
     this.vaultOwner ??= acquireOpenAiLimits({
       source: {
         kind: 'vault',
@@ -51,7 +92,8 @@ export class OpenCodeLimitSource {
       log: this.options.log,
     })
     const request = await this.vaultOwner.forRequest(true)
-    await request.reloadForBindings(() => this.bindings())
+    if (this.disposed || performance.now() >= deadline) return undefined
+    await request.reloadForBindings(() => this.ownershipBindings())
     return request
   }
 
@@ -67,7 +109,12 @@ export class OpenCodeLimitSource {
     const owner = this.vaultOwner
     if (vault.enrolled()) {
       if (!owner) return []
-      const active = new Set(vault.routes().map((route) => route.id))
+      const active = new Set(
+        vault
+          .routes()
+          .filter((route) => route.kind === 'oauth')
+          .map((route) => route.id),
+      )
       return (vault.snapshot()?.rows ?? []).flatMap((row) =>
         active.has(row.routeId)
           ? [vaultLimitsBinding(owner.namespace, row)]
@@ -77,6 +124,25 @@ export class OpenCodeLimitSource {
     return this.options.pool.limitsBindings()
   }
 
+  /**
+   * Registry reloads compare persisted OAuth ownership, not route eligibility.
+   * Rows excluded from routing remain in the roster the registry reads. Omitting
+   * those rows from this comparison would cause repeated reloads of unchanged
+   * ownership. Only bindings() filters routable accounts, and an empty route
+   * set never starts registry readiness.
+   */
+  ownershipBindings(): IdentityBinding[] {
+    if (this.disposed) return []
+    if (!this.options.vault.enrolled())
+      return this.options.pool.limitsBindings()
+    const owner = this.vaultOwner
+    return owner
+      ? (this.options.vault.snapshot()?.rows ?? [])
+          .filter((row) => row.credentialType === 'oauth')
+          .map((row) => vaultLimitsBinding(owner.namespace, row))
+      : []
+  }
+
   accountKey(accountId: string): AccountKey | undefined {
     return this.bindings().find(
       (binding) => binding.account.accountId === accountId,
@@ -84,7 +150,10 @@ export class OpenCodeLimitSource {
   }
 
   marks(): Map<string, number> {
-    return projectOpenCodeMarks(this.owner()?.snapshot(), this.bindings())
+    const bindings = this.bindings()
+    return bindings.length
+      ? projectOpenCodeMarks(this.owner()?.snapshot(), bindings)
+      : new Map()
   }
 
   forget(sessionId: string): void {

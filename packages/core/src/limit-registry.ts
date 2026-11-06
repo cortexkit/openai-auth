@@ -556,16 +556,22 @@ export class OpenAiLimitsOwner {
 }
 
 /** @internal Isolated clocks and adapter factories keep lifecycle tests deterministic. */
-export function createLimitsLeaseManager(clock: LimitsClock = defaultClock) {
+export function createLimitsLeaseManager(
+  clock: LimitsClock = defaultClock,
+  options: {
+    /** Fresh once-state for isolated tests; production shares its process manager. */
+    droppedSignalLog?: { logged: boolean }
+  } = {},
+) {
   const leases = new Map<string, NamespaceLease>()
-  let dropped = false
+  const droppedSignalLog = options.droppedSignalLog ?? { logged: false }
   return {
     acquire(options: LeaseOptions): OpenAiLimitsOwner {
       let lease = leases.get(options.namespace)
       if (!lease) {
         lease = new NamespaceLease(options, clock, () => {
-          if (dropped) return
-          dropped = true
+          if (droppedSignalLog.logged) return
+          droppedSignalLog.logged = true
           options.log(
             'OpenAI limit signal dropped because timed-mark tracking is unavailable.',
           )

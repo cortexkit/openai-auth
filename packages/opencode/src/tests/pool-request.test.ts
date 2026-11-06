@@ -987,7 +987,10 @@ describe('the killswitch on a migrated install', () => {
         ],
         killswitch,
       )
-      const wire = installWire()
+      // Pin polls so background quota refresh cannot heal the seeded exhaustion.
+      const wire = installWire({
+        usage: () => new Response('', { status: 503 }),
+      })
       const fetchOverride = await loadFetch()
 
       const response = await fetchOverride(URL_RESPONSES, request('s-ks-last'))

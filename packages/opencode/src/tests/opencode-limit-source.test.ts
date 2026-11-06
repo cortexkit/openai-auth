@@ -3,6 +3,7 @@ import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { VaultRosterFile } from '@cortexkit/common-auth/claustrum'
 import * as stores from '@cortexkit/common-auth/store'
+import * as limitsCore from '@cortexkit/openai-auth-core/internal'
 import { OpenCodeLimitSource, projectOpenCodeMarks } from '../core/limit-source'
 import { PoolAccountSource } from '../core/pool-account-source'
 import { poolFiles, seedPool } from './fixtures/opencode2-host'
@@ -89,6 +90,106 @@ function localVault() {
 }
 
 describe('OpenCode limits source', () => {
+  for (const kind of ['disabled', 'cold', 'removed', 'static-key'] as const) {
+    it(`does not acquire or read limits for a ${kind} vault route`, async () => {
+      const { files, create } = setup()
+      const roster: VaultRosterFile = {
+        version: 1,
+        complete: true,
+        declined: [],
+        rows:
+          kind === 'removed'
+            ? []
+            : [
+                {
+                  routeId: 'vault-a',
+                  credentialId: 'credential-a',
+                  credentialType: kind === 'static-key' ? 'api_key' : 'oauth',
+                  accountIdentity: 'chatgpt-vault-a',
+                  state: kind === 'cold' ? 'needs_reauth' : 'active',
+                  label: 'a',
+                  enabled: kind !== 'disabled',
+                  addedAt: 7,
+                },
+              ],
+      }
+      const acquire = spyOn(
+        limitsCore,
+        'acquireOpenAiLimits',
+      ).mockImplementation(() => {
+        throw new Error('ineligible route started a limits read')
+      })
+      const host = new OpenCodeLimitSource({
+        pool: create(),
+        vault: {
+          ...localVault(),
+          authority: async () => 'vault',
+          enrolled: () => true,
+          snapshot: () => roster,
+          routes: () =>
+            kind === 'static-key' ? [{ id: 'vault-a', kind: 'api-key' }] : [],
+          paths: { rosterPath: join(files.dir, 'unused-roster.json') },
+        },
+      })
+      try {
+        expect(await host.forRequest()).toBeUndefined()
+        expect(host.owner()).toBeUndefined()
+        expect(host.marks()).toEqual(new Map())
+        expect(acquire).not.toHaveBeenCalled()
+      } finally {
+        await host.dispose()
+        acquire.mockRestore()
+      }
+    })
+  }
+
+  it('reconciles retained OAuth ownership without waiting for cold or disabled routes to become active', async () => {
+    const { files, create } = setup()
+    const rosterPath = join(files.dir, 'vault-roster.json')
+    const roster: VaultRosterFile = {
+      version: 1,
+      complete: true,
+      declined: [],
+      rows: ['a', 'b', 'c'].map((id, index) => ({
+        routeId: `vault-${id}`,
+        credentialId: `credential-${id}`,
+        credentialType: 'oauth',
+        accountIdentity: `chatgpt-vault-${id}`,
+        state: index === 1 ? 'needs_reauth' : 'active',
+        label: id,
+        enabled: index !== 2,
+        addedAt: 7,
+      })),
+    }
+    writeFileSync(rosterPath, JSON.stringify(roster))
+    const host = new OpenCodeLimitSource({
+      pool: create(),
+      vault: {
+        ...localVault(),
+        authority: async () => 'vault',
+        enrolled: () => true,
+        snapshot: () => roster,
+        routes: () => [{ id: 'vault-a', kind: 'oauth' }],
+        paths: { rosterPath },
+      },
+    })
+    cleanup.push(() => host.dispose())
+    expect(await host.forRequest()).toBeDefined()
+    expect(host.bindings().map((binding) => binding.account.accountId)).toEqual(
+      ['vault-a'],
+    )
+    expect(
+      host.ownershipBindings().map((binding) => binding.account.accountId),
+    ).toEqual(['vault-a', 'vault-b', 'vault-c'])
+    const reload = spyOn(host.owner()!.registry!, 'reload')
+    try {
+      expect(await host.forRequest()).toBeDefined()
+      expect(reload).not.toHaveBeenCalled()
+    } finally {
+      reload.mockRestore()
+    }
+  })
+
   for (const rosterFirst of [true, false]) {
     it(`shares vault readiness with roster ${rosterFirst ? 'before' : 'after'} request initialization and never opens the pool`, async () => {
       const { files, create } = setup()

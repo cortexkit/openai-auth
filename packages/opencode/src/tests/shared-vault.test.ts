@@ -369,6 +369,15 @@ describe('one host vault per process', () => {
     expect(daemon.gets.slice(gets)).toEqual([
       expect.objectContaining({ credential_id: 'oauth:openai:shared' }),
     ])
+    // Startup reads Insula, tries its watch, then reads once after the refused
+    // watch. Wait for those probe sockets to close before counting holders.
+    await waitFor(
+      () =>
+        daemon.insulaOpens >= 3 && daemon.insulaProbeConnections === 0
+          ? true
+          : undefined,
+      'startup Insula probes close',
+    )
     expect(daemon.connections).toBe(1)
     await second.hooks.dispose?.()
     await waitFor(

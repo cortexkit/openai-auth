@@ -8,13 +8,16 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createPoolLimitsAdapter } from '@cortexkit/common-auth/limits'
 import type { AccountStorage } from '@cortexkit/openai-auth-core/internal'
+import * as limitsCore from '@cortexkit/openai-auth-core/internal'
 import type { Hooks, PluginInput } from '@opencode-ai/plugin'
+import { createLimitsLeaseManager } from '../../../core/src/limit-registry'
 import { getAccountStoragePath } from '../core/account-paths'
 import { OpenCodeLimitSource } from '../core/limit-source'
 import { PoolAccountSource } from '../core/pool-account-source'
 import { CodexAuthPlugin } from '../index'
-import { flushForTest } from '../logger'
+import { flushForTest, setLogLevel } from '../logger'
 import { createRequestTestScope } from './request-test-scope'
 
 describe('QuotaManager refresh scheduling', () => {
@@ -746,6 +749,7 @@ describe('OC1 shared limit transport lifecycle', () => {
   async function fixture(
     options: { ws?: boolean; unsupported?: boolean } = {},
   ) {
+    await flushForTest()
     const dir = mkdtempSync(join(tmpdir(), 'oc1-limit-transport-'))
     const config = join(dir, 'accounts.json')
     const state = join(dir, 'state.json')
@@ -898,13 +902,42 @@ describe('OC1 shared limit transport lifecycle', () => {
       '@cortexkit/openai-auth-core/internal'
     )
     const legacySpy = spyOn(QuotaManager.prototype, 'markRateLimited')
+    const isolatedManager = createLimitsLeaseManager(undefined, {
+      droppedSignalLog: { logged: false },
+    })
+    const acquireSpy = options.unsupported
+      ? spyOn(limitsCore, 'acquireOpenAiLimits').mockImplementation((input) => {
+          const { source } = input
+          if (source.kind !== 'pool')
+            throw new Error('unexpected vault limits acquisition')
+          const namespace = limitsCore.poolLimitsNamespace(
+            source.configPath,
+            source.statePath,
+          )
+          const log = input.log ?? (() => {})
+          return isolatedManager.acquire({
+            namespace,
+            adapter: () =>
+              createPoolLimitsAdapter({
+                namespace,
+                store: source.store,
+                logger: { warn: log },
+              }),
+            log,
+            isAccessRestrictive: input.isAccessRestrictive ?? (() => false),
+          })
+        })
+      : undefined
     scope.capturePluginWork()
     let hooks: Hooks | undefined
     cleanup = async () => {
       await hooks?.dispose?.()
+      await flushForTest()
+      setLogLevel(undefined)
       sourceSpy.mockRestore()
       mapSpy.mockRestore()
       legacySpy.mockRestore()
+      acquireSpy?.mockRestore()
       clock.mockRestore()
       globalThis.fetch = originalFetch
       globalThis.WebSocket = originalSocket
@@ -951,6 +984,7 @@ describe('OC1 shared limit transport lifecycle', () => {
       }),
       { id: 'openai', models: [] } as never,
     )
+    setLogLevel('warn')
     const send = (
       loaded as { fetch: (url: string, init: RequestInit) => Promise<Response> }
     ).fetch
@@ -1016,11 +1050,15 @@ describe('OC1 shared limit transport lifecycle', () => {
   })
 
   it('no-registry fallback drops a WS mark and the next request still sends main', async () => {
+    // The log level may already be set to error. The fixture selects warning
+    // after initialization so saved settings cannot suppress its log assertion.
+    setLogLevel('error')
     const f = await fixture({ unsupported: true })
     await expect((await f.request()).text()).rejects.toMatchObject({
       isRetryable: true,
     })
     expect(f.limits().owner()?.registry).toBeUndefined()
+    f.limits().owner()?.dropSignal()
     expect((await f.log()).match(/OpenAI limit signal dropped/g)).toHaveLength(
       1,
     )

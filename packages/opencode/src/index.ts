@@ -122,7 +122,7 @@ import {
   MAIN_REFRESH_LOCK_NAME,
   opencode1SlotForClient,
 } from './core/host-slot'
-import { OpenCodeLimitSource } from './core/limit-source'
+import { OpenCodeLimitSource, withinVaultDeadline } from './core/limit-source'
 import {
   PoolAccountSource,
   settlesWithin,
@@ -3235,6 +3235,8 @@ export async function CodexAuthPlugin(
           vaultReceipt?: QuotaReceipt,
           limitsRequest?: OpenAiLimitsRequest,
           binding?: IdentityBinding,
+          pooled = false,
+          vaultDeadline?: number,
         ): Promise<Response> {
           // Nothing may leave here without a credential. An empty token is
           // always a local defect, but on the wire it becomes `Bearer ` and
@@ -3325,13 +3327,34 @@ export async function CodexAuthPlugin(
           })
           const requestInit = prepared.init
           if (limitsRequest) {
-            const dispatch = await limitsRequest.beforeDispatch(
-              binding,
-              () => limits.bindings(),
-              keepwarmAccountKey,
-            )
-            if (dispatch.status !== 'ready') {
-              return dispatch.status === 'absent' && vaultReceipt
+            const bindingIsActive = () => {
+              if (!binding) return true
+              const current = limits.accountKey(keepwarmAccountKey)
+              return Boolean(current && sameAccount(binding.account, current))
+            }
+            if (!bindingIsActive())
+              return vaultReceipt
+                ? new Response(
+                    vaultModeRefusalText(
+                      vaultModeNoRouteCause(vault),
+                      vault.name,
+                    ),
+                    { status: 401 },
+                  )
+                : killswitchBlockedResponse(null, 'quota-unknown')
+            const check = () =>
+              limitsRequest.beforeDispatch(
+                binding,
+                () => limits.ownershipBindings(),
+                keepwarmAccountKey,
+              )
+            const dispatch =
+              vaultDeadline === undefined
+                ? await check()
+                : await withinVaultDeadline(vaultDeadline, check)
+            const status = bindingIsActive() ? dispatch?.status : 'absent'
+            if (status !== 'ready') {
+              return status === 'absent' && vaultReceipt
                 ? new Response(
                     vaultModeRefusalText(
                       vaultModeNoRouteCause(vault),
@@ -3342,11 +3365,11 @@ export async function CodexAuthPlugin(
                 : killswitchBlockedResponse(null, 'quota-unknown')
             }
           }
-          const owner = limitsRequest ? limits.owner() : undefined
-          const probe = owner?.observe(binding)
+          const owner = pooled ? limits.owner() : undefined
+          const probe = limitsRequest ? owner?.observe(binding) : undefined
           const activityKey =
             binding?.account ??
-            (!limitsRequest
+            (!pooled
               ? limitAccountKey(
                   poolLimitsNamespace(getConfigPath(), getAccountStatePath()),
                   {
@@ -3356,7 +3379,7 @@ export async function CodexAuthPlugin(
                   },
                 )
               : undefined)
-          if (!limitsRequest && activityKey)
+          if (!pooled && activityKey)
             legacyKeys.set(keepwarmAccountKey, activityKey)
           const dispatched: SessionDispatch | undefined =
             sessionID && activityKey && typeof requestInit?.body === 'string'
@@ -3378,7 +3401,7 @@ export async function CodexAuthPlugin(
           const stream = {
             id: keepwarmAccountKey,
             receipt: vaultReceipt,
-            migrated: Boolean(limitsRequest),
+            migrated: pooled,
             owner,
             probe,
             limited: false,
@@ -4570,12 +4593,15 @@ export async function CodexAuthPlugin(
           parentSessionId: string | undefined,
           generation: number,
         ): Promise<Response> {
-          const limitsRequest = await limits.forRequest()
+          const readinessDeadline =
+            performance.now() + VAULT_FIRST_ROSTER_WAIT_MS
+          const limitsRequest = await limits.forRequest(readinessDeadline)
+          const vaultMode = vault.enrolled()
+          const vaultDeadline = vaultMode ? readinessDeadline : undefined
           const expectedBindings = limits.bindings()
           const mode: RoutingMode = reqStorage?.routing?.mode ?? 'main-first'
           // Vault mode routes the vault's accounts alone, so neither the pool
           // row `main` nor OpenCode's slot is read for this request.
-          const vaultMode = vault.enrolled()
           const mainRow = vaultMode
             ? undefined
             : poolSource.peek().rows.find((row) => row.id === 'main')
@@ -4601,10 +4627,10 @@ export async function CodexAuthPlugin(
                   vault: {
                     routes: () => vault.routes(),
                     awaitRoster: async () => {
-                      await settlesWithin(
-                        vault.awaitRequestRoster(),
-                        VAULT_FIRST_ROSTER_WAIT_MS,
-                      )
+                      if (vaultDeadline !== undefined)
+                        await withinVaultDeadline(vaultDeadline, () =>
+                          vault.awaitRequestRoster(),
+                        )
                     },
                     noRouteCause: () => vaultModeNoRouteCause(vault),
                     send: (id, dispatch) =>
@@ -4642,6 +4668,8 @@ export async function CodexAuthPlugin(
                 expectedBindings.find(
                   (binding) => binding.account.accountId === target.id,
                 ),
+                true,
+                vaultDeadline,
               ),
             recordQuota: (served, target, token, attempt) => {
               try {

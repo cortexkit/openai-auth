@@ -50,6 +50,7 @@ import { createAuthMethods } from '../auth/methods'
 import { OPENAI_AGENT_HEADER } from '../codex-request'
 import { applyOpenAiMenu } from '../commands'
 import type { OpenAICacheKeepManager } from '../core/cachekeep'
+import { OpenCodeLimitSource } from '../core/limit-source'
 import { PoolAccountSource } from '../core/pool-account-source'
 import { __menuContextForTest } from '../index.ts'
 import {
@@ -2251,6 +2252,92 @@ describe('routing', () => {
     expect(Date.now() - sending).toBeGreaterThanOrEqual(1_900)
     expect(Date.now() - sending).toBeLessThan(4_000)
   }, 10_000)
+
+  phaseIt(
+    'a vault account removed from active routing during final limits bookkeeping is not sent',
+    async () => {
+      await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
+      enroll()
+      seedPool(files, [{ id: 'main', quota: quotaMap(100) }])
+      const wire = installWire()
+      const { vault } = await plugin()
+      const send = await fetchOverride()
+      const routes = spyOn(vault, 'routes')
+      const forRequest = OpenCodeLimitSource.prototype.forRequest
+      const readiness = spyOn(
+        OpenCodeLimitSource.prototype,
+        'forRequest',
+      ).mockImplementation(async function (
+        this: OpenCodeLimitSource,
+        deadline,
+      ) {
+        const limits = await forRequest.call(this, deadline)
+        if (!limits) throw new Error('limits were not ready')
+        spyOn(limits, 'beforeDispatch').mockImplementation(async () => {
+          routes.mockReturnValue([])
+          return { status: 'ready' }
+        })
+        return limits
+      })
+      try {
+        const response = await request(send)
+        expect(response.status).toBe(401)
+        expect(wire.sends).toEqual([])
+      } finally {
+        readiness.mockRestore()
+        routes.mockRestore()
+      }
+    },
+  )
+
+  phaseIt(
+    'vault limits readiness and final dispatch share one first-roster deadline',
+    async () => {
+      await startDaemon({ 'oauth:openai:vault': vaultLogin('chatgpt-vault') })
+      enroll()
+      seedPool(files, [{ id: 'main', quota: quotaMap(100) }])
+      const wire = installWire()
+      await plugin()
+      const send = await fetchOverride()
+      const pendingDispatch = Promise.withResolvers<{ status: 'ready' }>()
+      const forRequest = OpenCodeLimitSource.prototype.forRequest
+      const readiness = spyOn(
+        OpenCodeLimitSource.prototype,
+        'forRequest',
+      ).mockImplementation(async function (
+        this: OpenCodeLimitSource,
+        deadline,
+      ) {
+        await clock.phase(
+          'limits readiness delay',
+          () => new Promise((resolve) => setTimeout(resolve, 900)),
+        )
+        const limits = await forRequest.call(this, deadline)
+        if (!limits) throw new Error('limits were not ready')
+        spyOn(limits, 'beforeDispatch').mockImplementation(() =>
+          clock.phase(
+            'pending final-dispatch bookkeeping',
+            () => pendingDispatch.promise,
+          ),
+        )
+        return limits
+      })
+      try {
+        const started = performance.now()
+        const response = await clock.phase('bounded vault request', () =>
+          request(send),
+        )
+        const elapsed = performance.now() - started
+        expect(response.status).toBe(429)
+        expect(wire.sends).toEqual([])
+        expect(elapsed).toBeGreaterThanOrEqual(1_900)
+        expect(elapsed).toBeLessThan(2_600)
+      } finally {
+        pendingDispatch.resolve({ status: 'ready' })
+        readiness.mockRestore()
+      }
+    },
+  )
 
   phaseIt(
     'a static OpenAI API key in the vault is never listed, read, routed or reported',

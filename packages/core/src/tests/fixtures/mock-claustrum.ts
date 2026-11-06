@@ -143,6 +143,8 @@ export interface MockDaemon {
   outageCalls: string[]
   /** Live transport connections, for consumer lifecycle assertions. */
   readonly connections: number
+  /** Live sockets that requested an Insula route, including refused probes. */
+  readonly insulaProbeConnections: number
   onReport?: (report: MockReport) => void
   approve(requestId: string, token?: string, generation?: number): void
   deny(requestId: string): void
@@ -175,6 +177,7 @@ export async function startMockDaemon(input: {
   const category = input.category ?? 'openai-native'
   const adapter = input.refreshAdapter ?? 'openai'
   const sockets = new Set<Socket>()
+  const insulaSockets = new Set<Socket>()
   const enrollments = new Map<
     string,
     {
@@ -223,6 +226,9 @@ export async function startMockDaemon(input: {
     ...(input.grants !== undefined && { grants: input.grants }),
     get connections() {
       return sockets.size
+    },
+    get insulaProbeConnections() {
+      return insulaSockets.size
     },
     approve(requestId, token = 'ab'.repeat(32), generation = 1) {
       const entry = enrollments.get(requestId)
@@ -432,6 +438,7 @@ export async function startMockDaemon(input: {
     sockets.add(socket)
     socket.once('close', () => {
       sockets.delete(socket)
+      insulaSockets.delete(socket)
       dropWatches(socket)
     })
     socket.on('error', () => {})
@@ -518,6 +525,7 @@ export async function startMockDaemon(input: {
           if (request.op === 'route.open') {
             const insulaRoute = request.target?.module_id === 'insula'
             if (insulaRoute) {
+              insulaSockets.add(socket)
               state.insulaOpens++
               if (!state.insula || state.insula.refusal) {
                 writeResponse(
