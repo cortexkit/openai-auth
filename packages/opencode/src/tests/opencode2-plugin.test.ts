@@ -1231,6 +1231,19 @@ describe('OpenCode 2 adapter: event rules', () => {
         reason: 'usage_limit_reached',
         status: 429,
         retryAfterMs: expect.any(Number),
+        resetAt: expect.any(Number),
+        resetSource: 'provider',
+        observedAt: now,
+        windows: [
+          {
+            window: 'usage',
+            confirmed: true,
+            confirmedByReading: false,
+            observedAt: now,
+            provenance: 'provider',
+            resetAt: expect.any(Number),
+          },
+        ],
       },
     })
     const limited = inspectCodexEvent(
@@ -1251,7 +1264,21 @@ describe('OpenCode 2 adapter: event rules', () => {
         }),
         now,
       ),
-    ).toEqual({ limit: { reason: 'rate_limit_exceeded' } })
+    ).toEqual({
+      limit: {
+        reason: 'rate_limit_exceeded',
+        observedAt: now,
+        windows: [
+          {
+            window: 'rate_limit_exceeded',
+            confirmed: false,
+            confirmedByReading: false,
+            observedAt: now,
+            provenance: 'unproven',
+          },
+        ],
+      },
+    })
     const quota = inspectCodexEvent(
       JSON.stringify({
         type: 'codex.rate_limits',

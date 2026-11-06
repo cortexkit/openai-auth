@@ -1018,7 +1018,10 @@ function parseWrappedError(
   }
 }
 
-export function parseRateLimitSignal(value: unknown):
+export function parseRateLimitSignal(
+  value: unknown,
+  at = Date.now(),
+):
   | {
       window: string
       resetAt?: number
@@ -1026,16 +1029,16 @@ export function parseRateLimitSignal(value: unknown):
   | undefined {
   if (typeof value === 'string') {
     try {
-      return parseRateLimitSignal(JSON.parse(value))
+      return parseRateLimitSignal(JSON.parse(value), at)
     } catch {
       return undefined
     }
   }
   if (!isRecord(value)) return undefined
 
-  const causeSignal = parseRateLimitSignal(value.cause)
+  const causeSignal = parseRateLimitSignal(value.cause, at)
   if (causeSignal) return causeSignal
-  const bodySignal = parseRateLimitSignal(value.body)
+  const bodySignal = parseRateLimitSignal(value.body, at)
   if (bodySignal) return bodySignal
 
   const detail = isRecord(value.error) ? value.error : value
@@ -1053,7 +1056,7 @@ export function parseRateLimitSignal(value: unknown):
       : typeof resetsInSeconds === 'number' &&
           Number.isFinite(resetsInSeconds) &&
           resetsInSeconds > 0
-        ? Date.now() + resetsInSeconds * 1000
+        ? at + resetsInSeconds * 1000
         : undefined
 
   // The window names the limit for the mark's expiry. Only a `response.failed`

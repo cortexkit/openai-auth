@@ -121,6 +121,8 @@ export interface PoolResetDepsOptions {
   storage: () => Promise<AccountStorage | null>
   counts: ResetCreditCounts
   now: () => number
+  /** Read the request path's existing marks without acquiring a registry for a menu. */
+  rateLimitMarks?: () => ReadonlyMap<string, number>
   /** The enrollment read; no local account is polled while it is not `local`. */
   authority?: () => Promise<'vault' | 'local' | 'unreadable'>
 }
@@ -226,7 +228,9 @@ export function createPoolResetDeps(
     isRateLimited: (accountKey) => {
       const row = rowFor(accountKey)
       if (!row) return false
-      const until = source.rateLimitMarks([row]).get(row.id)
+      const until = (
+        options.rateLimitMarks?.() ?? source.rateLimitMarks([row])
+      ).get(row.id)
       return until !== undefined && until > now()
     },
     getMain: () => entryFor('main'),

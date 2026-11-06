@@ -67,6 +67,7 @@ import type { Plugin } from '@opencode/plugin'
 import type { SessionHooks } from '@opencode/plugin/promise/session'
 import { getConfigPath, getSettings } from '../config'
 import { getAccountPaths } from '../core/account-paths'
+import { OpenCodeLimitSource } from '../core/limit-source'
 import {
   PoolAccountSource,
   settlesWithin,
@@ -127,7 +128,6 @@ import {
 } from './login'
 import { createControlPlaneMenu } from './menu'
 import { registerCodexModelRules } from './models'
-import { acquirePoolRateLimitMarks } from './rate-limit-marks'
 import { RequestDumps } from './request-dumps'
 import {
   createPoolQuotaPull,
@@ -603,8 +603,6 @@ export async function setupOpenAIAuth(
   const resetCounts = new ResetCreditCounts()
   const source = new PoolAccountSource({
     paths,
-    // One map per account store for every location in this process.
-    rateLimitMarks: acquirePoolRateLimitMarks(paths()),
     refreshProvider: async (credential) => {
       const tokens = await codexRefreshFn({
         refreshToken: credential.refresh,
@@ -643,6 +641,18 @@ export async function setupOpenAIAuth(
     log: createLogger('pool'),
   })
   if ((await vault.authority()) === 'local') await source.load()
+  // The limits source selects the pool or vault-roster namespace after a
+  // pool-routed request waits for account readiness. Setup and polls acquire none.
+  const limits = new OpenCodeLimitSource({
+    pool: source,
+    vault,
+    log: (message) => log.warn(message),
+  })
+  using _limitsRollback = {
+    [Symbol.dispose]() {
+      if (!setupComplete) void limits.dispose()
+    },
+  }
 
   const heartbeat =
     options.heartbeat === false
@@ -752,6 +762,7 @@ export async function setupOpenAIAuth(
     },
   }
   const openai = createOpenAIAdapter({
+    limits,
     codex,
     onRoute: sidebar.route,
     source,
@@ -844,6 +855,7 @@ export async function setupOpenAIAuth(
               // Reset credits over the pool: a missing row is refused, and
               // no host login is read in its place.
               ...createPoolResetDeps({
+                rateLimitMarks: () => limits.marks(),
                 source,
                 storage: loadStorage,
                 counts: resetCounts,
@@ -923,7 +935,7 @@ export async function setupOpenAIAuth(
     const cacheKeepReleased = cacheKeep.release()
     await controlPlane?.()
     lifecycle?.dispose()
-    await source.dispose()
+    await limits.dispose()
     await sidebar.release()
     await Promise.allSettled([
       installation.dispose(),

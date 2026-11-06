@@ -35,7 +35,9 @@
 // version) becomes the attempt's `data`, never a header, and a 401 on that
 // attempt is reported to the vault against that record version.
 
+import { randomUUID } from 'node:crypto'
 import type { ClaustrumScopedAttempt } from '@cortexkit/common-auth/claustrum'
+import { type LimitWindow, sameAccount } from '@cortexkit/common-auth/limits'
 import type {
   AccountHeadersResult,
   AccountRequest,
@@ -61,15 +63,23 @@ import {
   getKillswitchThresholdsForAccount,
   hasVaultRoutingAccessor,
   isCompleteQuotaHeaderFrame,
+  type LimitsProbe,
   normalizeQuotaHeaders,
   normalizeWsFrame,
+  type OpenAiLimitsOwner,
+  type OpenAiLimitsRequest,
   type OpenAiVault,
+  openAiRateLimitCommand,
+  openAiSignalWindows,
   parseJwtClaims,
   placeStickyPin,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
+  recordSessionCompletion,
   reportVaultRouting,
   resolveMidStreamRateLimitResetAt,
+  type SessionDispatch,
+  ttlForModel,
   type VaultModeRefusal,
   type VaultRoutingResponse,
   vaultModeNoRouteCause,
@@ -77,7 +87,9 @@ import {
   vaultRoutingStreamFailed,
   vaultRoutingStreamMayFail,
 } from '@cortexkit/openai-auth-core/internal'
+import type { OpenCodeLimitSource } from '../core/limit-source'
 import type { PoolAccountSource } from '../core/pool-account-source'
+import { VAULT_FIRST_ROSTER_WAIT_MS } from '../core/pool-account-source'
 import { POOL_LOGIN_REQUIRED_MESSAGE } from '../core/pool-main'
 import { windowsFromQuotaMap } from '../core/pool-quota'
 import { routableRows } from '../core/pool-request'
@@ -105,7 +117,6 @@ import {
 } from './codex-wire'
 import { codexRequestURL } from './endpoint'
 import type { PinReservation, SessionPins } from './pins'
-import { acquireVaultRateLimitMarks } from './rate-limit-marks'
 import { SessionAccounts } from './session-accounts'
 
 /** The provider (and integration) OpenCode 2 serves ChatGPT logins under. */
@@ -205,6 +216,8 @@ export type OpenAIAttemptData =
     }
 
 export interface OpenAIAdapterDeps {
+  /** Supplies limit ownership and waits for account readiness; always supplied by setup. */
+  limits?: OpenCodeLimitSource
   codex?: CodexHttpState
   /** Projects a primary request's actual route without affecting account choice. */
   onRoute?: (sessionId: string, accountId: string, route: string) => void
@@ -311,13 +324,31 @@ const ACCOUNT_LIMIT_CODES = new Set([
   'rate_limit_exceeded',
 ])
 
+/** Carry core's window facts so the next retry decision need not classify the error again. */
+export interface OpenAILimitSignal extends LimitSignal {
+  readonly windows: LimitWindow[]
+  readonly observedAt: number
+  readonly resetAt?: number
+  readonly resetSource?: 'provider' | 'retry-after'
+}
+
+export interface CodexEventVerdict extends EventVerdict<CodexQuotaReading> {
+  readonly limit?: OpenAILimitSignal
+}
+
 function toLimit(
   signal: { window: string; resetAt?: number },
   now: number,
   status?: number,
-): LimitSignal {
+  reading?: ReturnType<typeof windowsFromQuotaMap>,
+): OpenAILimitSignal {
   return {
     reason: signal.window,
+    windows: openAiSignalWindows(signal, now, reading, now),
+    observedAt: now,
+    ...(signal.resetAt !== undefined
+      ? { resetAt: signal.resetAt, resetSource: 'provider' as const }
+      : {}),
     ...(status !== undefined ? { status } : {}),
     ...(signal.resetAt !== undefined
       ? { retryAfterMs: Math.max(0, signal.resetAt - now) }
@@ -334,17 +365,24 @@ function toLimit(
 export function limitOfEvent(
   event: Record<string, unknown>,
   now: number,
-): LimitSignal | undefined {
-  const signal = parseRateLimitSignal(event)
-  if (signal) {
+  reading?: ReturnType<typeof windowsFromQuotaMap>,
+): OpenAILimitSignal | undefined {
+  // A failed envelope's own type is not the provider error code, even when
+  // the envelope also carries HTTP status 429.
+  if (event.type !== 'response.failed') {
+    const signal = parseRateLimitSignal(event, now)
     const status = typeof event.status === 'number' ? event.status : undefined
-    return toLimit(signal, now, status)
+    return signal ? toLimit(signal, now, status, reading) : undefined
   }
-  if (event.type !== 'response.failed' || !isRecord(event.response))
-    return undefined
+  if (!isRecord(event.response)) return undefined
   const failed = event.response.failed
   if (isRecord(failed) && typeof failed.rate_limit_reached_type === 'string')
-    return { reason: failed.rate_limit_reached_type }
+    return toLimit(
+      { window: failed.rate_limit_reached_type },
+      now,
+      undefined,
+      reading,
+    )
   const error = event.response.error
   if (isRecord(error)) {
     const code =
@@ -353,7 +391,14 @@ export function limitOfEvent(
         : typeof error.type === 'string'
           ? error.type
           : undefined
-    if (code && ACCOUNT_LIMIT_CODES.has(code)) return { reason: code }
+    if (code && ACCOUNT_LIMIT_CODES.has(code)) {
+      const status = typeof event.status === 'number' ? event.status : undefined
+      const parsed = parseRateLimitSignal(
+        { error: { ...error, type: code }, status },
+        now,
+      )
+      return toLimit(parsed ?? { window: code }, now, status, reading)
+    }
   }
   return undefined
 }
@@ -368,8 +413,16 @@ export function limitOfEvent(
 export function inspectCodexEvent(
   data: string,
   now: number,
-): EventVerdict<CodexQuotaReading> | undefined {
-  const event = parseJson(data)
+  reading?: ReturnType<typeof windowsFromQuotaMap>,
+): CodexEventVerdict | undefined {
+  return inspectParsedCodexEvent(parseJson(data), now, reading)
+}
+
+function inspectParsedCodexEvent(
+  event: unknown,
+  now: number,
+  reading?: ReturnType<typeof windowsFromQuotaMap>,
+): CodexEventVerdict | undefined {
   if (!isRecord(event)) return undefined
   const type = typeof event.type === 'string' ? event.type : undefined
   if (type === 'codex.rate_limits') {
@@ -380,7 +433,7 @@ export function inspectCodexEvent(
       },
     }
   }
-  const limit = limitOfEvent(event, now)
+  const limit = limitOfEvent(event, now, reading)
   if (limit) return { limit }
   if (type === undefined || type === 'error') return undefined
   return isNonEmittingFrame(type) ? undefined : { outputStarted: true }
@@ -408,7 +461,7 @@ export function quotaFromCodexHeaders(
 function retryAfterMs(headers: Headers): number | undefined {
   const value = headers.get('retry-after')
   if (value === null) return undefined
-  const seconds = Number(value)
+  const seconds = value.trim() ? Number(value) : NaN
   return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : undefined
 }
 
@@ -422,6 +475,25 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   const now = deps.now ?? Date.now
   const log = deps.log
   const vault = deps.vault
+  const limits = deps.limits
+  const producerId = randomUUID()
+  const feedback = new WeakMap<
+    OpenAIAttemptData,
+    {
+      owner: OpenAiLimitsOwner | undefined
+      probe: LimitsProbe | undefined
+      dispatch: SessionDispatch | undefined
+      failed: boolean
+      completed: boolean
+    }
+  >()
+  const currentDispatch = new Map<string, SessionDispatch>()
+  const quotaFor = (accountId: string, fromVault: boolean) =>
+    windowsFromQuotaMap(
+      fromVault
+        ? vault?.routes().find((route) => route.id === accountId)?.quota
+        : source.peek().rows.find((row) => row.id === accountId)?.quota,
+    )
   const effort = new MidConversationEffort(deps.codex)
   // Vault receipts authorized while choosing an account, kept until the
   // installer's `accountHeaders` call for the same session, request kind and
@@ -447,17 +519,53 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   // Retry choices reserve live pending bytes, but publish their pin and active
   // account only when accountHeaders consumes them. A discard releases the lease.
   const keptChoices = new Map<string, { commit(): void; drop(): void }>()
+  const requestHandoffs = new Map<
+    string,
+    {
+      request: OpenAiLimitsRequest
+      sessionID: string
+      expiresAt: number
+      timer: ReturnType<typeof setTimeout>
+    }
+  >()
+  const dropRequestHandoff = (key: string) => {
+    const entry = requestHandoffs.get(key)
+    if (entry) clearTimeout(entry.timer)
+    requestHandoffs.delete(key)
+  }
+  const keepRequestHandoff = (
+    input: ChooseAccountInput,
+    accountId: string,
+    request: OpenAiLimitsRequest,
+  ) => {
+    const key = receiptKey({ ...input, accountId })
+    dropRequestHandoff(key)
+    // Selection and credential preparation share one five-second deadline
+    // for reloading account bindings. Release requests from unused choices.
+    const entry = {
+      request,
+      sessionID: input.sessionID,
+      expiresAt: performance.now() + 5000,
+      timer: setTimeout(() => {
+        if (requestHandoffs.get(key) === entry) dropRequestHandoff(key)
+      }, 5000),
+    }
+    entry.timer.unref()
+    requestHandoffs.set(key, entry)
+    if (requestHandoffs.size > DEFAULT_MAX_RECORDS) {
+      const oldest = requestHandoffs.keys().next().value
+      if (oldest !== undefined) dropRequestHandoff(oldest)
+    }
+  }
+  const takeRequestHandoff = (key: string) => {
+    const entry = requestHandoffs.get(key)
+    dropRequestHandoff(key)
+    return entry && performance.now() < entry.expiresAt
+      ? entry.request
+      : undefined
+  }
   const receiptKey = (scope: AccountRequest) =>
     `${scope.sessionID}\u0000${scope.kind}\u0000${scope.accountId}`
-  // Rate-limit marks of vault accounts (the pool source keeps its rows'):
-  // account id to the mark's expiry time. Every location in the process that
-  // reads the same vault roster shares one map, so a 429 seen in one project
-  // keeps the others off the account too. A vault with no roster file (tests)
-  // gets a private map.
-  const rosterPath = vault?.paths?.rosterPath
-  const vaultMarks = rosterPath
-    ? acquireVaultRateLimitMarks(rosterPath)
-    : new Map<string, number>()
   // The row each session's latest agent-loop request went to, which its
   // title, compaction and generate requests follow in the ordered modes.
   const sessionAccounts = deps.sessionAccounts ?? new SessionAccounts()
@@ -526,13 +634,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     const vaultIds = new Set(
       targets.filter((target) => !target.row).map((target) => target.id),
     )
-    const rateLimitMarks = source.rateLimitMarks(rows)
-    for (const id of vaultIds) {
-      const until = vaultMarks.get(id)
-      if (until === undefined) continue
-      if (until <= at) vaultMarks.delete(id)
-      else rateLimitMarks.set(id, until)
-    }
+    // Routing reads a copy of the registry's marks, never another writable
+    // authority. Callers without registry ownership can still test routing
+    // with their source's rateLimitMarks implementation.
+    const rateLimitMarks = limits?.marks() ?? source.rateLimitMarks(rows)
     return {
       rows: routingRows,
       now: at,
@@ -668,6 +773,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   const chooseAccount = async (
     input: ChooseAccountInput,
   ): Promise<string | undefined> => {
+    let ready: OpenAiLimitsRequest | undefined
     const modeAuthority = await vault?.authority()
     const storage = await deps.storage()
     // Vault mode: only the vault's accounts serve this host.
@@ -682,8 +788,13 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       })
     }
     if (vaultMode) {
+      const deadline = performance.now() + VAULT_FIRST_ROSTER_WAIT_MS
       await deps.awaitVaultRoster?.()
+      ready = await limits?.forRequest(deadline)
     } else {
+      // Wait for the initial account-source read before checking its current
+      // view, which may otherwise appear empty. Registry acquisition also waits.
+      ready = await limits?.forRequest()
       const view = await source.current()
       if (!view.active) {
         if (await deps.slotPlaceholderWithoutMain?.()) refuseMissingLogin()
@@ -911,6 +1022,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         })
       }
       if (accountId !== undefined) {
+        if (ready) keepRequestHandoff(input, accountId, ready)
         const chosenId = accountId
         const heldReservation = reservation
         const nextPin = plannedPin
@@ -979,6 +1091,60 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           requestKind: request.kind,
           message: NO_ACCOUNT_REFUSAL,
         })
+      const prepareFeedback = async (data: OpenAIAttemptData) => {
+        if (!limits) return
+        const ready =
+          takeRequestHandoff(choiceKey) ?? (await limits.forRequest())
+        if (data.kind === 'pool') {
+          const currentRow = source
+            .peek()
+            .rows.find((candidate) => candidate.id === accountId)
+          if (
+            !currentRow ||
+            currentRow.credentialEpoch !== data.credentialEpoch ||
+            source.usableToken(currentRow) !== data.token
+          )
+            throw refuse()
+        }
+        const binding = limits
+          .bindings()
+          .find((candidate) => candidate.account.accountId === accountId)
+        const dispatch = await ready?.beforeDispatch(
+          binding,
+          () => limits.ownershipBindings(),
+          accountId,
+        )
+        const current = limits.accountKey(accountId)
+        if (
+          (dispatch && dispatch.status !== 'ready') ||
+          (binding && (!current || !sameAccount(binding.account, current)))
+        )
+          throw refuse()
+        const owner = limits.owner()
+        const sample = binding
+          ? {
+              sessionId: request.sessionID,
+              accountKey: binding.account,
+              dispatchedAt: now(),
+              ttlMs: ttlForModel(JSON.stringify({ model: request.modelID })),
+            }
+          : undefined
+        if (sample) {
+          currentDispatch.delete(sample.sessionId)
+          currentDispatch.set(sample.sessionId, sample)
+          if (currentDispatch.size > DEFAULT_MAX_RECORDS) {
+            const oldest = currentDispatch.keys().next().value
+            if (oldest !== undefined) currentDispatch.delete(oldest)
+          }
+        }
+        feedback.set(data, {
+          owner,
+          probe: owner?.observe(binding),
+          dispatch: sample,
+          failed: false,
+          completed: false,
+        })
+      }
       // In vault mode no pool row is sent with, so only the vault is asked.
       const row =
         vault && (await vault.authority()) !== 'local'
@@ -997,6 +1163,12 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           )
           throw refuse()
         }
+        const data: OpenAIAttemptData = {
+          kind: 'vault',
+          routeId: accountId,
+          receipt,
+        }
+        await prepareFeedback(data)
         commitChoice()
         return {
           headers: {
@@ -1008,7 +1180,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
               identityOfToken(receipt.accessToken) ??
               null,
           },
-          attempt: { kind: 'vault', routeId: accountId, receipt },
+          attempt: data,
         }
       }
       const token = row ? source.usableToken(row) : undefined
@@ -1019,6 +1191,13 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         throw refuse()
       }
       const identity = row.identity ?? identityOfToken(token)
+      const data: OpenAIAttemptData = {
+        kind: 'pool',
+        token,
+        credentialEpoch: row.credentialEpoch,
+        ...(identity !== undefined ? { identity } : {}),
+      }
+      await prepareFeedback(data)
       commitChoice()
       return {
         headers: {
@@ -1027,12 +1206,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           authorization: `Bearer ${token}`,
           'chatgpt-account-id': identity ?? null,
         },
-        attempt: {
-          kind: 'pool',
-          token,
-          credentialEpoch: row.credentialEpoch,
-          ...(identity !== undefined ? { identity } : {}),
-        },
+        attempt: data,
       }
     } finally {
       keptChoice?.drop()
@@ -1111,6 +1285,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     dropSameAccountRetry() {},
     dropChoice(input) {
       const key = receiptKey(input)
+      dropRequestHandoff(key)
       keptChoices.get(key)?.drop()
       keptChoices.delete(key)
       receipts.delete(key)
@@ -1156,10 +1331,14 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     async limitFromResponse({ status, headers, body, attempt }) {
       if (status < 400) return undefined
       const parsed = parseJson(await body().catch(() => ''))
-      const signal = parseRateLimitSignal({
-        ...(isRecord(parsed) ? parsed : {}),
-        status,
-      })
+      const at = now()
+      const signal = parseRateLimitSignal(
+        {
+          ...(isRecord(parsed) ? parsed : {}),
+          status,
+        },
+        at,
+      )
       if (attempt.data?.kind === 'vault' && hasVaultRoutingAccessor())
         reportVaultRouting(attempt.sessionID, attempt.data.receipt, {
           status,
@@ -1171,13 +1350,34 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           now: now(),
         })
       if (!signal) return undefined
-      const at = now()
-      const limit = toLimit(signal, at, status)
+      const limit = toLimit(
+        signal,
+        at,
+        status,
+        quotaFor(attempt.accountId, attempt.data?.kind === 'vault'),
+      )
       if (limit.retryAfterMs !== undefined) return limit
       const after = retryAfterMs(headers)
-      return after === undefined ? limit : { ...limit, retryAfterMs: after }
+      return after === undefined
+        ? limit
+        : {
+            ...limit,
+            retryAfterMs: after,
+            resetAt: at + after,
+            resetSource: 'retry-after',
+          }
     },
     inspectEvent: ({ data, transport, attempt }) => {
+      const event = parseJson(data)
+      const state = attempt.data && feedback.get(attempt.data)
+      if (
+        state &&
+        isRecord(event) &&
+        (event.type === 'response.failed' || event.type === 'error')
+      )
+        state.failed = true
+      if (state && isRecord(event) && event.type === 'response.completed')
+        state.completed = true
       if (
         attempt.data?.kind === 'vault' &&
         data.includes('codex.rate_limits')
@@ -1210,19 +1410,44 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             failed: routingFailures.has(attempt),
           })
       }
-      return inspectCodexEvent(data, now())
+      const verdict = inspectParsedCodexEvent(
+        event,
+        now(),
+        quotaFor(attempt.accountId, attempt.data?.kind === 'vault'),
+      )
+      // HTTP acceptance belongs to the body reader, not an SSE lifecycle
+      // frame. A WebSocket has no body end, so its completion is explicit.
+      return transport === 'ws' &&
+        isRecord(event) &&
+        event.type === 'response.completed'
+        ? { ...verdict, done: true }
+        : verdict
     },
-    limitFromError(error: HostError) {
+    limitFromError(error: HostError, attempt) {
       const parsed = parseJson(error.message)
-      const signal =
-        parseRateLimitSignal({
-          ...(isRecord(parsed) ? parsed : {}),
-          ...(error.status !== undefined ? { status: error.status } : {}),
-        }) ??
+      const at = now()
+      const reading = quotaFor(
+        attempt.accountId,
+        attempt.data?.kind === 'vault',
+      )
+      return (
+        limitOfEvent(
+          {
+            ...(isRecord(parsed) ? parsed : {}),
+            ...(error.status !== undefined ? { status: error.status } : {}),
+          },
+          at,
+          reading,
+        ) ??
         (error.message.includes('usage_limit_reached')
-          ? { window: 'usage_limit_reached' }
+          ? toLimit(
+              { window: 'usage_limit_reached' },
+              at,
+              error.status,
+              reading,
+            )
           : undefined)
-      return signal ? toLimit(signal, now(), error.status) : undefined
+      )
     },
     // A 401 on a send the vault authorized is reported to the vault against
     // the record version in that send's receipt; no other status is
@@ -1230,6 +1455,37 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     // plugin hook for a WebSocket handshake the server refuses.
     async onAttemptEnd(attempt, outcome) {
       const data = attempt.data
+      const state = data && feedback.get(data)
+      if (state) {
+        const clean =
+          !outcome.error &&
+          !outcome.limit &&
+          !state.failed &&
+          (attempt.transport === 'ws'
+            ? state.completed
+            : outcome.status !== undefined &&
+              outcome.status >= 200 &&
+              outcome.status < 300)
+        if (clean && state.dispatch && limits) {
+          const current = currentDispatch.get(state.dispatch.sessionId)
+          recordSessionCompletion(
+            limits.activity,
+            state.dispatch,
+            current === state.dispatch
+              ? limits.accountKey(attempt.accountId)
+              : undefined,
+            attempt.transport === 'ws'
+              ? { kind: 'ws', event: 'response.completed', aborted: false }
+              : {
+                  kind: 'http',
+                  completed: true,
+                  failed: false,
+                  aborted: false,
+                },
+          )
+        }
+        state.owner?.afterProbe(state.probe, clean, Boolean(outcome.limit))
+      }
       if (data && outcome.outputStarted && outcome.error?.reason === 'failed') {
         interrupted.set(requestKey(attempt), {
           accountId: attempt.accountId,
@@ -1322,6 +1578,37 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   ) => {
     const at = now()
     const fromVault = handle.data?.kind === 'vault'
+    if (limits) {
+      const state = handle.data && feedback.get(handle.data)
+      const owner = state?.owner ?? limits.owner()
+      if (!owner) return
+      if (!state?.probe || owner.registry !== state.probe.registry) {
+        owner.dropSignal()
+        return
+      }
+      const signal = limit as Partial<OpenAILimitSignal>
+      const { command, provenance } = openAiRateLimitCommand({
+        binding: state.probe.binding,
+        baseRevision: state.probe.baseRevision,
+        producerId,
+        operationId: randomUUID(),
+        parsed: {
+          window: limit.reason,
+          resetAt:
+            signal.resetAt ??
+            (limit.retryAfterMs !== undefined
+              ? at + limit.retryAfterMs
+              : undefined),
+        },
+        reading: quotaFor(accountId, fromVault),
+        now: at,
+        observedAt: signal.observedAt ?? at,
+        evidenceAt: at,
+        resetSource: signal.resetSource,
+      })
+      owner.enqueue(command, provenance)
+      return
+    }
     const quota = fromVault
       ? vault?.routes().find((route) => route.id === accountId)?.quota
       : source.peek().rows.find((candidate) => candidate.id === accountId)
@@ -1337,9 +1624,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       source.markRateLimited(accountId, until)
       return
     }
-    const existing = vaultMarks.get(accountId)
-    if (existing === undefined || existing < until)
-      vaultMarks.set(accountId, until)
+    // Without a registry, vault timed marks are not stored in a fallback map.
   }
 
   return {
@@ -1361,6 +1646,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       })
     },
     forgetSession(sessionId) {
+      for (const [key, entry] of requestHandoffs) {
+        if (entry.sessionID === sessionId) dropRequestHandoff(key)
+      }
+      currentDispatch.delete(sessionId)
+      limits?.forget(sessionId)
       for (const [key, attempt] of interrupted) {
         if (attempt.sessionID === sessionId) interrupted.delete(key)
       }
