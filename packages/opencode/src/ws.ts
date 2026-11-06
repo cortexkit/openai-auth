@@ -1316,3 +1316,87 @@ function closeMessage(message: string, code: number, reason: string | Buffer) {
 }
 
 export * as OpenAIWebSocket from './ws'
+/** Observe HTTP SSE without consuming ahead of the host or changing its bytes. */
+export function observeHttpCompletion(
+  response: Response,
+  onEnd: (clean: boolean) => void,
+): Response {
+  if (
+    !response.ok ||
+    !response.body ||
+    !response.headers.get('content-type')?.includes('text/event-stream')
+  )
+    return response
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let pending = ''
+  let completed = false
+  let failed = false
+  let oversized = false
+  const inspect = (text: string) => {
+    pending += text
+    for (;;) {
+      const boundary = /\r?\n\r?\n/.exec(pending)
+      if (!boundary || boundary.index === undefined) break
+      const frame = pending.slice(0, boundary.index)
+      pending = pending.slice(boundary.index + boundary[0].length)
+      if (oversized) {
+        oversized = false
+        continue
+      }
+      const data = frame
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trimStart())
+        .join('\n')
+      if (!data || data === '[DONE]') continue
+      try {
+        const event = JSON.parse(data)
+        if (event.type === 'response.completed') completed = true
+        if (
+          event.type === 'response.failed' ||
+          event.type === 'response.incomplete' ||
+          event.type === 'error'
+        )
+          failed = true
+      } catch {
+        // Malformed provider frames cannot prove a successful completion.
+        failed = true
+      }
+    }
+    // Activity is advisory. Discard oversized evidence rather than buffering an
+    // unbounded provider frame or treating an incomplete JSON suffix as proof.
+    if (pending.length > 1_048_576) {
+      pending = pending.slice(-1)
+      oversized = true
+      failed = true
+    }
+  }
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          const chunk = await reader.read()
+          if (chunk.done) {
+            inspect(decoder.decode())
+            onEnd(completed && !failed)
+            controller.close()
+          } else {
+            inspect(decoder.decode(chunk.value, { stream: true }))
+            controller.enqueue(chunk.value)
+          }
+        } catch (error) {
+          controller.error(error)
+        }
+      },
+      cancel(reason) {
+        return reader.cancel(reason)
+      },
+    }),
+    {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    },
+  )
+}

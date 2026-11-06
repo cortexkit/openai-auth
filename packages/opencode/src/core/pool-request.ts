@@ -186,6 +186,8 @@ export function isVaultModeRefusal(
 
 export interface PoolRequestContext {
   source: PoolAccountSource
+  /** The host's mark authority; omitted by callers still using the source map. */
+  rateLimitMarks?: () => Map<string, number>
   /** The vault accounts; present exactly while this host is in vault mode. */
   vault?: PoolVaultRoutes
   /** The legacy settings this request reads (routing, killswitch, fallback statuses). */
@@ -333,7 +335,9 @@ function routingInput(
   const vaultIds = new Set(
     targets.filter((target) => !target.row).map((target) => target.id),
   )
-  const rateLimitMarks = ctx.source.rateLimitMarks(rows)
+  const rateLimitMarks = ctx.rateLimitMarks
+    ? ctx.rateLimitMarks()
+    : ctx.source.rateLimitMarks(rows)
   for (const [id, until] of ctx.vault?.rateLimitMarks?.() ?? []) {
     if (vaultIds.has(id) && until > now) rateLimitMarks.set(id, until)
   }

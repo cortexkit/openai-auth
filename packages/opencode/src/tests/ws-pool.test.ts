@@ -3304,3 +3304,85 @@ async function withFakeWebSocket(
       original
   }
 }
+
+describe('clean HTTP completion observation', () => {
+  test('preserves split SSE bytes and accepts only at clean EOF', async () => {
+    const { observeHttpCompletion } = await import('../ws')
+    let finish = (_value: Uint8Array) => {}
+    let close = () => {}
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        finish = (value) => controller.enqueue(value)
+        close = () => controller.close()
+      },
+    })
+    const accepted: boolean[] = []
+    const response = observeHttpCompletion(
+      new Response(body, {
+        headers: { 'content-type': 'text/event-stream', 'x-test': 'preserved' },
+      }),
+      (clean) => accepted.push(clean),
+    )
+    const reader = response.body!.getReader()
+    const first = 'data: {"type":"response.com'
+    const last = 'pleted"}\r\n\r\ndata: [DONE]\n\n'
+    finish(new TextEncoder().encode(first))
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe(first)
+    finish(new TextEncoder().encode(last))
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe(last)
+    expect(accepted).toEqual([])
+    close()
+    expect((await reader.read()).done).toBe(true)
+    expect(accepted).toEqual([true])
+    expect(response.headers.get('x-test')).toBe('preserved')
+  })
+
+  for (const [label, data] of [
+    ['missing completion', 'data: {"type":"response.created"}\n\n'],
+    [
+      'failed then completed',
+      'data: {"type":"response.failed"}\n\ndata: {"type":"response.completed"}\n\n',
+    ],
+    ['incomplete', 'data: {"type":"response.incomplete"}\n\n'],
+    ['malformed', 'data: broken\n\ndata: {"type":"response.completed"}\n\n'],
+  ] as const) {
+    test(`rejects ${label} as accepted activity`, async () => {
+      const { observeHttpCompletion } = await import('../ws')
+      const accepted: boolean[] = []
+      const response = observeHttpCompletion(
+        new Response(data, {
+          headers: { 'content-type': 'text/event-stream' },
+        }),
+        (clean) => accepted.push(clean),
+      )
+      expect(await response.text()).toBe(data)
+      expect(accepted).toEqual([false])
+    })
+  }
+
+  test('does not accept a cancelled or non-success response', async () => {
+    const { observeHttpCompletion } = await import('../ws')
+    const accepted: boolean[] = []
+    const response = observeHttpCompletion(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode(
+                'data: {"type":"response.completed"}\n\n',
+              ),
+            )
+          },
+        }),
+        { headers: { 'content-type': 'text/event-stream' } },
+      ),
+      (clean) => accepted.push(clean),
+    )
+    await response.body!.cancel()
+    const failure = new Response('provider limit', { status: 429 })
+    expect(
+      observeHttpCompletion(failure, (clean) => accepted.push(clean)),
+    ).toBe(failure)
+    expect(accepted).toEqual([])
+  })
+})

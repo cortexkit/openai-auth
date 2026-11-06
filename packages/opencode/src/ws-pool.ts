@@ -60,6 +60,16 @@ export interface CreateWebSocketFetchOptions {
     accountId: string | undefined,
     resetAt?: number,
   ) => void
+  /** Clean main-response completion only; prewarms and synthetic terminals do not count. */
+  onComplete?: (
+    event: Record<string, unknown>,
+    accountId: string | undefined,
+  ) => void
+  /** Observe the actual HTTP path, including native-WebSocket fallbacks. */
+  onHttpResponse?: (
+    response: Response,
+    accountId: string | undefined,
+  ) => Response
 }
 
 interface PoolEntry {
@@ -202,6 +212,14 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           ? input
           : input.url
     const internalHeaders = OpenAIWebSocket.normalizeHeaders(init?.headers)
+    const requestAccountId =
+      typeof internalHeaders[QUOTA_ACCOUNT_HEADER] === 'string'
+        ? internalHeaders[QUOTA_ACCOUNT_HEADER]
+        : undefined
+    const sendHttp = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = await httpFetch(input, init)
+      return options?.onHttpResponse?.(response, requestAccountId) ?? response
+    }
     const wsInit = withoutInternalHeaders(init)
     const httpInit = sanitizeHttpFallbackInit(wsInit)
 
@@ -209,7 +227,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       init?.method !== 'POST' ||
       !new URL(url).pathname.endsWith('/responses')
     ) {
-      return httpFetch(input, httpInit)
+      return sendHttp(input, httpInit)
     }
 
     const body = (() => {
@@ -223,9 +241,9 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         return undefined
       }
     })()
-    if (!body?.stream) return httpFetch(input, httpInit)
+    if (!body?.stream) return sendHttp(input, httpInit)
     if (internalHeaders[TITLE_HEADER] === 'true') {
-      return httpFetch(input, httpInit)
+      return sendHttp(input, httpInit)
     }
 
     const sessionID =
@@ -234,7 +252,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       internalHeaders['session-id']
     const dumpSessionID = sessionID
     if (!sessionID) {
-      return httpFetch(input, httpInit)
+      return sendHttp(input, httpInit)
     }
     // Include the account identity in the pool key so a socket is NEVER reused
     // across accounts. An account switch mid-session produces a different
@@ -246,10 +264,6 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     )
     const acctDisc = accountDiscriminator(sourceHeadersForKey)
     const key = `${sessionID}:${acctDisc}:conversation`
-    const requestAccountId =
-      typeof internalHeaders[QUOTA_ACCOUNT_HEADER] === 'string'
-        ? internalHeaders[QUOTA_ACCOUNT_HEADER]
-        : undefined
     const requestOnRateLimitReached = onRateLimitReached
       ? (window: string, resetAt?: number) =>
           onRateLimitReached(window, requestAccountId, resetAt)
@@ -266,13 +280,13 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
     let comparison: RequestComparison | undefined
 
     if (entry.fallback) {
-      return httpFetch(
+      return sendHttp(
         input,
         httpFallbackInit(entry, body, httpInit, comparison),
       )
     }
     if (entry.busy) {
-      return httpFetch(
+      return sendHttp(
         input,
         httpFallbackInit(entry, body, httpInit, comparison),
       )
@@ -371,6 +385,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         onRateLimitReached: requestOnRateLimitReached,
         onFirstEvent: (error) => resolveFirstEvent(error ?? true),
         onComplete: (event, finalizedCallIds) => {
+          options?.onComplete?.(event, requestAccountId)
           const usage = responseUsage(event)
           void dumpDiagnostic({
             component: 'ws-pool',
@@ -441,7 +456,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       // advanceTurn is idempotent for a body already applied this send, so the
       // post-attempt exits re-stamp the header without minting a second turn.
       const runHttpFallback = () =>
-        httpFetch(input, httpFallbackInit(entry, body, httpInit, comparison))
+        sendHttp(input, httpFallbackInit(entry, body, httpInit, comparison))
       if (!entry.fallback)
         return relayWithOversizedFallback(response, runHttpFallback)
       return runHttpFallback()
@@ -476,7 +491,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
       entry.continuation = undefined
       invalidate(entry)
       if (entry.fallback)
-        return httpFetch(
+        return sendHttp(
           input,
           httpFallbackInit(entry, body, httpInit, comparison),
         )

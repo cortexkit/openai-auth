@@ -39,6 +39,9 @@ function fakeSocket() {
     write(frame: Frame) {
       emit('message', { data: JSON.stringify(frame) })
     },
+    writeRaw(data: string) {
+      emit('message', { data })
+    },
     peerClose(code: number, reason: string) {
       emit('close', { code, reason })
     },
@@ -575,6 +578,26 @@ describe('websocket failure after reasoning without text (real AI SDK parser)', 
 })
 
 describe('mid-stream rate limit after function calls only (real AI SDK parser)', () => {
+  test('lifecycle and malformed dropped frames are not output and the limit stays retryable', async () => {
+    const { error, calls, ofType } = await run({
+      frames: [created, reasoningAdded(0)],
+      failure: (socket) => {
+        socket.writeRaw('not a JSON event')
+        rateLimit(socket)
+      },
+    })
+    expect(error).toBeInstanceOf(ResponseStreamError)
+    expect(error).toMatchObject({ isRetryable: true })
+    expect(ofType('tool-call')).toHaveLength(0)
+    expect(calls.rateLimited).toEqual(['primary'])
+    expect(calls.completed).toBe(0)
+  })
+
+  test('terminal output wording is byte-exact and cannot invite replay', () => {
+    expect(TERMINAL_AFTER_OUTPUT_MESSAGE).toBe(
+      'The response ended early after part of it had already been shown. It was not sent again, because repeating it would duplicate that output and re-run any tools it had started. The transport log records what ended it.',
+    )
+  })
   test('with only an unfinished call it fails retryably so the turn reroutes', async () => {
     const { error, calls, ofType } = await run({
       frames: [created, callAdded(1), callDelta(1, '{"path":')],
@@ -614,7 +637,7 @@ describe('mid-stream rate limit after function calls only (real AI SDK parser)',
   })
 
   test('after a message item it ends without a retry and without a tool-calls finish', async () => {
-    const { error, ofType } = await run({
+    const { error, calls, ofType } = await run({
       frames: [
         created,
         {
@@ -625,6 +648,9 @@ describe('mid-stream rate limit after function calls only (real AI SDK parser)',
       ],
       failure: rateLimit,
     })
+    expect(calls.rateLimited).toEqual(['primary'])
+    expect(calls.completed).toBe(0)
+    expect(calls.terminal).toEqual(['response.failed'])
 
     expect(error).toBeUndefined()
     expect(ofType('finish')[0]).toMatchObject({

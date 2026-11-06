@@ -4,6 +4,11 @@ import os from 'node:os'
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import { parseApplyRequest } from '@cortexkit/common-auth/commands'
 import {
+  type AccountKey,
+  type IdentityBinding,
+  sameAccount,
+} from '@cortexkit/common-auth/limits'
+import {
   adoptRpcServer,
   type RpcServerAdoption,
 } from '@cortexkit/common-auth/rpc'
@@ -35,6 +40,8 @@ import {
   isTombstoned,
   killswitchPassesPolicy,
   killswitchRetryAfterSeconds,
+  type LimitsProbe,
+  limitAccountKey,
   loadAccountSettings,
   loadAccounts,
   migrateIfNeeded,
@@ -42,20 +49,27 @@ import {
   normalizeQuotaHeaders,
   type OAuthAccount,
   type OAuthQuotaSnapshot,
+  type OpenAiLimitsOwner,
+  type OpenAiLimitsRequest,
   type OpenAiVault,
+  openAiRateLimitCommand,
   parseJwtClaims,
+  poolLimitsNamespace,
   type QuotaEntry,
   QuotaManager,
   type RefreshAllQuotaResult,
   type RoutingMode,
+  recordSessionCompletion,
   redactCredentialError,
   redactCredentialResponse,
   refreshAllQuota,
   refreshBackoffActive,
   resolveMidStreamRateLimitResetAt,
+  type SessionDispatch,
   shouldFallbackStatus,
   type TokenResponse,
   TombstoneRefreshError,
+  ttlForModel,
   vaultModeNoRouteCause,
   vaultModeRefusalText,
   vaultRoutingRequestFromBody,
@@ -108,6 +122,7 @@ import {
   MAIN_REFRESH_LOCK_NAME,
   opencode1SlotForClient,
 } from './core/host-slot'
+import { OpenCodeLimitSource } from './core/limit-source'
 import {
   PoolAccountSource,
   settlesWithin,
@@ -224,6 +239,7 @@ import {
 import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
 import { PackageVersion } from './version'
+import { observeHttpCompletion } from './ws'
 import { OpenAIWebSocketPool } from './ws-pool'
 
 export const ALLOWED_MODELS = new Set([
@@ -1312,6 +1328,8 @@ export async function CodexAuthPlugin(
   // The account pool as the request path's source of accounts once the
   // install is migrated; the loader installs one per run.
   let poolAccountSource: PoolAccountSource | undefined
+  let limitSource: OpenCodeLimitSource | undefined
+  const sessionAccounts = new Map<string, AccountKey>()
   // Background account-pool migration, and adoption into the pool of logins
   // that land in OpenCode's slot after it. A client that cannot write the
   // slot runs without both and logs why: a migration that is off without a
@@ -1509,6 +1527,7 @@ export async function CodexAuthPlugin(
 
   return {
     async dispose() {
+      await limitSource?.dispose()
       vaultLease.release()
       poolLifecycle?.dispose()
       await poolAccountSource?.dispose()
@@ -1545,6 +1564,8 @@ export async function CodexAuthPlugin(
     async event(input) {
       if (input.event.type !== 'session.deleted') return
       const info = input.event.properties.info
+      limitSource?.forget(info.id)
+      sessionAccounts.delete(info.id)
       const meta = codexSessions.get(info.id)
       if (meta) {
         cmdCtx?.cacheKeepManager?.remove(meta.threadID)
@@ -1842,6 +1863,7 @@ export async function CodexAuthPlugin(
         // any other install it only reads the config once here and stays
         // idle. The first read is awaited because the loader is not the
         // request path; it also starts every row's first quota poll.
+        await limitSource?.dispose()
         await poolAccountSource?.dispose()
         const poolSource = new PoolAccountSource({
           paths: () => getAccountPaths(getConfigPath()),
@@ -1909,6 +1931,24 @@ export async function CodexAuthPlugin(
         })
         poolAccountSource = poolSource
         if (!loaderVaultMode) await poolSource.load()
+        limitSource = new OpenCodeLimitSource({
+          pool: poolSource,
+          vault,
+          log: (message) => logQ.warn(message),
+        })
+        const limits = limitSource
+        const legacyKeys = new Map<string, AccountKey>()
+        const currentSessionAccount = (
+          sessionId: string,
+        ): AccountKey | undefined => {
+          const key = sessionAccounts.get(sessionId)
+          const current =
+            key &&
+            (limits.accountKey(key.accountId) ?? legacyKeys.get(key.accountId))
+          return key && current && sameAccount(key, current)
+            ? current
+            : undefined
+        }
         const fallbackManager = new FallbackAccountManager({
           paths: getAccountPaths(getConfigPath()),
           refreshFn: async (opts) => {
@@ -2396,6 +2436,17 @@ export async function CodexAuthPlugin(
         const cacheKeepManager = createCacheKeepManager({
           fetchImpl: fetch,
           vault,
+          activity: {
+            store: limits.activity,
+            accountKey: ({ target }) => {
+              const current = currentSessionAccount(
+                target.meta.routingSessionId ?? target.sessionKey,
+              )
+              return current?.accountId === target.accountId
+                ? current
+                : undefined
+            },
+          },
           getMainToken: async () => {
             if ((await vault.authority()) !== 'local')
               throw new Error(
@@ -2613,18 +2664,30 @@ export async function CodexAuthPlugin(
 
         // The pure resolver prefers an admission error's explicit reset and
         // otherwise uses this account's cached named-window quota.
+        function rateLimitQuota(
+          accountKey: string,
+          migrated = false,
+        ): OAuthQuotaSnapshot | undefined {
+          if (migrated)
+            return vault.enrolled()
+              ? windowsFromQuotaMap(
+                  vault.routes().find((route) => route.id === accountKey)
+                    ?.quota,
+                )
+              : windowsFromQuotaMap(
+                  poolSource.peek().rows.find((row) => row.id === accountKey)
+                    ?.quota,
+                )
+          return accountKey === 'main'
+            ? quotaManager.peekMainForPolicy()?.quota
+            : quotaManager.peekFallbackForPolicy(accountKey)?.quota
+        }
         function midStreamRateLimitResetAt(
           accountKey: string,
           window: string,
           explicitResetAt?: number,
         ): number {
-          const quota =
-            windowsFromQuotaMap(
-              vault.routes().find((route) => route.id === accountKey)?.quota,
-            ) ??
-            (accountKey === 'main'
-              ? quotaManager.peekMainForPolicy()?.quota
-              : quotaManager.peekFallbackForPolicy(accountKey)?.quota)
+          const quota = rateLimitQuota(accountKey)
           return resolveMidStreamRateLimitResetAt(
             quota,
             window,
@@ -2645,11 +2708,18 @@ export async function CodexAuthPlugin(
         // receipt. The pool
         // removes the header before the request goes out, and still reuses
         // sockets by ChatGPT account, not by this key.
-        const vaultStreams = new Map<
+        const streams = new Map<
           string,
-          { id: string; receipt: QuotaReceipt }
+          {
+            id: string
+            receipt?: QuotaReceipt
+            migrated: boolean
+            owner?: OpenAiLimitsOwner
+            probe?: LimitsProbe
+            limited: boolean
+            complete: (kind: 'http' | 'ws') => void
+          }
         >()
-        const vaultMarks = new Map<string, number>()
         // A vault account's quota reading lands in the vault roster; in vault
         // mode the sidebar lists those accounts, so it is rewritten after one.
         function queueVaultSidebarWrite() {
@@ -2673,21 +2743,20 @@ export async function CodexAuthPlugin(
                 servedChatgptAccountId,
                 frame,
               ) => {
-                const served = accountId
-                  ? vaultStreams.get(accountId)
-                  : undefined
-                if (served) {
+                const served = accountId ? streams.get(accountId) : undefined
+                if (served?.receipt) {
                   vault.reportUsage(served.id, { frame }, served.receipt)
                   void vault
                     .recordSnapshot(served.id, s, true, served.receipt)
                     .then(queueVaultSidebarWrite)
                   return
                 }
-                const isMainBucket = !accountId || accountId === 'main'
+                const quotaAccount = served?.id ?? accountId
+                const isMainBucket = !quotaAccount || quotaAccount === 'main'
                 pushQuota(
                   s,
                   accessToken,
-                  accountId,
+                  quotaAccount,
                   isMainBucket ? servedChatgptAccountId : undefined,
                   true,
                 )
@@ -2706,26 +2775,55 @@ export async function CodexAuthPlugin(
                     { pid: process.pid, window },
                   )
                 }
-                const served = accountId
-                  ? vaultStreams.get(accountId)
-                  : undefined
+                const served = accountId ? streams.get(accountId) : undefined
+                if (!served && accountId?.startsWith('stream:')) return
                 const accountKey = served?.id ?? accountId ?? 'main'
+                if (served) served.limited = true
+                if (served?.migrated) {
+                  const { owner, probe } = served
+                  if (!owner) return
+                  if (!probe || owner.registry !== probe.registry) {
+                    owner.dropSignal()
+                    return
+                  }
+                  const now = Date.now()
+                  const { command, provenance } = openAiRateLimitCommand({
+                    binding: probe.binding,
+                    baseRevision: probe.baseRevision,
+                    producerId: installationID,
+                    operationId: randomUUID(),
+                    parsed: {
+                      window,
+                      resetAt: explicitResetAt,
+                    },
+                    reading: rateLimitQuota(accountKey, true),
+                    now,
+                    observedAt: now,
+                    evidenceAt: now,
+                  })
+                  owner.enqueue(command, provenance)
+                  return
+                }
                 const resetAt = midStreamRateLimitResetAt(
                   accountKey,
                   window,
                   explicitResetAt,
                 )
                 quotaManager.markRateLimited(accountKey, resetAt)
-                if (served) {
-                  vaultMarks.set(
-                    accountKey,
-                    Math.max(vaultMarks.get(accountKey) ?? 0, resetAt),
-                  )
-                } else poolSource.markRateLimited(accountKey, resetAt)
                 logQ.debug('mid-stream rate limit mark', {
                   pid: process.pid,
                   accountId: accountKey,
                   window,
+                })
+              },
+              onComplete: (event, accountId) => {
+                if (event.type === 'response.completed' && accountId)
+                  streams.get(accountId)?.complete('ws')
+              },
+              onHttpResponse: (response, accountId) => {
+                const stream = accountId ? streams.get(accountId) : undefined
+                return observeHttpCompletion(response, (clean) => {
+                  if (clean) stream?.complete('http')
                 })
               },
             })
@@ -3000,6 +3098,8 @@ export async function CodexAuthPlugin(
             cacheKeepWindow = window
           },
           clearStickyRouting: async (sessionId) => {
+            limits.forget(sessionId)
+            sessionAccounts.delete(sessionId)
             // Drop this process's copy first so neither the next request nor a
             // pending retry can put the pin back after the file is cleared.
             const sessionHash = hashSidebarSessionId(sessionId)
@@ -3133,6 +3233,8 @@ export async function CodexAuthPlugin(
           accountId?: string,
           keepwarmAccountKey: string = 'main',
           vaultReceipt?: QuotaReceipt,
+          limitsRequest?: OpenAiLimitsRequest,
+          binding?: IdentityBinding,
         ): Promise<Response> {
           // Nothing may leave here without a credential. An empty token is
           // always a local defect, but on the wire it becomes `Bearer ` and
@@ -3222,6 +3324,78 @@ export async function CodexAuthPlugin(
             dumpSessionID: sessionID,
           })
           const requestInit = prepared.init
+          if (limitsRequest) {
+            const dispatch = await limitsRequest.beforeDispatch(
+              binding,
+              () => limits.bindings(),
+              keepwarmAccountKey,
+            )
+            if (dispatch.status !== 'ready') {
+              return dispatch.status === 'absent' && vaultReceipt
+                ? new Response(
+                    vaultModeRefusalText(
+                      vaultModeNoRouteCause(vault),
+                      vault.name,
+                    ),
+                    { status: 401 },
+                  )
+                : killswitchBlockedResponse(null, 'quota-unknown')
+            }
+          }
+          const owner = limitsRequest ? limits.owner() : undefined
+          const probe = owner?.observe(binding)
+          const activityKey =
+            binding?.account ??
+            (!limitsRequest
+              ? limitAccountKey(
+                  poolLimitsNamespace(getConfigPath(), getAccountStatePath()),
+                  {
+                    kind: 'legacy',
+                    id: keepwarmAccountKey,
+                    verifiedIdentity: accountId,
+                  },
+                )
+              : undefined)
+          if (!limitsRequest && activityKey)
+            legacyKeys.set(keepwarmAccountKey, activityKey)
+          const dispatched: SessionDispatch | undefined =
+            sessionID && activityKey && typeof requestInit?.body === 'string'
+              ? {
+                  sessionId: sessionID,
+                  accountKey: activityKey,
+                  dispatchedAt: Date.now(),
+                  ttlMs: ttlForModel(requestInit.body),
+                }
+              : undefined
+          if (sessionID) sessionAccounts.delete(sessionID)
+          if (dispatched) {
+            sessionAccounts.set(dispatched.sessionId, dispatched.accountKey)
+            if (sessionAccounts.size > 256) {
+              const oldest = sessionAccounts.keys().next().value
+              if (oldest) sessionAccounts.delete(oldest)
+            }
+          }
+          const stream = {
+            id: keepwarmAccountKey,
+            receipt: vaultReceipt,
+            migrated: Boolean(limitsRequest),
+            owner,
+            probe,
+            limited: false,
+            complete: (kind: 'http' | 'ws') => {
+              if (init?.signal?.aborted || stream.limited) return
+              if (dispatched)
+                recordSessionCompletion(
+                  limits.activity,
+                  dispatched,
+                  currentSessionAccount(dispatched.sessionId),
+                  kind === 'ws'
+                    ? { kind, event: 'response.completed', aborted: false }
+                    : { kind, completed: true, failed: false, aborted: false },
+                )
+              owner?.afterProbe(probe, true, stream.limited)
+            },
+          }
           const keepwarmEnabled = cacheKeepEnabled
           const keepwarmHeaders = new Headers(requestInit?.headers)
           const keepwarmCapture = buildKeepwarmCapture({
@@ -3260,25 +3434,11 @@ export async function CodexAuthPlugin(
                 },
               })
             }
-            if (!vaultReceipt) {
-              try {
-                return await redactCredentialResponse(
-                  await websocketFetch(url, requestInit),
-                  accessToken,
-                  'event-stream',
-                )
-              } catch (error) {
-                throw redactCredentialError(error, accessToken)
-              }
-            }
-            const key = `vault-stream:${randomUUID()}`
-            vaultStreams.set(key, {
-              id: keepwarmAccountKey,
-              receipt: vaultReceipt,
-            })
+            const key = `stream:${randomUUID()}`
+            streams.set(key, stream)
             const scopedHeaders = new Headers(requestInit?.headers)
             scopedHeaders.set(OpenAIWebSocketPool.QUOTA_ACCOUNT_HEADER, key)
-            const release = () => vaultStreams.delete(key)
+            const release = () => streams.delete(key)
             try {
               const response = await websocketFetch(url, {
                 ...requestInit,
@@ -3374,7 +3534,9 @@ export async function CodexAuthPlugin(
               status: response.status,
             })
             return await redactCredentialResponse(
-              response,
+              observeHttpCompletion(response, (clean) => {
+                if (clean) stream.complete('http')
+              }),
               accessToken,
               'event-stream',
             )
@@ -4408,6 +4570,8 @@ export async function CodexAuthPlugin(
           parentSessionId: string | undefined,
           generation: number,
         ): Promise<Response> {
+          const limitsRequest = await limits.forRequest()
+          const expectedBindings = limits.bindings()
           const mode: RoutingMode = reqStorage?.routing?.mode ?? 'main-first'
           // Vault mode routes the vault's accounts alone, so neither the pool
           // row `main` nor OpenCode's slot is read for this request.
@@ -4431,6 +4595,7 @@ export async function CodexAuthPlugin(
           const sidebarSnapshot = await sidebarCache.get()
           const { response, servedId } = await servePoolRequest({
             source: poolSource,
+            rateLimitMarks: () => limits.marks(),
             ...(vaultMode
               ? {
                   vault: {
@@ -4448,12 +4613,6 @@ export async function CodexAuthPlugin(
                         ...(init?.signal ? { signal: init.signal } : {}),
                       }),
                     requestReading: (id) => vault.requestReading(id),
-                    rateLimitMarks: () => {
-                      for (const [id, until] of vaultMarks) {
-                        if (until <= Date.now()) vaultMarks.delete(id)
-                      }
-                      return vaultMarks
-                    },
                   },
                 }
               : {}),
@@ -4479,6 +4638,10 @@ export async function CodexAuthPlugin(
                 target.identity,
                 target.id,
                 attempt,
+                limitsRequest,
+                expectedBindings.find(
+                  (binding) => binding.account.accountId === target.id,
+                ),
               ),
             recordQuota: (served, target, token, attempt) => {
               try {

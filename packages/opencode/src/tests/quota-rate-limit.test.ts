@@ -1,6 +1,21 @@
-import { describe, expect, it } from 'bun:test'
+import { afterEach, describe, expect, it, spyOn } from 'bun:test'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { AccountStorage } from '@cortexkit/openai-auth-core/internal'
+import type { Hooks, PluginInput } from '@opencode-ai/plugin'
 import { getAccountStoragePath } from '../core/account-paths'
+import { OpenCodeLimitSource } from '../core/limit-source'
+import { PoolAccountSource } from '../core/pool-account-source'
+import { CodexAuthPlugin } from '../index'
+import { flushForTest } from '../logger'
+import { createRequestTestScope } from './request-test-scope'
 
 describe('QuotaManager refresh scheduling', () => {
   const storage: AccountStorage = {
@@ -643,5 +658,577 @@ describe('resolveMidStreamRateLimitResetAt', () => {
     expect(
       resolveMidStreamRateLimitResetAt(quota, 'secondary', now, defaultMs),
     ).toBe(now + defaultMs)
+  })
+})
+
+describe('OC1 mark authority selection', () => {
+  for (const supplied of [false, true]) {
+    it(`${supplied ? 'uses supplied registry projection without reading' : 'defaults to'} the source compatibility map`, async () => {
+      const { servePoolRequest } = await import('../core/pool-request')
+      const now = Date.now()
+      let sourceReads = 0
+      const source = {
+        current: async () => {},
+        prepareTokens: async () => {},
+        peek: () => ({
+          rows: [
+            {
+              id: 'main',
+              type: 'oauth',
+              enabled: true,
+              candidate: true,
+              credential: {
+                type: 'oauth',
+                access: 'test-token',
+                refresh: 'refresh',
+                expires: now + 3600_000,
+              },
+              quota: {
+                limits: [
+                  {
+                    scope: 'all',
+                    label: 'primary',
+                    kind: 'reading',
+                    checkedAt: now,
+                    usedPercent: 10,
+                    resetsAt: new Date(now + 120_000).toISOString(),
+                    windowMinutes: 300,
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        rateLimitMarks: () => {
+          sourceReads++
+          return new Map([['main', now + 60_000]])
+        },
+        refreshBackoffFor: () => new Map(),
+        usableToken: () => 'test-token',
+        requestReading: () => undefined,
+      }
+      const result = await servePoolRequest({
+        source:
+          source as unknown as import('../core/pool-account-source').PoolAccountSource,
+        ...(supplied
+          ? { rateLimitMarks: () => new Map<string, number>() }
+          : {}),
+        storage: { version: 1, accounts: [], killswitch: { enabled: false } },
+        mode: 'main-first',
+        sessionId: undefined,
+        body: '{}',
+        replayable: true,
+        now: () => now,
+        send: async () => new Response('sentinel'),
+        recordQuota: () => {},
+        placePin: () => undefined,
+        blocked: (block) => new Response(block.reason, { status: 429 }),
+        resetCredits: () => undefined,
+        isAbort: () => false,
+        log: { debug: () => {} },
+      })
+      expect(sourceReads === 0).toBe(supplied)
+      expect(await result.response.text()).toBe(
+        supplied ? 'sentinel' : 'mid-stream-rate-limit',
+      )
+    })
+  }
+})
+
+describe('OC1 shared limit transport lifecycle', () => {
+  const scope = createRequestTestScope()
+  let cleanup = async () => {}
+  afterEach(async () => {
+    await scope.teardown(cleanup)
+    cleanup = async () => {}
+  })
+
+  async function fixture(
+    options: { ws?: boolean; unsupported?: boolean } = {},
+  ) {
+    const dir = mkdtempSync(join(tmpdir(), 'oc1-limit-transport-'))
+    const config = join(dir, 'accounts.json')
+    const state = join(dir, 'state.json')
+    const vars: Record<string, string> = {
+      OPENCODE_OPENAI_AUTH_FILE: config,
+      OPENCODE_OPENAI_AUTH_STATE_FILE: state,
+      OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE: join(dir, 'sidebar.json'),
+      OPENCODE_OPENAI_AUTH_LOG_FILE: join(dir, 'plugin.log'),
+      OPENCODE_CONFIG_DIR: dir,
+    }
+    const env = Object.fromEntries(
+      Object.keys(vars).map((key) => [key, process.env[key]]),
+    )
+    Object.assign(process.env, vars)
+    const originalFetch = globalThis.fetch
+    const originalSocket = globalThis.WebSocket
+    let now = 1_800_000_000_000
+    const clock = spyOn(Date, 'now').mockImplementation(() => now)
+    const rows = ['main', 'b']
+    writeFileSync(
+      config,
+      JSON.stringify({
+        version: 1,
+        main: { type: 'opencode', provider: 'openai' },
+        accounts: rows.map((id) => ({
+          id,
+          type: 'oauth',
+          enabled: true,
+          accountId: `identity-${id}`,
+          addedAt: 1,
+        })),
+        routing: { mode: 'main-first' },
+        commonAuthPool: {
+          schemaVersion: 1,
+          rows: Object.fromEntries(
+            rows.map((id) => [
+              id,
+              {
+                credentialEpoch: 1,
+                needsFirstReading: false,
+                quota: {
+                  limits: [
+                    {
+                      scope: 'all',
+                      label: 'primary',
+                      kind: 'reading',
+                      checkedAt: now,
+                      usedPercent: 10,
+                      resetsAt: new Date(now + 60_000).toISOString(),
+                      windowMinutes: 300,
+                    },
+                  ],
+                },
+              },
+            ]),
+          ),
+        },
+        openaiAuthPool: { migratedAt: now - 60_000 },
+        ...(options.unsupported
+          ? { commonAuthLimits: { schemaVersion: 2 } }
+          : {}),
+      }),
+    )
+    writeFileSync(
+      state,
+      JSON.stringify({
+        version: 1,
+        accounts: Object.fromEntries(
+          rows.map((id) => [
+            id,
+            {
+              access: `${id}-token`,
+              refresh: `${id}-refresh`,
+              expires: now + 3600_000,
+            },
+          ]),
+        ),
+      }),
+    )
+    const wire: string[] = []
+    let failWs = true
+    let httpStatus = 200
+    let httpBody: BodyInit = 'data: {"type":"response.completed"}\n\n'
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).includes('/responses')) {
+          wire.push(new Headers(init?.headers).get('authorization') ?? '')
+          return new Response(httpBody, {
+            status: httpStatus,
+            headers: { 'content-type': 'text/event-stream' },
+          })
+        }
+        return Response.json({})
+      },
+      { preconnect() {} },
+    ) as typeof fetch
+    class Socket extends EventTarget {
+      readyState = 0
+      constructor(
+        _url: string,
+        private options?: { headers?: Record<string, string> },
+      ) {
+        super()
+        queueMicrotask(() => {
+          this.readyState = 1
+          this.dispatchEvent(new Event('open'))
+        })
+      }
+      send() {
+        const token = this.options?.headers?.authorization ?? ''
+        wire.push(token)
+        const event =
+          failWs && token === 'Bearer main-token'
+            ? {
+                type: 'response.failed',
+                response: {
+                  id: 'failed',
+                  failed: { rate_limit_reached_type: 'primary' },
+                },
+              }
+            : {
+                type: 'response.completed',
+                response: { id: 'completed', output: [] },
+              }
+        this.dispatchEvent(
+          new MessageEvent('message', { data: JSON.stringify(event) }),
+        )
+      }
+      close() {
+        this.readyState = 3
+      }
+    }
+    globalThis.WebSocket = Socket as unknown as typeof WebSocket
+    let source: OpenCodeLimitSource | undefined
+    const forRequest = OpenCodeLimitSource.prototype.forRequest
+    const sourceSpy = spyOn(
+      OpenCodeLimitSource.prototype,
+      'forRequest',
+    ).mockImplementation(async function (this: OpenCodeLimitSource) {
+      source = this
+      return forRequest.call(this)
+    })
+    const mapSpy = spyOn(
+      PoolAccountSource.prototype,
+      'rateLimitMarks',
+    ).mockImplementation(() => {
+      throw new Error('OC1 read the compatibility map')
+    })
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
+    const legacySpy = spyOn(QuotaManager.prototype, 'markRateLimited')
+    scope.capturePluginWork()
+    let hooks: Hooks | undefined
+    cleanup = async () => {
+      await hooks?.dispose?.()
+      sourceSpy.mockRestore()
+      mapSpy.mockRestore()
+      legacySpy.mockRestore()
+      clock.mockRestore()
+      globalThis.fetch = originalFetch
+      globalThis.WebSocket = originalSocket
+      for (const [key, value] of Object.entries(env)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      rmSync(dir, { recursive: true, force: true })
+    }
+    mkdirSync(join(dir, 'vault'), { mode: 0o700 })
+    hooks = scope.ownPlugin(
+      await CodexAuthPlugin(
+        {
+          client: {
+            auth: { set: async () => {} },
+            session: { promptAsync: async () => {} },
+          },
+          project: { id: 'limits' },
+          directory: '',
+          worktree: dir,
+          experimental_workspace: { register() {} },
+          serverUrl: new URL('http://localhost:0'),
+          $: {},
+        } as unknown as PluginInput,
+        {
+          experimentalWebSockets: options.ws ?? true,
+          poolMigration: { enabled: false },
+          vault: {
+            stateDir: join(dir, 'vault'),
+            connectionFile: () => join(dir, 'absent-daemon'),
+            pollIntervalMs: 0,
+          },
+        },
+      ),
+    )
+    const loader = hooks.auth?.loader
+    if (!loader) throw new Error('missing loader')
+    const loaded = await loader(
+      async () => ({
+        type: 'oauth',
+        refresh: 'common-auth-placeholder:v1:openai',
+        access: '',
+        expires: 0,
+      }),
+      { id: 'openai', models: [] } as never,
+    )
+    const send = (
+      loaded as { fetch: (url: string, init: RequestInit) => Promise<Response> }
+    ).fetch
+    return {
+      wire,
+      legacySpy,
+      mapSpy,
+      limits: () => {
+        if (!source) throw new Error('missing limits source')
+        return source
+      },
+      advance: (ms: number) => {
+        now += ms
+      },
+      now: () => now,
+      succeedWs: () => {
+        failWs = false
+      },
+      http: (status: number, body: BodyInit) => {
+        httpStatus = status
+        httpBody = body
+      },
+      log: async () => {
+        await flushForTest()
+        return readFileSync(join(dir, 'plugin.log'), 'utf8')
+      },
+      request: (session = 'limit-session') =>
+        scope.wrap(send)('https://api.openai.com/v1/responses', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'session-id': session,
+          },
+          body: JSON.stringify({ model: 'gpt-5.5', input: [], stream: true }),
+        }),
+    }
+  }
+
+  it('publishes one account-wide WS mark and routes the reissue without touching legacy maps', async () => {
+    const f = await fixture()
+    const first = await f.request()
+    await expect(first.text()).rejects.toMatchObject({ isRetryable: true })
+    const owner = f.limits().owner()
+    await owner?.flush()
+    const snapshot = owner?.snapshot()
+    expect(snapshot?.marks).toHaveLength(1)
+    expect(snapshot?.operationIds).toHaveLength(1)
+    expect(snapshot?.marks[0]).toMatchObject({
+      key: {
+        account: { accountId: 'main' },
+        window: 'account',
+        scope: { kind: 'pool' },
+      },
+      entries: [{ cause: 'rate-limit', until: 1_800_000_060_000 }],
+    })
+    expect(await (await f.request()).text()).toContain('response.completed')
+    expect(f.wire).toEqual(['Bearer main-token', 'Bearer b-token'])
+    await owner?.flush()
+    expect(owner?.snapshot()?.marks).toHaveLength(1)
+    expect(owner?.snapshot()?.operationIds).toHaveLength(1)
+    expect(f.legacySpy).not.toHaveBeenCalled()
+    expect(f.mapSpy).not.toHaveBeenCalled()
+  })
+
+  it('no-registry fallback drops a WS mark and the next request still sends main', async () => {
+    const f = await fixture({ unsupported: true })
+    await expect((await f.request()).text()).rejects.toMatchObject({
+      isRetryable: true,
+    })
+    expect(f.limits().owner()?.registry).toBeUndefined()
+    expect((await f.log()).match(/OpenAI limit signal dropped/g)).toHaveLength(
+      1,
+    )
+    expect(f.limits().marks().size).toBe(0)
+    f.succeedWs()
+    await (await f.request()).text()
+    expect(f.wire).toEqual(['Bearer main-token', 'Bearer main-token'])
+    expect(f.legacySpy).not.toHaveBeenCalled()
+    expect(f.mapSpy).not.toHaveBeenCalled()
+  })
+
+  it('HTTP 429 records no mark and a clean HTTP completion accepts dispatch time, not EOF', async () => {
+    const f = await fixture({ ws: false })
+    f.http(429, '{"error":{"type":"usage_limit_reached"}}')
+    await (await f.request()).text()
+    expect(f.limits().owner()?.snapshot()?.operationIds).toHaveLength(0)
+    expect(f.limits().activity.get('limit-session')).toBeUndefined()
+    let complete = () => {}
+    f.http(
+      200,
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          complete = () => {
+            controller.enqueue(
+              new TextEncoder().encode(
+                'data: {"type":"response.completed"}\n\n',
+              ),
+            )
+            controller.close()
+          }
+        },
+      }),
+    )
+    const dispatchedAt = f.now()
+    const response = await f.request()
+    f.advance(240_000)
+    complete()
+    await response.text()
+    expect(f.limits().activity.get('limit-session')).toMatchObject({
+      accountKey: f.limits().accountKey('main'),
+      lastAcceptedAt: dispatchedAt,
+      ttlMs: 300_000,
+    })
+    expect(f.wire).toEqual([
+      'Bearer main-token',
+      'Bearer b-token',
+      'Bearer main-token',
+    ])
+    expect(f.legacySpy).not.toHaveBeenCalled()
+    expect(f.limits().owner()?.snapshot()?.operationIds).toHaveLength(0)
+  })
+
+  it('clean HTTP completion cannot clear a live mark published during the request', async () => {
+    const f = await fixture({ ws: false })
+    let complete = () => {}
+    f.http(
+      200,
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          complete = () => {
+            controller.enqueue(
+              new TextEncoder().encode(
+                'data: {"type":"response.completed"}\n\n',
+              ),
+            )
+            controller.close()
+          }
+        },
+      }),
+    )
+    const response = await f.request()
+    const owner = f.limits().owner()
+    const binding = f
+      .limits()
+      .bindings()
+      .find((binding) => binding.account.accountId === 'main')
+    const observed = owner?.observe(binding)
+    if (!owner || !observed) throw new Error('missing dispatch binding')
+    owner.enqueue({
+      type: 'mark',
+      binding: observed.binding,
+      baseRevision: observed.baseRevision,
+      producerId: 'other-owner',
+      operationId: 'live-mark',
+      scope: { kind: 'pool' },
+      window: 'account',
+      cause: 'rate-limit',
+      until: f.now() + 120_000,
+      evidenceAt: f.now(),
+      mergeLaw: 'max-until',
+    })
+    await owner.flush()
+    complete()
+    await response.text()
+    await owner.flush()
+    expect(owner.snapshot()?.marks).toHaveLength(1)
+    expect(owner.snapshot()?.operationIds).toHaveLength(1)
+  })
+
+  it('WS completion earns one expired-probe clear and ordinary healthy turns add no writes', async () => {
+    const f = await fixture()
+    await expect((await f.request()).text()).rejects.toMatchObject({
+      isRetryable: true,
+    })
+    const owner = f.limits().owner()
+    await owner?.flush()
+    f.advance(60_000)
+    f.succeedWs()
+    const dispatchedAt = f.now()
+    await (await f.request()).text()
+    await owner?.flush()
+    expect(owner?.snapshot()?.marks).toEqual([])
+    expect(owner?.snapshot()?.operationIds).toHaveLength(2)
+    expect(f.limits().activity.get('limit-session')).toMatchObject({
+      accountKey: f.limits().accountKey('main'),
+      lastAcceptedAt: dispatchedAt,
+      ttlMs: 300_000,
+    })
+    for (let n = 0; n < 20; n++) await (await f.request()).text()
+    await owner?.flush()
+    expect(owner?.snapshot()?.operationIds).toHaveLength(2)
+    expect(f.legacySpy).not.toHaveBeenCalled()
+  })
+})
+
+describe('legacy expiry and resolver boundaries', () => {
+  it('expires exactly at the deadline in both account buckets and empty quota is not health', async () => {
+    const { QuotaManager } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
+    let now = 7_000_000
+    const manager = new QuotaManager({
+      configPath: getAccountStoragePath(),
+      storage: null,
+      now: () => now,
+    })
+    for (const id of ['main', 'fallback']) {
+      manager.markRateLimited(id, now + 60_000)
+      if (id === 'main')
+        manager.setMain(
+          'token',
+          { quota: {}, checkedAt: now, refreshAfter: now + 60_000 },
+          'identity',
+          true,
+        )
+      else
+        manager.setFallback(
+          id,
+          { quota: {}, checkedAt: now, refreshAfter: now + 60_000 },
+          'token',
+          true,
+          'identity',
+        )
+      expect(manager.isRateLimited(id)).toBe(true)
+    }
+    now += 60_000
+    expect(manager.isRateLimited('main')).toBe(false)
+    expect(manager.isRateLimited('fallback')).toBe(false)
+  })
+
+  it('invalid and equal explicit resets fall through to the exact named cache, never a sibling', async () => {
+    const { resolveMidStreamRateLimitResetAt } = await import(
+      '@cortexkit/openai-auth-core/internal'
+    )
+    const now = 7_000_000
+    const reading = {
+      primary: {
+        usedPercent: 100,
+        remainingPercent: 0,
+        checkedAt: 1,
+        resetsAt: new Date(now + 120_000).toISOString(),
+      },
+      secondary: {
+        usedPercent: 100,
+        remainingPercent: 0,
+        checkedAt: now,
+        resetsAt: new Date(now + 900_000).toISOString(),
+      },
+    }
+    for (const reset of [
+      now,
+      now - 1,
+      0,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+    ]) {
+      expect(
+        resolveMidStreamRateLimitResetAt(
+          reading,
+          'primary',
+          now,
+          60_000,
+          reset,
+        ),
+      ).toBe(7_120_000)
+      expect(
+        resolveMidStreamRateLimitResetAt(
+          reading,
+          'capacity',
+          now,
+          60_000,
+          reset,
+        ),
+      ).toBe(7_060_000)
+    }
+    reading.primary.resetsAt = new Date(now).toISOString()
+    expect(
+      resolveMidStreamRateLimitResetAt(reading, 'primary', now, 60_000),
+    ).toBe(7_060_000)
   })
 })
