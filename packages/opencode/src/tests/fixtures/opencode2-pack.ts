@@ -28,13 +28,22 @@ export function installPackedPackages(
   mkdirSync(packs, { recursive: true })
   const tarballs = sources.map((source) => {
     // Packing must not rebuild; it packs the build under test.
-    const packed = JSON.parse(
+    const parsed: unknown = JSON.parse(
       run(
         'npm',
         ['pack', '--pack-destination', packs, '--ignore-scripts', '--json'],
         source,
       ),
-    ) as { filename: string }[]
+    )
+    // npm 11 prints an array of package records, npm 12 an object keyed by
+    // package name; the records have the same fields.
+    const packed = (
+      Array.isArray(parsed)
+        ? parsed
+        : parsed !== null && typeof parsed === 'object'
+          ? Object.values(parsed)
+          : []
+    ) as { filename?: string }[]
     if (packed.length !== 1 || !packed[0]?.filename)
       throw new Error(`npm pack returned no single tarball for ${source}`)
     return join(packs, packed[0].filename)
