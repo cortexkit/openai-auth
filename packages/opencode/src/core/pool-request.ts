@@ -27,7 +27,22 @@
 // back to a local row.
 
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
-import { isQuotaMap } from '@cortexkit/common-auth/quota'
+import {
+  type AccountKey,
+  createRequestHistory,
+  type LimitCandidate,
+  type LimitDecision,
+  type LimitSignal,
+  type PolicyFacts,
+  type SessionActivity,
+  sameAccount,
+  type WaitCheckpoint,
+} from '@cortexkit/common-auth/limits'
+import {
+  budgetExhaustedResetAt,
+  isQuotaMap,
+  projectQuota,
+} from '@cortexkit/common-auth/quota'
 import {
   nextOrderedAttempt,
   type OrderedAttempt,
@@ -37,14 +52,25 @@ import {
 import type { PoolRow } from '@cortexkit/common-auth/store'
 import {
   type AccountStorage,
+  buildOpenAiQuotaRefusal,
   chooseVaultRouting,
+  classifyOpenAiLimitBody,
+  decideOpenAiLimit,
+  decideOpenAiTerminal,
   getFallbackStatuses,
   getKillswitchThresholdsForAccount,
+  isKillswitchEnabled,
   isRecord,
   isShieldedMainRow,
   isTombstoned,
+  killswitchPassesPolicy,
+  normalizeQuotaHeaders,
   type OAuthQuotaSnapshot,
+  type OpenAiLimitsOwner,
   observeVaultRoutingResponse,
+  openAiConfirmedBlockers,
+  openAiHoldFacts,
+  openAiTerminalFacts,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
   VAULT_MODE_REFUSAL_CAUSES,
@@ -188,12 +214,18 @@ export interface PoolRequestContext {
   source: PoolAccountSource
   /** The host's mark authority; omitted by callers still using the source map. */
   rateLimitMarks?: () => Map<string, number>
+  /** Process-local HTTP holds; transport streams have no Retry-After channel. */
+  limitPolicy?: PoolLimitPolicy
+  /** Do not create a new hold for a reissue whose pending hold was discarded. */
+  suppressHold?: boolean
   /** The vault accounts; present exactly while this host is in vault mode. */
   vault?: PoolVaultRoutes
   /** The legacy settings this request reads (routing, killswitch, fallback statuses). */
   storage: AccountStorage | null
   mode: RoutingMode
   sessionId: string | undefined
+  /** Separates endpoint and conversation/auxiliary retries within a session. */
+  requestKind?: string
   routingRequest?: VaultRoutingRequest
   /** The buffered request body, when there is one. */
   body: string | undefined
@@ -237,6 +269,404 @@ export interface PoolRequestContext {
     debug(message: string, meta?: Record<string, unknown>): void
     info?(message: string, meta?: Record<string, unknown>): void
   }
+}
+
+export interface PendingPoolHold {
+  sessionId: string
+  accountKey: AccountKey
+  model: string
+  target: number
+  checkpoint: WaitCheckpoint
+  decidedAt: number
+  decision: Extract<LimitDecision, { action: 'hold' }>
+}
+
+export interface PoolLimitPolicy {
+  pending: Map<string, PendingPoolHold>
+  accountKey(id: string): AccountKey | undefined
+  activity(): SessionActivity | undefined
+  currentAccountKey(): AccountKey | undefined
+  owner(): OpenAiLimitsOwner | undefined
+  /** Tests can observe reducer calls to distinguish provider pass-through from a local hold. */
+  decide?: typeof decideOpenAiLimit
+}
+
+function requestModel(ctx: PoolRequestContext): string {
+  try {
+    const body = JSON.parse(ctx.body ?? '{}')
+    return typeof body.model === 'string' ? body.model : ''
+  } catch {
+    return ''
+  }
+}
+
+function pendingKey(ctx: PoolRequestContext): string | undefined {
+  return (
+    ctx.sessionId &&
+    (ctx.requestKind === undefined
+      ? ctx.sessionId
+      : JSON.stringify([ctx.sessionId, ctx.requestKind]))
+  )
+}
+
+function policyCandidates(
+  ctx: PoolRequestContext,
+  rows: readonly PoolTarget[],
+  signal?: LimitSignal,
+  latest?: { id: string; reading: OAuthQuotaSnapshot },
+): LimitCandidate[] {
+  const routing = routingInput(ctx, rows)
+  return rows.flatMap((row) => {
+    const account = ctx.limitPolicy?.accountKey(row.id)
+    if (!account) return []
+    const reading =
+      latest?.id === row.id ? latest.reading : windowsFromQuotaMap(row.quota)
+    const confirmedBlockers = openAiConfirmedBlockers(
+      signal && sameAccount(signal.account, account) ? signal : undefined,
+      reading,
+      routing.now,
+    )
+    const hard = routing.rateLimitMarks.get(row.id)
+    const backoff = routing.refreshBackoff.get(row.id)
+    const blockers = [
+      ...(hard && hard > routing.now
+        ? [{ kind: 'hard' as const, until: hard }]
+        : []),
+      ...(backoff && backoff > routing.now
+        ? [{ kind: 'cooldown' as const, until: backoff }]
+        : []),
+    ]
+    const admitted =
+      killswitchPassesPolicy(
+        reading,
+        ctx.storage,
+        row.id === FORMER_MAIN_ID ? undefined : row.id,
+        routing.now,
+      ) &&
+      !!(reading?.primary || reading?.secondary) &&
+      !budgetExhaustedResetAt(
+        projectQuota(isQuotaMap(row.quota) ? row.quota : undefined),
+        routing.now,
+      ) &&
+      (!row.row || !!ctx.source.usableToken(row.row))
+    return [
+      {
+        account,
+        admitted,
+        placementEligible: admitted,
+        ready: admitted && !blockers.length && !confirmedBlockers.length,
+        blockers,
+        confirmedBlockers,
+      },
+    ]
+  })
+}
+
+function policyFacts(
+  ctx: PoolRequestContext,
+  candidates: LimitCandidate[],
+): PolicyFacts {
+  const now = ctx.now()
+  return {
+    phase: 'after-limit',
+    host: 'opencode1',
+    hostPhase: 'request',
+    now,
+    clockNow: now,
+    sessionId: ctx.sessionId ?? '',
+    requestScope: { kind: 'pool' },
+    history: createRequestHistory({
+      requestId: ctx.sessionId ?? 'request',
+      originalUrl: 'https://api.openai.com/v1/responses',
+      clockNow: now,
+    }),
+    delivery: { owned: true, attributable: true, replayable: ctx.replayable },
+    candidates,
+  }
+}
+
+function policyResponse(
+  ctx: PoolRequestContext,
+  decision: LimitDecision,
+): Response {
+  const wire = buildOpenAiQuotaRefusal({
+    decision,
+    now: ctx.now(),
+    host: 'opencode1',
+    maxSameAccountWait: ctx.storage?.routing?.maxSameAccountWait,
+  })
+  if (wire.kind !== 'http')
+    throw new Error('Expected an OC1 HTTP quota refusal')
+  return new Response(wire.body, { status: wire.status, headers: wire.headers })
+}
+
+async function afterLimit(
+  ctx: PoolRequestContext,
+  row: PoolTarget,
+  response: Response,
+  mode: 'ordered' | 'sticky',
+  next?: string,
+  attempted?: AccountKey,
+): Promise<{ hold?: Response; confirmed: boolean }> {
+  const policy = ctx.limitPolicy
+  // Classify only replayable failed HTTP responses, never consume a successful stream.
+  if (
+    !policy ||
+    !ctx.replayable ||
+    (mode === 'ordered' &&
+      !getFallbackStatuses(ctx.storage).includes(response.status)) ||
+    (mode === 'sticky' && ![401, 403, 429].includes(response.status))
+  )
+    return { confirmed: false }
+  const account = attempted
+  if (!account) return { confirmed: false }
+  const rows = currentTargets(ctx)
+  const current = rows.find((target) => target.id === row.id)
+  // Vault quota publication is detached. Judge the response's own headers now,
+  // without waiting for its roster write or losing a still-present sibling window.
+  const reading = {
+    ...windowsFromQuotaMap(current?.quota),
+    ...normalizeQuotaHeaders(response.headers),
+  }
+  const signal =
+    response.status === 429
+      ? classifyOpenAiLimitBody({
+          account,
+          status: response.status,
+          headers: response.headers,
+          body: await response.clone().text(),
+          now: ctx.now(),
+          reading,
+        })
+      : undefined
+  const candidates = policyCandidates(ctx, rows, signal, {
+    id: row.id,
+    reading,
+  })
+  const candidate = candidates.find((value) =>
+    sameAccount(value.account, account),
+  )
+  const selection =
+    next && candidates.find((value) => value.account.accountId === next)
+  const currentAccount = policy.currentAccountKey()
+  const decision = (policy.decide ?? decideOpenAiLimit)(
+    {
+      ...policyFacts(ctx, candidates),
+      attempted: account,
+      status: response.status,
+      signal,
+      affinity: mode === 'sticky' ? 'sticky' : 'none',
+      ...(selection
+        ? { selection: { account: selection.account, pin: 'preserve' } }
+        : {}),
+      hold:
+        candidate &&
+        ctx.sessionId &&
+        !ctx.suppressHold &&
+        currentAccount &&
+        sameAccount(currentAccount, candidate.account)
+          ? openAiHoldFacts({
+              candidate,
+              status: response.status,
+              activity: policy.activity(),
+              now: ctx.now(),
+              maxSameAccountWait: ctx.storage?.routing?.maxSameAccountWait,
+            })
+          : undefined,
+    },
+    { mode, fallbackOn: ctx.storage?.fallbackOn },
+  )
+  const key = pendingKey(ctx)
+  if (decision?.action === 'hold' && ctx.sessionId && key) {
+    policy.pending.set(key, {
+      sessionId: ctx.sessionId,
+      accountKey: account,
+      model: requestModel(ctx),
+      target: decision.target,
+      checkpoint: decision.checkpoint,
+      decidedAt: ctx.now(),
+      decision,
+    })
+    if (policy.pending.size > 256) {
+      const oldest = policy.pending.keys().next().value
+      if (oldest) policy.pending.delete(oldest)
+    }
+    response.body?.cancel().catch(() => {})
+    return { hold: policyResponse(ctx, decision), confirmed: true }
+  }
+  return {
+    confirmed:
+      !!candidate?.confirmedBlockers?.length && response.status === 429,
+  }
+}
+
+async function consumeHold(
+  ctx: PoolRequestContext,
+  rows: readonly PoolTarget[],
+): Promise<PoolRequestResult | undefined> {
+  const policy = ctx.limitPolicy
+  const session = ctx.sessionId
+  const key = pendingKey(ctx)
+  const pending = key && policy?.pending.get(key)
+  if (!pending || !policy || !session || !key) return undefined
+  const candidates = policyCandidates(ctx, rows)
+  const candidate = candidates.find((value) =>
+    sameAccount(value.account, pending.accountKey),
+  )
+  const windows = new Map<
+    string,
+    NonNullable<LimitCandidate['confirmedBlockers']>[number]
+  >(
+    pending.checkpoint.blockers.map((blocker) => [
+      blocker.window,
+      {
+        ...blocker,
+        confirmed: true,
+        confirmedByReading: false,
+        observedAt: pending.decidedAt,
+        provenance: 'provider',
+      },
+    ]),
+  )
+  for (const blocker of candidate?.confirmedBlockers ?? [])
+    windows.set(blocker.window, blocker)
+  const hold =
+    candidate &&
+    openAiHoldFacts({
+      candidate: { ...candidate, confirmedBlockers: [...windows.values()] },
+      activity: policy.activity(),
+      now: ctx.now(),
+      maxSameAccountWait: ctx.storage?.routing?.maxSameAccountWait,
+    })
+  policy.pending.delete(key)
+  const currentAccount = policy.currentAccountKey()
+  if (
+    !ctx.replayable ||
+    requestModel(ctx) !== pending.model ||
+    !currentAccount ||
+    !sameAccount(currentAccount, pending.accountKey) ||
+    !candidate?.admitted ||
+    !hold ||
+    hold.maxWaitMs <= 0 ||
+    ctx.now() > hold.cacheExpiresAt ||
+    pending.target > Math.min(hold.cacheExpiresAt, ctx.now() + hold.maxWaitMs)
+  )
+    return undefined
+  if (ctx.now() < pending.target) {
+    policy.pending.set(key, pending)
+    return {
+      response: policyResponse(ctx, {
+        ...pending.decision,
+        delayMs: pending.target - ctx.now(),
+        retryAfterMs: pending.target - ctx.now(),
+      }),
+      servedId: candidate.account.accountId,
+    }
+  }
+  // Retain checkpoint evidence even when its reading is stale at wake. Current
+  // windows replace the checkpoint, so new or extended exhaustion cannot be waived.
+  const decision = (policy.decide ?? decideOpenAiLimit)(
+    {
+      ...policyFacts(
+        ctx,
+        candidates.map((value) =>
+          value === candidate
+            ? { ...value, confirmedBlockers: [...windows.values()] }
+            : value,
+        ),
+      ),
+      phase: 'pre-send',
+      attempted: candidate.account,
+      hold,
+      wake: {
+        target: pending.target,
+        checkpoint: pending.checkpoint,
+        kind: 'hold',
+      },
+    },
+    { mode: 'sticky' },
+  )
+  if (decision?.action !== 'retain' || decision.reason !== 'wait-elapsed')
+    return undefined
+  const row = rows.find((value) => value.id === candidate.account.accountId)
+  const response = row && (await sendTo(ctx, row))
+  return response && row ? { response, servedId: row.id } : undefined
+}
+
+function terminalResponse(
+  ctx: PoolRequestContext,
+  rows: readonly PoolTarget[],
+  block: PoolBlock,
+): Response | undefined {
+  if (
+    !ctx.limitPolicy ||
+    !['quota-exhausted', 'killswitch', 'mid-stream-rate-limit'].includes(
+      block.reason,
+    )
+  )
+    return undefined
+  const policy = ctx.limitPolicy
+  const now = ctx.now()
+  const owner = policy.owner()
+  const accounts = rows.flatMap((row) => {
+    const account = policy.accountKey(row.id)
+    if (!account) return []
+    return [
+      {
+        account,
+        reading: windowsFromQuotaMap(row.quota),
+        floors: isKillswitchEnabled(ctx.storage)
+          ? getKillswitchThresholdsForAccount(
+              ctx.storage,
+              row.id === FORMER_MAIN_ID ? undefined : row.id,
+            )
+          : undefined,
+        marks: owner
+          ?.snapshot()
+          ?.marks.filter(
+            (mark) =>
+              mark.key.window === 'account' &&
+              mark.key.scope.kind === 'pool' &&
+              sameAccount(mark.key.account, account),
+          )
+          .flatMap((mark) =>
+            mark.entries.map((entry) => ({
+              until: entry.until,
+              evidenceAt: entry.evidenceAt,
+            })),
+          ),
+      },
+    ]
+  })
+  const terminal = openAiTerminalFacts({
+    accounts,
+    now,
+    effectiveModel: requestModel(ctx),
+    maxSameAccountWait: ctx.storage?.routing?.maxSameAccountWait,
+    activity: policy.activity(),
+    currentAccountKey: policy.currentAccountKey(),
+    provenance: owner?.provenance,
+  })
+  return policyResponse(
+    ctx,
+    decideOpenAiTerminal(
+      {
+        ...policyFacts(ctx, policyCandidates(ctx, rows)),
+        phase: 'pre-send',
+      },
+      accounts.length
+        ? terminal
+        : {
+            ...terminal,
+            messageKey:
+              block.reason === 'killswitch'
+                ? 'killswitch'
+                : block.reason === 'quota-exhausted'
+                  ? 'quota'
+                  : 'timed-mark',
+          },
+    ),
+  )
 }
 
 export interface PoolRequestResult {
@@ -422,6 +852,11 @@ export async function servePoolRequest(
     await firstReading
     rows = currentTargets(ctx)
   }
+  const key = pendingKey(ctx)
+  const hadPending = key && ctx.limitPolicy?.pending.has(key)
+  const held = await consumeHold(ctx, rows)
+  if (held) return held
+  if (hadPending) ctx = { ...ctx, suppressHold: true }
 
   if (
     ctx.mode === 'sticky-balanced' &&
@@ -458,17 +893,19 @@ async function serveOrdered(
       reason: plan.block.reason,
     })
     return {
-      response: ctx.blocked(
-        plan.block,
-        blockQuotas(rows),
-        ctx.vault
-          ? rows.length === 0
-            ? ctx.vault.noRouteCause()
-            : undefined
-          : rows.length === 0
-            ? 'no-accounts'
-            : 'unusable',
-      ),
+      response:
+        terminalResponse(ctx, rows, plan.block) ??
+        ctx.blocked(
+          plan.block,
+          blockQuotas(rows),
+          ctx.vault
+            ? rows.length === 0
+              ? ctx.vault.noRouteCause()
+              : undefined
+            : rows.length === 0
+              ? 'no-accounts'
+              : 'unusable',
+        ),
       servedId: FORMER_MAIN_ID,
     }
   }
@@ -511,6 +948,7 @@ async function serveOrdered(
     )
     const row = id === undefined ? undefined : byId.get(id)
     if (!row) break
+    const attempted = ctx.limitPolicy?.accountKey(row.id)
     let response: Response | undefined
     try {
       response = await sendTo(ctx, row)
@@ -537,6 +975,20 @@ async function serveOrdered(
     last?.response.body?.cancel().catch(() => {})
     last = { response, servedId: row.id }
     attempts.push({ id: row.id, status: response.status })
+    const next = nextOrderedAttempt(
+      order.filter((candidate) => !unsent.has(candidate)),
+      attempts,
+      retryStatuses,
+    )
+    const outcome = await afterLimit(
+      ctx,
+      row,
+      response,
+      'ordered',
+      next,
+      attempted,
+    )
+    if (outcome.hold) return { response: outcome.hold, servedId: row.id }
   }
   if (last) {
     noteServed(ctx, routing, last.servedId)
@@ -674,8 +1126,18 @@ async function serveSticky(
 
   let row = byId.get(id)
   if (!row) return undefined
+  const attempted = ctx.limitPolicy?.accountKey(row.id)
   let response = await sendTo(ctx, row)
   if (!response) return undefined
+  const outcome = await afterLimit(
+    ctx,
+    row,
+    response,
+    'sticky',
+    undefined,
+    attempted,
+  )
+  if (outcome.hold) return { response: outcome.hold, servedId: row.id }
 
   if (
     response.status === 401 ||
@@ -689,9 +1151,12 @@ async function serveSticky(
     sticky = admitSticky(routing)
     place = placer(routing, sticky)
     const after = stickyBreak(routing, sticky, id, response.status)
-    if (after.action === 'migrate') {
+    if (after.action === 'migrate' || outcome.confirmed) {
       const from = id
-      if (migrate(after.reason) && id !== from) {
+      if (
+        migrate(outcome.confirmed ? 'exhausted' : after.reason) &&
+        id !== from
+      ) {
         const replacement = current.find((candidate) => candidate.id === id)
         const replaced = replacement
           ? await sendTo(ctx, replacement)

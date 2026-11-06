@@ -511,6 +511,85 @@ const bearer = (id: string) => `Bearer ${id}-token`
 // ---------------------------------------------------------------------------
 
 describe('a migrated install serves requests from the account pool', () => {
+  it('the first owned local request reaches the provider sentinel with the row bearer', async () => {
+    const clock = spyOn(Date, 'now').mockReturnValue(1_800_000_000_000)
+    try {
+      seedPool('main-first', [{ id: 'main', quota: healthy() }])
+      const wire = installWire({
+        usage: () => new Response('', { status: 503 }),
+        respond: () => new Response('first-owned-local-sentinel'),
+      })
+      const fetchOverride = await loadFetch()
+      expect(
+        await (await fetchOverride(URL_RESPONSES, request('first'))).text(),
+      ).toBe('first-owned-local-sentinel')
+      expect(wire.sends).toEqual(['Bearer main-token'])
+      expect(wire.refreshTokens).toEqual([])
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  it('the real fetch override keeps an HTTP hold and wakes A after a clean accepted turn', async () => {
+    const start = 1_800_000_000_000
+    let now = start
+    const clock = spyOn(Date, 'now').mockImplementation(() => now)
+    try {
+      seedPool('main-first', [
+        { id: 'main', quota: healthy() },
+        { id: 'fallback-1', quota: healthy() },
+      ])
+      let limited = false
+      const wire = installWire({
+        usage: () => new Response('', { status: 503 }),
+        respond: () =>
+          limited
+            ? Response.json(
+                {
+                  error: {
+                    type: 'usage_limit_reached',
+                    resets_at: (start + 60_000) / 1000,
+                  },
+                },
+                { status: 429 },
+              )
+            : new Response(
+                'data: {"type":"response.completed","response":{"id":"accepted","output":[]}}\n\n',
+                { headers: { 'content-type': 'text/event-stream' } },
+              ),
+      })
+      const fetchOverride = await loadFetch()
+      await (await fetchOverride(URL_RESPONSES, request('hold-session'))).text()
+      limited = true
+      const held = await fetchOverride(URL_RESPONSES, request('hold-session'))
+      expect(held.headers.get('retry-after')).toBe('60')
+      expect(await held.text()).toBe(
+        '{"error":{"message":"OpenAI usage limit reached on this account. Waiting for it keeps the conversation\'s prompt cache. Retry in 1m.","type":"rate_limit_exceeded","code":"rate_limit_exceeded"}}',
+      )
+      now += 10_001
+      expect(
+        (
+          await fetchOverride(URL_RESPONSES, request('hold-session'))
+        ).headers.get('retry-after'),
+      ).toBe('50')
+      expect(wire.sends).toEqual(['Bearer main-token', 'Bearer main-token'])
+      now = start + 60_000
+      limited = false
+      expect(
+        await (
+          await fetchOverride(URL_RESPONSES, request('hold-session'))
+        ).text(),
+      ).toContain('response.completed')
+      expect(wire.sends).toEqual([
+        'Bearer main-token',
+        'Bearer main-token',
+        'Bearer main-token',
+      ])
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
   for (const mode of MODES) {
     it(`${mode}: sends with a pool row and records its quota through the store`, async () => {
       seedPool(mode, [
@@ -864,6 +943,8 @@ describe('exhaustion and the credit budget on a migrated install', () => {
         { id: 'fallback-1', quota: quotaMap(100) },
       ])
       const wire = installWire({
+        // Keep the exhausted seed from being healed by a background quota poll.
+        usage: failedPolls,
         respond: () => new Response('{}', { status: 429 }),
       })
       const fetchOverride = await loadFetch()
@@ -880,7 +961,8 @@ describe('exhaustion and the credit budget on a migrated install', () => {
         { id: 'main', quota: spent() },
         { id: 'fallback-1', quota: spent() },
       ])
-      const wire = installWire()
+      // Keep the spent-budget seed from being healed by a background quota poll.
+      const wire = installWire({ usage: failedPolls })
       const fetchOverride = await loadFetch()
 
       const response = await fetchOverride(URL_RESPONSES, request('s-spent'))
@@ -943,7 +1025,10 @@ describe('the killswitch on a migrated install', () => {
         ],
         killswitch,
       )
-      const wire = installWire()
+      // Keep the below-floor seed from being healed by a background quota poll.
+      const wire = installWire({
+        usage: () => new Response('', { status: 503 }),
+      })
       const fetchOverride = await loadFetch()
 
       const response = await fetchOverride(URL_RESPONSES, request('s-ks'))
@@ -961,7 +1046,10 @@ describe('the killswitch on a migrated install', () => {
         ],
         killswitch,
       )
-      const wire = installWire()
+      // Keep the below-floor seeds from being healed by a background quota poll.
+      const wire = installWire({
+        usage: () => new Response('', { status: 503 }),
+      })
       const fetchOverride = await loadFetch()
 
       const response = await fetchOverride(URL_RESPONSES, request('s-ks-all'))

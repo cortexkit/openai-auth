@@ -161,6 +161,7 @@ import { observationFromSnapshot, windowsFromQuotaMap } from './core/pool-quota'
 import {
   isVaultModeRefusal,
   LOCAL_CREDENTIAL_REFUSALS,
+  type PendingPoolHold,
   type PoolBlockQuotas,
   type PoolPinPlacement,
   servePoolRequest,
@@ -1330,6 +1331,12 @@ export async function CodexAuthPlugin(
   let poolAccountSource: PoolAccountSource | undefined
   let limitSource: OpenCodeLimitSource | undefined
   const sessionAccounts = new Map<string, AccountKey>()
+  const pendingPoolHolds = new Map<string, PendingPoolHold>()
+  const forgetPoolHolds = (sessionId: string) => {
+    for (const [key, hold] of pendingPoolHolds) {
+      if (hold.sessionId === sessionId) pendingPoolHolds.delete(key)
+    }
+  }
   // Background account-pool migration, and adoption into the pool of logins
   // that land in OpenCode's slot after it. A client that cannot write the
   // slot runs without both and logs why: a migration that is off without a
@@ -1565,6 +1572,7 @@ export async function CodexAuthPlugin(
       if (input.event.type !== 'session.deleted') return
       const info = input.event.properties.info
       limitSource?.forget(info.id)
+      forgetPoolHolds(info.id)
       sessionAccounts.delete(info.id)
       const meta = codexSessions.get(info.id)
       if (meta) {
@@ -3099,6 +3107,7 @@ export async function CodexAuthPlugin(
           },
           clearStickyRouting: async (sessionId) => {
             limits.forget(sessionId)
+            forgetPoolHolds(sessionId)
             sessionAccounts.delete(sessionId)
             // Drop this process's copy first so neither the next request nor a
             // pending retry can put the pin back after the file is cleared.
@@ -4619,9 +4628,29 @@ export async function CodexAuthPlugin(
             currentMainIdentity = mainRow?.identity
           }
           const sidebarSnapshot = await sidebarCache.get()
+          const routingRequest = vaultRoutingRequestFromBody(
+            init?.body,
+            effectiveRequestHeaders(requestInput, init).get(
+              OPENAI_AGENT_HEADER,
+            ) ?? undefined,
+          )
+          const requestPath = new URL(
+            requestInput instanceof Request
+              ? requestInput.url
+              : String(requestInput),
+          ).pathname
           const { response, servedId } = await servePoolRequest({
             source: poolSource,
             rateLimitMarks: () => limits.marks(),
+            limitPolicy: {
+              pending: pendingPoolHolds,
+              accountKey: (id) => limits.accountKey(id),
+              activity: () =>
+                sessionId ? limits.activity.get(sessionId) : undefined,
+              currentAccountKey: () =>
+                sessionId ? currentSessionAccount(sessionId) : undefined,
+              owner: () => limits.owner(),
+            },
             ...(vaultMode
               ? {
                   vault: {
@@ -4645,14 +4674,11 @@ export async function CodexAuthPlugin(
             storage: reqStorage,
             mode,
             sessionId,
-            routingRequest: vaultMode
-              ? vaultRoutingRequestFromBody(
-                  init?.body,
-                  effectiveRequestHeaders(requestInput, init).get(
-                    OPENAI_AGENT_HEADER,
-                  ) ?? undefined,
-                )
-              : undefined,
+            requestKind: JSON.stringify([
+              requestPath,
+              routingRequest?.kind ?? 'auxiliary',
+            ]),
+            routingRequest: vaultMode ? routingRequest : undefined,
             body: typeof init?.body === 'string' ? init.body : undefined,
             replayable: isReplayableRequest(requestInput, init),
             now: Date.now,

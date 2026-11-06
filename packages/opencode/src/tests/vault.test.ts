@@ -202,6 +202,38 @@ async function plugin(
 }
 
 describe('OpenCode 1 vault stream admission', () => {
+  test('the first owned vault request reaches the sentinel with the served bearer without manual roster warm-up', async () => {
+    const clock = spyOn(Date, 'now').mockReturnValue(1_800_000_000_000)
+    try {
+      const running = await startDaemon({
+        'oauth:openai:vault': vaultLogin('chatgpt-vault'),
+      })
+      enroll()
+      seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+      const wire = installWire()
+      const network = globalThis.fetch
+      globalThis.fetch = (async (url, init) => {
+        const response = await network(url, init)
+        return String(url).includes('/responses')
+          ? new Response('first-owned-vault-sentinel')
+          : response
+      }) as typeof fetch
+      hooks = await loadPlugin({
+        vault: {
+          stateDir,
+          connectionFile: () => running.connectionFile,
+          pollIntervalMs: 0,
+        },
+      })
+      const response = await request(await fetchOverride(), 'first-vault')
+      expect(await response.text()).toBe('first-owned-vault-sentinel')
+      expect(wire.sends).toEqual([`Bearer ${VAULT_ACCESS}`])
+      expect(wire.refreshTokens).toEqual([])
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
   test('local OpenCode 1 reply quota never reports usage to the vault', async () => {
     await startDaemon()
     seedPool(files, [{ id: 'main', quota: quotaMap(10) }])

@@ -40,3 +40,11 @@ The **Auth doctor** in the `opencode auth login` menu checks stored credentials 
 ## `Failed to authorize` after the account menu
 
 The `opencode auth login` account menu saves your change itself, then reports a failed sign-in to prevent OpenCode from recording an extra account as its main login. OpenCode prints `Failed to authorize` for that response, even though the menu change was saved. Open the plugin's `/openai` menu to see the result.
+
+## OpenCode 1 returns a local quota response
+
+A confirmed usage limit can return a local 429 instead of moving the conversation to another account. The message says that waiting keeps the conversation's prompt cache, and `Retry-After` gives the remaining wait in whole seconds (rounded up). The fetch call does not sleep. This happens only when every confirmed blocking window resets within the same account's remaining cache lifetime and **Longest wait on the same account** setting. An account below the killswitch's configured minimum remaining quota, or a longer live account-wide pause, prevents this hold; a generic 429 or Retry-After header alone does not prove exhaustion.
+
+A reissued request before the target gets the remaining delay, not a new wait. At the target, the plugin checks the account, credentials, cache activity and current quota blockers again. A changed model or login, forgotten session, expired cache, disabled waiting or killswitch rejection discards the hold and uses normal routing. WebSocket failures still use the stream's existing retry path; they do not create an HTTP hold.
+
+When admission permits no account to send, the local response is separate from a same-account hold. With waiting enabled, a fresh known release supplies a setting-capped Retry-After; the message's reset time describes the actual quota release, which can be later. Unknown or stale reset evidence gets only a five-minute retry hint. **Don't wait** returns a non-retryable 412 with no Retry-After. Unknown quota keeps its separate five-second checking response. Provider responses outside the configured ordered fallback statuses, credential refusals and refusals by the vault to serve a credential keep their existing behavior.
