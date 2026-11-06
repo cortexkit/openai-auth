@@ -668,11 +668,33 @@ describe('vault command menu', () => {
         .find((section) => section.id === 'accounts')!
         .actions.map((action) => action.id),
     ).toEqual(['add'])
-    expect(
-      disconnected.sections
-        .find((section) => section.id === 'routing')!
-        .actions.map((action) => action.id),
-    ).toEqual(['mode', 'order'])
+    const localRouting = disconnected.sections.find(
+      (section) => section.id === 'routing',
+    )!
+    expect(localRouting.actions.map((action) => action.id)).toEqual([
+      'mode',
+      'order',
+      'maxSameAccountWait',
+    ])
+    const wait = localRouting.actions.find(
+      (action) => action.id === 'maxSameAccountWait',
+    )!
+    expect({ label: wait.label, knobs: wait.knobs }).toEqual({
+      label: 'Longest wait on the same account',
+      knobs: [
+        {
+          kind: 'choice',
+          id: 'maxSameAccountWait',
+          label: 'Longest wait on the same account',
+          choices: [
+            { value: '0', label: "Don't wait" },
+            { value: '15', label: '15 minutes' },
+            { value: 'max', label: 'Until the cache expires' },
+          ],
+          value: '15',
+        },
+      ],
+    })
   })
   test('stale local dialog writes in vault mode refuse with a fixed message and byte-identical pool files', async () => {
     const ctx = context(false)
@@ -744,6 +766,7 @@ describe('vault command menu', () => {
 ### Routing
 Mode: Main first
 Roster order: main, ufuk
+Longest wait on the same account: 15 minutes
 
 ### Limits
 Killswitch off

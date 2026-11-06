@@ -367,11 +367,31 @@ describe('Pi and the Claustrum vault', () => {
           .find((section) => section.id === 'accounts')!
           .actions.map((action) => action.id),
       ).toEqual(['add'])
-      expect(
-        local
-          .find((section) => section.id === 'routing')!
-          .actions.map((action) => action.id),
-      ).toEqual(['mode', 'order'])
+      const localRouting = local.find((section) => section.id === 'routing')!
+      expect(localRouting.actions.map((action) => action.id)).toEqual([
+        'mode',
+        'order',
+        'maxSameAccountWait',
+      ])
+      const wait = localRouting.actions.find(
+        (action) => action.id === 'maxSameAccountWait',
+      )!
+      expect({ label: wait.label, knobs: wait.knobs }).toEqual({
+        label: 'Longest wait on the same account',
+        knobs: [
+          {
+            kind: 'choice',
+            id: 'maxSameAccountWait',
+            label: 'Longest wait on the same account',
+            choices: [
+              { value: '0', label: "Don't wait" },
+              { value: '15', label: '15 minutes' },
+              { value: 'max', label: 'Until the cache expires' },
+            ],
+            value: '15',
+          },
+        ],
+      })
       // Finish quota writes started in local mode before measuring whether
       // vault-mode menu actions leave the pool files unchanged.
       await support.store().pullsSettled()
