@@ -155,6 +155,36 @@ function fakeLocation() {
   return { location, state, sent, warnings, warningData }
 }
 
+test('successful OC2 keep-warm refreshes dispatch-time cache activity; failed replay does not', async () => {
+  const { createSessionActivityStore } = await import(
+    '@cortexkit/common-auth/limits'
+  )
+  const activity = createSessionActivityStore()
+  const key = { namespace: 'keep-warm', accountId: 'A', incarnation: '1' }
+  const fake = served()
+  fake.location.limits = { activity, accountKey: () => key }
+  const { lease, clock } = acquire(fake.location)
+  activity.recordAccepted({
+    sessionId: 'ses',
+    accountKey: key,
+    currentAccountKey: key,
+    lastAcceptedAt: START - 1000,
+    ttlMs: 300_000,
+  })
+  await lease.capture(captured('ses'))
+  await advance(lease, clock, 4 * MINUTE)
+  expect(fake.sent).toHaveLength(1)
+  expect(activity.get('ses')).toEqual({
+    accountKey: key,
+    lastAcceptedAt: START + 4 * MINUTE,
+    ttlMs: 300_000,
+  })
+  fake.state.status = 500
+  await advance(lease, clock, 4 * MINUTE)
+  expect(fake.sent).toHaveLength(2)
+  expect(activity.get('ses')?.lastAcceptedAt).toBe(START + 4 * MINUTE)
+})
+
 function storePaths() {
   const dir = join(tmpdir(), `oc2-cache-keep-${randomUUID()}`)
   return { configPath: join(dir, 'c.json'), statePath: join(dir, 's.json') }

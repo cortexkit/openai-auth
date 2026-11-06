@@ -79,7 +79,6 @@ function standIn(access: Access) {
       throw new Error('no poll expected')
     },
     peek: () => ({ active: true, rows: [] }),
-    rateLimitMarks: () => new Map(),
   }
   return { source, calls }
 }
@@ -88,6 +87,7 @@ const STORAGE = { version: 1, accounts: [] } as unknown as AccountStorage
 
 function depsOver(source: ResetPoolAccess, now: () => number = () => NOW) {
   return createPoolResetDeps({
+    rateLimitMarks: () => new Map(),
     source,
     storage: async () => STORAGE,
     counts: new ResetCreditCounts(),
@@ -197,8 +197,10 @@ function poolDeps(
   counts = new ResetCreditCounts(),
   now: () => number = () => NOW,
   authority?: () => Promise<'vault' | 'local' | 'unreadable'>,
+  marks: ReadonlyMap<string, number> = new Map(),
 ) {
   return createPoolResetDeps({
+    rateLimitMarks: () => marks,
     source,
     storage: () => loadAccounts(pool.paths()),
     counts,
@@ -383,8 +385,10 @@ describe('OpenCode 2 reset quota re-check and quota view', () => {
     // each test sees only the polls it asks for.
     await source.settled()
     server.bearers.length = 0
-    const deps = poolDeps(pool, source, counts, now)
+    const marks = new Map<string, number>()
+    const deps = poolDeps(pool, source, counts, now, undefined, marks)
     return {
+      marks,
       pool,
       server,
       source,
@@ -473,9 +477,9 @@ describe('OpenCode 2 reset quota re-check and quota view', () => {
   })
 
   it('is rate limited while the pool mark runs past now', async () => {
-    const { source, deps, advance } = await polledPool()
+    const { marks, deps, advance } = await polledPool()
     expect(deps.quotaManager.isRateLimited('alpha')).toBe(false)
-    source.markRateLimited('alpha', NOW + 1_000)
+    marks.set('alpha', NOW + 1_000)
     expect(deps.quotaManager.isRateLimited('alpha')).toBe(true)
     expect(deps.quotaManager.isRateLimited('main')).toBe(false)
     expect(deps.quotaManager.isRateLimited('ghost')).toBe(false)

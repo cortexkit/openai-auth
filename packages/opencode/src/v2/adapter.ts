@@ -37,12 +37,20 @@
 
 import { randomUUID } from 'node:crypto'
 import type { ClaustrumScopedAttempt } from '@cortexkit/common-auth/claustrum'
-import { type LimitWindow, sameAccount } from '@cortexkit/common-auth/limits'
+import {
+  createRequestHistory,
+  type LimitCandidate,
+  type LimitWindow,
+  type PolicyFacts,
+  readMaxSameAccountWait,
+  sameAccount,
+} from '@cortexkit/common-auth/limits'
 import type {
   AccountHeadersResult,
   AccountRequest,
   Attempt,
   ChooseAccountInput,
+  ChooseAccountResult,
   EventVerdict,
   HostError,
   LimitSignal,
@@ -51,33 +59,44 @@ import type {
 } from '@cortexkit/common-auth/opencode2'
 import {
   DEFAULT_MAX_RECORDS,
+  MAX_RETRY_HOLD_MS,
   OpenCode2AuthError,
 } from '@cortexkit/common-auth/opencode2'
-import { isQuotaMap } from '@cortexkit/common-auth/quota'
+import {
+  budgetExhaustedResetAt,
+  isQuotaMap,
+  projectQuota,
+} from '@cortexkit/common-auth/quota'
 import type { RoutingRow, StickyPin } from '@cortexkit/common-auth/routing'
 import type { PoolRow } from '@cortexkit/common-auth/store'
 import {
   type AccountStorage,
+  buildOpenAiQuotaRefusal,
   chooseVaultRouting,
+  decideOpenAiLimit,
+  decideOpenAiTerminal,
   extractAccountIdFromClaims,
   getKillswitchThresholdsForAccount,
   hasVaultRoutingAccessor,
   isCompleteQuotaHeaderFrame,
+  isKillswitchEnabled,
   type LimitsProbe,
   normalizeQuotaHeaders,
   normalizeWsFrame,
   type OpenAiLimitsOwner,
   type OpenAiLimitsRequest,
   type OpenAiVault,
+  openAiConfirmedBlockers,
+  openAiHoldFacts,
   openAiRateLimitCommand,
   openAiSignalWindows,
+  openAiTerminalFacts,
   parseJwtClaims,
   placeStickyPin,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
   recordSessionCompletion,
   reportVaultRouting,
-  resolveMidStreamRateLimitResetAt,
   type SessionDispatch,
   ttlForModel,
   type VaultModeRefusal,
@@ -122,6 +141,9 @@ import { SessionAccounts } from './session-accounts'
 /** The provider (and integration) OpenCode 2 serves ChatGPT logins under. */
 export const OPENAI_PROVIDER_ID = 'openai'
 
+/** Retry-attempt limit used by both the installer and the policy; a hold uses one attempt. */
+export const OPENAI_HOST_RETRY_LIMIT = 10
+
 /**
  * How long a row stays marked after a refusal that named no reset and whose
  * window has no known reset either; the value OpenCode 1 uses
@@ -162,11 +184,9 @@ export type PoolAccess = Pick<
   | 'peek'
   | 'prepareTokens'
   | 'usableToken'
-  | 'rateLimitMarks'
   | 'refreshBackoffFor'
   | 'requestReading'
   | 'recordSnapshot'
-  | 'markRateLimited'
 >
 
 export interface OpenAIAdapterLogger {
@@ -257,7 +277,11 @@ export interface OpenAIAdapterDeps {
 }
 
 export interface OpenAIAdapter {
-  readonly adapter: OpenCode2AuthAdapter<CodexQuotaReading, OpenAIAttemptData>
+  readonly adapter: OpenCode2AuthAdapter<
+    CodexQuotaReading,
+    OpenAIAttemptData,
+    ChooseAccountResult
+  >
   /** Records quota and refusals from the installer's events on the pool. */
   attach(
     installation: OpenCode2AuthInstallation<
@@ -634,10 +658,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     const vaultIds = new Set(
       targets.filter((target) => !target.row).map((target) => target.id),
     )
-    // Routing reads a copy of the registry's marks, never another writable
-    // authority. Callers without registry ownership can still test routing
-    // with their source's rateLimitMarks implementation.
-    const rateLimitMarks = limits?.marks() ?? source.rateLimitMarks(rows)
+    const rateLimitMarks = limits?.marks() ?? new Map<string, number>()
     return {
       rows: routingRows,
       now: at,
@@ -661,6 +682,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   ): string | undefined => {
     const plan = planOrdered({
       ...routing,
+      rows: routing.rows.filter((row) => !excluded.has(row.id)),
       placement: orderedPlacement(mode),
       mainId,
     })
@@ -772,7 +794,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
 
   const chooseAccount = async (
     input: ChooseAccountInput,
-  ): Promise<string | undefined> => {
+  ): Promise<ChooseAccountResult> => {
     let ready: OpenAiLimitsRequest | undefined
     const modeAuthority = await vault?.authority()
     const storage = await deps.storage()
@@ -822,6 +844,260 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     }
     const byId = new Map(targets.map((target) => [target.id, target]))
     let routing = routingInput(targets, storage, at)
+    const setting = storage?.routing?.maxSameAccountWait
+    const activity = limits?.activity.get(input.sessionID)
+    const activityKey =
+      activity && limits?.accountKey(activity.accountKey.accountId)
+    const previousId = input.previousAccountId ?? input.rerouteFrom?.accountId
+    const previousKey = previousId && limits?.accountKey(previousId)
+    const signal = input.rerouteFrom?.limit as OpenAILimitSignal | undefined
+    const candidates: LimitCandidate[] = targets.flatMap((target) => {
+      const account = limits?.accountKey(target.id)
+      if (!account) return []
+      const reading = windowsFromQuotaMap(target.quota)
+      const confirmedBlockers = openAiConfirmedBlockers(
+        signal && target.id === previousId
+          ? {
+              account,
+              kind: 'rate-limit',
+              reason: signal.reason,
+              scope: { kind: 'pool' },
+              windows: signal.windows ?? [],
+              observedAt: signal.observedAt ?? at,
+            }
+          : undefined,
+        reading,
+        at,
+      )
+      const hard = routing.rateLimitMarks.get(target.id)
+      const backoff = routing.refreshBackoff.get(target.id)
+      const blockers = [
+        ...(hard && hard > at
+          ? [
+              {
+                kind: 'hard' as const,
+                until: hard,
+                cause: 'rate-limit' as const,
+              },
+            ]
+          : []),
+        ...(backoff && backoff > at
+          ? [{ kind: 'cooldown' as const, until: backoff }]
+          : []),
+      ]
+      const admitted =
+        routing.killswitch.get(target.id) !== false &&
+        !!(reading?.primary || reading?.secondary) &&
+        !budgetExhaustedResetAt(
+          projectQuota(isQuotaMap(target.quota) ? target.quota : undefined),
+          at,
+        ) &&
+        !(backoff && backoff > at) &&
+        (!target.row || !!source.usableToken(target.row))
+      return [
+        {
+          account,
+          admitted,
+          placementEligible: admitted,
+          ready: admitted && !blockers.length && !confirmedBlockers.length,
+          blockers,
+          confirmedBlockers,
+        },
+      ]
+    })
+    const facts: PolicyFacts = {
+      phase: input.phase === 'retry' ? 'after-limit' : 'pre-send',
+      host: 'opencode2',
+      hostPhase: input.phase,
+      now: at,
+      clockNow: at,
+      sessionId: input.sessionID,
+      requestScope: { kind: 'pool' },
+      history: createRequestHistory({
+        requestId: input.sessionID,
+        originalUrl: 'https://api.openai.com/v1/responses',
+        clockNow: at,
+      }),
+      delivery: { owned: true, attributable: true, replayable: true },
+      candidates,
+      ...(input.phase === 'retry' && previousKey
+        ? { attempted: previousKey }
+        : {}),
+      ...(input.phase === 'retry' && previousKey && signal
+        ? {
+            signal: {
+              account: previousKey,
+              kind: 'rate-limit' as const,
+              reason: signal.reason,
+              scope: { kind: 'pool' as const },
+              windows: signal.windows ?? [],
+              observedAt: signal.observedAt ?? at,
+            },
+            status: signal.status,
+          }
+        : {}),
+      remainingRetries:
+        OPENAI_HOST_RETRY_LIMIT -
+        (input.hostAttempt ?? OPENAI_HOST_RETRY_LIMIT),
+    }
+    const terminalFacts = () => {
+      const owner = limits?.owner()
+      return openAiTerminalFacts({
+        accounts: candidates.flatMap((candidate) => {
+          const target = byId.get(candidate.account.accountId)
+          if (!target) return []
+          return [
+            {
+              account: candidate.account,
+              reading: windowsFromQuotaMap(target.quota),
+              usable: !target.row || !!source.usableToken(target.row),
+              confirmedBlockers: candidate.confirmedBlockers,
+              floors: isKillswitchEnabled(storage)
+                ? getKillswitchThresholdsForAccount(
+                    storage,
+                    target.id === FORMER_MAIN_ID ? undefined : target.id,
+                  )
+                : undefined,
+              marks: owner
+                ?.snapshot()
+                ?.marks.filter(
+                  (mark) =>
+                    mark.key.window === 'account' &&
+                    mark.key.scope.kind === 'pool' &&
+                    sameAccount(mark.key.account, candidate.account),
+                )
+                .flatMap((mark) =>
+                  mark.entries.map((entry) => ({
+                    until: entry.until,
+                    evidenceAt: entry.evidenceAt,
+                  })),
+                ),
+            },
+          ]
+        }),
+        now: at,
+        effectiveModel: input.modelID,
+        maxSameAccountWait: setting,
+        activity,
+        currentAccountKey: activityKey,
+        provenance: owner?.provenance,
+      })
+    }
+    const previous = candidates.find(
+      (candidate) => previousKey && sameAccount(candidate.account, previousKey),
+    )
+    if (input.phase === 'retry' && signal && previous) {
+      const hold = openAiHoldFacts({
+        candidate: previous,
+        activity,
+        maxSameAccountWait: setting,
+        now: at,
+        maxDelayMs: MAX_RETRY_HOLD_MS,
+      })
+      const ordinary = decideOpenAiLimit({ ...facts, hold }, { mode: 'sticky' })
+      if (ordinary?.action === 'hold')
+        return {
+          hold: {
+            delayMs: ordinary.delayMs,
+            target: ordinary.target,
+            checkpoint: ordinary.checkpoint,
+            kind: 'hold',
+          },
+        }
+      // This check must precede the chooser's temporary all-marked escape.
+      // A single account always keeps the host's original delayed retry.
+      const others = targets.filter((target) => target.id !== previousId)
+      const terminal =
+        previous.confirmedBlockers?.some((window) => window.confirmed) &&
+        others.length > 0 &&
+        others.every((target) => {
+          const candidate = candidates.find(
+            (value) => value.account.accountId === target.id,
+          )
+          return (
+            candidate &&
+            (!candidate.admitted ||
+              (routing.rateLimitMarks.get(target.id) ?? 0) > at)
+          )
+        })
+      if (terminal) {
+        const decision = decideOpenAiTerminal(facts, terminalFacts())
+        if (readMaxSameAccountWait(setting) === 0) return { hostRetry: 'veto' }
+        const delayMs =
+          'delayMs' in decision
+            ? decision.delayMs
+            : 'retryAfterMs' in decision
+              ? decision.retryAfterMs
+              : undefined
+        if (
+          (facts.remainingRetries ?? 0) < 1 ||
+          delayMs === undefined ||
+          delayMs > MAX_RETRY_HOLD_MS
+        )
+          return { hostRetry: 'leave' }
+        if (
+          decision.action === 'hold' &&
+          sameAccount(decision.account, previous.account)
+        )
+          return {
+            hold: {
+              delayMs,
+              target: decision.target,
+              checkpoint: decision.checkpoint,
+              kind: 'terminal',
+            },
+          }
+        return { waitThenReselect: { delayMs } }
+      }
+    }
+    let wakeAccount: string | undefined
+    if (
+      input.phase === 'request' &&
+      input.wake?.checkpoint &&
+      previous &&
+      (input.hostAttempt ?? OPENAI_HOST_RETRY_LIMIT) <
+        OPENAI_HOST_RETRY_LIMIT &&
+      readMaxSameAccountWait(setting) !== 0 &&
+      sameAccount(previous.account, input.wake.checkpoint.accountKey)
+    ) {
+      const checkpoint = input.wake.checkpoint
+      const windows = new Map<string, LimitWindow>(
+        checkpoint.blockers.map((blocker) => [
+          blocker.window,
+          {
+            ...blocker,
+            confirmed: true,
+            confirmedByReading: false,
+            observedAt: checkpoint.decidedAt,
+            provenance: 'provider' as const,
+          },
+        ]),
+      )
+      for (const blocker of previous.confirmedBlockers ?? [])
+        windows.set(blocker.window, blocker)
+      const held = { ...previous, confirmedBlockers: [...windows.values()] }
+      const hold = openAiHoldFacts({
+        candidate: held,
+        activity,
+        maxSameAccountWait: setting,
+        now: at,
+        maxDelayMs: MAX_RETRY_HOLD_MS,
+      })
+      const decision = decideOpenAiLimit(
+        {
+          ...facts,
+          attempted: previous.account,
+          candidates: candidates.map((candidate) =>
+            candidate === previous ? held : candidate,
+          ),
+          hold,
+          wake: { ...input.wake, checkpoint },
+        },
+        { mode: 'sticky' },
+      )
+      if (decision?.action === 'retain')
+        wakeAccount = previous.account.accountId
+    }
     const excluded = new Set<string>(
       input.rerouteFrom ? [input.rerouteFrom.accountId] : [],
     )
@@ -853,7 +1129,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         accountId = undefined
         plannedPin = undefined
         let cold = mode !== 'sticky-balanced'
-        if (mode === 'sticky-balanced') {
+        if (wakeAccount && !skip.has(wakeAccount)) {
+          accountId = wakeAccount
+          wakeAccount = undefined
+        } else if (mode === 'sticky-balanced') {
           const plannedPins = new Map(pins.placementSnapshot(input.sessionID))
           const previous = plannedPins.get(input.sessionID)
           cold = previous === undefined
@@ -924,21 +1203,29 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         }
         if (!routingConsulted) {
           routingConsulted = true
-          const preferred = await chooseVaultRouting({
-            vaultMode,
-            fresh: cold,
-            sessionId: input.sessionID,
-            request: {
-              modelId: input.modelID,
-              kind: input.kind,
-              retry: input.phase === 'retry' || input.rerouteFrom !== undefined,
-            },
-            routes: vault?.routes() ?? [],
-            routing,
-            eligibleIds: targets
-              .filter((target) => !skip.has(target.id))
-              .map((target) => target.id),
-          })
+          const preferred = input.wake
+            ? undefined
+            : await chooseVaultRouting({
+                vaultMode,
+                fresh: cold,
+                sessionId: input.sessionID,
+                request: {
+                  modelId: input.modelID,
+                  kind: input.kind,
+                  retry:
+                    input.phase === 'retry' || input.rerouteFrom !== undefined,
+                },
+                routes: vault?.routes() ?? [],
+                routing,
+                wait: {
+                  activity,
+                  accountKey: activityKey,
+                  maxSameAccountWait: setting,
+                },
+                eligibleIds: targets
+                  .filter((target) => !skip.has(target.id))
+                  .map((target) => target.id),
+              })
           if (preferred && preferred !== accountId) {
             if (reservation) pins.rollback(reservation)
             reservation = undefined
@@ -1050,6 +1337,36 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             ? { info: (message, data) => info.call(log, message, data) }
             : undefined,
         )
+      }
+      if (
+        accountId === undefined &&
+        input.phase === 'request' &&
+        candidates.length > 0 &&
+        candidates.every((candidate) => !candidate.admitted) &&
+        candidates.some(
+          (candidate) =>
+            routing.killswitch.get(candidate.account.accountId) === false ||
+            candidate.confirmedBlockers?.length,
+        )
+      ) {
+        const decision = decideOpenAiTerminal(facts, terminalFacts())
+        const wire = buildOpenAiQuotaRefusal({
+          decision,
+          now: at,
+          host: 'opencode2',
+          requestThrow: true,
+          maxSameAccountWait: setting,
+        })
+        if (wire.kind === 'http') {
+          const body = JSON.parse(wire.body) as { error: { message: string } }
+          throw new OpenCode2AuthError({
+            kind: 'no-account',
+            providerID: OPENAI_PROVIDER_ID,
+            sessionID: input.sessionID,
+            requestKind: input.kind,
+            message: body.error.message,
+          })
+        }
       }
       log?.debug('pool account chosen', {
         kind: input.kind,
@@ -1213,7 +1530,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     }
   }
 
-  const adapter: OpenCode2AuthAdapter<CodexQuotaReading, OpenAIAttemptData> = {
+  const adapter: OpenCode2AuthAdapter<
+    CodexQuotaReading,
+    OpenAIAttemptData,
+    ChooseAccountResult
+  > = {
     providerID: OPENAI_PROVIDER_ID,
     async retrySameAccount(input) {
       if (input.continuation !== 'interrupted-read') return undefined
@@ -1609,22 +1930,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       owner.enqueue(command, provenance)
       return
     }
-    const quota = fromVault
-      ? vault?.routes().find((route) => route.id === accountId)?.quota
-      : source.peek().rows.find((candidate) => candidate.id === accountId)
-          ?.quota
-    const until = resolveMidStreamRateLimitResetAt(
-      windowsFromQuotaMap(quota),
-      limit.reason,
-      at,
-      DEFAULT_LIMIT_MARK_MS,
-      limit.retryAfterMs !== undefined ? at + limit.retryAfterMs : undefined,
-    )
-    if (!fromVault) {
-      source.markRateLimited(accountId, until)
-      return
-    }
-    // Without a registry, vault timed marks are not stored in a fallback map.
+    // Without registry ownership neither custody mode stores fallback marks.
   }
 
   return {

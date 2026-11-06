@@ -68,11 +68,9 @@ function fixture(
     peek: () => ({ active: true, rows }),
     prepareTokens: async () => {},
     usableToken: () => 'local-token',
-    rateLimitMarks: () => new Map(),
     refreshBackoffFor: () => new Map(),
     requestReading: () => {},
     recordSnapshot: () => {},
-    markRateLimited: () => {},
   }
   const routes = ['a', 'b'].map((id) => ({
     id: `vault:${id}`,

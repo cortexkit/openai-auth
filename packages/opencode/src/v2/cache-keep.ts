@@ -48,6 +48,7 @@ import {
   type OpenAICacheKeepManager,
   type OpenAICacheKeepMeta,
 } from '../core/cachekeep'
+import type { OpenCodeLimitSource } from '../core/limit-source'
 import type { PoolAccountSource } from '../core/pool-account-source'
 import type { OpenAIAttemptData } from './adapter'
 import { acquireFrameMirror } from './frame-mirror'
@@ -111,6 +112,7 @@ export function cacheKeepSettingsOf(
 
 /** What one location lends the shared manager while it holds it. */
 export interface CacheKeepLocation {
+  limits?: Pick<OpenCodeLimitSource, 'activity' | 'accountKey'>
   /** This location's pool source; a local-mode warm takes its token here. */
   source: Pick<PoolAccountSource, 'accessFor'>
   /** The account settings, read for each local-mode token. */
@@ -247,6 +249,26 @@ function createEntry(
     getWindow: () => live()?.settings().window,
     getSustain: () => live()?.settings().sustain === true,
     resolveLocal: localAccess,
+    activity: {
+      store: {
+        get size() {
+          return live()?.limits?.activity.size ?? 0
+        },
+        get: (sessionID) => live()?.limits?.activity.get(sessionID),
+        forgetSession: (sessionID) =>
+          live()?.limits?.activity.forgetSession(sessionID),
+        recordAccepted: (input) =>
+          live()?.limits?.activity.recordAccepted(input) ?? false,
+      },
+      accountKey: ({ target }) => {
+        const location = live()
+        const sessionID = target.meta.routingSessionId ?? target.sessionKey
+        const accountId = target.accountId ?? 'main'
+        return location?.accounts.activeAccount(sessionID) === accountId
+          ? location.limits?.accountKey(accountId)
+          : undefined
+      },
+    },
     vault: {
       owns: (routeId) => live()?.vault.owns(routeId) === true,
       authority: () => need().vault.authority(),

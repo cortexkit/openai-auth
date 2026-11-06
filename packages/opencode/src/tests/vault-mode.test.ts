@@ -86,6 +86,7 @@ describe('the request path in vault mode', () => {
     const causes: Array<NoCredentialCause | undefined> = []
     const ctx: PoolRequestContext = {
       source,
+      rateLimitMarks: () => new Map(),
       vault,
       storage,
       mode,

@@ -18,7 +18,10 @@ function allowed(request: {
         ? ['enable', 'disable', 'remove', 'move'].includes(request.actionId)
         : request.actionId === 'add'
     case 'routing':
-      return !item && ['order', 'mode'].includes(request.actionId)
+      return (
+        !item &&
+        ['order', 'mode', 'maxSameAccountWait'].includes(request.actionId)
+      )
     case 'quota':
       return request.actionId === 'check'
     case 'limits':

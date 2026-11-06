@@ -212,8 +212,8 @@ export function isVaultModeRefusal(
 
 export interface PoolRequestContext {
   source: PoolAccountSource
-  /** The host's mark authority; omitted by callers still using the source map. */
-  rateLimitMarks?: () => Map<string, number>
+  /** The host's shared registry mark projection. */
+  rateLimitMarks: () => Map<string, number>
   /** Process-local HTTP holds; transport streams have no Retry-After channel. */
   limitPolicy?: PoolLimitPolicy
   /** Do not create a new hold for a reissue whose pending hold was discarded. */
@@ -765,9 +765,7 @@ function routingInput(
   const vaultIds = new Set(
     targets.filter((target) => !target.row).map((target) => target.id),
   )
-  const rateLimitMarks = ctx.rateLimitMarks
-    ? ctx.rateLimitMarks()
-    : ctx.source.rateLimitMarks(rows)
+  const rateLimitMarks = ctx.rateLimitMarks()
   for (const [id, until] of ctx.vault?.rateLimitMarks?.() ?? []) {
     if (vaultIds.has(id) && until > now) rateLimitMarks.set(id, until)
   }

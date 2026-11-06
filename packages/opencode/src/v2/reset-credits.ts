@@ -31,7 +31,7 @@ import { poolResetTarget, ResetTargetResolutionError } from '../index'
 /** The parts of the pool source the reset dependencies use. */
 export type ResetPoolAccess = Pick<
   PoolAccountSource,
-  'rowAccess' | 'pollRows' | 'peek' | 'rateLimitMarks'
+  'rowAccess' | 'pollRows' | 'peek'
 >
 
 /** One quota poll's request, as the pool source hands it to `pullQuota`. */
@@ -122,7 +122,7 @@ export interface PoolResetDepsOptions {
   counts: ResetCreditCounts
   now: () => number
   /** Read the request path's existing marks without acquiring a registry for a menu. */
-  rateLimitMarks?: () => ReadonlyMap<string, number>
+  rateLimitMarks: () => ReadonlyMap<string, number>
   /** The enrollment read; no local account is polled while it is not `local`. */
   authority?: () => Promise<'vault' | 'local' | 'unreadable'>
 }
@@ -228,9 +228,7 @@ export function createPoolResetDeps(
     isRateLimited: (accountKey) => {
       const row = rowFor(accountKey)
       if (!row) return false
-      const until = (
-        options.rateLimitMarks?.() ?? source.rateLimitMarks([row])
-      ).get(row.id)
+      const until = options.rateLimitMarks().get(row.id)
       return until !== undefined && until > now()
     },
     getMain: () => entryFor('main'),

@@ -221,6 +221,41 @@ function completedAccount(): IngestAccount {
   }
 }
 const invocation = { sessionId: 'S', notify() {} }
+for (const enrolled of [false, true]) {
+  test(`OC2 longest same-account wait options and config writes ${enrolled ? 'vault' : 'local'}`, async () => {
+    const f = fixture(enrolled)
+    const menu = f.menu()
+    const opened = await menu.open('S')
+    const action = opened.menu.sections
+      .find((section) => section.id === 'routing')
+      ?.actions.find((action) => action.id === 'maxSameAccountWait')
+    expect(action).toMatchObject({ label: 'Longest wait on the same account' })
+    expect(action?.knobs).toMatchObject([
+      {
+        choices: [
+          { label: "Don't wait" },
+          { label: '15 minutes' },
+          { label: 'Until the cache expires' },
+        ],
+      },
+    ])
+    for (const value of [0, 15, 'max'] as const) {
+      const applied = await menu.apply({
+        sessionId: 'S',
+        command: 'openai',
+        sectionId: 'routing',
+        actionId: 'maxSameAccountWait',
+        values: { maxSameAccountWait: String(value) },
+      })
+      expect(applied.ok).toBe(true)
+      expect(
+        JSON.parse(readFileSync(f.files.configPath, 'utf8')).routing
+          .maxSameAccountWait,
+      ).toBe(value)
+    }
+  })
+}
+
 const rows = [
   {
     name: 'disable',
@@ -615,6 +650,7 @@ for (const enrolled of [false, true]) {
     const permitted = new Set(
       [
         ...rows,
+        { sectionId: 'routing', actionId: 'maxSameAccountWait' },
         { sectionId: 'vault', actionId: 'connect' },
         { sectionId: 'vault', actionId: 'disconnect' },
         ...['enable', 'disable'].map((actionId) => ({

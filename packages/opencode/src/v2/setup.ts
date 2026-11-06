@@ -41,6 +41,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import {
   type Attempt,
+  type ChooseAccountResult,
   installOpenCode2Auth,
   type OpenCode2AuthAdapter,
   OpenCode2AuthError,
@@ -99,6 +100,7 @@ import { createLogger, setLogLevel } from '../logger'
 import { PackageVersion } from '../version'
 import {
   createOpenAIAdapter,
+  OPENAI_HOST_RETRY_LIMIT,
   OPENAI_PROVIDER_ID,
   type OpenAIAdapterLogger,
 } from './adapter'
@@ -222,7 +224,7 @@ type SetupContext = Pick<
 
 async function installPoolHooks<Q, A>(
   ctx: SetupContext,
-  adapter: OpenCode2AuthAdapter<Q, A>,
+  adapter: OpenCode2AuthAdapter<Q, A, ChooseAccountResult>,
   log: Pick<OpenAIAdapterLogger, 'warn'>,
   codex = new CodexHttpState(),
   // Sees every owned request in its final form, with its account attempt.
@@ -472,6 +474,7 @@ async function installPoolHooks<Q, A>(
             : undefined
         },
       },
+      hostRetryLimit: OPENAI_HOST_RETRY_LIMIT,
       logger: {
         warn: (message, data) => log.warn(message, { data }),
       },
@@ -740,6 +743,7 @@ export async function setupOpenAIAuth(
     paths(),
     {
       source,
+      limits,
       storage: loadStorage,
       vault,
       // The same process-wide registry the adapter below records into.

@@ -302,14 +302,12 @@ describe('OpenCode limits source', () => {
     })
   }
 
-  it('projects shared marks by row and epoch independently of the pre-registry map', async () => {
+  it('projects shared marks by row and epoch', async () => {
     const { create } = setup([
       { id: 'a', identity: 'same' },
       { id: 'b', identity: 'same' },
     ])
-    const legacyUntil = Date.now() + 900_000
-    const retired = new Map([['identity:same', legacyUntil]])
-    const a = create({ rateLimitMarks: retired })
+    const a = create()
     const b = create()
     await a.limitsForRequest()
     await b.limitsForRequest()
@@ -318,7 +316,6 @@ describe('OpenCode limits source', () => {
     expect(marks(b)).toEqual(new Map([['a', until]]))
     marks(b).clear()
     expect(marks(a)).toEqual(new Map([['a', until]]))
-    expect(retired).toEqual(new Map([['identity:same', legacyUntil]]))
     await a.limitsOwner()!.flush()
     const oldRow = a.peek().rows[0]!
     expect(

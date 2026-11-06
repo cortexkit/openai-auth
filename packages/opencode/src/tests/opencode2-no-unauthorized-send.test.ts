@@ -107,7 +107,9 @@ describe('OpenCode 2 never sends without the account credential', () => {
       storage: async () => null,
       pins: new SessionPins(),
     })
-    const chosen: Array<string | undefined> = []
+    const chosen: Array<
+      Awaited<ReturnType<typeof openai.adapter.chooseAccount>>
+    > = []
     const adapter = {
       ...openai.adapter,
       chooseAccount: async (

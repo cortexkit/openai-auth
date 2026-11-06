@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { ClaustrumScopedAttempt } from '@cortexkit/common-auth/claustrum'
+import { createSessionActivityStore } from '@cortexkit/common-auth/limits'
 import {
   type ChooseAccountInput,
   installOpenCode2Auth,
@@ -8,6 +9,7 @@ import {
 } from '@cortexkit/common-auth/opencode2'
 import type { PoolRow } from '@cortexkit/common-auth/store'
 import type { AccountStorage } from '@cortexkit/openai-auth-core/internal'
+import type { OpenCodeLimitSource } from '../core/limit-source'
 import {
   createOpenAIAdapter,
   type PoolAccess,
@@ -51,11 +53,9 @@ async function fixture(ids = ['a', 'b'], vault?: VaultAccess) {
           : undefined
         : undefined
     },
-    rateLimitMarks: () => marks,
     refreshBackoffFor: () => new Map(),
     requestReading: () => {},
     recordSnapshot: () => {},
-    markRateLimited: (id: string, until: number) => marks.set(id, until),
   } as unknown as PoolAccess
   const pins = new SessionPins()
   const routes: Array<[string, string]> = []
@@ -64,7 +64,41 @@ async function fixture(ids = ['a', 'b'], vault?: VaultAccess) {
     accounts: [],
     routing: { mode: 'sticky-balanced' },
   } as AccountStorage
+  const bindings = () =>
+    rows.map((row) => ({
+      account: {
+        namespace: 'retry-test',
+        accountId: row.id,
+        incarnation: String(row.credentialEpoch),
+      },
+      credentialEpoch: row.credentialEpoch,
+    }))
+  const registry = {}
+  const owner = {
+    registry,
+    observe: (binding: unknown) => ({ binding, baseRevision: 0, registry }),
+    enqueue: (command: {
+      binding: { account: { accountId: string } }
+      until: number
+    }) => marks.set(command.binding.account.accountId, command.until),
+    snapshot: () => undefined,
+    afterProbe() {},
+    dropSignal() {},
+  }
+  const limits = {
+    activity: createSessionActivityStore(),
+    bindings,
+    ownershipBindings: bindings,
+    accountKey: (id: string) =>
+      bindings().find((binding) => binding.account.accountId === id)?.account,
+    marks: () => new Map(marks),
+    owner: () => owner,
+    forRequest: async () => ({
+      beforeDispatch: async () => ({ status: 'ready' }),
+    }),
+  } as unknown as OpenCodeLimitSource
   const openai = createOpenAIAdapter({
+    limits,
     onRoute: (sessionId, accountId) => routes.push([sessionId, accountId]),
     source,
     pins,

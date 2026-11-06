@@ -125,11 +125,15 @@ async function measure(phase: 'request' | 'retry') {
     if (phase === 'retry') {
       expect(pins.size).toBe(0)
       expect(pins.placementSnapshot().size).toBe(4)
-      for (let index = 0; index < inputs.length; index++)
+      for (let index = 0; index < inputs.length; index++) {
+        const accountId = chosen[index]
+        expect(typeof accountId).toBe('string')
+        if (typeof accountId !== 'string') continue
         await adapters[index % 2]!.dropChoice!({
           ...inputs[index]!,
-          accountId: chosen[index]!,
+          accountId,
         })
+      }
       expect(pins.placementSnapshot().size).toBe(0)
     }
   }

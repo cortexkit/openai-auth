@@ -48,7 +48,6 @@ import {
 import {
   type AccountPaths,
   type AccountStorage,
-  poolAccountKey as accountKey,
   acquireOpenAiLimits,
   applyPendingPoolObservations,
   type PoolRefreshBackoff as BackoffEntry,
@@ -149,13 +148,6 @@ export interface PoolAccountSourceDeps {
     >
   >
   log?: Pick<ReturnType<typeof createLogger>, 'debug' | 'info' | 'warn'>
-  /**
-   * Where rate-limit marks are kept: account key to mark expiry (epoch ms).
-   * OpenCode 2 passes one map per account store, shared by every location in
-   * the process, so a 429 seen in one project keeps the others off the
-   * account too. Without it the source keeps its own.
-   */
-  rateLimitMarks?: Map<string, number>
   /**
    * The ChatGPT accounts the Claustrum vault holds for this host. A row
    * signing in as one of them is not this host's to use (one account has
@@ -277,9 +269,6 @@ export class PoolAccountSource {
   private readonly writes = new Map<string, Promise<void>>()
   private limits: { key: string; owner: OpenAiLimitsOwner } | undefined
   private readonly retiredLimits: Promise<void>[] = []
-  // Legacy in-memory mark store, still read by the OpenCode 1 and 2 request paths.
-  // Remove it once both hosts use the shared limits seam.
-  private readonly marks: Map<string, number>
   private readonly lastPull = new Map<string, number>()
   private readonly quotaPulls = new Map<
     string,
@@ -298,7 +287,6 @@ export class PoolAccountSource {
     this.deps = deps
     this.now = deps.now ?? Date.now
     this.log = deps.log ?? createLogger('pool')
-    this.marks = deps.rateLimitMarks ?? new Map()
     this.vaultRosterSettled = deps.vaultFirstRoster === undefined
     const settled = () => {
       this.vaultRosterSettled = true
@@ -769,26 +757,6 @@ export class PoolAccountSource {
   /** Shared authority for host command/recovery bridges; absent before readiness. */
   limitsOwner(): OpenAiLimitsOwner | undefined {
     return this.limits?.owner
-  }
-
-  /** Marks a row's account rate-limited until `untilMs` (a WebSocket signal). */
-  markRateLimited(rowId: string, untilMs: number): void {
-    const row = this.snapshot.rows.find((r) => r.id === rowId)
-    if (!row) return
-    const key = accountKey(row)
-    const existing = this.marks.get(key)
-    if (existing !== undefined && existing > untilMs) return
-    this.marks.set(key, untilMs)
-  }
-
-  /** For each given row with a live rate-limit mark: row id to the mark's expiry time (ms). */
-  rateLimitMarks(rows: readonly PoolRow[]): Map<string, number> {
-    const out = new Map<string, number>()
-    for (const row of rows) {
-      const until = this.marks.get(accountKey(row))
-      if (until !== undefined) out.set(row.id, until)
-    }
-    return out
   }
 
   // -------------------------------------------------------------------------

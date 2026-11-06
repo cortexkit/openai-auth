@@ -69,6 +69,7 @@ function context(
 ): PoolRequestContext {
   return {
     source,
+    rateLimitMarks: () => new Map(),
     storage,
     mode: 'main-first',
     sessionId: undefined,

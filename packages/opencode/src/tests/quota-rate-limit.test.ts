@@ -15,7 +15,6 @@ import type { Hooks, PluginInput } from '@opencode-ai/plugin'
 import { createLimitsLeaseManager } from '../../../core/src/limit-registry'
 import { getAccountStoragePath } from '../core/account-paths'
 import { OpenCodeLimitSource } from '../core/limit-source'
-import { PoolAccountSource } from '../core/pool-account-source'
 import { CodexAuthPlugin } from '../index'
 import { flushForTest, setLogLevel } from '../logger'
 import { createRequestTestScope } from './request-test-scope'
@@ -665,77 +664,65 @@ describe('resolveMidStreamRateLimitResetAt', () => {
 })
 
 describe('OC1 mark authority selection', () => {
-  for (const supplied of [false, true]) {
-    it(`${supplied ? 'uses supplied registry projection without reading' : 'defaults to'} the source compatibility map`, async () => {
-      const { servePoolRequest } = await import('../core/pool-request')
-      const now = Date.now()
-      let sourceReads = 0
-      const source = {
-        current: async () => {},
-        prepareTokens: async () => {},
-        peek: () => ({
-          rows: [
-            {
-              id: 'main',
+  it('uses the supplied registry projection', async () => {
+    const { servePoolRequest } = await import('../core/pool-request')
+    const now = Date.now()
+    const source = {
+      current: async () => {},
+      prepareTokens: async () => {},
+      peek: () => ({
+        rows: [
+          {
+            id: 'main',
+            type: 'oauth',
+            enabled: true,
+            candidate: true,
+            credential: {
               type: 'oauth',
-              enabled: true,
-              candidate: true,
-              credential: {
-                type: 'oauth',
-                access: 'test-token',
-                refresh: 'refresh',
-                expires: now + 3600_000,
-              },
-              quota: {
-                limits: [
-                  {
-                    scope: 'all',
-                    label: 'primary',
-                    kind: 'reading',
-                    checkedAt: now,
-                    usedPercent: 10,
-                    resetsAt: new Date(now + 120_000).toISOString(),
-                    windowMinutes: 300,
-                  },
-                ],
-              },
+              access: 'test-token',
+              refresh: 'refresh',
+              expires: now + 3600_000,
             },
-          ],
-        }),
-        rateLimitMarks: () => {
-          sourceReads++
-          return new Map([['main', now + 60_000]])
-        },
-        refreshBackoffFor: () => new Map(),
-        usableToken: () => 'test-token',
-        requestReading: () => undefined,
-      }
-      const result = await servePoolRequest({
-        source:
-          source as unknown as import('../core/pool-account-source').PoolAccountSource,
-        ...(supplied
-          ? { rateLimitMarks: () => new Map<string, number>() }
-          : {}),
-        storage: { version: 1, accounts: [], killswitch: { enabled: false } },
-        mode: 'main-first',
-        sessionId: undefined,
-        body: '{}',
-        replayable: true,
-        now: () => now,
-        send: async () => new Response('sentinel'),
-        recordQuota: () => {},
-        placePin: () => undefined,
-        blocked: (block) => new Response(block.reason, { status: 429 }),
-        resetCredits: () => undefined,
-        isAbort: () => false,
-        log: { debug: () => {} },
-      })
-      expect(sourceReads === 0).toBe(supplied)
-      expect(await result.response.text()).toBe(
-        supplied ? 'sentinel' : 'mid-stream-rate-limit',
-      )
+            quota: {
+              limits: [
+                {
+                  scope: 'all',
+                  label: 'primary',
+                  kind: 'reading',
+                  checkedAt: now,
+                  usedPercent: 10,
+                  resetsAt: new Date(now + 120_000).toISOString(),
+                  windowMinutes: 300,
+                },
+              ],
+            },
+          },
+        ],
+      }),
+      refreshBackoffFor: () => new Map(),
+      usableToken: () => 'test-token',
+      requestReading: () => undefined,
+    }
+    const result = await servePoolRequest({
+      source:
+        source as unknown as import('../core/pool-account-source').PoolAccountSource,
+      rateLimitMarks: () => new Map<string, number>(),
+      storage: { version: 1, accounts: [], killswitch: { enabled: false } },
+      mode: 'main-first',
+      sessionId: undefined,
+      body: '{}',
+      replayable: true,
+      now: () => now,
+      send: async () => new Response('sentinel'),
+      recordQuota: () => {},
+      placePin: () => undefined,
+      blocked: (block) => new Response(block.reason, { status: 429 }),
+      resetCredits: () => undefined,
+      isAbort: () => false,
+      log: { debug: () => {} },
     })
-  }
+    expect(await result.response.text()).toBe('sentinel')
+  })
 })
 
 describe('OC1 shared limit transport lifecycle', () => {
@@ -892,12 +879,6 @@ describe('OC1 shared limit transport lifecycle', () => {
       source = this
       return forRequest.call(this)
     })
-    const mapSpy = spyOn(
-      PoolAccountSource.prototype,
-      'rateLimitMarks',
-    ).mockImplementation(() => {
-      throw new Error('OC1 read the compatibility map')
-    })
     const { QuotaManager } = await import(
       '@cortexkit/openai-auth-core/internal'
     )
@@ -935,7 +916,6 @@ describe('OC1 shared limit transport lifecycle', () => {
       await flushForTest()
       setLogLevel(undefined)
       sourceSpy.mockRestore()
-      mapSpy.mockRestore()
       legacySpy.mockRestore()
       acquireSpy?.mockRestore()
       clock.mockRestore()
@@ -991,7 +971,6 @@ describe('OC1 shared limit transport lifecycle', () => {
     return {
       wire,
       legacySpy,
-      mapSpy,
       limits: () => {
         if (!source) throw new Error('missing limits source')
         return source
@@ -1046,7 +1025,6 @@ describe('OC1 shared limit transport lifecycle', () => {
     expect(owner?.snapshot()?.marks).toHaveLength(1)
     expect(owner?.snapshot()?.operationIds).toHaveLength(1)
     expect(f.legacySpy).not.toHaveBeenCalled()
-    expect(f.mapSpy).not.toHaveBeenCalled()
   })
 
   it('no-registry fallback drops a WS mark and the next request still sends main', async () => {
@@ -1067,7 +1045,6 @@ describe('OC1 shared limit transport lifecycle', () => {
     await (await f.request()).text()
     expect(f.wire).toEqual(['Bearer main-token', 'Bearer main-token'])
     expect(f.legacySpy).not.toHaveBeenCalled()
-    expect(f.mapSpy).not.toHaveBeenCalled()
   })
 
   it('HTTP 429 records no mark and a clean HTTP completion accepts dispatch time, not EOF', async () => {
