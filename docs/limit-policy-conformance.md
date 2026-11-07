@@ -4,11 +4,11 @@ This ledger tracks the OpenAI limit-policy contract across OpenCode 1 (OC1), Ope
 
 ## Published shared-library surface
 
-The audited artifact is **`@cortexkit/common-auth@0.39.1`**, npm gitHead `32582ce1c13b45bf3765c3710856ece822dd6b2e`, fetched with `npm pack @cortexkit/common-auth@0.39.1 --ignore-scripts --json`. Its registry tarball is <https://registry.npmjs.org/@cortexkit/common-auth/-/common-auth-0.39.1.tgz>.
+The audited artifact is **`@cortexkit/common-auth@0.39.2`**, npm gitHead `025e23337da2652d5bbcaa11c835a6a53a297c87`, fetched with `npm pack @cortexkit/common-auth@0.39.2 --ignore-scripts --json`. Its registry tarball is <https://registry.npmjs.org/@cortexkit/common-auth/-/common-auth-0.39.2.tgz>.
 
-- SHA-1: `7e01946c6409cb6e3673b7130964ff850cdb46fe`.
-- npm integrity: `sha512-Oap+vs4zKFLdFA8iUgvS3X1iOI/xZaXQyhYoDSlUBsjsCutcZZ0M0bXY9C0a16fBFgmmcReXb3Pn3+P9Bebjng==`.
-- The downloaded archive matched both registry hashes; all **316 published `dist/` files** and `package.json` were byte-identical to the installed 0.39.1 dependency. The artifact audit passed **322 assertions**.
+- SHA-1: `31eab538c571378b4fc10d0b0cc4824980816a31`.
+- npm integrity: `sha512-QYRQY0WCAjdYImXEjTT+kcy+brjqEiC40PGwfWn5UPt7O5e8wAeMxeg+CCdSeclkfifpfqt8XBwIR7hDBO1jaA==`.
+- The downloaded archive matched both registry hashes; all **316 published `dist/` files** and `package.json` were byte-identical to the installed 0.39.2 dependency. The artifact audit passed **322 assertions**.
 - Public imports and declaration/runtime-member checks, including a public-export and instance-member typecheck, passed **132 surface assertions** with Bun 1.4.4 on macOS. These checks establish availability, not adoption behavior. No foreign source checkout, unpublished candidate, or source-only export was used as published-dist proof.
 
 All subpaths below have both `import` and `types` targets in the published `package.json`. Paths in the evidence column are relative to that package, not this repository.
