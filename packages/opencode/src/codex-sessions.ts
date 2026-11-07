@@ -131,6 +131,15 @@ export function writeCodexSessionThreads(
 const saving = new Map<string, Promise<void>>()
 
 /**
+ * Resolves once every save to `path` started so far has finished (saves never
+ * reject). The plugin's dispose waits on it, so a session minted just before a
+ * restart keeps its thread id instead of losing it to a save still in flight.
+ */
+export function codexSessionsSettled(path: string): Promise<void> {
+  return saving.get(path) ?? Promise.resolve()
+}
+
+/**
  * Writes every session in the map under the file's `sessions` lock. Saves to
  * one file run one after another; a lock that stays held or a failed write is
  * ignored, and the next save writes the whole map again.

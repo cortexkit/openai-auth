@@ -11,13 +11,17 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { PluginInput } from '@opencode-ai/plugin'
-
+import {
+  acquireCodexSessionsLock,
+  readCodexSessionThreads,
+} from '../codex-sessions'
 import {
   DEFAULT_CODEX_API_ENDPOINT,
   getSettings,
   refreshSettings,
   resetSettingsForTest,
 } from '../config'
+import { getCodexSessionsPath } from '../core/account-paths'
 import { dumpCodexRequest, resetDumpStateForTest } from '../dump'
 import { CodexAuthPlugin, rewriteResponsesLiteBody } from '../index'
 import { ageDumpFiles, waitForDumpCap } from './fixtures/dump-retention'
@@ -433,6 +437,43 @@ describe('request dumps', () => {
         expect(promptCacheKeys[1]).not.toBe(promptCacheKeys[0])
       } finally {
         await disposePluginWork()
+        globalThis.fetch = originalFetch
+      }
+    })
+  })
+
+  test('dispose waits for a session save still in flight', async () => {
+    await withDumpEnv(async () => {
+      const originalFetch = globalThis.fetch
+      globalThis.fetch = Object.assign(
+        async () => new Response('ok', { status: 200 }),
+        { preconnect: () => {} },
+      )
+      try {
+        const hooks = await dumpPlugin({ experimentalWebSockets: false })
+        const fetch = await pluginFetch(hooks)
+        const path = getCodexSessionsPath('opencode1')
+        // Holding the file's lock keeps the session save in flight, as a
+        // slow disk or a contended lock does, until well after dispose starts.
+        const held = await acquireCodexSessionsLock(path)
+        expect(held).not.toBeNull()
+        await fetch('https://api.openai.com/v1/responses', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-session-affinity': 'ses_in_flight',
+          },
+          body: JSON.stringify(toolRequestBody()),
+        })
+        const release = setTimeout(() => void held?.release(), 150)
+        try {
+          await hooks.dispose?.()
+        } finally {
+          clearTimeout(release)
+          await held?.release().catch(() => {})
+        }
+        expect(readCodexSessionThreads(path).has('ses_in_flight')).toBe(true)
+      } finally {
         globalThis.fetch = originalFetch
       }
     })

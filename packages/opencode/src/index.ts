@@ -89,7 +89,11 @@ import {
   OPENAI_AGENT_HEADER,
   prepareCodexRequest,
 } from './codex-request'
-import { loadCodexSessions, saveCodexSessions } from './codex-sessions'
+import {
+  codexSessionsSettled,
+  loadCodexSessions,
+  saveCodexSessions,
+} from './codex-sessions'
 import {
   applyOpenAiMenu,
   menuText,
@@ -352,6 +356,9 @@ const AUTH_SET_RETRY_BASE_MS = 25
 // snapshot resolves a real reset time. Conservative and short: if the account
 // is still exhausted next turn, the next response.failed frame re-marks it.
 const DEFAULT_MID_STREAM_RATE_LIMIT_RESET_MS = 60_000
+// The longest dispose waits for a session save still in flight, the same bound
+// common-auth gives its own shutdown drain.
+const CODEX_SESSIONS_DISPOSE_WAIT_MS = 2_000
 
 const HANDLED_SENTINEL = '__OPENCODE_OPENAI_AUTH_COMMAND_HANDLED__'
 
@@ -1534,6 +1541,14 @@ export async function CodexAuthPlugin(
 
   return {
     async dispose() {
+      // A new session's thread id is saved in the background. Wait for that
+      // save, so the next process keeps the session's prompt cache key, but
+      // never hold up shutdown for longer than the bound.
+      await settleWithinBudget(
+        codexSessionsSettled(codexSessionStatePath()),
+        CODEX_SESSIONS_DISPOSE_WAIT_MS,
+        () => undefined,
+      )
       await limitSource?.dispose()
       await vaultLease.release()
       poolLifecycle?.dispose()
