@@ -56,6 +56,7 @@ import {
   codexRefreshFn,
   deferSessionCacheResponseTouch,
   extractAccountId,
+  hasVaultRoutingAccessor,
   loadAccountSettings,
   loadAccounts,
   type OpenAiVaultOptions,
@@ -423,7 +424,15 @@ async function installPoolHooks<Q, A>(
                   received.frame,
                   socket.bearer,
                 )
-                if (received.kind === 'primary' && socket.pending) {
+                if (
+                  received.kind === 'primary' &&
+                  socket.pending &&
+                  hasVaultRoutingAccessor() &&
+                  (received.frame.includes('"response.completed"') ||
+                    received.frame.includes('"response.failed"') ||
+                    received.frame.includes('"response.incomplete"') ||
+                    received.frame.includes('"error"'))
+                ) {
                   try {
                     const event = JSON.parse(received.frame)
                     if (event.type === 'response.completed') {

@@ -3,7 +3,7 @@
 // half drives `acquireCacheKeep` with stand-in locations; the second half runs
 // the real setup on the fake host, capturing at the post-installer seam.
 
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -1032,6 +1032,29 @@ async function websocket(
 }
 
 describe('OpenCode 2 WebSocket keep-warm', () => {
+  test('frame mirror skips policy reads for deltas before considering capture', () => {
+    let reads = 0
+    routing[routingKey] = () => ({
+      cache: () => {
+        reads++
+        return { keep_warm: 'always' }
+      },
+    })
+    const mirror = new FrameMirror(false)
+    mirror.send(
+      'ses',
+      JSON.stringify({ type: 'response.create', model: 'gpt-5.5', input: [] }),
+    )
+    reads = 0
+    mirror.receive(
+      'ses',
+      '{"type":"response.output_text.delta","delta":"hello"}',
+    )
+    expect(reads).toBe(0)
+    mirror.receive('ses', '{"type":"response.created","response":{"id":"r1"}}')
+    expect(reads).toBe(1)
+  })
+
   test('replay builds HTTP headers before the manager sanitizes the request', () => {
     const state = new CodexHttpState({ now: () => START, uuid: randomUUID })
     state.get('ses_ws')
@@ -1252,6 +1275,43 @@ function keepWarmPool() {
 }
 
 describe('OpenCode 2 keep-warm in setup', () => {
+  for (const [accessor, type, expectedParses] of [
+    [false, 'response.incomplete', 1],
+    [true, 'response.output_text.delta', 1],
+    [true, 'response.incomplete', 2],
+  ] as const) {
+    test(`OC2 cache reporting parser: accessor ${accessor}, frame ${type}`, async () => {
+      if (accessor) routing[routingKey] = () => ({})
+      const files = keepWarmPool()
+      const location = await startLocation(files, {
+        clock: { now: START },
+        timers: fakeTimers(),
+      })
+      const ws = await websocket(location)
+      await ws.send({ type: 'response.create', model: 'gpt-5.5', input: [] })
+      const frame = JSON.stringify({ type, delta: 'hello' })
+      const parse = JSON.parse
+      let parses = 0
+      const parser = spyOn(JSON, 'parse').mockImplementation(
+        (...args: Parameters<typeof JSON.parse>) => {
+          if (args[0] === frame) parses++
+          return parse(...args)
+        },
+      )
+      try {
+        await location.host.fire('experimental.ws.receive', {
+          ...scope('ses_ws'),
+          frame,
+        })
+        // The existing account event inspector parses once for quota/output
+        // classification. Cache reporting adds a parse only for routed terminals.
+        expect(parses).toBe(expectedParses)
+      } finally {
+        parser.mockRestore()
+      }
+    })
+  }
+
   for (const [plan, enabled, tracked] of [
     ['off', true, 0],
     ['always', false, 1],

@@ -163,10 +163,10 @@ export class FrameMirror {
     track?: (capture: FrameMirrorCapture) => void,
   ): void {
     if (
-      !shouldCaptureSessionCache(sessionID, this.enabled) ||
       (!frame.includes('response.created') &&
         !frame.includes('response.output_item.done') &&
-        !frame.includes('response.completed'))
+        !frame.includes('response.completed')) ||
+      !shouldCaptureSessionCache(sessionID, this.enabled)
     )
       return
     const entry = this.entries.get(sessionID)

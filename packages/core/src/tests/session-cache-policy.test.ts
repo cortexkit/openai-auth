@@ -11,6 +11,15 @@ afterEach(() => {
   delete routing[key]
 })
 
+test('OC1 and OC2 response reporting preserves the exact input response without an accessor', async () => {
+  for (const sessionId of ['opencode-1-session', 'opencode-2-session']) {
+    const response = new Response('host reply')
+    expect(reportSessionCacheResponse(response, sessionId)).toBe(response)
+    expect(response.body!.locked).toBe(false)
+    expect(await response.text()).toBe('host reply')
+  }
+})
+
 test('cache plans read the accessor afresh and never supply TTL or invented prices', () => {
   expect(sessionCacheKeepPlan('ses')).toBeUndefined()
   let policy: unknown = null

@@ -4,6 +4,7 @@ import {
   reportCacheWarmStopped,
   sessionCachePolicy,
 } from '@cortexkit/common-auth/routing-accessor'
+import { hasVaultRoutingAccessor } from './vault-routing'
 
 /** Codex chooses its cache lifetime; session TTL requests cannot change it. */
 export function sessionCacheKeepPlan(
@@ -50,7 +51,7 @@ export function reportSessionCacheResponse(
   sessionId: string | undefined,
   now: () => number = Date.now,
 ): Response {
-  if (!sessionId || !response.ok) return response
+  if (!sessionId || !response.ok || !hasVaultRoutingAccessor()) return response
   const completed = () => {
     deferSessionCacheResponseTouch(sessionId, now())
   }
