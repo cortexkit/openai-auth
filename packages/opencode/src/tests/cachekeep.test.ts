@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from 'bun:test'
 import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -1547,7 +1555,7 @@ describe('CacheKeepManager token resolution', () => {
     expect(mgr.status().targets[0]!.backoffUntil).toBeDefined()
   })
 
-  test('session.deleted event removes target by threadID and prevents further warm fires', async () => {
+  test('session.deleted event removes the host-session target and prevents further warm fires', async () => {
     const originalFetch = globalThis.fetch
 
     globalThis.fetch = (async (_url: any, _init: any) => {
@@ -1629,7 +1637,7 @@ describe('CacheKeepManager token resolution', () => {
 
       expect(mgr.status().tracked).toBe(1)
       const trackedTarget = mgr.status().targets[0]
-      expect(trackedTarget.sessionKey).not.toBe(opencodeSessionId)
+      expect(trackedTarget.sessionKey).toBe(opencodeSessionId)
 
       await plugin.event?.({
         event: {
@@ -1658,6 +1666,147 @@ describe('CacheKeepManager token resolution', () => {
       })
     }
   })
+})
+
+describe('OpenCode 1 session cache plans', () => {
+  const routing = globalThis as Record<symbol, unknown>
+  const routingKey = Symbol.for('cortexkit.routing')
+  afterEach(() => {
+    delete routing[routingKey]
+  })
+
+  for (const [plan, enabled, tracked] of [
+    ['off', true, 0],
+    ['always', false, 1],
+    [null, false, 0],
+    [null, true, 1],
+  ] as const) {
+    test(`OC1 plan ${plan} with setting ${enabled} captures and warms ${tracked} sessions`, async () => {
+      const originalFetch = globalThis.fetch
+      const clock = fakeNow()
+      const time = spyOn(Date, 'now').mockImplementation(clock.now)
+      let policy: unknown = plan ? { keep_warm: plan } : null
+      const reports: Array<[string, any]> = []
+      const lookedUp: string[] = []
+      routing[routingKey] = (id: string) => {
+        lookedUp.push(id)
+        return {
+          cache: () => policy,
+          report: (value: unknown) => reports.push([id, value]),
+        }
+      }
+      const warms: RequestInit[] = []
+      globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+        if (
+          typeof init?.body === 'string' &&
+          JSON.parse(init.body).store === false
+        )
+          warms.push(init)
+        return new Response('{}')
+      }) as typeof fetch
+      try {
+        await writeFile(
+          process.env.OPENCODE_OPENAI_AUTH_FILE!,
+          JSON.stringify({
+            version: 1,
+            main: { type: 'opencode', provider: 'openai' },
+            accounts: [],
+            cachekeep: { enabled },
+          }),
+        )
+        const plugin = pluginScope.ownPlugin(
+          await CodexAuthPlugin({
+            client: {
+              auth: { set: async () => {} },
+              session: { promptAsync: async () => {} },
+            } as any,
+            project: { id: 'test' } as any,
+            directory: '',
+            worktree: '/some/worktree',
+            experimental_workspace: { register: () => {} },
+            serverUrl: new URL('http://localhost:0'),
+            $: {} as any,
+          }),
+        )
+        const loaded = await plugin.auth!.loader!(
+          async () => ({
+            type: 'oauth',
+            access: 'access-token',
+            refresh: 'refresh-token',
+            expires: clock.now() + 3600_000,
+          }),
+          { id: 'openai', models: [] } as any,
+        )
+        const manager = (globalThis as any).__openaiAuthCacheKeepManagers.get(
+          getConfigPath(),
+        )
+        const send = (agent: string) =>
+          loaded.fetch!('https://api.openai.com/v1/responses', {
+            method: 'POST',
+            headers: {
+              'session-id': 'runner-session',
+              'x-openai-auth-agent': agent,
+            },
+            body: JSON.stringify({ model: 'gpt-5.5', input: 'hello' }),
+          })
+        const response = await send('build')
+        await Bun.sleep(5)
+        expect(reports).toEqual([])
+        await response.text()
+        await Bun.sleep(5)
+        expect(reports).toEqual([
+          [
+            'runner-session',
+            {
+              kind: 'cache_touch',
+              at: clock.now(),
+              ttl_ms: 'implicit',
+              source: 'response',
+            },
+          ],
+        ])
+        await (await send('title')).text()
+        await Bun.sleep(5)
+        expect(reports).toHaveLength(1)
+        expect(manager.status().tracked).toBe(tracked)
+        if (tracked)
+          expect(manager.status().targets[0].sessionKey).toBe('runner-session')
+        clock.advance(270_000)
+        await manager.tick()
+        expect(warms).toHaveLength(tracked)
+        expect(lookedUp.every((id) => id === 'runner-session')).toBe(true)
+        if (plan === 'always') {
+          expect(reports.at(-1)).toEqual([
+            'runner-session',
+            {
+              kind: 'cache_touch',
+              at: clock.now(),
+              ttl_ms: 'implicit',
+              source: 'warm',
+            },
+          ])
+          policy = null
+          clock.advance(270_000)
+          await manager.tick()
+          expect(manager.status().tracked).toBe(0)
+          expect(warms).toHaveLength(1)
+          expect(reports.at(-1)).toEqual([
+            'runner-session',
+            {
+              kind: 'cache_warm_stopped',
+              at: clock.now(),
+              reason: 'session-ended',
+            },
+          ])
+        }
+      } finally {
+        await pluginScope.teardown(async () => {
+          globalThis.fetch = originalFetch
+        })
+        time.mockRestore()
+      }
+    })
+  }
 })
 
 describe('RPC server dispose', () => {

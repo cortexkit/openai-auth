@@ -1,6 +1,9 @@
 import { Buffer } from 'node:buffer'
 import { resolve } from 'node:path'
-import type { AccountPaths } from '@cortexkit/openai-auth-core/internal'
+import {
+  type AccountPaths,
+  shouldCaptureSessionCache,
+} from '@cortexkit/openai-auth-core/internal'
 import { CACHE_KEEP_CAPS } from '../core/cachekeep'
 
 /** A completed conversation, ready for the HTTP replay adapter to capture. */
@@ -96,18 +99,23 @@ export class FrameMirror {
 
   constructor(private enabled = false) {}
 
-  /** Disabling discards every baseline; re-enabling waits for a new full frame. */
+  /** Local warming can discard conversation snapshots unless a session plan still needs them. */
   setEnabled(enabled: boolean): void {
     this.enabled = enabled
     if (!enabled) {
-      this.entries.clear()
-      this.bytes = 0
+      for (const sessionID of this.entries.keys()) {
+        if (!shouldCaptureSessionCache(sessionID, enabled))
+          this.forget(sessionID)
+      }
     }
   }
 
   /** Records the final response.create bytes, without changing the host frame. */
   send(sessionID: string, frame: string): void {
-    if (!this.enabled) return
+    if (!shouldCaptureSessionCache(sessionID, this.enabled)) {
+      this.forget(sessionID)
+      return
+    }
     const body = object(frame)
     if (body?.type !== 'response.create') return
     if (!Array.isArray(body.input)) {
@@ -155,7 +163,7 @@ export class FrameMirror {
     track?: (capture: FrameMirrorCapture) => void,
   ): void {
     if (
-      !this.enabled ||
+      !shouldCaptureSessionCache(sessionID, this.enabled) ||
       (!frame.includes('response.created') &&
         !frame.includes('response.output_item.done') &&
         !frame.includes('response.completed'))

@@ -64,8 +64,10 @@ import {
   redactCredentialResponse,
   refreshAllQuota,
   refreshBackoffActive,
+  reportSessionCacheResponse,
   resolveMidStreamRateLimitResetAt,
   type SessionDispatch,
+  shouldCaptureSessionCache,
   shouldFallbackStatus,
   type TokenResponse,
   TombstoneRefreshError,
@@ -1589,10 +1591,7 @@ export async function CodexAuthPlugin(
       limitSource?.forget(info.id)
       forgetPoolHolds(info.id)
       sessionAccounts.delete(info.id)
-      const meta = codexSessions.get(info.id)
-      if (meta) {
-        cmdCtx?.cacheKeepManager?.remove(meta.threadID)
-      }
+      cmdCtx?.cacheKeepManager?.remove(info.id)
       if (codexSessions.delete(info.id)) persistCodexSessions()
       // A pin still waiting to be written would otherwise land after the
       // removal below and resurrect the deleted session's entry.
@@ -3311,6 +3310,7 @@ export async function CodexAuthPlugin(
           )
 
           const sessionID = resolveSidebarSessionId(headers)
+          const agent = headers.get(OPENAI_AGENT_HEADER) ?? undefined
 
           const codexMetadata = sessionID
             ? getCodexSessionMetadata(
@@ -3443,14 +3443,23 @@ export async function CodexAuthPlugin(
               owner?.afterProbe(probe, true, stream.limited)
             },
           }
-          const keepwarmEnabled = cacheKeepEnabled
+          const keepwarmEnabled = shouldCaptureSessionCache(
+            sessionID ?? '',
+            cacheKeepEnabled,
+          )
           const keepwarmHeaders = new Headers(requestInit?.headers)
           const keepwarmCapture = buildKeepwarmCapture({
-            enabled: keepwarmEnabled,
+            enabled: !['title', 'compaction', 'summary'].includes(agent ?? ''),
             includeSubagents: cacheKeepSubagents,
             headers: keepwarmHeaders,
             body: requestInit?.body,
+            sessionID,
           })
+          const reportResponse = (response: Response) =>
+            reportSessionCacheResponse(
+              response,
+              keepwarmCapture && agent ? sessionID : undefined,
+            )
           if (keepwarmEnabled) {
             cacheKeepLogger.trace('cachekeep headers', {
               pid: process.pid,
@@ -3468,7 +3477,7 @@ export async function CodexAuthPlugin(
               pathname: parsed.pathname,
               accountId: keepwarmAccountKey,
             })
-            if (keepwarmCapture) {
+            if (keepwarmEnabled && keepwarmCapture) {
               cacheKeepManager.track({
                 sessionKey: keepwarmCapture.sessionKey,
                 bodyText: keepwarmCapture.bodyText,
@@ -3493,39 +3502,41 @@ export async function CodexAuthPlugin(
               })
               if (!response.body) {
                 release()
-                return response
+                return reportResponse(response)
               }
               const reader = response.body.getReader()
-              return await redactCredentialResponse(
-                new Response(
-                  new ReadableStream<Uint8Array>({
-                    async pull(controller) {
-                      try {
-                        const chunk = await reader.read()
-                        if (chunk.done) {
+              return reportResponse(
+                await redactCredentialResponse(
+                  new Response(
+                    new ReadableStream<Uint8Array>({
+                      async pull(controller) {
+                        try {
+                          const chunk = await reader.read()
+                          if (chunk.done) {
+                            release()
+                            controller.close()
+                          } else controller.enqueue(chunk.value)
+                        } catch (error) {
                           release()
-                          controller.close()
-                        } else controller.enqueue(chunk.value)
-                      } catch (error) {
+                          controller.error(
+                            redactCredentialError(error, accessToken),
+                          )
+                        }
+                      },
+                      cancel(reason) {
                         release()
-                        controller.error(
-                          redactCredentialError(error, accessToken),
-                        )
-                      }
+                        return reader.cancel(reason)
+                      },
+                    }),
+                    {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers,
                     },
-                    cancel(reason) {
-                      release()
-                      return reader.cancel(reason)
-                    },
-                  }),
-                  {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: response.headers,
-                  },
+                  ),
+                  accessToken,
+                  'event-stream',
                 ),
-                accessToken,
-                'event-stream',
               )
             } catch (error) {
               release()
@@ -3546,9 +3557,8 @@ export async function CodexAuthPlugin(
             }
           }
 
-          // Keepwarm capture: track every request body for idle
-          // prompt-cache warming. Cheap — stores the already-serialized string.
-          if (keepwarmCapture) {
+          // Store the finalized agent request, never a title or history rewrite.
+          if (keepwarmEnabled && keepwarmCapture) {
             cacheKeepManager.track({
               sessionKey: keepwarmCapture.sessionKey,
               bodyText: keepwarmCapture.bodyText,
@@ -3580,12 +3590,14 @@ export async function CodexAuthPlugin(
               headers: finalInit.headers,
               status: response.status,
             })
-            return await redactCredentialResponse(
-              observeHttpCompletion(response, (clean) => {
-                if (clean) stream.complete('http')
-              }),
-              accessToken,
-              'event-stream',
+            return reportResponse(
+              await redactCredentialResponse(
+                observeHttpCompletion(response, (clean) => {
+                  if (clean) stream.complete('http')
+                }),
+                accessToken,
+                'event-stream',
+              ),
             )
           } catch (error) {
             await dumpCodexRequest({

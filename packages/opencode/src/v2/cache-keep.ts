@@ -39,6 +39,7 @@ import {
   type AccountStorage,
   cacheKeepSettings,
   type OpenAiVault,
+  shouldCaptureSessionCache,
 } from '@cortexkit/openai-auth-core/internal'
 import {
   CACHE_KEEP_CAPS,
@@ -293,7 +294,11 @@ function createEntry(
       if (sessionID === undefined) throw new Error('target has no session')
       const location = live()
       const settings = location?.settings()
-      if (!location || !settings?.enabled) {
+      if (
+        !location ||
+        !settings ||
+        !shouldCaptureSessionCache(sessionID, settings.enabled)
+      ) {
         drop(sessionID, 'keep-warm is off')
         return undefined
       }
@@ -398,7 +403,11 @@ export function acquireCacheKeep(
   const capture = async (input: CacheKeepCaptureInput) => {
     try {
       const settings = holder.location.settings()
-      if (released || !settings.enabled) return
+      if (
+        released ||
+        !shouldCaptureSessionCache(input.sessionID, settings.enabled)
+      )
+        return
       if (input.kind !== 'primary') {
         if (
           input.kind === 'generate' &&

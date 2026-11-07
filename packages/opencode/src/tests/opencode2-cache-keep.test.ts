@@ -39,9 +39,12 @@ const LIVE_TOKEN = 'secret-live-request-token'
 
 const leases: CacheKeepLease[] = []
 const cleanups: Array<() => unknown> = []
+const routing = globalThis as Record<symbol, unknown>
+const routingKey = Symbol.for('cortexkit.routing')
 afterEach(async () => {
   for (const lease of leases.splice(0)) await lease.release()
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+  delete routing[routingKey]
 })
 
 type Sent = {
@@ -1249,6 +1252,138 @@ function keepWarmPool() {
 }
 
 describe('OpenCode 2 keep-warm in setup', () => {
+  for (const [plan, enabled, tracked] of [
+    ['off', true, 0],
+    ['always', false, 1],
+  ] as const) {
+    for (const transport of ['http', 'ws'] as const) {
+      test(`OC2 ${transport} plan ${plan} with setting ${enabled} captures and warms ${tracked} sessions`, async () => {
+        const sessions: string[] = []
+        routing[routingKey] = (id: string) => {
+          sessions.push(id)
+          return { cache: () => ({ keep_warm: plan }) }
+        }
+        const files = keepWarmPool()
+        const config = JSON.parse(readFileSync(files.configPath, 'utf8'))
+        config.cacheKeep.enabled = enabled
+        writeFileSync(files.configPath, JSON.stringify(config))
+        const shared = { clock: { now: START }, timers: fakeTimers() }
+        const location = await startLocation(files, shared)
+        if (transport === 'http') await location.request('runner-session')
+        else {
+          const ws = await websocket(location, 'runner-session')
+          await ws.send({
+            type: 'response.create',
+            model: 'gpt-5.5',
+            input: [{ role: 'user', content: 'hello' }],
+          })
+          await ws.complete('r1')
+        }
+        expect(managerOf(files)!.status().tracked).toBe(tracked)
+        shared.clock.now += 270_000
+        await managerOf(files)!.tick()
+        expect(location.warms).toHaveLength(tracked)
+        expect(sessions.length).toBeGreaterThan(0)
+        expect(sessions.every((id) => id === 'runner-session')).toBe(true)
+      })
+    }
+  }
+
+  test('OC2 reports only owned primary replies after host handoff, including WebSocket completion', async () => {
+    const reports: Array<[string, any]> = []
+    routing[routingKey] = (id: string) => ({
+      report: (value: unknown) => reports.push([id, value]),
+    })
+    const files = keepWarmPool()
+    const shared = { clock: { now: START }, timers: fakeTimers() }
+    const location = await startLocation(files, shared)
+    for (const kind of ['primary', 'title'] as const) {
+      const request = await location.request('ses', kind)
+      const result = await location.host.fire('http.response', {
+        ...scope('ses', kind),
+        request: request.request,
+        response: new Response('reply'),
+      })
+      await Bun.sleep(5)
+      expect(reports).toHaveLength(kind === 'primary' ? 0 : 1)
+      await result.response.text()
+      expect(reports).toHaveLength(kind === 'primary' ? 0 : 1)
+      await Bun.sleep(5)
+      expect(reports).toHaveLength(1)
+    }
+    expect(reports[0]).toEqual([
+      'ses',
+      {
+        kind: 'cache_touch',
+        at: expect.any(Number),
+        ttl_ms: 'implicit',
+        source: 'response',
+      },
+    ])
+    const foreign = await location.request('foreign', 'primary', {
+      authorization: 'Bearer not-ours',
+    })
+    const result = await location.host.fire('http.response', {
+      ...scope('foreign'),
+      request: foreign.request,
+      response: new Response('foreign'),
+    })
+    await result.response.text()
+    const ws = await websocket(location)
+    await ws.send({ type: 'response.create', model: 'gpt-5.5', input: [] })
+    await ws.complete('r1')
+    expect(reports).toHaveLength(1)
+    await Bun.sleep(5)
+    expect(reports).toHaveLength(2)
+    expect(reports[1]).toEqual([
+      'ses_ws',
+      {
+        kind: 'cache_touch',
+        at: expect.any(Number),
+        ttl_ms: 'implicit',
+        source: 'response',
+      },
+    ])
+  })
+
+  test('OC2 warm and retired plan reports reach the fresh routing handle', async () => {
+    let policy: unknown = { keep_warm: 'always' }
+    const reports: Array<[string, unknown]> = []
+    routing[routingKey] = (id: string) => ({
+      cache: () => policy,
+      report: (value: unknown) => reports.push([id, value]),
+    })
+    const fake = served()
+    fake.state.settings.enabled = false
+    const { lease, clock } = acquire(fake.location)
+    await lease.capture(captured('ses'))
+    await advance(lease, clock, 270_000)
+    expect(fake.sent).toHaveLength(1)
+    expect(reports).toEqual([
+      [
+        'ses',
+        {
+          kind: 'cache_touch',
+          at: clock.now,
+          ttl_ms: 'implicit',
+          source: 'warm',
+        },
+      ],
+    ])
+    policy = null
+    await advance(lease, clock, 270_000)
+    expect(fake.sent).toHaveLength(1)
+    expect(lease.manager.status().tracked).toBe(0)
+    expect(reports.at(-1)).toEqual([
+      'ses',
+      {
+        kind: 'cache_warm_stopped',
+        at: clock.now,
+        reason: 'session-ended',
+      },
+    ])
+  })
+
   test('Cache menu settings reach the shared manager and captures in both live locations', async () => {
     const files = keepWarmPool()
     const config = JSON.parse(readFileSync(files.configPath, 'utf8'))

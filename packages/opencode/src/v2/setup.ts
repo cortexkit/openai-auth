@@ -54,6 +54,7 @@ import {
   type AccountPaths,
   beginAccountLogin,
   codexRefreshFn,
+  deferSessionCacheResponseTouch,
   extractAccountId,
   loadAccountSettings,
   loadAccounts,
@@ -62,6 +63,7 @@ import {
   redactCredentialFrame,
   redactCredentialResponse,
   redactCredentialText,
+  reportSessionCacheResponse,
   vaultStateDir,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Plugin } from '@opencode/plugin'
@@ -248,7 +250,13 @@ async function installPoolHooks<Q, A>(
   // bearer. A send using another integration's login is not ours to rewrite.
   const sockets = new Map<
     string,
-    { bearer: string; attempt: Attempt<A>; url: string; headers: Headers }
+    {
+      bearer: string
+      attempt: Attempt<A>
+      url: string
+      headers: Headers
+      pending: boolean
+    }
   >()
   const latest = new Map<string, string>()
   const forget = (sessionID: string) => {
@@ -322,6 +330,7 @@ async function installPoolHooks<Q, A>(
             if (name === 'experimental.ws.send') {
               const sent = draft as SessionHooks['experimental.ws.send']
               const socket = sockets.get(`${sent.sessionID}:${sent.kind}`)
+              if (socket) socket.pending = true
               if (socket) await dumps.frame(sent.frame, socket.attempt)
               if (socket && sent.kind === 'primary')
                 recordPrimaryWebSocketFrame(sent)
@@ -346,6 +355,7 @@ async function installPoolHooks<Q, A>(
                   sockets.set(key, {
                     bearer,
                     attempt: observation.attempt,
+                    pending: false,
                     url: handshake.url,
                     headers: new Headers(
                       Object.entries(handshake.headers).filter(([name]) =>
@@ -413,6 +423,28 @@ async function installPoolHooks<Q, A>(
                   received.frame,
                   socket.bearer,
                 )
+                if (received.kind === 'primary' && socket.pending) {
+                  try {
+                    const event = JSON.parse(received.frame)
+                    if (event.type === 'response.completed') {
+                      socket.pending = false
+                      deferSessionCacheResponseTouch(
+                        received.sessionID,
+                        Date.now(),
+                      )
+                    } else if (
+                      [
+                        'response.failed',
+                        'response.incomplete',
+                        'error',
+                      ].includes(event.type)
+                    ) {
+                      socket.pending = false
+                    }
+                  } catch {
+                    // A malformed frame cannot prove successful completion.
+                  }
+                }
               }
             } else if (name === 'retry') {
               const retry = draft as SessionHooks['retry']
@@ -458,10 +490,14 @@ async function installPoolHooks<Q, A>(
         await dumps.response(input.request, input.response.status)
         const response =
           (await adapter.rewriteResponse?.(input)) ?? input.response
-        return redactCredentialResponse(
+        const redacted = await redactCredentialResponse(
           response,
           input.request.headers.get('authorization')?.replace(/^Bearer /, ''),
           'event-stream',
+        )
+        return reportSessionCacheResponse(
+          redacted,
+          input.kind === 'primary' ? input.sessionID : undefined,
         )
       },
     },

@@ -41,6 +41,7 @@ import {
   type QuotaManager,
   type RefreshAllQuotaResult,
   setLogLevel,
+  shouldCaptureSessionCache,
 } from '@cortexkit/openai-auth-core/internal'
 import { getSettings, isRequestDumpEnabled, refreshSettings } from './config'
 import { poolRemovalRefusal, poolSettingsLocks } from './core/pool-accounts'
@@ -215,7 +216,14 @@ function cacheSection(ctx: OpenCodeMenuContext) {
               })
               ctx.setCacheKeepEnabled?.(on)
               if (on) mgr.start()
-              else mgr.stop()
+              else {
+                // The local toggle does not cancel a runner's session plan.
+                for (const target of mgr.status().targets) {
+                  if (!shouldCaptureSessionCache(target.sessionKey, false))
+                    mgr.remove(target.sessionKey)
+                }
+                if (mgr.status().tracked === 0) mgr.stop()
+              }
               log.info(on ? 'cachekeep enabled' : 'cachekeep disabled')
               return on
                 ? `Keep-warm is on. TTL ${Math.round(status.ttlMs / 1000)}s, idle cap ${Math.round(status.maxIdleWarmMs / 60_000)}min.`

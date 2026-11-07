@@ -35,7 +35,10 @@ import {
   recordSessionCompletion,
   redactCredentialError,
   redactCredentialResponse,
+  reportSessionCacheWarmed,
+  reportSessionCacheWarmStopped,
   type SessionDispatch,
+  sessionCacheKeepPlan,
 } from '@cortexkit/openai-auth-core/internal'
 import { sanitizeHttpFallbackInit } from '../codex-http'
 import {
@@ -109,6 +112,7 @@ export function buildKeepwarmCapture(input: {
   includeSubagents: boolean
   headers: Headers
   body: unknown
+  sessionID?: string
 }): KeepwarmCapture | undefined {
   if (!input.enabled || typeof input.body !== 'string') return undefined
 
@@ -116,6 +120,7 @@ export function buildKeepwarmCapture(input: {
   if (isSubagent && !input.includeSubagents) return undefined
 
   const sessionKey =
+    input.sessionID ??
     input.headers.get('session-id') ??
     input.headers.get('x-opencode-session') ??
     input.headers.get('x-session-affinity') ??
@@ -428,6 +433,9 @@ export function createOpenAICacheKeepAdapter(
   const log = options.logger
   const activeAccount = options.activeAccount
   return {
+    plan: sessionCacheKeepPlan,
+    onWarmed: reportSessionCacheWarmed,
+    onWarmStopped: reportSessionCacheWarmStopped,
     buildBody: (target) => buildKeepwarmBody(target.bodyText),
 
     async send({ target, body, signal }) {

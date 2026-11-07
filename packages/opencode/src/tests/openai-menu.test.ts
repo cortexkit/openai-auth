@@ -639,22 +639,29 @@ describe('/openai on a migrated install', () => {
       cachekeep: { enabled: false, subagents: true, startHour: 9, endHour: 18 },
     })
     const calls: string[] = []
+    const targets: Array<{ sessionKey: string }> = []
     const manager: CacheKeepManager = {
       status: () => ({
         running: false,
         sustain: false,
         window: { startHour: 9, endHour: 18 },
-        tracked: 0,
+        tracked: targets.length,
         generatedAt: 0,
         ttlMs: 300_000,
         leadMs: 75_000,
         maxIdleWarmMs: 3600_000,
         maxSubagentIdleMs: 1800_000,
-        targets: [],
+        targets: targets.map((target) => ({ ...target, cacheExpiresAt: 0 })),
       }),
       start: () => calls.push('start'),
       stop: () => calls.push('stop'),
-      remove: () => {},
+      remove: (key) => {
+        calls.push(`remove:${key}`)
+        targets.splice(
+          targets.findIndex((target) => target.sessionKey === key),
+          1,
+        )
+      },
     }
     const ctx = context({
       cacheKeepManager: manager,
@@ -715,6 +722,35 @@ describe('/openai on a migrated install', () => {
       'window:22-6',
       'window:none',
     ])
+    const routing = globalThis as Record<symbol, unknown>
+    const key = Symbol.for('cortexkit.routing')
+    routing[key] = (id: string) => ({
+      cache: () => (id === 'planned' ? { keep_warm: 'always' } : null),
+    })
+    try {
+      targets.push({ sessionKey: 'standalone' }, { sessionKey: 'planned' })
+      await apply(ctx, {
+        sectionId: 'cache',
+        actionId: 'enabled',
+        values: { enabled: false },
+      })
+      expect(targets).toEqual([{ sessionKey: 'planned' }])
+      expect(calls.slice(-2)).toEqual(['enabled:false', 'remove:standalone'])
+      delete routing[key]
+      await apply(ctx, {
+        sectionId: 'cache',
+        actionId: 'enabled',
+        values: { enabled: false },
+      })
+      expect(targets).toEqual([])
+      expect(calls.slice(-3)).toEqual([
+        'enabled:false',
+        'remove:planned',
+        'stop',
+      ])
+    } finally {
+      delete routing[key]
+    }
   })
 
   test('Diagnostics turns request dumps on and sets the log level', async () => {

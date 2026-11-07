@@ -40,6 +40,7 @@ import {
   connectClaustrumEnrollmentClient,
   connectClaustrumScopedClient,
   enrollmentName,
+  hasVaultHost,
   hostEnrollmentPaths,
   type KeptReceiptState,
   type QuotaReceipt,
@@ -84,14 +85,7 @@ type VaultQuotaSourceReason =
 /** The plugin part of each host's enrollment name (`openai-auth-opencode`, `openai-auth-pi`). */
 export const VAULT_PLUGIN_NAME = 'openai-auth'
 
-/**
- * Only Thalamus's exact spawn marker selects hosted custody. common-auth
- * 0.40.0 defines the same check in hasVaultHost but omits that helper from its
- * public /claustrum exports. Replace this with hasVaultHost when exported.
- */
-export function isVaultHosted(): boolean {
-  return process.env.CORTEXKIT_VAULT_HOST === 'thalamus'
-}
+export { hasVaultHost as isVaultHosted }
 
 /**
  * Which vault credentials are OpenAI's: OAuth logins refreshed by the vault's
@@ -431,7 +425,7 @@ export class OpenAiVault {
   }
 
   #enrollmentKey(): string {
-    if (isVaultHosted()) return 'host'
+    if (hasVaultHost()) return 'host'
     return [this.paths.tokenPath, this.paths.statePath]
       .map((path) => {
         try {
@@ -464,7 +458,7 @@ export class OpenAiVault {
    */
   enrolled(): boolean {
     return (
-      isVaultHosted() ||
+      hasVaultHost() ||
       this.#authorityKey !== this.#enrollmentKey() ||
       this.#authority !== 'local'
     )
