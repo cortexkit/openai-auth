@@ -22,7 +22,6 @@ import { createVaultLimitsAdapter } from '@cortexkit/common-auth/limits/vault'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore } from '@cortexkit/common-auth/store'
 import {
-  canonicalStorePath,
   limitAccountKey,
   poolLimitsBinding,
   poolLimitsNamespace,
@@ -147,6 +146,21 @@ describe('core limits namespace lease', () => {
         path('real', 'config'),
         path('real', 'state'),
       ])
+      // Saved limits use these exact path bytes. Compute expected paths without
+      // the shared helper so a canonicalization change cannot silently reset them.
+      const checkSharedPaths = () => {
+        for (const parent of ['real', 'alias-one', 'alias-two']) {
+          expect(canonicalLimitsPath(join(root, parent, 'config'))).toBe(
+            join(root, 'real', 'config'),
+          )
+          for (const file of ['config', 'state', 'roster']) {
+            expect(canonicalLimitsPath(path(parent, file))).toBe(
+              path('real', file),
+            )
+          }
+        }
+      }
+      checkSharedPaths()
       expect(
         poolLimitsNamespace(
           path('alias-one', 'config'),
@@ -157,15 +171,16 @@ describe('core limits namespace lease', () => {
         JSON.stringify(['openai', 'vault', path('real', 'roster')]),
       )
       await mkdir(join(root, 'real', 'not-yet-created'))
-      expect(canonicalStorePath(path('alias-one', 'config'))).toBe(
-        canonicalLimitsPath(path('alias-one', 'config')),
-      )
+      checkSharedPaths()
       expect(
         poolLimitsNamespace(
           path('alias-two', 'config'),
           path('alias-one', 'state'),
         ),
       ).toBe(expectedPool)
+      expect(vaultLimitsNamespace(path('alias-two', 'roster'))).toBe(
+        JSON.stringify(['openai', 'vault', path('real', 'roster')]),
+      )
       expect(
         poolLimitsNamespace(path('real', 'config'), path('real', 'other')),
       ).not.toBe(expectedPool)

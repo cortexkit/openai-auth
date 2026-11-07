@@ -4,12 +4,12 @@ This ledger tracks the OpenAI limit-policy contract across OpenCode 1 (OC1), Ope
 
 ## Published shared-library surface
 
-The audited artifact is **`@cortexkit/common-auth@0.38.0`**, npm gitHead `9d1b086e05f179e960ea8892479999bfd7fd5fdd`, fetched with `npm pack @cortexkit/common-auth@0.38.0 --ignore-scripts --json`. Its registry tarball is <https://registry.npmjs.org/@cortexkit/common-auth/-/common-auth-0.38.0.tgz>.
+The audited artifact is **`@cortexkit/common-auth@0.39.0`**, npm gitHead `7cc14aa25f0ea6428768660f2d030ecdc6346d77`, fetched with `npm pack @cortexkit/common-auth@0.39.0 --ignore-scripts --json`. Its registry tarball is <https://registry.npmjs.org/@cortexkit/common-auth/-/common-auth-0.39.0.tgz>.
 
-- SHA-1: `c0f8cd2f48ceec73ce06482896bb1ce205f95925`.
-- npm integrity: `sha512-YDXtwuuj/gz4h/bPO+UAVItjo3ZMYw9DhccEf4DWAk8dr+Rk/uo/cVUeTRbC4xXE7FXTeBr1HaRnyG7drZIg3w==`.
-- The downloaded archive matched both registry hashes; all **316 published `dist/` files** and `package.json` were byte-identical to the installed 0.38.0 dependency. The artifact audit passed **322 assertions**.
-- Public imports and declaration/runtime-member checks passed **124 surface assertions** with Bun 1.4.2 on Linux. These checks establish availability, not adoption behavior. No foreign source checkout, unpublished candidate, or source-only export was used as published-dist proof.
+- SHA-1: `9c497bba2c6883671aa1425319516665e8e826f2`.
+- npm integrity: `sha512-Qu+04zv5gI5y/jT/sdUM9zW9hQfb8HJVTrfEx4LoQLOjXFbJxSAmnhI7Gh3J14N8YI8zd+DgpVpqOagbmucwwA==`.
+- The downloaded archive matched both registry hashes; all **316 published `dist/` files** and `package.json` were byte-identical to the installed 0.39.0 dependency. The artifact audit passed **322 assertions**.
+- Public imports and declaration/runtime-member checks, including a public-export and instance-member typecheck, passed **132 surface assertions** with Bun 1.4.4 on macOS. These checks establish availability, not adoption behavior. No foreign source checkout, unpublished candidate, or source-only export was used as published-dist proof.
 
 All subpaths below have both `import` and `types` targets in the published `package.json`. Paths in the evidence column are relative to that package, not this repository.
 
@@ -36,7 +36,7 @@ The same surface audit checked these public exports so later adapters need no pr
 | `@cortexkit/common-auth/routing-accessor` | `askRouting`, `reportRouting` | Public declarations in `dist/routing-accessor/index.d.ts` |
 | `@cortexkit/common-auth/claustrum` | `ClaustrumConsumer`, `readVaultRoster`, `reorderVaultRoster`, `mutateVaultRoster` | Public declarations in `dist/claustrum/index.d.ts` |
 
-`terminalRefusalDecision` is an internal shared helper reached through public `decideAfterLimit`, not a promised public import. `recordAccepted` belongs to the activity store; `beforeDispatch`/`observe`/`reload`/`flush`/`dispose` belong to the acquired registry. Plugin helpers such as `ttlForModel`, `limitOfEvent`, and projection reload/recovery-latch facilities are not claimed as shared-library exports. `window-router` is a preset ID, not the exported `windowRouter` value; `hold_wait_max_s` is a routing-advice field, not a named export. Availability of `mutateVaultRoster`/`updateLimitsNamespace` is not permission to add plugin-side envelope repair; native 0.38.0 handling owns it.
+`terminalRefusalDecision` is an internal shared helper reached through public `decideAfterLimit`, not a promised public import. `recordAccepted` belongs to the activity store; `beforeDispatch`/`observe`/`reload`/`flush`/`dispose` belong to the acquired registry. Plugin helpers such as `ttlForModel`, `limitOfEvent`, and projection reload/recovery-latch facilities are not claimed as shared-library exports. `window-router` is a preset ID, not the exported `windowRouter` value; `hold_wait_max_s` is a routing-advice field, not a named export. Availability of `mutateVaultRoster`/`updateLimitsNamespace` is not permission to add plugin-side envelope repair; native 0.39.0 handling owns it.
 
 ## Evidence rules
 

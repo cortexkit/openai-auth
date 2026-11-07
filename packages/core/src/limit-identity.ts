@@ -1,34 +1,8 @@
-import { statSync } from 'node:fs'
-import { basename, dirname, join, resolve } from 'node:path'
 import {
   type AccountKey,
   canonicalLimitsPath,
   type IdentityBinding,
 } from '@cortexkit/common-auth/limits'
-
-/**
- * common-auth 0.38.0 canonicalizes only the immediate parent. Walk missing
- * parents so aliases share even before the store directory exists. Once the
- * dependency ships that ancestor walk, this can be a plain canonicalLimitsPath.
- */
-export function canonicalStorePath(path: string): string {
-  const absolute = resolve(path)
-  let ancestor = dirname(absolute)
-  const missing = [basename(absolute)]
-  for (;;) {
-    try {
-      statSync(ancestor)
-      return join(dirname(canonicalLimitsPath(join(ancestor, '_'))), ...missing)
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code
-      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error
-      const parent = dirname(ancestor)
-      if (parent === ancestor) return canonicalLimitsPath(path)
-      missing.unshift(basename(ancestor))
-      ancestor = parent
-    }
-  }
-}
 
 export function poolLimitsNamespace(
   configPath: string,
@@ -37,13 +11,13 @@ export function poolLimitsNamespace(
   return JSON.stringify([
     'openai',
     'pool',
-    canonicalStorePath(configPath),
-    canonicalStorePath(statePath),
+    canonicalLimitsPath(configPath),
+    canonicalLimitsPath(statePath),
   ])
 }
 
 export function vaultLimitsNamespace(rosterPath: string): string {
-  return JSON.stringify(['openai', 'vault', canonicalStorePath(rosterPath)])
+  return JSON.stringify(['openai', 'vault', canonicalLimitsPath(rosterPath)])
 }
 
 export type LimitAccount =
