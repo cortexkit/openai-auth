@@ -1,6 +1,7 @@
 # Dependencies and build outputs
 node_modules/
-target/scratch/gate-tools/
+# Gate logs, pinned toolchains, release notes drafts and scratch copies.
+target/
 dist/
 packages/*/dist/
 packages/opencode/src/tui-compiled/
