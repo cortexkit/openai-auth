@@ -23,20 +23,20 @@
       "name": "@cortexkit/openai-auth-core",
       "version": "0.0.0",
       "devDependencies": {
-        "@cortexkit/claustrum-client": "^0.15.0",
+        "@cortexkit/claustrum-client": "^0.16.0",
         "@cortexkit/common-auth": "^0.40.0",
       },
     },
     "packages/opencode": {
       "name": "@cortexkit/opencode-openai-auth",
-      "version": "1.10.0",
+      "version": "1.10.1",
       "bin": {
         "opencode-openai-auth": "./dist/bin.js",
       },
       "dependencies": {
-        "@cortexkit/claustrum-client": "^0.15.0",
+        "@cortexkit/claustrum-client": "^0.16.0",
         "@cortexkit/private-files": "^0.2.2",
-        "@cortexkit/subc-client": "^0.22.0",
+        "@cortexkit/subc-client": "^0.24.0",
         "@opentui/core": ">=0.7.0",
         "@opentui/solid": ">=0.7.0",
         "ai": "^7.0.159",
@@ -59,11 +59,11 @@
     },
     "packages/pi": {
       "name": "@cortexkit/pi-openai-auth",
-      "version": "1.10.0",
+      "version": "1.10.1",
       "dependencies": {
-        "@cortexkit/claustrum-client": "^0.15.0",
+        "@cortexkit/claustrum-client": "^0.16.0",
         "@cortexkit/private-files": "^0.2.2",
-        "@cortexkit/subc-client": "^0.22.0",
+        "@cortexkit/subc-client": "^0.24.0",
       },
       "devDependencies": {
         "@cortexkit/common-auth": "^0.40.0",
@@ -223,7 +223,7 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.6.4", "", { "os": "win32", "cpu": "x64" }, "sha512-pYsMy5AThiHFOZAsngg8qN4PurM6nInKBhVX7sbj3eNpRQqo1Hb0MgCwPL7VqVMrmcEEMj9Ks3qbkallR65e8g=="],
 
-    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.15.0", "", { "dependencies": { "@cortexkit/store": "^0.2.1", "@cortexkit/subc-client": "^0.22.0" } }, "sha512-1foTSPsqwB2lyUtK5XWUgONUyi7ef9KNysf1MZxsnuD5LzV2kP9kFDvDuGfdRnQWMWrXnUmdCc1zZcqpFNvUEQ=="],
+    "@cortexkit/claustrum-client": ["@cortexkit/claustrum-client@0.16.0", "", { "dependencies": { "@cortexkit/store": "^0.2.3", "@cortexkit/subc-client": "^0.24.0" } }, "sha512-K2iY0j0pJscnmjs3Z5cXxL2sJPuAuf/EnaYM1/6CCmMGgenibp8yaaPu0ijxOztWxxyJwtzIrHCdVKtzMtdmSw=="],
 
     "@cortexkit/common-auth": ["@cortexkit/common-auth@0.40.0", "", { "dependencies": { "@cortexkit/private-files": "^0.2.2", "jsonc-parser": "^3.3.1" }, "peerDependencies": { "@cortexkit/claustrum-client": ">=0.6.2", "@cortexkit/subc-client": "^0.16.0 || ^0.22.0", "@opencode/plugin": ">=2.0.21", "@opentui/core": ">=0.4.5", "@opentui/solid": ">=0.4.5", "solid-js": ">=1.9.12 <2" }, "optionalPeers": ["@cortexkit/claustrum-client", "@cortexkit/subc-client", "@opencode/plugin", "@opentui/core", "@opentui/solid", "solid-js"] }, "sha512-P0rfQ+fRXTBhAAG0rWkcP2CXkDb32Zplo37qpQx6TINHi78yzp8kNEnHSSwSeEReH5imh7hptg9L69AYCg4Jdw=="],
 
@@ -237,7 +237,7 @@
 
     "@cortexkit/store": ["@cortexkit/store@0.2.3", "", { "dependencies": { "@cortexkit/private-files": "^0.2.0" } }, "sha512-cOCjAhb2rJp9u71xHXTlb2tS67237hHVN5DCB+aVh9S/FSu1UjOj8j/LjTSnVAZYXrNuWWb8eoQghiEcDtNT8g=="],
 
-    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.22.5", "", {}, "sha512-C3yw60RtmWDsG6wXtEBRA+T2ybUFbIjfaAnQmuf3HIlWniLOBWoYNwMVdcUORc3wxegE5vC58DFhA3VPJ9+aAw=="],
+    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.24.0", "", {}, "sha512-adx2FoWdJqqEyOOChX3I7SKOUhoxDohK1lCn6Kj4OQvB4jIKONJ/8MoCc/jDnRidoiOx+k+K/nZcybHMYbBc5Q=="],
 
     "@earendil-works/pi-agent-core": ["@earendil-works/pi-agent-core@1.4.0", "", { "dependencies": { "@earendil-works/pi-ai": "1.4.0", "typebox": "1.3.27" } }, "sha512-PoKY84SKUwnt7S5QBZaGUqfNO1kjP3KHpHUA9QpFTj4cOjaVWMYIcBPJ6FDRCdE8Zen9OSECQUd0uUfVgtSmgA=="],
 

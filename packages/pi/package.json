@@ -42,9 +42,9 @@
     "@cortexkit/openai-auth-core": "workspace:*"
   },
   "dependencies": {
-    "@cortexkit/claustrum-client": "^0.15.0",
+    "@cortexkit/claustrum-client": "^0.16.0",
     "@cortexkit/private-files": "^0.2.2",
-    "@cortexkit/subc-client": "^0.22.0"
+    "@cortexkit/subc-client": "^0.24.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=1.0.1",

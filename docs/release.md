@@ -6,6 +6,8 @@ This repository uses CortexKit's tag-driven release workflow. One version number
 
 The plugins now use `@cortexkit/common-auth` 0.40.0. That is the dependency version, not the version to pass to the plugin release script below. Users continue to install through the setup command; no separate common-auth installation or credential migration is required.
 
+Vault connections use `@cortexkit/claustrum-client` 0.16.0 with `@cortexkit/subc-client` 0.24.0 and `@cortexkit/store` 0.2.3. This includes SUBC's freeze fix and SDK-side retries for daemon `route_busy` responses; an exhausted `route_busy` is reported as never-sent.
+
 Release notes should call out these user-visible changes:
 
 - **Longest wait on the same account**, under Routing, defaults to **15 minutes**, with **Don't wait** and **Until the cache expires** alternatives. A same-account hold waits for a reset time confirmed by the provider or fresh quota readings, only while the session's cache remains usable. Credentials, quota and cache are checked again before sending after the wait. Any suggested delay in a quota-refusal message uses fresh quota information and is capped by the selected wait bound.

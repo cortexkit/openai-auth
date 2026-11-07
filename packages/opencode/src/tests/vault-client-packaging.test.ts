@@ -34,7 +34,7 @@ function tree() {
   const dir = mkdtempSync(join(tmpdir(), 'openai-client-tree-'))
   temporary.push(dir)
   install(dir, 'private-files', '0.2.1')
-  const client = install(dir, 'subc-client', '0.22.5')
+  const client = install(dir, 'subc-client', '0.24.0')
   install(dir, 'common-auth', '0.16.0')
   return { dir, client }
 }
@@ -55,9 +55,9 @@ describe('vault client packaging', () => {
         readFileSync(join(packageDir, 'package.json'), 'utf8'),
       )
       expect(manifest.dependencies['@cortexkit/claustrum-client']).toBe(
-        '^0.15.0',
+        '^0.16.0',
       )
-      expect(manifest.dependencies['@cortexkit/subc-client']).toBe('^0.22.0')
+      expect(manifest.dependencies['@cortexkit/subc-client']).toBe('^0.24.0')
       const dist = join(packageDir, 'dist')
       const sources = readdirSync(dist, { recursive: true })
         .map(String)
@@ -93,7 +93,7 @@ describe('vault client packaging', () => {
     expect(result.status).toBe(0)
     expect(result.stderr).toBe('')
     expect(result.stdout).toContain(
-      'subc-client tree ok (1 physical copy: 0.22.5)',
+      'subc-client tree ok (1 physical copy: 0.24.0)',
     )
     expect(result.stdout).toContain(
       'private-files tree ok (1 physical copy: 0.2.1',
@@ -148,11 +148,11 @@ describe('vault client packaging', () => {
 
   test('rejects a second subc-client copy at the same version', () => {
     const { dir } = tree()
-    install(join(dir, 'consumer'), 'subc-client', '0.22.5')
+    install(join(dir, 'consumer'), 'subc-client', '0.24.0')
     const result = check(dir)
     expect(result.status).toBe(1)
     expect(result.stderr).toContain(
-      'Expected exactly one physical @cortexkit/subc-client',
+      'Expected exactly one physical @cortexkit/subc-client at 0.24.x',
     )
   })
 
@@ -172,7 +172,7 @@ describe('vault client packaging', () => {
     const result = check(dir)
     expect(result.status).toBe(1)
     expect(result.stderr).toContain(
-      'Expected exactly one physical @cortexkit/subc-client',
+      'Expected exactly one physical @cortexkit/subc-client at 0.24.x',
     )
   })
 })

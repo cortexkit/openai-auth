@@ -108,10 +108,10 @@ if (
 if (
   requireSubc &&
   (subc.size !== 1 ||
-    !Bun.semver.satisfies([...subc.values()][0] ?? '', '^0.22.0'))
+    !Bun.semver.satisfies([...subc.values()][0] ?? '', '^0.24.0'))
 ) {
   console.error(
-    'Expected exactly one physical @cortexkit/subc-client at 0.22.x',
+    'Expected exactly one physical @cortexkit/subc-client at 0.24.x',
   )
   console.error([...subc.entries()])
   process.exit(1)
