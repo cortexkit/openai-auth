@@ -32,6 +32,19 @@ jobs:
       - run: bun run test
       - run: bun run format:check
       - run: bun run lint
+  check-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+      - run: bun install --frozen-lockfile
+      - name: Install locked OpenCode host fixtures without lifecycle scripts
+        run: |
+          for host in opencode1 opencode2; do
+            npm ci --ignore-scripts --prefix packages/opencode/src/tests/fixtures/$host-host || exit
+          done
+      - run: bun run build
+      - run: bun run test
   # Runs the plugin's OpenCode 2 entry, packed as a consumer installs it, in
   # the real OpenCode 2 CLI (pinned in its locked fixture) against a loopback
   # mock of the Codex backend. It fails when a host
