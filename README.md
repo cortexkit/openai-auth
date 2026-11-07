@@ -31,7 +31,7 @@ Then start OpenCode and run `/openai`.
 
 ## Shared limit policy
 
-The plugins adopt `@cortexkit/common-auth`; it is installed automatically, not a separate setup step. In `/openai`, **Routing → Longest wait on the same account** offers **Don't wait**, **15 minutes** (the default), and **Until the cache expires**. A wait needs a confirmed reset and usable cache evidence; an unknown reset does not justify holding the account. The killswitch and credential checks still apply, and the killswitch can prevent a same-account wait.
+In `/openai`, **Routing → Longest wait on the same account** offers **Don't wait**, **15 minutes** (the default), and **Until the cache expires**. A wait needs a confirmed reset and usable cache evidence; an unknown reset does not justify holding the account. The killswitch and credential checks still apply, and the killswitch can prevent a same-account wait.
 
 OpenCode shares persisted account-wide rate-limit marks across processes using the same local pool or vault roster. Pi keeps its stream-local routing and offers a cancellable countdown before publishing output. Plugin-driven recovery does not replay an answer or a completed tool call to recover from a limit. OpenCode 2 leaves retry decisions to the host when a session mixes plugin-owned and foreign credentials. An OpenCode 2 user turn can use only one policy hold, even if it later changes accounts; a new user prompt restores that allowance. See [configuration](docs/configuration.md) and [OpenCode 2](docs/opencode-2.md) for host-specific retry boundaries.
 
