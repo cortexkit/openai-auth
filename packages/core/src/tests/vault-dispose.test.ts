@@ -60,7 +60,15 @@ test('dispose drains a pending roster quota write and releases its lease', async
   const spy = spyOn(locks, 'acquireRefreshFileLock').mockImplementation(
     async (options) => {
       const lease = await acquire(options)
-      if (lease && options.name === 'claustrum-roster-write') {
+      // Hold only this vault's roster write. The suite shares one process, so
+      // a late write left by an earlier test file can take a lock of the same
+      // name on its own roster; holding that one would leave this vault's
+      // lock file absent and the check below would fail for the wrong reason.
+      if (
+        lease &&
+        options.name === 'claustrum-roster-write' &&
+        options.path === vault.paths.rosterPath
+      ) {
         const original = lease.release.bind(lease)
         lease.release = async () => {
           entered.resolve()
