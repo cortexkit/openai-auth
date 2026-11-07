@@ -667,22 +667,65 @@ describe('Pi pre-publication policy evidence', () => {
     const events = await send(runtime)
     expect(events[0]?.type).toBe('error')
     expect(observations).toEqual([])
-    const unknown = makeRuntime(0, { onLimitDecision: observe })
+    // Only the unverified Pi login may serve; verified pool rows would earn activity.
+    await store().disable('alpha', 'fixture')
+    await store().disable('beta', 'fixture')
+    const sentTokens: Array<string | undefined> = []
+    const unknown = makeRuntime(FIRST_READING_WAIT_MS, {
+      onLimitDecision: observe,
+      // The real SDK rejects opaque tokens before a request or completion.
+      streamSimple(model, _context, options) {
+        sentTokens.push(options?.apiKey)
+        const stream = createAssistantMessageEventStream()
+        void (async () => {
+          const response = await options!.fetch!(CODEX_URL, {
+            headers: { authorization: `Bearer ${options?.apiKey}` },
+          })
+          await options?.onResponse?.(
+            {
+              status: response.status,
+              headers: Object.fromEntries(response.headers),
+            },
+            model,
+          )
+          const error = errorEvent(model, await response.text())
+          if (error.type !== 'error') throw new Error('expected error fixture')
+          if (response.ok) {
+            const message = { ...error.error, stopReason: 'stop' as const }
+            stream.push({ type: 'start', partial: message })
+            stream.push({ type: 'done', reason: 'stop', message })
+          } else {
+            stream.push(error)
+          }
+          stream.end()
+        })()
+        return stream
+      },
+    })
     await ready(unknown)
-    await send(unknown, {
+    const accepted = await send(unknown, {
       apiKey: 'opaque-unverified-token',
       sessionId: 'session-1',
     })
+    expect(sentTokens).toEqual(['opaque-unverified-token'])
+    expect(codexTokens()).toEqual(['opaque-unverified-token'])
+    expect(accepted.at(-1)).toMatchObject({ type: 'done', reason: 'stop' })
     expect(unknown.activity.get('session-1')).toBeUndefined()
     codexHandler = () =>
       Response.json(
         { error: { type: 'usage_limit_reached', resets_in_seconds: 60 } },
         { status: 429 },
       )
-    await send(unknown, {
+    const refused = await send(unknown, {
       apiKey: 'opaque-unverified-token',
       sessionId: 'session-1',
     })
+    expect(refused[0]?.type).toBe('error')
+    expect(sentTokens).toEqual([
+      'opaque-unverified-token',
+      'opaque-unverified-token',
+    ])
+    expect(codexTokens()).toEqual(sentTokens)
     expect(
       observations.every(
         ({ decision, facts }) =>
