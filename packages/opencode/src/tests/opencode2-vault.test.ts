@@ -133,9 +133,11 @@ async function start(
     )
     chmodSync(tokenPath, 0o600)
   }
+  let relay: Awaited<ReturnType<typeof installVaultRelay>> | undefined
   if (options.hosted === 'relay') {
-    const relay = await installVaultRelay(daemon.connectionFile)
-    cleanups.push(() => relay.close())
+    const installed = await installVaultRelay(daemon.connectionFile)
+    relay = installed
+    cleanups.push(() => installed.close())
   } else if (options.hosted === 'missing') {
     process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
     cleanups.push(() => {
@@ -202,7 +204,7 @@ async function start(
   } finally {
     observer.release()
   }
-  return { host, daemon, files, tokenPath }
+  return { host, daemon, files, tokenPath, relay }
 }
 
 type Host = Awaited<ReturnType<typeof start>>['host']
@@ -329,7 +331,7 @@ async function send(host: Host, status: number) {
 
 describe('vault accounts on OpenCode 2', () => {
   it('host relay activates the vault placeholder and serves without enrollment', async () => {
-    const { host, daemon, tokenPath, files } = await start(
+    const { host, daemon, tokenPath, files, relay } = await start(
       'main-first',
       [{ id: 'main' }],
       {
@@ -340,11 +342,15 @@ describe('vault accounts on OpenCode 2', () => {
     const method = host.methods.find(
       (entry) => entry.method.id === VAULT_METHOD,
     )!
+    const clientsBefore = relay!.pluginIds.length
     const flow = await method.authorize({})
     if (typeof flow.callback === 'function')
       throw new Error('expected automatic vault activation')
     const credential = await flow.callback
     expect(isPlaceholderCredential(credential, 'openai')).toBe(true)
+    // The activation's relay probe is its own client, and it closes it.
+    expect(relay!.pluginIds.slice(clientsBefore)).toEqual(['openai-auth'])
+    expect(relay!.closed).toEqual([clientsBefore])
     expect((await send(host, 200)).get('authorization')).toBe(
       `Bearer ${VAULT_ACCESS}`,
     )

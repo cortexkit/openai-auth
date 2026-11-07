@@ -89,7 +89,10 @@ export function vaultLoginMethod(
       const authority = await vaultAuthority(vault.paths, vault.name)
       if (authority === 'host') {
         // Proves Thalamus's relay is installed: this throws when it isn't.
-        connectVaultHost(VAULT_PLUGIN_NAME)
+        // Each accessor call returns a new client its caller owns, so the
+        // probe closes it; the consumer opens its own for serving.
+        const probe = connectVaultHost(VAULT_PLUGIN_NAME)
+        await Promise.resolve(probe.close()).catch(() => undefined)
       } else if (authority !== 'vault') {
         throw new Error(VAULT_ACTIVATION_REFUSAL)
       }

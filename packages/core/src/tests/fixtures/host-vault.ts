@@ -16,24 +16,29 @@ export async function installVaultRelay(connectionFile: string) {
   const usage: Parameters<
     NonNullable<ClaustrumScopedClient['reportUsageScoped']>
   >[0][] = []
-  const relay: ClaustrumScopedClient = {
-    listScoped: (...args) => client.listScoped(...args),
-    getScoped: (input) => client.getScoped(input),
-    reportAuthFailureScoped: (input) => client.reportAuthFailureScoped(input),
-    reportUsageScoped: async (input) => {
-      usage.push(input)
-    },
-    insula: client.insula,
-    close() {},
-  }
+  // Like Thalamus's accessor, every call returns a new client its caller owns;
+  // `closed` records which of them (by call order) were closed.
+  const closed: number[] = []
   globals[key] = (pluginId) => {
-    pluginIds.push(pluginId)
-    return relay
+    const index = pluginIds.push(pluginId) - 1
+    return {
+      listScoped: (...args) => client.listScoped(...args),
+      getScoped: (input) => client.getScoped(input),
+      reportAuthFailureScoped: (input) => client.reportAuthFailureScoped(input),
+      reportUsageScoped: async (input) => {
+        usage.push(input)
+      },
+      insula: client.insula,
+      close() {
+        closed.push(index)
+      },
+    }
   }
   process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
   return {
     pluginIds,
     usage,
+    closed,
     async close() {
       if (previous) globals[key] = previous
       else delete globals[key]
