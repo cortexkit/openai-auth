@@ -38,8 +38,9 @@ export function reportSessionCacheWarmStopped(
 }
 
 export function deferSessionCacheResponseTouch(sessionId: string, at: number) {
-  // A timer also covers bodyless replies and WebSocket frames: the host must
-  // receive the reply before even a synchronous bridge report can run.
+  // Deferred to a timer, also for bodyless replies and WebSocket frames, so
+  // the host has the reply before `reportCacheTouch` (which calls the Thalamus
+  // routing accessor synchronously) runs.
   setTimeout(() => {
     reportCacheTouch(sessionId, { at, ttlMs: 'implicit', source: 'response' })
   }, 0)

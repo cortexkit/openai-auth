@@ -99,7 +99,11 @@ export class FrameMirror {
 
   constructor(private enabled = false) {}
 
-  /** Local warming can discard conversation snapshots unless a session plan still needs them. */
+  /**
+   * Turning the user's keep-warm setting off forgets each session's snapshot,
+   * except for sessions whose Thalamus cache plan still asks for warming
+   * (`shouldCaptureSessionCache`).
+   */
   setEnabled(enabled: boolean): void {
     this.enabled = enabled
     if (!enabled) {

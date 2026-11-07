@@ -217,7 +217,8 @@ function cacheSection(ctx: OpenCodeMenuContext) {
               ctx.setCacheKeepEnabled?.(on)
               if (on) mgr.start()
               else {
-                // The local toggle does not cancel a runner's session plan.
+                // Turning keep-warm off here keeps the sessions whose Thalamus
+                // cache plan still asks for warming (shouldCaptureSessionCache).
                 for (const target of mgr.status().targets) {
                   if (!shouldCaptureSessionCache(target.sessionKey, false))
                     mgr.remove(target.sessionKey)
