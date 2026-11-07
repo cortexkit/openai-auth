@@ -1,262 +1,64 @@
 # Codebase Structure
 
-## Directory Layout
+A Bun workspace of three TypeScript packages. This file is a map; to find a specific symbol, search the code rather than this document. `ARCHITECTURE.md` explains how the parts work.
 
-```
-[project-root]/
-├── packages/
-│   ├── opencode/                  # @cortexkit/opencode-openai-auth (OpenCode plugin + TUI)
-│   │   ├── src/                   # All plugin source
-│   │   │   ├── core/              # Host-owned core (pool request path, host slot, cachekeep, sticky routing, quota polling, paths)
-│   │   │   ├── auth/              # /login openai methods + account menu (methods.ts, doctor.ts, ui/)
-│   │   │   ├── rpc/               # Loopback HTTP RPC between loader and TUI
-│   │   │   ├── tests/             # Co-located bun tests
-│   │   │   ├── tui/               # TUI sidebar Solid components
-│   │   │   ├── util/              # Small dependency-free helpers
-│   │   │   ├── index.ts           # CodexAuthPlugin entry
-│   │   │   ├── codex-http.ts      # HTTP fallback sanitization for WebSocket downgrades
-│   │   │   ├── commands.ts        # /openai-* dialog builders
-│   │   │   ├── config.ts          # Settings resolution (env > file > default)
-│   │   │   ├── logger.ts          # Leveled, redacting, rotating logger
-│   │   │   ├── model-costs.ts     # Dev catalog parser and cost restorer
-│   │   │   ├── sidebar-state.ts   # Loader→TUI snapshot and sticky-pin state
-│   │   │   ├── tui-preferences.ts # Shared tui-preferences.jsonc reader/writer/watcher
-│   │   │   ├── tui.tsx            # TUI sidebar component
-│   │   │   ├── ws.ts              # Low-level WS connect/stream
-│   │   │   ├── ws-pool.ts         # Per-account WS pool with continuation state
-│   │   │   ├── raw-ws.ts          # Runtime-aware RawWebSocket selector
-│   │   │   ├── raw-ws-bun.ts      # Bun.connect-backed hand-rolled client
-│   │   │   ├── raw-ws-node.ts     # node:net/node:tls-backed hand-rolled client
-│   │   │   ├── raw-ws-upgrade.ts  # HTTP upgrade status & header parser for rejected handshakes
-│   │   │   ├── hosted-web-search.ts # Provider-hosted web_search tool + replay/SSE translation
-│   │   │   ├── response-stream-error.ts # Stream error type for WS/HTTP
-│   │   │   ├── prompt-context.ts  # Assistant model/variant resolver for synthetic replies
-│   │   │   ├── dump.ts            # Optional transport request dumps for cache debugging
-│   │   │   ├── version.ts         # Package version (mirrors package.json)
-│   │   │   └── WEBSOCKET.md       # Developer reference for WebSocket flow/lifetime/retries
-│   │   ├── scripts/               # Package-specific build scripts
-│   │   │   └── build-tui.ts       # Precompiles TUI Solid JSX into tui-compiled/
-│   │   ├── package.json
-│   │   ├── README.md
-│   │   ├── tsconfig.json
-│   │   ├── tsconfig.build.json
-│   │   └── bunfig.toml
-│   ├── core/                      # @cortexkit/openai-auth-core (private shared core, never published)
-│   │   ├── src/                   # Shared store, OAuth, quota, commands, logger (no env reads, no host paths)
-│   │   │   ├── util/              # error.ts, record.ts, open-url.ts (shared helpers)
-│   │   │   ├── tests/             # Core bun tests
-│   │   │   ├── index.ts           # Command seam (buildDialogPayload, applyCommand)
-│   │   │   ├── internal.ts        # Host support (store, OAuth, quota, logger, protocol)
-│   │   │   ├── accounts.ts / provider.ts / quota-manager.ts / oauth.ts # Store, seams, quota
-│   │   │   ├── commands.ts / protocol.ts / paths.ts # Shared bodies, wire types, file names
-│   │   │   ├── vault.ts / tombstone.ts # Claustrum vault accounts + handle-mode leftovers
-│   │   │   └── quota-normalize.ts / reset-credits.ts / refresh-all-quota.ts # Quota + reset
-│   │   ├── package.json
-│   │   ├── README.md
-│   │   └── tsconfig.json
-│   └── pi/                        # @cortexkit/pi-openai-auth (Pi coding-agent extension)
-│       ├── src/
-│       │   ├── tests/             # Extension tests
-│       │   │   ├── commands.test.ts
-│       │   │   └── index.test.ts
-│       │   ├── index.ts           # Pi extension entry (registers openai-codex provider)
-│       │   ├── commands.ts        # Thin wrappers over the shared openai-account/quota/routing bodies
-│       │   ├── paths.ts           # Pi-only store paths
-│       │   ├── routing.ts         # Process-local session pins
-│       │   └── raw-ws-node.ts     # node:net/node:tls-backed hand-rolled WS client
-│       ├── package.json
-│       ├── README.md
-│       ├── tsconfig.json
-│       └── tsconfig.build.json
-├── scripts/                       # Release + dev tooling
-│   ├── dev.ts                     # Build + symlink into .opencode/plugins/, run tsc --watch
-│   ├── dev-clean.ts               # Remove the dev symlink
-│   ├── check-installed-ranges.mjs # Build gate: installed deps must satisfy declared ranges
-│   ├── analyze-cache-cliffs.mjs   # Cache cliff analyzer for dumped sessions
-│   ├── find-order-dependent-tests.mjs # Scanner for order-dependent tests
-│   ├── measure-store-contention.mjs # Account-store lock contention benchmark under load
-│   ├── release.sh                 # Tag-driven release driver
-│   ├── wait-release.sh            # Poll for the GitHub release to appear
-│   └── version-sync.mjs           # Sync package versions and documented install pins
-├── docs/                          # User documentation pages, linked from README.md
-├── .github/                       # Issue templates + release workflow
-├── biome.json                     # Formatter/linter config
-├── lefthook.yml                   # Pre-commit biome check
-├── mise.toml                      # Tooling versions
-├── package.json                   # Workspace root (bun workspaces)
-├── bun.lock
-└── README.md                      # Short landing page; details live in docs/
+## Workspace
+
+```text
+packages/
+  core/       @cortexkit/openai-auth-core: private shared code, bundled into both npm packages
+  opencode/   @cortexkit/opencode-openai-auth: the OpenCode 1 plugin (package root) and OpenCode 2 plugin (./server)
+  pi/         @cortexkit/pi-openai-auth: the Pi extension
+scripts/      gate.sh (local checks), release.sh, version-sync.mjs, build-time dependency checks, benchmarks
+docs/         user documentation, linked from README.md
+.github/      CI (ci.yml), release (release.yaml), issue templates
 ```
 
-## Directory Purposes
+Each package keeps its tests in `src/tests/`. `@cortexkit/common-auth` (the library every CortexKit auth plugin shares) is a build-time dependency: its account store, vault consumer, limit policy, OpenCode 2 installer, command menu and sidebar are bundled in.
 
-**`packages/opencode/src/core/`:**
-- Purpose: Host-owned core. Owns the migrated install's request path (pool rows and vault accounts), reading OpenCode's login slot, cache keep-warm, sticky routing, background quota polling, and account-path resolution. The generic store, OAuth flow, quota bookkeeping, reset path, shared command bodies, and logger live in `packages/core/src/` so both hosts run the same code.
-- Contains: `account-paths.ts`, `background-quota-refresh.ts`, `cachekeep.ts`, `host-slot.ts`, `pool-*.ts`, `sticky-routing.ts`, `version-fence.ts`.
-- Key files:
-  - `packages/opencode/src/core/account-paths.ts` — host path resolver (`getAccountStoragePath`, `getAccountStatePath`, `getAccountPaths`, `accountPathsCollide`) over the shared file names in `packages/core/src/paths.ts`
-  - `packages/opencode/src/core/background-quota-refresh.ts` — `BackgroundQuotaRefresh` (periodic jittered poller for idle account quota with cross-process lease lock)
-  - `packages/opencode/src/core/sticky-routing.ts` — cold-session candidate selection, sustainable window weighting, and sticky-break classification
-  - `packages/opencode/src/core/cachekeep.ts` — `CacheKeepManager` (idle prompt-cache warmer with model-aware TTLs, subagent 2-warm limits, clock windows, idle pruning, and main-only sustain)
-  - `packages/opencode/src/core/pool-accounts.ts` — store access and migration protection/settings-lock callbacks for the common-auth account menu; no duplicate row CRUD or report renderer
-  - `packages/opencode/src/core/pool-request.ts` — one request on a migrated install, routed over the pool rows and the vault's accounts
-  - `packages/opencode/src/core/host-slot.ts` — reading OpenCode's `openai` slot (real login, tombstone, confirmed absent) and the `main-refresh` lock name
+## `packages/core/src`
 
-**`packages/core/src/`:**
-- Purpose: Private shared core (`@cortexkit/openai-auth-core`, never published; each host bundles it). Holds the account store, OAuth flow, reset-credit state machine, quota bookkeeping, logger, and shared slash-command bodies. Reads no env vars and resolves no host paths — every store entry point takes an `AccountPaths` (`{ configPath, statePath }`) the host resolves.
-- Contains: `accounts.ts`, `backoff.ts`, `commands.ts`, `index.ts` (command seam), `internal.ts` (host support), `logger.ts`, `oauth.ts`, `paths.ts`, `pool-source-state.ts`, `pool-session-pins.ts`, `pool-routing.ts`, `pool-quota.ts`, `protocol.ts`, `provider.ts`, `quota-manager.ts`, `quota-normalize.ts`, `refresh-all-quota.ts`, `reset-credits.ts`, `tombstone.ts`, `vault.ts`, `util/`.
-- Key files:
-  - `packages/core/src/index.ts` — command seam (`buildDialogPayload`, `applyCommand`; the only way to run a command body so knob scrubbing cannot be bypassed)
-  - `packages/core/src/internal.ts` — host support (store, OAuth, quota, logger, protocol re-exports; importing from here is visibly reaching past the seam)
-  - `packages/core/src/commands.ts` — shared command bodies with module-private `execute*` fns and `scrubKnobs`
-  - `packages/core/src/protocol.ts` — command/RPC wire types (`OpenDialogPayload`, `ApplyRequest`, `ApplyResult`)
-  - `packages/core/src/paths.ts` — shared file names (`ACCOUNT_FILE_NAME`, `ACCOUNT_STATE_FILE_NAME`) and `deriveStatePath`
-  - `packages/core/src/provider.ts` — Codex-specific injection seam (`codexRefreshFn`, `whamUsageFn`)
-  - `packages/core/src/pool-source-state.ts` — shared credential projection, pending observation replay and refresh backoff; host readers retain their lifecycle and write authority
-  - `packages/core/src/pool-session-pins.ts` — shared sticky placement policy with host-owned pin persistence and eviction
-  - `packages/core/src/pool-routing.ts` — admission/routing policy over common-auth, including shared per-row killswitch verdicts
-  - `packages/core/src/vault.ts` — `OpenAiVault`: one host's OpenAI accounts in the Claustrum vault over `@cortexkit/common-auth/claustrum` (routing rows, per-send authorization, quota, decline/accept, enrollment, disconnect, host-slot guard)
-  - `packages/core/src/tombstone.ts` — recognising the tombstones the removed handle-mode custody left (never sent, never refreshed)
+- `index.ts`: the command seam (`buildDialogPayload`, `applyCommand`), kept small because it runs credential scrubbing; `internal.ts`: everything else the hosts import. `src/tests/export-surface.test.ts` fails when the seam exposes a command body or a store, OAuth or reset entry point.
+- `accounts.ts`: the account store types and the legacy fallback manager. `oauth.ts`: PKCE, browser and device logins, JWT claims. `provider.ts`: token refresh and the `wham/usage` quota fetch.
+- `pool-routing.ts`: the routing every host uses (OpenCode on a migrated install, Pi always). `pool-session-pins.ts`, `pool-source-state.ts`, `pool-quota.ts`: sticky placement and pool state shared by OpenCode 2 and Pi.
+- `limit-*.ts`, `routing-wait.ts`, `session-cache-activity.ts`, `quota-refusal.ts`: the shared limit policy as openai-auth adopts it.
+- `quota-manager.ts`, `quota-normalize.ts`, `refresh-all-quota.ts`, `insula-quota.ts`: quota cache, intake and polling.
+- `vault.ts`, `vault-*.ts`: Claustrum vault accounts, vault routing and the vault menu.
+- `commands.ts`: the `/openai` menu. `reset-credits.ts`: reset-credit redemption.
+- `util/`: credential redaction, error text, URL opening.
 
-**`packages/opencode/src/auth/`:**
-- Purpose: The `/login openai` method entries and the account menu rendered inside `opencode auth login`. Replaces the removed `openai-auth` binary.
-- Contains: `methods.ts` (`createAuthMethods`, the six menu actions), `doctor.ts` (`createAuthDoctorReport`, `findStoredMainCredential`), `ui/auth-menu.ts`, `ui/select.ts`, `ui/confirm.ts`, `ui/ansi.ts`.
-- Key files: `packages/opencode/src/auth/methods.ts`, `packages/opencode/src/auth/doctor.ts`.
-- Note: the `ui/` files are first-party terminal code on purpose — the package carries no prompt-library runtime dependency.
+## `packages/opencode/src`
 
-**`packages/opencode/src/rpc/`:**
-- Purpose: Loopback HTTP RPC between the auth loader and the TUI sidebar.
-- Contains: `rpc-server.ts` (bearer-token HTTP server, 1 MiB body cap), `port-file.ts` (`port-<pid>.json` write + discovery), `rpc-client.ts` (TUI-side client with 2s timeout), `rpc-dir.ts` (`XDG_STATE_HOME/cortexkit/openai-auth/rpc/openai-auth-<sha256(projectDir)>/` with startup sweeps for dead port files and empty project directories), `notifications.ts` (queue + per-session TUI-connected tracking), `protocol.ts` (wire types).
-- Key files: `packages/opencode/src/rpc/rpc-server.ts`, `packages/opencode/src/rpc/rpc-client.ts`, `packages/opencode/src/rpc/notifications.ts`.
+- `index.ts`: the OpenCode 1 plugin: auth loader, fetch override, legacy path, model rules, `/openai` hook. `bin.ts` and `setup.ts`: the `opencode-openai-auth setup` command.
+- `codex-request.ts`, `codex-body.ts`, `codex-sessions.ts`: the Codex request shape and the per-session thread ids.
+- `ws.ts`, `ws-pool.ts`, `raw-ws*.ts`, `codex-http.ts`: OpenCode 1's WebSocket transport and its HTTP fallback.
+- `core/`: host-owned machinery: `pool-request.ts` (one request over the pool or vault), `pool-account-source.ts`, `pool-migration.ts`, `pool-lifecycle.ts`, `host-slot.ts`, `version-fence.ts`, `process-heartbeat.ts`, `runtime-layout.ts`, `account-paths.ts`, `limit-source.ts`, `shared-vault.ts`, `cachekeep.ts`, `background-quota-refresh.ts`.
+- `v2/`: the OpenCode 2 plugin: `server.ts` (entry), `setup.ts` (wiring), `adapter.ts` (answers common-auth's installer), `codex-wire.ts` and `frame-*.ts` (request and frame rewrites), `login.ts`, `models.ts`, `pins.ts`, `session-accounts.ts`, `cache-keep.ts`, `control-plane.ts`, `menu.ts`, `sidebar-publisher.ts`.
+- `auth/`: the `/login openai` methods and the `opencode auth login` account menu (`methods.ts`), and the doctor checks (`doctor.ts`).
+- `sidebar-state.ts`: the sidebar snapshot file and the OpenCode 1 session pins. `tui.tsx`, `tui/`: the sidebar and dialogs (OpenCode 1 in `tui.tsx`, OpenCode 2 in `tui/v2.tsx`). `rpc/`: the loopback RPC between server and TUI.
+- `config.ts`: settings from environment and `openai-auth.json`. `logger.ts`, `dump.ts`, `dump-size.ts`: the log file and request dumps.
+- `scripts/build-tui.ts`: precompiles the TUI into `src/tui-compiled/` at build time.
 
-**`packages/opencode/src/tests/`:**
-- Purpose: Co-located bun tests (every `*.test.ts` exercises a sibling source file).
-- Contains: 50+ test files plus a `setup-env.ts` and a `fixtures/` directory. `vault.test.ts` drives the vault end to end against the mock Claustrum daemon in `packages/core/src/tests/fixtures/mock-claustrum.ts`.
-- Key files: `packages/opencode/src/tests/integration.test.ts`, `packages/core/src/tests/oauth.test.ts`, `packages/opencode/src/tests/cachekeep.test.ts`, `packages/opencode/src/tests/rpc-server.test.ts`.
+## `packages/pi/src`
 
-**`packages/opencode/src/tui/`:**
-- Purpose: TUI sidebar Solid components and entry loader (separated from `tui.tsx` to keep the top-level entry small).
-- Contains: `command-dialogs.tsx`, `entry.mjs`.
-- Key files: `packages/opencode/src/tui/command-dialogs.tsx`, `packages/opencode/src/tui/entry.mjs`.
+- `index.ts`: registers the `openai-codex` provider and the `/openai` command.
+- `runtime.ts`, `pool-request.ts`, `pool-source.ts`, `main-account.ts`: routing each request across Pi's own login and the pool, and vault mode.
+- `store-paths.ts`, `paths.ts`: where Pi's store lives. `vault-slot.ts`: the placeholder Pi's `auth.json` holds in vault mode. `raw-ws-node.ts`: the WebSocket shim. `routing.ts`: in-memory session pins.
 
-**`packages/opencode/src/util/`:**
-- Purpose: Small, host-only helpers.
-- Contains: `proxy-env.ts`, `stable-json.ts`, `uuid-v7.ts` (shared helpers `error.ts`, `record.ts`, `open-url.ts` live in `packages/core/src/util/`).
-- Key files: `packages/opencode/src/util/uuid-v7.ts` (Codex session/turn id parity), `packages/opencode/src/util/stable-json.ts` (cache key parity).
+## Where to add new code
 
-**`packages/opencode/scripts/`:**
-- Purpose: Package-specific build and helper scripts.
-- Contains: `build-tui.ts`.
-- Key files: `packages/opencode/scripts/build-tui.ts`.
+- **Routing or admission behaviour:** `packages/core/src/pool-routing.ts`, so OpenCode 1, OpenCode 2 and Pi all get it. The legacy OpenCode 1 path in `packages/opencode/src/index.ts` changes only for fixes.
+- **A Codex request rewrite:** `packages/opencode/src/codex-request.ts`. OpenCode 2 reaches it through `v2/codex-wire.ts`; check both the HTTP body and the WebSocket frame.
+- **A `/openai` menu item:** `packages/core/src/commands.ts` for something every host has. A host-only item goes in the host's menu options: `packages/opencode/src/commands.ts` for OpenCode, `packages/pi/src/commands.ts` for Pi.
+- **A setting:** stored in `openai-auth.json` and written only through the pool store's `updateSettings`. Environment overrides go in `packages/opencode/src/config.ts`.
+- **A new runtime file:** name it in `packages/opencode/src/core/account-paths.ts` and add it to the move in `runtime-layout.ts`, or OpenCode 2 will watch it in the config folder.
+- **A quota source:** a normalizer in `packages/core/src/quota-normalize.ts` returning the shared snapshot shape.
+- **Vault behaviour:** the consumer itself is `@cortexkit/common-auth/claustrum`; this plugin's side is `packages/core/src/vault.ts`.
+- **A test:** `src/tests/*.test.ts` in the package whose code it covers. Real-host suites are `packages/opencode/src/tests/opencode1-e2e.test.ts` and `opencode2-e2e.test.ts`.
 
-**`packages/pi/src/`:**
-- Purpose: Sibling package exposing the same Codex OAuth capability to the Pi coding agent, plus the shared account commands.
-- Contains: `index.ts` (Pi extension entry, provider registration, custom streaming wrapper), `commands.ts` (thin wrappers registering `openai-account`, `openai-quota`, `openai-routing` over the shared core bodies), `paths.ts` (Pi-only store paths), `routing.ts` (process-local session pins), `raw-ws-node.ts`.
-- Key files: `packages/pi/src/index.ts`, `packages/pi/src/commands.ts`, `packages/pi/src/paths.ts`.
+## Conventions
 
-**`scripts/`:**
-- Purpose: Release + local dev tooling.
-- Contains: `dev.ts` (build + symlink into `.opencode/plugins/` + tsc --watch), `dev-clean.ts` (remove the symlink), `check-installed-ranges.mjs` (build gate refusing a build when an installed dependency's version falls outside its declared range), `analyze-cache-cliffs.mjs` (cache cliff analyzer for dumped sessions), `find-order-dependent-tests.mjs` (scanner for order-dependent tests), `measure-store-contention.mjs` (account-store lock contention benchmark under load / correlated arrival), `release.sh` (tag-driven release driver), `wait-release.sh` (poll for the GitHub release), `version-sync.mjs` (sync package versions and rewrite README install pins).
-- Key files: `scripts/dev.ts`, `scripts/release.sh`, `scripts/check-installed-ranges.mjs`, `scripts/analyze-cache-cliffs.mjs`, `scripts/find-order-dependent-tests.mjs`, `scripts/measure-store-contention.mjs`.
-
-## Key File Locations
-
-**Entry Points:**
-- `packages/opencode/src/index.ts` — OpenCode plugin (server hook). The plugin registers as `openai` provider.
-- `packages/opencode/src/tui/entry.mjs` — TUI export shim; loads the precompiled TUI for packaged hosts and raw TSX for compatible local loaders.
-- `packages/opencode/src/tui.tsx` — TUI sidebar source; compiled into `src/tui-compiled/` during the package build.
-- `packages/pi/src/index.ts` — Pi extension entry.
-
-**Configuration:**
-- `packages/opencode/src/config.ts` — settings resolution (env > file > default), memoization invalidation (`refreshSettings`), `DEFAULT_CODEX_API_ENDPOINT`, env-var constants.
-- `packages/opencode/package.json` — `oc-plugin` field declaring `["server", "tui"]`, exports map (`./tui`, `./tui-prefs`).
-- `packages/opencode/src/tui-preferences.ts` — shared `tui-preferences.jsonc` reader/writer/watcher (used by the TUI sidebar slot config).
-- `biome.json` — formatter/linter config.
-- `lefthook.yml` — pre-commit biome check.
-- `mise.toml` — tooling versions.
-
-**Core Logic:**
-- `packages/core/src/accounts.ts` — multi-account store, `FallbackAccountManager`.
-- `packages/opencode/src/core/account-paths.ts` — host state-path resolver over the shared file names in `packages/core/src/paths.ts`.
-- `packages/core/src/oauth.ts` — PKCE, OAuth flow, JWT parsing.
-- `packages/core/src/quota-manager.ts` — quota cache, backoff, and mid-stream rate limit marking.
-- `packages/opencode/src/core/background-quota-refresh.ts` — periodic background quota refresher with jittered interval, freshness gate, and cross-process lease lock.
-- `packages/opencode/src/core/sticky-routing.ts` — cold-session candidate selection, sustainable window weighting, and sticky-break classification.
-- `packages/opencode/src/core/cachekeep.ts` — prompt-cache warmer with model-aware TTL, clock window, subagent warm caps, and main-only sustain that bypasses idle pruning but not memory/LRU caps.
-- `packages/core/src/reset-credits.ts` — reset-credit listing, eligibility checks, persisted redemption claims, bounded consume requests, and terminal-outcome finalization.
-- `packages/core/src/vault.ts` — OpenAI accounts served from the Claustrum vault (`OpenAiVault` over `@cortexkit/common-auth/claustrum`).
-- `packages/core/src/tombstone.ts` — tombstones left by the removed handle-mode custody.
-- `packages/opencode/src/prompt-context.ts` — assistant model/variant resolver for synthetic command replies.
-- `packages/core/src/provider.ts` — Codex injection seam (`codexRefreshFn`, `whamUsageFn`).
-- `packages/core/src/backoff.ts` — retry/backoff math.
-- `@cortexkit/common-auth/fs` — atomic JSON writes and generation-fenced refresh locks, used through the private core's internal exports.
-- `packages/opencode/src/codex-http.ts` — HTTP fallback sanitization for WebSocket downgrades.
-- `packages/opencode/src/ws-pool.ts` — per-account WebSocket pool with continuation chaining, refusal cleanup, and HTTP relay fallback for oversized frames (1009).
-- `packages/opencode/src/ws.ts` — low-level WS connect/stream, response lifecycle logging, and oversized frame classification.
-- `packages/opencode/src/response-stream-error.ts` — retryable and terminal stream error shape for WS/HTTP.
-- `packages/opencode/src/WEBSOCKET.md` — developer reference for WebSocket flow, lifetime, and retry strategies.
-- `packages/opencode/src/raw-ws-bun.ts` / `packages/opencode/src/raw-ws-node.ts` / `packages/opencode/src/raw-ws-upgrade.ts` — hand-rolled RFC 6455 clients and HTTP upgrade response parser.
-- `packages/opencode/src/hosted-web-search.ts` — provider-hosted `web_search` tool + replay/SSE translation.
-- `packages/core/src/quota-normalize.ts` — HTTP/WS/wham → `OAuthQuotaSnapshot`.
-- `packages/opencode/src/commands.ts` — host command surface (`hostCommandBodies` for killswitch/dump/logging/cachekeep over the shared bodies in `packages/core/src/commands.ts`).
-- `packages/opencode/src/sidebar-state.ts` — loader→TUI snapshot, tolerant reader, and SHA-256-keyed sticky session assignments with seven-day TTL.
-- `packages/opencode/src/dump.ts` — optional transport request dumps with tool schema preservation for cache debugging.
-- `packages/core/src/logger.ts` — redaction + rotation engine; `packages/opencode/src/logger.ts` — host destination shim (log file + env level, exit flush).
-- `packages/opencode/src/model-costs.ts` — model cost resolution and restoration from `models.dev` catalog.
-
-**Tests:**
-- `packages/opencode/src/tests/` — co-located bun tests (`*.test.ts`).
-- `packages/core/src/tests/` — shared-core bun tests, including `export-surface.test.ts` (fails when the root subpath exposes a command body or a store, OAuth or reset entry point) and `fixtures/mock-claustrum.ts` (a Claustrum daemon stand-in speaking the real wire protocol, which the OpenCode and Pi `vault.test.ts` files drive the real client against).
-- `packages/core/src/tests/reset-credits.test.ts` — reset-credit listing and consumption, redemption preconditions, and atomic persisted redemption state.
-- `packages/opencode/src/tests/background-quota-refresh.test.ts` — background quota poller tests, lease renewal, and snapshot timestamp merging.
-- `packages/opencode/src/tests/sticky-routing.test.ts` — sticky-balanced selection, sustainable spend weighting, and sticky break decisions.
-- `packages/opencode/bunfig.toml` — bun test config.
-- Run: `bun run test` (root) → `cd packages/opencode && bun run test`.
-
-## Naming Conventions
-
-**Files:** lowercase-kebab or lowercase-flat. Top-level files use bare lowercase names (`index.ts`, `codex-http.ts`, `commands.ts`, `config.ts`, `logger.ts`, `model-costs.ts`, `quota-normalize.ts`, `sidebar-state.ts`, `ws-pool.ts`, `hosted-web-search.ts`, `response-stream-error.ts`, `raw-ws-bun.ts`, `raw-ws-node.ts`, `raw-ws-upgrade.ts`, `version.ts`). Subdirectory files share the directory name as a prefix where it helps (`core/accounts.ts`, `core/oauth.ts`, `rpc/rpc-server.ts`, `rpc/port-file.ts`, `util/uuid-v7.ts`).
-Example: `packages/opencode/src/core/cachekeep.ts`, `packages/opencode/src/rpc/rpc-server.ts`.
-
-**Directories:** lowercase-kebab. Subdirectories group by layer (`core/`, `rpc/`, `tests/`, `tui/`, `util/`).
-Example: `packages/opencode/src/core/`, `packages/opencode/src/rpc/`, `packages/opencode/src/util/`.
-
-**Tests:** co-located `*.test.ts` next to the file under test.
-Example: `packages/opencode/src/tests/accounts-store.test.ts` tests `packages/core/src/accounts.ts`.
-
-**Types/classes:** PascalCase (`CodexAuthPlugin`, `FallbackAccountManager`, `QuotaManager`, `CacheKeepManager`, `OpenAIWebSocketPool`, `ResponseStreamError`).
-Example: `packages/opencode/src/core/cachekeep.ts` exports `CacheKeepManager`.
-
-**Command name constants:** SCREAMING_SNAKE_CASE prefixed with `OPENAI_` (`OPENAI_QUOTA_COMMAND_NAME`, `OPENAI_ACCOUNT_COMMAND_NAME`, `OPENAI_ROUTING_COMMAND_NAME`, `OPENAI_KILLSWITCH_COMMAND_NAME`, `OPENAI_DUMP_COMMAND_NAME`, `OPENAI_LOGGING_COMMAND_NAME`, `OPENAI_CACHEKEEP_COMMAND_NAME`, `OPENAI_RESET_COMMAND_NAME`).
-Example: `packages/opencode/src/commands.ts`.
-
-**Environment variables:** SCREAMING_SNAKE_CASE with the `CORTEXKIT_OPENAI_AUTH_*` and `OPENCODE_OPENAI_AUTH_*` prefixes (negative-prefixed `CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH` for the default-on cache fix).
-Example: `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS`, `CORTEXKIT_OPENAI_AUTH_RAW_WS`, `OPENCODE_OPENAI_AUTH_DUMP_DIR`.
-
-**RPC methods:** lowercase, dash-separated (`pending-notifications`, `apply`). JSON-RPC-shaped bodies.
-
-**Model IDs:** GPT-style dotted identifiers that pass `gpt-X.Y` or major versions like `gpt-X`; the allow-list at `packages/opencode/src/index.ts` (`ALLOWED_MODELS`) and the regex `^gpt-(\d+(?:\.\d+)?)` with `> 5.4` fallback define which models surface to the TUI (explicitly disallowing the bare `gpt-5.6`, `gpt-6` and `gpt-6.1` while accepting `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6.1-sol`, `gpt-6.1-terra`, and the `gpt-5.6` `-luna`/`-sol`/`-terra` variants).
-
-## Where to Add New Code
-
-**New OAuth provider (replace Codex with another):** add the refresh + quota fns to `packages/core/src/provider.ts` next to `codexRefreshFn` / `whamUsageFn`; inject them into `FallbackAccountManager` + `QuotaManager` in `packages/opencode/src/index.ts` `auth.loader`. The generic core stays untouched.
-
-**New `/openai-*` slash command:** add the command name constant in `packages/core/src/commands.ts` (`OPENAI_*_COMMAND_NAME`), add it to `MODAL_COMMANDS`, implement the `executeXxxCommand` body there (keep it module-private so it runs only via `buildDialogPayload`/`applyCommand` and knob scrubbing cannot be bypassed). Only when the command needs live host state (cachekeep manager, memoized settings) put its body in `packages/opencode/src/commands.ts` as a `hostCommandBodies` entry instead. The TUI dialog content lives in `packages/opencode/src/tui/command-dialogs.tsx`.
-
-**New storage key (under the existing JSON file):** extend `AccountStorage` in `packages/core/src/accounts.ts`, bump `version`, and update the config through `mutateAccounts` (atomic read-modify-write). Account operations preserve existing transport settings. Do not use `saveAccounts` (which union-merges the account list and can resurrect concurrently-removed accounts) except for test seeding. Gating of state writes on the config roster is handled automatically by `saveAccountState`. Note that `"main"` is a reserved account ID (case-insensitive) and cannot be used as a label for fallback accounts.
-
-**New transport (gRPC, etc.):** create a new file under `packages/opencode/src/` mirroring `ws.ts` + `ws-pool.ts`; integrate in `packages/opencode/src/index.ts` `sendWithAccessToken` next to the HTTP/WS branch. Update `packages/opencode/src/raw-ws.ts` only if you need a new runtime-specific client.
-
-**New quota source (e.g. a different HTTP endpoint):** add a normalizer to `packages/core/src/quota-normalize.ts` (`normalizeXxx` returning `OAuthQuotaSnapshot`); expose it on `packages/core/src/provider.ts` as a new `ProviderQuotaFn` shape; inject into `QuotaManager` via `fetchQuotaFn` (currently `undefined` — push-only) and call it from `refresh-all-quota.ts`.
-
-**New shared util:** add to `packages/core/src/util/` when both hosts need it, otherwise `packages/opencode/src/util/`. Keep the file dependency-free (node: builtins only).
-
-**New vault interaction:** the consumer itself (enrollment, discovery, authorization, 401 reporting, the interlock, the host-slot guard) is `@cortexkit/common-auth/claustrum`; this plugin's side lives in `packages/core/src/vault.ts` (shared, no host paths: each host passes its state directory). Host wiring goes in `packages/opencode/src/index.ts` / `core/pool-request.ts` and `packages/pi/src/runtime.ts` / `pool-request.ts`.
-
-**New test:** add `*.test.ts` next to the source file it exercises, under `packages/opencode/src/tests/` for host code or `packages/core/src/tests/` for shared-core code. Bun test only — no jest/vitest.
-
-**New script:** add to `scripts/` and wire into the `scripts` block of the root `package.json`. Release-driving scripts go through `scripts/release.sh`.
-
-**New package (sibling to `opencode` or `pi`):** create `packages/<name>/` with its own `package.json`, `src/`, `tsconfig.json`, `tsconfig.build.json`, and add it under `workspaces` in the root `package.json`. Mirror the existing `opencode` or `pi` layout — Bun workspaces, `bun run build`, `bun run typecheck`.
-
-**New plugin command constant / TUI preferences key:** add to `packages/opencode/src/tui-preferences.ts` (`DEFAULT_PREFS` + a typed key under the `PLUGIN_KEY = 'openai-auth'` top-level key in `~/.config/opencode/tui-preferences.jsonc`); the schema-validated reader will accept the new key automatically because `resolveOpenaiAuthPrefs` per-key defaults.
+- Files are kebab-case; tests are `*.test.ts` under each package's `src/tests/`.
+- Bun runs the tests (`bun run test` at the root runs all three packages). TypeScript is checked with `tsc`, and formatting and lint are Biome.
+- `scripts/gate.sh --fast` runs the quick checks; `scripts/gate.sh` runs the full suites, the packaging checks and both real-host suites, as CI does.
+- The OpenCode and Pi test preloads (`src/tests/setup-env.ts`) point state and config paths at temporary folders and clear `CORTEXKIT_VAULT_HOST`, so no test touches live accounts or runs in hosted mode by accident. A child process spawned without an `env` option gets the environment the test process started with, so tests that spawn children pass `env` built from `process.env`.

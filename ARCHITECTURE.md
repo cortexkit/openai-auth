@@ -1,338 +1,196 @@
 # Architecture
 
-## Pattern Overview
-
-**Overall:** Multi-account OAuth plugin with Codex request rewriting, reactive account fallback, sticky routing that keeps sessions on an account until its quota or credit budget is exhausted, OpenAI accounts served from the Claustrum vault, push-based quota tracking with background idle polling, idle cache keep-warm, and a separate TUI sidebar communicating over a loopback RPC.
-
-**Key Characteristics:**
-- Registers as the built-in `openai` provider; OpenCode loads external server plugins after its internal ones, so this package transparently supersedes OpenCode's internal OpenAI auth hook.
-- Rewrites OpenAI Responses requests into Codex's wire shape (headers, body, tools, turn metadata) so the Codex backend treats traffic as if it came from the official Codex CLI.
-- Reactive account fallback for ordered modes, plus sticky-balanced cold-session placement. Sticky pins migrate only on confirmed exhaustion — an exhausted rate-limit window or a reached credit budget — or permanent auth failure; there is no mid-session rebalance or Retry-After hold. Enforce the killswitch as a hard circuit-breaker directly on the request path to block requests or filter candidates before spending when cached quota falls below configured thresholds.
-- Push-based quota tracking with background idle polling: quota comes in-band from `x-codex-*` HTTP response headers or `codex.rate_limits` WS frames, while an unref'd jittered background timer refreshes idle accounts across processes under a shared lease lock to keep sidebar and routing quota fresh without extra polling on active traffic. Wham/usage also carries a spend-control credit budget and reset-credit counts, normalized alongside the rate-limit windows.
-- Optional Claustrum vault accounts, through the shared consumer in `@cortexkit/common-auth/claustrum`: once a host is enrolled (approved by the operator with `ck`), it is in vault mode: the OpenAI credentials the vault grants it are its only routing rows, and no local account (pool row, OpenCode's slot, Pi's own login) is used, refreshed, polled or warmed until it disconnects. A vault row holds no token: each send asks the vault for one.
-- Three transport modes carry Codex requests: HTTP/SSE, native WebSocket, and a hand-rolled RFC 6455 WebSocket (Bun.connect or node:net/node:tls). Requests do not inject a cache-stabilizer tool to pad the prompt or automatically add a provider-hosted web-search tool.
-- TUI sidebar reads a serialized, machine-global `sidebar-state.json` snapshot pushed by the auth loader; it owns SHA-256-keyed sticky assignments with a seven-day TTL. The loader and TUI exchange dialogs/notifications over a loopback HTTP RPC bound to a per-process token.
-- Plugin is split into a shared, provider-agnostic core package (`packages/core/src/`, imported as `@cortexkit/openai-auth-core`) and Codex-specific seams (`provider.ts`, `oauth.ts`) so the same shape could host another OAuth provider. Host-only behavior — cache keep-warm, sticky routing, background quota polling, and account-path resolution — stays in `packages/opencode/src/core/`.
-
-## Layers
-
-**Provider injection seam:**
-- Purpose: Generic types (`ProviderRefreshFn`, `ProviderQuotaFn`, `ProviderHttpError`) plus the two Codex-specific fns (`codexRefreshFn`, `whamUsageFn`).
-- Location: `packages/core/src/provider.ts`
-- Contains: Token-refresh function type, quota-fetch function type, error shape carrying `status` + `retryAfter`, Codex OAuth constants, Codex HTTP refresh impl (with 15s timeout), Codex `wham/usage` quota fetch impl (with 15s timeout and logger warning).
-- Depends on: `core/backoff.ts` (`parseRetryAfter`); dynamic-imported `quota-normalize.ts` (avoids a load-time cycle).
-- Used by: `FallbackAccountManager` and `QuotaManager` constructors; `index.ts` plugin loader.
-
-**Accounts and fallback storage:**
-- Purpose: Atomic, multi-account JSON store with file locks, retry/backoff state, killswitch config, routing mode, persisted quota, log level, and dump/cachekeep toggles.
-- Location: `packages/core/src/accounts.ts`, `@cortexkit/common-auth/fs` (atomic writes and refresh locks), `packages/core/src/paths.ts` (shared file names + `deriveStatePath`), plus the host path resolver `packages/opencode/src/core/account-paths.ts` and the one-time move of the runtime files into the state home, `packages/opencode/src/core/runtime-layout.ts`
-- Contains: `deriveStatePath` in `account-paths.ts` (derives `${configPath}.state.json` when custom config paths are used, preventing distinct account files from sharing one state document, with `accountPathsCollide` detecting aliases), `loadAccounts`/`migrateIfNeeded` (serialized under the shared save lock to coordinate concurrent migrations and mutations), `mutateAccounts` (authoritative read-modify-write for structural mutations and scalar writes, preserving load-dropped raw entries on disk with an `allowDrop` option for intentional caller removals, preventing concurrent union-merge resurrection of deleted accounts/secrets), `saveAccounts` (test seeding only), `saveAccountState` (updates state secrets, gated by config roster to prevent resurrection of deleted account secrets), `FallbackAccountManager` (background refresh, `getUsableFallbackAccounts`, fire-and-forget `markUsed` telemetry; a row holding a tombstone from the removed handle-mode custody is never refreshed or selected), every config writer dropping the removed custody's `claustrum` settings, `OAuthAccount`/`CorruptOAuthAccount`/`ApiKeyAccount` types, single-writer eviction-marker file lock with separated acquire window, lock TTL, and generation-fenced renewal and release (distinguishes holder contention from event-loop starvation in timeout errors, verifies owner and marker identity to avoid deleting or extending a successor's lock, and recreates missing parent directories automatically on `ENOENT`), atomic JSON write (temp + rename, mode `0o600`).
-- Depends on: `core/oauth.ts` (`extractAccountId`), `core/tombstone.ts` (tombstone recognition), `core/provider.ts` (`ProviderQuotaFn`), `core/backoff.ts`.
-- Used by: Plugin loader, `/openai-account`/`/openai-routing`/`/openai-killswitch` commands, every quota push.
-
-**Shared pool mechanics:**
-- Location: `packages/core/src/pool-source-state.ts`, `pool-session-pins.ts`, `pool-routing.ts`, and `pool-quota.ts`.
-- Both host pool readers use one copy of OAuth credential projection, file freshness keys, bounded pending quota observations and provider-versus-local refresh backoff. Hosts retain their snapshots, token usability rules, vault authority checks and store-write lifecycle.
-- Both request adapters use `poolKillswitchVerdicts` for per-account remaining-quota floor decisions. OpenCode 2 and Pi use `placeStickyPin` with host-owned ledgers: OpenCode keeps its LRU bound, Pi its process-local map.
-- Account add/enable/disable/remove/reorder and terminal rendering belong to `@cortexkit/common-auth/auth-menu` and the pool store. OpenCode's `core/pool-accounts.ts` retains only store access, migration detection, removal protection and legacy settings-lock hooks. OpenCode's `auth/doctor.ts` still detects account/login faults and supplies repair actions to the shared menu, but no longer formats a second terminal report. The vault menu does not mix a local-account listing into a connected vault view.
-
-**Quota cache and policy:**
-- Purpose: In-memory cache of main + per-fallback quota snapshots, dedup of inflight fetches, refresh-after math, backoff gating, and mid-stream rate-limit marks.
-- Location: `packages/core/src/quota-manager.ts`, `packages/core/src/refresh-all-quota.ts`, plus `packages/opencode/src/core/background-quota-refresh.ts` and `packages/opencode/src/core/sticky-routing.ts`
-- Contains: `QuotaManager` class with `getMain`/`setMain`/`getFallback`/`setFallback`/`seedFallbacksFromAccounts`/`isBackedOff`/`isFallbackBackedOff`, rate limit marking (`markRateLimited`, `isRateLimited`, `rateLimitedUntil`), stable-identity policy peeks (`peekMainForPolicy`, `peekFallbackForPolicy`) to prevent token refreshes from invalidating cached quota, token-fingerprint helpers, `refreshAllQuota` orchestration (treats quota endpoint 401s as token refresh triggers, skips poll attempts for accounts with armed non-transient refresh backoff by marking them permanent failures, never polls with a tombstone, and displays quota readings with their own age when older than 15 minutes), `BackgroundQuotaRefresh` (unref'd 5-minute jittered poll with 4-minute freshness gating and auto-renewed `bg-quota-refresh` file lease lock), and `sticky-routing.ts` candidate selection and break classification (`selectStickyCandidate`, `decideStickyBreak`, `sustainableWindowWeight`). The credit budget is a third pressure axis on its own monthly reset clock: `spendControlExhaustedResetAt` in `sidebar-state.ts` is the single shared exhaustion signal that admission, cold placement, and warm-pin migration all read, judged by the provider's authoritative `reached` boolean and failing open on a stale or missing reset. `getPresentQuotaWindows`/`exhaustedQuotaResetAt`/`isQuotaExhausted` in `sidebar-state.ts` back the killswitch and admission checks. Mid-stream rate-limit reset resolution (`resolveMidStreamRateLimitResetAt`) prefers explicit provider resets (e.g. from admission-time errors or HTTP/WS 429 upgrade frames) over cached named-window resets or bounded defaults. Policies drop cached window snapshots when their reset timestamps are in the past.
-- Depends on: `core/accounts.ts` types, `core/provider.ts` (`ProviderQuotaFn` injection), `@cortexkit/common-auth/fs`, `sidebar-state.ts`.
-- Used by: Plugin loader (push updates and background poller), `refresh-all-quota.ts` (active polling for `/openai-quota`).
-
-**Backoff and retry policy:**
-- Purpose: Classify refresh and quota errors as transient vs non-transient, build retry records, expose `*BackoffActive` checks.
-- Location: `packages/core/src/backoff.ts`
-- Contains: `isTransientRefreshError`, `isTransientQuotaError`, `buildRefreshOperationError`, `buildQuotaOperationError`, `hashRefreshToken`, `refreshBackoffActive`, `quotaBackoffActive`, `parseRetryAfter`.
-- Depends on: `node:crypto`.
-- Used by: `accounts.ts`, `quota-manager.ts`, the shared pool-source state primitives, plugin loader (`refreshMainWithLease`).
-
-**OAuth flow:**
-- Purpose: PKCE generation, OAuth authorize-URL building, local callback HTTP server, device-code flow, JWT/account-id extraction, fallback-account onboarding.
-- Location: `packages/core/src/oauth.ts`
-- Contains: `CLIENT_ID`, `ISSUER`, `OAUTH_PORT`, PKCE helpers, `startOAuthServer`, `waitForOAuthCallback`, `beginDeviceAuth`, `completeDeviceAuth`, `buildAuthorizeUrl`, `flowCleanup`, `parseJwtClaims`, `extractAccountIdFromClaims`, `beginAccountLogin`, `upsertAccount`.
-- Depends on: `node:http`, `node:timers/promises`, `version.ts`.
-- Used by: Plugin loader (`/login openai` `methods`), `/openai-account add`.
-
-**Claustrum vault accounts:**
-- Purpose: Serve the OpenAI accounts the Claustrum vault holds, in place of the local accounts while the host is enrolled (vault mode). Each host enrolls once under its own name (`openai-auth-opencode`, `openai-auth-pi`), from a setup surface only; the request path never enrolls.
-- Location: `packages/core/src/vault.ts` (`OpenAiVault`, one per host process), over `@cortexkit/common-auth/claustrum` (`ClaustrumConsumer`, `ClaustrumEnrollmentManager`). Routing: `packages/opencode/src/core/pool-request.ts` (`ctx.vault`) and `packages/pi/src/pool-request.ts` / `runtime.ts`. Setup: the Vault section of `/openai` (`vaultSection` in `packages/core/src/commands.ts`) on both hosts, and Connect in the `opencode auth login` menu (`packages/opencode/src/auth/methods.ts`).
-- Contains: the family (`openai` refresh adapter, `openai-native` category; static `apikey:openai` keys are not admitted, since every send goes to the ChatGPT Codex endpoint and a 401 there would be reported as the death of a working key), the identity parser (the ChatGPT account id in the access token's claims), the host's vault directory (`openai-auth-vault/` beside the account state file, so for OpenCode in the plugin's state folder by default, 0700: `<host>-enrollment.json` token and `<host>-enrollment-state.json` ceremony state, both 0600, and the secret-free `<host>-roster.json`), `routes()` (enabled, active vault accounts as routing rows), `identities()` (the ChatGPT accounts the vault holds; a local row signing in as one is skipped: one account, one owner), `send()` (one `get_scoped` per attempt, no cache; a 401 is retried once on a newer record version and the final one is reported with the version that send used), quota recorded into the roster (`recordSnapshot`, `pollQuota`, `requestReading` for an admission refusal), decline/accept (the interlock), `connectStep`/`waitForApproval` (propose, the operator approves with `ck`, poll), `disconnect` (forgets the token), and `assertHostSlot` (the consumer's guard against a real login in OpenCode's slot).
-- Depends on: `@cortexkit/common-auth/claustrum` and `@cortexkit/claustrum-client` (the connection file: `CLAUSTRUM_SUBC_CONNECTION`, else the client's default), both bundled into each host; `core/oauth.ts` (claims), `core/pool-quota.ts`, `core/provider.ts` (`whamUsageFn`).
-- Used by: OpenCode's loader (one vault per plugin instance; polls in the background so an enrollment finished by `opencode auth login` is picked up), Pi's runtime, both `/openai` menus, the auth-login menu.
-
-**Handle-mode leftovers:**
-- Purpose: The vault custody this plugin used to ship ("handle mode": a manifest of handles, tombstones written into account rows and into OpenCode's slot, `claustrum.mode`) was removed. An existing install can still hold its tombstones (refresh token `claustrum-tombstone:v1:openai`, empty access token) and the mode setting.
-- Location: `packages/core/src/tombstone.ts`; the doctor findings in `packages/opencode/src/auth/doctor.ts`.
-- Behaviour: a tombstoned row never routes, is never refreshed (`codexRefreshFn` refuses one before any network call) and never polled; a tombstone in OpenCode's slot is taken like the pool placeholder (main lives in the pool row `main`, or nowhere on an install that never migrated) and never sent; `claustrum.mode` is ignored and every config writer drops it. The doctor lists each of them with the remedy: connect the vault, or sign in to the account again.
-
-**Cache keep-warm:**
-- Purpose: Track idle main-agent (and optionally subagent) sessions and replay the last real request as a `store:false` shadow request just before Codex evicts the prompt cache. Employs model-aware TTL (raising GPT-5.6 TTL to 30 min from the 5-min default), gpt-5.6 subagent 2-warm caps, a process clock-bound window (outside of which warming and capture are skipped), and extended subagent idle bounds (75 min for GPT-5.6 subagents). `sustain` defaults off and bypasses only main idle pruning; it leaves the clock window, subagent limits, target-count, byte, and LRU caps intact.
-- Location: `packages/opencode/src/core/cachekeep.ts`
-- Contains: `CacheKeepManager` class (target map, timer, idle caps, backoff), `buildKeepwarmCapture`, `buildKeepwarmBody`, model-aware TTL matcher (`isGpt56Model`, `ttlForModel`), clock window checker (`isWithinCacheKeepWindow`), SSE/JSON usage extraction.
-- Depends on: `core/accounts.ts` (`findCachekeepFallbackAccount` exported from `index.ts`), `quota-normalize.ts`.
-- Used by: Plugin loader (per-instance wiring); `/openai-cachekeep` command.
-
-**Request transformation:**
-- Purpose: Convert OpenAI Responses calls into Codex-shaped wire requests (UUIDv7 thread/turn ids, Codex turn-metadata header, OAuth/ChatGPT account headers, client_metadata, tool normalization, key-reordering via `orderCodexBody` to match Codex wire serialization), with an opt-in Responses Lite shape for the models the backend catalog marks `use_responses_lite` (`gpt-5.6-sol`/`-terra`/`-luna`, `gpt-6-astra`/`-sol`/`-luna`, and `gpt-6.1-sol`/`-terra`). Responses Lite trades capabilities for compact requests by disabling parallel tool calls, moving system instructions and tools into developer messages prefixing the input sequence, excluding hosted tools, and stripping details from images. Preserves OpenCode's native `max` reasoning variant on the wire, sets the Codex client version to `0.159.0` (required for `gpt-6.1-sol`, and also serves `gpt-6.1-terra`), and gives `gpt-6.1-sol` and `gpt-6.1-terra` Codex's own default window (500k context, 372k input, 128k output). On both hosts, Terra inherits missing reasoning variants from the host's Sol entry, preserving Terra's own definitions and overrides. The `gpt-5.6` variants, `gpt-6-sol`, `gpt-6-luna`, and `gpt-6-astra` receive the Codex catalog's full reported `max_context_window` (872k context, 744k input, 128k output); the former 372k context caps existed only to avoid the long-context charge. OpenAI's ChatGPT rate card (help.openai.com/en/articles/20001415, read 2026-10-26, "Long-context pricing in Codex") now says no long-context multiplier applies to any Codex model when signed in with ChatGPT, including above 272K input tokens. A `codexApiEndpoint` override pointing at a relay or differently billed surface may still charge; the operator must re-check that surface's pricing. Preserves byte-identical prefix caches for `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, and `gpt-6.1-sol` by pinning request-level reasoning effort to session-opening values and carrying mid-conversation effort changes as `configuration_update` input items immediately preceding the new user turn (models outside `MID_CONVERSATION_EFFORT_MODELS`, such as `gpt-5.6-sol`, retain standard request-level effort updates), and filters legacy experimental `-pro` model entries and bare disallowed IDs (`gpt-5.6`, `gpt-6`) while accepting major/minor versions `> 5.4` (such as `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`). Resolves and preserves model/variant context for synthetic command replies to prevent model regression.
-- Location: `packages/opencode/src/index.ts` (`prepareCodexRequest`, `applyMidConversationEffort`, `normalizeCodexTool`, `getCodexSessionMetadata`, `loadCodexSessions`/`saveCodexSessions`, `ALLOWED_MODELS`/`DISALLOWED_MODELS`/`RESPONSES_LITE_MODELS`/`MID_CONVERSATION_EFFORT_MODELS`/`CODEX_VERSION`), `packages/opencode/src/codex-http.ts` (`sanitizeHttpFallbackInit`, `sanitizeHttpFallbackBody`, `hasWebSocketResponsesLiteMetadata`), `packages/opencode/src/prompt-context.ts` (`resolvePromptContext`), `packages/opencode/src/response-stream-error.ts`.
-- Depends on: `util/uuid-v7.ts`, `util/stable-json.ts`, `packages/core/src/util/record.ts` (`isRecord`), `config.ts`.
-- Used by: Plugin loader `sendWithAccessToken`, `fetch` override.
-
-**Transports:**
-- Purpose: Run Codex requests over HTTP or WebSocket, with a session-keyed pool for the WebSocket path and Codex-style incremental streaming when the hand-rolled client is enabled. WebSocket connection starts with a prompt-prewarming phase (sending a `generate: false` body to populate the session's prompt cache and establish continuation state) before sending the main turn. Intercepts rate-limit notifications on prewarm and main connections (including admission-time `usage_limit_reached` frames and 429 handshake upgrade rejections parsed via `raw-ws-upgrade.ts`) via the `onRateLimitReached` callback to mark the account rate-limited with explicit provider resets. Applies a no-replay gate (forces a retryable `ResponseStreamError` only if no generated output item — including tool/function calls — was yet emitted (`emittedOutput`), enabling a same-turn fallback reroute on the stock `@ai-sdk/openai` runtime, else closes the stream to prevent duplication, double-billing, or re-running side-effecting tools; note that same-turn rerouting is bypassed under the experimental native runtime `OPENCODE_EXPERIMENTAL_NATIVE_LLM=1` where the errored body rejects with a non-retryable error, though the mark still steers the next turn off that account). Handles oversized WebSocket request frames (close code 1009) by marking them non-retryable on WebSocket; `relayWithOversizedFallback` in `ws-pool.ts` intercepts oversized frame failures on the returned response body and, provided no output bytes were yet delivered to the consumer, transparently issues the request over HTTP and streams the fallback response to finish the turn without spending futile retries. When a socket closes or continuation fails before output, the socket is destroyed and continuation state is cleared so retried turns resend full input rather than chaining to a refused response. In hand-rolled WebSocket clients (`raw-ws-bun.ts`, `raw-ws-node.ts`), parsed peer close frames take precedence over synthetic 1006 TCP close events. Transport lifecycle logging records `response.created` (with response ID and continuation tracking) and stream death diagnostics (frames produced, elapsed time, and continuation context) ungated by request-dump settings.
-- Location: `packages/opencode/src/ws.ts` (WS connect/stream, header ordering, idle timeout, retryable terminal hook, mid-stream event parser), `packages/opencode/src/ws-pool.ts` (account pool keyed by ChatGPT account ID or token hash fallback to prevent token refreshes from busting continuation chains, turn rotation via shared `advanceTurn`, prewarm connection limit failover, `OpenAIWebSocketPool`), `packages/opencode/src/raw-ws.ts` (runtime selection), `packages/opencode/src/raw-ws-bun.ts` (`Bun.connect`), `packages/opencode/src/raw-ws-node.ts` (`node:net`/`node:tls`), `packages/opencode/src/raw-ws-upgrade.ts` (handshake upgrade 4xx/5xx status & header parser), `packages/opencode/src/util/proxy-env.ts`.
-- Depends on: `dump.ts`, `packages/core/src/quota-normalize.ts`, `response-stream-error.ts`, `packages/core/src/util/error.ts` (`errorMessage`), `packages/core/src/util/record.ts` (`isRecord`).
-- Used by: Plugin loader `sendWithAccessToken`.
-
-**RPC (loader ↔ TUI):**
-- Purpose: Loopback HTTP server so the TUI can drain queued notifications and dispatch `apply` calls back to the auth loader (which already holds QuotaManager / FallbackAccountManager / storage).
-- Location: `packages/opencode/src/rpc/rpc-server.ts`, `packages/opencode/src/rpc/port-file.ts`, `packages/opencode/src/rpc/rpc-client.ts`, `packages/opencode/src/rpc/rpc-dir.ts`, `packages/opencode/src/rpc/protocol.ts` (re-export of the wire types in `packages/core/src/protocol.ts`), `packages/opencode/src/rpc/notifications.ts`.
-- Contains: 32-byte hex token, 1 MiB body cap, timed-out HTTP requests (2s), per-process port files (`port-<pid>.json`, mode `0o600`), pid-based discovery (drops dead pids), SHA-256(project-dir) `XDG_STATE_HOME/cortexkit/openai-auth/rpc/openai-auth-<hash>/` (mode `0o700`) with startup sweeps for dead port files and empty project directories, queue with monotonic IDs and per-session TUI-connected tracking.
-- Depends on: `node:crypto`, `node:http`, `node:fs/promises`.
-- Used by: Plugin loader (server + notifications push), `tui.tsx` (RPC client polling + dialog delivery).
-- OpenCode 2: `v2/control-plane.ts` exposes one process-wide command definition through each location's public command transform and dispatches by session directory. `v2/menu.ts` opens the same `createOpenCodeMenu` seam with core read-only and unavailable-section options; apply refuses before any action runs, explaining an unfinished migration or a local-only action attempted while enrolled in the vault. `tui/v2.tsx` drains only the displayed session and `tui/v2-dialog.ts` renders native host dialogs. This path does not register the OpenCode 1 sidebar; the OpenCode 2 quota sidebar is still deferred.
-
-**TUI sidebar:**
-- Purpose: Render an OpenCode sidebar slot showing main/fallback quota bars, routing/killswitch/health state, and the command dialog surfaces. The TUI does not own any auth state — it reads `sidebar-state.json`, resolves the session-safe active account via `resolveSessionSidebarRouting`, and pushes commands via RPC.
-- Location: `packages/opencode/src/tui.tsx`, `packages/opencode/src/tui/entry.mjs`, generated `packages/opencode/src/tui-compiled/`, `packages/opencode/src/tui/command-dialogs.tsx`, `packages/opencode/src/sidebar-state.ts`, `packages/opencode/src/tui-preferences.ts`.
-- Depends on: `@opentui/core`, `@opentui/solid`, `solid-js`, `jsonc-parser`.
-- Used by: OpenCode's TUI plugin loader (`./tui` export).
-
-**Quota normalization:**
-- Purpose: One place to coerce three quota shapes (HTTP `x-codex-*` headers, WS `codex.rate_limits` frame, wham/usage JSON) into the shared `OAuthQuotaSnapshot`, including reset-timestamp coercion (epoch seconds/ms/ISO).
-- Location: `packages/core/src/quota-normalize.ts`
-- Contains: `normalizeQuotaHeaders`, `normalizeWsFrame`, `normalizeWham`, `toResetIso`.
-- Used by: Plugin loader (push), `refresh-all-quota.ts`, `cachekeep.ts`, `provider.ts` (dynamic import to avoid a cycle).
-
-**Model cost restoration:**
-- Purpose: Restore real model costs from a local cache or a remote catalog (`models.dev`) when cost zeroing is disabled.
-- Location: `packages/opencode/src/model-costs.ts`
-- Contains: `loadModelsDevCosts`, `resetModelCostsForTest`, `toSdkCost` with strict price validation, `modelsCachePath` checking `OPENCODE_OPENAI_AUTH_MODELS_CACHE`/`OPENCODE_MODELS_PATH` env vars and falling back to XDG cache, and catalog caching with a timeout-backed fetch.
-- Depends on: `node:fs/promises`, `node:os`, `node:path`.
-- Used by: `packages/opencode/src/index.ts` models provider hook.
-
-**Settings and logging:**
-- Purpose: Resolve plugin settings from env + config file, and provide a leveled, secret-redacting, size-rotating logger.
-- Location: `packages/opencode/src/config.ts`, `packages/core/src/logger.ts` (redaction + rotation engine) with the host destination shim `packages/opencode/src/logger.ts`, `packages/opencode/src/dump.ts`.
-- Contains: `getSettings`, `refreshSettings` (invalidates the process-memoized settings cache so commands that modify configuration on disk take effect without a restart), `getConfigDir`, `getConfigPath`, `DEFAULT_CODEX_API_ENDPOINT`; leveled logger with key/value redaction (`redact`) and credential string scrubbing (`redactStrings`) for Bearer/sk-/JWT tokens, secret/api-key/password/token-like keys; 5 MiB log rotation keeping 3 generations; request-dump writer with redaction for `authorization`/`chatgpt-account-id`/`cookie`/`set-cookie`, embedding `process.pid` in filenames to avoid collisions across processes and restarts, recovering diff baselines from existing disk dumps across restarts, diffing on redacted body text so offsets match `.body.json`, and preserving tool schema properties via `redactStrings` so definitions remain valid and captures remain replayable.
-- Depends on: `node:os`, `node:path`, `node:fs`.
-- Used by: Plugin loader, command implementations, every logger channel (`transport`, `quota`, `refresh`, `accounts`, `cachekeep`, `rpc`, `dump`, `sidebar`, `commands`, `rpc-tui`).
-
-**Utilities:**
-- Purpose: Small, dependency-free helpers shared by every layer.
-- Location: `packages/opencode/src/util/` (`proxy-env.ts`, `stable-json.ts`, `uuid-v7.ts`) plus `packages/core/src/util/` (`error.ts`, `record.ts`, `open-url.ts`) for the helpers both hosts share.
-- Contains: `errorMessage`, `ProxyEnv.getProxyForUrl` (Bun honors `HTTPS_PROXY`/`HTTP_PROXY`), `isRecord`, `stableStringify`, `uuidV7` (UUIDv7 with ms timestamp prefix), cross-platform `openUrl`.
-- Used by: Everywhere.
-
-**Commands (dialogs):**
- - Purpose: Per-slash-command payload builders producing `OpenDialogPayload` (text + knobs) and applying user selections to storage. Copies the command context copy per invocation to prevent concurrent sessions from crossing feedback. Projects identity fields and scrubs credentials from knob payloads before sending over RPC. The shared bodies (quota, account, routing, reset, plus the dispatch and scrubbing) live in `packages/core/src/commands.ts` with module-private `execute*` bodies; the four host-owned bodies (killswitch, dump, logging, cachekeep) live in `packages/opencode/src/commands.ts` as `hostCommandBodies` and run through the core's `buildDialogPayload`/`applyCommand` so scrubbing applies uniformly.
- - Location: `packages/core/src/commands.ts` (shared bodies + seam), `packages/opencode/src/commands.ts` (host bodies + re-exported seam)
- - Contains: Command name constants (`OPENAI_*_COMMAND_NAME`), `MODAL_COMMANDS`, `CommandContext` DI shape, `buildDialogPayload`, `applyCommand`, `scrubKnobs`, `hostCommandBodies`.
-- Depends on: `core/accounts.ts`, `core/cachekeep.ts`, `core/oauth.ts`, `core/refresh-all-quota.ts`, `core/reset-credits.ts`, `quota-manager.ts`, `rpc/protocol.ts`, `logger.ts`, `config.ts`.
-- Used by: Plugin loader (`auth.loader`), RPC `apply` dispatch.
-
-**Auth methods and the account menu:**
-- Purpose: The three `/login openai` entries, plus an account menu rendered inside `opencode auth login` on a machine past its first sign-in. Replaces the removed `openai-auth` binary.
-- Location: `packages/opencode/src/auth/methods.ts` (entries, menu actions, `createAuthMethods`), `packages/opencode/src/auth/doctor.ts` (`createAuthDoctorReport`, `findStoredMainCredential`), `packages/opencode/src/auth/ui/` (`auth-menu.ts`, `select.ts`, `confirm.ts`, `ansi.ts` — first-party terminal code, no prompt library).
-- Contains: Six actions (add account, auth current, check quotas, auth doctor, apply repairs, delete all accounts); the doctor's findings and their repairs; `AUTH_MENU_ACTIONS`.
-- Key behaviours: `authorize(inputs?)` receives `inputs` only from the CLI, so the TUI path is unchanged. The menu opens when a main credential exists, not when the fallback roster is non-empty — gating on the roster hid it from the user adding their first fallback. Menu actions update the account store directly rather than signing in through OpenCode. Their OAuth result has empty URL and instructions; its callback returns `{ type: 'failed' }` to say no sign-in occurred, even when the action succeeded. Reporting success would make OpenCode treat a newly added fallback as the main login. Delete-all passes an explicit id list to `allowDrop`, built inside the mutation from the raw roster ids `mutateAccounts` exposes.
-- Depends on: `packages/core/src/index.ts` and `./internal`, `refresh-all-quota.ts`, the loader-captured `getAuth`, `client.auth.set`.
-- Used by: `packages/opencode/src/index.ts` `auth.methods`.
-
-**Pi extension (sibling package):**
-- Purpose: Same Codex OAuth capability for the Pi coding agent (separate OpenAI Codex Responses API surface), plus the shared account commands.
-- Location: `packages/pi/src/index.ts`, `packages/pi/src/commands.ts`, `packages/pi/src/paths.ts`, `packages/pi/src/routing.ts`, `packages/pi/src/raw-ws-node.ts`
-- Contains: Provider registration (`openai-codex`), model list (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`), custom streaming wrapper, hand-rolled WebSocket shim, and thin wrappers registering `openai-account`, `openai-quota` and `openai-routing` over the shared core bodies. Not `openai-reset`: it spends an irreversible credit bound to a ChatGPT identity Pi has no concept of.
-- Storage: `PI_OPENAI_AUTH_FILE` else Pi's `getAgentDir()` (`PI_CODING_AGENT_DIR` with tilde expansion, default `~/.pi/agent`), retaining a default-directory store in place with a warning if the configured directory has none; never the `OPENCODE_*` variables for either file.
-- Known gap: the Pi request path does not read the store, so a routing choice persists without moving traffic. Tracked as issue #153.
-- Depends on: `@earendil-works/pi-ai` (imported via `/compat` to match Pi loader's alias table), `@earendil-works/pi-coding-agent`, `node:net`/`node:tls`, `@cortexkit/openai-auth-core`.
-- Used by: Pi extension loader.
-
-## Data Flow
-
-**OAuth login + token refresh (main account):**
-
-1. User runs `/login openai` and picks "ChatGPT Pro/Plus (browser)" or "(headless)" — `packages/opencode/src/index.ts` `auth.methods`.
-2. `startOAuthServer` + `generatePKCE` + `buildAuthorizeUrl` open the authorize URL — `packages/core/src/oauth.ts`.
-3. `waitForOAuthCallback` (browser) or `beginDeviceAuth` + `completeDeviceAuth` (headless) completes the flow.
-4. `migrateIfNeeded` seeds the multi-account store on first run, serializing operations under the shared save lock to coordinate concurrent migrations and mutations — `packages/core/src/accounts.ts`.
-5. `auth.loader` constructs `QuotaManager`, `FallbackAccountManager`, and (if any fallback accounts) starts `fallbackManager.startBackgroundRefresh()`.
-6. Each refresh runs through `codexRefreshFn` with file-lock + lease concurrency — `@cortexkit/common-auth/fs`, `index.ts` `refreshMainWithLease`. Refreshed token persistence retries up to 3 times to prevent transient file locks or API write errors from invalidating sessions.
-
-**Routing and request flow (per request):**
-
-1. Resolve the session key from `x-session-affinity`, `x-opencode-session`, `x-session-id`, or `session-id`.
-2. Read the shared sidebar state once. In `sticky-balanced` mode, retain a valid pin or create one using least projected pressure against fresh quota; stale and unknown quota are excluded, and an empty weighted set fails open to configured order. The credit budget is a third pressure axis with its own monthly reset, so a spent budget lowers a candidate's weight as well; equal scores use configured order then account id, while a shared pending-byte bridge accounts for concurrent cold sessions. A row holding a tombstone from the removed handle-mode custody never enters the roster.
-3. Strip any existing `authorization` header, refresh an expired main token via `refreshMainWithLease`, or refresh a fallback via `fallbackManager.refreshAccount`. Derive the main ChatGPT identity from the access-token JWT so quota and killswitch tracking survive a main-account switch.
-4. Consult admission before spending. A candidate whose freshest known quota — in-process cache or the shared sidebar file, whichever is newer under a matching account identity — is exhausted is skipped rather than probed; exhaustion includes a reached credit budget, judged by the same shared signal cold placement uses. Filtering can never remove the last path: if it would, the original order is restored and the wire stays authoritative.
-5. Send on the chosen account. Ordered modes retain their normal main-first or fallback-first retry behavior; sticky-balanced does not rebalance a live session and has no Retry-After hold. A blocked primary returns a synthetic 429 whose `Retry-After` comes from the blocking reason's own reset.
-6. Classify a sticky break after the send. Only confirmed exhaustion — an exhausted rate-limit window or a reached credit budget — and permanent auth failure migrate the pin; transient, stale, and unknown outcomes retain it. A response that already served is never replayed.
-7. Repin immediately on migration, then write the served account to the display state. Telemetry updates (`markUsed`) run fire-and-forget so a served response is never delayed by storage contention. Main and fallback quota headers are normalized into `QuotaManager`; `activeRouting` remains a short-lived display record, while `stickyAssignments` owns the seven-day, SHA-256-keyed session pins. A child session uses its own pin, and the parent display keeps its own pin rather than mirroring the child.
-
-**Quota push and background refresh:**
-
-1. HTTP path — `normalizeQuotaHeaders(finalResponse.headers)` runs inside the `fetch` override.
-2. WS path — `codex.rate_limits` in-band frame fires `onQuota` in `ws.ts`, which calls back into `pushQuota` carrying the connection's per-request access token, internal quota account key, and the served ChatGPT account ID header to prevent cross-account leakage.
-3. `pushQuota` writes to `QuotaManager.setMain`/`setFallback` (discarding stale main frames and past-expired windows) and triggers `writeMachineSidebarState` (updates machine-global state in the sidebar snapshot using `setSidebarMachineState`).
-4. Background polling — `BackgroundQuotaRefresh` runs an unref'd 5-minute jittered interval under the `bg-quota-refresh` file lease lock, invoking `refreshAllQuota` with a 4-minute freshness threshold (`BACKGROUND_QUOTA_FRESHNESS_MS`) to keep idle fallback and main quota fresh in the shared sidebar state. Window snapshots merge per window by newest `checkedAt`; a same-identity merge keeps the fresher of each window (and of `spendControl`), while a differing or unknown identity whole-picks the fresher snapshot.
-5. `/openai-quota` command additionally calls `refreshAllQuota` directly to actively fetch `wham/usage` for main + every fallback (respecting per-account backoff).
-
-**Claustrum vault (enrollment and requests):**
-
-1. Enrollment runs only from setup: Connect in the `opencode auth login` menu (it waits, printing the `ck` commands, until the operator approves) or Connect in the Vault section of `/openai` (one step, then a background wait that reports the outcome to the session). `ClaustrumEnrollmentManager.reconcile()` proposes `openai-auth-<host>`, and polls a proposal already on disk; the token is written 0600 under the host's vault directory. A denied or blocked request is cleared before a new Connect.
-2. Each host process runs one `OpenAiVault`. Its consumer polls the vault every few seconds whether or not the host is enrolled (a file check when it is not), so an enrollment finished in another process is picked up; custody is active exactly while the token file exists. In vault mode the consumer also holds a Claustrum `auth.watch_scoped` and an insula `usage.watch` open (common-auth 0.21.0, claustrum-client 0.12): while the vault watch is open the poll lists the vault only every five minutes and a change notice starts a discovery at once, and while the insula watch is open insula is read only when it announces a change. A vault or insula without the watch is polled as before. OpenCode 2 (`src/v2/`) does not route vault accounts: its installer sends the request itself and exposes no per-request handle, so a 401 could not be tied to the record version that request was served.
-3. In vault mode (the host holds its enrollment token) a request routes over `vault.routes()` alone, migrated install or not: no pool row, slot login or Pi login is read for routing, refreshed or polled (the pool source and Pi's pool set every row aside), and a request no vault account can serve is refused locally with a fixed `VAULT_MODE_REFUSALS` text (unreachable, empty, refused) after at most the 2 s wait for the vault's first roster. On Pi the models keep the `openai-codex` provider. `@cortexkit/common-auth/pi-slot` stashes Pi's original login before writing a static placeholder to its `auth.json` slot, then Pi's model registry is reloaded. Vault-mode streams accept only that resolved placeholder and replace it with a vault-served token. Disconnect restores the original entry before removing enrollment; a foreign login causes a reported conflict and both logins are kept without overwriting. The sidebar file carries the vault accounts in the additive `vaultAccounts` field, with `main` and `fallbacks` empty. Outside vault mode a request routes over the local pool rows. A vault account sends through `vault.send`: one `get_scoped` per attempt while the vault is reachable (once a vault call or the vault watch finds it unreachable, the token the vault last served that account is used without waiting, until a background list sees the vault answer again), a 401 retried once on a newer record version, and the final 401 reported with the version that attempt used; the consumer then refreshes its roster so a cold account leaves routing. Admission refusing a vault account for want of quota asks the vault account for a usage reading; response headers and rate-limit frames are recorded into the roster, fenced on the served account.
-4. In vault mode a real login in OpenCode's slot is not used (the request is served from the vault before the slot is read), and the pool lifecycle is paused (`PoolLifecycleDeps.paused`): no migration and no adoption run, and the loader writes no account file, so the slot and the account files stay byte-identical. The lifecycle checks again every minute; after a disconnect it migrates or adopts then, or a request that finds the real slot login asks for an adoption at once. The host-slot guard (`host-slot-login`) only catches an enrollment that lands while a request is starting.
-5. Disconnect deletes the token and ceremony state (the enrollment stays approved in the vault until `ck auth enroll revoke`); Disable/Enable on a vault account is the consumer's declined-account interlock, kept in the roster file.
-
-**Slash command (TUI dialog):**
-
-1. OpenCode TUI fires `command.execute.before` for `/openai-*`.
-2. The plugin returns `cleanAbort()` (sentinel throw) so OpenCode does NOT execute any built-in command — `packages/opencode/src/index.ts`.
-3. The plugin pushes an `open-dialog` notification via `pushNotification` (`packages/opencode/src/rpc/notifications.ts`).
-4. TUI's `tui.tsx` polls the loader's loopback RPC (`/rpc/pending-notifications`), receives the dialog, and renders it via `command-dialogs.tsx`.
-5. User clicks Apply → TUI POSTs `/rpc/apply` → loader's `apply` calls `buildDialogPayload`, mutates storage via `mutateAccounts`, and returns updated knobs for the TUI to re-render.
-
-**`/openai-reset` credit redemption:**
-
-1. The account list reuses each account's valid L1 access token to fetch `wham/usage` and reset-credit inventory in parallel, producing a per-account preview. Exhausted accounts with an eligible credit in reset inventory (evaluated without rejecting when wham's `applicable_available_count` is zero or out of sync) and a stable ChatGPT account identity can continue.
-2. Selecting an account opens an explicit L2 confirmation bound to its stable `chatgptAccountId`; the dialog states that one reset credit will be spent (showing the available credit count or unknown) and that the action is irreversible.
-3. Confirmation resolves the target again and rejects the redemption if its ChatGPT identity no longer matches the bound identity.
-4. A new attempt re-fetches quota and credits and re-checks exhaustion and applicable-credit preconditions immediately before claiming a credit. Under the persisted-pair retry rule (3a), an explicit retry instead requires an active in-flight attempt and reuses its `creditId` and `redeemRequestId` pair.
-5. `consumeResetCredit` sends the explicit credit ID and redemption UUID to the consume endpoint in a POST bounded by a 60-second timeout. The read-only credit-list GET is bounded by a 15-second timeout; an abort surfaces as an `http_error` list failure.
-6. Terminal server outcomes (`reset`, `already_redeemed`, `nothing_to_reset`, `no_credit`) clear the matching in-flight pair and persist `lastOutcome`; only the credit-spending `reset` and `already_redeemed` outcomes start cooldown. HTTP and ambiguous outcomes preserve the pair so a retry can reuse the same identifiers; an expired unreconciled pair requires an explicit replay, while corrupt local state is recorded as locally ambiguous instead of issuing a consume request.
-7. A successful or already-redeemed outcome runs the normal targeted quota refresh for the selected account, pushes the result through `QuotaManager`, refreshes the sidebar snapshot, and fetches the remaining applicable-credit count.
-
-Server-side deduplication of a repeated `redeem_request_id` is verified live (2026-07-23): replaying a consumed `(redeem_request_id, credit_id)` returns `already_redeemed` with `windows_reset: 0`, the account's available-credit count does not decrement a second time, and the response carries the original redemption's `redeemed_at`. Replaying a consumed identifier is therefore safe — the server dedupes on it and never spends another credit — which is the invariant the retry path relies on.
-
-**Cache keep-warm (idle session):**
-
-1. Every main-agent (and optionally subagent) request is captured by `buildKeepwarmCapture` from `sendWithAccessToken`. Outside of the configured clock window, capture is skipped.
-2. `cacheKeepManager.track` stores the body + replay headers per session, computing `cacheExpiresAt` using model-aware TTL (30 min for GPT-5.6 models, 5 min otherwise).
-3. A 60s timer fires; if the current hour is within the clock window, it checks each tracked session. For sessions within `leadMs` of expiry and within their respective idle caps (1 h main, 30 min subagent, or 75 min for GPT-5.6 subagents), it calls `buildKeepwarmBody(body)` (`store:false`, token caps removed) and replays via `fetchImpl`. With `sustain on`, only the main 1-hour idle pruning bound is bypassed; the window and all memory/LRU caps still apply.
-4. Successful warms increment `warmCount`. A GPT-5.6 subagent session is immediately removed/evicted from tracking once its `warmCount` reaches the 2-warm cap.
-5. Failures trigger a 10-min backoff per session.
-
-## Key Abstractions
-
-**`CodexAuthPlugin` (the plugin itself):**
-- Purpose: Entry point for OpenCode's plugin system. Returns `Hooks` (auth, provider, tool, event, dispose).
-- Location: `packages/opencode/src/index.ts`
-- Pattern: Factory; accepts `PluginInput` + `CodexAuthPluginOptions`; wires the auth loader, the WebSocket pool, the RPC server, the host's `OpenAiVault`, and the per-loader `CacheKeepManager` set.
-
-**`FallbackAccountManager`:**
-  - Purpose: Owns the pre-pool fallback state, background refresh, and `getUsableFallbackAccounts` (killswitch + routing aware; tombstoned rows are skipped). Still used when the pool source is inactive; its background refresh is paused once the pool or vault serves.
- - Location: `packages/core/src/accounts.ts`
-- Pattern: Constructor-injected `refreshFn` (`codexRefreshFn`) and `quotaManager`; background timer with on-demand `markUsed` to refresh before the next request.
-
-**`OpenAiVault`:**
-- Purpose: One host's view of its OpenAI accounts in the Claustrum vault: routing rows, per-send authorization, quota, the interlock, enrollment and the host-slot guard.
-- Location: `packages/core/src/vault.ts`
-- Pattern: Wraps the shared `ClaustrumConsumer` (no credential cache by design: every send is authorized by the vault) and runs `ClaustrumEnrollmentManager` for Connect; connections, the state directory and the clock are injected so tests drive it against a mock daemon.
-
-**`QuotaManager`:**
- - Purpose: Single source of truth for in-memory main + per-fallback quota. Inflight dedup per fingerprint so concurrent calls with different tokens never cross-pollute.
- - Location: `packages/core/src/quota-manager.ts`
-- Pattern: Push-only (no `fetchQuotaFn` injected — quota comes via `setMain`/`setFallback`); active refresh is orchestrated by `refreshAllQuota`.
-
-**`BackgroundQuotaRefresh`:**
-- Purpose: Periodic background quota polling for idle accounts across processes with an auto-renewing cross-process lease lock (`bg-quota-refresh`), per-window freshness gating, and timestamp-based snapshot merging.
-- Location: `packages/opencode/src/core/background-quota-refresh.ts`
-- Pattern: Unref'd interval timer with jitter; non-blocking cancellation (`isStopped()` check before writing sidebar state); serialized cross-process execution via `acquireBackgroundRefreshLock`.
-
-**Sticky candidate selection:**
-- Purpose: Cold-session candidate selection, sustainable spend-rate weighting, and sticky-break classification.
-- Location: `packages/opencode/src/core/sticky-routing.ts`
-- Pattern: Pure functions (`selectStickyCandidate`, `decideStickyBreak`, `sustainableWindowWeight`) calculating quota pressure divided by sustainable spendable rate, where the credit budget participates as its own axis on its own reset; excludes stale or killswitch-failing accounts; falls open to configured order. Reads the shared `spendControlExhaustedResetAt` signal so cold placement, admission, and warm-pin migration agree on what "spent" means.
-
-**`CacheKeepManager`:**
-- Purpose: Idle prompt-cache warmer with per-session targets, idle caps (1 h main / 30 min subagent, extended to 75 min for GPT-5.6 subagents), clock window checks, and 10-min backoff after a failed warm. Main-only `sustain` bypasses idle pruning without affecting the other bounds.
-- Location: `packages/opencode/src/core/cachekeep.ts`
-- Pattern: Target map keyed by session id; interval timer; bounded (`maxTargets`, `maxBytes`) so a long-lived process cannot leak; model-aware TTL adjustment (30-min TTL for GPT-5.6 models) and gpt-5.6 subagent 2-warm limits.
-
-**Reset credit redemption coordinator:**
-- Purpose: Preview reset-credit eligibility and redeem exactly one explicit credit for an exhausted account after identity-bound confirmation.
- - Location: `packages/core/src/reset-credits.ts`; command orchestration in `packages/core/src/commands.ts` (`executeResetCommand` shared body).
-- Pattern: Persisted `(creditId, redeemRequestId)` claim before the consume POST; confirm-time identity and new-attempt precondition checks; terminal-only finalization with bounded, identifier-stable retry for ambiguous outcomes.
-
-**`OpenAIWebSocketPool` / `createWebSocketFetch`:**
-- Purpose: Session-keyed WebSocket pool with continuation chaining (`previous_response_id`), refusal cleanup (clearing continuation state and destroying the socket so retries re-send full input), oversized frame (1009) HTTP relay fallback (`relayWithOversizedFallback`), per-account discriminator so a switch forces a fresh socket, and stream-failure retries.
-- Location: `packages/opencode/src/ws-pool.ts`
-- Pattern: `Map<accountDiscriminator, PoolEntry>`; lazy WS upgrades; pool entry owns its `turnID`/`turnStartedAt` so a single user turn keeps one Codex turn id across the whole tool loop; owns the response body so pre-output oversized frame rejections seamlessly complete over HTTP.
-
-**Loopback RPC server:**
-- Purpose: Notification queue + apply dispatch between loader and TUI.
-- Location: `packages/opencode/src/rpc/`
-- Pattern: HTTP server on `127.0.0.1:<ephemeral>` with a 32-byte bearer token written to `port-<pid>.json`; client discovers via pid-liveness scan of the dir.
-
-**Sidebar snapshot:**
-- Purpose: Loader → TUI surface for quota/killswitch/routing without coupling the TUI to the auth storage schema; also owns machine-global sticky assignments.
-- Location: `packages/opencode/src/sidebar-state.ts`
-- Pattern: Promise-chained writes (no interleaved/stale writes); file path bound at loader-run time; `normalizeSidebarState` is the tolerant-read entry point so a malformed file never crashes the TUI. Writes machine-wide quota state via `setSidebarMachineState`, short-lived session display records via `upsertSidebarActiveRouting`, and SHA-256-keyed sticky assignments via `resolveSidebarStickyAssignment`; file locking and a promise serialization chain preserve concurrent placement and pending-byte accounting. Pins expire after seven days.
-
-## Entry Points
-
-**Plugin entry:**
-- Location: `packages/opencode/src/index.ts` (`CodexAuthPlugin`)
-- Triggers: OpenCode loads `@cortexkit/opencode-openai-auth` per `~/.config/opencode/opencode.json` `plugin` field.
-- Responsibilities: Returns `Hooks`; `provider.models` filters the OpenAI model list (allow-list + GPT >5.4 fallback, disallowing bare `gpt-5.6`/`gpt-6`) and zeroes OAuth costs; `auth.loader` does the heavy lifting on first OAuth request and starts the vault's background roster poll; `auth.fetch` is the per-request wrapper; `command.execute.before` returns `cleanAbort` for `/openai-*`; `event` cleans session state on `session.deleted`; `dispose` closes WS, stops cachekeep, stops background refresh, stops background quota polling, and closes the vault connection.
-
-**TUI entry:**
-- Location: `packages/opencode/src/tui/entry.mjs` (exported as `./tui`; dispatches to the precompiled or raw TUI)
-- Triggers: OpenCode TUI loads the plugin per its `oc-plugin: ["server", "tui"]` field.
-- Responsibilities: Renders the sidebar (quota, fallback accounts, routing, health, pacing); polls the loader RPC for dialogs; dispatches Apply; reads/writes `tui-preferences.jsonc`.
-
-**Pi extension entry:**
-- Location: `packages/pi/src/index.ts` (`cortexKitPiOpenAIAuth`)
-- Triggers: Pi loads the extension per its `pi.extensions` field.
-- Responsibilities: Registers the `openai-codex` provider with model list, OAuth login/refresh, custom streaming wrapper that swaps `globalThis.WebSocket` for the hand-rolled client, and the `/openai` command (its Vault section enrolls Pi as `openai-auth-pi`).
-
-## Error Handling
-
-**Strategy:** Fail-soft with structured retry; never break a request because of a quota or logging concern.
-
-- Refresh errors: classified transient by `isTransientRefreshError`; build a `nextRetryAt` and store it in `refresh.lastRefreshError`. A `refreshBackoffActive` check short-circuits future refresh attempts for the same token hash.
-- Quota errors: classified by `isTransientQuotaError`; `quotaBackoffActive` gates future quota fetches per account.
-- Token-refresh race: file lock + lease token hash in storage prevent two processes from refreshing the same main token simultaneously; late processes either join or wait via `waitForConcurrentMainRefresh`.
-- Storage lock acquire timeouts: the acquire deadline is separated from lock TTL, and the timeout message reports attempt count and average gap between attempts to distinguish genuine holder contention from host event-loop starvation.
-- Request-path telemetry: `markUsed` writes run fire-and-forget and swallow failures so lock contention or store read errors never kill a served response.
-- HTTP/WS stream failures: `response-stream-error.ts` `ResponseStreamError` (supports `retryable` parameter); WS retries up to 5 times (`streamRetries`); `websocket_connection_limit_reached` (including during socket prewarm) falls back to HTTP for the session immediately. Oversized request frames (peer close code 1009) are classified non-retryable on WebSocket (`isOversizedFrame`), include the serialized request frame size in the error message, and trigger HTTP fallback via `relayWithOversizedFallback` if no output has streamed yet to complete the turn.
-- Refused continuations: when a continuation fails or is closed before output, the socket is destroyed and continuation state is cleared (`entry.continuation = undefined`) so subsequent attempts never chain to a refused response and re-send full input instead.
-- Peer close frame race: `RawWebSocket` implementations (`raw-ws-bun.ts`, `raw-ws-node.ts`) record parsed peer close frames (`peerClose`) so explicit peer close codes (such as 1009) take precedence over the synthetic 1006 TCP close event.
-- Mid-stream rate-limiting / quota exhaustion: parsed from `response.failed` frames carrying `rate_limit_reached_type`, admission-time `usage_limit_reached` frames, or handshake 429 upgrade rejections. If `emittedOutput` is false (no generated output items emitted), triggers a retryable `ResponseStreamError` enabling a same-turn fallback reroute. If `emittedOutput` is true, closes the stream without retrying (no-replay gate) to prevent text duplication, double-billing, or re-running side-effecting tool calls, and annotates the error message with `(not retried: output already emitted)` and continuation provenance `(continuation of <previousResponseID>)` when applicable. Marks the account rate-limited using explicit provider resets when available, or reset math resolved from that window's last-known cached reset (falling back to a bounded default if unknown).
-- 401/403/429 mid-request: handled by `tryFallbackAccounts` (reactive); the original body must be a string (else skip fallback).
-- Storage corruption: `loadAccounts` is wrapped to throw a clear actionable message rather than a raw `JSON.parse` error.
-- CLI self-fallback rejection: the account-menu `add` action refuses to add the main account as a fallback (would re-route a `429` onto the same account).
-- Reserved account ID rejection: `"main"` is a reserved ID (case-insensitive); the OAuth callback login path and the `mutateAccounts` roster guard reject any fallback account using this label to avoid colliding with the primary account's tracking.
-- Vault refusals: a vault account the vault will not serve (not enrolled, declined, cold, unreachable, an identity that changed) is treated like a row with no token: an ordered loop moves on to the next vault account, since nothing reached the provider, and the request is refused locally (`vault-refused`) when none is left; a vault error never reaches a log or an error message with a credential in it. Only a 401 on a credential this host was served is reported to the vault (429, 402 and 5xx never are).
-- Handle-mode tombstones: `TombstoneRefreshError` refuses a refresh whose refresh token is a tombstone before any network call; refresh-failure bookkeeping ignores it (there is nothing to retry).
-- Background refresh concurrency: `FallbackAccountManager` catches `AccountRemovedDuringRefreshError` to gracefully skip updates for fallback accounts removed from storage during a background refresh operation.
-- Token refresh rotation tolerance: `codexRefreshFn` tolerates missing or empty `refresh_token` strings when the provider declines to rotate, preserving the existing refresh token without failing.
-- Quota endpoint 401 handling: treated as a refresh trigger; accounts with armed non-transient refresh backoff are skipped during background quota polls and flagged permanent, advising operators to remove and re-add the account instead of retrying indefinitely.
-- Load-time drop preservation: `mutateAccounts` and `saveAccounts` preserve un-loadable raw config entries on disk across writes rather than silently deleting them, requiring explicit `allowDrop` from callers (such as the account-menu delete-all action) for intentional removals.
-- Token persistence retry: `persistMainAuthTokens` retries writing refreshed main auth tokens up to 3 times to handle transient client/storage update lock contentions.
-- RPC state sweep: startup cleanup sweeps dead-PID port files and empty RPC directories with narrow parsing and validation so corrupted port files cannot abort directory sweeps for other projects.
-- Command RPC credential scrubbing: `buildDialogPayload` scrubs credential keys from knob payloads and logs warnings rather than leaking tokens across the RPC boundary.
-- All catch paths around quota/sidebar/RPC are best-effort by design; failures are logged at `warn` and swallowed so a sidebar/dump/RPC hiccup never crashes a turn.
-
-## Cross-Cutting Concerns
-
-**Logging:** Leveled logger engine in `packages/core/src/logger.ts`, initialized per host by `packages/opencode/src/logger.ts` (log file + env level). Channels: `transport`, `quota`, `refresh`, `accounts`, `cachekeep`, `vault`, `claustrum`, `models`, `rpc`, `rpc-tui`, `dump`, `sidebar`, `commands`. Redacts Bearer/sk-/JWT tokens, secret/api-key/password/token-like headers, ChatGPT stable ID (`chatgpt-account-id`/`chatgptAccountId`), and any value matching the secret-key patterns, while keeping the internal account ID visible. Vault tokens and served credentials never reach the `vault` or `claustrum` channels. Transport lifecycle and stream failures log to `transport` independent of dump settings so errors leave records at normal log levels. Log files, request dumps, and the default dump directory are restricted to private permissions (`0o600` for files, `0o700` for directories). Credentials and tokens are redacted from request dump bodies as well as log files, while `redactStrings` preserves tool schemas in dumps so definitions remain parseable and replayable. File rotates at 5 MiB keeping 3 generations; default file `tmpdir/opencode-openai-auth.log` (override `OPENCODE_OPENAI_AUTH_LOG_FILE`). Log level is settable at runtime via `/openai-logging` (persisted) or env `OPENCODE_OPENAI_AUTH_LOG_LEVEL`.
-
-**Caching:** Two layers.
-- **In-memory quota cache:** `QuotaManager` (per-account fingerprint; 5-min refresh-after default; `respectBackoff` gates active polling).
-- **Prompt cache keep-warm:** `CacheKeepManager` tracks per-session last request and replays as `store:false` before the Codex ~5-min eviction window.
-
-`/openai-cachekeep sustain on|off` is main-agent-only and defaults off. It is orthogonal to the clock window, retains memory/LRU limits, and never warms a non-active account. GPT-5.6 targets warm about twice per hour per session (about 1K output tokens/hour at about 99.4% cache hit); non-5.6 targets warm about twelve times per hour. Before enabling it for a main-session model, the operator must preserve existing entries in `~/.config/cortexkit/magic-context.jsonc` and set that model's `cache_ttl` to `"never"`. Magic Context does not run in subagent sessions. An indefinitely live cache invalidates elapsed-time assumptions that a cache is cold and that mutation is free. The sibling anthropic plugin's `always` means ignore the clock schedule; this plugin's `sustain` means bypass main idle pruning.
-
-**Storage:** Config and state are stored in two separate files. The config, `openai-auth.json` (default `~/.config/opencode/openai-auth.json` under `$OPENCODE_CONFIG_DIR`, overridable via `OPENCODE_OPENAI_AUTH_FILE`), holds settings and metadata without credentials and stays in OpenCode's config folder. Everything the plugin rewrites at run time lives in the runtime folder that `core/account-paths.ts` resolves: the state file `openai-auth-state.json` (access/refresh tokens and API keys; overridable via `OPENCODE_OPENAI_AUTH_STATE_FILE`), the vault folder `openai-auth-vault/` beside it, and the Codex sessions files `openai-auth-sessions.json` (OpenCode 1) and `openai-auth-sessions-opencode2.json` (OpenCode 2), which persist UUIDv7 thread/turn ids for prompt-cache continuity. The runtime folder is `$XDG_STATE_HOME/cortexkit/openai-auth/opencode/` (default `~/.local/state/...` on every OS) for the config folder `<home>/.config/opencode`, and `.../opencode-<first 16 hex of sha256(real path of the config folder)>/` for any other, because OpenCode 2 watches its config folder; `config-dir.json` in it names its config folder, and a folder naming another one is refused. `core/runtime-layout.ts` moves the files there from OpenCode's config folder once, at plugin start, under a layout lock and the store, roster and sessions locks, and only while no live process could still write the old files (an older version, or any process on the legacy layout; both are read from the process heartbeats). Only a process without state or config-file overrides moves files or writes the marker; it refuses the move when the destination holds a runtime file it did not list in `layout-moving.json`, or when an old path and its new place are one physical file. A process that cannot take the layout lock or record a legacy choice in its heartbeat refuses to start. `layout.json` marks the state folder authoritative, and each process keeps the layout it chose for its whole life. `deriveStatePath` keeps a custom config file's state file beside it (`<configPath>.state.json`), and `accountPathsCollide` validates against path collisions. Atomic writes via `writeJsonAtomic` (temp + `rename`, mode `0o600`). File-level locks at `<config>.save.lock` and `<config>.main-refresh.lock` coordinate cross-process refresh and quota seed. Sidebar state lives at `$XDG_STATE_HOME/cortexkit/openai-auth/sidebar-state.json` (default `~/.local/state/...`, override `OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE`); it holds seven-day session pins, so it stays out of the temp folder. The first resolution copies a pre-existing `tmpdir/opencode-openai-auth/sidebar-state.json` once, leaving the old file for older versions still running. Loopback RPC port files live in `$XDG_STATE_HOME/cortexkit/openai-auth/rpc/openai-auth-<sha256(projectDir)>/port-<pid>.json` (mode `0o600`, directories `0o700`); dead port files and empty project directories are swept on server startup.
-
-**Configuration resolution (`config.ts`):** Env wins over config file wins over default. The `webSearch` cache fix is default-on and gated by a NEGATIVE env (`CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH`). Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty. Settings are memoized per process; commands that write configuration on disk (such as `/openai-dump`) invoke `refreshSettings()` to invalidate the memoized settings and pick up changes immediately. Tests call `resetSettingsForTest`.
-
-**Versioning & build:** `packages/opencode/src/version.ts` exposes `PackageVersion` (currently `0.9.0`); the TUI plugin header reads `package.json` at runtime via `import.meta.url` so the version badge tracks the package version without baking it into the dist. Use `packages/opencode/scripts/build-tui.ts` during the build to precompile TUI Solid JSX source files into `packages/opencode/src/tui-compiled/` using the `@opentui/solid` compiler transform, binding Solid/OpenTUI imports to the host's virtual runtime registry (`opentui:runtime-module:<specifier>`) so the TUI shares the host's single Solid/OpenTUI runtime. The root `build` script runs `scripts/check-installed-ranges.mjs` first, refusing the build when an installed dependency's version (resolved from the nearest `node_modules` walking up from each workspace) falls outside the range its manifest declares — `bun install --frozen-lockfile` never checks the installed tree against the manifests, and because the build inlines dependencies, whatever version is installed at build time is what every user runs. The release pipeline is tag-driven (`.github/workflows` + `scripts/release.sh`); see `docs/release.md` for the exact command surface.
-
-**Formatting/linting:** Biome 2.5.15 (single quotes, no semicolons, trailing commas, 2-space indent). Lefthook runs `biome check` on staged files. Tests run via `bun test src/tests`; typecheck via `tsc`.
+openai-auth lets coding agents use ChatGPT subscriptions (the Codex backend at `chatgpt.com/backend-api/codex`) with more than one account. It signs requests with a ChatGPT login instead of an API key, chooses which account serves each request, follows each account's quota, and moves work to another account when one runs out. It can also take its accounts from the Claustrum vault instead of holding credentials itself.
+
+It runs in three hosts:
+
+- **OpenCode 1**, as `@cortexkit/opencode-openai-auth` (`packages/opencode`). The package root is the OpenCode 1 plugin. It replaces OpenCode's built-in `openai` auth hook and sends every request itself.
+- **OpenCode 2**, through the same package's `./server` export (`packages/opencode/src/v2/server.ts`). OpenCode 2 sends requests itself, over its own OpenAI driver; the plugin edits them through host hooks.
+- **Pi**, as `@cortexkit/pi-openai-auth` (`packages/pi`), registering the `openai-codex` provider.
+
+Both npm packages bundle two pieces of shared code at build time: `@cortexkit/openai-auth-core` (`packages/core`, private, never published) and `@cortexkit/common-auth`, the library all CortexKit auth plugins share. At run time they load three packages that must exist once per install: `@cortexkit/private-files`, `@cortexkit/claustrum-client` and `@cortexkit/subc-client` (kept external in each build script).
+
+Paths below are relative to the repository root.
+
+## Where state lives
+
+On OpenCode (both versions share the files):
+
+- **Settings and the account roster:** `openai-auth.json` in OpenCode's config folder (`OPENCODE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/opencode`, else `~/.config/opencode`), or the file `OPENCODE_OPENAI_AUTH_FILE` names. It holds no credential.
+- **The runtime folder:** the state file `openai-auth-state.json` (tokens), the vault folder `openai-auth-vault/` (enrollment, roster) and the Codex sessions files (`openai-auth-sessions.json` for OpenCode 1, `openai-auth-sessions-opencode2.json` for OpenCode 2). They live in `$XDG_STATE_HOME/cortexkit/openai-auth/opencode/` (default `~/.local/state`) for the config folder `~/.config/opencode`, and in `.../opencode-<16 hex>/` for any other config folder. Older installs kept them in the config folder; a one-time move takes them out (see Runtime folder move). `OPENCODE_OPENAI_AUTH_STATE_FILE` overrides the state file.
+- **Machine-wide, beside the runtime folders** in `$XDG_STATE_HOME/cortexkit/openai-auth/`: `sidebar-state.json` (the sidebar snapshot and seven-day session pins; `OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE` overrides it), `processes/<pid>.json` (process heartbeats) and `rpc/` (loopback RPC port files).
+- **OpenCode's own login slot:** OpenCode 1's `auth.json`, key `openai`. Before the pool migration it holds the main account's login; after it, a placeholder that is never sent. OpenCode 2's credential table only ever receives a placeholder.
+
+On Pi, `openai-auth.json` lives in Pi's agent folder (`PI_CODING_AGENT_DIR`, else `~/.pi/agent`; `PI_OPENAI_AUTH_FILE` overrides it). The state file and vault folder sit beside it (`PI_OPENAI_AUTH_STATE_FILE` overrides the state file). Pi's own login stays in Pi's `auth.json`. None of Pi's files move.
+
+`packages/opencode/src/core/account-paths.ts` and `packages/pi/src/store-paths.ts` are the only places these rules are written. The store code takes both paths as arguments and resolves nothing, so a lock and the write it guards can never disagree about which file they mean.
+
+## Terms
+
+- **Account pool, row:** the shared account store from `@cortexkit/common-auth/store`. Each account is a row with its credential, its ChatGPT identity and its quota. Row `main` is the account that used to be OpenCode's own login; the others are fallbacks.
+- **Migrated install, legacy path:** an OpenCode install whose accounts have moved into the pool. Before that, OpenCode 1 serves the main account from its login slot and fallbacks from the old roster (the legacy path in `packages/opencode/src/index.ts`); OpenCode 2 serves nothing from the plugin.
+- **Placeholder:** a fixed non-secret value written into a host's login slot so the host routes requests through the plugin. It's never sent to a provider.
+- **Vault mode:** the host is enrolled with the Claustrum vault. Only the OpenAI accounts the vault grants this host are used; local accounts are left untouched on disk.
+- **Hosted mode:** Thalamus started the host with `CORTEXKIT_VAULT_HOST=thalamus` and provides a vault connection. It's vault mode without an enrollment of the host's own.
+- **Route:** a vault account as a routing row. It holds no token.
+- **Receipt:** what the vault returns for one send: a token and the record version it came from.
+- **Roster:** the vault accounts this host saw on its last list, with their quota, order and declined state (`<host>-roster.json` in the vault folder). It holds no token.
+- **Routing mode:** `main-first`, `fallback-first` or `sticky-balanced`, set in `/openai` → Routing.
+- **Pin:** in sticky-balanced, the account a session was placed on.
+- **Admission:** whether an account may serve a request now, judged from its quota, killswitch floors, limit marks and credential.
+- **Killswitch floor:** a minimum percentage of a quota window an account must keep; below it, the account is not admitted.
+- **Limit mark:** a record that an account hit a usage or rate limit, with when it resets.
+- **Confirmed reset:** a reset time the provider stated. Only a confirmed reset can keep a session waiting on the same account.
+- **Owned request:** a request the plugin acts on: its placeholder is the active credential. Every other request passes through untouched.
+- **Output started:** the provider has sent part of the answer (text, reasoning or a tool call) that the host may already have shown or acted on.
+
+## Code map
+
+| Layer | Where | Role |
+|---|---|---|
+| OpenCode 1 plugin | `packages/opencode/src/index.ts` | Auth loader and fetch override, legacy path, model rules, quota recording, sidebar writes, the `/openai` command hook. |
+| OpenCode 1 request path | `packages/opencode/src/core/pool-request.ts` | Routes one request over pool rows or vault routes. |
+| Codex wire | `packages/opencode/src/codex-request.ts`, `codex-sessions.ts` | Rewrites requests into Codex's shape; keeps each session's thread id across restarts. |
+| OpenCode 1 transports | `packages/opencode/src/ws.ts`, `ws-pool.ts`, `raw-ws*.ts` | Optional WebSocket transport with continuation, prewarm and HTTP fallback. |
+| OpenCode 2 plugin | `packages/opencode/src/v2/` | `setup.ts` wires the pool, vault and hooks; `adapter.ts` answers common-auth's OpenCode 2 installer; `codex-wire.ts` rewrites HTTP bodies and WebSocket frames. |
+| Pi extension | `packages/pi/src/` | `index.ts` registers the provider; `runtime.ts` and `pool-request.ts` route each request; `pool-source.ts` reads Pi's pool. |
+| Shared core | `packages/core/src/` | Account store wrappers, OAuth, routing rules, limits, quota, the vault, reset credits, the `/openai` menu, redaction. |
+| Pool and migration | `packages/opencode/src/core/pool-*.ts`, `host-slot.ts`, `version-fence.ts`, `process-heartbeat.ts` | Reading the pool for requests, migrating into it, adopting later logins. |
+| Runtime layout | `packages/opencode/src/core/runtime-layout.ts`, `account-paths.ts` | The one-time move of runtime files out of OpenCode's config folder. |
+| Keep-warm | `packages/opencode/src/core/cachekeep.ts`, `v2/cache-keep.ts` | Replays a session's last request to keep its prompt cache alive. |
+| Sidebar and RPC | `packages/opencode/src/sidebar-state.ts`, `tui.tsx`, `tui/`, `rpc/`, `v2/sidebar-publisher.ts` | The quota sidebar, its state file, and the loopback RPC between server and TUI. |
+| Setup | `packages/opencode/src/bin.ts`, `setup.ts` | `opencode-openai-auth setup`, over `@cortexkit/common-auth/setup`. |
+
+`STRUCTURE.md` has the directory map and where to add new code.
+
+## A request, per host
+
+**OpenCode 1.** The auth loader returns a `fetch` that receives every OpenAI request. It reads the vault's authority first. In vault or hosted mode the request goes to `servePooled`, which routes over vault routes alone. Otherwise, if OpenCode's slot holds the pool placeholder and the install is migrated, `servePooled` routes over pool rows. Otherwise the legacy path serves the slot's own login and the old fallback roster. Each path rewrites the request into Codex's shape, sends it (HTTP, or WebSocket when `webSockets` is on), records quota from the response, and writes the sidebar.
+
+**OpenCode 2.** `v2/setup.ts` runs once per location (project). It builds the pool source over the same files OpenCode 1 uses, starts the migration lifecycle, connects the vault, and installs common-auth's OpenCode 2 hooks with openai-auth's adapter. The host sends the request; the hooks choose the account (`chooseAccount`), set its bearer and `chatgpt-account-id`, rewrite the body or WebSocket frame, read quota from headers and `codex.rate_limits` frames, and decide retries. Title, compaction and generate requests follow the session's current account (`v2/session-accounts.ts`). An install that hasn't migrated yet migrates on the first OpenCode 2 start, behind the same version fence as on OpenCode 1. Until then the pool serves nothing, pool requests are refused locally, and a credential that isn't the plugin's placeholder passes through untouched.
+
+**Pi.** Pi hands each `openai-codex` request to the extension with the token of Pi's own login. That login is routed as row `main` and the pool rows are fallbacks (`packages/pi/src/main-account.ts`). The runtime picks the account and streams through pi-ai's Codex stream with that account's token; pi-ai derives `chatgpt-account-id` from the token. In vault mode Pi's slot holds a placeholder and only vault routes serve.
+
+## Codex wire shape
+
+`prepareCodexRequest` (`packages/opencode/src/codex-request.ts`) makes a request look like it came from the official Codex CLI: Codex headers and client version (`CODEX_VERSION`), a UUIDv7 thread id per host session and turn id per user turn, turn metadata, and Codex's body key order. The thread id doubles as the prompt-cache key, so `codex-sessions.ts` stores it per session (thread ids only, never a token) and a restart keeps the cache.
+
+- **Reasoning effort:** for the models in `MID_CONVERSATION_EFFORT_MODELS`, the request keeps the effort the session opened with, and a later change travels as a `configuration_update` input item before the new user turn. A changed request-level effort would invalidate the cached prefix.
+- **Responses Lite:** a compact request shape for the models the backend marks Lite (`RESPONSES_LITE_MODELS`). It's off unless the `responsesLite` setting is on.
+- **Models:** `codexOAuthModelListed` and `codexOAuthModelLimit` in `packages/opencode/src/index.ts` decide which models a ChatGPT login is offered and their context windows. OpenCode 2 applies the same rules through `v2/models.ts`. Pi registers its own fixed model list.
+
+## Transports and no replay
+
+OpenCode 1 sends over HTTP by default. With `webSockets` on, a session reuses a socket (`ws-pool.ts`), prewarms a new user turn, and chains turns with `previous_response_id`; `rawWebSocket` switches to the hand-rolled client in `raw-ws-bun.ts` or `raw-ws-node.ts`. A socket that can't serve falls back to HTTP for the session, and a request too big for a WebSocket frame (close 1009) is sent again over HTTP if nothing has streamed yet. OpenCode 2 uses the host's own HTTP and WebSocket transports. Pi uses pi-ai's Codex stream with a WebSocket shim (`packages/pi/src/raw-ws-node.ts`).
+
+**No replay after output.** The host keeps what it has shown and runs tool calls as they arrive, so sending a request again after output started would duplicate text and re-run tools. So:
+
+- On OpenCode 1's WebSocket path, a failed attempt surfaces as a retryable error only while no output frame has arrived (`emittedOutput` in `ws.ts`). OpenCode then sends the request again, and routing can move it to another account. After output, the stream ends with the fixed `TERMINAL_AFTER_OUTPUT_MESSAGE`, which OpenCode does not retry.
+- On OpenCode 2, an attempt refused before output can retry on another account. After output, the turn continues only when the reply was cut mid-read (an HTTP body read failure, or a WebSocket that dropped with no terminal frame), on the same account, after routing and quota are checked again. The host then keeps the shown output. A limit, payment refusal, error status, account change or mixed session still ends the turn.
+- Pi sends again only when an attempt failed before streaming its first event.
+
+## Accounts and the pool migration
+
+The pool is one store for both OpenCode hosts and Pi's own copy for Pi. `PoolAccountSource` (`packages/opencode/src/core/pool-account-source.ts`) is what a request reads, under one rule: a request waits on a store lock only to get a usable token. Rows are read lock-free into memory and re-read only when the files changed. A token inside its refresh window is refreshed in the background; a request waits only for an expired one. Quota from responses is merged in memory at once and written to the store in the background.
+
+The migration (`packages/opencode/src/core/pool-migration.ts`) moves the slot's login and the old roster into the pool and writes the placeholder into the slot. It never runs on the request path; `pool-lifecycle.ts` runs it in the background and retries on a backoff, then keeps adopting logins that later land in the slot.
+
+- **Crash safety:** the slot keeps the only unmoved copy of its credential until the pool holds it and a reload proved it. The placeholder is written only if the slot still holds the exact pair that was read, and a durable pending-transfer record says whether an interrupted transfer happened.
+- **The version fence** (`version-fence.ts`): the migration runs only while every live openai-auth process is this version or newer, because older versions refresh the slot's token by their own rules and OpenAI refresh tokens are single-use. Processes are found by heartbeats and RPC port files. A record older than this boot (by more than five minutes) doesn't count, since a reused pid isn't the old process.
+- **Paused in vault mode:** no migration or adoption runs while the host is enrolled, so the slot and account files stay byte-identical.
+
+## Vault mode and hosted mode
+
+`OpenAiVault` (`packages/core/src/vault.ts`) is one host's view of its OpenAI accounts in the Claustrum vault, built on common-auth's `ClaustrumConsumer`. OpenCode and Pi enroll separately (`openai-auth-opencode`, `openai-auth-pi`), only from setup surfaces: Connect in `/openai` → Vault, the `opencode auth login` menu, or `opencode-openai-auth setup`. The operator approves the request with `ck`.
+
+- **Exclusive:** while enrolled, the vault's routes are the only accounts routed. No pool row, slot login or Pi login is used, refreshed, polled or warmed. A request no vault account can serve is refused locally with a fixed vault-mode message; there is no fallback to local accounts.
+- **One token per send:** a route holds no token. Each send asks the vault (`send`), so a revoked enrollment or a changed record takes effect on the next request. A 401 on a served credential is reported to the vault with the record version that send used, and nothing else is reported.
+- **Last good token:** when the vault can't be reached, common-auth's consumer reuses the token it last served each account, in memory only, until that token expires. An explicit vault refusal drops it at once.
+- **First roster:** a request in vault mode waits at most 2 seconds (`VAULT_FIRST_ROSTER_WAIT_MS`) for the vault's first account list.
+- **Quota:** read from insula when insula has a reading for the account, else polled from the provider. Quota from responses is recorded into the roster, and the `x-codex-*` headers of each vault-served reply are also reported to the vault, so insula sees them without polling.
+
+Hosted mode follows `vaultAuthority` from common-auth. When the environment has exactly `CORTEXKIT_VAULT_HOST=thalamus`, the authority is `host`. The consumer then connects only through the client Thalamus installs at `globalThis[Symbol.for('cortexkit.vault')]` (plugin id `openai-auth`). It reads no enrollment token file and refuses Connect, Disconnect and setup with common-auth's `VAULT_HOST_CONNECT_REFUSAL`. Menus show "Served by Thalamus". With the marker set and no relay, requests are refused as in vault mode. Synchronous checks use `isVaultHosted()` in `vault.ts`.
+
+## Routing and admission
+
+`packages/core/src/pool-routing.ts` holds the routing both hosts use, over common-auth's routing library. The library judges admission and order, places and moves sticky sessions, and decides when a pinned session must leave its account. openai-auth adds what the library has no input for:
+
+- **The last path:** when admission leaves no account, the request still goes to one whose quota reads exhausted, because the reading may be stale and the provider has the final say. An account refused for unknown quota never takes this path; unknown quota blocks.
+- **No-replay gate:** a request that can't be sent twice goes to one account and is never retried on another.
+- **Prepaid credits:** an account whose free quota is used up but whose workspace credits are usable serves only when no account has free quota left.
+
+The ordered modes try the next admitted account on a configured fallback status (default 401, 403 and 429). Sticky-balanced keeps a session on its pin until the account is confirmed unable to serve. It places a new session on the account with the least quota pressure, counting the pending bytes of other sessions just placed (`packages/core/src/pool-session-pins.ts`). Pins live in `sidebar-state.json` for seven days on OpenCode 1. OpenCode 2 keeps them in memory (`v2/pins.ts`) and only projects them to the sidebar file. Pi keeps them in memory for the process.
+
+On OpenCode 1 and 2 in vault mode, when Thalamus's routing accessor (`globalThis[Symbol.for('cortexkit.routing')]`) is present, a primary request asks it which account to use (`packages/core/src/vault-routing.ts`). Pi doesn't ask. openai-auth sends its own same-account wait cap as `hold_wait_max_s`, takes only the account the answer names, and ignores any delay it suggests. Without the accessor, nothing changes and nothing is parsed.
+
+## Limits and same-account waits
+
+The shared limit policy (`@cortexkit/common-auth/limits`, adopted in `packages/core/src/limit-*.ts` and `packages/opencode/src/core/limit-source.ts`) records limit marks per account and per login, and decides after a limit whether to wait on the same account or switch.
+
+- **Proof of exhaustion:** only a named failed frame or a `usage_limit_reached` error proves an account is exhausted. A bare 429 is a short cooldown, not exhaustion.
+- **Wait or switch:** a session waits on its account only when the provider confirmed the reset and the reset comes before the session's prompt cache would expire. Switching accounts loses the cache. The cap is the routing setting **Longest wait on the same account** (`routing.maxSameAccountWait`: don't wait, 15 minutes by default, or until the cache expires). The cache lifetime is 30 minutes for GPT-5.6 and later and 5 minutes for older models (`ttlForModel` in `packages/core/src/session-cache-activity.ts`). A session waits at most once per user turn.
+- **Per host:**
+  - OpenCode 1 doesn't wait inside the plugin; it returns a 429 with `Retry-After`, and OpenCode's retry goes to the same account.
+  - OpenCode 2 holds the retry through the host's retry hook.
+  - Pi waits in the plugin with a countdown that Escape cancels, and doesn't wait without a screen.
+  - Before a send that follows a wait, every host checks admission, the credential and the ChatGPT identity again.
+- **Persistence:** marks are stored with the pool or the vault roster through common-auth's registry. Loading them is time-boxed, and if tracking can't load, the request is still served with tracking off.
+
+Refusal texts are fixed and carry no account label or number, because OpenCode 1's retry policy matches error text and could retry a local refusal forever.
+
+## Quota
+
+Quota arrives three ways and is normalized into one snapshot shape (`packages/core/src/quota-normalize.ts`):
+
+- **Response headers:** `x-codex-*` on HTTP responses.
+- **WebSocket frames:** `codex.rate_limits`, attributed to the account that opened the socket, never to a shared global.
+- **Polling:** `wham/usage` (`whamUsageFn` in `packages/core/src/provider.ts`), or insula in vault mode.
+
+Readings carry their own time and merge per window by the newer reading. A background poll (`packages/opencode/src/core/background-quota-refresh.ts`) refreshes idle accounts under a cross-process lease, so only one process polls at a time. Unknown quota blocks admission, so every account gets a poll as soon as a process sees it. Workspace credits and the spend-control budget are read with the windows. The request path never waits on quota bookkeeping.
+
+## Cache keep-warm
+
+The Codex backend evicts an unused prompt cache after a while. Keep-warm (off by default; `/openai` → Cache) replays a session's last real request with `store: false` and its output-token caps removed, shortly before the cache would expire. The schedule, caps and backoff are common-auth's `CacheKeepManager`; `packages/opencode/src/core/cachekeep.ts` holds the Codex parts (which headers to replay, body capping, the GPT-5.6 lifetime and subagent policy). OpenCode 2 runs one manager per account store in the process (`v2/cache-keep.ts`). A warm goes only to the account that serves the session now, with a fresh credential, and only if that credential still signs in as the captured ChatGPT account. A successful warm counts as cache activity for the same-account wait. Pi has no keep-warm.
+
+## Commands, sidebar and RPC
+
+`/openai` is the one command on all three hosts (`createOpenAiMenu` in `packages/core/src/commands.ts`): accounts, quota, routing, killswitch floors, cache, diagnostics, vault, reset credits and session pins. It's built on common-auth's shared command menu. Each host adds what only it has: OpenCode its keep-warm, dumps and logging; Pi its own login. Until an install is migrated, `/openai` shows only why.
+
+On OpenCode 1, the server process writes `sidebar-state.json` and the TUI (`packages/opencode/src/tui.tsx`) reads it. The `/openai` dialog travels over a loopback HTTP RPC (`packages/opencode/src/rpc/`) on `127.0.0.1` with a per-process bearer token; port files live under the RPC folder per project. On OpenCode 2, `v2/control-plane.ts` registers the command and `tui/v2.tsx` drains the dialog for the displayed session. The sidebar component is common-auth's shared quota sidebar.
+
+## Runtime folder move
+
+OpenCode 2 watches its config folder, so files the plugin rewrites every few seconds must not live there. `packages/opencode/src/core/runtime-layout.ts` moves the state file, the vault folder and the sessions files to the runtime folder once, at plugin start:
+
+- **One layout per process:** a process fixes its layout for a config folder before it builds the vault, the store or a sessions store, and never switches while it runs, because a live switch would race writes already in flight.
+- **When it may move:** only while no live process could still write the old files (an older version, or one on the legacy layout, read from the heartbeats). A process that can't record its choice in its heartbeat refuses to start.
+- **How:** under the layout lock and every data lock it copies, byte-verifies, writes `layout.json` last, and removes only byte-identical old files. A process with a path override never moves files.
+- **After the move:** an old state or vault file that reappears refuses the start with a fixed message naming both paths. A reappeared sessions file only warns.
+
+## Logging, dumps and redaction
+
+The logger (`packages/core/src/logger.ts`, file set by `packages/opencode/src/logger.ts`) writes to `opencode-openai-auth.log` in the temp folder by default (`OPENCODE_OPENAI_AUTH_LOG_FILE`, `OPENCODE_OPENAI_AUTH_LOG_LEVEL`). It redacts bearer tokens, JWTs, API keys and ChatGPT account ids, and rotates the file at 5 MiB. Request dumps (`packages/opencode/src/dump.ts`, off by default) go to `opencode-openai-auth-dumps` in the temp folder, capped at 512 MiB with the oldest removed first, and are redacted the same way. Error bodies are scrubbed by `packages/core/src/util/credential-redaction.ts` before they reach the host. Transport lifecycle and stream failures log at normal levels whether or not dumps are on.
+
+## Load-bearing invariants
+
+1. **No replay after output.** A request whose output started is never sent again by the plugin, except OpenCode 2's same-account continuation of a cut read. Replaying duplicates shown text and re-runs tools.
+2. **Vault mode is exclusive.** Enrolled or hosted, no local account is used, refreshed, polled, warmed or written, and a request no vault account serves is refused, never sent locally.
+3. **The request path never waits on bookkeeping.** Quota writes, sidebar writes, usage reports and `lastUsed` stamps run after the reply is handed back and never block or fail a request.
+4. **Unknown quota blocks.** Admission never treats a missing reading as headroom.
+5. **One refresh per token family.** OpenAI refresh tokens are single-use, so two refreshes of one token log the account out. Token refreshes take the store's locks, and the pool migration waits behind the version fence so an older version never refreshes a token the pool also refreshes.
+6. **Fixed refusal texts.** Refusals carry no account label, id, number or provider text, because OpenCode 1 retries errors whose text matches its patterns.
+7. **Path rules live in one place.** Only `account-paths.ts` and `store-paths.ts` resolve file locations; store code takes paths as arguments.
+8. **Credentials never cross into logs, dumps, the sidebar, RPC payloads or menus.** Menu payloads project account fields explicitly, and every output path is redacted.
+
+## Failure handling
+
+- **Vault unreachable:** the last good token serves each account until it expires; then the request is refused with a fixed message.
+- **No account can serve:** the last path tries an exhausted account. With none, the request is refused locally; on OpenCode 1 the refusal is a 429 whose `Retry-After` comes from the blocking reset.
+- **Store lock contention:** request-path reads stay lock-free and fall back to the last snapshot; background writes log at warn. A request waits on a lock only to refresh an expired token.
+- **Limits state unreadable:** requests are served with tracking off and a warning logged once.
+- **WebSocket failure:** before output, retried or moved to HTTP; after output, ended with the fixed message (OpenCode 1).
+- **Sidebar, RPC or dump failure:** logged at warn and ignored; a turn never fails for them.
+
+## Further reading
+
+`docs/` has the user documentation: `accounts-and-routing.md`, `vault.md`, `transports.md`, `cache-keep-warm.md`, `commands.md`, `configuration.md`, `opencode-2.md`, `troubleshooting.md`, and `limit-policy-conformance.md` (the per-host limit behaviour ledger). `docs/development.md` and `docs/release.md` cover working on and releasing the plugin. `packages/opencode/src/WEBSOCKET.md` describes the OpenCode 1 WebSocket transport.

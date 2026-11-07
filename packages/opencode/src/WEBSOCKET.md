@@ -24,7 +24,7 @@ Enabled by the CortexKit OpenAI Auth plugin.
 
 - Retry WebSocket stream/setup failures up to 5 times, then use HTTP for that session until the pool entry is idle-pruned.
 - `websocket_connection_limit_reached` switches that session to HTTP fallback immediately.
-- If a WebSocket fails after its first event, fail it as retryable rather than replaying partial output in transport.
+- If a WebSocket fails before any output (text, reasoning or a tool call) was emitted, fail it as retryable so OpenCode sends the request again. Once output was emitted, end the stream with a non-retryable error instead: a retry would duplicate shown text and re-run tools.
 - Abort or cancel closes the socket.
 
 ## Next Steps
