@@ -461,6 +461,28 @@ async function runHost(
   let server: ReturnType<typeof Bun.spawn> | undefined
   let output: Promise<unknown> | undefined
   let url = ''
+  const capture = async (
+    stream: ReadableStream<Uint8Array>,
+    onLine?: (line: string) => void,
+  ) => {
+    const decoder = new TextDecoder()
+    let text = ''
+    let pending = ''
+    for await (const chunk of stream) {
+      const decoded = decoder.decode(chunk, { stream: true })
+      text += decoded
+      pending += decoded
+      let newline = pending.indexOf('\n')
+      while (newline >= 0) {
+        onLine?.(pending.slice(0, newline))
+        pending = pending.slice(newline + 1)
+        newline = pending.indexOf('\n')
+      }
+    }
+    text += decoder.decode()
+    if (pending) onLine?.(pending)
+    return text
+  }
   const stop = async () => {
     if (!server) return
     server.kill('SIGTERM')
@@ -556,7 +578,18 @@ async function runHost(
         fixture.releaseRoster()
       }
       const [stdout, stderr] = await Promise.all([
-        new Response(child.stdout).text(),
+        capture(child.stdout, (line) => {
+          if (turn.reject !== 'cut-after-tool' || !line.startsWith('{')) return
+          const event = JSON.parse(line)
+          if (
+            event.type === 'tool_use' &&
+            event.part?.tool === 'read' &&
+            event.part?.state?.status === 'completed' &&
+            event.part.state.output?.includes('TOOL-SENTINEL')
+          ) {
+            mock.toolCompleted()
+          }
+        }),
         new Response(child.stderr).text(),
         child.exited,
       ])
@@ -575,17 +608,19 @@ async function runHost(
   const read = (path: string) =>
     existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {}
   const state = read(join(runtimeDir, 'openai-auth-state.json'))
+  const pluginLog = existsSync(env.OPENCODE_OPENAI_AUTH_LOG_FILE)
+    ? readFileSync(env.OPENCODE_OPENAI_AUTH_LOG_FILE, 'utf8')
+    : ''
   const diagnostics = JSON.stringify(
     {
       error: error instanceof Error ? error.stack : error,
       results,
       trace,
       wire: mock.records,
-      pluginLog: existsSync(env.OPENCODE_OPENAI_AUTH_LOG_FILE)
-        ? readFileSync(env.OPENCODE_OPENAI_AUTH_LOG_FILE, 'utf8').slice(-12_000)
-        : '',
+      pluginLog: pluginLog.slice(-12_000),
       serverLog: serverLog.join('').slice(-12_000),
       state,
+      cuts: mock.cuts,
     },
     null,
     2,
@@ -599,10 +634,12 @@ async function runHost(
     wire: [...mock.records],
     wireBeforeRoster,
     samples: [...mock.samples],
+    cuts: [...mock.cuts],
     reports: daemon?.reports ?? [],
     pids,
     state,
     limits,
+    pluginLog,
     diagnostics,
     error,
   }

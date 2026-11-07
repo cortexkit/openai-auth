@@ -6,6 +6,7 @@
 // with Codex's usage-limit shapes or a 401. It also answers the quota poll
 // (`/backend-api/wham/usage`) for a plugin pointed at it.
 
+import { createServer } from 'node:net'
 import { chatgptAccessToken } from '../../../../core/src/tests/fixtures/mock-claustrum.ts'
 
 export const MOCK_ACCOUNTS = {
@@ -27,6 +28,8 @@ export type RejectMode =
   | 'failed-before-output'
   | 'failed-after-text'
   | 'failed-after-tool'
+  | 'cut-after-text'
+  | 'cut-after-tool'
   | 'unauthorized'
   | 'stream-error-missing-type'
   | 'stream-error-plain-type'
@@ -191,8 +194,11 @@ export interface MockCodex {
   readonly records: WireRecord[]
   /** Agent-loop requests in full, for reading what the host's driver sends. */
   readonly samples: WireSample[]
+  readonly cuts: Array<{ connection: number; code: number; afterTool: boolean }>
   /** Refuses the next agent-loop request of `account` once. */
   reject(account: MockAccount, mode: RejectMode): void
+  /** Releases a socket cut waiting for the host's completed tool result. */
+  toolCompleted(): void
   stop(): Promise<void>
 }
 
@@ -206,6 +212,7 @@ export function startMockCodex(
 ): MockCodex {
   const records: WireRecord[] = []
   const samples: WireSample[] = []
+  const cuts: MockCodex['cuts'] = []
   const parse = (text: string): unknown => {
     try {
       return JSON.parse(text)
@@ -216,13 +223,19 @@ export function startMockCodex(
   const rejects: Array<{ account: MockAccount; mode: RejectMode }> = []
   let requests = 0
   let connections = 0
+  let cutAfterTool: (() => void) | undefined
+  const terminateCuts: Array<() => void> = []
   const shortLimit = () => ({
     type: 'usage_limit_reached',
     message: 'The usage limit has been reached',
     resets_at:
       ((options.now?.() ?? Date.now()) + (options.resetMs ?? 1000)) / 1000,
   })
-  const failedEvents = (mode: RejectMode, id: string) => {
+  const failedEvents = (
+    mode: RejectMode,
+    id: string,
+    toolArguments = '{"filePath":"sentinel.txt"}',
+  ) => {
     const events: unknown[] = [responseEvents('', id)[0]]
     if (mode === 'failed-after-text')
       events.push(...responseEvents('DO-NOT-REPLAY', id).slice(1, -1))
@@ -232,7 +245,7 @@ export function startMockCodex(
         type: 'function_call',
         call_id: `call_${id}`,
         name: 'read',
-        arguments: '{"filePath":"sentinel.txt"}',
+        arguments: toolArguments,
         status: 'completed',
       }
       events.push(
@@ -470,6 +483,34 @@ export function startMockCodex(
             send(event)
           return
         }
+        if (rejected === 'cut-after-text' || rejected === 'cut-after-tool') {
+          const mode =
+            rejected === 'cut-after-text'
+              ? 'failed-after-text'
+              : 'failed-after-tool'
+          // Omit response.failed: only the transport, not the provider,
+          // ends this attempt after the host has received its output.
+          for (const event of failedEvents(
+            mode,
+            `ws${connection}_${index}`,
+            '{"path":"sentinel.txt"}',
+          ).slice(0, -1))
+            send(event)
+          const cut = () => {
+            const afterTool = rejected === 'cut-after-tool'
+            cuts.push({
+              connection,
+              code: afterTool ? 1006 : 1012,
+              afterTool,
+            })
+            terminateCuts.push(() => socket.terminate())
+            if (afterTool) socket.terminate()
+            else socket.close(1012, 'mock service restart')
+          }
+          if (rejected === 'cut-after-tool') cutAfterTool = cut
+          else setImmediate(cut)
+          return
+        }
         for (const event of responseEvents(
           `MOCK-WS-REPLY-${index}-${identity}`,
           `ws${connection}_${index}`,
@@ -482,11 +523,33 @@ export function startMockCodex(
     url: `http://127.0.0.1:${server.port}`,
     records,
     samples,
+    cuts,
     reject(account, mode) {
       rejects.push({ account, mode })
     },
+    toolCompleted() {
+      const cut = cutAfterTool
+      cutAfterTool = undefined
+      cut?.()
+    },
     async stop() {
-      await server.stop(true)
+      for (const terminate of terminateCuts) terminate()
+      const port = server.port
+      const stopped = server.stop(true)
+      if (cuts.length === 0) {
+        await stopped
+        return
+      }
+      // Bun 1.3.14 leaves stop(true) pending with pendingWebSockets at 1
+      // after a server-side terminate() or close(1012), even with the peer
+      // closed. Force-close those sockets and prove the listening port is free.
+      const probe = createServer()
+      await new Promise<void>((resolve, reject) => {
+        probe.once('error', reject)
+        probe.listen(port, '127.0.0.1', () => {
+          probe.close((error) => (error ? reject(error) : resolve()))
+        })
+      })
     },
   }
 }

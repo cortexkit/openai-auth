@@ -905,6 +905,89 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     })
   }, 240_000)
 
+  for (const mode of ['cut-after-text', 'cut-after-tool'] as const) {
+    test(`websocket: ${mode} continues on the same account without replay`, async () => {
+      const result = await acceptance({
+        transport: 'websocket',
+        turns: [{ reject: mode }],
+      })
+      checkAcceptance(result, () => {
+        expect(
+          result.wire
+            .filter((row) => row.kind === 'primary')
+            .map((row) => row.identity),
+        ).toEqual(['V', 'V'])
+        // The host CLI sets a nonzero exit on session.step.failed even when
+        // continuation succeeds; the final assistant reply is the contract.
+        expect(
+          result.trace.filter((event) => event.event === 'retry'),
+        ).toMatchObject([{ retry: true }])
+        const events = result.results[0]!.stdout.trim()
+          .split('\n')
+          .map((line) => JSON.parse(line))
+        const texts = events.filter((event) => event.type === 'text')
+        const text = texts.map((event) => event.part.text).join('')
+        const finalText = texts.at(-1)!.part
+        expect(finalText.text).toMatch(/^MOCK-WS-REPLY-\d+-V$/)
+        const errors = events.filter((event) => event.type === 'error')
+        expect(errors).toHaveLength(1)
+        expect(errors[0]).toMatchObject({
+          error: { type: 'provider.transport' },
+        })
+        expect(events.indexOf(errors[0])).toBeLessThan(
+          events.indexOf(texts.at(-1)),
+        )
+        const decisions = result.pluginLog
+          .split('\n')
+          .filter((line) => line.includes('opencode2 auth retry decision'))
+        expect(decisions).toHaveLength(1)
+        expect(decisions[0]).toMatch(
+          /INFO.*"reason":"continue-same-account","retry":true/,
+        )
+        expect(result.cuts).toMatchObject([
+          {
+            code: mode === 'cut-after-tool' ? 1006 : 1012,
+            afterTool: mode === 'cut-after-tool',
+          },
+        ])
+        expect(events.at(-1)).toMatchObject({
+          type: 'step_finish',
+          part: { reason: 'stop', messageID: finalText.messageID },
+        })
+        if (mode === 'cut-after-text') {
+          expect(finalText.messageID).not.toBe(texts[0].part.messageID)
+          expect(text.match(/DO-NOT-REPLAY/g)).toHaveLength(1)
+          expect(events.filter((event) => event.type === 'tool_use')).toEqual(
+            [],
+          )
+        } else {
+          expect(finalText.messageID).not.toBe(
+            events.find((event) => event.type === 'tool_use').part.messageID,
+          )
+          expect(
+            events.filter((event) => event.type === 'tool_use'),
+          ).toMatchObject([
+            {
+              part: {
+                tool: 'read',
+                state: {
+                  status: 'completed',
+                  output: expect.stringContaining('TOOL-SENTINEL'),
+                },
+              },
+            },
+          ])
+          expect(
+            events.filter((event) => event.type === 'tool_use'),
+          ).toHaveLength(1)
+          expect(JSON.stringify(result.samples[1]?.body)).toContain(
+            'TOOL-SENTINEL',
+          )
+        }
+      })
+    }, 240_000)
+  }
+
   test('post-output mixed ownership preserves the host decision without plugin rerouting', async () => {
     const result = await acceptance({
       mixed: true,

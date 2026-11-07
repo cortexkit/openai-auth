@@ -21,8 +21,11 @@
 //
 // The installer retries a request refused before any output on another
 // account; `attach` records the refusal before the next choice. After output,
-// only an HTTP read failure observed by the installer's own body reader may
-// continue, with the host's delay and the same still-admitted identity.
+// continuation needs proof of an interrupted read: an HTTP body-reader failure,
+// or inspected WebSocket output without a terminal frame followed by a transport
+// error (the host never writes to the socket after output). Either may continue
+// with the host's delay and the same live ChatGPT account identity, after
+// rechecking routing and quota admission, never after a limit or provider failure.
 //
 // While this host is enrolled with the Claustrum vault (vault mode), the
 // OpenAI accounts the vault serves it are the only accounts routed, through

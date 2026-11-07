@@ -225,7 +225,7 @@ type SetupContext = Pick<
 async function installPoolHooks<Q, A>(
   ctx: SetupContext,
   adapter: OpenCode2AuthAdapter<Q, A, ChooseAccountResult>,
-  log: Pick<OpenAIAdapterLogger, 'warn'>,
+  log: Pick<OpenAIAdapterLogger, 'warn' | 'info'>,
   codex = new CodexHttpState(),
   // Sees every owned request in its final form, with its account attempt.
   // Keep-warm captures agent-loop requests here.
@@ -476,6 +476,7 @@ async function installPoolHooks<Q, A>(
       },
       hostRetryLimit: OPENAI_HOST_RETRY_LIMIT,
       logger: {
+        info: (message, data) => log.info?.(message, { data }),
         warn: (message, data) => log.warn(message, { data }),
       },
     },

@@ -38,6 +38,7 @@ function start(
   files: ReturnType<typeof poolFiles>,
   envLevel?: Level,
   next?: Level,
+  retryProbe = false,
 ) {
   const root = files.dir
   const env = { ...process.env }
@@ -62,6 +63,7 @@ function start(
     OPENCODE_OPENAI_AUTH_MODELS_CACHE: join(root, 'models.json'),
     OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE: join(root, 'sidebar.json'),
     CLAUSTRUM_SUBC_CONNECTION: join(root, 'no-vault.json'),
+    OPENAI_AUTH_TEST_RETRY_PROBE: retryProbe ? '1' : '0',
   })
   if (envLevel) env.OPENCODE_OPENAI_AUTH_LOG_LEVEL = envLevel
   else delete env.OPENCODE_OPENAI_AUTH_LOG_LEVEL
@@ -160,4 +162,40 @@ test('OpenCode 2 log strings retain OpenCode 1 credential and identity redaction
   expect(two.redacted.slice(two.redacted.indexOf('redaction-probe'))).toBe(
     one.redacted.slice(one.redacted.indexOf('redaction-probe')),
   )
+})
+
+test('OpenCode 2 retry decisions reach the info log without account or error data', () => {
+  const files = fixture('info')
+  seedPool(files, 'main-first', [
+    {
+      id: 'private-account',
+      identity: 'private-chatgpt-identity',
+      access: 'private-token',
+    },
+  ])
+  const config = JSON.parse(readFileSync(files.configPath, 'utf8'))
+  config.logging = { level: 'info' }
+  writeFileSync(files.configPath, JSON.stringify(config))
+  const result = start('2', files, undefined, undefined, true)
+  expect(result.retryDecision).toBeString()
+  expect(result.retryDecision).toContain('INFO')
+  expect(result.retryDecision).toContain('opencode2 auth retry decision')
+  const data = JSON.parse(
+    result.retryDecision.slice(result.retryDecision.indexOf('{')),
+  ).data
+  expect(data).toEqual({
+    sessionID: 'retry-log-session',
+    transport: 'ws',
+    attempt: 1,
+    reason: 'continue-same-account',
+    retry: true,
+  })
+  for (const secret of [
+    'private-account',
+    'private-chatgpt-identity',
+    'private@example.test',
+    'private-token',
+    'private-error',
+  ])
+    expect(result.retryDecision).not.toContain(secret)
 })

@@ -1,6 +1,10 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { CommandApplyRequest } from '@cortexkit/common-auth/commands'
+import {
+  placeholderCredential,
+  placeholderSecret,
+} from '@cortexkit/common-auth/opencode2'
 import { loadAccounts } from '@cortexkit/openai-auth-core/internal'
 import type { PluginInput } from '@opencode-ai/plugin'
 import { createOpenCodeMenu, type OpenCodeMenuContext } from '../../commands'
@@ -8,9 +12,10 @@ import { openAccountPool } from '../../core/pool-accounts'
 import { OpenAIAuthPlugin } from '../../index'
 import { createLogger, flushForTest, getLogFile } from '../../logger'
 import { opencode1HostSlot } from '../../v2/host-slot'
+import { POOL_BROWSER_METHOD } from '../../v2/login'
 import { createControlPlaneMenu } from '../../v2/menu'
 import { setupOpenAIAuth } from '../../v2/setup'
-import { fakeOpenCode2Host, poolFiles } from './opencode2-host'
+import { fakeOpenCode2Host, poolFiles, scope } from './opencode2-host'
 
 const [version, root, next] = process.argv.slice(2)
 if (!root) throw new Error('missing logging fixture directory')
@@ -22,10 +27,22 @@ const offline: typeof fetch = Object.assign(
   { preconnect() {} },
 ) as typeof fetch
 globalThis.fetch = offline
+const retryProbe = process.env.OPENAI_AUTH_TEST_RETRY_PROBE === '1'
+const host = fakeOpenCode2Host({
+  ...(retryProbe
+    ? {
+        activeCredential: placeholderCredential({
+          integrationID: 'openai',
+          methodID: POOL_BROWSER_METHOD,
+          now: Date.now(),
+        }),
+      }
+    : {}),
+})
 
 let cleanup: (() => unknown) | undefined
 if (version === '2') {
-  cleanup = await setupOpenAIAuth(fakeOpenCode2Host().ctx, {
+  cleanup = await setupOpenAIAuth(host.ctx, {
     paths: files.paths,
     sidebarStateFile: join(root, 'sidebar.json'),
     slot: opencode1HostSlot(join(root, 'auth.json')),
@@ -120,8 +137,37 @@ await flushForTest()
 const redacted = readFileSync(getLogFile(), 'utf8')
   .split('\n')
   .find((line) => line.includes('redaction-probe'))
+let retryDecision: string | undefined
+if (retryProbe) {
+  await host.fire('experimental.ws.handshake', {
+    ...scope('retry-log-session'),
+    url: 'wss://api.openai.com/v1/responses',
+    headers: { authorization: `Bearer ${placeholderSecret('openai')}` },
+  })
+  await host.fire('experimental.ws.receive', {
+    ...scope('retry-log-session'),
+    frame: JSON.stringify({
+      type: 'response.output_text.delta',
+      delta: 'hello',
+    }),
+  })
+  await host.fire('retry', {
+    ...scope('retry-log-session'),
+    attempt: 1,
+    error: {
+      type: 'provider.transport',
+      message:
+        'private-account private@example.test private-token private-error',
+    },
+    decision: { retry: true, delay: 1234 },
+  })
+  await flushForTest()
+  retryDecision = readFileSync(getLogFile(), 'utf8')
+    .split('\n')
+    .find((line) => line.includes('opencode2 auth retry decision'))
+}
 await cleanup?.()
-console.log(JSON.stringify({ startup, applied, redacted }))
+console.log(JSON.stringify({ startup, applied, redacted, retryDecision }))
 // OpenCode 1 owns background services for its host's lifetime; this child is
 // the host, and exiting is the restart boundary the parent test exercises.
 process.exit(0)
