@@ -4,7 +4,7 @@ This repository uses CortexKit's tag-driven release workflow. One version number
 
 ## Shared-auth adoption
 
-The plugins now use `@cortexkit/common-auth` 0.39.0. That is the dependency version, not the version to pass to the plugin release script below. Users continue to install through the setup command; no separate common-auth installation or credential migration is required.
+The plugins now use `@cortexkit/common-auth` 0.39.1. That is the dependency version, not the version to pass to the plugin release script below. Users continue to install through the setup command; no separate common-auth installation or credential migration is required.
 
 Release notes should call out these user-visible changes:
 
