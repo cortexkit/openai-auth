@@ -72,6 +72,15 @@ counts() {
   [[ "$passed" -gt 0 && "$failed" -eq 0 ]]
 }
 
+# Bun prints a failed test's error just before its "(fail)" line, and the
+# end-of-run summary repeats only the names. The suite log is deleted when the
+# gate exits, so print the 40 lines ending at each failure line first.
+failure_errors() {
+  awk '/^ *[0-9]+ tests? failed:$/ { exit }
+    { kept[NR % 40] = $0 }
+    /^\(fail\)/ { for (i = NR - 39; i <= NR; i++) if (i > 0) print kept[i % 40]; print "----" }' "$1"
+}
+
 step=toolchain
 if [[ -z "$fast" ]]; then
   [[ "$(uname -s)" == Linux && "$(node -p 'process.versions.node.split(".")[0]')" == 24 ]] || {
@@ -146,6 +155,7 @@ collect() {
     wait "${pids[$i]}" || status=$?
     counts "${names[$i]}" "$logs/${names[$i]}.log" || status=1
     if [[ $status -ne 0 ]]; then
+      failure_errors "$logs/${names[$i]}.log"
       tail -n 80 "$logs/${names[$i]}.log"
       if [[ -z "$failed" ]]; then failed=${names[$i]}; fi
     fi
