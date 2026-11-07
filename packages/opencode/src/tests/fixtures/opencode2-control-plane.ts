@@ -27,13 +27,21 @@ export async function controlPlaneProbe(input: {
     }),
   )
   const record = `import { appendFileSync } from 'node:fs'
-const record = (event, data = {}) => appendFileSync(${JSON.stringify(trace)}, JSON.stringify({ event, ...data }) + '\\n')`
+const record = (event, data = {}) => appendFileSync(${JSON.stringify(trace)}, JSON.stringify({ event, at: Date.now(), ...data }) + '\\n')`
   writeFileSync(
     join(plugin, 'server.js'),
     `import { createOpenAIAuthPlugin } from '@cortexkit/opencode-openai-auth/server'
+import { readFileSync } from 'node:fs'
 ${record}
 export default { id: 'openai-control-plane-probe', async setup(ctx) {
   record('server', { location: ctx.location })
+  // Hold only the setup caused by editing the probe, not initial activation.
+  // This exposes the interval where the TUI is mounted but commands are absent.
+  const delay = Number(process.env.OPENAI_AUTH_E2E_RESETUP_DELAY_MS ?? 0)
+  if (delay && readFileSync(${JSON.stringify(trace)}, 'utf8').includes('"event":"force-host-resetup"')) {
+    record('server-delay', { directory: ctx.location.directory, delay })
+    await new Promise(resolve => setTimeout(resolve, delay))
+  }
   const menu = { command: 'openai', title: 'OpenAI P0 connection', sections: [{
     id: 'connection', slot: 'extra', title: 'Connection', lines: [], items: [],
     actions: [{ id: 'apply', label: 'Check connection', knobs: [] }],
@@ -153,7 +161,12 @@ const sequence = async () => { try {
     }
   }
   await countBoth('both-set-up')
-  const readyCount = () => readFileSync(${JSON.stringify(trace)}, 'utf8').split('\\n').filter(line => line.includes('"event":"server-ready"')).length
+  const readyCount = (directory) => readFileSync(${JSON.stringify(trace)}, 'utf8').split('\\n').filter(line => {
+    try {
+      const entry = JSON.parse(line)
+      return entry.event === 'server-ready' && (!directory || entry.directory === directory)
+    } catch { return false }
+  }).length
   const previousReady = readyCount()
   await (await ctx()).client.location.reload()
   // Location reload returns before asynchronous plugin setup. Listing each
@@ -178,12 +191,23 @@ const sequence = async () => { try {
     // the current setup's cleanup and calls setup again on a new context, as
     // it sometimes does by itself after a location reload.
     const setups = probe.setups
+    const previousReady = readyCount(c.location.directory)
     record('force-host-resetup', { setups })
     appendFileSync(${JSON.stringify(join(plugin, 'tui.js'))}, '\\n// edited by the probe so the host reloads this plugin\\n')
     await new Promise(resolve => {
       const check = () => probe.setups > setups && probe.current ? resolve() : setTimeout(check, 50)
       check()
     })
+    // Editing tui.js also reloads the server plugin. A live TUI context does
+    // not mean its location's commands have been registered again. Activate
+    // the location, then wait for its new setup-complete event before phase 4.
+    await (await ctx()).client.command.list({ location: { directory: c.location.directory } })
+    await new Promise(resolve => {
+      const check = () => { if (readyCount(c.location.directory) > previousReady) { watcher.close(); resolve() } }
+      const watcher = watch(${JSON.stringify(trace)}, check)
+      check()
+    })
+    record('host-resetup-ready', { directory: c.location.directory })
   }
   await invoke(c)
   // A host dispose just before this point leaves no live mount until the

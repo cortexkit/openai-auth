@@ -393,6 +393,49 @@ function wrapperSource(input: Input): string {
   ].join('\n')
 }
 
+export async function waitForHostReady(
+  url: string,
+  host: 1 | 2,
+  options: {
+    authorization?: string
+    checkRunning?: () => void
+    timeoutMs?: number
+    requestTimeoutMs?: number
+    pollIntervalMs?: number
+  } = {},
+) {
+  const deadline = Date.now() + (options.timeoutMs ?? 180_000)
+  let last = 'no response'
+  while (Date.now() < deadline) {
+    options.checkRunning?.()
+    try {
+      // OpenCode 2 reports startup readiness on /api/info, without enumerating
+      // providers or hydrating the plugin before the first turn. /health is
+      // only a web app fallback on OpenCode 1, so preserve its socket check.
+      const response = await fetch(
+        `${url}${host === 2 ? '/api/info' : '/health'}`,
+        {
+          headers: options.authorization
+            ? { authorization: options.authorization }
+            : undefined,
+          signal: AbortSignal.timeout(options.requestTimeoutMs ?? 500),
+        },
+      )
+      await response.body?.cancel()
+      if (host === 1 || response.status === 200) return
+      if (response.status !== 503)
+        throw new Error(`host readiness answered ${response.status}`)
+      last = 'service starting'
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('host readiness'))
+        throw error
+      last = error instanceof Error ? error.message : String(error)
+    }
+    await Bun.sleep(options.pollIntervalMs ?? 50)
+  }
+  throw new Error(`host at ${url} did not become ready (${last})`)
+}
+
 async function runHost(
   input: Input,
   fixture: {
@@ -453,23 +496,16 @@ async function runHost(
       new Response(child.stdout).text(),
       new Response(child.stderr).text(),
     ]).then((parts) => serverLog.push(...parts))
-    const deadline = Date.now() + 180_000
-    while (true) {
-      if (child.exitCode !== null)
-        throw new Error(`host exited before listening: ${serverLog.join('')}`)
-      try {
-        // A listening socket is enough: provider enumeration would hydrate the
-        // plugin before the first turn and hide first-request readiness bugs.
-        const response = await fetch(`${url}/health`, {
-          signal: AbortSignal.timeout(500),
-        })
-        await response.body?.cancel()
-        break
-      } catch {
-        if (Date.now() > deadline) throw new Error('host never listened')
-        await Bun.sleep(50)
-      }
-    }
+    await waitForHostReady(url, input.host, {
+      authorization:
+        input.host === 2
+          ? `Basic ${btoa(`opencode:${env.OPENCODE_SERVER_PASSWORD}`)}`
+          : undefined,
+      checkRunning: () => {
+        if (child.exitCode !== null)
+          throw new Error(`host exited before listening: ${serverLog.join('')}`)
+      },
+    })
   }
   let error: unknown
   try {

@@ -34,6 +34,7 @@ import { hostBinary, runtimeStateDir } from './fixtures/opencode-host'
 import {
   POLICY_NOW,
   runLimitAcceptance,
+  waitForHostReady,
 } from './fixtures/opencode-limit-acceptance'
 import { controlPlaneProbe } from './fixtures/opencode2-control-plane'
 import {
@@ -190,30 +191,16 @@ function seedPool(
 // the authenticated `/api/info` reports readiness: 200 ready, 503 still
 // starting or stopping, 500 failed (@opencode/cli 2.0.22, server process).
 async function waitForServer(url: string, child: Bun.Subprocess) {
-  const deadline = Date.now() + 60_000
-  const authorization = `Basic ${btoa(`opencode:${PASSWORD}`)}`
-  let last = 'no response'
-  while (Date.now() < deadline) {
-    if (child.exitCode !== null)
-      throw new Error(`host exited early with ${child.exitCode}`)
-    try {
-      const response = await fetch(`${url}/api/info`, {
-        headers: { authorization },
-        signal: AbortSignal.timeout(1000),
-      })
-      await response.body?.cancel()
-      if (response.status === 200) return
-      if (response.status !== 503)
-        throw new Error(`host readiness answered ${response.status}`)
-      last = 'service starting'
-    } catch (error) {
-      if (error instanceof Error && error.message.startsWith('host readiness'))
-        throw error
-      last = error instanceof Error ? error.message : String(error)
-    }
-    await Bun.sleep(250)
-  }
-  throw new Error(`host at ${url} did not become ready (${last})`)
+  await waitForHostReady(url, 2, {
+    authorization: `Basic ${btoa(`opencode:${PASSWORD}`)}`,
+    checkRunning: () => {
+      if (child.exitCode !== null)
+        throw new Error(`host exited early with ${child.exitCode}`)
+    },
+    timeoutMs: 60_000,
+    requestTimeoutMs: 1000,
+    pollIntervalMs: 250,
+  })
 }
 
 async function collect(
@@ -682,6 +669,56 @@ function expectOnlyPoolAccountsOnWire(result: ScenarioResult) {
   }
 }
 
+describe('limit host readiness', () => {
+  test('OpenCode 2 waits through startup 503s until authenticated /api/info is ready', async () => {
+    const requests: { path: string; authorization: string | null }[] = []
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch(request) {
+        requests.push({
+          path: new URL(request.url).pathname,
+          authorization: request.headers.get('authorization'),
+        })
+        return new Response('info', {
+          status: requests.length <= 3 ? 503 : 200,
+        })
+      },
+    })
+    try {
+      await waitForHostReady(server.url.origin, 2, {
+        authorization: 'Basic unit-test',
+      })
+      expect(requests).toEqual(
+        Array.from({ length: 4 }, () => ({
+          path: '/api/info',
+          authorization: 'Basic unit-test',
+        })),
+      )
+    } finally {
+      await server.stop(true)
+    }
+  })
+
+  test('OpenCode 1 keeps its listening-socket readiness behavior', async () => {
+    let requests = 0
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch() {
+        requests++
+        return new Response('not a health endpoint', { status: 404 })
+      },
+    })
+    try {
+      await waitForHostReady(server.url.origin, 1)
+      expect(requests).toBe(1)
+    } finally {
+      await server.stop(true)
+    }
+  })
+})
+
 describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
   const acceptance = (
     options: Omit<
@@ -1042,9 +1079,14 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       cli,
       consumer: packedConsumer,
       root,
-      env,
+      env: {
+        ...env,
+        ...(hostResetup ? { OPENAI_AUTH_E2E_RESETUP_DELAY_MS: '2500' } : {}),
+      },
       hostResetup,
     })
+    if (process.env.OPENAI_AUTH_OPENCODE2_E2E_VERBOSE === '1')
+      console.error(result.trace)
     expect(result.trace).toContain('"server"')
     expect(result.trace).not.toContain('"failure"')
     expect(result.trace).toContain('"event":"done"')
@@ -1159,6 +1201,12 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         .some((row) => row.event === 'tick' && row.generation > 1),
     ).toBe(true)
     if (hostResetup) {
+      const ready = rows('host-resetup-ready')[0]
+      expect(ready).toBeDefined()
+      expect(
+        rows('server-delay').some((row) => row.directory === ready.directory),
+      ).toBe(true)
+      expect(ready.at).toBeLessThanOrEqual(rows('commands').at(-1)?.at)
       expect(setups).toBeGreaterThanOrEqual(2)
       expect(rows('host-dispose').length).toBeGreaterThanOrEqual(1)
     }
