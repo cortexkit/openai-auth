@@ -38,7 +38,7 @@
     "prepublishOnly": "bun run build"
   },
   "devDependencies": {
-    "@cortexkit/common-auth": "^0.41.1",
+    "@cortexkit/common-auth": "^0.42.0",
     "@cortexkit/openai-auth-core": "workspace:*"
   },
   "dependencies": {
