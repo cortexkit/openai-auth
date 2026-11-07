@@ -289,6 +289,9 @@ export interface OpenAIAdapter {
       OpenAIAttemptData
     >,
   ): void
+  /** A user prompt starts a new turn; retries and auxiliary requests do not. */
+  beginTurn(sessionId: string): void
+  dispose(): void
   /** Drops a session's pin and remembered account. */
   forgetSession(sessionId: string): void
   /**
@@ -519,6 +522,13 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         : source.peek().rows.find((row) => row.id === accountId)?.quota,
     )
   const effort = new MidConversationEffort(deps.codex)
+  // The installer passes a hold's reset checkpoint only to the next request,
+  // not to a later refusal. Keep the consumed wait until a new user prompt.
+  const heldTurns = new Map<string, string>()
+  const clearTurn = (sessionId: string) => {
+    for (const [key, session] of heldTurns)
+      if (session === sessionId) heldTurns.delete(key)
+  }
   // Vault receipts authorized while choosing an account, kept until the
   // installer's `accountHeaders` call for the same session, request kind and
   // account consumes them. A kept retry choice may wait until a later attempt.
@@ -845,6 +855,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     const byId = new Map(targets.map((target) => [target.id, target]))
     let routing = routingInput(targets, storage, at)
     const setting = storage?.routing?.maxSameAccountWait
+    const turnKey = JSON.stringify([input.sessionID, input.kind])
+    // Auxiliary requests belong to the same user turn and share its wait budget.
+    const alreadyHeld = [...heldTurns.values()].includes(input.sessionID)
     const activity = limits?.activity.get(input.sessionID)
     const activityKey =
       activity && limits?.accountKey(activity.accountKey.accountId)
@@ -995,7 +1008,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         maxDelayMs: MAX_RETRY_HOLD_MS,
       })
       const ordinary = decideOpenAiLimit({ ...facts, hold }, { mode: 'sticky' })
-      if (ordinary?.action === 'hold')
+      if (ordinary?.action === 'hold' && !alreadyHeld) {
+        heldTurns.set(turnKey, input.sessionID)
         return {
           hold: {
             delayMs: ordinary.delayMs,
@@ -1004,6 +1018,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             kind: 'hold',
           },
         }
+      }
       // This check must precede the chooser's temporary all-marked escape.
       // A single account always keeps the host's original delayed retry.
       const others = targets.filter((target) => target.id !== previousId)
@@ -1021,6 +1036,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           )
         })
       if (terminal) {
+        if (alreadyHeld) return { hostRetry: 'veto' }
         const decision = decideOpenAiTerminal(facts, terminalFacts())
         if (readMaxSameAccountWait(setting) === 0) return { hostRetry: 'veto' }
         const delayMs =
@@ -1038,7 +1054,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         if (
           decision.action === 'hold' &&
           sameAccount(decision.account, previous.account)
-        )
+        ) {
+          heldTurns.set(turnKey, input.sessionID)
           return {
             hold: {
               delayMs,
@@ -1047,6 +1064,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
               kind: 'terminal',
             },
           }
+        }
+        heldTurns.set(turnKey, input.sessionID)
         return { waitThenReselect: { delayMs } }
       }
     }
@@ -1935,6 +1954,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
 
   return {
     adapter,
+    beginTurn: clearTurn,
+    dispose: () => heldTurns.clear(),
     attach(installation) {
       installation.on('quota', (event) =>
         recordQuota(event.accountId, event.quota, event.handle),
@@ -1952,6 +1973,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       })
     },
     forgetSession(sessionId) {
+      clearTurn(sessionId)
       for (const [key, entry] of requestHandoffs) {
         if (entry.sessionID === sessionId) dropRequestHandoff(key)
       }

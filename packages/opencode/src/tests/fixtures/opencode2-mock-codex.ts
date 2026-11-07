@@ -23,6 +23,10 @@ export type Identity = MockAccount | 'none'
 /** How the next agent-loop request of an account is refused. */
 export type RejectMode =
   | 'usage-limit'
+  | 'short-limit'
+  | 'failed-before-output'
+  | 'failed-after-text'
+  | 'failed-after-tool'
   | 'unauthorized'
   | 'stream-error-missing-type'
   | 'stream-error-plain-type'
@@ -192,7 +196,14 @@ export interface MockCodex {
   stop(): Promise<void>
 }
 
-export function startMockCodex(forbidden: readonly string[]): MockCodex {
+export function startMockCodex(
+  forbidden: readonly string[],
+  options: {
+    now?: () => number
+    resetMs?: number
+    used?: Partial<Record<MockAccount, number>>
+  } = {},
+): MockCodex {
   const records: WireRecord[] = []
   const samples: WireSample[] = []
   const parse = (text: string): unknown => {
@@ -205,6 +216,56 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
   const rejects: Array<{ account: MockAccount; mode: RejectMode }> = []
   let requests = 0
   let connections = 0
+  const shortLimit = () => ({
+    type: 'usage_limit_reached',
+    message: 'The usage limit has been reached',
+    resets_at:
+      ((options.now?.() ?? Date.now()) + (options.resetMs ?? 1000)) / 1000,
+  })
+  const failedEvents = (mode: RejectMode, id: string) => {
+    const events: unknown[] = [responseEvents('', id)[0]]
+    if (mode === 'failed-after-text')
+      events.push(...responseEvents('DO-NOT-REPLAY', id).slice(1, -1))
+    if (mode === 'failed-after-tool') {
+      const item = {
+        id: `fc_${id}`,
+        type: 'function_call',
+        call_id: `call_${id}`,
+        name: 'read',
+        arguments: '{"filePath":"sentinel.txt"}',
+        status: 'completed',
+      }
+      events.push(
+        {
+          type: 'response.output_item.added',
+          output_index: 0,
+          item: { ...item, arguments: '', status: 'in_progress' },
+        },
+        {
+          type: 'response.function_call_arguments.delta',
+          item_id: item.id,
+          output_index: 0,
+          delta: item.arguments,
+        },
+        {
+          type: 'response.function_call_arguments.done',
+          item_id: item.id,
+          output_index: 0,
+          arguments: item.arguments,
+        },
+        { type: 'response.output_item.done', output_index: 0, item },
+      )
+    }
+    events.push({
+      type: 'response.failed',
+      response: {
+        id,
+        status: 'failed',
+        error: { ...shortLimit(), code: 'usage_limit_reached' },
+      },
+    })
+    return events
+  }
   const carriesForbidden = (headers: Headers) =>
     [...headers.values()].some((value) =>
       forbidden.some((secret) => value.includes(secret)),
@@ -265,7 +326,12 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
         return Response.json({
           rate_limit: {
             primary_window: {
-              used_percent: account.used,
+              used_percent:
+                options.used?.[
+                  Object.entries(MOCK_ACCOUNTS).find(
+                    ([, entry]) => entry === account,
+                  )?.[0] as MockAccount
+                ] ?? account.used,
               limit_window_seconds: 18_000,
               reset_at: Math.floor(Date.now() / 1000) + 7200,
             },
@@ -302,9 +368,9 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
         forbiddenSeen,
         ...(rejected ? { rejected } : {}),
       })
-      if (rejected === 'usage-limit') {
+      if (rejected === 'usage-limit' || rejected === 'short-limit') {
         return Response.json(
-          { error: USAGE_LIMIT },
+          { error: rejected === 'short-limit' ? shortLimit() : USAGE_LIMIT },
           { status: 429, headers: quotaHeaders(identity) },
         )
       }
@@ -319,6 +385,10 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
           { status: 401 },
         )
       }
+      if (rejected?.startsWith('failed-'))
+        return new Response(toSSE(failedEvents(rejected, `r${index}`)), {
+          headers: { 'content-type': 'text/event-stream' },
+        })
       if (rejected?.startsWith('stream-error-')) {
         const token = request.headers
           .get('authorization')
@@ -364,14 +434,19 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
     websocket: {
       message(socket, message) {
         const { connection, identity, accountHeader, headers } = socket.data
-        samples.push({ transport: 'ws', headers, body: parse(String(message)) })
+        const body = parse(String(message))
+        samples.push({ transport: 'ws', headers, body })
+        // OpenCode 1 prewarms a socket without generating output. A prewarm
+        // must not consume a refusal queued for an owned generation attempt.
+        const prewarm =
+          (body as { generate?: boolean } | null)?.generate === false
         const index = ++requests
-        const rejected = takeReject(identity)
+        const rejected = prewarm ? undefined : takeReject(identity)
         records.push({
           transport: 'ws',
           action: 'frame',
           connection,
-          kind: 'primary',
+          kind: prewarm ? 'other' : 'primary',
           identity,
           accountHeader,
           forbiddenSeen: false,
@@ -379,8 +454,20 @@ export function startMockCodex(forbidden: readonly string[]): MockCodex {
         })
         const send = (event: unknown) => socket.send(JSON.stringify(event))
         send(quotaFrame(identity))
-        if (rejected === 'usage-limit') {
-          send({ type: 'error', status: 429, error: USAGE_LIMIT })
+        if (rejected === 'usage-limit' || rejected === 'short-limit') {
+          send({
+            type: 'error',
+            status: 429,
+            error: rejected === 'short-limit' ? shortLimit() : USAGE_LIMIT,
+          })
+          return
+        }
+        if (rejected?.startsWith('failed-')) {
+          for (const event of failedEvents(
+            rejected,
+            `ws${connection}_${index}`,
+          ))
+            send(event)
           return
         }
         for (const event of responseEvents(

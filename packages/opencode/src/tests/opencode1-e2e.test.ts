@@ -45,6 +45,7 @@ import {
   POOL_PLACEHOLDER,
 } from '../core/pool-migration'
 import { hostBinary, runtimeStateDir } from './fixtures/opencode-host'
+import { runLimitAcceptance } from './fixtures/opencode-limit-acceptance'
 import {
   MOCK_ACCOUNTS,
   type MockCodex,
@@ -594,6 +595,144 @@ function verify(result: ScenarioResult, assertions: () => void) {
 }
 
 describe.skipIf(!ENABLED)('openai-auth on OpenCode 1 (real host)', () => {
+  const acceptance = (
+    options: Omit<
+      Parameters<typeof runLimitAcceptance>[0],
+      'host' | 'binary' | 'plugin' | 'wrapperRoot'
+    >,
+  ) =>
+    runLimitAcceptance({
+      host: 1,
+      binary,
+      plugin: pathToFileURL(BUILT_PLUGIN).href,
+      wrapperRoot: scratch,
+      ...options,
+    })
+  const checkAcceptance = (
+    result: Awaited<ReturnType<typeof acceptance>>,
+    assertions: () => void,
+  ) => {
+    try {
+      expect(result.error).toBeUndefined()
+      assertions()
+    } catch (error) {
+      throw new Error(`${String(error)}\n${result.diagnostics}`)
+    }
+  }
+
+  for (const vault of [false, true]) {
+    test(`first owned ${vault ? 'delayed vault' : 'local pool'} request reaches the sentinel without warm-up`, async () => {
+      const result = await acceptance({
+        vault,
+        delayedRoster: vault,
+        turns: [{}],
+      })
+      checkAcceptance(result, () => {
+        expect(result.pids).toHaveLength(1)
+        expect(result.results[0]?.stdout).toContain('MOCK-HTTP-REPLY')
+        const primary = result.wire.filter((row) => row.kind === 'primary')
+        expect(primary).toHaveLength(1)
+        expect(primary[0]).toMatchObject({
+          identity: 'V',
+          accountHeader: MOCK_ACCOUNTS.V.id,
+          forbiddenSeen: false,
+        })
+        expect(result.samples[0]?.headers.authorization).toBe(
+          `Bearer ${MOCK_ACCOUNTS.V.token}`,
+        )
+        expect(result.wireBeforeRoster).toEqual([])
+      })
+    }, 240_000)
+  }
+
+  test('a pre-output A limit routes to B without replaying output', async () => {
+    const result = await acceptance({
+      setting: 0,
+      turns: [{ reject: 'usage-limit' }],
+    })
+    checkAcceptance(result, () => {
+      expect(
+        result.wire
+          .filter((row) => row.kind === 'primary')
+          .map((row) => row.identity),
+      ).toEqual(['V', 'B'])
+      expect(result.results[0]?.stdout).toContain('-B')
+      expect(result.results[0]?.stdout).not.toContain('-V')
+    })
+  }, 240_000)
+
+  test('a short confirmed hold wakes on A rather than sending B', async () => {
+    const result = await acceptance({ turns: [{}, { reject: 'short-limit' }] })
+    checkAcceptance(result, () => {
+      expect(
+        result.wire
+          .filter((row) => row.kind === 'primary')
+          .map((row) => row.identity),
+      ).toEqual(['V', 'V', 'V'])
+      expect(
+        result.trace.filter((event) => event.status === 429),
+      ).toMatchObject([{ retryAfter: '1' }])
+      expect(result.results[1]?.stdout).toContain('MOCK-HTTP-REPLY')
+    })
+  }, 240_000)
+
+  test('setting zero makes exhausted alternatives terminal without a retry timer', async () => {
+    const result = await acceptance({
+      setting: 0,
+      allExhausted: true,
+      turns: [{}],
+    })
+    checkAcceptance(result, () => {
+      expect(result.wire.filter((row) => row.kind === 'primary')).toEqual([])
+      expect(
+        result.trace.filter((event) => event.kind === 'primary'),
+      ).toMatchObject([{ status: 412, retryAfter: null }])
+      expect(result.results[0]?.stdout).not.toContain('MOCK-HTTP-REPLY')
+    })
+  }, 240_000)
+
+  test('WebSocket limit marks survive a host restart', async () => {
+    const result = await acceptance({
+      setting: 0,
+      transport: 'websocket',
+      turns: [{ reject: 'usage-limit' }, { restart: true }],
+    })
+    checkAcceptance(result, () => {
+      expect(new Set(result.pids).size).toBe(2)
+      expect(
+        result.wire
+          .filter((row) => row.kind === 'primary')
+          .map((row) => row.identity),
+      ).toEqual(['V', 'B', 'B'])
+      expect(result.limits?.marks.length).toBeGreaterThan(0)
+    })
+  }, 240_000)
+
+  for (const mode of ['failed-after-text', 'failed-after-tool'] as const) {
+    test(`${mode} does not replay output or duplicate completed tools`, async () => {
+      const result = await acceptance({
+        transport: 'websocket',
+        setting: 0,
+        turns: [{ reject: mode }],
+      })
+      checkAcceptance(result, () => {
+        const rejected = result.wire.filter(
+          (row) => row.kind === 'primary' && row.rejected,
+        )
+        expect(rejected).toHaveLength(1)
+        expect(
+          result.wire.filter(
+            (row) => row.kind === 'primary' && row.identity === 'B',
+          ),
+        ).toEqual([])
+        const output = result.results[0]?.stdout ?? ''
+        if (mode === 'failed-after-text')
+          expect(output.match(/DO-NOT-REPLAY/g)).toHaveLength(1)
+        else expect(output.match(/"type":"tool_use"/g)).toHaveLength(1)
+      })
+    }, 240_000)
+  }
+
   for (const model of ['gpt-6.1-terra', 'gpt-6.1-sol']) {
     for (const webSockets of [false, true]) {
       for (const variants of [['low', 'xhigh'], ['xhigh']]) {

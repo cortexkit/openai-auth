@@ -796,6 +796,9 @@ export async function setupOpenAIAuth(
     (sessionID) => cacheKeep.forget(sessionID),
   )
   openai.attach(installation)
+  const turns = await ctx.session.hook('prompt', (draft) => {
+    openai.beginTurn(draft.sessionID)
+  })
 
   /** Waits for a migration run when the install has not migrated yet. */
   const ensureMigrated = async (login: PoolLoginResult) => {
@@ -933,6 +936,7 @@ export async function setupOpenAIAuth(
   return async () => {
     closing = true
     abort.abort()
+    openai.dispose()
     // Drop this location's hold first, so no warm reads the pool source or
     // vault released below. The last hold stops the manager at once; its
     // warm in flight is joined within the shutdown limit below.
@@ -943,6 +947,7 @@ export async function setupOpenAIAuth(
     await sidebar.release()
     await Promise.allSettled([
       installation.dispose(),
+      turns.dispose(),
       methods.dispose(),
       models.dispose(),
     ])

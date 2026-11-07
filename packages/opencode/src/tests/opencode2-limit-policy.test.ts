@@ -258,6 +258,7 @@ describe('OpenCode 2 shared limit policy', () => {
           ? { hostRetry: 'veto' }
           : { waitThenReselect: { delayMs: 300_000 } },
       )
+      f.openai.beginTurn('ses_1')
       expect(await f.retry(undefined, { hostAttempt: 10 })).toEqual({
         hostRetry: setting === 0 ? 'veto' : 'leave',
       })
@@ -289,6 +290,7 @@ describe('OpenCode 2 shared limit policy', () => {
       waitThenReselect: { delayMs: 60_000 },
     })
     f.mark('b', 180_000)
+    f.openai.beginTurn('ses_1')
     expect(await f.retry(120_000)).toEqual({
       hold: {
         delayMs: 120_000,
@@ -536,31 +538,102 @@ describe('OpenCode 2 shared limit policy', () => {
       const retry = {
         sessionID: 'ses_1',
         model: scope().model,
-        attempt: 1,
+        attempt: 2,
         error: { type: 'api', message: 'usage limit', status: 429 },
         decision: { retry: true, delay: 1234 },
       }
       await host.fire('retry', retry)
       expect(retry.decision).toEqual({ retry: true, delay: 60_000 })
       f.tick(60_000)
-      await host.fire('http.request', {
+      const wake = {
         ...scope(),
         request: new Request('http://codex.test/responses'),
-      })
+      }
+      await host.fire('http.request', wake)
       expect(choices.map((choice) => choice.phase)).toEqual([
         'request',
         'retry',
         'request',
       ])
       expect(choices.at(-1)).toMatchObject({
-        hostAttempt: 1,
+        hostAttempt: 2,
         wake: { target: T0 + 60_000, kind: 'hold' },
       })
       expect(choices.filter((choice) => choice.phase === 'retry')).toHaveLength(
         1,
       )
+      await host.fire('http.response', {
+        ...scope(),
+        request: wake.request,
+        response: Response.json(
+          { error: { type: 'usage_limit_reached', resets_in_seconds: 60 } },
+          { status: 429 },
+        ),
+      })
+      const secondRetry = {
+        ...retry,
+        attempt: 3,
+        decision: { retry: true, delay: 1234 },
+      }
+      await host.fire('retry', secondRetry)
+      expect(secondRetry.decision).toEqual({ retry: true, delay: 0 })
+      const rerouted = {
+        ...scope(),
+        request: new Request('http://codex.test/responses'),
+      }
+      await host.fire('http.request', rerouted)
+      expect(rerouted.request.headers.get('authorization')).toBe(
+        'Bearer b-token',
+      )
     } finally {
       await installation.dispose()
     }
   })
+
+  test('a new user turn may hold after the previous turn consumed its wait', async () => {
+    const f = fixture()
+    f.cache()
+    expect(await f.retry(60_000)).toMatchObject({ hold: { delayMs: 60_000 } })
+    f.tick(60_000)
+    expect(await f.retry(120_000, { hostAttempt: 3 })).toBe('b')
+    f.openai.beginTurn('ses_1')
+    expect(await f.retry(120_000, { hostAttempt: 2 })).toMatchObject({
+      hold: { delayMs: 60_000 },
+    })
+    f.openai.dispose()
+  })
+
+  test('a different account cannot hold after the turn has already waited', async () => {
+    const f = fixture()
+    f.cache()
+    expect(await f.retry(60_000)).toMatchObject({ hold: { delayMs: 60_000 } })
+    f.tick(60_000)
+    f.limits.activity.recordAccepted({
+      sessionId: 'ses_1',
+      accountKey: f.accountKey('b'),
+      currentAccountKey: f.accountKey('b'),
+      lastAcceptedAt: T0 + 60_000,
+      ttlMs: 300_000,
+    })
+    expect(
+      await f.retry(120_000, {
+        hostAttempt: 3,
+        previousAccountId: 'b',
+        rerouteFrom: { accountId: 'b', limit: f.signal(120_000) },
+      }),
+    ).toBe('a')
+    f.openai.forgetSession('ses_1')
+    f.openai.dispose()
+  })
+
+  test.each(['title', 'compaction'] as const)(
+    'a %s request cannot hold after the primary request already waited',
+    async (kind) => {
+      const f = fixture()
+      f.cache()
+      expect(await f.retry(60_000)).toMatchObject({ hold: { delayMs: 60_000 } })
+      expect(await f.retry(60_000, { kind, hostAttempt: 3 })).toBe('b')
+      f.openai.dispose()
+    },
+  )
 })

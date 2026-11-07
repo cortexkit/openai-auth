@@ -31,6 +31,10 @@ import {
 import { POOL_PLACEHOLDER } from '../core/pool-migration'
 import { CODEX_USER_AGENT, CODEX_VERSION } from '../index'
 import { hostBinary, runtimeStateDir } from './fixtures/opencode-host'
+import {
+  POLICY_NOW,
+  runLimitAcceptance,
+} from './fixtures/opencode-limit-acceptance'
 import { controlPlaneProbe } from './fixtures/opencode2-control-plane'
 import {
   MOCK_ACCOUNTS,
@@ -679,6 +683,223 @@ function expectOnlyPoolAccountsOnWire(result: ScenarioResult) {
 }
 
 describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
+  const acceptance = (
+    options: Omit<
+      Parameters<typeof runLimitAcceptance>[0],
+      'host' | 'binary' | 'plugin' | 'wrapperRoot'
+    >,
+  ) =>
+    runLimitAcceptance({
+      host: 2,
+      binary: cli,
+      plugin: `${PACKAGE_NAME}/server`,
+      wrapperRoot: packedConsumer,
+      ...options,
+    })
+  const checkAcceptance = (
+    result: Awaited<ReturnType<typeof acceptance>>,
+    assertions: () => void,
+  ) => {
+    try {
+      expect(result.error).toBeUndefined()
+      assertions()
+    } catch (error) {
+      throw new Error(`${String(error)}\n${result.diagnostics}`)
+    }
+  }
+
+  for (const vault of [false, true]) {
+    test(`first owned ${vault ? 'delayed vault' : 'local pool'} request reaches the sentinel without warm-up`, async () => {
+      const result = await acceptance({
+        vault,
+        delayedRoster: vault,
+        turns: [{}],
+      })
+      checkAcceptance(result, () => {
+        expect(result.pids).toHaveLength(1)
+        expect(result.results[0]?.stdout).toContain('MOCK-HTTP-REPLY')
+        expect(
+          result.wire.filter((row) => row.kind === 'primary'),
+        ).toMatchObject([
+          {
+            identity: 'V',
+            accountHeader: MOCK_ACCOUNTS.V.id,
+            forbiddenSeen: false,
+          },
+        ])
+        expect(result.wire.filter((row) => row.identity === 'none')).toEqual([])
+        expect(result.samples[0]?.headers.authorization).toBe(
+          `Bearer ${MOCK_ACCOUNTS.V.token}`,
+        )
+        expect(result.wireBeforeRoster).toEqual([])
+      })
+    }, 240_000)
+  }
+
+  for (const transport of ['http', 'websocket'] as const) {
+    test(`${transport} records limit feedback before the zero-delay choice of B`, async () => {
+      const result = await acceptance({
+        transport,
+        setting: 0,
+        turns: [{ reject: 'usage-limit' }],
+      })
+      checkAcceptance(result, () => {
+        expect(
+          result.wire
+            .filter((row) => row.kind === 'primary')
+            .map((row) => row.identity),
+        ).toEqual(['V', 'B'])
+        expect(
+          result.trace.filter((event) => event.event === 'retry'),
+        ).toMatchObject([{ retry: true, delay: 0 }])
+        expect(result.limits?.marks.length).toBeGreaterThan(0)
+        expect(result.results[0]?.stdout).toContain('-B')
+      })
+    }, 240_000)
+
+    test(`${transport} short explicit hold wakes on A once and does not chain`, async () => {
+      const result = await acceptance({
+        transport,
+        turns: [{}, { reject: 'short-limit', rejectAgain: 'short-limit' }],
+      })
+      checkAcceptance(result, () => {
+        const primary = result.wire
+          .filter((row) => row.kind === 'primary')
+          .map((row) => row.identity)
+        expect(primary).toEqual(['V', 'V', 'V', 'B'])
+        const retries = result.trace.filter((event) => event.event === 'retry')
+        expect(retries.map((event) => event.delay)).toEqual([1000, 0])
+        expect(retries.map((event) => event.now)).toEqual([
+          POLICY_NOW,
+          POLICY_NOW + 1000,
+        ])
+        expect(result.results[1]?.stdout).toContain('-B')
+      })
+    }, 240_000)
+  }
+
+  test('setting zero vetoes final retry with no provider resend', async () => {
+    const result = await acceptance({
+      setting: 0,
+      blockedAlternative: true,
+      turns: [{ reject: 'short-limit' }],
+    })
+    checkAcceptance(result, () => {
+      expect(
+        result.wire
+          .filter((row) => row.kind === 'primary')
+          .map((row) => row.identity),
+      ).toEqual(['V'])
+      expect(
+        result.trace.filter((event) => event.event === 'retry'),
+      ).toMatchObject([{ retry: false }])
+    })
+  }, 240_000)
+
+  test('a new user prompt restores the same-account hold allowance', async () => {
+    const result = await acceptance({
+      turns: [{}, { reject: 'short-limit' }, { reject: 'short-limit' }],
+    })
+    checkAcceptance(result, () => {
+      expect(
+        result.wire
+          .filter((row) => row.kind === 'primary')
+          .map((row) => row.identity),
+      ).toEqual(['V', 'V', 'V', 'V', 'V'])
+      expect(
+        result.trace
+          .filter((event) => event.event === 'retry')
+          .map((event) => event.delay),
+      ).toEqual([1000, 1000])
+      expect(
+        result.results.every((turn) => turn.stdout.includes('MOCK-HTTP-REPLY')),
+      ).toBe(true)
+    })
+  }, 240_000)
+
+  test('live marks steer a new location and survive a host restart', async () => {
+    const result = await acceptance({
+      setting: 0,
+      turns: [
+        { reject: 'usage-limit' },
+        { otherLocation: true },
+        { restart: true },
+      ],
+    })
+    checkAcceptance(result, () => {
+      expect(new Set(result.pids).size).toBe(2)
+      expect(
+        result.wire
+          .filter((row) => row.kind === 'primary')
+          .map((row) => row.identity),
+      ).toEqual(['V', 'B', 'B', 'B'])
+      expect(result.limits?.marks.length).toBeGreaterThan(0)
+    })
+  }, 240_000)
+
+  test('pre-output failure reroutes but post-output text is not replayed', async () => {
+    const before = await acceptance({
+      transport: 'websocket',
+      setting: 0,
+      turns: [{ reject: 'failed-before-output' }],
+    })
+    checkAcceptance(before, () => {
+      expect(
+        before.wire
+          .filter((row) => row.kind === 'primary')
+          .map((row) => row.identity),
+      ).toEqual(['V', 'B'])
+    })
+    const after = await acceptance({
+      transport: 'websocket',
+      setting: 0,
+      turns: [{ reject: 'failed-after-text' }],
+    })
+    checkAcceptance(after, () => {
+      expect(
+        after.wire
+          .filter((row) => row.kind === 'primary')
+          .map((row) => row.identity),
+      ).toEqual(['V'])
+      expect(after.results[0]?.stdout.match(/DO-NOT-REPLAY/g)).toHaveLength(1)
+      expect(
+        after.trace.filter((event) => event.event === 'retry'),
+      ).toMatchObject([{ retry: false }])
+    })
+  }, 240_000)
+
+  test('post-output mixed ownership preserves the host decision without plugin rerouting', async () => {
+    const result = await acceptance({
+      mixed: true,
+      turns: [{ reject: 'failed-after-text' }],
+    })
+    checkAcceptance(result, () => {
+      expect(
+        result.wire
+          .filter((row) => row.kind === 'primary')
+          .map((row) => row.identity),
+      ).toEqual(['V', 'V'])
+      expect(
+        result.wire.some(
+          (row) =>
+            row.kind === 'other' &&
+            row.identity === 'none' &&
+            !row.forbiddenSeen,
+        ),
+      ).toBe(true)
+      const host = result.trace.find((event) => event.event === 'host-retry')
+      const final = result.trace.find((event) => event.event === 'retry')
+      expect(host).toBeDefined()
+      expect(final).toMatchObject({
+        retry: host?.retry,
+        ...(host?.retry ? { delay: host.delay } : {}),
+      })
+      expect(
+        result.trace.some((event) => event.event === 'foreign-title'),
+      ).toBe(true)
+      expect(result.results[0]?.stdout.match(/DO-NOT-REPLAY/g)).toHaveLength(1)
+    })
+  }, 240_000)
   beforeAll(async () => {
     scratch = mkdtempSync(join(tmpdir(), 'oai-oc2-cli-'))
     cli = hostBinary(2)
