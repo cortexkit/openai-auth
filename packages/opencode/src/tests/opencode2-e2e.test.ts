@@ -294,6 +294,8 @@ async function runScenario(input: {
   model?: string
   /** Serve account V from a mock Claustrum vault this host is enrolled in. */
   vault?: boolean
+  /** Use the host relay instead of a plugin enrollment. */
+  hostedVault?: boolean
   /**
    * Seed an old vault registry and command locations without abort controllers,
    * then edit the live entry to load the current server code.
@@ -338,17 +340,19 @@ async function runScenario(input: {
       },
     })
     env.OPENAI_AUTH_E2E_CLAUSTRUM = daemon.connectionFile
+    if (input.hostedVault) env.CORTEXKIT_VAULT_HOST = 'thalamus'
     // An approved enrollment, as Connect in `opencode auth login` leaves it.
     const paths = vaultPaths(
       vaultStateDir(join(configDir, 'openai-auth-state.json')),
       'opencode',
     )
     mkdirSync(join(paths.tokenPath, '..'), { recursive: true, mode: 0o700 })
-    writeFileSync(
-      paths.tokenPath,
-      JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
-      { mode: 0o600 },
-    )
+    if (!input.hostedVault)
+      writeFileSync(
+        paths.tokenPath,
+        JSON.stringify({ token: '01'.repeat(32), token_generation: 1 }),
+        { mode: 0o600 },
+      )
     writeFileSync(join(configDir, OLD_SESSIONS), OLD_SESSIONS_TEXT, {
       mode: 0o600,
     })
@@ -1124,6 +1128,14 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       join(vaultPlugin, 'index.js'),
       [
         `import { createOpenAIAuthPlugin } from '${PACKAGE_NAME}/server'`,
+        `import { ClaustrumClient } from '@cortexkit/claustrum-client'`,
+        `if (process.env.CORTEXKIT_VAULT_HOST === 'thalamus') {`,
+        `  const relay = await ClaustrumClient.connect({ connectionFile: process.env.OPENAI_AUTH_E2E_CLAUSTRUM })`,
+        `  globalThis[Symbol.for('cortexkit.vault')] = (pluginId) => {`,
+        `    if (pluginId !== 'openai-auth') throw new Error('wrong relay plugin identity')`,
+        `    return relay`,
+        `  }`,
+        `}`,
         'const mock = process.env.OPENAI_AUTH_E2E_MOCK_URL',
         'export default createOpenAIAuthPlugin({',
         '  fetch: (input, init) => fetch(',
@@ -1132,7 +1144,10 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         '    init,',
         '  ),',
         '  vault: {',
-        '    connectionFile: () => process.env.OPENAI_AUTH_E2E_CLAUSTRUM,',
+        '    connectionFile: () => {',
+        "      if (process.env.CORTEXKIT_VAULT_HOST === 'thalamus') throw new Error('native connection used while hosted')",
+        '      return process.env.OPENAI_AUTH_E2E_CLAUSTRUM',
+        '    },',
         '    pollIntervalMs: 0,',
         '  },',
         '})',
@@ -1673,6 +1688,27 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
           (item) => item.type === 'configuration_update',
         ),
       ).toEqual([EFFORT_UPDATE_HIGH])
+    })
+  }, 180_000)
+
+  test('http: hosted relay serves one vault turn without an enrollment token', async () => {
+    const result = await runScenario({
+      transport: 'http',
+      accounts: ['A'],
+      mode: 'fallback-first',
+      plugin: vaultPlugin,
+      vault: true,
+      hostedVault: true,
+      turns: [{}],
+    })
+    verify(result, () => {
+      expect(result.exits).toEqual([0])
+      expectOnlyPoolAccountsOnWire(result)
+      expect(pick(primaries(result.wire), 'identity', 'rejected')).toEqual([
+        'V:',
+      ])
+      expect(result.stdout[0]).toContain('-V')
+      expect(result.runtime.moved[OLD_VAULT_TOKEN]).toBeNull()
     })
   }, 180_000)
 

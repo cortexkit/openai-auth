@@ -2,8 +2,10 @@ import { resolve } from 'node:path'
 import { resolveClaustrumConnectionPath } from '@cortexkit/claustrum-client'
 import {
   type AccountPaths,
+  isVaultHosted,
   OpenAiVault,
   type OpenAiVaultOptions,
+  VAULT_PLUGIN_NAME,
 } from '@cortexkit/openai-auth-core/internal'
 import { createLogger } from '../logger'
 import { removeMovedVaultStateLeftover } from './runtime-layout'
@@ -61,10 +63,13 @@ export function acquireOpenCodeVault(
 ) {
   const isolated = Boolean(options.connectScoped || options.connectEnrollment)
   const stateDir = resolve(options.stateDir)
-  const connectionFile = resolve(
-    (options.connectionFile ?? resolveClaustrumConnectionPath)(),
-  )
+  // Hosted processes need no native connection file. Keep their consumers
+  // separate from native ones, with the plugin identity in the registry key.
+  const connectionFile = isVaultHosted()
+    ? 'host'
+    : resolve((options.connectionFile ?? resolveClaustrumConnectionPath)())
   const key = JSON.stringify([
+    VAULT_PLUGIN_NAME,
     options.host,
     stateDir,
     connectionFile,
@@ -92,7 +97,10 @@ export function acquireOpenCodeVault(
     const vault = new OpenAiVault({
       ...options,
       stateDir,
-      connectionFile: () => connectionFile,
+      connectionFile: () =>
+        connectionFile === 'host'
+          ? (options.connectionFile ?? resolveClaustrumConnectionPath)()
+          : connectionFile,
       // ClaustrumClient uses projectRoot only as identity.project_root metadata; scoped authorization uses the enrollment token.
       ...(!isolated ? { projectRoot: stateDir } : {}),
       // Every holder of this entry reads the same pool store (the store paths

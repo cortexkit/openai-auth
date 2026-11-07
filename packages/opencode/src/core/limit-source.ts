@@ -77,7 +77,8 @@ export class OpenCodeLimitSource {
     if (this.disposed || performance.now() >= deadline) return undefined
     // Enrollment can change while discovery runs. Never acquire a local store
     // on the vault path, even if discovery returns no usable routes.
-    if ((await this.options.vault.authority()) !== 'vault') return undefined
+    const authority = await this.options.vault.authority()
+    if (authority !== 'vault' && authority !== 'host') return undefined
     if (this.disposed || performance.now() >= deadline) return undefined
     if (
       !this.options.vault.snapshot() ||

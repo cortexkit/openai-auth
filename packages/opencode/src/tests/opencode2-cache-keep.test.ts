@@ -73,7 +73,7 @@ function fakeLocation() {
   const warnings: string[] = []
   const warningData: unknown[] = []
   const state = {
-    authority: 'local' as 'local' | 'vault' | 'unreadable',
+    authority: 'local' as 'host' | 'local' | 'vault' | 'unreadable',
     owned: new Set<string>(),
     rows: new Map<string, { token: string; identity?: string }>(),
     receiptIdentity: new Map<string, string>(),
@@ -793,28 +793,29 @@ describe('OpenCode 2 keep-warm credentials', () => {
     expect(lease.manager.status().tracked).toBe(0)
   })
 
-  test('after enrolling, a local capture sends nothing and backs off; a vault capture warms with a fresh receipt each time', async () => {
-    const fake = served()
-    const { lease, clock } = acquire(fake.location)
-    await lease.capture(captured('ses'))
-    fake.state.authority = 'vault'
-    fake.state.owned.add('V')
-    fake.state.receiptIdentity.set('V', 'chatgpt-V')
-    await advance(lease, clock, 4 * MINUTE)
-    expect(fake.sent).toHaveLength(0)
-    expect(fake.state.accessReads).toBe(0)
-    expect(lease.manager.status().targets[0]!.failures).toBe(1)
+  for (const authority of ['vault', 'host'] as const)
+    test(`after ${authority} authority, a local capture sends nothing and backs off; a vault capture warms with a fresh receipt each time`, async () => {
+      const fake = served()
+      const { lease, clock } = acquire(fake.location)
+      await lease.capture(captured('ses'))
+      fake.state.authority = authority
+      fake.state.owned.add('V')
+      fake.state.receiptIdentity.set('V', 'chatgpt-V')
+      await advance(lease, clock, 4 * MINUTE)
+      expect(fake.sent).toHaveLength(0)
+      expect(fake.state.accessReads).toBe(0)
+      expect(lease.manager.status().targets[0]!.failures).toBe(1)
 
-    fake.state.accounts.set('ses', 'V')
-    await lease.capture(captured('ses', { accountId: 'V', mode: 'vault' }))
-    await advance(lease, clock, 4 * MINUTE)
-    await advance(lease, clock, 4 * MINUTE)
-    expect(fake.sent.map((s) => s.headers.get('authorization'))).toEqual([
-      'Bearer receipt-token-1',
-      'Bearer receipt-token-2',
-    ])
-    expect(fake.state.accessReads).toBe(0)
-  })
+      fake.state.accounts.set('ses', 'V')
+      await lease.capture(captured('ses', { accountId: 'V', mode: 'vault' }))
+      await advance(lease, clock, 4 * MINUTE)
+      await advance(lease, clock, 4 * MINUTE)
+      expect(fake.sent.map((s) => s.headers.get('authorization'))).toEqual([
+        'Bearer receipt-token-1',
+        'Bearer receipt-token-2',
+      ])
+      expect(fake.state.accessReads).toBe(0)
+    })
 
   test('a local capture is never warmed with a vault receipt, even for a vault route with the same id', async () => {
     const fake = served()

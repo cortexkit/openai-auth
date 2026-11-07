@@ -154,6 +154,7 @@ export function createPiMenu(
         ...vaultMenu,
         build: async (invocation) => {
           const view = await vaultMenu.build(invocation)
+          if ((await pool.readAuthority()) === 'host') return view
           const disconnect = {
             id: 'disconnect',
             label: 'Disconnect',

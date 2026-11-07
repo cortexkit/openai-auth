@@ -15,7 +15,11 @@ import {
   runAccountMenu,
   runMenu,
 } from '@cortexkit/common-auth/auth-menu'
-import { enrollmentAuthority } from '@cortexkit/common-auth/claustrum'
+import {
+  VAULT_HOST_CONNECT_REFUSAL,
+  VAULT_HOST_STATUS,
+  vaultAuthority,
+} from '@cortexkit/common-auth/claustrum'
 import type { PoolRow, PoolStore } from '@cortexkit/common-auth/store'
 import {
   type MigrationBlocker,
@@ -30,6 +34,7 @@ import {
   extractAccountId,
   flowCleanup,
   generatePKCE,
+  isVaultHosted,
   loadAccounts,
   mutateAccounts,
   type OpenAiVault,
@@ -395,6 +400,8 @@ export function createAuthMethods({
     pollQuota,
     doctor: doctorChecks(true),
     status: async () => {
+      if (vault && (await vault.authority()) === 'host')
+        return [VAULT_HOST_STATUS]
       const enrollment = await vault?.status()
       if (vault && (await vault.authority()) !== 'local' && enrollment)
         return [
@@ -414,7 +421,9 @@ export function createAuthMethods({
           : []),
       ]
     },
-    ...(vault ? { extraActions: [connectVaultAction(vault)] } : {}),
+    ...(vault && !isVaultHosted()
+      ? { extraActions: [connectVaultAction(vault)] }
+      : {}),
   })
 
   /**
@@ -434,6 +443,10 @@ export function createAuthMethods({
       hint: 'serve OpenAI accounts held in the vault',
       run: async (context) => {
         const mode = await target.authority()
+        if (mode === 'host') {
+          context.print(VAULT_HOST_CONNECT_REFUSAL)
+          return
+        }
         if (disconnect) {
           if (mode !== 'local') await target.disconnect()
           context.print('Disconnected from the Claustrum vault.')
@@ -553,10 +566,8 @@ export function createAuthMethods({
               instructions: VAULT_LOGIN_INSTRUCTIONS,
               method: 'auto',
               callback: async () => {
-                if (
-                  (await enrollmentAuthority(vault.paths, vault.name)) !==
-                  'vault'
-                )
+                const authority = await vaultAuthority(vault.paths, vault.name)
+                if (authority !== 'vault' && authority !== 'host')
                   return { type: 'failed' }
                 // The host client cannot read logins. Inspect the disk record
                 // without filtering invalid entries or treating read errors as

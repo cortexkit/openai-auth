@@ -8,6 +8,7 @@
 // reported to the vault, the declined-account interlock, the vault-mode
 // sidebar, and what an install still holds from the removed handle-mode
 // custody.
+
 import { afterEach, beforeEach, describe, expect, spyOn } from 'bun:test'
 import {
   chmodSync,
@@ -26,9 +27,12 @@ import {
   type ClaustrumScopedAttempt,
   connectClaustrumScopedClient,
   readClaustrumEnrollmentToken,
+  VAULT_HOST_CONNECT_REFUSAL,
+  VAULT_HOST_STATUS,
 } from '@cortexkit/common-auth/claustrum'
 import { type QuotaMap, quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore } from '@cortexkit/common-auth/store'
+import { vaultSection } from '@cortexkit/openai-auth-core'
 import {
   loadAccounts,
   mutateAccounts,
@@ -38,6 +42,7 @@ import {
   vaultPaths,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks } from '@opencode-ai/plugin'
+import { installVaultRelay } from '../../../core/src/tests/fixtures/host-vault.ts'
 import {
   chatgptAccessToken,
   type MockCredential,
@@ -131,6 +136,7 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
+  delete process.env.CORTEXKIT_VAULT_HOST
   restoreLocalStoreReads?.()
   restoreLocalStoreReads = undefined
   await scope.teardown(async () => {
@@ -202,6 +208,90 @@ async function plugin(
 }
 
 describe('OpenCode 1 vault stream admission', () => {
+  test('host relay serves the loader, reports reply usage and keeps native enrollment dormant', async () => {
+    const running = await startDaemon({
+      'chatgpt:openai': vaultLogin('chatgpt-vault'),
+      'chatgpt:openai:work': vaultLogin('chatgpt-work'),
+    })
+    running.insula = { reply: { result: [insulaReading('chatgpt-vault')] } }
+    const relay = await installVaultRelay(running.connectionFile)
+    seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+    // A token path that cannot be read as a file exposes accidental enrollment reads.
+    mkdirSync(vaultPaths(stateDir, 'opencode').tokenPath, { recursive: true })
+    const native = spyOn(
+      {
+        connect: async () => {
+          throw new Error('native connector used')
+        },
+      },
+      'connect',
+    )
+    const wire = installWire()
+    const network = globalThis.fetch
+    globalThis.fetch = (async (input, init) => {
+      const response = await network(input, init)
+      if (String(input).includes('/responses'))
+        response.headers.set('x-codex-primary-used-percent', '12')
+      return response
+    }) as typeof fetch
+    try {
+      hooks = await loadPlugin({
+        vault: { stateDir, pollIntervalMs: 0, connectScoped: native },
+      })
+      const vault = __menuContextForTest()!.vault!
+      await vault.refresh()
+      await vault.pollStale(0)
+      const response = await request(await fetchOverride(), 'hosted')
+      expect(response.status).toBe(200)
+      expect(wire.sends).toEqual([`Bearer ${VAULT_ACCESS}`])
+      await waitFor(() => relay.usage[0], 'host relay usage report')
+      expect(relay.usage[0]!.reading.provider).toBe('codex')
+      expect(relay.pluginIds).toEqual(['openai-auth'])
+      expect(running.insulaReads).toBeGreaterThan(0)
+      expect(native).not.toHaveBeenCalled()
+      expect(wire.refreshTokens).toEqual([])
+      const section = await vaultSection({ vault }).build({
+        notify() {},
+      } as never)
+      expect(section.lines).toContain(VAULT_HOST_STATUS)
+      expect(section.actions).toEqual([])
+      await expect(vault.connectStep()).rejects.toThrow(
+        VAULT_HOST_CONNECT_REFUSAL,
+      )
+      expect(running.proposals).toEqual([])
+      const ids = vault.routes().map((route) => route.id)
+      expect(ids).toHaveLength(2)
+      await vault.reorder([...ids].reverse())
+      expect(vault.routes().map((route) => route.id)).toEqual(
+        [...ids].reverse(),
+      )
+      await vault.decline(ids[1]!)
+      expect(vault.routes().map((route) => route.id)).toEqual([ids[0]!])
+      await vault.accept(ids[1]!)
+      expect(vault.routes().map((route) => route.id)).toContain(ids[1]!)
+    } finally {
+      await hooks?.dispose?.()
+      hooks = undefined
+      await relay.close()
+    }
+  })
+
+  test('host without a relay refuses the loader and never polls, warms or refreshes local accounts', async () => {
+    await startDaemon()
+    seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
+    process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+    const wire = installWire()
+    const { vault } = await plugin()
+    await vault.pollStale(0)
+    const response = await request(await fetchOverride(), 'host-missing')
+    expect(await response.text()).toContain(
+      VAULT_MODE_REFUSALS['vault-unreachable'],
+    )
+    expect(wire.sends).toEqual([])
+    expect(wire.polls).toEqual([])
+    expect(wire.refreshTokens).toEqual([])
+  })
+
   test('the first owned vault request reaches the sentinel with the served bearer without manual roster warm-up', async () => {
     const clock = spyOn(Date, 'now').mockReturnValue(1_800_000_000_000)
     try {
@@ -1522,6 +1612,25 @@ describe('enrollment', () => {
 })
 
 describe('auth account menu with vault accounts', () => {
+  test('hosted auth login menu shows the shared status without Connect or Disconnect', async () => {
+    await startDaemon()
+    seedPool(files, [{ id: 'main' }])
+    process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+    const vault = new OpenAiVault({
+      host: 'opencode',
+      stateDir,
+      pollIntervalMs: 0,
+    })
+    try {
+      const output = await menu(['\u001b'], vault)
+      expect(output).toContain(VAULT_HOST_STATUS)
+      expect(output).not.toContain('Connect to the Claustrum vault')
+      expect(output).not.toContain('Disconnect from the Claustrum vault')
+    } finally {
+      await vault.dispose()
+    }
+  })
+
   test('reset preview spend and retry refuse shadowed live and expired local credentials without refreshing or sending', async () => {
     await startDaemon({
       'oauth:openai:main': vaultLogin('chatgpt-main'),

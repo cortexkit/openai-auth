@@ -277,7 +277,8 @@ function createEntry(
       // receipt. Undefined is the vault's own "refused before sending".
       send: async (routeId, dispatch, options) => {
         const location = need()
-        if ((await location.vault.authority()) !== 'vault') return undefined
+        const authority = await location.vault.authority()
+        if (authority !== 'vault' && authority !== 'host') return undefined
         return location.vault.send(routeId, dispatch, options)
       },
     },

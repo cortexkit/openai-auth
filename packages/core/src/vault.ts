@@ -39,16 +39,17 @@ import {
   type ClaustrumWatchState,
   connectClaustrumEnrollmentClient,
   connectClaustrumScopedClient,
-  enrollmentAuthority,
   enrollmentName,
   hostEnrollmentPaths,
   type KeptReceiptState,
   type QuotaReceipt,
   readClaustrumEnrollmentStatus,
   readVaultRoster,
+  VAULT_HOST_CONNECT_REFUSAL,
   type VaultGrantReach,
   type VaultRosterFile,
   type VaultRosterRow,
+  vaultAuthority,
 } from '@cortexkit/common-auth/claustrum'
 import { CommandError } from '@cortexkit/common-auth/commands'
 import { projectQuota, type QuotaMap } from '@cortexkit/common-auth/quota'
@@ -82,6 +83,15 @@ type VaultQuotaSourceReason =
 
 /** The plugin part of each host's enrollment name (`openai-auth-opencode`, `openai-auth-pi`). */
 export const VAULT_PLUGIN_NAME = 'openai-auth'
+
+/**
+ * Only Thalamus's exact spawn marker selects hosted custody. common-auth
+ * 0.40.0 defines the same check in hasVaultHost but omits that helper from its
+ * public /claustrum exports. Replace this with hasVaultHost when exported.
+ */
+export function isVaultHosted(): boolean {
+  return process.env.CORTEXKIT_VAULT_HOST === 'thalamus'
+}
 
 /**
  * Which vault credentials are OpenAI's: OAuth logins refreshed by the vault's
@@ -320,7 +330,7 @@ export class OpenAiVault {
   #closed = false
   /** Settles once this instance's first roster discovery has, either way. */
   readonly #firstRoster = Promise.withResolvers<void>()
-  #authority: 'vault' | 'local' | 'unreadable' | 'unknown' = 'unknown'
+  #authority: 'host' | 'vault' | 'local' | 'unreadable' | 'unknown' = 'unknown'
   #authorityKey: string | undefined
 
   constructor(options: OpenAiVaultOptions) {
@@ -332,6 +342,7 @@ export class OpenAiVault {
       rosterPath: this.paths.rosterPath,
       tokenPath: this.paths.tokenPath,
       family: VAULT_FAMILY,
+      pluginId: VAULT_PLUGIN_NAME,
       connect: () => this.#connectScoped(),
       // Unknown or unreadable enrollment must never enable local credentials.
       isCustodyActive: () => this.#custodyActive(),
@@ -420,6 +431,7 @@ export class OpenAiVault {
   }
 
   #enrollmentKey(): string {
+    if (isVaultHosted()) return 'host'
     return [this.paths.tokenPath, this.paths.statePath]
       .map((path) => {
         try {
@@ -432,10 +444,10 @@ export class OpenAiVault {
       .join('|')
   }
 
-  /** Read enrollment files before a request, menu action or background pass, using common-auth's mode rules. */
-  async authority(): Promise<'vault' | 'local' | 'unreadable'> {
+  /** Read authority before a request, menu action or background pass, including changes to the host marker. */
+  async authority(): Promise<'host' | 'vault' | 'local' | 'unreadable'> {
     const key = this.#enrollmentKey()
-    const mode = await enrollmentAuthority(this.paths, this.name)
+    const mode = await vaultAuthority(this.paths, this.name)
     if (key === this.#enrollmentKey()) {
       this.#authority = mode
       this.#authorityKey = key
@@ -452,6 +464,7 @@ export class OpenAiVault {
    */
   enrolled(): boolean {
     return (
+      isVaultHosted() ||
       this.#authorityKey !== this.#enrollmentKey() ||
       this.#authority !== 'local'
     )
@@ -524,12 +537,13 @@ export class OpenAiVault {
    */
   async awaitRequestRoster(): Promise<void> {
     if (this.snapshot()) return
-    if ((await this.authority()) !== 'vault') return
+    if (!['vault', 'host'].includes(await this.authority())) return
 
     const inFlight = this.#discovery
     if (inFlight) await inFlight.catch(() => undefined)
 
-    if (this.snapshot() || (await this.authority()) !== 'vault') return
+    if (this.snapshot() || !['vault', 'host'].includes(await this.authority()))
+      return
 
     const discovery = this.#discovery ?? this.#discover()
     await discovery.catch((error: unknown) => {
@@ -945,7 +959,8 @@ export class OpenAiVault {
 
   /** Reorders this host's vault roster without touching its local accounts. */
   async reorder(routeIds: readonly string[]) {
-    if ((await this.authority()) !== 'vault')
+    const authority = await this.authority()
+    if (authority !== 'vault' && authority !== 'host')
       throw new Error('Vault order can only be changed in vault mode.')
     return this.#consumer.reorder(routeIds)
   }
@@ -962,10 +977,13 @@ export class OpenAiVault {
   }
 
   async status(): Promise<VaultStatus> {
-    await this.authority()
+    const authority = await this.authority()
     let enrollment: ClaustrumEnrollmentStatus
     try {
-      enrollment = await readClaustrumEnrollmentStatus(this.paths, this.name)
+      enrollment =
+        authority === 'host'
+          ? { state: 'idle' }
+          : await readClaustrumEnrollmentStatus(this.paths, this.name)
     } catch (error) {
       this.#fail('vault enrollment state unreadable', error)
       enrollment = {
@@ -994,6 +1012,8 @@ export class OpenAiVault {
    * so Connect always starts a usable request.
    */
   async connectStep(): Promise<ClaustrumEnrollmentStatus> {
+    if ((await this.authority()) === 'host')
+      throw new CommandError('vault-host', VAULT_HOST_CONNECT_REFUSAL)
     const client = await this.#connectEnrollment().catch((error: unknown) => {
       // A CommandError, so the `/openai` menu's Connect shows this message
       // (the menu shows a generic line for any other thrown error).
@@ -1062,6 +1082,8 @@ export class OpenAiVault {
    * it there.
    */
   async disconnect(): Promise<void> {
+    if ((await this.authority()) === 'host')
+      throw new CommandError('vault-host', VAULT_HOST_CONNECT_REFUSAL)
     await rm(this.paths.tokenPath, { force: true })
     await rm(this.paths.statePath, { force: true })
     await this.#options.afterDisconnect?.()

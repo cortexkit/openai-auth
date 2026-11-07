@@ -124,7 +124,7 @@ export interface PoolResetDepsOptions {
   /** Read the request path's existing marks without acquiring a registry for a menu. */
   rateLimitMarks: () => ReadonlyMap<string, number>
   /** The enrollment read; no local account is polled while it is not `local`. */
-  authority?: () => Promise<'vault' | 'local' | 'unreadable'>
+  authority?: () => Promise<'host' | 'vault' | 'local' | 'unreadable'>
 }
 
 export type PoolResetDeps = Pick<

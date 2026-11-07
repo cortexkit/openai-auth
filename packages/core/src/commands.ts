@@ -13,6 +13,7 @@
  * `updateSettings`. On the way, `withSettingsMigration` moves settings this
  * plugin wrote under an older name or meaning into the shared vocabulary.
  */
+import { VAULT_HOST_STATUS } from '@cortexkit/common-auth/claustrum'
 import {
   type AccountsSectionOptions,
   type CommandApplyRequest,
@@ -737,19 +738,31 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
         status.enrollment.state === 'approved'
           ? (status.enrollment.approvedName ?? status.name)
           : status.name
-      const connected = (await vault.authority()) !== 'local'
+      const authority = await vault.authority()
+      const hosted = authority === 'host'
+      const connected = authority !== 'local'
       const routing = vault.routes().length
       return {
         lines: [
-          connected
-            ? status.discovered
-              ? `Connected · ${status.accounts.length} account${status.accounts.length === 1 ? '' : 's'}`
-              : "Connected · waiting for the vault's first answer"
-            : status.enrollment.state === 'idle'
-              ? 'Not connected'
-              : `Enrollment ${status.enrollment.state}`,
-          vaultEnrollmentLine(status.host, status.name, status.enrollment),
-          ...vaultApprovalInstructions(status.name, status.enrollment),
+          hosted
+            ? VAULT_HOST_STATUS
+            : connected
+              ? status.discovered
+                ? `Connected · ${status.accounts.length} account${status.accounts.length === 1 ? '' : 's'}`
+                : "Connected · waiting for the vault's first answer"
+              : status.enrollment.state === 'idle'
+                ? 'Not connected'
+                : `Enrollment ${status.enrollment.state}`,
+          ...(!hosted
+            ? [
+                vaultEnrollmentLine(
+                  status.host,
+                  status.name,
+                  status.enrollment,
+                ),
+                ...vaultApprovalInstructions(status.name, status.enrollment),
+              ]
+            : []),
           ...(connected && status.discovered
             ? [
                 status.accounts.length === 0
@@ -800,75 +813,77 @@ export function vaultSection(deps: VaultSectionDeps): PluginExtraSection {
                 },
           ],
         })),
-        actions: connected
-          ? [
-              {
-                id: 'disconnect',
-                label: 'Disconnect',
-                description:
-                  "Forgets this host's vault token; its vault accounts stop routing at once. Revoke the enrollment itself with `ck auth enroll revoke`.",
-                confirm:
-                  'Disconnect from the vault? Connecting again needs a new approval with `ck`.',
-                run: async () => {
-                  // Disconnect removes the enrollment state and its approved name.
-                  // status() reports unreadable state as blocked; do not guess a revoke target.
-                  const enrollment = (
-                    await vault.status().catch(() => undefined)
-                  )?.enrollment
-                  const name =
-                    enrollment?.state === 'approved'
-                      ? (enrollment.approvedName ?? vault.name)
-                      : vault.name
-                  const revoke =
-                    enrollment && enrollment.state !== 'blocked'
-                      ? `Run \`ck auth enroll revoke --name ${name}\` to revoke it in the vault too.`
-                      : "Run ck auth enroll list to find this host's enrollment name, then ck auth enroll revoke --name <name>."
-                  await vault.disconnect()
-                  await deps.changed?.()
-                  return `Disconnected: ${name} no longer reads from the vault. ${revoke}`
-                },
-              },
-            ]
-          : [
-              {
-                id: 'connect',
-                label: 'Connect',
-                description:
-                  'Asks the vault to enroll this host; you approve the request with `ck`.',
-                run: async ({ invocation }) => {
-                  const step = await vault.connectStep()
-                  if (step.state !== 'pending' && step.state !== 'busy') {
+        actions: hosted
+          ? []
+          : connected
+            ? [
+                {
+                  id: 'disconnect',
+                  label: 'Disconnect',
+                  description:
+                    "Forgets this host's vault token; its vault accounts stop routing at once. Revoke the enrollment itself with `ck auth enroll revoke`.",
+                  confirm:
+                    'Disconnect from the vault? Connecting again needs a new approval with `ck`.',
+                  run: async () => {
+                    // Disconnect removes the enrollment state and its approved name.
+                    // status() reports unreadable state as blocked; do not guess a revoke target.
+                    const enrollment = (
+                      await vault.status().catch(() => undefined)
+                    )?.enrollment
+                    const name =
+                      enrollment?.state === 'approved'
+                        ? (enrollment.approvedName ?? vault.name)
+                        : vault.name
+                    const revoke =
+                      enrollment && enrollment.state !== 'blocked'
+                        ? `Run \`ck auth enroll revoke --name ${name}\` to revoke it in the vault too.`
+                        : "Run ck auth enroll list to find this host's enrollment name, then ck auth enroll revoke --name <name>."
+                    await vault.disconnect()
                     await deps.changed?.()
-                    return vaultConnectOutcome(vault, step)
-                  }
-                  // The approval happens outside this menu; keep polling for
-                  // it and report the outcome to the session that asked.
-                  void vault
-                    .waitForApproval(deps.wait)
-                    .then(async (final) => {
-                      await deps.changed?.()
-                      const outcome = vaultConnectOutcome(vault, final)
-                      invocation.notify(
-                        outcome.text,
-                        outcome.ok ? 'info' : 'warning',
-                      )
-                    })
-                    .catch((error: unknown) => {
-                      invocation.notify(
-                        `Connecting to the vault failed: ${error instanceof Error ? error.message : String(error)}`,
-                        'error',
-                      )
-                    })
-                  return {
-                    ok: true,
-                    text: [
-                      ...vaultApprovalInstructions(vault.name, step),
-                      'Waiting for the approval; you are told here when it lands.',
-                    ].join('\n'),
-                  }
+                    return `Disconnected: ${name} no longer reads from the vault. ${revoke}`
+                  },
                 },
-              },
-            ],
+              ]
+            : [
+                {
+                  id: 'connect',
+                  label: 'Connect',
+                  description:
+                    'Asks the vault to enroll this host; you approve the request with `ck`.',
+                  run: async ({ invocation }) => {
+                    const step = await vault.connectStep()
+                    if (step.state !== 'pending' && step.state !== 'busy') {
+                      await deps.changed?.()
+                      return vaultConnectOutcome(vault, step)
+                    }
+                    // The approval happens outside this menu; keep polling for
+                    // it and report the outcome to the session that asked.
+                    void vault
+                      .waitForApproval(deps.wait)
+                      .then(async (final) => {
+                        await deps.changed?.()
+                        const outcome = vaultConnectOutcome(vault, final)
+                        invocation.notify(
+                          outcome.text,
+                          outcome.ok ? 'info' : 'warning',
+                        )
+                      })
+                      .catch((error: unknown) => {
+                        invocation.notify(
+                          `Connecting to the vault failed: ${error instanceof Error ? error.message : String(error)}`,
+                          'error',
+                        )
+                      })
+                    return {
+                      ok: true,
+                      text: [
+                        ...vaultApprovalInstructions(vault.name, step),
+                        'Waiting for the approval; you are told here when it lands.',
+                      ].join('\n'),
+                    }
+                  },
+                },
+              ],
       }
     },
   }

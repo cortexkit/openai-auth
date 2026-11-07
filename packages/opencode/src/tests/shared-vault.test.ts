@@ -15,6 +15,7 @@ import {
 import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
 import { OpenAiVault, vaultPaths } from '@cortexkit/openai-auth-core/internal'
 import type { Hooks } from '@opencode-ai/plugin'
+import { installVaultRelay } from '../../../core/src/tests/fixtures/host-vault.ts'
 import {
   chatgptAccessToken,
   type MockDaemon,
@@ -429,6 +430,7 @@ describe('one host vault per process', () => {
         statePath: join(dir, 'openai-auth-state.json'),
       }
       const key = JSON.stringify([
+        'openai-auth',
         options.host,
         stateDir,
         daemon.connectionFile,
@@ -489,6 +491,36 @@ describe('one host vault per process', () => {
       if (location === 'compatibleV1') expect(registry.get(key)).toBe(primary)
     })
   }
+
+  test('hosted leases share the plugin consumer without resolving a connection file and start discovery', async () => {
+    const relay = await installVaultRelay(daemon.connectionFile)
+    const paths = {
+      configPath: join(dir, 'openai-auth.json'),
+      statePath: join(dir, 'openai-auth-state.json'),
+    }
+    const options = {
+      host: 'opencode' as const,
+      stateDir,
+      pollIntervalMs: 0,
+      connectionFile: () => {
+        throw new Error('host has no connection file')
+      },
+    }
+    const first = acquireOpenCodeVault(options, paths)
+    const second = acquireOpenCodeVault(options, paths)
+    try {
+      expect(first.vault).toBe(second.vault)
+      first.start()
+      second.start()
+      await first.firstRoster
+      expect(daemon.lists).toBe(1)
+      expect(relay.pluginIds).toEqual(['openai-auth'])
+    } finally {
+      await first.release()
+      await second.release()
+      await relay.close()
+    }
+  })
 
   test('leases share the first roster and never consult a released source', async () => {
     let firstReads = 0

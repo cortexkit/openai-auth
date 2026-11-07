@@ -190,8 +190,13 @@ describe('OpenCode limits source', () => {
     }
   })
 
-  for (const rosterFirst of [true, false]) {
-    it(`shares vault readiness with roster ${rosterFirst ? 'before' : 'after'} request initialization and never opens the pool`, async () => {
+  for (const [authority, rosterFirst] of [
+    ['vault', true],
+    ['vault', false],
+    ['host', true],
+    ['host', false],
+  ] as const) {
+    it(`shares ${authority} readiness with roster ${rosterFirst ? 'before' : 'after'} request initialization and never opens the pool`, async () => {
       const { files, create } = setup()
       const rosterPath = join(files.dir, 'vault-roster.json')
       const roster: VaultRosterFile = {
@@ -219,7 +224,7 @@ describe('OpenCode limits source', () => {
       if (rosterFirst) ready.resolve()
       const vault = {
         ...localVault(),
-        authority: async () => 'vault' as const,
+        authority: async () => authority,
         enrolled: () => true,
         awaitRequestRoster: async () => {
           await ready.promise

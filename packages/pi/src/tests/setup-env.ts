@@ -9,3 +9,6 @@ import { join } from 'node:path'
 process.env.PI_CODING_AGENT_DIR = mkdtempSync(
   join(tmpdir(), 'pi-test-agent-process-'),
 )
+
+// Tests opt into the relay explicitly rather than inheriting the launcher mode.
+delete process.env.CORTEXKIT_VAULT_HOST

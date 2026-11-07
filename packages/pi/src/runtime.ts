@@ -26,6 +26,7 @@
 
 import { statSync } from 'node:fs'
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
+import { VAULT_HOST_CONNECT_REFUSAL } from '@cortexkit/common-auth/claustrum'
 import type {
   AccountKey,
   LimitDecision,
@@ -341,7 +342,7 @@ export class PiOpenAIRuntime {
   }
 
   /** A fresh read of enrollment, through the vault so Pi and OpenCode share one rule and one cache. */
-  readAuthority(): Promise<'local' | 'vault' | 'unreadable'> {
+  readAuthority(): Promise<'host' | 'local' | 'vault' | 'unreadable'> {
     return this.vault.authority()
   }
 
@@ -379,6 +380,8 @@ export class PiOpenAIRuntime {
    */
   disconnectVault(): Promise<'restored' | 'conflict' | 'nothing-to-do'> {
     return this.withSlot(async () => {
+      if ((await this.readAuthority()) === 'host')
+        throw new Error(VAULT_HOST_CONNECT_REFUSAL)
       this.slotVaultMode = undefined
       try {
         const result = await this.vaultSlot().exitVault()
@@ -1138,7 +1141,7 @@ export class PiOpenAIRuntime {
 
 /** The pool-backed parts of the Pi `/openai` command. */
 export interface PiPoolCommands {
-  readAuthority: () => Promise<'local' | 'vault' | 'unreadable'>
+  readAuthority: () => Promise<'host' | 'local' | 'vault' | 'unreadable'>
   syncVaultSlot?: (refresh?: () => unknown, explicit?: boolean) => Promise<void>
   disconnectVault?: () => Promise<'restored' | 'conflict' | 'nothing-to-do'>
   /**

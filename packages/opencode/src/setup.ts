@@ -1,9 +1,10 @@
 import { basename } from 'node:path'
 import { resolveClaustrumConnectionPath } from '@cortexkit/claustrum-client'
 import {
-  enrollmentAuthority,
   hostEnrollmentPaths,
   readClaustrumEnrollmentStatus,
+  VAULT_HOST_CONNECT_REFUSAL,
+  vaultAuthority,
 } from '@cortexkit/common-auth/claustrum'
 import {
   assertHostsStopped,
@@ -50,10 +51,11 @@ export function createSetupPlugin(deps: SetupDependencies = {}): SetupPlugin {
     },
   }
   const assertLocal = async (host: SetupHost) => {
-    const authority = await enrollmentAuthority(
+    const authority = await vaultAuthority(
       hostEnrollmentPaths(paths[host]),
       vaultEnrollmentName(host),
     )
+    if (authority === 'host') throw new Error(VAULT_HOST_CONNECT_REFUSAL)
     if (authority !== 'local') {
       throw new Error(
         `${host} is enrolled in Claustrum or its enrollment is unreadable. Disconnect it from the vault before using local sign-in.`,
@@ -77,6 +79,13 @@ export function createSetupPlugin(deps: SetupDependencies = {}): SetupPlugin {
       },
     },
     async beforeRegister(host, mode) {
+      if (
+        (await vaultAuthority(
+          hostEnrollmentPaths(paths[host]),
+          vaultEnrollmentName(host),
+        )) === 'host'
+      )
+        throw new Error(VAULT_HOST_CONNECT_REFUSAL)
       // Vault enrollment must not read, rewrite or migrate local credentials.
       if (mode === 'claustrum') {
         const enrollment = await readClaustrumEnrollmentStatus(

@@ -13,6 +13,7 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { ClaustrumEnrollmentConnection } from '@cortexkit/common-auth/claustrum'
+import { VAULT_HOST_CONNECT_REFUSAL } from '@cortexkit/common-auth/claustrum'
 import {
   runSetup,
   type SetupCallbackContext,
@@ -140,6 +141,31 @@ afterEach(() => {
 })
 
 describe('setup', () => {
+  test('hosted setup refuses Connect before detection, enrollment or local login', async () => {
+    process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+    io.env = { ...io.env, CORTEXKIT_VAULT_HOST: 'thalamus' }
+    const connect = mock(async () => {
+      throw new Error('native enrollment connector used')
+    })
+    io.connect = connect
+    const setup = plugin()
+    await expect(
+      runSetup(setup, ['--yes', '--claustrum', '--opencode=2'], io),
+    ).rejects.toThrow(VAULT_HOST_CONNECT_REFUSAL)
+    for (const host of ['opencode', 'pi'] as const) {
+      await expect(
+        setup.beforeRegister!(host, 'claustrum', {
+          ...localContext,
+          mode: 'claustrum',
+        }),
+      ).rejects.toThrow(VAULT_HOST_CONNECT_REFUSAL)
+    }
+    expect(connect).not.toHaveBeenCalled()
+    expect(beginLogin).not.toHaveBeenCalled()
+    expect(existsSync(authPath())).toBe(false)
+    expect(existsSync(getAccountPaths().configPath)).toBe(false)
+  })
+
   test('an old vault stops setup immediately without reconnecting or writing a local login', async () => {
     const daemon = await startMockDaemon({ directory: root, credentials: {} })
     process.env.CLAUSTRUM_SUBC_CONNECTION = daemon.connectionFile

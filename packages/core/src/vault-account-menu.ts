@@ -30,7 +30,7 @@ export type MenuVault = Pick<
 >
 
 export interface VaultMenuView {
-  authority: 'vault' | 'local' | 'unreadable'
+  authority: 'host' | 'vault' | 'local' | 'unreadable'
   status: VaultStatus
   identities: ReadonlySet<string>
   routes: ReadonlySet<string>

@@ -331,3 +331,6 @@ process.on('exit', () => {
     rmSync(FLOOR_DIR, { recursive: true, force: true })
   } catch {}
 })
+
+// Tests opt into the relay explicitly rather than inheriting the launcher mode.
+delete process.env.CORTEXKIT_VAULT_HOST

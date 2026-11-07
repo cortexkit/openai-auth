@@ -6,6 +6,7 @@
 //
 // Pi resolves auth before calling a provider's stream. The real model-runtime
 // tests therefore swap the stored login before reloading Pi's auth snapshot.
+
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import {
   chmodSync,
@@ -19,6 +20,10 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import {
+  VAULT_HOST_CONNECT_REFUSAL,
+  VAULT_HOST_STATUS,
+} from '@cortexkit/common-auth/claustrum'
 import { openPiSlot, type PiSlot } from '@cortexkit/common-auth/pi-slot'
 import { quotaCodec } from '@cortexkit/common-auth/quota'
 import { openPoolStore } from '@cortexkit/common-auth/store'
@@ -161,6 +166,7 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
+  delete process.env.CORTEXKIT_VAULT_HOST
   clearPiStickyRouting('session-1')
   await daemon?.stop()
   daemon = undefined
@@ -291,6 +297,50 @@ function poolFiles(): string[] {
 }
 
 describe('Pi in vault mode', () => {
+  test('host without a relay fails closed, hides enrollment actions and restores the native slot when hosting ends', async () => {
+    await addExpiredLocalRow()
+    writeNativeLogin()
+    const before = poolFiles()
+    process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+    const target = vault()
+    const runtime = runtimeWith(target)
+    try {
+      await runtime.syncVaultSlot()
+      expect(await runtime.readAuthority()).toBe('host')
+      expect(
+        JSON.parse(readFileSync(join(dir, 'auth.json'), 'utf8'))[
+          'openai-codex'
+        ],
+      ).toEqual({ type: 'api_key', key: VAULT_PLACEHOLDER_KEY })
+      await runtime.commandSupport().observeLogin(NATIVE_ACCESS)
+      await runtime.commandSupport().refreshAllQuota()
+      expect(errorOf(await send(runtime))).toBe(
+        VAULT_MODE_REFUSALS['vault-unreachable'],
+      )
+      expect(codexTokens).toEqual([])
+      expect(whamTokens).toEqual([])
+      expect(refreshes).toBe(0)
+      expect(poolFiles()).toEqual(before)
+      const menu = (
+        await createPiMenu(runtime.commandSupport()).open({ notify() {} })
+      ).menu
+      const section = menu.sections.find((section) => section.id === 'vault')!
+      expect(section.lines).toContain(VAULT_HOST_STATUS)
+      expect(section.actions).toEqual([])
+      await expect(target.connectStep()).rejects.toThrow(
+        VAULT_HOST_CONNECT_REFUSAL,
+      )
+      delete process.env.CORTEXKIT_VAULT_HOST
+      await runtime.syncVaultSlot()
+      expect(
+        JSON.parse(readFileSync(join(dir, 'auth.json'), 'utf8'))['openai-codex']
+          .access,
+      ).toBe(NATIVE_ACCESS)
+    } finally {
+      await target.dispose()
+    }
+  })
+
   for (const mode of ['main-first', 'fallback-first'] as const) {
     test(`${mode} places the default vault account as main`, async () => {
       const credentials = {

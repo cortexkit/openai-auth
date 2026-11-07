@@ -22,7 +22,10 @@
 // refresh tokens are single-use, so the host and pool must not refresh the
 // same token family. Choosing a pool login runs a separate OAuth flow.
 
-import { enrollmentAuthority } from '@cortexkit/common-auth/claustrum'
+import {
+  connectVaultHost,
+  vaultAuthority,
+} from '@cortexkit/common-auth/claustrum'
 import {
   isPlaceholderCredential,
   type PoolLoginMethod,
@@ -82,8 +85,12 @@ export function vaultLoginMethod(
       label: 'ChatGPT accounts in the vault',
     },
     async activate() {
-      if ((await enrollmentAuthority(vault.paths, vault.name)) !== 'vault')
+      const authority = await vaultAuthority(vault.paths, vault.name)
+      if (authority === 'host') {
+        connectVaultHost('openai-auth')
+      } else if (authority !== 'vault') {
         throw new Error(VAULT_ACTIVATION_REFUSAL)
+      }
     },
   }
 }

@@ -111,7 +111,7 @@ export interface PiPoolSourceDeps {
    */
   vaultMode?: () => boolean
   /** Re-read whether the vault is connected before writing queued local observations. */
-  vaultAuthority?: () => Promise<'local' | 'vault' | 'unreadable'>
+  vaultAuthority?: () => Promise<'host' | 'local' | 'vault' | 'unreadable'>
 }
 
 type Snapshot = PiPoolView & { key: string | undefined; readAt: number }

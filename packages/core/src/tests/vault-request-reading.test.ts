@@ -7,7 +7,7 @@ test('vault requestReading reports rejected quota polls without an unhandled rej
       process.execPath,
       join(import.meta.dir, 'fixtures/vault-request-reading-harness.ts'),
     ],
-    { stdout: 'pipe', stderr: 'pipe', timeout: 8_000 },
+    { env: { ...process.env }, stdout: 'pipe', stderr: 'pipe', timeout: 8_000 },
   )
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(child.stdout).text(),

@@ -164,7 +164,7 @@ export interface PoolAccountSourceDeps {
    */
   vaultMode?: () => boolean
   /** Read enrollment before local refreshes, quota polls or writes; vaultMode blocks synchronous callbacks until that read completes. */
-  vaultAuthority?: () => Promise<'vault' | 'local' | 'unreadable'>
+  vaultAuthority?: () => Promise<'host' | 'vault' | 'local' | 'unreadable'>
   /**
    * Settles (resolved or rejected) once the vault has read its first roster.
    * Until then `vaultIdentities` is empty even for an account the vault

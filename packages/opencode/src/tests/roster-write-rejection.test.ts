@@ -9,7 +9,12 @@ for (const trigger of ['startup', 'interval']) {
         join(import.meta.dir, 'fixtures/roster-write-rejection.ts'),
         trigger,
       ],
-      { stdout: 'pipe', stderr: 'pipe', timeout: 8_000 },
+      {
+        env: { ...process.env },
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 8_000,
+      },
     )
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(child.stdout).text(),
@@ -46,7 +51,12 @@ for (const trigger of ['startup', 'interval']) {
         trigger,
         'poll-rejects',
       ],
-      { stdout: 'pipe', stderr: 'pipe', timeout: 8_000 },
+      {
+        env: { ...process.env },
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 8_000,
+      },
     )
     const [stdout, stderr, exitCode] = await Promise.all([
       new Response(child.stdout).text(),

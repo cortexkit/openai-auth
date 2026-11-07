@@ -16,7 +16,9 @@ import {
 } from 'node:fs'
 import { join } from 'node:path'
 import type { ClaustrumScopedAttempt } from '@cortexkit/common-auth/claustrum'
+import { VAULT_HOST_STATUS } from '@cortexkit/common-auth/claustrum'
 import {
+  isPlaceholderCredential,
   OpenCode2AuthError,
   placeholderSecret,
 } from '@cortexkit/common-auth/opencode2'
@@ -27,6 +29,7 @@ import {
   vaultModeRefusalText,
   vaultPaths,
 } from '@cortexkit/openai-auth-core/internal'
+import { installVaultRelay } from '../../../core/src/tests/fixtures/host-vault.ts'
 import {
   chatgptAccessToken,
   type MockCredential,
@@ -39,6 +42,8 @@ import { PoolAccountSource } from '../core/pool-account-source'
 import { acquireOpenCodeVault } from '../core/shared-vault'
 import { resetDumpStateForTest } from '../dump'
 import { flushForTest } from '../logger'
+import { createRpcClient } from '../rpc/rpc-client'
+import { resolveRpcDir } from '../rpc/rpc-dir'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { VAULT_METHOD } from '../v2/login'
 import { setupOpenAIAuth } from '../v2/setup'
@@ -92,6 +97,8 @@ async function start(
   rows: PoolSeedRow[],
   credentials: Record<string, MockCredential>,
   options: {
+    hosted?: 'relay' | 'missing'
+    menu?: boolean
     /** Runs on the seeded files before setup. */
     prepare?: (files: PoolFiles) => void
     fetch?: typeof fetch
@@ -116,13 +123,26 @@ async function start(
   const stateDir = join(files.dir, 'vault')
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   const { tokenPath } = vaultPaths(stateDir, 'opencode')
-  writeFileSync(
-    tokenPath,
-    JSON.stringify({ token: ENROLLMENT_TOKEN, token_generation: 1 }),
-    { mode: 0o600 },
-  )
-  chmodSync(tokenPath, 0o600)
-  const host = fakeOpenCode2Host()
+  if (options.hosted === 'relay') {
+    mkdirSync(tokenPath, { recursive: true })
+  } else if (!options.hosted) {
+    writeFileSync(
+      tokenPath,
+      JSON.stringify({ token: ENROLLMENT_TOKEN, token_generation: 1 }),
+      { mode: 0o600 },
+    )
+    chmodSync(tokenPath, 0o600)
+  }
+  if (options.hosted === 'relay') {
+    const relay = await installVaultRelay(daemon.connectionFile)
+    cleanups.push(() => relay.close())
+  } else if (options.hosted === 'missing') {
+    process.env.CORTEXKIT_VAULT_HOST = 'thalamus'
+    cleanups.push(() => {
+      delete process.env.CORTEXKIT_VAULT_HOST
+    })
+  }
+  const host = fakeOpenCode2Host(options.menu ? { directory: files.dir } : {})
   const stop = await setupOpenAIAuth(host.ctx, {
     paths: files.paths,
     sidebarStateFile: join(files.dir, 'sidebar.json'),
@@ -308,6 +328,71 @@ async function send(host: Host, status: number) {
 }
 
 describe('vault accounts on OpenCode 2', () => {
+  it('host relay activates the vault placeholder and serves without enrollment', async () => {
+    const { host, daemon, tokenPath, files } = await start(
+      'main-first',
+      [{ id: 'main' }],
+      {
+        'chatgpt:openai': vaultLogin('chatgpt-vault'),
+      },
+      { hosted: 'relay', menu: true },
+    )
+    const method = host.methods.find(
+      (entry) => entry.method.id === VAULT_METHOD,
+    )!
+    const flow = await method.authorize({})
+    if (typeof flow.callback === 'function')
+      throw new Error('expected automatic vault activation')
+    const credential = await flow.callback
+    expect(isPlaceholderCredential(credential, 'openai')).toBe(true)
+    expect((await send(host, 200)).get('authorization')).toBe(
+      `Bearer ${VAULT_ACCESS}`,
+    )
+    expect(readdirSync(tokenPath)).toEqual([])
+    expect(daemon.proposals).toEqual([])
+    const client = createRpcClient(
+      (await resolveRpcDir(files.dir)).dir,
+      process.pid,
+    )
+    await client.pending(0, 'host-menu')
+    await host.commands[0]!.execute({ sessionID: 'host-menu' })
+    const messages = await client.pending(0, 'host-menu')
+    expect(messages).toHaveLength(1)
+    const payload = messages[0]!.payload as {
+      menu: {
+        sections: Array<{ id: string; lines: string[]; actions: unknown[] }>
+      }
+    }
+    const vault = payload.menu.sections.find(
+      (section) => section.id === 'vault',
+    )!
+    expect(vault.lines).toContain(VAULT_HOST_STATUS)
+    expect(vault.actions).toEqual([])
+  })
+
+  it('host without a relay refuses without local refresh or quota polls', async () => {
+    const calls: string[] = []
+    const { host } = await start(
+      'main-first',
+      [{ id: 'main', access: 'expired-local' }],
+      {},
+      {
+        hosted: 'missing',
+        prepare: (files) => {
+          const state = JSON.parse(readFileSync(files.statePath, 'utf8'))
+          state.accounts.main.expires = 1
+          writeFileSync(files.statePath, JSON.stringify(state))
+        },
+        fetch: (async (input: unknown) => {
+          calls.push(String(input))
+          throw new Error('local network must stay dormant')
+        }) as unknown as typeof fetch,
+      },
+    )
+    await expectVaultRefusal(host, 'vault-unreachable')
+    expect(calls).toEqual([])
+  })
+
   it('dumps the internal vault route key without vault credentials or personal identifiers', async () => {
     const keys = [
       'CORTEXKIT_OPENAI_AUTH_DUMP',

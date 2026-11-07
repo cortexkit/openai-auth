@@ -137,7 +137,7 @@ describe('vault reset credits', () => {
           secondFile,
           String(env.now),
         ],
-        { stdout: 'pipe', stderr: 'pipe' },
+        { env: { ...process.env }, stdout: 'pipe', stderr: 'pipe' },
       )
       const stderr = new Response(child.stderr).text()
       try {
