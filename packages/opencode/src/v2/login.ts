@@ -43,6 +43,7 @@ import {
   type OpenAiVault,
   POOL_MAIN_ROW_ID,
   parseJwtClaims,
+  VAULT_PLUGIN_NAME,
 } from '@cortexkit/openai-auth-core/internal'
 import {
   legacyRefreshLocks,
@@ -87,7 +88,8 @@ export function vaultLoginMethod(
     async activate() {
       const authority = await vaultAuthority(vault.paths, vault.name)
       if (authority === 'host') {
-        connectVaultHost('openai-auth')
+        // Proves Thalamus's relay is installed: this throws when it isn't.
+        connectVaultHost(VAULT_PLUGIN_NAME)
       } else if (authority !== 'vault') {
         throw new Error(VAULT_ACTIVATION_REFUSAL)
       }
