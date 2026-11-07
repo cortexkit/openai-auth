@@ -10,5 +10,9 @@ process.env.PI_CODING_AGENT_DIR = mkdtempSync(
   join(tmpdir(), 'pi-test-agent-process-'),
 )
 
-// Tests opt into the relay explicitly rather than inheriting the launcher mode.
+// A host that Thalamus starts sets CORTEXKIT_VAULT_HOST=thalamus, and a test
+// process started inside one inherits it, which would run every vault test in
+// hosted mode. Clear it here; tests that exercise hosted mode set it themselves.
+// Children spawned without an `env` option still get the original value, so
+// those that reach vault code pass `env` built from process.env.
 delete process.env.CORTEXKIT_VAULT_HOST

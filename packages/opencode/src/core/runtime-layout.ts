@@ -956,7 +956,8 @@ async function vaultModeWithoutToken(
  * The SHA-256 of the enrollment state file this move copied, when that state
  * keeps the host in vault mode once the old token is gone: approved, or
  * blocked because the token is missing, under OpenCode's enrollment name.
- * common-auth's `enrollmentAuthority` (what older versions call) reads such a state with no token next
+ * common-auth's `enrollmentAuthority`, the check older versions of this
+ * plugin use, reads such a state with no token next
  * to it as 'vault', so leaving it in the old vault folder keeps an older
  * version in vault mode. Any other state (pending, denied, unreadable)
  * protects nothing, and the old copy is removed as usual.
