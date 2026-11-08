@@ -443,6 +443,12 @@ export class OpenAiVault {
     const key = this.#enrollmentKey()
     const mode = await vaultAuthority(this.paths, this.name)
     if (key === this.#enrollmentKey()) {
+      // One line per process when authority is first read, then one per change
+      // (connect, disconnect, a host marker), so an operator can read from the
+      // log whether this process serves through Thalamus, the vault or local
+      // accounts. Requests call this every time; only a change is logged.
+      if (mode !== this.#authority)
+        log.info('vault authority', { host: this.host, authority: mode })
       this.#authority = mode
       this.#authorityKey = key
       return mode
