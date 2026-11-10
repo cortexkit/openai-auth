@@ -36,6 +36,7 @@ import {
   type ClaustrumFamily,
   type ClaustrumScopedAttempt,
   type ClaustrumScopedClient,
+  ClaustrumUnreachableError,
   type ClaustrumWatchState,
   connectClaustrumEnrollmentClient,
   connectClaustrumScopedClient,
@@ -115,6 +116,11 @@ const HOST_NAMES: Record<VaultHost, string> = {
 /** The name a host proposes when it enrolls, for example `openai-auth-pi`. */
 export function vaultEnrollmentName(host: VaultHost): string {
   return enrollmentName(VAULT_PLUGIN_NAME, host)
+}
+
+/** The person-facing name shown when approving and managing a host's vault access. */
+export function vaultEnrollmentDisplayName(host: VaultHost): string {
+  return `ChatGPT for ${HOST_NAMES[host]}`
 }
 
 /**
@@ -421,7 +427,13 @@ export class OpenAiVault {
 
   #fail(message: string, error: unknown): void {
     this.#lastError = errorMessage(error)
-    log.warn(message, { host: this.host, error: this.#lastError })
+    log.warn(message, {
+      host: this.host,
+      error: this.#lastError,
+      ...(error instanceof ClaustrumUnreachableError && error.reason
+        ? { reason: error.reason }
+        : {}),
+    })
   }
 
   #enrollmentKey(): string {
@@ -1027,6 +1039,7 @@ export class OpenAiVault {
         client,
         paths: this.paths,
         proposedName: this.name,
+        displayName: vaultEnrollmentDisplayName(this.host),
         ...(this.#options.now ? { now: this.#options.now } : {}),
       })
       const current = await manager.status()

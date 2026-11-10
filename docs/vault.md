@@ -17,6 +17,8 @@ Then grant OpenAI access to the name you approved with --name (defaults to opena
   ck auth grant --principal enrolled:openai-auth-opencode --selector-kind category --selector openai-native --operation read
 ```
 
+The phone and desktop apps show "ChatGPT for OpenCode" or "ChatGPT for Pi" on the plugin's permission row when approving access.
+
 The grant reaches only vault logins that carry the `openai-native` category, for both `openai-auth-opencode` and `openai-auth-pi`. Check the CATEGORIES column with `ck auth status`. A login added before the vault assigned categories shows none; `ck auth reclassify --from-registry` fills every empty category set from the vault's defaults, without removing any category. To add the category to one login, run `ck auth set-category <credential-id> --add openai-native`.
 
 Pi's commands identify its separate enrollment, `openai-auth-pi`, instead of OpenCode's. Pi reports when the vault owner approves its request.

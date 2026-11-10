@@ -19,6 +19,7 @@ import {
   beginAccountLogin,
   openUrl,
   VAULT_FAMILY,
+  vaultEnrollmentDisplayName,
   vaultEnrollmentName,
   vaultStateDir,
 } from '@cortexkit/openai-auth-core/internal'
@@ -73,9 +74,14 @@ export function createSetupPlugin(deps: SetupDependencies = {}): SetupPlugin {
       hosts: {
         opencode: {
           name: vaultEnrollmentName('opencode'),
+          displayName: vaultEnrollmentDisplayName('opencode'),
           paths: paths.opencode,
         },
-        pi: { name: vaultEnrollmentName('pi'), paths: paths.pi },
+        pi: {
+          name: vaultEnrollmentName('pi'),
+          displayName: vaultEnrollmentDisplayName('pi'),
+          paths: paths.pi,
+        },
       },
     },
     async beforeRegister(host, mode) {

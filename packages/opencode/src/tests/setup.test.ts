@@ -372,10 +372,12 @@ describe('setup', () => {
       }
       const name = `openai-auth-${host}`
       const approvedName = `${name}-secondary`
+      let proposedDisplayName: string | undefined
       const connect = mock(
         async (): Promise<ClaustrumEnrollmentConnection> => ({
           enrollPropose: async (input) => {
             expect(input.name).toBe(name)
+            proposedDisplayName = input.displayName
             return { requestId: `${host}-request` }
           },
           enrollPoll: async () => ({
@@ -391,6 +393,9 @@ describe('setup', () => {
       const setup = plugin()
       expect(setup.packages.pi).toBe(piPackage.name)
       await runSetup(setup, ['--yes', '--claustrum', '--opencode=1'], io)
+      expect(proposedDisplayName).toBe(
+        host === 'opencode' ? 'ChatGPT for OpenCode' : 'ChatGPT for Pi',
+      )
       expect(output).toContain(
         `ck auth grant --principal enrolled:${approvedName} --selector-kind category --selector openai-native --operation read`,
       )
