@@ -1709,9 +1709,9 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     })
   }, 180_000)
 
-  test('billing http: hosted relay reports one completed primary vault turn', async () => {
+  test('billing websocket: hosted relay reports one completed primary vault turn', async () => {
     const result = await runScenario({
-      transport: 'http',
+      transport: 'websocket',
       accounts: ['A'],
       mode: 'fallback-first',
       plugin: vaultPlugin,
@@ -1737,13 +1737,14 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         outcome: 'completed',
         credential_id: 'oauth:openai:work',
         provider: 'openai',
-        status: 200,
         attempt: 1,
       })
       expect(primary[0]!.usage).toMatchObject({
         input: expect.any(Number),
         output: expect.any(Number),
       })
+      expect(primary[0]).not.toHaveProperty('status')
+      expect(samplesOn(result, 'ws')).toHaveLength(1)
       expect(Object.keys(primary[0]!.usage as object).length).toBeGreaterThan(1)
     })
   }, 180_000)

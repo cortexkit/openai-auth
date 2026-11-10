@@ -77,4 +77,4 @@ OpenCode 2 has no transcript-only feedback surface for this command: its [`execu
 
 ## Cost tracking under Thalamus
 
-Under Thalamus, the plugin reports token counts for each vault-served call, including title, compaction and keep-warm calls, to Thalamus for cost tracking. Reports contain request metadata and measured token counts, not reply content, credentials or access tokens. Local-account calls are not reported.
+Under Thalamus, the plugin reports token counts for each vault-served call, including title, compaction and keep-warm calls, to Thalamus for cost tracking. Both HTTP and WebSocket model calls are covered. Reports contain request metadata and measured token counts, not reply content, credentials or access tokens. Local-account calls are not reported.

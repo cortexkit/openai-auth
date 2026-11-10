@@ -295,11 +295,6 @@ export interface OpenAIAdapter {
   ): void
   /** A user prompt starts a new turn; retries and auxiliary requests do not. */
   beginTurn(sessionId: string): void
-  /** Starts billing only for a vault send when Thalamus's global routing accessor is present. */
-  startBilling(
-    attempt: Attempt<OpenAIAttemptData>,
-    body: string,
-  ): VaultBillingAttempt | undefined
   dispose(): void
   /** Drops a session's pin and remembered account. */
   forgetSession(sessionId: string): void
@@ -509,32 +504,35 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   const routingFailures = new WeakSet<Attempt<OpenAIAttemptData>>()
   const billing = new WeakMap<Attempt<OpenAIAttemptData>, VaultBillingAttempt>()
   const billingCounts = new Map<string, number>()
-  const startBilling = (attempt: Attempt<OpenAIAttemptData>, body: string) => {
+  const observeBillingModel = (
+    attempt: Attempt<OpenAIAttemptData> | undefined,
+  ) => {
     if (
-      attempt.data?.kind !== 'vault' ||
+      attempt?.data?.kind !== 'vault' ||
       !attempt.data.receipt.credentialId ||
       !hasVaultRoutingAccessor()
     )
       return undefined
-    const request = parseJson(body)
-    if (!isRecord(request) || typeof request.model !== 'string')
-      return undefined
-    if (attempt.transport === 'ws' && request.type !== 'response.create')
-      return undefined
-    const key = `${attempt.sessionID}\u0000${attempt.kind}`
-    const count = (billingCounts.get(key) ?? 0) + 1
-    billingCounts.set(key, count)
-    if (billingCounts.size > DEFAULT_MAX_RECORDS) {
-      const oldest = billingCounts.keys().next().value
-      if (oldest !== undefined) billingCounts.delete(oldest)
+    const receipt = attempt.data.receipt
+    return (model: string) => {
+      const key = `${attempt.sessionID}\u0000${attempt.kind}`
+      const count = (billingCounts.get(key) ?? 0) + 1
+      billingCounts.set(key, count)
+      if (billingCounts.size > DEFAULT_MAX_RECORDS) {
+        const oldest = billingCounts.keys().next().value
+        if (oldest !== undefined) billingCounts.delete(oldest)
+      }
+      billing.set(
+        attempt,
+        new VaultBillingAttempt(
+          attempt.sessionID,
+          receipt,
+          attempt.kind,
+          model,
+          count,
+        ),
+      )
     }
-    return new VaultBillingAttempt(
-      attempt.sessionID,
-      attempt.data.receipt,
-      attempt.kind,
-      request.model,
-      count,
-    )
   }
   const { source, pins } = deps
   const now = deps.now ?? Date.now
@@ -1683,27 +1681,22 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           { sessionID, kind },
           effort,
           deps.responsesLite?.() ?? false,
+          undefined,
+          observeBillingModel(attempt),
         )) ?? routed
-      if (
-        attempt.data?.kind === 'vault' &&
-        attempt.data.receipt.credentialId &&
-        hasVaultRoutingAccessor()
-      ) {
-        try {
-          const record = startBilling(attempt, await rewritten.clone().text())
-          if (record) billing.set(attempt, record)
-        } catch {
-          // Optional accounting must not stop a request whose body cannot be inspected.
-        }
-      }
       return rewritten
     },
     rewriteHandshakeURL: ({ url }) =>
       deps.codexEndpoint
         ? codexRequestURL(url, deps.codexEndpoint())
         : undefined,
-    rewriteWebSocketFrame: ({ frame, sessionID, kind }) =>
-      rewriteCodexFrame(frame, { sessionID, kind }, effort),
+    rewriteWebSocketFrame: ({ frame, sessionID, kind, attempt }) =>
+      rewriteCodexFrame(
+        frame,
+        { sessionID, kind },
+        effort,
+        observeBillingModel(attempt),
+      ),
     quotaFromHeaders: (headers, status, attempt) => {
       if (attempt.data?.kind === 'vault')
         vault?.reportUsage(
@@ -1761,6 +1754,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     },
     inspectEvent: ({ data, transport, attempt }) => {
       const event = parseJson(data)
+      let billingDone = false
       const state = attempt.data && feedback.get(attempt.data)
       if (
         state &&
@@ -1783,7 +1777,16 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           )
       }
       if (attempt.data?.kind === 'vault' && hasVaultRoutingAccessor()) {
-        if (transport === 'http') billing.get(attempt)?.event(event)
+        const record = billing.get(attempt)
+        if (record) {
+          record.event(event)
+          billingDone =
+            transport === 'ws' &&
+            isRecord(event) &&
+            (event.type === 'response.incomplete' ||
+              event.type === 'response.failed' ||
+              event.type === 'error')
+        }
         if (
           vaultRoutingStreamMayFail(data) ||
           (transport === 'ws' && data.includes('"response.completed"'))
@@ -1809,9 +1812,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       )
       // HTTP acceptance belongs to the body reader, not an SSE lifecycle
       // frame. A WebSocket has no body end, so its completion is explicit.
-      return transport === 'ws' &&
-        isRecord(event) &&
-        event.type === 'response.completed'
+      return billingDone ||
+        (transport === 'ws' &&
+          isRecord(event) &&
+          event.type === 'response.completed')
         ? { ...verdict, done: true }
         : verdict
     },
@@ -2015,7 +2019,6 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   return {
     adapter,
     beginTurn: clearTurn,
-    startBilling,
     dispose: () => {
       heldTurns.clear()
       billingCounts.clear()

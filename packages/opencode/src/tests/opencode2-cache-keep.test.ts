@@ -1633,7 +1633,7 @@ test('billing keep-warm reports a vault send with measured usage', async () => {
     fake.state.receiptIdentity.set('V', 'chatgpt-V')
     fake.location.fetch = (async () =>
       new Response(
-        `data: ${JSON.stringify({ type: 'response.completed', response: { id: 'warm-response', usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 60 }, cache_write_tokens: 5, output_tokens: 2 } } })}\n\n`,
+        `data: ${JSON.stringify({ type: 'response.completed', response: { id: 'warm-response', usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 60, cache_write_tokens: 5 }, output_tokens: 2 } } })}\n\n`,
         { headers: { 'content-type': 'text/event-stream' } },
       )) as unknown as typeof fetch
     const { lease, clock } = acquire(fake.location)

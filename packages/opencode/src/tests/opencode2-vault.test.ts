@@ -1059,7 +1059,7 @@ describe('vault accounts on OpenCode 2', () => {
 })
 
 for (const hosted of [undefined, 'relay'] as const) {
-  it(`billing WebSocket ${hosted ?? 'vault'} reports each send on a reused socket and a cut on retry`, async () => {
+  it(`billing WebSocket ${hosted ?? 'vault'} reports each model-call attempt and a cut on retry`, async () => {
     const key = Symbol.for('cortexkit.routing')
     const original = Object.getOwnPropertyDescriptor(globalThis, key)
     const reports: Record<string, unknown>[] = []
@@ -1079,13 +1079,14 @@ for (const hosted of [undefined, 'relay'] as const) {
       { hosted },
     )
     const request = scope('billing-ws')
-    await host.fire('experimental.ws.handshake', {
-      ...request,
-      url: 'wss://codex.test/responses',
-      headers: { authorization: `Bearer ${PLACEHOLDER}` },
-    })
-    const send = () =>
-      host.fire('experimental.ws.send', {
+    const send = async () => {
+      // The host runs this interceptor for every model call, even on a cached socket.
+      await host.fire('experimental.ws.handshake', {
+        ...request,
+        url: 'wss://codex.test/responses',
+        headers: { authorization: `Bearer ${PLACEHOLDER}` },
+      })
+      await host.fire('experimental.ws.send', {
         ...request,
         frame: JSON.stringify({
           type: 'response.create',
@@ -1093,6 +1094,7 @@ for (const hosted of [undefined, 'relay'] as const) {
           input: [],
         }),
       })
+    }
     const receive = (event: unknown) =>
       host.fire('experimental.ws.receive', {
         ...request,
@@ -1105,9 +1107,8 @@ for (const hosted of [undefined, 'relay'] as const) {
         id: 'ws-1',
         usage: {
           input_tokens: 100,
-          input_tokens_details: { cached_tokens: 80 },
+          input_tokens_details: { cached_tokens: 80, cache_write_tokens: 0 },
           output_tokens: 9,
-          cache_write_tokens: 0,
         },
       },
     })

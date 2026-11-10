@@ -306,6 +306,8 @@ export async function rewriteCodexHttpRequest(
   effort: MidConversationEffort,
   lite: boolean,
   state: CodexHttpState = effort.http,
+  /** Reuse the shaping parse rather than reading the request body again for accounting. */
+  onModel?: (model: string) => void,
 ): Promise<Request | undefined> {
   if (request.method.toUpperCase() !== 'POST') return undefined
   if (!/\/responses\/?$/.test(new URL(request.url).pathname)) return undefined
@@ -332,6 +334,7 @@ export async function rewriteCodexHttpRequest(
     responsesLite: lite,
     applyEffort: (parsed) => {
       effort.apply(parsed, scope, 'http')
+      if (onModel && typeof parsed.model === 'string') onModel(parsed.model)
     },
   })
   return new Request(request, { headers, body: prepared.init?.body })
@@ -428,6 +431,8 @@ export function rewriteCodexFrame(
   frame: string,
   scope: CodexRewriteScope,
   effort: MidConversationEffort,
+  /** The model is observed from the final frame already parsed for input preservation. */
+  onModel?: (model: string) => void,
 ): string | undefined {
   const body = parseObject(frame)
   if (body?.type !== 'response.create') return undefined
@@ -456,6 +461,7 @@ export function rewriteCodexFrame(
   })
   const sent = parseObject(String(prepared.init?.body))
   if (!sent) return undefined
+  if (onModel && typeof sent.model === 'string') onModel(sent.model)
   // `body` is still the host's frame: the builder parsed its own copy.
   if (!frameInputKept(body.input, sent.input)) {
     if ('input' in body) sent.input = body.input

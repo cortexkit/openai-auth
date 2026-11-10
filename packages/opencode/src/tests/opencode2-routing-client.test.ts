@@ -325,6 +325,18 @@ test('OpenCode 2 reports a completed vault WebSocket response without waiting', 
         outcome: 'served',
         headers: {},
       },
+      {
+        kind: 'billing',
+        attempt_id: expect.any(String),
+        request_kind: 'primary',
+        credential_id: 'credential-b',
+        account_id: 'account-b',
+        provider: 'openai',
+        model: 'gpt-6',
+        outcome: 'completed',
+        attempt: 1,
+        provider_response_id: 'done',
+      },
     ])
   } finally {
     await installation.dispose()
@@ -489,8 +501,7 @@ const billingTerminal = (type = 'response.completed') => ({
     id: 'resp-billed',
     usage: {
       input_tokens: 120,
-      input_tokens_details: { cached_tokens: 70 },
-      cache_write_tokens: 10,
+      input_tokens_details: { cached_tokens: 40, cache_write_tokens: 60 },
       output_tokens: 12,
       output_tokens_details: { reasoning_tokens: 4 },
     },
@@ -537,10 +548,12 @@ test.each(['response.completed', 'response.incomplete'])(
   'billing HTTP %s reports exact vault usage once after body end',
   async (type) => {
     const env = await billingFixture()
+    const clone = spyOn(Request.prototype, 'clone')
     try {
       const response = await env.send(
         new Response(billingSse(billingTerminal(type))),
       )
+      expect(clone).toHaveBeenCalledTimes(1)
       expect(env.reports).toEqual([])
       await response.text()
       expect(env.reports).toEqual([
@@ -557,16 +570,17 @@ test.each(['response.completed', 'response.incomplete'])(
           attempt: 1,
           provider_response_id: 'resp-billed',
           usage: {
-            input: 40,
+            input: 20,
             output: 12,
-            cache_read: 70,
-            cache_write: 10,
+            cache_read: 40,
+            cache_write: 60,
             reasoning: 4,
             reasoning_included_in_output: true,
           },
         },
       ])
     } finally {
+      clone.mockRestore()
       await env.installation.dispose()
     }
   },
@@ -669,8 +683,10 @@ test('billing HTTP title preserves kind and omits unmeasured counts and zero cac
             response: {
               usage: {
                 input_tokens: 5,
-                input_tokens_details: { cached_tokens: 9 },
-                cache_write_tokens: 0,
+                input_tokens_details: {
+                  cached_tokens: 9,
+                  cache_write_tokens: 0,
+                },
               },
             },
           }),

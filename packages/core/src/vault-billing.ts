@@ -10,10 +10,11 @@ import { isRecord } from './util/record'
 /** Codex input includes cache hits and measured cache writes; billing input does not. */
 export function codexBillingUsage(value: unknown): BillingUsage | undefined {
   if (!isRecord(value)) return undefined
-  const cached = isRecord(value.input_tokens_details)
-    ? value.input_tokens_details.cached_tokens
+  const details = isRecord(value.input_tokens_details)
+    ? value.input_tokens_details
     : undefined
-  const written = value.cache_write_tokens
+  const cached = details?.cached_tokens
+  const written = details?.cache_write_tokens
   const reasoning = isRecord(value.output_tokens_details)
     ? value.output_tokens_details.reasoning_tokens
     : undefined
