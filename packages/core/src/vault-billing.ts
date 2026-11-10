@@ -3,9 +3,15 @@ import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import {
   type BillingRequestKind,
   type BillingUsage,
+  isCacheWarmStopReason,
   reportRouting,
 } from '@cortexkit/common-auth/routing-accessor'
 import { isRecord } from './util/record'
+
+export interface VaultBillingWarming {
+  on: boolean
+  stopReason?: string
+}
 
 /** Codex input includes cache hits and measured cache writes; billing input does not. */
 export function codexBillingUsage(value: unknown): BillingUsage | undefined {
@@ -56,6 +62,7 @@ export class VaultBillingAttempt {
     private readonly requestKind: BillingRequestKind,
     private readonly model: string,
     private readonly attempt: number,
+    private readonly warming?: (sessionId: string) => VaultBillingWarming,
   ) {}
 
   event(event: unknown): void {
@@ -96,6 +103,12 @@ export class VaultBillingAttempt {
   end(outputStarted: boolean, ended: boolean, status?: number): void {
     if (this.reported) return
     this.reported = true
+    let warming: VaultBillingWarming | undefined
+    try {
+      warming = this.warming?.(this.sessionId)
+    } catch {
+      // Optional accounting cannot interrupt the host if a manager was released.
+    }
     reportRouting({
       sessionId: this.sessionId,
       kind: 'billing',
@@ -108,6 +121,17 @@ export class VaultBillingAttempt {
       provider: 'openai',
       model: this.model,
       attempt: this.attempt,
+      cache: {
+        implicit: true,
+        warming: warming?.on
+          ? { on: true }
+          : {
+              on: false,
+              ...(isCacheWarmStopReason(warming?.stopReason)
+                ? { stopReason: warming.stopReason }
+                : {}),
+            },
+      },
       outcome:
         this.failed || (status !== undefined && (status < 200 || status >= 300))
           ? 'failed'

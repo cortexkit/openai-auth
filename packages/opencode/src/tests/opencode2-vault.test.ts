@@ -1130,6 +1130,7 @@ for (const hosted of [undefined, 'relay'] as const) {
     expect(new Set(reports.map((value) => value.attempt_id)).size).toBe(3)
     expect(reports[0]).toEqual({
       kind: 'billing',
+      cache: { implicit: true, warming: { on: false } },
       attempt_id: expect.any(String),
       request_kind: 'primary',
       credential_id: 'oauth:openai:vault',

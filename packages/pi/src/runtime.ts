@@ -61,6 +61,7 @@ import {
   redactCredentialResponse,
   redactCredentialText,
   type SessionDispatch,
+  sessionCacheKeepPlan,
   ttlForModel,
   VAULT_REQUEST_ROSTER_WAIT_MS,
   VaultBillingAttempt,
@@ -933,6 +934,12 @@ export class PiOpenAIRuntime {
         'primary',
         model.id,
         execution.billingAttempt,
+        (sessionId) => {
+          const plan = sessionCacheKeepPlan(sessionId)
+          return plan && plan.mode !== 'off'
+            ? { on: false, stopReason: 'unsupported' }
+            : { on: false }
+        },
       )
     }
     let status: number | undefined

@@ -42,6 +42,7 @@ import {
   type OpenAiVault,
   shouldCaptureSessionCache,
   VaultBillingAttempt,
+  type VaultBillingWarming,
 } from '@cortexkit/openai-auth-core/internal'
 import {
   CACHE_KEEP_CAPS,
@@ -198,6 +199,18 @@ const processState = globalThis as typeof globalThis & {
 const entries = processState[registryKey] ?? new Map<string, Entry>()
 processState[registryKey] = entries
 
+/** Read the existing store's session state without starting a keep-warm manager. */
+export function cacheKeepWarming(
+  paths: AccountPaths,
+  sessionID: string,
+): VaultBillingWarming {
+  const key = JSON.stringify([
+    resolve(paths.configPath),
+    resolve(paths.statePath),
+  ])
+  return entries.get(key)?.manager.warming(sessionID) ?? { on: false }
+}
+
 function createEntry(
   setup: CacheKeepManagerSetup,
   settings: CacheKeepSettingsView,
@@ -252,6 +265,7 @@ function createEntry(
         'keep_warm',
         model,
         attempt,
+        (sessionId) => manager.warming(sessionId),
       )
       return {
         response: (response) => observeBillingResponse(record, response),

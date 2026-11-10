@@ -327,6 +327,7 @@ test('OpenCode 2 reports a completed vault WebSocket response without waiting', 
       },
       {
         kind: 'billing',
+        cache: { implicit: true, warming: { on: false } },
         attempt_id: expect.any(String),
         request_kind: 'primary',
         credential_id: 'credential-b',
@@ -559,6 +560,7 @@ test.each(['response.completed', 'response.incomplete'])(
       expect(env.reports).toEqual([
         {
           kind: 'billing',
+          cache: { implicit: true, warming: { on: false } },
           attempt_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
           request_kind: 'primary',
           credential_id: 'credential-a',
@@ -596,6 +598,7 @@ test('billing HTTP 429 fails without usage', async () => {
     expect(env.reports).toEqual([
       {
         kind: 'billing',
+        cache: { implicit: true, warming: { on: false } },
         attempt_id: expect.any(String),
         request_kind: 'primary',
         credential_id: 'credential-a',

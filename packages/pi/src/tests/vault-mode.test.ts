@@ -1719,14 +1719,20 @@ describe('Pi vault slot lifecycle', () => {
   })
 })
 
-for (const outcome of [
-  'completed',
-  'throw',
-  'error',
-  'error-id',
-  'aborted',
+for (const { outcome, plan, warming } of [
+  { outcome: 'completed', plan: undefined, warming: { on: false } },
+  { outcome: 'completed', plan: 'off', warming: { on: false } },
+  {
+    outcome: 'completed',
+    plan: 'always',
+    warming: { on: false, stop_reason: 'unsupported' },
+  },
+  { outcome: 'throw', plan: undefined, warming: { on: false } },
+  { outcome: 'error', plan: undefined, warming: { on: false } },
+  { outcome: 'error-id', plan: undefined, warming: { on: false } },
+  { outcome: 'aborted', plan: undefined, warming: { on: false } },
 ] as const) {
-  test(`billing Pi injected vault stream ${outcome} reports once with Pi session id`, async () => {
+  test(`billing Pi injected vault stream ${outcome} plan ${plan ?? 'none'} reports once with Pi session id`, async () => {
     const key = Symbol.for('cortexkit.routing')
     const original = Object.getOwnPropertyDescriptor(globalThis, key)
     const reports: Record<string, unknown>[] = []
@@ -1734,6 +1740,7 @@ for (const outcome of [
     Reflect.set(globalThis, key, (sessionId: string) => {
       sessions.push(sessionId)
       return {
+        cache: () => (plan ? { keep_warm: plan } : undefined),
         report: (payload: Record<string, unknown>) => {
           if (payload.kind === 'billing') reports.push(payload)
         },
@@ -1807,6 +1814,7 @@ for (const outcome of [
       expect(reports).toEqual([
         {
           kind: 'billing',
+          cache: { implicit: true, warming },
           attempt_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
           request_kind: 'primary',
           credential_id: 'oauth:openai:vault',

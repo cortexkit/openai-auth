@@ -1744,6 +1744,10 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         output: expect.any(Number),
       })
       expect(primary[0]).not.toHaveProperty('status')
+      expect(primary[0]!.cache).toEqual({
+        implicit: true,
+        warming: { on: false },
+      })
       expect(samplesOn(result, 'ws')).toHaveLength(1)
       expect(Object.keys(primary[0]!.usage as object).length).toBeGreaterThan(1)
     })

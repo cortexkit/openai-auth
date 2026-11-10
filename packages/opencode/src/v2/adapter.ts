@@ -103,6 +103,7 @@ import {
   type SessionDispatch,
   ttlForModel,
   VaultBillingAttempt,
+  type VaultBillingWarming,
   type VaultModeRefusal,
   type VaultRoutingResponse,
   vaultModeNoRouteCause,
@@ -240,6 +241,8 @@ export type OpenAIAttemptData =
     }
 
 export interface OpenAIAdapterDeps {
+  /** Reads this account store's live keep-warm state at the end of a served call. */
+  cacheWarming?: (sessionId: string) => VaultBillingWarming
   /** Supplies limit ownership and waits for account readiness; always supplied by setup. */
   limits?: OpenCodeLimitSource
   codex?: CodexHttpState
@@ -530,6 +533,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           attempt.kind,
           model,
           count,
+          deps.cacheWarming,
         ),
       )
     }

@@ -112,6 +112,7 @@ import {
   type CacheKeepCaptureInput,
   type CacheKeepManagerSetup,
   cacheKeepSettingsOf,
+  cacheKeepWarming,
 } from './cache-keep'
 import { acquireCodexSessions } from './codex-sessions'
 import { CodexHttpState, codexReplayRequest } from './codex-wire'
@@ -812,6 +813,7 @@ export async function setupOpenAIAuth(
     },
   }
   const openai = createOpenAIAdapter({
+    cacheWarming: (sessionId) => cacheKeepWarming(paths(), sessionId),
     limits,
     codex,
     onRoute: sidebar.route,

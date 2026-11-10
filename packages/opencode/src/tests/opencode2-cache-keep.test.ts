@@ -9,20 +9,26 @@ import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { CacheKeepManager } from '@cortexkit/common-auth/cachekeep'
-import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
+import {
+  type Attempt,
+  placeholderSecret,
+} from '@cortexkit/common-auth/opencode2'
 import { CACHE_KEEP_CAPS } from '../core/cachekeep'
 import { drainNotifications } from '../rpc/notifications'
 import { createRpcClient } from '../rpc/rpc-client'
 import { resolveRpcDir } from '../rpc/rpc-dir'
+import { createOpenAIAdapter, type OpenAIAttemptData } from '../v2/adapter'
 import {
   acquireCacheKeep,
   type CacheKeepCaptureInput,
   type CacheKeepLease,
   type CacheKeepLocation,
   type CacheKeepSettingsView,
+  cacheKeepWarming,
 } from '../v2/cache-keep'
 import { CodexHttpState, codexReplayRequest } from '../v2/codex-wire'
 import { acquireFrameMirror, FrameMirror } from '../v2/frame-mirror'
+import { SessionPins } from '../v2/pins'
 import { acquireSessionAccounts } from '../v2/session-accounts'
 import { setupOpenAIAuth } from '../v2/setup'
 import {
@@ -1642,6 +1648,7 @@ test('billing keep-warm reports a vault send with measured usage', async () => {
     expect(reports).toEqual([
       {
         kind: 'billing',
+        cache: { implicit: true, warming: { on: true } },
         attempt_id: expect.any(String),
         request_kind: 'keep_warm',
         credential_id: 'credential-V',
@@ -1664,5 +1671,110 @@ test('billing keep-warm reports a vault send with measured usage', async () => {
   } finally {
     if (previous) Object.defineProperty(globalThis, key, previous)
     else Reflect.deleteProperty(globalThis, key)
+  }
+})
+
+test('billing cache facts follow tracked, count-cap and internal idle manager states', async () => {
+  const reports: Record<string, unknown>[] = []
+  routing[routingKey] = () => ({
+    report: (value: Record<string, unknown>) => {
+      if (value.kind === 'billing') reports.push(value)
+    },
+  })
+  const fake = served()
+  fake.state.settings.subagents = true
+  fake.state.parents.set('ses', 'parent')
+  const paths = storePaths()
+  const { lease, clock } = acquire(fake.location, { paths })
+  expect(cacheKeepWarming(storePaths(), 'ses')).toEqual({ on: false })
+  const openai = createOpenAIAdapter({
+    cacheWarming: (sessionId) => cacheKeepWarming(paths, sessionId),
+    pins: new SessionPins(),
+    storage: async () => null,
+    source: {
+      current: async () => ({ active: true, rows: [] }),
+      peek: () => ({ active: true, rows: [] }),
+      prepareTokens: async () => {},
+      usableToken: () => undefined,
+      refreshBackoffFor: () => new Map(),
+      requestReading: () => {},
+      recordSnapshot: () => {},
+    },
+  })
+  const begin = async () => {
+    const attempt: Attempt<OpenAIAttemptData> = {
+      providerID: 'openai',
+      modelID: 'gpt-5.6',
+      sessionID: 'ses',
+      agent: 'build',
+      kind: 'primary',
+      accountId: 'A',
+      attemptId: randomUUID(),
+      transport: 'ws',
+      data: {
+        kind: 'vault',
+        routeId: 'A',
+        receipt: {
+          credentialId: 'credential-A',
+          credentialType: 'oauth',
+          accountIdentity: 'chatgpt-A',
+          accountIdentitySource: 'asserted',
+          accessToken: 'vault-test-token',
+          recordVersion: 1,
+          expiresAtMs: null,
+        },
+      },
+    }
+    await openai.adapter.rewriteWebSocketFrame!({
+      ...attempt,
+      frame: JSON.stringify({
+        type: 'response.create',
+        model: 'gpt-5.6',
+        input: [],
+      }),
+      attempt,
+    })
+    return async () => {
+      openai.adapter.inspectEvent!({
+        attempt,
+        transport: 'ws',
+        data: JSON.stringify({
+          type: 'response.completed',
+          response: { id: 'cache-facts' },
+        }),
+      })
+      await openai.adapter.onAttemptEnd!(attempt, { outputStarted: true })
+    }
+  }
+  try {
+    await lease.capture(captured('ses', { model: 'gpt-5.6' }))
+    expect(lease.manager.warming('ses')).toEqual({ on: true })
+    await (await begin())()
+    // Read warming state at request end, after two keep-warm sends reach the count cap.
+    const capped = await begin()
+    await advance(lease, clock, 29 * MINUTE)
+    await advance(lease, clock, 29 * MINUTE)
+    expect(lease.manager.warming('ses')).toEqual({
+      on: false,
+      stopReason: 'count-cap',
+    })
+    await capped()
+    fake.state.parents.delete('ses')
+    await lease.capture(captured('ses'))
+    const idle = await begin()
+    for (let index = 0; index < 16; index++)
+      await advance(lease, clock, 4 * MINUTE)
+    expect(lease.manager.warming('ses')).toEqual({
+      on: false,
+      stopReason: 'idle',
+    })
+    await idle()
+    expect(reports.map((report) => report.cache)).toEqual([
+      { implicit: true, warming: { on: true } },
+      { implicit: true, warming: { on: false, stop_reason: 'count-cap' } },
+      { implicit: true, warming: { on: false } },
+    ])
+  } finally {
+    openai.dispose()
   }
 })
