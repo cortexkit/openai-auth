@@ -1057,3 +1057,97 @@ describe('vault accounts on OpenCode 2', () => {
     expect(JSON.parse(readFileSync(authPath, 'utf8')).openai).toEqual(login)
   })
 })
+
+for (const hosted of [undefined, 'relay'] as const) {
+  it(`billing WebSocket ${hosted ?? 'vault'} reports each send on a reused socket and a cut on retry`, async () => {
+    const key = Symbol.for('cortexkit.routing')
+    const original = Object.getOwnPropertyDescriptor(globalThis, key)
+    const reports: Record<string, unknown>[] = []
+    Reflect.set(globalThis, key, () => ({
+      report: (value: Record<string, unknown>) => {
+        if (value.kind === 'billing') reports.push(value)
+      },
+    }))
+    cleanups.push(() => {
+      if (original) Object.defineProperty(globalThis, key, original)
+      else Reflect.deleteProperty(globalThis, key)
+    })
+    const { host } = await start(
+      'main-first',
+      [],
+      { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+      { hosted },
+    )
+    const request = scope('billing-ws')
+    await host.fire('experimental.ws.handshake', {
+      ...request,
+      url: 'wss://codex.test/responses',
+      headers: { authorization: `Bearer ${PLACEHOLDER}` },
+    })
+    const send = () =>
+      host.fire('experimental.ws.send', {
+        ...request,
+        frame: JSON.stringify({
+          type: 'response.create',
+          model: 'gpt-5.5',
+          input: [],
+        }),
+      })
+    const receive = (event: unknown) =>
+      host.fire('experimental.ws.receive', {
+        ...request,
+        frame: JSON.stringify(event),
+      })
+    await send()
+    await receive({
+      type: 'response.completed',
+      response: {
+        id: 'ws-1',
+        usage: {
+          input_tokens: 100,
+          input_tokens_details: { cached_tokens: 80 },
+          output_tokens: 9,
+          cache_write_tokens: 0,
+        },
+      },
+    })
+    await send()
+    await receive({ type: 'response.incomplete', response: { id: 'ws-2' } })
+    await send()
+    await receive({ type: 'response.output_text.delta', delta: 'hello' })
+    await host.fire('retry', {
+      ...request,
+      attempt: 1,
+      error: { type: 'provider.transport', message: 'socket closed' },
+      decision: { retry: false },
+    })
+    expect(reports.map((value) => [value.outcome, value.attempt])).toEqual([
+      ['completed', 1],
+      ['completed', 2],
+      ['cut', 3],
+    ])
+    expect(new Set(reports.map((value) => value.attempt_id)).size).toBe(3)
+    expect(reports[0]).toEqual({
+      kind: 'billing',
+      attempt_id: expect.any(String),
+      request_kind: 'primary',
+      credential_id: 'oauth:openai:vault',
+      account_id: 'chatgpt-vault',
+      provider: 'openai',
+      model: 'gpt-5.5',
+      outcome: 'completed',
+      attempt: 1,
+      provider_response_id: 'ws-1',
+      usage: {
+        input: 20,
+        output: 9,
+        cache_read: 80,
+        reasoning_included_in_output: true,
+      },
+    })
+    expect(reports[1]).not.toHaveProperty('usage')
+    expect(reports[2]).not.toHaveProperty('usage')
+    await host.publish('session.deleted', { sessionID: request.sessionID })
+    expect(reports).toHaveLength(3)
+  })
+}

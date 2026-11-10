@@ -81,3 +81,7 @@ Static OpenAI API keys held in the vault (`apikey:openai`) are not used: they ar
 ## Leftovers from earlier versions
 
 Earlier vault integrations replaced local credentials with **tombstones**, non-secret markers that are not usable logins. These can remain in account rows or OpenCode's slot, along with an old `claustrum.mode` setting; they are never sent or refreshed. **Auth doctor**, the credential diagnostics in `opencode auth login`, lists them and suggests connecting OpenCode to the vault or signing in again.
+
+## Pi cost tracking under Thalamus
+
+Under Thalamus, Pi reports each vault-served call's measured token counts to Thalamus for cost tracking, using Pi's own session id. Pi's provider stream does not reliably distinguish summaries or compaction from other requests, so these calls are reported as primary requests. The provider library's internal pre-output retries and WebSocket-to-HTTP fallback are covered by the stream's final report, rather than separate reports. No reply content, credentials or access tokens are sent in billing reports; local-account calls are not reported.

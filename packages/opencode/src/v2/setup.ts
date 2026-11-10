@@ -65,6 +65,7 @@ import {
   redactCredentialResponse,
   redactCredentialText,
   reportSessionCacheResponse,
+  type VaultBillingAttempt,
   vaultStateDir,
 } from '@cortexkit/openai-auth-core/internal'
 import type { Plugin } from '@opencode/plugin'
@@ -103,6 +104,7 @@ import { createLogger, setLogLevel } from '../logger'
 import { PackageVersion } from '../version'
 import {
   createOpenAIAdapter,
+  inspectCodexEvent,
   OPENAI_HOST_RETRY_LIMIT,
   OPENAI_PROVIDER_ID,
   type OpenAIAdapterLogger,
@@ -240,6 +242,10 @@ async function installPoolHooks<Q, A>(
   }) => Promise<void>,
   mirror?: FrameMirror,
   onOwnedFrame?: (sessionID: string) => void,
+  startBilling?: (
+    attempt: Attempt<A>,
+    body: string,
+  ) => VaultBillingAttempt | undefined,
 ) {
   const dumps = new RequestDumps(log)
   // installOpenCode2Auth supplies an Attempt to the rewrite callbacks before it
@@ -257,13 +263,28 @@ async function installPoolHooks<Q, A>(
       url: string
       headers: Headers
       pending: boolean
+      billing?: { record: VaultBillingAttempt; outputStarted: boolean }
     }
   >()
   const latest = new Map<string, string>()
+  const endBilling = (
+    socket:
+      | { billing?: { record: VaultBillingAttempt; outputStarted: boolean } }
+      | undefined,
+    ended = false,
+  ) => {
+    if (!socket?.billing) return
+    const { record, outputStarted } = socket.billing
+    delete socket.billing
+    record.end(outputStarted, ended)
+  }
   const forget = (sessionID: string) => {
     latest.delete(sessionID)
     for (const key of sockets.keys())
-      if (key.startsWith(`${sessionID}:`)) sockets.delete(key)
+      if (key.startsWith(`${sessionID}:`)) {
+        endBilling(sockets.get(key))
+        sockets.delete(key)
+      }
   }
   const recordPrimaryWebSocketFrame = (
     sent: SessionHooks['experimental.ws.send'],
@@ -296,8 +317,16 @@ async function installPoolHooks<Q, A>(
               prepared?.get('authorization') ===
               `Bearer ${placeholderSecret(adapter.providerID)}`
             const observation: { attempt?: Attempt<A> } = {}
-            if (handshake)
+            if (handshake) {
+              endBilling(
+                sockets.get(`${handshake.sessionID}:${handshake.kind}`),
+              )
               sockets.delete(`${handshake.sessionID}:${handshake.kind}`)
+            }
+            if (name === 'retry') {
+              const retry = draft as SessionHooks['retry']
+              endBilling(sockets.get(`${retry.sessionID}:primary`))
+            }
             try {
               await observing.run(observation, () => callback(draft))
             } catch (error) {
@@ -331,6 +360,13 @@ async function installPoolHooks<Q, A>(
             if (name === 'experimental.ws.send') {
               const sent = draft as SessionHooks['experimental.ws.send']
               const socket = sockets.get(`${sent.sessionID}:${sent.kind}`)
+              if (socket && startBilling) {
+                const record = startBilling(socket.attempt, sent.frame)
+                if (record) {
+                  endBilling(socket)
+                  socket.billing = { record, outputStarted: false }
+                }
+              }
               if (socket) socket.pending = true
               if (socket) await dumps.frame(sent.frame, socket.attempt)
               if (socket && sent.kind === 'primary')
@@ -376,7 +412,10 @@ async function installPoolHooks<Q, A>(
               }
               if (sockets.size > 512) {
                 const oldest = sockets.keys().next().value
-                if (oldest) sockets.delete(oldest)
+                if (oldest) {
+                  endBilling(sockets.get(oldest))
+                  sockets.delete(oldest)
+                }
               }
             } else if (name === 'experimental.ws.receive') {
               const received = draft as SessionHooks['experimental.ws.receive']
@@ -384,6 +423,26 @@ async function installPoolHooks<Q, A>(
                 `${received.sessionID}:${received.kind}`,
               )
               if (socket) {
+                if (socket.billing) {
+                  socket.billing.outputStarted ||=
+                    inspectCodexEvent(received.frame, Date.now())
+                      ?.outputStarted === true
+                  try {
+                    const event = JSON.parse(received.frame)
+                    socket.billing.record.event(event)
+                    if (
+                      [
+                        'response.completed',
+                        'response.incomplete',
+                        'response.failed',
+                        'error',
+                      ].includes(event.type)
+                    )
+                      endBilling(socket, true)
+                  } catch {
+                    // Malformed frames cannot establish completion or usage.
+                  }
+                }
                 // Only an owned socket's frames move the frame turn state.
                 codex.frameReceived(received.sessionID, received.frame)
                 if (received.kind === 'primary') {
@@ -531,6 +590,7 @@ async function installPoolHooks<Q, A>(
     ...installation,
     dispose: async () => {
       latest.clear()
+      for (const socket of sockets.values()) endBilling(socket)
       sockets.clear()
       await dispose()
       await dumps.settle()
@@ -840,6 +900,7 @@ export async function setupOpenAIAuth(
     (input: CacheKeepCaptureInput) => cacheKeep.capture(input),
     mirror,
     (sessionID) => cacheKeep.forget(sessionID),
+    openai.startBilling,
   )
   openai.attach(installation)
   const turns = await ctx.session.hook('prompt', (draft) => {

@@ -482,3 +482,232 @@ for (const scenario of [
     }
   })
 }
+
+const billingTerminal = (type = 'response.completed') => ({
+  type,
+  response: {
+    id: 'resp-billed',
+    usage: {
+      input_tokens: 120,
+      input_tokens_details: { cached_tokens: 70 },
+      cache_write_tokens: 10,
+      output_tokens: 12,
+      output_tokens_details: { reasoning_tokens: 4 },
+    },
+  },
+})
+const billingSse = (event: unknown) => `data: ${JSON.stringify(event)}\n\n`
+
+async function billingFixture(vaultMode = true, accessor = true) {
+  const reports: Record<string, unknown>[] = []
+  if (accessor)
+    Reflect.set(globalThis, key, () => ({
+      report: (payload: Record<string, unknown>) => {
+        if (payload.kind === 'billing') reports.push(payload)
+        return new Promise(() => {})
+      },
+    }))
+  else Reflect.deleteProperty(globalThis, key)
+  const env = fixture(vaultMode)
+  const host = fakeOpenCode2Host()
+  const installation = await installOpenCode2Auth(host.ctx, env.openai.adapter)
+  const send = async (
+    response: Response,
+    kind: 'primary' | 'title' = 'primary',
+  ) => {
+    const request = await host.fire('http.request', {
+      ...scope('fleet-session', kind),
+      request: new Request('https://codex.test/responses', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${placeholderSecret('openai')}` },
+        body: JSON.stringify({ model: 'gpt-6', input: [] }),
+      }),
+    })
+    const received = await host.fire('http.response', {
+      ...scope('fleet-session', kind),
+      request: request.request,
+      response,
+    })
+    return received.response
+  }
+  return { ...env, host, installation, reports, send }
+}
+
+test.each(['response.completed', 'response.incomplete'])(
+  'billing HTTP %s reports exact vault usage once after body end',
+  async (type) => {
+    const env = await billingFixture()
+    try {
+      const response = await env.send(
+        new Response(billingSse(billingTerminal(type))),
+      )
+      expect(env.reports).toEqual([])
+      await response.text()
+      expect(env.reports).toEqual([
+        {
+          kind: 'billing',
+          attempt_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+          request_kind: 'primary',
+          credential_id: 'credential-a',
+          account_id: 'account-a',
+          provider: 'openai',
+          model: 'gpt-6',
+          outcome: 'completed',
+          status: 200,
+          attempt: 1,
+          provider_response_id: 'resp-billed',
+          usage: {
+            input: 40,
+            output: 12,
+            cache_read: 70,
+            cache_write: 10,
+            reasoning: 4,
+            reasoning_included_in_output: true,
+          },
+        },
+      ])
+    } finally {
+      await env.installation.dispose()
+    }
+  },
+)
+
+test('billing HTTP 429 fails without usage', async () => {
+  const env = await billingFixture()
+  try {
+    const response = await env.send(
+      new Response('{"error":{"code":"usage_limit_reached"}}', { status: 429 }),
+    )
+    await response.text()
+    expect(env.reports).toEqual([
+      {
+        kind: 'billing',
+        attempt_id: expect.any(String),
+        request_kind: 'primary',
+        credential_id: 'credential-a',
+        account_id: 'account-a',
+        provider: 'openai',
+        model: 'gpt-6',
+        outcome: 'failed',
+        status: 429,
+        attempt: 1,
+      },
+    ])
+  } finally {
+    await env.installation.dispose()
+  }
+})
+
+test('billing HTTP cut then same-account continuation increments attempt and resets on a user turn', async () => {
+  const env = await billingFixture()
+  const continuation = spyOn(env.openai.adapter, 'retrySameAccount')
+  let controller!: ReadableStreamDefaultController<Uint8Array>
+  try {
+    const response = await env.send(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(value) {
+            controller = value
+          },
+        }),
+      ),
+    )
+    controller.enqueue(
+      new TextEncoder().encode(
+        billingSse({ type: 'response.output_text.delta', delta: 'hello' }),
+      ),
+    )
+    const reader = response.body!.getReader()
+    await reader.read()
+    controller.error(new Error('socket interrupted'))
+    await expect(reader.read()).rejects.toThrow('socket interrupted')
+    await env.host.fire('retry', {
+      ...scope('fleet-session'),
+      attempt: 1,
+      error: { type: 'provider.transport', message: 'interrupted' },
+      decision: { retry: true, delay: 0 },
+    })
+    expect(continuation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        continuation: 'interrupted-read',
+        accountId: 'vault:a',
+      }),
+    )
+    const continued = await env.send(
+      new Response(billingSse(billingTerminal())),
+    )
+    await continued.text()
+    expect(
+      env.reports.map((value) => [
+        value.outcome,
+        value.attempt,
+        value.credential_id,
+      ]),
+    ).toEqual([
+      ['cut', 1, 'credential-a'],
+      ['completed', 2, 'credential-a'],
+    ])
+    expect(env.reports[0]!.attempt_id).not.toBe(env.reports[1]!.attempt_id)
+    expect(env.reports[0]).not.toHaveProperty('usage')
+    env.openai.beginTurn('fleet-session')
+    await (await env.send(new Response(billingSse(billingTerminal())))).text()
+    expect(env.reports[2]!.attempt).toBe(1)
+  } finally {
+    continuation.mockRestore()
+    await env.installation.dispose()
+  }
+})
+
+test('billing HTTP title preserves kind and omits unmeasured counts and zero cache writes', async () => {
+  const env = await billingFixture()
+  try {
+    await (
+      await env.send(
+        new Response(
+          billingSse({
+            type: 'response.completed',
+            response: {
+              usage: {
+                input_tokens: 5,
+                input_tokens_details: { cached_tokens: 9 },
+                cache_write_tokens: 0,
+              },
+            },
+          }),
+        ),
+        'title',
+      )
+    ).text()
+    expect(env.reports[0]).toMatchObject({
+      request_kind: 'title',
+      usage: { input: 0, cache_read: 9, reasoning_included_in_output: true },
+    })
+    expect(env.reports[0]!.usage).toEqual({
+      input: 0,
+      cache_read: 9,
+      reasoning_included_in_output: true,
+    })
+    expect(env.reports[0]).not.toHaveProperty('provider_response_id')
+  } finally {
+    await env.installation.dispose()
+  }
+})
+
+test.each([
+  [false, true],
+  [true, false],
+])(
+  'billing gate vault=%s accessor=%s reports nothing',
+  async (vaultMode, accessor) => {
+    const env = await billingFixture(vaultMode, accessor)
+    try {
+      const response = await env.send(
+        new Response(billingSse(billingTerminal())),
+      )
+      await response.text()
+      expect(env.reports).toEqual([])
+    } finally {
+      await env.installation.dispose()
+    }
+  },
+)

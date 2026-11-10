@@ -74,3 +74,7 @@ One difference: OpenCode 2 always places the sidebar after its own panels, so th
 ## Host API note
 
 OpenCode 2 has no transcript-only feedback surface for this command: its [`execute` type](https://unpkg.com/@opencode/plugin@2.0.32/dist/promise/command.d.ts) returns `Promise<void>` (lines 11–14). Its [`session.synthetic` endpoint](https://unpkg.com/@opencode/protocol@2.0.32/dist/groups/session.js) durably admits session input even with `resume: false` (lines 331–348), rather than appending an ignored notice. The plugin therefore logs the refusal instead of inserting text into the conversation or starting a model turn.
+
+## Cost tracking under Thalamus
+
+Under Thalamus, the plugin reports token counts for each vault-served call, including title, compaction and keep-warm calls, to Thalamus for cost tracking. Reports contain request metadata and measured token counts, not reply content, credentials or access tokens. Local-account calls are not reported.

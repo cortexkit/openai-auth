@@ -1615,3 +1615,54 @@ describe('OpenCode 2 keep-warm in setup', () => {
     expect(managerOf(files)).toBeUndefined()
   })
 })
+
+test('billing keep-warm reports a vault send with measured usage', async () => {
+  const key = Symbol.for('cortexkit.routing')
+  const previous = Object.getOwnPropertyDescriptor(globalThis, key)
+  const reports: Record<string, unknown>[] = []
+  Reflect.set(globalThis, key, () => ({
+    report: (value: Record<string, unknown>) => {
+      if (value.kind === 'billing') reports.push(value)
+    },
+  }))
+  try {
+    const fake = served()
+    fake.state.authority = 'vault'
+    fake.state.owned.add('V')
+    fake.state.accounts.set('ses', 'V')
+    fake.state.receiptIdentity.set('V', 'chatgpt-V')
+    fake.location.fetch = (async () =>
+      new Response(
+        `data: ${JSON.stringify({ type: 'response.completed', response: { id: 'warm-response', usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 60 }, cache_write_tokens: 5, output_tokens: 2 } } })}\n\n`,
+        { headers: { 'content-type': 'text/event-stream' } },
+      )) as unknown as typeof fetch
+    const { lease, clock } = acquire(fake.location)
+    await lease.capture(captured('ses', { accountId: 'V', mode: 'vault' }))
+    await advance(lease, clock, 4 * MINUTE)
+    expect(reports).toEqual([
+      {
+        kind: 'billing',
+        attempt_id: expect.any(String),
+        request_kind: 'keep_warm',
+        credential_id: 'credential-V',
+        account_id: 'chatgpt-V',
+        provider: 'openai',
+        model: 'gpt-5.5',
+        outcome: 'completed',
+        status: 200,
+        attempt: 1,
+        provider_response_id: 'warm-response',
+        usage: {
+          input: 35,
+          cache_read: 60,
+          cache_write: 5,
+          output: 2,
+          reasoning_included_in_output: true,
+        },
+      },
+    ])
+  } finally {
+    if (previous) Object.defineProperty(globalThis, key, previous)
+    else Reflect.deleteProperty(globalThis, key)
+  }
+})

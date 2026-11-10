@@ -45,6 +45,7 @@ import {
   createLogger,
   createSessionActivityStore,
   extractAccountId,
+  hasVaultRoutingAccessor,
   isCompleteQuotaHeaderFrame,
   limitAccountKey,
   loadAccounts,
@@ -62,6 +63,7 @@ import {
   type SessionDispatch,
   ttlForModel,
   VAULT_REQUEST_ROSTER_WAIT_MS,
+  VaultBillingAttempt,
   type VaultModeRefusal,
   vaultLimitsNamespace,
   vaultModeNoRouteCause,
@@ -787,7 +789,7 @@ export class PiOpenAIRuntime {
     model: Model<Api>,
     context: Context,
     options: SimpleStreamOptions | undefined,
-    execution: { canWait: boolean; wake?: PiWake },
+    execution: { canWait: boolean; wake?: PiWake; billingAttempt?: number },
   ): Promise<
     | ({ kind: 'sent'; decision?: LimitDecision } & StreamAttempt)
     | { kind: 'blocked'; block: PoolBlock; refusal?: VaultModeRefusal }
@@ -856,12 +858,16 @@ export class PiOpenAIRuntime {
           options?.signal?.aborted
             ? Promise.resolve(undefined)
             : account.vault
-              ? this.vaultAttempt(model, context, options, account.id).then(
-                  (attempt) => {
-                    if (!attempt) vaultRefused = true
-                    return attempt
-                  },
-                )
+              ? this.vaultAttempt(
+                  model,
+                  context,
+                  options,
+                  account.id,
+                  execution,
+                ).then((attempt) => {
+                  if (!attempt) vaultRefused = true
+                  return attempt
+                })
               : account.token
                 ? this.attempt(
                     model,
@@ -910,7 +916,25 @@ export class PiOpenAIRuntime {
     options: SimpleStreamOptions | undefined,
     accountId: string,
     token: string,
+    receipt?: QuotaReceipt,
+    execution?: { billingAttempt?: number },
   ): Promise<StreamAttempt> {
+    let billing: VaultBillingAttempt | undefined
+    if (
+      receipt?.credentialId &&
+      options?.sessionId &&
+      execution &&
+      hasVaultRoutingAccessor()
+    ) {
+      execution.billingAttempt = (execution.billingAttempt ?? 0) + 1
+      billing = new VaultBillingAttempt(
+        options.sessionId,
+        receipt,
+        'primary',
+        model.id,
+        execution.billingAttempt,
+      )
+    }
     let status: number | undefined
     let signal: LimitSignal | undefined
     let reading: OAuthQuotaSnapshot | undefined
@@ -991,6 +1015,7 @@ export class PiOpenAIRuntime {
         },
       })
     } catch (error) {
+      billing?.end(false, false, status)
       return {
         head: errorEvent(model, redactCredentialError(error, token).message),
         rest: undefined,
@@ -1000,9 +1025,30 @@ export class PiOpenAIRuntime {
     const iterator = (async function* () {
       let stopped = false
       let failed = false
+      let outputStarted = false
       try {
         for await (const event of inner) {
           if (event.type === 'done') stopped = true
+          if (billing) {
+            if (event.type === 'done')
+              billing.piCompleted(event.message.responseId, event.message.usage)
+            else if (event.type === 'error') {
+              billing.piResponseId(event.error.responseId)
+              if (event.reason !== 'aborted') billing.event({ type: 'error' })
+              // A first error is consumed by routing, which may discard the iterator.
+              billing.end(outputStarted, false, status)
+            } else if (
+              [
+                'text_start',
+                'text_delta',
+                'thinking_start',
+                'thinking_delta',
+                'toolcall_start',
+                'toolcall_delta',
+              ].includes(event.type)
+            )
+              outputStarted = true
+          }
           if (event.type === 'error') {
             failed = true
             // pi-ai reuses this message in earlier start/delta events; a clone leaves those aliases raw.
@@ -1027,7 +1073,10 @@ export class PiOpenAIRuntime {
             },
           )
       } catch (error) {
+        billing?.end(outputStarted, false, status)
         yield errorEvent(model, redactCredentialError(error, token).message)
+      } finally {
+        billing?.end(outputStarted, stopped && !failed, status)
       }
     })()
     const first = await iterator.next()
@@ -1053,6 +1102,7 @@ export class PiOpenAIRuntime {
     context: Context,
     options: SimpleStreamOptions | undefined,
     accountId: string,
+    execution: { billingAttempt?: number },
   ): Promise<StreamAttempt | undefined> {
     let last: StreamAttempt | undefined
     const response = await this.vault.send(
@@ -1074,7 +1124,15 @@ export class PiOpenAIRuntime {
         })
         // An attempt the vault retries is dropped unread: it ended without
         // streaming, so nothing of it reached Pi.
-        last = await this.attempt(model, context, options, accountId, token)
+        last = await this.attempt(
+          model,
+          context,
+          options,
+          accountId,
+          token,
+          attempt,
+          execution,
+        )
         return new Response(null, { status: last.status ?? 200 })
       },
       { site: 'model', ...(options?.signal ? { signal: options.signal } : {}) },

@@ -55,7 +55,12 @@ import { createPiMenu } from '../commands.ts'
 import { registerPiProvider } from '../index.ts'
 import { PiPoolSource } from '../pool-source.ts'
 import { clearPiStickyRouting } from '../routing.ts'
-import { FIRST_READING_WAIT_MS, PiOpenAIRuntime } from '../runtime.ts'
+import {
+  errorEvent,
+  FIRST_READING_WAIT_MS,
+  PiOpenAIRuntime,
+  type PiOpenAIRuntimeDeps,
+} from '../runtime.ts'
 import {
   openVaultSlot,
   VAULT_PLACEHOLDER_KEY,
@@ -186,9 +191,13 @@ function vault(
   })
 }
 
-function runtimeWith(target: OpenAiVault, slot?: PiSlot): PiOpenAIRuntime {
+function runtimeWith(
+  target: OpenAiVault,
+  slot?: PiSlot,
+  injectedStream = streamSimple as PiOpenAIRuntimeDeps['streamSimple'],
+): PiOpenAIRuntime {
   return new PiOpenAIRuntime({
-    streamSimple,
+    streamSimple: injectedStream,
     createStream: createAssistantMessageEventStream,
     paths: () => paths,
     fetchImpl: fakeFetch,
@@ -1709,3 +1718,140 @@ describe('Pi vault slot lifecycle', () => {
     }
   })
 })
+
+for (const outcome of [
+  'completed',
+  'throw',
+  'error',
+  'error-id',
+  'aborted',
+] as const) {
+  test(`billing Pi injected vault stream ${outcome} reports once with Pi session id`, async () => {
+    const key = Symbol.for('cortexkit.routing')
+    const original = Object.getOwnPropertyDescriptor(globalThis, key)
+    const reports: Record<string, unknown>[] = []
+    const sessions: string[] = []
+    Reflect.set(globalThis, key, (sessionId: string) => {
+      sessions.push(sessionId)
+      return {
+        report: (payload: Record<string, unknown>) => {
+          if (payload.kind === 'billing') reports.push(payload)
+        },
+      }
+    })
+    daemon = await startMockDaemon({
+      directory: dir,
+      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+    })
+    enroll()
+    const target = vault()
+    const runtime = runtimeWith(
+      target,
+      undefined,
+      (model, _context, options) => {
+        if (outcome === 'throw') throw new Error('failed before first event')
+        const stream = createAssistantMessageEventStream()
+        const error = errorEvent(model, 'provider failed')
+        if (error.type !== 'error') throw new Error('expected error fixture')
+        if (
+          outcome === 'error' ||
+          outcome === 'error-id' ||
+          outcome === 'aborted'
+        ) {
+          if (outcome === 'aborted')
+            stream.push({
+              type: 'text_start',
+              contentIndex: 0,
+              partial: error.error,
+            })
+          stream.push(
+            outcome === 'aborted'
+              ? { ...error, reason: 'aborted' }
+              : outcome === 'error-id'
+                ? {
+                    ...error,
+                    error: { ...error.error, responseId: 'resp_pi_FAILED-Id' },
+                  }
+                : error,
+          )
+          stream.end()
+          return stream
+        }
+        void (async () => {
+          await options?.onResponse?.({ status: 200, headers: {} }, model)
+          const message = {
+            ...error.error,
+            stopReason: 'stop' as const,
+            responseId: 'resp_pi_EXACT-Id',
+            usage: {
+              ...error.error.usage,
+              input: 30,
+              output: 12,
+              cacheRead: 70,
+              cacheWrite: 0,
+              reasoning: 4,
+            },
+          }
+          stream.push({ type: 'start', partial: message })
+          stream.push({ type: 'done', reason: 'stop', message })
+          stream.end()
+        })()
+        return stream
+      },
+    )
+    try {
+      await target.refresh()
+      await target.pollStale(0)
+      const events = await send(runtime, 'pi-own-session')
+      expect(sessions).toContain('pi-own-session')
+      expect(reports).toEqual([
+        {
+          kind: 'billing',
+          attempt_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+          request_kind: 'primary',
+          credential_id: 'oauth:openai:vault',
+          account_id: 'chatgpt-vault',
+          provider: 'openai',
+          model: MODEL.id,
+          outcome:
+            outcome === 'completed'
+              ? 'completed'
+              : outcome === 'aborted'
+                ? 'cut'
+                : 'failed',
+          attempt: 1,
+          ...(outcome === 'completed'
+            ? {
+                status: 200,
+                provider_response_id: 'resp_pi_EXACT-Id',
+                usage: {
+                  input: 30,
+                  output: 12,
+                  cache_read: 70,
+                  reasoning: 4,
+                  reasoning_included_in_output: true,
+                },
+              }
+            : outcome === 'error-id'
+              ? { provider_response_id: 'resp_pi_FAILED-Id' }
+              : {}),
+        },
+      ])
+      const final = events.findLast(
+        (event) => event.type === 'done' || event.type === 'error',
+      )
+      if (final?.type === 'done') {
+        expect(final.message.responseId).toBe('resp_pi_EXACT-Id')
+        expect(reports[0]!.provider_response_id).toBe(final.message.responseId)
+      } else if (final?.type === 'error' && final.error.responseId) {
+        expect(reports[0]!.provider_response_id).toBe(final.error.responseId)
+      } else {
+        expect(reports[0]).not.toHaveProperty('provider_response_id')
+      }
+    } finally {
+      await target.dispose()
+      if (original) Object.defineProperty(globalThis, key, original)
+      else Reflect.deleteProperty(globalThis, key)
+    }
+  })
+}

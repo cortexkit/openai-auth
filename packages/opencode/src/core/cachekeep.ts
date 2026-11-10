@@ -362,6 +362,13 @@ export interface CacheKeepCredentialCheck {
 
 export interface OpenAICacheKeepAdapterBaseOptions {
   fetchImpl: typeof fetch
+  /** Optional vault billing observer; absent on OpenCode 1 and local sends. */
+  observeBillingSend?: (
+    target: CacheKeepTargetView<OpenAICacheKeepMeta>,
+    body: string,
+    receipt: QuotaReceipt,
+    attempt: number,
+  ) => { response(response: Response): Response; failed(): void } | undefined
   /** Session policy activity is committed only after a successful warm is consumed. */
   activity?: {
     store: SessionActivityStore
@@ -439,6 +446,7 @@ export function createOpenAICacheKeepAdapter(
     buildBody: (target) => buildKeepwarmBody(target.bodyText),
 
     async send({ target, body, signal }) {
+      let physicalAttempt = 0
       // `vaultAttempt` is the vault's receipt when the vault sends (it calls
       // this with the served token and the receipt); a local send passes the
       // row's known identity instead.
@@ -480,6 +488,15 @@ export function createOpenAICacheKeepAdapter(
         }
 
         let warmBodyShape: Record<string, unknown> | undefined
+        const billing =
+          vaultAttempt && options.observeBillingSend
+            ? options.observeBillingSend(
+                target,
+                body,
+                vaultAttempt,
+                ++physicalAttempt,
+              )
+            : undefined
         try {
           const parsed = JSON.parse(body) as Record<string, unknown>
           warmBodyShape = {
@@ -501,7 +518,7 @@ export function createOpenAICacheKeepAdapter(
         })
 
         try {
-          const response = await options.fetchImpl(
+          const received = await options.fetchImpl(
             target.meta.url ?? options.codexResponsesUrl,
             sanitizeHttpFallbackInit({
               method: 'POST',
@@ -510,6 +527,7 @@ export function createOpenAICacheKeepAdapter(
               signal,
             }),
           )
+          const response = billing ? billing.response(received) : received
           if (vaultAttempt && target.accountId)
             options.vault?.reportUsage(
               target.accountId,
@@ -565,6 +583,7 @@ export function createOpenAICacheKeepAdapter(
             },
           )
         } catch (error) {
+          billing?.failed()
           throw redactCredentialError(error, accessToken)
         }
       }
@@ -659,6 +678,7 @@ export function createCacheKeepManager(
 ): OpenAICacheKeepManager {
   const {
     fetchImpl,
+    observeBillingSend,
     getMainToken: _getMainToken,
     refreshFallback: _refreshFallback,
     resolveLocal: _resolveLocal,
@@ -682,6 +702,7 @@ export function createCacheKeepManager(
     logger,
     adapter: createOpenAICacheKeepAdapter({
       fetchImpl,
+      observeBillingSend,
       ...local,
       vault,
       codexResponsesUrl,

@@ -59,4 +59,5 @@ export {
   VAULT_LOCAL_ACTION_REFUSAL,
   vaultAccountName,
 } from './vault-account-menu'
+export * from './vault-billing'
 export * from './vault-routing'

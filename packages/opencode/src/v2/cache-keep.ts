@@ -38,8 +38,10 @@ import {
   type AccountPaths,
   type AccountStorage,
   cacheKeepSettings,
+  hasVaultRoutingAccessor,
   type OpenAiVault,
   shouldCaptureSessionCache,
+  VaultBillingAttempt,
 } from '@cortexkit/openai-auth-core/internal'
 import {
   CACHE_KEEP_CAPS,
@@ -52,6 +54,7 @@ import {
 import type { OpenCodeLimitSource } from '../core/limit-source'
 import type { PoolAccountSource } from '../core/pool-account-source'
 import type { OpenAIAttemptData } from './adapter'
+import { observeBillingResponse } from './billing-response'
 import { acquireFrameMirror } from './frame-mirror'
 import type { ActiveAccounts } from './session-accounts'
 
@@ -232,6 +235,29 @@ function createEntry(
     return { token: access.token, identity: access.row.identity }
   }
   const manager: OpenAICacheKeepManager = createCacheKeepManager({
+    observeBillingSend(target, body, receipt, attempt) {
+      if (!receipt.credentialId || !hasVaultRoutingAccessor()) return undefined
+      const sessionId = target.meta.routingSessionId
+      if (!sessionId) return undefined
+      let model: unknown
+      try {
+        model = JSON.parse(body).model
+      } catch {
+        return undefined
+      }
+      if (typeof model !== 'string') return undefined
+      const record = new VaultBillingAttempt(
+        sessionId,
+        receipt,
+        'keep_warm',
+        model,
+        attempt,
+      )
+      return {
+        response: (response) => observeBillingResponse(record, response),
+        failed: () => record.end(false, false),
+      }
+    },
     ...CACHE_KEEP_CAPS,
     now: setup.now,
     ...(setup.setIntervalImpl

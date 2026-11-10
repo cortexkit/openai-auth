@@ -102,6 +102,7 @@ import {
   reportVaultRouting,
   type SessionDispatch,
   ttlForModel,
+  VaultBillingAttempt,
   type VaultModeRefusal,
   type VaultRoutingResponse,
   vaultModeNoRouteCause,
@@ -294,6 +295,11 @@ export interface OpenAIAdapter {
   ): void
   /** A user prompt starts a new turn; retries and auxiliary requests do not. */
   beginTurn(sessionId: string): void
+  /** Starts billing only for a vault send when Thalamus's global routing accessor is present. */
+  startBilling(
+    attempt: Attempt<OpenAIAttemptData>,
+    body: string,
+  ): VaultBillingAttempt | undefined
   dispose(): void
   /** Drops a session's pin and remembered account. */
   forgetSession(sessionId: string): void
@@ -501,6 +507,35 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     VaultRoutingResponse
   >()
   const routingFailures = new WeakSet<Attempt<OpenAIAttemptData>>()
+  const billing = new WeakMap<Attempt<OpenAIAttemptData>, VaultBillingAttempt>()
+  const billingCounts = new Map<string, number>()
+  const startBilling = (attempt: Attempt<OpenAIAttemptData>, body: string) => {
+    if (
+      attempt.data?.kind !== 'vault' ||
+      !attempt.data.receipt.credentialId ||
+      !hasVaultRoutingAccessor()
+    )
+      return undefined
+    const request = parseJson(body)
+    if (!isRecord(request) || typeof request.model !== 'string')
+      return undefined
+    if (attempt.transport === 'ws' && request.type !== 'response.create')
+      return undefined
+    const key = `${attempt.sessionID}\u0000${attempt.kind}`
+    const count = (billingCounts.get(key) ?? 0) + 1
+    billingCounts.set(key, count)
+    if (billingCounts.size > DEFAULT_MAX_RECORDS) {
+      const oldest = billingCounts.keys().next().value
+      if (oldest !== undefined) billingCounts.delete(oldest)
+    }
+    return new VaultBillingAttempt(
+      attempt.sessionID,
+      attempt.data.receipt,
+      attempt.kind,
+      request.model,
+      count,
+    )
+  }
   const { source, pins } = deps
   const now = deps.now ?? Date.now
   const log = deps.log
@@ -529,6 +564,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   // not to a later refusal. Keep the consumed wait until a new user prompt.
   const heldTurns = new Map<string, string>()
   const clearTurn = (sessionId: string) => {
+    for (const key of billingCounts.keys())
+      if (key.startsWith(`${sessionId}\u0000`)) billingCounts.delete(key)
     for (const [key, session] of heldTurns)
       if (session === sessionId) heldTurns.delete(key)
   }
@@ -1635,19 +1672,31 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     },
     chooseAccount,
     accountHeaders,
-    async rewriteRequest({ request, sessionID, kind }) {
+    async rewriteRequest({ request, sessionID, kind, attempt }) {
       const url = deps.codexEndpoint
         ? codexRequestURL(request.url, deps.codexEndpoint())
         : request.url
       const routed = url === request.url ? request : new Request(url, request)
-      return (
+      const rewritten =
         (await rewriteCodexHttpRequest(
           routed,
           { sessionID, kind },
           effort,
           deps.responsesLite?.() ?? false,
         )) ?? routed
-      )
+      if (
+        attempt.data?.kind === 'vault' &&
+        attempt.data.receipt.credentialId &&
+        hasVaultRoutingAccessor()
+      ) {
+        try {
+          const record = startBilling(attempt, await rewritten.clone().text())
+          if (record) billing.set(attempt, record)
+        } catch {
+          // Optional accounting must not stop a request whose body cannot be inspected.
+        }
+      }
+      return rewritten
     },
     rewriteHandshakeURL: ({ url }) =>
       deps.codexEndpoint
@@ -1733,25 +1782,25 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             attempt.data.receipt,
           )
       }
-      if (
-        attempt.data?.kind === 'vault' &&
-        hasVaultRoutingAccessor() &&
-        (vaultRoutingStreamMayFail(data) ||
-          (transport === 'ws' && data.includes('"response.completed"')))
-      ) {
-        const event = parseJson(data)
-        if (vaultRoutingStreamFailed(event)) routingFailures.add(attempt)
-        // WebSocket completions have no HTTP header hook to report their outcome.
+      if (attempt.data?.kind === 'vault' && hasVaultRoutingAccessor()) {
+        if (transport === 'http') billing.get(attempt)?.event(event)
         if (
-          transport === 'ws' &&
-          isRecord(event) &&
-          event.type === 'response.completed'
-        )
-          reportVaultRouting(attempt.sessionID, attempt.data.receipt, {
-            status: 200,
-            headers: new Headers(),
-            failed: routingFailures.has(attempt),
-          })
+          vaultRoutingStreamMayFail(data) ||
+          (transport === 'ws' && data.includes('"response.completed"'))
+        ) {
+          if (vaultRoutingStreamFailed(event)) routingFailures.add(attempt)
+          // WebSocket completions have no HTTP header hook to report their outcome.
+          if (
+            transport === 'ws' &&
+            isRecord(event) &&
+            event.type === 'response.completed'
+          )
+            reportVaultRouting(attempt.sessionID, attempt.data.receipt, {
+              status: 200,
+              headers: new Headers(),
+              failed: routingFailures.has(attempt),
+            })
+        }
       }
       const verdict = inspectParsedCodexEvent(
         event,
@@ -1797,6 +1846,14 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     // reported. Only an HTTP response gives a status here: OpenCode 2 runs no
     // plugin hook for a WebSocket handshake the server refuses.
     async onAttemptEnd(attempt, outcome) {
+      const record =
+        attempt.data?.kind === 'vault' && hasVaultRoutingAccessor()
+          ? billing.get(attempt)
+          : undefined
+      if (record) {
+        billing.delete(attempt)
+        record.end(outcome.outputStarted, !outcome.error, outcome.status)
+      }
       const data = attempt.data
       const state = data && feedback.get(data)
       if (state) {
@@ -1958,7 +2015,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   return {
     adapter,
     beginTurn: clearTurn,
-    dispose: () => heldTurns.clear(),
+    startBilling,
+    dispose: () => {
+      heldTurns.clear()
+      billingCounts.clear()
+    },
     attach(installation) {
       installation.on('quota', (event) =>
         recordQuota(event.accountId, event.quota, event.handle),

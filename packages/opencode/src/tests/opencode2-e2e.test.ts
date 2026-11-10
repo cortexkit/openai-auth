@@ -237,6 +237,7 @@ async function runCli(
 }
 
 interface ScenarioResult {
+  readonly billingReports: Array<Record<string, unknown>>
   readonly destinations: string[]
   readonly wire: WireRecord[]
   /** Agent-loop requests and frames as sent, with their headers. */
@@ -296,6 +297,8 @@ async function runScenario(input: {
   vault?: boolean
   /** Use the host relay instead of a plugin enrollment. */
   hostedVault?: boolean
+  /** Install a stand-in Thalamus routing accessor in the host process to capture billing reports. */
+  billing?: boolean
   /**
    * Seed an old vault registry and command locations without abort controllers,
    * then edit the live entry to load the current server code.
@@ -316,6 +319,7 @@ async function runScenario(input: {
     OPENAI_AUTH_E2E_RELOAD_TRACE: join(root, 'reload.jsonl'),
   }
   const configDir = join(isolated.XDG_CONFIG_HOME, 'opencode')
+  if (input.billing) env.OPENAI_AUTH_E2E_BILLING = join(root, 'billing.jsonl')
   // The pool is seeded where versions before the move kept it; the plugin
   // moves its runtime files into the state home at its first start.
   seedPool(configDir, input.accounts, input.mode)
@@ -558,6 +562,13 @@ async function runScenario(input: {
         .split('\n')
         .map((line) => JSON.parse(line))
     : []
+  const billingReports =
+    input.billing && existsSync(env.OPENAI_AUTH_E2E_BILLING!)
+      ? readFileSync(env.OPENAI_AUTH_E2E_BILLING!, 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line))
+      : []
   const diagnostics = [
     `exported credential: ${exported}`,
     `destinations: ${JSON.stringify(destinations)}`,
@@ -589,6 +600,7 @@ async function runScenario(input: {
     ).layouts ?? {}
   rmSync(root, { recursive: true, force: true })
   return {
+    billingReports,
     destinations,
     wire: [...mock.records],
     samples: [...mock.samples],
@@ -1129,6 +1141,12 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       [
         `import { createOpenAIAuthPlugin } from '${PACKAGE_NAME}/server'`,
         `import { ClaustrumClient } from '@cortexkit/claustrum-client'`,
+        `import { appendFileSync } from 'node:fs'`,
+        `if (process.env.OPENAI_AUTH_E2E_BILLING) {`,
+        `  globalThis[Symbol.for('cortexkit.routing')] = () => ({ report(payload) {`,
+        `    if (payload.kind === 'billing') appendFileSync(process.env.OPENAI_AUTH_E2E_BILLING, JSON.stringify(payload) + '\\n')`,
+        `  } })`,
+        `}`,
         `if (process.env.CORTEXKIT_VAULT_HOST === 'thalamus') {`,
         `  const relay = await ClaustrumClient.connect({ connectionFile: process.env.OPENAI_AUTH_E2E_CLAUSTRUM })`,
         `  globalThis[Symbol.for('cortexkit.vault')] = (pluginId) => {`,
@@ -1691,7 +1709,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     })
   }, 180_000)
 
-  test('http: hosted relay serves one vault turn without an enrollment token', async () => {
+  test('billing http: hosted relay reports one completed primary vault turn', async () => {
     const result = await runScenario({
       transport: 'http',
       accounts: ['A'],
@@ -1699,6 +1717,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       plugin: vaultPlugin,
       vault: true,
       hostedVault: true,
+      billing: true,
       turns: [{}],
     })
     verify(result, () => {
@@ -1709,6 +1728,23 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       ])
       expect(result.stdout[0]).toContain('-V')
       expect(result.runtime.moved[OLD_VAULT_TOKEN]).toBeNull()
+      const primary = result.billingReports.filter(
+        (report) => report.request_kind === 'primary',
+      )
+      expect(primary).toHaveLength(1)
+      expect(primary[0]).toMatchObject({
+        kind: 'billing',
+        outcome: 'completed',
+        credential_id: 'oauth:openai:work',
+        provider: 'openai',
+        status: 200,
+        attempt: 1,
+      })
+      expect(primary[0]!.usage).toMatchObject({
+        input: expect.any(Number),
+        output: expect.any(Number),
+      })
+      expect(Object.keys(primary[0]!.usage as object).length).toBeGreaterThan(1)
     })
   }, 180_000)
 
