@@ -1,0 +1,107 @@
+# GitHub sends no event when a review thread is resolved. After resolving all
+# bot threads, re-run the PR's own failed run of this workflow (`gh run rerun
+# <run-id>`): that rerun reports on the PR's head commit, so it can satisfy a
+# required check. A workflow_dispatch run reports on the default branch's head
+# commit instead, so it only shows the current state in its summary.
+# Never check out or execute PR code: even fork events only run API queries.
+name: Review findings
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to check after resolving review threads
+        required: true
+        type: string
+
+permissions:
+  pull-requests: read
+  contents: read
+
+jobs:
+  review-findings:
+    name: review-findings
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check unresolved reviewer-bot threads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REVIEW_BOTS='["cubic-dev-ai", "greptile-apps"]'
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo 'Supply a valid PR number.' >&2; exit 1; }
+          # The PR merge script runs this same query and filter before it merges; keep the
+          # two identical so this check and the merge gate agree on what blocks.
+          # GraphQL variables must reach the API unchanged, not expand in the shell.
+          # shellcheck disable=SC2016
+          QUERY='query($owner:String!, $repo:String!, $number:Int!, $cursor:String) {
+            repository(owner:$owner, name:$repo) {
+              pullRequest(number:$number) {
+                number title headRefOid isCrossRepository state baseRefName
+                reviewThreads(first:100, after:$cursor) {
+                  nodes {
+                    isResolved path line originalLine
+                    comments(first:1) { nodes { author { login } body url } }
+                  }
+                  pageInfo { hasNextPage endCursor }
+                }
+              }
+            }
+          }'
+          VALID_PAGE='(.errors // [] | length) == 0 and
+            (.data.repository.pullRequest | type == "object") and
+            (.data.repository.pullRequest.reviewThreads | ( .nodes | type == "array") and
+              (.pageInfo.hasNextPage | type == "boolean"))'
+          # These are jq variables, not shell variables.
+          # shellcheck disable=SC2016
+          FINDINGS_FILTER='.data.repository.pullRequest.reviewThreads.nodes[] |
+            .comments.nodes[0] as $comment |
+            ($comment.author.login // "" | sub("\\[bot\\]$"; "")) as $author |
+            select(($bots | index($author)) != null and .isResolved == false) |
+            ($comment.body | gsub("(?s)<!--.*?-->"; "") | split("\n") |
+              map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | .[0] // "(empty body)") as $body |
+            "\($author) \(.path):\(.line // .originalLine // "?"): \($body)\n  \($comment.url)"'
+          run() {
+            local status=0
+            timeout 60s "$@" || status=$?
+            if [ "$status" -ne 0 ]; then
+              printf 'Review findings query failed (exit %s): %s\n' "$status" "$*" >&2
+              exit "$status"
+            fi
+          }
+          cursor=''
+          blocked=0
+          printf '## Reviewer-bot findings for PR #%s\n' "$PR_NUMBER" >> "$GITHUB_STEP_SUMMARY"
+          while :; do
+            args=(api graphql -f query="$QUERY" -f owner="${GITHUB_REPOSITORY%/*}" -f repo="${GITHUB_REPOSITORY#*/}" -F number="$PR_NUMBER")
+            [ -z "$cursor" ] || args+=(-f cursor="$cursor")
+            page=$(run gh "${args[@]}")
+            run jq -e "$VALID_PAGE" >/dev/null <<< "$page"
+            findings=$(run jq -r --argjson bots "$REVIEW_BOTS" "$FINDINGS_FILTER" <<< "$page")
+            if [ -n "$findings" ]; then
+              printf '%s\n' "$findings"
+              # Review bodies are untrusted text, not summary markup.
+              escaped=$(run jq -Rrs '@html' <<< "$findings")
+              printf '<pre>%s</pre>\n' "$escaped" >> "$GITHUB_STEP_SUMMARY"
+              blocked=1
+            fi
+            next=$(run jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' <<< "$page")
+            [ "$next" = true ] || break
+            previous=$cursor
+            cursor=$(run jq -er '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor' <<< "$page")
+            [ "$cursor" != "$previous" ] || { echo 'Repeated review-thread cursor.' >&2; exit 1; }
+          done
+          if [ "$blocked" -eq 1 ]; then
+            echo 'Resolve the listed threads on GitHub, then rerun this workflow.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo 'No unresolved reviewer-bot findings.' >> "$GITHUB_STEP_SUMMARY"
