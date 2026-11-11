@@ -77,7 +77,7 @@
     "@cortexkit/subc-client": "^0.24.0",
     "@opentui/core": ">=0.7.0",
     "@opentui/solid": ">=0.7.0",
-    "ai": "^7.0.159",
+    "ai": "^7.0.165",
     "jsonc-parser": "^3.3.1",
     "solid-js": "1.9.18"
   }
