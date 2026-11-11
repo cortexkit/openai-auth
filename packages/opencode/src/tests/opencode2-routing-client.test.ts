@@ -346,6 +346,257 @@ test('OpenCode 2 reports a completed vault WebSocket response without waiting', 
   }
 })
 
+for (const scenario of [
+  {
+    name: 'failed primary window',
+    frame: {
+      type: 'response.failed',
+      response: { failed: { rate_limit_reached_type: 'primary' } },
+    },
+    exhausted: true,
+  },
+  {
+    name: 'usage-limit error',
+    frame: {
+      type: 'error',
+      error: {
+        type: 'usage_limit_reached',
+        rate_limit_reached_type: 'primary',
+        resets_at: 1_900_000_000,
+      },
+    },
+    exhausted: true,
+  },
+  {
+    name: 'short rate limit',
+    frame: {
+      type: 'error',
+      status: 429,
+      error: { type: 'rate_limit_exceeded', window: '5h' },
+    },
+    exhausted: false,
+  },
+  {
+    name: 'failed response without a limit',
+    frame: {
+      type: 'response.failed',
+      response: { error: { code: 'server_error' } },
+    },
+    exhausted: false,
+  },
+]) {
+  test(`OpenCode 2 vault WebSocket ${scenario.name} reports exhaustion only for account limits`, async () => {
+    const reports: Record<string, unknown>[] = []
+    Reflect.set(globalThis, key, () => ({
+      accountFor: async () => ({ account_id: 'account-b' }),
+      report: (payload: Record<string, unknown>) => {
+        if (!payload.kind) reports.push(payload)
+        return new Promise(() => {})
+      },
+    }))
+    const env = fixture()
+    Object.assign(env.routes[1]!.quota.limits[0]!, {
+      resetsAt: new Date(1_900_000_000_000).toISOString(),
+    })
+    const host = fakeOpenCode2Host()
+    const installation = await installOpenCode2Auth(
+      host.ctx,
+      env.openai.adapter,
+    )
+    try {
+      const requestScope = scope('fleet-session')
+      await host.fire('experimental.ws.handshake', {
+        ...requestScope,
+        url: 'wss://chatgpt.com/backend-api/codex/responses',
+        headers: { authorization: `Bearer ${placeholderSecret('openai')}` },
+      })
+      await host.fire('experimental.ws.send', {
+        ...requestScope,
+        frame: JSON.stringify({
+          type: 'response.create',
+          model: 'gpt-6',
+          input: [],
+        }),
+      })
+      expect(reports).toEqual([])
+      await host.fire('experimental.ws.receive', {
+        ...requestScope,
+        frame: JSON.stringify(scenario.frame),
+      })
+      expect(reports).toEqual(
+        scenario.exhausted
+          ? [
+              {
+                account_id: 'account-b',
+                credential_id: 'credential-b',
+                outcome: 'exhausted',
+                window: '5h',
+                resets_at: 1_900_000_000_000,
+              },
+            ]
+          : [],
+      )
+    } finally {
+      await installation.dispose()
+    }
+  })
+}
+
+test('OpenCode 2 vault HTTP usage-limit 429 reports exactly once and preserves the refusal bytes', async () => {
+  const reports: Record<string, unknown>[] = []
+  Reflect.set(globalThis, key, () => ({
+    report: (payload: Record<string, unknown>) => {
+      if (!payload.kind) reports.push(payload)
+    },
+  }))
+  const env = fixture()
+  const host = fakeOpenCode2Host()
+  const installation = await installOpenCode2Auth(host.ctx, env.openai.adapter)
+  const body =
+    '{ "error": { "type": "usage_limit_reached", "rate_limit_reached_type": "primary", "resets_at": 1900000000 } }'
+  try {
+    const requestScope = scope('fleet-session')
+    const draft = await host.fire('http.request', {
+      ...requestScope,
+      request: new Request('https://codex.test/v1/responses', {
+        method: 'POST',
+        body: '{}',
+        headers: { authorization: `Bearer ${placeholderSecret('openai')}` },
+      }),
+    })
+    const received = await host.fire('http.response', {
+      ...requestScope,
+      request: draft.request,
+      response: new Response(body, {
+        status: 429,
+        headers: {
+          'x-codex-primary-window-minutes': '300',
+          'x-codex-primary-reset-at': '1950000000',
+          'retry-after': '20',
+        },
+      }),
+    })
+    expect(await received.response.text()).toBe(body)
+    expect(reports).toEqual([
+      {
+        account_id: 'account-a',
+        credential_id: 'credential-a',
+        outcome: 'exhausted',
+        window: '5h',
+        resets_at: 1_900_000_000_000,
+      },
+    ])
+  } finally {
+    await installation.dispose()
+  }
+})
+
+for (const scenario of [
+  {
+    name: 'classified usage limit',
+    message: JSON.stringify({
+      error: {
+        type: 'usage_limit_reached',
+        window: '5h',
+        resets_at: 1_900_000_000,
+      },
+    }),
+    exhausted: true,
+  },
+  {
+    name: 'usage limit already handled by HTTP',
+    message: JSON.stringify({
+      error: {
+        type: 'usage_limit_reached',
+        window: '5h',
+        resets_at: 1_900_000_000,
+      },
+    }),
+    exhausted: true,
+    httpFirst: true,
+  },
+  {
+    name: 'short rate limit',
+    message: JSON.stringify({
+      error: { type: 'rate_limit_exceeded', window: '5h' },
+    }),
+    exhausted: false,
+  },
+  {
+    name: 'unstructured usage-limit text',
+    message: 'usage_limit_reached for primary',
+    exhausted: false,
+  },
+]) {
+  test(`OpenCode 2 vault host error ${scenario.name} reports at most once per attempt`, async () => {
+    const reports: unknown[] = []
+    Reflect.set(globalThis, key, () => ({
+      report: (payload: unknown) => {
+        reports.push(payload)
+      },
+    }))
+    const env = fixture()
+    const attempt: Attempt<OpenAIAttemptData> = {
+      providerID: 'openai',
+      modelID: 'gpt-6',
+      sessionID: 'fleet-session',
+      agent: 'build',
+      kind: 'primary',
+      attemptId: 'host-error',
+      accountId: 'vault:a',
+      transport: 'http',
+      data: {
+        kind: 'vault',
+        routeId: 'vault:a',
+        receipt: {
+          credentialId: 'credential-a',
+          credentialType: 'oauth',
+          accountIdentity: 'account-a',
+          accountIdentitySource: 'asserted',
+          accessToken: 'vault:a-token',
+          recordVersion: 1,
+          expiresAtMs: null,
+        },
+      },
+    }
+    if ('httpFirst' in scenario) {
+      const limit = await env.openai.adapter.limitFromResponse!({
+        status: 429,
+        headers: new Headers(),
+        body: async () => scenario.message,
+        attempt,
+      })
+      await env.openai.adapter.onAttemptEnd!(attempt, {
+        status: 429,
+        outputStarted: false,
+        limit,
+      })
+      expect(reports).toHaveLength(1)
+    }
+    const limit = await env.openai.adapter.limitFromError!(
+      { type: 'api', message: scenario.message, status: 429 },
+      attempt,
+    )
+    if (!('httpFirst' in scenario)) expect(reports).toEqual([])
+    const outcome = { outputStarted: false, limit }
+    await env.openai.adapter.onAttemptEnd!(attempt, outcome)
+    await env.openai.adapter.onAttemptEnd!(attempt, outcome)
+    expect(reports).toEqual(
+      scenario.exhausted
+        ? [
+            {
+              account_id: 'account-a',
+              credential_id: 'credential-a',
+              outcome: 'exhausted',
+              window: '5h',
+              resets_at: 1_900_000_000_000,
+            },
+          ]
+        : [],
+    )
+  })
+}
+
 test('OpenCode 2 reports a served vault response without waiting, with only rate headers', async () => {
   const reports: unknown[] = []
   Reflect.set(globalThis, key, () => ({

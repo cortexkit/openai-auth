@@ -100,6 +100,7 @@ import {
   type RoutingMode,
   recordSessionCompletion,
   reportVaultRouting,
+  reportVaultRoutingLimit,
   type SessionDispatch,
   ttlForModel,
   VaultBillingAttempt,
@@ -507,6 +508,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     VaultRoutingResponse
   >()
   const routingFailures = new WeakSet<Attempt<OpenAIAttemptData>>()
+  let routingLimitBodies:
+    | WeakMap<Attempt<OpenAIAttemptData>, unknown>
+    | undefined
+  let routingLimitsHandled: WeakSet<Attempt<OpenAIAttemptData>> | undefined
   const billing = new WeakMap<Attempt<OpenAIAttemptData>, VaultBillingAttempt>()
   const billingCounts = new Map<string, number>()
   const observeBillingModel = (
@@ -1760,7 +1765,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         },
         at,
       )
-      if (attempt.data?.kind === 'vault' && hasVaultRoutingAccessor())
+      if (attempt.data?.kind === 'vault' && hasVaultRoutingAccessor()) {
         reportVaultRouting(attempt.sessionID, attempt.data.receipt, {
           status,
           headers,
@@ -1770,6 +1775,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             ?.quota,
           now: now(),
         })
+        // The HTTP refusal was handled here; attempt-end must not report it again.
+        routingLimitsHandled ??= new WeakSet()
+        routingLimitsHandled.add(attempt)
+      }
       if (!signal) return undefined
       const limit = toLimit(
         signal,
@@ -1846,6 +1855,14 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         now(),
         quotaFor(attempt.accountId, attempt.data?.kind === 'vault'),
       )
+      if (
+        attempt.data?.kind === 'vault' &&
+        hasVaultRoutingAccessor() &&
+        verdict?.limit
+      ) {
+        routingLimitBodies ??= new WeakMap()
+        routingLimitBodies.set(attempt, event)
+      }
       // HTTP acceptance belongs to the body reader, not an SSE lifecycle
       // frame. A WebSocket has no body end, so its completion is explicit.
       return billingDone ||
@@ -1862,7 +1879,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         attempt.accountId,
         attempt.data?.kind === 'vault',
       )
-      return (
+      const limit =
         limitOfEvent(
           {
             ...(isRecord(parsed) ? parsed : {}),
@@ -1879,7 +1896,15 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
               reading,
             )
           : undefined)
-      )
+      if (
+        attempt.data?.kind === 'vault' &&
+        hasVaultRoutingAccessor() &&
+        limit
+      ) {
+        routingLimitBodies ??= new WeakMap()
+        routingLimitBodies.set(attempt, parsed)
+      }
+      return limit
     },
     // A 401 on a send the vault authorized is reported to the vault against
     // the record version in that send's receipt; no other status is
@@ -1959,6 +1984,37 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           ? routingResponses.get(attempt)
           : undefined
       routingResponses.delete(attempt)
+      if (
+        data?.kind === 'vault' &&
+        hasVaultRoutingAccessor() &&
+        outcome.limit &&
+        routingLimitBodies?.has(attempt) &&
+        !routingLimitsHandled?.has(attempt)
+      ) {
+        routingLimitsHandled ??= new WeakSet()
+        routingLimitsHandled.add(attempt)
+        const limit = outcome.limit as OpenAILimitSignal
+        if (limit.windows?.some((window) => window.confirmed))
+          reportVaultRoutingLimit(
+            attempt.sessionID,
+            data.receipt,
+            {
+              window: limit.reason,
+              resetAt:
+                limit.resetAt ??
+                limit.windows.find((window) => window.confirmed)?.resetAt,
+            },
+            {
+              body: routingLimitBodies?.get(attempt),
+              headers: response?.headers,
+              quota: vault
+                ?.routes()
+                .find((route) => route.id === attempt.accountId)?.quota,
+              now: now(),
+            },
+          )
+      }
+      routingLimitBodies?.delete(attempt)
       // HTTP success is reported only after the body ends without an error or cancellation.
       if (
         data?.kind === 'vault' &&

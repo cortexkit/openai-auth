@@ -40,6 +40,7 @@ import {
   startMockDaemon,
   vaultLogin,
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
+import * as vaultRouting from '../../../core/src/vault-routing.ts'
 import { createPiMenu } from '../commands.ts'
 import { clearPiStickyRouting } from '../routing.ts'
 import { PiOpenAIRuntime } from '../runtime.ts'
@@ -108,6 +109,9 @@ let daemon: MockDaemon
 let codexTokens: string[]
 let codexStatus: (token: string) => number
 let codexReplyHeaders: Record<string, string>
+let codexErrorBody: string
+const routingKey = Symbol.for('cortexkit.routing')
+const originalRouting = Object.getOwnPropertyDescriptor(globalThis, routingKey)
 
 const fakeFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = String(input instanceof Request ? input.url : input)
@@ -117,7 +121,8 @@ const fakeFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url === CODEX_URL) {
     codexTokens.push(token)
     const status = codexStatus(token)
-    const response = status === 200 ? sseOk() : new Response('{}', { status })
+    const response =
+      status === 200 ? sseOk() : new Response(codexErrorBody, { status })
     for (const [name, value] of Object.entries(codexReplyHeaders))
       response.headers.set(name, value)
     return response
@@ -136,9 +141,13 @@ beforeEach(() => {
   codexTokens = []
   codexStatus = () => 200
   codexReplyHeaders = {}
+  codexErrorBody = '{}'
 })
 
 afterEach(async () => {
+  if (originalRouting)
+    Object.defineProperty(globalThis, routingKey, originalRouting)
+  else Reflect.deleteProperty(globalThis, routingKey)
   clearPiStickyRouting('session-1')
   await daemon?.stop()
   rmSync(dir, { recursive: true, force: true })
@@ -200,6 +209,112 @@ function enroll() {
 }
 
 describe('Pi and the Claustrum vault', () => {
+  for (const scenario of [
+    { name: 'usage-limit refusal', accessor: true, wait: false, usage: true },
+    {
+      name: 'same-account usage-limit wait',
+      accessor: true,
+      wait: true,
+      usage: true,
+    },
+    {
+      name: 'usage limit without routing',
+      accessor: false,
+      wait: false,
+      usage: true,
+    },
+    { name: 'short rate limit', accessor: true, wait: false, usage: false },
+  ]) {
+    test(`vault routing exhaustion: ${scenario.name}`, async () => {
+      const reports: Record<string, unknown>[] = []
+      let asks = 0
+      if (scenario.accessor)
+        Reflect.set(globalThis, routingKey, () => ({
+          accountFor: () => {
+            asks++
+            return undefined
+          },
+          report: (payload: Record<string, unknown>) => {
+            if (!payload.kind) reports.push(payload)
+            return new Promise(() => {})
+          },
+        }))
+      else Reflect.deleteProperty(globalThis, routingKey)
+      daemon = await startMockDaemon({
+        directory: dir,
+        credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+      })
+      enroll()
+      const target = vault()
+      let now = Date.now()
+      const reset = Math.floor(now / 1000) * 1000 + 60_000
+      const expected = [
+        {
+          account_id: 'chatgpt-vault',
+          credential_id: 'oauth:openai:vault',
+          outcome: 'exhausted',
+          window: '5h',
+          resets_at: reset,
+        },
+      ]
+      const waits: number[] = []
+      const runtime = new PiOpenAIRuntime({
+        streamSimple,
+        createStream: createAssistantMessageEventStream,
+        paths: () => paths,
+        vault: target,
+        fetchImpl: fakeFetch,
+        firstReadingWaitMs: 0,
+        now: () => now,
+        waitForPi: async (delay) => {
+          expect(reports).toEqual(expected)
+          waits.push(delay)
+          now += delay
+          codexStatus = () => 200
+          codexReplyHeaders = {}
+          return 'elapsed'
+        },
+      })
+      if (scenario.wait) runtime.setWorkingMessage = () => {}
+      const report = spyOn(vaultRouting, 'reportVaultRoutingLimit')
+      try {
+        await target.refresh()
+        await target.pollStale(0)
+        await send(runtime, { sessionId: 'session-1' })
+        codexTokens = []
+        codexStatus = () => 429
+        codexErrorBody = JSON.stringify({
+          error: {
+            type: scenario.usage
+              ? 'usage_limit_reached'
+              : 'rate_limit_exceeded',
+            rate_limit_reached_type: 'primary',
+            resets_at: reset / 1000,
+          },
+        })
+        codexReplyHeaders = {
+          'x-codex-primary-used-percent': '100',
+          'x-codex-primary-window-minutes': '300',
+          'x-codex-primary-reset-at': String(reset / 1000),
+        }
+        const events = await send(runtime, { sessionId: 'session-1' })
+        expect(reports).toEqual(
+          scenario.accessor && scenario.usage ? expected : [],
+        )
+        expect(waits).toHaveLength(scenario.wait ? 1 : 0)
+        expect(codexTokens).toHaveLength(scenario.wait ? 2 : 1)
+        expect(events.at(-1)?.type).toBe(scenario.wait ? 'done' : 'error')
+        expect(asks).toBe(0)
+        if (!scenario.accessor || !scenario.usage)
+          expect(report).not.toHaveBeenCalled()
+      } finally {
+        report.mockRestore()
+        await target.dispose()
+        await runtime.pool.dispose()
+      }
+    })
+  }
+
   test('quota hold wake rereads withdrawn vault custody without another wait or local send', async () => {
     daemon = await startMockDaemon({
       directory: dir,

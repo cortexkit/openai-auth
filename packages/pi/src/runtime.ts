@@ -60,6 +60,7 @@ import {
   redactCredentialError,
   redactCredentialResponse,
   redactCredentialText,
+  reportVaultRoutingLimit,
   type SessionDispatch,
   sessionCacheKeepPlan,
   ttlForModel,
@@ -1022,6 +1023,36 @@ export class PiOpenAIRuntime {
               now: this.now(),
               reading,
             })
+          if (
+            receipt &&
+            hasVaultRoutingAccessor() &&
+            signal?.kind === 'quota-exhausted'
+          ) {
+            let parsed = body
+            if (typeof parsed === 'string') {
+              try {
+                parsed = JSON.parse(parsed)
+              } catch {
+                parsed = undefined
+              }
+            }
+            // Report before routing chooses another account or waits on this one.
+            reportVaultRoutingLimit(
+              options?.sessionId,
+              receipt,
+              {
+                window: signal.reason,
+                resetAt: signal.windows.find((window) => window.confirmed)
+                  ?.resetAt,
+              },
+              {
+                body: parsed,
+                headers: new Headers(response.headers),
+                quota: account?.quota,
+                now: observedAt,
+              },
+            )
+          }
           await options?.onResponse?.(response, responseModel)
         },
       })

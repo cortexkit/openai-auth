@@ -5,6 +5,7 @@ import {
   chooseVaultRouting,
   observeVaultRoutingResponse,
   reportVaultRouting,
+  reportVaultRoutingLimit,
   vaultRoutingRequestFromBody,
 } from '../vault-routing'
 
@@ -277,6 +278,92 @@ function captureReports() {
   }))
   return reports
 }
+
+test('classified exhaustion resolves slot minutes and keeps parsed-reset precedence', () => {
+  const reports = captureReports()
+  reportVaultRoutingLimit(
+    'session',
+    receipt,
+    { window: 'primary', resetAt: 1_900_000_000_000 },
+    {
+      quota: {
+        limits: [
+          {
+            scope: 'all',
+            label: 'primary',
+            kind: 'reading',
+            usedPercent: 100,
+            windowMinutes: 300,
+            checkedAt: Date.now(),
+          },
+        ],
+      },
+      headers: new Headers({
+        'x-codex-primary-reset-at': '1950000000',
+        'retry-after': '20',
+      }),
+    },
+  )
+  expect(reports).toEqual([
+    {
+      account_id: 'account-b',
+      credential_id: 'credential-b',
+      outcome: 'exhausted',
+      window: '5h',
+      resets_at: 1_900_000_000_000,
+    },
+  ])
+})
+
+test.each([
+  'rate_limit',
+  'rate_limit_exceeded',
+  'turn_rate_limit_exceeded',
+  'message text',
+])(
+  'classified-limit reporting rejects %s even when the body names a quota window',
+  (window) => {
+    const reports = captureReports()
+    reportVaultRoutingLimit(
+      'session',
+      receipt,
+      { window },
+      {
+        body: { error: { window: '5h' } },
+      },
+    )
+    expect(reports).toEqual([])
+  },
+)
+
+test('without routing, classified-limit reporting does not inspect the signal or quota', () => {
+  Reflect.deleteProperty(globalThis, key)
+  const unexpected = () => {
+    throw new Error('routing-only data inspected')
+  }
+  expect(() =>
+    reportVaultRoutingLimit(
+      'session',
+      receipt,
+      {
+        get window(): string {
+          return unexpected()
+        },
+      },
+      {
+        get body() {
+          return unexpected()
+        },
+        get quota() {
+          return unexpected()
+        },
+        get headers(): Headers {
+          return unexpected()
+        },
+      },
+    ),
+  ).not.toThrow()
+})
 
 test.each(['usage_limit_reached', 'insufficient_quota', 'quota_exceeded'])(
   '%s 429 without a recognized window reports nothing, even with an explicit reset',

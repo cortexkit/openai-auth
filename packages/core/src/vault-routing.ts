@@ -162,6 +162,66 @@ function resetFromRetryAfter(
   return Number.isFinite(date) ? date : undefined
 }
 
+/** Report only classified account exhaustion, never an HTTP status or error text alone. */
+export function reportVaultRoutingLimit(
+  sessionId: string | undefined,
+  receipt: QuotaReceipt | undefined,
+  limit: { window: string; resetAt?: number },
+  options: Pick<VaultRoutingResponse, 'body' | 'quota' | 'now'> & {
+    headers?: Headers
+  } = {},
+): void {
+  if (!hasVaultRoutingAccessor() || !sessionId || !receipt?.accountIdentity)
+    return
+  if (
+    !USAGE_LIMIT_CODES.has(limit.window) &&
+    !['primary', 'secondary', '5h', '7d'].includes(limit.window)
+  )
+    return
+  const body = isRecord(options.body) ? options.body : undefined
+  const response = isRecord(body?.response) ? body.response : body
+  const detail = isRecord(response?.error) ? response.error : response
+  const failed = isRecord(response?.failed) ? response.failed : undefined
+  const named =
+    typeof failed?.rate_limit_reached_type === 'string'
+      ? failed.rate_limit_reached_type
+      : typeof detail?.rate_limit_reached_type === 'string'
+        ? detail.rate_limit_reached_type
+        : typeof detail?.window === 'string'
+          ? detail.window
+          : limit.window
+  const snapshot = windowsFromQuotaMap(options.quota)
+  const slot = named === 'primary' || named === 'secondary' ? named : undefined
+  const minutes = slot
+    ? Number(
+        options.headers?.get(`x-codex-${slot}-window-minutes`) ??
+          snapshot?.[slot]?.windowMinutes,
+      )
+    : undefined
+  const window = minutes === 300 ? '5h' : minutes === 10080 ? '7d' : named
+  if (window !== '5h' && window !== '7d') return
+  const headerReset = slot
+    ? Number(options.headers?.get(`x-codex-${slot}-reset-at`)) * 1000
+    : NaN
+  const reset = limit.resetAt
+  const resetsAt =
+    reset !== undefined && Number.isFinite(reset) && reset > 0
+      ? reset
+      : Number.isFinite(headerReset) && headerReset > 0
+        ? headerReset
+        : options.headers
+          ? resetFromRetryAfter(options.headers, options.now ?? Date.now())
+          : undefined
+  reportRouting({
+    sessionId,
+    accountId: receipt.accountIdentity,
+    credentialId: receipt.credentialId,
+    outcome: 'exhausted',
+    window,
+    ...(resetsAt !== undefined ? { resetsAt } : {}),
+  })
+}
+
 /** Only successful responses and classified account exhaustion reach routing. */
 export function reportVaultRouting(
   sessionId: string | undefined,
@@ -199,33 +259,12 @@ export function reportVaultRouting(
         : typeof detail?.window === 'string'
           ? detail.window
           : usage
-    const snapshot = windowsFromQuotaMap(response.quota)
-    const slot =
-      named === 'primary' || named === 'secondary' ? named : undefined
-    const minutes = slot
-      ? Number(
-          headers.get(`x-codex-${slot}-window-minutes`) ??
-            snapshot?.[slot]?.windowMinutes,
-        )
-      : undefined
-    const window = minutes === 300 ? '5h' : minutes === 10080 ? '7d' : named
-    if (window !== '5h' && window !== '7d') return
-    const headerReset = slot
-      ? Number(headers.get(`x-codex-${slot}-reset-at`)) * 1000
-      : NaN
-    const reset = response.limit?.resetAt
-    const resetsAt =
-      reset !== undefined && Number.isFinite(reset) && reset > 0
-        ? reset
-        : Number.isFinite(headerReset) && headerReset > 0
-          ? headerReset
-          : resetFromRetryAfter(headers, response.now ?? Date.now())
-    reportRouting({
-      ...identity,
-      outcome: 'exhausted',
-      window,
-      ...(resetsAt !== undefined ? { resetsAt } : {}),
-    })
+    reportVaultRoutingLimit(
+      sessionId,
+      receipt,
+      { window: named, resetAt: response.limit?.resetAt },
+      { headers, quota: response.quota, now: response.now },
+    )
     return
   }
   if (status < 200 || status >= 300) return
