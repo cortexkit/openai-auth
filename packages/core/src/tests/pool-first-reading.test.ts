@@ -64,6 +64,7 @@ describe('first quota reading admission', () => {
       kind: 'send',
       order: ['vault-work'],
       lastPath: false,
+      tiers: { 'vault-work': 'free' },
     })
   })
 
@@ -140,6 +141,7 @@ describe('first quota reading admission', () => {
       kind: 'send',
       order: ['ready'],
       lastPath: false,
+      tiers: { ready: 'free' },
     })
   })
 

@@ -118,6 +118,7 @@ import { POOL_LOGIN_REQUIRED_MESSAGE } from '../core/pool-main'
 import { windowsFromQuotaMap } from '../core/pool-quota'
 import { routableRows } from '../core/pool-request'
 import {
+  type AdmissionTier,
   admitSticky,
   CreditsServing,
   FORMER_MAIN_ID,
@@ -238,6 +239,7 @@ export type OpenAIAttemptData =
       readonly kind: 'vault'
       readonly routeId: string
       readonly receipt: ClaustrumScopedAttempt
+      readonly freeQuota?: boolean
     }
 
 export interface OpenAIAdapterDeps {
@@ -534,6 +536,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           model,
           count,
           deps.cacheWarming,
+          attempt.data?.kind === 'vault' && attempt.data.freeQuota,
         ),
       )
     }
@@ -574,7 +577,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   // Vault receipts authorized while choosing an account, kept until the
   // installer's `accountHeaders` call for the same session, request kind and
   // account consumes them. A kept retry choice may wait until a later attempt.
-  const receipts = new Map<string, ClaustrumScopedAttempt>()
+  const receipts = new Map<
+    string,
+    { receipt: ClaustrumScopedAttempt; freeQuota: boolean }
+  >()
   // A read failure may be continued only as the identity that received its
   // output. Keep the send's identity, never its old admission decision.
   const interrupted = new Map<
@@ -731,6 +737,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     excluded: ReadonlySet<string>,
     follow: string | undefined,
     mainId: string | null | undefined,
+    admissionTiers?: Map<string, AdmissionTier>,
   ): string | undefined => {
     const plan = planOrdered({
       ...routing,
@@ -745,6 +752,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       return undefined
     }
     const order = plan.order.filter((id) => !excluded.has(id))
+    if (admissionTiers)
+      for (const id of order) {
+        const tier = plan.tiers[id]
+        if (tier) admissionTiers.set(id, tier)
+      }
     if (follow !== undefined && order.includes(follow)) return follow
     return order[0]
   }
@@ -784,6 +796,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     persist: boolean,
     plannedPins: Map<string, StickyPin>,
     preferred?: string,
+    admissionTiers?: Map<string, AdmissionTier>,
   ): string | undefined => {
     const options = stickyOptions(targets, storage)
     const sticky = admitSticky(routing)
@@ -806,11 +819,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           wireAccountIdByAccount: Object.fromEntries(
             targets.map((target) => [target.id, target.identity]),
           ),
-          select: (pendingBytes) =>
-            preferred
+          select: (pendingBytes) => {
+            const selection = preferred
               ? {
                   accountId: preferred,
-                  source: 'mode-fallback',
+                  source: 'mode-fallback' as const,
                   quotaCheckedAt: sticky.projections.get(preferred)?.checkedAt,
                 }
               : selectStickyRow(
@@ -818,7 +831,11 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
                   options,
                   new Set(exclude),
                   pendingBytes,
-                ),
+                )
+            if (selection && 'tier' in selection)
+              admissionTiers?.set(selection.accountId, selection.tier)
+            return selection
+          },
           persist: keep,
         },
         (sessionId, pin) => plannedPins.set(sessionId, pin),
@@ -828,6 +845,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     if (!assignment) return undefined
     const id = assignment.accountId
     const pinned = routePinnedRow(routing, options, id)
+    if (pinned.kind === 'serve') admissionTiers?.set(id, pinned.tier)
+    else admissionTiers?.delete(id)
     if (pinned.kind === 'none') return undefined
     if (pinned.kind === 'move') {
       const replacement = place([...base, id], persist)
@@ -896,6 +915,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     }
     const byId = new Map(targets.map((target) => [target.id, target]))
     let routing = routingInput(targets, storage, at)
+    const admissionTiers = hasVaultRoutingAccessor()
+      ? new Map<string, AdmissionTier>()
+      : undefined
     const setting = storage?.routing?.maxSameAccountWait
     const turnKey = JSON.stringify([input.sessionID, input.kind])
     // Auxiliary requests belong to the same user turn and share its wait budget.
@@ -1188,6 +1210,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       for (;;) {
         const skip = new Set([...excluded, ...refused])
         accountId = undefined
+        admissionTiers?.clear()
         plannedPin = undefined
         let cold = mode !== 'sticky-balanced'
         if (wakeAccount && !skip.has(wakeAccount)) {
@@ -1208,6 +1231,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             // choosing again after one does not move the session's sticky pin.
             primary && refused.size === 0,
             plannedPins,
+            undefined,
+            admissionTiers,
           )
           if (
             accountId !== undefined &&
@@ -1225,6 +1250,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
               ? null
               : vaultMainRouteId(vault?.routes() ?? [])
             : undefined,
+          admissionTiers,
         )
         if (accountId === undefined || refused.has(accountId)) {
           // With no alternative, keep the refused account for the host's own
@@ -1304,6 +1330,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
                   primary,
                   stickyPins,
                   preferred,
+                  admissionTiers,
                 ) ?? accountId
               plannedPin = stickyPins.get(input.sessionID) ?? plannedPin
             } else accountId = preferred
@@ -1321,7 +1348,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           if (!vault) break
           const receipt = await vault.authorize(accountId)
           if (receipt) {
-            receipts.set(receiptKey({ ...input, accountId }), receipt)
+            receipts.set(receiptKey({ ...input, accountId }), {
+              receipt,
+              freeQuota: admissionTiers?.get(accountId) === 'free',
+            })
             break
           }
           log?.debug('the vault refused to serve an account; choosing again', {
@@ -1530,7 +1560,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           : source.peek().rows.find((candidate) => candidate.id === accountId)
       if (!row && vault) {
         const key = receiptKey(request)
-        const receipt = receipts.get(key) ?? (await vault.authorize(accountId))
+        const choice = receipts.get(key)
+        const receipt = choice?.receipt ?? (await vault.authorize(accountId))
         receipts.delete(key)
         if (!receipt) {
           log?.warn(
@@ -1545,6 +1576,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           kind: 'vault',
           routeId: accountId,
           receipt,
+          ...(choice?.freeQuota ? { freeQuota: true } : {}),
         }
         await prepareFeedback(data)
         commitChoice()

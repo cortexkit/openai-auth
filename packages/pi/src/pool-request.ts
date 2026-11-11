@@ -62,6 +62,7 @@ import {
 
 import { windowsFromQuotaMap } from '@cortexkit/openai-auth-core/pool-quota'
 import {
+  type AdmissionTier,
   admitSticky,
   type CreditsServing,
   FORMER_MAIN_ID,
@@ -152,11 +153,13 @@ export interface PiRouteContext<A extends RouteAttempt> {
   /** Optional override for tests or callers with their own first-reading wait budget. */
   firstReadingWaitMs?: number
   limitPolicy?: PiLimitPolicy
+  /** Retain sticky admission tiers only when the host will report billing. */
+  captureAdmissionTier?: boolean
   /**
    * Sends the request with one account. Undefined when nothing was sent: the
    * vault refused to serve a vault account.
    */
-  send(account: RouteAccount): Promise<A | undefined>
+  send(account: RouteAccount, tier?: AdmissionTier): Promise<A | undefined>
   /** The session pin ledger: decides (and, when asked, records) a session's pin. */
   placePin(input: StickyPinPlacement): { accountId: string } | undefined
   /**
@@ -631,7 +634,7 @@ async function routeOrdered<A extends RouteAttempt>(
       unsent.add(id)
       continue
     }
-    const attempt = await ctx.send(account)
+    const attempt = await ctx.send(account, plan.tiers[id])
     if (!attempt) {
       unsent.add(id)
       continue
@@ -667,6 +670,9 @@ async function routeSticky<A extends RouteAttempt>(
   const byId = new Map(accounts.map((account) => [account.id, account]))
   let routing = routingInput(ctx, accounts)
   let sticky = admitSticky(routing)
+  const tiers = ctx.captureAdmissionTier
+    ? new Map<string, AdmissionTier>()
+    : undefined
   const options: StickyRouteOptions = {
     requestBytes,
     // Each account's killswitch thresholds are its reserve: placement weighs
@@ -713,8 +719,16 @@ async function routeSticky<A extends RouteAttempt>(
         wireAccountIdByAccount: Object.fromEntries(
           current.map((account) => [account.id, account.identity]),
         ),
-        select: (pendingBytes) =>
-          selectStickyRow(input, selectionOptions, excluded, pendingBytes),
+        select: (pendingBytes) => {
+          const selection = selectStickyRow(
+            input,
+            selectionOptions,
+            excluded,
+            pendingBytes,
+          )
+          if (selection) tiers?.set(selection.accountId, selection.tier)
+          return selection
+        },
         persist,
       })
     }
@@ -737,6 +751,8 @@ async function routeSticky<A extends RouteAttempt>(
   }
 
   const pinned = routePinnedRow(routing, options, id)
+  if (pinned.kind === 'serve') tiers?.set(id, pinned.tier)
+  else tiers?.delete(id)
   if (pinned.kind === 'none') return undefined
   if (pinned.kind === 'move') {
     // The pin ledger re-places the session with its own pending bytes. If it
@@ -757,7 +773,7 @@ async function routeSticky<A extends RouteAttempt>(
 
   let account = byId.get(id)
   if (!sendable(account)) return undefined
-  let attempt = await ctx.send(account)
+  let attempt = await ctx.send(account, tiers?.get(id))
   if (!attempt) return undefined
   let decision: LimitDecision | undefined
 
@@ -794,7 +810,7 @@ async function routeSticky<A extends RouteAttempt>(
       if (migrate(after.reason) && id !== from) {
         const replacement = current.find((candidate) => candidate.id === id)
         const replaced = sendable(replacement)
-          ? await ctx.send(replacement)
+          ? await ctx.send(replacement, tiers?.get(id))
           : undefined
         if (replacement && replaced) {
           attempt = replaced

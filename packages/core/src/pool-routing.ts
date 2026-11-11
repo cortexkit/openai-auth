@@ -227,8 +227,15 @@ export interface PoolBlock {
   resetAtMs?: number
 }
 
+export type AdmissionTier = 'free' | 'credits' | 'last-path'
+
 export type OrderedPlan =
-  | { kind: 'send'; order: string[]; lastPath: boolean }
+  | {
+      kind: 'send'
+      order: string[]
+      lastPath: boolean
+      tiers: Readonly<Record<string, AdmissionTier>>
+    }
   | { kind: 'block'; block: PoolBlock }
 
 function isConfirmedExhaustion(refusal: AdmissionRefusal): boolean {
@@ -456,6 +463,21 @@ export function planOrdered(
   // Credits rows in placement order, whatever their place in the roster
   // relative to rows that hold no credits.
   const credits = ids.filter((id) => tiers.credits.includes(id))
+  const send = (order: string[], lastPath: boolean): OrderedPlan => ({
+    kind: 'send',
+    order,
+    lastPath,
+    tiers: Object.fromEntries(
+      order.map((id) => [
+        id,
+        tiers.free.has(id)
+          ? 'free'
+          : tiers.credits.includes(id)
+            ? 'credits'
+            : 'last-path',
+      ]),
+    ),
+  })
 
   if (!replayable) {
     // The gate keeps main whatever its tier; without main, free quota comes
@@ -465,11 +487,11 @@ export function planOrdered(
       ? mainId
       : (free[0] ?? credits[0] ?? route.order[0] ?? lastPath[0])
     if (target !== undefined && route.order.includes(target))
-      return { kind: 'send', order: [target], lastPath: false }
+      return send([target], false)
     if (target !== undefined && credits.includes(target))
-      return { kind: 'send', order: [target], lastPath: false }
+      return send([target], false)
     if (target !== undefined && confirmed.has(target))
-      return { kind: 'send', order: [target], lastPath: true }
+      return send([target], true)
     return {
       kind: 'block',
       block: hasMain
@@ -478,22 +500,19 @@ export function planOrdered(
     }
   }
 
-  if (free.length > 0) return { kind: 'send', order: free, lastPath: false }
+  if (free.length > 0) return send(free, false)
   // No free quota: credits rows first, then whatever today's last path would
   // try (rows the library keeps for spent credit budgets, else every row
   // confirmed exhausted), in case a credits row is refused after all.
   if (credits.length > 0) {
     const rest = route.order.length > 0 ? route.order : lastPath
-    return {
-      kind: 'send',
-      order: [...credits, ...rest.filter((id) => !credits.includes(id))],
-      lastPath: false,
-    }
+    return send(
+      [...credits, ...rest.filter((id) => !credits.includes(id))],
+      false,
+    )
   }
-  if (route.order.length > 0)
-    return { kind: 'send', order: route.order, lastPath: false }
-  if (lastPath.length > 0)
-    return { kind: 'send', order: lastPath, lastPath: true }
+  if (route.order.length > 0) return send(route.order, false)
+  if (lastPath.length > 0) return send(lastPath, true)
   return {
     kind: 'block',
     block: routeBlock(ids, route.admission, input.killswitch),
@@ -597,7 +616,7 @@ export function selectStickyRow(
   options: StickyRouteOptions,
   exclude: ReadonlySet<string>,
   pendingBytes: ReadonlyMap<string, number>,
-): StickySelection | undefined {
+): (StickySelection & { tier: AdmissionTier }) | undefined {
   const route = routePoolSticky(input, options, { exclude, pendingBytes })
   const rows = input.rows.filter((row) => !exclude.has(row.id))
   const tiers = creditsTiers(rows, input, route.admission)
@@ -607,6 +626,9 @@ export function selectStickyRow(
       ? {
           accountId: route.accountId,
           source: route.source,
+          tier: tiers.free.has(route.accountId)
+            ? ('free' as const)
+            : ('last-path' as const),
           ...(route.quotaCheckedAt === undefined
             ? {}
             : { quotaCheckedAt: route.quotaCheckedAt }),
@@ -621,6 +643,7 @@ export function selectStickyRow(
   return {
     accountId: credits,
     source: 'mode-fallback',
+    tier: 'credits',
     ...(checkedAt === undefined ? {} : { quotaCheckedAt: checkedAt }),
   }
 }
@@ -642,7 +665,7 @@ export function selectStickyRow(
  * - `none`: nothing can serve; the request is routed like an unpinned one.
  */
 export type PinnedRowRoute =
-  | { kind: 'serve' }
+  | { kind: 'serve'; tier: AdmissionTier }
   | { kind: 'move'; reason: 'killswitch' | 'exhausted' }
   | { kind: 'detour' }
   | { kind: 'last-path' }
@@ -668,12 +691,12 @@ export function routePinnedRow(
     // first: a credits pin keeps serving, any other pin moves to credits.
     const toLastPath = !tiers.free.has(route.accountId)
     if (route.pin.action === 'assign') {
-      if (toLastPath && onCredits) return { kind: 'serve' }
+      if (toLastPath && onCredits) return { kind: 'serve', tier: 'credits' }
       return move
     }
     if (route.accountId !== id) return { kind: 'detour' }
     if (toLastPath && othersOnCredits) return move
-    return { kind: 'serve' }
+    return { kind: 'serve', tier: toLastPath ? 'last-path' : 'free' }
   }
   const refusal = route.admission.refused.find((entry) => entry.id === id)
   const confirmed =
@@ -681,7 +704,7 @@ export function routePinnedRow(
   // No row has free quota. A credits pin serves on its credits; a pin
   // confirmed unable to serve moves to a credits row; a pin still waiting
   // for a reading keeps its pin and this one request goes to credits.
-  if (onCredits) return { kind: 'serve' }
+  if (onCredits) return { kind: 'serve', tier: 'credits' }
   if (othersOnCredits) return confirmed ? move : { kind: 'detour' }
   if (!killed && refusal && isConfirmedExhaustion(refusal))
     return { kind: 'last-path' }

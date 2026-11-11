@@ -1732,134 +1732,144 @@ for (const { outcome, plan, warming } of [
   { outcome: 'error-id', plan: undefined, warming: { on: false } },
   { outcome: 'aborted', plan: undefined, warming: { on: false } },
 ] as const) {
-  test(`billing Pi injected vault stream ${outcome} plan ${plan ?? 'none'} reports once with Pi session id`, async () => {
-    const key = Symbol.for('cortexkit.routing')
-    const original = Object.getOwnPropertyDescriptor(globalThis, key)
-    const reports: Record<string, unknown>[] = []
-    const sessions: string[] = []
-    Reflect.set(globalThis, key, (sessionId: string) => {
-      sessions.push(sessionId)
-      return {
-        cache: () => (plan ? { keep_warm: plan } : undefined),
-        report: (payload: Record<string, unknown>) => {
-          if (payload.kind === 'billing') reports.push(payload)
-        },
-      }
-    })
-    daemon = await startMockDaemon({
-      directory: dir,
-      credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
-    })
-    enroll()
-    const target = vault()
-    const runtime = runtimeWith(
-      target,
-      undefined,
-      (model, _context, options) => {
-        if (outcome === 'throw') throw new Error('failed before first event')
-        const stream = createAssistantMessageEventStream()
-        const error = errorEvent(model, 'provider failed')
-        if (error.type !== 'error') throw new Error('expected error fixture')
-        if (
-          outcome === 'error' ||
-          outcome === 'error-id' ||
-          outcome === 'aborted'
-        ) {
-          if (outcome === 'aborted')
-            stream.push({
-              type: 'text_start',
-              contentIndex: 0,
-              partial: error.error,
-            })
-          stream.push(
-            outcome === 'aborted'
-              ? { ...error, reason: 'aborted' }
-              : outcome === 'error-id'
-                ? {
-                    ...error,
-                    error: { ...error.error, responseId: 'resp_pi_FAILED-Id' },
-                  }
-                : error,
-          )
-          stream.end()
-          return stream
+  test.each(['main-first', 'sticky-balanced'] as const)(
+    `billing Pi %s injected vault stream ${outcome} plan ${plan ?? 'none'} reports once with Pi session id`,
+    async (mode) => {
+      const key = Symbol.for('cortexkit.routing')
+      const original = Object.getOwnPropertyDescriptor(globalThis, key)
+      const reports: Record<string, unknown>[] = []
+      const sessions: string[] = []
+      Reflect.set(globalThis, key, (sessionId: string) => {
+        sessions.push(sessionId)
+        return {
+          cache: () => (plan ? { keep_warm: plan } : undefined),
+          report: (payload: Record<string, unknown>) => {
+            if (payload.kind === 'billing') reports.push(payload)
+          },
         }
-        void (async () => {
-          await options?.onResponse?.({ status: 200, headers: {} }, model)
-          const message = {
-            ...error.error,
-            stopReason: 'stop' as const,
-            responseId: 'resp_pi_EXACT-Id',
-            usage: {
-              ...error.error.usage,
-              input: 30,
-              output: 12,
-              cacheRead: 70,
-              cacheWrite: 0,
-              reasoning: 4,
-            },
+      })
+      daemon = await startMockDaemon({
+        directory: dir,
+        credentials: { 'oauth:openai:vault': vaultLogin('chatgpt-vault') },
+      })
+      enroll()
+      await setMode(mode)
+      const target = vault()
+      const runtime = runtimeWith(
+        target,
+        undefined,
+        (model, _context, options) => {
+          if (outcome === 'throw') throw new Error('failed before first event')
+          const stream = createAssistantMessageEventStream()
+          const error = errorEvent(model, 'provider failed')
+          if (error.type !== 'error') throw new Error('expected error fixture')
+          if (
+            outcome === 'error' ||
+            outcome === 'error-id' ||
+            outcome === 'aborted'
+          ) {
+            if (outcome === 'aborted')
+              stream.push({
+                type: 'text_start',
+                contentIndex: 0,
+                partial: error.error,
+              })
+            stream.push(
+              outcome === 'aborted'
+                ? { ...error, reason: 'aborted' }
+                : outcome === 'error-id'
+                  ? {
+                      ...error,
+                      error: {
+                        ...error.error,
+                        responseId: 'resp_pi_FAILED-Id',
+                      },
+                    }
+                  : error,
+            )
+            stream.end()
+            return stream
           }
-          stream.push({ type: 'start', partial: message })
-          stream.push({ type: 'done', reason: 'stop', message })
-          stream.end()
-        })()
-        return stream
-      },
-    )
-    try {
-      await target.refresh()
-      await target.pollStale(0)
-      const events = await send(runtime, 'pi-own-session')
-      expect(sessions).toContain('pi-own-session')
-      expect(reports).toEqual([
-        {
-          kind: 'billing',
-          cache: { implicit: true, warming },
-          attempt_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
-          request_kind: 'primary',
-          credential_id: 'oauth:openai:vault',
-          account_id: 'chatgpt-vault',
-          provider: 'openai',
-          model: MODEL.id,
-          outcome:
-            outcome === 'completed'
-              ? 'completed'
-              : outcome === 'aborted'
-                ? 'cut'
-                : 'failed',
-          attempt: 1,
-          ...(outcome === 'completed'
-            ? {
-                status: 200,
-                provider_response_id: 'resp_pi_EXACT-Id',
-                usage: {
-                  input: 30,
-                  output: 12,
-                  cache_read: 70,
-                  reasoning: 4,
-                  reasoning_included_in_output: true,
-                },
-              }
-            : outcome === 'error-id'
-              ? { provider_response_id: 'resp_pi_FAILED-Id' }
-              : {}),
+          void (async () => {
+            await options?.onResponse?.({ status: 200, headers: {} }, model)
+            const message = {
+              ...error.error,
+              stopReason: 'stop' as const,
+              responseId: 'resp_pi_EXACT-Id',
+              usage: {
+                ...error.error.usage,
+                input: 30,
+                output: 12,
+                cacheRead: 70,
+                cacheWrite: 0,
+                reasoning: 4,
+              },
+            }
+            stream.push({ type: 'start', partial: message })
+            stream.push({ type: 'done', reason: 'stop', message })
+            stream.end()
+          })()
+          return stream
         },
-      ])
-      const final = events.findLast(
-        (event) => event.type === 'done' || event.type === 'error',
       )
-      if (final?.type === 'done') {
-        expect(final.message.responseId).toBe('resp_pi_EXACT-Id')
-        expect(reports[0]!.provider_response_id).toBe(final.message.responseId)
-      } else if (final?.type === 'error' && final.error.responseId) {
-        expect(reports[0]!.provider_response_id).toBe(final.error.responseId)
-      } else {
-        expect(reports[0]).not.toHaveProperty('provider_response_id')
+      try {
+        await target.refresh()
+        await target.pollStale(0)
+        const events = await send(runtime, 'pi-own-session')
+        expect(sessions).toContain('pi-own-session')
+        expect(reports).toEqual([
+          {
+            kind: 'billing',
+            cache: { implicit: true, warming },
+            attempt_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+            request_kind: 'primary',
+            credential_id: 'oauth:openai:vault',
+            account_id: 'chatgpt-vault',
+            provider: 'openai',
+            model: MODEL.id,
+            charge_basis: 'subscription_included',
+            outcome:
+              outcome === 'completed'
+                ? 'completed'
+                : outcome === 'aborted'
+                  ? 'cut'
+                  : 'failed',
+            attempt: 1,
+            ...(outcome === 'completed'
+              ? {
+                  status: 200,
+                  provider_response_id: 'resp_pi_EXACT-Id',
+                  usage: {
+                    input: 30,
+                    output: 12,
+                    cache_read: 70,
+                    reasoning: 4,
+                    reasoning_included_in_output: true,
+                  },
+                }
+              : outcome === 'error-id'
+                ? { provider_response_id: 'resp_pi_FAILED-Id' }
+                : {}),
+          },
+        ])
+        const final = events.findLast(
+          (event) => event.type === 'done' || event.type === 'error',
+        )
+        if (final?.type === 'done') {
+          expect(final.message.responseId).toBe('resp_pi_EXACT-Id')
+          expect(reports[0]!.provider_response_id).toBe(
+            final.message.responseId,
+          )
+        } else if (final?.type === 'error' && final.error.responseId) {
+          expect(reports[0]!.provider_response_id).toBe(final.error.responseId)
+        } else {
+          expect(reports[0]).not.toHaveProperty('provider_response_id')
+        }
+      } finally {
+        await target.dispose()
+        if (original) Object.defineProperty(globalThis, key, original)
+        else Reflect.deleteProperty(globalThis, key)
       }
-    } finally {
-      await target.dispose()
-      if (original) Object.defineProperty(globalThis, key, original)
-      else Reflect.deleteProperty(globalThis, key)
-    }
-  })
+    },
+  )
 }

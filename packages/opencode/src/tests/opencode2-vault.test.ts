@@ -1137,6 +1137,7 @@ for (const hosted of [undefined, 'relay'] as const) {
       account_id: 'chatgpt-vault',
       provider: 'openai',
       model: 'gpt-5.5',
+      charge_basis: 'subscription_included',
       outcome: 'completed',
       attempt: 1,
       provider_response_id: 'ws-1',

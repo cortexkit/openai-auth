@@ -93,6 +93,7 @@ describe('ordered routing placement', () => {
       kind: 'send',
       order: ['alpha', 'main', 'beta'],
       lastPath: false,
+      tiers: { alpha: 'free', main: 'free', beta: 'free' },
     })
   })
 

@@ -63,6 +63,7 @@ export class VaultBillingAttempt {
     private readonly model: string,
     private readonly attempt: number,
     private readonly warming?: (sessionId: string) => VaultBillingWarming,
+    private readonly freeQuota = false,
   ) {}
 
   event(event: unknown): void {
@@ -120,6 +121,9 @@ export class VaultBillingAttempt {
         : {}),
       provider: 'openai',
       model: this.model,
+      ...(this.freeQuota
+        ? { chargeBasis: 'subscription_included' as const }
+        : {}),
       attempt: this.attempt,
       cache: {
         implicit: true,

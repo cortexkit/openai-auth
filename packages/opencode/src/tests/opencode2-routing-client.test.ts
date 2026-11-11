@@ -510,7 +510,11 @@ const billingTerminal = (type = 'response.completed') => ({
 })
 const billingSse = (event: unknown) => `data: ${JSON.stringify(event)}\n\n`
 
-async function billingFixture(vaultMode = true, accessor = true) {
+async function billingFixture(
+  vaultMode = true,
+  accessor = true,
+  mode: 'ordered' | 'sticky-balanced' = 'ordered',
+) {
   const reports: Record<string, unknown>[] = []
   if (accessor)
     Reflect.set(globalThis, key, () => ({
@@ -520,7 +524,7 @@ async function billingFixture(vaultMode = true, accessor = true) {
       },
     }))
   else Reflect.deleteProperty(globalThis, key)
-  const env = fixture(vaultMode)
+  const env = fixture(vaultMode, mode)
   const host = fakeOpenCode2Host()
   const installation = await installOpenCode2Auth(host.ctx, env.openai.adapter)
   const send = async (
@@ -567,6 +571,7 @@ test.each(['response.completed', 'response.incomplete'])(
           account_id: 'account-a',
           provider: 'openai',
           model: 'gpt-6',
+          charge_basis: 'subscription_included',
           outcome: 'completed',
           status: 200,
           attempt: 1,
@@ -605,6 +610,7 @@ test('billing HTTP 429 fails without usage', async () => {
         account_id: 'account-a',
         provider: 'openai',
         model: 'gpt-6',
+        charge_basis: 'subscription_included',
         outcome: 'failed',
         status: 429,
         attempt: 1,
@@ -614,6 +620,43 @@ test('billing HTTP 429 fails without usage', async () => {
     await env.installation.dispose()
   }
 })
+
+for (const mode of ['ordered', 'sticky-balanced'] as const) {
+  test.each(['free', 'credits', 'last-path'] as const)(
+    `billing HTTP ${mode} charge basis reflects %s admission`,
+    async (tier) => {
+      const env = await billingFixture(true, true, mode)
+      for (const route of env.routes) {
+        route.quota = quotaMap(tier === 'free' ? 10 : 100)
+        const limit = route.quota.limits[0]
+        if (limit?.kind === 'reading')
+          limit.resetsAt = new Date(Date.now() + 3600_000).toISOString()
+        if (tier === 'credits')
+          route.quota.credits = {
+            hasCredits: true,
+            unlimited: false,
+            balance: 50,
+            checkedAt: Date.now(),
+          }
+      }
+      try {
+        const response = await env.send(
+          new Response(billingSse(billingTerminal())),
+        )
+        await response.text()
+        expect(env.reports).toHaveLength(1)
+        if (tier === 'free')
+          expect(env.reports[0]).toHaveProperty(
+            'charge_basis',
+            'subscription_included',
+          )
+        else expect(env.reports[0]).not.toHaveProperty('charge_basis')
+      } finally {
+        await env.installation.dispose()
+      }
+    },
+  )
+}
 
 test('billing HTTP cut then same-account continuation increments attempt and resets on a user turn', async () => {
   const env = await billingFixture()
@@ -666,6 +709,11 @@ test('billing HTTP cut then same-account continuation increments attempt and res
     ])
     expect(env.reports[0]!.attempt_id).not.toBe(env.reports[1]!.attempt_id)
     expect(env.reports[0]).not.toHaveProperty('usage')
+    expect(env.reports[0]).toHaveProperty(
+      'charge_basis',
+      'subscription_included',
+    )
+    expect(env.reports[1]).not.toHaveProperty('charge_basis')
     env.openai.beginTurn('fleet-session')
     await (await env.send(new Response(billingSse(billingTerminal())))).text()
     expect(env.reports[2]!.attempt).toBe(1)

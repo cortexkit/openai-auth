@@ -114,7 +114,12 @@ describe('prepaid credits as a fallback tier', () => {
       for (const mode of MODES)
         expect(
           planOrdered({ ...input(rows), placement: orderedPlacement(mode) }),
-        ).toEqual({ kind: 'send', order: ['b'], lastPath: false })
+        ).toEqual({
+          kind: 'send',
+          order: ['b'],
+          lastPath: false,
+          tiers: { b: 'free' },
+        })
       expect(place(input(rows))).toBe('b')
       expect(creditsFallbackIds(input(rows))).toEqual(['main'])
     }
@@ -133,7 +138,12 @@ describe('prepaid credits as a fallback tier', () => {
       for (const mode of MODES)
         expect(
           planOrdered({ ...input(rows), placement: orderedPlacement(mode) }),
-        ).toEqual({ kind: 'send', order: ['a', 'main'], lastPath: false })
+        ).toEqual({
+          kind: 'send',
+          order: ['a', 'main'],
+          lastPath: false,
+          tiers: { a: 'credits', main: 'last-path' },
+        })
       expect(place(input(rows))).toBe('a')
     }
     // A request that cannot be replayed and has no main goes to credits too.
@@ -143,7 +153,12 @@ describe('prepaid credits as a fallback tier', () => {
         placement: 'roster',
         replayable: false,
       }),
-    ).toEqual({ kind: 'send', order: ['a'], lastPath: false })
+    ).toEqual({
+      kind: 'send',
+      order: ['a'],
+      lastPath: false,
+      tiers: { a: 'credits' },
+    })
   })
 
   test('credits serve before the last path the library keeps for spent credit budgets', () => {
@@ -184,13 +199,19 @@ describe('prepaid credits as a fallback tier', () => {
         kind: 'send',
         order: ['main', 'a'],
         lastPath: true,
+        tiers: { main: 'last-path', a: 'last-path' },
       })
       expect(place(input(rows))).toBeUndefined()
     }
     const unrecorded = [row('main', spent()), row('a', spent())]
     expect(
       planOrdered({ ...input(unrecorded), placement: 'main-first' }),
-    ).toEqual({ kind: 'send', order: ['main', 'a'], lastPath: true })
+    ).toEqual({
+      kind: 'send',
+      order: ['main', 'a'],
+      lastPath: true,
+      tiers: { main: 'last-path', a: 'last-path' },
+    })
   })
 
   test('a killswitch floor and a reached spending cap still block an account with credits', () => {
@@ -224,6 +245,7 @@ describe('prepaid credits as a fallback tier', () => {
       kind: 'send',
       order: ['main', 'a'],
       lastPath: true,
+      tiers: { main: 'last-path', a: 'last-path' },
     })
     expect(place(capped)).toBeUndefined()
   })
@@ -255,7 +277,7 @@ describe('prepaid credits as a fallback tier', () => {
         sticky,
         'c',
       ),
-    ).toEqual({ kind: 'serve' })
+    ).toEqual({ kind: 'serve', tier: 'credits' })
     // Another account's window has reset: the credits pin moves to it.
     const recovered = input([row('f', free()), row('c', onCredits())])
     expect(routePinnedRow(recovered, sticky, 'c')).toEqual({
@@ -263,6 +285,10 @@ describe('prepaid credits as a fallback tier', () => {
       reason: 'exhausted',
     })
     expect(place(recovered, ['c'])).toBe('f')
+    expect(routePinnedRow(recovered, sticky, 'f')).toEqual({
+      kind: 'serve',
+      tier: 'free',
+    })
   })
 
   test('a pin waiting for its first reading keeps its pin while this request goes to credits', () => {

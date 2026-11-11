@@ -843,6 +843,7 @@ export class PiOpenAIRuntime {
         requestPull: (id) => this.requestPull(id),
         firstReadingWaitMs:
           this.deps.firstReadingWaitMs ?? FIRST_READING_WAIT_MS,
+        captureAdmissionTier: hasVaultRoutingAccessor(),
         limitPolicy: {
           execute: true,
           canWait: execution.canWait,
@@ -855,7 +856,7 @@ export class PiOpenAIRuntime {
           onDecision: (decision, facts) =>
             this.deps.onLimitDecision?.(decision, facts),
         },
-        send: (account) =>
+        send: (account, tier) =>
           options?.signal?.aborted
             ? Promise.resolve(undefined)
             : account.vault
@@ -865,6 +866,7 @@ export class PiOpenAIRuntime {
                   options,
                   account.id,
                   execution,
+                  tier === 'free',
                 ).then((attempt) => {
                   if (!attempt) vaultRefused = true
                   return attempt
@@ -919,6 +921,7 @@ export class PiOpenAIRuntime {
     token: string,
     receipt?: QuotaReceipt,
     execution?: { billingAttempt?: number },
+    freeQuota = false,
   ): Promise<StreamAttempt> {
     let billing: VaultBillingAttempt | undefined
     if (
@@ -940,6 +943,7 @@ export class PiOpenAIRuntime {
             ? { on: false, stopReason: 'unsupported' }
             : { on: false }
         },
+        freeQuota,
       )
     }
     let status: number | undefined
@@ -1110,6 +1114,7 @@ export class PiOpenAIRuntime {
     options: SimpleStreamOptions | undefined,
     accountId: string,
     execution: { billingAttempt?: number },
+    freeQuota = false,
   ): Promise<StreamAttempt | undefined> {
     let last: StreamAttempt | undefined
     const response = await this.vault.send(
@@ -1139,6 +1144,7 @@ export class PiOpenAIRuntime {
           token,
           attempt,
           execution,
+          freeQuota,
         )
         return new Response(null, { status: last.status ?? 200 })
       },

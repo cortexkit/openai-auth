@@ -34,6 +34,7 @@
 import { resolve } from 'node:path'
 import type { CacheKeepLogger } from '@cortexkit/common-auth/cachekeep'
 import type { Attempt } from '@cortexkit/common-auth/opencode2'
+import { isQuotaMap } from '@cortexkit/common-auth/quota'
 import {
   type AccountPaths,
   type AccountStorage,
@@ -54,6 +55,7 @@ import {
 } from '../core/cachekeep'
 import type { OpenCodeLimitSource } from '../core/limit-source'
 import type { PoolAccountSource } from '../core/pool-account-source'
+import { planOrdered } from '../core/pool-routing'
 import type { OpenAIAttemptData } from './adapter'
 import { observeBillingResponse } from './billing-response'
 import { acquireFrameMirror } from './frame-mirror'
@@ -123,7 +125,10 @@ export interface CacheKeepLocation {
   /** The account settings, read for each local-mode token. */
   storage: () => Promise<AccountStorage | null>
   /** This location's vault; a vault-mode warm gets a new receipt here. */
-  vault: Pick<OpenAiVault, 'authority' | 'owns' | 'send' | 'reportUsage'>
+  vault: Pick<
+    OpenAiVault,
+    'authority' | 'owns' | 'send' | 'reportUsage' | 'routes'
+  >
   /** The account serving each session now (the session-account registry). */
   accounts: ActiveAccounts
   /** This location's live keep-warm settings. */
@@ -259,6 +264,27 @@ function createEntry(
         return undefined
       }
       if (typeof model !== 'string') return undefined
+      const route = need()
+        .vault.routes()
+        .find((route) => route.id === target.accountId)
+      const plan = planOrdered({
+        rows: route
+          ? [
+              {
+                id: route.id,
+                kind: 'oauth',
+                ...(isQuotaMap(route.quota) ? { quota: route.quota } : {}),
+              },
+            ]
+          : [],
+        now: setup.now(),
+        placement: 'roster',
+        mainId: null,
+        rateLimitMarks: new Map(),
+        refreshBackoff: new Map(),
+        killswitch: new Map(),
+        requestPull: () => {},
+      })
       const record = new VaultBillingAttempt(
         sessionId,
         receipt,
@@ -266,6 +292,9 @@ function createEntry(
         model,
         attempt,
         (sessionId) => manager.warming(sessionId),
+        route !== undefined &&
+          plan.kind === 'send' &&
+          plan.tiers[route.id] === 'free',
       )
       return {
         response: (response) => observeBillingResponse(record, response),
