@@ -2000,9 +2000,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             data.receipt,
             {
               window: limit.reason,
-              resetAt:
-                limit.resetAt ??
-                limit.windows.find((window) => window.confirmed)?.resetAt,
+              resetAt: limit.resetAt,
             },
             {
               body: routingLimitBodies?.get(attempt),
@@ -2010,7 +2008,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
               quota: vault
                 ?.routes()
                 .find((route) => route.id === attempt.accountId)?.quota,
-              now: now(),
+              now: limit.observedAt,
             },
           )
       }

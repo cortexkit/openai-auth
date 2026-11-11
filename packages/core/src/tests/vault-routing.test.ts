@@ -315,6 +315,51 @@ test('classified exhaustion resolves slot minutes and keeps parsed-reset precede
   ])
 })
 
+test.each([undefined, 1_900_000_000])(
+  'classified named-frame reset %s never borrows quota bookkeeping',
+  (reset) => {
+    const reports = captureReports()
+    reportVaultRoutingLimit(
+      'session',
+      receipt,
+      { window: 'primary' },
+      {
+        body: {
+          type: 'response.failed',
+          response: {
+            failed: {
+              rate_limit_reached_type: 'primary',
+              ...(reset !== undefined ? { resets_at: reset } : {}),
+            },
+          },
+        },
+        quota: {
+          limits: [
+            {
+              scope: 'all',
+              label: 'primary',
+              kind: 'reading',
+              usedPercent: 100,
+              windowMinutes: 300,
+              checkedAt: Date.now(),
+              resetsAt: '2099-01-01T00:00:00Z',
+            },
+          ],
+        },
+      },
+    )
+    expect(reports).toEqual([
+      {
+        account_id: 'account-b',
+        credential_id: 'credential-b',
+        outcome: 'exhausted',
+        window: '5h',
+        ...(reset !== undefined ? { resets_at: 1_900_000_000_000 } : {}),
+      },
+    ])
+  },
+)
+
 test.each([
   'rate_limit',
   'rate_limit_exceeded',

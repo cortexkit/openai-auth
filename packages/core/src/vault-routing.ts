@@ -203,7 +203,17 @@ export function reportVaultRoutingLimit(
   const headerReset = slot
     ? Number(options.headers?.get(`x-codex-${slot}-reset-at`)) * 1000
     : NaN
-  const reset = limit.resetAt
+  const absolute = detail?.resets_at ?? failed?.resets_at
+  const relative = detail?.resets_in_seconds ?? failed?.resets_in_seconds
+  const providerReset =
+    typeof absolute === 'number' && Number.isFinite(absolute) && absolute > 0
+      ? absolute * 1000
+      : typeof relative === 'number' &&
+          Number.isFinite(relative) &&
+          relative > 0
+        ? (options.now ?? Date.now()) + relative * 1000
+        : undefined
+  const reset = limit.resetAt ?? providerReset
   const resetsAt =
     reset !== undefined && Number.isFinite(reset) && reset > 0
       ? reset

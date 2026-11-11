@@ -354,6 +354,21 @@ for (const scenario of [
       response: { failed: { rate_limit_reached_type: 'primary' } },
     },
     exhausted: true,
+    reset: false,
+  },
+  {
+    name: 'failed primary window with provider reset',
+    frame: {
+      type: 'response.failed',
+      response: {
+        failed: {
+          rate_limit_reached_type: 'primary',
+          resets_at: 1_900_000_000,
+        },
+      },
+    },
+    exhausted: true,
+    reset: true,
   },
   {
     name: 'usage-limit error',
@@ -366,6 +381,7 @@ for (const scenario of [
       },
     },
     exhausted: true,
+    reset: true,
   },
   {
     name: 'short rate limit',
@@ -431,7 +447,9 @@ for (const scenario of [
                 credential_id: 'credential-b',
                 outcome: 'exhausted',
                 window: '5h',
-                resets_at: 1_900_000_000_000,
+                ...('reset' in scenario && scenario.reset
+                  ? { resets_at: 1_900_000_000_000 }
+                  : {}),
               },
             ]
           : [],

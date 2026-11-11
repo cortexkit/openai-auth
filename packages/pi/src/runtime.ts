@@ -1042,8 +1042,10 @@ export class PiOpenAIRuntime {
               receipt,
               {
                 window: signal.reason,
-                resetAt: signal.windows.find((window) => window.confirmed)
-                  ?.resetAt,
+                resetAt: signal.windows.find(
+                  (window) =>
+                    window.confirmed && window.provenance === 'provider',
+                )?.resetAt,
               },
               {
                 body: parsed,
