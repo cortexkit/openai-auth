@@ -49,7 +49,7 @@ import {
 import { installPackedPlugin, PACKAGE_NAME } from './fixtures/opencode2-pack'
 
 const ENABLED = process.env.OPENAI_AUTH_OPENCODE2_E2E === '1'
-export const OPENCODE_CLI_VERSION = '2.2.5'
+export const OPENCODE_CLI_VERSION = '2.2.6'
 const PLACEHOLDER = placeholderSecret('openai')
 const PASSWORD = 'openai-auth-e2e-loopback-only'
 const HOUR = 3600_000
@@ -933,8 +933,6 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
             .filter((row) => row.kind === 'primary')
             .map((row) => row.identity),
         ).toEqual(['V', 'V'])
-        // The host CLI sets a nonzero exit on session.step.failed even when
-        // continuation succeeds; the final assistant reply is the contract.
         expect(
           result.trace.filter((event) => event.event === 'retry'),
         ).toMatchObject([{ retry: true }])
@@ -945,12 +943,12 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         const text = texts.map((event) => event.part.text).join('')
         const finalText = texts.at(-1)!.part
         expect(finalText.text).toMatch(/^MOCK-WS-REPLY-\d+-V$/)
-        const errors = events.filter((event) => event.type === 'error')
-        expect(errors).toHaveLength(1)
-        expect(errors[0]).toMatchObject({
+        const retries = events.filter((event) => event.type === 'retry')
+        expect(retries).toHaveLength(1)
+        expect(retries[0]).toMatchObject({
           error: { type: 'provider.transport' },
         })
-        expect(events.indexOf(errors[0])).toBeLessThan(
+        expect(events.indexOf(retries[0])).toBeLessThan(
           events.indexOf(texts.at(-1)),
         )
         const decisions = result.pluginLog
