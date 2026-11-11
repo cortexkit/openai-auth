@@ -206,17 +206,31 @@ async function waitForServer(url: string, child: Bun.Subprocess) {
 async function collect(
   stream: ReadableStream<Uint8Array> | null | undefined,
   into: string[],
+  onLine?: (line: string) => Promise<void>,
 ) {
   if (!stream) return
   const decoder = new TextDecoder()
-  for await (const chunk of stream)
-    into.push(decoder.decode(chunk, { stream: true }))
+  let pending = ''
+  for await (const chunk of stream) {
+    const text = decoder.decode(chunk, { stream: true })
+    into.push(text)
+    if (!onLine) continue
+    pending += text
+    let newline = pending.indexOf('\n')
+    while (newline >= 0) {
+      const line = pending.slice(0, newline)
+      pending = pending.slice(newline + 1)
+      await onLine(line)
+      newline = pending.indexOf('\n')
+    }
+  }
 }
 
 async function runCli(
   args: string[],
   cwd: string,
   env: Record<string, string>,
+  onLine?: (line: string) => Promise<void>,
 ) {
   const child = Bun.spawn([cli, ...args], {
     cwd,
@@ -228,7 +242,7 @@ async function runCli(
   const err: string[] = []
   const timer = setTimeout(() => child.kill('SIGKILL'), 90_000)
   await Promise.all([
-    collect(child.stdout, out),
+    collect(child.stdout, out, onLine),
     collect(child.stderr, err),
     child.exited,
   ])
@@ -238,6 +252,7 @@ async function runCli(
 
 interface ScenarioResult {
   readonly billingReports: Array<Record<string, unknown>>
+  readonly httpStreams: MockCodex['httpStreams']
   readonly destinations: string[]
   readonly wire: WireRecord[]
   /** Agent-loop requests and frames as sent, with their headers. */
@@ -299,6 +314,8 @@ async function runScenario(input: {
   hostedVault?: boolean
   /** Install a stand-in Thalamus routing accessor in the host process to capture billing reports. */
   billing?: boolean
+  /** Stream HTTP events separately; optionally abort the session before its terminal event. */
+  httpStream?: { terminalDelayMs: number; abortBeforeTerminal?: boolean }
   /**
    * Seed an old vault registry and command locations without abort controllers,
    * then edit the live entry to load the current server code.
@@ -309,7 +326,16 @@ async function runScenario(input: {
   const project = join(root, 'project')
   mkdirSync(project, { recursive: true })
   spawnSync('git', ['init', '-q'], { cwd: project })
-  const mock: MockCodex = startMockCodex([PLACEHOLDER])
+  const mock: MockCodex = startMockCodex([PLACEHOLDER], {
+    ...(input.httpStream
+      ? {
+          httpStream: {
+            terminalDelayMs: input.httpStream.terminalDelayMs,
+            holdBeforeTerminal: input.httpStream.abortBeforeTerminal,
+          },
+        }
+      : {}),
+  })
   const isolated = isolatedEnv(root)
   const env: Record<string, string> = {
     ...isolated,
@@ -505,7 +531,24 @@ async function runScenario(input: {
         ...(index > 0 ? ['--continue'] : []),
         `Turn ${index + 1}: say hello.`,
       ]
-      const result = await runCli(args, project, env)
+      let aborted = false
+      const result = await runCli(args, project, env, async (line) => {
+        if (!input.httpStream?.abortBeforeTerminal || aborted || !line.trim())
+          return
+        const event = JSON.parse(line)
+        if (event.type !== 'text') return
+        aborted = true
+        const response = await fetch(
+          `${serverURL}/api/session/${event.sessionID}/interrupt`,
+          {
+            method: 'POST',
+            headers: { authorization: `Basic ${btoa(`opencode:${PASSWORD}`)}` },
+          },
+        )
+        if (!response.ok)
+          throw new Error(`session interrupt answered ${response.status}`)
+        await response.body?.cancel()
+      })
       exits.push(result.exit)
       stdout.push(result.stdout)
       clientLog.push(`--- turn ${index + 1} stderr ---\n${result.stderr}`)
@@ -601,6 +644,7 @@ async function runScenario(input: {
   rmSync(root, { recursive: true, force: true })
   return {
     billingReports,
+    httpStreams: mock.httpStreams,
     destinations,
     wire: [...mock.records],
     samples: [...mock.samples],
@@ -1142,7 +1186,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         `import { appendFileSync } from 'node:fs'`,
         `if (process.env.OPENAI_AUTH_E2E_BILLING) {`,
         `  globalThis[Symbol.for('cortexkit.routing')] = () => ({ report(payload) {`,
-        `    if (payload.kind === 'billing') appendFileSync(process.env.OPENAI_AUTH_E2E_BILLING, JSON.stringify(payload) + '\\n')`,
+        `    if (payload.kind === 'billing') appendFileSync(process.env.OPENAI_AUTH_E2E_BILLING, JSON.stringify({...payload, reportedAt: Date.now()}) + '\\n')`,
         `  } })`,
         `}`,
         `if (process.env.CORTEXKIT_VAULT_HOST === 'thalamus') {`,
@@ -1704,6 +1748,76 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
           (item) => item.type === 'configuration_update',
         ),
       ).toEqual([EFFORT_UPDATE_HIGH])
+    })
+  }, 180_000)
+
+  test('billing http: cancellation after a delayed terminal event reports completed before the next request', async () => {
+    const result = await runScenario({
+      transport: 'http',
+      accounts: [],
+      plugin: vaultPlugin,
+      vault: true,
+      hostedVault: true,
+      billing: true,
+      httpStream: { terminalDelayMs: 250 },
+      turns: [{}, {}],
+    })
+    verify(result, () => {
+      expect(result.exits).toEqual([0, 0])
+      const streams = result.httpStreams.filter((row) => row.kind === 'primary')
+      const reports = result.billingReports.filter(
+        (report) => report.request_kind === 'primary',
+      )
+      expect(streams).toHaveLength(2)
+      expect(reports).toHaveLength(2)
+      for (const [index, stream] of streams.entries()) {
+        expect(stream.terminalAt).toBeDefined()
+        expect(stream.terminalAt! - stream.requestAt).toBeGreaterThanOrEqual(
+          250,
+        )
+        expect(stream.cancelledAt).toBeGreaterThanOrEqual(stream.terminalAt!)
+        const report = reports.find(
+          (row) => row.provider_response_id === stream.responseId,
+        )
+        expect(report).toMatchObject({
+          outcome: 'completed',
+          status: 200,
+          usage: { input: 11, output: 3 },
+        })
+        expect(report!.reportedAt).toBeGreaterThanOrEqual(stream.terminalAt!)
+        expect(Number(report!.reportedAt) - stream.terminalAt!).toBeLessThan(
+          1000,
+        )
+        if (streams[index + 1])
+          expect(report!.reportedAt).toBeLessThan(streams[index + 1]!.requestAt)
+      }
+    })
+  }, 180_000)
+
+  test('billing http: cancellation before the terminal event remains cut', async () => {
+    const result = await runScenario({
+      transport: 'http',
+      accounts: [],
+      plugin: vaultPlugin,
+      vault: true,
+      hostedVault: true,
+      billing: true,
+      httpStream: { terminalDelayMs: 250, abortBeforeTerminal: true },
+      turns: [{}],
+    })
+    verify(result, () => {
+      expect(result.exits).toEqual([1])
+      expect(result.stdout[0]).toContain('"type":"aborted"')
+      const streams = result.httpStreams.filter((row) => row.kind === 'primary')
+      expect(streams).toHaveLength(1)
+      expect(streams[0]!.terminalAt).toBeUndefined()
+      expect(streams[0]!.cancelledAt).toBeDefined()
+      const reports = result.billingReports.filter(
+        (report) => report.request_kind === 'primary',
+      )
+      expect(reports).toHaveLength(1)
+      expect(reports[0]).toMatchObject({ outcome: 'cut', status: 200 })
+      expect(reports[0]).not.toHaveProperty('usage')
     })
   }, 180_000)
 

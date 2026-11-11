@@ -101,7 +101,12 @@ export class VaultBillingAttempt {
     this.responseId = responseId
   }
 
-  end(outputStarted: boolean, ended: boolean, status?: number): void {
+  end(
+    outputStarted: boolean,
+    ended: boolean,
+    status?: number,
+    cancelled = false,
+  ): void {
     if (this.reported) return
     this.reported = true
     let warming: VaultBillingWarming | undefined
@@ -136,10 +141,13 @@ export class VaultBillingAttempt {
                 : {}),
             },
       },
+      // A host may stop reading HTTP after a terminal event instead of
+      // waiting for EOF. Only that cancellation preserves completion;
+      // a transport read error still means the response was interrupted.
       outcome:
         this.failed || (status !== undefined && (status < 200 || status >= 300))
           ? 'failed'
-          : this.completed && ended
+          : this.completed && (ended || cancelled)
             ? 'completed'
             : outputStarted
               ? 'cut'

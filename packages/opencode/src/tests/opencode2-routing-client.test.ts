@@ -595,6 +595,52 @@ test.each(['response.completed', 'response.incomplete'])(
   },
 )
 
+test.each([
+  ['response.completed', 'cancelled', 'completed'],
+  ['response.incomplete', 'cancelled', 'completed'],
+  ['response.failed', 'cancelled', 'failed'],
+  ['error', 'cancelled', 'failed'],
+  ['response.output_text.delta', 'cancelled', 'cut'],
+  ['response.completed', 'failed', 'cut'],
+] as const)(
+  'billing HTTP %s then %s reports %s',
+  async (type, end, outcome) => {
+    const env = await billingFixture()
+    let controller!: ReadableStreamDefaultController<Uint8Array>
+    try {
+      const response = await env.send(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(value) {
+              controller = value
+            },
+          }),
+        ),
+      )
+      controller.enqueue(
+        new TextEncoder().encode(billingSse(billingTerminal(type))),
+      )
+      const reader = response.body!.getReader()
+      await reader.read()
+      expect(env.reports).toEqual([])
+      if (end === 'cancelled') await reader.cancel()
+      else {
+        controller.error(new Error('transport read failed'))
+        await expect(reader.read()).rejects.toThrow('transport read failed')
+      }
+      expect(env.reports).toHaveLength(1)
+      expect(env.reports[0]).toMatchObject({ outcome, status: 200 })
+      if (outcome === 'completed')
+        expect(env.reports[0]).toMatchObject({
+          provider_response_id: 'resp-billed',
+          usage: { input: 20, output: 12, cache_read: 40, cache_write: 60 },
+        })
+    } finally {
+      await env.installation.dispose()
+    }
+  },
+)
+
 test('billing HTTP 429 fails without usage', async () => {
   const env = await billingFixture()
   try {

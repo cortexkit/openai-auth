@@ -195,6 +195,13 @@ export interface MockCodex {
   /** Agent-loop requests in full, for reading what the host's driver sends. */
   readonly samples: WireSample[]
   readonly cuts: Array<{ connection: number; code: number; afterTool: boolean }>
+  readonly httpStreams: Array<{
+    kind: 'primary' | 'other'
+    responseId: string
+    requestAt: number
+    terminalAt?: number
+    cancelledAt?: number
+  }>
   /** Refuses the next agent-loop request of `account` once. */
   reject(account: MockAccount, mode: RejectMode): void
   /** Releases a socket cut waiting for the host's completed tool result. */
@@ -208,11 +215,14 @@ export function startMockCodex(
     now?: () => number
     resetMs?: number
     used?: Partial<Record<MockAccount, number>>
+    /** Deliver each SSE event separately so the host can cancel after completion, before EOF. */
+    httpStream?: { terminalDelayMs: number; holdBeforeTerminal?: boolean }
   } = {},
 ): MockCodex {
   const records: WireRecord[] = []
   const samples: WireSample[] = []
   const cuts: MockCodex['cuts'] = []
+  const httpStreams: MockCodex['httpStreams'] = []
   const parse = (text: string): unknown => {
     try {
       return JSON.parse(text)
@@ -432,17 +442,49 @@ export function startMockCodex(
           },
         )
       }
-      return new Response(
-        toSSE(
-          responseEvents(`MOCK-HTTP-REPLY-${index}-${identity}`, `r${index}`),
-        ),
-        {
-          headers: {
-            'content-type': 'text/event-stream',
-            ...quotaHeaders(identity),
-          },
-        },
+      const events = responseEvents(
+        `MOCK-HTTP-REPLY-${index}-${identity}`,
+        `r${index}`,
       )
+      let responseBody: BodyInit = toSSE(events)
+      if (options.httpStream) {
+        const timing = {
+          kind,
+          responseId: `r${index}`,
+          requestAt: Date.now(),
+        } as MockCodex['httpStreams'][number]
+        httpStreams.push(timing)
+        const stream = options.httpStream
+        let cancelled = false
+        responseBody = new ReadableStream<Uint8Array>({
+          async start(controller) {
+            for (const event of events) {
+              if (event.type === 'response.completed') {
+                if (stream.holdBeforeTerminal) return
+                await Bun.sleep(stream.terminalDelayMs)
+              } else await Bun.sleep(10)
+              if (cancelled) return
+              controller.enqueue(new TextEncoder().encode(toSSE([event])))
+              if (event.type === 'response.completed')
+                timing.terminalAt = Date.now()
+            }
+            // Keep EOF separate from the terminal event. The host may cancel
+            // after consuming completion instead of asking for the next chunk.
+            await Bun.sleep(100)
+            if (!cancelled) controller.close()
+          },
+          cancel() {
+            cancelled = true
+            timing.cancelledAt = Date.now()
+          },
+        })
+      }
+      return new Response(responseBody, {
+        headers: {
+          'content-type': 'text/event-stream',
+          ...quotaHeaders(identity),
+        },
+      })
     },
     websocket: {
       message(socket, message) {
@@ -524,6 +566,7 @@ export function startMockCodex(
     records,
     samples,
     cuts,
+    httpStreams,
     reject(account, mode) {
       rejects.push({ account, mode })
     },

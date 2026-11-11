@@ -1892,7 +1892,12 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           : undefined
       if (record) {
         billing.delete(attempt)
-        record.end(outcome.outputStarted, !outcome.error, outcome.status)
+        record.end(
+          outcome.outputStarted,
+          !outcome.error,
+          outcome.status,
+          outcome.error?.reason === 'cancelled',
+        )
       }
       const data = attempt.data
       const state = data && feedback.get(data)
