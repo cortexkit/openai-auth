@@ -334,6 +334,8 @@ test('OpenCode 2 reports a completed vault WebSocket response without waiting', 
         account_id: 'account-b',
         provider: 'openai',
         model: 'gpt-6',
+        // The fixture's account-b has free plan quota, so the call is included.
+        charge_basis: 'subscription_included',
         outcome: 'completed',
         attempt: 1,
         provider_response_id: 'done',
