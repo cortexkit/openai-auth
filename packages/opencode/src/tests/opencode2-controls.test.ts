@@ -513,9 +513,9 @@ for (const outcome of ['approved', 'denied'] as const) {
     })
     expect(result.ok).toBe(true)
     expect(result.text).toContain('ck auth enroll approve')
-    expect(result.text).toContain(
-      'ck auth grant --principal enrolled:openai-auth-opencode',
-    )
+    // The request carries its read grant, so approval grants access and no
+    // separate grant command is shown.
+    expect(result.text).not.toContain('ck auth grant')
     expect(result.text).toContain('Waiting for the approval')
     expect(daemon.proposals).toHaveLength(1)
     const pending = (await vault.status()).enrollment
