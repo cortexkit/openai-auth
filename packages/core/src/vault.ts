@@ -34,6 +34,7 @@ import {
   type ClaustrumEnrollmentPaths,
   type ClaustrumEnrollmentStatus,
   type ClaustrumFamily,
+  type ClaustrumRequestedGrant,
   type ClaustrumScopedAttempt,
   type ClaustrumScopedClient,
   ClaustrumUnreachableError,
@@ -112,6 +113,10 @@ const HOST_NAMES: Record<VaultHost, string> = {
   opencode: 'OpenCode',
   pi: 'Pi',
 }
+
+export const VAULT_REQUESTED_GRANTS: readonly ClaustrumRequestedGrant[] = [
+  { selector: { category: 'openai-native' }, operation: 'read' },
+]
 
 /** The name a host proposes when it enrolls, for example `openai-auth-pi`. */
 export function vaultEnrollmentName(host: VaultHost): string {
@@ -1040,6 +1045,7 @@ export class OpenAiVault {
         paths: this.paths,
         proposedName: this.name,
         displayName: vaultEnrollmentDisplayName(this.host),
+        requestedGrants: VAULT_REQUESTED_GRANTS,
         ...(this.#options.now ? { now: this.#options.now } : {}),
       })
       const current = await manager.status()
@@ -1148,8 +1154,12 @@ export function vaultApprovalInstructions(
   return [
     `Enrollment request ${status.requestId} for ${name} is waiting for approval. Approve it with:`,
     `  ck auth enroll approve --request-id ${status.requestId}`,
-    `Then grant OpenAI access to the name you approved with --name (defaults to ${name}):`,
-    `  ${vaultGrantCommand(name)}`,
+    ...(status.requestedGrantsStatus === 'sent'
+      ? []
+      : [
+          `Then grant OpenAI access to the name you approved with --name (defaults to ${name}):`,
+          `  ${vaultGrantCommand(name)}`,
+        ]),
   ]
 }
 

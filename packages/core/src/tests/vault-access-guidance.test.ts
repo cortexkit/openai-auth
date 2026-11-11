@@ -129,6 +129,29 @@ describe('vault access guidance', () => {
     expect(lines).toContain(`  ${GRANT}`)
   })
 
+  test('pending instructions defer access guidance when the proposal includes grants', () => {
+    const pending = {
+      state: 'pending' as const,
+      proposedName: NAME,
+      requestId: 'request-1',
+    }
+    expect(
+      vaultApprovalInstructions(NAME, {
+        ...pending,
+        requestedGrantsStatus: 'sent',
+      }),
+    ).toEqual([
+      `Enrollment request request-1 for ${NAME} is waiting for approval. Approve it with:`,
+      '  ck auth enroll approve --request-id request-1',
+    ])
+    expect(
+      vaultApprovalInstructions(NAME, {
+        ...pending,
+        requestedGrantsStatus: 'dropped',
+      }),
+    ).toContain(`  ${GRANT}`)
+  })
+
   test('without a grant, the connect outcome and the menu give the exact grant command', async () => {
     const hint = vaultEmptyAccessHint(NAME, NO_GRANT)
     expect(hint).toBe(

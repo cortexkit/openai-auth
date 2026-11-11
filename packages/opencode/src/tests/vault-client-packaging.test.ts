@@ -55,7 +55,7 @@ describe('vault client packaging', () => {
         readFileSync(join(packageDir, 'package.json'), 'utf8'),
       )
       expect(manifest.dependencies['@cortexkit/claustrum-client']).toBe(
-        '^0.17.0',
+        '^0.18.0',
       )
       expect(manifest.dependencies['@cortexkit/subc-client']).toBe('^0.24.0')
       const dist = join(packageDir, 'dist')

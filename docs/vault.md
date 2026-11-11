@@ -6,15 +6,19 @@
 
 Each application enrolls under its own name, `openai-auth-opencode` for OpenCode and `openai-auth-pi` for Pi, so either can be revoked alone. OpenCode versions 1 and 2 share the `openai-auth-opencode` enrollment and its files.
 
-Approve a second host of the same kind with its own `--name` (for example, `openai-auth-opencode-thalamus1`); the grant must name that same name in `--principal enrolled:<name>`.
+Approve a second host of the same kind with its own `--name` (for example, `openai-auth-opencode-thalamus1`). If a manual grant is needed, it must name that same name in `--principal enrolled:<name>`.
 
-**Connect** (in `opencode auth login`, the Vault section of the plugin's [`/openai` slash-command menu](commands.md#the-openai-command), or Pi's `openai` menu) sends an enrollment request for the vault owner to approve with the vault's [`ck` command-line tool](https://github.com/cortexkit/claustrum). It prints the approval and account-access commands:
+**Connect** (in `opencode auth login`, the Vault section of the plugin's [`/openai` slash-command menu](commands.md#the-openai-command), or Pi's `openai` menu) sends an enrollment request for the vault owner to approve with the vault's [`ck` command-line tool](https://github.com/cortexkit/claustrum). The request asks for read access to `openai-native` accounts, so approval grants access in one step on vaults that support it. Setup confirms access with a scoped account listing after approval. Connect prints the approval command:
 
 ```text
 Enrollment request <id> for openai-auth-opencode is waiting for approval. Approve it with:
   ck auth enroll approve --request-id <id>
-Then grant OpenAI access to the name you approved with --name (defaults to openai-auth-opencode):
-  ck auth grant --principal enrolled:openai-auth-opencode --selector-kind category --selector openai-native --operation read
+```
+
+On older vaults, or when approval leaves access missing, grant OpenAI access manually to the name you approved with `--name` (defaults to `openai-auth-opencode`):
+
+```sh
+ck auth grant --principal enrolled:openai-auth-opencode --selector-kind category --selector openai-native --operation read
 ```
 
 The phone and desktop apps show "ChatGPT for OpenCode" or "ChatGPT for Pi" on the plugin's permission row when approving access.

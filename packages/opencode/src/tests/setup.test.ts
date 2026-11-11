@@ -12,6 +12,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { ClaustrumCredentialError } from '@cortexkit/claustrum-client'
 import type { ClaustrumEnrollmentConnection } from '@cortexkit/common-auth/claustrum'
 import { VAULT_HOST_CONNECT_REFUSAL } from '@cortexkit/common-auth/claustrum'
 import {
@@ -377,6 +378,9 @@ describe('setup', () => {
         async (): Promise<ClaustrumEnrollmentConnection> => ({
           enrollPropose: async (input) => {
             expect(input.name).toBe(name)
+            expect(input.requestedGrants).toEqual([
+              { selector: { category: 'openai-native' }, operation: 'read' },
+            ])
             proposedDisplayName = input.displayName
             return { requestId: `${host}-request` }
           },
@@ -443,37 +447,121 @@ describe('setup', () => {
     })
   }
 
-  for (const savedProposal of [undefined, 'my-opencode-host']) {
-    test(`grant guidance explains the missing approved name and uses ${savedProposal ?? 'the default proposal'}`, async () => {
-      const stateDir = join(root, 'oc-state', 'openai-auth-vault')
-      seed(
-        join(stateDir, 'opencode-enrollment.json'),
-        JSON.stringify({ token: '03'.repeat(32), token_generation: 1 }),
-      )
-      if (savedProposal)
+  for (const [enrollment, access] of [
+    ['fresh', 'reachable'],
+    ['fresh', 'no-logins'],
+    ['fresh', 'older-vault'],
+    ['fresh', 'unconfirmed'],
+    ['legacy', 'reachable'],
+    ['legacy', 'no-logins'],
+    ['unnamed', 'no-logins'],
+  ] as const) {
+    test(`setup reports ${access} access for ${enrollment} enrollment`, async () => {
+      seed(join(root, 'bin', 'ck'), '')
+      seed(join(root, 'connection.json'), '{}')
+      io.fs = {
+        exists: existsSync,
+        isDirectory: (path) => existsSync(path) && statSync(path).isDirectory(),
+        isFile: (path) => existsSync(path) && statSync(path).isFile(),
+        isExecutable: (path) => existsSync(path) && statSync(path).isFile(),
+        readText: (path) => readFileSync(path, 'utf8'),
+        realpath: (path) => path,
+      }
+      const approvedName = 'openai-auth-opencode-secondary'
+      const token = '03'.repeat(32)
+      if (enrollment !== 'fresh') {
+        const stateDir = join(root, 'oc-state', 'openai-auth-vault')
+        seed(
+          join(stateDir, 'opencode-enrollment.json'),
+          JSON.stringify({ token, token_generation: 1 }),
+        )
+        // Older enrollments did not store requested grants, even after approval.
         seed(
           join(stateDir, 'opencode-enrollment-state.json'),
           JSON.stringify({
             version: 1,
             phase: 'approved',
-            proposedName: savedProposal,
+            proposedName: 'openai-auth-opencode',
+            ...(enrollment === 'legacy' ? { approvedName } : {}),
             tokenGeneration: 1,
             updatedAt: 1,
           }),
         )
-      await plugin().beforeRegister!('opencode', 'claustrum', {
-        ...localContext,
-        mode: 'claustrum',
+      }
+      const listScoped = mock(async (enrollmentToken?: string) => {
+        expect(enrollmentToken).toBe(token)
+        if (access === 'unconfirmed') throw new Error('vault unavailable')
+        return {
+          rows:
+            access === 'reachable'
+              ? [
+                  {
+                    id: 'chatgpt-login',
+                    categories: ['openai-native'],
+                    credentialType: 'oauth',
+                    serves: [],
+                    providerIds: [],
+                    state: 'active',
+                    recordVersion: 1,
+                    operations: ['read'],
+                    createdAtMs: null,
+                  },
+                ]
+              : [],
+          view: 'setup-view',
+          grants: access === 'reachable' ? 1 : 0,
+          grantTuples: [],
+        }
       })
-      expect(output).toContain(
-        'The enrollment state does not record an approved name',
+      const propose = mock(
+        async (
+          input: Parameters<ClaustrumEnrollmentConnection['enrollPropose']>[0],
+        ) => {
+          if (access === 'older-vault' && input.requestedGrants)
+            throw new ClaustrumCredentialError(
+              'invalid_params',
+              'permanent',
+              'gone',
+            )
+          return { requestId: 'setup-access-request' }
+        },
       )
+      io.connect = async () => ({
+        enrollPropose: propose,
+        enrollPoll: async () => ({
+          status: 'approved',
+          name: approvedName,
+          token,
+          tokenGeneration: 1,
+        }),
+        listScoped,
+        close() {},
+      })
+      await runSetup(plugin(), ['--yes', '--claustrum', '--opencode=1'], io)
       expect(output).toContain(
-        'if the vault approved a different name, substitute it',
+        {
+          reachable: 'Confirmed read access',
+          'no-logins': 'Approved, but no logins are reachable yet',
+          'older-vault':
+            'This vault is too old to grant access with the approval',
+          unconfirmed: 'Approved, but access could not be confirmed',
+        }[access],
       )
-      expect(output).toContain(
-        `ck auth grant --principal enrolled:${savedProposal ?? 'openai-auth-opencode'} --selector-kind category --selector openai-native --operation read`,
-      )
+      expect(listScoped).toHaveBeenCalledTimes(access === 'older-vault' ? 0 : 1)
+      if (enrollment !== 'fresh') expect(propose).not.toHaveBeenCalled()
+      if (access === 'reachable') {
+        expect(output).toContain('Confirmed read access')
+        expect(output).not.toContain('ck auth grant')
+      } else if (enrollment === 'unnamed') {
+        expect(output).toContain(
+          'check ck auth status for the approved name before granting access',
+        )
+        expect(output).not.toContain('ck auth grant')
+      } else {
+        expect(output).toContain(
+          `ck auth grant --principal enrolled:${approvedName} --selector-kind category --selector openai-native --operation read`,
+        )
+      }
     })
   }
 

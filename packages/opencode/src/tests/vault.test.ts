@@ -1546,7 +1546,7 @@ const LOCAL_NOTE =
 const ENTER = '\r'
 
 describe('enrollment', () => {
-  test('Connect in `opencode auth login` proposes this host, tells the operator the ck commands, and stores the token owner-only', async () => {
+  test('Connect in `opencode auth login` proposes this host, prints the approval command, and stores the token owner-only', async () => {
     const running = await startDaemon({
       'oauth:openai:work': vaultLogin('chatgpt-work'),
     })
@@ -1589,9 +1589,7 @@ describe('enrollment', () => {
     const printed = scripted.written()
     expect(printed).toContain('Connect to the Claustrum vault')
     expect(printed).toContain('ck auth enroll approve --request-id request-1')
-    expect(printed).toContain(
-      'ck auth grant --principal enrolled:openai-auth-opencode --selector-kind category --selector openai-native --operation read',
-    )
+    expect(printed).not.toContain('ck auth grant')
     expect(printed).toContain(
       'Connected: the vault approved openai-auth-opencode',
     )

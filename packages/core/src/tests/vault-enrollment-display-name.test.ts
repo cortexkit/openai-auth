@@ -31,7 +31,13 @@ for (const [host, displayName] of [
     try {
       expect(await vault.connectStep()).toMatchObject({ state: 'pending' })
       expect(proposals).toEqual([
-        expect.objectContaining({ name: `openai-auth-${host}`, displayName }),
+        expect.objectContaining({
+          name: `openai-auth-${host}`,
+          displayName,
+          requestedGrants: [
+            { selector: { category: 'openai-native' }, operation: 'read' },
+          ],
+        }),
       ])
     } finally {
       vault.close()
@@ -86,6 +92,9 @@ test('Connect sends its display name through the real enrollment client to the w
         params: {
           proposed_name: 'openai-auth-opencode',
           display_name: 'ChatGPT for OpenCode',
+          requested_grants: [
+            { selector: { category: 'openai-native' }, operation: 'read' },
+          ],
           request_secret_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
         },
       },

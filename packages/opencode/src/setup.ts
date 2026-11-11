@@ -2,7 +2,6 @@ import { basename } from 'node:path'
 import { resolveClaustrumConnectionPath } from '@cortexkit/claustrum-client'
 import {
   hostEnrollmentPaths,
-  readClaustrumEnrollmentStatus,
   VAULT_HOST_CONNECT_REFUSAL,
   vaultAuthority,
 } from '@cortexkit/common-auth/claustrum'
@@ -18,7 +17,7 @@ import {
 import {
   beginAccountLogin,
   openUrl,
-  VAULT_FAMILY,
+  VAULT_REQUESTED_GRANTS,
   vaultEnrollmentDisplayName,
   vaultEnrollmentName,
   vaultStateDir,
@@ -75,11 +74,13 @@ export function createSetupPlugin(deps: SetupDependencies = {}): SetupPlugin {
         opencode: {
           name: vaultEnrollmentName('opencode'),
           displayName: vaultEnrollmentDisplayName('opencode'),
+          requestedGrants: VAULT_REQUESTED_GRANTS,
           paths: paths.opencode,
         },
         pi: {
           name: vaultEnrollmentName('pi'),
           displayName: vaultEnrollmentDisplayName('pi'),
+          requestedGrants: VAULT_REQUESTED_GRANTS,
           paths: paths.pi,
         },
       },
@@ -94,25 +95,6 @@ export function createSetupPlugin(deps: SetupDependencies = {}): SetupPlugin {
         throw new Error(VAULT_HOST_CONNECT_REFUSAL)
       // Vault enrollment must not read, rewrite or migrate local credentials.
       if (mode === 'claustrum') {
-        const enrollment = await readClaustrumEnrollmentStatus(
-          hostEnrollmentPaths(paths[host]),
-          vaultEnrollmentName(host),
-        )
-        const approvedName =
-          enrollment.state === 'approved' ? enrollment.approvedName : undefined
-        const grantName =
-          approvedName ??
-          ('proposedName' in enrollment
-            ? enrollment.proposedName
-            : vaultEnrollmentName(host))
-        if (!approvedName) {
-          print(
-            'The enrollment state does not record an approved name. The command below uses the proposed name; if the vault approved a different name, substitute it.',
-          )
-        }
-        print(
-          `Allow this host to read OpenAI accounts with:\n  ck auth grant --principal enrolled:${grantName} --selector-kind category --selector ${VAULT_FAMILY.category} --operation read`,
-        )
         if (host === 'opencode') {
           print(
             'Then run opencode auth login and choose ChatGPT accounts in the vault to activate vault routing without local sign-in.',
