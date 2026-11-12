@@ -477,11 +477,10 @@ export class PiOpenAIRuntime {
   }
 
   /** Memory only; a settings view never decides whether an account store exists. */
-  private settings(storage: AccountStorage | null): AccountStorage {
-    return (
-      this.deps.settings?.view(storage) ??
-      storage ?? { version: 1, accounts: [] }
-    )
+  private settings(storage: AccountStorage | null): AccountStorage | null {
+    // Without a shared snapshot the store itself is the settings, exactly as
+    // before, including null for a missing store.
+    return this.deps.settings ? this.deps.settings.view(storage) : storage
   }
 
   // -------------------------------------------------------------------------
@@ -830,7 +829,7 @@ export class PiOpenAIRuntime {
       // until its refresh lands.
       void this.pool.refreshDueTokens(this.pool.peek().rows, settings)
     }
-    const mode: RoutingMode = settings.routing?.mode ?? 'main-first'
+    const mode: RoutingMode = settings?.routing?.mode ?? 'main-first'
     let vaultRefused = false
     let candidates = 0
     const run = () =>
