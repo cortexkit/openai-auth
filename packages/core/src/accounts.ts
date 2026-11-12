@@ -27,6 +27,7 @@ import type {
 } from './provider.ts'
 import { PRIMARY, SECONDARY } from './provider.ts'
 import { quotaWindowResetIsPast } from './quota-manager.ts'
+import { getSettingsDecision } from './settings-decisions.ts'
 import {
   assertNotTombstoneRefresh,
   HOST_SLOT_TOMBSTONE_REFRESH,
@@ -1194,6 +1195,59 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
   })
 }
 
+function keepSharedConfigPreferences(
+  config: Record<string, unknown>,
+  raw: Record<string, unknown>,
+  storage: AccountStorage,
+  configPath: string,
+): Record<string, unknown> {
+  if (getSettingsDecision(configPath) !== 'shared') return config
+
+  // A whole-store save still owns account state, not the old preferences.
+  // Copy from the locked raw read, never the normalized or resolved view:
+  // even invalid JSON values and absent keys must survive unchanged.
+  const next = { ...config }
+  for (const key of [
+    'routing',
+    'fallbackOn',
+    'refresh',
+    'quota',
+    'dump',
+    'costZeroing',
+    'killswitch',
+    'logging',
+    'cachekeep',
+    'cacheKeep',
+    'dumpDir',
+    'dumpMaxBytes',
+    'webSockets',
+    'rawWebSocket',
+    'responsesLite',
+    'codexApiEndpoint',
+  ]) {
+    delete next[key]
+    if (Object.hasOwn(raw, key)) next[key] = raw[key]
+  }
+
+  // Migrated main-account refreshes keep their lease and backoff in config.
+  // These four fields are state; only their preference siblings stay frozen.
+  const refresh = isRecord(raw.refresh) ? { ...raw.refresh } : {}
+  for (const key of [
+    'mainLastRefreshError',
+    'mainRefreshLeaseId',
+    'mainRefreshLeaseUntil',
+    'mainRefreshLeaseTokenHash',
+  ] as const) {
+    delete refresh[key]
+    const value = storage.refresh?.[key]
+    if (value !== undefined) refresh[key] = value
+  }
+  if (isRecord(raw.refresh) || Object.keys(refresh).length > 0) {
+    next.refresh = refresh
+  }
+  return next
+}
+
 const CREDENTIAL_FIELDS = [
   'access',
   'refresh',
@@ -1255,7 +1309,7 @@ function mergeStorageForSave(
   }
 }
 
-async function acquireSaveAccountsLock(path: string, renew = false) {
+export async function acquireSaveAccountsLock(path: string, renew = false) {
   const startedAt = Date.now()
   const deadline = startedAt + SAVE_ACCOUNTS_LOCK_WAIT_MS
   let attempts = 0
@@ -1413,7 +1467,10 @@ export async function saveAccounts(
         ],
       }
       if (canWrite && !canWrite()) return
-      await writeJsonAtomic(path, nextConfig)
+      await writeJsonAtomic(
+        path,
+        keepSharedConfigPreferences(nextConfig, existing, merged, path),
+      )
       if (canWrite && !canWrite()) return
       await writeJsonAtomic(statePath, stateFromStorage(merged))
     } finally {
@@ -1615,6 +1672,11 @@ export async function mutateAccounts(
     try {
       const configJson = await readJsonIfPresent(path)
       const stateJson = await readJsonIfPresent(statePath)
+      // Normalization shares nested objects with the raw read. A mutator can
+      // edit them in place, so retain the original before invoking it.
+      const existing = isRecord(configJson.value)
+        ? structuredClone(configJson.value)
+        : {}
       const current =
         (configJson.exists
           ? normalizeStorage(
@@ -1672,7 +1734,6 @@ export async function mutateAccounts(
         return !writtenIds.has(raw.id.trim())
       })
 
-      const existing = isRecord(configJson.value) ? configJson.value : {}
       const nextConfig = {
         ...withoutRetiredSettings(existing),
         ...baseConfig,
@@ -1682,7 +1743,10 @@ export async function mutateAccounts(
         ],
       }
       if (options.canWrite && !options.canWrite()) return current
-      await writeJsonAtomic(path, nextConfig)
+      await writeJsonAtomic(
+        path,
+        keepSharedConfigPreferences(nextConfig, existing, next, path),
+      )
       if (options.canWrite && !options.canWrite()) return current
       await writeJsonAtomic(statePath, stateFromStorage(next))
       // Log the actual written roster (nextConfig.accounts), not the
