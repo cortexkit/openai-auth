@@ -24,6 +24,7 @@ import {
   type SettingsView,
   type SnapshotHost,
   type SnapshotSetting,
+  type SnapshotValues,
 } from '../settings-snapshot.js'
 
 const log = { warn() {}, info() {} }
@@ -347,6 +348,124 @@ const badFloors = [
     entries: [{ account: 'main', host: 'opencode', primary: 1 }],
   },
 ]
+
+type ProtectionEdit = {
+  [K in SnapshotSetting]: {
+    setting: K
+    applied: SnapshotValues[K]
+    invalid: unknown
+    fallback: SnapshotValues[K]
+  }
+}[SnapshotSetting]
+
+const protectedEdits: ProtectionEdit[] = [
+  {
+    setting: 'killswitch_enabled',
+    applied: true,
+    invalid: 'yes',
+    fallback: false,
+  },
+  {
+    setting: 'killswitch_default_primary',
+    applied: 70,
+    invalid: '70',
+    fallback: 5,
+  },
+  {
+    setting: 'killswitch_default_secondary',
+    applied: 75,
+    invalid: null,
+    fallback: 10,
+  },
+  {
+    setting: 'killswitch_account_floors',
+    applied: [floors('main', 'opencode')],
+    invalid: [floors('main', 'both')],
+    fallback: [],
+  },
+  {
+    setting: 'killswitch_account_floors',
+    applied: [floors('main', 'opencode')],
+    invalid: [{ account: 'main', host: 'opencode', primary: 1 }],
+    fallback: [],
+  },
+  {
+    setting: 'quota_minimum_remaining',
+    applied: [{ window: 'primary', floor: 70 }],
+    invalid: [
+      { window: 'primary', floor: 1 },
+      { window: 'primary', floor: 2 },
+    ],
+    fallback: [],
+  },
+  {
+    setting: 'quota_minimum_remaining',
+    applied: [{ window: 'primary', floor: 70 }],
+    invalid: [{ window: 'primary', floor: '1' }],
+    fallback: [],
+  },
+  {
+    setting: 'cache_keep_window',
+    applied: [{ start_hour: 7, end_hour: 8 }],
+    invalid: [{ start_hour: 7, end_hour: 7 }],
+    fallback: [],
+  },
+  {
+    setting: 'cache_keep_window',
+    applied: [{ start_hour: 7, end_hour: 8 }],
+    invalid: [{ start_hour: 7 }],
+    fallback: [],
+  },
+]
+
+describe('invalid protection edits', () => {
+  for (const [
+    index,
+    { setting, applied, invalid, fallback },
+  ] of protectedEdits.entries()) {
+    it(`keeps applied ${setting} after an invalid refresh (${index})`, async () => {
+      const { file, snapshot } = await fixture({ [setting]: applied })
+      expect(snapshot.get(setting)).toEqual(applied)
+      await writeFile(file, JSON.stringify({ [setting]: invalid }))
+      await snapshot.refresh()
+      expect(snapshot.get(setting)).toEqual(applied)
+      expect(invalidSettings(snapshot)).toContain(setting)
+    })
+
+    it(`uses the declared default for invalid ${setting} at startup (${index})`, async () => {
+      const { snapshot } = await fixture({ [setting]: invalid })
+      expect(snapshot.get(setting)).toEqual(fallback)
+      expect(invalidSettings(snapshot)).toContain(setting)
+    })
+  }
+
+  for (const reason of ['unparseable', 'unreadable'] as const) {
+    it(`retains quota minima and warm hours when the file becomes ${reason}`, async () => {
+      const minima: SnapshotValues['quota_minimum_remaining'] = [
+        { window: 'primary', floor: 70 },
+      ]
+      const window = [{ start_hour: 7, end_hour: 8 }]
+      const { file, snapshot } = await fixture({
+        quota_minimum_remaining: minima,
+        cache_keep_window: window,
+      })
+      if (reason === 'unparseable') await writeFile(file, '{ broken json')
+      else {
+        await rm(file)
+        await mkdir(file)
+      }
+      await snapshot.refresh()
+      expect(snapshot.get('quota_minimum_remaining')).toEqual(minima)
+      expect(snapshot.view().quota?.minimumRemaining).toEqual({ primary: 70 })
+      expect(snapshot.get('cache_keep_window')).toEqual(window)
+      expect(cacheKeepSettings(snapshot.view())?.startHour).toBe(7)
+      expect(cacheKeepSettings(snapshot.view())?.endHour).toBe(8)
+      expect(snapshot.report()).toContainEqual(
+        expect.objectContaining({ reason }),
+      )
+    })
+  }
+})
 
 describe('unread lists and files', () => {
   for (const { name, entries } of badFloors) {

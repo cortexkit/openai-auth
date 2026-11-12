@@ -40,6 +40,15 @@ type ListSetting =
   | 'quota_minimum_remaining'
   | 'cache_keep_window'
 
+const protectedSettings = [
+  'killswitch_enabled',
+  'killswitch_default_primary',
+  'killswitch_default_secondary',
+  'killswitch_account_floors',
+  'quota_minimum_remaining',
+  'cache_keep_window',
+] as const
+
 function semanticChecks(values: SnapshotValues, file: string): ReportEntry[] {
   const entries: ReportEntry[] = []
   const invalid = (setting: ListSetting, detail: string) => {
@@ -175,25 +184,29 @@ export async function createSettingsSnapshot(options: {
     ) as SnapshotValues
     const readReport = handle.report()
     report = [...readReport, ...semanticChecks(next, file)]
-    const unusable = (setting: ListSetting) =>
+    const invalid = (setting: SnapshotSetting) =>
       report.some(
         (entry) =>
-          entry.reason === 'unreadable' ||
-          entry.reason === 'unparseable' ||
-          (entry.reason === 'invalid-value' && entry.keyPath[0] === setting),
+          entry.reason === 'invalid-value' && entry.keyPath[0] === setting,
       )
-    if (unusable('killswitch_account_floors')) {
+    const retain = <K extends SnapshotSetting>(setting: K) => {
+      next[setting] = structuredClone(
+        values?.[setting] ?? openaiSettings.settings[setting].default,
+      ) as SnapshotValues[K]
+    }
+    // An invalid edit must not disable a protection or remove its limits.
+    // Whole-file failures already retain good values inside common-auth.
+    for (const setting of protectedSettings)
+      if (invalid(setting)) retain(setting)
+    if (invalid('killswitch_account_floors')) {
       // Retain the complete applied policy, including defaults: a corrupt list
       // must not quietly remove an account's protection or lower its fallback.
-      next.killswitch_account_floors = values?.killswitch_account_floors ?? []
       next.killswitch_default_primary =
         values?.killswitch_default_primary ?? next.killswitch_default_primary
       next.killswitch_default_secondary =
         values?.killswitch_default_secondary ??
         next.killswitch_default_secondary
     }
-    if (unusable('quota_minimum_remaining')) next.quota_minimum_remaining = []
-    if (unusable('cache_keep_window')) next.cache_keep_window = []
     values = next
     current = preferences(next, host)
     if (!disposed) for (const callback of callbacks) callback()
