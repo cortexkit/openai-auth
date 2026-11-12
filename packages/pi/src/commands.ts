@@ -10,6 +10,7 @@
 import {
   CommandError,
   type CommandMenu,
+  createCommandMenu,
   runPiCommandMenu,
 } from '@cortexkit/common-auth/commands'
 import {
@@ -21,6 +22,7 @@ import {
 import {
   createOpenAiMenu,
   OPENAI_COMMAND_NAME,
+  OPENAI_MENU_TITLE,
   sessionSection,
   vaultSection,
 } from '@cortexkit/openai-auth-core'
@@ -29,6 +31,7 @@ import {
   type OAuthQuotaSnapshot,
   type VaultWaitOptions,
 } from '@cortexkit/openai-auth-core/internal'
+import { createBuiltinSettingsPort } from '@cortexkit/openai-auth-core/settings-port'
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -37,9 +40,11 @@ import type {
 import packageJson from '../package.json' with { type: 'json' }
 import { clearPiStickyRouting, getPiStickyRouting } from './routing.ts'
 import type { PiPoolCommands } from './runtime.ts'
+import type { PiSettingsStartup } from './settings-startup.ts'
 import { VAULT_SLOT_CONFLICT } from './vault-slot.ts'
 
 export type PiCommandDependencies = {
+  settingsStartup?: PiSettingsStartup
   beginAccountLogin?: typeof beginAccountLogin
   packageVersion?: string
   /** The account pool the request path routes across; the menu works on it. */
@@ -107,6 +112,7 @@ export function createPiMenu(
 ): CommandMenu {
   const begin = dependencies.beginAccountLogin ?? beginAccountLogin
   const version = dependencies.packageVersion ?? packageJson.version
+  const startup = dependencies.settingsStartup
   const vaultMenu = vaultSection({
     vault: pool.vault,
     changed: dependencies.afterApply,
@@ -114,6 +120,22 @@ export function createPiMenu(
   })
   const menu = createOpenAiMenu({
     store: pool.store(),
+    ...(startup
+      ? {
+          configPath: startup.paths.configPath,
+          diagnostics: startup.diagnostics,
+        }
+      : {}),
+    ...(startup?.authority?.decision === 'shared' && startup.snapshot
+      ? {
+          settings: createBuiltinSettingsPort({
+            file: startup.authority.install.target,
+            host: 'pi',
+            snapshot: startup.snapshot,
+            log: startup.log,
+          }),
+        }
+      : {}),
     // The shared menu reads the vault's own enrollment authority, so an
     // unreadable or token-less enrollment still gets the vault-only view.
     vault: pool.vault,
@@ -247,10 +269,36 @@ export function createPiMenu(
   }
 }
 
+/** No store is attached: even opening a refused start must not read preferences. */
+export function createRefusedPiMenu(startup: PiSettingsStartup): CommandMenu {
+  const unavailable = () => ({
+    lines: ["Unavailable: openai-auth didn't start. See Diagnostics."],
+  })
+  return createCommandMenu({
+    command: OPENAI_COMMAND_NAME,
+    title: OPENAI_MENU_TITLE,
+    replace: {
+      accounts: { title: 'Accounts', build: unavailable },
+      quota: { title: 'Quota', build: unavailable },
+      routing: { title: 'Routing', build: unavailable },
+      limits: { title: 'Limits', build: unavailable },
+    },
+    diagnostics: startup.diagnostics,
+  })
+}
+
 async function runOpenAiCommand(
   ctx: ExtensionCommandContext,
   dependencies: PiCommandDependencies,
 ): Promise<void> {
+  if (dependencies.settingsStartup?.refusal) {
+    await runPiCommandMenu(
+      createRefusedPiMenu(dependencies.settingsStartup),
+      ctx.ui,
+      { sessionId: ctx.sessionManager.getSessionId() },
+    )
+    return
+  }
   const pool = dependencies.pool
   if (!pool) {
     ctx.ui.notify('The OpenAI account pool is not available.', 'error')

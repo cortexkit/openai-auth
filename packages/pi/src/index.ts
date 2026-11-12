@@ -1,3 +1,4 @@
+import type { AccountPaths } from '@cortexkit/openai-auth-core/internal'
 import type { Api, Model } from '@earendil-works/pi-ai'
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
 // Imported from `/compat` rather than the deep `/api/openai-codex-responses`
@@ -19,6 +20,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { registerCommands } from './commands.ts'
 import { RawWebSocket } from './raw-ws-node.ts'
 import { PiOpenAIRuntime } from './runtime.ts'
+import { preparePiSettingsStartup } from './settings-startup.ts'
 import { VAULT_PLACEHOLDER_KEY } from './vault-slot.ts'
 
 const BASE_URL = 'https://chatgpt.com/backend-api'
@@ -160,8 +162,9 @@ export function registerPiProvider(
  * Creates the request path for one loaded extension: requests are routed
  * across Pi's own login and the account pool (see `runtime.ts`).
  */
-export function createPiOpenAIRuntime(): PiOpenAIRuntime {
+export function createPiOpenAIRuntime(paths?: AccountPaths): PiOpenAIRuntime {
   return new PiOpenAIRuntime({
+    ...(paths ? { paths: () => paths } : {}),
     streamSimple: (model, context, options) =>
       streamSimpleOpenAICodexResponses(model as CodexModel, context, options),
     createStream: createAssistantMessageEventStream,
@@ -170,7 +173,12 @@ export function createPiOpenAIRuntime(): PiOpenAIRuntime {
 }
 
 export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
-  const runtime = createPiOpenAIRuntime()
+  const settingsStartup = await preparePiSettingsStartup()
+  if (settingsStartup.refusal) {
+    registerCommands(pi, { settingsStartup })
+    return
+  }
+  const runtime = createPiOpenAIRuntime(settingsStartup.paths)
   webSocketObserver = (headers, data) =>
     runtime.observeWebSocketMessage(headers, data)
   let refresh: (() => unknown) | undefined
@@ -194,6 +202,7 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
     })
   }
   registerCommands(pi, {
+    settingsStartup,
     pool: runtime.commandSupport(),
     afterApply: syncSlot,
     onContext: (ctx) => {
@@ -214,6 +223,7 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
   if (typeof pi.on === 'function') {
     pi.on('session_shutdown', async () => {
       clearInterval(syncTimer)
+      settingsStartup.snapshot?.dispose()
       await Promise.all([runtime.pool.dispose(), runtime.vault.dispose()])
     })
     pi.on('session_start', async (_event, ctx) => {
