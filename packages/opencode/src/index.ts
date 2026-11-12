@@ -78,6 +78,7 @@ import {
   vaultStateDir,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
+import { createBuiltinSettingsPort } from '@cortexkit/openai-auth-core/settings-port'
 import type {
   AuthOAuthResult,
   Hooks,
@@ -103,12 +104,13 @@ import {
   type OpenCodeMenuContext,
   openOpenAiMenu,
 } from './commands'
-import { getConfigPath, getSettings } from './config'
 import {
-  getAccountPaths,
-  getAccountStatePath,
-  getCodexSessionsPath,
-} from './core/account-paths'
+  getConfigPath,
+  getResolvedSettingsView,
+  getSettings,
+  registerSettingsSnapshot,
+} from './config'
+import { getAccountPaths, getCodexSessionsPath } from './core/account-paths'
 import {
   acquireBackgroundRefreshLock,
   BackgroundQuotaRefresh,
@@ -189,6 +191,7 @@ import {
   type RuntimeLayoutOptions,
   takeRuntimeLayoutNotice,
 } from './core/runtime-layout'
+import { prepareSettingsStartup } from './core/settings-startup'
 import { acquireOpenCodeVault } from './core/shared-vault'
 import {
   decideStickyBreak,
@@ -451,9 +454,11 @@ function resetTargetNeedsRefresh(
   expires: number | undefined,
   storage: AccountStorage | null,
   now: number,
+  configPath: string,
 ) {
   const refreshBeforeExpiryMs =
-    (storage?.refresh?.refreshBeforeExpiryMinutes ?? 240) * 60_000
+    (getResolvedSettingsView(storage, configPath).refresh
+      ?.refreshBeforeExpiryMinutes ?? 240) * 60_000
   return !access || !expires || expires - now <= refreshBeforeExpiryMs
 }
 
@@ -536,6 +541,7 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
         resolved.expires,
         storage,
         deps.now(),
+        deps.accountStoragePath,
       )
     ) {
       resolved = await (deps.refreshPoolMainRow ?? deps.refreshFallbackAccount)(
@@ -577,7 +583,13 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
         )
       }
       if (
-        resetTargetNeedsRefresh(auth.access, auth.expires, storage, deps.now())
+        resetTargetNeedsRefresh(
+          auth.access,
+          auth.expires,
+          storage,
+          deps.now(),
+          deps.accountStoragePath,
+        )
       ) {
         try {
           auth = { type: 'oauth', ...(await deps.refreshMainWithLease()) }
@@ -654,6 +666,7 @@ export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
         resolved.expires,
         storage,
         deps.now(),
+        deps.accountStoragePath,
       )
     ) {
       resolved = await deps.refreshFallbackAccount(resolved, storage)
@@ -722,9 +735,13 @@ function cleanAbort(): never {
  */
 async function writeLoaderSettingsLocally(
   edit: (current: AccountStorage) => void,
-  options: { holdsMainRefreshLock?: boolean; canWrite?: () => boolean } = {},
+  options: {
+    paths?: ReturnType<typeof getAccountPaths>
+    holdsMainRefreshLock?: boolean
+    canWrite?: () => boolean
+  } = {},
 ): Promise<void> {
-  const paths = getAccountPaths(getConfigPath())
+  const paths = options.paths ?? getAccountPaths(getConfigPath())
   if (poolMigrated(paths.configPath)) {
     await writeSettings(
       openAccountPool(paths),
@@ -1252,8 +1269,41 @@ export async function CodexAuthPlugin(
     version: PackageVersion,
     ...options.runtimeLayout,
   })
+  const configPath = getConfigPath()
+  const settingsStartup = await prepareSettingsStartup({
+    version: PackageVersion,
+  })
+  const accountPaths = getAccountPaths(configPath)
+  const unregisterSettings = settingsStartup.snapshot
+    ? registerSettingsSnapshot(configPath, settingsStartup.snapshot)
+    : undefined
+  const resolved = (store: AccountStorage | null) =>
+    getResolvedSettingsView(store, configPath)
+  // Keep file existence separate from preferences: a view always exists, even
+  // when no account store has been created yet.
+  const withPreferences = (store: AccountStorage | null) =>
+    store === null ? null : resolved(store)
+  const readAccounts: typeof loadAccounts = async (paths) =>
+    withPreferences(await loadAccounts(paths))
+  const readAccountSettings: typeof loadAccountSettings = async (paths) =>
+    withPreferences(await loadAccountSettings(paths))
+
+  // The manager's background refreshes and refresh joins use its public load
+  // method too. They must not recover obsolete preferences from the old file.
+  class SettingsFallbackAccountManager extends FallbackAccountManager {
+    override async load() {
+      return withPreferences(await super.load())
+    }
+  }
+  const startupSettings = getSettings(configPath)
+  options = {
+    ...options,
+    experimentalWebSockets:
+      options.experimentalWebSockets ?? startupSettings.webSockets,
+    responsesLite: options.responsesLite ?? startupSettings.responsesLite,
+  }
   const codexApiEndpoint =
-    options.codexApiEndpoint ?? getSettings().codexApiEndpoint
+    options.codexApiEndpoint ?? startupSettings.codexApiEndpoint
   const installationID = crypto.randomUUID()
   const codexSessions = loadCodexSessions(codexSessionStatePath())
   const persistCodexSessions = () =>
@@ -1296,8 +1346,7 @@ export async function CodexAuthPlugin(
     {
       host: 'opencode',
       stateDir:
-        options.vault?.stateDir ??
-        vaultStateDir(getAccountPaths(getConfigPath()).statePath),
+        options.vault?.stateDir ?? vaultStateDir(accountPaths.statePath),
       ...(input.directory ? { projectRoot: input.directory } : {}),
       reservedRouteIds: () =>
         poolAccountSource?.peek().rows.map((row) => row.id) ?? [],
@@ -1315,7 +1364,7 @@ export async function CodexAuthPlugin(
         : {}),
       fetchImpl: () => fetch,
     },
-    getAccountPaths(getConfigPath()),
+    accountPaths,
   )
   const vault = vaultLease.vault
   await vault.authority()
@@ -1361,7 +1410,7 @@ export async function CodexAuthPlugin(
   const poolLifecycle: PoolLifecycle | undefined =
     poolMigrationOn && 'slot' in hostSlot
       ? createPoolLifecycle({
-          paths: () => getAccountPaths(getConfigPath()),
+          paths: () => accountPaths,
           slot: hostSlot.slot,
           version: PackageVersion,
           ...poolMigrationDeps,
@@ -1543,6 +1592,8 @@ export async function CodexAuthPlugin(
 
   return {
     async dispose() {
+      unregisterSettings?.()
+      settingsStartup.snapshot?.dispose()
       // A new session's thread id is saved in the background. Wait for that
       // save, so the next process keeps the session's prompt cache key, but
       // never hold up shutdown for longer than the bound.
@@ -1602,7 +1653,7 @@ export async function CodexAuthPlugin(
         const accounts =
           (await vault.authority()) !== 'local'
             ? vault.routes().map((route) => ({ id: route.id }))
-            : (await loadAccounts(getAccountPaths(getConfigPath())))?.accounts
+            : (await readAccounts(accountPaths))?.accounts
         // OpenCode discards event-hook promises. The writer already logs a
         // failure; keep deletion cleanup running without rejecting the hook.
         await removeSidebarActiveRouting(
@@ -1626,9 +1677,9 @@ export async function CodexAuthPlugin(
         // always has.
         const storage =
           (await vault.authority()) !== 'local'
-            ? await loadAccountSettings(getAccountPaths(getConfigPath()))
-            : await loadAccounts(getAccountPaths(getConfigPath()))
-        const zeroCosts = !storage || isCostZeroingEnabled(storage)
+            ? await readAccountSettings(accountPaths)
+            : await readAccounts(accountPaths)
+        const zeroCosts = !storage || isCostZeroingEnabled(resolved(storage))
         const catalog = zeroCosts ? null : await loadModelsDevCosts()
         if (!zeroCosts && catalog && !loggedCostRestoration) {
           loggedCostRestoration = true
@@ -1707,7 +1758,7 @@ export async function CodexAuthPlugin(
         const rpcDir = input.directory
           ? await resolveRpcDir(input.directory)
           : undefined
-        const cacheKeepKey = rpcDir?.dir ?? getConfigPath()
+        const cacheKeepKey = rpcDir?.dir ?? configPath
 
         // In vault mode (this host enrolled with the Claustrum vault) no local
         // account file is written, so the two loader-time writes below wait
@@ -1719,6 +1770,7 @@ export async function CodexAuthPlugin(
           if ((await vault.authority()) !== 'local') return
           return writeLoaderSettingsLocally(edit, {
             ...options,
+            paths: accountPaths,
             canWrite: () => !vault.enrolled(),
           })
         }
@@ -1733,7 +1785,7 @@ export async function CodexAuthPlugin(
               refresh: auth.refresh ?? '',
               expires: auth.expires ?? 0,
             },
-            getAccountPaths(getConfigPath()),
+            accountPaths,
           )
         }
 
@@ -1741,11 +1793,11 @@ export async function CodexAuthPlugin(
         // A broken local credential store must not prevent serving vault accounts
         // or explaining how to recover an unavailable vault.
         const storage = await (loaderVaultMode
-          ? loadAccountSettings(getAccountPaths(getConfigPath()))
-          : loadAccounts(getAccountPaths(getConfigPath()))
+          ? readAccountSettings(accountPaths)
+          : readAccounts(accountPaths)
         ).catch(async (err) => {
           if ((await vault.authority()) !== 'local') return null
-          const path = getConfigPath()
+          const path = configPath
           throw new Error(
             `OpenAI auth store at ${path} is corrupt or unreadable: ${err instanceof Error ? err.message : String(err)}. Fix or remove it to continue.`,
             { cause: err },
@@ -1754,10 +1806,7 @@ export async function CodexAuthPlugin(
 
         if (
           !loaderVaultMode &&
-          (await poolPlaceholderWithoutMain(
-            getAccountPaths(getConfigPath()),
-            auth,
-          ))
+          (await poolPlaceholderWithoutMain(accountPaths, auth))
         ) {
           if (poolLifecycle) poolLifecycle.noticePlaceholderWithoutMain()
           else if (!missingPoolMainLogged) {
@@ -1782,7 +1831,7 @@ export async function CodexAuthPlugin(
         // A loader can be idle while another process changes routing, so a
         // machine-state write must not rely on its last request's snapshot.
         const currentStorageReader = createCurrentStorageReader({
-          path: getConfigPath,
+          path: () => configPath,
           stat: (path) => {
             try {
               const stat = statSync(path)
@@ -1791,10 +1840,10 @@ export async function CodexAuthPlugin(
               return undefined
             }
           },
-          read: (path) => loadAccounts(getAccountPaths(path)),
+          read: () => readAccounts(accountPaths),
           fallback: async (error) => {
             if ((await vault.authority()) !== 'local')
-              return loadAccountSettings(getAccountPaths(getConfigPath()))
+              return readAccountSettings(accountPaths)
             throw error
           },
           onRead: (next) => {
@@ -1804,7 +1853,10 @@ export async function CodexAuthPlugin(
         })
 
         function loadCurrentStorageForDisplay() {
-          return currentStorageReader.read()
+          const store = currentStorageReader.read()
+          return store instanceof Promise
+            ? store.then(withPreferences)
+            : withPreferences(store)
         }
 
         // Request reads wait only for the hot-path budget. A changed config is
@@ -1814,7 +1866,7 @@ export async function CodexAuthPlugin(
           return settleWithinBudget(
             Promise.resolve(loadCurrentStorageForDisplay()),
             HOT_PATH_READ_BUDGET_MS,
-            () => lastRequestStorage,
+            () => withPreferences(lastRequestStorage),
           )
         }
 
@@ -1846,7 +1898,7 @@ export async function CodexAuthPlugin(
         }
 
         // Restore persisted log level from stored config.
-        const storedLevel = storage?.logging?.level
+        const storedLevel = resolved(storage).logging?.level
         if (storedLevel && typeof storedLevel === 'string') {
           setLogLevel(storedLevel as Parameters<typeof setLogLevel>[0])
         }
@@ -1864,16 +1916,16 @@ export async function CodexAuthPlugin(
         // observable in the file log without enabling request dumps.
         logT.info('codex auth loader ready', {
           codexApiEndpoint,
-          transport: getSettings().rawWebSocket
+          transport: getSettings(configPath).rawWebSocket
             ? 'raw-websocket'
-            : getSettings().webSockets
+            : getSettings(configPath).webSockets
               ? 'websocket'
               : 'http',
         })
 
         const quotaManager = new QuotaManager({
-          storage,
-          configPath: getConfigPath(),
+          storage: resolved(storage),
+          configPath,
           fetchQuotaFn: undefined, // push-only: quota comes from HTTP headers / WS frames
         })
         let currentMainIdentity: string | undefined
@@ -1888,7 +1940,7 @@ export async function CodexAuthPlugin(
         await limitSource?.dispose()
         await poolAccountSource?.dispose()
         const poolSource = new PoolAccountSource({
-          paths: () => getAccountPaths(getConfigPath()),
+          paths: () => accountPaths,
           refreshProvider: async (credential) => {
             const tokens = await codexRefreshFn({
               refreshToken: credential.refresh,
@@ -1971,8 +2023,8 @@ export async function CodexAuthPlugin(
             ? current
             : undefined
         }
-        const fallbackManager = new FallbackAccountManager({
-          paths: getAccountPaths(getConfigPath()),
+        const fallbackManager = new SettingsFallbackAccountManager({
+          paths: accountPaths,
           refreshFn: async (opts) => {
             if ((await vault.authority()) !== 'local')
               throw new Error(LOCAL_CREDENTIAL_REFUSALS['vault-refused'])
@@ -2019,7 +2071,7 @@ export async function CodexAuthPlugin(
             refreshMainWithLease: refreshMainToken,
             fallbackManager,
             quotaManager,
-            loadAccounts,
+            loadAccounts: readAccounts,
             // The sidebar write reads the current store itself, so the store a
             // quota refresh passes is not needed.
             writeSidebarState: (qm) => writeMachineSidebarState(qm),
@@ -2028,7 +2080,7 @@ export async function CodexAuthPlugin(
             >[0]['client'],
             fetchImpl: fetch,
             now: Date.now,
-            paths: getAccountPaths(getConfigPath()),
+            paths: accountPaths,
             readSidebarState:
               readSidebarState ?? (() => getSidebarState(boundSidebarFile)),
             storageMainAccountId: storage?.mainAccountId,
@@ -2046,7 +2098,7 @@ export async function CodexAuthPlugin(
           ids?: readonly string[],
         ): Promise<RefreshAllQuotaResult[]> {
           const results = await poolSource.pollRows(
-            await loadAccounts(getAccountPaths(getConfigPath())),
+            await readAccounts(accountPaths),
             ids ? { ids } : {},
           )
           return results.map((result) => ({
@@ -2060,10 +2112,7 @@ export async function CodexAuthPlugin(
         // credits): refreshed through the pool source when due, never through
         // the legacy per-account refresh or the host slot.
         async function poolRowAccess(id: string) {
-          return poolSource.accessFor(
-            id,
-            await loadAccounts(getAccountPaths(getConfigPath())),
-          )
+          return poolSource.accessFor(id, await readAccounts(accountPaths))
         }
 
         // -------------------------------------------------------------------
@@ -2072,13 +2121,14 @@ export async function CodexAuthPlugin(
         const cacheKeepLogger = createLogger('cachekeep')
         // Read under either name: a migrated install renames `cachekeep` to
         // `cacheKeep` on its first settings write.
-        const storedCacheKeep = cacheKeepSettings(storage)
+        const storedCacheKeep = cacheKeepSettings(resolved(storage))
         let cacheKeepEnabled = storedCacheKeep?.enabled === true
         let cacheKeepSubagents = storedCacheKeep?.subagents === true
         let cacheKeepSustain = storedCacheKeep?.sustain === true
-        let cacheKeepWindow = getCacheKeepWindow(
-          storage ? { ...storage, cachekeep: storedCacheKeep } : storage,
-        )
+        let cacheKeepWindow = getCacheKeepWindow({
+          ...resolved(storage),
+          cachekeep: storedCacheKeep,
+        })
         let mainRefreshPromise:
           | Promise<{ access: string; refresh: string; expires: number }>
           | undefined
@@ -2199,9 +2249,7 @@ export async function CodexAuthPlugin(
               if (freshAuth.type !== 'oauth') throw new Error('not oauth')
 
               const freshTokenHash = hashRefreshToken(freshRefresh)
-              const latestStorage = await loadAccounts(
-                getAccountPaths(getConfigPath()),
-              )
+              const latestStorage = await loadAccounts(accountPaths)
               const mainError = latestStorage?.refresh?.mainLastRefreshError
               if (
                 mainError &&
@@ -2226,7 +2274,7 @@ export async function CodexAuthPlugin(
               const fileLock = await acquireRefreshFileLock({
                 name: MAIN_REFRESH_LOCK_NAME,
                 ttlMs: MAIN_REFRESH_LOCK_TTL_MS,
-                path: getConfigPath(),
+                path: configPath,
                 renew: true,
               })
               if (!fileLock) {
@@ -2264,9 +2312,7 @@ export async function CodexAuthPlugin(
                       expires: underLock.expires ?? 0,
                     }
                   }
-                  const storageNow = await loadAccounts(
-                    getAccountPaths(getConfigPath()),
-                  )
+                  const storageNow = await loadAccounts(accountPaths)
                   const currentError = storageNow?.refresh?.mainLastRefreshError
                   if (
                     currentError &&
@@ -2292,7 +2338,7 @@ export async function CodexAuthPlugin(
               // it has expired, and dropping it cannot leave a second
               // refresher of this token, it goes and the refresh proceeds.
               await reclaimExpiredPoolTransfer(
-                getAccountPaths(getConfigPath()),
+                accountPaths,
                 current.refresh,
                 current.access !== undefined
                   ? { slotAccess: current.access }
@@ -2310,10 +2356,7 @@ export async function CodexAuthPlugin(
                   // the migration sees it and plans again (see the
                   // lock-order note in core/pool-migration.ts).
                   if (
-                    poolTransferPendingInConfigFile(
-                      getConfigPath(),
-                      current.refresh,
-                    )
+                    poolTransferPendingInConfigFile(configPath, current.refresh)
                   )
                     throw new PoolTransferPendingError()
                   nextStorage.refresh = nextStorage.refresh ?? {}
@@ -2324,9 +2367,7 @@ export async function CodexAuthPlugin(
                     refreshTokenHash
                 })
 
-                const latestLease = await loadAccounts(
-                  getAccountPaths(getConfigPath()),
-                )
+                const latestLease = await loadAccounts(accountPaths)
                 if (
                   latestLease?.refresh?.mainRefreshLeaseId !== leaseId ||
                   latestLease.refresh.mainRefreshLeaseTokenHash !==
@@ -2421,7 +2462,7 @@ export async function CodexAuthPlugin(
 
         async function pooledMainTokens() {
           const pooled = await resolvePooledMain(
-            await loadAccounts(getAccountPaths(getConfigPath())),
+            await readAccounts(accountPaths),
           )
           if (!pooled) {
             throw new Error(
@@ -2754,7 +2795,7 @@ export async function CodexAuthPlugin(
         const websocketFetch = options.experimentalWebSockets
           ? OpenAIWebSocketPool.createWebSocketFetch({
               httpFetch: fetch,
-              rawWebSocket: getSettings().rawWebSocket,
+              rawWebSocket: getSettings(configPath).rawWebSocket,
               // Per-request account identity is captured at send time by the
               // pool and threaded here so the frame is attributed to the
               // connection's own account, not the shared mutable globals.
@@ -2881,14 +2922,12 @@ export async function CodexAuthPlugin(
             // Preferences never seed the local read cache. After disconnect,
             // even an unchanged config must reload the current credentials.
             currentStorageReader.invalidate()
-            const vaultStore = await loadAccountSettings(
-              getAccountPaths(getConfigPath()),
-            )
+            const vaultStore = await readAccountSettings(accountPaths)
             await setSidebarMachineState(
               buildVaultSidebarMachineState(
                 vault.snapshot()?.rows,
                 new Set(vault.routes().map((route) => route.id)),
-                vaultStore,
+                resolved(vaultStore),
                 Date.now(),
               ),
               boundSidebarFile,
@@ -2911,7 +2950,7 @@ export async function CodexAuthPlugin(
             await setSidebarMachineState(
               buildPoolSidebarMachineState(
                 pool.rows,
-                store,
+                resolved(store),
                 Date.now(),
                 (id) =>
                   (id === 'main' ? qm.getMain() : qm.getFallback(id))?.quota
@@ -3046,14 +3085,29 @@ export async function CodexAuthPlugin(
         // -------------------------------------------------------------------
         activeFallbackManager?.stopBackgroundRefresh()
         activeFallbackManager = fallbackManager
-        const menuPaths = getAccountPaths(getConfigPath())
+        const menuPaths = accountPaths
+        const settingsFile = settingsStartup.authority.install.target
+        const sharedMenuSettings =
+          settingsStartup.snapshot && settingsFile
+            ? {
+                settingsSnapshot: settingsStartup.snapshot,
+                settings: createBuiltinSettingsPort({
+                  file: settingsFile,
+                  host: 'opencode',
+                  snapshot: settingsStartup.snapshot,
+                  log: createLogger('settings'),
+                }),
+              }
+            : {}
         cmdCtx = menuContextForTest = {
+          configPath,
+          ...sharedMenuSettings,
           accountStoragePath: menuPaths.configPath,
           accountStatePath: menuPaths.statePath,
           packageVersion: PackageVersion,
           layoutNotice: takeRuntimeLayoutNotice,
           quotaManager,
-          loadAccounts,
+          loadAccounts: readAccounts,
           beginAccountLogin,
           // The files this loader run serves, fixed now: the menu works on
           // them even if another project's run changes the environment.
@@ -3098,11 +3152,11 @@ export async function CodexAuthPlugin(
             poolAccess: async (accountKey) =>
               poolSource.rowAccess(
                 accountKey,
-                await loadAccounts(getAccountPaths(getConfigPath())),
+                await readAccounts(accountPaths),
               ),
-            loadAccounts,
-            accountStoragePath: getConfigPath(),
-            accountStatePath: getAccountStatePath(getConfigPath()),
+            loadAccounts: readAccounts,
+            accountStoragePath: configPath,
+            accountStatePath: accountPaths.statePath,
             now: Date.now,
           }),
           ...buildResetRedemptionDeps(),
@@ -3395,7 +3449,7 @@ export async function CodexAuthPlugin(
             binding?.account ??
             (!pooled
               ? limitAccountKey(
-                  poolLimitsNamespace(getConfigPath(), getAccountStatePath()),
+                  poolLimitsNamespace(configPath, accountPaths.statePath),
                   {
                     kind: 'legacy',
                     id: keepwarmAccountKey,
@@ -3809,7 +3863,7 @@ export async function CodexAuthPlugin(
             mainQuota,
             fallbackAccounts,
             now,
-            storage,
+            resolved(storage),
           )
           if (reason === 'quota-unknown') {
             retryAfter = POOL_QUOTA_UNKNOWN_RETRY_SECONDS
@@ -3919,7 +3973,8 @@ export async function CodexAuthPlugin(
           mainAccountIdentity?: string
           mainUnavailable: boolean
         }): Promise<StickyRouteCandidate[]> {
-          const killswitchEnabled = isKillswitchEnabled(input.storage)
+          const preferences = resolved(input.storage)
+          const killswitchEnabled = isKillswitchEnabled(preferences)
           const killswitchNow = Date.now()
           const mainMemory = quotaManager.peekMainForPolicy(
             input.mainAccountIdentity,
@@ -3938,7 +3993,7 @@ export async function CodexAuthPlugin(
           const mainKillswitchPasses = killswitchEnabled
             ? killswitchPassesPolicy(
                 mainMemory?.quota,
-                input.storage,
+                preferences,
                 undefined,
                 killswitchNow,
               )
@@ -3953,9 +4008,8 @@ export async function CodexAuthPlugin(
                   keepwarmAccountKey: 'main',
                   quota: mainFreshest.quota,
                   quotaCheckedAt: mainFreshest.quotaCheckedAt,
-                  reservePercent: getKillswitchThresholdsForAccount(
-                    input.storage,
-                  ),
+                  reservePercent:
+                    getKillswitchThresholdsForAccount(preferences),
                   configuredOrder: 0,
                   resetCreditsApplicable: resetCreditsApplicable(
                     mainFreshest.quota,
@@ -3986,7 +4040,7 @@ export async function CodexAuthPlugin(
             const fallbackKillswitchPasses = killswitchEnabled
               ? killswitchPassesPolicy(
                   memoryEntry?.quota,
-                  input.storage,
+                  preferences,
                   fallback.id,
                   killswitchNow,
                 )
@@ -4000,7 +4054,7 @@ export async function CodexAuthPlugin(
               quota: freshest.quota,
               quotaCheckedAt: freshest.quotaCheckedAt,
               reservePercent: getKillswitchThresholdsForAccount(
-                input.storage,
+                preferences,
                 fallback.id,
               ),
               configuredOrder: roster.length,
@@ -4023,7 +4077,7 @@ export async function CodexAuthPlugin(
           // fallen below floor since the pin was created migrates the same
           // way an exhausted pin does. Undefined = passes (killswitch
           // disabled or no quota seen).
-          const killswitchPasses = isKillswitchEnabled(storage)
+          const killswitchPasses = isKillswitchEnabled(resolved(storage))
             ? candidate.killswitchPasses
             : undefined
           if (candidate.accountId === 'main') {
@@ -4281,14 +4335,14 @@ export async function CodexAuthPlugin(
           // threshold so routing never spends on a killed account. Opt-in — a
           // no-op when disabled. Non-invalidating peek so a token refresh does
           // not flip a killed account to "unknown".
-          const current = isKillswitchEnabled(fallbackStorage)
+          const current = isKillswitchEnabled(resolved(fallbackStorage))
             ? notRateLimited.filter((c) =>
                 killswitchPassesPolicy(
                   quotaManager.peekFallbackForPolicy(
                     c.quotaAccountId,
                     c.accountId,
                   )?.quota,
-                  fallbackStorage,
+                  resolved(fallbackStorage),
                   c.quotaAccountId,
                   Date.now(),
                 ),
@@ -4412,7 +4466,9 @@ export async function CodexAuthPlugin(
               )
               throw error
             }
-            if (!shouldFallbackStatus(response.status, fallbackStorage)) {
+            if (
+              !shouldFallbackStatus(response.status, resolved(fallbackStorage))
+            ) {
               // Not awaited: the response is already in hand, and this only
               // stamps a telemetry timestamp nothing reads. Awaiting it puts a
               // contended store write between the provider's answer and the
@@ -4494,7 +4550,9 @@ export async function CodexAuthPlugin(
               accountId: candidate.quotaAccountId,
             }
 
-            if (!shouldFallbackStatus(response.status, fallbackStorage)) {
+            if (
+              !shouldFallbackStatus(response.status, resolved(fallbackStorage))
+            ) {
               // See the fallback-first path above: telemetry only, never awaited
               // on the request path.
               void fallbackManager.markUsed(candidate.fallback)
@@ -4574,8 +4632,8 @@ export async function CodexAuthPlugin(
             if (await poolSource.active()) {
               const polled = await refreshPoolInBackground(
                 poolSource,
-                await loadAccounts(getAccountPaths(getConfigPath())),
-                () => acquireBackgroundRefreshLock(getConfigPath()),
+                await readAccounts(accountPaths),
+                () => acquireBackgroundRefreshLock(configPath),
               )
               if (polled.length > 0) {
                 await writeMachineSidebarState(quotaManager)
@@ -4635,7 +4693,8 @@ export async function CodexAuthPlugin(
           const vaultMode = vault.enrolled()
           const vaultDeadline = vaultMode ? readinessDeadline : undefined
           const expectedBindings = limits.bindings()
-          const mode: RoutingMode = reqStorage?.routing?.mode ?? 'main-first'
+          const mode: RoutingMode =
+            resolved(reqStorage).routing?.mode ?? 'main-first'
           // Vault mode routes the vault's accounts alone, so neither the pool
           // row `main` nor OpenCode's slot is read for this request.
           const mainRow = vaultMode
@@ -4647,10 +4706,7 @@ export async function CodexAuthPlugin(
           const loginRequired =
             !mainRow &&
             !vaultMode &&
-            (await poolPlaceholderWithoutMain(
-              getAccountPaths(getConfigPath()),
-              slot,
-            ))
+            (await poolPlaceholderWithoutMain(accountPaths, slot))
           if (generation === mainIdentityGeneration) {
             currentMainIdentity = mainRow?.identity
           }
@@ -4667,6 +4723,7 @@ export async function CodexAuthPlugin(
               : String(requestInput),
           ).pathname
           const { response, servedId } = await servePoolRequest({
+            configPath,
             source: poolSource,
             rateLimitMarks: () => limits.marks(),
             limitPolicy: {
@@ -4835,7 +4892,7 @@ export async function CodexAuthPlugin(
             // exactly as before, within the hot-path budget.
             const reqStorage =
               authority !== 'local'
-                ? await loadAccountSettings(getAccountPaths(getConfigPath()))
+                ? await readAccountSettings(accountPaths)
                 : await loadRequestAccounts()
 
             // Vault mode (this host is enrolled with the Claustrum vault):
@@ -4962,9 +5019,7 @@ export async function CodexAuthPlugin(
                   // start of the request predates the move (row `main` may
                   // not have existed yet), so it is read again.
                   if (error instanceof MainAccountInPoolError) {
-                    await usePooledMain(
-                      await loadAccounts(getAccountPaths(getConfigPath())),
-                    )
+                    await usePooledMain(await readAccounts(accountPaths))
                   }
                   // Otherwise use the stale token on refresh failure.
                 }
@@ -4997,7 +5052,8 @@ export async function CodexAuthPlugin(
             if (myGeneration === mainIdentityGeneration) {
               currentMainIdentity = mainAccountIdentity
             }
-            const mode: RoutingMode = reqStorage?.routing?.mode ?? 'main-first'
+            const mode: RoutingMode =
+              resolved(reqStorage).routing?.mode ?? 'main-first'
             // One shared sidebar snapshot per request: admission decisions for
             // main and the fallbacks must all judge the same snapshot. It comes
             // from the cache and never waits on the sidebar lock.
@@ -5137,7 +5193,10 @@ export async function CodexAuthPlugin(
 
                 if (
                   stickyCandidate.fallback &&
-                  !shouldFallbackStatus(stickyResponse.status, reqStorage)
+                  !shouldFallbackStatus(
+                    stickyResponse.status,
+                    resolved(reqStorage),
+                  )
                 ) {
                   // See the fallback-first path above: telemetry only, never
                   // awaited on the request path.
@@ -5163,10 +5222,10 @@ export async function CodexAuthPlugin(
               mainAccountIdentity,
             )
             const killswitchBlocksMain =
-              isKillswitchEnabled(reqStorage) &&
+              isKillswitchEnabled(resolved(reqStorage)) &&
               !killswitchPassesPolicy(
                 killswitchMainQuota(mainAccountIdentity),
-                reqStorage,
+                resolved(reqStorage),
                 undefined,
                 Date.now(),
               )
@@ -5305,7 +5364,7 @@ export async function CodexAuthPlugin(
             if (
               !servedFallback &&
               !fallbacksAlreadyTried &&
-              shouldFallbackStatus(response.status, reqStorage)
+              shouldFallbackStatus(response.status, resolved(reqStorage))
             ) {
               logA.debug('reactive fallback triggered', {
                 pid: process.pid,
@@ -5343,10 +5402,7 @@ export async function CodexAuthPlugin(
               mainInPool &&
               mainUnavailable &&
               !fallbackServed &&
-              (await poolPlaceholderWithoutMain(
-                getAccountPaths(getConfigPath()),
-                await getAuth(),
-              ))
+              (await poolPlaceholderWithoutMain(accountPaths, await getAuth()))
             )
               throw new Error(POOL_LOGIN_REQUIRED_MESSAGE)
 
@@ -5456,12 +5512,7 @@ export async function CodexAuthPlugin(
 }
 
 export const OpenAIAuthPlugin: Plugin = async (input) => {
-  const settings = getSettings()
-  return CodexAuthPlugin(input, {
-    codexApiEndpoint: settings.codexApiEndpoint,
-    experimentalWebSockets: settings.webSockets,
-    responsesLite: settings.responsesLite,
-  })
+  return CodexAuthPlugin(input)
 }
 
 export default {
