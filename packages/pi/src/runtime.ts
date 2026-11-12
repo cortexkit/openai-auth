@@ -63,6 +63,7 @@ import {
   reportVaultRoutingLimit,
   type SessionDispatch,
   sessionCacheKeepPlan,
+  startVaultRoutingWait,
   ttlForModel,
   VAULT_REQUEST_ROSTER_WAIT_MS,
   VaultBillingAttempt,
@@ -705,6 +706,7 @@ export class PiOpenAIRuntime {
     const restoreWebSocket = this.deps.installWebSocket?.() ?? (() => {})
     const setWorkingMessage = this.setWorkingMessage
     void (async () => {
+      let endWait: ReturnType<typeof startVaultRoutingWait>
       try {
         let waited = false
         let wake: PiWake | undefined
@@ -741,6 +743,13 @@ export class PiOpenAIRuntime {
               return
             }
             waited = true
+            const at = this.now()
+            endWait = startVaultRoutingWait({
+              sessionId: options?.sessionId,
+              reason: 'account_limit',
+              now: at,
+              nextMs: at + decision.delayMs,
+            })
             let result: 'elapsed' | 'aborted'
             try {
               result = await (this.deps.waitForPi ?? waitForPi)(
@@ -756,7 +765,11 @@ export class PiOpenAIRuntime {
                 setWorkingMessage()
               } catch {}
             }
-            if (result === 'aborted' || options?.signal?.aborted) return
+            if (result === 'aborted' || options?.signal?.aborted) {
+              endWait?.('cancelled')
+              endWait = undefined
+              return
+            }
             wake = attempt.wake
             continue
           }
@@ -771,6 +784,8 @@ export class PiOpenAIRuntime {
             )
             return
           }
+          endWait?.('resumed')
+          endWait = undefined
           if (attempt.head) outer.push(attempt.head)
           if (attempt.rest) {
             for (;;) {
@@ -789,6 +804,7 @@ export class PiOpenAIRuntime {
           ),
         )
       } finally {
+        endWait?.(options?.signal?.aborted ? 'cancelled' : 'abandoned')
         outer.end()
         restoreWebSocket()
       }

@@ -6,6 +6,7 @@ import {
   observeVaultRoutingResponse,
   reportVaultRouting,
   reportVaultRoutingLimit,
+  startVaultRoutingWait,
   vaultRoutingRequestFromBody,
 } from '../vault-routing'
 
@@ -75,6 +76,104 @@ test('fleet selection uses an eligible vault identity, not a plugin route id', a
     ],
   ])
 })
+
+test.each([undefined, 'route-b'])(
+  'fleet advice carries only an existing session warm credential (%s)',
+  async (warmAccountId) => {
+    const calls: unknown[] = []
+    Reflect.set(globalThis, key, () => ({
+      accountFor: async (request: unknown) => {
+        calls.push(request)
+      },
+    }))
+    await chooseVaultRouting({ ...input(), warmAccountId })
+    expect(calls).toEqual([
+      {
+        provider: 'openai',
+        modelId: 'gpt-6',
+        hold_wait_max_s: 0,
+        refusals: true,
+        ...(warmAccountId ? { warm_credential: 'credential-b' } : {}),
+      },
+    ])
+  },
+)
+
+test('wait reporting skips absent accessors and waits planned below two seconds', () => {
+  Reflect.deleteProperty(globalThis, key)
+  const uuid = spyOn(crypto, 'randomUUID')
+  try {
+    expect(
+      startVaultRoutingWait({
+        sessionId: 'session',
+        reason: 'account_limit',
+        now: 1000,
+        nextMs: 4000,
+      }),
+    ).toBeUndefined()
+    const calls: unknown[] = []
+    Reflect.set(globalThis, key, () => ({
+      report: (payload: unknown) => calls.push(payload),
+    }))
+    expect(
+      startVaultRoutingWait({
+        sessionId: 'session',
+        reason: 'account_limit',
+        now: 1000,
+        nextMs: 2999,
+      }),
+    ).toBeUndefined()
+    expect(calls).toEqual([])
+    expect(uuid).not.toHaveBeenCalled()
+  } finally {
+    uuid.mockRestore()
+  }
+})
+
+test.each([
+  ['account_limit', 'Waiting for the account limit to reset'],
+  ['account_free', 'Waiting for an account to come free'],
+  ['quota_reading', 'Checking account quota'],
+] as const)(
+  'wait reports use fixed wire fields for %s without awaiting reports',
+  (reason, message) => {
+    const calls: unknown[] = []
+    Reflect.set(globalThis, key, (sessionId: string) => ({
+      report: (payload: unknown) => {
+        calls.push([sessionId, payload])
+        return new Promise(() => {})
+      },
+    }))
+    const uuid = spyOn(crypto, 'randomUUID').mockReturnValue(
+      '12345678-1234-4234-8234-123456789abc',
+    )
+    try {
+      const end = startVaultRoutingWait({
+        sessionId: 'session',
+        reason,
+        now: 1000,
+        nextMs: 3000,
+        attempt: 2,
+      })
+      expect(end).toBeFunction()
+      end?.('resumed')
+      const base = {
+        kind: 'wait',
+        wait_id: '12345678-1234-4234-8234-123456789abc',
+        reason,
+        next_ms: 3000,
+        attempt: 2,
+        message,
+      }
+      expect(calls).toEqual([
+        ['session', { ...base, phase: 'start' }],
+        ['session', { ...base, phase: 'end', outcome: 'resumed' }],
+      ])
+    } finally {
+      uuid.mockRestore()
+    }
+  },
+)
 
 test.each([
   { setting: 0, expected: 0 },

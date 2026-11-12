@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { createSessionActivityStore } from '@cortexkit/common-auth/limits'
 import {
   type ChooseAccountInput,
@@ -21,6 +21,44 @@ import { SessionPins } from '../v2/pins'
 import { fakeOpenCode2Host, scope } from './fixtures/opencode2-host'
 
 const T0 = 1_900_000_000_000
+const routingKey = Symbol.for('cortexkit.routing')
+const originalRouting = Object.getOwnPropertyDescriptor(globalThis, routingKey)
+afterEach(() => {
+  if (originalRouting)
+    Object.defineProperty(globalThis, routingKey, originalRouting)
+  else Reflect.deleteProperty(globalThis, routingKey)
+})
+
+function recordWaits() {
+  const reports: unknown[] = []
+  Reflect.set(globalThis, routingKey, (sessionId: string) => ({
+    report: (payload: unknown) => reports.push([sessionId, payload]),
+  }))
+  return reports
+}
+
+function expectWait(
+  reports: unknown[],
+  reason: string,
+  delay: number,
+  message: string,
+  outcome: string,
+) {
+  const first = (reports[0] as [string, { wait_id: string }])?.[1]
+  expect(first?.wait_id).toMatch(/^[0-9a-f-]{36}$/)
+  const base = {
+    kind: 'wait',
+    wait_id: first?.wait_id,
+    reason,
+    next_ms: T0 + delay,
+    attempt: 1,
+    message,
+  }
+  expect(reports).toEqual([
+    ['ses_1', { ...base, phase: 'start' }],
+    ['ses_1', { ...base, phase: 'end', outcome }],
+  ])
+}
 
 function quotaMap(usedPercent: number, checkedAt = T0) {
   return {
@@ -203,6 +241,7 @@ function fixture(
     mark,
     rows,
     storage,
+    source,
     limits,
     cache,
     accountKey,
@@ -213,6 +252,121 @@ function fixture(
 }
 
 describe('OpenCode 2 shared limit policy', () => {
+  test.each(['hold', 'terminal'] as const)(
+    '%s wait reports start and checkpoint wake end',
+    async (kind) => {
+      const reports = recordWaits()
+      const f = fixture()
+      if (kind === 'hold') f.cache()
+      else f.mark('b', 180_000)
+      const result = await f.retry(60_000)
+      expect(result).toHaveProperty('hold')
+      if (!result || typeof result === 'string' || !('hold' in result))
+        throw new Error('expected hold')
+      f.tick(60_000)
+      await f.openai.adapter.chooseAccount(
+        f.input({
+          phase: 'request',
+          wake: {
+            ...result.hold,
+            checkpoint: result.hold.checkpoint,
+            target: T0 + 60_000,
+          },
+        }),
+      )
+      expectWait(
+        reports,
+        'account_limit',
+        60_000,
+        'Waiting for the account limit to reset',
+        'resumed',
+      )
+    },
+  )
+
+  test('waitThenReselect reports account_free start and observed wake end', async () => {
+    const reports = recordWaits()
+    const f = fixture()
+    f.mark('b', 60_000)
+    expect(await f.retry(120_000)).toEqual({
+      waitThenReselect: { delayMs: 60_000 },
+    })
+    f.tick(60_000)
+    await f.openai.adapter.chooseAccount(f.input({ phase: 'request' }))
+    expectWait(
+      reports,
+      'account_free',
+      60_000,
+      'Waiting for an account to come free',
+      'resumed',
+    )
+  })
+
+  test.each([true, false])(
+    'first quota reading reports exact end when reading arrives: %s',
+    async (arrives) => {
+      const reports = recordWaits()
+      const f = fixture(['a'])
+      f.rows[0]!.quota = undefined
+      let pulls = 0
+      f.source.requestReading = async () => {
+        pulls++
+        if (arrives) f.rows[0]!.quota = quotaMap(10)
+      }
+      const result = await f.openai.adapter.chooseAccount(
+        f.input({ phase: 'request' }),
+      )
+      expect(result).toBe(arrives ? 'a' : undefined)
+      expect(pulls).toBe(arrives ? 1 : 2)
+      expectWait(
+        reports,
+        'quota_reading',
+        5000,
+        'Checking account quota',
+        arrives ? 'resumed' : 'abandoned',
+      )
+    },
+  )
+
+  test('without routing accessor the adapter does not create wait reports', async () => {
+    Reflect.deleteProperty(globalThis, routingKey)
+    const uuid = spyOn(crypto, 'randomUUID')
+    try {
+      const f = fixture()
+      f.cache()
+      await f.retry(60_000)
+      expect(uuid).not.toHaveBeenCalled()
+    } finally {
+      uuid.mockRestore()
+    }
+  })
+
+  test('reported waits count per user turn with fresh ids and reset on a new prompt', async () => {
+    const reports = recordWaits()
+    const f = fixture(['a'])
+    for (let index = 0; index < 3; index++) {
+      if (index === 2) f.openai.beginTurn('ses_1')
+      f.rows[0]!.quota = undefined
+      f.source.requestReading = async () => {
+        f.rows[0]!.quota = quotaMap(10)
+      }
+      await f.openai.adapter.chooseAccount(f.input({ phase: 'request' }))
+    }
+    const starts = reports.filter(
+      (row) => (row as [string, { phase: string }])[1].phase === 'start',
+    ) as Array<[string, { attempt: number; wait_id: string }]>
+    expect(starts.map(([, payload]) => payload.attempt)).toEqual([1, 2, 1])
+    expect(new Set(starts.map(([, payload]) => payload.wait_id)).size).toBe(3)
+  })
+
+  test('adapter holds planned below two seconds do not report', async () => {
+    const reports = recordWaits()
+    const f = fixture()
+    f.cache()
+    expect(await f.retry(1999)).toHaveProperty('hold')
+    expect(reports).toEqual([])
+  })
+
   for (const setting of [0, 15, 'max'] as const) {
     test(`single-account confirmed OA-51 preserves host delay at ${setting}`, async () => {
       const f = fixture(['a'], setting)

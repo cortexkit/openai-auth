@@ -35,6 +35,8 @@ const MODEL: Model<Api> = {
   maxTokens: 128_000,
 }
 const T0 = 1_900_000_000_000
+const routingKey = Symbol.for('cortexkit.routing')
+const originalRouting = Object.getOwnPropertyDescriptor(globalThis, routingKey)
 function jwt(identity: string, nonce = '') {
   return `e30.${Buffer.from(JSON.stringify({ nonce, 'https://api.openai.com/auth': { chatgpt_account_id: identity } })).toString('base64url')}.sig`
 }
@@ -111,6 +113,9 @@ beforeEach(async () => {
   }, paths)
 })
 afterEach(async () => {
+  if (originalRouting)
+    Object.defineProperty(globalThis, routingKey, originalRouting)
+  else Reflect.deleteProperty(globalThis, routingKey)
   await runtime?.pool.dispose()
   await runtime?.vault.dispose()
   rmSync(dir, { recursive: true, force: true })
@@ -201,6 +206,90 @@ async function addB() {
 }
 
 describe('Pi bounded quota waits', () => {
+  test.each(['no accessor', 'short wait'])(
+    'countdown %s creates no wait report id',
+    async (scenario) => {
+      const reports: Array<{ kind?: string }> = []
+      if (scenario === 'no accessor')
+        Reflect.deleteProperty(globalThis, routingKey)
+      else {
+        Reflect.set(globalThis, routingKey, () => ({
+          report: (payload: { kind?: string }) => reports.push(payload),
+        }))
+        reset = T0 + 1999
+      }
+      used = 100
+      await mutateAccounts((storage) => {
+        storage.killswitch = { enabled: true }
+        return storage
+      }, paths)
+      await start({
+        waitForPi: async (delay) => {
+          now += delay
+          used = 10
+          await runtime.main.pollNow()
+          return 'elapsed'
+        },
+      })
+      const uuid = spyOn(crypto, 'randomUUID')
+      try {
+        await send({ sessionId: 'unreported' })
+        expect(reports.filter((report) => report.kind === 'wait')).toEqual([])
+        expect(uuid).not.toHaveBeenCalled()
+        expect(sends).toEqual([MAIN])
+      } finally {
+        uuid.mockRestore()
+      }
+    },
+  )
+
+  test.each(['resumed', 'cancelled', 'abandoned'] as const)(
+    'countdown wait reports exact start and %s end',
+    async (outcome) => {
+      const reports: unknown[] = []
+      Reflect.set(globalThis, routingKey, (session: string) => ({
+        report: (payload: unknown) => reports.push([session, payload]),
+      }))
+      used = 100
+      if (outcome === 'abandoned') reset = T0 + 7_200_000
+      await mutateAccounts((storage) => {
+        storage.killswitch = { enabled: true }
+        return storage
+      }, paths)
+      const controller = new AbortController()
+      await start({
+        waitForPi: async (delay) => {
+          if (outcome === 'cancelled') {
+            controller.abort()
+            return 'aborted'
+          }
+          now += delay
+          if (outcome === 'resumed') used = 10
+          await runtime.main.pollNow()
+          return 'elapsed'
+        },
+      })
+      await send({ sessionId: 'wait-report', signal: controller.signal })
+      const waits = reports.filter(
+        (row) => (row as [string, { kind: string }])[1].kind === 'wait',
+      )
+      const first = (waits[0] as [string, { wait_id: string }])?.[1]
+      expect(first?.wait_id).toMatch(/^[0-9a-f-]{36}$/)
+      const base = {
+        kind: 'wait',
+        wait_id: first?.wait_id,
+        reason: 'account_limit',
+        next_ms: T0 + (outcome === 'abandoned' ? 900_000 : 60_000),
+        message: 'Waiting for the account limit to reset',
+      }
+      expect(waits).toEqual([
+        ['wait-report', { ...base, phase: 'start' }],
+        ['wait-report', { ...base, phase: 'end', outcome }],
+      ])
+      expect(sends.length).toBe(outcome === 'resumed' ? 1 : 0)
+    },
+  )
+
   test('fitting hold lifts only the checkpoint and reuses A rather than ready B', async () => {
     await addB()
     const waits: number[] = []

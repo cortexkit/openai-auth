@@ -37,6 +37,44 @@ export function hasVaultRoutingAccessor(): boolean {
   }
 }
 
+export const ROUTING_WAIT_MESSAGES = {
+  account_limit: 'Waiting for the account limit to reset',
+  account_free: 'Waiting for an account to come free',
+  quota_reading: 'Checking account quota',
+} as const
+
+/** Routing reports are advisory and must not delay a request when reporting is unavailable or slow. */
+export function startVaultRoutingWait(input: {
+  sessionId: string | undefined
+  reason: keyof typeof ROUTING_WAIT_MESSAGES
+  now: number
+  nextMs: number
+  attempt?: number
+}): ((outcome: 'resumed' | 'cancelled' | 'abandoned') => void) | undefined {
+  if (
+    !input.sessionId ||
+    !hasVaultRoutingAccessor() ||
+    input.nextMs - input.now < 2_000
+  )
+    return undefined
+  const report = {
+    sessionId: input.sessionId,
+    kind: 'wait' as const,
+    waitId: crypto.randomUUID(),
+    reason: input.reason,
+    nextMs: input.nextMs,
+    ...(input.attempt === undefined ? {} : { attempt: input.attempt }),
+    message: ROUTING_WAIT_MESSAGES[input.reason],
+  }
+  reportRouting({ ...report, phase: 'start' })
+  let ended = false
+  return (outcome) => {
+    if (ended) return
+    ended = true
+    reportRouting({ ...report, phase: 'end', outcome })
+  }
+}
+
 /** Title generation and history maintenance must not choose a new vault account. */
 export function vaultRoutingKind(agent: string | undefined): string {
   return agent && !['title', 'compaction', 'summary'].includes(agent)
@@ -73,6 +111,7 @@ export async function chooseVaultRouting(input: {
   routing: PoolRoutingInput
   eligibleIds?: readonly string[]
   wait?: RoutingWaitInput
+  warmAccountId?: string
 }): Promise<string | RoutingRefusal | undefined> {
   const { request, sessionId } = input
   if (
@@ -112,6 +151,9 @@ export async function chooseVaultRouting(input: {
     provider: 'openai',
     modelId: request.modelId,
     candidates,
+    warmCredentialId: input.routes.find(
+      (route) => route.id === input.warmAccountId,
+    )?.credentialId,
     refusals: true,
     holdWaitMaxS: routingHoldWaitMaxS({
       ...input.wait,

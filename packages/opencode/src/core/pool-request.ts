@@ -231,6 +231,8 @@ export interface PoolRequestContext {
   /** Separates endpoint and conversation/auxiliary retries within a session. */
   requestKind?: string
   routingRequest?: VaultRoutingRequest
+  /** The session's existing sticky pin, not a newly previewed placement. */
+  warmAccountId?: string
   /** The buffered request body, when there is one. */
   body: string | undefined
   replayable: boolean
@@ -948,6 +950,10 @@ async function serveOrdered(
     routes: ctx.vault?.routes() ?? [],
     routing,
     eligibleIds: plan.order,
+    warmAccountId:
+      ctx.mode === 'sticky-balanced'
+        ? ctx.warmAccountId
+        : ctx.limitPolicy?.currentAccountKey()?.accountId,
   })
   if (preferred && typeof preferred !== 'string')
     throw new Error(VAULT_ROUTING_REFUSAL_MESSAGE)
@@ -1098,6 +1104,7 @@ async function serveSticky(
       sessionId,
       request: ctx.routingRequest,
       routes: ctx.vault?.routes() ?? [],
+      warmAccountId: ctx.warmAccountId,
       routing,
     })
     if (advised && typeof advised !== 'string')

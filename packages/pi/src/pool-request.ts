@@ -58,6 +58,7 @@ import {
   quotaSnapshotPassesPolicy,
   type RoutingMode,
   type StickyPinPlacement,
+  startVaultRoutingWait,
 } from '@cortexkit/openai-auth-core/internal'
 
 import { windowsFromQuotaMap } from '@cortexkit/openai-auth-core/pool-quota'
@@ -65,6 +66,7 @@ import {
   type AdmissionTier,
   admitSticky,
   type CreditsServing,
+  FIRST_QUOTA_READING_WAIT_MS,
   FORMER_MAIN_ID,
   orderedPlacement,
   type PoolBlock,
@@ -487,8 +489,27 @@ export async function routePiRequest<A extends RouteAttempt>(
     ctx.firstReadingWaitMs,
   )
   if (firstReading) {
+    const at = ctx.now()
+    const end = startVaultRoutingWait({
+      sessionId: ctx.sessionId,
+      reason: 'quota_reading',
+      now: at,
+      nextMs: at + (ctx.firstReadingWaitMs ?? FIRST_QUOTA_READING_WAIT_MS),
+    })
     await firstReading
     accounts = ctx.accounts()
+    if (end)
+      end(
+        planOrdered({
+          ...routingInput(ctx, accounts),
+          // Reporting admission must not trigger another quota poll.
+          requestPull: () => {},
+          placement: 'roster',
+          mainId: null,
+        }).kind === 'block'
+          ? 'abandoned'
+          : 'resumed',
+      )
   }
   const policy = ctx.limitPolicy
   const wake = policy?.wake

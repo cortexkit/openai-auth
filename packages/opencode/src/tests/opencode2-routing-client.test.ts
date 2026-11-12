@@ -211,6 +211,53 @@ for (const mode of ['ordered', 'sticky-balanced'] as const) {
   })
 }
 
+test('OpenCode 2 routing asks hint the current ordered account, not a new local choice', async () => {
+  const calls: unknown[] = []
+  Reflect.set(globalThis, key, () => ({
+    accountFor: async (request: unknown) => {
+      calls.push(request)
+      return { account_id: 'account-b', credential_id: 'credential-b' }
+    },
+  }))
+  const env = fixture()
+  expect(await env.openai.adapter.chooseAccount(env.request)).toBe('vault:b')
+  expect(await env.openai.adapter.chooseAccount(env.request)).toBe('vault:b')
+  expect(calls).toEqual([
+    {
+      provider: 'openai',
+      modelId: 'gpt-6',
+      hold_wait_max_s: 0,
+      refusals: true,
+    },
+    {
+      provider: 'openai',
+      modelId: 'gpt-6',
+      hold_wait_max_s: 0,
+      refusals: true,
+      warm_credential: 'credential-b',
+    },
+  ])
+})
+
+test('OpenCode 2 cold sticky choice does not hint a provisional pin', async () => {
+  const calls: unknown[] = []
+  Reflect.set(globalThis, key, () => ({
+    accountFor: async (request: unknown) => {
+      calls.push(request)
+    },
+  }))
+  const env = fixture(true, 'sticky-balanced')
+  await env.openai.adapter.chooseAccount(env.request)
+  expect(calls).toEqual([
+    {
+      provider: 'openai',
+      modelId: 'gpt-6',
+      hold_wait_max_s: 0,
+      refusals: true,
+    },
+  ])
+})
+
 test.each([
   'ineligible',
   'no-answer',

@@ -102,6 +102,7 @@ import {
   reportVaultRouting,
   reportVaultRoutingLimit,
   type SessionDispatch,
+  startVaultRoutingWait,
   ttlForModel,
   VAULT_ROUTING_REFUSAL_MESSAGE,
   VaultBillingAttempt,
@@ -124,6 +125,7 @@ import {
   type AdmissionTier,
   admitSticky,
   CreditsServing,
+  FIRST_QUOTA_READING_WAIT_MS,
   FORMER_MAIN_ID,
   orderedPlacement,
   type PoolRoutingInput,
@@ -577,7 +579,37 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   // The installer passes a hold's reset checkpoint only to the next request,
   // not to a later refusal. Keep the consumed wait until a new user prompt.
   const heldTurns = new Map<string, string>()
+  const waitCounts = new Map<string, number>()
+  const pendingWaits = new Map<
+    string,
+    {
+      checkpoint?: string
+      nextMs: number
+      end: NonNullable<ReturnType<typeof startVaultRoutingWait>>
+    }
+  >()
+  const startWait = (
+    input: ChooseAccountInput,
+    reason: 'account_limit' | 'account_free' | 'quota_reading',
+    at: number,
+    delayMs: number,
+  ) => {
+    if (!hasVaultRoutingAccessor()) return undefined
+    const attempt = (waitCounts.get(input.sessionID) ?? 0) + 1
+    const end = startVaultRoutingWait({
+      sessionId: input.sessionID,
+      reason,
+      now: at,
+      nextMs: at + delayMs,
+      attempt,
+    })
+    if (end) waitCounts.set(input.sessionID, attempt)
+    return end
+  }
   const clearTurn = (sessionId: string) => {
+    waitCounts.delete(sessionId)
+    for (const key of pendingWaits.keys())
+      if (JSON.parse(key)[0] === sessionId) pendingWaits.delete(key)
     for (const key of billingCounts.keys())
       if (key.startsWith(`${sessionId}\u0000`)) billingCounts.delete(key)
     for (const [key, session] of heldTurns)
@@ -922,9 +954,27 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       ),
     )
     if (firstReading) {
+      const end = startWait(
+        input,
+        'quota_reading',
+        at,
+        FIRST_QUOTA_READING_WAIT_MS,
+      )
       await firstReading
       at = now()
       targets = currentTargets(storage, at, vaultMode)
+      if (end)
+        end(
+          planOrdered({
+            ...routingInput(targets, storage, at),
+            // Reporting admission must not trigger another quota poll.
+            requestPull: () => {},
+            placement: 'roster',
+            mainId: null,
+          }).kind === 'block'
+            ? 'abandoned'
+            : 'resumed',
+        )
     }
     const byId = new Map(targets.map((target) => [target.id, target]))
     let routing = routingInput(targets, storage, at)
@@ -933,6 +983,17 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       : undefined
     const setting = storage?.routing?.maxSameAccountWait
     const turnKey = JSON.stringify([input.sessionID, input.kind])
+    const pendingWait = pendingWaits.get(turnKey)
+    if (
+      input.phase === 'request' &&
+      pendingWait &&
+      (pendingWait.checkpoint
+        ? JSON.stringify(input.wake?.checkpoint) === pendingWait.checkpoint
+        : at >= pendingWait.nextMs)
+    ) {
+      pendingWait.end('resumed')
+      pendingWaits.delete(turnKey)
+    }
     // Auxiliary requests belong to the same user turn and share its wait budget.
     const alreadyHeld = [...heldTurns.values()].includes(input.sessionID)
     const activity = limits?.activity.get(input.sessionID)
@@ -1087,6 +1148,13 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       const ordinary = decideOpenAiLimit({ ...facts, hold }, { mode: 'sticky' })
       if (ordinary?.action === 'hold' && !alreadyHeld) {
         heldTurns.set(turnKey, input.sessionID)
+        const end = startWait(input, 'account_limit', at, ordinary.delayMs)
+        if (end)
+          pendingWaits.set(turnKey, {
+            checkpoint: JSON.stringify(ordinary.checkpoint),
+            nextMs: at + ordinary.delayMs,
+            end,
+          })
         return {
           hold: {
             delayMs: ordinary.delayMs,
@@ -1133,6 +1201,13 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           sameAccount(decision.account, previous.account)
         ) {
           heldTurns.set(turnKey, input.sessionID)
+          const end = startWait(input, 'account_limit', at, delayMs)
+          if (end)
+            pendingWaits.set(turnKey, {
+              checkpoint: JSON.stringify(decision.checkpoint),
+              nextMs: at + delayMs,
+              end,
+            })
           return {
             hold: {
               delayMs,
@@ -1143,6 +1218,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           }
         }
         heldTurns.set(turnKey, input.sessionID)
+        const end = startWait(input, 'account_free', at, delayMs)
+        if (end) pendingWaits.set(turnKey, { nextMs: at + delayMs, end })
         return { waitThenReselect: { delayMs } }
       }
     }
@@ -1316,6 +1393,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
                     input.phase === 'retry' || input.rerouteFrom !== undefined,
                 },
                 routes: vault?.routes() ?? [],
+                warmAccountId:
+                  mode === 'sticky-balanced'
+                    ? pins.get(input.sessionID)
+                    : sessionAccounts.activeAccount(input.sessionID),
                 routing,
                 wait: {
                   activity,
@@ -2135,6 +2216,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     beginTurn: clearTurn,
     dispose: () => {
       heldTurns.clear()
+      waitCounts.clear()
+      pendingWaits.clear()
       billingCounts.clear()
     },
     attach(installation) {

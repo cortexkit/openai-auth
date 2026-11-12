@@ -4725,6 +4725,10 @@ export async function CodexAuthPlugin(
           ).pathname
           const { response, servedId } = await servePoolRequest({
             configPath,
+            warmAccountId: resolveSessionStickyAccount(
+              applyStickyPinOverlay(sidebarSnapshot, stickyPinOverlay),
+              sessionId,
+            ),
             source: poolSource,
             rateLimitMarks: () => limits.marks(),
             limitPolicy: {
