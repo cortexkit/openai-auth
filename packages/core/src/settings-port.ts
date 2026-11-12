@@ -126,8 +126,12 @@ export function createBuiltinSettingsPort(options: {
         await snapshot.refresh()
         const before = menuView(snapshot)
         const tracked = trackFloors(structuredClone(before))
-        const next = (await mutator(tracked.value)) ?? tracked.value
+        const edited = (await mutator(tracked.value)) ?? tracked.value
         tracked.finish()
+        // Compare a plain copy, not the tracking proxies: Bun 1.3's
+        // isDeepStrictEqual reports a Proxy unequal to an identical object,
+        // which would mark every account as edited and reorder the list.
+        const next = JSON.parse(JSON.stringify(edited)) as PoolSettings
         const edits: SettingsEdit[] = []
         const routing = record(next.routing)
         const oldRouting = record(before.routing)
