@@ -5,7 +5,11 @@ import {
 } from '@cortexkit/common-auth/settings'
 import { openaiSettings } from './settings-definition.js'
 import type { SettingsHost, SettingsInstall } from './settings-install.js'
-import { mapSettings, readSettingsSource } from './settings-map.js'
+import {
+  CannotMoveSettingError,
+  mapSettings,
+  readSettingsSource,
+} from './settings-map.js'
 
 export type SettingsMoveFailure =
   | { kind: 'setting'; setting: string }
@@ -19,7 +23,8 @@ export interface SettingsMoveResult extends MoveResult {
 export interface SettingsMoveOptions {
   install: SettingsInstall
   fence(): boolean | Promise<boolean>
-  log?: { warn(message: string): unknown }
+  /** The plugin's file logger. Console output would corrupt the host's terminal. */
+  log: { warn(message: string): unknown }
 }
 
 class SourceReadError extends Error {
@@ -51,15 +56,11 @@ function classifyFailure(
       code: cause.code,
     }
   }
-  // Only the mapper's fixed error shape can supply a setting name. Arbitrary
-  // exception messages may contain source text or credentials and stay private.
-  const setting =
-    cause instanceof Error
-      ? /^Cannot move setting ([a-zA-Z_][a-zA-Z0-9_]*)(?: \([a-zA-Z0-9_.]+\))?$/.exec(
-          cause.message,
-        )?.[1]
-      : undefined
-  if (setting) return { kind: 'setting', setting }
+  // Only the mapper's own error supplies a setting name. Arbitrary exception
+  // messages may contain source text or credentials and stay private.
+  if (cause instanceof CannotMoveSettingError) {
+    return { kind: 'setting', setting: cause.setting }
+  }
   const path = (cause as { path?: unknown } | null)?.path
   const source = sources.find((source) => source.path === path)
   const code = errorCode(cause)
@@ -84,7 +85,7 @@ function classifyFailure(
 export async function runSettingsMove({
   install,
   fence,
-  log = console,
+  log,
 }: SettingsMoveOptions): Promise<SettingsMoveResult | undefined> {
   if (install.separate || install.sources.length === 0) return undefined
   const sources: MoveSource[] = [...install.sources]

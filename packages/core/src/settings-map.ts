@@ -95,9 +95,22 @@ function accepts(
   }
 }
 
+/**
+ * A preference the move can't reproduce. It names the setting and the old key,
+ * never the stored value, so callers can report it without leaking store text.
+ */
+export class CannotMoveSettingError extends Error {
+  constructor(
+    readonly setting: string,
+    readonly key?: string,
+  ) {
+    super(`Cannot move setting ${setting}${key ? ` (${key})` : ''}`)
+    this.name = 'CannotMoveSettingError'
+  }
+}
+
 function cannotMove(setting: string, key?: string): never {
-  // Errors name the setting and key, never the stored value or credential data.
-  throw new Error(`Cannot move setting ${setting}${key ? ` (${key})` : ''}`)
+  throw new CannotMoveSettingError(setting, key)
 }
 
 function numeric(value: unknown, setting: Setting, key: string): number {
