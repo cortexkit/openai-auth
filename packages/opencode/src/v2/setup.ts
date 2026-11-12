@@ -67,9 +67,15 @@ import {
   reportSessionCacheResponse,
   vaultStateDir,
 } from '@cortexkit/openai-auth-core/internal'
+import { createBuiltinSettingsPort } from '@cortexkit/openai-auth-core/settings-port'
 import type { Plugin } from '@opencode/plugin'
 import type { SessionHooks } from '@opencode/plugin/promise/session'
-import { getConfigPath, getSettings } from '../config'
+import {
+  getConfigPath,
+  getResolvedSettingsView,
+  getSettings,
+  registerSettingsSnapshot,
+} from '../config'
 import { getAccountPaths } from '../core/account-paths'
 import { OpenCodeLimitSource } from '../core/limit-source'
 import {
@@ -96,6 +102,7 @@ import {
   type RuntimeLayoutOptions,
   takeRuntimeLayoutNotice,
 } from '../core/runtime-layout'
+import { prepareSettingsStartup } from '../core/settings-startup'
 import { acquireOpenCodeVault } from '../core/shared-vault'
 import { migrationFenceOpen } from '../core/version-fence'
 import { POOL_MIGRATION_ENABLED } from '../index'
@@ -561,11 +568,32 @@ export async function setupOpenAIAuth(
   // them out of OpenCode's config folder first when that is safe.
   await prepareRuntimeLayout({ version, ...options.runtimeLayout })
   const paths = options.paths ?? (() => getAccountPaths(getConfigPath()))
+  const configPath = paths().configPath
+  const settingsStartup = await prepareSettingsStartup({
+    version,
+    paths: paths(),
+    log,
+  })
+  const snapshot = settingsStartup.snapshot
+  const unregisterSettings = snapshot
+    ? registerSettingsSnapshot(configPath, snapshot)
+    : undefined
+  const disposeSettings = () => {
+    unregisterSettings?.()
+    snapshot?.dispose()
+  }
+  let setupComplete = false
+  using _settingsRollback = {
+    [Symbol.dispose]() {
+      if (!setupComplete) disposeSettings()
+    },
+  }
   // The logger starts with the environment floor. A saved choice overrides it,
   // just as it does on OpenCode 1, before setup writes any diagnostic lines.
   const storage = await loadAccountSettings(paths())
-  const storedLevel = storage?.logging?.level
-  if (storedLevel && typeof storedLevel === 'string') {
+  const storedLevel = getResolvedSettingsView(storage, configPath).logging
+    ?.level
+  if (!snapshot && storedLevel && typeof storedLevel === 'string') {
     setLogLevel(storedLevel as Parameters<typeof setLogLevel>[0])
   }
   const fetchImpl = options.fetch ?? fetch
@@ -596,7 +624,14 @@ export async function setupOpenAIAuth(
       },
       log,
     )
-    return () => installation.dispose()
+    setupComplete = true
+    return async () => {
+      try {
+        await installation.dispose()
+      } finally {
+        disposeSettings()
+      }
+    }
   }
 
   // The vault serves nothing until this host is enrolled through
@@ -640,7 +675,6 @@ export async function setupOpenAIAuth(
     (await vault.authority()) === 'local'
       ? loadAccounts(paths())
       : loadAccountSettings(paths())
-  let setupComplete = false
   let closing = false
   using _leaseRollback = {
     [Symbol.dispose]() {
@@ -784,7 +818,7 @@ export async function setupOpenAIAuth(
     new CodexHttpState(undefined, undefined, acquireCodexSessions())
   // One keep-warm manager per process and account store; this location lends
   // it its own pool source, vault, settings and request capture.
-  const cacheKeepSettings = cacheKeepSettingsOf(storage)
+  const cacheKeepSettings = cacheKeepSettingsOf(storage, configPath)
   const mirror = acquireFrameMirror(paths())
   const cacheKeep = acquireCacheKeep(
     paths(),
@@ -803,10 +837,13 @@ export async function setupOpenAIAuth(
     },
     {
       now,
-      codexResponsesUrl: getSettings().codexApiEndpoint,
+      codexResponsesUrl: getSettings(configPath).codexApiEndpoint,
       ...options.cacheKeep,
     },
   )
+  snapshot?.onChange(() => {
+    cacheKeep.configure(cacheKeepSettingsOf(storage, configPath))
+  })
   using _cacheKeepRollback = {
     [Symbol.dispose]() {
       if (!setupComplete) void cacheKeep.release()
@@ -820,6 +857,7 @@ export async function setupOpenAIAuth(
     source,
     slotPlaceholderWithoutMain,
     storage: loadStorage,
+    configPath,
     pins,
     sessionAccounts: acquireSessionAccounts(paths()),
     vault,
@@ -829,8 +867,8 @@ export async function setupOpenAIAuth(
         VAULT_FIRST_ROSTER_WAIT_MS,
       )
     },
-    responsesLite: () => getSettings().responsesLite,
-    codexEndpoint: () => getSettings().codexApiEndpoint,
+    responsesLite: () => getSettings(configPath).responsesLite,
+    codexEndpoint: () => getSettings(configPath).codexApiEndpoint,
     now,
     log,
   })
@@ -922,6 +960,18 @@ export async function setupOpenAIAuth(
               randomUUID,
               accountStoragePath: paths().configPath,
               accountStatePath: paths().statePath,
+              configPath,
+              ...(snapshot
+                ? {
+                    settingsSnapshot: snapshot,
+                    settings: createBuiltinSettingsPort({
+                      file: settingsStartup.authority.install.target,
+                      host: 'opencode',
+                      snapshot,
+                      log,
+                    }),
+                  }
+                : {}),
               packageVersion: version,
               layoutNotice: takeRuntimeLayoutNotice,
               loadAccounts,
@@ -1021,6 +1071,7 @@ export async function setupOpenAIAuth(
       ])
     } finally {
       clearTimeout(settleTimer)
+      disposeSettings()
       await vaultLease.release()
       await heartbeat?.release()
     }

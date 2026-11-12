@@ -112,6 +112,7 @@ import {
   vaultRoutingStreamFailed,
   vaultRoutingStreamMayFail,
 } from '@cortexkit/openai-auth-core/internal'
+import { getResolvedSettingsView } from '../config'
 import type { OpenCodeLimitSource } from '../core/limit-source'
 import type { PoolAccountSource } from '../core/pool-account-source'
 import { VAULT_FIRST_ROSTER_WAIT_MS } from '../core/pool-account-source'
@@ -260,6 +261,8 @@ export interface OpenAIAdapterDeps {
   slotPlaceholderWithoutMain?: () => Promise<boolean>
   /** The settings a request reads (routing mode, killswitch, quota policy). */
   storage: () => Promise<AccountStorage | null>
+  /** The config identity shared by this location's store and settings authority. */
+  configPath?: string
   pins: SessionPins
   /**
    * Where each session's latest agent-loop account is recorded. Setup passes
@@ -677,6 +680,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           storage,
           at,
           vault?.identities() ?? new Set<string>(),
+          deps.configPath,
         )
     const routes = (vault?.routes() ?? []).filter(
       (route) =>
@@ -873,7 +877,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   ): Promise<ChooseAccountResult> => {
     let ready: OpenAiLimitsRequest | undefined
     const modeAuthority = await vault?.authority()
-    const storage = await deps.storage()
+    const storage = getResolvedSettingsView(
+      await deps.storage(),
+      deps.configPath,
+    )
     // Vault mode: only the vault's accounts serve this host.
     const vaultMode = modeAuthority !== undefined && modeAuthority !== 'local'
     const refuseMissingLogin = () => {
@@ -1648,7 +1655,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         return undefined
       const vaultMode =
         vault !== undefined && (await vault.authority()) !== 'local'
-      const storage = await deps.storage()
+      const storage = getResolvedSettingsView(
+        await deps.storage(),
+        deps.configPath,
+      )
       if (!vaultMode && !(await source.current()).active) return undefined
       const at = now()
       const targets = currentTargets(storage, at, vaultMode)

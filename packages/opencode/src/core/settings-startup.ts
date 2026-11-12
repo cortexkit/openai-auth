@@ -1,4 +1,5 @@
 import { openSettings } from '@cortexkit/common-auth/settings'
+import type { AccountPaths } from '@cortexkit/openai-auth-core/internal'
 import {
   decideSettingsAuthority,
   type SettingsAuthorityResult,
@@ -36,6 +37,7 @@ export interface SettingsStartup {
  */
 export async function prepareSettingsStartup(options: {
   version: string
+  paths?: AccountPaths
   log?: {
     warn(message: string): unknown
     info(message: string): unknown
@@ -44,7 +46,7 @@ export async function prepareSettingsStartup(options: {
   const log = options.log ?? createLogger('settings')
   const install = resolveSettingsInstall({
     host: 'opencode',
-    paths: getAccountPaths(),
+    paths: options.paths ?? getAccountPaths(),
     logger: log,
   })
   const authority = await decideSettingsAuthority({

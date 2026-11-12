@@ -45,6 +45,7 @@ import {
   VaultBillingAttempt,
   type VaultBillingWarming,
 } from '@cortexkit/openai-auth-core/internal'
+import { getResolvedSettingsView } from '../config'
 import {
   CACHE_KEEP_CAPS,
   type CacheKeepWindow,
@@ -105,15 +106,15 @@ export interface CacheKeepSettingsView {
 /** The saved keep-warm settings, read the way OpenCode 1 reads them. */
 export function cacheKeepSettingsOf(
   storage: AccountStorage | null,
+  configPath?: string,
 ): CacheKeepSettingsView {
-  const stored = cacheKeepSettings(storage)
+  const view = getResolvedSettingsView(storage, configPath)
+  const stored = cacheKeepSettings(view)
   return {
     enabled: stored?.enabled === true,
     subagents: stored?.subagents === true,
     sustain: stored?.sustain === true,
-    window: getCacheKeepWindow(
-      storage ? { ...storage, cachekeep: stored } : storage,
-    ),
+    window: getCacheKeepWindow({ ...view, cachekeep: stored }),
   }
 }
 
