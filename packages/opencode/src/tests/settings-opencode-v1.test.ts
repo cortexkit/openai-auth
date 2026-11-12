@@ -32,6 +32,7 @@ import {
 } from '../index'
 import { flushForTest, setLogLevel } from '../logger'
 import { createRequestTestScope } from './request-test-scope'
+import { unsetEnv } from './setup-env'
 
 const scope = createRequestTestScope()
 const { it } = scope
@@ -694,7 +695,7 @@ describe('OpenCode 1 legacy and move boundaries', () => {
         refresh_enabled: false,
       })
       const shared = async () => {
-        delete process.env.OPENCODE_CONFIG_DIR
+        unsetEnv('OPENCODE_CONFIG_DIR')
         config = sharedConfig
         return start()
       }
@@ -741,8 +742,8 @@ describe('OpenCode default settings-store parity', () => {
   it.each(['none', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME'] as const)(
     'core matches host paths with %s and with or without a layout marker',
     async (env) => {
-      delete process.env.XDG_CONFIG_HOME
-      delete process.env.XDG_STATE_HOME
+      unsetEnv('XDG_CONFIG_HOME')
+      unsetEnv('XDG_STATE_HOME')
       if (env === 'XDG_CONFIG_HOME')
         process.env.XDG_CONFIG_HOME = join(folder, 'alternate-config')
       if (env === 'XDG_STATE_HOME')

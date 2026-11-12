@@ -4335,14 +4335,15 @@ export async function CodexAuthPlugin(
           // threshold so routing never spends on a killed account. Opt-in — a
           // no-op when disabled. Non-invalidating peek so a token refresh does
           // not flip a killed account to "unknown".
-          const current = isKillswitchEnabled(resolved(fallbackStorage))
+          const fallbackPreferences = resolved(fallbackStorage)
+          const current = isKillswitchEnabled(fallbackPreferences)
             ? notRateLimited.filter((c) =>
                 killswitchPassesPolicy(
                   quotaManager.peekFallbackForPolicy(
                     c.quotaAccountId,
                     c.accountId,
                   )?.quota,
-                  resolved(fallbackStorage),
+                  fallbackPreferences,
                   c.quotaAccountId,
                   Date.now(),
                 ),
@@ -4894,6 +4895,9 @@ export async function CodexAuthPlugin(
               authority !== 'local'
                 ? await readAccountSettings(accountPaths)
                 : await loadRequestAccounts()
+            // Resolve preferences once per request: each resolution copies them,
+            // and one view keeps every decision below on the same settings.
+            const reqPreferences = resolved(reqStorage)
 
             // Vault mode (this host is enrolled with the Claustrum vault):
             // only the vault's accounts serve. OpenCode's slot, the pool rows
@@ -5053,7 +5057,7 @@ export async function CodexAuthPlugin(
               currentMainIdentity = mainAccountIdentity
             }
             const mode: RoutingMode =
-              resolved(reqStorage).routing?.mode ?? 'main-first'
+              reqPreferences.routing?.mode ?? 'main-first'
             // One shared sidebar snapshot per request: admission decisions for
             // main and the fallbacks must all judge the same snapshot. It comes
             // from the cache and never waits on the sidebar lock.
@@ -5193,10 +5197,7 @@ export async function CodexAuthPlugin(
 
                 if (
                   stickyCandidate.fallback &&
-                  !shouldFallbackStatus(
-                    stickyResponse.status,
-                    resolved(reqStorage),
-                  )
+                  !shouldFallbackStatus(stickyResponse.status, reqPreferences)
                 ) {
                   // See the fallback-first path above: telemetry only, never
                   // awaited on the request path.
@@ -5222,10 +5223,10 @@ export async function CodexAuthPlugin(
               mainAccountIdentity,
             )
             const killswitchBlocksMain =
-              isKillswitchEnabled(resolved(reqStorage)) &&
+              isKillswitchEnabled(reqPreferences) &&
               !killswitchPassesPolicy(
                 killswitchMainQuota(mainAccountIdentity),
-                resolved(reqStorage),
+                reqPreferences,
                 undefined,
                 Date.now(),
               )
@@ -5364,7 +5365,7 @@ export async function CodexAuthPlugin(
             if (
               !servedFallback &&
               !fallbacksAlreadyTried &&
-              shouldFallbackStatus(response.status, resolved(reqStorage))
+              shouldFallbackStatus(response.status, reqPreferences)
             ) {
               logA.debug('reactive fallback triggered', {
                 pid: process.pid,
