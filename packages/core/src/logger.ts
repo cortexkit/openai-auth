@@ -54,7 +54,8 @@ export type InitLoggerOptions = Pick<CommonInitLoggerOptions, 'file' | 'level'>
 /**
  * Point the logger at a host's file and level. Idempotent: calling it again
  * replaces both, and a runtime level from `setLogLevel` still outranks the
- * floor. The identity keys above are always added to the shared redaction.
+ * floor. Use setLogLevel(undefined) to clear that runtime override and return
+ * to the host's floor. The identity keys above are always added to redaction.
  */
 export function initLogger(options: InitLoggerOptions): void {
   commonInitLogger({ ...options, extraSecretKeys: isOpenaiIdentityKey })

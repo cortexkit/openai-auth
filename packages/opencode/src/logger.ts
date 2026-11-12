@@ -20,6 +20,7 @@ import {
   flushLogs,
   initLogger,
   type Level,
+  setLogLevel,
 } from '@cortexkit/openai-auth-core/tui-support'
 
 export {
@@ -46,6 +47,19 @@ export function getLogFile(): string {
 export function getEnvLogLevel(): Level | undefined {
   const env = process.env.OPENCODE_OPENAI_AUTH_LOG_LEVEL as Level | undefined
   return env && LEVELS.includes(env) ? env : undefined
+}
+
+/**
+ * An absent saved level leaves the logger alone at startup. A later settings
+ * refresh must instead remove any saved/menu override, including one installed
+ * through setLogLevel: reinitialising the logger would leave that override set.
+ */
+export function applySettingsLogLevel(
+  level: Level | 'default',
+  phase: 'startup' | 'refresh',
+): void {
+  if (level !== 'default') setLogLevel(level)
+  else if (phase === 'refresh') setLogLevel(undefined)
 }
 
 initLogger({ file: getLogFile, level: getEnvLogLevel })
