@@ -28,7 +28,7 @@ export const FLOOR_ROOTS = {
   XDG_CACHE_HOME: join(FLOOR_DIR, 'xdg', 'cache'),
   OPENCODE_CONFIG_DIR: join(FLOOR_DIR, 'xdg', 'config', 'opencode'),
 } as const
-export { FLOOR_DIR, REAL_HOME }
+export { FLOOR_DIR }
 
 for (const [name, path] of Object.entries(FLOOR_ROOTS)) {
   mkdirSync(path, { recursive: true })
