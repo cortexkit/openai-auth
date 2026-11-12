@@ -19,7 +19,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
 import { registerCommands } from './commands.ts'
 import { RawWebSocket } from './raw-ws-node.ts'
-import { PiOpenAIRuntime } from './runtime.ts'
+import { PiOpenAIRuntime, type PiOpenAIRuntimeDeps } from './runtime.ts'
 import { preparePiSettingsStartup } from './settings-startup.ts'
 import { VAULT_PLACEHOLDER_KEY } from './vault-slot.ts'
 
@@ -162,9 +162,13 @@ export function registerPiProvider(
  * Creates the request path for one loaded extension: requests are routed
  * across Pi's own login and the account pool (see `runtime.ts`).
  */
-export function createPiOpenAIRuntime(paths?: AccountPaths): PiOpenAIRuntime {
+export function createPiOpenAIRuntime(
+  paths?: AccountPaths,
+  settings?: PiOpenAIRuntimeDeps['settings'],
+): PiOpenAIRuntime {
   return new PiOpenAIRuntime({
     ...(paths ? { paths: () => paths } : {}),
+    ...(settings ? { settings } : {}),
     streamSimple: (model, context, options) =>
       streamSimpleOpenAICodexResponses(model as CodexModel, context, options),
     createStream: createAssistantMessageEventStream,
@@ -178,7 +182,10 @@ export default async function cortexKitPiOpenAIAuth(pi: ExtensionAPI) {
     registerCommands(pi, { settingsStartup })
     return
   }
-  const runtime = createPiOpenAIRuntime(settingsStartup.paths)
+  const runtime = createPiOpenAIRuntime(
+    settingsStartup.paths,
+    settingsStartup.snapshot,
+  )
   webSocketObserver = (headers, data) =>
     runtime.observeWebSocketMessage(headers, data)
   let refresh: (() => unknown) | undefined

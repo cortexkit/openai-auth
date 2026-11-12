@@ -137,7 +137,7 @@ export type PiWaitDecision = Extract<
 export interface PiRouteContext<A extends RouteAttempt> {
   /** The routable accounts as they are now; read again after each response. */
   accounts: () => readonly RouteAccount[]
-  /** The settings this request reads (killswitch, fallback statuses). */
+  /** Resolved preferences captured for this request, not evidence of a store. */
   storage: AccountStorage | null
   mode: RoutingMode
   /** Unset uses Pi's local main; null means the vault has no default account. */
@@ -202,7 +202,7 @@ export function routablePoolRows<
   },
 >(
   rows: readonly R[],
-  storage: AccountStorage | null,
+  settings: AccountStorage | null,
   now: number,
   mainIdentity: string | undefined,
   vaultIdentities: ReadonlySet<string> = new Set(),
@@ -218,7 +218,7 @@ export function routablePoolRows<
       return false
     return quotaSnapshotPassesPolicy(
       windowsFromQuotaMap(row.quota),
-      storage,
+      settings,
       now,
     )
   })

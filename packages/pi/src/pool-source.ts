@@ -560,11 +560,11 @@ export class PiPoolSource {
    */
   refreshDueTokens(
     rows: readonly PoolRow[],
-    storage: AccountStorage | null,
+    settings: AccountStorage | null,
   ): Promise<void> {
     if (this.setAside()) return Promise.resolve()
     const now = this.now()
-    const windowMs = refreshBeforeExpiryMs(storage)
+    const windowMs = refreshBeforeExpiryMs(settings)
     const runs: Promise<void>[] = []
     for (const row of rows) {
       if (!row.candidate) continue
@@ -692,7 +692,7 @@ export class PiPoolSource {
    * pull path the first and admission polls take, and resolves once every
    * poll has ended. Due tokens are refreshed first.
    */
-  async pollRows(storage: AccountStorage | null): Promise<PoolPollResult[]> {
+  async pollRows(settings: AccountStorage | null): Promise<PoolPollResult[]> {
     if (this.setAside()) return []
     const view = await this.load()
     if (!view.active || this.disposed) return []
@@ -700,7 +700,7 @@ export class PiPoolSource {
       (row) => row.candidate && row.type === 'oauth',
     )
     if (targets.length === 0) return []
-    await this.refreshDueTokens(targets, storage)
+    await this.refreshDueTokens(targets, settings)
     for (const row of targets) {
       this.pollOutcomes.delete(row.id)
       this.requestReading(row.id, true)

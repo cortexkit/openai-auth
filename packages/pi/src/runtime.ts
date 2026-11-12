@@ -137,6 +137,8 @@ export interface PiOpenAIRuntimeDeps {
   /** Installed for the lifetime of one request; returns its uninstaller. */
   installWebSocket?: () => () => void
   paths?: () => AccountPaths
+  /** Shared with the menu when startup chose shared preferences; omitted while the account config remains authoritative. */
+  settings?: { view(store?: AccountStorage | null): AccountStorage }
   /** Used for quota polls and token refreshes; read at call time by default. */
   fetchImpl?: typeof fetch
   now?: () => number
@@ -474,6 +476,14 @@ export class PiOpenAIRuntime {
     )
   }
 
+  /** Memory only; a settings view never decides whether an account store exists. */
+  private settings(storage: AccountStorage | null): AccountStorage {
+    return (
+      this.deps.settings?.view(storage) ??
+      storage ?? { version: 1, accounts: [] }
+    )
+  }
+
   // -------------------------------------------------------------------------
   // Accounts
   // -------------------------------------------------------------------------
@@ -801,6 +811,7 @@ export class PiOpenAIRuntime {
       >
   > {
     const storage = await this.storage()
+    const settings = this.settings(storage)
     const vaultMode = (await this.readAuthority()) !== 'local'
     if (vaultMode) {
       // Vault mode: Pi's login (the key Pi hands over) and the pool are not
@@ -817,19 +828,19 @@ export class PiOpenAIRuntime {
       // Token refreshes of pool rows run in the background, so no request
       // waits on the pool store's locks; a row whose token ran out sits out
       // until its refresh lands.
-      void this.pool.refreshDueTokens(this.pool.peek().rows, storage)
+      void this.pool.refreshDueTokens(this.pool.peek().rows, settings)
     }
-    const mode: RoutingMode = storage?.routing?.mode ?? 'main-first'
+    const mode: RoutingMode = settings.routing?.mode ?? 'main-first'
     let vaultRefused = false
     let candidates = 0
     const run = () =>
       routePiRequest<StreamAttempt>({
         accounts: () => {
-          const accounts = this.accounts(storage)
+          const accounts = this.accounts(settings)
           candidates = accounts.length
           return accounts
         },
-        storage,
+        storage: settings,
         mode,
         mainId: vaultMode ? vaultMainRouteId(this.vault.routes()) : undefined,
         sessionId: options?.sessionId,
@@ -950,9 +961,9 @@ export class PiOpenAIRuntime {
     let status: number | undefined
     let signal: LimitSignal | undefined
     let reading: OAuthQuotaSnapshot | undefined
-    const account = this.accounts(this.storageCache?.storage ?? null).find(
-      (value) => value.id === accountId,
-    )
+    const account = this.accounts(
+      this.settings(this.storageCache?.storage ?? null),
+    ).find((value) => value.id === accountId)
     const accountKey = account?.accountKey
     const dispatch: SessionDispatch | undefined =
       accountKey && options?.sessionId
@@ -1108,7 +1119,7 @@ export class PiOpenAIRuntime {
             runtime.activity,
             dispatch,
             runtime
-              .accounts(runtime.storageCache?.storage ?? null)
+              .accounts(runtime.settings(runtime.storageCache?.storage ?? null))
               .find((value) => value.id === accountId)?.accountKey,
             {
               kind: 'pi',
@@ -1221,7 +1232,7 @@ export class PiOpenAIRuntime {
           }))
         const [main, rows, vaultRows] = await Promise.all([
           this.main.currentToken() ? this.main.pollNow() : undefined,
-          this.pool.pollRows(storage),
+          this.pool.pollRows(this.settings(storage)),
           this.vault.pollStale(0),
         ])
         const results: RefreshAllQuotaResults = []
