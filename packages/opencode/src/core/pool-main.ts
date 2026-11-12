@@ -15,6 +15,8 @@ import {
   refreshBackoffActive,
 } from '@cortexkit/openai-auth-core/internal'
 
+import { getResolvedSettingsView } from '../config'
+
 export {
   findPoolMainRow,
   isPoolMainPlaceholder,
@@ -52,6 +54,7 @@ export interface PoolMainAccess {
 }
 
 export interface PoolMainAccessDeps {
+  configPath?: string
   storage: AccountStorage | null | undefined
   now: () => number
   /** Refresh the row through the per-row refresh path, as the main account. */
@@ -102,7 +105,8 @@ export async function resolvePoolMainAccess(
   let account = row
   const now = deps.now()
   const refreshWindowMs =
-    (storage.refresh?.refreshBeforeExpiryMinutes ?? 240) * 60_000
+    (getResolvedSettingsView(storage, deps.configPath).refresh
+      ?.refreshBeforeExpiryMinutes ?? 240) * 60_000
   const due =
     !account.access ||
     !account.expires ||

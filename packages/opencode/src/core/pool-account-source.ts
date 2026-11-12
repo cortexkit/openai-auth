@@ -67,6 +67,7 @@ import {
   refreshBeforeExpiryMs,
   rememberPoolObservation,
 } from '@cortexkit/openai-auth-core/internal'
+import { getResolvedSettingsView } from '../config'
 import { createLogger } from '../logger'
 import { HOT_PATH_READ_BUDGET_MS, settleWithinBudget } from '../sidebar-state'
 import {
@@ -788,7 +789,9 @@ export class PoolAccountSource {
         this.deps.vaultFirstRosterWaitMs ?? VAULT_FIRST_ROSTER_WAIT_MS,
       )
     const now = this.now()
-    const windowMs = refreshBeforeExpiryMs(storage)
+    const windowMs = refreshBeforeExpiryMs(
+      getResolvedSettingsView(storage, this.deps.paths().configPath),
+    )
     const waits: Promise<void>[] = []
     for (const row of rows) {
       if (!row.candidate || this.vaultOwned(row)) continue

@@ -78,6 +78,8 @@ import {
   type VaultModeRefusal,
   type VaultRoutingRequest,
 } from '@cortexkit/openai-auth-core/internal'
+import { getSettingsDecision } from '@cortexkit/openai-auth-core/settings-decisions'
+import { getConfigPath, getResolvedSettingsView } from '../config'
 import { parseRateLimitSignal } from '../ws'
 import type { PoolAccountSource } from './pool-account-source'
 import { windowsFromQuotaMap } from './pool-quota'
@@ -220,8 +222,9 @@ export interface PoolRequestContext {
   suppressHold?: boolean
   /** The vault accounts; present exactly while this host is in vault mode. */
   vault?: PoolVaultRoutes
-  /** The legacy settings this request reads (routing, killswitch, fallback statuses). */
+  /** The account store; preferences are projected separately for shared installs. */
   storage: AccountStorage | null
+  configPath?: string
   mode: RoutingMode
   sessionId: string | undefined
   /** Separates endpoint and conversation/auxiliary retries within a session. */
@@ -689,7 +692,9 @@ export function routableRows(
   storage: AccountStorage | null,
   now: number,
   vaultIdentities: ReadonlySet<string> = new Set(),
+  configPath = getConfigPath(),
 ): PoolRow[] {
+  const settings = getResolvedSettingsView(storage, configPath)
   return rows.filter((row) => {
     if (!row.enabled || !row.candidate || row.type !== 'oauth') return false
     if (row.credential?.type !== 'oauth') return false
@@ -701,7 +706,7 @@ export function routableRows(
     if (isShieldedMainRow(storage, { accountId: row.identity })) return false
     return quotaSnapshotPassesPolicy(
       windowsFromQuotaMap(row.quota),
-      storage,
+      settings,
       now,
     )
   })
@@ -716,7 +721,13 @@ function currentTargets(ctx: PoolRequestContext): PoolTarget[] {
   const vault = ctx.vault
   const rows = vault
     ? []
-    : routableRows(ctx.source.peek().rows, ctx.storage, ctx.now())
+    : routableRows(
+        ctx.source.peek().rows,
+        ctx.storage,
+        ctx.now(),
+        undefined,
+        ctx.configPath,
+      )
   return [
     ...rows.map(
       (row): PoolTarget => ({
@@ -830,6 +841,16 @@ async function sendTo(
 export async function servePoolRequest(
   ctx: PoolRequestContext,
 ): Promise<PoolRequestResult> {
+  const configPath = ctx.configPath ?? getConfigPath()
+  const settings = getResolvedSettingsView(ctx.storage, configPath)
+  ctx = {
+    ...ctx,
+    storage: settings,
+    mode:
+      getSettingsDecision(configPath) === 'shared'
+        ? (settings.routing?.mode ?? 'main-first')
+        : ctx.mode,
+  }
   if (ctx.vault) {
     // Vault mode: no pool row is read or refreshed. Before the vault's first
     // account list there is nothing to route, so that is waited for (bounded).
