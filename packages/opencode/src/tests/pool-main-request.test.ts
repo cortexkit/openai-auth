@@ -765,6 +765,9 @@ describe('process heartbeat', () => {
       // Which file layout this process uses per config folder; the layout
       // tests (`runtime-layout.test.ts`) pin its contents.
       layouts: expect.any(Object),
+      // The settings authority this process decided; this test's config
+      // folder is not the default one, so the install is separate.
+      settings: 'separate',
     })
     const { startedAt } = JSON.parse(readFileSync(file, 'utf8'))
     expect(startedAt).toBeGreaterThanOrEqual(startedBefore)
