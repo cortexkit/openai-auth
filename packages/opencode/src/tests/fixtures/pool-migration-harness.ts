@@ -489,13 +489,18 @@ export function runChild(
     exited?.()
     closed = observer?.start('child pipes close')
   })
+  // `out` interleaves both pipes for diagnostics. Protocol lines are parsed
+  // from `stdout` alone, because a stderr chunk can land in the middle of a
+  // stdout line in `out`.
   let out = ''
+  let stdout = ''
   let stderr = ''
   let buffered = ''
   let stepIndex = 0
   child.stdout.on('data', (chunk: Buffer) => {
     const text = chunk.toString()
     out += text
+    stdout += text
     if (!observer) return
     buffered += text
     const lines = buffered.split('\n')
@@ -530,7 +535,7 @@ export function runChild(
         reached?.()
         exited?.()
         closed?.()
-        const lines = out.split('\n')
+        const lines = stdout.split('\n')
         const steps = lines
           .filter((line) => line.startsWith('step:'))
           .map((line) => line.slice('step:'.length))
