@@ -13,35 +13,85 @@ The plugin intentionally registers the built-in `openai` provider id. OpenCode l
 
 ## Settings
 
-The settings below apply to the OpenCode plugin. They come from two sources: **environment variables take precedence over the config file**, and any unset value falls back to the default.
+OpenCode 1, OpenCode 2 and Pi share preferences in `openai-auth.jsonc`, separate from their account stores. The file accepts JSON with comments and uses readable `snake_case` setting names. Settings are user-only; a project's `.cortexkit` folder cannot override them. Each host reads only the settings it supports.
 
-Config file: `~/.config/opencode/openai-auth.json`. The directory follows `OPENCODE_CONFIG_DIR`, then `XDG_CONFIG_HOME`; `OPENCODE_OPENAI_AUTH_FILE` overrides the full path. A missing, unreadable or malformed config file falls back to the environment and the defaults.
+| OS | Default shared settings file |
+| --- | --- |
+| Linux | `~/.config/cortexkit/openai-auth.jsonc` |
+| macOS | `~/.config/cortexkit/openai-auth.jsonc`, not `~/Library` |
+| Windows | `%APPDATA%\cortexkit\openai-auth.jsonc`, falling back to `%USERPROFILE%\AppData\Roaming\cortexkit\openai-auth.jsonc` |
 
-```json
+An absolute `XDG_CONFIG_HOME` overrides the base on every OS: `<XDG_CONFIG_HOME>/cortexkit/openai-auth.jsonc`. Empty or relative values do not choose the shared settings folder.
+
+| Environment variable | Purpose |
+| --- | --- |
+| `OPENCODE_OPENAI_AUTH_SETTINGS_FILE` | Opt OpenCode 1 or 2 into an explicit shared settings file. |
+| `PI_OPENAI_AUTH_SETTINGS_FILE` | Opt Pi into an explicit shared settings file. Pi does not read `OPENCODE_` variables. |
+
+Only an absolute path counts for either variable; an empty or relative value is ignored. An absolute override wins over the separate-install rule below, but is ignored with a warning if it names this install's config or state file, or either host's default config or state file. An account store cannot double as the settings file.
+
+### Separate installs
+
+Without an explicit settings-file opt-in, an install is **separate** when its resolved config file is a different file from that host's default `openai-auth.json`. OpenCode's default is `<XDG_CONFIG_HOME>/opencode/openai-auth.json` when `XDG_CONFIG_HOME` is absolute, otherwise `~/.config/opencode/openai-auth.json`, on every OS. Pi's default is `~/.pi/agent/openai-auth.json`; its resolved file is checked after Pi's agent-folder fallback described [below](#pi). Identity follows real paths, including links; a file not yet created is compared through its nearest existing parent.
+
+A state-file override alone does not make an install separate, and neither does an override naming the default config file. A genuinely different config file selected by `OPENCODE_CONFIG_DIR`, `OPENCODE_OPENAI_AUTH_FILE`, `PI_CODING_AGENT_DIR` or `PI_OPENAI_AUTH_FILE` does. A separate install never reads the shared settings file: it keeps reading and writing preferences in its old account store, and its menus keep saving there.
+
+### The one-time settings move
+
+At startup, a default install moves preferences from both hosts' default config files, OpenCode's first and Pi's second. It leaves the source stores unchanged, including their credentials and state. Preferences that differ between the two hosts are preserved as host-specific values; per-account floors retain their host tags. An explicit settings-file opt-in moves only that host's own non-default config file. An opt-in on the default config file moves nothing and reads the selected settings file, or defaults if it is missing.
+
+The move leaves a best-effort `<source>.MOVED_READPLEASE` note beside each old store, for example `openai-auth.json.MOVED_READPLEASE`. It names the target in `Settings moved to <target>.` and warns that a rollback loses changes made after the move. An older package still reads its old store, not the shared file. **Upgrade both packages together, before creating the settings file by hand, then close every OpenCode and Pi process and start them again.** An existing target counts as a completed move, however it was created; old preferences are not imported over it.
+
+The move waits for processes that could still write preferences in an old store. A process whose move is blocked or fails keeps reading and writing its old store for its whole life and retries only at the next start. Restarting processes one at a time can therefore keep the move waiting. Diagnostics explains whether settings are shared, separate, or still in the old store.
+
+If a process cannot take the lock coordinating the settings move or record that it uses the old store, and no move is complete and a source is present, the plugin refuses to start rather than write preferences invisibly to other processes. The error names the folder and cause: the records folder is `<XDG_STATE_HOME>/cortexkit/openai-auth`, or `~/.local/state/cortexkit/openai-auth` when unset. Fix the named folder or lock problem and restart. OpenCode registers no plugin hooks or menu on this refusal; Pi registers no provider, but keeps a read-only `/openai` Diagnostics view of the refusal.
+
+This coordination of running processes has limits, even with the restart step above:
+
+- A process under a different `XDG_STATE_HOME` against the same store is invisible, as is a Pi release that wrote no process record. Close those processes too before restarting on the upgraded packages.
+- An older package that is installed but not running is invisible. If it runs after the other host has moved, it still edits its old store; those edits are not imported when it is upgraded later, because the shared file already exists.
+- Two environments can classify one config file differently. A process with `OPENCODE_CONFIG_DIR` pointing at a non-default folder is separate, while another process whose `XDG_CONFIG_HOME` makes that same folder the default can move from it. After the move, the separate process and the default-install process stop sharing preferences: edits in either no longer reach the other.
+
+Other limits to keep in mind:
+
+- Two processes editing per-account floors in the same instant can lose one edit, because the floors list is replaced as a whole.
+- A floor stored above 100 moves as `100`. This changes admission only for a fully unused window. A stored negative floor moves as `0`, so it no longer enlarges the sticky router's spendable share.
+- Removing the shared file normally gives declared defaults without importing the old stores again, because a note names the target. A move that left no note naming its target, either because every note failed or because a source kept an older note for another target, can run again after the shared file is removed. A menu edit can create the shared file again.
+
+A host with no config file of its own, such as a vault-only Pi, reads the shared values after the move too, including the old store's `routing.mode` and `killswitch.enabled` preferences (now `routing_mode` and `killswitch_enabled`). For example, an OpenCode store using `sticky-balanced` with the killswitch on makes that Pi use both values instead of its previous defaults. It does not gain the other host's local per-account floors or single-store vault floor entries.
+
+If the settings file cannot be read or parsed **at start**, there is no last-good snapshot: every setting takes its declared default, so **the killswitch is off until the file is fixed**. Diagnostics names the file and its problems. An unreadable or unparseable file during a running process keeps its last-good snapshot. After a successful move, an omitted setting uses its declared default, never the old store's saved value.
+
+### OpenCode transport and diagnostics settings
+
+The settings below apply to OpenCode. Transport and dump environment variables take precedence over the resolved file values; unset values use the defaults. The shared file uses the names below; the legacy config fields apply only to separate installs or processes still using an old store. That legacy config file is `~/.config/opencode/openai-auth.json`; its directory follows `OPENCODE_CONFIG_DIR`, then `XDG_CONFIG_HOME`, and `OPENCODE_OPENAI_AUTH_FILE` overrides the full path.
+
+```jsonc
 {
-  "webSockets": false,
-  "rawWebSocket": false,
-  "responsesLite": false,
-  "dump": false,
-  "codexApiEndpoint": "https://chatgpt.com/backend-api/codex/responses"
+  "schema_version": 1,
+  "web_sockets": false,
+  "raw_web_socket": false,
+  "responses_lite": false,
+  "request_dumps": false,
+  "codex_api_endpoint": "https://chatgpt.com/backend-api/codex/responses"
 }
 ```
 
-| Setting | Config field | Environment variable | Default | Purpose |
-| --- | --- | --- | --- | --- |
-| WebSocket transport | `webSockets` | `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS` | `false` | Use the Codex Responses WebSocket transport instead of plain HTTP. See [Transports](transports.md). |
-| Hand-rolled WebSocket client | `rawWebSocket` | `CORTEXKIT_OPENAI_AUTH_RAW_WS` | `false` | When WebSockets are enabled, use the hand-rolled raw TCP/TLS client that surfaces Codex-style incremental streaming. Bun uses `Bun.connect`; Node and OpenCode Desktop use `node:net`/`node:tls`. |
-| Responses Lite | `responsesLite` | `CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE` | `false` | Send requests for the models Codex marks for Responses Lite (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6.1-sol` and `gpt-6.1-terra`) in Codex's Responses Lite shape, the wire format the Codex CLI itself uses for these models. |
-| Request dumps | `dump` | `CORTEXKIT_OPENAI_AUTH_DUMP` | `false` | Write final Codex request bodies and redacted request metadata for cache debugging. Bodies may contain prompt and session content. The config field also accepts `{ "enabled": true }`, the form the plugin's [`/openai` slash-command menu](commands.md#the-openai-command) saves. See [Troubleshooting](troubleshooting.md#request-dumps). |
-| Dump directory | `dumpDir` | `OPENCODE_OPENAI_AUTH_DUMP_DIR` | OS temp dir: `opencode-openai-auth-dumps` | Destination for `.body.json`, `.meta.json` and `.request.json` dump files. |
-| Dump retention cap | `dumpMaxBytes` | `OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES` | `536870912` (512 MiB) | Retain this many dump-artifact bytes, evicting whole dumps oldest first. `0` disables the cap. Applies to both OpenCode 1 and 2. |
-| Codex endpoint | `codexApiEndpoint` | `CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT` | `https://chatgpt.com/backend-api/codex/responses` | Send rewritten Codex requests to a compatible proxy or relay instead of ChatGPT's backend endpoint. |
+| Setting | Shared setting | Legacy config field | Environment variable | Default | Purpose |
+| --- | --- | --- | --- | --- | --- |
+| WebSocket transport | `web_sockets` | `webSockets` | `CORTEXKIT_OPENAI_AUTH_WEBSOCKETS` | `false` | Use the Codex Responses WebSocket transport instead of plain HTTP. See [Transports](transports.md). |
+| Hand-rolled WebSocket client | `raw_web_socket` | `rawWebSocket` | `CORTEXKIT_OPENAI_AUTH_RAW_WS` | `false` | When WebSockets are enabled, use the hand-rolled raw TCP/TLS client that surfaces Codex-style incremental streaming. Bun uses `Bun.connect`; Node and OpenCode Desktop use `node:net`/`node:tls`. |
+| Responses Lite | `responses_lite` | `responsesLite` | `CORTEXKIT_OPENAI_AUTH_RESPONSES_LITE` | `false` | Send requests for the models Codex marks for Responses Lite (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-6.1-sol` and `gpt-6.1-terra`) in Codex's Responses Lite shape, the wire format the Codex CLI itself uses for these models. |
+| Request dumps | `request_dumps` | `dump` | `CORTEXKIT_OPENAI_AUTH_DUMP` | `false` | Write final Codex request bodies and redacted request metadata for cache debugging. Bodies may contain prompt and session content. The legacy field also accepts `{ "enabled": true }`, the form the old-store [`/openai` slash-command menu](commands.md#the-openai-command) saves. See [Troubleshooting](troubleshooting.md#request-dumps). |
+| Dump directory | `dump_dir` | `dumpDir` | `OPENCODE_OPENAI_AUTH_DUMP_DIR` | `""` (OS temp dir: `opencode-openai-auth-dumps`) | Destination for `.body.json`, `.meta.json` and `.request.json` dump files. |
+| Dump retention cap | `dump_max_bytes` | `dumpMaxBytes` | `OPENCODE_OPENAI_AUTH_DUMP_MAX_BYTES` | `536870912` (512 MiB) | Retain this many dump-artifact bytes, evicting whole dumps oldest first. `0` disables the cap. Applies to both OpenCode 1 and 2. |
+| Codex endpoint | `codex_api_endpoint` | `codexApiEndpoint` | `CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT` | `https://chatgpt.com/backend-api/codex/responses` | Send rewritten Codex requests to a compatible proxy or relay instead of ChatGPT's backend endpoint. |
 
 On both OpenCode versions, `gpt-6.1-terra` inherits missing reasoning variants from the host's `gpt-6.1-sol` model. This makes variants such as `xhigh` available even when the host's Terra catalog entry is incomplete; Terra's existing variant definitions and custom overrides take precedence.
 
-Booleans accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty, in any case. Any other value is ignored, and the config file or the default decides.
+Boolean environment variables accept `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`/empty, in any case. Any other value is ignored, and the resolved file value or the default decides. In the shared file, use JSON booleans `true` or `false`.
 
-`dumpMaxBytes` accepts a nonnegative safe integer in bytes (a JSON number in the config file). An invalid value, including an empty environment variable, negative number, fraction, or unit suffix such as `512MiB`, falls back to 512 MiB and logs one warning per process. An explicitly set environment variable takes precedence even when invalid. `0` means **unlimited**, not zero retained bytes; use it only if you manage cleanup yourself.
+`dump_max_bytes` (legacy `dumpMaxBytes`) accepts a nonnegative safe integer in bytes (a JSON number in the file). An invalid value, including an empty environment variable, negative number, fraction, or unit suffix such as `512MiB`, falls back to 512 MiB and logs one warning per process. An explicitly set environment variable takes precedence even when invalid. `0` means **unlimited**, not zero retained bytes; use it only if you manage cleanup yourself.
 
 Both OpenCode versions use the same directory and retention settings. The default directory is `opencode-openai-auth-dumps` inside Node's OS temporary directory:
 
@@ -51,11 +101,15 @@ Both OpenCode versions use the same directory and retention settings. The defaul
 | macOS | `$TMPDIR/opencode-openai-auth-dumps`, normally `/var/folders/<user-specific directories>/T/opencode-openai-auth-dumps` |
 | Windows | `%TEMP%\opencode-openai-auth-dumps`, normally `%USERPROFILE%\AppData\Local\Temp\opencode-openai-auth-dumps` |
 
-OS temporary-directory environment overrides can change these locations; `dumpDir` / `OPENCODE_OPENAI_AUTH_DUMP_DIR` selects an explicit destination on every OS. Retention is best-effort background cleanup after successful writes, at most once every five minutes. Dumps younger than one minute and the just-written dump are protected, so usage can exceed the cap (including for a single oversized request). Another eligible successful write must trigger a sweep to reclaim excess bytes; while idle, the excess can persist. Only recognized dump artifacts are evicted; unrelated files and symlinks are left alone. The Diagnostics section of `/openai` shows a read-only size snapshot and the cap while dumps are on. It counts top-level regular files without reading their contents or traversing subdirectories, only when the menu is built, not on requests.
+OS temporary-directory environment overrides can change these locations; `dump_dir` (legacy `dumpDir`) / `OPENCODE_OPENAI_AUTH_DUMP_DIR` selects an explicit destination on every OS. Retention is best-effort background cleanup after successful writes, at most once every five minutes. Dumps younger than one minute and the just-written dump are protected, so usage can exceed the cap (including for a single oversized request). Another eligible successful write must trigger a sweep to reclaim excess bytes; while idle, the excess can persist. Only recognized dump artifacts are evicted; unrelated files and symlinks are left alone. The Diagnostics section of `/openai` shows a read-only size snapshot and the cap while dumps are on. It counts top-level regular files without reading their contents or traversing subdirectories, only when the menu is built, not on requests.
 
 The `webSearch` setting and `CORTEXKIT_OPENAI_AUTH_NO_WEB_SEARCH` have been removed, along with the `web_search` tool the plugin used to add to requests; a config file that still sets `webSearch` loads normally and the key is ignored.
 
-The Routing menu saves `routing.maxSameAccountWait`: `0` (**Don't wait**), `15` (**15 minutes**, default) or `"max"` (**Until the cache expires**). Invalid or absent values use `15`; numeric strings are not accepted. A same-account hold requires confirmed exhaustion with every reset fitting the accepted session's cache lifetime. The killswitch takes precedence: with a positive floor on an exhausted window (including the default 5%/10% floors), the account is not admitted and cannot hold or wake on that account. Disable the killswitch or set that window's floor to zero to allow a cache-preserving hold. See [Routing](accounts-and-routing.md#routing).
+### Routing wait and log level
+
+The shared `max_same_account_wait` takes `"off"` (**Don't wait**), `"15m"` (**15 minutes**, default) or `"cache"` (**Until the cache expires**). The move and Routing menu map these to and from the old store's `routing.maxSameAccountWait` values `0`, `15` and `"max"`. Invalid or absent values use the default; numeric strings are not accepted. A same-account hold requires confirmed exhaustion with every reset fitting the accepted session's cache lifetime. The killswitch takes precedence: with a positive floor on an exhausted window (including the default 5%/10% floors), the account is not admitted and cannot hold or wake on that account. Disable the killswitch or set that window's floor to zero to allow a cache-preserving hold. See [Routing](accounts-and-routing.md#routing).
+
+On OpenCode, `log_level` accepts `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"` or `"default"` (the default). `"default"`, or removing the setting, uses `OPENCODE_OPENAI_AUTH_LOG_LEVEL`, else `info`. A saved level other than `"default"` overrides that environment variable. The log level follows the shared file while the process runs: an external edit is applied when the settings watch sees it, normally within its one-second poll period plus reload time. A menu edit takes effect immediately in the editing process. A process still using its old store keeps its previous log-level timing.
 
 ### Other environment variables
 
@@ -70,12 +124,12 @@ The Routing menu saves `routing.maxSameAccountWait`: `0` (**Don't wait**), `15` 
 
 ### Examples
 
-Opt into the WebSocket transport with the config file:
+Opt into the WebSocket transport with the shared settings file (use the legacy fields in the table for a separate install):
 
 ```json
 {
-  "webSockets": true,
-  "rawWebSocket": true
+  "web_sockets": true,
+  "raw_web_socket": true
 }
 ```
 
@@ -87,11 +141,11 @@ CORTEXKIT_OPENAI_AUTH_CODEX_ENDPOINT=http://127.0.0.1:8899/v1/responses opencode
 
 ## The account store
 
-The account store combines `openai-auth.json` with its companion state file (`openai-auth-state.json` by default; see `OPENCODE_OPENAI_AUTH_STATE_FILE` above). Together they hold accounts, routing, [killswitch quota floors](accounts-and-routing.md#killswitch), quota cache, log level and cache keep-warm state. Change these through `/openai` rather than by hand: account operations preserve transport settings, and a settings-only file is never overwritten with account data. See [Accounts and routing](accounts-and-routing.md#the-account-pool).
+The account store combines `openai-auth.json` with its companion state file (`openai-auth-state.json` by default; see `OPENCODE_OPENAI_AUTH_STATE_FILE` above). It keeps accounts, credentials, quota cache and runtime state. After the settings move, preferences such as routing, [killswitch quota floors](accounts-and-routing.md#killswitch), log level and cache keep-warm settings come only from the shared file; old preference keys remain in the store but are no longer used or updated. Separate installs and processes waiting for the move still use their old store for preferences. The main account's refresh lease and backoff are state, not preferences, and remain in `openai-auth.json`. Use `/openai` to manage accounts and settings; a shared settings file is never overwritten with account data. See [Accounts and routing](accounts-and-routing.md#the-account-pool).
 
 ## Where the files live
 
-The settings file `openai-auth.json` stays in OpenCode's config folder, where you edit it. The files the plugin rewrites while it runs are kept in its state folder, out of OpenCode's config folder, because OpenCode 2 watches that folder for changes. Those files are:
+OpenCode's account config file `openai-auth.json` stays in its config folder; the shared preferences are in `openai-auth.jsonc` at the path [above](#settings). The runtime files below are kept in the state folder, out of OpenCode's config folder, because OpenCode 2 watches that folder for changes:
 
 - the account state file `openai-auth-state.json`, which holds the OAuth tokens;
 - the vault folder `openai-auth-vault/`, which holds the enrollment token, the enrollment state and the vault roster;
@@ -140,7 +194,7 @@ Close every OpenCode process before switching versions or moving credentials. Do
 
 ## Pi
 
-The settings above are the OpenCode plugin's; the Pi extension does not read them. Its account store is `openai-auth.json` in Pi's agent directory (`~/.pi/agent` unless `PI_CODING_AGENT_DIR` says otherwise, with `~` expanded by Pi); `PI_OPENAI_AUTH_FILE` overrides the store's path and `PI_OPENAI_AUTH_STATE_FILE` the state file's path. `PI_AGENT_DIR` is not used. If only `~/.pi/agent` has an existing store (settings, account state, or a vault enrollment token/state file), the extension keeps using it there and logs a warning to stderr once per process. A cached vault roster alone does not count as an enrollment. If the configured directory already has a store, it wins; if neither has one, the configured directory is used. Credentials are never copied or moved between directories.
+Pi reads its supported preferences from the same shared settings file as OpenCode, unless it is a separate install or its process is still waiting for the settings move. The OpenCode transport and diagnostics settings do not enable those features on Pi. Pi's account store is `openai-auth.json` in its agent directory (`~/.pi/agent` unless `PI_CODING_AGENT_DIR` says otherwise, with `~` expanded by Pi); `PI_OPENAI_AUTH_FILE` overrides the store's path and `PI_OPENAI_AUTH_STATE_FILE` the state file's path. `PI_AGENT_DIR` is not used. If only `~/.pi/agent` has an existing store (settings, account state, or a vault enrollment token/state file), the extension keeps using it there and logs a warning to stderr once per process. A cached vault roster alone does not count as an enrollment. If the configured directory already has a store, it wins; if neither has one, the configured directory is used. Credentials are never copied or moved between directories.
 
 The Pi provider catalog includes `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini` and `gpt-5.3-codex-spark`.
 
