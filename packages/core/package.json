@@ -24,16 +24,20 @@
     "./pool-routing": {
       "types": "./src/pool-routing.ts",
       "import": "./src/pool-routing.ts"
+    },
+    "./settings*": {
+      "types": "./src/settings*.ts",
+      "import": "./src/settings*.ts"
     }
   },
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && cp openai-auth.schema.json dist/openai-auth.schema.json",
     "test": "bun test src/tests",
     "typecheck": "tsc",
     "types": "tsc"
   },
   "devDependencies": {
     "@cortexkit/claustrum-client": "^0.18.0",
-    "@cortexkit/common-auth": "^0.44.0"
+    "@cortexkit/common-auth": "^0.45.0"
   }
 }

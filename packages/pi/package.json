@@ -30,7 +30,7 @@
     ]
   },
   "scripts": {
-    "build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --external '@earendil-works/pi-ai' --external '@earendil-works/pi-ai/*' --external '@earendil-works/pi-coding-agent' --external '@earendil-works/pi-coding-agent/*' --external '@earendil-works/pi-tui' --external '@earendil-works/pi-tui/*' --external @cortexkit/private-files --external @cortexkit/claustrum-client --external @cortexkit/subc-client --minify && bun run build:types",
+    "build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --external '@earendil-works/pi-ai' --external '@earendil-works/pi-ai/*' --external '@earendil-works/pi-coding-agent' --external '@earendil-works/pi-coding-agent/*' --external '@earendil-works/pi-tui' --external '@earendil-works/pi-tui/*' --external @cortexkit/private-files --external @cortexkit/claustrum-client --external @cortexkit/subc-client --minify && bun run build:types && cp ../core/openai-auth.schema.json dist/openai-auth.schema.json",
     "build:types": "cd ../core && bun run build && cd ../pi && tsdown --config tsdown.config.ts --config-loader native",
     "test": "bun test src/tests",
     "typecheck": "tsc",
@@ -38,7 +38,7 @@
     "prepublishOnly": "bun run build"
   },
   "devDependencies": {
-    "@cortexkit/common-auth": "^0.44.0",
+    "@cortexkit/common-auth": "^0.45.0",
     "@cortexkit/openai-auth-core": "workspace:*"
   },
   "dependencies": {
