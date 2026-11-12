@@ -29,7 +29,7 @@
     },
     "packages/opencode": {
       "name": "@cortexkit/opencode-openai-auth",
-      "version": "1.13.0",
+      "version": "1.15.0",
       "bin": {
         "opencode-openai-auth": "./dist/bin.js",
       },
@@ -60,11 +60,12 @@
     },
     "packages/pi": {
       "name": "@cortexkit/pi-openai-auth",
-      "version": "1.13.0",
+      "version": "1.15.0",
       "dependencies": {
         "@cortexkit/claustrum-client": "^0.18.0",
         "@cortexkit/private-files": "^0.2.2",
         "@cortexkit/subc-client": "^0.24.0",
+        "jsonc-parser": "^3.3.1",
       },
       "devDependencies": {
         "@cortexkit/common-auth": "^0.45.0",
