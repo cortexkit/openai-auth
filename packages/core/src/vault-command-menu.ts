@@ -211,6 +211,7 @@ export function createVaultCommandMenu(
       accounts: options.accounts,
       quota: options.quota,
       limits: options.limits,
+      ...(options.settings ? { settings: options.settings } : {}),
       routing: {
         ...options.routing,
         formerMainId: mainId ?? '',

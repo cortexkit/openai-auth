@@ -9,13 +9,13 @@
  * The menu works on the account pool, so it needs a migrated install. Until
  * then `/openai` shows only why (`migrationNoticeMenu`).
  *
- * Every settings write the menu makes goes through the pool store's
- * `updateSettings`. On the way, `withSettingsMigration` moves settings this
- * plugin wrote under an older name or meaning into the shared vocabulary.
+ * Shared installs supply a settings port; other installs write through the
+ * pool store's `updateSettings`, migrating older names and meanings on the way.
  */
 import { VAULT_HOST_STATUS } from '@cortexkit/common-auth/claustrum'
 import {
   type AccountsSectionOptions,
+  type BuiltinSettingsPort,
   type CommandApplyRequest,
   type CommandApplyResult,
   type CommandDialogPayload,
@@ -59,6 +59,7 @@ import {
   runResetCreditRedemption,
   selectCreditToSpend,
 } from './reset-credits'
+import { getSettingsDecision } from './settings-decisions'
 import { isRecord } from './util/record.ts'
 import {
   type OpenAiVault,
@@ -275,7 +276,11 @@ async function rosterIdsOf(store: PoolStore): Promise<string[]> {
  * gets no entry of its own from the migration, and is judged by the block's
  * `defaults` instead.
  */
-export function withSettingsMigration(store: PoolStore): PoolStore {
+export function withSettingsMigration(
+  store: PoolStore,
+  configPath?: string,
+): PoolStore {
+  if (configPath && getSettingsDecision(configPath) === 'shared') return store
   const readSettings: PoolStore['readSettings'] = async () => {
     const read = await store.readSettings()
     if (read.status === 'error') return read
@@ -432,10 +437,11 @@ const POOL_OWNED = ['version', 'accounts', 'commonAuthPool'] as const
 export function settingsMutateAccounts(
   store: PoolStore,
   extraLocks: readonly PoolLockSpec[] | undefined,
+  configPath?: string,
 ): typeof defaultMutateAccounts {
   return async (mutate) => {
     let view: AccountStorage | undefined
-    await withSettingsMigration(store).updateSettings(
+    await withSettingsMigration(store, configPath).updateSettings(
       (settings) => {
         const current = {
           ...settings,
@@ -1060,6 +1066,10 @@ export function resetCreditsSection(
 
 export interface OpenAiMenuOptions {
   store: PoolStore
+  /** The instance's config identity, used to skip old-store migration after a move. */
+  configPath?: string
+  /** Shared-file preferences for the built-in Routing and Limits sections. */
+  settings?: BuiltinSettingsPort
   vault?: MenuVault
   /** Display the normal actions, but refuse all applies before running one. */
   readOnly?: boolean
@@ -1129,8 +1139,10 @@ export function createOpenAiMenu(options: OpenAiMenuOptions): CommandMenu {
         withAccountRules(options.store, {
           ...(options.rowLocks ? { rowLocks: options.rowLocks } : {}),
         }),
+        options.configPath,
       ),
     ),
+    ...(options.settings ? { settings: options.settings } : {}),
     ...(options.extraLocks ? { extraLocks: options.extraLocks } : {}),
     accounts: {
       ...(options.login
