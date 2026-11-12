@@ -1,5 +1,8 @@
 import { openSettings } from '@cortexkit/common-auth/settings'
-import type { AccountPaths } from '@cortexkit/openai-auth-core/internal'
+import {
+  type AccountPaths,
+  createLogger,
+} from '@cortexkit/openai-auth-core/internal'
 import {
   decideSettingsAuthority,
   type SettingsAuthorityResult,
@@ -36,7 +39,9 @@ export async function preparePiSettingsStartup(
   } = {},
 ): Promise<PiSettingsStartup> {
   const paths = options.paths ?? getPiAccountPaths()
-  const log = options.log ?? console
+  // The settings handle keeps this logger for watch-time warnings, which arrive
+  // while Pi's screen is drawn, so they go to the plugin log, not the terminal.
+  const log = options.log ?? createLogger('settings')
   const install = resolveSettingsInstall({ host: 'pi', paths, logger: log })
   let authority: SettingsAuthorityResult
   try {
