@@ -9,6 +9,7 @@ import {
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
+import { resolveDefaultSettingsStores } from '@cortexkit/openai-auth-core/settings-install'
 import { getConfigDir } from '../config'
 import {
   assertFloorSidebarLocal,
@@ -45,6 +46,22 @@ describe('test environment floor', () => {
       expect(isUnder(dir, join(homedir(), '.config'))).toBe(false)
     } finally {
       restoreEnv('OPENCODE_CONFIG_DIR')
+    }
+  })
+
+  it('homedir() follows the floored HOME, and both default settings stores stay under the floor', () => {
+    // Settings startup finds Pi's default store at <home>/.pi/agent. Before
+    // homedir() followed HOME, a test run wrote the operator's real Pi folder.
+    const floorDir = resolve(FLOOR_ROOTS.OPENCODE_CONFIG_DIR, '..', '..', '..')
+    expect(isUnder(homedir(), floorDir)).toBe(true)
+    unsetEnv('XDG_STATE_HOME')
+    try {
+      for (const store of resolveDefaultSettingsStores()) {
+        expect(isUnder(store.configPath, floorDir)).toBe(true)
+        expect(isUnder(store.statePath, floorDir)).toBe(true)
+      }
+    } finally {
+      restoreEnv('XDG_STATE_HOME')
     }
   })
 

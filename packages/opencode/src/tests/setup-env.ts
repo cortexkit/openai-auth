@@ -22,10 +22,12 @@ import { afterEach } from 'bun:test'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { isAbsolute, join, resolve, sep } from 'node:path'
+import { followHomeEnvironment } from './home-floor'
 
 // Captured before HOME is floored below, so the live-default checks compare
 // against the operator's real home rather than the floor.
 const REAL_HOME = homedir()
+followHomeEnvironment(REAL_HOME)
 
 // One unique temp dir per test process — survives the full suite run.
 const FLOOR_DIR = mkdtempSync(join(tmpdir(), 'openai-auth-test-floor-'))
@@ -73,10 +75,11 @@ if (!process.env.CLAUSTRUM_SUBC_CONNECTION) {
 // even when the shell already sets them: an inherited XDG_CONFIG_HOME is
 // exactly the live directory this preload exists to keep tests out of.
 //
-// Bun's os.homedir() caches the home directory at startup and ignores a later
-// HOME change, so flooring HOME only redirects code that reads process.env.HOME
-// directly (the Claustrum client does). Plugin code resolves through the XDG
-// and OPENCODE_* variables, which are read at call time.
+// HOME is floored too. Bun's os.homedir() would keep returning the real home
+// after that, so followHomeEnvironment (above) makes it read HOME at call time,
+// as Node does. Without it, code that derives a default from the home folder
+// (Pi's default store at ~/.pi/agent, the ~/.local/state fallback) reached the
+// operator's real files.
 export const FLOOR_ROOTS = {
   HOME: join(FLOOR_DIR, 'home'),
   XDG_CONFIG_HOME: join(FLOOR_DIR, 'xdg', 'config'),

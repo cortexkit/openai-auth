@@ -1,0 +1,4 @@
+[test]
+# Tests run from each package folder, where the package's bunfig.toml loads its
+# test preload. This root file exists only to refuse a run from here.
+preload = ["./scripts/test-from-package.ts"]
