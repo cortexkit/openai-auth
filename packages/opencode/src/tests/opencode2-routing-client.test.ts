@@ -1,9 +1,10 @@
-import { afterEach, expect, spyOn, test } from 'bun:test'
+import { afterEach, expect, mock, spyOn, test } from 'bun:test'
 import type { ClaustrumScopedAttempt } from '@cortexkit/common-auth/claustrum'
 import {
   type Attempt,
   type ChooseAccountInput,
   installOpenCode2Auth,
+  OpenCode2AuthError,
   placeholderSecret,
 } from '@cortexkit/common-auth/opencode2'
 import type { QuotaMap } from '@cortexkit/common-auth/quota'
@@ -70,7 +71,7 @@ function fixture(
     usableToken: () => 'local-token',
     refreshBackoffFor: () => new Map(),
     requestReading: () => {},
-    recordSnapshot: () => {},
+    recordSnapshot: mock(() => {}),
   }
   const routes = ['a', 'b'].map((id) => ({
     id: `vault:${id}`,
@@ -127,10 +128,68 @@ function fixture(
     kind: 'primary',
     phase: 'request',
   }
-  return { openai, pins, storage, routes, refused, authorized, request }
+  return { openai, pins, storage, routes, refused, authorized, request, source }
 }
 
 for (const mode of ['ordered', 'sticky-balanced'] as const) {
+  for (const code of [
+    'account_limit_exhausted',
+    'account_selection_refused',
+    'account_selection_final',
+  ]) {
+    test(`OpenCode 2 routing refusal ${code} stops ${mode} before dispatch`, async () => {
+      const accountFor = mock(async () => ({
+        refused: {
+          code,
+          message: 'private account-429 at capacity; retry in 500 seconds',
+          routing_code: 'private-account-429',
+          retry_after_secs: 500,
+        },
+      }))
+      Reflect.set(globalThis, key, () => ({ accountFor }))
+      const env = fixture(true, mode)
+      const before = structuredClone(env.storage)
+      const host = fakeOpenCode2Host()
+      const installation = await installOpenCode2Auth(
+        host.ctx,
+        env.openai.adapter,
+      )
+      env.openai.attach(installation)
+      const providerFetch = mock(async () => new Response('ok'))
+      const draftScope = scope(env.request.sessionID, 'primary')
+      const headers = { authorization: `Bearer ${placeholderSecret('openai')}` }
+      try {
+        const error = await host
+          .fire('model.request', { ...draftScope, headers })
+          .then(() =>
+            host.fire('http.request', {
+              ...draftScope,
+              request: new Request('https://codex.test/responses', { headers }),
+            }),
+          )
+          .then(providerFetch)
+          .then(
+            () => undefined,
+            (error: unknown) => error,
+          )
+        expect(error).toBeInstanceOf(OpenCode2AuthError)
+        expect((error as Error).message).toBe(
+          'Thalamus routing declined this request, so it was not sent.',
+        )
+        expect(accountFor).toHaveBeenCalledTimes(1)
+        expect(providerFetch).not.toHaveBeenCalled()
+        expect(env.authorized).toEqual([])
+        expect(env.source.recordSnapshot).not.toHaveBeenCalled()
+        expect(env.storage).toEqual(before)
+        expect(env.pins.placementSnapshot().size).toBe(0)
+        expect(env.openai.activeAccount(env.request.sessionID)).toBeUndefined()
+      } finally {
+        await installation.dispose()
+        env.openai.dispose()
+      }
+    })
+  }
+
   test(`OpenCode 2 uses eligible fleet advice for a fresh ${mode} choice`, async () => {
     let asks = 0
     Reflect.set(globalThis, key, () => ({

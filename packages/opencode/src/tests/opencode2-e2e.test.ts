@@ -251,6 +251,7 @@ async function runCli(
 }
 
 interface ScenarioResult {
+  readonly routingAsks: Array<Record<string, unknown>>
   readonly billingReports: Array<Record<string, unknown>>
   readonly httpStreams: MockCodex['httpStreams']
   readonly destinations: string[]
@@ -314,6 +315,8 @@ async function runScenario(input: {
   hostedVault?: boolean
   /** Install a stand-in Thalamus routing accessor in the host process to capture billing reports. */
   billing?: boolean
+  /** Refuse primary requests through a stand-in Thalamus accessor. */
+  routingRefusal?: boolean
   /** Stream HTTP events separately; optionally abort the session before its terminal event. */
   httpStream?: { terminalDelayMs: number; abortBeforeTerminal?: boolean }
   /**
@@ -346,6 +349,8 @@ async function runScenario(input: {
   }
   const configDir = join(isolated.XDG_CONFIG_HOME, 'opencode')
   if (input.billing) env.OPENAI_AUTH_E2E_BILLING = join(root, 'billing.jsonl')
+  if (input.routingRefusal)
+    env.OPENAI_AUTH_E2E_ROUTING_REFUSAL = join(root, 'routing-refusal.jsonl')
   // The pool is seeded where versions before the move kept it; the plugin
   // moves its runtime files into the state home at its first start.
   seedPool(configDir, input.accounts, input.mode)
@@ -612,6 +617,13 @@ async function runScenario(input: {
           .split('\n')
           .map((line) => JSON.parse(line))
       : []
+  const routingAsks =
+    input.routingRefusal && existsSync(env.OPENAI_AUTH_E2E_ROUTING_REFUSAL!)
+      ? readFileSync(env.OPENAI_AUTH_E2E_ROUTING_REFUSAL!, 'utf8')
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line))
+      : []
   const diagnostics = [
     `exported credential: ${exported}`,
     `destinations: ${JSON.stringify(destinations)}`,
@@ -621,6 +633,7 @@ async function runScenario(input: {
     `samples: ${JSON.stringify(mock.samples)}`,
     `stdout: ${JSON.stringify(stdout)}`,
     `retries: ${JSON.stringify(retries)}`,
+    `routing asks: ${JSON.stringify(routingAsks)}`,
     ...clientLog,
     `--- plugin log (tail) ---\n${pluginLog.slice(-6000)}`,
     `--- host log (tail) ---\n${serverLog.join('').slice(-6000)}`,
@@ -643,6 +656,7 @@ async function runScenario(input: {
     ).layouts ?? {}
   rmSync(root, { recursive: true, force: true })
   return {
+    routingAsks,
     billingReports,
     httpStreams: mock.httpStreams,
     destinations,
@@ -780,6 +794,31 @@ describe('limit host readiness', () => {
 })
 
 describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
+  test('a Thalamus routing refusal is asked once and sends nothing for one user turn', async () => {
+    const result = await runScenario({
+      transport: 'http',
+      accounts: [],
+      turns: [{}],
+      vault: true,
+      plugin: vaultPlugin,
+      routingRefusal: true,
+    })
+    try {
+      expect(result.routingAsks).toHaveLength(1)
+      expect(result.routingAsks[0]?.refusals).toBe(true)
+      // Title generation is a separate auxiliary request and never asks routing.
+      expect(primaries(result.wire)).toEqual([])
+      expect(result.samples).toEqual([])
+      expect(result.vaultReports).toEqual([])
+      expect(result.stdout.join('')).toContain(
+        'Thalamus routing declined this request, so it was not sent.',
+      )
+      expect(result.retries).toEqual([])
+    } catch (error) {
+      throw new Error(`${String(error)}\n${result.diagnostics}`)
+    }
+  }, 240_000)
+
   const acceptance = (
     options: Omit<
       Parameters<typeof runLimitAcceptance>[0],
@@ -1184,6 +1223,12 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         `import { createOpenAIAuthPlugin } from '${PACKAGE_NAME}/server'`,
         `import { ClaustrumClient } from '@cortexkit/claustrum-client'`,
         `import { appendFileSync } from 'node:fs'`,
+        `if (process.env.OPENAI_AUTH_E2E_ROUTING_REFUSAL) {`,
+        `  globalThis[Symbol.for('cortexkit.routing')] = () => ({ async accountFor(request) {`,
+        `    appendFileSync(process.env.OPENAI_AUTH_E2E_ROUTING_REFUSAL, JSON.stringify(request) + '\\n')`,
+        `    return { refused: { code: 'account_selection_final', retry_after_secs: 500, routing_code: 'private-account-429' } }`,
+        `  } })`,
+        `}`,
         `if (process.env.OPENAI_AUTH_E2E_BILLING) {`,
         `  globalThis[Symbol.for('cortexkit.routing')] = () => ({ report(payload) {`,
         `    if (payload.kind === 'billing') appendFileSync(process.env.OPENAI_AUTH_E2E_BILLING, JSON.stringify({...payload, reportedAt: Date.now()}) + '\\n')`,
@@ -1197,7 +1242,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         `  }`,
         `}`,
         'const mock = process.env.OPENAI_AUTH_E2E_MOCK_URL',
-        'export default createOpenAIAuthPlugin({',
+        'const configured = createOpenAIAuthPlugin({',
         '  fetch: (input, init) => fetch(',
         '    String(input instanceof Request ? input.url : input).replace(',
         "      'https://chatgpt.com', mock),",
@@ -1211,6 +1256,13 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         '    pollIntervalMs: 0,',
         '  },',
         '})',
+        'export default process.env.OPENAI_AUTH_E2E_ROUTING_REFUSAL ? { ...configured, async setup(ctx) {',
+        '  const dispose = await configured.setup(ctx)',
+        '  const retry = await ctx.session.hook("retry", (draft) => {',
+        '    appendFileSync(process.env.OPENAI_AUTH_E2E_RETRIES, JSON.stringify({ error: draft.error, decision: draft.decision }) + "\\n")',
+        '  }, { providerID: "openai" })',
+        '  return async () => { await retry.dispose(); await dispose?.() }',
+        '} } : configured',
         '',
       ].join('\n'),
     )

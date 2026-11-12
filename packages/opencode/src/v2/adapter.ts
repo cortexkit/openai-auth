@@ -103,6 +103,7 @@ import {
   reportVaultRoutingLimit,
   type SessionDispatch,
   ttlForModel,
+  VAULT_ROUTING_REFUSAL_MESSAGE,
   VaultBillingAttempt,
   type VaultBillingWarming,
   type VaultModeRefusal,
@@ -1325,6 +1326,14 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
                   .filter((target) => !skip.has(target.id))
                   .map((target) => target.id),
               })
+          if (preferred && typeof preferred !== 'string')
+            throw new OpenCode2AuthError({
+              kind: 'no-account',
+              providerID: OPENAI_PROVIDER_ID,
+              sessionID: input.sessionID,
+              requestKind: input.kind,
+              message: VAULT_ROUTING_REFUSAL_MESSAGE,
+            })
           if (preferred && preferred !== accountId) {
             if (reservation) pins.rollback(reservation)
             reservation = undefined

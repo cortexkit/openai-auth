@@ -4,7 +4,7 @@
 // pool source refreshes, polls and offers a bearer for none of them; and the
 // sidebar file lists the vault accounts in place of the local ones.
 
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -34,6 +34,7 @@ import {
   setSidebarState,
 } from '../sidebar-state'
 import { renderedQuotas } from '../tui.tsx'
+import { loadHostPolicy } from './fixtures/opencode1-error-policy'
 import { HOUR, quotaMap, seedPool } from './fixtures/pool-install'
 
 let dir: string
@@ -133,6 +134,77 @@ describe('the request path in vault mode', () => {
           accountIdentitySource: 'asserted',
         }),
       requestReading: () => {},
+    }
+  }
+
+  for (const mode of ['ordered', 'sticky-balanced'] as const) {
+    for (const code of [
+      'account_limit_exhausted',
+      'account_selection_refused',
+      'account_selection_final',
+    ]) {
+      it(`OpenCode 1 routing refusal ${code} stops ${mode} before sending or marking an account`, async () => {
+        const key = Symbol.for('cortexkit.routing')
+        const previous = Reflect.get(globalThis, key)
+        const accountFor = mock(async () => ({
+          refused: {
+            code,
+            message: 'private account-429 at capacity; retry in 500 seconds',
+            routing_code: 'private-account-429',
+            retry_after_secs: 500,
+          },
+        }))
+        Reflect.set(globalThis, key, () => ({ accountFor }))
+        const providerFetch = mock(async () => new Response('ok'))
+        const recordQuota = mock(() => {})
+        const pins = new Map()
+        const marks = new Map<string, number>()
+        const vault = vaultWith(
+          ['a', 'b'].map((id) => ({
+            id: `vault:${id}`,
+            identity: `account-${id}`,
+            credentialId: `credential-${id}`,
+            kind: 'oauth' as const,
+            quota: quotaMap(10),
+          })),
+        )
+        const authorize = mock(vault.send)
+        vault.send = authorize
+        try {
+          const error = await serve(vault, null, mode, 200, {
+            sessionId: 'refused-session',
+            routingRequest: { modelId: 'gpt-6', kind: 'primary' },
+            send: providerFetch,
+            recordQuota,
+            rateLimitMarks: () => marks,
+            placePin: (input) =>
+              placeStickyPin(pins, input, (id, pin) => pins.set(id, pin)),
+          }).then(
+            () => undefined,
+            (error: unknown) => error,
+          )
+          expect(error).toBeInstanceOf(Error)
+          const message = (error as Error).message
+          expect(message).toBe(
+            'Thalamus routing declined this request, so it was not sent.',
+          )
+          expect(
+            loadHostPolicy().retryable(
+              { name: 'UnknownError', data: { type: 'api_error', message } },
+              'openai',
+            ),
+          ).toBeUndefined()
+          expect(accountFor).toHaveBeenCalledTimes(1)
+          expect(authorize).not.toHaveBeenCalled()
+          expect(providerFetch).not.toHaveBeenCalled()
+          expect(recordQuota).not.toHaveBeenCalled()
+          expect(marks.size).toBe(0)
+          expect(pins.size).toBe(0)
+        } finally {
+          if (previous === undefined) Reflect.deleteProperty(globalThis, key)
+          else Reflect.set(globalThis, key, previous)
+        }
+      })
     }
   }
 

@@ -75,6 +75,7 @@ import {
   type RoutingMode,
   VAULT_MODE_REFUSAL_CAUSES,
   VAULT_MODE_REFUSALS,
+  VAULT_ROUTING_REFUSAL_MESSAGE,
   type VaultModeRefusal,
   type VaultRoutingRequest,
 } from '@cortexkit/openai-auth-core/internal'
@@ -948,6 +949,8 @@ async function serveOrdered(
     routing,
     eligibleIds: plan.order,
   })
+  if (preferred && typeof preferred !== 'string')
+    throw new Error(VAULT_ROUTING_REFUSAL_MESSAGE)
   const order = preferred
     ? [preferred, ...plan.order.filter((id) => id !== preferred)]
     : plan.order
@@ -1097,6 +1100,8 @@ async function serveSticky(
       routes: ctx.vault?.routes() ?? [],
       routing,
     })
+    if (advised && typeof advised !== 'string')
+      throw new Error(VAULT_ROUTING_REFUSAL_MESSAGE)
     preferred = advised
       ? {
           accountId: advised,

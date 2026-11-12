@@ -1,6 +1,7 @@
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import {
   askRouting,
+  type RoutingRefusal,
   reportRouting,
 } from '@cortexkit/common-auth/routing-accessor'
 import { windowsFromQuotaMap } from './pool-quota'
@@ -19,6 +20,10 @@ interface VaultRoutingRoute {
   identity?: string
   credentialId?: string
 }
+
+// Hosts match error text to decide retries; never include routing's details.
+export const VAULT_ROUTING_REFUSAL_MESSAGE =
+  'Thalamus routing declined this request, so it was not sent.'
 
 /** The process-global routing accessor can change after plugin load; check it each time. */
 export function hasVaultRoutingAccessor(): boolean {
@@ -68,7 +73,7 @@ export async function chooseVaultRouting(input: {
   routing: PoolRoutingInput
   eligibleIds?: readonly string[]
   wait?: RoutingWaitInput
-}): Promise<string | undefined> {
+}): Promise<string | RoutingRefusal | undefined> {
   const { request, sessionId } = input
   if (
     !input.vaultMode ||
@@ -107,13 +112,14 @@ export async function chooseVaultRouting(input: {
     provider: 'openai',
     modelId: request.modelId,
     candidates,
+    refusals: true,
     holdWaitMaxS: routingHoldWaitMaxS({
       ...input.wait,
       sessionId,
       now: input.routing.now,
     }),
   })
-  return answer?.candidate.id
+  return answer && 'refused' in answer ? answer : answer?.candidate.id
 }
 
 const RATE_LIMIT_HEADERS = [
