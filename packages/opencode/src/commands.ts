@@ -12,9 +12,15 @@
  * payload of its own.
  */
 import {
+  type BuiltinSettingsPort,
   CommandError,
   type CommandMenuModel,
 } from '@cortexkit/common-auth/commands'
+import {
+  openSettings,
+  type SettingsEdit,
+  SettingsRefusal,
+} from '@cortexkit/common-auth/settings'
 import type { PoolStore } from '@cortexkit/common-auth/store'
 import {
   type ApplyRequest,
@@ -43,6 +49,15 @@ import {
   setLogLevel,
   shouldCaptureSessionCache,
 } from '@cortexkit/openai-auth-core/internal'
+import { getSettingsAuthority } from '@cortexkit/openai-auth-core/settings-authority'
+import { getSettingsDecision } from '@cortexkit/openai-auth-core/settings-decisions'
+import { openaiSettings } from '@cortexkit/openai-auth-core/settings-definition'
+import {
+  buildSettingsDiagnostics,
+  settingsRefusalText,
+} from '@cortexkit/openai-auth-core/settings-diagnostics'
+import { createBuiltinSettingsPort } from '@cortexkit/openai-auth-core/settings-port'
+import type { SettingsSnapshot } from '@cortexkit/openai-auth-core/settings-snapshot'
 import { getSettings, isRequestDumpEnabled, refreshSettings } from './config'
 import { poolRemovalRefusal, poolSettingsLocks } from './core/pool-accounts'
 import { legacyRefreshLocks } from './core/pool-migration'
@@ -62,6 +77,12 @@ export interface OpenCodeMenuContext {
   accountStoragePath: string
   /** Runtime-state file that goes with `accountStoragePath`. */
   accountStatePath: string
+  /** Preference identity when the menu uses a different account-store adapter. */
+  configPath?: string
+  /** Resolved settings writer supplied by the runtime boundary. */
+  settings?: BuiltinSettingsPort
+  /** This instance's shared view; menu writes publish here before live effects. */
+  settingsSnapshot?: SettingsSnapshot
   /** Host package version, sent as the version half of the OAuth `User-Agent`. */
   packageVersion: string
   /**
@@ -122,6 +143,66 @@ function storePaths(ctx: OpenCodeMenuContext): AccountPaths {
   }
 }
 
+function menuConfigPath(ctx: OpenCodeMenuContext): string {
+  return ctx.configPath ?? storePaths(ctx).configPath
+}
+
+async function sharedMenuSettings(ctx: OpenCodeMenuContext) {
+  const snapshot = ctx.settingsSnapshot
+  const configPath = menuConfigPath(ctx)
+  if (!snapshot || getSettingsDecision(configPath) !== 'shared')
+    return undefined
+  const authority = await getSettingsAuthority(configPath)
+  if (authority?.decision !== 'shared') return undefined
+  const file = authority.install.target
+  return {
+    snapshot,
+    file,
+    writer: openSettings(openaiSettings, {
+      file,
+      log,
+      separateInstall: false,
+      createMissing: true,
+    }),
+  }
+}
+
+async function writeMenuSetting(
+  ctx: OpenCodeMenuContext,
+  edit: SettingsEdit,
+  legacyWrite: () => Promise<unknown>,
+) {
+  const shared = await sharedMenuSettings(ctx)
+  if (!shared) {
+    await legacyWrite()
+    return
+  }
+  try {
+    if (edit.setting === 'cache_keep_window') {
+      // Lists replace the whole value. Re-read before deciding it is safe to edit.
+      await shared.snapshot.refresh()
+      if (
+        shared.snapshot
+          .report()
+          .some(
+            (entry) =>
+              (entry.reason === 'invalid-value' &&
+                entry.keyPath[0] === edit.setting) ||
+              entry.reason === 'unreadable' ||
+              entry.reason === 'unparseable',
+          )
+      )
+        throw new SettingsRefusal('settings-invalid-value', shared.file)
+    }
+    await shared.writer.update([edit], { host: 'opencode' })
+    await shared.snapshot.refresh()
+  } catch (error) {
+    if (error instanceof SettingsRefusal)
+      throw new CommandError(error.code, settingsRefusalText(error.code))
+    throw error
+  }
+}
+
 function hourLabel(window: { startHour: number; endHour: number }) {
   return `${String(window.startHour).padStart(2, '0')}-${String(window.endHour).padStart(2, '0')}`
 }
@@ -152,18 +233,30 @@ const SUSTAIN_ON_TEXT =
 
 /** The Cache section: prompt-cache keep-warm, over the live manager. */
 function cacheSection(ctx: OpenCodeMenuContext) {
-  const write = (edit: (cacheKeep: Record<string, unknown>) => void) =>
-    writeSettings(ctx.store(), poolSettingsLocks(storePaths(ctx)), (s) => {
-      const cacheKeep = { ...((s.cacheKeep as object | undefined) ?? {}) }
-      edit(cacheKeep as Record<string, unknown>)
-      s.cacheKeep = cacheKeep
-    })
+  const write = (
+    setting: string,
+    value: unknown,
+    edit: (cacheKeep: Record<string, unknown>) => void,
+  ) =>
+    writeMenuSetting(ctx, { setting, value }, () =>
+      writeSettings(ctx.store(), poolSettingsLocks(storePaths(ctx)), (s) => {
+        const cacheKeep = { ...((s.cacheKeep as object | undefined) ?? {}) }
+        edit(cacheKeep as Record<string, unknown>)
+        s.cacheKeep = cacheKeep
+      }),
+    )
   return {
     title: 'Cache',
     build: async () => {
       const mgr = ctx.cacheKeepManager
       if (!mgr) return { lines: ['Keep-warm unavailable'] }
-      const stored = cacheKeepSettings(await ctx.loadAccounts(storePaths(ctx)))
+      const shared = await sharedMenuSettings(ctx)
+      await shared?.snapshot.refresh()
+      const stored = cacheKeepSettings(
+        shared
+          ? shared.snapshot.view()
+          : await ctx.loadAccounts(storePaths(ctx)),
+      )
       const enabled = stored?.enabled === true
       const subagents = stored?.subagents === true
       const status = mgr.status()
@@ -211,7 +304,7 @@ function cacheSection(ctx: OpenCodeMenuContext) {
             ],
             run: async ({ values }: { values: Record<string, unknown> }) => {
               const on = values.enabled === true
-              await write((cacheKeep) => {
+              await write('cache_keep_enabled', on, (cacheKeep) => {
                 cacheKeep.enabled = on
               })
               ctx.setCacheKeepEnabled?.(on)
@@ -246,7 +339,7 @@ function cacheSection(ctx: OpenCodeMenuContext) {
             ],
             run: async ({ values }: { values: Record<string, unknown> }) => {
               const on = values.subagents === true
-              await write((cacheKeep) => {
+              await write('cache_keep_subagents', on, (cacheKeep) => {
                 cacheKeep.subagents = on
               })
               ctx.setCacheKeepSubagents?.(on)
@@ -268,7 +361,7 @@ function cacheSection(ctx: OpenCodeMenuContext) {
             ],
             run: async ({ values }: { values: Record<string, unknown> }) => {
               const on = values.sustain === true
-              await write((cacheKeep) => {
+              await write('cache_keep_sustain', on, (cacheKeep) => {
                 cacheKeep.sustain = on
               })
               ctx.setCacheKeepSustain?.(on)
@@ -294,7 +387,7 @@ function cacheSection(ctx: OpenCodeMenuContext) {
             run: async ({ values }: { values: Record<string, unknown> }) => {
               const raw = values.window
               if (typeof raw !== 'string' || raw.trim() === '') {
-                await write((cacheKeep) => {
+                await write('cache_keep_window', [], (cacheKeep) => {
                   delete cacheKeep.startHour
                   delete cacheKeep.endHour
                 })
@@ -305,10 +398,14 @@ function cacheSection(ctx: OpenCodeMenuContext) {
               if (!parsed.ok)
                 return { ok: false, text: `Invalid window: ${parsed.reason}` }
               const { startHour, endHour } = parsed
-              await write((cacheKeep) => {
-                cacheKeep.startHour = startHour
-                cacheKeep.endHour = endHour
-              })
+              await write(
+                'cache_keep_window',
+                [{ start_hour: startHour, end_hour: endHour }],
+                (cacheKeep) => {
+                  cacheKeep.startHour = startHour
+                  cacheKeep.endHour = endHour
+                },
+              )
               ctx.setCacheKeepWindow?.({ startHour, endHour })
               return `Warming limited to ${hourLabel(parsed)} local hours.`
             },
@@ -326,10 +423,25 @@ function diagnosticsSection(ctx: OpenCodeMenuContext) {
   return {
     title: 'Diagnostics',
     build: async () => {
-      const settings = getSettings()
-      const dumping = isRequestDumpEnabled()
-      const storage = await ctx.loadAccounts(storePaths(ctx))
-      const level = storage?.logging?.level ?? 'info'
+      const configPath = menuConfigPath(ctx)
+      const diagnostics = getSettingsAuthority(configPath)
+        ? await buildSettingsDiagnostics({
+            configPath,
+            snapshot: ctx.settingsSnapshot,
+            log,
+          })
+        : { lines: [] }
+      const shared = await sharedMenuSettings(ctx)
+      const settings = getSettings(configPath)
+      const dumping = isRequestDumpEnabled(configPath)
+      // A broken account store may have prevented settings migration. Keep the
+      // failure visible even when that store cannot load logging preferences.
+      const storage = shared
+        ? shared.snapshot.view()
+        : await ctx.loadAccounts(storePaths(ctx)).catch(() => null)
+      const savedLevel = storage?.logging?.level
+      const level =
+        !savedLevel || savedLevel === 'default' ? 'info' : savedLevel
       const size = dumping
         ? await getDumpDirectorySize(settings.dumpDir)
         : undefined
@@ -346,6 +458,7 @@ function diagnosticsSection(ctx: OpenCodeMenuContext) {
           `Dump directory: ${settings.dumpDir}`,
           `Log level: ${level}`,
           ...(layoutNotice ? [layoutNotice] : []),
+          ...diagnostics.lines,
         ],
         actions: [
           {
@@ -361,19 +474,24 @@ function diagnosticsSection(ctx: OpenCodeMenuContext) {
             ],
             run: async ({ values }: { values: Record<string, unknown> }) => {
               const on = values.enabled === true
-              await writeSettings(
-                ctx.store(),
-                poolSettingsLocks(storePaths(ctx)),
-                (s) => {
-                  s.dump = {
-                    ...((s.dump as object | undefined) ?? {}),
-                    enabled: on,
-                  }
-                },
+              await writeMenuSetting(
+                ctx,
+                { setting: 'request_dumps', value: on },
+                () =>
+                  writeSettings(
+                    ctx.store(),
+                    poolSettingsLocks(storePaths(ctx)),
+                    (s) => {
+                      s.dump = {
+                        ...((s.dump as object | undefined) ?? {}),
+                        enabled: on,
+                      }
+                    },
+                  ),
               )
               // The dump gates read memoized settings; without this the running
               // process keeps dumping nothing while the file says it is on.
-              const updated = refreshSettings()
+              const updated = refreshSettings(configPath)
               log.info(on ? 'request dump enabled' : 'request dump disabled')
               return on
                 ? `Request dumps are on, written to ${updated.dumpDir}.\n\nBody dumps may contain prompt and session content. Turn this off after debugging.`
@@ -396,15 +514,20 @@ function diagnosticsSection(ctx: OpenCodeMenuContext) {
             ],
             run: async ({ values }: { values: Record<string, unknown> }) => {
               const next = String(values.level) as (typeof LOG_LEVELS)[number]
-              await writeSettings(
-                ctx.store(),
-                poolSettingsLocks(storePaths(ctx)),
-                (s) => {
-                  s.logging = {
-                    ...((s.logging as object | undefined) ?? {}),
-                    level: next,
-                  }
-                },
+              await writeMenuSetting(
+                ctx,
+                { setting: 'log_level', value: next },
+                () =>
+                  writeSettings(
+                    ctx.store(),
+                    poolSettingsLocks(storePaths(ctx)),
+                    (s) => {
+                      s.logging = {
+                        ...((s.logging as object | undefined) ?? {}),
+                        level: next,
+                      }
+                    },
+                  ),
               )
               // Takes effect now, without a restart.
               setLogLevel(next)
@@ -435,7 +558,34 @@ async function resetAccountKeys(ctx: OpenCodeMenuContext): Promise<string[]> {
 /** The `/openai` menu over this process's context. */
 export function createOpenCodeMenu(ctx: OpenCodeMenuContext) {
   const paths = storePaths(ctx)
+  const configPath = ctx.configPath ?? paths.configPath
   const extraLocks = poolSettingsLocks(paths)
+  const settings =
+    ctx.settings ??
+    (ctx.settingsSnapshot && getSettingsDecision(configPath) === 'shared'
+      ? ({
+          read: async () => {
+            const shared = await sharedMenuSettings(ctx)
+            if (!shared) throw new Error('Shared settings are unavailable')
+            return createBuiltinSettingsPort({
+              ...shared,
+              host: 'opencode',
+              log,
+            }).read()
+          },
+          update: async (
+            mutator: Parameters<BuiltinSettingsPort['update']>[0],
+          ) => {
+            const shared = await sharedMenuSettings(ctx)
+            if (!shared) throw new Error('Shared settings are unavailable')
+            await createBuiltinSettingsPort({
+              ...shared,
+              host: 'opencode',
+              log,
+            }).update(mutator)
+          },
+        } satisfies BuiltinSettingsPort)
+      : undefined)
   const reset =
     ctx.quotaManager &&
     ctx.resolveResetTarget &&
@@ -448,7 +598,11 @@ export function createOpenCodeMenu(ctx: OpenCodeMenuContext) {
           statePath: paths.statePath,
           quotaManager: ctx.quotaManager,
           loadAccounts: ctx.loadAccounts,
-          mutateAccounts: settingsMutateAccounts(ctx.store(), extraLocks),
+          mutateAccounts: settingsMutateAccounts(
+            ctx.store(),
+            extraLocks,
+            configPath,
+          ),
           resolveResetTarget: ctx.resolveResetTarget,
           refreshResetTargetQuota: ctx.refreshResetTargetQuota,
           fetchImpl: ctx.fetchImpl,
@@ -460,6 +614,8 @@ export function createOpenCodeMenu(ctx: OpenCodeMenuContext) {
   const beginLogin = ctx.beginAccountLogin
   return createOpenAiMenu({
     store: ctx.store(),
+    configPath,
+    ...(settings ? { settings } : {}),
     ...(ctx.readOnly ? { readOnly: true } : {}),
     ...(ctx.allowAction ? { allowAction: ctx.allowAction } : {}),
     ...(ctx.unavailableSections
