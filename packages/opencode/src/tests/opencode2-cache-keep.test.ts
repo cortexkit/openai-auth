@@ -1352,7 +1352,9 @@ describe('OpenCode 2 keep-warm in setup', () => {
         await managerOf(files)!.tick()
         expect(location.warms).toHaveLength(tracked)
         expect(sessions.length).toBeGreaterThan(0)
-        expect(sessions.every((id) => id === 'runner-session')).toBe(true)
+        // Same check as every-id-is-the-runner's, but a failure names the
+        // stray session ids (macOS CI once saw one).
+        expect(sessions.filter((id) => id !== 'runner-session')).toEqual([])
       })
     }
   }
