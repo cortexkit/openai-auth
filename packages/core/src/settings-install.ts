@@ -52,6 +52,25 @@ export function canonicalSettingsPath(path: string): string {
   }
 }
 
+const identities = new Map<string, string>()
+
+/**
+ * canonicalSettingsPath, resolved once per path string for the process.
+ * Request-path readers look up the settings decision and snapshot by identity
+ * on every request, and resolving it walks the filesystem each time. A process
+ * fixes its settings decision once at startup, so keeping the identity it
+ * resolved then also keeps one config from splitting into two keys if a link
+ * changes later.
+ */
+export function settingsIdentity(path: string): string {
+  let identity = identities.get(path)
+  if (identity === undefined) {
+    identity = canonicalSettingsPath(path)
+    identities.set(path, identity)
+  }
+  return identity
+}
+
 /**
  * Default stores are shared move sources, not either host's overridden stores.
  * Only generic environment variables are read here, including when Pi calls it.

@@ -20,6 +20,7 @@ import {
   type SettingsHost,
   type SettingsInstallOptions,
   type SettingsPathOptions,
+  settingsIdentity,
 } from '../settings-install.ts'
 
 let root: string
@@ -469,6 +470,23 @@ describe('resolved identities and process decisions', () => {
     )
     seed(join(actual, 'not', 'created', 'settings.jsonc'))
     expect(canonicalSettingsPath(path)).toBe(realpathSync.native(path))
+  })
+
+  it('settingsIdentity keeps the identity it first resolved for a path', () => {
+    const first = join(root, 'first')
+    const second = join(root, 'second')
+    const alias = join(root, 'identity-alias')
+    mkdirSync(first)
+    mkdirSync(second)
+    symlinkSync(first, alias, 'junction')
+    const path = join(alias, 'openai-auth.json')
+    expect(settingsIdentity(path)).toBe(join(first, 'openai-auth.json'))
+    // Repointing the link changes the canonical path, but not the identity
+    // request readers already keyed this config by.
+    rmSync(alias, { recursive: true, force: true })
+    symlinkSync(second, alias, 'junction')
+    expect(canonicalSettingsPath(path)).toBe(join(second, 'openai-auth.json'))
+    expect(settingsIdentity(path)).toBe(join(first, 'openai-auth.json'))
   })
 
   it('keeps the first decision per config identity and leaves other configs undecided', () => {

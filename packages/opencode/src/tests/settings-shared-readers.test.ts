@@ -607,7 +607,8 @@ describe('shared OpenCode pool readers', () => {
     const { snapshot } = await shared({ refresh_before_expiry_minutes: 20 })
     const rows = source.peek().rows
     await source.prepareTokens(rows, null, { waitForAll: true })
-    expect(refreshes).toEqual(['main-refresh', 'B-refresh'])
+    // prepareTokens refreshes rows concurrently, so their order isn't fixed.
+    expect([...refreshes].sort()).toEqual(['B-refresh', 'main-refresh'])
     await put(target, { refresh_before_expiry_minutes: 1 })
     await snapshot.refresh()
     refreshes.length = 0

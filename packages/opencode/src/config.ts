@@ -17,7 +17,7 @@ import {
 } from '@cortexkit/openai-auth-core/internal'
 import { getSettingsDecision } from '@cortexkit/openai-auth-core/settings-decisions'
 import { openaiSettings } from '@cortexkit/openai-auth-core/settings-definition'
-import { canonicalSettingsPath } from '@cortexkit/openai-auth-core/settings-install'
+import { settingsIdentity } from '@cortexkit/openai-auth-core/settings-install'
 import type {
   SettingsSnapshot,
   SettingsView,
@@ -126,7 +126,7 @@ export function registerSettingsSnapshot(
   configPath: string,
   snapshot: SettingsSnapshot,
 ): () => void {
-  const identity = canonicalSettingsPath(configPath)
+  const identity = settingsIdentity(configPath)
   const live = snapshots.get(identity) ?? new Set<SettingsSnapshot>()
   if (live.size === 0) cached.delete(identity)
   snapshots.set(identity, live)
@@ -150,7 +150,7 @@ export function registerSettingsSnapshot(
 }
 
 function sharedSnapshot(configPath: string): SettingsSnapshot | undefined {
-  const identity = canonicalSettingsPath(configPath)
+  const identity = settingsIdentity(configPath)
   const live = snapshots.get(identity)
   let latest: SettingsSnapshot | undefined
   for (const snapshot of live ?? []) latest = snapshot
@@ -375,7 +375,7 @@ const cached = new Map<
  * settings on every request.
  */
 export function getSettings(configPath = getConfigPath()): ResolvedSettings {
-  const identity = canonicalSettingsPath(configPath)
+  const identity = settingsIdentity(configPath)
   const shared = getSettingsDecision(configPath) === 'shared'
   let entry = cached.get(identity)
   if (!entry || entry.shared !== shared) {
@@ -394,7 +394,7 @@ export function getSettings(configPath = getConfigPath()): ResolvedSettings {
 export function refreshSettings(
   configPath = getConfigPath(),
 ): ResolvedSettings {
-  cached.delete(canonicalSettingsPath(configPath))
+  cached.delete(settingsIdentity(configPath))
   dumpCache = undefined
   return getSettings(configPath)
 }

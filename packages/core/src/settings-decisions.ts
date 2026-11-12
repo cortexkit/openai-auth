@@ -1,4 +1,4 @@
-import { canonicalSettingsPath } from './settings-install.ts'
+import { settingsIdentity } from './settings-install.ts'
 
 export type SettingsDecision = 'shared' | 'legacy' | 'separate'
 
@@ -14,7 +14,8 @@ processState[decisionsKey] = decisions
 export function getSettingsDecision(
   configPath: string,
 ): SettingsDecision | undefined {
-  return decisions.get(canonicalSettingsPath(configPath))
+  // Every request reads this; settingsIdentity resolves the path only once.
+  return decisions.get(settingsIdentity(configPath))
 }
 
 /** The first startup choice lasts for this config file's process lifetime. */
@@ -22,7 +23,7 @@ export function recordSettingsDecision(
   configPath: string,
   decision: SettingsDecision,
 ): SettingsDecision {
-  const identity = canonicalSettingsPath(configPath)
+  const identity = settingsIdentity(configPath)
   const existing = decisions.get(identity)
   if (existing !== undefined) return existing
   decisions.set(identity, decision)
