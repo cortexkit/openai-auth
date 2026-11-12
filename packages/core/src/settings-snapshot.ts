@@ -184,6 +184,11 @@ export async function createSettingsSnapshot(options: {
     ) as SnapshotValues
     const readReport = handle.report()
     report = [...readReport, ...semanticChecks(next, file)]
+    const fileFailed = readReport.some(
+      (entry) =>
+        entry.file.path === file &&
+        (entry.reason === 'unreadable' || entry.reason === 'unparseable'),
+    )
     const invalid = (setting: SnapshotSetting) =>
       report.some(
         (entry) =>
@@ -194,10 +199,11 @@ export async function createSettingsSnapshot(options: {
         values?.[setting] ?? openaiSettings.settings[setting].default,
       ) as SnapshotValues[K]
     }
-    // An invalid edit must not disable a protection or remove its limits.
-    // Whole-file failures already retain good values inside common-auth.
+    // Invalid edits and whole-file failures keep the applied protection policy.
     for (const setting of protectedSettings)
-      if (invalid(setting)) retain(setting)
+      if (fileFailed || invalid(setting)) retain(setting)
+    // With no applied policy to retain, a broken file must not disable protection.
+    if (fileFailed && !values) next.killswitch_enabled = true
     if (invalid('killswitch_account_floors')) {
       // Retain the complete applied policy, including defaults: a corrupt list
       // must not quietly remove an account's protection or lower its fallback.

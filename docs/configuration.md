@@ -60,7 +60,7 @@ Other limits to keep in mind:
 
 A host with no config file of its own, such as a vault-only Pi, reads the shared values after the move too, including the old store's `routing.mode` and `killswitch.enabled` preferences (now `routing_mode` and `killswitch_enabled`). For example, an OpenCode store using `sticky-balanced` with the killswitch on makes that Pi use both values instead of its previous defaults. It does not gain the other host's local per-account floors or single-store vault floor entries.
 
-If the settings file cannot be read or parsed **at start**, there is no last-good snapshot: every setting takes its declared default, so **the killswitch is off until the file is fixed**. Diagnostics names the file and its problems. An unreadable or unparseable file during a running process keeps its last-good snapshot. After a successful move, an omitted setting uses its declared default, never the old store's saved value.
+If the settings file cannot be read or parsed **at start**, **the killswitch is on with the default floors (5% primary, 10% secondary) until the file is fixed**. Diagnostics names the file and its problems. An unreadable or unparseable file during a running process keeps its last-good snapshot. After a successful move, an omitted setting uses its declared default, never the old store's saved value.
 
 ### OpenCode transport and diagnostics settings
 

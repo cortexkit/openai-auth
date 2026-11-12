@@ -243,6 +243,8 @@ describe('shared settings snapshot', () => {
       const { snapshot } = await open(file, host)
       expect(snapshot.view(null).routing?.mode).toBe('main-first')
       expect(snapshot.view(null).accounts).toEqual([])
+      expect(isKillswitchEnabled(snapshot.view(null))).toBe(false)
+      expect(thresholds(snapshot)).toEqual({ primary: 5, secondary: 10 })
       expect(snapshot.report()).toEqual([])
     })
 
@@ -615,16 +617,69 @@ describe('unread lists and files', () => {
   }
 
   for (const reason of ['unparseable', 'unreadable'] as const) {
-    it(`starts on defaults with the killswitch off when the file is ${reason}`, async () => {
+    it(`starts with strict protections when the file is ${reason}`, async () => {
       const file = join(await folder(), 'broken.jsonc')
       if (reason === 'unparseable') await writeFile(file, '{ invalid json')
       else await mkdir(file)
       const { snapshot } = await open(file)
-      expect(isKillswitchEnabled(snapshot.view())).toBe(false)
+      expect(isKillswitchEnabled(snapshot.view())).toBe(true)
       expect(snapshot.view().routing?.mode).toBe('main-first')
       expect(thresholds(snapshot)).toEqual({ primary: 5, secondary: 10 })
+      expect(snapshot.get('killswitch_account_floors')).toEqual([])
+      expect(snapshot.get('quota_minimum_remaining')).toEqual([])
+      expect(snapshot.get('cache_keep_window')).toEqual([])
       expect(snapshot.report()).toContainEqual(
         expect.objectContaining({ reason, file: { kind: 'user', path: file } }),
+      )
+
+      await snapshot.refresh()
+      expect(isKillswitchEnabled(snapshot.view())).toBe(true)
+      expect(thresholds(snapshot)).toEqual({ primary: 5, secondary: 10 })
+
+      if (reason === 'unreadable') await rm(file, { recursive: true })
+      await writeFile(
+        file,
+        JSON.stringify({
+          killswitch_enabled: false,
+          killswitch_default_primary: 20,
+          killswitch_default_secondary: 30,
+          killswitch_account_floors: [floors('main', 'opencode', 40, 50)],
+          quota_minimum_remaining: [{ window: 'primary', floor: 60 }],
+          cache_keep_window: [{ start_hour: 7, end_hour: 8 }],
+        }),
+      )
+      await snapshot.refresh()
+      expect(isKillswitchEnabled(snapshot.view())).toBe(false)
+      expect(snapshot.view().killswitch?.defaults).toEqual({
+        primary: 20,
+        secondary: 30,
+      })
+      expect(thresholds(snapshot)).toEqual({ primary: 40, secondary: 50 })
+      expect(snapshot.get('quota_minimum_remaining')).toEqual([
+        { window: 'primary', floor: 60 },
+      ])
+      expect(snapshot.get('cache_keep_window')).toEqual([
+        { start_hour: 7, end_hour: 8 },
+      ])
+      expect(snapshot.report()).toEqual([])
+    })
+
+    it(`keeps an applied disabled killswitch when the file becomes ${reason}`, async () => {
+      const { file, snapshot } = await fixture({
+        killswitch_enabled: false,
+        killswitch_default_primary: 20,
+        killswitch_default_secondary: 30,
+      })
+      if (reason === 'unparseable') await writeFile(file, '{ invalid json')
+      else {
+        await rm(file)
+        await mkdir(file)
+      }
+      await snapshot.refresh()
+      expect(isKillswitchEnabled(snapshot.view())).toBe(false)
+      expect(thresholds(snapshot)).toEqual({ primary: 20, secondary: 30 })
+      expect(snapshot.report()).toContainEqual(
+        expect.objectContaining({ reason }),
       )
     })
 
