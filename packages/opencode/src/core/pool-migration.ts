@@ -86,7 +86,18 @@
 //     store's own locks, which it takes last in every operation and releases
 //     before it calls a refresh's provider; the legacy `mutateAccounts`,
 //     `saveAccounts` and `saveAccountState` (the last takes the state one
-//     alone); and `updateConfig` below. Nothing is taken while they are held.
+//     alone); and `updateConfig` below. Writers use only their own host's pair
+//     and never wait for `settings-authority` or `settings-move` while holding it.
+//
+// The settings mover is the one path that takes another host's lock while it
+// holds a `save` lock: `settings-authority`, then `settings-move` on the target,
+// then OpenCode's `save(C)`, `save(S)`, then Pi's `save(C)`, `save(S)` (C is the
+// resolved config path, S the resolved state path). It takes no `main-refresh`
+// or other outer lock above. All movers use that order; no other store writer
+// waits for the other host's locks. Writers that take `main-refresh` before
+// `save` keep that order. Neither the pool migration nor its config callbacks
+// take settings locks or await the settings move, so they cannot close a cycle
+// with the mover, which never takes a pool or refresh lock.
 // Leaf locks of their own files, never held while another lock is taken and
 // never taken while one of the above is held: `sidebar-write` at the sidebar
 // file, and the vault's `claustrum-roster` then `claustrum-roster-write` at
@@ -122,7 +133,7 @@
 // moved on to a new token of the same account.
 
 import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import {
@@ -156,6 +167,8 @@ import {
   saveAccountState,
   tokenFingerprint,
 } from '@cortexkit/openai-auth-core/internal'
+import { getSettingsDecision } from '@cortexkit/openai-auth-core/settings-decisions'
+import { resolveSettingsInstall } from '@cortexkit/openai-auth-core/settings-install'
 import { createLogger } from '../logger'
 import {
   asCompleteMainOauthSlot,
@@ -627,11 +640,12 @@ export async function withMainRefreshLock<T>(
 /**
  * One read-modify-write of the config under the older writers' `save` lock
  * pair (config, then state) — the pair the pool store and every legacy
- * writer serialise on.
+ * writer serialise on. The callback is synchronous: no other lock or move is
+ * awaited while the pair is held.
  */
 async function updateConfig(
   ctx: LockContext,
-  mutate: (config: Record<string, unknown>) => boolean | Promise<boolean>,
+  mutate: (config: Record<string, unknown>) => boolean,
 ): Promise<void> {
   const ttlMs = ctx.locks.saveTtlMs
   const configLock = await acquireLock(ctx, 'save', ctx.paths.configPath, ttlMs)
@@ -639,7 +653,7 @@ async function updateConfig(
     const stateLock = await acquireLock(ctx, 'save', ctx.paths.statePath, ttlMs)
     try {
       const config = await readConfig(ctx.paths.configPath)
-      if (!(await mutate(config))) return
+      if (!mutate(config)) return
       await writeJsonAtomic(ctx.paths.configPath, config, {
         beforeRename: async () => {
           await configLock.assertOwned()
@@ -1388,9 +1402,9 @@ async function carryLegacyMainState(ctx: Context, row: PoolRow): Promise<void> {
  * account as a fallback, and a tolerant one would not refresh the row in the
  * background.
  *
- * The write that first marks a migration done also pins the routing mode
- * when none is set (`pinLegacyRoutingDefault`), so the marker and the mode
- * land together and no crash can leave a migrated install without it.
+ * While preferences still belong to this store, the write that first marks a
+ * migration done also pins an unset routing mode (`pinLegacyRoutingDefault`).
+ * Shared settings own their default instead, even after their file is removed.
  */
 async function writeFinished(
   ctx: Context,
@@ -1400,7 +1414,11 @@ async function writeFinished(
   await updateConfig(ctx, (config) => {
     const book = readPoolMigrationBookkeeping(config)
     delete config.mainAccountId
-    if (mode === 'migrate' && book.migratedAt === undefined)
+    if (
+      mode === 'migrate' &&
+      book.migratedAt === undefined &&
+      shouldPinLegacyRoutingDefault(ctx)
+    )
       pinLegacyRoutingDefault(config)
     writeBookkeeping(config, {
       ...(book.migratedAt !== undefined || mode === 'migrate'
@@ -1414,6 +1432,22 @@ async function writeFinished(
     })
     return true
   })
+}
+
+function shouldPinLegacyRoutingDefault(ctx: Context): boolean {
+  const decision = getSettingsDecision(ctx.paths.configPath)
+  if (decision === 'shared') return false
+  if (decision === 'separate') return true
+  const install = resolveSettingsInstall({
+    host: 'opencode',
+    paths: ctx.paths,
+    // Startup already reports rejected opt-ins; this is only a path probe.
+    logger: { warn() {} },
+  })
+  // Checked under this store's save locks: a mover that published before this
+  // write already owns the default. Only existence matters; never read the file
+  // or wait for the move, which takes these same locks without any pool locks.
+  return install.separate || !existsSync(install.target)
 }
 
 /**
