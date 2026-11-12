@@ -32,19 +32,18 @@ import { openAccountPool } from '../core/pool-accounts'
 import { createLogger, flushForTest, setLogLevel } from '../logger'
 import { createControlPlaneMenu } from '../v2/menu'
 import { poolFiles, seedPool } from './fixtures/opencode2-host'
+import { restoreEnv } from './setup-env'
 
 const log = { warn() {}, info() {} }
 const cleanups: Array<() => void> = []
 const roots: string[] = []
-const previousLogFile = process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) cleanup()
   setLogLevel(undefined)
   resetSettingsForTest()
   await flushForTest()
-  if (previousLogFile === undefined)
-    delete process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
-  else process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = previousLogFile
+  // The log file is a floored variable: return it to the floor, never unset.
+  restoreEnv('OPENCODE_OPENAI_AUTH_LOG_FILE')
   for (const root of roots.splice(0))
     rmSync(root, { recursive: true, force: true })
 })
