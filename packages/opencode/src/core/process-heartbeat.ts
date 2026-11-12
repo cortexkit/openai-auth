@@ -7,8 +7,9 @@
 // treats a file whose pid is no longer running as absent, so a crashed process
 // leaves nothing it has to clean up.
 //
-// Writing it is best-effort. A failure is logged and never fails the loader,
-// and nothing here runs on the request path.
+// Ordinary heartbeat writes are best-effort. Writes that publish a settings
+// decision throw, so a process cannot use an old store without a live record.
+// Nothing here runs on the request path.
 //
 // The file also carries `layouts`: for each OpenCode config folder this
 // process resolved, whether it keeps that folder's runtime files in the
@@ -21,6 +22,9 @@ import { randomUUID } from 'node:crypto'
 import { chmod, mkdir, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import type { SettingsDecision } from '@cortexkit/openai-auth-core/settings-decisions'
+import { canonicalSettingsPath } from '@cortexkit/openai-auth-core/settings-install'
+import { aggregateProcessSettings } from '@cortexkit/openai-auth-core/settings-process-records'
 import { hasLegacyRuntimeGeneration } from './runtime-process-state'
 
 /** Where one process keeps one config folder's runtime files. */
@@ -32,6 +36,8 @@ export interface ProcessHeartbeat {
   startedAt: number
   /** Config folder key (`runtimeLayoutLocation().key`) to its layout. */
   layouts: Record<string, ProcessLayout>
+  /** Absent until the first config file's settings source has been decided. */
+  settings?: SettingsDecision
 }
 
 /**
@@ -67,6 +73,20 @@ const layoutState = globalThis as typeof globalThis & {
 const processLayouts = layoutState[layoutsKey] ?? new Map()
 layoutState[layoutsKey] = processLayouts
 
+const settingsKey = Symbol.for('@cortexkit/openai-auth/process-settings')
+type SettingsState = {
+  decisions: Map<string, SettingsDecision>
+  writing: Promise<unknown>
+}
+const settingsGlobal = globalThis as typeof globalThis & {
+  [settingsKey]?: SettingsState
+}
+const settingsState = settingsGlobal[settingsKey] ?? {
+  decisions: new Map<string, SettingsDecision>(),
+  writing: Promise.resolve(),
+}
+settingsGlobal[settingsKey] = settingsState
+
 function layoutsRecord(): Record<string, ProcessLayout> {
   return {
     ...Object.fromEntries(processLayouts),
@@ -95,6 +115,24 @@ export interface ProcessHeartbeatHandle {
 }
 
 async function writeHeartbeatFile(
+  dir: string,
+  heartbeat: ProcessHeartbeat,
+): Promise<string> {
+  // Bundle copies and plugin instances share the queue. An older heartbeat
+  // write must not overwrite a settings decision that has already completed.
+  const write = settingsState.writing
+    .catch(() => {})
+    .then(() =>
+      writeHeartbeatFileNow(dir, {
+        ...heartbeat,
+        settings: aggregateProcessSettings(settingsState.decisions.values()),
+      }),
+    )
+  settingsState.writing = write
+  return write
+}
+
+async function writeHeartbeatFileNow(
   dir: string,
   heartbeat: ProcessHeartbeat,
 ): Promise<string> {
@@ -170,16 +208,29 @@ export async function startProcessHeartbeat(input: {
       released = true
       liveOwners = Math.max(0, liveOwners - 1)
       if (liveOwners > 0) return
-      // A legacy-layout process keeps using the old paths until it exits.
-      if (holdsLegacyLayout()) return
-      await rm(processHeartbeatPath(pid, dir), { force: true }).catch(
-        (error: unknown) => {
-          input.logger.warn('process heartbeat not removed', {
-            dir,
-            error: error instanceof Error ? error.message : String(error),
-          })
-        },
-      )
+      // Order removals with writes too: disposal must not unlink a legacy
+      // decision that another instance is publishing at the same time.
+      const removal = settingsState.writing
+        .catch(() => {})
+        .then(async () => {
+          if (
+            liveOwners > 0 ||
+            holdsLegacyLayout() ||
+            aggregateProcessSettings(settingsState.decisions.values()) ===
+              'legacy'
+          )
+            return
+          await rm(processHeartbeatPath(pid, dir), { force: true }).catch(
+            (error: unknown) => {
+              input.logger.warn('process heartbeat not removed', {
+                dir,
+                error: error instanceof Error ? error.message : String(error),
+              })
+            },
+          )
+        })
+      settingsState.writing = removal
+      await removal
     },
   }
 }
@@ -212,9 +263,38 @@ export async function recordProcessLayout(input: {
   })
 }
 
+/**
+ * Publish a config file's fixed settings choice. A caller that may use old
+ * preferences holds the shared settings-authority lock, which orders fence
+ * scans, moves and record writes. Separate installs need no such lock.
+ * Unlike the ordinary heartbeat, this write must succeed before an old store
+ * can be used. A legacy choice remains in the record until the process exits.
+ */
+export async function recordProcessSettings(input: {
+  configPath: string
+  settings: SettingsDecision
+  version: string
+  now?: () => number
+  pid?: number
+  dir?: string
+}): Promise<void> {
+  const identity = canonicalSettingsPath(input.configPath)
+  if (!settingsState.decisions.has(identity))
+    settingsState.decisions.set(identity, input.settings)
+  processStartedAt ??= (input.now ?? Date.now)()
+  await writeHeartbeatFile(input.dir ?? processHeartbeatDir(), {
+    pid: input.pid ?? process.pid,
+    version: input.version,
+    startedAt: processStartedAt,
+    layouts: layoutsRecord(),
+  })
+}
+
 /** Forget the process-wide owner count; for tests only. */
 export function __resetProcessHeartbeatForTest(): void {
   liveOwners = 0
   processStartedAt = undefined
   processLayouts.clear()
+  settingsState.decisions.clear()
+  settingsState.writing = Promise.resolve()
 }
