@@ -600,7 +600,9 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       sessionId: input.sessionID,
       reason,
       now: at,
-      nextMs: at + delayMs,
+      ...(reason === 'quota_reading'
+        ? { boundMs: delayMs }
+        : { nextMs: at + delayMs }),
       attempt,
     })
     if (end) waitCounts.set(input.sessionID, attempt)

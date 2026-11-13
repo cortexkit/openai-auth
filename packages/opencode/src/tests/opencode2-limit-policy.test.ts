@@ -40,7 +40,7 @@ function recordWaits() {
 function expectWait(
   reports: unknown[],
   reason: string,
-  delay: number,
+  delay: number | undefined,
   message: string,
   outcome: string,
 ) {
@@ -50,7 +50,7 @@ function expectWait(
     kind: 'wait',
     wait_id: first?.wait_id,
     reason,
-    next_ms: T0 + delay,
+    ...(delay === undefined ? {} : { next_ms: T0 + delay }),
     attempt: 1,
     message,
   }
@@ -321,7 +321,7 @@ describe('OpenCode 2 shared limit policy', () => {
       expectWait(
         reports,
         'quota_reading',
-        5000,
+        undefined,
         'Checking account quota',
         arrives ? 'resumed' : 'abandoned',
       )

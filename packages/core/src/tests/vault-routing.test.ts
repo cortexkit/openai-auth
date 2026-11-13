@@ -123,6 +123,23 @@ test('wait reporting skips absent accessors and waits planned below two seconds'
         nextMs: 2999,
       }),
     ).toBeUndefined()
+    expect(
+      startVaultRoutingWait({
+        sessionId: 'session',
+        reason: 'quota_reading',
+        now: 1000,
+        boundMs: 1999,
+      }),
+    ).toBeUndefined()
+    expect(
+      startVaultRoutingWait({
+        sessionId: 'session',
+        reason: 'account_free',
+        now: 1000,
+        nextMs: 2999,
+        boundMs: 5000,
+      }),
+    ).toBeUndefined()
     expect(calls).toEqual([])
     expect(uuid).not.toHaveBeenCalled()
   } finally {
@@ -152,7 +169,7 @@ test.each([
         sessionId: 'session',
         reason,
         now: 1000,
-        nextMs: 3000,
+        ...(reason === 'quota_reading' ? { boundMs: 2000 } : { nextMs: 3000 }),
         attempt: 2,
       })
       expect(end).toBeFunction()
@@ -161,7 +178,7 @@ test.each([
         kind: 'wait',
         wait_id: '12345678-1234-4234-8234-123456789abc',
         reason,
-        next_ms: 3000,
+        ...(reason === 'quota_reading' ? {} : { next_ms: 3000 }),
         attempt: 2,
         message,
       }

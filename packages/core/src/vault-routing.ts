@@ -48,21 +48,21 @@ export function startVaultRoutingWait(input: {
   sessionId: string | undefined
   reason: keyof typeof ROUTING_WAIT_MESSAGES
   now: number
-  nextMs: number
+  nextMs?: number
+  /** Planned duration bound used only for the short-wait filter, not a wake time. */
+  boundMs?: number
   attempt?: number
 }): ((outcome: 'resumed' | 'cancelled' | 'abandoned') => void) | undefined {
-  if (
-    !input.sessionId ||
-    !hasVaultRoutingAccessor() ||
-    input.nextMs - input.now < 2_000
-  )
+  const boundMs =
+    input.nextMs === undefined ? (input.boundMs ?? 0) : input.nextMs - input.now
+  if (!input.sessionId || !hasVaultRoutingAccessor() || boundMs < 2_000)
     return undefined
   const report = {
     sessionId: input.sessionId,
     kind: 'wait' as const,
     waitId: crypto.randomUUID(),
     reason: input.reason,
-    nextMs: input.nextMs,
+    ...(input.nextMs === undefined ? {} : { nextMs: input.nextMs }),
     ...(input.attempt === undefined ? {} : { attempt: input.attempt }),
     message: ROUTING_WAIT_MESSAGES[input.reason],
   }

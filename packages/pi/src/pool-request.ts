@@ -494,7 +494,7 @@ export async function routePiRequest<A extends RouteAttempt>(
       sessionId: ctx.sessionId,
       reason: 'quota_reading',
       now: at,
-      nextMs: at + (ctx.firstReadingWaitMs ?? FIRST_QUOTA_READING_WAIT_MS),
+      boundMs: ctx.firstReadingWaitMs ?? FIRST_QUOTA_READING_WAIT_MS,
     })
     await firstReading
     accounts = ctx.accounts()

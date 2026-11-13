@@ -53,7 +53,6 @@ for (const arrives of [true, false]) {
       kind: 'wait',
       wait_id: first?.wait_id,
       reason: 'quota_reading',
-      next_ms: now + 5000,
       message: 'Checking account quota',
     }
     expect(reports).toEqual([
@@ -68,6 +67,28 @@ for (const arrives of [true, false]) {
     expect(pulls).toBe(arrives ? 1 : 2)
   })
 }
+
+test('Pi quota wait with a custom bound below two seconds does not report', async () => {
+  const reports: unknown[] = []
+  Reflect.set(globalThis, key, () => ({
+    report: (payload: unknown) => reports.push(payload),
+  }))
+  const result = await routePiRequest({
+    accounts: () => [{ id: 'main', token: 'token' }],
+    storage: null,
+    mode: 'main-first',
+    sessionId: 'quota-session',
+    requestBytes: 10,
+    now: () => now,
+    firstReadingWaitMs: 1999,
+    refreshBackoff: () => new Map(),
+    requestPull: async () => {},
+    send: async () => ({ status: 200 }),
+    placePin: () => undefined,
+  })
+  expect(result.kind).toBe('blocked')
+  expect(reports).toEqual([])
+})
 
 test('Pi quota wait without an accessor creates no report id', async () => {
   Reflect.deleteProperty(globalThis, key)
