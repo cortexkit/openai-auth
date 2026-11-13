@@ -37,6 +37,7 @@ import {
   startMockDaemon,
   vaultLogin,
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
+import { vaultReceiptClock } from '../../../core/src/tests/fixtures/vault-receipt-clock'
 import { resetSettingsForTest } from '../config'
 import { PoolAccountSource } from '../core/pool-account-source'
 import { acquireOpenCodeVault } from '../core/shared-vault'
@@ -97,6 +98,7 @@ async function start(
   rows: PoolSeedRow[],
   credentials: Record<string, MockCredential>,
   options: {
+    vaultClock?: ReturnType<typeof vaultReceiptClock>
     hosted?: 'relay' | 'missing'
     menu?: boolean
     /** Runs on the seeded files before setup. */
@@ -157,6 +159,7 @@ async function start(
       stateDir,
       connectionFile: () => daemon.connectionFile,
       pollIntervalMs: 0,
+      ...options.vaultClock,
     },
   })
   cleanups.push(() => rmSync(files.dir, { recursive: true, force: true }))
@@ -177,6 +180,7 @@ async function start(
       stateDir,
       connectionFile: () => daemon.connectionFile,
       pollIntervalMs: 0,
+      ...options.vaultClock,
     },
     files.paths(),
   )
@@ -617,12 +621,21 @@ describe('vault accounts on OpenCode 2', () => {
   })
 
   it('a 401 on a kept receipt is not reported, and the account then refuses for the rest of the outage', async () => {
-    const { host, daemon } = await start('fallback-first', [{ id: 'main' }], {
-      'oauth:openai:vault': vaultLogin('chatgpt-vault', { record_version: 7 }),
-    })
+    const time = vaultReceiptClock()
+    const { host, daemon } = await start(
+      'fallback-first',
+      [{ id: 'main' }],
+      {
+        'oauth:openai:vault': vaultLogin('chatgpt-vault', {
+          record_version: 7,
+        }),
+      },
+      { vaultClock: time },
+    )
     expect((await send(host, 200)).get('authorization')).toBe(
       `Bearer ${VAULT_ACCESS}`,
     )
+    time.expireWaits()
     daemon.outage = 'connection_dropped'
     expect((await send(host, 401)).get('authorization')).toBe(
       `Bearer ${VAULT_ACCESS}`,
@@ -634,9 +647,17 @@ describe('vault accounts on OpenCode 2', () => {
   })
 
   it('a 401 reported while the vault answers is not served again during a later outage', async () => {
-    const { host, daemon } = await start('fallback-first', [{ id: 'main' }], {
-      'oauth:openai:vault': vaultLogin('chatgpt-vault', { record_version: 7 }),
-    })
+    const time = vaultReceiptClock()
+    const { host, daemon } = await start(
+      'fallback-first',
+      [{ id: 'main' }],
+      {
+        'oauth:openai:vault': vaultLogin('chatgpt-vault', {
+          record_version: 7,
+        }),
+      },
+      { vaultClock: time },
+    )
     const receipts = authorizedReceipts()
     // First, with nothing yet discarding the kept token, an outage is served with it.
     daemon.outage = 'connection_dropped'
@@ -656,6 +677,7 @@ describe('vault accounts on OpenCode 2', () => {
     expect(daemon.reports).toEqual([
       expect.objectContaining({ provider_status: 401, record_version: 7 }),
     ])
+    time.expireWaits()
     daemon.outage = 'connection_dropped'
     await expectVaultRefusal(host, 'vault-refused')
   })

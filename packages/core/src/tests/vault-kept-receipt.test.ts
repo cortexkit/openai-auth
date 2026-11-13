@@ -22,6 +22,7 @@ import {
   startMockDaemon,
   vaultLogin,
 } from './fixtures/mock-claustrum'
+import { vaultReceiptClock } from './fixtures/vault-receipt-clock'
 
 const cleanups: Array<() => Promise<void>> = []
 afterEach(async () => {
@@ -35,7 +36,7 @@ function credentials(): Record<string, MockCredential> {
   }
 }
 
-async function setup() {
+async function setup(clock?: ReturnType<typeof vaultReceiptClock>) {
   const dir = await mkdtemp(join(tmpdir(), 'openai-kept-'))
   const daemon: MockDaemon = await startMockDaemon({
     directory: dir,
@@ -51,6 +52,7 @@ async function setup() {
     connectionFile: () => daemon.connectionFile,
     pollIntervalMs: 0,
     now: () => now,
+    ...(clock ?? {}),
     fetchImpl: () =>
       (async (_input, init) => {
         const headers = new Headers(init?.headers)
@@ -106,6 +108,7 @@ async function setup() {
      * transport error (see `MockDaemon.outage`).
      */
     outage() {
+      clock?.expireWaits()
       daemon.outage = 'connection_dropped'
     },
     /** Makes the vault reachable again, holding `next`. */
@@ -210,7 +213,7 @@ describe('vault quota polls through a vault outage', () => {
   })
 
   test('a 401 on a kept quota token is neither retried nor reported, and the account then refuses', async () => {
-    const env = await setup()
+    const env = await setup(vaultReceiptClock())
     expect(await env.vault.pollQuota(env.a)).toEqual({ ok: true })
     expect(await env.vault.pollQuota(env.b)).toEqual({ ok: true })
     env.outage()
@@ -241,7 +244,7 @@ describe('vault quota polls through a vault outage', () => {
   })
 
   test('a fresh 401 reported before an outage is not served again during it', async () => {
-    const env = await setup()
+    const env = await setup(vaultReceiptClock())
     expect(await env.vault.pollQuota(env.b)).toEqual({ ok: true })
     env.status.set('account-a', 401)
     expect(await env.vault.pollQuota(env.a)).toMatchObject({ ok: false })
@@ -263,7 +266,7 @@ describe('vault quota polls through a vault outage', () => {
   })
 
   test('a vault refusal while reachable drops the kept token, so a later outage refuses that account', async () => {
-    const env = await setup()
+    const env = await setup(vaultReceiptClock())
     expect(await env.vault.pollQuota(env.a)).toEqual({ ok: true })
     expect(await env.vault.pollQuota(env.b)).toEqual({ ok: true })
     const credential = env.daemon.credentials.a

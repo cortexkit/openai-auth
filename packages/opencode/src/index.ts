@@ -831,6 +831,9 @@ interface CodexAuthPluginOptions {
       | 'connectScoped'
       | 'connectEnrollment'
       | 'pollIntervalMs'
+      | 'now'
+      | 'setTimeoutImpl'
+      | 'clearTimeoutImpl'
     >
   > & {
     /**
@@ -1361,6 +1364,13 @@ export async function CodexAuthPlugin(
         : {}),
       ...(options.vault?.pollIntervalMs !== undefined
         ? { pollIntervalMs: options.vault.pollIntervalMs }
+        : {}),
+      ...(options.vault?.now ? { now: options.vault.now } : {}),
+      ...(options.vault?.setTimeoutImpl
+        ? { setTimeoutImpl: options.vault.setTimeoutImpl }
+        : {}),
+      ...(options.vault?.clearTimeoutImpl
+        ? { clearTimeoutImpl: options.vault.clearTimeoutImpl }
         : {}),
       fetchImpl: () => fetch,
     },

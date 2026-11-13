@@ -50,6 +50,7 @@ import {
   startMockDaemon,
   vaultLogin,
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
+import { vaultReceiptClock } from '../../../core/src/tests/fixtures/vault-receipt-clock'
 import { authDoctorChecks, readStoreIds } from '../auth/doctor'
 import { createAuthMethods } from '../auth/methods'
 import { OPENAI_AGENT_HEADER } from '../codex-request'
@@ -182,6 +183,7 @@ async function plugin(
   slot: Record<string, unknown> = { ...PLACEHOLDER },
   options: Parameters<typeof loadPlugin>[0] = {},
   pollIntervalMs = 0,
+  vaultClock?: ReturnType<typeof vaultReceiptClock>,
 ) {
   const running = daemon
   if (!running) throw new Error('start the daemon first')
@@ -193,6 +195,7 @@ async function plugin(
           stateDir,
           connectionFile: () => running.connectionFile,
           pollIntervalMs,
+          ...vaultClock,
         },
       },
       slot,
@@ -858,6 +861,7 @@ describe('migrated credential refusal messages', () => {
   // served this process a token: once the vault is unreachable there is no
   // kept token to send with.
   test('a vault refusal returns a distinct fixed explanatory local 401', async () => {
+    const time = vaultReceiptClock()
     const running = await startDaemon({
       'oauth:openai:vault': vaultLogin('chatgpt-vault'),
     })
@@ -865,11 +869,12 @@ describe('migrated credential refusal messages', () => {
     enroll()
     seedPool(files, [{ id: 'main', enabled: false, quota: quotaMap(10) }])
     const wire = installWire()
-    await plugin()
+    await plugin(undefined, {}, 0, time)
     const send = await fetchOverride()
     expect(running.gets).toEqual([])
     await daemon!.stop()
     daemon = undefined
+    time.expireWaits()
     const response = await request(send)
     expect(response.status).toBe(401)
     const message = await response.text()
@@ -1059,6 +1064,7 @@ describe('vault cachekeep', () => {
     recordVersion = 7,
     local = false,
     replyHeaders: Record<string, string> = {},
+    vaultClock?: ReturnType<typeof vaultReceiptClock>,
   ) {
     const sidebarFile = join(dir, 'sidebar.json')
     process.env.OPENCODE_OPENAI_AUTH_SIDEBAR_STATE_FILE = sidebarFile
@@ -1095,9 +1101,14 @@ describe('vault cachekeep', () => {
       String(url).startsWith(codex.url.origin)
         ? originalFetch(url as string, init)
         : network(url as string, init)) as typeof globalThis.fetch
-    const { vault } = await plugin(PLACEHOLDER, {
-      codexApiEndpoint: new URL('/responses', codex.url).href,
-    })
+    const { vault } = await plugin(
+      PLACEHOLDER,
+      {
+        codexApiEndpoint: new URL('/responses', codex.url).href,
+      },
+      0,
+      vaultClock,
+    )
     const send = await fetchOverride()
     const routeId = local ? 'main' : vault.routes()[0]?.id
     if (!routeId) throw new Error('no route for warm')
@@ -1298,8 +1309,9 @@ describe('vault cachekeep', () => {
   })
 
   test('a 401 on a kept warm token is neither retried nor reported, and the account then refuses until the vault is back', async () => {
+    const time = vaultReceiptClock()
     const { running, vault, manager, sends, makeDue, setStatus, routeId } =
-      await trackedWarm(7)
+      await trackedWarm(7, false, {}, time)
     running.outage = 'connection_dropped'
     setStatus(401)
     makeDue()
@@ -1313,7 +1325,9 @@ describe('vault cachekeep', () => {
       Date.now(),
     )
     if (!routeId) throw new Error('no vault route')
+    time.expireWaits()
     expect(await vault.authorize(routeId)).toBeUndefined()
+    time.expireWaits(false)
     running.outage = undefined
     expect(await vault.authorize(routeId)).toMatchObject({ recordVersion: 7 })
     expect(running.reports).toEqual([])
@@ -2691,13 +2705,14 @@ describe('a vault outage after the vault has served this process', () => {
   })
 
   test('OpenCode 1: a vault refusal while reachable drops the kept token, so a later outage refuses with the vault-refused text and sends nothing', async () => {
+    const time = vaultReceiptClock()
     const running = await startDaemon({
       'oauth:openai:vault': vaultLogin('chatgpt-vault'),
     })
     enroll()
     seedPool(files, [{ id: 'main', quota: quotaMap(10) }])
     const wire = installWire()
-    const { vault } = await plugin()
+    const { vault } = await plugin(undefined, {}, 0, time)
     const send = await fetchOverride()
 
     // First, with nothing yet discarding the kept token, an outage is served with it.
@@ -2715,6 +2730,7 @@ describe('a vault outage after the vault has served this process', () => {
     expect(await refused.text()).toBe(VAULT_MODE_REFUSALS['vault-refused'])
 
     delete credential.refuse
+    time.expireWaits()
     running.outage = 'connection_dropped'
     const later = await request(send)
     expect(later.status).toBe(401)

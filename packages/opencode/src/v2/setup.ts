@@ -216,6 +216,9 @@ export interface OpenAIAuthV2Options {
       | 'connectScoped'
       | 'connectEnrollment'
       | 'pollIntervalMs'
+      | 'now'
+      | 'setTimeoutImpl'
+      | 'clearTimeoutImpl'
     >
   > & {
     /**
@@ -665,6 +668,13 @@ export async function setupOpenAIAuth(
         : {}),
       ...(options.vault?.pollIntervalMs !== undefined
         ? { pollIntervalMs: options.vault.pollIntervalMs }
+        : {}),
+      ...(options.vault?.now ? { now: options.vault.now } : {}),
+      ...(options.vault?.setTimeoutImpl
+        ? { setTimeoutImpl: options.vault.setTimeoutImpl }
+        : {}),
+      ...(options.vault?.clearTimeoutImpl
+        ? { clearTimeoutImpl: options.vault.clearTimeoutImpl }
         : {}),
       fetchImpl: () => fetchImpl,
     },
