@@ -6,17 +6,16 @@
 
 import { afterAll, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { installPackedPlugin, PACKAGE_NAME } from './fixtures/opencode2-pack'
+import {
+  discardScratch,
+  installPackedPlugin,
+  PACKAGE_NAME,
+} from './fixtures/opencode2-pack'
 
 const { consumer } = installPackedPlugin()
-// Removing the npm-installed consumer tree is cleanup, not a check. On a
-// loaded macOS disk it can take longer than Bun's 5 s hook limit.
-afterAll(
-  () => rmSync(dirname(consumer), { recursive: true, force: true }),
-  30_000,
-)
+afterAll(() => discardScratch(dirname(consumer)))
 
 function node(source: string) {
   return spawnSync('node', ['--input-type=module', '-e', source], {

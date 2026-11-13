@@ -1,8 +1,11 @@
 import { afterAll, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, rmSync, symlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, symlinkSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
-import { installPackedPackages } from './fixtures/opencode2-pack'
+import {
+  discardScratch,
+  installPackedPackages,
+} from './fixtures/opencode2-pack'
 
 // Loads the packed Pi extension the way Pi does: an npm install of the tarball
 // with its runtime dependencies, then an import of its entry under Node. The
@@ -17,7 +20,7 @@ if (!existsSync(join(piDir, 'dist', 'index.js')))
     'packages/pi/dist/index.js is missing: run `bun run build` first',
   )
 const consumer = installPackedPackages([piDir])
-afterAll(() => rmSync(dirname(consumer), { recursive: true, force: true }))
+afterAll(() => discardScratch(dirname(consumer)))
 
 // Pi itself supplies these peers. Link the workspace's copies rather than
 // download them; they are what the extension is built and tested against.

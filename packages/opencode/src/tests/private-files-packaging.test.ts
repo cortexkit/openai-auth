@@ -1,9 +1,12 @@
 import { describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { readdirSync, readFileSync, realpathSync } from 'node:fs'
 import { dirname, join, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { installPackedPackages } from './fixtures/opencode2-pack'
+import {
+  discardScratch,
+  installPackedPackages,
+} from './fixtures/opencode2-pack'
 
 const packages = join(import.meta.dir, '../../../..', 'packages')
 const installedTreeCheck = join(
@@ -103,7 +106,7 @@ describe('private-files packaging boundary', () => {
         assertExternalTree(join(root, 'dist'))
       }
     } finally {
-      rmSync(dirname(consumer), { recursive: true, force: true })
+      discardScratch(dirname(consumer))
     }
   }, 120_000)
 })

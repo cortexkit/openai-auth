@@ -3,7 +3,7 @@
 // Native private-file IO stays external to the bundles, so extracting just
 // the host's tarball would not reproduce a working consumer installation.
 
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -65,6 +65,26 @@ export function installPackedPackages(
     consumer,
   )
   return consumer
+}
+
+/**
+ * Removes a scratch install tree without making the test wait for it.
+ *
+ * Deleting an npm consumer is cleanup, not a check, but a synchronous delete
+ * blocks the test process: on a busy macOS disk it has taken 38 s, past any
+ * hook limit, and failed a release's packaging step after every test passed.
+ * A detached child does the delete instead and outlives the test process.
+ */
+export function discardScratch(root: string): void {
+  spawn(
+    process.execPath,
+    [
+      '-e',
+      'require("node:fs").rmSync(process.argv[1], { recursive: true, force: true })',
+      root,
+    ],
+    { detached: true, stdio: 'ignore' },
+  ).unref()
 }
 
 /** Installs the built plugin and its runtime dependencies into an empty consumer. */
