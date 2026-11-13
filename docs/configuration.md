@@ -216,7 +216,7 @@ Pinning is strongly recommended for any OpenCode plugin:
 
 ```json
 {
-  "plugin": ["@cortexkit/opencode-openai-auth@1.17.1"]
+  "plugin": ["@cortexkit/opencode-openai-auth@1.17.2"]
 }
 ```
 
@@ -247,7 +247,7 @@ The account you sign in to with a local ChatGPT method is your **main** account.
 Requires Pi 1.0.1 or newer. Install with Pi's package manager:
 
 ```bash
-pi install npm:@cortexkit/pi-openai-auth@1.17.1
+pi install npm:@cortexkit/pi-openai-auth@1.17.2
 ```
 
 For an unpinned install:
