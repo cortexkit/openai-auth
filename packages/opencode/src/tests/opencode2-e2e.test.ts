@@ -1508,26 +1508,64 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     })
   }, 180_000)
 
-  test('an imported OpenCode 1 placeholder alone does not activate pool routing', async () => {
-    const result = await runScenario({
-      transport: 'http',
-      upgrade: 'custom',
-      accounts: ['A'],
-      preparePoolCredential: false,
-      turns: [{}],
-    })
-    verify(result, () => {
-      expect(result.exits).toEqual([0])
-      const sent = samplesOn(result, 'http')
-      expect(sent.length).toBe(1)
-      expect(sent[0]?.headers['chatgpt-account-id']).toBeUndefined()
-      expect(sent[0]?.headers.originator).toBeUndefined()
-      expect(
-        primaries(result.wire).every((record) => record.identity === 'none'),
-      ).toBe(true)
-      expect(usedOn(result, 'main')).toBe(5)
-    })
-  }, 180_000)
+  for (const model of ['gpt-5.5', 'gpt-6.1-sol']) {
+    test(`an imported OpenCode 1 placeholder alone does not activate pool routing: ${model}`, async () => {
+      const result = await runScenario({
+        transport: 'http',
+        upgrade: 'custom',
+        accounts: ['A'],
+        preparePoolCredential: false,
+        model,
+        turns: [{}],
+      })
+      verify(result, () => {
+        // OpenCode 2.3 imports auth.json during fresh database bootstrap;
+        // earlier fresh hosts ignore it and can make an unowned, keyless send.
+        const [major = 0, minor = 0] =
+          OPENCODE_CLI_VERSION.split('.').map(Number)
+        const importsLegacy = major > 2 || (major === 2 && minor >= 3)
+        const errors = result.stdout.flatMap((output) =>
+          output
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line))
+            .filter((event) => event.type === 'error')
+            .map((event) => event.error),
+        )
+        if (importsLegacy) {
+          expect(result.exits).toEqual([1])
+          expect(errors).toEqual([
+            model === 'gpt-5.5'
+              ? {
+                  type: 'provider.no-route',
+                  message: 'Model unavailable: openai/gpt-5.5',
+                }
+              : {
+                  type: 'provider.auth',
+                  message: 'OPENAI_API_KEY is not set',
+                },
+          ])
+          expect(result.wire).toEqual([])
+          expect(result.samples).toEqual([])
+          expect(result.destinations).toEqual([])
+        } else {
+          expect(result.exits).toEqual([0])
+          expect(errors).toEqual([])
+          const sent = samplesOn(result, 'http')
+          expect(sent).toHaveLength(1)
+          expect(sent[0]?.headers['chatgpt-account-id']).toBeUndefined()
+          expect(sent[0]?.headers.originator).toBeUndefined()
+          expect(primaries(result.wire)).toHaveLength(1)
+        }
+        expect(result.wire.every((record) => record.identity === 'none')).toBe(
+          true,
+        )
+        expect(result.retries).toEqual([])
+        expect(usedOn(result, 'main')).toBe(5)
+        expect(result.state.accounts.main?.refresh).toBe('refresh-A')
+      })
+    }, 180_000)
+  }
 
   test('a selected pool placeholder after OpenCode 1 upgrade keeps a custom provider baseURL', async () => {
     const result = await runScenario({

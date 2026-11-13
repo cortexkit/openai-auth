@@ -11,13 +11,17 @@ import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
+import {
+  placeholderCredential,
+  placeholderSecret,
+} from '@cortexkit/common-auth/opencode2'
 import { vaultPaths, vaultStateDir } from '@cortexkit/openai-auth-core/internal'
 import {
   startMockDaemon,
   vaultLogin,
 } from '../../../../core/src/tests/fixtures/mock-claustrum'
 import { POOL_PLACEHOLDER } from '../../core/pool-migration'
+import { POOL_BROWSER_METHOD, VAULT_METHOD } from '../../v2/login'
 import { runtimeStateDir } from './opencode-host'
 import {
   MOCK_ACCOUNTS,
@@ -231,13 +235,15 @@ export async function runLimitAcceptance(input: Input) {
     input.blockedAlternative,
     input.allExhausted,
   )
-  const dataDir = join(env.XDG_DATA_HOME, 'opencode')
-  mkdirSync(dataDir, { recursive: true })
-  writeFileSync(
-    join(dataDir, 'auth.json'),
-    JSON.stringify({ openai: POOL_PLACEHOLDER }),
-    { mode: 0o600 },
-  )
+  if (input.host === 1) {
+    const dataDir = join(env.XDG_DATA_HOME, 'opencode')
+    mkdirSync(dataDir, { recursive: true })
+    writeFileSync(
+      join(dataDir, 'auth.json'),
+      JSON.stringify({ openai: POOL_PLACEHOLDER }),
+      { mode: 0o600 },
+    )
+  }
   const rosterGate = Promise.withResolvers<void>()
   const daemon = input.vault
     ? await startMockDaemon({
@@ -284,7 +290,6 @@ export async function runLimitAcceptance(input: Input) {
             providers: {
               openai: {
                 settings: {
-                  apiKey: placeholderSecret('openai'),
                   baseURL: `${mock.url}/v1`,
                   transport: input.transport ?? 'http',
                 },
@@ -324,6 +329,7 @@ function wrapperSource(input: Input): string {
     'const now = () => Number(readFileSync(process.env.OPENAI_AUTH_E2E_CLOCK, "utf8"))',
     // OC1 samples Date.now directly; freezing it also holds registry freshness
     // constant while vault discovery crosses the first-request boundary.
+    // Host logs can jump backwards when this clock replaces wall time.
     'Date.now = now',
     'const trace = (event) => appendFileSync(process.env.OPENAI_AUTH_E2E_POLICY_TRACE, JSON.stringify(event) + "\\n")',
     'const advance = (ms) => writeFileSync(process.env.OPENAI_AUTH_E2E_CLOCK, String(now() + ms))',
@@ -532,6 +538,35 @@ async function runHost(
   let error: unknown
   try {
     await start()
+    if (input.host === 2) {
+      // Use the host's credential API to select the same OAuth placeholder a
+      // plugin login returns; an OC1 auth.json marker is not an OC2 pool login.
+      const response = await fetch(`${url}/api/credential`, {
+        method: 'POST',
+        headers: {
+          authorization: `Basic ${btoa(`opencode:${env.OPENCODE_SERVER_PASSWORD}`)}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          integrationID: 'openai',
+          label: 'openai-auth acceptance pool',
+          value: placeholderCredential({
+            integrationID: 'openai',
+            methodID: input.vault ? VAULT_METHOD : POOL_BROWSER_METHOD,
+            now: POLICY_NOW,
+          }),
+          activate: true,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      })
+      if (!response.ok)
+        throw new Error(
+          `pool credential creation failed (${response.status}): ${await response.text()}`,
+        )
+      const created = (await response.json()) as { data?: { active?: boolean } }
+      if (!created.data?.active)
+        throw new Error('the host did not activate the pool credential')
+    }
     for (const [index, turn] of input.turns.entries()) {
       if (turn.restart) {
         await stop()
