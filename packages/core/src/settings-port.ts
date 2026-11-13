@@ -15,7 +15,6 @@ import type {
   OpenAiSettingsHandle,
   SettingsSnapshot,
   SnapshotHost,
-  SnapshotValues,
 } from './settings-snapshot.js'
 import { isRecord } from './util/record.js'
 
@@ -122,7 +121,7 @@ export function createBuiltinSettingsPort(options: {
     },
     async update(mutator) {
       try {
-        // Never replace a list based on a stale watcher snapshot.
+        // Refresh the menu view and catch existing file problems before editing.
         await snapshot.refresh()
         const before = menuView(snapshot)
         const tracked = trackFloors(structuredClone(before))
@@ -161,7 +160,8 @@ export function createBuiltinSettingsPort(options: {
         ]))
           if (!isDeepStrictEqual(oldAccounts[id], accounts[id]))
             tracked.accounts.add(id)
-        if (tracked.touched() || tracked.accounts.size > 0) {
+        const editFloors = tracked.touched() || tracked.accounts.size > 0
+        if (editFloors) {
           if (
             snapshot
               .report()
@@ -173,27 +173,52 @@ export function createBuiltinSettingsPort(options: {
               )
           )
             throw new SettingsRefusal('settings-invalid-value', options.file)
-          let floors = snapshot.get('killswitch_account_floors')
-          for (const id of tracked.accounts) {
-            // Vault ids name one account on both hosts. Local ids name only
-            // this host's account; all entries belonging to the other host stay.
-            floors = floors.filter(
-              (entry) =>
-                entry.account !== id ||
-                (!id.startsWith('vault:') && entry.host !== host),
-            )
-            const own = record(accounts[id])
-            if (Object.keys(own).length > 0)
-              floors.push({
-                account: id,
-                host: id.startsWith('vault:') ? 'both' : host,
-                primary: own.primary ?? 0,
-                secondary: own.secondary ?? 0,
-              } as SnapshotValues['killswitch_account_floors'][number])
-          }
-          edits.push({ setting: 'killswitch_account_floors', value: floors })
         }
-        await writer.update(edits, { host })
+        await writer.update(
+          (current) => {
+            const planned = [...edits]
+            if (editFloors) {
+              // Merge against the locked file, not the menu snapshot: another
+              // host may have saved an unrelated account while the menu was open.
+              const base =
+                current.status === 'ready' &&
+                Object.hasOwn(current.document, 'killswitch_account_floors')
+                  ? current.document.killswitch_account_floors
+                  : openaiSettings.settings.killswitch_account_floors.default
+              if (!Array.isArray(base))
+                throw new SettingsRefusal(
+                  'settings-invalid-value',
+                  options.file,
+                )
+              let floors: unknown[] = base
+              for (const id of tracked.accounts) {
+                // Vault ids name one account on both hosts. Local ids name only
+                // this host's account; all entries belonging to the other host stay.
+                floors = floors.filter(
+                  (entry) =>
+                    record(entry).account !== id ||
+                    (!id.startsWith('vault:') && record(entry).host !== host),
+                )
+                const own = record(accounts[id])
+                if (Object.keys(own).length > 0)
+                  floors.push({
+                    account: id,
+                    host: id.startsWith('vault:') ? 'both' : host,
+                    primary: own.primary ?? 0,
+                    secondary: own.secondary ?? 0,
+                  })
+              }
+              // The writer validates the complete list against its declaration
+              // before publishing either the floors or the scalar edits.
+              planned.push({
+                setting: 'killswitch_account_floors',
+                value: floors,
+              })
+            }
+            return planned
+          },
+          { host },
+        )
         // Publish to request readers and live-setting callbacks before success.
         await snapshot.refresh()
       } catch (error) {

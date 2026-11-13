@@ -24,9 +24,21 @@ import type { MenuVault } from '../vault-account-menu'
 
 const log = { warn() {}, info() {} }
 const invocation = { notify() {} }
+const { setSettingsWriteStepHookForTest } = (await import(
+  new URL('write.js', import.meta.resolve('@cortexkit/common-auth/settings'))
+    .href
+)) as {
+  setSettingsWriteStepHookForTest(
+    hook?: (
+      step: 'staged',
+      paths: { target: string; temp: string },
+    ) => void | Promise<void>,
+  ): void
+}
 const folders: string[] = []
 const snapshots: SettingsSnapshot[] = []
 afterEach(async () => {
+  setSettingsWriteStepHookForTest()
   for (const snapshot of snapshots.splice(0)) snapshot.dispose()
   for (const folder of folders.splice(0))
     await rm(folder, { recursive: true, force: true })
@@ -63,6 +75,14 @@ async function fixture(
       file,
       typeof values === 'string' ? values : JSON.stringify(values),
     )
+  return settingsPort(file, host)
+}
+
+async function settingsPort(
+  file: string,
+  host: SnapshotHost,
+  beforeWrite?: () => void,
+) {
   const handle: OpenAiSettingsHandle = {
     ...openSettings(openaiSettings, {
       file,
@@ -75,7 +95,23 @@ async function fixture(
   }
   const snapshot = await createSettingsSnapshot({ handle, file, host })
   snapshots.push(snapshot)
-  const port = createBuiltinSettingsPort({ file, host, snapshot, log })
+  const port = createBuiltinSettingsPort({
+    file,
+    host,
+    snapshot,
+    log,
+    ...(beforeWrite
+      ? {
+          writer: {
+            ...handle,
+            update: (...args: Parameters<OpenAiSettingsHandle['update']>) => {
+              beforeWrite()
+              return handle.update(...args)
+            },
+          },
+        }
+      : {}),
+  })
   const menu = createOpenAiMenu({ store: store(), settings: port })
   const saved = () => handle.get('killswitch_account_floors', { host })
   return { file, host, snapshot, port, menu, handle, saved }
@@ -87,6 +123,17 @@ const floor = (
   primary = 30,
   secondary = 40,
 ) => ({ account, host, primary, secondary })
+function setFloor(
+  settings: PoolSettings,
+  account: string,
+  primary: number,
+  secondary: number,
+) {
+  const killswitch = settings.killswitch as {
+    accounts: Record<string, { primary: number; secondary: number }>
+  }
+  killswitch.accounts[account] = { primary, secondary }
+}
 const apply = (
   menu: ReturnType<typeof createOpenAiMenu>,
   sectionId: string,
@@ -110,6 +157,38 @@ const floors = (
   primary: number | null,
   secondary: number | null,
 ) => apply(menu, 'limits', 'floors', { primary, secondary }, id)
+
+async function overlappingFloorEdits(
+  initial: ReturnType<typeof floor>[],
+  firstEdit: SettingsMutator,
+  secondEdit: SettingsMutator,
+) {
+  const first = await fixture({ killswitch_account_floors: initial })
+  const releaseFirst = Promise.withResolvers<void>()
+  const staged = Promise.withResolvers<void>()
+  const second = await settingsPort(first.file, 'pi', releaseFirst.resolve)
+  await Promise.all([first.port.read(), second.port.read()])
+  let held = false
+  setSettingsWriteStepHookForTest(async (_step, { target }) => {
+    if (target !== first.file || held) return
+    held = true
+    // Leave the old file visible until the other port has refreshed and called
+    // its writer. The second update must then wait for the first write's lock.
+    staged.resolve()
+    await releaseFirst.promise
+  })
+  const firstWrite = first.port.update(firstEdit)
+  try {
+    await staged.promise
+    await Promise.all([firstWrite, second.port.update(secondEdit)])
+    return JSON.parse(await readFile(first.file, 'utf8'))
+      .killswitch_account_floors
+  } finally {
+    releaseFirst.resolve()
+    await firstWrite
+    setSettingsWriteStepHookForTest()
+  }
+}
 
 describe('shared builtin settings port', () => {
   test.each([
@@ -315,6 +394,98 @@ test('Pi updates only its existing host override', async () => {
 })
 
 describe('fresh list edits and refusals', () => {
+  test('overlapping local floor edits from two hosts preserve both updates', async () => {
+    const untouched = [
+      floor('alpha', 'pi', 21, 22),
+      floor('vault:other', 'both'),
+    ]
+    expect(
+      await overlappingFloorEdits(
+        [floor('alpha', 'opencode'), floor('beta', 'pi'), ...untouched],
+        (settings) => {
+          setFloor(settings, 'alpha', 71, 72)
+        },
+        (settings) => {
+          setFloor(settings, 'beta', 81, 82)
+        },
+      ),
+    ).toEqual([
+      ...untouched,
+      floor('alpha', 'opencode', 71, 72),
+      floor('beta', 'pi', 81, 82),
+    ])
+  })
+
+  test('overlapping vault floor edits use the last host values and preserve other accounts', async () => {
+    const untouched = [floor('alpha', 'opencode'), floor('beta', 'pi')]
+    expect(
+      await overlappingFloorEdits(
+        [
+          floor('vault:shared', 'both'),
+          floor('vault:shared', 'pi'),
+          ...untouched,
+        ],
+        (settings) => {
+          setFloor(settings, 'vault:shared', 71, 72)
+        },
+        (settings) => {
+          setFloor(settings, 'vault:shared', 81, 82)
+        },
+      ),
+    ).toEqual([...untouched, floor('vault:shared', 'both', 81, 82)])
+  })
+
+  test.each([
+    { name: 'non-array', value: {} },
+    { name: 'null', value: null },
+    {
+      name: 'incomplete entry',
+      value: [{ account: 'beta', host: 'pi', primary: 80 }],
+    },
+    { name: 'null entry', value: [null] },
+  ])(
+    'a floor value made invalid after the last read refuses without writing scalar edits: $name',
+    async ({ value }) => {
+      const f = await fixture({
+        killswitch_account_floors: [floor('alpha', 'opencode')],
+      })
+      const invalid = JSON.stringify({ killswitch_account_floors: value })
+      await expect(
+        f.port.update(async (settings) => {
+          setFloor(settings, 'alpha', 71, 72)
+          settings.routing = {
+            ...(settings.routing as object),
+            mode: 'ordered',
+          }
+          // Mutators run after the port's last refresh, before the writer locks.
+          await writeFile(f.file, invalid)
+        }),
+      ).rejects.toMatchObject({
+        code: 'settings-invalid-value',
+        message: "That value isn't allowed for this setting.",
+      })
+      expect(await readFile(f.file, 'utf8')).toBe(invalid)
+    },
+  )
+
+  test.each(['key', 'file'] as const)(
+    'floor edits use the declared default when the %s disappears after the last read',
+    async (missing) => {
+      const f = await fixture({
+        killswitch_account_floors: [
+          floor('alpha', 'opencode'),
+          floor('beta', 'pi'),
+        ],
+      })
+      await f.port.update(async (settings) => {
+        setFloor(settings, 'alpha', 71, 72)
+        if (missing === 'file') await rm(f.file)
+        else await writeFile(f.file, '{}')
+      })
+      expect(await f.saved()).toEqual([floor('alpha', 'opencode', 71, 72)])
+    },
+  )
+
   test.each(['unparseable', 'unreadable'])(
     'a floor edit refuses an %s file without writing',
     async (kind) => {
