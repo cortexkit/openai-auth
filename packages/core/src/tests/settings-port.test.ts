@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CommandApplyRequest } from '@cortexkit/common-auth/commands'
@@ -67,7 +74,10 @@ async function fixture(
   values: Record<string, unknown> | string | null = {},
   host: SnapshotHost = 'opencode',
 ) {
-  const folder = await mkdtemp(join(tmpdir(), 'settings-port-'))
+  // The settings writer reports canonical paths to its step hook, so the
+  // overlap tests compare against the folder's real path, not tmpdir()'s alias
+  // (/var on macOS, short names on Windows).
+  const folder = await realpath(await mkdtemp(join(tmpdir(), 'settings-port-')))
   folders.push(folder)
   const file = join(folder, 'settings.jsonc')
   if (values !== null)
@@ -177,12 +187,24 @@ async function overlappingFloorEdits(
     staged.resolve()
     await releaseFirst.promise
   })
-  const firstWrite = first.port.update(firstEdit)
+  // Which update finished first goes into the failure message, so a rare
+  // failure under load explains itself.
+  const finished: string[] = []
+  const firstWrite = first.port.update(firstEdit).then(() => {
+    finished.push('opencode')
+  })
   try {
     await staged.promise
-    await Promise.all([firstWrite, second.port.update(secondEdit)])
-    return JSON.parse(await readFile(first.file, 'utf8'))
-      .killswitch_account_floors
+    await Promise.all([
+      firstWrite,
+      second.port.update(secondEdit).then(() => {
+        finished.push('pi')
+      }),
+    ])
+    const floors = JSON.parse(
+      await readFile(first.file, 'utf8'),
+    ).killswitch_account_floors
+    return { floors, finished: `finished: ${finished.join(' then ')}` }
   } finally {
     releaseFirst.resolve()
     await firstWrite
@@ -399,17 +421,16 @@ describe('fresh list edits and refusals', () => {
       floor('alpha', 'pi', 21, 22),
       floor('vault:other', 'both'),
     ]
-    expect(
-      await overlappingFloorEdits(
-        [floor('alpha', 'opencode'), floor('beta', 'pi'), ...untouched],
-        (settings) => {
-          setFloor(settings, 'alpha', 71, 72)
-        },
-        (settings) => {
-          setFloor(settings, 'beta', 81, 82)
-        },
-      ),
-    ).toEqual([
+    const { floors, finished } = await overlappingFloorEdits(
+      [floor('alpha', 'opencode'), floor('beta', 'pi'), ...untouched],
+      (settings) => {
+        setFloor(settings, 'alpha', 71, 72)
+      },
+      (settings) => {
+        setFloor(settings, 'beta', 81, 82)
+      },
+    )
+    expect(floors, finished).toEqual([
       ...untouched,
       floor('alpha', 'opencode', 71, 72),
       floor('beta', 'pi', 81, 82),
@@ -418,21 +439,23 @@ describe('fresh list edits and refusals', () => {
 
   test('overlapping vault floor edits use the last host values and preserve other accounts', async () => {
     const untouched = [floor('alpha', 'opencode'), floor('beta', 'pi')]
-    expect(
-      await overlappingFloorEdits(
-        [
-          floor('vault:shared', 'both'),
-          floor('vault:shared', 'pi'),
-          ...untouched,
-        ],
-        (settings) => {
-          setFloor(settings, 'vault:shared', 71, 72)
-        },
-        (settings) => {
-          setFloor(settings, 'vault:shared', 81, 82)
-        },
-      ),
-    ).toEqual([...untouched, floor('vault:shared', 'both', 81, 82)])
+    const { floors, finished } = await overlappingFloorEdits(
+      [
+        floor('vault:shared', 'both'),
+        floor('vault:shared', 'pi'),
+        ...untouched,
+      ],
+      (settings) => {
+        setFloor(settings, 'vault:shared', 71, 72)
+      },
+      (settings) => {
+        setFloor(settings, 'vault:shared', 81, 82)
+      },
+    )
+    expect(floors, finished).toEqual([
+      ...untouched,
+      floor('vault:shared', 'both', 81, 82),
+    ])
   })
 
   test.each([
