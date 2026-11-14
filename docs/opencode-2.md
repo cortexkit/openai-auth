@@ -20,6 +20,8 @@ Sign in with `opencode auth login openai` (or the TUI) and pick **ChatGPT (opena
 
 A pool login stores ChatGPT credentials in the shared [account pool](accounts-and-routing.md#the-account-pool) and gives OpenCode 2 a **placeholder**, a non-secret marker instead of those credentials. The plugin handles only requests whose Authorization bearer matches that marker. API keys, environment keys and OpenCode's built-in ChatGPT logins pass through unchanged. Selecting the pool login as the active OpenAI connection enables pool routing; selecting another credential bypasses it. If no pool account can serve, the request is refused locally, never sent with the marker.
 
+If you upgraded from OpenCode 1, sign in this way once even though your accounts are already in the pool. OpenCode 2.3 and later import OpenCode 1's `auth.json`, which holds only the plugin's placeholder, and make it the active OpenAI sign-in. Requests then fail with `Model unavailable: openai/gpt-5.5` or `OPENAI_API_KEY is not set` until you sign in with the plugin. See [Troubleshooting](troubleshooting.md#opencode-2-says-model-unavailable-or-openai_api_key-is-not-set-after-upgrading-from-opencode-1).
+
 ### Vault-only hosts
 
 To use only the [Claustrum vault](vault.md), enroll OpenCode with `/openai` → **Vault** → **Connect** first, then choose **ChatGPT accounts in the vault**, or run `opencode2 auth login openai --method openai-auth-vault` (use your OpenCode 2 executable's name). This activates vault routing without browser sign-in or a local pool account; OpenCode 2 stores only the placeholder. OpenCode 1 and 2 share the `openai-auth-opencode` enrollment and its token/state files; vault login refuses until that enrollment is approved.

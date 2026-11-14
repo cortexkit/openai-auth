@@ -37,6 +37,15 @@ rm -rf ~/.cache/opencode
 
 The **Auth doctor** in the `opencode auth login` menu checks stored credentials and offers repairs; see [Commands](commands.md#from-a-terminal-without-a-tui-session). If it reports an [untagged pool placeholder](accounts-and-routing.md#the-account-pool) or [old vault tombstone](vault.md#leftovers-from-earlier-versions), a login has been replaced by a marker, not a usable token. Follow the linked migration or vault guidance to restore access.
 
+## OpenCode 2 says `Model unavailable` or `OPENAI_API_KEY is not set` after upgrading from OpenCode 1
+
+If you used openai-auth on OpenCode 1, its `auth.json` holds the plugin's placeholder under `openai`. The first time OpenCode 2.3 or later starts with a new database, it imports that file and makes the placeholder your active OpenAI sign-in. The placeholder isn't a usable login, and openai-auth doesn't treat it as one of its own sign-ins, so OpenCode fails the request before it is sent:
+
+- `Model unavailable: openai/gpt-5.5` (older models, which OpenCode hides for ChatGPT sign-ins)
+- `OPENAI_API_KEY is not set` (newer models)
+
+To fix it, sign in once with **ChatGPT (openai-auth pool, browser)** or **ChatGPT (openai-auth pool, headless)** (see [Signing in](opencode-2.md#signing-in)), or **ChatGPT accounts in the vault** if you use the vault. That makes the plugin's own sign-in active; your accounts are already in the pool, so nothing else is needed. openai-auth can't detect this state itself: OpenCode 2 doesn't tell plugins which sign-in method is active.
+
 ## `Failed to authorize` after the account menu
 
 The `opencode auth login` account menu saves your change itself, then reports a failed sign-in to prevent OpenCode from recording an extra account as its main login. OpenCode prints `Failed to authorize` for that response, even though the menu change was saved. Open the plugin's `/openai` menu to see the result.
