@@ -77,7 +77,7 @@ On Pi, `openai-auth.json` lives in Pi's agent folder (`PI_CODING_AGENT_DIR`, els
 
 - **Reasoning effort:** for the models in `MID_CONVERSATION_EFFORT_MODELS`, the request keeps the effort the session opened with, and a later change travels as a `configuration_update` input item before the new user turn. A changed request-level effort would invalidate the cached prefix.
 - **Responses Lite:** a compact request shape for the models the backend marks Lite (`RESPONSES_LITE_MODELS`). It's off unless the `responsesLite` setting is on.
-- **Models:** `codexOAuthModelListed` and `codexOAuthModelLimit` in `packages/opencode/src/index.ts` decide which models a ChatGPT login is offered and their context windows. OpenCode 2 applies the same rules through `v2/models.ts`. Pi registers its own fixed model list.
+- **Models:** `codexOAuthModelListed` and `codexOAuthModelLimit` in `packages/opencode/src/codex-models.ts` decide which models a ChatGPT login is offered and their context windows. OpenCode 2 applies the same rules through `v2/models.ts`. Pi registers its own fixed model list.
 
 ## Transports and no replay
 

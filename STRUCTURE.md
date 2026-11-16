@@ -29,7 +29,11 @@ Each package keeps its tests in `src/tests/`. `@cortexkit/common-auth` (the libr
 
 ## `packages/opencode/src`
 
-- `index.ts`: the OpenCode 1 plugin: auth loader, fetch override, legacy path, model rules, `/openai` hook. `bin.ts` and `setup.ts`: the `opencode-openai-auth setup` command.
+- `index.ts`: the OpenCode 1 plugin: auth loader, fetch override, legacy path, `/openai` hook. `bin.ts` and `setup.ts`: the `opencode-openai-auth setup` command.
+- `codex-models.ts`: the shared ChatGPT model allow/deny rules, context windows and reasoning-variant sources.
+- `reset-target.ts`: reset-credit account and bearer resolution, and auth-persistence errors.
+- `sidebar-snapshot.ts`: sidebar snapshot builders, pushed quota metadata and session-id resolution.
+- `codex-effort.ts`: mid-conversation reasoning effort and Responses Lite request shaping.
 - `codex-request.ts`, `codex-body.ts`, `codex-sessions.ts`: the Codex request shape and the per-session thread ids.
 - `ws.ts`, `ws-pool.ts`, `raw-ws*.ts`, `codex-http.ts`: OpenCode 1's WebSocket transport and its HTTP fallback.
 - `core/`: host-owned machinery: `pool-request.ts` (one request over the pool or vault), `pool-account-source.ts`, `pool-migration.ts`, `pool-lifecycle.ts`, `host-slot.ts`, `version-fence.ts`, `process-heartbeat.ts`, `runtime-layout.ts`, `account-paths.ts`, `limit-source.ts`, `shared-vault.ts`, `cachekeep.ts`, `background-quota-refresh.ts`.

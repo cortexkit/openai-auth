@@ -4,14 +4,7 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const LIMIT = 5000
-const EXCEPTIONS = [
-  {
-    path: 'packages/opencode/src/index.ts',
-    maxLines: 5536,
-    reason:
-      'OpenCode 1 plugin entry; may not grow; split by area when next worked in',
-  },
-]
+const EXCEPTIONS = []
 
 // Exempt *.test.*, *.spec.*, test/, tests/, fixture/ and fixtures/; tui-compiled/ is generated.
 function exempt(path) {

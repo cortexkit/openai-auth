@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { statSync } from 'node:fs'
 import os from 'node:os'
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
@@ -12,10 +12,7 @@ import {
   adoptRpcServer,
   type RpcServerAdoption,
 } from '@cortexkit/common-auth/rpc'
-import {
-  type ResetTargetIdentity,
-  writeSettings,
-} from '@cortexkit/openai-auth-core'
+import { writeSettings } from '@cortexkit/openai-auth-core'
 import {
   type AccountStorage,
   acquireRefreshFileLock,
@@ -87,8 +84,16 @@ import type {
 } from '@opencode-ai/plugin'
 import { createAuthMethods } from './auth/methods'
 import {
+  applyMidConversationEffort,
+  rewriteResponsesLiteBody,
+} from './codex-effort'
+import {
+  codexOAuthModelLimit,
+  codexOAuthModelListed,
+  codexOAuthModelVariantSource,
+} from './codex-models'
+import {
   type CodexSessionMetadata,
-  isMessageWithRole,
   OPENAI_AGENT_HEADER,
   prepareCodexRequest,
 } from './codex-request'
@@ -149,7 +154,6 @@ import {
   type PoolLifecycleDeps,
 } from './core/pool-lifecycle'
 import {
-  findPoolMainRow,
   isPoolMainPlaceholder,
   MainAccountInPoolError,
   POOL_LOGIN_REQUIRED_MESSAGE,
@@ -211,6 +215,12 @@ import { createLogger, setLogLevel } from './logger'
 import { loadModelsDevCosts } from './model-costs'
 import { resolvePromptContext } from './prompt-context'
 import {
+  AuthPersistError,
+  buildResetRedemptionDeps,
+  createResetTargetResolver,
+  isAuthPersistError,
+} from './reset-target'
+import {
   drainNotifications,
   isTuiConnected,
   pushNotification,
@@ -218,6 +228,12 @@ import {
 import type { ApplyRequest, ApplyResult } from './rpc/protocol'
 import { resolveRpcDir } from './rpc/rpc-dir'
 import { RPC_SERVER_REGISTRY_KEY, startRpcServer } from './rpc/rpc-server'
+import {
+  buildSidebarMachineState,
+  findCachekeepFallbackAccount,
+  mergePushedQuotaMetadata,
+  resolveSidebarSessionId,
+} from './sidebar-snapshot'
 import {
   type AccountQuota,
   applyStickyPinOverlay,
@@ -232,12 +248,10 @@ import {
   isQuotaExhausted,
   persistSidebarStickyAssignment,
   planSidebarStickyAssignmentFromSnapshot,
-  type QuotaWindow,
   rememberStickyPin,
   removeSidebarActiveRouting,
   resolveSessionStickyAccount,
   type SidebarBookkeepingQueue,
-  type SidebarMachineState,
   type SidebarSnapshot,
   type SidebarState,
   type StickyPinOverlay,
@@ -246,97 +260,38 @@ import {
   settleWithinBudget,
   upsertSidebarActiveRouting,
 } from './sidebar-state'
-import { stableStringify } from './util/stable-json'
 import { uuidV7 } from './util/uuid-v7'
 import { PackageVersion } from './version'
 import { observeHttpCompletion } from './ws'
 import { OpenAIWebSocketPool } from './ws-pool'
 
-export const ALLOWED_MODELS = new Set([
-  'gpt-5.5',
-  'gpt-5.3-codex-spark',
-  'gpt-5.4',
-  'gpt-5.4-mini',
-])
-// The suffix-less gpt-5.6 model is rejected by the Codex OAuth backend
-// ("not supported when using Codex with a ChatGPT account"); only the
-// -luna/-sol/-terra variants work. Its -fast/-pro synthetics inherit the same
-// api.id ("gpt-5.6"), so filtering on api.id drops them all at once while
-// keeping the working variants (api.id gpt-5.6-luna, etc.).
-// Same shape for gpt-6: the backend rejects the bare id ("not supported when
-// using Codex with a ChatGPT account") and serves only the named variants
-// (gpt-6-astra, gpt-6-sol, gpt-6-luna), so any -fast/-pro synthetics inheriting
-// api.id "gpt-6" drop with it. gpt-6.1 is the same again: gpt-6.1-sol and
-// gpt-6.1-terra are served, but the bare id (like gpt-6.1-luna and
-// gpt-6.1-astra) answers 400.
-export const DISALLOWED_MODELS = new Set(['gpt-5.6', 'gpt-6', 'gpt-6.1'])
-
-/**
- * Whether a model (by its API id) is offered on a ChatGPT login: the allow
- * list, else not the deny list and a GPT version above 5.4. The caller drops
- * `pro` reasoning variants itself. Shared by the OpenCode 1 models hook and
- * the OpenCode 2 model transform.
- */
-export function codexOAuthModelListed(apiId: string): boolean {
-  if (ALLOWED_MODELS.has(apiId)) return true
-  if (DISALLOWED_MODELS.has(apiId)) return false
-  // The minor is optional: a major-only id like gpt-6-astra carries no
-  // decimal, and requiring one silently dropped it from the catalogue even
-  // though the backend serves it.
-  const match = apiId.match(/^gpt-(\d+(?:\.\d+)?)/)
-  const version = match?.[1]
-  return version ? parseFloat(version) > 5.4 : false
-}
-
-/**
- * The context window a ChatGPT login gets for a model (by its id), or
- * undefined to keep the model's own. Shared by the OpenCode 1 models hook and
- * the OpenCode 2 model transform.
- */
-export function codexOAuthModelLimit(
-  modelId: string,
-): { context: number; input: number; output: number } | undefined {
-  if (modelId.includes('gpt-5.5'))
-    return { context: 400_000, input: 272_000, output: 128_000 }
-  // OpenAI's ChatGPT rate card (help.openai.com/en/articles/20001415, read
-  // 2026-10-26), "Long-context pricing in Codex": "When you use Codex signed
-  // in with ChatGPT, no long-context multiplier applies to any Codex model,
-  // including requests above 272K input tokens."
-  //
-  // The 5.6 variants, gpt-6-sol and gpt-6-luna had 372k context / 244k input
-  // caps only to avoid the former 2x long-context charge. With that charge gone,
-  // they use the Codex catalog's reported max_context_window of 872000, as
-  // gpt-6-astra already does. Input and output share the window, so `input`
-  // leaves a 128k output reserve.
-  //
-  // This pricing applies to the default ChatGPT endpoint. A `codexApiEndpoint`
-  // override pointed at a relay or differently billed surface may still charge;
-  // the operator must re-check its pricing rather than assume the exemption.
-  if (
-    modelId.includes('gpt-5.6') ||
-    modelId.includes('gpt-6-astra') ||
-    modelId.includes('gpt-6-sol') ||
-    modelId.includes('gpt-6-luna')
-  )
-    return { context: 872_000, input: 744_000, output: 128_000 }
-  // gpt-6.1-sol gets Codex's own 500k default context (raised from 272k
-  // around 2026-10-12). gpt-6.1-terra uses the same default: Codex CLI's
-  // models_cache.json (client 0.164.0, fetched 2026-10-26T18:37Z) reports
-  // context_window 500000, despite max_context_window 872000. `input` is the
-  // default window minus the 128k output reserve. As for gpt-6-astra, an
-  // endpoint override pointed at a differently billed surface is the operator's
-  // to re-check; the ChatGPT rate card does not establish platform API pricing.
-  if (modelId.includes('gpt-6.1-sol') || modelId.includes('gpt-6.1-terra'))
-    return { context: 500_000, input: 372_000, output: 128_000 }
-  return undefined
-}
-
-/** Terra supports Sol's reasoning variants before every host catalog knows it. */
-export function codexOAuthModelVariantSource(
-  modelId: string,
-): string | undefined {
-  return modelId === 'gpt-6.1-terra' ? 'gpt-6.1-sol' : undefined
-}
+export {
+  MID_CONVERSATION_EFFORT_MODELS,
+  rewriteResponsesLiteBody,
+} from './codex-effort'
+export {
+  ALLOWED_MODELS,
+  codexOAuthModelLimit,
+  codexOAuthModelListed,
+  codexOAuthModelVariantSource,
+  DISALLOWED_MODELS,
+} from './codex-models'
+export {
+  AuthPersistError,
+  buildResetRedemptionDeps,
+  createResetTargetResolver,
+  type PoolResetAccess,
+  poolResetTarget,
+  ResetTargetResolutionError,
+  type ResetTargetResolutionErrorKind,
+} from './reset-target'
+export {
+  buildSidebarMachineState,
+  buildSidebarState,
+  findCachekeepFallbackAccount,
+  mergePushedQuotaMetadata,
+  resolveSidebarSessionId,
+} from './sidebar-snapshot'
 
 /**
  * Surfaced when a request would go to the wire with no credential.
@@ -384,340 +339,6 @@ export function __resetBootQuotaSeedForTest(): void {
 const logModels = createLogger('models')
 let loggedCostRestoration = false
 let warnedCostCatalogUnavailable = false
-
-export class AuthPersistError extends Error {
-  readonly code = 'OPENAI_AUTH_PERSIST_FAILED'
-
-  constructor(cause: unknown) {
-    super(
-      'OpenAI OAuth token refreshed but could not be persisted; re-login required',
-      { cause },
-    )
-    this.name = 'AuthPersistError'
-  }
-}
-
-export type ResetTargetResolutionErrorKind =
-  | 'unknown_account'
-  | 'disabled_account'
-  | 'non_oauth_account'
-  | 'token_unavailable'
-
-export class ResetTargetResolutionError extends Error {
-  readonly code: ResetTargetResolutionErrorKind
-
-  constructor(code: ResetTargetResolutionErrorKind, message: string) {
-    super(message)
-    this.name = 'ResetTargetResolutionError'
-    this.code = code
-  }
-}
-
-interface ResetTargetResolverDeps {
-  getAuth: () => Promise<{
-    type: string
-    access?: string
-    refresh?: string
-    expires?: number
-  }>
-  refreshMainWithLease: () => Promise<{
-    access: string
-    refresh: string
-    expires: number
-  }>
-  refreshFallbackAccount: (
-    account: OAuthAccount,
-    storage: AccountStorage,
-  ) => Promise<OAuthAccount>
-  /**
-   * Refresh the pool row `main` while it serves as the main account. Defaults
-   * to refreshFallbackAccount.
-   */
-  refreshPoolMainRow?: (
-    account: OAuthAccount,
-    storage: AccountStorage,
-  ) => Promise<OAuthAccount>
-  /**
-   * On a migrated install, the pool row behind an account key (`main` is row
-   * `main`) and its usable bearer, refreshed through the pool. Undefined when
-   * the install is not migrated; the legacy slot and roster then apply.
-   */
-  poolAccess?: (accountKey: string) => Promise<PoolResetAccess | undefined>
-  loadAccounts: typeof loadAccounts
-  accountStoragePath: string
-  accountStatePath: string
-  now: () => number
-}
-
-function resetTargetNeedsRefresh(
-  access: string | undefined,
-  expires: number | undefined,
-  storage: AccountStorage | null,
-  now: number,
-  configPath: string,
-) {
-  const refreshBeforeExpiryMs =
-    (getResolvedSettingsView(storage, configPath).refresh
-      ?.refreshBeforeExpiryMinutes ?? 240) * 60_000
-  return !access || !expires || expires - now <= refreshBeforeExpiryMs
-}
-
-/** A pool row as the reset-credit resolver sees it; `row` is absent when no row has the id. */
-export interface PoolResetAccess {
-  row?: {
-    id: string
-    type: 'oauth' | 'api'
-    enabled: boolean
-    label?: string
-    identity?: string
-  }
-  token?: string
-}
-
-/** The reset target for a pool row, or the refusal the legacy resolver gives. */
-export function poolResetTarget(
-  accountKey: string,
-  pooled: PoolResetAccess,
-): ResetTargetIdentity {
-  const isMain = accountKey === 'main'
-  const row = pooled.row
-  const noToken = () =>
-    new ResetTargetResolutionError(
-      'token_unavailable',
-      isMain
-        ? 'Main OpenAI account has no usable access token.'
-        : `Fallback account ${accountKey} has no usable access token.`,
-    )
-  if (!row) {
-    if (isMain) throw noToken()
-    throw new ResetTargetResolutionError(
-      'unknown_account',
-      `Fallback account ${accountKey} was not found.`,
-    )
-  }
-  if (!row.enabled) {
-    throw new ResetTargetResolutionError(
-      'disabled_account',
-      `${isMain ? 'Main' : 'Fallback'} account ${accountKey} is disabled.`,
-    )
-  }
-  if (row.type !== 'oauth') {
-    throw new ResetTargetResolutionError(
-      'non_oauth_account',
-      `${isMain ? 'Main' : 'Fallback'} account ${accountKey} is not an OAuth account.`,
-    )
-  }
-  if (!pooled.token) throw noToken()
-  const claims = parseJwtClaims(pooled.token)
-  return {
-    accountKey,
-    label: isMain ? 'Main account' : (row.label ?? accountKey),
-    accessToken: pooled.token,
-    chatgptAccountId:
-      row.identity ?? (claims ? extractAccountIdFromClaims(claims) : undefined),
-  }
-}
-
-export function createResetTargetResolver(deps: ResetTargetResolverDeps) {
-  // The main account while the slot holds the pool placeholder: the pool row
-  // `main`, refreshed and resolved the way a fallback row is, but reported as
-  // the main account.
-  async function resolvePoolMainTarget(): Promise<ResetTargetIdentity> {
-    const storage = await deps.loadAccounts({
-      configPath: deps.accountStoragePath,
-      statePath: deps.accountStatePath,
-    })
-    const row = findPoolMainRow(storage)
-    if (!storage || !row || isTombstoned(row)) {
-      throw new ResetTargetResolutionError(
-        'token_unavailable',
-        'Main OpenAI account has no usable access token.',
-      )
-    }
-    let resolved = row
-    if (
-      resetTargetNeedsRefresh(
-        resolved.access,
-        resolved.expires,
-        storage,
-        deps.now(),
-        deps.accountStoragePath,
-      )
-    ) {
-      resolved = await (deps.refreshPoolMainRow ?? deps.refreshFallbackAccount)(
-        resolved,
-        storage,
-      )
-    }
-    if (!resolved.access) {
-      throw new ResetTargetResolutionError(
-        'token_unavailable',
-        'Main OpenAI account has no usable access token.',
-      )
-    }
-    const claims = parseJwtClaims(resolved.access)
-    return {
-      accountKey: 'main',
-      label: 'Main account',
-      accessToken: resolved.access,
-      chatgptAccountId:
-        resolved.accountId ??
-        (claims ? extractAccountIdFromClaims(claims) : undefined),
-    }
-  }
-
-  return async (accountKey: string): Promise<ResetTargetIdentity> => {
-    const pooled = await deps.poolAccess?.(accountKey)
-    if (pooled) return poolResetTarget(accountKey, pooled)
-    if (accountKey === 'main') {
-      const storage = await deps.loadAccounts({
-        configPath: deps.accountStoragePath,
-        statePath: deps.accountStatePath,
-      })
-      let auth = await deps.getAuth()
-      if (isPoolMainPlaceholder(auth)) return resolvePoolMainTarget()
-      if (auth.type !== 'oauth') {
-        throw new ResetTargetResolutionError(
-          'non_oauth_account',
-          'Main OpenAI account is not authenticated with OAuth.',
-        )
-      }
-      if (
-        resetTargetNeedsRefresh(
-          auth.access,
-          auth.expires,
-          storage,
-          deps.now(),
-          deps.accountStoragePath,
-        )
-      ) {
-        try {
-          auth = { type: 'oauth', ...(await deps.refreshMainWithLease()) }
-        } catch (error) {
-          // The slot became the placeholder while this refresh waited.
-          if (error instanceof MainAccountInPoolError) {
-            return resolvePoolMainTarget()
-          }
-          throw error
-        }
-      }
-      if (!auth.access) {
-        throw new ResetTargetResolutionError(
-          'token_unavailable',
-          'Main OpenAI account has no usable access token.',
-        )
-      }
-      // The access token's claims reflect the account authenticated right
-      // now; the persisted mainAccountId lags a re-login until the next
-      // storage write. Prefer the live identity, falling back to storage for
-      // token shapes that carry no account claim.
-      const claims = parseJwtClaims(auth.access)
-      const liveAccountId = claims
-        ? extractAccountIdFromClaims(claims)
-        : undefined
-      const freshStorage = await deps.loadAccounts({
-        configPath: deps.accountStoragePath,
-        statePath: deps.accountStatePath,
-      })
-      return {
-        accountKey,
-        label: 'Main account',
-        accessToken: auth.access,
-        chatgptAccountId: liveAccountId ?? freshStorage?.mainAccountId,
-      }
-    }
-
-    const storage = await deps.loadAccounts({
-      configPath: deps.accountStoragePath,
-      statePath: deps.accountStatePath,
-    })
-    const account = storage?.accounts.find(
-      (candidate) => candidate.id === accountKey,
-    )
-    if (!storage || !account) {
-      throw new ResetTargetResolutionError(
-        'unknown_account',
-        `Fallback account ${accountKey} was not found.`,
-      )
-    }
-    if (account.enabled === false) {
-      throw new ResetTargetResolutionError(
-        'disabled_account',
-        `Fallback account ${accountKey} is disabled.`,
-      )
-    }
-    if (!isOAuthAccount(account)) {
-      throw new ResetTargetResolutionError(
-        'non_oauth_account',
-        `Fallback account ${accountKey} is not an OAuth account.`,
-      )
-    }
-
-    const noToken = () =>
-      new ResetTargetResolutionError(
-        'token_unavailable',
-        `Fallback account ${accountKey} has no usable access token.`,
-      )
-    if (isTombstoned(account)) throw noToken()
-    let resolved = account
-    if (
-      resetTargetNeedsRefresh(
-        resolved.access,
-        resolved.expires,
-        storage,
-        deps.now(),
-        deps.accountStoragePath,
-      )
-    ) {
-      resolved = await deps.refreshFallbackAccount(resolved, storage)
-    }
-    if (!resolved.access) throw noToken()
-
-    const freshStorage = await deps.loadAccounts({
-      configPath: deps.accountStoragePath,
-      statePath: deps.accountStatePath,
-    })
-    const freshAccount = freshStorage?.accounts.find(
-      (candidate) => candidate.id === accountKey,
-    )
-    if (!freshStorage || !freshAccount) {
-      throw new ResetTargetResolutionError(
-        'unknown_account',
-        `Fallback account ${accountKey} was not found.`,
-      )
-    }
-    if (freshAccount.enabled === false) {
-      throw new ResetTargetResolutionError(
-        'disabled_account',
-        `Fallback account ${accountKey} is disabled.`,
-      )
-    }
-    if (!isOAuthAccount(freshAccount)) {
-      throw new ResetTargetResolutionError(
-        'non_oauth_account',
-        `Fallback account ${accountKey} is not an OAuth account.`,
-      )
-    }
-    return {
-      accountKey,
-      label: resolved.label ?? accountKey,
-      accessToken: resolved.access,
-      chatgptAccountId: freshAccount.accountId,
-    }
-  }
-}
-
-export function buildResetRedemptionDeps() {
-  return {
-    fetchImpl: fetch,
-    now: Date.now,
-    randomUUID: () => crypto.randomUUID(),
-  }
-}
-
-function isAuthPersistError(error: unknown): error is AuthPersistError {
-  return error instanceof AuthPersistError
-}
 
 function cleanAbort(): never {
   throw new Error(HANDLED_SENTINEL)
@@ -891,159 +512,6 @@ function codexSessionStatePath() {
   return getCodexSessionsPath('opencode1')
 }
 
-export function findCachekeepFallbackAccount(
-  accounts: FallbackAccount[],
-  accountId: string,
-): OAuthAccount | undefined {
-  return accounts.find(
-    (a): a is OAuthAccount =>
-      a.enabled !== false &&
-      isOAuthAccount(a) &&
-      (a.id === accountId || a.accountId === accountId),
-  )
-}
-
-// wham is the only source that reports reset-credit counts and spend-control
-// budgets; header/WS pushes never carry those fields. An incoming push that
-// omits them inherits the last known reading for the same account so the
-// sidebar and command output do not lose it on every per-turn update — but an
-// explicit incoming value (including 0) always wins over a stale cached one.
-export function mergePushedQuotaMetadata(
-  incoming: OAuthQuotaSnapshot,
-  previous: OAuthQuotaSnapshot | undefined,
-): OAuthQuotaSnapshot {
-  if (!previous) return incoming
-  const merged: OAuthQuotaSnapshot = { ...incoming }
-  for (const key of [
-    'resetCreditsAvailable',
-    'resetCreditsApplicable',
-  ] as const) {
-    const carried = previous[key]
-    if (merged[key] === undefined && carried !== undefined) {
-      merged[key] = carried
-    }
-  }
-  // A snapshot that explicitly reports no budget must not inherit the old one.
-  if (
-    merged.spendControl === undefined &&
-    merged.spendControlCleared !== true &&
-    previous.spendControl !== undefined
-  ) {
-    merged.spendControl = previous.spendControl
-  }
-  // Prepaid credits come only from a usage poll or the response headers that
-  // carry them; a push without them keeps the last reading, with its own time.
-  if (merged.credits === undefined && previous.credits !== undefined) {
-    merged.credits = previous.credits
-  }
-  return merged
-}
-
-// Returns the window unchanged when it already carries a usable checkedAt, or
-// the same window with the entry timestamp stamped onto it when it does not.
-// Absent windows are returned unchanged so we never fabricate a slot the wire
-// did not report. The stamp keeps mergeQuotaByWindow's per-window freshness
-// comparison meaningful against files written without window stamps (old code
-// only wrote the snapshot-level checkedAt).
-function stampWindowCheckedAt(
-  window: QuotaWindow | undefined,
-  entryCheckedAt: number,
-): QuotaWindow | undefined {
-  if (!window) return window
-  if (
-    typeof window.checkedAt === 'number' &&
-    Number.isFinite(window.checkedAt)
-  ) {
-    return window
-  }
-  return { ...window, checkedAt: entryCheckedAt }
-}
-
-export function buildSidebarMachineState(
-  qm: QuotaManager,
-  store: AccountStorage,
-  now = Date.now(),
-  mainAccountIdentity = store.mainAccountId,
-): SidebarMachineState {
-  const mainEntry = qm.getMain()
-  const mainQuota = mainEntry?.quota
-  return {
-    main: {
-      quota: mainQuota
-        ? {
-            ...(mainQuota as AccountQuota),
-            checkedAt: mainEntry.checkedAt,
-            primary: stampWindowCheckedAt(
-              mainQuota.primary,
-              mainEntry.checkedAt,
-            ),
-            secondary: stampWindowCheckedAt(
-              mainQuota.secondary,
-              mainEntry.checkedAt,
-            ),
-          }
-        : null,
-      ...(typeof mainAccountIdentity === 'string'
-        ? { mainAccountId: mainAccountIdentity }
-        : {}),
-      killed: !killswitchPassesPolicy(mainQuota, store, undefined, now),
-      ...(mainQuota?.resetCreditsAvailable !== undefined
-        ? { resetCredits: mainQuota.resetCreditsAvailable }
-        : {}),
-    },
-    fallbacks: store.accounts
-      .filter((account) => account.enabled)
-      .map((account) => {
-        const fallbackEntry = qm.getFallback(account.id)
-        const fallbackQuota = fallbackEntry?.quota
-        return {
-          id: account.id,
-          label: (account as { label?: string }).label,
-          // Identity follows the cached snapshot (the identity that quota was
-          // captured under), falling back to the live account — so a re-login
-          // never pairs the previous identity's stale quota with the new one.
-          accountId:
-            fallbackEntry?.accountId ?? (account as OAuthAccount).accountId,
-          quota: fallbackQuota
-            ? {
-                ...(fallbackQuota as AccountQuota),
-                checkedAt: fallbackEntry.checkedAt,
-                primary: stampWindowCheckedAt(
-                  fallbackQuota.primary,
-                  fallbackEntry.checkedAt,
-                ),
-                secondary: stampWindowCheckedAt(
-                  fallbackQuota.secondary,
-                  fallbackEntry.checkedAt,
-                ),
-              }
-            : null,
-          killed: !killswitchPassesPolicy(
-            fallbackQuota,
-            store,
-            account.id,
-            now,
-          ),
-          enabled: true,
-          ...(fallbackQuota?.resetCreditsAvailable !== undefined
-            ? { resetCredits: fallbackQuota.resetCreditsAvailable }
-            : {}),
-        }
-      }),
-    route: store.routing?.mode ?? 'main-first',
-    lastUpdated: now,
-  }
-}
-
-export function buildSidebarState(
-  qm: QuotaManager,
-  store: AccountStorage,
-  activeId: string,
-  now = Date.now(),
-): SidebarState {
-  return { ...buildSidebarMachineState(qm, store, now), activeId }
-}
-
 function effectiveRequestHeaders(
   requestInput: RequestInfo | URL,
   init: RequestInit | undefined,
@@ -1078,187 +546,6 @@ async function materializeRequestInit(
     referrer: request.referrer,
     referrerPolicy: request.referrerPolicy,
   }
-}
-
-export function resolveSidebarSessionId(headers: Headers): string | undefined {
-  return (
-    headers.get('x-session-affinity') ??
-    headers.get('x-opencode-session') ??
-    headers.get('x-session-id') ??
-    headers.get('session-id') ??
-    undefined
-  )
-}
-
-// Models where a `configuration_update` item is both accepted and shown to change
-// effort. Accepted is not enough: a silently ignored item also completes with 200,
-// so each entry was measured by reasoning tokens on one hard prompt at low effort,
-// without and with an update to xhigh:
-//   gpt-6-sol    91 -> 516
-//   gpt-6-luna   1034 -> 3126
-//   gpt-6.1-sol  878, 938 -> 1227, 1247 (two samples each; a request-level
-//                xhigh on the same prompt gave 733 and 1456)
-// gpt-5.6-sol is deliberately NOT here. It answered 400 for this item until
-// September 2026, now accepts it, and moved 2292 -> 3785 on a single sample -
-// too weak to tell from noise, on a model people already run, where the
-// request-level effort change it uses today is known to work.
-export const MID_CONVERSATION_EFFORT_MODELS: ReadonlySet<string> = new Set([
-  'gpt-6-astra',
-  'gpt-6-sol',
-  'gpt-6-luna',
-  'gpt-6.1-sol',
-])
-
-// OpenCode's built-in definitions (packages/opencode/src/agent/agent.ts in the
-// OpenCode repository) mark title, compaction and summary as hidden helpers,
-// not the conversation's agent loop. chat.headers supplies the
-// host's agent name; missing tags retain compatibility with other fetch callers.
-const HIDDEN_EFFORT_AGENTS = new Set(['title', 'compaction', 'summary'])
-
-/**
- * Keep the request-level effort fixed for prefix caching. The host does not
- * replay injected items, so remember each change at its original user message
- * and rebuild the same prefix before the WebSocket pool trims continuations.
- * Fingerprints detect compaction/revert at an anchor; a rewritten conversation
- * starts a new pin rather than replaying instructions into unrelated history.
- * Usage still reports the pinned request-level effort, not the effective one.
- */
-function applyMidConversationEffort(
-  parsed: Record<string, unknown>,
-  metadata: CodexSessionMetadata,
-  agent: string | null,
-) {
-  if (agent !== null && HIDDEN_EFFORT_AGENTS.has(agent)) return
-  const model = typeof parsed.model === 'string' ? parsed.model : ''
-  if (!MID_CONVERSATION_EFFORT_MODELS.has(model)) return
-  const reasoning = isRecord(parsed.reasoning) ? parsed.reasoning : undefined
-  const effort =
-    typeof reasoning?.effort === 'string' ? reasoning.effort : undefined
-  if (!effort) return
-  const input = Array.isArray(parsed.input) ? parsed.input : undefined
-  metadata.effortUpdates ??= []
-  const updates = metadata.effortUpdates
-  const fingerprint = (item: unknown) =>
-    createHash('sha256')
-      .update(stableStringify(item))
-      .digest('hex')
-      .slice(0, 16)
-  if (
-    metadata.pinnedEffort === undefined ||
-    updates.some(
-      (update) =>
-        !input ||
-        !isMessageWithRole(input[update.anchor], 'user') ||
-        fingerprint(input[update.anchor]) !== update.fingerprint,
-    )
-  ) {
-    metadata.pinnedEffort = effort
-    metadata.effortUpdates = []
-    return
-  }
-  if (!input || input.length === 0) return
-  const anchor = input.findLastIndex((item) => isMessageWithRole(item, 'user'))
-  const latest = updates.at(-1)
-  const effective = latest?.effort ?? metadata.pinnedEffort
-  if (anchor >= 0 && effort !== effective) {
-    if (latest?.anchor === anchor) {
-      const before = updates.at(-2)?.effort ?? metadata.pinnedEffort
-      if (effort === before) updates.pop()
-      else latest.effort = effort
-    } else {
-      updates.push({ anchor, fingerprint: fingerprint(input[anchor]), effort })
-    }
-  } else if (anchor < 0 && effort !== effective) {
-    // No user turn can carry a new instruction; leave the host's effort alone.
-    return
-  }
-  // Anchors only ever grow, because a new one is the latest user message and
-  // an older anchor that moved fails its fingerprint first. Should that ever
-  // not hold, start over from this request's effort rather than fail the
-  // request or send two updates side by side, which the API refuses.
-  if (
-    updates.some(
-      (update, i) => i > 0 && update.anchor <= (updates[i - 1]?.anchor ?? -1),
-    )
-  ) {
-    metadata.pinnedEffort = effort
-    metadata.effortUpdates = []
-    return
-  }
-  parsed.reasoning = { ...reasoning, effort: metadata.pinnedEffort }
-  // Anchors are indices into the host's input. Inserting from the highest
-  // anchor down keeps the lower ones valid. Each update goes in front of a
-  // different user message, so that message always separates it from the
-  // next update: the API refuses two updates side by side.
-  for (let i = updates.length - 1; i >= 0; i--) {
-    const update = updates[i]
-    if (!update) continue
-    input.splice(update.anchor, 0, {
-      type: 'configuration_update',
-      reasoning: { effort: update.effort },
-    })
-  }
-}
-
-// Copy only changed paths: saved host history must retain image details for
-// the next request's turn comparison, even when Lite strips them on the wire.
-function stripResponsesLiteImageDetails(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    let next = value
-    for (let index = 0; index < value.length; index++) {
-      const nested = stripResponsesLiteImageDetails(value[index])
-      if (nested === value[index]) continue
-      if (next === value) next = value.slice()
-      next[index] = nested
-    }
-    return next
-  }
-  if (!isRecord(value)) return value
-  let next = value
-  for (const key of Object.keys(value)) {
-    if (value.type === 'input_image' && key === 'detail') {
-      if (next === value) next = { ...value }
-      delete next[key]
-      continue
-    }
-    const nested = stripResponsesLiteImageDetails(value[key])
-    if (nested === value[key]) continue
-    if (next === value) next = { ...value }
-    next[key] = nested
-  }
-  return next
-}
-
-// Lite is opt-in because it disables parallel calls and excludes hosted tools.
-export function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
-  const reasoning = isRecord(parsed.reasoning) ? { ...parsed.reasoning } : {}
-  reasoning.context = 'all_turns'
-  parsed.reasoning = reasoning
-  parsed.parallel_tool_calls = false
-  const input = stripResponsesLiteImageDetails(
-    Array.isArray(parsed.input) ? parsed.input : [],
-  ) as unknown[]
-  const tools = Array.isArray(parsed.tools)
-    ? parsed.tools.filter(
-        (tool) => !(isRecord(tool) && tool.type === 'web_search'),
-      )
-    : []
-  const prefix: unknown[] = [
-    { type: 'additional_tools', role: 'developer', tools },
-  ]
-  if (
-    typeof parsed.instructions === 'string' &&
-    parsed.instructions.length > 0
-  ) {
-    prefix.push({
-      type: 'message',
-      role: 'developer',
-      content: [{ type: 'input_text', text: parsed.instructions }],
-    })
-  }
-  parsed.input = [...prefix, ...input]
-  delete parsed.tools
-  delete parsed.instructions
 }
 
 export async function CodexAuthPlugin(
