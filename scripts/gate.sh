@@ -109,6 +109,7 @@ if [[ -z "$fast" ]]; then
   }
 fi
 printf 'Toolchain: Bun %s (%s), Node %s\n' "$(bun --version)" "$(command -v bun)" "$(node --version)"
+run source-file-size node scripts/check-source-size.mjs
 run frozen-lockfile bun install --frozen-lockfile
 if [[ -z "$fast" ]]; then
   for host in opencode1 opencode2; do

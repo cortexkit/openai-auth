@@ -27,6 +27,8 @@ jobs:
           for host in opencode1 opencode2; do
             npm ci --ignore-scripts --prefix packages/opencode/src/tests/fixtures/$host-host || exit
           done
+      - name: Check source file sizes
+        run: node scripts/check-source-size.mjs
       - run: bun run types
       - run: bun run build
       - run: bun run test
