@@ -268,6 +268,30 @@ export function __resetRuntimeLayoutRunsForTest(): void {
   processState.notice = undefined
 }
 
+type LayoutLockEventForTest = {
+  phase:
+    | 'acquire-start'
+    | 'acquire-end'
+    | 'release-start'
+    | 'release-end'
+    | 'renewal-scheduled'
+    | 'renewal-cancelled'
+  name: string
+  path: string
+  heldLeases: number
+  failed?: boolean
+}
+
+let lockObserverForTest: ((event: LayoutLockEventForTest) => void) | undefined
+let heldLeasesForTest = 0
+
+/** Test seam: observe lease lifetimes without changing unobserved lock work. */
+export function __setRuntimeLayoutLockObserverForTest(
+  observer?: (event: LayoutLockEventForTest) => void,
+): void {
+  lockObserverForTest = observer
+}
+
 /**
  * The status line `/openai` shows once per process when old runtime files
  * appeared again in OpenCode's config folder; undefined after that, and when
@@ -1556,25 +1580,94 @@ async function takeLock(
   waitMs: number,
 ): Promise<RefreshFileLock> {
   const started = performance.now()
-  for (;;) {
-    let lock: RefreshFileLock | null = null
-    try {
-      lock = await acquireRefreshFileLock({
-        name,
-        path,
-        ttlMs: LOCK_TTL_MS,
-        renew: true,
-      })
-    } catch (error) {
-      // On Windows a holder that releases while this attempt reads its lock
-      // file makes the attempt fail with ENOENT: the lock is free, so try
-      // again rather than fail.
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  const observer = lockObserverForTest
+  observer?.({
+    phase: 'acquire-start',
+    name,
+    path,
+    heldLeases: heldLeasesForTest,
+  })
+  try {
+    for (;;) {
+      let lock: RefreshFileLock | null = null
+      try {
+        lock = await acquireRefreshFileLock({
+          name,
+          path,
+          ttlMs: LOCK_TTL_MS,
+          renew: true,
+          onRenewalTimer: observer
+            ? (event) =>
+                observer({
+                  phase:
+                    event === 'scheduled'
+                      ? 'renewal-scheduled'
+                      : 'renewal-cancelled',
+                  name,
+                  path,
+                  heldLeases: heldLeasesForTest,
+                })
+            : undefined,
+        })
+      } catch (error) {
+        // On Windows a holder that releases while this attempt reads its lock
+        // file makes the attempt fail with ENOENT: the lock is free, so try
+        // again rather than fail.
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+      if (lock) {
+        if (!observer) return lock
+        heldLeasesForTest++
+        observer({
+          phase: 'acquire-end',
+          name,
+          path,
+          heldLeases: heldLeasesForTest,
+        })
+        const acquired = lock
+        let released = false
+        return {
+          ...acquired,
+          async release(signal) {
+            observer({
+              phase: 'release-start',
+              name,
+              path,
+              heldLeases: heldLeasesForTest,
+            })
+            let failed = true
+            try {
+              await acquired.release(signal)
+              failed = false
+            } finally {
+              if (!released && !failed) {
+                released = true
+                heldLeasesForTest--
+              }
+              observer({
+                phase: 'release-end',
+                name,
+                path,
+                heldLeases: heldLeasesForTest,
+                failed,
+              })
+            }
+          },
+        }
+      }
+      if (performance.now() - started >= waitMs)
+        throw new LayoutMoveError('lock-timeout', `${name} lock at ${path}`)
+      await new Promise((done) => setTimeout(done, LOCK_RETRY_MS))
     }
-    if (lock) return lock
-    if (performance.now() - started >= waitMs)
-      throw new LayoutMoveError('lock-timeout', `${name} lock at ${path}`)
-    await new Promise((done) => setTimeout(done, LOCK_RETRY_MS))
+  } catch (error) {
+    observer?.({
+      phase: 'acquire-end',
+      name,
+      path,
+      heldLeases: heldLeasesForTest,
+      failed: true,
+    })
+    throw error
   }
 }
 

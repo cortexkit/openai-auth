@@ -115,4 +115,6 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Runtime layout move
         working-directory: packages/opencode
+        env:
+          OPENAI_AUTH_LAYOUT_TIMING: "1"
         run: bun test src/tests/runtime-layout.test.ts
