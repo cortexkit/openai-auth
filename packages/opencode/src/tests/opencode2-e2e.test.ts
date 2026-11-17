@@ -21,7 +21,10 @@ import {
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { placeholderSecret } from '@cortexkit/common-auth/opencode2'
+import {
+  placeholderCredential,
+  placeholderSecret,
+} from '@cortexkit/common-auth/opencode2'
 import { vaultPaths, vaultStateDir } from '@cortexkit/openai-auth-core/internal'
 import {
   type MockDaemon,
@@ -30,6 +33,7 @@ import {
 } from '../../../core/src/tests/fixtures/mock-claustrum.ts'
 import { POOL_PLACEHOLDER } from '../core/pool-migration'
 import { CODEX_USER_AGENT, CODEX_VERSION } from '../index'
+import { POOL_BROWSER_METHOD } from '../v2/login'
 import { hostBinary, runtimeStateDir } from './fixtures/opencode-host'
 import {
   POLICY_NOW,
@@ -302,6 +306,8 @@ async function runScenario(input: {
   turns: Turn[]
   plugin?: string
   login?: boolean | 'vault'
+  /** Select the pool's browser sign-in through the host's credential API. */
+  poolLogin?: boolean
   /** The API key the host prepares instead of the account pool's placeholder bearer. */
   apiKey?: string
   /** Omit the pool bearer to show that importing legacy auth.json does not activate pool routing. */
@@ -409,7 +415,7 @@ async function runScenario(input: {
             settings: {
               // Prepare exactly the credential selected for this scenario.
               // An old auth.json alone must not activate pool routing.
-              ...(input.preparePoolCredential === false
+              ...(input.preparePoolCredential === false || input.poolLogin
                 ? {}
                 : { apiKey: input.apiKey ?? PLACEHOLDER }),
               ...(input.upgrade === 'default'
@@ -458,6 +464,35 @@ async function runScenario(input: {
   let exported = ''
   try {
     await waitForServer(serverURL, server)
+    if (input.poolLogin) {
+      // Select the plugin's sign-in after bootstrap imports the legacy login;
+      // a config API key does not replace the imported active credential.
+      const response = await fetch(`${serverURL}/api/credential`, {
+        method: 'POST',
+        headers: {
+          authorization: `Basic ${btoa(`opencode:${PASSWORD}`)}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          integrationID: 'openai',
+          label: 'openai-auth upgrade pool',
+          value: placeholderCredential({
+            integrationID: 'openai',
+            methodID: POOL_BROWSER_METHOD,
+            now: POLICY_NOW,
+          }),
+          activate: true,
+        }),
+        signal: AbortSignal.timeout(10_000),
+      })
+      if (!response.ok)
+        throw new Error(
+          `pool credential creation failed (${response.status}): ${await response.text()}`,
+        )
+      const created = (await response.json()) as { data?: { active?: boolean } }
+      if (!created.data?.active)
+        throw new Error('the host did not activate the pool credential')
+    }
     if (input.reload) {
       const response = await fetch(`${serverURL}/api/location`, {
         headers: { authorization: `Basic ${btoa(`opencode:${PASSWORD}`)}` },
@@ -1492,6 +1527,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     const result = await runScenario({
       transport: 'http',
       upgrade: 'default',
+      poolLogin: true,
       accounts: ['A'],
       turns: [{}],
     })
@@ -1571,6 +1607,7 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
     const result = await runScenario({
       transport: 'http',
       upgrade: 'custom',
+      poolLogin: true,
       accounts: ['A'],
       turns: [{}],
     })
