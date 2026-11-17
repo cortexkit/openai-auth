@@ -33,13 +33,19 @@ interface SetupDependencies {
   beginLogin?: typeof beginAccountLogin
   openBrowser?: typeof openUrl
   fence?: ProcessFence
+  /** Builds the default fence when `fence` is not given; tests replace it. */
+  createFence?: typeof createProcessFence
   io?: SetupIO
   print?: (message: string) => void
 }
 
 export function createSetupPlugin(deps: SetupDependencies = {}): SetupPlugin {
   const print = deps.print ?? console.log
-  const fence = deps.fence ?? createProcessFence()
+  // A Windows on ARM check through PowerShell 5.1 can take over a minute;
+  // the fence prints a line before it so setup doesn't look stuck.
+  const fence =
+    deps.fence ??
+    (deps.createFence ?? createProcessFence)(undefined, { onProgress: print })
   const paths = {
     opencode: {
       stateDir: vaultStateDir(getAccountPaths().statePath),
