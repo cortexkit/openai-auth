@@ -6,7 +6,7 @@
 // menu shows its quota in a section of its own and refuses to add that
 // account again as a row. Its Vault section connects Pi to the Claustrum
 // vault; while connected (vault mode) the vault's OpenAI accounts are the only
-// ones routed. Pi's login is stashed until disconnect; the pool is untouched.
+// ones routed. Connecting deletes Pi's saved login; the pool is untouched.
 import {
   CommandError,
   type CommandMenu,
@@ -41,7 +41,6 @@ import packageJson from '../package.json' with { type: 'json' }
 import { clearPiStickyRouting, getPiStickyRouting } from './routing.ts'
 import type { PiPoolCommands } from './runtime.ts'
 import type { PiSettingsStartup } from './settings-startup.ts'
-import { VAULT_SLOT_CONFLICT } from './vault-slot.ts'
 
 export type PiCommandDependencies = {
   settingsStartup?: PiSettingsStartup
@@ -181,7 +180,7 @@ export function createPiMenu(
             id: 'disconnect',
             label: 'Disconnect',
             confirm:
-              'Disconnect this Pi host from the vault and restore its original login?',
+              "Disconnect this Pi host from the vault? Pi's previous sign-in is not restored; sign in to Pi again if needed.",
             run: async () => {
               // Disconnect removes the enrollment state and its approved name.
               // status() reports unreadable state as blocked; do not guess a revoke target.
@@ -196,13 +195,8 @@ export function createPiMenu(
                 enrollment && enrollment.state !== 'blocked'
                   ? `Run \`ck auth enroll revoke --name ${name}\` to revoke it in the vault too.`
                   : "Run ck auth enroll list to find this host's enrollment name, then ck auth enroll revoke --name <name>."
-              let result:
-                | Awaited<
-                    ReturnType<NonNullable<PiPoolCommands['disconnectVault']>>
-                  >
-                | undefined
               try {
-                result = await pool.disconnectVault?.()
+                await pool.disconnectVault?.()
               } catch {
                 let reloadFailed = false
                 try {
@@ -215,8 +209,8 @@ export function createPiMenu(
                   'vault-disconnect-failed',
                   [
                     authority === 'local'
-                      ? 'Disconnect did not finish cleanly; local accounts are active. Retry Disconnect if Pi login restoration did not complete.'
-                      : 'Disconnect failed; Pi is still enrolled or enrollment is unreadable. Local accounts remain disabled; retry Disconnect to restore the login.',
+                      ? "Disconnect did not finish cleanly; local accounts are active. Pi's previous sign-in is not restored. Sign in to Pi again if needed."
+                      : 'Disconnect failed; Pi is still enrolled or enrollment is unreadable. Local accounts remain disabled; retry Disconnect to clear the vault placeholder.',
                     ...(reloadFailed
                       ? [
                           'Pi could not reload its auth snapshot; reopen the session.',
@@ -228,7 +222,7 @@ export function createPiMenu(
               await dependencies.afterApply?.()
               return [
                 `Disconnected: ${name} no longer reads from the vault. ${revoke}`,
-                ...(result === 'conflict' ? [VAULT_SLOT_CONFLICT] : []),
+                "Pi's previous sign-in is not restored. Sign in to Pi again to use its own ChatGPT account.",
               ].join('\n')
             },
           }
@@ -238,8 +232,17 @@ export function createPiMenu(
             actions: [
               ...actions.map((action) =>
                 action.id === 'disconnect' && pool.disconnectVault
-                  ? { ...action, run: disconnect.run }
-                  : action,
+                  ? {
+                      ...action,
+                      confirm: disconnect.confirm,
+                      run: disconnect.run,
+                    }
+                  : action.id === 'connect'
+                    ? {
+                        ...action,
+                        description: `${action.description ?? ''} Connecting deletes Pi's saved ChatGPT sign-in without keeping a copy. If it is missing from the vault, first run \`ck auth import --source pi\`.`,
+                      }
+                    : action,
               ),
               ...(pool.vaultMode() &&
               pool.disconnectVault &&

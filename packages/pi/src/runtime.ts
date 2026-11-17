@@ -20,9 +20,10 @@
 // Once Pi is connected to the Claustrum vault (`/openai` > Vault), Pi is in
 // vault mode: the OpenAI accounts the vault serves it are the only accounts
 // routed (`vault.ts` in the core), and each attempt on one sends with the
-// token the vault serves for it. Pi's own login and the pool rows are then
-// neither used, refreshed, polled nor written; a request no vault account can
-// serve is refused with a fixed message. Disconnecting restores them.
+// token the vault serves for it. Connecting deletes Pi's saved login; pool rows
+// are neither used, refreshed, polled nor written. A request no vault account can
+// serve is refused with a fixed message. Disconnecting re-enables local routing,
+// but Pi's previous login is not restored.
 
 import { statSync } from 'node:fs'
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
@@ -293,7 +294,7 @@ export class PiOpenAIRuntime {
         ? { readBudgetMs: deps.readBudgetMs }
         : {}),
       // In vault mode the pool is set aside: nothing in it is refreshed,
-      // polled or written. Read on every use, so a disconnect restores it.
+      // polled or written. Read on every use, so a disconnect re-enables it.
       vaultMode: () => this.vaultMode(),
       vaultAuthority: () => this.readAuthority(),
       refreshProvider: async (credential) => {
@@ -368,7 +369,7 @@ export class PiOpenAIRuntime {
   }
 
   /**
-   * Stash Pi's original login and install the placeholder before reloading
+   * Delete Pi's original login and install the placeholder before reloading
    * auth, so Pi cannot refresh the local login after approval outside the menu.
    */
   syncVaultSlot(refresh?: () => unknown, explicit = false): Promise<void> {
@@ -382,10 +383,10 @@ export class PiOpenAIRuntime {
   }
 
   /**
-   * Restore Pi's stashed login before forgetting this host's vault enrollment.
-   * If Pi's slot changed, keep the new login and the original stash instead.
+   * Clear the placeholder before forgetting this host's vault enrollment.
+   * The slot helper leaves any non-placeholder entry untouched on exit.
    */
-  disconnectVault(): Promise<'restored' | 'conflict' | 'nothing-to-do'> {
+  disconnectVault(): Promise<'cleared' | 'nothing-to-do'> {
     return this.withSlot(async () => {
       if ((await this.readAuthority()) === 'host')
         throw new Error(VAULT_HOST_CONNECT_REFUSAL)
@@ -417,7 +418,7 @@ export class PiOpenAIRuntime {
       (previousMode !== undefined && mode !== previousMode) ||
       this.slotNeedsRefresh
     // Another process can change enrollment while the slot helper waits for
-    // its auth.json lock. Reconcile that change after the locked move finishes.
+    // its auth.json lock. Reconcile that change after the locked update finishes.
     const currentMode = (await this.readAuthority()) !== 'local'
     if (currentMode !== mode) {
       if (currentMode) await this.vaultSlot().enterVault()
@@ -1273,7 +1274,7 @@ export class PiOpenAIRuntime {
 export interface PiPoolCommands {
   readAuthority: () => Promise<'host' | 'local' | 'vault' | 'unreadable'>
   syncVaultSlot?: (refresh?: () => unknown, explicit?: boolean) => Promise<void>
-  disconnectVault?: () => Promise<'restored' | 'conflict' | 'nothing-to-do'>
+  disconnectVault?: () => Promise<'cleared' | 'nothing-to-do'>
   /**
    * Whether Pi is in vault mode. Pi's own login is then not read: asking Pi
    * for its key would make Pi refresh and store that login.

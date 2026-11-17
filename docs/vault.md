@@ -68,7 +68,7 @@ Routing → **Longest wait on the same account** applies to vault accounts too: 
 
 Insula background quota includes its `credits` spend pool as well as usage windows, workspace spending limits and saved resets, so [prepaid-credit routing](accounts-and-routing.md#prepaid-credits) need not wait for a model request. Credits keep Insula's fetch time. An absent credits pool preserves the prior reading without renewing it. Insula's `unlimited` boolean is used when present. Older builds omit it: a balance-less pool then preserves a known unlimited reading; without one it is shown as available credits, not unlimited. An explicit `false` does replace a prior unlimited verdict.
 
-Disconnecting OpenCode makes its local pool eligible again; disconnecting Pi restores its local login and fallbacks. OpenCode may still need to transfer its old slot login into the pool, as described below.
+Disconnecting OpenCode or Pi makes its local pool eligible again. Pi's previous sign-in is not restored; sign in to Pi again if needed. OpenCode may still need to transfer its old slot login into the pool, as described below.
 
 ### OpenCode's login slot in vault mode
 
@@ -78,7 +78,9 @@ Do not delete OpenCode 1's placeholder as a repair: OpenCode 1 installs the plug
 
 ### Pi in vault mode
 
-On Pi, use `openai-codex/<model>` in both local and vault mode. Before Pi reloads auth, the plugin saves Pi's original `auth.json` login in an owner-only stash under its vault state directory and puts a non-secret placeholder in Pi's `auth.json`, so Pi cannot refresh that login while the vault serves. Disconnecting Pi restores the original entry before removing Pi's vault token. If another Pi login was added while connected, disconnect reports a conflict and keeps both that login and the stashed original without overwriting either.
+On Pi, use `openai-codex/<model>` in both local and vault mode. While Pi is connected to the vault, its own ChatGPT sign-in is replaced by a non-secret placeholder in Pi's `auth.json` before reloading auth. No copy is kept. If the vault lacks that sign-in, import it **before connecting** with `ck auth import --source pi`; the plugin cannot import it into the vault for you.
+
+Disconnecting removes only the placeholder before removing Pi's vault token; the previous sign-in is not restored. Sign in to Pi again to use its own ChatGPT account. A legacy stash file under the vault state directory is deleted without being read; a symlink at that path is refused.
 
 ## API keys in the vault
 

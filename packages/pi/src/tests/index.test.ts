@@ -96,7 +96,7 @@ describe('Pi OpenAI auth extension', () => {
     it(`owns ${operation} lock-compromised at startup, session start and a background tick`, async () => {
       const failure = new PiSlotError('lock-compromised')
       const slot: PiSlot = {
-        inspect: async () => ({ slot: 'original', stash: 'missing' }),
+        inspect: async () => ({ slot: 'original' }),
         enterVault: async () => {},
         exitVault: async () => 'nothing-to-do',
       }
