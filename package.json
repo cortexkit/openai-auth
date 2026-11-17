@@ -25,9 +25,9 @@
   "devDependencies": {
     "@biomejs/biome": "2.6.6",
     "@cortexkit/openai-auth-core": "workspace:*",
-    "@earendil-works/pi-ai": "1.5.0",
-    "@earendil-works/pi-coding-agent": "1.5.0",
-    "@earendil-works/pi-tui": "1.5.0",
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@earendil-works/pi-tui": "1.5.2",
     "@opencode-ai/plugin": "1.19.5",
     "@tsconfig/bun": "1.0.11",
     "@types/bun": "1.4.4",
