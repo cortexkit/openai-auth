@@ -25,6 +25,7 @@ import {
   poolFiles,
   seedPool,
 } from './fixtures/opencode2-host'
+import { restoreEnv, unsetEnv } from './setup-env'
 
 const cleanups: Array<() => unknown> = []
 afterEach(async () => {
@@ -56,10 +57,7 @@ async function blockedLocation() {
   const logFile = join(root, 'test.log')
   process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = logFile
   setLogLevel('warn')
-  cleanups.push(() => {
-    if (oldLog === undefined) delete process.env.OPENCODE_OPENAI_AUTH_LOG_FILE
-    else process.env.OPENCODE_OPENAI_AUTH_LOG_FILE = oldLog
-  })
+  cleanups.push(() => restoreEnv('OPENCODE_OPENAI_AUTH_LOG_FILE', oldLog))
   const files = poolFiles(root)
   seedPool(files, 'main-first', [{ id: 'handover-account' }])
   const config = files.readConfig()
@@ -234,11 +232,8 @@ test('setup tracing is opt-in and host-log diagnostics use only the isolated dat
   cleanups.push(() => rmSync(root, { recursive: true, force: true }))
   const trace = join(root, 'trace.jsonl')
   const old = process.env.OPENAI_AUTH_E2E_RELOAD_TRACE
-  cleanups.push(() => {
-    if (old === undefined) delete process.env.OPENAI_AUTH_E2E_RELOAD_TRACE
-    else process.env.OPENAI_AUTH_E2E_RELOAD_TRACE = old
-  })
-  delete process.env.OPENAI_AUTH_E2E_RELOAD_TRACE
+  cleanups.push(() => restoreEnv('OPENAI_AUTH_E2E_RELOAD_TRACE', old))
+  unsetEnv('OPENAI_AUTH_E2E_RELOAD_TRACE')
   setupTrace('disabled', root)
   expect(existsSync(trace)).toBe(false)
   process.env.OPENAI_AUTH_E2E_RELOAD_TRACE = trace
