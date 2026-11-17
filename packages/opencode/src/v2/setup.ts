@@ -148,6 +148,7 @@ import {
   ResetCreditCounts,
 } from './reset-credits'
 import { acquireSessionAccounts } from './session-accounts'
+import { setupTrace } from './setup-trace'
 import { acquireSessionPins } from './shared-pins'
 import { acquireSidebarPublisher } from './sidebar-publisher'
 
@@ -488,6 +489,7 @@ async function installPoolHooks<Q, A>(
         })(),
     },
   }
+  setupTrace('before installOpenCode2Auth', ctx.location?.directory)
   const installation = await installOpenCode2Auth(
     context,
     {
@@ -538,6 +540,7 @@ async function installPoolHooks<Q, A>(
     },
   )
   const dispose = installation.dispose
+  setupTrace('after installOpenCode2Auth', ctx.location?.directory)
   return {
     ...installation,
     dispose: async () => {
@@ -563,20 +566,26 @@ export async function setupOpenAIAuth(
   ctx: SetupContext,
   options: OpenAIAuthV2Options = {},
 ): Promise<Plugin.Cleanup> {
+  const directory = ctx.location?.directory
+  setupTrace('setup enter', directory)
   const log = createLogger('opencode2')
   const logQ = createLogger('quota')
   const version = options.version ?? PackageVersion
   // Before anything resolves a runtime path: where this process keeps its
   // state file, vault folder and sessions file for its whole life, moving
   // them out of OpenCode's config folder first when that is safe.
+  setupTrace('before prepareRuntimeLayout', directory)
   await prepareRuntimeLayout({ version, ...options.runtimeLayout })
+  setupTrace('after prepareRuntimeLayout', directory)
   const paths = options.paths ?? (() => getAccountPaths(getConfigPath()))
   const configPath = paths().configPath
+  setupTrace('before prepareSettingsStartup', directory)
   const settingsStartup = await prepareSettingsStartup({
     version,
     paths: paths(),
     log,
   })
+  setupTrace('after prepareSettingsStartup', directory)
   const snapshot = settingsStartup.snapshot
   const unregisterSettings = snapshot
     ? registerSettingsSnapshot(configPath, snapshot)
@@ -593,7 +602,9 @@ export async function setupOpenAIAuth(
   }
   // The logger starts with the environment floor. A saved choice overrides it,
   // just as it does on OpenCode 1, before setup writes any diagnostic lines.
+  setupTrace('before loadAccountSettings', directory)
   const storage = await loadAccountSettings(paths())
+  setupTrace('after loadAccountSettings', directory)
   const storedLevel = getResolvedSettingsView(storage, configPath).logging
     ?.level
   if (!snapshot && storedLevel && typeof storedLevel === 'string') {
@@ -618,6 +629,7 @@ export async function setupOpenAIAuth(
         message: POOL_LOGIN_REQUIRED_MESSAGE,
       })
     }
+    setupTrace('before installPoolHooks (stand-aside)', directory)
     const installation = await installPoolHooks(
       ctx,
       {
@@ -627,7 +639,9 @@ export async function setupOpenAIAuth(
       },
       log,
     )
+    setupTrace('after installPoolHooks (stand-aside)', directory)
     setupComplete = true
+    setupTrace('setup exit (stand-aside)', directory)
     return async () => {
       try {
         await installation.dispose()
@@ -691,7 +705,9 @@ export async function setupOpenAIAuth(
       if (!setupComplete) vaultLease.release()
     },
   }
+  setupTrace('before vault.authority', directory)
   await vault.authority()
+  setupTrace('after vault.authority', directory)
   const vaultFirstRoster = vaultLease.firstRoster
 
   const resetCounts = new ResetCreditCounts()
@@ -734,7 +750,14 @@ export async function setupOpenAIAuth(
     vaultFirstRosterBackgroundWaitMs: vaultRosterWaitMs,
     log: createLogger('pool'),
   })
-  if ((await vault.authority()) === 'local') await source.load()
+  setupTrace('before vault.authority (source)', directory)
+  const authority = await vault.authority()
+  setupTrace('after vault.authority (source)', directory)
+  if (authority === 'local') {
+    setupTrace('before source.load', directory)
+    await source.load()
+    setupTrace('after source.load', directory)
+  }
   // The limits source selects the pool or vault-roster namespace after a
   // pool-routed request waits for account readiness. Setup and polls acquire none.
   const limits = new OpenCodeLimitSource({
@@ -748,6 +771,7 @@ export async function setupOpenAIAuth(
     },
   }
 
+  setupTrace('before startProcessHeartbeat', directory)
   const heartbeat =
     options.heartbeat === false
       ? undefined
@@ -755,6 +779,7 @@ export async function setupOpenAIAuth(
           version,
           logger: createLogger('heartbeat'),
         })
+  setupTrace('after startProcessHeartbeat', directory)
 
   // Only while the migration is switched on. With it off, setup gets here
   // only on an already migrated install, and no adoption of a later login in
@@ -882,6 +907,7 @@ export async function setupOpenAIAuth(
     now,
     log,
   })
+  setupTrace('before installPoolHooks', directory)
   const installation = await installPoolHooks(
     ctx,
     openai.adapter,
@@ -891,10 +917,13 @@ export async function setupOpenAIAuth(
     mirror,
     (sessionID) => cacheKeep.forget(sessionID),
   )
+  setupTrace('after installPoolHooks', directory)
   openai.attach(installation)
+  setupTrace('before session.hook (prompt)', directory)
   const turns = await ctx.session.hook('prompt', (draft) => {
     openai.beginTurn(draft.sessionID)
   })
+  setupTrace('after session.hook (prompt)', directory)
 
   /** Waits for a migration run when the install has not migrated yet. */
   const ensureMigrated = async (login: PoolLoginResult) => {
@@ -929,6 +958,7 @@ export async function setupOpenAIAuth(
     log.info('ChatGPT login stored in the account pool', outcome)
   }
 
+  setupTrace('before registerOpenCode2AuthMethods', directory)
   const methods = await registerOpenCode2AuthMethods(ctx, {
     integrationID: OPENAI_PROVIDER_ID,
     methods: chatgptLoginMethods({
@@ -940,11 +970,15 @@ export async function setupOpenAIAuth(
     label: 'ChatGPT (openai-auth account pool)',
     vault: vaultLoginMethod(vault),
   })
+  setupTrace('after registerOpenCode2AuthMethods', directory)
+  setupTrace('before registerCodexModelRules', directory)
   const models = await registerCodexModelRules(ctx)
+  setupTrace('after registerCodexModelRules', directory)
   if (options.controlPlane && (!ctx.command || !ctx.location))
     throw new Error(
       'OpenCode 2 control plane requires command and location APIs',
     )
+  setupTrace('before installControlPlane', directory)
   const controlPlane =
     ctx.command && ctx.location
       ? await installControlPlane(
@@ -1019,6 +1053,7 @@ export async function setupOpenAIAuth(
             }),
         )
       : undefined
+  setupTrace('after installControlPlane', directory)
 
   // A deleted session's pin, remembered account, mirror and keep-warm target
   // go with it.
@@ -1041,6 +1076,7 @@ export async function setupOpenAIAuth(
   })()
 
   setupComplete = true
+  setupTrace('setup exit', directory)
   return async () => {
     closing = true
     abort.abort()

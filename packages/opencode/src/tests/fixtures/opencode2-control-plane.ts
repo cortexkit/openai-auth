@@ -46,13 +46,17 @@ export default { id: 'openai-control-plane-probe', async setup(ctx) {
     id: 'connection', slot: 'extra', title: 'Connection', lines: [], items: [],
     actions: [{ id: 'apply', label: 'Check connection', knobs: [] }],
   }] }
-  const dispose = await createOpenAIAuthPlugin({ heartbeat: false, controlPlane: {
+  let dispose
+  try { dispose = await createOpenAIAuthPlugin({ heartbeat: false, controlPlane: {
     async open(sessionId) { record('open', { sessionId, directory: ctx.location.directory }); return { command: 'openai', menu } },
     async apply(request) {
       record('apply', { request, directory: ctx.location.directory })
       return { command: 'openai', ok: false, code: 'unavailable', text: 'P0: nothing was changed', menu }
     },
-  } }).setup(ctx)
+  } }).setup(ctx) } catch (error) {
+    record('server-error', { directory: ctx.location.directory, message: String(error), stack: error?.stack })
+    throw error
+  }
   record('server-ready', { directory: ctx.location.directory })
   return dispose
 } }
@@ -272,7 +276,11 @@ export default { id: plugin.id, async setup(ctx) {
   }
   const process = Bun.spawn([input.cli, '--standalone'], {
     cwd: directory,
-    env: { ...input.env, TERM: 'xterm-256color' },
+    env: {
+      ...input.env,
+      TERM: 'xterm-256color',
+      OPENAI_AUTH_E2E_RELOAD_TRACE: trace,
+    },
     terminal: {
       cols: 140,
       rows: 45,
@@ -305,11 +313,23 @@ export default { id: plugin.id, async setup(ctx) {
         const text = readFileSync(trace, 'utf8')
         if (
           !text.includes('"event":"done"') &&
-          !text.includes('"event":"failure"')
+          !text.includes('"event":"failure"') &&
+          !text.includes('"event":"server-error"')
         )
           return
         clearTimeout(timer)
         watcher.close()
+        if (
+          text.includes('"event":"failure"') ||
+          text.includes('"event":"server-error"')
+        ) {
+          reject(
+            new Error(
+              `P0 failed:\n${text}\n--- screen ---\n${screen.lines().join('\n')}\n--- output tail ---\n${output.slice(-6000)}`,
+            ),
+          )
+          return
+        }
         resolve()
       }
       const watcher = watch(trace, check)
@@ -321,9 +341,27 @@ export default { id: plugin.id, async setup(ctx) {
       screen: [...shown].join('\n'),
       trace: readFileSync(trace, 'utf8'),
     }
+  } catch (error) {
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}\n--- OpenCode host log tail ---\n${openCodeHostLogTail(input.env)}`,
+      { cause: error },
+    )
   } finally {
     process.kill()
     await process.exited
     process.terminal?.close()
+  }
+}
+
+/** Reads only the isolated host's log, never the operator's OpenCode folders. */
+export function openCodeHostLogTail(env: Record<string, string>): string {
+  if (!env.XDG_DATA_HOME) return '(isolated data folder unavailable)'
+  try {
+    return readFileSync(
+      join(env.XDG_DATA_HOME, 'opencode', 'log', 'opencode.log'),
+      'utf8',
+    ).slice(-6000)
+  } catch {
+    return '(host log unavailable)'
   }
 }

@@ -9,6 +9,7 @@ import {
 import type { ApplyResult, OpenDialogPayload } from '../rpc/protocol'
 import { resolveRpcDir } from '../rpc/rpc-dir'
 import { RPC_SERVER_REGISTRY_KEY, startRpcServer } from '../rpc/rpc-server'
+import { setupTrace } from './setup-trace'
 
 /** Server-owned menu callbacks shared by command dispatch and loopback RPC. */
 export interface ControlPlaneMenu {
@@ -33,6 +34,7 @@ type Registry = {
 }
 const KEY = Symbol.for('cortexkit.openai-auth.v2.commands')
 const log = createLogger('v2-command')
+const RPC_HANDOVER_WAIT_MS = 5_000
 
 function isLocation(value: unknown): value is Location {
   if (!value || typeof value !== 'object') return false
@@ -71,24 +73,67 @@ export async function installControlPlane(
     session: ctx.session,
     closed: new AbortController(),
   }
+  setupTrace('before resolveRpcDir', directory)
   const rpcDir = await resolveRpcDir(directory)
-  const rpc = await adoptRpcServer(RPC_SERVER_REGISTRY_KEY, rpcDir.dir, () =>
-    startRpcServer({
-      ...rpcDir,
-      drain: drainNotifications,
-      apply: (request) => {
-        const owner = state.locations.get(directory)
-        if (!isLocation(owner))
-          throw new Error('The OpenAI menu location was closed')
-        return owner.menu.apply(request)
-      },
-    }),
-  )
+  setupTrace('after resolveRpcDir', directory)
+  let rpc: Awaited<ReturnType<typeof adoptRpcServer>> | undefined
+  const handover = (async () => {
+    try {
+      setupTrace('before adoptRpcServer', directory)
+      const adopted = await adoptRpcServer(
+        RPC_SERVER_REGISTRY_KEY,
+        rpcDir.dir,
+        () =>
+          startRpcServer({
+            ...rpcDir,
+            drain: drainNotifications,
+            apply: (request) => {
+              const owner = state.locations.get(directory)
+              if (!isLocation(owner))
+                throw new Error('The OpenAI menu location was closed')
+              return owner.menu.apply(request)
+            },
+          }),
+      )
+      setupTrace('after adoptRpcServer', directory)
+      // A timed-out setup can be disposed or replaced while adoption is still
+      // waiting for the previous server. Never leave its late server behind.
+      if (location.closed.signal.aborted) await adopted.release()
+      else rpc = adopted
+    } catch {
+      // Server errors can contain request data; log only the affected folder.
+      log.warn('OpenAI menu RPC hand-over failed', { directory })
+    }
+  })()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  setupTrace('before RPC hand-over wait', directory)
+  try {
+    await Promise.race([
+      handover,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          log.warn(
+            'OpenAI menu RPC hand-over is still pending after 5 seconds',
+            {
+              directory,
+            },
+          )
+          resolve()
+        }, RPC_HANDOVER_WAIT_MS)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+  setupTrace('after RPC hand-over wait', directory)
   const previous = state.locations.get(directory)
   state.locations.set(directory, location)
   if (isLocation(previous)) {
     previous.closed.abort()
+    setupTrace('before previous.registration.dispose', directory)
     await previous.registration?.dispose()
+    setupTrace('after previous.registration.dispose', directory)
   }
   const currentCommand: NonNullable<Registry['command']> = {
     name: 'openai',
@@ -144,14 +189,16 @@ export async function installControlPlane(
   state.command.execute = currentCommand.execute
   const command = state.command
   try {
+    setupTrace('before command.transform', directory)
     location.registration = await ctx.command.transform((editor) => {
       editor.add(command)
     })
+    setupTrace('after command.transform', directory)
   } catch (error) {
     location.closed.abort()
     if (state.locations.get(directory) === location)
       state.locations.delete(directory)
-    await rpc.release()
+    await rpc?.release()
     throw error
   }
   let disposed = false
@@ -161,7 +208,7 @@ export async function installControlPlane(
     location.closed.abort()
     if (state.locations.get(directory) === location)
       state.locations.delete(directory)
-    await rpc.release()
+    await rpc?.release()
     await location.registration?.dispose()
   }
 }

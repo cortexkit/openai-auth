@@ -40,7 +40,10 @@ import {
   runLimitAcceptance,
   waitForHostReady,
 } from './fixtures/opencode-limit-acceptance'
-import { controlPlaneProbe } from './fixtures/opencode2-control-plane'
+import {
+  controlPlaneProbe,
+  openCodeHostLogTail,
+} from './fixtures/opencode2-control-plane'
 import {
   MOCK_ACCOUNTS,
   type MockAccount,
@@ -1330,6 +1333,21 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       },
       hostResetup,
     })
+    try {
+      assertControlPlane(result, hostResetup, root)
+    } catch (error) {
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}\n--- OpenCode host log tail ---\n${openCodeHostLogTail(env)}`,
+        { cause: error },
+      )
+    }
+  }
+
+  function assertControlPlane(
+    result: Awaited<ReturnType<typeof controlPlaneProbe>>,
+    hostResetup: boolean,
+    root: string,
+  ) {
     if (process.env.OPENAI_AUTH_OPENCODE2_E2E_VERBOSE === '1')
       console.error(result.trace)
     expect(result.trace).toContain('"server"')
@@ -1342,6 +1360,15 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       .map((line) => JSON.parse(line))
     const rows = (event: string) =>
       events.filter((entry) => entry.event === event)
+    expect(rows('server-error')).toEqual([])
+    expect(
+      rows('setup-step').some(
+        (entry) => entry.step === 'before adoptRpcServer',
+      ),
+    ).toBe(true)
+    expect(
+      rows('setup-step').some((entry) => entry.step === 'after adoptRpcServer'),
+    ).toBe(true)
     // Require visible server-published quotas and a component render event;
     // registering a slot or rendering placeholder text alone is not enough.
     // Visible text is read from the rendered screen: the renderer repaints
