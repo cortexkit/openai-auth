@@ -6,7 +6,7 @@
 // than named imports, so each one fails on its own assertion against a build
 // that lacks them instead of the whole file failing to load.
 import { dlopen, FFIType, ptr } from 'bun:ffi'
-import { afterAll, afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { createHash } from 'node:crypto'
 import {
   chmodSync,
@@ -48,14 +48,12 @@ import {
 import * as runtimeLayout from '../core/runtime-layout'
 import {
   __resetRuntimeLayoutRunsForTest,
-  __setRuntimeLayoutLockObserverForTest,
   prepareRuntimeLayout,
   RUNTIME_LAYOUT_DEFERRED_MESSAGE,
   type RuntimeLayoutOptions,
 } from '../core/runtime-layout'
 import { acquireOpenCodeVault } from '../core/shared-vault'
 import { processHeartbeatDir } from '../core/version-fence'
-import { RuntimeLayoutTiming } from './runtime-layout-timing'
 import { restoreEnv, unsetEnv } from './setup-env'
 
 const VERSION = '1.7.0'
@@ -67,22 +65,15 @@ const ENV_NAMES = [
   'OPENCODE_OPENAI_AUTH_STATE_FILE',
 ] as const
 const POSIX = process.platform !== 'win32'
-const timing =
-  process.env.OPENAI_AUTH_LAYOUT_TIMING === '1'
-    ? new RuntimeLayoutTiming()
-    : undefined
-if (timing) __setRuntimeLayoutLockObserverForTest(timing.observeLock)
-afterAll(() => {
-  if (timing) __setRuntimeLayoutLockObserverForTest()
-})
 
 let root: string
 let saved: Record<string, string | undefined>
 let logged: { level: string; message: string; meta?: unknown }[]
+let currentCase: { ended: boolean }
 
 beforeEach(() => {
   root = realpathSync.native(mkdtempSync(join(tmpdir(), 'runtime-layout-')))
-  timing?.beginCase(root)
+  currentCase = { ended: false }
   saved = Object.fromEntries(ENV_NAMES.map((name) => [name, process.env[name]]))
   process.env.XDG_CONFIG_HOME = join(root, 'config')
   process.env.XDG_STATE_HOME = join(root, 'state')
@@ -99,22 +90,17 @@ const preparing = new Set<Promise<unknown>>()
 const PREPARE_SETTLE_MS = 25_000
 
 afterEach(async () => {
-  timing?.snapshot('teardown-start', preparing.size)
-  // A test that timed out still has its `prepare()` running, and the rest of
-  // its body runs once that settles. Both name their files through `root`
-  // and the environment, so they must finish before the next test replaces
-  // those, or they act on the next test's folder; and the folder cannot be
-  // deleted on Windows while they hold its files open.
+  // A timeout does not stop an async test body. Reject its prepare continuation
+  // before it can read files or reset the next test's process state. The
+  // underlying filesystem work must still settle before removing its folder.
+  currentCase.ended = true
   await settlePreparing()
-  timing?.snapshot('prepares-settled', preparing.size)
   for (const name of ENV_NAMES) restoreEnv(name, saved[name])
   resetProcess()
-  timing?.snapshot('process-reset', preparing.size)
   try {
     chmodSync(join(root, 'state'), 0o700)
   } catch {}
   rmSync(root, { recursive: true, force: true })
-  timing?.snapshot('teardown-end', preparing.size)
 }, PREPARE_SETTLE_MS + 5_000)
 
 /**
@@ -149,7 +135,12 @@ const layoutModule = () =>
   runtimeLayout as typeof runtimeLayout & Record<string, unknown>
 
 function prepare(options: Partial<RuntimeLayoutOptions> = {}) {
-  const measured = timing?.prepare(options)
+  const testCase = currentCase
+  const assertActive = () => {
+    if (testCase.ended)
+      throw new Error('runtime-layout test case already ended')
+  }
+  assertActive()
   const run = prepareRuntimeLayout({
     version: VERSION,
     log: {
@@ -157,19 +148,19 @@ function prepare(options: Partial<RuntimeLayoutOptions> = {}) {
       warn: (message, meta) => logged.push({ level: 'warn', message, meta }),
     },
     ...options,
-    ...(measured ? { steps: measured.steps } : {}),
-  })
-  preparing.add(run)
-  run.then(
-    () => {
-      preparing.delete(run)
-      measured?.finish('resolved')
+  }).then(
+    (layout) => {
+      assertActive()
+      return layout
     },
-    () => {
-      preparing.delete(run)
-      measured?.finish('rejected')
+    (error) => {
+      assertActive()
+      throw error
     },
   )
+  preparing.add(run)
+  const settled = () => preparing.delete(run)
+  run.then(settled, settled)
   return run
 }
 
@@ -590,8 +581,9 @@ describe('moving an existing layout', () => {
   it.each(CREDENTIAL_FILES)(
     'refuses changed old credentials during immediate cleanup: %s',
     async (relative) => {
-      timing?.labelCase(`immediate cleanup: ${relative}`)
-      const files = { ...oldLayout(), [relative]: 'original-credentials\n' }
+      // Only this credential matters to the conflict; full-layout moves are
+      // covered separately, without repeating their copy and cleanup here.
+      const files = { [relative]: 'original-credentials\n' }
       seed(configDir(), files)
       await expect(
         prepare({
@@ -618,8 +610,7 @@ describe('moving an existing layout', () => {
   it.each(CREDENTIAL_FILES)(
     'refuses changed old credentials when cleanup retries after a crash: %s',
     async (relative) => {
-      timing?.labelCase(`cleanup retry after crash: ${relative}`)
-      const files = { ...oldLayout(), [relative]: 'original-credentials\n' }
+      const files = { [relative]: 'original-credentials\n' }
       seed(configDir(), files)
       await prepare({
         steps: {
