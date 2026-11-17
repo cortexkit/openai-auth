@@ -95,14 +95,14 @@ for (const reason of [
       expect(warning).toContain(' WARN [vault] ')
       expect(warning).toContain('"host":"opencode"')
       expect(warning).toContain(
-        '"error":"Claustrum scoped operation unavailable"',
+        '"error":"Claustrum vault could not be reached"',
       )
       if (reason) expect(warning).toContain(`"reason":"${reason}"`)
       else expect(warning).not.toContain('"reason":')
     }
     expect(text).not.toContain('ab'.repeat(32))
     expect((await vault.status()).lastError).toBe(
-      'Claustrum scoped operation unavailable',
+      'Claustrum vault could not be reached',
     )
   })
 }
