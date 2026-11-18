@@ -71,6 +71,13 @@ test('fleet selection uses an eligible vault identity, not a plugin route id', a
         modelId: 'gpt-6',
         hold_wait_max_s: 0,
         refusals: true,
+        candidates: {
+          view_digest: expect.any(String),
+          accounts: [
+            { account_id: 'account-a', credential_id: 'credential-a' },
+            { account_id: 'account-b', credential_id: 'credential-b' },
+          ],
+        },
       },
       { deadlineMs: 1500 },
     ],
@@ -93,6 +100,9 @@ test.each([undefined, 'route-b'])(
         modelId: 'gpt-6',
         hold_wait_max_s: 0,
         refusals: true,
+        candidates: expect.objectContaining({
+          view_digest: expect.any(String),
+        }),
         ...(warmAccountId ? { warm_credential: 'credential-b' } : {}),
       },
     ])
@@ -237,6 +247,9 @@ test.each([
           provider: 'openai',
           modelId: 'gpt-6',
           hold_wait_max_s: expected,
+          candidates: expect.objectContaining({
+            view_digest: expect.any(String),
+          }),
           refusals: true,
         },
         { deadlineMs: 1500 },
@@ -244,6 +257,47 @@ test.each([
     ])
   },
 )
+
+test('a continue hold names the exhausted account and stays within the ordinary wait cap', async () => {
+  const request = input()
+  const accountKey = {
+    namespace: 'vault',
+    accountId: 'route-a',
+    incarnation: '1',
+  }
+  Reflect.set(globalThis, key, () => ({
+    accountFor: async () => ({
+      account_id: 'account-a',
+      credential_id: 'credential-a',
+      hold: { retry_after_ms: 300_000 },
+    }),
+  }))
+  expect(
+    await chooseVaultRouting({
+      ...request,
+      fresh: false,
+      eligibleIds: ['route-b'],
+      continuation: {
+        previousId: 'route-a',
+        exhausted: {
+          accountId: 'account-a',
+          credentialId: 'credential-a',
+          limitWindow: 'seven_day',
+          observedAtMs: request.routing.now,
+        },
+      },
+      wait: {
+        activity: {
+          accountKey,
+          lastAcceptedAt: request.routing.now - 1,
+          ttlMs: 60_001,
+        },
+        accountKey,
+        maxSameAccountWait: 'max',
+      },
+    }),
+  ).toEqual({ holdMs: 60_000 })
+})
 
 test.each([
   'account_limit_exhausted',
@@ -330,52 +384,45 @@ test.each(['killswitch', 'refused', 'not-in-request'])(
   },
 )
 
-test.each([
-  'local',
-  'warm',
-  'retry',
-  'title',
-  'compaction',
-  'keep-warm',
-  'no-session',
-  'no-candidates',
-  'blocked',
-])('%s request never asks the fleet', async (kind) => {
-  let calls = 0
-  Reflect.set(globalThis, key, () => {
-    calls++
-    return {
-      accountFor: async () => ({
-        refused: { code: 'account_selection_final' },
+test.each(['local', 'warm', 'retry', 'no-session', 'no-candidates', 'blocked'])(
+  '%s request never asks the fleet',
+  async (kind) => {
+    let calls = 0
+    Reflect.set(globalThis, key, () => {
+      calls++
+      return {
+        accountFor: async () => ({
+          refused: { code: 'account_selection_final' },
+        }),
+      }
+    })
+    const request = input()
+    expect(
+      await chooseVaultRouting({
+        ...request,
+        vaultMode: kind !== 'local',
+        fresh: kind !== 'warm',
+        sessionId: kind === 'no-session' ? undefined : request.sessionId,
+        routes: kind === 'no-candidates' ? [] : request.routes,
+        routing:
+          kind === 'blocked'
+            ? { ...request.routing, rows: [] }
+            : request.routing,
+        request: {
+          ...request.request,
+          retry: kind === 'retry',
+        },
       }),
-    }
-  })
-  const request = input()
-  expect(
-    await chooseVaultRouting({
-      ...request,
-      vaultMode: kind !== 'local',
-      fresh: kind !== 'warm',
-      sessionId: kind === 'no-session' ? undefined : request.sessionId,
-      routes: kind === 'no-candidates' ? [] : request.routes,
-      routing:
-        kind === 'blocked' ? { ...request.routing, rows: [] } : request.routing,
-      request: {
-        ...request.request,
-        retry: kind === 'retry',
-        kind: ['title', 'compaction', 'keep-warm'].includes(kind)
-          ? kind
-          : 'primary',
-      },
-    }),
-  ).toBeUndefined()
-  expect(calls).toBe(0)
-})
+    ).toBeUndefined()
+    expect(calls).toBe(0)
+  },
+)
 
-test('OpenCode 1 routing metadata excludes hidden agents and unclassified calls', () => {
+test('OpenCode 1 routing metadata distinguishes title from other auxiliary requests', () => {
   const body = JSON.stringify({ model: 'gpt-6', input: [] })
   expect(vaultRoutingRequestFromBody(body, 'build')?.kind).toBe('primary')
-  for (const agent of ['title', 'compaction', 'summary', undefined])
+  expect(vaultRoutingRequestFromBody(body, 'title')?.kind).toBe('title')
+  for (const agent of ['compaction', 'summary', undefined])
     expect(vaultRoutingRequestFromBody(body, agent)?.kind).toBe('auxiliary')
   expect(vaultRoutingRequestFromBody('{}', 'build')).toBeUndefined()
   expect(vaultRoutingRequestFromBody('invalid', 'build')).toBeUndefined()

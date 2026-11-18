@@ -26,7 +26,7 @@ afterEach(() => {
   else Reflect.deleteProperty(globalThis, key)
 })
 
-function quotaMap(usedPercent: number): QuotaMap {
+function quotaMap(usedPercent: number, checkedAt = Date.now()): QuotaMap {
   return {
     limits: [
       {
@@ -34,7 +34,7 @@ function quotaMap(usedPercent: number): QuotaMap {
         label: 'primary',
         kind: 'reading',
         usedPercent,
-        checkedAt: Date.now(),
+        checkedAt,
         windowMinutes: 300,
       },
     ],
@@ -44,6 +44,7 @@ function quotaMap(usedPercent: number): QuotaMap {
 function fixture(
   vaultMode = true,
   mode: 'ordered' | 'sticky-balanced' = 'ordered',
+  now: () => number = Date.now,
 ) {
   const rows: PoolRow[] = [
     {
@@ -61,7 +62,7 @@ function fixture(
         refresh: 'local-refresh',
         expires: Date.now() + 3600_000,
       },
-      quota: quotaMap(10),
+      quota: quotaMap(10, now()),
     },
   ]
   const source: PoolAccess = {
@@ -78,7 +79,7 @@ function fixture(
     identity: `account-${id}`,
     credentialId: `credential-${id}`,
     kind: 'oauth' as const,
-    quota: quotaMap(10),
+    quota: quotaMap(10, now()),
   }))
   const refused = new Set<string>()
   const authorized: string[] = []
@@ -89,6 +90,7 @@ function fixture(
     routing: { mode },
   }
   const openai = createOpenAIAdapter({
+    now,
     source,
     storage: async () => storage,
     pins,
@@ -211,7 +213,7 @@ for (const mode of ['ordered', 'sticky-balanced'] as const) {
   })
 }
 
-test('OpenCode 2 routing asks hint the current ordered account, not a new local choice', async () => {
+test('OpenCode 2 follows its recorded ordered account without asking again', async () => {
   const calls: unknown[] = []
   Reflect.set(globalThis, key, () => ({
     accountFor: async (request: unknown) => {
@@ -228,13 +230,13 @@ test('OpenCode 2 routing asks hint the current ordered account, not a new local 
       modelId: 'gpt-6',
       hold_wait_max_s: 0,
       refusals: true,
-    },
-    {
-      provider: 'openai',
-      modelId: 'gpt-6',
-      hold_wait_max_s: 0,
-      refusals: true,
-      warm_credential: 'credential-b',
+      candidates: {
+        view_digest: expect.any(String),
+        accounts: [
+          { account_id: 'account-a', credential_id: 'credential-a' },
+          { account_id: 'account-b', credential_id: 'credential-b' },
+        ],
+      },
     },
   ])
 })
@@ -254,6 +256,7 @@ test('OpenCode 2 cold sticky choice does not hint a provisional pin', async () =
       modelId: 'gpt-6',
       hold_wait_max_s: 0,
       refusals: true,
+      candidates: expect.objectContaining({ view_digest: expect.any(String) }),
     },
   ])
 })
@@ -266,8 +269,6 @@ test.each([
   'killswitch',
   'refused',
   'retry',
-  'title',
-  'compaction',
   'local',
 ])('OpenCode 2 %s keeps its own choice without re-asking', async (kind) => {
   let asks = 0
@@ -295,17 +296,28 @@ test.each([
   const request = {
     ...env.request,
     phase: kind === 'retry' ? ('retry' as const) : ('request' as const),
-    kind:
-      kind === 'title' || kind === 'compaction' ? kind : ('primary' as const),
   }
   expect(await env.openai.adapter.chooseAccount(request)).toBe(
     kind === 'local' ? 'main' : 'vault:a',
   )
-  expect(asks).toBe(
-    ['retry', 'title', 'compaction', 'local'].includes(kind) ? 0 : 1,
-  )
+  expect(asks).toBe(['retry', 'local'].includes(kind) ? 0 : 1)
   if (kind === 'refused') expect(env.authorized).toEqual(['vault:b', 'vault:a'])
 })
+
+test.each(['compaction', 'generate', 'title'] as const)(
+  'OpenCode 2 first %s asks without recording or pinning',
+  async (kind) => {
+    const accountFor = mock(async () => ({ account_id: 'account-b' }))
+    Reflect.set(globalThis, key, () => ({ accountFor }))
+    const env = fixture(true, 'sticky-balanced')
+    expect(
+      await env.openai.adapter.chooseAccount({ ...env.request, kind }),
+    ).toBe('vault:b')
+    expect(accountFor).toHaveBeenCalledTimes(1)
+    expect(env.openai.activeAccount(env.request.sessionID)).toBeUndefined()
+    expect(env.pins.placementSnapshot().size).toBe(0)
+  },
+)
 
 test('OpenCode 2 skips inactive routing observation and checks the bridge again for later responses', async () => {
   Reflect.deleteProperty(globalThis, key)
@@ -497,6 +509,13 @@ for (const scenario of [
       error: { type: 'rate_limit_exceeded', window: '5h' },
     },
     exhausted: false,
+    backoff: 'rate_limit_exceeded',
+  },
+  {
+    name: 'forbidden',
+    frame: { type: 'error', status: 403, error: { code: 'forbidden' } },
+    exhausted: false,
+    backoff: 'forbidden',
   },
   {
     name: 'failed response without a limit',
@@ -507,16 +526,19 @@ for (const scenario of [
     exhausted: false,
   },
 ]) {
-  test(`OpenCode 2 vault WebSocket ${scenario.name} reports exhaustion only for account limits`, async () => {
+  test(`OpenCode 2 vault WebSocket ${scenario.name} reports only the classified outcome`, async () => {
     const reports: Record<string, unknown>[] = []
+    const at = 1_900_000_000_000
+    const accountFor = mock(async () => ({ account_id: 'account-b' }))
     Reflect.set(globalThis, key, () => ({
-      accountFor: async () => ({ account_id: 'account-b' }),
+      accountFor,
       report: (payload: Record<string, unknown>) => {
-        if (!payload.kind) reports.push(payload)
+        if (!payload.kind || payload.kind === 'transient_backoff')
+          reports.push(payload)
         return new Promise(() => {})
       },
     }))
-    const env = fixture()
+    const env = fixture(true, 'ordered', () => at)
     Object.assign(env.routes[1]!.quota.limits[0]!, {
       resetsAt: new Date(1_900_000_000_000).toISOString(),
     })
@@ -558,8 +580,32 @@ for (const scenario of [
                   : {}),
               },
             ]
-          : [],
+          : 'backoff' in scenario
+            ? [
+                {
+                  account_id: 'account-b',
+                  credential_id: 'credential-b',
+                  kind: 'transient_backoff',
+                  retry_at_ms: at + 5000,
+                  provider_code: scenario.backoff,
+                },
+              ]
+            : [],
       )
+      if ('backoff' in scenario) {
+        const retry = await host.fire('retry', {
+          ...requestScope,
+          attempt: 2,
+          decision: { retry: true, delay: 0 },
+          error: {
+            type: 'api',
+            message: JSON.stringify(scenario.frame),
+            status: scenario.frame.status,
+          },
+        })
+        expect(retry.decision).toEqual({ retry: true, delay: 5000 })
+        expect(accountFor).toHaveBeenCalledTimes(1)
+      }
     } finally {
       await installation.dispose()
     }
@@ -775,7 +821,7 @@ test('OpenCode 2 reports a served vault response without waiting, with only rate
   }
 })
 
-test('OpenCode 2 reports nothing for a usage-limit 429 without a recognized window', async () => {
+test('OpenCode 2 reports only backoff for a usage-limit 429 without a recognized window', async () => {
   const reports: unknown[] = []
   Reflect.set(globalThis, key, () => ({
     accountFor: async () => ({ account_id: 'account-b' }),
@@ -807,19 +853,22 @@ test('OpenCode 2 reports nothing for a usage-limit 429 without a recognized wind
         { status: 429 },
       ),
     })
-    expect(reports).toEqual([])
+    expect(
+      reports.filter(
+        (report) => (report as { kind?: string }).kind !== 'billing',
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        kind: 'transient_backoff',
+        account_id: 'account-b',
+      }),
+    ])
   } finally {
     await installation.dispose()
   }
 })
 
 for (const scenario of [
-  {
-    name: 'short 429',
-    status: 429,
-    body: JSON.stringify({ error: { type: 'rate_limit_exceeded' } }),
-    type: 'application/json',
-  },
   { name: '500', status: 500, body: '{}', type: 'application/json' },
   { name: '401', status: 401, body: '{}', type: 'application/json' },
   {
@@ -872,6 +921,210 @@ for (const scenario of [
     }
   })
 }
+
+test.each([
+  {
+    name: '429 with Retry-After',
+    status: 429,
+    headers: new Headers({ 'retry-after': '7' }),
+    code: 'turn_rate_limit_exceeded',
+    delay: 7000,
+  },
+  {
+    name: '429 without a retry time',
+    status: 429,
+    headers: undefined,
+    code: undefined,
+    delay: 5000,
+  },
+  {
+    name: '403',
+    status: 403,
+    headers: new Headers({ 'retry-after-ms': '2400' }),
+    code: undefined,
+    delay: 2400,
+  },
+  {
+    name: 'exhausted: route',
+    status: 429,
+    headers: undefined,
+    code: 'usage_limit_reached',
+    next: 'vault:c',
+  },
+  {
+    name: 'exhausted: refusal',
+    status: 429,
+    headers: undefined,
+    code: 'usage_limit_reached',
+    next: null,
+  },
+  {
+    name: 'exhausted: no answer',
+    status: 429,
+    headers: undefined,
+    code: 'usage_limit_reached',
+    next: 'vault:a',
+  },
+  {
+    name: 'exhausted: same account',
+    status: 429,
+    headers: undefined,
+    code: 'usage_limit_reached',
+    next: 'vault:b',
+  },
+])(
+  'OpenCode 2 routed HTTP $name uses the retry hook before another send',
+  async (scenario) => {
+    const at = 1_900_000_000_000
+    const events: unknown[] = []
+    Reflect.set(globalThis, key, () => ({
+      accountFor: async (request: Record<string, unknown>) => {
+        events.push(['ask', request])
+        if (request.mode !== 'continue') return { account_id: 'account-b' }
+        if (scenario.next === null)
+          return {
+            refused: {
+              code: 'account_selection_refused',
+              reason: 'candidates_disjoint',
+            },
+          }
+        if (scenario.next === 'vault:b') return { account_id: 'account-b' }
+        if (scenario.next === 'vault:c') return { account_id: 'account-c' }
+        return undefined
+      },
+      report: (report: Record<string, unknown>) => {
+        if (
+          report.kind === 'transient_backoff' ||
+          report.outcome === 'exhausted'
+        )
+          events.push(['report', report])
+        return new Promise(() => {})
+      },
+    }))
+    const env = fixture(true, 'ordered', () => at)
+    env.routes.push({
+      ...env.routes[0]!,
+      id: 'vault:c',
+      identity: 'account-c',
+      credentialId: 'credential-c',
+    })
+    const host = fakeOpenCode2Host()
+    const installation = await installOpenCode2Auth(
+      host.ctx,
+      env.openai.adapter,
+    )
+    env.openai.attach(installation)
+    const requestScope = scope('fleet-session')
+    const headers = { authorization: `Bearer ${placeholderSecret('openai')}` }
+    const send = async () => {
+      await host.fire('model.request', {
+        ...requestScope,
+        headers: { ...headers },
+      })
+      const draft = await host.fire('http.request', {
+        ...requestScope,
+        request: new Request('https://codex.test/v1/responses', {
+          method: 'POST',
+          body: '{}',
+          headers,
+        }),
+      })
+      events.push(['send', draft.request.headers.get('authorization')])
+      return draft.request
+    }
+    try {
+      const request = await send()
+      const exhausted = scenario.code === 'usage_limit_reached'
+      const payload = scenario.code
+        ? {
+            error: {
+              code: scenario.code,
+              ...(exhausted ? { window: '5h', resets_in_seconds: 30 } : {}),
+            },
+          }
+        : {}
+      await host.fire('http.response', {
+        ...requestScope,
+        request,
+        response: Response.json(payload, {
+          status: scenario.status,
+          headers: scenario.headers,
+        }),
+      })
+      const retry = await host.fire('retry', {
+        ...requestScope,
+        attempt: 2,
+        decision: { retry: true, delay: 12345 },
+        error: {
+          type: 'api',
+          message: JSON.stringify(payload),
+          status: scenario.status,
+        },
+      })
+      if (retry.decision.retry) await send()
+      expect(retry.decision.retry).toBe(scenario.next !== null)
+      if (scenario.next !== null)
+        expect(retry.decision.delay).toBe(scenario.delay ?? 0)
+      expect(events).toEqual([
+        ['ask', expect.not.objectContaining({ mode: 'continue' })],
+        ['send', 'Bearer vault:b-token'],
+        ...(exhausted
+          ? [
+              [
+                'report',
+                {
+                  account_id: 'account-b',
+                  credential_id: 'credential-b',
+                  outcome: 'exhausted',
+                  window: '5h',
+                  resets_at: at + 30_000,
+                },
+              ],
+              [
+                'ask',
+                expect.objectContaining({
+                  mode: 'continue',
+                  request_id: expect.any(String),
+                  exhausted: expect.objectContaining({
+                    account: 'account-b',
+                    credential_id: 'credential-b',
+                    limit_window: 'five_hour',
+                    observed_at_ms: at,
+                    resets_at_ms: at + 30_000,
+                  }),
+                  candidates: expect.objectContaining({
+                    accounts: expect.arrayContaining([
+                      {
+                        account_id: 'account-b',
+                        credential_id: 'credential-b',
+                      },
+                    ]),
+                  }),
+                }),
+              ],
+            ]
+          : [
+              [
+                'report',
+                {
+                  account_id: 'account-b',
+                  credential_id: 'credential-b',
+                  kind: 'transient_backoff',
+                  retry_at_ms: at + scenario.delay!,
+                  provider_code: scenario.code ?? `http_${scenario.status}`,
+                },
+              ],
+            ]),
+        ...(scenario.next === null
+          ? []
+          : [['send', `Bearer ${scenario.next ?? 'vault:b'}-token`]]),
+      ])
+    } finally {
+      await installation.dispose()
+      env.openai.dispose()
+    }
+  },
+)
 
 const billingTerminal = (type = 'response.completed') => ({
   type,

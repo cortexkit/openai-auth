@@ -29,6 +29,7 @@ import {
   formatRefreshBackoffMessage,
   getKillswitchThresholdsForAccount,
   hashRefreshToken,
+  hasVaultRoutingAccessor,
   isCompleteQuotaHeaderFrame,
   isCostZeroingEnabled,
   isKillswitchEnabled,
@@ -174,6 +175,7 @@ import {
   isVaultModeRefusal,
   LOCAL_CREDENTIAL_REFUSALS,
   type PendingPoolHold,
+  type PendingVaultRetry,
   type PoolBlockQuotas,
   type PoolPinPlacement,
   servePoolRequest,
@@ -687,9 +689,13 @@ export async function CodexAuthPlugin(
   let limitSource: OpenCodeLimitSource | undefined
   const sessionAccounts = new Map<string, AccountKey>()
   const pendingPoolHolds = new Map<string, PendingPoolHold>()
+  const pendingVaultRetries = new Map<string, PendingVaultRetry>()
   const forgetPoolHolds = (sessionId: string) => {
     for (const [key, hold] of pendingPoolHolds) {
       if (hold.sessionId === sessionId) pendingPoolHolds.delete(key)
+    }
+    for (const [key, retry] of pendingVaultRetries) {
+      if (retry.sessionId === sessionId) pendingVaultRetries.delete(key)
     }
   }
   // Background account-pool migration, and adoption into the pool of logins
@@ -2662,6 +2668,11 @@ export async function CodexAuthPlugin(
 
           const sessionID = resolveSidebarSessionId(headers)
           const agent = headers.get(OPENAI_AGENT_HEADER) ?? undefined
+          const recordsAccount = !(
+            agent === 'title' &&
+            vaultReceipt &&
+            hasVaultRoutingAccessor()
+          )
 
           const codexMetadata = sessionID
             ? getCodexSessionMetadata(
@@ -2757,7 +2768,10 @@ export async function CodexAuthPlugin(
           if (!pooled && activityKey)
             legacyKeys.set(keepwarmAccountKey, activityKey)
           const dispatched: SessionDispatch | undefined =
-            sessionID && activityKey && typeof requestInit?.body === 'string'
+            recordsAccount &&
+            sessionID &&
+            activityKey &&
+            typeof requestInit?.body === 'string'
               ? {
                   sessionId: sessionID,
                   accountKey: activityKey,
@@ -2765,7 +2779,7 @@ export async function CodexAuthPlugin(
                   ttlMs: ttlForModel(requestInit.body),
                 }
               : undefined
-          if (sessionID) sessionAccounts.delete(sessionID)
+          if (recordsAccount && sessionID) sessionAccounts.delete(sessionID)
           if (dispatched) {
             sessionAccounts.set(dispatched.sessionId, dispatched.accountKey)
             if (sessionAccounts.size > 256) {
@@ -4027,6 +4041,7 @@ export async function CodexAuthPlugin(
               sessionId,
             ),
             source: poolSource,
+            vaultRetries: pendingVaultRetries,
             rateLimitMarks: () => limits.marks(),
             limitPolicy: {
               pending: pendingPoolHolds,
@@ -4062,7 +4077,9 @@ export async function CodexAuthPlugin(
             sessionId,
             requestKind: JSON.stringify([
               requestPath,
-              routingRequest?.kind ?? 'auxiliary',
+              routingRequest?.kind === 'title'
+                ? 'auxiliary'
+                : (routingRequest?.kind ?? 'auxiliary'),
             ]),
             routingRequest: vaultMode ? routingRequest : undefined,
             body: typeof init?.body === 'string' ? init.body : undefined,
@@ -4159,6 +4176,12 @@ export async function CodexAuthPlugin(
             creditsServing,
             log: logA,
           })
+          if (
+            vaultMode &&
+            routingRequest?.kind === 'title' &&
+            hasVaultRoutingAccessor()
+          )
+            return response
           queueRequestSidebarRouting(
             sessionId,
             parentSessionId,

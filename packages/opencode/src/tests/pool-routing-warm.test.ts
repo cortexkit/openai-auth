@@ -64,7 +64,7 @@ function context(): PoolRequestContext {
 }
 
 test.each([undefined, 'vault:b'])(
-  'OpenCode 1 ordered routing hints only the current session account (%s)',
+  'OpenCode 1 ordered routing asks only for first placement (%s)',
   async (currentId) => {
     const calls: unknown[] = []
     Reflect.set(globalThis, key, () => ({
@@ -83,16 +83,22 @@ test.each([undefined, 'vault:b'])(
           : undefined,
       owner: () => undefined,
     }
-    await servePoolRequest(ctx)
-    expect(calls).toEqual([
-      {
-        provider: 'openai',
-        modelId: 'gpt-6',
-        hold_wait_max_s: 0,
-        refusals: true,
-        ...(currentId ? { warm_credential: 'credential-b' } : {}),
-      },
-    ])
+    expect((await servePoolRequest(ctx)).servedId).toBe(currentId ?? 'vault:a')
+    expect(calls).toEqual(
+      currentId
+        ? []
+        : [
+            {
+              provider: 'openai',
+              modelId: 'gpt-6',
+              hold_wait_max_s: 0,
+              refusals: true,
+              candidates: expect.objectContaining({
+                view_digest: expect.any(String),
+              }),
+            },
+          ],
+    )
   },
 )
 

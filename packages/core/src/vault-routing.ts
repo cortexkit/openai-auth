@@ -1,5 +1,6 @@
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import {
+  type AskRoutingInput,
   askRouting,
   type RoutingRefusal,
   reportRouting,
@@ -20,6 +21,15 @@ interface VaultRoutingRoute {
   identity?: string
   credentialId?: string
 }
+
+type VaultRoutingExhausted = Extract<
+  NonNullable<AskRoutingInput['exhausted']>,
+  { limitWindow: 'five_hour' | 'seven_day' }
+>
+
+export type VaultRoutingFeedback =
+  | { kind: 'exhausted'; exhausted: VaultRoutingExhausted }
+  | { kind: 'backoff'; retryAtMs: number; credentialId: string }
 
 // Hosts match error text to decide retries; never include routing's details.
 export const VAULT_ROUTING_REFUSAL_MESSAGE =
@@ -75,9 +85,9 @@ export function startVaultRoutingWait(input: {
   }
 }
 
-/** Title generation and history maintenance must not choose a new vault account. */
 export function vaultRoutingKind(agent: string | undefined): string {
-  return agent && !['title', 'compaction', 'summary'].includes(agent)
+  if (agent === 'title') return 'title'
+  return agent && !['compaction', 'summary'].includes(agent)
     ? 'primary'
     : 'auxiliary'
 }
@@ -110,28 +120,36 @@ export async function chooseVaultRouting(input: {
   routes: readonly VaultRoutingRoute[]
   routing: PoolRoutingInput
   eligibleIds?: readonly string[]
+  continuation?: { previousId: string; exhausted: VaultRoutingExhausted }
   wait?: RoutingWaitInput
   warmAccountId?: string
-}): Promise<string | RoutingRefusal | undefined> {
-  const { request, sessionId } = input
+}): Promise<string | RoutingRefusal | { holdMs: number } | undefined> {
+  const { request, sessionId, continuation } = input
   if (
     !input.vaultMode ||
-    !input.fresh ||
+    !hasVaultRoutingAccessor() ||
     !sessionId ||
     !request?.modelId ||
-    request.kind !== 'primary' ||
-    request.retry
+    (!continuation && (!input.fresh || request.retry))
   )
     return undefined
   const plan = planOrdered({
     ...input.routing,
+    rows:
+      continuation && input.eligibleIds
+        ? input.routing.rows.filter((row) =>
+            input.eligibleIds?.includes(row.id),
+          )
+        : input.routing.rows,
     placement: 'roster',
     mainId: null,
   })
-  if (plan.kind === 'block') return undefined
-  const eligible = new Set(input.eligibleIds ?? plan.order)
+  if (plan.kind === 'block' && !continuation) return undefined
+  const order = plan.kind === 'send' ? plan.order : []
+  const eligible = new Set(input.eligibleIds ?? order)
   const candidates = input.routes.flatMap((route) =>
-    plan.order.includes(route.id) &&
+    route.id !== continuation?.previousId &&
+    order.includes(route.id) &&
     eligible.has(route.id) &&
     route.identity &&
     route.credentialId
@@ -144,9 +162,18 @@ export async function chooseVaultRouting(input: {
         ]
       : [],
   )
+  if (continuation) {
+    const { accountId, credentialId } = continuation.exhausted
+    // Routing must be able to name the exhausted account in a same-account hold.
+    candidates.push({ accountId, credentialId, id: continuation.previousId })
+  }
   if (candidates.length === 0) return undefined
-  // askRouting enforces its own deadline; ignore suggested delays to stay within it.
-  const answer = await askRouting({
+  const holdWaitMaxS = routingHoldWaitMaxS({
+    ...input.wait,
+    sessionId,
+    now: input.routing.now,
+  })
+  const ask = {
     sessionId,
     provider: 'openai',
     modelId: request.modelId,
@@ -154,14 +181,26 @@ export async function chooseVaultRouting(input: {
     warmCredentialId: input.routes.find(
       (route) => route.id === input.warmAccountId,
     )?.credentialId,
-    refusals: true,
-    holdWaitMaxS: routingHoldWaitMaxS({
-      ...input.wait,
-      sessionId,
-      now: input.routing.now,
-    }),
-  })
-  return answer && 'refused' in answer ? answer : answer?.candidate.id
+    refusals: true as const,
+    holdWaitMaxS,
+  }
+  const answer = continuation
+    ? await askRouting({
+        ...ask,
+        mode: 'continue',
+        exhausted: continuation.exhausted,
+        requestId: crypto.randomUUID(),
+      })
+    : await askRouting(ask)
+  if (!answer || 'refused' in answer) return answer
+  return answer.candidate.id === continuation?.previousId
+    ? {
+        holdMs: Math.min(
+          answer.hold?.retry_after_ms ?? 0,
+          (holdWaitMaxS ?? 0) * 1000,
+        ),
+      }
+    : answer.candidate.id
 }
 
 const RATE_LIMIT_HEADERS = [
@@ -183,6 +222,7 @@ export interface VaultRoutingResponse {
   quota?: unknown
   failed?: boolean
   now?: number
+  backoff?: boolean
 }
 
 const USAGE_LIMIT_CODES = new Set([
@@ -197,17 +237,27 @@ function resetFromRetryAfter(
 ): number | undefined {
   const milliseconds = headers.get('retry-after-ms')
   if (
-    milliseconds !== null &&
+    milliseconds?.trim() &&
     Number.isFinite(Number(milliseconds)) &&
     Number(milliseconds) >= 0
   )
     return now + Number(milliseconds)
   const value = headers.get('retry-after')
-  if (value === null) return undefined
+  if (!value?.trim()) return undefined
   const seconds = Number(value)
   if (Number.isFinite(seconds) && seconds >= 0) return now + seconds * 1000
   const date = Date.parse(value)
   return Number.isFinite(date) ? date : undefined
+}
+
+function providerResetAt(absolute: unknown, relative: unknown, now: number) {
+  return typeof absolute === 'number' &&
+    Number.isFinite(absolute) &&
+    absolute > 0
+    ? absolute * 1000
+    : typeof relative === 'number' && Number.isFinite(relative) && relative > 0
+      ? now + relative * 1000
+      : undefined
 }
 
 /** Report only classified account exhaustion, never an HTTP status or error text alone. */
@@ -218,14 +268,14 @@ export function reportVaultRoutingLimit(
   options: Pick<VaultRoutingResponse, 'body' | 'quota' | 'now'> & {
     headers?: Headers
   } = {},
-): void {
+): VaultRoutingExhausted | undefined {
   if (!hasVaultRoutingAccessor() || !sessionId || !receipt?.accountIdentity)
-    return
+    return undefined
   if (
     !USAGE_LIMIT_CODES.has(limit.window) &&
     !['primary', 'secondary', '5h', '7d'].includes(limit.window)
   )
-    return
+    return undefined
   const body = isRecord(options.body) ? options.body : undefined
   const response = isRecord(body?.response) ? body.response : body
   const detail = isRecord(response?.error) ? response.error : response
@@ -247,20 +297,14 @@ export function reportVaultRoutingLimit(
       )
     : undefined
   const window = minutes === 300 ? '5h' : minutes === 10080 ? '7d' : named
-  if (window !== '5h' && window !== '7d') return
+  if (window !== '5h' && window !== '7d') return undefined
   const headerReset = slot
     ? Number(options.headers?.get(`x-codex-${slot}-reset-at`)) * 1000
     : NaN
   const absolute = detail?.resets_at ?? failed?.resets_at
   const relative = detail?.resets_in_seconds ?? failed?.resets_in_seconds
-  const providerReset =
-    typeof absolute === 'number' && Number.isFinite(absolute) && absolute > 0
-      ? absolute * 1000
-      : typeof relative === 'number' &&
-          Number.isFinite(relative) &&
-          relative > 0
-        ? (options.now ?? Date.now()) + relative * 1000
-        : undefined
+  const now = options.now ?? Date.now()
+  const providerReset = providerResetAt(absolute, relative, now)
   const reset = limit.resetAt ?? providerReset
   const resetsAt =
     reset !== undefined && Number.isFinite(reset) && reset > 0
@@ -268,7 +312,7 @@ export function reportVaultRoutingLimit(
       : Number.isFinite(headerReset) && headerReset > 0
         ? headerReset
         : options.headers
-          ? resetFromRetryAfter(options.headers, options.now ?? Date.now())
+          ? resetFromRetryAfter(options.headers, now)
           : undefined
   reportRouting({
     sessionId,
@@ -278,54 +322,80 @@ export function reportVaultRoutingLimit(
     window,
     ...(resetsAt !== undefined ? { resetsAt } : {}),
   })
+  return {
+    accountId: receipt.accountIdentity,
+    credentialId: receipt.credentialId,
+    limitWindow: window === '5h' ? 'five_hour' : 'seven_day',
+    observedAtMs: now,
+    ...(resetsAt !== undefined ? { resetsAtMs: resetsAt } : {}),
+  }
 }
 
-/** Only successful responses and classified account exhaustion reach routing. */
+/** Classify a provider response without forwarding its body or error message. */
 export function reportVaultRouting(
   sessionId: string | undefined,
   receipt: QuotaReceipt | undefined,
   response: VaultRoutingResponse,
-): void {
-  if (
-    !sessionId ||
-    !receipt?.accountIdentity ||
-    response.failed ||
-    !hasVaultRoutingAccessor()
-  )
+): VaultRoutingFeedback | undefined {
+  if (!sessionId || !receipt || response.failed || !hasVaultRoutingAccessor())
     return
   const { status, headers } = response
-  const identity = {
-    sessionId,
-    accountId: receipt.accountIdentity,
-    credentialId: receipt.credentialId,
-  }
-  if (status === 429) {
-    const body = isRecord(response.body) ? response.body : undefined
+  const identity = receipt.accountIdentity
+    ? {
+        sessionId,
+        accountId: receipt.accountIdentity,
+        credentialId: receipt.credentialId,
+      }
+    : undefined
+  if (status === 429 || status === 403) {
+    const envelope = isRecord(response.body) ? response.body : undefined
+    const body = isRecord(envelope?.response) ? envelope.response : envelope
     const detail = isRecord(body?.error) ? body.error : body
     const reason = response.limit?.window
     const code = typeof detail?.code === 'string' ? detail.code : undefined
-    const usage =
-      reason && USAGE_LIMIT_CODES.has(reason)
-        ? reason
-        : code && USAGE_LIMIT_CODES.has(code)
-          ? code
-          : undefined
-    if (!usage) return
-    const named =
-      typeof detail?.rate_limit_reached_type === 'string'
-        ? detail.rate_limit_reached_type
-        : typeof detail?.window === 'string'
-          ? detail.window
-          : usage
-    reportVaultRoutingLimit(
-      sessionId,
-      receipt,
-      { window: named, resetAt: response.limit?.resetAt },
-      { headers, quota: response.quota, now: response.now },
+    const type =
+      typeof detail?.type === 'string' &&
+      !['error', 'response.failed'].includes(detail.type)
+        ? detail.type
+        : undefined
+    const usage = [reason, code, type].find(
+      (value) => value !== undefined && USAGE_LIMIT_CODES.has(value),
     )
+    if (status === 429 && usage) {
+      const named =
+        typeof detail?.rate_limit_reached_type === 'string'
+          ? detail.rate_limit_reached_type
+          : typeof detail?.window === 'string'
+            ? detail.window
+            : usage
+      const exhausted = reportVaultRoutingLimit(
+        sessionId,
+        receipt,
+        { window: named, resetAt: response.limit?.resetAt },
+        { headers, quota: response.quota, now: response.now },
+      )
+      if (exhausted) return { kind: 'exhausted', exhausted }
+    }
+    if (response.backoff) {
+      const now = response.now ?? Date.now()
+      const retryAtMs = Math.ceil(
+        resetFromRetryAfter(headers, now) ??
+          response.limit?.resetAt ??
+          providerResetAt(detail?.resets_at, detail?.resets_in_seconds, now) ??
+          now + 5_000,
+      )
+      if (identity)
+        reportRouting({
+          ...identity,
+          kind: 'transient_backoff',
+          retryAtMs,
+          providerCode: code || type || `http_${status}`,
+        })
+      return { kind: 'backoff', retryAtMs, credentialId: receipt.credentialId }
+    }
     return
   }
-  if (status < 200 || status >= 300) return
+  if (!identity || status < 200 || status >= 300) return
   const rateHeaders: Record<string, string> = {}
   for (const name of RATE_LIMIT_HEADERS) {
     const value = headers.get(name)
@@ -366,31 +436,46 @@ export function observeVaultRoutingResponse(
     parseLimit: (body: unknown) => VaultRoutingResponse['limit']
     quota?: unknown
     now?: () => number
+    /** A reroute must wait for classification, not for routing to accept the report. */
+    onRefusal?: (classified: Promise<VaultRoutingFeedback | undefined>) => void
   },
 ): Response {
-  if (!hasVaultRoutingAccessor() || !sessionId || !receipt.accountIdentity)
+  if (
+    !hasVaultRoutingAccessor() ||
+    !sessionId ||
+    (!receipt.accountIdentity && !options.onRefusal)
+  )
     return response
   const outcome = {
     status: response.status,
     headers: response.headers,
     quota: options.quota,
   }
-  if (response.status === 429) {
+  if (!receipt.accountIdentity) return response
+  if (
+    response.status === 429 ||
+    (response.status === 403 && options.onRefusal)
+  ) {
     // Inspect a copy only for refused requests; the caller retains its unread body.
+    const receivedAt = options.now?.() ?? Date.now()
+    const report = (body?: unknown) =>
+      reportVaultRouting(sessionId, receipt, {
+        ...outcome,
+        body,
+        limit: options.parseLimit(body),
+        now: receivedAt,
+        backoff: options.onRefusal !== undefined,
+      })
     try {
-      void response
+      const classified = response
         .clone()
         .json()
-        .then((body: unknown) => {
-          reportVaultRouting(sessionId, receipt, {
-            ...outcome,
-            body,
-            limit: options.parseLimit(body),
-            now: options.now?.(),
-          })
-        })
-        .catch(() => {})
-    } catch {}
+        .then(report, () => report())
+        .catch(() => undefined)
+      options.onRefusal?.(classified)
+    } catch {
+      options.onRefusal?.(Promise.resolve(report()))
+    }
     return response
   }
   if (!response.ok) return response

@@ -276,6 +276,74 @@ describe('the request path in vault mode', () => {
     }
   })
 
+  it('OpenCode 1 a cold title asks but does not place a sticky pin', async () => {
+    const key = Symbol.for('cortexkit.routing')
+    const previous = Object.getOwnPropertyDescriptor(globalThis, key)
+    const accountFor = mock(async () => ({ account_id: 'account-b' }))
+    Reflect.set(globalThis, key, () => ({ accountFor }))
+    const pins = new Map()
+    const routes = ['a', 'b'].map((id) => ({
+      id: `vault:${id}`,
+      identity: `account-${id}`,
+      credentialId: `credential-${id}`,
+      kind: 'oauth' as const,
+      quota: quotaMap(10),
+    }))
+    try {
+      const { result } = await serve(
+        vaultWith(routes),
+        null,
+        'sticky-balanced',
+        200,
+        {
+          sessionId: 'title-session',
+          routingRequest: { modelId: 'gpt-6', kind: 'title' },
+          placePin: (input) =>
+            placeStickyPin(pins, input, (id, pin) => pins.set(id, pin)),
+        },
+      )
+      expect(result.servedId).toBe('vault:b')
+      expect(accountFor).toHaveBeenCalledTimes(1)
+      expect(pins.size).toBe(0)
+    } finally {
+      if (previous) Object.defineProperty(globalThis, key, previous)
+      else Reflect.deleteProperty(globalThis, key)
+    }
+  })
+
+  it('OpenCode 1 routing does not replay a single-send request', async () => {
+    const key = Symbol.for('cortexkit.routing')
+    const previous = Object.getOwnPropertyDescriptor(globalThis, key)
+    const accountFor = mock(async () => ({ account_id: 'account-a' }))
+    Reflect.set(globalThis, key, () => ({ accountFor }))
+    const routes = ['a', 'b'].map((id) => ({
+      id: `vault:${id}`,
+      identity: `account-${id}`,
+      credentialId: `credential-${id}`,
+      kind: 'oauth' as const,
+      quota: quotaMap(10),
+    }))
+    const body = JSON.stringify({
+      error: { code: 'usage_limit_reached', window: '5h' },
+    })
+    const send = mock(async () => new Response(body, { status: 429 }))
+    try {
+      const { result } = await serve(vaultWith(routes), null, 'ordered', 429, {
+        sessionId: 'no-replay-session',
+        routingRequest: { modelId: 'gpt-6', kind: 'primary' },
+        replayable: false,
+        send,
+      })
+      expect(result.response.status).toBe(429)
+      expect(await result.response.text()).toBe(body)
+      expect(send).toHaveBeenCalledTimes(1)
+      expect(accountFor).toHaveBeenCalledTimes(1)
+    } finally {
+      if (previous) Object.defineProperty(globalThis, key, previous)
+      else Reflect.deleteProperty(globalThis, key)
+    }
+  })
+
   for (const kind of [
     'ineligible',
     'no-answer',
@@ -287,7 +355,7 @@ describe('the request path in vault mode', () => {
     'keep-warm',
     'local',
   ] as const) {
-    it(`OpenCode 1 ${kind} keeps its own ordered choice`, async () => {
+    it(`OpenCode 1 ordered placement with ${kind} routing input`, async () => {
       const key = Symbol.for('cortexkit.routing')
       const previous = Reflect.get(globalThis, key)
       let asks = 0
@@ -310,13 +378,7 @@ describe('the request path in vault mode', () => {
           kind: 'oauth' as const,
           quota: quotaMap(10),
         }))
-        const neverAsk = [
-          'retry',
-          'title',
-          'compaction',
-          'keep-warm',
-          'local',
-        ].includes(kind)
+        const neverAsk = ['retry', 'local'].includes(kind)
         const { result } = await serve(
           vaultWith(routes),
           null,
@@ -334,7 +396,13 @@ describe('the request path in vault mode', () => {
             },
           },
         )
-        expect(result.servedId).toBe(kind === 'local' ? 'main' : 'vault:a')
+        expect(result.servedId).toBe(
+          kind === 'local'
+            ? 'main'
+            : ['title', 'compaction', 'keep-warm'].includes(kind)
+              ? 'vault:b'
+              : 'vault:a',
+        )
         expect(asks).toBe(neverAsk ? 0 : 1)
       } finally {
         if (previous === undefined) Reflect.deleteProperty(globalThis, key)
@@ -343,38 +411,188 @@ describe('the request path in vault mode', () => {
     })
   }
 
-  it('an ordered fleet choice is asked once, never again for its retry', async () => {
-    const key = Symbol.for('cortexkit.routing')
-    const previous = Reflect.get(globalThis, key)
-    let asks = 0
-    Reflect.set(globalThis, key, () => ({
-      accountFor: async () => {
-        asks++
-        return { account_id: 'account-b' }
-      },
-    }))
-    try {
-      const routes = ['a', 'b'].map((id) => ({
+  it.each([
+    {
+      name: '429 with Retry-After',
+      status: 429,
+      headers: new Headers({ 'retry-after': '7' }),
+      code: 'turn_rate_limit_exceeded',
+      delay: 7000,
+    },
+    {
+      name: '429 without a retry time',
+      status: 429,
+      headers: undefined,
+      code: undefined,
+      delay: 5000,
+    },
+    {
+      name: '403',
+      status: 403,
+      headers: new Headers({ 'retry-after-ms': '2400' }),
+      code: undefined,
+      delay: 2400,
+    },
+    {
+      name: 'exhausted: route',
+      status: 429,
+      headers: undefined,
+      code: 'usage_limit_reached',
+      next: 'vault:c',
+    },
+    {
+      name: 'exhausted: refusal',
+      status: 429,
+      headers: undefined,
+      code: 'usage_limit_reached',
+      next: null,
+    },
+    {
+      name: 'exhausted: no answer',
+      status: 429,
+      headers: undefined,
+      code: 'usage_limit_reached',
+      next: 'vault:a',
+    },
+    {
+      name: 'exhausted: same account',
+      status: 429,
+      headers: undefined,
+      code: 'usage_limit_reached',
+      next: 'vault:b',
+    },
+  ])(
+    'OpenCode 1 ordered $name reports before moving or retrying',
+    async (scenario) => {
+      const key = Symbol.for('cortexkit.routing')
+      const previous = Reflect.get(globalThis, key)
+      const at = Date.now()
+      let now = at
+      const events: unknown[] = []
+      let sent = 0
+      Reflect.set(globalThis, key, () => ({
+        accountFor: async (request: Record<string, unknown>) => {
+          events.push(['ask', request])
+          if (request.mode !== 'continue') return { account_id: 'account-b' }
+          if (scenario.next === null)
+            return {
+              refused: {
+                code: 'account_selection_refused',
+                reason: 'candidates_disjoint',
+              },
+            }
+          if (scenario.next === 'vault:b') return { account_id: 'account-b' }
+          if (scenario.next === 'vault:c') return { account_id: 'account-c' }
+          return undefined
+        },
+        report: (report: unknown) => {
+          events.push(['report', report])
+          return new Promise(() => {})
+        },
+      }))
+      const routes = ['a', 'b', 'c'].map((id) => ({
         id: `vault:${id}`,
         identity: `account-${id}`,
         credentialId: `credential-${id}`,
         kind: 'oauth' as const,
         quota: quotaMap(10),
       }))
-      const { sent } = await serve(vaultWith(routes), null, 'ordered', 429, {
+      const exhausted = scenario.code === 'usage_limit_reached'
+      const vault = vaultWith(routes)
+      const overrides: Partial<PoolRequestContext> = {
         sessionId: 'retry-session',
         routingRequest: { modelId: 'gpt-6', kind: 'primary' },
-      })
-      expect(sent).toEqual([
-        'vault:b:vault-token-vault:b',
-        'vault:a:vault-token-vault:a',
-      ])
-      expect(asks).toBe(1)
-    } finally {
-      if (previous === undefined) Reflect.deleteProperty(globalThis, key)
-      else Reflect.set(globalThis, key, previous)
-    }
-  })
+        vaultRetries: new Map(),
+        now: () => now,
+        send: async ({ id }) => {
+          const first = sent++ === 0
+          events.push(['send', id])
+          if (!first) return new Response('ok')
+          return Response.json(
+            scenario.code
+              ? {
+                  error: {
+                    code: scenario.code,
+                    ...(exhausted
+                      ? { window: '5h', resets_in_seconds: 30 }
+                      : {}),
+                  },
+                }
+              : {},
+            { status: scenario.status, headers: scenario.headers },
+          )
+        },
+      }
+      try {
+        const run = () =>
+          serve(vault, null, 'ordered', scenario.status, overrides)
+        if (scenario.next === null) {
+          await expect(run()).rejects.toThrow(
+            'Thalamus routing declined this request, so it was not sent.',
+          )
+        } else {
+          const { result } = await run()
+          if (!exhausted || scenario.next === 'vault:b') {
+            expect(result.response.status).toBe(429)
+            expect(result.response.headers.get('retry-after')).toBe(
+              String(Math.max(1, Math.ceil((scenario.delay ?? 0) / 1000))),
+            )
+            now += scenario.delay ?? 1000
+            expect((await run()).result.servedId).toBe('vault:b')
+          } else expect(result.servedId).toBe(scenario.next!)
+        }
+        expect(events).toEqual([
+          ['ask', expect.not.objectContaining({ mode: 'continue' })],
+          ['send', 'vault:b'],
+          ...(exhausted
+            ? [
+                [
+                  'report',
+                  {
+                    account_id: 'account-b',
+                    credential_id: 'credential-b',
+                    outcome: 'exhausted',
+                    window: '5h',
+                    resets_at: at + 30_000,
+                  },
+                ],
+                [
+                  'ask',
+                  expect.objectContaining({
+                    mode: 'continue',
+                    request_id: expect.any(String),
+                    exhausted: expect.objectContaining({
+                      account: 'account-b',
+                      credential_id: 'credential-b',
+                      limit_window: 'five_hour',
+                      observed_at_ms: at,
+                      resets_at_ms: at + 30_000,
+                    }),
+                  }),
+                ],
+              ]
+            : [
+                [
+                  'report',
+                  {
+                    account_id: 'account-b',
+                    credential_id: 'credential-b',
+                    kind: 'transient_backoff',
+                    retry_at_ms: at + scenario.delay!,
+                    provider_code: scenario.code ?? `http_${scenario.status}`,
+                  },
+                ],
+              ]),
+          ...(scenario.next === null
+            ? []
+            : [['send', scenario.next ?? 'vault:b']]),
+        ])
+      } finally {
+        if (previous === undefined) Reflect.deleteProperty(globalThis, key)
+        else Reflect.set(globalThis, key, previous)
+      }
+    },
+  )
 
   for (const scenario of [
     {
@@ -395,13 +613,6 @@ describe('the request path in vault mode', () => {
         },
       }),
       reports: 'exhausted',
-      type: 'application/json',
-    },
-    {
-      name: 'short 429',
-      status: 429,
-      body: JSON.stringify({ error: { type: 'turn_rate_limit_exceeded' } }),
-      reports: undefined,
       type: 'application/json',
     },
     {
