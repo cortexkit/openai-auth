@@ -112,6 +112,7 @@ import {
   type VaultRoutingResponse,
   vaultModeNoRouteCause,
   vaultModeRefusalText,
+  vaultRoutingPlacementRetryMs,
   vaultRoutingStreamFailed,
   vaultRoutingStreamMayFail,
 } from '@cortexkit/openai-auth-core/internal'
@@ -334,6 +335,21 @@ interface Target {
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
+
+function waitForRoutingRetry(delayMs: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    signal?.throwIfAborted()
+    const abort = () => {
+      clearTimeout(timer)
+      reject(signal?.reason)
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', abort)
+      resolve()
+    }, delayMs)
+    signal?.addEventListener('abort', abort, { once: true })
+  })
+}
 
 /**
  * The reset-credit balance a pool row's or vault account's quota map holds
@@ -989,7 +1005,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
   }
 
   const chooseAccount = async (
-    input: ChooseAccountInput,
+    input: ChooseAccountInput & { signal?: AbortSignal },
   ): Promise<ChooseAccountResult> => {
     let ready: OpenAiLimitsRequest | undefined
     const modeAuthority = await vault?.authority()
@@ -1103,7 +1119,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             : 'resumed',
         )
     }
-    const byId = new Map(targets.map((target) => [target.id, target]))
+    let byId = new Map(targets.map((target) => [target.id, target]))
     let routing = routingInput(targets, storage, at)
     const admissionTiers = hasVaultRoutingAccessor()
       ? new Map<string, AdmissionTier>()
@@ -1208,7 +1224,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         }
       }
     }
-    const candidates: LimitCandidate[] = targets.flatMap((target) => {
+    const readLimitCandidate = (target: Target): LimitCandidate[] => {
       const account = limits?.accountKey(target.id)
       if (!account) return []
       const reading = windowsFromQuotaMap(target.quota)
@@ -1261,7 +1277,8 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           confirmedBlockers,
         },
       ]
-    })
+    }
+    let candidates = targets.flatMap(readLimitCandidate)
     const facts: PolicyFacts = {
       phase: input.phase === 'retry' ? 'after-limit' : 'pre-send',
       host: 'opencode2',
@@ -1494,6 +1511,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     let reservation: PinReservation | undefined
     let accountId: string | undefined
     let routingConsulted = false
+    let retriedPlacement = false
     let explicitPick: string | undefined
     const reserveAccount = (id: string) => {
       const checkedAt = admitSticky(routing).projections.get(id)?.checkedAt
@@ -1626,6 +1644,25 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
                 }))
           continued = undefined
           if (preferred && typeof preferred !== 'string') {
+            const delayMs = !retriedPlacement
+              ? vaultRoutingPlacementRetryMs(preferred)
+              : undefined
+            if (delayMs !== undefined) {
+              // Routing may be starting up. No account has been chosen, so
+              // release the provisional reservation while routing gets ready.
+              if (reservation) pins.rollback(reservation)
+              reservation = undefined
+              await waitForRoutingRetry(delayMs, input.signal)
+              input.signal?.throwIfAborted()
+              retriedPlacement = true
+              routingConsulted = false
+              at = now()
+              targets = currentTargets(storage, at, vaultMode)
+              byId = new Map(targets.map((target) => [target.id, target]))
+              routing = routingInput(targets, storage, at)
+              candidates = targets.flatMap(readLimitCandidate)
+              continue
+            }
             throw new OpenCode2AuthError({
               kind: 'no-account',
               providerID: OPENAI_PROVIDER_ID,
@@ -1776,7 +1813,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             candidate.confirmedBlockers?.length,
         )
       ) {
-        const decision = decideOpenAiTerminal(facts, terminalFacts())
+        const decision = decideOpenAiTerminal(
+          { ...facts, now: at, clockNow: at, candidates },
+          terminalFacts(),
+        )
         const wire = buildOpenAiQuotaRefusal({
           decision,
           now: at,

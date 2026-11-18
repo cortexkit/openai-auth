@@ -238,7 +238,7 @@ type SetupContext = Pick<
 > &
   Partial<Pick<Plugin.Context, 'command' | 'location'>>
 
-async function installPoolHooks<Q, A extends OpenAIAttemptData>(
+export async function installPoolHooks<Q, A extends OpenAIAttemptData>(
   ctx: SetupContext,
   adapter: OpenCode2AuthAdapter<Q, A, ChooseAccountResult>,
   log: Pick<OpenAIAdapterLogger, 'warn' | 'info'>,
@@ -262,7 +262,8 @@ async function installPoolHooks<Q, A extends OpenAIAttemptData>(
   // installOpenCode2Auth supplies an Attempt to the rewrite callbacks before it
   // constructs the final Request. Async-local storage carries that handle to
   // this hook's final snapshot without sharing a latest attempt across requests.
-  const observing = new AsyncLocalStorage<{ attempt?: Attempt<A> }>()
+  type HookObservation = { attempt?: Attempt<A>; signal?: AbortSignal }
+  const observing = new AsyncLocalStorage<HookObservation>()
   // Receive/retry hooks have no request object to identify the send they answer.
   // They answer the last handshake or send for this session, so remember its
   // bearer. A send using another integration's login is not ours to rewrite.
@@ -312,12 +313,21 @@ async function installPoolHooks<Q, A extends OpenAIAttemptData>(
             const owned =
               prepared?.get('authorization') ===
               `Bearer ${placeholderSecret(adapter.providerID)}`
-            const observation: { attempt?: Attempt<A> } = {}
+            // The WebSocket handshake exposes no abort signal, so a placement
+            // retry there can only rely on its bounded delay.
+            const signal = request?.request.signal
+            const observation: HookObservation = { signal }
             if (handshake)
               sockets.delete(`${handshake.sessionID}:${handshake.kind}`)
             try {
               await observing.run(observation, () => callback(draft))
             } catch (error) {
+              // Preserve cancellation without exposing a custom abort reason.
+              if (owned && signal?.aborted && error === signal.reason)
+                throw new DOMException(
+                  'The operation was aborted.',
+                  'AbortError',
+                )
               if (owned && !(error instanceof OpenCode2AuthError))
                 throw redactCredentialError(error)
               throw error
@@ -499,6 +509,11 @@ async function installPoolHooks<Q, A extends OpenAIAttemptData>(
     context,
     {
       ...adapter,
+      chooseAccount: (input) => {
+        // The installer does not pass the HTTP request's signal to selection.
+        const choice = { ...input, signal: observing.getStore()?.signal }
+        return adapter.chooseAccount(choice)
+      },
       answeredBy: async (input) => {
         const answered = await adapter.answeredBy?.(input)
         const data =

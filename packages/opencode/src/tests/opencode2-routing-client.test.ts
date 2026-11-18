@@ -11,7 +11,10 @@ import {
 import type { QuotaMap } from '@cortexkit/common-auth/quota'
 import * as routingClient from '@cortexkit/common-auth/routing-accessor'
 import type { PoolRow } from '@cortexkit/common-auth/store'
-import type { AccountStorage } from '@cortexkit/openai-auth-core/internal'
+import {
+  type AccountStorage,
+  VAULT_MODE_REFUSALS,
+} from '@cortexkit/openai-auth-core/internal'
 import type { OpenCodeLimitSource } from '../core/limit-source'
 import {
   createOpenAIAdapter,
@@ -20,6 +23,7 @@ import {
   type PoolAccess,
 } from '../v2/adapter'
 import { SessionPins } from '../v2/pins'
+import { installPoolHooks } from '../v2/setup'
 import { fakeOpenCode2Host, scope } from './fixtures/opencode2-host'
 
 const key = Symbol.for('cortexkit.routing')
@@ -217,6 +221,230 @@ for (const mode of ['ordered', 'sticky-balanced'] as const) {
     }
   })
 }
+
+const shortPlacementRefusal = {
+  refused: {
+    code: 'account_selection_refused',
+    routing_code: 'account_selection_unavailable',
+    retry_after_secs: 3,
+  },
+}
+const placementRefusalError = {
+  kind: 'no-account',
+  message: 'Thalamus routing declined this request, so it was not sent.',
+}
+
+async function placementRequest(answers: unknown[]) {
+  const secondAsk = Promise.withResolvers<void>()
+  const accountFor = mock(async (_request: unknown) => {
+    if (accountFor.mock.calls.length === 2) secondAsk.resolve()
+    return answers.shift()
+  })
+  Reflect.set(globalThis, key, () => ({ accountFor }))
+  const env = fixture(true, 'sticky-balanced')
+  const host = fakeOpenCode2Host()
+  const installation = await installPoolHooks(host.ctx, env.openai.adapter, {
+    warn() {},
+    info() {},
+  })
+  env.openai.attach(installation)
+  const controller = new AbortController()
+  const providerFetch = mock((request: Request) =>
+    request.headers.get('authorization'),
+  )
+  const scheduled = Promise.withResolvers<{ delay: number; wake: () => void }>()
+  const realSetTimeout = globalThis.setTimeout
+  const timers = spyOn(globalThis, 'setTimeout').mockImplementation(((
+    run: () => void,
+    delay?: number,
+    ...args: unknown[]
+  ) => {
+    if (delay !== undefined && [0, 3000, 5000, 6000].includes(delay)) {
+      scheduled.resolve({ delay, wake: run })
+      const timer = realSetTimeout(() => {}, delay)
+      clearTimeout(timer)
+      return timer
+    }
+    return realSetTimeout(run, delay, ...args)
+  }) as typeof setTimeout)
+  return {
+    ...env,
+    accountFor,
+    secondAsk: secondAsk.promise,
+    controller,
+    providerFetch,
+    wait: scheduled.promise,
+    async waitBeforeSend(sent: Promise<string | null>) {
+      const wait = await Promise.race([scheduled.promise, sent])
+      if (!wait || typeof wait !== 'object')
+        throw new Error('request sent before the placement wait')
+      return wait
+    },
+    async send(kind: ChooseAccountInput['kind'] = 'primary') {
+      const draft = await host.fire('http.request', {
+        ...scope(env.request.sessionID, kind),
+        request: new Request('https://codex.test/responses', {
+          headers: { authorization: `Bearer ${placeholderSecret('openai')}` },
+          signal: controller.signal,
+        }),
+      })
+      return providerFetch(draft.request)
+    },
+    async dispose() {
+      controller.abort()
+      timers.mockRestore()
+      await installation.dispose()
+      env.openai.dispose()
+    },
+  }
+}
+
+test.each(['primary', 'title', 'compaction', 'generate'] as const)(
+  'short first placement refusal waits before routing a %s request to B',
+  async (kind) => {
+    const pick = Promise.withResolvers<{ account_id: string }>()
+    const env = await placementRequest([shortPlacementRefusal, pick.promise])
+    env.storage.killswitch = {
+      enabled: true,
+      schema: 'floors-v1',
+      defaults: { primary: 25, secondary: 0 },
+    }
+    try {
+      const sent = env.send(kind)
+      const wait = await env.waitBeforeSend(sent)
+      expect(wait.delay).toBe(3000)
+      expect(env.accountFor).toHaveBeenCalledTimes(1)
+      expect(env.providerFetch).not.toHaveBeenCalled()
+      expect(env.authorized).toEqual([])
+      env.routes[0]!.quota = quotaMap(99)
+      wait.wake()
+      await Promise.race([env.secondAsk, sent])
+      expect(env.providerFetch).not.toHaveBeenCalled()
+      expect(env.authorized).toEqual([])
+      pick.resolve({ account_id: 'account-b' })
+      expect(await sent).toBe('Bearer vault:b-token')
+      expect(env.providerFetch).toHaveBeenCalledTimes(1)
+      expect(env.authorized).toEqual(['vault:b'])
+      expect(env.accountFor).toHaveBeenCalledTimes(2)
+      const first = env.accountFor.mock.calls[0]?.[0] as {
+        candidates: { accounts: unknown[] }
+      }
+      expect(first.candidates.accounts).toHaveLength(2)
+      expect(first).not.toHaveProperty('mode')
+      expect(env.accountFor.mock.calls[1]?.[0]).toEqual({
+        ...first,
+        candidates: {
+          view_digest: expect.any(String),
+          accounts: [
+            { account_id: 'account-b', credential_id: 'credential-b' },
+          ],
+        },
+      })
+      expect(env.openai.activeAccount(env.request.sessionID)).toBe(
+        kind === 'primary' ? 'vault:b' : undefined,
+      )
+    } finally {
+      await env.dispose()
+    }
+  },
+)
+
+test('a second short first placement refusal stops without another wait', async () => {
+  const env = await placementRequest([
+    shortPlacementRefusal,
+    shortPlacementRefusal,
+  ])
+  try {
+    const sent = env.send()
+    const wait = await env.waitBeforeSend(sent)
+    wait.wake()
+    await expect(sent).rejects.toMatchObject(placementRefusalError)
+    expect(env.accountFor).toHaveBeenCalledTimes(2)
+    expect(env.providerFetch).not.toHaveBeenCalled()
+    expect(env.authorized).toEqual([])
+  } finally {
+    await env.dispose()
+  }
+})
+
+test('no answer after the five-second placement wait uses the local vault choice', async () => {
+  const env = await placementRequest([
+    { refused: { code: 'account_selection_refused', retry_after_secs: 5 } },
+    undefined,
+  ])
+  env.routes.pop()
+  try {
+    const sent = env.send()
+    const wait = await env.waitBeforeSend(sent)
+    expect(wait.delay).toBe(5000)
+    wait.wake()
+    expect(await sent).toBe('Bearer vault:a-token')
+    expect(env.accountFor).toHaveBeenCalledTimes(2)
+  } finally {
+    await env.dispose()
+  }
+})
+
+test('losing all vault routes during a placement wait keeps the local no-account refusal', async () => {
+  const env = await placementRequest([shortPlacementRefusal])
+  try {
+    const sent = env.send()
+    const wait = await env.waitBeforeSend(sent)
+    env.routes.length = 0
+    wait.wake()
+    await expect(sent).rejects.toMatchObject({
+      kind: 'no-account',
+      message: VAULT_MODE_REFUSALS['vault-unreachable'],
+    })
+    expect(env.accountFor).toHaveBeenCalledTimes(1)
+    expect(env.providerFetch).not.toHaveBeenCalled()
+    expect(env.authorized).toEqual([])
+  } finally {
+    await env.dispose()
+  }
+})
+
+test.each([
+  ['six-second selection refusal', 'account_selection_refused', 6],
+  ['zero-second selection refusal', 'account_selection_refused', 0],
+  ['selection refusal without a delay', 'account_selection_refused', undefined],
+  ['final selection refusal', 'account_selection_final', 3],
+  ['account limit exhaustion', 'account_limit_exhausted', 3],
+] as const)(
+  'first placement stops immediately on %s',
+  async (_name, code, seconds) => {
+    const env = await placementRequest([
+      { refused: { code, retry_after_secs: seconds } },
+    ])
+    try {
+      await expect(Promise.race([env.wait, env.send()])).rejects.toMatchObject(
+        placementRefusalError,
+      )
+      expect(env.accountFor).toHaveBeenCalledTimes(1)
+      expect(env.providerFetch).not.toHaveBeenCalled()
+      expect(env.authorized).toEqual([])
+    } finally {
+      await env.dispose()
+    }
+  },
+)
+
+test('aborting the HTTP request during the first placement wait stops before another ask', async () => {
+  const env = await placementRequest([shortPlacementRefusal])
+  try {
+    const sent = env.send('title')
+    await env.waitBeforeSend(sent)
+    env.controller.abort(new Error('custom cancellation reason'))
+    const error = await sent.catch((error: unknown) => error)
+    expect(error).toBeInstanceOf(DOMException)
+    expect(error).toHaveProperty('name', 'AbortError')
+    expect(env.accountFor).toHaveBeenCalledTimes(1)
+    expect(env.providerFetch).not.toHaveBeenCalled()
+    expect(env.authorized).toEqual([])
+  } finally {
+    await env.dispose()
+  }
+})
 
 test('OpenCode 2 follows its recorded ordered account without asking again', async () => {
   const calls: unknown[] = []
@@ -1072,6 +1300,7 @@ test.each([
             refused: {
               code: 'account_selection_refused',
               reason: 'candidates_disjoint',
+              retry_after_secs: 3,
             },
           }
         if (scenario.next === 'vault:b') return { account_id: 'account-b' }

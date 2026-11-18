@@ -40,6 +40,22 @@ export type VaultRoutingFeedback =
 export const VAULT_ROUTING_REFUSAL_MESSAGE =
   'Thalamus routing declined this request, so it was not sent.'
 
+/** Only short selection refusals may be retried, before a first placement. */
+export function vaultRoutingPlacementRetryMs(
+  answer: RoutingRefusal | { holdMs: number },
+): number | undefined {
+  if (!('refused' in answer)) return undefined
+  const { code, retryAfterSecs } = answer.refused
+  if (
+    code === 'account_selection_refused' &&
+    typeof retryAfterSecs === 'number' &&
+    retryAfterSecs > 0 &&
+    retryAfterSecs <= 5
+  )
+    return retryAfterSecs * 1000
+  return undefined
+}
+
 /** The process-global routing accessor can change after plugin load; check it each time. */
 export function hasVaultRoutingAccessor(): boolean {
   try {
