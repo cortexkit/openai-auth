@@ -89,6 +89,15 @@ const preparing = new Set<Promise<unknown>>()
 /** How long the teardown waits for them; under the hook's own timeout. */
 const PREPARE_SETTLE_MS = 25_000
 
+/**
+ * Limit for the changed-credential cases, which move real private files twice.
+ * On windows-2022 CI runners they normally take 0.3-0.9 s per case (two
+ * measured runs, 18 Nov 2026), but a runner stall stretched a whole window of
+ * them to 1.2-5.3 s, with no lock, lease or file left over from earlier cases.
+ * Don't raise this further without measuring where the time goes.
+ */
+const CREDENTIAL_CASE_TIMEOUT_MS = 20_000
+
 afterEach(async () => {
   // A timeout does not stop an async test body. Reject its prepare continuation
   // before it can read files or reset the next test's process state. The
@@ -605,6 +614,7 @@ describe('moving an existing layout', () => {
         'original-credentials\n',
       )
     },
+    CREDENTIAL_CASE_TIMEOUT_MS,
   )
 
   it.each(CREDENTIAL_FILES)(
@@ -633,6 +643,7 @@ describe('moving an existing layout', () => {
         'original-credentials\n',
       )
     },
+    CREDENTIAL_CASE_TIMEOUT_MS,
   )
 
   it.each([
