@@ -986,6 +986,7 @@ async function startLocation(
     sessionID: string,
     kind: 'primary' | 'title' = 'primary',
     headers: Record<string, string> = {},
+    instructions?: string,
   ) =>
     host.fire('http.request', {
       ...scope(sessionID, kind),
@@ -998,6 +999,7 @@ async function startLocation(
         },
         body: JSON.stringify({
           model: 'gpt-5.5',
+          instructions,
           input: [{ role: 'user', content: 'hi' }],
           max_output_tokens: 50,
         }),
@@ -1563,7 +1565,8 @@ describe('OpenCode 2 keep-warm in setup', () => {
     const files = keepWarmPool()
     const shared = { clock: { now: Date.now() }, timers: fakeTimers() }
     const location = await startLocation(files, shared)
-    await location.request('ses_1')
+    const primary = await location.request('ses_1', 'primary', {}, 'help')
+    const sent = await primary.request.json()
     await location.request('ses_title', 'title')
     await location.host.fire('http.request', {
       ...scope('ses_key'),
@@ -1589,6 +1592,16 @@ describe('OpenCode 2 keep-warm in setup', () => {
     expect(warm!.headers.get('authorization')).toBe('Bearer main-pool-token')
     expect(warm!.headers.get('chatgpt-account-id')).toBe('chatgpt-main')
     expect(warm!.body).toMatchObject({ store: false })
+    expect(warm!.body).not.toHaveProperty('instructions')
+    expect(warm!.body.input).toEqual(sent.input)
+    expect(warm!.body.input).toEqual([
+      {
+        type: 'message',
+        role: 'developer',
+        content: [{ type: 'input_text', text: 'help' }],
+      },
+      { role: 'user', content: 'hi' },
+    ])
     expect(warm!.body).not.toHaveProperty('max_output_tokens')
     expect(shared.timers.armed).toHaveLength(1)
   })

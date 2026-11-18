@@ -2976,6 +2976,7 @@ describe('integration: active fallback routing', () => {
         instructions: 'Be concise',
         input: [
           {
+            type: 'message',
             role: 'user',
             content: [
               { type: 'input_text', text: 'hi' },
@@ -7592,6 +7593,11 @@ describe('integration: active fallback routing', () => {
         content: [{ type: 'input_text', text: 'Be concise' }],
       })
       const sourceInput = input.slice(2)
+      expect(sourceInput.map((item) => item.type)).toEqual([
+        'message',
+        'function_call_output',
+        'custom_tool_call_output',
+      ])
       expect([
         (
           sourceInput[0]?.content as Array<Record<string, unknown>> | undefined
@@ -7606,14 +7612,20 @@ describe('integration: active fallback routing', () => {
     },
   )
 
-  it('preserves the standard body when Responses Lite is disabled', async () => {
+  it('moves the system prompt into standard HTTP input without stripping image details', async () => {
     const captured = await captureResponsesLiteHttpRequest(
       'gpt-5.6-sol',
       false,
       'responses-lite-disabled',
     )
     const body = JSON.parse(String(captured.body)) as Record<string, unknown>
-    const input = body.input as Array<Record<string, unknown>>
+    const [system, ...input] = body.input as Array<Record<string, unknown>>
+    expect(body).not.toHaveProperty('instructions')
+    expect(system).toEqual({
+      type: 'message',
+      role: 'developer',
+      content: [{ type: 'input_text', text: 'Be concise' }],
+    })
     expect([
       (input[0]?.content as Array<Record<string, unknown>> | undefined)?.[1]
         ?.detail,
@@ -7623,8 +7635,95 @@ describe('integration: active fallback routing', () => {
         ?.detail,
     ]).toEqual(['high', 'low', 'auto'])
     expect(body.parallel_tool_calls).toBe(true)
-    expect(body.instructions).toBe('Be concise')
     expect(body.tools).toBeDefined()
+  })
+
+  it('chains only new WebSocket input until the system prompt changes', async () => {
+    seedEmptyAccountStorage()
+    const sent: Array<Record<string, unknown>> = []
+    const user = {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'one' }],
+    }
+    const delta = {
+      type: 'function_call_output',
+      call_id: 'call_1',
+      output: 'ok',
+    }
+    const developer = (text: string) => ({
+      type: 'message',
+      role: 'developer',
+      content: [{ type: 'input_text', text }],
+    })
+    await withFakeWebSocket(
+      ({ message }) => ({
+        send(data) {
+          sent.push(JSON.parse(data))
+          message(
+            JSON.stringify({
+              type: 'response.completed',
+              response: { id: `resp_${sent.length}` },
+            }),
+          )
+        },
+      }),
+      async () => {
+        const loaded = await loadFetchOverride(
+          createMockPluginInput(),
+          Date.now() + 3600_000,
+          true,
+        )
+        const request = async (instructions: string, input: unknown[]) => {
+          const response = await loaded.fetchOverride(
+            'https://api.openai.com/v1/responses',
+            {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                'session-id': 'ws-system',
+              },
+              body: JSON.stringify({
+                model: 'gpt-5.5',
+                stream: true,
+                instructions,
+                input,
+              }),
+            },
+          )
+          await response.text()
+        }
+        try {
+          await request('First prompt', [user])
+          await request('First prompt', [user, delta])
+          await request('Changed prompt', [user, delta])
+        } finally {
+          await loaded.hooks.dispose?.()
+        }
+      },
+    )
+    expect(
+      sent.map(({ generate, previous_response_id, input }) => ({
+        generate,
+        previous_response_id,
+        input,
+      })),
+    ).toEqual([
+      { generate: false, previous_response_id: undefined, input: [] },
+      {
+        generate: undefined,
+        previous_response_id: 'resp_1',
+        input: [developer('First prompt'), user],
+      },
+      { generate: undefined, previous_response_id: 'resp_2', input: [delta] },
+      { generate: false, previous_response_id: undefined, input: [] },
+      {
+        generate: undefined,
+        previous_response_id: 'resp_4',
+        input: [developer('Changed prompt'), user, delta],
+      },
+    ])
+    for (const frame of sent) expect(frame).not.toHaveProperty('instructions')
   })
 
   it('marks Responses Lite in WS metadata and still prewarms', async () => {
@@ -7682,96 +7781,108 @@ describe('integration: active fallback routing', () => {
     ).toBeUndefined()
   })
 
-  it('converts a WS Responses Lite capture into a sanitized HTTP cachekeep request', async () => {
-    seedEmptyAccountStorage()
-    const originalFetch = globalThis.fetch
-    const originalNow = Date.now
-    let now = originalNow()
-    const warmRequests: RequestInit[] = []
-    let hooks: Hooks | undefined
-    Date.now = () => now
-    try {
-      globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
-        // Record only the keep-warm request this test is about — the replay the
-        // plugin sends to keep a prompt cache alive. The loader's startup quota
-        // refresh also passes through this stub, and capturing that would make
-        // the assertion below race it.
-        if (init && isResponsesSend(url)) warmRequests.push(init)
-        return new Response('{}', { status: 200 })
-      }) as typeof globalThis.fetch
-      await withFakeWebSocket(
-        ({ message }) => ({
-          send(data) {
-            const body = JSON.parse(data) as Record<string, unknown>
-            message(
-              JSON.stringify({
-                type: 'response.completed',
-                response: {
-                  id: body.generate === false ? 'resp_prewarm' : 'resp_main',
-                },
-              }),
+  it.each([false, true])(
+    'converts a WS capture into a sanitized HTTP cachekeep request (Lite=%s)',
+    async (lite) => {
+      seedEmptyAccountStorage()
+      const originalFetch = globalThis.fetch
+      const originalNow = Date.now
+      let now = originalNow()
+      const warmRequests: RequestInit[] = []
+      let warmedInput: unknown
+      let hooks: Hooks | undefined
+      Date.now = () => now
+      try {
+        globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+          // Record only the keep-warm request this test is about — the replay the
+          // plugin sends to keep a prompt cache alive. The loader's startup quota
+          // refresh also passes through this stub, and capturing that would make
+          // the assertion below race it.
+          if (init && isResponsesSend(url)) warmRequests.push(init)
+          return new Response('{}', { status: 200 })
+        }) as typeof globalThis.fetch
+        await withFakeWebSocket(
+          ({ message }) => ({
+            send(data) {
+              const body = JSON.parse(data) as Record<string, unknown>
+              if (body.generate !== false) warmedInput = body.input
+              message(
+                JSON.stringify({
+                  type: 'response.completed',
+                  response: {
+                    id: body.generate === false ? 'resp_prewarm' : 'resp_main',
+                  },
+                }),
+              )
+            },
+          }),
+          async () => {
+            const loaded = await loadFetchOverride(
+              createMockPluginInput(),
+              now + 3600_000,
+              true,
+              lite,
             )
+            hooks = loaded.hooks
+            await cacheKeep('on')
+            const request = responsesLiteRequestInit(
+              'gpt-5.6-sol',
+              'responses-lite-keepwarm',
+              { stream: true },
+            )
+            const headers = new Headers(request.headers)
+            headers.set('x-opencode-session', 'internal-session')
+            request.headers = headers
+            const response = await loaded.fetchOverride(
+              'https://api.openai.com/v1/responses',
+              request,
+            )
+            await response.text()
+            // gpt-5.6 caches live 30 minutes; the warm is due inside the lead
+            // window before that, and is never sent once the cache expired.
+            now += 29 * 60_000
+            const manager = (
+              globalThis as typeof globalThis & {
+                __openaiAuthCacheKeepManagers?: Map<
+                  string,
+                  { tick(): Promise<void> }
+                >
+              }
+            ).__openaiAuthCacheKeepManagers?.get(getConfigPath())
+            if (!manager) throw new Error('missing cachekeep manager')
+            await manager.tick()
           },
-        }),
-        async () => {
-          const loaded = await loadFetchOverride(
-            createMockPluginInput(),
-            now + 3600_000,
-            true,
-            true,
-          )
-          hooks = loaded.hooks
-          await cacheKeep('on')
-          const request = responsesLiteRequestInit(
-            'gpt-5.6-sol',
-            'responses-lite-keepwarm',
-            { stream: true },
-          )
-          const headers = new Headers(request.headers)
-          headers.set('x-opencode-session', 'internal-session')
-          request.headers = headers
-          const response = await loaded.fetchOverride(
-            'https://api.openai.com/v1/responses',
-            request,
-          )
-          await response.text()
-          // gpt-5.6 caches live 30 minutes; the warm is due inside the lead
-          // window before that, and is never sent once the cache expired.
-          now += 29 * 60_000
-          const manager = (
-            globalThis as typeof globalThis & {
-              __openaiAuthCacheKeepManagers?: Map<
-                string,
-                { tick(): Promise<void> }
-              >
-            }
-          ).__openaiAuthCacheKeepManagers?.get(getConfigPath())
-          if (!manager) throw new Error('missing cachekeep manager')
-          await manager.tick()
-        },
-      )
-    } finally {
-      Date.now = originalNow
-      await scope.settlePluginWork()
-      globalThis.fetch = originalFetch
-      await hooks?.dispose?.()
-    }
+        )
+      } finally {
+        Date.now = originalNow
+        await scope.settlePluginWork()
+        globalThis.fetch = originalFetch
+        await hooks?.dispose?.()
+      }
 
-    expect(warmRequests).toHaveLength(1)
-    const warm = warmRequests[0]!
-    const warmHeaders = new Headers(warm.headers)
-    expect(warmHeaders.get('x-openai-internal-codex-responses-lite')).toBe(
-      'true',
-    )
-    expect(warmHeaders.has('x-opencode-session')).toBe(false)
-    const body = JSON.parse(String(warm.body)) as Record<string, unknown>
-    const metadata = body.client_metadata as Record<string, unknown>
-    expect('x-codex-turn-metadata' in metadata).toBe(false)
-    expect('x-codex-ws-stream-request-start-ms' in metadata).toBe(false)
-    expect(
-      'ws_request_header_x_openai_internal_codex_responses_lite' in metadata,
-    ).toBe(false)
-  })
+      expect(warmRequests).toHaveLength(1)
+      const warm = warmRequests[0]!
+      const warmHeaders = new Headers(warm.headers)
+      expect(warmHeaders.get('x-openai-internal-codex-responses-lite')).toBe(
+        lite ? 'true' : null,
+      )
+      expect(warmHeaders.has('x-opencode-session')).toBe(false)
+      const body = JSON.parse(String(warm.body)) as Record<string, unknown>
+      expect(body).not.toHaveProperty('instructions')
+      expect(body.input).toEqual(warmedInput)
+      expect((body.input as unknown[])[lite ? 1 : 0]).toEqual({
+        type: 'message',
+        role: 'developer',
+        content: [{ type: 'input_text', text: 'Be concise' }],
+      })
+      const metadata = body.client_metadata as Record<string, unknown>
+      expect('x-codex-turn-metadata' in metadata).toBe(false)
+      expect('x-codex-ws-stream-request-start-ms' in metadata).toBe(false)
+      expect(
+        'ws_request_header_x_openai_internal_codex_responses_lite' in metadata,
+      ).toBe(false)
+    },
+  )
 
   it('keeps the main refresh advisory lease shorter than the file lock TTL', () => {
     expect(MAIN_REFRESH_LEASE_TTL_MS).toBeLessThan(MAIN_REFRESH_LOCK_TTL_MS)

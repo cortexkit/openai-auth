@@ -758,6 +758,14 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 1 (real host)', () => {
               (sample) => sample.body as Record<string, any>,
             )
             expect(bodies).toHaveLength(variants.length)
+            expect(bodies[0]).not.toHaveProperty('instructions')
+            expect(bodies[0]?.input[0]).toMatchObject({
+              type: 'message',
+              role: 'developer',
+              content: [{ type: 'input_text', text: expect.any(String) }],
+            })
+            for (const body of bodies)
+              expect(body).not.toHaveProperty('instructions')
             expect(bodies[0]?.reasoning).toMatchObject({ effort: variants[0] })
             expect(
               bodies[0]?.input.some(

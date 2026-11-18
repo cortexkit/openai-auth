@@ -117,7 +117,8 @@ function codexState(rt = runtime().runtime) {
 /**
  * OpenCode 1's WebSocket request builder for the same host body: the body
  * without its output cap, through `prepareCodexRequest` with
- * `websocket: true`, for the given turn and send time.
+ * `websocket: true`, for the given turn and send time. Keep the old prompt
+ * layout to compare against frames whose history the host owns.
  */
 function opencode1Frame(
   frame: Record<string, unknown>,
@@ -133,6 +134,7 @@ function opencode1Frame(
     runtime: { now: () => sentAt, uuid: () => 'unused' },
     websocket: true,
     responsesLite: false,
+    preserveInstructions: true,
     rewriteLite: () => {},
   })
   return String(prepared.init?.body)
@@ -145,7 +147,7 @@ const turnMetadata = (text: string) =>
   }
 
 describe('WebSocket frame shaping', () => {
-  it("shapes every frame of a tool step, compaction, refusal and failover byte for byte as OpenCode 1's WebSocket builder does", () => {
+  it("uses OpenCode 1's Codex metadata and field order while preserving the legacy host's prompt layout", () => {
     const { clock, runtime: rt } = runtime()
     const effort = codexState(rt)
     const compacted = [user('summary'), assistant('ok'), user('three')]
@@ -168,6 +170,10 @@ describe('WebSocket frame shaping', () => {
       clock.now += 1_000
       if (!starts.has(turn)) starts.set(turn, clock.now)
       const sent = rewriteCodexFrame(JSON.stringify(frame), SESSION, effort)
+      expect(JSON.parse(sent ?? 'null')).toMatchObject({
+        instructions: 'be brief',
+        input: frame.input,
+      })
       expect(sent).toBe(
         opencode1Frame(
           frame,

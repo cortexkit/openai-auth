@@ -48,6 +48,11 @@ const user = (text: string) => ({
   role: 'user',
   content: [{ type: 'input_text', text }],
 })
+const developer = (text: string) => ({
+  type: 'message',
+  role: 'developer',
+  content: [{ type: 'input_text', text }],
+})
 const assistant = (text: string) => ({
   type: 'message',
   role: 'assistant',
@@ -84,7 +89,7 @@ function frame(
 
 function httpBody(
   effort: string,
-  input: unknown[],
+  input: unknown[] | string,
   extra: Record<string, unknown> = {},
 ) {
   return new Request('https://codex.test/v1/responses', {
@@ -248,6 +253,55 @@ describe('mid-conversation effort on WebSocket frames', () => {
 })
 
 describe('mid-conversation effort and Responses Lite on HTTP', () => {
+  it('moves the exact system prompt after existing additional_tools on a standard HTTP request', async () => {
+    const instructions = '  Be brief.\r\nUse café 🌱.\n'
+    const tools = { type: 'additional_tools', role: 'developer', tools: [] }
+    const request = httpBody('low', [tools, user('one')], {
+      instructions,
+      model: 'gpt-5.5',
+    })
+    const sent = await rewriteCodexHttpRequest(
+      request,
+      SESSION,
+      testEffort(),
+      false,
+    )
+    const body = await sent?.json()
+    expect(body).not.toHaveProperty('instructions')
+    expect(body.input).toEqual([tools, developer(instructions), user('one')])
+  })
+
+  it('keeps the OpenCode 2.3.2 HTTP input unchanged when it already carries the system prompt', async () => {
+    const input = [
+      { type: 'additional_tools', role: 'developer', tools: [] },
+      { type: 'message', role: 'developer', content: 'be brief' },
+      user('one'),
+    ]
+    const request = httpBody('low', input, { instructions: undefined })
+    const sent = await rewriteCodexHttpRequest(
+      request,
+      SESSION,
+      testEffort(),
+      false,
+    )
+    const body = await sent?.json()
+    expect(body).not.toHaveProperty('instructions')
+    expect(body.input).toEqual(input)
+  })
+
+  it('keeps shorthand user input when moving the system prompt', async () => {
+    const request = httpBody('low', 'one')
+    const sent = await rewriteCodexHttpRequest(
+      request,
+      SESSION,
+      testEffort(),
+      false,
+    )
+    const body = await sent?.json()
+    expect(body).not.toHaveProperty('instructions')
+    expect(body.input).toEqual([developer('be brief'), user('one')])
+  })
+
   it('carries the update on every request after a change, before the turn user message', async () => {
     const effort = testEffort()
     const first = await rewriteCodexHttpRequest(
@@ -279,6 +333,7 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
     const stepBody = await step?.json()
     expect(turnBody.reasoning).toEqual({ effort: 'low', summary: 'auto' })
     expect(turnBody.input).toEqual([
+      developer('be brief'),
       user('one'),
       assistant('a'),
       update('high'),
@@ -286,6 +341,7 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
     ])
     expect(stepBody.reasoning).toEqual({ effort: 'low', summary: 'auto' })
     expect(stepBody.input).toEqual([
+      developer('be brief'),
       user('one'),
       assistant('a'),
       update('high'),
@@ -330,11 +386,7 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
           role: 'developer',
           tools: [{ type: 'function', name: 'x', strict: false }],
         },
-        {
-          type: 'message',
-          role: 'developer',
-          content: [{ type: 'input_text', text: 'be brief' }],
-        },
+        developer('be brief'),
         user('one'),
       ])
       // A model not marked Lite keeps the standard shape.

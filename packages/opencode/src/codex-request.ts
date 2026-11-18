@@ -78,6 +78,37 @@ export function isMessageWithRole(item: unknown, role: string) {
   )
 }
 
+// GPT-6.2 caches the system prompt in input, but not in top-level instructions.
+export function moveInstructionsToDeveloperMessage(
+  body: Record<string, unknown>,
+) {
+  const instructions = body.instructions
+  if (typeof instructions !== 'string' || instructions.length === 0) return
+  const items = Array.isArray(body.input)
+    ? body.input
+    : typeof body.input === 'string'
+      ? [
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: body.input }],
+          },
+        ]
+      : []
+  const first = items[0]
+  const at = isRecord(first) && first.type === 'additional_tools' ? 1 : 0
+  body.input = [
+    ...items.slice(0, at),
+    {
+      type: 'message',
+      role: 'developer',
+      content: [{ type: 'input_text', text: instructions }],
+    },
+    ...items.slice(at),
+  ]
+  delete body.instructions
+}
+
 function startsHttpUserTurn(
   metadata: CodexSessionMetadata,
   input: unknown[],
@@ -112,7 +143,7 @@ export function updateHttpTurnMetadata(
   } else if (!metadata.turnStartedAt) {
     metadata.turnStartedAt = (runtime?.now ?? Date.now)()
   }
-  // Copy host history before effort or Lite rewrites, so tool continuations do
+  // Copy host history before rewriting input, so tool continuations do
   // not mistake injected input items for the beginning of another user turn.
   if (input && canonical) {
     metadata.input = input.slice()
@@ -131,6 +162,7 @@ export function prepareCodexRequest(input: {
   runtime?: CodexRequestRuntime
   /** Background replays read the turn without recording history. Defaults to false. */
   skipTurnUpdate?: boolean
+  preserveInstructions?: boolean
   /** Each host owns its effort policy; it runs once, after host-history capture. */
   applyEffort?: (
     body: Record<string, unknown>,
@@ -198,6 +230,8 @@ export function prepareCodexRequest(input: {
     parsed.tools = parsed.tools.map(normalizeCodexTool)
   input.applyEffort?.(parsed, input.metadata, agent)
   if (useResponsesLite) input.rewriteLite(parsed)
+  else if (!input.preserveInstructions)
+    moveInstructionsToDeveloperMessage(parsed)
   const clientMetadata: Record<string, unknown> = {
     ...(typeof parsed.client_metadata === 'object' &&
     parsed.client_metadata !== null

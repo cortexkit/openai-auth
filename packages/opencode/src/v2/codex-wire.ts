@@ -297,7 +297,7 @@ export interface CodexRewriteScope {
 
 /**
  * Shape every Responses HTTP request routed through the pool placeholder.
- * Capture the host's input before effort and Lite inject or replace items, so
+ * Capture the host's input before rewrites inject or replace items, so
  * a later tool continuation compares against host history, not injected items.
  */
 export async function rewriteCodexHttpRequest(
@@ -371,6 +371,7 @@ export function codexReplayRequest(
     runtime: state.runtime,
     websocket: false,
     skipTurnUpdate: true,
+    preserveInstructions: true,
     responsesLite: false,
     rewriteLite: () => {},
   })
@@ -455,6 +456,10 @@ export function rewriteCodexFrame(
     runtime: effort.http.runtime,
     websocket: true,
     responsesLite: false,
+    // Hosts before 2.3.2 build incremental frames against their own request
+    // shape. Leave instructions where the host put them; 2.3.2 moves the
+    // system prompt into input before it computes continuations.
+    preserveInstructions: true,
     applyEffort: (parsed) => {
       effort.apply(parsed, scope, 'ws')
     },

@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto'
 import { isRecord } from '@cortexkit/openai-auth-core/internal'
-import { type CodexSessionMetadata, isMessageWithRole } from './codex-request'
+import {
+  type CodexSessionMetadata,
+  isMessageWithRole,
+  moveInstructionsToDeveloperMessage,
+} from './codex-request'
 import { stableStringify } from './util/stable-json'
 
 // Models where a `configuration_update` item is both accepted and shown to change
@@ -156,20 +160,11 @@ export function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
         (tool) => !(isRecord(tool) && tool.type === 'web_search'),
       )
     : []
-  const prefix: unknown[] = [
+  parsed.input = [
     { type: 'additional_tools', role: 'developer', tools },
+    ...input,
   ]
-  if (
-    typeof parsed.instructions === 'string' &&
-    parsed.instructions.length > 0
-  ) {
-    prefix.push({
-      type: 'message',
-      role: 'developer',
-      content: [{ type: 'input_text', text: parsed.instructions }],
-    })
-  }
-  parsed.input = [...prefix, ...input]
+  moveInstructionsToDeveloperMessage(parsed)
   delete parsed.tools
   delete parsed.instructions
 }

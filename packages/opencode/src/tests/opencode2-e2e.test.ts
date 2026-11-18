@@ -1766,7 +1766,17 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       expect(result.exits).toEqual([0, 0])
       const sent = samplesOn(result, 'http')
       expect(sent.length).toBe(2)
-      for (const sample of sent) expectCodexClient(sample.headers)
+      for (const sample of sent) {
+        expectCodexClient(sample.headers)
+        const body = bodyOf(sample)
+        expect(body).not.toHaveProperty('instructions')
+        const messages = body.input.filter(
+          (item) => item.type === 'message' && item.role === 'developer',
+        )
+        expect(messages).toHaveLength(1)
+        const start = body.input[0]?.type === 'additional_tools' ? 1 : 0
+        expect(body.input[start]).toBe(messages[0])
+      }
     })
   }, 180_000)
 
@@ -1792,6 +1802,10 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       expect(
         bodies.map((body) => body.previous_response_id !== undefined),
       ).toEqual([false, true, true])
+      for (const body of bodies.slice(1)) {
+        expect(body.input).toHaveLength(1)
+        expect(body.input[0]?.role).toBe('user')
+      }
     })
   }, 180_000)
 
