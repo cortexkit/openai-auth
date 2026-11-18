@@ -14,7 +14,10 @@ import { createAssistantMessageEventStream } from '@earendil-works/pi-ai'
 // explicitly by the loader, and it resolves to the same file under plain Node.
 // The bare root does NOT work outside pi — it resolves to `dist/index.js`,
 // which does not export `streamSimple`.
-import { streamSimple as streamSimpleOpenAICodexResponses } from '@earendil-works/pi-ai/compat'
+import {
+  getModels as getBuiltinModels,
+  streamSimple as streamSimpleOpenAICodexResponses,
+} from '@earendil-works/pi-ai/compat'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
 import { registerCommands } from './commands.ts'
@@ -82,60 +85,90 @@ export function installRawCodexWebSocket() {
   }
 }
 
-const OPENAI_CODEX_MODELS: CodexModel[] = [
+/**
+ * Codex models a ChatGPT login can use that a Pi release may not list yet, each
+ * built from the Pi entry of its nearest predecessor (`from`). The Codex
+ * backend serves both 6.2 models from client 0.166.0 (measured 2026-11-18);
+ * pi-ai's Codex stream sends no client version header, which the backend
+ * accepts for them. Context windows are the Codex catalog's defaults, as Pi
+ * uses for its own entries. Costs are OpenAI's list prices (models.dev).
+ */
+const ADDED_CODEX_MODELS: ReadonlyArray<{
+  id: string
+  name: string
+  from: string
+  contextWindow: number
+  cost: CodexModel['cost']
+}> = [
   {
-    id: 'gpt-5.5',
-    name: 'GPT-5.5',
-    api: 'openai-codex-responses',
-    provider: 'openai-codex',
-    baseUrl: BASE_URL,
-    reasoning: true,
-    thinkingLevelMap: { xhigh: 'xhigh', minimal: 'low' },
-    input: ['text', 'image'],
-    cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
-    contextWindow: 272_000,
-    maxTokens: 128_000,
+    id: 'gpt-6.2-sol',
+    name: 'GPT-6.2 Sol',
+    from: 'gpt-6.1-sol',
+    contextWindow: 500_000,
+    cost: {
+      input: 2,
+      output: 10,
+      cacheRead: 0.1,
+      cacheWrite: 2.5,
+      tiers: [
+        {
+          inputTokensAbove: 272_000,
+          input: 4,
+          output: 15,
+          cacheRead: 0.2,
+          cacheWrite: 5,
+        },
+      ],
+    },
   },
   {
-    id: 'gpt-5.4',
-    name: 'GPT-5.4',
-    api: 'openai-codex-responses',
-    provider: 'openai-codex',
-    baseUrl: BASE_URL,
-    reasoning: true,
-    thinkingLevelMap: { xhigh: 'xhigh', minimal: 'low' },
-    input: ['text', 'image'],
-    cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
+    id: 'gpt-6.2-astra',
+    name: 'GPT-6.2 Astra',
+    from: 'gpt-6-astra',
     contextWindow: 272_000,
-    maxTokens: 128_000,
-  },
-  {
-    id: 'gpt-5.4-mini',
-    name: 'GPT-5.4 mini',
-    api: 'openai-codex-responses',
-    provider: 'openai-codex',
-    baseUrl: BASE_URL,
-    reasoning: true,
-    thinkingLevelMap: { xhigh: 'xhigh', minimal: 'low' },
-    input: ['text', 'image'],
-    cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
-    contextWindow: 272_000,
-    maxTokens: 128_000,
-  },
-  {
-    id: 'gpt-5.3-codex-spark',
-    name: 'GPT-5.3 Codex Spark',
-    api: 'openai-codex-responses',
-    provider: 'openai-codex',
-    baseUrl: BASE_URL,
-    reasoning: true,
-    thinkingLevelMap: { xhigh: 'xhigh', minimal: 'low' },
-    input: ['text'],
-    cost: { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
-    contextWindow: 128_000,
-    maxTokens: 128_000,
+    cost: {
+      input: 8,
+      output: 40,
+      cacheRead: 0.4,
+      cacheWrite: 10,
+      tiers: [
+        {
+          inputTokensAbove: 272_000,
+          input: 16,
+          output: 60,
+          cacheRead: 0.8,
+          cacheWrite: 20,
+        },
+      ],
+    },
   },
 ]
+
+/**
+ * The model list this extension registers for `openai-codex`. Pi replaces its
+ * built-in list with an extension's `models`, so this starts from Pi's own
+ * Codex models and only adds what that Pi release does not list yet.
+ */
+export function openAICodexModels(
+  builtin: readonly CodexModel[] = getBuiltinModels(
+    'openai-codex',
+  ) as CodexModel[],
+): CodexModel[] {
+  const models = [...builtin]
+  for (const added of ADDED_CODEX_MODELS) {
+    if (models.some((model) => model.id === added.id)) continue
+    const template = builtin.find((model) => model.id === added.from)
+    if (!template) continue
+    models.push({
+      ...template,
+      id: added.id,
+      name: added.name,
+      contextWindow: added.contextWindow,
+      cost: structuredClone(added.cost),
+    })
+  }
+  return models
+}
 
 /** How often enrollment approved outside the menu is noticed. */
 const PROVIDER_SYNC_INTERVAL_MS = 5_000
@@ -152,7 +185,7 @@ export function registerPiProvider(
     // Pi's built-in Codex provider is OAuth-only. This enables its api_key
     // resolver for the vault slot without replacing Pi's OAuth login method.
     ...(runtime.vaultMode() ? { apiKey: VAULT_PLACEHOLDER_KEY } : {}),
-    models: OPENAI_CODEX_MODELS,
+    models: openAICodexModels(),
     streamSimple: (model: Model<Api>, context, options) =>
       runtime.stream(model, context, options),
   })

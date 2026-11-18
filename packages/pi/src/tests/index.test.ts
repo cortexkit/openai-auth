@@ -224,12 +224,57 @@ describe('Pi OpenAI auth extension', () => {
     // Pi 0.80+ inherits canonical OAuth from its built-in provider when an
     // extension overrides transport/models without supplying its own OAuth.
     expect(registrations[0]?.provider.oauth).toBeUndefined()
-    expect(registrations[0]?.provider.models.map((model) => model.id)).toEqual([
-      'gpt-5.5',
-      'gpt-5.4',
-      'gpt-5.4-mini',
-      'gpt-5.3-codex-spark',
+    // Pi replaces its built-in list with an extension's models, so the
+    // registration must carry Pi's own Codex models plus the ones it lacks.
+    const ids = registrations[0]?.provider.models.map((model) => model.id)
+    expect(ids).toContain('gpt-6.1-sol')
+    expect(ids).toContain('gpt-6-astra')
+    expect(ids).toContain('gpt-6.2-sol')
+    expect(ids).toContain('gpt-6.2-astra')
+  })
+
+  it('adds GPT-6.2 from its predecessors without duplicating a listed model', async () => {
+    const { openAICodexModels } = await import('../index.ts')
+    const base = (id: string, contextWindow: number) =>
+      ({
+        id,
+        name: id,
+        api: 'openai-codex-responses',
+        provider: 'openai-codex',
+        baseUrl: 'https://chatgpt.com/backend-api',
+        reasoning: true,
+        input: ['text', 'image'],
+        cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+        contextWindow,
+        maxTokens: 128_000,
+        thinkingLevelMap: { xhigh: 'xhigh', max: 'max' },
+      }) as never
+    const models = openAICodexModels([
+      base('gpt-6.1-sol', 500_000),
+      base('gpt-6-astra', 272_000),
     ])
+    expect(models.map((model) => model.id)).toEqual([
+      'gpt-6.1-sol',
+      'gpt-6-astra',
+      'gpt-6.2-sol',
+      'gpt-6.2-astra',
+    ])
+    const sol = models.find((model) => model.id === 'gpt-6.2-sol')
+    expect(sol?.contextWindow).toBe(500_000)
+    expect(sol?.thinkingLevelMap).toEqual({ xhigh: 'xhigh', max: 'max' })
+    expect(sol?.cost.input).toBe(2)
+    expect(
+      models.find((model) => model.id === 'gpt-6.2-astra')?.contextWindow,
+    ).toBe(272_000)
+    // A Pi release that already lists 6.2 keeps its own entry.
+    const listed = openAICodexModels([
+      base('gpt-6.1-sol', 500_000),
+      base('gpt-6.2-sol', 600_000),
+    ])
+    expect(listed.filter((model) => model.id === 'gpt-6.2-sol')).toHaveLength(1)
+    expect(
+      listed.find((model) => model.id === 'gpt-6.2-sol')?.contextWindow,
+    ).toBe(600_000)
   })
 
   it('registers exactly the one /openai command', async () => {

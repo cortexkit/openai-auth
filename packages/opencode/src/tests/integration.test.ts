@@ -3347,7 +3347,11 @@ describe('integration: active fallback routing', () => {
     // catalog's own `minimal_client_version`, read 2026-09-25, except
     // gpt-6.1-sol, whose catalog field says 0.153.0 while the catalog only
     // lists it, and a request only completes, from 0.159.0 (measured 2026-09-29).
+    // gpt-6.2-sol and gpt-6.2-astra answer 400 at 0.165.0 and complete at
+    // 0.166.0 (measured 2026-11-18).
     const minimums: Record<string, string> = {
+      'gpt-6.2-sol': '0.166.0',
+      'gpt-6.2-astra': '0.166.0',
       'gpt-6.1-sol': '0.159.0',
       'gpt-6-sol': '0.155.0',
       'gpt-6-luna': '0.155.0',

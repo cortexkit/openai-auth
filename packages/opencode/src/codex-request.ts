@@ -19,20 +19,22 @@ export const RESPONSES_LITE_MODELS: ReadonlySet<string> = new Set([
   'gpt-6-luna',
   'gpt-6.1-sol',
   'gpt-6.1-terra',
+  'gpt-6.2-sol',
+  'gpt-6.2-astra',
 ])
 const CODEX_BETA_FEATURES = 'terminal_resize_reflow'
-// gpt-6.1-sol requires Codex client >= 0.159.0: the backend's model catalog
-// lists it from 0.159.0 and a request answers 400 ("not supported when using
-// Codex with a ChatGPT account") at 0.158.0, measured 2026-09-29. Its catalog
-// `minimal_client_version` says 0.153.0, which is wrong, so the catalog listing
-// and a real request are the evidence, not that field. gpt-6-sol and gpt-6-luna
-// need 0.155.0 and gpt-6-astra 0.153.0. Verified at 0.159.0 that gpt-6.1-sol,
-// the three gpt-6 models, gpt-5.5 and the three 5.6 variants all complete, so
-// one version serves the whole range. gpt-5.4, gpt-5.4-mini and
-// gpt-5.3-codex-spark answer 400 at every version ("not supported when using
-// Codex with a ChatGPT account") - a backend retirement, not something this
-// version causes.
-export const CODEX_VERSION = '0.159.0'
+// gpt-6.2-sol and gpt-6.2-astra require Codex client >= 0.166.0: a request
+// answers 400 ("not supported when using Codex with a ChatGPT account") at
+// 0.165.0 and completes at 0.166.0, measured 2026-11-18. Older models need
+// less: gpt-6.1-sol 0.159.0 (its catalog `minimal_client_version` says
+// 0.153.0, which is wrong, so a real request is the evidence, not that field),
+// gpt-6-sol and gpt-6-luna 0.155.0, gpt-6-astra 0.153.0. Verified at 0.166.0
+// that both 6.2 models, gpt-6.1-sol, gpt-6.1-terra, the three gpt-6 models and
+// the three 5.6 variants all complete, so one version serves the whole range.
+// gpt-5.5, gpt-5.4, gpt-5.4-mini and gpt-5.3-codex-spark answer 400 at every
+// version ("not supported when using Codex with a ChatGPT account") - a
+// backend retirement, not something this version causes.
+export const CODEX_VERSION = '0.166.0'
 export const CODEX_USER_AGENT = `codex_exec/${CODEX_VERSION} (Debian 12.0.0; aarch64) unknown (codex_exec; ${CODEX_VERSION})`
 const CODEX_SANDBOX = 'seccomp'
 export const OPENAI_AGENT_HEADER = 'x-openai-auth-agent'

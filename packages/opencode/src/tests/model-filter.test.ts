@@ -126,6 +126,10 @@ async function surfacedModels() {
       },
       'gpt-6.1': model('gpt-6.1', 'gpt-6.1'),
       'gpt-6.1-fast': model('gpt-6.1-fast', 'gpt-6.1'),
+      'gpt-6.2-sol': model('gpt-6.2-sol', 'gpt-6.2-sol'),
+      'gpt-6.2-astra': model('gpt-6.2-astra', 'gpt-6.2-astra'),
+      'gpt-6.2': model('gpt-6.2', 'gpt-6.2'),
+      'gpt-6.2-fast': model('gpt-6.2-fast', 'gpt-6.2'),
     },
   }
 
@@ -460,6 +464,31 @@ describe('provider.models filter', () => {
       input: 372_000,
       output: 128_000,
     })
+  })
+
+  it('surfaces gpt-6.2-sol with the 500k context Codex uses by default, like gpt-6.1-sol', async () => {
+    const models = await surfacedModels()
+    expect(models['gpt-6.2-sol']?.limit).toEqual({
+      context: 500_000,
+      input: 372_000,
+      output: 128_000,
+    })
+  })
+
+  it('surfaces gpt-6.2-astra with the full reported Codex window, like gpt-6-astra', async () => {
+    const models = await surfacedModels()
+    expect(models['gpt-6.2-astra']?.limit).toEqual({
+      context: 872_000,
+      input: 744_000,
+      output: 128_000,
+    })
+  })
+
+  it('drops the bare gpt-6.2 and its synthetics', async () => {
+    // The backend answers the bare id 400, as for gpt-6 and gpt-6.1.
+    const models = await surfacedModels()
+    expect(models['gpt-6.2']).toBeUndefined()
+    expect(models['gpt-6.2-fast']).toBeUndefined()
   })
 
   it('surfaces gpt-6-sol and gpt-6-luna with the full reported Codex window', async () => {
