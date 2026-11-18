@@ -121,7 +121,14 @@ Hosted mode follows `vaultAuthority` from common-auth. When the environment has 
 
 The ordered modes try the next admitted account on a configured fallback status (default 401, 403 and 429). Sticky-balanced keeps a session on its pin until the account is confirmed unable to serve. It places a new session on the account with the least quota pressure, counting the pending bytes of other sessions just placed (`packages/core/src/pool-session-pins.ts`). Pins live in `sidebar-state.json` for seven days on OpenCode 1. OpenCode 2 keeps them in memory (`v2/pins.ts`) and only projects them to the sidebar file. Pi keeps them in memory for the process.
 
-On OpenCode 1 and 2 in vault mode, when Thalamus's routing accessor (`globalThis[Symbol.for('cortexkit.routing')]`) is present, a primary request asks it which account to use (`packages/core/src/vault-routing.ts`). Pi doesn't ask. openai-auth sends its own same-account wait cap as `hold_wait_max_s`, takes only the account the answer names, and ignores any delay it suggests. Without the accessor, nothing changes and nothing is parsed.
+On OpenCode 2 in vault mode, when Thalamus's routing accessor (`globalThis[Symbol.for('cortexkit.routing')]`) is present, routing decides which vault account serves (`packages/core/src/vault-routing.ts`, `v2/adapter.ts`). OpenCode 1 doesn't ask, because Thalamus never starts an OpenCode 1 host. Pi doesn't ask, because its requests carry no marker of what they are for.
+
+- **Placement:** a session's first request of any kind asks, offering the locally eligible accounts as candidates. A title asks but never records its account; other requests follow the session's account once a primary request has recorded one.
+- **Final pick:** routing's answer is the account used. If the vault won't authorize it, the request stops with the fixed vault-mode refusal instead of falling back to the local order. A routing refusal stops it too.
+- **Short limits:** a 429 that doesn't prove a usage limit, or a 403, is reported as `transient_backoff`. The request then waits and retries on the same account, through a host-retry hold.
+- **Proved 5h/7d limits:** reported as `exhausted`, then asked again with `mode: 'continue'`. Routing answers with another account, a hold on this one within openai-auth's own wait cap, or a refusal. A hold longer than the cap stops the request.
+- **Refused bodies:** a vault-served 403/429 body is read at most 64 KiB within 2 s. Past either bound the host gets a fixed diagnostic text instead of a cut body.
+- **No accessor:** nothing changes and nothing is parsed.
 
 ## Limits and same-account waits
 

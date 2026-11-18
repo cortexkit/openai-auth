@@ -560,7 +560,16 @@ async function installPoolHooks<Q, A extends OpenAIAttemptData>(
         await dumps.response(input.request, input.response.status)
         const response =
           (await adapter.rewriteResponse?.(input)) ?? input.response
-        const bounded = await refusals.get(input.attempt)?.redacted
+        // Bound the read even when classification never asked for the body.
+        const refusal = refusals.get(input.attempt)
+        if (refusal)
+          refusal.redacted ??= redactCredentialResponse(
+            refusal.original.clone(),
+            refusal.credential,
+            'event-stream',
+            { boundRefusal: true },
+          )
+        const bounded = await refusal?.redacted
         refusals.delete(input.attempt)
         if (bounded) void response.body?.cancel().catch(() => {})
         const redacted =
