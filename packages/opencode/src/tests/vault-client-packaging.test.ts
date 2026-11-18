@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -48,6 +49,18 @@ function check(dir: string) {
 }
 
 describe('vault client packaging', () => {
+  test('workspace packages resolve one shared claustrum-client runtime', () => {
+    const clients = ['core', 'opencode', 'pi'].map((host) =>
+      realpathSync(
+        Bun.resolveSync(
+          '@cortexkit/claustrum-client',
+          join(root, 'packages', host),
+        ),
+      ),
+    )
+    expect(new Set(clients).size).toBe(1)
+  })
+
   for (const host of ['opencode', 'pi']) {
     test(`${host} imports vault clients from runtime dependencies`, () => {
       const packageDir = join(root, 'packages', host)
@@ -55,7 +68,7 @@ describe('vault client packaging', () => {
         readFileSync(join(packageDir, 'package.json'), 'utf8'),
       )
       expect(manifest.dependencies['@cortexkit/claustrum-client']).toBe(
-        '^0.18.0',
+        '^0.20.0',
       )
       expect(manifest.dependencies['@cortexkit/subc-client']).toBe('^0.24.0')
       const dist = join(packageDir, 'dist')

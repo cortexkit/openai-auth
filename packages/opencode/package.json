@@ -69,15 +69,15 @@
     "@cortexkit/common-auth": "^0.53.0",
     "@cortexkit/openai-auth-core": "workspace:*",
     "@cortexkit/opencode-sidebar": "0.1.0",
-    "@opencode/plugin": "2.2.6"
+    "@opencode/plugin": "2.3.0"
   },
   "dependencies": {
-    "@cortexkit/claustrum-client": "^0.18.0",
+    "@cortexkit/claustrum-client": "^0.20.0",
     "@cortexkit/private-files": "^0.2.2",
     "@cortexkit/subc-client": "^0.24.0",
-    "@opentui/core": ">=0.8.3",
-    "@opentui/solid": ">=0.8.3",
-    "ai": "^7.0.165",
+    "@opentui/core": ">=0.9.0",
+    "@opentui/solid": ">=0.9.0",
+    "ai": "^7.0.173",
     "jsonc-parser": "^3.3.1",
     "solid-js": "1.9.18"
   }
