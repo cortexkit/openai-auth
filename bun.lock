@@ -47,7 +47,7 @@
         "@ai-sdk/openai": "3.0.88",
         "@cortexkit/common-auth": "^0.53.0",
         "@cortexkit/openai-auth-core": "workspace:*",
-        "@cortexkit/opencode-sidebar": "0.1.0",
+        "@cortexkit/opencode-sidebar": "0.3.0",
         "@opencode/plugin": "2.3.0",
       },
       "peerDependencies": {
@@ -233,7 +233,7 @@
 
     "@cortexkit/opencode-openai-auth": ["@cortexkit/opencode-openai-auth@workspace:packages/opencode"],
 
-    "@cortexkit/opencode-sidebar": ["@cortexkit/opencode-sidebar@0.1.0", "", { "peerDependencies": { "@opentui/core": ">=0.4.5", "@opentui/solid": ">=0.4.5", "solid-js": ">=1.9.12 <2" } }, "sha512-Dqon2Yuz9HBXDwsupm6RhLV9uwTeThQZtfje8Oz+A+lq0ej7dVHoeBS/qHCtBWnvNADTJokiwxiBWqhyQHSEpg=="],
+    "@cortexkit/opencode-sidebar": ["@cortexkit/opencode-sidebar@0.3.0", "", { "peerDependencies": { "@opentui/core": ">=0.4.5", "@opentui/solid": ">=0.4.5", "solid-js": ">=1.9.12 <2" } }, "sha512-jyVL2kKOS2IXEdJYrmKhNpNMyKgf3WRske5sbzPkVhzYJ53vFFV0CAqvect9JTR2pG4gTmKJIOU+WcRC9Qiruw=="],
 
     "@cortexkit/pi-openai-auth": ["@cortexkit/pi-openai-auth@workspace:packages/pi"],
 
