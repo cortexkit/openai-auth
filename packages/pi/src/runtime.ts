@@ -48,8 +48,10 @@ import {
   extractAccountId,
   hasVaultRoutingAccessor,
   isCompleteQuotaHeaderFrame,
+  isRecord,
   limitAccountKey,
   loadAccounts,
+  moveInstructionsToDeveloperMessage,
   normalizeQuotaHeaders,
   normalizeWsFrame,
   type OAuthQuotaSnapshot,
@@ -997,6 +999,20 @@ export class PiOpenAIRuntime {
       inner = this.deps.streamSimple(model, context, {
         ...options,
         apiKey: token,
+        // pi-ai uses the transformed body for HTTP and to compute WebSocket deltas.
+        onPayload: async (payload, payloadModel) => {
+          const replacement = await options?.onPayload?.(payload, payloadModel)
+          const source = replacement === undefined ? payload : replacement
+          if (
+            !isRecord(source) ||
+            typeof source.instructions !== 'string' ||
+            source.instructions.length === 0
+          )
+            return source
+          const body = { ...source }
+          moveInstructionsToDeveloperMessage(body)
+          return body
+        },
         // Scrub before pi-ai parses errors into its shared partial message objects.
         fetch: Object.assign(
           async (input: RequestInfo | URL, init?: RequestInit) => {

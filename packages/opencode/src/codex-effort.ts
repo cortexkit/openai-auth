@@ -1,10 +1,9 @@
 import { createHash } from 'node:crypto'
-import { isRecord } from '@cortexkit/openai-auth-core/internal'
 import {
-  type CodexSessionMetadata,
-  isMessageWithRole,
+  isRecord,
   moveInstructionsToDeveloperMessage,
-} from './codex-request'
+} from '@cortexkit/openai-auth-core/internal'
+import { type CodexSessionMetadata, isMessageWithRole } from './codex-request'
 import { stableStringify } from './util/stable-json'
 
 // Models where a `configuration_update` item is both accepted and shown to change
