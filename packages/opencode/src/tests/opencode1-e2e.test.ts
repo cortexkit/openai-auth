@@ -44,6 +44,7 @@ import {
   POOL_MIGRATION_KEY,
   POOL_PLACEHOLDER,
 } from '../core/pool-migration'
+import { expectedBaseInstructions } from './fixtures/codex-instructions'
 import { hostBinary, runtimeStateDir } from './fixtures/opencode-host'
 import { runLimitAcceptance } from './fixtures/opencode-limit-acceptance'
 import {
@@ -759,11 +760,9 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 1 (real host)', () => {
             )
             expect(bodies).toHaveLength(variants.length)
             expect(bodies[0]).not.toHaveProperty('instructions')
-            expect(bodies[0]?.input[0]).toMatchObject({
-              type: 'message',
-              role: 'developer',
-              content: [{ type: 'input_text', text: expect.any(String) }],
-            })
+            expect(bodies[0]?.input[0]).toEqual(
+              expectedBaseInstructions(expect.any(String)),
+            )
             for (const body of bodies)
               expect(body).not.toHaveProperty('instructions')
             expect(bodies[0]?.reasoning).toMatchObject({ effort: variants[0] })

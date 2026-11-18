@@ -42,6 +42,7 @@ import {
   resolveSessionSidebarRouting,
   type SidebarState,
 } from '../sidebar-state.ts'
+import { expectedBaseInstructions } from './fixtures/codex-instructions'
 import { createRequestTestScope } from './request-test-scope.ts'
 import { restoreEnv } from './setup-env'
 import {
@@ -7587,11 +7588,9 @@ describe('integration: active fallback routing', () => {
           (tool) => tool.type === 'web_search',
         ) ?? false,
       ).toBe(false)
-      expect(input[1]).toEqual({
-        type: 'message',
-        role: 'developer',
-        content: [{ type: 'input_text', text: 'Be concise' }],
-      })
+      expect(input[1]).toEqual(
+        expectedBaseInstructions('Be concise', { lite: true }),
+      )
       const sourceInput = input.slice(2)
       expect(sourceInput.map((item) => item.type)).toEqual([
         'message',
@@ -7621,11 +7620,7 @@ describe('integration: active fallback routing', () => {
     const body = JSON.parse(String(captured.body)) as Record<string, unknown>
     const [system, ...input] = body.input as Array<Record<string, unknown>>
     expect(body).not.toHaveProperty('instructions')
-    expect(system).toEqual({
-      type: 'message',
-      role: 'developer',
-      content: [{ type: 'input_text', text: 'Be concise' }],
-    })
+    expect(system).toEqual(expectedBaseInstructions('Be concise'))
     expect([
       (input[0]?.content as Array<Record<string, unknown>> | undefined)?.[1]
         ?.detail,
@@ -7651,11 +7646,6 @@ describe('integration: active fallback routing', () => {
       call_id: 'call_1',
       output: 'ok',
     }
-    const developer = (text: string) => ({
-      type: 'message',
-      role: 'developer',
-      content: [{ type: 'input_text', text }],
-    })
     await withFakeWebSocket(
       ({ message }) => ({
         send(data) {
@@ -7713,17 +7703,21 @@ describe('integration: active fallback routing', () => {
       {
         generate: undefined,
         previous_response_id: 'resp_1',
-        input: [developer('First prompt'), user],
+        input: [expectedBaseInstructions('First prompt'), user],
       },
       { generate: undefined, previous_response_id: 'resp_2', input: [delta] },
       { generate: false, previous_response_id: undefined, input: [] },
       {
         generate: undefined,
         previous_response_id: 'resp_4',
-        input: [developer('Changed prompt'), user, delta],
+        input: [expectedBaseInstructions('Changed prompt'), user, delta],
       },
     ])
     for (const frame of sent) expect(frame).not.toHaveProperty('instructions')
+    const [first] = sent[1]!.input as Array<Record<string, unknown>>
+    const [changed] = sent[4]!.input as Array<Record<string, unknown>>
+    expect(sent[4]!.prompt_cache_key).toBe(sent[1]!.prompt_cache_key)
+    expect(changed?.id).not.toBe(first?.id)
   })
 
   it('marks Responses Lite in WS metadata and still prewarms', async () => {
@@ -7772,6 +7766,9 @@ describe('integration: active fallback routing', () => {
     expect(sent).toHaveLength(2)
     expect(sent[0]?.generate).toBe(false)
     const main = sent[1]!
+    expect((main.input as unknown[])[1]).toEqual(
+      expectedBaseInstructions('Be concise', { lite: true }),
+    )
     expect(
       (main.client_metadata as Record<string, unknown>)
         .ws_request_header_x_openai_internal_codex_responses_lite,
@@ -7870,11 +7867,9 @@ describe('integration: active fallback routing', () => {
       const body = JSON.parse(String(warm.body)) as Record<string, unknown>
       expect(body).not.toHaveProperty('instructions')
       expect(body.input).toEqual(warmedInput)
-      expect((body.input as unknown[])[lite ? 1 : 0]).toEqual({
-        type: 'message',
-        role: 'developer',
-        content: [{ type: 'input_text', text: 'Be concise' }],
-      })
+      expect((body.input as unknown[])[lite ? 1 : 0]).toEqual(
+        expectedBaseInstructions('Be concise', { lite }),
+      )
       const metadata = body.client_metadata as Record<string, unknown>
       expect('x-codex-turn-metadata' in metadata).toBe(false)
       expect('x-codex-ws-stream-request-start-ms' in metadata).toBe(false)

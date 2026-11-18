@@ -31,6 +31,7 @@ import { acquireFrameMirror, FrameMirror } from '../v2/frame-mirror'
 import { SessionPins } from '../v2/pins'
 import { acquireSessionAccounts } from '../v2/session-accounts'
 import { setupOpenAIAuth } from '../v2/setup'
+import { expectedBaseInstructions } from './fixtures/codex-instructions'
 import {
   fakeOpenCode2Host,
   poolFiles,
@@ -1595,11 +1596,7 @@ describe('OpenCode 2 keep-warm in setup', () => {
     expect(warm!.body).not.toHaveProperty('instructions')
     expect(warm!.body.input).toEqual(sent.input)
     expect(warm!.body.input).toEqual([
-      {
-        type: 'message',
-        role: 'developer',
-        content: [{ type: 'input_text', text: 'help' }],
-      },
+      expectedBaseInstructions('help'),
       { role: 'user', content: 'hi' },
     ])
     expect(warm!.body).not.toHaveProperty('max_output_tokens')

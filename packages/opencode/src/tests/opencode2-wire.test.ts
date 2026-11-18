@@ -21,6 +21,7 @@ import {
 } from '../v2/codex-wire'
 import { opencode1HostSlot } from '../v2/host-slot'
 import { setupOpenAIAuth } from '../v2/setup'
+import { expectedBaseInstructions } from './fixtures/codex-instructions'
 import {
   fakeOpenCode2Host,
   poolFiles,
@@ -32,6 +33,7 @@ import {
 const PLACEHOLDER = placeholderSecret('openai')
 const SESSION = { sessionID: 'ses_1', kind: 'primary' }
 const THREAD = '00000000-0000-7000-8000-000000000001'
+const BRIEF_ID = 'msg_ae9f4650-7e56-5c38-aec4-c458158d31ac'
 
 function testEffort() {
   const state = new CodexHttpState()
@@ -46,11 +48,6 @@ function testEffort() {
 const user = (text: string) => ({
   type: 'message',
   role: 'user',
-  content: [{ type: 'input_text', text }],
-})
-const developer = (text: string) => ({
-  type: 'message',
-  role: 'developer',
   content: [{ type: 'input_text', text }],
 })
 const assistant = (text: string) => ({
@@ -268,7 +265,13 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
     )
     const body = await sent?.json()
     expect(body).not.toHaveProperty('instructions')
-    expect(body.input).toEqual([tools, developer(instructions), user('one')])
+    expect(body.input).toEqual([
+      tools,
+      expectedBaseInstructions(instructions, {
+        id: 'msg_866c57e8-f59a-5b93-83f8-c778d4181e63',
+      }),
+      user('one'),
+    ])
   })
 
   it('keeps the OpenCode 2.3.2 HTTP input unchanged when it already carries the system prompt', async () => {
@@ -299,7 +302,10 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
     )
     const body = await sent?.json()
     expect(body).not.toHaveProperty('instructions')
-    expect(body.input).toEqual([developer('be brief'), user('one')])
+    expect(body.input).toEqual([
+      expectedBaseInstructions('be brief', { id: BRIEF_ID }),
+      user('one'),
+    ])
   })
 
   it('carries the update on every request after a change, before the turn user message', async () => {
@@ -310,7 +316,10 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
       effort,
       false,
     )
-    expect((await first!.json()).reasoning.effort).toBe('low')
+    const firstBody = await first!.json()
+    expect(firstBody.reasoning.effort).toBe('low')
+    const base = expectedBaseInstructions('be brief', { id: BRIEF_ID })
+    expect(firstBody.input).toEqual([base, user('one')])
     const turn = await rewriteCodexHttpRequest(
       httpBody('high', [user('one'), assistant('a'), user('two')]),
       SESSION,
@@ -333,7 +342,7 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
     const stepBody = await step?.json()
     expect(turnBody.reasoning).toEqual({ effort: 'low', summary: 'auto' })
     expect(turnBody.input).toEqual([
-      developer('be brief'),
+      base,
       user('one'),
       assistant('a'),
       update('high'),
@@ -341,7 +350,7 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
     ])
     expect(stepBody.reasoning).toEqual({ effort: 'low', summary: 'auto' })
     expect(stepBody.input).toEqual([
-      developer('be brief'),
+      base,
       user('one'),
       assistant('a'),
       update('high'),
@@ -380,15 +389,20 @@ describe('mid-conversation effort and Responses Lite on HTTP', () => {
       expect(body.instructions).toBe(undefined)
       expect(body.parallel_tool_calls).toBe(false)
       expect(body.reasoning.context).toBe('all_turns')
+      const base = expectedBaseInstructions('be brief', {
+        id: BRIEF_ID,
+        lite: true,
+      })
       expect(body.input).toEqual([
         {
           type: 'additional_tools',
           role: 'developer',
           tools: [{ type: 'function', name: 'x', strict: false }],
         },
-        developer('be brief'),
+        base,
         user('one'),
       ])
+      expect(JSON.stringify(body.input[1])).toBe(JSON.stringify(base))
       // A model not marked Lite keeps the standard shape.
       const nonLite = await rewriteCodexHttpRequest(
         httpBody('low', [user('one')], { model: 'gpt-5.5' }),

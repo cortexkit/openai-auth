@@ -163,7 +163,7 @@ export function rewriteResponsesLiteBody(parsed: Record<string, unknown>) {
     { type: 'additional_tools', role: 'developer', tools },
     ...input,
   ]
-  moveInstructionsToDeveloperMessage(parsed)
+  moveInstructionsToDeveloperMessage(parsed, { responsesLite: true })
   delete parsed.tools
   delete parsed.instructions
 }

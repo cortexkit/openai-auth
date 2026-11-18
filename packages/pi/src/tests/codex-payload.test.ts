@@ -27,6 +27,8 @@ const model: Model<'openai-codex-responses'> = {
 }
 const apiKey = chatgptAccessToken('payload-test-account')
 const systemPrompt = '  Answer tersely.\nPreserve punctuation: café.\n'
+const sessionId = 'pi-codex-payload-session'
+const systemId = 'msg_9e4fd0b8-1a27-5801-9e64-f9a84d591bcc'
 const firstUser = {
   role: 'user',
   content: 'Name a colour.',
@@ -34,11 +36,15 @@ const firstUser = {
 } as const
 const context: Context = { systemPrompt, messages: [firstUser] }
 
-function developerMessage(text: string) {
+function developerMessage(text: string, id?: string) {
   return {
     type: 'message',
+    ...(id && { id }),
     role: 'developer',
     content: [{ type: 'input_text', text }],
+    internal_chat_message_metadata_passthrough: {
+      content_item_kinds: ['model.base_instructions'],
+    },
   }
 }
 
@@ -111,13 +117,15 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-async function httpBody(onPayload?: SimpleStreamOptions['onPayload']) {
+async function httpBody(
+  options?: Pick<SimpleStreamOptions, 'onPayload' | 'sessionId'>,
+) {
   const bodies: Record<string, unknown>[] = []
   const result = await runtime
     .stream(model, context, {
       apiKey,
       transport: 'sse',
-      onPayload,
+      ...options,
       fetch: mockFetch(async (_input, init) => {
         const payload = new Response(init?.body)
         const encoded = new Headers(init?.headers).get('content-encoding')
@@ -148,7 +156,21 @@ async function httpBody(onPayload?: SimpleStreamOptions['onPayload']) {
 }
 
 test('Codex HTTP sends system instructions as the leading developer message', async () => {
+  const body = await httpBody({ sessionId })
+  expect(body.prompt_cache_key).toBe(sessionId)
+  expect(body).not.toHaveProperty('instructions')
+  expect(body.input).toEqual([
+    developerMessage(systemPrompt, systemId),
+    {
+      role: 'user',
+      content: [{ type: 'input_text', text: firstUser.content }],
+    },
+  ])
+})
+
+test('Codex HTTP omits the base instructions id without a Pi session id', async () => {
   const body = await httpBody()
+  expect(body).not.toHaveProperty('prompt_cache_key')
   expect(body).not.toHaveProperty('instructions')
   expect(body.input).toEqual([
     developerMessage(systemPrompt),
@@ -165,23 +187,29 @@ test('Codex transforms an awaited onPayload replacement after leading additional
     role: 'developer',
     tools: [],
   }
-  const body = await httpBody(async (raw, receivedModel) => {
-    await Promise.resolve()
-    expect(receivedModel.id).toBe(model.id)
-    const original = raw as { instructions: string; input: unknown[] }
-    expect(original.instructions).toBe(systemPrompt)
-    return {
-      ...original,
-      instructions: 'Replacement prompt.',
-      input: [additionalTools, ...original.input],
-      metadata: { caller: 'replacement' },
-    }
+  const body = await httpBody({
+    sessionId,
+    async onPayload(raw, receivedModel) {
+      await Promise.resolve()
+      expect(receivedModel.id).toBe(model.id)
+      const original = raw as { instructions: string; input: unknown[] }
+      expect(original.instructions).toBe(systemPrompt)
+      return {
+        ...original,
+        instructions: 'Replacement prompt.',
+        input: [additionalTools, ...original.input],
+        metadata: { caller: 'replacement' },
+      }
+    },
   })
   expect(body).not.toHaveProperty('instructions')
   expect(body.metadata).toEqual({ caller: 'replacement' })
   expect(body.input).toEqual([
     additionalTools,
-    developerMessage('Replacement prompt.'),
+    developerMessage(
+      'Replacement prompt.',
+      'msg_863029c1-4b0c-5d97-a1b6-4156e117721d',
+    ),
     {
       role: 'user',
       content: [{ type: 'input_text', text: firstUser.content }],
@@ -191,17 +219,23 @@ test('Codex transforms an awaited onPayload replacement after leading additional
 
 test('Codex transforms in-place onPayload edits without mutating the SDK body', async () => {
   let sdkBody: Record<string, unknown> | undefined
-  const body = await httpBody(async (raw) => {
-    await Promise.resolve()
-    sdkBody = raw as Record<string, unknown>
-    expect(sdkBody.instructions).toBe(systemPrompt)
-    sdkBody.instructions = 'Edited prompt.'
-    sdkBody.metadata = { caller: 'in-place' }
+  const body = await httpBody({
+    sessionId,
+    async onPayload(raw) {
+      await Promise.resolve()
+      sdkBody = raw as Record<string, unknown>
+      expect(sdkBody.instructions).toBe(systemPrompt)
+      sdkBody.instructions = 'Edited prompt.'
+      sdkBody.metadata = { caller: 'in-place' }
+    },
   })
   expect(body).not.toHaveProperty('instructions')
   expect(body.metadata).toEqual({ caller: 'in-place' })
   expect(body.input).toEqual([
-    developerMessage('Edited prompt.'),
+    developerMessage(
+      'Edited prompt.',
+      'msg_b2c7bd31-aeb8-5ffc-93d2-37be42031b32',
+    ),
     {
       role: 'user',
       content: [{ type: 'input_text', text: firstUser.content }],
@@ -237,7 +271,7 @@ test('Codex cached WebSocket sends the developer message once and only new input
     const options: SimpleStreamOptions = {
       apiKey,
       transport: 'websocket-cached',
-      sessionId: crypto.randomUUID(),
+      sessionId,
       fetch: mockFetch(async () => {
         throw new Error('Expected to send over the WebSocket')
       }),
@@ -267,16 +301,18 @@ test('Codex cached WebSocket sends the developer message once and only new input
     expect(frames).toHaveLength(2)
     const [full, delta] = frames
     expect(full?.type).toBe('response.create')
+    expect(full?.prompt_cache_key).toBe(sessionId)
     expect(full).not.toHaveProperty('instructions')
     expect(full).not.toHaveProperty('previous_response_id')
     expect(full?.input).toEqual([
-      developerMessage(systemPrompt),
+      developerMessage(systemPrompt, systemId),
       {
         role: 'user',
         content: [{ type: 'input_text', text: firstUser.content }],
       },
     ])
     expect(delta?.type).toBe('response.create')
+    expect(delta?.prompt_cache_key).toBe(sessionId)
     expect(delta).not.toHaveProperty('instructions')
     expect(delta?.previous_response_id).toBe('resp_1')
     expect(delta?.input).toEqual([

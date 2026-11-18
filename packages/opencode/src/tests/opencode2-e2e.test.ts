@@ -34,6 +34,7 @@ import {
 import { POOL_PLACEHOLDER } from '../core/pool-migration'
 import { CODEX_USER_AGENT, CODEX_VERSION } from '../index'
 import { POOL_BROWSER_METHOD } from '../v2/login'
+import { expectedBaseInstructions } from './fixtures/codex-instructions'
 import { hostBinary, runtimeStateDir } from './fixtures/opencode-host'
 import {
   POLICY_NOW,
@@ -1776,6 +1777,9 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
         expect(messages).toHaveLength(1)
         const start = body.input[0]?.type === 'additional_tools' ? 1 : 0
         expect(body.input[start]).toBe(messages[0])
+        expect(messages[0]).toEqual(
+          expectedBaseInstructions(expect.any(String)),
+        )
       }
     })
   }, 180_000)
