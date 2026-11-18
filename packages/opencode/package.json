@@ -66,9 +66,9 @@
   },
   "devDependencies": {
     "@ai-sdk/openai": "3.0.88",
-    "@cortexkit/common-auth": "^0.53.0",
+    "@cortexkit/common-auth": "^0.54.0",
     "@cortexkit/openai-auth-core": "workspace:*",
-    "@cortexkit/opencode-sidebar": "0.1.0",
+    "@cortexkit/opencode-sidebar": "0.3.0",
     "@opencode/plugin": "2.3.0"
   },
   "dependencies": {
