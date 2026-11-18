@@ -26,11 +26,9 @@
 // vault account can serve, the request is refused locally; it never falls
 // back to a local row.
 
-import { createHash } from 'node:crypto'
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import {
   type AccountKey,
-  buildRefusal,
   createRequestHistory,
   type LimitCandidate,
   type LimitDecision,
@@ -55,39 +53,29 @@ import type { PoolRow } from '@cortexkit/common-auth/store'
 import {
   type AccountStorage,
   buildOpenAiQuotaRefusal,
-  chooseVaultRouting,
   classifyOpenAiLimitBody,
   decideOpenAiLimit,
   decideOpenAiTerminal,
   getFallbackStatuses,
   getKillswitchThresholdsForAccount,
-  hasVaultRoutingAccessor,
   isKillswitchEnabled,
-  isRecord,
   isShieldedMainRow,
   isTombstoned,
   killswitchPassesPolicy,
   normalizeQuotaHeaders,
   type OAuthQuotaSnapshot,
   type OpenAiLimitsOwner,
-  observeVaultRoutingResponse,
   openAiConfirmedBlockers,
   openAiHoldFacts,
-  openAiLimitMessages,
   openAiTerminalFacts,
-  providerRefusalReceivedAt,
   quotaSnapshotPassesPolicy,
   type RoutingMode,
   VAULT_MODE_REFUSAL_CAUSES,
   VAULT_MODE_REFUSALS,
-  VAULT_ROUTING_REFUSAL_MESSAGE,
   type VaultModeRefusal,
-  type VaultRoutingFeedback,
-  type VaultRoutingRequest,
 } from '@cortexkit/openai-auth-core/internal'
 import { getSettingsDecision } from '@cortexkit/openai-auth-core/settings-decisions'
 import { getConfigPath, getResolvedSettingsView } from '../config'
-import { parseRateLimitSignal } from '../ws'
 import type { PoolAccountSource } from './pool-account-source'
 import { windowsFromQuotaMap } from './pool-quota'
 import {
@@ -220,7 +208,6 @@ export function isVaultModeRefusal(
 }
 
 export interface PoolRequestContext {
-  vaultRetries?: Map<string, PendingVaultRetry>
   source: PoolAccountSource
   /** The host's shared registry mark projection. */
   rateLimitMarks: () => Map<string, number>
@@ -237,9 +224,6 @@ export interface PoolRequestContext {
   sessionId: string | undefined
   /** Separates endpoint and conversation/auxiliary retries within a session. */
   requestKind?: string
-  routingRequest?: VaultRoutingRequest
-  /** The session's existing sticky pin, not a newly previewed placement. */
-  warmAccountId?: string
   /** The buffered request body, when there is one. */
   body: string | undefined
   replayable: boolean
@@ -292,14 +276,6 @@ export interface PendingPoolHold {
   checkpoint: WaitCheckpoint
   decidedAt: number
   decision: Extract<LimitDecision, { action: 'hold' }>
-}
-
-export interface PendingVaultRetry {
-  sessionId: string
-  accountId: string
-  credentialId: string
-  accountIdentity?: string
-  retryAtMs: number
 }
 
 export interface PoolLimitPolicy {
@@ -611,11 +587,7 @@ async function consumeHold(
     return undefined
   const row = rows.find((value) => value.id === candidate.account.accountId)
   const response = row && (await sendTo(ctx, row))
-  if (!response || !row) return undefined
-  const result = { response, servedId: row.id }
-  return routingRefusals.has(response)
-    ? finishVaultAttempt(ctx, result)
-    : result
+  return response && row ? { response, servedId: row.id } : undefined
 }
 
 function terminalResponse(
@@ -836,7 +808,6 @@ function blockQuotas(targets: readonly PoolTarget[]): PoolBlockQuotas {
 async function sendTo(
   ctx: PoolRequestContext,
   target: PoolTarget,
-  retry?: PendingVaultRetry,
 ): Promise<Response | undefined> {
   if (target.row) {
     const token = ctx.source.usableToken(target.row)
@@ -845,281 +816,18 @@ async function sendTo(
     ctx.recordQuota(response, target, token)
     return response
   }
-  let mismatched = false
-  const response = await ctx.vault?.send(target.id, async (token, attempt) => {
-    if (
-      retry &&
-      (attempt.credentialId !== retry.credentialId ||
-        attempt.accountIdentity !== retry.accountIdentity)
-    ) {
-      mismatched = true
-      return new Response(null, { status: 412 })
-    }
+  return ctx.vault?.send(target.id, async (token, attempt) => {
     const response = await ctx.send(target, token, attempt)
-    const receivedAt = hasVaultRoutingAccessor()
-      ? (providerRefusalReceivedAt(response) ?? ctx.now())
-      : undefined
     ctx.recordQuota(response, target, token, attempt)
-    if (localResponses.has(response)) return response
-    return observeVaultRoutingResponse(ctx.sessionId, attempt, response, {
-      parseLimit: (body) =>
-        parseRateLimitSignal(
-          { ...(isRecord(body) ? body : {}), status: response.status },
-          receivedAt,
-        ),
-      quota: target.quota,
-      now: () => receivedAt ?? ctx.now(),
-      failed: providerFailures.get(response),
-      onRefusal: (classified) => routingRefusals.set(response, classified),
-    })
+    return response
   })
-  return mismatched ? undefined : response
-}
-
-const localResponses = new WeakSet<Response>()
-const providerFailures = new WeakMap<Response, () => boolean>()
-
-/** Tag a refusal produced before either provider transport was called. */
-export function localPoolResponse(response: Response): Response {
-  localResponses.add(response)
-  return response
-}
-
-export function trackPoolResponseFailure(
-  response: Response,
-  failed: () => boolean,
-): Response {
-  providerFailures.set(response, failed)
-  return response
-}
-
-const routingRefusals = new WeakMap<
-  Response,
-  Promise<VaultRoutingFeedback | undefined>
->()
-
-function vaultWait(
-  ctx: PoolRequestContext,
-  retry: PendingVaultRetry,
-): PoolRequestResult {
-  const now = ctx.now()
-  const wire = buildRefusal({
-    family: 'openai-429',
-    messages: openAiLimitMessages,
-    messageKey: 'hold',
-    now,
-    // OpenCode 1 reissues the request via its own retry loop, with a one-second minimum.
-    retryAfterMs: Math.max(1000, retry.retryAtMs - now),
-  })
-  if (wire.kind !== 'http')
-    throw new Error('Expected an OC1 HTTP quota refusal')
-  return {
-    response: new Response(wire.body, {
-      status: wire.status,
-      headers: wire.headers,
-    }),
-    servedId: retry.accountId,
-  }
-}
-
-function vaultRetryKey(ctx: PoolRequestContext): string | undefined {
-  const key = pendingKey(ctx)
-  return (
-    key &&
-    JSON.stringify([
-      key,
-      ctx.routingRequest?.kind,
-      ctx.routingRequest?.modelId ?? requestModel(ctx),
-      createHash('sha256')
-        .update(ctx.body ?? '')
-        .digest('hex'),
-    ])
-  )
-}
-
-const VAULT_RETRY_EXPIRY_MS = 60_000
-
-function holdVaultAccount(
-  ctx: PoolRequestContext,
-  last: PoolRequestResult,
-  retryAtMs: number,
-  credentialId: string,
-  accountIdentity: string | undefined,
-): PoolRequestResult {
-  const key = vaultRetryKey(ctx)
-  const retry = {
-    sessionId: ctx.sessionId ?? '',
-    accountId: last.servedId,
-    credentialId,
-    accountIdentity,
-    retryAtMs,
-  }
-  if (key && ctx.vaultRetries) {
-    const now = ctx.now()
-    for (const [id, entry] of ctx.vaultRetries)
-      if (now >= entry.retryAtMs + VAULT_RETRY_EXPIRY_MS)
-        ctx.vaultRetries.delete(id)
-    ctx.vaultRetries.delete(key)
-    ctx.vaultRetries.set(key, retry)
-    if (ctx.vaultRetries.size > 256) {
-      const oldest = ctx.vaultRetries.keys().next().value
-      if (oldest !== undefined) ctx.vaultRetries.delete(oldest)
-    }
-  }
-  last.response.body?.cancel().catch(() => {})
-  return vaultWait(ctx, retry)
-}
-
-async function consumeVaultRetry(
-  ctx: PoolRequestContext,
-  rows: readonly PoolTarget[],
-): Promise<PoolRequestResult | undefined> {
-  if (
-    !ctx.vault ||
-    !ctx.replayable ||
-    !hasVaultRoutingAccessor() ||
-    !ctx.vaultRetries?.size
-  )
-    return undefined
-  const key = vaultRetryKey(ctx)
-  const retry = key && ctx.vaultRetries?.get(key)
-  if (!retry) return undefined
-  if (ctx.now() >= retry.retryAtMs + VAULT_RETRY_EXPIRY_MS) {
-    ctx.vaultRetries?.delete(key)
-    return undefined
-  }
-  if (ctx.now() < retry.retryAtMs) return vaultWait(ctx, retry)
-  ctx.vaultRetries?.delete(key)
-  const row = rows.find((target) => target.id === retry.accountId)
-  const route = ctx.vault
-    .routes()
-    .find((target) => target.id === retry.accountId)
-  if (
-    row &&
-    route &&
-    route.credentialId === retry.credentialId &&
-    routingInput(ctx, rows).killswitch.get(row.id) !== false
-  ) {
-    const response = await sendTo(ctx, row, retry)
-    if (response)
-      return finishVaultAttempt(ctx, {
-        response,
-        servedId: row.id,
-      })
-  }
-  return refusedVaultPick(ctx, rows, retry.accountId)
-}
-
-function refusedVaultPick(
-  ctx: PoolRequestContext,
-  rows: readonly PoolTarget[],
-  id: string,
-): PoolRequestResult {
-  return {
-    response: ctx.blocked(
-      { reason: 'no-credential' },
-      blockQuotas(rows),
-      'vault-refused',
-    ),
-    servedId: id,
-  }
-}
-
-async function routeVaultRefusal(
-  ctx: PoolRequestContext,
-  last: PoolRequestResult,
-  excluded: ReadonlySet<string>,
-): Promise<string | PoolRequestResult | undefined> {
-  if (
-    !ctx.vault ||
-    !ctx.replayable ||
-    !ctx.sessionId ||
-    ![403, 429].includes(last.response.status) ||
-    !hasVaultRoutingAccessor()
-  )
-    return undefined
-  const feedback = await routingRefusals.get(last.response)
-  if (!feedback) return undefined
-  if (feedback.kind === 'backoff')
-    return holdVaultAccount(
-      ctx,
-      last,
-      feedback.retryAtMs,
-      feedback.credentialId,
-      feedback.accountIdentity,
-    )
-  const live = currentTargets(ctx)
-  const answer = await chooseVaultRouting({
-    vaultMode: true,
-    fresh: false,
-    continuation: { previousId: last.servedId, exhausted: feedback.exhausted },
-    sessionId: ctx.sessionId,
-    request: ctx.routingRequest,
-    routes: ctx.vault.routes(),
-    routing: routingInput(ctx, live),
-    eligibleIds: live
-      .filter((row) => !excluded.has(row.id))
-      .map((row) => row.id),
-    wait: {
-      activity: ctx.limitPolicy?.activity(),
-      accountKey: ctx.limitPolicy?.currentAccountKey(),
-      maxSameAccountWait: ctx.storage?.routing?.maxSameAccountWait,
-    },
-  })
-  if (answer && typeof answer !== 'string' && 'refused' in answer) {
-    last.response.body?.cancel().catch(() => {})
-    throw new Error(VAULT_ROUTING_REFUSAL_MESSAGE)
-  }
-  return typeof answer === 'object'
-    ? holdVaultAccount(
-        ctx,
-        last,
-        ctx.now() + answer.holdMs,
-        feedback.exhausted.credentialId,
-        feedback.exhausted.accountId,
-      )
-    : answer
-}
-
-async function finishVaultAttempt(
-  ctx: PoolRequestContext,
-  result: PoolRequestResult,
-  tried = new Set<string>(),
-): Promise<PoolRequestResult> {
-  while (routingRefusals.has(result.response)) {
-    tried.add(result.servedId)
-    const choice = await routeVaultRefusal(ctx, result, tried)
-    if (typeof choice !== 'string') {
-      if (
-        !choice &&
-        ctx.mode !== 'sticky-balanced' &&
-        ctx.replayable &&
-        hasVaultRoutingAccessor() &&
-        getFallbackStatuses(ctx.storage).includes(result.response.status) &&
-        (await routingRefusals.get(result.response))?.kind === 'exhausted'
-      )
-        return serveOrdered(
-          ctx,
-          currentTargets(ctx).filter((row) => !tried.has(row.id)),
-          false,
-          { result, tried },
-        )
-      return choice ?? result
-    }
-    const rows = currentTargets(ctx)
-    const target = rows.find((row) => row.id === choice)
-    const next = target && (await sendTo(ctx, target))
-    result.response.body?.cancel().catch(() => {})
-    if (!next) return refusedVaultPick(ctx, rows, choice)
-    result = { response: next, servedId: choice }
-  }
-  return result
 }
 
 /** Reads the current rows, readies their tokens, and routes one request. */
 export async function servePoolRequest(
   ctx: PoolRequestContext,
 ): Promise<PoolRequestResult> {
+  // Thalamus never starts OpenCode 1 hosts, so account selection is local.
   const configPath = ctx.configPath ?? getConfigPath()
   const settings = getResolvedSettingsView(ctx.storage, configPath)
   ctx = {
@@ -1139,8 +847,6 @@ export async function servePoolRequest(
     await ctx.source.prepareTokens(ctx.source.peek().rows, ctx.storage)
   }
   let rows = currentTargets(ctx)
-  const vaultRetry = await consumeVaultRetry(ctx, rows)
-  if (vaultRetry) return vaultRetry
   const firstReadingRows =
     ctx.replayable === false && rows.some((row) => row.id === FORMER_MAIN_ID)
       ? rows.filter((row) => row.id === FORMER_MAIN_ID)
@@ -1164,12 +870,9 @@ export async function servePoolRequest(
     ctx.replayable &&
     ctx.body !== undefined
   ) {
-    let checkedPlacement = false
-    const sticky = await serveSticky(ctx, rows, ctx.sessionId, ctx.body, () => {
-      checkedPlacement = true
-    })
+    const sticky = await serveSticky(ctx, rows, ctx.sessionId, ctx.body)
     if (sticky) return sticky
-    return serveOrdered(ctx, rows, !checkedPlacement)
+    return serveOrdered(ctx, rows)
   }
   return serveOrdered(ctx, rows)
 }
@@ -1177,8 +880,6 @@ export async function servePoolRequest(
 async function serveOrdered(
   ctx: PoolRequestContext,
   rows: readonly PoolTarget[],
-  firstPlacement = true,
-  previous?: { result: PoolRequestResult; tried: ReadonlySet<string> },
 ): Promise<PoolRequestResult> {
   const placement = orderedPlacement(ctx.mode)
   const routing = routingInput(ctx, rows)
@@ -1193,7 +894,6 @@ async function serveOrdered(
     replayable: ctx.replayable,
   })
   if (plan.kind === 'block') {
-    if (previous) return previous.result
     ctx.log.debug('pool admission blocked the request', {
       pid: process.pid,
       reason: plan.block.reason,
@@ -1226,59 +926,23 @@ async function serveOrdered(
   }
 
   const byId = new Map(rows.map((row) => [row.id, row]))
-  const active = ctx.limitPolicy?.currentAccountKey()?.accountId
-  const existingId = ctx.warmAccountId ?? active
-  const preferred = await chooseVaultRouting({
-    vaultMode: ctx.vault !== undefined,
-    fresh: firstPlacement && existingId === undefined,
-    sessionId: ctx.sessionId,
-    request: ctx.routingRequest,
-    routes: ctx.vault?.routes() ?? [],
-    routing,
-    eligibleIds: plan.order,
-    warmAccountId: ctx.mode === 'sticky-balanced' ? ctx.warmAccountId : active,
-  })
-  if (preferred && typeof preferred !== 'string')
-    throw new Error(VAULT_ROUTING_REFUSAL_MESSAGE)
-  const first =
-    preferred ??
-    (ctx.vault &&
-    hasVaultRoutingAccessor() &&
-    existingId &&
-    plan.order.includes(existingId)
-      ? existingId
-      : undefined)
-  const order = first
-    ? [first, ...plan.order.filter((id) => id !== first)]
-    : plan.order
+  const order = plan.order
   const retryStatuses = getFallbackStatuses(ctx.storage)
-  const attempts: OrderedAttempt[] = previous
-    ? [...previous.tried].map((id) => ({
-        id,
-        status: previous.result.response.status,
-      }))
-    : []
+  const attempts: OrderedAttempt[] = []
   // Accounts that had nothing to send with (a vault account the vault would
   // not serve, a row without a usable token). Nothing reached the provider,
   // so the next account in the order is tried as if this one were not there.
   const unsent = new Set<string>()
-  let last = previous?.result
+  let last: PoolRequestResult | undefined
   let vaultRefused = false
-  let advised = preferred
   for (;;) {
-    const available = order.filter((candidate) => !unsent.has(candidate))
-    const explicit = advised !== undefined
-    const id = advised ?? nextOrderedAttempt(available, attempts, retryStatuses)
-    advised = undefined
-    const row = explicit
-      ? currentTargets(ctx).find((row) => row.id === id)
-      : id === undefined
-        ? undefined
-        : byId.get(id)
-    if (!row) {
-      if (explicit && id !== undefined) return refusedVaultPick(ctx, rows, id)
-      break
-    }
+    const id = nextOrderedAttempt(
+      order.filter((candidate) => !unsent.has(candidate)),
+      attempts,
+      retryStatuses,
+    )
+    const row = id === undefined ? undefined : byId.get(id)
+    if (!row) break
     const attempted = ctx.limitPolicy?.accountKey(row.id)
     let response: Response | undefined
     try {
@@ -1297,10 +961,6 @@ async function serveOrdered(
       return last
     }
     if (!response) {
-      if (explicit) {
-        last?.response.body?.cancel().catch(() => {})
-        return refusedVaultPick(ctx, rows, row.id)
-      }
       if (!row.row) vaultRefused = true
       unsent.add(row.id)
       continue
@@ -1315,16 +975,6 @@ async function serveOrdered(
       attempts,
       retryStatuses,
     )
-    const choice = await routeVaultRefusal(
-      ctx,
-      last,
-      new Set([...unsent, ...attempts.map((attempt) => attempt.id)]),
-    )
-    if (typeof choice === 'object') return choice
-    if (choice) {
-      advised = choice
-      continue
-    }
     const outcome = await afterLimit(
       ctx,
       row,
@@ -1354,11 +1004,8 @@ async function serveSticky(
   rows: readonly PoolTarget[],
   sessionId: string,
   body: string,
-  checkedPlacement: () => void,
 ): Promise<PoolRequestResult | undefined> {
   const requestBytes = Buffer.byteLength(body, 'utf8')
-  const routed = ctx.vault !== undefined && hasVaultRoutingAccessor()
-  const persistPin = !routed || ctx.routingRequest?.kind !== 'title'
   const byId = new Map(rows.map((row) => [row.id, row]))
   let routing = routingInput(ctx, rows)
   let sticky = admitSticky(routing)
@@ -1379,8 +1026,6 @@ async function serveSticky(
     },
   }
 
-  let preferred: StickySelection | undefined
-  let cold = false
   const placer =
     (input: PoolRoutingInput, admission: StickyAdmission) =>
     (exclude: readonly string[], persist: boolean) => {
@@ -1405,75 +1050,40 @@ async function serveSticky(
         wireAccountIdByAccount: Object.fromEntries(
           rows.map((row) => [row.id, row.identity]),
         ),
-        select: (pendingBytes) => {
-          if (!persist && exclude.length === 0) cold = true
-          const selected =
-            preferred ?? selectStickyRow(input, options, excluded, pendingBytes)
-          return selected
-        },
+        select: (pendingBytes) =>
+          selectStickyRow(input, options, excluded, pendingBytes),
         persist,
       })
     }
 
   let place = placer(routing, sticky)
-  const preview = ctx.vault && ctx.routingRequest ? place([], false) : undefined
-  if (preview) checkedPlacement()
-  if (
-    preview &&
-    cold &&
-    !ctx.warmAccountId &&
-    !ctx.limitPolicy?.currentAccountKey()
-  ) {
-    const advised = await chooseVaultRouting({
-      vaultMode: ctx.vault !== undefined,
-      fresh: true,
-      sessionId,
-      request: ctx.routingRequest,
-      routes: ctx.vault?.routes() ?? [],
-      warmAccountId: ctx.warmAccountId,
-      routing,
-    })
-    if (advised && typeof advised !== 'string')
-      throw new Error(VAULT_ROUTING_REFUSAL_MESSAGE)
-    preferred = advised
-      ? {
-          accountId: advised,
-          source: 'mode-fallback',
-          quotaCheckedAt: sticky.projections.get(advised)?.checkedAt,
-        }
-      : undefined
-  }
-  const assignment = place([], persistPin)
-  const advisedId = preferred?.accountId
-  preferred = undefined
+  const assignment = place([], true)
   if (!assignment) return undefined
-  let id = advisedId ?? assignment.accountId
+  let id = assignment.accountId
 
   const migrate = (reason: string) => {
-    const replacement = place([id], persistPin)
+    const replacement = place([id], true)
     if (!replacement) return false
-    if (persistPin)
-      ctx.log.debug('sticky routing: migrated session pin', {
-        pid: process.pid,
-        fromAccountId: id,
-        toAccountId: replacement.accountId,
-        reason,
-      })
+    ctx.log.debug('sticky routing: migrated session pin', {
+      pid: process.pid,
+      fromAccountId: id,
+      toAccountId: replacement.accountId,
+      reason,
+    })
     id = replacement.accountId
     return true
   }
 
-  const pinned =
-    id === advisedId ? undefined : routePinnedRow(routing, options, id)
-  if (pinned?.kind === 'none') return undefined
-  if (pinned?.kind === 'move') {
+  const pinned = routePinnedRow(routing, options, id)
+  if (pinned.kind === 'none') return undefined
+  if (pinned.kind === 'move') {
     // The pin ledger re-places the session with its own pending bytes. If it
     // finds no other row after all, a pinned row that is only exhausted is
     // still sent to (as on the `last-path` route); a row below its
     // killswitch floor never is.
     if (!migrate(pinned.reason) && pinned.reason === 'killswitch')
       return undefined
-  } else if (pinned?.kind === 'detour') {
+  } else if (pinned.kind === 'detour') {
     const detour = place([id], false)
     if (!detour) return undefined
     ctx.log.debug('sticky routing: pinned account awaits a quota reading', {
@@ -1484,47 +1094,11 @@ async function serveSticky(
     id = detour.accountId
   }
 
-  const row = byId.get(id)
+  let row = byId.get(id)
   if (!row) return undefined
   const attempted = ctx.limitPolicy?.accountKey(row.id)
-  const response = await sendTo(ctx, row)
-  if (!response)
-    return advisedId ? refusedVaultPick(ctx, rows, advisedId) : undefined
-  const current =
-    routed && [403, 429].includes(response.status) ? currentTargets(ctx) : rows
-  const choice = await routeVaultRefusal(
-    ctx,
-    { response, servedId: row.id },
-    new Set([row.id]),
-  )
-  if (typeof choice === 'object') return choice
-  if (choice) {
-    const replacement = current.find((candidate) => candidate.id === choice)
-    if (replacement) {
-      const replaced = await sendTo(ctx, replacement)
-      if (replaced) {
-        preferred = {
-          accountId: choice,
-          source: 'mode-fallback',
-          quotaCheckedAt: sticky.projections.get(choice)?.checkedAt,
-        }
-        migrate('exhausted')
-        response.body?.cancel().catch(() => {})
-        const result = await finishVaultAttempt(
-          ctx,
-          {
-            response: replaced,
-            servedId: choice,
-          },
-          new Set([row.id]),
-        )
-        noteServed(ctx, routing, result.servedId)
-        return result
-      }
-    }
-    response.body?.cancel().catch(() => {})
-    return refusedVaultPick(ctx, current, choice)
-  }
+  let response = await sendTo(ctx, row)
+  if (!response) return undefined
   const outcome = await afterLimit(
     ctx,
     row,
@@ -1558,17 +1132,12 @@ async function serveSticky(
           ? await sendTo(ctx, replacement)
           : undefined
         if (replacement && replaced) {
-          response.body?.cancel().catch(() => {})
-          const result = await finishVaultAttempt(
-            ctx,
-            {
-              response: replaced,
-              servedId: replacement.id,
-            },
-            new Set([row.id]),
-          )
-          noteServed(ctx, routing, result.servedId)
-          return result
+          const previous = response
+          response = replaced
+          previous.body?.cancel().catch(() => {})
+          row = replacement
+        } else {
+          id = from
         }
       }
     }

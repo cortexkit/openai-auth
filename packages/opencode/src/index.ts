@@ -29,7 +29,6 @@ import {
   formatRefreshBackoffMessage,
   getKillswitchThresholdsForAccount,
   hashRefreshToken,
-  hasVaultRoutingAccessor,
   isCompleteQuotaHeaderFrame,
   isCostZeroingEnabled,
   isKillswitchEnabled,
@@ -63,7 +62,6 @@ import {
   refreshAllQuota,
   refreshBackoffActive,
   reportSessionCacheResponse,
-  reportVaultRouting,
   resolveMidStreamRateLimitResetAt,
   type SessionDispatch,
   shouldCaptureSessionCache,
@@ -73,7 +71,6 @@ import {
   ttlForModel,
   vaultModeNoRouteCause,
   vaultModeRefusalText,
-  vaultRoutingRequestFromBody,
   vaultStateDir,
   whamUsageFn,
 } from '@cortexkit/openai-auth-core/internal'
@@ -175,13 +172,10 @@ import { observationFromSnapshot, windowsFromQuotaMap } from './core/pool-quota'
 import {
   isVaultModeRefusal,
   LOCAL_CREDENTIAL_REFUSALS,
-  localPoolResponse,
   type PendingPoolHold,
-  type PendingVaultRetry,
   type PoolBlockQuotas,
   type PoolPinPlacement,
   servePoolRequest,
-  trackPoolResponseFailure,
 } from './core/pool-request'
 import {
   CreditsServing,
@@ -692,13 +686,9 @@ export async function CodexAuthPlugin(
   let limitSource: OpenCodeLimitSource | undefined
   const sessionAccounts = new Map<string, AccountKey>()
   const pendingPoolHolds = new Map<string, PendingPoolHold>()
-  const pendingVaultRetries = new Map<string, PendingVaultRetry>()
   const forgetPoolHolds = (sessionId: string) => {
     for (const [key, hold] of pendingPoolHolds) {
       if (hold.sessionId === sessionId) pendingPoolHolds.delete(key)
-    }
-    for (const [key, retry] of pendingVaultRetries) {
-      if (retry.sessionId === sessionId) pendingVaultRetries.delete(key)
     }
   }
   // Background account-pool migration, and adoption into the pool of logins
@@ -2671,11 +2661,6 @@ export async function CodexAuthPlugin(
 
           const sessionID = resolveSidebarSessionId(headers)
           const agent = headers.get(OPENAI_AGENT_HEADER) ?? undefined
-          const recordsAccount = !(
-            agent === 'title' &&
-            vaultReceipt &&
-            hasVaultRoutingAccessor()
-          )
 
           const codexMetadata = sessionID
             ? getCodexSessionMetadata(
@@ -2730,9 +2715,7 @@ export async function CodexAuthPlugin(
                     ),
                     { status: 401 },
                   )
-                : localPoolResponse(
-                    killswitchBlockedResponse(null, 'quota-unknown'),
-                  )
+                : killswitchBlockedResponse(null, 'quota-unknown')
             const check = () =>
               limitsRequest.beforeDispatch(
                 binding,
@@ -2753,9 +2736,7 @@ export async function CodexAuthPlugin(
                     ),
                     { status: 401 },
                   )
-                : localPoolResponse(
-                    killswitchBlockedResponse(null, 'quota-unknown'),
-                  )
+                : killswitchBlockedResponse(null, 'quota-unknown')
             }
           }
           const owner = pooled ? limits.owner() : undefined
@@ -2775,10 +2756,7 @@ export async function CodexAuthPlugin(
           if (!pooled && activityKey)
             legacyKeys.set(keepwarmAccountKey, activityKey)
           const dispatched: SessionDispatch | undefined =
-            recordsAccount &&
-            sessionID &&
-            activityKey &&
-            typeof requestInit?.body === 'string'
+            sessionID && activityKey && typeof requestInit?.body === 'string'
               ? {
                   sessionId: sessionID,
                   accountKey: activityKey,
@@ -2786,7 +2764,7 @@ export async function CodexAuthPlugin(
                   ttlMs: ttlForModel(requestInit.body),
                 }
               : undefined
-          if (recordsAccount && sessionID) sessionAccounts.delete(sessionID)
+          if (sessionID) sessionAccounts.delete(sessionID)
           if (dispatched) {
             sessionAccounts.set(dispatched.sessionId, dispatched.accountKey)
             if (sessionAccounts.size > 256) {
@@ -2832,9 +2810,6 @@ export async function CodexAuthPlugin(
               response,
               keepwarmCapture && agent ? sessionID : undefined,
             )
-          const boundRefusal = Boolean(
-            pooled && vaultReceipt && sessionID && hasVaultRoutingAccessor(),
-          )
           if (keepwarmEnabled) {
             cacheKeepLogger.trace('cachekeep headers', {
               pid: process.pid,
@@ -2871,36 +2846,16 @@ export async function CodexAuthPlugin(
             scopedHeaders.set(OpenAIWebSocketPool.QUOTA_ACCOUNT_HEADER, key)
             const release = () => streams.delete(key)
             try {
-              const observeRouting =
-                pooled && vaultReceipt && sessionID && hasVaultRoutingAccessor()
-              const response = await websocketFetch(
-                url,
-                {
-                  ...requestInit,
-                  headers: scopedHeaders,
-                },
-                observeRouting
-                  ? (body, limit, headers) => {
-                      stream.limited = true
-                      reportVaultRouting(sessionID, vaultReceipt, {
-                        status: 429,
-                        headers: new Headers(headers),
-                        body,
-                        limit,
-                        quota: vault
-                          .routes()
-                          .find((route) => route.id === keepwarmAccountKey)
-                          ?.quota,
-                      })
-                    }
-                  : undefined,
-              )
+              const response = await websocketFetch(url, {
+                ...requestInit,
+                headers: scopedHeaders,
+              })
               if (!response.body) {
                 release()
                 return reportResponse(response)
               }
               const reader = response.body.getReader()
-              const reported = reportResponse(
+              return reportResponse(
                 await redactCredentialResponse(
                   new Response(
                     new ReadableStream<Uint8Array>({
@@ -2931,12 +2886,8 @@ export async function CodexAuthPlugin(
                   ),
                   accessToken,
                   'event-stream',
-                  { boundRefusal },
                 ),
               )
-              return observeRouting
-                ? trackPoolResponseFailure(reported, () => stream.limited)
-                : reported
             } catch (error) {
               release()
               throw redactCredentialError(error, accessToken)
@@ -2950,7 +2901,6 @@ export async function CodexAuthPlugin(
                 await fetch(url, finalInit),
                 accessToken,
                 'event-stream',
-                { boundRefusal },
               )
             } catch (error) {
               throw redactCredentialError(error, accessToken)
@@ -2979,7 +2929,6 @@ export async function CodexAuthPlugin(
           })
           try {
             const response = await fetch(url, finalInit)
-            const receivedAt = boundRefusal ? Date.now() : undefined
             await dumpCodexRequest({
               sessionID,
               transport: 'http',
@@ -2998,7 +2947,6 @@ export async function CodexAuthPlugin(
                 }),
                 accessToken,
                 'event-stream',
-                { boundRefusal, receivedAt },
               ),
             )
           } catch (error) {
@@ -4060,12 +4008,24 @@ export async function CodexAuthPlugin(
             currentMainIdentity = mainRow?.identity
           }
           const sidebarSnapshot = await sidebarCache.get()
-          const routingRequest = vaultRoutingRequestFromBody(
-            init?.body,
-            effectiveRequestHeaders(requestInput, init).get(
-              OPENAI_AGENT_HEADER,
-            ) ?? undefined,
+          const agent = effectiveRequestHeaders(requestInput, init).get(
+            OPENAI_AGENT_HEADER,
           )
+          // Keep the existing hold keys for the agent loop and its auxiliary requests.
+          const requestKind =
+            agent &&
+            !['title', 'compaction', 'summary'].includes(agent) &&
+            typeof init?.body === 'string'
+              ? (() => {
+                  try {
+                    return typeof JSON.parse(init.body).model === 'string'
+                      ? 'primary'
+                      : 'auxiliary'
+                  } catch {
+                    return 'auxiliary'
+                  }
+                })()
+              : 'auxiliary'
           const requestPath = new URL(
             requestInput instanceof Request
               ? requestInput.url
@@ -4073,12 +4033,7 @@ export async function CodexAuthPlugin(
           ).pathname
           const { response, servedId } = await servePoolRequest({
             configPath,
-            warmAccountId: resolveSessionStickyAccount(
-              applyStickyPinOverlay(sidebarSnapshot, stickyPinOverlay),
-              sessionId,
-            ),
             source: poolSource,
-            vaultRetries: pendingVaultRetries,
             rateLimitMarks: () => limits.marks(),
             limitPolicy: {
               pending: pendingPoolHolds,
@@ -4112,13 +4067,7 @@ export async function CodexAuthPlugin(
             storage: reqStorage,
             mode,
             sessionId,
-            requestKind: JSON.stringify([
-              requestPath,
-              routingRequest?.kind === 'title'
-                ? 'auxiliary'
-                : (routingRequest?.kind ?? 'auxiliary'),
-            ]),
-            routingRequest: vaultMode ? routingRequest : undefined,
+            requestKind: JSON.stringify([requestPath, requestKind]),
             body: typeof init?.body === 'string' ? init.body : undefined,
             replayable: isReplayableRequest(requestInput, init),
             now: Date.now,
@@ -4213,12 +4162,6 @@ export async function CodexAuthPlugin(
             creditsServing,
             log: logA,
           })
-          if (
-            vaultMode &&
-            routingRequest?.kind === 'title' &&
-            hasVaultRoutingAccessor()
-          )
-            return response
           queueRequestSidebarRouting(
             sessionId,
             parentSessionId,

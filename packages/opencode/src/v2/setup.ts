@@ -113,6 +113,7 @@ import {
   OPENAI_HOST_RETRY_LIMIT,
   OPENAI_PROVIDER_ID,
   type OpenAIAdapterLogger,
+  type OpenAIAttemptData,
 } from './adapter'
 import {
   acquireCacheKeep,
@@ -237,7 +238,7 @@ type SetupContext = Pick<
 > &
   Partial<Pick<Plugin.Context, 'command' | 'location'>>
 
-async function installPoolHooks<Q, A>(
+async function installPoolHooks<Q, A extends OpenAIAttemptData>(
   ctx: SetupContext,
   adapter: OpenCode2AuthAdapter<Q, A, ChooseAccountResult>,
   log: Pick<OpenAIAdapterLogger, 'warn' | 'info'>,
@@ -254,6 +255,10 @@ async function installPoolHooks<Q, A>(
   onOwnedFrame?: (sessionID: string) => void,
 ) {
   const dumps = new RequestDumps(log)
+  const refusals = new WeakMap<
+    Attempt<A>,
+    { original: Response; credential?: string; redacted?: Promise<Response> }
+  >()
   // installOpenCode2Auth supplies an Attempt to the rewrite callbacks before it
   // constructs the final Request. Async-local storage carries that handle to
   // this hook's final snapshot without sharing a latest attempt across requests.
@@ -494,6 +499,49 @@ async function installPoolHooks<Q, A>(
     context,
     {
       ...adapter,
+      answeredBy: async (input) => {
+        const answered = await adapter.answeredBy?.(input)
+        const data =
+          answered &&
+          answered.accountId !== input.attempt.accountId &&
+          'data' in answered
+            ? answered.data
+            : input.attempt.data
+        const { status } = input.response
+        if (
+          (status === 403 || status === 429) &&
+          data?.kind === 'vault' &&
+          hasVaultRoutingAccessor()
+        )
+          refusals.set(input.attempt, {
+            original: input.response,
+            credential: input.request.headers
+              .get('authorization')
+              ?.replace(/^Bearer /, ''),
+          })
+        return answered
+      },
+      limitFromResponse:
+        adapter.limitFromResponse &&
+        ((input) => {
+          const refusal = refusals.get(input.attempt)
+          if (!refusal || input.attempt.data?.kind !== 'vault')
+            return adapter.limitFromResponse?.(input)
+          // The installer classifies before rewriteResponse. Give both hooks
+          // the same bounded diagnostic instead of using its unbounded body supplier.
+          return adapter.limitFromResponse?.({
+            ...input,
+            body: async () => {
+              refusal.redacted ??= redactCredentialResponse(
+                refusal.original.clone(),
+                refusal.credential,
+                'event-stream',
+                { boundRefusal: true },
+              )
+              return (await refusal.redacted).clone().text()
+            },
+          })
+        }),
       rewriteRequest: async (input) => {
         const observation = observing.getStore()
         if (observation) observation.attempt = input.attempt
@@ -512,11 +560,16 @@ async function installPoolHooks<Q, A>(
         await dumps.response(input.request, input.response.status)
         const response =
           (await adapter.rewriteResponse?.(input)) ?? input.response
-        const redacted = await redactCredentialResponse(
-          response,
-          input.request.headers.get('authorization')?.replace(/^Bearer /, ''),
-          'event-stream',
-        )
+        const bounded = await refusals.get(input.attempt)?.redacted
+        refusals.delete(input.attempt)
+        if (bounded) void response.body?.cancel().catch(() => {})
+        const redacted =
+          bounded ??
+          (await redactCredentialResponse(
+            response,
+            input.request.headers.get('authorization')?.replace(/^Bearer /, ''),
+            'event-stream',
+          ))
         return reportSessionCacheResponse(
           redacted,
           input.kind === 'primary' ? input.sessionID : undefined,

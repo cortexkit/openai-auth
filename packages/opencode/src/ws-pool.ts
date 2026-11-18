@@ -204,7 +204,6 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
   async function websocketFetch(
     input: RequestInfo | URL,
     init?: RequestInit,
-    onRoutingLimit?: OpenAIWebSocket.StreamResponsesWebSocketOptions['onRoutingLimit'],
   ): Promise<Response> {
     const url =
       input instanceof URL
@@ -384,7 +383,6 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
         signal: init?.signal ?? undefined,
         onQuota: requestOnQuota,
         onRateLimitReached: requestOnRateLimitReached,
-        onRoutingLimit,
         onFirstEvent: (error) => resolveFirstEvent(error ?? true),
         onComplete: (event, finalizedCallIds) => {
           options?.onComplete?.(event, requestAccountId)
@@ -446,11 +444,7 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
           throw error
         },
       })
-      // Lifecycle frames are not output. Keep pre-output refusals in the
-      // request path; the stream's own idle deadline still bounds a quiet peer.
-      const first = await (onRoutingLimit
-        ? firstEvent
-        : withGrace(firstEvent, firstEventGraceMs))
+      const first = await withGrace(firstEvent, firstEventGraceMs)
       if (first !== false) {
         if (first === true || first.status < 200 || first.status > 599)
           return response

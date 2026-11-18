@@ -1248,6 +1248,163 @@ test.each([
   },
 )
 
+test.each([
+  {
+    transport: 'ws',
+    frame: { type: 'error', error: { type: 'rate_limit_exceeded' } },
+    code: 'rate_limit_exceeded',
+  },
+  {
+    transport: 'ws',
+    frame: {
+      type: 'response.failed',
+      response: { failed: { rate_limit_reached_type: 'secondary' } },
+    },
+    code: 'http_429',
+  },
+  {
+    transport: 'ws',
+    frame: {
+      type: 'response.failed',
+      response: { error: { code: 'rate_limit_exceeded' } },
+    },
+    code: 'rate_limit_exceeded',
+  },
+  {
+    transport: 'sse',
+    frame: { type: 'error', error: { code: 'rate_limit_exceeded' } },
+    code: 'rate_limit_exceeded',
+  },
+  {
+    transport: 'sse',
+    frame: {
+      type: 'response.failed',
+      response: { failed: { rate_limit_reached_type: 'secondary' } },
+    },
+    code: 'http_429',
+  },
+  {
+    transport: 'sse',
+    frame: {
+      type: 'response.failed',
+      response: { error: { code: 'usage_limit_reached', window: '7d' } },
+    },
+    code: undefined,
+  },
+])(
+  'OC2 $transport classifies statusless $frame.type limits with code $code',
+  async ({ transport, frame, code }) => {
+    const at = 1_900_000_000_000
+    const asks: unknown[] = []
+    const reports: Array<Record<string, unknown>> = []
+    Reflect.set(globalThis, key, () => ({
+      accountFor: async (ask: { mode?: string }) => {
+        asks.push(ask.mode)
+        return {
+          account_id: ask.mode === 'continue' ? 'account-a' : 'account-b',
+        }
+      },
+      report: (report: Record<string, unknown>) => {
+        if (
+          report.kind === 'transient_backoff' ||
+          report.outcome === 'exhausted'
+        )
+          reports.push(report)
+      },
+    }))
+    const env = fixture(true, 'ordered', () => at)
+    const host = fakeOpenCode2Host()
+    const installation = await installOpenCode2Auth(
+      host.ctx,
+      env.openai.adapter,
+    )
+    const requestScope = scope('statusless-frame')
+    const headers = { authorization: `Bearer ${placeholderSecret('openai')}` }
+    const sendHttp = () =>
+      host.fire('http.request', {
+        ...requestScope,
+        request: new Request('https://codex.test/v1/responses', {
+          method: 'POST',
+          body: '{}',
+          headers,
+        }),
+      })
+    try {
+      if (transport === 'ws') {
+        await host.fire('experimental.ws.handshake', {
+          ...requestScope,
+          url: 'wss://codex.test/v1/responses',
+          headers: { ...headers },
+        })
+        await host.fire('experimental.ws.send', {
+          ...requestScope,
+          frame: '{"type":"response.create","input":[]}',
+        })
+        await host.fire('experimental.ws.receive', {
+          ...requestScope,
+          frame: JSON.stringify(frame),
+        })
+      } else {
+        const draft = await sendHttp()
+        const got = await host.fire('http.response', {
+          ...requestScope,
+          request: draft.request,
+          response: new Response(billingSse(frame), {
+            headers: { 'content-type': 'text/event-stream' },
+          }),
+        })
+        await got.response.text()
+      }
+      const retry = await host.fire('retry', {
+        ...requestScope,
+        attempt: 2,
+        decision: { retry: false },
+        error: { type: 'api', message: JSON.stringify(frame) },
+      })
+      expect(retry.decision).toEqual(
+        expect.objectContaining({ retry: true, delay: code ? 5000 : 0 }),
+      )
+      await host.fire('model.request', {
+        ...requestScope,
+        headers: { ...headers },
+      })
+      expect((await sendHttp()).request.headers.get('authorization')).toBe(
+        `Bearer vault:${code ? 'b' : 'a'}-token`,
+      )
+      expect(asks).toEqual(code ? [undefined] : [undefined, 'continue'])
+      expect(reports).toEqual([
+        code
+          ? expect.objectContaining({
+              kind: 'transient_backoff',
+              account_id: 'account-b',
+              provider_code: code,
+              retry_at_ms: at + 5000,
+            })
+          : expect.objectContaining({
+              outcome: 'exhausted',
+              account_id: 'account-b',
+              window: '7d',
+            }),
+      ])
+    } finally {
+      await installation.dispose()
+      env.openai.dispose()
+    }
+  },
+)
+
+test('OC2 keeps an eligible recorded account when switching to sticky-balanced before a pin exists', async () => {
+  const accountFor = mock(async () => ({ account_id: 'account-b' }))
+  Reflect.set(globalThis, key, () => ({ accountFor }))
+  const env = fixture()
+  expect(await env.openai.adapter.chooseAccount(env.request)).toBe('vault:b')
+  expect(env.pins.get(env.request.sessionID)).toBeUndefined()
+  env.storage.routing = { mode: 'sticky-balanced' }
+  expect(await env.openai.adapter.chooseAccount(env.request)).toBe('vault:b')
+  expect(env.pins.get(env.request.sessionID)).toBe('vault:b')
+  expect(accountFor).toHaveBeenCalledTimes(1)
+})
+
 const billingTerminal = (type = 'response.completed') => ({
   type,
   response: {

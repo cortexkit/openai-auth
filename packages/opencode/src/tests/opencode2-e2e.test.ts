@@ -833,7 +833,7 @@ describe('limit host readiness', () => {
 })
 
 describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
-  test('a Thalamus routing refusal is asked once and sends nothing for one user turn', async () => {
+  test('Thalamus routing refuses both the cold primary and title without a send or retry', async () => {
     const result = await runScenario({
       transport: 'http',
       accounts: [],
@@ -843,9 +843,13 @@ describe.skipIf(!ENABLED)('openai-auth on OpenCode 2 (real host)', () => {
       routingRefusal: true,
     })
     try {
-      expect(result.routingAsks).toHaveLength(1)
-      expect(result.routingAsks[0]?.refusals).toBe(true)
-      // Title generation is a separate auxiliary request and never asks routing.
+      expect(result.routingAsks.map((ask) => ask.modelId).sort()).toEqual([
+        'gpt-5.5',
+        'gpt-6-luna',
+      ])
+      expect(result.routingAsks.every((ask) => ask.refusals === true)).toBe(
+        true,
+      )
       expect(primaries(result.wire)).toEqual([])
       expect(result.samples).toEqual([])
       expect(result.vaultReports).toEqual([])

@@ -372,6 +372,13 @@ const ACCOUNT_LIMIT_CODES = new Set([
   'rate_limit_exceeded',
 ])
 
+const ROUTED_LIMIT_CODES = new Set([
+  ...ACCOUNT_LIMIT_CODES,
+  'turn_rate_limit_exceeded',
+  'insufficient_quota',
+  'quota_exceeded',
+])
+
 /** Carry core's window facts so the next retry decision need not classify the error again. */
 export interface OpenAILimitSignal extends LimitSignal {
   readonly windows: LimitWindow[]
@@ -485,6 +492,66 @@ function inspectParsedCodexEvent(
   if (limit) return { limit }
   if (type === undefined || type === 'error') return undefined
   return isNonEmittingFrame(type) ? undefined : { outputStarted: true }
+}
+
+function routedFrameLimit(
+  event: Record<string, unknown>,
+  observedAt: number,
+  reading: ReturnType<typeof windowsFromQuotaMap>,
+): OpenAILimitSignal | undefined {
+  if (event.type !== 'error' && !vaultRoutingStreamFailed(event))
+    return undefined
+  const status = event.status ?? event.status_code
+  if (status === 403) return toLimit({ window: 'http_403' }, observedAt, status)
+  if (status !== 429 && status !== undefined && status !== 200) return undefined
+  const response = isRecord(event.response) ? event.response : event
+  const error = isRecord(response.error) ? response.error : response
+  const code = [error.code, error.type].find(
+    (value): value is string =>
+      typeof value === 'string' && ROUTED_LIMIT_CODES.has(value),
+  )
+  const named =
+    isRecord(response.failed) &&
+    typeof response.failed.rate_limit_reached_type === 'string'
+      ? response.failed.rate_limit_reached_type
+      : undefined
+  if (status !== 429 && !code && !named) return undefined
+  // Streaming transports can report a limit after HTTP 200, with no status in the frame.
+  const parsed = parseRateLimitSignal(
+    { status: 429, error: { ...error, type: code } },
+    observedAt,
+  )
+  return toLimit(
+    {
+      window: named ?? parsed?.window ?? RATE_LIMIT_WINDOW,
+      resetAt: parsed?.resetAt,
+    },
+    observedAt,
+    429,
+    reading,
+  )
+}
+
+function frameRoutingHeaders(
+  initial: Headers | undefined,
+  body: Record<string, unknown>,
+): Headers {
+  const headers = new Headers(initial)
+  if (isRecord(body.headers)) {
+    for (const [key, value] of Object.entries(body.headers)) {
+      if (
+        ['retry-after', 'retry-after-ms'].includes(key.toLowerCase()) &&
+        (typeof value === 'string' || typeof value === 'number')
+      ) {
+        try {
+          headers.set(key, String(value))
+        } catch {
+          // Invalid frame headers must not suppress the refusal itself.
+        }
+      }
+    }
+  }
+  return headers
 }
 
 /** Quota from the `x-codex-*` response headers; undefined when there are none. */
@@ -991,9 +1058,17 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         receipt.accountIdentity !== wake.accountIdentity
       )
         throw vaultRefusal()
+      // The wake overrides the old timed mark, not the account's current quota tier.
+      const routing = routingInput(targets, storage, at)
+      const plan = planOrdered({
+        ...routing,
+        rows: routing.rows.filter((row) => row.id === accountId),
+        rateLimitMarks: new Map(),
+        placement: 'roster',
+      })
       receipts.set(receiptKey({ ...input, accountId }), {
         receipt,
-        freeQuota: false,
+        freeQuota: plan.kind === 'send' && plan.tiers[accountId] === 'free',
       })
       if (ready) keepRequestHandoff(input, accountId, ready)
       return accountId
@@ -1442,6 +1517,18 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         } else if (mode === 'sticky-balanced') {
           const plannedPins = new Map(pins.placementSnapshot(input.sessionID))
           const previous = plannedPins.get(input.sessionID)
+          const follow =
+            routingEnabled &&
+            !previous &&
+            activeAccount &&
+            !skip.has(activeAccount) &&
+            routePinnedRow(
+              routing,
+              stickyOptions(targets, storage),
+              activeAccount,
+            ).kind === 'serve'
+              ? activeAccount
+              : undefined
           accountId = chooseSticky(
             routing,
             targets,
@@ -1453,7 +1540,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
             // choosing again after one does not move the session's sticky pin.
             primary && refused.size === 0,
             plannedPins,
-            undefined,
+            follow,
             admissionTiers,
           )
           if (
@@ -2120,37 +2207,43 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         }
       }
       const observedAt = now()
-      let verdict = inspectParsedCodexEvent(
-        event,
-        observedAt,
-        quotaFor(attempt.accountId, attempt.data?.kind === 'vault'),
+      const reading = quotaFor(
+        attempt.accountId,
+        attempt.data?.kind === 'vault',
       )
+      let verdict = inspectParsedCodexEvent(event, observedAt, reading)
       if (
         attempt.data?.kind === 'vault' &&
         hasVaultRoutingAccessor() &&
-        isRecord(event) &&
-        event.type === 'error'
+        isRecord(event)
       ) {
-        const status = event.status ?? event.status_code
-        if (status === 403)
-          verdict = {
-            ...verdict,
-            limit: toLimit({ window: 'http_403' }, observedAt, 403),
+        const limit = routedFrameLimit(event, observedAt, reading)
+        if (limit) {
+          verdict = { ...verdict, outputStarted: false, limit }
+          if (!routingLimitsHandled?.has(attempt)) {
+            const feedback = reportVaultRouting(
+              attempt.sessionID,
+              attempt.data.receipt,
+              {
+                status: limit.status ?? 429,
+                headers: frameRoutingHeaders(
+                  routingResponses.get(attempt)?.headers,
+                  event,
+                ),
+                body: event,
+                limit: { window: limit.reason, resetAt: limit.resetAt },
+                quota: vault
+                  ?.routes()
+                  .find((route) => route.id === attempt.accountId)?.quota,
+                now: observedAt,
+                backoff: true,
+              },
+            )
+            if (feedback) routingFeedback.set(limit, feedback)
+            routingLimitsHandled ??= new WeakSet()
+            routingLimitsHandled.add(attempt)
           }
-        else if (
-          status === 429 &&
-          verdict?.limit &&
-          verdict.limit.status === undefined
-        )
-          verdict = { ...verdict, limit: { ...verdict.limit, status } }
-      }
-      if (
-        attempt.data?.kind === 'vault' &&
-        hasVaultRoutingAccessor() &&
-        verdict?.limit
-      ) {
-        routingLimitBodies ??= new WeakMap()
-        routingLimitBodies.set(attempt, event)
+        }
       }
       // HTTP acceptance belongs to the body reader, not an SSE lifecycle
       // frame. A WebSocket has no body end, so its completion is explicit.
@@ -2347,16 +2440,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           isRecord(body) &&
           vaultRoutingStreamFailed(body)
         ) {
-          const headers = new Headers(response?.headers)
-          if (isRecord(body.headers)) {
-            for (const [key, value] of Object.entries(body.headers)) {
-              if (
-                ['retry-after', 'retry-after-ms'].includes(key.toLowerCase()) &&
-                (typeof value === 'string' || typeof value === 'number')
-              )
-                headers.set(key, String(value))
-            }
-          }
+          const headers = frameRoutingHeaders(response?.headers, body)
           const feedback = reportVaultRouting(attempt.sessionID, data.receipt, {
             status: limit.status,
             headers,

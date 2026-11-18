@@ -333,6 +333,84 @@ async function send(host: Host, status: number) {
   return draft.request.headers
 }
 
+it.each([403, 429])(
+  'the real OC2 vault response hook discards incomplete %i diagnostics',
+  async (status) => {
+    const key = Symbol.for('cortexkit.routing')
+    const prior = Object.getOwnPropertyDescriptor(globalThis, key)
+    const reports: unknown[] = []
+    Reflect.set(globalThis, key, () => ({
+      report: (value: unknown) => reports.push(value),
+    }))
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const opaque = 'opaque-token-no-jwt-shape-for-boundary-test'
+      const { host } = await start('main-first', [{ id: 'main' }], {
+        'chatgpt:openai': vaultLogin('chatgpt-vault', {
+          payload: JSON.stringify({ access_token: opaque }),
+        }),
+      })
+      const requestScope = scope('bounded-diagnostic', 'primary')
+      const headers = { authorization: `Bearer ${PLACEHOLDER}` }
+      await host.fire('model.request', { ...requestScope, headers })
+      const draft = await host.fire('http.request', {
+        ...requestScope,
+        request: new Request('https://codex.test/v1/responses', {
+          method: 'POST',
+          headers,
+          body: '{}',
+        }),
+      })
+      const token = draft.request.headers.get('authorization')?.slice(7) ?? ''
+      expect(token).toBe(opaque)
+      const body =
+        status === 403
+          ? new ReadableStream<Uint8Array>({
+              start(stream) {
+                controller = stream
+                stream.enqueue(new TextEncoder().encode(token))
+              },
+              cancel() {
+                controller = undefined
+              },
+            })
+          : `${'x'.repeat(65536 - 16)}${token}`
+      const work = host.fire('http.response', {
+        ...requestScope,
+        request: draft.request,
+        response: new Response(body, {
+          status,
+          headers: { 'retry-after': '8', 'x-diagnostic': 'preserved' },
+        }),
+      })
+      const received = await Promise.race([
+        work,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error('the HTTP refusal read did not finish')),
+            3000,
+          )
+        }),
+      ])
+      expect(received.response.status).toBe(status)
+      expect(received.response.headers.get('retry-after')).toBe('8')
+      expect(received.response.headers.get('x-diagnostic')).toBe('preserved')
+      expect(await received.response.text()).toBe('No diagnostic was received.')
+      expect(
+        reports.filter(
+          (value) => (value as { kind?: string }).kind === 'transient_backoff',
+        ),
+      ).toEqual([expect.objectContaining({ provider_code: `http_${status}` })])
+    } finally {
+      clearTimeout(timer)
+      controller?.close()
+      if (prior) Object.defineProperty(globalThis, key, prior)
+      else Reflect.deleteProperty(globalThis, key)
+    }
+  },
+)
+
 describe('vault accounts on OpenCode 2', () => {
   it('host relay activates the vault placeholder and serves without enrollment', async () => {
     const { host, daemon, tokenPath, files, relay } = await start(

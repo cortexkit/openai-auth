@@ -397,6 +397,7 @@ async function cleanSend(
   sessionID: string,
   transport: 'http' | 'ws',
   kind: Parameters<typeof scope>[1] = 'primary',
+  responseBody = 'sentinel',
 ) {
   await host.fire('model.request', {
     ...scope(sessionID, kind),
@@ -420,17 +421,17 @@ async function cleanSend(
     request: new Request('http://codex.test/v1/responses', {
       method: 'POST',
       headers: { authorization: `Bearer ${PLACEHOLDER}` },
-      body: '{}',
+      body: '{"model":"gpt-5.5","input":[]}',
     }),
   }
   await host.fire('http.request', draft)
   const response = {
     ...scope(sessionID, kind),
     request: draft.request,
-    response: new Response('sentinel'),
+    response: new Response(responseBody),
   }
   await host.fire('http.response', response)
-  expect(await response.response.text()).toBe('sentinel')
+  expect(await response.response.text()).toBe(responseBody)
   return draft.request.headers.get('authorization')
 }
 
@@ -445,11 +446,13 @@ function freezeClock() {
 
 function routingAccessor(
   accountFor: (ask: Record<string, unknown>) => unknown,
+  report?: (event: Record<string, unknown>) => void,
 ) {
   const key = Symbol.for('cortexkit.routing')
   const before = Object.getOwnPropertyDescriptor(globalThis, key)
   Reflect.set(globalThis, key, () => ({
     accountFor: async (ask: Record<string, unknown>) => accountFor(ask),
+    report,
   }))
   cleanups.push(() => {
     if (before) Object.defineProperty(globalThis, key, before)
@@ -472,10 +475,15 @@ function judgeRetry(host: Host, sessionID: string) {
 
 it('OC2 a bound routing hold wakes on the account even while the real registry marks it', async () => {
   const clock = freezeClock()
-  routingAccessor((ask) =>
-    ask.mode === 'continue'
-      ? { account_id: 'chatgpt-a', hold: { retry_after_ms: 2000 } }
-      : { account_id: 'chatgpt-a' },
+  const billing: unknown[] = []
+  routingAccessor(
+    (ask) =>
+      ask.mode === 'continue'
+        ? { account_id: 'chatgpt-a', hold: { retry_after_ms: 2000 } }
+        : { account_id: 'chatgpt-a' },
+    (event) => {
+      if (event.kind === 'billing') billing.push(event)
+    },
   )
   const f = await registryLocation('vault')
   const choose = spyOn(f.openai.adapter, 'chooseAccount')
@@ -489,7 +497,21 @@ it('OC2 a bound routing hold wakes on the account even while the real registry m
   })
   expect(f.limits.marks().get('a')).toBeGreaterThan(T0 + 2000)
   clock(T0 + 2000)
-  expect(await send(f.host, sessionID)).toBe('Bearer token-a')
+  expect(
+    await cleanSend(
+      f.host,
+      sessionID,
+      'http',
+      'primary',
+      'data: {"type":"response.completed","response":{"id":"woke"}}\n\n',
+    ),
+  ).toBe('Bearer token-a')
+  expect(billing.at(-1)).toEqual(
+    expect.objectContaining({
+      outcome: 'completed',
+      charge_basis: 'subscription_included',
+    }),
+  )
   expect(
     choose.mock.calls.some(
       ([input]) => input.wake?.checkpoint?.accountKey.accountId === 'a',

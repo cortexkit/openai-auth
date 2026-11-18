@@ -8,10 +8,6 @@ import {
 import { windowsFromQuotaMap } from './pool-quota'
 import { type PoolRoutingInput, planOrdered } from './pool-routing'
 import { type RoutingWaitInput, routingHoldWaitMaxS } from './routing-wait'
-import {
-  isIncompleteProviderRefusal,
-  readBoundedRefusalBody,
-} from './util/credential-redaction'
 import { isRecord } from './util/record'
 
 export interface VaultRoutingRequest {
@@ -91,28 +87,6 @@ export function startVaultRoutingWait(input: {
     if (ended) return
     ended = true
     reportRouting({ ...report, phase: 'end', outcome })
-  }
-}
-
-export function vaultRoutingKind(agent: string | undefined): string {
-  if (agent === 'title') return 'title'
-  return agent && !['compaction', 'summary'].includes(agent)
-    ? 'primary'
-    : 'auxiliary'
-}
-
-export function vaultRoutingRequestFromBody(
-  body: unknown,
-  agent: string | undefined,
-): VaultRoutingRequest | undefined {
-  if (typeof body !== 'string') return undefined
-  try {
-    const parsed = JSON.parse(body)
-    return typeof parsed?.model === 'string'
-      ? { modelId: parsed.model, kind: vaultRoutingKind(agent) }
-      : undefined
-  } catch {
-    return undefined
   }
 }
 
@@ -454,115 +428,4 @@ export function vaultRoutingStreamMayFail(data: string): boolean {
     (data.includes('"error"') && /"type"\s*:\s*"error"/.test(data)) ||
     (data.includes('"failed"') && /"status"\s*:\s*"failed"/.test(data))
   )
-}
-
-async function readRoutingRefusalBody(response: Response): Promise<unknown> {
-  if (isIncompleteProviderRefusal(response)) return undefined
-  const bounded = await readBoundedRefusalBody(response.clone().body)
-  if (bounded.complete) return JSON.parse(bounded.text)
-}
-
-/** Observe completion without consuming or changing the caller's response bytes. */
-export function observeVaultRoutingResponse(
-  sessionId: string | undefined,
-  receipt: QuotaReceipt,
-  response: Response,
-  options: {
-    parseLimit: (body: unknown) => VaultRoutingResponse['limit']
-    quota?: unknown
-    now?: () => number
-    failed?: () => boolean
-    /** A reroute must wait for classification, not for routing to accept the report. */
-    onRefusal?: (classified: Promise<VaultRoutingFeedback | undefined>) => void
-  },
-): Response {
-  if (
-    !hasVaultRoutingAccessor() ||
-    !sessionId ||
-    (!receipt.accountIdentity && !options.onRefusal)
-  )
-    return response
-  const outcome = {
-    status: response.status,
-    headers: response.headers,
-    quota: options.quota,
-  }
-  if (
-    response.status === 429 ||
-    (response.status === 403 && options.onRefusal)
-  ) {
-    // Inspect a copy only for refused requests; the caller retains its unread body.
-    const receivedAt = options.now?.() ?? Date.now()
-    const report = (body?: unknown) =>
-      reportVaultRouting(sessionId, receipt, {
-        ...outcome,
-        body,
-        limit: body === undefined ? undefined : options.parseLimit(body),
-        now: receivedAt,
-        backoff: options.onRefusal !== undefined,
-      })
-    const classified = readRoutingRefusalBody(response)
-      .then(report, () => report())
-      .catch(() => undefined)
-    options.onRefusal?.(classified)
-    return response
-  }
-  if (!receipt.accountIdentity || !response.ok) return response
-  if (!response.body) {
-    reportVaultRouting(sessionId, receipt, outcome)
-    return response
-  }
-  const sse = response.headers
-    .get('content-type')
-    ?.includes('text/event-stream')
-  const decoder = new TextDecoder()
-  let pending = ''
-  let failed = false
-  const inspect = (line: string) => {
-    if (failed) return
-    if (line.startsWith('event:') && line.slice(6).trim() === 'error')
-      failed = true
-    if (!line.startsWith('data:') || !vaultRoutingStreamMayFail(line)) return
-    try {
-      failed ||= vaultRoutingStreamFailed(JSON.parse(line.slice(5)))
-    } catch {}
-  }
-  const stream = response.body.pipeThrough(
-    new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
-        if (sse && !failed) {
-          pending += decoder.decode(chunk, { stream: true })
-          let newline = pending.indexOf('\n')
-          while (newline >= 0) {
-            inspect(pending.slice(0, newline))
-            pending = pending.slice(newline + 1)
-            newline = pending.indexOf('\n')
-          }
-          // An unbounded or malformed event cannot establish successful completion.
-          if (pending.length > 1024 * 1024) {
-            failed = true
-            pending = ''
-          }
-        }
-        controller.enqueue(chunk)
-      },
-      flush() {
-        if (sse) inspect(pending + decoder.decode())
-        reportVaultRouting(sessionId, receipt, {
-          ...outcome,
-          failed: failed || options.failed?.(),
-        })
-      },
-    }),
-  )
-  const observed = new Response(stream, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  })
-  Object.defineProperties(observed, {
-    url: { value: response.url },
-    redirected: { value: response.redirected },
-  })
-  return observed
 }
