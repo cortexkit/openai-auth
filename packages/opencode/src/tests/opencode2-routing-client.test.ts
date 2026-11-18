@@ -272,7 +272,6 @@ test.each([
   'timeout',
   'throw',
   'killswitch',
-  'refused',
   'retry',
   'local',
 ])('OpenCode 2 %s keeps its own choice without re-asking', async (kind) => {
@@ -297,7 +296,6 @@ test.each([
       defaults: { primary: 25, secondary: 0 },
     }
   }
-  if (kind === 'refused') env.refused.add('vault:b')
   const request = {
     ...env.request,
     phase: kind === 'retry' ? ('retry' as const) : ('request' as const),
@@ -306,8 +304,23 @@ test.each([
     kind === 'local' ? 'main' : 'vault:a',
   )
   expect(asks).toBe(['retry', 'local'].includes(kind) ? 0 : 1)
-  if (kind === 'refused') expect(env.authorized).toEqual(['vault:b', 'vault:a'])
 })
+
+test.each(['ordered', 'sticky-balanced'] as const)(
+  'OpenCode 2 %s refuses when the vault cannot authorize routing’s pick',
+  async (mode) => {
+    Reflect.set(globalThis, key, () => ({
+      accountFor: async () => ({ account_id: 'account-b' }),
+    }))
+    const env = fixture(true, mode)
+    env.refused.add('vault:b')
+    await expect(env.openai.adapter.chooseAccount(env.request)).rejects.toThrow(
+      'vault',
+    )
+    expect(env.authorized).toEqual(['vault:b'])
+    expect(env.openai.activeAccount(env.request.sessionID)).toBeUndefined()
+  },
+)
 
 test.each(['compaction', 'generate', 'title'] as const)(
   'OpenCode 2 first %s asks without recording or pinning',
@@ -696,11 +709,26 @@ for (const scenario of [
       error: { type: 'rate_limit_exceeded', window: '5h' },
     }),
     exhausted: false,
+    providerCode: 'rate_limit_exceeded',
   },
   {
     name: 'unstructured usage-limit text',
     message: 'usage_limit_reached for primary',
     exhausted: false,
+    providerCode: 'http_429',
+  },
+  {
+    name: '403 without a structured error',
+    message: 'Forbidden',
+    exhausted: false,
+    status: 403,
+    providerCode: 'http_403',
+  },
+  {
+    name: '429 with a failed envelope that names no window',
+    message: JSON.stringify({ type: 'response.failed', response: {} }),
+    exhausted: false,
+    providerCode: 'http_429',
   },
 ]) {
   test(`OpenCode 2 vault host error ${scenario.name} reports at most once per attempt`, async () => {
@@ -710,7 +738,8 @@ for (const scenario of [
         reports.push(payload)
       },
     }))
-    const env = fixture()
+    const at = 1_900_000_000_000
+    const env = fixture(true, 'ordered', () => at)
     const attempt: Attempt<OpenAIAttemptData> = {
       providerID: 'openai',
       modelID: 'gpt-6',
@@ -749,10 +778,14 @@ for (const scenario of [
       expect(reports).toHaveLength(1)
     }
     const limit = await env.openai.adapter.limitFromError!(
-      { type: 'api', message: scenario.message, status: 429 },
+      {
+        type: 'api',
+        message: scenario.message,
+        status: 'status' in scenario ? scenario.status : 429,
+      },
       attempt,
     )
-    if (!('httpFirst' in scenario)) expect(reports).toEqual([])
+    expect(reports).toHaveLength(1)
     const outcome = { outputStarted: false, limit }
     await env.openai.adapter.onAttemptEnd!(attempt, outcome)
     await env.openai.adapter.onAttemptEnd!(attempt, outcome)
@@ -767,7 +800,16 @@ for (const scenario of [
               resets_at: 1_900_000_000_000,
             },
           ]
-        : [],
+        : [
+            {
+              account_id: 'account-a',
+              credential_id: 'credential-a',
+              kind: 'transient_backoff',
+              retry_at_ms: at + 5000,
+              provider_code:
+                'providerCode' in scenario ? scenario.providerCode : undefined,
+            },
+          ],
     )
   })
 }
@@ -949,12 +991,29 @@ test.each([
     code: undefined,
     delay: 2400,
   },
+  ...[429, 403].map((status) => ({
+    name: `host-only ${status}`,
+    status,
+    headers: undefined,
+    code: undefined,
+    delay: 5000,
+    hostOnly: true,
+    next: 'vault:b',
+  })),
   {
     name: 'exhausted: route',
     status: 429,
     headers: undefined,
     code: 'usage_limit_reached',
     next: 'vault:c',
+  },
+  {
+    name: 'exhausted: continue pick cannot be authorized',
+    status: 429,
+    headers: undefined,
+    code: 'usage_limit_reached',
+    next: 'vault:c',
+    refuseAuthorization: true,
   },
   {
     name: 'exhausted: refusal',
@@ -996,7 +1055,9 @@ test.each([
     const at = 1_900_000_000_000
     const events: unknown[] = []
     const hold = 'hold' in scenario ? scenario.hold : undefined
-    const stop = hold?.stop === true || scenario.next === null
+    const cannotAuthorize = 'refuseAuthorization' in scenario
+    const stop =
+      hold?.stop === true || scenario.next === null || cannotAuthorize
     Reflect.set(globalThis, key, () => ({
       accountFor: async (request: Record<string, unknown>) => {
         events.push(['ask', request])
@@ -1052,6 +1113,7 @@ test.each([
       identity: 'account-c',
       credentialId: 'credential-c',
     })
+    if (cannotAuthorize) env.refused.add('vault:c')
     const host = fakeOpenCode2Host()
     const installation = await installOpenCode2Auth(
       host.ctx,
@@ -1095,14 +1157,15 @@ test.each([
             },
           }
         : {}
-      await host.fire('http.response', {
-        ...requestScope,
-        request,
-        response: Response.json(payload, {
-          status: scenario.status,
-          headers: scenario.headers,
-        }),
-      })
+      if (!('hostOnly' in scenario))
+        await host.fire('http.response', {
+          ...requestScope,
+          request,
+          response: Response.json(payload, {
+            status: scenario.status,
+            headers: scenario.headers,
+          }),
+        })
       const retry = await host.fire('retry', {
         ...requestScope,
         attempt: 2,
@@ -1115,7 +1178,10 @@ test.each([
       })
       if (retry.decision.retry) await send()
       expect(retry.decision.retry).toBe(!stop)
-      if (stop)
+      if (cannotAuthorize) {
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('vault'))
+        expect(env.authorized).toEqual(['vault:b', 'vault:c'])
+      } else if (stop)
         expect(warn).toHaveBeenCalledWith(
           'Thalamus routing declined this request, so it was not sent.',
         )

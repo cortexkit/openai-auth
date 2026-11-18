@@ -138,7 +138,11 @@ import {
   vaultMainRouteId,
   waitForFirstQuotaReading,
 } from '../core/pool-routing'
-import { isNonEmittingFrame, parseRateLimitSignal } from '../ws'
+import {
+  isNonEmittingFrame,
+  parseRateLimitSignal,
+  RATE_LIMIT_WINDOW,
+} from '../ws'
 import {
   CODEX_CLIENT_HEADERS,
   type CodexHttpState,
@@ -520,6 +524,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     | undefined
   let routingLimitsHandled: WeakSet<Attempt<OpenAIAttemptData>> | undefined
   const routingFeedback = new WeakMap<LimitSignal, VaultRoutingFeedback>()
+  const routingWakes = new WeakMap<
+    object,
+    Pick<ClaustrumScopedAttempt, 'accountIdentity' | 'credentialId'>
+  >()
   const billing = new WeakMap<Attempt<OpenAIAttemptData>, VaultBillingAttempt>()
   const billingCounts = new Map<string, number>()
   const observeBillingModel = (
@@ -925,6 +933,17 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     // Vault mode: only the vault's accounts serve this host.
     const vaultMode = modeAuthority !== undefined && modeAuthority !== 'local'
     const routingEnabled = vaultMode && hasVaultRoutingAccessor()
+    const vaultRefusal = () =>
+      new OpenCode2AuthError({
+        kind: 'no-account',
+        providerID: OPENAI_PROVIDER_ID,
+        sessionID: input.sessionID,
+        requestKind: input.kind,
+        message: vaultModeRefusalText(
+          'vault-refused',
+          vault?.name ?? 'openai-auth-opencode',
+        ),
+      })
     const refuseMissingLogin = () => {
       throw new OpenCode2AuthError({
         kind: 'no-account',
@@ -955,6 +974,30 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     }
     let at = now()
     let targets = currentTargets(storage, at, vaultMode)
+    const checkpoint = input.wake?.checkpoint
+    const wake = checkpoint && routingWakes.get(checkpoint)
+    if (wake && checkpoint) {
+      routingWakes.delete(checkpoint)
+      const accountId = checkpoint.accountKey.accountId
+      const receipt =
+        vaultMode &&
+        targets.some((target) => target.id === accountId) &&
+        routingInput(targets, storage, at).killswitch.get(accountId) !==
+          false &&
+        (await vault?.authorize(accountId))
+      if (
+        !receipt ||
+        receipt.credentialId !== wake.credentialId ||
+        receipt.accountIdentity !== wake.accountIdentity
+      )
+        throw vaultRefusal()
+      receipts.set(receiptKey({ ...input, accountId }), {
+        receipt,
+        freeQuota: false,
+      })
+      if (ready) keepRequestHandoff(input, accountId, ready)
+      return accountId
+    }
     const firstReading = waitForFirstQuotaReading(
       routingInput(
         targets.filter((target) => target.id !== input.rerouteFrom?.accountId),
@@ -1024,14 +1067,42 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
       signal
     ) {
       const feedback = routingFeedback.get(signal)
-      const sameAccountHold = (delayMs: number): ChooseAccountResult =>
-        delayMs <= MAX_RETRY_HOLD_MS
-          ? { hold: { delayMs, kind: 'hold' } }
-          : { hostRetry: 'veto' }
+      const from = input.rerouteFrom.accountId
+      const sameAccountHold = (
+        delayMs: number,
+        receipt: Pick<
+          ClaustrumScopedAttempt,
+          'accountIdentity' | 'credentialId'
+        >,
+      ): ChooseAccountResult => {
+        // The host cannot schedule an ordinary hold past its one-hour limit.
+        // A veto is safer than retrying before the provider's backoff ends.
+        if (delayMs > MAX_RETRY_HOLD_MS) return { hostRetry: 'veto' }
+        const checkpoint = {
+          accountKey: limits?.accountKey(from) ?? {
+            namespace: 'vault',
+            accountId: from,
+            incarnation: receipt.credentialId,
+          },
+          decidedAt: now(),
+          blockers: [],
+        }
+        routingWakes.set(checkpoint, receipt)
+        return {
+          hold: {
+            delayMs,
+            target: checkpoint.decidedAt + delayMs,
+            checkpoint,
+            kind: 'hold',
+          },
+        }
+      }
       if (feedback?.kind === 'backoff')
-        return sameAccountHold(Math.max(0, feedback.retryAtMs - now()))
+        return sameAccountHold(
+          Math.max(0, feedback.retryAtMs - now()),
+          feedback,
+        )
       if (feedback?.kind === 'exhausted') {
-        const from = input.rerouteFrom.accountId
         const answer = await chooseVaultRouting({
           vaultMode,
           fresh: false,
@@ -1040,7 +1111,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
           request: { modelId: input.modelID, kind: input.kind },
           routes: vault?.routes() ?? [],
           routing,
-          wait: routingWait,
+          wait: { ...routingWait, accountKey: limits?.accountKey(from) },
           eligibleIds: targets
             .filter(
               (target) =>
@@ -1050,7 +1121,10 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         })
         if (typeof answer === 'string') continued = answer
         else if (answer && 'holdMs' in answer)
-          return sameAccountHold(answer.holdMs)
+          return sameAccountHold(answer.holdMs, {
+            credentialId: feedback.exhausted.credentialId,
+            accountIdentity: feedback.exhausted.accountId,
+          })
         else if (answer) {
           // The host has already read the provider response. A retry veto
           // prevents another send but cannot replace the host's error text.
@@ -1345,6 +1419,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
     let reservation: PinReservation | undefined
     let accountId: string | undefined
     let routingConsulted = false
+    let explicitPick: string | undefined
     const reserveAccount = (id: string) => {
       const checkedAt = admitSticky(routing).projections.get(id)?.checkedAt
       const identity = byId.get(id)?.identity
@@ -1493,11 +1568,15 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
                   stickyPins,
                   preferred,
                   admissionTiers,
-                ) ?? accountId
+                ) ?? preferred
               plannedPin = stickyPins.get(input.sessionID) ?? plannedPin
             } else accountId = preferred
             if (primary && mode === 'sticky-balanced')
               reservation = reserveAccount(accountId)
+          }
+          if (preferred) {
+            explicitPick = preferred
+            accountId = preferred
           }
         }
         const row = byId.get(accountId)?.row
@@ -1515,6 +1594,13 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
               freeQuota: admissionTiers?.get(accountId) === 'free',
             })
             break
+          }
+          if (explicitPick === accountId) {
+            const refusal = vaultRefusal()
+            if (input.phase !== 'retry') throw refusal
+            // OpenCode's retry veto has no message field; keep its provider error.
+            log?.warn(refusal.message)
+            return { hostRetry: 'veto' }
           }
           log?.debug('the vault refused to serve an account; choosing again', {
             accountId,
@@ -1568,6 +1654,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         const nextPin = plannedPin
         const commit = () => {
           if (heldReservation) pins.finish(heldReservation, nextPin)
+          // Only primary requests update the active account; auxiliary choices are per request.
           if (primary) {
             sessionAccounts.record(input.sessionID, chosenId)
             deps.onRoute?.(input.sessionID, chosenId, mode)
@@ -1691,14 +1778,20 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         )
           throw refuse()
         const owner = limits.owner()
-        const sample = binding
-          ? {
-              sessionId: request.sessionID,
-              accountKey: binding.account,
-              dispatchedAt: now(),
-              ttlMs: ttlForModel(JSON.stringify({ model: request.modelID })),
-            }
-          : undefined
+        const sample =
+          binding &&
+          !(
+            request.kind === 'title' &&
+            data.kind === 'vault' &&
+            hasVaultRoutingAccessor()
+          )
+            ? {
+                sessionId: request.sessionID,
+                accountKey: binding.account,
+                dispatchedAt: now(),
+                ttlMs: ttlForModel(JSON.stringify({ model: request.modelID })),
+              }
+            : undefined
         if (sample) {
           currentDispatch.delete(sample.sessionId)
           currentDispatch.set(sample.sessionId, sample)
@@ -2075,6 +2168,7 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
         attempt.accountId,
         attempt.data?.kind === 'vault',
       )
+      const routed = attempt.data?.kind === 'vault' && hasVaultRoutingAccessor()
       const limit =
         limitOfEvent(
           {
@@ -2091,7 +2185,42 @@ export function createOpenAIAdapter(deps: OpenAIAdapterDeps): OpenAIAdapter {
               error.status,
               reading,
             )
+          : undefined) ??
+        (routed && (error.status === 403 || error.status === 429)
+          ? toLimit(
+              { window: error.status === 403 ? 'http_403' : RATE_LIMIT_WINDOW },
+              at,
+              error.status,
+            )
           : undefined)
+      if (
+        attempt.data?.kind === 'vault' &&
+        routed &&
+        limit &&
+        (error.status === 429 || error.status === 403) &&
+        !routingLimitsHandled?.has(attempt) &&
+        !routingLimitBodies?.has(attempt)
+      ) {
+        // A refusal reported only as a host error may arrive after the attempt-end hook.
+        const feedback = reportVaultRouting(
+          attempt.sessionID,
+          attempt.data.receipt,
+          {
+            status: error.status,
+            headers: new Headers(),
+            body: parsed,
+            limit: { window: limit.reason, resetAt: limit.resetAt },
+            quota: vault
+              ?.routes()
+              .find((route) => route.id === attempt.accountId)?.quota,
+            now: at,
+            backoff: true,
+          },
+        )
+        if (feedback) routingFeedback.set(limit, feedback)
+        routingLimitsHandled ??= new WeakSet()
+        routingLimitsHandled.add(attempt)
+      }
       if (
         attempt.data?.kind === 'vault' &&
         hasVaultRoutingAccessor() &&

@@ -90,6 +90,12 @@ export interface StreamResponsesWebSocketOptions {
   idleTimeout?: number
   signal?: AbortSignal
   onFirstEvent?: (error?: WrappedError) => void
+  /** Present when the caller can route a pre-output refusal as an HTTP response. */
+  onRoutingLimit?: (
+    event: unknown,
+    limit: { window: string; resetAt?: number },
+    headers?: Record<string, string>,
+  ) => void
   /**
    * Fires on response.completed/response.done. `finalizedFunctionCallIds` is the
    * set of function/custom tool call ids the response actually finalized (emitted
@@ -574,6 +580,42 @@ export function streamResponsesWebSocket(
     // still a refusal of the whole response, and marking the account is what
     // makes the retry go to a different one.
     const shapeAtSignal = outputShape()
+    const beforeOutput =
+      shapeAtSignal === 'none' || shapeAtSignal === 'unfinished-calls'
+    const wrapped = parseWrappedError(event, text)
+    const routingLimit =
+      options.onRoutingLimit &&
+      event?.type === 'error' &&
+      (wrapped === undefined ||
+        wrapped.status === 403 ||
+        wrapped.status === 429)
+        ? (parseRateLimitSignal(event) ??
+          (wrapped?.status === 403 ? { window: 'http_403' } : undefined))
+        : undefined
+    if (routingLimit && beforeOutput) {
+      completed = true
+      cleanup()
+      options.onTerminal?.(event)
+      options.onFirstEvent?.({
+        status: wrapped?.status ?? 429,
+        headers: wrapped?.headers,
+        body: text,
+      })
+      controller?.close()
+      return
+    }
+    if (routingLimit) {
+      options.onRoutingLimit?.(event, routingLimit, wrapped?.headers)
+      if (!wrapped) {
+        // A statusless limit is useful feedback, not permission to replay shown output.
+        completed = true
+        cleanup()
+        options.onTerminal?.(event)
+        if (shapeAtSignal === 'finished-calls') closeWithSyntheticCompletion()
+        else closeCompleted()
+        return
+      }
+    }
     const admissionRateLimit =
       shapeAtSignal === 'none' || shapeAtSignal === 'unfinished-calls'
         ? parseRateLimitSignal(event)
@@ -622,9 +664,10 @@ export function streamResponsesWebSocket(
       }
     }
 
-    const wrappedError = parseWrappedError(event, text)
+    const wrappedError = wrapped
     if (wrappedError && event) {
-      if (!emitted) options.onFirstEvent?.(wrappedError)
+      if (options.onRoutingLimit ? beforeOutput : !emitted)
+        options.onFirstEvent?.(wrappedError)
       completed = true
       cleanup()
       options.onTerminal?.(event)
@@ -723,6 +766,14 @@ export function streamResponsesWebSocket(
         options.onRateLimitReached?.(label)
         options.onTerminal?.(event)
         const outcome = outputShape()
+        if (options.onRoutingLimit) {
+          if (outcome === 'none' || outcome === 'unfinished-calls') {
+            options.onFirstEvent?.({ status: 429, body: text })
+            controller?.close()
+            return
+          }
+          options.onRoutingLimit(event, { window: label })
+        }
         if (outcome !== 'none') {
           logT.warn(
             outcome === 'other'
@@ -772,13 +823,13 @@ export function streamResponsesWebSocket(
       // reroute for a later admission-time rate limit (the `!emitted` gate
       // above). onFirstEvent still fires so the idle timer and the pool's
       // first-event gate register the activity.
-      if (!emitted) options.onFirstEvent?.()
+      if (!emitted && !options.onRoutingLimit) options.onFirstEvent?.()
       resetIdleTimeout('idle timeout waiting for websocket')
       return
     }
     recordFinalizedFunctionCall(event, finalizedFunctionCallIds)
 
-    if (!emitted) options.onFirstEvent?.()
+    if (!emitted && !options.onRoutingLimit) options.onFirstEvent?.()
     controller?.enqueue(
       encoder.encode(
         `${text
@@ -817,6 +868,19 @@ export function streamResponsesWebSocket(
       emittedOutput = true
       recordEmittedCallFrame(event, emittedCalls)
     }
+    if (
+      options.onRoutingLimit &&
+      (outputShape() === 'other' ||
+        outputShape() === 'finished-calls' ||
+        [
+          'response.completed',
+          'response.done',
+          'response.failed',
+          'response.incomplete',
+          'error',
+        ].includes(event.type))
+    )
+      options.onFirstEvent?.()
     resetIdleTimeout('idle timeout waiting for websocket')
 
     if (event.type === 'response.completed' || event.type === 'response.done') {

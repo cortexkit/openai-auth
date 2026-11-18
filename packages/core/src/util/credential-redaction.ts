@@ -135,6 +135,65 @@ function redactDiagnosticBody(body: string, credential?: string): string {
 const diagnosticLimit = 16_384
 const responseBodyLimit = 64 * 1024
 
+export const INCOMPLETE_PROVIDER_REFUSAL = 'No diagnostic was received.'
+const incompleteRefusals = new WeakSet<Response>()
+const refusalReceiptTimes = new WeakMap<Response, number>()
+
+export function isIncompleteProviderRefusal(response: Response): boolean {
+  return incompleteRefusals.has(response)
+}
+
+export function providerRefusalReceivedAt(
+  response: Response,
+): number | undefined {
+  return refusalReceiptTimes.get(response)
+}
+
+/** Read up to 64 KiB in at most two seconds, even if the stream never closes. */
+export async function readBoundedRefusalBody(
+  body: ReadableStream<Uint8Array> | null,
+): Promise<
+  { complete: true; text: string } | { complete: false; text?: string }
+> {
+  if (!body) return { complete: true, text: '' }
+  const reader = body.getReader()
+  const buffer = new Uint8Array(responseBodyLimit)
+  const decoder = new TextDecoder()
+  const deadline = performance.now() + 2000
+  let size = 0
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const read = async () => {
+      while (performance.now() < deadline) {
+        const { done, value } = await reader.read()
+        if (done)
+          return {
+            complete: true as const,
+            text: decoder.decode(buffer.subarray(0, size)),
+          }
+        const used = Math.min(value.byteLength, buffer.byteLength - size)
+        buffer.set(value.subarray(0, used), size)
+        size += used
+        if (used < value.byteLength)
+          return { complete: false as const, text: decoder.decode(buffer) }
+      }
+      return { complete: false as const }
+    }
+    return await Promise.race([
+      read(),
+      new Promise<{ complete: false }>((resolve) => {
+        timer = setTimeout(() => resolve({ complete: false }), 2000)
+      }),
+    ])
+  } catch {
+    return { complete: false }
+  } finally {
+    clearTimeout(timer)
+    // One branch of a tee can wait for the other to finish before cancelling.
+    void reader.cancel().catch(() => {})
+  }
+}
+
 // OpenCode 1's session retry policy (session/retry.ts) matches these patterns
 // against an API error's responseBody and retries on a match, even when
 // isRetryable is false. A body cut down to the size limit must still contain
@@ -433,6 +492,7 @@ export async function redactCredentialResponse(
   response: Response,
   credential?: string,
   mode: 'event-stream' | 'http' = 'http',
+  options?: { boundRefusal?: boolean; receivedAt?: number },
 ): Promise<Response> {
   try {
     if (!safeObject(response)) throw new Error('Invalid provider response')
@@ -466,6 +526,19 @@ export async function redactCredentialResponse(
         }
       }
       init.headers.delete('content-length')
+      if (options?.boundRefusal && (status === 403 || status === 429)) {
+        const receivedAt = options.receivedAt ?? Date.now()
+        const body = await readBoundedRefusalBody(bodyStream)
+        const safe = new Response(
+          body.text === undefined
+            ? INCOMPLETE_PROVIDER_REFUSAL
+            : redactDiagnosticBody(body.text, credential),
+          init,
+        )
+        if (!body.complete) incompleteRefusals.add(safe)
+        refusalReceiptTimes.set(safe, receivedAt)
+        return safe
+      }
       const body = await responseText.call(response)
       // Scan lexical strings even in malformed JSON or HTTP bodies containing SSE.
       return new Response(redactDiagnosticBody(body, credential), init)

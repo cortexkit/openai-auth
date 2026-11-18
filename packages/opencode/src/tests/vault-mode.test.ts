@@ -634,6 +634,252 @@ describe('the request path in vault mode', () => {
     },
   )
 
+  const healthyRoutes = (): Array<
+    ReturnType<PoolVaultRoutes['routes']>[number]
+  > =>
+    ['a', 'b'].map((id) => ({
+      id: `vault:${id}`,
+      identity: `account-${id}`,
+      credentialId: `credential-${id}`,
+      kind: 'oauth' as const,
+      quota: quotaMap(10),
+    }))
+
+  function withRouting(handle: object): () => void {
+    const key = Symbol.for('cortexkit.routing')
+    const before = Object.getOwnPropertyDescriptor(globalThis, key)
+    Reflect.set(globalThis, key, () => handle)
+    return () => {
+      if (before) Object.defineProperty(globalThis, key, before)
+      else Reflect.deleteProperty(globalThis, key)
+    }
+  }
+
+  it('OC1 an exhausted wake offers live alternatives and excludes exhausted last-path rows', async () => {
+    const asks: Array<{ mode?: string; candidates: { accounts: unknown[] } }> =
+      []
+    const restore = withRouting({
+      accountFor: async (ask: (typeof asks)[number]) => {
+        asks.push(ask)
+        return {
+          account_id: ask.mode === 'continue' ? 'account-b' : 'account-a',
+        }
+      },
+    })
+    const routes = healthyRoutes()
+    routes.push({
+      ...routes[1]!,
+      id: 'vault:c',
+      identity: 'account-c',
+      credentialId: 'credential-c',
+      quota: quotaMap(100),
+    })
+    let now = Date.now()
+    const sent: string[] = []
+    const ctx: Partial<PoolRequestContext> = {
+      now: () => now,
+      sessionId: 'wake',
+      body: '{"model":"gpt-6","input":"turn"}',
+      routingRequest: { modelId: 'gpt-6', kind: 'primary' },
+      vaultRetries: new Map(),
+      send: async ({ id }) => {
+        sent.push(id)
+        if (sent.length === 1)
+          return new Response('rate limited', { status: 429 })
+        if (sent.length === 2)
+          return Response.json(
+            { error: { code: 'usage_limit_reached', window: '5h' } },
+            { status: 429 },
+          )
+        return new Response('ok')
+      },
+    }
+    try {
+      const vault = vaultWith(routes)
+      expect(
+        (await serve(vault, null, 'ordered', 200, ctx)).result.response.status,
+      ).toBe(429)
+      now += 5000
+      expect(
+        (await serve(vault, null, 'ordered', 200, ctx)).result.servedId,
+      ).toBe('vault:b')
+      expect(sent).toEqual(['vault:a', 'vault:a', 'vault:b'])
+      expect(asks[1]?.candidates.accounts).toEqual([
+        { account_id: 'account-b', credential_id: 'credential-b' },
+        { account_id: 'account-a', credential_id: 'credential-a' },
+      ])
+    } finally {
+      restore()
+    }
+  })
+
+  it.each(
+    (['ordered', 'sticky-balanced'] as const).flatMap((mode) =>
+      (['place', 'continue'] as const).map((phase) => ({ mode, phase })),
+    ),
+  )(
+    'OC1 $mode stops if a $phase pick cannot be authorized',
+    async ({ mode, phase }) => {
+      const restore = withRouting({
+        accountFor: async (ask: { mode?: string }) => ({
+          account_id:
+            phase === 'continue' && ask.mode !== 'continue'
+              ? 'account-a'
+              : 'account-b',
+        }),
+      })
+      const vault = vaultWith(healthyRoutes())
+      const attempted: string[] = []
+      const authorize = vault.send
+      vault.send = async (id, dispatch) => {
+        attempted.push(id)
+        return id !== 'vault:b' ? authorize(id, dispatch) : undefined
+      }
+      const pins = new Map()
+      const sent: string[] = []
+      try {
+        const { result, causes } = await serve(vault, null, mode, 200, {
+          sessionId: 'final-pick',
+          routingRequest: { modelId: 'gpt-6', kind: 'primary' },
+          placePin: (input) =>
+            placeStickyPin(pins, input, (id, pin) => pins.set(id, pin)),
+          send: async ({ id }) => {
+            sent.push(id)
+            return Response.json(
+              { error: { code: 'usage_limit_reached', window: '5h' } },
+              { status: 429 },
+            )
+          },
+        })
+        expect(result.response.status).toBe(401)
+        expect(causes).toEqual(['vault-refused'])
+        expect(attempted).toEqual(
+          phase === 'continue' ? ['vault:a', 'vault:b'] : ['vault:b'],
+        )
+        expect(sent).toEqual(phase === 'continue' ? ['vault:a'] : [])
+      } finally {
+        restore()
+      }
+    },
+  )
+
+  it('OC1 a sticky placement does not replace an explicit routing pick with a credits account', async () => {
+    const restore = withRouting({
+      accountFor: async () => ({ account_id: 'account-a' }),
+    })
+    const routes = healthyRoutes()
+    routes[0]!.quota = quotaMap(100)
+    routes[1]!.quota = {
+      ...quotaMap(100),
+      credits: {
+        hasCredits: true,
+        unlimited: false,
+        balance: 50,
+        checkedAt: Date.now(),
+      },
+    }
+    const pins = new Map()
+    try {
+      const { result, sent } = await serve(
+        vaultWith(routes),
+        null,
+        'sticky-balanced',
+        200,
+        {
+          sessionId: 'credits-detour',
+          routingRequest: { modelId: 'gpt-6', kind: 'primary' },
+          placePin: (input) =>
+            placeStickyPin(pins, input, (id, pin) => pins.set(id, pin)),
+        },
+      )
+      expect(result.servedId).toBe('vault:a')
+      expect(sent).toEqual(['vault:a:vault-token-vault:a'])
+    } finally {
+      restore()
+    }
+  })
+
+  it.each([
+    'another input',
+    'another model',
+    'expired',
+    'different receipt',
+  ] as const)(
+    'OC1 pending retry is bound to the request and login: %s',
+    async (scenario) => {
+      let pick = 'account-a'
+      const restore = withRouting({
+        accountFor: async () => ({ account_id: pick }),
+      })
+      const routes = healthyRoutes()
+      const vault = vaultWith(routes)
+      let now = Date.now()
+      const hold = new Map()
+      const attempt: Partial<PoolRequestContext> = {
+        sessionId: 'retry-identity',
+        now: () => now,
+        vaultRetries: hold,
+        body: '{"model":"gpt-6","input":"original"}',
+        routingRequest: { modelId: 'gpt-6', kind: 'primary' },
+        send: async () =>
+          new Response(null, { status: 429, headers: { 'retry-after': '5' } }),
+      }
+      try {
+        expect(
+          (await serve(vault, null, 'ordered', 429, attempt)).result.response
+            .status,
+        ).toBe(429)
+        expect(hold.size).toBe(1)
+        const send = mock(async () => new Response('ok'))
+        if (scenario === 'expired') {
+          now += 65_000
+          pick = 'account-b'
+        }
+        if (scenario === 'different receipt') {
+          now += 5000
+          const originalSend = vault.send
+          vault.send = (id, dispatch) =>
+            originalSend(id, (token, receipt) =>
+              dispatch(token, { ...receipt, accountIdentity: 'new-login' }),
+            )
+        }
+        const { result, causes } = await serve(vault, null, 'ordered', 200, {
+          ...attempt,
+          send,
+          ...(scenario === 'another input'
+            ? { body: '{"model":"gpt-6","input":"new turn"}' }
+            : {}),
+          ...(scenario === 'another model'
+            ? {
+                body: '{"model":"gpt-7","input":"original"}',
+                routingRequest: { modelId: 'gpt-7', kind: 'primary' },
+              }
+            : {}),
+        })
+        if (scenario === 'different receipt') {
+          expect(causes).toEqual(['vault-refused'])
+          expect(send).not.toHaveBeenCalled()
+        } else {
+          expect(await result.response.text()).toBe('ok')
+          expect(send).toHaveBeenCalledTimes(1)
+          if (scenario !== 'expired') {
+            expect(hold.size).toBe(1)
+            expect(
+              (await serve(vault, null, 'ordered', 200, { ...attempt, send }))
+                .result.response.status,
+            ).toBe(429)
+            expect(send).toHaveBeenCalledTimes(1)
+          } else {
+            expect(result.servedId).toBe('vault:b')
+            expect(hold.size).toBe(0)
+          }
+        }
+      } finally {
+        restore()
+      }
+    },
+  )
+
   for (const scenario of [
     {
       name: '2xx',

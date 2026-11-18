@@ -63,6 +63,7 @@ import {
   refreshAllQuota,
   refreshBackoffActive,
   reportSessionCacheResponse,
+  reportVaultRouting,
   resolveMidStreamRateLimitResetAt,
   type SessionDispatch,
   shouldCaptureSessionCache,
@@ -174,11 +175,13 @@ import { observationFromSnapshot, windowsFromQuotaMap } from './core/pool-quota'
 import {
   isVaultModeRefusal,
   LOCAL_CREDENTIAL_REFUSALS,
+  localPoolResponse,
   type PendingPoolHold,
   type PendingVaultRetry,
   type PoolBlockQuotas,
   type PoolPinPlacement,
   servePoolRequest,
+  trackPoolResponseFailure,
 } from './core/pool-request'
 import {
   CreditsServing,
@@ -2727,7 +2730,9 @@ export async function CodexAuthPlugin(
                     ),
                     { status: 401 },
                   )
-                : killswitchBlockedResponse(null, 'quota-unknown')
+                : localPoolResponse(
+                    killswitchBlockedResponse(null, 'quota-unknown'),
+                  )
             const check = () =>
               limitsRequest.beforeDispatch(
                 binding,
@@ -2748,7 +2753,9 @@ export async function CodexAuthPlugin(
                     ),
                     { status: 401 },
                   )
-                : killswitchBlockedResponse(null, 'quota-unknown')
+                : localPoolResponse(
+                    killswitchBlockedResponse(null, 'quota-unknown'),
+                  )
             }
           }
           const owner = pooled ? limits.owner() : undefined
@@ -2825,6 +2832,9 @@ export async function CodexAuthPlugin(
               response,
               keepwarmCapture && agent ? sessionID : undefined,
             )
+          const boundRefusal = Boolean(
+            pooled && vaultReceipt && sessionID && hasVaultRoutingAccessor(),
+          )
           if (keepwarmEnabled) {
             cacheKeepLogger.trace('cachekeep headers', {
               pid: process.pid,
@@ -2861,16 +2871,36 @@ export async function CodexAuthPlugin(
             scopedHeaders.set(OpenAIWebSocketPool.QUOTA_ACCOUNT_HEADER, key)
             const release = () => streams.delete(key)
             try {
-              const response = await websocketFetch(url, {
-                ...requestInit,
-                headers: scopedHeaders,
-              })
+              const observeRouting =
+                pooled && vaultReceipt && sessionID && hasVaultRoutingAccessor()
+              const response = await websocketFetch(
+                url,
+                {
+                  ...requestInit,
+                  headers: scopedHeaders,
+                },
+                observeRouting
+                  ? (body, limit, headers) => {
+                      stream.limited = true
+                      reportVaultRouting(sessionID, vaultReceipt, {
+                        status: 429,
+                        headers: new Headers(headers),
+                        body,
+                        limit,
+                        quota: vault
+                          .routes()
+                          .find((route) => route.id === keepwarmAccountKey)
+                          ?.quota,
+                      })
+                    }
+                  : undefined,
+              )
               if (!response.body) {
                 release()
                 return reportResponse(response)
               }
               const reader = response.body.getReader()
-              return reportResponse(
+              const reported = reportResponse(
                 await redactCredentialResponse(
                   new Response(
                     new ReadableStream<Uint8Array>({
@@ -2901,8 +2931,12 @@ export async function CodexAuthPlugin(
                   ),
                   accessToken,
                   'event-stream',
+                  { boundRefusal },
                 ),
               )
+              return observeRouting
+                ? trackPoolResponseFailure(reported, () => stream.limited)
+                : reported
             } catch (error) {
               release()
               throw redactCredentialError(error, accessToken)
@@ -2916,6 +2950,7 @@ export async function CodexAuthPlugin(
                 await fetch(url, finalInit),
                 accessToken,
                 'event-stream',
+                { boundRefusal },
               )
             } catch (error) {
               throw redactCredentialError(error, accessToken)
@@ -2944,6 +2979,7 @@ export async function CodexAuthPlugin(
           })
           try {
             const response = await fetch(url, finalInit)
+            const receivedAt = boundRefusal ? Date.now() : undefined
             await dumpCodexRequest({
               sessionID,
               transport: 'http',
@@ -2962,6 +2998,7 @@ export async function CodexAuthPlugin(
                 }),
                 accessToken,
                 'event-stream',
+                { boundRefusal, receivedAt },
               ),
             )
           } catch (error) {

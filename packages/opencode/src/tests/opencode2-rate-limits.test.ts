@@ -234,6 +234,7 @@ function fakeVault(ids: string[], rosterPath: string) {
     routes: () =>
       ids.map((id) => ({
         id,
+        credentialId: id,
         kind: 'oauth',
         identity: `chatgpt-${id}`,
         quota: quotaMap(10),
@@ -395,26 +396,27 @@ async function cleanSend(
   host: Host,
   sessionID: string,
   transport: 'http' | 'ws',
+  kind: Parameters<typeof scope>[1] = 'primary',
 ) {
   await host.fire('model.request', {
-    ...scope(sessionID),
+    ...scope(sessionID, kind),
     headers: { authorization: `Bearer ${PLACEHOLDER}` },
   })
   if (transport === 'ws') {
     const handshake = {
-      ...scope(sessionID),
+      ...scope(sessionID, kind),
       url: 'ws://codex.test/v1/responses',
       headers: { authorization: `Bearer ${PLACEHOLDER}` },
     }
     await host.fire('experimental.ws.handshake', handshake)
     await host.fire('experimental.ws.receive', {
-      ...scope(sessionID),
+      ...scope(sessionID, kind),
       frame: '{"type":"response.completed"}',
     })
     return handshake.headers.authorization
   }
   const draft = {
-    ...scope(sessionID),
+    ...scope(sessionID, kind),
     request: new Request('http://codex.test/v1/responses', {
       method: 'POST',
       headers: { authorization: `Bearer ${PLACEHOLDER}` },
@@ -423,7 +425,7 @@ async function cleanSend(
   }
   await host.fire('http.request', draft)
   const response = {
-    ...scope(sessionID),
+    ...scope(sessionID, kind),
     request: draft.request,
     response: new Response('sentinel'),
   }
@@ -440,6 +442,102 @@ function freezeClock() {
     time = value
   }
 }
+
+function routingAccessor(
+  accountFor: (ask: Record<string, unknown>) => unknown,
+) {
+  const key = Symbol.for('cortexkit.routing')
+  const before = Object.getOwnPropertyDescriptor(globalThis, key)
+  Reflect.set(globalThis, key, () => ({
+    accountFor: async (ask: Record<string, unknown>) => accountFor(ask),
+  }))
+  cleanups.push(() => {
+    if (before) Object.defineProperty(globalThis, key, before)
+    else Reflect.deleteProperty(globalThis, key)
+  })
+}
+
+const provedRefusal = {
+  error: { type: 'usage_limit_reached', window: '5h', resets_in_seconds: 600 },
+}
+
+function judgeRetry(host: Host, sessionID: string) {
+  return host.fire('retry', {
+    ...scope(sessionID),
+    attempt: 2,
+    decision: { retry: true, delay: 1234 },
+    error: { type: 'api', status: 429, message: JSON.stringify(provedRefusal) },
+  })
+}
+
+it('OC2 a bound routing hold wakes on the account even while the real registry marks it', async () => {
+  const clock = freezeClock()
+  routingAccessor((ask) =>
+    ask.mode === 'continue'
+      ? { account_id: 'chatgpt-a', hold: { retry_after_ms: 2000 } }
+      : { account_id: 'chatgpt-a' },
+  )
+  const f = await registryLocation('vault')
+  const choose = spyOn(f.openai.adapter, 'chooseAccount')
+  const sessionID = 'marked-wake'
+  await cleanSend(f.host, sessionID, 'http')
+  expect(f.limits.activity.get(sessionID)?.accountKey.accountId).toBe('a')
+  expect(await send(f.host, sessionID, provedRefusal)).toBe('Bearer token-a')
+  expect((await judgeRetry(f.host, sessionID)).decision).toEqual({
+    retry: true,
+    delay: 2000,
+  })
+  expect(f.limits.marks().get('a')).toBeGreaterThan(T0 + 2000)
+  clock(T0 + 2000)
+  expect(await send(f.host, sessionID)).toBe('Bearer token-a')
+  expect(
+    choose.mock.calls.some(
+      ([input]) => input.wake?.checkpoint?.accountKey.accountId === 'a',
+    ),
+  ).toBe(true)
+})
+
+it('OC2 a warm cache on A does not fund an exhausted B hold', async () => {
+  freezeClock()
+  const caps: unknown[] = []
+  routingAccessor((ask) => {
+    if (ask.mode !== 'continue') return { account_id: 'chatgpt-b' }
+    caps.push(ask.hold_wait_max_s)
+    return { account_id: 'chatgpt-b', hold: { retry_after_ms: 2000 } }
+  })
+  const f = await registryLocation('vault')
+  const sessionID = 'warm-other'
+  await f.limits.forRequest()
+  const accountKey = f.limits.accountKey('a')!
+  f.limits.activity.recordAccepted({
+    sessionId: sessionID,
+    accountKey,
+    currentAccountKey: accountKey,
+    lastAcceptedAt: T0,
+    ttlMs: 60_000,
+  })
+  expect(await send(f.host, sessionID, provedRefusal)).toBe('Bearer token-b')
+  const retry = await judgeRetry(f.host, sessionID)
+  expect(caps).toEqual([0])
+  expect(retry.decision.retry).toBe(false)
+})
+
+it('OC2 a routed title does not seed or replace session cache activity', async () => {
+  const clock = freezeClock()
+  routingAccessor(() => ({ account_id: 'chatgpt-b' }))
+  const f = await registryLocation('vault')
+  const sessionID = 'title-cache'
+  expect(await cleanSend(f.host, sessionID, 'http', 'title')).toBe(
+    'Bearer token-b',
+  )
+  expect(f.limits.activity.get(sessionID)).toBeUndefined()
+  await cleanSend(f.host, sessionID, 'http')
+  const activity = f.limits.activity.get(sessionID)
+  expect(activity?.lastAcceptedAt).toBe(T0)
+  clock(T0 + 1000)
+  await cleanSend(f.host, sessionID, 'http', 'title')
+  expect(f.limits.activity.get(sessionID)).toEqual(activity)
+})
 
 describe('OC2 policy facts and numeric-only Retry-After', () => {
   it('relative reset uses one parser sample under an advancing clock', async () => {

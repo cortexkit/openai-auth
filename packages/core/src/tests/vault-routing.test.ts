@@ -299,6 +299,41 @@ test('a continue hold beyond the remaining cache lifetime is refused', async () 
   ).toEqual({ refused: { code: 'account_selection_refused' } })
 })
 
+test('a continue asks with the held route but does not offer confirmed exhausted alternatives', async () => {
+  const request = input()
+  request.routing.rows[1]!.quota.limits[0]!.usedPercent = 100
+  Object.assign(request.routing.rows[1]!.quota.limits[0]!, {
+    resetsAt: new Date(request.routing.now + 60000).toISOString(),
+  })
+  const accountFor = mock(async (_ask: unknown) => ({
+    account_id: 'account-b',
+  }))
+  Reflect.set(globalThis, key, () => ({ accountFor }))
+  expect(
+    await chooseVaultRouting({
+      ...request,
+      eligibleIds: ['route-b'],
+      continuation: {
+        previousId: 'route-a',
+        exhausted: {
+          accountId: 'account-a',
+          credentialId: 'credential-a',
+          limitWindow: 'five_hour',
+          observedAtMs: request.routing.now,
+        },
+      },
+    }),
+  ).toBeUndefined()
+  expect(accountFor).toHaveBeenCalledWith(
+    expect.objectContaining({
+      candidates: expect.objectContaining({
+        accounts: [{ account_id: 'account-a', credential_id: 'credential-a' }],
+      }),
+    }),
+    expect.anything(),
+  )
+})
+
 test.each([
   'account_limit_exhausted',
   'account_selection_refused',
@@ -901,6 +936,67 @@ test.each([403, 429])(
     expect(reports).toEqual([])
     expect(observed).toBe(response)
     expect(await observed.text()).toBe(body)
+  },
+)
+
+test.each(['never ends', 'exceeds 64 KiB'])(
+  'a refusal body that %s cannot delay routing or prove exhaustion',
+  async (scenario) => {
+    const reports = captureReports()
+    const now = 1_900_000_000_000
+    const body =
+      scenario === 'never ends'
+        ? new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                new TextEncoder().encode(
+                  '{"error":{"code":"usage_limit_reached","window":"5h"}}',
+                ),
+              )
+            },
+          })
+        : JSON.stringify({
+            error: {
+              code: 'usage_limit_reached',
+              window: '5h',
+              message: 'x'.repeat(65536),
+            },
+          })
+    const response = new Response(body, {
+      status: 429,
+      headers: { 'retry-after': '9' },
+    })
+    const onRefusal = mock((_classified: Promise<unknown>) => {})
+    observeVaultRoutingResponse('session', receipt, response, {
+      parseLimit: () => undefined,
+      now: () => now,
+      onRefusal,
+    })
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      const result = await Promise.race([
+        onRefusal.mock.calls[0]?.[0],
+        new Promise((resolve) => {
+          timeout = setTimeout(() => resolve('still waiting'), 2500)
+        }),
+      ])
+      expect(result).toEqual({
+        kind: 'backoff',
+        retryAtMs: now + 9000,
+        credentialId: receipt.credentialId,
+        accountIdentity: receipt.accountIdentity,
+      })
+      expect(reports).toEqual([
+        expect.objectContaining({
+          kind: 'transient_backoff',
+          retry_at_ms: now + 9000,
+          provider_code: 'http_429',
+        }),
+      ])
+    } finally {
+      clearTimeout(timeout)
+      void response.body?.cancel().catch(() => {})
+    }
   },
 )
 
