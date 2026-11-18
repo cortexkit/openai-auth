@@ -151,7 +151,7 @@ test('Pi 1.4.0 startup swaps the enrolled slot before auth resolution and the fi
       join(piAgentDir, 'settings.json'),
       JSON.stringify({
         defaultProvider: 'openai-codex',
-        defaultModel: 'gpt-5.4',
+        defaultModel: 'gpt-6.1-sol',
       }),
     )
     mkdirSync(join(piAgentDir, 'extensions'))
@@ -257,10 +257,10 @@ export default async function(pi) {
     await runtime?.vault.pollStale(0)
     const models = session.modelRuntime
     const model = (await models.getAvailable('openai-codex')).find(
-      (entry) => entry.id === 'gpt-5.4',
+      (entry) => entry.id === 'gpt-6.1-sol',
     )
     expect(model).toBeDefined()
-    if (!model) throw new Error('Pi did not offer openai-codex/gpt-5.4')
+    if (!model) throw new Error('Pi did not offer openai-codex/gpt-6.1-sol')
     const result = await models
       .streamSimple(
         model,

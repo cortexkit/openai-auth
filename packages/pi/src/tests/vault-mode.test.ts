@@ -991,8 +991,8 @@ describe("Pi's real model runtime in vault mode", () => {
       expect(
         available.every((model) => model.provider === 'openai-codex'),
       ).toBe(true)
-      const model = available.find((entry) => entry.id === 'gpt-5.4')
-      if (!model) throw new Error('openai-codex offers no gpt-5.4')
+      const model = available.find((entry) => entry.id === 'gpt-6.1-sol')
+      if (!model) throw new Error('openai-codex offers no gpt-6.1-sol')
 
       const result = await models
         .streamSimple(model, CONTEXT, {
