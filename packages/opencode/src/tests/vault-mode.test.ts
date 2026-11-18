@@ -461,6 +461,19 @@ describe('the request path in vault mode', () => {
       code: 'usage_limit_reached',
       next: 'vault:b',
     },
+    ...[
+      { name: 'within cap', cap: 3, holdMs: 2000, stop: false },
+      { name: 'over cap', cap: 3, holdMs: 4000, stop: true },
+      { name: 'zero cap', cap: 0, holdMs: 2000, stop: true },
+    ].map((hold) => ({
+      name: `exhausted: routing hold ${hold.name}`,
+      status: 429,
+      headers: undefined,
+      code: 'usage_limit_reached',
+      next: 'vault:b',
+      delay: hold.holdMs,
+      hold,
+    })),
   ])(
     'OpenCode 1 ordered $name reports before moving or retrying',
     async (scenario) => {
@@ -470,10 +483,17 @@ describe('the request path in vault mode', () => {
       let now = at
       const events: unknown[] = []
       let sent = 0
+      const hold = 'hold' in scenario ? scenario.hold : undefined
+      const stop = hold?.stop === true || scenario.next === null
       Reflect.set(globalThis, key, () => ({
         accountFor: async (request: Record<string, unknown>) => {
           events.push(['ask', request])
           if (request.mode !== 'continue') return { account_id: 'account-b' }
+          if (hold)
+            return {
+              account_id: 'account-b',
+              hold: { retry_after_ms: hold.holdMs },
+            }
           if (scenario.next === null)
             return {
               refused: {
@@ -499,10 +519,31 @@ describe('the request path in vault mode', () => {
       }))
       const exhausted = scenario.code === 'usage_limit_reached'
       const vault = vaultWith(routes)
+      const accountKey = {
+        namespace: 'vault',
+        accountId: 'vault:b',
+        incarnation: '1',
+      }
       const overrides: Partial<PoolRequestContext> = {
         sessionId: 'retry-session',
         routingRequest: { modelId: 'gpt-6', kind: 'primary' },
         vaultRetries: new Map(),
+        ...(hold
+          ? {
+              limitPolicy: {
+                pending: new Map(),
+                accountKey: (id) =>
+                  id === accountKey.accountId ? accountKey : undefined,
+                activity: () => ({
+                  accountKey,
+                  lastAcceptedAt: at,
+                  ttlMs: hold.cap * 1000,
+                }),
+                currentAccountKey: () => (sent > 0 ? accountKey : undefined),
+                owner: () => undefined,
+              },
+            }
+          : {}),
         now: () => now,
         send: async ({ id }) => {
           const first = sent++ === 0
@@ -526,7 +567,7 @@ describe('the request path in vault mode', () => {
       try {
         const run = () =>
           serve(vault, null, 'ordered', scenario.status, overrides)
-        if (scenario.next === null) {
+        if (stop) {
           await expect(run()).rejects.toThrow(
             'Thalamus routing declined this request, so it was not sent.',
           )
@@ -561,6 +602,7 @@ describe('the request path in vault mode', () => {
                   expect.objectContaining({
                     mode: 'continue',
                     request_id: expect.any(String),
+                    ...(hold ? { hold_wait_max_s: hold.cap } : {}),
                     exhausted: expect.objectContaining({
                       account: 'account-b',
                       credential_id: 'credential-b',
@@ -583,9 +625,7 @@ describe('the request path in vault mode', () => {
                   },
                 ],
               ]),
-          ...(scenario.next === null
-            ? []
-            : [['send', scenario.next ?? 'vault:b']]),
+          ...(stop ? [] : [['send', scenario.next ?? 'vault:b']]),
         ])
       } finally {
         if (previous === undefined) Reflect.deleteProperty(globalThis, key)

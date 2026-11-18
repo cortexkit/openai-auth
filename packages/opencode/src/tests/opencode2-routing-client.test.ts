@@ -1,5 +1,6 @@
 import { afterEach, expect, mock, spyOn, test } from 'bun:test'
 import type { ClaustrumScopedAttempt } from '@cortexkit/common-auth/claustrum'
+import { createSessionActivityStore } from '@cortexkit/common-auth/limits'
 import {
   type Attempt,
   type ChooseAccountInput,
@@ -11,8 +12,10 @@ import type { QuotaMap } from '@cortexkit/common-auth/quota'
 import * as routingClient from '@cortexkit/common-auth/routing-accessor'
 import type { PoolRow } from '@cortexkit/common-auth/store'
 import type { AccountStorage } from '@cortexkit/openai-auth-core/internal'
+import type { OpenCodeLimitSource } from '../core/limit-source'
 import {
   createOpenAIAdapter,
+  type OpenAIAdapterDeps,
   type OpenAIAttemptData,
   type PoolAccess,
 } from '../v2/adapter'
@@ -45,6 +48,7 @@ function fixture(
   vaultMode = true,
   mode: 'ordered' | 'sticky-balanced' = 'ordered',
   now: () => number = Date.now,
+  deps: Pick<OpenAIAdapterDeps, 'limits' | 'log'> = {},
 ) {
   const rows: PoolRow[] = [
     {
@@ -90,6 +94,7 @@ function fixture(
     routing: { mode },
   }
   const openai = createOpenAIAdapter({
+    ...deps,
     now,
     source,
     storage: async () => storage,
@@ -972,15 +977,35 @@ test.each([
     code: 'usage_limit_reached',
     next: 'vault:b',
   },
+  ...[
+    { name: 'within cap', cap: 3, holdMs: 2000, stop: false },
+    { name: 'over cap', cap: 3, holdMs: 4000, stop: true },
+    { name: 'zero cap', cap: 0, holdMs: 2000, stop: true },
+  ].map((hold) => ({
+    name: `exhausted: routing hold ${hold.name}`,
+    status: 429,
+    headers: undefined,
+    code: 'usage_limit_reached',
+    next: 'vault:b',
+    delay: hold.holdMs,
+    hold,
+  })),
 ])(
   'OpenCode 2 routed HTTP $name uses the retry hook before another send',
   async (scenario) => {
     const at = 1_900_000_000_000
     const events: unknown[] = []
+    const hold = 'hold' in scenario ? scenario.hold : undefined
+    const stop = hold?.stop === true || scenario.next === null
     Reflect.set(globalThis, key, () => ({
       accountFor: async (request: Record<string, unknown>) => {
         events.push(['ask', request])
         if (request.mode !== 'continue') return { account_id: 'account-b' }
+        if (hold)
+          return {
+            account_id: 'account-b',
+            hold: { retry_after_ms: hold.holdMs },
+          }
         if (scenario.next === null)
           return {
             refused: {
@@ -1001,7 +1026,26 @@ test.each([
         return new Promise(() => {})
       },
     }))
-    const env = fixture(true, 'ordered', () => at)
+    const warn = mock((_message: string) => {})
+    const accountKey = {
+      namespace: 'vault',
+      accountId: 'vault:b',
+      incarnation: '1',
+    }
+    const activity = createSessionActivityStore()
+    const limits = {
+      activity,
+      bindings: () => [],
+      accountKey: (id: string) =>
+        id === accountKey.accountId ? accountKey : undefined,
+      marks: () => new Map(),
+      owner: () => undefined,
+      forRequest: async () => undefined,
+    } as unknown as OpenCodeLimitSource
+    const env = fixture(true, 'ordered', () => at, {
+      limits: hold ? limits : undefined,
+      log: { debug: () => {}, warn },
+    })
     env.routes.push({
       ...env.routes[0]!,
       id: 'vault:c',
@@ -1034,6 +1078,14 @@ test.each([
     }
     try {
       const request = await send()
+      if (hold)
+        activity.recordAccepted({
+          sessionId: requestScope.sessionID,
+          accountKey,
+          currentAccountKey: accountKey,
+          lastAcceptedAt: at,
+          ttlMs: hold.cap * 1000,
+        })
       const exhausted = scenario.code === 'usage_limit_reached'
       const payload = scenario.code
         ? {
@@ -1062,9 +1114,12 @@ test.each([
         },
       })
       if (retry.decision.retry) await send()
-      expect(retry.decision.retry).toBe(scenario.next !== null)
-      if (scenario.next !== null)
-        expect(retry.decision.delay).toBe(scenario.delay ?? 0)
+      expect(retry.decision.retry).toBe(!stop)
+      if (stop)
+        expect(warn).toHaveBeenCalledWith(
+          'Thalamus routing declined this request, so it was not sent.',
+        )
+      else expect(retry.decision.delay).toBe(scenario.delay ?? 0)
       expect(events).toEqual([
         ['ask', expect.not.objectContaining({ mode: 'continue' })],
         ['send', 'Bearer vault:b-token'],
@@ -1085,6 +1140,7 @@ test.each([
                 expect.objectContaining({
                   mode: 'continue',
                   request_id: expect.any(String),
+                  ...(hold ? { hold_wait_max_s: hold.cap } : {}),
                   exhausted: expect.objectContaining({
                     account: 'account-b',
                     credential_id: 'credential-b',
@@ -1115,7 +1171,7 @@ test.each([
                 },
               ],
             ]),
-        ...(scenario.next === null
+        ...(stop
           ? []
           : [['send', `Bearer ${scenario.next ?? 'vault:b'}-token`]]),
       ])

@@ -1,4 +1,4 @@
-import { afterEach, expect, spyOn, test } from 'bun:test'
+import { afterEach, expect, mock, spyOn, test } from 'bun:test'
 import type { QuotaReceipt } from '@cortexkit/common-auth/claustrum'
 import * as routingClient from '@cortexkit/common-auth/routing-accessor'
 import {
@@ -258,7 +258,7 @@ test.each([
   },
 )
 
-test('a continue hold names the exhausted account and stays within the ordinary wait cap', async () => {
+test('a continue hold beyond the remaining cache lifetime is refused', async () => {
   const request = input()
   const accountKey = {
     namespace: 'vault',
@@ -296,7 +296,7 @@ test('a continue hold names the exhausted account and stays within the ordinary 
         maxSameAccountWait: 'max',
       },
     }),
-  ).toEqual({ holdMs: 60_000 })
+  ).toEqual({ refused: { code: 'account_selection_refused' } })
 })
 
 test.each([
@@ -872,6 +872,35 @@ test.each([{ status: 200 }, { status: 429 }])(
       report.mockRestore()
       clone.mockRestore()
     }
+  },
+)
+
+test.each([403, 429])(
+  'a vault %i without an account identity is classified for same-account backoff but not reported',
+  async (status) => {
+    const reports = captureReports()
+    const body = '{"error":{"code":"try_again"}}'
+    const response = new Response(body, {
+      status,
+      headers: { 'retry-after': '2' },
+    })
+    const onRefusal = mock((_classified: Promise<unknown>) => {})
+    const now = 1_900_000_000_000
+    const observed = observeVaultRoutingResponse(
+      'session',
+      { ...receipt, accountIdentity: undefined },
+      response,
+      { parseLimit: () => undefined, now: () => now, onRefusal },
+    )
+    expect(onRefusal).toHaveBeenCalledTimes(1)
+    expect(await onRefusal.mock.calls[0]?.[0]).toEqual({
+      kind: 'backoff',
+      retryAtMs: now + 2000,
+      credentialId: receipt.credentialId,
+    })
+    expect(reports).toEqual([])
+    expect(observed).toBe(response)
+    expect(await observed.text()).toBe(body)
   },
 )
 

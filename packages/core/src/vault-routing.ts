@@ -193,14 +193,14 @@ export async function chooseVaultRouting(input: {
       })
     : await askRouting(ask)
   if (!answer || 'refused' in answer) return answer
-  return answer.candidate.id === continuation?.previousId
-    ? {
-        holdMs: Math.min(
-          answer.hold?.retry_after_ms ?? 0,
-          (holdWaitMaxS ?? 0) * 1000,
-        ),
-      }
-    : answer.candidate.id
+  if (answer.candidate.id !== continuation?.previousId)
+    return answer.candidate.id
+  if (!answer.hold) return { holdMs: 0 }
+  const holdMs = answer.hold.retry_after_ms
+  // A shorter wait would resend to an account routing still considers exhausted.
+  if (!holdWaitMaxS || holdMs > holdWaitMaxS * 1000)
+    return { refused: { code: 'account_selection_refused' } }
+  return { holdMs }
 }
 
 const RATE_LIMIT_HEADERS = [
@@ -451,7 +451,6 @@ export function observeVaultRoutingResponse(
     headers: response.headers,
     quota: options.quota,
   }
-  if (!receipt.accountIdentity) return response
   if (
     response.status === 429 ||
     (response.status === 403 && options.onRefusal)
@@ -478,7 +477,7 @@ export function observeVaultRoutingResponse(
     }
     return response
   }
-  if (!response.ok) return response
+  if (!receipt.accountIdentity || !response.ok) return response
   if (!response.body) {
     reportVaultRouting(sessionId, receipt, outcome)
     return response
