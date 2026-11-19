@@ -711,6 +711,20 @@ describe('unread lists and files', () => {
 })
 
 describe('off-request refresh and watch callbacks', () => {
+  it('preserves the last applied view and skips a queued read after disposal', async () => {
+    const { file, snapshot, handle, unwatched } = await fixture({
+      routing_mode: 'ordered',
+    })
+    await writeFile(file, JSON.stringify({ routing_mode: 'main-first' }))
+    const read = spyOn(handle, 'read')
+    const queued = snapshot.refresh()
+    snapshot.dispose()
+    await queued
+    expect(unwatched()).toBe(true)
+    expect(snapshot.view().routing?.mode).toBe('ordered')
+    expect(read).not.toHaveBeenCalled()
+  })
+
   it('refreshes before menus even when a watch callback has not fired', async () => {
     const { file, snapshot, handle, unwatched } = await fixture({
       log_level: 'info',

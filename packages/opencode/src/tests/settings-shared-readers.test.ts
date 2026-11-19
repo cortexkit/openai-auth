@@ -79,8 +79,12 @@ async function put(path: string, value: unknown) {
   await writeFile(path, JSON.stringify(value))
 }
 
-async function shared(values: Record<string, unknown> = {}, watch = false) {
-  await put(target, values)
+async function shared(
+  values: Record<string, unknown> | string = {},
+  watch = false,
+) {
+  if (typeof values === 'string') await writeFile(target, values)
+  else await put(target, values)
   recordSettingsDecision(config, 'shared')
   const handle = openSettings(openaiSettings, {
     file: target,
@@ -211,7 +215,7 @@ describe('shared OpenCode transport readers', () => {
     expect(isRequestDumpEnabled()).toBe(true)
   })
 
-  it('keeps start-only values across instance registration and disposal while live readers keep a remaining snapshot', async () => {
+  it('keeps start-only values while an instance remains, then serves the retired snapshot until replacement', async () => {
     const first = await shared({ web_sockets: true, request_dumps: false })
     const startOnly = getSettings()
     const second = await shared({ web_sockets: false, request_dumps: true })
@@ -221,11 +225,12 @@ describe('shared OpenCode transport readers', () => {
     expect(getSettings()).toBe(startOnly)
     expect(isRequestDumpEnabled()).toBe(true)
     second.unregister()
+    second.snapshot.dispose()
     expect(getSettings().webSockets).toBe(false)
-    expect(isRequestDumpEnabled()).toBe(false)
-    await shared({ request_dumps: true })
-    first.unregister()
     expect(isRequestDumpEnabled()).toBe(true)
+    await shared({ request_dumps: false })
+    first.unregister()
+    expect(isRequestDumpEnabled()).toBe(false)
   })
 
   it.each([undefined, '', '   '])(
@@ -301,13 +306,13 @@ describe('shared OpenCode transport readers', () => {
     expect(isRequestDumpEnabled()).toBe(true)
   })
 
-  it('uses declared defaults without a registered shared snapshot, never the old store', async () => {
+  it('holds protection strict without a shared snapshot, uses other defaults, and warns once per identity', async () => {
     await put(config, {
       webSockets: true,
       dump: true,
       dumpMaxBytes: 1,
       routing: { mode: 'fallback-first' },
-      killswitch: { enabled: true },
+      killswitch: { enabled: false },
     })
     recordSettingsDecision(config, 'shared')
     expect(getSettings()).toEqual({
@@ -320,25 +325,33 @@ describe('shared OpenCode transport readers', () => {
       codexApiEndpoint: DEFAULT_CODEX_API_ENDPOINT,
     })
     expect(isRequestDumpEnabled()).toBe(false)
-    expect(
-      getResolvedSettingsView({
-        version: 1,
-        accounts: [],
-        killswitch: { enabled: true },
-      }).killswitch?.enabled,
-    ).toBe(false)
+    const view = getResolvedSettingsView({
+      version: 1,
+      accounts: [],
+      routing: { mode: 'fallback-first' },
+      killswitch: { enabled: false },
+    })
+    expect(view.routing?.mode).toBe('main-first')
+    expect(view.killswitch?.enabled).toBe(true)
+    expect(view.killswitch?.defaults).toEqual({
+      primary: openaiSettings.settings.killswitch_default_primary.default,
+      secondary: openaiSettings.settings.killswitch_default_secondary.default,
+    })
     await flushForTest()
-    expect(
-      fs
-        .readFileSync(process.env.OPENCODE_OPENAI_AUTH_LOG_FILE!, 'utf8')
-        .split('Shared settings snapshot is not registered'),
-    ).toHaveLength(2)
+    const warnings = fs
+      .readFileSync(process.env.OPENCODE_OPENAI_AUTH_LOG_FILE!, 'utf8')
+      .split('\n')
+      .filter((line) => line.includes('[config]'))
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toEndWith(
+      `Holding protection values strict until the shared settings file is read ${JSON.stringify({ configPath: config })}`,
+    )
   })
 
-  it('defaults stay aligned with a real default snapshot, including absent stores', async () => {
+  it('uses the same fallback as an unreadable startup file, including absent stores', async () => {
     recordSettingsDecision(config, 'shared')
     const fallback = getResolvedSettingsView(null)
-    const { snapshot } = await shared()
+    const { snapshot } = await shared('{ broken settings')
     expect(fallback).toEqual(snapshot.view(null))
     expect(getResolvedSettingsView(null)).not.toBeNull()
   })

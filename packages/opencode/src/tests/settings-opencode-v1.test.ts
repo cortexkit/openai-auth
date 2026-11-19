@@ -272,7 +272,7 @@ describe('OpenCode 1 settings authority wiring', () => {
       configReader.getResolvedSettingsView(null, config).routing?.mode,
     ).toBe('main-first')
     await hooks.dispose?.()
-    expect(configReader.getSettings(config).codexApiEndpoint).not.toBe(
+    expect(configReader.getSettings(config).codexApiEndpoint).toBe(
       'https://shared.invalid',
     )
   })

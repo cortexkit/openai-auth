@@ -96,22 +96,22 @@ export function bodySummary(parsed: Record<string, unknown>) {
   }
 }
 
+// The host loads the module before setup has read the shared settings file.
+let dumper: Dumper | undefined
 let dumperMaxBytes: number
 
-function newDumper(): Dumper {
-  dumperMaxBytes = getSettings().dumpMaxBytes
+function newDumper(maxBytes: number): Dumper {
+  dumperMaxBytes = maxBytes
   return createDumper({
     // Read on every dump, so a changed setting needs no restart.
     dir: () => getSettings().dumpDir,
-    maxBytes: dumperMaxBytes,
+    maxBytes,
     logger: log,
     secretKeys: DUMP_SECRET_KEYS,
     schemaKeys: DUMP_SCHEMA_KEYS,
     summarize: bodySummary,
   })
 }
-
-let dumper = newDumper()
 
 export async function dumpCodexRequest(input: {
   sessionID?: string | null
@@ -126,10 +126,11 @@ export async function dumpCodexRequest(input: {
   error?: string
 }): Promise<void> {
   if (!isRequestDumpEnabled()) {
-    dumper.setEnabled(false)
+    dumper?.setEnabled(false)
     return
   }
-  if (getSettings().dumpMaxBytes !== dumperMaxBytes) dumper = newDumper()
+  const maxBytes = getSettings().dumpMaxBytes
+  if (!dumper || maxBytes !== dumperMaxBytes) dumper = newDumper(maxBytes)
   dumper.setEnabled(true)
   const bodyText =
     typeof input.bodyText === 'function' ? input.bodyText() : input.bodyText
@@ -159,5 +160,5 @@ export async function dumpDiagnostic(event: Record<string, unknown>) {
  * cannot reuse a name the old one wrote.
  */
 export function resetDumpStateForTest() {
-  dumper = newDumper()
+  dumper = undefined
 }

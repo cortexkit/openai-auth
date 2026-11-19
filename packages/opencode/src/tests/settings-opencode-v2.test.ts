@@ -151,6 +151,70 @@ async function request(
 }
 
 describe('OpenCode 2 settings wiring', () => {
+  it('keeps shared settings between a disposed setup and its replacement', async () => {
+    const files = await filesAtDefault()
+    await put(target, {
+      routing_mode: 'ordered',
+      killswitch_enabled: true,
+      killswitch_default_primary: 82,
+      killswitch_default_secondary: 37,
+      responses_lite: true,
+    })
+    const old = await start(files)
+    expect(config.getSettings(files.configPath).responsesLite).toBe(true)
+    await old.stop()
+
+    // An edit during the gap must not change the disposed instance's view.
+    await put(target, { routing_mode: 'fallback-first' })
+    const disk = spyOn(SettingsFs, 'readFile')
+    try {
+      const view = config.getResolvedSettingsView(null, files.configPath)
+      expect(view.routing?.mode).toBe('ordered')
+      expect(view.killswitch).toMatchObject({
+        enabled: true,
+        defaults: { primary: 82, secondary: 37 },
+      })
+      expect(config.getSettings(files.configPath).responsesLite).toBe(true)
+      expect(disk).not.toHaveBeenCalled()
+    } finally {
+      disk.mockRestore()
+    }
+
+    const replacement = await start(files)
+    const snapshot = replacement.snapshot
+    if (!snapshot)
+      throw new Error('Replacement shared snapshot was not registered')
+    expect(
+      config.getResolvedSettingsView(null, files.configPath).routing?.mode,
+    ).toBe('fallback-first')
+    expect(config.getSettings(files.configPath).responsesLite).toBe(false)
+
+    const changed = new Promise<void>((done) => {
+      snapshot.onChange(() => {
+        if (snapshot.get('routing_mode') === 'sticky-balanced') done()
+      })
+    })
+    await put(target, { routing_mode: 'sticky-balanced' })
+    await changed
+    expect(
+      config.getResolvedSettingsView(null, files.configPath).routing?.mode,
+    ).toBe('sticky-balanced')
+  })
+
+  it('does not read settings when the replacement loads the request dumper before setup', async () => {
+    const files = await filesAtDefault()
+    await put(target, { routing_mode: 'ordered' })
+    const old = await start(files)
+    await old.stop()
+
+    const read = spyOn(config, 'getSettings')
+    cleanups.push(() => read.mockRestore())
+    // A fresh module instance runs the same initializer as a replacement bundle.
+    const replacementDumper = '../dump?settings-reload'
+    await import(replacementDumper)
+    expect(read).not.toHaveBeenCalled()
+  })
+
   it('registers the location snapshot, and passes its config identity to direct routableRows', async () => {
     const ownDir = join(folder, 'location')
     await mkdir(ownDir)
@@ -187,10 +251,10 @@ describe('OpenCode 2 settings wiring', () => {
     await stop()
     expect(
       config.getResolvedSettingsView(null, files.configPath).routing?.mode,
-    ).toBe('main-first')
+    ).toBe('ordered')
   })
 
-  it('moves before the migration-off early return and disposes its registration', async () => {
+  it('moves before the migration-off early return and retires its snapshot at disposal', async () => {
     const files = await filesAtDefault()
     await put(files.configPath, {
       version: 1,
@@ -208,7 +272,7 @@ describe('OpenCode 2 settings wiring', () => {
     await stop()
     expect(
       config.getResolvedSettingsView(null, files.configPath).routing?.mode,
-    ).toBe('main-first')
+    ).toBe('sticky-balanced')
   })
 
   it('keeps the absent-store branch while the resolved view is non-null', async () => {

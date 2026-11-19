@@ -11,16 +11,12 @@
 import { readFileSync, statSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import {
-  type AccountStorage,
-  KILLSWITCH_FLOORS_SCHEMA,
-} from '@cortexkit/openai-auth-core/internal'
+import type { AccountStorage } from '@cortexkit/openai-auth-core/internal'
 import { getSettingsDecision } from '@cortexkit/openai-auth-core/settings-decisions'
-import { openaiSettings } from '@cortexkit/openai-auth-core/settings-definition'
 import { settingsIdentity } from '@cortexkit/openai-auth-core/settings-install'
-import type {
-  SettingsSnapshot,
-  SettingsView,
+import {
+  type SettingsSnapshot,
+  unreadSettingsView,
 } from '@cortexkit/openai-auth-core/settings-snapshot'
 import { createLogger } from './logger'
 
@@ -108,18 +104,23 @@ function readConfigFile(path: string): OpenAIAuthConfig {
 const snapshotsKey = Symbol.for(
   '@cortexkit/openai-auth/opencode-settings-snapshots',
 )
+const retiredSnapshotsKey = Symbol.for(
+  '@cortexkit/openai-auth/opencode-retired-settings-snapshots',
+)
 const warningsKey = Symbol.for(
   '@cortexkit/openai-auth/opencode-settings-snapshot-warnings',
 )
 const processState = globalThis as typeof globalThis & {
   [snapshotsKey]?: Map<string, Set<SettingsSnapshot>>
+  [retiredSnapshotsKey]?: Map<string, SettingsSnapshot>
   [warningsKey]?: Set<string>
 }
-const snapshots =
-  processState[snapshotsKey] ?? new Map<string, Set<SettingsSnapshot>>()
-processState[snapshotsKey] = snapshots
-const warnedMissingSnapshot = processState[warningsKey] ?? new Set<string>()
-processState[warningsKey] = warnedMissingSnapshot
+processState[snapshotsKey] ??= new Map()
+processState[retiredSnapshotsKey] ??= new Map()
+processState[warningsKey] ??= new Set()
+const snapshots = processState[snapshotsKey]
+const retiredSnapshots = processState[retiredSnapshotsKey]
+const warnedMissingSnapshot = processState[warningsKey]
 
 /** Register after startup; unregister before disposing this instance's snapshot. */
 export function registerSettingsSnapshot(
@@ -129,6 +130,7 @@ export function registerSettingsSnapshot(
   const identity = settingsIdentity(configPath)
   const live = snapshots.get(identity) ?? new Set<SettingsSnapshot>()
   if (live.size === 0) cached.delete(identity)
+  retiredSnapshots.delete(identity)
   snapshots.set(identity, live)
   live.add(snapshot)
   // A menu refresh of one instance must win over another instance's older view.
@@ -144,6 +146,8 @@ export function registerSettingsSnapshot(
     live.delete(snapshot)
     if (live.size === 0) {
       snapshots.delete(identity)
+      // The disposed snapshot has no watcher, but its last view can bridge a reload.
+      retiredSnapshots.set(identity, snapshot)
       cached.delete(identity)
     }
   }
@@ -152,76 +156,18 @@ export function registerSettingsSnapshot(
 function sharedSnapshot(configPath: string): SettingsSnapshot | undefined {
   const identity = settingsIdentity(configPath)
   const live = snapshots.get(identity)
-  let latest: SettingsSnapshot | undefined
+  let latest = retiredSnapshots.get(identity)
   for (const snapshot of live ?? []) latest = snapshot
   if (!latest && !warnedMissingSnapshot.has(identity)) {
     warnedMissingSnapshot.add(identity)
     log.warn(
-      'Shared settings snapshot is not registered; using declared defaults',
+      'Holding protection values strict until the shared settings file is read',
       {
         configPath: identity,
       },
     )
   }
   return latest
-}
-
-/** Without a registered shared snapshot, ignore the account store's obsolete preferences. */
-function defaultSettingsView(store: AccountStorage | null): SettingsView {
-  const d = openaiSettings.settings
-  return {
-    version: 1,
-    accounts: store?.accounts ?? [],
-    main: store?.main,
-    routing: {
-      mode: d.routing_mode.default,
-      maxSameAccountWait: ({ off: 0, '15m': 15, cache: 'max' } as const)[
-        d.max_same_account_wait.default
-      ],
-    },
-    fallbackOn: [...d.fallback_on.default],
-    refresh: {
-      enabled: d.refresh_enabled.default,
-      refreshBeforeExpiryMinutes: d.refresh_before_expiry_minutes.default,
-      mainLastRefreshError: store?.refresh?.mainLastRefreshError,
-      mainRefreshLeaseId: store?.refresh?.mainRefreshLeaseId,
-      mainRefreshLeaseUntil: store?.refresh?.mainRefreshLeaseUntil,
-      mainRefreshLeaseTokenHash: store?.refresh?.mainRefreshLeaseTokenHash,
-    },
-    quota: {
-      enabled: d.quota_enabled.default,
-      checkIntervalMinutes: d.quota_check_interval_minutes.default,
-      minimumRemaining: {},
-      failClosedOnUnknownQuota: d.quota_fail_closed_on_unknown.default,
-      mainQuota: store?.quota?.mainQuota,
-      mainQuotaCheckedAt: store?.quota?.mainQuotaCheckedAt,
-      mainQuotaToken: store?.quota?.mainQuotaToken,
-      mainLastQuotaApiError: store?.quota?.mainLastQuotaApiError,
-    },
-    killswitch: {
-      schema: KILLSWITCH_FLOORS_SCHEMA,
-      enabled: d.killswitch_enabled.default,
-      defaults: {
-        primary: d.killswitch_default_primary.default,
-        secondary: d.killswitch_default_secondary.default,
-      },
-      accounts: {},
-    },
-    costZeroing: { enabled: d.cost_zeroing.default },
-    logging: {},
-    cacheKeep: {
-      enabled: d.cache_keep_enabled.default,
-      subagents: d.cache_keep_subagents.default,
-      sustain: d.cache_keep_sustain.default,
-    },
-    dump: { enabled: d.request_dumps.default },
-    dumpDir: d.dump_dir.default,
-    dumpMaxBytes: d.dump_max_bytes.default,
-    webSockets: d.web_sockets.default,
-    rawWebSocket: d.raw_web_socket.default,
-    responsesLite: d.responses_lite.default,
-    codexApiEndpoint: d.codex_api_endpoint.default,
-  }
 }
 
 /** Memory only for shared installs. A non-null view is not proof a store exists. */
@@ -231,13 +177,16 @@ export function getResolvedSettingsView(
 ): AccountStorage {
   if (getSettingsDecision(configPath) !== 'shared')
     return store ?? { version: 1, accounts: [] }
-  return sharedSnapshot(configPath)?.view(store) ?? defaultSettingsView(store)
+  return (
+    sharedSnapshot(configPath)?.view(store) ??
+    unreadSettingsView('opencode', store)
+  )
 }
 
 function settingsConfig(configPath: string): OpenAIAuthConfig {
   if (getSettingsDecision(configPath) !== 'shared')
     return readConfigFile(configPath)
-  return sharedSnapshot(configPath)?.view() ?? defaultSettingsView(null)
+  return sharedSnapshot(configPath)?.view() ?? unreadSettingsView('opencode')
 }
 
 /** Parse an env var as a boolean. undefined => not set (defer to config). */

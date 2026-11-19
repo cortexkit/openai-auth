@@ -25,7 +25,7 @@ export type SettingsView = AccountStorage & {
 }
 
 export interface SettingsSnapshot {
-  /** Memory only. A view is not evidence that an account store exists. */
+  /** Memory only, including after disposal. Not evidence that an account store exists. */
   view(store?: AccountStorage | null): SettingsView
   get<K extends SnapshotSetting>(name: K): SnapshotValues[K]
   report(): ReportEntry[]
@@ -48,6 +48,18 @@ const protectedSettings = [
   'quota_minimum_remaining',
   'cache_keep_window',
 ] as const
+
+function startupDefault<K extends SnapshotSetting>(
+  setting: K,
+  unread: boolean,
+): SnapshotValues[K] {
+  // A missing or unreadable policy must not disable protection before it is read.
+  return structuredClone(
+    unread && setting === 'killswitch_enabled'
+      ? true
+      : openaiSettings.settings[setting].default,
+  ) as SnapshotValues[K]
+}
 
 function semanticChecks(values: SnapshotValues, file: string): ReportEntry[] {
   const entries: ReportEntry[] = []
@@ -156,6 +168,48 @@ function preferences(values: SnapshotValues, host: SnapshotHost): SettingsView {
   }
 }
 
+function withAccountState(
+  prefs: SettingsView,
+  store?: AccountStorage | null,
+): SettingsView {
+  return {
+    ...store,
+    ...prefs,
+    accounts: store?.accounts ?? [],
+    main: store?.main,
+    // These objects mix preferences and state. Copy only their state fields
+    // from the store, never a preference omitted by the shared file.
+    refresh: {
+      ...prefs.refresh,
+      mainLastRefreshError: store?.refresh?.mainLastRefreshError,
+      mainRefreshLeaseId: store?.refresh?.mainRefreshLeaseId,
+      mainRefreshLeaseUntil: store?.refresh?.mainRefreshLeaseUntil,
+      mainRefreshLeaseTokenHash: store?.refresh?.mainRefreshLeaseTokenHash,
+    },
+    quota: {
+      ...prefs.quota,
+      mainQuota: store?.quota?.mainQuota,
+      mainQuotaCheckedAt: store?.quota?.mainQuotaCheckedAt,
+      mainQuotaToken: store?.quota?.mainQuotaToken,
+      mainLastQuotaApiError: store?.quota?.mainLastQuotaApiError,
+    },
+  }
+}
+
+/** Shared authority without a snapshot uses the same protections as a failed startup read. */
+export function unreadSettingsView(
+  host: SnapshotHost,
+  store?: AccountStorage | null,
+): SettingsView {
+  const defaults = Object.fromEntries(
+    (Object.keys(openaiSettings.settings) as SnapshotSetting[]).map((name) => [
+      name,
+      startupDefault(name, true),
+    ]),
+  ) as SnapshotValues
+  return withAccountState(preferences(defaults, host), store)
+}
+
 /**
  * Own one snapshot per shared instance. common-auth's get() refreshes files, so
  * only startup, explicit menu refreshes and watch callbacks may call it here.
@@ -174,7 +228,9 @@ export async function createSettingsSnapshot(options: {
   const callbacks = new Set<() => void>()
 
   const reload = async () => {
+    if (disposed) return
     await handle.read()
+    if (disposed) return
     const next = Object.fromEntries(
       await Promise.all(
         (Object.keys(openaiSettings.settings) as SnapshotSetting[]).map(
@@ -182,6 +238,9 @@ export async function createSettingsSnapshot(options: {
         ),
       ),
     ) as SnapshotValues
+    // A read may have been in flight at disposal. Leave the last applied view
+    // intact for readers that still hold this snapshot.
+    if (disposed) return
     const readReport = handle.report()
     report = [...readReport, ...semanticChecks(next, file)]
     const fileFailed = readReport.some(
@@ -195,15 +254,13 @@ export async function createSettingsSnapshot(options: {
           entry.reason === 'invalid-value' && entry.keyPath[0] === setting,
       )
     const retain = <K extends SnapshotSetting>(setting: K) => {
-      next[setting] = structuredClone(
-        values?.[setting] ?? openaiSettings.settings[setting].default,
-      ) as SnapshotValues[K]
+      next[setting] = values
+        ? structuredClone(values[setting])
+        : startupDefault(setting, fileFailed)
     }
     // Invalid edits and whole-file failures keep the applied protection policy.
     for (const setting of protectedSettings)
       if (fileFailed || invalid(setting)) retain(setting)
-    // With no applied policy to retain, a broken file must not disable protection.
-    if (fileFailed && !values) next.killswitch_enabled = true
     if (invalid('killswitch_account_floors')) {
       // Retain the complete applied policy, including defaults: a corrupt list
       // must not quietly remove an account's protection or lower its fallback.
@@ -233,29 +290,7 @@ export async function createSettingsSnapshot(options: {
   }
   return {
     view(store) {
-      const prefs = structuredClone(current)
-      return {
-        ...store,
-        ...prefs,
-        accounts: store?.accounts ?? [],
-        main: store?.main,
-        // These objects mix preferences and state. Copy only their state fields
-        // from the store, never a preference omitted by the shared file.
-        refresh: {
-          ...prefs.refresh,
-          mainLastRefreshError: store?.refresh?.mainLastRefreshError,
-          mainRefreshLeaseId: store?.refresh?.mainRefreshLeaseId,
-          mainRefreshLeaseUntil: store?.refresh?.mainRefreshLeaseUntil,
-          mainRefreshLeaseTokenHash: store?.refresh?.mainRefreshLeaseTokenHash,
-        },
-        quota: {
-          ...prefs.quota,
-          mainQuota: store?.quota?.mainQuota,
-          mainQuotaCheckedAt: store?.quota?.mainQuotaCheckedAt,
-          mainQuotaToken: store?.quota?.mainQuotaToken,
-          mainLastQuotaApiError: store?.quota?.mainLastQuotaApiError,
-        },
-      }
+      return withAccountState(structuredClone(current), store)
     },
     get(name) {
       return structuredClone(values[name])
