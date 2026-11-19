@@ -1,146 +1,25 @@
 import { afterEach, expect, mock, spyOn, test } from 'bun:test'
-import type { ClaustrumScopedAttempt } from '@cortexkit/common-auth/claustrum'
 import { createSessionActivityStore } from '@cortexkit/common-auth/limits'
 import {
   type Attempt,
-  type ChooseAccountInput,
   installOpenCode2Auth,
   OpenCode2AuthError,
   placeholderSecret,
 } from '@cortexkit/common-auth/opencode2'
-import type { QuotaMap } from '@cortexkit/common-auth/quota'
 import * as routingClient from '@cortexkit/common-auth/routing-accessor'
-import type { PoolRow } from '@cortexkit/common-auth/store'
-import {
-  type AccountStorage,
-  VAULT_MODE_REFUSALS,
-} from '@cortexkit/openai-auth-core/internal'
+import { VAULT_MODE_REFUSALS } from '@cortexkit/openai-auth-core/internal'
 import type { OpenCodeLimitSource } from '../core/limit-source'
-import {
-  createOpenAIAdapter,
-  type OpenAIAdapterDeps,
-  type OpenAIAttemptData,
-  type PoolAccess,
-} from '../v2/adapter'
-import { SessionPins } from '../v2/pins'
-import { installPoolHooks } from '../v2/setup'
+import type { OpenAIAttemptData } from '../v2/adapter'
 import { fakeOpenCode2Host, scope } from './fixtures/opencode2-host'
+import {
+  fixture,
+  routingKey as key,
+  placementRequest,
+  quotaMap,
+  restoreRoutingAccessor,
+} from './fixtures/opencode2-routing'
 
-const key = Symbol.for('cortexkit.routing')
-const original = Object.getOwnPropertyDescriptor(globalThis, key)
-afterEach(() => {
-  if (original) Object.defineProperty(globalThis, key, original)
-  else Reflect.deleteProperty(globalThis, key)
-})
-
-function quotaMap(usedPercent: number, checkedAt = Date.now()): QuotaMap {
-  return {
-    limits: [
-      {
-        scope: 'all',
-        label: 'primary',
-        kind: 'reading',
-        usedPercent,
-        checkedAt,
-        windowMinutes: 300,
-      },
-    ],
-  }
-}
-
-function fixture(
-  vaultMode = true,
-  mode: 'ordered' | 'sticky-balanced' = 'ordered',
-  now: () => number = Date.now,
-  deps: Pick<OpenAIAdapterDeps, 'limits' | 'log'> = {},
-) {
-  const rows: PoolRow[] = [
-    {
-      id: 'main',
-      type: 'oauth',
-      enabled: true,
-      candidate: true,
-      hasEntry: true,
-      needsFirstReading: false,
-      identity: 'local-account',
-      credentialEpoch: 1,
-      credential: {
-        type: 'oauth',
-        access: 'local-token',
-        refresh: 'local-refresh',
-        expires: Date.now() + 3600_000,
-      },
-      quota: quotaMap(10, now()),
-    },
-  ]
-  const source: PoolAccess = {
-    current: async () => ({ active: true, rows }),
-    peek: () => ({ active: true, rows }),
-    prepareTokens: async () => {},
-    usableToken: () => 'local-token',
-    refreshBackoffFor: () => new Map(),
-    requestReading: () => {},
-    recordSnapshot: mock(() => {}),
-  }
-  const routes = ['a', 'b'].map((id) => ({
-    id: `vault:${id}`,
-    identity: `account-${id}`,
-    credentialId: `credential-${id}`,
-    kind: 'oauth' as const,
-    quota: quotaMap(10, now()),
-  }))
-  const refused = new Set<string>()
-  const authorized: string[] = []
-  const pins = new SessionPins()
-  const storage: AccountStorage = {
-    version: 1,
-    accounts: [],
-    routing: { mode },
-  }
-  const openai = createOpenAIAdapter({
-    ...deps,
-    now,
-    source,
-    storage: async () => storage,
-    pins,
-    vault: {
-      routes: () => routes,
-      identities: () => new Set(routes.map((route) => route.identity)),
-      enrolled: () => vaultMode,
-      authority: async () => (vaultMode ? 'vault' : 'local'),
-      snapshot: () => undefined,
-      authorize: async (id) => {
-        authorized.push(id)
-        if (refused.has(id)) return undefined
-        const route = routes.find((route) => route.id === id)!
-        return {
-          credentialId: route.credentialId,
-          credentialType: 'oauth',
-          accountIdentity: route.identity,
-          accountIdentitySource: 'asserted',
-          accessToken: `${id}-token`,
-          recordVersion: 1,
-          expiresAtMs: null,
-        } satisfies ClaustrumScopedAttempt
-      },
-      reportFailure: async () => {},
-      recordSnapshot: async () => {},
-      reportUsage: () => {},
-      requestReading: () => {},
-      grantReach: () => undefined,
-      name: 'openai-auth-opencode',
-    },
-  })
-  const request: ChooseAccountInput = {
-    providerID: 'openai',
-    modelID: 'gpt-6',
-    sessionID: 'fleet-session',
-    agent: 'build',
-    kind: 'primary',
-    phase: 'request',
-  }
-  return { openai, pins, storage, routes, refused, authorized, request, source }
-}
+afterEach(restoreRoutingAccessor)
 
 for (const mode of ['ordered', 'sticky-balanced'] as const) {
   for (const code of [
@@ -232,71 +111,6 @@ const shortPlacementRefusal = {
 const placementRefusalError = {
   kind: 'no-account',
   message: 'Thalamus routing declined this request, so it was not sent.',
-}
-
-async function placementRequest(answers: unknown[]) {
-  const secondAsk = Promise.withResolvers<void>()
-  const accountFor = mock(async (_request: unknown) => {
-    if (accountFor.mock.calls.length === 2) secondAsk.resolve()
-    return answers.shift()
-  })
-  Reflect.set(globalThis, key, () => ({ accountFor }))
-  const env = fixture(true, 'sticky-balanced')
-  const host = fakeOpenCode2Host()
-  const installation = await installPoolHooks(host.ctx, env.openai.adapter, {
-    warn() {},
-    info() {},
-  })
-  env.openai.attach(installation)
-  const controller = new AbortController()
-  const providerFetch = mock((request: Request) =>
-    request.headers.get('authorization'),
-  )
-  const scheduled = Promise.withResolvers<{ delay: number; wake: () => void }>()
-  const realSetTimeout = globalThis.setTimeout
-  const timers = spyOn(globalThis, 'setTimeout').mockImplementation(((
-    run: () => void,
-    delay?: number,
-    ...args: unknown[]
-  ) => {
-    if (delay !== undefined && [0, 3000, 5000, 6000].includes(delay)) {
-      scheduled.resolve({ delay, wake: run })
-      const timer = realSetTimeout(() => {}, delay)
-      clearTimeout(timer)
-      return timer
-    }
-    return realSetTimeout(run, delay, ...args)
-  }) as typeof setTimeout)
-  return {
-    ...env,
-    accountFor,
-    secondAsk: secondAsk.promise,
-    controller,
-    providerFetch,
-    wait: scheduled.promise,
-    async waitBeforeSend(sent: Promise<string | null>) {
-      const wait = await Promise.race([scheduled.promise, sent])
-      if (!wait || typeof wait !== 'object')
-        throw new Error('request sent before the placement wait')
-      return wait
-    },
-    async send(kind: ChooseAccountInput['kind'] = 'primary') {
-      const draft = await host.fire('http.request', {
-        ...scope(env.request.sessionID, kind),
-        request: new Request('https://codex.test/responses', {
-          headers: { authorization: `Bearer ${placeholderSecret('openai')}` },
-          signal: controller.signal,
-        }),
-      })
-      return providerFetch(draft.request)
-    },
-    async dispose() {
-      controller.abort()
-      timers.mockRestore()
-      await installation.dispose()
-      env.openai.dispose()
-    },
-  }
 }
 
 test.each(['primary', 'title', 'compaction', 'generate'] as const)(

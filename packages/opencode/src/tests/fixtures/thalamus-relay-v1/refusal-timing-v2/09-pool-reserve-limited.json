@@ -1,0 +1,56 @@
+{
+  "plugin_reply": {
+    "choice": null,
+    "refused": {
+      "code": "account_limit_exhausted",
+      "resets_at_ms": 1784721690000,
+      "routing_code": "account_pool_reserve_limited"
+    }
+  },
+  "plugin_request": {
+    "model": "opus",
+    "op": "account_for",
+    "provider": "anthropic",
+    "refusals": true,
+    "request_id": "timing-refusal"
+  },
+  "scripted_router_refusal": {
+    "code": "account_pool_reserve_limited",
+    "detail": {
+      "code": "account_pool_reserve_limited",
+      "decision_id": "acd_c66ed050137a0c950562c46e",
+      "exclusions": [
+        {
+          "account_id": "identity-0",
+          "pool": {
+            "name": "gemini",
+            "scope": {
+              "kind": "every_model"
+            },
+            "window_minutes": 300
+          },
+          "reason": "confirmed_fence"
+        },
+        {
+          "account_id": "identity-1",
+          "reason": "below_reserve",
+          "window": "five_hour"
+        }
+      ],
+      "reset_at_ms": 1784721690000,
+      "retry_after_s": 150
+    },
+    "message": "no account admitted: account_pool_reserve_limited"
+  },
+  "wire": [
+    {
+      "body": {
+        "admission_id": "a4d65df4-00eb-882b-8743-fe017d749dd5",
+        "conversation_key": "195525b9a0da4dd28bb9ce4e999404ce",
+        "model": "opus",
+        "provider": "anthropic"
+      },
+      "request": "route.account_for"
+    }
+  ]
+}

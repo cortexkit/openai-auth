@@ -1,0 +1,54 @@
+{
+  "dropped_plugin_report": {
+    "op": "report",
+    "report": {
+      "account_id": "a",
+      "credential_id": "c",
+      "outcome": "auth_failed"
+    },
+    "sequence": 1
+  },
+  "plugin_reply": {
+    "choice": null,
+    "refused": {
+      "code": "account_selection_final",
+      "reason": "candidates_disjoint",
+      "routing_code": "account_unservable"
+    }
+  },
+  "plugin_request": {
+    "candidates": {
+      "accounts": [],
+      "view_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "model": "opus",
+    "op": "account_for",
+    "provider": "anthropic",
+    "refusals": true,
+    "request_id": "plain-transport-id"
+  },
+  "wire": [
+    {
+      "body": {
+        "admission_id": "ad8a3c4b-fee4-8f51-9845-d7cfff875db5",
+        "candidates": {
+          "accounts": [],
+          "view_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "conversation_key": "195525b9a0da4dd28bb9ce4e999404ce",
+        "model": "opus",
+        "provider": "anthropic"
+      },
+      "request": "route.account_for"
+    },
+    {
+      "body": {
+        "code": "account_unservable",
+        "detail": {
+          "reason": "candidates_disjoint"
+        }
+      },
+      "refusal": "route.account_for"
+    }
+  ]
+}

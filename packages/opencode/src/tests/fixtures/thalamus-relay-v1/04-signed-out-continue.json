@@ -1,0 +1,186 @@
+[
+  {
+    "capabilities": [],
+    "injected_legacy_auth_failed": false,
+    "name": "04-signed-out-continue",
+    "plugin_replies": [
+      {
+        "body": {
+          "choice": {
+            "account_id": "identity-0",
+            "credential_id": "credential-0"
+          }
+        },
+        "call_index": 0
+      },
+      {
+        "body": {
+          "choice": {
+            "account_id": "identity-1",
+            "credential_id": "credential-1"
+          }
+        },
+        "call_index": 2
+      }
+    ],
+    "scripted_router_refusals": [],
+    "wire": [
+      {
+        "body": {
+          "admission_id": "8a695938-1575-873c-b749-86ebdcc0529d",
+          "candidates": {
+            "accounts": [
+              {
+                "account_id": "identity-0",
+                "credential_id": "credential-0"
+              },
+              {
+                "account_id": "identity-1",
+                "credential_id": "credential-1"
+              }
+            ],
+            "view_digest": "004ad59d3b2d30838d2cb13326e7bfdf8617f84b9f831ae15eefe4c3b9bcc61b"
+          },
+          "conversation_key": "195525b9a0da4dd28bb9ce4e999404ce",
+          "model": "gemini-3-flash",
+          "provider": "antigravity"
+        },
+        "request": "route.account_for"
+      },
+      {
+        "body": {
+          "admission_id": "fe760cc9-a344-89d2-8eaa-28f3e657a816",
+          "candidates": {
+            "accounts": [
+              {
+                "account_id": "identity-1",
+                "credential_id": "credential-1"
+              }
+            ],
+            "view_digest": "c81035afdce1d0e75ee716a809d6383dd4edbbac7fa9ebe7dd295b861cf1ca28"
+          },
+          "conversation_key": "195525b9a0da4dd28bb9ce4e999404ce",
+          "hold_wait_max_s": 0,
+          "model": "gemini-3-flash",
+          "provider": "antigravity"
+        },
+        "request": "route.account_for"
+      },
+      {
+        "body": {
+          "admission_id": "fe760cc9-a344-89d2-8eaa-28f3e657a816",
+          "credential_id": "credential-1",
+          "event_id": "fe760cc9-a344-89d2-8eaa-28f3e657a816:3:attempt",
+          "headers": {},
+          "kind": "attempt",
+          "run_id": "synthetic-capture-run",
+          "served_account_id": "identity-1"
+        },
+        "request": "route.account_observe"
+      },
+      {
+        "answer": "route.account_observe",
+        "body": {
+          "observation": {
+            "bound": true,
+            "duplicate": false,
+            "effects": [],
+            "id": "synthetic-observation"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "capabilities": [],
+    "injected_legacy_auth_failed": true,
+    "name": "04-signed-out-continue",
+    "plugin_replies": [
+      {
+        "body": {
+          "choice": {
+            "account_id": "identity-0",
+            "credential_id": "credential-0"
+          }
+        },
+        "call_index": 0
+      },
+      {
+        "body": {
+          "choice": {
+            "account_id": "identity-1",
+            "credential_id": "credential-1"
+          }
+        },
+        "call_index": 2
+      }
+    ],
+    "scripted_router_refusals": [],
+    "wire": [
+      {
+        "body": {
+          "admission_id": "8a695938-1575-873c-b749-86ebdcc0529d",
+          "candidates": {
+            "accounts": [
+              {
+                "account_id": "identity-0",
+                "credential_id": "credential-0"
+              },
+              {
+                "account_id": "identity-1",
+                "credential_id": "credential-1"
+              }
+            ],
+            "view_digest": "004ad59d3b2d30838d2cb13326e7bfdf8617f84b9f831ae15eefe4c3b9bcc61b"
+          },
+          "conversation_key": "195525b9a0da4dd28bb9ce4e999404ce",
+          "model": "gemini-3-flash",
+          "provider": "antigravity"
+        },
+        "request": "route.account_for"
+      },
+      {
+        "body": {
+          "admission_id": "fe760cc9-a344-89d2-8eaa-28f3e657a816",
+          "candidates": {
+            "accounts": [
+              {
+                "account_id": "identity-1",
+                "credential_id": "credential-1"
+              }
+            ],
+            "view_digest": "c81035afdce1d0e75ee716a809d6383dd4edbbac7fa9ebe7dd295b861cf1ca28"
+          },
+          "conversation_key": "195525b9a0da4dd28bb9ce4e999404ce",
+          "hold_wait_max_s": 0,
+          "model": "gemini-3-flash",
+          "provider": "antigravity"
+        },
+        "request": "route.account_for"
+      },
+      {
+        "body": {
+          "admission_id": "fe760cc9-a344-89d2-8eaa-28f3e657a816",
+          "credential_id": "credential-1",
+          "event_id": "fe760cc9-a344-89d2-8eaa-28f3e657a816:4:attempt",
+          "headers": {},
+          "kind": "attempt",
+          "run_id": "synthetic-capture-run",
+          "served_account_id": "identity-1"
+        },
+        "request": "route.account_observe"
+      },
+      {
+        "answer": "route.account_observe",
+        "body": {
+          "observation": {
+            "bound": true,
+            "duplicate": false,
+            "effects": [],
+            "id": "synthetic-observation"
+          }
+        }
+      }
+    ]
+  }
+]

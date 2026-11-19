@@ -1,0 +1,217 @@
+[
+  {
+    "capabilities": [],
+    "injected_legacy_auth_failed": false,
+    "name": "06-first-refusal-with-retry",
+    "plugin_replies": [
+      {
+        "body": {
+          "choice": null,
+          "refused": {
+            "code": "account_selection_refused",
+            "reason": "vault.empty",
+            "retry_after_secs": 30.0,
+            "routing_code": "account_selection_unavailable"
+          }
+        },
+        "call_index": 0
+      }
+    ],
+    "scripted_router_refusals": [
+      {
+        "body": {
+          "code": "account_selection_unavailable",
+          "detail": {
+            "reason": "vault.empty",
+            "retry_after_secs": 30
+          }
+        },
+        "call_index": 0
+      }
+    ],
+    "wire": [
+      {
+        "body": {
+          "admission_id": "8a695938-1575-873c-b749-86ebdcc0529d",
+          "candidates": {
+            "accounts": [
+              {
+                "account_id": "identity-0",
+                "credential_id": "credential-0"
+              },
+              {
+                "account_id": "identity-1",
+                "credential_id": "credential-1"
+              }
+            ],
+            "view_digest": "004ad59d3b2d30838d2cb13326e7bfdf8617f84b9f831ae15eefe4c3b9bcc61b"
+          },
+          "conversation_key": "195525b9a0da4dd28bb9ce4e999404ce",
+          "model": "gemini-3-flash",
+          "provider": "antigravity"
+        },
+        "request": "route.account_for"
+      }
+    ]
+  },
+  {
+    "capabilities": [],
+    "injected_legacy_auth_failed": false,
+    "name": "06-first-refusal-without-retry",
+    "plugin_replies": [
+      {
+        "body": {
+          "choice": null,
+          "refused": {
+            "code": "account_selection_final",
+            "routing_code": "account_unservable"
+          }
+        },
+        "call_index": 0
+      }
+    ],
+    "scripted_router_refusals": [
+      {
+        "body": {
+          "code": "account_unservable",
+          "detail": {}
+        },
+        "call_index": 0
+      }
+    ],
+    "wire": [
+      {
+        "body": {
+          "admission_id": "8a695938-1575-873c-b749-86ebdcc0529d",
+          "candidates": {
+            "accounts": [
+              {
+                "account_id": "identity-0",
+                "credential_id": "credential-0"
+              },
+              {
+                "account_id": "identity-1",
+                "credential_id": "credential-1"
+              }
+            ],
+            "view_digest": "004ad59d3b2d30838d2cb13326e7bfdf8617f84b9f831ae15eefe4c3b9bcc61b"
+          },
+          "conversation_key": "195525b9a0da4dd28bb9ce4e999404ce",
+          "model": "gemini-3-flash",
+          "provider": "antigravity"
+        },
+        "request": "route.account_for"
+      }
+    ]
+  },
+  {
+    "capabilities": [],
+    "injected_legacy_auth_failed": false,
+    "name": "06-continue-refusal",
+    "plugin_replies": [
+      {
+        "body": {
+          "choice": {
+            "account_id": "identity-0",
+            "credential_id": "credential-0"
+          }
+        },
+        "call_index": 0
+      },
+      {
+        "body": {
+          "choice": null,
+          "refused": {
+            "code": "account_limit_exhausted",
+            "reason": "pool.empty",
+            "resets_at_ms": 1784721690000,
+            "routing_code": "account_pool_exhausted"
+          }
+        },
+        "call_index": 3
+      }
+    ],
+    "scripted_router_refusals": [
+      {
+        "body": {
+          "code": "account_pool_exhausted",
+          "detail": {
+            "reason": "pool.empty",
+            "resets_at_ms": 1784721690000
+          }
+        },
+        "call_index": 3
+      }
+    ],
+    "wire": [
+      {
+        "body": {
+          "admission_id": "8a695938-1575-873c-b749-86ebdcc0529d",
+          "candidates": {
+            "accounts": [
+              {
+                "account_id": "identity-0",
+                "credential_id": "credential-0"
+              },
+              {
+                "account_id": "identity-1",
+                "credential_id": "credential-1"
+              }
+            ],
+            "view_digest": "004ad59d3b2d30838d2cb13326e7bfdf8617f84b9f831ae15eefe4c3b9bcc61b"
+          },
+          "conversation_key": "195525b9a0da4dd28bb9ce4e999404ce",
+          "model": "gemini-3-flash",
+          "provider": "antigravity"
+        },
+        "request": "route.account_for"
+      },
+      {
+        "body": {
+          "admission_id": "8a695938-1575-873c-b749-86ebdcc0529d",
+          "event_id": "8a695938-1575-873c-b749-86ebdcc0529d:2:account_limit_exhausted",
+          "kind": "account_limit_exhausted",
+          "limit_window": "five_hour",
+          "pool": "gemini",
+          "resets_at_ms": 1784725200000,
+          "resets_at_source": "header"
+        },
+        "request": "route.account_observe"
+      },
+      {
+        "answer": "route.account_observe",
+        "body": {
+          "observation": {
+            "bound": true,
+            "duplicate": false,
+            "effects": [],
+            "id": "synthetic-observation"
+          }
+        }
+      },
+      {
+        "body": {
+          "admission_id": "50370668-bb78-83ef-9508-80b324dbb283",
+          "candidates": {
+            "accounts": [
+              {
+                "account_id": "identity-0",
+                "credential_id": "credential-0"
+              },
+              {
+                "account_id": "identity-1",
+                "credential_id": "credential-1"
+              }
+            ],
+            "view_digest": "004ad59d3b2d30838d2cb13326e7bfdf8617f84b9f831ae15eefe4c3b9bcc61b"
+          },
+          "conversation_key": "195525b9a0da4dd28bb9ce4e999404ce",
+          "hold_wait_max_s": 300,
+          "model": "gemini-3-flash",
+          "provider": "antigravity"
+        },
+        "request": "route.account_for"
+      }
+    ]
+  }
+]

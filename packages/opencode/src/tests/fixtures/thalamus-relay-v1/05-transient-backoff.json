@@ -1,0 +1,155 @@
+[
+  {
+    "capabilities": [
+      "observe_backoff"
+    ],
+    "injected_legacy_auth_failed": false,
+    "name": "05-transient-backoff",
+    "plugin_replies": [
+      {
+        "body": {
+          "choice": {
+            "account_id": "identity-0",
+            "credential_id": "credential-0"
+          }
+        },
+        "call_index": 0
+      }
+    ],
+    "scripted_router_refusals": [],
+    "wire": [
+      {
+        "body": {
+          "admission_id": "8a695938-1575-873c-b749-86ebdcc0529d",
+          "candidates": {
+            "accounts": [
+              {
+                "account_id": "identity-0",
+                "credential_id": "credential-0"
+              },
+              {
+                "account_id": "identity-1",
+                "credential_id": "credential-1"
+              }
+            ],
+            "view_digest": "004ad59d3b2d30838d2cb13326e7bfdf8617f84b9f831ae15eefe4c3b9bcc61b"
+          },
+          "conversation_key": "195525b9a0da4dd28bb9ce4e999404ce",
+          "model": "gemini-3-flash",
+          "provider": "antigravity"
+        },
+        "request": "route.account_for"
+      },
+      {
+        "body": {
+          "admission_id": "8a695938-1575-873c-b749-86ebdcc0529d",
+          "credential_id": "credential-0",
+          "event_id": "8a695938-1575-873c-b749-86ebdcc0529d:2:transient_backoff",
+          "kind": "transient_backoff",
+          "retry_at_ms": 1784721608000,
+          "run_id": "synthetic-capture-run",
+          "served_account_id": "identity-0"
+        },
+        "request": "route.account_observe"
+      },
+      {
+        "answer": "route.account_observe",
+        "body": {
+          "observation": {
+            "bound": true,
+            "duplicate": false,
+            "effects": [],
+            "id": "synthetic-observation"
+          }
+        }
+      },
+      {
+        "body": {
+          "admission_id": "8a695938-1575-873c-b749-86ebdcc0529d",
+          "credential_id": "credential-0",
+          "event_id": "8a695938-1575-873c-b749-86ebdcc0529d:6:attempt",
+          "headers": {},
+          "kind": "attempt",
+          "run_id": "synthetic-capture-run",
+          "served_account_id": "identity-0"
+        },
+        "request": "route.account_observe"
+      },
+      {
+        "answer": "route.account_observe",
+        "body": {
+          "observation": {
+            "bound": true,
+            "duplicate": false,
+            "effects": [],
+            "id": "synthetic-observation"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "capabilities": [],
+    "injected_legacy_auth_failed": false,
+    "name": "05-transient-backoff",
+    "plugin_replies": [
+      {
+        "body": {
+          "choice": {
+            "account_id": "identity-0",
+            "credential_id": "credential-0"
+          }
+        },
+        "call_index": 0
+      }
+    ],
+    "scripted_router_refusals": [],
+    "wire": [
+      {
+        "body": {
+          "admission_id": "8a695938-1575-873c-b749-86ebdcc0529d",
+          "candidates": {
+            "accounts": [
+              {
+                "account_id": "identity-0",
+                "credential_id": "credential-0"
+              },
+              {
+                "account_id": "identity-1",
+                "credential_id": "credential-1"
+              }
+            ],
+            "view_digest": "004ad59d3b2d30838d2cb13326e7bfdf8617f84b9f831ae15eefe4c3b9bcc61b"
+          },
+          "conversation_key": "195525b9a0da4dd28bb9ce4e999404ce",
+          "model": "gemini-3-flash",
+          "provider": "antigravity"
+        },
+        "request": "route.account_for"
+      },
+      {
+        "body": {
+          "admission_id": "8a695938-1575-873c-b749-86ebdcc0529d",
+          "credential_id": "credential-0",
+          "event_id": "8a695938-1575-873c-b749-86ebdcc0529d:6:attempt",
+          "headers": {},
+          "kind": "attempt",
+          "run_id": "synthetic-capture-run",
+          "served_account_id": "identity-0"
+        },
+        "request": "route.account_observe"
+      },
+      {
+        "answer": "route.account_observe",
+        "body": {
+          "observation": {
+            "bound": true,
+            "duplicate": false,
+            "effects": [],
+            "id": "synthetic-observation"
+          }
+        }
+      }
+    ]
+  }
+]

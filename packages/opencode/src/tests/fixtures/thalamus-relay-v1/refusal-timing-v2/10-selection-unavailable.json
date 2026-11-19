@@ -1,0 +1,49 @@
+{
+  "plugin_reply": {
+    "choice": null,
+    "refused": {
+      "code": "account_selection_refused",
+      "retry_after_secs": 3.0,
+      "routing_code": "account_selection_unavailable"
+    }
+  },
+  "plugin_request": {
+    "model": "opus",
+    "op": "account_for",
+    "provider": "anthropic",
+    "refusals": true,
+    "request_id": "timing-refusal"
+  },
+  "scripted_router_refusal": {
+    "code": "account_selection_unavailable",
+    "detail": {
+      "cause": "credential_listing_not_loaded",
+      "code": "account_selection_unavailable",
+      "decision_id": null,
+      "exclusions": [
+        {
+          "account_id": "identity-0",
+          "reason": "routing just started and hasn't read the credential list yet"
+        },
+        {
+          "account_id": "identity-1",
+          "reason": "routing just started and hasn't read the credential list yet"
+        }
+      ],
+      "retry_after_ms": 3000,
+      "retry_after_s": 3
+    },
+    "message": "Routing is awaiting its first credential listing; retry shortly."
+  },
+  "wire": [
+    {
+      "body": {
+        "admission_id": "a4d65df4-00eb-882b-8743-fe017d749dd5",
+        "conversation_key": "195525b9a0da4dd28bb9ce4e999404ce",
+        "model": "opus",
+        "provider": "anthropic"
+      },
+      "request": "route.account_for"
+    }
+  ]
+}

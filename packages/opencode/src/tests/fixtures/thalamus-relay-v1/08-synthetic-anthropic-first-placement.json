@@ -1,0 +1,51 @@
+{
+  "plugin_reply": {
+    "choice": {
+      "account_id": "b",
+      "credential_id": "c"
+    }
+  },
+  "plugin_request": {
+    "candidates": {
+      "accounts": [
+        {
+          "account_id": "b",
+          "credential_id": "c"
+        },
+        {
+          "account_id": "a",
+          "credential_id": "other-credential"
+        }
+      ],
+      "view_digest": "feb2a112a63c35ab1251c4f56c998edc658e60c05ff39037d2e2a4926e94898e"
+    },
+    "model": "opus",
+    "op": "account_for",
+    "provider": "anthropic",
+    "request_id": "question"
+  },
+  "wire": [
+    {
+      "body": {
+        "admission_id": "75e88846-d10b-8e3a-a016-44a7e33c405e",
+        "candidates": {
+          "accounts": [
+            {
+              "account_id": "b",
+              "credential_id": "c"
+            },
+            {
+              "account_id": "a",
+              "credential_id": "other-credential"
+            }
+          ],
+          "view_digest": "feb2a112a63c35ab1251c4f56c998edc658e60c05ff39037d2e2a4926e94898e"
+        },
+        "conversation_key": "195525b9a0da4dd28bb9ce4e999404ce",
+        "model": "opus",
+        "provider": "anthropic"
+      },
+      "request": "route.account_for"
+    }
+  ]
+}

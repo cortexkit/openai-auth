@@ -33,6 +33,10 @@
   },
   "overrides": [
     {
+      "includes": ["packages/opencode/src/tests/fixtures/thalamus-relay-v1/**"],
+      "formatter": { "enabled": false }
+    },
+    {
       "includes": ["**/*.test.ts"],
       "linter": {
         "rules": {
